@@ -1,0 +1,121 @@
+{
+    "sage": {
+        "database": {
+            "bucket_size": 1024,
+            "enzyme": {
+                "missed_cleavages": 2,
+                "min_len": 6,
+                "max_len": 45,
+                "cleave_at": "$",
+                "c_terminal": true
+            },
+            "fragment_min_mz": 100,
+            "fragment_max_mz": 2500,
+            "peptide_min_mass": 300,
+            "peptide_max_mass": 5000,
+            "ion_kinds": [
+                "b",
+                "y"
+            ],
+            "min_ion_index": 2,
+            "static_mods": {
+                "C": 57.0215
+            },
+            "variable_mods": {
+				"H" : [15.9949,31.989829, 42.010565, 	14.015650, 12.000000],
+				"N" : [-18.010565, -17.026549, 15.9949,31.989829, 	14.015650],
+				"Q" : [-18.010565, -17.026549, 15.9949,31.989829, 	14.015650],
+				"E" : [-18.010565, 15.9949, 17.026549, 31.989829, 	14.015650],
+				"D" : [-18.010565, 15.9949, 17.026549, 31.989829],
+				"W" : [44.985078],
+				"F" : [44.985078],
+				"M": [15.9949, 	31.989829, 	43.005814],
+				"K": [15.9949, 	31.989829, 	42.010565, 	14.015650, 57.021464, 114.042927, 71.037114, 114.031694, 43.005814, 56.026215, 12.000000],
+				"R": [15.9949, 	31.989829, 	42.010565, 	14.015650, 43.005814, 12.000000],
+				"S" : [-18.010565, 15.9949,14.015650, 57.021464, 114.042927, 56.026215],
+				"T" : [-18.010565, 15.9949,14.015650, 57.021464, 114.042927, 56.026215],
+				"Y" : [-18.010565, 15.9949,44.985078, 12.000000],
+				"P" : [15.9949]
+            },
+            "max_variable_mods": 1,
+            "decoy_tag": "rev_",
+            "generate_decoys": false,
+            "fasta": "ecoli_22032024.fasta"
+        },
+        "precursor_tol": {
+            "da": [
+            -40,
+            40
+            ]
+        },
+        "fragment_tol": {
+            "ppm": [
+                -10,
+                10
+            ]
+        },
+        "precursor_charge": [
+            1,
+            6
+        ],
+        "isotope_errors": [
+            -1,
+            3
+        ],
+        "deisotope": false,
+        "annotate_matches": true,
+        "chimera": true,
+        "wide_window": true,
+        "min_peaks": 10,
+        "max_peaks": 1000,
+        "min_matched_peaks": 4,
+        "max_fragment_charge": 2,
+        "report_psms": 10,
+        "output_directory": "./",
+        "mzml_paths": [
+            "LFQ_Orbitrap_AIF_Ecoli_01.mzML"
+        ]
+    },
+    "mumdia": {
+        "rescoring_features": [
+            "num_proteins",
+            "rank",
+            "charge",
+            "peptide_len",
+            "correlation_max",
+            "correlation_min",
+            "correlation_median",
+            "correlation_mean",
+            "missed_cleavages",
+            "isotope_error",
+            "precursor_ppm",
+            "fragment_ppm",
+            "hyperscore",
+            "delta_next",
+            "delta_best",
+            "rt",
+            "aligned_rt",
+            "predicted_rt",
+            "delta_rt_model",
+            "matched_peaks",
+            "longest_b",
+            "longest_y",
+            "longest_y_pct",
+            "matched_intensity_pct",
+            "scored_candidates",
+            "poisson",
+            "sage_discriminant_score",
+            "posterior_error",
+            "spectrum_q",
+            "peptide_q",
+            "reporter_ion_intensity",
+            "fragment_intensity",
+            "rt_right",
+            "rt_predictions",
+            "rt_prediction_error_abs_relative",
+            "distribution_correlation_matrix_psm_ids",
+            "distribution_correlation_matrix_frag_ids",
+            "distribution_correlation_individual"
+        ]
+    }
+}

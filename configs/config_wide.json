@@ -1,0 +1,109 @@
+{
+    "sage": {
+        "database": {
+            "bucket_size": 1024,
+            "enzyme": {
+                "missed_cleavages": 0,
+                "min_len": 6,
+                "max_len": 30,
+                "cleave_at": "KR",
+                "restrict": "P",
+                "c_terminal": true
+            },
+            "fragment_min_mz": 100,
+            "fragment_max_mz": 2500,
+            "peptide_min_mass": 300,
+            "peptide_max_mass": 5000,
+            "ion_kinds": [
+                "b",
+                "y"
+            ],
+            "min_ion_index": 2,
+            "static_mods": {
+                "C": 57.0215
+            },
+            "variable_mods": {
+                "M": [15.9949]
+            },
+            "max_variable_mods": 1,
+            "decoy_tag": "rev_",
+            "generate_decoys": true,
+            "fasta": "ecoli_22032024.fasta"
+        },
+        "precursor_tol": {
+            "da": [
+            -40,
+            40
+            ]
+        },
+        "fragment_tol": {
+            "ppm": [
+                -50,
+                50
+            ]
+        },
+        "precursor_charge": [
+            2,
+            4
+        ],
+        "isotope_errors": [
+            -1,
+            1
+        ],
+        "deisotope": false,
+        "annotate_matches": true,
+        "chimera": true,
+        "wide_window": true,
+        "min_peaks": 10,
+        "max_peaks": 1000,
+        "min_matched_peaks": 4,
+        "max_fragment_charge": 1,
+        "report_psms": 50,
+        "output_directory": "./",
+        "mzml_paths": [
+            "mzml/LFQ_timsTOFPro_diaPASEF_Human_01.mzml"
+        ]
+    },
+    "mumdia": {
+        "rescoring_features": [
+            "num_proteins",
+            "rank",
+            "charge",
+            "peptide_len",
+            "correlation_max",
+            "correlation_min",
+            "correlation_median",
+            "correlation_mean",
+            "missed_cleavages",
+            "isotope_error",
+            "precursor_ppm",
+            "fragment_ppm",
+            "hyperscore",
+            "delta_next",
+            "delta_best",
+            "rt",
+            "aligned_rt",
+            "predicted_rt",
+            "delta_rt_model",
+            "matched_peaks",
+            "longest_b",
+            "longest_y",
+            "longest_y_pct",
+            "matched_intensity_pct",
+            "scored_candidates",
+            "poisson",
+            "sage_discriminant_score",
+            "posterior_error",
+            "spectrum_q",
+            "peptide_q",
+            "reporter_ion_intensity",
+            "fragment_intensity",
+            "rt_right",
+            "rt_predictions",
+            "rt_prediction_error_abs_relative",
+            "distribution_correlation_matrix_psm_ids",
+            "distribution_correlation_matrix_frag_ids",
+            "distribution_correlation_individual"
+        ]
+    }
+}
