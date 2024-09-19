@@ -43,6 +43,9 @@ import numpy as np
 from sklearn.linear_model import Lasso
 import matplotlib.pyplot as plt
 import random
+from typing import Any, Dict
+import pickle
+import pandas as pd
 
 
 def lasso_deconv():
@@ -337,19 +340,19 @@ def run_sage(config, fasta_file, output_dir):
     )
 
 
-def modify_config(key, value):
+def modify_config(key, value, config_file="config.json"):
     # Read the config.json file
-    with open("config.json", "r") as file:
+    with open(config_file, "r") as file:
         config = json.load(file)
 
     # Modify the config based on the input
     config[key] = value
 
     # Write the modified config back to the file
-    with open("config.json", "w") as file:
+    with open(config_file, "w") as file:
         json.dump(config, file, indent=4)
 
-    print("Config file updated successfully!")
+    log_info(f"Updated the config file with {key}: {value}")
 
 
 def parse_arguments():
@@ -474,41 +477,20 @@ def assign_identifiers(group):
     return group.with_columns(identifiers.alias("peak_identifier"))
 
 
-if __name__ == "__main__":
-    # Path to your FASTA file
-    fasta_file = "fasta/ecoli_22032024.fasta"
-
-    # Perform the tryptic digest and retrieve the list of peptides
-    peptides = tryptic_digest_pyopenms(fasta_file)
-
-    args = parse_arguments()
+def create_dirs(
+    args,
+    result_temp="temp",
+    result_temp_results_initial_search="results_initial_search",
+):
     result_dir = Path(args.result_dir)
-    create_directory(result_dir.joinpath("temp"))
-    create_directory(result_dir.joinpath("temp", "results_initial_search"))
-
-    with open(args.config_file, "r") as file:
-        config = json.load(file)
-    """
-    run_sage(
-        config["sage_basic"],
-        args.fasta_file,  # ecoli_22032024
-        result_dir.joinpath("temp", "results_initial_search"),
+    create_directory(result_dir.joinpath(result_temp))
+    create_directory(
+        result_dir.joinpath(result_temp, result_temp_results_initial_search)
     )
+    return result_dir, result_temp, result_temp_results_initial_search
 
-    df_fragment, df_psms, df_fragment_max, df_fragment_max_peptide = parquet_reader(
-        parquet_file_results=result_dir.joinpath(
-            "temp", "results_initial_search", "results.sage.parquet"
-        ),
-        parquet_file_fragments=result_dir.joinpath(
-            "temp", "results_initial_search", "matched_fragments.sage.parquet"
-        ),
-        q_value_filter=0.01,
-    )
 
-    ####################################
-    "Seperate out the following !!!"
-    ####################################
-
+def retrain_and_bouds(df_psms, result_dir=""):
     dlc_calibration, dlc_transfer_learn, perc_95 = retrain_deeplc(
         df_psms,
         outfile_calib=result_dir.joinpath("deeplc_calibration.png"),
@@ -526,65 +508,35 @@ if __name__ == "__main__":
     peptide_df["predictions_lower"] = peptide_df["predictions"] - perc_95
     peptide_df["predictions_upper"] = peptide_df["predictions"] + perc_95
 
-    ####################################
-    "Seperate out the following !!!"
-    ####################################
+    return peptide_df, dlc_calibration, dlc_transfer_learn, perc_95
 
-    ####################################
-    "Seperate out the following !!!"
-    ####################################
 
-    mzml_dict = split_mzml_by_retention_time(
-        "LFQ_Orbitrap_AIF_Ecoli_01.mzML",
-        time_interval=perc_95,
-        dir_files="results/temp/",
-    )
-    ####################################
-    "Seperate out the following !!!"
-    ####################################
-
+def retention_window_searches(mzml_dict, peptide_df, config, perc_95):
     df_fragment_list = []
     df_psms_list = []
-    df_fragment_max_list = []
-    df_fragment_max_peptide_list = []
-
     psm_ident_start = 0
 
-    for key, value in mzml_dict.items():
-        bool_list = (
-            (peptide_df["predictions_lower"] > (key - perc_95))
-            & (peptide_df["predictions_lower"] < key)
-        ) | (
-            (peptide_df["predictions_upper"] < (key - perc_95))
-            & (peptide_df["predictions_upper"] > key)
-        )
-        # TODO it needs to be introduced that the range is larger than the key - perc_95 and smaller than key + perc_95
-        # | (
-        #    (
-        #        (peptide_df["predictions_lower"] < (key + perc_95))
-        #        & (peptide_df["predictions_lower"] > key)
-        #    )
-        #    | (
-        #        (peptide_df["predictions_upper"] > (key + perc_95))
-        #        & (peptide_df["predictions_upper"] < key)
-        #    )
-        # )
+    for upper_mzml_partition, mzml_path in mzml_dict.items():
+        peptide_selection_mask = np.maximum(
+            peptide_df["predictions_lower"], upper_mzml_partition - perc_95
+        ) <= np.minimum(peptide_df["predictions_upper"], upper_mzml_partition)
 
-        sub_peptide_df = peptide_df[bool_list]
+        sub_peptide_df = peptide_df[peptide_selection_mask]
+
+        # Check if any peptides fall in the range of the mzml, otherwise continue
         if len(sub_peptide_df.index) == 0:
             continue
 
-        fasta_file = os.path.join(os.path.dirname(value), "vectorized_output.fasta")
-
+        fasta_file = os.path.join(os.path.dirname(mzml_path), "vectorized_output.fasta")
         write_to_fasta(sub_peptide_df, output_file=fasta_file)
 
         with open("configs/config.json", "r") as file:
             config = json.load(file)
 
-        sub_results = os.path.dirname(value)
+        sub_results = os.path.dirname(mzml_path)
 
         config["sage"]["database"]["fasta"] = fasta_file
-        config["sage"]["mzml_paths"] = [value]
+        config["sage"]["mzml_paths"] = [mzml_path]
 
         # TODO change mzml in config!
         run_sage(config["sage"], fasta_file, sub_results)
@@ -615,8 +567,6 @@ if __name__ == "__main__":
 
         df_fragment_list.append(df_fragment)
         df_psms_list.append(df_psms)
-        df_fragment_max_list.append(df_fragment_max)
-        df_fragment_max_peptide_list.append(df_fragment_max_peptide)
 
         psm_ident_start = df_psms["psm_id"].max() + 1
 
@@ -626,10 +576,6 @@ if __name__ == "__main__":
     if len(set(df_fragment["peptide"])) != len(set(df_psms["peptide"])):
         print(len(set(df_fragment["peptide"])), len(set(df_psms["peptide"])))
 
-    # df_fragment_max = pl.concat(df_fragment_max_list)
-    # df_fragment_max_peptide = pl.concat(df_fragment_max_peptide_list)
-
-    # Will return random order of max fragment intensity
     df_fragment_max = df_fragment.sort("fragment_intensity", descending=True).unique(
         subset="psm_id", keep="first", maintain_order=True
     )
@@ -640,7 +586,7 @@ if __name__ == "__main__":
     # might also want to do on charge
     df_fragment_max_peptide = df_fragment_max.unique(
         subset=["peptide"],
-        keep="first",  # , "charge"
+        keep="first",
     )
 
     if len(set(df_fragment_max_peptide["peptide"])) != len(set(df_psms["peptide"])):
@@ -648,10 +594,34 @@ if __name__ == "__main__":
             len(set(df_fragment_max_peptide["peptide"])), len(set(df_psms["peptide"]))
         )
 
-    # print(df_fragment)
-    # print(df_psms)
-    # input()
+    return (df_fragment, df_psms, df_fragment_max, df_fragment_max_peptide)
 
+
+def write_pickles(
+    df_fragment: pd.DataFrame,
+    df_psms: pd.DataFrame,
+    df_fragment_max: pd.DataFrame,
+    df_fragment_max_peptide: pd.DataFrame,
+    dlc_calibration: Any,
+    dlc_transfer_learn: Any,
+    perc_95: float,
+) -> None:
+    """
+    Write the given dataframes and objects to pickle files.
+
+    Args:
+        df_fragment (pd.DataFrame): The dataframe containing fragment data.
+        df_psms (pd.DataFrame): The dataframe containing PSMs (Peptide-Spectrum Matches) data.
+        df_fragment_max (pd.DataFrame): The dataframe containing maximum fragment data.
+        df_fragment_max_peptide (pd.DataFrame): The dataframe containing maximum fragment peptide data.
+        dlc_calibration (Any): The calibration object.
+        dlc_transfer_learn (Any): The transfer learning object.
+        perc_95 (float): The 95th percentile value.
+
+    Returns:
+        None: This function does not return anything.
+    """
+    log_info("Write the pickles...")
     with open("df_fragment_first.pkl", "wb") as f:
         pickle.dump(df_fragment, f)
     with open("df_psms_first.pkl", "wb") as f:
@@ -666,8 +636,11 @@ if __name__ == "__main__":
         pickle.dump(dlc_transfer_learn, f)
     with open("perc_95_first.pkl", "wb") as f:
         pickle.dump(perc_95, f)
-    """
+    log_info("DONE - Write the pickles...")
 
+
+def read_pickles():
+    log_info("Read the pickles...")
     with open("configs/config.json", "r") as f:
         config = json.load(f)
     with open("df_fragment_first.pkl", "rb") as f:
@@ -684,52 +657,82 @@ if __name__ == "__main__":
         dlc_transfer_learn = pickle.load(f)
     with open("perc_95_first.pkl", "rb") as f:
         perc_95 = pickle.load(f)
+    log_info("DONE - Read the pickles...")
+    return (
+        config,
+        df_fragment,
+        df_psms,
+        df_fragment_max,
+        df_fragment_max_peptide,
+        dlc_calibration,
+        dlc_transfer_learn,
+        perc_95,
+    )
 
-    log_info("Read the pickles...")
 
+if __name__ == "__main__":
+    # Path to your FASTA file
+    fasta_file = "fasta/ecoli_22032024.fasta"
+
+    # Perform the tryptic digest and retrieve the list of peptides
+    peptides = tryptic_digest_pyopenms(fasta_file)
+
+    args = parse_arguments()
+    # TODO overwrite configs supplied by the user
+    # modify_config(args.key, args.value, config=args.config_file)
+
+    result_dir, result_temp, result_temp_results_initial_search = create_dirs(args)
+
+    with open(args.config_file, "r") as file:
+        config = json.load(file)
+
+    run_sage(
+        config["sage_basic"],
+        args.fasta_file,
+        result_dir.joinpath(result_temp, result_temp_results_initial_search),
+    )
+
+    df_fragment, df_psms, df_fragment_max, df_fragment_max_peptide = parquet_reader(
+        parquet_file_results=result_dir.joinpath(
+            result_temp, result_temp_results_initial_search, "results.sage.parquet"
+        ),
+        parquet_file_fragments=result_dir.joinpath(
+            result_temp,
+            result_temp_results_initial_search,
+            "matched_fragments.sage.parquet",
+        ),
+        q_value_filter=0.01,
+    )
+
+    peptide_df, dlc_calibration, dlc_transfer_learn, perc_95 = retrain_and_bouds(
+        df_psms, result_dir=result_dir
+    )
+
+    mzml_dict = split_mzml_by_retention_time(
+        "LFQ_Orbitrap_AIF_Ecoli_01.mzML",
+        time_interval=perc_95,
+        dir_files="results/temp/",
+    )
+
+    df_fragment, df_psms, df_fragment_max, df_fragment_max_peptide = (
+        retention_window_searches(mzml_dict, peptide_df, config, perc_95)
+    )
+
+    log_info("Add the PSM identifier to fragments...")
     df_fragment = df_fragment.join(
         df_psms.select(["psm_id", "scannr"]), on="psm_id", how="left"
     )
-
-    log_info("Joined fragments with scannr...")
-
-    # Group by 'scannr' and apply the function
-    df_fragment = df_fragment.groupby("scannr").apply(assign_identifiers)
-
-    log_info("Assigned identifiers to scannr...")
-    """
-    # Display the resulting DataFrame
-    print(df_fragment)
-
-    print(df_fragment.columns)
-    input()
-    print(df_psms.columns)
-    input()
-    """
-
-    # Will return random order of max fragment intensity
-    df_fragment_max = df_fragment.sort("fragment_intensity", descending=True).unique(
-        subset="psm_id", keep="first", maintain_order=True
-    )
-    log_info("Fragment max...")
-
-    # might also want to do on charge
-    df_fragment_max_peptide = df_fragment_max.unique(
-        subset=["peptide"],
-        keep="first",  # , "charge"
-    )
-    log_info("Fragment max peptide...")
+    log_info("DONE - Add the PSM identifier to fragments...")
 
     mumdia.main(
         df_fragment=df_fragment,
         df_psms=df_psms,
         df_fragment_max=df_fragment_max,
         df_fragment_max_peptide=df_fragment_max_peptide,
-        q_value_filter=1.0,
         config=config,
         deeplc_model=dlc_transfer_learn,
-        # write_deeplc_pickle=True,
-        # write_ms2pip_pickle=True,
-        read_deeplc_pickle=True,
-        read_ms2pip_pickle=True,
+        write_deeplc_pickle=True,
+        write_ms2pip_pickle=True,
+        read_deeplc_pickle=False,
+        read_ms2pip_pickle=False,
     )

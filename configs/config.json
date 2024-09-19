@@ -5,7 +5,7 @@
             "enzyme": {
                 "missed_cleavages": 0,
                 "min_len": 6,
-                "max_len": 30,
+                "max_len": 15,
                 "cleave_at": "KR",
                 "restrict": "P",
                 "c_terminal": true
@@ -28,7 +28,7 @@
             "max_variable_mods": 1,
             "decoy_tag": "rev_",
             "generate_decoys": true,
-            "fasta": "diann_peptides.fasta"
+            "fasta": "fasta/ecoli_22032024.fasta"
         },
         "precursor_tol": {
             "da": [
@@ -52,11 +52,11 @@
         ],
         "deisotope": false,
         "annotate_matches": true,
-        "chimera": false,
+        "chimera": true,
         "wide_window": true,
         "min_peaks": 10,
         "max_peaks": 1000,
-        "min_matched_peaks": 4,
+        "min_matched_peaks": 15,
         "max_fragment_charge": 1,
         "report_psms": 5,
         "output_directory": "./",
@@ -125,9 +125,9 @@
         "wide_window": true,
         "min_peaks": 10,
         "max_peaks": 1000,
-        "min_matched_peaks": 2,
+        "min_matched_peaks": 4,
         "max_fragment_charge": 2,
-        "report_psms": 100,
+        "report_psms": 25,
         "output_directory": "./",
         "mzml_paths": [
             "LFQ_Orbitrap_AIF_Ecoli_01.mzML"

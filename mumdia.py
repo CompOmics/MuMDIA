@@ -378,6 +378,8 @@ def run_peptidoform(
     Returns:
     - pl.DataFrame: Enriched DataFrame with additional features.
     """
+    print(df_psms_sub_peptidoform)
+
     # Perform bulk operations for max, min, mean, and sum
     distribution_features = [
         v for v in selected_features if v.startswith("distribution_")
@@ -648,7 +650,10 @@ def calculate_features(
     - Processes the DataFrames to calculate additional features and updates them in-place.
     - Writes the results to a file "outfile.pin".
     """
-    if not read_deeplc_pickle:
+    #########
+    # Step 1: Obtain retention time predictions
+    #########
+    if write_deeplc_pickle or (not write_deeplc_pickle and not read_deeplc_pickle):
         if deeplc_model is None:
             dlc_calibration, dlc_transfer_learn, predictions_deeplc = (
                 get_predictions_retentiontime(df_psms)
@@ -674,6 +679,11 @@ def calculate_features(
 
     log_info("Obtained retention time predictions...")
 
+    #########
+    # Step 2: Obtain features retention time
+    #########
+    log_info("Step 2")
+
     df_psms = df_psms.join(predictions_deeplc, on="peptide", how="left")
     max_rt = df_psms["rt"].max()
 
@@ -693,6 +703,11 @@ def calculate_features(
         df_psms["rt_prediction_error_abs_relative"] < filter_rel_rt_error
     )
 
+    #########
+    # Step 3: Get a peptide count and filter by minimum occurrences
+    #########
+    log_info("Step 3")
+
     peptide_counts = df_psms.groupby("peptide").agg(pl.count().alias("count"))
 
     df_psms = (
@@ -700,6 +715,11 @@ def calculate_features(
         .filter(pl.col("count") >= min_occurrences)
         .drop("count")
     )
+
+    #########
+    # Step 4: Obtain fragment intensity predictions
+    #########
+    log_info("Step 4")
 
     if not read_ms2pip_pickle:
         ms2pip_predictions = get_predictions_fragment_intensity(df_psms)
@@ -722,189 +742,39 @@ def calculate_features(
         )
     )
 
+    #########
+    # Step 5: Calculate features correlation
+    #########
+    log_info("Step 5")
+
     psm_dict = {}
     fragment_dict = {}
     correlations_fragment_dict = {}
 
     log_info("Starting to process peptidoforms...")
     if not read_correlation_pickles:
-        flat_ms2pip = {
-            (peptide, fragment): value
-            for peptide, fragments in ms2pip_predictions.items()
-            for fragment, value in fragments.items()
-        }
-
-        df_fragment = df_fragment.with_columns(
-            pl.concat_str([pl.col("peptide"), pl.col("charge")], separator="/").alias(
-                "peptidoform"
-            )
-        )
-
-        df_fragment = df_fragment.with_columns(
-            pl.struct(["peptidoform", "fragment_name"])
-            .apply(
-                lambda x: flat_ms2pip.get((x["peptidoform"], x["fragment_name"]), None)
-            )
-            .alias("predicted_intensity")
-        )
-
-        df_fragment = df_fragment.with_columns(
-            pl.col("predicted_intensity").fill_null(0.0)
-        )
-        aggregated_fragment_df = df_fragment.groupby("psm_id").agg(
-            [
-                pl.col("fragment_name").alias(
-                    "fragment_names"
-                ),  # Aggregates as a list by default
-                pl.col("fragment_intensity").alias("observed_intensities"),
-                pl.col("predicted_intensity").alias("predicted_intensities"),
-            ]
-        )
-
-        # Step 2: Join the aggregated fragment data with the PSM dataframe
-        psm_df_with_fragments = df_psms.join(
-            aggregated_fragment_df, on="psm_id", how="left"
-        )
-
-        # Step 3: Convert lists to numpy arrays
-        psm_df_with_fragments = psm_df_with_fragments.with_columns(
-            [
-                pl.col("fragment_names")
-                .apply(lambda x: np.array(x) if x is not None else np.array([]))
-                .alias("fragment_names"),
-                pl.col("observed_intensities")
-                .apply(lambda x: np.array(x) if x is not None else np.array([]))
-                .alias("observed_intensities"),
-                pl.col("predicted_intensities")
-                .apply(lambda x: np.array(x) if x is not None else np.array([]))
-                .alias("predicted_intensities"),
-            ]
-        )
-
-        print(psm_df_with_fragments)
-        input()
-        print(df_psms.describe())
-        print(df_psms.columns)
-        print(df_psms)
-        input()
-        print(df_fragment.describe())
-        print(df_fragment.columns)
-        print(df_fragment)
-        input()
-
-        """
-        # Create a column combining peptide and charge to avoid repetitive string operations
-        df_fragment = df_fragment.with_columns(
-            (pl.col("peptide") + "/" + pl.col("charge").cast(str)).alias(
-                "peptide_charge"
-            )
-        )
-
-        # Group by peptide and charge
-        grouped_df = df_fragment.groupby("peptide_charge").agg(
-            [
-                pl.col("peptide").first().alias("peptide"),
-                pl.col("charge").first().alias("charge"),
-                pl.col("rt"),
-            ]
-        )
-
-        # Filter the predictions and match fragments
-        for group in tqdm(grouped_df.iter_rows(named=True)):
-            peptide_charge = group["peptide_charge"]
-            peptidoform = group["peptide"]
-            charge = group["charge"]
-
-            preds = ms2pip_predictions.get(peptide_charge)
-            if not preds:
-                continue
-
-            df_fragment_max_peptide_sub = df_fragment_max_peptide.filter(
-                pl.col("peptide") == peptidoform
-            )
-
-            # Use logical_and for filtering floating-point columns
-            df_fragment_sub_peptidoform = df_fragment.filter(
-                pl.col("peptide_charge") == peptide_charge
-            ).filter(
-                (pl.col("rt") - df_fragment_max_peptide_sub["rt"]).abs()
-                < filter_max_apex_rt
-            )
-
-            if df_fragment_sub_peptidoform.height == 0:
-                continue
-
-            correlations, correlation_matrix_psm_ids, correlation_matrix_frag_ids = (
-                match_fragments(df_fragment_sub_peptidoform, preds)
-            )
-
-            fragment_dict[peptide_charge] = df_fragment_sub_peptidoform
-            correlations_fragment_dict[peptide_charge] = [
-                correlations,
-                correlation_matrix_psm_ids,
-                correlation_matrix_frag_ids,
-            ]
-
-        # Partition the DataFrame by peptide and charge
-        partitions = df_fragment.partition_by(["peptide", "charge"])
-
-        for partition in tqdm(partitions):
-            peptidoform = partition["peptide"][0]
-            charge = partition["charge"][0]
-
-            preds = ms2pip_predictions.get(f"{peptidoform}/{charge}")
-            if not preds:
-                continue
-
-            df_fragment_max_peptide_sub = df_fragment_max_peptide.filter(
-                df_fragment_max_peptide["peptide"] == peptidoform
-            )
-
-            # Filtering using vectorized operations
-            df_fragment_sub_peptidoform = partition.filter(
-                abs(partition["rt"] - df_fragment_max_peptide_sub["rt"])
-                < filter_max_apex_rt
-            )
-
-            if df_fragment_sub_peptidoform.shape[0] == 0:
-                continue
-
-            correlations, correlation_matrix_psm_ids, correlation_matrix_frag_ids = (
-                match_fragments(df_fragment_sub_peptidoform, preds)
-            )
-            fragment_dict[f"{peptidoform}/{charge}"] = df_fragment_sub_peptidoform
-            correlations_fragment_dict[f"{peptidoform}/{charge}"] = [
-                correlations,
-                correlation_matrix_psm_ids,
-                correlation_matrix_frag_ids,
-            ]
-        """
-        """
         for (peptidoform, charge), df_fragment_sub_peptidoform in tqdm(
             df_fragment.groupby(["peptide", "charge"])
         ):
             preds = ms2pip_predictions.get(f"{peptidoform}/{charge}")
             if not preds:
                 continue
+
             df_fragment_max_peptide_sub = df_fragment_max_peptide.filter(
                 df_fragment_max_peptide["peptide"] == peptidoform
             )
-            
-            try:
-                df_fragment_sub_peptidoform = df_fragment_sub_peptidoform.filter(
-                    abs(
-                        df_fragment_sub_peptidoform["rt"]
-                        - df_fragment_max_peptide_sub["rt"]
-                    )
-                    < filter_max_apex_rt
+
+            df_fragment_sub_peptidoform = df_fragment_sub_peptidoform.filter(
+                abs(
+                    df_fragment_sub_peptidoform["rt"]
+                    - df_fragment_max_peptide_sub["rt"]
                 )
-            except:
-                continue
+                < filter_max_apex_rt
+            )
 
             if df_fragment_sub_peptidoform.shape[0] == 0:
                 continue
 
-            
             correlations, correlation_matrix_psm_ids, correlation_matrix_frag_ids = (
                 match_fragments(df_fragment_sub_peptidoform, preds)
             )
@@ -913,9 +783,7 @@ def calculate_features(
                 correlations,
                 correlation_matrix_psm_ids,
                 correlation_matrix_frag_ids,
-            
             ]
-        """
         if write_correlation_pickles:
             with open("fragment_dict.pkl", "wb") as f:
                 pickle.dump(fragment_dict, f)
@@ -926,6 +794,11 @@ def calculate_features(
             fragment_dict = pickle.load(f)
         with open("correlations_fragment_dict.pkl", "rb") as f:
             correlations_fragment_dict = pickle.load(f)
+
+    #########
+    # Step 6: Go from peptidoform ID to subslice of the dataframe
+    #########
+    log_info("Step 6")
 
     for (peptidoform, charge), df_sub_peptidoform in tqdm(
         df_psms.groupby(["peptide", "charge"])
@@ -941,12 +814,17 @@ def calculate_features(
     pin_in = []
 
     # pin_in = process_peptidoforms(peptidoform_args)
-
+    #########
+    # Step 7: Calculate features for each peptidoform
+    #########
+    log_info("Step 7")
     for (
         df_psms_sub_peptidoform,
         df_fragment_sub_peptidoform,
         correlations_list,
     ) in tqdm(peptidoform_args):
+        print(df_psms_sub_peptidoform)
+        print(correlations_list)
         pin_in.append(
             run_peptidoform(
                 df_psms_sub_peptidoform,
@@ -955,6 +833,11 @@ def calculate_features(
                 config["mumdia"]["rescoring_features"],
             )
         )
+
+    #########
+    # Step 8: Concatenate the results
+    #########
+    log_info("Step 8")
 
     concatenated_df = (
         pl.concat(pin_in)
@@ -976,22 +859,17 @@ def calculate_features(
 
 
 def main(
-    parquet_file_results: str = "",
-    parquet_file_fragments: str = "",
     df_fragment: pl.DataFrame = None,
     df_psms: pl.DataFrame = None,
     df_fragment_max: pl.DataFrame = None,
     df_fragment_max_peptide: pl.DataFrame = None,
     config: dict = {},
-    q_value_filter: float = 0.1,
     deeplc_model=None,
     write_deeplc_pickle: bool = False,
     write_ms2pip_pickle: bool = False,
-    write_parquet_pickle: bool = False,
     write_correlation_pickles: bool = False,
     read_deeplc_pickle: bool = False,
     read_ms2pip_pickle: bool = False,
-    read_parquet_pickle: bool = False,
     read_correlation_pickles: bool = False,
 ) -> None:
     """
@@ -1007,38 +885,6 @@ def main(
     - Performs data processing and feature calculation.
     - Outputs processed data to files and logs information about t he process.
     """
-
-    if (
-        not read_parquet_pickle
-        and len(parquet_file_results) > 0
-        and len(parquet_file_fragments) > 0
-    ):
-        log_info("Reading parquet files...")
-        df_fragment, df_psms, df_fragment_max, df_fragment_max_peptide = parquet_reader(
-            parquet_file_results=parquet_file_results,
-            parquet_file_fragments=parquet_file_fragments,
-            q_value_filter=q_value_filter,
-        )
-
-    if write_parquet_pickle:
-        with open("df_fragment.pkl", "wb") as f:
-            pickle.dump(df_fragment, f)
-        with open("df_psms.pkl", "wb") as f:
-            pickle.dump(df_psms, f)
-        with open("df_fragment_max.pkl", "wb") as f:
-            pickle.dump(df_fragment_max, f)
-        with open("df_fragment_max_peptide.pkl", "wb") as f:
-            pickle.dump(df_fragment_max_peptide, f)
-    if read_parquet_pickle:
-        with open("df_fragment.pkl", "rb") as f:
-            df_fragment = pickle.load(f)
-        with open("df_psms.pkl", "rb") as f:
-            df_psms = pickle.load(f)
-        with open("df_fragment_max.pkl", "rb") as f:
-            df_fragment_max = pickle.load(f)
-        with open("df_fragment_max_peptide.pkl", "rb") as f:
-            df_fragment_max_peptide = pickle.load(f)
-
     df_psms = pl.DataFrame(df_psms)
     df_psms = df_psms.filter(~df_psms["peptide"].str.contains("U"))
     df_psms = df_psms.sort("rt")
