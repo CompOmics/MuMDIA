@@ -1,0 +1,278 @@
+{
+    "sage_basic": {
+        "database": {
+            "bucket_size": 1024,
+            "enzyme": {
+                "missed_cleavages": 0,
+                "min_len": 6,
+                "max_len": 15,
+                "cleave_at": "KR",
+                "restrict": "P",
+                "c_terminal": true
+            },
+            "fragment_min_mz": 100,
+            "fragment_max_mz": 2500,
+            "peptide_min_mass": 300,
+            "peptide_max_mass": 5000,
+            "ion_kinds": [
+                "b",
+                "y"
+            ],
+            "min_ion_index": 2,
+            "static_mods": {
+                "C": 57.0215
+            },
+            "variable_mods": {
+                "M": [15.9949]
+            },
+            "max_variable_mods": 1,
+            "decoy_tag": "rev_",
+            "generate_decoys": true,
+            "fasta": "fasta/ecoli_22032024.fasta"
+        },
+        "precursor_tol": {
+            "da": [
+            -40,
+            40
+            ]
+        },
+        "fragment_tol": {
+            "ppm": [
+                -20,
+                20
+            ]
+        },
+        "precursor_charge": [
+            2,
+            4
+        ],
+        "isotope_errors": [
+            -1,
+            1
+        ],
+        "deisotope": false,
+        "annotate_matches": true,
+        "chimera": true,
+        "wide_window": true,
+        "min_peaks": 10,
+        "max_peaks": 1000,
+        "min_matched_peaks": 15,
+        "max_fragment_charge": 1,
+        "report_psms": 5,
+        "output_directory": "./",
+        "mzml_paths": [
+            "LFQ_Orbitrap_AIF_Ecoli_01.mzML"
+        ]
+    },
+    "sage": {
+        "database": {
+            "bucket_size": 10240,
+            "enzyme": {
+                "missed_cleavages": 2,
+                "min_len": 6,
+                "max_len": 30,
+                "cleave_at": "$"
+            },
+            "fragment_min_mz": 50,
+            "fragment_max_mz": 2500,
+            "peptide_min_mass": 300,
+            "peptide_max_mass": 5000,
+            "ion_kinds": [
+                "b",
+                "y"
+            ],
+            "min_ion_index": 2,
+            "static_mods": {
+                "C": 57.0215
+            },
+            "variable_mods": {
+                "M": [15.9949],
+                "K": [15.9949, 31.989829, 42.010565, 14.015650],
+                "R": [15.9949, 31.989829, 42.010565, 14.015650],
+                "S" : [79.966331],
+                "T" : [79.966331],
+                "Y" : [79.966331]
+            },
+            "max_variable_mods": 2,
+            "decoy_tag": "rev_",
+            "generate_decoys": true,
+            "fasta": "ecoli_22032024.fasta"
+        },
+        "precursor_tol": {
+            "da": [
+            -40,
+            40
+            ]
+        },
+        "fragment_tol": {
+            "ppm": [
+                -25,
+                25
+            ]
+        },
+        "precursor_charge": [
+            1,
+            5
+        ],
+        "isotope_errors": [
+            -1,
+            1
+        ],
+        "deisotope": false,
+        "annotate_matches": true,
+        "chimera": true,
+        "predict_rt": false,
+        "wide_window": true,
+        "min_peaks": 10,
+        "max_peaks": 1000,
+        "min_matched_peaks": 4,
+        "max_fragment_charge": 2,
+        "report_psms": 25,
+        "output_directory": "./",
+        "mzml_paths": [
+            "LFQ_Orbitrap_AIF_Ecoli_01.mzML"
+        ]
+    },
+    "mumdia": {
+        "rescoring_features": [
+            "distribution_correlation_matrix_psm_ids",
+            "distribution_correlation_matrix_frag_ids",
+            "distribution_correlation_individual",
+            "top_correlation_individual",
+            "top_correlation_matrix_frag_ids",
+            "top_correlation_matrix_psm_ids"
+        ],
+        "collapse_max_columns": [
+            "fragment_ppm",
+            "rank",
+            "delta_next",
+            "delta_rt_model",
+            "matched_peaks",
+            "longest_b",
+            "longest_y",
+            "matched_intensity_pct",
+            "fragment_intensity",
+            "poisson",
+            "spectrum_q",
+            "peptide_q",
+            "protein_q",
+            "rt",
+            "rt_predictions",
+            "rt_prediction_error_abs",
+            "rt_prediction_error_abs_relative",
+            "precursor_ppm",
+            "hyperscore",
+            "delta_best"
+        ],
+        "collapse_min_columns": [
+            "fragment_ppm",
+            "rank",
+            "delta_next",
+            "delta_rt_model",
+            "matched_peaks",
+            "longest_b",
+            "longest_y",
+            "matched_intensity_pct",
+            "fragment_intensity",
+            "poisson",
+            "spectrum_q",
+            "peptide_q",
+            "protein_q",
+            "rt",
+            "rt_predictions",
+            "rt_prediction_error_abs",
+            "rt_prediction_error_abs_relative",
+            "precursor_ppm",
+            "hyperscore",
+            "delta_best"
+        ],
+        "collapse_mean_columns": [
+            "fragment_ppm",
+            "rank",
+            "delta_next",
+            "delta_rt_model",
+            "matched_peaks",
+            "longest_b",
+            "longest_y",
+            "matched_intensity_pct",
+            "fragment_intensity",
+            "poisson",
+            "spectrum_q",
+            "peptide_q",
+            "protein_q",
+            "rt",
+            "rt_predictions",
+            "rt_prediction_error_abs",
+            "rt_prediction_error_abs_relative",
+            "precursor_ppm",
+            "hyperscore",
+            "delta_best"
+        ],
+        "collapse_sum_columns": [
+            "hyperscore",
+            "delta_rt_model",
+            "matched_peaks",
+            "longest_b",
+            "longest_y",
+            "matched_intensity_pct",
+            "fragment_intensity",
+            "rt",
+            "rt_predictions",
+            "rt_prediction_error_abs",
+            "rt_prediction_error_abs_relative",
+            "precursor_ppm",
+            "fragment_ppm",
+            "delta_next",
+            "delta_best"
+        ],
+        "get_first_entry": [
+            "psm_id",
+            "filename",
+            "scannr",
+            "peptide",
+            "num_proteins",
+            "proteins",
+            "expmass",
+            "calcmass",
+            "is_decoy",
+            "charge",
+            "peptide_len",
+            "missed_cleavages"
+        ],
+        "collect_distributions": [
+            0,
+            5,
+            10,
+            15,
+            20,
+            25,
+            30,
+            35,
+            40,
+            45,
+            50,
+            55,
+            60,
+            65,
+            70,
+            75,
+            80,
+            85,
+            90,
+            95,
+            100
+        ],
+        "collect_top": [
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10
+        ]
+    }
+}

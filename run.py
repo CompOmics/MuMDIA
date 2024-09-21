@@ -1,6 +1,10 @@
+import os
+
+os.environ["POLARS_MAX_THREADS"] = "1"
+
 import argparse
 import json
-import os
+
 import subprocess
 import subprocess
 import mumdia
@@ -11,16 +15,18 @@ from rich.logging import RichHandler
 from rich.console import Console
 import datetime
 from pyteomics import parser, fasta
-from mzml_parser import split_mzml_by_retention_time, get_ms1_mzml
-from parquet_parser import parquet_reader
-from deeplc_wrapper import get_predictions_retentiontime, retrain_deeplc, predict_deeplc
+from parsers.parser_mzml import split_mzml_by_retention_time, get_ms1_mzml
+from parsers.parser_parquet import parquet_reader
+from MuMDIA.prediction_wrappers.wrapper_deeplc import (
+    get_predictions_retentiontime,
+    retrain_deeplc,
+    predict_deeplc,
+)
 import pandas as pd
 import polars as pl
 import pickle
 from matplotlib import pyplot as plt
-
-# os.environ["RAYON_NUM_THREADS"] = "64"
-os.environ["POLARS_MAX_THREADS"] = "128"
+from MuMDIA.utilities.logger import log_info
 
 # Record the start time
 start_time = datetime.datetime.now()
@@ -46,158 +52,6 @@ import random
 from typing import Any, Dict
 import pickle
 import pandas as pd
-
-
-def lasso_deconv():
-    [
-        "psm_id",
-        "fragment_type",
-        "fragment_ordinals",
-        "fragment_charge",
-        "fragment_mz_experimental",
-        "fragment_mz_calculated",
-        "fragment_intensity",
-        "peptide",
-        "charge",
-        "rt",
-        "scannr",
-        "peak_identifier",
-    ]
-
-    [
-        "psm_id",
-        "filename",
-        "scannr",
-        "peptide",
-        "stripped_peptide",
-        "proteins",
-        "num_proteins",
-        "rank",
-        "is_decoy",
-        "expmass",
-        "calcmass",
-        "charge",
-        "peptide_len",
-        "missed_cleavages",
-        "semi_enzymatic",
-        "ms2_intensity",
-        "isotope_error",
-        "precursor_ppm",
-        "fragment_ppm",
-        "hyperscore",
-        "delta_next",
-        "delta_best",
-        "rt",
-        "aligned_rt",
-        "predicted_rt",
-        "delta_rt_model",
-        "ion_mobility",
-        "predicted_mobility",
-        "delta_mobility",
-        "matched_peaks",
-        "longest_b",
-        "longest_y",
-        "longest_y_pct",
-        "matched_intensity_pct",
-        "scored_candidates",
-        "poisson",
-        "sage_discriminant_score",
-        "posterior_error",
-        "spectrum_q",
-        "peptide_q",
-        "protein_q",
-        "reporter_ion_intensity",
-        "fragment_intensity",
-    ]
-
-    # Parameters
-    num_experimental_peaks = 50
-    num_theoretical_spectra = 1500
-    mz_range = (100, 600)
-    intensity_range = (10, 100)
-
-    # Generate experimental spectrum
-    experimental_spectrum = generate_random_spectrum(
-        num_experimental_peaks, mz_range, intensity_range
-    )
-
-    # Generate theoretical spectra with a random number of matched peaks
-    theoretical_spectra = []
-    for _ in range(num_theoretical_spectra):
-        num_peaks = random.randint(5, num_experimental_peaks)
-        theoretical_spectrum = generate_random_spectrum(
-            num_peaks, mz_range, intensity_range
-        )
-        theoretical_spectra.append(theoretical_spectrum)
-
-    # Convert spectra to numpy arrays for processing
-    def spectrum_to_vector(spectrum, mz_values):
-        mz_dict = dict(spectrum)
-        return np.array([mz_dict.get(mz, 0) for mz in mz_values])
-
-    # Get the set of all unique m/z values
-    all_mz_values = sorted(set(mz for mz, _ in experimental_spectrum))
-
-    # Convert experimental spectrum to vector
-    exp_vector = spectrum_to_vector(experimental_spectrum, all_mz_values)
-
-    # Convert theoretical spectra to matrix
-    theoretical_matrix = np.array(
-        [spectrum_to_vector(spec, all_mz_values) for spec in theoretical_spectra]
-    ).T
-
-    # Use Lasso to find the coefficients with L1 regularization
-    lasso = Lasso(alpha=100.0, positive=True, max_iter=10000)
-    lasso.fit(theoretical_matrix, exp_vector)
-    coefficients = lasso.coef_
-
-    # Print the results
-    print("Coefficients:", coefficients)
-
-    # Reconstruct the experimental spectrum from the theoretical spectra using the coefficients
-    reconstructed_spectrum = np.dot(theoretical_matrix, coefficients)
-
-    # Plot the experimental and reconstructed spectra for comparison
-    plt.figure(figsize=(12, 6))
-    plt.vlines(
-        all_mz_values, 0, exp_vector, label="Experimental Spectrum", color="blue"
-    )
-    plt.vlines(
-        all_mz_values,
-        0,
-        reconstructed_spectrum,
-        label="Reconstructed Spectrum",
-        color="red",
-        linestyle="--",
-    )
-    plt.xlabel("m/z")
-    plt.ylabel("Intensity")
-    plt.legend()
-    plt.title("Experimental vs Reconstructed Spectrum")
-    plt.show()
-
-    # Plot the stacked contribution of each theoretical spectrum
-    plt.figure(figsize=(12, 6))
-    bottom = np.zeros(len(all_mz_values))
-    colors = plt.cm.tab20(np.linspace(0, 1, num_theoretical_spectra))
-    for j, vector in enumerate(theoretical_spectra):
-        contribution = coefficients[j] * spectrum_to_vector(vector, all_mz_values)
-        plt.bar(
-            all_mz_values,
-            contribution,
-            bottom=bottom,
-            color=colors[j],
-            edgecolor="white",
-            width=4,
-            label=f"Theoretical Spectrum {j+1}",
-        )
-        bottom += contribution
-
-    plt.xlabel("m/z")
-    plt.ylabel("Intensity")
-    # plt.legend(loc='upper right', bbox_to_anchor=(1.15, 1))
-    plt.title("Stacked Contributions of Theoretical Spectra")
-    plt.show()
 
 
 def tryptic_digest_pyopenms(
@@ -287,15 +141,6 @@ def write_to_fasta(df, output_file="vectorized_output.fasta"):
     # Write the content to a file
     with open(output_file, "w") as fasta_file:
         fasta_file.write(fasta_content)
-
-
-def log_info(message):
-    current_time = datetime.datetime.now()
-    elapsed = current_time - start_time
-    # Add Rich markup for coloring and styling
-    console.log(
-        f"[green]{current_time:%Y-%m-%d %H:%M:%S}[/green] [bold blue]{message}[/bold blue] - Elapsed Time: [yellow]{elapsed}[/yellow]"
-    )
 
 
 def run_sage(config, fasta_file, output_dir):
@@ -597,76 +442,67 @@ def retention_window_searches(mzml_dict, peptide_df, config, perc_95):
     return (df_fragment, df_psms, df_fragment_max, df_fragment_max_peptide)
 
 
-def write_pickles(
-    df_fragment: pd.DataFrame,
-    df_psms: pd.DataFrame,
-    df_fragment_max: pd.DataFrame,
-    df_fragment_max_peptide: pd.DataFrame,
-    dlc_calibration: Any,
-    dlc_transfer_learn: Any,
-    perc_95: float,
-) -> None:
-    """
-    Write the given dataframes and objects to pickle files.
-
-    Args:
-        df_fragment (pd.DataFrame): The dataframe containing fragment data.
-        df_psms (pd.DataFrame): The dataframe containing PSMs (Peptide-Spectrum Matches) data.
-        df_fragment_max (pd.DataFrame): The dataframe containing maximum fragment data.
-        df_fragment_max_peptide (pd.DataFrame): The dataframe containing maximum fragment peptide data.
-        dlc_calibration (Any): The calibration object.
-        dlc_transfer_learn (Any): The transfer learning object.
-        perc_95 (float): The 95th percentile value.
-
-    Returns:
-        None: This function does not return anything.
-    """
-    log_info("Write the pickles...")
-    with open("df_fragment_first.pkl", "wb") as f:
+def write_variables_to_pickles(
+    df_fragment,
+    df_psms,
+    df_fragment_max,
+    df_fragment_max_peptide,
+    config,
+    dlc_transfer_learn,
+    write_deeplc_pickle,
+    write_ms2pip_pickle,
+    write_correlation_pickles,
+):
+    with open("df_fragment.pkl", "wb") as f:
         pickle.dump(df_fragment, f)
-    with open("df_psms_first.pkl", "wb") as f:
+    with open("df_psms.pkl", "wb") as f:
         pickle.dump(df_psms, f)
-    with open("df_fragment_max_first.pkl", "wb") as f:
+    with open("df_fragment_max.pkl", "wb") as f:
         pickle.dump(df_fragment_max, f)
-    with open("df_fragment_max_peptide_first.pkl", "wb") as f:
+    with open("df_fragment_max_peptide.pkl", "wb") as f:
         pickle.dump(df_fragment_max_peptide, f)
-    with open("dlc_calibration_first.pkl", "wb") as f:
-        pickle.dump(dlc_calibration, f)
-    with open("dlc_transfer_learn_first.pkl", "wb") as f:
+    with open("config.pkl", "wb") as f:
+        pickle.dump(config, f)
+    with open("dlc_transfer_learn.pkl", "wb") as f:
         pickle.dump(dlc_transfer_learn, f)
-    with open("perc_95_first.pkl", "wb") as f:
-        pickle.dump(perc_95, f)
-    log_info("DONE - Write the pickles...")
+    # Also save the flags
+    with open("flags.pkl", "wb") as f:
+        pickle.dump(
+            {
+                "write_deeplc_pickle": write_deeplc_pickle,
+                "write_ms2pip_pickle": write_ms2pip_pickle,
+                "write_correlation_pickles": write_correlation_pickles,
+                "read_deeplc_pickle": False,
+                "read_ms2pip_pickle": False,
+                "read_correlation_pickles": False,
+            },
+            f,
+        )
 
 
-def read_pickles():
-    log_info("Read the pickles...")
-    with open("configs/config.json", "r") as f:
-        config = json.load(f)
-    with open("df_fragment_first.pkl", "rb") as f:
+def read_variables_from_pickles():
+    with open("df_fragment.pkl", "rb") as f:
         df_fragment = pickle.load(f)
-    with open("df_psms_first.pkl", "rb") as f:
+    with open("df_psms.pkl", "rb") as f:
         df_psms = pickle.load(f)
-    with open("df_fragment_max_first.pkl", "rb") as f:
+    with open("df_fragment_max.pkl", "rb") as f:
         df_fragment_max = pickle.load(f)
-    with open("df_fragment_max_peptide_first.pkl", "rb") as f:
+    with open("df_fragment_max_peptide.pkl", "rb") as f:
         df_fragment_max_peptide = pickle.load(f)
-    with open("dlc_calibration_first.pkl", "rb") as f:
-        dlc_calibration = pickle.load(f)
-    with open("dlc_transfer_learn_first.pkl", "rb") as f:
+    with open("config.pkl", "rb") as f:
+        config = pickle.load(f)
+    with open("dlc_transfer_learn.pkl", "rb") as f:
         dlc_transfer_learn = pickle.load(f)
-    with open("perc_95_first.pkl", "rb") as f:
-        perc_95 = pickle.load(f)
-    log_info("DONE - Read the pickles...")
+    with open("flags.pkl", "rb") as f:
+        flags = pickle.load(f)
     return (
-        config,
         df_fragment,
         df_psms,
         df_fragment_max,
         df_fragment_max_peptide,
-        dlc_calibration,
+        config,
         dlc_transfer_learn,
-        perc_95,
+        flags,
     )
 
 
@@ -723,6 +559,30 @@ if __name__ == "__main__":
         df_psms.select(["psm_id", "scannr"]), on="psm_id", how="left"
     )
     log_info("DONE - Add the PSM identifier to fragments...")
+
+    # Now, write all variables to pickles before calling mumdia.main
+    write_variables_to_pickles(
+        df_fragment=df_fragment,
+        df_psms=df_psms,
+        df_fragment_max=df_fragment_max,
+        df_fragment_max_peptide=df_fragment_max_peptide,
+        config=config,
+        dlc_transfer_learn=dlc_transfer_learn,
+        write_deeplc_pickle=True,
+        write_ms2pip_pickle=True,
+        write_correlation_pickles=True,
+    )
+
+    # Later, you can read the variables back
+    (
+        df_fragment,
+        df_psms,
+        df_fragment_max,
+        df_fragment_max_peptide,
+        config,
+        dlc_transfer_learn,
+        flags,
+    ) = read_variables_from_pickles()
 
     mumdia.main(
         df_fragment=df_fragment,

@@ -1,59 +1,45 @@
-from deeplc_wrapper import get_predictions_retentiontime
-from mzml_parser import get_spectra_mzml
-from parquet_parser import parquet_reader
-from collections import Counter
 from tqdm import tqdm
-from matplotlib import pyplot as plt
 import numpy as np
-import matplotlib.pyplot as plt
-import pandas as pd
-import pickle
 import polars as pl
 from tqdm import tqdm
-from ms2pip_wrapper import get_predictions_fragment_intensity
-from scipy.stats import pearsonr
 import mokapot
-from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import ProcessPoolExecutor
 from multiprocessing import Manager
 import logging
 import os
 from sklearn.neural_network import MLPClassifier
-from sklearn.model_selection import GridSearchCV
 from typing import Tuple, List
 from sklearn.linear_model import Lasso
+from MuMDIA.prediction_wrappers.wrapper_deeplc import (
+    get_predictions_retention_time_mainloop,
+)
+from feature_generators.features_retention_time import add_retention_time_features
+from feature_generators.features_general import add_count_and_filter_peptides
+from feature_generators.features_fragment_intensity import (
+    get_features_fragment_intensity,
+)
+from MuMDIA.prediction_wrappers.wrapper_ms2pip import (
+    get_predictions_fragment_intensity_main_loop,
+    get_predictions_fragment_intensity,
+)
+
+os.environ["POLARS_MAX_THREADS"] = "1"
 
 # TODO make a logger module in a seperate file
-try:
-    from run import log_info
-except:
-    import datetime
-
-    start_time = datetime.datetime.now()
-    from rich.logging import RichHandler
-    from rich.console import Console
-
-    console = Console()
-
-    def log_info(message):
-        current_time = datetime.datetime.now()
-        elapsed = current_time - start_time
-        # Add Rich markup for coloring and styling
-        console.log(
-            f"[green]{current_time:%Y-%m-%d %H:%M:%S}[/green] [bold blue]{message}[/bold blue] - Elapsed Time: [yellow]{elapsed}[/yellow]"
-        )
-
+from MuMDIA.utilities.logger import log_info
 
 from typing import Any
 import xgboost as xgb
 from mokapot.model import PercolatorModel
-from deeplc_wrapper import predict_deeplc_pl
+from MuMDIA.wrapper_deeplc import predict_deeplc_pl
 
 from keras.models import Sequential
 from keras.layers import Dense
 
 # from keras.wrappers.scikit_learn import KerasClassifier
 from sklearn.model_selection import cross_val_score
+
+from contextlib import contextmanager
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
@@ -131,60 +117,7 @@ def pearson_np(x, y):
     return np.array([corr_np(x[:, i], y) for i in range(x.shape[1])])
 
 
-def match_fragments(
-    df_fragment_sub_peptidoform: pl.DataFrame, ms2pip_predictions: dict
-) -> Tuple[float, np.ndarray, List[np.ndarray]]:
-    """
-    Match fragments and calculate their correlation.
-
-    Parameters:
-    - df_fragment_sub_peptidoform (pl.DataFrame): A DataFrame containing fragment data.
-    - ms2pip_predictions (dict): A dictionary of MS2PIP predictions.
-
-    Returns:
-    - Tuple[float, np.ndarray, List[np.ndarray]]: A tuple containing the correlation result,
-      a numpy array of PSM ID correlation matrix, and a list of numpy arrays of fragment ID correlation matrices.
-    """
-    intensity_matrix = df_fragment_sub_peptidoform.pivot(
-        index="psm_id", columns="fragment_name", values="fragment_intensity"
-    ).fill_null(0.0)
-
-    if intensity_matrix.shape[0] > 1:
-        correlation_matrix_frag_ids = intensity_matrix[:, 1:].corr()
-    else:
-        correlation_matrix_frag_ids = pl.DataFrame()
-
-    intensity_matrix_transposed = intensity_matrix.transpose()
-    correlation_matrix_psm_ids = np.square(
-        intensity_matrix_transposed.corr().to_numpy().flatten()
-    )
-    correlation_matrix_psm_ids = np.sort(correlation_matrix_psm_ids)
-    correlation_matrix_psm_ids = correlation_matrix_psm_ids[
-        : -len(intensity_matrix_transposed)
-    ]
-
-    pred_frag_intens = np.array(
-        [ms2pip_predictions.get(fid, 0.0) for fid in intensity_matrix.columns]
-    )
-
-    correlation_result = pearson_np(intensity_matrix_transposed, pred_frag_intens)
-
-    """
-    [
-        (
-            correlation_matrix_frag_ids[sorted_predicted_intens_names[i]].to_numpy()
-            if sorted_predicted_intens_names[i] in correlation_matrix_frag_ids.columns
-            else np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
-        )
-        for i in range(3)
-    ]
-    """
-
-    return (
-        correlation_result,
-        correlation_matrix_psm_ids,
-        correlation_matrix_frag_ids,
-    )
+import numpy as np
 
 
 def collapse_columns(
@@ -378,7 +311,6 @@ def run_peptidoform(
     Returns:
     - pl.DataFrame: Enriched DataFrame with additional features.
     """
-    print(df_psms_sub_peptidoform)
 
     # Perform bulk operations for max, min, mean, and sum
     distribution_features = [
@@ -464,11 +396,7 @@ def run_peptidoform(
     )
 
     df_psms_sub_peptidoform_collapsed = df_psms_sub_peptidoform_collapsed.with_columns(
-        pl.Series(
-            "is_decoy",
-            df_psms_sub_peptidoform_collapsed["is_decoy"].apply(transform_bool),
-            dtype=pl.Int32,
-        )
+        pl.when(pl.col("is_decoy")).then(-1).otherwise(1).alias("is_decoy")
     )
 
     df_psms_sub_peptidoform_collapsed = df_psms_sub_peptidoform_collapsed.with_columns(
@@ -520,7 +448,7 @@ def dataframe_to_dict_fragintensity(df_fragment: pl.DataFrame) -> dict:
     - dict: A dictionary with PSM IDs as keys and corresponding DataFrames as values.
     """
     fragment_dict = {}
-    for psm_id, sub_df_fragment in df_fragment.groupby("psm_id"):
+    for psm_id, sub_df_fragment in df_fragment.group_by("psm_id"):
         fragment_dict[psm_id] = sub_df_fragment
 
     return fragment_dict
@@ -578,7 +506,7 @@ def deconv_filter_fragment_spectra(
     df_fragment = df_fragment.with_columns(pl.col("predicted_intensity").fill_null(0.0))
 
     selected_peptidoforms = []
-    for group in df_fragment.groupby("scannr"):
+    for group in df_fragment.group_by("scannr"):
 
         df_scan = group[1].sort("peak_identifier")
 
@@ -650,158 +578,49 @@ def calculate_features(
     - Processes the DataFrames to calculate additional features and updates them in-place.
     - Writes the results to a file "outfile.pin".
     """
-    #########
-    # Step 1: Obtain retention time predictions
-    #########
-    if write_deeplc_pickle or (not write_deeplc_pickle and not read_deeplc_pickle):
-        if deeplc_model is None:
-            dlc_calibration, dlc_transfer_learn, predictions_deeplc = (
-                get_predictions_retentiontime(df_psms)
-            )
-        else:
-            predictions_deeplc = predict_deeplc_pl(df_psms, deeplc_model)
-
-    if write_deeplc_pickle:
-        if deeplc_model is None:
-            with open("dlc_calibration.pkl", "wb") as f:
-                pickle.dump(dlc_calibration, f)
-            with open("dlc_transfer_learn.pkl", "wb") as f:
-                pickle.dump(dlc_transfer_learn, f)
-        with open("predictions_deeplc.pkl", "wb") as f:
-            pickle.dump(predictions_deeplc, f)
-    if read_deeplc_pickle:
-        with open("dlc_calibration_first.pkl", "rb") as f:
-            dlc_calibration = pickle.load(f)
-        with open("dlc_transfer_learn_first.pkl", "rb") as f:
-            dlc_transfer_learn = pickle.load(f)
-        with open("predictions_deeplc.pkl", "rb") as f:
-            predictions_deeplc = pickle.load(f)
-
-    log_info("Obtained retention time predictions...")
-
-    #########
-    # Step 2: Obtain features retention time
-    #########
-    log_info("Step 2")
-
-    df_psms = df_psms.join(predictions_deeplc, on="peptide", how="left")
-    max_rt = df_psms["rt"].max()
-
-    df_psms = df_psms.with_columns(
-        pl.Series(
-            "rt_prediction_error_abs",
-            abs(df_psms["rt"] - df_psms["rt_predictions"]),
-        )
-    )
-    df_psms = df_psms.with_columns(
-        pl.Series(
-            "rt_prediction_error_abs_relative",
-            abs(df_psms["rt"] - df_psms["rt_predictions"]) / max_rt,
-        )
-    )
-    df_psms = df_psms.filter(
-        df_psms["rt_prediction_error_abs_relative"] < filter_rel_rt_error
-    )
-
-    #########
-    # Step 3: Get a peptide count and filter by minimum occurrences
-    #########
-    log_info("Step 3")
-
-    peptide_counts = df_psms.groupby("peptide").agg(pl.count().alias("count"))
-
-    df_psms = (
-        df_psms.join(peptide_counts, on="peptide")
-        .filter(pl.col("count") >= min_occurrences)
-        .drop("count")
-    )
-
-    #########
-    # Step 4: Obtain fragment intensity predictions
-    #########
-    log_info("Step 4")
-
-    if not read_ms2pip_pickle:
-        ms2pip_predictions = get_predictions_fragment_intensity(df_psms)
-    if write_ms2pip_pickle:
-        with open("ms2pip_predictions.pkl", "wb") as f:
-            pickle.dump(ms2pip_predictions, f)
-    if read_ms2pip_pickle:
-        with open("ms2pip_predictions.pkl", "rb") as f:
-            ms2pip_predictions = pickle.load(f)
-
-    df_fragment = df_fragment.filter(df_fragment["psm_id"].is_in(df_psms["psm_id"]))
-
-    df_fragment = df_fragment.with_columns(
-        pl.Series(
-            "fragment_name",
-            df_fragment["fragment_type"]
-            + df_fragment["fragment_ordinals"]
-            + "/"
-            + df_fragment["fragment_charge"],
+    log_info("Obtaining retention time predictions for the main loop...")
+    dlc_calibration, dlc_transfer_learn, predictions_deeplc = (
+        get_predictions_retention_time_mainloop(
+            df_psms, write_deeplc_pickle, read_deeplc_pickle, deeplc_model
         )
     )
 
-    #########
-    # Step 5: Calculate features correlation
-    #########
-    log_info("Step 5")
+    log_info("Obtaining features retention time...")
+    # TODO make it adjustable what features to include
+    df_psms = add_retention_time_features(
+        df_psms, predictions_deeplc, filter_rel_rt_error=0.2
+    )
 
-    psm_dict = {}
-    fragment_dict = {}
-    correlations_fragment_dict = {}
+    log_info(
+        "Counting individual peptides per MS2 and filtering by minimum occurrences"
+    )
+    df_psms = add_count_and_filter_peptides(df_psms, min_occurrences)
 
-    log_info("Starting to process peptidoforms...")
-    if not read_correlation_pickles:
-        for (peptidoform, charge), df_fragment_sub_peptidoform in tqdm(
-            df_fragment.groupby(["peptide", "charge"])
-        ):
-            preds = ms2pip_predictions.get(f"{peptidoform}/{charge}")
-            if not preds:
-                continue
+    log_info("Obtaining fragment intensity predictions for the main loop...")
+    df_fragment, ms2pip_predictions = get_predictions_fragment_intensity_main_loop(
+        df_psms,
+        df_fragment,
+        read_ms2pip_pickle=read_ms2pip_pickle,
+        write_ms2pip_pickle=write_ms2pip_pickle,
+    )
 
-            df_fragment_max_peptide_sub = df_fragment_max_peptide.filter(
-                df_fragment_max_peptide["peptide"] == peptidoform
-            )
-
-            df_fragment_sub_peptidoform = df_fragment_sub_peptidoform.filter(
-                abs(
-                    df_fragment_sub_peptidoform["rt"]
-                    - df_fragment_max_peptide_sub["rt"]
-                )
-                < filter_max_apex_rt
-            )
-
-            if df_fragment_sub_peptidoform.shape[0] == 0:
-                continue
-
-            correlations, correlation_matrix_psm_ids, correlation_matrix_frag_ids = (
-                match_fragments(df_fragment_sub_peptidoform, preds)
-            )
-            fragment_dict[f"{peptidoform}/{charge}"] = df_fragment_sub_peptidoform
-            correlations_fragment_dict[f"{peptidoform}/{charge}"] = [
-                correlations,
-                correlation_matrix_psm_ids,
-                correlation_matrix_frag_ids,
-            ]
-        if write_correlation_pickles:
-            with open("fragment_dict.pkl", "wb") as f:
-                pickle.dump(fragment_dict, f)
-            with open("correlations_fragment_dict.pkl", "wb") as f:
-                pickle.dump(correlations_fragment_dict, f)
-    if read_correlation_pickles:
-        with open("fragment_dict.pkl", "rb") as f:
-            fragment_dict = pickle.load(f)
-        with open("correlations_fragment_dict.pkl", "rb") as f:
-            correlations_fragment_dict = pickle.load(f)
+    log_info("Obtaining features fragment intensity predictions...")
+    fragment_dict, correlations_fragment_dict = get_features_fragment_intensity(
+        ms2pip_predictions,
+        df_fragment,
+        df_fragment_max_peptide,
+        read_correlation_pickles=read_correlation_pickles,
+        write_correlation_pickles=write_correlation_pickles,
+    )
 
     #########
     # Step 6: Go from peptidoform ID to subslice of the dataframe
     #########
     log_info("Step 6")
 
+    psm_dict = {}
     for (peptidoform, charge), df_sub_peptidoform in tqdm(
-        df_psms.groupby(["peptide", "charge"])
+        df_psms.group_by(["peptide", "charge"])
     ):
         psm_dict[f"{peptidoform}/{charge}"] = df_sub_peptidoform
 
@@ -823,8 +642,6 @@ def calculate_features(
         df_fragment_sub_peptidoform,
         correlations_list,
     ) in tqdm(peptidoform_args):
-        print(df_psms_sub_peptidoform)
-        print(correlations_list)
         pin_in.append(
             run_peptidoform(
                 df_psms_sub_peptidoform,
