@@ -5,7 +5,7 @@ from numba import njit
 import numpy as np
 from tqdm import tqdm
 from typing import Tuple
-from MuMDIA.utilities.logger import log_info
+from utilities.logger import log_info
 
 
 @njit

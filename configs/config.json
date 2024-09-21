@@ -56,9 +56,9 @@
         "wide_window": true,
         "min_peaks": 10,
         "max_peaks": 1000,
-        "min_matched_peaks": 15,
+        "min_matched_peaks": 8,
         "max_fragment_charge": 1,
-        "report_psms": 5,
+        "report_psms": 3,
         "output_directory": "./",
         "mzml_paths": [
             "LFQ_Orbitrap_AIF_Ecoli_01.mzML"

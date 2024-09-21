@@ -1,10 +1,21 @@
 import datetime
-
-start_time = datetime.datetime.now()
 from rich.logging import RichHandler
 from rich.console import Console
+import logging
 
+# Record the start time
+start_time = datetime.datetime.now()
+
+# Create a console for rich print
 console = Console()
+
+# Set up Rich logging configuration
+logging.basicConfig(
+    level="INFO",
+    format="%(message)s",
+    datefmt="[%X]",
+    handlers=[RichHandler(console=console, rich_tracebacks=True)],
+)
 
 
 def log_info(message):

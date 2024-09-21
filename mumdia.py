@@ -10,7 +10,7 @@ import os
 from sklearn.neural_network import MLPClassifier
 from typing import Tuple, List
 from sklearn.linear_model import Lasso
-from MuMDIA.prediction_wrappers.wrapper_deeplc import (
+from prediction_wrappers.wrapper_deeplc import (
     get_predictions_retention_time_mainloop,
 )
 from feature_generators.features_retention_time import add_retention_time_features
@@ -18,7 +18,7 @@ from feature_generators.features_general import add_count_and_filter_peptides
 from feature_generators.features_fragment_intensity import (
     get_features_fragment_intensity,
 )
-from MuMDIA.prediction_wrappers.wrapper_ms2pip import (
+from prediction_wrappers.wrapper_ms2pip import (
     get_predictions_fragment_intensity_main_loop,
     get_predictions_fragment_intensity,
 )
@@ -26,15 +26,19 @@ from MuMDIA.prediction_wrappers.wrapper_ms2pip import (
 os.environ["POLARS_MAX_THREADS"] = "1"
 
 # TODO make a logger module in a seperate file
-from MuMDIA.utilities.logger import log_info
+from utilities.logger import log_info
 
 from typing import Any
 import xgboost as xgb
 from mokapot.model import PercolatorModel
-from MuMDIA.wrapper_deeplc import predict_deeplc_pl
 
-from keras.models import Sequential
-from keras.layers import Dense
+from prediction_wrappers.wrapper_ms2pip import (
+    get_predictions_fragment_intensity_main_loop,
+)
+from prediction_wrappers.wrapper_deeplc import (
+    get_predictions_retention_time_mainloop,
+)
+
 
 # from keras.wrappers.scikit_learn import KerasClassifier
 from sklearn.model_selection import cross_val_score
