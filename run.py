@@ -18,12 +18,6 @@ from prediction_wrappers.wrapper_deeplc import (
 import pandas as pd
 import polars as pl
 
-from utilities.pickling import (
-    write_variables_to_pickles,
-    read_variables_from_pickles,
-)
-
-
 import numpy as np
 import pandas as pd
 
@@ -301,6 +295,7 @@ if __name__ == "__main__":
             write_deeplc_pickle=True,
             write_ms2pip_pickle=True,
             write_correlation_pickles=True,
+            dir=result_dir,
         )
     if read_initial_search_pickle:
         (
