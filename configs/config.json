@@ -122,7 +122,7 @@
         "max_peaks": 1000,
         "min_matched_peaks": 4,
         "max_fragment_charge": 2,
-        "report_psms": 10,
+        "report_psms": 1,
         "output_directory": "./",
         "mzml_paths": [
             "LFQ_Orbitrap_AIF_Ecoli_01.mzML"
@@ -218,6 +218,7 @@
             "precursor_ppm",
             "fragment_ppm",
             "delta_next",
+            "rank",
             "delta_best"
         ],
         "get_first_entry": [

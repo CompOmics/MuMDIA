@@ -8,6 +8,7 @@ import numpy as np
 import polars as pl
 from operator import itemgetter
 
+import pandas as pd
 import pickle
 
 
@@ -238,3 +239,24 @@ def get_predictions_retention_time_mainloop(
         return None, None, predictions_deeplc
     else:
         return dlc_calibration, dlc_transfer_learn, predictions_deeplc
+
+
+def retrain_and_bounds(df_psms, peptides, result_dir=""):
+    dlc_calibration, dlc_transfer_learn, perc_95 = retrain_deeplc(
+        df_psms,
+        outfile_calib=result_dir.joinpath("deeplc_calibration.png"),
+        outfile_transf_learn=result_dir.joinpath("deeplc_transfer_learn.png"),
+    )
+    perc_95 = perc_95 * 60.0 * 2.0
+    predictions = predict_deeplc(peptides, dlc_transfer_learn)
+
+    peptide_df = pd.DataFrame(
+        peptides, columns=["protein", "start", "end", "id", "peptide"]
+    )
+    peptide_df["predictions"] = predictions
+    peptide_df["predictions"] = peptide_df["predictions"] * 60.0
+    peptide_df.to_csv("peptide_predictions.csv", index=False)
+    peptide_df["predictions_lower"] = peptide_df["predictions"] - perc_95
+    peptide_df["predictions_upper"] = peptide_df["predictions"] + perc_95
+
+    return peptide_df, dlc_calibration, dlc_transfer_learn, perc_95

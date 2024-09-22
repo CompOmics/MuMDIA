@@ -40,7 +40,10 @@ from prediction_wrappers.wrapper_deeplc import (
 )
 
 
-# from keras.wrappers.scikit_learn import KerasClassifier
+from keras.models import Sequential
+from keras.layers import Dense
+from scikeras.wrappers import KerasClassifier
+
 from sklearn.model_selection import cross_val_score
 
 from contextlib import contextmanager
@@ -54,9 +57,8 @@ last_features = ["proteins"]
 # Function to create the Keras model
 def create_model():
     model = Sequential()
-    model.add(Dense(20, input_dim=169, activation="relu"))
+    model.add(Dense(100, input_dim=169, activation="relu"))
     model.add(Dense(20, activation="relu"))
-    model.add(Dense(10, activation="relu"))
     model.add(Dense(10, activation="relu"))
     model.add(Dense(1, activation="sigmoid"))
     model.compile(loss="binary_crossentropy", optimizer="adam", metrics=["accuracy"])
@@ -88,19 +90,20 @@ def run_mokapot() -> None:
     # Read the PSMs from the PIN file:
     psms = mokapot.read_pin("outfile.pin")
 
-    model = MLPClassifier(hidden_layer_sizes=(10, 5, 5, 5), max_iter=50)
+    # model = MLPClassifier(hidden_layer_sizes=(10, 5, 5, 5), max_iter=50)
     # Wrap the model with KerasClassifier
-    # model = KerasClassifier(
-    #    build_fn=create_model, epochs=100, batch_size=10, verbose=10
-    # )
-    # results, models = mokapot.brew(psms, mokapot.Model(mlp), folds=5)
+    model = KerasClassifier(
+        build_fn=create_model, epochs=100, batch_size=1000, verbose=10
+    )
+
+    results, models = mokapot.brew(psms, mokapot.Model(model), folds=5)
     # model = xgb.XGBClassifier(n_estimators=100, max_depth=8, learning_rate=0.1)
     # results, models = mokapot.brew(
     #    psms, mokapot.Model(model, max_iter=25), max_workers=20, folds=10
     # )
-
+    # model = create_model()
     # Conduct the mokapot analysis:
-    results, models = mokapot.brew(psms, PercolatorModel(max_iter=50), folds=10)
+    # results, models = mokapot.brew(psms, model, folds=3)
 
     # Save the results to two tab-delimited files
     # "mokapot.psms.txt" and "mokapot.peptides.txt"
