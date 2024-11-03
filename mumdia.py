@@ -485,69 +485,6 @@ def process_peptidoforms(
         return list(results)
 
 
-def deconv_filter_fragment_spectra(
-    ms2pip_predictions: dict,
-    df_fragment: pl.DataFrame,
-    min_coefficient=0.0000000001,
-    alpha_penalty=0.1,
-):
-    # Flatten the nested dictionary into a single mapping
-    flat_ms2pip = {
-        (peptide, fragment): value
-        for peptide, fragments in ms2pip_predictions.items()
-        for fragment, value in fragments.items()
-    }
-
-    df_fragment = df_fragment.with_columns(
-        pl.concat_str([pl.col("peptide"), pl.col("charge")], separator="/").alias(
-            "peptidoform"
-        )
-    )
-
-    df_fragment = df_fragment.with_columns(
-        pl.struct(["peptidoform", "fragment_name"])
-        .apply(lambda x: flat_ms2pip.get((x["peptidoform"], x["fragment_name"]), None))
-        .alias("predicted_intensity")
-    )
-
-    df_fragment = df_fragment.with_columns(pl.col("predicted_intensity").fill_null(0.0))
-
-    selected_peptidoforms = []
-    for group in df_fragment.group_by("scannr"):
-
-        df_scan = group[1].sort("peak_identifier")
-
-        exp_spectrum_intensity = (
-            df_scan.unique(subset=["peak_identifier"], keep="first")[
-                "fragment_intensity"
-            ]
-            .fill_null(0.0)
-            .to_numpy()
-        )
-        exp_spectrum_intensity_normalized = exp_spectrum_intensity / np.sum(
-            exp_spectrum_intensity
-        )
-
-        pivot_df = df_scan.pivot(
-            values="predicted_intensity",
-            index="peptidoform",
-            columns="peak_identifier",
-            aggregate_function="sum",
-        )
-        pivot_df_intensity = pivot_df[pivot_df.columns[1:]].fill_null(0.0).to_numpy().T
-
-        lasso = Lasso(alpha=alpha_penalty, positive=True, max_iter=100000)
-        lasso.fit(pivot_df_intensity, exp_spectrum_intensity_normalized)
-        coefficients = lasso.coef_
-
-        selected_peptidoforms_filter = pl.Series(coefficients > min_coefficient)
-
-        selected_peptidoforms.extend(
-            list(pivot_df[pivot_df.columns[0]].filter(selected_peptidoforms_filter))
-        )
-    return selected_peptidoforms
-
-
 def calculate_features(
     df_psms: pl.DataFrame,
     df_fragment: pl.DataFrame,

@@ -61,7 +61,7 @@ def parse_arguments():
     parser.add_argument(
         "--fasta_file",
         help="The location of the fasta file",
-        default="fasta/human.fasta",
+        default="fasta/ecoli_22032024.fasta",
     )
     parser.add_argument(
         "--result_dir", help="The location of the result directory", default="results"
@@ -96,13 +96,10 @@ def parse_arguments():
     return parser.parse_args()
 
 
-def main(skip_sage=False):
+def main():
     log_info("Parsing command line arguments...")
     # Parse the command line arguments
     args = parse_arguments()
-
-    write_initial_search_pickle = True
-    read_initial_search_pickle = True
 
     log_info("Creating the result directory...")
     # TODO overwrite configs supplied by the user
@@ -130,8 +127,22 @@ def main(skip_sage=False):
             result_temp_results_initial_search,
             "matched_fragments.sage.parquet",
         ),
-        q_value_filter=0.01,
+        q_value_filter=0.001,
     )
+
+    if args.write_initial_search_pickle:
+        write_variables_to_pickles(
+            df_fragment=df_fragment,
+            df_psms=df_psms,
+            df_fragment_max=df_fragment_max,
+            df_fragment_max_peptide=df_fragment_max_peptide,
+            config=config,
+            dlc_transfer_learn=True,
+            write_deeplc_pickle=True,
+            write_ms2pip_pickle=True,
+            write_correlation_pickles=True,
+            dir=result_dir,
+        )
 
     peptides = tryptic_digest_pyopenms(args.fasta_file)
 
@@ -177,7 +188,7 @@ def main(skip_sage=False):
             config,
             dlc_transfer_learn,
             flags,
-        ) = read_variables_from_pickles()
+        ) = read_variables_from_pickles(dir=result_dir)
 
     mumdia.main(
         df_fragment=df_fragment,
