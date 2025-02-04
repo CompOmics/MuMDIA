@@ -13,25 +13,32 @@ def write_variables_to_pickles(
     write_deeplc_pickle,
     write_ms2pip_pickle,
     write_correlation_pickles,
+    df_fragment_fname="df_fragment.pkl",
+    df_psms_fname="df_psms.pkl",
+    df_fragment_max_fname="df_fragment_max.pkl",
+    df_fragment_max_peptide_fname="df_fragment_max_peptide.pkl",
+    config_fname="config.pkl",
+    dlc_transfer_learn_fname="dlc_transfer_learn.pkl",
+    flags_fname="flags.pkl",
     dir="./",
 ):
     pickle_dir = Path(dir)
     create_directory(pickle_dir)
 
-    with open(pickle_dir.joinpath("df_fragment.pkl"), "wb") as f:
+    with open(pickle_dir.joinpath(df_fragment_fname), "wb") as f:
         pickle.dump(df_fragment, f)
-    with open(pickle_dir.joinpath("df_psms.pkl"), "wb") as f:
+    with open(pickle_dir.joinpath(df_psms_fname), "wb") as f:
         pickle.dump(df_psms, f)
-    with open(pickle_dir.joinpath("df_fragment_max.pkl"), "wb") as f:
+    with open(pickle_dir.joinpath(df_fragment_max_fname), "wb") as f:
         pickle.dump(df_fragment_max, f)
-    with open(pickle_dir.joinpath("df_fragment_max_peptide.pkl"), "wb") as f:
+    with open(pickle_dir.joinpath(df_fragment_max_peptide_fname), "wb") as f:
         pickle.dump(df_fragment_max_peptide, f)
-    with open(pickle_dir.joinpath("config.pkl"), "wb") as f:
+    with open(pickle_dir.joinpath(config_fname), "wb") as f:
         pickle.dump(config, f)
-    with open(pickle_dir.joinpath("dlc_transfer_learn.pkl"), "wb") as f:
+    with open(pickle_dir.joinpath(dlc_transfer_learn_fname), "wb") as f:
         pickle.dump(dlc_transfer_learn, f)
     # Also save the flags
-    with open(pickle_dir.joinpath("flags.pkl"), "wb") as f:
+    with open(pickle_dir.joinpath(flags_fname), "wb") as f:
         pickle.dump(
             {
                 "write_deeplc_pickle": write_deeplc_pickle,

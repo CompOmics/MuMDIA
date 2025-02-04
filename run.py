@@ -97,6 +97,7 @@ def parse_arguments():
 
 
 def main():
+
     log_info("Parsing command line arguments...")
     # Parse the command line arguments
     args = parse_arguments()
@@ -127,7 +128,7 @@ def main():
             result_temp_results_initial_search,
             "matched_fragments.sage.parquet",
         ),
-        q_value_filter=0.001,
+        q_value_filter=config["mumdia"]["fdr_init_search"],
     )
 
     if args.write_initial_search_pickle:
@@ -142,6 +143,13 @@ def main():
             write_ms2pip_pickle=True,
             write_correlation_pickles=True,
             dir=result_dir,
+            df_fragment_fname="df_fragment_basic.pkl",
+            df_psms_fname="df_psms_basic.pkl",
+            df_fragment_max_fname="df_fragment_max_basic.pkl",
+            df_fragment_max_peptide_fname="df_fragment_max_peptide_basic.pkl",
+            config_fname="config_basic.pkl",
+            dlc_transfer_learn_fname="dlc_transfer_learn_basic.pkl",
+            flags_fname="flags_basic.pkl",
         )
 
     peptides = tryptic_digest_pyopenms(args.fasta_file)
@@ -179,6 +187,7 @@ def main():
             write_correlation_pickles=True,
             dir=result_dir,
         )
+
     if args.read_initial_search_pickle:
         (
             df_fragment,
@@ -208,6 +217,98 @@ def main():
         remove_intermediate_files(args.result_dir)
 
 
+def main_read_initial():
+    log_info("Parsing command line arguments...")
+    # Parse the command line arguments
+    args = parse_arguments()
+
+    log_info("Creating the result directory...")
+    # TODO overwrite configs supplied by the user
+    # modify_config(args.key, args.value, config=args.config_file)
+
+    result_dir, result_temp, result_temp_results_initial_search = create_dirs(args)
+
+    log_info("Reading the configuration json file...")
+    # Read the config file
+    with open(args.config_file, "r") as file:
+        config = json.load(file)
+
+    if args.read_initial_search_pickle:
+        (
+            df_fragment,
+            df_psms,
+            df_fragment_max,
+            df_fragment_max_peptide,
+            config,
+            dlc_transfer_learn,
+            flags,
+        ) = read_variables_from_pickles(dir=result_dir)
+
+    mumdia.main(
+        df_fragment=df_fragment,
+        df_psms=df_psms,
+        df_fragment_max=df_fragment_max,
+        df_fragment_max_peptide=df_fragment_max_peptide,
+        config=config,
+        deeplc_model=dlc_transfer_learn,
+        write_deeplc_pickle=True,
+        write_ms2pip_pickle=True,
+        read_deeplc_pickle=False,
+        read_ms2pip_pickle=False,
+    )
+
+    # Remove intermediate files if specified
+    if args.remove_intermediate_files:
+        remove_intermediate_files(args.result_dir)
+
+
+def main_read_initial_skip_pred():
+    log_info("Parsing command line arguments...")
+    # Parse the command line arguments
+    args = parse_arguments()
+
+    log_info("Creating the result directory...")
+    # TODO overwrite configs supplied by the user
+    # modify_config(args.key, args.value, config=args.config_file)
+
+    result_dir, result_temp, result_temp_results_initial_search = create_dirs(args)
+
+    log_info("Reading the configuration json file...")
+    # Read the config file
+    with open(args.config_file, "r") as file:
+        config = json.load(file)
+
+    if args.read_initial_search_pickle:
+        (
+            df_fragment,
+            df_psms,
+            df_fragment_max,
+            df_fragment_max_peptide,
+            config,
+            dlc_transfer_learn,
+            flags,
+        ) = read_variables_from_pickles(dir=result_dir)
+
+    mumdia.main(
+        df_fragment=df_fragment,
+        df_psms=df_psms,
+        df_fragment_max=df_fragment_max,
+        df_fragment_max_peptide=df_fragment_max_peptide,
+        config=config,
+        deeplc_model=dlc_transfer_learn,
+        write_deeplc_pickle=False,
+        write_ms2pip_pickle=False,
+        read_deeplc_pickle=True,
+        read_ms2pip_pickle=True,
+    )
+
+    # Remove intermediate files if specified
+    if args.remove_intermediate_files:
+        remove_intermediate_files(args.result_dir)
+
+
 if __name__ == "__main__":
+    # main_read_initial()
+    # main_read_initial_skip_pred()
     main()
     run_mokapot()

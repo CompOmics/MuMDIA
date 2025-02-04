@@ -228,10 +228,16 @@ def get_predictions_retention_time_mainloop(
         with open("predictions_deeplc.pkl", "wb") as f:
             pickle.dump(predictions_deeplc, f)
     if read_deeplc_pickle:
-        with open("dlc_calibration_first.pkl", "rb") as f:
-            dlc_calibration = pickle.load(f)
-        with open("dlc_transfer_learn_first.pkl", "rb") as f:
-            dlc_transfer_learn = pickle.load(f)
+        try:
+            with open("dlc_calibration_first.pkl", "rb") as f:
+                dlc_calibration = pickle.load(f)
+        except IOError:
+            pass
+        try:
+            with open("dlc_transfer_learn_first.pkl", "rb") as f:
+                dlc_transfer_learn = pickle.load(f)
+        except IOError:
+            pass
         with open("predictions_deeplc.pkl", "rb") as f:
             predictions_deeplc = pickle.load(f)
 
@@ -241,22 +247,28 @@ def get_predictions_retention_time_mainloop(
         return dlc_calibration, dlc_transfer_learn, predictions_deeplc
 
 
-def retrain_and_bounds(df_psms, peptides, result_dir=""):
+def retrain_and_bounds(
+    df_psms,
+    peptides,
+    result_dir="",
+    coefficient_bounds=1.0,
+    correct_to_mzml_rt_constant=60.0,
+):
     dlc_calibration, dlc_transfer_learn, perc_95 = retrain_deeplc(
         df_psms,
         outfile_calib=result_dir.joinpath("deeplc_calibration.png"),
         outfile_transf_learn=result_dir.joinpath("deeplc_transfer_learn.png"),
     )
-    perc_95 = perc_95 * 60.0 * 2.0
+    perc_95 = perc_95 * correct_to_mzml_rt_constant * coefficient_bounds
     predictions = predict_deeplc(peptides, dlc_transfer_learn)
 
     peptide_df = pd.DataFrame(
         peptides, columns=["protein", "start", "end", "id", "peptide"]
     )
     peptide_df["predictions"] = predictions
-    peptide_df["predictions"] = peptide_df["predictions"] * 60.0
+    peptide_df["predictions"] = peptide_df["predictions"] * correct_to_mzml_rt_constant
     peptide_df.to_csv("peptide_predictions.csv", index=False)
-    peptide_df["predictions_lower"] = peptide_df["predictions"] - perc_95
-    peptide_df["predictions_upper"] = peptide_df["predictions"] + perc_95
+    peptide_df["predictions_lower"] = peptide_df["predictions"] - perc_95 / 2.0
+    peptide_df["predictions_upper"] = peptide_df["predictions"] + perc_95 / 2.0
 
     return peptide_df, dlc_calibration, dlc_transfer_learn, perc_95
