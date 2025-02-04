@@ -589,7 +589,6 @@ def calculate_features(
         pin_in.append(
             run_peptidoform(
                 df_psms_sub_peptidoform,
-                # df_fragment_sub_peptidoform,
                 correlations_list,
                 config["mumdia"]["rescoring_features"],
             )

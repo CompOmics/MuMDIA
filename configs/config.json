@@ -3,9 +3,9 @@
         "database": {
             "bucket_size": 1024,
             "enzyme": {
-                "missed_cleavages": 0,
+                "missed_cleavages": 2,
                 "min_len": 6,
-                "max_len": 15,
+                "max_len": 30,
                 "cleave_at": "KR",
                 "restrict": "P",
                 "c_terminal": true
@@ -18,7 +18,7 @@
                 "b",
                 "y"
             ],
-            "min_ion_index": 2,
+            "min_ion_index": 0,
             "static_mods": {
                 "C": 57.0215
             },
@@ -38,12 +38,12 @@
         },
         "fragment_tol": {
             "ppm": [
-                -20,
-                20
+                -25,
+                25
             ]
         },
         "precursor_charge": [
-            2,
+            1,
             4
         ],
         "isotope_errors": [
@@ -54,11 +54,11 @@
         "annotate_matches": true,
         "chimera": true,
         "wide_window": true,
-        "min_peaks": 10,
-        "max_peaks": 1000,
-        "min_matched_peaks": 8,
-        "max_fragment_charge": 1,
-        "report_psms": 3,
+        "min_peaks": 0,
+        "max_peaks": 10000,
+        "min_matched_peaks": 4,
+        "max_fragment_charge": 2,
+        "report_psms": 10,
         "output_directory": "./",
         "mzml_paths": [
             "LFQ_Orbitrap_AIF_Ecoli_01.mzML"
@@ -81,7 +81,7 @@
                 "b",
                 "y"
             ],
-            "min_ion_index": 2,
+            "min_ion_index": 0,
             "static_mods": {
                 "C": 57.0215
             },
@@ -107,7 +107,7 @@
         },
         "precursor_charge": [
             1,
-            5
+            4
         ],
         "isotope_errors": [
             -1,
@@ -118,17 +118,18 @@
         "chimera": true,
         "predict_rt": false,
         "wide_window": true,
-        "min_peaks": 10,
-        "max_peaks": 1000,
-        "min_matched_peaks": 4,
-        "max_fragment_charge": 2,
-        "report_psms": 1,
+        "min_peaks": 0,
+        "max_peaks": 100,
+        "min_matched_peaks": 2,
+        "max_fragment_charge": 1,
+        "report_psms": 5,
         "output_directory": "./",
         "mzml_paths": [
             "LFQ_Orbitrap_AIF_Ecoli_01.mzML"
         ]
     },
     "mumdia": {
+        "fdr_init_search": 0.001,
         "rescoring_features": [
             "distribution_correlation_matrix_psm_ids",
             "distribution_correlation_matrix_frag_ids",
