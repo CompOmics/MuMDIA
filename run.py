@@ -309,6 +309,6 @@ def main_read_initial_skip_pred():
 
 if __name__ == "__main__":
     # main_read_initial()
-    # main_read_initial_skip_pred()
-    main()
+    main_read_initial_skip_pred()
+    # main()
     run_mokapot()

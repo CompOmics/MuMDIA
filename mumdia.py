@@ -23,6 +23,15 @@ from prediction_wrappers.wrapper_ms2pip import (
     get_predictions_fragment_intensity,
 )
 
+import concurrent.futures
+from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor
+from typing import Tuple, List
+import polars as pl
+from tqdm import tqdm
+
+from copy import deepcopy
+
 os.environ["POLARS_MAX_THREADS"] = "1"
 
 # TODO make a logger module in a seperate file
@@ -444,6 +453,299 @@ def run_peptidoform(
     return df_psms_sub_peptidoform_collapsed[columns_for_pin]
 
 
+def run_peptidoform_df(
+    df_psms_sub_peptidoform: pl.DataFrame,
+    selected_features: List[str] = [],
+    collect_distributions: list[int] = [
+        0,
+        5,
+        10,
+        15,
+        20,
+        25,
+        30,
+        35,
+        40,
+        45,
+        50,
+        55,
+        60,
+        65,
+        70,
+        75,
+        80,
+        85,
+        90,
+        95,
+        100,
+    ],
+    collect_top: list[int] = [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+    ],
+    collapse_max_columns: list[str] = [
+        "fragment_ppm",
+        "rank",
+        "delta_next",
+        "delta_rt_model",
+        "matched_peaks",
+        "longest_b",
+        "longest_y",
+        "matched_intensity_pct",
+        "fragment_intensity",
+        "poisson",
+        "spectrum_q",
+        "peptide_q",
+        "rt",
+        "rt_predictions",
+        "rt_prediction_error_abs",
+        "rt_prediction_error_abs_relative",
+        "precursor_ppm",
+        "hyperscore",
+        "delta_best",
+    ],
+    collapse_min_columns: list[str] = [
+        "fragment_ppm",
+        "rank",
+        "delta_next",
+        "delta_rt_model",
+        "matched_peaks",
+        "longest_b",
+        "longest_y",
+        "matched_intensity_pct",
+        "fragment_intensity",
+        "poisson",
+        "spectrum_q",
+        "peptide_q",
+        "rt",
+        "rt_predictions",
+        "rt_prediction_error_abs",
+        "rt_prediction_error_abs_relative",
+        "precursor_ppm",
+        "hyperscore",
+        "delta_best",
+    ],
+    collapse_mean_columns: list[str] = [
+        "fragment_ppm",
+        "rank",
+        "delta_next",
+        "delta_rt_model",
+        "matched_peaks",
+        "longest_b",
+        "longest_y",
+        "matched_intensity_pct",
+        "fragment_intensity",
+        "poisson",
+        "spectrum_q",
+        "peptide_q",
+        "rt",
+        "rt_predictions",
+        "rt_prediction_error_abs",
+        "rt_prediction_error_abs_relative",
+        "precursor_ppm",
+        "hyperscore",
+        "delta_best",
+    ],
+    collapse_sum_columns: list[str] = [
+        "hyperscore",
+        "delta_rt_model",
+        "matched_peaks",
+        "longest_b",
+        "longest_y",
+        "matched_intensity_pct",
+        "fragment_intensity",
+        "rt",
+        "rt_predictions",
+        "rt_prediction_error_abs",
+        "rt_prediction_error_abs_relative",
+        "precursor_ppm",
+        "fragment_ppm",
+        "delta_next",
+        "delta_best",
+    ],
+    get_first_entry: list[str] = [
+        "psm_id",
+        "filename",
+        "scannr",
+        "peptide",
+        "num_proteins",
+        "proteins",
+        "expmass",
+        "calcmass",
+        "is_decoy",
+        "charge",
+        "peptide_len",
+        "missed_cleavages",
+    ],
+) -> pl.DataFrame:
+    """
+    Process peptidoform data to enrich it with correlation and other calculated features.
+
+    Parameters:
+    - df_psms_sub_peptidoform (pl.DataFrame): DataFrame containing PSMs data.
+    - df_fragment_sub_peptidoform (pl.DataFrame): DataFrame containing fragment data.
+    - correlations_list (list[float]): List of correlation values.
+
+    Returns:
+    - pl.DataFrame: Enriched DataFrame with additional features.
+    """
+
+    # Perform bulk operations for max, min, mean, and sum
+    distribution_features = [
+        v for v in selected_features if v.startswith("distribution_")
+    ]
+    distribution_features_with_percentile = [
+        dist_f + "_" + str(v)
+        for dist_f in distribution_features
+        for v in collect_distributions
+    ]
+
+    top_features = [v for v in selected_features if v.startswith("top_")]
+    top_features_with_percentile = [
+        dist_f + "_" + str(v) for dist_f in top_features for v in collect_top
+    ]
+
+    df_psms_sub_peptidoform_collapsed = collapse_columns(
+        df_psms_sub_peptidoform,
+        collapse_max_columns=collapse_max_columns,
+        collapse_min_columns=collapse_min_columns,
+        collapse_mean_columns=collapse_mean_columns,
+        collapse_sum_columns=collapse_sum_columns,
+        get_first_entry=get_first_entry,
+    )
+
+    df_psms_sub_peptidoform_collapsed = df_psms_sub_peptidoform_collapsed.with_columns(
+        pl.when(pl.col("is_decoy")).then(-1).otherwise(1).alias("is_decoy")
+    )
+
+    df_psms_sub_peptidoform_collapsed = df_psms_sub_peptidoform_collapsed.with_columns(
+        pl.Series(
+            "SpecId",
+            df_psms_sub_peptidoform_collapsed["psm_id"]
+            + "|"
+            + df_psms_sub_peptidoform_collapsed["filename"]
+            + "|"
+            + df_psms_sub_peptidoform_collapsed["scannr"],
+        )
+    )
+
+    columns_for_pin = ["SpecId"]
+    columns_for_pin.extend(
+        [
+            v
+            for v in selected_features
+            if not v.startswith("distribution_") and not v.startswith("top_")
+        ]
+    )
+    columns_for_pin.extend(distribution_features_with_percentile)
+    columns_for_pin.extend(top_features_with_percentile)
+    columns_for_pin.extend(last_features)
+
+    return df_psms_sub_peptidoform_collapsed
+
+
+def run_peptidoform_correlation(
+    correlations_list,
+    collect_distributions: list[int] = [
+        0,
+        5,
+        10,
+        15,
+        20,
+        25,
+        30,
+        35,
+        40,
+        45,
+        50,
+        55,
+        60,
+        65,
+        70,
+        75,
+        80,
+        85,
+        90,
+        95,
+        100,
+    ],
+    collect_top: list[int] = [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+    ],
+    pad_size=10,
+):
+    correlations, correlation_matrix_psm_ids, correlation_matrix_frag_ids = (
+        correlations_list
+    )
+
+    df_psms_sub_peptidoform_collapsed = pl.concat(
+        [
+            add_feature_columns(
+                correlation_matrix_psm_ids,
+                "distribution_correlation_matrix_psm_ids",
+                collect_distributions,
+                "percentile",
+                pad_size=len(collect_distributions),
+            ),
+            add_feature_columns(
+                correlation_matrix_frag_ids,
+                "distribution_correlation_matrix_frag_ids",
+                collect_distributions,
+                "percentile",
+                pad_size=len(collect_distributions),
+            ),
+            add_feature_columns(
+                correlations,
+                "distribution_correlation_individual",
+                collect_distributions,
+                "percentile",
+                pad_size=len(collect_distributions),
+            ),
+            add_feature_columns(
+                correlation_matrix_psm_ids,
+                "top_correlation_matrix_psm_ids",
+                collect_top,
+                "top",
+                pad_size,
+            ),
+            add_feature_columns(
+                correlation_matrix_frag_ids,
+                "top_correlation_matrix_frag_ids",
+                collect_top,
+                "top",
+                pad_size,
+            ),
+            add_feature_columns(
+                correlations,
+                "top_correlation_individual",
+                collect_top,
+                "top",
+                pad_size,
+            ),
+        ],
+        how="horizontal",
+    )
+
+    return df_psms_sub_peptidoform_collapsed
+
+
 def dataframe_to_dict_fragintensity(df_fragment: pl.DataFrame) -> dict:
     """
     Converts a DataFrame of fragment intensities into a dictionary.
@@ -462,27 +764,42 @@ def dataframe_to_dict_fragintensity(df_fragment: pl.DataFrame) -> dict:
 
 
 def run_peptidoform_wrapper(
-    args: Tuple[pl.DataFrame, pl.DataFrame, List[float]]
+    args: Tuple[pl.DataFrame, pl.DataFrame, List[float], List[str]]
 ) -> pl.DataFrame:
     """
-    Wrapper function for running the peptidoform processing.
-
-    Parameters:
-    - args (Tuple[pl.DataFrame, pl.DataFrame, List[float]]): A tuple containing the DataFrames and list of correlations.
-
-    Returns:
-    - pl.DataFrame: The processed DataFrame from run_peptidoform function.
+    A small wrapper to call run_peptidoform() with the correct arguments.
     """
-    return run_peptidoform(*args)
+    (
+        df_psms_sub_peptidoform,
+        df_fragment_sub_peptidoform,
+        correlations_list,
+        selected_features,
+    ) = args
+    return run_peptidoform(
+        df_psms_sub_peptidoform,
+        correlations_list,
+        selected_features,
+    )
 
 
 def process_peptidoforms(
-    peptidoform_args: List[Tuple[pl.DataFrame, pl.DataFrame, List[float]]],
-    max_workers: int = 2,
+    peptidoform_args: List[Tuple[pl.DataFrame, pl.DataFrame, List[float], List[str]]],
+    max_workers: int = 4,
 ) -> List[pl.DataFrame]:
+    """
+    Execute run_peptidoform() in parallel for each peptidoform.
+    Returns a list of the resulting DataFrames.
+    """
+    results = []
     with ProcessPoolExecutor(max_workers=max_workers) as executor:
-        results = executor.map(run_peptidoform_wrapper, peptidoform_args)
-        return list(results)
+        # Map each peptidoform argument tuple to our wrapper
+        futures = [
+            executor.submit(run_peptidoform_wrapper, arg) for arg in peptidoform_args
+        ]
+        for f in concurrent.futures.as_completed(futures):
+            results.append(f.result())
+
+    return results
 
 
 def calculate_features(
@@ -491,7 +808,7 @@ def calculate_features(
     df_fragment_max: pl.DataFrame,
     df_fragment_max_peptide: pl.DataFrame,
     filter_rel_rt_error: float = 0.1,
-    min_occurrences: int = 0,
+    min_occurrences: int = 10,
     filter_max_apex_rt: float = 0.75,
     config: dict = {},
     deeplc_model=None,
@@ -501,6 +818,8 @@ def calculate_features(
     read_deeplc_pickle: bool = False,
     read_ms2pip_pickle: bool = False,
     read_correlation_pickles: bool = False,
+    parallel_workers: int = 156,
+    chunk_size: int = 10000,
 ) -> None:
     """
     Process multiple peptidoforms in parallel using ProcessPoolExecutor.
@@ -569,7 +888,11 @@ def calculate_features(
         psm_dict[f"{peptidoform}/{charge}"] = df_sub_peptidoform
 
     peptidoform_args = [
-        (psm_dict[k], fragment_dict[k], correlations_fragment_dict[k])
+        (
+            deepcopy(psm_dict[k]),
+            deepcopy(fragment_dict[k]),
+            deepcopy(correlations_fragment_dict[k]),
+        )
         for k in psm_dict.keys()
         if k in correlations_fragment_dict.keys()
     ]
@@ -580,20 +903,34 @@ def calculate_features(
     #########
     # Step 7: Calculate features for each peptidoform
     #########
+
     log_info("Step 7")
+
+    # pin_in = process_peptidoforms(peptidoform_args, max_workers=parallel_workers)
+    # pin_in = process_peptidoforms(peptidoform_args, max_workers=parallel_workers)
+
     for (
         df_psms_sub_peptidoform,
         df_fragment_sub_peptidoform,
         correlations_list,
     ) in tqdm(peptidoform_args):
         pin_in.append(
-            run_peptidoform(
-                df_psms_sub_peptidoform,
-                correlations_list,
-                config["mumdia"]["rescoring_features"],
+            pl.concat(
+                [
+                    run_peptidoform_df(df_psms_sub_peptidoform),
+                    run_peptidoform_correlation(correlations_list),
+                ],
+                how="horizontal",
             )
         )
-
+        # pin_in.append(
+        #    run_peptidoform(
+        #        df_psms_sub_peptidoform,
+        #        correlations_list,
+        #        config["mumdia"]["rescoring_features"],
+        #    )
+        # )
+    # input()
     #########
     # Step 8: Concatenate the results
     #########

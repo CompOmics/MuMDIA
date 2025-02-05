@@ -12,4 +12,5 @@ def add_count_and_filter_peptides(df_psms: pl.DataFrame, min_occurrences: int = 
     df_psms = df_psms.join(peptide_counts, on="peptide").filter(
         pl.col("count") >= min_occurrences
     )
+    df_psms = df_psms.sample(n=50000)
     return df_psms
