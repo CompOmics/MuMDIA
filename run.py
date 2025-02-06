@@ -163,51 +163,76 @@ def parse_arguments():
         "--mumdia_fdr", help="Override mumdia FDR setting in config", type=float
     )
 
-    return parser.parse_args()
+    return parser, parser.parse_args()
 
 
-def modify_config(config_file, result_dir, **kwargs):
+def modify_config(config_file, result_dir, parser, **kwargs):
     """
-    Modify the configuration file with command-line arguments and save it in the results folder.
-    Only updates the config if arguments are provided.
+    Modify the configuration file by ensuring all command-line arguments
+    go under the "mumdia" key and fall back to argparse defaults if missing.
 
     Args:
         config_file (str): Original config file path.
         result_dir (str): Path to the result directory.
+        parser (argparse.ArgumentParser): The argparse parser to retrieve default values.
         **kwargs: Command-line arguments as key-value pairs.
+
     Returns:
         str: Path to the new saved config file.
     """
-    with open(config_file, "r") as file:
-        config = json.load(file)
+    # Load existing configuration
+    if os.path.exists(config_file):
+        with open(config_file, "r") as file:
+            config = json.load(file)
+    else:
+        log_info(
+            f"Warning: Config file '{config_file}' not found. Using argparse defaults."
+        )
+        config = {}
+
+    # Ensure "mumdia" exists in the config
+    if "mumdia" not in config:
+        config["mumdia"] = {}
+
+    # Get default values from argparse (Fix: Use parser, not args)
+    default_args = {
+        action.dest: action.default
+        for action in parser._actions
+        if action.default is not None
+    }
 
     updated = False
+
+    # Ensure missing values inside "mumdia" are filled with argparse defaults
+    for key, default_value in default_args.items():
+        if key not in config["mumdia"]:  # Missing in config, use argparse default
+            config["mumdia"][key] = default_value
+            updated = True  # Mark as updated if we added a default value
+
+    # Apply command-line argument overrides if explicitly set
     for key, value in kwargs.items():
-        if value is not None:  # Update only if a new value is provided
-            keys = key.split(".")  # Allow nested keys
-            sub_config = config
-            for k in keys[:-1]:
-                sub_config = sub_config.setdefault(k, {})
-            if sub_config.get(keys[-1]) != value:
-                sub_config[keys[-1]] = value
-                updated = True
+        if value is not None:  # Only overwrite if an argument is provided
+            if key not in config["mumdia"] or config["mumdia"][key] != value:
+                config["mumdia"][key] = value
+                updated = True  # Mark as updated if a CLI override was applied
 
     # Define new config path in results folder
     new_config_path = os.path.join(result_dir, "updated_config.json")
 
+    # Write to new file only if updates were made
     if updated:
         with open(new_config_path, "w") as file:
             json.dump(config, file, indent=4)
         log_info(f"Configuration updated and saved to {new_config_path}")
     else:
-        log_info("No configuration changes made.")
+        log_info("No configuration changes were made, using existing values.")
 
-    return new_config_path  # Return path to the new config file
+    return new_config_path  # Return path to the updated config file
 
 
 def main():
     log_info("Parsing command line arguments...")
-    args = parse_arguments()
+    parser, args = parse_arguments()
 
     log_info("Creating the result directory...")
     result_dir, result_temp, result_temp_results_initial_search = create_dirs(args)
@@ -216,16 +241,19 @@ def main():
     new_config_file = modify_config(
         args.config_file,
         result_dir=args.result_dir,
+        parser=parser,
     )
 
     log_info("Reading the updated configuration JSON file...")
     with open(new_config_file, "r") as file:
         config = json.load(file)
 
-    if args.write_initial_search_pickle:
+    args_dict = config["mumdia"]
+
+    if args_dict["write_initial_search_pickle"]:
         run_sage(
             config["sage_basic"],
-            args.fasta_file,
+            args_dict["fasta_file"],
             result_dir.joinpath(result_temp, result_temp_results_initial_search),
         )
 
@@ -238,29 +266,29 @@ def main():
                 result_temp_results_initial_search,
                 "matched_fragments.sage.parquet",
             ),
-            q_value_filter=config["mumdia"]["fdr_init_search"],
+            q_value_filter=args_dict["fdr_init_search"],
         )
 
-    if args.write_initial_search_pickle:
+    if args_dict["write_initial_search_pickle"]:
         write_variables_to_pickles(
             df_fragment=df_fragment,
             df_psms=df_psms,
             df_fragment_max=df_fragment_max,
             df_fragment_max_peptide=df_fragment_max_peptide,
             config=config,
-            dlc_transfer_learn=args.dlc_transfer_learn,
-            write_deeplc_pickle=args.write_deeplc_pickle,
-            write_ms2pip_pickle=args.write_ms2pip_pickle,
-            write_correlation_pickles=args.write_correlation_pickles,
-            write_full_search_pickle=args.write_full_search_pickle,
-            read_deeplc_pickle=args.read_deeplc_pickle,
-            read_ms2pip_pickle=args.read_ms2pip_pickle,
-            read_correlation_pickles=args.read_correlation_pickles,
-            read_full_search_pickle=args.write_full_search_pickle,
+            dlc_transfer_learn=args_dict["dlc_transfer_learn"],
+            write_deeplc_pickle=args_dict["write_deeplc_pickle"],
+            write_ms2pip_pickle=args_dict["write_ms2pip_pickle"],
+            write_correlation_pickles=args_dict["write_correlation_pickles"],
+            write_full_search_pickle=args_dict["write_full_search_pickle"],
+            read_deeplc_pickle=args_dict["read_deeplc_pickle"],
+            read_ms2pip_pickle=args_dict["read_ms2pip_pickle"],
+            read_correlation_pickles=args_dict["read_correlation_pickles"],
+            read_full_search_pickle=args_dict["read_full_search_pickle"],
             dir=result_dir,
         )
 
-    if args.read_initial_search_pickle:
+    if args_dict["read_initial_search_pickle"]:
         (
             df_fragment,
             df_psms,
@@ -270,10 +298,10 @@ def main():
             dlc_transfer_learn,
             flags,
         ) = read_variables_from_pickles(dir=result_dir)
-        args.update(flags)
+        args_dict.update(flags)
 
-    if args.write_full_search_pickle:
-        peptides = tryptic_digest_pyopenms(args.fasta_file)
+    if args_dict["write_full_search_pickle"]:
+        peptides = tryptic_digest_pyopenms(args_dict["fasta_file"])
 
         peptide_df, dlc_calibration, dlc_transfer_learn, perc_95 = retrain_and_bounds(
             df_psms, peptides, result_dir=result_dir
@@ -294,26 +322,26 @@ def main():
             df_psms.select(["psm_id", "scannr"]), on="psm_id", how="left"
         )
 
-    if args.write_full_search_pickle:
+    if args_dict["write_full_search_pickle"]:
         write_variables_to_pickles(
             df_fragment=df_fragment,
             df_psms=df_psms,
             df_fragment_max=df_fragment_max,
             df_fragment_max_peptide=df_fragment_max_peptide,
             config=config,
-            dlc_transfer_learn=args.dlc_transfer_learn,
-            write_deeplc_pickle=args.write_deeplc_pickle,
-            write_ms2pip_pickle=args.write_ms2pip_pickle,
-            write_correlation_pickles=args.write_correlation_pickles,
-            write_full_search_pickle=args.write_full_search_pickle,
-            read_deeplc_pickle=args.read_deeplc_pickle,
-            read_ms2pip_pickle=args.read_ms2pip_pickle,
-            read_correlation_pickles=args.read_correlation_pickles,
-            read_full_search_pickle=args.write_full_search_pickle,
+            dlc_transfer_learn=args_dict["dlc_transfer_learn"],
+            write_deeplc_pickle=args_dict["write_deeplc_pickle"],
+            write_ms2pip_pickle=args_dict["write_ms2pip_pickle"],
+            write_correlation_pickles=args_dict["write_correlation_pickles"],
+            write_full_search_pickle=args_dict["write_full_search_pickle"],
+            read_deeplc_pickle=args_dict["read_deeplc_pickle"],
+            read_ms2pip_pickle=args_dict["read_ms2pip_pickle"],
+            read_correlation_pickles=args_dict["read_correlation_pickles"],
+            read_full_search_pickle=args_dict["read_full_search_pickle"],
             dir=result_dir,
         )
 
-    if args.read_full_search_pickle:
+    if args_dict["read_full_search_pickle"]:
         (
             df_fragment,
             df_psms,
@@ -323,7 +351,7 @@ def main():
             dlc_transfer_learn,
             flags,
         ) = read_variables_from_pickles(dir=result_dir)
-        args.update(flags)
+        args_dict.update(flags)
 
     mumdia.main(
         df_fragment=df_fragment,
@@ -332,14 +360,14 @@ def main():
         df_fragment_max_peptide=df_fragment_max_peptide,
         config=config,
         deeplc_model=dlc_transfer_learn,
-        write_deeplc_pickle=args.write_deeplc_pickle,
-        write_ms2pip_pickle=args.write_ms2pip_pickle,
-        read_deeplc_pickle=args.read_deeplc_pickle,
-        read_ms2pip_pickle=args.read_ms2pip_pickle,
+        write_deeplc_pickle=args_dict["write_deeplc_pickle"],
+        write_ms2pip_pickle=args_dict["write_ms2pip_pickle"],
+        read_deeplc_pickle=args_dict["read_deeplc_pickle"],
+        read_ms2pip_pickle=args_dict["read_ms2pip_pickle"],
     )
 
-    if args.remove_intermediate_files:
-        remove_intermediate_files(args.result_dir)
+    if args_dict["remove_intermediate_files"]:
+        remove_intermediate_files(args_dict["result_dir"])
 
 
 if __name__ == "__main__":
