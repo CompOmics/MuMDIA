@@ -1,18 +1,15 @@
+#!/usr/bin/env python
+import os
+import logging
 from tqdm import tqdm
 import numpy as np
 import polars as pl
-from tqdm import tqdm
 import mokapot
-from concurrent.futures import ProcessPoolExecutor
-from multiprocessing import Manager
-import logging
-import os
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from sklearn.neural_network import MLPClassifier
-from typing import Tuple, List
+from typing import List
 from sklearn.linear_model import Lasso
-from prediction_wrappers.wrapper_deeplc import (
-    get_predictions_retention_time_mainloop,
-)
+from prediction_wrappers.wrapper_deeplc import get_predictions_retention_time_mainloop
 from feature_generators.features_retention_time import add_retention_time_features
 from feature_generators.features_general import add_count_and_filter_peptides
 from feature_generators.features_fragment_intensity import (
@@ -22,51 +19,130 @@ from prediction_wrappers.wrapper_ms2pip import (
     get_predictions_fragment_intensity_main_loop,
     get_predictions_fragment_intensity,
 )
-
-import concurrent.futures
-from concurrent.futures import ProcessPoolExecutor
-from concurrent.futures import ProcessPoolExecutor
-from typing import Tuple, List
-import polars as pl
-from tqdm import tqdm
-
-from copy import deepcopy
-
-os.environ["POLARS_MAX_THREADS"] = "1"
-
-# TODO make a logger module in a seperate file
-from utilities.logger import log_info
-
-from typing import Any
 import xgboost as xgb
 from mokapot.model import PercolatorModel
-
-from prediction_wrappers.wrapper_ms2pip import (
-    get_predictions_fragment_intensity_main_loop,
-)
-from prediction_wrappers.wrapper_deeplc import (
-    get_predictions_retention_time_mainloop,
-)
-
-
 from keras.models import Sequential
 from keras.layers import Dense
 from scikeras.wrappers import KerasClassifier
-
 from sklearn.model_selection import cross_val_score
+from copy import deepcopy
 
-from contextlib import contextmanager
+# Import numba and set up Numba decorators
+import numba as nb
 
+# Set maximum threads for Polars to one to avoid oversubscription
+os.environ["POLARS_MAX_THREADS"] = "1"
+
+# Configure logging
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+# Assumes that log_info is defined in utilities.logger.
+from utilities.logger import log_info
 
-# standard_features = ["SpecId", "Label", "ExpMass", "CalcMass", "Peptide", "ScanNr"]
+# Constant features for later concatenation.
 last_features = ["proteins"]
 
 
-# Function to create the Keras model
+#############################################
+# Numba-accelerated functions
+#############################################
+@nb.njit
+def numba_percentile(data, q):
+    """
+    Compute the q-th percentile of a 1D array using a simple linear interpolation.
+    q should be given as a float between 0 and 100.
+    """
+    n = data.shape[0]
+    if n == 0:
+        return 0.0
+    sorted_data = np.sort(data)
+    pos = (q / 100.0) * (n - 1)
+    lower = int(pos)
+    upper = lower if lower == n - 1 else lower + 1
+    weight = pos - lower
+    return sorted_data[lower] * (1.0 - weight) + sorted_data[upper] * weight
+
+
+@nb.njit
+def compute_percentiles_nb(data, qs):
+    """
+    Compute an array of percentiles given a 1D array and an array of q values.
+    """
+    m = qs.shape[0]
+    result = np.empty(m, dtype=np.float64)
+    for i in range(m):
+        result[i] = numba_percentile(data, qs[i])
+    return result
+
+
+@nb.njit
+def compute_top_nb(data, m):
+    """
+    Sort the array in descending order and return the first m values.
+    If there are fewer than m elements, pad with zeros.
+    """
+    n = data.shape[0]
+    sorted_data = np.sort(data)[::-1]
+    result = np.empty(m, dtype=np.float64)
+    for i in range(m):
+        if i < n:
+            result[i] = sorted_data[i]
+        else:
+            result[i] = 0.0
+    return result
+
+
+@nb.njit
+def corr_np_nb(data1, data2):
+    """
+    Compute the Pearson correlation coefficient between two 1D arrays.
+    """
+    n = data1.shape[0]
+    sum1 = 0.0
+    sum2 = 0.0
+    for i in range(n):
+        sum1 += data1[i]
+        sum2 += data2[i]
+    mean1 = sum1 / n
+    mean2 = sum2 / n
+
+    cov = 0.0
+    var1 = 0.0
+    var2 = 0.0
+    for i in range(n):
+        diff1 = data1[i] - mean1
+        diff2 = data2[i] - mean2
+        cov += diff1 * diff2
+        var1 += diff1 * diff1
+        var2 += diff2 * diff2
+    std1 = (var1 / n) ** 0.5
+    std2 = (var2 / n) ** 0.5
+    return cov / n / (std1 * std2)
+
+
+@nb.njit
+def pearson_np_nb(x, y):
+    """
+    Compute the Pearson correlation between a 2D array x and a 1D array y.
+    Returns a 1D array with the correlation for each column of x.
+    """
+    m = x.shape[1]
+    result = np.empty(m, dtype=np.float64)
+    for i in range(m):
+        result[i] = corr_np_nb(x[:, i], y)
+    return result
+
+
+#############################################
+# End of Numba functions
+#############################################
+
+
 def create_model():
+    """
+    Create and compile a simple Keras model.
+    """
     model = Sequential()
-    model.add(Dense(100, input_dim=169, activation="relu"))
+    model.add(Dense(100, input_dim=124, activation="relu"))
     model.add(Dense(20, activation="relu"))
     model.add(Dense(10, activation="relu"))
     model.add(Dense(1, activation="sigmoid"))
@@ -76,75 +152,38 @@ def create_model():
 
 def transform_bool(value: bool) -> int:
     """
-    Transform a boolean value to an integer.
-
-    Parameters:
-    - value (bool): A boolean value.
-
-    Returns:
-    - int: Returns -1 if the value is True, else 1.
+    Return -1 if True, otherwise 1.
     """
     return -1 if value else 1
 
 
-def run_mokapot() -> None:
+def run_mokapot(output_dir="results/") -> None:
     """
-    Run the mokapot analysis on PSMs (Peptide-Spectrum Matches) read from a PIN file.
-    The results are saved in tab-delimited text files.
-
-    Side effects:
-    - Reads PSMs from "outfile.pin".
-    - Saves the analysis results in "mokapot.psms.txt" and "mokapot.peptides.txt".
+    Run the mokapot analysis on PSMs read from a PIN file.
+    The results are saved to tab-delimited text files.
     """
-    # Read the PSMs from the PIN file:
     psms = mokapot.read_pin("outfile.pin")
-
-    # model = MLPClassifier(hidden_layer_sizes=(10, 5, 5, 5), max_iter=50)
-    # Wrap the model with KerasClassifier
-    model = KerasClassifier(
-        build_fn=create_model, epochs=100, batch_size=1000, verbose=10
-    )
-
-    results, models = mokapot.brew(psms, mokapot.Model(model), folds=5)
-    # model = xgb.XGBClassifier(n_estimators=100, max_depth=8, learning_rate=0.1)
-    # results, models = mokapot.brew(
-    #    psms, mokapot.Model(model, max_iter=25), max_workers=20, folds=10
+    # model = KerasClassifier(
+    #    build_fn=create_model, epochs=100, batch_size=1000, verbose=10
     # )
-    # model = create_model()
-    # Conduct the mokapot analysis:
-    # results, models = mokapot.brew(psms, model, folds=3)
+    results, models = mokapot.brew(psms)  # mokapot.Model(model), folds=3
+    result_files = results.to_txt(dest_dir=output_dir)
+    print(result_files)
 
-    # Save the results to two tab-delimited files
-    # "mokapot.psms.txt" and "mokapot.peptides.txt"
-    result_files = results.to_txt()
-
-
-# https://stackoverflow.com/questions/73658716/how-to-calculate-correlation-between-1d-numpy-array-and-every-column-of-a-2d-num
-def corr_np(data1, data2):
-    mean1 = data1.mean()
-    mean2 = data2.mean()
-    std1 = data1.std()
-    std2 = data2.std()
-    corr = ((data1 * data2).mean() - mean1 * mean2) / (std1 * std2)
-    return corr
-
-
-def pearson_np(x, y):
-    return np.array([corr_np(x[:, i], y) for i in range(x.shape[1])])
-
-
-import numpy as np
+    input()
 
 
 def collapse_columns(
     df_psms_sub_peptidoform: pl.DataFrame,
-    collapse_max_columns: list[str] = [],
-    collapse_min_columns: list[str] = [],
-    collapse_mean_columns: list[str] = [],
-    collapse_sum_columns: list[str] = [],
-    get_first_entry: list[str] = [],
+    collapse_max_columns: List[str] = [],
+    collapse_min_columns: List[str] = [],
+    collapse_mean_columns: List[str] = [],
+    collapse_sum_columns: List[str] = [],
+    get_first_entry: List[str] = [],
 ):
-    # Combine operations into a single loop to reduce redundancy
+    """
+    Collapse columns using max, min, mean, and sum operations.
+    """
     collapsed_columns = [df_psms_sub_peptidoform.select(get_first_entry).head(1)]
     operations = (
         ("max", collapse_max_columns),
@@ -153,345 +192,47 @@ def collapse_columns(
         ("sum", collapse_sum_columns),
     )
     for op, collapse_list in operations:
-        collapsed_columns.append(
-            getattr(df_psms_sub_peptidoform[collapse_list], op)().rename(
-                {col: f"{col}_{op}" for col in collapse_list}
+        if collapse_list:
+            collapsed_columns.append(
+                getattr(df_psms_sub_peptidoform[collapse_list], op)().rename(
+                    {col: f"{col}_{op}" for col in collapse_list}
+                )
             )
-        )
-
-    # Use Polars concat for efficient horizontal concatenation
     return pl.concat(collapsed_columns, how="horizontal")
 
 
-def add_feature_columns(data, feature_name, values, method, pad_size=10):
-    if len(data) == 0:
-        data = np.zeros(pad_size)
+def add_feature_columns_nb(data, feature_name, values, method, pad_size=10):
+    """
+    Compute a feature vector from the input data using Numba-accelerated routines.
+    Returns a dictionary mapping column names to computed scalar values.
+    """
+    data = np.asarray(data, dtype=np.float64)
+    required_length = len(values)
+    if data.size == 0:
+        computed = np.zeros(required_length, dtype=np.float64)
     elif method == "percentile":
-        if type(data[0]) != np.float64:
-            data = np.concatenate(data)
-        data = np.percentile(data, values)
-        data = np.pad(data, (0, pad_size), mode="constant", constant_values=0.0)
+        qs = np.array(values, dtype=np.float64)
+        computed = compute_percentiles_nb(data, qs)
     elif method == "top":
-        if type(data[0]) != np.float64:
-            data = np.concatenate(data)
-        data = np.sort(data, kind="heapsort", axis=None)[::-1]
-        data = np.pad(data, (0, pad_size), mode="constant", constant_values=0.0)
-
-    column_names = [f"{feature_name}_{v}" for v in values]
-    return pl.DataFrame({column_names[i]: data[i] for i in range(len(column_names))})
-
-
-def run_peptidoform(
-    df_psms_sub_peptidoform: pl.DataFrame,
-    correlations_list: list[float],
-    selected_features: List[str] = [],
-    collect_distributions: list[int] = [
-        0,
-        5,
-        10,
-        15,
-        20,
-        25,
-        30,
-        35,
-        40,
-        45,
-        50,
-        55,
-        60,
-        65,
-        70,
-        75,
-        80,
-        85,
-        90,
-        95,
-        100,
-    ],
-    collect_top: list[int] = [
-        1,
-        2,
-        3,
-        4,
-        5,
-        6,
-        7,
-        8,
-        9,
-        10,
-    ],
-    collapse_max_columns: list[str] = [
-        "fragment_ppm",
-        "rank",
-        "delta_next",
-        "delta_rt_model",
-        "matched_peaks",
-        "longest_b",
-        "longest_y",
-        "matched_intensity_pct",
-        "fragment_intensity",
-        "poisson",
-        "spectrum_q",
-        "peptide_q",
-        "rt",
-        "rt_predictions",
-        "rt_prediction_error_abs",
-        "rt_prediction_error_abs_relative",
-        "precursor_ppm",
-        "hyperscore",
-        "delta_best",
-    ],
-    collapse_min_columns: list[str] = [
-        "fragment_ppm",
-        "rank",
-        "delta_next",
-        "delta_rt_model",
-        "matched_peaks",
-        "longest_b",
-        "longest_y",
-        "matched_intensity_pct",
-        "fragment_intensity",
-        "poisson",
-        "spectrum_q",
-        "peptide_q",
-        "rt",
-        "rt_predictions",
-        "rt_prediction_error_abs",
-        "rt_prediction_error_abs_relative",
-        "precursor_ppm",
-        "hyperscore",
-        "delta_best",
-    ],
-    collapse_mean_columns: list[str] = [
-        "fragment_ppm",
-        "rank",
-        "delta_next",
-        "delta_rt_model",
-        "matched_peaks",
-        "longest_b",
-        "longest_y",
-        "matched_intensity_pct",
-        "fragment_intensity",
-        "poisson",
-        "spectrum_q",
-        "peptide_q",
-        "rt",
-        "rt_predictions",
-        "rt_prediction_error_abs",
-        "rt_prediction_error_abs_relative",
-        "precursor_ppm",
-        "hyperscore",
-        "delta_best",
-    ],
-    collapse_sum_columns: list[str] = [
-        "hyperscore",
-        "delta_rt_model",
-        "matched_peaks",
-        "longest_b",
-        "longest_y",
-        "matched_intensity_pct",
-        "fragment_intensity",
-        "rt",
-        "rt_predictions",
-        "rt_prediction_error_abs",
-        "rt_prediction_error_abs_relative",
-        "precursor_ppm",
-        "fragment_ppm",
-        "delta_next",
-        "delta_best",
-    ],
-    get_first_entry: list[str] = [
-        "psm_id",
-        "filename",
-        "scannr",
-        "peptide",
-        "num_proteins",
-        "proteins",
-        "expmass",
-        "calcmass",
-        "is_decoy",
-        "charge",
-        "peptide_len",
-        "missed_cleavages",
-    ],
-    pad_size=10,
-) -> pl.DataFrame:
-    """
-    Process peptidoform data to enrich it with correlation and other calculated features.
-
-    Parameters:
-    - df_psms_sub_peptidoform (pl.DataFrame): DataFrame containing PSMs data.
-    - df_fragment_sub_peptidoform (pl.DataFrame): DataFrame containing fragment data.
-    - correlations_list (list[float]): List of correlation values.
-
-    Returns:
-    - pl.DataFrame: Enriched DataFrame with additional features.
-    """
-
-    # Perform bulk operations for max, min, mean, and sum
-    distribution_features = [
-        v for v in selected_features if v.startswith("distribution_")
-    ]
-    distribution_features_with_percentile = [
-        dist_f + "_" + str(v)
-        for dist_f in distribution_features
-        for v in collect_distributions
-    ]
-
-    top_features = [v for v in selected_features if v.startswith("top_")]
-    top_features_with_percentile = [
-        dist_f + "_" + str(v) for dist_f in top_features for v in collect_top
-    ]
-
-    df_psms_sub_peptidoform_collapsed = collapse_columns(
-        df_psms_sub_peptidoform,
-        collapse_max_columns=collapse_max_columns,
-        collapse_min_columns=collapse_min_columns,
-        collapse_mean_columns=collapse_mean_columns,
-        collapse_sum_columns=collapse_sum_columns,
-        get_first_entry=get_first_entry,
-    )
-
-    # Update selected features
-    selected_features = [
-        v for v in list(df_psms_sub_peptidoform_collapsed.columns) if v != "proteins"
-    ]
-
-    correlations, correlation_matrix_psm_ids, correlation_matrix_frag_ids = (
-        correlations_list
-    )
-
-    df_psms_sub_peptidoform_collapsed = df_psms_sub_peptidoform_collapsed.with_columns(
-        pl.concat(
-            [
-                add_feature_columns(
-                    correlation_matrix_psm_ids,
-                    "distribution_correlation_matrix_psm_ids",
-                    collect_distributions,
-                    "percentile",
-                    pad_size=len(collect_distributions),
-                ),
-                add_feature_columns(
-                    correlation_matrix_frag_ids,
-                    "distribution_correlation_matrix_frag_ids",
-                    collect_distributions,
-                    "percentile",
-                    pad_size=len(collect_distributions),
-                ),
-                add_feature_columns(
-                    correlations,
-                    "distribution_correlation_individual",
-                    collect_distributions,
-                    "percentile",
-                    pad_size=len(collect_distributions),
-                ),
-                add_feature_columns(
-                    correlation_matrix_psm_ids,
-                    "top_correlation_matrix_psm_ids",
-                    collect_top,
-                    "top",
-                    pad_size,
-                ),
-                add_feature_columns(
-                    correlation_matrix_frag_ids,
-                    "top_correlation_matrix_frag_ids",
-                    collect_top,
-                    "top",
-                    pad_size,
-                ),
-                add_feature_columns(
-                    correlations,
-                    "top_correlation_individual",
-                    collect_top,
-                    "top",
-                    pad_size,
-                ),
-            ],
-            how="horizontal",
-        )
-    )
-
-    df_psms_sub_peptidoform_collapsed = df_psms_sub_peptidoform_collapsed.with_columns(
-        pl.when(pl.col("is_decoy")).then(-1).otherwise(1).alias("is_decoy")
-    )
-
-    df_psms_sub_peptidoform_collapsed = df_psms_sub_peptidoform_collapsed.with_columns(
-        pl.Series(
-            "SpecId",
-            df_psms_sub_peptidoform_collapsed["psm_id"]
-            + "|"
-            + df_psms_sub_peptidoform_collapsed["filename"]
-            + "|"
-            + df_psms_sub_peptidoform_collapsed["scannr"],
-        )
-    )
-
-    columns_for_pin = ["SpecId"]
-    columns_for_pin.extend(
-        [
-            v
-            for v in selected_features
-            if not v.startswith("distribution_") and not v.startswith("top_")
-        ]
-    )
-    columns_for_pin.extend(distribution_features_with_percentile)
-    columns_for_pin.extend(top_features_with_percentile)
-    columns_for_pin.extend(last_features)
-
-    # shape of elution
-    # number of matches
-    # time of profile
-    # order conservation
-    # number of peaks
-    # number of peaks matched
-    # apex squared error
-    # MS1 peak present
-    # MS1 correlation
-    # MS1 correlation with MS2
-
-    # TODO the renaming, dropping, filling, and cloning can be done later in the pipeline this is more efficient
-    return df_psms_sub_peptidoform_collapsed[columns_for_pin]
+        computed = compute_top_nb(data, required_length)
+    else:
+        raise ValueError(f"Unknown method: {method}")
+    # Ensure computed is of the required length
+    if computed.size < required_length:
+        padded = np.zeros(required_length, dtype=np.float64)
+        padded[: computed.size] = computed
+        computed = padded
+    else:
+        computed = computed[:required_length]
+    return {f"{feature_name}_{v}": computed[i] for i, v in enumerate(values)}
 
 
 def run_peptidoform_df(
     df_psms_sub_peptidoform: pl.DataFrame,
     selected_features: List[str] = [],
-    collect_distributions: list[int] = [
-        0,
-        5,
-        10,
-        15,
-        20,
-        25,
-        30,
-        35,
-        40,
-        45,
-        50,
-        55,
-        60,
-        65,
-        70,
-        75,
-        80,
-        85,
-        90,
-        95,
-        100,
-    ],
-    collect_top: list[int] = [
-        1,
-        2,
-        3,
-        4,
-        5,
-        6,
-        7,
-        8,
-        9,
-        10,
-    ],
-    collapse_max_columns: list[str] = [
+    collect_distributions: List[int] = [0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100],
+    collect_top: List[int] = [1, 2, 3, 4, 5],
+    collapse_max_columns: List[str] = [
         "fragment_ppm",
         "rank",
         "delta_next",
@@ -512,7 +253,7 @@ def run_peptidoform_df(
         "hyperscore",
         "delta_best",
     ],
-    collapse_min_columns: list[str] = [
+    collapse_min_columns: List[str] = [
         "fragment_ppm",
         "rank",
         "delta_next",
@@ -533,7 +274,7 @@ def run_peptidoform_df(
         "hyperscore",
         "delta_best",
     ],
-    collapse_mean_columns: list[str] = [
+    collapse_mean_columns: List[str] = [
         "fragment_ppm",
         "rank",
         "delta_next",
@@ -554,7 +295,7 @@ def run_peptidoform_df(
         "hyperscore",
         "delta_best",
     ],
-    collapse_sum_columns: list[str] = [
+    collapse_sum_columns: List[str] = [
         "hyperscore",
         "delta_rt_model",
         "matched_peaks",
@@ -571,7 +312,7 @@ def run_peptidoform_df(
         "delta_next",
         "delta_best",
     ],
-    get_first_entry: list[str] = [
+    get_first_entry: List[str] = [
         "psm_id",
         "filename",
         "scannr",
@@ -587,32 +328,8 @@ def run_peptidoform_df(
     ],
 ) -> pl.DataFrame:
     """
-    Process peptidoform data to enrich it with correlation and other calculated features.
-
-    Parameters:
-    - df_psms_sub_peptidoform (pl.DataFrame): DataFrame containing PSMs data.
-    - df_fragment_sub_peptidoform (pl.DataFrame): DataFrame containing fragment data.
-    - correlations_list (list[float]): List of correlation values.
-
-    Returns:
-    - pl.DataFrame: Enriched DataFrame with additional features.
+    Process a peptidoform DataFrame to add calculated features.
     """
-
-    # Perform bulk operations for max, min, mean, and sum
-    distribution_features = [
-        v for v in selected_features if v.startswith("distribution_")
-    ]
-    distribution_features_with_percentile = [
-        dist_f + "_" + str(v)
-        for dist_f in distribution_features
-        for v in collect_distributions
-    ]
-
-    top_features = [v for v in selected_features if v.startswith("top_")]
-    top_features_with_percentile = [
-        dist_f + "_" + str(v) for dist_f in top_features for v in collect_top
-    ]
-
     df_psms_sub_peptidoform_collapsed = collapse_columns(
         df_psms_sub_peptidoform,
         collapse_max_columns=collapse_max_columns,
@@ -621,11 +338,9 @@ def run_peptidoform_df(
         collapse_sum_columns=collapse_sum_columns,
         get_first_entry=get_first_entry,
     )
-
     df_psms_sub_peptidoform_collapsed = df_psms_sub_peptidoform_collapsed.with_columns(
         pl.when(pl.col("is_decoy")).then(-1).otherwise(1).alias("is_decoy")
     )
-
     df_psms_sub_peptidoform_collapsed = df_psms_sub_peptidoform_collapsed.with_columns(
         pl.Series(
             "SpecId",
@@ -636,170 +351,87 @@ def run_peptidoform_df(
             + df_psms_sub_peptidoform_collapsed["scannr"],
         )
     )
-
-    columns_for_pin = ["SpecId"]
-    columns_for_pin.extend(
-        [
-            v
-            for v in selected_features
-            if not v.startswith("distribution_") and not v.startswith("top_")
-        ]
-    )
-    columns_for_pin.extend(distribution_features_with_percentile)
-    columns_for_pin.extend(top_features_with_percentile)
-    columns_for_pin.extend(last_features)
 
     return df_psms_sub_peptidoform_collapsed
 
 
 def run_peptidoform_correlation(
     correlations_list,
-    collect_distributions: list[int] = [
-        0,
-        5,
-        10,
-        15,
-        20,
-        25,
-        30,
-        35,
-        40,
-        45,
-        50,
-        55,
-        60,
-        65,
-        70,
-        75,
-        80,
-        85,
-        90,
-        95,
-        100,
-    ],
-    collect_top: list[int] = [
-        1,
-        2,
-        3,
-        4,
-        5,
-        6,
-        7,
-        8,
-        9,
-        10,
-    ],
+    collect_distributions: List[int] = [0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100],
+    collect_top: List[int] = [1, 2, 3, 4, 5],
     pad_size=10,
 ):
+    """
+    Compute correlation-based features and return a one-row Polars DataFrame.
+    """
     correlations, correlation_matrix_psm_ids, correlation_matrix_frag_ids = (
         correlations_list
     )
-
-    df_psms_sub_peptidoform_collapsed = pl.concat(
-        [
-            add_feature_columns(
-                correlation_matrix_psm_ids,
-                "distribution_correlation_matrix_psm_ids",
-                collect_distributions,
-                "percentile",
-                pad_size=len(collect_distributions),
-            ),
-            add_feature_columns(
-                correlation_matrix_frag_ids,
-                "distribution_correlation_matrix_frag_ids",
-                collect_distributions,
-                "percentile",
-                pad_size=len(collect_distributions),
-            ),
-            add_feature_columns(
-                correlations,
-                "distribution_correlation_individual",
-                collect_distributions,
-                "percentile",
-                pad_size=len(collect_distributions),
-            ),
-            add_feature_columns(
-                correlation_matrix_psm_ids,
-                "top_correlation_matrix_psm_ids",
-                collect_top,
-                "top",
-                pad_size,
-            ),
-            add_feature_columns(
-                correlation_matrix_frag_ids,
-                "top_correlation_matrix_frag_ids",
-                collect_top,
-                "top",
-                pad_size,
-            ),
-            add_feature_columns(
-                correlations,
-                "top_correlation_individual",
-                collect_top,
-                "top",
-                pad_size,
-            ),
-        ],
-        how="horizontal",
-    )
-
-    return df_psms_sub_peptidoform_collapsed
+    feature_dict = {}
+    params = [
+        (
+            correlation_matrix_psm_ids,
+            "distribution_correlation_matrix_psm_ids",
+            collect_distributions,
+            "percentile",
+            len(collect_distributions),
+        ),
+        (
+            correlation_matrix_frag_ids,
+            "distribution_correlation_matrix_frag_ids",
+            collect_distributions,
+            "percentile",
+            len(collect_distributions),
+        ),
+        (
+            correlations,
+            "distribution_correlation_individual",
+            collect_distributions,
+            "percentile",
+            len(collect_distributions),
+        ),
+        (
+            correlation_matrix_psm_ids,
+            "top_correlation_matrix_psm_ids",
+            collect_top,
+            "top",
+            pad_size,
+        ),
+        (
+            correlation_matrix_frag_ids,
+            "top_correlation_matrix_frag_ids",
+            collect_top,
+            "top",
+            pad_size,
+        ),
+        (correlations, "top_correlation_individual", collect_top, "top", pad_size),
+    ]
+    for data, feat_name, values, method, ps in params:
+        # Here, for percentiles and top values, we use the Numba-accelerated add_feature_columns_nb.
+        feature_dict.update(
+            add_feature_columns_nb(data, feat_name, values, method, pad_size=ps)
+        )
+    return pl.DataFrame(feature_dict)
 
 
 def dataframe_to_dict_fragintensity(df_fragment: pl.DataFrame) -> dict:
     """
-    Converts a DataFrame of fragment intensities into a dictionary.
-
-    Parameters:
-    - df_fragment (pl.DataFrame): A DataFrame containing fragment intensity data.
-
-    Returns:
-    - dict: A dictionary with PSM IDs as keys and corresponding DataFrames as values.
+    Convert a DataFrame of fragment intensities into a dictionary keyed by psm_id.
     """
     fragment_dict = {}
     for psm_id, sub_df_fragment in df_fragment.group_by("psm_id"):
         fragment_dict[psm_id] = sub_df_fragment
-
     return fragment_dict
 
 
-def run_peptidoform_wrapper(
-    args: Tuple[pl.DataFrame, pl.DataFrame, List[float], List[str]]
-) -> pl.DataFrame:
+def process_peptidoform(args):
     """
-    A small wrapper to call run_peptidoform() with the correct arguments.
+    Process a single peptidoform group by computing its feature DataFrames and concatenating them.
     """
-    (
-        df_psms_sub_peptidoform,
-        df_fragment_sub_peptidoform,
-        correlations_list,
-        selected_features,
-    ) = args
-    return run_peptidoform(
-        df_psms_sub_peptidoform,
-        correlations_list,
-        selected_features,
-    )
-
-
-def process_peptidoforms(
-    peptidoform_args: List[Tuple[pl.DataFrame, pl.DataFrame, List[float], List[str]]],
-    max_workers: int = 4,
-) -> List[pl.DataFrame]:
-    """
-    Execute run_peptidoform() in parallel for each peptidoform.
-    Returns a list of the resulting DataFrames.
-    """
-    results = []
-    with ProcessPoolExecutor(max_workers=max_workers) as executor:
-        # Map each peptidoform argument tuple to our wrapper
-        futures = [
-            executor.submit(run_peptidoform_wrapper, arg) for arg in peptidoform_args
-        ]
-        for f in concurrent.futures.as_completed(futures):
-            results.append(f.result())
-
-    return results
+    df_psms_sub_peptidoform, df_fragment_sub_peptidoform, correlations_list = args
+    df1 = run_peptidoform_df(df_psms_sub_peptidoform)
+    df2 = run_peptidoform_correlation(correlations_list)
+    return pl.concat([df1, df2], how="horizontal")
 
 
 def calculate_features(
@@ -818,38 +450,19 @@ def calculate_features(
     read_deeplc_pickle: bool = False,
     read_ms2pip_pickle: bool = False,
     read_correlation_pickles: bool = False,
-    parallel_workers: int = 156,
-    chunk_size: int = 10000,
+    parallel_workers: int = 24,  # Adjust to number of physical cores
+    chunk_size: int = 500,  # Increase chunk size to reduce overhead
 ) -> None:
     """
-    Process multiple peptidoforms in parallel using ProcessPoolExecutor.
-
-    Parameters:
-    - peptidoform_args (List[Tuple[pl.DataFrame, pl.DataFrame, List[float]]]): A list of arguments to pass to the peptidoform processing function.
-    - max_workers (int, optional): The maximum number of worker processes. Default is 2.
-
-    Returns:
-    - List[pl.DataFrame]: A list of DataFrames, each representing processed data for a peptidoform.
-    - df_fragment (pl.DataFrame): DataFrame containing fragment data.
-    - df_fragment_max (pl.DataFrame): DataFrame containing maximum fragment information.
-    - df_fragment_max_peptide (pl.DataFrame): DataFrame containing maximum fragment information for each peptide.
-    - filter_rel_rt_error (float, optional): The relative retention time error filter threshold. Default is 0.05.
-    - min_occurrences (int, optional): The minimum number of occurrences for a peptide to be included. Default is 0.
-    - filter_max_apex_rt (float, optional): The filter threshold for maximum apex retention time. Default is 5.0.
-
-    Side effects:
-    - Processes the DataFrames to calculate additional features and updates them in-place.
-    - Writes the results to a file "outfile.pin".
+    Process the PSM and fragment DataFrames, compute features, and save the output.
+    This function uses parallel processing with task chunking.
     """
     log_info("Obtaining retention time predictions for the main loop...")
-    dlc_calibration, dlc_transfer_learn, predictions_deeplc = (
-        get_predictions_retention_time_mainloop(
-            df_psms, write_deeplc_pickle, read_deeplc_pickle, deeplc_model
-        )
+    _, _, predictions_deeplc = get_predictions_retention_time_mainloop(
+        df_psms, write_deeplc_pickle, read_deeplc_pickle, deeplc_model
     )
 
     log_info("Obtaining features retention time...")
-    # TODO make it adjustable what features to include
     df_psms = add_retention_time_features(
         df_psms, predictions_deeplc, filter_rel_rt_error=0.2
     )
@@ -876,66 +489,38 @@ def calculate_features(
         write_correlation_pickles=write_correlation_pickles,
     )
 
-    #########
-    # Step 6: Go from peptidoform ID to subslice of the dataframe
-    #########
-    log_info("Step 6")
-
+    log_info("Step 6: Grouping peptidoforms by peptide and charge")
     psm_dict = {}
     for (peptidoform, charge), df_sub_peptidoform in tqdm(
         df_psms.group_by(["peptide", "charge"])
     ):
         psm_dict[f"{peptidoform}/{charge}"] = df_sub_peptidoform
 
+    # Pass data as-is (read-only) without deep copying.
     peptidoform_args = [
-        (
-            deepcopy(psm_dict[k]),
-            deepcopy(fragment_dict[k]),
-            deepcopy(correlations_fragment_dict[k]),
-        )
+        (psm_dict[k], fragment_dict[k], correlations_fragment_dict[k])
         for k in psm_dict.keys()
-        if k in correlations_fragment_dict.keys()
+        if k in correlations_fragment_dict
     ]
 
-    pin_in = []
-
-    # pin_in = process_peptidoforms(peptidoform_args)
-    #########
-    # Step 7: Calculate features for each peptidoform
-    #########
-
-    log_info("Step 7")
-
-    # pin_in = process_peptidoforms(peptidoform_args, max_workers=parallel_workers)
-    # pin_in = process_peptidoforms(peptidoform_args, max_workers=parallel_workers)
-
-    for (
-        df_psms_sub_peptidoform,
-        df_fragment_sub_peptidoform,
-        correlations_list,
-    ) in tqdm(peptidoform_args):
-        pin_in.append(
-            pl.concat(
-                [
-                    run_peptidoform_df(df_psms_sub_peptidoform),
-                    run_peptidoform_correlation(correlations_list),
-                ],
-                how="horizontal",
+    log_info("Step 7: Processing peptidoforms in parallel (with chunking)")
+    chunks = [
+        peptidoform_args[i : i + chunk_size]
+        for i in range(0, len(peptidoform_args), chunk_size)
+    ]
+    with ThreadPoolExecutor(max_workers=parallel_workers) as executor:
+        chunk_results = list(
+            tqdm(
+                executor.map(
+                    lambda chunk: [process_peptidoform(args) for args in chunk], chunks
+                ),
+                total=len(chunks),
+                desc="Processing chunks",
             )
         )
-        # pin_in.append(
-        #    run_peptidoform(
-        #        df_psms_sub_peptidoform,
-        #        correlations_list,
-        #        config["mumdia"]["rescoring_features"],
-        #    )
-        # )
-    # input()
-    #########
-    # Step 8: Concatenate the results
-    #########
-    log_info("Step 8")
+    pin_in = [item for sublist in chunk_results for item in sublist]
 
+    log_info("Step 8: Concatenating results")
     concatenated_df = (
         pl.concat(pin_in)
         .rename(
@@ -971,16 +556,6 @@ def main(
 ) -> None:
     """
     Main function to run the complete analysis pipeline.
-
-    Parameters:
-    - parquet_file_results (str): The file path for the parquet file containing results.
-    - parquet_file_fragments (str): The file path for the parquet file containing fragment data.
-    - q_value_filter (float, optional): The filter threshold for q-values. Default is 0.1.
-
-    Side effects:
-    - Reads data from the specified parquet files.
-    - Performs data processing and feature calculation.
-    - Outputs processed data to files and logs information about t he process.
     """
     df_psms = pl.DataFrame(df_psms)
     df_psms = df_psms.filter(~df_psms["peptide"].str.contains("U"))
@@ -1002,11 +577,10 @@ def main(
     )
 
     log_info("Done running MuMDIA...")
-
     run_mokapot()
 
 
 if __name__ == "__main__":
-    # main("results/results.sage.parquet", "results/matched_fragments.sage.parquet")
-    # print("going to run mokapot")
+    # In practice, load your input DataFrames (e.g., from parquet files) and then call main().
+    # For demonstration, we call run_mokapot().
     run_mokapot()

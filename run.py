@@ -46,7 +46,6 @@ from prediction_wrappers.wrapper_deeplc import retrain_and_bounds
 
 
 def parse_arguments():
-    # Create an argument parser
     parser = argparse.ArgumentParser()
 
     # Add arguments
@@ -71,6 +70,7 @@ def parse_arguments():
         help="The location of the config file",
         default="configs/config.json",
     )
+
     parser.add_argument(
         "--remove_intermediate_files",
         help="Flag to indicate if intermediate results should be removed",
@@ -80,99 +80,166 @@ def parse_arguments():
 
     parser.add_argument(
         "--write_initial_search_pickle",
-        help="Flag to indicate if all result pickles (including deeplc models) should be written",
+        help="Flag to indicate if all result pickles should be written",
         type=bool,
         default=True,
     )
 
     parser.add_argument(
         "--read_initial_search_pickle",
-        help="Flag to indicate if all result pickles (including deeplc models) should be read",
+        help="Flag to indicate if all result pickles should be read",
         type=bool,
         default=True,
     )
 
-    # Parse the command line arguments
+    parser.add_argument(
+        "--write_deeplc_pickle",
+        help="Flag to indicate if DeepLC pickles should be written",
+        type=bool,
+        default=True,
+    )
+
+    parser.add_argument(
+        "--write_ms2pip_pickle",
+        help="Flag to indicate if MS2PIP pickles should be written",
+        type=bool,
+        default=True,
+    )
+
+    parser.add_argument(
+        "--read_deeplc_pickle",
+        help="Flag to indicate if DeepLC pickles should be read",
+        type=bool,
+        default=True,
+    )
+
+    parser.add_argument(
+        "--read_ms2pip_pickle",
+        help="Flag to indicate if MS2PIP pickles should be read",
+        type=bool,
+        default=True,
+    )
+
+    parser.add_argument(
+        "--write_correlation_pickles",
+        help="Flag to indicate if correlation pickles should be written",
+        type=bool,
+        default=True,
+    )
+
+    parser.add_argument(
+        "--read_correlation_pickles",
+        help="Flag to indicate if correlation pickles should be read",
+        type=bool,
+        default=True,
+    )
+
+    parser.add_argument(
+        "--dlc_transfer_learn",
+        help="Flag to indicate if DeepLC should use transfer learning",
+        type=bool,
+        default=True,
+    )
+
+    parser.add_argument(
+        "--write_full_search_pickle",
+        help="Flag to indicate if the full search pickles should be written",
+        type=bool,
+        default=True,
+    )
+
+    parser.add_argument(
+        "--read_full_search_pickle",
+        help="Flag to indicate if the full search pickles should be read",
+        type=bool,
+        default=True,
+    )
+
+    # Additional possible configuration overrides from CLI
+    parser.add_argument(
+        "--sage_basic", help="Override sage basic settings in config", type=str
+    )
+    parser.add_argument(
+        "--mumdia_fdr", help="Override mumdia FDR setting in config", type=float
+    )
+
     return parser.parse_args()
 
 
+def modify_config(config_file, result_dir, **kwargs):
+    """
+    Modify the configuration file with command-line arguments and save it in the results folder.
+    Only updates the config if arguments are provided.
+
+    Args:
+        config_file (str): Original config file path.
+        result_dir (str): Path to the result directory.
+        **kwargs: Command-line arguments as key-value pairs.
+    Returns:
+        str: Path to the new saved config file.
+    """
+    with open(config_file, "r") as file:
+        config = json.load(file)
+
+    updated = False
+    for key, value in kwargs.items():
+        if value is not None:  # Update only if a new value is provided
+            keys = key.split(".")  # Allow nested keys
+            sub_config = config
+            for k in keys[:-1]:
+                sub_config = sub_config.setdefault(k, {})
+            if sub_config.get(keys[-1]) != value:
+                sub_config[keys[-1]] = value
+                updated = True
+
+    # Define new config path in results folder
+    new_config_path = os.path.join(result_dir, "updated_config.json")
+
+    if updated:
+        with open(new_config_path, "w") as file:
+            json.dump(config, file, indent=4)
+        log_info(f"Configuration updated and saved to {new_config_path}")
+    else:
+        log_info("No configuration changes made.")
+
+    return new_config_path  # Return path to the new config file
+
+
 def main():
-
     log_info("Parsing command line arguments...")
-    # Parse the command line arguments
     args = parse_arguments()
 
     log_info("Creating the result directory...")
-    # TODO overwrite configs supplied by the user
-    # modify_config(args.key, args.value, config=args.config_file)
-
     result_dir, result_temp, result_temp_results_initial_search = create_dirs(args)
 
-    log_info("Reading the configuration json file...")
-    # Read the config file
-    with open(args.config_file, "r") as file:
+    log_info("Updating configuration if needed and saving to results folder...")
+    new_config_file = modify_config(
+        args.config_file,
+        result_dir=args.result_dir,
+    )
+
+    log_info("Reading the updated configuration JSON file...")
+    with open(new_config_file, "r") as file:
         config = json.load(file)
 
-    run_sage(
-        config["sage_basic"],
-        args.fasta_file,
-        result_dir.joinpath(result_temp, result_temp_results_initial_search),
-    )
-
-    df_fragment, df_psms, df_fragment_max, df_fragment_max_peptide = parquet_reader(
-        parquet_file_results=result_dir.joinpath(
-            result_temp, result_temp_results_initial_search, "results.sage.parquet"
-        ),
-        parquet_file_fragments=result_dir.joinpath(
-            result_temp,
-            result_temp_results_initial_search,
-            "matched_fragments.sage.parquet",
-        ),
-        q_value_filter=config["mumdia"]["fdr_init_search"],
-    )
-
     if args.write_initial_search_pickle:
-        write_variables_to_pickles(
-            df_fragment=df_fragment,
-            df_psms=df_psms,
-            df_fragment_max=df_fragment_max,
-            df_fragment_max_peptide=df_fragment_max_peptide,
-            config=config,
-            dlc_transfer_learn=True,
-            write_deeplc_pickle=True,
-            write_ms2pip_pickle=True,
-            write_correlation_pickles=True,
-            dir=result_dir,
-            df_fragment_fname="df_fragment_basic.pkl",
-            df_psms_fname="df_psms_basic.pkl",
-            df_fragment_max_fname="df_fragment_max_basic.pkl",
-            df_fragment_max_peptide_fname="df_fragment_max_peptide_basic.pkl",
-            config_fname="config_basic.pkl",
-            dlc_transfer_learn_fname="dlc_transfer_learn_basic.pkl",
-            flags_fname="flags_basic.pkl",
+        run_sage(
+            config["sage_basic"],
+            args.fasta_file,
+            result_dir.joinpath(result_temp, result_temp_results_initial_search),
         )
 
-    peptides = tryptic_digest_pyopenms(args.fasta_file)
-
-    peptide_df, dlc_calibration, dlc_transfer_learn, perc_95 = retrain_and_bounds(
-        df_psms, peptides, result_dir=result_dir
-    )
-
-    mzml_dict = split_mzml_by_retention_time(
-        "LFQ_Orbitrap_AIF_Ecoli_01.mzML",
-        time_interval=perc_95,
-        dir_files="results/temp/",
-    )
-
-    df_fragment, df_psms, df_fragment_max, df_fragment_max_peptide = (
-        retention_window_searches(mzml_dict, peptide_df, config, perc_95)
-    )
-
-    log_info("Add the PSM identifier to fragments...")
-    df_fragment = df_fragment.join(
-        df_psms.select(["psm_id", "scannr"]), on="psm_id", how="left"
-    )
-    log_info("DONE - Add the PSM identifier to fragments...")
+        df_fragment, df_psms, df_fragment_max, df_fragment_max_peptide = parquet_reader(
+            parquet_file_results=result_dir.joinpath(
+                result_temp, result_temp_results_initial_search, "results.sage.parquet"
+            ),
+            parquet_file_fragments=result_dir.joinpath(
+                result_temp,
+                result_temp_results_initial_search,
+                "matched_fragments.sage.parquet",
+            ),
+            q_value_filter=config["mumdia"]["fdr_init_search"],
+        )
 
     if args.write_initial_search_pickle:
         write_variables_to_pickles(
@@ -181,10 +248,15 @@ def main():
             df_fragment_max=df_fragment_max,
             df_fragment_max_peptide=df_fragment_max_peptide,
             config=config,
-            dlc_transfer_learn=dlc_transfer_learn,
-            write_deeplc_pickle=True,
-            write_ms2pip_pickle=True,
-            write_correlation_pickles=True,
+            dlc_transfer_learn=args.dlc_transfer_learn,
+            write_deeplc_pickle=args.write_deeplc_pickle,
+            write_ms2pip_pickle=args.write_ms2pip_pickle,
+            write_correlation_pickles=args.write_correlation_pickles,
+            write_full_search_pickle=args.write_full_search_pickle,
+            read_deeplc_pickle=args.read_deeplc_pickle,
+            read_ms2pip_pickle=args.read_ms2pip_pickle,
+            read_correlation_pickles=args.read_correlation_pickles,
+            read_full_search_pickle=args.write_full_search_pickle,
             dir=result_dir,
         )
 
@@ -198,42 +270,50 @@ def main():
             dlc_transfer_learn,
             flags,
         ) = read_variables_from_pickles(dir=result_dir)
+        args.update(flags)
 
-    mumdia.main(
-        df_fragment=df_fragment,
-        df_psms=df_psms,
-        df_fragment_max=df_fragment_max,
-        df_fragment_max_peptide=df_fragment_max_peptide,
-        config=config,
-        deeplc_model=dlc_transfer_learn,
-        write_deeplc_pickle=True,
-        write_ms2pip_pickle=True,
-        read_deeplc_pickle=False,
-        read_ms2pip_pickle=False,
-    )
+    if args.write_full_search_pickle:
+        peptides = tryptic_digest_pyopenms(args.fasta_file)
 
-    # Remove intermediate files if specified
-    if args.remove_intermediate_files:
-        remove_intermediate_files(args.result_dir)
+        peptide_df, dlc_calibration, dlc_transfer_learn, perc_95 = retrain_and_bounds(
+            df_psms, peptides, result_dir=result_dir
+        )
 
+        mzml_dict = split_mzml_by_retention_time(
+            "LFQ_Orbitrap_AIF_Ecoli_01.mzML",
+            time_interval=perc_95,
+            dir_files="results/temp/",
+        )
 
-def main_read_initial():
-    log_info("Parsing command line arguments...")
-    # Parse the command line arguments
-    args = parse_arguments()
+        df_fragment, df_psms, df_fragment_max, df_fragment_max_peptide = (
+            retention_window_searches(mzml_dict, peptide_df, config, perc_95)
+        )
 
-    log_info("Creating the result directory...")
-    # TODO overwrite configs supplied by the user
-    # modify_config(args.key, args.value, config=args.config_file)
+        log_info("Adding the PSM identifier to fragments...")
+        df_fragment = df_fragment.join(
+            df_psms.select(["psm_id", "scannr"]), on="psm_id", how="left"
+        )
 
-    result_dir, result_temp, result_temp_results_initial_search = create_dirs(args)
+    if args.write_full_search_pickle:
+        write_variables_to_pickles(
+            df_fragment=df_fragment,
+            df_psms=df_psms,
+            df_fragment_max=df_fragment_max,
+            df_fragment_max_peptide=df_fragment_max_peptide,
+            config=config,
+            dlc_transfer_learn=args.dlc_transfer_learn,
+            write_deeplc_pickle=args.write_deeplc_pickle,
+            write_ms2pip_pickle=args.write_ms2pip_pickle,
+            write_correlation_pickles=args.write_correlation_pickles,
+            write_full_search_pickle=args.write_full_search_pickle,
+            read_deeplc_pickle=args.read_deeplc_pickle,
+            read_ms2pip_pickle=args.read_ms2pip_pickle,
+            read_correlation_pickles=args.read_correlation_pickles,
+            read_full_search_pickle=args.write_full_search_pickle,
+            dir=result_dir,
+        )
 
-    log_info("Reading the configuration json file...")
-    # Read the config file
-    with open(args.config_file, "r") as file:
-        config = json.load(file)
-
-    if args.read_initial_search_pickle:
+    if args.read_full_search_pickle:
         (
             df_fragment,
             df_psms,
@@ -243,6 +323,7 @@ def main_read_initial():
             dlc_transfer_learn,
             flags,
         ) = read_variables_from_pickles(dir=result_dir)
+        args.update(flags)
 
     mumdia.main(
         df_fragment=df_fragment,
@@ -251,64 +332,16 @@ def main_read_initial():
         df_fragment_max_peptide=df_fragment_max_peptide,
         config=config,
         deeplc_model=dlc_transfer_learn,
-        write_deeplc_pickle=True,
-        write_ms2pip_pickle=True,
-        read_deeplc_pickle=False,
-        read_ms2pip_pickle=False,
+        write_deeplc_pickle=args.write_deeplc_pickle,
+        write_ms2pip_pickle=args.write_ms2pip_pickle,
+        read_deeplc_pickle=args.read_deeplc_pickle,
+        read_ms2pip_pickle=args.read_ms2pip_pickle,
     )
 
-    # Remove intermediate files if specified
-    if args.remove_intermediate_files:
-        remove_intermediate_files(args.result_dir)
-
-
-def main_read_initial_skip_pred():
-    log_info("Parsing command line arguments...")
-    # Parse the command line arguments
-    args = parse_arguments()
-
-    log_info("Creating the result directory...")
-    # TODO overwrite configs supplied by the user
-    # modify_config(args.key, args.value, config=args.config_file)
-
-    result_dir, result_temp, result_temp_results_initial_search = create_dirs(args)
-
-    log_info("Reading the configuration json file...")
-    # Read the config file
-    with open(args.config_file, "r") as file:
-        config = json.load(file)
-
-    if args.read_initial_search_pickle:
-        (
-            df_fragment,
-            df_psms,
-            df_fragment_max,
-            df_fragment_max_peptide,
-            config,
-            dlc_transfer_learn,
-            flags,
-        ) = read_variables_from_pickles(dir=result_dir)
-
-    mumdia.main(
-        df_fragment=df_fragment,
-        df_psms=df_psms,
-        df_fragment_max=df_fragment_max,
-        df_fragment_max_peptide=df_fragment_max_peptide,
-        config=config,
-        deeplc_model=dlc_transfer_learn,
-        write_deeplc_pickle=False,
-        write_ms2pip_pickle=False,
-        read_deeplc_pickle=True,
-        read_ms2pip_pickle=True,
-    )
-
-    # Remove intermediate files if specified
     if args.remove_intermediate_files:
         remove_intermediate_files(args.result_dir)
 
 
 if __name__ == "__main__":
-    # main_read_initial()
-    main_read_initial_skip_pred()
-    # main()
+    main()
     run_mokapot()
