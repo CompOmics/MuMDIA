@@ -128,7 +128,7 @@ def get_features_fragment_intensity(
         & (abs(pl.col("rt") - pl.col("rt_max_peptide_sub")) < filter_max_apex_rt)
     )
 
-    log_info("Starting to process peptidoforms...")
+    log_info("Calculation of all correlation values...")
 
     if not read_correlation_pickles:
         for (peptidoform, charge), df_fragment_sub_peptidoform in tqdm(
@@ -137,11 +137,9 @@ def get_features_fragment_intensity(
             preds = ms2pip_predictions.get(f"{peptidoform}/{charge}")
             if not preds:
                 continue
-
             if df_fragment_sub_peptidoform.shape[0] == 0:
                 continue
 
-            # Proceed with the rest of your code
             (
                 correlations,
                 correlation_matrix_psm_ids,

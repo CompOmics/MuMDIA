@@ -26,9 +26,34 @@ def write_variables_to_pickles(
     dlc_transfer_learn_fname="dlc_transfer_learn.pkl",
     flags_fname="flags.pkl",
     dir="./",
+    write_to_tsv=False,
 ):
     pickle_dir = Path(dir)
     create_directory(pickle_dir)
+
+    if write_to_tsv:
+        if df_fragment is not None:
+            df_fragment.write_csv(
+                pickle_dir.joinpath(df_fragment_fname.replace(".pkl", ".tsv")),
+                separator="\t",
+            )
+        if df_psms is not None:
+            df_psms.write_csv(
+                pickle_dir.joinpath(df_psms_fname.replace(".pkl", ".tsv")),
+                separator="\t",
+            )
+        if df_fragment_max is not None:
+            df_fragment_max.write_csv(
+                pickle_dir.joinpath(df_fragment_max_fname.replace(".pkl", ".tsv")),
+                separator="\t",
+            )
+        if df_fragment_max_peptide is not None:
+            df_fragment_max_peptide.write_csv(
+                pickle_dir.joinpath(
+                    df_fragment_max_peptide_fname.replace(".pkl", ".tsv")
+                ),
+                separator="\t",
+            )
 
     with open(pickle_dir.joinpath(df_fragment_fname), "wb") as f:
         pickle.dump(df_fragment, f)

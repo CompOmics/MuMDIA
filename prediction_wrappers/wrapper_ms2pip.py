@@ -98,6 +98,7 @@ def get_predictions_fragment_intensity_main_loop(
     """
     if not read_ms2pip_pickle:
         ms2pip_predictions = get_predictions_fragment_intensity(df_psms)
+
     if write_ms2pip_pickle:
         with open("ms2pip_predictions.pkl", "wb") as f:
             pickle.dump(ms2pip_predictions, f)

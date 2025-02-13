@@ -89,7 +89,7 @@ def retrain_deeplc(
 
     # Make a DeepLC object with the models trained previously
     dlc_transfer_learn = DeepLC(
-        batch_num=1024000, deeplc_retrain=True, n_epochs=200, n_jobs=64
+        batch_num=1024000, deeplc_retrain=True, n_epochs=75, n_jobs=64
     )
 
     # Perform calibration, make predictions and calculate metrics

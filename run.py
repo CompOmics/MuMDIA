@@ -44,6 +44,12 @@ from mumdia import run_mokapot
 
 from prediction_wrappers.wrapper_deeplc import retrain_and_bounds
 
+import os
+import sys
+import json
+import argparse
+from utilities.logger import log_info
+
 
 def parse_arguments():
     parser = argparse.ArgumentParser()
@@ -166,21 +172,37 @@ def parse_arguments():
     return parser, parser.parse_args()
 
 
-def modify_config(config_file, result_dir, parser, **kwargs):
+def was_arg_explicitly_provided(parser, arg_name):
     """
-    Modify the configuration file by ensuring all command-line arguments
-    go under the "mumdia" key and fall back to argparse defaults if missing.
+    Check if an argument with destination `arg_name` was explicitly provided on the command line.
+    """
+    for action in parser._actions:
+        if action.dest == arg_name:
+            for option in action.option_strings:
+                # If any of the option flags for this argument is present in sys.argv, consider it provided.
+                if option in sys.argv:
+                    return True
+    return False
+
+
+def modify_config(config_file, result_dir, parser, args):
+    """
+    Update the configuration JSON file with command-line overrides if and only if the user explicitly provided them.
+
+    This function loads an existing configuration (if any) and ensures that under the "mumdia" key,
+    only those parameters that the user has explicitly specified on the command line will override the JSON config.
+    Missing values are filled from argparse defaults.
 
     Args:
-        config_file (str): Original config file path.
+        config_file (str): Path to the original JSON configuration file.
         result_dir (str): Path to the result directory.
-        parser (argparse.ArgumentParser): The argparse parser to retrieve default values.
-        **kwargs: Command-line arguments as key-value pairs.
+        parser (argparse.ArgumentParser): The parser used to obtain default values and option strings.
+        args (argparse.Namespace): The parsed command-line arguments.
 
     Returns:
-        str: Path to the new saved config file.
+        str: Path to the updated configuration JSON file.
     """
-    # Load existing configuration
+    # Load existing configuration if it exists
     if os.path.exists(config_file):
         with open(config_file, "r") as file:
             config = json.load(file)
@@ -194,7 +216,7 @@ def modify_config(config_file, result_dir, parser, **kwargs):
     if "mumdia" not in config:
         config["mumdia"] = {}
 
-    # Get default values from argparse (Fix: Use parser, not args)
+    # Obtain default values from the parser for all arguments that have a default
     default_args = {
         action.dest: action.default
         for action in parser._actions
@@ -203,23 +225,22 @@ def modify_config(config_file, result_dir, parser, **kwargs):
 
     updated = False
 
-    # Ensure missing values inside "mumdia" are filled with argparse defaults
-    for key, default_value in default_args.items():
-        if key not in config["mumdia"]:  # Missing in config, use argparse default
-            config["mumdia"][key] = default_value
-            updated = True  # Mark as updated if we added a default value
-
-    # Apply command-line argument overrides if explicitly set
-    for key, value in kwargs.items():
-        if value is not None:  # Only overwrite if an argument is provided
+    # Update only those values that were explicitly provided by the user.
+    for key, value in vars(args).items():
+        if was_arg_explicitly_provided(parser, key):
+            # Only override if either the key is missing or the value differs.
             if key not in config["mumdia"] or config["mumdia"][key] != value:
                 config["mumdia"][key] = value
-                updated = True  # Mark as updated if a CLI override was applied
+                updated = True
+        else:
+            # If no value exists in the config, fill it with the argparse default.
+            if key not in config["mumdia"]:
+                config["mumdia"][key] = default_args.get(key, value)
+                updated = True
 
-    # Define new config path in results folder
+    # Define new config path in the results folder
     new_config_path = os.path.join(result_dir, "updated_config.json")
 
-    # Write to new file only if updates were made
     if updated:
         with open(new_config_path, "w") as file:
             json.dump(config, file, indent=4)
@@ -227,7 +248,7 @@ def modify_config(config_file, result_dir, parser, **kwargs):
     else:
         log_info("No configuration changes were made, using existing values.")
 
-    return new_config_path  # Return path to the updated config file
+    return new_config_path
 
 
 def main():
@@ -239,9 +260,7 @@ def main():
 
     log_info("Updating configuration if needed and saving to results folder...")
     new_config_file = modify_config(
-        args.config_file,
-        result_dir=args.result_dir,
-        parser=parser,
+        args.config_file, result_dir=args.result_dir, parser=parser, args=args
     )
 
     log_info("Reading the updated configuration JSON file...")
@@ -276,7 +295,7 @@ def main():
             df_fragment_max=df_fragment_max,
             df_fragment_max_peptide=df_fragment_max_peptide,
             config=config,
-            dlc_transfer_learn=args_dict["dlc_transfer_learn"],
+            dlc_transfer_learn=None,
             write_deeplc_pickle=args_dict["write_deeplc_pickle"],
             write_ms2pip_pickle=args_dict["write_ms2pip_pickle"],
             write_correlation_pickles=args_dict["write_correlation_pickles"],
@@ -285,7 +304,15 @@ def main():
             read_ms2pip_pickle=args_dict["read_ms2pip_pickle"],
             read_correlation_pickles=args_dict["read_correlation_pickles"],
             read_full_search_pickle=args_dict["read_full_search_pickle"],
+            df_fragment_fname="df_fragment_initial_search.pkl",
+            df_psms_fname="df_psms_initial_search.pkl",
+            df_fragment_max_fname="df_fragment_max_initial_search.pkl",
+            df_fragment_max_peptide_fname="df_fragment_max_peptide_initial_search.pkl",
+            config_fname="config_initial_search.pkl",
+            dlc_transfer_learn_fname="dlc_transfer_learn_initial_search.pkl",
+            flags_fname="flags_initial_search.pkl",
             dir=result_dir,
+            write_to_tsv=True,
         )
 
     if args_dict["read_initial_search_pickle"]:
@@ -298,6 +325,8 @@ def main():
             dlc_transfer_learn,
             flags,
         ) = read_variables_from_pickles(dir=result_dir)
+        del flags["write_full_search_pickle"]
+        del flags["read_full_search_pickle"]
         args_dict.update(flags)
 
     if args_dict["write_full_search_pickle"]:
@@ -329,7 +358,7 @@ def main():
             df_fragment_max=df_fragment_max,
             df_fragment_max_peptide=df_fragment_max_peptide,
             config=config,
-            dlc_transfer_learn=args_dict["dlc_transfer_learn"],
+            dlc_transfer_learn=dlc_transfer_learn,
             write_deeplc_pickle=args_dict["write_deeplc_pickle"],
             write_ms2pip_pickle=args_dict["write_ms2pip_pickle"],
             write_correlation_pickles=args_dict["write_correlation_pickles"],
@@ -339,6 +368,7 @@ def main():
             read_correlation_pickles=args_dict["read_correlation_pickles"],
             read_full_search_pickle=args_dict["read_full_search_pickle"],
             dir=result_dir,
+            write_to_tsv=True,
         )
 
     if args_dict["read_full_search_pickle"]:
@@ -353,6 +383,11 @@ def main():
         ) = read_variables_from_pickles(dir=result_dir)
         args_dict.update(flags)
 
+    log_info("Parsing the mzML file...")
+    ms1_dict, ms2_to_ms1_dict, ms2_spectra = get_ms1_mzml(
+        config["sage_basic"]["mzml_paths"][0]
+    )
+
     mumdia.main(
         df_fragment=df_fragment,
         df_psms=df_psms,
@@ -364,6 +399,8 @@ def main():
         write_ms2pip_pickle=args_dict["write_ms2pip_pickle"],
         read_deeplc_pickle=args_dict["read_deeplc_pickle"],
         read_ms2pip_pickle=args_dict["read_ms2pip_pickle"],
+        ms1_dict=ms1_dict,
+        ms2_to_ms1_dict=ms2_to_ms1_dict,
     )
 
     if args_dict["remove_intermediate_files"]:

@@ -38,6 +38,8 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 # Assumes that log_info is defined in utilities.logger.
 from utilities.logger import log_info
 
+import concurrent.futures
+
 # Constant features for later concatenation.
 last_features = ["proteins"]
 
@@ -168,9 +170,6 @@ def run_mokapot(output_dir="results/") -> None:
     # )
     results, models = mokapot.brew(psms)  # mokapot.Model(model), folds=3
     result_files = results.to_txt(dest_dir=output_dir)
-    print(result_files)
-
-    input()
 
 
 def collapse_columns(
@@ -241,17 +240,15 @@ def run_peptidoform_df(
         "longest_b",
         "longest_y",
         "matched_intensity_pct",
-        "fragment_intensity",
-        "poisson",
         "spectrum_q",
         "peptide_q",
-        "rt",
-        "rt_predictions",
-        "rt_prediction_error_abs",
         "rt_prediction_error_abs_relative",
         "precursor_ppm",
         "hyperscore",
-        "delta_best",
+        "protein_q",
+        "precursor_intensity_M",
+        "precursor_intensity_M+1",
+        "precursor_intensity_M-1",
     ],
     collapse_min_columns: List[str] = [
         "fragment_ppm",
@@ -273,44 +270,23 @@ def run_peptidoform_df(
         "precursor_ppm",
         "hyperscore",
         "delta_best",
+        "protein_q",
+        "precursor_intensity_M",
+        "precursor_intensity_M+1",
+        "precursor_intensity_M-1",
     ],
     collapse_mean_columns: List[str] = [
-        "fragment_ppm",
-        "rank",
-        "delta_next",
-        "delta_rt_model",
-        "matched_peaks",
-        "longest_b",
-        "longest_y",
-        "matched_intensity_pct",
-        "fragment_intensity",
-        "poisson",
         "spectrum_q",
         "peptide_q",
-        "rt",
-        "rt_predictions",
-        "rt_prediction_error_abs",
-        "rt_prediction_error_abs_relative",
-        "precursor_ppm",
-        "hyperscore",
-        "delta_best",
+        "protein_q",
+        "precursor_intensity_M",
+        "precursor_intensity_M+1",
+        "precursor_intensity_M-1",
     ],
     collapse_sum_columns: List[str] = [
-        "hyperscore",
-        "delta_rt_model",
-        "matched_peaks",
-        "longest_b",
-        "longest_y",
-        "matched_intensity_pct",
-        "fragment_intensity",
-        "rt",
-        "rt_predictions",
-        "rt_prediction_error_abs",
-        "rt_prediction_error_abs_relative",
-        "precursor_ppm",
-        "fragment_ppm",
-        "delta_next",
-        "delta_best",
+        "precursor_intensity_M",
+        "precursor_intensity_M+1",
+        "precursor_intensity_M-1",
     ],
     get_first_entry: List[str] = [
         "psm_id",
@@ -357,8 +333,14 @@ def run_peptidoform_df(
 
 def run_peptidoform_correlation(
     correlations_list,
-    collect_distributions: List[int] = [0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100],
-    collect_top: List[int] = [1, 2, 3, 4, 5],
+    collect_distributions: List[int] = [
+        0,
+        25,
+        50,
+        75,
+        100,
+    ],  # [0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100],
+    collect_top: List[int] = [1, 2, 3],  # [1, 2, 3, 4, 5],
     pad_size=10,
 ):
     """
@@ -434,13 +416,196 @@ def process_peptidoform(args):
     return pl.concat([df1, df2], how="horizontal")
 
 
+# TODO move to feature generators
+def find_mz_indices(spectrum, target_mz, ppm_tolerance=20):
+    """
+    Find indices in the sorted m/z array that are within a specified ppm tolerance of a target m/z value.
+
+    Parameters
+    ----------
+    spectrum : dict
+        Dictionary containing the spectrum data with keys 'mz', 'intensity', etc.
+    target_mz : float
+        The target m/z value to search for.
+    ppm_tolerance : float, optional
+        The tolerance in parts-per-million (default is 20 ppm).
+
+    Returns
+    -------
+    indices : numpy.ndarray
+        Array of indices in spectrum['mz'] that lie within the specified tolerance.
+    """
+    # Calculate the absolute tolerance
+    tol = target_mz * ppm_tolerance * 1e-6
+
+    # Define the lower and upper bounds of the m/z window
+    lower_bound = target_mz - tol
+    upper_bound = target_mz + tol
+
+    # Use np.searchsorted to determine the range of indices
+    mz_array = spectrum["mz"]
+    lower_index = np.searchsorted(mz_array, lower_bound, side="left")
+    upper_index = np.searchsorted(mz_array, upper_bound, side="right")
+
+    # Return all indices within the window
+    return np.arange(lower_index, upper_index)
+
+
+def find_all_three_isotopic_peaks(
+    spectrum,
+    target_mz,
+    charge,
+    ppm_tolerance=20,
+    isotope_mass_diff=1.0033548378,
+    return_intensity=False,
+):
+    """
+    Find indices for the target m/z value and its two neighboring isotopic peaks:
+    M–1, M, and M+1. If return_intensity is True, return the intensity value (max intensity)
+    corresponding to each peak instead of the indices.
+
+    Parameters
+    ----------
+    spectrum : dict
+        Dictionary containing the spectrum data with key 'mz' (a sorted NumPy array)
+        and 'intensity' (a NumPy array of intensities).
+    target_mz : float
+        The target m/z value (typically corresponding to the monoisotopic peak).
+    charge : int
+        The charge state of the peptide.
+    ppm_tolerance : float, optional
+        Tolerance in parts-per-million for matching (default is 20 ppm).
+    isotope_mass_diff : float, optional
+        The nominal mass difference between isotopes (default is 1.0033548378 Da).
+    return_intensity : bool, optional
+        If True, returns the intensity value (maximum intensity among the matching peaks)
+        instead of the indices.
+
+    Returns
+    -------
+    dict
+        A dictionary with keys 'M-1', 'M', and 'M+1'. Depending on return_intensity,
+        each key maps either to a NumPy array of indices or to a single intensity value.
+    """
+    # Calculate the spacing for the given charge.
+    spacing = isotope_mass_diff / charge
+
+    # Determine indices for the main and neighboring peaks.
+    main_indices = find_mz_indices(spectrum, target_mz, ppm_tolerance)
+    lower_indices = find_mz_indices(spectrum, target_mz - spacing, ppm_tolerance)
+    upper_indices = find_mz_indices(spectrum, target_mz + spacing, ppm_tolerance)
+
+    if return_intensity:
+        # Instead of indices, return the maximum intensity found within the tolerance window.
+        intensity_M = (
+            np.max(spectrum["intensity"][main_indices])
+            if main_indices.size > 0
+            else 0.0
+        )
+        intensity_M_minus = (
+            np.max(spectrum["intensity"][lower_indices])
+            if lower_indices.size > 0
+            else 0.0
+        )
+        intensity_M_plus = (
+            np.max(spectrum["intensity"][upper_indices])
+            if upper_indices.size > 0
+            else 0.0
+        )
+        return {"M-1": intensity_M_minus, "M": intensity_M, "M+1": intensity_M_plus}
+    else:
+        return {"M-1": lower_indices, "M": main_indices, "M+1": upper_indices}
+
+
+def add_precursor_intensities_optimized_parallel(
+    df_psms, ms1_dict, ms2_to_ms1_dict, max_workers=8
+):
+    # 1. Extract unique precursor combinations
+    unique_precursors = df_psms.select(["scannr", "charge", "calcmass"]).unique()
+
+    # 2. Define the function to compute intensities for a single row
+    def compute_intensities(row):
+        scannr, charge, calcmass = row["scannr"], row["charge"], row["calcmass"]
+        if scannr not in ms2_to_ms1_dict:
+            return {"M-1": 0.0, "M": 0.0, "M+1": 0.0}
+        spectrum = ms1_dict.get(ms2_to_ms1_dict[scannr], {})
+        if not spectrum:
+            return {"M-1": 0.0, "M": 0.0, "M+1": 0.0}
+        target_mz = (calcmass / charge) + 1.007276466812
+        return find_all_three_isotopic_peaks(
+            spectrum, target_mz, charge, return_intensity=True
+        )
+
+    # 3. Convert the unique precursors to a list of dictionaries for parallel processing.
+    rows = unique_precursors.to_dicts()
+
+    # 4. Use a thread pool to parallelize the intensity computations.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        intensities = list(executor.map(compute_intensities, rows))
+
+    # 5. Convert the list of intensity dictionaries to a DataFrame and merge back.
+    intensities_df = pl.DataFrame(intensities)
+    unique_precursors = unique_precursors.hstack(intensities_df)
+
+    # 6. Merge the computed intensities back into the original DataFrame.
+    df_psms = df_psms.join(unique_precursors, on=["scannr", "charge", "calcmass"])
+    return df_psms
+
+
+def add_precursor_intensities(df_psms, ms1_dict, ms2_to_ms1_dict):
+    """Efficiently add precursor intensity features using Polars vectorized operations."""
+
+    def extract_intensities(scannr, charge, calcmass):
+        if scannr not in ms2_to_ms1_dict:
+            return {"M-1": 0.0, "M": 0.0, "M+1": 0.0}  # Default if missing
+        spectrum = ms1_dict.get(ms2_to_ms1_dict[scannr], {})
+        if not spectrum:
+            return {"M-1": 0.0, "M": 0.0, "M+1": 0.0}  # Default if spectrum missing
+        target_mz = (calcmass / charge) + 1.007276466812
+        return find_all_three_isotopic_peaks(
+            spectrum, target_mz, charge, return_intensity=True
+        )
+
+    # Apply function using `.map_elements()`, storing result as a struct column
+    df_psms = df_psms.with_columns(
+        [
+            pl.struct(["scannr", "charge", "calcmass"])
+            .map_elements(
+                lambda row: extract_intensities(
+                    row["scannr"], row["charge"], row["calcmass"]
+                )
+            )
+            .alias("precursor_intensities")
+        ]
+    )
+
+    # Extract individual intensity values by using the correct field names
+    df_psms = df_psms.with_columns(
+        [
+            df_psms["precursor_intensities"]
+            .struct.field("M-1")
+            .alias("precursor_intensity_M-1"),
+            df_psms["precursor_intensities"]
+            .struct.field("M")
+            .alias("precursor_intensity_M"),
+            df_psms["precursor_intensities"]
+            .struct.field("M+1")
+            .alias("precursor_intensity_M+1"),
+        ]
+    ).drop(
+        "precursor_intensities"
+    )  # Drop struct column after extraction
+
+    return df_psms
+
+
 def calculate_features(
     df_psms: pl.DataFrame,
     df_fragment: pl.DataFrame,
     df_fragment_max: pl.DataFrame,
     df_fragment_max_peptide: pl.DataFrame,
     filter_rel_rt_error: float = 0.1,
-    min_occurrences: int = 10,
+    min_occurrences: int = 1,
     filter_max_apex_rt: float = 0.75,
     config: dict = {},
     deeplc_model=None,
@@ -452,6 +617,8 @@ def calculate_features(
     read_correlation_pickles: bool = False,
     parallel_workers: int = 24,  # Adjust to number of physical cores
     chunk_size: int = 500,  # Increase chunk size to reduce overhead
+    ms1_dict={},
+    ms2_to_ms1_dict={},
 ) -> None:
     """
     Process the PSM and fragment DataFrames, compute features, and save the output.
@@ -489,7 +656,14 @@ def calculate_features(
         write_correlation_pickles=write_correlation_pickles,
     )
 
+    log_info("Step 5: obtain MS1 peak presence")
+
+    df_psms = add_precursor_intensities_optimized_parallel(
+        df_psms, ms1_dict, ms2_to_ms1_dict
+    )
+
     log_info("Step 6: Grouping peptidoforms by peptide and charge")
+
     psm_dict = {}
     for (peptidoform, charge), df_sub_peptidoform in tqdm(
         df_psms.group_by(["peptide", "charge"])
@@ -553,6 +727,8 @@ def main(
     read_deeplc_pickle: bool = False,
     read_ms2pip_pickle: bool = False,
     read_correlation_pickles: bool = False,
+    ms1_dict={},
+    ms2_to_ms1_dict={},
 ) -> None:
     """
     Main function to run the complete analysis pipeline.
@@ -574,6 +750,8 @@ def main(
         read_correlation_pickles=read_correlation_pickles,
         deeplc_model=deeplc_model,
         config=config,
+        ms1_dict=ms1_dict,
+        ms2_to_ms1_dict=ms2_to_ms1_dict,
     )
 
     log_info("Done running MuMDIA...")
