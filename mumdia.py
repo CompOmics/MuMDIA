@@ -40,6 +40,8 @@ from utilities.logger import log_info
 
 import concurrent.futures
 
+from scipy import stats
+
 # Constant features for later concatenation.
 last_features = ["proteins"]
 
@@ -331,6 +333,209 @@ def run_peptidoform_df(
     return df_psms_sub_peptidoform_collapsed
 
 
+def pearson_pvalue(r, n):
+    """
+    Compute the two-tailed p-value for a Pearson correlation coefficient
+    given the sample size n.
+
+    Parameters
+    ----------
+    r : float
+        Pearson correlation coefficient.
+    n : int
+        Number of datapoints used in the correlation.
+
+    Returns
+    -------
+    float
+        Two-tailed p-value. Returns np.nan if n <= 2.
+    """
+    if n <= 2:
+        return np.nan  # Not enough datapoints for a meaningful p-value.
+    t_stat = r * np.sqrt((n - 2) / (1 - r**2))
+    p_value = 2 * stats.t.sf(np.abs(t_stat), df=n - 2)
+    return p_value
+
+
+def run_peptidoform_correlation(
+    correlations_list,
+    collect_distributions=[0, 25, 50, 75, 100],
+    collect_top=[1, 2, 3],
+    pad_size=10,
+):
+    """
+    Compute correlation-based features and include p-value features for each correlation
+    array.
+
+    Parameters
+    ----------
+    correlations_list : tuple
+        A tuple containing three arrays:
+        - correlations: individual correlation coefficients.
+        - correlation_matrix_psm_ids: correlation coefficients per PSM IDs.
+        - correlation_matrix_frag_ids: correlation coefficients per fragment IDs.
+    collect_distributions : list, optional
+        Percentile values for distribution features.
+    collect_top : list, optional
+        Top-k values to extract as features.
+    pad_size : int, optional
+        Padding size for the 'top' features.
+
+    Returns
+    -------
+    pl.DataFrame
+        A one-row DataFrame containing the aggregated correlation and p-value features.
+    """
+    correlations, correlation_matrix_psm_ids, correlation_matrix_frag_ids = (
+        correlations_list
+    )
+    feature_dict = {}
+
+    # For demonstration purposes, we assume a fixed number of datapoints.
+    # Replace this with the actual number of peaks used for each correlation.
+    n_datapoints = 50
+
+    # Compute p-values for each correlation array.
+    p_values_individual = np.array(
+        [pearson_pvalue(r, n_datapoints) for r in correlations]
+    )
+    p_values_psm_ids = np.array(
+        [pearson_pvalue(r, n_datapoints) for r in correlation_matrix_psm_ids]
+    )
+    p_values_frag_ids = np.array(
+        [pearson_pvalue(r, n_datapoints) for r in correlation_matrix_frag_ids]
+    )
+
+    # Define feature extraction parameters for both correlation and p-value features.
+    params = [
+        # Correlation distribution features
+        (
+            correlation_matrix_psm_ids,
+            "distribution_correlation_matrix_psm_ids",
+            collect_distributions,
+            "percentile",
+            len(collect_distributions),
+        ),
+        (
+            correlation_matrix_frag_ids,
+            "distribution_correlation_matrix_frag_ids",
+            collect_distributions,
+            "percentile",
+            len(collect_distributions),
+        ),
+        (
+            correlations,
+            "distribution_correlation_individual",
+            collect_distributions,
+            "percentile",
+            len(collect_distributions),
+        ),
+        # Correlation top features
+        (
+            correlation_matrix_psm_ids,
+            "top_correlation_matrix_psm_ids",
+            collect_top,
+            "top",
+            pad_size,
+        ),
+        (
+            correlation_matrix_frag_ids,
+            "top_correlation_matrix_frag_ids",
+            collect_top,
+            "top",
+            pad_size,
+        ),
+        (correlations, "top_correlation_individual", collect_top, "top", pad_size),
+        # P-value distribution features
+        (
+            p_values_psm_ids,
+            "distribution_correlation_matrix_psm_ids_pvalue",
+            collect_distributions,
+            "percentile",
+            len(collect_distributions),
+        ),
+        (
+            p_values_frag_ids,
+            "distribution_correlation_matrix_frag_ids_pvalue",
+            collect_distributions,
+            "percentile",
+            len(collect_distributions),
+        ),
+        (
+            p_values_individual,
+            "distribution_correlation_individual_pvalue",
+            collect_distributions,
+            "percentile",
+            len(collect_distributions),
+        ),
+        # P-value top features
+        (
+            p_values_psm_ids,
+            "top_correlation_matrix_psm_ids_pvalue",
+            collect_top,
+            "top",
+            pad_size,
+        ),
+        (
+            p_values_frag_ids,
+            "top_correlation_matrix_frag_ids_pvalue",
+            collect_top,
+            "top",
+            pad_size,
+        ),
+        (
+            p_values_individual,
+            "top_correlation_individual_pvalue",
+            collect_top,
+            "top",
+            pad_size,
+        ),
+    ]
+
+    # Add features to the dictionary using your existing helper function.
+    for data, feat_name, values, method, ps in params:
+        feature_dict.update(
+            add_feature_columns_nb(data, feat_name, values, method, pad_size=ps)
+        )
+
+    return pl.DataFrame(feature_dict)
+
+
+@nb.njit
+def corr_np_nb_new(data1, data2):
+    n = data1.shape[0]
+    # ...
+    return cov / n / (std1 * std2)
+
+
+@nb.njit
+def corr_np_with_n_new(data1, data2):
+    n = data1.shape[0]
+    # Compute correlation as before
+    sum1 = 0.0
+    sum2 = 0.0
+    for i in range(n):
+        sum1 += data1[i]
+        sum2 += data2[i]
+    mean1 = sum1 / n
+    mean2 = sum2 / n
+
+    cov = 0.0
+    var1 = 0.0
+    var2 = 0.0
+    for i in range(n):
+        diff1 = data1[i] - mean1
+        diff2 = data2[i] - mean2
+        cov += diff1 * diff2
+        var1 += diff1 * diff1
+        var2 += diff2 * diff2
+    std1 = (var1 / n) ** 0.5
+    std2 = (var2 / n) ** 0.5
+
+    # Return both the correlation and the count of datapoints
+    return cov / n / (std1 * std2), n
+
+
 def run_peptidoform_correlation(
     correlations_list,
     collect_distributions: List[int] = [
@@ -346,9 +551,21 @@ def run_peptidoform_correlation(
     """
     Compute correlation-based features and return a one-row Polars DataFrame.
     """
-    correlations, correlation_matrix_psm_ids, correlation_matrix_frag_ids = (
-        correlations_list
-    )
+    (
+        correlations,
+        correlation_result_counts,
+        correlation_matrix_psm_ids,
+        correlation_matrix_frag_ids,
+        correlation_matrix_psm_ids_ignore_zeros,
+        correlation_matrix_psm_ids_ignore_zeros_counts,
+        correlation_matrix_psm_ids_missing,
+        correlation_matrix_psm_ids_missing_zeros_counts,
+        correlation_matrix_frag_ids_ignore_zeros,
+        correlation_matrix_frag_ids_ignore_zeros_counts,
+        correlation_matrix_frag_ids_missing,
+        correlation_matrix_frag_ids_missing_zeros_counts,
+    ) = correlations_list
+
     feature_dict = {}
     params = [
         (
@@ -631,7 +848,7 @@ def calculate_features(
 
     log_info("Obtaining features retention time...")
     df_psms = add_retention_time_features(
-        df_psms, predictions_deeplc, filter_rel_rt_error=0.2
+        df_psms, predictions_deeplc, filter_rel_rt_error=0.05
     )
 
     log_info(
@@ -658,9 +875,7 @@ def calculate_features(
 
     log_info("Step 5: obtain MS1 peak presence")
 
-    df_psms = add_precursor_intensities_optimized_parallel(
-        df_psms, ms1_dict, ms2_to_ms1_dict
-    )
+    df_psms = add_precursor_intensities(df_psms, ms1_dict, ms2_to_ms1_dict)
 
     log_info("Step 6: Grouping peptidoforms by peptide and charge")
 
@@ -678,10 +893,12 @@ def calculate_features(
     ]
 
     log_info("Step 7: Processing peptidoforms in parallel (with chunking)")
+
     chunks = [
         peptidoform_args[i : i + chunk_size]
         for i in range(0, len(peptidoform_args), chunk_size)
     ]
+    """
     with ThreadPoolExecutor(max_workers=parallel_workers) as executor:
         chunk_results = list(
             tqdm(
@@ -692,6 +909,11 @@ def calculate_features(
                 desc="Processing chunks",
             )
         )
+    """
+    chunk_results = []
+    for chunk in chunks:
+        for args in tqdm(chunk):
+            chunk_results.append(process_peptidoform(args))
     pin_in = [item for sublist in chunk_results for item in sublist]
 
     log_info("Step 8: Concatenating results")

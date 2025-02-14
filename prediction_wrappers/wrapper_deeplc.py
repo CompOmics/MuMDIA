@@ -20,7 +20,7 @@ def plot_performance(psm_list, preds, outfile="plot.png"):
     plt.close()
 
 
-def predict_deeplc_pl(psm_df_pl, dlc_model):
+def predict_deeplc_pl_old(psm_df_pl, dlc_model):
     # rt_train get the psm_id and add instread, then merge with prev
     psm_list = [
         PSM(peptidoform=seq, retention_time=tr, spectrum_id=idx)
@@ -31,6 +31,33 @@ def predict_deeplc_pl(psm_df_pl, dlc_model):
 
     psm_df_pl = psm_df_pl.with_columns(
         pl.Series("rt_predictions", dlc_model.make_preds(psm_list))
+    )
+
+    return psm_df_pl
+
+
+def predict_deeplc_pl(psm_df_pl, dlc_model):
+    # Extract unique peptide entries (deduplicate by peptide sequence)
+    unique_peptides_df = psm_df_pl.unique(subset="peptide")
+
+    # Create a list of PSM objects for the unique peptides
+    psm_list = [
+        PSM(peptidoform=row["peptide"], retention_time=row["rt"], spectrum_id=idx)
+        for idx, row in enumerate(unique_peptides_df.to_dicts())
+    ]
+    psm_list = PSMList(psm_list=psm_list)
+
+    # Compute predictions for the unique peptides only
+    predictions = dlc_model.make_preds(psm_list)
+    unique_peptides_df = unique_peptides_df.with_columns(
+        pl.Series("rt_predictions", predictions)
+    )
+
+    # Merge the unique predictions back to the original DataFrame based on peptide sequence
+    psm_df_pl = psm_df_pl.join(
+        unique_peptides_df.select(["peptide", "rt_predictions"]),
+        on="peptide",
+        how="left",
     )
 
     return psm_df_pl

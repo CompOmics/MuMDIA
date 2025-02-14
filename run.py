@@ -66,7 +66,7 @@ def parse_arguments():
     parser.add_argument(
         "--fasta_file",
         help="The location of the fasta file",
-        default="fasta/ecoli_22032024.fasta",
+        default="fasta/unmodified_peptides.fasta",
     )
     parser.add_argument(
         "--result_dir", help="The location of the result directory", default="results"
@@ -330,7 +330,7 @@ def main():
         args_dict.update(flags)
 
     if args_dict["write_full_search_pickle"]:
-        peptides = tryptic_digest_pyopenms(args_dict["fasta_file"])
+        peptides = tryptic_digest_pyopenms(config["sage"]["database"]["fasta"])
 
         peptide_df, dlc_calibration, dlc_transfer_learn, perc_95 = retrain_and_bounds(
             df_psms, peptides, result_dir=result_dir
@@ -384,9 +384,11 @@ def main():
         args_dict.update(flags)
 
     log_info("Parsing the mzML file...")
-    ms1_dict, ms2_to_ms1_dict, ms2_spectra = get_ms1_mzml(
-        config["sage_basic"]["mzml_paths"][0]
-    )
+    # ms1_dict, ms2_to_ms1_dict, ms2_spectra = get_ms1_mzml(
+    #    config["sage_basic"]["mzml_paths"][0]
+    # )
+    ms1_dict = {}
+    ms2_to_ms1_dict = {}
 
     mumdia.main(
         df_fragment=df_fragment,
