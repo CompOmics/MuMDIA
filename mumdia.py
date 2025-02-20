@@ -67,15 +67,63 @@ def numba_percentile(data, q):
 
 
 @nb.njit
+def numba_percentile_sorted(sorted_data, q):
+    """
+    Compute the q-th percentile of a 1D array using a simple linear interpolation.
+    q should be given as a float between 0 and 100.
+    """
+    n = sorted_data.shape[0]
+    if n == 0:
+        return 0.0
+    pos = (q / 100.0) * (n - 1)
+    lower = int(pos)
+    upper = lower if lower == n - 1 else lower + 1
+    weight = pos - lower
+    return sorted_data[lower] * (1.0 - weight) + sorted_data[upper] * weight
+
+
+@nb.njit
+def numba_percentile_sorted_idx(sorted_data, q):
+    """
+    Compute the q-th percentile of a 1D array using a simple linear interpolation.
+    q should be given as a float between 0 and 100.
+    """
+    n = sorted_data.shape[0]
+    if n == 0:
+        return 0.0, 0
+    pos = (q / 100.0) * (n - 1)
+    lower = int(pos)
+    upper = lower if lower == n - 1 else lower + 1
+    weight = pos - lower
+    return sorted_data[lower] * (1.0 - weight) + sorted_data[upper] * weight, int(pos)
+
+
+@nb.njit
 def compute_percentiles_nb(data, qs):
     """
     Compute an array of percentiles given a 1D array and an array of q values.
     """
     m = qs.shape[0]
     result = np.empty(m, dtype=np.float64)
+    data = np.sort(data)
     for i in range(m):
-        result[i] = numba_percentile(data, qs[i])
+        result[i] = numba_percentile_sorted(data, qs[i])
     return result
+
+
+@nb.njit
+def compute_percentiles_nb_idx(data, qs, idx_lookup):
+    """
+    Compute an array of percentiles given a 1D array `data` and an array of q values `qs`,
+    and use the provided `idx_lookup` array to retrieve index information.
+    """
+    m = qs.shape[0]
+    result = np.empty(m, dtype=np.float64)
+    computed_idx = np.empty(m, dtype=np.float64)
+    for i in range(m):
+        result[i], pos = numba_percentile_sorted_idx(data, qs[i])
+        computed_idx[i] = idx_lookup[pos]
+    return result, computed_idx
 
 
 @nb.njit
@@ -93,6 +141,26 @@ def compute_top_nb(data, m):
         else:
             result[i] = 0.0
     return result
+
+
+@nb.njit
+def compute_top_nb_idx(data, m, idx_ret_list):
+    """
+    Sort the array in descending order and return the first m values.
+    If there are fewer than m elements, pad with zeros.
+    """
+    n = data.shape[0]
+    sorted_data = np.sort(data)[::-1]
+    result = np.empty(m, dtype=np.float64)
+    result_idx = np.empty(m, dtype=np.float64)
+    for i in range(m):
+        if i < n:
+            result[i] = sorted_data[i]
+            idx_ret_list[i] = idx_ret_list[i]
+        else:
+            result[i] = 0.0
+            idx_ret_list[i] = 0.0
+    return result, idx_ret_list
 
 
 @nb.njit
@@ -146,7 +214,7 @@ def create_model():
     Create and compile a simple Keras model.
     """
     model = Sequential()
-    model.add(Dense(100, input_dim=124, activation="relu"))
+    model.add(Dense(100, input_dim=85, activation="relu"))
     model.add(Dense(20, activation="relu"))
     model.add(Dense(10, activation="relu"))
     model.add(Dense(1, activation="sigmoid"))
@@ -167,11 +235,13 @@ def run_mokapot(output_dir="results/") -> None:
     The results are saved to tab-delimited text files.
     """
     psms = mokapot.read_pin("outfile.pin")
-    # model = KerasClassifier(
-    #    build_fn=create_model, epochs=100, batch_size=1000, verbose=10
-    # )
-    results, models = mokapot.brew(psms)  # mokapot.Model(model), folds=3
+    model = KerasClassifier(
+        build_fn=create_model, epochs=100, batch_size=1000, verbose=10
+    )
+    results, models = mokapot.brew(psms, mokapot.Model(model), folds=3)  # psms)
     result_files = results.to_txt(dest_dir=output_dir)
+
+    return result_files
 
 
 def collapse_columns(
@@ -202,7 +272,7 @@ def collapse_columns(
     return pl.concat(collapsed_columns, how="horizontal")
 
 
-def add_feature_columns_nb(data, feature_name, values, method, pad_size=10):
+def add_feature_columns_nb(data, feature_name, values, method, add_index, pad_size=10):
     """
     Compute a feature vector from the input data using Numba-accelerated routines.
     Returns a dictionary mapping column names to computed scalar values.
@@ -213,9 +283,17 @@ def add_feature_columns_nb(data, feature_name, values, method, pad_size=10):
         computed = np.zeros(required_length, dtype=np.float64)
     elif method == "percentile":
         qs = np.array(values, dtype=np.float64)
-        computed = compute_percentiles_nb(data, qs)
+        if len(add_index) > 0:
+            computed, computed_idx = compute_percentiles_nb_idx(data, qs, add_index)
+        else:
+            computed = compute_percentiles_nb(data, qs)
     elif method == "top":
-        computed = compute_top_nb(data, required_length)
+        if len(add_index) > 0:
+            computed, computed_idx = compute_top_nb_idx(
+                data, required_length, add_index
+            )
+        else:
+            computed = compute_top_nb(data, required_length)
     else:
         raise ValueError(f"Unknown method: {method}")
     # Ensure computed is of the required length
@@ -223,9 +301,24 @@ def add_feature_columns_nb(data, feature_name, values, method, pad_size=10):
         padded = np.zeros(required_length, dtype=np.float64)
         padded[: computed.size] = computed
         computed = padded
+        if len(add_index) > 0:
+            padded_idx = np.zeros(required_length, dtype=np.float64)
+            padded_idx[: computed_idx.size] = computed_idx
+            computed_idx = padded_idx
     else:
         computed = computed[:required_length]
-    return {f"{feature_name}_{v}": computed[i] for i, v in enumerate(values)}
+        if len(add_index) > 0:
+            computed_idx = computed_idx[:required_length]
+
+    if len(add_index) > 0:
+        return {
+            **{f"{feature_name}_{v}": computed[i] for i, v in enumerate(values)},
+            **{
+                f"{feature_name}_{v}_idx": computed_idx[i] for i, v in enumerate(values)
+            },
+        }
+    else:
+        return {f"{feature_name}_{v}": computed[i] for i, v in enumerate(values)}
 
 
 def run_peptidoform_df(
@@ -247,7 +340,7 @@ def run_peptidoform_df(
         "rt_prediction_error_abs_relative",
         "precursor_ppm",
         "hyperscore",
-        "protein_q",
+        # "protein_q",
         "precursor_intensity_M",
         "precursor_intensity_M+1",
         "precursor_intensity_M-1",
@@ -272,7 +365,7 @@ def run_peptidoform_df(
         "precursor_ppm",
         "hyperscore",
         "delta_best",
-        "protein_q",
+        # "protein_q",
         "precursor_intensity_M",
         "precursor_intensity_M+1",
         "precursor_intensity_M-1",
@@ -280,7 +373,7 @@ def run_peptidoform_df(
     collapse_mean_columns: List[str] = [
         "spectrum_q",
         "peptide_q",
-        "protein_q",
+        # "protein_q",
         "precursor_intensity_M",
         "precursor_intensity_M+1",
         "precursor_intensity_M-1",
@@ -357,150 +450,6 @@ def pearson_pvalue(r, n):
     return p_value
 
 
-def run_peptidoform_correlation(
-    correlations_list,
-    collect_distributions=[0, 25, 50, 75, 100],
-    collect_top=[1, 2, 3],
-    pad_size=10,
-):
-    """
-    Compute correlation-based features and include p-value features for each correlation
-    array.
-
-    Parameters
-    ----------
-    correlations_list : tuple
-        A tuple containing three arrays:
-        - correlations: individual correlation coefficients.
-        - correlation_matrix_psm_ids: correlation coefficients per PSM IDs.
-        - correlation_matrix_frag_ids: correlation coefficients per fragment IDs.
-    collect_distributions : list, optional
-        Percentile values for distribution features.
-    collect_top : list, optional
-        Top-k values to extract as features.
-    pad_size : int, optional
-        Padding size for the 'top' features.
-
-    Returns
-    -------
-    pl.DataFrame
-        A one-row DataFrame containing the aggregated correlation and p-value features.
-    """
-    correlations, correlation_matrix_psm_ids, correlation_matrix_frag_ids = (
-        correlations_list
-    )
-    feature_dict = {}
-
-    # For demonstration purposes, we assume a fixed number of datapoints.
-    # Replace this with the actual number of peaks used for each correlation.
-    n_datapoints = 50
-
-    # Compute p-values for each correlation array.
-    p_values_individual = np.array(
-        [pearson_pvalue(r, n_datapoints) for r in correlations]
-    )
-    p_values_psm_ids = np.array(
-        [pearson_pvalue(r, n_datapoints) for r in correlation_matrix_psm_ids]
-    )
-    p_values_frag_ids = np.array(
-        [pearson_pvalue(r, n_datapoints) for r in correlation_matrix_frag_ids]
-    )
-
-    # Define feature extraction parameters for both correlation and p-value features.
-    params = [
-        # Correlation distribution features
-        (
-            correlation_matrix_psm_ids,
-            "distribution_correlation_matrix_psm_ids",
-            collect_distributions,
-            "percentile",
-            len(collect_distributions),
-        ),
-        (
-            correlation_matrix_frag_ids,
-            "distribution_correlation_matrix_frag_ids",
-            collect_distributions,
-            "percentile",
-            len(collect_distributions),
-        ),
-        (
-            correlations,
-            "distribution_correlation_individual",
-            collect_distributions,
-            "percentile",
-            len(collect_distributions),
-        ),
-        # Correlation top features
-        (
-            correlation_matrix_psm_ids,
-            "top_correlation_matrix_psm_ids",
-            collect_top,
-            "top",
-            pad_size,
-        ),
-        (
-            correlation_matrix_frag_ids,
-            "top_correlation_matrix_frag_ids",
-            collect_top,
-            "top",
-            pad_size,
-        ),
-        (correlations, "top_correlation_individual", collect_top, "top", pad_size),
-        # P-value distribution features
-        (
-            p_values_psm_ids,
-            "distribution_correlation_matrix_psm_ids_pvalue",
-            collect_distributions,
-            "percentile",
-            len(collect_distributions),
-        ),
-        (
-            p_values_frag_ids,
-            "distribution_correlation_matrix_frag_ids_pvalue",
-            collect_distributions,
-            "percentile",
-            len(collect_distributions),
-        ),
-        (
-            p_values_individual,
-            "distribution_correlation_individual_pvalue",
-            collect_distributions,
-            "percentile",
-            len(collect_distributions),
-        ),
-        # P-value top features
-        (
-            p_values_psm_ids,
-            "top_correlation_matrix_psm_ids_pvalue",
-            collect_top,
-            "top",
-            pad_size,
-        ),
-        (
-            p_values_frag_ids,
-            "top_correlation_matrix_frag_ids_pvalue",
-            collect_top,
-            "top",
-            pad_size,
-        ),
-        (
-            p_values_individual,
-            "top_correlation_individual_pvalue",
-            collect_top,
-            "top",
-            pad_size,
-        ),
-    ]
-
-    # Add features to the dictionary using your existing helper function.
-    for data, feat_name, values, method, ps in params:
-        feature_dict.update(
-            add_feature_columns_nb(data, feat_name, values, method, pad_size=ps)
-        )
-
-    return pl.DataFrame(feature_dict)
-
-
 @nb.njit
 def corr_np_nb_new(data1, data2):
     n = data1.shape[0]
@@ -554,6 +503,7 @@ def run_peptidoform_correlation(
     (
         correlations,
         correlation_result_counts,
+        sum_pred_frag_intens,
         correlation_matrix_psm_ids,
         correlation_matrix_frag_ids,
         correlation_matrix_psm_ids_ignore_zeros,
@@ -564,7 +514,20 @@ def run_peptidoform_correlation(
         correlation_matrix_frag_ids_ignore_zeros_counts,
         correlation_matrix_frag_ids_missing,
         correlation_matrix_frag_ids_missing_zeros_counts,
+        most_intens_cor,
+        most_intens_cos,
+        mse_avg_pred_intens,
+        mse_avg_pred_intens_total,
     ) = correlations_list
+
+    """
+    print(
+        [pearson_pvalue(r, n) for r, n in zip(correlations, correlation_result_counts)]
+    )
+    print(correlations)
+    print(correlation_result_counts)
+    input("stop!")
+    """
 
     feature_dict = {}
     params = [
@@ -574,6 +537,7 @@ def run_peptidoform_correlation(
             collect_distributions,
             "percentile",
             len(collect_distributions),
+            [],
         ),
         (
             correlation_matrix_frag_ids,
@@ -581,6 +545,7 @@ def run_peptidoform_correlation(
             collect_distributions,
             "percentile",
             len(collect_distributions),
+            [],
         ),
         (
             correlations,
@@ -588,6 +553,7 @@ def run_peptidoform_correlation(
             collect_distributions,
             "percentile",
             len(collect_distributions),
+            correlation_result_counts,
         ),
         (
             correlation_matrix_psm_ids,
@@ -595,6 +561,7 @@ def run_peptidoform_correlation(
             collect_top,
             "top",
             pad_size,
+            [],
         ),
         (
             correlation_matrix_frag_ids,
@@ -602,14 +569,29 @@ def run_peptidoform_correlation(
             collect_top,
             "top",
             pad_size,
+            [],
         ),
-        (correlations, "top_correlation_individual", collect_top, "top", pad_size),
+        ([most_intens_cos], "top_correlation_cos", [1], "top", pad_size, []),
+        ([most_intens_cor], "top_correlation_cos", [1], "top", pad_size, []),
+        ([mse_avg_pred_intens], "mse_avg_pred_intens", [1], "top", pad_size, []),
+        (
+            [mse_avg_pred_intens_total],
+            "mse_avg_pred_intens_total",
+            [1],
+            "top",
+            pad_size,
+            [],
+        ),
+        (correlations, "top_correlation_individual", collect_top, "top", pad_size, []),
     ]
-    for data, feat_name, values, method, ps in params:
+    for data, feat_name, values, method, ps, add_index in params:
         # Here, for percentiles and top values, we use the Numba-accelerated add_feature_columns_nb.
         feature_dict.update(
-            add_feature_columns_nb(data, feat_name, values, method, pad_size=ps)
+            add_feature_columns_nb(
+                data, feat_name, values, method, add_index, pad_size=ps
+            )
         )
+
     return pl.DataFrame(feature_dict)
 
 
@@ -842,13 +824,16 @@ def calculate_features(
     This function uses parallel processing with task chunking.
     """
     log_info("Obtaining retention time predictions for the main loop...")
+    log_info(
+        f"Reading the DeepLC pickle: {read_deeplc_pickle} and writing DeepLC pickle: {write_deeplc_pickle}"
+    )
     _, _, predictions_deeplc = get_predictions_retention_time_mainloop(
         df_psms, write_deeplc_pickle, read_deeplc_pickle, deeplc_model
     )
 
     log_info("Obtaining features retention time...")
     df_psms = add_retention_time_features(
-        df_psms, predictions_deeplc, filter_rel_rt_error=0.05
+        df_psms, predictions_deeplc, filter_rel_rt_error=0.15
     )
 
     log_info(
@@ -857,6 +842,10 @@ def calculate_features(
     df_psms = add_count_and_filter_peptides(df_psms, min_occurrences)
 
     log_info("Obtaining fragment intensity predictions for the main loop...")
+    log_info(
+        f"Reading the MS2PIP pickle: {read_ms2pip_pickle} and writing MS2PIP pickle: {write_ms2pip_pickle}"
+    )
+
     df_fragment, ms2pip_predictions = get_predictions_fragment_intensity_main_loop(
         df_psms,
         df_fragment,
@@ -898,7 +887,7 @@ def calculate_features(
         peptidoform_args[i : i + chunk_size]
         for i in range(0, len(peptidoform_args), chunk_size)
     ]
-    """
+
     with ThreadPoolExecutor(max_workers=parallel_workers) as executor:
         chunk_results = list(
             tqdm(
@@ -911,9 +900,10 @@ def calculate_features(
         )
     """
     chunk_results = []
-    for chunk in chunks:
-        for args in tqdm(chunk):
+    for chunk in tqdm(chunks):
+        for args in chunk:
             chunk_results.append(process_peptidoform(args))
+    """
     pin_in = [item for sublist in chunk_results for item in sublist]
 
     log_info("Step 8: Concatenating results")

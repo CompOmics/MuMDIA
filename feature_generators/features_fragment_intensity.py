@@ -169,6 +169,37 @@ def corrcoef_ignore_zeros(data):
     return corr_matrix
 
 
+def cosine_similarity(vec1: np.ndarray, vec2: np.ndarray) -> float:
+    """
+    Compute the cosine similarity between two vectors.
+
+    Parameters
+    ----------
+    vec1 : np.ndarray
+        The first vector (e.g., experimental spectrum intensities).
+    vec2 : np.ndarray
+        The second vector (e.g., predicted spectrum intensities).
+
+    Returns
+    -------
+    float
+        The cosine similarity between vec1 and vec2. Returns 0.0 if either vector has zero norm.
+    """
+    # Calculate the dot product between the vectors.
+    dot_product = np.dot(vec1, vec2)
+
+    # Compute the L2 (Euclidean) norms of the vectors.
+    norm_vec1 = np.linalg.norm(vec1)
+    norm_vec2 = np.linalg.norm(vec2)
+
+    # Avoid division by zero by checking if either norm is zero.
+    if norm_vec1 == 0 or norm_vec2 == 0:
+        return 0.0
+
+    # Return the cosine similarity.
+    return dot_product / (norm_vec1 * norm_vec2)
+
+
 def match_fragments(
     df_fragment_sub_peptidoform: pl.DataFrame, ms2pip_predictions: dict
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -191,6 +222,31 @@ def match_fragments(
         index="psm_id", columns="fragment_name", values="fragment_intensity"
     ).fill_null(0.0)
 
+    max_intens_ms2pip = max(ms2pip_predictions.values())
+    ms2pip_predictions = dict(
+        [(k, v / max_intens_ms2pip) for k, v in ms2pip_predictions.items()]
+    )
+
+    most_abundant_frag_psm = df_fragment_sub_peptidoform.filter(
+        df_fragment_sub_peptidoform["rt"]
+        == df_fragment_sub_peptidoform["rt_max_peptide_sub"][0]
+    )
+
+    pred_frag_intens_individual = np.array(
+        [
+            ms2pip_predictions.get(fid, 0.0)
+            for fid in most_abundant_frag_psm["fragment_name"]
+        ]
+    )
+
+    most_intens_cor = np.corrcoef(
+        pred_frag_intens_individual, most_abundant_frag_psm["fragment_intensity"]
+    )[0][1]
+
+    most_intens_cos = cosine_similarity(
+        pred_frag_intens_individual, most_abundant_frag_psm["fragment_intensity"]
+    )
+
     # first column is PMS ID, ignore that one, messes up calculation as it is numeric
     intensity_matrix = intensity_matrix_df[:, 1:].to_numpy()
     # Get fragment names, first column is PMS ID, ignore that one, messes up calculation as it is numeric
@@ -201,11 +257,31 @@ def match_fragments(
         [ms2pip_predictions.get(fid, 0.0) for fid in fragment_names]
     )
 
+    # Collect predictions for keys not listed in fragment_names.
+    non_matched_predictions = np.array(
+        [v for k, v in ms2pip_predictions.items() if k not in fragment_names]
+    )
+
+    sum_pred_frag_intens = np.array(
+        sum([ms2pip_predictions.get(fid, 0.0) for fid in fragment_names])
+    )
+
     # Ensure data types are consistent
     intensity_matrix = intensity_matrix.astype(np.float32)
     pred_frag_intens = pred_frag_intens.astype(np.float32)
+    non_matched_predictions = non_matched_predictions.astype(np.float32)
 
-    intensity_matrix_normalized = intensity_matrix / intensity_matrix.sum(
+    pred_frag_intens = np.concatenate((pred_frag_intens, non_matched_predictions))
+
+    # Calculate the number of zeros to append
+    pad_width = len(pred_frag_intens) - len(intensity_matrix[0])
+
+    # Extend array 'a' by padding with zeros on the right side
+    intensity_matrix = np.pad(
+        intensity_matrix, ((0, 0), (0, pad_width)), mode="constant", constant_values=0
+    )
+
+    intensity_matrix_normalized = intensity_matrix / intensity_matrix.max(
         axis=1, keepdims=True
     )
 
@@ -227,9 +303,19 @@ def match_fragments(
         .ravel()
     )
 
+    mse_avg_pred_intens = (
+        abs(intensity_matrix_normalized - pred_frag_intens).sum(axis=1)
+    ).sum() / intensity_matrix_normalized.shape[0]
+    mse_avg_pred_intens_total = (
+        (abs(intensity_matrix_normalized - pred_frag_intens).sum(axis=1)).sum()
+        + sum(non_matched_predictions)
+    ) / intensity_matrix_normalized.shape[0]
+
     # Compute correlation matrix for PSM IDs
-    if intensity_matrix.shape[0] > 1:
-        correlation_matrix_psm_ids = np.corrcoef(intensity_matrix)
+    if intensity_matrix_normalized.shape[0] > 1:
+        correlation_matrix_psm_ids = np.corrcoef(intensity_matrix_normalized)
+
+        """
         (
             correlation_matrix_psm_ids_ignore_zeros,
             correlation_matrix_psm_ids_ignore_zeros_counts,
@@ -239,6 +325,12 @@ def match_fragments(
             correlation_matrix_psm_ids_missing,
             correlation_matrix_psm_ids_missing_zeros_counts,
         ) = corrcoef_ignore_both_missing_counts(intensity_matrix)
+        """
+
+        correlation_matrix_psm_ids_ignore_zeros = np.array([])
+        correlation_matrix_psm_ids_ignore_zeros_counts = np.array([])
+        correlation_matrix_psm_ids_missing = np.array([])
+        correlation_matrix_psm_ids_missing_zeros_counts = np.array([])
 
         # Remove diagonal elements and flatten
         correlation_matrix_psm_ids = correlation_matrix_psm_ids[
@@ -254,9 +346,10 @@ def match_fragments(
         correlation_matrix_psm_ids_missing_zeros_counts = np.array([])
 
     # Compute correlation matrix for fragment IDs
-    if intensity_matrix.shape[1] > 1:
-        correlation_matrix_frag_ids = np.corrcoef(intensity_matrix.T)
+    if intensity_matrix_normalized.shape[1] > 1:
+        correlation_matrix_frag_ids = np.corrcoef(intensity_matrix_normalized.T)
 
+        """
         (
             correlation_matrix_frag_ids_ignore_zeros,
             correlation_matrix_frag_ids_ignore_zeros_counts,
@@ -266,6 +359,11 @@ def match_fragments(
             correlation_matrix_frag_ids_missing,
             correlation_matrix_frag_ids_missing_zeros_counts,
         ) = corrcoef_ignore_both_missing_counts(intensity_matrix)
+        """
+        correlation_matrix_frag_ids_ignore_zeros = np.array([])
+        correlation_matrix_frag_ids_ignore_zeros_counts = np.array([])
+        correlation_matrix_frag_ids_missing = np.array([])
+        correlation_matrix_frag_ids_missing_zeros_counts = np.array([])
 
         # Remove diagonal elements and flatten
         correlation_matrix_frag_ids = correlation_matrix_frag_ids[
@@ -296,6 +394,7 @@ def match_fragments(
     return (
         correlation_result,
         correlation_result_counts,
+        sum_pred_frag_intens,
         correlation_matrix_psm_ids,
         correlation_matrix_frag_ids,
         correlation_matrix_psm_ids_ignore_zeros,
@@ -306,6 +405,10 @@ def match_fragments(
         correlation_matrix_frag_ids_ignore_zeros_counts,
         correlation_matrix_frag_ids_missing,
         correlation_matrix_frag_ids_missing_zeros_counts,
+        most_intens_cor,
+        most_intens_cos,
+        mse_avg_pred_intens,
+        mse_avg_pred_intens_total,
     )
 
 
@@ -364,6 +467,7 @@ def get_features_fragment_intensity(
             (
                 correlations,
                 correlations_count,
+                sum_pred_frag_intens,
                 correlation_matrix_psm_ids,
                 correlation_matrix_frag_ids,
                 correlation_matrix_psm_ids_ignore_zeros,
@@ -374,12 +478,17 @@ def get_features_fragment_intensity(
                 correlation_matrix_frag_ids_ignore_zeros_counts,
                 correlation_matrix_frag_ids_missing,
                 correlation_matrix_frag_ids_missing_zeros_counts,
+                most_intens_cor,
+                most_intens_cos,
+                mse_avg_pred_intens,
+                mse_avg_pred_intens_total,
             ) = match_fragments(df_fragment_sub_peptidoform, preds)
 
             fragment_dict[f"{peptidoform}/{charge}"] = df_fragment_sub_peptidoform
             correlations_fragment_dict[f"{peptidoform}/{charge}"] = [
                 correlations,
                 correlations_count,
+                sum_pred_frag_intens,
                 correlation_matrix_psm_ids,
                 correlation_matrix_frag_ids,
                 correlation_matrix_psm_ids_ignore_zeros,
@@ -390,6 +499,10 @@ def get_features_fragment_intensity(
                 correlation_matrix_frag_ids_ignore_zeros_counts,
                 correlation_matrix_frag_ids_missing,
                 correlation_matrix_frag_ids_missing_zeros_counts,
+                most_intens_cor,
+                most_intens_cos,
+                mse_avg_pred_intens,
+                mse_avg_pred_intens_total,
             ]
 
         if write_correlation_pickles:
