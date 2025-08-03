@@ -1,0 +1,43 @@
+name: Dependency Update Tests
+
+on:
+  schedule:
+    # Run weekly on Sundays at 2 AM UTC
+    - cron: '0 2 * * 0'
+  workflow_dispatch:  # Allow manual triggering
+
+jobs:
+  test-latest-dependencies:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Python 3.11
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+    
+    - name: Install latest dependencies
+      run: |
+        python -m pip install --upgrade pip
+        # Install latest versions of all dependencies
+        pip install --upgrade $(cat test_requirements.txt | grep -v '#' | sed 's/[>=<].*//g' | tr '\n' ' ')
+        pip install -e .
+        pip install rustyms || echo "RustyMS optional"
+    
+    - name: Run core tests with latest dependencies
+      run: |
+        python -m pytest tests/ -v -m "unit" --tb=short --maxfail=10
+    
+    - name: Create issue on failure
+      if: failure()
+      uses: actions/github-script@v6
+      with:
+        script: |
+          github.rest.issues.create({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            title: 'Dependency update test failure',
+            body: 'The weekly dependency update test failed. Please check the latest dependency versions for compatibility.'
+          })
