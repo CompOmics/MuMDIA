@@ -5,8 +5,32 @@ import random
 import polars as pl
 
 
+def generate_random_spectrum(num_peaks, mz_range, intensity_range):
+    """
+    Generate a random spectrum for testing purposes.
+    
+    Args:
+        num_peaks: Number of peaks to generate
+        mz_range: Tuple of (min_mz, max_mz) for m/z values
+        intensity_range: Tuple of (min_intensity, max_intensity) for intensities
+    
+    Returns:
+        List of tuples [(mz, intensity), ...]
+    """
+    spectrum = []
+    for _ in range(num_peaks):
+        mz = random.uniform(mz_range[0], mz_range[1])
+        intensity = random.uniform(intensity_range[0], intensity_range[1])
+        spectrum.append((mz, intensity))
+    
+    # Sort by m/z
+    spectrum.sort(key=lambda x: x[0])
+    return spectrum
+
+
 def lasso_deconv():
-    [
+    # Expected columns for PSM fragment data
+    fragment_columns = [
         "psm_id",
         "fragment_type",
         "fragment_ordinals",
@@ -21,7 +45,8 @@ def lasso_deconv():
         "peak_identifier",
     ]
 
-    [
+    # Expected columns for PSM data
+    psm_columns = [
         "psm_id",
         "filename",
         "scannr",

@@ -1,4 +1,6 @@
 # Benchmark different methods using timeit
+import timeit
+import pandas as pd
 
 # Define test cases
 empty_nested_list = [[]]  # l1 == [[]]
@@ -62,4 +64,5 @@ results = {
 df = pd.DataFrame(results.items(), columns=["Method", "Time (seconds)"]).sort_values(
     by="Time (seconds)"
 )
-tools.display_dataframe_to_user(name="Optimized Benchmark of Methods", dataframe=df)
+print("Optimized Benchmark of Methods:")
+print(df)
