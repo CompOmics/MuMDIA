@@ -1,6 +1,6 @@
 # Makefile for MuMDIA testing and development
 
-.PHONY: help test test-unit test-integration test-fast test-slow coverage lint format type-check install-test-deps clean
+.PHONY: help test test-unit test-integration test-fast test-slow coverage lint format type-check install-test-deps clean diagrams
 
 # Default target
 help:
@@ -18,6 +18,9 @@ help:
 	@echo "  lint              Run linting checks"
 	@echo "  format            Format code with black and isort"
 	@echo "  type-check        Run mypy type checking"
+	@echo ""
+	@echo "Documentation:"
+	@echo "  diagrams          Generate workflow diagrams"
 	@echo ""
 	@echo "Setup:"
 	@echo "  install-test-deps Install test dependencies"
@@ -70,6 +73,11 @@ clean:
 	find . -type d -name "__pycache__" -exec rm -rf {} +
 	find . -type f -name "*.pyc" -delete
 	@echo "Cleanup complete!"
+
+# Documentation
+diagrams:
+	@echo "Generating workflow diagrams..."
+	cd workflow_visualization && ./generate_diagrams.sh
 
 # Development workflow
 dev-setup: install-test-deps

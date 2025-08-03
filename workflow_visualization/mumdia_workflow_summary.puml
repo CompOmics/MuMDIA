@@ -1,0 +1,160 @@
+@startuml
+skinparam object {
+  BackgroundColor #f9f9f9
+  BorderColor #333
+  ArrowColor #333
+  RoundCorner 15
+}
+
+skinparam note {
+  BackgroundColor #ffffcc
+  BorderColor #666
+}
+
+title MuMDIA Workflow Summary
+
+object "Setup & Configuration" as Setup {
+  -- Components --
+  • Parse CLI arguments
+  • Create output directories
+  • Merge config with CLI args
+  
+  -- Outputs --
+  Configuration dict
+  Result directories
+}
+
+object "Initial Peptide Search" as InitialSearch {
+  -- Components --
+  • Run Sage search engine
+  • Load & filter PSM results
+  • Parse fragment matches
+  
+  -- Key Outputs --
+  df_psms: Peptide-spectrum matches
+  df_fragment: Fragment ion matches
+  Fragment intensity data
+}
+
+object "Retention Time Modeling" as RTModeling {
+  -- Components --
+  • Tryptic digest of FASTA
+  • Retrain DeepLC model
+  • Calculate RT prediction bounds
+  
+  -- Key Outputs --
+  Calibrated DeepLC model
+  RT predictions for all peptides
+  95th percentile RT window
+}
+
+object "Retention Window Search" as WindowSearch {
+  -- Components --
+  • Split mzML by RT windows
+  • Run targeted Sage searches
+  • Merge results with initial search
+  
+  -- Key Outputs --
+  Expanded PSM dataset
+  Enhanced fragment coverage
+}
+
+object "Spectral Data Parsing" as SpectralParsing {
+  -- Components --
+  • Parse mzML files
+  • Extract MS1 & MS2 spectra
+  • Build scan relationships
+  
+  -- Key Outputs --
+  MS1 scan dictionary
+  MS2 scan dictionary
+  MS2-to-MS1 mappings
+}
+
+object "Feature Engineering" as FeatureEngineering {
+  -- Components --
+  • DeepLC RT predictions & error features
+  • MS2PiP fragment intensity predictions
+  • Fragment correlation analysis
+  • MS1 precursor intensity features
+  • Peptidoform-level aggregations
+  
+  -- Key Features --
+  RT prediction errors
+  Fragment intensity correlations
+  Precursor ion intensities
+  Statistical aggregations
+  
+  -- Processing --
+  Parallel computation (24 workers)
+  Chunked processing (500 peptidoforms)
+}
+
+object "Machine Learning Scoring" as MLScoring {
+  -- Components --
+  • Neural network classifier
+  • 3-fold cross-validation
+  • FDR control
+  
+  -- Key Outputs --
+  PSM confidence scores
+  Q-values for FDR control
+  Ranked peptide identifications
+}
+
+object "Results & Cleanup" as Results {
+  -- Components --
+  • Export final results
+  • Generate reports
+  • Clean temporary files
+  
+  -- Output Files --
+  mokapot.psms.txt
+  mokapot.peptides.txt
+  mokapot.proteins.txt
+}
+
+' ---- Main Workflow Connections ----
+Setup --> InitialSearch : config
+InitialSearch --> RTModeling : PSM data
+RTModeling --> WindowSearch : RT predictions
+WindowSearch --> SpectralParsing : updated data
+InitialSearch --> SpectralParsing : mzML files
+SpectralParsing --> FeatureEngineering : spectral data
+WindowSearch --> FeatureEngineering : enhanced PSMs
+FeatureEngineering --> MLScoring : feature matrix
+MLScoring --> Results : scored PSMs
+
+' ---- Caching Branches ----
+InitialSearch ..> Setup : pickle cache
+WindowSearch ..> RTModeling : pickle cache
+FeatureEngineering ..> SpectralParsing : pickle cache
+
+note right of FeatureEngineering
+  Core feature types:
+  • Retention time predictions
+  • Fragment intensity correlations
+  • MS1 precursor features
+  • Statistical aggregations
+  
+  Parallel processing with
+  chunked peptidoform analysis
+end note
+
+note right of MLScoring
+  Machine learning pipeline:
+  • Keras neural network
+  • Cross-validation training
+  • FDR-controlled scoring
+  • Confidence estimation
+end note
+
+note bottom of Setup
+  Workflow supports:
+  • Configurable processing
+  • Parallel execution
+  • Caching mechanisms
+  • Modular architecture
+end note
+
+@enduml

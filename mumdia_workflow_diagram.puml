@@ -1,0 +1,108 @@
+@startuml MuMDIA_Workflow
+!theme plain
+title MuMDIA: Multi-modal Data-Independent Acquisition Proteomics Analysis Workflow
+
+skinparam backgroundColor #FFFFFF
+skinparam defaultFontSize 11
+skinparam activity {
+  BackgroundColor #E1F5FE
+  BorderColor #0277BD
+  FontColor #000000
+}
+
+skinparam partition {
+  BackgroundColor #F3E5F5
+  BorderColor #7B1FA2
+}
+
+|Input Data|
+start
+:Raw MS Data\n(.mzML files);
+:Protein Database\n(.fasta file);
+:Configuration\n(.json file);
+
+|Data Processing|
+partition "Peptide Search" {
+  :Generate Peptide Database;
+  :Run Sage Search Engine;
+  :Filter PSMs by q-value;
+}
+
+|Prediction Engines|
+partition "Retention Time Prediction" {
+  :DeepLC RT Prediction;
+  :Transfer Learning\nModel Training;
+  :RT Feature Generation;
+}
+
+partition "Fragment Intensity Prediction" {
+  :MS2PIP Fragment\nIntensity Prediction;
+  :Theoretical Spectrum\nGeneration;
+  :Spectral Similarity\nCalculation;
+}
+
+|Feature Engineering|
+partition "Multi-modal Features" {
+  :Fragment Intensity\nFeatures;
+  :Retention Time\nFeatures;
+  :General PSM\nFeatures;
+  :Precursor Features;
+}
+
+:Feature Concatenation\nand Normalization;
+
+|Machine Learning|
+partition "Model Training & Scoring" {
+  :Choose ML Model\n(XGBoost/Neural Net/Percolator);
+  if (Model Type?) then (Neural Network)
+    :Keras Sequential Model\nwith Dense Layers;
+  else (XGBoost/Percolator)
+    :Mokapot ML Pipeline;
+  endif
+  :Train Model on Features;
+  :Score PSMs;
+}
+
+|Quality Control|
+partition "Result Processing" {
+  :Statistical Validation;
+  :FDR Control;
+  :Result Filtering;
+  :Quality Metrics;
+}
+
+|Output|
+:Scored PSMs\n(.txt files);
+:Peptide Results\n(.txt files);
+:Quality Reports;
+:Intermediate Results\n(.pkl files);
+
+stop
+
+note right of start
+  **Input Requirements:**
+  • .mzML mass spectrometry files
+  • Protein FASTA database
+  • Configuration parameters
+  • Optional: Pre-trained models
+end note
+
+note left of "Feature Concatenation\nand Normalization"
+  **Feature Types:**
+  • Cosine similarity
+  • Pearson correlation
+  • RT delta features
+  • Fragment matching
+  • Precursor mass accuracy
+  • Spectral intensity metrics
+end note
+
+note right of "Choose ML Model\n(XGBoost/Neural Net/Percolator)"
+  **Supported Models:**
+  • XGBoost (gradient boosting)
+  • Neural Networks (Keras)
+  • Percolator (SVM-based)
+  • Custom ensemble models
+end note
+
+@enduml
