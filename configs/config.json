@@ -18,7 +18,7 @@
                 "b",
                 "y"
             ],
-            "min_ion_index": 0,
+            "min_ion_index": 2,
             "static_mods": {
                 "C": 57.0215
             },
@@ -38,8 +38,8 @@
         },
         "fragment_tol": {
             "ppm": [
-                -25,
-                25
+                -13,
+                13
             ]
         },
         "precursor_charge": [
@@ -56,8 +56,8 @@
         "wide_window": true,
         "min_peaks": 0,
         "max_peaks": 10000,
-        "min_matched_peaks": 4,
-        "max_fragment_charge": 2,
+        "min_matched_peaks": 5,
+        "max_fragment_charge": 1,
         "report_psms": 5,
         "output_directory": "./",
         "mzml_paths": [
@@ -81,7 +81,7 @@
                 "b",
                 "y"
             ],
-            "min_ion_index": 0,
+            "min_ion_index": 2,
             "fixed_mods": {
                 "C": 57.0215
             },
@@ -101,8 +101,8 @@
         },
         "fragment_tol": {
             "ppm": [
-                -25,
-                25
+                -13,
+                13
             ]
         },
         "precursor_charge": [
@@ -120,26 +120,25 @@
         "wide_window": true,
         "min_peaks": 0,
         "max_peaks": 10000,
-        "min_matched_peaks": 2,
+        "min_matched_peaks": 3,
         "max_fragment_charge": 1,
-        "report_psms": 15,
+        "report_psms": 25,
         "output_directory": "./",
         "mzml_paths": [
             "LFQ_Orbitrap_AIF_Ecoli_01.mzML"
         ]
     },
     "mumdia": {
-        "write_deeplc_pickle": true,
+        "write_deeplc_pickle": false,
         "write_ms2pip_pickle": true,
         "write_correlation_pickles": true,
         "write_initial_search_pickle": true,
         "write_full_search_pickle": true,
         "read_deeplc_pickle": false,
         "read_ms2pip_pickle": false,
-        "read_correlation_pickles": false,
-        "read_full_search_pickles": false,
-        "read_initial_search_pickle": false,
-        "read_full_search_pickle": false,
+        "read_correlation_pickles": true,
+        "read_full_search_pickles": true,
+        "read_initial_search_pickle": true,
         "remove_intermediate_files": false,
         "dlc_transfer_learn": false,
         "fdr_init_search": 0.001,

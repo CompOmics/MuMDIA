@@ -1,10 +1,12 @@
 import pandas as pd
 import polars as pl
+from typing import Dict, Tuple, Optional, Union
+from pathlib import Path
 
 
 def replace_mass_shift(
-    peptide,
-    replace_dict={
+    peptide: str,
+    replace_dict: Dict[str, str] = {
         "[+57.0215]": "[Carbamidomethyl]",
         "[+57.021465]": "[Carbamidomethyl]",
         "[+15.9949]": "[Oxidation]",
@@ -39,17 +41,51 @@ def replace_mass_shift(
         "[+56.026215]": "[Delta:H(4)C(3)O(1)]",
         "[+71.03712]": "[Propionamide]",
     },
-):
+) -> str:
+    """
+    Replace mass shift annotations with standardized modification names.
+    
+    Converts numeric mass shift annotations (e.g., [+57.0215]) to readable 
+    modification names (e.g., [Carbamidomethyl]) for better interpretability.
+    
+    Args:
+        peptide: Peptide sequence string with mass shift annotations
+        replace_dict: Dictionary mapping mass shifts to modification names
+        
+    Returns:
+        Peptide sequence with standardized modification names
+    """
     for k, v in replace_dict.items():
         peptide = peptide.replace(k, v)
     return peptide
 
 
 def parquet_reader(
-    parquet_file_results="results.sage.parquet",
-    parquet_file_fragments="matched_fragments.sage.parquet",
-    q_value_filter=1.0,
-):
+    parquet_file_results: Union[str, Path] = "results.sage.parquet",
+    parquet_file_fragments: Union[str, Path] = "matched_fragments.sage.parquet",
+    q_value_filter: float = 1.0,
+) -> Tuple[Optional[pl.DataFrame], Optional[pl.DataFrame], Optional[pl.DataFrame], Optional[pl.DataFrame]]:
+    """
+    Load and process Sage search results from parquet files.
+    
+    This function loads PSM and fragment data from Sage parquet outputs, applies
+    q-value filtering, processes modification annotations, and creates derived
+    DataFrames for downstream analysis.
+    
+    Args:
+        parquet_file_results: Path to Sage PSM results parquet file
+        parquet_file_fragments: Path to Sage fragment matches parquet file  
+        q_value_filter: Q-value threshold for filtering PSMs (default: 1.0 = no filtering)
+        
+    Returns:
+        Tuple containing:
+        - df_fragment: All fragment matches with peptide info joined
+        - df_psms: Filtered PSMs with fragment intensities added
+        - df_fragment_max: Maximum intensity fragment per PSM
+        - df_fragment_max_peptide: Maximum intensity fragment per unique peptide
+        
+        Returns (None, None, None, None) if no fragments pass the q-value filter
+    """
     df_fragment = pd.read_parquet(parquet_file_fragments)
     df_fragment.index = df_fragment["psm_id"]
 

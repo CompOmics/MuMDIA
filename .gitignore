@@ -31,6 +31,8 @@ fasta/
 *.pkl
 *.mzml
 *.mzML
+*.mgf
+*.ckpt
 mokapot.*
 peptide_predictions.*
 

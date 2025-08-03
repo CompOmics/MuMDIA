@@ -1,0 +1,31 @@
+# Test requirements for MuMDIA
+# Install with: pip install -r test_requirements.txt
+
+# Core testing framework
+pytest>=7.0.0
+pytest-cov>=4.0.0
+pytest-mock>=3.10.0
+pytest-xdist>=3.0.0  # For parallel test execution
+
+# Testing utilities
+pytest-benchmark>=4.0.0  # For performance testing
+pytest-timeout>=2.1.0    # For timeout handling
+pytest-html>=3.0.0       # For HTML test reports
+
+# Data and scientific testing
+numpy>=1.20.0
+polars>=0.19.0
+
+# Mocking and fixtures
+responses>=0.23.0         # For HTTP mocking if needed
+freezegun>=1.2.0         # For time mocking
+factory-boy>=3.2.0       # For test data generation
+
+# Code quality
+flake8>=5.0.0
+black>=22.0.0
+isort>=5.10.0
+mypy>=1.0.0
+
+# Coverage reporting
+coverage[toml]>=6.0.0

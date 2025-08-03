@@ -1,0 +1,60 @@
+MTD	mzTab-version	1.0.0
+MTD	mzTab-mode	Summary
+MTD	mzTab-type	Identification
+MTD	description	Casanovo identification file results
+MTD	software[1]	[MS, MS:1003281, Casanovo, 4.3.0]
+MTD	psm_search_engine_score[1]	[MS, MS:1001143, search engine specific score for PSMs, ]
+MTD	fixed_mod[1]	[UNIMOD, UNIMOD:4, Carbamidomethyl, ]
+MTD	fixed_mod[1]-site	C
+MTD	variable_mod[1]	[UNIMOD, UNIMOD:7, Deamidated, ]
+MTD	variable_mod[1]-site	N
+MTD	variable_mod[2]	[UNIMOD, UNIMOD:7, Deamidated, ]
+MTD	variable_mod[2]-site	Q
+MTD	variable_mod[3]	[UNIMOD, UNIMOD:35, Oxidation, ]
+MTD	variable_mod[3]-site	M
+MTD	variable_mod[4]	[UNIMOD, UNIMOD:5, Carbamyl, ]
+MTD	variable_mod[4]-site	N-term
+MTD	variable_mod[5]	[UNIMOD, UNIMOD:1, Acetyl, ]
+MTD	variable_mod[5]-site	N-term
+MTD	variable_mod[6]	[UNIMOD, UNIMOD:385, Ammonia-loss, ]
+MTD	variable_mod[6]-site	N-term
+MTD	software[1]-setting[1]	model = /home/robbin/.cache/casanovo/casanovo_v4_2_0_v4_2_0.ckpt
+MTD	software[1]-setting[2]	config_filename = default
+MTD	software[1]-setting[3]	precursor_mass_tol = 50.0
+MTD	software[1]-setting[4]	isotope_error_range = (0, 1)
+MTD	software[1]-setting[5]	min_peptide_len = 6
+MTD	software[1]-setting[6]	predict_batch_size = 1024
+MTD	software[1]-setting[7]	n_beams = 1
+MTD	software[1]-setting[8]	top_match = 1
+MTD	software[1]-setting[9]	accelerator = auto
+MTD	software[1]-setting[10]	devices = None
+MTD	software[1]-setting[11]	random_seed = 454
+MTD	software[1]-setting[12]	n_log = 1
+MTD	software[1]-setting[13]	tb_summarywriter = None
+MTD	software[1]-setting[14]	save_top_k = 5
+MTD	software[1]-setting[15]	model_save_folder_path = 
+MTD	software[1]-setting[16]	val_check_interval = 50000
+MTD	software[1]-setting[17]	n_peaks = 150
+MTD	software[1]-setting[18]	min_mz = 50.0
+MTD	software[1]-setting[19]	max_mz = 2500.0
+MTD	software[1]-setting[20]	min_intensity = 0.01
+MTD	software[1]-setting[21]	remove_precursor_tol = 2.0
+MTD	software[1]-setting[22]	max_charge = 10
+MTD	software[1]-setting[23]	dim_model = 512
+MTD	software[1]-setting[24]	n_head = 8
+MTD	software[1]-setting[25]	dim_feedforward = 1024
+MTD	software[1]-setting[26]	n_layers = 9
+MTD	software[1]-setting[27]	dropout = 0.0
+MTD	software[1]-setting[28]	dim_intensity = None
+MTD	software[1]-setting[29]	max_length = 100
+MTD	software[1]-setting[30]	warmup_iters = 100000
+MTD	software[1]-setting[31]	cosine_schedule_period_iters = 600000
+MTD	software[1]-setting[32]	learning_rate = 0.0005
+MTD	software[1]-setting[33]	weight_decay = 1e-05
+MTD	software[1]-setting[34]	train_label_smoothing = 0.01
+MTD	software[1]-setting[35]	train_batch_size = 32
+MTD	software[1]-setting[36]	max_epochs = 30
+MTD	software[1]-setting[37]	num_sanity_val_steps = 0
+MTD	software[1]-setting[38]	calculate_precision = False
+MTD	software[1]-setting[40]	n_workers = 128
+PSH	sequence	PSM_ID	accession	unique	database	database_version	search_engine	search_engine_score[1]	modifications	retention_time	charge	exp_mass_to_charge	calc_mass_to_charge	spectra_ref	pre	post	start	end	opt_ms_run[1]_aa_scores

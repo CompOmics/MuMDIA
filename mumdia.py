@@ -1,44 +1,45 @@
 #!/usr/bin/env python
+"""
+MuMDIA: Multi-modal Data-Independent Acquisition proteomics analysis.
+
+This module contains the core feature calculation and machine learning pipeline
+for peptide-spectrum match scoring using retention time, fragment intensity,
+and MS1 precursor features.
+"""
+
 import os
 import logging
-from tqdm import tqdm
+import concurrent.futures
+from concurrent.futures import ThreadPoolExecutor
+
+from typing import List, Dict, Optional, Any
+import mokapot
+import numba as nb
 import numpy as np
 import polars as pl
-import mokapot
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
-from sklearn.neural_network import MLPClassifier
-from typing import List
-from sklearn.linear_model import Lasso
-from prediction_wrappers.wrapper_deeplc import get_predictions_retention_time_mainloop
-from feature_generators.features_retention_time import add_retention_time_features
-from feature_generators.features_general import add_count_and_filter_peptides
+from keras.layers import Dense
+from keras.models import Sequential
+from scikeras.wrappers import KerasClassifier
+from tqdm import tqdm
+
 from feature_generators.features_fragment_intensity import (
     get_features_fragment_intensity,
 )
-from prediction_wrappers.wrapper_ms2pip import (
-    get_predictions_fragment_intensity_main_loop,
-    get_predictions_fragment_intensity,
-)
-import xgboost as xgb
-from mokapot.model import PercolatorModel
-from keras.models import Sequential
-from keras.layers import Dense
-from scikeras.wrappers import KerasClassifier
-from sklearn.model_selection import cross_val_score
-from copy import deepcopy
+from feature_generators.features_general import add_count_and_filter_peptides
+from feature_generators.features_retention_time import add_retention_time_features
+from prediction_wrappers.wrapper_deeplc import get_predictions_retention_time_mainloop
+from prediction_wrappers.wrapper_ms2pip import get_predictions_fragment_intensity_main_loop
+from utilities.logger import log_info
+from data_structures import PickleConfig, SpectraData
 
-# Import numba and set up Numba decorators
-import numba as nb
+# Re-export for backward compatibility
+__all__ = ['main', 'PickleConfig', 'SpectraData', 'run_mokapot']
 
 # Set maximum threads for Polars to one to avoid oversubscription
 os.environ["POLARS_MAX_THREADS"] = "1"
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
-# Assumes that log_info is defined in utilities.logger.
-from utilities.logger import log_info
-
-import concurrent.futures
 
 from scipy import stats
 
@@ -214,9 +215,9 @@ def create_model():
     Create and compile a simple Keras model.
     """
     model = Sequential()
-    model.add(Dense(100, input_dim=85, activation="relu"))
+    model.add(Dense(100, input_dim=103, activation="relu"))
+    model.add(Dense(50, activation="relu"))
     model.add(Dense(20, activation="relu"))
-    model.add(Dense(10, activation="relu"))
     model.add(Dense(1, activation="sigmoid"))
     model.compile(loss="binary_crossentropy", optimizer="adam", metrics=["accuracy"])
     return model
@@ -451,9 +452,47 @@ def pearson_pvalue(r, n):
 
 
 @nb.njit
-def corr_np_nb_new(data1, data2):
+def corr_np_nb_new(data1: np.ndarray, data2: np.ndarray) -> float:
+    """
+    Compute Pearson correlation coefficient using Numba acceleration.
+    
+    Args:
+        data1: First data array
+        data2: Second data array
+        
+    Returns:
+        Pearson correlation coefficient
+    """
     n = data1.shape[0]
-    # ...
+    if n == 0:
+        return 0.0
+    
+    # Compute means
+    sum1 = 0.0
+    sum2 = 0.0
+    for i in range(n):
+        sum1 += data1[i]
+        sum2 += data2[i]
+    mean1 = sum1 / n
+    mean2 = sum2 / n
+
+    # Compute correlation
+    cov = 0.0
+    var1 = 0.0
+    var2 = 0.0
+    for i in range(n):
+        diff1 = data1[i] - mean1
+        diff2 = data2[i] - mean2
+        cov += diff1 * diff2
+        var1 += diff1 * diff1
+        var2 += diff2 * diff2
+    
+    std1 = (var1 / n) ** 0.5
+    std2 = (var2 / n) ** 0.5
+    
+    if std1 == 0.0 or std2 == 0.0:
+        return 0.0
+    
     return cov / n / (std1 * std2)
 
 
@@ -494,7 +533,7 @@ def run_peptidoform_correlation(
         75,
         100,
     ],  # [0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100],
-    collect_top: List[int] = [1, 2, 3],  # [1, 2, 3, 4, 5],
+    collect_top: List[int] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10],  # [1, 2, 3, 4, 5],
     pad_size=10,
 ):
     """
@@ -519,15 +558,6 @@ def run_peptidoform_correlation(
         mse_avg_pred_intens,
         mse_avg_pred_intens_total,
     ) = correlations_list
-
-    """
-    print(
-        [pearson_pvalue(r, n) for r, n in zip(correlations, correlation_result_counts)]
-    )
-    print(correlations)
-    print(correlation_result_counts)
-    input("stop!")
-    """
 
     feature_dict = {}
     params = [
@@ -756,9 +786,12 @@ def add_precursor_intensities(df_psms, ms1_dict, ms2_to_ms1_dict):
 
     def extract_intensities(scannr, charge, calcmass):
         if scannr not in ms2_to_ms1_dict:
+            log_info(f"Missing scannr {scannr}")
             return {"M-1": 0.0, "M": 0.0, "M+1": 0.0}  # Default if missing
+
         spectrum = ms1_dict.get(ms2_to_ms1_dict[scannr], {})
         if not spectrum:
+            log_info(f"Not a spectrum {scannr}")
             return {"M-1": 0.0, "M": 0.0, "M+1": 0.0}  # Default if spectrum missing
         target_mz = (calcmass / charge) + 1.007276466812
         return find_all_three_isotopic_peaks(
@@ -803,32 +836,35 @@ def calculate_features(
     df_fragment: pl.DataFrame,
     df_fragment_max: pl.DataFrame,
     df_fragment_max_peptide: pl.DataFrame,
+    *,  # Force keyword-only arguments
     filter_rel_rt_error: float = 0.1,
     min_occurrences: int = 1,
     filter_max_apex_rt: float = 0.75,
     config: dict = {},
     deeplc_model=None,
-    write_deeplc_pickle: bool = False,
-    write_ms2pip_pickle: bool = False,
-    write_correlation_pickles: bool = False,
-    read_deeplc_pickle: bool = False,
-    read_ms2pip_pickle: bool = False,
-    read_correlation_pickles: bool = False,
+    pickle_config: Optional[PickleConfig] = None,
     parallel_workers: int = 24,  # Adjust to number of physical cores
     chunk_size: int = 500,  # Increase chunk size to reduce overhead
-    ms1_dict={},
-    ms2_to_ms1_dict={},
+    spectra_data: Optional[SpectraData] = None,
 ) -> None:
     """
     Process the PSM and fragment DataFrames, compute features, and save the output.
     This function uses parallel processing with task chunking.
     """
+    # Handle pickle configuration
+    if pickle_config is None:
+        pickle_config = PickleConfig()
+    
+    # Handle spectra data
+    if spectra_data is None:
+        spectra_data = SpectraData()
+    
     log_info("Obtaining retention time predictions for the main loop...")
     log_info(
-        f"Reading the DeepLC pickle: {read_deeplc_pickle} and writing DeepLC pickle: {write_deeplc_pickle}"
+        f"Reading the DeepLC pickle: {pickle_config.read_deeplc} and writing DeepLC pickle: {pickle_config.write_deeplc}"
     )
     _, _, predictions_deeplc = get_predictions_retention_time_mainloop(
-        df_psms, write_deeplc_pickle, read_deeplc_pickle, deeplc_model
+        df_psms, pickle_config.write_deeplc, pickle_config.read_deeplc, deeplc_model
     )
 
     log_info("Obtaining features retention time...")
@@ -843,14 +879,14 @@ def calculate_features(
 
     log_info("Obtaining fragment intensity predictions for the main loop...")
     log_info(
-        f"Reading the MS2PIP pickle: {read_ms2pip_pickle} and writing MS2PIP pickle: {write_ms2pip_pickle}"
+        f"Reading the MS2PIP pickle: {pickle_config.read_ms2pip} and writing MS2PIP pickle: {pickle_config.write_ms2pip}"
     )
 
     df_fragment, ms2pip_predictions = get_predictions_fragment_intensity_main_loop(
         df_psms,
         df_fragment,
-        read_ms2pip_pickle=read_ms2pip_pickle,
-        write_ms2pip_pickle=write_ms2pip_pickle,
+        read_ms2pip_pickle=pickle_config.read_ms2pip,
+        write_ms2pip_pickle=pickle_config.write_ms2pip,
     )
 
     log_info("Obtaining features fragment intensity predictions...")
@@ -858,13 +894,14 @@ def calculate_features(
         ms2pip_predictions,
         df_fragment,
         df_fragment_max_peptide,
-        read_correlation_pickles=read_correlation_pickles,
-        write_correlation_pickles=write_correlation_pickles,
+        read_correlation_pickles=pickle_config.read_correlation,
+        write_correlation_pickles=pickle_config.write_correlation,
+        ms2_dict=spectra_data.ms2_dict,
     )
 
     log_info("Step 5: obtain MS1 peak presence")
 
-    df_psms = add_precursor_intensities(df_psms, ms1_dict, ms2_to_ms1_dict)
+    df_psms = add_precursor_intensities(df_psms, spectra_data.ms1_dict, spectra_data.ms2_to_ms1_dict)
 
     log_info("Step 6: Grouping peptidoforms by peptide and charge")
 
@@ -927,23 +964,32 @@ def calculate_features(
 
 
 def main(
-    df_fragment: pl.DataFrame = None,
-    df_psms: pl.DataFrame = None,
-    df_fragment_max: pl.DataFrame = None,
-    df_fragment_max_peptide: pl.DataFrame = None,
-    config: dict = {},
-    deeplc_model=None,
-    write_deeplc_pickle: bool = False,
-    write_ms2pip_pickle: bool = False,
-    write_correlation_pickles: bool = False,
-    read_deeplc_pickle: bool = False,
-    read_ms2pip_pickle: bool = False,
-    read_correlation_pickles: bool = False,
-    ms1_dict={},
-    ms2_to_ms1_dict={},
+    df_fragment: Optional[pl.DataFrame] = None,
+    df_psms: Optional[pl.DataFrame] = None,
+    df_fragment_max: Optional[pl.DataFrame] = None,
+    df_fragment_max_peptide: Optional[pl.DataFrame] = None,
+    *,  # Force keyword-only arguments
+    config: Dict[str, Any] = {},
+    deeplc_model: Optional[Any] = None,
+    pickle_config: Optional[PickleConfig] = None,
+    spectra_data: Optional[SpectraData] = None,
 ) -> None:
     """
-    Main function to run the complete analysis pipeline.
+    Main MuMDIA workflow coordinator for feature calculation and PSM scoring.
+    
+    This function orchestrates the complete feature engineering pipeline,
+    including retention time predictions, fragment intensity modeling,
+    MS1 precursor analysis, and parallel peptidoform processing.
+    
+    Args:
+        df_fragment: Fragment matches DataFrame from search engine
+        df_psms: Peptide-spectrum matches DataFrame
+        df_fragment_max: Maximum intensity fragments per PSM
+        df_fragment_max_peptide: Maximum intensity fragments per peptide
+        config: Configuration dictionary with workflow parameters
+        deeplc_model: Optional pre-trained DeepLC model
+        pickle_config: Configuration for caching predictions and features
+        spectra_data: Container for MS1/MS2 spectral data
     """
     df_psms = pl.DataFrame(df_psms)
     df_psms = df_psms.filter(~df_psms["peptide"].str.contains("U"))
@@ -954,16 +1000,10 @@ def main(
         df_fragment,
         df_fragment_max,
         df_fragment_max_peptide,
-        write_deeplc_pickle=write_deeplc_pickle,
-        write_ms2pip_pickle=write_ms2pip_pickle,
-        write_correlation_pickles=write_correlation_pickles,
-        read_deeplc_pickle=read_deeplc_pickle,
-        read_ms2pip_pickle=read_ms2pip_pickle,
-        read_correlation_pickles=read_correlation_pickles,
+        pickle_config=pickle_config,
         deeplc_model=deeplc_model,
         config=config,
-        ms1_dict=ms1_dict,
-        ms2_to_ms1_dict=ms2_to_ms1_dict,
+        spectra_data=spectra_data,
     )
 
     log_info("Done running MuMDIA...")

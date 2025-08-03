@@ -17,6 +17,7 @@ def write_mzml(filename, experiment):
     """Write MSExperiment object to an mzML file"""
     MzMLFile().store(filename, experiment)
 
+
 def get_ms1_mzml(file_path):
     # Create MSExperiment object
     exp = MSExperiment()
@@ -39,17 +40,16 @@ def get_ms1_mzml(file_path):
         if spectrum.getMSLevel() == 1:
             # Extract m/z and intensity values
             mz_array, intensity_array = spectrum.get_peaks()
-            
+
             # Get retention time (in seconds)
             retention_time = spectrum.getRT()
 
             # Update MS1 spectra dictionary
             ms1_spectra[scan_id] = {
-                "mz": mz_array, 
-                "intensity": intensity_array, 
-                "retention_time": retention_time
+                "mz": mz_array,
+                "intensity": intensity_array,
+                "retention_time": retention_time,
             }
-
 
             # Update the last MS1 scan identifier
             last_ms1_id = scan_id
@@ -61,9 +61,14 @@ def get_ms1_mzml(file_path):
 
             retention_time = spectrum.getRT()
 
-            ms2_spectra[scan_id] = {"retention_time": retention_time}
+            ms2_spectra[scan_id] = {
+                "retention_time": retention_time,
+                "mz": mz_array,
+                "intensity": intensity_array,
+            }
 
     return ms1_spectra, ms2_to_ms1_map, ms2_spectra
+
 
 def get_ms1_mzml_old(file_path):
     # Create MSExperiment object
@@ -81,7 +86,7 @@ def get_ms1_mzml_old(file_path):
         if spectrum.getMSLevel() == 1:
             # Extract m/z and intensity values
             mzs, intensities = spectrum.get_peaks()
-            
+
             # Convert to numpy arrays
             mz_array = np.array(mzs)
             intensity_array = np.array(intensities)
@@ -93,6 +98,7 @@ def get_ms1_mzml_old(file_path):
             ms1_spectra[scan_id] = {"mz": mz_array, "intensity": intensity_array}
 
     return ms1_spectra
+
 
 def split_mzml_by_retention_time(original_file, dir_files="", time_interval=120.0):
     """Split mzML file into smaller files based on retention time intervals"""

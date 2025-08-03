@@ -1,18 +1,45 @@
-from matplotlib import pyplot as plt
-from deeplc import DeepLC
+"""
+DeepLC Retention Time Prediction Wrapper for MuMDIA
 
+This module provides interfaces to DeepLC for retention time prediction in
+liquid chromatography-mass spectrometry workflows. DeepLC uses deep learning
+to predict peptide retention times based on sequence and chemical properties.
+
+Key Features:
+- Transfer learning for experiment-specific model adaptation
+- Batch processing for efficient predictions
+- Retention time bounds calculation for targeted searches
+- Model training and validation with experimental data
+- Integration with PSM utils for standardized data formats
+
+The retention time predictions are used for:
+1. Quality filtering of peptide-spectrum matches
+2. Partitioning mzML files for targeted searches  
+3. Feature generation for machine learning scoring
+"""
+
+import pickle
+from pathlib import Path
+from typing import List, Tuple, Optional, Dict, Any, Union
+
+import numpy as np
+import pandas as pd
+import polars as pl
+from deeplc import DeepLC
+from matplotlib import pyplot as plt
 from psm_utils.psm import PSM
 from psm_utils.psm_list import PSMList
 
-import numpy as np
-import polars as pl
-from operator import itemgetter
 
-import pandas as pd
-import pickle
-
-
-def plot_performance(psm_list, preds, outfile="plot.png"):
+def plot_performance(psm_list: PSMList, preds: np.ndarray, outfile: str = "plot.png") -> None:
+    """
+    Create a scatter plot comparing observed vs predicted retention times.
+    
+    Args:
+        psm_list: List of PSM objects with retention time information
+        preds: Array of predicted retention times
+        outfile: Output file path for the plot
+    """
     plt.scatter([v.retention_time for v in psm_list], preds, s=3, alpha=0.05)
     plt.xlabel("Observed retention time (min)")
     plt.ylabel("Predicted retention time (min)")
@@ -20,7 +47,20 @@ def plot_performance(psm_list, preds, outfile="plot.png"):
     plt.close()
 
 
-def predict_deeplc_pl_old(psm_df_pl, dlc_model):
+def predict_deeplc_pl_old(psm_df_pl: pl.DataFrame, dlc_model: DeepLC) -> pl.DataFrame:
+    """
+    Legacy function: Generate DeepLC retention time predictions for all PSMs.
+    
+    Note: This function processes all PSMs individually. Use predict_deeplc_pl() for 
+    better performance with deduplicated peptides.
+    
+    Args:
+        psm_df_pl: Polars DataFrame with 'peptide' and 'rt' columns
+        dlc_model: Trained DeepLC model
+        
+    Returns:
+        DataFrame with added 'rt_predictions' column
+    """
     # rt_train get the psm_id and add instread, then merge with prev
     psm_list = [
         PSM(peptidoform=seq, retention_time=tr, spectrum_id=idx)
@@ -36,7 +76,20 @@ def predict_deeplc_pl_old(psm_df_pl, dlc_model):
     return psm_df_pl
 
 
-def predict_deeplc_pl(psm_df_pl, dlc_model):
+def predict_deeplc_pl(psm_df_pl: pl.DataFrame, dlc_model: DeepLC) -> pl.DataFrame:
+    """
+    Generate DeepLC retention time predictions with peptide deduplication for efficiency.
+    
+    This function optimizes prediction by computing RT predictions only for unique peptides,
+    then merging results back to the full PSM DataFrame.
+    
+    Args:
+        psm_df_pl: Polars DataFrame containing PSM data with 'peptide' and 'rt' columns
+        dlc_model: Trained DeepLC model for retention time prediction
+        
+    Returns:
+        Original DataFrame with added 'rt_predictions' column containing predicted retention times
+    """
     # Extract unique peptide entries (deduplicate by peptide sequence)
     unique_peptides_df = psm_df_pl.unique(subset="peptide")
 
@@ -63,7 +116,19 @@ def predict_deeplc_pl(psm_df_pl, dlc_model):
     return psm_df_pl
 
 
-def predict_deeplc(psms_list, dlc_model):
+def predict_deeplc(psms_list: List[Tuple], dlc_model: DeepLC) -> np.ndarray:
+    """
+    Generate retention time predictions for a list of peptide tuples.
+    
+    Args:
+        psms_list: List of tuples containing peptide information, where:
+                  - psms_list[i][-1] contains the peptide sequence
+                  - psms_list[i][-2] contains the spectrum ID
+        dlc_model: Trained DeepLC model
+        
+    Returns:
+        Array of predicted retention times for each peptide
+    """
     psm_list_calib = [
         PSM(peptidoform=seq, spectrum_id=idx)
         for seq, idx in zip(
@@ -76,13 +141,35 @@ def predict_deeplc(psms_list, dlc_model):
 
 
 def retrain_deeplc(
-    df_psms,
-    plot_perf=True,
-    outfile_calib="deeplc_calibration.png",
-    outfile_transf_learn="deeplc_transfer_learn.png",
-    percentile_exclude=95,
-    q_value_filter=0.01,
-):
+    df_psms: pl.DataFrame,
+    plot_perf: bool = True,
+    outfile_calib: Union[str, Path] = "deeplc_calibration.png",
+    outfile_transf_learn: Union[str, Path] = "deeplc_transfer_learn.png",
+    percentile_exclude: float = 95,
+    q_value_filter: float = 0.01,
+) -> Tuple[DeepLC, DeepLC, float]:
+    """
+    Retrain DeepLC model with transfer learning and calculate retention time error bounds.
+    
+    This function performs a two-stage DeepLC training:
+    1. Calibration on high-confidence PSMs
+    2. Transfer learning on filtered data (excluding high-error predictions)
+    
+    Args:
+        df_psms: Polars DataFrame with PSM data including 'spectrum_q', 'peptide', 'rt', 'fragment_intensity'
+        plot_perf: Whether to generate performance plots
+        outfile_calib: Output path for calibration performance plot
+        outfile_transf_learn: Output path for transfer learning performance plot
+        percentile_exclude: Percentile threshold for excluding high-error predictions (default: 95)
+        q_value_filter: Q-value threshold for filtering high-confidence PSMs (default: 0.01)
+        
+    Returns:
+        Tuple containing:
+        - dlc_calibration: Initial calibrated DeepLC model
+        - dlc_transfer_learn: Transfer learning DeepLC model  
+        - perc_95: 95th percentile of absolute RT prediction errors (doubled for window size)
+    """
+    print(df_psms)
     df_psms_filtered = df_psms.filter(df_psms["spectrum_q"] < q_value_filter)
     rt_train = (
         df_psms_filtered.sort("fragment_intensity")
@@ -148,15 +235,35 @@ def retrain_deeplc(
 
 
 def get_predictions_retentiontime(
-    df_psms,
-    plot_perf=True,
-    outfile_calib="deeplc_calibration.png",
-    outfile_transf_learn="deeplc_transfer_learn.png",
-    percentile_exclude=50,
-    return_obj=True,
-    return_predictions=True,
-    q_value_filter=0.01,
-):
+    df_psms: pl.DataFrame,
+    plot_perf: bool = True,
+    outfile_calib: Union[str, Path] = "deeplc_calibration.png",
+    outfile_transf_learn: Union[str, Path] = "deeplc_transfer_learn.png",
+    percentile_exclude: float = 50,
+    return_obj: bool = True,
+    return_predictions: bool = True,
+    q_value_filter: float = 0.01,
+) -> Union[Tuple[DeepLC, DeepLC], Tuple[DeepLC, DeepLC, pl.DataFrame]]:
+    """
+    Complete DeepLC training and prediction pipeline.
+    
+    Performs calibration, transfer learning, and generates predictions for all peptides.
+    This is the main function for retention time prediction in the initial workflow.
+    
+    Args:
+        df_psms: Polars DataFrame with PSM data
+        plot_perf: Whether to generate performance plots
+        outfile_calib: Output path for calibration plot
+        outfile_transf_learn: Output path for transfer learning plot
+        percentile_exclude: Percentile for filtering training data (default: 50)
+        return_obj: Whether to return trained model objects
+        return_predictions: Whether to return prediction DataFrame
+        q_value_filter: Q-value threshold for high-confidence PSMs
+        
+    Returns:
+        If return_obj and return_predictions: (dlc_calibration, dlc_transfer_learn, predictions_df)
+        If return_obj only: (dlc_calibration, dlc_transfer_learn)
+    """
     df_psms_filtered = df_psms.filter(df_psms["spectrum_q"] < q_value_filter)
 
     rt_train = (
@@ -236,8 +343,27 @@ def get_predictions_retention_time_mainloop(
     df_psms: pl.DataFrame,
     write_deeplc_pickle: bool,
     read_deeplc_pickle: bool,
-    deeplc_model=None,
-):
+    deeplc_model: Optional[DeepLC] = None,
+) -> Tuple[Optional[DeepLC], Optional[DeepLC], pl.DataFrame]:
+    """
+    Main function for managing DeepLC predictions with caching support.
+    
+    This function handles the logic for training new models vs. using cached models,
+    and manages pickle file I/O for caching trained models and predictions.
+    
+    Args:
+        df_psms: Polars DataFrame containing PSM data
+        write_deeplc_pickle: Whether to save models and predictions to pickle files
+        read_deeplc_pickle: Whether to load models and predictions from pickle files
+        deeplc_model: Optional pre-trained DeepLC model to use for predictions
+        
+    Returns:
+        Tuple containing:
+        - dlc_calibration: Calibrated DeepLC model (None if using pre-trained model)
+        - dlc_transfer_learn: Transfer learning DeepLC model (None if using pre-trained model)
+        - predictions_deeplc: DataFrame with retention time predictions
+    """
+    # If you need to write a pickle with predictions or if you are not writing or reading a pickle
     if write_deeplc_pickle or (not write_deeplc_pickle and not read_deeplc_pickle):
         if deeplc_model is None:
             dlc_calibration, dlc_transfer_learn, predictions_deeplc = (
@@ -245,7 +371,7 @@ def get_predictions_retention_time_mainloop(
             )
         else:
             predictions_deeplc = predict_deeplc_pl(df_psms, deeplc_model)
-
+    # If you need to write a pickle
     if write_deeplc_pickle:
         if deeplc_model is None:
             with open("dlc_calibration.pkl", "wb") as f:
@@ -275,12 +401,32 @@ def get_predictions_retention_time_mainloop(
 
 
 def retrain_and_bounds(
-    df_psms,
-    peptides,
-    result_dir="",
-    coefficient_bounds=1.0,
-    correct_to_mzml_rt_constant=60.0,
-):
+    df_psms: pl.DataFrame,
+    peptides: List[Tuple],
+    result_dir: Union[str, Path] = "",
+    coefficient_bounds: float = 1.0,
+    correct_to_mzml_rt_constant: float = 60.0,
+) -> Tuple[pd.DataFrame, DeepLC, DeepLC, float]:
+    """
+    Retrain DeepLC and calculate retention time bounds for windowed searches.
+    
+    This function combines DeepLC retraining with retention time bound calculation
+    for creating time-based mzML partitions in the full search workflow.
+    
+    Args:
+        df_psms: Polars DataFrame with PSM data for training
+        peptides: List of peptide tuples from tryptic digestion
+        result_dir: Directory for saving output plots and files
+        coefficient_bounds: Multiplier for retention time bounds (default: 1.0)
+        correct_to_mzml_rt_constant: Conversion factor for mzML time units (default: 60.0 seconds)
+        
+    Returns:
+        Tuple containing:
+        - peptide_df: Pandas DataFrame with peptides and RT predictions/bounds
+        - dlc_calibration: Calibrated DeepLC model
+        - dlc_transfer_learn: Transfer learning DeepLC model
+        - perc_95: 95th percentile RT error for windowing
+    """
     dlc_calibration, dlc_transfer_learn, perc_95 = retrain_deeplc(
         df_psms,
         outfile_calib=result_dir.joinpath("deeplc_calibration.png"),

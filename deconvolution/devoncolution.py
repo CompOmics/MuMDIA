@@ -2,6 +2,7 @@ from matplotlib import pyplot as plt
 import numpy as np
 from sklearn.linear_model import Lasso
 import random
+import polars as pl
 
 
 def lasso_deconv():

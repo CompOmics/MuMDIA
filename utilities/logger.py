@@ -21,7 +21,8 @@ logging.basicConfig(
 def log_info(message):
     current_time = datetime.datetime.now()
     elapsed = current_time - start_time
-    # Add Rich markup for coloring and styling
-    console.log(
-        f"[green]{current_time:%Y-%m-%d %H:%M:%S}[/green] [bold blue]{message}[/bold blue] - Elapsed Time: [yellow]{elapsed}[/yellow]"
+    # Simple console logging without complex Rich markup
+    simple_message = (
+        f"{current_time:%Y-%m-%d %H:%M:%S} {message} - Elapsed Time: {elapsed}"
     )
+    console.print(simple_message)

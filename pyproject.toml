@@ -1,0 +1,111 @@
+[tool.pytest.ini_options]
+# Pytest configuration for MuMDIA
+minversion = "7.0"
+testpaths = ["tests"]
+
+# Test discovery patterns
+python_files = ["test_*.py", "*_test.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+
+# Markers for test categorization
+markers = [
+    "unit: Unit tests for individual functions/classes",
+    "integration: Integration tests for component interaction", 
+    "slow: Tests that take a long time to run",
+    "fast: Quick tests for CI/CD",
+    "fragmentation: Tests related to fragment intensity features",
+    "data_validation: Tests for data structure validation",
+    "io: Tests for input/output operations",
+    "performance: Performance and benchmarking tests",
+    "numerical: Tests for numerical accuracy and mathematical functions",
+    "memory: Tests for memory usage and resource monitoring",
+    "statistical: Tests for statistical methods and analysis",
+    "scalability: Tests for scalability and large data handling",
+    "complexity: Tests for computational complexity analysis",
+    "resource: Tests for resource usage and monitoring"
+]
+
+# Output formatting
+addopts = [
+    "--strict-markers",
+    "--tb=short",
+    "--disable-warnings",
+    "-ra",  # Show summary of all except passed
+]
+
+# Filters for warnings
+filterwarnings = [
+    "ignore::UserWarning",
+    "ignore::DeprecationWarning",
+    "ignore::PendingDeprecationWarning",
+]
+
+# Test timeout (in seconds)
+timeout = 300
+
+[tool.coverage.run]
+source = [
+    "feature_generators",
+    "data_structures", 
+    "utilities",
+    "parsers",
+    "prediction_wrappers",
+    "peptide_search"
+]
+
+omit = [
+    "*/tests/*",
+    "*/__pycache__/*",
+    "*/venv/*",
+    "*/env/*",
+    "setup.py",
+    "conftest.py"
+]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "if self.debug:",
+    "if settings.DEBUG",
+    "raise AssertionError",
+    "raise NotImplementedError",
+    "if 0:",
+    "if __name__ == .__main__.:",
+    "class .*\\bProtocol\\):",
+    "@(abc\\.)?abstractmethod",
+]
+
+show_missing = true
+precision = 2
+skip_covered = false
+
+[tool.coverage.html]
+directory = "htmlcov"
+
+[tool.mypy]
+python_version = "3.11"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+disallow_untyped_decorators = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_no_return = true
+warn_unreachable = true
+strict_equality = true
+
+[tool.black]
+line-length = 88
+target-version = ['py311']
+include = '\.pyi?$'
+
+[tool.isort]
+profile = "black"
+multi_line_output = 3
+line_length = 88
+known_first_party = ["mumdia", "feature_generators", "data_structures", "utilities"]
