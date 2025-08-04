@@ -4,21 +4,22 @@ Test suite for utility functions.
 This module tests logging, I/O utilities, and pickling functionality.
 """
 
-import pytest
-import tempfile
 import os
+import tempfile
 from pathlib import Path
-from unittest.mock import Mock, patch, mock_open
-import polars as pl
+from unittest.mock import Mock, mock_open, patch
 
-from utilities.logger import log_info
+import polars as pl
+import pytest
+
+from data_structures import PickleConfig
 from utilities.io_utils import (
+    assign_identifiers,
     create_directory,
     remove_intermediate_files,
-    assign_identifiers,
 )
-from utilities.pickling import write_variables_to_pickles, read_variables_from_pickles
-from data_structures import PickleConfig
+from utilities.logger import log_info
+from utilities.pickling import read_variables_from_pickles, write_variables_to_pickles
 
 
 class TestLogger:
@@ -159,7 +160,6 @@ class TestPickling:
                 patch("pickle.dump") as mock_dump,
                 patch("builtins.open", mock_open()) as mock_file,
             ):
-
                 write_variables_to_pickles(
                     df_fragment=sample_fragment_data,
                     df_psms=sample_psm_data,
@@ -188,7 +188,6 @@ class TestPickling:
                 patch("pickle.dump") as mock_dump,
                 patch("builtins.open", mock_open()) as mock_file,
             ):
-
                 write_variables_to_pickles(
                     df_fragment=sample_fragment_data,
                     df_psms=sample_psm_data,
@@ -299,7 +298,6 @@ class TestUtilityIntegration:
 
             # Test that pickling can work in the created directory
             with patch("pickle.dump") as mock_dump, patch("builtins.open", mock_open()):
-
                 write_variables_to_pickles(
                     df_fragment=sample_fragment_data,
                     df_psms=sample_psm_data,

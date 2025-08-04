@@ -5,13 +5,14 @@ This module tests configuration handling, argument parsing,
 and workflow utility functions.
 """
 
-import pytest
-import tempfile
+import argparse
 import json
 import os
+import tempfile
 from pathlib import Path
-from unittest.mock import Mock, patch, MagicMock
-import argparse
+from unittest.mock import MagicMock, Mock, patch
+
+import pytest
 
 # Test configuration utilities
 try:
@@ -22,7 +23,7 @@ except ImportError:
     CONFIG_UTILS_AVAILABLE = False
 
 try:
-    from run import parse_arguments, modify_config, was_arg_explicitly_provided
+    from run import modify_config, parse_arguments, was_arg_explicitly_provided
 
     RUN_MODULE_AVAILABLE = True
 except ImportError:

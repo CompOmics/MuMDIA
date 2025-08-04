@@ -5,15 +5,16 @@ This module tests performance characteristics, memory usage,
 and computational efficiency of various MuMDIA components.
 """
 
-import pytest
-import time
-import psutil
 import os
+import tempfile
+import time
 from pathlib import Path
 from unittest.mock import Mock, patch
-import polars as pl
+
 import numpy as np
-import tempfile
+import polars as pl
+import psutil
+import pytest
 
 
 class TestPerformanceBenchmarks:

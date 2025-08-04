@@ -1,5 +1,6 @@
 # Benchmark different methods using timeit
 import timeit
+
 import pandas as pd
 
 # Define test cases

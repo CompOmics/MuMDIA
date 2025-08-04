@@ -7,12 +7,12 @@ for peptide-spectrum match scoring using retention time, fragment intensity,
 and MS1 precursor features.
 """
 
-import os
-import logging
 import concurrent.futures
+import logging
+import os
 from concurrent.futures import ThreadPoolExecutor
+from typing import Any, Dict, List, Optional
 
-from typing import List, Dict, Optional, Any
 import mokapot
 import numba as nb
 import numpy as np
@@ -22,18 +22,20 @@ from keras.models import Sequential
 from scikeras.wrappers import KerasClassifier
 from tqdm import tqdm
 
+from data_structures import PickleConfig, SpectraData
 from feature_generators.features_fragment_intensity import (
     get_features_fragment_intensity,
 )
 from feature_generators.features_general import add_count_and_filter_peptides
 from feature_generators.features_retention_time import add_retention_time_features
 from prediction_wrappers.wrapper_deeplc import get_predictions_retention_time_mainloop
-from prediction_wrappers.wrapper_ms2pip import get_predictions_fragment_intensity_main_loop
+from prediction_wrappers.wrapper_ms2pip import (
+    get_predictions_fragment_intensity_main_loop,
+)
 from utilities.logger import log_info
-from data_structures import PickleConfig, SpectraData
 
 # Re-export for backward compatibility
-__all__ = ['main', 'PickleConfig', 'SpectraData', 'run_mokapot']
+__all__ = ["main", "PickleConfig", "SpectraData", "run_mokapot"]
 
 # Set maximum threads for Polars to one to avoid oversubscription
 os.environ["POLARS_MAX_THREADS"] = "1"
@@ -455,18 +457,18 @@ def pearson_pvalue(r, n):
 def corr_np_nb_new(data1: np.ndarray, data2: np.ndarray) -> float:
     """
     Compute Pearson correlation coefficient using Numba acceleration.
-    
+
     Args:
         data1: First data array
         data2: Second data array
-        
+
     Returns:
         Pearson correlation coefficient
     """
     n = data1.shape[0]
     if n == 0:
         return 0.0
-    
+
     # Compute means
     sum1 = 0.0
     sum2 = 0.0
@@ -486,13 +488,13 @@ def corr_np_nb_new(data1: np.ndarray, data2: np.ndarray) -> float:
         cov += diff1 * diff2
         var1 += diff1 * diff1
         var2 += diff2 * diff2
-    
+
     std1 = (var1 / n) ** 0.5
     std2 = (var2 / n) ** 0.5
-    
+
     if std1 == 0.0 or std2 == 0.0:
         return 0.0
-    
+
     return cov / n / (std1 * std2)
 
 
@@ -854,11 +856,11 @@ def calculate_features(
     # Handle pickle configuration
     if pickle_config is None:
         pickle_config = PickleConfig()
-    
+
     # Handle spectra data
     if spectra_data is None:
         spectra_data = SpectraData()
-    
+
     log_info("Obtaining retention time predictions for the main loop...")
     log_info(
         f"Reading the DeepLC pickle: {pickle_config.read_deeplc} and writing DeepLC pickle: {pickle_config.write_deeplc}"
@@ -901,7 +903,9 @@ def calculate_features(
 
     log_info("Step 5: obtain MS1 peak presence")
 
-    df_psms = add_precursor_intensities(df_psms, spectra_data.ms1_dict, spectra_data.ms2_to_ms1_dict)
+    df_psms = add_precursor_intensities(
+        df_psms, spectra_data.ms1_dict, spectra_data.ms2_to_ms1_dict
+    )
 
     log_info("Step 6: Grouping peptidoforms by peptide and charge")
 
@@ -976,11 +980,11 @@ def main(
 ) -> None:
     """
     Main MuMDIA workflow coordinator for feature calculation and PSM scoring.
-    
+
     This function orchestrates the complete feature engineering pipeline,
     including retention time predictions, fragment intensity modeling,
     MS1 precursor analysis, and parallel peptidoform processing.
-    
+
     Args:
         df_fragment: Fragment matches DataFrame from search engine
         df_psms: Peptide-spectrum matches DataFrame

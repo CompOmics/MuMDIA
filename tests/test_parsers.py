@@ -5,14 +5,15 @@ This module tests the data parsers that read experimental mzML files
 and search result parquet files, which are critical for data ingestion.
 """
 
-import pytest
-import tempfile
 import os
+import tempfile
 from pathlib import Path
-from unittest.mock import Mock, patch, MagicMock
-import polars as pl
-import pandas as pd
+from unittest.mock import MagicMock, Mock, patch
+
 import numpy as np
+import pandas as pd
+import polars as pl
+import pytest
 
 # Test parsers
 try:
@@ -89,12 +90,15 @@ class TestParquetParser:
             results_file = Path("fake_results.sage.parquet")
             fragments_file = Path("fake_matched_fragments.sage.parquet")
 
-            df_fragment, df_psms, df_fragment_max, df_fragment_max_peptide = (
-                parquet_reader(
-                    parquet_file_results=results_file,
-                    parquet_file_fragments=fragments_file,
-                    q_value_filter=0.01,
-                )
+            (
+                df_fragment,
+                df_psms,
+                df_fragment_max,
+                df_fragment_max_peptide,
+            ) = parquet_reader(
+                parquet_file_results=results_file,
+                parquet_file_fragments=fragments_file,
+                q_value_filter=0.01,
             )
 
             # Verify the function was called and returned DataFrames
@@ -132,12 +136,15 @@ class TestParquetParser:
 
                 # Test with q_value_filter = 0.01
                 try:
-                    df_fragment, df_psms, df_fragment_max, df_fragment_max_peptide = (
-                        parquet_reader(
-                            parquet_file_results=results_file,
-                            parquet_file_fragments=fragments_file,
-                            q_value_filter=0.01,
-                        )
+                    (
+                        df_fragment,
+                        df_psms,
+                        df_fragment_max,
+                        df_fragment_max_peptide,
+                    ) = parquet_reader(
+                        parquet_file_results=results_file,
+                        parquet_file_fragments=fragments_file,
+                        q_value_filter=0.01,
                     )
                     # Just verify no errors occurred and DataFrames returned
                     assert isinstance(df_psms, pl.DataFrame)
@@ -163,12 +170,15 @@ class TestParquetParser:
 
                 # Should handle empty files gracefully
                 try:
-                    df_fragment, df_psms, df_fragment_max, df_fragment_max_peptide = (
-                        parquet_reader(
-                            parquet_file_results=results_file,
-                            parquet_file_fragments=fragments_file,
-                            q_value_filter=0.01,
-                        )
+                    (
+                        df_fragment,
+                        df_psms,
+                        df_fragment_max,
+                        df_fragment_max_peptide,
+                    ) = parquet_reader(
+                        parquet_file_results=results_file,
+                        parquet_file_fragments=fragments_file,
+                        q_value_filter=0.01,
                     )
                     # Verify empty DataFrames returned
                     assert isinstance(df_fragment, pl.DataFrame)

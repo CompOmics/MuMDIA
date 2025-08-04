@@ -1,9 +1,11 @@
 import pickle
 from pathlib import Path
-from typing import Tuple, Union, Any, Optional
+from typing import Any, Optional, Tuple, Union
+
 import polars as pl
-from utilities.io_utils import create_directory
+
 from data_structures import PickleConfig
+from utilities.io_utils import create_directory
 
 
 def write_variables_to_pickles(
@@ -28,13 +30,13 @@ def write_variables_to_pickles(
 ) -> None:
     """
     Serialize DataFrames and configuration to pickle files for caching.
-    
+
     This function saves all workflow state to pickle files for resuming processing
     and optionally exports DataFrames to TSV format for inspection.
-    
+
     Args:
         df_fragment: Fragment matches DataFrame
-        df_psms: PSM results DataFrame  
+        df_psms: PSM results DataFrame
         df_fragment_max: Maximum intensity fragments per PSM
         df_fragment_max_peptide: Maximum intensity fragments per peptide
         config: Configuration dictionary
@@ -126,20 +128,20 @@ def read_variables_from_pickles(
 ) -> Tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame, pl.DataFrame, dict, Any, dict]:
     """
     Deserialize cached DataFrames and configuration from pickle files.
-    
+
     This function loads all workflow state from pickle files to resume processing
     from a previously saved checkpoint.
-    
+
     Args:
         dir: Directory containing pickle files
         df_fragment_fname: Filename for fragment DataFrame pickle
-        df_psms_fname: Filename for PSM DataFrame pickle  
+        df_psms_fname: Filename for PSM DataFrame pickle
         df_fragment_max_fname: Filename for max fragment DataFrame pickle
         df_fragment_max_peptide_fname: Filename for max peptide DataFrame pickle
         config_fname: Filename for configuration pickle
         dlc_transfer_learn_fname: Filename for DeepLC model pickle
         flags_fname: Filename for processing flags pickle
-        
+
     Returns:
         Tuple containing:
         - df_fragment: Fragment matches DataFrame

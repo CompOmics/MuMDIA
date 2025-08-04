@@ -1,5 +1,6 @@
-import pyopenms as pms
 import random
+
+import pyopenms as pms
 
 
 def tryptic_digest_pyopenms(

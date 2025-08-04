@@ -5,13 +5,14 @@ This module tests the prediction wrapper functions that interface with
 DeepLC for retention time prediction and MS2PIP for fragment intensity prediction.
 """
 
-import pytest
-import tempfile
 import pickle
-from unittest.mock import Mock, patch, MagicMock
-import polars as pl
-import numpy as np
+import tempfile
 from pathlib import Path
+from unittest.mock import MagicMock, Mock, patch
+
+import numpy as np
+import polars as pl
+import pytest
 
 # Test prediction wrappers
 try:
@@ -68,13 +69,15 @@ class TestDeepLCWrapper:
             mock_pickle_load.return_value = mock_predictions
 
             try:
-                df_psms_with_rt, dlc_model, predictions = (
-                    get_predictions_retention_time_mainloop(
-                        df_psms=mock_df_psms,
-                        write_deeplc_pickle=False,
-                        read_deeplc_pickle=True,
-                        deeplc_model=None,
-                    )
+                (
+                    df_psms_with_rt,
+                    dlc_model,
+                    predictions,
+                ) = get_predictions_retention_time_mainloop(
+                    df_psms=mock_df_psms,
+                    write_deeplc_pickle=False,
+                    read_deeplc_pickle=True,
+                    deeplc_model=None,
                 )
 
                 # Verify output types
@@ -105,13 +108,15 @@ class TestDeepLCWrapper:
                     mock_exists.return_value = False  # No existing pickle
 
                     try:
-                        df_psms_out, model, predictions = (
-                            get_predictions_retention_time_mainloop(
-                                df_psms=mock_df_psms,
-                                write_deeplc_pickle=True,
-                                read_deeplc_pickle=False,
-                                deeplc_model=None,
-                            )
+                        (
+                            df_psms_out,
+                            model,
+                            predictions,
+                        ) = get_predictions_retention_time_mainloop(
+                            df_psms=mock_df_psms,
+                            write_deeplc_pickle=True,
+                            read_deeplc_pickle=False,
+                            deeplc_model=None,
                         )
 
                         # Should attempt to write predictions
@@ -125,13 +130,15 @@ class TestDeepLCWrapper:
                     mock_load.return_value = {"TESTPEP": 15.2}
 
                     try:
-                        df_psms_out, model, predictions = (
-                            get_predictions_retention_time_mainloop(
-                                df_psms=mock_df_psms,
-                                write_deeplc_pickle=False,
-                                read_deeplc_pickle=True,
-                                deeplc_model=None,
-                            )
+                        (
+                            df_psms_out,
+                            model,
+                            predictions,
+                        ) = get_predictions_retention_time_mainloop(
+                            df_psms=mock_df_psms,
+                            write_deeplc_pickle=False,
+                            read_deeplc_pickle=True,
+                            deeplc_model=None,
                         )
 
                         assert isinstance(predictions, dict)
@@ -159,10 +166,13 @@ class TestDeepLCWrapper:
             mock_deeplc_class.return_value = mock_deeplc
 
             try:
-                peptide_df, calibration, transfer_learn_model, perc_95 = (
-                    retrain_and_bounds(
-                        df_psms=mock_df_psms, peptides=mock_peptides, result_dir="temp/"
-                    )
+                (
+                    peptide_df,
+                    calibration,
+                    transfer_learn_model,
+                    perc_95,
+                ) = retrain_and_bounds(
+                    df_psms=mock_df_psms, peptides=mock_peptides, result_dir="temp/"
                 )
 
                 # Verify outputs
@@ -210,13 +220,14 @@ class TestMS2PIPWrapper:
             mock_pickle_load.return_value = mock_predictions
 
             try:
-                df_fragment_out, ms2pip_predictions = (
-                    get_predictions_fragment_intensity_main_loop(
-                        df_psms=mock_df_psms,
-                        df_fragment=mock_df_fragment,
-                        read_ms2pip_pickle=True,
-                        write_ms2pip_pickle=False,
-                    )
+                (
+                    df_fragment_out,
+                    ms2pip_predictions,
+                ) = get_predictions_fragment_intensity_main_loop(
+                    df_psms=mock_df_psms,
+                    df_fragment=mock_df_fragment,
+                    read_ms2pip_pickle=True,
+                    write_ms2pip_pickle=False,
                 )
 
                 # Verify outputs

@@ -31,7 +31,7 @@ from tqdm import tqdm
 def plot_performance(psm_list, preds, outfile="plot.png"):
     """
     Create a scatter plot comparing observed vs predicted retention times.
-    
+
     Args:
         psm_list: List of PSM objects with retention_time attributes
         preds: Array of predicted retention times
@@ -49,16 +49,16 @@ def batch_process_predict_batch(
 ):
     """
     Process large PSM lists in batches for efficient MS2PIP prediction.
-    
+
     This function splits the input into manageable batches to avoid memory
     issues with large datasets and enables parallel processing.
-    
+
     Args:
         input_list: List of PSM objects for prediction
         batch_size: Number of PSMs to process per batch
         process_function: Function to apply to each batch (typically predict_batch)
         n_processes: Number of parallel processes to use (default: 64)
-        
+
     Returns:
         Combined results from all batches
     """
@@ -76,13 +76,13 @@ def batch_process_predict_batch(
 def get_predictions_fragment_intensity(df_psms):
     """
     Generate MS2PIP fragment intensity predictions for unique peptide-charge combinations.
-    
+
     This function converts PSM data to MS2PIP format, runs predictions, and returns
     a dictionary mapping peptidoform strings to fragment ion intensity predictions.
-    
+
     Args:
         df_psms: Polars DataFrame with columns ['peptide', 'charge', 'rt']
-        
+
     Returns:
         Dictionary mapping peptidoform strings (peptide/charge) to fragment
         intensity dictionaries with keys like 'b1/1', 'y1/1', etc.

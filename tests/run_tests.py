@@ -5,10 +5,11 @@ This script provides convenient ways to run the test suite with different
 configurations and reporting options.
 """
 
-import sys
-import pytest
 import argparse
+import sys
 from pathlib import Path
+
+import pytest
 
 
 def run_tests(

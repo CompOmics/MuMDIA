@@ -5,18 +5,19 @@ This module tests deconvolution, peptide search wrappers, advanced feature
 generation, and other specialized components of the MuMDIA pipeline.
 """
 
-import pytest
-import tempfile
 import json
+import tempfile
 from pathlib import Path
-from unittest.mock import Mock, patch, MagicMock
-import polars as pl
-import pandas as pd
+from unittest.mock import MagicMock, Mock, patch
+
 import numpy as np
+import pandas as pd
+import polars as pl
+import pytest
 
 # Test advanced modules
 try:
-    from peptide_search.wrapper_sage import run_sage, retention_window_searches
+    from peptide_search.wrapper_sage import retention_window_searches, run_sage
 
     SAGE_WRAPPER_AVAILABLE = True
 except ImportError:

@@ -5,9 +5,10 @@ This module tests the core functionality of the features_general module,
 including peptide counting, filtering, and data quality checks.
 """
 
-import pytest
-import polars as pl
 import numpy as np
+import polars as pl
+import pytest
+
 from feature_generators.features_general import add_count_and_filter_peptides
 
 

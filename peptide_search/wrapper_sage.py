@@ -21,27 +21,30 @@ import json
 import os
 import pathlib
 import subprocess
-from typing import Any, Dict, Union, Tuple
+from typing import Any, Dict, Tuple, Union
 
 import numpy as np
 import pandas as pd
 import polars as pl
+
 from parsers.parser_parquet import parquet_reader
 from sequence.fasta import write_to_fasta
 
 
-def run_sage(config: Dict[str, Any], fasta_file: str, output_dir: Union[str, pathlib.Path]) -> None:
+def run_sage(
+    config: Dict[str, Any], fasta_file: str, output_dir: Union[str, pathlib.Path]
+) -> None:
     """
     Execute Sage peptide search engine via subprocess.
-    
+
     This function writes the Sage configuration to a JSON file and executes
     the Sage binary with the specified parameters for peptide identification.
-    
+
     Args:
         config: Dictionary containing Sage configuration parameters
         fasta_file: Path to the protein database FASTA file
         output_dir: Directory where Sage results will be written
-        
+
     Returns:
         None (results written to parquet files in output_dir)
     """
@@ -70,7 +73,7 @@ def run_sage(config: Dict[str, Any], fasta_file: str, output_dir: Union[str, pat
             )
         )
     )
-    
+
     # Execute Sage peptide search engine with the configuration file
     # Key flags explained:
     # --annotate-matches: Include detailed fragment ion annotations in output
@@ -78,39 +81,39 @@ def run_sage(config: Dict[str, Any], fasta_file: str, output_dir: Union[str, pat
     # --disable-telemetry: Prevent Sage from sending usage statistics
     subprocess.run(
         [
-            "bin/sage",           # Sage executable binary
-            json_path,            # Configuration file path
-            "-o",                 # Output directory flag
-            output_dir,           # Directory for results
-            "--annotate-matches", # Enable fragment ion annotations
-            "--parquet",          # Use Parquet output format
+            "bin/sage",  # Sage executable binary
+            json_path,  # Configuration file path
+            "-o",  # Output directory flag
+            output_dir,  # Directory for results
+            "--annotate-matches",  # Enable fragment ion annotations
+            "--parquet",  # Use Parquet output format
             "--disable-telemetry-i-dont-want-to-improve-sage",  # Disable telemetry
         ]
     )
 
 
 def retention_window_searches(
-    mzml_dict: Dict[float, str], 
-    peptide_df: pd.DataFrame, 
-    config: Dict[str, Any], 
-    perc_95: float
+    mzml_dict: Dict[float, str],
+    peptide_df: pd.DataFrame,
+    config: Dict[str, Any],
+    perc_95: float,
 ) -> Tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame, pl.DataFrame]:
     """
     Perform Sage searches on retention time-partitioned mzML files.
-    
+
     This function runs targeted searches on time-based mzML partitions using
     peptides predicted to elute in each time window, then combines results.
-    
+
     Args:
         mzml_dict: Mapping of retention time upper bounds to mzML file paths
         peptide_df: DataFrame with peptides and RT prediction bounds
         config: Sage configuration dictionary
         perc_95: 95th percentile RT error for window overlap calculation
-        
+
     Returns:
         Tuple containing combined results:
         - df_fragment: All fragment matches across time windows
-        - df_psms: All PSMs across time windows  
+        - df_psms: All PSMs across time windows
         - df_fragment_max: Maximum intensity fragments per PSM
         - df_fragment_max_peptide: Maximum intensity fragments per peptide
     """
@@ -146,7 +149,7 @@ def retention_window_searches(
 
         # Update configuration for this specific partition
         config["sage"]["database"]["fasta"] = fasta_file  # Set partition-specific FASTA
-        config["sage"]["mzml_paths"] = [mzml_path]        # Set partition-specific mzML
+        config["sage"]["mzml_paths"] = [mzml_path]  # Set partition-specific mzML
 
         # Execute Sage search on this retention time partition
         run_sage(config["sage"], fasta_file, sub_results)

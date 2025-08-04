@@ -1,19 +1,20 @@
-from matplotlib import pyplot as plt
-import numpy as np
-from sklearn.linear_model import Lasso
 import random
+
+import numpy as np
 import polars as pl
+from matplotlib import pyplot as plt
+from sklearn.linear_model import Lasso
 
 
 def generate_random_spectrum(num_peaks, mz_range, intensity_range):
     """
     Generate a random spectrum for testing purposes.
-    
+
     Args:
         num_peaks: Number of peaks to generate
         mz_range: Tuple of (min_mz, max_mz) for m/z values
         intensity_range: Tuple of (min_intensity, max_intensity) for intensities
-    
+
     Returns:
         List of tuples [(mz, intensity), ...]
     """
@@ -22,7 +23,7 @@ def generate_random_spectrum(num_peaks, mz_range, intensity_range):
         mz = random.uniform(mz_range[0], mz_range[1])
         intensity = random.uniform(intensity_range[0], intensity_range[1])
         spectrum.append((mz, intensity))
-    
+
     # Sort by m/z
     spectrum.sort(key=lambda x: x[0])
     return spectrum

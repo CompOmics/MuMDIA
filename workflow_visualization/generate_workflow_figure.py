@@ -4,10 +4,11 @@ Script to generate a figure from the PlantUML workflow diagram.
 Uses PlantUML web service to render the diagram.
 """
 
-import requests
 import base64
 import zlib
 from pathlib import Path
+
+import requests
 
 
 def plantuml_encode(plantuml_text):

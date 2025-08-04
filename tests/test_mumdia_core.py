@@ -5,20 +5,21 @@ This module tests the main MuMDIA functions and workflow components
 that can be tested without external dependencies.
 """
 
-import pytest
+from typing import Dict, List
+from unittest.mock import MagicMock, Mock, patch
+
 import numpy as np
 import polars as pl
-from unittest.mock import Mock, patch, MagicMock
-from typing import List, Dict
+import pytest
 
 # Test core MuMDIA functions
 try:
     from mumdia import (
-        transform_bool,
-        collapse_columns,
         add_feature_columns_nb,
-        numba_percentile,
+        collapse_columns,
         compute_percentiles_nb,
+        numba_percentile,
+        transform_bool,
     )
 
     MUMDIA_CORE_AVAILABLE = True

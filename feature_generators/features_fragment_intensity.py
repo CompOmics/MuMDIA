@@ -23,55 +23,55 @@ from typing import List, Tuple
 import numpy as np
 import polars as pl
 from numba import njit
-from tqdm import tqdm
-
-from utilities.logger import log_info
-from data_structures import PickleConfig, CorrelationResults
 from rustyms import (
+    CompoundPeptidoform,
     FragmentationModel,
     LinearPeptide,
     MassMode,
     RawSpectrum,
-    CompoundPeptidoform,
 )
+from tqdm import tqdm
+
+from data_structures import CorrelationResults, PickleConfig
+from utilities.logger import log_info
 
 
 @njit
 def compute_correlations(intensity_matrix, pred_frag_intens):
     """
     Compute Pearson correlations between experimental and predicted intensities.
-    
+
     This Numba-optimized function calculates correlation coefficients between
     each row of the intensity matrix (representing fragment intensities for
     different PSMs) and the predicted fragment intensities.
-    
+
     Args:
         intensity_matrix: 2D array where each row contains fragment intensities for one PSM
         pred_frag_intens: 1D array of predicted fragment intensities
-        
+
     Returns:
         Array of correlation coefficients, one per PSM
     """
     num_psms = intensity_matrix.shape[0]
     correlations = np.zeros(num_psms)
-    
+
     for i in range(num_psms):
         x = intensity_matrix[i, :]  # Experimental intensities for this PSM
-        y = pred_frag_intens         # Predicted intensities
-        
+        y = pred_frag_intens  # Predicted intensities
+
         # Calculate means and standard deviations
         mean_x = np.mean(x)
         mean_y = np.mean(y)
         std_x = np.std(x)
         std_y = np.std(y)
-        
+
         # Only compute correlation if both arrays have non-zero variance
         if std_x > 0 and std_y > 0:
             covariance = np.mean((x - mean_x) * (y - mean_y))
             correlations[i] = covariance / (std_x * std_y)
         else:
             correlations[i] = 0.0  # No correlation possible with zero variance
-            
+
     return correlations
 
 
@@ -395,12 +395,12 @@ def match_fragments(
 
     fragment_records = []
 
-    unique_psm_id = df_fragment_sub_peptidoform \
-                .sort("fragment_intensity",descending=True) \
-                .unique(subset=["psm_id"], keep="first")
-    
+    unique_psm_id = df_fragment_sub_peptidoform.sort(
+        "fragment_intensity", descending=True
+    ).unique(subset=["psm_id"], keep="first")
+
     unique_psm_id_dicts = unique_psm_id.to_dicts()
-    
+
     for row in unique_psm_id_dicts:
         psm_id = int(row["psm_id"])
         rt = float(row["rt"])
@@ -420,9 +420,7 @@ def match_fragments(
             intensity_array=ms2_dict[scannr]["intensity"],
         )
 
-        linear_peptide = CompoundPeptidoform(
-            peptide
-        )
+        linear_peptide = CompoundPeptidoform(peptide)
 
         annotated_spectrum = spectrum.annotate(
             peptide=linear_peptide,
@@ -435,27 +433,31 @@ def match_fragments(
             for annotated_peak in annotated_spectrum.spectrum
             if annotated_peak.annotation
         ]
-        
+
         for mf in matched_fragments:
             ion_label = re.search(ion_pattern, repr(mf.annotation[0])).group(1)
             ion_charge = re.search(charge_pattern, repr(mf.annotation[0])).group(1)
 
-            fragment_records.append({
-                "psm_id": psm_id,
-                "fragment_type": ion_label[0],
-                "fragment_ordinals": ion_label[1:],
-                "fragment_charge": ion_charge,
-                "fragment_intensity": mf.intensity,
-                "rt": rt,
-                "scannr": scannr,
-                "fragment_name": f"{ion_label}/{ion_charge}",
-                "rt_max_peptide_sub": rt_max_peptide_sub,
-            })
+            fragment_records.append(
+                {
+                    "psm_id": psm_id,
+                    "fragment_type": ion_label[0],
+                    "fragment_ordinals": ion_label[1:],
+                    "fragment_charge": ion_charge,
+                    "fragment_intensity": mf.intensity,
+                    "rt": rt,
+                    "scannr": scannr,
+                    "fragment_name": f"{ion_label}/{ion_charge}",
+                    "rt_max_peptide_sub": rt_max_peptide_sub,
+                }
+            )
     if len(fragment_records) != 0:
-        df_fragment_sub_peptidoform = pl.DataFrame(fragment_records)\
-                                        .sort("fragment_intensity",descending=True)\
-                                        .unique(subset=["psm_id", "fragment_name"], keep="first")
-    
+        df_fragment_sub_peptidoform = (
+            pl.DataFrame(fragment_records)
+            .sort("fragment_intensity", descending=True)
+            .unique(subset=["psm_id", "fragment_name"], keep="first")
+        )
+
     intensity_matrix_df = df_fragment_sub_peptidoform.pivot(
         index="psm_id", columns="fragment_name", values="fragment_intensity"
     ).fill_null(0.0)
@@ -772,4 +774,3 @@ def get_features_fragment_intensity(
             read_correlation_pickles = False  # Fall back to computation
 
     return fragment_dict, correlations_fragment_dict
- 

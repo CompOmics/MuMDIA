@@ -1,9 +1,9 @@
+import os
 import xml.etree.ElementTree as ET
+
+import numpy as np
 import pymzml
 from pyopenms import MSExperiment, MzMLFile
-import numpy as np
-
-import os
 
 
 def read_mzml(filename):

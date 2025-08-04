@@ -5,15 +5,16 @@ This module tests the integration between different workflow stages,
 end-to-end pipeline execution, and complex multi-module interactions.
 """
 
-import pytest
-import tempfile
+import argparse
 import json
 import os
-import argparse
+import tempfile
 from pathlib import Path
-from unittest.mock import Mock, patch, MagicMock
-import polars as pl
+from unittest.mock import MagicMock, Mock, patch
+
 import numpy as np
+import polars as pl
+import pytest
 
 # Import run module
 import run

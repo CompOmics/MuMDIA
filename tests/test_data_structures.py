@@ -5,9 +5,10 @@ This module tests the dataclasses and their functionality used throughout
 the MuMDIA pipeline.
 """
 
-import pytest
-import numpy as np
 from dataclasses import fields
+
+import numpy as np
+import pytest
 
 from data_structures import CorrelationResults, PickleConfig, SpectraData
 

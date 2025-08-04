@@ -4,11 +4,13 @@ Simple tests for utilities.pickling module.
 This module tests basic pickling functionality with proper mock isolation.
 """
 
-import pytest
 import tempfile
-import polars as pl
 from pathlib import Path
 from unittest.mock import Mock, patch
+
+import polars as pl
+import pytest
+
 from data_structures import PickleConfig
 from utilities.pickling import write_variables_to_pickles
 
@@ -53,9 +55,12 @@ class TestWriteVariablesToPickles:
         self, sample_dataframes, sample_config, sample_pickle_config
     ):
         """Test basic pickle writing functionality."""
-        df_fragment, df_psms, df_fragment_max, df_fragment_max_peptide = (
-            sample_dataframes
-        )
+        (
+            df_fragment,
+            df_psms,
+            df_fragment_max,
+            df_fragment_max_peptide,
+        ) = sample_dataframes
 
         with tempfile.TemporaryDirectory() as temp_dir:
             # Mock the pickle.dump to avoid complex object serialization
@@ -81,9 +86,12 @@ class TestWriteVariablesToPickles:
         self, sample_dataframes, sample_config
     ):
         """Test selective pickle writing based on configuration."""
-        df_fragment, df_psms, df_fragment_max, df_fragment_max_peptide = (
-            sample_dataframes
-        )
+        (
+            df_fragment,
+            df_psms,
+            df_fragment_max,
+            df_fragment_max_peptide,
+        ) = sample_dataframes
 
         # Configure to write only some pickles
         selective_config = PickleConfig(

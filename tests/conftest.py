@@ -5,11 +5,12 @@ This module provides common test data, fixtures, and utilities used across
 all test modules in the MuMDIA project.
 """
 
-import pytest
+from pathlib import Path
+from typing import Any, Dict
+
 import numpy as np
 import polars as pl
-from typing import Dict, Any
-from pathlib import Path
+import pytest
 
 from data_structures import CorrelationResults, PickleConfig, SpectraData
 

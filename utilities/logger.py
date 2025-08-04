@@ -1,7 +1,8 @@
 import datetime
-from rich.logging import RichHandler
-from rich.console import Console
 import logging
+
+from rich.console import Console
+from rich.logging import RichHandler
 
 # Record the start time
 start_time = datetime.datetime.now()

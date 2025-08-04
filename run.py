@@ -34,30 +34,30 @@ import argparse
 import json
 import sys
 from pathlib import Path
-from typing import Tuple, Dict, Any
+from typing import Any, Dict, Tuple
+
+import polars as pl
 
 import mumdia
-import polars as pl
-from mumdia import run_mokapot
 from data_structures import PickleConfig, SpectraData
-
-from parsers.parser_mzml import split_mzml_by_retention_time, get_ms1_mzml
+from mumdia import run_mokapot
+from parsers.parser_mzml import get_ms1_mzml, split_mzml_by_retention_time
 from parsers.parser_parquet import parquet_reader
+from peptide_search.wrapper_sage import retention_window_searches, run_sage
 from prediction_wrappers.wrapper_deeplc import retrain_and_bounds
-from peptide_search.wrapper_sage import run_sage, retention_window_searches
 from sequence.fasta import tryptic_digest_pyopenms
-from utilities.io_utils import remove_intermediate_files, create_dirs
+from utilities.io_utils import create_dirs, remove_intermediate_files
 from utilities.logger import log_info
 from utilities.pickling import (
-    write_variables_to_pickles,
     read_variables_from_pickles,
+    write_variables_to_pickles,
 )
 
 
 def parse_arguments() -> Tuple[argparse.ArgumentParser, argparse.Namespace]:
     """
     Parse command line arguments for the MuMDIA workflow.
-    
+
     Returns:
         Tuple containing:
         - parser: ArgumentParser object for checking explicitly provided arguments
@@ -186,11 +186,11 @@ def parse_arguments() -> Tuple[argparse.ArgumentParser, argparse.Namespace]:
 def was_arg_explicitly_provided(parser: argparse.ArgumentParser, arg_name: str) -> bool:
     """
     Check if an argument with destination `arg_name` was explicitly provided on the command line.
-    
+
     Args:
         parser: ArgumentParser object containing argument definitions
         arg_name: Destination name of the argument to check
-        
+
     Returns:
         True if the argument was explicitly provided, False otherwise
     """
@@ -204,16 +204,16 @@ def was_arg_explicitly_provided(parser: argparse.ArgumentParser, arg_name: str) 
 
 
 def modify_config(
-    config_file: str, 
-    result_dir: str, 
-    parser: argparse.ArgumentParser, 
-    args: argparse.Namespace
+    config_file: str,
+    result_dir: str,
+    parser: argparse.ArgumentParser,
+    args: argparse.Namespace,
 ) -> str:
     """
     Update the configuration JSON file with command-line overrides if explicitly provided.
 
     This function loads an existing configuration and ensures that under the "mumdia" key,
-    only those parameters that the user has explicitly specified on the command line will 
+    only those parameters that the user has explicitly specified on the command line will
     override the JSON config. Missing values are filled from argparse defaults.
 
     Args:
@@ -277,7 +277,7 @@ def modify_config(
 def main() -> None:
     """
     Main MuMDIA workflow orchestrator.
-    
+
     This function coordinates the entire MuMDIA pipeline:
     1. Parse command line arguments
     2. Create directory structure
@@ -319,7 +319,7 @@ def main() -> None:
     # The MuMDIA pipeline uses a two-stage search strategy:
     # 1. Initial broad search: Used to train DeepLC retention time models
     # 2. Targeted search: Uses RT predictions to partition data for faster, more accurate searches
-    
+
     if args_dict["write_initial_search_pickle"]:
         log_info("Running initial Sage search for RT model training...")
         run_sage(
@@ -392,7 +392,7 @@ def main() -> None:
     # This stage uses the trained DeepLC model to predict retention times for all
     # possible peptides, then partitions the mzML data by retention time for
     # targeted searches that are both faster and more accurate.
-    
+
     if args_dict["write_full_search_pickle"]:
         log_info("Generating peptide library and training DeepLC model...")
         peptides = tryptic_digest_pyopenms(config["sage"]["database"]["fasta"])
@@ -409,9 +409,12 @@ def main() -> None:
             dir_files="results/temp/",
         )
 
-        df_fragment, df_psms, df_fragment_max, df_fragment_max_peptide = (
-            retention_window_searches(mzml_dict, peptide_df, config, perc_95)
-        )
+        (
+            df_fragment,
+            df_psms,
+            df_fragment_max,
+            df_fragment_max_peptide,
+        ) = retention_window_searches(mzml_dict, peptide_df, config, perc_95)
 
         log_info("Adding the PSM identifier to fragments...")
         df_fragment = df_fragment.join(
@@ -461,14 +464,12 @@ def main() -> None:
     # - MS1 precursor features (mass accuracy, intensity, charge state)
     # - Machine learning model training and PSM scoring
     log_info("Running MuMDIA feature calculation and machine learning pipeline...")
-    
+
     # Configure spectra data
     spectra_data = SpectraData(
-        ms1_dict=ms1_dict,
-        ms2_to_ms1_dict=ms2_to_ms1_dict,
-        ms2_dict=ms2_spectra
+        ms1_dict=ms1_dict, ms2_to_ms1_dict=ms2_to_ms1_dict, ms2_dict=ms2_spectra
     )
-    
+
     mumdia.main(
         df_fragment=df_fragment,
         df_psms=df_psms,

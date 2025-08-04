@@ -5,10 +5,11 @@ This module tests fragment intensity correlation calculations and
 feature generation with proper dependency handling.
 """
 
-import pytest
+from unittest.mock import Mock, patch
+
 import numpy as np
 import polars as pl
-from unittest.mock import Mock, patch
+import pytest
 
 # Check for RustyMS availability
 try:

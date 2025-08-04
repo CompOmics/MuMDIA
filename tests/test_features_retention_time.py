@@ -5,9 +5,10 @@ This module tests the retention time prediction features,
 including DeepLC integration, error calculations, and filtering.
 """
 
-import pytest
-import polars as pl
 import numpy as np
+import polars as pl
+import pytest
+
 from feature_generators.features_retention_time import add_retention_time_features
 
 

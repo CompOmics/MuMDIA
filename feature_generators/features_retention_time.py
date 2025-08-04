@@ -1,5 +1,6 @@
-import polars as pl
 from typing import Union
+
+import polars as pl
 
 
 def add_retention_time_features(
@@ -11,18 +12,18 @@ def add_retention_time_features(
 ) -> pl.DataFrame:
     """
     Add retention time prediction error features and filter by RT accuracy.
-    
+
     This function joins DeepLC retention time predictions with PSMs, calculates
     absolute and relative prediction errors, and filters out PSMs with poor
     retention time predictions to improve overall data quality.
-    
+
     Args:
         df_psms: PSM DataFrame with 'peptide' and 'rt' columns
         predictions_deeplc: DataFrame with 'peptide' and 'rt_predictions' columns
         filter_rel_rt_error: Maximum relative RT error threshold for filtering (default: 0.2)
         rt_prediction_error_abs: Whether to calculate absolute RT error (default: True)
         rt_prediction_error_abs_relative: Whether to calculate relative RT error (default: True)
-        
+
     Returns:
         PSM DataFrame with RT prediction features added and filtered by RT accuracy.
         Added columns: rt_predictions, rt_prediction_error_abs, rt_prediction_error_abs_relative

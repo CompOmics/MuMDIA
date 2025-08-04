@@ -5,12 +5,13 @@ This module tests the numerical accuracy, statistical validity, and
 mathematical correctness of calculations used throughout the pipeline.
 """
 
-import pytest
+import warnings
+from unittest.mock import Mock, patch
+
 import numpy as np
 import polars as pl
+import pytest
 from scipy import stats
-from unittest.mock import Mock, patch
-import warnings
 
 # Test numerical computing modules
 try:

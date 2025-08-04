@@ -6,14 +6,17 @@ This demonstrates the transformation from the old, repetitive parameter style
 to the new, clean dataclass-based configuration approach.
 """
 
-from mumdia import main
-from data_structures import PickleConfig, SpectraData
 import polars as pl
+
+from data_structures import PickleConfig, SpectraData
+from mumdia import main
+
 
 def old_style_example():
     """The old way - repetitive and error-prone."""
     print("❌ OLD STYLE - Not Pythonic:")
-    print("""
+    print(
+        """
     main(
         df_fragment=df_fragment,
         df_psms=df_psms, 
@@ -31,12 +34,15 @@ def old_style_example():
         config=config,
         deeplc_model=model
     )
-    """)
+    """
+    )
+
 
 def new_style_example():
     """The new way - clean and Pythonic."""
     print("✅ NEW STYLE - Pythonic and Clean:")
-    print("""
+    print(
+        """
     # Configure pickle settings clearly
     pickle_config = PickleConfig(
         write_deeplc=True,
@@ -62,12 +68,15 @@ def new_style_example():
         config=config,
         deeplc_model=model
     )
-    """)
+    """
+    )
+
 
 def comparison_benefits():
     """Show the benefits of the new approach."""
     print("🎯 BENEFITS OF THE NEW APPROACH:")
-    print("""
+    print(
+        """
     1. DRY (Don't Repeat Yourself):
        - No more repetitive 'pickle' parameter names
        - Grouped related settings together
@@ -93,53 +102,48 @@ def comparison_benefits():
     6. Immutable Configuration:
        - Dataclasses can be frozen
        - Prevents accidental modifications
-    """)
+    """
+    )
+
 
 def practical_examples():
     """Show practical usage patterns."""
     print("📚 PRACTICAL USAGE PATTERNS:")
-    
+
     print("\n1. Cache Everything:")
     cache_all = PickleConfig(
-        write_deeplc=True,
-        write_ms2pip=True,
-        write_correlation=True
+        write_deeplc=True, write_ms2pip=True, write_correlation=True
     )
-    
+
     print("\n2. Load from Cache:")
-    load_cache = PickleConfig(
-        read_deeplc=True,
-        read_ms2pip=True,
-        read_correlation=True
-    )
-    
+    load_cache = PickleConfig(read_deeplc=True, read_ms2pip=True, read_correlation=True)
+
     print("\n3. Development Mode (write and read):")
     dev_mode = PickleConfig(
-        write_deeplc=True,
-        write_ms2pip=True,
-        read_deeplc=True,
-        read_ms2pip=True
+        write_deeplc=True, write_ms2pip=True, read_deeplc=True, read_ms2pip=True
     )
-    
+
     print("\n4. Production Mode (no caching):")
     prod_mode = PickleConfig()  # All False by default
-    
+
     print("\n5. From Configuration File:")
+
     def from_config_file(config_dict):
         return PickleConfig(
-            write_deeplc=config_dict.get('cache_deeplc', False),
-            write_ms2pip=config_dict.get('cache_ms2pip', False),
-            read_deeplc=config_dict.get('load_cache', False)
+            write_deeplc=config_dict.get("cache_deeplc", False),
+            write_ms2pip=config_dict.get("cache_ms2pip", False),
+            read_deeplc=config_dict.get("load_cache", False),
         )
+
 
 if __name__ == "__main__":
     print("🚀 MuMDIA Pythonic Interface Demonstration\n")
     old_style_example()
-    print("\n" + "="*60 + "\n")
+    print("\n" + "=" * 60 + "\n")
     new_style_example()
-    print("\n" + "="*60 + "\n")
+    print("\n" + "=" * 60 + "\n")
     comparison_benefits()
-    print("\n" + "="*60 + "\n")
+    print("\n" + "=" * 60 + "\n")
     practical_examples()
-    
+
     print("\n🎉 The new interface is much more maintainable and Pythonic!")

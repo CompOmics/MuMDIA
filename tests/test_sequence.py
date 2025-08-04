@@ -5,16 +5,17 @@ This module tests FASTA file processing, protein digestion,
 and peptide sequence handling functionality.
 """
 
-import pytest
-import tempfile
 import os
+import tempfile
 from pathlib import Path
 from unittest.mock import Mock, patch
+
 import polars as pl
+import pytest
 
 # Test sequence module
 try:
-    from sequence.fasta import write_to_fasta, tryptic_digest_pyopenms
+    from sequence.fasta import tryptic_digest_pyopenms, write_to_fasta
 
     SEQUENCE_FASTA_AVAILABLE = True
 except ImportError:
