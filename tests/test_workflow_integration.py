@@ -152,7 +152,9 @@ class TestWorkflowIntegration:
         )
 
         joined = df_psms.join(df_fragment, on="psm_id", how="left")
-        assert len(joined) == 6  # 2 fragments for psm_id=1, 1 for psm_id=2, 2 for psm_id=3, 1 null for psm_id=4
+        assert (
+            len(joined) == 6
+        )  # 2 fragments for psm_id=1, 1 for psm_id=2, 2 for psm_id=3, 1 null for psm_id=4
         assert "fragment_mz" in joined.columns
 
 
