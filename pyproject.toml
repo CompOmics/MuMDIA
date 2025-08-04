@@ -20,6 +20,7 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Bio-Informatics",
 ]
 dependencies = [
+    # Core scientific computing
     "polars>=0.20.0",
     "pandas>=2.0.0",
     "numpy>=1.24.0",
@@ -27,12 +28,29 @@ dependencies = [
     "scikit-learn>=1.3.0",
     "matplotlib>=3.7.0",
     "numba>=0.57.0",
+    
+    # System and monitoring
     "psutil>=5.9.0",
     "rich>=13.0.0",
+    "tqdm>=4.65.0",
+    
+    # Machine learning and proteomics
     "mokapot>=0.8.0",
     "tensorflow>=2.13.0",
     "scikeras>=0.12.0",
-    "tqdm>=4.65.0",
+    
+    # Mass spectrometry tools
+    "pymzml>=2.5.0",
+    "pyopenms>=3.0.0",
+    "rustyms>=0.9.0",
+    
+    # MS prediction tools
+    "ms2pip>=4.0.0",
+    "psm-utils>=0.4.0",
+    "deeplc>=2.0.0",
+    
+    # Web and data handling
+    "requests>=2.31.0",
 ]
 
 [tool.setuptools.packages.find]
@@ -70,15 +88,6 @@ dev = [
     "isort>=5.12",
     "mypy>=1.0",
     "flake8>=6.0",
-]
-rustyms = [
-    "rustyms>=0.9.0",
-]
-deeplc = [
-    "deeplc>=2.0.0",
-]
-ms2pip = [
-    "ms2pip>=4.0.0",
 ]
 
 [project.urls]
