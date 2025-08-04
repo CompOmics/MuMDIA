@@ -8,7 +8,7 @@ peptide sequence and precursor charge state.
 
 Key Features:
 - Batch processing for efficient MS2PIP predictions
-- PSM format conversion for MS2PIP compatibility  
+- PSM format conversion for MS2PIP compatibility
 - Fragment intensity prediction caching via pickle files
 - Integration with Polars DataFrames for fast data processing
 - Support for HCD fragmentation model (HCD2021)

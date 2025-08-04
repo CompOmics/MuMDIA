@@ -14,7 +14,7 @@ Key Features:
 
 The retention time predictions are used for:
 1. Quality filtering of peptide-spectrum matches
-2. Partitioning mzML files for targeted searches  
+2. Partitioning mzML files for targeted searches
 3. Feature generation for machine learning scoring
 """
 

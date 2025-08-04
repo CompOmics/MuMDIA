@@ -8,7 +8,7 @@ to improve peptide-spectrum match scoring in data-independent acquisition workfl
 
 The pipeline includes:
 1. Peptide database generation and FASTA processing
-2. Sage peptide search engine execution  
+2. Sage peptide search engine execution
 3. DeepLC retention time prediction with transfer learning
 4. MS2PIP fragment intensity prediction
 5. Feature generation from multiple modalities
