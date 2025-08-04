@@ -1,3 +1,10 @@
+# Generated documentation and diagrams
+workflow_visualization/*.png
+workflow_visualization/*.svg
+workflow_visualization/*.pdf
+workflow_visualization/plantuml.jar
+workflow_visualization/*.class
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
