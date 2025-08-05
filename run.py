@@ -99,7 +99,7 @@ def parse_arguments() -> Tuple[argparse.ArgumentParser, argparse.Namespace]:
         "--write_initial_search_pickle",
         help="Flag to indicate if all result pickles should be written",
         type=bool,
-        default=True,
+        default=False,
     )
 
     parser.add_argument(
@@ -113,14 +113,14 @@ def parse_arguments() -> Tuple[argparse.ArgumentParser, argparse.Namespace]:
         "--write_deeplc_pickle",
         help="Flag to indicate if DeepLC pickles should be written",
         type=bool,
-        default=True,
+        default=False,
     )
 
     parser.add_argument(
         "--write_ms2pip_pickle",
         help="Flag to indicate if MS2PIP pickles should be written",
         type=bool,
-        default=True,
+        default=False,
     )
 
     parser.add_argument(
@@ -162,7 +162,7 @@ def parse_arguments() -> Tuple[argparse.ArgumentParser, argparse.Namespace]:
         "--write_full_search_pickle",
         help="Flag to indicate if the full search pickles should be written",
         type=bool,
-        default=True,
+        default=False,
     )
 
     parser.add_argument(
@@ -261,6 +261,15 @@ def modify_config(
                 config["mumdia"][key] = default_args.get(key, value)
                 updated = True
 
+    # Ensure the correct mzML file is set in both "sage_basic" and "sage" configs
+    for section in ["sage_basic", "sage"]:
+        if section not in config:
+            config[section] = {}
+        mzml_paths = config[section].get("mzml_paths", [])
+        if args.mzml_file not in mzml_paths:
+            mzml_paths.append(args.mzml_file)
+            config[section]["mzml_paths"] = mzml_paths
+
     # Define new config path in the results folder
     new_config_path = os.path.join(result_dir, "updated_config.json")
 
@@ -340,7 +349,6 @@ def main() -> None:
             q_value_filter=args_dict["fdr_init_search"],
         )
 
-    if args_dict["write_initial_search_pickle"]:
         write_variables_to_pickles(
             df_fragment=df_fragment,
             df_psms=df_psms,
@@ -404,7 +412,7 @@ def main() -> None:
 
         log_info("Partitioning mzML files by predicted retention time...")
         mzml_dict = split_mzml_by_retention_time(
-            "LFQ_Orbitrap_AIF_Ecoli_01.mzML",
+            "mzml_files/LFQ_Orbitrap_AIF_Ecoli_01.mzML",
             time_interval=perc_95,
             dir_files="results/temp/",
         )
@@ -421,7 +429,6 @@ def main() -> None:
             df_psms.select(["psm_id", "scannr"]), on="psm_id", how="left"
         )
 
-    if args_dict["write_full_search_pickle"]:
         write_variables_to_pickles(
             df_fragment=df_fragment,
             df_psms=df_psms,
@@ -454,7 +461,7 @@ def main() -> None:
     # Parse mzML to extract MS1 precursor information for additional features
     log_info("Parsing the mzML file for MS1 precursor information...")
     ms1_dict, ms2_to_ms1_dict, ms2_spectra = get_ms1_mzml(
-        config["sage_basic"]["mzml_paths"][0]
+        config["sage_basic"]["mzml_paths"][1]  # TODO: should be for all mzml files
     )
 
     # Execute the main MuMDIA feature calculation and machine learning pipeline

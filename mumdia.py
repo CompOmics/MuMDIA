@@ -907,6 +907,8 @@ def calculate_features(
         df_psms, spectra_data.ms1_dict, spectra_data.ms2_to_ms1_dict
     )
 
+    log_info(f"Number of PSMs:{df_psms.shape[0]}")
+
     log_info("Step 6: Grouping peptidoforms by peptide and charge")
 
     psm_dict = {}
@@ -915,7 +917,22 @@ def calculate_features(
     ):
         psm_dict[f"{peptidoform}/{charge}"] = df_sub_peptidoform
 
-    # Pass data as-is (read-only) without deep copying.
+    log_info(f"Number of peptidoforms: {len(psm_dict)}")
+
+    # Output psm_dict to a pickle file for debugging
+    # import pickle
+
+    # with open("psm_dict_debug.pkl", "wb") as f:
+    #     pickle.dump(psm_dict, f)
+
+    # with open("fragment_dict_debug.pkl", "wb") as f:
+    #     pickle.dump(fragment_dict, f)
+
+    # with open("correlations_fragment_dict_debug.pkl", "wb") as f:
+    #     pickle.dump(correlations_fragment_dict, f)
+
+    # Pass data as-is (read-only) without deep copying. # FIXME: it goes wrong here, psm_dict which is populated turns into an empty peptidoform_args
+    # Probably due to the keys in some of the dictionaries not matching
     peptidoform_args = [
         (psm_dict[k], fragment_dict[k], correlations_fragment_dict[k])
         for k in psm_dict.keys()
@@ -939,6 +956,7 @@ def calculate_features(
                 desc="Processing chunks",
             )
         )
+
     """
     chunk_results = []
     for chunk in tqdm(chunks):

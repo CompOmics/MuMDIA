@@ -367,7 +367,7 @@ def get_predictions_retention_time_mainloop(
     """
     # If you need to write a pickle with predictions or if you are not writing or reading a pickle
     if write_deeplc_pickle or (not write_deeplc_pickle and not read_deeplc_pickle):
-        if deeplc_model is None:
+        if deeplc_model is None:  # When does this happen?
             (
                 dlc_calibration,
                 dlc_transfer_learn,
@@ -375,6 +375,7 @@ def get_predictions_retention_time_mainloop(
             ) = get_predictions_retentiontime(df_psms)
         else:
             predictions_deeplc = predict_deeplc_pl(df_psms, deeplc_model)
+
     # If you need to write a pickle
     if write_deeplc_pickle:
         if deeplc_model is None:
@@ -382,7 +383,9 @@ def get_predictions_retention_time_mainloop(
                 pickle.dump(dlc_calibration, f)
             with open("dlc_transfer_learn.pkl", "wb") as f:
                 pickle.dump(dlc_transfer_learn, f)
-        with open("predictions_deeplc.pkl", "wb") as f:
+        with open(
+            "predictions_deeplc.pkl", "wb"
+        ) as f:  # TODO: outputted in root, should be in results
             pickle.dump(predictions_deeplc, f)
     if read_deeplc_pickle:
         try:
@@ -396,7 +399,9 @@ def get_predictions_retention_time_mainloop(
         except IOError:
             pass
         with open("predictions_deeplc.pkl", "rb") as f:
-            predictions_deeplc = pickle.load(f)
+            predictions_deeplc = pickle.load(
+                f
+            )  # FIXME: this gives a polars typeError, not sure why. Might be a polars version issue? or a pickle issue?
 
     if deeplc_model:
         return None, None, predictions_deeplc

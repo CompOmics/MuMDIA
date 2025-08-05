@@ -721,47 +721,50 @@ def get_features_fragment_intensity(
 
     log_info("Calculation of all correlation values...")
 
-    if not read_correlation_pickles:
-        for (peptidoform, charge), df_fragment_sub_peptidoform in tqdm(
-            df_fragment.group_by(["peptide", "charge"])
-        ):
-            preds = ms2pip_predictions.get(f"{peptidoform}/{charge}")
-            if not preds:
-                log_info(f"No intensity prediction found for {peptidoform}/{charge}...")
-                continue
-            if df_fragment_sub_peptidoform.shape[0] == 0:
-                log_info(f"No fragments found for {peptidoform}/{charge}...")
-                continue
+    # if (
+    #     not read_correlation_pickles
+    # ):  # TODO: needs to be handled differently because if there is no pickle file, we need to compute the correlations, and empty dicts will be returned
 
-            results = match_fragments(df_fragment_sub_peptidoform, preds, ms2_dict)
+    for (peptidoform, charge), df_fragment_sub_peptidoform in tqdm(
+        df_fragment.group_by(["peptide", "charge"])
+    ):
+        preds = ms2pip_predictions.get(f"{peptidoform}/{charge}")
+        if not preds:
+            log_info(f"No intensity prediction found for {peptidoform}/{charge}...")
+            continue
+        if df_fragment_sub_peptidoform.shape[0] == 0:
+            log_info(f"No fragments found for {peptidoform}/{charge}...")
+            continue
 
-            fragment_dict[f"{peptidoform}/{charge}"] = df_fragment_sub_peptidoform
-            # Keep backward compatibility: convert dataclass back to list for downstream code
-            correlations_fragment_dict[f"{peptidoform}/{charge}"] = [
-                results.correlations,
-                results.correlations_count,
-                results.sum_pred_frag_intens,
-                results.correlation_matrix_psm_ids,
-                results.correlation_matrix_frag_ids,
-                results.correlation_matrix_psm_ids_ignore_zeros,
-                results.correlation_matrix_psm_ids_ignore_zeros_counts,
-                results.correlation_matrix_psm_ids_missing,
-                results.correlation_matrix_psm_ids_missing_zeros_counts,
-                results.correlation_matrix_frag_ids_ignore_zeros,
-                results.correlation_matrix_frag_ids_ignore_zeros_counts,
-                results.correlation_matrix_frag_ids_missing,
-                results.correlation_matrix_frag_ids_missing_zeros_counts,
-                results.most_intens_cor,
-                results.most_intens_cos,
-                results.mse_avg_pred_intens,
-                results.mse_avg_pred_intens_total,
-            ]
+        results = match_fragments(df_fragment_sub_peptidoform, preds, ms2_dict)
 
-        if write_correlation_pickles:
-            with open("fragment_dict.pkl", "wb") as f:
-                pickle.dump(fragment_dict, f)
-            with open("correlations_fragment_dict.pkl", "wb") as f:
-                pickle.dump(correlations_fragment_dict, f)
+        fragment_dict[f"{peptidoform}/{charge}"] = df_fragment_sub_peptidoform
+        # Keep backward compatibility: convert dataclass back to list for downstream code
+        correlations_fragment_dict[f"{peptidoform}/{charge}"] = [
+            results.correlations,
+            results.correlations_count,
+            results.sum_pred_frag_intens,
+            results.correlation_matrix_psm_ids,
+            results.correlation_matrix_frag_ids,
+            results.correlation_matrix_psm_ids_ignore_zeros,
+            results.correlation_matrix_psm_ids_ignore_zeros_counts,
+            results.correlation_matrix_psm_ids_missing,
+            results.correlation_matrix_psm_ids_missing_zeros_counts,
+            results.correlation_matrix_frag_ids_ignore_zeros,
+            results.correlation_matrix_frag_ids_ignore_zeros_counts,
+            results.correlation_matrix_frag_ids_missing,
+            results.correlation_matrix_frag_ids_missing_zeros_counts,
+            results.most_intens_cor,
+            results.most_intens_cos,
+            results.mse_avg_pred_intens,
+            results.mse_avg_pred_intens_total,
+        ]
+
+    if write_correlation_pickles:
+        with open("fragment_dict.pkl", "wb") as f:
+            pickle.dump(fragment_dict, f)
+        with open("correlations_fragment_dict.pkl", "wb") as f:
+            pickle.dump(correlations_fragment_dict, f)
     if read_correlation_pickles:
         try:
             with open("fragment_dict.pkl", "rb") as f:
