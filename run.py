@@ -329,8 +329,13 @@ def main() -> None:
     # 1. Initial broad search: Used to train DeepLC retention time models
     # 2. Targeted search: Uses RT predictions to partition data for faster, more accurate searches
 
-    if args_dict["write_initial_search_pickle"]:
+    if args_dict["write_initial_search_pickle"] or not os.path.exists(
+        result_dir.joinpath(
+            result_temp, result_temp_results_initial_search, "results.sage.parquet"
+        )
+    ):
         log_info("Running initial Sage search for RT model training...")
+        # TODO: Earlier, implement a check whether the mzML file exists, because otherwise Sage will still run on an non-existing file and later on an error will be raised that is not very informative.
         run_sage(
             config["sage_basic"],
             args_dict["fasta_file"],
@@ -401,7 +406,9 @@ def main() -> None:
     # possible peptides, then partitions the mzML data by retention time for
     # targeted searches that are both faster and more accurate.
 
-    if args_dict["write_full_search_pickle"]:
+    if args_dict["write_full_search_pickle"] or not os.path.exists(
+        result_dir.joinpath("results.sage.parquet")
+    ):
         log_info("Generating peptide library and training DeepLC model...")
         peptides = tryptic_digest_pyopenms(config["sage"]["database"]["fasta"])
 
@@ -461,7 +468,7 @@ def main() -> None:
     # Parse mzML to extract MS1 precursor information for additional features
     log_info("Parsing the mzML file for MS1 precursor information...")
     ms1_dict, ms2_to_ms1_dict, ms2_spectra = get_ms1_mzml(
-        config["sage_basic"]["mzml_paths"][1]  # TODO: should be for all mzml files
+        config["sage_basic"]["mzml_paths"][0]  # TODO: should be for all mzml files
     )
 
     # Execute the main MuMDIA feature calculation and machine learning pipeline

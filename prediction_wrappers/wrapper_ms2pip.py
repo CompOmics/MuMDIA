@@ -17,6 +17,7 @@ The predictions are used as features in the MuMDIA machine learning pipeline
 to improve peptide-spectrum match scoring and validation.
 """
 
+import os
 import pickle
 
 import matplotlib.pyplot as plt
@@ -150,14 +151,14 @@ def get_predictions_fragment_intensity_main_loop(
             - peptide: Peptide sequence
             - spectrum_id: Spectrum ID
     """
-    if not read_ms2pip_pickle:
+    if not read_ms2pip_pickle or not os.path.exists("results/ms2pip_predictions.pkl"):
         ms2pip_predictions = get_predictions_fragment_intensity(df_psms)
 
     if write_ms2pip_pickle:
-        with open("ms2pip_predictions.pkl", "wb") as f:
+        with open("results/ms2pip_predictions.pkl", "wb") as f:
             pickle.dump(ms2pip_predictions, f)
-    if read_ms2pip_pickle:
-        with open("ms2pip_predictions.pkl", "rb") as f:
+    if read_ms2pip_pickle and os.path.exists("results/ms2pip_predictions.pkl"):
+        with open("results/ms2pip_predictions.pkl", "rb") as f:
             ms2pip_predictions = pickle.load(f)
 
     df_fragment = df_fragment.filter(df_fragment["psm_id"].is_in(df_psms["psm_id"]))
