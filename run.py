@@ -329,11 +329,22 @@ def main() -> None:
     # 1. Initial broad search: Used to train DeepLC retention time models
     # 2. Targeted search: Uses RT predictions to partition data for faster, more accurate searches
 
-    if args_dict["write_initial_search_pickle"] or not os.path.exists(
-        result_dir.joinpath(
-            result_temp, result_temp_results_initial_search, "results.sage.parquet"
-        )
-    ):
+    # Check if all required initial search pickle files exist
+    initial_search_pickles = [
+        "df_fragment_initial_search.pkl",
+        "df_psms_initial_search.pkl",
+        "df_fragment_max_initial_search.pkl",
+        "df_fragment_max_peptide_initial_search.pkl",
+        "config_initial_search.pkl",
+        "dlc_transfer_learn_initial_search.pkl",
+        "flags_initial_search.pkl",
+    ]
+    initial_search_pickles_exist = all(
+        os.path.exists(result_dir.joinpath(pickle_file))
+        for pickle_file in initial_search_pickles
+    )
+
+    if args_dict["write_initial_search_pickle"] or not initial_search_pickles_exist:
         log_info("Running initial Sage search for RT model training...")
         # TODO: Earlier, implement a check whether the mzML file exists, because otherwise Sage will still run on an non-existing file and later on an error will be raised that is not very informative.
         run_sage(
@@ -406,9 +417,23 @@ def main() -> None:
     # possible peptides, then partitions the mzML data by retention time for
     # targeted searches that are both faster and more accurate.
 
-    if args_dict["write_full_search_pickle"] or not os.path.exists(
-        result_dir.joinpath("results.sage.parquet")
-    ):
+    # Check if all required initial search pickle files exist
+    full_search_pickles = [
+        "df_fragment.pkl",
+        "df_psms.pkl",
+        "df_fragment_max.pkl",
+        "df_fragment_max_peptide.pkl",
+        "config.pkl",
+        "dlc_transfer_learn.pkl",
+        "flags.pkl",
+    ]
+
+    full_search_pickles_exist = all(
+        os.path.exists(result_dir.joinpath(pickle_file))
+        for pickle_file in full_search_pickles
+    )
+
+    if args_dict["write_full_search_pickle"] or not full_search_pickles_exist:
         log_info("Generating peptide library and training DeepLC model...")
         peptides = tryptic_digest_pyopenms(config["sage"]["database"]["fasta"])
 
@@ -421,7 +446,7 @@ def main() -> None:
         mzml_dict = split_mzml_by_retention_time(
             "mzml_files/LFQ_Orbitrap_AIF_Ecoli_01.mzML",
             time_interval=perc_95,
-            dir_files="results/temp/",
+            dir_files=result_dir.joinpath("/temp/"),
         )
 
         (
