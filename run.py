@@ -261,13 +261,14 @@ def modify_config(
                 config["mumdia"][key] = default_args.get(key, value)
                 updated = True
 
-    # Ensure the correct mzML file is set in both "sage_basic" and "sage" configs, if args.mzml_file is explicitly provided
-    if args.mzml_file:
-        for section in ["sage_basic", "sage"]:
-            if section not in config:
-                config[section] = {}
-            # Replace with the provided mzml_file argument
+    # Update mzML and FASTA paths in config if explicitly provided
+    for section in ["sage_basic", "sage"]:
+        if section not in config:
+            config[section] = {}
+        if was_arg_explicitly_provided(parser, "mzml_file"):
             config[section]["mzml_paths"] = [args.mzml_file]
+        if was_arg_explicitly_provided(parser, "fasta_file"):
+            config[section]["database"] = {"fasta": args.fasta_file}
 
     # Define new config path in the results folder
     new_config_path = os.path.join(result_dir, "updated_config.json")

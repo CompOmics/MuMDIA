@@ -42,6 +42,7 @@ fasta/
 *.ckpt
 mokapot.*
 peptide_predictions.*
+*.d
 
 # PyInstaller
 #  Usually these files are written by a python script from a template
