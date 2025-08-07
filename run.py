@@ -410,6 +410,8 @@ def main() -> None:
         del flags["read_full_search_pickle"]
         args_dict.update(flags)
 
+    log_info("Number of PSMs after initial search: {}".format(len(df_psms)))
+
     # ============================================================================
     # STAGE 2: Targeted Search with Retention Time Partitioning
     # ============================================================================
@@ -444,9 +446,9 @@ def main() -> None:
 
         log_info("Partitioning mzML files by predicted retention time...")
         mzml_dict = split_mzml_by_retention_time(
-            "mzml_files/LFQ_Orbitrap_AIF_Ecoli_01.mzML",
+            args.mzml_file,
             time_interval=perc_95,
-            dir_files=result_dir.joinpath("/temp/"),
+            dir_files=result_dir,
         )
 
         (
@@ -528,8 +530,10 @@ def main() -> None:
         log_info("Cleaning up intermediate files...")
         remove_intermediate_files(args_dict["result_dir"])
 
+    return config["mumdia"]["result_dir"]
+
 
 if __name__ == "__main__":
-    main()
+    output_dir = main()  # For now output output_dir, should be handled differently
     # Run Mokapot for final statistical validation and FDR control
-    run_mokapot()
+    run_mokapot(output_dir)

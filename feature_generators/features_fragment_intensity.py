@@ -410,8 +410,12 @@ def match_fragments(
         scannr = row["scannr"]
         peptide = row["peptide"]
 
+        # # Output ms2dict to pickle file for debugging
+        # with open("results/timsconvert/ms2_dict.pkl", "wb") as f:
+        #     pickle.dump(ms2_dict, f)
+
         spectrum = RawSpectrum(
-            title=row["scannr"],
+            title=scannr,
             num_scans=1,
             rt=float(rt),
             precursor_charge=precursor_charge,
@@ -688,6 +692,7 @@ def get_features_fragment_intensity(
     read_correlation_pickles: bool = False,
     write_correlation_pickles: bool = False,
     ms2_dict: dict = {},
+    output_dir: str = "results/",
 ):
     fragment_dict = {}
     correlations_fragment_dict = {}
@@ -718,6 +723,8 @@ def get_features_fragment_intensity(
         (pl.col("rt_max_peptide_sub").is_not_null())
         & (abs(pl.col("rt") - pl.col("rt_max_peptide_sub")) < filter_max_apex_rt)
     )
+
+    log_info("df_fragment after filtering: {}".format(df_fragment.shape))
 
     log_info("Calculation of all correlation values...")
 
@@ -761,15 +768,15 @@ def get_features_fragment_intensity(
         ]
 
     if write_correlation_pickles:
-        with open("fragment_dict.pkl", "wb") as f:
+        with open(f"{output_dir}/fragment_dict.pkl", "wb") as f:
             pickle.dump(fragment_dict, f)
-        with open("correlations_fragment_dict.pkl", "wb") as f:
+        with open(f"{output_dir}/correlations_fragment_dict.pkl", "wb") as f:
             pickle.dump(correlations_fragment_dict, f)
     if read_correlation_pickles:
         try:
-            with open("fragment_dict.pkl", "rb") as f:
+            with open(f"{output_dir}/fragment_dict.pkl", "rb") as f:
                 fragment_dict = pickle.load(f)
-            with open("correlations_fragment_dict.pkl", "rb") as f:
+            with open(f"{output_dir}/correlations_fragment_dict.pkl", "rb") as f:
                 correlations_fragment_dict = pickle.load(f)
             log_info("Successfully loaded correlation data from pickle files")
         except FileNotFoundError:

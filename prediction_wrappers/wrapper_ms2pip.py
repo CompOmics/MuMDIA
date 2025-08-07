@@ -28,6 +28,8 @@ from psm_utils.psm import PSM
 from psm_utils.psm_list import PSMList
 from tqdm import tqdm
 
+from utilities.logger import log_info
+
 
 def plot_performance(psm_list, preds, outfile="plot.png"):
     """
@@ -143,6 +145,7 @@ def get_predictions_fragment_intensity_main_loop(
     df_fragment: pl.DataFrame,
     read_ms2pip_pickle: bool = False,
     write_ms2pip_pickle: bool = False,
+    output_dir: str = None,
 ) -> pl.DataFrame:
     """
     Get fragment intensity predictions using MS2PIP.
@@ -151,17 +154,28 @@ def get_predictions_fragment_intensity_main_loop(
             - peptide: Peptide sequence
             - spectrum_id: Spectrum ID
     """
-    if not read_ms2pip_pickle or not os.path.exists("results/ms2pip_predictions.pkl"):
-        ms2pip_predictions = get_predictions_fragment_intensity(df_psms)
 
-    if write_ms2pip_pickle:
-        with open("results/ms2pip_predictions.pkl", "wb") as f:
-            pickle.dump(ms2pip_predictions, f)
-    if read_ms2pip_pickle and os.path.exists("results/ms2pip_predictions.pkl"):
-        with open("results/ms2pip_predictions.pkl", "rb") as f:
+    if not read_ms2pip_pickle or not os.path.exists(
+        f"{output_dir}/ms2pip_predictions.pkl"
+    ):
+        ms2pip_predictions = get_predictions_fragment_intensity(df_psms)
+        if write_ms2pip_pickle:
+            with open(f"{output_dir}/ms2pip_predictions.pkl", "wb") as f:
+                pickle.dump(ms2pip_predictions, f)
+
+    if read_ms2pip_pickle and os.path.exists(f"{output_dir}/ms2pip_predictions.pkl"):
+        log_info(
+            "Reading MS2PIP predictions from pickle file: %s"
+            % f"{output_dir}/ms2pip_predictions.pkl"
+        )
+        with open(f"{output_dir}/ms2pip_predictions.pkl", "rb") as f:
             ms2pip_predictions = pickle.load(f)
 
+    log_info("Df_fragment shape before filtering: {}".format(df_fragment.shape))
+
     df_fragment = df_fragment.filter(df_fragment["psm_id"].is_in(df_psms["psm_id"]))
+
+    log_info("Df_fragment shape after filtering: {}".format(df_fragment.shape))
 
     df_fragment = df_fragment.with_columns(
         pl.Series(

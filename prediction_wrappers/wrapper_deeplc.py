@@ -346,6 +346,7 @@ def get_predictions_retention_time_mainloop(
     write_deeplc_pickle: bool,
     read_deeplc_pickle: bool,
     deeplc_model: Optional[DeepLC] = None,
+    output_dir: Union[str, Path] = "results",
 ) -> Tuple[Optional[DeepLC], Optional[DeepLC], pl.DataFrame]:
     """
     Main function for managing DeepLC predictions with caching support.
@@ -379,26 +380,24 @@ def get_predictions_retention_time_mainloop(
     # If you need to write a pickle
     if write_deeplc_pickle:
         if deeplc_model is None:
-            with open("dlc_calibration.pkl", "wb") as f:
+            with open(f"{output_dir}/dlc_calibration.pkl", "wb") as f:
                 pickle.dump(dlc_calibration, f)
-            with open("dlc_transfer_learn.pkl", "wb") as f:
+            with open(f"{output_dir}/dlc_transfer_learn.pkl", "wb") as f:
                 pickle.dump(dlc_transfer_learn, f)
-        with open(
-            "predictions_deeplc.pkl", "wb"
-        ) as f:  # TODO: outputted in root, should be in results
+        with open(f"{output_dir}/predictions_deeplc.pkl", "wb") as f:
             pickle.dump(predictions_deeplc, f)
     if read_deeplc_pickle:
         try:
-            with open("dlc_calibration_first.pkl", "rb") as f:
+            with open(f"{output_dir}/dlc_calibration_first.pkl", "rb") as f:
                 dlc_calibration = pickle.load(f)
         except IOError:
             pass
         try:
-            with open("dlc_transfer_learn_first.pkl", "rb") as f:
+            with open(f"{output_dir}/dlc_transfer_learn_first.pkl", "rb") as f:
                 dlc_transfer_learn = pickle.load(f)
         except IOError:
             pass
-        with open("predictions_deeplc.pkl", "rb") as f:
+        with open(f"{output_dir}/predictions_deeplc.pkl", "rb") as f:
             predictions_deeplc = pickle.load(
                 f
             )  # FIXME: this gives a polars typeError, not sure why. Might be a polars version issue? or a pickle issue?
