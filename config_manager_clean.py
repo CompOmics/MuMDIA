@@ -12,7 +12,7 @@ and provides simple methods for loading from JSON files or command-line argument
 import argparse
 import json
 import sys
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Optional
 

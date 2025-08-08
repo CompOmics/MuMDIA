@@ -17,6 +17,7 @@ using retention time predictions to limit peptide candidates for each
 time-partitioned mzML file, leading to faster and more accurate identifications.
 """
 
+import copy
 import json
 import os
 import pathlib
@@ -26,7 +27,6 @@ from typing import Any, Dict, Tuple, Union
 import numpy as np
 import pandas as pd
 import polars as pl
-import copy
 
 from parsers.parser_parquet import parquet_reader
 from sequence.fasta import write_to_fasta

@@ -19,9 +19,8 @@ import os
 import sys
 from typing import Any, Dict
 
-from utilities.logger import log_info
 from utilities.config_models import ConfigModel
-
+from utilities.logger import log_info
 
 _TRUE = {"1", "true", "yes", "on", "y", "t"}
 _FALSE = {"0", "false", "no", "off", "n", "f"}

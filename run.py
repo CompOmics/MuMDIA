@@ -16,18 +16,19 @@ import os
 
 os.environ["POLARS_MAX_THREADS"] = "1"
 
-from pathlib import Path
-import polars as pl
 import argparse
 import json
 import sys
+from pathlib import Path
 from typing import Tuple, cast
 
+import polars as pl
+
+import utilities.pickling as pickling
 from data_structures import PickleConfig, SpectraData
+from utilities.config_loader import merge_config_from_sources, write_updated_config
 from utilities.io_utils import create_dirs, remove_intermediate_files
 from utilities.logger import log_info
-from utilities.config_loader import merge_config_from_sources, write_updated_config
-import utilities.pickling as pickling
 
 
 def parse_arguments() -> Tuple[argparse.ArgumentParser, argparse.Namespace]:
@@ -281,12 +282,12 @@ def main() -> str:
         config = json.load(file)
 
     # Lazy imports for heavy modules to avoid import errors during test collection
+    import mumdia
+    from parsers.parser_mzml import get_ms1_mzml, split_mzml_by_retention_time
     from parsers.parser_parquet import parquet_reader
     from peptide_search.wrapper_sage import retention_window_searches, run_sage
     from prediction_wrappers.wrapper_deeplc import retrain_and_bounds
     from sequence.fasta import tryptic_digest_pyopenms
-    from parsers.parser_mzml import get_ms1_mzml, split_mzml_by_retention_time
-    import mumdia
 
     args_dict = config["mumdia"]
 
