@@ -13,14 +13,43 @@ import os
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional
 
-import mokapot
-import numba as nb
+# Optional numba: provide no-op decorator if unavailable
+try:
+    import numba as nb
+except Exception:
+
+    class _NB:
+        def njit(self, *args, **kwargs):
+            def deco(f):
+                return f
+
+            return deco
+
+    nb = _NB()
 import numpy as np
 import polars as pl
-from keras.layers import Dense
-from keras.models import Sequential
-from scikeras.wrappers import KerasClassifier
-from tqdm import tqdm
+
+# Defer keras/scikeras imports to runtime in create_model/run_mokapot
+
+# Optional tqdm: fallback to identity iterator if unavailable
+try:
+    from tqdm import tqdm
+except Exception:
+
+    def tqdm(iterable=None, *args, **kwargs):
+        return iterable if iterable is not None else []
+
+
+# Optional scipy: create a lazy placeholder that errors on use
+try:
+    from scipy import stats
+except Exception:
+
+    class _Stats:
+        def __getattr__(self, name):
+            raise ImportError("scipy is required for this functionality")
+
+    stats = _Stats()
 
 from data_structures import PickleConfig, SpectraData
 from feature_generators.features_fragment_intensity import (
@@ -43,7 +72,6 @@ os.environ["POLARS_MAX_THREADS"] = "1"
 # Configure logging
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
-from scipy import stats
 
 # Constant features for later concatenation.
 last_features = ["proteins"]
@@ -216,6 +244,14 @@ def create_model():
     """
     Create and compile a simple Keras model.
     """
+    try:
+        from keras.layers import Dense
+        from keras.models import Sequential
+    except Exception as e:
+        raise ImportError(
+            f"Keras is required to build the model for mokapot integration ({e})."
+        )
+
     model = Sequential()
     model.add(Dense(100, input_dim=103, activation="relu"))
     model.add(Dense(50, activation="relu"))
@@ -237,6 +273,15 @@ def run_mokapot(output_dir="results/") -> None:
     Run the mokapot analysis on PSMs read from a PIN file.
     The results are saved to tab-delimited text files.
     """
+    try:
+        import mokapot
+        from scikeras.wrappers import KerasClassifier
+    except Exception as e:
+        log_info(
+            f"mokapot is not installed or failed to import ({e}). Skipping mokapot run."
+        )
+        return None
+
     psms = mokapot.read_pin(f"{output_dir}/outfile.pin")
     model = KerasClassifier(
         build_fn=create_model, epochs=100, batch_size=1000, verbose=10
@@ -282,8 +327,11 @@ def add_feature_columns_nb(data, feature_name, values, method, add_index, pad_si
     """
     data = np.asarray(data, dtype=np.float64)
     required_length = len(values)
+    computed_idx = np.array([], dtype=np.float64)
     if data.size == 0:
         computed = np.zeros(required_length, dtype=np.float64)
+        if len(add_index) > 0:
+            computed_idx = np.zeros(required_length, dtype=np.float64)
     elif method == "percentile":
         qs = np.array(values, dtype=np.float64)
         if len(add_index) > 0:
@@ -306,11 +354,12 @@ def add_feature_columns_nb(data, feature_name, values, method, add_index, pad_si
         computed = padded
         if len(add_index) > 0:
             padded_idx = np.zeros(required_length, dtype=np.float64)
-            padded_idx[: computed_idx.size] = computed_idx
+            if computed_idx.size > 0:
+                padded_idx[: computed_idx.size] = computed_idx
             computed_idx = padded_idx
     else:
         computed = computed[:required_length]
-        if len(add_index) > 0:
+        if len(add_index) > 0 and computed_idx.size > 0:
             computed_idx = computed_idx[:required_length]
 
     if len(add_index) > 0:

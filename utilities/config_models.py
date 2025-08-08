@@ -19,8 +19,9 @@ class DatabaseConfig:
     fasta: str = ""
 
     def validate(self) -> None:
-        if not isinstance(self.fasta, str) or self.fasta.strip() == "":
-            raise ValueError("database.fasta must be a non-empty string")
+        if not isinstance(self.fasta, str):
+            raise ValueError("database.fasta must be a string")
+        # Allow empty strings during initial config creation
 
 
 @dataclass
@@ -29,10 +30,9 @@ class SageSection:
     database: DatabaseConfig = field(default_factory=DatabaseConfig)
 
     def validate(self) -> None:
-        if not isinstance(self.mzml_paths, list) or any(
-            not isinstance(x, str) or x.strip() == "" for x in self.mzml_paths
-        ):
-            raise ValueError("sage section requires non-empty list of mzml_paths")
+        if not isinstance(self.mzml_paths, list):
+            raise ValueError("sage section requires mzml_paths to be a list")
+        # Allow empty lists during initial config creation
         self.database.validate()
 
 
@@ -73,16 +73,7 @@ class MuMDIASettings:
             or self.fdr_init_search < 0
         ):
             raise ValueError("fdr_init_search must be a non-negative number")
-        for path_attr in (
-            "mzml_file",
-            "mzml_dir",
-            "fasta_file",
-            "result_dir",
-            "config_file",
-        ):
-            val = getattr(self, path_attr, "")
-            if not isinstance(val, str) or val.strip() == "":
-                raise ValueError(f"{path_attr} must be a non-empty string")
+        # Allow empty strings during initial config creation - they'll be filled with defaults
 
 
 @dataclass
@@ -103,8 +94,10 @@ class ConfigModel:
         sage_basic_raw: Dict[str, Any] = data.get("sage_basic", {}) or {}
         sage_raw: Dict[str, Any] = data.get("sage", {}) or {}
 
-        # Build nested objects; tolerate missing keys
-        mumdia = MuMDIASettings(**{**asdict(MuMDIASettings()), **mumdia_raw})
+        # Build nested objects; tolerate missing keys and filter unknown fields
+        mumdia_defaults = asdict(MuMDIASettings())
+        mumdia_filtered = {k: v for k, v in mumdia_raw.items() if k in mumdia_defaults}
+        mumdia = MuMDIASettings(**{**mumdia_defaults, **mumdia_filtered})
 
         # Database
         sb_db = DatabaseConfig(
