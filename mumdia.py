@@ -890,8 +890,6 @@ def calculate_features(
         read_ms2pip_pickle=pickle_config.read_ms2pip,
         write_ms2pip_pickle=pickle_config.write_ms2pip,
     )
-
-    log_info("Obtaining features fragment intensity predictions...")
     fragment_dict, correlations_fragment_dict = get_features_fragment_intensity(
         ms2pip_predictions,
         df_fragment,

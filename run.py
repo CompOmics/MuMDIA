@@ -6,39 +6,21 @@ This is the main entry point for the MuMDIA proteomics analysis pipeline.
 MuMDIA integrates multiple prediction tools and machine learning approaches
 to improve peptide-spectrum match scoring in data-independent acquisition workflows.
 
-The pipeline includes:
-1. Peptide database generation and FASTA processing
-2. Sage peptide search engine execution
-3. DeepLC retention time prediction with transfer learning
-4. MS2PIP fragment intensity prediction
-5. Feature generation from multiple modalities
-6. Machine learning-based PSM scoring with Mokapot
-7. Quality control and result validation
-
-Key Features:
-- Retention time-partitioned searches for improved speed
-- Multi-modal feature integration (RT, fragment intensity, precursor features)
-- Configurable machine learning models (XGBoost, Neural Networks, Percolator)
-- Comprehensive logging and intermediate result caching
-- Parallel processing for computational efficiency
-
 Usage:
     python run.py --mzml_file data.mzML --fasta_file proteins.fasta --result_dir results/
+    python run.py --config_file my_config.json
+    python run.py --no-cache  # Force recomputation
 """
 
 import os
 
 os.environ["POLARS_MAX_THREADS"] = "1"
 
-import argparse
-import json
-import sys
 from pathlib import Path
-from typing import Any, Dict, Tuple
-
 import polars as pl
 
 import mumdia
+from config_manager import get_config
 from data_structures import PickleConfig, SpectraData
 from mumdia import run_mokapot
 from parsers.parser_mzml import get_ms1_mzml, split_mzml_by_retention_time
@@ -52,135 +34,6 @@ from utilities.pickling import (
     read_variables_from_pickles,
     write_variables_to_pickles,
 )
-
-
-def parse_arguments() -> Tuple[argparse.ArgumentParser, argparse.Namespace]:
-    """
-    Parse command line arguments for the MuMDIA workflow.
-
-    Returns:
-        Tuple containing:
-        - parser: ArgumentParser object for checking explicitly provided arguments
-        - args: Namespace object with parsed command line arguments
-    """
-    parser = argparse.ArgumentParser()
-
-    # Add arguments
-    parser.add_argument(
-        "--mzml_file",
-        help="The location of the mzml file",
-        default="mzml_files/LFQ_Orbitrap_AIF_Ecoli_01.mzML",
-    )
-    parser.add_argument(
-        "--mzml_dir", help="The directory of the mzml file", default="mzml_files"
-    )
-    parser.add_argument(
-        "--fasta_file",
-        help="The location of the fasta file",
-        default="fasta/unmodified_peptides.fasta",
-    )
-    parser.add_argument(
-        "--result_dir", help="The location of the result directory", default="results"
-    )
-    parser.add_argument(
-        "--config_file",
-        help="The location of the config file",
-        default="configs/config.json",
-    )
-
-    parser.add_argument(
-        "--remove_intermediate_files",
-        help="Flag to indicate if intermediate results should be removed",
-        type=bool,
-        default=False,
-    )
-
-    parser.add_argument(
-        "--write_initial_search_pickle",
-        help="Flag to indicate if all result pickles should be written",
-        type=bool,
-        default=True,
-    )
-
-    parser.add_argument(
-        "--read_initial_search_pickle",
-        help="Flag to indicate if all result pickles should be read",
-        type=bool,
-        default=True,
-    )
-
-    parser.add_argument(
-        "--write_deeplc_pickle",
-        help="Flag to indicate if DeepLC pickles should be written",
-        type=bool,
-        default=True,
-    )
-
-    parser.add_argument(
-        "--write_ms2pip_pickle",
-        help="Flag to indicate if MS2PIP pickles should be written",
-        type=bool,
-        default=True,
-    )
-
-    parser.add_argument(
-        "--read_deeplc_pickle",
-        help="Flag to indicate if DeepLC pickles should be read",
-        type=bool,
-        default=True,
-    )
-
-    parser.add_argument(
-        "--read_ms2pip_pickle",
-        help="Flag to indicate if MS2PIP pickles should be read",
-        type=bool,
-        default=True,
-    )
-
-    parser.add_argument(
-        "--write_correlation_pickles",
-        help="Flag to indicate if correlation pickles should be written",
-        type=bool,
-        default=True,
-    )
-
-    parser.add_argument(
-        "--read_correlation_pickles",
-        help="Flag to indicate if correlation pickles should be read",
-        type=bool,
-        default=True,
-    )
-
-    parser.add_argument(
-        "--dlc_transfer_learn",
-        help="Flag to indicate if DeepLC should use transfer learning",
-        type=bool,
-        default=True,
-    )
-
-    parser.add_argument(
-        "--write_full_search_pickle",
-        help="Flag to indicate if the full search pickles should be written",
-        type=bool,
-        default=True,
-    )
-
-    parser.add_argument(
-        "--read_full_search_pickle",
-        help="Flag to indicate if the full search pickles should be read",
-        type=bool,
-        default=True,
-    )
-
-    # Additional possible configuration overrides from CLI
-    parser.add_argument(
-        "--sage_basic", help="Override sage basic settings in config", type=str
-    )
-    parser.add_argument(
-        "--mumdia_fdr", help="Override mumdia FDR setting in config", type=float
-    )
-
-    return parser, parser.parse_args()
 
 
 def was_arg_explicitly_provided(parser: argparse.ArgumentParser, arg_name: str) -> bool:
@@ -278,39 +131,30 @@ def main() -> None:
     """
     Main MuMDIA workflow orchestrator.
 
-    This function coordinates the entire MuMDIA pipeline:
-    1. Parse command line arguments
-    2. Create directory structure
-    3. Update configuration with CLI overrides
-    4. Run initial or full search workflow based on flags
-    5. Perform feature calculation and machine learning
-    6. Optional cleanup of intermediate files
+    This function coordinates the entire MuMDIA pipeline using simplified configuration management.
     """
-    log_info("Parsing command line arguments...")
-    parser, args = parse_arguments()
+    log_info("Loading configuration...")
+    config = get_config()
 
     log_info("Creating the result directory...")
-    result_dir, result_temp, result_temp_results_initial_search = create_dirs(args)
+    result_dir = Path(config.result_dir)
+    result_temp = result_dir / "temp"
+    result_temp_results_initial_search = result_temp / "results_initial_search"
 
-    log_info("Updating configuration if needed and saving to results folder...")
-    new_config_file = modify_config(
-        args.config_file, result_dir=args.result_dir, parser=parser, args=args
-    )
+    # Create directories
+    result_dir.mkdir(parents=True, exist_ok=True)
+    result_temp.mkdir(parents=True, exist_ok=True)
+    result_temp_results_initial_search.mkdir(parents=True, exist_ok=True)
 
-    log_info("Reading the updated configuration JSON file...")
-    with open(new_config_file, "r") as file:
-        config = json.load(file)
-
-    args_dict = config["mumdia"]
-
-    # Configure pickle settings once for the entire workflow
+    # Configure pickle settings based on cache preference
+    use_cache = not config.no_cache
     pickle_config = PickleConfig(
-        write_deeplc=args_dict["write_deeplc_pickle"],
-        write_ms2pip=args_dict["write_ms2pip_pickle"],
-        write_correlation=args_dict["write_correlation_pickles"],
-        read_deeplc=args_dict["read_deeplc_pickle"],
-        read_ms2pip=args_dict["read_ms2pip_pickle"],
-        read_correlation=args_dict["read_correlation_pickles"],
+        write_deeplc=not use_cache,
+        write_ms2pip=not use_cache,
+        write_correlation=not use_cache,
+        read_deeplc=use_cache,
+        read_ms2pip=use_cache,
+        read_correlation=use_cache,
     )
 
     # ============================================================================

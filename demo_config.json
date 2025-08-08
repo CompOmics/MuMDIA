@@ -1,0 +1,9 @@
+{
+  "mzml_file": "LFQ_Orbitrap_AIF_Ecoli_01.mzML",
+  "fasta_file": "fasta/ecoli_22032024.fasta",
+  "result_dir": "my_results",
+  "n_windows": 15,
+  "training_fdr": 0.1,
+  "model_type": "nn",
+  "verbose": true
+}
