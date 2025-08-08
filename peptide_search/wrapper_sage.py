@@ -26,6 +26,7 @@ from typing import Any, Dict, Tuple, Union
 import numpy as np
 import pandas as pd
 import polars as pl
+import copy
 
 from parsers.parser_parquet import parquet_reader
 from sequence.fasta import write_to_fasta
@@ -141,18 +142,19 @@ def retention_window_searches(
         fasta_file = os.path.join(os.path.dirname(mzml_path), "vectorized_output.fasta")
         write_to_fasta(sub_peptide_df, output_file=fasta_file)
 
-        # Load fresh configuration for each partition to avoid parameter conflicts
-        with open("configs/config.json", "r") as file:
-            config = json.load(file)
+        # Use a deep copy of the provided config to avoid mutating caller state
+        sub_config = copy.deepcopy(config)
 
         sub_results = os.path.dirname(mzml_path)
 
         # Update configuration for this specific partition
-        config["sage"]["database"]["fasta"] = fasta_file  # Set partition-specific FASTA
-        config["sage"]["mzml_paths"] = [mzml_path]  # Set partition-specific mzML
+        sub_config["sage"]["database"][
+            "fasta"
+        ] = fasta_file  # Set partition-specific FASTA
+        sub_config["sage"]["mzml_paths"] = [mzml_path]  # Set partition-specific mzML
 
         # Execute Sage search on this retention time partition
-        run_sage(config["sage"], fasta_file, sub_results)
+        run_sage(sub_config["sage"], fasta_file, sub_results)
 
         # Parse Sage results from JSON metadata file
         result_file_json_path = pathlib.Path(sub_results).joinpath("results.json")
@@ -176,8 +178,9 @@ def retention_window_searches(
         if df_fragment is None:
             continue
 
-        # Ensure unique PSM IDs across all partitions by adding running offset
-        # This prevents ID conflicts when combining results from multiple partitions
+        # Narrow types for static analysis
+        assert isinstance(df_fragment, pl.DataFrame)
+        assert isinstance(df_psms, pl.DataFrame)
 
         # Ensure unique PSM IDs across all partitions by adding running offset
         # This prevents ID conflicts when combining results from multiple partitions
@@ -193,9 +196,25 @@ def retention_window_searches(
         df_psms_list.append(df_psms)
 
         # Update PSM ID offset for next partition
-        psm_ident_start = df_psms["psm_id"].max() + 1
+        # Ensure numeric max for offset (handle empty/None safely)
+        next_offset = psm_ident_start
+        try:
+            # Compute scalar max safely via an aggregation
+            max_series = df_psms.select(pl.col("psm_id").max()).to_series()
+            max_value = max_series[0] if len(max_series) > 0 else None
+            if isinstance(max_value, (int, np.integer, float, np.floating)):
+                next_offset = int(max_value) + 1
+        except Exception:
+            # Keep existing offset if anything unexpected happens
+            pass
+        psm_ident_start = next_offset
 
     # Combine results from all retention time partitions
+    if len(df_fragment_list) == 0 or len(df_psms_list) == 0:
+        # No results were produced; return empty DataFrames to keep pipeline running
+        empty = pl.DataFrame()
+        return empty, empty, empty, empty
+
     df_fragment = pl.concat(df_fragment_list)
     df_psms = pl.concat(df_psms_list)
 
