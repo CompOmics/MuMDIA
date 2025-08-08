@@ -20,6 +20,7 @@ import sys
 from typing import Any, Dict
 
 from utilities.logger import log_info
+from utilities.config_models import ConfigModel
 
 
 _TRUE = {"1", "true", "yes", "on", "y", "t"}
@@ -110,6 +111,7 @@ def merge_config_from_sources(
     Returns a full config dict with keys:
     - "mumdia": merged CLI-related settings
     - "sage_basic" and "sage": ensured to contain mzml_paths and database.fasta
+    Validates against typed dataclass schema.
     """
     config: Dict[str, Any] = (
         existing_config.copy() if isinstance(existing_config, dict) else {}
@@ -150,7 +152,10 @@ def merge_config_from_sources(
         config["sage_basic"]["database"] = db_basic
         config["sage"]["database"] = db_sage
 
-    return config
+    # Validate with typed schema and return as dict
+    model = ConfigModel.from_dict(config)
+    model.validate()
+    return model.to_dict()
 
 
 def write_updated_config(config: Dict[str, Any], result_dir: str) -> str:
