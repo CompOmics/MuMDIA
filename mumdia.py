@@ -237,7 +237,7 @@ def run_mokapot(output_dir="results/") -> None:
     Run the mokapot analysis on PSMs read from a PIN file.
     The results are saved to tab-delimited text files.
     """
-    psms = mokapot.read_pin("outfile.pin")
+    psms = mokapot.read_pin(f"{output_dir}/outfile.pin")
     model = KerasClassifier(
         build_fn=create_model, epochs=100, batch_size=1000, verbose=10
     )
@@ -866,7 +866,11 @@ def calculate_features(
         f"Reading the DeepLC pickle: {pickle_config.read_deeplc} and writing DeepLC pickle: {pickle_config.write_deeplc}"
     )
     _, _, predictions_deeplc = get_predictions_retention_time_mainloop(
-        df_psms, pickle_config.write_deeplc, pickle_config.read_deeplc, deeplc_model
+        df_psms,
+        pickle_config.write_deeplc,
+        pickle_config.read_deeplc,
+        deeplc_model,
+        output_dir=config["mumdia"]["result_dir"],
     )
 
     log_info("Obtaining features retention time...")
@@ -889,6 +893,7 @@ def calculate_features(
         df_fragment,
         read_ms2pip_pickle=pickle_config.read_ms2pip,
         write_ms2pip_pickle=pickle_config.write_ms2pip,
+        output_dir=config["mumdia"]["result_dir"],
     )
 
     log_info("Obtaining features fragment intensity predictions...")
@@ -899,6 +904,7 @@ def calculate_features(
         read_correlation_pickles=pickle_config.read_correlation,
         write_correlation_pickles=pickle_config.write_correlation,
         ms2_dict=spectra_data.ms2_dict,
+        output_dir=config["mumdia"]["result_dir"],
     )
 
     log_info("Step 5: obtain MS1 peak presence")
@@ -907,6 +913,8 @@ def calculate_features(
         df_psms, spectra_data.ms1_dict, spectra_data.ms2_to_ms1_dict
     )
 
+    log_info(f"Number of PSMs:{df_psms.shape[0]}")
+
     log_info("Step 6: Grouping peptidoforms by peptide and charge")
 
     psm_dict = {}
@@ -914,6 +922,20 @@ def calculate_features(
         df_psms.group_by(["peptide", "charge"])
     ):
         psm_dict[f"{peptidoform}/{charge}"] = df_sub_peptidoform
+
+    log_info(f"Number of peptidoforms: {len(psm_dict)}")
+
+    # Output psm_dict to a pickle file for debugging
+    # import pickle
+
+    # with open("psm_dict_debug.pkl", "wb") as f:
+    #     pickle.dump(psm_dict, f)
+
+    # with open("fragment_dict_debug.pkl", "wb") as f:
+    #     pickle.dump(fragment_dict, f)
+
+    # with open("correlations_fragment_dict_debug.pkl", "wb") as f:
+    #     pickle.dump(correlations_fragment_dict, f)
 
     # Pass data as-is (read-only) without deep copying.
     peptidoform_args = [
@@ -939,6 +961,7 @@ def calculate_features(
                 desc="Processing chunks",
             )
         )
+
     """
     chunk_results = []
     for chunk in tqdm(chunks):
@@ -964,7 +987,9 @@ def calculate_features(
         .fill_null(0.0)
         .fill_nan(0.0)
     )
-    concatenated_df.write_csv("outfile.pin", separator="\t")
+    concatenated_df.write_csv(
+        f"{config['mumdia']['result_dir']}/outfile.pin", separator="\t"
+    )
 
 
 def main(

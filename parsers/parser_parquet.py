@@ -4,6 +4,8 @@ from typing import Dict, Optional, Tuple, Union
 import pandas as pd
 import polars as pl
 
+from utilities.logger import log_info
+
 
 def replace_mass_shift(
     peptide: str,
@@ -105,6 +107,9 @@ def parquet_reader(
     df_psms = pl.DataFrame(df_psms)
 
     if len(df_fragment["psm_id"]) == 0:
+        log_info(
+            "No fragments passed the q-value filter. Returning empty DataFrames."
+        )  # TODO: shouuld throw error instead?
         return None, None, None, None
 
     # df_fragment_max.index = df_fragment_max["psm_id"]
