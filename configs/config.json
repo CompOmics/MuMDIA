@@ -61,7 +61,7 @@
         "report_psms": 5,
         "output_directory": "./",
         "mzml_paths": [
-            "LFQ_Orbitrap_AIF_Ecoli_01.mzML"
+            "mzml_files/LFQ_Orbitrap_AIF_Ecoli_01.mzML"
         ]
     },
     "sage": {
@@ -125,17 +125,17 @@
         "report_psms": 25,
         "output_directory": "./",
         "mzml_paths": [
-            "LFQ_Orbitrap_AIF_Ecoli_01.mzML"
+            "mzml_files/LFQ_Orbitrap_AIF_Ecoli_01.mzML"
         ]
     },
     "mumdia": {
         "write_deeplc_pickle": false,
         "write_ms2pip_pickle": true,
         "write_correlation_pickles": true,
-        "write_initial_search_pickle": true,
-        "write_full_search_pickle": true,
-        "read_deeplc_pickle": false,
-        "read_ms2pip_pickle": false,
+        "write_initial_search_pickle": false,
+        "write_full_search_pickle": false,
+        "read_deeplc_pickle": true,
+        "read_ms2pip_pickle": true,
         "read_correlation_pickles": true,
         "read_full_search_pickles": true,
         "read_initial_search_pickle": true,

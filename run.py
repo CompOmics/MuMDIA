@@ -36,6 +36,135 @@ from utilities.pickling import (
 )
 
 
+def parse_arguments() -> Tuple[argparse.ArgumentParser, argparse.Namespace]:
+    """
+    Parse command line arguments for the MuMDIA workflow.
+
+    Returns:
+        Tuple containing:
+        - parser: ArgumentParser object for checking explicitly provided arguments
+        - args: Namespace object with parsed command line arguments
+    """
+    parser = argparse.ArgumentParser()
+
+    # Add arguments
+    parser.add_argument(
+        "--mzml_file",
+        help="The location of the mzml file",
+        default="mzml_files/LFQ_Orbitrap_AIF_Ecoli_01.mzML",
+    )
+    parser.add_argument(
+        "--mzml_dir", help="The directory of the mzml file", default="mzml_files"
+    )
+    parser.add_argument(
+        "--fasta_file",
+        help="The location of the fasta file",
+        default="fasta/unmodified_peptides.fasta",
+    )
+    parser.add_argument(
+        "--result_dir", help="The location of the result directory", default="results"
+    )
+    parser.add_argument(
+        "--config_file",
+        help="The location of the config file",
+        default="configs/config.json",
+    )
+
+    parser.add_argument(
+        "--remove_intermediate_files",
+        help="Flag to indicate if intermediate results should be removed",
+        type=bool,
+        default=False,
+    )
+
+    parser.add_argument(
+        "--write_initial_search_pickle",
+        help="Flag to indicate if all result pickles should be written",
+        type=bool,
+        default=False,
+    )
+
+    parser.add_argument(
+        "--read_initial_search_pickle",
+        help="Flag to indicate if all result pickles should be read",
+        type=bool,
+        default=True,
+    )
+
+    parser.add_argument(
+        "--write_deeplc_pickle",
+        help="Flag to indicate if DeepLC pickles should be written",
+        type=bool,
+        default=False,
+    )
+
+    parser.add_argument(
+        "--write_ms2pip_pickle",
+        help="Flag to indicate if MS2PIP pickles should be written",
+        type=bool,
+        default=False,
+    )
+
+    parser.add_argument(
+        "--read_deeplc_pickle",
+        help="Flag to indicate if DeepLC pickles should be read",
+        type=bool,
+        default=True,
+    )
+
+    parser.add_argument(
+        "--read_ms2pip_pickle",
+        help="Flag to indicate if MS2PIP pickles should be read",
+        type=bool,
+        default=True,
+    )
+
+    parser.add_argument(
+        "--write_correlation_pickles",
+        help="Flag to indicate if correlation pickles should be written",
+        type=bool,
+        default=True,
+    )
+
+    parser.add_argument(
+        "--read_correlation_pickles",
+        help="Flag to indicate if correlation pickles should be read",
+        type=bool,
+        default=True,
+    )
+
+    parser.add_argument(
+        "--dlc_transfer_learn",
+        help="Flag to indicate if DeepLC should use transfer learning",
+        type=bool,
+        default=True,
+    )
+
+    parser.add_argument(
+        "--write_full_search_pickle",
+        help="Flag to indicate if the full search pickles should be written",
+        type=bool,
+        default=False,
+    )
+
+    parser.add_argument(
+        "--read_full_search_pickle",
+        help="Flag to indicate if the full search pickles should be read",
+        type=bool,
+        default=True,
+    )
+
+    # Additional possible configuration overrides from CLI
+    parser.add_argument(
+        "--sage_basic", help="Override sage basic settings in config", type=str
+    )
+    parser.add_argument(
+        "--mumdia_fdr", help="Override mumdia FDR setting in config", type=float
+    )
+
+    return parser, parser.parse_args()
+
+
 def was_arg_explicitly_provided(parser: argparse.ArgumentParser, arg_name: str) -> bool:
     """
     Check if an argument with destination `arg_name` was explicitly provided on the command line.
@@ -114,6 +243,15 @@ def modify_config(
                 config["mumdia"][key] = default_args.get(key, value)
                 updated = True
 
+    # Update mzML and FASTA paths in config if explicitly provided
+    for section in ["sage_basic", "sage"]:
+        if section not in config:
+            config[section] = {}
+        if was_arg_explicitly_provided(parser, "mzml_file"):
+            config[section]["mzml_paths"] = [args.mzml_file]
+        if was_arg_explicitly_provided(parser, "fasta_file"):
+            config[section]["database"] = {"fasta": args.fasta_file}
+
     # Define new config path in the results folder
     new_config_path = os.path.join(result_dir, "updated_config.json")
 
@@ -164,8 +302,24 @@ def main() -> None:
     # 1. Initial broad search: Used to train DeepLC retention time models
     # 2. Targeted search: Uses RT predictions to partition data for faster, more accurate searches
 
-    if args_dict["write_initial_search_pickle"]:
+    # Check if all required initial search pickle files exist
+    initial_search_pickles = [
+        "df_fragment_initial_search.pkl",
+        "df_psms_initial_search.pkl",
+        "df_fragment_max_initial_search.pkl",
+        "df_fragment_max_peptide_initial_search.pkl",
+        "config_initial_search.pkl",
+        "dlc_transfer_learn_initial_search.pkl",
+        "flags_initial_search.pkl",
+    ]
+    initial_search_pickles_exist = all(
+        os.path.exists(result_dir.joinpath(pickle_file))
+        for pickle_file in initial_search_pickles
+    )
+
+    if args_dict["write_initial_search_pickle"] or not initial_search_pickles_exist:
         log_info("Running initial Sage search for RT model training...")
+        # TODO: Earlier, implement a check whether the mzML file exists, because otherwise Sage will still run on an non-existing file and later on an error will be raised that is not very informative.
         run_sage(
             config["sage_basic"],
             args_dict["fasta_file"],
@@ -184,7 +338,6 @@ def main() -> None:
             q_value_filter=args_dict["fdr_init_search"],
         )
 
-    if args_dict["write_initial_search_pickle"]:
         write_variables_to_pickles(
             df_fragment=df_fragment,
             df_psms=df_psms,
@@ -230,6 +383,8 @@ def main() -> None:
         del flags["read_full_search_pickle"]
         args_dict.update(flags)
 
+    log_info("Number of PSMs after initial search: {}".format(len(df_psms)))
+
     # ============================================================================
     # STAGE 2: Targeted Search with Retention Time Partitioning
     # ============================================================================
@@ -237,7 +392,23 @@ def main() -> None:
     # possible peptides, then partitions the mzML data by retention time for
     # targeted searches that are both faster and more accurate.
 
-    if args_dict["write_full_search_pickle"]:
+    # Check if all required initial search pickle files exist
+    full_search_pickles = [
+        "df_fragment.pkl",
+        "df_psms.pkl",
+        "df_fragment_max.pkl",
+        "df_fragment_max_peptide.pkl",
+        "config.pkl",
+        "dlc_transfer_learn.pkl",
+        "flags.pkl",
+    ]
+
+    full_search_pickles_exist = all(
+        os.path.exists(result_dir.joinpath(pickle_file))
+        for pickle_file in full_search_pickles
+    )
+
+    if args_dict["write_full_search_pickle"] or not full_search_pickles_exist:
         log_info("Generating peptide library and training DeepLC model...")
         peptides = tryptic_digest_pyopenms(config["sage"]["database"]["fasta"])
 
@@ -248,9 +419,9 @@ def main() -> None:
 
         log_info("Partitioning mzML files by predicted retention time...")
         mzml_dict = split_mzml_by_retention_time(
-            "LFQ_Orbitrap_AIF_Ecoli_01.mzML",
+            args.mzml_file,
             time_interval=perc_95,
-            dir_files="results/temp/",
+            dir_files=result_dir,
         )
 
         (
@@ -265,7 +436,6 @@ def main() -> None:
             df_psms.select(["psm_id", "scannr"]), on="psm_id", how="left"
         )
 
-    if args_dict["write_full_search_pickle"]:
         write_variables_to_pickles(
             df_fragment=df_fragment,
             df_psms=df_psms,
@@ -298,7 +468,7 @@ def main() -> None:
     # Parse mzML to extract MS1 precursor information for additional features
     log_info("Parsing the mzML file for MS1 precursor information...")
     ms1_dict, ms2_to_ms1_dict, ms2_spectra = get_ms1_mzml(
-        config["sage_basic"]["mzml_paths"][0]
+        config["sage_basic"]["mzml_paths"][0]  # TODO: should be for all mzml files
     )
 
     # Execute the main MuMDIA feature calculation and machine learning pipeline
@@ -333,8 +503,10 @@ def main() -> None:
         log_info("Cleaning up intermediate files...")
         remove_intermediate_files(args_dict["result_dir"])
 
+    return config["mumdia"]["result_dir"]
+
 
 if __name__ == "__main__":
-    main()
+    output_dir = main()  # For now output output_dir, should be handled differently
     # Run Mokapot for final statistical validation and FDR control
-    run_mokapot()
+    run_mokapot(output_dir)

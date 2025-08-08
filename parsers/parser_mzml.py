@@ -111,16 +111,19 @@ def split_mzml_by_retention_time(original_file, dir_files="", time_interval=120.
     part = 1
     sub_exp = MSExperiment()
 
+    tempdir = os.path.join(dir_files, "temp")
+
     for spec in spectra:
         if spec.getRT() <= end_time:
             sub_exp.addSpectrum(spec)
         else:
             sub_dir = f"part_{end_time-time_interval}_{end_time}"
-            if not os.path.exists(os.path.join(dir_files, sub_dir)):
-                os.makedirs(os.path.join(dir_files, sub_dir))
+            print(f"Writing part {part} to {tempdir}/{sub_dir}...")
+            if not os.path.exists(os.path.join(tempdir, sub_dir)):
+                os.makedirs(os.path.join(tempdir, sub_dir))
 
             file_out = os.path.join(
-                dir_files, sub_dir, f"part_{end_time-time_interval}_{end_time}.mzml"
+                tempdir, sub_dir, f"part_{end_time-time_interval}_{end_time}.mzml"
             )
 
             dict_mzml_files[end_time] = file_out
@@ -136,11 +139,11 @@ def split_mzml_by_retention_time(original_file, dir_files="", time_interval=120.
 
     if sub_exp.getNrSpectra() > 0:
         sub_dir = f"part_{end_time-time_interval}_{end_time}"
-        if not os.path.exists(os.path.join(dir_files, sub_dir)):
-            os.makedirs(os.path.join(dir_files, sub_dir))
+        if not os.path.exists(os.path.join(tempdir, sub_dir)):
+            os.makedirs(os.path.join(tempdir, sub_dir))
 
         file_out = os.path.join(
-            dir_files, sub_dir, f"part_{end_time-time_interval}_{end_time}.mzml"
+            tempdir, sub_dir, f"part_{end_time-time_interval}_{end_time}.mzml"
         )
 
         dict_mzml_files[end_time] = file_out
