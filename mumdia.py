@@ -281,8 +281,8 @@ def run_mokapot(output_dir="results/") -> None:
             f"mokapot is not installed or failed to import ({e}). Skipping mokapot run."
         )
         return None
+    psms = mokapot.read_pin(f"{output_dir}outfile.pin")
 
-    psms = mokapot.read_pin(f"{output_dir}/outfile.pin")
     model = KerasClassifier(
         build_fn=create_model, epochs=100, batch_size=1000, verbose=10
     )
@@ -1083,10 +1083,13 @@ def main(
     )
 
     log_info("Done running MuMDIA...")
-    run_mokapot()
+    run_mokapot(output_dir=config["mumdia"]["result_dir"])
 
 
 if __name__ == "__main__":
     # In practice, load your input DataFrames (e.g., from parquet files) and then call main().
     # For demonstration, we call run_mokapot().
-    run_mokapot()
+    import sys
+
+    output_dir = sys.argv[1] if len(sys.argv) > 1 else "results/"
+    run_mokapot(output_dir=output_dir)
