@@ -745,6 +745,19 @@ def get_features_fragment_intensity(
     ms2_dict: dict = {},
     output_dir: str = "results/",
 ):
+
+    if read_correlation_pickles and not write_correlation_pickles:
+        try:
+            with open(f"{output_dir}/fragment_dict.pkl", "rb") as f:
+                fragment_dict = pickle.load(f)
+            with open(f"{output_dir}/correlations_fragment_dict.pkl", "rb") as f:
+                correlations_fragment_dict = pickle.load(f)
+            log_info("Successfully loaded correlation data from pickle files")
+            return fragment_dict, correlations_fragment_dict
+        except FileNotFoundError:
+            log_info("Pickle files not found, will compute correlations instead")
+            read_correlation_pickles = False  # Fall back to computation
+
     fragment_dict = {}
     correlations_fragment_dict = {}
 
@@ -837,15 +850,15 @@ def get_features_fragment_intensity(
             pickle.dump(fragment_dict, f)
         with open(f"{output_dir}/correlations_fragment_dict.pkl", "wb") as f:
             pickle.dump(correlations_fragment_dict, f)
-    if read_correlation_pickles:
-        try:
-            with open(f"{output_dir}/fragment_dict.pkl", "rb") as f:
-                fragment_dict = pickle.load(f)
-            with open(f"{output_dir}/correlations_fragment_dict.pkl", "rb") as f:
-                correlations_fragment_dict = pickle.load(f)
-            log_info("Successfully loaded correlation data from pickle files")
-        except FileNotFoundError:
-            log_info("Pickle files not found, will compute correlations instead")
-            read_correlation_pickles = False  # Fall back to computation
+    # if read_correlation_pickles:
+    #     try:
+    #         with open(f"{output_dir}/fragment_dict.pkl", "rb") as f:
+    #             fragment_dict = pickle.load(f)
+    #         with open(f"{output_dir}/correlations_fragment_dict.pkl", "rb") as f:
+    #             correlations_fragment_dict = pickle.load(f)
+    #         log_info("Successfully loaded correlation data from pickle files")
+    #     except FileNotFoundError:
+    #         log_info("Pickle files not found, will compute correlations instead")
+    #         read_correlation_pickles = False  # Fall back to computation
 
     return fragment_dict, correlations_fragment_dict

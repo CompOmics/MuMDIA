@@ -5,7 +5,7 @@ import polars as pl
 
 def add_retention_time_features(
     df_psms: pl.DataFrame,
-    predictions_deeplc: pl.DataFrame,
+    # predictions_deeplc: pl.DataFrame,
     filter_rel_rt_error: float = 0.2,
     rt_prediction_error_abs: bool = True,
     rt_prediction_error_abs_relative: bool = True,
@@ -29,7 +29,7 @@ def add_retention_time_features(
         Added columns: rt_predictions, rt_prediction_error_abs, rt_prediction_error_abs_relative
     """
 
-    df_psms = df_psms.join(predictions_deeplc, on="peptide", how="left")
+    # df_psms = df_psms.join(predictions_deeplc, on=["peptide"], how="left")
     max_rt = df_psms["rt"].max()
 
     if rt_prediction_error_abs:

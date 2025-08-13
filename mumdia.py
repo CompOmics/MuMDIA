@@ -12,6 +12,8 @@ import logging
 import os
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional
+import pickle
+import sys
 
 # Optional numba: provide no-op decorator if unavailable
 try:
@@ -805,7 +807,11 @@ def add_precursor_intensities_optimized_parallel(
 
     # 2. Define the function to compute intensities for a single row
     def compute_intensities(row):
-        scannr, charge, calcmass = row["scannr"], row["charge"], row["calcmass"]
+        scannr, charge, calcmass = (
+            row["scannr"],
+            row["charge"],
+            row["calcmass"],
+        )  # Should this not be expmass?
         if scannr not in ms2_to_ms1_dict:
             return {"M-1": 0.0, "M": 0.0, "M+1": 0.0}
         spectrum = ms1_dict.get(ms2_to_ms1_dict[scannr], {})
@@ -855,7 +861,9 @@ def add_precursor_intensities(df_psms, ms1_dict, ms2_to_ms1_dict):
             pl.struct(["scannr", "charge", "calcmass"])
             .map_elements(
                 lambda row: extract_intensities(
-                    row["scannr"], row["charge"], row["calcmass"]
+                    row["scannr"],
+                    row["charge"],
+                    row["calcmass"],  # Should this not be expmass?
                 )
             )
             .alias("precursor_intensities")
@@ -885,7 +893,7 @@ def add_precursor_intensities(df_psms, ms1_dict, ms2_to_ms1_dict):
 def calculate_features(
     df_psms: pl.DataFrame,
     df_fragment: pl.DataFrame,
-    df_fragment_max: pl.DataFrame,
+    df_fragment_max: pl.DataFrame,  # Why not used?
     df_fragment_max_peptide: pl.DataFrame,
     *,  # Force keyword-only arguments
     filter_rel_rt_error: float = 0.1,
@@ -902,6 +910,7 @@ def calculate_features(
     Process the PSM and fragment DataFrames, compute features, and save the output.
     This function uses parallel processing with task chunking.
     """
+    # df_psms.write_csv("debug/df_psms_beginning.csv", separator="\t")
     # Handle pickle configuration
     if pickle_config is None:
         pickle_config = PickleConfig()
@@ -914,18 +923,20 @@ def calculate_features(
     log_info(
         f"Reading the DeepLC pickle: {pickle_config.read_deeplc} and writing DeepLC pickle: {pickle_config.write_deeplc}"
     )
-    _, _, predictions_deeplc = get_predictions_retention_time_mainloop(
-        df_psms,
-        pickle_config.write_deeplc,
-        pickle_config.read_deeplc,
-        deeplc_model,
-        output_dir=config["mumdia"]["result_dir"],
+    _, _, df_psms = (
+        get_predictions_retention_time_mainloop(  # Changed, since predictions_deeplc is just df_psms with RT predictions
+            df_psms,
+            pickle_config.write_deeplc,
+            pickle_config.read_deeplc,
+            deeplc_model,
+            output_dir=config["mumdia"]["result_dir"],
+        )
     )
 
     log_info("Obtaining features retention time...")
-    df_psms = add_retention_time_features(
-        df_psms, predictions_deeplc, filter_rel_rt_error=0.15
-    )
+    df_psms = add_retention_time_features(df_psms, filter_rel_rt_error=0.15)
+
+    df_psms.write_csv("debug/df_psms_after_rt.csv", separator="\t")
 
     log_info(
         "Counting individual peptides per MS2 and filtering by minimum occurrences"
@@ -972,24 +983,16 @@ def calculate_features(
 
     log_info(f"Number of peptidoforms: {len(psm_dict)}")
 
-    # Output psm_dict to a pickle file for debugging
-    # import pickle
-
-    # with open("psm_dict_debug.pkl", "wb") as f:
-    #     pickle.dump(psm_dict, f)
-
-    # with open("fragment_dict_debug.pkl", "wb") as f:
-    #     pickle.dump(fragment_dict, f)
-
-    # with open("correlations_fragment_dict_debug.pkl", "wb") as f:
-    #     pickle.dump(correlations_fragment_dict, f)
-
     # Pass data as-is (read-only) without deep copying.
     peptidoform_args = [
         (psm_dict[k], fragment_dict[k], correlations_fragment_dict[k])
         for k in psm_dict.keys()
         if k in correlations_fragment_dict
     ]
+
+    # Save psm_dict to a pickle file for debugging or future use
+    with open("debug/psm_dict.pkl", "wb") as f:
+        pickle.dump(psm_dict, f)
 
     log_info("Step 7: Processing peptidoforms in parallel (with chunking)")
 
