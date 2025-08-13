@@ -42,7 +42,8 @@ dependencies = [
     # Mass spectrometry tools
     "pymzml>=2.5.0",
     "pyopenms>=3.0.0",
-    "rustyms>=0.9.0",
+    # "rustyms>=0.9.0",
+    "rustyms @ git+https://github.com/rodvrees/mzcore-mumdia.git@mumdia-branch#subdirectory=rustyms-py",
     
     # MS prediction tools
     "ms2pip>=4.0.0",
