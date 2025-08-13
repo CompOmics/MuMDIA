@@ -120,9 +120,9 @@
         "wide_window": true,
         "min_peaks": 0,
         "max_peaks": 10000,
-        "min_matched_peaks": 3,
+        "min_matched_peaks": 5,
         "max_fragment_charge": 1,
-        "report_psms": 25,
+        "report_psms": 12,
         "output_directory": "./",
         "mzml_paths": [
             "mzml_files/LFQ_Orbitrap_AIF_Ecoli_01.mzML"
@@ -130,18 +130,18 @@
     },
     "mumdia": {
         "write_deeplc_pickle": false,
-        "write_ms2pip_pickle": true,
+        "write_ms2pip_pickle": false,
         "write_correlation_pickles": true,
         "write_initial_search_pickle": false,
         "write_full_search_pickle": false,
         "read_deeplc_pickle": true,
         "read_ms2pip_pickle": true,
-        "read_correlation_pickles": true,
+        "read_correlation_pickles": false,
         "read_full_search_pickles": true,
         "read_initial_search_pickle": true,
         "remove_intermediate_files": false,
         "dlc_transfer_learn": false,
-        "fdr_init_search": 0.001,
+        "fdr_init_search": 0.01,
         "rescoring_features": [
             "distribution_correlation_matrix_psm_ids",
             "distribution_correlation_matrix_frag_ids",
