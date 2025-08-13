@@ -24,11 +24,11 @@ import numpy as np
 import polars as pl
 from numba import njit
 from rustyms import (
-    CompoundPeptidoform,
     FragmentationModel,
-    LinearPeptide,
     MassMode,
     RawSpectrum,
+    CompoundPeptidoformIon,
+    MatchingParameters,
 )
 from tqdm import tqdm
 
@@ -390,30 +390,39 @@ def match_fragments(
     Match fragments theoretical and experimental intensities.
     """
 
+    if df_fragment_sub_peptidoform.is_empty():
+        log_info("No fragments to match, returning empty results.")
+
+    # Compile regex patterns for extracting ion and charge from annotation strings
     ion_pattern = r"ion='([^']*)'"
     charge_pattern = r"charge=(\d+),"
 
     fragment_records = []
 
+    # Get unique PSMs (peptide-spectrum matches) by sorting by fragment intensity and keeping the first occurrence per PSM
     unique_psm_id = df_fragment_sub_peptidoform.sort(
         "fragment_intensity", descending=True
-    ).unique(subset=["psm_id"], keep="first")
+    ).unique(
+        subset=["psm_id"], keep="first"
+    )  # TODO: is this the best approach to select the apex?
 
     unique_psm_id_dicts = unique_psm_id.to_dicts()
 
+    # Iterate over each unique PSM to annotate and match fragments
     for row in unique_psm_id_dicts:
         psm_id = int(row["psm_id"])
         rt = float(row["rt"])
         scannr = row["scannr"]
         rt_max_peptide_sub = float(row["rt_max_peptide_sub"])
-        precursor_charge = int(row["fragment_charge"])
-        scannr = row["scannr"]
+        precursor_charge = int(
+            row["charge"]
+        )  # This was fragment_charge before, but it is the precursor charge
         peptide = row["peptide"]
+        precursor = row[
+            "precursor"
+        ]  # TODO: check if its okay to do on precursor level. If we don't we have a problem with RT matching
 
-        # # Output ms2dict to pickle file for debugging
-        # with open("results/timsconvert/ms2_dict.pkl", "wb") as f:
-        #     pickle.dump(ms2_dict, f)
-
+        # Construct a RawSpectrum object for this PSM using the scan number and MS2 data
         spectrum = RawSpectrum(
             title=scannr,
             num_scans=1,
@@ -424,10 +433,18 @@ def match_fragments(
             intensity_array=ms2_dict[scannr]["intensity"],
         )
 
-        linear_peptide = CompoundPeptidoform(peptide)
+        # Convert peptide string to CompoundPeptidoform for annotation
+        linear_peptide = CompoundPeptidoformIon(precursor)
 
+        matching_parameters = MatchingParameters()
+        matching_parameters.tolerance_ppm = (
+            13.0  # TODO: make this a parameter used by the config
+        )
+
+        # Annotate the spectrum with theoretical fragments using RustyMS
         annotated_spectrum = spectrum.annotate(
-            peptide=linear_peptide,
+            peptidoform=linear_peptide,
+            parameters=matching_parameters,
             model=FragmentationModel.CidHcd,
             mode=MassMode.Monoisotopic,
         )
@@ -436,9 +453,16 @@ def match_fragments(
             annotated_peak
             for annotated_peak in annotated_spectrum.spectrum
             if annotated_peak.annotation
+            and annotated_peak.annotation[0].charge == 1  # make configurable
+            and (
+                repr(annotated_peak.annotation[0].ion).startswith("b")
+                or repr(annotated_peak.annotation[0].ion).startswith("y")
+            )
         ]
 
+        # For each matched fragment, extract ion type, ordinal, charge, and intensity
         for mf in matched_fragments:
+
             ion_label = re.search(ion_pattern, repr(mf.annotation[0])).group(1)
             ion_charge = re.search(charge_pattern, repr(mf.annotation[0])).group(1)
 
@@ -449,12 +473,14 @@ def match_fragments(
                     "fragment_ordinals": ion_label[1:],
                     "fragment_charge": ion_charge,
                     "fragment_intensity": mf.intensity,
+                    "fragment_mz": mf.experimental_mz,
                     "rt": rt,
                     "scannr": scannr,
                     "fragment_name": f"{ion_label}/{ion_charge}",
                     "rt_max_peptide_sub": rt_max_peptide_sub,
                 }
             )
+    # If any fragment records were found, create a new DataFrame and ensure uniqueness per PSM/fragment
     if len(fragment_records) != 0:
         df_fragment_sub_peptidoform = (
             pl.DataFrame(fragment_records)
@@ -462,6 +488,7 @@ def match_fragments(
             .unique(subset=["psm_id", "fragment_name"], keep="first")
         )
 
+    # Pivot the DataFrame to create a matrix: rows=PSMs, columns=fragment names, values=fragment intensities
     intensity_matrix_df = df_fragment_sub_peptidoform.pivot(
         index="psm_id", columns="fragment_name", values="fragment_intensity"
     ).fill_null(0.0)
@@ -493,22 +520,33 @@ def match_fragments(
     Get pearson and cosing similarity of spectrum with highest intensity
     """
 
+    # Select the PSM(s) with RT equal to the maximum RT for this precursor (i.e., apex)
+
     most_abundant_frag_psm = df_fragment_sub_peptidoform.filter(
         df_fragment_sub_peptidoform["rt"]
         == df_fragment_sub_peptidoform["rt_max_peptide_sub"][0]
     )
 
+    if most_abundant_frag_psm.is_empty():
+
+        log_info("No PSMs found with matching RT for the apex spectrum.")
+
+    # Build predicted intensity vector for the fragments present in the most abundant PSM
     pred_frag_intens_individual = np.array(
         [
-            ms2pip_predictions.get(fid, 0.0)
+            ms2pip_predictions.get(
+                fid, 0.0
+            )  # TODO: how do we handle fragments that MS2PIP cannot predict? Do we still use them? e.g. 'p' ions
             for fid in most_abundant_frag_psm["fragment_name"]
         ]
     )
 
+    # Compute Pearson correlation between predicted and observed intensities for the apex spectrum
     most_intens_cor = np.corrcoef(
         pred_frag_intens_individual, most_abundant_frag_psm["fragment_intensity"]
     )[0][1]
 
+    # Compute cosine similarity between predicted and observed intensities for the apex spectrum
     most_intens_cos = cosine_similarity(
         pred_frag_intens_individual, most_abundant_frag_psm["fragment_intensity"]
     )
@@ -520,34 +558,35 @@ def match_fragments(
     """
     Get the intensity matrix of observations
     """
-
     # first column is PSM ID, ignore that one, messes up calculation as it is numeric
     intensity_matrix = intensity_matrix_df[:, 1:].to_numpy()
     # Get fragment names, first column is PMS ID, ignore that one, messes up calculation as it is numeric
     fragment_names = intensity_matrix_df.columns[1:]
 
-    # Prepare predicted fragment intensities
+    # Prepare predicted fragment intensities for all fragments in the matrix columns
     pred_frag_intens = np.array(
         [ms2pip_predictions.get(fid, 0.0) for fid in fragment_names]
     )
 
-    # Collect predictions for keys not listed in fragment_names.
+    # Collect predictions for keys not listed in fragment_names (i.e., fragments predicted but not observed)
     non_matched_predictions = np.array(
         [v for k, v in ms2pip_predictions.items() if k not in fragment_names]
     )
 
+    # Sum of predicted intensities for matched fragments (for feature engineering)
     sum_pred_frag_intens = np.array(
         sum([ms2pip_predictions.get(fid, 0.0) for fid in fragment_names])
     )
 
-    # Ensure data types are consistent
+    # Ensure data types are consistent for downstream calculations
     intensity_matrix = intensity_matrix.astype(np.float32)
     pred_frag_intens = pred_frag_intens.astype(np.float32)
     non_matched_predictions = non_matched_predictions.astype(np.float32)
 
+    # Concatenate predicted intensities for matched and non-matched fragments
     pred_frag_intens = np.concatenate((pred_frag_intens, non_matched_predictions))
 
-    # Calculate the number of zeros to append
+    # Calculate the number of zeros to append to the intensity matrix so it matches the length of pred_frag_intens
     pad_width = len(pred_frag_intens) - len(intensity_matrix[0])
 
     # Extend array 'a' by padding with zeros on the right side
@@ -555,15 +594,17 @@ def match_fragments(
         intensity_matrix, ((0, 0), (0, pad_width)), mode="constant", constant_values=0
     )
 
+    # Normalize each row (PSM) by its maximum intensity for fair comparison
     intensity_matrix_normalized = intensity_matrix / intensity_matrix.max(
         axis=1, keepdims=True
     )
 
-    # Compute correlations between observed and predicted intensities
+    # Compute correlations between observed and predicted intensities for each PSM
     correlation_result = compute_correlations(
         intensity_matrix_normalized, pred_frag_intens
     )
 
+    # Count the number of nonzero entries per PSM (for feature engineering)
     correlation_result_counts = (
         intensity_matrix_df.select(
             pl.fold(
@@ -578,15 +619,17 @@ def match_fragments(
         .ravel()
     )
 
+    # Compute mean squared error between normalized observed and predicted intensities (per PSM, then averaged)
     mse_avg_pred_intens = (
         abs(intensity_matrix_normalized - pred_frag_intens).sum(axis=1)
     ).sum() / intensity_matrix_normalized.shape[0]
+    # Compute total MSE including non-matched predictions
     mse_avg_pred_intens_total = (
         (abs(intensity_matrix_normalized - pred_frag_intens).sum(axis=1)).sum()
         + sum(non_matched_predictions)
     ) / intensity_matrix_normalized.shape[0]
 
-    # Compute correlation matrix for PSM IDs
+    # Compute correlation matrix for PSM IDs (rows of intensity matrix)
     if intensity_matrix_normalized.shape[0] > 1:
         correlation_matrix_psm_ids = np.corrcoef(intensity_matrix_normalized)
 
@@ -602,25 +645,28 @@ def match_fragments(
         ) = corrcoef_ignore_both_missing_counts(intensity_matrix)
         """
 
+        # Placeholders for additional correlation matrices (not computed here)
         correlation_matrix_psm_ids_ignore_zeros = np.array([])
         correlation_matrix_psm_ids_ignore_zeros_counts = np.array([])
         correlation_matrix_psm_ids_missing = np.array([])
         correlation_matrix_psm_ids_missing_zeros_counts = np.array([])
 
-        # Remove diagonal elements and flatten
+        # Remove diagonal elements (self-correlation) and flatten to 1D
         correlation_matrix_psm_ids = correlation_matrix_psm_ids[
             ~np.eye(correlation_matrix_psm_ids.shape[0], dtype=bool)
         ]
-        # Square and sort
+        # Square and sort the correlation values for downstream use
         correlation_matrix_psm_ids = np.sort(correlation_matrix_psm_ids**2)
     else:
+
+        # If only one PSM, set all correlation matrices to empty
         correlation_matrix_psm_ids = np.array([])
         correlation_matrix_psm_ids_ignore_zeros = np.array([])
         correlation_matrix_psm_ids_ignore_zeros_counts = np.array([])
         correlation_matrix_psm_ids_missing = np.array([])
         correlation_matrix_psm_ids_missing_zeros_counts = np.array([])
 
-    # Compute correlation matrix for fragment IDs
+    # Compute correlation matrix for fragment IDs (columns of intensity matrix)
     if intensity_matrix_normalized.shape[1] > 1:
         correlation_matrix_frag_ids = np.corrcoef(intensity_matrix_normalized.T)
 
@@ -635,36 +681,41 @@ def match_fragments(
             correlation_matrix_frag_ids_missing_zeros_counts,
         ) = corrcoef_ignore_both_missing_counts(intensity_matrix)
         """
+        # Placeholders for additional correlation matrices (not computed here)
         correlation_matrix_frag_ids_ignore_zeros = np.array([])
         correlation_matrix_frag_ids_ignore_zeros_counts = np.array([])
         correlation_matrix_frag_ids_missing = np.array([])
         correlation_matrix_frag_ids_missing_zeros_counts = np.array([])
 
-        # Remove diagonal elements and flatten
+        # Remove diagonal elements (self-correlation) and flatten to 1D
         correlation_matrix_frag_ids = correlation_matrix_frag_ids[
             ~np.eye(correlation_matrix_frag_ids.shape[0], dtype=bool)
         ]
-        # Square and sort
+        # Square and sort the correlation values for downstream use
         correlation_matrix_frag_ids = np.sort(correlation_matrix_frag_ids**2)
     else:
+
+        # If only one fragment, set all correlation matrices to empty
         correlation_matrix_frag_ids = np.array([])
         correlation_matrix_frag_ids_ignore_zeros = np.array([])
         correlation_matrix_frag_ids_ignore_zeros_counts = np.array([])
         correlation_matrix_frag_ids_missing = np.array([])
         correlation_matrix_frag_ids_missing_zeros_counts = np.array([])
 
-    # Correlation result: 1D array of correlation values between predicted MS2PIP intensities and observed fragment intensities
-    # Correlation matrix PSM IDs: 1D array of correlation values between PSMs
-    # Correlation matrix fragment IDs: 1D array of correlation values between fragments
+        # Correlation result: 1D array of correlation values between predicted MS2PIP intensities and observed fragment intensities
+        # Correlation matrix PSM IDs: 1D array of correlation values between PSMs
+        # Correlation matrix fragment IDs: 1D array of correlation values between fragments
 
-    # correlation_result, correlation_result_counts
-    # correlation_matrix_psm_ids, correlation_matrix_psm_ids_counts
-    # correlation_matrix_frag_ids, correlation_matrix_frag_ids_counts
+        # correlation_result, correlation_result_counts
+        # correlation_matrix_psm_ids, correlation_matrix_psm_ids_counts
+        # correlation_matrix_frag_ids, correlation_matrix_frag_ids_counts
 
-    #        correlation_matrix_psm_ids_ignore_zeros,
-    #        correlation_matrix_psm_ids_ignore_zeros_counts,
-    #        correlation_matrix_frag_ids_ignore_zeros,
-    #        correlation_matrix_frag_ids_ignore_zeros_counts,
+        #        correlation_matrix_psm_ids_ignore_zeros,
+        #        correlation_matrix_psm_ids_ignore_zeros_counts,
+        #        correlation_matrix_frag_ids_ignore_zeros,
+        #        correlation_matrix_frag_ids_ignore_zeros_counts,
+
+        # Return all computed features and correlation matrices as a CorrelationResults dataclass
 
     return CorrelationResults(
         correlations=correlation_result,
@@ -700,35 +751,49 @@ def get_features_fragment_intensity(
     fragment_dict = {}
     correlations_fragment_dict = {}
 
-    peptide_to_rt_max = dict(
+    # Dictionary to hold the RTs for each peptide
+    # peptide_to_rt_max = dict(
+    #     zip(
+    #         df_fragment_max_peptide["peptide"].to_list(),
+    #         df_fragment_max_peptide["rt"].to_list(),
+    #     )
+    # )
+    df_fragment_max_peptide = df_fragment_max_peptide.with_columns(
+        (pl.col("peptide") + "/" + pl.col("charge").cast(pl.Utf8)).alias("precursor")
+    )
+    precursor_to_rt_max = dict(
         zip(
-            df_fragment_max_peptide["peptide"].to_list(),
+            df_fragment_max_peptide["precursor"].to_list(),
             df_fragment_max_peptide["rt"].to_list(),
         )
     )
 
-    df_peptide_rt = pl.DataFrame(
+    df_precursor_rt = pl.DataFrame(
         {
-            "peptide": list(peptide_to_rt_max.keys()),
-            "rt_max_peptide_sub": list(peptide_to_rt_max.values()),
+            "precursor": list(precursor_to_rt_max.keys()),
+            "rt_max_peptide_sub": list(precursor_to_rt_max.values()),
         }
     )
 
-    # Add rt_max_peptide_sub to df_fragment
-    df_fragment = df_fragment.join(df_peptide_rt, on="peptide", how="left")
+    # # Create a new df with this mapping
+    # df_peptide_rt = pl.DataFrame(
+    #     {
+    #         "peptide": list(peptide_to_rt_max.keys()),
+    #         "rt_max_peptide_sub": list(peptide_to_rt_max.values()),
+    #     }
+    # )
+
+    # Add rt_max_peptide_sub to df_fragment and filter based on RT
+    # df_fragment = df_fragment.join(df_peptide_rt, on="peptide", how="left")
+    df_fragment = df_fragment.with_columns(
+        (pl.col("peptide") + "/" + pl.col("charge").cast(pl.Utf8)).alias("precursor")
+    )
+    df_fragment = df_fragment.join(df_precursor_rt, on="precursor", how="left")
     df_fragment = df_fragment.filter(
         (pl.col("rt_max_peptide_sub").is_not_null())
         & (abs(pl.col("rt") - pl.col("rt_max_peptide_sub")) < filter_max_apex_rt)
     )
-
-    # Ensure rt_max_peptide_sub is not null and apply the RT filter
-    df_fragment = df_fragment.filter(
-        (pl.col("rt_max_peptide_sub").is_not_null())
-        & (abs(pl.col("rt") - pl.col("rt_max_peptide_sub")) < filter_max_apex_rt)
-    )
-
     log_info("df_fragment after filtering: {}".format(df_fragment.shape))
-
     log_info("Calculation of all correlation values...")
 
     # if (

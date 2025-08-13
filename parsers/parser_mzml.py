@@ -4,6 +4,7 @@ import xml.etree.ElementTree as ET
 import numpy as np
 import pymzml
 from pyopenms import MSExperiment, MzMLFile
+from utilities.logger import log_info
 
 
 def read_mzml(filename):
@@ -60,6 +61,9 @@ def get_ms1_mzml(file_path):
             ms2_to_ms1_map[scan_id] = last_ms1_id
 
             retention_time = spectrum.getRT()
+
+            # Extract m/z and intensity values for MS2
+            mz_array, intensity_array = spectrum.get_peaks()
 
             ms2_spectra[scan_id] = {
                 "retention_time": retention_time,

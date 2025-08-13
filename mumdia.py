@@ -1083,7 +1083,7 @@ def main(
     )
 
     log_info("Done running MuMDIA...")
-    run_mokapot(output_dir=config["mumdia"]["result_dir"])
+    # run_mokapot(output_dir=config["mumdia"]["result_dir"])
 
 
 if __name__ == "__main__":
