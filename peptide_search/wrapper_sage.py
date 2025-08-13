@@ -54,8 +54,17 @@ def run_sage(
     json_path = pathlib.Path(output_dir).joinpath("sage_values.json")
 
     # Serialize the entire config dictionary to JSON format
+    def remove_nulls(obj):
+        if isinstance(obj, dict):
+            return {k: remove_nulls(v) for k, v in obj.items() if v is not None}
+        elif isinstance(obj, list):
+            return [remove_nulls(v) for v in obj if v is not None]
+        else:
+            return obj
+
+    config_no_nulls = remove_nulls(config)
     with open(json_path, "w") as file:
-        json.dump(config, file, indent=4)
+        json.dump(config_no_nulls, file, indent=4)
 
     # Log the exact command that will be executed for debugging purposes
     print(
