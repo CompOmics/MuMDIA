@@ -227,6 +227,14 @@ def retention_window_searches(
     df_fragment = pl.concat(df_fragment_list)
     df_psms = pl.concat(df_psms_list)
 
+    # Output for debugging
+    df_fragment.write_csv(
+        "debug/df_fragment_after_retention_window_searches.tsv", separator="\t"
+    )
+    df_psms.write_csv(
+        "debug/df_psms_after_retention_window_searches.tsv", separator="\t"
+    )
+
     # Generate derived DataFrames for downstream analysis
     # df_fragment_max: Contains the highest intensity fragment for each PSM
     # This is used for feature generation and quality assessment
@@ -238,7 +246,8 @@ def retention_window_searches(
     # This helps identify the best representative fragment for each peptide sequence
     # Note: Could be extended to consider charge state as well
     df_fragment_max_peptide = df_fragment_max.unique(
-        subset=["peptide"],
+        subset=["peptide", "charge"],
+        maintain_order=True,
         keep="first",
     )
 

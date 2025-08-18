@@ -399,7 +399,7 @@ def match_fragments(
 
     fragment_records = []
 
-    # Get unique PSMs (peptide-spectrum matches) by sorting by fragment intensity and keeping the first occurrence per PSM
+    # Get unique PSMs by sorting by fragment intensity and keeping the first occurrence per PSM
     unique_psm_id = df_fragment_sub_peptidoform.sort(
         "fragment_intensity", descending=True
     ).unique(
@@ -408,7 +408,44 @@ def match_fragments(
 
     unique_psm_id_dicts = unique_psm_id.to_dicts()
 
+    log_info("Original df_fragment_sub_peptidoform:")
+    log_info(df_fragment_sub_peptidoform)
+    log_info("Shape: {}".format(df_fragment_sub_peptidoform.shape))
+    log_info(
+        "Unique PSM IDs in original: {}".format(
+            df_fragment_sub_peptidoform["psm_id"].unique().to_list()
+        )
+    )
+    log_info(
+        "Unique RTs in original: {}".format(
+            sorted(df_fragment_sub_peptidoform["rt"].unique().to_list())
+        )
+    )
+    log_info(
+        "rt_max_peptide_sub values: {}".format(
+            df_fragment_sub_peptidoform["rt_max_peptide_sub"].unique().to_list()
+        )
+    )
+    print("\n" * 2)
+
+    log_info("After selecting unique PSMs by highest fragment intensity:")
+    log_info("Shape: {}".format(unique_psm_id.shape))
+    log_info(
+        "Unique PSM IDs in unique_psm_id: {}".format(
+            unique_psm_id["psm_id"].unique().to_list()
+        )
+    )
+    log_info(
+        "Unique RTs in unique_psm_id: {}".format(
+            sorted(unique_psm_id["rt"].unique().to_list())
+        )
+    )
+    print("\n" * 2)
+
     # Iterate over each unique PSM to annotate and match fragments
+    successful_psm_ids = []
+    failed_psm_ids = []
+
     for row in unique_psm_id_dicts:
         psm_id = int(row["psm_id"])
         rt = float(row["rt"])
@@ -417,76 +454,181 @@ def match_fragments(
         precursor_charge = int(
             row["charge"]
         )  # This was fragment_charge before, but it is the precursor charge
-        peptide = row["peptide"]
         precursor = row[
             "precursor"
         ]  # TODO: check if its okay to do on precursor level. If we don't we have a problem with RT matching
-
-        # Construct a RawSpectrum object for this PSM using the scan number and MS2 data
-        spectrum = RawSpectrum(
-            title=scannr,
-            num_scans=1,
-            rt=float(rt),
-            precursor_charge=precursor_charge,
-            precursor_mass=1.0,
-            mz_array=ms2_dict[scannr]["mz"],
-            intensity_array=ms2_dict[scannr]["intensity"],
-        )
-
-        # Convert peptide string to CompoundPeptidoform for annotation
-        linear_peptide = CompoundPeptidoformIon(precursor)
-
-        matching_parameters = MatchingParameters()
-        matching_parameters.tolerance_ppm = (
-            13.0  # TODO: make this a parameter used by the config
-        )
-
-        # Annotate the spectrum with theoretical fragments using RustyMS
-        annotated_spectrum = spectrum.annotate(
-            peptidoform=linear_peptide,
-            parameters=matching_parameters,
-            model=FragmentationModel.CidHcd,
-            mode=MassMode.Monoisotopic,
-        )
-
-        matched_fragments = [
-            annotated_peak
-            for annotated_peak in annotated_spectrum.spectrum
-            if annotated_peak.annotation
-            and annotated_peak.annotation[0].charge == 1  # make configurable
-            and (
-                repr(annotated_peak.annotation[0].ion).startswith("b")
-                or repr(annotated_peak.annotation[0].ion).startswith("y")
+        log_info(
+            "Processing PSM ID: {}, RT: {}, rt_max_peptide_sub: {}".format(
+                psm_id, rt, rt_max_peptide_sub
             )
-        ]
+        )
 
-        # For each matched fragment, extract ion type, ordinal, charge, and intensity
-        for mf in matched_fragments:
-
-            ion_label = re.search(ion_pattern, repr(mf.annotation[0])).group(1)
-            ion_charge = re.search(charge_pattern, repr(mf.annotation[0])).group(1)
-
-            fragment_records.append(
-                {
-                    "psm_id": psm_id,
-                    "fragment_type": ion_label[0],
-                    "fragment_ordinals": ion_label[1:],
-                    "fragment_charge": ion_charge,
-                    "fragment_intensity": mf.intensity,
-                    "fragment_mz": mf.experimental_mz,
-                    "rt": rt,
-                    "scannr": scannr,
-                    "fragment_name": f"{ion_label}/{ion_charge}",
-                    "rt_max_peptide_sub": rt_max_peptide_sub,
-                }
+        try:
+            # Construct a RawSpectrum object for this PSM using the scan number and MS2 data
+            spectrum = RawSpectrum(
+                title=scannr,
+                num_scans=1,
+                rt=float(rt),
+                precursor_charge=precursor_charge,
+                precursor_mass=1.0,
+                mz_array=ms2_dict[scannr]["mz"],
+                intensity_array=ms2_dict[scannr]["intensity"],
             )
+
+            # Convert peptide string to CompoundPeptidoform for annotation
+            linear_peptide = CompoundPeptidoformIon(precursor)
+
+            matching_parameters = MatchingParameters()
+            matching_parameters.tolerance_ppm = (
+                13.0  # TODO: make this a parameter used by the config
+            )
+
+            # Annotate the spectrum with theoretical fragments using RustyMS
+            annotated_spectrum = spectrum.annotate(
+                peptidoform=linear_peptide,
+                parameters=matching_parameters,
+                model=FragmentationModel.CidHcd,
+                mode=MassMode.Monoisotopic,
+            )
+
+            log_info(
+                "Annotated spectrum for PSM ID: {} with {} peaks.".format(
+                    psm_id, len(annotated_spectrum.spectrum or [])
+                )
+            )
+
+            # Log all annotated peaks
+            log_info("Annotated peaks:")
+            for annotated_peak in annotated_spectrum.spectrum:
+
+                if annotated_peak.annotation:
+                    ion_label = re.search(
+                        ion_pattern, repr(annotated_peak.annotation[0])
+                    ).group(1)
+                    charge_label = re.search(
+                        charge_pattern, repr(annotated_peak.annotation[0])
+                    ).group(1)
+                    log_info(
+                        "m/z: {}, Intensity:{}, Charge:{}, Ion:{}".format(
+                            annotated_peak.experimental_mz,
+                            annotated_peak.intensity,
+                            charge_label,
+                            ion_label,
+                        )
+                    )
+            log_info("\n" * 2)
+
+            matched_fragments = [
+                annotated_peak
+                for annotated_peak in annotated_spectrum.spectrum
+                if annotated_peak.annotation
+                and annotated_peak.annotation[0].charge == 1  # make configurable
+                and (
+                    re.search(ion_pattern, repr(annotated_peak.annotation[0]))
+                    .group(1)
+                    .startswith("b")
+                    or re.search(ion_pattern, repr(annotated_peak.annotation[0]))
+                    .group(1)
+                    .startswith("y")
+                )
+            ]
+
+            # For each matched fragment, extract ion type, ordinal, charge, and intensity
+            log_info(
+                "Found {} matched fragments for PSM ID: {}".format(
+                    len(matched_fragments), psm_id
+                )
+            )
+
+            if len(matched_fragments) == 0:
+                log_info(
+                    "WARNING: No matched fragments found for PSM ID: {}, RT: {}".format(
+                        psm_id, rt
+                    )
+                )
+                failed_psm_ids.append(psm_id)
+                continue
+
+            # log_info("Matched fragment:")
+            for mf in matched_fragments:
+
+                # log_info(
+                #     "m/z: {}, Intensity: {}, Charge: {}, Annotation: {}".format(
+                #         mf.experimental_mz,
+                #         mf.intensity,
+                #         mf.annotation[0].charge,
+                #         repr(mf.annotation[0]),
+                #     )
+                # )
+
+                ion_label = re.search(ion_pattern, repr(mf.annotation[0])).group(1)
+                ion_charge = re.search(charge_pattern, repr(mf.annotation[0])).group(1)
+
+                fragment_records.append(
+                    {
+                        "psm_id": psm_id,
+                        "fragment_type": ion_label[0],
+                        "fragment_ordinals": ion_label[1:],
+                        "fragment_charge": ion_charge,
+                        "fragment_intensity": mf.intensity,
+                        "fragment_mz": mf.experimental_mz,
+                        "rt": rt,
+                        "scannr": scannr,
+                        "fragment_name": f"{ion_label}/{ion_charge}",
+                        "rt_max_peptide_sub": rt_max_peptide_sub,
+                    }
+                )
+
+            successful_psm_ids.append(psm_id)
+
+        except Exception as e:
+            log_info(
+                "ERROR: Failed to process PSM ID: {}, RT: {}, Error: {}".format(
+                    psm_id, rt, str(e)
+                )
+            )
+            failed_psm_ids.append(psm_id)
+            continue
+
+    log_info("Summary of PSM processing:")
+    log_info(
+        "  Successful PSMs: {} - {}".format(len(successful_psm_ids), successful_psm_ids)
+    )
+    log_info("  Failed PSMs: {} - {}".format(len(failed_psm_ids), failed_psm_ids))
+    log_info("  Total fragment records created: {}".format(len(fragment_records)))
+
     # If any fragment records were found, create a new DataFrame and ensure uniqueness per PSM/fragment
     if len(fragment_records) != 0:
-        df_fragment_sub_peptidoform = (
+        new_df_fragment_sub_peptidoform = (
             pl.DataFrame(fragment_records)
             .sort("fragment_intensity", descending=True)
             .unique(subset=["psm_id", "fragment_name"], keep="first")
         )
+
+        log_info("After creating new DataFrame from fragment records:")
+        log_info("  Shape: {}".format(new_df_fragment_sub_peptidoform.shape))
+        log_info(
+            "  Unique PSM IDs: {}".format(
+                new_df_fragment_sub_peptidoform["psm_id"].unique().to_list()
+            )
+        )
+        log_info(
+            "  Unique RTs: {}".format(
+                sorted(new_df_fragment_sub_peptidoform["rt"].unique().to_list())
+            )
+        )
+        log_info(
+            "  rt_max_peptide_sub values: {}".format(
+                new_df_fragment_sub_peptidoform["rt_max_peptide_sub"].unique().to_list()
+            )
+        )
+
+        # Replace the original DataFrame
+        df_fragment_sub_peptidoform = new_df_fragment_sub_peptidoform
+    else:
+        log_info("ERROR: No fragment records were created! All PSMs failed processing.")
+        # Keep the original DataFrame rather than creating an empty one
+        log_info("Keeping original df_fragment_sub_peptidoform")
 
     # Pivot the DataFrame to create a matrix: rows=PSMs, columns=fragment names, values=fragment intensities
     intensity_matrix_df = df_fragment_sub_peptidoform.pivot(
@@ -506,6 +648,8 @@ def match_fragments(
     └──────────┴─────────────┴─────────────┴──────────────┴────────────┴─────────────┴─────────────┴────────────┘
     """
 
+    log_info("{}".format(intensity_matrix_df.head(5)))
+
     # Do a max normalization of the MS2PIP predictions by dividing by the maximum
     # predicted intensity
     max_intens_ms2pip = max(ms2pip_predictions.values())
@@ -518,15 +662,44 @@ def match_fragments(
     """
 
     # Select the PSM(s) with RT equal to the maximum RT for this precursor (i.e., apex)
+    target_rt = df_fragment_sub_peptidoform["rt_max_peptide_sub"][0]
 
     most_abundant_frag_psm = df_fragment_sub_peptidoform.filter(
-        df_fragment_sub_peptidoform["rt"]
-        == df_fragment_sub_peptidoform["rt_max_peptide_sub"][0]
+        df_fragment_sub_peptidoform["rt"] == target_rt
     )
 
-    if most_abundant_frag_psm.is_empty():
+    log_info(
+        "Looking for PSMs with RT exactly matching target RT: {}".format(target_rt)
+    )
+    log_info(
+        "Available RTs in current DataFrame: {}".format(
+            sorted(df_fragment_sub_peptidoform["rt"].unique().to_list())
+        )
+    )
+    log_info(
+        "Most abundant fragment PSMs with matching RT {} for the apex spectrum: {}".format(
+            target_rt,
+            (
+                most_abundant_frag_psm["psm_id"][0]
+                if most_abundant_frag_psm.shape[0] > 0
+                else "N/A"
+            ),
+        )
+    )
 
+    log_info("{}".format(most_abundant_frag_psm.head(20)))
+
+    if most_abundant_frag_psm.is_empty():
         log_info("No PSMs found with matching RT for the apex spectrum.")
+        log_info("Target RT = {:.6f}".format(target_rt))
+        log_info("Available RTs:")
+        for rt in sorted(df_fragment_sub_peptidoform["rt"].unique()):
+            rt_diff = abs(float(rt) - target_rt)
+            log_info("  {:.6f} (diff: {:.6f})".format(rt, rt_diff))
+        log_info(
+            "This indicates that the PSM with the correct RT was lost during fragment annotation processing."
+        )
+        log_info("\n")
 
     # Build predicted intensity vector for the fragments present in the most abundant PSM
     pred_frag_intens_individual = np.array(
@@ -538,19 +711,30 @@ def match_fragments(
         ]
     )
 
+    log_info(
+        "Predicted fragment intensities for the most abundant PSM: {}".format(
+            pred_frag_intens_individual
+        )
+    )
+
+    """
+    Get pearson and cosine similarity of spectrum with highest intensity
+    """
     # Compute Pearson correlation between predicted and observed intensities for the apex spectrum
     most_intens_cor = np.corrcoef(
         pred_frag_intens_individual, most_abundant_frag_psm["fragment_intensity"]
     )[0][1]
+
+    log_info(
+        "Pearson correlation for the most abundant PSM: {}".format(most_intens_cor)
+    )
 
     # Compute cosine similarity between predicted and observed intensities for the apex spectrum
     most_intens_cos = cosine_similarity(
         pred_frag_intens_individual, most_abundant_frag_psm["fragment_intensity"]
     )
 
-    """
-    Get pearson and cosing similarity of spectrum with highest intensity
-    """
+    log_info("Cosine similarity for the most abundant PSM: {}".format(most_intens_cos))
 
     """
     Get the intensity matrix of observations
@@ -565,14 +749,30 @@ def match_fragments(
         [ms2pip_predictions.get(fid, 0.0) for fid in fragment_names]
     )
 
+    log_info("Intensity matrix shape: {}".format(intensity_matrix.shape))
+    log_info("{}".format(intensity_matrix))
+    log_info("Predicted fragment intensities: \n{}".format(pred_frag_intens))
+
     # Collect predictions for keys not listed in fragment_names (i.e., fragments predicted but not observed)
     non_matched_predictions = np.array(
         [v for k, v in ms2pip_predictions.items() if k not in fragment_names]
     )
+    log_info(
+        "Non-matched fragment predictions (not in intensity matrix): \n{}".format(
+            non_matched_predictions
+        )
+    )
 
     # Sum of predicted intensities for matched fragments (for feature engineering)
+    # TODO: is it a good idea to sum over PSMs? Or should we do it per PSM?
     sum_pred_frag_intens = np.array(
         sum([ms2pip_predictions.get(fid, 0.0) for fid in fragment_names])
+    )
+
+    log_info(
+        "Sum of predicted fragment intensities for matched fragments: {}".format(
+            sum_pred_frag_intens
+        )
     )
 
     # Ensure data types are consistent for downstream calculations
@@ -600,35 +800,65 @@ def match_fragments(
     correlation_result = compute_correlations(
         intensity_matrix_normalized, pred_frag_intens
     )
+    log_info("Correlation results: {}".format(correlation_result))
 
     # Count the number of nonzero entries per PSM (for feature engineering)
+    # TODO: is there a relevance to this? Because the number of columns depends on the max number of fragments for the PSM with the most fragments
     correlation_result_counts = (
         intensity_matrix_df.select(
-            pl.fold(
-                acc=pl.lit(0),
+            pl.fold(  # fold is used to apply a function across multiple columns
+                acc=pl.lit(0),  # Initialize accumulator to zero
                 exprs=[
-                    (pl.col(c) != 0).cast(pl.Int64) for c in intensity_matrix_df.columns
+                    (pl.col(c) != 0).cast(pl.Int64)
+                    for c in intensity_matrix_df.columns  # Convert non-zero entries to 1
                 ],
-                function=lambda acc, x: acc + x,
-            ).alias("non_zero_count")
+                function=lambda acc, x: acc + x,  # Sum the non-zero counts
+            ).alias(
+                "non_zero_count"
+            )  # Rename the result column
         )
-        .to_numpy()
-        .ravel()
+        .to_numpy()  # Convert to NumPy array for consistency
+        .ravel()  # Flatten the array to 1D
+    )
+
+    log_info(
+        "Count of non-zero fragment entries per PSM: {}".format(
+            correlation_result_counts
+        )
     )
 
     # Compute mean squared error between normalized observed and predicted intensities (per PSM, then averaged)
     mse_avg_pred_intens = (
         abs(intensity_matrix_normalized - pred_frag_intens).sum(axis=1)
     ).sum() / intensity_matrix_normalized.shape[0]
+
+    log_info(
+        "Mean Squared Error (MSE) between normalized observed and predicted intensities: {}".format(
+            mse_avg_pred_intens
+        )
+    )
     # Compute total MSE including non-matched predictions
     mse_avg_pred_intens_total = (
         (abs(intensity_matrix_normalized - pred_frag_intens).sum(axis=1)).sum()
         + sum(non_matched_predictions)
     ) / intensity_matrix_normalized.shape[0]
 
+    log_info(
+        "Total Mean Squared Error (MSE) including non-matched predictions: {}".format(
+            mse_avg_pred_intens_total
+        )
+    )
+
     # Compute correlation matrix for PSM IDs (rows of intensity matrix)
-    if intensity_matrix_normalized.shape[0] > 1:
-        correlation_matrix_psm_ids = np.corrcoef(intensity_matrix_normalized)
+    log_info(
+        "Shape of intensity matrix normalized: {}".format(
+            intensity_matrix_normalized.shape
+        )
+    )
+    if intensity_matrix_normalized.shape[0] > 1:  # Ensure there are multiple PSMs
+        correlation_matrix_psm_ids = np.corrcoef(
+            intensity_matrix_normalized
+        )  # Calculate correlation matrix for PSM IDs
 
         """
         (
@@ -653,7 +883,13 @@ def match_fragments(
             ~np.eye(correlation_matrix_psm_ids.shape[0], dtype=bool)
         ]
         # Square and sort the correlation values for downstream use
+        # TODO: why square?
         correlation_matrix_psm_ids = np.sort(correlation_matrix_psm_ids**2)
+        log_info(
+            "Correlation matrix for PSM IDs computed with shape: {}".format(
+                correlation_matrix_psm_ids.shape
+            )
+        )
     else:
 
         # If only one PSM, set all correlation matrices to empty
@@ -699,39 +935,27 @@ def match_fragments(
         correlation_matrix_frag_ids_missing = np.array([])
         correlation_matrix_frag_ids_missing_zeros_counts = np.array([])
 
-        # Correlation result: 1D array of correlation values between predicted MS2PIP intensities and observed fragment intensities
-        # Correlation matrix PSM IDs: 1D array of correlation values between PSMs
-        # Correlation matrix fragment IDs: 1D array of correlation values between fragments
-
-        # correlation_result, correlation_result_counts
-        # correlation_matrix_psm_ids, correlation_matrix_psm_ids_counts
-        # correlation_matrix_frag_ids, correlation_matrix_frag_ids_counts
-
-        #        correlation_matrix_psm_ids_ignore_zeros,
-        #        correlation_matrix_psm_ids_ignore_zeros_counts,
-        #        correlation_matrix_frag_ids_ignore_zeros,
-        #        correlation_matrix_frag_ids_ignore_zeros_counts,
-
-        # Return all computed features and correlation matrices as a CorrelationResults dataclass
+    log_info("##" * 25)
+    log_info("\n" * 10)
 
     return CorrelationResults(
-        correlations=correlation_result,
-        correlations_count=correlation_result_counts,
-        sum_pred_frag_intens=sum_pred_frag_intens,
-        correlation_matrix_psm_ids=correlation_matrix_psm_ids,
-        correlation_matrix_frag_ids=correlation_matrix_frag_ids,
-        correlation_matrix_psm_ids_ignore_zeros=correlation_matrix_psm_ids_ignore_zeros,
-        correlation_matrix_psm_ids_ignore_zeros_counts=correlation_matrix_psm_ids_ignore_zeros_counts,
-        correlation_matrix_psm_ids_missing=correlation_matrix_psm_ids_missing,
-        correlation_matrix_psm_ids_missing_zeros_counts=correlation_matrix_psm_ids_missing_zeros_counts,
-        correlation_matrix_frag_ids_ignore_zeros=correlation_matrix_frag_ids_ignore_zeros,
-        correlation_matrix_frag_ids_ignore_zeros_counts=correlation_matrix_frag_ids_ignore_zeros_counts,
-        correlation_matrix_frag_ids_missing=correlation_matrix_frag_ids_missing,
-        correlation_matrix_frag_ids_missing_zeros_counts=correlation_matrix_frag_ids_missing_zeros_counts,
-        most_intens_cor=most_intens_cor,
-        most_intens_cos=most_intens_cos,
-        mse_avg_pred_intens=mse_avg_pred_intens,
-        mse_avg_pred_intens_total=mse_avg_pred_intens_total,
+        correlations=correlation_result,  # Pearson correlation between predicted and observed intensities
+        correlations_count=correlation_result_counts,  # Count of non-zero fragments entries per PSM
+        sum_pred_frag_intens=sum_pred_frag_intens,  # Sum of predicted fragment intensities for matched fragments
+        correlation_matrix_psm_ids=correlation_matrix_psm_ids,  # Correlation matrix for PSMs, i.e. the correlation between fragments of different PSMs
+        correlation_matrix_frag_ids=correlation_matrix_frag_ids,  # Correlation matrix for fragments, i.e. the correlation between fragments of every PSM
+        correlation_matrix_psm_ids_ignore_zeros=correlation_matrix_psm_ids_ignore_zeros,  # TODO: always empty, needs to be implemented
+        correlation_matrix_psm_ids_ignore_zeros_counts=correlation_matrix_psm_ids_ignore_zeros_counts,  # TODO: always empty, needs to be implemented
+        correlation_matrix_psm_ids_missing=correlation_matrix_psm_ids_missing,  # TODO: always empty, needs to be implemented
+        correlation_matrix_psm_ids_missing_zeros_counts=correlation_matrix_psm_ids_missing_zeros_counts,  # Always empty, needs to be implemented
+        correlation_matrix_frag_ids_ignore_zeros=correlation_matrix_frag_ids_ignore_zeros,  # Always empty, needs to be implemented
+        correlation_matrix_frag_ids_ignore_zeros_counts=correlation_matrix_frag_ids_ignore_zeros_counts,  # Always empty, needs to be implemented
+        correlation_matrix_frag_ids_missing=correlation_matrix_frag_ids_missing,  # Always empty, needs to be implemented
+        correlation_matrix_frag_ids_missing_zeros_counts=correlation_matrix_frag_ids_missing_zeros_counts,  # Always empty, needs to be implemented
+        most_intens_cor=most_intens_cor,  # Pearson correlation of the most intense PSM
+        most_intens_cos=most_intens_cos,  # Cosine similarity of the most intense PSM
+        mse_avg_pred_intens=mse_avg_pred_intens,  # Average MSE of predicted fragment intensities
+        mse_avg_pred_intens_total=mse_avg_pred_intens_total,  # Total MSE of predicted fragment intensities including non-matched predictions
     )
 
 
@@ -761,22 +985,26 @@ def get_features_fragment_intensity(
     fragment_dict = {}
     correlations_fragment_dict = {}
 
-    # Dictionary to hold the RTs for each peptide
-    # peptide_to_rt_max = dict(
-    #     zip(
-    #         df_fragment_max_peptide["peptide"].to_list(),
-    #         df_fragment_max_peptide["rt"].to_list(),
-    #     )
-    # )
     df_fragment_max_peptide = df_fragment_max_peptide.with_columns(
         (pl.col("peptide") + "/" + pl.col("charge").cast(pl.Utf8)).alias("precursor")
     )
+    
+    log_info("df_fragment_max_peptide summary:")
+    log_info("  Shape: {}".format(df_fragment_max_peptide.shape))
+    log_info("  Sample entries:")
+    for row in df_fragment_max_peptide.head(5).iter_rows(named=True):
+        log_info("    Precursor: {}, PSM ID: {}, RT: {}".format(
+            row["precursor"], row["psm_id"], row["rt"]
+        ))
+    
     precursor_to_rt_max = dict(
         zip(
             df_fragment_max_peptide["precursor"].to_list(),
             df_fragment_max_peptide["rt"].to_list(),
         )
     )
+    
+    log_info("precursor_to_rt_max mapping created with {} entries".format(len(precursor_to_rt_max)))
 
     df_precursor_rt = pl.DataFrame(
         {
@@ -785,30 +1013,28 @@ def get_features_fragment_intensity(
         }
     )
 
-    # # Create a new df with this mapping
-    # df_peptide_rt = pl.DataFrame(
-    #     {
-    #         "peptide": list(peptide_to_rt_max.keys()),
-    #         "rt_max_peptide_sub": list(peptide_to_rt_max.values()),
-    #     }
-    # )
-
-    # Add rt_max_peptide_sub to df_fragment and filter based on RT
-    # df_fragment = df_fragment.join(df_peptide_rt, on="peptide", how="left")
     df_fragment = df_fragment.with_columns(
         (pl.col("peptide") + "/" + pl.col("charge").cast(pl.Utf8)).alias("precursor")
     )
+    
+    log_info("Before joining rt_max_peptide_sub:")
+    log_info("  df_fragment shape: {}".format(df_fragment.shape))
+    log_info("  Unique precursors in df_fragment: {}".format(len(df_fragment["precursor"].unique())))
+    
     df_fragment = df_fragment.join(df_precursor_rt, on="precursor", how="left")
+    
+    log_info("After joining rt_max_peptide_sub:")
+    log_info("  df_fragment shape: {}".format(df_fragment.shape))
+    log_info("  Entries with null rt_max_peptide_sub: {}".format(
+        df_fragment.filter(pl.col("rt_max_peptide_sub").is_null()).shape[0]
+    ))
+    
     df_fragment = df_fragment.filter(
         (pl.col("rt_max_peptide_sub").is_not_null())
         & (abs(pl.col("rt") - pl.col("rt_max_peptide_sub")) < filter_max_apex_rt)
     )
     log_info("df_fragment after filtering: {}".format(df_fragment.shape))
     log_info("Calculation of all correlation values...")
-
-    # if (
-    #     not read_correlation_pickles
-    # ):  # TODO: needs to be handled differently because if there is no pickle file, we need to compute the correlations, and empty dicts will be returned
 
     for (peptidoform, charge), df_fragment_sub_peptidoform in tqdm(
         df_fragment.group_by(["peptide", "charge"])
@@ -850,15 +1076,5 @@ def get_features_fragment_intensity(
             pickle.dump(fragment_dict, f)
         with open(f"{output_dir}/correlations_fragment_dict.pkl", "wb") as f:
             pickle.dump(correlations_fragment_dict, f)
-    # if read_correlation_pickles:
-    #     try:
-    #         with open(f"{output_dir}/fragment_dict.pkl", "rb") as f:
-    #             fragment_dict = pickle.load(f)
-    #         with open(f"{output_dir}/correlations_fragment_dict.pkl", "rb") as f:
-    #             correlations_fragment_dict = pickle.load(f)
-    #         log_info("Successfully loaded correlation data from pickle files")
-    #     except FileNotFoundError:
-    #         log_info("Pickle files not found, will compute correlations instead")
-    #         read_correlation_pickles = False  # Fall back to computation
 
     return fragment_dict, correlations_fragment_dict

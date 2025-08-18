@@ -37,13 +37,11 @@ def get_ms1_mzml(file_path):
     # Iterate over each spectrum in the file
     for spectrum in exp.getSpectra():
         scan_id = spectrum.getNativeID()
+        mz_array, intensity_array = spectrum.get_peaks()
+        # Get retention time (in seconds)
+        retention_time = spectrum.getRT()
 
         if spectrum.getMSLevel() == 1:
-            # Extract m/z and intensity values
-            mz_array, intensity_array = spectrum.get_peaks()
-
-            # Get retention time (in seconds)
-            retention_time = spectrum.getRT()
 
             # Update MS1 spectra dictionary
             ms1_spectra[scan_id] = {
@@ -56,14 +54,8 @@ def get_ms1_mzml(file_path):
             last_ms1_id = scan_id
 
         elif spectrum.getMSLevel() == 2 and last_ms1_id is not None:
-            # Map current MS2 scan identifier to the last MS1 scan identifier
-            retention_time = spectrum.getRT()
+            # Map current MS2 scan identifier to the last MS1 scan identifier)
             ms2_to_ms1_map[scan_id] = last_ms1_id
-
-            retention_time = spectrum.getRT()
-
-            # Extract m/z and intensity values for MS2
-            mz_array, intensity_array = spectrum.get_peaks()
 
             ms2_spectra[scan_id] = {
                 "retention_time": retention_time,
