@@ -34,6 +34,7 @@ from tqdm import tqdm
 
 from data_structures import CorrelationResults, PickleConfig
 from utilities.logger import log_info
+from utilities.plotting import plot_XIC
 
 
 @njit
@@ -398,6 +399,9 @@ def match_fragments(
     charge_pattern = r"charge=(\d+),"
 
     fragment_records = []
+
+    # Plot XICs
+    plot_XIC(df_fragment_sub_peptidoform)
 
     # Get unique PSMs by sorting by fragment intensity and keeping the first occurrence per PSM
     unique_psm_id = df_fragment_sub_peptidoform.sort(
@@ -988,23 +992,29 @@ def get_features_fragment_intensity(
     df_fragment_max_peptide = df_fragment_max_peptide.with_columns(
         (pl.col("peptide") + "/" + pl.col("charge").cast(pl.Utf8)).alias("precursor")
     )
-    
+
     log_info("df_fragment_max_peptide summary:")
     log_info("  Shape: {}".format(df_fragment_max_peptide.shape))
     log_info("  Sample entries:")
     for row in df_fragment_max_peptide.head(5).iter_rows(named=True):
-        log_info("    Precursor: {}, PSM ID: {}, RT: {}".format(
-            row["precursor"], row["psm_id"], row["rt"]
-        ))
-    
+        log_info(
+            "    Precursor: {}, PSM ID: {}, RT: {}".format(
+                row["precursor"], row["psm_id"], row["rt"]
+            )
+        )
+
     precursor_to_rt_max = dict(
         zip(
             df_fragment_max_peptide["precursor"].to_list(),
             df_fragment_max_peptide["rt"].to_list(),
         )
     )
-    
-    log_info("precursor_to_rt_max mapping created with {} entries".format(len(precursor_to_rt_max)))
+
+    log_info(
+        "precursor_to_rt_max mapping created with {} entries".format(
+            len(precursor_to_rt_max)
+        )
+    )
 
     df_precursor_rt = pl.DataFrame(
         {
@@ -1016,19 +1026,25 @@ def get_features_fragment_intensity(
     df_fragment = df_fragment.with_columns(
         (pl.col("peptide") + "/" + pl.col("charge").cast(pl.Utf8)).alias("precursor")
     )
-    
+
     log_info("Before joining rt_max_peptide_sub:")
     log_info("  df_fragment shape: {}".format(df_fragment.shape))
-    log_info("  Unique precursors in df_fragment: {}".format(len(df_fragment["precursor"].unique())))
-    
+    log_info(
+        "  Unique precursors in df_fragment: {}".format(
+            len(df_fragment["precursor"].unique())
+        )
+    )
+
     df_fragment = df_fragment.join(df_precursor_rt, on="precursor", how="left")
-    
+
     log_info("After joining rt_max_peptide_sub:")
     log_info("  df_fragment shape: {}".format(df_fragment.shape))
-    log_info("  Entries with null rt_max_peptide_sub: {}".format(
-        df_fragment.filter(pl.col("rt_max_peptide_sub").is_null()).shape[0]
-    ))
-    
+    log_info(
+        "  Entries with null rt_max_peptide_sub: {}".format(
+            df_fragment.filter(pl.col("rt_max_peptide_sub").is_null()).shape[0]
+        )
+    )
+
     df_fragment = df_fragment.filter(
         (pl.col("rt_max_peptide_sub").is_not_null())
         & (abs(pl.col("rt") - pl.col("rt_max_peptide_sub")) < filter_max_apex_rt)
