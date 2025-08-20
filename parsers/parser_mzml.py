@@ -114,7 +114,7 @@ def split_mzml_by_retention_time(original_file, dir_files="", time_interval=120.
             sub_exp.addSpectrum(spec)
         else:
             sub_dir = f"part_{end_time-time_interval}_{end_time}"
-            print(f"Writing part {part} to {tempdir}/{sub_dir}...")
+            log_info(f"Writing part {part} to {tempdir}/{sub_dir}...")
             if not os.path.exists(os.path.join(tempdir, sub_dir)):
                 os.makedirs(os.path.join(tempdir, sub_dir))
 

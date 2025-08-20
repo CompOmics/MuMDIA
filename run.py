@@ -440,8 +440,12 @@ def main() -> str:
         # Train DeepLC retention time model and calculate prediction bounds
         # Narrow type for static analysis
         assert isinstance(df_psms, pl.DataFrame)
+        print(args_dict)
         peptide_df, dlc_calibration, dlc_transfer_learn, perc_95 = retrain_and_bounds(
-            cast(pl.DataFrame, df_psms), peptides, result_dir=result_dir
+            cast(pl.DataFrame, df_psms),
+            peptides,
+            result_dir=result_dir,
+            coefficient_bounds=args_dict["coefficient_bounds"],
         )
 
         log_info("Partitioning mzML files by predicted retention time...")
