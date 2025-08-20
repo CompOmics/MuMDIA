@@ -12,6 +12,8 @@ import logging
 import os
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional
+import pickle
+import sys
 
 # Optional numba: provide no-op decorator if unavailable
 try:
@@ -673,17 +675,10 @@ def run_peptidoform_correlation(
             )
         )
 
-    return pl.DataFrame(feature_dict)
+    df = pl.DataFrame(feature_dict)
+    df.write_csv("debug/correlation_features.csv")
 
-
-def dataframe_to_dict_fragintensity(df_fragment: pl.DataFrame) -> dict:
-    """
-    Convert a DataFrame of fragment intensities into a dictionary keyed by psm_id.
-    """
-    fragment_dict = {}
-    for psm_id, sub_df_fragment in df_fragment.group_by("psm_id"):
-        fragment_dict[psm_id] = sub_df_fragment
-    return fragment_dict
+    return df
 
 
 def process_peptidoform(args):
@@ -805,7 +800,11 @@ def add_precursor_intensities_optimized_parallel(
 
     # 2. Define the function to compute intensities for a single row
     def compute_intensities(row):
-        scannr, charge, calcmass = row["scannr"], row["charge"], row["calcmass"]
+        scannr, charge, calcmass = (
+            row["scannr"],
+            row["charge"],
+            row["calcmass"],
+        )  # Should this not be expmass?
         if scannr not in ms2_to_ms1_dict:
             return {"M-1": 0.0, "M": 0.0, "M+1": 0.0}
         spectrum = ms1_dict.get(ms2_to_ms1_dict[scannr], {})
@@ -855,7 +854,9 @@ def add_precursor_intensities(df_psms, ms1_dict, ms2_to_ms1_dict):
             pl.struct(["scannr", "charge", "calcmass"])
             .map_elements(
                 lambda row: extract_intensities(
-                    row["scannr"], row["charge"], row["calcmass"]
+                    row["scannr"],
+                    row["charge"],
+                    row["calcmass"],  # Should this not be expmass?
                 )
             )
             .alias("precursor_intensities")
@@ -885,7 +886,7 @@ def add_precursor_intensities(df_psms, ms1_dict, ms2_to_ms1_dict):
 def calculate_features(
     df_psms: pl.DataFrame,
     df_fragment: pl.DataFrame,
-    df_fragment_max: pl.DataFrame,
+    df_fragment_max: pl.DataFrame,  # Why not used?
     df_fragment_max_peptide: pl.DataFrame,
     *,  # Force keyword-only arguments
     filter_rel_rt_error: float = 0.1,
@@ -902,6 +903,7 @@ def calculate_features(
     Process the PSM and fragment DataFrames, compute features, and save the output.
     This function uses parallel processing with task chunking.
     """
+    # df_psms.write_csv("debug/df_psms_beginning.csv", separator="\t")
     # Handle pickle configuration
     if pickle_config is None:
         pickle_config = PickleConfig()
@@ -914,23 +916,121 @@ def calculate_features(
     log_info(
         f"Reading the DeepLC pickle: {pickle_config.read_deeplc} and writing DeepLC pickle: {pickle_config.write_deeplc}"
     )
-    _, _, predictions_deeplc = get_predictions_retention_time_mainloop(
-        df_psms,
-        pickle_config.write_deeplc,
-        pickle_config.read_deeplc,
-        deeplc_model,
-        output_dir=config["mumdia"]["result_dir"],
+
+    df_psms.write_csv("debug/df_psms_before_rt.tsv", separator="\t")
+    _, _, df_psms = (
+        get_predictions_retention_time_mainloop(  # Changed, since predictions_deeplc is just df_psms with RT predictions
+            df_psms,
+            pickle_config.write_deeplc,
+            pickle_config.read_deeplc,
+            deeplc_model,
+            output_dir=config["mumdia"]["result_dir"],
+        )
     )
 
     log_info("Obtaining features retention time...")
-    df_psms = add_retention_time_features(
-        df_psms, predictions_deeplc, filter_rel_rt_error=0.15
+    df_psms = add_retention_time_features(df_psms, filter_rel_rt_error=0.15)
+
+    df_psms.write_csv("debug/df_psms_after_rt.csv", separator="\t")
+
+    log_info("PSMs shape after RT filtering: {}".format(df_psms.shape))
+
+    # CRITICAL FIX: Regenerate df_fragment_max_peptide after RT filtering
+    # to ensure apex PSMs are consistent with filtered data
+    log_info("Regenerating df_fragment_max_peptide after RT filtering...")
+
+    # Filter df_fragment to only include PSMs that passed RT filtering
+    df_fragment = df_fragment.filter(pl.col("psm_id").is_in(df_psms["psm_id"]))
+    log_info(
+        "df_fragment shape after filtering to match RT-filtered PSMs: {}".format(
+            df_fragment.shape
+        )
     )
+
+    # Regenerate the maximum intensity fragment per PSM
+    df_fragment_max = df_fragment.sort("fragment_intensity", descending=True).unique(
+        subset="psm_id", keep="first", maintain_order=True
+    )
+
+    # Regenerate the apex PSM per peptide/charge combination from the filtered data
+    df_fragment_max_peptide = (
+        df_fragment_max.with_columns(
+            [
+                (pl.col("peptide") + "/" + pl.col("charge").cast(pl.Utf8)).alias(
+                    "peptide_charge"
+                )
+            ]
+        )
+        .sort("fragment_intensity", descending=True)
+        .unique(subset=["peptide", "charge"], keep="first")
+    )
+
+    log_info("Regenerated df_fragment_max_peptide:")
+    log_info("  Shape: {}".format(df_fragment_max_peptide.shape))
+    log_info("  Sample entries:")
+    for row in df_fragment_max_peptide.head(3).iter_rows(named=True):
+        log_info(
+            "    Peptide: {}, Charge: {}, PSM ID: {}, RT: {}, Fragment Intensity: {}".format(
+                row["peptide"],
+                row["charge"],
+                row["psm_id"],
+                row["rt"],
+                row["fragment_intensity"],
+            )
+        )
 
     log_info(
         "Counting individual peptides per MS2 and filtering by minimum occurrences"
     )
     df_psms = add_count_and_filter_peptides(df_psms, min_occurrences)
+
+    log_info("PSMs shape after peptide count filtering: {}".format(df_psms.shape))
+
+    # CRITICAL FIX: Regenerate df_fragment_max_peptide again after peptide count filtering
+    log_info("Regenerating df_fragment_max_peptide after peptide count filtering...")
+
+    # Filter df_fragment to only include PSMs that passed all filtering
+    df_fragment = df_fragment.filter(pl.col("psm_id").is_in(df_psms["psm_id"]))
+    log_info(
+        "df_fragment shape after filtering to match all-filtered PSMs: {}".format(
+            df_fragment.shape
+        )
+    )
+
+    # Regenerate the maximum intensity fragment per PSM
+    df_fragment_max = df_fragment.sort("fragment_intensity", descending=True).unique(
+        subset="psm_id", keep="first", maintain_order=True
+    )
+
+    # Regenerate the apex PSM per peptide/charge combination from the fully filtered data
+    df_fragment_max_peptide = (
+        df_fragment_max.with_columns(
+            [
+                (pl.col("peptide") + "/" + pl.col("charge").cast(pl.Utf8)).alias(
+                    "peptide_charge"
+                )
+            ]
+        )
+        .sort("fragment_intensity", descending=True)
+        .unique(subset=["peptide", "charge"], keep="first")
+    )
+
+    log_info("Final df_fragment_max_peptide after all filtering:")
+    log_info("  Shape: {}".format(df_fragment_max_peptide.shape))
+    log_info("  This should now be consistent with all downstream processing")
+
+    # Validation: Check that all peptides in df_fragment_max_peptide exist in the filtered data
+    fragment_max_psm_ids = set(df_fragment_max_peptide["psm_id"].to_list())
+    filtered_psm_ids = set(df_psms["psm_id"].to_list())
+    missing_psms = fragment_max_psm_ids - filtered_psm_ids
+    if missing_psms:
+        log_info(
+            "WARNING: {} PSMs in df_fragment_max_peptide are missing from filtered df_psms: {}".format(
+                len(missing_psms), list(missing_psms)[:5]  # Show first 5
+            )
+        )
+    else:
+        log_info("VALIDATION PASSED: All apex PSMs exist in filtered data")
 
     log_info("Obtaining fragment intensity predictions for the main loop...")
     log_info(
@@ -944,6 +1044,19 @@ def calculate_features(
         write_ms2pip_pickle=pickle_config.write_ms2pip,
         output_dir=config["mumdia"]["result_dir"],
     )
+
+    df_fragment.write_csv("debug/df_fragment_after_ms2pip.tsv", separator="\t")
+    df_fragment_max_peptide.write_csv(
+        "debug/df_fragment_max_peptide_after_ms2pip.tsv", separator="\t"
+    )
+    with open("debug/ms2pip_predictions.pkl", "wb") as f:
+        pickle.dump(ms2pip_predictions, f)
+
+    with open("debug/ms2dict.pkl", "wb") as f:
+        pickle.dump(spectra_data.ms2_dict, f)
+
+    df_psms.write_csv("debug/df_psms_after_ms2pip.tsv", separator="\t")
+
     fragment_dict, correlations_fragment_dict = get_features_fragment_intensity(
         ms2pip_predictions,
         df_fragment,
@@ -972,24 +1085,19 @@ def calculate_features(
 
     log_info(f"Number of peptidoforms: {len(psm_dict)}")
 
-    # Output psm_dict to a pickle file for debugging
-    # import pickle
-
-    # with open("psm_dict_debug.pkl", "wb") as f:
-    #     pickle.dump(psm_dict, f)
-
-    # with open("fragment_dict_debug.pkl", "wb") as f:
-    #     pickle.dump(fragment_dict, f)
-
-    # with open("correlations_fragment_dict_debug.pkl", "wb") as f:
-    #     pickle.dump(correlations_fragment_dict, f)
-
     # Pass data as-is (read-only) without deep copying.
     peptidoform_args = [
         (psm_dict[k], fragment_dict[k], correlations_fragment_dict[k])
         for k in psm_dict.keys()
         if k in correlations_fragment_dict
     ]
+
+    # Save psm_dict to a pickle file for debugging or future use
+    with open("debug/psm_dict.pkl", "wb") as f:
+        pickle.dump(psm_dict, f)
+
+    with open("debug/correlations_fragment_dict.pkl", "wb") as f:
+        pickle.dump(correlations_fragment_dict, f)
 
     log_info("Step 7: Processing peptidoforms in parallel (with chunking)")
 
@@ -1067,6 +1175,7 @@ def main(
         pickle_config: Configuration for caching predictions and features
         spectra_data: Container for MS1/MS2 spectral data
     """
+    df_psms.write_csv("debug/df_psms_before_mumdia.tsv", separator="\t")
     df_psms = pl.DataFrame(df_psms)
     df_psms = df_psms.filter(~df_psms["peptide"].str.contains("U"))
     df_psms = df_psms.sort("rt")
@@ -1083,7 +1192,7 @@ def main(
     )
 
     log_info("Done running MuMDIA...")
-    run_mokapot(output_dir=config["mumdia"]["result_dir"])
+    # run_mokapot(output_dir=config["mumdia"]["result_dir"])
 
 
 if __name__ == "__main__":

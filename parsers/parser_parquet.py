@@ -124,16 +124,54 @@ def parquet_reader(
         df_psms[["psm_id", "peptide", "charge", "rt"]], on="psm_id", how="left"
     )
 
-    # Will return random order of max fragment intensity
+    log_info("After joining peptide info to fragments:")
+    log_info("  df_fragment shape: {}".format(df_fragment.shape))
+    log_info(
+        "  Unique peptide/charge combinations: {}".format(
+            len(df_fragment.select(["peptide", "charge"]).unique())
+        )
+    )
+    log_info(
+        "  RT range: {} to {}".format(df_fragment["rt"].min(), df_fragment["rt"].max())
+    )
+
+    # Get the maximum fragment intensity per PSM
     df_fragment_max = df_fragment.sort("fragment_intensity", descending=True).unique(
         subset="psm_id", keep="first", maintain_order=True
     )
 
-    # might also want to do on charge
-    df_fragment_max_peptide = df_fragment_max.unique(
-        subset=["peptide"],
-        keep="first",  # , "charge"
+    # For each peptide/charge combination, find the PSM with the highest total fragment intensity
+    # This should represent the "apex" or most intense spectrum for that peptide
+    df_fragment_max_peptide = (
+        df_fragment_max.with_columns(
+            [
+                # Add a combined identifier for grouping
+                (pl.col("peptide") + "/" + pl.col("charge").cast(pl.Utf8)).alias(
+                    "precursor"
+                )
+            ]
+        )
+        .sort("fragment_intensity", descending=True)
+        .unique(subset=["peptide", "charge"], keep="first", maintain_order=True)
     )
+
+    log_info("df_fragment_max_peptide creation summary:")
+    log_info(
+        "  Total unique peptide/charge combinations: {}".format(
+            len(df_fragment_max_peptide)
+        )
+    )
+    log_info("  Sample of selected PSMs:")
+    for row in df_fragment_max_peptide.head(5).iter_rows(named=True):
+        log_info(
+            "    Peptide: {}, Charge: {}, PSM ID: {}, RT: {}, Fragment Intensity: {}".format(
+                row["peptide"],
+                row["charge"],
+                row["psm_id"],
+                row["rt"],
+                row["fragment_intensity"],
+            )
+        )
 
     # df_psms = pd.concat([df_psms, df_fragment_max["fragment_intensity"]], axis=1)
 

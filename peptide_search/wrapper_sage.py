@@ -54,8 +54,17 @@ def run_sage(
     json_path = pathlib.Path(output_dir).joinpath("sage_values.json")
 
     # Serialize the entire config dictionary to JSON format
+    def remove_nulls(obj):
+        if isinstance(obj, dict):
+            return {k: remove_nulls(v) for k, v in obj.items() if v is not None}
+        elif isinstance(obj, list):
+            return [remove_nulls(v) for v in obj if v is not None]
+        else:
+            return obj
+
+    config_no_nulls = remove_nulls(config)
     with open(json_path, "w") as file:
-        json.dump(config, file, indent=4)
+        json.dump(config_no_nulls, file, indent=4)
 
     # Log the exact command that will be executed for debugging purposes
     print(
@@ -218,6 +227,14 @@ def retention_window_searches(
     df_fragment = pl.concat(df_fragment_list)
     df_psms = pl.concat(df_psms_list)
 
+    # Output for debugging
+    df_fragment.write_csv(
+        "debug/df_fragment_after_retention_window_searches.tsv", separator="\t"
+    )
+    df_psms.write_csv(
+        "debug/df_psms_after_retention_window_searches.tsv", separator="\t"
+    )
+
     # Generate derived DataFrames for downstream analysis
     # df_fragment_max: Contains the highest intensity fragment for each PSM
     # This is used for feature generation and quality assessment
@@ -229,7 +246,8 @@ def retention_window_searches(
     # This helps identify the best representative fragment for each peptide sequence
     # Note: Could be extended to consider charge state as well
     df_fragment_max_peptide = df_fragment_max.unique(
-        subset=["peptide"],
+        subset=["peptide", "charge"],
+        maintain_order=True,
         keep="first",
     )
 

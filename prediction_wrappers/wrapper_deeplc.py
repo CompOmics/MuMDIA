@@ -448,7 +448,7 @@ def retrain_and_bounds(
     )
     peptide_df["predictions"] = predictions
     peptide_df["predictions"] = peptide_df["predictions"] * correct_to_mzml_rt_constant
-    peptide_df.to_csv("peptide_predictions.csv", index=False)
+    # peptide_df.to_csv("peptide_predictions.csv", index=False)
     peptide_df["predictions_lower"] = peptide_df["predictions"] - perc_95 / 2.0
     peptide_df["predictions_upper"] = peptide_df["predictions"] + perc_95 / 2.0
 
