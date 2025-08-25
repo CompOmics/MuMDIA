@@ -464,6 +464,38 @@ def match_fragments(
                 mode=MassMode.Monoisotopic,
             )
 
+            # log_info("Annotated spectrum for PSM ID: {}".format(psm_id))
+            # for annotated_peak in annotated_spectrum.spectrum:
+            #     if annotated_peak.annotation:
+            #         log_info(" - Found annotated peak: {}".format(annotated_peak))
+            #         log_info(
+            #             "  - Charge: {}".format(annotated_peak.annotation[0].charge)
+            #         )
+            #         log_info(
+            #             "  - ion type: {}".format(
+            #                 re.search(
+            #                     ion_pattern, repr(annotated_peak.annotation[0])
+            #                 ).group(1)
+            #             )
+            #         )
+            #         log_info(
+            #             "Charge is 1: {}".format(
+            #                 annotated_peak.annotation[0].charge == 1
+            #             )
+            #         )
+            #         log_info(
+            #             "Ion type starts with b or y: {}".format(
+            #                 re.search(ion_pattern, repr(annotated_peak.annotation[0]))
+            #                 .group(1)
+            #                 .startswith("b")
+            #                 or re.search(
+            #                     ion_pattern, repr(annotated_peak.annotation[0])
+            #                 )
+            #                 .group(1)
+            #                 .startswith("y")
+            #             )
+            #         )
+
             matched_fragments = [
                 annotated_peak
                 for annotated_peak in annotated_spectrum.spectrum

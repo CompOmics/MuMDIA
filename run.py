@@ -435,7 +435,14 @@ def main() -> str:
 
     if args_dict["write_full_search_pickle"] or not full_search_pickles_exist:
         log_info("Generating peptide library and training DeepLC model...")
-        peptides = tryptic_digest_pyopenms(config["sage"]["database"]["fasta"])
+        database_config = config["sage"]["database"]
+        peptides = tryptic_digest_pyopenms(
+            database_config["fasta"],
+            min_len=database_config["enzyme"]["min_len"],
+            max_len=database_config["enzyme"]["max_len"],
+            missed_cleavages=database_config["enzyme"]["missed_cleavages"],
+            decoy_prefix=database_config["decoy_tag"],
+        )
 
         # Train DeepLC retention time model and calculate prediction bounds
         # Narrow type for static analysis

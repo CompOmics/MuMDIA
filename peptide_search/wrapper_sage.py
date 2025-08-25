@@ -141,6 +141,58 @@ def retention_window_searches(
         ) <= np.minimum(peptide_df["predictions_upper"], upper_mzml_partition)
 
         sub_peptide_df = peptide_df[peptide_selection_mask]
+        non_sub_peptide_df = peptide_df[~peptide_selection_mask]
+
+        # Visualization: Show which peptides are selected for this partition
+        try:
+            import matplotlib.pyplot as plt
+
+            plt.figure(figsize=(10, 4))
+            plt.title(f"RT Partition ≤ {upper_mzml_partition} min (±{perc_95} min)")
+            plt.xlabel("Retention Time (min)")
+            plt.ylabel("Peptide Index")
+
+            # Plot all peptides' RT intervals
+            for idx, row in non_sub_peptide_df.sample(
+                n=100, random_state=42
+            ).iterrows():
+                plt.plot(
+                    [row["predictions_lower"], row["predictions_upper"]],
+                    [idx, idx],
+                    color="gray",
+                    alpha=0.3,
+                )
+
+            # Highlight selected peptides
+            for idx, row in sub_peptide_df.sample(n=100, random_state=42).iterrows():
+                plt.plot(
+                    [row["predictions_lower"], row["predictions_upper"]],
+                    [idx, idx],
+                    color="red",
+                    linewidth=2,
+                )
+
+            # Draw partition boundary
+            plt.axvline(
+                upper_mzml_partition,
+                color="blue",
+                linestyle="--",
+                label="Partition Upper Bound",
+            )
+            plt.axvspan(
+                upper_mzml_partition - perc_95,
+                upper_mzml_partition,
+                color="blue",
+                alpha=0.1,
+                label="Window",
+            )
+
+            plt.legend()
+            plt.tight_layout()
+            plt.savefig(f"debug/rt_partition_{upper_mzml_partition}.png")
+            plt.close()
+        except ValueError:
+            pass
 
         # Skip partitions with no predicted peptides to avoid empty searches
         if len(sub_peptide_df.index) == 0:

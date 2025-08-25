@@ -171,7 +171,6 @@ def retrain_deeplc(
         - dlc_transfer_learn: Transfer learning DeepLC model
         - perc_95: 95th percentile of absolute RT prediction errors (doubled for window size)
     """
-    print(df_psms)
     df_psms_filtered = df_psms.filter(df_psms["spectrum_q"] < q_value_filter)
     rt_train = (
         df_psms_filtered.sort("fragment_intensity")
@@ -441,6 +440,7 @@ def retrain_and_bounds(
         outfile_transf_learn=result_dir.joinpath("deeplc_transfer_learn.png"),
     )
     perc_95 = perc_95 * correct_to_mzml_rt_constant * coefficient_bounds
+    print(f"Percentile 95: {perc_95}")
     predictions = predict_deeplc(peptides, dlc_transfer_learn)
 
     peptide_df = pd.DataFrame(

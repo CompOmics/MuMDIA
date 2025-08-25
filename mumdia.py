@@ -993,37 +993,10 @@ def calculate_features(
         .unique(subset=["peptide", "charge"], keep="first")
     )
 
-    log_info("Regenerated df_fragment_max_peptide:")
-    log_info("  Shape: {}".format(df_fragment_max_peptide.shape))
-    log_info("  Sample entries:")
-    for row in df_fragment_max_peptide.head(3).iter_rows(named=True):
-        log_info(
-            "    Peptide: {}, Charge: {}, PSM ID: {}, RT: {}, Fragment Intensity: {}".format(
-                row["peptide"],
-                row["charge"],
-                row["psm_id"],
-                row["rt"],
-                row["fragment_intensity"],
-            )
-        )
-
-    log_info(
-        "Counting individual peptides per MS2 and filtering by minimum occurrences"
-    )
     df_psms = add_count_and_filter_peptides(df_psms, min_occurrences)
-
-    log_info("PSMs shape after peptide count filtering: {}".format(df_psms.shape))
-
-    # CRITICAL FIX: Regenerate df_fragment_max_peptide again after peptide count filtering
-    log_info("Regenerating df_fragment_max_peptide after peptide count filtering...")
 
     # Filter df_fragment to only include PSMs that passed all filtering
     df_fragment = df_fragment.filter(pl.col("psm_id").is_in(df_psms["psm_id"]))
-    log_info(
-        "df_fragment shape after filtering to match all-filtered PSMs: {}".format(
-            df_fragment.shape
-        )
-    )
 
     # Regenerate the maximum intensity fragment per PSM
     df_fragment_max = df_fragment.sort("fragment_intensity", descending=True).unique(

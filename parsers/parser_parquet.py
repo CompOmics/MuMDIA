@@ -98,9 +98,14 @@ def parquet_reader(
     df_fragment.index = df_fragment["psm_id"]
 
     df_psms = pd.read_parquet(parquet_file_results)
-    df_psms.drop_duplicates(subset=["scannr", "peptide"], inplace=True)
+    log_info("df_psms shape: {}".format(df_psms.shape))
+    df_psms.drop_duplicates(
+        subset=["scannr", "peptide", "charge"], inplace=True
+    )  # Okay to add charge?
+    log_info("df_psms shape after dropping duplicates: {}".format(df_psms.shape))
 
     df_psms = df_psms[df_psms["spectrum_q"] < q_value_filter]
+    log_info("df_psms shape after filtering by q-value: {}".format(df_psms.shape))
     df_fragment = df_fragment[df_fragment.index.isin(df_psms["psm_id"])]
 
     df_fragment = pl.DataFrame(df_fragment)
@@ -119,6 +124,7 @@ def parquet_reader(
     df_psms = df_psms.with_columns(
         pl.col("peptide").map_elements(replace_mass_shift).alias("peptide")
     )
+    log_info("df_psms shape after replacing mass shifts: {}".format(df_psms.shape))
 
     df_fragment = df_fragment.join(
         df_psms[["psm_id", "peptide", "charge", "rt"]], on="psm_id", how="left"
@@ -151,5 +157,6 @@ def parquet_reader(
         on="psm_id",
         how="left",
     )
+    log_info("df_psms shape after joining with fragment max: {}".format(df_psms.shape))
 
     return df_fragment, df_psms, df_fragment_max, df_fragment_max_peptide
