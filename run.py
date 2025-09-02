@@ -134,72 +134,33 @@ def run_initial_search(config, args_dict, result_dir, result_temp_results_initia
 
     log_info("Number of PSMs after initial search: {}".format(len(df_psms)))
     
-    return df_fragment, df_psms, df_fragment_max, df_fragment_max_peptide, dlc_transfer_learn, config  
+    return df_fragment, df_psms, df_fragment_max, df_fragment_max_peptide, dlc_transfer_learn, config
 
-def main() -> str:
+
+def run_targeted_search(config, args_dict, result_dir, pickle_config, df_fragment, df_psms, df_fragment_max, df_fragment_max_peptide, dlc_transfer_learn):
     """
-    Main MuMDIA workflow orchestrator.
+    STAGE 2: Targeted Search with Retention Time Partitioning
+    
+    This stage uses the trained DeepLC model to predict retention times for all
+    possible peptides, then partitions the mzML data by retention time for
+    targeted searches that are both faster and more accurate.
+    
+    Args:
+        config: Full configuration dictionary
+        args_dict: MuMDIA-specific arguments
+        result_dir: Result directory path
+        pickle_config: Pickle configuration
+        df_fragment: Fragment DataFrame from initial search
+        df_psms: PSMs DataFrame from initial search
+        df_fragment_max: Fragment max DataFrame from initial search
+        df_fragment_max_peptide: Fragment max peptide DataFrame from initial search
+        dlc_transfer_learn: DeepLC transfer learning model
+    
+    Returns:
+        Tuple of (df_fragment, df_psms, df_fragment_max, df_fragment_max_peptide, dlc_transfer_learn, config)
     """
-    # Get configuration with clean, simple interface
-    config_obj = get_config()
-    log_info(f"Starting MuMDIA workflow with config file: {config_obj._config_file}")
-    
-    # Create directories
-    result_dir = Path(config_obj.result_dir)
-    
-    result_temp = result_dir / "temp"
-    result_temp_results_initial_search = result_temp / "initial_search_results"
-    
-    # Create all necessary directories
-    result_dir.mkdir(parents=True, exist_ok=True)
-    result_temp.mkdir(parents=True, exist_ok=True)
-    result_temp_results_initial_search.mkdir(parents=True, exist_ok=True)
-    
-    # Get the mumdia configuration dictionary for backwards compatibility
-    config = config_obj.to_legacy_format()
-
-    args_dict = config["mumdia"]
-
-    # Configure pickle settings once for the entire workflow
-    pickle_config = PickleConfig(
-        write_deeplc=args_dict["write_deeplc_pickle"],
-        write_ms2pip=args_dict["write_ms2pip_pickle"],
-        write_correlation=args_dict["write_correlation_pickles"],
-        read_deeplc=args_dict["read_deeplc_pickle"],
-        read_ms2pip=args_dict["read_ms2pip_pickle"],
-        read_correlation=args_dict["read_correlation_pickles"],
-    )
-
-    # Run initial search (Stage 1)
-    df_fragment, df_psms, df_fragment_max, df_fragment_max_peptide, dlc_transfer_learn, config = run_initial_search(
-        config, args_dict, result_dir, result_temp_results_initial_search, pickle_config
-    )
-
-
-    # ============================================================================
-    # STAGE 2: Targeted Search with Retention Time Partitioning
-    # ============================================================================
-    # This stage uses the trained DeepLC model to predict retention times for all
-    # possible peptides, then partitions the mzML data by retention time for
-    # targeted searches that are both faster and more accurate.
-
-    # Check if all required initial search pickle files exist
-    full_search_pickles = [
-        "df_fragment.pkl",
-        "df_psms.pkl",
-        "df_fragment_max.pkl",
-        "df_fragment_max_peptide.pkl",
-        "config.pkl",
-        "dlc_transfer_learn.pkl",
-        "flags.pkl",
-    ]
-
-    full_search_pickles_exist = all(
-        os.path.exists(result_dir.joinpath(pickle_file))
-        for pickle_file in full_search_pickles
-    )
-
-    if args_dict["write_full_search_pickle"] or not full_search_pickles_exist:
+    # Check if all required full search pickle files exist
+    if args_dict["write_full_search_pickle"]:
         log_info("Generating peptide library and training DeepLC model...")
         peptides = tryptic_digest_pyopenms(config["sage"]["database"]["fasta"])
 
@@ -260,6 +221,52 @@ def main() -> str:
             flags,
         ) = pickling.read_variables_from_pickles(dir=result_dir)
         args_dict.update(flags)
+
+    return df_fragment, df_psms, df_fragment_max, df_fragment_max_peptide, dlc_transfer_learn, config  
+
+def main() -> str:
+    """
+    Main MuMDIA workflow orchestrator.
+    """
+    # Get configuration with clean, simple interface
+    config_obj = get_config()
+    log_info(f"Starting MuMDIA workflow with config file: {config_obj._config_file}")
+    
+    # Create directories
+    result_dir = Path(config_obj.result_dir)
+    
+    result_temp = result_dir / "temp"
+    result_temp_results_initial_search = result_temp / "initial_search_results"
+    
+    # Create all necessary directories
+    result_dir.mkdir(parents=True, exist_ok=True)
+    result_temp.mkdir(parents=True, exist_ok=True)
+    result_temp_results_initial_search.mkdir(parents=True, exist_ok=True)
+    
+    # Get the mumdia configuration dictionary for backwards compatibility
+    config = config_obj.to_legacy_format()
+
+    args_dict = config["mumdia"]
+
+    # Configure pickle settings once for the entire workflow
+    pickle_config = PickleConfig(
+        write_deeplc=args_dict["write_deeplc_pickle"],
+        write_ms2pip=args_dict["write_ms2pip_pickle"],
+        write_correlation=args_dict["write_correlation_pickles"],
+        read_deeplc=args_dict["read_deeplc_pickle"],
+        read_ms2pip=args_dict["read_ms2pip_pickle"],
+        read_correlation=args_dict["read_correlation_pickles"],
+    )
+
+    # Run initial search (Stage 1)
+    df_fragment, df_psms, df_fragment_max, df_fragment_max_peptide, dlc_transfer_learn, config = run_initial_search(
+        config, args_dict, result_dir, result_temp_results_initial_search, pickle_config
+    )
+
+    # Run targeted search (Stage 2)
+    df_fragment, df_psms, df_fragment_max, df_fragment_max_peptide, dlc_transfer_learn, config = run_targeted_search(
+        config, args_dict, result_dir, pickle_config, df_fragment, df_psms, df_fragment_max, df_fragment_max_peptide, dlc_transfer_learn
+    )
 
     # ============================================================================
     # STAGE 3: Feature Calculation and Machine Learning Pipeline
