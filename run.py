@@ -34,64 +34,18 @@ from parsers.parser_parquet import parquet_reader
 from peptide_search.wrapper_sage import retention_window_searches, run_sage
 from prediction_wrappers.wrapper_deeplc import retrain_and_bounds
 from sequence.fasta import tryptic_digest_pyopenms
-    
 
-def main() -> str:
+def run_initial_search(config, args_dict, result_dir, result_temp_results_initial_search, pickle_config):
     """
-    Main MuMDIA workflow orchestrator.
+    STAGE 1: Initial Search for Retention Time Model Training
+    
+    The MuMDIA pipeline uses a two-stage search strategy:
+    1. Initial broad search: Used to train DeepLC retention time models
+    2. Targeted search: Uses RT predictions to partition data for faster, more accurate searches
+    
+    Returns:
+        Tuple of (df_fragment, df_psms, df_fragment_max, df_fragment_max_peptide, dlc_transfer_learn, config)
     """
-
-    # Get configuration with clean, simple interface
-    config_obj = get_config()
-    log_info(f"Starting MuMDIA workflow with config file: {config_obj._config_file}")
-    
-    # Create directories
-    result_dir = Path(config_obj.result_dir)
-    result_temp = result_dir / "temp"
-    result_temp_results_initial_search = result_temp / "initial_search_results"
-    
-    # Create all necessary directories
-    result_dir.mkdir(parents=True, exist_ok=True)
-    result_temp.mkdir(parents=True, exist_ok=True)
-    result_temp_results_initial_search.mkdir(parents=True, exist_ok=True)
-    
-    # Get the mumdia configuration dictionary for backwards compatibility
-    config = config_obj.to_legacy_format()
-
-    args_dict = config["mumdia"]
-
-    # Configure pickle settings once for the entire workflow
-    pickle_config = PickleConfig(
-        write_deeplc=args_dict["write_deeplc_pickle"],
-        write_ms2pip=args_dict["write_ms2pip_pickle"],
-        write_correlation=args_dict["write_correlation_pickles"],
-        read_deeplc=args_dict["read_deeplc_pickle"],
-        read_ms2pip=args_dict["read_ms2pip_pickle"],
-        read_correlation=args_dict["read_correlation_pickles"],
-    )
-
-    # ============================================================================
-    # STAGE 1: Initial Search for Retention Time Model Training
-    # ============================================================================
-    # The MuMDIA pipeline uses a two-stage search strategy:
-    # 1. Initial broad search: Used to train DeepLC retention time models
-    # 2. Targeted search: Uses RT predictions to partition data for faster, more accurate searches
-
-    # Check if all required initial search pickle files exist
-    initial_search_pickles = [
-        "df_fragment_initial_search.pkl",
-        "df_psms_initial_search.pkl",
-        "df_fragment_max_initial_search.pkl",
-        "df_fragment_max_peptide_initial_search.pkl",
-        "config_initial_search.pkl",
-        "dlc_transfer_learn_initial_search.pkl",
-        "flags_initial_search.pkl",
-    ]
-    initial_search_pickles_exist = all(
-        os.path.exists(result_dir.joinpath(pickle_file))
-        for pickle_file in initial_search_pickles
-    )
-
     # Initialize variables to satisfy type checking and ensure defined in all branches
     df_fragment = pl.DataFrame()
     df_psms = pl.DataFrame()
@@ -99,22 +53,22 @@ def main() -> str:
     df_fragment_max_peptide = pl.DataFrame()
     dlc_transfer_learn = None
 
-    if args_dict["write_initial_search_pickle"] or not initial_search_pickles_exist:
+    if not args_dict["read_initial_search_pickle"]:
         log_info("Running initial Sage search for RT model training...")
-        # TODO: Earlier, implement a check whether the mzML file exists, because otherwise Sage will still run on an non-existing file and later on an error will be raised that is not very informative.
+        # TODO: Earlier, implement a check whether the mzML file exists, because 
+        # otherwise Sage will still run on an non-existing file and later on an error 
+        # will be raised that is not very informative.
         run_sage(
             config["sage_basic"],
             args_dict["fasta_file"],
-            result_dir.joinpath(result_temp, result_temp_results_initial_search),
+            result_temp_results_initial_search,
         )
 
         df_fragment, df_psms, df_fragment_max, df_fragment_max_peptide = parquet_reader(
-            parquet_file_results=result_dir.joinpath(
-                result_temp, result_temp_results_initial_search, "results.sage.parquet"
+            parquet_file_results=result_temp_results_initial_search.joinpath(
+                "results.sage.parquet"
             ),
-            parquet_file_fragments=result_dir.joinpath(
-                result_temp,
-                result_temp_results_initial_search,
+            parquet_file_fragments=result_temp_results_initial_search.joinpath(
                 "matched_fragments.sage.parquet",
             ),
             q_value_filter=args_dict["fdr_init_search"],
@@ -126,6 +80,7 @@ def main() -> str:
         assert isinstance(df_fragment_max, pl.DataFrame)
         assert isinstance(df_fragment_max_peptide, pl.DataFrame)
 
+    if args_dict["write_initial_search_pickle"]:
         pickling.write_variables_to_pickles(
             df_fragment=cast(pl.DataFrame, df_fragment),
             df_psms=cast(pl.DataFrame, df_psms),
@@ -178,6 +133,48 @@ def main() -> str:
     assert isinstance(df_fragment_max_peptide, pl.DataFrame)
 
     log_info("Number of PSMs after initial search: {}".format(len(df_psms)))
+    
+    return df_fragment, df_psms, df_fragment_max, df_fragment_max_peptide, dlc_transfer_learn, config  
+
+def main() -> str:
+    """
+    Main MuMDIA workflow orchestrator.
+    """
+    # Get configuration with clean, simple interface
+    config_obj = get_config()
+    log_info(f"Starting MuMDIA workflow with config file: {config_obj._config_file}")
+    
+    # Create directories
+    result_dir = Path(config_obj.result_dir)
+    
+    result_temp = result_dir / "temp"
+    result_temp_results_initial_search = result_temp / "initial_search_results"
+    
+    # Create all necessary directories
+    result_dir.mkdir(parents=True, exist_ok=True)
+    result_temp.mkdir(parents=True, exist_ok=True)
+    result_temp_results_initial_search.mkdir(parents=True, exist_ok=True)
+    
+    # Get the mumdia configuration dictionary for backwards compatibility
+    config = config_obj.to_legacy_format()
+
+    args_dict = config["mumdia"]
+
+    # Configure pickle settings once for the entire workflow
+    pickle_config = PickleConfig(
+        write_deeplc=args_dict["write_deeplc_pickle"],
+        write_ms2pip=args_dict["write_ms2pip_pickle"],
+        write_correlation=args_dict["write_correlation_pickles"],
+        read_deeplc=args_dict["read_deeplc_pickle"],
+        read_ms2pip=args_dict["read_ms2pip_pickle"],
+        read_correlation=args_dict["read_correlation_pickles"],
+    )
+
+    # Run initial search (Stage 1)
+    df_fragment, df_psms, df_fragment_max, df_fragment_max_peptide, dlc_transfer_learn, config = run_initial_search(
+        config, args_dict, result_dir, result_temp_results_initial_search, pickle_config
+    )
+
 
     # ============================================================================
     # STAGE 2: Targeted Search with Retention Time Partitioning
