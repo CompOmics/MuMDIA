@@ -39,15 +39,8 @@ from sequence.fasta import tryptic_digest_pyopenms
 def main() -> str:
     """
     Main MuMDIA workflow orchestrator.
-
-    This function coordinates the entire MuMDIA pipeline using clean config system.
     """
-    # Ensure we're in the correct conda environment
-    conda_env = os.environ.get('CONDA_DEFAULT_ENV')
-    if conda_env != 'py312':
-        log_info(f"Warning: Expected conda environment 'py312', but currently in '{conda_env}'")
-        log_info("Please run: conda activate py312")
-    
+
     # Get configuration with clean, simple interface
     config_obj = get_config()
     log_info(f"Starting MuMDIA workflow with config file: {config_obj._config_file}")
