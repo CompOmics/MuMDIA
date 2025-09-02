@@ -79,7 +79,7 @@ class MuMDIASettings:
     read_deeplc_pickle: bool = True
     read_ms2pip_pickle: bool = True
     read_correlation_pickles: bool = True
-    read_full_search_pickles: bool = True
+    read_full_search_pickle: bool = True
     read_initial_search_pickle: bool = True
     
     # Processing settings
@@ -271,7 +271,7 @@ class Config:
             config.mumdia.read_ms2pip_pickle = False
             config.mumdia.read_correlation_pickles = False
             config.mumdia.read_initial_search_pickle = False
-            config.mumdia.read_full_search_pickles = False
+            config.mumdia.read_full_search_pickle = False
             
         if config.clean:
             config.mumdia.remove_intermediate_files = True
