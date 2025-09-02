@@ -27,12 +27,27 @@ from data_structures import PickleConfig, SpectraData
 from utilities.io_utils import remove_intermediate_files
 from utilities.logger import log_info
 
+import mumdia
+
+from parsers.parser_mzml import get_ms1_mzml, split_mzml_by_retention_time
+from parsers.parser_parquet import parquet_reader
+from peptide_search.wrapper_sage import retention_window_searches, run_sage
+from prediction_wrappers.wrapper_deeplc import retrain_and_bounds
+from sequence.fasta import tryptic_digest_pyopenms
+    
+
 def main() -> str:
     """
     Main MuMDIA workflow orchestrator.
 
     This function coordinates the entire MuMDIA pipeline using clean config system.
     """
+    # Ensure we're in the correct conda environment
+    conda_env = os.environ.get('CONDA_DEFAULT_ENV')
+    if conda_env != 'py312':
+        log_info(f"Warning: Expected conda environment 'py312', but currently in '{conda_env}'")
+        log_info("Please run: conda activate py312")
+    
     # Get configuration with clean, simple interface
     config_obj = get_config()
     log_info(f"Starting MuMDIA workflow with config file: {config_obj._config_file}")
@@ -49,13 +64,6 @@ def main() -> str:
     
     # Get the mumdia configuration dictionary for backwards compatibility
     config = config_obj.to_legacy_format()
-
-    # Lazy imports for heavy modules to avoid import errors during test collection
-    from parsers.parser_mzml import get_ms1_mzml, split_mzml_by_retention_time
-    from parsers.parser_parquet import parquet_reader
-    from peptide_search.wrapper_sage import retention_window_searches, run_sage
-    from prediction_wrappers.wrapper_deeplc import retrain_and_bounds
-    from sequence.fasta import tryptic_digest_pyopenms
 
     args_dict = config["mumdia"]
 
@@ -104,12 +112,18 @@ def main() -> str:
         run_sage(
             config["sage_basic"],
             args_dict["fasta_file"],
-            result_temp_results_initial_search,
+            result_dir.joinpath(result_temp, result_temp_results_initial_search),
         )
 
         df_fragment, df_psms, df_fragment_max, df_fragment_max_peptide = parquet_reader(
-            parquet_file_results=result_temp_results_initial_search / "results.sage.parquet",
-            parquet_file_fragments=result_temp_results_initial_search / "matched_fragments.sage.parquet",
+            parquet_file_results=result_dir.joinpath(
+                result_temp, result_temp_results_initial_search, "results.sage.parquet"
+            ),
+            parquet_file_fragments=result_dir.joinpath(
+                result_temp,
+                result_temp_results_initial_search,
+                "matched_fragments.sage.parquet",
+            ),
             q_value_filter=args_dict["fdr_init_search"],
         )
 
@@ -279,9 +293,6 @@ def main() -> str:
         ms1_dict=ms1_dict, ms2_to_ms1_dict=ms2_to_ms1_dict, ms2_dict=ms2_spectra
     )
 
-    # Import mumdia only when needed to avoid dependency issues
-    import mumdia
-    
     mumdia.main(
         df_fragment=df_fragment,
         df_psms=df_psms,
