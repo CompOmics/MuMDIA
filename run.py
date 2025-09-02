@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-MuMDIA (Multi-modal Data-Independant Acquisition) Main Workflow
+MuMDIA
 
 This is the main entry point for the MuMDIA proteomics analysis pipeline.
 MuMDIA integrates multiple prediction tools and machine learning approaches
@@ -16,273 +16,41 @@ import os
 
 os.environ["POLARS_MAX_THREADS"] = "1"
 
-import argparse
-import json
-import sys
 from pathlib import Path
-from typing import Tuple, cast
+from typing import cast
 
 import polars as pl
 
 import utilities.pickling as pickling
+from config import get_config  # Clean, simple config import
 from data_structures import PickleConfig, SpectraData
-from utilities.config_loader import merge_config_from_sources, write_updated_config
-from utilities.io_utils import create_dirs, remove_intermediate_files
+from utilities.io_utils import remove_intermediate_files
 from utilities.logger import log_info
-
-
-def parse_arguments() -> Tuple[argparse.ArgumentParser, argparse.Namespace]:
-    """
-    Parse command line arguments for the MuMDIA workflow.
-
-    Returns:
-        Tuple containing:
-        - parser: ArgumentParser object for checking explicitly provided arguments
-        - args: Namespace object with parsed command line arguments
-    """
-    parser = argparse.ArgumentParser()
-
-    # Add arguments
-    parser.add_argument(
-        "--mzml_file",
-        help="The location of the mzml file",
-        default="mzml_files/LFQ_Orbitrap_AIF_Ecoli_01.mzML",
-    )
-    parser.add_argument(
-        "--mzml_dir", help="The directory of the mzml file", default="mzml_files"
-    )
-    parser.add_argument(
-        "--fasta_file",
-        help="The location of the fasta file",
-        default="fasta/unmodified_peptides.fasta",
-    )
-    parser.add_argument(
-        "--result_dir", help="The location of the result directory", default="results"
-    )
-    parser.add_argument(
-        "--config_file",
-        help="The location of the config file",
-        default="configs/config.json",
-    )
-
-    parser.add_argument(
-        "--remove_intermediate_files",
-        help="Remove intermediate results after completion",
-        action="store_true",
-        default=False,
-    )
-
-    parser.add_argument(
-        "--write_initial_search_pickle",
-        help="Write initial search pickles",
-        action="store_true",
-        default=False,
-    )
-
-    # Default: read initial search pickles (can be disabled with --no-read_initial_search_pickle)
-    parser.add_argument(
-        "--read_initial_search_pickle",
-        dest="read_initial_search_pickle",
-        help="Read initial search pickles",
-        action="store_true",
-    )
-    parser.add_argument(
-        "--no-read_initial_search_pickle",
-        dest="read_initial_search_pickle",
-        help="Do not read initial search pickles",
-        action="store_false",
-    )
-    parser.set_defaults(read_initial_search_pickle=True)
-
-    parser.add_argument(
-        "--write_deeplc_pickle",
-        help="Write DeepLC pickles",
-        action="store_true",
-        default=False,
-    )
-
-    parser.add_argument(
-        "--write_ms2pip_pickle",
-        help="Write MS2PIP pickles",
-        action="store_true",
-        default=False,
-    )
-
-    # Default: read DeepLC pickles (can be disabled with --no-read_deeplc_pickle)
-    parser.add_argument(
-        "--read_deeplc_pickle",
-        dest="read_deeplc_pickle",
-        help="Read DeepLC pickles",
-        action="store_true",
-    )
-    parser.add_argument(
-        "--no-read_deeplc_pickle",
-        dest="read_deeplc_pickle",
-        help="Do not read DeepLC pickles",
-        action="store_false",
-    )
-    parser.set_defaults(read_deeplc_pickle=True)
-
-    # Default: read MS2PIP pickles (can be disabled with --no-read_ms2pip_pickle)
-    parser.add_argument(
-        "--read_ms2pip_pickle",
-        dest="read_ms2pip_pickle",
-        help="Read MS2PIP pickles",
-        action="store_true",
-    )
-    parser.add_argument(
-        "--no-read_ms2pip_pickle",
-        dest="read_ms2pip_pickle",
-        help="Do not read MS2PIP pickles",
-        action="store_false",
-    )
-    parser.set_defaults(read_ms2pip_pickle=True)
-
-    parser.add_argument(
-        "--write_correlation_pickles",
-        help="Write correlation pickles",
-        action="store_true",
-        default=False,
-    )
-
-    # Default: read correlation pickles (can be disabled with --no-read_correlation_pickles)
-    parser.add_argument(
-        "--read_correlation_pickles",
-        dest="read_correlation_pickles",
-        help="Read correlation pickles",
-        action="store_true",
-    )
-    parser.add_argument(
-        "--no-read_correlation_pickles",
-        dest="read_correlation_pickles",
-        help="Do not read correlation pickles",
-        action="store_false",
-    )
-    parser.set_defaults(read_correlation_pickles=True)
-
-    # Default: use DeepLC transfer learning (can be disabled with --no-dlc_transfer_learn)
-    parser.add_argument(
-        "--dlc_transfer_learn",
-        dest="dlc_transfer_learn",
-        help="Use DeepLC transfer learning",
-        action="store_true",
-    )
-    parser.add_argument(
-        "--no-dlc_transfer_learn",
-        dest="dlc_transfer_learn",
-        help="Disable DeepLC transfer learning",
-        action="store_false",
-    )
-    parser.set_defaults(dlc_transfer_learn=True)
-
-    parser.add_argument(
-        "--write_full_search_pickle",
-        help="Write full search pickles",
-        action="store_true",
-        default=False,
-    )
-
-    # Default: read full search pickles (can be disabled with --no-read_full_search_pickle)
-    parser.add_argument(
-        "--read_full_search_pickle",
-        dest="read_full_search_pickle",
-        help="Read full search pickles",
-        action="store_true",
-    )
-    parser.add_argument(
-        "--no-read_full_search_pickle",
-        dest="read_full_search_pickle",
-        help="Do not read full search pickles",
-        action="store_false",
-    )
-    parser.set_defaults(read_full_search_pickle=True)
-
-    parser.add_argument(
-        "--fdr_init_search",
-        help="Q-value (FDR) threshold for initial search filtering",
-        type=float,
-        default=0.05,
-    )
-
-    # Additional possible configuration overrides from CLI
-    parser.add_argument(
-        "--sage_basic", help="Override sage basic settings in config", type=str
-    )
-    parser.add_argument(
-        "--mumdia_fdr", help="Override mumdia FDR setting in config", type=float
-    )
-
-    return parser, parser.parse_args()
-
-
-def was_arg_explicitly_provided(parser: argparse.ArgumentParser, arg_name: str) -> bool:
-    """
-    Check if an argument with destination `arg_name` was explicitly provided on the command line.
-
-    Args:
-        parser: ArgumentParser object containing argument definitions
-        arg_name: Destination name of the argument to check
-
-    Returns:
-        True if the argument was explicitly provided, False otherwise
-    """
-    for action in parser._actions:
-        if action.dest == arg_name:
-            for option in action.option_strings:
-                # If any of the option flags for this argument is present in sys.argv, consider it provided.
-                if option in sys.argv:
-                    return True
-    return False
-
-
-def modify_config(
-    config_file: str,
-    result_dir: str,
-    parser: argparse.ArgumentParser,
-    args: argparse.Namespace,
-) -> str:
-    """
-    Load existing JSON (if any), merge with defaults + env + explicit CLI, and write to results.
-
-    Returns path to updated config JSON.
-    """
-    # Load existing configuration if it exists
-    existing_config = None
-    if os.path.exists(config_file):
-        with open(config_file, "r") as file:
-            existing_config = json.load(file)
-    else:
-        log_info(
-            f"Warning: Config file '{config_file}' not found. Using argparse defaults + env + CLI."
-        )
-
-    merged = merge_config_from_sources(existing_config, parser, args)
-    return write_updated_config(merged, result_dir)
-
 
 def main() -> str:
     """
     Main MuMDIA workflow orchestrator.
 
-    This function coordinates the entire MuMDIA pipeline using argparse + JSON config.
+    This function coordinates the entire MuMDIA pipeline using clean config system.
     """
-    log_info("Parsing command line arguments...")
-    parser, args = parse_arguments()
-
-    log_info("Creating the result directory...")
-    result_dir, result_temp, result_temp_results_initial_search = create_dirs(args)
-
-    log_info("Updating configuration if needed and saving to results folder...")
-    new_config_file = modify_config(
-        args.config_file, result_dir=args.result_dir, parser=parser, args=args
-    )
-
-    log_info("Reading the updated configuration JSON file...")
-    with open(new_config_file, "r") as file:
-        config = json.load(file)
+    # Get configuration with clean, simple interface
+    config_obj = get_config()
+    log_info(f"Starting MuMDIA workflow with config file: {config_obj._config_file}")
+    
+    # Create directories
+    result_dir = Path(config_obj.result_dir)
+    result_temp = result_dir / "temp"
+    result_temp_results_initial_search = result_temp / "initial_search_results"
+    
+    # Create all necessary directories
+    result_dir.mkdir(parents=True, exist_ok=True)
+    result_temp.mkdir(parents=True, exist_ok=True)
+    result_temp_results_initial_search.mkdir(parents=True, exist_ok=True)
+    
+    # Get the mumdia configuration dictionary for backwards compatibility
+    config = config_obj.to_legacy_format()
 
     # Lazy imports for heavy modules to avoid import errors during test collection
-    import mumdia
     from parsers.parser_mzml import get_ms1_mzml, split_mzml_by_retention_time
     from parsers.parser_parquet import parquet_reader
     from peptide_search.wrapper_sage import retention_window_searches, run_sage
@@ -336,18 +104,12 @@ def main() -> str:
         run_sage(
             config["sage_basic"],
             args_dict["fasta_file"],
-            result_dir.joinpath(result_temp, result_temp_results_initial_search),
+            result_temp_results_initial_search,
         )
 
         df_fragment, df_psms, df_fragment_max, df_fragment_max_peptide = parquet_reader(
-            parquet_file_results=result_dir.joinpath(
-                result_temp, result_temp_results_initial_search, "results.sage.parquet"
-            ),
-            parquet_file_fragments=result_dir.joinpath(
-                result_temp,
-                result_temp_results_initial_search,
-                "matched_fragments.sage.parquet",
-            ),
+            parquet_file_results=result_temp_results_initial_search / "results.sage.parquet",
+            parquet_file_fragments=result_temp_results_initial_search / "matched_fragments.sage.parquet",
             q_value_filter=args_dict["fdr_init_search"],
         )
 
@@ -517,6 +279,9 @@ def main() -> str:
         ms1_dict=ms1_dict, ms2_to_ms1_dict=ms2_to_ms1_dict, ms2_dict=ms2_spectra
     )
 
+    # Import mumdia only when needed to avoid dependency issues
+    import mumdia
+    
     mumdia.main(
         df_fragment=df_fragment,
         df_psms=df_psms,
