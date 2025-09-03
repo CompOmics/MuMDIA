@@ -1,0 +1,45 @@
+{
+    "mzml_file": "mzml_files/LFQ_Orbitrap_AIF_Ecoli_01.mzML",
+    "fasta_file": "fasta/ecoli_22032024.fasta",
+    "result_dir": "results",
+    
+
+    "_comment_basic_params": "Basic search parameters with defaults",
+
+    "chimera": true,
+    "wide_window": true,
+    "missed_cleavages": 2,
+    "max_variable_mods": 1,
+    
+
+    "_comment_initial_overrides": "Parameters specific to initial search",
+
+    "cleave_at_initial_search": "KR",
+    "report_psms_initial_search": 5,
+    "deisotope_initial_search": false,
+    "max_variable_mods_initial_search": 1,
+    
+
+    "_comment_full_overrides": "Parameters specific to full search", 
+
+    "cleave_at_full_search": "$",
+    "report_psms_full_search": 12,
+    "deisotope_full_search": true,
+    "max_variable_mods_full_search": 2,
+    
+
+    "_comment_pickle_settings": "Control caching behavior",
+    
+    "read_deeplc_pickle": false,
+    "read_ms2pip_pickle": false,
+    "read_correlation_pickles": false,
+    "read_full_search_pickle": false,
+    "read_initial_search_pickle": false,
+    
+    
+    "_comment_mumdia_settings": "MuMDIA-specific settings",
+    
+    "fdr_init_search": 0.01,
+    "n_windows": 10,
+    "model_type": "xgboost"
+}
