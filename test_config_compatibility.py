@@ -5,7 +5,7 @@ Test script to verify that both old and new config formats work with the new sys
 This demonstrates that the new system is fully backwards compatible.
 """
 
-from config_new import load_config_from_json
+from config import load_config_from_json
 
 def test_config_format(config_path, format_name):
     """Test loading and using a specific config format."""

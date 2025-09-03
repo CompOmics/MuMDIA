@@ -259,7 +259,7 @@ def main() -> str:
     """
     import argparse
     import sys
-    from config_new import load_config_from_json
+    from config import load_config_from_json
     
     # Parse command line arguments
     parser = argparse.ArgumentParser(description="Run MuMDIA workflow")
