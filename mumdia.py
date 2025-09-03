@@ -255,7 +255,7 @@ def create_model():
         )
 
     model = Sequential()
-    model.add(Dense(100, input_dim=103, activation="relu"))
+    model.add(Dense(100, input_dim=69, activation="relu"))
     model.add(Dense(50, activation="relu"))
     model.add(Dense(20, activation="relu"))
     model.add(Dense(1, activation="sigmoid"))

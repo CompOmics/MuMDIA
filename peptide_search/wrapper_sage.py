@@ -205,6 +205,7 @@ def retention_window_searches(
 
         # Use a deep copy of the provided config to avoid mutating caller state
         sub_config = copy.deepcopy(config)
+        print(sub_config["sage"])
 
         sub_results = os.path.dirname(mzml_path)
 

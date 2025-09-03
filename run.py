@@ -257,6 +257,7 @@ def modify_config(
         )
 
     merged = merge_config_from_sources(existing_config, parser, args)
+
     return write_updated_config(merged, result_dir)
 
 
@@ -434,6 +435,7 @@ def main() -> str:
     )
 
     if args_dict["write_full_search_pickle"] or not full_search_pickles_exist:
+
         log_info("Generating peptide library and training DeepLC model...")
         database_config = config["sage"]["database"]
         peptides = tryptic_digest_pyopenms(
@@ -514,6 +516,14 @@ def main() -> str:
     ms1_dict, ms2_to_ms1_dict, ms2_spectra = get_ms1_mzml(
         config["sage_basic"]["mzml_paths"][0]  # TODO: should be for all mzml files
     )
+
+    import pickle
+
+    with open("debug/ms1_dict.pkl", "wb") as f:
+        pickle.dump(ms1_dict, f)
+
+    with open("debug/ms2_to_ms1_dict.pkl", "wb") as f:
+        pickle.dump(ms2_to_ms1_dict, f)
 
     # Execute the main MuMDIA feature calculation and machine learning pipeline
     # This includes:
