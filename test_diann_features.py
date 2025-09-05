@@ -15,9 +15,13 @@ from multiprocessing import Pool, cpu_count
 from functools import partial
 import os
 import psutil
+import warnings
+
 
 # Suppress RuntimeWarnings from numpy
-np.seterr(divide="ignore", invalid="ignore")
+np.seterr(all="ignore")
+# Suppress RuntimeWarnings Degrees of freedom
+warnings.filterwarnings("ignore", message="Degrees of freedom <= 0 for slice")
 
 # Configure logging
 logging.basicConfig(
@@ -109,8 +113,8 @@ def process_single_precursor_efficient(precursor_id):
             ),
             "Peptide": precursor["peptide"].iloc[0],
             "Proteins": (
-                precursor.get("protein", ["unknown"]).iloc[0]
-                if "protein" in precursor.columns
+                precursor.get("proteins", ["unknown"]).iloc[0]
+                if "proteins" in precursor.columns
                 else "unknown"
             ),
         }
@@ -247,24 +251,32 @@ def load_test_data():
     try:
         # Load predictions
         ms2pip_preds = pickle.load(
-            open("results/config_playing/ms2pip_predictions.pkl", "rb")
+            open(
+                "/home/robbe/MuMDIA/results/config_playing/ms2pip_predictions.pkl", "rb"
+            )
         )
         deeplc_preds = pickle.load(
-            open("results/config_playing/predictions_deeplc.pkl", "rb")
+            open(
+                "/home/robbe/MuMDIA/results/config_playing/predictions_deeplc.pkl", "rb"
+            )
         )
 
         # Load PSM and fragment data
-        df_psms = pd.read_csv("results/config_playing/df_psms.tsv", sep="\t")
+        df_psms = pd.read_csv(
+            "/home/robbe/MuMDIA/results/config_playing/df_psms.tsv", sep="\t"
+        )
         df_psms["precursor"] = df_psms["peptide"] + "/" + df_psms["charge"].astype(str)
 
-        df_fragment = pd.read_csv("results/config_playing/df_fragment.tsv", sep="\t")
+        df_fragment = pd.read_csv(
+            "/home/robbe/MuMDIA/results/config_playing/df_fragment.tsv", sep="\t"
+        )
         df_fragment["fragment_names"] = df_fragment["fragment_type"].astype(
             str
         ) + df_fragment["fragment_ordinals"].astype("Int64").astype(str)
 
         # Load spectral dictionaries
-        ms2dict = pickle.load(open("debug/ms2dict.pkl", "rb"))
-        ms1_dict = pickle.load(open("debug/ms1_dict.pkl", "rb"))
+        ms2dict = pickle.load(open("/home/robbe/MuMDIA/debug/ms2dict.pkl", "rb"))
+        ms1_dict = pickle.load(open("/home/robbe/MuMDIA/debug/ms1_dict.pkl", "rb"))
 
         # Convert DeepLC predictions to pandas if needed
         if hasattr(deeplc_preds, "to_pandas"):
@@ -576,23 +588,6 @@ def output_features_to_file(
             ):
                 results.append(result)
                 processed_count += 1
-
-                # Simple progress reporting every 200 items - avoid psutil process enumeration
-                if processed_count % 200 == 0:
-                    try:
-                        # Just show basic progress and memory - no process enumeration
-                        memory_info = psutil.virtual_memory()
-                        print(
-                            f"  Progress: {processed_count}/{len(precursor_ids)} "
-                            f"({100*processed_count/len(precursor_ids):.1f}%), "
-                            f"Memory: {memory_info.percent:.1f}%"
-                        )
-                    except Exception:
-                        # If even basic monitoring fails, just show count
-                        print(
-                            f"  Progress: {processed_count}/{len(precursor_ids)} "
-                            f"({100*processed_count/len(precursor_ids):.1f}%)"
-                        )
 
             # Stop monitoring
             stop_monitoring.set()
@@ -1002,48 +997,6 @@ def main():
         return
 
     print("Data loaded successfully!")
-
-    # Test single precursor
-    print("\n1. Testing single precursor...")
-    features = test_single_precursor(data)
-
-    if features:
-        print_feature_summary(features)
-
-        # Validate features
-        issues = validate_features(features)
-        if issues:
-            print("\nValidation Issues Found:")
-            for issue in issues:
-                print(f"  - {issue}")
-        else:
-            print("\nAll features passed validation!")
-
-    # Test multiple precursors
-    print("\n2. Testing multiple precursors...")
-    multiple_results = test_multiple_precursors(data, max_precursors=3)
-
-    print(f"Successfully processed {len(multiple_results)} precursors")
-
-    # Show feature consistency across precursors
-    if len(multiple_results) > 1:
-        print("\n3. Feature consistency check...")
-        feature_names = set()
-        for result in multiple_results.values():
-            feature_names.update(result.keys())
-
-        print("Common features across all precursors:")
-        common_features = feature_names
-        for result in multiple_results.values():
-            common_features = common_features.intersection(result.keys())
-
-        print(f"  {len(common_features)} common features: {sorted(common_features)}")
-
-    # Performance benchmark
-    print("\n4. Performance benchmark...")
-    benchmark_performance(data, num_tests=5)
-
-    print("\nTest completed successfully!")
 
     print(
         "\n Calculating all features for all precursors and outputting to outfile.pin..."
