@@ -1075,7 +1075,19 @@ def add_retention_time_margins(df_psms: pl.DataFrame, df_fragment: pl.DataFrame,
         ]
     )
 
-    return df_psms
+    # add rt_lower_margin and rt_higher_margin to df_fragment
+    df_fragment = df_fragment.with_columns(
+        [
+            pl.struct(["peptide", "charge"])
+            .map_elements(lambda row: pept2lowermargins.get((row["peptide"], row["charge"]), np.nan))
+            .alias("rt_lower_margin"),
+            pl.struct(["peptide", "charge"])
+            .map_elements(lambda row: pept2highermargins.get((row["peptide"], row["charge"]), np.nan))
+            .alias("rt_higher_margin")
+        ]
+    )
+
+    return df_psms, df_fragment
 
 
 def add_retention_time_margins_loop(df_psms: pl.DataFrame, df_fragment: pl.DataFrame, top_n: int = 10, intensity_threshold: float = 0.05) -> pl.DataFrame:
