@@ -64,7 +64,7 @@ from prediction_wrappers.wrapper_ms2pip import (
     get_predictions_fragment_intensity_main_loop,
 )
 from quantification.lfq import quantify_precursors
-from utilities.plotting import plot_XIC_with_margins
+from utilities.plotting import plot_XIC_with_margins, plot_rt_margin_histogram
 from utilities.logger import log_info
 
 # Re-export for backward compatibility
@@ -1019,6 +1019,10 @@ def calculate_min_max_margins(df_psms: pl.DataFrame, df_fragments: pl.DataFrame,
         min_diff = np.percentile(diffs, 5)
         max_diff = np.percentile(diffs, 95)
         log_info(f"Using min and max retention time margins: {min_diff}, {max_diff}")
+
+    # plot histogram of diffs
+    plot_rt_margin_histogram(diffs, output_dir='debug/calibration_xics', min_diff=min_diff, max_diff=max_diff)
+
     return min_diff, max_diff
 
 
@@ -1027,7 +1031,8 @@ def add_retention_time_margins(df_psms: pl.DataFrame, df_fragment: pl.DataFrame,
     Add retention time margin features to the PSM DataFrame.
     """
 
-    pept2margins = {}
+    pept2lowermargins = {}
+    pept2highermargins = {}
 
     for (peptidoform, charge), df_fragments_sub in tqdm(
                 df_fragment.group_by(["peptide", "charge"])
@@ -1035,7 +1040,8 @@ def add_retention_time_margins(df_psms: pl.DataFrame, df_fragment: pl.DataFrame,
 
         # speed up: skip peptidoforms with only 1 PSM
         if df_fragments_sub['psm_id'].n_unique() < 2:
-            pept2margins[(peptidoform, charge)] = (np.nan, np.nan)
+            pept2lowermargins[(peptidoform, charge)] = np.nan
+            pept2highermargins[(peptidoform, charge)] = np.nan
             continue
 
         intensity_based_margins = calculate_rt_margins_intensity_based(df_fragments_sub, intensity_threshold, output_dir='xics')
@@ -1054,14 +1060,18 @@ def add_retention_time_margins(df_psms: pl.DataFrame, df_fragment: pl.DataFrame,
         if right_diff > max_diff:
             right_bound = apex_rt + max_diff
 
-        pept2margins[(peptidoform, charge)] = (left_bound, right_bound)
+        pept2lowermargins[(peptidoform, charge)] = left_bound
+        pept2highermargins[(peptidoform, charge)] = right_bound
 
-    # add rt_margins column to df_psms
+    # add rt_lower_margin and rt_higher_margin to df_psms
     df_psms = df_psms.with_columns(
         [
             pl.struct(["peptide", "charge"])
-            .map_elements(lambda row: pept2margins.get((row["peptide"], row["charge"]), (np.nan, np.nan)))
-            .alias("rt_margins")
+            .map_elements(lambda row: pept2lowermargins.get((row["peptide"], row["charge"]), np.nan))
+            .alias("rt_lower_margin"),
+            pl.struct(["peptide", "charge"])
+            .map_elements(lambda row: pept2highermargins.get((row["peptide"], row["charge"]), np.nan))
+            .alias("rt_higher_margin")
         ]
     )
 
@@ -1072,12 +1082,15 @@ def add_retention_time_margins_loop(df_psms: pl.DataFrame, df_fragment: pl.DataF
     """
     Add retention time margin features to the PSM DataFrame.
     """
-
+    log_info("Calculating min max retention time margins based on intensity...")
+    print(df_fragment)
     # Step 1: Calculate min and max retention time window based on top 100 peptidoforms
     min_diff, max_diff = calculate_min_max_margins(df_psms, df_fragment, top_n, intensity_threshold)
 
     # Step 2: Calculate adapted margins for each PSM based on the intensity of the most intense fragment
     # and use the retention time distribution as min and max
+    log_info("Adding retention time margin features to PSM DataFrame...")
+    print(df_fragment)
     df_psms = add_retention_time_margins(df_psms, df_fragment, min_diff, max_diff, intensity_threshold)
 
     return df_psms

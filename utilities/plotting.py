@@ -238,3 +238,25 @@ def plot_XIC_with_margins(df: pl.DataFrame, output_dir: str = "debug/calibration
     plt.tight_layout()
     plt.savefig(f"{output_dir}/{precursor}_XIC.svg")
 
+def plot_rt_margin_histogram(rt_margins, output_dir: str = "debug/calibration_xics", min_diff=None, max_diff=None):
+    """
+    Plots a histogram of the rt_margins from the PSM DataFrame.
+    Expects rt_margins to be a list of tuples (left_margin, right_margin).
+    """
+    if not rt_margins:
+        raise ValueError("rt_margins list is empty.")
+
+    plt.figure(figsize=(10, 6))
+    plt.hist(rt_margins, bins=100, alpha=0.5, label='Margins', color='orange')
+
+    if min_diff is not None:
+        plt.axvline(x=min_diff, color='red', linestyle='--', label='Min RT Margin')
+    if max_diff is not None:
+        plt.axvline(x=max_diff, color='green', linestyle='--', label='Max RT Margin')
+
+    plt.xlabel('Retention Time Margin')
+    plt.ylabel('Frequency')
+    plt.title('Histogram of Retention Time Margins')
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(f"{output_dir}/rt_margin_histogram.svg")
