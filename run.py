@@ -463,6 +463,18 @@ def main() -> str:
             df_psms.select(["psm_id", "scannr"]), on="psm_id", how="left"
         )
 
+        log_info("Adding fragment names to fragments...")
+        df_fragment = df_fragment.with_columns(
+            pl.Series(
+                "fragment_name",
+                df_fragment["fragment_type"]
+                + df_fragment["fragment_ordinals"]
+                + "/"
+                + df_fragment["fragment_charge"],
+            )
+        )
+
+
         # Narrow types for static analysis
         assert isinstance(df_fragment, pl.DataFrame)
         assert isinstance(df_psms, pl.DataFrame)
