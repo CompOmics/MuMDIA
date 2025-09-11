@@ -952,7 +952,7 @@ def calculate_rt_margins_intensity_based(df_fragments: pl.DataFrame, intensity_t
         right_bound = right_df["rt"][-1]
 
     # plot XIC with the margins
-    # plot_XIC_with_margins(df_sorted, output_dir=output_dir, adapted_interval=(left_bound, right_bound), apex_rt=apex_rt, cutoff=cutoff)
+    plot_XIC_with_margins(df_sorted, output_dir=output_dir, adapted_interval=(left_bound, right_bound), apex_rt=apex_rt, cutoff=cutoff)
 
     return left_bound, right_bound, apex_rt
 
@@ -1078,7 +1078,7 @@ def add_retention_time_margins(df_psms: pl.DataFrame, df_fragment: pl.DataFrame,
     return df_psms
 
 
-def add_retention_time_margins_loop(df_psms: pl.DataFrame, df_fragment: pl.DataFrame, top_n: int = 10, intensity_threshold: float = 0.01) -> pl.DataFrame:
+def add_retention_time_margins_loop(df_psms: pl.DataFrame, df_fragment: pl.DataFrame, top_n: int = 10, intensity_threshold: float = 0.05) -> pl.DataFrame:
     """
     Add retention time margin features to the PSM DataFrame.
     """
