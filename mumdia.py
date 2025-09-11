@@ -1083,14 +1083,12 @@ def add_retention_time_margins_loop(df_psms: pl.DataFrame, df_fragment: pl.DataF
     Add retention time margin features to the PSM DataFrame.
     """
     log_info("Calculating min max retention time margins based on intensity...")
-    print(df_fragment)
     # Step 1: Calculate min and max retention time window based on top 100 peptidoforms
     min_diff, max_diff = calculate_min_max_margins(df_psms, df_fragment, top_n, intensity_threshold)
 
     # Step 2: Calculate adapted margins for each PSM based on the intensity of the most intense fragment
     # and use the retention time distribution as min and max
     log_info("Adding retention time margin features to PSM DataFrame...")
-    print(df_fragment)
     df_psms = add_retention_time_margins(df_psms, df_fragment, min_diff, max_diff, intensity_threshold)
 
     return df_psms
