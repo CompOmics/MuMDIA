@@ -63,7 +63,7 @@ from prediction_wrappers.wrapper_deeplc import get_predictions_retention_time_ma
 from prediction_wrappers.wrapper_ms2pip import (
     get_predictions_fragment_intensity_main_loop,
 )
-from quantification.lfq import quantify_precursors
+from quantification.lfq import quantify_precursors, quantify_fragments
 from utilities.plotting import plot_XIC_with_margins, plot_rt_margin_histogram
 from utilities.logger import log_info
 
@@ -952,7 +952,7 @@ def calculate_rt_margins_intensity_based(df_fragments: pl.DataFrame, intensity_t
         right_bound = right_df["rt"][-1]
 
     # plot XIC with the margins
-    plot_XIC_with_margins(df_sorted, output_dir=output_dir, adapted_interval=(left_bound, right_bound), apex_rt=apex_rt, cutoff=cutoff)
+    # plot_XIC_with_margins(df_sorted, output_dir=output_dir, adapted_interval=(left_bound, right_bound), apex_rt=apex_rt, cutoff=cutoff)
 
     return left_bound, right_bound, apex_rt
 
@@ -1034,6 +1034,8 @@ def add_retention_time_margins(df_psms: pl.DataFrame, df_fragment: pl.DataFrame,
     pept2lowermargins = {}
     pept2highermargins = {}
 
+    log_info("Calculating adapted retention time margins based on intensity for all peptides")
+
     for (peptidoform, charge), df_fragments_sub in tqdm(
                 df_fragment.group_by(["peptide", "charge"])
             ):
@@ -1063,6 +1065,8 @@ def add_retention_time_margins(df_psms: pl.DataFrame, df_fragment: pl.DataFrame,
         pept2lowermargins[(peptidoform, charge)] = left_bound
         pept2highermargins[(peptidoform, charge)] = right_bound
 
+    log_info("Adding retention time margin features to PSM DataFrame...")
+
     # add rt_lower_margin and rt_higher_margin to df_psms
     df_psms = df_psms.with_columns(
         [
@@ -1074,6 +1078,8 @@ def add_retention_time_margins(df_psms: pl.DataFrame, df_fragment: pl.DataFrame,
             .alias("rt_higher_margin")
         ]
     )
+
+    log_info("Adding retention time margin features to Fragment DataFrame...")
 
     # add rt_lower_margin and rt_higher_margin to df_fragment
     df_fragment = df_fragment.with_columns(
@@ -1101,9 +1107,9 @@ def add_retention_time_margins_loop(df_psms: pl.DataFrame, df_fragment: pl.DataF
     # Step 2: Calculate adapted margins for each PSM based on the intensity of the most intense fragment
     # and use the retention time distribution as min and max
     log_info("Adding retention time margin features to PSM DataFrame...")
-    df_psms = add_retention_time_margins(df_psms, df_fragment, min_diff, max_diff, intensity_threshold)
+    df_psms, df_fragment = add_retention_time_margins(df_psms, df_fragment, min_diff, max_diff, intensity_threshold)
 
-    return df_psms
+    return df_psms, df_fragment
 
 
 def calculate_features(
@@ -1421,7 +1427,9 @@ def main(
     df_fragment.write_csv("debug/df_fragment_before_quant.tsv", separator="\t")
     df_psms.write_csv("debug/df_psms_before_quant.tsv", separator="\t")
 
-    # quantify_precursors(df_fragment, mokapot_results, config=config, output_dir=config["mumdia"]["result_dir"])
+    quantify_precursors(df_fragment, mokapot_results, config=config, output_dir=config["mumdia"]["result_dir"])
+
+    quantify_fragments(df_fragment, mokapot_results, config=config, output_dir=config["mumdia"]["result_dir"]) 
 
 if __name__ == "__main__":
     # In practice, load your input DataFrames (e.g., from parquet files) and then call main().
