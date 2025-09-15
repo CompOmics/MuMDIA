@@ -31,9 +31,6 @@ def quantify_fragments(df_fragment, mokapot_results, config, output_dir: str = N
 
     logging.info(f"Quantifying fragments")
 
-    # TODO: Aggregate PSMs to fragment level (1 number per fragment per peptidoform)
-    # And then run directLFQ on that 
-
     for (peptidoform, charge, fragment_name), df_fragment_mokapot_filtered_sub in tqdm(
             df_fragment_mokapot_filtered.group_by(["peptide", "charge", "fragment_name"])
         ):
