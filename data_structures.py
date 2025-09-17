@@ -20,14 +20,14 @@ class CorrelationResults:
     sum_pred_frag_intens: np.ndarray
     correlation_matrix_psm_ids: np.ndarray
     correlation_matrix_frag_ids: np.ndarray
-    correlation_matrix_psm_ids_ignore_zeros: np.ndarray
-    correlation_matrix_psm_ids_ignore_zeros_counts: np.ndarray
-    correlation_matrix_psm_ids_missing: np.ndarray
-    correlation_matrix_psm_ids_missing_zeros_counts: np.ndarray
-    correlation_matrix_frag_ids_ignore_zeros: np.ndarray
-    correlation_matrix_frag_ids_ignore_zeros_counts: np.ndarray
-    correlation_matrix_frag_ids_missing: np.ndarray
-    correlation_matrix_frag_ids_missing_zeros_counts: np.ndarray
+    # correlation_matrix_psm_ids_ignore_zeros: np.ndarray
+    # correlation_matrix_psm_ids_ignore_zeros_counts: np.ndarray
+    # correlation_matrix_psm_ids_missing: np.ndarray
+    # correlation_matrix_psm_ids_missing_zeros_counts: np.ndarray
+    # correlation_matrix_frag_ids_ignore_zeros: np.ndarray
+    # correlation_matrix_frag_ids_ignore_zeros_counts: np.ndarray
+    # correlation_matrix_frag_ids_missing: np.ndarray
+    # correlation_matrix_frag_ids_missing_zeros_counts: np.ndarray
     most_intens_cor: float
     most_intens_cos: float
     mse_avg_pred_intens: float

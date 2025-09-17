@@ -255,7 +255,7 @@ def create_model():
         )
 
     model = Sequential()
-    model.add(Dense(100, input_dim=103, activation="relu"))
+    model.add(Dense(100, input_dim=69, activation="relu"))
     model.add(Dense(50, activation="relu"))
     model.add(Dense(20, activation="relu"))
     model.add(Dense(1, activation="sigmoid"))
@@ -327,30 +327,49 @@ def add_feature_columns_nb(data, feature_name, values, method, add_index, pad_si
     Compute a feature vector from the input data using Numba-accelerated routines.
     Returns a dictionary mapping column names to computed scalar values.
     """
+    # logging.info(
+    #     f"add_feature_columns_nb: feature_name={feature_name}, method={method}, values={values}, pad_size={pad_size}"
+    # )
     data = np.asarray(data, dtype=np.float64)
     required_length = len(values)
     computed_idx = np.array([], dtype=np.float64)
+    # logging.debug(f"Input data size: {data.size}")
     if data.size == 0:
+        # logging.info("Input data is empty, returning zeros.")
         computed = np.zeros(required_length, dtype=np.float64)
         if len(add_index) > 0:
             computed_idx = np.zeros(required_length, dtype=np.float64)
     elif method == "percentile":
         qs = np.array(values, dtype=np.float64)
+        # logging.info(f"Computing percentiles: qs={qs}")
         if len(add_index) > 0:
             computed, computed_idx = compute_percentiles_nb_idx(data, qs, add_index)
+            # logging.debug(
+            #     f"Percentile results: computed={computed}, computed_idx={computed_idx}"
+            # )
         else:
             computed = compute_percentiles_nb(data, qs)
+            # logging.debug(f"Percentile results: computed={computed}")
     elif method == "top":
+        # logging.info(f"Computing top values: count={required_length}")
         if len(add_index) > 0:
             computed, computed_idx = compute_top_nb_idx(
                 data, required_length, add_index
             )
+            # logging.debug(
+            #     f"Top results: computed={computed}, computed_idx={computed_idx}"
+            # )
         else:
             computed = compute_top_nb(data, required_length)
+            # logging.debug(f"Top results: computed={computed}")
     else:
+        logging.error(f"Unknown method: {method}")
         raise ValueError(f"Unknown method: {method}")
     # Ensure computed is of the required length
     if computed.size < required_length:
+        # logging.info(
+        #     f"Padded computed array from size {computed.size} to {required_length}"
+        # )
         padded = np.zeros(required_length, dtype=np.float64)
         padded[: computed.size] = computed
         computed = padded
@@ -365,6 +384,7 @@ def add_feature_columns_nb(data, feature_name, values, method, add_index, pad_si
             computed_idx = computed_idx[:required_length]
 
     if len(add_index) > 0:
+        # logging.info(f"Returning feature dict with index columns for {feature_name}")
         return {
             **{f"{feature_name}_{v}": computed[i] for i, v in enumerate(values)},
             **{
@@ -372,14 +392,12 @@ def add_feature_columns_nb(data, feature_name, values, method, add_index, pad_si
             },
         }
     else:
+        # logging.info(f"Returning feature dict for {feature_name}")
         return {f"{feature_name}_{v}": computed[i] for i, v in enumerate(values)}
 
 
 def run_peptidoform_df(
     df_psms_sub_peptidoform: pl.DataFrame,
-    selected_features: List[str] = [],
-    collect_distributions: List[int] = [0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100],
-    collect_top: List[int] = [1, 2, 3, 4, 5],
     collapse_max_columns: List[str] = [
         "fragment_ppm",
         "rank",
@@ -463,6 +481,13 @@ def run_peptidoform_df(
         collapse_sum_columns=collapse_sum_columns,
         get_first_entry=get_first_entry,
     )
+
+    # log_info(
+    #     "df_psms_sub_peptidoform_collapsed shape: {}".format(
+    #         df_psms_sub_peptidoform_collapsed.shape
+    #     )
+    # )
+    # log_info(df_psms_sub_peptidoform_collapsed)
     df_psms_sub_peptidoform_collapsed = df_psms_sub_peptidoform_collapsed.with_columns(
         pl.when(pl.col("is_decoy")).then(-1).otherwise(1).alias("is_decoy")
     )
@@ -598,14 +623,14 @@ def run_peptidoform_correlation(
         sum_pred_frag_intens,
         correlation_matrix_psm_ids,
         correlation_matrix_frag_ids,
-        correlation_matrix_psm_ids_ignore_zeros,
-        correlation_matrix_psm_ids_ignore_zeros_counts,
-        correlation_matrix_psm_ids_missing,
-        correlation_matrix_psm_ids_missing_zeros_counts,
-        correlation_matrix_frag_ids_ignore_zeros,
-        correlation_matrix_frag_ids_ignore_zeros_counts,
-        correlation_matrix_frag_ids_missing,
-        correlation_matrix_frag_ids_missing_zeros_counts,
+        # correlation_matrix_psm_ids_ignore_zeros,
+        # correlation_matrix_psm_ids_ignore_zeros_counts,
+        # correlation_matrix_psm_ids_missing,
+        # correlation_matrix_psm_ids_missing_zeros_counts,
+        # correlation_matrix_frag_ids_ignore_zeros,
+        # correlation_matrix_frag_ids_ignore_zeros_counts,
+        # correlation_matrix_frag_ids_missing,
+        # correlation_matrix_frag_ids_missing_zeros_counts,
         most_intens_cor,
         most_intens_cos,
         mse_avg_pred_intens,
@@ -669,6 +694,9 @@ def run_peptidoform_correlation(
     ]
     for data, feat_name, values, method, ps, add_index in params:
         # Here, for percentiles and top values, we use the Numba-accelerated add_feature_columns_nb.
+        # log_info(
+        #     f"Adding feature {feat_name} with method {method} and values {values}."
+        # )
         feature_dict.update(
             add_feature_columns_nb(
                 data, feat_name, values, method, add_index, pad_size=ps
@@ -676,7 +704,7 @@ def run_peptidoform_correlation(
         )
 
     df = pl.DataFrame(feature_dict)
-    df.write_csv("debug/correlation_features.csv")
+    # df.write_csv("debug/correlation_features.csv")
 
     return df
 
@@ -965,37 +993,10 @@ def calculate_features(
         .unique(subset=["peptide", "charge"], keep="first")
     )
 
-    log_info("Regenerated df_fragment_max_peptide:")
-    log_info("  Shape: {}".format(df_fragment_max_peptide.shape))
-    log_info("  Sample entries:")
-    for row in df_fragment_max_peptide.head(3).iter_rows(named=True):
-        log_info(
-            "    Peptide: {}, Charge: {}, PSM ID: {}, RT: {}, Fragment Intensity: {}".format(
-                row["peptide"],
-                row["charge"],
-                row["psm_id"],
-                row["rt"],
-                row["fragment_intensity"],
-            )
-        )
-
-    log_info(
-        "Counting individual peptides per MS2 and filtering by minimum occurrences"
-    )
     df_psms = add_count_and_filter_peptides(df_psms, min_occurrences)
-
-    log_info("PSMs shape after peptide count filtering: {}".format(df_psms.shape))
-
-    # CRITICAL FIX: Regenerate df_fragment_max_peptide again after peptide count filtering
-    log_info("Regenerating df_fragment_max_peptide after peptide count filtering...")
 
     # Filter df_fragment to only include PSMs that passed all filtering
     df_fragment = df_fragment.filter(pl.col("psm_id").is_in(df_psms["psm_id"]))
-    log_info(
-        "df_fragment shape after filtering to match all-filtered PSMs: {}".format(
-            df_fragment.shape
-        )
-    )
 
     # Regenerate the maximum intensity fragment per PSM
     df_fragment_max = df_fragment.sort("fragment_intensity", descending=True).unique(

@@ -19,7 +19,7 @@ def tryptic_digest_pyopenms(
 
     # Set up the enzyme digestion
     digestor = pms.ProteaseDigestion()
-    digestor.setEnzyme("Trypsin")
+    digestor.setEnzyme("Trypsin/P")
     digestor.setMissedCleavages(missed_cleavages)
 
     peptides = []

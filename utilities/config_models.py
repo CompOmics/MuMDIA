@@ -111,6 +111,8 @@ class MuMDIASettings:
 
     fdr_init_search: float = 0.05
 
+    coefficient_bounds: int = 1
+
     def validate(self) -> None:
         # Basic sanity checks aligning with argparse defaults
         if (

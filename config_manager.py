@@ -104,6 +104,7 @@ class MuMDIAConfig:
                     "read_correlation",
                     "dlc_transfer_learn",
                     "fdr_init_search",
+                    "coefficient_bounds",
                 ]
             },
             "sage_basic": self.sage_basic,
