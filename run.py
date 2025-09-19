@@ -460,7 +460,7 @@ def main() -> str:
 
         log_info("Adding the PSM identifier to fragments...")
         df_fragment = df_fragment.join(
-            df_psms.select(["psm_id", "scannr"]), on="psm_id", how="left"
+            df_psms.select(["psm_id", "scannr", "stripped_peptide"]), on="psm_id", how="left"
         )
 
         log_info("Adding fragment names to fragments...")
