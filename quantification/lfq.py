@@ -30,7 +30,7 @@ def quantify_fragments(df_fragment, mokapot_results, config, output_dir: str = N
     results = []
 
     logging.info(f"Quantifying fragments")
-
+ 
     for (peptidoform, charge, fragment_name), df_fragment_mokapot_filtered_sub in tqdm(
             df_fragment_mokapot_filtered.group_by(["peptide", "charge", "fragment_name"])
         ):
@@ -84,11 +84,6 @@ def quantify_fragments(df_fragment, mokapot_results, config, output_dir: str = N
 
 
 def quantify_precursors(df_fragment, mokapot_results, config, output_dir):
-
-    # read in fasta once for mapping peptides to proteins
-    fasta_path = config["sage"]["database"]["fasta"]
-    fasta_dict = SeqIO.to_dict(SeqIO.parse(fasta_path, "fasta"))
-
     # extract basename of mzml file for column name
     mzml_filename = os.path.basename(config["sage"]["mzml_paths"][0]).split('.')[0]
 
@@ -102,17 +97,12 @@ def quantify_precursors(df_fragment, mokapot_results, config, output_dir):
     logging.info(f"Quantifying peptides")
 
     #aggregate fragment to precursor level
-    for (peptidoform, charge), df_fragment_mokapot_filtered_sub in tqdm(
-            df_fragment_mokapot_filtered.group_by(["peptide", "charge"])
+    for (peptidoform, stripped_sequence, charge, proteins), df_fragment_mokapot_filtered_sub in tqdm(
+            df_fragment_mokapot_filtered.group_by(["peptide", "stripped_peptide", "charge", "proteins"])
         ):
-        # extract proteins where peptide is substring of
 
-        proforma_seq = proforma.parse(peptidoform)
-        stripped_sequence = ''.join([x[0] for x in proforma_seq[0]])
-
-        proteins = ';'.join([record.id.split('|')[-1] for record in fasta_dict.values() if stripped_sequence in record.seq])
-        if proteins == '':
-            print("Warning: No protein found for peptidoform ", stripped_sequence)
+        # extract protein id e.g. from rev_sp|P58107|EPIPL_HUMAN|2501|2518;rev_sp|P58107|EPIPL_HUMAN|2501|2518
+        proteins = ';'.join(proteinstring.split('|')[2] for proteinstring in proteins.split(';'))
 
         results.append({
             "Sequence": stripped_sequence,
@@ -120,9 +110,9 @@ def quantify_precursors(df_fragment, mokapot_results, config, output_dir):
             "Charge": charge,
             "Modified sequence": peptidoform,
             mzml_filename + '_baseline': quantify_precursor_baseline(df_fragment_mokapot_filtered_sub),
-            #mzml_filename + '_baseline_margin': quantify_precursor_baseline(df_fragment_mokapot_filtered_sub, margin=True),
+            mzml_filename + '_baseline_margin': quantify_precursor_baseline(df_fragment_mokapot_filtered_sub, margin=True),
             mzml_filename + '_integrated': quantify_precursor_integrated(df_fragment_mokapot_filtered_sub),
-            #mzml_filename + '_integrated_margin': quantify_precursor_integrated(df_fragment_mokapot_filtered_sub, margin=True)
+            mzml_filename + '_integrated_margin': quantify_precursor_integrated(df_fragment_mokapot_filtered_sub, margin=True)
 
         })
         # break  # for debugging, remove break for full run
@@ -130,8 +120,8 @@ def quantify_precursors(df_fragment, mokapot_results, config, output_dir):
     logging.info(f"Writing quantification results to file in proteobench format")
     # write to file in proteobench format
     df_results = pl.DataFrame(results)
-    df_results.write_csv(os.path.join(output_dir, "quantification_results.csv"))
-    
+    df_results.write_csv(os.path.join(output_dir, mzml_filename + "_quantification_results.csv"))
+
     return # df_results
 
 def quantify_precursor_baseline(df_fragment_sub_peptidoform, margin: bool = False):
