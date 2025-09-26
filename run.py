@@ -471,7 +471,7 @@ def main() -> str:
             df_fragment_max_peptide,
         ) = retention_window_searches(mzml_dict, peptide_df, config, perc_95)
 
-        log_info("Adding PSM identifiers and other columns to fragment df...")
+        log_info("Adding columns ['psm_id', 'scannr', 'stripped_peptide', 'proteins'] from PSMs to fragment df...")
         df_fragment = df_fragment.join(
             df_psms.select(["psm_id", "scannr", "stripped_peptide", "proteins"]), on="psm_id", how="left"
         )
