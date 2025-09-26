@@ -98,9 +98,14 @@ def parquet_reader(
     df_fragment.index = df_fragment["psm_id"]
 
     df_psms = pd.read_parquet(parquet_file_results)
-    df_psms.drop_duplicates(subset=["scannr", "peptide"], inplace=True)
+    log_info("df_psms shape: {}".format(df_psms.shape))
+    df_psms.drop_duplicates(
+        subset=["scannr", "peptide", "charge"], inplace=True
+    )  # Okay to add charge?
+    log_info("df_psms shape after dropping duplicates: {}".format(df_psms.shape))
 
     df_psms = df_psms[df_psms["spectrum_q"] < q_value_filter]
+    log_info("df_psms shape after filtering by q-value: {}".format(df_psms.shape))
     df_fragment = df_fragment[df_fragment.index.isin(df_psms["psm_id"])]
 
     df_fragment = pl.DataFrame(df_fragment)
@@ -119,20 +124,10 @@ def parquet_reader(
     df_psms = df_psms.with_columns(
         pl.col("peptide").map_elements(replace_mass_shift).alias("peptide")
     )
+    log_info("df_psms shape after replacing mass shifts: {}".format(df_psms.shape))
 
     df_fragment = df_fragment.join(
         df_psms[["psm_id", "peptide", "charge", "rt"]], on="psm_id", how="left"
-    )
-
-    log_info("After joining peptide info to fragments:")
-    log_info("  df_fragment shape: {}".format(df_fragment.shape))
-    log_info(
-        "  Unique peptide/charge combinations: {}".format(
-            len(df_fragment.select(["peptide", "charge"]).unique())
-        )
-    )
-    log_info(
-        "  RT range: {} to {}".format(df_fragment["rt"].min(), df_fragment["rt"].max())
     )
 
     # Get the maximum fragment intensity per PSM
@@ -155,24 +150,6 @@ def parquet_reader(
         .unique(subset=["peptide", "charge"], keep="first", maintain_order=True)
     )
 
-    log_info("df_fragment_max_peptide creation summary:")
-    log_info(
-        "  Total unique peptide/charge combinations: {}".format(
-            len(df_fragment_max_peptide)
-        )
-    )
-    log_info("  Sample of selected PSMs:")
-    for row in df_fragment_max_peptide.head(5).iter_rows(named=True):
-        log_info(
-            "    Peptide: {}, Charge: {}, PSM ID: {}, RT: {}, Fragment Intensity: {}".format(
-                row["peptide"],
-                row["charge"],
-                row["psm_id"],
-                row["rt"],
-                row["fragment_intensity"],
-            )
-        )
-
     # df_psms = pd.concat([df_psms, df_fragment_max["fragment_intensity"]], axis=1)
 
     df_psms = df_psms.join(
@@ -180,5 +157,6 @@ def parquet_reader(
         on="psm_id",
         how="left",
     )
+    log_info("df_psms shape after joining with fragment max: {}".format(df_psms.shape))
 
     return df_fragment, df_psms, df_fragment_max, df_fragment_max_peptide

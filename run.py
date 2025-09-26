@@ -257,6 +257,7 @@ def modify_config(
         )
 
     merged = merge_config_from_sources(existing_config, parser, args)
+
     return write_updated_config(merged, result_dir)
 
 
@@ -434,14 +435,26 @@ def main() -> str:
     )
 
     if args_dict["write_full_search_pickle"] or not full_search_pickles_exist:
+
         log_info("Generating peptide library and training DeepLC model...")
-        peptides = tryptic_digest_pyopenms(config["sage"]["database"]["fasta"])
+        database_config = config["sage"]["database"]
+        peptides = tryptic_digest_pyopenms(
+            database_config["fasta"],
+            min_len=database_config["enzyme"]["min_len"],
+            max_len=database_config["enzyme"]["max_len"],
+            missed_cleavages=database_config["enzyme"]["missed_cleavages"],
+            decoy_prefix=database_config["decoy_tag"],
+        )
 
         # Train DeepLC retention time model and calculate prediction bounds
         # Narrow type for static analysis
         assert isinstance(df_psms, pl.DataFrame)
+        print(args_dict)
         peptide_df, dlc_calibration, dlc_transfer_learn, perc_95 = retrain_and_bounds(
-            cast(pl.DataFrame, df_psms), peptides, result_dir=result_dir
+            cast(pl.DataFrame, df_psms),
+            peptides,
+            result_dir=result_dir,
+            coefficient_bounds=args_dict["coefficient_bounds"],
         )
 
         log_info("Partitioning mzML files by predicted retention time...")
@@ -522,6 +535,21 @@ def main() -> str:
     df_psms, df_fragment = mumdia.add_retention_time_margins_loop(
         df_psms=df_psms, df_fragment=df_fragment, top_n=100, intensity_threshold=0.01
     )
+
+    # Add retention time margins to precursor ions by going right and left from
+    # apex retention time in MS2 scans until fragment intensity drops below 1% of apex
+    log_info("Adding retention time margins to precursor ions and fragments...")
+    df_psms, df_fragment = mumdia.add_retention_time_margins_loop(
+        df_psms=df_psms, df_fragment=df_fragment, top_n=100, intensity_threshold=0.01
+    )
+    
+    import pickle
+
+    with open("debug/ms1_dict.pkl", "wb") as f:
+        pickle.dump(ms1_dict, f)
+
+    with open("debug/ms2_to_ms1_dict.pkl", "wb") as f:
+        pickle.dump(ms2_to_ms1_dict, f)
 
     # Execute the main MuMDIA feature calculation and machine learning pipeline
     # This includes:

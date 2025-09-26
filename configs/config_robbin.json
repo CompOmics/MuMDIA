@@ -73,9 +73,9 @@
                 "max_len": 30,
                 "cleave_at": "$"
             },
-            "fragment_min_mz": 200,
-            "fragment_max_mz": 1800,
-            "peptide_min_mass": 300,
+            "fragment_min_mz": 100,
+            "fragment_max_mz": 3000,
+            "peptide_min_mass": 200,
             "peptide_max_mass": 7200,
             "ion_kinds": [
                 "b",
@@ -101,44 +101,40 @@
         },
         "fragment_tol": {
             "ppm": [
-                -13,
-                13
+                -40,
+                40
             ]
         },
         "precursor_charge": [
             1,
             4
         ],
-        "isotope_errors": [
-            -1,
-            3
-        ],
-        "deisotope": false,
+        "deisotope": true,
         "annotate_matches": true,
-        "chimera": false,
+        "chimera": true,
         "predict_rt": false,
         "wide_window": true,
-        "min_peaks": 15,
+        "min_peaks": 1,
         "max_peaks": 100000000,
-        "min_matched_peaks": 1,
-        "max_fragment_charge": 1,
-        "report_psms": 200,
+        "min_matched_peaks": 2,
+        "max_fragment_charge": 2,
+        "report_psms": 10,
         "output_directory": "./",
         "mzml_paths": [
             "mzml_files/LFQ_Orbitrap_AIF_Ecoli_01.mzML"
         ]
     },
     "mumdia": {
-        "write_deeplc_pickle": false,
-        "write_ms2pip_pickle": false,
+        "write_deeplc_pickle": true,
+        "write_ms2pip_pickle": true,
         "write_correlation_pickles": true,
-        "write_initial_search_pickle": true,
+        "write_initial_search_pickle": false,
         "write_full_search_pickle": true,
-        "read_deeplc_pickle": true,
-        "read_ms2pip_pickle": true,
+        "read_deeplc_pickle": false,
+        "read_ms2pip_pickle": false,
         "read_correlation_pickles": false,
         "read_full_search_pickles": false,
-        "read_initial_search_pickle": false,
+        "read_initial_search_pickle": true,
         "remove_intermediate_files": false,
         "dlc_transfer_learn": false,
         "coefficient_bounds": 1,
@@ -286,3 +282,4 @@
         ]
     }
 }
+ 
