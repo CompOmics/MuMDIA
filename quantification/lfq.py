@@ -60,8 +60,8 @@ def quantify_fragments(df_fragment, mokapot_psm_path, config, output_dir: str = 
         proteins = ';'.join(proteinstring.split('|')[2] for proteinstring in proteins.split(';'))
 
         results.append({
-            "Proteins": proteins,
-            "ion": stripped_sequence + "_CHARGE_" + str(charge) + "_" + fragment_name,
+            "protein": proteins,
+            "ion": "SEQ_" + stripped_sequence + "_MOD" + peptidoform + "_CHARGE_" + str(charge) + "_" + fragment_name,
             #mzml_filename + "_Intensity_peak": quantify_fragment_peak_intensity(df_fragment_mokapot_filtered_sub, margin=False),
             #mzml_filename + "_Intensity_peak_margin": quantify_fragment_peak_intensity(df_fragment_mokapot_filtered_sub, margin=True),
             mzml_filename + "_Intensity_integrated": quantify_fragment_integrated_intensity(df_fragment_mokapot_filtered_sub,  margin=False),
