@@ -1427,9 +1427,8 @@ def main(
     df_fragment.write_csv("debug/df_fragment_before_quant.tsv", separator="\t")
     df_psms.write_csv("debug/df_psms_before_quant.tsv", separator="\t")
 
-    quantify_precursors(df_fragment, mokapot_results, config=config, output_dir=config["mumdia"]["result_dir"])
-
-    quantify_fragments(df_fragment, mokapot_results, config=config, output_dir=config["mumdia"]["result_dir"]) 
+    # this file will later be used for quantification of proteins with directLFQ (combined with all runs)
+    df_quant_fragment = quantify_fragments(df_fragment, mokapot_results[1], config=config, output_dir=config["mumdia"]["result_dir"]) 
 
 if __name__ == "__main__":
     # In practice, load your input DataFrames (e.g., from parquet files) and then call main().
