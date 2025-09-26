@@ -536,12 +536,6 @@ def main() -> str:
         df_psms=df_psms, df_fragment=df_fragment, top_n=100, intensity_threshold=0.01
     )
 
-    # Add retention time margins to precursor ions by going right and left from
-    # apex retention time in MS2 scans until fragment intensity drops below 1% of apex
-    log_info("Adding retention time margins to precursor ions and fragments...")
-    df_psms, df_fragment = mumdia.add_retention_time_margins_loop(
-        df_psms=df_psms, df_fragment=df_fragment, top_n=100, intensity_threshold=0.01
-    )
     
     import pickle
 
