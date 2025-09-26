@@ -1446,7 +1446,15 @@ def main(
     df_psms.write_csv("debug/df_psms_before_quant.tsv", separator="\t")
 
     # this file will later be used for quantification of proteins with directLFQ (combined with all runs)
-    df_quant_fragment = quantify_fragments(df_fragment, mokapot_results[1], config=config, output_dir=config["mumdia"]["result_dir"]) 
+    if mokapot_results is not None and isinstance(mokapot_results, (list, tuple)) and len(mokapot_results) > 1:
+        df_quant_fragment = quantify_fragments(
+            df_fragment,
+            mokapot_results[1],
+            config=config,
+            output_dir=config["mumdia"]["result_dir"]
+        )
+    else:
+        logging.warning("mokapot_results is None or does not have enough elements; skipping quantification step.")
 
 if __name__ == "__main__":
     # In practice, load your input DataFrames (e.g., from parquet files) and then call main().
