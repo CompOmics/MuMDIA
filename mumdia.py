@@ -63,7 +63,7 @@ from prediction_wrappers.wrapper_deeplc import get_predictions_retention_time_ma
 from prediction_wrappers.wrapper_ms2pip import (
     get_predictions_fragment_intensity_main_loop,
 )
-from quantification.lfq import quantify_precursors, quantify_fragments
+from quantification.lfq import quantify_fragments
 from utilities.plotting import plot_XIC_with_margins, plot_rt_margin_histogram
 from utilities.logger import log_info
 
