@@ -5,7 +5,7 @@ import polars as pl
 from matplotlib.lines import Line2D
 
 
-def plot_XIC(df: pl.DataFrame, output_dir: str = "xics"):
+def plot_XIC(df: pl.DataFrame, output_dir: str = "results"):
     """
     Plots fragment_intensity vs rt for each unique fragment_name.
     Colors by fragment_name, lines connect fragments, marker shape by psm_id.

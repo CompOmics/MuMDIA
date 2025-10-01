@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-MuMDIA (Multi-modal Data-Independant Acquisition) Main Workflow
+MuMDIA
 
 This is the main entry point for the MuMDIA proteomics analysis pipeline.
 MuMDIA integrates multiple prediction tools and machine learning approaches
@@ -16,314 +16,39 @@ import os
 
 os.environ["POLARS_MAX_THREADS"] = "1"
 
-import argparse
-import json
-import sys
 from pathlib import Path
-from typing import Tuple, cast
+from typing import cast
 
 import polars as pl
 
 import utilities.pickling as pickling
 from data_structures import PickleConfig, SpectraData
-from utilities.config_loader import merge_config_from_sources, write_updated_config
-from utilities.io_utils import create_dirs, remove_intermediate_files
+from utilities.io_utils import remove_intermediate_files
 from utilities.logger import log_info
 
+import mumdia
 
-def parse_arguments() -> Tuple[argparse.ArgumentParser, argparse.Namespace]:
+from parsers.parser_mzml import get_ms1_mzml, split_mzml_by_retention_time
+from parsers.parser_parquet import parquet_reader
+from peptide_search.wrapper_sage import retention_window_searches, run_sage
+from prediction_wrappers.wrapper_deeplc import retrain_and_bounds
+from sequence.fasta import tryptic_digest_pyopenms
+
+def run_initial_search(config_obj, result_dir, result_temp_results_initial_search, pickle_config):
     """
-    Parse command line arguments for the MuMDIA workflow.
-
+    STAGE 1: Initial Search for Retention Time Model Training
+    
+    The MuMDIA pipeline uses a two-stage search strategy:
+    1. Initial broad search: Used to train DeepLC retention time models
+    2. Targeted search: Uses RT predictions to partition data for faster, more accurate searches
+    
     Returns:
-        Tuple containing:
-        - parser: ArgumentParser object for checking explicitly provided arguments
-        - args: Namespace object with parsed command line arguments
+        Tuple of (df_fragment, df_psms, df_fragment_max, df_fragment_max_peptide, dlc_transfer_learn)
     """
-    parser = argparse.ArgumentParser()
-
-    # Add arguments
-    parser.add_argument(
-        "--mzml_file",
-        help="The location of the mzml file",
-        default="mzml_files/LFQ_Orbitrap_AIF_Ecoli_01.mzML",
-    )
-    parser.add_argument(
-        "--mzml_dir", help="The directory of the mzml file", default="mzml_files"
-    )
-    parser.add_argument(
-        "--fasta_file",
-        help="The location of the fasta file",
-        default="fasta/unmodified_peptides.fasta",
-    )
-    parser.add_argument(
-        "--result_dir", help="The location of the result directory", default="results"
-    )
-    parser.add_argument(
-        "--config_file",
-        help="The location of the config file",
-        default="configs/config.json",
-    )
-
-    parser.add_argument(
-        "--remove_intermediate_files",
-        help="Remove intermediate results after completion",
-        action="store_true",
-        default=False,
-    )
-
-    parser.add_argument(
-        "--write_initial_search_pickle",
-        help="Write initial search pickles",
-        action="store_true",
-        default=False,
-    )
-
-    # Default: read initial search pickles (can be disabled with --no-read_initial_search_pickle)
-    parser.add_argument(
-        "--read_initial_search_pickle",
-        dest="read_initial_search_pickle",
-        help="Read initial search pickles",
-        action="store_true",
-    )
-    parser.add_argument(
-        "--no-read_initial_search_pickle",
-        dest="read_initial_search_pickle",
-        help="Do not read initial search pickles",
-        action="store_false",
-    )
-    parser.set_defaults(read_initial_search_pickle=True)
-
-    parser.add_argument(
-        "--write_deeplc_pickle",
-        help="Write DeepLC pickles",
-        action="store_true",
-        default=False,
-    )
-
-    parser.add_argument(
-        "--write_ms2pip_pickle",
-        help="Write MS2PIP pickles",
-        action="store_true",
-        default=False,
-    )
-
-    # Default: read DeepLC pickles (can be disabled with --no-read_deeplc_pickle)
-    parser.add_argument(
-        "--read_deeplc_pickle",
-        dest="read_deeplc_pickle",
-        help="Read DeepLC pickles",
-        action="store_true",
-    )
-    parser.add_argument(
-        "--no-read_deeplc_pickle",
-        dest="read_deeplc_pickle",
-        help="Do not read DeepLC pickles",
-        action="store_false",
-    )
-    parser.set_defaults(read_deeplc_pickle=True)
-
-    # Default: read MS2PIP pickles (can be disabled with --no-read_ms2pip_pickle)
-    parser.add_argument(
-        "--read_ms2pip_pickle",
-        dest="read_ms2pip_pickle",
-        help="Read MS2PIP pickles",
-        action="store_true",
-    )
-    parser.add_argument(
-        "--no-read_ms2pip_pickle",
-        dest="read_ms2pip_pickle",
-        help="Do not read MS2PIP pickles",
-        action="store_false",
-    )
-    parser.set_defaults(read_ms2pip_pickle=True)
-
-    parser.add_argument(
-        "--write_correlation_pickles",
-        help="Write correlation pickles",
-        action="store_true",
-        default=False,
-    )
-
-    # Default: read correlation pickles (can be disabled with --no-read_correlation_pickles)
-    parser.add_argument(
-        "--read_correlation_pickles",
-        dest="read_correlation_pickles",
-        help="Read correlation pickles",
-        action="store_true",
-    )
-    parser.add_argument(
-        "--no-read_correlation_pickles",
-        dest="read_correlation_pickles",
-        help="Do not read correlation pickles",
-        action="store_false",
-    )
-    parser.set_defaults(read_correlation_pickles=True)
-
-    # Default: use DeepLC transfer learning (can be disabled with --no-dlc_transfer_learn)
-    parser.add_argument(
-        "--dlc_transfer_learn",
-        dest="dlc_transfer_learn",
-        help="Use DeepLC transfer learning",
-        action="store_true",
-    )
-    parser.add_argument(
-        "--no-dlc_transfer_learn",
-        dest="dlc_transfer_learn",
-        help="Disable DeepLC transfer learning",
-        action="store_false",
-    )
-    parser.set_defaults(dlc_transfer_learn=True)
-
-    parser.add_argument(
-        "--write_full_search_pickle",
-        help="Write full search pickles",
-        action="store_true",
-        default=False,
-    )
-
-    # Default: read full search pickles (can be disabled with --no-read_full_search_pickle)
-    parser.add_argument(
-        "--read_full_search_pickle",
-        dest="read_full_search_pickle",
-        help="Read full search pickles",
-        action="store_true",
-    )
-    parser.add_argument(
-        "--no-read_full_search_pickle",
-        dest="read_full_search_pickle",
-        help="Do not read full search pickles",
-        action="store_false",
-    )
-    parser.set_defaults(read_full_search_pickle=True)
-
-    parser.add_argument(
-        "--fdr_init_search",
-        help="Q-value (FDR) threshold for initial search filtering",
-        type=float,
-        default=0.05,
-    )
-
-    # Additional possible configuration overrides from CLI
-    parser.add_argument(
-        "--sage_basic", help="Override sage basic settings in config", type=str
-    )
-    parser.add_argument(
-        "--mumdia_fdr", help="Override mumdia FDR setting in config", type=float
-    )
-
-    return parser, parser.parse_args()
-
-
-def was_arg_explicitly_provided(parser: argparse.ArgumentParser, arg_name: str) -> bool:
-    """
-    Check if an argument with destination `arg_name` was explicitly provided on the command line.
-
-    Args:
-        parser: ArgumentParser object containing argument definitions
-        arg_name: Destination name of the argument to check
-
-    Returns:
-        True if the argument was explicitly provided, False otherwise
-    """
-    for action in parser._actions:
-        if action.dest == arg_name:
-            for option in action.option_strings:
-                # If any of the option flags for this argument is present in sys.argv, consider it provided.
-                if option in sys.argv:
-                    return True
-    return False
-
-
-def modify_config(
-    config_file: str,
-    result_dir: str,
-    parser: argparse.ArgumentParser,
-    args: argparse.Namespace,
-) -> str:
-    """
-    Load existing JSON (if any), merge with defaults + env + explicit CLI, and write to results.
-
-    Returns path to updated config JSON.
-    """
-    # Load existing configuration if it exists
-    existing_config = None
-    if os.path.exists(config_file):
-        with open(config_file, "r") as file:
-            existing_config = json.load(file)
-    else:
-        log_info(
-            f"Warning: Config file '{config_file}' not found. Using argparse defaults + env + CLI."
-        )
-
-    merged = merge_config_from_sources(existing_config, parser, args)
-
-    return write_updated_config(merged, result_dir)
-
-
-def main() -> str:
-    """
-    Main MuMDIA workflow orchestrator.
-
-    This function coordinates the entire MuMDIA pipeline using argparse + JSON config.
-    """
-    log_info("Parsing command line arguments...")
-    parser, args = parse_arguments()
-
-    log_info("Creating the result directory...")
-    result_dir, result_temp, result_temp_results_initial_search = create_dirs(args)
-
-    log_info("Updating configuration if needed and saving to results folder...")
-    new_config_file = modify_config(
-        args.config_file, result_dir=args.result_dir, parser=parser, args=args
-    )
-
-    log_info("Reading the updated configuration JSON file...")
-    with open(new_config_file, "r") as file:
-        config = json.load(file)
-
-    # Lazy imports for heavy modules to avoid import errors during test collection
-    import mumdia
-    from parsers.parser_mzml import get_ms1_mzml, split_mzml_by_retention_time
-    from parsers.parser_parquet import parquet_reader
-    from peptide_search.wrapper_sage import retention_window_searches, run_sage
-    from prediction_wrappers.wrapper_deeplc import retrain_and_bounds
-    from sequence.fasta import tryptic_digest_pyopenms
-
-    args_dict = config["mumdia"]
-
-    # Configure pickle settings once for the entire workflow
-    pickle_config = PickleConfig(
-        write_deeplc=args_dict["write_deeplc_pickle"],
-        write_ms2pip=args_dict["write_ms2pip_pickle"],
-        write_correlation=args_dict["write_correlation_pickles"],
-        read_deeplc=args_dict["read_deeplc_pickle"],
-        read_ms2pip=args_dict["read_ms2pip_pickle"],
-        read_correlation=args_dict["read_correlation_pickles"],
-    )
-
-    # ============================================================================
-    # STAGE 1: Initial Search for Retention Time Model Training
-    # ============================================================================
-    # The MuMDIA pipeline uses a two-stage search strategy:
-    # 1. Initial broad search: Used to train DeepLC retention time models
-    # 2. Targeted search: Uses RT predictions to partition data for faster, more accurate searches
-
-    # Check if all required initial search pickle files exist
-    initial_search_pickles = [
-        "df_fragment_initial_search.pkl",
-        "df_psms_initial_search.pkl",
-        "df_fragment_max_initial_search.pkl",
-        "df_fragment_max_peptide_initial_search.pkl",
-        "config_initial_search.pkl",
-        "dlc_transfer_learn_initial_search.pkl",
-        "flags_initial_search.pkl",
-    ]
-    initial_search_pickles_exist = all(
-        os.path.exists(result_dir.joinpath(pickle_file))
-        for pickle_file in initial_search_pickles
-    )
-
+    # Get initial search config and mumdia settings
+    initial_config = config_obj.get_initial_search_config()
+    mumdia_config = config_obj.get_mumdia_config()
+    
     # Initialize variables to satisfy type checking and ensure defined in all branches
     df_fragment = pl.DataFrame()
     df_psms = pl.DataFrame()
@@ -331,25 +56,25 @@ def main() -> str:
     df_fragment_max_peptide = pl.DataFrame()
     dlc_transfer_learn = None
 
-    if args_dict["write_initial_search_pickle"] or not initial_search_pickles_exist:
+    if not mumdia_config["read_initial_search_pickle"]:
         log_info("Running initial Sage search for RT model training...")
-        # TODO: Earlier, implement a check whether the mzML file exists, because otherwise Sage will still run on an non-existing file and later on an error will be raised that is not very informative.
+        # TODO: Earlier, implement a check whether the mzML file exists, because 
+        # otherwise Sage will still run on an non-existing file and later on an error 
+        # will be raised that is not very informative.
         run_sage(
-            config["sage_basic"],
-            args_dict["fasta_file"],
-            result_dir.joinpath(result_temp, result_temp_results_initial_search),
+            initial_config,
+            config_obj.fasta_file,
+            result_temp_results_initial_search,
         )
 
         df_fragment, df_psms, df_fragment_max, df_fragment_max_peptide = parquet_reader(
-            parquet_file_results=result_dir.joinpath(
-                result_temp, result_temp_results_initial_search, "results.sage.parquet"
+            parquet_file_results=result_temp_results_initial_search.joinpath(
+                "results.sage.parquet"
             ),
-            parquet_file_fragments=result_dir.joinpath(
-                result_temp,
-                result_temp_results_initial_search,
+            parquet_file_fragments=result_temp_results_initial_search.joinpath(
                 "matched_fragments.sage.parquet",
             ),
-            q_value_filter=args_dict["fdr_init_search"],
+            q_value_filter=config_obj.fdr_init_search,
         )
 
         # Narrow types for static analysis
@@ -358,16 +83,20 @@ def main() -> str:
         assert isinstance(df_fragment_max, pl.DataFrame)
         assert isinstance(df_fragment_max_peptide, pl.DataFrame)
 
+    if mumdia_config["write_initial_search_pickle"]:
+        # Create legacy config format for pickling compatibility
+        legacy_config = config_obj.to_legacy_format()
+        
         pickling.write_variables_to_pickles(
             df_fragment=cast(pl.DataFrame, df_fragment),
             df_psms=cast(pl.DataFrame, df_psms),
             df_fragment_max=cast(pl.DataFrame, df_fragment_max),
             df_fragment_max_peptide=cast(pl.DataFrame, df_fragment_max_peptide),
-            config=config,
+            config=legacy_config,
             dlc_transfer_learn=None,
             pickle_config=pickle_config,
-            write_full_search_pickle=args_dict["write_full_search_pickle"],
-            read_full_search_pickle=args_dict["read_full_search_pickle"],
+            write_full_search_pickle=mumdia_config["write_full_search_pickle"],
+            read_full_search_pickle=mumdia_config["read_full_search_pickle"],
             df_fragment_fname="df_fragment_initial_search.pkl",
             df_psms_fname="df_psms_initial_search.pkl",
             df_fragment_max_fname="df_fragment_max_initial_search.pkl",
@@ -379,7 +108,7 @@ def main() -> str:
             write_to_tsv=False,
         )
 
-    if args_dict["read_initial_search_pickle"]:
+    if mumdia_config["read_initial_search_pickle"]:
         (
             df_fragment,
             df_psms,
@@ -399,9 +128,9 @@ def main() -> str:
             flags_fname="flags_initial_search.pkl",
         )
 
-        del flags["write_full_search_pickle"]
-        del flags["read_full_search_pickle"]
-        args_dict.update(flags)
+        # Update the config object with any flags that were saved
+        # Note: In the new system, flags are handled through the config object
+        # so we don't need to update args_dict like before
 
     # Ensure DataFrames are concrete types for downstream usage
     assert isinstance(df_psms, pl.DataFrame)
@@ -410,15 +139,36 @@ def main() -> str:
     assert isinstance(df_fragment_max_peptide, pl.DataFrame)
 
     log_info("Number of PSMs after initial search: {}".format(len(df_psms)))
+    
+    return df_fragment, df_psms, df_fragment_max, df_fragment_max_peptide, dlc_transfer_learn
 
-    # ============================================================================
-    # STAGE 2: Targeted Search with Retention Time Partitioning
-    # ============================================================================
-    # This stage uses the trained DeepLC model to predict retention times for all
-    # possible peptides, then partitions the mzML data by retention time for
-    # targeted searches that are both faster and more accurate.
 
-    # Check if all required initial search pickle files exist
+def run_targeted_search(config_obj, result_dir, pickle_config, df_fragment, df_psms, df_fragment_max, df_fragment_max_peptide, dlc_transfer_learn):
+    """
+    STAGE 2: Targeted Search with Retention Time Partitioning
+    
+    This stage uses the trained DeepLC model to predict retention times for all
+    possible peptides, then partitions the mzML data by retention time for
+    targeted searches that are both faster and more accurate.
+    
+    Args:
+        config_obj: MuMDIAConfig object
+        result_dir: Result directory path
+        pickle_config: Pickle configuration
+        df_fragment: Fragment DataFrame from initial search
+        df_psms: PSMs DataFrame from initial search
+        df_fragment_max: Fragment max DataFrame from initial search
+        df_fragment_max_peptide: Fragment max peptide DataFrame from initial search
+        dlc_transfer_learn: DeepLC transfer learning model
+    
+    Returns:
+        Tuple of (df_fragment, df_psms, df_fragment_max, df_fragment_max_peptide, dlc_transfer_learn)
+    """
+    # Get full search config and mumdia settings
+    full_config = config_obj.get_full_search_config()
+    mumdia_config = config_obj.get_mumdia_config()
+    
+    # Check if all required full search pickle files exist
     full_search_pickles = [
         "df_fragment.pkl",
         "df_psms.pkl",
@@ -434,59 +184,38 @@ def main() -> str:
         for pickle_file in full_search_pickles
     )
 
-    if args_dict["write_full_search_pickle"] or not full_search_pickles_exist:
-
+    if mumdia_config["write_full_search_pickle"] or not full_search_pickles_exist:
         log_info("Generating peptide library and training DeepLC model...")
-        database_config = config["sage"]["database"]
-        peptides = tryptic_digest_pyopenms(
-            database_config["fasta"],
-            min_len=database_config["enzyme"]["min_len"],
-            max_len=database_config["enzyme"]["max_len"],
-            missed_cleavages=database_config["enzyme"]["missed_cleavages"],
-            decoy_prefix=database_config["decoy_tag"],
-        )
+        peptides = tryptic_digest_pyopenms(config_obj.fasta_file)
 
         # Train DeepLC retention time model and calculate prediction bounds
         # Narrow type for static analysis
         assert isinstance(df_psms, pl.DataFrame)
-        print(args_dict)
         peptide_df, dlc_calibration, dlc_transfer_learn, perc_95 = retrain_and_bounds(
-            cast(pl.DataFrame, df_psms),
-            peptides,
-            result_dir=result_dir,
-            coefficient_bounds=args_dict["coefficient_bounds"],
+            cast(pl.DataFrame, df_psms), peptides, result_dir=result_dir
         )
 
         log_info("Partitioning mzML files by predicted retention time...")
         mzml_dict = split_mzml_by_retention_time(
-            config["sage_basic"]["mzml_paths"][0],  # use configured mzML
+            config_obj.mzml_file,  # use configured mzML
             time_interval=perc_95,
             dir_files=str(result_dir),
         )
 
+        # Create legacy config format for retention window searches
+        legacy_config = config_obj.to_legacy_format()
+        
         (
             df_fragment,
             df_psms,
             df_fragment_max,
             df_fragment_max_peptide,
-        ) = retention_window_searches(mzml_dict, peptide_df, config, perc_95)
+        ) = retention_window_searches(mzml_dict, peptide_df, legacy_config, perc_95)
 
-        log_info("Adding columns ['psm_id', 'scannr', 'stripped_peptide', 'proteins'] from PSMs to fragment df...")
+        log_info("Adding the PSM identifier to fragments...")
         df_fragment = df_fragment.join(
-            df_psms.select(["psm_id", "scannr", "stripped_peptide", "proteins"]), on="psm_id", how="left"
+            df_psms.select(["psm_id", "scannr"]), on="psm_id", how="left"
         )
-
-        log_info("Adding fragment names to fragments...")
-        df_fragment = df_fragment.with_columns(
-            pl.Series(
-                "fragment_name",
-                df_fragment["fragment_type"]
-                + df_fragment["fragment_ordinals"]
-                + "/"
-                + df_fragment["fragment_charge"],
-            )
-        )
-
 
         # Narrow types for static analysis
         assert isinstance(df_fragment, pl.DataFrame)
@@ -499,16 +228,16 @@ def main() -> str:
             df_psms=cast(pl.DataFrame, df_psms),
             df_fragment_max=cast(pl.DataFrame, df_fragment_max),
             df_fragment_max_peptide=cast(pl.DataFrame, df_fragment_max_peptide),
-            config=config,
+            config=legacy_config,
             dlc_transfer_learn=dlc_transfer_learn,
             pickle_config=pickle_config,
-            write_full_search_pickle=args_dict["write_full_search_pickle"],
-            read_full_search_pickle=args_dict["read_full_search_pickle"],
+            write_full_search_pickle=mumdia_config["write_full_search_pickle"],
+            read_full_search_pickle=mumdia_config["read_full_search_pickle"],
             dir=result_dir,
             write_to_tsv=True,
         )
 
-    if args_dict["read_full_search_pickle"]:
+    if mumdia_config["read_full_search_pickle"]:
         (
             df_fragment,
             df_psms,
@@ -518,7 +247,73 @@ def main() -> str:
             dlc_transfer_learn,
             flags,
         ) = pickling.read_variables_from_pickles(dir=result_dir)
-        args_dict.update(flags)
+        # Note: In the new system, flags are handled through the config object
+
+    return df_fragment, df_psms, df_fragment_max, df_fragment_max_peptide, dlc_transfer_learn  
+
+def main() -> str:
+    """
+    Main MuMDIA workflow orchestrator.
+
+    This function coordinates the entire MuMDIA pipeline using the new simplified config system.
+    """
+    import argparse
+    import sys
+    from config import load_config_from_json
+    
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description="Run MuMDIA workflow")
+    parser.add_argument("config_file", help="Path to JSON configuration file")
+    args = parser.parse_args()
+    
+    # Load configuration from JSON file
+    try:
+        config_obj = load_config_from_json(args.config_file)
+        log_info(f"Loaded configuration from {args.config_file}")
+    except Exception as e:
+        log_info(f"Error loading configuration: {e}")
+        sys.exit(1)
+    
+    # Ensure we're in the correct conda environment
+    conda_env = os.environ.get('CONDA_DEFAULT_ENV')
+    if conda_env != 'py312':
+        log_info(f"Warning: Expected conda environment 'py312', but currently in '{conda_env}'")
+        log_info("Please run: conda activate py312")
+    
+    log_info(f"Starting MuMDIA workflow with config file: {args.config_file}")
+    
+    # Create directories
+    result_dir = Path(config_obj.result_dir)
+    result_temp = result_dir / "temp"
+    result_temp_results_initial_search = result_temp / "initial_search_results"
+    
+    # Create all necessary directories
+    result_dir.mkdir(parents=True, exist_ok=True)
+    result_temp.mkdir(parents=True, exist_ok=True)
+    result_temp_results_initial_search.mkdir(parents=True, exist_ok=True)
+    
+    # Get mumdia configuration
+    mumdia_config = config_obj.get_mumdia_config()
+
+    # Configure pickle settings once for the entire workflow
+    pickle_config = PickleConfig(
+        write_deeplc=mumdia_config["write_deeplc_pickle"],
+        write_ms2pip=mumdia_config["write_ms2pip_pickle"],
+        write_correlation=mumdia_config["write_correlation_pickles"],
+        read_deeplc=mumdia_config["read_deeplc_pickle"],
+        read_ms2pip=mumdia_config["read_ms2pip_pickle"],
+        read_correlation=mumdia_config["read_correlation_pickles"],
+    )
+
+    # Run initial search (Stage 1)
+    df_fragment, df_psms, df_fragment_max, df_fragment_max_peptide, dlc_transfer_learn = run_initial_search(
+        config_obj, result_dir, result_temp_results_initial_search, pickle_config
+    )
+
+    # Run targeted search (Stage 2)
+    df_fragment, df_psms, df_fragment_max, df_fragment_max_peptide, dlc_transfer_learn = run_targeted_search(
+        config_obj, result_dir, pickle_config, df_fragment, df_psms, df_fragment_max, df_fragment_max_peptide, dlc_transfer_learn
+    )
 
     # ============================================================================
     # STAGE 3: Feature Calculation and Machine Learning Pipeline
@@ -526,24 +321,8 @@ def main() -> str:
     # Parse mzML to extract MS1 precursor information for additional features
     log_info("Parsing the mzML file for MS1 precursor information...")
     ms1_dict, ms2_to_ms1_dict, ms2_spectra = get_ms1_mzml(
-        config["sage_basic"]["mzml_paths"][0]  # TODO: should be for all mzml files
+        config_obj.mzml_file  # Using the mzml_file from the new config object
     )
-
-    # Add retention time margins to precursor ions by going right and left from
-    # apex retention time in MS2 scans until fragment intensity drops below 1% of apex
-    log_info("Adding retention time margins to precursor ions and fragments...")
-    df_psms, df_fragment = mumdia.add_retention_time_margins_loop(
-        df_psms=df_psms, df_fragment=df_fragment, top_n=100, intensity_threshold=0.01
-    )
-
-    
-    import pickle
-
-    with open("debug/ms1_dict.pkl", "wb") as f:
-        pickle.dump(ms1_dict, f)
-
-    with open("debug/ms2_to_ms1_dict.pkl", "wb") as f:
-        pickle.dump(ms2_to_ms1_dict, f)
 
     # Execute the main MuMDIA feature calculation and machine learning pipeline
     # This includes:
@@ -563,7 +342,7 @@ def main() -> str:
         df_psms=df_psms,
         df_fragment_max=df_fragment_max,
         df_fragment_max_peptide=df_fragment_max_peptide,
-        config=config,
+        config=config_obj.to_legacy_format(),  # Convert to legacy format for compatibility
         deeplc_model=dlc_transfer_learn,
         pickle_config=pickle_config,
         spectra_data=spectra_data,
@@ -573,11 +352,11 @@ def main() -> str:
     # STAGE 4: Optional Cleanup and Final Processing
     # ============================================================================
     # Clean up intermediate files if requested to save disk space
-    if args_dict["remove_intermediate_files"]:
+    if config_obj.remove_intermediate_files:
         log_info("Cleaning up intermediate files...")
-        remove_intermediate_files(args_dict["result_dir"])
+        remove_intermediate_files(config_obj.result_dir)
 
-    return config["mumdia"]["result_dir"]
+    return config_obj.result_dir
 
 
 if __name__ == "__main__":
