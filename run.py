@@ -471,10 +471,22 @@ def main() -> str:
             df_fragment_max_peptide,
         ) = retention_window_searches(mzml_dict, peptide_df, config, perc_95)
 
-        log_info("Adding the PSM identifier to fragments...")
+        log_info("Adding columns ['psm_id', 'scannr', 'stripped_peptide', 'proteins'] from PSMs to fragment df...")
         df_fragment = df_fragment.join(
-            df_psms.select(["psm_id", "scannr"]), on="psm_id", how="left"
+            df_psms.select(["psm_id", "scannr", "stripped_peptide", "proteins"]), on="psm_id", how="left"
         )
+
+        log_info("Adding fragment names to fragments...")
+        df_fragment = df_fragment.with_columns(
+            pl.Series(
+                "fragment_name",
+                df_fragment["fragment_type"]
+                + df_fragment["fragment_ordinals"]
+                + "/"
+                + df_fragment["fragment_charge"],
+            )
+        )
+
 
         # Narrow types for static analysis
         assert isinstance(df_fragment, pl.DataFrame)
@@ -517,6 +529,14 @@ def main() -> str:
         config["sage_basic"]["mzml_paths"][0]  # TODO: should be for all mzml files
     )
 
+    # Add retention time margins to precursor ions by going right and left from
+    # apex retention time in MS2 scans until fragment intensity drops below 1% of apex
+    log_info("Adding retention time margins to precursor ions and fragments...")
+    df_psms, df_fragment = mumdia.add_retention_time_margins_loop(
+        df_psms=df_psms, df_fragment=df_fragment, top_n=100, intensity_threshold=0.01
+    )
+
+    
     import pickle
 
     with open("debug/ms1_dict.pkl", "wb") as f:

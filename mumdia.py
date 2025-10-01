@@ -63,6 +63,8 @@ from prediction_wrappers.wrapper_deeplc import get_predictions_retention_time_ma
 from prediction_wrappers.wrapper_ms2pip import (
     get_predictions_fragment_intensity_main_loop,
 )
+from quantification.lfq import quantify_fragments
+from utilities.plotting import plot_XIC_with_margins, plot_rt_margin_histogram
 from utilities.logger import log_info
 
 # Re-export for backward compatibility
@@ -283,7 +285,7 @@ def run_mokapot(output_dir="results/") -> None:
             f"mokapot is not installed or failed to import ({e}). Skipping mokapot run."
         )
         return None
-    psms = mokapot.read_pin(f"{output_dir}outfile.pin")
+    psms = mokapot.read_pin(f"{output_dir}/outfile.pin")
 
     model = KerasClassifier(
         build_fn=create_model, epochs=100, batch_size=1000, verbose=10
@@ -911,6 +913,233 @@ def add_precursor_intensities(df_psms, ms1_dict, ms2_to_ms1_dict):
     return df_psms
 
 
+def calculate_rt_margins_intensity_based(df_fragments: pl.DataFrame, intensity_threshold: float, output_dir='xics') -> pl.DataFrame:
+    """
+    Calculate retention time margins based on a relative intensity threshold of the apex intensity fragment.
+    The margins are determined by finding the retention times where the fragment intensity
+    drops below the specified fraction of the apex intensity on both sides of the apex.
+    If the intensity never drops below the threshold on one side, the margin is set to the
+    first/last retention time where the most intense fragment was detected.
+    The function also generates and saves a plot of the XIC with the calculated margins.
+
+    Parameters
+    ----------
+    df_fragments : pl.DataFrame
+        DataFrame containing fragment ion information for a single peptidoform.
+    intensity_threshold : float
+        Intensity threshold (as a fraction of apex intensity) to define retention time margins.
+    output_dir : str
+        Directory to save the XIC plots with margins.
+    Returns
+    -------
+    left_bound : float
+        Left retention time margin.
+    right_bound : float
+        Right retention time margin.
+    apex_rt : float
+        Retention time at apex intensity.
+    """
+
+    # Sort by rt
+    df_sorted = df_fragments.sort("rt")
+    # Find apex
+    apex_idx = df_sorted["fragment_intensity"].arg_max()
+    apex_rt = df_sorted["rt"][apex_idx]
+    apex_intensity = df_sorted["fragment_intensity"][apex_idx]
+    # Threshold value
+    cutoff = intensity_threshold * apex_intensity
+    apex_fragment_name = df_sorted["fragment_name"][apex_idx]
+
+    # Left of apex
+    left_df = df_sorted.filter(pl.col("fragment_name") == apex_fragment_name)  # only consider the apex fragment
+    apex_idx_left = left_df["fragment_intensity"].arg_max()
+    left_df = left_df[:apex_idx_left][::-1]  # reverse to go from apex down
+    left_bound = apex_rt
+
+    for rt, intensity in zip(left_df["rt"], left_df["fragment_intensity"]):
+        if intensity < cutoff:
+            left_bound = rt
+            break
+
+    # if the left bound is still the apex rt, set it to the first rt where fragment was detected
+    if left_bound == apex_rt and len(left_df) > 0:
+        left_bound = left_df["rt"][-1]
+
+    # Right of apex
+    right_df = df_sorted.filter(pl.col("fragment_name") == apex_fragment_name)  # only consider the apex fragment
+    apex_idx_right = right_df["fragment_intensity"].arg_max()
+    right_df = right_df[apex_idx_right+1:]
+    right_bound = apex_rt
+    for rt, intensity in zip(right_df["rt"], right_df["fragment_intensity"]):
+        if intensity < cutoff:
+            right_bound = rt
+            break
+
+    # if the right bound is still the apex rt, set it to the last rt where fragment was detected
+    if right_bound == apex_rt and len(right_df) > 0:
+        right_bound = right_df["rt"][-1]
+
+    # plot XIC with the margins
+    # plot_XIC_with_margins(df_sorted, output_dir=output_dir, adapted_interval=(left_bound, right_bound), apex_rt=apex_rt, cutoff=cutoff)
+
+    return left_bound, right_bound, apex_rt
+
+
+def calculate_min_max_margins(df_psms: pl.DataFrame, df_fragments: pl.DataFrame, top_n: int = 100, intensity_threshold: float = 0.01) -> dict:
+    """
+    Calculate the retention time distribution of the top N peptidoforms (with at least 6 PSMs, and then ranked by spectrum peptide q value)
+    Min and max margins are defined as the 5th and 95th percentiles of the distribution of retention time margins
+    across the top N peptidoforms.
+    Returns a tuple with (min_diff, max_diff).
+
+    Parameters
+    ----------
+    df_psms : pl.DataFrame
+        DataFrame containing PSM information
+    df_fragments : pl.DataFrame
+        DataFrame containing fragment ion information
+    top_n : int, optional
+        Number of top peptidoforms to consider based on the lowest 'peptide_q' value (default is 100).
+    intensity_threshold : float, optional
+        Intensity threshold (as a fraction of apex intensity) to define retention time margins (default is 0.01).
+    """
+
+    # Step 1: Identify the 100 best scoring peptidoforms based on sage qvalue
+    # group by peptide and charge to get unique peptidoforms, aggregate number of PSMs, keep min peptide_q
+
+    df_top_peptidoforms = (
+        df_psms.group_by(["peptide", "charge"])
+        .agg(
+            [pl.count().alias("num_psms"), pl.min("peptide_q").alias("min_peptide_q")]
+        )
+        .sort("min_peptide_q")
+    )
+
+    # filter for peptidoforms with at least 6 PSMs
+    df_top_peptidoforms = df_top_peptidoforms.filter(pl.col("num_psms") >= 6)
+
+    # get the top N peptidoforms
+    df_top_peptidoforms = df_top_peptidoforms.head(top_n)
+
+    # Step 2: Extract the retention times of the entire XICs from df_fragments of these peptidoforms
+    df_fragments_top100 = df_fragments.filter(pl.col("peptide").is_in(df_top_peptidoforms["peptide"]) & pl.col("charge").is_in(df_top_peptidoforms["charge"]))
+    diffs = []
+
+    for (peptidoform, charge), df_fragments_top100_sub in tqdm(
+                df_fragments_top100.group_by(["peptide", "charge"])
+            ):
+        left_bound, right_bound, apex_rt = calculate_rt_margins_intensity_based(df_fragments_top100_sub, intensity_threshold, output_dir='debug/calibration_xics')
+        left_diff = apex_rt - left_bound
+        right_diff = right_bound - apex_rt
+        diffs.append(left_diff)
+        diffs.append(right_diff)
+
+    # remove 0 diffs (if the apex is at the start or end of the XIC)
+    diffs = [d for d in diffs if d > 0]
+
+    # Step 3: Calculate the min and max retention times across all these XICs
+    if len(diffs) == 0:
+        log_info("Could not calibrate retention time margins, using default values.")
+        min_diff = 0.02
+        max_diff = 0.2
+    else:
+        # get 5th and 95th percentiles
+        min_diff = np.percentile(diffs, 5)
+        max_diff = np.percentile(diffs, 95)
+        log_info(f"Using min and max retention time margins: {min_diff}, {max_diff}")
+
+    # plot histogram of diffs
+    plot_rt_margin_histogram(diffs, output_dir='debug/calibration_xics', min_diff=min_diff, max_diff=max_diff)
+
+    return min_diff, max_diff
+
+
+def add_retention_time_margins(df_psms: pl.DataFrame, df_fragment: pl.DataFrame, min_diff: float, max_diff: float, intensity_threshold: float) -> pl.DataFrame:
+    """
+    Add retention time margin features to the PSM DataFrame.
+    """
+
+    pept2lowermargins = {}
+    pept2highermargins = {}
+
+    log_info("Calculating adapted retention time margins based on intensity for all peptides")
+
+    for (peptidoform, charge), df_fragments_sub in tqdm(
+                df_fragment.group_by(["peptide", "charge"])
+            ):
+
+        # speed up: skip peptidoforms with only 1 PSM
+        if df_fragments_sub['psm_id'].n_unique() < 2:
+            pept2lowermargins[(peptidoform, charge)] = np.nan
+            pept2highermargins[(peptidoform, charge)] = np.nan
+            continue
+
+        intensity_based_margins = calculate_rt_margins_intensity_based(df_fragments_sub, intensity_threshold, output_dir='xics')
+        left_bound, right_bound, apex_rt = intensity_based_margins
+
+        # check if the intensity based margins are higher than max or lower than min
+        left_diff = apex_rt - left_bound
+        right_diff = right_bound - apex_rt
+
+        if left_diff < min_diff:
+            left_bound = apex_rt - min_diff
+        if right_diff < min_diff:
+            right_bound = apex_rt + min_diff
+        if left_diff > max_diff:
+            left_bound = apex_rt - max_diff
+        if right_diff > max_diff:
+            right_bound = apex_rt + max_diff
+
+        pept2lowermargins[(peptidoform, charge)] = left_bound
+        pept2highermargins[(peptidoform, charge)] = right_bound
+
+    log_info("Adding retention time margin features to PSM DataFrame...")
+
+    # add rt_lower_margin and rt_higher_margin to df_psms
+    df_psms = df_psms.with_columns(
+        [
+            pl.struct(["peptide", "charge"])
+            .map_elements(lambda row: pept2lowermargins.get((row["peptide"], row["charge"]), np.nan))
+            .alias("rt_lower_margin"),
+            pl.struct(["peptide", "charge"])
+            .map_elements(lambda row: pept2highermargins.get((row["peptide"], row["charge"]), np.nan))
+            .alias("rt_higher_margin")
+        ]
+    )
+
+    log_info("Adding retention time margin features to Fragment DataFrame...")
+
+    # add rt_lower_margin and rt_higher_margin to df_fragment
+    df_fragment = df_fragment.with_columns(
+        [
+            pl.struct(["peptide", "charge"])
+            .map_elements(lambda row: pept2lowermargins.get((row["peptide"], row["charge"]), np.nan))
+            .alias("rt_lower_margin"),
+            pl.struct(["peptide", "charge"])
+            .map_elements(lambda row: pept2highermargins.get((row["peptide"], row["charge"]), np.nan))
+            .alias("rt_higher_margin")
+        ]
+    )
+
+    return df_psms, df_fragment
+
+
+def add_retention_time_margins_loop(df_psms: pl.DataFrame, df_fragment: pl.DataFrame, top_n: int = 10, intensity_threshold: float = 0.05) -> pl.DataFrame:
+    """
+    Add retention time margin features to the PSM DataFrame.
+    """
+    log_info("Calculating min max retention time margins based on intensity...")
+    # Step 1: Calculate min and max retention time window based on top 100 peptidoforms
+    min_diff, max_diff = calculate_min_max_margins(df_psms, df_fragment, top_n, intensity_threshold)
+
+    # Step 2: Calculate adapted margins for each PSM based on the intensity of the most intense fragment
+    # and use the retention time distribution as min and max
+    log_info("Adding retention time margin features to PSM DataFrame...")
+    df_psms, df_fragment = add_retention_time_margins(df_psms, df_fragment, min_diff, max_diff, intensity_threshold)
+
+    return df_psms, df_fragment
+
+
 def calculate_features(
     df_psms: pl.DataFrame,
     df_fragment: pl.DataFrame,
@@ -993,6 +1222,23 @@ def calculate_features(
         .unique(subset=["peptide", "charge"], keep="first")
     )
 
+    log_info("Regenerated df_fragment_max_peptide:")
+    log_info("  Shape: {}".format(df_fragment_max_peptide.shape))
+    log_info("  Sample entries:")
+    #for row in df_fragment_max_peptide.head(3).iter_rows(named=True):
+    #    log_info(
+    #        "    Peptide: {}, Charge: {}, PSM ID: {}, RT: {}, Fragment Intensity: {}".format(
+    #            row["peptide"],
+    #            row["charge"],
+    #            row["psm_id"],
+    #            row["rt"],
+    #            row["fragment_intensity"],
+    #        )
+    #    )
+
+    log_info(
+        "Counting individual peptides per MS2 and filtering by minimum occurrences"
+    )
     df_psms = add_count_and_filter_peptides(df_psms, min_occurrences)
 
     # Filter df_fragment to only include PSMs that passed all filtering
@@ -1147,6 +1393,7 @@ def calculate_features(
         f"{config['mumdia']['result_dir']}/outfile.pin", separator="\t"
     )
 
+    return df_fragment, df_psms
 
 def main(
     df_fragment: Optional[pl.DataFrame] = None,
@@ -1181,7 +1428,7 @@ def main(
     df_psms = df_psms.filter(~df_psms["peptide"].str.contains("U"))
     df_psms = df_psms.sort("rt")
 
-    calculate_features(
+    df_fragment, df_psms = calculate_features(
         df_psms,
         df_fragment,
         df_fragment_max,
@@ -1193,8 +1440,21 @@ def main(
     )
 
     log_info("Done running MuMDIA...")
-    # run_mokapot(output_dir=config["mumdia"]["result_dir"])
+    mokapot_results = run_mokapot(output_dir=config["mumdia"]["result_dir"])
 
+    df_fragment.write_csv("debug/df_fragment_before_quant.tsv", separator="\t")
+    df_psms.write_csv("debug/df_psms_before_quant.tsv", separator="\t")
+
+    # this file will later be used for quantification of proteins with directLFQ (combined with all runs)
+    if mokapot_results is not None and isinstance(mokapot_results, (list, tuple)) and len(mokapot_results) > 1:
+        df_quant_fragment = quantify_fragments(
+            df_fragment,
+            mokapot_results[1],
+            config=config,
+            output_dir=config["mumdia"]["result_dir"]
+        )
+    else:
+        logging.warning("mokapot_results is None or does not have enough elements; skipping quantification step.")
 
 if __name__ == "__main__":
     # In practice, load your input DataFrames (e.g., from parquet files) and then call main().

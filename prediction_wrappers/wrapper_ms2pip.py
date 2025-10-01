@@ -177,14 +177,4 @@ def get_predictions_fragment_intensity_main_loop(
 
     log_info("Df_fragment shape after filtering: {}".format(df_fragment.shape))
 
-    df_fragment = df_fragment.with_columns(
-        pl.Series(
-            "fragment_name",
-            df_fragment["fragment_type"]
-            + df_fragment["fragment_ordinals"]
-            + "/"
-            + df_fragment["fragment_charge"],
-        )
-    )
-
     return df_fragment, ms2pip_predictions
