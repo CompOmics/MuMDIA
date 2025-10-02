@@ -114,7 +114,8 @@ def write_variables_to_pickles(
             },
             f,
         )
-    input("TSVs written. Press to continue")
+    # Remove interactive input to make function testable
+    # input("TSVs written. Press to continue")
 
 
 def read_variables_from_pickles(
