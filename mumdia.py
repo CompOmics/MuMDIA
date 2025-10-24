@@ -244,7 +244,7 @@ def pearson_np_nb(x, y):
 #############################################
 
 
-def create_model():
+def create_model(n_features):
     """
     Create and compile a simple Keras model.
     """
@@ -257,7 +257,7 @@ def create_model():
         )
 
     model = Sequential()
-    model.add(Dense(100, input_dim=69, activation="relu"))
+    model.add(Dense(100, input_dim=n_features, activation="relu"))
     model.add(Dense(50, activation="relu"))
     model.add(Dense(20, activation="relu"))
     model.add(Dense(1, activation="sigmoid"))
@@ -287,8 +287,10 @@ def run_mokapot(output_dir="results/") -> None:
         return None
     psms = mokapot.read_pin(f"{output_dir}/outfile.pin")
 
+    n_features = psms.features.shape[1]
+
     model = KerasClassifier(
-        build_fn=create_model, epochs=100, batch_size=1000, verbose=10
+        build_fn=create_model(n_features), epochs=100, batch_size=1000, verbose=10
     )
     results, models = mokapot.brew(psms, mokapot.Model(model), folds=3)  # psms)
     result_files = results.to_txt(dest_dir=output_dir)
