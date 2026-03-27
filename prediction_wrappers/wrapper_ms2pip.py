@@ -33,12 +33,15 @@ from utilities.logger import log_info
 
 def plot_performance(psm_list, preds, outfile="plot.png"):
     """
-    Create a scatter plot comparing observed vs predicted retention times.
+    Create a scatter plot comparing observed vs predicted values.
+
+    Note: This function is a copy from wrapper_deeplc.py. In this MS2PIP
+    context it plots retention times, not fragment intensities.
 
     Args:
-        psm_list: List of PSM objects with retention_time attributes
-        preds: Array of predicted retention times
-        outfile: Output filename for the plot (default: "plot.png")
+        psm_list: List of PSM objects with retention_time attributes.
+        preds: Array of predicted retention times.
+        outfile: Output filename for the plot (default: "plot.png").
     """
     plt.scatter([v.retention_time for v in psm_list], preds, s=3, alpha=0.05)
     plt.xlabel("Observed retention time (min)")
@@ -71,6 +74,9 @@ def batch_process_predict_batch(
 
     results = []
     for batch in tqdm(batches):
+        # HCD2021 is hardcoded because MuMDIA targets HCD (Higher-energy Collisional
+        # Dissociation) fragmentation data; this is the most current MS2PIP model for
+        # that fragmentation type and covers the vast majority of proteomics workflows.
         results.extend(process_function(batch, processes=n_processes, model="HCD2021"))
 
     return results
@@ -116,16 +122,20 @@ def get_predictions_fragment_intensity(df_psms):
     for pred in ms2pip_predictions:
         k = str(pred.psm.peptidoform)  # Use peptidoform as key
         try:
-            # Convert b-ion predictions from log2 scale and create fragment keys
+            # MS2PIP returns intensities in log2 scale; convert back to linear with 2**v.
+            # Fragment keys follow the format "<ion_type><position>/<charge>", e.g. "b1/1"
+            # means b-ion at position 1 with charge 1. These keys match the fragment
+            # notation used elsewhere in MuMDIA for spectral matching and scoring.
             ms2pip_predictions_dict[k] = dict(
                 [
-                    ("b%s/1" % (idx + 1), 2**v)  # Convert log2 back to linear scale
+                    ("b%s/1" % (idx + 1), 2**v)
                     for idx, v in enumerate(pred.predicted_intensity["b"])
                 ]
             )
-        except:
-            print(k)
+        except Exception as e:
+            log_info(f"MS2PIP b-ion prediction failed for {k}: {e}")
         try:
+            # Same log2-to-linear conversion for y-ions
             ms2pip_predictions_dict[k].update(
                 dict(
                     [
@@ -134,8 +144,8 @@ def get_predictions_fragment_intensity(df_psms):
                     ]
                 )
             )
-        except:
-            print(k)
+        except Exception as e:
+            log_info(f"MS2PIP y-ion prediction failed for {k}: {e}")
 
     return ms2pip_predictions_dict
 
@@ -148,11 +158,21 @@ def get_predictions_fragment_intensity_main_loop(
     output_dir: str = None,
 ) -> pl.DataFrame:
     """
-    Get fragment intensity predictions using MS2PIP.
+    Get fragment intensity predictions using MS2PIP, with pickle caching.
+
+    Generates MS2PIP predictions for all unique peptide/charge combinations,
+    then filters df_fragment to only include PSMs present in df_psms.
+
     Args:
-        df_psms: PSM dataframe with the following columns:
-            - peptide: Peptide sequence
-            - spectrum_id: Spectrum ID
+        df_psms: PSM DataFrame with columns: peptide, charge, rt.
+        df_fragment: Fragment DataFrame with psm_id column (filtered to match df_psms).
+        read_ms2pip_pickle: Load cached predictions from pickle (default: False).
+        write_ms2pip_pickle: Save predictions to pickle (default: False).
+        output_dir: Directory for pickle cache files.
+
+    Returns:
+        Tuple of (df_fragment, ms2pip_predictions) where df_fragment is filtered
+        and ms2pip_predictions is Dict[peptidoform, Dict[fragment_key, intensity]].
     """
 
     if not read_ms2pip_pickle or not os.path.exists(

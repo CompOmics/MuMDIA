@@ -1,3 +1,5 @@
+"""Rich-based logging with elapsed time tracking since pipeline start."""
+
 import datetime
 import logging
 
@@ -20,6 +22,7 @@ logging.basicConfig(
 
 
 def log_info(message):
+    """Print a timestamped message with elapsed time since module import."""
     current_time = datetime.datetime.now()
     elapsed = current_time - start_time
     # Simple console logging without complex Rich markup

@@ -1,3 +1,5 @@
+"""Experimental Lasso-based spectral deconvolution for DIA spectra (not integrated into main pipeline)."""
+
 import random
 
 import numpy as np

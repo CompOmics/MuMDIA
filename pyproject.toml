@@ -75,10 +75,8 @@ exclude = [
 [tool.setuptools]
 py-modules = [
     "mumdia",
-    "run", 
+    "run",
     "data_structures",
-    "example_usage",
-    "time_script"
 ]
 
 [project.optional-dependencies]

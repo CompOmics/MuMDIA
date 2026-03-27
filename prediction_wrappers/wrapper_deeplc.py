@@ -30,6 +30,8 @@ from matplotlib import pyplot as plt
 from psm_utils.psm import PSM
 from psm_utils.psm_list import PSMList
 
+from utilities.logger import log_info
+
 
 def plot_performance(
     psm_list: PSMList, preds: np.ndarray, outfile: str = "plot.png"
@@ -193,6 +195,9 @@ def retrain_deeplc(
     # Perform calibration, make predictions and calculate metrics
     preds = dlc_calibration.make_preds(psm_list_calib, calibrate=True)
 
+    # Percentile-based filtering: remove the worst-predicted PSMs (top 5% by default)
+    # before transfer learning. These outliers are likely misidentifications or
+    # chromatographic anomalies that would degrade the transfer-learned model.
     errors = abs(np.array(preds) - np.array([v.retention_time for v in psm_list_calib]))
     selection = errors < np.percentile(errors, percentile_exclude)
     psm_list_calib_filtered_percentile = [
@@ -221,6 +226,9 @@ def retrain_deeplc(
             outfile=outfile_transf_learn,
         )
 
+    # Return the 95th percentile of absolute RT errors, doubled (* 2) to create a
+    # symmetric window: the value will later be split into +/- halves around the
+    # predicted RT, so doubling here ensures each side covers the 95th-percentile error.
     return (
         dlc_calibration,
         dlc_transfer_learn,
@@ -288,6 +296,11 @@ def get_predictions_retentiontime(
     # Perform calibration, make predictions and calculate metrics
     preds = dlc_calibration.make_preds(psm_list_calib, calibrate=True)
 
+    # Use the 50th percentile (median) here -- more aggressive filtering than
+    # retrain_deeplc's 95th percentile. This keeps only the better-predicted half
+    # of PSMs for transfer learning, producing a tighter model at the cost of
+    # discarding more training data. Suitable for the prediction pathway where
+    # model accuracy matters more than the RT error bound estimate.
     errors = abs(np.array(preds) - np.array([v.retention_time for v in psm_list_calib]))
     selection = errors < np.percentile(errors, percentile_exclude)
     psm_list_calib_filtered_percentile = [
@@ -365,15 +378,20 @@ def get_predictions_retention_time_mainloop(
         - dlc_transfer_learn: Transfer learning DeepLC model (None if using pre-trained model)
         - predictions_deeplc: DataFrame with retention time predictions
     """
-    # If you need to write a pickle with predictions or if you are not writing or reading a pickle
+    # Three code paths:
+    # 1. write_deeplc_pickle=True: train/predict now, then save to disk below.
+    # 2. Both False: train/predict now, no caching -- normal non-cached run.
+    # 3. read_deeplc_pickle=True: skip this block entirely, load from disk below.
     if write_deeplc_pickle or (not write_deeplc_pickle and not read_deeplc_pickle):
         if deeplc_model is None:  # When does this happen?
+            # No pre-trained model supplied -- train from scratch via full pipeline
             (
                 dlc_calibration,
                 dlc_transfer_learn,
                 predictions_deeplc,
             ) = get_predictions_retentiontime(df_psms)
         else:
+            # Pre-trained model supplied -- only run inference, skip training
             predictions_deeplc = predict_deeplc_pl(df_psms, deeplc_model)
 
     # If you need to write a pickle
@@ -386,6 +404,10 @@ def get_predictions_retention_time_mainloop(
         with open(f"{output_dir}/predictions_deeplc.pkl", "wb") as f:
             pickle.dump(predictions_deeplc, f)
     if read_deeplc_pickle:
+        # NOTE: The pickle filenames use a "_first" suffix (e.g. dlc_calibration_first.pkl)
+        # which does not match the filenames written above (dlc_calibration.pkl).
+        # This means reading will only succeed if the files were saved under the
+        # "_first" names by an earlier pipeline stage. See FIXME below.
         try:
             with open(f"{output_dir}/dlc_calibration_first.pkl", "rb") as f:
                 dlc_calibration = pickle.load(f)
@@ -439,16 +461,21 @@ def retrain_and_bounds(
         outfile_calib=result_dir.joinpath("deeplc_calibration.png"),
         outfile_transf_learn=result_dir.joinpath("deeplc_transfer_learn.png"),
     )
+    # Convert perc_95 from DeepLC's native unit (minutes) to mzML time units
+    # (seconds by default, factor=60). coefficient_bounds allows further scaling.
     perc_95 = perc_95 * correct_to_mzml_rt_constant * coefficient_bounds
-    print(f"Percentile 95: {perc_95}")
+    log_info(f"RT window (perc_95): {perc_95}")
     predictions = predict_deeplc(peptides, dlc_transfer_learn)
 
     peptide_df = pd.DataFrame(
         peptides, columns=["protein", "start", "end", "id", "peptide"]
     )
+    # Also convert per-peptide predictions from minutes to mzML seconds
     peptide_df["predictions"] = predictions
     peptide_df["predictions"] = peptide_df["predictions"] * correct_to_mzml_rt_constant
     # peptide_df.to_csv("peptide_predictions.csv", index=False)
+    # Build a symmetric RT window: perc_95 is the full window width (already doubled
+    # in retrain_deeplc), so divide by 2 to get the half-width for +/- bounds.
     peptide_df["predictions_lower"] = peptide_df["predictions"] - perc_95 / 2.0
     peptide_df["predictions_upper"] = peptide_df["predictions"] + perc_95 / 2.0
 

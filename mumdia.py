@@ -77,9 +77,6 @@ os.environ["POLARS_MAX_THREADS"] = "1"
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
 
-# Constant features for later concatenation.
-last_features = ["proteins"]
-
 
 #############################################
 # Numba-accelerated functions
@@ -185,12 +182,15 @@ def compute_top_nb_idx(data, m, idx_ret_list):
     If there are fewer than m elements, pad with zeros.
     """
     n = data.shape[0]
-    sorted_data = np.sort(data)[::-1]
+    sorted_data = np.sort(data)[::-1]  # Descending sort
     result = np.empty(m, dtype=np.float64)
     result_idx = np.empty(m, dtype=np.float64)
     for i in range(m):
         if i < n:
             result[i] = sorted_data[i]
+            # NOTE: This is a no-op (self-assignment). The idx_ret_list indices
+            # are not reordered to match the sorted values. This means the index
+            # tracking does not correspond to the actual top-k positions.
             idx_ret_list[i] = idx_ret_list[i]
         else:
             result[i] = 0.0
@@ -202,6 +202,9 @@ def compute_top_nb_idx(data, m, idx_ret_list):
 def corr_np_nb(data1, data2):
     """
     Compute the Pearson correlation coefficient between two 1D arrays.
+
+    WARNING: No zero-variance guard — will produce NaN/inf if either array
+    is constant. Use corr_np_nb_new() for a safe version.
     """
     n = data1.shape[0]
     sum1 = 0.0
@@ -223,6 +226,7 @@ def corr_np_nb(data1, data2):
         var2 += diff2 * diff2
     std1 = (var1 / n) ** 0.5
     std2 = (var2 / n) ** 0.5
+    # Division by zero if either std is 0 (constant array) — no guard here
     return cov / n / (std1 * std2)
 
 
@@ -256,11 +260,14 @@ def create_model():
             f"Keras is required to build the model for mokapot integration ({e})."
         )
 
+    # NOTE: input_dim=69 may be stale — the actual PIN file feature count depends
+    # on which Sage columns are present after collapse (~95-105 features).
+    # If this mismatches, Keras will raise an InputSpec error at training time.
     model = Sequential()
     model.add(Dense(100, input_dim=69, activation="relu"))
     model.add(Dense(50, activation="relu"))
     model.add(Dense(20, activation="relu"))
-    model.add(Dense(1, activation="sigmoid"))
+    model.add(Dense(1, activation="sigmoid"))  # Binary output: target vs decoy
     model.compile(loss="binary_crossentropy", optimizer="adam", metrics=["accuracy"])
     return model
 
@@ -305,8 +312,15 @@ def collapse_columns(
     get_first_entry: List[str] = [],
 ):
     """
-    Collapse columns using max, min, mean, and sum operations.
+    Collapse multiple PSM rows for one peptidoform into a single feature row.
+
+    Takes all PSMs for a peptidoform and produces one row by:
+    - Taking the first row's values for metadata columns (get_first_entry)
+    - Aggregating numeric columns via max/min/mean/sum, suffixed as e.g. "hyperscore_max"
+
+    Returns a 1-row DataFrame with all collapsed columns concatenated horizontally.
     """
+    # Take metadata from the first PSM row (arbitrary — these are identical per peptidoform)
     collapsed_columns = [df_psms_sub_peptidoform.select(get_first_entry).head(1)]
     operations = (
         ("max", collapse_max_columns),
@@ -316,11 +330,13 @@ def collapse_columns(
     )
     for op, collapse_list in operations:
         if collapse_list:
+            # Apply aggregation across all rows, rename columns with suffix
             collapsed_columns.append(
                 getattr(df_psms_sub_peptidoform[collapse_list], op)().rename(
                     {col: f"{col}_{op}" for col in collapse_list}
                 )
             )
+    # Horizontal concat: one metadata block + one block per aggregation type
     return pl.concat(collapsed_columns, how="horizontal")
 
 
@@ -473,7 +489,15 @@ def run_peptidoform_df(
     ],
 ) -> pl.DataFrame:
     """
-    Process a peptidoform DataFrame to add calculated features.
+    Collapse all PSMs for one peptidoform into a single feature row for the PIN file.
+
+    Takes a peptidoform-grouped sub-DataFrame containing multiple PSMs and:
+    1. Collapses numeric Sage score columns via max/min/mean/sum aggregation
+    2. Converts is_decoy (bool) to Label format (-1 for decoy, +1 for target)
+    3. Creates SpecId as "psm_id|filename|scannr" (unique peptidoform identifier)
+
+    The collapse_*_columns defaults define which Sage output columns get which
+    aggregation. These are hardcoded here and NOT read from the config system.
     """
     df_psms_sub_peptidoform_collapsed = collapse_columns(
         df_psms_sub_peptidoform,
@@ -484,12 +508,6 @@ def run_peptidoform_df(
         get_first_entry=get_first_entry,
     )
 
-    # log_info(
-    #     "df_psms_sub_peptidoform_collapsed shape: {}".format(
-    #         df_psms_sub_peptidoform_collapsed.shape
-    #     )
-    # )
-    # log_info(df_psms_sub_peptidoform_collapsed)
     df_psms_sub_peptidoform_collapsed = df_psms_sub_peptidoform_collapsed.with_columns(
         pl.when(pl.col("is_decoy")).then(-1).otherwise(1).alias("is_decoy")
     )
@@ -578,6 +596,17 @@ def corr_np_nb_new(data1: np.ndarray, data2: np.ndarray) -> float:
 
 @nb.njit
 def corr_np_with_n_new(data1, data2):
+    """
+    Compute Pearson correlation coefficient and return both the correlation
+    and the number of datapoints used.
+
+    Args:
+        data1: First 1D array.
+        data2: Second 1D array (same length as data1).
+
+    Returns:
+        Tuple of (correlation_coefficient, n) where n is the array length.
+    """
     n = data1.shape[0]
     # Compute correlation as before
     sum1 = 0.0
@@ -625,14 +654,6 @@ def run_peptidoform_correlation(
         sum_pred_frag_intens,
         correlation_matrix_psm_ids,
         correlation_matrix_frag_ids,
-        # correlation_matrix_psm_ids_ignore_zeros,
-        # correlation_matrix_psm_ids_ignore_zeros_counts,
-        # correlation_matrix_psm_ids_missing,
-        # correlation_matrix_psm_ids_missing_zeros_counts,
-        # correlation_matrix_frag_ids_ignore_zeros,
-        # correlation_matrix_frag_ids_ignore_zeros_counts,
-        # correlation_matrix_frag_ids_missing,
-        # correlation_matrix_frag_ids_missing_zeros_counts,
         most_intens_cor,
         most_intens_cos,
         mse_avg_pred_intens,
@@ -682,6 +703,8 @@ def run_peptidoform_correlation(
             [],
         ),
         ([most_intens_cos], "top_correlation_cos", [1], "top", pad_size, []),
+        # BUG: Same feature name "top_correlation_cos" as above — Pearson overwrites cosine.
+        # Should likely be "top_correlation_pearson" or "top_correlation_cor".
         ([most_intens_cor], "top_correlation_cos", [1], "top", pad_size, []),
         ([mse_avg_pred_intens], "mse_avg_pred_intens", [1], "top", pad_size, []),
         (
@@ -695,10 +718,6 @@ def run_peptidoform_correlation(
         (correlations, "top_correlation_individual", collect_top, "top", pad_size, []),
     ]
     for data, feat_name, values, method, ps, add_index in params:
-        # Here, for percentiles and top values, we use the Numba-accelerated add_feature_columns_nb.
-        # log_info(
-        #     f"Adding feature {feat_name} with method {method} and values {values}."
-        # )
         feature_dict.update(
             add_feature_columns_nb(
                 data, feat_name, values, method, add_index, pad_size=ps
@@ -825,6 +844,23 @@ def find_all_three_isotopic_peaks(
 def add_precursor_intensities_optimized_parallel(
     df_psms, ms1_dict, ms2_to_ms1_dict, max_workers=8
 ):
+    """
+    Add M-1, M, and M+1 precursor isotope peak intensities to the PSM DataFrame
+    using parallel processing.
+
+    For each unique (scannr, charge, calcmass) combination, looks up the
+    preceding MS1 spectrum and extracts the maximum intensity within a 20 ppm
+    tolerance window for each isotopic peak.
+
+    Args:
+        df_psms: Polars DataFrame with columns: scannr, charge, calcmass.
+        ms1_dict: Dict mapping MS1 scan IDs to {mz, intensity, retention_time}.
+        ms2_to_ms1_dict: Dict mapping MS2 scan IDs to preceding MS1 scan IDs.
+        max_workers: Number of threads for ThreadPoolExecutor (default: 8).
+
+    Returns:
+        df_psms with added columns: M-1, M, M+1 (precursor isotope intensities).
+    """
     # 1. Extract unique precursor combinations
     unique_precursors = df_psms.select(["scannr", "charge", "calcmass"]).unique()
 
@@ -834,12 +870,14 @@ def add_precursor_intensities_optimized_parallel(
             row["scannr"],
             row["charge"],
             row["calcmass"],
-        )  # Should this not be expmass?
+        )  # NOTE: uses calcmass (theoretical) not expmass (observed). See also line 933.
         if scannr not in ms2_to_ms1_dict:
             return {"M-1": 0.0, "M": 0.0, "M+1": 0.0}
+        # Look up the MS1 spectrum that immediately preceded this MS2 scan
         spectrum = ms1_dict.get(ms2_to_ms1_dict[scannr], {})
         if not spectrum:
             return {"M-1": 0.0, "M": 0.0, "M+1": 0.0}
+        # Convert neutral mass to m/z: m/z = (mass / z) + proton_mass
         target_mz = (calcmass / charge) + 1.007276466812
         return find_all_three_isotopic_peaks(
             spectrum, target_mz, charge, return_intensity=True
@@ -913,7 +951,9 @@ def add_precursor_intensities(df_psms, ms1_dict, ms2_to_ms1_dict):
     return df_psms
 
 
-def calculate_rt_margins_intensity_based(df_fragments: pl.DataFrame, intensity_threshold: float, output_dir='xics') -> pl.DataFrame:
+def calculate_rt_margins_intensity_based(
+    df_fragments: pl.DataFrame, intensity_threshold: float, output_dir="xics"
+) -> pl.DataFrame:
     """
     Calculate retention time margins based on a relative intensity threshold of the apex intensity fragment.
     The margins are determined by finding the retention times where the fragment intensity
@@ -951,7 +991,9 @@ def calculate_rt_margins_intensity_based(df_fragments: pl.DataFrame, intensity_t
     apex_fragment_name = df_sorted["fragment_name"][apex_idx]
 
     # Left of apex
-    left_df = df_sorted.filter(pl.col("fragment_name") == apex_fragment_name)  # only consider the apex fragment
+    left_df = df_sorted.filter(
+        pl.col("fragment_name") == apex_fragment_name
+    )  # only consider the apex fragment
     apex_idx_left = left_df["fragment_intensity"].arg_max()
     left_df = left_df[:apex_idx_left][::-1]  # reverse to go from apex down
     left_bound = apex_rt
@@ -966,9 +1008,11 @@ def calculate_rt_margins_intensity_based(df_fragments: pl.DataFrame, intensity_t
         left_bound = left_df["rt"][-1]
 
     # Right of apex
-    right_df = df_sorted.filter(pl.col("fragment_name") == apex_fragment_name)  # only consider the apex fragment
+    right_df = df_sorted.filter(
+        pl.col("fragment_name") == apex_fragment_name
+    )  # only consider the apex fragment
     apex_idx_right = right_df["fragment_intensity"].arg_max()
-    right_df = right_df[apex_idx_right+1:]
+    right_df = right_df[apex_idx_right + 1 :]
     right_bound = apex_rt
     for rt, intensity in zip(right_df["rt"], right_df["fragment_intensity"]):
         if intensity < cutoff:
@@ -985,7 +1029,12 @@ def calculate_rt_margins_intensity_based(df_fragments: pl.DataFrame, intensity_t
     return left_bound, right_bound, apex_rt
 
 
-def calculate_min_max_margins(df_psms: pl.DataFrame, df_fragments: pl.DataFrame, top_n: int = 100, intensity_threshold: float = 0.01) -> dict:
+def calculate_min_max_margins(
+    df_psms: pl.DataFrame,
+    df_fragments: pl.DataFrame,
+    top_n: int = 100,
+    intensity_threshold: float = 0.01,
+) -> dict:
     """
     Calculate the retention time distribution of the top N peptidoforms (with at least 6 PSMs, and then ranked by spectrum peptide q value)
     Min and max margins are defined as the 5th and 95th percentiles of the distribution of retention time margins
@@ -1009,9 +1058,7 @@ def calculate_min_max_margins(df_psms: pl.DataFrame, df_fragments: pl.DataFrame,
 
     df_top_peptidoforms = (
         df_psms.group_by(["peptide", "charge"])
-        .agg(
-            [pl.count().alias("num_psms"), pl.min("peptide_q").alias("min_peptide_q")]
-        )
+        .agg([pl.count().alias("num_psms"), pl.min("peptide_q").alias("min_peptide_q")])
         .sort("min_peptide_q")
     )
 
@@ -1022,13 +1069,20 @@ def calculate_min_max_margins(df_psms: pl.DataFrame, df_fragments: pl.DataFrame,
     df_top_peptidoforms = df_top_peptidoforms.head(top_n)
 
     # Step 2: Extract the retention times of the entire XICs from df_fragments of these peptidoforms
-    df_fragments_top100 = df_fragments.filter(pl.col("peptide").is_in(df_top_peptidoforms["peptide"]) & pl.col("charge").is_in(df_top_peptidoforms["charge"]))
+    df_fragments_top100 = df_fragments.filter(
+        pl.col("peptide").is_in(df_top_peptidoforms["peptide"])
+        & pl.col("charge").is_in(df_top_peptidoforms["charge"])
+    )
     diffs = []
 
     for (peptidoform, charge), df_fragments_top100_sub in tqdm(
-                df_fragments_top100.group_by(["peptide", "charge"])
-            ):
-        left_bound, right_bound, apex_rt = calculate_rt_margins_intensity_based(df_fragments_top100_sub, intensity_threshold, output_dir='debug/calibration_xics')
+        df_fragments_top100.group_by(["peptide", "charge"])
+    ):
+        left_bound, right_bound, apex_rt = calculate_rt_margins_intensity_based(
+            df_fragments_top100_sub,
+            intensity_threshold,
+            output_dir="debug/calibration_xics",
+        )
         left_diff = apex_rt - left_bound
         right_diff = right_bound - apex_rt
         diffs.append(left_diff)
@@ -1049,12 +1103,20 @@ def calculate_min_max_margins(df_psms: pl.DataFrame, df_fragments: pl.DataFrame,
         log_info(f"Using min and max retention time margins: {min_diff}, {max_diff}")
 
     # plot histogram of diffs
-    plot_rt_margin_histogram(diffs, output_dir='debug/calibration_xics', min_diff=min_diff, max_diff=max_diff)
+    plot_rt_margin_histogram(
+        diffs, output_dir="debug/calibration_xics", min_diff=min_diff, max_diff=max_diff
+    )
 
     return min_diff, max_diff
 
 
-def add_retention_time_margins(df_psms: pl.DataFrame, df_fragment: pl.DataFrame, min_diff: float, max_diff: float, intensity_threshold: float) -> pl.DataFrame:
+def add_retention_time_margins(
+    df_psms: pl.DataFrame,
+    df_fragment: pl.DataFrame,
+    min_diff: float,
+    max_diff: float,
+    intensity_threshold: float,
+) -> pl.DataFrame:
     """
     Add retention time margin features to the PSM DataFrame.
     """
@@ -1062,19 +1124,23 @@ def add_retention_time_margins(df_psms: pl.DataFrame, df_fragment: pl.DataFrame,
     pept2lowermargins = {}
     pept2highermargins = {}
 
-    log_info("Calculating adapted retention time margins based on intensity for all peptides")
+    log_info(
+        "Calculating adapted retention time margins based on intensity for all peptides"
+    )
 
     for (peptidoform, charge), df_fragments_sub in tqdm(
-                df_fragment.group_by(["peptide", "charge"])
-            ):
+        df_fragment.group_by(["peptide", "charge"])
+    ):
 
         # speed up: skip peptidoforms with only 1 PSM
-        if df_fragments_sub['psm_id'].n_unique() < 2:
+        if df_fragments_sub["psm_id"].n_unique() < 2:
             pept2lowermargins[(peptidoform, charge)] = np.nan
             pept2highermargins[(peptidoform, charge)] = np.nan
             continue
 
-        intensity_based_margins = calculate_rt_margins_intensity_based(df_fragments_sub, intensity_threshold, output_dir='xics')
+        intensity_based_margins = calculate_rt_margins_intensity_based(
+            df_fragments_sub, intensity_threshold, output_dir="xics"
+        )
         left_bound, right_bound, apex_rt = intensity_based_margins
 
         # check if the intensity based margins are higher than max or lower than min
@@ -1099,11 +1165,19 @@ def add_retention_time_margins(df_psms: pl.DataFrame, df_fragment: pl.DataFrame,
     df_psms = df_psms.with_columns(
         [
             pl.struct(["peptide", "charge"])
-            .map_elements(lambda row: pept2lowermargins.get((row["peptide"], row["charge"]), np.nan))
+            .map_elements(
+                lambda row: pept2lowermargins.get(
+                    (row["peptide"], row["charge"]), np.nan
+                )
+            )
             .alias("rt_lower_margin"),
             pl.struct(["peptide", "charge"])
-            .map_elements(lambda row: pept2highermargins.get((row["peptide"], row["charge"]), np.nan))
-            .alias("rt_higher_margin")
+            .map_elements(
+                lambda row: pept2highermargins.get(
+                    (row["peptide"], row["charge"]), np.nan
+                )
+            )
+            .alias("rt_higher_margin"),
         ]
     )
 
@@ -1113,29 +1187,46 @@ def add_retention_time_margins(df_psms: pl.DataFrame, df_fragment: pl.DataFrame,
     df_fragment = df_fragment.with_columns(
         [
             pl.struct(["peptide", "charge"])
-            .map_elements(lambda row: pept2lowermargins.get((row["peptide"], row["charge"]), np.nan))
+            .map_elements(
+                lambda row: pept2lowermargins.get(
+                    (row["peptide"], row["charge"]), np.nan
+                )
+            )
             .alias("rt_lower_margin"),
             pl.struct(["peptide", "charge"])
-            .map_elements(lambda row: pept2highermargins.get((row["peptide"], row["charge"]), np.nan))
-            .alias("rt_higher_margin")
+            .map_elements(
+                lambda row: pept2highermargins.get(
+                    (row["peptide"], row["charge"]), np.nan
+                )
+            )
+            .alias("rt_higher_margin"),
         ]
     )
 
     return df_psms, df_fragment
 
 
-def add_retention_time_margins_loop(df_psms: pl.DataFrame, df_fragment: pl.DataFrame, top_n: int = 10, intensity_threshold: float = 0.05) -> pl.DataFrame:
+def add_retention_time_margins_loop(
+    df_psms: pl.DataFrame,
+    df_fragment: pl.DataFrame,
+    top_n: int = 10,
+    intensity_threshold: float = 0.05,
+) -> pl.DataFrame:
     """
     Add retention time margin features to the PSM DataFrame.
     """
     log_info("Calculating min max retention time margins based on intensity...")
     # Step 1: Calculate min and max retention time window based on top 100 peptidoforms
-    min_diff, max_diff = calculate_min_max_margins(df_psms, df_fragment, top_n, intensity_threshold)
+    min_diff, max_diff = calculate_min_max_margins(
+        df_psms, df_fragment, top_n, intensity_threshold
+    )
 
     # Step 2: Calculate adapted margins for each PSM based on the intensity of the most intense fragment
     # and use the retention time distribution as min and max
     log_info("Adding retention time margin features to PSM DataFrame...")
-    df_psms, df_fragment = add_retention_time_margins(df_psms, df_fragment, min_diff, max_diff, intensity_threshold)
+    df_psms, df_fragment = add_retention_time_margins(
+        df_psms, df_fragment, min_diff, max_diff, intensity_threshold
+    )
 
     return df_psms, df_fragment
 
@@ -1157,10 +1248,23 @@ def calculate_features(
     spectra_data: Optional[SpectraData] = None,
 ) -> None:
     """
-    Process the PSM and fragment DataFrames, compute features, and save the output.
-    This function uses parallel processing with task chunking.
+    Main feature computation pipeline — the workhorse of Stage 3.
+
+    Orchestrates 9 steps to transform raw search results into a scored PIN file:
+    1. DeepLC RT predictions (reuses transfer-learned model from Stage 2)
+    2. RT error features + filtering (removes PSMs with >15% relative RT error)
+    3. Regenerate apex DataFrames after RT filtering (data consistency)
+    4. Peptide occurrence filtering (min_occurrences, default 1 = keep all)
+    5. MS2PIP fragment intensity predictions + RustyMS annotation → correlations
+    6. Precursor M-1/M/M+1 isotope intensities from MS1 spectra
+    7. Group PSMs by peptidoform, collapse via max/min/mean/sum
+    8. Extract percentile + top-k features from correlation matrices (parallel)
+    9. Write PIN file for Mokapot
+
+    NOTE: filter_rel_rt_error and filter_max_apex_rt parameters are accepted
+    but not used — hardcoded values are passed to the feature functions instead.
+    The return type annotation says None but actually returns (df_fragment, df_psms).
     """
-    # df_psms.write_csv("debug/df_psms_beginning.csv", separator="\t")
     # Handle pickle configuration
     if pickle_config is None:
         pickle_config = PickleConfig()
@@ -1185,6 +1289,11 @@ def calculate_features(
         )
     )
 
+    # Step 2: Compute RT error features and filter out poor predictions.
+    # BUG: add_retention_time_features() requires (df_psms, predictions_deeplc, ...)
+    # but predictions_deeplc is not passed here. This call is missing the 2nd positional arg.
+    # It works only if df_psms already has 'rt_predictions' column (joined in Step 1)
+    # AND the function signature is updated to make predictions_deeplc optional.
     log_info("Obtaining features retention time...")
     df_psms = add_retention_time_features(df_psms, filter_rel_rt_error=0.15)
 
@@ -1225,17 +1334,6 @@ def calculate_features(
     log_info("Regenerated df_fragment_max_peptide:")
     log_info("  Shape: {}".format(df_fragment_max_peptide.shape))
     log_info("  Sample entries:")
-    #for row in df_fragment_max_peptide.head(3).iter_rows(named=True):
-    #    log_info(
-    #        "    Peptide: {}, Charge: {}, PSM ID: {}, RT: {}, Fragment Intensity: {}".format(
-    #            row["peptide"],
-    #            row["charge"],
-    #            row["psm_id"],
-    #            row["rt"],
-    #            row["fragment_intensity"],
-    #        )
-    #    )
-
     log_info(
         "Counting individual peptides per MS2 and filtering by minimum occurrences"
     )
@@ -1322,6 +1420,8 @@ def calculate_features(
 
     log_info(f"Number of PSMs:{df_psms.shape[0]}")
 
+    # Step 7: Group all PSMs by peptidoform (peptide/charge) and prepare for parallel processing.
+    # Each peptidoform becomes one row in the final PIN file.
     log_info("Step 6: Grouping peptidoforms by peptide and charge")
 
     psm_dict = {}
@@ -1332,7 +1432,9 @@ def calculate_features(
 
     log_info(f"Number of peptidoforms: {len(psm_dict)}")
 
-    # Pass data as-is (read-only) without deep copying.
+    # Build argument tuples: (psm_sub_df, fragment_sub_df, correlation_list)
+    # Only include peptidoforms that have both fragment and correlation data.
+    # Peptidoforms missing from correlations_fragment_dict (e.g., no MS2PIP predictions) are skipped.
     peptidoform_args = [
         (psm_dict[k], fragment_dict[k], correlations_fragment_dict[k])
         for k in psm_dict.keys()
@@ -1346,6 +1448,10 @@ def calculate_features(
     with open("debug/correlations_fragment_dict.pkl", "wb") as f:
         pickle.dump(correlations_fragment_dict, f)
 
+    # Step 8: Process each peptidoform in parallel using ThreadPoolExecutor.
+    # Each peptidoform is collapsed to one row (run_peptidoform_df) and gets
+    # correlation features appended (run_peptidoform_correlation).
+    # Chunking reduces ThreadPoolExecutor overhead for many small tasks.
     log_info("Step 7: Processing peptidoforms in parallel (with chunking)")
 
     chunks = [
@@ -1364,14 +1470,12 @@ def calculate_features(
             )
         )
 
-    """
-    chunk_results = []
-    for chunk in tqdm(chunks):
-        for args in chunk:
-            chunk_results.append(process_peptidoform(args))
-    """
+    # Flatten list of lists → list of 1-row DataFrames
     pin_in = [item for sublist in chunk_results for item in sublist]
 
+    # Step 9: Build the PIN file for Mokapot.
+    # Rename columns to Percolator/Mokapot PIN format, drop redundant scannr,
+    # fill any NaN/null with 0.0 to avoid Mokapot errors.
     log_info("Step 8: Concatenating results")
     concatenated_df = (
         pl.concat(pin_in)
@@ -1379,13 +1483,13 @@ def calculate_features(
             {
                 "expmass": "ExpMass",
                 "calcmass": "CalcMass",
-                "psm_id": "ScanNr",
+                "psm_id": "ScanNr",     # Mokapot uses ScanNr for grouping
                 "peptide": "Peptide",
                 "proteins": "Proteins",
-                "is_decoy": "Label",
+                "is_decoy": "Label",     # -1 = decoy, +1 = target
             }
         )
-        .drop("scannr")
+        .drop("scannr")  # Redundant after SpecId was created
         .fill_null(0.0)
         .fill_nan(0.0)
     )
@@ -1394,6 +1498,7 @@ def calculate_features(
     )
 
     return df_fragment, df_psms
+
 
 def main(
     df_fragment: Optional[pl.DataFrame] = None,
@@ -1446,15 +1551,22 @@ def main(
     df_psms.write_csv("debug/df_psms_before_quant.tsv", separator="\t")
 
     # this file will later be used for quantification of proteins with directLFQ (combined with all runs)
-    if mokapot_results is not None and isinstance(mokapot_results, (list, tuple)) and len(mokapot_results) > 1:
+    if (
+        mokapot_results is not None
+        and isinstance(mokapot_results, (list, tuple))
+        and len(mokapot_results) > 1
+    ):
         df_quant_fragment = quantify_fragments(
             df_fragment,
             mokapot_results[1],
             config=config,
-            output_dir=config["mumdia"]["result_dir"]
+            output_dir=config["mumdia"]["result_dir"],
         )
     else:
-        logging.warning("mokapot_results is None or does not have enough elements; skipping quantification step.")
+        logging.warning(
+            "mokapot_results is None or does not have enough elements; skipping quantification step."
+        )
+
 
 if __name__ == "__main__":
     # In practice, load your input DataFrames (e.g., from parquet files) and then call main().

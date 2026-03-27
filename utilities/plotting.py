@@ -1,3 +1,5 @@
+"""Extracted ion chromatogram (XIC) and RT margin visualization utilities."""
+
 import matplotlib.pyplot as plt
 import pandas as pd
 import numpy as np

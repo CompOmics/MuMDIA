@@ -158,6 +158,7 @@ def merge_config_from_sources(
 
 
 def write_updated_config(config: Dict[str, Any], result_dir: str) -> str:
+    """Save merged configuration to updated_config.json in the result directory."""
     new_config_path = os.path.join(result_dir, "updated_config.json")
     with open(new_config_path, "w") as f:
         json.dump(config, f, indent=4)

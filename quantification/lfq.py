@@ -1,3 +1,5 @@
+"""Fragment-level label-free quantification using trapezoidal integration over RT."""
+
 import os
 import logging
 
@@ -35,17 +37,23 @@ def quantify_fragments(df_fragment, mokapot_psm_path, config, output_dir: str = 
             - 'psm_id': Unique identifier for the PSM.
             - 'rt_lower_margin': Lower margin of the retention time window.
             - 'rt_higher_margin': Upper margin of the retention time window.
-        mokapot_psm_path (str): Path to the mokapot PSM results file.
-        config (dict): Configuration dictionary containing at least the key 'sage' with subkey '
-                          mzml_paths' (list of str): List of mzML file paths.
+        mokapot_psm_path (str): Path to the mokapot PSM results TSV file (contains 'Peptide'
+            and 'mokapot q-value' columns).
+        config (dict): Configuration dictionary containing config['sage']['mzml_paths'] —
+            list of mzML file paths (first element used for output naming).
         output_dir (str, optional): Directory to save the output CSV file. Defaults to None.
     Returns:
         pl.DataFrame: DataFrame with quantified fragment ion intensities.
     """
     # TODO: adapt this so it works for multiple runs
+    # Extract the mzML filename (without extension) from the first path in the
+    # Sage config. This basename is used as a column header in the output so
+    # that multi-run results can later be merged on a per-run basis.
     mzml_filename = os.path.basename(config["sage"]["mzml_paths"][0]).split('.')[0]
 
-    #filter df_fragment to peptides that survived mokapot 
+    # Keep only fragments whose parent peptide passed Mokapot FDR control at
+    # 1% q-value. Mokapot's "Peptide" column stores the modified sequence that
+    # matches the "peptide" column in df_fragment.
     mokapot_peptides = pl.read_csv(mokapot_psm_path, separator="\t")
     mokapot_peptides = mokapot_peptides.filter(pl.col("mokapot q-value") < 0.01)
     df_fragment_mokapot_filtered = df_fragment.filter(pl.col("peptide").is_in(mokapot_peptides["Peptide"]))
@@ -57,8 +65,14 @@ def quantify_fragments(df_fragment, mokapot_psm_path, config, output_dir: str = 
     for (peptidoform, stripped_sequence, charge, fragment_name, proteins), df_fragment_mokapot_filtered_sub in tqdm(
             df_fragment_mokapot_filtered.group_by(["peptide", "stripped_peptide", "charge",  "fragment_name", "proteins"])
         ):
+        # Protein strings are in UniProt FASTA header format: "sp|P12345|PROT_HUMAN".
+        # Split on '|' and take the third field (entry name) for each protein,
+        # then rejoin with ';' for multi-protein groups.
         proteins = ';'.join(proteinstring.split('|')[2] for proteinstring in proteins.split(';'))
 
+        # Build a unique ion identifier that encodes the stripped sequence, full
+        # modified peptidoform, charge state, and fragment name. This composite
+        # key allows directLFQ to track individual fragment ions across runs.
         results.append({
             "protein": proteins,
             "ion": "SEQ_" + stripped_sequence + "_MOD" + peptidoform + "_CHARGE_" + str(charge) + "_" + fragment_name,
@@ -74,6 +88,16 @@ def quantify_fragments(df_fragment, mokapot_psm_path, config, output_dir: str = 
     return df_quant_fragment
 
 def quantify_fragment_peak_intensity(df_fragment_ion_psms, margin: bool = False):
+    """
+    Return the maximum fragment intensity across all retention times.
+
+    Args:
+        df_fragment_ion_psms: Polars DataFrame with fragment_intensity column.
+        margin: If True, filter to RT margin bounds first (requires rt_lower_margin/rt_higher_margin columns).
+
+    Returns:
+        Maximum fragment intensity value (float).
+    """
     # return highest intensity of fragment over RT
     if margin:
         df_fragment_ion_psms = _filter_margin_rt(df_fragment_ion_psms)
@@ -81,6 +105,20 @@ def quantify_fragment_peak_intensity(df_fragment_ion_psms, margin: bool = False)
     return df_fragment_ion_psms["fragment_intensity"].max()
 
 def quantify_fragment_integrated_intensity(df_fragment_ion_psms, margin: bool = False):
+    """
+    Integrate fragment intensities over retention time using the trapezoidal rule.
+
+    For a single time point, returns that intensity directly. For multiple time
+    points, sorts by RT and computes the area under the curve via
+    scipy.integrate.trapezoid.
+
+    Args:
+        df_fragment_ion_psms: Polars DataFrame with rt and fragment_intensity columns.
+        margin: If True, filter to RT margin bounds first.
+
+    Returns:
+        Integrated intensity (float) or single-point intensity.
+    """
     # integrate fragment intensities over RT
     if margin:
         df_fragment_ion_psms = _filter_margin_rt(df_fragment_ion_psms)
@@ -100,6 +138,8 @@ def quantify_fragment_integrated_intensity(df_fragment_ion_psms, margin: bool = 
     return aoc
 
 def _filter_margin_rt(df):
+    """Filter DataFrame to rows within the calibrated RT margin bounds.
+    Only applies filtering when multiple PSM IDs are present."""
     if df['psm_id'].n_unique() > 1:
         df = df.filter(
             (pl.col("rt") >= pl.col("rt_lower_margin")) &

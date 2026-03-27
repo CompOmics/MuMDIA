@@ -110,161 +110,219 @@ class TestParquetParser:
             # Verify filtering worked (q_value <= 0.01)
             assert mock_read_parquet.call_count >= 2
 
-    @pytest.mark.skipif(
-        not PARSER_PARQUET_AVAILABLE, reason="parquet_parser not available"
-    )
     @pytest.mark.unit
     def test_parquet_reader_q_value_filtering(self):
         """Test q-value filtering functionality."""
-        with patch("polars.read_parquet") as mock_read_parquet:
-            # Create test data with varying q-values
-            mock_data = pl.DataFrame(
+        with patch("pandas.read_parquet") as mock_pd_read_parquet:
+            # Create mock PSMs data with required columns
+            mock_psms_data = pd.DataFrame(
                 {
                     "peptide": ["PEPTIDE1", "PEPTIDE2", "PEPTIDE3"],
-                    "q_value": [0.001, 0.05, 0.1],  # Only first two should pass filter
+                    "spectrum_q": [
+                        0.001,
+                        0.05,
+                        0.1,
+                    ],  # Only first should pass filter 0.01
                     "psm_id": [1, 2, 3],
+                    "scannr": [100, 200, 300],
+                    "charge": [2, 2, 3],
+                    "rt": [10.0, 20.0, 30.0],
                 }
             )
 
-            mock_read_parquet.return_value = mock_data
+            # Create mock fragments data
+            mock_fragments_data = pd.DataFrame(
+                {
+                    "psm_id": [1, 1, 2, 2, 3],
+                    "fragment_mz": [200.1, 300.2, 400.3, 500.4, 600.5],
+                    "fragment_intensity": [1000.0, 2000.0, 1500.0, 2500.0, 800.0],
+                }
+            )
+
+            # Mock read_parquet to return appropriate data based on file path
+            def mock_read_side_effect(file_path):
+                if "results" in str(file_path):
+                    return mock_psms_data
+                elif "fragments" in str(file_path):
+                    return mock_fragments_data
+                return pd.DataFrame()
+
+            mock_pd_read_parquet.side_effect = mock_read_side_effect
 
             with tempfile.TemporaryDirectory() as temp_dir:
                 results_file = Path(temp_dir) / "results.sage.parquet"
                 fragments_file = Path(temp_dir) / "fragments.sage.parquet"
-                results_file.touch()
-                fragments_file.touch()
 
-                # Test with q_value_filter = 0.01
-                try:
-                    (
-                        df_fragment,
-                        df_psms,
-                        df_fragment_max,
-                        df_fragment_max_peptide,
-                    ) = parquet_reader(
-                        parquet_file_results=results_file,
-                        parquet_file_fragments=fragments_file,
-                        q_value_filter=0.01,
-                    )
-                    # Just verify no errors occurred and DataFrames returned
-                    assert isinstance(df_psms, pl.DataFrame)
-                except Exception:
-                    # If implementation requires specific columns, that's okay
-                    pytest.skip("Parquet reader requires specific data schema")
+                (
+                    df_fragment,
+                    df_psms,
+                    df_fragment_max,
+                    df_fragment_max_peptide,
+                ) = parquet_reader(
+                    parquet_file_results=results_file,
+                    parquet_file_fragments=fragments_file,
+                    q_value_filter=0.01,
+                )
 
-    @pytest.mark.skipif(
-        not PARSER_PARQUET_AVAILABLE, reason="parquet_parser not available"
-    )
+                # Verify results
+                assert isinstance(df_psms, pl.DataFrame)
+                assert isinstance(df_fragment, pl.DataFrame)
+                # Should only have one PSM with spectrum_q <= 0.01
+                assert len(df_psms) == 1
+                assert df_psms["peptide"][0] == "PEPTIDE1"
+
     @pytest.mark.unit
     def test_parquet_reader_empty_files(self):
         """Test handling of empty parquet files."""
-        with patch("polars.read_parquet") as mock_read_parquet:
-            # Mock empty DataFrames
-            mock_read_parquet.return_value = pl.DataFrame()
+        with patch("pandas.read_parquet") as mock_pd_read_parquet:
+            # Mock empty DataFrames with required columns to avoid column errors
+            empty_psms = pd.DataFrame(
+                {
+                    "peptide": [],
+                    "spectrum_q": [],
+                    "psm_id": [],
+                    "scannr": [],
+                    "charge": [],
+                    "rt": [],
+                }
+            )
+
+            empty_fragments = pd.DataFrame(
+                {
+                    "psm_id": [],
+                    "fragment_mz": [],
+                    "fragment_intensity": [],
+                }
+            )
+
+            def mock_read_side_effect(file_path):
+                if "results" in str(file_path):
+                    return empty_psms
+                elif "fragments" in str(file_path):
+                    return empty_fragments
+                return pd.DataFrame()
+
+            mock_pd_read_parquet.side_effect = mock_read_side_effect
 
             with tempfile.TemporaryDirectory() as temp_dir:
                 results_file = Path(temp_dir) / "results.sage.parquet"
                 fragments_file = Path(temp_dir) / "fragments.sage.parquet"
-                results_file.touch()
-                fragments_file.touch()
 
-                # Should handle empty files gracefully
-                try:
-                    (
-                        df_fragment,
-                        df_psms,
-                        df_fragment_max,
-                        df_fragment_max_peptide,
-                    ) = parquet_reader(
-                        parquet_file_results=results_file,
-                        parquet_file_fragments=fragments_file,
-                        q_value_filter=0.01,
-                    )
-                    # Verify empty DataFrames returned
-                    assert isinstance(df_fragment, pl.DataFrame)
-                    assert isinstance(df_psms, pl.DataFrame)
-                except Exception:
-                    # If implementation has specific requirements, skip
-                    pytest.skip("Parquet reader requires specific data columns")
+                # Should handle empty files gracefully and return None
+                result = parquet_reader(
+                    parquet_file_results=results_file,
+                    parquet_file_fragments=fragments_file,
+                    q_value_filter=0.01,
+                )
+
+                # Should return (None, None, None, None) when no data passes filter
+                assert result == (None, None, None, None)
 
 
 class TestMzMLParser:
     """Test the mzML parser for mass spectrometry data."""
 
-    @pytest.mark.skipif(not PARSER_MZML_AVAILABLE, reason="parser_mzml not available")
     @pytest.mark.unit
     def test_get_ms1_mzml_basic_functionality(self):
         """Test basic MS1 extraction functionality."""
-        with patch("parsers.parser_mzml.pymzml") as mock_pymzml:
-            # Mock pymzml reader
-            mock_reader = MagicMock()
-            mock_pymzml.run.Reader.return_value = mock_reader
+        with (
+            patch("parsers.parser_mzml.MzMLFile") as mock_mzmlfile,
+            patch("parsers.parser_mzml.MSExperiment") as mock_msexp,
+        ):
 
-            # Mock MS1 spectrum
+            # Mock MSExperiment and its methods
+            mock_exp = MagicMock()
+            mock_msexp.return_value = mock_exp
+
+            # Mock MzMLFile
+            mock_file = MagicMock()
+            mock_mzmlfile.return_value = mock_file
+
+            # Mock spectra
             mock_ms1_spectrum = MagicMock()
-            mock_ms1_spectrum.ms_level = 1
-            mock_ms1_spectrum.scan_time = [10.5]
-            mock_ms1_spectrum.mz = np.array([100.0, 200.0, 300.0])
-            mock_ms1_spectrum.i = np.array([1000.0, 2000.0, 1500.0])
-            mock_ms1_spectrum.id = 100
-
-            # Mock MS2 spectrum
-            mock_ms2_spectrum = MagicMock()
-            mock_ms2_spectrum.ms_level = 2
-            mock_ms2_spectrum.scan_time = [10.7]
-            mock_ms2_spectrum.selected_precursors = [{"mz": 200.0, "charge": 2}]
-            mock_ms2_spectrum.id = 101
-
-            # Configure iterator
-            mock_reader.__iter__ = lambda x: iter(
-                [mock_ms1_spectrum, mock_ms2_spectrum]
+            mock_ms1_spectrum.getMSLevel.return_value = 1
+            mock_ms1_spectrum.getNativeID.return_value = "scan=100"
+            mock_ms1_spectrum.getRT.return_value = 10.5
+            mock_ms1_spectrum.get_peaks.return_value = (
+                np.array([100.0, 200.0, 300.0]),
+                np.array([1000.0, 2000.0, 1500.0]),
             )
 
-            try:
-                ms1_dict, ms2_to_ms1_dict, ms2_spectra = get_ms1_mzml("test.mzML")
+            mock_ms2_spectrum = MagicMock()
+            mock_ms2_spectrum.getMSLevel.return_value = 2
+            mock_ms2_spectrum.getNativeID.return_value = "scan=101"
+            mock_ms2_spectrum.getRT.return_value = 10.7
+            mock_ms2_spectrum.get_peaks.return_value = (
+                np.array([150.0, 250.0]),
+                np.array([800.0, 1200.0]),
+            )
 
-                # Verify dictionaries are returned
-                assert isinstance(ms1_dict, dict)
-                assert isinstance(ms2_to_ms1_dict, dict)
-                assert isinstance(ms2_spectra, dict)
+            # Mock precursor
+            mock_precursor = MagicMock()
+            mock_precursor.getMZ.return_value = 200.0
+            mock_precursor.getCharge.return_value = 2
+            mock_ms2_spectrum.getPrecursors.return_value = [mock_precursor]
 
-            except Exception:
-                # If implementation requires specific mzML structure, skip
-                pytest.skip("MS1 parser requires specific mzML format")
+            # Configure experiment to return spectra
+            mock_exp.getSpectra.return_value = [mock_ms1_spectrum, mock_ms2_spectrum]
+
+            ms1_dict, ms2_to_ms1_dict, ms2_spectra = get_ms1_mzml("test.mzML")
+
+            # Verify dictionaries are returned
+            assert isinstance(ms1_dict, dict)
+            assert isinstance(ms2_to_ms1_dict, dict)
+            assert isinstance(ms2_spectra, dict)
+
+            # Check that we have the expected MS1 scan
+            assert "scan=100" in ms1_dict
+            assert "scan=101" in ms2_spectra
 
     @pytest.mark.skipif(not PARSER_MZML_AVAILABLE, reason="parser_mzml not available")
     @pytest.mark.unit
     def test_split_mzml_by_retention_time_basic(self):
         """Test retention time-based mzML splitting."""
-        with patch("parsers.parser_mzml.pymzml") as mock_pymzml:
-            mock_reader = MagicMock()
-            mock_pymzml.run.Reader.return_value = mock_reader
+        from parsers.parser_mzml import split_mzml_by_retention_time
 
-            # Mock spectrum with retention time
-            mock_spectrum = MagicMock()
-            mock_spectrum.scan_time = [15.0]  # 15 minutes
-            mock_spectrum.ms_level = 2
-            mock_spectrum.id = 200
+        with (
+            patch("parsers.parser_mzml.read_mzml") as mock_read_mzml,
+            patch("parsers.parser_mzml.MSExperiment") as mock_ms_experiment,
+            patch("parsers.parser_mzml.write_mzml") as mock_write_mzml,
+            patch("parsers.parser_mzml.os.path.exists") as mock_exists,
+            patch("parsers.parser_mzml.os.makedirs") as mock_makedirs,
+        ):
 
-            mock_reader.__iter__ = lambda x: iter([mock_spectrum])
+            # Mock the MSExperiment and spectra
+            mock_exp = MagicMock()
+            mock_read_mzml.return_value = mock_exp
 
-            try:
-                # Test time window splitting
-                result = split_mzml_by_retention_time(
-                    peptide_df=pl.DataFrame(
-                        {"peptide": ["PEPTIDE1"], "rt_start": [10.0], "rt_end": [20.0]}
-                    ),
-                    mzml_file="test.mzML",
-                    time_interval=5.0,
-                    dir_files="temp/",
-                )
+            # Create mock spectra with retention times
+            mock_spectrum1 = MagicMock()
+            mock_spectrum1.getRT.return_value = 60.0  # 1 minute
+            mock_spectrum2 = MagicMock()
+            mock_spectrum2.getRT.return_value = 180.0  # 3 minutes
 
-                # Should return some kind of result structure
-                assert result is not None
+            mock_exp.getSpectra.return_value = [mock_spectrum1, mock_spectrum2]
 
-            except Exception:
-                # If implementation has complex dependencies, skip
-                pytest.skip("mzML splitter requires specific dependencies")
+            # Mock sub experiment with proper methods
+            mock_sub_exp = MagicMock()
+            mock_sub_exp.getNrSpectra.return_value = 1  # Return a number for comparison
+            mock_ms_experiment.return_value = mock_sub_exp
+
+            # Mock file operations
+            mock_exists.return_value = False
+
+            # Test the splitting function with correct parameters
+            result = split_mzml_by_retention_time(
+                original_file="test.mzML", dir_files="temp/", time_interval=120.0
+            )
+
+            # Verify the function was called and executed
+            mock_read_mzml.assert_called_once_with("test.mzML")
+            mock_exp.getSpectra.assert_called_once()
+            assert mock_sub_exp.addSpectrum.called
+
+            # Should return dictionary of output files
+            assert isinstance(result, dict)
 
 
 class TestParserIntegration:
@@ -334,54 +392,66 @@ class TestParserEdgeCases:
     @pytest.mark.unit
     def test_extreme_q_value_filters(self):
         """Test parser behavior with extreme q-value filters."""
-        with patch("polars.read_parquet") as mock_read_parquet:
-            mock_data = pl.DataFrame(
+        with patch("pandas.read_parquet") as mock_pd_read_parquet:
+            # Create mock data with extreme q-values
+            mock_psms_data = pd.DataFrame(
                 {
                     "peptide": ["PEPTIDE1", "PEPTIDE2"],
-                    "q_value": [0.001, 0.999],
+                    "spectrum_q": [0.001, 0.999],
                     "psm_id": [1, 2],
+                    "scannr": [100, 200],
+                    "charge": [2, 3],
+                    "rt": [10.0, 20.0],
                 }
             )
-            mock_read_parquet.return_value = mock_data
 
-            if PARSER_PARQUET_AVAILABLE:
-                with tempfile.TemporaryDirectory() as temp_dir:
-                    results_file = Path(temp_dir) / "results.parquet"
-                    fragments_file = Path(temp_dir) / "fragments.parquet"
-                    results_file.touch()
-                    fragments_file.touch()
+            mock_fragments_data = pd.DataFrame(
+                {
+                    "psm_id": [1, 2],
+                    "fragment_mz": [200.1, 300.2],
+                    "fragment_intensity": [1000.0, 2000.0],
+                }
+            )
 
-                    try:
-                        # Test very strict filter (should get minimal results)
-                        (
-                            df_fragment,
-                            df_psms,
-                            df_fragment_max,
-                            df_fragment_max_peptide,
-                        ) = parquet_reader(
-                            parquet_file_results=results_file,
-                            parquet_file_fragments=fragments_file,
-                            q_value_filter=0.0001,
-                        )
+            def mock_read_side_effect(file_path):
+                if "results" in str(file_path):
+                    return mock_psms_data
+                elif "fragments" in str(file_path):
+                    return mock_fragments_data
+                return pd.DataFrame()
 
-                        # Test very lenient filter (should get most results)
-                        (
-                            df_fragment2,
-                            df_psms2,
-                            df_fragment_max2,
-                            df_fragment_max_peptide2,
-                        ) = parquet_reader(
-                            parquet_file_results=results_file,
-                            parquet_file_fragments=fragments_file,
-                            q_value_filter=1.0,
-                        )
+            mock_pd_read_parquet.side_effect = mock_read_side_effect
 
-                        # Verify DataFrames returned
-                        assert isinstance(df_psms, pl.DataFrame)
-                        assert isinstance(df_psms2, pl.DataFrame)
+            with tempfile.TemporaryDirectory() as temp_dir:
+                results_file = Path(temp_dir) / "results.parquet"
+                fragments_file = Path(temp_dir) / "fragments.parquet"
 
-                    except Exception:
-                        pytest.skip("Parquet reader requires specific schema")
+                # Test very strict filter (should get minimal results)
+                result1 = parquet_reader(
+                    parquet_file_results=results_file,
+                    parquet_file_fragments=fragments_file,
+                    q_value_filter=0.0001,
+                )
+
+                # Should return None for very strict filter (no PSMs pass)
+                assert result1 == (None, None, None, None)
+
+                # Test very lenient filter (should get most results)
+                (
+                    df_fragment2,
+                    df_psms2,
+                    df_fragment_max2,
+                    df_fragment_max_peptide2,
+                ) = parquet_reader(
+                    parquet_file_results=results_file,
+                    parquet_file_fragments=fragments_file,
+                    q_value_filter=1.0,
+                )
+
+                # Verify DataFrames returned for lenient filter
+                assert isinstance(df_psms2, pl.DataFrame)
+                assert isinstance(df_fragment2, pl.DataFrame)
+                assert len(df_psms2) == 2  # Both PSMs should pass
 
     @pytest.mark.unit
     def test_large_data_handling(self):

@@ -1,3 +1,5 @@
+"""Pickle-based serialization for caching workflow state across pipeline stages."""
+
 import pickle
 from pathlib import Path
 from typing import Any, Optional, Tuple, Union
@@ -31,33 +33,29 @@ def write_variables_to_pickles(
     """
     Serialize DataFrames and configuration to pickle files for caching.
 
-    This function saves all workflow state to pickle files for resuming processing
-    and optionally exports DataFrames to TSV format for inspection.
+    Saves all workflow state (4 DataFrames, config dict, DeepLC model, and
+    processing flags) to pickle files. Optionally exports DataFrames as TSV.
 
     Args:
-        df_fragment: Fragment matches DataFrame
-        df_psms: PSM results DataFrame
-        df_fragment_max: Maximum intensity fragments per PSM
-        df_fragment_max_peptide: Maximum intensity fragments per peptide
-        config: Configuration dictionary
-        dlc_transfer_learn: Trained DeepLC model
-        write_deeplc_pickle: Flag for DeepLC pickle operations
-        write_ms2pip_pickle: Flag for MS2PIP pickle operations
-        write_correlation_pickles: Flag for correlation pickle operations
-        write_full_search_pickle: Flag for full search pickle operations
-        read_deeplc_pickle: Flag for DeepLC pickle reading
-        read_ms2pip_pickle: Flag for MS2PIP pickle reading
-        read_correlation_pickles: Flag for correlation pickle reading
-        read_full_search_pickle: Flag for full search pickle reading
-        df_fragment_fname: Filename for fragment DataFrame pickle
-        df_psms_fname: Filename for PSM DataFrame pickle
-        df_fragment_max_fname: Filename for max fragment DataFrame pickle
-        df_fragment_max_peptide_fname: Filename for max peptide DataFrame pickle
-        config_fname: Filename for configuration pickle
-        dlc_transfer_learn_fname: Filename for DeepLC model pickle
-        flags_fname: Filename for processing flags pickle
-        dir: Output directory for pickle files
-        write_to_tsv: Whether to also export DataFrames as TSV files
+        df_fragment: Fragment matches DataFrame.
+        df_psms: PSM results DataFrame.
+        df_fragment_max: Maximum intensity fragments per PSM.
+        df_fragment_max_peptide: Maximum intensity fragments per peptide.
+        config: Configuration dictionary (legacy nested format).
+        dlc_transfer_learn: Trained DeepLC model (or None for initial search).
+        pickle_config: PickleConfig dataclass with read/write flags for
+            DeepLC, MS2PIP, and correlation caches.
+        write_full_search_pickle: Whether full search pickle writing is enabled.
+        read_full_search_pickle: Whether full search pickle reading is enabled.
+        df_fragment_fname: Filename for fragment DataFrame pickle.
+        df_psms_fname: Filename for PSM DataFrame pickle.
+        df_fragment_max_fname: Filename for max fragment DataFrame pickle.
+        df_fragment_max_peptide_fname: Filename for max peptide DataFrame pickle.
+        config_fname: Filename for configuration pickle.
+        dlc_transfer_learn_fname: Filename for DeepLC model pickle.
+        flags_fname: Filename for processing flags pickle.
+        dir: Output directory for pickle files.
+        write_to_tsv: Whether to also export DataFrames as TSV files.
     """
     pickle_dir = Path(dir)
     create_directory(pickle_dir)

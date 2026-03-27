@@ -4,6 +4,15 @@ workflow_visualization/*.svg
 workflow_visualization/*.pdf
 workflow_visualization/plantuml.jar
 workflow_visualization/*.class
+*.png
+*.puml
+
+# Pipeline output and intermediate files
+test_results.txt
+.benchmarks/
+mumdia.egg-info/
+mzml_files/
+notebook_helpers/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

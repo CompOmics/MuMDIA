@@ -1,3 +1,5 @@
+"""File and directory I/O utilities for the MuMDIA pipeline."""
+
 import os
 from pathlib import Path
 
@@ -5,6 +7,7 @@ from utilities.logger import log_info
 
 
 def remove_intermediate_files(result_dir):
+    """Remove Sage intermediate files (parquet results and config JSON) from result_dir."""
     log_info("Removing intermediate files...")
     # Remove the intermediate files
     intermediate_files = [
@@ -20,6 +23,7 @@ def remove_intermediate_files(result_dir):
 
 
 def create_directory(directory_path):
+    """Create directory if it doesn't exist; if it does, remove stale Sage parquet files."""
     if not os.path.exists(directory_path):
         os.makedirs(directory_path)
     else:
@@ -45,6 +49,7 @@ def create_dirs(
     result_temp="temp",
     result_temp_results_initial_search="results_initial_search",
 ):
+    """Create result directory structure: result_dir/temp/results_initial_search/."""
     result_dir = Path(args.result_dir)
     create_directory(result_dir.joinpath(result_temp))
     create_directory(
@@ -54,6 +59,7 @@ def create_dirs(
 
 
 def assign_identifiers(group):
+    """Assign dense-ranked peak identifiers based on rounded fragment m/z values."""
     rounded_series = group["fragment_mz_experimental"].round(3)
     identifiers = rounded_series.rank(method="dense").cast(int)
     return group.with_columns(identifiers.alias("peak_identifier"))

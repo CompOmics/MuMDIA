@@ -168,40 +168,84 @@ class TestEdgeCases:
 class TestComputeCorrelations:
     """Test suite for compute_correlations function (requires Numba resolution)."""
 
-    @pytest.mark.skip(
-        reason="Numba compilation issues - requires dependency resolution"
-    )
+    @pytest.mark.unit
     def test_compute_correlations_perfect_correlation(self):
         """Test correlation calculation with perfect correlation."""
-        pass
+        from feature_generators.features_fragment_intensity import compute_correlations
+        import numpy as np
 
-    @pytest.mark.skip(
-        reason="Numba compilation issues - requires dependency resolution"
-    )
+        # Test data with perfect correlation
+        intensity_matrix = np.array([[1, 2, 3], [2, 4, 6]], dtype=np.float64)
+        pred_intensities = np.array([1, 2, 3], dtype=np.float64)
+
+        correlations = compute_correlations(intensity_matrix, pred_intensities)
+
+        # Should have perfect correlation for both rows
+        expected = np.ones(2)
+        np.testing.assert_array_almost_equal(correlations, expected, decimal=10)
+
+    @pytest.mark.unit
     def test_compute_correlations_no_correlation(self):
         """Test correlation calculation with no correlation."""
-        pass
+        from feature_generators.features_fragment_intensity import compute_correlations
+        import numpy as np
 
-    @pytest.mark.skip(
-        reason="Numba compilation issues - requires dependency resolution"
-    )
+        # Test data with no correlation (constant prediction)
+        intensity_matrix = np.array([[1, 0, -1], [0, 1, 0]], dtype=np.float64)
+        pred_intensities = np.array([2, 2, 2], dtype=np.float64)  # Constant values
+
+        correlations = compute_correlations(intensity_matrix, pred_intensities)
+
+        # Should have zero correlation (constant prediction has zero variance)
+        expected = np.zeros(2)
+        np.testing.assert_array_almost_equal(correlations, expected, decimal=10)
+
+    @pytest.mark.unit
     def test_compute_correlations_zero_variance(self):
         """Test correlation calculation with zero variance."""
-        pass
+        from feature_generators.features_fragment_intensity import compute_correlations
+        import numpy as np
 
-    @pytest.mark.skip(
-        reason="Numba compilation issues - requires dependency resolution"
-    )
+        # Test data where experimental intensities have zero variance
+        intensity_matrix = np.array([[3, 3, 3], [7, 7, 7]], dtype=np.float64)
+        pred_intensities = np.array([1, 2, 3], dtype=np.float64)
+
+        correlations = compute_correlations(intensity_matrix, pred_intensities)
+
+        # Should have zero correlation due to zero variance in experimental data
+        expected = np.zeros(2)
+        np.testing.assert_array_almost_equal(correlations, expected, decimal=10)
+
+    @pytest.mark.unit
     def test_compute_correlations_empty_matrix(self):
         """Test correlation calculation with empty input matrix."""
-        pass
+        from feature_generators.features_fragment_intensity import compute_correlations
+        import numpy as np
 
-    @pytest.mark.skip(
-        reason="Numba compilation issues - requires dependency resolution"
-    )
+        # Test data with empty matrix
+        intensity_matrix = np.empty((0, 3), dtype=np.float64)
+        pred_intensities = np.array([1, 2, 3], dtype=np.float64)
+
+        correlations = compute_correlations(intensity_matrix, pred_intensities)
+
+        # Should return empty array
+        assert correlations.shape == (0,)
+
+    @pytest.mark.unit
     def test_compute_correlations_single_psm(self):
         """Test correlation calculation with single PSM."""
-        pass
+        from feature_generators.features_fragment_intensity import compute_correlations
+        import numpy as np
+
+        # Test data with single PSM
+        intensity_matrix = np.array([[2, 4, 6]], dtype=np.float64)
+        pred_intensities = np.array([1, 2, 3], dtype=np.float64)
+
+        correlations = compute_correlations(intensity_matrix, pred_intensities)
+
+        # Should return single correlation value of 1 (perfect correlation)
+        assert correlations.shape == (1,)
+        np.testing.assert_almost_equal(correlations[0], 1.0, decimal=10)
 
 
 class TestMatchFragments:

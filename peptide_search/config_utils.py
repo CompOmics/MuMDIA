@@ -1,9 +1,12 @@
+"""Utility for modifying JSON configuration files at runtime."""
+
 import json
 
-from MuMDIA.utilities.logger import log_info
+from utilities.logger import log_info
 
 
 def modify_config(key, value, config_file="config.json"):
+    """Update a single key-value pair in a JSON configuration file."""
     # Read the config.json file
     with open(config_file, "r") as file:
         config = json.load(file)

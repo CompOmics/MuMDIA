@@ -103,7 +103,7 @@ def load_config_from_json(json_path: str) -> 'MuMDIAConfig':
     
     # Check if this is the old nested format
     if "sage_basic" in config_data or "sage" in config_data or "mumdia" in config_data:
-        print(f"🔄 Converting legacy config format to new simplified format...")
+        print("Converting legacy config format to new simplified format...")
         config_data = convert_legacy_config(config_data)
     
     # Filter out comment fields (fields starting with _comment)
@@ -532,9 +532,9 @@ if __name__ == "__main__":
         print(f"  deisotope: {full['deisotope']}")
         print()
         
-        print("✅ Simplified configuration with smart defaults!")
-        print("✅ Automatic initial vs full search differentiation!")
-        print("✅ Override system working!")
-        
+        print("Simplified configuration with smart defaults!")
+        print("Automatic initial vs full search differentiation!")
+        print("Override system working!")
+
     except SystemExit:
-        print("❌ Configuration validation failed")
+        print("Configuration validation failed")

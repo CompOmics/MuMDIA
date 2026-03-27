@@ -1,3 +1,5 @@
+"""General feature utilities for peptide filtering based on occurrence counts."""
+
 import polars as pl
 
 

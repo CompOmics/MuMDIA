@@ -30,6 +30,7 @@ import polars as pl
 
 from parsers.parser_parquet import parquet_reader
 from sequence.fasta import write_to_fasta
+from utilities.logger import log_info
 
 
 def run_sage(
@@ -63,12 +64,14 @@ def run_sage(
             return obj
 
     config_no_nulls = remove_nulls(config)
+
     with open(json_path, "w") as file:
         json.dump(config_no_nulls, file, indent=4)
 
     # Log the exact command that will be executed for debugging purposes
-    print(
-        " ".join(
+    log_info(
+        "Sage command: "
+        + " ".join(
             map(
                 str,
                 [
@@ -133,9 +136,10 @@ def retention_window_searches(
 
     # Process each retention time partition sequentially
     for upper_mzml_partition, mzml_path in mzml_dict.items():
-        # Calculate peptide selection mask using retention time predictions
-        # This selects peptides whose RT prediction intervals overlap with the current partition
-        # The overlap calculation accounts for prediction uncertainty (perc_95)
+        # Select peptides whose predicted RT interval overlaps the current
+        # mzML partition window [upper_mzml_partition - perc_95, upper_mzml_partition].
+        # Two intervals [a, b] and [c, d] overlap iff max(a, c) <= min(b, d).
+        # Here a=predictions_lower, b=predictions_upper, c=partition_start, d=partition_end.
         peptide_selection_mask = np.maximum(
             peptide_df["predictions_lower"], upper_mzml_partition - perc_95
         ) <= np.minimum(peptide_df["predictions_upper"], upper_mzml_partition)
@@ -205,7 +209,7 @@ def retention_window_searches(
 
         # Use a deep copy of the provided config to avoid mutating caller state
         sub_config = copy.deepcopy(config)
-        print(sub_config["sage"])
+        log_info(f"Sage sub-config for partition: {sub_config['sage']}")
 
         sub_results = os.path.dirname(mzml_path)
 
@@ -223,9 +227,9 @@ def retention_window_searches(
         try:
             with open(result_file_json_path, "r") as file:
                 sage_result_json = json.load(file)
-        except:
+        except (FileNotFoundError, json.JSONDecodeError):
             # Handle cases where Sage failed to produce results for this partition
-            print(result_file_json_path)
+            log_info(f"Failed to read Sage results: {result_file_json_path}")
             continue
 
         # Load and process Sage output parquet files
@@ -244,8 +248,10 @@ def retention_window_searches(
         assert isinstance(df_fragment, pl.DataFrame)
         assert isinstance(df_psms, pl.DataFrame)
 
-        # Ensure unique PSM IDs across all partitions by adding running offset
-        # This prevents ID conflicts when combining results from multiple partitions
+        # Sage assigns psm_id starting from 0 in every partition. To keep IDs
+        # globally unique after concatenation, shift all IDs in this partition by
+        # the running offset (psm_ident_start). Both df_fragment and df_psms must
+        # be shifted identically so that they remain joinable on psm_id.
         df_fragment = df_fragment.with_columns(
             (df_fragment["psm_id"] + psm_ident_start).alias("psm_id")
         )
@@ -257,8 +263,8 @@ def retention_window_searches(
         df_fragment_list.append(df_fragment)
         df_psms_list.append(df_psms)
 
-        # Update PSM ID offset for next partition
-        # Ensure numeric max for offset (handle empty/None safely)
+        # Advance the offset to one past the current maximum psm_id, so the
+        # next partition's IDs will not collide with any previously assigned ID.
         next_offset = psm_ident_start
         try:
             # Compute scalar max safely via an aggregation

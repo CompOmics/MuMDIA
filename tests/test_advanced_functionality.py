@@ -24,7 +24,7 @@ except ImportError:
     SAGE_WRAPPER_AVAILABLE = False
 
 try:
-    from deconvolution.devoncolution import *  # Check if deconvolution module exists
+    from deconvolution.deconvolution import *  # Check if deconvolution module exists
 
     DECONVOLUTION_AVAILABLE = True
 except ImportError:

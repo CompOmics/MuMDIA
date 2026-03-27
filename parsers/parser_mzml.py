@@ -1,3 +1,5 @@
+"""mzML file parsing: spectrum extraction, MS1/MS2 mapping, and RT-based partitioning."""
+
 import os
 import xml.etree.ElementTree as ET
 
@@ -20,6 +22,21 @@ def write_mzml(filename, experiment):
 
 
 def get_ms1_mzml(file_path):
+    """
+    Extract MS1 and MS2 spectra from an mzML file with MS2-to-MS1 mapping.
+
+    Iterates spectra chronologically. Each MS2 spectrum is mapped to the most
+    recent preceding MS1 spectrum, enabling precursor intensity lookup.
+
+    Args:
+        file_path: Path to the mzML file.
+
+    Returns:
+        Tuple of (ms1_spectra, ms2_to_ms1_map, ms2_spectra) where:
+        - ms1_spectra: {scan_id: {mz, intensity, retention_time}}
+        - ms2_to_ms1_map: {ms2_scan_id: preceding_ms1_scan_id}
+        - ms2_spectra: {scan_id: {retention_time, mz, intensity}}
+    """
     # Create MSExperiment object
     exp = MSExperiment()
 
@@ -66,38 +83,22 @@ def get_ms1_mzml(file_path):
     return ms1_spectra, ms2_to_ms1_map, ms2_spectra
 
 
-def get_ms1_mzml_old(file_path):
-    # Create MSExperiment object
-    exp = MSExperiment()
-
-    # Load the mzML file
-    MzMLFile().load(file_path, exp)
-
-    # Dictionary to store MS1 spectra
-    ms1_spectra = {}
-
-    # Iterate over each spectrum in the file
-    for spectrum in exp.getSpectra():
-        # Check if the spectrum is MS1
-        if spectrum.getMSLevel() == 1:
-            # Extract m/z and intensity values
-            mzs, intensities = spectrum.get_peaks()
-
-            # Convert to numpy arrays
-            mz_array = np.array(mzs)
-            intensity_array = np.array(intensities)
-
-            # Get the spectrum identifier
-            scan_id = spectrum.getNativeID()
-
-            # Add to dictionary with nested structure
-            ms1_spectra[scan_id] = {"mz": mz_array, "intensity": intensity_array}
-
-    return ms1_spectra
-
-
 def split_mzml_by_retention_time(original_file, dir_files="", time_interval=120.0):
-    """Split mzML file into smaller files based on retention time intervals"""
+    """
+    Split mzML file into time-windowed partitions for targeted searching.
+
+    Iterates spectra chronologically and writes sub-experiments to separate
+    mzML files when spectra exceed the current time window boundary.
+
+    Args:
+        original_file: Path to the input mzML file.
+        dir_files: Base directory for output (partitions go into dir_files/temp/).
+        time_interval: Duration of each partition in seconds (dynamically set to
+            perc_95 from DeepLC in the main pipeline, not always 120s).
+
+    Returns:
+        Dict mapping upper RT bound (float) to partition mzML file path (str).
+    """
     dict_mzml_files = {}
     exp = read_mzml(original_file)
     spectra = exp.getSpectra()
@@ -153,6 +154,19 @@ def split_mzml_by_retention_time(original_file, dir_files="", time_interval=120.
 
 
 def parse_mzml(file_path):
+    """
+    Parse mzML XML to extract CV parameters for each spectrum.
+
+    Extracts accession values for isolation window (MS:1000827-1000829),
+    MS level (MS:1000511), and m/z/intensity arrays (MS:1000514-1000515).
+
+    Args:
+        file_path: Path to the mzML file.
+
+    Returns:
+        Dict mapping spectrum_id to {spectrum_id, MS:1000827, MS:1000828, ...}.
+        Not used in the main pipeline.
+    """
     tree = ET.parse(file_path)
     root = tree.getroot()
 
@@ -193,17 +207,27 @@ def parse_mzml(file_path):
 
 
 def get_spectra_mzml(file_path="./LFQ_Orbitrap_AIF_Ecoli_01.mzML"):
+    """
+    Read MS2 spectra using pymzml and group by isolation window.
+
+    Groups spectra by an identifier combining isolation window lower and upper
+    bounds: "{iso_mz - lower_offset}|{iso_mz + upper_offset}".
+
+    Args:
+        file_path: Path to the mzML file.
+
+    Returns:
+        Tuple of (id_to_vals, group_to_ids) where:
+        - id_to_vals: {spectrum_id: [iso_mz, lower, upper, lower_delta, upper_delta, ident, mz_array, intensity_array]}
+        - group_to_ids: {ident: [spectrum_id, ...]}
+        Not used in the main pipeline.
+    """
     run = pymzml.run.Reader(file_path)
 
     id_to_vals = {}
     group_to_ids = {}
 
     for spectrum in run:
-        # print(dir(spectrum))
-        # print(spectrum.id_dict)
-        # print(spectrum.id_dict)
-        # print(spectrum.index)
-        # print(spectrum.to_string())
         spectrum_id = " ".join(
             [str(k) + "=" + str(v) for k, v in spectrum.id_dict.items()]
         )
@@ -247,52 +271,6 @@ def get_spectra_mzml(file_path="./LFQ_Orbitrap_AIF_Ecoli_01.mzML"):
             group_to_ids[ident].append(spectrum_id)
         except KeyError:
             group_to_ids[ident] = [spectrum_id]
-
-    return id_to_vals, group_to_ids
-
-
-def get_spectra_mzml_old(file_path="./LFQ_Orbitrap_AIF_Ecoli_01.mzML"):
-    values = parse_mzml(file_path)
-
-    id_to_vals = {}
-    group_to_ids = {}
-    for spectrum_id, spectrum_values in values.items():
-        try:
-            # if spectrum_values.get("MS:1000511") == 1.0:
-            #    continue
-            ident = (
-                str(
-                    round(
-                        spectrum_values.get("MS:1000827")
-                        - spectrum_values.get("MS:1000828"),
-                        3,
-                    )
-                )
-                + "|"
-                + str(
-                    round(
-                        spectrum_values.get("MS:1000827")
-                        + spectrum_values.get("MS:1000829"),
-                        3,
-                    )
-                )
-            )
-            id_to_vals[spectrum_id] = [
-                spectrum_values.get("MS:1000827"),
-                spectrum_values.get("MS:1000828"),
-                spectrum_values.get("MS:1000829"),
-                spectrum_values.get("MS:1000827") - spectrum_values.get("MS:1000828"),
-                spectrum_values.get("MS:1000827") + spectrum_values.get("MS:1000829"),
-                ident,
-                spectrum_values.get("MS:1000514"),
-                spectrum_values.get("MS:1000515"),
-            ]
-            try:
-                group_to_ids[ident].append(spectrum_id)
-            except KeyError:
-                group_to_ids[ident] = [spectrum_id]
-        except:
-            continue
 
     return id_to_vals, group_to_ids
 

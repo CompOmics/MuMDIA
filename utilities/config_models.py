@@ -16,6 +16,8 @@ from typing import Any, Dict, List, Optional
 
 @dataclass
 class EnzymeConfig:
+    """Enzyme digestion parameters for Sage search."""
+
     missed_cleavages: int = 2
     min_len: int = 6
     max_len: int = 30
@@ -26,12 +28,16 @@ class EnzymeConfig:
 
 @dataclass
 class ToleranceConfig:
+    """Mass tolerance settings (Da or ppm) for precursor/fragment matching."""
+
     da: Optional[List[int]] = None
     ppm: Optional[List[int]] = None
 
 
 @dataclass
 class DatabaseConfig:
+    """Protein database and search space parameters for Sage."""
+
     fasta: str = ""
     bucket_size: int = 1024
     enzyme: EnzymeConfig = field(default_factory=EnzymeConfig)
@@ -49,6 +55,7 @@ class DatabaseConfig:
     generate_decoys: bool = True
 
     def validate(self) -> None:
+        """Validate database configuration fields."""
         if not isinstance(self.fasta, str):
             raise ValueError("database.fasta must be a string")
         # Allow empty strings during initial config creation
@@ -56,6 +63,8 @@ class DatabaseConfig:
 
 @dataclass
 class SageSection:
+    """Complete Sage search engine configuration for one search stage."""
+
     mzml_paths: List[str] = field(default_factory=list)
     database: DatabaseConfig = field(default_factory=DatabaseConfig)
     precursor_tol: ToleranceConfig = field(default_factory=ToleranceConfig)
@@ -75,6 +84,7 @@ class SageSection:
     predict_rt: Optional[bool] = None
 
     def validate(self) -> None:
+        """Validate Sage section fields and cascade to database validation."""
         if not isinstance(self.mzml_paths, list):
             raise ValueError("sage section requires mzml_paths to be a list")
         # Allow empty lists during initial config creation
@@ -83,6 +93,8 @@ class SageSection:
 
 @dataclass
 class MuMDIASettings:
+    """MuMDIA pipeline settings: file paths, pickle caching flags, and processing options."""
+
     # Core paths
     mzml_file: str = "mzml_files/LFQ_Orbitrap_AIF_Ecoli_01.mzML"
     mzml_dir: str = "mzml_files"
@@ -114,6 +126,7 @@ class MuMDIASettings:
     coefficient_bounds: int = 1
 
     def validate(self) -> None:
+        """Validate MuMDIA settings (FDR must be non-negative)."""
         # Basic sanity checks aligning with argparse defaults
         if (
             not isinstance(self.fdr_init_search, (int, float))
@@ -125,17 +138,21 @@ class MuMDIASettings:
 
 @dataclass
 class ConfigModel:
+    """Top-level configuration aggregating MuMDIA settings and two Sage search stages."""
+
     mumdia: MuMDIASettings = field(default_factory=MuMDIASettings)
     sage_basic: SageSection = field(default_factory=SageSection)
     sage: SageSection = field(default_factory=SageSection)
 
     def validate(self) -> None:
+        """Cascade validation through all configuration sections."""
         self.mumdia.validate()
         self.sage_basic.validate()
         self.sage.validate()
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "ConfigModel":
+        """Construct ConfigModel from dict, filtering unknown fields and building nested objects."""
         # Extract sections with safe fallbacks
         mumdia_raw: Dict[str, Any] = data.get("mumdia", {}) or {}
         sage_basic_raw: Dict[str, Any] = data.get("sage_basic", {}) or {}
@@ -196,6 +213,7 @@ class ConfigModel:
         return cls(mumdia=mumdia, sage_basic=sage_basic, sage=sage)
 
     def to_dict(self) -> Dict[str, Any]:
+        """Convert entire config to flat dict with mumdia/sage_basic/sage sections."""
         return {
             "mumdia": asdict(self.mumdia),
             "sage_basic": asdict(self.sage_basic),

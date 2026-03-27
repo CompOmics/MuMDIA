@@ -1,3 +1,5 @@
+"""Sage parquet result parsing with modification normalization and DataFrame construction."""
+
 from pathlib import Path
 from typing import Dict, Optional, Tuple, Union
 
@@ -94,6 +96,9 @@ def parquet_reader(
 
         Returns (None, None, None, None) if no fragments pass the q-value filter
     """
+    # Sage writes parquet files using the Arrow/Pandas convention, so we read
+    # them with Pandas first (which handles Sage's schema directly) and then
+    # convert to Polars DataFrames for the rest of the pipeline.
     df_fragment = pd.read_parquet(parquet_file_fragments)
     df_fragment.index = df_fragment["psm_id"]
 
@@ -108,6 +113,7 @@ def parquet_reader(
     log_info("df_psms shape after filtering by q-value: {}".format(df_psms.shape))
     df_fragment = df_fragment[df_fragment.index.isin(df_psms["psm_id"])]
 
+    # Convert from Pandas to Polars for efficient downstream processing
     df_fragment = pl.DataFrame(df_fragment)
     df_psms = pl.DataFrame(df_psms)
 
@@ -121,6 +127,10 @@ def parquet_reader(
     # df_psms.index = df_psms["psm_id"]
     # df_psms = pd.concat([df_psms, df_fragment_max["fragment_intensity"]], axis=1)
 
+    # Normalize numeric mass-shift annotations in peptide sequences to named
+    # modification strings. For example, [+57.0215] becomes [Carbamidomethyl].
+    # This is needed because Sage outputs raw mass shifts, but downstream tools
+    # (MS2PIP, DeepLC) expect named modification formats.
     df_psms = df_psms.with_columns(
         pl.col("peptide").map_elements(replace_mass_shift).alias("peptide")
     )
@@ -135,8 +145,10 @@ def parquet_reader(
         subset="psm_id", keep="first", maintain_order=True
     )
 
-    # For each peptide/charge combination, find the PSM with the highest total fragment intensity
-    # This should represent the "apex" or most intense spectrum for that peptide
+    # Build the "apex PSM per peptidoform" table: for each unique
+    # (peptide, charge) pair, keep only the PSM with the highest fragment
+    # intensity. This gives one representative spectrum per precursor, which
+    # is used later for feature extraction and RT calibration.
     df_fragment_max_peptide = (
         df_fragment_max.with_columns(
             [

@@ -8,7 +8,7 @@ with real data from the MuMDIA pipeline.
 import pandas as pd
 import pickle
 import numpy as np
-from diann_feature_generator import DIANNFeatureGenerator, FeatureConfig
+from feature_generators.diann_feature_generator import DIANNFeatureGenerator, FeatureConfig
 import logging
 from tqdm import tqdm
 from multiprocessing import Pool, cpu_count
