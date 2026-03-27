@@ -7,7 +7,7 @@ import polars as pl
 
 def add_retention_time_features(
     df_psms: pl.DataFrame,
-    predictions_deeplc: pl.DataFrame,
+    predictions_deeplc: pl.DataFrame = None,
     filter_rel_rt_error: float = 0.2,
     rt_prediction_error_abs: bool = True,
     rt_prediction_error_abs_relative: bool = True,
@@ -27,8 +27,10 @@ def add_retention_time_features(
     when falling back to absolute error.
 
     Args:
-        df_psms: PSM DataFrame with 'peptide' and 'rt' columns
-        predictions_deeplc: DataFrame with 'peptide' and 'rt_predictions' columns
+        df_psms: PSM DataFrame with 'peptide' and 'rt' columns.
+        predictions_deeplc: DataFrame with 'peptide' and 'rt_predictions' columns.
+            If None, df_psms must already contain 'rt_predictions' (e.g. from
+            predict_deeplc_pl in Stage 1).
         filter_rel_rt_error: Maximum relative RT error threshold for filtering (default: 0.2)
         rt_prediction_error_abs: Whether to calculate absolute RT error (default: True)
         rt_prediction_error_abs_relative: Whether to calculate relative RT error (default: True)
@@ -38,7 +40,8 @@ def add_retention_time_features(
         Added columns: rt_predictions, rt_prediction_error_abs, rt_prediction_error_abs_relative
     """
 
-    df_psms = df_psms.join(predictions_deeplc, on=["peptide"], how="left")
+    if predictions_deeplc is not None:
+        df_psms = df_psms.join(predictions_deeplc, on=["peptide"], how="left")
     # max_rt is the latest observed retention time in the experiment. Dividing
     # by max_rt converts absolute RT error into a fraction of the experiment's
     # total RT range, so the filter_rel_rt_error threshold (e.g. 0.2 = 20%)

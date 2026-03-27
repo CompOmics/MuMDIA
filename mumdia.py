@@ -1290,10 +1290,7 @@ def calculate_features(
     )
 
     # Step 2: Compute RT error features and filter out poor predictions.
-    # BUG: add_retention_time_features() requires (df_psms, predictions_deeplc, ...)
-    # but predictions_deeplc is not passed here. This call is missing the 2nd positional arg.
-    # It works only if df_psms already has 'rt_predictions' column (joined in Step 1)
-    # AND the function signature is updated to make predictions_deeplc optional.
+    # predictions_deeplc=None because rt_predictions is already in df_psms from Step 1.
     log_info("Obtaining features retention time...")
     df_psms = add_retention_time_features(df_psms, filter_rel_rt_error=0.15)
 

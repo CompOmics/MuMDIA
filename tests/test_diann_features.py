@@ -296,7 +296,7 @@ def load_test_data():
         return None
 
 
-def test_single_precursor(data, precursor_id="GYINSLGALTGGQALQQAK/2"):
+def check_single_precursor(data, precursor_id="GYINSLGALTGGQALQQAK/2"):
     """Test feature generation for a single precursor."""
 
     logger.info(f"Testing feature generation for precursor: {precursor_id}")
@@ -379,7 +379,7 @@ def print_feature_summary(features):
     print("\n" + "=" * 50)
 
 
-def test_multiple_precursors(data, max_precursors=5):
+def check_multiple_precursors(data, max_precursors=5):
     """Test feature generation for multiple precursors."""
 
     logger.info(f"Testing feature generation for up to {max_precursors} precursors")
@@ -392,7 +392,7 @@ def test_multiple_precursors(data, max_precursors=5):
     for precursor_id in unique_precursors:
         try:
             logger.info(f"Processing {precursor_id}")
-            features = test_single_precursor(data, precursor_id)
+            features = check_single_precursor(data, precursor_id)
             if features:
                 results[precursor_id] = features
             else:
@@ -436,7 +436,7 @@ def benchmark_performance(data, num_tests=10):
         start_time = time.time()
 
         try:
-            features = test_single_precursor(data, precursor_id)
+            features = check_single_precursor(data, precursor_id)
             if features:
                 elapsed = time.time() - start_time
                 times.append(elapsed)
@@ -1023,7 +1023,7 @@ def main_sequential():
 
     # Test single precursor
     print("\n1. Testing single precursor...")
-    features = test_single_precursor(data)
+    features = check_single_precursor(data)
 
     if features:
         print_feature_summary(features)

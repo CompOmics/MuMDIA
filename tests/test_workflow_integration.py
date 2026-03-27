@@ -41,53 +41,68 @@ class TestWorkflowIntegration:
 
     @pytest.mark.skipif(not RUN_MODULE_AVAILABLE, reason="run module not available")
     @pytest.mark.integration
-    def test_argument_parsing_integration(self):
-        """Test command line argument parsing and validation."""
-        with patch(
-            "sys.argv",
-            ["run.py", "--mzml_file", "test.mzML", "--result_dir", "test_results"],
-        ):
-            parser, args = run.parse_arguments()
+    def test_config_loading_integration(self):
+        """Test loading config from JSON and generating search configs."""
+        from config import MuMDIAConfig, load_config_from_json
 
-            assert hasattr(args, "mzml_file")
-            assert hasattr(args, "result_dir")
-            assert args.mzml_file == "test.mzML"
-            assert args.result_dir == "test_results"
-
-    @pytest.mark.skipif(not RUN_MODULE_AVAILABLE, reason="run module not available")
-    @pytest.mark.integration
-    def test_config_modification_workflow(self):
-        """Test configuration modification and validation workflow."""
-        # Create a temporary config file
+        # Create a temporary config file in the new flat format
         config_data = {
-            "mumdia": {"fdr_init_search": 0.01, "min_occurrences": 1},
-            "sage": {"database": {"fasta": "test.fasta"}},
+            "mzml_file": "test.mzML",
+            "fasta_file": "test.fasta",
+            "result_dir": "test_results",
+            "fdr_init_search": 0.01,
         }
 
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".json", delete=False
+        ) as f:
             json.dump(config_data, f)
             config_path = f.name
 
         try:
-            with tempfile.TemporaryDirectory() as temp_dir:
-                # Mock parser and args with proper defaults
-                parser = Mock()
-                parser._actions = []
+            config = load_config_from_json(config_path)
+            assert config.mzml_file == "test.mzML"
+            assert config.result_dir == "test_results"
+            assert config.fdr_init_search == 0.01
 
-                # Create a proper args namespace without sentinel objects
-                args = argparse.Namespace(
-                    fdr_init_search=0.05, min_occurrences=1, database=None, fasta=None
-                )
+            initial = config.get_initial_search_config()
+            full = config.get_full_search_config()
+            assert "database" in initial
+            assert "database" in full
+        finally:
+            os.unlink(config_path)
 
-                # Test config modification
-                new_config_path = run.modify_config(config_path, temp_dir, parser, args)
+    @pytest.mark.skipif(not RUN_MODULE_AVAILABLE, reason="run module not available")
+    @pytest.mark.integration
+    def test_legacy_config_conversion(self):
+        """Test that legacy nested configs are auto-converted."""
+        from config import load_config_from_json
 
-                # Verify new config was created
-                assert os.path.exists(new_config_path)
+        config_data = {
+            "sage_basic": {
+                "database": {"fasta": "test.fasta", "enzyme": {"cleave_at": "KR"}},
+                "deisotope": False,
+                "report_psms": 5,
+            },
+            "sage": {
+                "database": {"fasta": "test.fasta", "enzyme": {"cleave_at": "$"}},
+                "deisotope": True,
+                "report_psms": 12,
+            },
+            "mumdia": {"fdr_init_search": 0.01},
+        }
 
-                with open(new_config_path) as f:
-                    updated_config = json.load(f)
-                    assert "mumdia" in updated_config
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".json", delete=False
+        ) as f:
+            json.dump(config_data, f)
+            config_path = f.name
+
+        try:
+            config = load_config_from_json(config_path)
+            mumdia_config = config.get_mumdia_config()
+            assert "fdr_init_search" in mumdia_config
+            assert mumdia_config["fdr_init_search"] == 0.01
         finally:
             os.unlink(config_path)
 
