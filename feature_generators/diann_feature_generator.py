@@ -9,19 +9,20 @@ Author: Generated from Jupyter notebook analysis
 Date: August 2025
 """
 
-import numpy as np
-import pandas as pd
-from typing import Dict, List, Tuple, Optional, Union, Any
-from scipy.signal import savgol_filter
-from dataclasses import dataclass
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from functools import partial
-import matplotlib.pyplot as plt
+from typing import Any, Dict, List, Optional, Tuple, Union
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from scipy.signal import savgol_filter
+
+# Silence DIA-NN feature generator logging — too verbose for per-peptidoform calls
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.CRITICAL)
 
 
 @dataclass
@@ -48,7 +49,9 @@ class FeatureConfig:
     ms2_accuracy_factors: List[float] = None
 
     # Feature toggles
-    enable_ms1_features: bool = False  # MS1-based features (groups 2-3); slow, disabled by default
+    enable_ms1_features: bool = (
+        False  # MS1-based features (groups 2-3); slow, disabled by default
+    )
 
     # Parallelization settings
     n_jobs: int = -1  # -1 means use all available CPU cores
@@ -105,7 +108,9 @@ class DIANNFeatureGenerator:
         self._correlation_cache = {}
 
         # Pre-processed MS1 data (set via prepare_ms1_dict)
-        self._ms1_prepared = None  # list of (rt, mz_array, intensity_array) sorted by RT
+        self._ms1_prepared = (
+            None  # list of (rt, mz_array, intensity_array) sorted by RT
+        )
 
         logger.info("Initialized DIANNFeatureGenerator with built-in optimizations")
 
@@ -772,9 +777,11 @@ class DIANNFeatureGenerator:
         try:
             # Avoid double plotting here: get correlations without visualization,
             # then perform visualization specific to this "top-n" feature below.
-            best_trace, smoothed_best_trace, correlations = (
-                self.calculate_pearson_correlations(fragments, visualize=False)
-            )
+            (
+                best_trace,
+                smoothed_best_trace,
+                correlations,
+            ) = self.calculate_pearson_correlations(fragments, visualize=False)
 
             # Determine the top-n fragments according to your internal criterion
             top_fragments = self.find_top_n_fragments(fragments, n)
@@ -975,10 +982,12 @@ class DIANNFeatureGenerator:
                         continue
 
                 # Calculate correlations using the determined reference fragment
-                _, _, correlations = (
-                    self.calculate_pearson_correlations(  # TODO: Use all RT???
-                        filtered, best_fragment=reference_fragment
-                    )
+                (
+                    _,
+                    _,
+                    correlations,
+                ) = self.calculate_pearson_correlations(  # TODO: Use all RT???
+                    filtered, best_fragment=reference_fragment
                 )
 
                 # Get top N fragments from the filtered data
@@ -3373,24 +3382,24 @@ class DIANNFeatureGenerator:
 
         # Group 1: Ion co-elution (MS2 level)
         try:
-            features["pearson_correlations_top_12"] = (
-                self.feature_pearson_correlations_top_n(fragments)
-            )
-            features["sum_correlations_mass_accuracy"] = (
-                self.feature_sum_correlations_mass_accuracy(fragments)
-            )
-            features["remaining_fragments_correlations"] = (
-                self.feature_remaining_fragments_correlations(fragments)
-            )
-            features["best_b_fragments_correlation"] = (
-                self.feature_best_b_fragments_correlation(fragments)
-            )
+            features[
+                "pearson_correlations_top_12"
+            ] = self.feature_pearson_correlations_top_n(fragments)
+            features[
+                "sum_correlations_mass_accuracy"
+            ] = self.feature_sum_correlations_mass_accuracy(fragments)
+            features[
+                "remaining_fragments_correlations"
+            ] = self.feature_remaining_fragments_correlations(fragments)
+            features[
+                "best_b_fragments_correlation"
+            ] = self.feature_best_b_fragments_correlation(fragments)
 
             if ms1_dict is not None:
-                features["precursor_best_fragment_correlation"] = (
-                    self.feature_precursor_best_fragment_correlation(
-                        precursor, fragments, ms1_dict
-                    )
+                features[
+                    "precursor_best_fragment_correlation"
+                ] = self.feature_precursor_best_fragment_correlation(
+                    precursor, fragments, ms1_dict
                 )
         except Exception as e:
             logger.error(f"Error in group 1 features: {e}")
@@ -3398,10 +3407,10 @@ class DIANNFeatureGenerator:
         # Group 2: MS1 level co-elution
         if ms1_dict is not None:
             try:
-                features["ms1_accuracy_correlations"] = (
-                    self.feature_ms1_accuracy_correlations(
-                        precursor, fragments, ms1_dict
-                    )
+                features[
+                    "ms1_accuracy_correlations"
+                ] = self.feature_ms1_accuracy_correlations(
+                    precursor, fragments, ms1_dict
                 )
             except Exception as e:
                 logger.error(f"Error in group 2 features: {e}")
@@ -3409,22 +3418,22 @@ class DIANNFeatureGenerator:
         # Group 3: Isotopologue co-elution
         if ms1_dict is not None:
             try:
-                features["c13_isotope_correlations"] = (
-                    self.feature_c13_isotope_correlations(
-                        precursor, fragments, ms1_dict
-                    )
+                features[
+                    "c13_isotope_correlations"
+                ] = self.feature_c13_isotope_correlations(
+                    precursor, fragments, ms1_dict
                 )
             except Exception as e:
                 logger.error(f"Error in group 3.1 features: {e}")
 
         if ms2dict is not None:
             try:
-                features["c13_subtracted_correlations"] = (
-                    self.feature_c13_subtracted_correlations(fragments, ms2dict)
-                )
-                features["sum_c13_subtracted_correlations"] = (
-                    self.feature_sum_c13_subtracted_correlations(fragments, ms2dict)
-                )
+                features[
+                    "c13_subtracted_correlations"
+                ] = self.feature_c13_subtracted_correlations(fragments, ms2dict)
+                features[
+                    "sum_c13_subtracted_correlations"
+                ] = self.feature_sum_c13_subtracted_correlations(fragments, ms2dict)
             except Exception as e:
                 logger.error(f"Error in group 3.3-3.4 features: {e}")
 
@@ -3436,9 +3445,9 @@ class DIANNFeatureGenerator:
 
         # Group 5: Fragment intensities
         try:
-            features["relative_intensities_top_6"] = (
-                self.feature_relative_intensities_top_6(fragments)
-            )
+            features[
+                "relative_intensities_top_6"
+            ] = self.feature_relative_intensities_top_6(fragments)
         except Exception as e:
             logger.error(f"Error in group 5 features: {e}")
 
@@ -3454,9 +3463,9 @@ class DIANNFeatureGenerator:
         try:
             features["rt_apex"] = self.feature_rt_apex(fragments)
             if rt_predictions is not None:
-                features["rt_prediction_difference"] = (
-                    self.feature_rt_prediction_difference(fragments, rt_predictions)
-                )
+                features[
+                    "rt_prediction_difference"
+                ] = self.feature_rt_prediction_difference(fragments, rt_predictions)
         except Exception as e:
             logger.error(f"Error in group 7 features: {e}")
 
@@ -3475,15 +3484,15 @@ class DIANNFeatureGenerator:
             features["precursor_length"] = self.feature_precursor_length(precursor)
 
             if intensity_predictions is not None:
-                features["relative_predicted_intensities"] = (
-                    self.feature_relative_predicted_intensities(
-                        fragments, intensity_predictions
-                    )
+                features[
+                    "relative_predicted_intensities"
+                ] = self.feature_relative_predicted_intensities(
+                    fragments, intensity_predictions
                 )
-                features["library_fragment_count"] = (
-                    self.feature_library_fragment_count(
-                        precursor, intensity_predictions
-                    )
+                features[
+                    "library_fragment_count"
+                ] = self.feature_library_fragment_count(
+                    precursor, intensity_predictions
                 )
         except Exception as e:
             logger.error(f"Error in group 10 features: {e}")

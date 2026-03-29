@@ -642,7 +642,6 @@ def match_fragments(
     """
     # first column is PSM ID, ignore that one, messes up calculation as it is numeric
     intensity_matrix = intensity_matrix_df[:, 1:].to_numpy()
-    # Get fragment names, first column is PMS ID, ignore that one, messes up calculation as it is numeric
     fragment_names = intensity_matrix_df.columns[1:]
 
     # Prepare predicted fragment intensities for all fragments in the matrix columns
@@ -650,123 +649,142 @@ def match_fragments(
         [ms2pip_predictions.get(fid, 0.0) for fid in fragment_names]
     )
 
-    # Collect predictions for keys not listed in fragment_names (i.e., fragments predicted but not observed)
+    # Collect predictions for keys not listed in fragment_names (not observed)
     non_matched_predictions = np.array(
         [v for k, v in ms2pip_predictions.items() if k not in fragment_names]
     )
 
-    # Sum of predicted intensities for matched fragments (for feature engineering)
-    # TODO: is it a good idea to sum over PSMs? Or should we do it per PSM?
+    # Concatenate predictions (matched + non-matched)
+    pred_frag_intens_full = np.concatenate((pred_frag_intens, non_matched_predictions))
+
+    # Zero-pad intensity matrix to match full prediction vector length
+    pad_width = len(pred_frag_intens_full) - intensity_matrix.shape[1]
+    if pad_width > 0:
+        intensity_matrix = np.pad(
+            intensity_matrix,
+            ((0, 0), (0, pad_width)),
+            mode="constant",
+            constant_values=0,
+        )
+
+    intensity_matrix = intensity_matrix.astype(np.float64)
+    pred_frag_intens_full = pred_frag_intens_full.astype(np.float64)
+
+    n_psms = intensity_matrix.shape[0]
+    n_frags = intensity_matrix.shape[1]
+    non_matched_sum = (
+        float(non_matched_predictions.sum())
+        if len(non_matched_predictions) > 0
+        else 0.0
+    )
+
+    # Find apex PSM index
+    apex_idx = 0
+    if n_psms > 0:
+        row_maxes = intensity_matrix.max(axis=1)
+        apex_idx = int(np.argmax(row_maxes))
+
+    # Fast path: single Rust call for all matrix operations
+    if _RUST_CORRELATIONS:
+        (
+            correlation_result,
+            correlation_result_counts,
+            sum_pred_frag_intens_val,
+            correlation_matrix_psm_ids,
+            correlation_matrix_frag_ids,
+            most_intens_cor_val,
+            most_intens_cos_val,
+            mse_avg_pred_intens,
+            mse_avg_pred_intens_total,
+        ) = mumdia_rs.compute_fragment_correlations(
+            np.ascontiguousarray(intensity_matrix).ravel(),
+            n_psms,
+            n_frags,
+            np.ascontiguousarray(pred_frag_intens_full),
+            non_matched_sum,
+            apex_idx,
+        )
+        return CorrelationResults(
+            correlations=correlation_result,
+            correlations_count=correlation_result_counts,
+            sum_pred_frag_intens=np.array(sum_pred_frag_intens_val),
+            correlation_matrix_psm_ids=correlation_matrix_psm_ids,
+            correlation_matrix_frag_ids=correlation_matrix_frag_ids,
+            most_intens_cor=most_intens_cor
+            if most_intens_cor != 0.0
+            else most_intens_cor_val,
+            most_intens_cos=most_intens_cos
+            if most_intens_cos != 0.0
+            else most_intens_cos_val,
+            mse_avg_pred_intens=mse_avg_pred_intens,
+            mse_avg_pred_intens_total=mse_avg_pred_intens_total,
+        )
+
+    # Fallback: Python path
     sum_pred_frag_intens = np.array(
         sum([ms2pip_predictions.get(fid, 0.0) for fid in fragment_names])
     )
 
-    # Ensure data types are consistent for downstream calculations
-    intensity_matrix = intensity_matrix.astype(np.float32)
-    pred_frag_intens = pred_frag_intens.astype(np.float32)
-    non_matched_predictions = non_matched_predictions.astype(np.float32)
-
-    # Concatenate predicted intensities for matched and non-matched fragments
-    pred_frag_intens = np.concatenate((pred_frag_intens, non_matched_predictions))
-
-    # Zero-pad the intensity matrix columns to match the full prediction vector length.
-    # Fragments that MS2PIP predicted but were NOT observed in any PSM get zero observed
-    # intensity. This ensures the prediction and observation vectors have equal length
-    # for correlation/error calculations, and penalizes PSMs that are missing expected
-    # fragments (a predicted-but-absent fragment contributes 0 observed vs nonzero predicted).
-    pad_width = len(pred_frag_intens) - len(intensity_matrix[0])
-    intensity_matrix = np.pad(
-        intensity_matrix, ((0, 0), (0, pad_width)), mode="constant", constant_values=0
+    # Normalize each PSM row independently by its own max intensity
+    intensity_matrix_normalized = intensity_matrix / np.maximum(
+        intensity_matrix.max(axis=1, keepdims=True), 1e-10
     )
 
-    # Normalize each PSM row independently by its own max intensity, scaling to [0, 1].
-    # This removes absolute intensity differences between PSMs (e.g., due to varying
-    # injection amounts or elution profiles) so that correlations reflect relative
-    # fragment patterns rather than overall signal strength.
-    intensity_matrix_normalized = intensity_matrix / intensity_matrix.max(
-        axis=1, keepdims=True
-    )
-
-    # Compute correlations between observed and predicted intensities for each PSM
     correlation_result = compute_correlations(
-        intensity_matrix_normalized, pred_frag_intens
+        intensity_matrix_normalized, pred_frag_intens_full
     )
 
-    # Count the number of nonzero entries per PSM (for feature engineering)
-    # TODO: is there a relevance to this? Because the number of columns depends on the max number of fragments for the PSM with the most fragments
     correlation_result_counts = (
         intensity_matrix_df.select(
-            pl.fold(  # fold is used to apply a function across multiple columns
-                acc=pl.lit(0),  # Initialize accumulator to zero
+            pl.fold(
+                acc=pl.lit(0),
                 exprs=[
-                    (pl.col(c) != 0).cast(pl.Int64)
-                    for c in intensity_matrix_df.columns  # Convert non-zero entries to 1
+                    (pl.col(c) != 0).cast(pl.Int64) for c in intensity_matrix_df.columns
                 ],
-                function=lambda acc, x: acc + x,  # Sum the non-zero counts
-            ).alias(
-                "non_zero_count"
-            )  # Rename the result column
+                function=lambda acc, x: acc + x,
+            ).alias("non_zero_count")
         )
-        .to_numpy()  # Convert to NumPy array for consistency
-        .ravel()  # Flatten the array to 1D
+        .to_numpy()
+        .ravel()
     )
 
-    # Compute mean squared error between normalized observed and predicted intensities (per PSM, then averaged)
     mse_avg_pred_intens = (
-        abs(intensity_matrix_normalized - pred_frag_intens).sum(axis=1)
-    ).sum() / intensity_matrix_normalized.shape[0]
+        abs(intensity_matrix_normalized - pred_frag_intens_full).sum(axis=1)
+    ).sum() / n_psms
 
-    # Compute total MSE including non-matched predictions
     mse_avg_pred_intens_total = (
-        (abs(intensity_matrix_normalized - pred_frag_intens).sum(axis=1)).sum()
-        + sum(non_matched_predictions)
-    ) / intensity_matrix_normalized.shape[0]
+        (abs(intensity_matrix_normalized - pred_frag_intens_full).sum(axis=1)).sum()
+        + non_matched_sum
+    ) / n_psms
 
-    # Compute correlation matrix for PSM IDs (rows of intensity matrix)
-    if intensity_matrix_normalized.shape[0] > 1:  # Ensure there are multiple PSMs
-        correlation_matrix_psm_ids = np.corrcoef(
-            intensity_matrix_normalized
-        )  # Calculate correlation matrix for PSM IDs
-
-        # Remove diagonal elements (self-correlation) and flatten to 1D
+    if n_psms > 1:
+        correlation_matrix_psm_ids = np.corrcoef(intensity_matrix_normalized)
         correlation_matrix_psm_ids = correlation_matrix_psm_ids[
             ~np.eye(correlation_matrix_psm_ids.shape[0], dtype=bool)
         ]
-        # Square correlations to get R² (coefficient of determination), which
-        # represents the proportion of variance explained. Sorting produces a
-        # ranked distribution of PSM-pair agreement for downstream feature extraction.
-        # NOTE: this converts r to R², unlike the fragment correlation matrix below.
         correlation_matrix_psm_ids = np.sort(correlation_matrix_psm_ids**2)
     else:
-        # If only one PSM, set all correlation matrices to empty
         correlation_matrix_psm_ids = np.array([])
 
-    # Compute correlation matrix for fragment IDs (columns of intensity matrix)
-    if intensity_matrix_normalized.shape[1] > 1:
+    if n_frags > 1:
         correlation_matrix_frag_ids = np.corrcoef(intensity_matrix_normalized.T)
-
-        # Remove diagonal elements (self-correlation) and flatten to 1D
         correlation_matrix_frag_ids = correlation_matrix_frag_ids[
             ~np.eye(correlation_matrix_frag_ids.shape[0], dtype=bool)
         ]
-        # Sort the fragment-pair correlations. NOTE: unlike the PSM correlation
-        # matrix above, these are NOT squared (raw Pearson r, not R²). This
-        # preserves the sign, allowing detection of anti-correlated fragment pairs.
         correlation_matrix_frag_ids = np.sort(correlation_matrix_frag_ids)
     else:
-        # If only one fragment, set all correlation matrices to empty
         correlation_matrix_frag_ids = np.array([])
 
     return CorrelationResults(
-        correlations=correlation_result,  # Pearson correlation between predicted and observed intensities
-        correlations_count=correlation_result_counts,  # Count of non-zero fragments entries per PSM
-        sum_pred_frag_intens=sum_pred_frag_intens,  # Sum of predicted fragment intensities for matched fragments
-        correlation_matrix_psm_ids=correlation_matrix_psm_ids,  # Correlation matrix for PSMs, i.e. the correlation between fragments of different PSMs
-        correlation_matrix_frag_ids=correlation_matrix_frag_ids,  # Correlation matrix for fragments, i.e. the correlation between fragments of every PSM
-        most_intens_cor=most_intens_cor,  # Pearson correlation of the most intense PSM
-        most_intens_cos=most_intens_cos,  # Cosine similarity of the most intense PSM
-        mse_avg_pred_intens=mse_avg_pred_intens,  # Average MSE of predicted fragment intensities
-        mse_avg_pred_intens_total=mse_avg_pred_intens_total,  # Total MSE of predicted fragment intensities including non-matched predictions
+        correlations=correlation_result,
+        correlations_count=correlation_result_counts,
+        sum_pred_frag_intens=sum_pred_frag_intens,
+        correlation_matrix_psm_ids=correlation_matrix_psm_ids,
+        correlation_matrix_frag_ids=correlation_matrix_frag_ids,
+        most_intens_cor=most_intens_cor,
+        most_intens_cos=most_intens_cos,
+        mse_avg_pred_intens=mse_avg_pred_intens,
+        mse_avg_pred_intens_total=mse_avg_pred_intens_total,
     )
 
 

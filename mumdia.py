@@ -836,7 +836,7 @@ def run_peptidoform_diann(df_psms_sub, df_fragment_sub, spectra_data, ms2pip_pre
             parallel=False,  # Already inside ThreadPoolExecutor
         )
     except Exception as e:
-        logging.warning(f"DIA-NN features failed for peptidoform: {e}")
+        logging.debug(f"DIA-NN features failed for peptidoform: {e}")
         return pl.DataFrame({"diann_failed": [1.0]})
 
     # Flatten dict → 1-row DataFrame with diann_ prefix

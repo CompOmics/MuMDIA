@@ -5,6 +5,7 @@ use pyo3::prelude::*;
 
 mod batch;
 mod correlation;
+mod fragment_correlations;
 mod percentiles;
 mod topk;
 
@@ -113,6 +114,66 @@ fn batch_correlation_features(
     })
 }
 
+/// Compute cosine similarity between two 1D arrays. Returns 0.0 for zero-norm inputs.
+#[pyfunction]
+fn cosine_similarity(py: Python<'_>, a: PyReadonlyArray1<f64>, b: PyReadonlyArray1<f64>) -> f64 {
+    let a_vec = a.as_slice().unwrap().to_vec();
+    let b_vec = b.as_slice().unwrap().to_vec();
+    py.allow_threads(|| fragment_correlations::cosine_similarity_impl(&a_vec, &b_vec))
+}
+
+/// Complete fragment correlation pipeline.
+/// Takes intensity matrix (n_psms x n_frags, NOT yet row-normalized),
+/// prediction vector, non-matched prediction sum, and apex index.
+/// Returns tuple of 9 values matching CorrelationResults.
+#[pyfunction]
+#[pyo3(signature = (intensity_data, n_psms, n_frags, matched_predictions, non_matched_sum, apex_psm_idx))]
+fn compute_fragment_correlations<'py>(
+    py: Python<'py>,
+    intensity_data: PyReadonlyArray1<f64>,
+    n_psms: usize,
+    n_frags: usize,
+    matched_predictions: PyReadonlyArray1<f64>,
+    non_matched_sum: f64,
+    apex_psm_idx: usize,
+) -> (
+    Bound<'py, PyArray1<f64>>,
+    Bound<'py, PyArray1<f64>>,
+    f64,
+    Bound<'py, PyArray1<f64>>,
+    Bound<'py, PyArray1<f64>>,
+    f64,
+    f64,
+    f64,
+    f64,
+) {
+    let data = intensity_data.as_slice().unwrap().to_vec();
+    let preds = matched_predictions.as_slice().unwrap().to_vec();
+
+    let result = py.allow_threads(|| {
+        fragment_correlations::compute_fragment_correlations_impl(
+            &data,
+            n_psms,
+            n_frags,
+            &preds,
+            non_matched_sum,
+            apex_psm_idx,
+        )
+    });
+
+    (
+        PyArray1::from_vec(py, result.correlations),
+        PyArray1::from_vec(py, result.correlation_counts),
+        result.sum_pred_frag_intens,
+        PyArray1::from_vec(py, result.corr_matrix_psm_ids),
+        PyArray1::from_vec(py, result.corr_matrix_frag_ids),
+        result.most_intens_cor,
+        result.most_intens_cos,
+        result.mse_avg_pred_intens,
+        result.mse_avg_pred_intens_total,
+    )
+}
+
 /// Rust-accelerated numerical functions for MuMDIA proteomics pipeline.
 #[pymodule]
 fn mumdia_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -122,5 +183,7 @@ fn mumdia_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(pearson_1d, m)?)?;
     m.add_function(wrap_pyfunction!(compute_correlations, m)?)?;
     m.add_function(wrap_pyfunction!(batch_correlation_features, m)?)?;
+    m.add_function(wrap_pyfunction!(cosine_similarity, m)?)?;
+    m.add_function(wrap_pyfunction!(compute_fragment_correlations, m)?)?;
     Ok(())
 }
