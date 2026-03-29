@@ -672,6 +672,24 @@ def run_peptidoform_correlation(
         mse_avg_pred_intens_total,
     ) = correlations_list
 
+    # Fast path: single Rust call replaces 10 Python→Rust round trips
+    if _RUST_BACKEND:
+        feature_dict = mumdia_rs.batch_correlation_features(
+            np.asarray(correlations, dtype=np.float64),
+            np.asarray(correlation_result_counts, dtype=np.float64),
+            np.asarray(correlation_matrix_psm_ids, dtype=np.float64),
+            np.asarray(correlation_matrix_frag_ids, dtype=np.float64),
+            float(most_intens_cor),
+            float(most_intens_cos),
+            float(mse_avg_pred_intens),
+            float(mse_avg_pred_intens_total),
+            [float(x) for x in collect_distributions],
+            [int(x) for x in collect_top],
+            pad_size,
+        )
+        return pl.DataFrame(feature_dict)
+
+    # Fallback: Python path with 10 separate calls
     feature_dict = {}
     params = [
         (
@@ -737,8 +755,6 @@ def run_peptidoform_correlation(
         )
 
     df = pl.DataFrame(feature_dict)
-    # df.write_csv("debug/correlation_features.csv")
-
     return df
 
 
@@ -1617,9 +1633,10 @@ def calculate_features(
     # Pre-convert MS1 data to sorted numpy arrays for fast DIA-NN elution profiles
     _prepare_diann_ms1(spectra_data)
 
-    # Sequential processing — all work is CPU-bound (numpy/pandas/polars) so the
-    # GIL makes ThreadPoolExecutor counterproductive (measured 3-6x slower than
-    # single-threaded due to thread contention). Sequential: ~13 it/s vs ~2 it/s.
+    # Sequential processing. Even with Rust GIL release, ThreadPoolExecutor is
+    # slower because process_peptidoform() still does significant Python work
+    # (Polars aggregation, DIA-NN pandas conversion, dict building) that holds
+    # the GIL. Threading will only help once more of the pipeline is in Rust.
     pin_in = [
         process_peptidoform(args)
         for args in tqdm(peptidoform_args, desc="Processing peptidoforms")
