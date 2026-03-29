@@ -81,6 +81,7 @@ def convert_legacy_config(legacy_data: Dict[str, Any]) -> Dict[str, Any]:
         "read_initial_search_pickle": "read_initial_search_pickle",
         "remove_intermediate_files": "remove_intermediate_files",
         "fdr_init_search": "fdr_init_search",
+        "min_occurrences": "min_occurrences",
     }
     
     if "mumdia" in legacy_data:
@@ -217,6 +218,9 @@ class MuMDIAConfig:
     read_full_search_pickle: bool = False
     read_initial_search_pickle: bool = False
     
+    # Filtering settings
+    min_occurrences: int = 5  # Minimum PSMs per peptide to keep
+
     # Processing settings
     remove_intermediate_files: bool = False
     dlc_transfer_learn: bool = False
@@ -233,6 +237,7 @@ class MuMDIAConfig:
     clean: bool = False
     sage_only: bool = False
     skip_mokapot: bool = False
+    use_diann_features: bool = True
     verbose: bool = False
     
     # Feature settings
@@ -382,7 +387,8 @@ class MuMDIAConfig:
             "clean": self.clean,
             "sage_only": self.sage_only,
             "skip_mokapot": self.skip_mokapot,
-            "verbose": self.verbose
+            "verbose": self.verbose,
+            "min_occurrences": self.min_occurrences
         }
     
     def to_legacy_format(self) -> Dict[str, Any]:

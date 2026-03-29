@@ -248,9 +248,14 @@ def pearson_np_nb(x, y):
 #############################################
 
 
-def create_model():
+def create_model(meta=None):
     """
-    Create and compile a simple Keras model.
+    Create and compile a Keras model for Mokapot PSM scoring.
+
+    Args:
+        meta: Metadata dict from scikit-keras containing n_features_in_,
+            n_classes_, etc. Automatically passed by KerasClassifier at
+            fit time with the actual feature count from training data.
     """
     try:
         from keras.layers import Dense
@@ -260,11 +265,11 @@ def create_model():
             f"Keras is required to build the model for mokapot integration ({e})."
         )
 
-    # NOTE: input_dim=69 may be stale — the actual PIN file feature count depends
-    # on which Sage columns are present after collapse (~95-105 features).
-    # If this mismatches, Keras will raise an InputSpec error at training time.
+    # Extract feature count from scikit-keras metadata, or fall back to default
+    n_features = meta["n_features_in_"] if meta else 69
+
     model = Sequential()
-    model.add(Dense(100, input_dim=69, activation="relu"))
+    model.add(Dense(100, input_dim=n_features, activation="relu"))
     model.add(Dense(50, activation="relu"))
     model.add(Dense(20, activation="relu"))
     model.add(Dense(1, activation="sigmoid"))  # Binary output: target vs decoy
@@ -730,14 +735,112 @@ def run_peptidoform_correlation(
     return df
 
 
+_diann_generator = None
+
+
+def _get_diann_generator():
+    """Return a shared DIANNFeatureGenerator, creating it once on first call."""
+    global _diann_generator
+    if _diann_generator is None:
+        from feature_generators.diann_feature_generator import (
+            DIANNFeatureGenerator,
+            FeatureConfig,
+        )
+        _diann_generator = DIANNFeatureGenerator(FeatureConfig(n_jobs=1))
+    return _diann_generator
+
+
+def _prepare_diann_ms1(spectra_data):
+    """Pre-convert ms1_dict to sorted numpy arrays for the DIA-NN generator."""
+    gen = _get_diann_generator()
+    if gen._ms1_prepared is None and spectra_data and spectra_data.ms1_dict:
+        gen.prepare_ms1_dict(spectra_data.ms1_dict)
+
+
+def run_peptidoform_diann(df_psms_sub, df_fragment_sub, spectra_data, ms2pip_preds):
+    """
+    Compute DIA-NN-style features for one peptidoform.
+
+    Returns a 1-row Polars DataFrame with diann_* prefixed feature columns.
+    Features include fragment co-elution, isotopologue correlations,
+    mass-accuracy-weighted correlations, and elution profile metrics.
+    """
+    generator = _get_diann_generator()
+
+    # Convert Polars → Pandas (DIA-NN generator uses pandas internally)
+    precursor_pd = df_psms_sub.head(1).to_pandas()
+    fragments_pd = df_fragment_sub.to_pandas()
+
+    # Column name mapping: MuMDIA uses 'fragment_name', DIA-NN expects 'fragment_names'
+    if "fragment_name" in fragments_pd.columns and "fragment_names" not in fragments_pd.columns:
+        fragments_pd = fragments_pd.rename(columns={"fragment_name": "fragment_names"})
+
+    # Compute ppm_error from fragment_ppm if available
+    if "fragment_ppm" in fragments_pd.columns and "ppm_error" not in fragments_pd.columns:
+        fragments_pd["ppm_error"] = fragments_pd["fragment_ppm"]
+
+    # Ensure stripped_peptide exists
+    if "stripped_peptide" not in precursor_pd.columns and "peptide" in precursor_pd.columns:
+        import re
+        precursor_pd["stripped_peptide"] = precursor_pd["peptide"].apply(
+            lambda p: re.sub(r"\[.*?\]", "", p)
+        )
+
+    # Pass ms1_dict only if MS1 features are enabled in config.
+    # When enabled, the generator uses pre-processed arrays (via prepare_ms1_dict)
+    # for ~10x faster elution profile building.
+    use_ms1 = generator.config.enable_ms1_features and spectra_data and spectra_data.ms1_dict
+    try:
+        features = generator.calculate_all_features(
+            precursor=precursor_pd,
+            fragments=fragments_pd,
+            ms1_dict=spectra_data.ms1_dict if use_ms1 else None,
+            ms2dict=spectra_data.ms2_dict if spectra_data else None,
+            intensity_predictions=ms2pip_preds,
+            parallel=False,  # Already inside ThreadPoolExecutor
+        )
+    except Exception as e:
+        logging.warning(f"DIA-NN features failed for peptidoform: {e}")
+        return pl.DataFrame({"diann_failed": [1.0]})
+
+    # Flatten dict → 1-row DataFrame with diann_ prefix
+    flat = {}
+    for name, value in features.items():
+        if isinstance(value, np.ndarray):
+            for i, v in enumerate(value):
+                try:
+                    flat[f"diann_{name}_{i}"] = float(v) if not np.isnan(float(v)) else 0.0
+                except (ValueError, TypeError):
+                    flat[f"diann_{name}_{i}"] = 0.0
+        else:
+            try:
+                flat[f"diann_{name}"] = float(value) if not np.isnan(float(value)) else 0.0
+            except (ValueError, TypeError):
+                flat[f"diann_{name}"] = 0.0
+
+    # Clear caches after each peptidoform to prevent unbounded memory growth.
+    # The caches (pivot, correlation, validation) use fragment hashes as keys,
+    # so entries from previous peptidoforms are never reused — they just leak.
+    generator.clear_cache()
+
+    return pl.DataFrame(flat)
+
+
+def _run_diann_packed(packed_args):
+    """Unpack args and run DIA-NN features. Module-level for ProcessPoolExecutor pickling."""
+    return run_peptidoform_diann(*packed_args)
+
+
 def process_peptidoform(args):
     """
     Process a single peptidoform group by computing its feature DataFrames and concatenating them.
+    Computes: collapsed PSM features, correlation features, and DIA-NN features.
     """
-    df_psms_sub_peptidoform, df_fragment_sub_peptidoform, correlations_list = args
+    df_psms_sub_peptidoform, df_fragment_sub_peptidoform, correlations_list, spectra_data, ms2pip_preds = args
     df1 = run_peptidoform_df(df_psms_sub_peptidoform)
     df2 = run_peptidoform_correlation(correlations_list)
-    return pl.concat([df1, df2], how="horizontal")
+    df3 = run_peptidoform_diann(df_psms_sub_peptidoform, df_fragment_sub_peptidoform, spectra_data, ms2pip_preds)
+    return pl.concat([df1, df2, df3], how="horizontal")
 
 
 # TODO move to feature generators
@@ -1238,7 +1341,7 @@ def calculate_features(
     df_fragment_max_peptide: pl.DataFrame,
     *,  # Force keyword-only arguments
     filter_rel_rt_error: float = 0.1,
-    min_occurrences: int = 1,
+    min_occurrences: int = 5,
     filter_max_apex_rt: float = 0.75,
     config: dict = {},
     deeplc_model=None,
@@ -1254,7 +1357,7 @@ def calculate_features(
     1. DeepLC RT predictions (reuses transfer-learned model from Stage 2)
     2. RT error features + filtering (removes PSMs with >15% relative RT error)
     3. Regenerate apex DataFrames after RT filtering (data consistency)
-    4. Peptide occurrence filtering (min_occurrences, default 1 = keep all)
+    4. Peptide occurrence filtering (min_occurrences, default 5)
     5. MS2PIP fragment intensity predictions + RustyMS annotation → correlations
     6. Precursor M-1/M/M+1 isotope intensities from MS1 spectra
     7. Group PSMs by peptidoform, collapse via max/min/mean/sum
@@ -1374,6 +1477,27 @@ def calculate_features(
     else:
         log_info("VALIDATION PASSED: All apex PSMs exist in filtered data")
 
+    # Step 4b: Calculate adaptive RT margins per peptidoform.
+    # Calibrates min/max margins from top-scoring peptidoforms, then walks each
+    # peptidoform's XIC outward from apex until intensity drops below threshold.
+    # Adds rt_lower_margin and rt_higher_margin columns to both DataFrames.
+    log_info("Calculating adaptive retention time margins...")
+
+    # Construct fragment_name column if not present (Sage parquet doesn't include it)
+    if "fragment_name" not in df_fragment.columns:
+        df_fragment = df_fragment.with_columns(
+            (
+                pl.col("fragment_type")
+                + pl.col("fragment_ordinals").cast(pl.Utf8)
+                + "/"
+                + pl.col("fragment_charge").cast(pl.Utf8)
+            ).alias("fragment_name")
+        )
+
+    df_psms, df_fragment = add_retention_time_margins_loop(
+        df_psms, df_fragment, top_n=100, intensity_threshold=0.05
+    )
+
     log_info("Obtaining fragment intensity predictions for the main loop...")
     log_info(
         f"Reading the MS2PIP pickle: {pickle_config.read_ms2pip} and writing MS2PIP pickle: {pickle_config.write_ms2pip}"
@@ -1429,11 +1553,12 @@ def calculate_features(
 
     log_info(f"Number of peptidoforms: {len(psm_dict)}")
 
-    # Build argument tuples: (psm_sub_df, fragment_sub_df, correlation_list)
+    # Build argument tuples for parallel processing.
+    # Each tuple: (psm_sub_df, fragment_sub_df, correlation_list, spectra_data, ms2pip_preds_for_peptidoform)
     # Only include peptidoforms that have both fragment and correlation data.
-    # Peptidoforms missing from correlations_fragment_dict (e.g., no MS2PIP predictions) are skipped.
     peptidoform_args = [
-        (psm_dict[k], fragment_dict[k], correlations_fragment_dict[k])
+        (psm_dict[k], fragment_dict[k], correlations_fragment_dict[k],
+         spectra_data, ms2pip_predictions.get(k))
         for k in psm_dict.keys()
         if k in correlations_fragment_dict
     ]
@@ -1449,26 +1574,24 @@ def calculate_features(
     # Each peptidoform is collapsed to one row (run_peptidoform_df) and gets
     # correlation features appended (run_peptidoform_correlation).
     # Chunking reduces ThreadPoolExecutor overhead for many small tasks.
-    log_info("Step 7: Processing peptidoforms in parallel (with chunking)")
+    log_info("Step 7: Processing peptidoforms in parallel")
 
-    chunks = [
-        peptidoform_args[i : i + chunk_size]
-        for i in range(0, len(peptidoform_args), chunk_size)
+    # Pre-convert MS1 data to sorted numpy arrays for fast DIA-NN elution profiles
+    _prepare_diann_ms1(spectra_data)
+
+    # Sequential processing — all work is CPU-bound (numpy/pandas/polars) so the
+    # GIL makes ThreadPoolExecutor counterproductive (measured 3-6x slower than
+    # single-threaded due to thread contention). Sequential: ~13 it/s vs ~2 it/s.
+    pin_in = [
+        process_peptidoform(args)
+        for args in tqdm(peptidoform_args, desc="Processing peptidoforms")
     ]
 
-    with ThreadPoolExecutor(max_workers=parallel_workers) as executor:
-        chunk_results = list(
-            tqdm(
-                executor.map(
-                    lambda chunk: [process_peptidoform(args) for args in chunk], chunks
-                ),
-                total=len(chunks),
-                desc="Processing chunks",
-            )
-        )
-
-    # Flatten list of lists → list of 1-row DataFrames
-    pin_in = [item for sublist in chunk_results for item in sublist]
+    # Reset the shared DIA-NN generator after all processing is done
+    global _diann_generator
+    if _diann_generator is not None:
+        _diann_generator.clear_cache()
+    _diann_generator = None
 
     # Step 9: Build the PIN file for Mokapot.
     # Rename columns to Percolator/Mokapot PIN format, drop redundant scannr,
@@ -1535,6 +1658,7 @@ def main(
         df_fragment,
         df_fragment_max,
         df_fragment_max_peptide,
+        min_occurrences=config.get("mumdia", {}).get("min_occurrences", 5),
         pickle_config=pickle_config,
         deeplc_model=deeplc_model,
         config=config,

@@ -47,6 +47,9 @@ class FeatureConfig:
     ms1_accuracy_factors: List[float] = None
     ms2_accuracy_factors: List[float] = None
 
+    # Feature toggles
+    enable_ms1_features: bool = False  # MS1-based features (groups 2-3); slow, disabled by default
+
     # Parallelization settings
     n_jobs: int = -1  # -1 means use all available CPU cores
 
@@ -101,7 +104,39 @@ class DIANNFeatureGenerator:
         self._pivot_cache = {}
         self._correlation_cache = {}
 
+        # Pre-processed MS1 data (set via prepare_ms1_dict)
+        self._ms1_prepared = None  # list of (rt, mz_array, intensity_array) sorted by RT
+
         logger.info("Initialized DIANNFeatureGenerator with built-in optimizations")
+
+    def prepare_ms1_dict(self, ms1_dict: Dict[str, Dict[str, Any]]) -> None:
+        """Pre-convert ms1_dict to sorted numpy arrays for fast elution profile building.
+
+        Call once before processing peptidoforms. Converts each scan's mz/intensity
+        lists to numpy arrays and sorts the scan list by RT. This avoids repeated
+        np.asarray + sort checks in build_elution_profile (~20ms -> ~2ms per call).
+        """
+        prepared = []
+        for scan_dict in ms1_dict.values():
+            mzs = scan_dict.get("mz", [])
+            intensities = scan_dict.get("intensity", [])
+            rt = scan_dict.get("retention_time", None)
+            if rt is None or len(mzs) == 0:
+                continue
+            # Convert RT from seconds to minutes if needed
+            if isinstance(rt, (int, float)) and rt > 1000:
+                rt = rt / 60
+            mz_arr = np.asarray(mzs)
+            int_arr = np.asarray(intensities)
+            # Ensure sorted by m/z
+            if len(mz_arr) > 1 and mz_arr[0] > mz_arr[-1]:
+                order = np.argsort(mz_arr)
+                mz_arr = mz_arr[order]
+                int_arr = int_arr[order]
+            prepared.append((rt, mz_arr, int_arr))
+        # Sort by RT for potential windowed access
+        prepared.sort(key=lambda x: x[0])
+        self._ms1_prepared = prepared
 
     def _setup_parallelization(self):
         """Set up parallelization parameters."""
@@ -158,7 +193,7 @@ class DIANNFeatureGenerator:
         self._cache.clear()
         self._pivot_cache.clear()
         self._correlation_cache.clear()
-        logger.info("Cleared all caches")
+        logger.debug("Cleared all caches")
 
     def get_cache_stats(self) -> Dict[str, int]:
         """Get cache statistics for monitoring."""
@@ -657,9 +692,27 @@ class DIANNFeatureGenerator:
         if tolerance_ppm is None:
             tolerance_ppm = self.config.precursor_mass_tolerance
 
-        elution_profile = {}
         tol_mz = target_mz * tolerance_ppm / 1e6 * acc_factor
 
+        # Fast path: use pre-processed arrays (avoids np.asarray + sort per scan)
+        if self._ms1_prepared is not None:
+            elution_profile = {}
+            for rt, mz_arr, int_arr in self._ms1_prepared:
+                idx = np.searchsorted(mz_arr, target_mz)
+                best_idx = None
+                best_diff = tol_mz
+                for check_idx in (idx - 1, idx, idx + 1):
+                    if 0 <= check_idx < len(mz_arr):
+                        diff = abs(mz_arr[check_idx] - target_mz)
+                        if diff < best_diff:
+                            best_diff = diff
+                            best_idx = check_idx
+                if best_idx is not None:
+                    elution_profile[rt] = int_arr[best_idx]
+            return elution_profile
+
+        # Slow fallback: original dict-based path
+        elution_profile = {}
         for scan, scan_dict in ms1_dict.items():
             mzs = scan_dict.get("mz", [])
             intensities = scan_dict.get("intensity", [])
@@ -668,8 +721,7 @@ class DIANNFeatureGenerator:
             if rt is None or len(mzs) == 0 or len(intensities) == 0:
                 continue
 
-            # Convert RT from seconds to minutes if needed
-            if isinstance(rt, (int, float)) and rt > 1000:  # Likely in seconds
+            if isinstance(rt, (int, float)) and rt > 1000:
                 rt = rt / 60
 
             best_idx, best_val = self._search_sorted_with_tolerance(
@@ -3272,7 +3324,7 @@ class DIANNFeatureGenerator:
                 except Exception as e:
                     logger.error(f"Error calculating {feature_name}: {e}")
 
-        logger.info(f"Calculated {len(features)} feature groups in parallel")
+        logger.debug(f"Calculated {len(features)} feature groups in parallel")
         return features
 
     def _safe_feature_calculation(self, func, args):
@@ -3317,7 +3369,7 @@ class DIANNFeatureGenerator:
         """
         features = {}
 
-        logger.info("Calculating DIA-NN features...")
+        logger.debug("Calculating DIA-NN features...")
 
         # Group 1: Ion co-elution (MS2 level)
         try:
@@ -3436,7 +3488,7 @@ class DIANNFeatureGenerator:
         except Exception as e:
             logger.error(f"Error in group 10 features: {e}")
 
-        logger.info(f"Calculated {len(features)} feature groups")
+        logger.debug(f"Calculated {len(features)} feature groups")
         return features
 
 

@@ -58,6 +58,19 @@ def quantify_fragments(df_fragment, mokapot_psm_path, config, output_dir: str = 
     mokapot_peptides = mokapot_peptides.filter(pl.col("mokapot q-value") < 0.01)
     df_fragment_mokapot_filtered = df_fragment.filter(pl.col("peptide").is_in(mokapot_peptides["Peptide"]))
 
+    # Derive stripped_peptide (remove modifications like [Oxidation], [Carbamidomethyl], etc.)
+    if "stripped_peptide" not in df_fragment_mokapot_filtered.columns:
+        df_fragment_mokapot_filtered = df_fragment_mokapot_filtered.with_columns(
+            pl.col("peptide").str.replace_all(r"\[.*?\]", "").alias("stripped_peptide")
+        )
+
+    # Join proteins from mokapot results if not already in df_fragment
+    if "proteins" not in df_fragment_mokapot_filtered.columns:
+        proteins_map = mokapot_peptides.select(["Peptide", "Proteins"]).unique(subset=["Peptide"])
+        df_fragment_mokapot_filtered = df_fragment_mokapot_filtered.join(
+            proteins_map, left_on="peptide", right_on="Peptide", how="left"
+        ).rename({"Proteins": "proteins"})
+
     results = []
 
     logging.info(f"Quantifying fragments")

@@ -840,10 +840,32 @@ def get_features_fragment_intensity(
 
     df_fragment = df_fragment.join(df_precursor_rt, on="precursor", how="left")
 
-    df_fragment = df_fragment.filter(
-        (pl.col("rt_max_peptide_sub").is_not_null())
-        & (abs(pl.col("rt") - pl.col("rt_max_peptide_sub")) < filter_max_apex_rt)
-    )
+    # Filter fragments to the retention time window around the apex.
+    # If calibrated RT margins are available (rt_lower_margin / rt_higher_margin),
+    # use them for per-peptidoform adaptive windows. Otherwise fall back to the
+    # fixed ±filter_max_apex_rt seconds window.
+    if "rt_lower_margin" in df_fragment.columns and "rt_higher_margin" in df_fragment.columns:
+        df_fragment = df_fragment.filter(
+            (pl.col("rt_max_peptide_sub").is_not_null())
+            & (
+                # Use calibrated margins where available, fall back to fixed window where NaN
+                pl.when(pl.col("rt_lower_margin").is_not_null())
+                .then(
+                    (pl.col("rt") >= pl.col("rt_lower_margin"))
+                    & (pl.col("rt") <= pl.col("rt_higher_margin"))
+                )
+                .otherwise(
+                    abs(pl.col("rt") - pl.col("rt_max_peptide_sub")) < filter_max_apex_rt
+                )
+            )
+        )
+        log_info("Fragment filtering: using calibrated RT margins (with fixed fallback)")
+    else:
+        df_fragment = df_fragment.filter(
+            (pl.col("rt_max_peptide_sub").is_not_null())
+            & (abs(pl.col("rt") - pl.col("rt_max_peptide_sub")) < filter_max_apex_rt)
+        )
+        log_info(f"Fragment filtering: using fixed ±{filter_max_apex_rt}s window (no margins available)")
 
     for (peptidoform, charge), df_fragment_sub_peptidoform in tqdm(
         df_fragment.group_by(["peptide", "charge"])

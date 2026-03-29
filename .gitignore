@@ -13,6 +13,7 @@ test_results.txt
 mumdia.egg-info/
 mzml_files/
 notebook_helpers/
+test_data/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
