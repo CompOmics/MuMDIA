@@ -24,11 +24,11 @@ import numpy as np
 import polars as pl
 from numba import njit
 from rustyms import (
+    CompoundPeptidoformIon,
     FragmentationModel,
     MassMode,
-    RawSpectrum,
-    CompoundPeptidoformIon,
     MatchingParameters,
+    RawSpectrum,
 )
 from tqdm import tqdm
 
@@ -36,9 +36,17 @@ from data_structures import CorrelationResults, PickleConfig
 from utilities.logger import log_info
 from utilities.plotting import plot_XIC
 
+# Optional Rust backend for compute_correlations
+try:
+    import mumdia_rs
+
+    _RUST_CORRELATIONS = True
+except ImportError:
+    _RUST_CORRELATIONS = False
+
 
 @njit
-def compute_correlations(intensity_matrix, pred_frag_intens):
+def _compute_correlations_numba(intensity_matrix, pred_frag_intens):
     """
     Compute Pearson correlations between experimental and predicted intensities.
 
@@ -74,6 +82,16 @@ def compute_correlations(intensity_matrix, pred_frag_intens):
             correlations[i] = 0.0  # No correlation possible with zero variance
 
     return correlations
+
+
+def compute_correlations(intensity_matrix, pred_frag_intens):
+    """Dispatch to Rust or Numba for per-PSM Pearson correlations."""
+    if _RUST_CORRELATIONS:
+        return mumdia_rs.compute_correlations(
+            np.ascontiguousarray(intensity_matrix, dtype=np.float64),
+            np.ascontiguousarray(pred_frag_intens, dtype=np.float64),
+        )
+    return _compute_correlations_numba(intensity_matrix, pred_frag_intens)
 
 
 def corrcoef_ignore_both_missing(data):
@@ -476,7 +494,6 @@ def match_fragments(
                 mode=MassMode.Monoisotopic,
             )
 
-
             # Filter annotated peaks to keep only singly-charged b and y ions.
             # RustyMS annotations are accessed via repr() strings, so regex is
             # used to extract the ion type (e.g. "b3", "y7") from the annotation
@@ -577,7 +594,6 @@ def match_fragments(
     └──────────┴─────────────┴─────────────┴──────────────┴────────────┴─────────────┴─────────────┴────────────┘
     """
 
-
     # Max-normalize MS2PIP predictions to [0, 1] range. This is necessary because
     # MS2PIP outputs raw predicted intensities on an arbitrary scale, while the
     # experimental intensities will also be max-normalized per PSM later (line ~722).
@@ -608,7 +624,6 @@ def match_fragments(
         ]
     )
 
-
     """
     Get pearson and cosine similarity of spectrum with highest intensity
     """
@@ -617,12 +632,10 @@ def match_fragments(
         pred_frag_intens_individual, most_abundant_frag_psm["fragment_intensity"]
     )[0][1]
 
-
     # Compute cosine similarity between predicted and observed intensities for the apex spectrum
     most_intens_cos = cosine_similarity(
         pred_frag_intens_individual, most_abundant_frag_psm["fragment_intensity"]
     )
-
 
     """
     Get the intensity matrix of observations
@@ -637,7 +650,6 @@ def match_fragments(
         [ms2pip_predictions.get(fid, 0.0) for fid in fragment_names]
     )
 
-
     # Collect predictions for keys not listed in fragment_names (i.e., fragments predicted but not observed)
     non_matched_predictions = np.array(
         [v for k, v in ms2pip_predictions.items() if k not in fragment_names]
@@ -648,7 +660,6 @@ def match_fragments(
     sum_pred_frag_intens = np.array(
         sum([ms2pip_predictions.get(fid, 0.0) for fid in fragment_names])
     )
-
 
     # Ensure data types are consistent for downstream calculations
     intensity_matrix = intensity_matrix.astype(np.float32)
@@ -700,7 +711,6 @@ def match_fragments(
         .ravel()  # Flatten the array to 1D
     )
 
-
     # Compute mean squared error between normalized observed and predicted intensities (per PSM, then averaged)
     mse_avg_pred_intens = (
         abs(intensity_matrix_normalized - pred_frag_intens).sum(axis=1)
@@ -711,7 +721,6 @@ def match_fragments(
         (abs(intensity_matrix_normalized - pred_frag_intens).sum(axis=1)).sum()
         + sum(non_matched_predictions)
     ) / intensity_matrix_normalized.shape[0]
-
 
     # Compute correlation matrix for PSM IDs (rows of intensity matrix)
     if intensity_matrix_normalized.shape[0] > 1:  # Ensure there are multiple PSMs
@@ -729,14 +738,12 @@ def match_fragments(
         # NOTE: this converts r to R², unlike the fragment correlation matrix below.
         correlation_matrix_psm_ids = np.sort(correlation_matrix_psm_ids**2)
     else:
-
         # If only one PSM, set all correlation matrices to empty
         correlation_matrix_psm_ids = np.array([])
 
     # Compute correlation matrix for fragment IDs (columns of intensity matrix)
     if intensity_matrix_normalized.shape[1] > 1:
         correlation_matrix_frag_ids = np.corrcoef(intensity_matrix_normalized.T)
-
 
         # Remove diagonal elements (self-correlation) and flatten to 1D
         correlation_matrix_frag_ids = correlation_matrix_frag_ids[
@@ -747,11 +754,8 @@ def match_fragments(
         # preserves the sign, allowing detection of anti-correlated fragment pairs.
         correlation_matrix_frag_ids = np.sort(correlation_matrix_frag_ids)
     else:
-
         # If only one fragment, set all correlation matrices to empty
         correlation_matrix_frag_ids = np.array([])
-
-
 
     return CorrelationResults(
         correlations=correlation_result,  # Pearson correlation between predicted and observed intensities
@@ -818,14 +822,12 @@ def get_features_fragment_intensity(
         (pl.col("peptide") + "/" + pl.col("charge").cast(pl.Utf8)).alias("precursor")
     )
 
-
     precursor_to_rt_max = dict(
         zip(
             df_fragment_max_peptide["precursor"].to_list(),
             df_fragment_max_peptide["rt"].to_list(),
         )
     )
-
 
     df_precursor_rt = pl.DataFrame(
         {
@@ -844,7 +846,10 @@ def get_features_fragment_intensity(
     # If calibrated RT margins are available (rt_lower_margin / rt_higher_margin),
     # use them for per-peptidoform adaptive windows. Otherwise fall back to the
     # fixed ±filter_max_apex_rt seconds window.
-    if "rt_lower_margin" in df_fragment.columns and "rt_higher_margin" in df_fragment.columns:
+    if (
+        "rt_lower_margin" in df_fragment.columns
+        and "rt_higher_margin" in df_fragment.columns
+    ):
         df_fragment = df_fragment.filter(
             (pl.col("rt_max_peptide_sub").is_not_null())
             & (
@@ -855,17 +860,22 @@ def get_features_fragment_intensity(
                     & (pl.col("rt") <= pl.col("rt_higher_margin"))
                 )
                 .otherwise(
-                    abs(pl.col("rt") - pl.col("rt_max_peptide_sub")) < filter_max_apex_rt
+                    abs(pl.col("rt") - pl.col("rt_max_peptide_sub"))
+                    < filter_max_apex_rt
                 )
             )
         )
-        log_info("Fragment filtering: using calibrated RT margins (with fixed fallback)")
+        log_info(
+            "Fragment filtering: using calibrated RT margins (with fixed fallback)"
+        )
     else:
         df_fragment = df_fragment.filter(
             (pl.col("rt_max_peptide_sub").is_not_null())
             & (abs(pl.col("rt") - pl.col("rt_max_peptide_sub")) < filter_max_apex_rt)
         )
-        log_info(f"Fragment filtering: using fixed ±{filter_max_apex_rt}s window (no margins available)")
+        log_info(
+            f"Fragment filtering: using fixed ±{filter_max_apex_rt}s window (no margins available)"
+        )
 
     for (peptidoform, charge), df_fragment_sub_peptidoform in tqdm(
         df_fragment.group_by(["peptide", "charge"])

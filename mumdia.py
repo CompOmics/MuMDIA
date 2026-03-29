@@ -10,10 +10,18 @@ and MS1 precursor features.
 import concurrent.futures
 import logging
 import os
-from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Dict, List, Optional
 import pickle
 import sys
+from concurrent.futures import ThreadPoolExecutor
+from typing import Any, Dict, List, Optional
+
+# Optional Rust backend: provides ~3x faster numerical functions and GIL release
+try:
+    import mumdia_rs
+
+    _RUST_BACKEND = True
+except ImportError:
+    _RUST_BACKEND = False
 
 # Optional numba: provide no-op decorator if unavailable
 try:
@@ -64,8 +72,8 @@ from prediction_wrappers.wrapper_ms2pip import (
     get_predictions_fragment_intensity_main_loop,
 )
 from quantification.lfq import quantify_fragments
-from utilities.plotting import plot_XIC_with_margins, plot_rt_margin_histogram
 from utilities.logger import log_info
+from utilities.plotting import plot_rt_margin_histogram, plot_XIC_with_margins
 
 # Re-export for backward compatibility
 __all__ = ["main", "PickleConfig", "SpectraData", "run_mokapot"]
@@ -75,7 +83,6 @@ os.environ["POLARS_MAX_THREADS"] = "1"
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
-
 
 
 #############################################
@@ -371,20 +378,20 @@ def add_feature_columns_nb(data, feature_name, values, method, add_index, pad_si
             #     f"Percentile results: computed={computed}, computed_idx={computed_idx}"
             # )
         else:
-            computed = compute_percentiles_nb(data, qs)
-            # logging.debug(f"Percentile results: computed={computed}")
+            if _RUST_BACKEND:
+                computed = mumdia_rs.compute_percentiles(data, qs)
+            else:
+                computed = compute_percentiles_nb(data, qs)
     elif method == "top":
-        # logging.info(f"Computing top values: count={required_length}")
         if len(add_index) > 0:
             computed, computed_idx = compute_top_nb_idx(
                 data, required_length, add_index
             )
-            # logging.debug(
-            #     f"Top results: computed={computed}, computed_idx={computed_idx}"
-            # )
         else:
-            computed = compute_top_nb(data, required_length)
-            # logging.debug(f"Top results: computed={computed}")
+            if _RUST_BACKEND:
+                computed = mumdia_rs.compute_top(data, required_length)
+            else:
+                computed = compute_top_nb(data, required_length)
     else:
         logging.error(f"Unknown method: {method}")
         raise ValueError(f"Unknown method: {method}")
@@ -746,6 +753,7 @@ def _get_diann_generator():
             DIANNFeatureGenerator,
             FeatureConfig,
         )
+
         _diann_generator = DIANNFeatureGenerator(FeatureConfig(n_jobs=1))
     return _diann_generator
 
@@ -772,16 +780,26 @@ def run_peptidoform_diann(df_psms_sub, df_fragment_sub, spectra_data, ms2pip_pre
     fragments_pd = df_fragment_sub.to_pandas()
 
     # Column name mapping: MuMDIA uses 'fragment_name', DIA-NN expects 'fragment_names'
-    if "fragment_name" in fragments_pd.columns and "fragment_names" not in fragments_pd.columns:
+    if (
+        "fragment_name" in fragments_pd.columns
+        and "fragment_names" not in fragments_pd.columns
+    ):
         fragments_pd = fragments_pd.rename(columns={"fragment_name": "fragment_names"})
 
     # Compute ppm_error from fragment_ppm if available
-    if "fragment_ppm" in fragments_pd.columns and "ppm_error" not in fragments_pd.columns:
+    if (
+        "fragment_ppm" in fragments_pd.columns
+        and "ppm_error" not in fragments_pd.columns
+    ):
         fragments_pd["ppm_error"] = fragments_pd["fragment_ppm"]
 
     # Ensure stripped_peptide exists
-    if "stripped_peptide" not in precursor_pd.columns and "peptide" in precursor_pd.columns:
+    if (
+        "stripped_peptide" not in precursor_pd.columns
+        and "peptide" in precursor_pd.columns
+    ):
         import re
+
         precursor_pd["stripped_peptide"] = precursor_pd["peptide"].apply(
             lambda p: re.sub(r"\[.*?\]", "", p)
         )
@@ -789,7 +807,9 @@ def run_peptidoform_diann(df_psms_sub, df_fragment_sub, spectra_data, ms2pip_pre
     # Pass ms1_dict only if MS1 features are enabled in config.
     # When enabled, the generator uses pre-processed arrays (via prepare_ms1_dict)
     # for ~10x faster elution profile building.
-    use_ms1 = generator.config.enable_ms1_features and spectra_data and spectra_data.ms1_dict
+    use_ms1 = (
+        generator.config.enable_ms1_features and spectra_data and spectra_data.ms1_dict
+    )
     try:
         features = generator.calculate_all_features(
             precursor=precursor_pd,
@@ -809,12 +829,16 @@ def run_peptidoform_diann(df_psms_sub, df_fragment_sub, spectra_data, ms2pip_pre
         if isinstance(value, np.ndarray):
             for i, v in enumerate(value):
                 try:
-                    flat[f"diann_{name}_{i}"] = float(v) if not np.isnan(float(v)) else 0.0
+                    flat[f"diann_{name}_{i}"] = (
+                        float(v) if not np.isnan(float(v)) else 0.0
+                    )
                 except (ValueError, TypeError):
                     flat[f"diann_{name}_{i}"] = 0.0
         else:
             try:
-                flat[f"diann_{name}"] = float(value) if not np.isnan(float(value)) else 0.0
+                flat[f"diann_{name}"] = (
+                    float(value) if not np.isnan(float(value)) else 0.0
+                )
             except (ValueError, TypeError):
                 flat[f"diann_{name}"] = 0.0
 
@@ -836,10 +860,18 @@ def process_peptidoform(args):
     Process a single peptidoform group by computing its feature DataFrames and concatenating them.
     Computes: collapsed PSM features, correlation features, and DIA-NN features.
     """
-    df_psms_sub_peptidoform, df_fragment_sub_peptidoform, correlations_list, spectra_data, ms2pip_preds = args
+    (
+        df_psms_sub_peptidoform,
+        df_fragment_sub_peptidoform,
+        correlations_list,
+        spectra_data,
+        ms2pip_preds,
+    ) = args
     df1 = run_peptidoform_df(df_psms_sub_peptidoform)
     df2 = run_peptidoform_correlation(correlations_list)
-    df3 = run_peptidoform_diann(df_psms_sub_peptidoform, df_fragment_sub_peptidoform, spectra_data, ms2pip_preds)
+    df3 = run_peptidoform_diann(
+        df_psms_sub_peptidoform, df_fragment_sub_peptidoform, spectra_data, ms2pip_preds
+    )
     return pl.concat([df1, df2, df3], how="horizontal")
 
 
@@ -1234,7 +1266,6 @@ def add_retention_time_margins(
     for (peptidoform, charge), df_fragments_sub in tqdm(
         df_fragment.group_by(["peptide", "charge"])
     ):
-
         # speed up: skip peptidoforms with only 1 PSM
         if df_fragments_sub["psm_id"].n_unique() < 2:
             pept2lowermargins[(peptidoform, charge)] = np.nan
@@ -1382,14 +1413,16 @@ def calculate_features(
     )
 
     df_psms.write_csv("debug/df_psms_before_rt.tsv", separator="\t")
-    _, _, df_psms = (
-        get_predictions_retention_time_mainloop(  # Changed, since predictions_deeplc is just df_psms with RT predictions
-            df_psms,
-            pickle_config.write_deeplc,
-            pickle_config.read_deeplc,
-            deeplc_model,
-            output_dir=config["mumdia"]["result_dir"],
-        )
+    (
+        _,
+        _,
+        df_psms,
+    ) = get_predictions_retention_time_mainloop(  # Changed, since predictions_deeplc is just df_psms with RT predictions
+        df_psms,
+        pickle_config.write_deeplc,
+        pickle_config.read_deeplc,
+        deeplc_model,
+        output_dir=config["mumdia"]["result_dir"],
     )
 
     # Step 2: Compute RT error features and filter out poor predictions.
@@ -1557,8 +1590,13 @@ def calculate_features(
     # Each tuple: (psm_sub_df, fragment_sub_df, correlation_list, spectra_data, ms2pip_preds_for_peptidoform)
     # Only include peptidoforms that have both fragment and correlation data.
     peptidoform_args = [
-        (psm_dict[k], fragment_dict[k], correlations_fragment_dict[k],
-         spectra_data, ms2pip_predictions.get(k))
+        (
+            psm_dict[k],
+            fragment_dict[k],
+            correlations_fragment_dict[k],
+            spectra_data,
+            ms2pip_predictions.get(k),
+        )
         for k in psm_dict.keys()
         if k in correlations_fragment_dict
     ]
@@ -1603,10 +1641,10 @@ def calculate_features(
             {
                 "expmass": "ExpMass",
                 "calcmass": "CalcMass",
-                "psm_id": "ScanNr",     # Mokapot uses ScanNr for grouping
+                "psm_id": "ScanNr",  # Mokapot uses ScanNr for grouping
                 "peptide": "Peptide",
                 "proteins": "Proteins",
-                "is_decoy": "Label",     # -1 = decoy, +1 = target
+                "is_decoy": "Label",  # -1 = decoy, +1 = target
             }
         )
         .drop("scannr")  # Redundant after SpecId was created

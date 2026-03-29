@@ -1,0 +1,14 @@
+[package]
+name = "mumdia_rs"
+version = "0.1.0"
+edition = "2021"
+description = "Rust-accelerated numerical functions for MuMDIA proteomics pipeline"
+
+[lib]
+name = "mumdia_rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.23", features = ["extension-module"] }
+numpy = "0.23"
+ndarray = "0.16"
