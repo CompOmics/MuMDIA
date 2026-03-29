@@ -871,10 +871,13 @@ def _run_diann_packed(packed_args):
     return run_peptidoform_diann(*packed_args)
 
 
+_use_diann_features = True  # Set from config in calculate_features()
+
+
 def process_peptidoform(args):
     """
     Process a single peptidoform group by computing its feature DataFrames and concatenating them.
-    Computes: collapsed PSM features, correlation features, and DIA-NN features.
+    Computes: collapsed PSM features, correlation features, and optionally DIA-NN features.
     """
     (
         df_psms_sub_peptidoform,
@@ -885,10 +888,15 @@ def process_peptidoform(args):
     ) = args
     df1 = run_peptidoform_df(df_psms_sub_peptidoform)
     df2 = run_peptidoform_correlation(correlations_list)
-    df3 = run_peptidoform_diann(
-        df_psms_sub_peptidoform, df_fragment_sub_peptidoform, spectra_data, ms2pip_preds
-    )
-    return pl.concat([df1, df2, df3], how="horizontal")
+    if _use_diann_features:
+        df3 = run_peptidoform_diann(
+            df_psms_sub_peptidoform,
+            df_fragment_sub_peptidoform,
+            spectra_data,
+            ms2pip_preds,
+        )
+        return pl.concat([df1, df2, df3], how="horizontal")
+    return pl.concat([df1, df2], how="horizontal")
 
 
 # TODO move to feature generators
@@ -1630,8 +1638,15 @@ def calculate_features(
     # Chunking reduces ThreadPoolExecutor overhead for many small tasks.
     log_info("Step 7: Processing peptidoforms in parallel")
 
+    # Set DIA-NN feature flag from config (use_diann_features defaults to True)
+    global _use_diann_features
+    _use_diann_features = config.get("mumdia", {}).get("use_diann_features", True)
+    if not _use_diann_features:
+        log_info("  DIA-NN features DISABLED (use_diann_features=False)")
+
     # Pre-convert MS1 data to sorted numpy arrays for fast DIA-NN elution profiles
-    _prepare_diann_ms1(spectra_data)
+    if _use_diann_features:
+        _prepare_diann_ms1(spectra_data)
 
     # Sequential processing. Even with Rust GIL release, ThreadPoolExecutor is
     # slower because process_peptidoform() still does significant Python work
@@ -1653,7 +1668,7 @@ def calculate_features(
     # fill any NaN/null with 0.0 to avoid Mokapot errors.
     log_info("Step 8: Concatenating results")
     concatenated_df = (
-        pl.concat(pin_in)
+        pl.concat(pin_in, how="diagonal")
         .rename(
             {
                 "expmass": "ExpMass",

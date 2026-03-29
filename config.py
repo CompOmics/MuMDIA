@@ -237,7 +237,7 @@ class MuMDIAConfig:
     clean: bool = False
     sage_only: bool = False
     skip_mokapot: bool = False
-    use_diann_features: bool = True
+    use_diann_features: bool = False  # Slow Python DIA-NN features, disabled by default
     verbose: bool = False
 
     # Feature settings
@@ -415,6 +415,7 @@ class MuMDIAConfig:
             "clean": self.clean,
             "sage_only": self.sage_only,
             "skip_mokapot": self.skip_mokapot,
+            "use_diann_features": self.use_diann_features,
             "verbose": self.verbose,
             "min_occurrences": self.min_occurrences,
         }
