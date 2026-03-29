@@ -41,10 +41,22 @@ jobs:
         # Install the package in development mode
         pip install -e .
     
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Build and install mumdia_rs (Rust-accelerated functions)
+      run: |
+        pip install maturin
+        cd rust/mumdia_rs && maturin develop --release
+
     - name: Install RustyMS (optional dependency)
       run: |
         pip install rustyms || echo "RustyMS installation failed, tests will skip RustyMS-dependent functionality"
     
+    - name: Run Rust unit tests
+      run: |
+        cd rust/mumdia_rs && cargo test
+
     - name: Lint with flake8
       run: |
         pip install flake8
@@ -96,13 +108,18 @@ jobs:
       with:
         python-version: '3.11'
     
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
         pip install -r test_requirements.txt
         pip install -e .
+        pip install maturin
+        cd rust/mumdia_rs && maturin develop --release
         pip install rustyms || echo "RustyMS optional"
-    
+
     - name: Run performance tests
       run: |
         python -m pytest tests/ -v -m "performance" --tb=short || echo "Performance tests completed"
