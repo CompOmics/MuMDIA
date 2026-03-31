@@ -6,7 +6,16 @@ import xml.etree.ElementTree as ET
 import numpy as np
 import pymzml
 from pyopenms import MSExperiment, MzMLFile
+
 from utilities.logger import log_info
+
+# Optional Rust-accelerated mzML parser
+try:
+    import mumdia_rs
+
+    _RUST_MZML = True
+except ImportError:
+    _RUST_MZML = False
 
 
 def read_mzml(filename):
@@ -37,6 +46,15 @@ def get_ms1_mzml(file_path):
         - ms2_to_ms1_map: {ms2_scan_id: preceding_ms1_scan_id}
         - ms2_spectra: {scan_id: {retention_time, mz, intensity}}
     """
+    # Fast path: Rust mzML parser (falls back to PyOpenMS on error)
+    if _RUST_MZML:
+        try:
+            log_info("Using Rust mzML parser (mumdia_rs)")
+            return mumdia_rs.parse_mzml_file(str(file_path))
+        except (OSError, RuntimeError):
+            log_info("Rust mzML parser failed, falling back to PyOpenMS")
+
+    # Fallback: PyOpenMS
     # Create MSExperiment object
     exp = MSExperiment()
 
@@ -59,7 +77,6 @@ def get_ms1_mzml(file_path):
         retention_time = spectrum.getRT()
 
         if spectrum.getMSLevel() == 1:
-
             # Update MS1 spectra dictionary
             ms1_spectra[scan_id] = {
                 "mz": mz_array,
