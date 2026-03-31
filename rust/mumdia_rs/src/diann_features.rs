@@ -199,107 +199,128 @@ pub fn compute_diann_features_impl(
     let smoothed_best = smooth_3pt(&best_trace);
 
     // Step 3: Compute correlations for ALL fragments vs smoothed best.
-    let mut all_correlations: Vec<(usize, f64)> = Vec::with_capacity(n_frags);
+    // Compute BOTH strategies — they provide complementary information:
+    // - overlap_only: accurate co-elution signal for observed data
+    // - fill_zero: penalizes missing fragments (informative for scoring)
+    let mut corr_overlap: Vec<(usize, f64)> = Vec::with_capacity(n_frags);
+    let mut corr_fillzero: Vec<(usize, f64)> = Vec::with_capacity(n_frags);
     for f in 0..n_frags {
-        let r = match na_strategy {
-            NaStrategy::OverlapOnly => {
-                // Only use RT points where both fragments have observed values
-                let mut a_vals = Vec::new();
-                let mut b_vals = Vec::new();
-                for r in 0..n_rts {
-                    let best_val = matrix[r][best_frag];
-                    let frag_val = matrix[r][f];
-                    if !best_val.is_nan() && !frag_val.is_nan() {
-                        a_vals.push(smoothed_best[r]);
-                        b_vals.push(frag_val);
-                    }
-                }
-                if a_vals.len() >= 2 {
-                    pearson_1d_impl(&a_vals, &b_vals)
-                } else {
-                    0.0
+        // Overlap-only: correlate at RTs where both fragments are observed
+        let r_overlap = {
+            let mut a_vals = Vec::new();
+            let mut b_vals = Vec::new();
+            for r in 0..n_rts {
+                if !matrix[r][best_frag].is_nan() && !matrix[r][f].is_nan() {
+                    a_vals.push(smoothed_best[r]);
+                    b_vals.push(matrix[r][f]);
                 }
             }
-            NaStrategy::FillZero => {
-                // Fill NaN with 0 and use all RT points
-                let frag_trace = column_filled(&matrix, f);
-                pearson_1d_impl(&smoothed_best, &frag_trace)
+            if a_vals.len() >= 2 {
+                pearson_1d_impl(&a_vals, &b_vals)
+            } else {
+                0.0
             }
         };
-        all_correlations.push((f, r));
+        corr_overlap.push((f, r_overlap));
+
+        // Fill-zero: fill NaN with 0 and use all RT points
+        let frag_trace = column_filled(&matrix, f);
+        let r_fillzero = pearson_1d_impl(&smoothed_best, &frag_trace);
+        corr_fillzero.push((f, r_fillzero));
     }
+
+    // Use the configured strategy as the "primary" correlations for derived features
+    let all_correlations = match na_strategy {
+        NaStrategy::OverlapOnly => &corr_overlap,
+        NaStrategy::FillZero => &corr_fillzero,
+    };
 
     // Step 4: Top-N fragments by intensity
     let top_n_frags = find_top_n_fragments(&matrix, n_frags, top_n);
     let top_n_ext_frags = find_top_n_fragments(&matrix, n_frags, top_n_extended);
 
-    // === Feature Group 1: Pearson correlations top-N (extended) ===
-    for i in 0..top_n_extended {
-        let val = if i < top_n_ext_frags.len() {
-            let frag_idx = top_n_ext_frags[i];
-            all_correlations
-                .iter()
-                .find(|&&(idx, _)| idx == frag_idx)
-                .map(|&(_, r)| if r.is_nan() { 0.0 } else { r })
-                .unwrap_or(0.0)
-        } else {
-            f64::NAN
-        };
-        features.insert(format!("diann_pearson_correlations_top_12_{i}"), val);
-    }
+    // === Emit correlation features for BOTH strategies ===
+    // The primary strategy (configured) gets the standard feature names.
+    // The secondary strategy gets "_alt" suffixed names.
+    let (primary_corrs, secondary_corrs, alt_suffix) = match na_strategy {
+        NaStrategy::OverlapOnly => (&corr_overlap, &corr_fillzero, "_fz"),
+        NaStrategy::FillZero => (&corr_fillzero, &corr_overlap, "_ov"),
+    };
 
-    // === Feature Group 1: Sum of correlations (top-N) ===
-    let top_corr_sum: f64 = top_n_frags
-        .iter()
-        .map(|&idx| {
-            all_correlations
-                .iter()
-                .find(|&&(i, _)| i == idx)
-                .map(|&(_, r)| if r.is_nan() { 0.0 } else { r })
-                .unwrap_or(0.0)
-        })
-        .sum();
-    features.insert("diann_sum_correlations_mass_accuracy".into(), top_corr_sum);
+    // Helper: get correlation for fragment index from a correlation list
+    let get_corr = |corrs: &[(usize, f64)], frag_idx: usize| -> f64 {
+        corrs
+            .iter()
+            .find(|&&(i, _)| i == frag_idx)
+            .map(|&(_, r)| if r.is_nan() { 0.0 } else { r })
+            .unwrap_or(0.0)
+    };
 
-    // === Feature Group 1: Remaining fragment correlations ===
-    let top_set: std::collections::HashSet<usize> = top_n_frags.iter().copied().collect();
-    let remaining_sum: f64 = all_correlations
-        .iter()
-        .filter(|&&(idx, _)| !top_set.contains(&idx))
-        .map(|&(_, r)| if r.is_nan() { 0.0 } else { r })
-        .sum();
-    let remaining_count = n_frags.saturating_sub(top_n_frags.len());
-    features.insert("diann_remaining_fragments_correlations".into(), remaining_sum);
-    features.insert(
-        "diann_remaining_fragments_mean".into(),
-        if remaining_count > 0 {
-            remaining_sum / remaining_count as f64
-        } else {
-            0.0
-        },
-    );
-
-    // === Feature Group 1: Best b-fragments correlation ===
-    let mut b_corrs: Vec<f64> = Vec::new();
-    for (idx, &(frag_idx, r)) in all_correlations.iter().enumerate() {
-        if idx < fragment_names.len() && fragment_names[frag_idx].starts_with('b') {
-            b_corrs.push(if r.is_nan() { 0.0 } else { r });
+    // Emit top-N correlations for both strategies
+    for (corrs, suffix) in [(primary_corrs, ""), (secondary_corrs, alt_suffix)] {
+        for i in 0..top_n_extended {
+            let val = if i < top_n_ext_frags.len() {
+                get_corr(corrs, top_n_ext_frags[i])
+            } else {
+                f64::NAN
+            };
+            features.insert(
+                format!("diann_pearson_correlations_top_12_{i}{suffix}"),
+                val,
+            );
         }
+
+        // Sum of top-N correlations
+        let top_corr_sum: f64 = top_n_frags.iter().map(|&idx| get_corr(corrs, idx)).sum();
+        features.insert(
+            format!("diann_sum_correlations_mass_accuracy{suffix}"),
+            top_corr_sum,
+        );
     }
-    b_corrs.sort_by(|a, b| b.partial_cmp(a).unwrap());
-    let best_b_sum: f64 = b_corrs.iter().take(3).sum();
-    features.insert("diann_best_b_fragments_correlation".into(), best_b_sum);
+
+    // === Feature Group 1: Remaining + b-fragment correlations (both strategies) ===
+    let top_set: std::collections::HashSet<usize> = top_n_frags.iter().copied().collect();
+
+    for (corrs, suffix) in [(primary_corrs, ""), (secondary_corrs, alt_suffix)] {
+        let remaining_sum: f64 = corrs
+            .iter()
+            .filter(|&&(idx, _)| !top_set.contains(&idx))
+            .map(|&(_, r)| if r.is_nan() { 0.0 } else { r })
+            .sum();
+        let remaining_count = n_frags.saturating_sub(top_n_frags.len());
+        features.insert(
+            format!("diann_remaining_fragments_correlations{suffix}"),
+            remaining_sum,
+        );
+        features.insert(
+            format!("diann_remaining_fragments_mean{suffix}"),
+            if remaining_count > 0 {
+                remaining_sum / remaining_count as f64
+            } else {
+                0.0
+            },
+        );
+
+        let mut b_corrs_vec: Vec<f64> = Vec::new();
+        for &(frag_idx, r) in corrs.iter() {
+            if frag_idx < fragment_names.len() && fragment_names[frag_idx].starts_with('b') {
+                b_corrs_vec.push(if r.is_nan() { 0.0 } else { r });
+            }
+        }
+        b_corrs_vec.sort_by(|a, b| b.partial_cmp(a).unwrap());
+        let best_b_sum: f64 = b_corrs_vec.iter().take(3).sum();
+        features.insert(
+            format!("diann_best_b_fragments_correlation{suffix}"),
+            best_b_sum,
+        );
+    }
 
     // === Feature Group 4: Weighted AUC ===
     let mut weighted_auc = 0.0;
     for &frag_idx in &top_n_frags {
         let frag_trace = column_filled(&matrix, frag_idx);
         let auc = trapezoid_auc(&sorted_rts, &frag_trace);
-        let corr = all_correlations
-            .iter()
-            .find(|&&(i, _)| i == frag_idx)
-            .map(|&(_, r)| if r.is_nan() { 0.0 } else { r.abs() })
-            .unwrap_or(0.0);
+        let corr = get_corr(all_correlations, frag_idx).abs();
         weighted_auc += auc * corr;
     }
     features.insert(
