@@ -5,6 +5,7 @@ use pyo3::prelude::*;
 
 mod batch;
 mod correlation;
+mod diann_features;
 mod fragment_correlations;
 mod mzml;
 mod percentiles;
@@ -233,6 +234,41 @@ fn parse_mzml_file(
     Ok((ms1_dict, data.ms2_to_ms1_map, ms2_dict))
 }
 
+/// Compute all DIA-NN-style features for one peptidoform in Rust.
+/// Replaces the entire Python DIANNFeatureGenerator.calculate_all_features() call.
+#[pyfunction]
+#[pyo3(signature = (rts, frag_ids, intensities, fragment_names, precursor_mz, precursor_charge, peptide_length, top_n=6, top_n_extended=12))]
+fn compute_diann_features(
+    py: Python<'_>,
+    rts: PyReadonlyArray1<f64>,
+    frag_ids: PyReadonlyArray1<u32>,
+    intensities: PyReadonlyArray1<f64>,
+    fragment_names: Vec<String>,
+    precursor_mz: f64,
+    precursor_charge: i32,
+    peptide_length: usize,
+    top_n: usize,
+    top_n_extended: usize,
+) -> HashMap<String, f64> {
+    let rts_vec = rts.as_slice().unwrap().to_vec();
+    let frag_ids_vec: Vec<u32> = frag_ids.as_slice().unwrap().to_vec();
+    let intensities_vec = intensities.as_slice().unwrap().to_vec();
+
+    py.allow_threads(|| {
+        diann_features::compute_diann_features_impl(
+            &rts_vec,
+            &frag_ids_vec,
+            &intensities_vec,
+            &fragment_names,
+            precursor_mz,
+            precursor_charge,
+            peptide_length,
+            top_n,
+            top_n_extended,
+        )
+    })
+}
+
 /// Rust-accelerated numerical functions for MuMDIA proteomics pipeline.
 #[pymodule]
 fn mumdia_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -245,5 +281,6 @@ fn mumdia_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(cosine_similarity, m)?)?;
     m.add_function(wrap_pyfunction!(compute_fragment_correlations, m)?)?;
     m.add_function(wrap_pyfunction!(parse_mzml_file, m)?)?;
+    m.add_function(wrap_pyfunction!(compute_diann_features, m)?)?;
     Ok(())
 }

@@ -237,7 +237,7 @@ class MuMDIAConfig:
     clean: bool = False
     sage_only: bool = False
     skip_mokapot: bool = False
-    use_diann_features: bool = False  # Slow Python DIA-NN features, disabled by default
+    use_diann_features: bool = True  # DIA-NN features enabled (fast with Rust backend)
     verbose: bool = False
 
     # Feature settings

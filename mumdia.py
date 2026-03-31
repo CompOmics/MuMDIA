@@ -786,43 +786,75 @@ def run_peptidoform_diann(df_psms_sub, df_fragment_sub, spectra_data, ms2pip_pre
     Compute DIA-NN-style features for one peptidoform.
 
     Returns a 1-row Polars DataFrame with diann_* prefixed feature columns.
-    Features include fragment co-elution, isotopologue correlations,
-    mass-accuracy-weighted correlations, and elution profile metrics.
+    Uses Rust implementation when available (mumdia_rs.compute_diann_features),
+    falling back to the Python DIANNFeatureGenerator.
     """
+    import re
+
+    # === Fast path: Rust DIA-NN features ===
+    if _RUST_BACKEND and "fragment_name" in df_fragment_sub.columns:
+        try:
+            # Extract precursor info from first PSM row
+            first_row = df_psms_sub.row(0, named=True)
+            peptide = first_row.get("peptide", "")
+            calcmass = float(first_row.get("calcmass", 0.0))
+            charge = int(first_row.get("charge", 2))
+            precursor_mz = calcmass / charge + 1.007276466812
+            peptide_length = len(re.sub(r"\[.*?\]", "", peptide))
+
+            # Build fragment name → index mapping
+            frag_name_col = df_fragment_sub["fragment_name"]
+            unique_names = frag_name_col.unique().sort().to_list()
+            name_to_idx = {name: i for i, name in enumerate(unique_names)}
+
+            # Extract parallel arrays for Rust
+            rts = df_fragment_sub["rt"].to_numpy().astype(np.float64)
+            frag_ids = np.array(
+                [name_to_idx[n] for n in frag_name_col.to_list()], dtype=np.uint32
+            )
+            intensities = (
+                df_fragment_sub["fragment_intensity"].to_numpy().astype(np.float64)
+            )
+
+            features = mumdia_rs.compute_diann_features(
+                rts,
+                frag_ids,
+                intensities,
+                unique_names,
+                precursor_mz,
+                charge,
+                peptide_length,
+            )
+            # Replace NaN with 0.0
+            features = {k: (0.0 if v != v else v) for k, v in features.items()}
+            return pl.DataFrame(features)
+        except Exception:
+            pass  # Fall through to Python path
+
+    # === Python fallback: DIANNFeatureGenerator ===
     generator = _get_diann_generator()
 
-    # Convert Polars → Pandas (DIA-NN generator uses pandas internally)
     precursor_pd = df_psms_sub.head(1).to_pandas()
     fragments_pd = df_fragment_sub.to_pandas()
 
-    # Column name mapping: MuMDIA uses 'fragment_name', DIA-NN expects 'fragment_names'
     if (
         "fragment_name" in fragments_pd.columns
         and "fragment_names" not in fragments_pd.columns
     ):
         fragments_pd = fragments_pd.rename(columns={"fragment_name": "fragment_names"})
-
-    # Compute ppm_error from fragment_ppm if available
     if (
         "fragment_ppm" in fragments_pd.columns
         and "ppm_error" not in fragments_pd.columns
     ):
         fragments_pd["ppm_error"] = fragments_pd["fragment_ppm"]
-
-    # Ensure stripped_peptide exists
     if (
         "stripped_peptide" not in precursor_pd.columns
         and "peptide" in precursor_pd.columns
     ):
-        import re
-
         precursor_pd["stripped_peptide"] = precursor_pd["peptide"].apply(
             lambda p: re.sub(r"\[.*?\]", "", p)
         )
 
-    # Pass ms1_dict only if MS1 features are enabled in config.
-    # When enabled, the generator uses pre-processed arrays (via prepare_ms1_dict)
-    # for ~10x faster elution profile building.
     use_ms1 = (
         generator.config.enable_ms1_features and spectra_data and spectra_data.ms1_dict
     )
@@ -833,13 +865,11 @@ def run_peptidoform_diann(df_psms_sub, df_fragment_sub, spectra_data, ms2pip_pre
             ms1_dict=spectra_data.ms1_dict if use_ms1 else None,
             ms2dict=spectra_data.ms2_dict if spectra_data else None,
             intensity_predictions=ms2pip_preds,
-            parallel=False,  # Already inside ThreadPoolExecutor
+            parallel=False,
         )
-    except Exception as e:
-        logging.debug(f"DIA-NN features failed for peptidoform: {e}")
+    except Exception:
         return pl.DataFrame({"diann_failed": [1.0]})
 
-    # Flatten dict → 1-row DataFrame with diann_ prefix
     flat = {}
     for name, value in features.items():
         if isinstance(value, np.ndarray):
@@ -857,12 +887,7 @@ def run_peptidoform_diann(df_psms_sub, df_fragment_sub, spectra_data, ms2pip_pre
                 )
             except (ValueError, TypeError):
                 flat[f"diann_{name}"] = 0.0
-
-    # Clear caches after each peptidoform to prevent unbounded memory growth.
-    # The caches (pivot, correlation, validation) use fragment hashes as keys,
-    # so entries from previous peptidoforms are never reused — they just leak.
     generator.clear_cache()
-
     return pl.DataFrame(flat)
 
 
