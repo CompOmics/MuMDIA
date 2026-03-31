@@ -236,8 +236,13 @@ fn parse_mzml_file(
 
 /// Compute all DIA-NN-style features for one peptidoform in Rust.
 /// Replaces the entire Python DIANNFeatureGenerator.calculate_all_features() call.
+/// Compute all DIA-NN-style features for one peptidoform in Rust.
+///
+/// `na_strategy`: how to handle missing values in correlations.
+///   - "overlap_only" (default): only correlate at RTs where both fragments are observed
+///   - "fill_zero": fill NaN with 0 and use all RTs
 #[pyfunction]
-#[pyo3(signature = (rts, frag_ids, intensities, fragment_names, precursor_mz, precursor_charge, peptide_length, top_n=6, top_n_extended=12))]
+#[pyo3(signature = (rts, frag_ids, intensities, fragment_names, precursor_mz, precursor_charge, peptide_length, top_n=6, top_n_extended=12, na_strategy="overlap_only"))]
 fn compute_diann_features(
     py: Python<'_>,
     rts: PyReadonlyArray1<f64>,
@@ -249,10 +254,15 @@ fn compute_diann_features(
     peptide_length: usize,
     top_n: usize,
     top_n_extended: usize,
+    na_strategy: &str,
 ) -> HashMap<String, f64> {
     let rts_vec = rts.as_slice().unwrap().to_vec();
     let frag_ids_vec: Vec<u32> = frag_ids.as_slice().unwrap().to_vec();
     let intensities_vec = intensities.as_slice().unwrap().to_vec();
+    let strategy = match na_strategy {
+        "fill_zero" => diann_features::NaStrategy::FillZero,
+        _ => diann_features::NaStrategy::OverlapOnly,
+    };
 
     py.allow_threads(|| {
         diann_features::compute_diann_features_impl(
@@ -265,6 +275,7 @@ fn compute_diann_features(
             peptide_length,
             top_n,
             top_n_extended,
+            strategy,
         )
     })
 }

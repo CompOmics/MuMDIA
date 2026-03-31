@@ -238,6 +238,7 @@ class MuMDIAConfig:
     sage_only: bool = False
     skip_mokapot: bool = False
     use_diann_features: bool = True  # DIA-NN features enabled (fast with Rust backend)
+    diann_na_strategy: str = "overlap_only"  # "overlap_only" or "fill_zero"
     verbose: bool = False
 
     # Feature settings
@@ -416,6 +417,7 @@ class MuMDIAConfig:
             "sage_only": self.sage_only,
             "skip_mokapot": self.skip_mokapot,
             "use_diann_features": self.use_diann_features,
+            "diann_na_strategy": self.diann_na_strategy,
             "verbose": self.verbose,
             "min_occurrences": self.min_occurrences,
         }

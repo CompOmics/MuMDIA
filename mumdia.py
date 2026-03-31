@@ -824,6 +824,7 @@ def run_peptidoform_diann(df_psms_sub, df_fragment_sub, spectra_data, ms2pip_pre
                 precursor_mz,
                 charge,
                 peptide_length,
+                na_strategy=_diann_na_strategy,
             )
             # Replace NaN with 0.0
             features = {k: (0.0 if v != v else v) for k, v in features.items()}
@@ -897,6 +898,7 @@ def _run_diann_packed(packed_args):
 
 
 _use_diann_features = True  # Set from config in calculate_features()
+_diann_na_strategy = "overlap_only"  # "overlap_only" or "fill_zero"
 
 
 def process_peptidoform(args):
@@ -1663,11 +1665,16 @@ def calculate_features(
     # Chunking reduces ThreadPoolExecutor overhead for many small tasks.
     log_info("Step 7: Processing peptidoforms in parallel")
 
-    # Set DIA-NN feature flag from config (use_diann_features defaults to True)
-    global _use_diann_features
+    # Set DIA-NN feature flags from config
+    global _use_diann_features, _diann_na_strategy
     _use_diann_features = config.get("mumdia", {}).get("use_diann_features", True)
+    _diann_na_strategy = config.get("mumdia", {}).get(
+        "diann_na_strategy", "overlap_only"
+    )
     if not _use_diann_features:
         log_info("  DIA-NN features DISABLED (use_diann_features=False)")
+    else:
+        log_info(f"  DIA-NN NA strategy: {_diann_na_strategy}")
 
     # Pre-convert MS1 data to sorted numpy arrays for fast DIA-NN elution profiles
     if _use_diann_features:

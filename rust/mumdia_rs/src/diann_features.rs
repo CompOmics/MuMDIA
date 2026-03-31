@@ -138,10 +138,25 @@ fn trapezoid_auc(x: &[f64], y: &[f64]) -> f64 {
     area
 }
 
+/// Strategy for handling missing (NaN) values in correlation calculations.
+#[derive(Clone, Copy, PartialEq)]
+pub enum NaStrategy {
+    /// Only use RT points where both fragments have observed values.
+    /// More accurate for sparse data. Matches Python DIA-NN behavior.
+    OverlapOnly,
+    /// Fill missing values with 0.0 before correlating.
+    /// Uses all RT points. Faster and penalizes missing observations.
+    FillZero,
+}
+
 /// Compute all DIA-NN-style features for one peptidoform.
 ///
 /// Input: parallel arrays of (rt, fragment_id, intensity) for all fragment observations,
 /// plus fragment name list, precursor info.
+///
+/// `na_strategy`: how to handle missing values in correlations.
+///   - `OverlapOnly`: only correlate at RTs where both fragments are observed (Python-compatible)
+///   - `FillZero`: fill NaN with 0 and use all RTs (faster, penalizes missing data)
 ///
 /// Returns HashMap of feature_name → value.
 pub fn compute_diann_features_impl(
@@ -154,6 +169,7 @@ pub fn compute_diann_features_impl(
     peptide_length: usize,
     top_n: usize,          // default 6
     top_n_extended: usize,  // default 12
+    na_strategy: NaStrategy,
 ) -> HashMap<String, f64> {
     let mut features = HashMap::with_capacity(60);
     let n_frags = fragment_names.len();
@@ -183,25 +199,32 @@ pub fn compute_diann_features_impl(
     let smoothed_best = smooth_3pt(&best_trace);
 
     // Step 3: Compute correlations for ALL fragments vs smoothed best.
-    // Only use RT points where BOTH the best fragment and the current fragment
-    // have non-NaN values (matching Python's use_all_rt=False behavior).
     let mut all_correlations: Vec<(usize, f64)> = Vec::with_capacity(n_frags);
     for f in 0..n_frags {
-        // Collect paired values where both are non-NaN
-        let mut a_vals = Vec::new();
-        let mut b_vals = Vec::new();
-        for r in 0..n_rts {
-            let best_val = matrix[r][best_frag];
-            let frag_val = matrix[r][f];
-            if !best_val.is_nan() && !frag_val.is_nan() {
-                a_vals.push(smoothed_best[r]);
-                b_vals.push(frag_val);
+        let r = match na_strategy {
+            NaStrategy::OverlapOnly => {
+                // Only use RT points where both fragments have observed values
+                let mut a_vals = Vec::new();
+                let mut b_vals = Vec::new();
+                for r in 0..n_rts {
+                    let best_val = matrix[r][best_frag];
+                    let frag_val = matrix[r][f];
+                    if !best_val.is_nan() && !frag_val.is_nan() {
+                        a_vals.push(smoothed_best[r]);
+                        b_vals.push(frag_val);
+                    }
+                }
+                if a_vals.len() >= 2 {
+                    pearson_1d_impl(&a_vals, &b_vals)
+                } else {
+                    0.0
+                }
             }
-        }
-        let r = if a_vals.len() >= 2 {
-            pearson_1d_impl(&a_vals, &b_vals)
-        } else {
-            0.0
+            NaStrategy::FillZero => {
+                // Fill NaN with 0 and use all RT points
+                let frag_trace = column_filled(&matrix, f);
+                pearson_1d_impl(&smoothed_best, &frag_trace)
+            }
         };
         all_correlations.push((f, r));
     }
@@ -402,6 +425,7 @@ mod tests {
             10,    // peptide_length
             6,     // top_n
             12,    // top_n_extended
+            NaStrategy::OverlapOnly,
         );
 
         assert!(features.contains_key("diann_precursor_mz"));
@@ -427,6 +451,7 @@ mod tests {
             8,
             6,
             12,
+            NaStrategy::OverlapOnly,
         );
         assert!((features["diann_precursor_mz"] - 400.0).abs() < 1e-12);
         assert_eq!(features.len(), 3); // only precursor features
