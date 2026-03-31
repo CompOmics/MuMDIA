@@ -411,14 +411,4 @@ def main():
 
 
 if __name__ == "__main__":
-    output_dir = main()  # For now output output_dir, should be handled differently
-    # NOTE: run_mokapot is also called inside mumdia.main(). This second call
-    # is intentional for standalone execution but results in a duplicate run
-    # when the full pipeline is invoked via this __main__ block.
-    # Run Mokapot for final statistical validation and FDR control
-    try:
-        from mumdia import run_mokapot
-
-        run_mokapot(output_dir)
-    except Exception as e:
-        log_info(f"Skipping mokapot run: {e}")
+    output_dir = main()
