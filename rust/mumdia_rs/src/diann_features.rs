@@ -182,11 +182,27 @@ pub fn compute_diann_features_impl(
     let best_trace = column_filled(&matrix, best_frag);
     let smoothed_best = smooth_3pt(&best_trace);
 
-    // Step 3: Compute correlations for ALL fragments vs smoothed best
+    // Step 3: Compute correlations for ALL fragments vs smoothed best.
+    // Only use RT points where BOTH the best fragment and the current fragment
+    // have non-NaN values (matching Python's use_all_rt=False behavior).
     let mut all_correlations: Vec<(usize, f64)> = Vec::with_capacity(n_frags);
     for f in 0..n_frags {
-        let frag_trace = column_filled(&matrix, f);
-        let r = pearson_1d_impl(&smoothed_best, &frag_trace);
+        // Collect paired values where both are non-NaN
+        let mut a_vals = Vec::new();
+        let mut b_vals = Vec::new();
+        for r in 0..n_rts {
+            let best_val = matrix[r][best_frag];
+            let frag_val = matrix[r][f];
+            if !best_val.is_nan() && !frag_val.is_nan() {
+                a_vals.push(smoothed_best[r]);
+                b_vals.push(frag_val);
+            }
+        }
+        let r = if a_vals.len() >= 2 {
+            pearson_1d_impl(&a_vals, &b_vals)
+        } else {
+            0.0
+        };
         all_correlations.push((f, r));
     }
 
