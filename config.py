@@ -158,7 +158,7 @@ class MuMDIAConfig:
     # Ion settings
     ion_kinds: List[str] = field(default_factory=lambda: ["b", "y"])
     min_ion_index: int = 2
-    max_fragment_charge: int = 1
+    max_fragment_charge: int = 2  # Match charge-1 and charge-2 fragment ions
 
     # Modifications
     static_mods: Dict[str, float] = field(default_factory=lambda: {"C": 57.0215})

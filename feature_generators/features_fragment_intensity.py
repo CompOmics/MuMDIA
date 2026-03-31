@@ -497,13 +497,12 @@ def match_fragments(
             # Filter annotated peaks to keep only singly-charged b and y ions.
             # RustyMS annotations are accessed via repr() strings, so regex is
             # used to extract the ion type (e.g. "b3", "y7") from the annotation
-            # representation. Only charge-1 fragments are kept to match MS2PIP's
-            # prediction scope (which only predicts singly-charged b/y ions).
+            # representation. Keep all b/y fragment charges (not just charge-1)
+            # to match DIA-NN's behavior and capture charge-2 fragments.
             matched_fragments = [
                 annotated_peak
                 for annotated_peak in annotated_spectrum.spectrum
                 if annotated_peak.annotation
-                and annotated_peak.annotation[0].charge == 1  # make configurable
                 and (
                     re.search(ion_pattern, repr(annotated_peak.annotation[0]))
                     .group(1)
