@@ -9,6 +9,7 @@ mod diann_features;
 mod fragment_correlations;
 mod mzml;
 mod percentiles;
+mod targeted_xic;
 mod topk;
 
 /// Compute the q-th percentile of a 1D array (q in 0..100).
@@ -280,6 +281,38 @@ fn compute_diann_features(
     })
 }
 
+/// Extract XIC features for a single peptidoform from all MS2 scans.
+#[pyfunction]
+#[pyo3(signature = (ms2_rts, ms2_mz_offsets, ms2_mz_lengths, ms2_mz_flat, ms2_int_flat, target_mzs, target_predictions, rt_min, rt_max, ppm_tolerance=13.0))]
+fn extract_xic_features(
+    py: Python<'_>,
+    ms2_rts: PyReadonlyArray1<f64>,
+    ms2_mz_offsets: PyReadonlyArray1<u64>,
+    ms2_mz_lengths: PyReadonlyArray1<u64>,
+    ms2_mz_flat: PyReadonlyArray1<f64>,
+    ms2_int_flat: PyReadonlyArray1<f64>,
+    target_mzs: PyReadonlyArray1<f64>,
+    target_predictions: PyReadonlyArray1<f64>,
+    rt_min: f64,
+    rt_max: f64,
+    ppm_tolerance: f64,
+) -> HashMap<String, f64> {
+    let rts = ms2_rts.as_slice().unwrap().to_vec();
+    let offsets = ms2_mz_offsets.as_slice().unwrap().to_vec();
+    let lengths = ms2_mz_lengths.as_slice().unwrap().to_vec();
+    let mz = ms2_mz_flat.as_slice().unwrap().to_vec();
+    let ints = ms2_int_flat.as_slice().unwrap().to_vec();
+    let targets = target_mzs.as_slice().unwrap().to_vec();
+    let preds = target_predictions.as_slice().unwrap().to_vec();
+
+    py.allow_threads(|| {
+        targeted_xic::extract_xic_features_impl(
+            &rts, &offsets, &lengths, &mz, &ints, &targets, &preds, rt_min, rt_max,
+            ppm_tolerance,
+        )
+    })
+}
+
 /// Rust-accelerated numerical functions for MuMDIA proteomics pipeline.
 #[pymodule]
 fn mumdia_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -293,5 +326,6 @@ fn mumdia_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(compute_fragment_correlations, m)?)?;
     m.add_function(wrap_pyfunction!(parse_mzml_file, m)?)?;
     m.add_function(wrap_pyfunction!(compute_diann_features, m)?)?;
+    m.add_function(wrap_pyfunction!(extract_xic_features, m)?)?;
     Ok(())
 }

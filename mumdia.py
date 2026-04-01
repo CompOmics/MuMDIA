@@ -904,7 +904,7 @@ _diann_na_strategy = "overlap_only"  # "overlap_only" or "fill_zero"
 def process_peptidoform(args):
     """
     Process a single peptidoform group by computing its feature DataFrames and concatenating them.
-    Computes: collapsed PSM features, correlation features, and optionally DIA-NN features.
+    Computes: collapsed PSM features, correlation features, DIA-NN features, and XIC features.
     """
     (
         df_psms_sub_peptidoform,
@@ -912,18 +912,24 @@ def process_peptidoform(args):
         correlations_list,
         spectra_data,
         ms2pip_preds,
+        xic_features,
     ) = args
-    df1 = run_peptidoform_df(df_psms_sub_peptidoform)
-    df2 = run_peptidoform_correlation(correlations_list)
+    dfs = [
+        run_peptidoform_df(df_psms_sub_peptidoform),
+        run_peptidoform_correlation(correlations_list),
+    ]
     if _use_diann_features:
-        df3 = run_peptidoform_diann(
-            df_psms_sub_peptidoform,
-            df_fragment_sub_peptidoform,
-            spectra_data,
-            ms2pip_preds,
+        dfs.append(
+            run_peptidoform_diann(
+                df_psms_sub_peptidoform,
+                df_fragment_sub_peptidoform,
+                spectra_data,
+                ms2pip_preds,
+            )
         )
-        return pl.concat([df1, df2, df3], how="horizontal")
-    return pl.concat([df1, df2], how="horizontal")
+    if xic_features:
+        dfs.append(pl.DataFrame(xic_features))
+    return pl.concat(dfs, how="horizontal")
 
 
 # TODO move to feature generators
@@ -1625,6 +1631,102 @@ def calculate_features(
 
     log_info(f"Number of PSMs:{df_psms.shape[0]}")
 
+    # Step 5b: Targeted XIC extraction from ALL MS2 scans
+    xic_features_dict = {}
+    if _RUST_BACKEND and spectra_data and spectra_data.ms2_dict:
+        log_info("Step 5b: Extracting targeted XICs from all MS2 scans...")
+
+        # Flatten MS2 data into sorted arrays for efficient Rust access
+        ms2_items = sorted(spectra_data.ms2_dict.items(), key=lambda x: x[1]["retention_time"])
+        ms2_rts_flat = np.array([v["retention_time"] for _, v in ms2_items], dtype=np.float64)
+
+        mz_arrays = [np.asarray(v["mz"], dtype=np.float64) for _, v in ms2_items]
+        int_arrays = [np.asarray(v["intensity"], dtype=np.float64) for _, v in ms2_items]
+
+        offsets = np.zeros(len(mz_arrays), dtype=np.uint64)
+        lengths = np.zeros(len(mz_arrays), dtype=np.uint64)
+        offset = 0
+        for i, mz_arr in enumerate(mz_arrays):
+            offsets[i] = offset
+            lengths[i] = len(mz_arr)
+            offset += len(mz_arr)
+
+        ms2_mz_flat = np.concatenate(mz_arrays) if mz_arrays else np.array([], dtype=np.float64)
+        ms2_int_flat = np.concatenate(int_arrays) if int_arrays else np.array([], dtype=np.float64)
+
+        log_info(f"  Flattened {len(ms2_items)} MS2 scans ({len(ms2_mz_flat)} total peaks)")
+
+        # Extract fragment m/z targets from df_fragment (Sage output)
+        if "fragment_mz_calculated" in df_fragment.columns:
+            for k in tqdm(list(correlations_fragment_dict.keys()), desc="XIC extraction"):
+                parts = k.rsplit("/", 1)
+                if len(parts) != 2:
+                    continue
+                peptide, charge_str = parts
+                charge = int(charge_str)
+
+                # Get this peptidoform's fragments with calculated m/z
+                frag_data = df_fragment.filter(
+                    (pl.col("peptide") == peptide) & (pl.col("charge") == charge)
+                )
+                if len(frag_data) == 0:
+                    continue
+
+                # Unique fragment m/z values
+                frag_mzs = (
+                    frag_data.select("fragment_mz_calculated")
+                    .unique()
+                    .to_series()
+                    .to_numpy()
+                    .astype(np.float64)
+                )
+                frag_mzs = np.sort(frag_mzs)
+
+                # Get RT window from apex ± margin
+                pep_psms = df_psms.filter(
+                    (pl.col("peptide") == peptide) & (pl.col("charge") == charge)
+                )
+                if len(pep_psms) == 0:
+                    continue
+                rt_center = pep_psms["rt"].median()
+                rt_margin = 180.0  # 3 minutes in seconds (or whatever unit RT is in)
+                # Auto-detect: if max RT > 200, it's in seconds; otherwise minutes
+                if ms2_rts_flat.max() < 200:
+                    rt_margin = 3.0  # minutes
+
+                # Get predictions for correlation
+                preds = ms2pip_predictions.get(k, {})
+                pred_values = np.array(
+                    [preds.get(fn, 0.0) for fn in frag_data.select("fragment_name").unique().to_series().to_list()],
+                    dtype=np.float64,
+                )
+                # Pad or trim to match frag_mzs length
+                if len(pred_values) < len(frag_mzs):
+                    pred_values = np.pad(pred_values, (0, len(frag_mzs) - len(pred_values)))
+                elif len(pred_values) > len(frag_mzs):
+                    pred_values = pred_values[: len(frag_mzs)]
+
+                try:
+                    features = mumdia_rs.extract_xic_features(
+                        ms2_rts_flat,
+                        offsets,
+                        lengths,
+                        ms2_mz_flat,
+                        ms2_int_flat,
+                        frag_mzs,
+                        pred_values,
+                        rt_center - rt_margin,
+                        rt_center + rt_margin,
+                        13.0,
+                    )
+                    xic_features_dict[k] = features
+                except Exception:
+                    pass
+
+            log_info(f"  Extracted XICs for {len(xic_features_dict)} peptidoforms")
+        else:
+            log_info("  Skipping XIC: fragment_mz_calculated column not available")
+
     # Step 7: Group all PSMs by peptidoform (peptide/charge) and prepare for parallel processing.
     # Each peptidoform becomes one row in the final PIN file.
     log_info("Step 6: Grouping peptidoforms by peptide and charge")
@@ -1647,6 +1749,7 @@ def calculate_features(
             correlations_fragment_dict[k],
             spectra_data,
             ms2pip_predictions.get(k),
+            xic_features_dict.get(k),
         )
         for k in psm_dict.keys()
         if k in correlations_fragment_dict
