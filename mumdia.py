@@ -1661,13 +1661,48 @@ def calculate_features(
             log_info("  Building XIC targets from fragment m/z values...")
 
             # Auto-detect RT margin (seconds vs minutes)
-            rt_margin = 180.0 if ms2_rts_flat.max() > 200 else 3.0
+            rt_margin = 3.0 if ms2_rts_flat.max() < 200 else 180.0
 
-            # Pre-group fragment data by peptide/charge for fast lookup
+            # Generate ALL theoretical fragment m/z using RustyMS (not just Sage-matched)
+            log_info("  Generating theoretical fragment m/z with RustyMS...")
+            try:
+                from rustyms import CompoundPeptidoformIon, FragmentationModel
+            except ImportError:
+                CompoundPeptidoformIon = None
+
             frag_by_key = {}
             for (peptide, charge), df_sub in df_fragment.group_by(["peptide", "charge"]):
                 key = f"{peptide}/{charge}"
-                mzs = np.sort(df_sub["fragment_mz_calculated"].unique().to_numpy().astype(np.float64))
+                charge_int = int(charge)
+
+                # Try RustyMS theoretical fragments first (complete coverage)
+                if CompoundPeptidoformIon is not None:
+                    try:
+                        pep_ion = CompoundPeptidoformIon(key)
+                        max_frag_charge = min(charge_int, 2)
+                        theo_frags = pep_ion.generate_theoretical_fragments(
+                            max_frag_charge, FragmentationModel.CidHcd
+                        )
+                        mzs = []
+                        for f in theo_frags:
+                            frag_repr = repr(f)
+                            if ("ion='b" in frag_repr or "ion='y" in frag_repr) and "H2O" not in frag_repr and "NH3" not in frag_repr:
+                                mz = f.formula.monoisotopic_mass() / f.charge
+                                if 100 <= mz <= 2500:  # Within typical MS2 range
+                                    mzs.append(mz)
+                        if mzs:
+                            frag_by_key[key] = np.sort(np.array(mzs, dtype=np.float64))
+                            continue
+                    except Exception:
+                        pass
+
+                # Fallback: use Sage-matched fragment m/z
+                mzs = np.sort(
+                    df_sub["fragment_mz_calculated"]
+                    .unique()
+                    .to_numpy()
+                    .astype(np.float64)
+                )
                 frag_by_key[key] = mzs
 
             # Build flat arrays for batch Rust call
