@@ -313,6 +313,67 @@ fn extract_xic_features(
     })
 }
 
+/// Batch XIC extraction: process ALL peptidoforms in a single Rust call.
+/// Avoids the overhead of passing 41M-element arrays from Python per call.
+#[pyfunction]
+#[pyo3(signature = (ms2_rts, ms2_mz_offsets, ms2_mz_lengths, ms2_mz_flat, ms2_int_flat, all_target_mzs, all_target_mz_offsets, all_target_mz_lengths, all_predictions, all_pred_offsets, all_pred_lengths, all_rt_mins, all_rt_maxs, ppm_tolerance=13.0))]
+fn batch_extract_xic_features(
+    py: Python<'_>,
+    ms2_rts: PyReadonlyArray1<f64>,
+    ms2_mz_offsets: PyReadonlyArray1<u64>,
+    ms2_mz_lengths: PyReadonlyArray1<u64>,
+    ms2_mz_flat: PyReadonlyArray1<f64>,
+    ms2_int_flat: PyReadonlyArray1<f64>,
+    // Per-peptidoform targets: flat arrays with offsets
+    all_target_mzs: PyReadonlyArray1<f64>,
+    all_target_mz_offsets: PyReadonlyArray1<u64>,
+    all_target_mz_lengths: PyReadonlyArray1<u64>,
+    all_predictions: PyReadonlyArray1<f64>,
+    all_pred_offsets: PyReadonlyArray1<u64>,
+    all_pred_lengths: PyReadonlyArray1<u64>,
+    all_rt_mins: PyReadonlyArray1<f64>,
+    all_rt_maxs: PyReadonlyArray1<f64>,
+    ppm_tolerance: f64,
+) -> Vec<HashMap<String, f64>> {
+    let rts = ms2_rts.as_slice().unwrap();
+    let offsets = ms2_mz_offsets.as_slice().unwrap();
+    let lengths = ms2_mz_lengths.as_slice().unwrap();
+    let mz = ms2_mz_flat.as_slice().unwrap();
+    let ints = ms2_int_flat.as_slice().unwrap();
+    let target_mzs = all_target_mzs.as_slice().unwrap();
+    let target_offsets = all_target_mz_offsets.as_slice().unwrap();
+    let target_lengths = all_target_mz_lengths.as_slice().unwrap();
+    let predictions = all_predictions.as_slice().unwrap();
+    let pred_offsets = all_pred_offsets.as_slice().unwrap();
+    let pred_lengths = all_pred_lengths.as_slice().unwrap();
+    let rt_mins = all_rt_mins.as_slice().unwrap();
+    let rt_maxs = all_rt_maxs.as_slice().unwrap();
+    let n_peptidoforms = rt_mins.len();
+
+    py.allow_threads(|| {
+        (0..n_peptidoforms)
+            .map(|i| {
+                let t_off = target_offsets[i] as usize;
+                let t_len = target_lengths[i] as usize;
+                let p_off = pred_offsets[i] as usize;
+                let p_len = pred_lengths[i] as usize;
+                targeted_xic::extract_xic_features_impl(
+                    rts,
+                    offsets,
+                    lengths,
+                    mz,
+                    ints,
+                    &target_mzs[t_off..t_off + t_len],
+                    &predictions[p_off..p_off + p_len],
+                    rt_mins[i],
+                    rt_maxs[i],
+                    ppm_tolerance,
+                )
+            })
+            .collect()
+    })
+}
+
 /// Rust-accelerated numerical functions for MuMDIA proteomics pipeline.
 #[pymodule]
 fn mumdia_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -327,5 +388,6 @@ fn mumdia_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(parse_mzml_file, m)?)?;
     m.add_function(wrap_pyfunction!(compute_diann_features, m)?)?;
     m.add_function(wrap_pyfunction!(extract_xic_features, m)?)?;
+    m.add_function(wrap_pyfunction!(batch_extract_xic_features, m)?)?;
     Ok(())
 }

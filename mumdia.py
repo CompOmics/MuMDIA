@@ -1656,72 +1656,93 @@ def calculate_features(
 
         log_info(f"  Flattened {len(ms2_items)} MS2 scans ({len(ms2_mz_flat)} total peaks)")
 
-        # Extract fragment m/z targets from df_fragment (Sage output)
+        # Build batch XIC targets from df_fragment (Sage output)
         if "fragment_mz_calculated" in df_fragment.columns:
-            for k in tqdm(list(correlations_fragment_dict.keys()), desc="XIC extraction"):
+            log_info("  Building XIC targets from fragment m/z values...")
+
+            # Auto-detect RT margin (seconds vs minutes)
+            rt_margin = 180.0 if ms2_rts_flat.max() > 200 else 3.0
+
+            # Pre-group fragment data by peptide/charge for fast lookup
+            frag_by_key = {}
+            for (peptide, charge), df_sub in df_fragment.group_by(["peptide", "charge"]):
+                key = f"{peptide}/{charge}"
+                mzs = np.sort(df_sub["fragment_mz_calculated"].unique().to_numpy().astype(np.float64))
+                frag_by_key[key] = mzs
+
+            # Build flat arrays for batch Rust call
+            xic_keys = []
+            all_target_mzs_list = []
+            all_preds_list = []
+            all_rt_mins = []
+            all_rt_maxs = []
+
+            for k in correlations_fragment_dict.keys():
+                if k not in frag_by_key:
+                    continue
+                frag_mzs = frag_by_key[k]
+                if len(frag_mzs) == 0:
+                    continue
+
+                # RT window
                 parts = k.rsplit("/", 1)
                 if len(parts) != 2:
                     continue
                 peptide, charge_str = parts
-                charge = int(charge_str)
-
-                # Get this peptidoform's fragments with calculated m/z
-                frag_data = df_fragment.filter(
-                    (pl.col("peptide") == peptide) & (pl.col("charge") == charge)
-                )
-                if len(frag_data) == 0:
-                    continue
-
-                # Unique fragment m/z values
-                frag_mzs = (
-                    frag_data.select("fragment_mz_calculated")
-                    .unique()
-                    .to_series()
-                    .to_numpy()
-                    .astype(np.float64)
-                )
-                frag_mzs = np.sort(frag_mzs)
-
-                # Get RT window from apex ± margin
                 pep_psms = df_psms.filter(
-                    (pl.col("peptide") == peptide) & (pl.col("charge") == charge)
+                    (pl.col("peptide") == peptide) & (pl.col("charge") == int(charge_str))
                 )
                 if len(pep_psms) == 0:
                     continue
-                rt_center = pep_psms["rt"].median()
-                rt_margin = 180.0  # 3 minutes in seconds (or whatever unit RT is in)
-                # Auto-detect: if max RT > 200, it's in seconds; otherwise minutes
-                if ms2_rts_flat.max() < 200:
-                    rt_margin = 3.0  # minutes
+                rt_center = float(pep_psms["rt"].median())
 
-                # Get predictions for correlation
+                # Predictions
                 preds = ms2pip_predictions.get(k, {})
-                pred_values = np.array(
-                    [preds.get(fn, 0.0) for fn in frag_data.select("fragment_name").unique().to_series().to_list()],
-                    dtype=np.float64,
-                )
-                # Pad or trim to match frag_mzs length
-                if len(pred_values) < len(frag_mzs):
-                    pred_values = np.pad(pred_values, (0, len(frag_mzs) - len(pred_values)))
-                elif len(pred_values) > len(frag_mzs):
-                    pred_values = pred_values[: len(frag_mzs)]
+                pred_values = np.zeros(len(frag_mzs), dtype=np.float64)
+                # Simple: just fill with available predictions (order may not match perfectly)
+                pred_list = list(preds.values())
+                for i in range(min(len(pred_list), len(pred_values))):
+                    pred_values[i] = pred_list[i]
 
-                try:
-                    features = mumdia_rs.extract_xic_features(
-                        ms2_rts_flat,
-                        offsets,
-                        lengths,
-                        ms2_mz_flat,
-                        ms2_int_flat,
-                        frag_mzs,
-                        pred_values,
-                        rt_center - rt_margin,
-                        rt_center + rt_margin,
-                        13.0,
-                    )
-                    xic_features_dict[k] = features
-                except Exception:
-                    pass
+                xic_keys.append(k)
+                all_target_mzs_list.append(frag_mzs)
+                all_preds_list.append(pred_values)
+                all_rt_mins.append(rt_center - rt_margin)
+                all_rt_maxs.append(rt_center + rt_margin)
+
+            log_info(f"  Prepared {len(xic_keys)} peptidoforms for batch XIC extraction")
+
+            if xic_keys:
+                # Flatten target arrays with offsets
+                target_mz_flat = np.concatenate(all_target_mzs_list)
+                target_offsets_arr = np.zeros(len(xic_keys), dtype=np.uint64)
+                target_lengths_arr = np.zeros(len(xic_keys), dtype=np.uint64)
+                pred_flat = np.concatenate(all_preds_list)
+                pred_offsets_arr = np.zeros(len(xic_keys), dtype=np.uint64)
+                pred_lengths_arr = np.zeros(len(xic_keys), dtype=np.uint64)
+
+                t_offset = 0
+                p_offset = 0
+                for i in range(len(xic_keys)):
+                    target_offsets_arr[i] = t_offset
+                    target_lengths_arr[i] = len(all_target_mzs_list[i])
+                    t_offset += len(all_target_mzs_list[i])
+                    pred_offsets_arr[i] = p_offset
+                    pred_lengths_arr[i] = len(all_preds_list[i])
+                    p_offset += len(all_preds_list[i])
+
+                # Single Rust call for ALL peptidoforms
+                log_info("  Running batch XIC extraction in Rust...")
+                results = mumdia_rs.batch_extract_xic_features(
+                    ms2_rts_flat, offsets, lengths, ms2_mz_flat, ms2_int_flat,
+                    target_mz_flat, target_offsets_arr, target_lengths_arr,
+                    pred_flat, pred_offsets_arr, pred_lengths_arr,
+                    np.array(all_rt_mins, dtype=np.float64),
+                    np.array(all_rt_maxs, dtype=np.float64),
+                    13.0,
+                )
+                for i, k in enumerate(xic_keys):
+                    xic_features_dict[k] = results[i]
 
             log_info(f"  Extracted XICs for {len(xic_features_dict)} peptidoforms")
         else:
