@@ -16,6 +16,12 @@ pub struct Spectrum {
     pub retention_time: f64, // in seconds
     pub mz: Vec<f64>,
     pub intensity: Vec<f64>,
+    /// Isolation window center m/z (MS2 only)
+    pub isolation_window_target: Option<f64>,
+    /// Isolation window lower offset from target
+    pub isolation_window_lower: Option<f64>,
+    /// Isolation window upper offset from target
+    pub isolation_window_upper: Option<f64>,
 }
 
 /// Result of parsing an mzML file: MS1 spectra, MS2→MS1 mapping, MS2 spectra.
@@ -86,6 +92,10 @@ pub fn parse_mzml(path: &str) -> Result<MzMLData, String> {
     let mut current_scan_id = String::new();
     let mut current_ms_level: u8 = 0;
     let mut current_rt: f64 = 0.0;
+    let mut current_iso_target: Option<f64> = None;
+    let mut current_iso_lower: Option<f64> = None;
+    let mut current_iso_upper: Option<f64> = None;
+    let mut in_isolation_window = false;
 
     // State for binary data arrays
     let mut in_binary_data_array = false;
@@ -112,6 +122,9 @@ pub fn parse_mzml(path: &str) -> Result<MzMLData, String> {
                         in_spectrum = true;
                         current_ms_level = 0;
                         current_rt = 0.0;
+                        current_iso_target = None;
+                        current_iso_lower = None;
+                        current_iso_upper = None;
                         current_mz.clear();
                         current_intensity.clear();
 
@@ -122,6 +135,9 @@ pub fn parse_mzml(path: &str) -> Result<MzMLData, String> {
                                     String::from_utf8_lossy(&attr.value).to_string();
                             }
                         }
+                    }
+                    b"isolationWindow" if in_spectrum => {
+                        in_isolation_window = true;
                     }
                     b"binaryDataArray" => {
                         in_binary_data_array = true;
@@ -196,6 +212,18 @@ pub fn parse_mzml(path: &str) -> Result<MzMLData, String> {
                             "MS:1000576" if in_binary_data_array => {
                                 is_compressed = false;
                             }
+                            // Isolation window target m/z
+                            "MS:1000827" if in_isolation_window => {
+                                current_iso_target = value.parse().ok();
+                            }
+                            // Isolation window lower offset
+                            "MS:1000828" if in_isolation_window => {
+                                current_iso_lower = value.parse().ok();
+                            }
+                            // Isolation window upper offset
+                            "MS:1000829" if in_isolation_window => {
+                                current_iso_upper = value.parse().ok();
+                            }
                             _ => {}
                         }
                     }
@@ -227,6 +255,9 @@ pub fn parse_mzml(path: &str) -> Result<MzMLData, String> {
                     b"binaryDataArray" => {
                         in_binary_data_array = false;
                     }
+                    b"isolationWindow" => {
+                        in_isolation_window = false;
+                    }
                     b"spectrum" => {
                         if in_spectrum && !current_mz.is_empty() {
                             let spec = Spectrum {
@@ -235,6 +266,9 @@ pub fn parse_mzml(path: &str) -> Result<MzMLData, String> {
                                 retention_time: current_rt,
                                 mz: std::mem::take(&mut current_mz),
                                 intensity: std::mem::take(&mut current_intensity),
+                                isolation_window_target: current_iso_target,
+                                isolation_window_lower: current_iso_lower,
+                                isolation_window_upper: current_iso_upper,
                             };
 
                             match current_ms_level {

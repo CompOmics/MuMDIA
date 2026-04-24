@@ -6,7 +6,7 @@ This module provides a simplified, flat configuration system that replaces the p
 complex nested configuration. Key features:
 
 1. Single flat parameter structure instead of nested sections
-2. Override mechanism using suffixes (_initial_search, _full_search)  
+2. Override mechanism using suffixes (_initial_search, _full_search)
 3. Automatic default values for all parameters
 4. Backwards compatibility with existing workflow code
 """
@@ -78,6 +78,12 @@ def convert_legacy_config(legacy_data: Dict[str, Any]) -> Dict[str, Any]:
         "remove_intermediate_files": "remove_intermediate_files",
         "fdr_init_search": "fdr_init_search",
         "min_occurrences": "min_occurrences",
+        "rt_margin_top_n": "rt_margin_top_n",
+        "rt_margin_intensity_threshold": "rt_margin_intensity_threshold",
+        "rt_margin_preferred_fragment_count": "rt_margin_preferred_fragment_count",
+        "rt_margin_mode": "rt_margin_mode",
+        "stop_after_stage2": "stop_after_stage2",
+        "custom_engine_skip_python_scoring": "custom_engine_skip_python_scoring",
     }
 
     if "mumdia" in legacy_data:
@@ -85,6 +91,46 @@ def convert_legacy_config(legacy_data: Dict[str, Any]) -> Dict[str, Any]:
         for old_key, new_key in mumdia_field_mapping.items():
             if old_key in mumdia:
                 flat_data[new_key] = mumdia[old_key]
+        if "targeted_search_engine" in mumdia:
+            flat_data["targeted_search_engine"] = mumdia["targeted_search_engine"]
+        if "custom_engine_max_candidates_per_spectrum" in mumdia:
+            flat_data["custom_engine_max_candidates_per_spectrum"] = mumdia[
+                "custom_engine_max_candidates_per_spectrum"
+            ]
+        if "custom_engine_use_predicted_fragments" in mumdia:
+            flat_data["custom_engine_use_predicted_fragments"] = mumdia[
+                "custom_engine_use_predicted_fragments"
+            ]
+        if "custom_engine_fragment_top_n" in mumdia:
+            flat_data["custom_engine_fragment_top_n"] = mumdia[
+                "custom_engine_fragment_top_n"
+            ]
+        if "custom_engine_min_top_fragment_matches" in mumdia:
+            flat_data["custom_engine_min_top_fragment_matches"] = mumdia[
+                "custom_engine_min_top_fragment_matches"
+            ]
+        if "custom_engine_fragment_bin_size_da" in mumdia:
+            flat_data["custom_engine_fragment_bin_size_da"] = mumdia[
+                "custom_engine_fragment_bin_size_da"
+            ]
+        if "custom_engine_skip_python_scoring" in mumdia:
+            flat_data["custom_engine_skip_python_scoring"] = mumdia[
+                "custom_engine_skip_python_scoring"
+            ]
+        if "custom_engine_skip_fragment_rows" in mumdia:
+            flat_data["custom_engine_skip_fragment_rows"] = mumdia[
+                "custom_engine_skip_fragment_rows"
+            ]
+        if "custom_engine_top1_only" in mumdia:
+            flat_data["custom_engine_top1_only"] = mumdia["custom_engine_top1_only"]
+        if "custom_engine_skip_qvalues" in mumdia:
+            flat_data["custom_engine_skip_qvalues"] = mumdia[
+                "custom_engine_skip_qvalues"
+            ]
+        if "custom_engine_partition_workers" in mumdia:
+            flat_data["custom_engine_partition_workers"] = mumdia[
+                "custom_engine_partition_workers"
+            ]
 
     # Set default result_dir if not present
     if "result_dir" not in flat_data:
@@ -192,13 +238,19 @@ class MuMDIAConfig:
 
     annotate_matches: bool = True
     chimera: bool = True
+    chimera_initial_search: Optional[bool] = None
+    chimera_full_search: Optional[bool] = None
     predict_rt: bool = False
     wide_window: bool = True
+    wide_window_initial_search: Optional[bool] = None
+    wide_window_full_search: Optional[bool] = None
 
     # Peak settings
     min_peaks: int = 0
     max_peaks: int = 10000
     min_matched_peaks: int = 5
+    min_matched_peaks_initial_search: Optional[int] = None
+    min_matched_peaks_full_search: Optional[int] = None
 
     # Reporting
     report_psms: int = 5
@@ -225,6 +277,32 @@ class MuMDIAConfig:
     remove_intermediate_files: bool = False
     dlc_transfer_learn: bool = False
     fdr_init_search: float = 0.01
+    rt_split_percentile: float = 95.0
+    rt_split_window_multiplier: float = 4.0
+    rt_split_window_seconds: Optional[float] = None
+    deeplc_epochs_rt_window: int = 75
+    deeplc_epochs_prediction: int = 50
+    deeplc_min_peptidoform_occurrences: int = 1
+    deeplc_use_calibration_only: bool = False
+    predicted_apex_min_fraction_of_max_count: float = 0.9
+    predicted_rt_window_reannotation_multiplier: float = 1.15
+    predicted_rt_window_reannotation_range_scale: float = 2.0
+    predicted_rt_window_reannotation_min_extra: float = 0.0
+    rt_margin_top_n: int = 100
+    rt_margin_intensity_threshold: float = 0.05
+    rt_margin_preferred_fragment_count: int = 2
+    rt_margin_mode: str = "adaptive_per_peptidoform"
+    targeted_search_engine: str = "sage"
+    custom_engine_max_candidates_per_spectrum: int = 2000
+    custom_engine_use_predicted_fragments: bool = True
+    custom_engine_fragment_top_n: int = 3
+    custom_engine_min_top_fragment_matches: int = 1
+    custom_engine_fragment_bin_size_da: float = 0.05
+    custom_engine_skip_python_scoring: bool = False
+    custom_engine_skip_fragment_rows: bool = False
+    custom_engine_top1_only: bool = False
+    custom_engine_skip_qvalues: bool = False
+    custom_engine_partition_workers: int = 0
 
     # ML settings
     n_windows: int = 10
@@ -237,6 +315,7 @@ class MuMDIAConfig:
     clean: bool = False
     sage_only: bool = False
     skip_mokapot: bool = False
+    stop_after_stage2: bool = False
     use_diann_features: bool = True  # DIA-NN features enabled (fast with Rust backend)
     diann_na_strategy: str = "overlap_only"  # "overlap_only" or "fill_zero"
     verbose: bool = False
@@ -349,11 +428,11 @@ class MuMDIAConfig:
             "isotope_errors": [self.isotope_errors_min, self.isotope_errors_max],
             "deisotope": get_param("deisotope"),
             "annotate_matches": self.annotate_matches,
-            "chimera": self.chimera,
-            "wide_window": self.wide_window,
+            "chimera": get_param("chimera"),
+            "wide_window": get_param("wide_window"),
             "min_peaks": self.min_peaks,
             "max_peaks": self.max_peaks,
-            "min_matched_peaks": self.min_matched_peaks,
+            "min_matched_peaks": get_param("min_matched_peaks"),
             "max_fragment_charge": self.max_fragment_charge,
             "report_psms": get_param("report_psms"),
             "output_directory": "./",
@@ -416,10 +495,37 @@ class MuMDIAConfig:
             "clean": self.clean,
             "sage_only": self.sage_only,
             "skip_mokapot": self.skip_mokapot,
+            "stop_after_stage2": self.stop_after_stage2,
             "use_diann_features": self.use_diann_features,
             "diann_na_strategy": self.diann_na_strategy,
             "verbose": self.verbose,
             "min_occurrences": self.min_occurrences,
+            "rt_split_percentile": self.rt_split_percentile,
+            "rt_split_window_multiplier": self.rt_split_window_multiplier,
+            "rt_split_window_seconds": self.rt_split_window_seconds,
+            "deeplc_epochs_rt_window": self.deeplc_epochs_rt_window,
+            "deeplc_epochs_prediction": self.deeplc_epochs_prediction,
+            "deeplc_min_peptidoform_occurrences": self.deeplc_min_peptidoform_occurrences,
+            "deeplc_use_calibration_only": self.deeplc_use_calibration_only,
+            "predicted_apex_min_fraction_of_max_count": self.predicted_apex_min_fraction_of_max_count,
+            "predicted_rt_window_reannotation_multiplier": self.predicted_rt_window_reannotation_multiplier,
+            "predicted_rt_window_reannotation_range_scale": self.predicted_rt_window_reannotation_range_scale,
+            "predicted_rt_window_reannotation_min_extra": self.predicted_rt_window_reannotation_min_extra,
+            "rt_margin_top_n": self.rt_margin_top_n,
+            "rt_margin_intensity_threshold": self.rt_margin_intensity_threshold,
+            "rt_margin_preferred_fragment_count": self.rt_margin_preferred_fragment_count,
+            "rt_margin_mode": self.rt_margin_mode,
+            "targeted_search_engine": self.targeted_search_engine,
+            "custom_engine_max_candidates_per_spectrum": self.custom_engine_max_candidates_per_spectrum,
+            "custom_engine_use_predicted_fragments": self.custom_engine_use_predicted_fragments,
+            "custom_engine_fragment_top_n": self.custom_engine_fragment_top_n,
+            "custom_engine_min_top_fragment_matches": self.custom_engine_min_top_fragment_matches,
+            "custom_engine_fragment_bin_size_da": self.custom_engine_fragment_bin_size_da,
+            "custom_engine_skip_python_scoring": self.custom_engine_skip_python_scoring,
+            "custom_engine_skip_fragment_rows": self.custom_engine_skip_fragment_rows,
+            "custom_engine_top1_only": self.custom_engine_top1_only,
+            "custom_engine_skip_qvalues": self.custom_engine_skip_qvalues,
+            "custom_engine_partition_workers": self.custom_engine_partition_workers,
         }
 
     def to_legacy_format(self) -> Dict[str, Any]:
@@ -481,6 +587,88 @@ class MuMDIAConfig:
         )
         parser.add_argument("--final_fdr", type=float, default=0.01, help="Final FDR")
         parser.add_argument(
+            "--rt_split_percentile",
+            type=float,
+            default=95.0,
+            help="Percentile of Stage-1 RT error used to set mzML split window width",
+        )
+        parser.add_argument(
+            "--rt_split_window_multiplier",
+            type=float,
+            default=1.5,
+            help="Scale factor applied to the percentile-derived mzML split window width",
+        )
+        parser.add_argument(
+            "--rt_split_window_seconds",
+            type=float,
+            help="Optional fixed mzML split window width in seconds; overrides percentile-derived width",
+        )
+        parser.add_argument(
+            "--deeplc_min_peptidoform_occurrences",
+            type=int,
+            help="Minimum number of observations per peptide/charge required for DeepLC fine-tuning",
+        )
+        parser.add_argument(
+            "--deeplc_use_calibration_only",
+            action="store_true",
+            help="Use DeepLC calibration only and skip transfer learning fine-tuning",
+        )
+        parser.add_argument(
+            "--rt_margin_top_n",
+            type=int,
+            help="Top-N peptidoforms used to calibrate global RT margin bounds",
+        )
+        parser.add_argument(
+            "--rt_margin_intensity_threshold",
+            type=float,
+            help="Relative intensity cutoff used for RT margin extraction",
+        )
+        parser.add_argument(
+            "--rt_margin_preferred_fragment_count",
+            type=int,
+            help="Number of top predicted fragments used for apex-centric RT margins",
+        )
+        parser.add_argument(
+            "--rt_margin_mode",
+            choices=["adaptive_per_peptidoform", "global_top_n"],
+            help="RT margin mode: per-peptidoform adaptive or global bounds from top-N",
+        )
+        parser.add_argument(
+            "--targeted-search-engine",
+            choices=["sage", "custom"],
+            help="Backend for stage-2 RT-partition searches",
+        )
+        parser.add_argument(
+            "--custom-engine-max-candidates-per-spectrum",
+            type=int,
+            help="Maximum candidate precursors evaluated per MS2 spectrum in the custom stage-2 backend",
+        )
+        parser.add_argument(
+            "--custom-engine-fragment-top-n",
+            type=int,
+            help="Number of top predicted fragments retained per peptide/charge in the custom stage-2 backend",
+        )
+        parser.add_argument(
+            "--custom-engine-min-top-fragment-matches",
+            type=int,
+            help="Minimum matched top predicted fragments required to keep a candidate in the custom stage-2 shortlist",
+        )
+        parser.add_argument(
+            "--custom-engine-fragment-bin-size-da",
+            type=float,
+            help="Fragment m/z bin width in Da for the custom stage-2 top-fragment inverted index",
+        )
+        parser.add_argument(
+            "--custom-engine-partition-workers",
+            type=int,
+            help="Number of mzML RT partitions to search concurrently in the custom stage-2 backend (0 = auto)",
+        )
+        parser.add_argument(
+            "--disable-custom-engine-predicted-fragments",
+            action="store_true",
+            help="Disable MS2PIP/top-fragment shortlisting in the custom stage-2 backend",
+        )
+        parser.add_argument(
             "--model_type",
             choices=["xgboost", "nn", "percolator"],
             default="xgboost",
@@ -494,6 +682,11 @@ class MuMDIAConfig:
         )
         parser.add_argument("--sage-only", action="store_true", help="Run Sage only")
         parser.add_argument("--skip-mokapot", action="store_true", help="Skip Mokapot")
+        parser.add_argument(
+            "--stop-after-stage2",
+            action="store_true",
+            help="Stop after Stage 2 targeted search and skip Stage 3/4",
+        )
         parser.add_argument("--verbose", action="store_true", help="Verbose output")
 
         args = parser.parse_args()
@@ -517,6 +710,50 @@ class MuMDIAConfig:
             config.training_fdr = args.training_fdr
         if args.final_fdr != 0.01:
             config.final_fdr = args.final_fdr
+        if args.rt_split_percentile != 95.0:
+            config.rt_split_percentile = args.rt_split_percentile
+        if args.rt_split_window_multiplier != 1.5:
+            config.rt_split_window_multiplier = args.rt_split_window_multiplier
+        if args.rt_split_window_seconds is not None:
+            config.rt_split_window_seconds = args.rt_split_window_seconds
+        if args.deeplc_min_peptidoform_occurrences is not None:
+            config.deeplc_min_peptidoform_occurrences = (
+                args.deeplc_min_peptidoform_occurrences
+            )
+        if args.deeplc_use_calibration_only:
+            config.deeplc_use_calibration_only = True
+        if args.rt_margin_top_n is not None:
+            config.rt_margin_top_n = args.rt_margin_top_n
+        if args.rt_margin_intensity_threshold is not None:
+            config.rt_margin_intensity_threshold = args.rt_margin_intensity_threshold
+        if args.rt_margin_preferred_fragment_count is not None:
+            config.rt_margin_preferred_fragment_count = (
+                args.rt_margin_preferred_fragment_count
+            )
+        if args.rt_margin_mode is not None:
+            config.rt_margin_mode = args.rt_margin_mode
+        if args.targeted_search_engine is not None:
+            config.targeted_search_engine = args.targeted_search_engine
+        if args.custom_engine_max_candidates_per_spectrum is not None:
+            config.custom_engine_max_candidates_per_spectrum = (
+                args.custom_engine_max_candidates_per_spectrum
+            )
+        if args.custom_engine_fragment_top_n is not None:
+            config.custom_engine_fragment_top_n = args.custom_engine_fragment_top_n
+        if args.custom_engine_min_top_fragment_matches is not None:
+            config.custom_engine_min_top_fragment_matches = (
+                args.custom_engine_min_top_fragment_matches
+            )
+        if args.custom_engine_fragment_bin_size_da is not None:
+            config.custom_engine_fragment_bin_size_da = (
+                args.custom_engine_fragment_bin_size_da
+            )
+        if args.custom_engine_partition_workers is not None:
+            config.custom_engine_partition_workers = (
+                args.custom_engine_partition_workers
+            )
+        if args.disable_custom_engine_predicted_fragments:
+            config.custom_engine_use_predicted_fragments = False
         if args.model_type != "xgboost":
             config.model_type = args.model_type
 
@@ -524,6 +761,7 @@ class MuMDIAConfig:
         config.clean = args.clean
         config.sage_only = args.sage_only
         config.skip_mokapot = args.skip_mokapot
+        config.stop_after_stage2 = args.stop_after_stage2
         config.verbose = args.verbose
 
         return config

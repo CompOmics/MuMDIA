@@ -18,7 +18,7 @@ by measuring how well the predicted fragment pattern matches the observed spectr
 
 import pickle
 import re
-from typing import List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import polars as pl
@@ -428,149 +428,121 @@ def match_fragments(
     if df_fragment_sub_peptidoform.is_empty():
         log_info("No fragments to match, returning empty results.")
 
-    # Compile regex patterns for extracting ion and charge from annotation strings
-    ion_pattern = r"ion='([^']*)'"
-    charge_pattern = r"charge=(\d+),"
+    if ms2_dict:
+        # Compile regex patterns for extracting ion and charge from annotation strings
+        ion_pattern = r"ion='([^']*)'"
+        charge_pattern = r"charge=(\d+),"
 
-    fragment_records = []
+        fragment_records = []
 
-    # # Plot XICs
-    # plot_XIC(df_fragment_sub_peptidoform)
+        # Get unique PSMs by sorting by fragment intensity and keeping the first occurrence per PSM
+        unique_psm_id = df_fragment_sub_peptidoform.sort(
+            "fragment_intensity", descending=True
+        ).unique(subset=["psm_id"], keep="first")
 
-    # Get unique PSMs by sorting by fragment intensity and keeping the first occurrence per PSM
-    unique_psm_id = df_fragment_sub_peptidoform.sort(
-        "fragment_intensity", descending=True
-    ).unique(
-        subset=["psm_id"], keep="first"
-    )  # TODO: is this the best approach to select the apex?
+        unique_psm_id_dicts = unique_psm_id.to_dicts()
 
-    unique_psm_id_dicts = unique_psm_id.to_dicts()
+        # Iterate over each unique PSM to annotate and match fragments
+        successful_psm_ids = []
+        failed_psm_ids = []
 
-    # Iterate over each unique PSM to annotate and match fragments
-    successful_psm_ids = []
-    failed_psm_ids = []
+        for row in unique_psm_id_dicts:
+            psm_id = int(row["psm_id"])
+            rt = float(row["rt"])
+            scannr = row["scannr"]
+            rt_max_peptide_sub = float(row["rt_max_peptide_sub"])
+            precursor_charge = int(row["charge"])
+            precursor = row["precursor"]
 
-    for row in unique_psm_id_dicts:
-        psm_id = int(row["psm_id"])
-        rt = float(row["rt"])
-        scannr = row["scannr"]
-        rt_max_peptide_sub = float(row["rt_max_peptide_sub"])
-        precursor_charge = int(
-            row["charge"]
-        )  # This was fragment_charge before, but it is the precursor charge
-        precursor = row[
-            "precursor"
-        ]  # TODO: check if its okay to do on precursor level. If we don't we have a problem with RT matching
-
-        try:
-            # Construct a RawSpectrum object for this PSM using the scan number and MS2 data
-            spectrum = RawSpectrum(
-                title=scannr,
-                num_scans=1,
-                rt=float(rt),
-                precursor_charge=precursor_charge,
-                precursor_mass=1.0,
-                mz_array=ms2_dict[scannr]["mz"],
-                intensity_array=ms2_dict[scannr]["intensity"],
-            )
-
-            # CompoundPeptidoformIon parses the "peptide/charge" string into a
-            # structured peptidoform object that RustyMS can use for theoretical
-            # fragment generation (handles modifications, charge state, etc.)
-            linear_peptide = CompoundPeptidoformIon(precursor)
-
-            # MatchingParameters controls how RustyMS matches experimental peaks
-            # to theoretical fragments (here: 13 ppm mass tolerance window)
-            matching_parameters = MatchingParameters()
-            matching_parameters.tolerance_ppm = (
-                13.0  # TODO: make this a parameter used by the config
-            )
-
-            # Annotate the spectrum with theoretical fragments using RustyMS
-            annotated_spectrum = spectrum.annotate(
-                peptidoform=linear_peptide,
-                parameters=matching_parameters,
-                model=FragmentationModel.CidHcd,
-                mode=MassMode.Monoisotopic,
-            )
-
-            # Filter annotated peaks to keep only singly-charged b and y ions.
-            # RustyMS annotations are accessed via repr() strings, so regex is
-            # used to extract the ion type (e.g. "b3", "y7") from the annotation
-            # representation. Keep all b/y fragment charges (not just charge-1)
-            # to match DIA-NN's behavior and capture charge-2 fragments.
-            matched_fragments = [
-                annotated_peak
-                for annotated_peak in annotated_spectrum.spectrum
-                if annotated_peak.annotation
-                and (
-                    re.search(ion_pattern, repr(annotated_peak.annotation[0]))
-                    .group(1)
-                    .startswith("b")
-                    or re.search(ion_pattern, repr(annotated_peak.annotation[0]))
-                    .group(1)
-                    .startswith("y")
+            try:
+                spectrum = RawSpectrum(
+                    title=scannr,
+                    num_scans=1,
+                    rt=float(rt),
+                    precursor_charge=precursor_charge,
+                    precursor_mass=1.0,
+                    mz_array=ms2_dict[scannr]["mz"],
+                    intensity_array=ms2_dict[scannr]["intensity"],
                 )
-            ]
 
-            # # For each matched fragment, extract ion type, ordinal, charge, and intensity
+                linear_peptide = CompoundPeptidoformIon(precursor)
+                matching_parameters = MatchingParameters()
+                matching_parameters.tolerance_ppm = 13.0
 
-            if len(matched_fragments) == 0:
+                annotated_spectrum = spectrum.annotate(
+                    peptidoform=linear_peptide,
+                    parameters=matching_parameters,
+                    model=FragmentationModel.CidHcd,
+                    mode=MassMode.Monoisotopic,
+                )
+
+                matched_fragments = [
+                    annotated_peak
+                    for annotated_peak in annotated_spectrum.spectrum
+                    if annotated_peak.annotation
+                    and (
+                        re.search(ion_pattern, repr(annotated_peak.annotation[0]))
+                        .group(1)
+                        .startswith("b")
+                        or re.search(ion_pattern, repr(annotated_peak.annotation[0]))
+                        .group(1)
+                        .startswith("y")
+                    )
+                ]
+
+                if len(matched_fragments) == 0:
+                    log_info(
+                        "WARNING: No matched fragments found for PSM ID: {}, RT: {}".format(
+                            psm_id, rt
+                        )
+                    )
+                    failed_psm_ids.append(psm_id)
+                    continue
+
+                for mf in matched_fragments:
+                    ion_label = re.search(ion_pattern, repr(mf.annotation[0])).group(1)
+                    ion_charge = re.search(
+                        charge_pattern, repr(mf.annotation[0])
+                    ).group(1)
+
+                    fragment_records.append(
+                        {
+                            "psm_id": psm_id,
+                            "fragment_type": ion_label[0],
+                            "fragment_ordinals": ion_label[1:],
+                            "fragment_charge": ion_charge,
+                            "fragment_intensity": mf.intensity,
+                            "fragment_mz": mf.experimental_mz,
+                            "rt": rt,
+                            "scannr": scannr,
+                            "fragment_name": f"{ion_label}/{ion_charge}",
+                            "rt_max_peptide_sub": rt_max_peptide_sub,
+                        }
+                    )
+
+                successful_psm_ids.append(psm_id)
+
+            except Exception as e:
                 log_info(
-                    "WARNING: No matched fragments found for PSM ID: {}, RT: {}".format(
-                        psm_id, rt
+                    "ERROR: Failed to process PSM ID: {}, RT: {}, Error: {}".format(
+                        psm_id, rt, str(e)
                     )
                 )
                 failed_psm_ids.append(psm_id)
                 continue
 
-            for mf in matched_fragments:
-                # Extract ion type (e.g. "b3", "y7") and charge from the RustyMS
-                # annotation repr string using the precompiled regex patterns.
-                # ion_label[0] gives the ion series letter, ion_label[1:] the ordinal.
-                ion_label = re.search(ion_pattern, repr(mf.annotation[0])).group(1)
-                ion_charge = re.search(charge_pattern, repr(mf.annotation[0])).group(1)
-
-                fragment_records.append(
-                    {
-                        "psm_id": psm_id,
-                        "fragment_type": ion_label[0],
-                        "fragment_ordinals": ion_label[1:],
-                        "fragment_charge": ion_charge,
-                        "fragment_intensity": mf.intensity,
-                        "fragment_mz": mf.experimental_mz,
-                        "rt": rt,
-                        "scannr": scannr,
-                        "fragment_name": f"{ion_label}/{ion_charge}",
-                        "rt_max_peptide_sub": rt_max_peptide_sub,
-                    }
-                )
-
-            successful_psm_ids.append(psm_id)
-
-        except Exception as e:
-            log_info(
-                "ERROR: Failed to process PSM ID: {}, RT: {}, Error: {}".format(
-                    psm_id, rt, str(e)
-                )
+        if len(fragment_records) != 0:
+            new_df_fragment_sub_peptidoform = (
+                pl.DataFrame(fragment_records)
+                .sort("fragment_intensity", descending=True)
+                .unique(subset=["psm_id", "fragment_name"], keep="first")
             )
-            failed_psm_ids.append(psm_id)
-            continue
-
-    # If any fragment records were found, create a new DataFrame and ensure uniqueness per PSM/fragment
-    if len(fragment_records) != 0:
-        new_df_fragment_sub_peptidoform = (
-            pl.DataFrame(fragment_records)
-            .sort("fragment_intensity", descending=True)
-            .unique(subset=["psm_id", "fragment_name"], keep="first")
-        )
-
-        # Replace the original DataFrame
-        df_fragment_sub_peptidoform = new_df_fragment_sub_peptidoform
-    else:
-        log_info("ERROR: No fragment records were created! All PSMs failed processing.")
-        # Keep the original DataFrame rather than creating an empty one
-        log_info("Keeping original df_fragment_sub_peptidoform")
+            df_fragment_sub_peptidoform = new_df_fragment_sub_peptidoform
+        else:
+            log_info(
+                "ERROR: No fragment records were created! All PSMs failed processing."
+            )
+            log_info("Keeping original df_fragment_sub_peptidoform")
 
     # Pivot from long format (one row per PSM-fragment pair) to wide format
     # (one row per PSM, one column per fragment ion). This creates the intensity
@@ -709,12 +681,12 @@ def match_fragments(
             sum_pred_frag_intens=np.array(sum_pred_frag_intens_val),
             correlation_matrix_psm_ids=correlation_matrix_psm_ids,
             correlation_matrix_frag_ids=correlation_matrix_frag_ids,
-            most_intens_cor=most_intens_cor
-            if most_intens_cor != 0.0
-            else most_intens_cor_val,
-            most_intens_cos=most_intens_cos
-            if most_intens_cos != 0.0
-            else most_intens_cos_val,
+            most_intens_cor=(
+                most_intens_cor if most_intens_cor != 0.0 else most_intens_cor_val
+            ),
+            most_intens_cos=(
+                most_intens_cos if most_intens_cos != 0.0 else most_intens_cos_val
+            ),
             mse_avg_pred_intens=mse_avg_pred_intens,
             mse_avg_pred_intens_total=mse_avg_pred_intens_total,
         )
@@ -796,6 +768,7 @@ def get_features_fragment_intensity(
     write_correlation_pickles: bool = False,
     ms2_dict: dict = {},
     output_dir: str = "results/",
+    preannotated_fragment_dict: Optional[Dict[str, pl.DataFrame]] = None,
 ):
     """
     Compute fragment intensity correlation features for all peptidoforms.
@@ -853,11 +826,42 @@ def get_features_fragment_intensity(
         }
     )
 
+    if "primary_window_id" in df_fragment_max_peptide.columns:
+        precursor_to_window = dict(
+            zip(
+                df_fragment_max_peptide["precursor"].to_list(),
+                df_fragment_max_peptide["primary_window_id"].to_list(),
+            )
+        )
+        df_precursor_window = pl.DataFrame(
+            {
+                "precursor": list(precursor_to_window.keys()),
+                "primary_window_id": list(precursor_to_window.values()),
+            }
+        )
+    else:
+        df_precursor_window = None
+
     df_fragment = df_fragment.with_columns(
         (pl.col("peptide") + "/" + pl.col("charge").cast(pl.Utf8)).alias("precursor")
     )
 
     df_fragment = df_fragment.join(df_precursor_rt, on="precursor", how="left")
+    if df_precursor_window is not None:
+        df_fragment = df_fragment.join(df_precursor_window, on="precursor", how="left")
+
+    if (
+        "window_id" in df_fragment.columns
+        and "primary_window_id" in df_fragment.columns
+    ):
+        df_fragment = df_fragment.filter(
+            pl.col("primary_window_id").is_null()
+            | (pl.col("window_id") == pl.col("primary_window_id"))
+        )
+    if "precursor_in_window" in df_fragment.columns:
+        df_fragment = df_fragment.filter(
+            pl.col("precursor_in_window").is_null() | pl.col("precursor_in_window")
+        )
 
     # Filter fragments to the retention time window around the apex.
     # If calibrated RT margins are available (rt_lower_margin / rt_higher_margin),
@@ -897,7 +901,8 @@ def get_features_fragment_intensity(
     for (peptidoform, charge), df_fragment_sub_peptidoform in tqdm(
         df_fragment.group_by(["peptide", "charge"])
     ):
-        preds = ms2pip_predictions.get(f"{peptidoform}/{charge}")
+        precursor_key = f"{peptidoform}/{charge}"
+        preds = ms2pip_predictions.get(precursor_key)
         if not preds:
             log_info(f"No intensity prediction found for {peptidoform}/{charge}...")
             continue
@@ -905,11 +910,60 @@ def get_features_fragment_intensity(
             log_info(f"No fragments found for {peptidoform}/{charge}...")
             continue
 
-        results = match_fragments(df_fragment_sub_peptidoform, preds, ms2_dict)
+        matched_fragment_df = None
+        if preannotated_fragment_dict is not None:
+            matched_fragment_df = preannotated_fragment_dict.get(precursor_key)
+            if matched_fragment_df is not None and not matched_fragment_df.is_empty():
+                primary_window_id = None
+                if (
+                    "primary_window_id" in df_fragment_max_peptide.columns
+                    and precursor_key in precursor_to_rt_max
+                ):
+                    window_rows = df_fragment_max_peptide.filter(
+                        (pl.col("peptide") == peptidoform)
+                        & (pl.col("charge") == charge)
+                    )
+                    if (
+                        not window_rows.is_empty()
+                        and "primary_window_id" in window_rows.columns
+                    ):
+                        primary_window_id = window_rows["primary_window_id"][0]
+                if (
+                    primary_window_id is not None
+                    and "window_id" in matched_fragment_df.columns
+                ):
+                    matched_fragment_df = matched_fragment_df.filter(
+                        pl.col("window_id") == primary_window_id
+                    )
+                if "precursor_in_window" in matched_fragment_df.columns:
+                    matched_fragment_df = matched_fragment_df.filter(
+                        pl.col("precursor_in_window").is_null()
+                        | pl.col("precursor_in_window")
+                    )
+                matched_fragment_df = matched_fragment_df.filter(
+                    (pl.col("rt_max_peptide_sub").is_not_null())
+                    & (
+                        pl.when(pl.col("rt_lower_margin").is_not_null())
+                        .then(
+                            (pl.col("rt") >= pl.col("rt_lower_margin"))
+                            & (pl.col("rt") <= pl.col("rt_higher_margin"))
+                        )
+                        .otherwise(
+                            abs(pl.col("rt") - pl.col("rt_max_peptide_sub"))
+                            < filter_max_apex_rt
+                        )
+                    )
+                )
 
-        fragment_dict[f"{peptidoform}/{charge}"] = df_fragment_sub_peptidoform
+        if matched_fragment_df is not None and not matched_fragment_df.is_empty():
+            results = match_fragments(matched_fragment_df, preds, ms2_dict={})
+            fragment_dict[precursor_key] = matched_fragment_df
+        else:
+            results = match_fragments(df_fragment_sub_peptidoform, preds, ms2_dict)
+            fragment_dict[precursor_key] = df_fragment_sub_peptidoform
+
         # Keep backward compatibility: convert dataclass back to list for downstream code
-        correlations_fragment_dict[f"{peptidoform}/{charge}"] = [
+        correlations_fragment_dict[precursor_key] = [
             results.correlations,
             results.correlations_count,
             results.sum_pred_frag_intens,

@@ -42,6 +42,8 @@ class TestConfigCompatibility:
         mumdia = config.get_mumdia_config()
         assert "read_initial_search_pickle" in mumdia
         assert "write_deeplc_pickle" in mumdia
+        assert "targeted_search_engine" in mumdia
+        assert "stop_after_stage2" in mumdia
 
     def test_legacy_nested_format(self, legacy_config_path):
         """Load the old nested (sage_basic / sage / mumdia) format."""
@@ -66,4 +68,6 @@ class TestConfigCompatibility:
             or initial["database"]["enzyme"]["cleave_at"]
             != full["database"]["enzyme"]["cleave_at"]
         )
-        assert differs, "Initial and full search configs should have at least one difference"
+        assert (
+            differs
+        ), "Initial and full search configs should have at least one difference"

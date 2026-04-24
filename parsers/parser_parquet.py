@@ -137,7 +137,9 @@ def parquet_reader(
     log_info("df_psms shape after replacing mass shifts: {}".format(df_psms.shape))
 
     df_fragment = df_fragment.join(
-        df_psms[["psm_id", "peptide", "charge", "rt"]], on="psm_id", how="left"
+        df_psms[["psm_id", "peptide", "charge", "rt", "scannr"]],
+        on="psm_id",
+        how="left",
     )
 
     # Get the maximum fragment intensity per PSM

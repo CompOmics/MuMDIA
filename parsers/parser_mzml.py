@@ -91,11 +91,25 @@ def get_ms1_mzml(file_path):
             # Map current MS2 scan identifier to the last MS1 scan identifier)
             ms2_to_ms1_map[scan_id] = last_ms1_id
 
-            ms2_spectra[scan_id] = {
+            entry = {
                 "retention_time": retention_time,
                 "mz": mz_array,
                 "intensity": intensity_array,
             }
+
+            # Extract isolation window for DIA scan filtering
+            precursors = spectrum.getPrecursors()
+            if precursors:
+                p = precursors[0]
+                iso_target = p.getMZ()
+                iso_lower = p.getIsolationWindowLowerOffset()
+                iso_upper = p.getIsolationWindowUpperOffset()
+                if iso_target > 0:
+                    entry["isolation_window_target"] = iso_target
+                    entry["isolation_window_lower"] = iso_lower
+                    entry["isolation_window_upper"] = iso_upper
+
+            ms2_spectra[scan_id] = entry
 
     return ms1_spectra, ms2_to_ms1_map, ms2_spectra
 
@@ -111,7 +125,7 @@ def split_mzml_by_retention_time(original_file, dir_files="", time_interval=120.
         original_file: Path to the input mzML file.
         dir_files: Base directory for output (partitions go into dir_files/temp/).
         time_interval: Duration of each partition in seconds (dynamically set to
-            perc_95 from DeepLC in the main pipeline, not always 120s).
+            the RT split window from DeepLC/config in the main pipeline, not always 120s).
 
     Returns:
         Dict mapping upper RT bound (float) to partition mzML file path (str).

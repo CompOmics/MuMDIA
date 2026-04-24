@@ -51,11 +51,11 @@ class TestWorkflowIntegration:
             "fasta_file": "test.fasta",
             "result_dir": "test_results",
             "fdr_init_search": 0.01,
+            "targeted_search_engine": "custom",
+            "stop_after_stage2": True,
         }
 
-        with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".json", delete=False
-        ) as f:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
             json.dump(config_data, f)
             config_path = f.name
 
@@ -64,6 +64,8 @@ class TestWorkflowIntegration:
             assert config.mzml_file == "test.mzML"
             assert config.result_dir == "test_results"
             assert config.fdr_init_search == 0.01
+            assert config.targeted_search_engine == "custom"
+            assert config.stop_after_stage2 is True
 
             initial = config.get_initial_search_config()
             full = config.get_full_search_config()
@@ -92,9 +94,7 @@ class TestWorkflowIntegration:
             "mumdia": {"fdr_init_search": 0.01},
         }
 
-        with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".json", delete=False
-        ) as f:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
             json.dump(config_data, f)
             config_path = f.name
 

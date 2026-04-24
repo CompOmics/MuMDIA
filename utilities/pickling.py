@@ -164,8 +164,13 @@ def read_variables_from_pickles(
         df_fragment_max_peptide = pickle.load(f)
     with open(pickle_dir.joinpath(config_fname), "rb") as f:
         config = pickle.load(f)
-    with open(pickle_dir.joinpath(dlc_transfer_learn_fname), "rb") as f:
-        dlc_transfer_learn = pickle.load(f)
+    try:
+        with open(pickle_dir.joinpath(dlc_transfer_learn_fname), "rb") as f:
+            dlc_transfer_learn = pickle.load(f)
+    except Exception:
+        # Gracefully handle cases where the DeepLC model cannot be deserialized
+        # (e.g. missing optional dependency version). The pipeline will retrain.
+        dlc_transfer_learn = None
     with open(pickle_dir.joinpath(flags_fname), "rb") as f:
         flags = pickle.load(f)
 

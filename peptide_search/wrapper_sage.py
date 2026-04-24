@@ -109,7 +109,7 @@ def retention_window_searches(
     mzml_dict: Dict[float, str],
     peptide_df: pd.DataFrame,
     config: Dict[str, Any],
-    perc_95: float,
+    rt_split_window: float,
 ) -> Tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame, pl.DataFrame]:
     """
     Perform Sage searches on retention time-partitioned mzML files.
@@ -121,7 +121,7 @@ def retention_window_searches(
         mzml_dict: Mapping of retention time upper bounds to mzML file paths
         peptide_df: DataFrame with peptides and RT prediction bounds
         config: Sage configuration dictionary
-        perc_95: 95th percentile RT error for window overlap calculation
+        rt_split_window: RT split window width for overlap calculation
 
     Returns:
         Tuple containing combined results:
@@ -137,11 +137,11 @@ def retention_window_searches(
     # Process each retention time partition sequentially
     for upper_mzml_partition, mzml_path in mzml_dict.items():
         # Select peptides whose predicted RT interval overlaps the current
-        # mzML partition window [upper_mzml_partition - perc_95, upper_mzml_partition].
+        # mzML partition window [upper_mzml_partition - rt_split_window, upper_mzml_partition].
         # Two intervals [a, b] and [c, d] overlap iff max(a, c) <= min(b, d).
         # Here a=predictions_lower, b=predictions_upper, c=partition_start, d=partition_end.
         peptide_selection_mask = np.maximum(
-            peptide_df["predictions_lower"], upper_mzml_partition - perc_95
+            peptide_df["predictions_lower"], upper_mzml_partition - rt_split_window
         ) <= np.minimum(peptide_df["predictions_upper"], upper_mzml_partition)
 
         sub_peptide_df = peptide_df[peptide_selection_mask]
@@ -152,7 +152,9 @@ def retention_window_searches(
             import matplotlib.pyplot as plt
 
             plt.figure(figsize=(10, 4))
-            plt.title(f"RT Partition ≤ {upper_mzml_partition} min (±{perc_95} min)")
+            plt.title(
+                f"RT Partition ≤ {upper_mzml_partition} min (±{rt_split_window} min)"
+            )
             plt.xlabel("Retention Time (min)")
             plt.ylabel("Peptide Index")
 
@@ -184,7 +186,7 @@ def retention_window_searches(
                 label="Partition Upper Bound",
             )
             plt.axvspan(
-                upper_mzml_partition - perc_95,
+                upper_mzml_partition - rt_split_window,
                 upper_mzml_partition,
                 color="blue",
                 alpha=0.1,

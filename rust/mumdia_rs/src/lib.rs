@@ -2,14 +2,16 @@ use std::collections::HashMap;
 
 use numpy::{PyArray1, PyReadonlyArray1, PyReadonlyArray2, PyUntypedArrayMethods};
 use pyo3::prelude::*;
+use rayon::prelude::*;
 
 mod batch;
 mod correlation;
 mod diann_features;
 mod fragment_correlations;
-mod mzml;
+mod r#match;
+pub mod mzml;
 mod percentiles;
-mod targeted_xic;
+pub mod targeted_xic;
 mod topk;
 
 /// Compute the q-th percentile of a 1D array (q in 0..100).
@@ -229,6 +231,25 @@ fn parse_mzml_file(
             "retention_time".to_string(),
             spec.retention_time.into_pyobject(py)?.unbind().into(),
         );
+        // Isolation window for DIA MS2 scans
+        if let Some(target) = spec.isolation_window_target {
+            entry.insert(
+                "isolation_window_target".to_string(),
+                target.into_pyobject(py)?.unbind().into(),
+            );
+        }
+        if let Some(lower) = spec.isolation_window_lower {
+            entry.insert(
+                "isolation_window_lower".to_string(),
+                lower.into_pyobject(py)?.unbind().into(),
+            );
+        }
+        if let Some(upper) = spec.isolation_window_upper {
+            entry.insert(
+                "isolation_window_upper".to_string(),
+                upper.into_pyobject(py)?.unbind().into(),
+            );
+        }
         ms2_dict.insert(spec.scan_id.clone(), entry);
     }
 
@@ -281,9 +302,9 @@ fn compute_diann_features(
     })
 }
 
-/// Extract XIC features for a single peptidoform from all MS2 scans.
+/// Extract XIC features for a single peptidoform from MS2 scans matching its isolation window.
 #[pyfunction]
-#[pyo3(signature = (ms2_rts, ms2_mz_offsets, ms2_mz_lengths, ms2_mz_flat, ms2_int_flat, target_mzs, target_predictions, rt_min, rt_max, ppm_tolerance=13.0))]
+#[pyo3(signature = (ms2_rts, ms2_mz_offsets, ms2_mz_lengths, ms2_mz_flat, ms2_int_flat, ms2_iso_lower, ms2_iso_upper, target_mzs, target_predictions, precursor_mz, rt_min, rt_max, ppm_tolerance=13.0))]
 fn extract_xic_features(
     py: Python<'_>,
     ms2_rts: PyReadonlyArray1<f64>,
@@ -291,8 +312,11 @@ fn extract_xic_features(
     ms2_mz_lengths: PyReadonlyArray1<u64>,
     ms2_mz_flat: PyReadonlyArray1<f64>,
     ms2_int_flat: PyReadonlyArray1<f64>,
+    ms2_iso_lower: PyReadonlyArray1<f64>,
+    ms2_iso_upper: PyReadonlyArray1<f64>,
     target_mzs: PyReadonlyArray1<f64>,
     target_predictions: PyReadonlyArray1<f64>,
+    precursor_mz: f64,
     rt_min: f64,
     rt_max: f64,
     ppm_tolerance: f64,
@@ -302,21 +326,26 @@ fn extract_xic_features(
     let lengths = ms2_mz_lengths.as_slice().unwrap().to_vec();
     let mz = ms2_mz_flat.as_slice().unwrap().to_vec();
     let ints = ms2_int_flat.as_slice().unwrap().to_vec();
+    let iso_lo = ms2_iso_lower.as_slice().unwrap().to_vec();
+    let iso_hi = ms2_iso_upper.as_slice().unwrap().to_vec();
     let targets = target_mzs.as_slice().unwrap().to_vec();
     let preds = target_predictions.as_slice().unwrap().to_vec();
 
     py.allow_threads(|| {
         targeted_xic::extract_xic_features_impl(
-            &rts, &offsets, &lengths, &mz, &ints, &targets, &preds, rt_min, rt_max,
+            &rts, &offsets, &lengths, &mz, &ints,
+            &iso_lo, &iso_hi,
+            &targets, &preds,
+            precursor_mz, rt_min, rt_max,
             ppm_tolerance,
         )
     })
 }
 
 /// Batch XIC extraction: process ALL peptidoforms in a single Rust call.
-/// Avoids the overhead of passing 41M-element arrays from Python per call.
+/// Filters scans by isolation window per peptidoform for proper DIA handling.
 #[pyfunction]
-#[pyo3(signature = (ms2_rts, ms2_mz_offsets, ms2_mz_lengths, ms2_mz_flat, ms2_int_flat, all_target_mzs, all_target_mz_offsets, all_target_mz_lengths, all_predictions, all_pred_offsets, all_pred_lengths, all_rt_mins, all_rt_maxs, ppm_tolerance=13.0))]
+#[pyo3(signature = (ms2_rts, ms2_mz_offsets, ms2_mz_lengths, ms2_mz_flat, ms2_int_flat, ms2_iso_lower, ms2_iso_upper, all_target_mzs, all_target_mz_offsets, all_target_mz_lengths, all_predictions, all_pred_offsets, all_pred_lengths, all_precursor_mzs, all_rt_mins, all_rt_maxs, ppm_tolerance=13.0))]
 fn batch_extract_xic_features(
     py: Python<'_>,
     ms2_rts: PyReadonlyArray1<f64>,
@@ -324,6 +353,8 @@ fn batch_extract_xic_features(
     ms2_mz_lengths: PyReadonlyArray1<u64>,
     ms2_mz_flat: PyReadonlyArray1<f64>,
     ms2_int_flat: PyReadonlyArray1<f64>,
+    ms2_iso_lower: PyReadonlyArray1<f64>,
+    ms2_iso_upper: PyReadonlyArray1<f64>,
     // Per-peptidoform targets: flat arrays with offsets
     all_target_mzs: PyReadonlyArray1<f64>,
     all_target_mz_offsets: PyReadonlyArray1<u64>,
@@ -331,6 +362,7 @@ fn batch_extract_xic_features(
     all_predictions: PyReadonlyArray1<f64>,
     all_pred_offsets: PyReadonlyArray1<u64>,
     all_pred_lengths: PyReadonlyArray1<u64>,
+    all_precursor_mzs: PyReadonlyArray1<f64>,
     all_rt_mins: PyReadonlyArray1<f64>,
     all_rt_maxs: PyReadonlyArray1<f64>,
     ppm_tolerance: f64,
@@ -340,18 +372,22 @@ fn batch_extract_xic_features(
     let lengths = ms2_mz_lengths.as_slice().unwrap();
     let mz = ms2_mz_flat.as_slice().unwrap();
     let ints = ms2_int_flat.as_slice().unwrap();
+    let iso_lo = ms2_iso_lower.as_slice().unwrap();
+    let iso_hi = ms2_iso_upper.as_slice().unwrap();
     let target_mzs = all_target_mzs.as_slice().unwrap();
     let target_offsets = all_target_mz_offsets.as_slice().unwrap();
     let target_lengths = all_target_mz_lengths.as_slice().unwrap();
     let predictions = all_predictions.as_slice().unwrap();
     let pred_offsets = all_pred_offsets.as_slice().unwrap();
     let pred_lengths = all_pred_lengths.as_slice().unwrap();
+    let precursor_mzs = all_precursor_mzs.as_slice().unwrap();
     let rt_mins = all_rt_mins.as_slice().unwrap();
     let rt_maxs = all_rt_maxs.as_slice().unwrap();
     let n_peptidoforms = rt_mins.len();
 
     py.allow_threads(|| {
         (0..n_peptidoforms)
+            .into_par_iter()
             .map(|i| {
                 let t_off = target_offsets[i] as usize;
                 let t_len = target_lengths[i] as usize;
@@ -363,8 +399,11 @@ fn batch_extract_xic_features(
                     lengths,
                     mz,
                     ints,
+                    iso_lo,
+                    iso_hi,
                     &target_mzs[t_off..t_off + t_len],
                     &predictions[p_off..p_off + p_len],
+                    precursor_mzs[i],
                     rt_mins[i],
                     rt_maxs[i],
                     ppm_tolerance,
@@ -372,6 +411,88 @@ fn batch_extract_xic_features(
             })
             .collect()
     })
+}
+
+/// Search one RT-partition mzML for top predicted fragment chromatograms.
+/// Parses mzML and performs targeted XIC extraction fully in Rust.
+#[pyfunction]
+#[pyo3(signature = (mzml_path, peptides, charges, precursor_mzs, rt_mins, rt_maxs, predicted_fragment_mzs, predicted_fragment_mz_offsets, predicted_fragment_mz_lengths, predicted_fragment_names, predicted_fragment_name_offsets, predicted_fragment_name_lengths, predicted_fragment_weights, predicted_fragment_weight_offsets, predicted_fragment_weight_lengths, top_n=3, ppm_tolerance=13.0))]
+fn search_partition_chromatograms(
+    py: Python<'_>,
+    mzml_path: &str,
+    peptides: Vec<String>,
+    charges: PyReadonlyArray1<u64>,
+    precursor_mzs: PyReadonlyArray1<f64>,
+    rt_mins: PyReadonlyArray1<f64>,
+    rt_maxs: PyReadonlyArray1<f64>,
+    predicted_fragment_mzs: PyReadonlyArray1<f64>,
+    predicted_fragment_mz_offsets: PyReadonlyArray1<u64>,
+    predicted_fragment_mz_lengths: PyReadonlyArray1<u64>,
+    predicted_fragment_names: Vec<String>,
+    predicted_fragment_name_offsets: PyReadonlyArray1<u64>,
+    predicted_fragment_name_lengths: PyReadonlyArray1<u64>,
+    predicted_fragment_weights: PyReadonlyArray1<f64>,
+    predicted_fragment_weight_offsets: PyReadonlyArray1<u64>,
+    predicted_fragment_weight_lengths: PyReadonlyArray1<u64>,
+    top_n: usize,
+    ppm_tolerance: f64,
+) -> PyResult<Vec<HashMap<String, f64>>> {
+    let charges_slice = charges.as_slice()?;
+    let precursor_mzs_slice = precursor_mzs.as_slice()?;
+    let rt_mins_slice = rt_mins.as_slice()?;
+    let rt_maxs_slice = rt_maxs.as_slice()?;
+    let pred_mzs = predicted_fragment_mzs.as_slice()?;
+    let pred_mz_offsets = predicted_fragment_mz_offsets.as_slice()?;
+    let pred_mz_lengths = predicted_fragment_mz_lengths.as_slice()?;
+    let pred_name_offsets = predicted_fragment_name_offsets.as_slice()?;
+    let pred_name_lengths = predicted_fragment_name_lengths.as_slice()?;
+    let pred_weights = predicted_fragment_weights.as_slice()?;
+    let pred_weight_offsets = predicted_fragment_weight_offsets.as_slice()?;
+    let pred_weight_lengths = predicted_fragment_weight_lengths.as_slice()?;
+
+    let n_candidates = peptides.len();
+    if charges_slice.len() != n_candidates
+        || precursor_mzs_slice.len() != n_candidates
+        || rt_mins_slice.len() != n_candidates
+        || rt_maxs_slice.len() != n_candidates
+        || pred_mz_offsets.len() != n_candidates
+        || pred_mz_lengths.len() != n_candidates
+        || pred_name_offsets.len() != n_candidates
+        || pred_name_lengths.len() != n_candidates
+        || pred_weight_offsets.len() != n_candidates
+        || pred_weight_lengths.len() != n_candidates
+    {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "candidate array lengths must match",
+        ));
+    }
+
+    let charges_vec: Vec<u8> = charges_slice.iter().map(|&v| v as u8).collect();
+    let mzml = py
+        .allow_threads(|| mzml::parse_mzml(mzml_path))
+        .map_err(pyo3::exceptions::PyIOError::new_err)?;
+
+    Ok(py.allow_threads(|| {
+        targeted_xic::search_partition_chromatograms_impl(
+            &mzml,
+            &peptides,
+            &charges_vec,
+            precursor_mzs_slice,
+            rt_mins_slice,
+            rt_maxs_slice,
+            pred_mzs,
+            pred_mz_offsets,
+            pred_mz_lengths,
+            &predicted_fragment_names,
+            pred_name_offsets,
+            pred_name_lengths,
+            pred_weights,
+            pred_weight_offsets,
+            pred_weight_lengths,
+            top_n,
+            ppm_tolerance,
+        )
+    }))
 }
 
 /// Rust-accelerated numerical functions for MuMDIA proteomics pipeline.
@@ -389,5 +510,7 @@ fn mumdia_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(compute_diann_features, m)?)?;
     m.add_function(wrap_pyfunction!(extract_xic_features, m)?)?;
     m.add_function(wrap_pyfunction!(batch_extract_xic_features, m)?)?;
+    m.add_function(wrap_pyfunction!(search_partition_chromatograms, m)?)?;
+    m.add_function(wrap_pyfunction!(r#match::prefilter_window_candidates, m)?)?;
     Ok(())
 }

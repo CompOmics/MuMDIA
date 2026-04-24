@@ -119,3 +119,43 @@ class TestRustProperties:
             assert (
                 -1.0 - 1e-10 <= r <= 1.0 + 1e-10
             ), f"Row {i}: correlation {r} out of range"
+
+
+@pytest.mark.skipif(not RUST_AVAILABLE, reason="mumdia_rs not installed")
+class TestRustPrefilter:
+    def test_prefilter_window_candidates(self):
+        spectrum_idx, candidate_idx, matched_counts = (
+            mumdia_rs.prefilter_window_candidates(
+                np.array([500.25, 503.25], dtype=np.float64),
+                np.array(
+                    [
+                        204.13,
+                        317.22,
+                        430.31,
+                        533.40,
+                        646.48,
+                        759.57,
+                        150.0,
+                        250.0,
+                        350.0,
+                    ],
+                    dtype=np.float64,
+                ),
+                np.array([0, 6], dtype=np.uint64),
+                np.array([6, 3], dtype=np.uint64),
+                np.array([499.0], dtype=np.float64),
+                np.array([501.0], dtype=np.float64),
+                np.array(
+                    [204.1305, 317.2195, 430.3108, 646.4820, 1000.0], dtype=np.float64
+                ),
+                np.array([0], dtype=np.uint64),
+                np.array([5], dtype=np.uint64),
+                20.0,
+                3,
+                0.08,
+            )
+        )
+
+        assert spectrum_idx.tolist() == [0]
+        assert candidate_idx.tolist() == [0]
+        assert matched_counts.tolist() == [4]

@@ -6,7 +6,7 @@ to avoid circular import issues.
 """
 
 from dataclasses import dataclass, field
-from typing import Dict
+from typing import Any, Dict
 
 import numpy as np
 
@@ -45,3 +45,4 @@ class SpectraData:
     ms1_dict: Dict = field(default_factory=dict)
     ms2_to_ms1_dict: Dict = field(default_factory=dict)
     ms2_dict: Dict = field(default_factory=dict)
+    ms2_scan_metadata: Any = None

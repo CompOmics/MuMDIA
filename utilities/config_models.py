@@ -124,6 +124,10 @@ class MuMDIASettings:
     fdr_init_search: float = 0.05
 
     coefficient_bounds: int = 1
+    predicted_apex_min_fraction_of_max_count: float = 0.9
+    predicted_rt_window_reannotation_multiplier: float = 1.15
+    predicted_rt_window_reannotation_range_scale: float = 2.0
+    predicted_rt_window_reannotation_min_extra: float = 0.0
 
     def validate(self) -> None:
         """Validate MuMDIA settings (FDR must be non-negative)."""

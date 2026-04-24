@@ -13,6 +13,7 @@ Usage:
 """
 
 import os
+import pickle
 
 os.environ["POLARS_MAX_THREADS"] = "1"
 
@@ -32,9 +33,78 @@ import mumdia
 
 from parsers.parser_mzml import get_ms1_mzml, split_mzml_by_retention_time
 from parsers.parser_parquet import parquet_reader
-from peptide_search.wrapper_sage import retention_window_searches, run_sage
+from peptide_search.search_backend import run_targeted_search_backend
+from peptide_search.wrapper_sage import run_sage
 from prediction_wrappers.wrapper_deeplc import retrain_and_bounds
+from prediction_wrappers.wrapper_ms2pip import get_predictions_fragment_intensity
+from peptide_search.custom_engine import build_ms2pip_prediction_input
 from sequence.fasta import tryptic_digest_pyopenms
+
+
+def _get_cached_targeted_search_backend(result_dir: Path) -> str | None:
+    """Return the cached stage-2 backend if full-search pickles already exist."""
+    config_path = result_dir.joinpath("config.pkl")
+    if not config_path.exists():
+        return None
+
+    try:
+        with open(config_path, "rb") as handle:
+            cached_config = pickle.load(handle)
+    except Exception:
+        return None
+
+    if not isinstance(cached_config, dict):
+        return None
+
+    return (
+        cached_config.get("mumdia", {}).get("targeted_search_engine")
+        if isinstance(cached_config.get("mumdia"), dict)
+        else None
+    )
+
+
+def _get_stage2_ms2pip_cache_path(result_dir: Path) -> Path:
+    """Return the cache path for precomputed Stage-2 MS2PIP predictions."""
+    return result_dir.joinpath("stage2_ms2pip_predictions.pkl")
+
+
+def _prepare_stage2_backend_context(
+    requested_backend: str,
+    peptide_df,
+    legacy_config,
+    mumdia_config,
+    result_dir: Path,
+) -> dict:
+    """Build reusable backend context for Stage 2 search backends."""
+    backend_context: dict = {}
+    if requested_backend != "custom":
+        return backend_context
+    if not mumdia_config.get("custom_engine_use_predicted_fragments", True):
+        return backend_context
+
+    cache_path = _get_stage2_ms2pip_cache_path(result_dir)
+    if mumdia_config.get("read_ms2pip_pickle") and cache_path.exists():
+        log_info(f"Reading Stage-2 MS2PIP predictions from {cache_path}")
+        with open(cache_path, "rb") as handle:
+            backend_context["ms2pip_predictions"] = pickle.load(handle)
+        return backend_context
+
+    ms2pip_input = build_ms2pip_prediction_input(peptide_df, legacy_config["sage"])
+    if ms2pip_input.is_empty():
+        return backend_context
+
+    log_info(
+        "Precomputing MS2PIP predictions for Stage-2 custom backend: "
+        f"{ms2pip_input.height} peptide/charge candidates"
+    )
+    ms2pip_predictions = get_predictions_fragment_intensity(ms2pip_input)
+    backend_context["ms2pip_predictions"] = ms2pip_predictions
+
+    if mumdia_config.get("write_ms2pip_pickle"):
+        with open(cache_path, "wb") as handle:
+            pickle.dump(ms2pip_predictions, handle)
+
+    return backend_context
 
 
 def run_initial_search(
@@ -143,8 +213,9 @@ def run_initial_search(
     assert isinstance(df_fragment, pl.DataFrame)
     assert isinstance(df_fragment_max, pl.DataFrame)
     assert isinstance(df_fragment_max_peptide, pl.DataFrame)
+    df_psms = cast(pl.DataFrame, df_psms)
 
-    log_info("Number of PSMs after initial search: {}".format(len(df_psms)))
+    log_info("Number of PSMs after initial search: {}".format(df_psms.height))
 
     return (
         df_fragment,
@@ -205,6 +276,20 @@ def run_targeted_search(
         for pickle_file in full_search_pickles
     )
 
+    requested_backend = str(mumdia_config.get("targeted_search_engine", "sage"))
+    cached_backend = _get_cached_targeted_search_backend(result_dir)
+    if (
+        full_search_pickles_exist
+        and cached_backend is not None
+        and cached_backend != requested_backend
+    ):
+        log_info(
+            "Full-search pickles were created with backend "
+            f"'{cached_backend}', but current config requests '{requested_backend}'. "
+            "Ignoring cached stage-2 pickles and recomputing targeted search."
+        )
+        full_search_pickles_exist = False
+
     if mumdia_config["write_full_search_pickle"] or not full_search_pickles_exist:
         # --- Targeted search flow ---
         # 1. Tryptic digest: enumerate all possible peptides from the FASTA database.
@@ -212,25 +297,45 @@ def run_targeted_search(
         peptides = tryptic_digest_pyopenms(config_obj.fasta_file)
 
         # 2. DeepLC training: use Stage-1 PSMs to train a retention-time model,
-        #    then predict RT bounds for every tryptic peptide. perc_95 is the 95th
-        #    percentile prediction error used as the RT tolerance window.
+        #    then predict RT bounds for every tryptic peptide. The configured
+        #    RT-error percentile is used as the RT tolerance window.
         # Narrow type for static analysis
         assert isinstance(df_psms, pl.DataFrame)
-        peptide_df, dlc_calibration, dlc_transfer_learn, perc_95 = retrain_and_bounds(
-            cast(pl.DataFrame, df_psms), peptides, result_dir=result_dir
+        peptide_df, dlc_calibration, dlc_transfer_learn, rt_split_window = (
+            retrain_and_bounds(
+                cast(pl.DataFrame, df_psms),
+                peptides,
+                result_dir=result_dir,
+                coefficient_bounds=config_obj.rt_split_window_multiplier,
+                percentile_exclude=config_obj.rt_split_percentile,
+                fixed_rt_window_seconds=config_obj.rt_split_window_seconds,
+                n_epochs=config_obj.deeplc_epochs_rt_window,
+                min_peptidoform_occurrences=config_obj.deeplc_min_peptidoform_occurrences,
+                calibration_only=config_obj.deeplc_use_calibration_only,
+            )
         )
 
         # 3. mzML partitioning: split the original mzML into time slices whose
-        #    width equals perc_95, so each slice covers one RT window.
+        #    width equals the configured RT split window, so each slice covers one RT window.
         log_info("Partitioning mzML files by predicted retention time...")
         mzml_dict = split_mzml_by_retention_time(
             config_obj.mzml_file,  # use configured mzML
-            time_interval=perc_95,
+            time_interval=rt_split_window,
             dir_files=str(result_dir),
         )
 
         # Create legacy config format for retention window searches
         legacy_config = config_obj.to_legacy_format()
+        legacy_config["sage"]["custom_engine_max_candidates_per_spectrum"] = (
+            mumdia_config["custom_engine_max_candidates_per_spectrum"]
+        )
+        backend_context = _prepare_stage2_backend_context(
+            requested_backend,
+            peptide_df,
+            legacy_config,
+            mumdia_config,
+            result_dir,
+        )
 
         # 4. Retention window searches: for each mzML partition, run Sage only
         #    against peptides predicted to elute in that window, then merge results.
@@ -239,7 +344,14 @@ def run_targeted_search(
             df_psms,
             df_fragment_max,
             df_fragment_max_peptide,
-        ) = retention_window_searches(mzml_dict, peptide_df, legacy_config, perc_95)
+        ) = run_targeted_search_backend(
+            requested_backend,
+            mzml_dict,
+            peptide_df,
+            legacy_config,
+            rt_split_window,
+            backend_context=backend_context,
+        )
 
         # Sage's matched_fragments parquet does not include scannr (scan number);
         # it only lives in the PSM results table. Join it onto df_fragment here so
@@ -365,6 +477,13 @@ def main():
         df_fragment_max_peptide,
         dlc_transfer_learn,
     )
+
+    if config_obj.stop_after_stage2:
+        log_info(
+            "Stopping after Stage 2 as requested. Targeted-search outputs are available in "
+            f"{config_obj.result_dir}"
+        )
+        return config_obj.result_dir
 
     # ============================================================================
     # STAGE 3: Feature Calculation and Machine Learning Pipeline
