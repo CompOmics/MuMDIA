@@ -10,6 +10,7 @@ pub mod features;
 pub mod peptidoforms;
 pub mod predict_frag;
 pub mod quant;
+pub mod report;
 pub mod rescore;
 pub mod rt_im_train;
 pub mod run;

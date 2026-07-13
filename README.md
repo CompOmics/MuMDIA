@@ -66,9 +66,12 @@ mumdia run \
 ```
 
 `--profile dia` applies the tuned settings (extended features, rolling-window
-apex, retention-time prior). Outputs land in `results/`; use
-`mumdia inspect results/scored.parquet` to view them. Any stage can also be run
-standalone on prior outputs.
+apex, retention-time prior). `run` writes human-readable `results/peptides.tsv`
+and `results/proteins.tsv` (identified peptides and protein groups with q-values
+and quantities), alongside the Parquet artifacts and a `manifest.json`; use
+`mumdia inspect <artifact>` to view any Parquet. Any stage, and the report
+(`mumdia report --scored … --out-dir …`), can also be run standalone on prior
+outputs.
 
 ## Optional Python sidecars
 

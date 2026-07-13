@@ -175,6 +175,22 @@ pub fn run(p: RunParams) -> Result<()> {
     man.record(record_artifact(artifact::PEPTIDE_QUANT.0, artifact::PEPTIDE_QUANT, &pep_q, nq1, "quant", &ch)?);
     man.record(record_artifact(artifact::PROTEIN_GROUP_QUANT.0, artifact::PROTEIN_GROUP_QUANT, &pg_q, nq2, "quant", &ch)?);
 
+    // Human-readable report (peptides.tsv + proteins.tsv) + stdout summary.
+    let pep_tsv = d("peptides.tsv");
+    let prot_tsv = d("proteins.tsv");
+    let (n_pep, n_prot) = report::run(report::ReportParams {
+        scored: &scored,
+        peptide_quant: Some(&pep_q),
+        protein_quant: Some(&pg_q),
+        out_peptides: &pep_tsv,
+        out_proteins: &prot_tsv,
+        q_threshold: cfg.quant.q_threshold,
+    })?;
+    println!(
+        "MuMDIA: {n_pep} peptides, {n_prot} protein groups at q <= {} (rescorer: {:?})\n  {}\n  {}",
+        cfg.quant.q_threshold, cfg.rescore.classifier, pep_tsv, prot_tsv
+    );
+
     // Model identities.
     man.model_identities
         .insert("rt_predictor".into(), format!("{:?}", cfg.predict_frag.rt_predictor));

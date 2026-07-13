@@ -214,6 +214,19 @@ enum Cmd {
     Inspect {
         artifact: String,
     },
+    /// Write peptides.tsv + proteins.tsv from a scored PSM table.
+    Report {
+        #[arg(long)]
+        scored: String,
+        #[arg(long)]
+        out_dir: String,
+        #[arg(long)]
+        peptide_quant: Option<String>,
+        #[arg(long)]
+        protein_quant: Option<String>,
+        #[arg(long, default_value_t = 0.01)]
+        q: f64,
+    },
 }
 
 fn load_config(_path: &Option<String>) -> Result<Config> {
@@ -458,6 +471,20 @@ fn main() -> Result<()> {
         }
         Cmd::Inspect { artifact } => {
             print!("{}", mumdia_io::inspect(&artifact)?);
+        }
+        Cmd::Report { scored, out_dir, peptide_quant, protein_quant, q } => {
+            std::fs::create_dir_all(&out_dir)?;
+            let pep = format!("{out_dir}/peptides.tsv");
+            let prot = format!("{out_dir}/proteins.tsv");
+            let (n_pep, n_prot) = stages::report::run(stages::report::ReportParams {
+                scored: &scored,
+                peptide_quant: peptide_quant.as_deref(),
+                protein_quant: protein_quant.as_deref(),
+                out_peptides: &pep,
+                out_proteins: &prot,
+                q_threshold: q,
+            })?;
+            println!("MuMDIA: {n_pep} peptides, {n_prot} protein groups at q <= {q}\n  {pep}\n  {prot}");
         }
     }
     Ok(())
