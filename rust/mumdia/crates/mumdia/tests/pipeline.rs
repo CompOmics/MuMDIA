@@ -8,9 +8,16 @@ use mumdia_io::table::{write_table, Col, Table};
 use mumdia::stages;
 
 fn tmp(name: &str) -> String {
-    let dir = std::env::temp_dir().join("mumdia_pipeline_test");
+    // Unique per call: cargo runs tests concurrently in one process, and several
+    // tests craft files with the same logical name (ms2.parquet, ...). A shared
+    // path made them race (a half-written file read by another test). A
+    // per-process dir + atomic counter gives every call its own file.
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static CTR: AtomicU64 = AtomicU64::new(0);
+    let dir = std::env::temp_dir().join(format!("mumdia_pipeline_test_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    dir.join(name).to_str().unwrap().to_string()
+    let n = CTR.fetch_add(1, Ordering::Relaxed);
+    dir.join(format!("{n}_{name}")).to_str().unwrap().to_string()
 }
 
 /// Two candidates in the same isolation window: a target whose three fragments
