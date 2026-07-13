@@ -100,6 +100,21 @@ pub fn run_deeplc(
     Ok(oid.into_iter().zip(rt).collect())
 }
 
+/// DeepLC multitask fine-tune: adapt the RT model to this run's confident seed
+/// PSMs and rewrite the supplied library's `predicted_irt`. Positional contract:
+/// `deeplc_finetune.py <lib_in> <seed> <lib_out>`.
+pub fn run_deeplc_finetune(
+    python: &str,
+    script: &str,
+    lib_in: &str,
+    seed: &str,
+    lib_out: &str,
+) -> Result<()> {
+    info!(lib_in, seed, lib_out, "sidecar: running DeepLC multitask fine-tune");
+    run_worker(python, script, &[lib_in, seed, lib_out], true)
+        .context("DeepLC fine-tune failed")
+}
+
 /// Invoke a Python worker: `python script arg...`. `utf8` forces UTF-8 I/O
 /// (DeepLC/Keras crash on the Windows cp1252 console otherwise).
 fn run_worker(python: &str, script: &str, args: &[&str], utf8: bool) -> Result<()> {

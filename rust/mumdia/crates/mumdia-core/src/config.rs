@@ -406,6 +406,12 @@ pub struct RtImTrainConfig {
     pub loess_span: f64,
     /// Fallback fixed RT window in seconds when calibration cannot be fit.
     pub fallback_rt_window_s: f64,
+    /// Fine-tune the DeepLC multitask model on this run's confident seed PSMs
+    /// and rewrite the library's `predicted_irt` before RT calibration. Requires
+    /// `predict_frag.deeplc_python` (the DeepLC interpreter). Off by default; the
+    /// main use is library-input mode, where the base iRT comes from the imported
+    /// library rather than a DeepLC prediction.
+    pub finetune_deeplc: bool,
 }
 impl Default for RtImTrainConfig {
     fn default() -> Self {
@@ -418,6 +424,7 @@ impl Default for RtImTrainConfig {
             min_seed_for_calibration: 50,
             loess_span: 0.3,
             fallback_rt_window_s: 120.0,
+            finetune_deeplc: false,
         }
     }
 }

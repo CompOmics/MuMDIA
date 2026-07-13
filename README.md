@@ -170,12 +170,30 @@ both; in Docker use `/opt/conda/envs/rescore/bin/python`).
 
    Everything downstream (search-seed, RT calibration, extraction, features,
    competition, rescoring, quant, report) is unchanged. Because the DIA-NN
-   library supplies both fragment intensities and retention times, no MS2PIP or
-   DeepLC sidecar is used in this mode.
+   library supplies both fragment intensities and retention times, no fragment
+   or RT prediction sidecar is required in this mode.
+
+**Optional: fine-tune retention time (matches the benchmark).** You can adapt
+DeepLC's multitask retention-time model to this run and rewrite the library's
+retention times before extraction (the benchmark's per-run RT lever). Enable it
+in the config and point at a DeepLC 4.0 multitask environment:
+
+```json
+{
+  "rt_im_train": { "finetune_deeplc": true, "rt_window_multiplier": 1.5 },
+  "predict_frag": { "deeplc_python": "/path/to/deeplc/python", "sidecar_script_dir": "scripts" }
+}
+```
+
+Pass it with `--config`. `run` then fine-tunes on the confident seed PSMs and
+re-predicts iRT for the whole library between search-seed and RT calibration. A
+ready-made config for the Docker image is `docker/config.diann-lib.json` (it
+targets the image's bundled `deeplc` environment). The fine-tune uses no fixed
+random seed, so identification counts vary slightly between runs.
 
 In Docker, mount the library files and point `--lib-precursors` /
-`--lib-fragments` at the mounted paths; steps 2-3 can run in the image's rescore
-environment.
+`--lib-fragments` at the mounted paths; steps 2-3 (and the fine-tune) run in the
+image's bundled environments.
 
 ## FDR
 

@@ -60,6 +60,12 @@ fn preflight(p: &RunParams) -> Result<()> {
             anyhow::bail!("{flag} not found or unreadable: {path}");
         }
     }
+    if p.config.rt_im_train.finetune_deeplc && p.config.predict_frag.deeplc_python.is_none() {
+        anyhow::bail!(
+            "rt_im_train.finetune_deeplc requires predict_frag.deeplc_python (a Python \
+             interpreter with DeepLC 4.0 multitask installed)"
+        );
+    }
     match p.config.rescore.classifier {
         RescorerKind::Mokapot if p.config.rescore.python.is_none() => anyhow::bail!(
             "rescore.classifier=mokapot requires rescore.python (a Python interpreter with \
@@ -172,6 +178,24 @@ pub fn run(p: RunParams) -> Result<()> {
         config_hash: &ch,
     })?;
     man.record(record_artifact(artifact::SEED_PSMS.0, artifact::SEED_PSMS, &seed, n, "search-seed", &ch)?);
+
+    // Optional DeepLC multitask fine-tune: adapt the RT model to this run's
+    // confident seed PSMs and rewrite the library's predicted_irt before RT
+    // calibration. The seed is iRT-independent, so it was computed above on the
+    // base library and is reused here. rt-im-train and extract then read the
+    // fine-tuned library.
+    let lib_p = if cfg.rt_im_train.finetune_deeplc {
+        let python = cfg.predict_frag.deeplc_python.as_deref().expect(
+            "preflight guarantees deeplc_python when finetune_deeplc is set",
+        );
+        let script =
+            crate::sidecar::resolve_script(&cfg.predict_frag.sidecar_script_dir, "deeplc_finetune.py");
+        let lib_p_ft = d("fragment_library_precursors_ft.parquet");
+        crate::sidecar::run_deeplc_finetune(python, &script, &lib_p, &seed, &lib_p_ft)?;
+        lib_p_ft
+    } else {
+        lib_p
+    };
 
     let windows = d("run_windows.parquet");
     let cal = d("cal.json");
