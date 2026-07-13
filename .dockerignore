@@ -1,0 +1,17 @@
+# Keep the build context small and free of machine-specific / large files.
+.git
+**/target
+**/.cargo/config.toml
+out_*/
+mzml_files/
+fasta/
+notebooks/
+sidecar_work/
+*.parquet
+*.mzML
+*.mzml
+*.raw
+*.pin
+*.log
+__pycache__/
+*.pyc

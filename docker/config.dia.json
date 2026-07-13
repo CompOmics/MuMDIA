@@ -1,0 +1,15 @@
+{
+  "features": { "set": "extended" },
+  "extract": { "apex_count_window": 5, "apex_rt_prior_s": 120.0 },
+  "predict_frag": {
+    "predictor": "ms2pip",
+    "rt_predictor": "deeplc",
+    "ms2pip_python": "/opt/conda/envs/rescore/bin/python",
+    "deeplc_python": "/opt/conda/envs/deeplc/bin/python",
+    "sidecar_script_dir": "/opt/mumdia/scripts"
+  },
+  "rescore": {
+    "classifier": "mokapot",
+    "python": "/opt/conda/envs/rescore/bin/python"
+  }
+}

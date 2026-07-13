@@ -37,6 +37,29 @@ rt-im-train -> extract -> features -> compete -> rescore
 `manifest.json`; `mumdia inspect <artifact>` prints schema, head, and row count
 for any Parquet output.
 
+## Run with Docker (bundles all sidecars)
+
+The published image contains the engine plus the Python sidecars (mokapot,
+MS2PIP, DeepLC), so the full high-sensitivity recipe runs with nothing to install
+but Docker:
+
+```
+docker pull ghcr.io/compomics/mumdia:latest
+
+docker run --rm -v "$PWD:/data" ghcr.io/compomics/mumdia \
+    run --fasta   /data/proteome.fasta \
+        --mzml    /data/sample.mzML \
+        --out-dir /data/results \
+        --config  /opt/mumdia/config.dia.json
+```
+
+Mount your working directory at `/data`; the outputs (including `peptides.tsv`
+and `proteins.tsv`) appear under `results/`. The baked
+`/opt/mumdia/config.dia.json` selects the Extended feature set and the DIA apex
+settings, and wires DeepLC, MS2PIP, and mokapot (logistic regression) to the
+in-image conda environments. To run the native, dependency-free models instead,
+drop `--config` and add `--profile dia`.
+
 ## Build
 
 Requires Rust >= 1.85 (the dependencies use edition 2024; `rustup update` if
@@ -80,7 +103,10 @@ higher sensitivity, MuMDIA can call Python sidecars over a simple file contract
 (input Parquet in, output Parquet out). The mokapot rescorer, for example, needs
 only a small environment (`mokapot`, `scikit-learn`, `numpy`, `pyarrow`,
 `pandas`); DeepLC and MS2PIP need their own environments. Sidecar selection and
-the Python interpreter path are set in the configuration.
+the Python interpreter path are set in the configuration. The Docker image above
+bundles all three so no manual environment setup is needed; the environment
+specifications are under `env/` (`mumdia-rescore.yml`, `docker-rescore.yml`,
+`docker-deeplc.yml`).
 
 ## FDR
 
