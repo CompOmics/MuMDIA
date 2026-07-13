@@ -5,11 +5,13 @@
 # build). Built into the image as /opt/conda/envs/rescore; the baked
 # docker/config.dia.json points rescore.python and predict_frag.ms2pip_python at
 # its interpreter.
+# python 3.11: mokapot/ms2pip pull pandas<2, which has no cp312 wheel (would
+# force a fragile source build); 3.11 has prebuilt wheels for the whole graph.
 name: rescore
 channels:
   - conda-forge
 dependencies:
-  - python=3.12
+  - python=3.11
   - pip
   - pip:
       - "numpy<2"

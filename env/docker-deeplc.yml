@@ -5,11 +5,13 @@
 # ships inside the DeepLC package, so no separate download is needed. Built into
 # the image as /opt/conda/envs/deeplc; the baked docker/config.dia.json points
 # predict_frag.deeplc_python at its interpreter.
+# python 3.11: DeepLC pulls pandas<2 (no cp312 wheel -> fragile source build);
+# 3.11 has prebuilt wheels for torch-cpu, pandas, and the whole DeepLC graph.
 name: deeplc
 channels:
   - conda-forge
 dependencies:
-  - python=3.12
+  - python=3.11
   - pip
   - pip:
       - --extra-index-url https://download.pytorch.org/whl/cpu
