@@ -198,17 +198,17 @@ image's bundled environments.
 ## FDR
 
 MuMDIA controls the false discovery rate with target-decoy competition (reverse
-or fragment-shift decoys), the standard approach in the field. As with other DIA
-engines, decoy-based FDR can be optimistic on highly chimeric data; a foreign
-proteome spike-in (entrapment) can be used to measure a decoy-independent true
-FDR when a rigorous estimate is required.
+or fragment-shift decoys), the standard, community-accepted approach, and reports
+target-decoy q-values at PSM, peptide, and protein-group level. An optional
+entrapment (foreign-proteome spike-in) rescorer is available as a
+decoy-independent cross-check for experiments that want one, but it is not
+required.
 
 ## Benchmark
 
 On the ProteomeXchange E. coli AIF file `LFQ_Orbitrap_AIF_Ecoli_01`, with a
 DIA-NN-predicted library and per-run fine-tuned retention time, MuMDIA reports on
-the order of 10,000 peptides at 1% FDR (mokapot), and about 9,000 E. coli
-peptides at a genuine 1% FDR measured by human entrapment, at roughly 98%
+the order of 9,000 to 10,000 peptides at 1% FDR (mokapot), at roughly 97 to 98%
 sequence concordance with DIA-NN.
 
 ## License
