@@ -1,18 +1,19 @@
 # Conda env "rescore" for the MuMDIA Docker image: mokapot (rescoring) + MS2PIP
-# (fragment-intensity prediction). Pins mirror the validated recipe. Built into
-# the image as /opt/conda/envs/rescore; the baked docker/config.dia.json points
-# rescore.python and predict_frag.ms2pip_python at its interpreter.
+# (fragment-intensity prediction). Only the two tools are version-anchored; their
+# scientific-Python dependencies are left to pip so it resolves builds that exist
+# for the interpreter (exact older pins like pandas 1.5.3 have no cp312 conda
+# build). Built into the image as /opt/conda/envs/rescore; the baked
+# docker/config.dia.json points rescore.python and predict_frag.ms2pip_python at
+# its interpreter.
 name: rescore
 channels:
   - conda-forge
 dependencies:
   - python=3.12
-  - numpy=1.26.4
-  - pandas=1.5.3
-  - pyarrow=17.0.0
-  - scikit-learn=1.5.1
-  - xgboost=1.7.6
   - pip
   - pip:
+      - "numpy<2"
+      - pyarrow
+      - scikit-learn
       - mokapot==0.10.0
       - ms2pip==4.0.0.dev9
