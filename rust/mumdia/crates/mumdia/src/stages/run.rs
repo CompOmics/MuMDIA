@@ -16,9 +16,17 @@ use crate::stages::*;
 
 pub struct RunParams<'a> {
     pub config: &'a Config,
-    pub fasta: &'a str,
+    /// FASTA to digest into the spectral library. Required unless a prebuilt
+    /// library is supplied via `lib_precursors` + `lib_fragments`.
+    pub fasta: Option<&'a str>,
     pub mzml: &'a str,
     pub out_dir: &'a str,
+    /// Library-input mode: consume this prebuilt precursor library (e.g. an
+    /// imported DIA-NN speclib) instead of digesting the FASTA. Requires
+    /// `lib_fragments`; when both are set, digest/peptidoforms/predict-frag are
+    /// skipped and the FASTA is not read.
+    pub lib_precursors: Option<&'a str>,
+    pub lib_fragments: Option<&'a str>,
     pub max_spectra: usize,
     pub top_peaks_ms2: usize,
 }
@@ -28,7 +36,26 @@ pub struct RunParams<'a> {
 /// actionable message.
 fn preflight(p: &RunParams) -> Result<()> {
     use mumdia_core::config::RescorerKind;
-    for (flag, path) in [("--fasta", p.fasta), ("--mzml", p.mzml)] {
+    // Inputs depend on the mode: library-input supplies a prebuilt library and
+    // skips the FASTA; otherwise the FASTA is digested into the library.
+    let mut required: Vec<(&str, &str)> = vec![("--mzml", p.mzml)];
+    match (p.lib_precursors, p.lib_fragments) {
+        (Some(lp), Some(lf)) => {
+            required.push(("--lib-precursors", lp));
+            required.push(("--lib-fragments", lf));
+        }
+        (None, None) => match p.fasta {
+            Some(f) => required.push(("--fasta", f)),
+            None => anyhow::bail!(
+                "provide either --fasta (to digest a library) or both \
+                 --lib-precursors and --lib-fragments (library-input mode)"
+            ),
+        },
+        _ => anyhow::bail!(
+            "library-input mode requires both --lib-precursors and --lib-fragments"
+        ),
+    }
+    for (flag, path) in required {
         if !std::path::Path::new(path).exists() {
             anyhow::bail!("{flag} not found or unreadable: {path}");
         }
@@ -57,38 +84,62 @@ pub fn run(p: RunParams) -> Result<()> {
 
     let mut man = Manifest::new(cfg.canonical_json(), ch.clone());
 
-    // --- experiment-wide artifacts ---
-    let dig = d("peptides.parquet");
-    let n = digest::run(digest::DigestParams {
-        fasta: p.fasta,
-        out: &dig,
-        cfg: &cfg.digest,
-        rng_seed: cfg.rng_seed,
-        config_hash: &ch,
-    })?;
-    man.record(record_artifact(artifact::PEPTIDES.0, artifact::PEPTIDES, &dig, n, "digest", &ch)?);
+    // --- experiment-wide artifacts: the spectral library ---
+    // Either digest the FASTA (default) or consume a prebuilt library
+    // (library-input mode), then feed the same lib_p/lib_f downstream.
+    let (lib_p, lib_f) = match (p.lib_precursors, p.lib_fragments) {
+        (Some(lp), Some(lf)) => {
+            // Library-input mode: skip digest -> peptidoforms -> predict-frag and
+            // consume the supplied library (e.g. an imported DIA-NN speclib).
+            info!(
+                lib_precursors = lp,
+                lib_fragments = lf,
+                "run: library-input mode (skipping digest/peptidoforms/predict-frag)"
+            );
+            let np = mumdia_io::table::Table::read(lp)?.nrows as u64;
+            let nf = mumdia_io::table::Table::read(lf)?.nrows as u64;
+            man.record(record_artifact(artifact::FRAGMENT_LIBRARY_PRECURSORS.0, artifact::FRAGMENT_LIBRARY_PRECURSORS, lp, np, "library-input", &ch)?);
+            man.record(record_artifact(artifact::FRAGMENT_LIBRARY_FRAGMENTS.0, artifact::FRAGMENT_LIBRARY_FRAGMENTS, lf, nf, "library-input", &ch)?);
+            (lp.to_string(), lf.to_string())
+        }
+        _ => {
+            // Build the library from the FASTA digest. preflight guarantees the
+            // FASTA is present in this branch.
+            let fasta = p.fasta.expect("preflight guarantees --fasta in build mode");
+            let dig = d("peptides.parquet");
+            let n = digest::run(digest::DigestParams {
+                fasta,
+                out: &dig,
+                cfg: &cfg.digest,
+                rng_seed: cfg.rng_seed,
+                config_hash: &ch,
+            })?;
+            man.record(record_artifact(artifact::PEPTIDES.0, artifact::PEPTIDES, &dig, n, "digest", &ch)?);
 
-    let pf = d("peptidoforms.parquet");
-    let n = peptidoforms::run(peptidoforms::PeptidoformsParams {
-        peptides: &dig,
-        out: &pf,
-        cfg: &cfg.peptidoforms,
-        config_hash: &ch,
-    })?;
-    man.record(record_artifact(artifact::PEPTIDOFORMS.0, artifact::PEPTIDOFORMS, &pf, n, "peptidoforms", &ch)?);
+            let pf = d("peptidoforms.parquet");
+            let n = peptidoforms::run(peptidoforms::PeptidoformsParams {
+                peptides: &dig,
+                out: &pf,
+                cfg: &cfg.peptidoforms,
+                config_hash: &ch,
+            })?;
+            man.record(record_artifact(artifact::PEPTIDOFORMS.0, artifact::PEPTIDOFORMS, &pf, n, "peptidoforms", &ch)?);
 
-    let lib_p = d("fragment_library_precursors.parquet");
-    let lib_f = d("fragment_library_fragments.parquet");
-    let (np, nf) = predict_frag::run(predict_frag::PredictFragParams {
-        peptidoforms: &pf,
-        out_precursors: &lib_p,
-        out_fragments: &lib_f,
-        work_dir: &d("sidecar_work"),
-        cfg: &cfg.predict_frag,
-        config_hash: &ch,
-    })?;
-    man.record(record_artifact(artifact::FRAGMENT_LIBRARY_PRECURSORS.0, artifact::FRAGMENT_LIBRARY_PRECURSORS, &lib_p, np, "predict-frag", &ch)?);
-    man.record(record_artifact(artifact::FRAGMENT_LIBRARY_FRAGMENTS.0, artifact::FRAGMENT_LIBRARY_FRAGMENTS, &lib_f, nf, "predict-frag", &ch)?);
+            let lib_p = d("fragment_library_precursors.parquet");
+            let lib_f = d("fragment_library_fragments.parquet");
+            let (np, nf) = predict_frag::run(predict_frag::PredictFragParams {
+                peptidoforms: &pf,
+                out_precursors: &lib_p,
+                out_fragments: &lib_f,
+                work_dir: &d("sidecar_work"),
+                cfg: &cfg.predict_frag,
+                config_hash: &ch,
+            })?;
+            man.record(record_artifact(artifact::FRAGMENT_LIBRARY_PRECURSORS.0, artifact::FRAGMENT_LIBRARY_PRECURSORS, &lib_p, np, "predict-frag", &ch)?);
+            man.record(record_artifact(artifact::FRAGMENT_LIBRARY_FRAGMENTS.0, artifact::FRAGMENT_LIBRARY_FRAGMENTS, &lib_f, nf, "predict-frag", &ch)?);
+            (lib_p, lib_f)
+        }
+    };
 
     // --- per-run artifacts ---
     let spectra_dir = d("spectra");

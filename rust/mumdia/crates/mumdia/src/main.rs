@@ -183,12 +183,22 @@ enum Cmd {
     },
     /// Orchestrate the full MVP pipeline on one run and write a manifest.
     Run {
+        /// FASTA to digest into the library. Omit when supplying a prebuilt
+        /// library via --lib-precursors + --lib-fragments (library-input mode).
         #[arg(long)]
-        fasta: String,
+        fasta: Option<String>,
         #[arg(long)]
         mzml: String,
         #[arg(long)]
         out_dir: String,
+        /// Library-input mode: consume a prebuilt precursor library (e.g. an
+        /// imported DIA-NN speclib) instead of digesting --fasta. Requires
+        /// --lib-fragments; skips digest/peptidoforms/predict-frag.
+        #[arg(long)]
+        lib_precursors: Option<String>,
+        /// Prebuilt fragment library paired with --lib-precursors.
+        #[arg(long)]
+        lib_fragments: Option<String>,
         #[arg(long)]
         config: Option<String>,
         /// Named tuning preset applied on top of --config/defaults. "dia" = the
@@ -461,6 +471,8 @@ fn main() -> Result<()> {
             fasta,
             mzml,
             out_dir,
+            lib_precursors,
+            lib_fragments,
             config,
             profile,
             max_spectra,
@@ -472,9 +484,11 @@ fn main() -> Result<()> {
             }
             stages::run::run(stages::run::RunParams {
                 config: &cfg,
-                fasta: &fasta,
+                fasta: fasta.as_deref(),
                 mzml: &mzml,
                 out_dir: &out_dir,
+                lib_precursors: lib_precursors.as_deref(),
+                lib_fragments: lib_fragments.as_deref(),
                 max_spectra,
                 top_peaks_ms2,
             })?;

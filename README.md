@@ -109,6 +109,74 @@ bundles all three so no manual environment setup is needed; the environment
 specifications are under `env/` (`mumdia-rescore.yml`, `docker-rescore.yml`,
 `docker-deeplc.yml`).
 
+## Using a DIA-NN spectral library (highest sensitivity)
+
+By default MuMDIA builds its library from a FASTA digest and predicts fragment
+intensities with the native model or MS2PIP. For the highest sensitivity, and to
+reproduce the benchmark numbers, you can supply a spectral library predicted by
+DIA-NN and have MuMDIA consume it directly. In this **library-input mode**, `run`
+skips the digest, MS2PIP, and DeepLC steps and uses DIA-NN's fragment intensities
+and retention times.
+
+MuMDIA does not include or download DIA-NN. You run DIA-NN yourself, under your
+own license: the DIA-NN "Academia" build is free for non-profit academic research
+(https://github.com/vdemichev/DiaNN). MuMDIA only reads the library file you
+produce, and never redistributes DIA-NN.
+
+The Python steps below need `pandas` and `pyarrow` (the mokapot sidecar env has
+both; in Docker use `/opt/conda/envs/rescore/bin/python`).
+
+1. **Predict a spectral library from your FASTA with DIA-NN** (library-free /
+   in-silico), matching your search parameters, and output a fragment-level
+   parquet library. For example:
+
+   ```
+   diann --fasta proteome.fasta --fasta-search --gen-spec-lib --predictor \
+         --cut "K*,R*" --missed-cleavages 1 \
+         --min-pep-len 7 --max-pep-len 30 --min-pr-charge 2 --max-pr-charge 4 \
+         --unimod4 --var-mods 1 --var-mod "UniMod:35,15.994915,M" \
+         --out-lib lib --threads 8
+   ```
+
+   MuMDIA maps only Carbamidomethyl (fixed) and Oxidation (variable);
+   precursors with other modifications are dropped on import.
+
+2. **Import the DIA-NN library into MuMDIA's schema** (targets only):
+
+   ```
+   python scripts/import_diann_lib.py \
+       lib.parquet lib_precursors_targets.parquet lib_fragments_targets.parquet
+   ```
+
+3. **Add the decoy population.** This also sorts by precursor m/z and re-indexes
+   `candidate_id`, which MuMDIA's fragment index requires:
+
+   ```
+   python scripts/make_reverse_decoys.py \
+       lib_precursors_targets.parquet lib_fragments_targets.parquet \
+       lib_precursors.parquet lib_fragments.parquet
+   ```
+
+4. **Run MuMDIA in library-input mode** (no `--fasta`):
+
+   ```
+   mumdia run \
+     --lib-precursors lib_precursors.parquet \
+     --lib-fragments  lib_fragments.parquet \
+     --mzml    sample.mzML \
+     --out-dir results \
+     --profile dia
+   ```
+
+   Everything downstream (search-seed, RT calibration, extraction, features,
+   competition, rescoring, quant, report) is unchanged. Because the DIA-NN
+   library supplies both fragment intensities and retention times, no MS2PIP or
+   DeepLC sidecar is used in this mode.
+
+In Docker, mount the library files and point `--lib-precursors` /
+`--lib-fragments` at the mounted paths; steps 2-3 can run in the image's rescore
+environment.
+
 ## FDR
 
 MuMDIA controls the false discovery rate with target-decoy competition (reverse
