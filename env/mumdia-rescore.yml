@@ -1,0 +1,21 @@
+# Minimal Python environment for the default mokapot (logistic-regression)
+# rescorer sidecar. This is the only Python dependency needed for the recommended
+# rescore path; it does NOT pull in torch / DeepLC / MS2PIP.
+#
+#   conda env create -f env/mumdia-rescore.yml
+#   # then point the config's rescore.python at this env's interpreter, e.g.
+#   #   "python": ".../envs/mumdia-rescore/bin/python"   (or ...\\python.exe on Windows)
+#
+# The worker itself is scripts/mokapot_worker.py (MUMDIA_RESCORE_MODEL=logreg).
+name: mumdia-rescore
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - numpy
+  - pandas
+  - pyarrow
+  - scikit-learn
+  - pip
+  - pip:
+      - mokapot

@@ -1,0 +1,6 @@
+# Pin the toolchain for reproducible builds (edition-2024 dependencies need
+# rustc >= 1.85; this is a known-good recent stable). rustup installs it
+# automatically when building in this directory.
+[toolchain]
+channel = "1.96.1"
+components = ["rustfmt", "clippy"]
