@@ -54,7 +54,8 @@ docker run --rm -v "$PWD:/data" ghcr.io/compomics/mumdia \
 ```
 
 Mount your working directory at `/data`; the outputs (including `peptides.tsv`
-and `proteins.tsv`) appear under `results/`. The baked
+and `proteins.tsv`) appear under `results/`. On Windows PowerShell, use
+`-v "${PWD}:/data"` (not `$PWD`, which PowerShell parses as a drive reference). The baked
 `/opt/mumdia/config.dia.json` selects the Extended feature set and the DIA apex
 settings, and wires DeepLC, MS2PIP, and mokapot (logistic regression) to the
 in-image conda environments. To run the native, dependency-free models instead,
