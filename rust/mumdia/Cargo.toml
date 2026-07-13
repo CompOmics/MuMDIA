@@ -1,0 +1,34 @@
+[workspace]
+resolver = "2"
+members = ["crates/mumdia-core", "crates/mumdia-io", "crates/mumdia"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+authors = ["CompOmics"]
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+blake3 = "1"
+rayon = "1"
+clap = { version = "4", features = ["derive"] }
+arrow = { version = "59", features = ["prettyprint"] }
+# Pure-Rust build: drop C zlib-ng (needs cmake); SNAPPY codec is pure Rust.
+parquet = { version = "59", default-features = false, features = ["arrow", "snap"] }
+# Pure-Rust zlib backend (miniz_oxide) instead of zlib-ng-compat (needs cmake).
+mzdata = { version = "0.65", default-features = false, features = ["mzml", "miniz_oxide"] }
+
+[profile.release]
+opt-level = 3
+
+# arrow-ipc's generated flatbuffer code reliably crashes rustc codegen at
+# opt-level 3 on this Windows toolchain (STATUS_ILLEGAL_INSTRUCTION). MuMDIA
+# never uses Arrow IPC, so compile just this crate at a lighter opt-level.
+[profile.release.package.arrow-ipc]
+opt-level = 1

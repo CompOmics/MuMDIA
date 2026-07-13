@@ -1,0 +1,11 @@
+# Optional LOCAL cargo config. Copy to `.cargo/config.toml` (gitignored) if you
+# build off a cloud-synced tree (OneDrive, Dropbox, iCloud): syncing thousands of
+# incremental build artifacts causes file locking / corruption
+# (STATUS_ACCESS_VIOLATION on Windows) and is slow. Redirect target/ to a local,
+# non-synced path. The committed build does NOT set this, so a fresh clone builds
+# into the default ./target and works on any machine.
+#
+# Alternative without a config file: set the CARGO_TARGET_DIR environment variable.
+
+[build]
+target-dir = "C:/Users/you/mumdia_build"
