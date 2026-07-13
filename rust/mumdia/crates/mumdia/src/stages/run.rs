@@ -23,9 +23,34 @@ pub struct RunParams<'a> {
     pub top_peaks_ms2: usize,
 }
 
+/// Validate inputs and sidecar configuration before any multi-minute compute,
+/// so a missing file or a misconfigured rescorer fails immediately with an
+/// actionable message.
+fn preflight(p: &RunParams) -> Result<()> {
+    use mumdia_core::config::RescorerKind;
+    for (flag, path) in [("--fasta", p.fasta), ("--mzml", p.mzml)] {
+        if !std::path::Path::new(path).exists() {
+            anyhow::bail!("{flag} not found or unreadable: {path}");
+        }
+    }
+    match p.config.rescore.classifier {
+        RescorerKind::Mokapot if p.config.rescore.python.is_none() => anyhow::bail!(
+            "rescore.classifier=mokapot requires rescore.python (a Python interpreter with \
+             mokapot installed; see env/mumdia-rescore.yml), or use classifier=native_tda"
+        ),
+        RescorerKind::Entrapment if p.config.rescore.entrapment_marker.is_none() => anyhow::bail!(
+            "rescore.classifier=entrapment requires rescore.entrapment_marker (the spike-in \
+             accession substring, e.g. \"_HUMAN\")"
+        ),
+        _ => {}
+    }
+    Ok(())
+}
+
 pub fn run(p: RunParams) -> Result<()> {
     let t0 = Instant::now();
     let cfg = p.config;
+    preflight(&p)?;
     let ch = mumdia_io::hash::blake3_str(&cfg.canonical_json());
     std::fs::create_dir_all(p.out_dir).ok();
     let d = |name: &str| format!("{}/{}", p.out_dir, name);
