@@ -227,6 +227,58 @@ enum Cmd {
         #[arg(long, default_value_t = 0.01)]
         q: f64,
     },
+    /// Check that the configured Python sidecar environments are usable.
+    Doctor {
+        #[arg(long)]
+        config: Option<String>,
+    },
+}
+
+/// Probe each configured sidecar interpreter for its required packages, so a
+/// broken or missing environment is reported clearly instead of failing mid-run.
+fn doctor(cfg: &Config) -> Result<()> {
+    use std::process::Command;
+    let checks = [
+        ("rescore.python (mokapot)", cfg.rescore.python.as_deref(), "mokapot,sklearn,numpy,pandas,pyarrow"),
+        ("predict_frag.deeplc_python (DeepLC)", cfg.predict_frag.deeplc_python.as_deref(), "deeplc,numpy,pandas"),
+        ("predict_frag.ms2pip_python (MS2PIP)", cfg.predict_frag.ms2pip_python.as_deref(), "ms2pip,numpy,pandas"),
+    ];
+    let mut bad = false;
+    for (label, py, pkgs) in checks {
+        match py {
+            None => println!("  [skip] {label}: not configured (native path used)"),
+            Some(interp) => {
+                let code = format!(
+                    "import importlib.util as u; m=[p for p in '{pkgs}'.split(',') if u.find_spec(p) is None]; print('MISSING '+','.join(m) if m else 'OK')"
+                );
+                match Command::new(interp).args(["-c", &code]).output() {
+                    Ok(o) => {
+                        let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                        if o.status.success() && s == "OK" {
+                            println!("  [ ok ] {label}: {interp}");
+                        } else {
+                            bad = true;
+                            let detail = if s.is_empty() {
+                                String::from_utf8_lossy(&o.stderr).trim().to_string()
+                            } else {
+                                s
+                            };
+                            println!("  [FAIL] {label}: {interp}\n         {detail}");
+                        }
+                    }
+                    Err(e) => {
+                        bad = true;
+                        println!("  [FAIL] {label}: cannot run {interp}: {e}");
+                    }
+                }
+            }
+        }
+    }
+    if bad {
+        anyhow::bail!("mumdia doctor: one or more configured sidecar environments are not usable");
+    }
+    println!("mumdia doctor: all configured sidecar environments OK");
+    Ok(())
 }
 
 fn load_config(_path: &Option<String>) -> Result<Config> {
@@ -485,6 +537,9 @@ fn main() -> Result<()> {
                 q_threshold: q,
             })?;
             println!("MuMDIA: {n_pep} peptides, {n_prot} protein groups at q <= {q}\n  {pep}\n  {prot}");
+        }
+        Cmd::Doctor { config } => {
+            doctor(&load_config(&config)?)?;
         }
     }
     Ok(())

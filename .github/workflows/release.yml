@@ -1,0 +1,68 @@
+name: Release
+
+# Dormant until a version tag is pushed, e.g.:
+#   git tag v0.1.0 && git push origin v0.1.0
+# Then builds a release binary per platform and attaches archives to the
+# GitHub Release for that tag.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            exe: ""
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            exe: ""
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            exe: ".exe"
+    defaults:
+      run:
+        working-directory: rust/mumdia
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install musl tools (linux)
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Add target
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --locked --bin mumdia --target ${{ matrix.target }}
+
+      - name: Package
+        shell: bash
+        run: |
+          name="mumdia-${{ github.ref_name }}-${{ matrix.target }}"
+          stage="dist/$name"
+          mkdir -p "$stage"
+          cp "target/${{ matrix.target }}/release/mumdia${{ matrix.exe }}" "$stage/"
+          cp ../../README.md ../../LICENSE "$stage/"
+          cd dist
+          if [ -n "${{ matrix.exe }}" ]; then
+            7z a "$name.zip" "$name" >/dev/null
+          else
+            tar czf "$name.tar.gz" "$name"
+          fi
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            rust/mumdia/dist/*.tar.gz
+            rust/mumdia/dist/*.zip
+          generate_release_notes: true
