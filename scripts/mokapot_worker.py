@@ -93,45 +93,44 @@ def main():
     psms = mokapot.read_pin(pin_path)
     np.random.seed(0)
     model = make_model(mokapot)
+    # Parallelize the cross-validation folds (mokapot default max_workers=1 runs
+    # them serially, which dominates the runtime). Thread-based (require=sharedmem),
+    # so no per-fold dataset copy; results are unchanged, only faster.
+    workers = int(os.environ.get("MUMDIA_MOKAPOT_WORKERS", "3"))
     if model is None:
-        results, _models = mokapot.brew(psms, rng=0)
+        _results, models = mokapot.brew(psms, rng=0, max_workers=workers)
     else:
-        results, _models = mokapot.brew(psms, model=model, rng=0)
+        _results, models = mokapot.brew(psms, model=model, rng=0, max_workers=workers)
 
-    # mokapot >=0.9 exposes PSM-level confidence as a DataFrame.
-    df = None
-    for attr in ("psms", "confidence_estimates"):
-        obj = getattr(results, attr, None)
-        if obj is not None:
-            df = obj["psms"] if isinstance(obj, dict) else obj
-            break
-    if df is None and hasattr(results, "to_df"):
-        df = results.to_df()
-    if df is None:
-        raise RuntimeError("could not extract mokapot PSM results")
-
-    cols = {c.lower(): c for c in df.columns}
-    spec_col = cols.get("specid") or cols.get("psmid") or list(df.columns)[0]
-    score_col = next(c for c in df.columns if "score" in c.lower())
-    q_col = next(
-        c for c in df.columns if "q-value" in c.lower() or "q_value" in c.lower()
+    # Score EVERY PSM (targets AND decoys) with the trained fold models. mokapot's
+    # confidence table is targets-only; returning only targets starves the decoys
+    # of scores downstream, so the caller's target-decoy q recomputation collapses
+    # (unscored decoys sink, so nearly every target passes -> huge false count).
+    # Model.predict == decision_function over the whole dataset; averaging across
+    # the cross-validation fold models gives every PSM a proper score in data order.
+    ml = list(models) if hasattr(models, "__len__") else [models]
+    score_mat = np.vstack(
+        [np.asarray(m.predict(psms), dtype=np.float64) for m in ml]
     )
+    scores = score_mat.mean(axis=0)
 
-    specids = df[spec_col].astype(str).tolist()
+    specids = psms.data["SpecId"].astype(str).to_numpy()
+    if len(specids) != len(scores):
+        raise RuntimeError(
+            f"specid/score length mismatch: {len(specids)} vs {len(scores)}"
+        )
     cids = [int(s.split("_")[-1]) for s in specids]
-    scores = df[score_col].to_numpy(dtype=np.float64)
-    qs = df[q_col].to_numpy(dtype=np.float64)
 
     out = pa.table(
         {
             "candidate_id": pa.array(cids, pa.uint32()),
             "score": pa.array(scores, pa.float64()),
-            "q_value": pa.array(qs, pa.float64()),
+            "q_value": pa.array(np.zeros(len(cids), dtype=np.float64), pa.float64()),
         }
     )
     pq.write_table(out, out_path)
     model_name = os.environ.get("MUMDIA_RESCORE_MODEL", "nn")
-    print(f"mokapot_worker[{model_name}]: {len(cids)} PSMs rescored")
+    print(f"mokapot_worker[{model_name}]: {len(cids)} PSMs rescored (targets+decoys)")
 
 
 if __name__ == "__main__":
