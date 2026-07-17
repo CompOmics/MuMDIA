@@ -624,6 +624,41 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
 
         let (fmzs0, fints0, _) = lib.cand_frags(cid);
 
+        // Acquisition scan grid: the covering isolation-window scans within the
+        // RT window. Project the sparse hit-groups onto it so apex counting and
+        // the co-elution run see MISSING acquisition scans (count 0, and they
+        // break a run) rather than only scans that happened to carry a hit. When
+        // no covering-window grid is available, fall back to the sparse groups.
+        let grid: Vec<f64> = if !windows.is_empty() {
+            let pm = lib.cands[cid as usize].precursor_mz;
+            let (lo, hi) = (rt_lo[cid as usize], rt_hi[cid as usize]);
+            let mut g: Vec<f64> = Vec::new();
+            for (wl, wu, rts) in &windows {
+                if *wl <= pm && pm <= *wu {
+                    let a = rts.partition_point(|&r| r < lo);
+                    let b = rts.partition_point(|&r| r <= hi);
+                    g.extend_from_slice(&rts[a..b]);
+                }
+            }
+            g.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            g.dedup();
+            g
+        } else {
+            Vec::new()
+        };
+        if !grid.is_empty() {
+            let g2i: HashMap<u64, usize> =
+                grid.iter().enumerate().map(|(j, r)| (r.to_bits(), j)).collect();
+            let mut aligned: Vec<(f64, BTreeMap<u16, f32>)> =
+                grid.iter().map(|&r| (r, BTreeMap::new())).collect();
+            for (rt, map) in std::mem::take(&mut groups) {
+                if let Some(&j) = g2i.get(&rt.to_bits()) {
+                    aligned[j].1 = map;
+                }
+            }
+            groups = aligned;
+        }
+
         // Apex: the scan group with the most distinct matched fragments, allowing
         // scans within `apex_count_tol` of that maximum (so a slightly-lower-count
         // but much more intense scan can still win), then the one maximizing the
@@ -720,31 +755,11 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
             return None;
         }
 
-        // Optional tier-d Pearson gate (kept for configurability; matched
-        // fraction above is the primary symmetric discriminator).
-        let apex_map = groups
-            .iter()
-            .find(|(rt, _)| (*rt - apex_rt).abs() < 1e-9)
-            .map(|(_, m)| m);
-        if p.cfg.min_frag_corr > 0.0 {
-            if let Some(map) = apex_map {
-                let obs: Vec<f64> = (0..fmzs0.len())
-                    .map(|k| *map.get(&(k as u16)).unwrap_or(&0.0) as f64)
-                    .collect();
-                let pred: Vec<f64> = fints0.iter().map(|x| *x as f64).collect();
-                if crate::stats::pearson(&obs, &pred) < p.cfg.min_frag_corr {
-                    return None;
-                }
-            }
-        }
-
         let c = &lib.cands[cid as usize];
-        let contested_val = {
-            let (w, l) = contested.get(&cid).copied().unwrap_or((0.0, 0.0));
-            if w + l > 0.0 { l / (w + l) } else { 0.0 }
-        };
 
-        // MS1 apex isotope intensities: nearest MS1 scan to the apex RT.
+        // MS1 apex isotope intensities (nearest MS1 scan to the apex RT), computed
+        // BEFORE the acceptance gate so MS1 evidence can rescue a candidate the
+        // single-scan fragment-Pearson gate would otherwise reject.
         let (o_ms1_m1, o_ms1_mono, o_ms1_i1, o_ms1_i2) = if ms1_scans.is_empty() {
             (None, None, None, None)
         } else {
@@ -759,6 +774,46 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
                 Some(sum_near(&s.mz, &s.intensity, c.precursor_mz + sp, tol) as f64),
                 Some(sum_near(&s.mz, &s.intensity, c.precursor_mz + 2.0 * sp, tol) as f64),
             )
+        };
+        // Cheap MS1 support: mono present and the +1/mono ratio in a plausible
+        // averagine band. Used only as the rescue signal for the Pearson gate.
+        let ms1_support = {
+            let mono = o_ms1_mono.unwrap_or(0.0);
+            let i1 = o_ms1_i1.unwrap_or(0.0);
+            mono > 0.0 && i1 > 0.0 && {
+                let r = i1 / mono;
+                (0.1..=1.5).contains(&r)
+            }
+        };
+
+        // Optional tier-d Pearson gate (kept for configurability; matched fraction
+        // above is the primary symmetric discriminator). With `ms1_rescue`, a
+        // candidate that fails the single-scan fragment Pearson is kept when it has
+        // adequate matched fragments AND MS1 isotope-pattern support.
+        let apex_map = groups
+            .iter()
+            .find(|(rt, _)| (*rt - apex_rt).abs() < 1e-9)
+            .map(|(_, m)| m);
+        if p.cfg.min_frag_corr > 0.0 {
+            if let Some(map) = apex_map {
+                let obs: Vec<f64> = (0..fmzs0.len())
+                    .map(|k| *map.get(&(k as u16)).unwrap_or(&0.0) as f64)
+                    .collect();
+                let pred: Vec<f64> = fints0.iter().map(|x| *x as f64).collect();
+                if crate::stats::pearson(&obs, &pred) < p.cfg.min_frag_corr {
+                    let rescued = p.cfg.ms1_rescue
+                        && ms1_support
+                        && distinct.len() >= p.cfg.presence_min_fragments.max(1);
+                    if !rescued {
+                        return None;
+                    }
+                }
+            }
+        }
+
+        let contested_val = {
+            let (w, l) = contested.get(&cid).copied().unwrap_or((0.0, 0.0));
+            if w + l > 0.0 { l / (w + l) } else { 0.0 }
         };
 
         // Per-fragment intensity-weighted observed m/z (for mass accuracy).
@@ -782,23 +837,7 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
                 per_frag.entry(frag).or_default().push((*rt, inten));
             }
         }
-        let grid: Vec<f64> = if !windows.is_empty() {
-            let pm = lib.cands[cid as usize].precursor_mz;
-            let (lo, hi) = (rt_lo[cid as usize], rt_hi[cid as usize]);
-            let mut g: Vec<f64> = Vec::new();
-            for (wl, wu, rts) in &windows {
-                if *wl <= pm && pm <= *wu {
-                    let a = rts.partition_point(|&r| r < lo);
-                    let b = rts.partition_point(|&r| r <= hi);
-                    g.extend_from_slice(&rts[a..b]);
-                }
-            }
-            g.sort_by(|a, b| a.partial_cmp(b).unwrap());
-            g.dedup();
-            g
-        } else {
-            Vec::new()
-        };
+        // (the acquisition-scan `grid` was computed above, before apex/co-elution)
         // Emit EVERY predicted transition, not just the observed ones. A predicted
         // fragment never matched anywhere gets a zero-intensity row (all-zero grid
         // trace, or an empty series without the grid) so the feature families see

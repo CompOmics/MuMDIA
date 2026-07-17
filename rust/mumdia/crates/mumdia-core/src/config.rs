@@ -513,6 +513,12 @@ pub struct ExtractConfig {
     /// peptide persists across its elution. 0 disables (the `scan_window` floor still
     /// applies). This is the DIA analog of a "seen in >= N PSMs" requirement.
     pub min_coelution_run: usize,
+    /// Rescue a candidate that fails the single-scan fragment-Pearson gate when it
+    /// has adequate matched fragments AND MS1 isotope-pattern support (mono + a
+    /// plausible +1/mono ratio). Off by default: it relaxes acceptance, so enable
+    /// it only with target-decoy/entrapment FDR validation. MS1 evidence is now
+    /// computed before the gate so this can take effect.
+    pub ms1_rescue: bool,
 }
 impl Default for ExtractConfig {
     fn default() -> Self {
@@ -544,6 +550,7 @@ impl Default for ExtractConfig {
             peak_claim_margin: 2.0,
             matcher: MatcherKind::Fragindex,
             min_coelution_run: 0, // disabled; scan_window floor still applies
+            ms1_rescue: false,    // opt-in; relaxes acceptance, validate FDR first
         }
     }
 }
