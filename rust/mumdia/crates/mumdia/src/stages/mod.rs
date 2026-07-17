@@ -2,6 +2,7 @@
 //! inputs and writing declared Parquet + a report (PLAN.md Section 3.5).
 
 pub mod align;
+pub mod audit;
 pub mod compete;
 pub mod convert;
 pub mod digest;

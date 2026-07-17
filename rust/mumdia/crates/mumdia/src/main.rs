@@ -224,6 +224,35 @@ enum Cmd {
     Inspect {
         artifact: String,
     },
+    /// Candidate audit: reconstruct per-candidate stage flags + earliest rejection
+    /// reason across the artifact chain and write candidate_audit.parquet
+    /// (sensitivity program, P0.3/P0.4). Non-destructive; reruns no compute.
+    Audit {
+        /// Library precursors parquet (the full candidate search space).
+        #[arg(long)]
+        library_precursors: String,
+        /// psms parquet from `extract`.
+        #[arg(long)]
+        psms: String,
+        /// competed parquet from `compete`.
+        #[arg(long)]
+        competed: String,
+        /// scored parquet from `rescore`.
+        #[arg(long)]
+        scored: String,
+        /// Output candidate_audit.parquet.
+        #[arg(long)]
+        out: String,
+        /// Precursor q-value threshold for passed_precursor_fdr / reported.
+        #[arg(long, default_value_t = 0.01)]
+        q: f64,
+        /// Run identifier stamped on every row.
+        #[arg(long, default_value = "run")]
+        run_id: String,
+        /// Optional protein substring marking entrapment candidates (e.g. _HUMAN).
+        #[arg(long, default_value = "")]
+        entrapment_substr: String,
+    },
     /// Write peptides.tsv + proteins.tsv from a scored PSM table.
     Report {
         #[arg(long)]
@@ -453,6 +482,27 @@ fn main() -> Result<()> {
                 out: &out,
                 cfg: &cfg.compete,
                 config_hash: &ch,
+            })?;
+        }
+        Cmd::Audit {
+            library_precursors,
+            psms,
+            competed,
+            scored,
+            out,
+            q,
+            run_id,
+            entrapment_substr,
+        } => {
+            stages::audit::run(stages::audit::AuditParams {
+                library_precursors: &library_precursors,
+                psms: &psms,
+                competed: &competed,
+                scored: &scored,
+                out: &out,
+                q_threshold: q,
+                run_id: &run_id,
+                entrapment_substr: &entrapment_substr,
             })?;
         }
         Cmd::Rescore { competed, out, config } => {
