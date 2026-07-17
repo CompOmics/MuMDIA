@@ -1,1816 +1,1922 @@
-# MuMDIA feature registry (machine-readable)
-# Auto-generated from _feat_inventory.json (360 features, 17 families).
-# Schema per feature: family, level, direction, source_file.
-# direction: higher_better | lower_better | neutral | ?
-# level: fragment | peak | precursor | candidate | run | ?
-# NOTE: 4 names collide with reserved Minimal/Rich names and are dropped
-#   from the scored schema; the dropped variant is keyed '<name>@<family>'
-#   and carries 'dropped_collision: true'. The active (reserved) row keeps
-#   the plain name.
 total_features: 360
 n_families: 17
 features:
-  "rt_error_abs":
-    family: "minimal"
-    level: "candidate"
-    direction: "lower_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features.rs"
-  "rt_error_rel":
-    family: "minimal"
-    level: "candidate"
-    direction: "lower_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features.rs"
-  "n_matched_fragments":
-    family: "minimal"
-    level: "candidate"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features.rs"
-  "coelution_run":
-    family: "minimal"
-    level: "peak"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features.rs"
-  "log_apex_intensity":
-    family: "minimal"
-    level: "peak"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features.rs"
-  "frag_corr":
-    family: "minimal"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features.rs"
-  "frag_cosine":
-    family: "minimal"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features.rs"
-  "spectral_angle":
-    family: "minimal"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features.rs"
-  "coelution_mean":
-    family: "minimal"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features.rs"
-  "coelution_best":
-    family: "minimal"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features.rs"
-  "n_coelution_above":
-    family: "minimal"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features.rs"
-  "charge":
-    family: "minimal"
-    level: "precursor"
-    direction: "neutral"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features.rs"
-  "peptide_length":
-    family: "minimal"
-    level: "candidate"
-    direction: "neutral"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features.rs"
-  "n_proteins":
-    family: "minimal"
-    level: "candidate"
-    direction: "lower_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features.rs"
-  "library_norm_manhattan":
-    family: "rich"
-    level: "fragment"
-    direction: "lower_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features.rs"
-  "library_rmsd":
-    family: "rich"
-    level: "fragment"
-    direction: "lower_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features.rs"
-  "xcorr_coelution":
-    family: "rich"
-    level: "fragment"
-    direction: "lower_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features.rs"
-  "xcorr_shape":
-    family: "rich"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features.rs"
-  "sum_b_intensity":
-    family: "rich"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features.rs"
-  "sum_y_intensity":
-    family: "rich"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features.rs"
-  "diff_by_intensity":
-    family: "rich"
-    level: "fragment"
-    direction: "neutral"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features.rs"
-  "n_b_ions":
-    family: "rich"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features.rs"
-  "n_y_ions":
-    family: "rich"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features.rs"
-  "weighted_mass_error":
-    family: "rich"
-    level: "fragment"
-    direction: "lower_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features.rs"
-  "mean_mass_error":
-    family: "rich"
-    level: "fragment"
-    direction: "lower_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features.rs"
-  "isotope_corr":
-    family: "rich"
-    level: "precursor"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features.rs"
-  "ms1_isom1_ratio":
-    family: "rich"
-    level: "precursor"
-    direction: "lower_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features.rs"
-  "log_mono_ms1":
-    family: "rich"
-    level: "precursor"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features.rs"
-  "has_ms1":
-    family: "rich"
-    level: "precursor"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features.rs"
-  "log_sn":
-    family: "rich"
-    level: "peak"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features.rs"
-  "n_observations":
-    family: "rich"
-    level: "peak"
-    direction: "neutral"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features.rs"
-  "base_width_rt":
-    family: "rich"
-    level: "peak"
-    direction: "neutral"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features.rs"
-  "seed_score":
-    family: "rich"
-    level: "candidate"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features.rs"
-  "seed_identified":
-    family: "rich"
-    level: "candidate"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features.rs"
-  "matched_fraction":
-    family: "rich"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features.rs"
-  "profile_cos":
-    family: "rich"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features.rs"
-  "ref_corr":
-    family: "rich"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features.rs"
-  "best_ref_corr":
-    family: "rich"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features.rs"
-  "low_frag_coel":
-    family: "rich"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features.rs"
-  "evidence":
-    family: "rich"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features.rs"
-  "contrast_min":
-    family: "rich"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features.rs"
-  "resid_corr":
-    family: "rich"
-    level: "fragment"
-    direction: "lower_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features.rs"
-  "coel_clean":
-    family: "rich"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features.rs"
-  "shadow_frac":
-    family: "rich"
-    level: "fragment"
-    direction: "lower_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features.rs"
-  "peak_contested_frac":
-    family: "extended-extra (psms-derived)"
-    level: "candidate"
-    direction: "lower_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features.rs"
-  "n_charge_states":
-    family: "extended-extra (cross-candidate)"
-    level: "precursor"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features.rs"
-  "charge_multi_flag":
-    family: "extended-extra (cross-candidate)"
-    level: "precursor"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features.rs"
-  "cross_charge_intensity_log":
-    family: "extended-extra (cross-candidate)"
-    level: "precursor"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features.rs"
-  "spectrum_cosine_matched":
-    family: "similarity"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/similarity.rs"
-  "spectrum_cosine_sqrt":
-    family: "similarity"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/similarity.rs"
-  "spectrum_cosine_log":
-    family: "similarity"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/similarity.rs"
-  "spectral_angle@similarity":
-    family: "similarity"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/similarity.rs"
+  rt_error_abs:
+    family: minimal
+    level: candidate
+    direction: lower_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features.rs
+  rt_error_rel:
+    family: minimal
+    level: candidate
+    direction: lower_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features.rs
+  n_matched_fragments:
+    family: minimal
+    level: candidate
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features.rs
+  coelution_run:
+    family: minimal
+    level: peak
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features.rs
+  log_apex_intensity:
+    family: minimal
+    level: peak
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features.rs
+  frag_corr:
+    family: minimal
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features.rs
+  frag_cosine:
+    family: minimal
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features.rs
+  spectral_angle:
+    family: minimal
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features.rs
+  coelution_mean:
+    family: minimal
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features.rs
+  coelution_best:
+    family: minimal
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features.rs
+  n_coelution_above:
+    family: minimal
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features.rs
+  charge:
+    family: minimal
+    level: precursor
+    direction: neutral
+    source_file: rust/mumdia/crates/mumdia/src/stages/features.rs
+  peptide_length:
+    family: minimal
+    level: candidate
+    direction: neutral
+    source_file: rust/mumdia/crates/mumdia/src/stages/features.rs
+  n_proteins:
+    family: minimal
+    level: candidate
+    direction: lower_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features.rs
+  library_norm_manhattan:
+    family: rich
+    level: fragment
+    direction: lower_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features.rs
+  library_rmsd:
+    family: rich
+    level: fragment
+    direction: lower_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features.rs
+  xcorr_coelution:
+    family: rich
+    level: fragment
+    direction: lower_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features.rs
+  xcorr_shape:
+    family: rich
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features.rs
+  sum_b_intensity:
+    family: rich
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features.rs
+  sum_y_intensity:
+    family: rich
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features.rs
+  diff_by_intensity:
+    family: rich
+    level: fragment
+    direction: neutral
+    source_file: rust/mumdia/crates/mumdia/src/stages/features.rs
+  n_b_ions:
+    family: rich
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features.rs
+  n_y_ions:
+    family: rich
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features.rs
+  weighted_mass_error:
+    family: rich
+    level: fragment
+    direction: lower_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features.rs
+  mean_mass_error:
+    family: rich
+    level: fragment
+    direction: lower_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features.rs
+  isotope_corr:
+    family: rich
+    level: precursor
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features.rs
+  ms1_isom1_ratio:
+    family: rich
+    level: precursor
+    direction: lower_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features.rs
+  log_mono_ms1:
+    family: rich
+    level: precursor
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features.rs
+  has_ms1:
+    family: rich
+    level: precursor
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features.rs
+  log_sn:
+    family: rich
+    level: peak
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features.rs
+  n_observations:
+    family: rich
+    level: peak
+    direction: neutral
+    source_file: rust/mumdia/crates/mumdia/src/stages/features.rs
+  base_width_rt:
+    family: rich
+    level: peak
+    direction: neutral
+    source_file: rust/mumdia/crates/mumdia/src/stages/features.rs
+  seed_score:
+    family: rich
+    level: candidate
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features.rs
+  seed_identified:
+    family: rich
+    level: candidate
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features.rs
+  matched_fraction:
+    family: rich
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features.rs
+  profile_cos:
+    family: rich
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features.rs
+  ref_corr:
+    family: rich
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features.rs
+  best_ref_corr:
+    family: rich
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features.rs
+  low_frag_coel:
+    family: rich
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features.rs
+  evidence:
+    family: rich
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features.rs
+  contrast_min:
+    family: rich
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features.rs
+  resid_corr:
+    family: rich
+    level: fragment
+    direction: lower_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features.rs
+  coel_clean:
+    family: rich
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features.rs
+  shadow_frac:
+    family: rich
+    level: fragment
+    direction: lower_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features.rs
+  peak_contested_frac:
+    family: extended-extra (psms-derived)
+    level: candidate
+    direction: lower_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features.rs
+  n_charge_states:
+    family: extended-extra (cross-candidate)
+    level: precursor
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features.rs
+  charge_multi_flag:
+    family: extended-extra (cross-candidate)
+    level: precursor
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features.rs
+  cross_charge_intensity_log:
+    family: extended-extra (cross-candidate)
+    level: precursor
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features.rs
+  spectrum_cosine_matched:
+    family: similarity
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/similarity.rs
+  spectrum_cosine_sqrt:
+    family: similarity
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/similarity.rs
+  spectrum_cosine_log:
+    family: similarity
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/similarity.rs
+  spectral_angle@similarity:
+    family: similarity
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/similarity.rs
     dropped_collision: true
-  "spectral_angle_sqrt":
-    family: "similarity"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/similarity.rs"
-  "spectral_angle_matched":
-    family: "similarity"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/similarity.rs"
-  "pearson_intensity_matched":
-    family: "similarity"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/similarity.rs"
-  "pearson_intensity_log":
-    family: "similarity"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/similarity.rs"
-  "spearman_intensity":
-    family: "similarity"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/similarity.rs"
-  "spearman_intensity_matched":
-    family: "similarity"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/similarity.rs"
-  "kendall_tau_intensity":
-    family: "similarity"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/similarity.rs"
-  "dot_product_raw":
-    family: "similarity"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/similarity.rs"
-  "dot_product_norm":
-    family: "similarity"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/similarity.rs"
-  "library_recall_intensity":
-    family: "similarity"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/similarity.rs"
-  "manhattan_sim":
-    family: "similarity"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/similarity.rs"
-  "manhattan_sqrt":
-    family: "similarity"
-    level: "fragment"
-    direction: "lower_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/similarity.rs"
-  "rmsd_norm":
-    family: "similarity"
-    level: "fragment"
-    direction: "lower_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/similarity.rs"
-  "mae_norm":
-    family: "similarity"
-    level: "fragment"
-    direction: "lower_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/similarity.rs"
-  "mse_log":
-    family: "similarity"
-    level: "fragment"
-    direction: "lower_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/similarity.rs"
-  "mae_weighted_pred":
-    family: "similarity"
-    level: "fragment"
-    direction: "lower_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/similarity.rs"
-  "abs_diff_q3":
-    family: "similarity"
-    level: "fragment"
-    direction: "lower_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/similarity.rs"
-  "max_positive_residual":
-    family: "similarity"
-    level: "fragment"
-    direction: "lower_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/similarity.rs"
-  "chebyshev_dist":
-    family: "similarity"
-    level: "fragment"
-    direction: "lower_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/similarity.rs"
-  "minkowski_p3":
-    family: "similarity"
-    level: "fragment"
-    direction: "lower_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/similarity.rs"
-  "bray_curtis":
-    family: "similarity"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/similarity.rs"
-  "bray_curtis_sqrt":
-    family: "similarity"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/similarity.rs"
-  "canberra":
-    family: "similarity"
-    level: "fragment"
-    direction: "lower_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/similarity.rs"
-  "canberra_matched":
-    family: "similarity"
-    level: "fragment"
-    direction: "lower_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/similarity.rs"
-  "wave_hedges":
-    family: "similarity"
-    level: "fragment"
-    direction: "lower_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/similarity.rs"
-  "chi_square_pearson":
-    family: "similarity"
-    level: "fragment"
-    direction: "lower_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/similarity.rs"
-  "chi_square_symmetric":
-    family: "similarity"
-    level: "fragment"
-    direction: "lower_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/similarity.rs"
-  "divergence_distance":
-    family: "similarity"
-    level: "fragment"
-    direction: "lower_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/similarity.rs"
-  "bhattacharyya_coef":
-    family: "similarity"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/similarity.rs"
-  "hellinger":
-    family: "similarity"
-    level: "fragment"
-    direction: "lower_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/similarity.rs"
-  "squared_chord":
-    family: "similarity"
-    level: "fragment"
-    direction: "lower_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/similarity.rs"
-  "harmonic_mean_sim":
-    family: "similarity"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/similarity.rs"
-  "jaccard_presence":
-    family: "similarity"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/similarity.rs"
-  "dice_presence":
-    family: "similarity"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/similarity.rs"
-  "intensity_weighted_pearson":
-    family: "similarity"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/similarity.rs"
-  "regression_slope":
-    family: "similarity"
-    level: "fragment"
-    direction: "neutral"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/similarity.rs"
-  "gini_diff":
-    family: "similarity"
-    level: "fragment"
-    direction: "neutral"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/similarity.rs"
-  "wasserstein_mz":
-    family: "similarity"
-    level: "fragment"
-    direction: "lower_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/similarity.rs"
-  "footrule_norm":
-    family: "similarity"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/similarity.rs"
-  "rank_overlap_top3":
-    family: "similarity"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/similarity.rs"
-  "top1_frag_match":
-    family: "similarity"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/similarity.rs"
-  "top1_predicted_observed":
-    family: "similarity"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/similarity.rs"
-  "frac_top3_predicted_observed":
-    family: "similarity"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/similarity.rs"
-  "count_strong_predicted_absent":
-    family: "similarity"
-    level: "fragment"
-    direction: "lower_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/similarity.rs"
-  "frac_predicted_absent":
-    family: "similarity"
-    level: "fragment"
-    direction: "lower_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/similarity.rs"
-  "cosine_area":
-    family: "similarity"
-    level: "peak"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/similarity.rs"
-  "pearson_area":
-    family: "similarity"
-    level: "peak"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/similarity.rs"
-  "spectral_angle_area":
-    family: "similarity"
-    level: "peak"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/similarity.rs"
-  "cosine_fullwindow":
-    family: "similarity"
-    level: "peak"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/similarity.rs"
-  "stein_scott_weighted_dot":
-    family: "similarity"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/similarity.rs"
-  "log_dot_product":
-    family: "similarity"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/similarity.rs"
-  "spectral_log_evidence":
-    family: "similarity"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/similarity.rs"
-  "scribe_score":
-    family: "similarity"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/similarity.rs"
-  "log_dot_product_area":
-    family: "similarity"
-    level: "peak"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/similarity.rs"
-  "spectral_log_evidence_area":
-    family: "similarity"
-    level: "peak"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/similarity.rs"
-  "scribe_score_area":
-    family: "similarity"
-    level: "peak"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/similarity.rs"
-  "cosine_high_ordinal":
-    family: "similarity"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/similarity.rs"
-  "cosine_robust_trim1":
-    family: "similarity"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/similarity.rs"
-  "cosine_robust_trim2":
-    family: "similarity"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/similarity.rs"
-  "cosine_robust_trim3":
-    family: "similarity"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/similarity.rs"
-  "spectral_entropy_similarity":
-    family: "entropy"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/entropy.rs"
-  "weighted_spectral_entropy_similarity":
-    family: "entropy"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/entropy.rs"
-  "spectral_entropy_similarity_sqrt":
-    family: "entropy"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/entropy.rs"
-  "spectral_entropy_similarity_topk":
-    family: "entropy"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/entropy.rs"
-  "spectral_entropy_similarity_area":
-    family: "entropy"
-    level: "peak"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/entropy.rs"
-  "jensen_shannon_divergence":
-    family: "entropy"
-    level: "fragment"
-    direction: "lower_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/entropy.rs"
-  "jeffreys_divergence":
-    family: "entropy"
-    level: "fragment"
-    direction: "lower_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/entropy.rs"
-  "kl_obs_pred":
-    family: "entropy"
-    level: "fragment"
-    direction: "lower_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/entropy.rs"
-  "kl_pred_obs":
-    family: "entropy"
-    level: "fragment"
-    direction: "lower_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/entropy.rs"
-  "cross_entropy_obs_pred":
-    family: "entropy"
-    level: "fragment"
-    direction: "lower_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/entropy.rs"
-  "obs_spectrum_entropy":
-    family: "entropy"
-    level: "fragment"
-    direction: "neutral"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/entropy.rs"
-  "pred_spectrum_entropy":
-    family: "entropy"
-    level: "fragment"
-    direction: "neutral"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/entropy.rs"
-  "entropy_diff":
-    family: "entropy"
-    level: "fragment"
-    direction: "neutral"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/entropy.rs"
-  "entropy_ratio":
-    family: "entropy"
-    level: "fragment"
-    direction: "neutral"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/entropy.rs"
-  "obs_normalized_entropy":
-    family: "entropy"
-    level: "fragment"
-    direction: "neutral"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/entropy.rs"
-  "normalized_entropy_diff":
-    family: "entropy"
-    level: "fragment"
-    direction: "neutral"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/entropy.rs"
-  "residual_spectrum_entropy":
-    family: "entropy"
-    level: "fragment"
-    direction: "lower_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/entropy.rs"
-  "entropy_weight_obs":
-    family: "entropy"
-    level: "fragment"
-    direction: "neutral"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/entropy.rs"
-  "frag_ref_corr_mean":
-    family: "coelution"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/coelution.rs"
-  "frag_ref_corr_obsweighted":
-    family: "coelution"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/coelution.rs"
-  "frag_ref_corr_min":
-    family: "coelution"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/coelution.rs"
-  "frag_ref_corr_std":
-    family: "coelution"
-    level: "fragment"
-    direction: "lower_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/coelution.rs"
-  "frag_ref_corr_sq_mean":
-    family: "coelution"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/coelution.rs"
-  "frag_ref_corr_topk_weighted":
-    family: "coelution"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/coelution.rs"
-  "n_frag_ref_corr_above_0_9":
-    family: "coelution"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/coelution.rs"
-  "frac_frag_ref_corr_above_0_8":
-    family: "coelution"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/coelution.rs"
-  "frag_ref_corr_mean_full":
-    family: "coelution"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/coelution.rs"
-  "full_vs_peak_corr_gain":
-    family: "coelution"
-    level: "fragment"
-    direction: "neutral"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/coelution.rs"
-  "pairwise_coelution_weighted":
-    family: "coelution"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/coelution.rs"
-  "pairwise_coelution_min":
-    family: "coelution"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/coelution.rs"
-  "pairwise_coelution_median":
-    family: "coelution"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/coelution.rs"
-  "pairwise_coelution_std":
-    family: "coelution"
-    level: "fragment"
-    direction: "lower_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/coelution.rs"
-  "pairwise_coelution_frac_negative":
-    family: "coelution"
-    level: "fragment"
-    direction: "lower_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/coelution.rs"
-  "pairwise_coelution_hi":
-    family: "coelution"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/coelution.rs"
-  "pairwise_coelution_lo":
-    family: "coelution"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/coelution.rs"
-  "coelution_hi_lo_contrast":
-    family: "coelution"
-    level: "fragment"
-    direction: "neutral"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/coelution.rs"
-  "coelution_corr_entropy":
-    family: "coelution"
-    level: "fragment"
-    direction: "lower_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/coelution.rs"
-  "xcorr_shape_mean":
-    family: "coelution"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/coelution.rs"
-  "xcorr_shape_min":
-    family: "coelution"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/coelution.rs"
-  "xcorr_shape_std":
-    family: "coelution"
-    level: "fragment"
-    direction: "lower_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/coelution.rs"
-  "xcorr_lag_mean_abs":
-    family: "coelution"
-    level: "fragment"
-    direction: "lower_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/coelution.rs"
-  "xcorr_lag_std":
-    family: "coelution"
-    level: "fragment"
-    direction: "lower_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/coelution.rs"
-  "xcorr_lag_iqr":
-    family: "coelution"
-    level: "fragment"
-    direction: "lower_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/coelution.rs"
-  "xcorr_lag_frac_zero":
-    family: "coelution"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/coelution.rs"
-  "xcorr_lag_max_abs":
-    family: "coelution"
-    level: "fragment"
-    direction: "lower_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/coelution.rs"
-  "xcorr_lag_entropy":
-    family: "coelution"
-    level: "fragment"
-    direction: "lower_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/coelution.rs"
-  "ref_xcorr_lag_mean":
-    family: "coelution"
-    level: "fragment"
-    direction: "lower_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/coelution.rs"
-  "ref_xcorr_shape_mean":
-    family: "coelution"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/coelution.rs"
-  "observed_sum_vs_template_corr":
-    family: "coelution"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/coelution.rs"
-  "frag_loo_ref_corr_mean":
-    family: "coelution"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/coelution.rs"
-  "frag_loo_ref_corr_min":
-    family: "coelution"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/coelution.rs"
-  "frac_frags_apex_aligned":
-    family: "coelution"
-    level: "peak"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/coelution.rs"
-  "top3_frag_ref_corr":
-    family: "coelution"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/coelution.rs"
-  "by_cross_coelution":
-    family: "coelution"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/coelution.rs"
-  "by_cross_lag_mean":
-    family: "coelution"
-    level: "fragment"
-    direction: "lower_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/coelution.rs"
-  "charge_cross_coelution":
-    family: "coelution"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/coelution.rs"
-  "explained_variance_ref":
-    family: "interference"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/interference.rs"
-  "profile_residual_fraction":
-    family: "interference"
-    level: "fragment"
-    direction: "lower_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/interference.rs"
-  "n_interfered_fragments":
-    family: "interference"
-    level: "fragment"
-    direction: "lower_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/interference.rs"
-  "corrected_vs_raw_cos":
-    family: "interference"
-    level: "fragment"
-    direction: "neutral"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/interference.rs"
-  "corrected_vs_raw_ratio":
-    family: "interference"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/interference.rs"
-  "ifs_removed_count":
-    family: "interference"
-    level: "fragment"
-    direction: "lower_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/interference.rs"
-  "ifs_removed_intensity_frac":
-    family: "interference"
-    level: "fragment"
-    direction: "lower_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/interference.rs"
-  "ifs_corr_gain":
-    family: "interference"
-    level: "fragment"
-    direction: "neutral"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/interference.rs"
-  "ifs_retained_frac":
-    family: "interference"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/interference.rs"
-  "matched_frac_after_ifs":
-    family: "interference"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/interference.rs"
-  "peak_to_full_area_ratio_profile":
-    family: "interference"
-    level: "peak"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/interference.rs"
-  "peak_to_full_area_ratio_frag_mean":
-    family: "interference"
-    level: "peak"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/interference.rs"
-  "peak_to_full_area_ratio_weighted":
-    family: "interference"
-    level: "peak"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/interference.rs"
-  "out_of_peak_intensity_frac":
-    family: "interference"
-    level: "peak"
-    direction: "lower_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/interference.rs"
-  "profile_corr_full_vs_peak_delta":
-    family: "interference"
-    level: "fragment"
-    direction: "neutral"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/interference.rs"
-  "frac_frag_ref_corr_below_0_5":
-    family: "interference"
-    level: "fragment"
-    direction: "lower_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/interference.rs"
-  "explained_apex_intensity_frac":
-    family: "interference"
-    level: "peak"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/interference.rs"
-  "apex_purity":
-    family: "interference"
-    level: "peak"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/interference.rs"
-  "interference_apex_residual_fraction":
-    family: "interference"
-    level: "peak"
-    direction: "lower_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/interference.rs"
-  "dominant_frag_ref_corr":
-    family: "interference"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/interference.rs"
-  "explained_variance_ratio":
-    family: "interference"
-    level: "peak"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/interference.rs"
-  "second_component_fraction":
-    family: "interference"
-    level: "peak"
-    direction: "lower_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/interference.rs"
-  "profile_second_peak_ratio":
-    family: "interference"
-    level: "peak"
-    direction: "lower_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/interference.rs"
-  "n_competing_peaks_in_window":
-    family: "interference"
-    level: "peak"
-    direction: "lower_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/interference.rs"
-  "matched_pred_intensity_fraction":
-    family: "interference"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/interference.rs"
-  "top_pred_frag_matched":
-    family: "interference"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/interference.rs"
-  "gaussian_fit_r2":
-    family: "chromatographic"
-    level: "peak"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/chromatographic.rs"
-  "gaussian_cosine":
-    family: "chromatographic"
-    level: "peak"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/chromatographic.rs"
-  "emg_fit_improvement":
-    family: "chromatographic"
-    level: "peak"
-    direction: "neutral"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/chromatographic.rs"
-  "apex_prominence":
-    family: "chromatographic"
-    level: "peak"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/chromatographic.rs"
-  "profile_peak_snr":
-    family: "chromatographic"
-    level: "peak"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/chromatographic.rs"
-  "fwhm_seconds":
-    family: "chromatographic"
-    level: "peak"
-    direction: "neutral"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/chromatographic.rs"
-  "fwhm_to_window_ratio":
-    family: "chromatographic"
-    level: "peak"
-    direction: "neutral"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/chromatographic.rs"
-  "width_at_10pct":
-    family: "chromatographic"
-    level: "peak"
-    direction: "neutral"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/chromatographic.rs"
-  "width_ratio_10_50":
-    family: "chromatographic"
-    level: "peak"
-    direction: "neutral"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/chromatographic.rs"
-  "hwhm_asymmetry":
-    family: "chromatographic"
-    level: "peak"
-    direction: "lower_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/chromatographic.rs"
-  "tailing_factor_usp":
-    family: "chromatographic"
-    level: "peak"
-    direction: "neutral"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/chromatographic.rs"
-  "asymmetry_factor_10pct":
-    family: "chromatographic"
-    level: "peak"
-    direction: "neutral"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/chromatographic.rs"
-  "apex_sharpness":
-    family: "chromatographic"
-    level: "peak"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/chromatographic.rs"
-  "apex_curvature":
-    family: "chromatographic"
-    level: "peak"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/chromatographic.rs"
-  "apex_to_boundary_ratio":
-    family: "chromatographic"
-    level: "peak"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/chromatographic.rs"
-  "apex_dominance":
-    family: "chromatographic"
-    level: "peak"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/chromatographic.rs"
-  "zigzag_index":
-    family: "chromatographic"
-    level: "peak"
-    direction: "lower_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/chromatographic.rs"
-  "jaggedness":
-    family: "chromatographic"
-    level: "peak"
-    direction: "lower_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/chromatographic.rs"
-  "roughness_2nd_deriv":
-    family: "chromatographic"
-    level: "peak"
-    direction: "lower_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/chromatographic.rs"
-  "n_local_maxima":
-    family: "chromatographic"
-    level: "peak"
-    direction: "lower_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/chromatographic.rs"
-  "modality":
-    family: "chromatographic"
-    level: "peak"
-    direction: "lower_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/chromatographic.rs"
-  "rt_skewness":
-    family: "chromatographic"
-    level: "peak"
-    direction: "neutral"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/chromatographic.rs"
-  "rt_excess_kurtosis":
-    family: "chromatographic"
-    level: "peak"
-    direction: "neutral"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/chromatographic.rs"
-  "rt_std_seconds":
-    family: "chromatographic"
-    level: "peak"
-    direction: "neutral"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/chromatographic.rs"
-  "mean_mode_offset":
-    family: "chromatographic"
-    level: "peak"
-    direction: "lower_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/chromatographic.rs"
-  "fraction_area_within_fwhm":
-    family: "chromatographic"
-    level: "peak"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/chromatographic.rs"
-  "triangle_area_similarity":
-    family: "chromatographic"
-    level: "peak"
-    direction: "lower_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/chromatographic.rs"
-  "baseline_fraction":
-    family: "chromatographic"
-    level: "peak"
-    direction: "neutral"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/chromatographic.rs"
-  "peak_completeness":
-    family: "chromatographic"
-    level: "peak"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/chromatographic.rs"
-  "apex_centering_offset":
-    family: "chromatographic"
-    level: "peak"
-    direction: "lower_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/chromatographic.rs"
-  "intensity_score":
-    family: "chromatographic"
-    level: "peak"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/chromatographic.rs"
-  "total_xic_log":
-    family: "chromatographic"
-    level: "peak"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/chromatographic.rs"
-  "frag_fwhm_cv":
-    family: "chromatographic"
-    level: "fragment"
-    direction: "lower_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/chromatographic.rs"
-  "frag_fwhm_mean":
-    family: "chromatographic"
-    level: "fragment"
-    direction: "neutral"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/chromatographic.rs"
-  "frag_apex_rt_dispersion":
-    family: "chromatographic"
-    level: "peak"
-    direction: "lower_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/chromatographic.rs"
-  "frag_apex_rt_dispersion_weighted":
-    family: "chromatographic"
-    level: "peak"
-    direction: "lower_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/chromatographic.rs"
-  "frag_apex_offset_from_profile_mean":
-    family: "chromatographic"
-    level: "peak"
-    direction: "lower_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/chromatographic.rs"
-  "frag_gaussianity_mean":
-    family: "chromatographic"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/chromatographic.rs"
-  "frag_gaussianity_weighted":
-    family: "chromatographic"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/chromatographic.rs"
-  "frag_zigzag_mean":
-    family: "chromatographic"
-    level: "fragment"
-    direction: "lower_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/chromatographic.rs"
-  "sumtrace_unweighted_gaussian_r2":
-    family: "chromatographic"
-    level: "peak"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/chromatographic.rs"
-  "reference_profile_rt_entropy_peak":
-    family: "chromatographic"
-    level: "peak"
-    direction: "lower_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/chromatographic.rs"
-  "reference_profile_rt_entropy_ratio":
-    family: "chromatographic"
-    level: "peak"
-    direction: "neutral"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/chromatographic.rs"
-  "median_abs_frag_ppm":
-    family: "mass_accuracy"
-    level: "fragment"
-    direction: "lower_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/mass_accuracy.rs"
-  "signed_mean_frag_ppm":
-    family: "mass_accuracy"
-    level: "fragment"
-    direction: "neutral"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/mass_accuracy.rs"
-  "ppm_std":
-    family: "mass_accuracy"
-    level: "fragment"
-    direction: "lower_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/mass_accuracy.rs"
-  "ppm_iqr":
-    family: "mass_accuracy"
-    level: "fragment"
-    direction: "lower_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/mass_accuracy.rs"
-  "ppm_range":
-    family: "mass_accuracy"
-    level: "fragment"
-    direction: "lower_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/mass_accuracy.rs"
-  "max_abs_frag_ppm":
-    family: "mass_accuracy"
-    level: "fragment"
-    direction: "lower_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/mass_accuracy.rs"
-  "intensity_weighted_abs_ppm":
-    family: "mass_accuracy"
-    level: "fragment"
-    direction: "lower_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/mass_accuracy.rs"
-  "intensity_weighted_signed_ppm":
-    family: "mass_accuracy"
-    level: "fragment"
-    direction: "neutral"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/mass_accuracy.rs"
-  "intensity_weighted_ppm_std":
-    family: "mass_accuracy"
-    level: "fragment"
-    direction: "lower_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/mass_accuracy.rs"
-  "lib_weighted_abs_ppm":
-    family: "mass_accuracy"
-    level: "fragment"
-    direction: "lower_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/mass_accuracy.rs"
-  "frac_frag_within_half_tol":
-    family: "mass_accuracy"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/mass_accuracy.rs"
-  "high_ppm_intensity_frac":
-    family: "mass_accuracy"
-    level: "fragment"
-    direction: "lower_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/mass_accuracy.rs"
-  "ppm_intensity_anticorr":
-    family: "mass_accuracy"
-    level: "fragment"
-    direction: "lower_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/mass_accuracy.rs"
-  "mass_error_mz_trend":
-    family: "mass_accuracy"
-    level: "fragment"
-    direction: "lower_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/mass_accuracy.rs"
-  "mean_abs_mz_error_da":
-    family: "mass_accuracy"
-    level: "fragment"
-    direction: "lower_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/mass_accuracy.rs"
-  "mass_evidence_gauss":
-    family: "mass_accuracy"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/mass_accuracy.rs"
-  "mass_log_evidence":
-    family: "mass_accuracy"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/mass_accuracy.rs"
-  "n_matched_b":
-    family: "ion_series"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/ion_series.rs"
-  "n_matched_y":
-    family: "ion_series"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/ion_series.rs"
-  "frac_matched_b":
-    family: "ion_series"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/ion_series.rs"
-  "frac_matched_y":
-    family: "ion_series"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/ion_series.rs"
-  "by_count_balance":
-    family: "ion_series"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/ion_series.rs"
-  "by_intensity_ratio":
-    family: "ion_series"
-    level: "fragment"
-    direction: "neutral"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/ion_series.rs"
-  "by_ratio_agreement":
-    family: "ion_series"
-    level: "fragment"
-    direction: "lower_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/ion_series.rs"
-  "by_ratio_consistency":
-    family: "ion_series"
-    level: "fragment"
-    direction: "lower_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/ion_series.rs"
-  "longest_b_run":
-    family: "ion_series"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/ion_series.rs"
-  "longest_y_run":
-    family: "ion_series"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/ion_series.rs"
-  "longest_run_max":
-    family: "ion_series"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/ion_series.rs"
-  "longest_run_frac_length":
-    family: "ion_series"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/ion_series.rs"
-  "series_coverage_b":
-    family: "ion_series"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/ion_series.rs"
-  "series_coverage_y":
-    family: "ion_series"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/ion_series.rs"
-  "sequence_coverage":
-    family: "ion_series"
-    level: "candidate"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/ion_series.rs"
-  "series_gap_fraction":
-    family: "ion_series"
-    level: "fragment"
-    direction: "lower_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/ion_series.rs"
-  "by_complement_count":
-    family: "ion_series"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/ion_series.rs"
-  "by_complement_mz_consistency":
-    family: "ion_series"
-    level: "fragment"
-    direction: "lower_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/ion_series.rs"
-  "by_complement_coelution":
-    family: "ion_series"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/ion_series.rs"
-  "ordinal_intensity_concordance_y":
-    family: "ion_series"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/ion_series.rs"
-  "ordinal_intensity_concordance_b":
-    family: "ion_series"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/ion_series.rs"
-  "series_coelution_y":
-    family: "ion_series"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/ion_series.rs"
-  "series_coelution_b":
-    family: "ion_series"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/ion_series.rs"
-  "spectral_angle_b":
-    family: "ion_series"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/ion_series.rs"
-  "spectral_angle_y":
-    family: "ion_series"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/ion_series.rs"
-  "pearson_b":
-    family: "ion_series"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/ion_series.rs"
-  "pearson_y":
-    family: "ion_series"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/ion_series.rs"
-  "cosine_charge1":
-    family: "ion_series"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/ion_series.rs"
-  "cosine_charge2":
-    family: "ion_series"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/ion_series.rs"
-  "charge_corr_balance":
-    family: "ion_series"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/ion_series.rs"
-  "mean_matched_ordinal_norm":
-    family: "ion_series"
-    level: "fragment"
-    direction: "neutral"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/ion_series.rs"
-  "by_ion_contiguous_intensity":
-    family: "ion_series"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/ion_series.rs"
-  "by_ion_contiguous_lib_frac":
-    family: "ion_series"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/ion_series.rs"
-  "both_series_present":
-    family: "ion_series"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/ion_series.rs"
-  "ms1_isotope_cosine_apex":
-    family: "ms1"
-    level: "precursor"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/ms1.rs"
-  "ms1_isotope_spectral_angle_apex":
-    family: "ms1"
-    level: "precursor"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/ms1.rs"
-  "ms1_isotope_chi2_apex":
-    family: "ms1"
-    level: "precursor"
-    direction: "lower_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/ms1.rs"
-  "ms1_isotope_manhattan_apex":
-    family: "ms1"
-    level: "precursor"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/ms1.rs"
-  "iso_ratio_1_0":
-    family: "ms1"
-    level: "precursor"
-    direction: "neutral"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/ms1.rs"
-  "iso_ratio_2_0":
-    family: "ms1"
-    level: "precursor"
-    direction: "neutral"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/ms1.rs"
-  "iso_plus1_ratio_dev":
-    family: "ms1"
-    level: "precursor"
-    direction: "lower_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/ms1.rs"
-  "iso_plus2_ratio_dev":
-    family: "ms1"
-    level: "precursor"
-    direction: "lower_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/ms1.rs"
-  "iso_minus_one_fraction":
-    family: "ms1"
-    level: "precursor"
-    direction: "lower_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/ms1.rs"
-  "iso_overlap_flag":
-    family: "ms1"
-    level: "precursor"
-    direction: "lower_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/ms1.rs"
-  "log_ms1_mono":
-    family: "ms1"
-    level: "precursor"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/ms1.rs"
-  "ms1_total_isotope_log":
-    family: "ms1"
-    level: "precursor"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/ms1.rs"
-  "has_ms1_signal":
-    family: "ms1"
-    level: "precursor"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/ms1.rs"
-  "ms1_isotope_apex_entropy_3":
-    family: "ms1"
-    level: "precursor"
-    direction: "neutral"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/ms1.rs"
-  "ms1_m1_entropy_contribution":
-    family: "ms1"
-    level: "precursor"
-    direction: "neutral"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/ms1.rs"
-  "ms1_ms2_time_corr":
-    family: "ms1"
-    level: "precursor"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/ms1.rs"
-  "ms1_ms2_envelope_time_corr":
-    family: "ms1"
-    level: "precursor"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/ms1.rs"
-  "ms1_iso_coelution":
-    family: "ms1"
-    level: "precursor"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/ms1.rs"
-  "ms1_ms2_apex_rt_delta":
-    family: "ms1"
-    level: "precursor"
-    direction: "lower_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/ms1.rs"
-  "ms1_iso_ratio_stability":
-    family: "ms1"
-    level: "precursor"
-    direction: "lower_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/ms1.rs"
-  "ms1_mono_gaussianity":
-    family: "ms1"
-    level: "precursor"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/ms1.rs"
-  "ms1_ms2_fwhm_ratio":
-    family: "ms1"
-    level: "precursor"
-    direction: "neutral"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/ms1.rs"
-  "ms1_isotope_corr_xic":
-    family: "ms1"
-    level: "precursor"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/ms1.rs"
-  "ms1_envelope_over_time_corr":
-    family: "ms1"
-    level: "precursor"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/ms1.rs"
-  "ms1_isotope_xic_shape_consistency":
-    family: "ms1"
-    level: "precursor"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/ms1.rs"
-  "rt_error_signed":
-    family: "rt"
-    level: "candidate"
-    direction: "neutral"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/rt.rs"
-  "rt_error_abs@rt":
-    family: "rt"
-    level: "candidate"
-    direction: "lower_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/rt.rs"
+  spectral_angle_sqrt:
+    family: similarity
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/similarity.rs
+  spectral_angle_matched:
+    family: similarity
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/similarity.rs
+  pearson_intensity_matched:
+    family: similarity
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/similarity.rs
+  pearson_intensity_log:
+    family: similarity
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/similarity.rs
+  spearman_intensity:
+    family: similarity
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/similarity.rs
+  spearman_intensity_matched:
+    family: similarity
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/similarity.rs
+  kendall_tau_intensity:
+    family: similarity
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/similarity.rs
+  dot_product_raw:
+    family: similarity
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/similarity.rs
+  dot_product_norm:
+    family: similarity
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/similarity.rs
+  library_recall_intensity:
+    family: similarity
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/similarity.rs
+  manhattan_sim:
+    family: similarity
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/similarity.rs
+  manhattan_sqrt:
+    family: similarity
+    level: fragment
+    direction: lower_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/similarity.rs
+  rmsd_norm:
+    family: similarity
+    level: fragment
+    direction: lower_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/similarity.rs
+  mae_norm:
+    family: similarity
+    level: fragment
+    direction: lower_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/similarity.rs
+  mse_log:
+    family: similarity
+    level: fragment
+    direction: lower_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/similarity.rs
+  mae_weighted_pred:
+    family: similarity
+    level: fragment
+    direction: lower_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/similarity.rs
+  abs_diff_q3:
+    family: similarity
+    level: fragment
+    direction: lower_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/similarity.rs
+  max_positive_residual:
+    family: similarity
+    level: fragment
+    direction: lower_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/similarity.rs
+  chebyshev_dist:
+    family: similarity
+    level: fragment
+    direction: lower_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/similarity.rs
+  minkowski_p3:
+    family: similarity
+    level: fragment
+    direction: lower_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/similarity.rs
+  bray_curtis:
+    family: similarity
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/similarity.rs
+  bray_curtis_sqrt:
+    family: similarity
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/similarity.rs
+  canberra:
+    family: similarity
+    level: fragment
+    direction: lower_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/similarity.rs
+  canberra_matched:
+    family: similarity
+    level: fragment
+    direction: lower_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/similarity.rs
+  wave_hedges:
+    family: similarity
+    level: fragment
+    direction: lower_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/similarity.rs
+  chi_square_pearson:
+    family: similarity
+    level: fragment
+    direction: lower_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/similarity.rs
+  chi_square_symmetric:
+    family: similarity
+    level: fragment
+    direction: lower_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/similarity.rs
+  divergence_distance:
+    family: similarity
+    level: fragment
+    direction: lower_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/similarity.rs
+  bhattacharyya_coef:
+    family: similarity
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/similarity.rs
+  hellinger:
+    family: similarity
+    level: fragment
+    direction: lower_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/similarity.rs
+  squared_chord:
+    family: similarity
+    level: fragment
+    direction: lower_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/similarity.rs
+  harmonic_mean_sim:
+    family: similarity
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/similarity.rs
+  jaccard_presence:
+    family: similarity
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/similarity.rs
+  dice_presence:
+    family: similarity
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/similarity.rs
+  intensity_weighted_pearson:
+    family: similarity
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/similarity.rs
+  regression_slope:
+    family: similarity
+    level: fragment
+    direction: neutral
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/similarity.rs
+  gini_diff:
+    family: similarity
+    level: fragment
+    direction: neutral
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/similarity.rs
+  wasserstein_mz:
+    family: similarity
+    level: fragment
+    direction: lower_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/similarity.rs
+  footrule_norm:
+    family: similarity
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/similarity.rs
+  rank_overlap_top3:
+    family: similarity
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/similarity.rs
+  top1_frag_match:
+    family: similarity
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/similarity.rs
+  top1_predicted_observed:
+    family: similarity
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/similarity.rs
+  frac_top3_predicted_observed:
+    family: similarity
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/similarity.rs
+  count_strong_predicted_absent:
+    family: similarity
+    level: fragment
+    direction: lower_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/similarity.rs
+  frac_predicted_absent:
+    family: similarity
+    level: fragment
+    direction: lower_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/similarity.rs
+  cosine_area:
+    family: similarity
+    level: peak
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/similarity.rs
+  pearson_area:
+    family: similarity
+    level: peak
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/similarity.rs
+  spectral_angle_area:
+    family: similarity
+    level: peak
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/similarity.rs
+  cosine_fullwindow:
+    family: similarity
+    level: peak
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/similarity.rs
+  stein_scott_weighted_dot:
+    family: similarity
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/similarity.rs
+  log_dot_product:
+    family: similarity
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/similarity.rs
+  spectral_log_evidence:
+    family: similarity
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/similarity.rs
+  scribe_score:
+    family: similarity
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/similarity.rs
+  log_dot_product_area:
+    family: similarity
+    level: peak
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/similarity.rs
+  spectral_log_evidence_area:
+    family: similarity
+    level: peak
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/similarity.rs
+  scribe_score_area:
+    family: similarity
+    level: peak
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/similarity.rs
+  cosine_high_ordinal:
+    family: similarity
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/similarity.rs
+  cosine_robust_trim1:
+    family: similarity
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/similarity.rs
+  cosine_robust_trim2:
+    family: similarity
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/similarity.rs
+  cosine_robust_trim3:
+    family: similarity
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/similarity.rs
+  spectral_entropy_similarity:
+    family: entropy
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/entropy.rs
+  weighted_spectral_entropy_similarity:
+    family: entropy
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/entropy.rs
+  spectral_entropy_similarity_sqrt:
+    family: entropy
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/entropy.rs
+  spectral_entropy_similarity_topk:
+    family: entropy
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/entropy.rs
+  spectral_entropy_similarity_area:
+    family: entropy
+    level: peak
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/entropy.rs
+  jensen_shannon_divergence:
+    family: entropy
+    level: fragment
+    direction: lower_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/entropy.rs
+  jeffreys_divergence:
+    family: entropy
+    level: fragment
+    direction: lower_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/entropy.rs
+  kl_obs_pred:
+    family: entropy
+    level: fragment
+    direction: lower_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/entropy.rs
+  kl_pred_obs:
+    family: entropy
+    level: fragment
+    direction: lower_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/entropy.rs
+  cross_entropy_obs_pred:
+    family: entropy
+    level: fragment
+    direction: lower_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/entropy.rs
+  obs_spectrum_entropy:
+    family: entropy
+    level: fragment
+    direction: neutral
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/entropy.rs
+  pred_spectrum_entropy:
+    family: entropy
+    level: fragment
+    direction: neutral
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/entropy.rs
+  entropy_diff:
+    family: entropy
+    level: fragment
+    direction: neutral
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/entropy.rs
+  entropy_ratio:
+    family: entropy
+    level: fragment
+    direction: neutral
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/entropy.rs
+  obs_normalized_entropy:
+    family: entropy
+    level: fragment
+    direction: neutral
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/entropy.rs
+  normalized_entropy_diff:
+    family: entropy
+    level: fragment
+    direction: neutral
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/entropy.rs
+  residual_spectrum_entropy:
+    family: entropy
+    level: fragment
+    direction: lower_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/entropy.rs
+  entropy_weight_obs:
+    family: entropy
+    level: fragment
+    direction: neutral
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/entropy.rs
+  frag_ref_corr_mean:
+    family: coelution
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/coelution.rs
+  frag_ref_corr_obsweighted:
+    family: coelution
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/coelution.rs
+  frag_ref_corr_min:
+    family: coelution
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/coelution.rs
+  frag_ref_corr_std:
+    family: coelution
+    level: fragment
+    direction: lower_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/coelution.rs
+  frag_ref_corr_sq_mean:
+    family: coelution
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/coelution.rs
+  frag_ref_corr_topk_weighted:
+    family: coelution
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/coelution.rs
+  n_frag_ref_corr_above_0_9:
+    family: coelution
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/coelution.rs
+  frac_frag_ref_corr_above_0_8:
+    family: coelution
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/coelution.rs
+  frag_ref_corr_mean_full:
+    family: coelution
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/coelution.rs
+  full_vs_peak_corr_gain:
+    family: coelution
+    level: fragment
+    direction: neutral
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/coelution.rs
+  pairwise_coelution_weighted:
+    family: coelution
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/coelution.rs
+  pairwise_coelution_min:
+    family: coelution
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/coelution.rs
+  pairwise_coelution_median:
+    family: coelution
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/coelution.rs
+  pairwise_coelution_std:
+    family: coelution
+    level: fragment
+    direction: lower_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/coelution.rs
+  pairwise_coelution_frac_negative:
+    family: coelution
+    level: fragment
+    direction: lower_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/coelution.rs
+  pairwise_coelution_hi:
+    family: coelution
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/coelution.rs
+  pairwise_coelution_lo:
+    family: coelution
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/coelution.rs
+  coelution_hi_lo_contrast:
+    family: coelution
+    level: fragment
+    direction: neutral
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/coelution.rs
+  coelution_corr_entropy:
+    family: coelution
+    level: fragment
+    direction: lower_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/coelution.rs
+  xcorr_shape_mean:
+    family: coelution
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/coelution.rs
+  xcorr_shape_min:
+    family: coelution
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/coelution.rs
+  xcorr_shape_std:
+    family: coelution
+    level: fragment
+    direction: lower_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/coelution.rs
+  xcorr_lag_mean_abs:
+    family: coelution
+    level: fragment
+    direction: lower_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/coelution.rs
+  xcorr_lag_std:
+    family: coelution
+    level: fragment
+    direction: lower_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/coelution.rs
+  xcorr_lag_iqr:
+    family: coelution
+    level: fragment
+    direction: lower_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/coelution.rs
+  xcorr_lag_frac_zero:
+    family: coelution
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/coelution.rs
+  xcorr_lag_max_abs:
+    family: coelution
+    level: fragment
+    direction: lower_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/coelution.rs
+  xcorr_lag_entropy:
+    family: coelution
+    level: fragment
+    direction: lower_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/coelution.rs
+  ref_xcorr_lag_mean:
+    family: coelution
+    level: fragment
+    direction: lower_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/coelution.rs
+  ref_xcorr_shape_mean:
+    family: coelution
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/coelution.rs
+  observed_sum_vs_template_corr:
+    family: coelution
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/coelution.rs
+  frag_loo_ref_corr_mean:
+    family: coelution
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/coelution.rs
+  frag_loo_ref_corr_min:
+    family: coelution
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/coelution.rs
+  frac_frags_apex_aligned:
+    family: coelution
+    level: peak
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/coelution.rs
+  top3_frag_ref_corr:
+    family: coelution
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/coelution.rs
+  by_cross_coelution:
+    family: coelution
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/coelution.rs
+  by_cross_lag_mean:
+    family: coelution
+    level: fragment
+    direction: lower_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/coelution.rs
+  charge_cross_coelution:
+    family: coelution
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/coelution.rs
+  explained_variance_ref:
+    family: interference
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/interference.rs
+  profile_residual_fraction:
+    family: interference
+    level: fragment
+    direction: lower_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/interference.rs
+  n_interfered_fragments:
+    family: interference
+    level: fragment
+    direction: lower_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/interference.rs
+  corrected_vs_raw_cos:
+    family: interference
+    level: fragment
+    direction: neutral
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/interference.rs
+  corrected_vs_raw_ratio:
+    family: interference
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/interference.rs
+  ifs_removed_count:
+    family: interference
+    level: fragment
+    direction: lower_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/interference.rs
+  ifs_removed_intensity_frac:
+    family: interference
+    level: fragment
+    direction: lower_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/interference.rs
+  ifs_corr_gain:
+    family: interference
+    level: fragment
+    direction: neutral
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/interference.rs
+  ifs_retained_frac:
+    family: interference
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/interference.rs
+  matched_frac_after_ifs:
+    family: interference
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/interference.rs
+  peak_to_full_area_ratio_profile:
+    family: interference
+    level: peak
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/interference.rs
+  peak_to_full_area_ratio_frag_mean:
+    family: interference
+    level: peak
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/interference.rs
+  peak_to_full_area_ratio_weighted:
+    family: interference
+    level: peak
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/interference.rs
+  out_of_peak_intensity_frac:
+    family: interference
+    level: peak
+    direction: lower_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/interference.rs
+  profile_corr_full_vs_peak_delta:
+    family: interference
+    level: fragment
+    direction: neutral
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/interference.rs
+  frac_frag_ref_corr_below_0_5:
+    family: interference
+    level: fragment
+    direction: lower_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/interference.rs
+  explained_apex_intensity_frac:
+    family: interference
+    level: peak
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/interference.rs
+  apex_purity:
+    family: interference
+    level: peak
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/interference.rs
+  interference_apex_residual_fraction:
+    family: interference
+    level: peak
+    direction: lower_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/interference.rs
+  dominant_frag_ref_corr:
+    family: interference
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/interference.rs
+  explained_variance_ratio:
+    family: interference
+    level: peak
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/interference.rs
+  second_component_fraction:
+    family: interference
+    level: peak
+    direction: lower_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/interference.rs
+  profile_second_peak_ratio:
+    family: interference
+    level: peak
+    direction: lower_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/interference.rs
+  n_competing_peaks_in_window:
+    family: interference
+    level: peak
+    direction: lower_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/interference.rs
+  matched_pred_intensity_fraction:
+    family: interference
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/interference.rs
+  top_pred_frag_matched:
+    family: interference
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/interference.rs
+  gaussian_fit_r2:
+    family: chromatographic
+    level: peak
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/chromatographic.rs
+  gaussian_cosine:
+    family: chromatographic
+    level: peak
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/chromatographic.rs
+  emg_fit_improvement:
+    family: chromatographic
+    level: peak
+    direction: neutral
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/chromatographic.rs
+  apex_prominence:
+    family: chromatographic
+    level: peak
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/chromatographic.rs
+  profile_peak_snr:
+    family: chromatographic
+    level: peak
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/chromatographic.rs
+  fwhm_seconds:
+    family: chromatographic
+    level: peak
+    direction: neutral
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/chromatographic.rs
+  fwhm_to_window_ratio:
+    family: chromatographic
+    level: peak
+    direction: neutral
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/chromatographic.rs
+  width_at_10pct:
+    family: chromatographic
+    level: peak
+    direction: neutral
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/chromatographic.rs
+  width_ratio_10_50:
+    family: chromatographic
+    level: peak
+    direction: neutral
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/chromatographic.rs
+  hwhm_asymmetry:
+    family: chromatographic
+    level: peak
+    direction: lower_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/chromatographic.rs
+  tailing_factor_usp:
+    family: chromatographic
+    level: peak
+    direction: neutral
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/chromatographic.rs
+  asymmetry_factor_10pct:
+    family: chromatographic
+    level: peak
+    direction: neutral
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/chromatographic.rs
+  apex_sharpness:
+    family: chromatographic
+    level: peak
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/chromatographic.rs
+  apex_curvature:
+    family: chromatographic
+    level: peak
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/chromatographic.rs
+  apex_to_boundary_ratio:
+    family: chromatographic
+    level: peak
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/chromatographic.rs
+  apex_dominance:
+    family: chromatographic
+    level: peak
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/chromatographic.rs
+  zigzag_index:
+    family: chromatographic
+    level: peak
+    direction: lower_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/chromatographic.rs
+  jaggedness:
+    family: chromatographic
+    level: peak
+    direction: lower_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/chromatographic.rs
+  roughness_2nd_deriv:
+    family: chromatographic
+    level: peak
+    direction: lower_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/chromatographic.rs
+  n_local_maxima:
+    family: chromatographic
+    level: peak
+    direction: lower_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/chromatographic.rs
+  modality:
+    family: chromatographic
+    level: peak
+    direction: lower_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/chromatographic.rs
+  rt_skewness:
+    family: chromatographic
+    level: peak
+    direction: neutral
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/chromatographic.rs
+  rt_excess_kurtosis:
+    family: chromatographic
+    level: peak
+    direction: neutral
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/chromatographic.rs
+  rt_std_seconds:
+    family: chromatographic
+    level: peak
+    direction: neutral
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/chromatographic.rs
+  mean_mode_offset:
+    family: chromatographic
+    level: peak
+    direction: lower_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/chromatographic.rs
+  fraction_area_within_fwhm:
+    family: chromatographic
+    level: peak
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/chromatographic.rs
+  triangle_area_similarity:
+    family: chromatographic
+    level: peak
+    direction: lower_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/chromatographic.rs
+  baseline_fraction:
+    family: chromatographic
+    level: peak
+    direction: neutral
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/chromatographic.rs
+  peak_completeness:
+    family: chromatographic
+    level: peak
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/chromatographic.rs
+  apex_centering_offset:
+    family: chromatographic
+    level: peak
+    direction: lower_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/chromatographic.rs
+  intensity_score:
+    family: chromatographic
+    level: peak
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/chromatographic.rs
+  total_xic_log:
+    family: chromatographic
+    level: peak
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/chromatographic.rs
+  frag_fwhm_cv:
+    family: chromatographic
+    level: fragment
+    direction: lower_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/chromatographic.rs
+  frag_fwhm_mean:
+    family: chromatographic
+    level: fragment
+    direction: neutral
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/chromatographic.rs
+  frag_apex_rt_dispersion:
+    family: chromatographic
+    level: peak
+    direction: lower_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/chromatographic.rs
+  frag_apex_rt_dispersion_weighted:
+    family: chromatographic
+    level: peak
+    direction: lower_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/chromatographic.rs
+  frag_apex_offset_from_profile_mean:
+    family: chromatographic
+    level: peak
+    direction: lower_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/chromatographic.rs
+  frag_gaussianity_mean:
+    family: chromatographic
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/chromatographic.rs
+  frag_gaussianity_weighted:
+    family: chromatographic
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/chromatographic.rs
+  frag_zigzag_mean:
+    family: chromatographic
+    level: fragment
+    direction: lower_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/chromatographic.rs
+  sumtrace_unweighted_gaussian_r2:
+    family: chromatographic
+    level: peak
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/chromatographic.rs
+  reference_profile_rt_entropy_peak:
+    family: chromatographic
+    level: peak
+    direction: lower_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/chromatographic.rs
+  reference_profile_rt_entropy_ratio:
+    family: chromatographic
+    level: peak
+    direction: neutral
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/chromatographic.rs
+  median_abs_frag_ppm:
+    family: mass_accuracy
+    level: fragment
+    direction: lower_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/mass_accuracy.rs
+  signed_mean_frag_ppm:
+    family: mass_accuracy
+    level: fragment
+    direction: neutral
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/mass_accuracy.rs
+  ppm_std:
+    family: mass_accuracy
+    level: fragment
+    direction: lower_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/mass_accuracy.rs
+  ppm_iqr:
+    family: mass_accuracy
+    level: fragment
+    direction: lower_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/mass_accuracy.rs
+  ppm_range:
+    family: mass_accuracy
+    level: fragment
+    direction: lower_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/mass_accuracy.rs
+  max_abs_frag_ppm:
+    family: mass_accuracy
+    level: fragment
+    direction: lower_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/mass_accuracy.rs
+  intensity_weighted_abs_ppm:
+    family: mass_accuracy
+    level: fragment
+    direction: lower_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/mass_accuracy.rs
+  intensity_weighted_signed_ppm:
+    family: mass_accuracy
+    level: fragment
+    direction: neutral
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/mass_accuracy.rs
+  intensity_weighted_ppm_std:
+    family: mass_accuracy
+    level: fragment
+    direction: lower_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/mass_accuracy.rs
+  lib_weighted_abs_ppm:
+    family: mass_accuracy
+    level: fragment
+    direction: lower_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/mass_accuracy.rs
+  frac_frag_within_half_tol:
+    family: mass_accuracy
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/mass_accuracy.rs
+  high_ppm_intensity_frac:
+    family: mass_accuracy
+    level: fragment
+    direction: lower_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/mass_accuracy.rs
+  ppm_intensity_anticorr:
+    family: mass_accuracy
+    level: fragment
+    direction: lower_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/mass_accuracy.rs
+  mass_error_mz_trend:
+    family: mass_accuracy
+    level: fragment
+    direction: lower_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/mass_accuracy.rs
+  mean_abs_mz_error_da:
+    family: mass_accuracy
+    level: fragment
+    direction: lower_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/mass_accuracy.rs
+  mass_evidence_gauss:
+    family: mass_accuracy
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/mass_accuracy.rs
+  mass_log_evidence:
+    family: mass_accuracy
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/mass_accuracy.rs
+  n_matched_b:
+    family: ion_series
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/ion_series.rs
+  n_matched_y:
+    family: ion_series
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/ion_series.rs
+  frac_matched_b:
+    family: ion_series
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/ion_series.rs
+  frac_matched_y:
+    family: ion_series
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/ion_series.rs
+  by_count_balance:
+    family: ion_series
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/ion_series.rs
+  by_intensity_ratio:
+    family: ion_series
+    level: fragment
+    direction: neutral
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/ion_series.rs
+  by_ratio_agreement:
+    family: ion_series
+    level: fragment
+    direction: lower_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/ion_series.rs
+  by_ratio_consistency:
+    family: ion_series
+    level: fragment
+    direction: lower_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/ion_series.rs
+  longest_b_run:
+    family: ion_series
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/ion_series.rs
+  longest_y_run:
+    family: ion_series
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/ion_series.rs
+  longest_run_max:
+    family: ion_series
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/ion_series.rs
+  longest_run_frac_length:
+    family: ion_series
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/ion_series.rs
+  series_coverage_b:
+    family: ion_series
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/ion_series.rs
+  series_coverage_y:
+    family: ion_series
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/ion_series.rs
+  sequence_coverage:
+    family: ion_series
+    level: candidate
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/ion_series.rs
+  series_gap_fraction:
+    family: ion_series
+    level: fragment
+    direction: lower_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/ion_series.rs
+  by_complement_count:
+    family: ion_series
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/ion_series.rs
+  by_complement_mz_consistency:
+    family: ion_series
+    level: fragment
+    direction: lower_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/ion_series.rs
+  by_complement_coelution:
+    family: ion_series
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/ion_series.rs
+  ordinal_intensity_concordance_y:
+    family: ion_series
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/ion_series.rs
+  ordinal_intensity_concordance_b:
+    family: ion_series
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/ion_series.rs
+  series_coelution_y:
+    family: ion_series
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/ion_series.rs
+  series_coelution_b:
+    family: ion_series
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/ion_series.rs
+  spectral_angle_b:
+    family: ion_series
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/ion_series.rs
+  spectral_angle_y:
+    family: ion_series
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/ion_series.rs
+  pearson_b:
+    family: ion_series
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/ion_series.rs
+  pearson_y:
+    family: ion_series
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/ion_series.rs
+  cosine_charge1:
+    family: ion_series
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/ion_series.rs
+  cosine_charge2:
+    family: ion_series
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/ion_series.rs
+  charge_corr_balance:
+    family: ion_series
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/ion_series.rs
+  mean_matched_ordinal_norm:
+    family: ion_series
+    level: fragment
+    direction: neutral
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/ion_series.rs
+  by_ion_contiguous_intensity:
+    family: ion_series
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/ion_series.rs
+  by_ion_contiguous_lib_frac:
+    family: ion_series
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/ion_series.rs
+  both_series_present:
+    family: ion_series
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/ion_series.rs
+  ms1_isotope_cosine_apex:
+    family: ms1
+    level: precursor
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/ms1.rs
+  ms1_isotope_spectral_angle_apex:
+    family: ms1
+    level: precursor
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/ms1.rs
+  ms1_isotope_chi2_apex:
+    family: ms1
+    level: precursor
+    direction: lower_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/ms1.rs
+  ms1_isotope_manhattan_apex:
+    family: ms1
+    level: precursor
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/ms1.rs
+  iso_ratio_1_0:
+    family: ms1
+    level: precursor
+    direction: neutral
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/ms1.rs
+  iso_ratio_2_0:
+    family: ms1
+    level: precursor
+    direction: neutral
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/ms1.rs
+  iso_plus1_ratio_dev:
+    family: ms1
+    level: precursor
+    direction: lower_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/ms1.rs
+  iso_plus2_ratio_dev:
+    family: ms1
+    level: precursor
+    direction: lower_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/ms1.rs
+  iso_minus_one_fraction:
+    family: ms1
+    level: precursor
+    direction: lower_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/ms1.rs
+  iso_overlap_flag:
+    family: ms1
+    level: precursor
+    direction: lower_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/ms1.rs
+  log_ms1_mono:
+    family: ms1
+    level: precursor
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/ms1.rs
+  ms1_total_isotope_log:
+    family: ms1
+    level: precursor
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/ms1.rs
+  has_ms1_signal:
+    family: ms1
+    level: precursor
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/ms1.rs
+  ms1_isotope_apex_entropy_3:
+    family: ms1
+    level: precursor
+    direction: neutral
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/ms1.rs
+  ms1_m1_entropy_contribution:
+    family: ms1
+    level: precursor
+    direction: neutral
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/ms1.rs
+  ms1_ms2_time_corr:
+    family: ms1
+    level: precursor
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/ms1.rs
+  ms1_ms2_envelope_time_corr:
+    family: ms1
+    level: precursor
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/ms1.rs
+  ms1_iso_coelution:
+    family: ms1
+    level: precursor
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/ms1.rs
+  ms1_ms2_apex_rt_delta:
+    family: ms1
+    level: precursor
+    direction: lower_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/ms1.rs
+  ms1_iso_ratio_stability:
+    family: ms1
+    level: precursor
+    direction: lower_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/ms1.rs
+  ms1_mono_gaussianity:
+    family: ms1
+    level: precursor
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/ms1.rs
+  ms1_ms2_fwhm_ratio:
+    family: ms1
+    level: precursor
+    direction: neutral
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/ms1.rs
+  ms1_isotope_corr_xic:
+    family: ms1
+    level: precursor
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/ms1.rs
+  ms1_envelope_over_time_corr:
+    family: ms1
+    level: precursor
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/ms1.rs
+  ms1_isotope_xic_shape_consistency:
+    family: ms1
+    level: precursor
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/ms1.rs
+  rt_error_signed:
+    family: rt
+    level: candidate
+    direction: neutral
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/rt.rs
+  rt_error_abs@rt:
+    family: rt
+    level: candidate
+    direction: lower_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/rt.rs
     dropped_collision: true
-  "rt_error_squared":
-    family: "rt"
-    level: "candidate"
-    direction: "lower_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/rt.rs"
-  "rt_error_signed_norm_gradient":
-    family: "rt"
-    level: "run"
-    direction: "neutral"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/rt.rs"
-  "rt_error_abs_norm_gradient":
-    family: "rt"
-    level: "run"
-    direction: "lower_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/rt.rs"
-  "observed_rt_raw":
-    family: "rt"
-    level: "candidate"
-    direction: "neutral"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/rt.rs"
-  "predicted_rt_raw":
-    family: "rt"
-    level: "candidate"
-    direction: "neutral"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/rt.rs"
-  "observed_rt_fraction":
-    family: "rt"
-    level: "run"
-    direction: "neutral"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/rt.rs"
-  "predicted_rt_fraction":
-    family: "rt"
-    level: "run"
-    direction: "neutral"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/rt.rs"
-  "rt_error_over_peak_width":
-    family: "rt"
-    level: "peak"
-    direction: "lower_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/rt.rs"
-  "rt_error_over_fwhm":
-    family: "rt"
-    level: "peak"
-    direction: "lower_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/rt.rs"
-  "rt_diff_profile_apex":
-    family: "rt"
-    level: "peak"
-    direction: "lower_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/rt.rs"
-  "predicted_rt_in_gradient":
-    family: "rt"
-    level: "run"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/rt.rs"
-  "log_seed_hyperscore":
-    family: "novel"
-    level: "candidate"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/novel.rs"
-  "seed_hyperscore_per_matched":
-    family: "novel"
-    level: "candidate"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/novel.rs"
-  "seed_identified@novel":
-    family: "novel"
-    level: "candidate"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/novel.rs"
+  rt_error_squared:
+    family: rt
+    level: candidate
+    direction: lower_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/rt.rs
+  rt_error_signed_norm_gradient:
+    family: rt
+    level: run
+    direction: neutral
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/rt.rs
+  rt_error_abs_norm_gradient:
+    family: rt
+    level: run
+    direction: lower_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/rt.rs
+  observed_rt_raw:
+    family: rt
+    level: candidate
+    direction: neutral
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/rt.rs
+  predicted_rt_raw:
+    family: rt
+    level: candidate
+    direction: neutral
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/rt.rs
+  observed_rt_fraction:
+    family: rt
+    level: run
+    direction: neutral
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/rt.rs
+  predicted_rt_fraction:
+    family: rt
+    level: run
+    direction: neutral
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/rt.rs
+  rt_error_over_peak_width:
+    family: rt
+    level: peak
+    direction: lower_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/rt.rs
+  rt_error_over_fwhm:
+    family: rt
+    level: peak
+    direction: lower_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/rt.rs
+  rt_diff_profile_apex:
+    family: rt
+    level: peak
+    direction: lower_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/rt.rs
+  predicted_rt_in_gradient:
+    family: rt
+    level: run
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/rt.rs
+  log_seed_hyperscore:
+    family: novel
+    level: candidate
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/novel.rs
+  seed_hyperscore_per_matched:
+    family: novel
+    level: candidate
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/novel.rs
+  seed_identified@novel:
+    family: novel
+    level: candidate
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/novel.rs
     dropped_collision: true
-  "peptide_length@novel":
-    family: "novel"
-    level: "candidate"
-    direction: "neutral"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/novel.rs"
+  peptide_length@novel:
+    family: novel
+    level: candidate
+    direction: neutral
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/novel.rs
     dropped_collision: true
-  "precursor_charge":
-    family: "novel"
-    level: "precursor"
-    direction: "neutral"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/novel.rs"
-  "charge_is_2":
-    family: "novel"
-    level: "precursor"
-    direction: "neutral"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/novel.rs"
-  "charge_is_3":
-    family: "novel"
-    level: "precursor"
-    direction: "neutral"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/novel.rs"
-  "charge_is_4plus":
-    family: "novel"
-    level: "precursor"
-    direction: "neutral"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/novel.rs"
-  "precursor_mass":
-    family: "novel"
-    level: "precursor"
-    direction: "neutral"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/novel.rs"
-  "log_total_matched_intensity":
-    family: "novel"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/novel.rs"
-  "n_matched_frags":
-    family: "novel"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/novel.rs"
-  "n_predicted_frags":
-    family: "novel"
-    level: "fragment"
-    direction: "neutral"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/novel.rs"
-  "frag_corr_peakmax":
-    family: "nonzero"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/nonzero.rs"
-  "frag_cosine_peakmax":
-    family: "nonzero"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/nonzero.rs"
-  "spectral_angle_peakmax":
-    family: "nonzero"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/nonzero.rs"
-  "frag_corr_matched_nz":
-    family: "nonzero"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/nonzero.rs"
-  "frag_cosine_matched_nz":
-    family: "nonzero"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/nonzero.rs"
-  "peakmax_apex_gain":
-    family: "nonzero"
-    level: "fragment"
-    direction: "lower_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/nonzero.rs"
-  "n_frag_present_inpeak":
-    family: "nonzero"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/nonzero.rs"
-  "frac_frag_present_inpeak":
-    family: "nonzero"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/nonzero.rs"
-  "coelution_mean_bothpos":
-    family: "nonzero"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/nonzero.rs"
-  "coelution_mean_summpos":
-    family: "nonzero"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/nonzero.rs"
-  "ref_corr_nz":
-    family: "nonzero"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/nonzero.rs"
-  "profile_cos_nz":
-    family: "nonzero"
-    level: "fragment"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/nonzero.rs"
-  "rank_corr_vs_apex_mean":
-    family: "order_consistency"
-    level: "peak"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/order_consistency.rs"
-  "rank_corr_vs_apex_std":
-    family: "order_consistency"
-    level: "peak"
-    direction: "lower_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/order_consistency.rs"
-  "rank_corr_adjacent_mean":
-    family: "order_consistency"
-    level: "peak"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/order_consistency.rs"
-  "kendall_vs_apex_mean":
-    family: "order_consistency"
-    level: "peak"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/order_consistency.rs"
-  "top1_frag_persistence":
-    family: "order_consistency"
-    level: "peak"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/order_consistency.rs"
-  "top2_order_persistence":
-    family: "order_consistency"
-    level: "peak"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/order_consistency.rs"
-  "argmax_frag_entropy":
-    family: "order_consistency"
-    level: "peak"
-    direction: "lower_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/order_consistency.rs"
-  "self_cosine_vs_apex_mean":
-    family: "order_consistency"
-    level: "peak"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/order_consistency.rs"
-  "n_peak_scans":
-    family: "peak_scans"
-    level: "peak"
-    direction: "higher_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/peak_scans.rs"
-  "peak_window_degenerate":
-    family: "peak_scans"
-    level: "peak"
-    direction: "lower_better"
-    source_file: "rust/mumdia/crates/mumdia/src/stages/features/peak_scans.rs"
+  precursor_charge:
+    family: novel
+    level: precursor
+    direction: neutral
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/novel.rs
+  charge_is_2:
+    family: novel
+    level: precursor
+    direction: neutral
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/novel.rs
+  charge_is_3:
+    family: novel
+    level: precursor
+    direction: neutral
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/novel.rs
+  charge_is_4plus:
+    family: novel
+    level: precursor
+    direction: neutral
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/novel.rs
+  precursor_mass:
+    family: novel
+    level: precursor
+    direction: neutral
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/novel.rs
+  log_total_matched_intensity:
+    family: novel
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/novel.rs
+  n_matched_frags:
+    family: novel
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/novel.rs
+  n_predicted_frags:
+    family: novel
+    level: fragment
+    direction: neutral
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/novel.rs
+  frag_corr_peakmax:
+    family: nonzero
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/nonzero.rs
+  frag_cosine_peakmax:
+    family: nonzero
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/nonzero.rs
+  spectral_angle_peakmax:
+    family: nonzero
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/nonzero.rs
+  frag_corr_matched_nz:
+    family: nonzero
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/nonzero.rs
+  frag_cosine_matched_nz:
+    family: nonzero
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/nonzero.rs
+  peakmax_apex_gain:
+    family: nonzero
+    level: fragment
+    direction: lower_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/nonzero.rs
+  n_frag_present_inpeak:
+    family: nonzero
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/nonzero.rs
+  frac_frag_present_inpeak:
+    family: nonzero
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/nonzero.rs
+  coelution_mean_bothpos:
+    family: nonzero
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/nonzero.rs
+  coelution_mean_summpos:
+    family: nonzero
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/nonzero.rs
+  ref_corr_nz:
+    family: nonzero
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/nonzero.rs
+  profile_cos_nz:
+    family: nonzero
+    level: fragment
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/nonzero.rs
+  rank_corr_vs_apex_mean:
+    family: order_consistency
+    level: peak
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/order_consistency.rs
+  rank_corr_vs_apex_std:
+    family: order_consistency
+    level: peak
+    direction: lower_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/order_consistency.rs
+  rank_corr_adjacent_mean:
+    family: order_consistency
+    level: peak
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/order_consistency.rs
+  kendall_vs_apex_mean:
+    family: order_consistency
+    level: peak
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/order_consistency.rs
+  top1_frag_persistence:
+    family: order_consistency
+    level: peak
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/order_consistency.rs
+  top2_order_persistence:
+    family: order_consistency
+    level: peak
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/order_consistency.rs
+  argmax_frag_entropy:
+    family: order_consistency
+    level: peak
+    direction: lower_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/order_consistency.rs
+  self_cosine_vs_apex_mean:
+    family: order_consistency
+    level: peak
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/order_consistency.rs
+  n_peak_scans:
+    family: peak_scans
+    level: peak
+    direction: higher_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/peak_scans.rs
+  peak_window_degenerate:
+    family: peak_scans
+    level: peak
+    direction: lower_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/peak_scans.rs
+  frag_apex_rt_std:
+    family: apex_dispersion
+    level: peak_group
+    direction: lower_is_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/apex_dispersion.rs
+  frag_apex_rt_mad:
+    family: apex_dispersion
+    level: peak_group
+    direction: lower_is_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/apex_dispersion.rs
+  frag_apex_max_dev:
+    family: apex_dispersion
+    level: peak_group
+    direction: lower_is_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/apex_dispersion.rs
+  frag_apex_mean_dev:
+    family: apex_dispersion
+    level: peak_group
+    direction: lower_is_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/apex_dispersion.rs
+  frag_apex_agree_frac:
+    family: apex_dispersion
+    level: peak_group
+    direction: higher_is_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/apex_dispersion.rs
+  precursor_frag_apex_delta:
+    family: apex_dispersion
+    level: peak_group
+    direction: lower_is_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/apex_dispersion.rs
+  peak_symmetry:
+    family: apex_dispersion
+    level: peak_group
+    direction: target_0.5
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/apex_dispersion.rs
+  peak_tailing:
+    family: apex_dispersion
+    level: peak_group
+    direction: target_1.0
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/apex_dispersion.rs
+  peak_n_local_maxima:
+    family: apex_dispersion
+    level: peak_group
+    direction: lower_is_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/apex_dispersion.rs
+  peak_shoulder_score:
+    family: apex_dispersion
+    level: peak_group
+    direction: lower_is_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/apex_dispersion.rs
+  peak_fwhm_scans:
+    family: apex_dispersion
+    level: peak_group
+    direction: ambiguous
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/apex_dispersion.rs
+  peak_truncation:
+    family: apex_dispersion
+    level: peak_group
+    direction: lower_is_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/apex_dispersion.rs
+  apex_frac_of_window:
+    family: apex_dispersion
+    level: peak_group
+    direction: ambiguous
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/apex_dispersion.rs
+  frag_mass_err_median:
+    family: mass_uncertainty
+    level: peak_group
+    direction: target_0
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/mass_uncertainty.rs
+  frag_mass_err_abs_median:
+    family: mass_uncertainty
+    level: peak_group
+    direction: lower_is_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/mass_uncertainty.rs
+  frag_mass_err_std:
+    family: mass_uncertainty
+    level: peak_group
+    direction: lower_is_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/mass_uncertainty.rs
+  frag_mass_err_iqr:
+    family: mass_uncertainty
+    level: peak_group
+    direction: lower_is_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/mass_uncertainty.rs
+  frag_mass_err_max_abs:
+    family: mass_uncertainty
+    level: peak_group
+    direction: lower_is_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/mass_uncertainty.rs
+  frag_mass_err_range:
+    family: mass_uncertainty
+    level: peak_group
+    direction: lower_is_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/mass_uncertainty.rs
+  effective_frag_count:
+    family: mass_uncertainty
+    level: peak_group
+    direction: higher_is_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/mass_uncertainty.rs
+  evidence_concentration:
+    family: mass_uncertainty
+    level: peak_group
+    direction: lower_is_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/mass_uncertainty.rs
+  frac_top3_pred_observed:
+    family: mass_uncertainty
+    level: peak_group
+    direction: higher_is_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/mass_uncertainty.rs
+  frac_top5_pred_observed:
+    family: mass_uncertainty
+    level: peak_group
+    direction: higher_is_better
+    source_file: rust/mumdia/crates/mumdia/src/stages/features/mass_uncertainty.rs

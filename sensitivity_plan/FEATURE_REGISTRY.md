@@ -11,6 +11,24 @@ family ablations (§4).
 A machine-readable copy of this table is `feature_registry.yaml` at the repository
 root (one entry per feature: `family`, `level`, `direction`, `source_file`).
 
+> Update: the Extended battery now has **383** features (was 356 at first
+> writing; the registry documents 383 including the Minimal/Rich tiers). Two
+> families were added this session (append-only, so the Extended-count test is
+> dynamic and stays green):
+> - **apex_dispersion** (13, `stages/features/apex_dispersion.rs`, P5.3): per-
+>   fragment apex-RT scatter (std/mad/max/mean deviation, agreement fraction),
+>   precursor-fragment apex delta, and consensus peak shape (symmetry, tailing,
+>   local maxima, shoulder, FWHM, truncation, apex position in window).
+> - **mass_uncertainty** (10, `stages/features/mass_uncertainty.rs`, P5.1/P5.2):
+>   fragment mass-error distribution (median/abs-median/std/IQR/max/range),
+>   effective fragment count, evidence concentration, and fraction of top-3/top-5
+>   predicted ions observed (breadth of the strong ions).
+>
+> These are computed from the per-PSM `Evidence` (peak-bounded traces + mass
+> errors) and are interference-resistant (shape and breadth, not absolute
+> intensity). They are registered in `feature_registry.yaml`; the per-family
+> tables below predate them.
+
 ## 1. Feature-set tiers
 
 The active feature set is selected by `features.set` (`FeatureSet` enum,

@@ -115,3 +115,38 @@ before dropping any family.
 ## Recommended next steps
 
 - See `NEXT_STEPS.md` (written at end of session).
+
+---
+
+## Session 2 (implement-more push) — full backlog status
+
+Branch `feat/sensitivity-improvements`. All Rust changes keep the suite green
+(95 tests) and are default-off / behaviour-preserving unless noted.
+
+### Done this push
+- P0.1 `scripts/search_space_manifest.py` (effective manifest + DIA-NN/declared parity, `--fail-on-mismatch`).
+- P0.2 `scripts/normalize_output.py` (MuMDIA scored -> spec 02 §4 common schema; `--reported-only` = 9,540 on E. coli).
+- P4.2 `scripts/feature_audit.py` (missingness/quantiles/constant, target-decoy-entrapment separation, redundancy clusters, leakage/intensity warnings). Finding on E. coli: 355 audited, 3 constant, 0 leakage-flagged (decoy-vs-entrapment gap <=0.043), 54 clusters.
+- P4.3 already done (`feature_ablation.py`); full both-model out_ecoli run produced in `accept/`.
+- P5.1 `mass_uncertainty` family (10) + P5.3 `apex_dispersion` family (13). Registry now 383 features.
+- P5.2 partially covered by `mass_uncertainty` (fragment-evidence distributions).
+- Apex evidence-count option `extract.apex_evidence_rank` (the interference insight: pick the apex by co-eluting fragment breadth, not intensity). Default off.
+- P3.2/P3.3 `rt_im_train.adaptive_rt_window` (per-RT-region local residual window, clamped). Default off.
+- P7.1 `scripts/benchmark_report.py` (self-contained HTML; smoke -> `accept/benchmark_report.html`).
+- P7.2 `scripts/candidate_diagnostics.py` (per-candidate chromatogram + feature bundle).
+
+### Still TODO (large or non-additive; documented in NEXT_STEPS.md)
+- P1.1/P1.2/P1.3 top-K peak RETENTION wired into scoring (enumerator + config + opportunity analysis done; the downstream rewire that carries multiple peaks per candidate through features/compete/rescore + a peak-selection model is the large remaining piece). The reference_apex_topk analysis already measures the opportunity (rank-1 47.9% full).
+- P2.2 peak-group conflict graph + P2.3 full conflict-feature list (only `contested_frac` + the new evidence-breadth features exist; a cross-candidate claimant graph is not built).
+- P3.1 two-pass mass calibration (RT adaptive window done; mass side not).
+- P5.4 remaining MS1/isotope features; P5.5 candidate-ambiguity margins (needs cross-candidate neighborhood).
+- P6.2 localization competition + P6.3 staged modification search (need site-determining-ion scoring).
+- P0.1 parity check not yet run against a real DIA-NN report (needs the report).
+
+### Acceptance validation status
+- Full out_ecoli ablation (logreg + hgb) produced in `accept/`. HYE + TTOF runs
+  were launched (`run_accept.sh`); TTOF sample identity is unconfirmed (see the
+  chat log). None of the new default-off knobs (apex_evidence_rank,
+  adaptive_rt_window, competition modes) has an engine-gain measurement yet: each
+  must pass the entrapment-holdout gate on >=2 datasets before being enabled by
+  default (spec 05 §6). That validation loop is the next action, not more code.
