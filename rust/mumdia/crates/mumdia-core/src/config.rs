@@ -531,6 +531,15 @@ pub struct ExtractConfig {
     /// and writes `<out-psms>.audit.parquet` (spec 01 §4 / P0.3). Near-zero cost
     /// when false (no per-candidate audit allocation). Default false (production).
     pub emit_candidate_audit: bool,
+    /// Evidence-count apex selection: choose the apex scan by the NUMBER of distinct
+    /// co-eluting predicted fragments present (breadth of evidence), using observed
+    /// signature-ion intensity only as a sub-integer tiebreak. In wide-window DIA a
+    /// single fragment m/z channel is chimeric, so the tallest scan is often a
+    /// co-isolated interferent; the scan where the most of the peptide's own
+    /// predicted transitions co-elute is a more reliable apex. `false` (default)
+    /// keeps the legacy signature-intensity apex. The rolling distinct-fragment
+    /// count (`apex_count_window`) still gates which scans qualify in both modes.
+    pub apex_evidence_rank: bool,
 }
 impl Default for ExtractConfig {
     fn default() -> Self {
@@ -565,6 +574,7 @@ impl Default for ExtractConfig {
             ms1_rescue: false,    // opt-in; relaxes acceptance, validate FDR first
             retain_top_peaks: 1,  // legacy single-apex behaviour (K=1)
             emit_candidate_audit: false, // diagnostic; off in production
+            apex_evidence_rank: false,   // legacy signature-intensity apex
         }
     }
 }

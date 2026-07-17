@@ -720,10 +720,24 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
                 continue;
             }
             let sig_sum: f32 = sig.iter().map(|&o| map.get(&o).copied().unwrap_or(0.0)).sum();
-            let score = if use_prior {
-                sig_sum * (-0.5 * ((*rt - rt_cal_c) / rt_prior_sigma).powi(2)).exp() as f32
+            let prior = if use_prior {
+                (-0.5 * ((*rt - rt_cal_c) / rt_prior_sigma).powi(2)).exp() as f32
             } else {
-                sig_sum
+                1.0
+            };
+            let score = if p.cfg.apex_evidence_rank {
+                // Breadth-of-evidence apex: the count of distinct co-eluting
+                // predicted fragments at this scan dominates; observed signature
+                // intensity only breaks ties within [0,1). Interference-resistant
+                // in wide-window DIA (a chimeric-intensity spike cannot outvote a
+                // scan where more of the peptide's own transitions co-elute).
+                let n_frag = map.len() as f32;
+                let tie = sig_sum / (sig_sum + 1.0);
+                (n_frag + tie) * prior
+            } else {
+                // Legacy: signature-ion observed intensity (x RT prior). Bit-identical
+                // to the previous behaviour (prior = 1.0 when the RT prior is off).
+                sig_sum * prior
             };
             if score > best_sig {
                 best_sig = score;
