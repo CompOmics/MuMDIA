@@ -8,6 +8,16 @@ The central principle is:
 
 A DIA-NN-only identification can disappear because it was absent from the search space, never generated as a candidate, extracted incorrectly, assigned to the wrong chromatographic peak, outcompeted by another peptide interpretation, ranked poorly, or removed by false-discovery-rate filtering.
 
+## Implementation status
+
+The spec files in this directory (01-06) are the requirements and stay fixed. The
+derived docs track what is built: `IMPLEMENTATION_STATUS.md` is the source of truth
+for progress (candidate audit + `mumdia audit`, top-K peak retention, competition
+modes, two-pass mass calibration, adaptive RT window, two new feature families, and
+ten diagnostic scripts are all implemented, default-off). `ARCHITECTURE_MAP.md` maps
+the code, `BENCHMARK_GUIDE.md` documents the diagnostics, and `NEXT_STEPS.md` lists
+the remaining work with exact hook sites.
+
 ## Documentation map
 
 1. [`01_workflow_and_gap_analysis.md`](01_workflow_and_gap_analysis.md)  

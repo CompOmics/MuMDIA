@@ -69,8 +69,14 @@ python scripts/reference_apex_topk.py \
   --chrom out_ecoli/chrom.parquet \
   [--diann diann_report.tsv] \
   [--out out_ecoli/topk_metrics.json] \
-  [--max-candidates 20000] [--bound-fraction 0.333] [--rt-tol-s 10]
+  [--max-candidates 20000] [--bound-fraction 0.333] [--rt-tol-s 10] \
+  [--rank-by area|count]
 ```
+
+`--rank-by count` (default `area`) ranks the enumerated peaks by co-eluting
+fragment breadth (evidence count) instead of integrated area. This mirrors the
+engine's `extract.apex_evidence_rank` option and is the ranking the peak-selection
+analysis found stronger than area.
 
 Self analysis (no DIA-NN needed) on 20,000 E. coli candidates:
 
@@ -133,7 +139,10 @@ python scripts/entrapment_holdout.py out_ecoli/comp.parquet --q 0.01
 
 Use this as the accept/reject gate for every change (spec 05 §6): a change ships only
 if held-out entrapment identifications rise without FDP inflation, reproduced on a
-second dataset.
+second dataset. The on-disk SWATH TTOF file is NOT a valid second dataset here: it
+produced 0 IDs against the Ox HYE library (the sample does not match the library). A
+genuine second labelled run (a matching TTOF library, or a ProteoBench HYE run) is
+still required for the held-out reproduction criterion.
 
 ## 5. End-to-end recipe for one experiment (spec 05)
 
@@ -144,6 +153,135 @@ second dataset.
 5. `python scripts/entrapment_holdout.py ...` -> honest FDP + identification count.
 6. Change ONE component (e.g. `compete.mode`, `retain_top_peaks`, a feature family),
    rerun 1-5, and compare at matched empirical FDP. Keep raw candidate outputs.
+
+## 6. Diagnostic and analysis tool reference
+
+Every diagnostic script in `scripts/` added by the sensitivity program, with its
+one-line purpose and CLI. All are non-invasive (read artifacts, write new files,
+never modify the engine or its inputs) and use the `py312_mumdia` interpreter.
+The first three are covered in detail above; the rest are documented here.
+
+### `reference_apex_topk.py` (top-K peak recall)
+
+Detailed in §2. How often the selected apex is the strongest peak; with `--diann`,
+whether the reference apex is within the top-K MuMDIA peaks.
+
+```
+python scripts/reference_apex_topk.py --psms psms.parquet --chrom chrom.parquet \
+  [--diann report.tsv] [--out topk.json] [--rank-by area|count] [--max-candidates N]
+```
+
+### `feature_ablation.py` (feature-family ablation)
+
+Detailed in §3. Grouped cross-validated per-family ablation at empirical FDP.
+
+```
+python scripts/feature_ablation.py --features comp.parquet --registry feature_registry.yaml \
+  --out ablation [--model both] [--folds 3] [--fdp 0.01] [--max-rows 60000]
+```
+
+### `feature_audit.py` (per-feature data-quality audit)
+
+Per-feature missingness / quantiles / constant detection, target-decoy-entrapment
+separation, redundancy clusters, and leakage / intensity warnings (spec 03 §5).
+
+```
+python scripts/feature_audit.py --features comp.parquet --registry feature_registry.yaml \
+  [--out DIR] [--max-rows N] [--entrapment-substr _HUMAN] [--real-substr _ECOLI] \
+  [--redundancy-threshold 0.95]
+```
+
+Finding on E. coli: 355 features audited, 3 constant, 0 leakage-flagged
+(decoy-vs-entrapment gap <= 0.043), 54 redundancy clusters.
+
+### `benchmark_report.py` (self-contained HTML report)
+
+Assembles the audit waterfall, top-K recall, ablation, and entrapment FDP into one
+portable HTML file (spec 02 §8). All inputs optional; each present section renders.
+
+```
+python scripts/benchmark_report.py --out report.html \
+  [--audit-metrics audit.metrics.json] [--audit candidate_audit.parquet] \
+  [--topk topk.json] [--ablation ablation] [--entrapment holdout.txt] [--title "..."]
+```
+
+### `candidate_diagnostics.py` (per-candidate bundle)
+
+For selected `candidate_id`s, exports overlaid fragment chromatograms
+(`fragments.png`), predicted-vs-observed intensities, and a `candidate.json` with
+metadata + all features (spec 02 §9).
+
+```
+python scripts/candidate_diagnostics.py --chrom chrom.parquet --psms psms.parquet \
+  [--comp comp.parquet] [--scored scored.parquet] \
+  [--candidates 12,34,56 | --candidates-file ids.txt] [--out candidate_diag]
+```
+
+### `search_space_manifest.py` (P0.1 search-space parity)
+
+Derives an effective search-space manifest from a MuMDIA library and optionally
+compares it to a declared manifest or a DIA-NN report; `--fail-on-mismatch` exits
+nonzero on a benchmark-invalidating difference.
+
+```
+python scripts/search_space_manifest.py --library-precursors lib_precursors.parquet \
+  [--out manifest.yaml] [--compare declared.yaml] [--diann report.parquet] \
+  [--fail-on-mismatch]
+```
+
+### `normalize_output.py` (P0.2 common-schema converter)
+
+Converts a MuMDIA scored table to the spec 02 §4 common schema (`run_id,
+precursor_id, stripped_sequence, modified_sequence, charge, ..., q_value, quantity`).
+
+```
+python scripts/normalize_output.py --scored scored.parquet [--out normalized.parquet] \
+  [--run-id ecoli] [--reported-only | --all-candidates] [--q 0.01]
+```
+
+`--reported-only` on E. coli keeps 9,540 rows (q <= 0.01); default keeps all
+candidates.
+
+### `conflict_features.py` (cross-candidate conflict features)
+
+Fragment-claimant index + peak-group conflict graph + contested / unique / ambiguity
+features (spec 04 §5, P2.1-2.3, P5.5), one row per candidate to `conflict.parquet`,
+joinable into rescoring by `candidate_id`.
+
+```
+python scripts/conflict_features.py --psms psms.parquet --chrom chrom.parquet \
+  [--comp comp.parquet] [--out conflict.parquet] [--frag-tol-ppm 20] [--rt-window-s 30] \
+  [--max-candidates N]
+```
+
+### `localization.py` (modification-localization competition)
+
+Groups localization variants (same stripped sequence + mod multiset + charge,
+different sites) and scores site-determining ions (spec 06 P6.2) to
+`localization.parquet`.
+
+```
+python scripts/localization.py --psms psms.parquet --chrom chrom.parquet \
+  [--out localization.parquet] [--rt-window-s 30] [--max-candidates N]
+```
+
+Finding on E. coli: 0 ambiguity groups (as expected for an unmodified search).
+
+### `peak_selection_model.py` (top-K peak ranker)
+
+Grouped out-of-fold ranker over the `<psms>.peaks.parquet` table emitted by
+`extract` when `retain_top_peaks > 1` (spec 03 §6): given several retained peaks for
+one precursor, which is correct? Reports top-1 / top-3 accuracy vs raw
+evidence-count and area rankings. Honest labels need `--diann`.
+
+```
+python scripts/peak_selection_model.py --peaks psms.parquet.peaks.parquet \
+  --psms psms.parquet [--diann report.tsv] [--folds 3] [--rt-tol-s 10] [--out sel.json]
+```
+
+Finding on E. coli (weak self-label, 237,328 candidates): learned top1 0.426 /
+top3 0.802; evidence-rank 0.418 beats area-rank 0.390, consistent with the argument
+that peak intensity is chimeric.
 
 ## Determinism and cost
 

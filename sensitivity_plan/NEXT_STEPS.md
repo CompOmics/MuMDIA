@@ -1,107 +1,132 @@
-# Sensitivity Program — Next Steps
+# Sensitivity Program - Next Steps
 
 Prioritized, with exact hook sites (from `ARCHITECTURE_MAP.md`). Items are ordered
 by expected sensitivity value per unit risk. Everything below builds on the
-`feat/sensitivity-improvements` branch.
+`feat/sensitivity-improvements` branch. The large scaffolding is now in place:
+top-K peak retention, competition modes, two feature families, two-pass mass
+calibration, and the adaptive RT window are all implemented and default-off. What
+remains is closing loops and validating each knob, not building new plumbing.
 
-## 1. Wire top-K peak retention into extraction (highest value, highest risk)
+## 1. Close the top-K peak loop (highest value, highest risk)
 
-The enumerator (`mumdia::peaks::enumerate_peaks`), config (`ExtractConfig.retain_top_peaks`),
-and tests exist; extraction still emits one apex per candidate.
+Peak RETENTION is done: `extract.retain_top_peaks > 1` enumerates top-K peak groups
+with `peaks::enumerate_peaks` and writes `<psms>.peaks.parquet`
+(`extract.rs:927-929`, `:1068`; 7 cols `candidate_id, peak_rank, apex_rt, start_rt,
+end_rt, evidence_count, area`). Validated K=5 on E. coli = 1,699,995 peaks
+(mean ~4.97/candidate) with the scored path unchanged. The offline peak-selection
+prototype `scripts/peak_selection_model.py` learns to rank the retained peaks
+(E. coli weak-self-label: learned top1 0.426 / top3 0.802; evidence-rank 0.418 beats
+area-rank 0.390). What is NOT done: the engine still reports the single heuristic
+apex; the retained peaks are a diagnostic sidecar, not fed back into scoring.
 
-- **Hook:** `extract.rs:718` (single-argmax apex loop) and `CandOut` (`extract.rs:569`),
-  which today carries one apex + one `Vec<chrom>`. Multiply it to `Vec<CandOut>` (one
-  per retained peak) when `retain_top_peaks > 1`.
-- **Approach:** after the scan-group build (`extract.rs:608`) and rolling count
-  (`extract.rs:681`), build the signature-ion summed profile over the grid and call
-  `enumerate_peaks(profile, k, bound_peak_fraction, prominence)`. For each returned
-  `PeakGroup`, run the existing apex/chrom emission restricted to `[start_idx, end_idx]`,
-  stamping a new `peak_rank` column on `psms_extracted` and `chromatograms`.
-- **Compatibility:** `K == 1` must bypass the enumerator and keep the current path
-  (a regression test must show byte-identical `psms.parquet` for K=1 on a fixed input).
-- **Downstream:** the features stage and `compete` key currently assume one row per
-  `candidate_id`. Add `peak_rank` to the competition key or add a peak-selection pass
-  (below) so multiple peaks of one candidate do not all survive to the report.
-- **Validation:** run `scripts/reference_apex_topk.py` before/after; the SELF top-K
-  distribution predicts the achievable gain. Confirm entrapment FDP is not inflated.
+- **Remaining hook (close the loop):** the retained peaks carry only coarse
+  descriptors today (apex/start/end RT, evidence count, area). To re-select a peak
+  before rescore, each retained `PeakGroup` needs the FULL per-peak feature vector.
+  Emit one `psms_extracted` + `chromatograms` row per `(candidate_id, peak_rank)`
+  (peak-restricted apex/chrom emission from `CandOut`, `extract.rs:569`), stamp a
+  `peak_rank` column, and let `features.rs` compute per-peak features (chrom grouping
+  must key by `(candidate_id, peak_rank)`).
+- **Re-selection:** run the peak-selection ranker (port `peak_selection_model.py`)
+  or a first native pass, keep the winning peak, then collapse to one row before
+  `compete` (`compete.rs:72` key) and `rescore` (peptide/protein grouping) so
+  multiple peaks of one candidate do not all reach the report.
+- **Compatibility:** `K == 1` must keep the current byte-identical path (regression
+  test on a fixed input).
+- **Validation:** `scripts/reference_apex_topk.py` before/after; confirm the
+  entrapment FDP is not inflated (item 7).
 
-## 2. In-extract candidate-audit emitter (precise extract-stage reasons)
+## 2. In-core wiring of the conflict / localization sidecar features
 
-`mumdia audit` already reconstructs the ladder from artifacts, but extraction losses
-collapse to `NO_PEAK_GROUP`. Emit the precise reason per candidate.
+The conflict graph and localization competition exist as non-invasive Python
+sidecars: `scripts/conflict_features.py` -> `conflict.parquet` (fragment-claimant
+index + peak-group conflict graph + contested/unique/ambiguity features, joinable by
+`candidate_id`) and `scripts/localization.py` -> `localization.parquet`
+(localization-variant grouping + site-determining ions; 0 ambiguity groups on
+E. coli, as expected). They are not yet in the rescorer feature schema.
+
+- **Hook:** add the cross-candidate pass inside `features.rs` (precedent: the
+  cross_charge extended-extras block), add the new fields to `Evidence`
+  (`features.rs:269`), and register a new family module following the
+  `NAMES` + `values(&Evidence)` contract appended to `FAMILIES` (`features.rs:49`);
+  dedup / schema-id / PIN flow then handle it automatically.
+- **Schema:** bump the family count and update the `feature_sets_sized` test
+  (`features.rs:1263`) and `feature_registry.yaml`.
+- These directly feed `compete.mode = unique_evidence`, which currently approximates
+  unique evidence from the existing features.
+
+## 3. P6.3 staged modification search
+
+Not started. A calibration stage (unmodified / common-mod search) followed by an
+extended-mod stage that opens the search space only where the calibration stage
+found evidence.
+
+- **Prerequisite:** site-determining-ion scoring; `scripts/localization.py` is the
+  offline prototype for the localization half.
+- **Hook:** a second `peptidoforms` -> `predict-frag` -> `extract` pass gated on the
+  first pass's confident precursors; needs a new orchestration branch in `run.rs`
+  and a config flag. This is genuinely new plumbing (unlike the items above) and is
+  the largest remaining feature.
+
+## 4. Entrapment-gate validation of every default-off knob on >=2 datasets
+
+Every knob shipped this program is OFF by default because none has passed the
+acceptance gate. This is the next ACTION, not more code.
+
+- **Knobs to validate:** `extract.retain_top_peaks` (once item 1 closes the loop),
+  `extract.apex_evidence_rank`, `rt_im_train.adaptive_rt_window`,
+  `search_seed.two_pass_mass_cal`, and `compete.mode`
+  (`none`/`features_only`/`unique_evidence`/`margin_gated`).
+- **Gate:** `scripts/entrapment_holdout.py` gives a leakage-free held-out entrapment
+  count on an unseen human null. A knob ships as a default only if held-out
+  entrapment identifications rise WITHOUT FDP inflation, reproduced on a SECOND
+  dataset (spec 05 §6).
+- **Blocker:** only one valid dataset is loaded here (the E. coli / HYE file). The
+  on-disk SWATH TTOF file is NOT a valid second dataset: it produced 0 IDs against
+  the Ox HYE library (the sample does not match the library). A genuine second
+  labelled run (a matching TTOF library, or a ProteoBench HYE run) is required.
+
+## 5. In-extract candidate-audit emitter (precise extract-stage reasons)
+
+`emit_candidate_audit` makes `run` write `candidate_audit.parquet` after rescore, but
+extraction losses still collapse to `NO_PEAK_GROUP` at artifact resolution.
 
 - **Hook:** the per-candidate cascade at `extract.rs:566` returns `Option<CandOut>`;
-  every `return None` (lines 600, 750-753, 808) is a mapped reason (see the drop
-  table in `ARCHITECTURE_MAP.md` §3). Change it to return
-  `Result<CandOut, RejectionReason>` (or a small `enum CandEval`), collect via rayon,
-  and when `extract.emit_candidate_audit` is set write `<out-psms>.audit.parquet`
-  (candidate_id, rejection_reason). Also diff the library candidate range against the
-  accumulator keys (`extract.rs:302`) to emit `NO_FRAGMENT_TRACES` for never-materialized
-  candidates.
-- `stages::audit::load_extract_reasons` already reads this sidecar and refines the
-  waterfall, so no audit-stage change is needed.
+  every `return None` (the mapped reasons in `ARCHITECTURE_MAP.md` §3) plus the
+  never-materialized cohort (library candidate range minus accumulator keys,
+  `extract.rs:302`) should write a `<psms>.audit.parquet` (candidate_id,
+  rejection_reason). `stages::audit::load_extract_reasons` already reads that sidecar
+  and refines the waterfall, so no audit-stage change is needed.
 - **Cost guard:** only allocate the audit vector when the flag is set.
 
-## 3. Competition after an initial rescoring pass (spec 04 §11)
+## 6. Competition after an initial rescoring pass (spec 04 §11)
 
-`compete` runs before `rescore` on the heuristic `prelim_score` (`run.rs:243` before
-`:252`), so a candidate a trained model would keep can be removed early.
+`compete` runs before `rescore` on the heuristic `prelim_score` (`run.rs` order), so
+a candidate a trained model would keep can be removed early. The modes are wired;
+the reordering is not.
 
-- **Interim (already available):** run with `compete.mode = none` (or `features_only`)
-  so competition removes nothing and the rescorer arbitrates. Benchmark this against
-  `winner_take_all` at matched empirical FDP (experiment E14).
-- **Full:** add a first-pass rescore (native `percolator_lite` is cheap) that writes an
+- **Interim (available now):** run with `compete.mode = none` (or `features_only`) so
+  competition removes nothing and the rescorer arbitrates. Benchmark against
+  `winner_take_all` at matched empirical FDP (validate per item 4).
+- **Full:** add a first-pass native `percolator_lite` rescore that writes an
   out-of-fold score, then run `compete` on that score instead of `prelim_score`. Keep
   the fold grouping by peptidoform+charge to avoid leakage.
 
-## 4. Fragment claimant / conflict-graph features (spec 04 §5, P2.1-2.3)
+## 7. Local calibration uncertainty (finish spec 03 §5 / P3)
 
-The nucleus exists: the per-peak `claimants` buffer (`extract.rs:304`) and the
-two-pass `contested` map (`extract.rs:308`, feature `contested_frac` at
-`extract.rs:814`). Extend to a candidate-level family:
+Two-pass mass calibration (`search_seed.two_pass_mass_cal`) and the adaptive RT
+window (`rt_im_train.adaptive_rt_window`) are done. The remaining piece is exporting a
+LOCAL per-region uncertainty estimate so features can normalize residuals
+(`abs(rt_residual)/local_rt_sigma`, `abs(mass_error)/local_mz_sigma`).
 
-- `claimant_count` / `contested_fragment_count`, `unique_fragment_count`,
-  `unique_intensity_fraction`, `shared_trace_correlation`, `conflict_group_size`,
-  `strongest_competitor_score`, `score_margin`.
-- **Hook:** compute in the two-pass arbitration (`extract.rs:456-511`) and emit as new
-  `psms_extracted` columns, or as a new `stages/features/*.rs` family reading the
-  chromatogram overlaps. Register in `feature_registry.yaml`. Keep target/decoy
-  computation symmetric (audit per spec 04 §9).
-- These directly feed `compete.mode = unique_evidence`, which currently approximates
-  unique evidence from `n_matched_fragments * (1 - contested_frac)`.
-
-## 5. New feature families with existing data (spec 03 §8, P5)
-
-Lowest risk, additive. Priorities by data availability (see `FEATURE_REGISTRY.md`
-gap table):
-
-- **Uncertainty-normalized residuals** (P5.1): `abs(rt_residual)/local_rt_sigma`,
-  `abs(mass_error)/local_mz_sigma`. Needs local uncertainty from calibration (item 6).
-- **Apex dispersion** (P5.3): fragment-apex RT stddev/MAD, precursor-fragment apex
-  delta. Data already in the chromatograms; compute in a new features family.
-- **Candidate ambiguity** (P5.5): margins to alternative peaks/peptides using
-  `prelim_score` (an earlier-stage score, not the final model, to avoid circularity).
-
-## 6. Two-pass calibration + local uncertainty (spec 03 §5, P3)
-
-`rt_im_train` (`rt_im_train.rs`) fits per-run RT calibration; mass calibration is in
-`search_seed` (`masscal.json`). Add: robust two-pass precursor+fragment mass
-calibration, a monotonic nonlinear RT map, and a LOCAL uncertainty estimate exported
-per region. The uncertainty unlocks item 5's normalized residuals and adaptive
-extraction windows (`window = max(min, scale * local_sigma)`), spec P3.3.
-
-## 7. Empirical-FDP-first evaluation loop
-
-`scripts/entrapment_holdout.py` already gives a leakage-free held-out entrapment count
-on an unseen human null. Make it the acceptance gate for every change above (spec 05
-§6): a change ships only if held-out entrapment identifications rise without FDP
-inflation, reproduced on a second dataset. The single E. coli/HYE file here is one
-dataset; a second (the TTOF SWATH file, or a ProteoBench HYE run) is needed for the
-spec's held-out reproduction criterion.
+- **Hook:** capture the residual distribution into `cal.json` (`rt_im_train.rs`) and
+  `masscal.json` (`search_seed.rs`); add a `pred_sigma` field to `Evidence`
+  (`features.rs:269`) fed by a new library/chromatogram column. The `mass_uncertainty`
+  and `apex_dispersion` families are the consumers already in place.
 
 ## Cannot be completed in this environment
 
-- Held-out reproduction on a second dataset (needs a second labelled run loaded).
+- Held-out reproduction on a second dataset (needs a valid second labelled run; the
+  on-disk TTOF file is the wrong sample for the Ox HYE library).
 - Reference-apex recall vs DIA-NN (needs a DIA-NN report; `scripts/reference_apex_topk.py`
-  computes it once `--diann` is supplied).
+  and `scripts/peak_selection_model.py` compute it once `--diann` is supplied).
 - Ion-mobility / diaPASEF families (no 4D data).

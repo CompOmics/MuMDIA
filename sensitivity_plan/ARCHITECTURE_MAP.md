@@ -33,21 +33,42 @@ safe dense array index downstream.
 
 ## 1. Modules added by the sensitivity lead agent
 
-Committed on `feat/sensitivity-improvements`: `2f46d6d` (rejection reasons, top-K
-peak enumerator, config scaffolding), `eb9da89` (candidate `audit` stage +
-subcommand), `de5ae2b` (competition modes wired into `compete`).
+Committed on `feat/sensitivity-improvements` across 17 commits (`2f46d6d`
+rejection reasons + top-K enumerator + config scaffolding, `eb9da89` candidate
+`audit` stage + subcommand, `de5ae2b` competition modes, `048cccd` apex-dispersion
++ mass-uncertainty feature families, `4ebf765` evidence-count apex selection,
+`a9e3df6` adaptive RT window, `b183fec` top-K peak retention wired into `extract`,
+`d61e3fe` two-pass mass calibration, `f6e6a6f` conflict/localization/peak-selection
+sidecars). All additions are default-off / K=1-compatible; production defaults are
+unchanged.
 
 Status of each addition:
 - `mumdia audit` subcommand: WIRED and verified on real data (P0.3/P0.4).
 - `CompetitionMode` in `compete`: WIRED (`de5ae2b`); default `WinnerTakeAll`
   reproduces the legacy behaviour bit-for-bit; `none`/`features_only`/
   `unique_evidence`/`margin_gated` are selectable and unit tested.
-- `enumerate_peaks` (`mumdia::peaks`): a tested pure helper, NOT yet called from
-  `extract` (extract still emits one apex per candidate). This is the one
-  remaining destructive-stage change; the exact hook site is in §4.
-- `ExtractConfig.retain_top_peaks` / `emit_candidate_audit`: parsed and validated,
-  NOT yet consumed by `extract` (the top-K wiring and the in-extract audit sidecar
-  are the primary next step; see `NEXT_STEPS.md`).
+- `enumerate_peaks` (`mumdia::peaks`): WIRED into `extract` (`b183fec`). When
+  `extract.retain_top_peaks > 1` the extractor enumerates top-K chromatographic
+  peak groups per candidate and writes `<psms>.peaks.parquet`; the default
+  `retain_top_peaks = 1` bypasses the enumerator and keeps the single-apex path.
+  Validated: K=5 on E. coli emitted 1,699,995 peak rows (mean ~4.97/candidate)
+  with the main `psms`/`chrom` flow and target-decoy FDR unchanged.
+- `ExtractConfig.retain_top_peaks` / `emit_candidate_audit`: both CONSUMED.
+  `retain_top_peaks > 1` triggers the top-K peak table above; `emit_candidate_audit`
+  is read by `run` to write `candidate_audit.parquet` after rescore.
+- `ExtractConfig.apex_evidence_rank`: IMPLEMENTED (default off). Selects the apex
+  by co-eluting fragment breadth (evidence count) rather than signature-ion
+  intensity. The peak-selection analysis found evidence-rank beats area-rank.
+- `RtImTrainConfig.adaptive_rt_window` (+ `adaptive_rt_bins`, `rt_window_min_s`):
+  IMPLEMENTED (default off). Per-RT-region local residual window, clamped.
+- `SearchSeedConfig.two_pass_mass_cal`: IMPLEMENTED (default off). Robust two-pass
+  precursor + fragment mass calibration.
+- Two new feature families `apex_dispersion` (13) and `mass_uncertainty` (10) are
+  registered in `FAMILIES` (`048cccd`); the registry is now 383 features.
+- None of the default-off knobs (top-K, `apex_evidence_rank`, `adaptive_rt_window`,
+  `two_pass_mass_cal`, competition modes) has passed the entrapment-holdout gate on
+  >=2 datasets yet, so all remain off by default; that validation is the next
+  action (see `NEXT_STEPS.md`).
 
 ### `mumdia_core::rejection` (`rust/mumdia/crates/mumdia-core/src/rejection.rs`)
 
@@ -90,18 +111,29 @@ Status of each addition:
 
 ### New config fields (`rust/mumdia/crates/mumdia-core/src/config.rs`)
 
-- `ExtractConfig.retain_top_peaks: usize` (`config.rs:528`, default 1): K
+- `ExtractConfig.retain_top_peaks: usize` (`config.rs:552`, default 1): K
   chromatographic peak groups per candidate; 1 = legacy single apex. Validated
-  `>= 1` (`config.rs:917`).
-- `ExtractConfig.emit_candidate_audit: bool` (`config.rs:533`, default false):
-  when true, extraction is to write `<out-psms>.audit.parquet` per-candidate
-  survivor flags / earliest reason. Near-zero cost when false.
-- `CompeteConfig.mode: CompetitionMode` (`config.rs:613`, default `WinnerTakeAll`),
-  `margin: f64` (`config.rs:616`), `unique_evidence_min_fragments: usize`
-  (`config.rs:620`), `emit_competition_audit: bool` (`config.rs:623`).
-- `CompetitionMode` enum (`config.rs:646`): `WinnerTakeAll` (legacy) / `None` /
+  `>= 1` (`config.rs:951`). CONSUMED in `extract.rs` (`>1` calls `enumerate_peaks`
+  at `extract.rs:929` and writes `<psms>.peaks.parquet` at `extract.rs:1068`).
+- `ExtractConfig.emit_candidate_audit: bool` (`config.rs:557`, default false):
+  when true, `run` writes `candidate_audit.parquet` after rescore (`run.rs:265`).
+  Near-zero cost when false. (The finer in-extract `<psms>.audit.parquet` sidecar
+  that `stages::audit::load_extract_reasons` can read is still future work; see
+  `NEXT_STEPS.md`.)
+- `ExtractConfig.apex_evidence_rank: bool` (`config.rs:566`, default false):
+  when true, the apex loop scores by co-eluting fragment count rather than
+  signature-ion intensity (`extract.rs:735`).
+- `SearchSeedConfig.two_pass_mass_cal: bool` (`config.rs:387`, default false):
+  robust two-pass precursor + fragment mass calibration in `search_seed.rs:188`.
+- `RtImTrainConfig.adaptive_rt_window: bool` (`config.rs:433`, default false) with
+  `adaptive_rt_bins: usize` (`config.rs:435`, default 12) and `rt_window_min_s: f64`
+  (`config.rs:437`, default 1.0): per-RT-region local residual window in
+  `rt_im_train.rs:121`, clamped to `[rt_window_min_s, fallback_rt_window_s]`.
+- `CompeteConfig.mode: CompetitionMode` (`config.rs:647`, default `WinnerTakeAll`),
+  plus `margin`, `unique_evidence_min_fragments`, and `emit_competition_audit`.
+- `CompetitionMode` enum (`config.rs:680`): `WinnerTakeAll` (legacy) / `None` /
   `FeaturesOnly` / `UniqueEvidence` / `MarginGated`, with `from_token`
-  (`config.rs:667`). Maps to spec 04 §6 strategies A/B/C/D. CONSUMED in
+  (`config.rs:699`). Maps to spec 04 §6 strategies A/B/C/D. CONSUMED in
   `compete.rs` via the pure `resolve_competition()` (`de5ae2b`); `WinnerTakeAll`
   is bit-identical to the previous behaviour.
 
@@ -172,6 +204,8 @@ config knobs that govern it, and existing tests.
   + `<seed>.masscal.json` `{frag_ppm_offset, frag_tol_ppm, n_dev}`. Native
   Sage-lite hyperscore for calibration only (not a library filter). Drives per-run
   mass recalibration; fallback `{0.0, cfg.fragment_tol_ppm}` when `n_dev < 20`.
+- New opt-in knob (default off): `two_pass_mass_cal` runs a robust two-pass
+  precursor + fragment mass calibration (`search_seed.rs:188`).
 - Knobs: `search_seed.fdr_seed` (`config.rs:368`), `fragment_tol_ppm` (370),
   `min_matched_peaks` (373/374), `report_psms` (371), `matcher` (381).
   `precursor_tol_ppm` (369) is a dead knob (warns).
@@ -187,6 +221,10 @@ config knobs that govern it, and existing tests.
   Fits predicted_irt -> observed RT (linear always, LOESS when configured), sets a
   single global RT window half-width `w_rt` applied uniformly to every candidate
   (no per-candidate uncertainty). Optional DeepLC multitask fine-tune first.
+- New opt-in knob (default off): `adaptive_rt_window` (+ `adaptive_rt_bins`,
+  `rt_window_min_s`) replaces the single global `w_rt` with a per-RT-region local
+  residual window, clamped to `[rt_window_min_s, fallback_rt_window_s]`
+  (`rt_im_train.rs:121-134`).
 - Knobs: `rt_im_train.calibration_method` (`config.rs:401`, `None` rejected),
   `q_train` (402), `p_rt` / `rt_window_multiplier` (404-405),
   `min_seed_for_calibration` (406), `loess_span` (408), `fallback_rt_window_s`
@@ -210,8 +248,15 @@ config knobs that govern it, and existing tests.
   `chromatograms.parquet` (7 cols, `LargeListF32` traces, keyed by candidate_id,
   write `extract.rs:986`). Peak-major over the SoA inverted index; a cheap-to-
   expensive cascade (distinct-fragment presence -> co-elution run -> matched
-  fraction -> Pearson gate) accepts candidates. Emits exactly one apex per
-  candidate (`extract.rs:718`); no peak dimension exists yet.
+  fraction -> Pearson gate) accepts candidates. The main `psms_extracted` table
+  still emits exactly one apex per candidate; the peak dimension now exists only in
+  the opt-in `<psms>.peaks.parquet` sidecar (7 cols: `candidate_id, peak_rank,
+  apex_rt, start_rt, end_rt, evidence_count, area`) written when
+  `retain_top_peaks > 1` (`extract.rs:1068`).
+- New opt-in knobs (default off): `retain_top_peaks > 1` enumerates top-K peak
+  groups (`extract.rs:927-929`, via `peaks::enumerate_peaks`); `apex_evidence_rank`
+  scores the apex by fragment breadth instead of intensity (`extract.rs:735`);
+  `emit_candidate_audit` makes `run` write `candidate_audit.parquet`.
 - Knobs (all `ExtractConfig`, `config.rs:436-533`): `frag_tol_ppm` (440),
   `prec_tol_ppm` (441), `presence_min_matched` (443), `presence_min_fragments`
   (445), `presence_min_coelution` (447), `min_frag_corr` (452/453),
@@ -219,8 +264,9 @@ config knobs that govern it, and existing tests.
   (439), `apex_top_fragments` (465), `apex_rt_prior_s` (469), `apex_count_tol`
   (474), `apex_count_window` (484), `emit_window_grid` (489), `peak_claim` (498),
   `emit_contested_features` (503), `peak_claim_margin` (507), `matcher` (509),
-  `ms1_rescue` (521), plus the new `retain_top_peaks` (528) and
-  `emit_candidate_audit` (533). Dead: `k_select` (491), `max_fragment_charge`
+  `ms1_rescue` (521), plus the new `retain_top_peaks` (552),
+  `emit_candidate_audit` (557) and `apex_evidence_rank` (566). Dead: `k_select` (491),
+  `max_fragment_charge`
   (495), `scan_scale` (438), `ScanWindowMode::PeakWidthDerived`.
 - Tests: none at stage level (exercised only via full `run`).
 
@@ -456,11 +502,17 @@ Exact file:line sites for the six work items, from the stage maps.
   reason column (`Col::OptI32` exists at `table.rs:33`; only `opt_f64`/`opt_*`
   readers check `is_null` today), or use `Col::Str`/`Col::Bool`.
 
-### 4.2 Top-K peaks (one apex/candidate today)
+### 4.2 Top-K peaks
 
-- Primary hook: the single-argmax apex loop `extract.rs:715-733`. Replace with a
-  local-maxima detector over the `score`/`smoothed` series; `peaks::enumerate_peaks`
-  (`peaks.rs:52`) is the ready-made pure function.
+- DONE (`b183fec`): when `retain_top_peaks > 1`, `extract` enumerates top-K peak
+  groups with `peaks::enumerate_peaks` (`extract.rs:927-929`) and writes them to
+  `<psms>.peaks.parquet` (`extract.rs:1068`). This is a diagnostic sidecar; the
+  scored `psms_extracted` path still reports the single heuristic apex.
+- Remaining hook (close the loop): the single-argmax apex selection still governs
+  the reported PSM. Feed a top-K peak back into the scored path via a re-selection
+  pass (the peak-selection model `scripts/peak_selection_model.py` is the offline
+  prototype); `peaks::enumerate_peaks` (`peaks.rs:52`) is the ready-made pure
+  function.
 - Emission: `CandOut` (`extract.rs:569`), single-row append (`extract.rs:926-958`),
   `psms_extracted` writer (`extract.rs:960`), chrom writer keyed by candidate_id
   (`extract.rs:986`, key `:989`). Add a `peak_index`/`peak_rank` column; candidate_id
@@ -498,7 +550,9 @@ Exact file:line sites for the six work items, from the stage maps.
   prelim[*w]` (`compete.rs:95`) with a margin test; `UniqueEvidence` keeps a loser
   that carries enough independent fragment evidence (needs the claimant graph and
   a `unique_fragment_count` feature). `group_by` stays orthogonal (equivalence
-  class); `mode` is the removal policy. Not yet wired.
+  class); `mode` is the removal policy. WIRED (`de5ae2b`) via the pure
+  `resolve_competition()`; `UniqueEvidence` currently approximates unique evidence
+  from the existing features pending the claimant graph (§4.3).
 
 ### 4.5 Feature registry
 
@@ -552,10 +606,14 @@ Exact file:line sites for the six work items, from the stage maps.
   modes now exist (`de5ae2b`): selecting them preserves every candidate so the
   rescorer, not `prelim_score`, arbitrates. Moving competition to AFTER an initial
   rescoring pass (spec 04 §11) remains future work.
-- One apex per candidate. Spec 01 §3.1 hypothesizes that a single apex is chosen
-  too early; confirmed: `extract.rs:718` emits exactly one apex PSM per candidate,
-  no peak dimension. `retain_top_peaks` (`config.rs:528`) and `peaks.rs` are the
-  answer but are not yet wired into extract.
+- One apex per candidate in the SCORED path. Spec 01 §3.1 hypothesizes that a
+  single apex is chosen too early; confirmed for the default path: the
+  `psms_extracted` table still emits one apex PSM per candidate. Top-K peak
+  retention is now wired (`retain_top_peaks > 1` writes `<psms>.peaks.parquet` via
+  `peaks::enumerate_peaks`), but the retained peaks are a diagnostic sidecar; the
+  loop is not yet closed, i.e. the engine still reports the heuristic apex and does
+  not re-select a peak from the top-K set before features/compete/rescore. Closing
+  it needs full per-peak features and a re-selection pass (see `NEXT_STEPS.md`).
 - Registry metadata is thinner in code than in spec. Spec 03 §2 wants
   `requires_calibration`, `uses_cross_run_information`, `missing_value_policy`,
   and `computational_cost` per feature; the code registry (`FAMILIES`) stores only
