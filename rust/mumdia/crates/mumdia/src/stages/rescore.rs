@@ -113,7 +113,7 @@ pub fn run(p: RescoreParams) -> Result<u64> {
                         anyhow::bail!("rescore: Mokapot sidecar failed ({e}) and rescore.strict=true");
                     }
                     warn!("rescore: Mokapot failed ({e}); falling back to native_tda");
-                    native_scores(&p, &feats, &is_decoy, &cid, &prelim)
+                    native_scores(&p, &feats, &is_decoy, &base, &prelim)
                 }
             },
             RescorerKind::Percolator => {
@@ -121,9 +121,9 @@ pub fn run(p: RescoreParams) -> Result<u64> {
                     anyhow::bail!("rescore: classifier=percolator but percolator.exe is not wired, and rescore.strict=true");
                 }
                 warn!("rescore: percolator.exe path not wired; using native_tda");
-                native_scores(&p, &feats, &is_decoy, &cid, &prelim)
+                native_scores(&p, &feats, &is_decoy, &base, &prelim)
             }
-            RescorerKind::NativeTda => native_scores(&p, &feats, &is_decoy, &cid, &prelim),
+            RescorerKind::NativeTda => native_scores(&p, &feats, &is_decoy, &base, &prelim),
             RescorerKind::Entrapment => {
                 let n_ent = is_entrapment.iter().filter(|&&b| b).count();
                 if p.cfg.entrapment_marker.is_none() || n_ent == 0 {
@@ -141,7 +141,7 @@ pub fn run(p: RescoreParams) -> Result<u64> {
                          (set rescore.entrapment_marker to the spike-in accession \
                          substring); falling back to native_tda"
                     );
-                    native_scores(&p, &feats, &is_decoy, &cid, &prelim)
+                    native_scores(&p, &feats, &is_decoy, &base, &prelim)
                 } else if p.cfg.python.is_some() {
                     match run_entrapment_gbm(&p, &feat_names, &cid, &base, &is_entrapment, &is_decoy, &feats) {
                         Ok(s) => {
@@ -159,7 +159,7 @@ pub fn run(p: RescoreParams) -> Result<u64> {
                             classifier_used = "entrapment_native";
                             model_identity = "native-percolator-lite-entrapment-v1".to_string();
                             qmode = QMode::Entrapment;
-                            native_scores(&p, &feats, &is_entrapment, &cid, &prelim)
+                            native_scores(&p, &feats, &is_entrapment, &base, &prelim)
                         }
                     }
                 } else {
@@ -170,7 +170,7 @@ pub fn run(p: RescoreParams) -> Result<u64> {
                     classifier_used = "entrapment_native";
                     model_identity = "native-percolator-lite-entrapment-v1".to_string();
                     qmode = QMode::Entrapment;
-                    native_scores(&p, &feats, &is_entrapment, &cid, &prelim)
+                    native_scores(&p, &feats, &is_entrapment, &base, &prelim)
                 }
             }
         }
@@ -311,13 +311,13 @@ fn native_scores(
     p: &RescoreParams,
     feats: &[Vec<f64>],
     is_decoy: &[bool],
-    cid: &[u32],
+    fold_key: &[u32],
     prelim: &[f64],
 ) -> Vec<f64> {
     percolator_lite(RescoreInput {
         features: feats,
         is_decoy,
-        candidate_id: cid,
+        fold_key,
         init_score: prelim,
         folds: p.cfg.folds,
         num_iter: p.cfg.num_iter,
