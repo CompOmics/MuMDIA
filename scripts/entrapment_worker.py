@@ -65,11 +65,14 @@ def main():
     folds = int(sys.argv[3]) if len(sys.argv) > 3 else 3
 
     t = pq.read_table(inp).to_pandas()
-    meta = ["candidate_id", "base_peptide_id", "is_entrapment", "is_decoy"]
+    meta = ["row_id", "candidate_id", "base_peptide_id", "is_entrapment", "is_decoy"]
     feat_cols = [c for c in t.columns if c not in meta]
 
     X = np.nan_to_num(t[feat_cols].to_numpy(dtype=np.float64), posinf=0.0, neginf=0.0)
     cid = t["candidate_id"].to_numpy()
+    # Unique flat row id for collision-free score readback (candidate_id repeats
+    # across competed runs). Fall back to positional index if absent.
+    rid = t["row_id"].to_numpy() if "row_id" in t.columns else np.arange(len(t), dtype=np.uint32)
     grp = t["base_peptide_id"].to_numpy()
     is_ent = t["is_entrapment"].to_numpy() != 0
     is_dec = t["is_decoy"].to_numpy() != 0
@@ -105,6 +108,7 @@ def main():
         scores[gap] = mf.predict_proba(X[gap])[:, 1]
 
     out = pa.table({
+        "row_id": pa.array(rid.astype("uint32")),
         "candidate_id": pa.array(cid.astype("uint32")),
         "score": pa.array(scores.astype(np.float64)),
     })

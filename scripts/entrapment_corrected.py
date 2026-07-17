@@ -96,7 +96,7 @@ def contam_mask(acct):
 
 def eco_at_true1(acct):
     contam = contam_mask(acct)
-    is_entrap = hum & ~contam            # valid false population
+    is_entrap = hum & ~contam & ~dec     # valid false population (exclude human decoys)
     is_real = ~dec & ~hum                # E. coli targets
     q = ent_q(SCORE, is_entrap, is_real, RATIO)
     gate = q <= 0.01
@@ -117,7 +117,7 @@ if "q_value" in c.columns:
     print(f"  [A] at shipped gate (q<=0.01): E.coli={eco_fixed}   true FDR by accounting:")
     for a in ("raw", "crap", "diann"):
         contam = contam_mask(a)
-        false_h = c.loc[(hum & ~contam) & gate, "strip"].nunique()
+        false_h = c.loc[(hum & ~contam & ~dec) & gate, "strip"].nunique()
         print(f"        acct={a:6}: true FDR = {false_h*RATIO/max(1,eco_fixed)*100:4.2f}%  (false human seqs={false_h})")
 
 # Framing B: re-threshold to a genuine true 1% under each accounting (score sweep)

@@ -50,9 +50,29 @@ def make_model(mokapot):
         )
         # scaler=None -> StandardScaler (features are on mixed scales).
         return mokapot.Model(net, train_fdr=0.01, max_iter=brew_iters, rng=0)
+    if kind in ("xgb", "xgboost"):
+        # Gradient-boosted trees: nonlinear, captures feature interactions the
+        # linear models miss. Used as the second stage after a cheap prefilter,
+        # where the reduced PSM count keeps it tractable. Hist tree method +
+        # capped depth/estimators for speed on millions of PSMs.
+        from xgboost import XGBClassifier
+
+        net = XGBClassifier(
+            n_estimators=int(os.environ.get("MUMDIA_XGB_TREES", "200")),
+            max_depth=int(os.environ.get("MUMDIA_XGB_DEPTH", "6")),
+            learning_rate=float(os.environ.get("MUMDIA_XGB_LR", "0.1")),
+            subsample=0.8,
+            colsample_bytree=0.8,
+            tree_method="hist",
+            n_jobs=int(os.environ.get("MUMDIA_XGB_JOBS", "0")) or None,
+            eval_metric="logloss",
+            random_state=0,
+        )
+        # scaler=None -> StandardScaler; harmless for trees, keeps the API uniform.
+        return mokapot.Model(net, train_fdr=0.01, max_iter=brew_iters, rng=0)
     if kind != "nn":
         raise ValueError(
-            f"unknown MUMDIA_RESCORE_MODEL={kind!r} (want nn|logreg|percolator)"
+            f"unknown MUMDIA_RESCORE_MODEL={kind!r} (want nn|logreg|xgb|percolator)"
         )
 
     from sklearn.neural_network import MLPClassifier
@@ -102,19 +122,44 @@ def main():
     else:
         _results, models = mokapot.brew(psms, model=model, rng=0, max_workers=workers)
 
-    # Score EVERY PSM (targets AND decoys) with the trained fold models. mokapot's
-    # confidence table is targets-only; returning only targets starves the decoys
-    # of scores downstream, so the caller's target-decoy q recomputation collapses
-    # (unscored decoys sink, so nearly every target passes -> huge false count).
-    # Model.predict == decision_function over the whole dataset; averaging across
-    # the cross-validation fold models gives every PSM a proper score in data order.
-    ml = list(models) if hasattr(models, "__len__") else [models]
-    score_mat = np.vstack(
-        [np.asarray(m.predict(psms), dtype=np.float64) for m in ml]
-    )
-    scores = score_mat.mean(axis=0)
-
     specids = psms.data["SpecId"].astype(str).to_numpy()
+
+    # Prefer mokapot's OUT-OF-FOLD scores: brew returns held-out confidence tables
+    # (targets in confidence_estimates, decoys in decoy_confidence_estimates), each
+    # PSM scored only by the fold that did not train on it. The previous approach
+    # (averaging all fold models over all rows) is NOT out-of-fold - 2 of 3 folds
+    # trained on each row - which inflates apparent sensitivity (~2.5% external FDR
+    # at a nominal 1% cut). Fall back to fold-model averaging only if the mokapot
+    # confidence API differs from what we expect.
+    # NOTE: unvalidated in the unit suite (no mokapot there); confirm on a real run.
+    def _oof_scores():
+        conf = _results[0] if isinstance(_results, (list, tuple)) else _results
+        tdf = conf.confidence_estimates["psms"]
+        ddf = conf.decoy_confidence_estimates["psms"]
+
+        def scol(df):
+            for c in ("mokapot score", "score"):
+                if c in df.columns:
+                    return c
+            return next(c for c in df.columns if "score" in c.lower())
+
+        m = {}
+        for df in (ddf, tdf):
+            m.update(dict(zip(df["SpecId"].astype(str), df[scol(df)].astype(float))))
+        if len(m) < 0.5 * len(specids):
+            raise RuntimeError(f"OOF tables cover only {len(m)}/{len(specids)} PSMs")
+        worst = min(m.values()) - 1.0
+        return np.array([m.get(s, worst) for s in specids], dtype=np.float64)
+
+    try:
+        scores = _oof_scores()
+        print("mokapot_worker: using out-of-fold confidence scores", flush=True)
+    except Exception as e:
+        print(f"mokapot_worker: OOF unavailable ({e}); fold-model average fallback", flush=True)
+        ml = list(models) if hasattr(models, "__len__") else [models]
+        scores = np.vstack(
+            [np.asarray(m.predict(psms), dtype=np.float64) for m in ml]
+        ).mean(axis=0)
     if len(specids) != len(scores):
         raise RuntimeError(
             f"specid/score length mismatch: {len(specids)} vs {len(scores)}"
