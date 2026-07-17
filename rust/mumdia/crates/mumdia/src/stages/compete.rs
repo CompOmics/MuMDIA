@@ -8,12 +8,13 @@ use std::collections::HashMap;
 use std::time::Instant;
 
 use anyhow::Result;
-use mumdia_core::config::{CompeteConfig, CompeteGroupBy};
+use mumdia_core::config::{CompeteConfig, CompeteGroupBy, CompetitionMode};
+use mumdia_core::rejection::RejectionReason;
 use mumdia_core::schema::artifact;
 use mumdia_io::report::ArtifactReport;
 use mumdia_io::table::{write_table, Col, Table};
 use serde_json::json;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::stages::features::FeatureSchema;
 
@@ -60,16 +61,15 @@ pub fn run(p: CompeteParams) -> Result<u64> {
         Vec::new()
     };
 
-    // Winner per competition group. The label is part of the key so a target is
-    // NOT competed against its own decoy: the decoy population must survive for
-    // the rescorer/FDR to have a valid null (otherwise decoys are depleted and
-    // FDR is badly underestimated). Competition only removes redundant charge/
-    // modification variants within targets and within decoys.
-    // Key is a fixed-size tuple (base_peptide_id, label_code, bucket) instead of a
-    // freshly-allocated String per PSM. The label is mapped to a small integer
-    // code so it stays part of the key exactly as before; Precursor grouping uses
-    // a constant bucket (0) so its equivalence classes are unchanged.
-    let mut winner: HashMap<(u32, u8, i64), usize> = HashMap::new();
+    // Competition group members. The label is part of the key so a target is NOT
+    // competed against its own decoy: the decoy population must survive for the
+    // rescorer/FDR to have a valid null (otherwise decoys are depleted and FDR is
+    // badly underestimated). Competition only arbitrates redundant charge/mod
+    // variants within targets and within decoys.
+    // Key is a fixed-size tuple (base-or-pform id, label_code, bucket) instead of a
+    // freshly-allocated String per PSM. Precursor grouping uses a constant bucket
+    // (0) so its equivalence classes are unchanged.
+    let mut groups: HashMap<(u32, u8, i64), Vec<usize>> = HashMap::new();
     for i in 0..t.nrows {
         let label_code = match label[i].as_str() {
             "target" => 0u8,
@@ -89,17 +89,30 @@ pub fn run(p: CompeteParams) -> Result<u64> {
                 (pform_id[i], label_code, c)
             }
         };
-        winner
-            .entry(key)
-            .and_modify(|w| {
-                if prelim[i] > prelim[*w] {
-                    *w = i;
-                }
-            })
-            .or_insert(i);
+        groups.entry(key).or_default().push(i);
     }
-    let mut keep: Vec<usize> = winner.into_values().collect();
-    keep.sort_unstable();
+
+    // Per-candidate unique-fragment evidence for the `unique_evidence` mode. Prefers
+    // an explicit `unique_fragment_count` feature; otherwise approximates it as
+    // matched-fragment count discounted by the contested fraction; None if neither
+    // is available (mode then falls back to winner-take-all).
+    let unique_ev = unique_evidence(&t);
+    if matches!(p.cfg.mode, CompetitionMode::UniqueEvidence) && unique_ev.is_none() {
+        warn!(
+            "compete mode=unique_evidence: no unique_fragment_count / \
+             (n_matched_fragments, contested_frac) columns; falling back to winner-take-all"
+        );
+    }
+
+    // Resolve each group per competition mode (pure function; unit tested below).
+    let (keep, removed) = resolve_competition(
+        &groups,
+        &prelim,
+        p.cfg.mode,
+        p.cfg.margin,
+        p.cfg.unique_evidence_min_fragments,
+        unique_ev.as_deref(),
+    );
 
     let sel = |v: &[f64]| keep.iter().map(|&i| v[i]).collect::<Vec<_>>();
     let mut cols: Vec<Col> = vec![
@@ -119,10 +132,58 @@ pub fn run(p: CompeteParams) -> Result<u64> {
     // Carry the feature schema forward for rescore.
     mumdia_io::json::write_json(&format!("{}.schema.json", p.out), &schema)?;
 
+    // Optional per-removal competition audit (spec 04 §2): every candidate removed
+    // by within-group competition, with its winner and removal reason. Within-label
+    // competition, so the sibling that outcompeted a loser shares its label.
+    if p.cfg.emit_competition_audit {
+        let reason_of = |i: usize| {
+            if label[i] == "decoy" {
+                RejectionReason::OutcompetedByDecoy
+            } else {
+                RejectionReason::OutcompetedByTarget
+            }
+        };
+        let audit = format!("{}.compete_audit.parquet", p.out);
+        write_table(
+            &audit,
+            vec![
+                Col::U32(
+                    "candidate_id".into(),
+                    removed.iter().map(|&(m, _)| cid[m]).collect(),
+                ),
+                Col::Str(
+                    "label".into(),
+                    removed.iter().map(|&(m, _)| label[m].clone()).collect(),
+                ),
+                Col::Str(
+                    "peptidoform".into(),
+                    removed.iter().map(|&(m, _)| pform[m].clone()).collect(),
+                ),
+                Col::U32(
+                    "winner_candidate_id".into(),
+                    removed.iter().map(|&(_, w)| cid[w]).collect(),
+                ),
+                Col::F64(
+                    "loser_prelim".into(),
+                    removed.iter().map(|&(m, _)| prelim[m]).collect(),
+                ),
+                Col::F64(
+                    "winner_prelim".into(),
+                    removed.iter().map(|&(_, w)| prelim[w]).collect(),
+                ),
+                Col::Str(
+                    "rejection_reason".into(),
+                    removed.iter().map(|&(m, _)| reason_of(m).code().to_string()).collect(),
+                ),
+            ],
+        )?;
+    }
+
     let elapsed = t0.elapsed().as_millis();
     let mut stats = std::collections::BTreeMap::new();
     stats.insert("input_rows".to_string(), json!(t.nrows));
     stats.insert("kept".to_string(), json!(rows));
+    stats.insert("removed".to_string(), json!(removed.len()));
     ArtifactReport {
         logical_name: artifact::PSMS_COMPETED.0.to_string(),
         schema_name: artifact::PSMS_COMPETED.0.to_string(),
@@ -130,13 +191,200 @@ pub fn run(p: CompeteParams) -> Result<u64> {
         stage: "compete".to_string(),
         rows,
         content_hash: mumdia_io::hash::blake3_file(p.out)?,
-        params: json!({"group_by": format!("{:?}", p.cfg.group_by)}),
+        params: json!({
+            "group_by": format!("{:?}", p.cfg.group_by),
+            "mode": format!("{:?}", p.cfg.mode),
+        }),
         stats,
         model_identity: None,
         elapsed_ms: elapsed,
     }
     .write_for(p.out)?;
 
-    info!(input = t.nrows, kept = rows, elapsed_ms = elapsed, "compete: done");
+    info!(
+        input = t.nrows,
+        kept = rows,
+        removed = removed.len(),
+        mode = ?p.cfg.mode,
+        "compete: done"
+    );
     Ok(rows)
+}
+
+/// Per-candidate unique-fragment evidence for `CompetitionMode::UniqueEvidence`.
+/// Prefers an explicit `unique_fragment_count` column; otherwise approximates it as
+/// `n_matched_fragments * (1 - contested_frac)` (contested-discounted matched
+/// count); falls back to raw `n_matched_fragments`; `None` if none are present.
+fn unique_evidence(t: &Table) -> Option<Vec<f64>> {
+    if let Some(u) = col_f64(t, "unique_fragment_count") {
+        return Some(u);
+    }
+    let nm = col_f64(t, "n_matched_fragments")?;
+    match col_f64(t, "contested_frac") {
+        Some(cf) => Some(
+            nm.iter()
+                .zip(cf)
+                .map(|(n, c)| n * (1.0 - c).clamp(0.0, 1.0))
+                .collect(),
+        ),
+        None => Some(nm),
+    }
+}
+
+/// Read a numeric column as f64, accepting an f64 or i32 encoding.
+fn col_f64(t: &Table, name: &str) -> Option<Vec<f64>> {
+    t.f64(name).ok().or_else(|| {
+        t.i32(name)
+            .ok()
+            .map(|v| v.into_iter().map(|x| x as f64).collect())
+    })
+}
+
+/// Resolve within-group competition per [`CompetitionMode`]. Returns the
+/// sorted-unique kept row indices and the `(loser, winner)` removal pairs.
+/// Deterministic: groups are visited in sorted key order; the winner is the
+/// highest `prelim` (ties broken by smallest index).
+fn resolve_competition(
+    groups: &HashMap<(u32, u8, i64), Vec<usize>>,
+    prelim: &[f64],
+    mode: CompetitionMode,
+    margin: f64,
+    unique_min: usize,
+    unique_ev: Option<&[f64]>,
+) -> (Vec<usize>, Vec<(usize, usize)>) {
+    use std::cmp::Ordering::Equal;
+    let mut group_keys: Vec<&(u32, u8, i64)> = groups.keys().collect();
+    group_keys.sort_unstable();
+    let mut keep: Vec<usize> = Vec::new();
+    let mut removed: Vec<(usize, usize)> = Vec::new();
+    for gk in group_keys {
+        let members = &groups[gk];
+        let win = *members
+            .iter()
+            .min_by(|&&a, &&b| prelim[b].partial_cmp(&prelim[a]).unwrap_or(Equal).then(a.cmp(&b)))
+            .unwrap();
+        match mode {
+            CompetitionMode::None | CompetitionMode::FeaturesOnly => {
+                keep.extend(members.iter().copied());
+            }
+            CompetitionMode::WinnerTakeAll => {
+                keep.push(win);
+                removed.extend(members.iter().copied().filter(|&m| m != win).map(|m| (m, win)));
+            }
+            CompetitionMode::UniqueEvidence => {
+                keep.push(win);
+                let thr = unique_min as f64;
+                for &m in members {
+                    if m == win {
+                        continue;
+                    }
+                    if unique_ev.map(|u| u[m] >= thr).unwrap_or(false) {
+                        keep.push(m);
+                    } else {
+                        removed.push((m, win));
+                    }
+                }
+            }
+            CompetitionMode::MarginGated => {
+                keep.push(win);
+                for &m in members {
+                    if m == win {
+                        continue;
+                    }
+                    if prelim[win] - prelim[m] >= margin {
+                        removed.push((m, win));
+                    } else {
+                        keep.push(m);
+                    }
+                }
+            }
+        }
+    }
+    keep.sort_unstable();
+    keep.dedup();
+    (keep, removed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn one_group(members: Vec<usize>) -> HashMap<(u32, u8, i64), Vec<usize>> {
+        let mut g = HashMap::new();
+        g.insert((0u32, 0u8, 0i64), members);
+        g
+    }
+
+    #[test]
+    fn winner_take_all_keeps_only_winner() {
+        let g = one_group(vec![0, 1, 2]);
+        let prelim = [0.1, 0.9, 0.5];
+        let (keep, removed) =
+            resolve_competition(&g, &prelim, CompetitionMode::WinnerTakeAll, 0.0, 2, None);
+        assert_eq!(keep, vec![1]);
+        assert_eq!(removed.len(), 2);
+    }
+
+    #[test]
+    fn none_and_features_only_keep_all() {
+        let g = one_group(vec![0, 1, 2]);
+        let prelim = [0.1, 0.9, 0.5];
+        for mode in [CompetitionMode::None, CompetitionMode::FeaturesOnly] {
+            let (keep, removed) = resolve_competition(&g, &prelim, mode, 0.0, 2, None);
+            assert_eq!(keep, vec![0, 1, 2]);
+            assert!(removed.is_empty());
+        }
+    }
+
+    #[test]
+    fn margin_gated_keeps_close_losers_removes_distant() {
+        // winner idx1 (0.9); idx2 (0.85) within margin 0.1 -> kept; idx0 removed
+        let g = one_group(vec![0, 1, 2]);
+        let prelim = [0.1, 0.9, 0.85];
+        let (keep, removed) =
+            resolve_competition(&g, &prelim, CompetitionMode::MarginGated, 0.1, 2, None);
+        assert_eq!(keep, vec![1, 2]);
+        assert_eq!(removed, vec![(0, 1)]);
+    }
+
+    #[test]
+    fn unique_evidence_keeps_losers_with_enough_evidence() {
+        // winner idx1; idx0 unique 3 (>=2) kept; idx2 unique 1 removed
+        let g = one_group(vec![0, 1, 2]);
+        let prelim = [0.1, 0.9, 0.5];
+        let ev = [3.0, 5.0, 1.0];
+        let (keep, removed) =
+            resolve_competition(&g, &prelim, CompetitionMode::UniqueEvidence, 0.0, 2, Some(&ev));
+        assert_eq!(keep, vec![0, 1]);
+        assert_eq!(removed, vec![(2, 1)]);
+    }
+
+    #[test]
+    fn unique_evidence_without_data_falls_back_to_winner_take_all() {
+        let g = one_group(vec![0, 1, 2]);
+        let prelim = [0.1, 0.9, 0.5];
+        let (keep, _) =
+            resolve_competition(&g, &prelim, CompetitionMode::UniqueEvidence, 0.0, 2, None);
+        assert_eq!(keep, vec![1]);
+    }
+
+    #[test]
+    fn winner_take_all_is_deterministic_across_groups() {
+        let mut g = HashMap::new();
+        g.insert((0u32, 0u8, 0i64), vec![0, 1]);
+        g.insert((1u32, 1u8, 0i64), vec![2, 3]);
+        let prelim = [0.2, 0.8, 0.9, 0.3];
+        let (keep, _) =
+            resolve_competition(&g, &prelim, CompetitionMode::WinnerTakeAll, 0.0, 2, None);
+        assert_eq!(keep, vec![1, 2]); // winners of each group, sorted
+    }
+
+    #[test]
+    fn winner_tie_breaks_to_smallest_index() {
+        let g = one_group(vec![0, 1, 2]);
+        let prelim = [0.9, 0.9, 0.1]; // tie between idx0 and idx1
+        let (keep, _) =
+            resolve_competition(&g, &prelim, CompetitionMode::WinnerTakeAll, 0.0, 2, None);
+        assert_eq!(keep, vec![0]);
+    }
 }
