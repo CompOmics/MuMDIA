@@ -588,6 +588,13 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
         ms1_i2: Option<f64>,
         /// (cid, frag_name, frag_mz, frag_obs_mz, predicted_intensity, rt, intensity)
         chrom: Vec<(u32, String, f64, f64, f32, Vec<f32>, Vec<f32>)>,
+        /// Top-K retained peak groups (sensitivity_plan P1.1/P1.2), populated only
+        /// when `retain_top_peaks > 1`. Each: (rank, apex_rt, start_rt, end_rt,
+        /// evidence_count, area). Ranked by co-eluting fragment breadth (not
+        /// intensity). The main PSM above still reports the single selected apex,
+        /// so FDR is unaffected; these are candidate peaks for an offline peak-
+        /// selection model. Empty for K=1.
+        peaks: Vec<(u8, f64, f64, f64, f64, f64)>,
     }
 
     let results: Vec<Option<CandOut>> = cand_hits
@@ -910,6 +917,32 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
             }
         }
 
+        // Top-K peak retention (opt-in; sensitivity_plan P1.1/P1.2). Enumerate peak
+        // groups over the per-scan distinct-fragment COUNT profile (co-eluting
+        // breadth, interference-resistant per the intensity-is-chimeric argument),
+        // ranked by breadth-area. The PSM above still carries the selected apex, so
+        // FDR is unchanged; these are extra candidate peaks for an offline peak-
+        // selection model. Empty for K=1 (the default).
+        let peaks: Vec<(u8, f64, f64, f64, f64, f64)> =
+            if p.cfg.retain_top_peaks > 1 && !groups.is_empty() {
+                let count_prof: Vec<f32> = groups.iter().map(|(_, m)| m.len() as f32).collect();
+                crate::peaks::enumerate_peaks(&count_prof, p.cfg.retain_top_peaks, 1.0 / 3.0, 0.1)
+                    .into_iter()
+                    .map(|pk| {
+                        (
+                            pk.rank as u8,
+                            groups[pk.apex_idx].0,
+                            groups[pk.start_idx].0,
+                            groups[pk.end_idx].0,
+                            groups[pk.apex_idx].1.len() as f64,
+                            pk.area as f64,
+                        )
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+
         Some(CandOut {
             cid,
             apex_rt,
@@ -931,6 +964,7 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
             ms1_i1: o_ms1_i1,
             ms1_i2: o_ms1_i2,
             chrom: chrom_rows,
+            peaks,
         })
     })
     .collect();
@@ -938,8 +972,23 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
     // Append results in the deterministic cand_ids order (parallel work above was
     // order-preserving via `collect`), reproducing the serial push order exactly.
     let mut n_accepted = 0u64;
+    // Top-K retained peaks (opt-in; empty for K=1).
+    let (mut pk_cid, mut pk_rank): (Vec<u32>, Vec<i32>) = (Vec::new(), Vec::new());
+    let (mut pk_apex, mut pk_start, mut pk_end): (Vec<f64>, Vec<f64>, Vec<f64>) =
+        (Vec::new(), Vec::new(), Vec::new());
+    let (mut pk_ev, mut pk_area): (Vec<f64>, Vec<f64>) = (Vec::new(), Vec::new());
     for r in results.into_iter().flatten() {
         n_accepted += 1;
+        let rcid = r.cid;
+        for (rank, apex, start, end, ev, area) in &r.peaks {
+            pk_cid.push(rcid);
+            pk_rank.push(*rank as i32);
+            pk_apex.push(*apex);
+            pk_start.push(*start);
+            pk_end.push(*end);
+            pk_ev.push(*ev);
+            pk_area.push(*area);
+        }
         cid_c.push(r.cid);
         apexrt_c.push(r.apex_rt);
         apexim_c.push(None);
@@ -1012,6 +1061,25 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
             Col::LargeListF32("intensity".into(), ch_int),
         ],
     )?;
+
+    // Top-K retained peaks (opt-in, sensitivity_plan P1.1/P1.2). Written next to
+    // the psms table only when retain_top_peaks > 1; one row per (candidate, peak).
+    if !pk_cid.is_empty() {
+        let pk_path = format!("{}.peaks.parquet", p.out_psms);
+        let n_peaks = write_table(
+            &pk_path,
+            vec![
+                Col::U32("candidate_id".into(), pk_cid),
+                Col::I32("peak_rank".into(), pk_rank),
+                Col::F64("apex_rt".into(), pk_apex),
+                Col::F64("start_rt".into(), pk_start),
+                Col::F64("end_rt".into(), pk_end),
+                Col::F64("evidence_count".into(), pk_ev),
+                Col::F64("area".into(), pk_area),
+            ],
+        )?;
+        info!(peaks = n_peaks, path = %pk_path, "extract: wrote top-K peak table");
+    }
 
     let elapsed = t0.elapsed().as_millis();
     let mut stats = std::collections::BTreeMap::new();
