@@ -35,9 +35,9 @@ Living log for the autonomous sensitivity-improvement session. Updated throughou
 | 3 | Top-K peak enumerator + config `retain_top_peaks` (K=1 compat) + tests | P1 | PARTIAL (enumerator+config+tests done; extract wiring = NEXT_STEPS #1) | 2f46d6d |
 | 4 | Competition-mode enum wired in compete (none/features-only/unique-evidence/margin-gated) | P2.4 | DONE | de5ae2b |
 | 5 | `ARCHITECTURE_MAP.md`, `FEATURE_REGISTRY.md`, `feature_registry.yaml` | P4.1 | DONE | docs |
-| 6 | Reference-apex top-K analysis script (Python) | P0.4, 02 §5 D | IN PROGRESS (benchmark agent) | - |
-| 7 | Feature-ablation runner (Python) | P4.3 | IN PROGRESS (benchmark agent) | - |
-| 8 | `BENCHMARK_GUIDE.md`, `NEXT_STEPS.md` | P7 | NEXT_STEPS done; BENCHMARK_GUIDE pending scripts | - |
+| 6 | Reference-apex top-K analysis script (Python) | P0.4, 02 §5 D | DONE | ed44e2a |
+| 7 | Feature-ablation runner (Python) | P4.3 | DONE | ed44e2a |
+| 8 | `BENCHMARK_GUIDE.md`, `NEXT_STEPS.md` | P7 | DONE | docs |
 | 9 | Fragment claimant / conflict features | P2.1-2.3 | DEFERRED -> NEXT_STEPS #4 (nucleus exists: contested_frac) | - |
 | 10 | In-extract precise reason emitter | P0.3 | DEFERRED -> NEXT_STEPS #2 (audit reads sidecar already) | - |
 
@@ -79,6 +79,33 @@ single-species (E. coli) sample, the vast majority of candidates correctly never
 form a peak. The audit now makes every loss category countable and stratifiable,
 which is the P0 prerequisite for targeting the recoverable losses (peak selection
 and FDR), per the spec's decision rules (05 §5).
+
+## Key diagnostic result (reference-apex top-K, 20,000 E. coli candidates)
+
+| metric | value |
+|---|---|
+| mean peaks / candidate | 10.35 |
+| candidates with >= 2 peaks | 95.2% |
+| selected apex is peak rank-1 | **52.5%** |
+| selected apex in top-3 / top-5 / top-10 | 79.2% / 88.3% / 94.8% |
+| selected apex in no enumerated peak | 3.5% |
+
+Interpretation: the current single-apex selection lands on the STRONGEST peak only
+about half the time; a better-ranked alternative peak exists within the top 5 for
+~88% of candidates. This is direct quantitative support for the spec's central
+hypothesis (01 §3.1) and for `extract.retain_top_peaks = 5` (NEXT_STEPS #1): the
+enumerator + config are in place; wiring them into `extract` is the highest-value
+remaining change. (Whether recovering those peaks raises IDENTIFICATIONS at matched
+empirical FDP must still be confirmed with the entrapment gate.)
+
+## Feature-family ablation (60,000 rows, logreg, 3-fold grouped CV)
+
+355 features / 17 families; full model 509 vs minimal-baseline 414 targets @1% FDP.
+Most useful (removal hurts): similarity (-393), rt (-382), entropy (-6). On this
+subset, removing interference / rich / coelution raised the count (+267 / +204 /
++119), indicating redundancy or subset overfit. One-subset, one-model result: not an
+action, a lead. Rerun with `--model both`, all rows, and a second dataset (spec 05 §7)
+before dropping any family.
 
 ## Known limitations / risks (running)
 
