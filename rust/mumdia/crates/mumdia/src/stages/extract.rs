@@ -838,40 +838,38 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
             }
         }
         // (the acquisition-scan `grid` was computed above, before apex/co-elution)
-        // Emit EVERY predicted transition, not just the observed ones. A predicted
-        // fragment never matched anywhere gets a zero-intensity row (all-zero grid
-        // trace, or an empty series without the grid) so the feature families see
-        // the full predicted set: similarity/entropy/ion-series/coelution get the
-        // correct denominator and a missing strong ion is penalized. obs m/z falls
-        // back to the theoretical m/z, which is harmless because the mass-accuracy
-        // features only count fragments with obs_apex > 0.
+        // Emit a row for EVERY predicted transition so the feature families see the
+        // full predicted set (a missing strong ion is penalized). An OBSERVED
+        // fragment carries its grid-sampled (or sorted) trace; a NEVER-OBSERVED one
+        // carries an EMPTY trace, NOT a grid-length zero vector. The empty trace
+        // still yields obs_apex = 0 downstream, but avoids inflating the total
+        // chromatogram list-values past arrow's 32-bit ListArray offset limit
+        // (a grid-length zero per absent fragment overflowed it on large runs).
+        // obs m/z falls back to theoretical; harmless since mass-accuracy counts
+        // only fragments with obs_apex > 0.
         for fi in 0..fmzs.len() {
             let frag = fi as u16;
             let obs_mz = wsum
                 .get(&frag)
                 .map(|(sm, sw)| if *sw > 0.0 { sm / sw } else { fmzs[fi] })
                 .unwrap_or(fmzs[fi]);
-            let (rts, ints): (Vec<f32>, Vec<f32>) = if !grid.is_empty() {
-                let m: HashMap<u64, f32> = per_frag
-                    .get(&frag)
-                    .map(|v| v.iter().map(|(r, i)| (r.to_bits(), *i)).collect())
-                    .unwrap_or_default();
-                (
-                    grid.iter().map(|r| *r as f32).collect(),
-                    grid.iter().map(|r| *m.get(&r.to_bits()).unwrap_or(&0.0)).collect(),
-                )
-            } else {
-                match per_frag.get(&frag) {
-                    Some(v) => {
-                        let mut s = v.clone();
-                        s.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-                        (
-                            s.iter().map(|(r, _)| *r as f32).collect(),
-                            s.iter().map(|(_, i)| *i).collect(),
-                        )
-                    }
-                    None => (Vec::new(), Vec::new()),
+            let (rts, ints): (Vec<f32>, Vec<f32>) = match per_frag.get(&frag) {
+                Some(v) if !grid.is_empty() => {
+                    let m: HashMap<u64, f32> = v.iter().map(|(r, i)| (r.to_bits(), *i)).collect();
+                    (
+                        grid.iter().map(|r| *r as f32).collect(),
+                        grid.iter().map(|r| *m.get(&r.to_bits()).unwrap_or(&0.0)).collect(),
+                    )
                 }
+                Some(v) => {
+                    let mut s = v.clone();
+                    s.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+                    (
+                        s.iter().map(|(r, _)| *r as f32).collect(),
+                        s.iter().map(|(_, i)| *i).collect(),
+                    )
+                }
+                None => (Vec::new(), Vec::new()), // absent predicted transition
             };
             chrom_rows.push((cid, fnames[fi].clone(), fmzs[fi], obs_mz, fints[fi], rts, ints));
         }
