@@ -414,6 +414,20 @@ pub struct RtImTrainConfig {
     /// main use is library-input mode, where the base iRT comes from the imported
     /// library rather than a DeepLC prediction.
     pub finetune_deeplc: bool,
+    /// Adaptive RT window (sensitivity_plan spec 03 §3.5, backlog P3.2/P3.3):
+    /// instead of one global residual-percentile half-width for every candidate,
+    /// bin the calibration anchors by calibrated RT and give each candidate the
+    /// LOCAL residual percentile of its RT region, clamped to
+    /// `[rt_window_min_s, fallback_rt_window_s]` and scaled by
+    /// `rt_window_multiplier`. A fixed window is simultaneously too wide for
+    /// well-calibrated regions and too narrow for poorly-calibrated ones; this
+    /// tightens clean regions (less interference) and widens noisy ones (more
+    /// recall). Empty/sparse bins fall back to the global width. Default false.
+    pub adaptive_rt_window: bool,
+    /// Number of equal-width calibrated-RT bins for the adaptive window.
+    pub adaptive_rt_bins: usize,
+    /// Lower clamp (seconds) for any RT half-window (the existing 1 s floor).
+    pub rt_window_min_s: f64,
 }
 impl Default for RtImTrainConfig {
     fn default() -> Self {
@@ -427,6 +441,9 @@ impl Default for RtImTrainConfig {
             loess_span: 0.3,
             fallback_rt_window_s: 120.0,
             finetune_deeplc: false,
+            adaptive_rt_window: false,
+            adaptive_rt_bins: 12,
+            rt_window_min_s: 1.0,
         }
     }
 }
