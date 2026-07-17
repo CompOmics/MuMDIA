@@ -46,10 +46,16 @@ pub fn run(p: RtImTrainParams) -> Result<u64> {
     let s_q = seed.f64("spectrum_q")?;
     let s_score = seed.f64("score")?;
     let s_rt = seed.f64("observed_rt")?;
+    let s_label = seed.str("label")?;
 
     let mut best_per_pep: HashMap<u32, (f64, f64, f64)> = HashMap::new(); // base -> (score, irt, rt)
     for i in 0..seed.nrows {
         if s_q[i] >= p.cfg.q_train {
+            continue;
+        }
+        // Only target PSMs may anchor the RT calibration; a decoy anchor injects a
+        // random iRT<->RT pair into the fit.
+        if s_label[i] != "target" {
             continue;
         }
         let irt = match irt_by_cid.get(&s_cid[i]) {
@@ -83,8 +89,13 @@ pub fn run(p: RtImTrainParams) -> Result<u64> {
         }
     };
 
-    // Residuals and RT window.
-    let (w_rt, status) = if n_train >= 2 {
+    // Residuals and RT window. Require enough anchors before trusting the
+    // residual-percentile window: with only a handful of points a linear fit
+    // passes ~exactly through them, so residuals ~0 and the window collapses to
+    // the 1s floor (which then discards nearly every true co-elution). Below the
+    // threshold, use the configured fixed fallback instead.
+    let min_anchors = p.cfg.min_seed_for_calibration.max(2);
+    let (w_rt, status) = if n_train >= min_anchors {
         let resid: Vec<f64> = train_irt
             .iter()
             .zip(&train_rt)
@@ -95,7 +106,10 @@ pub fn run(p: RtImTrainParams) -> Result<u64> {
         let status = if use_loess { "loess" } else { "linear" };
         (w, status.to_string())
     } else {
-        warn!("rt-im-train: too few seeds; using fallback fixed RT window");
+        warn!(
+            n_train,
+            min_anchors, "rt-im-train: too few target anchors; using fallback fixed RT window"
+        );
         (p.cfg.fallback_rt_window_s, "fallback_fixed".to_string())
     };
 

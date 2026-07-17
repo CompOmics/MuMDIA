@@ -1,6 +1,6 @@
 //! Native target-decoy FDR / q-values (PLAN.md Section 4 Stage F, Section 8:
-//! DIA-NN no-pi0 estimator `q = n_decoys / max(1,n_targets)`, monotonized).
-//! Shared by search-seed and rescore.
+//! no-pi0 estimator `q = (n_decoys + 1) / max(1, n_targets)`, monotonized, with
+//! tied scores collapsed to a single block q). Shared by search-seed and rescore.
 
 /// Compute per-record q-values from (score, is_decoy). Higher score is better.
 /// Returns q aligned to the input order.
@@ -18,13 +18,28 @@ pub fn target_decoy_q(scores: &[(f64, bool)]) -> Vec<f64> {
     });
     let (mut td, mut tt) = (0usize, 0usize);
     let mut fdr_at = vec![1.0f64; n];
-    for (rank, &i) in order.iter().enumerate() {
-        if scores[i].1 {
-            td += 1;
-        } else {
-            tt += 1;
+    // Walk in score order, processing tied-score blocks together so every PSM in
+    // a block gets the same FDR (its within-tie order is arbitrary and must not
+    // change the q). Numerator uses `n_decoys + 1` (the standard conservative
+    // target-decoy estimate); the bare `n_decoys / n_targets` is optimistic in
+    // the low-count regime.
+    let mut rank = 0usize;
+    while rank < n {
+        let s = scores[order[rank]].0;
+        let mut end = rank;
+        while end < n && scores[order[end]].0 == s {
+            if scores[order[end]].1 {
+                td += 1;
+            } else {
+                tt += 1;
+            }
+            end += 1;
         }
-        fdr_at[rank] = (td.max(0) as f64) / (tt.max(1) as f64);
+        let f = (td as f64 + 1.0) / (tt.max(1) as f64);
+        for r in rank..end {
+            fdr_at[r] = f;
+        }
+        rank = end;
     }
     // Monotonize from worst-scoring to best so q is non-increasing with score.
     let mut q = vec![1.0f64; n];
@@ -98,17 +113,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn perfect_separation_gives_zero_q_for_targets() {
-        // all targets score above all decoys
+    fn perfect_separation_q_is_conservative_plus_one() {
+        // all targets score above all decoys; with the (n_decoys+1)/n_targets
+        // estimator the best targets get q = 1/n_targets (not 0).
         let s = vec![(10.0, false), (9.0, false), (1.0, true), (0.5, true)];
         let q = target_decoy_q(&s);
-        // both targets outrank all decoys -> q = 0 for both
-        assert!(q[0] < 1e-9 && q[1] < 1e-9);
-        assert_eq!(count_targets_at_q(&q, &[false, false, true, true], 0.01), 2);
-        // With interleave the top target has q=0
+        // 2 targets, 0 decoys ranked above them -> q = (0+1)/2 = 0.5 for both
+        assert!((q[0] - 0.5).abs() < 1e-9 && (q[1] - 0.5).abs() < 1e-9);
+        assert_eq!(count_targets_at_q(&q, &[false, false, true, true], 0.5), 2);
+        // 3 targets above 1 decoy -> best target q = (0+1)/3 = 1/3
         let s2 = vec![(10.0, false), (9.0, false), (8.0, false), (1.0, true)];
         let q2 = target_decoy_q(&s2);
         assert_eq!(count_targets_at_q(&q2, &[false, false, false, true], 0.34), 3);
+    }
+
+    #[test]
+    fn tied_scores_share_one_q() {
+        // three PSMs at the same score must all receive the same q regardless of
+        // their arbitrary within-tie order (target/decoy interleave in a block).
+        let s = vec![(5.0, false), (5.0, true), (5.0, false)];
+        let q = target_decoy_q(&s);
+        assert!((q[0] - q[1]).abs() < 1e-12 && (q[1] - q[2]).abs() < 1e-12);
     }
 
     #[test]

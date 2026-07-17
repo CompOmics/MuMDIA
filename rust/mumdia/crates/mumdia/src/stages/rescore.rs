@@ -53,10 +53,16 @@ pub fn run(p: RescoreParams) -> Result<u64> {
     );
     let mut feats: Vec<Vec<f64>> = Vec::new();
     let mut mz: Vec<f64> = Vec::new();
+    // `source` = index of the competed input each PSM came from (0..N). For a
+    // single-run rescore this is all-zero; for an experiment-wide rescore over
+    // several files it lets quant map each scored PSM back to its run, and it is
+    // why the Mokapot PIN below keys on a unique row index rather than
+    // candidate_id (which is the library index and repeats across runs).
+    let mut source: Vec<u32> = Vec::new();
     // Feature list is taken from the schema companion of the first input so the
     // classifier input matches the set the features stage produced.
     let feat_names = FeatureSchema::read(&p.competed[0])?.feature_columns;
-    for path in p.competed {
+    for (src, path) in p.competed.iter().enumerate() {
         let t = Table::read(path)?;
         let c = t.u32("candidate_id")?;
         let l = t.str("label")?;
@@ -76,6 +82,7 @@ pub fn run(p: RescoreParams) -> Result<u64> {
             charge.push(z[i] as i32);
             prelim.push(pl[i]);
             mz.push(pm[i]);
+            source.push(src as u32);
             feats.push((0..feat_names.len()).map(|k| fcols[k][i]).collect());
         }
     }
@@ -258,6 +265,9 @@ pub fn run(p: RescoreParams) -> Result<u64> {
             Col::F64("pg_q_value".into(), pg_q),
             Col::F64("global_q_value".into(), global_q),
             Col::F64("prelim_score".into(), prelim),
+            // Run identity for experiment-wide rescore (index into --competed);
+            // all-zero for a single-run rescore. Lets quant map scores per file.
+            Col::U32("source".into(), source),
         ],
     )?;
 
@@ -387,7 +397,25 @@ fn grouped_q<K: std::hash::Hash + Eq + Clone>(
         }
     };
     let qmap: HashMap<K, f64> = ks.into_iter().zip(qv).collect();
-    (0..n).map(|i| qmap[&keys[i]]).collect()
+    // Assign the group q ONLY to the winning (max-score) row of each group. A
+    // losing sibling (a lower-scoring charge/mod variant, which may itself be a
+    // false target) must not inherit the winner's low q; it gets 1.0. The
+    // report/counts dedup by key on the winner, so peptide/PG counts are
+    // unchanged, but per-PSM peptide_q/pg_q no longer propagate to losers.
+    let mut winner: HashMap<K, (f64, usize)> = HashMap::new();
+    for i in 0..n {
+        let e = winner
+            .entry(keys[i].clone())
+            .or_insert((f64::NEG_INFINITY, i));
+        if scores[i] > e.0 {
+            *e = (scores[i], i);
+        }
+    }
+    let mut out = vec![1.0f64; n];
+    for (k, (_, i)) in winner {
+        out[i] = qmap[&k];
+    }
+    out
 }
 
 /// Run the entrapment GBM sidecar: write a Parquet of features + meta columns,
@@ -415,6 +443,10 @@ fn run_entrapment_gbm(
     let outp = format!("{}/entrapment_out.parquet", p.work_dir);
 
     let mut cols = vec![
+        // Unique per-row id for score readback: candidate_id repeats across
+        // competed runs, so mapping scores back by candidate_id collides (later
+        // runs overwrite earlier). Map by this flat row index instead.
+        Col::U32("row_id".into(), (0..cid.len()).map(|i| i as u32).collect()),
         Col::U32("candidate_id".into(), cid.to_vec()),
         Col::U32("base_peptide_id".into(), base.to_vec()),
         Col::I32("is_entrapment".into(), is_entrapment.iter().map(|&b| b as i32).collect()),
@@ -438,11 +470,13 @@ fn run_entrapment_gbm(
     }
 
     let t = Table::read(&outp)?;
-    let ocid = t.u32("candidate_id")?;
+    let orid = t.u32("row_id")?;
     let osc = t.f64("score")?;
-    let map: HashMap<u32, f64> = ocid.into_iter().zip(osc).collect();
+    let map: HashMap<u32, f64> = orid.into_iter().zip(osc).collect();
     let min = map.values().cloned().fold(f64::INFINITY, f64::min);
-    Ok(cid.iter().map(|c| *map.get(c).unwrap_or(&(min - 1.0))).collect())
+    Ok((0..cid.len())
+        .map(|i| *map.get(&(i as u32)).unwrap_or(&(min - 1.0)))
+        .collect())
 }
 
 /// Run Mokapot over a PIN written from the competed set; return scores aligned
@@ -472,9 +506,15 @@ fn run_mokapot(
     s.push_str("SpecId\tLabel\tScanNr\tExpMass\tCalcMass\t");
     s.push_str(&feat_names.join("\t"));
     s.push_str("\tPeptide\tProteins\n");
+    // Key the PIN on the unique row index i (SpecId=psm_i, ScanNr=i), NOT
+    // candidate_id: candidate_id is the library index and repeats across runs, so
+    // an experiment-wide (multi-file) PIN would collide on ScanNr and mokapot's
+    // per-spectrum competition would collapse the runs. The row index is unique
+    // across the whole concatenation. Single-run behaviour is unchanged (the
+    // mapping is bijective and mokapot does not use SpecId/ScanNr as features).
     for i in 0..cid.len() {
         let lab = if label[i] == "decoy" { -1 } else { 1 };
-        write!(s, "cand_{}\t{}\t{}\t{:.5}\t{:.5}\t", cid[i], lab, cid[i], mz[i], mz[i]).ok();
+        write!(s, "psm_{}\t{}\t{}\t{:.5}\t{:.5}\t", i, lab, i, mz[i], mz[i]).ok();
         for fi in 0..feat_names.len() {
             write!(s, "{:.6}\t", feats[i][fi]).ok();
         }
@@ -493,10 +533,13 @@ fn run_mokapot(
         anyhow::bail!("mokapot worker exited with {status}");
     }
 
+    // The worker echoes the PIN's SpecId tail as `candidate_id`, which here is the
+    // row index i. Map scores back by row index; a missing row (should not happen
+    // now the worker scores all PSMs) gets the worst score.
     let t = Table::read(&outp)?;
-    let ocid = t.u32("candidate_id")?;
+    let orow = t.u32("candidate_id")?;
     let osc = t.f64("score")?;
-    let map: HashMap<u32, f64> = ocid.into_iter().zip(osc).collect();
-    let min = map.values().cloned().fold(f64::INFINITY, f64::min);
-    Ok(cid.iter().map(|c| *map.get(c).unwrap_or(&(min - 1.0))).collect())
+    let map: HashMap<u32, f64> = orow.into_iter().zip(osc).collect();
+    let worst = map.values().cloned().fold(f64::INFINITY, f64::min) - 1.0;
+    Ok((0..cid.len() as u32).map(|i| *map.get(&i).unwrap_or(&worst)).collect())
 }

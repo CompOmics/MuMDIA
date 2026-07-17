@@ -39,6 +39,27 @@ pub fn run(p: CompeteParams) -> Result<u64> {
     let feat_names = &schema.feature_columns;
     let feat_cols: Vec<Vec<f64>> = feat_names.iter().map(|c| t.f64(c).unwrap()).collect();
 
+    // `charge` is a minimal feature column (present in every set), stored as f64.
+    // Only the peptidoform-charge grouping needs it.
+    let charge = t.f64("charge").ok();
+    if matches!(p.cfg.group_by, CompeteGroupBy::PeptidoformCharge) && charge.is_none() {
+        anyhow::bail!("compete group_by=peptidoform_charge requires a 'charge' feature column");
+    }
+    // Dense peptidoform id by first appearance (deterministic) so the fixed-size
+    // tuple key can separate modforms without allocating a String per PSM. Built
+    // only for the peptidoform-charge grouping; empty otherwise.
+    let pform_id: Vec<u32> = if matches!(p.cfg.group_by, CompeteGroupBy::PeptidoformCharge) {
+        let mut ids = Vec::with_capacity(t.nrows);
+        let mut seen: HashMap<&str, u32> = HashMap::new();
+        for i in 0..t.nrows {
+            let next = seen.len() as u32;
+            ids.push(*seen.entry(pform[i].as_str()).or_insert(next));
+        }
+        ids
+    } else {
+        Vec::new()
+    };
+
     // Winner per competition group. The label is part of the key so a target is
     // NOT competed against its own decoy: the decoy population must survive for
     // the rescorer/FDR to have a valid null (otherwise decoys are depleted and
@@ -60,6 +81,12 @@ pub fn run(p: CompeteParams) -> Result<u64> {
             CompeteGroupBy::Apex => {
                 let bucket = (apex_rt[i] / p.cfg.apex_rt_tolerance_s).round() as i64;
                 (base[i], label_code, bucket)
+            }
+            CompeteGroupBy::PeptidoformCharge => {
+                // pform_id separates modforms; charge in the bucket separates
+                // charges -> one group per peptidoform+charge (precursor-level).
+                let c = charge.as_ref().unwrap()[i].round() as i64;
+                (pform_id[i], label_code, c)
             }
         };
         winner
