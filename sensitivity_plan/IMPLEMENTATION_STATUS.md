@@ -150,3 +150,39 @@ Branch `feat/sensitivity-improvements`. All Rust changes keep the suite green
   adaptive_rt_window, competition modes) has an engine-gain measurement yet: each
   must pass the entrapment-holdout gate on >=2 datasets before being enabled by
   default (spec 05 §6). That validation loop is the next action, not more code.
+
+---
+
+## Session 3 (large items) — status
+
+All default-off / sidecar; suite green (95 tests), release builds. Validated on the
+real E. coli artifacts.
+
+### Done
+- P1.1/P1.2 top-K peak retention: `extract.retain_top_peaks>1` writes
+  `<psms>.peaks.parquet` (evidence-breadth-ranked peak groups). Validated: K=5 on
+  E. coli emitted 1,699,995 peaks (mean 4.97/candidate); main psms/chrom flow and
+  FDR unchanged (accepted 341,754 as at K=1).
+- P1.3 peak-selection model `scripts/peak_selection_model.py`: grouped-OOF ranker
+  over the peaks table. E. coli (weak self-label, 237,328 candidates): learned
+  top1 0.426 / top3 0.802; evidence-rank 0.418; area-rank 0.390. Evidence beats
+  area (consistent with the intensity-is-chimeric argument). Honest label needs
+  `--diann`.
+- P3.1 two-pass mass calibration (`search_seed.two_pass_mass_cal`).
+- P2.1/P2.2/P2.3/P5.5 `scripts/conflict_features.py`: fragment-claimant index +
+  peak-group conflict graph + contested/unique/ambiguity features -> conflict.parquet.
+- P6.2 `scripts/localization.py`: localization-variant grouping + site-determining
+  ions -> localization.parquet (0 ambiguity groups on E. coli, as expected).
+
+### Genuinely remaining (fix later, per user)
+- P6.3 staged modification search (calibration stage then extended-mod stage): not
+  started.
+- In-core wiring of the sidecar features (conflict_features / localization) into the
+  rescorer feature schema: they currently land as joinable Parquet sidecars. Wiring
+  needs the cross-candidate pass inside `features.rs` (precedent: the cross_charge
+  extended-extras) + schema-count test updates.
+- Top-K peak SELECTION fed back into the reported PSM (the peaks are retained + a
+  selection model exists, but the engine still reports the heuristic apex; closing
+  the loop needs per-peak features, P1.2-full, then re-selection before rescore).
+- All new default-off knobs still require the entrapment-gate validation on >=2
+  datasets before being enabled by default (spec 05 §6).
