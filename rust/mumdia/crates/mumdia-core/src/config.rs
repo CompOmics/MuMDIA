@@ -379,6 +379,12 @@ pub struct SearchSeedConfig {
     pub top_n_peaks: usize,
     /// Fragment-matcher backend (fragindex_spec). Default `Fragindex`.
     pub matcher: MatcherKind,
+    /// Robust two-pass fragment mass calibration (sensitivity_plan P3.1). After the
+    /// first median-offset + tolerance fit, re-fit on only the deviations inside the
+    /// first-pass tolerance window (rejecting outliers), giving a tighter, more
+    /// robust offset + local uncertainty. Falls back to the single-pass result when
+    /// too few in-window calibrants remain. Default false (single pass unchanged).
+    pub two_pass_mass_cal: bool,
 }
 impl Default for SearchSeedConfig {
     fn default() -> Self {
@@ -390,6 +396,7 @@ impl Default for SearchSeedConfig {
             min_matched_peaks: 4,
             top_n_peaks: 0,
             matcher: MatcherKind::Fragindex,
+            two_pass_mass_cal: false,
         }
     }
 }

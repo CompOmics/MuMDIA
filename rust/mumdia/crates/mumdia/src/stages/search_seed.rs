@@ -173,25 +173,46 @@ pub fn run(p: SearchSeedParams) -> Result<u64> {
             }
         }
     }
-    let (frag_ppm_offset, frag_tol_learned) = if devs.len() >= 20 {
-        let mut sorted = devs.clone();
+    // Median offset + 95th-percentile-of-centered tolerance. `fit` is reused by the
+    // optional robust second pass on the outlier-trimmed calibrants.
+    let fit = |d: &[f64]| -> (f64, f64) {
+        let mut sorted = d.to_vec();
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
         let offset = sorted[sorted.len() / 2];
-        let centered: Vec<f64> = devs.iter().map(|d| (d - offset).abs()).collect();
+        let centered: Vec<f64> = d.iter().map(|x| (x - offset).abs()).collect();
         let tol = (crate::calibrate::percentile(&centered, 0.95) * 1.5).max(5.0);
         (offset, tol)
+    };
+    let (frag_ppm_offset, frag_tol_learned, cal_passes) = if devs.len() >= 20 {
+        let (o1, t1) = fit(&devs);
+        if p.cfg.two_pass_mass_cal {
+            // Second pass: keep only deviations inside the first-pass window, so
+            // random-match outliers cannot bias the offset, then re-fit.
+            let inl: Vec<f64> = devs.iter().cloned().filter(|d| (d - o1).abs() <= t1).collect();
+            if inl.len() >= 20 {
+                let (o2, t2) = fit(&inl);
+                (o2, t2, 2)
+            } else {
+                (o1, t1, 1)
+            }
+        } else {
+            (o1, t1, 1)
+        }
     } else {
-        (0.0, p.cfg.fragment_tol_ppm)
+        (0.0, p.cfg.fragment_tol_ppm, 0)
     };
     mumdia_io::json::write_json(
         &format!("{}.masscal.json", p.out),
         &json!({
             "frag_ppm_offset": frag_ppm_offset,
             "frag_tol_ppm": frag_tol_learned,
+            // The learned tolerance is the local mass-uncertainty estimate.
+            "frag_ppm_sigma": frag_tol_learned,
             "n_dev": devs.len(),
+            "cal_passes": cal_passes,
         }),
     )?;
-    info!(frag_ppm_offset, frag_tol_learned, "search-seed: mass recalibration");
+    info!(frag_ppm_offset, frag_tol_learned, cal_passes, "search-seed: mass recalibration");
 
     let n = write_table(
         p.out,
