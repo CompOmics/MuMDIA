@@ -28,10 +28,12 @@ use rayon::prelude::*;
 // OktoberFest analogs plus novel families. Kept separate so they can be built
 // and reviewed independently; the registry below concatenates them in a fixed
 // order that defines the extended schema.
+mod apex_dispersion;
 mod chromatographic;
 mod coelution;
 mod entropy;
 mod interference;
+mod mass_uncertainty;
 mod ion_series;
 mod mass_accuracy;
 mod ms1;
@@ -60,6 +62,8 @@ const FAMILIES: &[(&[&str], FamilyFn)] = &[
     (nonzero::NAMES, nonzero::values),
     (order_consistency::NAMES, order_consistency::values),
     (peak_scans::NAMES, peak_scans::values),
+    (apex_dispersion::NAMES, apex_dispersion::values),
+    (mass_uncertainty::NAMES, mass_uncertainty::values),
 ];
 
 /// Names already used by the Minimal/Rich sets, which the extended battery must
