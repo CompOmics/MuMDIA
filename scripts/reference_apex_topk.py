@@ -241,6 +241,10 @@ def main():
     ap.add_argument("--bound-fraction", type=float, default=1.0 / 3.0)
     ap.add_argument("--min-prominence", type=float, default=0.05)
     ap.add_argument("--rt-tol-s", type=float, default=10.0)
+    ap.add_argument("--rank-by", choices=["area", "count"], default="area",
+                    help="peak ranking: 'area' = integrated intensity (chimeric in DIA); "
+                         "'count' = number of distinct predicted fragments co-eluting in the "
+                         "peak window (breadth of evidence, interference-resistant)")
     ap.add_argument("--rt-round", type=int, default=3, help="RT rounding decimals for axis union")
     ap.add_argument("--batch-size", type=int, default=100000)
     args = ap.parse_args()
@@ -306,6 +310,27 @@ def main():
         rt_axis, prof = build_consensus(rows, args.top_frags, args.rt_round)
         peaks = enumerate_peaks(prof, len(prof) if len(prof) else 0,
                                 args.bound_fraction, args.min_prominence)
+        # Evidence-count ranking (interference-resistant): rank each peak by the
+        # number of DISTINCT predicted fragments with any nonzero intensity inside
+        # its RT window, not by integrated intensity. In DIA the tallest peak is
+        # often a co-isolated interferent; the true peak is the one where the most
+        # of the peptide's own predicted transitions co-elute. Uses ALL fragment
+        # rows (breadth), not just the top-N summed into the detection profile.
+        if args.rank_by == "count" and peaks:
+            for p in peaks:
+                lo, hi = rt_axis[p["start_idx"]], rt_axis[p["end_idx"]]
+                ev = 0
+                for _predi, rt_list, int_list in rows:
+                    present = any(
+                        (lo <= float(rt) <= hi) and (float(it) > 0.0)
+                        for rt, it in zip(rt_list, int_list)
+                    )
+                    if present:
+                        ev += 1
+                p["evidence"] = ev
+            peaks.sort(key=lambda p: (-p.get("evidence", 0), -p["area"], p["apex_idx"]))
+            for r, p in enumerate(peaks):
+                p["rank"] = r
         peaks_per_cand.append(len(peaks))
         processed.add(cid)
         # SELF
