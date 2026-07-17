@@ -259,6 +259,23 @@ pub fn run(p: RunParams) -> Result<()> {
     })?;
     man.record(record_artifact(artifact::PSMS_SCORED.0, artifact::PSMS_SCORED, &scored, n, "rescore", &ch)?);
 
+    // Optional candidate audit (sensitivity program, P0.3): reconstruct the
+    // per-candidate identification-loss ladder from the artifact chain. Off by
+    // default (gated on extract.emit_candidate_audit); adds one cheap join pass.
+    if cfg.extract.emit_candidate_audit {
+        let audit_out = d("candidate_audit.parquet");
+        audit::run(audit::AuditParams {
+            library_precursors: &lib_p,
+            psms: &psms,
+            competed: &competed,
+            scored: &scored,
+            out: &audit_out,
+            q_threshold: 0.01,
+            run_id: p.out_dir,
+            entrapment_substr: "",
+        })?;
+    }
+
     let pep_q = d("peptide_quant.parquet");
     let pg_q = d("protein_group_quant.parquet");
     let frag_q = d("fragment_quant.parquet");
