@@ -36,3 +36,5 @@ scripts/_probe*.py
 # internal docs/specs/analysis: kept local, NOT published (public repo ships only READMEs)
 /*.md
 !/README.md
+# local archive of superseded working docs (not published)
+/_archive/

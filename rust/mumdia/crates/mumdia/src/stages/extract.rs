@@ -842,9 +842,10 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
         // full predicted set (a missing strong ion is penalized). An OBSERVED
         // fragment carries its grid-sampled (or sorted) trace; a NEVER-OBSERVED one
         // carries an EMPTY trace, NOT a grid-length zero vector. The empty trace
-        // still yields obs_apex = 0 downstream, but avoids inflating the total
-        // chromatogram list-values past arrow's 32-bit ListArray offset limit
-        // (a grid-length zero per absent fragment overflowed it on large runs).
+        // still yields obs_apex = 0 downstream, and keeps the total chromatogram
+        // list-value count down (a grid-length zero per absent fragment would
+        // bloat it needlessly; the column itself is now a 64-bit LargeList, so the
+        // old ~2.1B 32-bit offset ceiling no longer applies).
         // obs m/z falls back to theoretical; harmless since mass-accuracy counts
         // only fragments with obs_apex > 0.
         for fi in 0..fmzs.len() {
@@ -990,8 +991,11 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
             Col::F64("frag_mz".into(), ch_fmz),
             Col::F64("frag_obs_mz".into(), ch_obsmz),
             Col::F32("predicted_intensity".into(), ch_pint),
-            Col::ListF32("rt".into(), ch_rt),
-            Col::ListF32("intensity".into(), ch_int),
+            // LargeList (64-bit offsets): the total chromatogram list-value count
+            // can exceed the ~2.1B limit of a 32-bit ListArray offset buffer when
+            // extraction accepts a very large candidate set (e.g. gates opened up).
+            Col::LargeListF32("rt".into(), ch_rt),
+            Col::LargeListF32("intensity".into(), ch_int),
         ],
     )?;
 
