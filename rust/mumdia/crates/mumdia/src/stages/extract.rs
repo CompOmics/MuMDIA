@@ -663,23 +663,35 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
         let rt_prior_sigma = p.cfg.apex_rt_prior_s;
         let rt_cal_c = rt_cal[cid as usize];
         let use_prior = rt_prior_sigma > 0.0 && rt_cal_c > 0.0;
+        // Signature-ion apex tiebreak: sum the OBSERVED intensity of the top-K
+        // PREDICTED fragments (`apex_top_fragments`; 0 -> a default of 3) at each
+        // qualifying scan, instead of the 3 brightest observed peaks. A bright
+        // interferent on a non-signature ion can then no longer define the apex.
+        let k_sig = if p.cfg.apex_top_fragments > 0 {
+            p.cfg.apex_top_fragments
+        } else {
+            3
+        };
+        let sig: Vec<u16> = {
+            let mut ord: Vec<usize> = (0..fints0.len()).collect();
+            ord.sort_by(|&a, &b| fints0[b].partial_cmp(&fints0[a]).unwrap_or(std::cmp::Ordering::Equal));
+            ord.into_iter().take(k_sig).map(|o| o as u16).collect()
+        };
         let mut apex_rt = groups[0].0;
         let mut apex_sum = 0.0f32;
-        let mut best_top3 = f32::NEG_INFINITY;
+        let mut best_sig = f32::NEG_INFINITY;
         for (i, (rt, map)) in groups.iter().enumerate() {
             if map.is_empty() || smoothed[i] < thresh {
                 continue;
             }
-            let mut vals: Vec<f32> = map.values().cloned().collect();
-            vals.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
-            let top3: f32 = vals.iter().take(3).sum();
+            let sig_sum: f32 = sig.iter().map(|&o| map.get(&o).copied().unwrap_or(0.0)).sum();
             let score = if use_prior {
-                top3 * (-0.5 * ((*rt - rt_cal_c) / rt_prior_sigma).powi(2)).exp() as f32
+                sig_sum * (-0.5 * ((*rt - rt_cal_c) / rt_prior_sigma).powi(2)).exp() as f32
             } else {
-                top3
+                sig_sum
             };
-            if score > best_top3 {
-                best_top3 = score;
+            if score > best_sig {
+                best_sig = score;
                 apex_rt = *rt;
                 apex_sum = map.values().sum(); // report full apex intensity
             }
@@ -787,28 +799,40 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
         } else {
             Vec::new()
         };
-        let mut frag_keys: Vec<u16> = per_frag.keys().cloned().collect();
-        frag_keys.sort_unstable();
-        for frag in frag_keys {
-            let fi = frag as usize;
+        // Emit EVERY predicted transition, not just the observed ones. A predicted
+        // fragment never matched anywhere gets a zero-intensity row (all-zero grid
+        // trace, or an empty series without the grid) so the feature families see
+        // the full predicted set: similarity/entropy/ion-series/coelution get the
+        // correct denominator and a missing strong ion is penalized. obs m/z falls
+        // back to the theoretical m/z, which is harmless because the mass-accuracy
+        // features only count fragments with obs_apex > 0.
+        for fi in 0..fmzs.len() {
+            let frag = fi as u16;
             let obs_mz = wsum
                 .get(&frag)
                 .map(|(sm, sw)| if *sw > 0.0 { sm / sw } else { fmzs[fi] })
                 .unwrap_or(fmzs[fi]);
             let (rts, ints): (Vec<f32>, Vec<f32>) = if !grid.is_empty() {
-                let m: HashMap<u64, f32> =
-                    per_frag[&frag].iter().map(|(r, i)| (r.to_bits(), *i)).collect();
+                let m: HashMap<u64, f32> = per_frag
+                    .get(&frag)
+                    .map(|v| v.iter().map(|(r, i)| (r.to_bits(), *i)).collect())
+                    .unwrap_or_default();
                 (
                     grid.iter().map(|r| *r as f32).collect(),
                     grid.iter().map(|r| *m.get(&r.to_bits()).unwrap_or(&0.0)).collect(),
                 )
             } else {
-                let mut s = per_frag[&frag].clone();
-                s.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-                (
-                    s.iter().map(|(r, _)| *r as f32).collect(),
-                    s.iter().map(|(_, i)| *i).collect(),
-                )
+                match per_frag.get(&frag) {
+                    Some(v) => {
+                        let mut s = v.clone();
+                        s.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+                        (
+                            s.iter().map(|(r, _)| *r as f32).collect(),
+                            s.iter().map(|(_, i)| *i).collect(),
+                        )
+                    }
+                    None => (Vec::new(), Vec::new()),
+                }
             };
             chrom_rows.push((cid, fnames[fi].clone(), fmzs[fi], obs_mz, fints[fi], rts, ints));
         }

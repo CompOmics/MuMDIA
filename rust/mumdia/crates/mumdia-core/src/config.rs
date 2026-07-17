@@ -833,6 +833,36 @@ impl Config {
                     .into(),
             ));
         }
+        // Warn (not fail) when a declared-but-unimplemented knob is set away from
+        // its default: it silently has no effect, which otherwise misleads tuning.
+        let d = Self::default();
+        let mut dead = Vec::new();
+        if self.search_seed.precursor_tol_ppm != d.search_seed.precursor_tol_ppm {
+            dead.push("search_seed.precursor_tol_ppm");
+        }
+        if self.rt_im_train.tolerance_regime != d.rt_im_train.tolerance_regime {
+            dead.push("rt_im_train.tolerance_regime");
+        }
+        if self.extract.k_select != d.extract.k_select {
+            dead.push("extract.k_select");
+        }
+        if self.extract.max_fragment_charge != d.extract.max_fragment_charge {
+            dead.push("extract.max_fragment_charge");
+        }
+        if self.extract.scan_scale != d.extract.scan_scale {
+            dead.push("extract.scan_scale");
+        }
+        if self.digest.decoy.source != d.digest.decoy.source {
+            dead.push("digest.decoy.source");
+        }
+        if self.digest.decoy.ratio != d.digest.decoy.ratio {
+            dead.push("digest.decoy.ratio");
+        }
+        for k in &dead {
+            eprintln!(
+                "config warning: `{k}` is set but not implemented in the engine; it has no effect"
+            );
+        }
         Ok(())
     }
 
