@@ -519,6 +519,18 @@ pub struct ExtractConfig {
     /// it only with target-decoy/entrapment FDR validation. MS1 evidence is now
     /// computed before the gate so this can take effect.
     pub ms1_rescue: bool,
+    /// Number of chromatographic peak groups to retain per candidate (sensitivity
+    /// program, spec 04 §3 / P1). `1` = legacy behaviour (one apex-level PSM per
+    /// candidate). `K>1` retains up to K local-maxima peak groups per candidate so
+    /// a wrong early apex does not discard the correct peak before rescoring. Each
+    /// retained peak carries its own apex, boundaries, initial evidence, and
+    /// `peak_rank`. K=1 is bit-for-bit compatible with the previous behaviour.
+    pub retain_top_peaks: usize,
+    /// Diagnostic candidate-audit: when true, extraction records, for every probed
+    /// candidate, either the survivor stage-flags or the earliest `RejectionReason`,
+    /// and writes `<out-psms>.audit.parquet` (spec 01 §4 / P0.3). Near-zero cost
+    /// when false (no per-candidate audit allocation). Default false (production).
+    pub emit_candidate_audit: bool,
 }
 impl Default for ExtractConfig {
     fn default() -> Self {
@@ -551,6 +563,8 @@ impl Default for ExtractConfig {
             matcher: MatcherKind::Fragindex,
             min_coelution_run: 0, // disabled; scan_window floor still applies
             ms1_rescue: false,    // opt-in; relaxes acceptance, validate FDR first
+            retain_top_peaks: 1,  // legacy single-apex behaviour (K=1)
+            emit_candidate_audit: false, // diagnostic; off in production
         }
     }
 }
@@ -592,12 +606,72 @@ pub struct CompeteConfig {
     /// peptide are not collapsed.
     pub group_by: CompeteGroupBy,
     pub apex_rt_tolerance_s: f64,
+    /// How within-group competition resolves (sensitivity program, spec 04 §6 /
+    /// P2.4). `winner_take_all` = legacy (keep only the top `prelim_score` per
+    /// group). The other modes preserve more candidate evidence for the rescorer/
+    /// FDR to arbitrate. Default `winner_take_all` (unchanged behaviour).
+    pub mode: CompetitionMode,
+    /// Score margin (in `prelim_score` units) required to remove a loser under
+    /// `margin_gated`. A loser closer than this to the winner is kept.
+    pub margin: f64,
+    /// Minimum distinct unique-fragment count a loser must have to survive under
+    /// `unique_evidence` (needs the `unique_fragment_count` feature; falls back to
+    /// winner-take-all when the column is absent).
+    pub unique_evidence_min_fragments: usize,
+    /// Diagnostic: when true, write `<out>.compete_audit.parquet` recording every
+    /// removed candidate with its group, winner, scores, and removal reason.
+    pub emit_competition_audit: bool,
 }
 impl Default for CompeteConfig {
     fn default() -> Self {
         Self {
             group_by: CompeteGroupBy::Precursor,
             apex_rt_tolerance_s: 5.0,
+            mode: CompetitionMode::WinnerTakeAll,
+            margin: 0.0,
+            unique_evidence_min_fragments: 2,
+            emit_competition_audit: false,
+        }
+    }
+}
+
+/// Within-group competition resolution (spec 04 §6). Only `WinnerTakeAll` removes
+/// candidates unconditionally; the others preserve candidates the rescorer can
+/// still discriminate, which is the sensitivity program's central principle
+/// ("preserve candidate evidence until the workflow can make a calibrated
+/// decision"). Target/decoy labels remain part of the competition key in every
+/// mode, so a target never competes against its own decoy (the null is preserved).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CompetitionMode {
+    /// Legacy: keep only the highest `prelim_score` candidate per group.
+    #[default]
+    WinnerTakeAll,
+    /// Keep every candidate (no within-group removal); FDR handles ambiguity.
+    None,
+    /// Keep every candidate; conflict/contested features (added upstream) carry the
+    /// interference signal into rescoring. Same retained set as `None`; the name
+    /// documents intent for the experiment matrix.
+    FeaturesOnly,
+    /// Keep a loser when it has enough independent evidence
+    /// (`unique_fragment_count >= unique_evidence_min_fragments`); otherwise remove
+    /// it (winner-take-all fallback).
+    UniqueEvidence,
+    /// Remove a loser only when `winner_score - loser_score >= margin`; otherwise
+    /// keep it. Conservative removal for the low-FDR region.
+    MarginGated,
+}
+
+impl CompetitionMode {
+    /// Parse a CLI/token spelling.
+    pub fn from_token(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().replace('-', "_").as_str() {
+            "winner_take_all" | "winner" => Some(Self::WinnerTakeAll),
+            "none" => Some(Self::None),
+            "features_only" | "features" => Some(Self::FeaturesOnly),
+            "unique_evidence" | "unique" => Some(Self::UniqueEvidence),
+            "margin_gated" | "margin" => Some(Self::MarginGated),
+            _ => None,
         }
     }
 }
@@ -837,6 +911,13 @@ impl Config {
             return Err(Invalid(
                 "rt_im_train.calibration_method=none is not valid (it silently falls \
                  through to the linear fit). Use \"linear\" or \"loess\"."
+                    .into(),
+            ));
+        }
+        if self.extract.retain_top_peaks == 0 {
+            return Err(Invalid(
+                "extract.retain_top_peaks must be >= 1 (1 = legacy single-apex \
+                 behaviour; K>1 retains up to K peak groups per candidate)."
                     .into(),
             ));
         }

@@ -8,6 +8,7 @@ pub mod constants;
 pub mod error;
 pub mod manifest;
 pub mod mass;
+pub mod rejection;
 pub mod schema;
 pub mod types;
 
