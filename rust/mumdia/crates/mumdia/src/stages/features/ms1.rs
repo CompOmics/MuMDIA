@@ -283,7 +283,9 @@ fn xic_features(e: &Evidence) -> (f64, f64, f64, f64, f64, f64, f64, f64, f64, f
             };
             let base_width = fwhm(axis, r);
             let d = (axis[am_mono] - axis[am_r]).abs();
-            fin(d / (base_width + EPS))
+            // Bounded to [0,1): d/(d+width) instead of d/width, so a degenerate
+            // (~0) reference width can't send the feature to ~1e9.
+            fin(d / (d + base_width + EPS))
         } else {
             0.0
         }

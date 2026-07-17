@@ -38,6 +38,7 @@ mod ms1;
 mod nonzero;
 mod novel;
 mod order_consistency;
+mod peak_scans;
 mod rt;
 mod similarity;
 
@@ -58,6 +59,7 @@ const FAMILIES: &[(&[&str], FamilyFn)] = &[
     (novel::NAMES, novel::values),
     (nonzero::NAMES, nonzero::values),
     (order_consistency::NAMES, order_consistency::values),
+    (peak_scans::NAMES, peak_scans::values),
 ];
 
 /// Names already used by the Minimal/Rich sets, which the extended battery must
@@ -853,11 +855,24 @@ pub(crate) fn peak_bounds(prof: &[f64], ai: usize, frac: f64, grace: usize) -> (
     if n < 3 {
         return (0, n.saturating_sub(1));
     }
-    let peak = if prof[ai] > 0.0 {
-        prof[ai]
-    } else {
-        prof.iter().cloned().fold(0.0, f64::max)
-    };
+    // If the supplied apex sits at zero profile height, relocate it to the global
+    // maximum. Using the max only for the threshold while walking from the zero
+    // `ai` collapses both walks to a zero-width window around the wrong scan.
+    let mut ai = ai;
+    if prof[ai] <= 0.0 {
+        ai = prof
+            .iter()
+            .enumerate()
+            .fold((0usize, f64::NEG_INFINITY), |(bi, bv), (i, &v)| {
+                if v > bv {
+                    (i, v)
+                } else {
+                    (bi, bv)
+                }
+            })
+            .0;
+    }
+    let peak = prof[ai];
     if peak <= 0.0 {
         return (0, n - 1);
     }

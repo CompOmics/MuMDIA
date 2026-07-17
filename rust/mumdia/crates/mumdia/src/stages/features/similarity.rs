@@ -714,6 +714,14 @@ pub fn values(e: &Evidence) -> Vec<f64> {
             keep.remove(worst);
             let ot: Vec<f64> = keep.iter().map(|&i| o[i]).collect();
             let lt: Vec<f64> = keep.iter().map(|&i| l[i]).collect();
+            // Do not let trimming collapse to an all-absent observed vector: the
+            // trim ranks by residual and can remove every present fragment first,
+            // leaving only predicted-but-absent ones, for which cosine is a
+            // spurious 0.0 that reads as decoy-like for few-fragment peptides.
+            // Stop and hold the last non-degenerate value instead.
+            if ot.iter().map(|x| x.abs()).sum::<f64>() <= EPS {
+                break;
+            }
             let c = fin(cosine(&ot, &lt));
             for s in step..3 {
                 out[s] = c;
