@@ -334,7 +334,9 @@ pub struct PredictFragConfig {
     pub predictor: FragPredictorKind,
     pub rt_predictor: RtPredictorKind,
     /// Fragment charges rule: charge 1 always; charge 2 added for precursor
-    /// charge >= this threshold (PLAN.md Decision 3).
+    /// charge >= this threshold (PLAN.md Decision 3). Default 2: DIA-NN uses
+    /// doubly-charged fragments for ~16% of charge-2 precursors' transitions, so
+    /// blocking them (the old default of 3) discarded real signal.
     pub charge2_from_precursor_charge: i32,
     pub top_n_fragments: usize,
     pub ms2pip_model: String,
@@ -350,7 +352,7 @@ impl Default for PredictFragConfig {
         Self {
             predictor: t(),
             rt_predictor: t(),
-            charge2_from_precursor_charge: 3,
+            charge2_from_precursor_charge: 2,
             top_n_fragments: 6,
             ms2pip_model: "HCD".to_string(),
             ms2pip_python: None,
@@ -577,7 +579,10 @@ impl Default for FeaturesConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct CompeteConfig {
     /// competition grouping: `precursor` groups target/decoy pairs and charge
-    /// variants of one peptide; `apex` also groups by rounded apex RT.
+    /// variants of one peptide; `apex` also groups by rounded apex RT;
+    /// `peptidoform_charge` keeps each peptidoform+charge as its own group
+    /// (precursor-level, as DIA-NN/Spectronaut report), so sibling charges of one
+    /// peptide are not collapsed.
     pub group_by: CompeteGroupBy,
     pub apex_rt_tolerance_s: f64,
 }
@@ -595,6 +600,10 @@ impl Default for CompeteConfig {
 pub enum CompeteGroupBy {
     Precursor,
     Apex,
+    /// Precursor-level: separate every distinct peptidoform+charge. Recovers
+    /// sibling charges the peptide-level `Precursor` grouping collapses; the
+    /// label stays in the key so a target never competes against its own decoy.
+    PeptidoformCharge,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

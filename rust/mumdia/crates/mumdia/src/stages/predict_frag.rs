@@ -310,7 +310,7 @@ fn assign_intensities(p: &PredictFragParams, raws: &mut [Raw]) -> Result<String>
                     Some(per) if !per.is_empty() => {
                         // native as fallback for fragment charges MS2PIP does not emit (charge 2)
                         let nat = native.predict_intensities(&r.parsed, &r.frags);
-                        r.frag_int = r
+                        let mut vals: Vec<f32> = r
                             .frags
                             .iter()
                             .enumerate()
@@ -323,6 +323,27 @@ fn assign_intensities(p: &PredictFragParams, raws: &mut [Raw]) -> Result<String>
                                 }
                             })
                             .collect();
+                        // MS2PIP (charge-1, TIC-fraction, ~0.02-0.3) and the native
+                        // charge-2 fallback (max-normalized, ~0.19-0.5) live on
+                        // different scales; ranking them together in top-N buries
+                        // MS2PIP. Max-normalize each charge group to its own peak so
+                        // the two compete fairly.
+                        let gmax = |want2: bool| {
+                            r.frags
+                                .iter()
+                                .zip(&vals)
+                                .filter(|(fr, _)| (fr.charge >= 2) == want2)
+                                .map(|(_, v)| *v)
+                                .fold(0.0f32, f32::max)
+                        };
+                        let (m1, m2) = (gmax(false), gmax(true));
+                        for (k, fr) in r.frags.iter().enumerate() {
+                            let m = if fr.charge >= 2 { m2 } else { m1 };
+                            if m > 0.0 {
+                                vals[k] /= m;
+                            }
+                        }
+                        r.frag_int = vals;
                     }
                     _ => {
                         r.frag_int = native.predict_intensities(&r.parsed, &r.frags);
