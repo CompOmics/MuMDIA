@@ -117,6 +117,49 @@ fn sum_near(mz: &[f64], inten: &[f32], target: f64, tol_ppm: f64) -> f32 {
     acc
 }
 
+/// Co-elution acceptance score (sensitivity program): predicted-intensity-weighted
+/// mean Pearson correlation of each matched fragment's XIC to the signature-ion
+/// reference profile, over the elution scan groups. High when the peptide's own
+/// fragments co-elute (real); low when a matched fragment is a non-co-eluting
+/// interferent that only coincides at the apex. More robust to chimeric DIA
+/// interference than the single-scan apex intensity Pearson. Returns 1.0 (do not
+/// reject) when there are too few scan groups or no reference signal.
+fn coelution_gate_score(
+    groups: &[(f64, std::collections::BTreeMap<u16, f32>)],
+    distinct: &[u16],
+    sig: &[u16],
+    fints0: &[f32],
+) -> f64 {
+    if groups.len() < 3 {
+        return 1.0;
+    }
+    let refp: Vec<f64> = groups
+        .iter()
+        .map(|(_, m)| sig.iter().map(|o| *m.get(o).unwrap_or(&0.0) as f64).sum::<f64>())
+        .collect();
+    if refp.iter().all(|x| *x <= 0.0) {
+        return 1.0;
+    }
+    let (mut wsum, mut wtot) = (0.0f64, 0.0f64);
+    for &f in distinct {
+        let tr: Vec<f64> = groups
+            .iter()
+            .map(|(_, m)| *m.get(&f).unwrap_or(&0.0) as f64)
+            .collect();
+        if tr.iter().any(|x| *x > 0.0) {
+            let c = crate::stats::pearson(&tr, &refp).max(0.0);
+            let w = *fints0.get(f as usize).unwrap_or(&0.0) as f64 + 1e-9;
+            wsum += c * w;
+            wtot += w;
+        }
+    }
+    if wtot > 0.0 {
+        wsum / wtot
+    } else {
+        1.0
+    }
+}
+
 /// fragindex non-two-pass accumulation over isolation-window groups, in parallel.
 /// Each scan belongs to exactly one window, so the groups are independent; the
 /// per-candidate hit lists are merged by concatenating in (window-sorted) group
@@ -816,18 +859,26 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
             .find(|(rt, _)| (*rt - apex_rt).abs() < 1e-9)
             .map(|(_, m)| m);
         if p.cfg.min_frag_corr > 0.0 {
-            if let Some(map) = apex_map {
+            // Acceptance score: either the CO-ELUTION correlation over the elution
+            // window (interference-robust) or the legacy single-scan intensity
+            // Pearson at the apex, per `gate_coelution`.
+            let gate_score = if p.cfg.gate_coelution {
+                coelution_gate_score(&groups, &distinct, &sig, &fints0)
+            } else if let Some(map) = apex_map {
                 let obs: Vec<f64> = (0..fmzs0.len())
                     .map(|k| *map.get(&(k as u16)).unwrap_or(&0.0) as f64)
                     .collect();
                 let pred: Vec<f64> = fints0.iter().map(|x| *x as f64).collect();
-                if crate::stats::pearson(&obs, &pred) < p.cfg.min_frag_corr {
-                    let rescued = p.cfg.ms1_rescue
-                        && ms1_support
-                        && distinct.len() >= p.cfg.presence_min_fragments.max(1);
-                    if !rescued {
-                        return None;
-                    }
+                crate::stats::pearson(&obs, &pred)
+            } else {
+                1.0 // no apex scan resolved; do not reject on spectral agreement
+            };
+            if gate_score < p.cfg.min_frag_corr {
+                let rescued = p.cfg.ms1_rescue
+                    && ms1_support
+                    && distinct.len() >= p.cfg.presence_min_fragments.max(1);
+                if !rescued {
+                    return None;
                 }
             }
         }
@@ -1116,4 +1167,50 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
         "extract: done"
     );
     Ok((n_psms, n_chrom))
+}
+
+#[cfg(test)]
+mod coelution_tests {
+    use super::coelution_gate_score;
+    use std::collections::BTreeMap;
+
+    fn g(rows: &[(f64, &[(u16, f32)])]) -> Vec<(f64, BTreeMap<u16, f32>)> {
+        rows.iter()
+            .map(|(rt, fs)| (*rt, fs.iter().cloned().collect()))
+            .collect()
+    }
+
+    #[test]
+    fn coeluting_fragments_score_high() {
+        // frags 0,1,2 all peak together at group index 2
+        let groups = g(&[
+            (0.0, &[(0, 1.0), (1, 1.0), (2, 1.0)]),
+            (1.0, &[(0, 4.0), (1, 3.0), (2, 2.0)]),
+            (2.0, &[(0, 9.0), (1, 8.0), (2, 5.0)]),
+            (3.0, &[(0, 4.0), (1, 3.0), (2, 2.0)]),
+            (4.0, &[(0, 1.0), (1, 1.0), (2, 1.0)]),
+        ]);
+        let s = coelution_gate_score(&groups, &[0, 1, 2], &[0, 1], &[10.0, 8.0, 5.0]);
+        assert!(s > 0.95, "co-eluting fragments should score high, got {s}");
+    }
+
+    #[test]
+    fn non_coeluting_interferent_drops_the_score() {
+        // frags 0,1 co-elute; frag 2 (a strong-predicted interferent) sits off-peak
+        let groups = g(&[
+            (0.0, &[(0, 1.0), (1, 1.0), (2, 9.0)]),
+            (1.0, &[(0, 4.0), (1, 3.0), (2, 0.0)]),
+            (2.0, &[(0, 9.0), (1, 8.0), (2, 0.0)]),
+            (3.0, &[(0, 4.0), (1, 3.0), (2, 0.0)]),
+            (4.0, &[(0, 1.0), (1, 1.0), (2, 0.0)]),
+        ]);
+        let s = coelution_gate_score(&groups, &[0, 1, 2], &[0, 1], &[10.0, 8.0, 9.0]);
+        assert!(s < 0.8, "a strong non-co-eluting interferent should lower the score, got {s}");
+    }
+
+    #[test]
+    fn too_few_scans_does_not_reject() {
+        let groups = g(&[(0.0, &[(0, 5.0)]), (1.0, &[(0, 9.0)])]);
+        assert_eq!(coelution_gate_score(&groups, &[0], &[0], &[10.0]), 1.0);
+    }
 }

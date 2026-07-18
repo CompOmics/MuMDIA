@@ -564,6 +564,16 @@ pub struct ExtractConfig {
     /// keeps the legacy signature-intensity apex. The rolling distinct-fragment
     /// count (`apex_count_window`) still gates which scans qualify in both modes.
     pub apex_evidence_rank: bool,
+    /// Gate on CO-ELUTION correlation instead of the single-scan apex intensity
+    /// Pearson. The `min_frag_corr` threshold is then applied to the
+    /// predicted-intensity-weighted mean correlation of each matched fragment's XIC
+    /// to the signature-ion reference profile over the elution window, rather than
+    /// to the observed-vs-predicted intensity pattern at the single apex scan. In
+    /// chimeric DIA an interferent inflates the apex-scan pattern but does not
+    /// co-elute with the peptide's own fragments, so co-elution is a stronger,
+    /// interference-robust acceptance signal (the OpenSWATH/DIA-NN discriminator).
+    /// `false` (default) keeps the legacy single-scan Pearson gate.
+    pub gate_coelution: bool,
 }
 impl Default for ExtractConfig {
     fn default() -> Self {
@@ -599,6 +609,7 @@ impl Default for ExtractConfig {
             retain_top_peaks: 1,  // legacy single-apex behaviour (K=1)
             emit_candidate_audit: false, // diagnostic; off in production
             apex_evidence_rank: false,   // legacy signature-intensity apex
+            gate_coelution: false,       // legacy single-scan intensity Pearson gate
         }
     }
 }
