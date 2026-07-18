@@ -133,21 +133,42 @@ fn coelution_gate_score(
     if groups.len() < 3 {
         return 1.0;
     }
+    // Signature-ion reference profile per scan group.
     let refp: Vec<f64> = groups
         .iter()
         .map(|(_, m)| sig.iter().map(|o| *m.get(o).unwrap_or(&0.0) as f64).sum::<f64>())
         .collect();
-    if refp.iter().all(|x| *x <= 0.0) {
+    let (apex, apex_v) = refp
+        .iter()
+        .enumerate()
+        .fold((0usize, 0.0f64), |(bi, bv), (i, v)| if *v > bv { (i, *v) } else { (bi, bv) });
+    if apex_v <= 0.0 {
         return 1.0;
     }
+    // Restrict the correlation to the PEAK: the contiguous scans around the
+    // reference apex above 10% of its height. Over the full (wide) extraction
+    // window the traces are mostly zeros and the correlation is noise; co-elution
+    // is only meaningful across the elution peak itself.
+    let thr = 0.1 * apex_v;
+    let (mut lo, mut hi) = (apex, apex);
+    while lo > 0 && refp[lo - 1] >= thr {
+        lo -= 1;
+    }
+    while hi + 1 < refp.len() && refp[hi + 1] >= thr {
+        hi += 1;
+    }
+    if hi - lo + 1 < 3 {
+        return 1.0; // peak too narrow to assess co-elution; do not reject
+    }
+    let refw = &refp[lo..=hi];
     let (mut wsum, mut wtot) = (0.0f64, 0.0f64);
     for &f in distinct {
-        let tr: Vec<f64> = groups
+        let tr: Vec<f64> = groups[lo..=hi]
             .iter()
             .map(|(_, m)| *m.get(&f).unwrap_or(&0.0) as f64)
             .collect();
         if tr.iter().any(|x| *x > 0.0) {
-            let c = crate::stats::pearson(&tr, &refp).max(0.0);
+            let c = crate::stats::pearson(&tr, refw).max(0.0);
             let w = *fints0.get(f as usize).unwrap_or(&0.0) as f64 + 1e-9;
             wsum += c * w;
             wtot += w;
