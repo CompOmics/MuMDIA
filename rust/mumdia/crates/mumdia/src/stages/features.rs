@@ -31,7 +31,7 @@ use rayon::prelude::*;
 mod apex_dispersion;
 mod chromatographic;
 mod coelution;
-mod entropy;
+pub(crate) mod entropy;
 mod interference;
 mod mass_uncertainty;
 mod ion_series;
@@ -209,8 +209,12 @@ pub fn active_features(set: FeatureSet) -> Vec<String> {
     }
     if matches!(set, FeatureSet::Extended) {
         v.extend(extended_names());
-        // psms-derived (not an Evidence family): the co-elution peak-contest metric.
+        // psms-derived (not an Evidence family): the co-elution peak-contest metrics.
+        // A peak-borrowing decoy loses most contested intensity/fragments to the real
+        // co-eluting peptide, so these three separate borrowers from genuine IDs.
         v.push("peak_contested_frac".to_string());
+        v.push("peak_contested_count_frac".to_string());
+        v.push("peak_apportioned_frac".to_string());
         // Cross-candidate charge-state corroboration (aggregated across the charge
         // states of one peptidoform, not visible to the per-PSM Evidence families):
         // a real peptide co-occurs at multiple charges more than a shift decoy.
@@ -511,6 +515,10 @@ pub fn run(p: FeaturesParams) -> Result<u64> {
     let protein = ps.str("protein")?;
     let mz = ps.f64("precursor_mz")?;
     let contested = ps.f64("contested_frac").unwrap_or_else(|_| vec![0.0; ps.nrows]);
+    // Richer soft-competition columns (present only with emit_contested_features;
+    // default to 0 so the feature vector length is stable when absent).
+    let contested_count = ps.f64("contested_count_frac").unwrap_or_else(|_| vec![0.0; ps.nrows]);
+    let apportioned = ps.f64("apportioned_frac").unwrap_or_else(|_| vec![0.0; ps.nrows]);
     let ms1_m1 = ps.opt_f64("ms1_isom1").unwrap_or_else(|_| vec![None; ps.nrows]);
     let ms1_mono = ps.opt_f64("ms1_mono").unwrap_or_else(|_| vec![None; ps.nrows]);
     let ms1_i1 = ps.opt_f64("ms1_iso1").unwrap_or_else(|_| vec![None; ps.nrows]);
@@ -713,6 +721,8 @@ pub fn run(p: FeaturesParams) -> Result<u64> {
         push(&mut fmap, "coel_clean", ff.coel_clean);
         push(&mut fmap, "shadow_frac", ff.shadow_frac);
         push(&mut fmap, "peak_contested_frac", contested[i]);
+        push(&mut fmap, "peak_contested_count_frac", contested_count[i]);
+        push(&mut fmap, "peak_apportioned_frac", apportioned[i]);
 
         // Extended battery (opt-in). Build the shared Evidence once per PSM and
         // fan it out to the family modules; push their values under the fixed
@@ -1269,8 +1279,10 @@ mod tests {
         assert_eq!(active_features(FeatureSet::Rich).len(), 14 + 30);
         // Extended = minimal + rich + the family battery, and its names are unique.
         let ext = active_features(FeatureSet::Extended);
-        // +4 psms-derived extras: peak_contested_frac + 3 charge-corroboration features.
-        assert_eq!(ext.len(), 14 + 30 + extended_names().len() + 4);
+        // +6 psms-derived extras: 3 co-elution peak-contest metrics
+        // (peak_contested_frac + peak_contested_count_frac + peak_apportioned_frac)
+        // + 3 charge-corroboration features.
+        assert_eq!(ext.len(), 14 + 30 + extended_names().len() + 6);
         let uniq: std::collections::HashSet<&String> = ext.iter().collect();
         assert_eq!(uniq.len(), ext.len(), "duplicate feature name in Extended set");
     }

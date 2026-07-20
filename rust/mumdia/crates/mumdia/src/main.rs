@@ -109,6 +109,12 @@ enum Cmd {
         out_psms: String,
         #[arg(long)]
         out_chrom: String,
+        /// Optional candidate allowlist (a prior run's psms.parquet): restrict
+        /// extraction to these candidate_ids. For "gate first, then compete" -
+        /// re-extract with a peak_claim strategy over only the gate-accepted
+        /// survivors, keeping the two-pass profile map small.
+        #[arg(long)]
+        restrict_candidates: Option<String>,
         #[arg(long)]
         config: Option<String>,
     },
@@ -276,9 +282,16 @@ enum Cmd {
 /// Probe each configured sidecar interpreter for its required packages, so a
 /// broken or missing environment is reported clearly instead of failing mid-run.
 fn doctor(cfg: &Config) -> Result<()> {
+    use mumdia_core::config::RescorerKind;
     use std::process::Command;
+    // The rescore sidecar's required packages depend on the selected classifier:
+    // the PyTorch NN needs torch; mokapot/entrapment need mokapot + sklearn.
+    let (rescore_label, rescore_pkgs) = match cfg.rescore.classifier {
+        RescorerKind::NnTorch => ("rescore.python (nn_torch)", "torch,numpy,pandas,pyarrow"),
+        _ => ("rescore.python (mokapot)", "mokapot,sklearn,numpy,pandas,pyarrow"),
+    };
     let checks = [
-        ("rescore.python (mokapot)", cfg.rescore.python.as_deref(), "mokapot,sklearn,numpy,pandas,pyarrow"),
+        (rescore_label, cfg.rescore.python.as_deref(), rescore_pkgs),
         ("predict_frag.deeplc_python (DeepLC)", cfg.predict_frag.deeplc_python.as_deref(), "deeplc,numpy,pandas"),
         ("predict_frag.ms2pip_python (MS2PIP)", cfg.predict_frag.ms2pip_python.as_deref(), "ms2pip,numpy,pandas"),
     ];
@@ -437,6 +450,7 @@ fn main() -> Result<()> {
             mass_cal,
             out_psms,
             out_chrom,
+            restrict_candidates,
             config,
         } => {
             let cfg = load_config(&config)?;
@@ -450,6 +464,7 @@ fn main() -> Result<()> {
                 mass_cal: mass_cal.as_deref(),
                 out_psms: &out_psms,
                 out_chrom: &out_chrom,
+                restrict_candidates: restrict_candidates.as_deref(),
                 cfg: &cfg.extract,
                 config_hash: &ch,
             })?;

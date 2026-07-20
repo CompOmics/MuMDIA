@@ -161,6 +161,13 @@ pub enum RescorerKind {
     NativeTda,
     /// Mokapot Python sidecar (PLAN.md Section 0).
     Mokapot,
+    /// PyTorch semi-supervised MLP sidecar (`nn_rescore_worker.py`): a nonlinear
+    /// Percolator/mokapot-style rescorer (CV folds + iterative positive
+    /// re-selection). On the E.coli benchmark it beats the linear mokapot model on
+    /// the same PIN, and — being robust to an unfiltered pool — gains further when
+    /// the extraction gate is opened. Same positional-CLI PIN contract as Mokapot;
+    /// requires `rescore.python` to point at an interpreter with torch.
+    NnTorch,
     /// External percolator.exe over the PIN file.
     Percolator,
     /// Spike-in (entrapment) negative rescorer: treat foreign-proteome PSMs
@@ -564,16 +571,20 @@ pub struct ExtractConfig {
     /// keeps the legacy signature-intensity apex. The rolling distinct-fragment
     /// count (`apex_count_window`) still gates which scans qualify in both modes.
     pub apex_evidence_rank: bool,
-    /// Gate on CO-ELUTION correlation instead of the single-scan apex intensity
-    /// Pearson. The `min_frag_corr` threshold is then applied to the
-    /// predicted-intensity-weighted mean correlation of each matched fragment's XIC
-    /// to the signature-ion reference profile over the elution window, rather than
-    /// to the observed-vs-predicted intensity pattern at the single apex scan. In
-    /// chimeric DIA an interferent inflates the apex-scan pattern but does not
-    /// co-elute with the peptide's own fragments, so co-elution is a stronger,
-    /// interference-robust acceptance signal (the OpenSWATH/DIA-NN discriminator).
-    /// `false` (default) keeps the legacy single-scan Pearson gate.
-    pub gate_coelution: bool,
+    /// Emit the four gate-diagnostic scores (`gate_apex`, `gate_peak_spectral`,
+    /// `gate_coelution`, `gate_spectral_entropy`) as extra `psms.parquet` columns,
+    /// for the offline gate-metric comparison. Default `false` (diagnostic sidecar,
+    /// like `emit_candidate_audit`): when off, neither the columns nor the extra
+    /// per-candidate score computation happen, so the default chain is byte-identical.
+    pub emit_gate_diagnostics: bool,
+    /// Which spectral-agreement score the `min_frag_corr` gate thresholds
+    /// (sensitivity program). The legacy gate uses a single apex-scan intensity
+    /// Pearson, which one chimeric scan can dominate. See [`GateMode`].
+    pub gate_mode: GateMode,
+    /// Second threshold for `GateMode::Combined`: the co-elution score must exceed
+    /// this while the peak-integrated spectral score exceeds `min_frag_corr`.
+    /// Requiring BOTH is more specific (rejects interferents that pass one axis).
+    pub gate_coelution_min: f64,
 }
 impl Default for ExtractConfig {
     fn default() -> Self {
@@ -609,9 +620,40 @@ impl Default for ExtractConfig {
             retain_top_peaks: 1,  // legacy single-apex behaviour (K=1)
             emit_candidate_audit: false, // diagnostic; off in production
             apex_evidence_rank: false,   // legacy signature-intensity apex
-            gate_coelution: false,       // legacy single-scan intensity Pearson gate
+            emit_gate_diagnostics: false, // diagnostic gate-score columns; off in production
+            gate_mode: GateMode::ApexPearson, // legacy single-scan intensity Pearson
+            gate_coelution_min: 0.5,     // used only by GateMode::Combined
         }
     }
+}
+
+/// Spectral-agreement score the extraction acceptance gate (`min_frag_corr`)
+/// thresholds. All are computed at the gate from data already in hand.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum GateMode {
+    /// Legacy: Pearson of observed-vs-predicted fragment intensities at the single
+    /// apex scan. One chimeric scan can dominate it.
+    #[default]
+    ApexPearson,
+    /// Pearson of the PEAK-INTEGRATED observed spectrum (each fragment summed over
+    /// the elution-peak scans) vs predicted intensities. Averages out a single
+    /// interfered scan; the standard library-dot-product measure.
+    PeakSpectral,
+    /// Li spectral-entropy similarity of the sqrt-transformed apex-scan observed vs
+    /// predicted intensities (`spectral_entropy_similarity_sqrt`). The full-feature
+    /// gate search (all ~379 features, target-vs-decoy) found this the single best
+    /// gate discriminator: AUC 0.826 / matched-pool recall 69.8%, versus apex
+    /// Pearson's 0.781 / 64.5%. Same inputs as `ApexPearson`, better separation.
+    SpectralEntropy,
+    /// Predicted-intensity-weighted mean CO-ELUTION correlation of each matched
+    /// fragment's XIC to the signature reference over the elution peak (temporal
+    /// agreement, orthogonal to intensity agreement).
+    Coelution,
+    /// Require BOTH: peak-integrated spectral Pearson >= `min_frag_corr` AND the
+    /// co-elution score >= `gate_coelution_min`. More specific (an interferent
+    /// passing one axis is still rejected), for a cleaner FDR pool.
+    Combined,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

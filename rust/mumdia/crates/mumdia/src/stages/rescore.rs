@@ -101,7 +101,7 @@ pub fn run(p: RescoreParams) -> Result<u64> {
         Vec::new()
     } else {
         match p.cfg.classifier {
-            RescorerKind::Mokapot => match run_mokapot(&p, &feat_names, &cid, &label, &pform, &protein, &mz, &feats) {
+            RescorerKind::Mokapot => match run_pin_sidecar(&p, "mokapot_worker.py", &feat_names, &cid, &label, &pform, &protein, &mz, &feats) {
                 Ok(s) => {
                     info!("rescore: using Mokapot scores");
                     classifier_used = "mokapot";
@@ -113,6 +113,21 @@ pub fn run(p: RescoreParams) -> Result<u64> {
                         anyhow::bail!("rescore: Mokapot sidecar failed ({e}) and rescore.strict=true");
                     }
                     warn!("rescore: Mokapot failed ({e}); falling back to native_tda");
+                    native_scores(&p, &feats, &is_decoy, &base, &prelim)
+                }
+            },
+            RescorerKind::NnTorch => match run_pin_sidecar(&p, "nn_rescore_worker.py", &feat_names, &cid, &label, &pform, &protein, &mz, &feats) {
+                Ok(s) => {
+                    info!("rescore: using PyTorch NN sidecar scores");
+                    classifier_used = "nn_torch";
+                    model_identity = "nn-torch-semisup-sidecar-v1".to_string();
+                    s
+                }
+                Err(e) => {
+                    if p.cfg.strict {
+                        anyhow::bail!("rescore: NnTorch sidecar failed ({e}) and rescore.strict=true");
+                    }
+                    warn!("rescore: NnTorch failed ({e}); falling back to native_tda");
                     native_scores(&p, &feats, &is_decoy, &base, &prelim)
                 }
             },
@@ -479,11 +494,14 @@ fn run_entrapment_gbm(
         .collect())
 }
 
-/// Run Mokapot over a PIN written from the competed set; return scores aligned
-/// to the input candidate order (PLAN.md Section 3.2 file contract).
+/// Run a PIN-contract Python rescorer sidecar (`mokapot_worker.py` or
+/// `nn_rescore_worker.py`) over a PIN written from the competed set; return scores
+/// aligned to the input candidate order (PLAN.md Section 3.2 file contract). Both
+/// sidecars share this exact contract: PIN in, `candidate_id`+`score` parquet out.
 #[allow(clippy::too_many_arguments)]
-fn run_mokapot(
+fn run_pin_sidecar(
     p: &RescoreParams,
+    script_name: &str,
     feat_names: &[String],
     cid: &[u32],
     label: &[String],
@@ -497,10 +515,10 @@ fn run_mokapot(
         .cfg
         .python
         .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("classifier=mokapot requires rescore.python"))?;
+        .ok_or_else(|| anyhow::anyhow!("classifier sidecar {script_name} requires rescore.python"))?;
     std::fs::create_dir_all(p.work_dir).ok();
     let pin = format!("{}/rescore.pin", p.work_dir);
-    let outp = format!("{}/mokapot_out.parquet", p.work_dir);
+    let outp = format!("{}/rescore_sidecar_out.parquet", p.work_dir);
 
     let mut s = String::new();
     s.push_str("SpecId\tLabel\tScanNr\tExpMass\tCalcMass\t");
@@ -522,7 +540,7 @@ fn run_mokapot(
     }
     std::fs::write(&pin, s)?;
 
-    let script = crate::sidecar::resolve_script(p.script_dir, "mokapot_worker.py");
+    let script = crate::sidecar::resolve_script(p.script_dir, script_name);
     let status = std::process::Command::new(python)
         .arg(&script)
         .arg(&pin)
@@ -530,7 +548,7 @@ fn run_mokapot(
         .env("PYTHONUTF8", "1")
         .status()?;
     if !status.success() {
-        anyhow::bail!("mokapot worker exited with {status}");
+        anyhow::bail!("{script_name} exited with {status}");
     }
 
     // The worker echoes the PIN's SpecId tail as `candidate_id`, which here is the

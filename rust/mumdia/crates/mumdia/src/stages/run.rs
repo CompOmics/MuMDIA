@@ -220,6 +220,7 @@ pub fn run(p: RunParams) -> Result<()> {
         mass_cal: Some(&format!("{seed}.masscal.json")),
         out_psms: &psms,
         out_chrom: &chrom,
+        restrict_candidates: None,
         cfg: &cfg.extract,
         config_hash: &ch,
     })?;

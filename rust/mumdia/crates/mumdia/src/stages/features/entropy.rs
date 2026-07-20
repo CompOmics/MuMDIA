@@ -73,6 +73,18 @@ fn shannon(p: &[f64]) -> f64 {
     fin(h)
 }
 
+/// Spectral-entropy similarity of the sqrt-transformed observed vs predicted
+/// intensity vectors. This is exactly the `spectral_entropy_similarity_sqrt`
+/// feature (see `values`, item 3), exposed so the extraction acceptance gate
+/// (`GateMode::SpectralEntropy`) can threshold the single best target/decoy
+/// discriminator found in the full-feature gate search, without duplicating the
+/// entropy kernel. `obs` and `pred` are co-indexed by predicted fragment.
+pub fn spectral_entropy_similarity_sqrt(obs: &[f64], pred: &[f64]) -> f64 {
+    let o: Vec<f64> = obs.iter().map(|x| if *x > 0.0 { x.sqrt() } else { 0.0 }).collect();
+    let l: Vec<f64> = pred.iter().map(|x| if *x > 0.0 { x.sqrt() } else { 0.0 }).collect();
+    entropy_sim(&o, &l)
+}
+
 /// Li spectral-entropy similarity: `1 - (2 H(m) - H(o) - H(l)) / ln 4`, with
 /// `m = (o + l) / 2` over sum-normalized `o` and `l`. Returns 0.0 if either
 /// input has non-positive mass or the lengths differ. Clamped to [0, 1].
