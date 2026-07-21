@@ -670,6 +670,26 @@ pub struct FeaturesConfig {
     /// to peak*fraction, or stop earlier at a valley below it). 1/3 matched DIA-NN's
     /// RT bounds best in the diagnostic-plot benchmark.
     pub bound_peak_fraction: f64,
+    /// Grace when walking the elution-peak boundary: number of consecutive
+    /// sub-threshold scans to BRIDGE before stopping. 0 (default) stops at the first
+    /// scan below `bound_peak_fraction` (brittle on jagged/gappy profiles); 1 bridges
+    /// a single-scan dip (DIA sampling gap / noise), giving steadier boundaries.
+    pub bound_peak_grace: usize,
+    /// Elution-peak boundary source. When true (default) a single set of left/right
+    /// half-widths (seconds) is learned once from the confident seed PSMs
+    /// (`spectrum_q <= 0.01`, target-only, the same set that anchors RT calibration /
+    /// DeepLC fine-tune) and applied to EVERY candidate around its own apex. This
+    /// removes per-candidate boundary manipulation so a decoy is scored over a real-
+    /// peptide-width window centred on its apex. When false, each candidate detects its
+    /// own peak boundary from its top-3-predicted-fragment profile (per-candidate,
+    /// but noisy/manipulable for chimeric decoys; the legacy behaviour). If the seed
+    /// yields < 20 confident anchors the stage logs a warning and falls back to
+    /// per-candidate detection for that run.
+    pub bound_from_confident: bool,
+    /// Percentile (0-100) of the confident-set half-widths taken as the global left/
+    /// right elution half-width when `bound_from_confident` is true. 50 = median
+    /// (typical real peak width); higher percentiles widen the shared window.
+    pub bound_confident_pct: f64,
 }
 impl Default for FeaturesConfig {
     fn default() -> Self {
@@ -679,6 +699,9 @@ impl Default for FeaturesConfig {
             prec_tol_ppm: 20.0,
             bound_features: true,
             bound_peak_fraction: 1.0 / 3.0,
+            bound_peak_grace: 0, // stop at first sub-threshold scan (legacy)
+            bound_from_confident: true, // fixed feature window from confident-seed norm
+            bound_confident_pct: 50.0,  // median confident half-width
         }
     }
 }

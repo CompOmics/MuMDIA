@@ -17,8 +17,9 @@ use mumdia_io::report::ArtifactReport;
 use mumdia_io::table::{write_table, Col, Table};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tracing::info;
+use tracing::{info, warn};
 
+use crate::calibrate::percentile;
 use crate::stats::{cosine, pearson, spectral_angle};
 use rayon::prelude::*;
 
@@ -341,7 +342,14 @@ fn parse_ion(name: &str) -> (bool, u32, u32) {
 /// rows (scalar fields default; the caller fills them). Mirrors the alignment
 /// and peak-bounding of [`fragment_features`] so the extended families see the
 /// same elution peak the legacy features use.
-fn build_evidence(rows: &[ChromRow], ms1_rows: &[ChromRow], apex_rt: f64, frac: f64) -> Evidence {
+fn build_evidence(
+    rows: &[ChromRow],
+    ms1_rows: &[ChromRow],
+    apex_rt: f64,
+    frac: f64,
+    grace: usize,
+    global_bounds: Option<(f64, f64)>,
+) -> Evidence {
     let m = rows.len();
     let mut obs_apex = Vec::with_capacity(m);
     let mut pred = Vec::with_capacity(m);
@@ -385,13 +393,6 @@ fn build_evidence(rows: &[ChromRow], ms1_rows: &[ChromRow], apex_rt: f64, frac: 
         .collect();
 
     let (lo_i, hi_i) = if axis_full.len() >= 3 {
-        let mut ord: Vec<usize> = (0..pred.len()).collect();
-        ord.sort_by(|&a, &b| pred[b].partial_cmp(&pred[a]).unwrap_or(std::cmp::Ordering::Equal));
-        let k3: Vec<usize> = ord.into_iter().take(3).collect();
-        let prof_raw: Vec<f64> = (0..axis_full.len())
-            .map(|k| k3.iter().map(|&i| traces_full[i][k]).sum::<f64>())
-            .collect();
-        let prof = smooth3(&prof_raw);
         let ai = axis_full
             .iter()
             .enumerate()
@@ -403,7 +404,21 @@ fn build_evidence(rows: &[ChromRow], ms1_rows: &[ChromRow], apex_rt: f64, frac: 
             })
             .map(|(i, _)| i)
             .unwrap_or(0);
-        peak_bounds(&prof, ai, frac, 0)
+        match global_bounds {
+            Some((l, r)) => global_bound_indices(&axis_full, apex_rt, ai, l, r),
+            None => {
+                let mut ord: Vec<usize> = (0..pred.len()).collect();
+                ord.sort_by(|&a, &b| {
+                    pred[b].partial_cmp(&pred[a]).unwrap_or(std::cmp::Ordering::Equal)
+                });
+                let k3: Vec<usize> = ord.into_iter().take(3).collect();
+                let prof_raw: Vec<f64> = (0..axis_full.len())
+                    .map(|k| k3.iter().map(|&i| traces_full[i][k]).sum::<f64>())
+                    .collect();
+                let prof = smooth3(&prof_raw);
+                peak_bounds(&prof, ai, frac, grace)
+            }
+        }
     } else {
         (0, axis_full.len().saturating_sub(1))
     };
@@ -554,22 +569,84 @@ pub fn run(p: FeaturesParams) -> Result<u64> {
         }
     }
 
-    // Seed corroboration maps (candidate_id -> seed score / identified flag).
-    let (seed_score_map, seed_id_map): (HashMap<u32, f64>, HashMap<u32, f64>) = match p.seed {
+    // Seed corroboration maps (candidate_id -> seed score / identified flag) plus the
+    // confident-target candidate set (spectrum_q <= 0.01, label == target) used to
+    // learn a global elution half-width when `bound_from_confident` is set. This
+    // mirrors the RT-calibration / DeepLC-fine-tune anchor set (rt_im_train.rs).
+    let (seed_score_map, seed_id_map, confident_cids): (
+        HashMap<u32, f64>,
+        HashMap<u32, f64>,
+        std::collections::HashSet<u32>,
+    ) = match p.seed {
         Some(path) => {
             let s = Table::read(path)?;
             let scid = s.u32("candidate_id")?;
             let ssc = s.f64("score")?;
             let sq = s.f64("spectrum_q")?;
+            let slabel = s.str("label")?;
             let mut sm = HashMap::new();
             let mut im = HashMap::new();
+            let mut conf = std::collections::HashSet::new();
             for i in 0..s.nrows {
                 sm.insert(scid[i], ssc[i]);
                 im.insert(scid[i], if sq[i] <= 0.01 { 1.0 } else { 0.0 });
+                if sq[i] <= 0.01 && slabel[i] == "target" {
+                    conf.insert(scid[i]);
+                }
             }
-            (sm, im)
+            (sm, im, conf)
         }
-        None => (HashMap::new(), HashMap::new()),
+        None => (HashMap::new(), HashMap::new(), std::collections::HashSet::new()),
+    };
+
+    // Global elution half-widths learned once from the confident set. Some((L, R)) in
+    // seconds when `bound_from_confident` and >= 20 confident anchors have a resolvable
+    // peak; then every candidate's feature region is [apex - L, apex + R]. None keeps
+    // the per-candidate boundary detection (default).
+    let global_bounds: Option<(f64, f64)> = if p.cfg.bound_from_confident {
+        let mut lefts: Vec<f64> = Vec::new();
+        let mut rights: Vec<f64> = Vec::new();
+        for i in 0..ps.nrows {
+            if !confident_cids.contains(&cid[i]) {
+                continue;
+            }
+            if let Some(rows) = chrom.get(&cid[i]) {
+                if let Some((lo, hi)) = elution_peak_rt_bounds(
+                    rows,
+                    apex_rt[i],
+                    p.cfg.bound_peak_fraction,
+                    p.cfg.bound_peak_grace,
+                ) {
+                    let l = apex_rt[i] - lo as f64;
+                    let r = hi as f64 - apex_rt[i];
+                    if l >= 0.0 && r >= 0.0 {
+                        lefts.push(l);
+                        rights.push(r);
+                    }
+                }
+            }
+        }
+        if lefts.len() >= 20 {
+            let q = (p.cfg.bound_confident_pct / 100.0).clamp(0.0, 1.0);
+            let (l, r) = (percentile(&lefts, q), percentile(&rights, q));
+            info!(
+                n_confident = lefts.len(),
+                left_hw_s = l,
+                right_hw_s = r,
+                pct = p.cfg.bound_confident_pct,
+                "features: global elution half-widths from confident set"
+            );
+            Some((l, r))
+        } else {
+            warn!(
+                n_confident = lefts.len(),
+                "features: bound_from_confident set but < 20 confident anchors; \
+                 falling back to per-candidate boundary"
+            );
+            None
+        }
+    } else {
+        None
     };
 
     let gradient = apex_rt.iter().cloned().fold(0.0f64, f64::max).max(1.0);
@@ -627,6 +704,8 @@ pub fn run(p: FeaturesParams) -> Result<u64> {
                     p.cfg.coelution_corr_threshold,
                     p.cfg.bound_features,
                     p.cfg.bound_peak_fraction,
+                    p.cfg.bound_peak_grace,
+                    global_bounds,
                 ),
                 _ => FragFeatures::default(),
             };
@@ -635,7 +714,7 @@ pub fn run(p: FeaturesParams) -> Result<u64> {
                     Some(rows) if !rows.is_empty() => {
                         let ms1_rows = ms1x.get(&cid[i]).map(|v| v.as_slice()).unwrap_or(&[]);
                         let mut ev =
-                            build_evidence(rows, ms1_rows, apex_rt[i], p.cfg.bound_peak_fraction);
+                            build_evidence(rows, ms1_rows, apex_rt[i], p.cfg.bound_peak_fraction, p.cfg.bound_peak_grace, global_bounds);
                         ev.rt_pred_cal = rt_cal[i];
                         ev.rt_err = (apex_rt[i] - rt_cal[i]).abs();
                         ev.gradient = gradient;
@@ -926,12 +1005,84 @@ pub(crate) fn peak_bounds(prof: &[f64], ai: usize, frac: f64, grace: usize) -> (
     (lo, hi)
 }
 
+/// Map a global (left, right) elution half-width (seconds) around `apex_rt` onto
+/// index bounds of `axis_full`, falling back to the apex-nearest scan `ai` if the
+/// window collapses between scans (sparse grid, or half-width below one cycle).
+fn global_bound_indices(
+    axis_full: &[f32],
+    apex_rt: f64,
+    ai: usize,
+    l: f64,
+    r: f64,
+) -> (usize, usize) {
+    let lo_rt = (apex_rt - l) as f32;
+    let hi_rt = (apex_rt + r) as f32;
+    let li = axis_full.iter().position(|&t| t >= lo_rt).unwrap_or(0);
+    let hi = axis_full
+        .iter()
+        .rposition(|&t| t <= hi_rt)
+        .unwrap_or(axis_full.len().saturating_sub(1));
+    if li <= hi {
+        (li, hi)
+    } else {
+        (ai, ai)
+    }
+}
+
+/// Per-candidate elution-peak RT bounds (seconds): reference = smoothed sum of the
+/// top-3 predicted-intensity fragments, walked from the apex-nearest scan while
+/// >= `frac` x apex height, bridging <= `grace` sub-threshold scans. Returns
+/// (lo_rt, hi_rt), or None when fewer than 3 distinct scans. Mirrors the boundary
+/// logic inside `fragment_features`/`build_evidence` so the confident-set half-widths
+/// match the per-candidate detector they replace when `bound_from_confident` is set.
+fn elution_peak_rt_bounds(
+    rows: &[ChromRow],
+    apex_rt: f64,
+    frac: f64,
+    grace: usize,
+) -> Option<(f32, f32)> {
+    let mut axis: Vec<f32> = rows.iter().flat_map(|r| r.rt.iter().cloned()).collect();
+    axis.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    axis.dedup();
+    if axis.len() < 3 {
+        return None;
+    }
+    let traces: Vec<Vec<f64>> = rows
+        .iter()
+        .map(|r| {
+            let map: HashMap<u32, f32> =
+                r.rt.iter().zip(&r.inten).map(|(&t, &v)| (t.to_bits(), v)).collect();
+            axis.iter().map(|t| *map.get(&t.to_bits()).unwrap_or(&0.0) as f64).collect()
+        })
+        .collect();
+    let mut ord: Vec<usize> = (0..rows.len()).collect();
+    ord.sort_by(|&a, &b| {
+        rows[b].pred_int.partial_cmp(&rows[a].pred_int).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let k3: Vec<usize> = ord.into_iter().take(3).collect();
+    let prof_raw: Vec<f64> =
+        (0..axis.len()).map(|k| k3.iter().map(|&i| traces[i][k]).sum::<f64>()).collect();
+    let prof = smooth3(&prof_raw);
+    let ai = axis
+        .iter()
+        .enumerate()
+        .min_by(|(_, a), (_, b)| {
+            (**a as f64 - apex_rt).abs().partial_cmp(&((**b as f64 - apex_rt).abs())).unwrap()
+        })
+        .map(|(i, _)| i)
+        .unwrap_or(0);
+    let (lo, hi) = peak_bounds(&prof, ai, frac, grace);
+    Some((axis[lo], axis[hi]))
+}
+
 fn fragment_features(
     rows: &[ChromRow],
     apex_rt: f64,
     coel_thresh: f64,
     bound: bool,
     frac: f64,
+    grace: usize,
+    global_bounds: Option<(f64, f64)>,
 ) -> FragFeatures {
     let mut f = FragFeatures::default();
     // Observed apex intensity per fragment (nearest scan to apex).
@@ -1002,13 +1153,6 @@ fn fragment_features(
         .collect();
     let (lo_i, hi_i) = if bound && axis_full.len() >= 3 {
         // boundary on the smoothed summed top-3-predicted-fragment profile, around apex
-        let mut ord: Vec<usize> = (0..pred.len()).collect();
-        ord.sort_by(|&a, &b| pred[b].partial_cmp(&pred[a]).unwrap_or(std::cmp::Ordering::Equal));
-        let k3: Vec<usize> = ord.into_iter().take(3).collect();
-        let prof_raw: Vec<f64> = (0..axis_full.len())
-            .map(|k| k3.iter().map(|&i| traces_full[i][k]).sum::<f64>())
-            .collect();
-        let prof = smooth3(&prof_raw);
         let ai = axis_full
             .iter()
             .enumerate()
@@ -1020,7 +1164,21 @@ fn fragment_features(
             })
             .map(|(i, _)| i)
             .unwrap_or(0);
-        peak_bounds(&prof, ai, frac, 0)
+        match global_bounds {
+            Some((l, r)) => global_bound_indices(&axis_full, apex_rt, ai, l, r),
+            None => {
+                let mut ord: Vec<usize> = (0..pred.len()).collect();
+                ord.sort_by(|&a, &b| {
+                    pred[b].partial_cmp(&pred[a]).unwrap_or(std::cmp::Ordering::Equal)
+                });
+                let k3: Vec<usize> = ord.into_iter().take(3).collect();
+                let prof_raw: Vec<f64> = (0..axis_full.len())
+                    .map(|k| k3.iter().map(|&i| traces_full[i][k]).sum::<f64>())
+                    .collect();
+                let prof = smooth3(&prof_raw);
+                peak_bounds(&prof, ai, frac, grace)
+            }
+        }
     } else {
         (0, axis_full.len().saturating_sub(1))
     };
