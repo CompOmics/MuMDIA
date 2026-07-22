@@ -428,6 +428,18 @@ pub struct RtImTrainConfig {
     /// main use is library-input mode, where the base iRT comes from the imported
     /// library rather than a DeepLC prediction.
     pub finetune_deeplc: bool,
+    /// DeepLC fine-tune training epochs (passed to `deeplc_finetune.py --epochs`).
+    /// Early stopping with `finetune_patience` usually halts before this cap, so it
+    /// is an upper bound rather than a fixed count. Only used when `finetune_deeplc`.
+    pub finetune_epochs: usize,
+    /// DeepLC fine-tune early-stopping patience (`--patience`): epochs without
+    /// validation-loss improvement before stopping. Only used when `finetune_deeplc`.
+    pub finetune_patience: usize,
+    /// DeepLC fine-tune batch size (`--batch`). 0 (default) auto-scales to the confident
+    /// seed size so each epoch has >= ~30 gradient steps; a fixed large batch underfits
+    /// small seeds (a ~4k-peptide reference at batch 512 is ~8 steps/epoch and never
+    /// converges). Only used when `finetune_deeplc`.
+    pub finetune_batch: usize,
     /// Adaptive RT window (sensitivity_plan spec 03 §3.5, backlog P3.2/P3.3):
     /// instead of one global residual-percentile half-width for every candidate,
     /// bin the calibration anchors by calibrated RT and give each candidate the
@@ -455,6 +467,9 @@ impl Default for RtImTrainConfig {
             loess_span: 0.3,
             fallback_rt_window_s: 120.0,
             finetune_deeplc: false,
+            finetune_epochs: 25,   // deeplc_finetune.py default
+            finetune_patience: 10, // deeplc_finetune.py default
+            finetune_batch: 0,     // 0 = auto-scale to seed size
             adaptive_rt_window: false,
             adaptive_rt_bins: 12,
             rt_window_min_s: 1.0,

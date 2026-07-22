@@ -109,10 +109,23 @@ pub fn run_deeplc_finetune(
     lib_in: &str,
     seed: &str,
     lib_out: &str,
+    epochs: usize,
+    patience: usize,
+    q_train: f64,
+    batch: usize,
 ) -> Result<()> {
-    info!(lib_in, seed, lib_out, "sidecar: running DeepLC multitask fine-tune");
-    run_worker(python, script, &[lib_in, seed, lib_out], true)
-        .context("DeepLC fine-tune failed")
+    info!(lib_in, seed, lib_out, epochs, patience, q_train, batch, "sidecar: running DeepLC multitask fine-tune");
+    let ep = epochs.to_string();
+    let pa = patience.to_string();
+    let qt = q_train.to_string();
+    let ba = batch.to_string();
+    run_worker(
+        python,
+        script,
+        &[lib_in, seed, lib_out, "--epochs", &ep, "--patience", &pa, "--q-train", &qt, "--batch", &ba],
+        true,
+    )
+    .context("DeepLC fine-tune failed")
 }
 
 /// Invoke a Python worker: `python script arg...`. `utf8` forces UTF-8 I/O

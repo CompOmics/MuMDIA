@@ -191,7 +191,17 @@ pub fn run(p: RunParams) -> Result<()> {
         let script =
             crate::sidecar::resolve_script(&cfg.predict_frag.sidecar_script_dir, "deeplc_finetune.py");
         let lib_p_ft = d("fragment_library_precursors_ft.parquet");
-        crate::sidecar::run_deeplc_finetune(python, &script, &lib_p, &seed, &lib_p_ft)?;
+        crate::sidecar::run_deeplc_finetune(
+            python,
+            &script,
+            &lib_p,
+            &seed,
+            &lib_p_ft,
+            cfg.rt_im_train.finetune_epochs,
+            cfg.rt_im_train.finetune_patience,
+            cfg.rt_im_train.q_train,
+            cfg.rt_im_train.finetune_batch,
+        )?;
         lib_p_ft
     } else {
         lib_p
