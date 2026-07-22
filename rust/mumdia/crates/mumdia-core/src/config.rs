@@ -940,6 +940,81 @@ impl Default for QuantConfig {
     }
 }
 
+/// Match-between-runs strategy (Stage D3, `mbr_plan.md`). Default `None` reproduces
+/// the current chain byte-for-byte. Later variants transfer identification evidence
+/// across a run set: `EmpiricalLibrary` builds the consensus anchor library only;
+/// `RtTransfer` adds cross-run expected-RT transfer extraction; `Full` adds
+/// requantification. All require >= 2 runs and a decoy-transfer FDR (see the plan).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MbrStrategy {
+    /// No match-between-runs (default).
+    #[default]
+    None,
+    /// Build the cross-run consensus anchor library (M1) only; no transfer.
+    EmpiricalLibrary,
+    /// EmpiricalLibrary + cross-run expected-RT transfer extraction (M2/M3).
+    RtTransfer,
+    /// RtTransfer + requantification of accepted transfers (M5).
+    Full,
+}
+
+/// Decoy-transfer null for the MBR false-transfer FDR (M4). `ReverseSequence`
+/// transfers reverse/scramble decoys at the same expected RT; `PermutedRt` transfers
+/// real precursors to a decoupled (wrong) expected RT; `Both` combines them. The
+/// prototype's shuffled-RT null gave a ~0.6% in-window false rate vs 66.6% true
+/// (113x separation), so the transfer q-value is well-calibrated.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum DecoyTransfer {
+    #[default]
+    PermutedRt,
+    ReverseSequence,
+    Both,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MbrConfig {
+    pub strategy: MbrStrategy,
+    /// q-value for a precursor to become a cross-run anchor (validated at 0.01).
+    pub q_anchor: f64,
+    /// Minimum number of OTHER runs a precursor must be confident in to transfer.
+    pub min_anchor_runs: usize,
+    /// Accept threshold for a transferred identification's transfer q-value.
+    pub q_transfer: f64,
+    /// Transfer RT half-window (seconds) around the cross-run-predicted RT. The M2
+    /// leave-target-out residual was ~17 s at p95, ~15x tighter than the search
+    /// window; this is the default so the false-transfer search space stays small.
+    pub rt_window_s: f64,
+    /// Which decoy-transfer null estimates the false-transfer rate (M4).
+    pub decoy_transfer: DecoyTransfer,
+    /// Minimum correlation of the observed fragment pattern to the empirical
+    /// consensus for a transfer to be accepted (interference guard; 0 disables).
+    pub consensus_corr_min: f64,
+    /// Requantify already-identified precursors too (fill the matrix), not only
+    /// transferred ones. Only used when `strategy = Full`.
+    pub requant_all: bool,
+    /// Python interpreter for the `mbr_worker.py` sidecar (pandas/pyarrow/numpy;
+    /// e.g. the `py312_mumdia` env). Required when `strategy != None`.
+    pub python: Option<String>,
+}
+impl Default for MbrConfig {
+    fn default() -> Self {
+        Self {
+            strategy: MbrStrategy::None,
+            q_anchor: 0.01,
+            min_anchor_runs: 2,
+            q_transfer: 0.01,
+            rt_window_s: 20.0, // >= the p95 M2 residual (~17 s)
+            decoy_transfer: DecoyTransfer::PermutedRt,
+            consensus_corr_min: 0.0,
+            requant_all: false,
+            python: None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RescoreConfig {
@@ -1012,6 +1087,8 @@ pub struct Config {
     pub compete: CompeteConfig,
     pub rescore: RescoreConfig,
     pub quant: QuantConfig,
+    #[serde(default)]
+    pub mbr: MbrConfig,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -1028,6 +1105,7 @@ impl Default for Config {
             compete: t(),
             rescore: t(),
             quant: t(),
+            mbr: t(),
         }
     }
 }

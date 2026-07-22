@@ -226,6 +226,19 @@ enum Cmd {
         #[arg(long)]
         config: Option<String>,
     },
+    /// Match-between-runs identification transfer (Stage D3) -> transferred.parquet.
+    Mbr {
+        /// Experiment-wide scored_combined.parquet (has the `source` column).
+        #[arg(long)]
+        scored: String,
+        /// Per-run psms.parquet in `source` order (one per run).
+        #[arg(long, num_args = 1..)]
+        psms: Vec<String>,
+        #[arg(long)]
+        out: String,
+        #[arg(long)]
+        config: Option<String>,
+    },
     /// Print schema, head sample, and row count for any artifact.
     Inspect {
         artifact: String,
@@ -599,6 +612,26 @@ fn main() -> Result<()> {
                 grid_n: 100,
                 config_hash: &ch,
             })?;
+        }
+        Cmd::Mbr { scored, psms, out, config } => {
+            let cfg = load_config(&config)?;
+            if cfg.mbr.strategy == mumdia_core::config::MbrStrategy::None {
+                anyhow::bail!(
+                    "mbr.strategy is `none`; set empirical_library / rt_transfer / full to run MBR"
+                );
+            }
+            if psms.len() < 2 {
+                anyhow::bail!("MBR needs >= 2 runs; got {} psms path(s)", psms.len());
+            }
+            let python = cfg.mbr.python.as_deref().ok_or_else(|| {
+                anyhow::anyhow!("mbr.python (sidecar interpreter) is required when mbr.strategy != none")
+            })?;
+            let script =
+                mumdia::sidecar::resolve_script(&cfg.predict_frag.sidecar_script_dir, "mbr_worker.py");
+            mumdia::sidecar::run_mbr(
+                python, &script, &scored, &psms, &out,
+                cfg.mbr.q_anchor, cfg.mbr.min_anchor_runs, cfg.mbr.q_transfer, cfg.rng_seed,
+            )?;
         }
         Cmd::Inspect { artifact } => {
             print!("{}", mumdia_io::inspect(&artifact)?);

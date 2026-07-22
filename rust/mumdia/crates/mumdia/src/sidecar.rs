@@ -128,6 +128,39 @@ pub fn run_deeplc_finetune(
     .context("DeepLC fine-tune failed")
 }
 
+/// MBR transfer (Stage D3): match-between-runs identification transfer over the
+/// experiment-wide scored table + per-run psms. Positional contract:
+/// `mbr_worker.py <scored_combined> <psms_csv> <out_transferred> [flags]`, where
+/// `psms_csv` is the per-run psms paths joined by ',' in `source` order.
+#[allow(clippy::too_many_arguments)]
+pub fn run_mbr(
+    python: &str,
+    script: &str,
+    scored: &str,
+    psms: &[String],
+    out: &str,
+    q_anchor: f64,
+    min_anchor_runs: usize,
+    q_transfer: f64,
+    seed: u64,
+) -> Result<()> {
+    let psms_csv = psms.join(",");
+    info!(scored, out, runs = psms.len(), q_anchor, min_anchor_runs, q_transfer,
+          "sidecar: running MBR transfer");
+    let qa = q_anchor.to_string();
+    let mar = min_anchor_runs.to_string();
+    let qt = q_transfer.to_string();
+    let sd = seed.to_string();
+    run_worker(
+        python,
+        script,
+        &[scored, &psms_csv, out, "--q-anchor", &qa, "--min-anchor-runs", &mar,
+          "--q-transfer", &qt, "--seed", &sd],
+        false,
+    )
+    .context("MBR transfer worker failed")
+}
+
 /// Invoke a Python worker: `python script arg...`. `utf8` forces UTF-8 I/O
 /// (DeepLC/Keras crash on the Windows cp1252 console otherwise).
 fn run_worker(python: &str, script: &str, args: &[&str], utf8: bool) -> Result<()> {
