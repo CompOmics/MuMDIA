@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::time::Instant;
 
 use anyhow::Result;
-use mumdia_core::config::{NormalizeMethod, PeakWindowMode, QuantConfig, RollupMethod};
+use mumdia_core::config::{NormalizeMethod, PeakWindowMode, QuantConfig, QuantQColumn, RollupMethod};
 use mumdia_core::schema::artifact;
 use mumdia_io::report::ArtifactReport;
 use mumdia_io::table::{write_table, Col, Table};
@@ -154,7 +154,13 @@ pub fn run(p: QuantParams) -> Result<(u64, u64)> {
     let charge = ps.i32("charge")?;
     let label = ps.str("label")?;
     let pg = ps.str("protein_group")?;
-    let pep_q = ps.f64("peptide_q_value")?;
+    // q-value column to filter on. Peptide q is per-run in a single-run rescore, but
+    // GLOBAL (best PSM per peptide across all runs) under an experiment-wide rescore,
+    // where the per-PSM q_value is the correct per-run choice for cross-run quant.
+    let pep_q = match p.cfg.q_filter {
+        QuantQColumn::PeptideQ => ps.f64("peptide_q_value")?,
+        QuantQColumn::PsmQ => ps.f64("q_value")?,
+    };
 
     // Chromatograms grouped by candidate.
     let ch = Table::read(p.chromatograms)?;
@@ -389,7 +395,8 @@ pub fn run(p: QuantParams) -> Result<(u64, u64)> {
             content_hash: mumdia_io::hash::blake3_file(path)?,
             params: json!({"q_threshold": p.cfg.q_threshold, "top_n_fragments": p.cfg.top_n_fragments,
                            "rollup": format!("{:?}", p.cfg.rollup), "bound_peak": p.cfg.bound_peak,
-                           "peak_fraction": p.cfg.peak_fraction, "peak_grace": p.cfg.peak_grace}),
+                           "peak_fraction": p.cfg.peak_fraction, "peak_grace": p.cfg.peak_grace,
+                           "q_filter": format!("{:?}", p.cfg.q_filter)}),
             stats: stats.clone(),
             model_identity: None,
             elapsed_ms: elapsed,

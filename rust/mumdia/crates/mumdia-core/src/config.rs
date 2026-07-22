@@ -875,6 +875,25 @@ impl NormalizeMethod {
     }
 }
 
+/// Which q-value column quant filters candidates on. Peptide-level q is correct
+/// for a single-run quant (per-run peptide FDR). Under an experiment-wide rescore,
+/// however, `peptide_q_value` is a GLOBAL per-peptide value carried on the single
+/// best PSM across all runs, so a per-run quant over one run's slice keeps only the
+/// peptides whose global-best PSM falls in that run and drops the rest, giving
+/// disjoint per-run quant sets and an empty cross-run intensity matrix. `PsmQ`
+/// filters on the per-PSM `q_value` instead (per run), the correct choice for a
+/// precursor-level cross-run quant such as a ProteoBench submission.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum QuantQColumn {
+    /// Filter on `peptide_q_value` (per-run peptide FDR). Default.
+    #[default]
+    PeptideQ,
+    /// Filter on the per-PSM `q_value`. Use for cross-run quant off an
+    /// experiment-wide rescore, where the peptide q is global.
+    PsmQ,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct QuantConfig {
@@ -900,6 +919,9 @@ pub struct QuantConfig {
     /// Peptide q-value cutoff defining the "confident" set that calibrates the
     /// consensus half-widths (Consensus mode only). Tighter than `q_threshold`.
     pub reliable_q: f64,
+    /// Which q-value column to filter candidates on (`peptide_q` default, or `psm_q`
+    /// for cross-run quant off an experiment-wide rescore). See [`QuantQColumn`].
+    pub q_filter: QuantQColumn,
 }
 impl Default for QuantConfig {
     fn default() -> Self {
@@ -913,6 +935,7 @@ impl Default for QuantConfig {
             peak_grace: 1,
             peak_window_mode: PeakWindowMode::PerCandidate,
             reliable_q: 0.001,
+            q_filter: QuantQColumn::PeptideQ,
         }
     }
 }
