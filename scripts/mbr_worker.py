@@ -52,6 +52,11 @@ def main():
     ap.add_argument("--min-anchor-runs", type=int, default=2)
     ap.add_argument("--q-transfer", type=float, default=0.01)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--out-scored", default=None,
+                    help="also write an augmented scored table: the input scored_combined "
+                         "with each accepted transfer's (candidate_id, source) row q_value set "
+                         "to its transfer_q and an is_transferred flag added, so quant/report "
+                         "(with quant.q_filter=psm_q) pick up the transfers.")
     a = ap.parse_args()
     rng = np.random.default_rng(a.seed)
 
@@ -165,6 +170,25 @@ def main():
     })
     pq.write_table(out, a.out)
     print(f"wrote {a.out} ({out.num_rows} accepted transfers)")
+
+    # M5: augmented scored table. Lower the accepted transfers' PSM q_value to their
+    # transfer_q on the matching (candidate_id, source) row and flag them, so a
+    # downstream quant/report with quant.q_filter=psm_q includes the transfers.
+    if a.out_scored:
+        full = pq.read_table(a.scored).to_pandas()
+        acc = {(int(c), int(s)): float(qq) for c, s, qq in
+               zip(cid[accept], src[accept], q[accept])}
+        key = list(zip(full.candidate_id.astype(int), full.source.astype(int)))
+        newq = full.q_value.to_numpy().copy()
+        is_tr = np.zeros(len(full), dtype=bool)
+        for i, k in enumerate(key):
+            if k in acc:
+                newq[i] = min(newq[i], acc[k])
+                is_tr[i] = True
+        full["q_value"] = newq
+        full["is_transferred"] = is_tr
+        pq.write_table(pa.Table.from_pandas(full, preserve_index=False), a.out_scored)
+        print(f"wrote {a.out_scored} (augmented scored; {int(is_tr.sum())} rows flagged transferred)")
 
 
 def pa_write_empty(path):
