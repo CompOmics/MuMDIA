@@ -236,6 +236,14 @@ enum Cmd {
         psms: Vec<String>,
         #[arg(long)]
         out: String,
+        /// Optional augmented scored table: input scored with accepted transfers'
+        /// q_value lowered + is_transferred flag (for quant/report with q_filter=psm_q).
+        #[arg(long)]
+        out_scored: Option<String>,
+        /// Optional per-run fragment_quant.parquet (source order) for the
+        /// fragment-consensus guard (needs mbr.consensus_corr_min > 0).
+        #[arg(long, num_args = 0..)]
+        frag: Vec<String>,
         #[arg(long)]
         config: Option<String>,
     },
@@ -613,7 +621,7 @@ fn main() -> Result<()> {
                 config_hash: &ch,
             })?;
         }
-        Cmd::Mbr { scored, psms, out, config } => {
+        Cmd::Mbr { scored, psms, out, out_scored, frag, config } => {
             let cfg = load_config(&config)?;
             if cfg.mbr.strategy == mumdia_core::config::MbrStrategy::None {
                 anyhow::bail!(
@@ -629,8 +637,9 @@ fn main() -> Result<()> {
             let script =
                 mumdia::sidecar::resolve_script(&cfg.predict_frag.sidecar_script_dir, "mbr_worker.py");
             mumdia::sidecar::run_mbr(
-                python, &script, &scored, &psms, &out,
-                cfg.mbr.q_anchor, cfg.mbr.min_anchor_runs, cfg.mbr.q_transfer, cfg.rng_seed,
+                python, &script, &scored, &psms, &out, out_scored.as_deref(), &frag,
+                cfg.mbr.q_anchor, cfg.mbr.min_anchor_runs, cfg.mbr.q_transfer,
+                cfg.mbr.consensus_corr_min, cfg.rng_seed,
             )?;
         }
         Cmd::Inspect { artifact } => {

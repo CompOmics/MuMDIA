@@ -57,6 +57,22 @@ def main():
                          "with each accepted transfer's (candidate_id, source) row q_value set "
                          "to its transfer_q and an is_transferred flag added, so quant/report "
                          "(with quant.q_filter=psm_q) pick up the transfers.")
+    ap.add_argument("--emit-transfer-targets", dest="emit_targets", default=None,
+                    help="RE-EXTRACTION TIER: instead of the rescuable transfer, write per-run "
+                         "run_windows-format tables (candidate_id, rt_pred_cal, rt_lo, rt_hi) for "
+                         "the ABSENT set (confident in >= min_anchor_runs other runs, not extracted "
+                         "in this run) at the tight cross-run-predicted RT window, plus a permuted-RT "
+                         "decoy target file. Feed to `extract --restrict-candidates <f> "
+                         "--run-windows <f>` to re-extract those precursors, then score + FDR.")
+    ap.add_argument("--rt-window", dest="rt_window", type=float, default=20.0,
+                    help="transfer RT half-window (s) for emitted targets (>= the p95 M2 residual).")
+    ap.add_argument("--frag-csv", dest="frag_csv", default=None,
+                    help="comma-separated per-run fragment_quant.parquet paths (source order) "
+                         "for the fragment-consensus guard.")
+    ap.add_argument("--consensus-corr-min", dest="corr_min", type=float, default=0.0,
+                    help="reject accepted transfers whose fragment pattern in the target run "
+                         "correlates < this with the empirical consensus over its confident runs "
+                         "(interference guard). 0 = off. ~0.8 recovers MBR's quant precision loss.")
     a = ap.parse_args()
     rng = np.random.default_rng(a.seed)
 
@@ -96,6 +112,46 @@ def main():
     allc = set().union(*conf_t.values())
     for c in allc:
         support_t[c] = sum(c in conf_t[i] for i in range(n_runs))
+
+    def expected_rt(c, i):
+        """Cross-run predicted RT of candidate c in run i (None if too few anchors)."""
+        js = [j for j in range(n_runs) if j != i and c in rt_anchor[j]]
+        if len(js) < a.min_anchor_runs:
+            return None
+        return float(from_ref[i](np.median([to_ref[j](rt_anchor[j][c]) for j in js])))
+
+    # RE-EXTRACTION TIER: emit per-run run_windows for the ABSENT set (confident
+    # elsewhere, not extracted here) at the tight predicted-RT window, so `extract`
+    # can rescue them. Also emit a permuted-RT decoy-target file for the transfer FDR.
+    if a.emit_targets:
+        import os
+        os.makedirs(a.emit_targets, exist_ok=True)
+        rng2 = np.random.default_rng(a.seed)
+        for i in range(n_runs):
+            cids, preds = [], []
+            for c in allc:
+                other = support_t[c] - (1 if c in conf_t[i] else 0)
+                if other < a.min_anchor_runs or c in conf_t[i] or c in rt_all[i]:
+                    continue  # absent-from-run only (rescuable tier handles extracted ones)
+                pr = expected_rt(c, i)
+                if pr is not None:
+                    cids.append(c); preds.append(pr)
+            preds = np.array(preds)
+            for tag, rt_pred in [("targets", preds),
+                                 ("decoys", preds[rng2.permutation(len(preds))] if len(preds) else preds)]:
+                tbl = pa.table({
+                    "candidate_id": pa.array(np.array(cids, dtype=np.uint32), pa.uint32()),
+                    "rt_pred_cal": pa.array(rt_pred, pa.float64()),
+                    "rt_lo": pa.array(rt_pred - a.rt_window, pa.float64()),
+                    "rt_hi": pa.array(rt_pred + a.rt_window, pa.float64()),
+                    "im_pred_cal": pa.array([None] * len(cids), pa.float64()),
+                    "im_lo": pa.array([None] * len(cids), pa.float64()),
+                    "im_hi": pa.array([None] * len(cids), pa.float64()),
+                })
+                pq.write_table(tbl, f"{a.emit_targets}/transfer_{tag}_{i}.parquet")
+            print(f"  run {i}: {len(cids)} absent-transfer targets (window +/-{a.rt_window:.0f}s)")
+        print(f"wrote per-run transfer targets + permuted-RT decoys to {a.emit_targets}")
+        return
 
     # build transfer candidates (rescuable: confident-elsewhere, sub-threshold here,
     # extracted here). Predict RT; also a permuted-RT decoy prediction for the null.
@@ -145,6 +201,45 @@ def main():
     accept = q <= a.q_transfer
     cid = np.array(rows["candidate_id"]); src = np.array(rows["source"])
     lab = meta.reindex(cid)["label"].values
+
+    # Fragment-consensus guard (M4 enhancement): reject accepted transfers whose
+    # fragment pattern in the target run does not match the empirical consensus over
+    # its confident runs -> removes RT-concordant interference that would otherwise
+    # add noisy/compressed quant. Validated to recover MBR's ratio-precision loss.
+    if a.frag_csv and a.corr_min > 0.0:
+        fpaths = a.frag_csv.split(",")
+        frag = {}
+        for i, fp in enumerate(fpaths):
+            d = pq.read_table(fp, columns=["candidate_id", "fragment_name", "quantity"]).to_pandas()
+            g = {}
+            for c, fn, qq in zip(d.candidate_id, d.fragment_name, d.quantity):
+                g.setdefault(int(c), {})[fn] = float(qq)
+            frag[i] = g
+
+        def cos(pa_, pb):
+            ks = set(pa_) | set(pb)
+            va = np.array([pa_.get(k, 0.0) for k in ks]); vb = np.array([pb.get(k, 0.0) for k in ks])
+            na, nb = np.linalg.norm(va), np.linalg.norm(vb)
+            return va @ vb / (na * nb) if na > 0 and nb > 0 else 0.0
+
+        kept = 0
+        for k in np.where(accept)[0]:
+            c, s = int(cid[k]), int(src[k])
+            anc = [j for j in range(n_runs) if j != s and c in conf_t[j] and c in frag.get(j, {})]
+            if c not in frag.get(s, {}) or len(anc) < a.min_anchor_runs:
+                accept[k] = False; continue
+            cons = {}
+            for j in anc:
+                p = frag[j][c]; tot = sum(p.values()) or 1.0
+                for kk, v in p.items():
+                    cons[kk] = cons.get(kk, 0.0) + v / tot / len(anc)
+            if cos(frag[s][c], cons) < a.corr_min:
+                accept[k] = False
+            else:
+                kept += 1
+        print(f"  fragment-consensus guard (>= {a.corr_min}): kept {kept} of "
+              f"{int((q <= a.q_transfer).sum())} FDR-passing transfers")
+
     n_acc = int(accept.sum())
     acc_dec = int(((lab == "decoy") & accept).sum())
     print(f"MBR transfer: candidates={len(cid)} accepted@q<={a.q_transfer}={n_acc} "

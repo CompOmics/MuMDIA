@@ -139,26 +139,34 @@ pub fn run_mbr(
     scored: &str,
     psms: &[String],
     out: &str,
+    out_scored: Option<&str>,
+    frag: &[String],
     q_anchor: f64,
     min_anchor_runs: usize,
     q_transfer: f64,
+    consensus_corr_min: f64,
     seed: u64,
 ) -> Result<()> {
     let psms_csv = psms.join(",");
     info!(scored, out, runs = psms.len(), q_anchor, min_anchor_runs, q_transfer,
-          "sidecar: running MBR transfer");
+          consensus_corr_min, "sidecar: running MBR transfer");
     let qa = q_anchor.to_string();
     let mar = min_anchor_runs.to_string();
     let qt = q_transfer.to_string();
     let sd = seed.to_string();
-    run_worker(
-        python,
-        script,
-        &[scored, &psms_csv, out, "--q-anchor", &qa, "--min-anchor-runs", &mar,
-          "--q-transfer", &qt, "--seed", &sd],
-        false,
-    )
-    .context("MBR transfer worker failed")
+    let cm = consensus_corr_min.to_string();
+    let frag_csv = frag.join(",");
+    let mut args: Vec<&str> = vec![
+        scored, &psms_csv, out, "--q-anchor", &qa, "--min-anchor-runs", &mar,
+        "--q-transfer", &qt, "--seed", &sd,
+    ];
+    if let Some(os) = out_scored {
+        args.extend_from_slice(&["--out-scored", os]);
+    }
+    if !frag.is_empty() && consensus_corr_min > 0.0 {
+        args.extend_from_slice(&["--frag-csv", &frag_csv, "--consensus-corr-min", &cm]);
+    }
+    run_worker(python, script, &args, false).context("MBR transfer worker failed")
 }
 
 /// Invoke a Python worker: `python script arg...`. `utf8` forces UTF-8 I/O
