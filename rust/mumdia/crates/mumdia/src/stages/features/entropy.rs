@@ -36,7 +36,11 @@ const EPS: f64 = 1e-10;
 /// Finite guard: replace NaN/Inf with 0.0.
 #[inline]
 fn fin(x: f64) -> f64 {
-    if x.is_finite() { x } else { 0.0 }
+    if x.is_finite() {
+        x
+    } else {
+        0.0
+    }
 }
 
 /// Clamp a similarity value to [0, 1] after a finite guard.
@@ -54,7 +58,13 @@ fn sumnorm(v: &[f64]) -> Option<Vec<f64>> {
     if s > 0.0 {
         Some(
             v.iter()
-                .map(|x| if x.is_finite() && *x > 0.0 { x / s } else { 0.0 })
+                .map(|x| {
+                    if x.is_finite() && *x > 0.0 {
+                        x / s
+                    } else {
+                        0.0
+                    }
+                })
                 .collect(),
         )
     } else {
@@ -80,8 +90,14 @@ fn shannon(p: &[f64]) -> f64 {
 /// discriminator found in the full-feature gate search, without duplicating the
 /// entropy kernel. `obs` and `pred` are co-indexed by predicted fragment.
 pub fn spectral_entropy_similarity_sqrt(obs: &[f64], pred: &[f64]) -> f64 {
-    let o: Vec<f64> = obs.iter().map(|x| if *x > 0.0 { x.sqrt() } else { 0.0 }).collect();
-    let l: Vec<f64> = pred.iter().map(|x| if *x > 0.0 { x.sqrt() } else { 0.0 }).collect();
+    let o: Vec<f64> = obs
+        .iter()
+        .map(|x| if *x > 0.0 { x.sqrt() } else { 0.0 })
+        .collect();
+    let l: Vec<f64> = pred
+        .iter()
+        .map(|x| if *x > 0.0 { x.sqrt() } else { 0.0 })
+        .collect();
     entropy_sim(&o, &l)
 }
 
@@ -147,15 +163,20 @@ pub fn values(e: &Evidence) -> Vec<f64> {
     let wsim = entropy_sim(&li_weight(&o), &li_weight(&l));
 
     // 3. spectral_entropy_similarity_sqrt
-    let o_sqrt: Vec<f64> = o.iter().map(|x| if *x > 0.0 { x.sqrt() } else { 0.0 }).collect();
-    let l_sqrt: Vec<f64> = l.iter().map(|x| if *x > 0.0 { x.sqrt() } else { 0.0 }).collect();
+    let o_sqrt: Vec<f64> = o
+        .iter()
+        .map(|x| if *x > 0.0 { x.sqrt() } else { 0.0 })
+        .collect();
+    let l_sqrt: Vec<f64> = l
+        .iter()
+        .map(|x| if *x > 0.0 { x.sqrt() } else { 0.0 })
+        .collect();
     let sim_sqrt = entropy_sim(&o_sqrt, &l_sqrt);
 
     // 4. spectral_entropy_similarity_topk (top-6 fragments by predicted intensity)
     let mut idx: Vec<usize> = (0..k).collect();
     idx.sort_by(|&a, &b| {
-        l[b]
-            .partial_cmp(&l[a])
+        l[b].partial_cmp(&l[a])
             .unwrap_or(std::cmp::Ordering::Equal)
             .then(a.cmp(&b))
     });
@@ -250,7 +271,11 @@ pub fn values(e: &Evidence) -> Vec<f64> {
     };
 
     // 18. entropy_weight_obs (Li exponent from observed spectral entropy)
-    let ent_weight = if obs_ent >= 3.0 { 1.0 } else { fin(0.25 + 0.25 * obs_ent) };
+    let ent_weight = if obs_ent >= 3.0 {
+        1.0
+    } else {
+        fin(0.25 + 0.25 * obs_ent)
+    };
 
     vec![
         sim,

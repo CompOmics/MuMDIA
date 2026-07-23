@@ -51,13 +51,14 @@ fn solve_fixed(l: &[Vec<f64>], c: &[f64]) -> Vec<f64> {
         if d.abs() < 1e-12 {
             continue;
         }
-        for r in (col + 1)..m {
-            let f = a[r][col] / d;
+        let pivot_row = a[col].clone();
+        for row in a[col + 1..m].iter_mut() {
+            let f = row[col] / d;
             if f == 0.0 {
                 continue;
             }
-            for j in col..=m {
-                a[r][j] -= f * a[col][j];
+            for (value, &pivot_value) in row[col..=m].iter_mut().zip(pivot_row[col..=m].iter()) {
+                *value -= f * pivot_value;
             }
         }
     }
@@ -171,12 +172,16 @@ pub fn lfq_profile(mat: &[Vec<Option<f64>>], n_samples: usize) -> Vec<f64> {
             c[ib] -= r;
         }
         let x = solve_fixed(&l, &c); // log-abundance, x[0] = 0
-        // Anchor so the component's exp-profile preserves its measured total.
+                                     // Anchor so the component's exp-profile preserves its measured total.
         let measured: f64 = members.iter().map(|&s| colsum[s]).sum();
         let expsum: f64 = x.iter().map(|v| v.exp()).sum();
         let scale = if expsum > 0.0 { measured / expsum } else { 0.0 };
         for (i, &s) in members.iter().enumerate() {
-            out[s] = if colcount[s] > 0 { x[i].exp() * scale } else { 0.0 };
+            out[s] = if colcount[s] > 0 {
+                x[i].exp() * scale
+            } else {
+                0.0
+            };
         }
     }
     out
@@ -229,10 +234,10 @@ mod tests {
         // Same profile, but each peptide observed in only a subset of samples.
         let true_prof = [1.0, 2.0, 4.0];
         let mat = vec![
-            vec![Some(10.0), Some(20.0), None],       // pep in s0,s1
-            vec![None, Some(10.0), Some(20.0)],       // pep in s1,s2
-            vec![Some(3.0), None, Some(12.0)],        // pep in s0,s2
-            vec![Some(5.0), Some(10.0), Some(20.0)],  // pep in all
+            vec![Some(10.0), Some(20.0), None],      // pep in s0,s1
+            vec![None, Some(10.0), Some(20.0)],      // pep in s1,s2
+            vec![Some(3.0), None, Some(12.0)],       // pep in s0,s2
+            vec![Some(5.0), Some(10.0), Some(20.0)], // pep in all
         ];
         let _ = true_prof;
         let q = maxlfq(&mat, 3);
@@ -250,7 +255,12 @@ mod tests {
         let q = maxlfq(&mat, 3);
         let measured: f64 = 10.0 + 20.0 + 40.0 + 5.0 + 10.0 + 20.0;
         let got: f64 = q.iter().sum();
-        assert!((got - measured).abs() < 1e-6, "sum={} want={}", got, measured);
+        assert!(
+            (got - measured).abs() < 1e-6,
+            "sum={} want={}",
+            got,
+            measured
+        );
     }
 
     #[test]

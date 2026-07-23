@@ -17,10 +17,11 @@ source is the source of truth if it has moved.
 | `cargo build`/`cargo test` crashes intermittently with `STATUS_ACCESS_VIOLATION` or `STATUS_ILLEGAL_INSTRUCTION`, not a clean error | Build target dir sits under the OneDrive-synced tree; sync churn locks and corrupts incremental artifacts | Redirect `build.target-dir` off OneDrive (or set `CARGO_TARGET_DIR`); see `rust/mumdia/.cargo/config.toml.example` |
 | rustc crashes with `STATUS_ILLEGAL_INSTRUCTION` while compiling `arrow-ipc` at release opt-level 3 | `arrow-ipc`'s generated FlatBuffer code crashes rustc codegen at opt-level 3 on the Windows toolchain | Keep the `opt-level = 1` pin for `arrow-ipc` (`Cargo.toml:34-35`); do not remove it |
 | Sidecar run fails with "worker not found" / a spawn error naming a script path | `predict_frag.sidecar_script_dir` does not resolve to an existing dir from any of the three candidates | Run from the project root, or set `sidecar_script_dir` to a native absolute path (`c:/...`, not a git-bash `/c/...` path) |
-| `rescore.classifier = nn_torch` (or `mokapot`) silently produces `native_tda` scores | Worker path did not resolve (e.g. a `/c/...` POSIX path Windows cannot `stat`), the sidecar failed, and `rescore.strict = false` let the run fall back | Set a native path; set `rescore.strict = true` so a broken rescorer is a hard error, not silent native scores |
+| `rescore.classifier = nn_torch` (or `mokapot`) produces `native_tda` scores | A compatibility config explicitly set `rescore.strict = false`, then worker resolution/execution failed and fallback ran | Keep the default `strict = true`; inspect `psms_scored.parquet.report.json` for the classifier actually used |
 | `run` aborts with "MS2PIP returned no predictions" | MS2PIP returned an empty map; `predict-frag` has no whole-run native fallback | Fix the MS2PIP env (`mumdia doctor`), or set `predict_frag.predictor = native` |
 | `run` aborts during the DeepLC predict / fine-tune / MBR step | `predict-frag`, the fine-tune, and MBR propagate worker errors with `?`; only `rescore` falls back | Fix the sidecar env, or disable that path (`rt_predictor = native`, `finetune_deeplc = false`, `mbr.strategy = none`) |
-| A short `--max-spectra` run finds almost nothing | The early gradient is void; a few thousand spectra carry no meaningful IDs | Use the full file, or a mid-gradient `--max-spectra` slice, for meaningful identifications |
+| A short `--max-spectra` run finds almost nothing | The flag reads the file head and the early gradient is void | Use the full file or externally prepare a mid-gradient mzML slice; `--max-spectra` has no offset |
+| A reused `--out-dir` contains contradictory or stale sidecars | `run` recomputes named outputs but does not clear the directory; optional files can remain and a failed rerun can leave an old manifest | Use a fresh output directory for every `run`; reuse artifacts only through explicit standalone stage commands |
 | Config load fails with an unknown-field parse error | `#[serde(deny_unknown_fields)]` rejects any unknown or misspelled key (including a removed knob) | Fix or remove the key; check it against the current `config.rs`, not an old config |
 | Two runs of the same command give slightly different identification counts | A nondeterministic opt-in path is on: DeepLC fine-tune (no seed) or the PyTorch NN rescorer (approximately reproducible) | Accept the trade for the ID gain, or leave those paths off; set `MUMDIA_NN_SEEDS > 1` to average out NN variance |
 | Peptidoforms silently get iRT 0.0 | DeepLC returned no iRT for some peptidoforms; they are anchored at 0.0 with a warning | Check the DeepLC env and the `n_irt_missing` warning; unmatched peptidoforms are a known foot-gun |
@@ -65,16 +66,18 @@ fails. Use a native Windows path (`c:/Users/...`) or a plain relative dir run fr
 the project root, or an absolute in-container path such as `/opt/mumdia/scripts`
 in the Docker configs.
 
-**A broken rescorer masked by the native fallback.** `rescore` is the only stage
-that falls back to `native_tda` when its sidecar fails. With `rescore.strict =
-false` (the default) a failed or misconfigured mokapot/nn_torch sidecar is logged
+**A broken rescorer masked by an explicitly enabled native fallback.** `rescore`
+is the only stage that can fall back to `native_tda` when its sidecar fails. With
+`rescore.strict = false` (not the default), a failed or misconfigured
+mokapot/nn_torch sidecar is logged
 as a warning and the run continues on native scores (`rescore.rs:112-118` for
 mokapot, `rescore.rs:127-133` for nn_torch). This means a worker that never
 resolved (see the path trap above) or crashed produces a completed run whose
 scores are silently native, not the classifier the config named. Set
 `rescore.strict = true` so any sidecar failure is a hard error
-(`rescore.rs:114`, `rescore.rs:129`); production configs should. Confirm the
-recorded classifier in the report matches what was intended.
+(`rescore.rs:114`, `rescore.rs:129`); this is the production default. Confirm
+`params.classifier` and `model_identity` in
+`psms_scored.parquet.report.json` match what was intended.
 
 ## No fallback outside rescore
 
@@ -105,8 +108,9 @@ false`, `mbr.strategy = none`).
 MS levels (`convert.rs:123`; the flag is documented at `docs/04_convert.md:243`).
 The early chromatographic gradient is void, so a few thousand leading spectra
 carry almost no identifiable peptides and a short cap will look like a broken
-engine. For meaningful identifications use the full file, or take a mid-gradient
-slice rather than the file head. This is expected behaviour, not a bug.
+engine. For meaningful identifications use the full file, or externally create a
+mid-gradient mzML slice and run that file. `--max-spectra` itself cannot seek to
+an offset. This is expected behaviour, not a bug.
 
 ## Config load errors
 

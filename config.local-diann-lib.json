@@ -15,7 +15,8 @@
   },
   "rescore": {
     "classifier": "nn_torch",
-    "python": "C:/Users/robbi/anaconda3/envs/py312_mumdia/python.exe"
+    "python": "C:/Users/robbi/anaconda3/envs/py312_mumdia/python.exe",
+    "strict": true
   },
   "quant": {
     "q_filter": "run_psm_q"

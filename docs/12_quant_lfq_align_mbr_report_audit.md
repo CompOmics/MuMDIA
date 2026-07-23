@@ -44,23 +44,31 @@ stages that operate across multiple runs.
 Consumes `psms_scored.parquet` (from `rescore`) and `chromatograms.parquet` (from
 `extract`). Produces two mandatory artifacts and two optional ones.
 
-`peptide_quant.parquet` (schema `PEPTIDE_QUANT` v1, `quant.rs:314`):
+`peptide_quant.parquet` (schema `PEPTIDE_QUANT` v2):
 
 | column | type | meaning |
 |---|---|---|
 | `candidate_id` | u32 | library candidate id |
+| `base_peptide_id` | u32 | stripped/base-peptide key used to deduplicate protein rollup |
 | `peptidoform` | str | ProForma peptidoform |
 | `charge` | i32 | precursor charge |
 | `protein_group` | str | protein-group key |
-| `quantity` | f64 | sum of top-N fragment areas |
-| `n_fragments_used` | i32 | number of fragments actually summed (`min(len, top_n_fragments)`) |
+| `quantity` | nullable f64 | sum of the top-N positive finite fragment areas; null when not quantifiable |
+| `quant_status` | str | `quantified` or the explicit reason quantity is missing |
+| `n_fragments_used` | i32 | number of positive finite fragments actually summed |
+| `integration_apex_rt` | nullable f64 | apex actually used for integration |
+| `integration_lo_rt` / `integration_hi_rt` | nullable f64 | integration bounds actually applied |
 
-`protein_group_quant.parquet` (schema `PROTEIN_GROUP_QUANT` v1, `quant.rs:341`):
-`protein_group` (str), `quantity` (f64), `n_peptides` (i32).
+`protein_group_quant.parquet` (schema `PROTEIN_GROUP_QUANT` v2):
+`protein_group` (str), nullable `quantity` (f64), `quant_status` (str), and
+`n_peptides` (i32, number of unique positive base peptides before Top-N
+truncation). Charge/modification siblings contribute only their maximum
+single-run quantity to the base-peptide representative.
 
 `fragment_quant.parquet` (optional, `--out-fragment`; `quant.rs:369`): one row per
 fragment area, `candidate_id`, `peptidoform`, `charge`, `protein_group`,
-`fragment_name` (str), `quantity` (f64). This is the input for ion-level directLFQ.
+`fragment_name` (str), `quantity` (f64). Only positive finite fragment areas are
+emitted. This is the input for ion-level directLFQ.
 
 `<peak_bounds>.parquet` (optional diagnostic, `--out-peak-bounds`, only when
 `bound_peak` is on; `quant.rs:273`): `candidate_id`, `lo_rt`, `hi_rt`, `width_s`
@@ -68,12 +76,11 @@ fragment area, `candidate_id`, `peptidoform`, `charge`, `protein_group`,
 A row is emitted only for a candidate whose chosen `(lo_rt, hi_rt)` are both finite
 (`quant.rs:256`), so unbounded/degenerate windows are absent.
 
-Only `peptide_quant` and `protein_quant` receive a sidecar `<artifact>.report.json`:
-the `ArtifactReport` loop (`quant.rs:386`) iterates just those two schemas.
-`fragment_quant.parquet` and the peak-bounds diagnostic are written with no
-`report.json`. The recorded params are `q_threshold`, `top_n_fragments`, `rollup`,
-`bound_peak`, `peak_fraction`, `peak_grace`, `q_filter` (`quant.rs:397`), and the
-stats are `quantified_peptides` / `quantified_protein_groups`.
+`peptide_quant`, `protein_group_quant`, and an emitted `fragment_quant` receive a
+sidecar `<artifact>.report.json`; the peak-bounds diagnostic does not. Recorded
+params include the q filter, integration settings, config hash, and exact scored
+and chromatogram inputs. Stats distinguish row counts from quantified and
+nonquantifiable rows.
 
 ### quant-lfq
 Consumes N per-run tables (peptide_quant for maxlfq, fragment_quant for directlfq).
@@ -161,15 +168,21 @@ the read returns empty and refinement is inert. Writes `candidate_audit.parquet`
 ### quant (`quant.rs:147`, `run`)
 
 1. Load `psms_scored`. The q-value column to filter on is selected by
-   `cfg.q_filter` (`quant.rs:160`): `PeptideQ` -> `peptide_q_value`, `PsmQ` ->
-   `q_value`, `RunPsmQ` -> `run_psm_q`. This choice matters for cross-run quant off
-   an experiment-wide rescore, where the peptide q is global and would give disjoint
-   per-run sets (see `QuantQColumn` doc, `config.rs:806`).
+   `cfg.q_filter`: `PeptideQ` -> `peptide_q_value`, `PrecursorQ` ->
+   `precursor_q`, `PsmQ` -> pooled `q_value`, `RunPsmQ` -> `run_psm_q`.
+   `PeptideQ`/`PrecursorQ` are grouped values suitable for a single-run rescore;
+   `RunPsmQ` is the run-local gate for a slice of an experiment-wide rescore.
+   Quant has no source selector: before per-run quantification, slice a pooled
+   scored table by `source` and pair that slice with the matching chromatograms.
+   Changing `q_filter` does not select a run.
 2. Group chromatogram rows by `candidate_id` into `cand_rows` (`quant.rs:176`). Rows
    whose `frag_name` starts with `ms1_` are MS1 isotope XIC pseudo-traces, not
    fragment ions; they are excluded from both peak detection and the top-N sum.
-3. **Phase 1** (`quant.rs:194`, only when `cfg.bound_peak`): compute a per-candidate
-   elution window `(lo_rt, hi_rt, apex_rt)` via `peak_window` (`quant.rs:75`). The
+3. **Phase 1** (only when `cfg.bound_peak`): compute a per-candidate elution
+   window `(lo_rt, hi_rt, apex_rt)` via `peak_window`. Schema-v3 scored tables
+   carry the exact identification apex through compete/rescore; quant anchors the
+   window at that apex. A missing, null, or non-finite apex from an older scored
+   artifact falls back to the legacy robust summed-XIC apex detector. The
    summed XIC across all of a candidate's fragments is built in a `BTreeMap` keyed by
    the f32 RT bit pattern, so both the union RT axis and the f64 summation order are
    fixed (determinism, docs/18_findings_and_decisions.md contract B2; non-negative RTs make bit order equal value
@@ -180,9 +193,8 @@ the read returns empty and refinement is inert. Writes `candidate_audit.parquet`
    nonzero-fragment count is at least `thresh = max(max_cnt - 1, 1)` (`quant.rs:109`,
    the `-1` for robustness, the `.max(1)` floor requiring at least one co-eluting
    fragment), take the highest summed intensity; fall back to a plain summed argmax
-   only if no scan qualifies. This rejects a lone tall interferent that a plain
-   intensity argmax would pick (test `peak_window_apex_prefers_coelution_over_lone_interferent`,
-   `quant.rs:686`). `peak_bounds` (`features.rs:946`) then walks out from the apex with
+   only if no scan qualifies. That detector is now a compatibility fallback, not
+   the normal source of the quant apex. `peak_bounds` then walks out from the apex with
    `peak_fraction` and `peak_grace`. A collapsed `lo==hi` window is widened to the
    adjacent grid scans so `trapezoid_window` never returns a raw height (units bug,
    `quant.rs:136`).
@@ -191,20 +203,23 @@ the read returns empty and refinement is inert. Writes `candidate_audit.parquet`
    peptides (`pep_q <= reliable_q`) it takes the median left half-width `apex - lo` and
    right half-width `hi - apex`, and applies `(apex - ml, apex + mr)` around each
    candidate's apex. Requires `>= 20` anchors (`quant.rs:232`), else falls back to the
-   per-candidate windows. Being global, the same width is used in every run, so fold
-   changes are preserved.
+   per-candidate windows. The consensus is local to one quant invocation; separate
+   runs estimate separate widths unless an external workflow supplies a shared
+   policy.
 5. **Phase 2** (`quant.rs:246`): integrate each fragment trace. With `bound_peak` off,
    integrate the whole trace with `trapezoid` (`quant.rs:36`). With it on, restrict to
    the chosen window via `trapezoid_window` (`quant.rs:51`). Areas are accumulated per
    candidate in `areas` and `frag_areas`.
-6. **Top-N sum** (`quant.rs:287`): for each PSM that is a target with `pep_q <=
-   q_threshold`, sort the candidate's area vector descending in place and sum the top
-   `top_n_fragments` (`quant.rs:297`). The per-candidate vector is sorted by mutable
-   reference (no clone); a repeated `candidate_id` re-sorts an already-sorted vector
-   (idempotent). Accumulate per protein group in `per_group`.
-7. **Protein rollup** (`quant.rs:327`): per group, sort peptide quantities descending
-   and apply `RollupMethod` (`TopNSum` = sum of top `top_n_peptides`, `Sum` = sum of
-   all). Groups are iterated in sorted key order.
+6. **Top-N sum:** for each accepted target, retain only positive finite fragment
+   areas, sort descending, and sum the top `top_n_fragments`. Missing traces,
+   all-zero/non-finite areas, or `top_n_fragments=0` produce a null quantity plus
+   an explicit `quant_status`; they are not converted to biological zero. The
+   applied apex and bounds are written with the row.
+7. **Protein rollup:** within each protein group, charge/modification siblings are
+   deduplicated by `base_peptide_id` using their maximum positive quantity.
+   `TopNSum` then sums the top `top_n_peptides` unique base peptides; `Sum` uses
+   all unique bases. A group with no quantifiable base peptide has null quantity
+   and `quant_status=no_quantifiable_peptide`.
 8. Optional fragment export (`quant.rs:351`) and peak-bounds diagnostic
    (`quant.rs:273`). `ArtifactReport` records params + stats for each table
    (`quant.rs:386`).
@@ -214,11 +229,11 @@ samples; a single sample returns its raw intensity (`quant.rs:37`). `trapezoid_w
 first filters to samples with `lo <= rt <= hi`, then calls `trapezoid` on the subset
 so the single-sample rule is identical; an empty window integrates to 0.
 
-**Known limits.** quant re-detects the apex from the summed XIC rather than reusing
-the apex `extract`/`features` already chose, so the quant apex and the scoring apex can
-differ. There is no quantifiability gate: a confident PSM with only one noisy fragment
-still produces a `quantity` (possibly a single-sample height widened to two grid
-scans); nothing downstream flags low-evidence quantities beyond `n_fragments_used`.
+**Remaining limits.** A single positive fragment can still yield a quantity; the
+status and `n_fragments_used` expose that evidence level but do not enforce a
+minimum-clean-ion rule. Peak-window and fragment-selection policies remain
+single-run choices rather than a learned cross-run consensus. Evaluate changes on
+known-ratio data rather than identification count alone.
 
 ### quant-lfq (`quant.rs:421`, `run_lfq_combine`)
 
@@ -255,6 +270,9 @@ rollup (`quant.rs:453`). For each protein group the feature-by-run matrix is pas
 
 Determinism: medians sort in place, the matrix is iterated in `BTreeMap` key order.
 With a single input, `run_lfq_combine` reduces to the per-run sum.
+If no positive feature is complete across all runs, `MedianRatio` returns identity
+factors (`1.0`) without estimating a scale correction. Inspect the logged
+`size_factors`; identity may mean either balanced data or no usable complete cases.
 
 ### align (`align.rs:53`, `run`)
 
@@ -357,6 +375,15 @@ column only, and a separate stripped-sequence count is logged. `q_value` is prin
 targets with `pg_q_value <= q_threshold` (`report.rs:117`). Returns `(n_precursors,
 n_protein_groups)`.
 
+This is a hybrid identification report: `peptides.tsv` has precursor-shaped rows
+but is filtered and labeled with peptide-level q. It is neither a stripped-peptide
+table nor a `precursor_q`-controlled precursor table. Report filtering is also
+independent of `quant.q_filter`, so a report row can legitimately have a blank
+quantity when quant excluded it or marked it nonquantifiable. Use
+`peptide_quant.parquet`/`protein_group_quant.parquet` for numerical analysis:
+Parquet retains nullable f64 precision and status/bounds, while TSV quantity is a
+presentation value rounded to one decimal.
+
 ### audit (`audit.rs:64`, `run`)
 
 The search space is every library precursor (`candidate_id`, `peptidoform`, `charge`,
@@ -439,9 +466,11 @@ FDR/reporting).
 - `peak_grace` (1): consecutive sub-threshold scans bridged during the walk.
 - `peak_window_mode` (`PerCandidate`): `PerCandidate` or `Consensus` (`config.rs:760`).
 - `reliable_q` (0.001): confident-set cutoff calibrating the consensus half-widths.
-- `q_filter` (`PeptideQ`): which q column to filter on; `PeptideQ`/`PsmQ`/`RunPsmQ`
-  (`config.rs:816`). Use `PsmQ`/`RunPsmQ` for cross-run quant off an experiment-wide
-  rescore.
+- `q_filter` (`PeptideQ`): which q column to filter on:
+  `PeptideQ`/`PrecursorQ`/`PsmQ`/`RunPsmQ`. Use `PrecursorQ` only after a
+  single-run rescore. For
+  experiment-wide rescoring, slice by `source` and normally use `RunPsmQ`;
+  `q_filter` alone does not select the run.
 
 **`quant-lfq`** takes no config struct; `--method` (maxlfq/directlfq) and `--normalize`
 (median_ratio/median/none, parsed by `NormalizeMethod::from_token`, `config.rs:796`)
@@ -477,13 +506,22 @@ but do not affect the wired `mumdia mbr` path.
   return a raw height (intensity, not intensity*seconds), mixing units against
   broad-peak peptides; `peak_window` widens to two grid scans to prevent this
   (`quant.rs:136`, test `peak_window_never_collapses_to_single_sample`).
-- **quant apex is re-detected**, not inherited from `extract`/`features`; the quant apex
-  and the scoring apex can differ. There is no quantifiability gate.
+- **Quant anchors at the identification apex.** Schema-v3 scored rows carry
+  `apex_rt`; quant uses it and only falls back to XIC apex detection for legacy,
+  missing, or non-finite values. Applied apex/bounds are emitted for QC.
+- **Missing is not zero.** Nonquantifiable accepted IDs receive null `quantity`
+  and an explicit `quant_status`. LFQ ignores null, non-finite, and nonpositive
+  values.
+- **Competition affects matrix completeness.** The default upstream
+  `group_by=precursor` collapses charge/modification siblings separately within
+  each label. `peptidoform_charge` preserves them, but changes the rescoring/FDR
+  population and must be benchmarked before production use.
 - **MS1 traces excluded.** `ms1_*` chromatogram rows are precursor channels and never
   enter peak detection or the top-N sum (`quant.rs:178`).
 - **report row unit.** `peptides.tsv` rows are precursors (peptidoform + charge), not
-  stripped sequences; the returned count and the header reflect that (`report.rs:87`).
-  A separate stripped-sequence count is only logged.
+  stripped sequences, but selection is by `peptide_q_value`, not `precursor_q`.
+  A separate stripped-sequence count is only logged. TSV quantity is rounded; use
+  Parquet for quantitative work.
 - **`<psms>.audit.parquet` has no producer.** `emit_candidate_audit` (`config.rs:521`)
   documents that extraction "writes `<out-psms>.audit.parquet`", but no stage in the
   current tree writes it (grep: only `compete` writes `<out>.compete_audit.parquet` and
@@ -509,9 +547,9 @@ but do not affect the wired `mumdia mbr` path.
   `PRECURSOR_MZ_OUT_OF_RANGE`, `CANDIDATE_CAP_REACHED`, `REMOVED_DURING_REPORTING`) have
   no producer at all: even a sidecar string of that name falls to the `_ => NoPeakGroup`
   arm (`audit.rs:142`).
-- **report.json coverage is partial.** `quant` writes `report.json` only for
-  `peptide_quant` + `protein_quant`; `fragment_quant` and the peak-bounds diagnostic get
-  none. `quant-lfq` and `mbr` write no `report.json` at all; `align` and `audit` do
+- **report.json coverage is partial.** `quant` writes reports for
+  `peptide_quant`, `protein_quant`, and emitted `fragment_quant`; the peak-bounds
+  diagnostic gets none. `quant-lfq` and `mbr` write no `report.json`; `align` and `audit` do
   (the latter as `<out>.metrics.json`). Do not assume every artifact here has a sidecar
   report.
 - **align / mbr need >=2 runs.** align degenerates to identity on one run; `mumdia mbr`

@@ -36,8 +36,8 @@ pub fn target_decoy_q(scores: &[(f64, bool)]) -> Vec<f64> {
             end += 1;
         }
         let f = (td as f64 + 1.0) / (tt.max(1) as f64);
-        for r in rank..end {
-            fdr_at[r] = f;
+        for value in fdr_at.iter_mut().take(end).skip(rank) {
+            *value = f;
         }
         rank = end;
     }
@@ -61,7 +61,12 @@ pub fn target_decoy_q(scores: &[(f64, bool)]) -> Vec<f64> {
 /// empirical-null analog of `target_decoy_q`: the entrapment population, unlike
 /// in-silico decoys, experiences the same chimeric DIA interference as real
 /// targets, so the estimate is not optimistic. Returns q aligned to input order.
-pub fn entrapment_q(scores: &[f64], is_entrapment: &[bool], is_real: &[bool], ratio: f64) -> Vec<f64> {
+pub fn entrapment_q(
+    scores: &[f64],
+    is_entrapment: &[bool],
+    is_real: &[bool],
+    ratio: f64,
+) -> Vec<f64> {
     let n = scores.len();
     if n == 0 {
         return Vec::new();
@@ -92,8 +97,8 @@ pub fn entrapment_q(scores: &[f64], is_entrapment: &[bool], is_real: &[bool], ra
             end += 1;
         }
         let f = (ratio * ne as f64 + 1.0) / (nr.max(1) as f64);
-        for r in rank..end {
-            fdr_at[r] = f;
+        for value in fdr_at.iter_mut().take(end).skip(rank) {
+            *value = f;
         }
         rank = end;
     }
@@ -153,7 +158,10 @@ mod tests {
         // 3 targets above 1 decoy -> best target q = (0+1)/3 = 1/3
         let s2 = vec![(10.0, false), (9.0, false), (8.0, false), (1.0, true)];
         let q2 = target_decoy_q(&s2);
-        assert_eq!(count_targets_at_q(&q2, &[false, false, false, true], 0.34), 3);
+        assert_eq!(
+            count_targets_at_q(&q2, &[false, false, false, true], 0.34),
+            3
+        );
     }
 
     #[test]

@@ -107,8 +107,10 @@ below) rather than trusting a doc; the schema is authoritative on disk.
 
 ### JSON sidecars produced
 
-- `<artifact>.report.json` (per artifact, written by every stage via
-  `ArtifactReport::write_for`, `report.rs:28`). Fields below.
+- `<artifact>.report.json` (written for most primary stage Parquets via
+  `ArtifactReport::write_for`, `report.rs:28`). Coverage is not universal:
+  schema/PIN files, report TSVs, and several optional or Python-written
+  artifacts have no report. Fields below.
 - `manifest.json` (written once by the `run` orchestrator from the collected
   `ArtifactRecord`s, `stages/run.rs`). This crate supplies the per-record
   builder `record_artifact` (`lib.rs:20`); it does not write the manifest file.
@@ -265,7 +267,7 @@ cleavages, length bounds, decoy strategy, and rng seed, and `stats` with
 stage-local helper `write_reports` (`stages/convert.rs:272-294`) that writes one
 report per artifact with a shared `params` and empty `stats`; note this
 `write_reports` lives in `convert.rs`, it is not part of the `mumdia-io` public
-API. Every other stage builds its `ArtifactReport` directly (see the
+API. Stages with report coverage build their `ArtifactReport` directly (see the
 `write_for` call sites in `align`, `compete`, `extract`, `search_seed`,
 `predict_frag`, `peptidoforms`, `rt_im_train`, `rescore`, `features`, `quant`).
 
@@ -280,10 +282,12 @@ are copied straight from the arguments; `format` is hard-coded to `"parquet"`
 `content_hash` is `blake3_file(path)` of the file just written; `producing_stage`
 comes from the `stage` argument (the struct field and the argument are named
 differently); and `config_hash` is the argument. The
-`run` orchestrator calls it once per artifact and records each into the
-`Manifest` (`stages/run.rs`, many call sites around `record_artifact(...)`),
-which is then serialized to `manifest.json`. Standalone single-stage invocations
-write only the `.report.json` sidecar, not a manifest.
+`run` orchestrator calls it for selected primary Parquet artifacts and records
+those into the `Manifest` (`stages/run.rs`, many call sites around
+`record_artifact(...)`), which is then serialized to `manifest.json`.
+Calibration JSON, PIN/schema companions, TSVs, and some diagnostics are not
+manifest records. Standalone single-stage invocations write their normal
+sidecars, when implemented, but not a manifest.
 
 ### `inspect` (`lib.rs:43`)
 

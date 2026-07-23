@@ -11,11 +11,12 @@ MuMDIA is a clean-room Rust reimplementation of a data-independent-acquisition
 identified peptides and proteins at target-decoy-controlled FDR out. It builds a
 spectral library from either an in-silico FASTA digest or an imported predicted
 library, extracts candidates against a peak-major inverted fragment index, and
-rescores with a semi-supervised classifier. The pipeline is a sequence of
-independent stages: `convert -> digest -> peptidoforms -> predict-frag ->
-search-seed -> rt-im-train -> extract -> features -> compete -> rescore`, plus
-`quant`/`quant-lfq`, the `run` orchestrator, `report`, `align`, `mbr`, and
-`audit`.
+rescores with a semi-supervised classifier. The pipeline is a DAG: mzML
+conversion and library creation/import are independent branches that converge at
+`search-seed`; optional DeepLC fine-tuning then sits between seed search and RT
+calibration. Extraction, features, competition, rescoring, quantification, and
+reporting follow. `align`, `mbr`, and `quant-lfq` are separate experiment-level
+commands.
 
 ---
 
@@ -26,8 +27,11 @@ Steer development by these. Unless noted, the benchmark is
 iRT has been fine-tuned (the `lib/lib_precursors_ft.parquet` library), the
 Extended feature set, and all reported points are FDR-valid (measured decoy
 fraction near 0.98 to 0.99 percent at the 1 percent threshold). Peptide counts
-are at 1 percent FDR on the `peptide_q_value` column. The extraction gate is
-`extract.min_frag_corr`, a co-elution Pearson floor on the accepted candidates.
+are at 1 percent FDR on the `peptide_q_value` column. The extraction threshold is
+`extract.min_frag_corr`; with the default `gate_mode=apex_pearson`, it is the
+Pearson correlation between observed and predicted fragment intensities at one
+apex scan. It is temporal co-elution only under `gate_mode=coelution` (or the
+co-elution half of `combined`).
 
 ### A1. The rescorer is the dominant sensitivity lever
 
@@ -73,7 +77,9 @@ is training-pool curation plus null curation, not feature engineering. A hard
 fixed threshold is the wrong instrument. The right fix is a soft or budgeted gate:
 prune the worst junk to protect the null and the training pool, keep the
 borderline candidates, and pass the gate score through to the rescorer as a
-feature rather than using it as a drop criterion.
+  feature rather than using it as a drop criterion. These mechanism claims refer
+  to the default apex-intensity Pearson gate used in the benchmark, not a
+  chromatographic co-elution threshold.
 
 ### A3. MS2 peak cap: keep 300 on AIF
 
@@ -84,12 +90,12 @@ capped versus 10,251 uncapped. On chimeric all-ion-fragmentation data the extra
 low-intensity peaks are interference, not signal, so the cap helps. This is
 instrument-dependent: narrow-window Orbitrap-Astral data behaves differently and
 should be re-evaluated on its own. The cap is applied at conversion time by
-`peaks_of`, which keeps the top-N most intense peaks with 0 meaning no cap
-(`rust/mumdia/crates/mumdia/src/stages/convert.rs:54` and `:76`). The `run`
-orchestrator defaults the MS2 cap to 0 (uncapped) while the standalone `convert`
-subcommand defaults it to 300
-(`rust/mumdia/crates/mumdia/src/main.rs:722` for `run`, `:741` for `convert`), so
-to reproduce the 300-cap results under `run`, pass the cap explicitly.
+`peaks_of`, which keeps the top-N most intense peaks with 0 meaning no cap.
+Both `run --top-peaks-ms2` and standalone `convert --top-peaks-ms2` default to
+0 (uncapped). Reproducing this AIF result therefore requires the explicit
+conversion flag `--top-peaks-ms2 300`. This is independent of
+`search_seed.top_n_peaks=300`, which limits seed probing only and does not remove
+peaks from downstream extraction or quantification.
 
 ### A4. DeepLC multitask fine-tune of iRT is essential in library mode
 
@@ -100,8 +106,10 @@ seconds MAD, which narrows the RT windows and materially lifts identifications.
 The fine-tune is therefore essential, not optional, in library-input mode. Do not
 use an already-fine-tuned library (a `_ft` or reversed-decoy library) as a "raw
 DIA-NN" baseline; the raw baseline is the un-fine-tuned precursor library. The
-fine-tune runs between search-seed and RT calibration and rewrites the library's
-`predicted_irt` in place; it is nondeterministic (see Part B).
+fine-tune runs between search-seed and RT calibration and writes a new
+`fragment_library_precursors_ft.parquet` with replaced `predicted_irt`; the input
+library is unchanged and downstream stages are rebound to the new table. It is
+nondeterministic (see Part B).
 
 ### A5. q-value units are independent per level, not a rollup
 
@@ -161,15 +169,17 @@ needed.
 
 ### B1. Interstage contract
 
-Every stage is an independent command. It reads its declared inputs from
-path-addressable Parquet (and JSON for scalars and configuration) on disk, and it
-writes its outputs as Parquet plus a sidecar `<artifact>.report.json`. No stage
-shares in-memory state with another stage. This is why any stage can run
-standalone on the outputs of a prior run, and why a rerun can recompute only what
-changed. The `run` orchestrator simply chains the stages and records every
-artifact in `manifest.json`.
+Computational stages exchange path-addressable Parquet (and JSON for scalars and
+configuration) rather than shared in-memory state. Most can run standalone on
+prior outputs. `run` does not cache, skip unchanged work, or resume: it
+unconditionally recomputes its chain, so use a fresh output directory and invoke
+selected downstream stages manually when reusing artifacts. Most primary
+Parquets receive `<artifact>.report.json`, and selected primary Parquets are
+recorded in `manifest.json`; coverage is not universal for diagnostics,
+PIN/schema companions, TSVs, or Python-written outputs.
 
-The per-artifact report is written by `ArtifactReport::write_for`, which writes
+Where implemented, the per-artifact report is written by
+`ArtifactReport::write_for`, which writes
 `<artifact_path>.report.json` next to the Parquet
 (`rust/mumdia/crates/mumdia-io/src/report.rs:28`). The report carries the logical
 name, schema name and version, stage, row count, a content hash, the resolved
@@ -212,7 +222,8 @@ Two known exceptions are nondeterministic by design and are documented as such:
   that NN training is only approximately reproducible, and it offers
   `MUMDIA_NN_SEEDS > 1` to ensemble seeds and average rank-normalized
   out-of-fold scores for stability (`scripts/nn_rescore_worker.py:29` through
-  `:30`). Treat `nn_torch` as effectively nondeterministic.
+  `:30`). Treat `nn_torch` as seeded and approximately reproducible, but not
+  bit-deterministic.
 
 ### B3. Sidecar contract
 
@@ -221,11 +232,11 @@ the PyTorch NN, entrapment, MBR) run as opt-in Python workers behind one file
 contract. The Rust caller writes an input Parquet (or a Percolator PIN for the
 rescorers), invokes the worker as a subprocess with positional command-line
 arguments (input path, output path, then any extra flags), and reads back an
-output Parquet. The output is keyed by a stable identifier so the caller can join
-it back without relying on row order: `id` for the per-candidate predictors and
-`candidate_id` for the rescorers. There is no JSON request file; the argv
-positions and the output schema are the contract, which is why any sidecar can be
-replaced by a native Rust implementation without touching callers.
+output Parquet. Predictor output is keyed by stable per-candidate `id`. PIN
+rescorers instead encode the concatenated flat row ordinal in `SpecId` and echo
+that ordinal in a column named `candidate_id`; it is deliberately not the
+library candidate ID, which repeats across source runs. There is no JSON request
+file; argv positions and the output schema are the contract.
 
 Concrete points in code:
 
@@ -237,8 +248,8 @@ Concrete points in code:
   (`rust/mumdia/crates/mumdia/src/sidecar.rs:95` through `:100`).
 - The DeepLC fine-tune is invoked as `<lib_in> <seed> <lib_out>` plus flags
   (`rust/mumdia/crates/mumdia/src/sidecar.rs:106` through `:129`).
-- The NN rescorer reads a PIN and writes a Parquet keyed by `candidate_id`
-  (`scripts/nn_rescore_worker.py:4`, `:264` through `:268`).
+- The NN rescorer reads a PIN and writes the flat PIN-row ordinal back in its
+  `candidate_id` column; Rust maps scores by that unique row index.
 
 Worker scripts are located by `sidecar::resolve_script`, which tries the
 configured directory relative to the working directory, then relative to the
@@ -246,7 +257,8 @@ binary's own directory, then `<exe_dir>/scripts`
 (`rust/mumdia/crates/mumdia/src/sidecar.rs:18` through `:33`). On Windows, set
 `predict_frag.sidecar_script_dir` to an absolute path with a drive letter
 (`c:/...`), not a git-bash `/c/...` path, or the binary cannot find the worker
-and `nn_torch` silently falls back to `native_tda`.
+and the strict default aborts. Only an explicit `rescore.strict=false`
+compatibility config falls back to `native_tda`.
 
 ---
 
@@ -263,17 +275,22 @@ Library-input mode is the recipe that wins:
    noisy.
 3. Use the Extended feature set (`features.set = extended`).
 4. Use the `nn_torch` rescorer (`rescore.classifier = nn_torch`, with
-   `rescore.python` pointing at a torch-capable interpreter). Rationale: finding
-   A1, the rescorer is the dominant lever.
+   `rescore.python` pointing at a torch-capable interpreter and
+   `rescore.strict = true`). Rationale: finding A1, the rescorer is the dominant
+   lever; strict mode prevents a failed sidecar from masquerading as the intended
+   model. Verify `params.classifier` in `psms_scored.parquet.report.json`.
 5. Use a loose extraction gate (`extract.min_frag_corr` near 0.2). Rationale:
    finding A1 and A2, the nonlinear rescorer prefers looser-is-better.
-6. Keep the MS2 peak cap at 300 on AIF. Rationale: finding A3, uncapping adds
-   interference on chimeric data.
+6. Keep the conversion-time MS2 peak cap at 300 on AIF by passing
+   `--top-peaks-ms2 300`. Rationale: finding A3, uncapping adds interference on
+   chimeric data. The seed-only `search_seed.top_n_peaks=300` is separate.
 
-On `LFQ_Orbitrap_AIF_Ecoli_01` this reaches about 10,300 target peptides at 1
-percent FDR (FDR-valid), single-run. The zero-dependency native FASTA-digest mode
-(about 1,213 peptides) is the high-precision fallback when no library is
-available.
+On `LFQ_Orbitrap_AIF_Ecoli_01` this historically reaches about 10,300
+`(peptidoform, charge)` rows in `peptides.tsv`, selected with
+`peptide_q_value <= 0.01`. That is a precursor-shaped report count under a
+peptide-level q filter, not a stripped-peptide count or a precursor-q count. The
+zero-dependency native FASTA-digest mode gives about 1,213 rows under the same
+definition. See docs/20 for the exact command and promotion gates.
 
 Report the right q-unit for the question asked (finding A5): `precursor_q` for a
 ProteoBench precursor matrix, `run_psm_q` for cross-run quantification,
@@ -297,11 +314,12 @@ ProteoBench precursor matrix, `run_psm_q` for cross-run quantification,
    unwired `MbrConfig` knobs, differentiate the `MbrStrategy` variants, keep the
    transfer q as a separate column rather than overwriting `q_value`, and chain
    transfer, search, and MBR under one config.
-4. **Quantification maturity.** Consume the identified apex instead of
-   redetecting it; add quantifiability gates (minimum clean ions, co-elution
-   correlation, minimum non-missing runs); use a cross-run consensus ion set;
-   keep identifications separate from quantifiable; default
-   `quant.q_filter = run_psm_q`.
+4. **Quantification maturity.** The current path now consumes the identified
+   apex, preserves missing quantities as null with `quant_status`, and prevents
+   sibling precursor forms from multiplying protein Top-N abundance. Next,
+   benchmark quantifiability gates (minimum clean ions/co-elution), a cross-run
+   consensus ion/window policy, and missingness rules on known-ratio datasets.
+   Keep identification acceptance separate from quantifiability.
 5. **Per-run figure-of-merit tolerance-optimization loop** (set each tolerance
    from a high percentile of the 1-percent-FDR error distribution and iterate to a
    stable precursor count).

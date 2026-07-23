@@ -443,9 +443,11 @@ Precursor isotope-envelope agreement against a Poisson-averagine model
 `ms1_ms2_envelope_time_corr`, `ms1_iso_coelution`, `ms1_ms2_apex_rt_delta`,
 `ms1_iso_ratio_stability`, `ms1_mono_gaussianity`, `ms1_ms2_fwhm_ratio`,
 `ms1_isotope_corr_xic`, `ms1_envelope_over_time_corr`,
-`ms1_isotope_xic_shape_consistency`) reads `Evidence.ms1_xic` and returns 0.0
-until the extract stage persists MS1 isotope XICs (evidence gap; currently
-unpopulated in the default chain).
+`ms1_isotope_xic_shape_consistency`) reads `Evidence.ms1_xic`. Extract now
+persists `ms1_mono`, `ms1_iso1`, and `ms1_iso2` chromatogram rows when MS1 input
+and a scan grid are available, so these features are populated in normal
+orchestrated runs. They remain 0.0 for older artifacts, standalone extraction
+without `--ms1`, or candidates without usable MS1/grid evidence.
 
 ### rt (13, `rt.rs`)
 
@@ -503,8 +505,8 @@ Fragment apex dispersion and consensus peak shape, intensity-independent
 `frag_apex_agree_frac`, `precursor_frag_apex_delta`, `peak_symmetry`,
 `peak_tailing`, `peak_n_local_maxima`, `peak_shoulder_score`, `peak_fwhm_scans`,
 `peak_truncation`, `apex_frac_of_window`. `precursor_frag_apex_delta` reads the
-mono MS1 XIC (`ms1_xic[0]`) and is 0.0 until the extract stage persists MS1
-isotope XICs (the same evidence gap as the `ms1` XIC block). Has unit tests
+mono MS1 XIC (`ms1_xic[0]`) and is populated under the same MS1/grid conditions
+as the `ms1` XIC block; otherwise it is 0.0. Has unit tests
 (`apex_dispersion.rs:226`).
 
 ### mass_uncertainty (10, `mass_uncertainty.rs`)
@@ -627,9 +629,10 @@ not carry the configured fragment tolerance.
 - `peptide_length` (`features.rs:246`) strips a leading `DECOY_` prefix before
   counting residues, and ignores bracketed modifications, so the decoy marker is
   not a length-based target/decoy label leak (tested at `features.rs:1425`).
-- MS1 XIC features return 0.0 unless the extract stage wrote `ms1_*`
-  chromatogram rows; `ms1_xic` is otherwise empty. This is a known evidence gap,
-  not a bug.
+- MS1 XIC features require `ms1_*` chromatogram rows. Normal `run` supplies
+  converted MS1 spectra to extract, which writes those rows when a usable grid is
+  present; older artifacts or standalone extraction without `--ms1` legitimately
+  leave the features at 0.0.
 - `bound_features` gates only the Minimal/Rich `fragment_features` path
   (`features.rs:1154`): when false, that path scores over the whole extracted
   window. The Extended `build_evidence` (`features.rs:345`) takes no such flag

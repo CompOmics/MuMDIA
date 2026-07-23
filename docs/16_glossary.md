@@ -79,9 +79,10 @@ nowhere and rejected by validation
 
 **DeepLC fine-tune**. An optional per-run adaptation of the DeepLC retention-time
 model on the confident seed PSMs, run between `search-seed` and RT calibration; it
-rewrites the library's `predicted_irt` for this run before windows are set. It is
-opt-in (`rt_im_train.finetune_deeplc`) and nondeterministic (no fixed torch/numpy
-seed). See `iRT`.
+writes a new `_ft` precursor-library table with replaced `predicted_irt` and
+rebinds downstream stages to it; the input file is unchanged. It is opt-in
+(`rt_im_train.finetune_deeplc`) and nondeterministic (no fixed torch/numpy seed).
+See `iRT`.
 
 **entrapment**. An optional decoy-independent FDR cross-check that spikes a foreign
 proteome into the search library and treats those spike-in PSMs as real negatives.
@@ -164,8 +165,9 @@ contract (`mbr_worker.py`); the default is no MBR and it needs at least two runs
 (`rust/mumdia/crates/mumdia/src/main.rs:246`).
 
 **mokapot**. An opt-in Python rescoring sidecar (`RescorerKind::Mokapot`) run over
-the PIN file with a logistic-regression default; on failure it falls back to the
-native rescorer unless `rescore.strict` is set
+the PIN file with a logistic-regression default; the default `rescore.strict=true`
+makes failure fatal. Setting strict false explicitly enables native compatibility
+fallback
 (`rust/mumdia/crates/mumdia-core/src/config.rs:132`,
 `rust/mumdia/crates/mumdia/src/stages/rescore.rs:105`). See `percolator_lite`.
 
@@ -239,7 +241,7 @@ different grouping contexts (`rust/mumdia/crates/mumdia/src/stages/rescore.rs:33
 | `q_value` | per-PSM, pooled across all runs (alias of `global_q_value` / `experiment_psm_q`) | experiment-wide PSM FDR; cross-run precursor quant off a pooled rescore (`QuantQColumn::PsmQ`) |
 | `experiment_psm_q` | per-PSM, pooled across all runs (identical to `q_value`) | explicit experiment-wide PSM FDR |
 | `run_psm_q` | per-PSM, target-decoy re-run within each source run separately | per-run PSM FDR; the correct filter for cross-run quant off an experiment-wide rescore (`QuantQColumn::RunPsmQ`) |
-| `precursor_q` | best PSM per (peptidoform + charge) | precursor-level FDR (e.g. a ProteoBench precursor list) |
+| `precursor_q` | best PSM per (peptidoform + charge) | precursor-level FDR; valid as a per-run quant filter only when rescore itself was single-run |
 | `peptide_q_value` | best PSM per base (stripped) peptide | peptide-level FDR; single-run quant (`QuantQColumn::PeptideQ`, default). Note: under an experiment-wide rescore this is a GLOBAL per-peptide value carried on one best PSM, so it is wrong for per-run cross-run quant |
 | `pg_q_value` | best PSM per protein group | protein-level FDR |
 

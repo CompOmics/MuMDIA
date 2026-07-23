@@ -21,8 +21,9 @@ The stage does two things:
 
 An optional pre-step, wired into the `run` orchestrator rather than into this
 stage, fine-tunes the DeepLC multitask model on the same confident seed PSMs and
-rewrites the library's `predicted_irt` before Stage B reads it. The fine-tune is
-a Python sidecar and is nondeterministic. It is default-off.
+writes a new precursor-library table with updated `predicted_irt` before Stage B
+reads it. The input library is unchanged. The fine-tune is a Python sidecar and
+is nondeterministic. It is default-off.
 
 Ion mobility (IM) is stubbed. The MVP is 3D, so the IM columns are always
 written null; there is no IM calibration or IM window.
@@ -35,7 +36,7 @@ written null; there is no IM calibration or IM window.
 | `rust/mumdia/crates/mumdia/src/calibrate.rs` | Calibration math: `linear_fit`, the `Loess` local-linear smoother, and `percentile`. Shared, no external deps. |
 | `rust/mumdia/crates/mumdia/src/stages/run.rs` | Orchestrator. Runs the optional DeepLC fine-tune between `search-seed` and this stage, then calls `rt_im_train::run` (see `run.rs:187-219`). |
 | `rust/mumdia/crates/mumdia/src/sidecar.rs` | `run_deeplc_finetune` (sidecar.rs:106-129): the file-contract client that invokes the fine-tune worker. |
-| `scripts/deeplc_finetune.py` | The fine-tune worker: transfer-learns DeepLC 4.0 on the seed and rewrites `predicted_irt` in the library parquet. |
+| `scripts/deeplc_finetune.py` | The fine-tune worker: transfer-learns DeepLC 4.0 on the seed and writes a new library parquet with replaced `predicted_irt`. |
 | `rust/mumdia/crates/mumdia-core/src/config.rs` | `RtImTrainConfig` (config.rs:362-427), `CalibrationMethod` enum (config.rs:66-77), and the load-time validation that rejects `calibration_method=none` (config.rs:1067-1073). |
 | `rust/mumdia/crates/mumdia-core/src/schema.rs` | `artifact::RUN_WINDOWS = ("run_windows", 1)` (schema.rs:16). |
 
@@ -234,7 +235,7 @@ This is not part of `rt_im_train::run`; it runs in the `run` orchestrator betwee
 The seed PSMs are searched once on the base library before the fine-tune and are
 reused as-is (the search-seed hyperscore does not depend on iRT), so the fine-tune
 and Stage B both consume that same seed table; only the library's `predicted_irt`
-is rewritten in between (run.rs:182-186).
+changes in the newly written `_ft` table between them.
 
 When enabled, the orchestrator resolves `deeplc_finetune.py`
 (`sidecar::resolve_script`), writes a fine-tuned library
@@ -341,9 +342,9 @@ though the enum variant still exists.
   filter if you refactor anchor selection.
 - **Library is the single iRT source.** Training and application both read
   `predicted_irt` from the same library table (rt_im_train.rs:31-39, 156-157). When
-  the fine-tune rewrites the library, the orchestrator rebinds `lib_p` to the `_ft`
-  file (run.rs:205) so both this stage and `extract` see the updated iRT. Do not
-  reintroduce a second iRT source.
+  the fine-tune writes its new table, the orchestrator rebinds `lib_p` to the
+  `_ft` file so both this stage and `extract` see the updated iRT. Do not
+  reintroduce a second iRT source or imply that the original file was mutated.
 - **The 1-second floor.** The global window is floored at 1.0s (rt_im_train.rs:105).
   With too few anchors the fit is near-exact, residuals collapse, and this floor
   would discard true co-elutions, which is exactly why the `min_anchors` fixed

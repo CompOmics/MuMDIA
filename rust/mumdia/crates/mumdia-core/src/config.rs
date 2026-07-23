@@ -12,11 +12,12 @@ use serde::{Deserialize, Serialize};
 // Strategy enums (Section 9)
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DecoyStrategy {
     /// Reverse the sequence keeping the C-terminal residue fixed. Documented,
     /// clean-room default for MVP (PLAN.md Section 11). No borrowed map.
+    #[default]
     Reverse,
     /// Deterministic seeded shuffle of the interior residues.
     Scramble,
@@ -25,11 +26,6 @@ pub enum DecoyStrategy {
     DiannShift,
     None,
 }
-impl Default for DecoyStrategy {
-    fn default() -> Self {
-        DecoyStrategy::Reverse
-    }
-}
 
 /// Fragment-matcher backend for search-seed and extract (fragindex_spec).
 /// Default `Fragindex` (log-bin CSR matcher): on narrow-window DIA it is ~1.95x
@@ -37,49 +33,38 @@ impl Default for DecoyStrategy {
 /// (HYE B_01: peptides -0.1%); `Bucketed` is the previous `Library::page_search`
 /// path (retained for A/B and for the AIF full-range-window case, where the
 /// predicate difference shifts IDs more).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MatcherKind {
     Bucketed,
+    #[default]
     Fragindex,
 }
-impl Default for MatcherKind {
-    fn default() -> Self {
-        MatcherKind::Fragindex
-    }
-}
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Enzyme {
     /// Trypsin/P: cut after K or R (including before P).
+    #[default]
     TrypsinP,
     /// Classic trypsin: cut after K or R but not before P.
     Trypsin,
 }
-impl Default for Enzyme {
-    fn default() -> Self {
-        Enzyme::TrypsinP
-    }
-}
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CalibrationMethod {
+    #[default]
     Loess,
     Linear,
     None,
 }
-impl Default for CalibrationMethod {
-    fn default() -> Self {
-        CalibrationMethod::Loess
-    }
-}
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FeatureSet {
     /// MVP feature set (PLAN.md Section 10).
+    #[default]
     Minimal,
     Rich,
     /// Minimal + Rich + the extended battery (DIA-NN / OpenSWATH / AlphaDIA /
@@ -88,46 +73,34 @@ pub enum FeatureSet {
     /// signal it can use (esp. under the nonlinear `Entrapment` rescorer).
     Extended,
 }
-impl Default for FeatureSet {
-    fn default() -> Self {
-        FeatureSet::Minimal
-    }
-}
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RtPredictorKind {
     /// Native additive retention-coefficient model (no Python). MVP default so
     /// the engine runs with zero external runtime dependencies.
+    #[default]
     Native,
     /// DeepLC Python sidecar (PLAN.md Section 0, Section 3.2).
     Deeplc,
 }
-impl Default for RtPredictorKind {
-    fn default() -> Self {
-        RtPredictorKind::Native
-    }
-}
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FragPredictorKind {
     /// Native heuristic intensity model (no Python). MVP default.
+    #[default]
     Native,
     /// MS2PIP Python sidecar (PLAN.md Section 0, Section 3.2).
     Ms2pip,
 }
-impl Default for FragPredictorKind {
-    fn default() -> Self {
-        FragPredictorKind::Native
-    }
-}
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RescorerKind {
     /// Native semi-supervised linear rescorer + target-decoy q-values. MVP
     /// default (always available).
+    #[default]
     NativeTda,
     /// Mokapot Python sidecar (PLAN.md Section 0).
     Mokapot,
@@ -148,21 +121,17 @@ pub enum RescorerKind {
     /// closes the FDR-validity gap the decoy schemes cannot.
     Entrapment,
 }
-impl Default for RescorerKind {
-    fn default() -> Self {
-        RescorerKind::NativeTda
-    }
-}
 
 /// Fragment-peak apportionment when one observed MS2 peak matches the fragments
 /// of several co-isolated, co-eluting candidates (near-universal in wide-window
 /// DIA: ~98% of fragment m/z collide within tolerance). Decides how the peak's
 /// intensity is shared, to stop a chimeric candidate borrowing a real peptide's
 /// peak wholesale.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PeakClaim {
     /// Every matching candidate gets the full peak intensity (legacy default).
+    #[default]
     None,
     /// Winner-take-all: only the candidate with the highest predicted intensity
     /// for its matching fragment gets the peak; the rest get nothing.
@@ -185,11 +154,6 @@ pub enum PeakClaim {
     /// stripping real peptides at ambiguous peaks where no candidate clearly owns
     /// the elution.
     CoelutionWinnerMargin,
-}
-impl Default for PeakClaim {
-    fn default() -> Self {
-        PeakClaim::None
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -275,16 +239,12 @@ pub struct ResidueMod {
     pub name: String,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UnknownModPolicy {
+    #[default]
     Error,
     Skip,
-}
-impl Default for UnknownModPolicy {
-    fn default() -> Self {
-        UnknownModPolicy::Error
-    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -455,7 +415,8 @@ pub struct ExtractConfig {
     /// rather than all matched fragments. In chimeric DIA a bright co-eluting
     /// interferent contributing to arbitrary channels wins a max-over-all-fragments
     /// apex; restricting to the peptide's strongest predicted ions locks onto its
-    /// true elution instead. 0 = use all matched fragments (legacy behavior).
+    /// true elution instead. 0 selects the implementation default of the top 3
+    /// predicted fragments.
     pub apex_top_fragments: usize,
     /// Optional Gaussian RT prior on apex selection: weight each scan group by
     /// exp(-0.5*((rt - rt_cal)/sigma)^2) with sigma = this value in seconds, so a
@@ -509,12 +470,11 @@ pub struct ExtractConfig {
     /// it only with target-decoy/entrapment FDR validation. MS1 evidence is now
     /// computed before the gate so this can take effect.
     pub ms1_rescue: bool,
-    /// Number of chromatographic peak groups to retain per candidate (sensitivity
-    /// program, spec 04 §3 / P1). `1` = legacy behaviour (one apex-level PSM per
-    /// candidate). `K>1` retains up to K local-maxima peak groups per candidate so
-    /// a wrong early apex does not discard the correct peak before rescoring. Each
-    /// retained peak carries its own apex, boundaries, initial evidence, and
-    /// `peak_rank`. K=1 is bit-for-bit compatible with the previous behaviour.
+    /// Number of chromatographic peak hypotheses to enumerate per candidate.
+    /// `K>1` writes up to K local maxima to the diagnostic
+    /// `<out-psms>.peaks.parquet` sidecar. The primary PSM still contains only the
+    /// selected apex, so these extra hypotheses are not currently rescored or used
+    /// to improve identifications. K=1 preserves the single-apex behaviour.
     pub retain_top_peaks: usize,
     /// Diagnostic candidate-audit: when true, extraction records, for every probed
     /// candidate, either the survivor stage-flags or the earliest `RejectionReason`,
@@ -565,7 +525,7 @@ impl Default for ExtractConfig {
             apex_rt_prior_s: 0.0,  // RT prior off by default
             apex_count_tol: 1,     // fragment-count apex with 1-fragment slack
             apex_count_window: 1,  // no rolling smoothing by default (opt-in; window 5
-                                   // cuts AIF apex misassignment, median |dRT| 131s->9s)
+            // cuts AIF apex misassignment, median |dRT| 131s->9s)
             emit_window_grid: true, // zero-filled window-grid chromatograms
             bucket_size: 8192,
             peak_claim: PeakClaim::None,
@@ -576,10 +536,10 @@ impl Default for ExtractConfig {
             ms1_rescue: false,    // opt-in; relaxes acceptance, validate FDR first
             retain_top_peaks: 1,  // legacy single-apex behaviour (K=1)
             emit_candidate_audit: false, // diagnostic; off in production
-            apex_evidence_rank: false,   // legacy signature-intensity apex
+            apex_evidence_rank: false, // legacy signature-intensity apex
             emit_gate_diagnostics: false, // diagnostic gate-score columns; off in production
             gate_mode: GateMode::ApexPearson, // legacy single-scan intensity Pearson
-            gate_coelution_min: 0.5,     // used only by GateMode::Combined
+            gate_coelution_min: 0.5, // used only by GateMode::Combined
         }
     }
 }
@@ -658,7 +618,7 @@ impl Default for FeaturesConfig {
             bound_peak_fraction: 1.0 / 3.0,
             bound_peak_grace: 0, // stop at first sub-threshold scan (legacy)
             bound_from_confident: true, // fixed feature window from confident-seed norm
-            bound_confident_pct: 50.0,  // median confident half-width
+            bound_confident_pct: 50.0, // median confident half-width
         }
     }
 }
@@ -666,8 +626,9 @@ impl Default for FeaturesConfig {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CompeteConfig {
-    /// competition grouping: `precursor` groups target/decoy pairs and charge
-    /// variants of one peptide; `apex` also groups by rounded apex RT;
+    /// Competition grouping: `precursor` collapses charge/modification siblings
+    /// separately within each target/decoy label; targets and decoys therefore do
+    /// not compete directly. `apex` also groups by rounded apex RT;
     /// `peptidoform_charge` keeps each peptidoform+charge as its own group
     /// (precursor-level, as DIA-NN/Spectronaut report), so sibling charges of one
     /// peptide are not collapsed.
@@ -740,18 +701,14 @@ pub enum CompeteGroupBy {
     PeptidoformCharge,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RollupMethod {
     /// Sum of the top-N most abundant peptides (single-run default).
+    #[default]
     TopNSum,
     /// Sum of all group peptides.
     Sum,
-}
-impl Default for RollupMethod {
-    fn default() -> Self {
-        RollupMethod::TopNSum
-    }
 }
 
 /// How the elution-peak integration window is chosen per candidate in quant.
@@ -765,8 +722,9 @@ pub enum PeakWindowMode {
     PerCandidate,
     /// Consensus window: the median left and right half-widths of confident
     /// peptides (a near-constant instrument/gradient property) applied around
-    /// each candidate's apex. Robust to a single window being distorted, and
-    /// identical across runs so it preserves fold changes.
+    /// each candidate's apex. Robust to a single window being distorted. The
+    /// widths are estimated per quant invocation, not shared automatically
+    /// across runs.
     Consensus,
 }
 
@@ -803,22 +761,25 @@ impl NormalizeMethod {
     }
 }
 
-/// Which q-value column quant filters candidates on. Peptide-level q is correct
-/// for a single-run quant (per-run peptide FDR). Under an experiment-wide rescore,
-/// however, `peptide_q_value` is a GLOBAL per-peptide value carried on the single
-/// best PSM across all runs, so a per-run quant over one run's slice keeps only the
-/// peptides whose global-best PSM falls in that run and drops the rest, giving
-/// disjoint per-run quant sets and an empty cross-run intensity matrix. `PsmQ`
-/// filters on the per-PSM `q_value` instead (per run), the correct choice for a
-/// precursor-level cross-run quant such as a ProteoBench submission.
+/// Which q-value column quant filters candidates on. Peptide- or precursor-level
+/// q is appropriate for a single-run rescore. Under experiment-wide rescoring,
+/// those grouped q-values are pooled and carried only on the best PSM across all
+/// runs, so filtering per-run slices on them creates disjoint quant sets.
+/// `RunPsmQ` is the run-local FDR gate for that cross-run workflow; `PsmQ` keeps
+/// the pooled per-PSM gate available when that is explicitly intended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum QuantQColumn {
     /// Filter on `peptide_q_value` (per-run peptide FDR). Default.
     #[default]
     PeptideQ,
-    /// Filter on the per-PSM `q_value`. Use for cross-run quant off an
-    /// experiment-wide rescore, where the peptide q is global.
+    /// Filter on `precursor_q`. This is valid only for a single-run rescore:
+    /// experiment-wide rescoring currently computes precursor q-values over the
+    /// pooled experiment and assigns each precursor's grouped q-value to its
+    /// best PSM, so it is not a per-run cross-run-quant gate.
+    PrecursorQ,
+    /// Filter on the per-PSM `q_value`. In an experiment-wide rescore this is a
+    /// pooled-experiment PSM q-value, not a run-local FDR estimate.
     PsmQ,
     /// Filter on `run_psm_q` (per-run PSM FDR). The correct choice for cross-run
     /// quant off an experiment-wide rescore: each run's PSMs are FDR-controlled
@@ -852,8 +813,9 @@ pub struct QuantConfig {
     /// Peptide q-value cutoff defining the "confident" set that calibrates the
     /// consensus half-widths (Consensus mode only). Tighter than `q_threshold`.
     pub reliable_q: f64,
-    /// Which q-value column to filter candidates on (`peptide_q` default, or `psm_q`
-    /// for cross-run quant off an experiment-wide rescore). See [`QuantQColumn`].
+    /// Which q-value column to filter candidates on (`peptide_q` default;
+    /// `precursor_q` is single-run only; use `run_psm_q` for per-run slices of an
+    /// experiment-wide rescore). See [`QuantQColumn`].
     pub q_filter: QuantQColumn,
 }
 impl Default for QuantConfig {
@@ -979,8 +941,9 @@ pub struct RescoreConfig {
     /// When true, any sidecar/classifier failure or misconfiguration (Mokapot or
     /// entrapment sidecar error, unwired percolator, entrapment mode with no
     /// entrapment PSMs) is a hard error instead of a silent fall back to the
-    /// native rescorer. Use in production so a broken rescorer never passes
-    /// silently as native scores.
+    /// native rescorer. Default true so a named scientific workflow cannot
+    /// silently execute a different model; set false only for explicit legacy
+    /// compatibility.
     pub strict: bool,
 }
 impl Default for RescoreConfig {
@@ -996,7 +959,7 @@ impl Default for RescoreConfig {
             entrapment_exclude: None,
             entrapment_contaminant_markers: Vec::new(),
             entrapment_ratio: 1.0,
-            strict: false,
+            strict: true,
         }
     }
 }
@@ -1044,8 +1007,8 @@ impl Default for Config {
 impl Config {
     /// Parse from a JSON string, rejecting unknown keys, then validate.
     pub fn from_json(s: &str) -> Result<Self, crate::error::ConfigError> {
-        let c: Config = serde_json::from_str(s)
-            .map_err(|e| crate::error::ConfigError::Parse(e.to_string()))?;
+        let c: Config =
+            serde_json::from_str(s).map_err(|e| crate::error::ConfigError::Parse(e.to_string()))?;
         c.validate()?;
         Ok(c)
     }
@@ -1083,7 +1046,53 @@ impl Config {
         {
             return Err(Invalid(
                 "extract.min_frag_corr must be finite and in [0, 1] (0 disables \
-                 the gate)."
+                the gate)."
+                    .into(),
+            ));
+        }
+        if self.rescore.folds < 2 {
+            return Err(Invalid(
+                "rescore.folds must be >= 2 so every PSM can receive an \
+                 out-of-fold score."
+                    .into(),
+            ));
+        }
+        if self.rescore.num_iter == 0 {
+            return Err(Invalid(
+                "rescore.num_iter must be >= 1 for iterative model training.".into(),
+            ));
+        }
+        if !self.rescore.train_fdr.is_finite()
+            || self.rescore.train_fdr <= 0.0
+            || self.rescore.train_fdr > 1.0
+        {
+            return Err(Invalid(
+                "rescore.train_fdr must be finite and in (0, 1].".into(),
+            ));
+        }
+        if matches!(
+            self.rescore.classifier,
+            RescorerKind::Mokapot | RescorerKind::NnTorch
+        ) && self.rescore.python.is_none()
+        {
+            return Err(Invalid(format!(
+                "rescore.classifier={:?} requires rescore.python",
+                self.rescore.classifier
+            )));
+        }
+        if self.rescore.classifier == RescorerKind::Percolator {
+            return Err(Invalid(
+                "rescore.classifier=percolator is not wired; use native_tda, \
+                 mokapot, nn_torch, or entrapment."
+                    .into(),
+            ));
+        }
+        if self.rescore.classifier == RescorerKind::Entrapment
+            && self.rescore.entrapment_marker.is_none()
+        {
+            return Err(Invalid(
+                "rescore.classifier=entrapment requires \
+                 rescore.entrapment_marker."
                     .into(),
             ));
         }
@@ -1130,6 +1139,7 @@ mod tests {
         assert_eq!(back.digest.min_len, 5);
         assert_eq!(back.features.set, FeatureSet::Minimal);
         assert_eq!(back.search_seed.top_n_peaks, 300);
+        assert!(back.rescore.strict);
     }
 
     #[test]
@@ -1146,6 +1156,25 @@ mod tests {
         assert_eq!(c.digest.max_len, 50);
         assert_eq!(c.peptidoforms.charge_max, 3);
         assert_eq!(c.search_seed.top_n_peaks, 300);
+    }
+
+    #[test]
+    fn precursor_q_quant_filter_parses_and_serializes() {
+        let c = Config::from_json(r#"{"quant":{"q_filter":"precursor_q"}}"#).unwrap();
+        assert_eq!(c.quant.q_filter, QuantQColumn::PrecursorQ);
+        assert_eq!(
+            serde_json::to_string(&c.quant.q_filter).unwrap(),
+            r#""precursor_q""#
+        );
+    }
+
+    #[test]
+    fn invalid_rescore_contracts_are_rejected() {
+        assert!(Config::from_json(r#"{"rescore":{"folds":1}}"#).is_err());
+        assert!(Config::from_json(r#"{"rescore":{"num_iter":0}}"#).is_err());
+        assert!(Config::from_json(r#"{"rescore":{"classifier":"nn_torch"}}"#).is_err());
+        assert!(Config::from_json(r#"{"rescore":{"classifier":"percolator"}}"#).is_err());
+        assert!(Config::from_json(r#"{"rescore":{"classifier":"entrapment"}}"#).is_err());
     }
 
     #[test]

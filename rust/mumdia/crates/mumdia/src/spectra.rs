@@ -30,7 +30,10 @@ pub fn load_ms2(path: &str) -> Result<Vec<Ms2Scan>> {
     // intermediate Vec<Vec<f32>> that list_f32() would materialize. m/z is stored
     // as f32 for size and widened to f64 here. The global row counter `i` tracks
     // the same batch-then-row order the scalar getters used, so it stays aligned.
-    let mz_i = t.schema.index_of("mz").map_err(|_| anyhow!("column 'mz' not found"))?;
+    let mz_i = t
+        .schema
+        .index_of("mz")
+        .map_err(|_| anyhow!("column 'mz' not found"))?;
     let in_i = t
         .schema
         .index_of("intensity")
@@ -101,7 +104,10 @@ pub fn load_ms1(path: &str) -> Result<Vec<Ms1Scan>> {
     // Build mz (widened to f64) and intensity in a single pass over the ListArrays,
     // downcasting each row's inner Float32Array once, without the intermediate
     // Vec<Vec<f32>> (and the extra intensity clone) that list_f32() would incur.
-    let mz_i = t.schema.index_of("mz").map_err(|_| anyhow!("column 'mz' not found"))?;
+    let mz_i = t
+        .schema
+        .index_of("mz")
+        .map_err(|_| anyhow!("column 'mz' not found"))?;
     let in_i = t
         .schema
         .index_of("intensity")

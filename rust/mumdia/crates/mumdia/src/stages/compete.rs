@@ -34,6 +34,8 @@ pub fn run(p: CompeteParams) -> Result<u64> {
     let pform = t.str("peptidoform")?;
     let protein = t.str("protein")?;
     let apex_rt = t.f64("apex_rt")?;
+    let elution_lo = t.f64("elution_lo")?;
+    let elution_hi = t.f64("elution_hi")?;
     let mz = t.f64("precursor_mz")?;
     let prelim = t.f64("prelim_score")?;
     let schema = FeatureSchema::read(p.features)?;
@@ -52,9 +54,9 @@ pub fn run(p: CompeteParams) -> Result<u64> {
     let pform_id: Vec<u32> = if matches!(p.cfg.group_by, CompeteGroupBy::PeptidoformCharge) {
         let mut ids = Vec::with_capacity(t.nrows);
         let mut seen: HashMap<&str, u32> = HashMap::new();
-        for i in 0..t.nrows {
+        for peptidoform in pform.iter().take(t.nrows) {
             let next = seen.len() as u32;
-            ids.push(*seen.entry(pform[i].as_str()).or_insert(next));
+            ids.push(*seen.entry(peptidoform.as_str()).or_insert(next));
         }
         ids
     } else {
@@ -100,7 +102,8 @@ pub fn run(p: CompeteParams) -> Result<u64> {
     if matches!(p.cfg.mode, CompetitionMode::UniqueEvidence) && unique_ev.is_none() {
         warn!(
             "compete mode=unique_evidence: no unique_fragment_count / \
-             (n_matched_fragments, contested_frac) columns; falling back to winner-take-all"
+             (n_matched_fragments, peak_contested_frac/contested_frac) columns; \
+             falling back to winner-take-all"
         );
     }
 
@@ -116,12 +119,29 @@ pub fn run(p: CompeteParams) -> Result<u64> {
 
     let sel = |v: &[f64]| keep.iter().map(|&i| v[i]).collect::<Vec<_>>();
     let mut cols: Vec<Col> = vec![
-        Col::U32("candidate_id".into(), keep.iter().map(|&i| cid[i]).collect()),
-        Col::Str("label".into(), keep.iter().map(|&i| label[i].clone()).collect()),
-        Col::U32("base_peptide_id".into(), keep.iter().map(|&i| base[i]).collect()),
-        Col::Str("peptidoform".into(), keep.iter().map(|&i| pform[i].clone()).collect()),
-        Col::Str("protein".into(), keep.iter().map(|&i| protein[i].clone()).collect()),
+        Col::U32(
+            "candidate_id".into(),
+            keep.iter().map(|&i| cid[i]).collect(),
+        ),
+        Col::Str(
+            "label".into(),
+            keep.iter().map(|&i| label[i].clone()).collect(),
+        ),
+        Col::U32(
+            "base_peptide_id".into(),
+            keep.iter().map(|&i| base[i]).collect(),
+        ),
+        Col::Str(
+            "peptidoform".into(),
+            keep.iter().map(|&i| pform[i].clone()).collect(),
+        ),
+        Col::Str(
+            "protein".into(),
+            keep.iter().map(|&i| protein[i].clone()).collect(),
+        ),
         Col::F64("apex_rt".into(), sel(&apex_rt)),
+        Col::F64("elution_lo".into(), sel(&elution_lo)),
+        Col::F64("elution_hi".into(), sel(&elution_hi)),
         Col::F64("precursor_mz".into(), sel(&mz)),
         Col::F64("prelim_score".into(), sel(&prelim)),
     ];
@@ -173,7 +193,10 @@ pub fn run(p: CompeteParams) -> Result<u64> {
                 ),
                 Col::Str(
                     "rejection_reason".into(),
-                    removed.iter().map(|&(m, _)| reason_of(m).code().to_string()).collect(),
+                    removed
+                        .iter()
+                        .map(|&(m, _)| reason_of(m).code().to_string())
+                        .collect(),
                 ),
             ],
         )?;
@@ -213,14 +236,19 @@ pub fn run(p: CompeteParams) -> Result<u64> {
 
 /// Per-candidate unique-fragment evidence for `CompetitionMode::UniqueEvidence`.
 /// Prefers an explicit `unique_fragment_count` column; otherwise approximates it as
-/// `n_matched_fragments * (1 - contested_frac)` (contested-discounted matched
-/// count); falls back to raw `n_matched_fragments`; `None` if none are present.
+/// `n_matched_fragments * (1 - peak_contested_frac)` (contested-discounted matched
+/// count). The legacy `contested_frac` spelling remains a fallback; raw matched
+/// count is used if neither fraction exists, and `None` if no matched count exists.
 fn unique_evidence(t: &Table) -> Option<Vec<f64>> {
     if let Some(u) = col_f64(t, "unique_fragment_count") {
         return Some(u);
     }
     let nm = col_f64(t, "n_matched_fragments")?;
-    match col_f64(t, "contested_frac") {
+    let contested = prefer_peak_contested_fraction(
+        col_f64(t, "peak_contested_frac"),
+        col_f64(t, "contested_frac"),
+    );
+    match contested {
         Some(cf) => Some(
             nm.iter()
                 .zip(cf)
@@ -229,6 +257,14 @@ fn unique_evidence(t: &Table) -> Option<Vec<f64>> {
         ),
         None => Some(nm),
     }
+}
+
+/// Prefer the Extended-feature spelling while accepting older feature tables.
+fn prefer_peak_contested_fraction(
+    peak_contested: Option<Vec<f64>>,
+    legacy_contested: Option<Vec<f64>>,
+) -> Option<Vec<f64>> {
+    peak_contested.or(legacy_contested)
 }
 
 /// Read a numeric column as f64, accepting an f64 or i32 encoding.
@@ -261,7 +297,12 @@ fn resolve_competition(
         let members = &groups[gk];
         let win = *members
             .iter()
-            .min_by(|&&a, &&b| prelim[b].partial_cmp(&prelim[a]).unwrap_or(Equal).then(a.cmp(&b)))
+            .min_by(|&&a, &&b| {
+                prelim[b]
+                    .partial_cmp(&prelim[a])
+                    .unwrap_or(Equal)
+                    .then(a.cmp(&b))
+            })
             .unwrap();
         match mode {
             CompetitionMode::None | CompetitionMode::FeaturesOnly => {
@@ -269,7 +310,13 @@ fn resolve_competition(
             }
             CompetitionMode::WinnerTakeAll => {
                 keep.push(win);
-                removed.extend(members.iter().copied().filter(|&m| m != win).map(|m| (m, win)));
+                removed.extend(
+                    members
+                        .iter()
+                        .copied()
+                        .filter(|&m| m != win)
+                        .map(|m| (m, win)),
+                );
             }
             CompetitionMode::UniqueEvidence => {
                 keep.push(win);
@@ -353,8 +400,14 @@ mod tests {
         let g = one_group(vec![0, 1, 2]);
         let prelim = [0.1, 0.9, 0.5];
         let ev = [3.0, 5.0, 1.0];
-        let (keep, removed) =
-            resolve_competition(&g, &prelim, CompetitionMode::UniqueEvidence, 0.0, 2, Some(&ev));
+        let (keep, removed) = resolve_competition(
+            &g,
+            &prelim,
+            CompetitionMode::UniqueEvidence,
+            0.0,
+            2,
+            Some(&ev),
+        );
         assert_eq!(keep, vec![0, 1]);
         assert_eq!(removed, vec![(2, 1)]);
     }
@@ -366,6 +419,14 @@ mod tests {
         let (keep, _) =
             resolve_competition(&g, &prelim, CompetitionMode::UniqueEvidence, 0.0, 2, None);
         assert_eq!(keep, vec![1]);
+    }
+
+    #[test]
+    fn unique_evidence_prefers_extended_peak_contested_fraction() {
+        let selected = prefer_peak_contested_fraction(Some(vec![0.25]), Some(vec![0.75])).unwrap();
+        assert_eq!(selected, vec![0.25]);
+        let legacy = prefer_peak_contested_fraction(None, Some(vec![0.75])).unwrap();
+        assert_eq!(legacy, vec![0.75]);
     }
 
     #[test]

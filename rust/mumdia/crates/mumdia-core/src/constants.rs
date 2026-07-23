@@ -104,8 +104,12 @@ mod ppm_tests {
         let delta = 20.0f64 * 1e-6;
         // points chosen away from the exact 20 ppm boundary (8, 10, 50, 28.6 ppm)
         // so the three algebraic forms round identically
-        let cases: [(f64, f64); 4] =
-            [(500.0, 500.004), (1000.0, 1000.01), (1999.9, 2000.0), (700.0, 700.02)];
+        let cases: [(f64, f64); 4] = [
+            (500.0, 500.004),
+            (1000.0, 1000.01),
+            (1999.9, 2000.0),
+            (700.0, 700.02),
+        ];
         for &(a, b) in &cases {
             let lo = a.min(b);
             let hi = a.max(b);

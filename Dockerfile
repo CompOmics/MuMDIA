@@ -8,8 +8,9 @@
 #           --out-dir /data/out \
 #           --config /opt/mumdia/config.dia.json
 #
-# The baked /opt/mumdia/config.dia.json wires the sidecars to the in-image conda
-# envs and selects the Extended feature set + DIA apex settings.
+# The baked /opt/mumdia/config.dia.json wires the FASTA workflow to the in-image
+# conda envs. /opt/mumdia/config.diann-lib.json selects imported-library
+# fine-tuning plus the torch rescorer.
 
 # ---------- Stage 1: build the Rust binary ----------
 FROM rust:1.96-bookworm AS build
@@ -36,10 +37,11 @@ RUN micromamba create -y -n rescore -f /tmp/env/docker-rescore.yml \
     && micromamba clean -a -y \
     && rm -rf /tmp/env
 
-# Engine binary, sidecar workers, and the baked DIA config.
+# Engine binary, sidecar workers, and the baked FASTA/library DIA configs.
 COPY --from=build /build/release/mumdia /usr/local/bin/mumdia
 COPY scripts /opt/mumdia/scripts
 COPY docker/config.dia.json /opt/mumdia/config.dia.json
+COPY docker/config.diann-lib.json /opt/mumdia/config.diann-lib.json
 
 # mokapot logistic-regression is the recommended default rescorer.
 ENV MUMDIA_RESCORE_MODEL=logreg

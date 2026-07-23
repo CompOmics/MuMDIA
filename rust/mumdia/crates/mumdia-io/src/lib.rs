@@ -57,13 +57,10 @@ pub fn inspect(path: &str) -> Result<String> {
     if let Some(first) = t.batches.first() {
         let head_rows = first.num_rows().min(10);
         let head = first.slice(0, head_rows);
-        match arrow::util::pretty::pretty_format_batches(&[head]) {
-            Ok(p) => {
-                s.push_str("head:\n");
-                s.push_str(&p.to_string());
-                s.push('\n');
-            }
-            Err(_) => {}
+        if let Ok(p) = arrow::util::pretty::pretty_format_batches(&[head]) {
+            s.push_str("head:\n");
+            s.push_str(&p.to_string());
+            s.push('\n');
         }
     }
     Ok(s)

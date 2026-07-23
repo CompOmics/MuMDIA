@@ -3,8 +3,8 @@
 
 ## Purpose
 
-MuMDIA is a pure-Rust engine with deterministic native fallbacks for every ML
-step, so it runs with zero Python. The sidecars are the opt-in path to real
+MuMDIA has deterministic native implementations for its default predictor and
+rescorer paths, so it runs with zero Python. The sidecars are the opt-in path to real
 predictors and rescorers that raise identification counts over the native
 defaults. Each sidecar is a standalone Python worker invoked as a subprocess over
 a **positional-CLI file contract** (the sidecar file contract; see
@@ -58,7 +58,7 @@ the column it keys the readback on.
 |---|---|---|---|
 | ms2pip_worker | `<in.parquet> <out.parquet> <model>` (`sidecar.rs:58`) | `ms2pip_out.parquet` | `id` |
 | deeplc_worker | `<in.parquet> <out.parquet>` (`sidecar.rs:95`) | `deeplc_out.parquet` | `id` |
-| deeplc_finetune | `<lib_in> <seed> <lib_out> --epochs --patience --q-train --batch` (`sidecar.rs:122-125`) | `<lib_out>` (= `fragment_library_precursors_ft.parquet`) | `peptidoform` (rewrites `predicted_irt` in place) |
+| deeplc_finetune | `<lib_in> <seed> <lib_out> --epochs --patience --q-train --batch` (`sidecar.rs:122-125`) | `<lib_out>` (= `fragment_library_precursors_ft.parquet`) | `peptidoform` (new table with replaced `predicted_irt`; input unchanged) |
 | mokapot_worker / nn_rescore_worker | `<rescore.pin> <out.parquet>` + env `MUMDIA_NN_FOLDS/ITERS/TRAIN_FDR` (`rescore.rs:605-617`) | `rescore_sidecar_out.parquet` | `candidate_id` (echoes the flat row index) |
 | entrapment_worker | `<in.parquet> <out.parquet> <folds>` (`rescore.rs:537-543`) | `entrapment_out.parquet` | `row_id` |
 | mbr_worker | `<scored> <psms_csv> <out> --q-anchor --min-anchor-runs --q-transfer --seed [--out-scored] [--frag-csv --consensus-corr-min]` (`sidecar.rs:159-168`) | `<out>.parquet` | `candidate_id` |
@@ -245,7 +245,9 @@ PIN, spawns the worker, and passes `MUMDIA_NN_FOLDS/ITERS/TRAIN_FDR` from
 `rescore.{folds,num_iter,train_fdr}` as env vars (`rescore.rs:614-616`) so the
 report's recorded params match what ran; mokapot ignores those three. On success
 the classifier label and `model_identity` are recorded; on failure the path falls
-back to `native_scores` unless `rescore.strict = true` (`rescore.rs:105-134`).
+back to `native_scores` only when `rescore.strict = false`; strict is the
+production default. The authoritative actual path is recorded in
+`psms_scored.parquet.report.json`.
 
 - `mokapot_worker.py` reads the PIN with `mokapot.read_pin`, builds a model
   chosen by `MUMDIA_RESCORE_MODEL` (`make_model`, `mokapot_worker.py:34-97`:
@@ -261,11 +263,12 @@ back to `native_scores` unless `rescore.strict = true` (`rescore.rs:105-134`).
 - `nn_rescore_worker.py` implements the semi-supervised scheme itself in PyTorch.
   Fold assignment is `md5(stripped_peptide) % FOLDS` (`nn_rescore_worker.py:123`),
   so peptides never leak across folds and the split is deterministic. Per fold it
-  initialises from the single best feature+sign (by targets at `TRAIN_FDR` on a
-  sample, `nn_rescore_worker.py:175-188`), then iterates {recompute target-decoy q
-  on the training folds -> targets at `q<=TRAIN_FDR` positive, all decoys negative
-  -> train MLP from scratch -> rescore} for `ITERS` rounds, then scores the
-  held-out fold (`one_pass`, `nn_rescore_worker.py:233-253`). Two feature
+  selects the initial feature+sign using a deterministic sample of training rows
+  only, then iterates {recompute target-decoy q on the training folds -> targets
+  at `q<=TRAIN_FDR` positive, all decoys negative -> train MLP from scratch ->
+  rescore} for `ITERS` rounds, then scores the held-out fold. Empty,
+  single-class, and zero-positive training folds hard-error; held-out labels do
+  not influence model selection. Two feature
   backends behind one accessor `get`: in-memory (median/IQR standardisation,
   `:127-141`) or a disk-backed float32 **memmap** streamed in `MUMDIA_NN_CHUNK`
   chunks with mean/std accumulated in one text pass (`:143-173`), auto-selected
@@ -409,7 +412,7 @@ configured.
 | `rescore.folds` | `3` | passed as `MUMDIA_NN_FOLDS` + entrapment `folds` argv |
 | `rescore.num_iter` | `10` | passed as `MUMDIA_NN_ITERS` (native semi-supervised iterations) |
 | `rescore.train_fdr` | `0.01` | passed as `MUMDIA_NN_TRAIN_FDR` |
-| `rescore.strict` | `false` | true makes any sidecar failure/misconfig a hard error (no native fallback) |
+| `rescore.strict` | `true` | fail on any rescorer sidecar failure/misconfiguration; false explicitly enables compatibility fallback |
 | `rescore.entrapment_marker` | `None` | protein substring marking spike-in negatives (required for `entrapment`) |
 | `rescore.entrapment_exclude` | `None` | substring that un-marks the sample's own species |
 | `rescore.entrapment_contaminant_markers` | `[]` | substrings for genuine contaminants (kept as real targets) |
@@ -493,11 +496,11 @@ MLP. Set it explicitly for the logreg path.
   contiguous-id + m/z-sorted precondition holds. Do not reorder afterward.
   `make_reverse_decoys.py` additionally aborts if its residue-mass calculator
   disagrees with the library's own target fragment m/z by > 5 ppm at p99.
-- **Fallback masks failure unless strict (rescore only).** With
+- **Fallback exists only when explicitly requested (rescore only).** With
   `rescore.strict = false` a crashed or misconfigured **rescore** sidecar is
-  logged and the run silently continues on `native_tda` (`rescore.rs:112-118,
-  127-133`). Production configs should set `strict = true` so a broken rescorer
-  never passes as native scores. The predictor sidecars (MS2PIP, DeepLC, DeepLC
+  logged and the run continues on `native_tda`; the default `strict = true`
+  makes the failure fatal. Verify the actual classifier in the scored artifact
+  report. The predictor sidecars (MS2PIP, DeepLC, DeepLC
   fine-tune) and MBR have no such gate: any nonzero exit aborts the run (see
   **Failure behavior**).
 - **MS2PIP charge coverage.** MS2PIP emits singly-charged b/y only; charge-2

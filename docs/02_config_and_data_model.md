@@ -96,13 +96,15 @@ id into the Parquet file itself).
 | `PSMS_EXTRACTED` | `psms_extracted` | 1 |
 | `CHROMATOGRAMS` | `chromatograms` | 1 |
 | `FEATURES` | `features` | 1 |
-| `PSMS_COMPETED` | `psms_competed` | 1 |
-| `PSMS_SCORED` | `psms_scored` | **2** |
-| `PEPTIDE_QUANT` | `peptide_quant` | 1 |
-| `PROTEIN_GROUP_QUANT` | `protein_group_quant` | 1 |
+| `PSMS_COMPETED` | `psms_competed` | **2** |
+| `PSMS_SCORED` | `psms_scored` | **3** |
+| `PEPTIDE_QUANT` | `peptide_quant` | **2** |
+| `PROTEIN_GROUP_QUANT` | `protein_group_quant` | **2** |
+| `FRAGMENT_QUANT` | `fragment_quant` | 1 |
 
-`PSMS_SCORED` is the only artifact bumped past v1. Its v2 column layout is
-written by the rescore stage (`rescore.rs:320-347`) and is the schema a
+`PSMS_SCORED` v3 carries the identification apex/bounds through rescoring so
+quant can integrate the selected peak. Its column layout is
+written by the rescore stage and is the schema a
 downstream reader must expect:
 
 | Column | Type | Meaning |
@@ -113,6 +115,8 @@ downstream reader must expect:
 | `label` | Str | `target` / `decoy` |
 | `protein` | Str | protein accession |
 | `base_peptide_id` | U32 | interned stripped-peptide id (peptide-level q grouping) |
+| `apex_rt` | F64 | identification apex used by downstream quant |
+| `elution_lo` / `elution_hi` | F64 | identified elution bounds carried through |
 | `score` | F64 | rescorer score |
 | `q_value` | F64 | per-PSM q (pooled) |
 | `peptide_q_value` | F64 | peptide-level q (global per base peptide) |
@@ -125,9 +129,9 @@ downstream reader must expect:
 | `experiment_psm_q` | F64 | pooled PSM FDR |
 | `precursor_q` | F64 | per (peptidoform+charge) FDR |
 
-The three trailing multi-context q columns (`run_psm_q`, `experiment_psm_q`,
-`precursor_q`, `rescore.rs:340-345`) are the reason for the v2 bump; a v1 reader
-that assumed the old column set would misread them. `quant.q_filter`
+The multi-context q columns and carried peak coordinates are the reasons for the
+schema bumps; an older reader that assumes the prior column set will misread
+them. `quant.q_filter`
 (see [QuantConfig](#quantconfig-quantrs)) selects which of these q columns the
 quant stage filters on.
 
@@ -150,10 +154,11 @@ keeps `max_len=50`, `charge_max=3`, `top_n_peaks=300` (`config.rs:1142-1149`).
 The `t::<T>()` helper (`config.rs:199-204`) is a terse `T::default()` used inside
 the per-struct `Default` impls.
 
-### `validate()` hard-error checks (`config.rs:1056-1091`)
+### `validate()` hard-error checks (`config.rs:1062-1137`)
 
-Four combinations are rejected at load so they never silently produce a wrong
-result. Defaults always pass.
+Known invalid combinations are rejected at load so they never silently produce a
+wrong result. This is targeted validation, not proof that every scientifically
+poor setting is detectable. Defaults always pass.
 
 1. `digest.decoy.strategy == DiannShift` -> `Invalid`: the engine digest
    produces zero decoys under it, giving an invalid target-decoy FDR
@@ -164,9 +169,14 @@ result. Defaults always pass.
 3. `extract.retain_top_peaks == 0` -> `Invalid`: must be `>= 1` (1 = legacy
    single apex) (`config.rs:1074-1080`).
 4. `extract.min_frag_corr` not finite or outside `[0, 1]` -> `Invalid`
-   (`config.rs:1081-1089`). 0 disables the gate. Verified by
+   (`config.rs:1087-1095`). 0 disables the gate. Verified by
    `explicit_uncapped_seed_and_invalid_gate_are_distinguished`
    (`config.rs:1152-1158`).
+5. `rescore.folds < 2` -> `Invalid`: every PSM needs an out-of-fold score.
+6. `rescore.train_fdr` non-finite or outside `(0, 1]` -> `Invalid`.
+7. Mokapot or NnTorch without `rescore.python` -> `Invalid`.
+8. `classifier = percolator` -> `Invalid`: the adapter is not wired.
+9. Entrapment without `rescore.entrapment_marker` -> `Invalid`.
 
 `canonical_json` (`config.rs:1116-1118`) serializes the fully-resolved config;
 `run` hashes it with `blake3_str` into `config_hash` (`run.rs:87`) and stores the
@@ -433,29 +443,31 @@ the MBR false-transfer null (M4): `PermutedRt` (default) transfers real precurso
 to a decoupled wrong expected RT; `ReverseSequence` transfers reverse/scramble
 decoys at the same expected RT; `Both` combines them.
 
-**`CompeteGroupBy`** (732-741). `Precursor` (default) groups target/decoy pairs
-AND charge variants of one peptide together; `Apex` additionally groups by rounded
-apex RT (`apex_rt_tolerance_s`); `PeptidoformCharge` keeps each distinct
-peptidoform+charge as its own group (precursor-level, as DIA-NN/Spectronaut
-report), recovering sibling charges the peptide-level `Precursor` grouping
-collapses. The label stays in the key in every mode.
+**`CompeteGroupBy`** (732-741). `Precursor` (default) groups charge/modification
+variants of one base peptide, separately within targets and within decoys;
+`Apex` additionally buckets by rounded apex RT (`apex_rt_tolerance_s`);
+`PeptidoformCharge` keeps each distinct peptidoform+charge as its own group
+(precursor-level, as DIA-NN/Spectronaut report), recovering sibling forms the
+base-peptide grouping collapses. The label stays in the key in every mode: a
+target never directly competes against its paired decoy in the `compete` stage.
+This does not remove target-decoy comparison from FDR: `rescore` later selects
+best representatives at each q-value unit and estimates the target-decoy null.
 
 **`PeakWindowMode`** (757-771). `PerCandidate` (default): each candidate's quant
-window comes from its own summed-XIC descent walk (exact per peak but stretched by
-interference and collapsed on sparse peaks). `Consensus`: the median left/right
-half-widths of confident peptides (a near-constant instrument/gradient property)
-applied around each candidate's apex; robust to a single distorted window and
-identical across runs, so it preserves fold changes.
+window is anchored at the identified apex when available, with a summed-XIC
+fallback for older scored artifacts; its descent bounds can still be stretched by
+interference or collapse on sparse peaks. `Consensus`: the median left/right
+half-widths of confident peptides applied around each candidate's identified
+apex. Consensus widths are estimated independently inside each quant invocation,
+not shared across runs.
 
-**`QuantQColumn`** (806-828) selects which q column quant filters on.
-`PeptideQ` (default) is `peptide_q_value`, correct for a single-run quant. Under an
-experiment-wide rescore, `peptide_q_value` is a GLOBAL per-peptide value carried on
-the single best PSM across all runs, so a per-run quant over one run's slice keeps
-only peptides whose global-best PSM falls in that run, giving disjoint per-run sets
-and an empty cross-run matrix. `PsmQ` filters on per-PSM `q_value` (per run);
-`RunPsmQ` filters on `run_psm_q` (per-run PSM FDR), the correct choice for a
-cross-run/precursor-level quant off an experiment-wide rescore, avoiding an external
-peptide-q overwrite.
+**`QuantQColumn`** selects which q column quant filters on. `PeptideQ` (default)
+uses `peptide_q_value`. `PrecursorQ` uses `precursor_q` and is valid only for a
+single-run rescore; after pooled rescoring that grouped q is experiment-wide.
+`PsmQ` uses pooled `q_value`. `RunPsmQ` uses per-source `run_psm_q` and is the
+run-local choice after an experiment-wide rescore. Quant has no source selector:
+slice the scored table by `source` before pairing it with each run's
+chromatograms. Changing the q column does not perform that slice.
 
 **`RollupMethod`** (743-750): `TopNSum` (default) sums the top-N most abundant
 peptides per protein group (`top_n_peptides`); `Sum` sums all group peptides.
@@ -602,7 +614,7 @@ requiring entrapment/target-decoy FDR validation before use.
 
 | Field | Default | Effect |
 |---|---|---|
-| `q_threshold` | 0.01 | peptide-q cutoff for inclusion |
+| `q_threshold` | 0.01 | cutoff applied to the q column selected by `q_filter` |
 | `top_n_fragments` | 3 | fragments summed per peptidoform |
 | `top_n_peptides` | 3 | peptides summed per protein group (TopNSum) |
 | `rollup` | `top_n_sum` | protein rollup method |
@@ -611,7 +623,7 @@ requiring entrapment/target-decoy FDR validation before use.
 | `peak_grace` | 1 | zig-zag grace (bridge N sub-threshold scans) |
 | `peak_window_mode` | `per_candidate` | per-candidate vs consensus window |
 | `reliable_q` | 0.001 | confident-set q for the consensus width |
-| `q_filter` | `peptide_q` | which q column to filter on (`QuantQColumn`) |
+| `q_filter` | `peptide_q` | `peptide_q`, `precursor_q` (single-run only), `psm_q`, or `run_psm_q` |
 
 ### `RescoreConfig` (config.rs:951-1002)
 
@@ -627,7 +639,7 @@ requiring entrapment/target-decoy FDR validation before use.
 | `entrapment_exclude` | `None` | substring that de-marks (own-species) |
 | `entrapment_contaminant_markers` | `[]` | substrings that keep a spike-in hit as a real target |
 | `entrapment_ratio` | 1.0 | N_real_lib / N_entrap_lib scaling |
-| `strict` | `false` | **default-off** turn any rescorer failure into a hard error (recommended for production) |
+| `strict` | `true` | fail on a rescorer sidecar failure or unsupported classifier; set false only for explicit compatibility fallback |
 
 ### `MbrConfig` (config.rs:909-949), stub
 
@@ -665,11 +677,11 @@ stale.
   is the only one the fragment index may use; `ppm_bounds` (query-centered) and
   `ppm_diff`/`ppm_match` (theoretical-relative) disagree at the tolerance edge.
   Substituting one for another shifts which fragments match at the boundary.
-- **Validation is fail-loud, not fail-quiet.** `DiannShift` decoys and
-  `CalibrationMethod::None` are rejected rather than silently degraded
-  (`config.rs:1058-1073`). `DecoyStrategy::None` is *not* rejected but produces no
-  decoys and therefore an invalid target-decoy FDR; treat it as a diagnostic-only
-  setting.
+- **Validation is targeted and fail-loud for known invalid states.** Invalid
+  decoy/calibration settings, impossible rescorer coverage, missing required
+  sidecar settings, and invalid numeric bounds are rejected. It is not a general
+  scientific validator. `DecoyStrategy::None` is still accepted but produces no
+  decoys and therefore no valid target-decoy FDR; treat it as diagnostic-only.
 - **`deny_unknown_fields` everywhere.** A misspelled key fails the whole load, so
   a config file cannot silently ignore a setting the author intended.
 - **Determinism.** `rng_seed` seeds all randomness. `canonical_json` is a stable
@@ -689,8 +701,10 @@ stale.
 - **Second mod at the same position accumulates** (`mass.rs:189`), which is a
   behavior difference from engines that drop it; terminal mods are separate
   fields, not part of `mods[i]`.
-- **`PSMS_SCORED` is v2, all other artifacts v1.** A reader that hardcodes v1 for
-  the scored table will misread the three multi-context q columns.
+- **Recent correctness changes bumped four schemas.** `PSMS_COMPETED` and
+  `PEPTIDE_QUANT`/`PROTEIN_GROUP_QUANT` are v2; `PSMS_SCORED` is v3. Other
+  registry entries remain v1. Readers must honor the registry rather than assume
+  one version globally.
 - **`content_hash` is the file's blake3, not the logical content.** Any byte
   change (compression, column order) changes the hash; it is a change detector,
   not a canonical-content identity.

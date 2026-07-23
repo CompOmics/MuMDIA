@@ -13,13 +13,13 @@ sources (FASTA digest versus imported DIA-NN library) and how the orchestrator
 branches between them, the single-run `run` orchestration and its
 `manifest.json`, and the current best-performing workflow.
 
-The design principle is that every stage is an independent command over
-path-addressable inputs and outputs on disk (the interstage contract, docs/18
-B1). No stage shares in-memory state with another; the orchestrator only threads
-file paths. This makes any stage runnable standalone on prior outputs, on a
-different configuration, or on hand-crafted minimal files. `run` is a convenience
-that chains the stages in order and records provenance; it computes nothing
-itself.
+The design principle is that every computational stage is an independent command
+over path-addressable inputs and outputs on disk (the interstage contract,
+docs/18 B1). No stage shares in-memory state with another. `run` threads those
+file paths, invokes the optional DeepLC fine-tune between stages, writes the
+human-readable report, and records provenance. Most stage commands can therefore
+be run standalone on prior outputs, on a different configuration, or on
+hand-crafted minimal files.
 
 `run` recomputes every stage on every invocation. There is no artifact caching,
 no skip-if-exists, and no resume: `run` calls each stage unconditionally and
@@ -27,7 +27,9 @@ overwrites its outputs even when identical artifacts already exist in `--out-dir
 (`run.rs:83-343`; no existence check precedes any stage call, and
 `std::fs::create_dir_all` at `run.rs:88` does not clear or skip). To reuse a
 prior artifact, invoke the downstream stage command standalone on it instead of
-rerunning `run`.
+rerunning `run`. Use a fresh output directory for each orchestrated run. Reusing
+one can leave a stale optional sidecar from an earlier configuration, and a
+failed rerun can leave an old manifest beside partially replaced outputs.
 
 The validated findings and the interstage, determinism, and sidecar contracts
 cited throughout this document are consolidated, self-contained, in
@@ -86,10 +88,11 @@ Rescorer           (free fn + RescorerKind enum, no trait)
 ## Inputs and outputs
 
 The pipeline consumes an mzML file plus one of two library sources, and produces
-a fixed set of Parquet artifacts plus JSON sidecars. Every stage also writes a
-small `<artifact>.report.json` next to each Parquet output (row counts, key
-distributions, parameters, timing; docs/18 B1), which is not listed below per
-artifact but always exists.
+a fixed set of Parquet artifacts plus JSON sidecars. Most primary stage Parquets
+receive a small `<artifact>.report.json` with row counts, parameters, hashes, and
+timing. Coverage is deliberately partial: report TSVs, schema/PIN files, some
+diagnostic/optional Parquets, and several Python-written outputs do not have one.
+See docs/03 and docs/12 rather than assuming a report always exists.
 
 External inputs:
 - `--mzml <file>` (mzML; `.raw`/`.d` must be converted upstream by msconvert).
@@ -182,17 +185,20 @@ every feature column carried through unchanged (`compete.rs:128`), for surviving
 rows only. Sidecar `psms_competed.parquet.schema.json` carries the schema
 forward for rescore.
 
-`psms_scored.parquet` (schema version 2, `rescore.rs:323`): `candidate_id` u32,
+`psms_scored.parquet` (schema version 3): `candidate_id` u32,
 `peptidoform` str, `charge` i32, `label` str, `protein` str, `base_peptide_id`
-u32, `score` f64, `q_value` f64, `peptide_q_value` f64, `protein_group` str,
+u32, carried `apex_rt`/`elution_lo`/`elution_hi`, `score` f64, `q_value` f64,
+`peptide_q_value` f64, `protein_group` str,
 `pg_q_value` f64, `global_q_value` f64, `prelim_score` f64, `source` u32,
 `run_psm_q` f64, `experiment_psm_q` f64, `precursor_q` f64. The q-value columns
 are independent per level, not a rollup (see Gotchas).
 
-`peptide_quant.parquet` (`quant.rs:317`): `candidate_id`, `peptidoform`,
-`charge`, `protein_group`, `quantity` f64, `n_fragments_used` i32.
-`protein_group_quant.parquet` (`quant.rs:344`): `protein_group`, `quantity`,
-`n_peptides` i32. Optional `fragment_quant.parquet` (`quant.rs:372`) and
+`peptide_quant.parquet` (schema version 2): `candidate_id`, `base_peptide_id`,
+`peptidoform`, `charge`, `protein_group`, nullable `quantity`, `quant_status`,
+`n_fragments_used`, and nullable applied integration apex/bounds.
+`protein_group_quant.parquet` (schema version 2): `protein_group`, nullable
+`quantity`, `quant_status`, and `n_peptides` (unique positive base peptides).
+Optional `fragment_quant.parquet` and
 `peak_bounds` (`quant.rs:278`) diagnostics. `quant-lfq` emits a
 protein-by-run matrix (`quant.rs:479`): `protein_group`, `run` i32, `quantity`,
 `n_features` i32.
@@ -312,7 +318,7 @@ Per-subcommand specifics that are easy to miss:
                                                         seed_psms.parquet.masscal.json
                                                |
         [optional] lib_p + seed --> deeplc_finetune --> fragment_library_precursors_ft.parquet
-                                    (rewrites predicted_irt; lib_p := *_ft)
+                                    (new table with updated predicted_irt; lib_p := *_ft)
                                                |
         seed + lib_p --> rt-im-train --> run_windows.parquet, cal.json
                                                |
@@ -334,7 +340,7 @@ Per-subcommand specifics that are easy to miss:
                                                |
         psms_scored + quant --> report --> peptides.tsv, proteins.tsv
                                                |
-                                    all artifacts recorded --> manifest.json
+                              selected primary Parquets recorded --> manifest.json
 ```
 
 ### The two library sources and how run.rs branches
@@ -360,14 +366,10 @@ The spectral library is the experiment-level, run-independent artifact pair
 `preflight` (`run.rs:37`) validates the mode before any compute: exactly one of
 the two source configurations must be present, and every required input path must
 exist (`run.rs:42-62`). It also checks sidecar prerequisites: `finetune_deeplc`
-requires `predict_frag.deeplc_python` (`run.rs:63`); `rescore.classifier=mokapot`
-requires `rescore.python`; `rescore.classifier=entrapment` requires
-`rescore.entrapment_marker` (`run.rs:69-79`). Note the asymmetry: the match arms
-cover only `Mokapot` and `Entrapment` (`run.rs:70,74`), so `nn_torch` with no
-`rescore.python` is not caught at preflight even though it needs an interpreter;
-that misconfiguration surfaces later in the rescore stage (or falls back to the
-native rescorer unless `rescore.strict` is set). `doctor` is the tool that checks
-`nn_torch`'s interpreter.
+requires `predict_frag.deeplc_python`; Mokapot and NnTorch require
+`rescore.python`; entrapment requires `rescore.entrapment_marker`. `Config::validate`
+rejects the same rescorer omissions at load time. `mumdia doctor` additionally
+checks that the configured interpreters can import the required packages.
 
 ### The per-run chain
 
@@ -390,8 +392,9 @@ recording each output in the manifest with `record_artifact` (`run.rs:83-343`):
 
 3. Optional DeepLC multitask fine-tune (`run.rs:187`, gated on
    `rt_im_train.finetune_deeplc`): `sidecar::run_deeplc_finetune` adapts the RT
-   model to this run's confident seed PSMs and rewrites `predicted_irt` into
-   `fragment_library_precursors_ft.parquet`. It is driven by the `rt_im_train`
+   model to this run's confident seed PSMs and writes a new
+   `fragment_library_precursors_ft.parquet` whose `predicted_irt` values are
+   updated; the input library is not modified. It is driven by the `rt_im_train`
    fields `finetune_epochs`, `finetune_patience`, `q_train` (the confident-seed
    cutoff), and `finetune_batch` (`run.rs:200-203`; `finetune_batch = 0`
    auto-scales the batch to the seed size). The `lib_p` binding is then rebound to
@@ -434,9 +437,10 @@ recording each output in the manifest with `record_artifact` (`run.rs:83-343`):
     protein groups, writing `peptide_quant`, `protein_group_quant`, and
     `fragment_quant`.
 
-11. `report::run` (`run.rs:309`) writes `peptides.tsv` and `proteins.tsv` from the
-    scored table plus quant, thresholded at `quant.q_threshold`, and prints a
-    stdout summary naming the actual rescorer used.
+11. `report::run` writes `peptides.tsv` and `proteins.tsv` from the scored table
+    plus quant, thresholded at `quant.q_threshold`. `run` reads the rescore
+    artifact report and uses its actual classifier in stdout and the manifest;
+    `psms_scored.parquet.report.json` remains the authoritative record.
 
 ### The manifest
 
@@ -445,8 +449,9 @@ version, `env!("CARGO_PKG_VERSION")`, stamped by `Manifest::new`), `config_json`
 (the fully-resolved canonical config), `config_hash` (its blake3 hash),
 `model_identities` (a `BTreeMap<String, String>`), and `artifacts` (a
 `BTreeMap<String, ArtifactRecord>`). `Manifest::new` (`manifest.rs:34`) seeds it
-with the canonical config JSON and hash (`run.rs:87,91`). Every stage output is
-recorded by `record_artifact` (`mumdia-io`), which builds an `ArtifactRecord`
+with the canonical config JSON and hash (`run.rs:87,91`). Selected primary
+Parquet outputs are recorded by `record_artifact` (`mumdia-io`), which builds an
+`ArtifactRecord`
 (`manifest.rs:10`) with nine fields: `logical_name`, `path`, `format`,
 `schema_name`, `schema_version`, `rows`, `content_hash`, `producing_stage`, and
 `config_hash`. `Manifest::record` (`manifest.rs:44`) keys artifacts by
@@ -454,8 +459,11 @@ recorded by `record_artifact` (`mumdia-io`), which builds an `ArtifactRecord`
 sorted, not insertion-ordered. The `producing_stage` is the stage name
 (`digest`, `convert`, ...); in library-input mode the two library records carry
 the synthetic stage `"library-input"` (`run.rs:107-108`). Four `model_identities`
-keys are recorded at `run.rs:323-332`: `rt_predictor`, `fragment_predictor`,
-`rescorer`, and `feature_schema_id`. The manifest is written last to
+keys are recorded: `rt_predictor`, `fragment_predictor`, `rescorer`, and
+`feature_schema_id`. The rescorer identity comes from the rescore report, and the
+fine-tuned precursor table is recorded when it is the table actually consumed
+downstream. Calibration JSON, PIN/schema companions, report TSVs, and some
+optional diagnostic sidecars are not manifest artifacts. The manifest is written last to
 `<out_dir>/manifest.json` (`run.rs:334`) with `mumdia_io::json::write_json`. The
 manifest is provenance recorded, not required: because inputs are
 path-addressable, no stage depends on it to run (docs/18 B1).
@@ -472,17 +480,22 @@ workflow") is library-input mode with:
 - the Extended feature set (`features.set = extended`, applied by `--profile dia`,
   `config.rs:1101`),
 - the `nn_torch` PyTorch MLP rescorer (`rescore.classifier = nn_torch` +
-  `rescore.python`), which is the dominant sensitivity lever and beats the native
-  linear rescorer by ~8.5% (docs/18 A1),
-- a loose extraction gate (`extract.min_frag_corr ~= 0.2`, now the default), since
+  `rescore.python`, with `rescore.strict = true`), which is the dominant
+  sensitivity lever and beats the native linear rescorer by ~8.5% (docs/18 A1),
+- a loose default apex-intensity Pearson gate
+  (`extract.gate_mode = apex_pearson`, `extract.min_frag_corr ~= 0.2`), since
   a strong nonlinear rescorer prefers recall and absorbs the loose-gate flood
   (docs/18 A1/A2),
-- the MS2 peak cap kept at 300 on AIF (docs/18 A3).
+- the conversion-time MS2 peak cap explicitly kept at 300 on AIF
+  (`--top-peaks-ms2 300`; both conversion entry points otherwise default to
+  uncapped). This is distinct from seed-only `search_seed.top_n_peaks`.
 
-On `LFQ_Orbitrap_AIF_Ecoli_01.mzML` this reaches ~10,300 peptides at 1% FDR. The
-zero-dependency native FASTA-digest mode (~1,213 peptides) is the high-precision
-fallback. This preset is invoked through `docker/config.diann-lib.json` plus
-`--profile dia`.
+On `LFQ_Orbitrap_AIF_Ecoli_01.mzML` this historically reaches ~10,300
+precursor-shaped `(peptidoform, charge)` report rows selected at
+`peptide_q_value <= 0.01`; it is not a precursor-q count or a universal preset.
+The zero-dependency native FASTA-digest mode (~1,213 rows under the same report
+definition) is the high-precision fallback. See docs/20 for the exact command,
+acceptance gates, and quantification-specific choices.
 
 ## Key types and functions
 

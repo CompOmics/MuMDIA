@@ -3,7 +3,7 @@
 //! clean-room decoy scheme (reverse or seeded scramble); the DIA-NN terminal
 //! shift map is a later license-checked addition (PLAN.md Section 11).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use anyhow::{Context, Result};
@@ -13,7 +13,13 @@ use mumdia_core::schema::artifact;
 use mumdia_io::report::ArtifactReport;
 use mumdia_io::table::{write_table, Col};
 use serde_json::json;
-use tracing::info;
+use tracing::{info, warn};
+
+/// A bounded retry count keeps decoy construction deterministic and prevents a
+/// pathological low-complexity peptide from looping forever. If no collision-free
+/// permutation exists, the target/decoy pair is dropped together so the emitted
+/// library retains a one-to-one target-decoy population.
+const MAX_DECOY_ATTEMPTS: usize = 64;
 
 /// Parse a FASTA file into (accession, sequence) pairs.
 pub fn read_fasta(path: &str) -> Result<Vec<(String, String)>> {
@@ -29,7 +35,10 @@ pub fn read_fasta(path: &str) -> Result<Vec<(String, String)>> {
             acc = rest.split_whitespace().next().unwrap_or("").to_string();
             seq.clear();
         } else {
-            seq.push_str(line.trim());
+            // FASTA sequence case is not biologically meaningful. Normalizing here
+            // avoids silently discarding otherwise valid lowercase proteins in
+            // `digest_protein`'s standard-residue check.
+            seq.push_str(&line.trim().to_ascii_uppercase());
         }
     }
     if !acc.is_empty() {
@@ -119,6 +128,34 @@ fn make_decoy(pep: &str, strategy: DecoyStrategy, seed: u64) -> Option<String> {
     }
 }
 
+/// Construct a deterministic decoy that is different from its paired target,
+/// does not collide with any target peptide, and is unique among emitted decoys.
+///
+/// The configured transform is tried first. A collision is retried with
+/// independently seeded interior scrambles while preserving the C terminus.
+/// Returns the sequence and number of collision retries.
+fn collision_safe_decoy(
+    pep: &str,
+    strategy: DecoyStrategy,
+    seed: u64,
+    targets: &HashSet<String>,
+    used_decoys: &HashSet<String>,
+) -> Option<(String, usize)> {
+    for attempt in 0..MAX_DECOY_ATTEMPTS {
+        let attempt_seed = seed ^ (attempt as u64).wrapping_mul(0xD1B5_4A32_D192_ED03) ^ fnv1a(pep);
+        let transform = if attempt == 0 {
+            strategy
+        } else {
+            DecoyStrategy::Scramble
+        };
+        let decoy = make_decoy(pep, transform, attempt_seed)?;
+        if decoy != pep && !targets.contains(&decoy) && !used_decoys.contains(&decoy) {
+            return Some((decoy, attempt));
+        }
+    }
+    None
+}
+
 fn splitmix64(state: &mut u64) -> u64 {
     *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
     let mut z = *state;
@@ -175,8 +212,40 @@ pub fn run(p: DigestParams) -> Result<u64> {
         (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
     let (mut label_c, mut target_c, mut strat_c) = (Vec::new(), Vec::new(), Vec::new());
 
+    let target_sequences: HashSet<String> = order.iter().cloned().collect();
+    let mut used_decoys: HashSet<String> = HashSet::new();
+    let mut decoy_collision_retries = 0usize;
+    let mut dropped_pairs = 0usize;
     let mut next_id: u32 = 0;
     for pep in &order {
+        // Resolve the decoy before writing the target. When a low-complexity
+        // sequence has no collision-free permutation, dropping both rows keeps
+        // the emitted target/decoy population paired instead of biasing FDR.
+        let decoy = if matches!(
+            p.cfg.decoy.strategy,
+            DecoyStrategy::Reverse | DecoyStrategy::Scramble
+        ) {
+            match collision_safe_decoy(
+                pep,
+                p.cfg.decoy.strategy,
+                p.rng_seed,
+                &target_sequences,
+                &used_decoys,
+            ) {
+                Some((decoy, retries)) => {
+                    decoy_collision_retries += retries;
+                    used_decoys.insert(decoy.clone());
+                    Some(decoy)
+                }
+                None => {
+                    dropped_pairs += 1;
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
+
         let tid = next_id;
         next_id += 1;
         let proteins_joined = pep_proteins[pep].join(";");
@@ -191,26 +260,29 @@ pub fn run(p: DigestParams) -> Result<u64> {
         strat_c.push(format!("{:?}", p.cfg.decoy.strategy).to_lowercase());
 
         // Materialize sequence-rewrite decoys here (PLAN.md Stage A).
-        if p.cfg.decoy.strategy != DecoyStrategy::None
-            && p.cfg.decoy.strategy != DecoyStrategy::DiannShift
-        {
-            if let Some(dec) = make_decoy(pep, p.cfg.decoy.strategy, p.rng_seed) {
-                let did = next_id;
-                next_id += 1;
-                id_c.push(did);
-                pep_c.push(dec);
-                prot_c.push(format!("DECOY_{proteins_joined}"));
-                start_c.push(st);
-                end_c.push(en);
-                label_c.push("decoy".to_string());
-                target_c.push(tid as i32);
-                strat_c.push(format!("{:?}", p.cfg.decoy.strategy).to_lowercase());
-            }
+        if let Some(dec) = decoy {
+            let did = next_id;
+            next_id += 1;
+            id_c.push(did);
+            pep_c.push(dec);
+            prot_c.push(format!("DECOY_{proteins_joined}"));
+            start_c.push(st);
+            end_c.push(en);
+            label_c.push("decoy".to_string());
+            target_c.push(tid as i32);
+            strat_c.push(format!("{:?}", p.cfg.decoy.strategy).to_lowercase());
         }
     }
 
     let n_targets = label_c.iter().filter(|l| *l == "target").count();
     let n_decoys = label_c.len() - n_targets;
+    if dropped_pairs > 0 {
+        warn!(
+            dropped_pairs,
+            max_attempts = MAX_DECOY_ATTEMPTS,
+            "digest: dropped target/decoy pairs with no collision-free decoy permutation"
+        );
+    }
     let rows = write_table(
         p.out,
         vec![
@@ -229,6 +301,14 @@ pub fn run(p: DigestParams) -> Result<u64> {
     let mut stats = std::collections::BTreeMap::new();
     stats.insert("n_targets".to_string(), json!(n_targets));
     stats.insert("n_decoys".to_string(), json!(n_decoys));
+    stats.insert(
+        "decoy_collision_retries".to_string(),
+        json!(decoy_collision_retries),
+    );
+    stats.insert(
+        "dropped_target_decoy_pairs".to_string(),
+        json!(dropped_pairs),
+    );
     ArtifactReport {
         logical_name: artifact::PEPTIDES.0.to_string(),
         schema_name: artifact::PEPTIDES.0.to_string(),
@@ -242,6 +322,7 @@ pub fn run(p: DigestParams) -> Result<u64> {
             "min_len": p.cfg.min_len, "max_len": p.cfg.max_len,
             "decoy_strategy": format!("{:?}", p.cfg.decoy.strategy),
             "rng_seed": p.rng_seed,
+            "max_decoy_attempts": MAX_DECOY_ATTEMPTS,
         }),
         stats,
         model_identity: None,
@@ -249,7 +330,13 @@ pub fn run(p: DigestParams) -> Result<u64> {
     }
     .write_for(p.out)?;
 
-    info!(targets = n_targets, decoys = n_decoys, rows, elapsed_ms = elapsed, "digest: done");
+    info!(
+        targets = n_targets,
+        decoys = n_decoys,
+        rows,
+        elapsed_ms = elapsed,
+        "digest: done"
+    );
     Ok(rows)
 }
 
@@ -289,5 +376,39 @@ mod tests {
         let b = make_decoy("PEPTIDEK", DecoyStrategy::Scramble, 42).unwrap();
         assert_eq!(a, b);
         assert_eq!(a.as_bytes()[a.len() - 1], b'K');
+    }
+
+    #[test]
+    fn collision_safe_decoy_avoids_targets_and_other_decoys() {
+        // The direct reverse of PEPTIDEK is EDITPEPK, which is deliberately
+        // present as another target. Construction must retry with a scramble.
+        let targets = HashSet::from(["PEPTIDEK".to_string(), "EDITPEPK".to_string()]);
+        let used = HashSet::new();
+        let (decoy, retries) =
+            collision_safe_decoy("PEPTIDEK", DecoyStrategy::Reverse, 42, &targets, &used)
+                .expect("a collision-free scramble exists");
+        assert!(retries > 0);
+        assert!(!targets.contains(&decoy));
+        assert_ne!(decoy, "PEPTIDEK");
+
+        let used = HashSet::from([decoy]);
+        let (second, _) =
+            collision_safe_decoy("EDITPEPK", DecoyStrategy::Reverse, 42, &targets, &used)
+                .expect("a distinct collision-free scramble exists");
+        assert!(!targets.contains(&second));
+        assert!(!used.contains(&second));
+    }
+
+    #[test]
+    fn impossible_low_complexity_decoy_drops_pair() {
+        let targets = HashSet::from(["AAAAAK".to_string()]);
+        assert!(collision_safe_decoy(
+            "AAAAAK",
+            DecoyStrategy::Reverse,
+            42,
+            &targets,
+            &HashSet::new()
+        )
+        .is_none());
     }
 }

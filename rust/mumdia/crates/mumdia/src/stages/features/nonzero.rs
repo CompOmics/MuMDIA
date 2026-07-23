@@ -47,9 +47,9 @@ pub fn values(e: &Evidence) -> Vec<f64> {
 
     // Matched-only (peak-max > 0) apex spectral agreement.
     let (mut om, mut pm) = (Vec::new(), Vec::new());
-    for i in 0..k {
-        if omax[i] > 0.0 {
-            om.push(omax[i]);
+    for (i, &peakmax) in omax.iter().enumerate().take(k) {
+        if peakmax > 0.0 {
+            om.push(peakmax);
             pm.push(e.pred[i]);
         }
     }
@@ -60,19 +60,25 @@ pub fn values(e: &Evidence) -> Vec<f64> {
     // present fragments). High = fragments peak off the apex scan (grid artifact,
     // or a chimera whose borrowed fragments peak at different times).
     let mut gains = Vec::new();
-    for i in 0..k {
-        if omax[i] > 0.0 {
-            gains.push(((omax[i] - e.obs_apex[i]).max(0.0)) / omax[i]);
+    for (i, &peakmax) in omax.iter().enumerate().take(k) {
+        if peakmax > 0.0 {
+            gains.push(((peakmax - e.obs_apex[i]).max(0.0)) / peakmax);
         }
     }
     let peakmax_apex_gain = super::mean(&gains);
 
     let n_present = omax.iter().filter(|&&x| x > 0.0).count();
     let n_frag_present_inpeak = n_present as f64;
-    let frac_frag_present_inpeak = if k > 0 { n_present as f64 / k as f64 } else { 0.0 };
+    let frac_frag_present_inpeak = if k > 0 {
+        n_present as f64 / k as f64
+    } else {
+        0.0
+    };
 
     // Summed profile and its nonzero-scan mask.
-    let summ: Vec<f64> = (0..np).map(|t| e.traces.iter().map(|tr| tr[t]).sum()).collect();
+    let summ: Vec<f64> = (0..np)
+        .map(|t| e.traces.iter().map(|tr| tr[t]).sum())
+        .collect();
     let sm: Vec<usize> = (0..np).filter(|&t| summ[t] > 0.0).collect();
 
     // Pairwise co-elution ignoring zeros: over scans where both fragments are

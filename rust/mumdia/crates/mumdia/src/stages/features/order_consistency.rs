@@ -39,7 +39,11 @@ const MIN_FRAGS: usize = 3;
 const MIN_SCANS: usize = 3;
 
 fn fin(x: f64) -> f64 {
-    if x.is_finite() { x } else { 0.0 }
+    if x.is_finite() {
+        x
+    } else {
+        0.0
+    }
 }
 
 /// Average (tie-corrected) ranks of `v`, ascending. Ties share the mean of the
@@ -76,8 +80,12 @@ fn kendall(a: &[f64], b: &[f64]) -> f64 {
     let (mut c, mut d) = (0i64, 0i64);
     for i in 0..n {
         for j in (i + 1)..n {
-            let sa = (a[i] - a[j]).partial_cmp(&0.0).unwrap_or(std::cmp::Ordering::Equal);
-            let sb = (b[i] - b[j]).partial_cmp(&0.0).unwrap_or(std::cmp::Ordering::Equal);
+            let sa = (a[i] - a[j])
+                .partial_cmp(&0.0)
+                .unwrap_or(std::cmp::Ordering::Equal);
+            let sb = (b[i] - b[j])
+                .partial_cmp(&0.0)
+                .unwrap_or(std::cmp::Ordering::Equal);
             use std::cmp::Ordering::*;
             if sa == Equal || sb == Equal {
                 continue;
@@ -90,14 +98,18 @@ fn kendall(a: &[f64], b: &[f64]) -> f64 {
         }
     }
     let t = c + d;
-    if t == 0 { 0.0 } else { fin((c - d) as f64 / t as f64) }
+    if t == 0 {
+        0.0
+    } else {
+        fin((c - d) as f64 / t as f64)
+    }
 }
 
 /// Index of the maximum element (first on ties); None if all non-positive.
 fn argmax_pos(v: &[f64]) -> Option<usize> {
     let mut best: Option<(usize, f64)> = None;
     for (i, &x) in v.iter().enumerate() {
-        if x > 0.0 && best.map_or(true, |(_, b)| x > b) {
+        if x > 0.0 && best.is_none_or(|(_, b)| x > b) {
             best = Some((i, x));
         }
     }
@@ -160,7 +172,11 @@ pub fn values(e: &Evidence) -> Vec<f64> {
     // ref top-2 order (indices of largest, second largest)
     let ref_top2: Option<(usize, usize)> = {
         let mut order: Vec<usize> = (0..refv.len()).collect();
-        order.sort_by(|&i, &j| refv[j].partial_cmp(&refv[i]).unwrap_or(std::cmp::Ordering::Equal));
+        order.sort_by(|&i, &j| {
+            refv[j]
+                .partial_cmp(&refv[i])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         if order.len() >= 2 && refv[order[0]] > 0.0 && refv[order[1]] > 0.0 {
             Some((order[0], order[1]))
         } else {
@@ -177,7 +193,7 @@ pub fn values(e: &Evidence) -> Vec<f64> {
     let mut top1_acc = 0.0; // weighted top-1 persistence
     let mut top2_num = 0.0; // weighted top-2 order matches
     let mut top2_den = 0.0; // weighted scans where both top-2 frags present
-    // argmax identity distribution (weighted) over fragment positions
+                            // argmax identity distribution (weighted) over fragment positions
     let mut argmax_w = vec![0.0f64; frag_ok.len()];
 
     for (col, &wk) in cols.iter().zip(&w) {
@@ -212,7 +228,11 @@ pub fn values(e: &Evidence) -> Vec<f64> {
             .map(|(x, wk)| wk * (x - sp_mean) * (x - sp_mean))
             .sum::<f64>()
             / wsum;
-        if v <= 0.0 { 0.0 } else { fin(v.sqrt()) }
+        if v <= 0.0 {
+            0.0
+        } else {
+            fin(v.sqrt())
+        }
     };
 
     // Adjacent-scan Spearman (consecutive kept columns), weighted by the mean of
@@ -224,13 +244,21 @@ pub fn values(e: &Evidence) -> Vec<f64> {
             num += wk * spearman(&cols[i], &cols[i + 1]);
             den += wk;
         }
-        if den > 0.0 { fin(num / den) } else { 0.0 }
+        if den > 0.0 {
+            fin(num / den)
+        } else {
+            0.0
+        }
     };
 
     let kendall_mean = fin(kd_acc / wsum);
     let self_cos_mean = fin(cos_acc / wsum);
     let top1 = fin(top1_acc / wsum);
-    let top2 = if top2_den > 0.0 { fin(top2_num / top2_den) } else { 0.0 };
+    let top2 = if top2_den > 0.0 {
+        fin(top2_num / top2_den)
+    } else {
+        0.0
+    };
 
     // Normalized Shannon entropy of the weighted argmax-fragment distribution.
     // 0 = one fragment dominates every scan (clean), 1 = argmax uniform (noisy).

@@ -199,7 +199,8 @@ input Parquet, invoke `python script arg...`, read an output Parquet keyed by id
   columns `id`, `predicted_rt` (f32). Returns `id -> predicted_rt`. Argv is
   `[input, output]`.
 - `run_deeplc_finetune` (`sidecar.rs:106-129`): fine-tunes the DeepLC RT model on
-  the confident seed PSMs and rewrites the library's `predicted_irt` in place.
+  confident seed PSMs and writes a new output precursor table with updated
+  `predicted_irt`; it does not modify the input library.
   Positional contract `deeplc_finetune.py <lib_in> <seed> <lib_out> --epochs E
   --patience P --q-train Q --batch B`. Invoked by `run` between search-seed and RT
   calibration, not by predict-frag.

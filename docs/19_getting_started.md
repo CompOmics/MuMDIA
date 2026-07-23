@@ -115,7 +115,7 @@ gitignored (large binaries kept on disk).
 | File | Rows | Role |
 |---|---|---|
 | `lib/lib_precursors.parquet` | 1,691,048 | Precursor library, `predicted_irt` = raw DIA-NN iRT |
-| `lib/lib_precursors_ft.parquet` | 1,691,048 | Same precursors, `predicted_irt` = DeepLC-fine-tuned (the one to use for direct library input) |
+| `lib/lib_precursors_ft.parquet` | 1,691,048 | Prior DeepLC-fine-tuned output; useful for direct stages or runs with fine-tuning disabled |
 | `lib/lib_fragments.parquet` | 19,998,666 | b/y fragment m/z + predicted intensities, keyed by `candidate_id` |
 | `lib/seed_psms.parquet` | 144,821 | Saved search-seed PSMs from the run that built the library |
 | `lib/seed_psms.parquet.masscal.json` | 1 | Per-run mass-recalibration sidecar for that seed |
@@ -153,21 +153,24 @@ Both precursor files have identical schemas and row counts and differ only in th
 
 You can tell them apart at a glance with `mumdia inspect lib/lib_precursors.parquet`
 vs `..._ft.parquet` and comparing the `predicted_irt` magnitudes. Raw DIA-NN iRT
-is locally noisy, so if you consume a precursor library directly the `_ft` file
-is the one to use: `rt-im-train` reads `predicted_irt` as-is to fit the RT
+is locally noisy, so if fine-tuning is disabled and you consume a precursor
+library directly, the `_ft` file is the one to use: `rt-im-train` reads
+`predicted_irt` as-is to fit the RT
 calibration and set per-candidate windows
 (`rust/mumdia/crates/mumdia/src/stages/rt_im_train.rs:35`, `:75`), and raw iRT
 gives poor windows.
 
 Interaction with the per-run fine-tune (the best-workflow config sets
 `rt_im_train.finetune_deeplc = true`): when the fine-tune is on, `run` fine-tunes
-DeepLC on this run's confident seed PSMs and rewrites `predicted_irt` for every
-standard peptidoform before RT calibration
+DeepLC on this run's confident seed PSMs and writes a new output table with
+replaced `predicted_irt` for every standard peptidoform before RT calibration
 (`rust/mumdia/crates/mumdia/src/stages/run.rs:187-208`;
 `scripts/deeplc_finetune.py:156-159`). The input file's `predicted_irt` is then
 only a fallback for non-standard peptidoforms (`deeplc_finetune.py:95`, `:156`),
-so raw and `_ft` produce equivalent results with the fine-tune on. The `_ft`
-distinction matters when `finetune_deeplc = false`.
+so raw and `_ft` may converge when the fine-tune is on. For a clean
+reproduction, pass the raw table when `finetune_deeplc = true` and let `run`
+create and record its own `_ft` output. The pre-existing `_ft` distinction matters
+when `finetune_deeplc = false`.
 
 ### The seed and mass-cal sidecars
 
@@ -200,7 +203,8 @@ C:/Users/robbi/mumdia_build/release/mumdia.exe run \
   --fasta fasta/ecoli_22032024.fasta \
   --mzml  mzml_files/LFQ_Orbitrap_AIF_Ecoli_01.mzML \
   --out-dir out_native \
-  --profile dia
+  --profile dia \
+  --top-peaks-ms2 300
 ```
 
 Expected result (documented, not re-verified here): approximately 1,213 target
@@ -214,28 +218,41 @@ digest/peptidoforms/predict-frag and consumes the prebuilt library
 (`main.rs:204-207`). The config `config.local-diann-lib.json` (repository root)
 turns on: Extended features, `min_frag_corr = 0.2`, rolling-window apex (5) and
 RT prior (120 s), the per-run DeepLC fine-tune via `deeplc_mt`, the `nn_torch`
-rescorer via `py312_mumdia`, and `quant.q_filter = run_psm_q`.
+rescorer via `py312_mumdia` with `rescore.strict = true`, an RT-window
+multiplier of 1.5, and `quant.q_filter = run_psm_q`. Use a new output directory:
+`run` has no cache/resume and does not clear stale optional files from a reused
+directory.
 
 ```
 C:/Users/robbi/mumdia_build/release/mumdia.exe run \
-  --lib-precursors lib/lib_precursors_ft.parquet \
+  --lib-precursors lib/lib_precursors.parquet \
   --lib-fragments  lib/lib_fragments.parquet \
   --mzml mzml_files/LFQ_Orbitrap_AIF_Ecoli_01.mzML \
   --out-dir out_lib \
-  --config config.local-diann-lib.json
+  --config config.local-diann-lib.json \
+  --top-peaks-ms2 300
 ```
 
-Expected result (documented, not re-verified here): approximately 10,300 target
-peptides at 1% FDR with the `nn_torch` rescorer. Runtime is roughly 10 minutes
+The raw precursor table is intentional: enabled fine-tuning writes a new
+`fragment_library_precursors_ft.parquet` in the output directory and rebinds
+downstream stages to it without modifying the input. The explicit conversion cap
+is also essential to this reproduction. Both `run` and standalone `convert`
+otherwise default to uncapped MS2 spectra; `search_seed.top_n_peaks=300` is a
+separate seed-only probe cap.
+
+Expected result (documented, not re-verified here): approximately 10,300
+precursor-shaped report rows at peptide q <= 1% with the `nn_torch` rescorer.
+Runtime is roughly 10 minutes
 on this machine (the fine-tune dominates; without it the chain is under 3
 minutes). This run is nondeterministic: `deeplc_finetune.py` sets no torch/numpy
 seed, so the fine-tuned iRT and the final count vary slightly between runs
-(`CLAUDE.md`, ML predictors section).
+(`CLAUDE.md`, ML predictors section). NnTorch itself seeds NumPy/Torch but is not
+guaranteed bit-deterministic.
 
 The `run` stdout ends with a one-line summary, for example:
 
 ```
-MuMDIA: <N> peptides, <M> protein groups at q <= 0.01 (rescorer: NnTorch)
+MuMDIA: <N> precursor rows, <M> protein groups at peptide/PG q <= 0.01 (rescorer used: nn_torch)
 ```
 
 `N` is the number of precursor rows written to `peptides.tsv` (the report unit is
@@ -244,51 +261,49 @@ peptidoform + charge, filtered to targets with peptide q <= the threshold;
 `quant.q_threshold`, default 0.01, `config.rs:862`; summary printed at
 `run.rs:317-320`).
 
+`peptides.tsv` is therefore not a stripped-peptide count and is not controlled by
+`precursor_q`. Confirm the actual classifier and model identity in
+`out_lib/psms_scored.parquet.report.json`; strict mode should make any sidecar
+failure fatal, and the report is the source of truth.
+
 ## 5. Acceptance and smoke check
 
-### Fast smoke run
+### Fast smoke checks
 
-Use `--max-spectra` to cap conversion for a quick end-to-end sanity check. The
-early gradient of this file is void, so a small cap finds almost nothing; the
-point is to confirm the chain and the sidecars run to completion, not to get a
-meaningful count.
+Start with `mumdia doctor --config config.local-diann-lib.json`; it validates
+imports without launching a full run.
 
-```
-C:/Users/robbi/mumdia_build/release/mumdia.exe run \
-  --lib-precursors lib/lib_precursors_ft.parquet \
-  --lib-fragments  lib/lib_fragments.parquet \
-  --mzml mzml_files/LFQ_Orbitrap_AIF_Ecoli_01.mzML \
-  --out-dir out_smoke \
-  --config config.local-diann-lib.json \
-  --max-spectra 20000
-```
+Do not use `--max-spectra 20000` with the fine-tuning recipe as a sidecar smoke
+test. `--max-spectra` reads the file head, and this run's early gradient contains
+no confident fine-tune anchors at that size, so the test can fail before it
+meaningfully exercises DeepLC or NnTorch. The flag cannot select a mid-gradient
+offset.
 
-What to look for:
+For a pipeline smoke test, externally prepare a centroided mid-gradient mzML
+slice containing real peptide signal and run the same Section 4b command against
+that file, still with `--top-peaks-ms2 300` and a fresh output directory. A
+plumbing-only alternative is a scratch config with
+`rt_im_train.finetune_deeplc=false`; do not compare its identification count to
+the validated full-run target.
 
-- The process exits 0 and prints the `MuMDIA: ... (rescorer: NnTorch)` summary
-  line, confirming the `nn_torch` sidecar in `py312_mumdia` ran (a sidecar
-  failure otherwise surfaces here).
-- The DeepLC fine-tune log lines appear (`fine-tune reference: <n> confident seed
-  peptides`, `wrote fine-tuned library`), confirming `deeplc_mt` ran.
-- `out_smoke/` contains `peptides.tsv`, `proteins.tsv`, `manifest.json`, and the
-  Parquet artifacts.
-
-Before the smoke run, `mumdia doctor --config config.local-diann-lib.json`
-confirms both interpreters import their packages without launching a full run.
+Verify the requested sidecars through their logs and
+`psms_scored.parquet.report.json`, then check that `peptides.tsv`,
+`proteins.tsv`, `manifest.json`, and the primary Parquets exist.
 
 ### Full-run regression guard
 
 Treat the Section 4 counts as regression targets on
 `LFQ_Orbitrap_AIF_Ecoli_01.mzML`:
 
-- Native FASTA run (`--profile dia`): approximately 1,213 target peptides at 1%
-  FDR, deterministic (exact match expected).
-- Best-workflow library run (`config.local-diann-lib.json`, `nn_torch`):
-  approximately 10,300 target peptides at 1% FDR, nondeterministic (expect small
-  run-to-run variation, so treat this as a band, not an exact number).
+- Native FASTA run (`--profile dia`): approximately 1,213 precursor-shaped
+  report rows passing peptide q <= 1%, deterministic (exact match expected).
+- Best-workflow library run (`config.local-diann-lib.json`, strict `nn_torch`,
+  explicit `--top-peaks-ms2 300`): approximately 10,300 rows under the same
+  report definition. Treat this as a band because DeepLC fine-tuning is unseeded
+  and NnTorch is seeded but not bit-deterministic.
 
-Count the peptide (precursor) rows in a report, which is the header line plus one
-row per precursor:
+Count the report rows, which are one per `(peptidoform, charge)` but selected by
+`peptide_q_value`:
 
 ```
 wc -l out_lib/peptides.tsv   # subtract 1 for the header

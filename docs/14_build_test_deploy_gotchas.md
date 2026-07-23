@@ -32,8 +32,8 @@ the conda specs in `env/`, the container definition in `Dockerfile` +
 | `.github/workflows/release.yml` | Dormant until a `v*` tag; builds per-platform binaries and attaches archives to the Release |
 | `.github/workflows/docker.yml` | Builds the image; pushes to GHCR only on a `v*` tag, build-only on `workflow_dispatch` |
 | `Dockerfile` | Two-stage image: Rust build stage + micromamba runtime with two sidecar envs |
-| `docker/config.dia.json` | Baked FASTA-digest config (MS2PIP + DeepLC + mokapot wired to in-image envs); the only config copied into the image (`Dockerfile:42`) |
-| `docker/config.diann-lib.json` | Library-input config in the repo (DeepLC fine-tune + mokapot); NOT copied into the image, so it must be bind-mounted to use it in the container |
+| `docker/config.dia.json` | Baked FASTA-digest config (MS2PIP + DeepLC + strict mokapot wired to in-image envs) |
+| `docker/config.diann-lib.json` | Baked library-input config (DeepLC fine-tune + strict NnTorch through the torch-capable DeepLC env) |
 | `env/docker-rescore.yml` | Conda spec for the in-image `rescore` env (`python=3.11`, `mokapot==0.10.0` + `ms2pip==4.0.0.dev9`) |
 | `env/docker-deeplc.yml` | Conda spec for the in-image `deeplc` env (`python=3.11`, `torch==2.12.1+cpu` + DeepLC 4.0 multitask pinned git commit) |
 | `env/mumdia-rescore.yml` | Minimal host env for the default mokapot rescorer only (`python=3.12`, no torch/DeepLC/MS2PIP) |
@@ -74,10 +74,10 @@ The build stage of the Docker image produces `/build/release/mumdia`
 `Dockerfile:17`); the release workflow produces `mumdia-<tag>-<target>.{tar.gz,zip}`
 archives (`release.yml:50-60`) containing the binary plus `README.md` and
 `LICENSE`. Non-Windows targets ship a `.tar.gz` (`tar czf`, `release.yml:59`);
-the Windows target ships a `.zip` (`7z a`, `release.yml:57`). Of the two
-`docker/*.json` configs only `config.dia.json` is copied into the image
-(`Dockerfile:42`); `config.diann-lib.json` stays in the repo and must be
-bind-mounted (`-v`) to be used from the container.
+the Windows target ships a `.zip` (`7z a`, `release.yml:57`). Both
+`docker/*.json` configs are copied into the image as
+`/opt/mumdia/config.dia.json` and `/opt/mumdia/config.diann-lib.json`. Input
+mzML, FASTA, and library Parquets remain user data and must be mounted.
 
 ## How it works
 
@@ -268,8 +268,8 @@ point at `/opt/conda/envs/<env>/bin/python`. It installs `git` +
 sdist-only pip dep), then creates two conda envs from `env/docker-rescore.yml` and
 `env/docker-deeplc.yml` and runs `micromamba clean -a -y` (`Dockerfile:29-37`). It
 copies the binary to `/usr/local/bin/mumdia`, `scripts/` to `/opt/mumdia/scripts`,
-and `docker/config.dia.json` to `/opt/mumdia/config.dia.json` (`Dockerfile:40-42`;
-note `config.diann-lib.json` is not copied), sets `MUMDIA_RESCORE_MODEL=logreg`
+and both Docker configs to `/opt/mumdia/config.dia.json` and
+`/opt/mumdia/config.diann-lib.json`, sets `MUMDIA_RESCORE_MODEL=logreg`
 (`Dockerfile:45`), sets the container working directory to `/data`
 (`WORKDIR /data`, `Dockerfile:47`, which is the bind-mount point in the usage
 example), and sets `ENTRYPOINT ["mumdia"]` with `CMD ["--help"]`
@@ -362,7 +362,9 @@ do not reintroduce removed knobs. The fields relevant here:
   `predictor`/`rt_predictor` (fragment intensities + iRT come from the imported
   library), configures only `deeplc_python` + `sidecar_script_dir` for the
   optional iRT fine-tune, and additionally sets `rt_im_train.finetune_deeplc =
-  true` and `rt_im_train.rt_window_multiplier = 1.5` (`docker/config.diann-lib.json:4-8`).
+  true` and `rt_im_train.rt_window_multiplier = 1.5`. It selects `nn_torch` using
+  the torch-capable `/opt/conda/envs/deeplc/bin/python` and sets
+  `rescore.strict = true`.
 - The pip pins in the two in-image envs are exact and reproducibility-load-bearing:
   `rescore` = `mokapot==0.10.0` + `ms2pip==4.0.0.dev9` + `numpy<2` (rest via pip);
   `deeplc` = `torch==2.12.1+cpu` + DeepLC pinned git commit `5c6a94e3...` + `numpy<2`.
@@ -432,9 +434,8 @@ above); bumping to 3.12 reintroduces a source build of `pandas<2`. `git` and
 (`Dockerfile:29`). A `workflow_dispatch` of `docker.yml` builds but does not push;
 only a `v*` tag publishes. The published image is `linux/amd64` only
 (`docker.yml:46`), so on arm64 hosts (Apple Silicon) it runs under emulation.
-Only `config.dia.json` is inside the image; running the library-input recipe in
-the container requires bind-mounting `docker/config.diann-lib.json` (or any custom
-config) and passing it with `--config`.
+Both standard configs are inside the image. A custom config can still be mounted,
+and the mzML/library/FASTA inputs always need a data mount.
 
 ## How to extend / modify
 

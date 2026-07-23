@@ -33,8 +33,10 @@ speedup.md
 scripts/run_*.sh
 scripts/_probe*.py
 
-# internal docs/specs/analysis: kept local, NOT published (public repo ships only READMEs)
+# Root-level research/spec/analysis notes stay local. The public README,
+# CLAUDE agent guide, and the tracked docs/ developer guide are source.
 /*.md
 !/README.md
+!/CLAUDE.md
 # local archive of superseded working docs (not published)
 /_archive/

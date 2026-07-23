@@ -64,7 +64,11 @@ fn fin(x: f64) -> f64 {
 #[inline]
 fn ln1p(x: f64) -> f64 {
     let a = 1.0 + x;
-    if a > 0.0 { fin(a.ln()) } else { 0.0 }
+    if a > 0.0 {
+        fin(a.ln())
+    } else {
+        0.0
+    }
 }
 
 /// Neutral precursor mass from m/z and charge; 0.0 if charge <= 0.
@@ -176,11 +180,7 @@ pub fn values(e: &Evidence) -> Vec<f64> {
     let dev1 = fin((r10 - tr10).abs());
     let dev2 = fin((r20 - tr20).abs());
     let m1_frac = fin(im1 / (i0 + i1 + i2 + EPS));
-    let overlap_flag = if im1 > 0.2 * i0 && i0 > 0.0 {
-        1.0
-    } else {
-        0.0
-    };
+    let overlap_flag = if im1 > 0.2 * i0 && i0 > 0.0 { 1.0 } else { 0.0 };
 
     // --- apex intensity / presence ---
     let log_mono = ln1p(i0);
@@ -386,7 +386,11 @@ fn xic_features(e: &Evidence) -> (f64, f64, f64, f64, f64, f64, f64, f64, f64, f
                 wc += w * c;
             }
         }
-        if wsum > 0.0 { fin(wc / wsum) } else { 0.0 }
+        if wsum > 0.0 {
+            fin(wc / wsum)
+        } else {
+            0.0
+        }
     };
 
     // ms1_isotope_xic_shape_consistency: mean pairwise pearson among baseline-subtracted XICs

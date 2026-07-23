@@ -67,7 +67,11 @@ fn frac_top_pred_observed(pred: &[f64], obs: &[f64], k: usize) -> f64 {
         return 0.0;
     }
     let mut idx: Vec<usize> = (0..n).collect();
-    idx.sort_by(|&a, &b| pred[b].partial_cmp(&pred[a]).unwrap_or(std::cmp::Ordering::Equal));
+    idx.sort_by(|&a, &b| {
+        pred[b]
+            .partial_cmp(&pred[a])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     let take = k.min(n);
     if take == 0 {
         return 0.0;
@@ -106,7 +110,11 @@ pub fn values(e: &Evidence) -> Vec<f64> {
     let obs_pos: Vec<f64> = e.obs_apex.iter().cloned().filter(|&x| x > 0.0).collect();
     let sum: f64 = obs_pos.iter().sum();
     let sum_sq: f64 = obs_pos.iter().map(|x| x * x).sum();
-    let effective_frag_count = if sum_sq > 0.0 { sum * sum / sum_sq } else { 0.0 };
+    let effective_frag_count = if sum_sq > 0.0 {
+        sum * sum / sum_sq
+    } else {
+        0.0
+    };
     let evidence_concentration = if sum > 0.0 {
         obs_pos.iter().cloned().fold(0.0, f64::max) / sum
     } else {
@@ -172,7 +180,11 @@ mod tests {
 
     #[test]
     fn names_match_values_len_and_finite() {
-        let v = values(&ev(vec![9.0, 5.0, 1.0], vec![8.0, 4.0, 0.0], vec![1.0, -2.0, 50.0]));
+        let v = values(&ev(
+            vec![9.0, 5.0, 1.0],
+            vec![8.0, 4.0, 0.0],
+            vec![1.0, -2.0, 50.0],
+        ));
         assert_eq!(v.len(), NAMES.len());
         assert!(v.iter().all(|x| x.is_finite()));
     }
@@ -180,23 +192,40 @@ mod tests {
     #[test]
     fn only_observed_fragments_count_toward_mass_error() {
         // third fragment is unobserved (obs 0) with a huge error -> excluded
-        let v = values(&ev(vec![9.0, 5.0, 1.0], vec![8.0, 4.0, 0.0], vec![1.0, -1.0, 999.0]));
-        let maxabs_i = NAMES.iter().position(|n| *n == "frag_mass_err_max_abs").unwrap();
+        let v = values(&ev(
+            vec![9.0, 5.0, 1.0],
+            vec![8.0, 4.0, 0.0],
+            vec![1.0, -1.0, 999.0],
+        ));
+        let maxabs_i = NAMES
+            .iter()
+            .position(|n| *n == "frag_mass_err_max_abs")
+            .unwrap();
         assert!(v[maxabs_i] <= 1.0 + 1e-9); // 999 excluded, only |1|,|-1|
     }
 
     #[test]
     fn breadth_of_top_predicted_ions() {
         // top-3 predicted = frags 0,1,2 (pred 9,5,3); obs>0 for 0 and 1 only -> 2/3
-        let v = values(&ev(vec![9.0, 5.0, 3.0, 1.0], vec![8.0, 4.0, 0.0, 2.0], vec![0.0; 4]));
-        let t3 = NAMES.iter().position(|n| *n == "frac_top3_pred_observed").unwrap();
+        let v = values(&ev(
+            vec![9.0, 5.0, 3.0, 1.0],
+            vec![8.0, 4.0, 0.0, 2.0],
+            vec![0.0; 4],
+        ));
+        let t3 = NAMES
+            .iter()
+            .position(|n| *n == "frac_top3_pred_observed")
+            .unwrap();
         assert!((v[t3] - 2.0 / 3.0).abs() < 1e-9);
     }
 
     #[test]
     fn concentration_high_when_one_dominant_fragment() {
         let v = values(&ev(vec![1.0, 1.0], vec![100.0, 1.0], vec![0.0, 0.0]));
-        let conc = NAMES.iter().position(|n| *n == "evidence_concentration").unwrap();
+        let conc = NAMES
+            .iter()
+            .position(|n| *n == "evidence_concentration")
+            .unwrap();
         assert!(v[conc] > 0.9);
     }
 }

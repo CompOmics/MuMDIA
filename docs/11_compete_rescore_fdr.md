@@ -46,14 +46,16 @@ Consumes the features artifact `psms_features` (path passed as `--features`),
 plus its schema companion `<features>.schema.json` (read at compete.rs:39 via
 `FeatureSchema::read`). Reads these columns (compete.rs:31-45): `candidate_id`
 (u32), `label` (str), `base_peptide_id` (u32), `peptidoform` (str), `protein`
-(str), `apex_rt` (f64), `precursor_mz` (f64), `prelim_score` (f64), `charge`
+(str), `apex_rt`, `elution_lo`, `elution_hi` (f64), `precursor_mz` (f64),
+`prelim_score` (f64), `charge`
 (f64, only needed for `peptidoform_charge` grouping), and every feature column
 named in the schema.
 
-Produces `psms_competed` (schema version 1, `artifact::PSMS_COMPETED`,
-schema.rs:20) at `--out`. Column schema (compete.rs:118-130): `candidate_id`
+Produces `psms_competed` (schema version 2, `artifact::PSMS_COMPETED`,
+schema.rs:20) at `--out`. Column schema includes `candidate_id`
 (u32), `label` (str), `base_peptide_id` (u32), `peptidoform` (str), `protein`
-(str), `apex_rt` (f64), `precursor_mz` (f64), `prelim_score` (f64), then every
+(str), `apex_rt`, `elution_lo`, `elution_hi` (f64), `precursor_mz` (f64),
+`prelim_score` (f64), then every
 feature column (f64) carried through unchanged. It also writes
 `<out>.schema.json` (compete.rs:133) so rescore recovers the exact feature list,
 and `<out>.report.json`.
@@ -74,17 +76,18 @@ ever emits these two.
 
 ### rescore
 
-Consumes one or more `psms_competed` tables (`--competed`, a `Vec<String>`,
-main.rs:154). The feature list is read from the schema companion of the first
-input only (rescore.rs:64); all inputs are assumed to share that schema. Reads
-`candidate_id`, `label`, `base_peptide_id`, `peptidoform`, `protein`, `charge`
-(f64, cast to i32), `prelim_score`, `precursor_mz`, and the feature columns
-(rescore.rs:66-87).
+Consumes one or more `psms_competed` tables (`--competed`, a `Vec<String>`).
+The ordered feature schema from the first input is the expected contract, and
+every later schema companion must match it exactly before tables are
+concatenated. Reads `candidate_id`, `label`, `base_peptide_id`, `peptidoform`,
+`protein`, `charge` (f64, cast to i32), `prelim_score`, `precursor_mz`,
+`apex_rt`, `elution_lo`, `elution_hi`, and the feature columns.
 
-Produces `psms_scored` (schema version 2, `artifact::PSMS_SCORED`, schema.rs:21)
-at `--out`. Column schema (rescore.rs:320-347): `candidate_id` (u32),
+Produces `psms_scored` (schema version 3, `artifact::PSMS_SCORED`, schema.rs:21)
+at `--out`. Column schema includes `candidate_id` (u32),
 `peptidoform` (str), `charge` (i32), `label` (str), `protein` (str),
-`base_peptide_id` (u32), `score` (f64, the classifier discriminant),
+`base_peptide_id` (u32), the carried identification `apex_rt`/`elution_lo`/
+`elution_hi` (f64), `score` (f64, the classifier discriminant),
 `q_value` (f64, pooled PSM q), `peptide_q_value` (f64), `protein_group` (str,
 the protein-accession-set string, a duplicate of `protein`), `pg_q_value` (f64),
 `global_q_value` (f64, byte-identical alias of `q_value`), `prelim_score` (f64),
@@ -254,14 +257,17 @@ back to `native_scores` (rescore.rs:112-118). Requires `rescore.python`.
 **`RescorerKind::NnTorch`** (config.rs:134-140): runs `nn_rescore_worker.py`
 through the same `run_pin_sidecar` contract (rescore.rs:120-134). A nonlinear
 PyTorch MLP with the same CV-fold + iterative positive-reselection scheme. The
+initial feature/sign and every positive set are selected from that fold's
+training rows only; empty, single-class, or zero-positive folds hard-error, so
+held-out labels do not influence OOF scoring. The
 worker receives the NN hyperparameters through environment variables
 `MUMDIA_NN_FOLDS`, `MUMDIA_NN_ITERS`, `MUMDIA_NN_TRAIN_FDR`, set from
 `cfg.folds/num_iter/train_fdr` (rescore.rs:610-616), so the report reflects the
 values actually used. Same strict/fallback logic as Mokapot.
 
-> **NnTorch is nondeterministic.** The worker seeds torch/numpy
-> (`nn_rescore_worker.py:205,258-259`) but PyTorch training on floats plus
-> nondeterministic kernels means runs are not byte-identical. It also has a
+> **NnTorch is seeded but not bit-deterministic.** The worker seeds torch/numpy
+> (`nn_rescore_worker.py:205,258-259`) but floating-point training and numerical
+> kernels mean runs are only approximately reproducible. It also has a
 > **scaler leak**: standardization statistics are computed over the **full**
 > feature matrix, not per training fold. In-memory backend uses global
 > median/IQR (`nn_rescore_worker.py:134-137`); streaming backend accumulates a
@@ -269,11 +275,10 @@ values actually used. Same strict/fallback logic as Mokapot.
 > native `percolator_lite`, which fits the scaler on the train fold only. Both
 > facts are properties of the sidecar, not the Rust dispatch.
 
-**`RescorerKind::Percolator`** (config.rs:141-142): **not wired.** The arm
-either hard-errors under `rescore.strict` or warns and uses `native_tda`
-(rescore.rs:135-141). `percolator.exe` is installed on the dev machine but no
-adapter exists; `rescore.percolator_bin` (config.rs:960) is a dead config field
-until it is.
+**`RescorerKind::Percolator`**: **not wired.** Normal config loading rejects this
+classifier before execution; the defensive rescore arm still errors under strict
+mode or falls back only for a manually constructed compatibility config.
+`rescore.percolator_bin` is a dead field until an adapter exists.
 
 **`RescorerKind::Entrapment`** (config.rs:143-149): a decoy-independent path for
 spike-in entrapment experiments. It requires `entrapment_marker` and at least one
@@ -419,7 +424,7 @@ this subsystem reads.
 
 | field | default | effect |
 |---|---|---|
-| `group_by` | `precursor` | competition grouping (`CompeteGroupBy`, config.rs:734): `precursor` groups a peptide's charge/mod variants and its decoy; `apex` also buckets by rounded apex RT; `peptidoform_charge` keeps each peptidoform+charge separate |
+| `group_by` | `precursor` | groups charge/mod variants of a base peptide separately within target and decoy labels; `apex` also buckets by rounded apex RT; `peptidoform_charge` keeps each precursor form separate |
 | `apex_rt_tolerance_s` | `5.0` | RT bucket width (s) for `group_by = apex` (compete.rs:82) |
 | `mode` | `winner_take_all` | within-group resolution (`CompetitionMode`, config.rs:713): `winner_take_all`, `none`, `features_only`, `unique_evidence`, `margin_gated` |
 | `margin` | `0.0` | score margin required to remove a loser under `margin_gated` (compete.rs:294) |
@@ -444,13 +449,15 @@ unless a knob is set.
 | `entrapment_exclude` | `None` | substring that, if also present, keeps a PSM as a real target (shared peptides) |
 | `entrapment_contaminant_markers` | `[]` | substrings marking genuine contaminants inside the spike-in proteome; matching PSMs stay real targets |
 | `entrapment_ratio` | `1.0` | `N_real_lib / N_entrap_lib`, scales the entrapment FDR estimate |
-| `strict` | `false` | when true, any sidecar failure / misconfiguration is a hard error instead of a native fallback |
+| `strict` | `true` | production default: any sidecar failure / misconfiguration is a hard error; false explicitly enables compatibility fallback |
 
 ## Invariants, determinism, gotchas
 
 - **Label stays in the competition key** (compete.rs:64-93, config.rs:705-710). A
-  target never competes against its own decoy. Removing this depletes decoys and
-  underestimates FDR.
+  target never directly eliminates its own decoy in the `compete` stage.
+  `rescore` still reduces target and decoy representatives by the requested
+  biological unit and compares those populations when estimating q values.
+  Removing the stage-level label partition would prematurely deplete the null.
 - **compete is deterministic.** Groups are visited in sorted key order and the
   winner tie-breaks to the smallest row index (compete.rs:256-265). Kept indices
   are sorted+deduped (compete.rs:303-304). No floats are summed across an unordered
@@ -464,12 +471,13 @@ unless a knob is set.
   (rescoring.rs:181-186); an empty train/test fold is skipped (rescoring.rs:117-119).
   So the discriminant `score` is a mix of learned scores and, for uncovered rows,
   the raw prelim. This is the intended safe fallback, not a bug.
-- **`nn_torch` is nondeterministic** and has a **scaler leak** (standardization
+- **`nn_torch` is seeded but not bit-deterministic** and has a **scaler leak** (standardization
   fit over the full matrix, not per fold; `nn_rescore_worker.py:134-137,159-170`).
   Do not treat its scores as reproducible; do not use it where byte-identity is
   required.
-- **`percolator` is unwired** (rescore.rs:135-141). It silently degrades to
-  `native_tda` unless `strict = true`. `percolator_bin` is a dead field.
+- **`percolator` is unwired.** Config loading rejects it. The defensive fallback
+  arm matters only to manually constructed compatibility configs;
+  `percolator_bin` remains a dead field.
 - **Sidecars key on the flat row index, not `candidate_id`** (rescore.rs:56-60,
   522-525, 588-593). `candidate_id` is the library index and repeats across runs;
   keying on it collides in an experiment-wide (multi-file) rescore. A missing row

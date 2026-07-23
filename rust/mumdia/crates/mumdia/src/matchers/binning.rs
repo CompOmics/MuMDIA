@@ -33,7 +33,13 @@ impl LogBins {
         let span = mz_max.ln() - ln_min;
         // +2 pads the top so both bin(mz_max) and bin(mz_max)+1 are valid indices.
         let n_bins = (span * inv_w).floor() as usize + 2;
-        LogBins { delta, w, inv_w, ln_min, n_bins }
+        LogBins {
+            delta,
+            w,
+            inv_w,
+            ln_min,
+            n_bins,
+        }
     }
 
     /// Bin index of an m/z value, clamped to `[0, n_bins - 1]`. Values at or below
@@ -80,7 +86,7 @@ mod tests {
         assert_eq!(bins.bin(0.0), 0);
         assert_eq!(bins.bin(-5.0), 0);
         assert_eq!(bins.bin(100.0), 0); // below min
-        assert!(bins.bin(5000.0) <= bins.n_bins - 1); // above max, clamped
+        assert!(bins.bin(5000.0) < bins.n_bins); // above max, clamped
     }
 
     #[test]

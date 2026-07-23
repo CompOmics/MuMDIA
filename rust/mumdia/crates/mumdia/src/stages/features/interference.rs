@@ -62,9 +62,9 @@ pub fn values(e: &Evidence) -> Vec<f64> {
     // Per-fragment least-squares scale onto R.
     let mut rf = vec![0.0f64; k];
     if ssr > 0.0 {
-        for f in 0..k {
+        for (f, scale) in rf.iter_mut().enumerate().take(k) {
             if f < e.traces.len() {
-                rf[f] = dot(&e.traces[f], r) / ssr;
+                *scale = dot(&e.traces[f], r) / ssr;
             }
         }
     }
@@ -90,14 +90,10 @@ pub fn values(e: &Evidence) -> Vec<f64> {
     // ---- 1. explained_variance_ref ----
     let mut num1 = 0.0;
     let mut den1 = 0.0;
-    for f in 0..k {
-        if f >= e.traces.len() {
-            continue;
-        }
-        let x = &e.traces[f];
+    for (&scale, x) in rf.iter().zip(e.traces.iter()).take(k) {
         let n = x.len().min(tp);
         for t in 0..n {
-            let resid = x[t] - rf[f] * r[t];
+            let resid = x[t] - scale * r[t];
             num1 += resid * resid;
             den1 += x[t] * x[t];
         }
@@ -107,17 +103,13 @@ pub fn values(e: &Evidence) -> Vec<f64> {
     // ---- 2. profile_residual_fraction ----
     let mut acc2 = 0.0;
     let mut cnt2 = 0usize;
-    for f in 0..k {
-        if f >= e.traces.len() {
-            continue;
-        }
-        let x = &e.traces[f];
+    for (&scale, x) in rf.iter().zip(e.traces.iter()).take(k) {
         let sx = ss(x);
         if sx > 0.0 {
             let n = x.len().min(tp);
             let mut resid = 0.0;
             for t in 0..n {
-                let d = x[t] - rf[f] * r[t];
+                let d = x[t] - scale * r[t];
                 resid += d * d;
             }
             acc2 += resid / sx;
@@ -128,9 +120,13 @@ pub fn values(e: &Evidence) -> Vec<f64> {
 
     // ---- 3. n_interfered_fragments ----
     let mut n_interfered = 0.0;
-    for f in 0..k {
-        let a = if f < e.obs_apex.len() { e.obs_apex[f] } else { 0.0 };
-        if a > 2.0 * rf[f] * r_apex {
+    for (f, &scale) in rf.iter().enumerate().take(k) {
+        let a = if f < e.obs_apex.len() {
+            e.obs_apex[f]
+        } else {
+            0.0
+        };
+        if a > 2.0 * scale * r_apex {
             n_interfered += 1.0;
         }
     }
@@ -141,9 +137,13 @@ pub fn values(e: &Evidence) -> Vec<f64> {
     // ---- 5. corrected_vs_raw_ratio ----
     let mut num5 = 0.0;
     let mut den5 = 0.0;
-    for f in 0..k {
-        let a = if f < e.obs_apex.len() { e.obs_apex[f] } else { 0.0 };
-        let cap = (1.5 * rf[f] * r_apex).max(0.0);
+    for (f, &scale) in rf.iter().enumerate().take(k) {
+        let a = if f < e.obs_apex.len() {
+            e.obs_apex[f]
+        } else {
+            0.0
+        };
+        let cap = (1.5 * scale * r_apex).max(0.0);
         num5 += a.min(cap);
         den5 += a;
     }
@@ -235,7 +235,11 @@ pub fn values(e: &Evidence) -> Vec<f64> {
             wsum += w;
         }
     }
-    let peak_to_full_area_ratio_frag_mean = if cnt_fm > 0 { acc_fm / cnt_fm as f64 } else { 0.0 };
+    let peak_to_full_area_ratio_frag_mean = if cnt_fm > 0 {
+        acc_fm / cnt_fm as f64
+    } else {
+        0.0
+    };
     let peak_to_full_area_ratio_weighted = if wsum > 0.0 { acc_w / wsum } else { 0.0 };
 
     // ---- 15. profile_corr_full_vs_peak_delta ----
@@ -305,7 +309,7 @@ pub fn values(e: &Evidence) -> Vec<f64> {
     // ---- 19. interference_apex_residual_fraction ----
     let mut num19 = 0.0;
     let mut den19 = 0.0;
-    for f in 0..k {
+    for (f, &scale) in rf.iter().enumerate().take(k) {
         if f >= e.traces.len() {
             continue;
         }
@@ -314,7 +318,7 @@ pub fn values(e: &Evidence) -> Vec<f64> {
         } else {
             0.0
         };
-        num19 += (xa - rf[f] * r_apex).max(0.0);
+        num19 += (xa - scale * r_apex).max(0.0);
         den19 += xa;
     }
     let interference_apex_residual_fraction = if den19 > 0.0 { num19 / den19 } else { 0.0 };
@@ -350,8 +354,8 @@ pub fn values(e: &Evidence) -> Vec<f64> {
             }
         }
         let mut trace = 0.0;
-        for i in 0..m {
-            trace += g[i][i];
+        for (i, row) in g.iter().enumerate().take(m) {
+            trace += row[i];
         }
         if trace > 0.0 {
             let (lam1, v1) = power_top(&g);
@@ -398,10 +402,8 @@ pub fn values(e: &Evidence) -> Vec<f64> {
             if !is_max {
                 continue;
             }
-            if i < lo || i > hi {
-                if rfull[i] > second_peak {
-                    second_peak = rfull[i];
-                }
+            if (i < lo || i > hi) && rfull[i] > second_peak {
+                second_peak = rfull[i];
             }
             if rfull[i] > thr && (i as isize - full_apex as isize).abs() >= w {
                 n_competing += 1.0;

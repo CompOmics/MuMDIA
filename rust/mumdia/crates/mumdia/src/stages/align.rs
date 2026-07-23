@@ -56,8 +56,16 @@ pub fn run(p: AlignParams) -> Result<u64> {
     let ref_rts = confident_rts(&p.seeds[0], p.q_train)?;
     let ref_rt_values: Vec<f64> = ref_rts.values().cloned().collect();
     let (grid_lo, grid_hi) = (
-        ref_rt_values.iter().cloned().fold(f64::MAX, f64::min).min(0.0),
-        ref_rt_values.iter().cloned().fold(f64::MIN, f64::max).max(1.0),
+        ref_rt_values
+            .iter()
+            .cloned()
+            .fold(f64::MAX, f64::min)
+            .min(0.0),
+        ref_rt_values
+            .iter()
+            .cloned()
+            .fold(f64::MIN, f64::max)
+            .max(1.0),
     );
 
     let (mut run_c, mut src_c, mut ref_c, mut resid_c) =
@@ -89,7 +97,11 @@ pub fn run(p: AlignParams) -> Result<u64> {
         };
         // residual spread on shared peptides
         let resid = if let Some(l) = &loess {
-            let r: Vec<f64> = xs.iter().zip(&ys).map(|(x, y)| (y - l.predict(*x)).abs()).collect();
+            let r: Vec<f64> = xs
+                .iter()
+                .zip(&ys)
+                .map(|(x, y)| (y - l.predict(*x)).abs())
+                .collect();
             percentile(&r, 0.95)
         } else {
             0.0
@@ -107,7 +119,12 @@ pub fn run(p: AlignParams) -> Result<u64> {
             ref_c.push(refrt);
             resid_c.push(resid);
         }
-        info!(run = run_id, shared = xs.len(), residual_p95 = resid, "align: run mapped");
+        info!(
+            run = run_id,
+            shared = xs.len(),
+            residual_p95 = resid,
+            "align: run mapped"
+        );
     }
 
     let rows = write_table(
@@ -134,6 +151,11 @@ pub fn run(p: AlignParams) -> Result<u64> {
         elapsed_ms: elapsed,
     }
     .write_for(p.out)?;
-    info!(runs = p.seeds.len(), rows, elapsed_ms = elapsed, "align: done");
+    info!(
+        runs = p.seeds.len(),
+        rows,
+        elapsed_ms = elapsed,
+        "align: done"
+    );
     Ok(rows)
 }

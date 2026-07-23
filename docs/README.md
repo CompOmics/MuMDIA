@@ -37,6 +37,9 @@ source rather than the spec.
    gitignored spec file and stands alone.
 9. Read **19 (getting started)** for the reproducible local setup and two
    copy-pasteable end-to-end runs (native and best-sensitivity library).
+10. Use **20 (sensitivity and quantification playbook)** when choosing or
+    promoting settings: it separates the validated AIF reference from
+    acquisition-specific tuning, FDR/entrapment gates, and quant accuracy.
 
 ## Document index
 
@@ -61,3 +64,4 @@ source rather than the spec.
 | [17_troubleshooting.md](17_troubleshooting.md) | Symptom -> cause -> fix lookup table for the quiet failure modes (silent fallbacks, nondeterminism, void results), cited to `file:line`. |
 | [18_findings_and_decisions.md](18_findings_and_decisions.md) | Self-contained findings and contracts: validated results, interstage/determinism/sidecar contracts, current best workflow, and ranked roadmap, with no dependency on `plan.md`. |
 | [19_getting_started.md](19_getting_started.md) | Reproducible getting-started: local sidecar environments, the pre-built E. coli test library, and two copy-pasteable end-to-end runs plus a smoke check. |
+| [20_sensitivity_and_quantification_playbook.md](20_sensitivity_and_quantification_playbook.md) | Operational playbook separating validated AIF sensitivity, acquisition-specific choices, FDR/entrapment promotion gates, quantification accuracy, and benchmark-gated research. |

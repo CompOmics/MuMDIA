@@ -532,6 +532,8 @@ Bookkeeping columns plus the feature columns carried from the schema (each
 | `peptidoform` | Utf8 | no | - | ProForma-lite peptidoform |
 | `protein` | Utf8 | no | - | protein accessions |
 | `apex_rt` | Float64 | no | s | apex RT |
+| `elution_lo` | Float64 | no | s | identified elution lower bound |
+| `elution_hi` | Float64 | no | s | identified elution upper bound |
 | `precursor_mz` | Float64 | no | m/z | precursor m/z |
 | `prelim_score` | Float64 | no | - | preliminary composite score |
 | ...feature columns... | Float64 | no | varies | each `feature_columns` entry from the schema |
@@ -555,7 +557,7 @@ candidate removed by within-group competition.
 
 ## Stage F: `rescore` (`stages/rescore.rs`)
 
-### psms_scored (schema v2, `rescore.rs:320-347`)
+### psms_scored (schema v3)
 
 | column | Arrow type | nullable | units | meaning |
 |---|---|---|---|---|
@@ -565,6 +567,9 @@ candidate removed by within-group competition.
 | `label` | Utf8 | no | - | `target` or `decoy` |
 | `protein` | Utf8 | no | - | protein accessions |
 | `base_peptide_id` | UInt32 | no | - | grouping key |
+| `apex_rt` | Float64 | no | s | identification apex carried through for quant |
+| `elution_lo` | Float64 | no | s | identified elution lower bound |
+| `elution_hi` | Float64 | no | s | identified elution upper bound |
 | `score` | Float64 | no | - | rescorer discriminant score (higher is better) |
 | `q_value` | Float64 | no | - | PSM-level q-value (pooled target-decoy or entrapment null) |
 | `peptide_q_value` | Float64 | no | - | peptide-level q (best PSM per base peptide); losers get 1.0 |
@@ -585,24 +590,30 @@ rescorer (`rescore.rs:196-204`).
 
 ## Stage G: `quant` (`stages/quant.rs`)
 
-### peptide_quant (`quant.rs:314-324`)
+### peptide_quant (schema v2)
 
 | column | Arrow type | nullable | units | meaning |
 |---|---|---|---|---|
 | `candidate_id` | UInt32 | no | - | library candidate id |
+| `base_peptide_id` | UInt32 | no | - | unique base-peptide rollup key |
 | `peptidoform` | Utf8 | no | - | ProForma-lite peptidoform |
 | `charge` | Int32 | no | - | precursor charge |
 | `protein_group` | Utf8 | no | - | protein-accession-set string |
-| `quantity` | Float64 | no | intensity x s | sum of the top-N fragment trapezoid areas |
-| `n_fragments_used` | Int32 | no | - | number of fragments summed (min of available and top-N) |
+| `quantity` | Float64 | yes | intensity x s | sum of top-N positive finite fragment areas; null when not quantifiable |
+| `quant_status` | Utf8 | no | - | quantified or explicit missing-quantity reason |
+| `n_fragments_used` | Int32 | no | - | number of positive finite fragments summed |
+| `integration_apex_rt` | Float64 | yes | s | apex actually used for integration |
+| `integration_lo_rt` | Float64 | yes | s | integration lower bound actually used |
+| `integration_hi_rt` | Float64 | yes | s | integration upper bound actually used |
 
-### protein_group_quant (`quant.rs:341-348`)
+### protein_group_quant (schema v2)
 
 | column | Arrow type | nullable | units | meaning |
 |---|---|---|---|---|
 | `protein_group` | Utf8 | no | - | protein-accession-set string |
-| `quantity` | Float64 | no | intensity x s | rollup quantity (top-N-sum or sum of member peptidoforms) |
-| `n_peptides` | Int32 | no | - | number of peptidoform quantities rolled up |
+| `quantity` | Float64 | yes | intensity x s | rollup over unique positive base-peptide representatives |
+| `quant_status` | Utf8 | no | - | quantified or `no_quantifiable_peptide` |
+| `n_peptides` | Int32 | no | - | unique positive base peptides before Top-N truncation |
 
 ### fragment_quant (optional, `quant.rs:369-379`)
 
@@ -686,7 +697,9 @@ flags and the earliest rejection reason.
 
 ### `<artifact>.report.json` (`mumdia-io/src/report.rs:10-24`)
 
-Written by every stage next to each Parquet artifact.
+Written next to most primary stage Parquets, but not every Parquet or stage
+output. Optional diagnostics, schema/PIN files, TSV reports, and some
+experiment-level/Python-written outputs have partial or no coverage.
 
 | field | JSON type | meaning |
 |---|---|---|
@@ -740,5 +753,6 @@ not engine artifacts.
 
 ## Schema-version registry
 
-`mumdia-core/src/schema.rs` freezes the `(logical name, version)` pairs. All are
-version 1 except `psms_scored`, which is version 2.
+`mumdia-core/src/schema.rs` freezes the `(logical name, version)` pairs.
+`psms_competed`, `peptide_quant`, and `protein_group_quant` are v2;
+`psms_scored` is v3; the remaining registered artifacts are v1.

@@ -13,19 +13,19 @@
 use super::Evidence;
 
 pub const NAMES: &[&str] = &[
-    "frag_apex_rt_std",         // scatter of per-fragment apex RTs (s)
-    "frag_apex_rt_mad",         // robust scatter (median abs dev, s)
-    "frag_apex_max_dev",        // max |fragment apex - consensus apex| (s)
-    "frag_apex_mean_dev",       // mean |fragment apex - consensus apex| (s)
-    "frag_apex_agree_frac",     // fraction of signal fragments apexing within 1 scan of consensus
-    "precursor_frag_apex_delta",// |MS1 mono apex - consensus apex| (s); 0 if no MS1
-    "peak_symmetry",            // right-area / (left-area+right-area) of consensus peak (~0.5 ideal)
-    "peak_tailing",             // right half-width / left half-width at half height
-    "peak_n_local_maxima",      // local maxima in consensus profile (>=1)
-    "peak_shoulder_score",      // 2nd-highest local max / apex height
-    "peak_fwhm_scans",          // full width at half maximum (scans)
-    "peak_truncation",          // 1 if apex at window edge or boundary height > 0.5*apex
-    "apex_frac_of_window",      // apex position within the window [0,1] (edge = mis-centered)
+    "frag_apex_rt_std",          // scatter of per-fragment apex RTs (s)
+    "frag_apex_rt_mad",          // robust scatter (median abs dev, s)
+    "frag_apex_max_dev",         // max |fragment apex - consensus apex| (s)
+    "frag_apex_mean_dev",        // mean |fragment apex - consensus apex| (s)
+    "frag_apex_agree_frac",      // fraction of signal fragments apexing within 1 scan of consensus
+    "precursor_frag_apex_delta", // |MS1 mono apex - consensus apex| (s); 0 if no MS1
+    "peak_symmetry", // right-area / (left-area+right-area) of consensus peak (~0.5 ideal)
+    "peak_tailing",  // right half-width / left half-width at half height
+    "peak_n_local_maxima", // local maxima in consensus profile (>=1)
+    "peak_shoulder_score", // 2nd-highest local max / apex height
+    "peak_fwhm_scans", // full width at half maximum (scans)
+    "peak_truncation", // 1 if apex at window edge or boundary height > 0.5*apex
+    "apex_frac_of_window", // apex position within the window [0,1] (edge = mis-centered)
 ];
 
 fn mean(v: &[f64]) -> f64 {
@@ -89,7 +89,11 @@ fn argmax_pos(v: &[f64]) -> Option<usize> {
 pub fn values(e: &Evidence) -> Vec<f64> {
     let axis = &e.axis;
     let n = axis.len();
-    let consensus_rt = if e.apex_idx < n { axis[e.apex_idx] } else { 0.0 };
+    let consensus_rt = if e.apex_idx < n {
+        axis[e.apex_idx]
+    } else {
+        0.0
+    };
     let mean_scan_dt = if n >= 2 {
         (axis[n - 1] - axis[0]) / (n as f64 - 1.0)
     } else {
@@ -121,13 +125,22 @@ pub fn values(e: &Evidence) -> Vec<f64> {
     let precursor_frag_apex_delta = e
         .ms1_xic
         .first()
-        .and_then(|mono| argmax_pos(mono).map(|p| (axis.get(p).copied().unwrap_or(consensus_rt) - consensus_rt).abs()))
+        .and_then(|mono| {
+            argmax_pos(mono)
+                .map(|p| (axis.get(p).copied().unwrap_or(consensus_rt) - consensus_rt).abs())
+        })
         .unwrap_or(0.0);
 
     // Consensus profile shape (predicted-intensity-weighted reference profile).
     let prof = &e.ref_profile;
-    let (peak_symmetry, peak_tailing, peak_fwhm_scans, peak_truncation, peak_n_local_maxima, peak_shoulder_score) =
-        profile_shape(prof, e.apex_idx);
+    let (
+        peak_symmetry,
+        peak_tailing,
+        peak_fwhm_scans,
+        peak_truncation,
+        peak_n_local_maxima,
+        peak_shoulder_score,
+    ) = profile_shape(prof, e.apex_idx);
 
     let apex_frac_of_window = if n >= 2 {
         e.apex_idx as f64 / (n as f64 - 1.0)
@@ -227,7 +240,12 @@ fn profile_shape(prof: &[f64], apex_idx: usize) -> (f64, f64, f64, f64, f64, f64
 mod tests {
     use super::*;
 
-    fn ev(axis: Vec<f64>, traces: Vec<Vec<f64>>, ref_profile: Vec<f64>, apex_idx: usize) -> Evidence {
+    fn ev(
+        axis: Vec<f64>,
+        traces: Vec<Vec<f64>>,
+        ref_profile: Vec<f64>,
+        apex_idx: usize,
+    ) -> Evidence {
         Evidence {
             axis,
             traces,
@@ -281,7 +299,10 @@ mod tests {
         let prof = vec![0.0, 1.5, 8.5, 1.5, 0.0];
         let v = values(&ev(axis, tr, prof, 2));
         let std_i = NAMES.iter().position(|n| *n == "frag_apex_rt_std").unwrap();
-        let agree_i = NAMES.iter().position(|n| *n == "frag_apex_agree_frac").unwrap();
+        let agree_i = NAMES
+            .iter()
+            .position(|n| *n == "frag_apex_agree_frac")
+            .unwrap();
         assert_eq!(v[std_i], 0.0); // both apex at same scan
         assert_eq!(v[agree_i], 1.0);
     }
@@ -294,7 +315,10 @@ mod tests {
         let prof = vec![0.0, 4.5, 1.0, 4.5, 0.0];
         let v = values(&ev(axis, tr, prof, 1));
         let std_i = NAMES.iter().position(|n| *n == "frag_apex_rt_std").unwrap();
-        let maxdev_i = NAMES.iter().position(|n| *n == "frag_apex_max_dev").unwrap();
+        let maxdev_i = NAMES
+            .iter()
+            .position(|n| *n == "frag_apex_max_dev")
+            .unwrap();
         assert!(v[std_i] > 0.0);
         assert!(v[maxdev_i] >= 2.0);
     }

@@ -18,7 +18,6 @@ use anyhow::Result;
 use mumdia_core::constants::{ppm_bounds, PROTON};
 use mumdia_io::table::Table;
 use rayon::prelude::*;
-use tracing::warn;
 
 #[derive(Clone, Debug)]
 pub struct Candidate {
@@ -63,6 +62,7 @@ impl Library {
         let irt = pt.f32("predicted_irt")?;
         let label = pt.str("label")?;
         let protein = pt.str("protein")?;
+        crate::fdr::validate_labels(&label)?;
 
         let ft = Table::read(fragments)?;
         let f_cid = ft.u32("candidate_id")?;
@@ -75,20 +75,20 @@ impl Library {
         // (the library + decoy builders guarantee this). An external library that
         // violates it would misgroup fragments or panic on the index below, so
         // check explicitly and fail with a clear error instead.
-        for c in 0..ncand {
-            if cid[c] as usize != c {
+        for (c, &candidate_id) in cid.iter().enumerate().take(ncand) {
+            if candidate_id as usize != c {
                 anyhow::bail!(
                     "library precursor row {c} has candidate_id {} but candidate_id must \
                      be the contiguous range 0..{ncand} in row order; reindex the library \
                      (e.g. via the decoy-builder scripts)",
-                    cid[c]
+                    candidate_id
                 );
             }
         }
         // Group fragments by candidate_id, preserving stored order.
         let mut per_cand_frags: Vec<Vec<usize>> = vec![Vec::new(); ncand];
-        for i in 0..ft.nrows {
-            let c = f_cid[i] as usize;
+        for (i, &candidate_id) in f_cid.iter().enumerate().take(ft.nrows) {
+            let c = candidate_id as usize;
             if c >= ncand {
                 anyhow::bail!(
                     "fragment row {i} references candidate_id {c} >= precursor count {ncand}"
@@ -144,21 +144,22 @@ impl Library {
                 );
             }
         }
-        // A decoy-free library gives q = (0+1)/n_targets, i.e. silently-invalid
-        // near-zero FDR downstream. Warn loudly (bailing could break intentional
-        // decoy-free diagnostics, so this is a warning, not an error).
+        // A missing class makes downstream target-decoy q-values meaningless.
+        // Fail at library load rather than completing a long search with a
+        // plausible-looking but invalid FDR estimate.
+        let n_target = cands.iter().filter(|c| !c.is_decoy).count();
         let n_decoy = cands.iter().filter(|c| c.is_decoy).count();
-        if n_decoy == 0 {
-            warn!(
-                "library has 0 decoy candidates; target-decoy q-values will be invalid \
-                 (add decoys, e.g. via make_reverse_decoys.py)"
+        if n_target == 0 || n_decoy == 0 {
+            anyhow::bail!(
+                "library must contain both target and decoy candidates for valid FDR \
+                 (targets={n_target}, decoys={n_decoy}); add paired decoys before search \
+                 (e.g. via make_reverse_decoys.py)"
             );
         }
 
         // Build flat index entries.
         let mut entries: Vec<(f32, u32, f32)> = Vec::with_capacity(ft.nrows);
-        for c in 0..ncand {
-            let cd = &cands[c];
+        for cd in cands.iter().take(ncand) {
             for k in 0..cd.n_frag {
                 let gi = cd.frag_start + k;
                 entries.push((frag_mz[gi] as f32, cd.candidate_id, frag_int[gi]));
@@ -209,7 +210,11 @@ impl Library {
         let c = &self.cands[cid as usize];
         let s = c.frag_start;
         let e = s + c.n_frag;
-        (&self.frag_mz[s..e], &self.frag_int[s..e], &self.frag_name[s..e])
+        (
+            &self.frag_mz[s..e],
+            &self.frag_int[s..e],
+            &self.frag_name[s..e],
+        )
     }
 
     /// Local fragment index (0..n_frag) of the candidate whose stored m/z is
@@ -255,7 +260,10 @@ impl Library {
         let nb = self.bucket_min.len();
         // First bucket whose min could hold an entry >= lo: the bucket before
         // the first min > lo.
-        let first = self.bucket_min.partition_point(|&m| m <= lo32).saturating_sub(1);
+        let first = self
+            .bucket_min
+            .partition_point(|&m| m <= lo32)
+            .saturating_sub(1);
         // Last bucket whose min <= hi.
         let last = self.bucket_min.partition_point(|&m| m <= hi32);
         let bs = self.bucket_size;
@@ -299,7 +307,10 @@ mod tests {
                 Col::U32("candidate_id".into(), vec![0, 1]),
                 Col::U32("peptidoform_id".into(), vec![0, 1]),
                 Col::U32("base_peptide_id".into(), vec![0, 1]),
-                Col::Str("peptidoform".into(), vec!["PEPTIDEK".into(), "SAMPLER".into()]),
+                Col::Str(
+                    "peptidoform".into(),
+                    vec!["PEPTIDEK".into(), "SAMPLER".into()],
+                ),
                 Col::I32("charge".into(), vec![2, 2]),
                 Col::F64("precursor_mz".into(), vec![400.0, 500.0]),
                 Col::F32("predicted_irt".into(), vec![10.0, 20.0]),
@@ -315,8 +326,14 @@ mod tests {
                 Col::U32("candidate_id".into(), vec![0, 0, 1, 1]),
                 Col::F64("mz".into(), vec![200.1, 300.2, 250.5, 350.6]),
                 Col::F32("predicted_intensity".into(), vec![1.0, 0.8, 0.9, 0.7]),
-                Col::Str("name".into(), vec!["b2".into(), "y3".into(), "b2".into(), "y3".into()]),
-                Col::Str("ion_type".into(), vec!["b".into(), "y".into(), "b".into(), "y".into()]),
+                Col::Str(
+                    "name".into(),
+                    vec!["b2".into(), "y3".into(), "b2".into(), "y3".into()],
+                ),
+                Col::Str(
+                    "ion_type".into(),
+                    vec!["b".into(), "y".into(), "b".into(), "y".into()],
+                ),
                 Col::I32("ordinal".into(), vec![2, 3, 2, 3]),
                 Col::I32("frag_charge".into(), vec![1, 1, 1, 1]),
             ],

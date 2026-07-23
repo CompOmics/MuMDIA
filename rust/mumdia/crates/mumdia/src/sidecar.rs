@@ -10,6 +10,8 @@ use anyhow::{bail, Context, Result};
 use mumdia_io::table::{write_table, Col, Table};
 use tracing::info;
 
+type FragmentIntensityMap = HashMap<u32, HashMap<(u8, u16), f32>>;
+
 /// Resolve a sidecar worker script path so a deployed binary finds its workers
 /// regardless of the working directory: try the configured dir relative to the
 /// CWD, then relative to the binary's own directory, then `<exe_dir>/scripts`.
@@ -22,7 +24,10 @@ pub fn resolve_script(dir: &str, worker: &str) -> String {
     }
     if let Ok(exe) = std::env::current_exe() {
         if let Some(base) = exe.parent() {
-            for cand in [base.join(dir).join(worker), base.join("scripts").join(worker)] {
+            for cand in [
+                base.join(dir).join(worker),
+                base.join("scripts").join(worker),
+            ] {
                 if cand.exists() {
                     return cand.to_string_lossy().into_owned();
                 }
@@ -42,7 +47,7 @@ pub fn run_ms2pip(
     peptidoforms: &[String],
     charges: &[i32],
     model: &str,
-) -> Result<HashMap<u32, HashMap<(u8, u16), f32>>> {
+) -> Result<FragmentIntensityMap> {
     std::fs::create_dir_all(workdir).ok();
     let inp = format!("{workdir}/ms2pip_in.parquet");
     let outp = format!("{workdir}/ms2pip_out.parquet");
@@ -55,8 +60,7 @@ pub fn run_ms2pip(
         ],
     )?;
     info!(n = ids.len(), model, "sidecar: running MS2PIP");
-    run_worker(python, script, &[&inp, &outp, model], false)
-        .context("MS2PIP worker failed")?;
+    run_worker(python, script, &[&inp, &outp, model], false).context("MS2PIP worker failed")?;
 
     let t = Table::read(&outp)?;
     let oid = t.u32("id")?;
@@ -103,6 +107,7 @@ pub fn run_deeplc(
 /// DeepLC multitask fine-tune: adapt the RT model to this run's confident seed
 /// PSMs and rewrite the supplied library's `predicted_irt`. Positional contract:
 /// `deeplc_finetune.py <lib_in> <seed> <lib_out>`.
+#[allow(clippy::too_many_arguments)]
 pub fn run_deeplc_finetune(
     python: &str,
     script: &str,
@@ -114,7 +119,16 @@ pub fn run_deeplc_finetune(
     q_train: f64,
     batch: usize,
 ) -> Result<()> {
-    info!(lib_in, seed, lib_out, epochs, patience, q_train, batch, "sidecar: running DeepLC multitask fine-tune");
+    info!(
+        lib_in,
+        seed,
+        lib_out,
+        epochs,
+        patience,
+        q_train,
+        batch,
+        "sidecar: running DeepLC multitask fine-tune"
+    );
     let ep = epochs.to_string();
     let pa = patience.to_string();
     let qt = q_train.to_string();
@@ -122,7 +136,19 @@ pub fn run_deeplc_finetune(
     run_worker(
         python,
         script,
-        &[lib_in, seed, lib_out, "--epochs", &ep, "--patience", &pa, "--q-train", &qt, "--batch", &ba],
+        &[
+            lib_in,
+            seed,
+            lib_out,
+            "--epochs",
+            &ep,
+            "--patience",
+            &pa,
+            "--q-train",
+            &qt,
+            "--batch",
+            &ba,
+        ],
         true,
     )
     .context("DeepLC fine-tune failed")
@@ -148,8 +174,16 @@ pub fn run_mbr(
     seed: u64,
 ) -> Result<()> {
     let psms_csv = psms.join(",");
-    info!(scored, out, runs = psms.len(), q_anchor, min_anchor_runs, q_transfer,
-          consensus_corr_min, "sidecar: running MBR transfer");
+    info!(
+        scored,
+        out,
+        runs = psms.len(),
+        q_anchor,
+        min_anchor_runs,
+        q_transfer,
+        consensus_corr_min,
+        "sidecar: running MBR transfer"
+    );
     let qa = q_anchor.to_string();
     let mar = min_anchor_runs.to_string();
     let qt = q_transfer.to_string();
@@ -157,8 +191,17 @@ pub fn run_mbr(
     let cm = consensus_corr_min.to_string();
     let frag_csv = frag.join(",");
     let mut args: Vec<&str> = vec![
-        scored, &psms_csv, out, "--q-anchor", &qa, "--min-anchor-runs", &mar,
-        "--q-transfer", &qt, "--seed", &sd,
+        scored,
+        &psms_csv,
+        out,
+        "--q-anchor",
+        &qa,
+        "--min-anchor-runs",
+        &mar,
+        "--q-transfer",
+        &qt,
+        "--seed",
+        &sd,
     ];
     if let Some(os) = out_scored {
         args.extend_from_slice(&["--out-scored", os]);
