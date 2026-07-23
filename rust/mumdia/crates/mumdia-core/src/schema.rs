@@ -18,7 +18,7 @@ pub mod artifact {
     pub const CHROMATOGRAMS: (&str, u32) = ("chromatograms", 1);
     pub const FEATURES: (&str, u32) = ("features", 1);
     pub const PSMS_COMPETED: (&str, u32) = ("psms_competed", 1);
-    pub const PSMS_SCORED: (&str, u32) = ("psms_scored", 1);
+    pub const PSMS_SCORED: (&str, u32) = ("psms_scored", 2);
     pub const PEPTIDE_QUANT: (&str, u32) = ("peptide_quant", 1);
     pub const PROTEIN_GROUP_QUANT: (&str, u32) = ("protein_group_quant", 1);
 }

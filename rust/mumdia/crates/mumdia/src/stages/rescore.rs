@@ -86,6 +86,7 @@ pub fn run(p: RescoreParams) -> Result<u64> {
             feats.push((0..feat_names.len()).map(|k| fcols[k][i]).collect());
         }
     }
+    crate::fdr::validate_labels(&label)?;
     let is_decoy: Vec<bool> = label.iter().map(|l| l == "decoy").collect();
     let (is_entrapment, is_real_target) = classify_entrapment(p.cfg, &protein, &is_decoy);
     let n = cid.len();
@@ -221,9 +222,53 @@ pub fn run(p: RescoreParams) -> Result<u64> {
         ids
     };
     let pg_q = grouped_q(&protein_id, &scores, &is_decoy, &is_entrapment, &is_real_target, qmode, p.cfg.entrapment_ratio);
-    // Multi-context q (PLAN.md Section 8 rescore): single run, so run-specific ==
-    // experiment-wide == global. Distinct column kept for multi-run forward-compat.
+    // Multi-context q-values (PLAN.md Section 8 rescore; comment.md C1/C3). The
+    // pooled per-PSM q is `experiment_psm_q`; `run_psm_q` re-runs TDA within each
+    // source (run) so a per-run quant/report gets a real per-run FDR rather than the
+    // pooled value; `precursor_q` groups on peptidoform+charge. `global_q` is kept
+    // as a byte-identical alias of the pooled q for backward-compat.
     let global_q = psm_q.clone();
+    let experiment_psm_q = psm_q.clone();
+    // Per-run PSM q: TDA within each source separately, scattered back by row index.
+    // Single-run (source all-zero) => equals `q_value`. Sorted (BTree) source
+    // iteration keeps it deterministic; no floats are summed.
+    let run_psm_q = {
+        let mut by_src: std::collections::BTreeMap<u32, Vec<usize>> = std::collections::BTreeMap::new();
+        for (i, &s) in source.iter().enumerate() {
+            by_src.entry(s).or_default().push(i);
+        }
+        let mut rq = vec![1.0f64; n];
+        for (_s, idxs) in by_src {
+            let q = match qmode {
+                QMode::Decoy => {
+                    let sd: Vec<(f64, bool)> = idxs.iter().map(|&i| (scores[i], is_decoy[i])).collect();
+                    target_decoy_q(&sd)
+                }
+                QMode::Entrapment => {
+                    let sc: Vec<f64> = idxs.iter().map(|&i| scores[i]).collect();
+                    let en: Vec<bool> = idxs.iter().map(|&i| is_entrapment[i]).collect();
+                    let re: Vec<bool> = idxs.iter().map(|&i| is_real_target[i]).collect();
+                    entrapment_q(&sc, &en, &re, p.cfg.entrapment_ratio)
+                }
+            };
+            for (k, &i) in idxs.iter().enumerate() {
+                rq[i] = q[k];
+            }
+        }
+        rq
+    };
+    // Precursor-level q: group on peptidoform+charge (interned to dense u32 like the
+    // protein path) and run TDA over the best PSM per precursor.
+    let precursor_id: Vec<u32> = {
+        let mut interner: HashMap<(&str, i32), u32> = HashMap::new();
+        let mut ids = Vec::with_capacity(pform.len());
+        for (pf, &z) in pform.iter().zip(charge.iter()) {
+            let next = interner.len() as u32;
+            ids.push(*interner.entry((pf.as_str(), z)).or_insert(next));
+        }
+        ids
+    };
+    let precursor_q = grouped_q(&precursor_id, &scores, &is_decoy, &is_entrapment, &is_real_target, qmode, p.cfg.entrapment_ratio);
 
     // Reported IDs: real targets in entrapment mode (spike-in excluded), else all
     // non-decoy targets.
@@ -247,6 +292,15 @@ pub fn run(p: RescoreParams) -> Result<u64> {
         for i in 0..n {
             if is_reported[i] && pg_q[i] <= 0.01 {
                 seen.insert(protein_id[i]);
+            }
+        }
+        seen.len()
+    };
+    let n_prec_1 = {
+        let mut seen = std::collections::HashSet::new();
+        for i in 0..n {
+            if is_reported[i] && precursor_q[i] <= 0.01 {
+                seen.insert(precursor_id[i]);
             }
         }
         seen.len()
@@ -283,6 +337,12 @@ pub fn run(p: RescoreParams) -> Result<u64> {
             // Run identity for experiment-wide rescore (index into --competed);
             // all-zero for a single-run rescore. Lets quant map scores per file.
             Col::U32("source".into(), source),
+            // Multi-context q columns (comment.md C1/C3). run_psm_q = per-run PSM
+            // FDR; experiment_psm_q = pooled PSM FDR (== q_value/global_q_value);
+            // precursor_q = per (peptidoform+charge) FDR.
+            Col::F64("run_psm_q".into(), run_psm_q),
+            Col::F64("experiment_psm_q".into(), experiment_psm_q),
+            Col::F64("precursor_q".into(), precursor_q),
         ],
     )?;
 
@@ -293,6 +353,7 @@ pub fn run(p: RescoreParams) -> Result<u64> {
     stats.insert("target_psms_at_1pct".to_string(), json!(n_psm_1));
     stats.insert("target_peptides_at_1pct".to_string(), json!(n_pep_1));
     stats.insert("target_protein_groups_at_1pct".to_string(), json!(n_pg_1));
+    stats.insert("target_precursors_at_1pct".to_string(), json!(n_prec_1));
     if qmode == QMode::Entrapment {
         stats.insert("entrapment_ratio".to_string(), json!(p.cfg.entrapment_ratio));
         stats.insert("entrapment_peptides_at_1pct".to_string(), json!(n_entrap_1));
@@ -546,6 +607,13 @@ fn run_pin_sidecar(
         .arg(&pin)
         .arg(&outp)
         .env("PYTHONUTF8", "1")
+        // Pass the configured NN hyperparameters so the worker uses them instead
+        // of its own defaults, and so the folds/num_iter/train_fdr recorded in the
+        // report reflect the values actually used (comment.md C4). Ignored by
+        // mokapot_worker.py, which shares this PIN contract.
+        .env("MUMDIA_NN_FOLDS", p.cfg.folds.to_string())
+        .env("MUMDIA_NN_ITERS", p.cfg.num_iter.to_string())
+        .env("MUMDIA_NN_TRAIN_FDR", p.cfg.train_fdr.to_string())
         .status()?;
     if !status.success() {
         anyhow::bail!("{script_name} exited with {status}");

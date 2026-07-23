@@ -36,6 +36,7 @@ fn confident_rts(path: &str, q_train: f64) -> Result<HashMap<u32, f64>> {
     let rt = t.f64("observed_rt")?;
     let score = t.f64("score")?;
     let label = t.str("label")?;
+    crate::fdr::validate_labels(&label)?;
     let mut best: HashMap<u32, (f64, f64)> = HashMap::new(); // base -> (score, rt)
     for i in 0..t.nrows {
         if label[i] == "decoy" || q[i] > q_train {
