@@ -205,7 +205,7 @@ pub const RICH_EXTRA: &[&str] = &[
 /// The ordered active feature list for the configured set.
 pub fn active_features(set: FeatureSet) -> Vec<String> {
     let mut v: Vec<String> = MINIMAL_FEATURES.iter().map(|s| s.to_string()).collect();
-    if matches!(set, FeatureSet::Rich | FeatureSet::Custom | FeatureSet::Extended) {
+    if matches!(set, FeatureSet::Rich | FeatureSet::Extended) {
         v.extend(RICH_EXTRA.iter().map(|s| s.to_string()));
     }
     if matches!(set, FeatureSet::Extended) {

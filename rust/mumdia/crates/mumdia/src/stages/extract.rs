@@ -760,12 +760,7 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
     info!(materialized = acc.len(), "extract: candidates with evidence");
 
     // Cascade + apex per candidate.
-    let scan_window = match p.cfg.scan_window_mode {
-        mumdia_core::config::ScanWindowMode::Fixed => p.cfg.fixed_scan_window,
-        // MVP: data-derived mode approximated by fixed default (v1 optimizer later)
-        mumdia_core::config::ScanWindowMode::PeakWidthDerived => p.cfg.fixed_scan_window,
-    }
-    .max(1);
+    let scan_window = p.cfg.fixed_scan_window.max(1);
 
     // psms_extracted columns
     let (mut cid_c, mut apexrt_c, mut apexint_c) = (Vec::new(), Vec::new(), Vec::new());

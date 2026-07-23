@@ -31,32 +31,17 @@ impl Default for DecoyStrategy {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum DecoySource {
-    /// MuMDIA generates decoys; the seed engine is told not to.
-    Library,
-    SearchEngine,
-}
-impl Default for DecoySource {
-    fn default() -> Self {
-        DecoySource::Library
-    }
-}
-
 /// Fragment-matcher backend for search-seed and extract (fragindex_spec).
 /// Default `Fragindex` (log-bin CSR matcher): on narrow-window DIA it is ~1.95x
 /// faster in search-seed and ~1.26x in extract with essentially unchanged IDs
 /// (HYE B_01: peptides -0.1%); `Bucketed` is the previous `Library::page_search`
 /// path (retained for A/B and for the AIF full-range-window case, where the
-/// predicate difference shifts IDs more); `Naive` is the band-join reference
-/// (equivalence tests only).
+/// predicate difference shifts IDs more).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MatcherKind {
     Bucketed,
     Fragindex,
-    Naive,
 }
 impl Default for MatcherKind {
     fn default() -> Self {
@@ -80,20 +65,6 @@ impl Default for Enzyme {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ToleranceRegime {
-    /// MVP-conservative: fixed ppm tolerances (PLAN.md Section 10).
-    Fixed,
-    /// v1: learned per-run percentile-driven optimizer (PLAN.md Section 8.4).
-    LearnedPercentile,
-}
-impl Default for ToleranceRegime {
-    fn default() -> Self {
-        ToleranceRegime::Fixed
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
 pub enum CalibrationMethod {
     Loess,
     Linear,
@@ -111,7 +82,6 @@ pub enum FeatureSet {
     /// MVP feature set (PLAN.md Section 10).
     Minimal,
     Rich,
-    Custom,
     /// Minimal + Rich + the extended battery (DIA-NN / OpenSWATH / AlphaDIA /
     /// MS2Rescore / OktoberFest analogs + novel families) from the per-family
     /// modules in `stages/features/`. Superset, opt-in; the classifier picks the
@@ -222,18 +192,6 @@ impl Default for PeakClaim {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ScanWindowMode {
-    PeakWidthDerived,
-    Fixed,
-}
-impl Default for ScanWindowMode {
-    fn default() -> Self {
-        ScanWindowMode::PeakWidthDerived
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Per-stage config
 // ---------------------------------------------------------------------------
@@ -249,16 +207,10 @@ where
 #[serde(default, deny_unknown_fields)]
 pub struct DecoyConfig {
     pub strategy: DecoyStrategy,
-    pub source: DecoySource,
-    pub ratio: u32,
 }
 impl Default for DecoyConfig {
     fn default() -> Self {
-        Self {
-            strategy: t(),
-            source: t(),
-            ratio: 1,
-        }
+        Self { strategy: t() }
     }
 }
 
@@ -373,7 +325,6 @@ impl Default for PredictFragConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct SearchSeedConfig {
     pub fdr_seed: f64,
-    pub precursor_tol_ppm: f64,
     pub fragment_tol_ppm: f64,
     /// Max reported PSMs per spectrum (wide-window DIA, PLAN.md Stage S).
     pub report_psms: usize,
@@ -398,7 +349,6 @@ impl Default for SearchSeedConfig {
     fn default() -> Self {
         Self {
             fdr_seed: 0.01,
-            precursor_tol_ppm: 20.0,
             fragment_tol_ppm: 20.0,
             report_psms: 5,
             min_matched_peaks: 4,
@@ -412,7 +362,6 @@ impl Default for SearchSeedConfig {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RtImTrainConfig {
-    pub tolerance_regime: ToleranceRegime,
     pub calibration_method: CalibrationMethod,
     pub q_train: f64,
     /// Percentile of |obs - calibrated_pred| residuals for the RT window.
@@ -459,7 +408,6 @@ pub struct RtImTrainConfig {
 impl Default for RtImTrainConfig {
     fn default() -> Self {
         Self {
-            tolerance_regime: t(),
             calibration_method: t(),
             q_train: 0.01,
             p_rt: 0.95,
@@ -481,8 +429,6 @@ impl Default for RtImTrainConfig {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ExtractConfig {
-    pub scan_window_mode: ScanWindowMode,
-    pub scan_scale: f64,
     pub fixed_scan_window: usize,
     pub frag_tol_ppm: f64,
     pub prec_tol_ppm: f64,
@@ -535,12 +481,8 @@ pub struct ExtractConfig {
     /// window), so the elution profile drops to zero between peaks and the
     /// features-stage boundary calling is not misled by interpolated gaps.
     pub emit_window_grid: bool,
-    /// tier-(c) k-select cap: exact scores run on at most this many per cell.
-    pub k_select: usize,
     /// m/z bucket size (power of two).
     pub bucket_size: usize,
-    /// Max fragment charge to probe (deconvolution loop bound).
-    pub max_fragment_charge: i32,
     /// How a shared observed peak's intensity is apportioned among co-isolated,
     /// co-eluting candidates that all match it (see [`PeakClaim`]).
     pub peak_claim: PeakClaim,
@@ -606,8 +548,6 @@ pub struct ExtractConfig {
 impl Default for ExtractConfig {
     fn default() -> Self {
         Self {
-            scan_window_mode: ScanWindowMode::Fixed, // MVP-conservative
-            scan_scale: 2.2,
             fixed_scan_window: 3,
             frag_tol_ppm: 20.0,
             prec_tol_ppm: 20.0,
@@ -627,9 +567,7 @@ impl Default for ExtractConfig {
             apex_count_window: 1,  // no rolling smoothing by default (opt-in; window 5
                                    // cuts AIF apex misassignment, median |dRT| 131s->9s)
             emit_window_grid: true, // zero-filled window-grid chromatograms
-            k_select: 50,
             bucket_size: 8192,
-            max_fragment_charge: 1,
             peak_claim: PeakClaim::None,
             emit_contested_features: false,
             peak_claim_margin: 2.0,
@@ -789,20 +727,6 @@ pub enum CompetitionMode {
     /// Remove a loser only when `winner_score - loser_score >= margin`; otherwise
     /// keep it. Conservative removal for the low-FDR region.
     MarginGated,
-}
-
-impl CompetitionMode {
-    /// Parse a CLI/token spelling.
-    pub fn from_token(s: &str) -> Option<Self> {
-        match s.to_ascii_lowercase().replace('-', "_").as_str() {
-            "winner_take_all" | "winner" => Some(Self::WinnerTakeAll),
-            "none" => Some(Self::None),
-            "features_only" | "features" => Some(Self::FeaturesOnly),
-            "unique_evidence" | "unique" => Some(Self::UniqueEvidence),
-            "margin_gated" | "margin" => Some(Self::MarginGated),
-            _ => None,
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1085,7 +1009,6 @@ impl Default for RescoreConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub rng_seed: u64,
-    pub threads: Option<usize>,
     pub digest: DigestConfig,
     pub peptidoforms: PeptidoformsConfig,
     pub predict_frag: PredictFragConfig,
@@ -1103,7 +1026,6 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             rng_seed: 0,
-            threads: None,
             digest: t(),
             peptidoforms: t(),
             predict_frag: t(),
@@ -1165,36 +1087,6 @@ impl Config {
                     .into(),
             ));
         }
-        // Warn (not fail) when a declared-but-unimplemented knob is set away from
-        // its default: it silently has no effect, which otherwise misleads tuning.
-        let d = Self::default();
-        let mut dead = Vec::new();
-        if self.search_seed.precursor_tol_ppm != d.search_seed.precursor_tol_ppm {
-            dead.push("search_seed.precursor_tol_ppm");
-        }
-        if self.rt_im_train.tolerance_regime != d.rt_im_train.tolerance_regime {
-            dead.push("rt_im_train.tolerance_regime");
-        }
-        if self.extract.k_select != d.extract.k_select {
-            dead.push("extract.k_select");
-        }
-        if self.extract.max_fragment_charge != d.extract.max_fragment_charge {
-            dead.push("extract.max_fragment_charge");
-        }
-        if self.extract.scan_scale != d.extract.scan_scale {
-            dead.push("extract.scan_scale");
-        }
-        if self.digest.decoy.source != d.digest.decoy.source {
-            dead.push("digest.decoy.source");
-        }
-        if self.digest.decoy.ratio != d.digest.decoy.ratio {
-            dead.push("digest.decoy.ratio");
-        }
-        for k in &dead {
-            eprintln!(
-                "config warning: `{k}` is set but not implemented in the engine; it has no effect"
-            );
-        }
         Ok(())
     }
 
@@ -1237,7 +1129,6 @@ mod tests {
         let back: Config = serde_json::from_str(&j).unwrap();
         assert_eq!(back.digest.min_len, 5);
         assert_eq!(back.features.set, FeatureSet::Minimal);
-        assert_eq!(back.rt_im_train.tolerance_regime, ToleranceRegime::Fixed);
         assert_eq!(back.search_seed.top_n_peaks, 300);
     }
 
