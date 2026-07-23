@@ -11,8 +11,7 @@
 //! are skipped: the `Evidence` struct carries only `seq_len`, not the stripped
 //! sequence or the ProForma modification list, so their evidence is unavailable.
 use super::Evidence;
-
-const PROTON_MASS: f64 = 1.007276466812;
+use mumdia_core::constants::PROTON;
 
 pub const NAMES: &[&str] = &[
     "log_seed_hyperscore",
@@ -49,7 +48,7 @@ pub fn values(e: &Evidence) -> Vec<f64> {
     let charge_is_4plus = if e.charge >= 4 { 1.0 } else { 0.0 };
     // Neutral monoisotopic precursor mass. Guard nonsensical charge (<=0).
     let precursor_mass = if e.charge > 0 {
-        (e.precursor_mz - PROTON_MASS) * (e.charge as f64)
+        (e.precursor_mz - PROTON) * (e.charge as f64)
     } else {
         0.0
     };

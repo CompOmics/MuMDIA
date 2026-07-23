@@ -270,9 +270,22 @@ fn assign_rt(p: &PredictFragParams, raws: &mut [Raw]) -> Result<String> {
                 }
             }
             let out = sidecar::run_deeplc(python, &script, p.work_dir, &ids, &peps)?;
+            let mut n_irt_missing = 0u64;
             for r in raws.iter_mut() {
                 let uid = uniq[&r.peptidoform];
-                r.irt = *out.get(&uid).unwrap_or(&0.0);
+                match out.get(&uid) {
+                    Some(&v) => r.irt = v,
+                    None => {
+                        r.irt = 0.0;
+                        n_irt_missing += 1;
+                    }
+                }
+            }
+            if n_irt_missing > 0 {
+                tracing::warn!(
+                    n_irt_missing,
+                    "predict-frag: DeepLC returned no iRT for some peptidoforms; anchored at iRT 0.0"
+                );
             }
             Ok("deeplc-4.0-mt".to_string())
         }
