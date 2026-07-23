@@ -246,7 +246,12 @@ pub fn run(p: ConvertParams) -> Result<ConvertOutputs> {
         ],
         p.config_hash,
         elapsed,
-        json!({"mzml": p.mzml, "max_spectra": p.max_spectra}),
+        json!({
+            "mzml": p.mzml,
+            "max_spectra": p.max_spectra,
+            "top_peaks_ms2": p.top_peaks_ms2,
+            "top_peaks_ms1": p.top_peaks_ms1,
+        }),
     )?;
 
     info!(

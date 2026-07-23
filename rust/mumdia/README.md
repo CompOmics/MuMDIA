@@ -28,12 +28,17 @@ run           config + FASTA + mzML    -> all of the above + manifest.json
 inspect       <artifact.parquet>       -> schema + head + row count
 ```
 
+`convert` retains every post-centroiding, positive MS2 peak by default. Seed
+probing independently uses the 300 most intense peaks per scan by default via
+`search_seed.top_n_peaks`; setting `convert --top-peaks-ms2` to a non-zero value
+also truncates the evidence available to extraction and quantification.
+
 ## Build
 
 ```
 cd rust/mumdia
 cargo build --release        # binary at $CARGO_TARGET_DIR/release/mumdia
-cargo test                   # 15 unit + 2 integration tests
+cargo test --workspace --all-targets
 ```
 
 Notes:

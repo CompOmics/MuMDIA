@@ -382,7 +382,8 @@ pub struct SearchSeedConfig {
     /// If > 0, probe only the `top_n_peaks` most intense peaks per MS2 scan
     /// (0 = all peaks). The seed only produces calibration anchors (RT/mass/IM),
     /// which come from abundant peptides, so this cuts the dominant per-peak index
-    /// probing cost with negligible anchor loss.
+    /// probing cost without discarding peaks from the downstream extraction
+    /// artifact. Default 300; set to 0 to probe every converted peak.
     pub top_n_peaks: usize,
     /// Fragment-matcher backend (fragindex_spec). Default `Fragindex`.
     pub matcher: MatcherKind,
@@ -401,7 +402,7 @@ impl Default for SearchSeedConfig {
             fragment_tol_ppm: 20.0,
             report_psms: 5,
             min_matched_peaks: 4,
-            top_n_peaks: 0,
+            top_n_peaks: 300,
             matcher: MatcherKind::Fragindex,
             two_pass_mass_cal: false,
         }
@@ -492,9 +493,10 @@ pub struct ExtractConfig {
     /// minimum simultaneously-present fragments over the consecutive-scan run.
     pub presence_min_coelution: usize,
     /// tier-(d) spectral-agreement gate: reject a candidate whose apex observed
-    /// fragment intensities correlate with the predicted pattern below this
-    /// (Pearson). Applied symmetrically to targets and decoys, it removes
-    /// chimeric false matches so the target-decoy null is valid. 0 disables.
+    /// fragment intensities correlate with the predicted pattern below this.
+    /// Applied symmetrically to targets and decoys, but that alone does not prove
+    /// null exchangeability in chimeric DIA; validate every threshold with an
+    /// independent entrapment. 0 disables.
     pub min_frag_corr: f64,
     /// tier-(c) minimum fraction of the candidate's predicted fragments that
     /// must be observed. With enough predicted fragments (top_n>=~10) this is a
@@ -612,10 +614,12 @@ impl Default for ExtractConfig {
             presence_min_matched: 3,
             presence_min_fragments: 3,
             presence_min_coelution: 2,
-            // Validated defensible regime (holds a ~valid target-decoy FDR):
-            // strict spectral gate on frag_corr. Loosening these raises raw
-            // counts but inflates FDR on chimeric DIA data (see COMPARISON.md).
-            min_frag_corr: 0.5,
+            // Loosening raises recall and candidate volume; external entrapment
+            // validation is required before treating any threshold as FDR-safe.
+            // Relaxed from the historical 0.5 to 0.2 to recover low-abundance
+            // candidates the hard single-scan Pearson gate was dropping
+            // (comment.md S1); still a hard gate, not the soft/budgeted redesign.
+            min_frag_corr: 0.2,
             min_matched_fraction: 0.0,
             apex_top_fragments: 0, // superseded by apex_count_tol; kept for compat
             apex_rt_prior_s: 0.0,  // RT prior off by default
@@ -892,6 +896,11 @@ pub enum QuantQColumn {
     /// Filter on the per-PSM `q_value`. Use for cross-run quant off an
     /// experiment-wide rescore, where the peptide q is global.
     PsmQ,
+    /// Filter on `run_psm_q` (per-run PSM FDR). The correct choice for cross-run
+    /// quant off an experiment-wide rescore: each run's PSMs are FDR-controlled
+    /// within their own run, so quant keeps the right per-run precursors without
+    /// the external `split_scored.py` peptide-q overwrite.
+    RunPsmQ,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1147,6 +1156,15 @@ impl Config {
                     .into(),
             ));
         }
+        if !self.extract.min_frag_corr.is_finite()
+            || !(0.0..=1.0).contains(&self.extract.min_frag_corr)
+        {
+            return Err(Invalid(
+                "extract.min_frag_corr must be finite and in [0, 1] (0 disables \
+                 the gate)."
+                    .into(),
+            ));
+        }
         // Warn (not fail) when a declared-but-unimplemented knob is set away from
         // its default: it silently has no effect, which otherwise misleads tuning.
         let d = Self::default();
@@ -1183,7 +1201,7 @@ impl Config {
     /// Apply a named tuning profile on top of the current config. `dia` is the
     /// validated DIA preset (Extended features + rolling-window apex + RT prior);
     /// the other extraction defaults (emit_window_grid, reverse decoys,
-    /// min_frag_corr) are already the good values. Lets one command reach a
+    /// min_frag_corr) remain conservative baselines. Lets one command reach a
     /// respectable result without hand-authoring the full config JSON.
     pub fn apply_profile(&mut self, name: &str) -> Result<(), crate::error::ConfigError> {
         match name {
@@ -1220,6 +1238,7 @@ mod tests {
         assert_eq!(back.digest.min_len, 5);
         assert_eq!(back.features.set, FeatureSet::Minimal);
         assert_eq!(back.rt_im_train.tolerance_regime, ToleranceRegime::Fixed);
+        assert_eq!(back.search_seed.top_n_peaks, 300);
     }
 
     #[test]
@@ -1235,5 +1254,15 @@ mod tests {
         assert_eq!(c.digest.min_len, 7);
         assert_eq!(c.digest.max_len, 50);
         assert_eq!(c.peptidoforms.charge_max, 3);
+        assert_eq!(c.search_seed.top_n_peaks, 300);
+    }
+
+    #[test]
+    fn explicit_uncapped_seed_and_invalid_gate_are_distinguished() {
+        let c = Config::from_json(r#"{"search_seed":{"top_n_peaks":0}}"#).unwrap();
+        assert_eq!(c.search_seed.top_n_peaks, 0);
+
+        assert!(Config::from_json(r#"{"extract":{"min_frag_corr":-0.1}}"#).is_err());
+        assert!(Config::from_json(r#"{"extract":{"min_frag_corr":1.1}}"#).is_err());
     }
 }

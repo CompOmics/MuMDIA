@@ -33,6 +33,12 @@ convert -> digest -> peptidoforms -> predict-frag -> search-seed ->
 rt-im-train -> extract -> features -> compete -> rescore
 ```
 
+Conversion retains all MS2 peaks by default. The seed search independently probes
+the 300 most intense peaks per scan (`search_seed.top_n_peaks`) because it is used
+only for calibration anchors. A non-zero `convert --top-peaks-ms2` (or the
+corresponding `run` option) irreversibly truncates the normalized spectrum and
+therefore also affects extraction, features, and quantification.
+
 `mumdia run` orchestrates the whole chain on one file and writes a
 `manifest.json`; `mumdia inspect <artifact>` prints schema, head, and row count
 for any Parquet output.

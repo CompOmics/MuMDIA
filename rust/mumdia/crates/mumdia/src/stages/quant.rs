@@ -160,6 +160,7 @@ pub fn run(p: QuantParams) -> Result<(u64, u64)> {
     let pep_q = match p.cfg.q_filter {
         QuantQColumn::PeptideQ => ps.f64("peptide_q_value")?,
         QuantQColumn::PsmQ => ps.f64("q_value")?,
+        QuantQColumn::RunPsmQ => ps.f64("run_psm_q")?,
     };
 
     // Chromatograms grouped by candidate.

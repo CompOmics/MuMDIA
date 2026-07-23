@@ -24,8 +24,12 @@ enum Cmd {
         /// Limit spectra read (0 = all), for fast iteration.
         #[arg(long, default_value_t = 0)]
         max_spectra: usize,
-        /// Keep at most this many MS2 peaks per scan (0 = all).
-        #[arg(long, default_value_t = 300)]
+        /// Keep at most this many MS2 peaks in the normalized artifact (0 = all).
+        ///
+        /// This is an irreversible conversion-time cap that also affects extraction,
+        /// features, and quantification. Use `search_seed.top_n_peaks` for a
+        /// seed-only limit.
+        #[arg(long, default_value_t = 0)]
         top_peaks_ms2: usize,
         /// Keep at most this many MS1 peaks per scan (0 = all).
         #[arg(long, default_value_t = 0)]
@@ -213,7 +217,9 @@ enum Cmd {
         profile: Option<String>,
         #[arg(long, default_value_t = 0)]
         max_spectra: usize,
-        #[arg(long, default_value_t = 300)]
+        /// Irreversible conversion-time MS2 cap (0 = all). Seed-only peak limiting
+        /// is configured by `search_seed.top_n_peaks`.
+        #[arg(long, default_value_t = 0)]
         top_peaks_ms2: usize,
     },
     /// Cross-run RT alignment (experiment-level) -> alignment.parquet.
@@ -376,7 +382,14 @@ fn main() -> Result<()> {
             top_peaks_ms1,
         } => {
             let cfg = load_config(&None)?;
-            let config_hash = mumdia_io::hash::blake3_str(&cfg.canonical_json());
+            // Fold the conversion CLI caps into the convert artifacts' provenance
+            // key: they change the spectra output but are not part of the config, so
+            // two different caps would otherwise produce an identical config_hash
+            // (comment.md A2/C4). The caps are also recorded in the convert report.
+            let config_hash = mumdia_io::hash::blake3_str(&format!(
+                "{}\u{1f}max_spectra={max_spectra}\u{1f}top_peaks_ms2={top_peaks_ms2}\u{1f}top_peaks_ms1={top_peaks_ms1}",
+                cfg.canonical_json()
+            ));
             stages::convert::run(stages::convert::ConvertParams {
                 mzml: &mzml,
                 out_dir: &out_dir,
@@ -664,4 +677,69 @@ fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::{Cli, Cmd};
+    use clap::Parser;
+
+    #[test]
+    fn conversion_caps_default_to_uncapped() {
+        let cli = Cli::try_parse_from([
+            "mumdia",
+            "convert",
+            "--mzml",
+            "run.mzML",
+            "--out-dir",
+            "spectra",
+        ])
+        .unwrap();
+        match cli.cmd {
+            Cmd::Convert {
+                top_peaks_ms2,
+                top_peaks_ms1,
+                ..
+            } => {
+                assert_eq!(top_peaks_ms2, 0);
+                assert_eq!(top_peaks_ms1, 0);
+            }
+            _ => panic!("expected convert command"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "mumdia",
+            "run",
+            "--fasta",
+            "proteome.fasta",
+            "--mzml",
+            "run.mzML",
+            "--out-dir",
+            "out",
+        ])
+        .unwrap();
+        match cli.cmd {
+            Cmd::Run { top_peaks_ms2, .. } => assert_eq!(top_peaks_ms2, 0),
+            _ => panic!("expected run command"),
+        }
+    }
+
+    #[test]
+    fn explicit_conversion_cap_is_preserved() {
+        let cli = Cli::try_parse_from([
+            "mumdia",
+            "convert",
+            "--mzml",
+            "run.mzML",
+            "--out-dir",
+            "spectra",
+            "--top-peaks-ms2",
+            "300",
+        ])
+        .unwrap();
+        match cli.cmd {
+            Cmd::Convert { top_peaks_ms2, .. } => assert_eq!(top_peaks_ms2, 300),
+            _ => panic!("expected convert command"),
+        }
+    }
 }

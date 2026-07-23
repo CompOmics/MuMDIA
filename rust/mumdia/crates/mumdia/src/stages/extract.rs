@@ -1450,8 +1450,13 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
             content_hash: mumdia_io::hash::blake3_file(path)?,
             params: json!({
                 "frag_tol_ppm": p.cfg.frag_tol_ppm,
+                "effective_frag_tol_ppm": frag_tol,
+                "frag_ppm_offset": frag_offset,
                 "presence_min_fragments": p.cfg.presence_min_fragments,
                 "presence_min_coelution": p.cfg.presence_min_coelution,
+                "min_frag_corr": p.cfg.min_frag_corr,
+                "gate_mode": p.cfg.gate_mode,
+                "gate_coelution_min": p.cfg.gate_coelution_min,
                 "scan_window": scan_window,
             }),
             stats: stats.clone(),

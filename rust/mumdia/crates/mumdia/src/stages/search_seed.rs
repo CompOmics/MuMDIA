@@ -248,6 +248,7 @@ pub fn run(p: SearchSeedParams) -> Result<u64> {
             "fragment_tol_ppm": p.cfg.fragment_tol_ppm,
             "report_psms": p.cfg.report_psms,
             "min_matched_peaks": p.cfg.min_matched_peaks,
+            "top_n_peaks": p.cfg.top_n_peaks,
             "fdr_seed": p.cfg.fdr_seed,
         }),
         stats,
@@ -383,4 +384,39 @@ fn seed_fragindex_windows(
 /// Sage-style hyperscore: ln(matched!) + ln(1 + summed matched intensity).
 fn hyperscore(matched: u32, sum_obs: f64) -> f64 {
     ln_factorial(matched) + (1.0 + sum_obs).ln()
+}
+
+#[cfg(test)]
+mod peak_selection_tests {
+    use super::select_peaks;
+    use mumdia_core::types::{IsolationWindow, Ms2Scan, Peak};
+
+    fn scan(n: usize) -> Ms2Scan {
+        Ms2Scan {
+            scan_index: 0,
+            id: "scan=0".into(),
+            rt_seconds: 0.0,
+            window: IsolationWindow {
+                target_mz: 0.0,
+                lower_mz: 0.0,
+                upper_mz: 2_000.0,
+                im_lower: None,
+                im_upper: None,
+            },
+            peaks: (0..n)
+                .map(|i| Peak {
+                    mz: 100.0 + i as f64,
+                    intensity: i as f32,
+                    ion_mobility: None,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn zero_selects_all_and_seed_cap_keeps_only_top_intensity_peaks() {
+        let s = scan(305);
+        assert_eq!(select_peaks(&s, 0), (0..305).collect::<Vec<_>>());
+        assert_eq!(select_peaks(&s, 300), (5..305).collect::<Vec<_>>());
+    }
 }
