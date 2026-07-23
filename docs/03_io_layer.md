@@ -50,8 +50,10 @@ two JSON sidecars.
 ### Artifact schema registry (`mumdia-core/src/schema.rs:7-23`)
 
 Each artifact carries a logical schema name and version so a stage can validate
-its inputs and a model is never applied under a mismatched schema. The tuples
-are `(name, version)`:
+its inputs and a model is never applied under a mismatched schema. They are
+`pub const` tuples in the `artifact` submodule, referenced as
+`mumdia_core::schema::artifact::PEPTIDES` and so on. The tuples are
+`(name, version)`:
 
 | logical name | version | producing stage |
 |---|---|---|
@@ -114,9 +116,12 @@ variants are `ListF32`, `ListF64`, and `LargeListF32`. `LargeListF32`
 (`table.rs:41`) is encoded as an Arrow `LargeList` with 64-bit offsets, needed
 when the total list-value count across all rows can exceed the ~2.1 billion
 limit of a 32-bit `ListArray` offset buffer (for example per-fragment
-chromatograms when extraction accepts a very large candidate set).
+chromatograms when extraction accepts a very large candidate set). The `Opt*`
+variants exist to back conditional and ion-mobility columns under the plan.md
+Section 2 missing-value policy (`table.rs:5-6`); ion-mobility columns are written
+null throughout the 3D MVP.
 
-`Col` has three private helpers used by the writer:
+`Col` has four private helpers used by the writer (all non-`pub`):
 - `name()` (`table.rs:45`): the column name, via a match over every variant.
 - `len()` (`table.rs:64`): the row count of the inner `Vec`.
 - `field()` (`table.rs:83`): the Arrow `Field`. Scalar variants are
@@ -152,15 +157,22 @@ returns the row count as `u64`:
 `Table` (`table.rs:197-201`) holds the `Arc<Schema>`, the `Vec<RecordBatch>`,
 and `nrows`. `Table::read(path)` (`table.rs:204`) opens the file, builds a
 `ParquetRecordBatchReaderBuilder`, captures the schema, then iterates the reader
-collecting every batch and summing `num_rows()`. The whole file is materialized
+collecting every batch and summing `num_rows()`. It errors with context
+`"opening {path}"` if the file cannot be opened and `"reading parquet {path}"` if
+the builder cannot parse the Parquet footer. The whole file is materialized
 into memory; there is no streaming or predicate pushdown.
 
 Column access is by name. `idx(name)` (`table.rs:228`) resolves a name to a
 column index via `schema.index_of`, returning a descriptive error listing all
 column names if the name is absent. The typed getters each downcast every
 batch's column to the concrete Arrow array type and concatenate across batches
-into one `Vec`. They error with `"column '<name>' is not <type>"` if the
-downcast fails, so the type is checked at read time.
+into one `Vec`. They error if the downcast fails, so the type is checked at read
+time. The message wording is per getter: `"column '<name>' is not
+f64|f32|i64|i32|u32|bool"` for the scalar getters (and `opt_f64` reuses the f64
+message), `"column '<name>' is not utf8"` for `str` (note: `utf8`, not `str`),
+and for `list_f32` either `"column '<name>' is not a list"` when the column is
+neither a `List` nor a `LargeList` (`table.rs:419`) or `"list '<name>' inner is
+not f32"` when the inner element array is not f32 (`table.rs:396`).
 
 The getters and their exact null behaviour:
 
@@ -187,8 +199,11 @@ The getters and their exact null behaviour:
 
 `blake3_file(path)` (`hash.rs:8`) streams the file in 64 KiB chunks
 (`[0u8; 1 << 16]`) through a `blake3::Hasher` and returns the hex digest. This
-is the artifact `content_hash`. `blake3_str(s)` (`hash.rs:23`) is a one-shot
-hex digest of a string, used for the `config_hash`. The engine derives the
+is the artifact `content_hash`. It is fallible: it returns `Result` and errors
+with context `"hashing {path}"` if the file cannot be opened or a read fails.
+`blake3_str(s)` (`hash.rs:23`) is a one-shot hex digest of a string, used for the
+`config_hash`; it is infallible and returns a plain `String` rather than a
+`Result`. The engine derives the
 config hash from `Config::canonical_json()` (`config.rs:1116`, a plain
 `serde_json::to_string`), for example at `main.rs:404`. The `convert` command is
 a deliberate exception: because `--max-spectra`, `--top-peaks-ms2`, and
@@ -197,9 +212,26 @@ of `Config`, they are folded into the hash with a unit-separator (`\u{1f}`)
 alongside the canonical config JSON so two different caps do not collapse to the
 same `config_hash` (`main.rs:389-392`).
 
+### JSON (`json.rs`)
+
+Both JSON sidecars (`<artifact>.report.json` and `manifest.json`) and every JSON
+scalar the engine persists go through this module.
+`write_json<T: Serialize>(path, value)` (`json.rs:7`) best-effort-creates the
+parent directory (`create_dir_all(...).ok()`, `json.rs:8-9`, same best-effort
+policy as `write_table`), serializes with `serde_json::to_string_pretty`
+(pretty-printed, human-diffable), and writes the file, erroring with context
+`"writing json {path}"` on an I/O failure.
+`read_json<T: DeserializeOwned>(path)` (`json.rs:16`) is the counterpart used to
+load configs and JSON sidecars back; it errors with context `"reading json
+{path}"` if the file cannot be read and `"parsing json {path}"` if
+deserialization fails. Serialized key order follows the type's serde field order,
+which is why `ArtifactReport.stats` uses a `BTreeMap` (below) to keep key order
+deterministic.
+
 ### Report sidecar (`report.rs`)
 
-`ArtifactReport` (`report.rs:11-24`) is the per-artifact JSON summary. A stage
+`ArtifactReport` (`report.rs:11-24`) is the per-artifact JSON summary; it derives
+`Clone`, `Debug`, `Serialize`, `Deserialize` (`report.rs:10`). A stage
 constructs it and calls `write_for(artifact_path)` (`report.rs:28`), which
 appends `.report.json` to the artifact path and writes it via
 `json::write_json` (pretty-printed). Fields:
@@ -231,9 +263,14 @@ API. Every other stage builds its `ArtifactReport` directly (see the
 ### `record_artifact` and the manifest
 
 `record_artifact(logical_name, schema, path, rows, stage, config_hash)`
-(`lib.rs:20`) builds an `ArtifactRecord` (`manifest.rs:10-20`) for the run
-manifest. It hard-codes `format = "parquet"`, hashes the file with
-`blake3_file`, and copies the schema name/version and the config hash. The
+(`lib.rs:20`) builds an `ArtifactRecord` (`manifest.rs:10-20`, in
+`mumdia_core::manifest`; derives `Clone`/`Debug`/`Serialize`/`Deserialize`) for
+the run manifest. The record has nine fields: `logical_name`, `path`, and `rows`
+are copied straight from the arguments; `format` is hard-coded to `"parquet"`
+(`lib.rs:31`); `schema_name`/`schema_version` come from the `schema` tuple;
+`content_hash` is `blake3_file(path)` of the file just written; `producing_stage`
+comes from the `stage` argument (the struct field and the argument are named
+differently); and `config_hash` is the argument. The
 `run` orchestrator calls it once per artifact and records each into the
 `Manifest` (`stages/run.rs`, many call sites around `record_artifact(...)`),
 which is then serialized to `manifest.json`. Standalone single-stage invocations
@@ -267,6 +304,7 @@ string (`main.rs:658-659`).
 | `write_table` | `table.rs:151` | validate + write one SNAPPY Parquet batch; returns row count |
 | `Table` (struct) | `table.rs:197` | read-back table: schema, batches, nrows |
 | `Table::read` | `table.rs:204` | read a Parquet file fully into memory |
+| `Table::column_names` | `table.rs:224` | schema field names, in order |
 | `Table::f64` / `f32` | `table.rs:234` / `254` | float getters; null -> NaN |
 | `Table::i64`/`i32`/`u32` | `table.rs:274`/`294`/`314` | integer getters; null NOT checked (-> buffer value) |
 | `Table::bool` | `table.rs:334` | bool getter; null NOT checked |
@@ -346,6 +384,13 @@ it. Its behaviour is fixed at compile time:
   `LargeList`, so an artifact whose encoding differs between two builds (32- vs
   64-bit offsets) still reads identically; do not assume a fixed offset width
   when consuming chromatograms.
+- **Test coverage is one round-trip.** The crate's only unit test is
+  `roundtrip_mixed_columns` (`table.rs:430`), which writes then reads back
+  `U32`/`F64`/`Str`/`OptF64`/`ListF32`/`LargeListF32`, asserting among other
+  things that a `LargeListF32` column cross-reads through `list_f32`. `hash.rs`,
+  `json.rs`, `report.rs`, and `lib.rs` (`inspect`, `record_artifact`,
+  `init_logging`) have no unit tests, and the integer/bool null gotcha and the
+  `Opt*`/`ListF64` reader gaps above are consequently not exercised by the suite.
 
 ## How to extend / modify
 

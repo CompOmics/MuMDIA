@@ -46,7 +46,10 @@ recipe").
   minimal: `>` starts a record, the accession is the first whitespace-delimited
   token after `>`, and sequence lines are concatenated and trimmed. There is no
   handling of `*` stop characters or lowercase residues beyond the residue
-  allowlist check applied later.
+  allowlist check applied later. An unreadable FASTA path is the one error case in
+  the parser (`with_context("reading fasta {path}")`, digest.rs:20); a file with no
+  `>` records is not an error, it simply yields zero proteins and an empty (but
+  valid) `peptides.parquet`.
 - Produces: `peptides.parquet` (logical name `peptides`, schema version 1, from
   `artifact::PEPTIDES`, schema.rs:11) plus a sibling `<out>.report.json`
   (`ArtifactReport`, digest.rs:232). Report `stats` carries `n_targets` and
@@ -155,8 +158,13 @@ residue fixed and rewrite the interior `b[..n-1]`:
 1. **Read** the digest table (peptidoforms.rs:70-75).
 2. **Validate modification names up front** (peptidoforms.rs:78-82): every fixed
    and variable mod name is looked up in `unimod_mass` (mass.rs:13); an unknown
-   name is a hard `anyhow::bail!`. This runs once before any row is processed, so
-   a typo fails fast.
+   name is a hard `anyhow::bail!` (message `unknown modification '<name>' in config
+   (fixed/variable)`). This runs once before any row is processed, so a typo fails
+   fast. The `unimod_mass` allowlist (mass.rs:14-24) currently recognizes exactly
+   eight names: `Carbamidomethyl`, `Oxidation`, `Acetyl`, `Phospho`, `Deamidated`,
+   `Methyl`, `Dimethyl`, `Carbamyl`. Any `fixed_mods`/`variable_mods` name outside
+   this set aborts the stage; extending the set is a `mass.rs` edit (see "How to
+   extend").
 3. **Per digest row** (peptidoforms.rs:89): compute `base_peptide_id` as
    `target_id` when it is `>= 0` (the row is a decoy) else the row's own `id`
    (peptidoforms.rs:91-95).
@@ -230,7 +238,11 @@ decoy strategy; `reverse` is independent of the seed.
 
 Config was recently pruned of dead fields in this area. `ResidueMod`
 (config.rs:271) is only `{ residue: char, name: String }`; there is no
-position/terminal specifier field. The doc comment on `residue` mentions `*` for
+position/terminal specifier field. Unlike the enclosing `DigestConfig` /
+`PeptidoformsConfig`, `ResidueMod` carries `#[serde(deny_unknown_fields)]` but
+**not** `#[serde(default)]` (config.rs:269-270), so both `residue` and `name` are
+mandatory in every mod entry; an entry missing either key is a load error rather
+than a defaulted value. The doc comment on `residue` mentions `*` for
 "any / terminal handled separately in MVP", but no such handling exists in the
 code (see gotchas). There is no `DecoySource` field on `DigestConfig` (the
 "dead/unwired config surface" list in CLAUDE.md refers to types elsewhere, not
@@ -320,7 +332,12 @@ here). `DecoyConfig` (config.rs:208) carries only `strategy`.
   `artifact::PEPTIDES` / `artifact::PEPTIDOFORMS` (schema.rs:11-12) and update the
   downstream readers (`Table::read` callers in predict-frag and later stages).
 - **Testing.** Existing unit tests live at the bottom of each file
-  (digest.rs:256, peptidoforms.rs:173) and cover cleavage, decoy C-term/
+  (digest.rs:256, peptidoforms.rs:173): `trypsin_p_cleaves_after_kr`
+  (digest.rs:261) pins Trypsin/P cut sites, `reverse_decoy_keeps_cterm`
+  (digest.rs:280) and `scramble_is_deterministic` (digest.rs:287) pin the fixed
+  C-terminus plus scramble reproducibility, `proforma_places_mods`
+  (peptidoforms.rs:178) pins bracket placement, and `combos_bounded`
+  (peptidoforms.rs:184) pins the subset counts. They cover cleavage, decoy C-term/
   determinism, ProForma placement, and combo bounds. There is no stage-level test
   that round-trips through Parquet or exercises `run` end to end (CLAUDE.md "test
   gaps"); add one when changing the output schema.

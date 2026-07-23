@@ -15,8 +15,11 @@ centroid, AIF/all-ion windows, missing precursor) must be resolved at this stage
 because later stages assume the normalized shape.
 
 The MVP is mzML-only and 3D. Ion-mobility columns are therefore absent from the
-artifacts; the in-memory `Peak`/`IsolationWindow` types carry `Option` IM fields
-that convert always leaves `None` (`crates/mumdia-core/src/types.rs:11`, `:21`).
+artifacts. convert writes no IM columns at all; the in-memory `Peak`/
+`IsolationWindow` types carry `Option` IM fields (`Peak.ion_mobility` at
+`crates/mumdia-core/src/types.rs:12`; `IsolationWindow.im_lower`/`im_upper` at
+`:21`/`:22`), and the read side (`spectra.rs`) fills them with `None`
+(`spectra.rs:71`, `:84-85`).
 
 ## Files
 
@@ -24,7 +27,7 @@ that convert always leaves `None` (`crates/mumdia-core/src/types.rs:11`, `:21`).
 |---|---|
 | `rust/mumdia/crates/mumdia/src/stages/convert.rs` | The whole stage: mzML reading, centroiding, peak capping, window synthesis, artifact writing. |
 | `rust/mumdia/crates/mumdia/src/main.rs` (`Cmd::Convert`, lines 18-37, 377-401) | CLI subcommand; builds the provenance `config_hash` and calls `convert::run`. |
-| `rust/mumdia/crates/mumdia/src/stages/run.rs` (lines 152-158) | The `run` orchestrator's call into convert (top_peaks_ms1 hardcoded to 0). |
+| `rust/mumdia/crates/mumdia/src/stages/run.rs` (lines 152-159) | The `run` orchestrator's call into convert (top_peaks_ms1 hardcoded to 0). |
 | `rust/mumdia/crates/mumdia/src/spectra.rs` | The read-back side: `load_ms1` / `load_ms2` turn the artifacts back into in-memory scans for downstream stages. |
 | `rust/mumdia/crates/mumdia-core/src/schema.rs` (lines 7-10) | Frozen `(logical name, version)` identifiers for the four output artifacts. |
 | `rust/mumdia/crates/mumdia-io/src/table.rs` | `Col` / `write_table` typed Parquet writer used to emit the artifacts. |
@@ -42,8 +45,11 @@ config file (see Configuration).
 Outputs: four Parquet artifacts written to `--out-dir`, each with a sibling
 `<file>.report.json`. All are written with SNAPPY compression via
 `write_table` (`table.rs:151`). List columns (`mz`, `intensity`) are Arrow
-`List<Float32>` with the list field marked nullable, but convert never writes a
-null list; an empty scan is a non-null empty list.
+`List<Float32>` (the `Col::ListF32` variant); both the outer list column and its
+inner `item` element are marked nullable in the Arrow schema (`table.rs:84`
+builds the nullable inner `item` field, `table.rs:98` the nullable list column),
+but convert writes neither as null. An empty scan is a non-null empty list
+(`ListBuilder::append(true)` at `table.rs:124`).
 
 ### `spectra_ms1.parquet` (`SPECTRA_MS1`, schema v1; written at `convert.rs:177`)
 
@@ -116,9 +122,13 @@ reader plus four table writes.
      (`convert.rs:168`), but it still consumed a `scan_index`, so the per-level
      tables have globally unique but non-contiguous indices.
 
-4. **Centroiding** happens inside `peaks_of` (`convert.rs:56`). It first pulls the
-   raw arrays via `spec.raw_arrays()` -> `mzs()` (f64) and `intensities()` (f32)
-   (`convert.rs:57-64`). If `spec.signal_continuity() == SignalContinuity::Profile`
+4. **Centroiding** happens inside `peaks_of` (`convert.rs:56`, generic over
+   `SpectrumLike`). It first pulls the raw arrays via `spec.raw_arrays()` ->
+   `mzs()` (f64) and `intensities()` (f32) (`convert.rs:57-64`). Each access is
+   `.map(|c| c.to_vec()).unwrap_or_default()`, so a spectrum whose `raw_arrays()`
+   is `None`, or that is missing either the m/z or intensity array, degrades to
+   empty vectors and therefore an empty peak list rather than an error. If
+   `spec.signal_continuity() == SignalContinuity::Profile`
    (`convert.rs:65`) it calls `centroid` (`convert.rs:19`); already-centroided
    spectra pass through unchanged. `centroid` does simple local-maxima detection
    with 3-point parabolic m/z refinement:
@@ -141,8 +151,12 @@ reader plus four table writes.
      as a fallback (`convert.rs:47-51`). This is a safety net; a pathological
      profile scan can therefore leak raw profile samples downstream.
 
-5. **Filter, cap, sort** (still in `peaks_of`, `convert.rs:70-83`): drop peaks
-   with intensity `<= 0`. If `top_n > 0` and there are more than `top_n` peaks,
+5. **Filter, cap, sort** (still in `peaks_of`, `convert.rs:70-83`): the m/z and
+   intensity vectors are joined with `mz.into_iter().zip(inten)`
+   (`convert.rs:71-73`), which stops at the shorter of the two, so a length
+   mismatch silently drops the tail of the longer array rather than erroring.
+   Drop peaks with intensity `<= 0`. If `top_n > 0` and there are more than
+   `top_n` peaks,
    sort descending by intensity and truncate to `top_n` (`convert.rs:76-79`).
    Then always sort ascending by m/z (`convert.rs:80`). Finally, cast m/z to
    `f32` for output (`*m as f32`, `convert.rs:81`) while intensity stays `f32`.
@@ -154,14 +168,22 @@ reader plus four table writes.
 6. **Isolation window and precursor resolution** (`convert.rs:142-154`): read
    `spec.precursor()` and clone its `isolation_window`. If a real window is
    present (not both bounds zero), use `(target, lower_bound, upper_bound)`
-   (`convert.rs:145-147`). Otherwise, the AIF / all-ion path synthesizes a
+   (`convert.rs:145-147`); mzdata exposes these three window fields as `f32`, and
+   each is widened with `as f64` before storage, so the stored window columns are
+   f64 even though the source precision is f32. Otherwise, the AIF / all-ion path
+   synthesizes a
    full-range window `(target=0.0, lower=0.0, upper=1.0e6)` (`convert.rs:148-149`).
    This `_` arm fires both when the quadrupole reported a zero-width window
    (AIF/all-ion acquisition) and when there is no precursor at all, so any MS2
    with no usable window is treated as covering the entire m/z range. The
-   downstream `IsolationWindow::covers` then returns true for every fragment
-   (`types.rs:26`). The precursor m/z and charge come from the first precursor ion
-   or are `None` (`convert.rs:151-154`).
+   downstream `IsolationWindow::covers` (inclusive on both bounds) then returns
+   true for every fragment (`types.rs:27`). The precursor m/z and charge come from
+   the first precursor ion
+   or are `None` (`convert.rs:151-154`). Window synthesis and precursor extraction
+   are independent code paths: a scan that reports a zero-width window but still
+   carries a precursor ion gets the synthesized full-range window
+   (`window_target = 0.0`) together with a non-null `precursor_mz`/
+   `precursor_charge`, so `window_target = 0.0` does not imply a null precursor.
 
 7. **Distinct isolation windows** (`convert.rs:187-202`): a `HashMap` keyed by the
    raw bit patterns of `(window_lower, window_upper)` via `f64::to_bits`
@@ -172,11 +194,17 @@ reader plus four table writes.
 
 8. **Write the four tables** (`convert.rs:177-237`) with `write_table`, then
    `write_reports` (`convert.rs:272-294`) emits one `ArtifactReport` per file:
-   logical/schema name and version from `schema.rs`, `stage = "convert"`, row
-   count, a blake3 content hash of the written file, the resolved params
-   (`mzml`, `max_spectra`, `top_peaks_ms2`, `top_peaks_ms1`), and elapsed ms. The
-   function returns `ConvertOutputs` with the four paths for chaining
-   (`convert.rs:264-269`).
+   `logical_name` and `schema_name` both set to the artifact's `schema.0` name
+   (`convert.rs:280-281`), `schema_version` = `schema.1`, `stage = "convert"`, row
+   count, a blake3 content hash of the written file (`convert.rs:285`), the same
+   resolved params for all four (`mzml`, `max_spectra`, `top_peaks_ms2`,
+   `top_peaks_ms1`), and `elapsed_ms` (shared across the four reports, measured
+   once for the whole stage). convert leaves the report's `stats` empty
+   (`Default::default()`, an empty `BTreeMap`) and `model_identity` `None`
+   (`convert.rs:287-288`), since it applies no model and computes no summary
+   distributions. The report is written next to the artifact as
+   `<artifact>.report.json` (`report.rs:28-31`). The function returns
+   `ConvertOutputs` with the four paths for chaining (`convert.rs:264-269`).
 
 Note the artifacts are written in acquisition order. RT-sorting is deferred to the
 read side: `spectra::load_ms1` / `load_ms2` sort by `rt_seconds` after loading
@@ -195,13 +223,18 @@ read side: `spectra::load_ms1` / `load_ms2` sort by `rt_seconds` after loading
 | `artifact::SPECTRA_MS1/_MS2/ISOLATION_WINDOWS/MS2_TO_MS1` | `schema.rs:7-10` | Frozen `(name, version)` schema identifiers, all v1. |
 | `Col` / `write_table` | `table.rs:23` / `table.rs:151` | Typed columns and the SNAPPY Parquet writer; validates equal lengths and rejects duplicate names. |
 | `ArtifactReport` | `report.rs:11` | The report struct written next to each artifact. |
-| `load_ms2` / `load_ms1` | `spectra.rs:20` / `spectra.rs:97` | Read-back into `Ms2Scan` / `Ms1Scan`, RT-sorted, m/z widened to f64. |
+| `load_ms2` / `load_ms1` | `spectra.rs:20` / `spectra.rs:97` | Read-back into `Ms2Scan` / `Ms1Scan`, RT-sorted, m/z widened to f64; per-scan peak count is `mf.len().min(iff.len())` (`spectra.rs:65`), tolerant of an m/z vs intensity length mismatch. |
+| `Ms1Scan` / `Ms2Scan` | `spectra.rs:12` / `types.rs:55` | Read-back structs. `Ms1Scan` (scan_index, rt_seconds, mz, intensity) is defined in `spectra.rs`, not `types.rs`; `Ms2Scan` (adds `id`, `window`, `peaks`) is in `types.rs`. |
 
 ## Configuration
 
-convert reads no `Config` fields. It is driven entirely by CLI arguments
+convert reads no `Config` fields, and its subcommand has no `--config` flag
 (`main.rs:18-37`). The stage function signature does not take a `Config`; the
-`config_hash` it receives is only recorded for provenance.
+`config_hash` it receives is only recorded for provenance. The CLI wrapper still
+loads the default config via `load_config(&None)` (`main.rs:384`) purely to seed
+that hash: `config_hash = blake3(cfg.canonical_json() + separators + caps)`
+(`main.rs:389-392`), so the default config's canonical JSON is embedded in the
+hash even though no config field alters the output.
 
 | CLI flag | Default | Effect |
 |---|---|---|
@@ -266,6 +299,17 @@ here, not a config toggle.
   `spectra.rs` sorts) would panic on NaN. Convert filters intensity `<= 0` before
   sorting and does not sort on m/z NaN in practice, so this is safe for real mzML
   but is a latent trap if malformed data ever reaches it.
+- **Out-dir creation errors are swallowed.** `std::fs::create_dir_all(p.out_dir)
+  .ok()` (`convert.rs:105`) discards a creation failure; a genuinely unwritable
+  out-dir does not fail here but surfaces later as a file-create error from
+  `write_table` (`table.rs:185`).
+- **Observability.** The stage is otherwise side-effect-free apart from its file
+  writes; it emits two `tracing::info!` records, one on open
+  (`convert.rs:106`) and one on completion carrying the MS1/MS2/window counts and
+  `elapsed_ms` (`convert.rs:257-263`).
+- **`elapsed_ms` is shared, not per-artifact.** A single `Instant` started at
+  `convert.rs:104` times the whole stage; the same value is written into all four
+  `report.json` sidecars, so per-artifact timing cannot be read from them.
 - **Test coverage.** Only the two CLI-parsing tests above exercise this area. The
   centroiding math, window synthesis, and artifact writing have no stage-level
   unit test (see CLAUDE.md "test gaps"). MS1 extraction and mass-calibration paths

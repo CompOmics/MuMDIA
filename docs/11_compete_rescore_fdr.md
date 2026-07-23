@@ -32,6 +32,7 @@ variants alive so the rescorer and FDR have a valid null to work against.
 | `rust/mumdia/crates/mumdia/src/stages/rescore.rs` | `rescore` stage: input concat, classifier dispatch, multi-context q-values, scored table |
 | `rust/mumdia/crates/mumdia/src/rescoring.rs` | `percolator_lite`, the native semi-supervised linear rescorer (the `native_tda` path) |
 | `rust/mumdia/crates/mumdia/src/fdr.rs` | q-value kernels: `target_decoy_q`, `entrapment_q`, `count_targets_at_q`, `validate_labels`, `ln_factorial` |
+| `rust/mumdia/crates/mumdia-core/src/rejection.rs` | `RejectionReason` codes; compete's audit `rejection_reason` uses `code()` |
 | `rust/mumdia/crates/mumdia-core/src/config.rs` | `CompeteConfig`, `CompetitionMode`, `CompeteGroupBy`, `RescoreConfig`, `RescorerKind` |
 | `scripts/mokapot_worker.py` | Mokapot PIN sidecar (`RescorerKind::Mokapot`) |
 | `scripts/nn_rescore_worker.py` | PyTorch MLP PIN sidecar (`RescorerKind::NnTorch`) |
@@ -61,8 +62,15 @@ Optional sidecar `<out>.compete_audit.parquet` (only when
 `compete.emit_competition_audit = true`, compete.rs:138-180): one row per removed
 candidate with `candidate_id` (u32), `label` (str), `peptidoform` (str),
 `winner_candidate_id` (u32), `loser_prelim` (f64), `winner_prelim` (f64),
-`rejection_reason` (str; `outcompeted_by_decoy` or `outcompeted_by_target` from
-`RejectionReason::code()`).
+`rejection_reason` (str). The reason string is `RejectionReason::code()`
+(rejection.rs:50), which is `SCREAMING_SNAKE_CASE`, so the two values written here
+are `OUTCOMPETED_BY_DECOY` and `OUTCOMPETED_BY_TARGET` (rejection.rs:64-65), not
+lowercase. The reason is keyed on the **loser's own label** (`reason_of`,
+compete.rs:139-145): a removed decoy is `OUTCOMPETED_BY_DECOY`, a removed target is
+`OUTCOMPETED_BY_TARGET`. Because competition is within-label, the winner shares the
+loser's label, so this equivalently describes the winner. `RejectionReason`
+(rejection.rs:19-45) has 17 variants spanning the whole loss ladder; compete only
+ever emits these two.
 
 ### rescore
 
@@ -82,11 +90,40 @@ the protein-accession-set string, a duplicate of `protein`), `pg_q_value` (f64),
 `global_q_value` (f64, byte-identical alias of `q_value`), `prelim_score` (f64),
 `source` (u32, index into `--competed` identifying the run), `run_psm_q` (f64),
 `experiment_psm_q` (f64, alias of `q_value`), `precursor_q` (f64). Plus
-`<out>.report.json` recording the classifier actually used and the 1% counts.
+`<out>.report.json` whose `params` records `classifier` (the path actually taken),
+`folds`, `num_iter`, `train_fdr` (rescore.rs:368), `model_identity` (e.g.
+`native-percolator-lite-v1`, `mokapot`, `nn-torch-semisup-sidecar-v1`,
+`entrapment-gbm-sidecar-v1`, `native-percolator-lite-entrapment-v1`,
+rescore.rs:98-99, 370), and `stats` records `psms`, `classifier`,
+`target_psms_at_1pct`, `target_peptides_at_1pct`, `target_protein_groups_at_1pct`,
+`target_precursors_at_1pct`, plus `entrapment_ratio` and
+`entrapment_peptides_at_1pct` in entrapment mode (rescore.rs:350-360).
 
-Sidecar working files are written under `--work-dir`: `rescore.pin` and
-`rescore_sidecar_out.parquet` for the PIN sidecars, `entrapment_in.parquet` /
-`entrapment_out.parquet` for the entrapment GBM (rescore.rs:518-519, 581-582).
+Sidecar working files are written under `--work-dir` (created with
+`create_dir_all`, rescore.rs:517, 580). Two distinct file contracts exist:
+
+- **PIN sidecars** (`RescorerKind::Mokapot`, `RescorerKind::NnTorch`): input
+  `rescore.pin` (Percolator tab format), output `rescore_sidecar_out.parquet`
+  (rescore.rs:581-582). The PIN header is `SpecId  Label  ScanNr  ExpMass
+  CalcMass  <features...>  Peptide  Proteins` (rescore.rs:585-587); each row is
+  `psm_{i}`, `Label` = `-1` for a decoy else `+1` (rescore.rs:595), `ScanNr` = `i`
+  (the flat row index), `ExpMass` = `CalcMass` = `precursor_mz` (5 decimals),
+  the feature columns in schema order (6 decimals), `Peptide` = `-.<peptidoform>.-`,
+  `Proteins` = `<protein>` (rescore.rs:594-601). The worker echoes the SpecId tail
+  as a `candidate_id` column (here the row index `i`) and emits a `score` column;
+  scores are mapped back by row index and a missing row gets the worst score
+  (`min - 1.0`, rescore.rs:625-630).
+- **Entrapment GBM** (`RescorerKind::Entrapment` with `rescore.python` set): input
+  `entrapment_in.parquet`, output `entrapment_out.parquet` (rescore.rs:518-519).
+  The input parquet columns are `row_id` (u32, the flat row index used for
+  score readback), `candidate_id` (u32), `base_peptide_id` (u32), `is_entrapment`
+  (i32, 0/1), `is_decoy` (i32, 0/1), then the feature columns in schema order
+  (f64) (rescore.rs:521-534). The worker is invoked as
+  `python entrapment_worker.py <in> <out> <folds>` (rescore.rs:537-543, `folds`
+  from `cfg.folds`); it reads back `row_id` (u32) + `score` (f64), maps by
+  `row_id`, and a missing row gets `min - 1.0` (rescore.rs:549-555). Both sidecars
+  are run with `PYTHONUTF8=1` and a non-zero exit is a hard error
+  (rescore.rs:544-545, 618-619).
 
 ## How it works
 
@@ -135,9 +172,11 @@ the winner as the highest `prelim_score`, ties broken by smallest row index
   from `unique_evidence` (compete.rs:218-232): prefers an explicit
   `unique_fragment_count` column, else approximates it as
   `n_matched_fragments * (1 - contested_frac)` clamped to [0,1], else raw
-  `n_matched_fragments`, else `None`. If the mode is selected but no column is
-  available it warns and falls back to winner-take-all (compete.rs:100-105,
-  281 `.unwrap_or(false)`).
+  `n_matched_fragments`, else `None`. Each of those columns is read through
+  `col_f64` (compete.rs:235-241), which accepts either an f64 or an i32 encoding,
+  so an integer-typed fragment count is handled without a schema mismatch. If the
+  mode is selected but no column is available it warns and falls back to
+  winner-take-all (compete.rs:100-105, 281 `.unwrap_or(false)`).
 - `MarginGated`: keep the winner; remove a loser only when
   `prelim[win] - prelim[m] >= margin`, otherwise keep it (compete.rs:288-300).
   Conservative removal for the low-FDR region.
@@ -160,7 +199,14 @@ repeats across runs, so an experiment-wide table would collide on it
 Immediately after loading, `crate::fdr::validate_labels` (rescore.rs:89) rejects
 any label that is not exactly `"target"` or `"decoy"`. `is_decoy` is derived at
 rescore.rs:90; entrapment status is derived separately from the protein string by
-`classify_entrapment` (rescore.rs:91, 411).
+`classify_entrapment` (rescore.rs:91, 411). Its exact rule (rescore.rs:422-436): a
+decoy is neither entrapment nor real; a non-decoy is `is_entrapment` when its
+protein **contains** `entrapment_marker` **and** (no `entrapment_exclude` set, or
+the protein does not contain it) **and** the protein matches none of
+`entrapment_contaminant_markers`; every other non-decoy is a real target. When
+`entrapment_marker` is `None` nothing is entrapment and every non-decoy is real.
+The contaminant carve-out exists so genuine contaminants living inside the spike-in
+proteome (keratins, albumin) are not mislabeled as false negatives.
 
 The classifier is dispatched on `RescoreConfig::classifier` (rescore.rs:104-192).
 The stage tracks `classifier_used`, `model_identity`, and `qmode` so the report
@@ -190,6 +236,15 @@ reflects the path actually taken rather than the requested one (rescore.rs:97-99
 - Final score for each test row is `score_row(w, std_row(...))` written back by
   original index (rescoring.rs:173-186). Weights start at zero and there is no
   RNG, so the whole path is deterministic.
+- **The result vector is seeded with `init_score` (the `prelim_score`)**
+  (rescoring.rs:181). Only rows a fold actually scores are overwritten, so any row
+  a fold cannot cover retains its prelim score. A fold whose training or test set
+  is empty produces nothing and is skipped (rescoring.rs:117-119); this happens
+  when a `fold_key` bucket is empty, e.g. very few peptides or all peptides landing
+  in one fold. `folds` is clamped to at least 1 (rescoring.rs:103) and `num_iter`
+  to at least 1 (rescoring.rs:129), so degenerate config still runs one fold and
+  one iteration. `fit_standardizer` divides by `idx.len().max(1)` (rescoring.rs:15)
+  so an empty index does not divide by zero.
 
 **`RescorerKind::Mokapot`** (config.rs:132): runs `mokapot_worker.py` through
 `run_pin_sidecar` (rescore.rs:105-119, 563). On success it uses the returned
@@ -332,6 +387,7 @@ counts feed a hyperscore-style term; `n` is small so the naive loop is fine.
 | `compete::run` | compete.rs:28 | full compete stage: group, resolve, write competed table + optional audit |
 | `compete::resolve_competition` | compete.rs:247 | pure per-mode within-group resolution; returns kept indices + removal pairs |
 | `compete::unique_evidence` | compete.rs:218 | derive per-candidate unique-fragment evidence for `UniqueEvidence` mode |
+| `compete::col_f64` | compete.rs:235 | read a numeric column as f64, accepting an f64 or i32 encoding |
 | `CompeteParams` | compete.rs:21 | `features`, `out`, `cfg`, `config_hash` |
 | `rescore::run` | rescore.rs:41 | full rescore stage: concat, dispatch, multi-context q, scored table |
 | `rescore::native_scores` | rescore.rs:386 | thin wrapper calling `percolator_lite` with the config knobs |
@@ -345,6 +401,9 @@ counts feed a hyperscore-style term; `n` is small so the naive loop is fine.
 | `RescoreInput` | rescoring.rs:85 | features, is_decoy, fold_key, init_score, folds, num_iter, train_fdr |
 | `fit_standardizer` | rescoring.rs:14 | per-fold mean/std over training rows only (leak-free) |
 | `logreg_fit` | rescoring.rs:48 | full-batch GD logistic regression with L2, weight[0]=bias |
+| `std_row` | rescoring.rs:42 | standardize one feature row with a fold's mean/std |
+| `score_row` | rescoring.rs:77 | linear discriminant `w[0] + sum(w[j+1]*r[j])` |
+| `RejectionReason` | rejection.rs:19 | loss-ladder reason codes; compete emits `OUTCOMPETED_BY_{TARGET,DECOY}` |
 | `target_decoy_q` | fdr.rs:7 | `(D+1)/T` monotonized tied-block q from `(score, is_decoy)` |
 | `entrapment_q` | fdr.rs:64 | `(ratio*E+1)/R` monotonized tied-block entrapment q |
 | `count_targets_at_q` | fdr.rs:110 | count non-decoy records at or below a q threshold |
@@ -376,7 +435,7 @@ unless a knob is set.
 | field | default | effect |
 |---|---|---|
 | `classifier` | `native_tda` | which rescorer (`RescorerKind`, config.rs:128): `native_tda`, `mokapot`, `nn_torch`, `percolator` (unwired), `entrapment` |
-| `folds` | `3` | CV folds (native + PIN sidecars via env) |
+| `folds` | `3` | CV folds: native `percolator_lite`, PIN sidecars via `MUMDIA_NN_FOLDS` env (rescore.rs:614), entrapment GBM via positional arg (rescore.rs:541) |
 | `train_fdr` | `0.01` | q threshold for the confident-positive set in the semi-supervised loop |
 | `num_iter` | `10` | semi-supervised iterations for the native rescorer |
 | `python` | `None` | interpreter for the Mokapot/NnTorch/entrapment sidecars; required for those paths |
@@ -400,6 +459,11 @@ unless a knob is set.
   (fdr.rs:27-43, 82-99). Within-tie order is arbitrary and must not change the q.
 - **`native_tda` is fully deterministic**: zero-initialized weights, no RNG,
   per-fold work is order-independent even under rayon (rescoring.rs:112-186).
+- **A row a fold cannot score keeps its `prelim_score`.** `percolator_lite` seeds
+  its output with `init_score` and only overwrites rows a fold actually scores
+  (rescoring.rs:181-186); an empty train/test fold is skipped (rescoring.rs:117-119).
+  So the discriminant `score` is a mix of learned scores and, for uncovered rows,
+  the raw prelim. This is the intended safe fallback, not a bug.
 - **`nn_torch` is nondeterministic** and has a **scaler leak** (standardization
   fit over the full matrix, not per fold; `nn_rescore_worker.py:134-137,159-170`).
   Do not treat its scores as reproducible; do not use it where byte-identity is

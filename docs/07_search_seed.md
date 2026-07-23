@@ -68,8 +68,14 @@ DeepLC fine-tune (`run.rs:182-208`).
 ### Produced
 
 **`seed_psms.parquet`** (schema id `seed_psms` v1, `schema.rs:15`), one row per
-candidate that matched at least `min_matched_peaks` fragments in at least one
-scan, sorted by `candidate_id`. Written at `search_seed.rs:217-234`:
+candidate that, in at least one scan, both cleared `min_matched_peaks` and ranked
+within that scan's top `report_psms` (the per-scan hyperscore sort is truncated to
+`report_psms` *before* the best-per-candidate fold, `search_seed.rs:85`/`:346`, so
+a candidate that always ranks below `report_psms` gets no row even if it cleared
+`min_matched_peaks`). Rows are sorted by `candidate_id`. Written at
+`search_seed.rs:217-234`. The `ArtifactReport` records `logical_name` =
+`schema_name` = `"seed_psms"`, `schema_version = 1`, and `stage = "search-seed"`
+(`search_seed.rs:241-244`):
 
 | column | type | meaning |
 |---|---|---|
@@ -91,23 +97,39 @@ scan, sorted by `candidate_id`. Written at `search_seed.rs:217-234`:
 
 | key | type | meaning |
 |---|---|---|
-| `frag_ppm_offset` | f64 | median matched-fragment ppm deviation (systematic offset) |
+| `frag_ppm_offset` | f64 | median signed ppm of `observed_peak` relative to `predicted_fragment` (`ppm_diff(peak_mz, fmz)`), i.e. the systematic offset |
 | `frag_tol_ppm` | f64 | learned tolerance: `max(5.0, 1.5 * P95(|dev - offset|))` |
 | `frag_ppm_sigma` | f64 | duplicate of `frag_tol_ppm` (the learned tolerance is the local mass-uncertainty estimate) |
-| `n_dev` | usize | number of matched-fragment deviations collected |
+| `n_dev` | usize | number of fragment-to-nearest-peak deviations collected (`devs.len()`) |
 | `cal_passes` | int | 0 (fallback, too few devs), 1 (single pass), or 2 (robust second pass) |
 
+Only `frag_ppm_offset` and `frag_tol_ppm` are consumed downstream (by `extract`,
+`extract.rs:624-628`). `frag_ppm_sigma`, `n_dev`, and `cal_passes` are written but
+read by no consumer (grep-confirmed); they are diagnostic / audit fields. The
+deviations are not the postings matched during scoring: for every confident target
+PSM a fresh nearest-peak search over the candidate's full library fragment list is
+run at its best scan (see step 6), so `n_dev` counts fragment-to-peak pairs, not
+matched hyperscore postings.
+
 **`<out>.report.json`** (`ArtifactReport`, `search_seed.rs:240-258`): rows,
-content hash, `params` (`fragment_tol_ppm`, `report_psms`, `min_matched_peaks`,
-`top_n_peaks`, `fdr_seed`), a `stats` map (`psms`, `targets_at_q<fdr_seed>`),
-`model_identity = "native-seed-hyperscore-v1"`, and `elapsed_ms`.
+`content_hash` (blake3 of the output Parquet, `search_seed.rs:246`), `params`
+(`fragment_tol_ppm`, `report_psms`, `min_matched_peaks`, `top_n_peaks`,
+`fdr_seed`; note `matcher` and `two_pass_mass_cal` are *not* recorded in `params`),
+a `stats` map (`psms`, and `targets_at_q<fdr_seed>` whose key is the float-
+formatted threshold, e.g. `targets_at_q0.01`), `model_identity =
+"native-seed-hyperscore-v1"`, and `elapsed_ms`.
 
 ## How it works
 
 Entry point: `search_seed::run(SearchSeedParams)` (`search_seed.rs:45-267`).
 
 **1. Load** the library (`Library::load`, `index.rs:55`) and MS2 scans
-(`load_ms2`), then log candidate and scan counts (`search_seed.rs:47-49`).
+(`load_ms2`, `spectra.rs:20`), then log candidate and scan counts
+(`search_seed.rs:47-49`). `load_ms2` sorts the returned `Vec<Ms2Scan>` by
+`rt_seconds` ascending (`spectra.rs:92`); this RT ordering is what makes the
+within-group strictly-greater update deterministic (earliest-RT wins a tie). It
+does **not** re-sort each scan's peaks: peak m/z order is inherited from `convert`
+(see the mass-cal invariant below).
 
 **2. Build the matcher.** When `cfg.matcher == Fragindex` (the default), a
 `FragIndex` is built once over the whole library at `cfg.fragment_tol_ppm`
@@ -139,9 +161,21 @@ index via `page_search` and needs no separate build.
   `(count, obs_sum)` into a `HashMap`. Same `min_matched_peaks` filter, hyperscore,
   sort, `report_psms` truncation, and best-per-candidate update.
 
+Both paths skip a scan whose candidate range is empty (`hi <= lo`,
+`search_seed.rs:65-67` / `:325-327`), so out-of-library-range windows cost nothing.
 Both accumulate `obs_sum` as the summed **observed** peak intensity of matched
 postings; the predicted fragment intensity is deliberately discarded in the seed
 (`fragindex.rs:185-190`, and the `_pi`/`_mz` discards at `search_seed.rs:73`).
+
+The two backends do **not** use the same tolerance-edge predicate, so their matched
+sets (and therefore ID counts) can differ slightly on the same data. The fragindex
+`probe_peak` verifies with `within_ppm` (min-relative, symmetric about the smaller
+mass, f64; `constants.rs:92`), while the bucketed `page_search` matches inside
+`ppm_bounds(peak, tol)` (query/observed-relative, f32-truncated bounds;
+`index.rs:253-272`). The mass-cal deviation collection uses a third convention,
+`ppm_diff` (theoretical/predicted-relative; `constants.rs:66`). Do not assume the
+three are interchangeable at the edge; `config.rs:34-39` records that the
+predicate difference shifts IDs more on the AIF full-range-window case.
 
 **Hyperscore** (`search_seed.rs:385-387`):
 
@@ -174,14 +208,21 @@ PSM (`!is_decoy && q <= fdr_seed`, `:152`), each library fragment m/z of that
 candidate (`lib.cand_frags(cid)`, `index.rs:208`) is searched against the best
 scan's peaks inside a **hardcoded 50 ppm window** (`ppm_bounds(fmz, 50.0)`,
 `:158`; `partition_point` finds the low edge, then a linear scan to the high edge).
-The nearest peak by absolute m/z distance contributes one signed ppm deviation
-(`ppm_diff(peak_mz, fmz)`, `constants.rs:66`) to `devs` (`:156-173`). The 50 ppm
-net is deliberately wider than `fragment_tol_ppm` so a systematic offset larger
-than the tolerance can still be measured.
+This `partition_point` + linear scan **assumes `scan.peaks` is m/z-ascending**;
+`load_ms2` does not re-sort peaks by m/z (`spectra.rs:20-93`), so the assumption
+rests on `convert` writing peaks in m/z order. The nearest peak by absolute m/z
+distance contributes one signed ppm deviation (`ppm_diff(peak_mz, fmz)`,
+`constants.rs:66`) to `devs` (`:156-173`). Every library fragment of the candidate
+is probed, not only those that matched during scoring, so a fragment that found no
+scoring posting can still supply a calibrant. The 50 ppm net is deliberately wider
+than `fragment_tol_ppm` so a systematic offset larger than the tolerance can still
+be measured.
 
 The fit closure (`:178-185`) takes deviations, sorts them, takes the median as the
-offset, then sets `tol = max(5.0, 1.5 * P95(|dev - offset|))` using
-`calibrate::percentile(.., 0.95)`. Control flow (`:186-203`):
+offset (`sorted[len/2]`, the upper-middle element for even-length inputs, not the
+two-element average), then sets `tol = max(5.0, 1.5 * P95(|dev - offset|))` using
+`calibrate::percentile(.., 0.95)` (nearest-rank on `round(p*(n-1))`,
+`calibrate.rs:154-162`). Control flow (`:186-203`):
 
 - `devs.len() < 20`: fallback, `(0.0, fragment_tol_ppm, cal_passes = 0)` (no
   offset, tolerance unchanged).
@@ -209,7 +250,7 @@ matching tolerance (falling back to the config value if the file is absent).
 | name | file:line | what it does |
 |---|---|---|
 | `run` | `search_seed.rs:45` | stage entry point; orchestrates load, score, q, masscal, write |
-| `SearchSeedParams` | `search_seed.rs:27` | input struct (ms2/library paths, cfg, bucket_size, config_hash) |
+| `SearchSeedParams` | `search_seed.rs:27` | input struct (`ms2`, `library_precursors`, `library_fragments`, `out` output-path prefix, `cfg`, `bucket_size`, `config_hash`) |
 | `Best` | `search_seed.rs:37` | per-candidate best `{ score, rt, matched, scan_index }` |
 | `seed_fragindex_windows` | `search_seed.rs:297` | parallel per-window fragindex scoring + deterministic merge |
 | `select_peaks` | `search_seed.rs:272` | top-N-by-intensity peak selection, re-sorted to index order |
@@ -223,7 +264,9 @@ matching tolerance (falling back to the config value if the file is absent).
 | `target_decoy_q` | `fdr.rs:7` | tied-block, monotonized `(n_decoys+1)/max(1,n_targets)` q |
 | `count_targets_at_q` | `fdr.rs:110` | target count at or below a q threshold |
 | `ln_factorial` | `fdr.rs:132` | `ln(n!)` via summed logs |
-| `ppm_diff` / `ppm_bounds` | `constants.rs:66` / `:78` | signed ppm and ppm window bounds |
+| `ppm_diff` / `ppm_bounds` | `constants.rs:66` / `:78` | signed ppm (theoretical-relative) and ppm window bounds (query-relative) |
+| `within_ppm` | `constants.rs:92` | min-relative tolerance predicate used by the fragindex match (differs at the edge from the two above) |
+| `load_ms2` | `spectra.rs:20` | reads `spectra_ms2.parquet` into `Vec<Ms2Scan>`, RT-sorted |
 | `percentile` | `calibrate.rs:154` | nearest-rank percentile (used for the tolerance) |
 
 ## Configuration
@@ -248,19 +291,31 @@ window, the `min 5.0 ppm` tolerance floor, the `1.5 * P95` scale, and the `>= 20
 deviation threshold are hardcoded in `search_seed.rs` (`:158`, `:183`, `:186`),
 not config fields.
 
+The standalone subcommand `Cmd::SearchSeed` (`main.rs:71-82`, dispatch `:441-459`)
+takes `--ms2`, `--library-precursors`, `--library-fragments`, `--out`, and
+`--config` (all `String`; `--config` optional). There is no `--bucket-size` flag;
+`bucket_size` is read from the resolved config's `extract.bucket_size`
+(`main.rs:456`).
+
 ## Invariants, determinism, gotchas
 
 - **Determinism** (PLAN.md Section 7): the fragindex parallel path is bit-identical
-  to the serial best-per-candidate. Groups run in `BTreeMap` key order, within a
-  group scans run in file (RT-ascending) order with a strictly-greater update, and
-  the cross-group merge is a total order (`max score`, tie earliest RT, tie min
-  scan_index; `search_seed.rs:365-381`). `select_peaks` re-sorts the top-N back to
-  index-ascending (`:283`) so the `obs_sum` float reduction is summed in a fixed
-  order. The `HashMap` is only ever reduced through this total order, never
+  to the *serial fragindex* best-per-candidate (this is a parallel-vs-serial claim
+  about the same backend, not a fragindex-vs-bucketed claim; the two backends use
+  different edge predicates, see the accumulation section). Groups run in `BTreeMap`
+  key order, within a group scans run in RT-ascending order (guaranteed by
+  `load_ms2`'s `sort_by rt_seconds`, `spectra.rs:92`) with a strictly-greater
+  update, and the cross-group merge is a total order (`max score`, tie earliest RT,
+  tie min scan_index; `search_seed.rs:365-381`). `select_peaks` re-sorts the top-N
+  back to index-ascending (`:283`) so the `obs_sum` float reduction is summed in a
+  fixed order. The `HashMap` is only ever reduced through this total order, never
   iterated for a float sum.
-- **Best-per-candidate, not best-per-spectrum.** One output row per candidate that
-  ever cleared `min_matched_peaks`. Ties in the update use strictly-greater
-  (`score > entry.score`, `:93` and `:354`), so the earliest-RT scan wins a tie.
+- **Best-per-candidate, not best-per-spectrum.** One output row per candidate that,
+  in at least one scan, cleared `min_matched_peaks` **and** ranked within that
+  scan's top `report_psms` (the per-scan sort is truncated before the fold). A
+  candidate below `report_psms` in every scan it appears in is dropped. Ties in the
+  update use strictly-greater (`score > entry.score`, `:93` and `:354`), so the
+  earliest-RT scan wins a tie.
 - **Library decoys only.** `label` comes straight from `Candidate::is_decoy`
   (`:129`); the stage never mints decoys. The target-decoy null therefore depends on
   the library carrying paired decoys (see the DIA-NN library recipe / `digest`).
@@ -272,9 +327,17 @@ not config fields.
 - **The 50 ppm mass-cal window is fixed** and independent of `fragment_tol_ppm`; it
   is intentionally wide so a systematic error larger than the scoring tolerance is
   still observable. Do not tie it to `fragment_tol_ppm`.
+- **Mass-cal assumes m/z-sorted peaks.** The deviation search uses
+  `scan.peaks.partition_point(|pk| pk.mz < lo)` + a linear scan to the high edge
+  (`search_seed.rs:159-169`), which is only correct if `scan.peaks` is m/z-ascending.
+  `load_ms2` sorts scans by RT but never re-sorts peaks (`spectra.rs:20-93`), so the
+  invariant is inherited from `convert`. The fragindex scoring path does not need
+  it (it bins each peak independently); only mass-cal relies on it.
 - **`config_hash` is carried but unused** inside `run` (part of `SearchSeedParams`
-  for call-site uniformity, `search_seed.rs:34`); the report hash is the content
-  hash of the output file, not this value.
+  for call-site uniformity, `search_seed.rs:34`). In the standalone CLI it is
+  `blake3_str(cfg.canonical_json())` (`main.rs:449`); in the `run` orchestrator it
+  is the shared chain hash `ch` (`run.rs:178`). Either way the report's
+  `content_hash` is the blake3 of the output Parquet, not this value.
 - **`top_n_peaks` is seed-only.** It caps the probe set to reduce index probing on
   the dominant cost, but abundant peptides supply the calibration anchors anyway;
   the downstream `extract` stage still sees all converted peaks.
@@ -284,10 +347,14 @@ not config fields.
   can be computed once and reused across the DeepLC fine-tune boundary
   (`run.rs:182-208`).
 - **Test coverage.** Only `select_peaks` has a unit test here
-  (`search_seed.rs:389-422`); `target_decoy_q`/`ln_factorial` are tested in
-  `fdr.rs` and the index in `fragindex.rs`. There is no stage-level test for
-  `search_seed::run`, the masscal output, or the bucketed vs fragindex equivalence
-  at the stage level (see CLAUDE.md "test gaps").
+  (`zero_selects_all_and_seed_cap_keeps_only_top_intensity_peaks`,
+  `search_seed.rs:389-422`), asserting `top_n = 0` returns all indices and
+  `top_n = 300` over 305 peaks keeps only the top-intensity `5..305` re-sorted to
+  index order. `target_decoy_q` (tied-block, `+1` conservatism) and `ln_factorial`
+  are tested in `fdr.rs` (`:140-198`); the fragindex match, epoch reset, precursor
+  gate, and the naive-equivalence gate are tested in `fragindex.rs` (`:280-444`).
+  There is no stage-level test for `search_seed::run`, the masscal output, or
+  bucketed-vs-fragindex equivalence at the stage level (see CLAUDE.md "test gaps").
 
 ## How to extend / modify
 

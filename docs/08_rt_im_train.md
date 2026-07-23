@@ -97,12 +97,21 @@ rt_im_train.rs:196-208). Fields:
 | `calibration_status` | `"loess"`, `"linear"`, or `"fallback_fixed"` |
 
 **`<run_windows>.report.json`** (`ArtifactReport`, rt_im_train.rs:215-227) records
-rows, content hash, params (`q_train`, `p_rt`, `method`), and stats (`n_train`,
-`w_rt`, `calibration_status`).
+`logical_name`/`schema_name`/`schema_version` (all from `artifact::RUN_WINDOWS`),
+`stage = "rt-im-train"`, rows, the blake3 content hash of `run_windows.parquet`,
+params (`q_train`, `p_rt`, `method` as the `Debug` form of `calibration_method`),
+stats (`n_train`, `w_rt`, `calibration_status`), and `elapsed_ms`. `model_identity`
+is `None` (this stage applies no serialized model, rt_im_train.rs:224). Params
+`stats` is a `BTreeMap`, so its key order is stable.
 
 ## How it works
 
-The stage entry point is `run(p: RtImTrainParams)` (rt_im_train.rs:28).
+The stage entry point is `run(p: RtImTrainParams)` (rt_im_train.rs:28). Standalone
+it is invoked as `mumdia rt-im-train --seed-psms <p> --library-precursors <p>
+--out-windows <p> --out-cal <p> [--config <p>]` (the `RtImTrain` subcommand,
+main.rs:84-95, dispatched at main.rs:460-477); the `run` orchestrator calls the
+same `run` function directly (run.rs:212-219). Both call sites build the config
+hash and pass it as `config_hash`, but the stage never reads it (see gotchas).
 
 ### 1. Join iRT to candidates
 
@@ -157,13 +166,20 @@ The math:
   walking outward from the insertion point (calibrate.rs:110-127), assigns each a
   tricubic weight `w = (1 - d^3)^3` with `d = |x_i - x0| / dmax` (calibrate.rs:
   131-137), and solves a weighted least-squares line, returning the fitted value
-  at `x0`. If the weighted system is degenerate it falls back to the global line
-  (calibrate.rs:145-147).
+  at `x0`. `dmax` is the larger of the two window-edge distances, floored at
+  `1e-12` to avoid a zero divide (calibrate.rs:128), and the weight is exactly 0
+  when `d >= 1.0` (calibrate.rs:132-137), so anchors past the window edge do not
+  contribute. If the weighted system is degenerate, meaning `sw < 1e-12` (all
+  weights vanished) or `sw*swxx - swx^2` near zero (calibrate.rs:144-147), it
+  falls back to the global line.
 - **`Loess::predict`** (calibrate.rs:87-102) uses the linear fallback for `x` at or
-  outside the grid ends (calibrate.rs:89-94) and otherwise linearly interpolates
-  between the two bracketing grid nodes found by `partition_point`
-  (calibrate.rs:95-101). Interpolating a precomputed grid makes bulk application
-  over the whole library cheap.
+  outside the grid ends, and also when the grid has fewer than 2 nodes
+  (calibrate.rs:89-94), and otherwise linearly interpolates between the two
+  bracketing grid nodes found by `partition_point` (calibrate.rs:95-101). When the
+  two bracketing nodes are within `1e-12` in `x` it returns the lower node's `y`
+  rather than interpolating, guarding against a zero divide (calibrate.rs:98-99).
+  Interpolating a precomputed grid makes bulk application over the whole library
+  cheap.
 
 ### 4. Derive the RT window
 
@@ -185,15 +201,21 @@ downstream. The fixed fallback avoids that collapse.
 
 When `adaptive_rt_window` is set (and `n_train >= min_anchors`), the global
 `w_rt` is replaced by a per-bin half-width (rt_im_train.rs:120-153). Anchors are
-binned into `adaptive_rt_bins` equal-width bins over the calibrated-RT range; each
-bin's half-width is its local residual percentile times the multiplier, clamped to
-`[rt_window_min_s, fallback_rt_window_s]` (rt_im_train.rs:134-146). Empty bins fall
-back to the global `w_rt` (rt_im_train.rs:139-140). Each candidate then takes the
-width of the bin its calibrated RT lands in (rt_im_train.rs:165-171). The rationale
-(config.rs:393-402): a single fixed window is simultaneously too wide for
-well-calibrated regions and too narrow for poorly-calibrated ones. This knob is
-part of the sensitivity program and has not passed the entrapment gate, so it stays
-default-off.
+binned into `nb = adaptive_rt_bins.max(1)` equal-width bins over the
+calibrated-RT range (rt_im_train.rs:126), with the bin index computed from
+`frac = ((cal - rt_min)/span).clamp(0.0, 0.999_999)` so the maximum RT lands in
+the last bin rather than out of range (rt_im_train.rs:131-132). Each bin's
+half-width is its local residual percentile times the multiplier, clamped to
+`[lo_clamp, hi_clamp]` where `lo_clamp = rt_window_min_s.max(0.0)` and
+`hi_clamp = fallback_rt_window_s.max(lo_clamp)` (rt_im_train.rs:134-146). Empty
+bins fall back to the global `w_rt` (rt_im_train.rs:139-140). Each candidate then
+takes the width of the bin its calibrated RT lands in (rt_im_train.rs:165-171).
+Degenerate case: when all calibrated anchor RTs are equal (`rt_max <= rt_min`) the
+adaptive block yields `None` and the stage silently uses the global `w_rt`
+(rt_im_train.rs:127, 148-150). The rationale (config.rs:393-402): a single fixed
+window is simultaneously too wide for well-calibrated regions and too narrow for
+poorly-calibrated ones. This knob is part of the sensitivity program and has not
+passed the entrapment gate, so it stays default-off.
 
 ### 6. Apply to every candidate and write
 
@@ -209,6 +231,10 @@ This is not part of `rt_im_train::run`; it runs in the `run` orchestrator betwee
 `search-seed` and Stage B, guarded by `cfg.rt_im_train.finetune_deeplc`
 (run.rs:187-208). Preflight (`run.rs:63-68`) rejects `finetune_deeplc` unless
 `predict_frag.deeplc_python` names a Python interpreter with DeepLC 4.0 multitask.
+The seed PSMs are searched once on the base library before the fine-tune and are
+reused as-is (the search-seed hyperscore does not depend on iRT), so the fine-tune
+and Stage B both consume that same seed table; only the library's `predicted_irt`
+is rewritten in between (run.rs:182-186).
 
 When enabled, the orchestrator resolves `deeplc_finetune.py`
 (`sidecar::resolve_script`), writes a fine-tuned library
@@ -216,20 +242,47 @@ When enabled, the orchestrator resolves `deeplc_finetune.py`
 Stage B and `extract` read the fine-tuned iRT (run.rs:187-208). The fine-tune is
 driven through `run_deeplc_finetune` (sidecar.rs:106-129), whose positional CLI
 contract is `deeplc_finetune.py <lib_in> <seed> <lib_out> --epochs E --patience P
---q-train Q --batch B`. The worker runs with `PYTHONUTF8=1` because DeepLC/Keras
-crash on the Windows cp1252 console (sidecar.rs:173-182).
+--q-train Q --batch B`. The worker runs with both `PYTHONUTF8=1` and
+`PYTHONIOENCODING=utf-8` set (the `utf8` flag on `run_worker`, sidecar.rs:174-182)
+because DeepLC/Keras crash on the Windows cp1252 console. `run_worker` spawns
+`python script arg...` and returns an error if the process exits non-zero
+(sidecar.rs:183-189); there is no JSON request file, only argv plus the parquet
+column contract.
 
 Inside the worker (`scripts/deeplc_finetune.py`): the reference set is the
 confident target seed PSMs (`label == "target"`, `spectrum_q <= q_train`, standard
-residues only), one observed RT per peptidoform (deeplc_finetune.py:97-109). The
-batch size auto-scales when `--batch 0`: `min(512, max(16, n_ref // 30))`, so each
-epoch runs at least about 30 gradient steps; a fixed large batch underfits small
-references (deeplc_finetune.py:111-117). `deeplc.finetune` transfer-learns the
-model (deeplc_finetune.py:128), and predictions are made on the DECOY_-stripped
-underlying sequence so decoys land on the same iRT scale as targets
-(deeplc_finetune.py:44, 135-154). The rewritten column overwrites `predicted_irt`
+residues only via `is_std`, deeplc_finetune.py:100-104). Note the gate is `<=`
+q_train here, whereas the Rust anchor selection uses strict `<` q_train
+(rt_im_train.rs:53), so the two reference sets can differ by the boundary rows.
+The worker keys the reference dict by `peptidoform` string (`ref[pf] = observed_rt`,
+deeplc_finetune.py:99-104), so it joins seed to library by peptidoform, not by
+`candidate_id` as the Rust stage does, and it keeps one RT per peptidoform by
+last-write-wins in iteration order rather than best-score. The batch size
+auto-scales when `--batch 0`: `min(512, max(16, n_ref // 30))`, so each epoch runs
+at least about 30 gradient steps; a fixed large batch underfits small references
+(deeplc_finetune.py:111-117). `deeplc.finetune(ref_psms, train_kwargs=...)`
+transfer-learns the model (deeplc_finetune.py:119-129); predictions come from
+`deeplc.predict(batch, model=ft_model)` over the unique standard peptidoforms in
+chunks of 100_000 (deeplc_finetune.py:138-154). DeepLC 4.0 multitask returns a 2D
+array (one column per task head); `agg` reduces it to one iRT by averaging across
+heads (`a.mean(axis=1)`, deeplc_finetune.py:48-50, 151). Prediction is on the
+DECOY_-stripped underlying sequence so decoys land on the same iRT scale as targets
+(deeplc_finetune.py:44, 135-158). The rewritten column overwrites `predicted_irt`
 in place in the output parquet (deeplc_finetune.py:156-159); peptidoforms with no
-prediction keep their original iRT (deeplc_finetune.py:156).
+prediction, including non-standard ones, keep their original iRT
+(`preds.get(base_pf(pf), orig[i])`, deeplc_finetune.py:156).
+
+The worker also carries a documented OpenMP crash fix: numpy's OpenBLAS (GNU
+OpenMP) and torch's Intel OpenMP coexist only under `KMP_DUPLICATE_LIB_OK=TRUE`,
+and each spawns a full thread pool that oversubscribes the CPU during the
+sustained backward pass and crashes the machine, so the worker pins OMP/BLAS to 1
+thread and bounds torch to `DEEPLC_FT_THREADS` (default 8) before importing numpy
+and torch (deeplc_finetune.py:6-13, 22-28, 82-91). `deeplc` is imported before
+numpy for OpenMP load order (deeplc_finetune.py:32). Beyond the four flags the
+engine passes, the worker accepts standalone-only flags the engine never sets, so
+they take their defaults: `--device {cpu,cuda}` (cuda sidesteps the CPU OpenMP
+crash entirely), `--threads`, `--max-ref`, `--predict-limit`, and `--skip-predict`
+(deeplc_finetune.py:58-76).
 
 The fine-tune sets no torch/numpy seed, so it is nondeterministic across runs
 (CLAUDE.md notes this). Its main use is library-input mode, where the base iRT is
@@ -240,14 +293,14 @@ per-run fine-tune materially tightens the RT window.
 
 | name | file:line | what it does |
 |---|---|---|
-| `RtImTrainParams` | rt_im_train.rs:19-26 | Input struct: seed PSMs path, library precursors path, output windows + cal paths, config, config hash. |
+| `RtImTrainParams` | rt_im_train.rs:19-26 | Input struct: seed PSMs path, library precursors path, output windows + cal paths, config, config hash. `config_hash` is a field but `run` never reads it (dead param; see gotchas). |
 | `rt_im_train::run` | rt_im_train.rs:28-231 | The stage: join iRT, select anchors, fit, window, apply, write. |
 | `linear_fit` | calibrate.rs:6-28 | OLS `y = slope*x + intercept` with degenerate-case guards. |
 | `Loess` | calibrate.rs:31-37 | Grid-based local-linear smoother; carries a linear fallback for extrapolation. |
 | `Loess::fit` | calibrate.rs:42-83 | Sorts anchors, builds a `grid_n`-point local-linear grid, `k = clamp(ceil(span*n),3,n)`. |
 | `Loess::predict` | calibrate.rs:87-102 | Grid interpolation inside range, linear extrapolation outside. |
 | `local_linear` | calibrate.rs:107-151 | Tricubic-weighted local least squares at one point. |
-| `percentile` | calibrate.rs:154-162 | Nearest-rank percentile: sorts a copy, `rank = round(p*(len-1))`. Not interpolated. |
+| `percentile` | calibrate.rs:154-162 | Nearest-rank percentile: sorts a copy, `rank = round(p.clamp(0,1)*(len-1))`. Not interpolated. Empty input returns 0.0. |
 | `CalibrationMethod` | config.rs:66-77 | Enum `{ Loess, Linear, None }`; default `Loess`. `None` is rejected at load. |
 | `RtImTrainConfig` | config.rs:362-427 | All Stage B config fields (below). |
 | `run_deeplc_finetune` | sidecar.rs:106-129 | Sidecar client: `deeplc_finetune.py <lib_in> <seed> <lib_out> [flags]`. |
@@ -321,6 +374,27 @@ though the enum variant still exists.
   a known correctness wart (see CLAUDE.md "Correctness").
 - **Report schema version is 1** (`artifact::RUN_WINDOWS`, schema.rs:16). Bump it if
   the column set changes.
+- **`config_hash` is a dead param in this stage.** Both call sites build the blake3
+  config hash and pass it as `RtImTrainParams.config_hash` (run.rs:218,
+  main.rs:475), but `run` never reads it (unlike stages that stamp it into their
+  report). Do not rely on the report to carry the config hash for Stage B.
+- **Anchor gate is `<`, fine-tune gate is `<=`.** The Rust anchor selection keeps
+  seed rows with `spectrum_q < q_train` (rt_im_train.rs:53), while the DeepLC
+  fine-tune worker keeps `spectrum_q <= q_train` (deeplc_finetune.py:102). The two
+  confident-seed reference sets can therefore differ by the boundary rows. Keep this
+  in mind when reasoning about why the fine-tune reference count and the calibration
+  anchor count are not identical.
+- **Fine-tune joins by peptidoform, Stage B joins by `candidate_id`.** The stage
+  maps seed to library iRT through `candidate_id` (rt_im_train.rs:61); the worker
+  maps seed observed RT to library peptidoforms through the `peptidoform` string
+  (deeplc_finetune.py:99-104, 156). A library whose peptidoform strings do not match
+  the seed's would silently fine-tune on nothing.
+- **Test coverage.** `calibrate.rs` has three unit tests: `linear_recovers_line`
+  (calibrate.rs:168-174), `loess_tracks_nonlinear` (calibrate.rs:176-183), and
+  `percentile_basic` (calibrate.rs:185-189). The stage `rt_im_train.rs` itself has
+  no unit or integration test (consistent with CLAUDE.md's noted stage-test gap);
+  its anchor selection, window derivation, and adaptive path are exercised only in
+  full runs.
 
 ## How to extend / modify
 

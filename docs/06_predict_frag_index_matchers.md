@@ -94,12 +94,22 @@ DeepLC.
 
 Each artifact also gets an `ArtifactReport` (`predict_frag.rs:219-238`) recording
 row count, blake3 content hash, params (`top_n`, `ms2pip_model`, `rt_predictor`,
-`fragment_predictor`), and `model_identity` (the concatenated RT + fragment model
-ids, `predict_frag.rs:114`).
+`fragment_predictor`), a shared `stats` map (`candidates`, `fragments`,
+`parse_errors`, `predict_frag.rs:215-218`), and `model_identity` (the concatenated
+RT + fragment model ids, `predict_frag.rs:114`). Both reports share the same
+`stats`/`model_identity`; only `rows` differs per artifact (`predict_frag.rs:228`).
+The schema ids are the constants `artifact::FRAGMENT_LIBRARY_PRECURSORS` /
+`artifact::FRAGMENT_LIBRARY_FRAGMENTS` (`schema.rs:13-14`). `run` itself returns
+`(n_prec, n_frag)` (`predict_frag.rs:50,241`).
 
 The library-input path (`--lib-precursors`/`--lib-fragments`) skips Stage C and
 feeds externally built Parquet with these exact schemas directly into
 `Library::load`.
+
+`predict_frag::run` is driven by `PredictFragParams` (`predict_frag.rs:24-31`):
+`peptidoforms` (input path), `out_precursors` / `out_fragments` (the two output
+paths), `cfg` (`&PredictFragConfig`), `work_dir` (scratch dir for sidecar
+Parquet), and `config_hash` (carried for provenance).
 
 ## How it works
 
@@ -124,7 +134,10 @@ prediction for are anchored at `irt = 0.0` and counted; if any are missing a
 `tracing::warn!` fires (`predict_frag.rs:284-289`). This is the DeepLC-miss iRT
 warning: it makes the silent "unmatched peptidoform gets iRT 0.0" failure visible,
 because an iRT-0 anchor collapses the RT window onto the gradient origin and
-misplaces the candidate at extraction.
+misplaces the candidate at extraction. The DeepLC branch requires `deeplc_python`
+and errors otherwise (`predict_frag.rs:255-259`); its returned model id is the
+hardcoded string `"deeplc-4.0-mt"` (`predict_frag.rs:290`), not a trait
+`identity()` (the sidecar path has no `RtPredictor` impl to query).
 
 **intensity assignment** (`assign_intensities`, `predict_frag.rs:296`). Native
 path calls `NativeFrag::predict_intensities`. MS2PIP path runs the sidecar over
@@ -136,7 +149,14 @@ values (TIC-fraction scale, roughly 0.02-0.3) and the native charge-2 fallback
 (max-normalized, roughly 0.19-0.5) live on different scales, so each charge group
 is max-normalized to its own peak before they compete for top-N slots
 (`predict_frag.rs:344-359`); otherwise the larger-scale group would always win the
-truncation. A candidate MS2PIP returns nothing for falls back wholesale to native.
+truncation. There are two distinct MS2PIP-miss fallbacks: a candidate MS2PIP
+returns nothing for (absent from the map, or an empty per-candidate map) falls
+back wholesale to native (`predict_frag.rs:361-363`), whereas a single charge-1
+fragment whose `(ion_byte, ordinal)` key MS2PIP omits gets intensity `0.0`, not
+the native value (`unwrap_or(&0.0)`, `predict_frag.rs:333`); a fragment at
+`0.0` can then be dropped by top-N. MS2PIP requires `ms2pip_python` and errors
+otherwise (`predict_frag.rs:306-310`); its model id is `format!("ms2pip-{model}")`
+(`predict_frag.rs:366`).
 
 **top-N and candidate_id** (`predict_frag.rs:119-137`). For each candidate,
 fragments are ranked by predicted intensity descending, truncated to
@@ -150,38 +170,98 @@ the whole subsystem: `candidate_id` is the dense precursor-m/z rank, which is wh
 lets the index recover the isolation-window candidate slice by binary search and
 lets `candidate_id` directly index the dense accumulator.
 
+### The native predictor models (`predict.rs`)
+
+Both native fallbacks are deterministic and Python-free, so the engine runs with
+zero external dependencies. `NativeRt` (`predict.rs:55-70`) sums a self-derived
+per-residue hydrophobicity coefficient (`rt_coeff`, `predict.rs:27-53`, clean-room,
+not a borrowed vector), adds `0.01 * mod_mass` per modified residue, and adds a
+`sqrt(length)` term so very long peptides do not elute infinitely late; `identity`
+is `native-rt-v1`. `NativeFrag` (`predict.rs:75-105`) weights y ions at 1.0 and b
+ions at 0.75, scales by a mid-sequence positional factor `1 - 0.5*|ordinal-L/2|/(L/2)`
+(mid-sequence fragments are more intense), halves charge-2 fragments, then
+max-normalizes the whole vector to its peak; `identity` is `native-frag-v1`. The
+predictor traits `RtPredictor` / `FragmentPredictor` (`predict.rs:13-22`) each
+expose `predict*` plus `identity`; only the native structs implement them (the
+sidecar paths bypass the traits and emit their own id strings, above).
+
+### The sidecar file contract (`sidecar.rs`)
+
+Sidecars follow a positional-CLI Parquet contract (no JSON request file): write an
+input Parquet, invoke `python script arg...`, read an output Parquet keyed by id.
+
+- `run_ms2pip` (`sidecar.rs:37-74`): input columns `id` (u32), `peptidoform`
+  (str), `charge` (i32); output columns `id`, `ion_type` (str), `ordinal` (i32),
+  `intensity` (f32). Returns `candidate_id -> (ion_byte, ordinal) -> intensity`;
+  `ion_byte` is the first byte of `ion_type` (`b'?'` if empty, `sidecar.rs:68`).
+  Argv is `[input, output, model]` (`sidecar.rs:58`).
+- `run_deeplc` (`sidecar.rs:77-101`): input columns `id`, `peptidoform`; output
+  columns `id`, `predicted_rt` (f32). Returns `id -> predicted_rt`. Argv is
+  `[input, output]`.
+- `run_deeplc_finetune` (`sidecar.rs:106-129`): fine-tunes the DeepLC RT model on
+  the confident seed PSMs and rewrites the library's `predicted_irt` in place.
+  Positional contract `deeplc_finetune.py <lib_in> <seed> <lib_out> --epochs E
+  --patience P --q-train Q --batch B`. Invoked by `run` between search-seed and RT
+  calibration, not by predict-frag.
+- `run_mbr` (`sidecar.rs:136-170`): match-between-runs transfer (Stage D3, needs
+  >= 2 runs). Positional contract `mbr_worker.py <scored_combined> <psms_csv>
+  <out_transferred> [flags]`, where `psms_csv` is the per-run psms paths joined by
+  `,` in `source` order; optional `--out-scored`, and `--frag-csv` /
+  `--consensus-corr-min` only when fragments are supplied and the threshold is > 0.
+- `run_worker` (`sidecar.rs:174-190`) is the shared launcher; it bails if the
+  process exits non-zero. `utf8 = true` sets `PYTHONUTF8=1` and
+  `PYTHONIOENCODING=utf-8` (DeepLC/Keras/torch crash on the Windows cp1252 console);
+  it is on for the DeepLC and fine-tune calls, off for MS2PIP and MBR.
+
 ### Library load and the bucketed inverted index (`index.rs:55`)
 
-`Library::load` reads both Parquet artifacts and rebuilds the per-candidate
-fragment arrays grouped and contiguous (`index.rs:100-128`), so `cand_frags(cid)`
-is a slice (`index.rs:208-213`). It then builds the bucketed inverted index
-(`index.rs:158-187`):
+`Library::load(precursors, fragments, bucket_size)` reads both Parquet artifacts
+and rebuilds the per-candidate fragment arrays grouped and contiguous
+(`index.rs:100-128`), so `cand_frags(cid)` returns three parallel slices
+(m/z, predicted intensity, name) for one candidate (`index.rs:208-213`);
+`n_candidates()` is the candidate count (`index.rs:203`). Each row becomes a
+`Candidate` (`index.rs:23-36`) with `candidate_id`, `peptidoform_id`,
+`base_peptide_id`, `peptidoform`, `charge`, `precursor_mz`, `predicted_irt`,
+`protein`, `frag_start`/`n_frag` (the slice bounds into the flat fragment arrays),
+and `is_decoy`, which is derived from the `label` string (`label == "decoy"`,
+`index.rs:122`); the string label is not otherwise retained. `load` then builds
+the bucketed inverted index (`index.rs:158-187`):
 
 1. Emit one `(frag_mz as f32, candidate_id, frag_int)` entry per fragment.
 2. Globally sort entries by fragment m/z with `par_sort_by` (parallel stable
    sort, identical result to the serial stable sort, `index.rs:169`).
-3. Chunk the sorted entries into fixed buckets of `bucket_size`; record each
-   bucket's first (== minimum) m/z in `bucket_min`; within each bucket sort by
-   `candidate_id` (`index.rs:172-178`).
+3. Chunk the sorted entries into fixed buckets of `bucket_size` (floored at 1 via
+   `bucket_size.max(1)`, `index.rs:172`); record each bucket's first (== minimum)
+   m/z in `bucket_min`; within each bucket sort by `candidate_id`
+   (`index.rs:172-178`).
 4. Split into the three parallel arrays `idx_mz`/`idx_cid`/`idx_int`.
 
-`page_search` (`index.rs:242`) probes this index for an observed neutral m/z `q`:
-`ppm_bounds(q, tol_ppm)` gives the query window `[lo, hi]` (cast to f32); a
-`partition_point` over `bucket_min` selects the buckets overlapping the window
-(`index.rs:258-260`); within each bucket, because `idx_cid` is ascending, two
-`partition_point` calls narrow to the `[cand_lo, cand_hi)` slice
-(`index.rs:266-268`); a linear tail applies the exact f32 m/z bound
-(`index.rs:269-275`). `candidate_range` (`index.rs:233`) turns an isolation window
-into `[lo, hi)` over `prec_mz` by two `partition_point`s.
+`page_search` (`index.rs:242`) probes this index for an observed neutral m/z `q`.
+It early-returns on a degenerate window or empty index (`cand_hi <= cand_lo ||
+idx_mz.is_empty()`, `index.rs:250-252`). Otherwise `ppm_bounds(q, tol_ppm)` gives
+the query window `[lo, hi]` (cast to f32); the first bucket is
+`partition_point(|m| m <= lo32).saturating_sub(1)` and the last is
+`partition_point(|m| m <= hi32)` over `bucket_min` (`index.rs:258-260`); within
+each bucket, because `idx_cid` is ascending, two `partition_point` calls narrow to
+the `[cand_lo, cand_hi)` slice (`index.rs:266-268`); a linear tail applies the
+exact f32 m/z bound (`index.rs:269-275`). `candidate_range` (`index.rs:233`) turns
+an isolation window into `[lo, hi)` over `prec_mz` by two `partition_point`s (`m <
+win_lo` for `lo`, `m <= win_hi` for `hi`, so `win_hi` is inclusive and `win_lo`
+exclusive).
 
 ### The fragindex CSR matcher (`matchers/fragindex.rs`, fragindex_spec Section 2-3)
 
 `FragIndex::build` (`fragindex.rs:46`) is a two-pass counting sort into a CSR
-layout keyed by log-space bin. `LogBins::new` (`binning.rs:27`) precomputes the
-geometry: `delta = tol_ppm * 1e-6`, bin width `w = ln(1 + delta)`, `inv_w`,
-`ln_min`, and `n_bins = floor(span * inv_w) + 2` (the `+2` pads the top so
-`bin+1` never overflows). `LogBins::bin` (`binning.rs:43`) maps m/z to
-`floor((ln(mz) - ln_min) * inv_w)`, clamped to `[0, n_bins-1]`. Pass 1 counts
+layout keyed by log-space bin. It first derives the m/z range by scanning
+`lib.frag_mz` for the min and max (`fragindex.rs:61-70`); if the library is empty
+(no finite bound) it falls back to `[1.0, 2.0]` (`fragindex.rs:71-74`), and it
+clamps the arguments to `LogBins::new` so `mz_min >= 1.0` and `mz_max > mz_min`
+(`fragindex.rs:75`). `LogBins::new` (`binning.rs:27`) asserts `mz_min > 0 &&
+mz_max >= mz_min` and precomputes the geometry: `delta = tol_ppm * 1e-6`, bin
+width `w = ln(1 + delta)`, `inv_w`, `ln_min`, and `n_bins = floor(span * inv_w)
++ 2` (the `+2` pads the top so `bin+1` never overflows). `LogBins::bin`
+(`binning.rs:43`) maps m/z to `floor((ln(mz) - ln_min) * inv_w)`, clamped to
+`[0, n_bins-1]` (m/z <= 0 or <= `mz_min` maps to bin 0). Pass 1 counts
 per-bin occupancy with the `+1` counting-sort offset (`fragindex.rs:83-86`); a
 prefix sum turns counts into CSR start offsets (`fragindex.rs:88-90`); pass 2
 scatters postings in candidate-id order (`fragindex.rs:98-110`) so `post_cand` is
@@ -189,18 +269,37 @@ ascending within every bin. Postings are Structure-of-Arrays
 (`post_cand`/`post_mz`/`post_int`/`post_frag`) so the verify hot loop streams only
 `post_mz`.
 
-`probe_peak` (`fragindex.rs:152`) probes bins `bin(peak)-1 ..= bin(peak)+1`
-(clamped, `fragindex.rs:162-165`), narrows each bin to `[cand_lo, cand_hi)` by
-binary search over the ascending `post_cand` (`fragindex.rs:172-174`), and
-verifies each posting with the exact `within_ppm` predicate in f64
-(`fragindex.rs:176-179`). `SeedScratch` (`fragindex.rs:191`) is the epoch-stamped
+`FragIndex` keeps its own copy of `prec_mz` and exposes `n_cand()`
+(`fragindex.rs:125`), `tol_ppm()` (`fragindex.rs:129`), and a `candidate_range`
+(`fragindex.rs:137-141`) with the same `[lo, hi)` semantics as
+`Library::candidate_range`, so a caller holding only the index can still narrow to
+the isolation window. `probe_peak` (`fragindex.rs:152`) early-returns on a
+degenerate window (`cand_hi <= cand_lo`, `fragindex.rs:159`), then probes bins
+`bin(peak)-1 ..= bin(peak)+1` (clamped, `fragindex.rs:162-165`), narrows each bin
+to `[cand_lo, cand_hi)` by binary search over the ascending `post_cand`
+(`fragindex.rs:172-174`), and verifies each posting with the exact `within_ppm`
+predicate in f64 (`fragindex.rs:176-179`). Its callback receives `(cid,
+post_mz_f64, post_int, post_frag)`, where `post_frag` is the candidate-local
+fragment ordinal that extract carries through directly (the bucketed path has to
+recover it via `local_frag_index`). `SeedScratch` (`fragindex.rs:191`) is the epoch-stamped
 dense accumulator: `stamp[cc]` records the last epoch a candidate was touched;
 `epoch` is incremented before each scan (`fragindex.rs:221`) and starts at 0 so 0
 is never a live epoch; on first touch the score is zeroed and the candidate pushed
 to `touched` (`fragindex.rs:227-232`); after a scan only touched candidates are
 read. The seed accumulates a fused `(count, obs_sum)` semiring where `obs_sum`
 sums the observed peak intensity per matched posting (predicted intensity
-deliberately discarded, `fragindex.rs:234`).
+deliberately discarded, `fragindex.rs:234`), and exposes the touched set plus
+per-candidate `count(cid)` / `obs_sum(cid)` getters (`fragindex.rs:241-253`).
+
+The free function `score_scan_count_dot` (`fragindex.rs:260`) is a separate,
+non-`SeedScratch` scorer used only by the equivalence gate: it accumulates
+`(count, dot)` per candidate over one scan, where `dot` is the sum over matched
+postings of `predicted_intensity * peak_intensity` (both widened to f64, distinct
+from `SeedScratch`'s observed-only `obs_sum`), collects into a `HashMap`, and
+returns the result sorted by candidate id (`fragindex.rs:275-277`). The `naive`
+band-join scorer (`naive.rs:16`) computes the identical `(count, dot)` under the
+same f32-rounded `within_ppm` predicate (`naive.rs:30-33`), which is what lets the
+gate assert exact Count equality and near-exact Dot equality.
 
 **The +/-1 probe exactness.** The correctness of probing only three bins rests on:
 two m/z values within tolerance differ by at most one bin. Proof sketch: within
@@ -243,26 +342,34 @@ per-thread `SeedScratch` and a deterministic total-order merge
 
 | name | file:line | what it does |
 |---|---|---|
-| `predict_frag::run` | `predict_frag.rs:50` | Stage C entry: parse, fragment, assign intensity/iRT, top-N, sort, write |
-| `assign_rt` | `predict_frag.rs:245` | native or DeepLC iRT; emits the DeepLC-miss warning |
-| `assign_intensities` | `predict_frag.rs:296` | native or MS2PIP intensity with per-charge-group normalization + native charge-2 fallback |
-| `RtPredictor` / `FragmentPredictor` | `predict.rs:13` / `predict.rs:19` | predictor traits (predict + `identity`) |
-| `NativeRt` | `predict.rs:25` | additive retention-coefficient model, `identity` `native-rt-v1` |
-| `NativeFrag` | `predict.rs:73` | heuristic b/y intensity model, max-normalized, `identity` `native-frag-v1` |
-| `resolve_script` | `sidecar.rs:18` | locate a worker script (CWD, exe dir, exe dir/scripts) |
-| `run_ms2pip` | `sidecar.rs:37` | MS2PIP client; returns `cid -> (ion_byte, ordinal) -> intensity` |
-| `run_deeplc` | `sidecar.rs:77` | DeepLC client; returns `id -> predicted_rt` |
+| `PredictFragParams` | `predict_frag.rs:24` | Stage C entry args: in/out paths, `cfg`, `work_dir`, `config_hash` |
+| `predict_frag::run` | `predict_frag.rs:50` | Stage C entry: parse, fragment, assign intensity/iRT, top-N, sort, write; returns `(n_prec, n_frag)` |
+| `Raw` | `predict_frag.rs:34` | one candidate pre-assignment; caches the `ParsedPeptidoform` so RT/intensity reuse the parse |
+| `assign_rt` | `predict_frag.rs:245` | native or DeepLC iRT; emits the DeepLC-miss warning; DeepLC id `"deeplc-4.0-mt"` |
+| `assign_intensities` | `predict_frag.rs:296` | native or MS2PIP intensity with per-charge-group normalization + native charge-2 fallback; MS2PIP id `"ms2pip-{model}"` |
+| `RtPredictor` / `FragmentPredictor` | `predict.rs:13` / `predict.rs:19` | predictor traits (predict + `identity`); implemented only by the native structs |
+| `NativeRt` | `predict.rs:25` | additive retention-coefficient model + `sqrt(len)` + `0.01*mod` term, `identity` `native-rt-v1` |
+| `NativeFrag` | `predict.rs:73` | heuristic b/y intensity model (y=1.0, b=0.75, mid-seq positional, charge-2 x0.5), max-normalized, `identity` `native-frag-v1` |
+| `resolve_script` | `sidecar.rs:18` | locate a worker script (CWD, exe dir/dir, exe dir/scripts, else CWD-relative) |
+| `run_ms2pip` | `sidecar.rs:37` | MS2PIP client; in `id`/`peptidoform`/`charge`, out `id`/`ion_type`/`ordinal`/`intensity`; returns `cid -> (ion_byte, ordinal) -> intensity` |
+| `run_deeplc` | `sidecar.rs:77` | DeepLC client; in `id`/`peptidoform`, out `id`/`predicted_rt`; returns `id -> predicted_rt` |
+| `run_deeplc_finetune` | `sidecar.rs:106` | DeepLC multitask fine-tune; `deeplc_finetune.py <lib_in> <seed> <lib_out>` + epoch/patience/q-train/batch flags (called by `run`, not predict-frag) |
+| `run_mbr` | `sidecar.rs:136` | MBR transfer (Stage D3); `mbr_worker.py <scored> <psms_csv> <out>` + flags |
+| `run_worker` | `sidecar.rs:174` | shared launcher; bails on non-zero exit; `utf8` sets `PYTHONUTF8`/`PYTHONIOENCODING` |
+| `Candidate` | `index.rs:23` | one library row in SoA; `is_decoy` derived from the `label` string |
 | `Library` | `index.rs:38` | SoA candidate + fragment model plus the bucketed inverted index |
 | `Library::load` | `index.rs:55` | read Parquet, group fragments, build index, enforce preconditions |
+| `Library::n_candidates` / `cand_frags` | `index.rs:203` / `index.rs:208` | candidate count; per-candidate (m/z, intensity, name) slices |
 | `Library::page_search` | `index.rs:242` | bucketed probe: bucket select -> candidate slice -> f32 ppm verify |
 | `Library::candidate_range` | `index.rs:233` | isolation window -> `[lo, hi)` over `prec_mz` |
 | `Library::local_frag_index` | `index.rs:217` | nearest-stored-m/z fragment ordinal (bucketed path only) |
 | `deconvolve` | `index.rs:283` | z-charged peak m/z -> neutral m/z, in f64 |
 | `LogBins` / `LogBins::bin` | `binning.rs:11` / `binning.rs:43` | log-space bin geometry and mapping |
-| `FragIndex::build` | `fragindex.rs:46` | two-pass counting-sort CSR build at a fixed tolerance |
-| `FragIndex::probe_peak` | `fragindex.rs:152` | +/-1 bin probe + `within_ppm` verify, candidate-window narrowed |
-| `SeedScratch` | `fragindex.rs:191` | epoch-stamped dense `(count, obs_sum)` accumulator |
-| `score_scan_count_dot` (fragindex / naive) | `fragindex.rs:260` / `naive.rs:16` | equivalence-gate scorers under an identical predicate |
+| `FragIndex::build` | `fragindex.rs:46` | two-pass counting-sort CSR build at a fixed tolerance; derives m/z range from the library |
+| `FragIndex::probe_peak` | `fragindex.rs:152` | +/-1 bin probe + `within_ppm` verify, candidate-window narrowed; callback `(cid, mz, int, frag)` |
+| `FragIndex::candidate_range` / `n_cand` / `tol_ppm` | `fragindex.rs:137` / `:125` / `:129` | index-side isolation-window narrowing + accessors |
+| `SeedScratch` | `fragindex.rs:191` | epoch-stamped dense `(count, obs_sum)` accumulator; `touched`/`count`/`obs_sum` getters |
+| `score_scan_count_dot` (fragindex / naive) | `fragindex.rs:260` / `naive.rs:16` | equivalence-gate scorers, `dot = predicted*observed`, under an identical predicate |
 | `within_ppm` / `ppm_bounds` | `constants.rs:92` / `constants.rs:78` | min-relative vs query-relative tolerance predicates |
 
 ## Configuration

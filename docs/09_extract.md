@@ -54,7 +54,9 @@ the CLI in `main.rs:492` (`Cmd::Extract`) and from the orchestrator in
 - `run_windows` (Parquet): per-candidate RT windows, columns `candidate_id`,
   `rt_pred_cal`, `rt_lo`, `rt_hi` (read at `extract.rs:568`, scattered into the
   dense `rt_lo`/`rt_hi`/`rt_cal` arrays indexed by `candidate_id`,
-  `extract.rs:574`). Candidates with no window row keep `[-inf, +inf]`.
+  `extract.rs:574`). Candidates with no window row keep `[-inf, +inf]` and
+  `rt_cal = 0.0` (`extract.rs:576`); the `0.0` disables the Gaussian RT prior for
+  those candidates (the prior requires `rt_cal > 0`, `extract.rs:964`).
 - `ms1` (optional Parquet): MS1 scans via `load_ms1` (`extract.rs:587`). When
   absent, all MS1 columns are null.
 - `mass_cal` (optional JSON, the seed's `<seed>.masscal.json`): reads
@@ -95,6 +97,21 @@ production schema stays byte-identical):
 - `emit_contested_features` -> `contested_count_frac` F64, `apportioned_frac` F64 (`extract.rs:1382`).
 - `emit_gate_diagnostics` -> `gate_apex`, `gate_peak_spectral`, `gate_coelution`, `gate_spectral_entropy` (all F32, `extract.rs:1388`).
 
+The three soft-competition columns are all derived from the per-candidate
+`Contested` accumulator (`extract.rs:101`), whose fields are `won`/`lost`
+(summed observed intensity of shared peaks this candidate won or lost as
+most-eluting claimant), `n_won`/`n_lost` (the corresponding peak-instance
+counts), and `apportioned` (the co-elution-weighted proportional share the
+candidate would keep under `CoelutionProportional`). The columns are (all 0 when
+the two-pass path did not run):
+- `contested_frac` = `lost / (won + lost)` (`extract.rs:1146`): fraction of
+  contested *intensity* lost to a better co-eluter.
+- `contested_count_frac` = `n_lost / (n_won + n_lost)` (`extract.rs:1150`):
+  fraction of contested fragment-*peaks* lost.
+- `apportioned_frac` = `apportioned / (won + lost)` (`extract.rs:1154`): fraction
+  of contested intensity the candidate retains under proportional apportionment
+  (1 = keeps all; ~0 = a peak-borrower stripped by its co-eluting competitors).
+
 ### Output: `chromatograms` (`out_chrom`, schema `chromatograms` v1)
 
 Column order from `extract.rs:1396`:
@@ -125,9 +142,15 @@ Written only when `retain_top_peaks > 1` (`extract.rs:1414`), one row per
 not scored** and do not affect FDR; they are candidate peaks for an offline
 peak-selection model (see below).
 
-Each artifact also gets an `<artifact>.report.json` (`extract.rs:1439`) recording
-row count, content hash, the effective/nominal fragment tolerance, and the gate
-parameters.
+Each artifact (`psms_extracted` and `chromatograms`, but **not** the top-K peaks
+sidecar) also gets an `<artifact>.report.json` (`extract.rs:1439`) recording the
+row count, blake3 content hash, stage name, schema name+version, and
+`elapsed_ms`. The `params` object (`extract.rs:1446`) carries `frag_tol_ppm`
+(nominal), `effective_frag_tol_ppm` (post mass-cal), `frag_ppm_offset`,
+`presence_min_fragments`, `presence_min_coelution`, `min_frag_corr`, `gate_mode`,
+`gate_coelution_min`, and `scan_window`. The `stats` map (`extract.rs:1433`)
+carries `accepted` (the accepted-candidate count) and `scan_window`.
+`model_identity` is `None` (no model in this stage).
 
 ## How it works
 
@@ -178,12 +201,23 @@ There are three accumulation paths:
   `peak_claim` strategy.
 - **Two-pass co-elution** (`extract_twopass_windows`, `extract.rs:360`): used
   when `peak_claim` is one of the `Coelution*` variants **or**
-  `emit_contested_features` is set (`extract.rs:651`). Pass 1 builds each
-  candidate's per-scan elution profile (summed matched intensity). Pass 2
-  arbitrates each shared peak to the claimant most eluting at that scan (highest
-  profile height at `rt`, `extract.rs:463`), tracks won/lost/apportioned
-  contested intensity in `Contested` (`extract.rs:101`), and reassigns intensity
-  per the co-elution claim variant.
+  `emit_contested_features` is set (`extract.rs:651`). Like the single-pass
+  parallel path it partitions scans by isolation window and fans out over the
+  ~150 windows with rayon (`extract.rs:384`), so it stays parallel even with a
+  `restrict` allowlist. Pass 1 builds each candidate's per-scan elution profile
+  (summed matched intensity, `extract.rs:426`). Pass 2 arbitrates each shared
+  peak to the claimant most eluting at that scan (highest profile height at `rt`,
+  `extract.rs:463`; ties break by higher predicted intensity then lower
+  `candidate_id`, `extract.rs:471`), tracks won/lost/apportioned contested
+  intensity in `Contested` (`extract.rs:101`), and reassigns intensity per the
+  co-elution claim variant. The `reassign` flag (`extract.rs:738`) is true **only**
+  for the three `Coelution*` variants; when the two-pass path is triggered by
+  `emit_contested_features` alone (a non-co-elution `peak_claim`), pass 2 still
+  computes the contested statistics but the returned accumulation is the base
+  full-intensity `acc1`, not the reassigned `acc2` (`extract.rs:527`). So
+  `emit_contested_features` adds the soft-competition features **without** altering
+  any extracted intensity. `restrict` is honored inside both passes via the push
+  closure (`extract.rs:412`, `extract.rs:451`).
 
 Per-peak claim strategies (`PeakClaim`, applied in the single-pass loop at
 `extract.rs:700` and mirrored in the parallel path):
@@ -211,7 +245,10 @@ The cheap-to-expensive acceptance cascade, in order:
 
 1. **Distinct-fragment presence (tier b)**: distinct matched fragments must be at
    least `presence_min_matched` (`extract.rs:864`), else the candidate is dropped
-   before any grouping work.
+   before any grouping work. `presence_min_matched`, `presence_min_fragments`, and
+   `presence_min_coelution` are each floored at 1 via `.max(1)` (`extract.rs:864`,
+   `extract.rs:1028`, `extract.rs:1017`), so a configured 0 still requires at
+   least one fragment.
 2. **Scan grouping**: hits are rt-sorted and grouped into scan groups
    `Vec<(rt, BTreeMap<frag, intensity>)>`, deduping the same fragment within one
    scan by max (`extract.rs:869`). The `BTreeMap` fixes per-scan fragment order so
@@ -309,19 +346,40 @@ are the per-PSM columns, taken from the nearest MS1 scan to the apex RT
 
 ### 7. Top-K peak enumeration (`retain_top_peaks`)
 
-When `retain_top_peaks > 1` (`extract.rs:1245`), the per-scan distinct-fragment
-count profile is passed to `crate::peaks::enumerate_peaks` (`peaks.rs:52`) with
-`bound_fraction = 1/3` and `min_prominence_frac = 0.1`. `enumerate_peaks` finds
-local maxima above a prominence floor, walks fractional-height boundaries
-(stopping below `bound_fraction * apex` or at a valley, `peaks.rs:88`),
-deduplicates maxima falling inside a stronger peak's envelope (`peaks.rs:136`),
-and returns up to K groups ranked strongest-first by integrated `area` with ties
-broken by earliest `apex_idx`. `enumerate_peaks(.., k=1, ..)` returns the single
-global-argmax peak, so callers can adopt it incrementally. The retained peaks
-rank by **co-eluting fragment breadth (count), not intensity**, per the finding
-that intensity is chimeric in DIA. The main PSM still reports the single selected
-apex, so FDR is unaffected; the sidecar peaks are unscored candidate peaks for an
-offline peak-selection model (`extract.rs:1239`).
+When `retain_top_peaks > 1` and the candidate has groups (`extract.rs:1246`), the
+per-scan distinct-fragment count profile (`count_prof`, `extract.rs:1247`) is
+passed to `crate::peaks::enumerate_peaks` (`peaks.rs:52`) with `k =
+retain_top_peaks`, `bound_fraction = 1/3` and `min_prominence_frac = 0.1`
+(`extract.rs:1248`). `enumerate_peaks` is a pure, side-effect-free function
+(`peaks.rs:1`):
+1. An empty profile, `k == 0`, or an all-non-positive profile returns an empty
+   vector (`peaks.rs:58`, `peaks.rs:63`).
+2. **Local maxima** (`peaks.rs:71`): index `i` qualifies when its value is `>
+   0`, is `>= prom_floor` (the prominence floor `min_prominence_frac *
+   global_max`, `peaks.rs:66`), is **strictly** greater than its left neighbour
+   (or is the left edge), and is `>=` its right neighbour (or is the right edge).
+   The strict-left / non-strict-right rule makes a flat plateau register once, at
+   its left edge; edges count as maxima against their single neighbour.
+3. **Boundary walk** (`peaks.rs:88`): from each apex, walk left and right,
+   stopping when the profile drops below `bound_fraction * apex` **or** turns back
+   upward (a valley); `area` is the integrated profile over `[start_idx,
+   end_idx]`.
+4. **Dedup + rank** (`peaks.rs:125`): peaks are sorted strongest-first by `area`,
+   then by `apex_intensity`, then by earliest `apex_idx`; a maximum whose apex
+   falls inside an already-kept peak's `[start_idx, end_idx]` envelope is dropped
+   (`peaks.rs:140`); the first `k` survivors are kept and assigned `rank`
+   0..k-1 (`peaks.rs:148`).
+
+`enumerate_peaks(.., k=1, ..)` returns the single global-argmax peak, so callers
+can adopt it incrementally. The retained peaks rank by **co-eluting fragment
+breadth (count), not intensity**, per the finding that intensity is chimeric in
+DIA. Back in `extract`, each returned `PeakGroup` is mapped to a sidecar row
+(`extract.rs:1250`): `apex_rt`/`start_rt`/`end_rt` are the RTs of the
+apex/start/end scan groups, `evidence_count` is the distinct-fragment count at
+the apex group (`groups[pk.apex_idx].1.len()`), and `area` is `pk.area`. The main
+PSM still reports the single selected apex, so FDR is unaffected; the sidecar
+peaks are unscored candidate peaks for an offline peak-selection model
+(`extract.rs:1239`).
 
 ## Key types and functions
 
@@ -330,7 +388,7 @@ offline peak-selection model (`extract.rs:1239`).
 | `run` | `extract.rs:550` | Stage entry point; orchestrates load, accumulate, cascade, write |
 | `ExtractParams` | `extract.rs:61` | Input path bundle + config + config hash |
 | `Hit` | `extract.rs:86` | One observed hit: `rt`, `frag`, `inten`, `obs_mz` |
-| `Contested` | `extract.rs:101` | Per-candidate won/lost/apportioned contested intensity (two-pass) |
+| `Contested` | `extract.rs:101` | Per-candidate two-pass contested-peak stats: `won`/`lost` intensity, `n_won`/`n_lost` peak counts, `apportioned` share |
 | `CandOut` | `extract.rs:815` | Per-candidate parallel-map result (PSM row + chrom rows + peaks) |
 | `probe_matched` | `extract.rs:43` | Dispatch a peak probe to fragindex or bucketed backend |
 | `extract_accumulate_windows` | `extract.rs:257` | Parallel single-pass per-window accumulation |
@@ -365,7 +423,7 @@ not reintroduce them.
 | `presence_min_coelution` | 2 | Min simultaneously-present fragments to extend a run (`extract.rs:1017`) |
 | `min_frag_corr` | **0.2** | Pearson/gate threshold; 0 disables the gate. Relaxed from a historical 0.5 to recover low-abundance candidates (`config.rs:559`) |
 | `min_matched_fraction` | 0.0 | Acceptance: min matched/predicted fraction (default off) |
-| `apex_top_fragments` | 0 | Signature-ion count for apex; 0 -> default 3 (`extract.rs:969`) |
+| `apex_top_fragments` | 0 | Signature-ion count for apex; 0 -> default 3 (`extract.rs:969`). Config marks it superseded by `apex_count_tol`, kept for compat (`config.rs:564`) |
 | `apex_rt_prior_s` | 0.0 | Gaussian RT-prior sigma on apex tiebreak; 0 = off |
 | `apex_count_tol` | 1 | Count slack for qualifying apex scans |
 | `apex_count_window` | 1 | Rolling-sum width for the count profile; 1 = no smoothing. Window 5 cut AIF apex misassignment (median \|dRT\| 131s -> 9s) |
@@ -415,11 +473,42 @@ not present in this `extract.rs`; the audit ladder is produced by the separate
   trace, not a grid-length zero vector (`extract.rs:1213`). Downstream code must
   treat an empty trace as `obs_apex = 0`.
 - **`apex_im` is always null** (3D MVP); do not assume an IM value.
-- **`restrict_candidates` routes to the serial path** (`extract.rs:660`), which is
-  slower but honors the allowlist filter and every `peak_claim` strategy.
+- **`restrict_candidates` only forces the serial path in the non-two-pass case.**
+  In the non-two-pass branch the parallel window accumulation is used only when a
+  fragindex is present **and** there is no `restrict` list (`extract.rs:660`); a
+  `restrict` list therefore routes to the slower serial single-pass loop, which
+  honors the allowlist and every non-co-elution `peak_claim` strategy. In the
+  two-pass branch (`Coelution*` or `emit_contested_features`) extraction stays on
+  the parallel `extract_twopass_windows` path regardless of `restrict`, which
+  applies the allowlist inside each pass's push closure (`extract.rs:412`,
+  `extract.rs:451`, wired at `extract.rs:753`).
 - **`peaks.parquet` is not scored** and never enters FDR; it is a research sidecar.
 - Chromatogram list columns are `LargeListF32` on purpose (`extract.rs:1404`); do
   not downgrade to 32-bit `ListF32` or wide-open gates overflow the offset buffer.
+
+## Tests
+
+Only the pure gate-scoring helpers and the peak enumerator are unit-tested; there
+is no stage-level test of `run` itself (consistent with the "no stage tests for
+extract" gap in CLAUDE.md). The tests encode the behavioral invariants that gate
+tuning must preserve.
+
+- `coelution_tests` (`extract.rs:1473`): co-eluting fragments score `> 0.95`
+  (`extract.rs:1484`); a strong non-co-eluting interferent drops the co-elution
+  score `< 0.8` (`extract.rs:1498`); fewer than 3 scan groups returns `1.0`
+  (do-not-reject) rather than a low score (`extract.rs:1512`); `peak_spectral`
+  scores `> 0.99` when the peak-integrated pattern matches predicted
+  (`extract.rs:1518`) and still recovers a fragment that is momentarily unsampled
+  at the apex scan by integrating over the peak (`extract.rs:1532`, the DIA
+  scan-gap case the single-scan apex Pearson fails).
+- `peaks::tests` (`peaks.rs:154`): empty/all-zero profiles yield no peaks; a
+  clean triangular peak resolves apex and 1/3-height boundaries; `k=1` keeps only
+  the strongest-area peak; a dominant interference peak with `k=1` discards a
+  weaker true peak but `k>=2` retains it (the core sensitivity behavior,
+  `peaks.rs:190`); two maxima rank by area; a left-edge-truncated peak apexes at
+  index 0; the prominence filter suppresses a noise bump; a shoulder inside a
+  stronger envelope collapses into it; and repeated calls are bit-identical with
+  ties broken by earliest apex (`peaks.rs:259`).
 
 ## How to extend / modify
 

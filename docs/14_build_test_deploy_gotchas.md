@@ -24,17 +24,19 @@ the conda specs in `env/`, the container definition in `Dockerfile` +
 | `rust/mumdia/rust-toolchain.toml` | Pins toolchain channel `1.96.1` + `rustfmt`/`clippy`; rustup auto-installs it on first `cargo` call in this dir |
 | `rust/mumdia/.cargo/config.toml` | Machine-specific, gitignored: redirects `target-dir` off the OneDrive tree |
 | `rust/mumdia/.cargo/config.toml.example` | Committed template of the above; a fresh clone with no local copy builds into `./target` |
-| `rust/mumdia/crates/mumdia/Cargo.toml` | The bin+lib crate `mumdia`; all deps come from `workspace.dependencies` |
+| `rust/mumdia/crates/mumdia/Cargo.toml` | The bin+lib crate `mumdia`; `[[bin]]` name `mumdia` -> `src/main.rs`; all deps come from `workspace.dependencies` |
+| `rust/mumdia/crates/mumdia-core/Cargo.toml` | Core crate; depends only on `serde`/`serde_json`/`thiserror` (no arrow/parquet, so no I/O layer) |
+| `rust/mumdia/crates/mumdia-io/Cargo.toml` | I/O crate; adds `arrow`/`parquet`/`blake3` over `mumdia-core` |
 | `rust/mumdia/crates/mumdia/tests/pipeline.rs` | The only integration test file: extract -> features -> compete -> rescore on crafted Parquet |
-| `.github/workflows/ci.yml` | Build + test matrix on ubuntu/macos/windows, `--locked` |
+| `.github/workflows/ci.yml` | Build + test matrix on ubuntu/macos/windows, `--locked`; on push-to-`main` + every PR |
 | `.github/workflows/release.yml` | Dormant until a `v*` tag; builds per-platform binaries and attaches archives to the Release |
 | `.github/workflows/docker.yml` | Builds the image; pushes to GHCR only on a `v*` tag, build-only on `workflow_dispatch` |
 | `Dockerfile` | Two-stage image: Rust build stage + micromamba runtime with two sidecar envs |
-| `docker/config.dia.json` | Baked FASTA-digest config (MS2PIP + DeepLC + mokapot wired to in-image envs) |
-| `docker/config.diann-lib.json` | Baked library-input config (DeepLC fine-tune + mokapot) |
-| `env/docker-rescore.yml` | Conda spec for the in-image `rescore` env (mokapot + MS2PIP) |
-| `env/docker-deeplc.yml` | Conda spec for the in-image `deeplc` env (DeepLC 4.0 multitask + CPU torch) |
-| `env/mumdia-rescore.yml` | Minimal host env for the default mokapot rescorer only (no torch/DeepLC/MS2PIP) |
+| `docker/config.dia.json` | Baked FASTA-digest config (MS2PIP + DeepLC + mokapot wired to in-image envs); the only config copied into the image (`Dockerfile:42`) |
+| `docker/config.diann-lib.json` | Library-input config in the repo (DeepLC fine-tune + mokapot); NOT copied into the image, so it must be bind-mounted to use it in the container |
+| `env/docker-rescore.yml` | Conda spec for the in-image `rescore` env (`python=3.11`, `mokapot==0.10.0` + `ms2pip==4.0.0.dev9`) |
+| `env/docker-deeplc.yml` | Conda spec for the in-image `deeplc` env (`python=3.11`, `torch==2.12.1+cpu` + DeepLC 4.0 multitask pinned git commit) |
+| `env/mumdia-rescore.yml` | Minimal host env for the default mokapot rescorer only (`python=3.12`, no torch/DeepLC/MS2PIP) |
 | `rust/mumdia/crates/mumdia/src/sidecar.rs` | Sidecar subprocess clients + `resolve_script` path resolution |
 | `rust/mumdia/crates/mumdia/src/main.rs` | Thin CLI; `doctor` subcommand probes configured sidecar interpreters (`main.rs:311`) |
 | `rust/mumdia/crates/mumdia-core/src/config.rs` | `Config::validate` (`config.rs:1056`) + `apply_profile` (`config.rs:1098`) |
@@ -71,7 +73,11 @@ The build stage of the Docker image produces `/build/release/mumdia`
 (`Dockerfile:20`, target dir forced by `ENV CARGO_TARGET_DIR=/build` at
 `Dockerfile:17`); the release workflow produces `mumdia-<tag>-<target>.{tar.gz,zip}`
 archives (`release.yml:50-60`) containing the binary plus `README.md` and
-`LICENSE`.
+`LICENSE`. Non-Windows targets ship a `.tar.gz` (`tar czf`, `release.yml:59`);
+the Windows target ships a `.zip` (`7z a`, `release.yml:57`). Of the two
+`docker/*.json` configs only `config.dia.json` is copied into the image
+(`Dockerfile:42`); `config.diann-lib.json` stays in the repo and must be
+bind-mounted (`-v`) to be used from the container.
 
 ## How it works
 
@@ -85,7 +91,13 @@ the same rustc.
 
 Every dependency is version-anchored once in `[workspace.dependencies]`
 (`Cargo.toml:12-26`) and each crate re-exports it with `x.workspace = true` (for
-example `crates/mumdia/Cargo.toml:11-25`). The engine is a **pure-Rust build with
+example `crates/mumdia/Cargo.toml:11-25`). The workspace uses the v2 feature
+resolver (`resolver = "2"`, `Cargo.toml:2`) and lists three members
+(`Cargo.toml:3`). Each crate declares only the subset it needs: `mumdia-core`
+depends on `serde`/`serde_json`/`thiserror` only (no arrow/parquet, so the core
+types stay I/O-free); `mumdia-io` adds `arrow`/`parquet`/`blake3` over
+`mumdia-core`; the `mumdia` bin+lib crate pulls the full set including `clap`,
+`rayon`, `mzdata`, and `tracing`. The engine is a **pure-Rust build with
 no C toolchain**: `parquet` uses `default-features = false, features =
 ["arrow","snap"]` to drop the C zlib-ng backend that needs cmake and to use the
 pure-Rust SNAPPY codec (`Cargo.toml:23-24`); `mzdata` uses `["mzml",
@@ -140,6 +152,91 @@ checks the PIN header and that a `q_value` column is produced. Both run the
 gives every crafted file a per-process, atomic-counter-unique path because cargo
 runs tests concurrently in one process.
 
+**What each module's tests assert (unit coverage detail).** This enumerates the
+substance behind the counts above, so a reader knows what "green" verifies at the
+function level.
+
+_`mumdia-core`:_
+
+- `mass.rs`: PEPTIDE neutral monoisotopic mass; Carbamidomethyl by-name vs
+  by-mass agree; N-term/C-term mods; low-information fragments dropped;
+  unknown-mod error; ambiguous-residue error.
+- `rejection.rs`: rejection `code()` strings match the spec; serde round-trip uses
+  the spec spelling; `earliest` keeps the smaller (earlier) stage; `is_rejection`
+  flags only losses; stage order is a monotone ladder.
+- `config.rs`: default round-trips (`min_len=5`, `FeatureSet::Minimal`,
+  `top_n_peaks=300`); unknown key rejected; partial override keeps defaults; an
+  explicit uncapped seed (`search_seed.top_n_peaks=0`, allowed) is distinguished
+  from an invalid gate (`extract.min_frag_corr` outside `[0,1]`, rejected).
+- `constants.rs`: the three `within_ppm` forms agree; the inclusive edge case.
+
+_`mumdia-io`:_ `table.rs` round-trips a mixed-column `Table` through Parquet
+(the only I/O-layer unit test).
+
+_`mumdia`:_
+
+- `peaks.rs`: empty/zero profile yields no peaks; a single triangular peak; `K=1`
+  keeps the strongest by area; a true peak is retained under a dominant
+  interferent with top-K; two maxima ranked by area; a peak truncated at the left
+  edge; a prominence filter suppresses noise flicker; overlapping maxima collapse
+  to the stronger; ties break by earlier apex (determinism).
+- `quant.rs`: trapezoid area; window clip to range; the peak window bounds the
+  summed XIC and rejects a lone interferent; grace bridges a single dip; median of
+  odd/even/empty; median-ratio recovers a global scale not real changes; `None`
+  leaves the matrix unnormalized; the peak-window apex prefers co-elution over a
+  lone interferent; the peak window never collapses to a single sample.
+- `compete.rs`: `winner_take_all` keeps only the winner; `none`/`features_only`
+  keep all; `margin_gated` keeps close losers and removes distant ones;
+  `unique_evidence` keeps losers with enough unique evidence and falls back to
+  winner-take-all without evidence data; winner-take-all is deterministic across
+  groups; the winner tie-breaks to the smallest index.
+- `matchers/fragindex.rs`: fragindex-vs-naive equivalence; two fragments hitting
+  one peak count both; the epoch counter resets with no carry across scans;
+  tolerance edges (inside matches, outside does not); the precursor-window gate
+  excludes out-of-range; the +/-1 bin probe finds within-tolerance pairs across
+  bin boundaries.
+- `matchers/binning.rs`: within-tolerance pairs are at most one bin apart;
+  out-of-range clamps; a boundary-straddling pair is covered by the probe.
+- `quant_lfq.rs`: a single sample is the column sum; recovers a known profile
+  (complete and with missing values); total intensity preserved; a disconnected
+  sample falls back to its own sum.
+- `stages/extract.rs`: co-eluting fragments score high; a non-co-eluting
+  interferent drops the score; too few scans does not reject; peak-spectral is
+  high when the integrated pattern matches and recovers a fragment absent at the
+  apex scan.
+- `stages/features/chromatographic.rs`: arity matches the names list; empty input
+  is all-finite-zero; a single point is finite; a Gaussian peak scores well; a
+  bimodal trace is detected.
+- `stages/features/apex_dispersion.rs`: names match the values length and are
+  finite; co-eluting fragments have low dispersion; scattered fragments have high
+  dispersion; truncation is flagged when the apex sits at an edge.
+- `stages/features/mass_uncertainty.rs`: names match values length and are finite;
+  only observed fragments count toward the mass error; breadth of the top
+  predicted ions; concentration is high when one fragment dominates.
+- `stages/features/order_consistency.rs`: length stable on a degenerate input; a
+  perfectly consistent intensity order scores high; a shuffled order scores low.
+- `stages/features.rs`: `peptide_length` ignores mods; the feature sets are sized
+  (Minimal = 14); cross-correlation of aligned traces.
+- `fdr.rs`: perfect separation gives the conservative `(n_decoys+1)/n_targets` q;
+  tied scores share one q; the entrapment q ranks real targets above spike-ins and
+  shares one q across ties.
+- `calibrate.rs`: linear fit recovers a line; LOESS tracks a nonlinear curve;
+  percentile basics.
+- `stages/digest.rs`: Trypsin/P cleaves after K/R; the reverse decoy keeps the
+  C-terminal residue; the scramble is deterministic.
+- `stages/peptidoforms.rs`: ProForma places mods at the right positions; the
+  variable-mod combination count is bounded.
+- `stages/audit.rs`: the waterfall assigns the earliest loss per candidate; the
+  entrapment label comes from a protein-name substring.
+- `stats.rs`: Pearson (perfect and flat) and cosine/angle.
+- `main.rs`: the conversion cap defaults to uncapped and an explicit cap is
+  preserved (CLI parsing).
+- `index.rs`: page search finds only in-window and in-tolerance hits.
+- `search_seed.rs`: zero selects all and the seed cap keeps only the top-intensity
+  peaks.
+- `rescoring.rs`: the native rescorer separates targets from decoys.
+- `report.rs`: mod-stripping and decoy handling for the TSV report.
+
 **Sidecar invocation contract.** `sidecar.rs` is a set of thin subprocess
 clients over a positional-CLI file contract: write an input Parquet, run
 `python <script> <args...>`, read an output Parquet keyed by id
@@ -150,44 +247,67 @@ CWD. `run_worker` (`sidecar.rs:174`) sets `PYTHONUTF8=1` and
 `PYTHONIOENCODING=utf-8` for the DeepLC calls because Keras crashes on the
 Windows cp1252 console otherwise (`sidecar.rs:180-182`).
 
-**Doctor.** `mumdia doctor` (`main.rs:311`) probes each configured sidecar
-interpreter with an inline `importlib.util.find_spec` check and reports
-`[ ok ]` / `[FAIL]` / `[skip]` per interpreter. Required packages depend on the
-selected rescorer: `NnTorch` needs `torch,numpy,pandas,pyarrow`; mokapot and
-entrapment need `mokapot,sklearn,numpy,pandas,pyarrow` (`main.rs:316-319`). It
+**Doctor.** `mumdia doctor` (`main.rs:311`) probes three interpreters
+(`main.rs:320-324`) with an inline `importlib.util.find_spec` check and reports
+`[ ok ]` / `[FAIL]` / `[skip]` per interpreter; `[skip]` means the interpreter is
+not configured, so the native path is used (`main.rs:328`). The rescore
+interpreter's required packages depend on the selected classifier: `NnTorch`
+needs `torch,numpy,pandas,pyarrow`; mokapot and entrapment (the `_` arm) need
+`mokapot,sklearn,numpy,pandas,pyarrow` (`main.rs:316-319`). The other two are
+fixed: `predict_frag.deeplc_python` needs `deeplc,numpy,pandas` (`main.rs:322`)
+and `predict_frag.ms2pip_python` needs `ms2pip,numpy,pandas` (`main.rs:323`). It
 exits non-zero if any configured env is unusable (`main.rs:356`).
 
 **Docker image.** Two-stage build. Stage 1 (`Dockerfile:15-20`) builds the
 release binary on `rust:1.96-bookworm` with `cargo build --release --locked
 --bin mumdia`. Stage 2 (`Dockerfile:23`) is `mambaorg/micromamba:1.5.10-bookworm-slim`;
-it installs `git` + `build-essential` (git for the pinned DeepLC commit,
-build-essential for any sdist-only pip dep), then creates two conda envs from
-`env/docker-rescore.yml` and `env/docker-deeplc.yml` and runs `micromamba clean
--a -y` (`Dockerfile:29-37`). It copies the binary to `/usr/local/bin/mumdia`,
-`scripts/` to `/opt/mumdia/scripts`, and `docker/config.dia.json` to
-`/opt/mumdia/config.dia.json` (`Dockerfile:40-42`), sets
-`MUMDIA_RESCORE_MODEL=logreg` (`Dockerfile:45`), and sets `ENTRYPOINT ["mumdia"]`
-with `CMD ["--help"]` (`Dockerfile:48-49`). The two conda envs both pin
-`python=3.11` on purpose: mokapot/MS2PIP/DeepLC pull `pandas<2`, which has no
-cp312 wheel and would force a fragile source build (`docker-rescore.yml:8-9`,
-`docker-deeplc.yml:8-9`). Torch is CPU-only (`docker-deeplc.yml:17-18`) and
-DeepLC is a pinned git commit (`docker-deeplc.yml:21`).
+it switches to `USER root` (`Dockerfile:24`) and sets
+`MAMBA_ROOT_PREFIX=/opt/conda` (`Dockerfile:25`), which is why the baked configs
+point at `/opt/conda/envs/<env>/bin/python`. It installs `git` +
+`build-essential` (git for the pinned DeepLC commit, build-essential for any
+sdist-only pip dep), then creates two conda envs from `env/docker-rescore.yml` and
+`env/docker-deeplc.yml` and runs `micromamba clean -a -y` (`Dockerfile:29-37`). It
+copies the binary to `/usr/local/bin/mumdia`, `scripts/` to `/opt/mumdia/scripts`,
+and `docker/config.dia.json` to `/opt/mumdia/config.dia.json` (`Dockerfile:40-42`;
+note `config.diann-lib.json` is not copied), sets `MUMDIA_RESCORE_MODEL=logreg`
+(`Dockerfile:45`), sets the container working directory to `/data`
+(`WORKDIR /data`, `Dockerfile:47`, which is the bind-mount point in the usage
+example), and sets `ENTRYPOINT ["mumdia"]` with `CMD ["--help"]`
+(`Dockerfile:48-49`). The two conda envs both pin `python=3.11` on purpose:
+mokapot/MS2PIP/DeepLC pull `pandas<2`, which has no cp312 wheel and would force a
+fragile source build (`docker-rescore.yml:8-9`, `docker-deeplc.yml:8-9`). The
+`rescore` env anchors only the two tools (`mokapot==0.10.0`,
+`ms2pip==4.0.0.dev9`) plus `numpy<2`/`pyarrow`/`scikit-learn`, leaving their
+scientific-Python graph to pip (`docker-rescore.yml:16-22`). The `deeplc` env
+installs `torch==2.12.1+cpu` from the PyTorch CPU index-url, `numpy<2`/`pyarrow`,
+and DeepLC from a pinned git commit (`5c6a94e3...`); the multitask model weight
+ships inside the DeepLC package, so no separate download is needed
+(`docker-deeplc.yml:5-6`, `16-21`).
 
-**CI / release / docker workflows.** `ci.yml` runs a `build + test` matrix on
-`ubuntu-latest`, `macos-latest`, `windows-latest` with `fail-fast: false`
-(`ci.yml:16-19`), all under `working-directory: rust/mumdia`
-(`ci.yml:20-22`). It caches the cargo registry, git, and `rust/mumdia/target`
-keyed on `Cargo.lock` (`ci.yml:28-36`), then `cargo build --release --locked`
-and `cargo test --locked` (`ci.yml:38-42`). `--locked` forces the committed
-`Cargo.lock`, so a lockfile drift fails CI. `release.yml` (`release.yml:8-9`)
-fires only on `v*` tags and builds three targets:
-`x86_64-unknown-linux-musl` (with `musl-tools`), `aarch64-apple-darwin`,
-`x86_64-pc-windows-msvc` (`release.yml:20-30`), packaging each with the binary +
-README + LICENSE and uploading to the Release (`release.yml:47-68`).
-`docker.yml` builds the image on `v*` tags and on manual `workflow_dispatch`, but
-`push:` is gated on `startsWith(github.ref, 'refs/tags/v')` (`docker.yml:47`), so
-a manual dispatch validates the build without publishing; a tag pushes
-`ghcr.io/compomics/mumdia:<tag>` + `:latest` + `:sha` (`docker.yml:36-38`).
+**CI / release / docker workflows.** `ci.yml` triggers on push to `main` and on
+every pull request (`ci.yml:3-6`), with a `concurrency` group per ref and
+`cancel-in-progress: true` (`ci.yml:8-10`) so a newer push supersedes an in-flight
+run on the same ref. It runs a `build + test` matrix on `ubuntu-latest`,
+`macos-latest`, `windows-latest` with `fail-fast: false` (`ci.yml:16-19`), all
+under `working-directory: rust/mumdia` (`ci.yml:20-22`). It caches the cargo
+registry, git, and `rust/mumdia/target` keyed on `Cargo.lock`, with a
+`${{ runner.os }}-cargo-` prefix restore-key fallback (`ci.yml:28-36`), then
+`cargo build --release --locked` and `cargo test --locked` (`ci.yml:38-42`).
+`--locked` forces the committed `Cargo.lock`, so a lockfile drift fails CI.
+`release.yml` (`release.yml:8-9`) fires only on `v*` tags, declares
+`permissions: contents: write` so it can attach archives (`release.yml:11-12`),
+and builds three targets: `x86_64-unknown-linux-musl` (with `musl-tools`),
+`aarch64-apple-darwin`, `x86_64-pc-windows-msvc` (`release.yml:20-30`), packaging
+each with the binary + README + LICENSE and uploading to the Release with
+`generate_release_notes: true` (`release.yml:47-68`). `docker.yml` declares
+`permissions: packages: write` (`docker.yml:11-13`), builds `linux/amd64` only
+(`docker.yml:46`, so the published image is amd64), and uses the GitHub Actions
+buildx layer cache (`cache-from/cache-to: type=gha`, `docker.yml:50-51`). It runs
+on `v*` tags and on manual `workflow_dispatch`, but the GHCR login and `push:` are
+both gated on `startsWith(github.ref, 'refs/tags/v')` (`docker.yml:24`,
+`docker.yml:47`), so a manual dispatch validates the build without publishing; a
+tag pushes `ghcr.io/compomics/mumdia:<tag>` + `:latest` + `:sha`
+(`docker.yml:36-39`).
 
 ## Key types and functions
 
@@ -198,7 +318,8 @@ a manual dispatch validates the build without publishing; a tag pushes
 | `Config::canonical_json` | `config.rs:1116` | Canonical config JSON for the manifest hash |
 | `doctor` | `main.rs:311` | Probes configured sidecar interpreters; exits non-zero if any is unusable |
 | `sidecar::resolve_script` | `sidecar.rs:18` | CWD/exe-dir/`scripts` path resolution for workers |
-| `sidecar::run_worker` | `sidecar.rs:174` | Spawns `python <script> <args>`; forces UTF-8 I/O for DeepLC |
+| `sidecar::run_worker` | `sidecar.rs:174` | Spawns `python <script> <args>`; forces UTF-8 I/O only when its `utf8` arg is set (DeepLC calls) |
+| `sidecar::run_deeplc_finetune` | `sidecar.rs:106` | Positional-CLI DeepLC multitask fine-tune; a known nondeterministic path (no torch/numpy seed) |
 | `make_decoy` | `digest.rs:92` | Reverse or seeded-scramble decoy generation |
 | `splitmix64` | `digest.rs:122` | Deterministic PRNG for the scramble Fisher-Yates shuffle |
 | `fnv1a` | `digest.rs:130` | Per-peptide seed hash so the scramble is peptide-stable |
@@ -227,11 +348,28 @@ do not reintroduce removed knobs. The fields relevant here:
 - The Docker default rescorer model is selected by the env var
   `MUMDIA_RESCORE_MODEL=logreg` baked at `Dockerfile:45`; the NN worker also reads
   `MUMDIA_NN_SEEDS` (`scripts/nn_rescore_worker.py:42`).
-- The baked configs point sidecars at fixed in-image interpreters:
+- Both `docker/*.json` configs open with the same DIA preset written out
+  explicitly (`features.set = extended`, `extract.apex_count_window = 5`,
+  `extract.apex_rt_prior_s = 120.0`), matching `apply_profile("dia")`.
+- `docker/config.dia.json` (FASTA-digest path) sets
+  `predict_frag.predictor = ms2pip` and `predict_frag.rt_predictor = deeplc`, and
+  points sidecars at fixed in-image interpreters:
   `/opt/conda/envs/rescore/bin/python` for MS2PIP + mokapot and
-  `/opt/conda/envs/deeplc/bin/python` for DeepLC (`docker/config.dia.json:6-13`).
-  `docker/config.diann-lib.json` additionally sets `rt_im_train.finetune_deeplc =
-  true` and `rt_window_multiplier = 1.5`.
+  `/opt/conda/envs/deeplc/bin/python` for DeepLC, with
+  `sidecar_script_dir = /opt/mumdia/scripts` (`docker/config.dia.json:4-14`); the
+  rescorer is `mokapot`.
+- `docker/config.diann-lib.json` (library-input path) does NOT set
+  `predictor`/`rt_predictor` (fragment intensities + iRT come from the imported
+  library), configures only `deeplc_python` + `sidecar_script_dir` for the
+  optional iRT fine-tune, and additionally sets `rt_im_train.finetune_deeplc =
+  true` and `rt_im_train.rt_window_multiplier = 1.5` (`docker/config.diann-lib.json:4-8`).
+- The pip pins in the two in-image envs are exact and reproducibility-load-bearing:
+  `rescore` = `mokapot==0.10.0` + `ms2pip==4.0.0.dev9` + `numpy<2` (rest via pip);
+  `deeplc` = `torch==2.12.1+cpu` + DeepLC pinned git commit `5c6a94e3...` + `numpy<2`.
+  The host-only `env/mumdia-rescore.yml` is a different pin set: `python=3.12`
+  with conda `numpy`/`pandas`/`pyarrow`/`scikit-learn` and pip `mokapot`
+  (unpinned, and no `pandas<2` constraint because it installs neither MS2PIP nor
+  DeepLC).
 
 ## Invariants, determinism, gotchas
 
@@ -292,7 +430,11 @@ the lockfile in the same commit as a dependency bump.
 above); bumping to 3.12 reintroduces a source build of `pandas<2`. `git` and
 `build-essential` in the runtime stage are required, not incidental
 (`Dockerfile:29`). A `workflow_dispatch` of `docker.yml` builds but does not push;
-only a `v*` tag publishes.
+only a `v*` tag publishes. The published image is `linux/amd64` only
+(`docker.yml:46`), so on arm64 hosts (Apple Silicon) it runs under emulation.
+Only `config.dia.json` is inside the image; running the library-input recipe in
+the container requires bind-mounting `docker/config.diann-lib.json` (or any custom
+config) and passing it with `--config`.
 
 ## How to extend / modify
 

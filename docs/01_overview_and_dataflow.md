@@ -28,6 +28,7 @@ chains the stages in order and records provenance; it computes nothing itself.
 | `rust/mumdia/crates/mumdia/src/stages/run.rs` | `run` orchestrator: preflight, library-source branch, per-run chain, manifest assembly (`run.rs:83`). |
 | `rust/mumdia/crates/mumdia/src/stages/mod.rs` | Re-exports every stage module. |
 | `rust/mumdia/crates/mumdia/src/stages/*.rs` | The stage implementations (`convert`, `digest`, `peptidoforms`, `predict_frag`, `search_seed`, `rt_im_train`, `extract`, `features`, `compete`, `rescore`, `quant`, `report`, `align`, `audit`). |
+| `rust/mumdia/crates/mumdia/src/lib.rs` | Crate lib root (bin+lib split, `lib.rs:5-16`): re-exports the pipeline modules so integration tests can drive stages directly. Public modules: `stages`, `matchers` (fragment matchers, doc 06), `index` (`Library` + inverted index, doc 06), `predict` (predictor traits + native fallbacks, doc 06), `rescoring` (`percolator_lite` + native NN, doc 11), `calibrate` (LOESS/linear/percentile, doc 08), `peaks` (peak enumeration, doc 09), `spectra` (in-memory spectrum model + loaders), `sidecar` (Python worker dispatch, doc 13), `stats` (pearson/cosine/spectral_angle kernel), `fdr` (target-decoy + entrapment q, doc 11). |
 | `rust/mumdia/crates/mumdia-core/src/schema.rs` | Frozen `(logical name, schema version)` for every artifact (`artifact` module, `schema.rs:6`). |
 | `rust/mumdia/crates/mumdia-core/src/manifest.rs` | `Manifest` and `ArtifactRecord` (`manifest.rs:10`, `manifest.rs:22`). |
 | `rust/mumdia/crates/mumdia-core/src/config.rs` | The single typed serde `Config` (`config.rs:1010`) with per-stage sections and `apply_profile` (`config.rs:1098`). |
@@ -152,6 +153,72 @@ reason).
 Human-readable outputs: `peptides.tsv`, `proteins.tsv` (report), and
 `manifest.json` (orchestrator).
 
+## CLI subcommands
+
+`main.rs` is a thin `clap` layer: the `Cmd` enum (`main.rs:16`) defines one
+subcommand per stage plus the `run` orchestrator, the experiment-level
+`align`/`mbr`, and the utilities `inspect`/`report`/`doctor`. Each stage arm
+loads the config, hashes its canonical JSON into a `config_hash`, and calls the
+stage `run`; every stage command is runnable standalone on prior outputs. Flags
+are `--kebab-case`; a `num_args = 1..` flag accepts several values. The full set,
+in source order:
+
+| `mumdia <cmd>` | Inputs (flags) | Outputs (flags / artifacts) |
+|---|---|---|
+| `convert` (`main.rs:19`) | `--mzml`, `--out-dir`; caps `--max-spectra`, `--top-peaks-ms2`, `--top-peaks-ms1` (each `0` = uncapped) | `spectra_ms1`, `spectra_ms2`, `isolation_windows`, `ms2_to_ms1` in `--out-dir` |
+| `digest` (`main.rs:39`) | `--fasta`, `--config` | `--out` = `peptides.parquet` |
+| `peptidoforms` (`main.rs:48`) | `--peptides`, `--config` | `--out` = `peptidoforms.parquet` |
+| `predict-frag` (`main.rs:57`) | `--peptidoforms`, `--work-dir` (default `sidecar_work`), `--config` | `--out-precursors`, `--out-fragments` (the library pair) |
+| `search-seed` (`main.rs:71`) | `--ms2`, `--library-precursors`, `--library-fragments`, `--config` | `--out` = `seed_psms.parquet` (+ `<out>.masscal.json`) |
+| `rt-im-train` (`main.rs:84`) | `--seed-psms`, `--library-precursors`, `--config` | `--out-windows` = `run_windows.parquet`, `--out-cal` = `cal.json` |
+| `extract` (`main.rs:97`) | `--ms2`, `--library-precursors`, `--library-fragments`, `--run-windows`, `--ms1` (opt), `--mass-cal` (opt), `--restrict-candidates` (opt allowlist), `--config` | `--out-psms` = `psms_extracted.parquet`, `--out-chrom` = `chromatograms.parquet` (+ `<psms>.peaks.parquet` when `retain_top_peaks>1`) |
+| `features` (`main.rs:126`) | `--psms`, `--chromatograms`, `--seed` (opt), `--config` | `--out` = `features.parquet` (+ `.schema.json`), `--out-pin` = PIN |
+| `compete` (`main.rs:142`) | `--features`, `--config` | `--out` = `psms_competed.parquet` (+ `.schema.json`) |
+| `rescore` (`main.rs:151`) | `--competed` (1+ competed tables), `--config` | `--out` = `psms_scored.parquet` |
+| `quant` (`main.rs:161`) | `--psms-scored`, `--chromatograms`, `--config` | `--out-peptide`, `--out-protein`, `--out-fragment` (opt), `--out-peak-bounds` (opt) |
+| `quant-lfq` (`main.rs:180`) | `--inputs` (1+ per-run tables), `--method` (`maxlfq` default / `directlfq`), `--normalize` (`median_ratio` default / `median` / `none`) | `--out` = protein-by-run matrix; no `--config` |
+| `run` (`main.rs:195`) | `--mzml`, `--out-dir`; `--fasta` xor (`--lib-precursors` + `--lib-fragments`); `--config`, `--profile`, `--max-spectra`, `--top-peaks-ms2` | the full chain + `manifest.json` |
+| `align` (`main.rs:226`) | `--seeds` (1+ `seed_psms`, first = reference), `--config` | `--out` = `alignment.parquet` |
+| `mbr` (`main.rs:236`) | `--scored` (experiment-wide `scored_combined`), `--psms` (1+ per-run in `source` order), `--frag` (0+ per-run `fragment_quant`), `--config` | `--out` = `transferred.parquet`, `--out-scored` (opt augmented scored) |
+| `inspect` (`main.rs:257`) | positional `artifact` (any parquet) | schema + head + row count to stdout; no `--config` |
+| `audit` (`main.rs:263`) | `--library-precursors`, `--psms`, `--competed`, `--scored`, `--q` (0.01), `--run-id` (`run`), `--entrapment-substr` (`""`) | `--out` = `candidate_audit.parquet`; no `--config` |
+| `report` (`main.rs:290`) | `--scored`, `--peptide-quant` (opt), `--protein-quant` (opt), `--q` (0.01) | `peptides.tsv` + `proteins.tsv` in `--out-dir` |
+| `doctor` (`main.rs:303`) | `--config` (opt) | probes the configured sidecar interpreters; nonzero exit if any FAIL |
+
+Per-subcommand specifics that are easy to miss:
+
+- `convert` is the only stage command with no `--config`; it always runs on
+  `Config::default()` (`main.rs:384`). Because the three caps are not part of the
+  config, `convert` folds them into the artifact `config_hash` (`main.rs:389`,
+  comment.md A2/C4) so two different caps do not collide on an identical hash.
+  `top_peaks_ms2` is an irreversible conversion-time cap that also affects
+  extraction/features/quant; `search_seed.top_n_peaks` is the seed-only
+  alternative.
+- `quant-lfq`, `inspect`, `audit`, and `report` also take no `--config`.
+  `quant-lfq` validates its two string flags: `--method` must be `maxlfq` or
+  `directlfq` (`main.rs:619`) and `--normalize` is parsed by
+  `NormalizeMethod::from_token` (`config.rs:796`), erroring on anything but
+  `median_ratio`/`median`/`none` (`main.rs:622`).
+- `search-seed` reads `extract.bucket_size` from the config (not a `search_seed`
+  field) for its fragment-index bucketing (`main.rs:456`, `run.rs:177`).
+- `rescore` standalone accepts several `--competed` tables for experiment-wide
+  scoring and uses a fixed `sidecar_work` working directory (`main.rs:563`);
+  inside `run` it is passed exactly one table and a per-out-dir work directory.
+- `align` uses `rt_im_train.q_train` for its training set and a hardcoded 100-knot
+  grid (`main.rs:632-634`); it needs >=2 seeds and is not part of the `run` chain.
+- `mbr` (`main.rs:637`) is a wired standalone command, not part of `run`. It
+  hard-errors when `mbr.strategy = none` (`main.rs:639`), when fewer than two
+  `--psms` are supplied (`main.rs:644`), or when `mbr.python` is unset
+  (`main.rs:647`), then runs the `mbr_worker.py` sidecar with the `mbr.*`
+  thresholds (`main.rs:652`). It transfers identifications across a run set
+  (Stage D3); see the extend section for its stub status inside `run`.
+- `doctor` (`main.rs:311`) probes three interpreters and prints `[ ok ]` /
+  `[FAIL]` / `[skip]` per line, exiting nonzero if any fail: `rescore.python`
+  (packages depend on the classifier: `torch,numpy,pandas,pyarrow` for `nn_torch`,
+  else `mokapot,sklearn,numpy,pandas,pyarrow`), `predict_frag.deeplc_python`
+  (`deeplc,numpy,pandas`), and `predict_frag.ms2pip_python`
+  (`ms2pip,numpy,pandas`).
+
 ## How it works
 
 ### The pipeline as a graph
@@ -228,7 +295,12 @@ the two source configurations must be present, and every required input path mus
 exist (`run.rs:42-62`). It also checks sidecar prerequisites: `finetune_deeplc`
 requires `predict_frag.deeplc_python` (`run.rs:63`); `rescore.classifier=mokapot`
 requires `rescore.python`; `rescore.classifier=entrapment` requires
-`rescore.entrapment_marker` (`run.rs:69-79`).
+`rescore.entrapment_marker` (`run.rs:69-79`). Note the asymmetry: the match arms
+cover only `Mokapot` and `Entrapment` (`run.rs:70,74`), so `nn_torch` with no
+`rescore.python` is not caught at preflight even though it needs an interpreter;
+that misconfiguration surfaces later in the rescore stage (or falls back to the
+native rescorer unless `rescore.strict` is set). `doctor` is the tool that checks
+`nn_torch`'s interpreter.
 
 ### The per-run chain
 
@@ -238,19 +310,26 @@ recording each output in the manifest with `record_artifact` (`run.rs:83-343`):
 1. `convert::run` (`run.rs:152`) reads the mzML through mzdata, centroids profile
    spectra, caps peaks, synthesizes a full-range window for AIF/all-ion scans,
    and writes the four spectra artifacts. It returns a `ConvertOutputs` struct of
-   paths (`convert.rs:96`).
+   paths (`convert.rs:96`). `run` forwards its `max_spectra` and `top_peaks_ms2`
+   but forces `top_peaks_ms1 = 0` (`run.rs:157`), so `run` never caps MS1 peaks;
+   only the standalone `convert` command can (`--top-peaks-ms1`).
 
 2. `search_seed::run` (`run.rs:171`) runs a native Sage-lite broad DIA search over
    `spectra_ms2` against the fragment index for calibration (not final ID). It
    writes `seed_psms.parquet` and the mass recalibration `masscal.json`. The seed
    is iRT-independent, so it is computed once here on the base library and reused.
+   It borrows `extract.bucket_size` for the fragment-index bucketing
+   (`run.rs:177`), not a `search_seed` field.
 
 3. Optional DeepLC multitask fine-tune (`run.rs:187`, gated on
    `rt_im_train.finetune_deeplc`): `sidecar::run_deeplc_finetune` adapts the RT
    model to this run's confident seed PSMs and rewrites `predicted_irt` into
-   `fragment_library_precursors_ft.parquet`. The `lib_p` binding is then rebound
-   to the fine-tuned file so rt-im-train and extract read it. `lib_f` is
-   unchanged (fine-tune touches iRT only). This step is nondeterministic (no fixed
+   `fragment_library_precursors_ft.parquet`. It is driven by the `rt_im_train`
+   fields `finetune_epochs`, `finetune_patience`, `q_train` (the confident-seed
+   cutoff), and `finetune_batch` (`run.rs:200-203`; `finetune_batch = 0`
+   auto-scales the batch to the seed size). The `lib_p` binding is then rebound to
+   the fine-tuned file so rt-im-train and extract read it. `lib_f` is unchanged
+   (fine-tune touches iRT only). This step is nondeterministic (no fixed
    torch/numpy seed).
 
 4. `rt_im_train::run` (`run.rs:212`) maps the run-independent iRT onto this run's
@@ -280,7 +359,9 @@ recording each output in the manifest with `record_artifact` (`run.rs:83-343`):
 9. Optional `audit::run` (`run.rs:276`, gated on `extract.emit_candidate_audit`)
    reconstructs the per-candidate identification-loss ladder into
    `candidate_audit.parquet`. It is a cheap join over the artifact chain and runs
-   no extraction.
+   no extraction. Inside `run` its parameters are fixed: `q_threshold = 0.01`,
+   `run_id = out_dir`, and an empty `entrapment_substr` (`run.rs:284-286`); the
+   standalone `audit` command exposes all three as flags.
 
 10. `quant::run` (`run.rs:293`) integrates fragment chromatograms and rolls up to
     protein groups, writing `peptide_quant`, `protein_group_quant`, and
@@ -292,13 +373,22 @@ recording each output in the manifest with `record_artifact` (`run.rs:83-343`):
 
 ### The manifest
 
-`Manifest::new` (`manifest.rs:34`) is seeded with the fully-resolved canonical
-config JSON and its blake3 hash (`run.rs:87,91`). Every stage output is recorded
-by `record_artifact` (`mumdia-io`), which builds an `ArtifactRecord`
-(`manifest.rs:10`) holding the logical name, path, format, schema name and
-version, row count, content hash, producing stage, and config hash. Model
-identities (RT predictor, fragment predictor, rescorer, and the feature schema
-id) are recorded at `run.rs:323-333`. The manifest is written last to
+`Manifest` (`manifest.rs:22`) has five fields: `mumdia_version` (the crate
+version, `env!("CARGO_PKG_VERSION")`, stamped by `Manifest::new`), `config_json`
+(the fully-resolved canonical config), `config_hash` (its blake3 hash),
+`model_identities` (a `BTreeMap<String, String>`), and `artifacts` (a
+`BTreeMap<String, ArtifactRecord>`). `Manifest::new` (`manifest.rs:34`) seeds it
+with the canonical config JSON and hash (`run.rs:87,91`). Every stage output is
+recorded by `record_artifact` (`mumdia-io`), which builds an `ArtifactRecord`
+(`manifest.rs:10`) with nine fields: `logical_name`, `path`, `format`,
+`schema_name`, `schema_version`, `rows`, `content_hash`, `producing_stage`, and
+`config_hash`. `Manifest::record` (`manifest.rs:44`) keys artifacts by
+`logical_name`, so re-recording the same logical name overwrites and the map is
+sorted, not insertion-ordered. The `producing_stage` is the stage name
+(`digest`, `convert`, ...); in library-input mode the two library records carry
+the synthetic stage `"library-input"` (`run.rs:107-108`). Four `model_identities`
+keys are recorded at `run.rs:323-332`: `rt_predictor`, `fragment_predictor`,
+`rescorer`, and `feature_schema_id`. The manifest is written last to
 `<out_dir>/manifest.json` (`run.rs:334`) with `mumdia_io::json::write_json`. The
 manifest is provenance recorded, not required: because inputs are
 path-addressable, no stage depends on it to run (plan.md Section 3.5).
@@ -342,6 +432,8 @@ fallback. This preset is invoked through `docker/config.diann-lib.json` plus
 | `artifact` module | `schema.rs:6` | Frozen `(logical name, schema version)` constants. |
 | `Config::apply_profile` | `config.rs:1098` | Applies the `dia` preset (Extended features, apex window 5, RT prior 120 s). |
 | `Config::canonical_json` | `config.rs:1116` | Canonical JSON for hashing into the manifest. |
+| `NormalizeMethod::from_token` | `config.rs:796` | Parses `--normalize` for `quant-lfq` (`median_ratio`/`median`/`none`). |
+| `Manifest::record` | `manifest.rs:44` | Inserts an `ArtifactRecord` keyed by `logical_name` (overwrites, sorted map). |
 | `Col` (enum) | `table.rs:23` | Typed column for writing Parquet; `LargeListF32` for chromatograms. |
 | `Table::read` + typed getters | `table.rs:204` | Reads a Parquet artifact and extracts typed columns. |
 
@@ -360,22 +452,28 @@ config (`main.rs:581`) before `run`. The fields this overview area touches:
 | `peptidoforms.charge_min` / `charge_max` | `2` / `3` | Precursor charge range enumerated in FASTA mode. |
 | `predict_frag.rt_predictor` | `native` | `native` or `deeplc` iRT source (recorded in manifest). |
 | `predict_frag.predictor` | `native` | `native` or `ms2pip` fragment intensities. |
-| `predict_frag.deeplc_python` | `None` | Interpreter for DeepLC; required if `finetune_deeplc`. |
-| `predict_frag.sidecar_script_dir` | `"scripts"` | Where sidecar workers are resolved from. |
+| `predict_frag.deeplc_python` | `None` | Interpreter for DeepLC; required if `finetune_deeplc`; probed by `doctor`. |
+| `predict_frag.ms2pip_python` | `None` | Interpreter for MS2PIP; probed by `doctor` (`main.rs:323`). |
+| `predict_frag.sidecar_script_dir` | `"scripts"` | Where sidecar workers are resolved from (used by `rescore`/`mbr`). |
 | `search_seed.top_n_peaks` | `300` | Seed-only MS2 peak cap (keep 300 on AIF, finding 4). |
+| `extract.bucket_size` | (see `ExtractConfig`) | Fragment-index bucket width; `search-seed` reads it too (`main.rs:456`). |
 | `rt_im_train.calibration_method` | `loess` | RT calibration; `none` is rejected by validation. |
+| `rt_im_train.q_train` | (see `RtImTrainConfig`) | Confident-seed q cutoff for the DeepLC fine-tune and the `align` reference set. |
 | `rt_im_train.finetune_deeplc` | `false` | Enables the per-run DeepLC fine-tune of iRT (best workflow). |
+| `rt_im_train.finetune_epochs` / `finetune_patience` | (see config) | DeepLC fine-tune schedule (`run.rs:200-201`). |
 | `rt_im_train.finetune_batch` | `0` | `0` auto-scales the fine-tune batch to seed size. |
 | `extract.min_frag_corr` | `0.2` | Spectral-agreement gate threshold; loose default suits `nn_torch`. |
 | `extract.gate_mode` | `apex_pearson` | Which spectral score the gate thresholds (`GateMode`, `config.rs:591`). |
 | `extract.retain_top_peaks` | `1` | `>1` writes the `<psms>.peaks.parquet` sidecar (not yet scored). |
 | `extract.emit_candidate_audit` | `false` | Emits `candidate_audit.parquet` in `run`. |
 | `extract.emit_gate_diagnostics` | `false` | Adds the four `gate_*` columns to `psms_extracted`. |
-| `features.set` | `minimal` | `minimal` (14) / `rich` (44) / `extended` (~381); `dia` profile sets extended. |
+| `features.set` | `minimal` | `minimal` (14) / `rich` (44) / `extended` (381, per `active_features` test `features.rs:1436-1443`); `dia` profile sets extended. |
 | `compete.mode` | `winner_take_all` | Within-group competition resolution (`CompetitionMode`). |
 | `rescore.classifier` | `native_tda` | Rescorer; `nn_torch` is the best lever, needs `rescore.python`. |
 | `rescore.python` | `None` | Interpreter for mokapot / nn_torch / entrapment sidecars. |
-| `quant.q_threshold` | (see `QuantConfig`) | q-value threshold for the human-readable report. |
+| `mbr.strategy` | `none` | MBR mode; `none` makes the standalone `mumdia mbr` command error out (`main.rs:639`). |
+| `mbr.python` | `None` | `mbr_worker.py` interpreter; required when `strategy != none` (`main.rs:647`). |
+| `quant.q_threshold` | `0.01` (`QuantConfig`) | q-value threshold for the human-readable report. |
 
 The config surface was recently pruned of dead or unwired fields (plan.md
 "Config-surface note"): `threads`, `extract.{k_select, max_fragment_charge,
@@ -385,7 +483,9 @@ scan_scale, scan_window_mode}` + `ScanWindowMode`, `digest.decoy.{ratio, source}
 `CompetitionMode::from_token` were removed. Do not reintroduce them. Kept
 deliberately as documented hooks: `DecoyStrategy::DiannShift` (deferred,
 license-checked; rejected by validation), `CalibrationMethod::None` (rejected by
-validation with a clear message), and the whole `mbr` section (planned feature).
+validation with a clear message), and the whole `mbr` section, which is wired to
+the standalone `mumdia mbr` command (`main.rs:637`, calls `mbr_worker.py`) but is
+not part of the `run` chain and needs >=2 runs.
 
 ## Invariants, determinism, gotchas
 
@@ -434,7 +534,9 @@ validation with a clear message), and the whole `mbr` section (planned feature).
 - To wire a new sidecar: follow the positional-CLI file contract
   (`sidecar::resolve_script` + a worker in `scripts/`), gate it behind a config
   field, and check its prerequisites in `preflight` and `doctor`.
-- Stubs and unwired areas to be aware of: `mbr` is a partial sidecar, not the full
-  experiment-wide flow; `align` is not in the `run` chain (needs >=2 runs); ion
-  mobility / 4D is a data-model stub only (IM columns are always null in 3D);
-  vendor readers other than mzML do not exist. Do not document these as complete.
+- Stubs and unwired areas to be aware of: `mbr` has a wired standalone command
+  (`mumdia mbr` -> `mbr_worker.py`) but is a partial sidecar (not the full
+  experiment-wide flow) and is not in the `run` chain (needs >=2 runs); `align` is
+  likewise standalone-only (needs >=2 runs); ion mobility / 4D is a data-model
+  stub only (IM columns are always null in 3D); vendor readers other than mzML do
+  not exist. Do not document these as complete.

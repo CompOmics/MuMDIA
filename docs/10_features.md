@@ -95,7 +95,9 @@ downstream and plotting read them rather than re-derive).
   (`write_pin`, `features.rs:1388`).
 - `<out>.report.json` (`ArtifactReport`, `features.rs:866`): logical name
   `features`, schema version 1, `stats` carrying `feature_schema_id`,
-  `n_features`, and `set`.
+  `n_features`, and `set`; `params` records `set` and
+  `coelution_corr_threshold` (`features.rs:873`); `content_hash` is the blake3 of
+  the features Parquet; `model_identity` is `None`.
 
 ## How it works
 
@@ -171,6 +173,36 @@ A cheap heuristic (not a trained score) that rewards matched-fragment count
 scaled by spectral correlation, co-elution, and log intensity, penalized by
 gradient-normalized RT error. `compete` uses it as the within-group ranking key.
 
+### Directly-computed Minimal/Rich scalars (serial loop, `features.rs:744`-`818`)
+
+Several Minimal/Rich columns are assembled inline in the serial loop rather than
+inside `fragment_features`:
+
+- `rt_error_abs` = `|apex_rt - rt_pred_cal|`; `rt_error_rel` = that over
+  `gradient` (`features.rs:754`-`755`).
+- `log_apex_intensity` = `ln(1 + apex_intensity)` (`features.rs:758`).
+- `n_matched_fragments`, `coelution_run`, `charge` pass through from the PSM
+  columns; `peptide_length` calls `peptide_length(peptidoform)`.
+- `n_proteins` = `protein.matches(';').count() + 1` (`features.rs:767`): the
+  `protein` string is semicolon-delimited, so this counts group membership.
+- `diff_by_intensity` = `sum_b_intensity - sum_y_intensity` (`features.rs:774`).
+- `matched_fraction` = `n_matched / max(1, n_predicted)` (`features.rs:788`-
+  `792`).
+
+### MS1 isotope features (Rich set, `isotope_features`, `features.rs:1367`)
+
+The four Rich MS1 columns (`isotope_corr`, `ms1_isom1_ratio`, `log_mono_ms1`,
+`has_ms1`) come from `isotope_features` (`features.rs:1367`) over the apex
+isotope intensities carried on the PSM rows. It fits a Poisson-averagine envelope
+`[1, lambda, lambda^2/2]` with `lambda = 0.00052 * neutral_mass`
+(`features.rs:1377`), the neutral mass being
+`precursor_mz * charge - charge * PROTON` (`features.rs:750`). This `0.00052`
+averagine differs from the `0.000594` used by the Extended `ms1` family
+(`ms1.rs:81`); the two MS1 code paths are independent and both are kept.
+`isotope_corr` = `pearson([mono, +1, +2], theo)`, `ms1_isom1_ratio` =
+`isom1 / (mono + 1)`, `log_mono_ms1` = `ln(1 + mono)`, `has_ms1` = 1.0 when
+`mono`/`+1`/`+2` are all present, else all four return 0.0.
+
 ### The Evidence struct (`features.rs:278`)
 
 `build_evidence` (`features.rs:345`) constructs the per-PSM `Evidence` handed to
@@ -185,10 +217,13 @@ every Extended family. It mirrors the alignment and peak-bounding of
   `obs_apex` (intensity at the apex scan; `> 0` defines "matched"), `is_b`,
   `ordinal`, `frag_charge`, `frag_mz` (theoretical), `frag_obs_mz` (intensity-
   weighted observed), `mass_err_ppm` (signed ppm).
+- `apex_rt` is set inside `build_evidence` itself (`features.rs:483`) from its
+  `apex_rt` argument, not by the caller.
 - Scalars filled by the caller after build (`features.rs:718`-`732`):
-  `apex_rt`, `rt_pred_cal`, `rt_err`, `gradient`, `precursor_mz`, `charge`,
-  `seq_len`, `n_matched`, `n_predicted`, `seed_score`, `seed_identified`,
-  `apex_intensity`.
+  `rt_pred_cal`, `rt_err`, `gradient`, `precursor_mz`, `charge`, `seq_len`,
+  `n_matched`, `n_predicted`, `seed_score`, `seed_identified`, `apex_intensity`
+  (plus the MS1 apex isotopes below, `features.rs:729`-`732`). All start at a
+  zero/`None` default set by `build_evidence` (`features.rs:483`-`499`).
 - MS1: `ms1_mono`/`ms1_iso1`/`ms1_iso2`/`ms1_isom1` (apex isotope intensities,
   `None` when no MS1) and `ms1_xic` (the `[mono,+1,+2]` XICs resampled onto
   `axis`; empty unless the extract stage persisted `ms1_*` chromatogram rows).
@@ -310,7 +345,9 @@ charge-1 vs multiply-charged). Names include `frag_ref_corr_mean`,
 `frag_ref_corr_mean_full`, `full_vs_peak_corr_gain`,
 `pairwise_coelution_weighted`, `pairwise_coelution_min/median/std/frac_negative`,
 `pairwise_coelution_hi/lo`, `coelution_hi_lo_contrast`,
-`coelution_corr_entropy`, the `xcorr_shape_*` and `xcorr_lag_*` statistics
+`coelution_corr_entropy` (Shannon entropy of a 10-bin `NBINS_CORR`
+pairwise-Pearson histogram over `[-1, 1]`), the `xcorr_shape_*` and
+`xcorr_lag_*` statistics
 (`_mean/_min/_std/_mean_abs/_iqr/_frac_zero/_max_abs/_entropy`),
 `ref_xcorr_lag_mean`, `ref_xcorr_shape_mean`, `observed_sum_vs_template_corr`,
 `frag_loo_ref_corr_mean/_min`, `frac_frags_apex_aligned`, `top3_frag_ref_corr`,
@@ -321,8 +358,15 @@ and is emitted once under the latter.
 ### interference (26, `interference.rs`)
 
 Co-isolation/chimera detection via the least-squares scale
-`r_f = <x_f, R> / <R, R>` projecting each fragment onto R. Names:
-`explained_variance_ref`, `profile_residual_fraction`, `n_interfered_fragments`,
+`r_f = <x_f, R> / <R, R>` projecting each fragment onto R. Two gating constants:
+`IFS_MIN_CORR = 0.6` (`interference.rs:48`) prunes the least-coherent matched
+fragment in the iterative `remove_ifs` loop until its leave-one-out ref-corr
+stays above it or only 3 fragments remain, and `COHERENT_THR = 0.7`
+(`interference.rs:47`) gates `explained_apex_intensity_frac` and `apex_purity`
+(only fragments with ref-corr at or above it count as explained);
+`n_interfered_fragments` flags a fragment whose apex intensity exceeds
+`2 * r_f * R_apex`. Names: `explained_variance_ref`,
+`profile_residual_fraction`, `n_interfered_fragments`,
 `corrected_vs_raw_cos`, `corrected_vs_raw_ratio`, the iterative interference-
 removal block (`ifs_removed_count`, `ifs_removed_intensity_frac`,
 `ifs_corr_gain`, `ifs_retained_frac`, `matched_frac_after_ifs`), the peak-vs-
@@ -458,7 +502,9 @@ Fragment apex dispersion and consensus peak shape, intensity-independent
 `frag_apex_rt_mad`, `frag_apex_max_dev`, `frag_apex_mean_dev`,
 `frag_apex_agree_frac`, `precursor_frag_apex_delta`, `peak_symmetry`,
 `peak_tailing`, `peak_n_local_maxima`, `peak_shoulder_score`, `peak_fwhm_scans`,
-`peak_truncation`, `apex_frac_of_window`. Has unit tests
+`peak_truncation`, `apex_frac_of_window`. `precursor_frag_apex_delta` reads the
+mono MS1 XIC (`ms1_xic[0]`) and is 0.0 until the extract stage persists MS1
+isotope XICs (the same evidence gap as the `ms1` XIC block). Has unit tests
 (`apex_dispersion.rs:226`).
 
 ### mass_uncertainty (10, `mass_uncertainty.rs`)
@@ -498,11 +544,15 @@ When `bound_from_confident` is true (the default), the stage learns one pair of
 elution half-widths `(L, R)` in seconds from the confident-target seed set
 (`spectrum_q <= 0.01`, `label == "target"`; the same anchor set used for RT
 calibration and DeepLC fine-tune). For each confident candidate it detects the
-per-candidate peak with `elution_peak_rt_bounds` (`features.rs:1038`) and
-records `apex - lo` and `hi - apex`. If at least 20 anchors resolve, it takes
-the `bound_confident_pct` percentile of the left and right half-widths (median
-by default) and returns `Some((L, R))`; every candidate is then bounded on
-`[apex - L, apex + R]` via `global_bound_indices` (`features.rs:1011`). This
+per-candidate peak with `elution_peak_rt_bounds` (`features.rs:1038`, which
+returns `None` for a candidate with fewer than 3 distinct scans, so it does not
+contribute an anchor) and records `apex - lo` and `hi - apex`. If at least 20
+anchors resolve, it takes the `bound_confident_pct` percentile of the left and
+right half-widths (median by default) and returns `Some((L, R))`; every
+candidate is then bounded on `[apex - L, apex + R]` via `global_bound_indices`
+(`features.rs:1011`), which falls back to the single apex-nearest scan
+`(ai, ai)` when the mapped window collapses between grid points (sparse grid or
+a half-width below one cycle). This
 removes per-candidate boundary manipulation, so a chimeric decoy is scored over
 a real-peptide-width window centred on its apex rather than one it can widen or
 narrow. With fewer than 20 anchors the stage logs a warning and falls back to
@@ -522,21 +572,26 @@ vector is all-zero. `spectral_angle` (`stats.rs:44`) is
 `1 - 2 * acos(clamp(cosine, -1, 1)) / pi`, in [0,1] with 1 = identical. Families
 add local specializations that do not belong in the shared kernel (weighted
 Pearson, Spearman via `pearson` on average ranks, Kendall tau, windowed cross-
-correlation via `super::best_xcorr`), but the base Pearson/cosine call the
-shared functions.
+correlation via `super::best_xcorr`, `features.rs:1337`, which returns the best
+normalized correlation and its integer lag over `[-maxlag, maxlag]` as
+`(lag_of_max, value.max(0.0))`), but the base Pearson/cosine call the shared
+functions.
 
 ## Configuration
 
-`FeaturesConfig` (`config.rs:618`); all fields have `#[serde(default)]` and the
-config was pruned of dead fields (the `FeatureSet::Custom` variant no longer
-exists).
+`FeaturesConfig` (`config.rs:618`) is `#[serde(default, deny_unknown_fields)]`,
+so every field defaults independently and an unknown config key is a hard load
+error. The `set` field's default is `t()` (`config.rs:654`), a generic
+`Default`-forwarding helper, so it resolves to `FeatureSet::default()` =
+`Minimal`. The config was pruned of dead fields (the `FeatureSet::Custom`
+variant no longer exists).
 
 | field | default | effect |
 |---|---|---|
 | `set` | `Minimal` | which set `active_features` returns (Minimal 14 / Rich 44 / Extended 381) |
 | `coelution_corr_threshold` | 0.9 | threshold for `n_coelution_above` (count of pairwise fragment correlations at or above it) |
 | `prec_tol_ppm` | 20.0 | precursor tolerance carried for feature bookkeeping |
-| `bound_features` | true | restrict trace-based features to the elution peak instead of the whole extracted window |
+| `bound_features` | true | restrict trace-based features to the elution peak instead of the whole extracted window; **gates only the Minimal/Rich `fragment_features` path** (Extended `build_evidence` always peak-bounds, see gotchas) |
 | `bound_peak_fraction` | 1/3 | peak-boundary threshold as a fraction of apex height (DIA-NN-style; matched DIA-NN RT bounds best) |
 | `bound_peak_grace` | 0 | consecutive sub-threshold scans to bridge before stopping (0 = stop at first miss; 1 bridges a single-scan dip) |
 | `bound_from_confident` | true | learn one global left/right half-width from the confident seed set and apply it to every candidate; false = per-candidate detection |
@@ -575,6 +630,13 @@ not carry the configured fragment tolerance.
 - MS1 XIC features return 0.0 unless the extract stage wrote `ms1_*`
   chromatogram rows; `ms1_xic` is otherwise empty. This is a known evidence gap,
   not a bug.
+- `bound_features` gates only the Minimal/Rich `fragment_features` path
+  (`features.rs:1154`): when false, that path scores over the whole extracted
+  window. The Extended `build_evidence` (`features.rs:345`) takes no such flag
+  and always peak-bounds `axis`/`traces` while still retaining
+  `axis_full`/`traces_full`, so Extended families read whichever window they
+  name regardless of `bound_features`, and `global_bounds` from
+  `bound_from_confident` always applies to them.
 - The peptidoform grouping for cross-charge features uses the ProForma string,
   which is charge-independent and keeps `DECOY_` peptidoforms grouped among
   themselves, so it is not a target/decoy label leak (`features.rs:662`).

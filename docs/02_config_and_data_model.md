@@ -181,7 +181,9 @@ baselines; the profile is a convenience shortcut, not a full preset file.
 residue, `residue_mass(r) + mod_delta`. `residue_mass` (`constants.rs:26-51`) is
 the 20-standard-amino-acid table; `B, J, O, U, X, Z` return `None` (ambiguous /
 non-standard) and cause `MassError::AmbiguousResidue` at parse time. Leucine and
-isoleucine share `113.084064015` (`constants.rs:34-35`).
+isoleucine share `113.084064015` (`constants.rs:34-35`). `is_standard_residue`
+(`constants.rs:54-56`) is the boolean form (`residue_mass(aa).is_some()`), used by
+the digest to reject peptides containing a non-standard residue byte.
 
 **m/z conversion** (`constants.rs:59-62`):
 `mass_to_mz(m, z) = (m + z * PROTON) / z`. `precursor_mz` (`mass.rs:76-78`) is
@@ -194,6 +196,9 @@ this over the neutral mass.
 `(residue_sum_incl_terminus + z * PROTON) / z` (`mass.rs:97`, `mass.rs:116`).
 `Fragment` (`mass.rs:45-53`) carries `ion_type`, `ordinal`, `charge`, `mz`, and a
 stable `name` (`b3`, or `y5^2` for charge 2, `frag_name` at `mass.rs:130-136`).
+`IonType` (`mass.rs:29-42`) is the `B`/`Y` enum; `IonType::symbol()` returns the
+lowercase `'b'`/`'y'` used in the fragment name. These two series are the only
+ones the MVP scores (PLAN.md Decision 3).
 
 **ppm predicates.** Three exist and they differ by which mass normalizes the
 difference; a maintainer must not treat them as interchangeable.
@@ -245,17 +250,77 @@ data model has one `mods[i]` slot per residue plus separate terminal deltas
 | `Config::apply_profile` | config.rs:1098-1112 | `dia` preset only |
 | `Config::canonical_json` | config.rs:1116-1118 | Serialize for manifest hashing |
 | `residue_mass` | constants.rs:26-51 | 20-AA monoisotopic table; `None` for ambiguous |
+| `is_standard_residue` | constants.rs:54-56 | `residue_mass(aa).is_some()` boolean form |
 | `mass_to_mz` | constants.rs:59-62 | Neutral mass -> m/z |
 | `ppm_diff` / `ppm_match` | constants.rs:66-74 | Theoretical-relative signed ppm + tolerance test |
 | `ppm_bounds` | constants.rs:78-81 | Query-centered symmetric m/z window |
 | `within_ppm` | constants.rs:92-96 | Min-relative canonical index predicate |
 | `parse_peptidoform` | mass.rs:143-203 | ProForma-lite parser |
 | `ParsedPeptidoform::fragments` | mass.rs:82-127 | b/y ions, drops b1/y1/y2 |
+| `IonType` | mass.rs:29-42 | `B`/`Y` enum; `symbol()` -> `'b'`/`'y'` |
 | `unimod_mass` | mass.rs:13-26 | 8-name UniMod subset |
-| `Manifest` / `ArtifactRecord` | manifest.rs:9-51 | Run provenance |
+| `Manifest` / `ArtifactRecord` | manifest.rs:9-51 | Run provenance; `new`/`record`/`get` (manifest.rs:33-51) |
 | `record_artifact` | mumdia-io/src/lib.rs:20-39 | Build `ArtifactRecord`, hash file |
 | `RejectionReason` | rejection.rs:19-113 | Ordered identification-loss ladder |
-| `Label` | types.rs:33-51 | Target/Decoy; `.pin()` = +1/-1 |
+| `Label` | types.rs:33-51 | Target/Decoy; `.pin()` = +1/-1, `.is_decoy()` |
+
+### Core data types (`types.rs`)
+
+Ion mobility is `Option`/nullable throughout so one model serves 3D and 4D runs;
+the MVP is 3D so every IM field is `None` (`types.rs:1-3`).
+
+| Type | file:line | Fields / behavior |
+|---|---|---|
+| `Peak` | types.rs:9-13 | `mz` f64, `intensity` f32, `ion_mobility` `Option<f32>` (`None` for Orbitrap DIA) |
+| `IsolationWindow` | types.rs:17-30 | `target_mz`/`lower_mz`/`upper_mz` f64, `im_lower`/`im_upper` `Option<f32>`; `covers(mz)` is inclusive m/z containment (`types.rs:26-29`) |
+| `Label` | types.rs:33-51 | `Target`/`Decoy` (serde snake_case); `pin()` -> +1/-1 (Percolator), `is_decoy()` |
+| `Ms2Scan` | types.rs:54-62 | `scan_index` u32, `id` String, `rt_seconds` f64, `window`, m/z-sorted `peaks` `Vec<Peak>` |
+
+### Error types (`error.rs`)
+
+Both enums derive `thiserror::Error`; the `#[error(...)]` string is the Display
+message. Misconfiguration and bad input fail loudly (PLAN.md Section 7).
+
+| Variant | file:line | Raised when |
+|---|---|---|
+| `MassError::Parse(String)` | error.rs:8-9 | peptidoform parse failure: stray `-`, non-alphabetic char, unclosed `[`, or no residues (mass.rs:172, 175, 195, 212) |
+| `MassError::AmbiguousResidue(char)` | error.rs:10-11 | a residue with no monoisotopic mass (B/J/O/U/X/Z) at parse (mass.rs:181) |
+| `MassError::UnknownModification(String)` | error.rs:12-13 | a `[...]` mod that is neither a UniMod name nor a parseable signed float (mass.rs:219) |
+| `ConfigError::Parse(String)` | error.rs:18-19 | `serde_json` failure inside `Config::from_json` (config.rs:1048) |
+| `ConfigError::Invalid(String)` | error.rs:20-21 | a `validate()` rejection or unknown `--profile` (config.rs:1059-1088, 1106) |
+
+### Candidate-audit reason ladder (`rejection.rs`)
+
+`RejectionReason` is the ordered identification-loss ladder written to the
+candidate-audit table (`emit_candidate_audit` / `mumdia audit`). Each candidate's
+row records the EARLIEST stage at which it was lost, so the aggregate answers
+"where was each DIA-NN-only precursor first lost?" without conflating later
+stages. The serialized spelling is `SCREAMING_SNAKE_CASE` and equals
+`code()`; `code()` (rejection.rs:50-71) is the stable string written to
+Parquet/JSON without a serde round-trip. `stage_order()` (rejection.rs:76-97) is
+the ladder position (0 = earliest); `earliest(a, b)` (rejection.rs:106-112) keeps
+the smaller `stage_order` and `Reported` never overrides a real rejection;
+`is_rejection()` (rejection.rs:100-102) is true for any non-`Reported` variant.
+
+| `stage_order` | Variant / `code()` | Stage lost at |
+|---|---|---|
+| 0 | `PeptideNotGenerated` / `PEPTIDE_NOT_GENERATED` | search space (A) |
+| 1 | `ModificationNotAllowed` / `MODIFICATION_NOT_ALLOWED` | search space (A) |
+| 2 | `ChargeOutOfRange` / `CHARGE_OUT_OF_RANGE` | search space (A) |
+| 3 | `PrecursorMzOutOfRange` / `PRECURSOR_MZ_OUT_OF_RANGE` | search space (A) |
+| 4 | `NoValidFragments` / `NO_VALID_FRAGMENTS` | search space (A) |
+| 5 | `WrongIsolationWindow` / `WRONG_ISOLATION_WINDOW` | search space (A) |
+| 6 | `RtPruned` / `RT_PRUNED` | candidate generation (B) |
+| 7 | `CandidateCapReached` / `CANDIDATE_CAP_REACHED` | candidate generation (B) |
+| 8 | `NoFragmentTraces` / `NO_FRAGMENT_TRACES` | extraction (C, D) |
+| 9 | `NoPeakGroup` / `NO_PEAK_GROUP` | extraction (C, D) |
+| 10 | `PeakNotSelected` / `PEAK_NOT_SELECTED` | peak/peptide ranking (E) |
+| 11 | `OutcompetedByTarget` / `OUTCOMPETED_BY_TARGET` | competition (G) |
+| 12 | `OutcompetedByDecoy` / `OUTCOMPETED_BY_DECOY` | competition (G) |
+| 13 | `FailedPrecursorFdr` / `FAILED_PRECURSOR_FDR` | FDR + reporting (H) |
+| 14 | `FailedPeptideFdr` / `FAILED_PEPTIDE_FDR` | FDR + reporting (H) |
+| 15 | `RemovedDuringReporting` / `REMOVED_DURING_REPORTING` | FDR + reporting (H) |
+| 255 | `Reported` / `REPORTED` | sentinel: reached the final report (not a loss) |
 
 ## Configuration
 
@@ -271,7 +336,7 @@ called out explicitly.
 | `MatcherKind` | config.rs:42-45 | `bucketed`, **`fragindex`** | fragment-matcher backend for search-seed + extract |
 | `Enzyme` | config.rs:54-59 | **`trypsin_p`**, `trypsin` | cut after K/R, with/without before-P |
 | `CalibrationMethod` | config.rs:68-72 | **`loess`**, `linear`, `none` | `none` rejected by validate (falls through to linear) |
-| `FeatureSet` | config.rs:81-90 | **`minimal`** (14), `rich` (44), `extended` (~383) | superset battery in `stages/features/` |
+| `FeatureSet` | config.rs:81-90 | **`minimal`** (14), `rich` (44), `extended` (381) | superset battery in `stages/features/`; count asserted at `features.rs:1443` |
 | `RtPredictorKind` | config.rs:99-105 | **`native`**, `deeplc` | DeepLC is a Python sidecar |
 | `FragPredictorKind` | config.rs:113-119 | **`native`**, `ms2pip` | MS2PIP is a Python sidecar |
 | `RescorerKind` | config.rs:128-150 | **`native_tda`**, `mokapot`, `nn_torch`, `percolator`, `entrapment` | see RescoreConfig |
@@ -286,6 +351,113 @@ called out explicitly.
 | `QuantQColumn` | config.rs:816-828 | **`peptide_q`**, `psm_q`, `run_psm_q` | which q column quant filters on |
 | `MbrStrategy` | config.rs:883-893 | **`none`**, `empirical_library`, `rt_transfer`, `full` | **stub**: only `none` runs; the rest are config hooks (Stage D3 not wired) |
 | `DecoyTransfer` | config.rs:900-907 | **`permuted_rt`**, `reverse_sequence`, `both` | MBR false-transfer null (**stub**, MBR-only) |
+
+#### Variant semantics (behaviorally-rich enums)
+
+The table names every variant; the ones below carry distinct behavior a
+maintainer must not confuse. Line refs are `config.rs`.
+
+**`MatcherKind`** (34-50). `Fragindex` (default) is the log-bin CSR matcher: on
+narrow-window DIA it is ~1.95x faster in search-seed and ~1.26x in extract with
+essentially unchanged IDs (HYE B_01 peptides -0.1%). `Bucketed` is the previous
+`Library::page_search` path, retained for A/B comparison and for the AIF
+full-range-window case, where the min-relative vs query-relative predicate
+difference shifts IDs more.
+
+**`RescorerKind`** (128-150). `NativeTda` (default): native semi-supervised
+linear rescorer + target-decoy q, always available. `Mokapot` (133): mokapot
+Python sidecar over the PIN. `NnTorch` (134-140): PyTorch semi-supervised MLP
+sidecar (`nn_rescore_worker.py`), a nonlinear Percolator/mokapot-style rescorer
+with CV folds + iterative positive re-selection; on the E.coli benchmark it beats
+linear mokapot on the same PIN and gains further when the extraction gate is
+opened; requires `rescore.python` to point at a torch interpreter. `Percolator`
+(141-142): external `percolator.exe` over the PIN. `Entrapment` (143-149): treats
+foreign-proteome PSMs (marked by `entrapment_marker`) as real negatives, trains a
+nonlinear GBM sidecar (out-of-fold by base peptide) or a native linear fallback,
+and reports entrapment-calibrated q-values; the chimeric false matches that
+in-silico decoys under-model appear as real negatives here.
+
+**`PeakClaim`** (157-193) apportions one observed MS2 peak that matches the
+fragments of several co-isolated, co-eluting candidates (near-universal in
+wide-window DIA: ~98% of fragment m/z collide within tolerance), to stop a
+chimeric candidate borrowing a real peptide's peak wholesale. `None` (default,
+legacy): every claimant gets the full peak intensity. `WinnerPredictedIntensity`:
+winner-take-all by highest predicted intensity for the matching fragment.
+`Proportional`: split by predicted intensity. `CoelutionWinner` (two-pass): a
+first pass builds each candidate's per-scan summed-matched-intensity elution
+profile, then the peak goes to the claimant most eluting at that scan (best
+corroborated by its OTHER fragments), not the one predicting the brightest ion.
+`CoelutionProportional` (two-pass): split by per-scan elution-profile height.
+`CoelutionWinnerMargin` (two-pass): winner-take-all only when the top eluter's
+profile height dominates the runner-up by `peak_claim_margin`, else the peak
+stays shared (as `None`).
+
+**`GateMode`** (587-614) selects which spectral-agreement score `min_frag_corr`
+thresholds, all computed at the gate from data in hand. `ApexPearson` (default,
+legacy): Pearson of observed-vs-predicted fragment intensities at the single apex
+scan (one chimeric scan can dominate). `PeakSpectral`: Pearson of the
+peak-integrated observed spectrum (each fragment summed over the elution-peak
+scans) vs predicted; the standard library-dot-product measure. `SpectralEntropy`:
+Li spectral-entropy similarity of the sqrt-transformed apex-scan intensities
+(`spectral_entropy_similarity_sqrt`); the full-feature gate search found it the
+single best gate discriminator (AUC 0.826 / matched-pool recall 69.8% vs apex
+Pearson 0.781 / 64.5%). `Coelution`: predicted-intensity-weighted mean co-elution
+correlation of each matched fragment's XIC to the signature reference over the
+peak (temporal agreement, orthogonal to intensity). `Combined`: require BOTH
+peak-integrated Pearson >= `min_frag_corr` AND co-elution >= `gate_coelution_min`.
+
+**`CompetitionMode`** (705-730). `WinnerTakeAll` (default, legacy): keep only the
+top `prelim_score` per group. `None`: keep every candidate (FDR handles
+ambiguity). `FeaturesOnly`: same retained set as `None`, with conflict/contested
+features carrying the interference signal into rescoring (the name documents
+intent for the experiment matrix). `UniqueEvidence`: keep a loser only when
+`unique_fragment_count >= unique_evidence_min_fragments`, else winner-take-all
+fallback (also falls back to WTA when the feature column is absent).
+`MarginGated`: remove a loser only when `winner_score - loser_score >= margin`,
+else keep it (conservative removal for the low-FDR region). Target/decoy labels
+stay in the competition key in every mode, so a target never competes against its
+own decoy.
+
+**`MbrStrategy`** (876-893) and **`DecoyTransfer`** (895-907) are stubs / config
+hooks (Stage D3 not wired; all require >= 2 runs). `MbrStrategy`: `None` (default)
+reproduces the chain byte-for-byte; `EmpiricalLibrary` builds the cross-run
+consensus anchor library only (M1); `RtTransfer` adds cross-run expected-RT
+transfer extraction (M2/M3); `Full` adds requantification (M5). `DecoyTransfer` is
+the MBR false-transfer null (M4): `PermutedRt` (default) transfers real precursors
+to a decoupled wrong expected RT; `ReverseSequence` transfers reverse/scramble
+decoys at the same expected RT; `Both` combines them.
+
+**`CompeteGroupBy`** (732-741). `Precursor` (default) groups target/decoy pairs
+AND charge variants of one peptide together; `Apex` additionally groups by rounded
+apex RT (`apex_rt_tolerance_s`); `PeptidoformCharge` keeps each distinct
+peptidoform+charge as its own group (precursor-level, as DIA-NN/Spectronaut
+report), recovering sibling charges the peptide-level `Precursor` grouping
+collapses. The label stays in the key in every mode.
+
+**`PeakWindowMode`** (757-771). `PerCandidate` (default): each candidate's quant
+window comes from its own summed-XIC descent walk (exact per peak but stretched by
+interference and collapsed on sparse peaks). `Consensus`: the median left/right
+half-widths of confident peptides (a near-constant instrument/gradient property)
+applied around each candidate's apex; robust to a single distorted window and
+identical across runs, so it preserves fold changes.
+
+**`QuantQColumn`** (806-828) selects which q column quant filters on.
+`PeptideQ` (default) is `peptide_q_value`, correct for a single-run quant. Under an
+experiment-wide rescore, `peptide_q_value` is a GLOBAL per-peptide value carried on
+the single best PSM across all runs, so a per-run quant over one run's slice keeps
+only peptides whose global-best PSM falls in that run, giving disjoint per-run sets
+and an empty cross-run matrix. `PsmQ` filters on per-PSM `q_value` (per run);
+`RunPsmQ` filters on `run_psm_q` (per-run PSM FDR), the correct choice for a
+cross-run/precursor-level quant off an experiment-wide rescore, avoiding an external
+peptide-q overwrite.
+
+**`RollupMethod`** (743-750): `TopNSum` (default) sums the top-N most abundant
+peptides per protein group (`top_n_peptides`); `Sum` sums all group peptides.
+**`NormalizeMethod`** (777-803, `quant-lfq` CLI token, not a config field):
+`MedianRatio` (default) is a DESeq-style median-of-ratios size factor over
+complete-case features, robust to a minority of changing features (does not flatten
+a spike-in design's real fold changes); `Median` aligns each run's median intensity
+(simpler, less robust to composition shifts); `None` uses raw areas.
 
 ### `DigestConfig` (config.rs:217-236)
 
@@ -309,8 +481,10 @@ called out explicitly.
 | `unknown_modification` | `error` | `error` or `skip` |
 
 `ResidueMod` (config.rs:269-276) is `{residue: char, name: String}` where `name`
-is a UniMod name. `deny_unknown_fields` applies but it has no `#[serde(default)]`,
-so both keys are required inside a `ResidueMod` entry.
+is a UniMod name. The doc comment reserves `residue: '*'` for "any" and notes
+terminal mods are handled separately in the MVP (config.rs:272-273).
+`deny_unknown_fields` applies but the struct has no `#[serde(default)]` (unlike
+every other section), so both keys are required inside a `ResidueMod` entry.
 
 ### `PredictFragConfig` (config.rs:290-322)
 
@@ -449,7 +623,7 @@ requiring entrapment/target-decoy FDR validation before use.
 | `entrapment_ratio` | 1.0 | N_real_lib / N_entrap_lib scaling |
 | `strict` | `false` | **default-off** turn any rescorer failure into a hard error (recommended for production) |
 
-### `MbrConfig` (config.rs:909-949) — stub
+### `MbrConfig` (config.rs:909-949), stub
 
 Config hooks only; the MBR stage (D3) is not wired into the run chain. Fields:
 `strategy` (`none` default), `q_anchor` 0.01, `min_anchor_runs` 2,
