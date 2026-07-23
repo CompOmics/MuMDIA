@@ -46,10 +46,16 @@ pub fn run(p: RtImTrainParams) -> Result<u64> {
     let s_q = seed.f64("spectrum_q")?;
     let s_score = seed.f64("score")?;
     let s_rt = seed.f64("observed_rt")?;
+    let s_label = seed.str("label")?;
 
     let mut best_per_pep: HashMap<u32, (f64, f64, f64)> = HashMap::new(); // base -> (score, irt, rt)
     for i in 0..seed.nrows {
         if s_q[i] >= p.cfg.q_train {
+            continue;
+        }
+        // Only target PSMs may anchor the RT calibration; a decoy anchor injects a
+        // random iRT<->RT pair into the fit.
+        if s_label[i] != "target" {
             continue;
         }
         let irt = match irt_by_cid.get(&s_cid[i]) {
@@ -83,8 +89,13 @@ pub fn run(p: RtImTrainParams) -> Result<u64> {
         }
     };
 
-    // Residuals and RT window.
-    let (w_rt, status) = if n_train >= 2 {
+    // Residuals and RT window. Require enough anchors before trusting the
+    // residual-percentile window: with only a handful of points a linear fit
+    // passes ~exactly through them, so residuals ~0 and the window collapses to
+    // the 1s floor (which then discards nearly every true co-elution). Below the
+    // threshold, use the configured fixed fallback instead.
+    let min_anchors = p.cfg.min_seed_for_calibration.max(2);
+    let (w_rt, status) = if n_train >= min_anchors {
         let resid: Vec<f64> = train_irt
             .iter()
             .zip(&train_rt)
@@ -95,9 +106,51 @@ pub fn run(p: RtImTrainParams) -> Result<u64> {
         let status = if use_loess { "loess" } else { "linear" };
         (w, status.to_string())
     } else {
-        warn!("rt-im-train: too few seeds; using fallback fixed RT window");
+        warn!(
+            n_train,
+            min_anchors, "rt-im-train: too few target anchors; using fallback fixed RT window"
+        );
         (p.cfg.fallback_rt_window_s, "fallback_fixed".to_string())
     };
+
+    // Optional adaptive window: local residual-percentile half-width per
+    // calibrated-RT bin, so well-calibrated regions get a tight window (less
+    // interference) and poorly-calibrated regions a wider one (more recall).
+    // `None` keeps the single global `w_rt`. Empty bins fall back to `w_rt`.
+    let adaptive: Option<(f64, f64, Vec<f64>)> =
+        if p.cfg.adaptive_rt_window && n_train >= min_anchors {
+            let cals: Vec<f64> = train_irt.iter().map(|x| predict(*x)).collect();
+            let resid: Vec<f64> = cals.iter().zip(&train_rt).map(|(c, y)| (y - c).abs()).collect();
+            let rt_min = cals.iter().cloned().fold(f64::INFINITY, f64::min);
+            let rt_max = cals.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            let nb = p.cfg.adaptive_rt_bins.max(1);
+            if rt_max > rt_min {
+                let span = rt_max - rt_min;
+                let mut per_bin: Vec<Vec<f64>> = vec![Vec::new(); nb];
+                for (c, r) in cals.iter().zip(&resid) {
+                    let frac = ((c - rt_min) / span).clamp(0.0, 0.999_999);
+                    per_bin[(frac * nb as f64) as usize].push(*r);
+                }
+                let lo_clamp = p.cfg.rt_window_min_s.max(0.0);
+                let hi_clamp = p.cfg.fallback_rt_window_s.max(lo_clamp);
+                let widths: Vec<f64> = per_bin
+                    .iter()
+                    .map(|rs| {
+                        if rs.is_empty() {
+                            w_rt
+                        } else {
+                            (percentile(rs, p.cfg.p_rt) * p.cfg.rt_window_multiplier)
+                                .clamp(lo_clamp, hi_clamp)
+                        }
+                    })
+                    .collect();
+                Some((rt_min, span, widths))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
 
     // Apply to every library candidate.
     let cid = lib_cid;
@@ -109,10 +162,18 @@ pub fn run(p: RtImTrainParams) -> Result<u64> {
         (Vec::with_capacity(n), Vec::with_capacity(n), Vec::with_capacity(n));
     for i in 0..n {
         let cal = predict(irt[i] as f64);
+        let width = match &adaptive {
+            Some((rt_min, span, widths)) => {
+                let nb = widths.len();
+                let frac = ((cal - rt_min) / span).clamp(0.0, 0.999_999);
+                widths[(frac * nb as f64) as usize]
+            }
+            None => w_rt,
+        };
         cid_c.push(cid[i]);
         cal_c.push(cal);
-        lo_c.push(cal - w_rt);
-        hi_c.push(cal + w_rt);
+        lo_c.push(cal - width);
+        hi_c.push(cal + width);
         im_c.push(None);
         imlo_c.push(None);
         imhi_c.push(None);

@@ -53,10 +53,16 @@ pub fn run(p: RescoreParams) -> Result<u64> {
     );
     let mut feats: Vec<Vec<f64>> = Vec::new();
     let mut mz: Vec<f64> = Vec::new();
+    // `source` = index of the competed input each PSM came from (0..N). For a
+    // single-run rescore this is all-zero; for an experiment-wide rescore over
+    // several files it lets quant map each scored PSM back to its run, and it is
+    // why the Mokapot PIN below keys on a unique row index rather than
+    // candidate_id (which is the library index and repeats across runs).
+    let mut source: Vec<u32> = Vec::new();
     // Feature list is taken from the schema companion of the first input so the
     // classifier input matches the set the features stage produced.
     let feat_names = FeatureSchema::read(&p.competed[0])?.feature_columns;
-    for path in p.competed {
+    for (src, path) in p.competed.iter().enumerate() {
         let t = Table::read(path)?;
         let c = t.u32("candidate_id")?;
         let l = t.str("label")?;
@@ -76,9 +82,11 @@ pub fn run(p: RescoreParams) -> Result<u64> {
             charge.push(z[i] as i32);
             prelim.push(pl[i]);
             mz.push(pm[i]);
+            source.push(src as u32);
             feats.push((0..feat_names.len()).map(|k| fcols[k][i]).collect());
         }
     }
+    crate::fdr::validate_labels(&label)?;
     let is_decoy: Vec<bool> = label.iter().map(|l| l == "decoy").collect();
     let (is_entrapment, is_real_target) = classify_entrapment(p.cfg, &protein, &is_decoy);
     let n = cid.len();
@@ -94,7 +102,7 @@ pub fn run(p: RescoreParams) -> Result<u64> {
         Vec::new()
     } else {
         match p.cfg.classifier {
-            RescorerKind::Mokapot => match run_mokapot(&p, &feat_names, &cid, &label, &pform, &protein, &mz, &feats) {
+            RescorerKind::Mokapot => match run_pin_sidecar(&p, "mokapot_worker.py", &feat_names, &cid, &label, &pform, &protein, &mz, &feats) {
                 Ok(s) => {
                     info!("rescore: using Mokapot scores");
                     classifier_used = "mokapot";
@@ -106,7 +114,22 @@ pub fn run(p: RescoreParams) -> Result<u64> {
                         anyhow::bail!("rescore: Mokapot sidecar failed ({e}) and rescore.strict=true");
                     }
                     warn!("rescore: Mokapot failed ({e}); falling back to native_tda");
-                    native_scores(&p, &feats, &is_decoy, &cid, &prelim)
+                    native_scores(&p, &feats, &is_decoy, &base, &prelim)
+                }
+            },
+            RescorerKind::NnTorch => match run_pin_sidecar(&p, "nn_rescore_worker.py", &feat_names, &cid, &label, &pform, &protein, &mz, &feats) {
+                Ok(s) => {
+                    info!("rescore: using PyTorch NN sidecar scores");
+                    classifier_used = "nn_torch";
+                    model_identity = "nn-torch-semisup-sidecar-v1".to_string();
+                    s
+                }
+                Err(e) => {
+                    if p.cfg.strict {
+                        anyhow::bail!("rescore: NnTorch sidecar failed ({e}) and rescore.strict=true");
+                    }
+                    warn!("rescore: NnTorch failed ({e}); falling back to native_tda");
+                    native_scores(&p, &feats, &is_decoy, &base, &prelim)
                 }
             },
             RescorerKind::Percolator => {
@@ -114,9 +137,9 @@ pub fn run(p: RescoreParams) -> Result<u64> {
                     anyhow::bail!("rescore: classifier=percolator but percolator.exe is not wired, and rescore.strict=true");
                 }
                 warn!("rescore: percolator.exe path not wired; using native_tda");
-                native_scores(&p, &feats, &is_decoy, &cid, &prelim)
+                native_scores(&p, &feats, &is_decoy, &base, &prelim)
             }
-            RescorerKind::NativeTda => native_scores(&p, &feats, &is_decoy, &cid, &prelim),
+            RescorerKind::NativeTda => native_scores(&p, &feats, &is_decoy, &base, &prelim),
             RescorerKind::Entrapment => {
                 let n_ent = is_entrapment.iter().filter(|&&b| b).count();
                 if p.cfg.entrapment_marker.is_none() || n_ent == 0 {
@@ -134,7 +157,7 @@ pub fn run(p: RescoreParams) -> Result<u64> {
                          (set rescore.entrapment_marker to the spike-in accession \
                          substring); falling back to native_tda"
                     );
-                    native_scores(&p, &feats, &is_decoy, &cid, &prelim)
+                    native_scores(&p, &feats, &is_decoy, &base, &prelim)
                 } else if p.cfg.python.is_some() {
                     match run_entrapment_gbm(&p, &feat_names, &cid, &base, &is_entrapment, &is_decoy, &feats) {
                         Ok(s) => {
@@ -152,7 +175,7 @@ pub fn run(p: RescoreParams) -> Result<u64> {
                             classifier_used = "entrapment_native";
                             model_identity = "native-percolator-lite-entrapment-v1".to_string();
                             qmode = QMode::Entrapment;
-                            native_scores(&p, &feats, &is_entrapment, &cid, &prelim)
+                            native_scores(&p, &feats, &is_entrapment, &base, &prelim)
                         }
                     }
                 } else {
@@ -163,7 +186,7 @@ pub fn run(p: RescoreParams) -> Result<u64> {
                     classifier_used = "entrapment_native";
                     model_identity = "native-percolator-lite-entrapment-v1".to_string();
                     qmode = QMode::Entrapment;
-                    native_scores(&p, &feats, &is_entrapment, &cid, &prelim)
+                    native_scores(&p, &feats, &is_entrapment, &base, &prelim)
                 }
             }
         }
@@ -199,9 +222,53 @@ pub fn run(p: RescoreParams) -> Result<u64> {
         ids
     };
     let pg_q = grouped_q(&protein_id, &scores, &is_decoy, &is_entrapment, &is_real_target, qmode, p.cfg.entrapment_ratio);
-    // Multi-context q (PLAN.md Section 8 rescore): single run, so run-specific ==
-    // experiment-wide == global. Distinct column kept for multi-run forward-compat.
+    // Multi-context q-values (PLAN.md Section 8 rescore; comment.md C1/C3). The
+    // pooled per-PSM q is `experiment_psm_q`; `run_psm_q` re-runs TDA within each
+    // source (run) so a per-run quant/report gets a real per-run FDR rather than the
+    // pooled value; `precursor_q` groups on peptidoform+charge. `global_q` is kept
+    // as a byte-identical alias of the pooled q for backward-compat.
     let global_q = psm_q.clone();
+    let experiment_psm_q = psm_q.clone();
+    // Per-run PSM q: TDA within each source separately, scattered back by row index.
+    // Single-run (source all-zero) => equals `q_value`. Sorted (BTree) source
+    // iteration keeps it deterministic; no floats are summed.
+    let run_psm_q = {
+        let mut by_src: std::collections::BTreeMap<u32, Vec<usize>> = std::collections::BTreeMap::new();
+        for (i, &s) in source.iter().enumerate() {
+            by_src.entry(s).or_default().push(i);
+        }
+        let mut rq = vec![1.0f64; n];
+        for (_s, idxs) in by_src {
+            let q = match qmode {
+                QMode::Decoy => {
+                    let sd: Vec<(f64, bool)> = idxs.iter().map(|&i| (scores[i], is_decoy[i])).collect();
+                    target_decoy_q(&sd)
+                }
+                QMode::Entrapment => {
+                    let sc: Vec<f64> = idxs.iter().map(|&i| scores[i]).collect();
+                    let en: Vec<bool> = idxs.iter().map(|&i| is_entrapment[i]).collect();
+                    let re: Vec<bool> = idxs.iter().map(|&i| is_real_target[i]).collect();
+                    entrapment_q(&sc, &en, &re, p.cfg.entrapment_ratio)
+                }
+            };
+            for (k, &i) in idxs.iter().enumerate() {
+                rq[i] = q[k];
+            }
+        }
+        rq
+    };
+    // Precursor-level q: group on peptidoform+charge (interned to dense u32 like the
+    // protein path) and run TDA over the best PSM per precursor.
+    let precursor_id: Vec<u32> = {
+        let mut interner: HashMap<(&str, i32), u32> = HashMap::new();
+        let mut ids = Vec::with_capacity(pform.len());
+        for (pf, &z) in pform.iter().zip(charge.iter()) {
+            let next = interner.len() as u32;
+            ids.push(*interner.entry((pf.as_str(), z)).or_insert(next));
+        }
+        ids
+    };
+    let precursor_q = grouped_q(&precursor_id, &scores, &is_decoy, &is_entrapment, &is_real_target, qmode, p.cfg.entrapment_ratio);
 
     // Reported IDs: real targets in entrapment mode (spike-in excluded), else all
     // non-decoy targets.
@@ -225,6 +292,15 @@ pub fn run(p: RescoreParams) -> Result<u64> {
         for i in 0..n {
             if is_reported[i] && pg_q[i] <= 0.01 {
                 seen.insert(protein_id[i]);
+            }
+        }
+        seen.len()
+    };
+    let n_prec_1 = {
+        let mut seen = std::collections::HashSet::new();
+        for i in 0..n {
+            if is_reported[i] && precursor_q[i] <= 0.01 {
+                seen.insert(precursor_id[i]);
             }
         }
         seen.len()
@@ -258,6 +334,15 @@ pub fn run(p: RescoreParams) -> Result<u64> {
             Col::F64("pg_q_value".into(), pg_q),
             Col::F64("global_q_value".into(), global_q),
             Col::F64("prelim_score".into(), prelim),
+            // Run identity for experiment-wide rescore (index into --competed);
+            // all-zero for a single-run rescore. Lets quant map scores per file.
+            Col::U32("source".into(), source),
+            // Multi-context q columns (comment.md C1/C3). run_psm_q = per-run PSM
+            // FDR; experiment_psm_q = pooled PSM FDR (== q_value/global_q_value);
+            // precursor_q = per (peptidoform+charge) FDR.
+            Col::F64("run_psm_q".into(), run_psm_q),
+            Col::F64("experiment_psm_q".into(), experiment_psm_q),
+            Col::F64("precursor_q".into(), precursor_q),
         ],
     )?;
 
@@ -268,6 +353,7 @@ pub fn run(p: RescoreParams) -> Result<u64> {
     stats.insert("target_psms_at_1pct".to_string(), json!(n_psm_1));
     stats.insert("target_peptides_at_1pct".to_string(), json!(n_pep_1));
     stats.insert("target_protein_groups_at_1pct".to_string(), json!(n_pg_1));
+    stats.insert("target_precursors_at_1pct".to_string(), json!(n_prec_1));
     if qmode == QMode::Entrapment {
         stats.insert("entrapment_ratio".to_string(), json!(p.cfg.entrapment_ratio));
         stats.insert("entrapment_peptides_at_1pct".to_string(), json!(n_entrap_1));
@@ -301,13 +387,13 @@ fn native_scores(
     p: &RescoreParams,
     feats: &[Vec<f64>],
     is_decoy: &[bool],
-    cid: &[u32],
+    fold_key: &[u32],
     prelim: &[f64],
 ) -> Vec<f64> {
     percolator_lite(RescoreInput {
         features: feats,
         is_decoy,
-        candidate_id: cid,
+        fold_key,
         init_score: prelim,
         folds: p.cfg.folds,
         num_iter: p.cfg.num_iter,
@@ -387,7 +473,25 @@ fn grouped_q<K: std::hash::Hash + Eq + Clone>(
         }
     };
     let qmap: HashMap<K, f64> = ks.into_iter().zip(qv).collect();
-    (0..n).map(|i| qmap[&keys[i]]).collect()
+    // Assign the group q ONLY to the winning (max-score) row of each group. A
+    // losing sibling (a lower-scoring charge/mod variant, which may itself be a
+    // false target) must not inherit the winner's low q; it gets 1.0. The
+    // report/counts dedup by key on the winner, so peptide/PG counts are
+    // unchanged, but per-PSM peptide_q/pg_q no longer propagate to losers.
+    let mut winner: HashMap<K, (f64, usize)> = HashMap::new();
+    for i in 0..n {
+        let e = winner
+            .entry(keys[i].clone())
+            .or_insert((f64::NEG_INFINITY, i));
+        if scores[i] > e.0 {
+            *e = (scores[i], i);
+        }
+    }
+    let mut out = vec![1.0f64; n];
+    for (k, (_, i)) in winner {
+        out[i] = qmap[&k];
+    }
+    out
 }
 
 /// Run the entrapment GBM sidecar: write a Parquet of features + meta columns,
@@ -415,6 +519,10 @@ fn run_entrapment_gbm(
     let outp = format!("{}/entrapment_out.parquet", p.work_dir);
 
     let mut cols = vec![
+        // Unique per-row id for score readback: candidate_id repeats across
+        // competed runs, so mapping scores back by candidate_id collides (later
+        // runs overwrite earlier). Map by this flat row index instead.
+        Col::U32("row_id".into(), (0..cid.len()).map(|i| i as u32).collect()),
         Col::U32("candidate_id".into(), cid.to_vec()),
         Col::U32("base_peptide_id".into(), base.to_vec()),
         Col::I32("is_entrapment".into(), is_entrapment.iter().map(|&b| b as i32).collect()),
@@ -438,18 +546,23 @@ fn run_entrapment_gbm(
     }
 
     let t = Table::read(&outp)?;
-    let ocid = t.u32("candidate_id")?;
+    let orid = t.u32("row_id")?;
     let osc = t.f64("score")?;
-    let map: HashMap<u32, f64> = ocid.into_iter().zip(osc).collect();
+    let map: HashMap<u32, f64> = orid.into_iter().zip(osc).collect();
     let min = map.values().cloned().fold(f64::INFINITY, f64::min);
-    Ok(cid.iter().map(|c| *map.get(c).unwrap_or(&(min - 1.0))).collect())
+    Ok((0..cid.len())
+        .map(|i| *map.get(&(i as u32)).unwrap_or(&(min - 1.0)))
+        .collect())
 }
 
-/// Run Mokapot over a PIN written from the competed set; return scores aligned
-/// to the input candidate order (PLAN.md Section 3.2 file contract).
+/// Run a PIN-contract Python rescorer sidecar (`mokapot_worker.py` or
+/// `nn_rescore_worker.py`) over a PIN written from the competed set; return scores
+/// aligned to the input candidate order (PLAN.md Section 3.2 file contract). Both
+/// sidecars share this exact contract: PIN in, `candidate_id`+`score` parquet out.
 #[allow(clippy::too_many_arguments)]
-fn run_mokapot(
+fn run_pin_sidecar(
     p: &RescoreParams,
+    script_name: &str,
     feat_names: &[String],
     cid: &[u32],
     label: &[String],
@@ -463,18 +576,24 @@ fn run_mokapot(
         .cfg
         .python
         .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("classifier=mokapot requires rescore.python"))?;
+        .ok_or_else(|| anyhow::anyhow!("classifier sidecar {script_name} requires rescore.python"))?;
     std::fs::create_dir_all(p.work_dir).ok();
     let pin = format!("{}/rescore.pin", p.work_dir);
-    let outp = format!("{}/mokapot_out.parquet", p.work_dir);
+    let outp = format!("{}/rescore_sidecar_out.parquet", p.work_dir);
 
     let mut s = String::new();
     s.push_str("SpecId\tLabel\tScanNr\tExpMass\tCalcMass\t");
     s.push_str(&feat_names.join("\t"));
     s.push_str("\tPeptide\tProteins\n");
+    // Key the PIN on the unique row index i (SpecId=psm_i, ScanNr=i), NOT
+    // candidate_id: candidate_id is the library index and repeats across runs, so
+    // an experiment-wide (multi-file) PIN would collide on ScanNr and mokapot's
+    // per-spectrum competition would collapse the runs. The row index is unique
+    // across the whole concatenation. Single-run behaviour is unchanged (the
+    // mapping is bijective and mokapot does not use SpecId/ScanNr as features).
     for i in 0..cid.len() {
         let lab = if label[i] == "decoy" { -1 } else { 1 };
-        write!(s, "cand_{}\t{}\t{}\t{:.5}\t{:.5}\t", cid[i], lab, cid[i], mz[i], mz[i]).ok();
+        write!(s, "psm_{}\t{}\t{}\t{:.5}\t{:.5}\t", i, lab, i, mz[i], mz[i]).ok();
         for fi in 0..feat_names.len() {
             write!(s, "{:.6}\t", feats[i][fi]).ok();
         }
@@ -482,21 +601,31 @@ fn run_mokapot(
     }
     std::fs::write(&pin, s)?;
 
-    let script = crate::sidecar::resolve_script(p.script_dir, "mokapot_worker.py");
+    let script = crate::sidecar::resolve_script(p.script_dir, script_name);
     let status = std::process::Command::new(python)
         .arg(&script)
         .arg(&pin)
         .arg(&outp)
         .env("PYTHONUTF8", "1")
+        // Pass the configured NN hyperparameters so the worker uses them instead
+        // of its own defaults, and so the folds/num_iter/train_fdr recorded in the
+        // report reflect the values actually used (comment.md C4). Ignored by
+        // mokapot_worker.py, which shares this PIN contract.
+        .env("MUMDIA_NN_FOLDS", p.cfg.folds.to_string())
+        .env("MUMDIA_NN_ITERS", p.cfg.num_iter.to_string())
+        .env("MUMDIA_NN_TRAIN_FDR", p.cfg.train_fdr.to_string())
         .status()?;
     if !status.success() {
-        anyhow::bail!("mokapot worker exited with {status}");
+        anyhow::bail!("{script_name} exited with {status}");
     }
 
+    // The worker echoes the PIN's SpecId tail as `candidate_id`, which here is the
+    // row index i. Map scores back by row index; a missing row (should not happen
+    // now the worker scores all PSMs) gets the worst score.
     let t = Table::read(&outp)?;
-    let ocid = t.u32("candidate_id")?;
+    let orow = t.u32("candidate_id")?;
     let osc = t.f64("score")?;
-    let map: HashMap<u32, f64> = ocid.into_iter().zip(osc).collect();
-    let min = map.values().cloned().fold(f64::INFINITY, f64::min);
-    Ok(cid.iter().map(|c| *map.get(c).unwrap_or(&(min - 1.0))).collect())
+    let map: HashMap<u32, f64> = orow.into_iter().zip(osc).collect();
+    let worst = map.values().cloned().fold(f64::INFINITY, f64::min) - 1.0;
+    Ok((0..cid.len() as u32).map(|i| *map.get(&i).unwrap_or(&worst)).collect())
 }

@@ -10,7 +10,7 @@ use std::sync::Arc;
 use anyhow::{anyhow, Context, Result};
 use arrow::array::{
     Array, ArrayRef, BooleanArray, Float32Array, Float32Builder, Float64Array, Int32Array,
-    Int64Array, ListArray, ListBuilder, StringArray, UInt32Array,
+    Int64Array, LargeListArray, LargeListBuilder, ListArray, ListBuilder, StringArray, UInt32Array,
 };
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
@@ -34,6 +34,11 @@ pub enum Col {
     OptStr(String, Vec<Option<String>>),
     ListF32(String, Vec<Vec<f32>>),
     ListF64(String, Vec<Vec<f64>>),
+    /// Like `ListF32` but encoded as an Arrow `LargeList` (64-bit offsets).
+    /// Required for columns whose total list-value count can exceed the ~2.1B
+    /// limit of the 32-bit `ListArray` offset buffer (e.g. per-fragment
+    /// chromatograms when extraction accepts a very large candidate set).
+    LargeListF32(String, Vec<Vec<f32>>),
 }
 
 impl Col {
@@ -51,7 +56,8 @@ impl Col {
             | Col::OptI32(n, _)
             | Col::OptStr(n, _)
             | Col::ListF32(n, _)
-            | Col::ListF64(n, _) => n,
+            | Col::ListF64(n, _)
+            | Col::LargeListF32(n, _) => n,
         }
     }
 
@@ -70,6 +76,7 @@ impl Col {
             Col::OptStr(_, v) => v.len(),
             Col::ListF32(_, v) => v.len(),
             Col::ListF64(_, v) => v.len(),
+            Col::LargeListF32(_, v) => v.len(),
         }
     }
 
@@ -90,6 +97,7 @@ impl Col {
             Col::OptStr(n, _) => Field::new(n, DataType::Utf8, true),
             Col::ListF32(n, _) => Field::new(n, DataType::List(item32()), true),
             Col::ListF64(n, _) => Field::new(n, DataType::List(item64()), true),
+            Col::LargeListF32(n, _) => Field::new(n, DataType::LargeList(item32()), true),
         }
     }
 
@@ -120,6 +128,14 @@ impl Col {
             Col::ListF64(_, v) => {
                 use arrow::array::Float64Builder;
                 let mut b = ListBuilder::new(Float64Builder::new());
+                for row in &v {
+                    b.values().append_slice(row);
+                    b.append(true);
+                }
+                Arc::new(b.finish())
+            }
+            Col::LargeListF32(_, v) => {
+                let mut b = LargeListBuilder::new(Float32Builder::new());
                 for row in &v {
                     b.values().append_slice(row);
                     b.append(true);
@@ -367,26 +383,40 @@ impl Table {
         Ok(out)
     }
 
+    /// Read an f32 list column. Accepts both `List` (32-bit offsets) and
+    /// `LargeList` (64-bit offsets, written by `Col::LargeListF32`) encodings,
+    /// so chromatogram artifacts written by either binary read back the same.
     pub fn list_f32(&self, name: &str) -> Result<Vec<Vec<f32>>> {
         let i = self.idx(name)?;
         let mut out = Vec::with_capacity(self.nrows);
-        for b in &self.batches {
-            let a = b
-                .column(i)
+        let push_inner = |out: &mut Vec<Vec<f32>>, v: ArrayRef| -> Result<()> {
+            let f = v
                 .as_any()
-                .downcast_ref::<ListArray>()
-                .ok_or_else(|| anyhow!("column '{name}' is not a list"))?;
-            for k in 0..a.len() {
-                if a.is_null(k) {
-                    out.push(Vec::new());
-                    continue;
+                .downcast_ref::<Float32Array>()
+                .ok_or_else(|| anyhow!("list '{name}' inner is not f32"))?;
+            out.push(f.values().to_vec());
+            Ok(())
+        };
+        for b in &self.batches {
+            let col = b.column(i);
+            if let Some(a) = col.as_any().downcast_ref::<LargeListArray>() {
+                for k in 0..a.len() {
+                    if a.is_null(k) {
+                        out.push(Vec::new());
+                    } else {
+                        push_inner(&mut out, a.value(k))?;
+                    }
                 }
-                let v = a.value(k);
-                let f = v
-                    .as_any()
-                    .downcast_ref::<Float32Array>()
-                    .ok_or_else(|| anyhow!("list '{name}' inner is not f32"))?;
-                out.push(f.values().to_vec());
+            } else if let Some(a) = col.as_any().downcast_ref::<ListArray>() {
+                for k in 0..a.len() {
+                    if a.is_null(k) {
+                        out.push(Vec::new());
+                    } else {
+                        push_inner(&mut out, a.value(k))?;
+                    }
+                }
+            } else {
+                return Err(anyhow!("column '{name}' is not a list"));
             }
         }
         Ok(out)
@@ -411,6 +441,7 @@ mod tests {
                 Col::Str("name".into(), vec!["a".into(), "b".into(), "c".into()]),
                 Col::OptF64("cal".into(), vec![Some(1.0), None, Some(3.0)]),
                 Col::ListF32("trace".into(), vec![vec![1.0, 2.0], vec![], vec![9.0]]),
+                Col::LargeListF32("big".into(), vec![vec![5.0], vec![6.0, 7.0], vec![]]),
             ],
         )
         .unwrap();
@@ -423,5 +454,8 @@ mod tests {
         assert_eq!(t.opt_f64("cal").unwrap(), vec![Some(1.0), None, Some(3.0)]);
         assert_eq!(t.list_f32("trace").unwrap()[0], vec![1.0, 2.0]);
         assert!(t.list_f32("trace").unwrap()[1].is_empty());
+        // LargeListF32 (64-bit offsets) reads back through the same list_f32 path.
+        assert_eq!(t.list_f32("big").unwrap()[1], vec![6.0, 7.0]);
+        assert!(t.list_f32("big").unwrap()[2].is_empty());
     }
 }

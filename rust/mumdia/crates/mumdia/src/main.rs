@@ -24,8 +24,12 @@ enum Cmd {
         /// Limit spectra read (0 = all), for fast iteration.
         #[arg(long, default_value_t = 0)]
         max_spectra: usize,
-        /// Keep at most this many MS2 peaks per scan (0 = all).
-        #[arg(long, default_value_t = 300)]
+        /// Keep at most this many MS2 peaks in the normalized artifact (0 = all).
+        ///
+        /// This is an irreversible conversion-time cap that also affects extraction,
+        /// features, and quantification. Use `search_seed.top_n_peaks` for a
+        /// seed-only limit.
+        #[arg(long, default_value_t = 0)]
         top_peaks_ms2: usize,
         /// Keep at most this many MS1 peaks per scan (0 = all).
         #[arg(long, default_value_t = 0)]
@@ -109,6 +113,12 @@ enum Cmd {
         out_psms: String,
         #[arg(long)]
         out_chrom: String,
+        /// Optional candidate allowlist (a prior run's psms.parquet): restrict
+        /// extraction to these candidate_ids. For "gate first, then compete" -
+        /// re-extract with a peak_claim strategy over only the gate-accepted
+        /// survivors, keeping the two-pass profile map small.
+        #[arg(long)]
+        restrict_candidates: Option<String>,
         #[arg(long)]
         config: Option<String>,
     },
@@ -207,7 +217,9 @@ enum Cmd {
         profile: Option<String>,
         #[arg(long, default_value_t = 0)]
         max_spectra: usize,
-        #[arg(long, default_value_t = 300)]
+        /// Irreversible conversion-time MS2 cap (0 = all). Seed-only peak limiting
+        /// is configured by `search_seed.top_n_peaks`.
+        #[arg(long, default_value_t = 0)]
         top_peaks_ms2: usize,
     },
     /// Cross-run RT alignment (experiment-level) -> alignment.parquet.
@@ -220,9 +232,59 @@ enum Cmd {
         #[arg(long)]
         config: Option<String>,
     },
+    /// Match-between-runs identification transfer (Stage D3) -> transferred.parquet.
+    Mbr {
+        /// Experiment-wide scored_combined.parquet (has the `source` column).
+        #[arg(long)]
+        scored: String,
+        /// Per-run psms.parquet in `source` order (one per run).
+        #[arg(long, num_args = 1..)]
+        psms: Vec<String>,
+        #[arg(long)]
+        out: String,
+        /// Optional augmented scored table: input scored with accepted transfers'
+        /// q_value lowered + is_transferred flag (for quant/report with q_filter=psm_q).
+        #[arg(long)]
+        out_scored: Option<String>,
+        /// Optional per-run fragment_quant.parquet (source order) for the
+        /// fragment-consensus guard (needs mbr.consensus_corr_min > 0).
+        #[arg(long, num_args = 0..)]
+        frag: Vec<String>,
+        #[arg(long)]
+        config: Option<String>,
+    },
     /// Print schema, head sample, and row count for any artifact.
     Inspect {
         artifact: String,
+    },
+    /// Candidate audit: reconstruct per-candidate stage flags + earliest rejection
+    /// reason across the artifact chain and write candidate_audit.parquet
+    /// (sensitivity program, P0.3/P0.4). Non-destructive; reruns no compute.
+    Audit {
+        /// Library precursors parquet (the full candidate search space).
+        #[arg(long)]
+        library_precursors: String,
+        /// psms parquet from `extract`.
+        #[arg(long)]
+        psms: String,
+        /// competed parquet from `compete`.
+        #[arg(long)]
+        competed: String,
+        /// scored parquet from `rescore`.
+        #[arg(long)]
+        scored: String,
+        /// Output candidate_audit.parquet.
+        #[arg(long)]
+        out: String,
+        /// Precursor q-value threshold for passed_precursor_fdr / reported.
+        #[arg(long, default_value_t = 0.01)]
+        q: f64,
+        /// Run identifier stamped on every row.
+        #[arg(long, default_value = "run")]
+        run_id: String,
+        /// Optional protein substring marking entrapment candidates (e.g. _HUMAN).
+        #[arg(long, default_value = "")]
+        entrapment_substr: String,
     },
     /// Write peptides.tsv + proteins.tsv from a scored PSM table.
     Report {
@@ -247,9 +309,16 @@ enum Cmd {
 /// Probe each configured sidecar interpreter for its required packages, so a
 /// broken or missing environment is reported clearly instead of failing mid-run.
 fn doctor(cfg: &Config) -> Result<()> {
+    use mumdia_core::config::RescorerKind;
     use std::process::Command;
+    // The rescore sidecar's required packages depend on the selected classifier:
+    // the PyTorch NN needs torch; mokapot/entrapment need mokapot + sklearn.
+    let (rescore_label, rescore_pkgs) = match cfg.rescore.classifier {
+        RescorerKind::NnTorch => ("rescore.python (nn_torch)", "torch,numpy,pandas,pyarrow"),
+        _ => ("rescore.python (mokapot)", "mokapot,sklearn,numpy,pandas,pyarrow"),
+    };
     let checks = [
-        ("rescore.python (mokapot)", cfg.rescore.python.as_deref(), "mokapot,sklearn,numpy,pandas,pyarrow"),
+        (rescore_label, cfg.rescore.python.as_deref(), rescore_pkgs),
         ("predict_frag.deeplc_python (DeepLC)", cfg.predict_frag.deeplc_python.as_deref(), "deeplc,numpy,pandas"),
         ("predict_frag.ms2pip_python (MS2PIP)", cfg.predict_frag.ms2pip_python.as_deref(), "ms2pip,numpy,pandas"),
     ];
@@ -313,7 +382,14 @@ fn main() -> Result<()> {
             top_peaks_ms1,
         } => {
             let cfg = load_config(&None)?;
-            let config_hash = mumdia_io::hash::blake3_str(&cfg.canonical_json());
+            // Fold the conversion CLI caps into the convert artifacts' provenance
+            // key: they change the spectra output but are not part of the config, so
+            // two different caps would otherwise produce an identical config_hash
+            // (comment.md A2/C4). The caps are also recorded in the convert report.
+            let config_hash = mumdia_io::hash::blake3_str(&format!(
+                "{}\u{1f}max_spectra={max_spectra}\u{1f}top_peaks_ms2={top_peaks_ms2}\u{1f}top_peaks_ms1={top_peaks_ms1}",
+                cfg.canonical_json()
+            ));
             stages::convert::run(stages::convert::ConvertParams {
                 mzml: &mzml,
                 out_dir: &out_dir,
@@ -408,6 +484,7 @@ fn main() -> Result<()> {
             mass_cal,
             out_psms,
             out_chrom,
+            restrict_candidates,
             config,
         } => {
             let cfg = load_config(&config)?;
@@ -421,6 +498,7 @@ fn main() -> Result<()> {
                 mass_cal: mass_cal.as_deref(),
                 out_psms: &out_psms,
                 out_chrom: &out_chrom,
+                restrict_candidates: restrict_candidates.as_deref(),
                 cfg: &cfg.extract,
                 config_hash: &ch,
             })?;
@@ -453,6 +531,27 @@ fn main() -> Result<()> {
                 out: &out,
                 cfg: &cfg.compete,
                 config_hash: &ch,
+            })?;
+        }
+        Cmd::Audit {
+            library_precursors,
+            psms,
+            competed,
+            scored,
+            out,
+            q,
+            run_id,
+            entrapment_substr,
+        } => {
+            stages::audit::run(stages::audit::AuditParams {
+                library_precursors: &library_precursors,
+                psms: &psms,
+                competed: &competed,
+                scored: &scored,
+                out: &out,
+                q_threshold: q,
+                run_id: &run_id,
+                entrapment_substr: &entrapment_substr,
             })?;
         }
         Cmd::Rescore { competed, out, config } => {
@@ -535,6 +634,27 @@ fn main() -> Result<()> {
                 config_hash: &ch,
             })?;
         }
+        Cmd::Mbr { scored, psms, out, out_scored, frag, config } => {
+            let cfg = load_config(&config)?;
+            if cfg.mbr.strategy == mumdia_core::config::MbrStrategy::None {
+                anyhow::bail!(
+                    "mbr.strategy is `none`; set empirical_library / rt_transfer / full to run MBR"
+                );
+            }
+            if psms.len() < 2 {
+                anyhow::bail!("MBR needs >= 2 runs; got {} psms path(s)", psms.len());
+            }
+            let python = cfg.mbr.python.as_deref().ok_or_else(|| {
+                anyhow::anyhow!("mbr.python (sidecar interpreter) is required when mbr.strategy != none")
+            })?;
+            let script =
+                mumdia::sidecar::resolve_script(&cfg.predict_frag.sidecar_script_dir, "mbr_worker.py");
+            mumdia::sidecar::run_mbr(
+                python, &script, &scored, &psms, &out, out_scored.as_deref(), &frag,
+                cfg.mbr.q_anchor, cfg.mbr.min_anchor_runs, cfg.mbr.q_transfer,
+                cfg.mbr.consensus_corr_min, cfg.rng_seed,
+            )?;
+        }
         Cmd::Inspect { artifact } => {
             print!("{}", mumdia_io::inspect(&artifact)?);
         }
@@ -557,4 +677,69 @@ fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::{Cli, Cmd};
+    use clap::Parser;
+
+    #[test]
+    fn conversion_caps_default_to_uncapped() {
+        let cli = Cli::try_parse_from([
+            "mumdia",
+            "convert",
+            "--mzml",
+            "run.mzML",
+            "--out-dir",
+            "spectra",
+        ])
+        .unwrap();
+        match cli.cmd {
+            Cmd::Convert {
+                top_peaks_ms2,
+                top_peaks_ms1,
+                ..
+            } => {
+                assert_eq!(top_peaks_ms2, 0);
+                assert_eq!(top_peaks_ms1, 0);
+            }
+            _ => panic!("expected convert command"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "mumdia",
+            "run",
+            "--fasta",
+            "proteome.fasta",
+            "--mzml",
+            "run.mzML",
+            "--out-dir",
+            "out",
+        ])
+        .unwrap();
+        match cli.cmd {
+            Cmd::Run { top_peaks_ms2, .. } => assert_eq!(top_peaks_ms2, 0),
+            _ => panic!("expected run command"),
+        }
+    }
+
+    #[test]
+    fn explicit_conversion_cap_is_preserved() {
+        let cli = Cli::try_parse_from([
+            "mumdia",
+            "convert",
+            "--mzml",
+            "run.mzML",
+            "--out-dir",
+            "spectra",
+            "--top-peaks-ms2",
+            "300",
+        ])
+        .unwrap();
+        match cli.cmd {
+            Cmd::Convert { top_peaks_ms2, .. } => assert_eq!(top_peaks_ms2, 300),
+            _ => panic!("expected convert command"),
+        }
+    }
 }

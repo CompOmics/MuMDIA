@@ -191,7 +191,17 @@ pub fn run(p: RunParams) -> Result<()> {
         let script =
             crate::sidecar::resolve_script(&cfg.predict_frag.sidecar_script_dir, "deeplc_finetune.py");
         let lib_p_ft = d("fragment_library_precursors_ft.parquet");
-        crate::sidecar::run_deeplc_finetune(python, &script, &lib_p, &seed, &lib_p_ft)?;
+        crate::sidecar::run_deeplc_finetune(
+            python,
+            &script,
+            &lib_p,
+            &seed,
+            &lib_p_ft,
+            cfg.rt_im_train.finetune_epochs,
+            cfg.rt_im_train.finetune_patience,
+            cfg.rt_im_train.q_train,
+            cfg.rt_im_train.finetune_batch,
+        )?;
         lib_p_ft
     } else {
         lib_p
@@ -220,6 +230,7 @@ pub fn run(p: RunParams) -> Result<()> {
         mass_cal: Some(&format!("{seed}.masscal.json")),
         out_psms: &psms,
         out_chrom: &chrom,
+        restrict_candidates: None,
         cfg: &cfg.extract,
         config_hash: &ch,
     })?;
@@ -258,6 +269,23 @@ pub fn run(p: RunParams) -> Result<()> {
         config_hash: &ch,
     })?;
     man.record(record_artifact(artifact::PSMS_SCORED.0, artifact::PSMS_SCORED, &scored, n, "rescore", &ch)?);
+
+    // Optional candidate audit (sensitivity program, P0.3): reconstruct the
+    // per-candidate identification-loss ladder from the artifact chain. Off by
+    // default (gated on extract.emit_candidate_audit); adds one cheap join pass.
+    if cfg.extract.emit_candidate_audit {
+        let audit_out = d("candidate_audit.parquet");
+        audit::run(audit::AuditParams {
+            library_precursors: &lib_p,
+            psms: &psms,
+            competed: &competed,
+            scored: &scored,
+            out: &audit_out,
+            q_threshold: 0.01,
+            run_id: p.out_dir,
+            entrapment_substr: "",
+        })?;
+    }
 
     let pep_q = d("peptide_quant.parquet");
     let pg_q = d("protein_group_quant.parquet");

@@ -45,7 +45,11 @@ def main():
     prot_col = "Protein.Names" if "Protein.Names" in df.columns else "Protein.Ids"
     df["protein_str"] = df[prot_col].astype(str)
 
-    keys = df.drop_duplicates("key").reset_index(drop=True)
+    # Sort precursors by m/z before assigning candidate_id, so the emitted library
+    # is monotonic in precursor_mz (the fragment index's candidate_range assumes
+    # this). The decoy builder re-sorts too, but this makes a direct target-only
+    # import index-valid on its own. mergesort = stable for reproducibility.
+    keys = df.drop_duplicates("key").sort_values("Precursor.Mz", kind="mergesort").reset_index(drop=True)
     keys["candidate_id"] = np.arange(len(keys), dtype=np.uint32)
     key2cand = dict(zip(keys["key"], keys["candidate_id"]))
     keys["base_peptide_id"] = pd.factorize(keys["Stripped.Sequence"])[0].astype(np.uint32)

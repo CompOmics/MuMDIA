@@ -132,6 +132,7 @@ fn run_extract(prec: &str, frag: &str, ms2: &str, win: &str, tag: &str) -> (Stri
         mass_cal: None,
         out_psms: &psms,
         out_chrom: &chrom,
+        restrict_candidates: None,
         cfg: &cfg.extract,
         config_hash: "test",
     })

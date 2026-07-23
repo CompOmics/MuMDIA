@@ -15,9 +15,11 @@ pub const WATER: f64 = 18.010_564_684;
 /// Monoisotopic mass of ammonia (NH3), Da.
 pub const AMMONIA: f64 = 17.026_549_1;
 
-/// Mass difference between two adjacent isotope peaks of a peptide (Da),
-/// the C13 - C12 neutron spacing used for the averagine envelope.
-pub const ISOTOPE_SPACING: f64 = 1.002_868_64;
+/// Mass difference between two adjacent isotope peaks of a peptide (Da): the
+/// true 13C - 12C mass difference (13.003_354_835 - 12 = 1.003_354_835), used as
+/// the isotope-peak spacing for MS1 envelope extraction. Public physical fact
+/// (AME2020 atomic masses); not copied from any proteomics implementation.
+pub const ISOTOPE_SPACING: f64 = 1.003_354_835;
 
 /// Monoisotopic residue mass in Da for a standard amino acid, or `None` for
 /// residues MuMDIA treats as ambiguous (B, J, O, U, X, Z).

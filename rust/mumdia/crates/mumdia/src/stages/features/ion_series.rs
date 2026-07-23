@@ -50,6 +50,7 @@ pub const NAMES: &[&str] = &[
     "mean_matched_ordinal_norm",
     "by_ion_contiguous_intensity",
     "by_ion_contiguous_lib_frac",
+    "both_series_present",
 ];
 
 const EPS: f64 = 1e-9;
@@ -194,9 +195,21 @@ pub fn values(e: &Evidence) -> Vec<f64> {
     };
 
     let by_ratio_agreement = {
+        // Bounded observed-vs-predicted b/y LOG-ODDS discrepancy, squashed to
+        // [0,1) by tanh. This is the log-odds analog (tail-sensitive), distinct
+        // from the linear-fraction `by_ratio_consistency` below; the earlier
+        // raw log-ratio version saturated to ~35 for single-series peptides.
         let lo = ((bo + EPS) / (yo + EPS)).ln();
         let lp = ((bp + EPS) / (yp + EPS)).ln();
-        fin((lo - lp).abs())
+        fin((0.5 * (lo - lp)).tanh().abs())
+    };
+
+    // Both fragment series observed: encodes single-series as a category rather
+    // than letting the ratio features carry it as a saturated magnitude.
+    let both_series_present = if n_matched_b > 0.0 && n_matched_y > 0.0 {
+        1.0
+    } else {
+        0.0
     };
 
     let by_ratio_consistency = {
@@ -559,6 +572,7 @@ pub fn values(e: &Evidence) -> Vec<f64> {
         mean_matched_ordinal_norm,
         by_ion_contiguous_intensity,
         by_ion_contiguous_lib_frac,
+        both_series_present,
     ];
     debug_assert_eq!(out.len(), NAMES.len());
     out.into_iter().map(fin).collect()

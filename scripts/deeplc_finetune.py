@@ -60,8 +60,14 @@ def main():
     ap.add_argument("--threads", type=int, default=int(_THREADS),
                     help="torch CPU threads for training (bounded to avoid OpenMP oversubscription; cpu only)")
     ap.add_argument("--epochs", type=int, default=25)
-    ap.add_argument("--batch", type=int, default=512)
+    ap.add_argument("--batch", type=int, default=0,
+                    help="fine-tune batch size; 0 (default) auto-scales to the reference "
+                         "size so every epoch has >= ~30 gradient steps. A fixed large "
+                         "batch (e.g. 512) underfits small seeds: a ~4k-peptide E.coli "
+                         "reference gives only ~8 steps/epoch and never converges.")
     ap.add_argument("--patience", type=int, default=10)
+    ap.add_argument("--q-train", dest="q_train", type=float, default=0.01,
+                    help="max spectrum_q for a seed PSM to enter the fine-tune reference set")
     ap.add_argument("--max-ref", type=int, default=0,
                     help="cap reference PSMs (0 = all); use a small value for a smoke test")
     ap.add_argument("--predict-limit", type=int, default=0,
@@ -93,7 +99,7 @@ def main():
     ref = {}
     for i in range(len(seed["peptidoform"])):
         pf = seed["peptidoform"][i]
-        if seed["label"][i] == "target" and seed["spectrum_q"][i] <= 0.01 and is_std(pf):
+        if seed["label"][i] == "target" and seed["spectrum_q"][i] <= args.q_train and is_std(pf):
             ref[pf] = seed["observed_rt"][i]
     ref_items = list(ref.items())
     if args.max_ref and len(ref_items) > args.max_ref:
@@ -102,10 +108,18 @@ def main():
                                  for k, (pf, rt) in enumerate(ref_items)])
     print(f"fine-tune reference: {len(ref_psms)} confident seed peptides", flush=True)
 
+    # Batch size: 0 -> auto-scale so each epoch runs ~30+ gradient steps. A fixed 512
+    # underfits small references (e.g. ~4k E.coli seed = ~8 steps/epoch, never
+    # converges); clamp to [16, 512].
+    batch = args.batch
+    if batch <= 0:
+        batch = int(min(512, max(16, len(ref_psms) // 30)))
+    print(f"fine-tune batch_size={batch} (~{max(1, len(ref_psms) // max(1, batch))} steps/epoch)", flush=True)
+
     train_kwargs = {
         "num_workers": 0,          # no DataLoader subprocesses
         "epochs": args.epochs,
-        "batch_size": args.batch,
+        "batch_size": batch,
         "patience": args.patience,
         "device": args.device,
     }

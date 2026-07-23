@@ -82,13 +82,17 @@ pub fn run(p: ReportParams) -> Result<(u64, u64)> {
     let mut order: Vec<usize> = (0..n).collect();
     order.sort_by(|&a, &b| pep_q[a].partial_cmp(&pep_q[b]).unwrap_or(std::cmp::Ordering::Equal));
     let mut seen: HashSet<(String, i32)> = HashSet::new();
+    let mut seen_strip: HashSet<String> = HashSet::new();
     let mut w = std::io::BufWriter::new(std::fs::File::create(p.out_peptides)?);
-    writeln!(w, "peptide\tstripped_sequence\tcharge\tprotein\tq_value\tscore\tquantity")?;
+    // The row unit here is the precursor (peptidoform + charge), NOT the stripped
+    // sequence; the header and the returned count reflect that.
+    writeln!(w, "precursor\tstripped_sequence\tcharge\tprotein\tq_value\tscore\tquantity")?;
     let mut npep = 0u64;
     for &i in &order {
         if label[i] != "target" || !(pep_q[i] <= p.q_threshold) {
             continue;
         }
+        seen_strip.insert(strip(&pform[i]));
         let key = (pform[i].clone(), charge[i]);
         if !seen.insert(key.clone()) {
             continue;
@@ -123,6 +127,12 @@ pub fn run(p: ReportParams) -> Result<(u64, u64)> {
     }
     w2.flush()?;
 
+    tracing::info!(
+        precursors = npep,
+        stripped_sequences = seen_strip.len() as u64,
+        protein_groups = nprot,
+        "report: done (peptides.tsv rows are precursors, not stripped sequences)"
+    );
     Ok((npep, nprot))
 }
 

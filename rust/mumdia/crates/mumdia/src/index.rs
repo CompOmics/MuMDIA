@@ -18,6 +18,7 @@ use anyhow::Result;
 use mumdia_core::constants::{ppm_bounds, PROTON};
 use mumdia_io::table::Table;
 use rayon::prelude::*;
+use tracing::warn;
 
 #[derive(Clone, Debug)]
 pub struct Candidate {
@@ -124,6 +125,34 @@ impl Library {
                 n_frag: n,
             });
             prec_mz.push(pmz[c]);
+        }
+
+        // Precondition for `candidate_range`: precursors ascending by m/z. The
+        // fragment-index `partition_point` search over `prec_mz` assumes this;
+        // an unsorted import (e.g. `import_diann_lib.py` output fed directly,
+        // skipping the sorting decoy builder) would silently return wrong
+        // candidate windows. Check explicitly and fail loudly.
+        for c in 1..ncand {
+            if prec_mz[c] < prec_mz[c - 1] {
+                anyhow::bail!(
+                    "library precursors must be ascending by precursor_mz (row {c} m/z \
+                     {} < row {} m/z {}); sort/reindex the library (the decoy-builder \
+                     scripts do this)",
+                    prec_mz[c],
+                    c - 1,
+                    prec_mz[c - 1]
+                );
+            }
+        }
+        // A decoy-free library gives q = (0+1)/n_targets, i.e. silently-invalid
+        // near-zero FDR downstream. Warn loudly (bailing could break intentional
+        // decoy-free diagnostics, so this is a warning, not an error).
+        let n_decoy = cands.iter().filter(|c| c.is_decoy).count();
+        if n_decoy == 0 {
+            warn!(
+                "library has 0 decoy candidates; target-decoy q-values will be invalid \
+                 (add decoys, e.g. via make_reverse_decoys.py)"
+            );
         }
 
         // Build flat index entries.

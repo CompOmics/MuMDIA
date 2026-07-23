@@ -109,10 +109,64 @@ pub fn run_deeplc_finetune(
     lib_in: &str,
     seed: &str,
     lib_out: &str,
+    epochs: usize,
+    patience: usize,
+    q_train: f64,
+    batch: usize,
 ) -> Result<()> {
-    info!(lib_in, seed, lib_out, "sidecar: running DeepLC multitask fine-tune");
-    run_worker(python, script, &[lib_in, seed, lib_out], true)
-        .context("DeepLC fine-tune failed")
+    info!(lib_in, seed, lib_out, epochs, patience, q_train, batch, "sidecar: running DeepLC multitask fine-tune");
+    let ep = epochs.to_string();
+    let pa = patience.to_string();
+    let qt = q_train.to_string();
+    let ba = batch.to_string();
+    run_worker(
+        python,
+        script,
+        &[lib_in, seed, lib_out, "--epochs", &ep, "--patience", &pa, "--q-train", &qt, "--batch", &ba],
+        true,
+    )
+    .context("DeepLC fine-tune failed")
+}
+
+/// MBR transfer (Stage D3): match-between-runs identification transfer over the
+/// experiment-wide scored table + per-run psms. Positional contract:
+/// `mbr_worker.py <scored_combined> <psms_csv> <out_transferred> [flags]`, where
+/// `psms_csv` is the per-run psms paths joined by ',' in `source` order.
+#[allow(clippy::too_many_arguments)]
+pub fn run_mbr(
+    python: &str,
+    script: &str,
+    scored: &str,
+    psms: &[String],
+    out: &str,
+    out_scored: Option<&str>,
+    frag: &[String],
+    q_anchor: f64,
+    min_anchor_runs: usize,
+    q_transfer: f64,
+    consensus_corr_min: f64,
+    seed: u64,
+) -> Result<()> {
+    let psms_csv = psms.join(",");
+    info!(scored, out, runs = psms.len(), q_anchor, min_anchor_runs, q_transfer,
+          consensus_corr_min, "sidecar: running MBR transfer");
+    let qa = q_anchor.to_string();
+    let mar = min_anchor_runs.to_string();
+    let qt = q_transfer.to_string();
+    let sd = seed.to_string();
+    let cm = consensus_corr_min.to_string();
+    let frag_csv = frag.join(",");
+    let mut args: Vec<&str> = vec![
+        scored, &psms_csv, out, "--q-anchor", &qa, "--min-anchor-runs", &mar,
+        "--q-transfer", &qt, "--seed", &sd,
+    ];
+    if let Some(os) = out_scored {
+        args.extend_from_slice(&["--out-scored", os]);
+    }
+    if !frag.is_empty() && consensus_corr_min > 0.0 {
+        args.extend_from_slice(&["--frag-csv", &frag_csv, "--consensus-corr-min", &cm]);
+    }
+    run_worker(python, script, &args, false).context("MBR transfer worker failed")
 }
 
 /// Invoke a Python worker: `python script arg...`. `utf8` forces UTF-8 I/O

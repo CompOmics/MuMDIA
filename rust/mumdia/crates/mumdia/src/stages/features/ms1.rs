@@ -13,6 +13,7 @@
 //! persisted. All values are guarded finite.
 use super::Evidence;
 use crate::stats::{cosine, pearson, spectral_angle};
+use mumdia_core::constants::PROTON;
 
 pub const NAMES: &[&str] = &[
     // apex isotope-envelope agreement vs averagine
@@ -48,7 +49,6 @@ pub const NAMES: &[&str] = &[
 ];
 
 const EPS: f64 = 1e-9;
-const PROTON: f64 = 1.007_276_466_812;
 
 /// Finite guard: replace NaN/Inf with 0.0.
 #[inline]
@@ -283,7 +283,9 @@ fn xic_features(e: &Evidence) -> (f64, f64, f64, f64, f64, f64, f64, f64, f64, f
             };
             let base_width = fwhm(axis, r);
             let d = (axis[am_mono] - axis[am_r]).abs();
-            fin(d / (base_width + EPS))
+            // Bounded to [0,1): d/(d+width) instead of d/width, so a degenerate
+            // (~0) reference width can't send the feature to ~1e9.
+            fin(d / (d + base_width + EPS))
         } else {
             0.0
         }
