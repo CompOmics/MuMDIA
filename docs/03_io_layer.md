@@ -12,13 +12,18 @@ reader/writer directly. The crate provides five things:
    Arrow + Parquet, so a stage declares its schema as a `Vec<Col>` and reads it
    back by column name with typed getters (`table.rs`).
 2. Parquet write (`write_table`) and read (`Table::read`), SNAPPY-compressed,
-   the open self-describing interstage format (plan.md Section 3.3).
+   the open self-describing interstage format (see the interstage contract in
+   `docs/18_findings_and_decisions.md`, B1).
 3. The per-artifact `<artifact>.report.json` sidecar (`ArtifactReport` in
    `report.rs`) so a stage can be evaluated (row counts, resolved params, key
    distributions, model identity, timing) without loading the full table.
 4. blake3 content hashing of files and strings (`hash.rs`), which feeds the
-   `content_hash` on every artifact record and the `config_hash` used to
-   invalidate downstream artifacts.
+   `content_hash` on every artifact record and the `config_hash` recorded on
+   each manifest `ArtifactRecord` (`manifest.rs:19`) and on the manifest header
+   (`manifest.rs:27`). These hashes are provenance only: nothing in the engine
+   reads them back to invalidate or skip a downstream artifact, and `run` always
+   recomputes the full chain. (`report.json` itself carries no `config_hash`
+   field; see the report fields below.)
 5. The `mumdia inspect <artifact>` implementation (`inspect` in `lib.rs`):
    schema + head sample + row count for any Parquet file.
 
@@ -49,9 +54,11 @@ two JSON sidecars.
 
 ### Artifact schema registry (`mumdia-core/src/schema.rs:7-23`)
 
-Each artifact carries a logical schema name and version so a stage can validate
-its inputs and a model is never applied under a mismatched schema. They are
-`pub const` tuples in the `artifact` submodule, referenced as
+Each artifact carries a logical schema name and version. The intent is that a
+stage could validate its inputs and refuse to apply a model under a mismatched
+schema, but no such read-side check is implemented: `schema_version` is only
+ever written into the report and the manifest, never read back and compared.
+They are `pub const` tuples in the `artifact` submodule, referenced as
 `mumdia_core::schema::artifact::PEPTIDES` and so on. The tuples are
 `(name, version)`:
 
@@ -76,16 +83,18 @@ its inputs and a model is never applied under a mismatched schema. They are
 | `protein_group_quant` | 1 | quant |
 
 Note only `psms_scored` is at version 2; everything else is version 1. The
-version is not consumed for a hard gate in this crate; it is recorded in the
-report and the manifest so a downstream reader can detect a mismatch.
+version is recorded in the report and the manifest but is not consumed anywhere:
+no stage reads a prior artifact's version back, so there is no schema-mismatch
+gate on read. A reader could compare the recorded version by hand, but the engine
+does not.
 
 ### Example concrete column schemas
 
 The IO crate stores no schema definitions; a stage's `write_table(path, vec![
 Col::… ])` is the schema. Two examples read from the actual code:
 
-`isolation_windows` (`stages/convert.rs:223-228`), one row per distinct window:
-`window_index: u32`, `target: f64`, `lower: f64`, `upper: f64`.
+`isolation_windows` (`stages/convert.rs:221-228`), one row per distinct window:
+`window_id: u32`, `target: f64`, `lower: f64`, `upper: f64`.
 `ms2_to_ms1` (`stages/convert.rs:231-237`): `ms2_scan_index: u32`,
 `ms1_scan_index: i32`.
 
@@ -117,9 +126,9 @@ variants are `ListF32`, `ListF64`, and `LargeListF32`. `LargeListF32`
 when the total list-value count across all rows can exceed the ~2.1 billion
 limit of a 32-bit `ListArray` offset buffer (for example per-fragment
 chromatograms when extraction accepts a very large candidate set). The `Opt*`
-variants exist to back conditional and ion-mobility columns under the plan.md
-Section 2 missing-value policy (`table.rs:5-6`); ion-mobility columns are written
-null throughout the 3D MVP.
+variants exist to back conditional and ion-mobility columns under the
+missing-value policy (`table.rs:5-6`; see `docs/18_findings_and_decisions.md`);
+ion-mobility columns are written null throughout the 3D MVP.
 
 `Col` has four private helpers used by the writer (all non-`pub`):
 - `name()` (`table.rs:45`): the column name, via a match over every variant.
@@ -344,7 +353,8 @@ it. Its behaviour is fixed at compile time:
   batch, so byte layout is stable for stable input. `ArtifactReport.stats` is a
   `BTreeMap`, so JSON key order is fixed. `config_hash` comes from
   `Config::canonical_json` (serde field order) so it is reproducible. blake3 is
-  deterministic. All of this is required by plan.md Section 7.
+  deterministic. All of this is required by the determinism contract (see
+  `docs/18_findings_and_decisions.md`, B2).
 - **Integer/bool null gotcha.** `i64`/`i32`/`u32`/`bool` getters do not check
   `is_null`; in the presence of nulls they return the raw buffer value (usually
   0 / false), silently. This is safe today only because the MVP integer/bool
@@ -408,7 +418,9 @@ it. Its behaviour is fixed at compile time:
   `mumdia-core/src/schema.rs` and pass it to `write_table` (schema = the
   `Vec<Col>` you write) plus the `ArtifactReport`/`record_artifact` calls. Bump
   the version only on a breaking column-schema change (as was done for
-  `psms_scored` -> 2), and document the change so readers can detect a mismatch.
+  `psms_scored` -> 2) and document the change. There is no read-side version
+  check today, so the bump is provenance only; if you need a hard gate, add the
+  check on the read path (it does not exist yet).
 - **Change compression.** It is a one-line change in `write_table`
   (`table.rs:186`); keep it to a codec available under the pinned pure-Rust
   Parquet features, and re-measure round-trip and file size.

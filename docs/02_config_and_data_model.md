@@ -16,8 +16,10 @@ here.
    peptidoform parsing, and b/y fragment generation. No other crate defines a
    mass constant or a ppm predicate.
 3. **Frozen artifact schema ids** (`schema.rs`): `(logical name, version)` pairs
-   stamped into every Parquet artifact and its `report.json` so a stage can
-   detect a schema mismatch.
+   recorded in each artifact's `report.json` and in the `manifest.json`
+   `ArtifactRecord`. They are provenance only: no stage reads them back, and
+   `Table::read` (`table.rs:204-222`) does no version check, so a schema id is
+   never used to detect a mismatch or invalidate a downstream artifact.
 4. **Run manifest** (`manifest.rs`): per-artifact provenance (content hash,
    producing stage, config hash) written once by the `run` orchestrator.
 
@@ -74,7 +76,10 @@ alongside each artifact by its producing stage, not by core: `logical_name`,
 ### Artifact schema ids (`schema.rs:6-24`)
 
 Every id is a `(&str, u32)` constant. A stage stamps `.0` and `.1` into its
-`ArtifactReport` and `ArtifactRecord`.
+`ArtifactReport` and `ArtifactRecord`. Both are provenance records only; nothing
+reads them back to validate a downstream read (`Table::read`, `table.rs:204-222`,
+does no version check, and `write_table`, `table.rs:151-193`, does not stamp the
+id into the Parquet file itself).
 
 | Constant | Logical name | Version |
 |---|---|---|
@@ -198,7 +203,7 @@ this over the neutral mass.
 stable `name` (`b3`, or `y5^2` for charge 2, `frag_name` at `mass.rs:130-136`).
 `IonType` (`mass.rs:29-42`) is the `B`/`Y` enum; `IonType::symbol()` returns the
 lowercase `'b'`/`'y'` used in the fragment name. These two series are the only
-ones the MVP scores (PLAN.md Decision 3).
+ones the MVP scores (see docs/18_findings_and_decisions.md).
 
 **ppm predicates.** Three exist and they differ by which mass normalizes the
 difference; a maintainer must not treat them as interchangeable.
@@ -279,7 +284,8 @@ the MVP is 3D so every IM field is `None` (`types.rs:1-3`).
 ### Error types (`error.rs`)
 
 Both enums derive `thiserror::Error`; the `#[error(...)]` string is the Display
-message. Misconfiguration and bad input fail loudly (PLAN.md Section 7).
+message. Misconfiguration and bad input fail loudly (see
+docs/18_findings_and_decisions.md).
 
 | Variant | file:line | Raised when |
 |---|---|---|
@@ -545,7 +551,7 @@ selection dominate.
 | `presence_min_coelution` | 2 | min simultaneously-present fragments over the run |
 | `min_frag_corr` | 0.2 | tier-(d) spectral-agreement gate (0 disables; must be in [0,1]) |
 | `min_matched_fraction` | 0.0 | tier-(c) min fraction of predicted fragments observed |
-| `apex_top_fragments` | 0 | signature-fragment apex (0 = all matched; superseded by `apex_count_tol`) |
+| `apex_top_fragments` | 0 | signature-fragment apex: sums the observed intensity of the top-K predicted fragments per scan; `0` falls back to a default of 3 (`extract.rs:969-973`), not all-matched |
 | `apex_rt_prior_s` | 0.0 | Gaussian RT prior sigma on apex (0 = off) |
 | `apex_count_tol` | 1 | fragment-count apex slack |
 | `apex_count_window` | 1 | rolling distinct-fragment count width (1 = none; profile `dia` sets 5) |
@@ -558,7 +564,7 @@ selection dominate.
 | `min_coelution_run` | 0 | **default-off** min consecutive co-elution scans |
 | `ms1_rescue` | `false` | **default-off** MS1-isotope rescue of gate failures |
 | `retain_top_peaks` | 1 | K peak groups per candidate (1 = legacy; must be >= 1) |
-| `emit_candidate_audit` | `false` | **default-off** writes `<psms>.audit.parquet` (P0.3) |
+| `emit_candidate_audit` | `false` | **default-off**; in `run` gates the separate `audit` stage that writes `candidate_audit.parquet` (`run.rs:276`); no stage writes `<psms>.audit.parquet`; no-op for standalone `mumdia extract` (P0.3) |
 | `apex_evidence_rank` | `false` | **default-off** evidence-count apex |
 | `emit_gate_diagnostics` | `false` | **default-off** four gate-score columns |
 | `gate_mode` | `apex_pearson` | which spectral score `min_frag_corr` thresholds |

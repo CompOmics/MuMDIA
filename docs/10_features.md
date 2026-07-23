@@ -411,9 +411,9 @@ Fragment ppm-error distribution over matched fragments (uses a fixed
 `lib_weighted_abs_ppm`, `frac_frag_within_half_tol`, `high_ppm_intensity_frac`,
 `ppm_intensity_anticorr`, `mass_error_mz_trend`, `mean_abs_mz_error_da`, and the
 positive DIA-NN-style evidence `mass_evidence_gauss` (predicted-weighted
-Gaussian concentration, sigma 10 ppm) and `mass_log_evidence`. The plan's
-`precursor_mass_error_ppm` is deliberately skipped (no theoretical precursor m/z
-in Evidence).
+Gaussian concentration, sigma 10 ppm) and `mass_log_evidence`.
+`precursor_mass_error_ppm` (in the plan.md feature spec, local only) is
+deliberately skipped (no theoretical precursor m/z in Evidence).
 
 ### ion_series (34, `ion_series.rs`)
 
@@ -463,9 +463,9 @@ Seed corroboration and precursor/charge metadata. Names:
 `log_seed_hyperscore`, `seed_hyperscore_per_matched`, `seed_identified` (dropped
 as reserved), `peptide_length` (dropped as reserved), `precursor_charge`,
 `charge_is_2/_is_3/_is_4plus`, `precursor_mass`, `log_total_matched_intensity`,
-`n_matched_frags`, `n_predicted_frags`. Sequence-dependent features from the
-plan (missed cleavages, C-terminal residue, modification count) are skipped
-because Evidence carries only `seq_len`.
+`n_matched_frags`, `n_predicted_frags`. Sequence-dependent features (missed
+cleavages, C-terminal residue, modification count) are skipped because Evidence
+carries only `seq_len`.
 
 ### nonzero (12, `nonzero.rs`)
 

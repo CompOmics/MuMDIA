@@ -7,13 +7,17 @@ MuMDIA is a pure-Rust engine with deterministic native fallbacks for every ML
 step, so it runs with zero Python. The sidecars are the opt-in path to real
 predictors and rescorers that raise identification counts over the native
 defaults. Each sidecar is a standalone Python worker invoked as a subprocess over
-a **positional-CLI file contract** (plan.md Section 3.2): the Rust caller writes
-an input file (Parquet or PIN), runs `python <worker> <argv...>`, and reads an
-output Parquet keyed by `id` or `candidate_id`. There is no JSON request file, no
-long-lived server, and no stdin/stdout data channel; the files on disk are the
-entire interface. This means any sidecar can be swapped for a native Rust
-implementation (or a different tool) without touching the callers, and a broken
-sidecar can fall back to the native path (`rescore.strict = false`).
+a **positional-CLI file contract** (the sidecar file contract; see
+`docs/18_findings_and_decisions.md`): the Rust caller writes an input file
+(Parquet or PIN), runs `python <worker> <argv...>`, and reads an output Parquet
+keyed by `id` or `candidate_id`. There is no JSON request file, no long-lived
+server, and no stdin/stdout data channel; the files on disk are the entire
+interface. Any sidecar can be swapped for a native Rust implementation (or a
+different tool) without touching the callers. Failure handling is **not uniform**:
+only the rescore sidecars fall back to a native rescorer, and only when
+`rescore.strict = false`. The predictor sidecars and MBR have no fallback and no
+strict gate, so a crashed MS2PIP, DeepLC, or DeepLC fine-tune aborts the whole
+run. The matrix in **Failure behavior** below is authoritative.
 
 The 10 scripts split into four groups: **predictors** (`ms2pip_worker`,
 `deeplc_worker`, `deeplc_finetune`) feed the run-independent library;
@@ -22,6 +26,47 @@ the competed PSMs in Stage F; **MBR** (`mbr_worker`) transfers identifications
 across runs (Stage D3); and the **DIA-NN recipe** (`import_diann_lib`,
 `make_reverse_decoys`, `make_shift_decoys`) is an offline, one-time toolchain to
 convert a user-produced DIA-NN library into MuMDIA's target+decoy library schema.
+
+## Failure behavior
+
+Two groups, verified in the source. Only the rescore sidecars fall back; the
+predictor sidecars and MBR abort the run on any nonzero exit. `run_worker` turns a
+nonzero exit into an `Err` (`sidecar.rs:186-188`); the call site decides whether
+that `Err` aborts or is caught.
+
+| worker (stage) | on nonzero exit | strict gate | fallback |
+|---|---|---|---|
+| ms2pip_worker (predict-frag) | aborts run | none | none: `run_ms2pip(...)?` propagates (`predict_frag.rs:315`); an empty result map is also a hard `bail!` (`predict_frag.rs:316-318`) |
+| deeplc_worker (predict-frag) | aborts run | none | none: `run_deeplc(...)?` propagates (`predict_frag.rs:272`) |
+| deeplc_finetune (run) | aborts run | none | none: `run_deeplc_finetune(...)?` propagates (`run.rs:204`) |
+| mbr_worker (`mumdia mbr`) | aborts command | none | none: `run_mbr(...)?` propagates (`main.rs:656`) |
+| mokapot_worker (rescore) | falls back / bails | `rescore.strict` | `native_tda` when `strict=false`, else bail (`rescore.rs:112-118`) |
+| nn_rescore_worker (rescore) | falls back / bails | `rescore.strict` | `native_tda` when `strict=false`, else bail (`rescore.rs:127-133`) |
+| percolator (rescore, unwired) | falls back / bails | `rescore.strict` | `native_tda` when `strict=false`, else bail (`rescore.rs:135-141`) |
+| entrapment_worker (rescore) | falls back / bails | `rescore.strict` | native linear entrapment rescorer (still `QMode::Entrapment`) when `strict=false`, else bail (`rescore.rs:170-180`) |
+
+A crashed MS2PIP, DeepLC, DeepLC fine-tune, or MBR worker aborts. A crashed
+rescorer aborts only under `rescore.strict = true`; otherwise its scores are
+silently replaced by the native path.
+
+### Argv contract
+
+The positional arguments each Rust caller passes, the output file it reads, and
+the column it keys the readback on.
+
+| worker | positional args in | output file | key column |
+|---|---|---|---|
+| ms2pip_worker | `<in.parquet> <out.parquet> <model>` (`sidecar.rs:58`) | `ms2pip_out.parquet` | `id` |
+| deeplc_worker | `<in.parquet> <out.parquet>` (`sidecar.rs:95`) | `deeplc_out.parquet` | `id` |
+| deeplc_finetune | `<lib_in> <seed> <lib_out> --epochs --patience --q-train --batch` (`sidecar.rs:122-125`) | `<lib_out>` (= `fragment_library_precursors_ft.parquet`) | `peptidoform` (rewrites `predicted_irt` in place) |
+| mokapot_worker / nn_rescore_worker | `<rescore.pin> <out.parquet>` + env `MUMDIA_NN_FOLDS/ITERS/TRAIN_FDR` (`rescore.rs:605-617`) | `rescore_sidecar_out.parquet` | `candidate_id` (echoes the flat row index) |
+| entrapment_worker | `<in.parquet> <out.parquet> <folds>` (`rescore.rs:537-543`) | `entrapment_out.parquet` | `row_id` |
+| mbr_worker | `<scored> <psms_csv> <out> --q-anchor --min-anchor-runs --q-transfer --seed [--out-scored] [--frag-csv --consensus-corr-min]` (`sidecar.rs:159-168`) | `<out>.parquet` | `candidate_id` |
+
+For the mapping from each conda environment to the config field that points at it
+(`predict_frag.ms2pip_python`, `predict_frag.deeplc_python`, `rescore.python`,
+`mbr.python`) and the interpreter paths on this machine, see
+`docs/19_getting_started.md`.
 
 ## Files
 
@@ -423,7 +468,7 @@ MLP. Set it explicitly for the logreg path.
 - **UTF-8.** `run_deeplc`/`run_deeplc_finetune` pass `utf8=true`; the PIN and
   entrapment sidecars set `PYTHONUTF8=1` directly. MS2PIP and MBR do not
   (`sidecar.rs:58, 95, 122, 169`).
-- **Determinism (plan.md Section 7).** MS2PIP predictions are deterministic
+- **Determinism (`docs/18_findings_and_decisions.md`, determinism contract).** MS2PIP predictions are deterministic
   regardless of process count (`ms2pip_worker.py:40-41`). DeepLC predict is
   deterministic given fixed weights. **DeepLC fine-tune is nondeterministic**: no
   torch/numpy seed is set (CLAUDE.md and MEMORY both flag this), so the rewritten
@@ -448,10 +493,13 @@ MLP. Set it explicitly for the logreg path.
   contiguous-id + m/z-sorted precondition holds. Do not reorder afterward.
   `make_reverse_decoys.py` additionally aborts if its residue-mass calculator
   disagrees with the library's own target fragment m/z by > 5 ppm at p99.
-- **Fallback masks failure unless strict.** With `rescore.strict = false` a
-  crashed or misconfigured sidecar is logged and the run silently continues on
-  `native_tda` (`rescore.rs:112-118, 127-133`). Production configs should set
-  `strict = true` so a broken rescorer never passes as native scores.
+- **Fallback masks failure unless strict (rescore only).** With
+  `rescore.strict = false` a crashed or misconfigured **rescore** sidecar is
+  logged and the run silently continues on `native_tda` (`rescore.rs:112-118,
+  127-133`). Production configs should set `strict = true` so a broken rescorer
+  never passes as native scores. The predictor sidecars (MS2PIP, DeepLC, DeepLC
+  fine-tune) and MBR have no such gate: any nonzero exit aborts the run (see
+  **Failure behavior**).
 - **MS2PIP charge coverage.** MS2PIP emits singly-charged b/y only; charge-2
   fragments keep the native heuristic intensity (`predict_frag.rs:324-337`).
 - **Entrapment worker needs both classes.** `entrapment_worker.py` raises

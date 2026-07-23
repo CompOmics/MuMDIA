@@ -7,10 +7,13 @@ config and data model that tie them together, the Python sidecars, and the build
 test, and deployment machinery. It is written for a developer or agent taking
 over the codebase who needs to understand not just what each part does but why it
 is built that way. Read `CLAUDE.md` at the repository root first for quick
-orientation (layout, build commands, implementation-status table); read `plan.md`
-(gitignored) for the algorithmic specification and the sensitivity-program
-findings. These docs sit between the two: more detail than `CLAUDE.md`, grounded
-in the actual code rather than the spec.
+orientation (layout, build commands, implementation-status table). For the
+validated findings and the interstage, determinism, and sidecar contracts, read
+`docs/18_findings_and_decisions.md`, which is self-contained and depends on no
+gitignored file. `plan.md` (gitignored, local-only) holds the deeper algorithmic
+specification but is not required to use these docs. These docs sit between
+`CLAUDE.md` and the code: more detail than `CLAUDE.md`, grounded in the actual
+source rather than the spec.
 
 ## Recommended reading order
 
@@ -25,6 +28,15 @@ in the actual code rather than the spec.
 5. Read **13 (sidecars)** when you need the real ML predictors and rescorers.
 6. Read **14 (build, test, deploy, gotchas)** before touching the build, the test
    suite, or the release machinery.
+7. Keep the reference docs to hand: **15 (Parquet data dictionary)** for the
+   column schema of every artifact, **16 (glossary)** for domain and codebase
+   terms, and **17 (troubleshooting)** for symptom -> cause -> fix lookups.
+8. Read **18 (findings, decisions, and contracts)** for the self-contained
+   restatement of the validated findings, the interstage/determinism/sidecar
+   contracts, the current best workflow, and the ranked roadmap. It depends on no
+   gitignored spec file and stands alone.
+9. Read **19 (getting started)** for the reproducible local setup and two
+   copy-pasteable end-to-end runs (native and best-sensitivity library).
 
 ## Document index
 
@@ -44,3 +56,8 @@ in the actual code rather than the spec.
 | [12_quant_lfq_align_mbr_report_audit.md](12_quant_lfq_align_mbr_report_audit.md) | The tail subcommands: `quant`, `quant-lfq` (MaxLFQ/directLFQ), `align`, `mbr`, `report`, and `audit`. |
 | [13_sidecars.md](13_sidecars.md) | The 10 Python sidecar workers (MS2PIP/DeepLC/mokapot/entrapment/diagnostics), the positional-CLI file contract, and the conda envs. |
 | [14_build_test_deploy_gotchas.md](14_build_test_deploy_gotchas.md) | The Rust workspace build, test coverage and gaps, the determinism contract, the clean-room boundary, and CI/Docker/release. |
+| [15_data_dictionary.md](15_data_dictionary.md) | Consolidated Parquet data dictionary: every column of every artifact, its Arrow type and nullability, sourced from the `Col`/`write_table` construction with `file:line` citations. |
+| [16_glossary.md](16_glossary.md) | Alphabetical glossary of domain and codebase terms as MuMDIA uses them, each entry self-contained and cited to `file:line` where it asserts code behavior. |
+| [17_troubleshooting.md](17_troubleshooting.md) | Symptom -> cause -> fix lookup table for the quiet failure modes (silent fallbacks, nondeterminism, void results), cited to `file:line`. |
+| [18_findings_and_decisions.md](18_findings_and_decisions.md) | Self-contained findings and contracts: validated results, interstage/determinism/sidecar contracts, current best workflow, and ranked roadmap, with no dependency on `plan.md`. |
+| [19_getting_started.md](19_getting_started.md) | Reproducible getting-started: local sidecar environments, the pre-built E. coli test library, and two copy-pasteable end-to-end runs plus a smoke check. |

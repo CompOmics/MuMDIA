@@ -26,6 +26,15 @@ Each stage is an independent subcommand that reads path-addressable inputs and
 writes Parquet plus a per-artifact `report.json`, so the pipeline is inspectable
 and resumable at any step.
 
+## Documentation
+
+`docs/` is the developer guide: a per-subsystem reference grounded in the current
+code (crates, each pipeline stage and its artifacts, the config and data model,
+the sidecars, and the build and deploy machinery); start at
+[`docs/README.md`](docs/README.md). For a practical local on-ramp with
+copy-pasteable end-to-end runs, see
+[`docs/19_getting_started.md`](docs/19_getting_started.md).
+
 ## Pipeline
 
 ```
@@ -89,9 +98,9 @@ One command from a FASTA and a DIA mzML, using the validated DIA preset:
 
 ```
 mumdia run \
-  --fasta  proteome.fasta \
-  --mzml   sample.mzML \
-  --out    results \
+  --fasta   proteome.fasta \
+  --mzml    sample.mzML \
+  --out-dir results \
   --profile dia
 ```
 
@@ -114,6 +123,15 @@ the Python interpreter path are set in the configuration. The Docker image above
 bundles all three so no manual environment setup is needed; the environment
 specifications are under `env/` (`mumdia-rescore.yml`, `docker-rescore.yml`,
 `docker-deeplc.yml`).
+
+The `scripts/` directory holds ten Python programs. Seven are engine-invoked
+sidecar workers, called by the relevant stage over that file contract: MS2PIP
+(`ms2pip_worker.py`), DeepLC (`deeplc_worker.py`), the DeepLC fine-tune
+(`deeplc_finetune.py`), mokapot (`mokapot_worker.py`), the native-torch rescorer
+(`nn_rescore_worker.py`), the entrapment rescorer (`entrapment_worker.py`), and
+match-between-runs (`mbr_worker.py`). The other three are helpers for the DIA-NN
+library recipe below and are run by hand: `import_diann_lib.py`,
+`make_reverse_decoys.py`, and `make_shift_decoys.py`.
 
 ## Using a DIA-NN spectral library (highest sensitivity)
 
@@ -212,10 +230,18 @@ required.
 
 ## Benchmark
 
-On the ProteomeXchange E. coli AIF file `LFQ_Orbitrap_AIF_Ecoli_01`, with a
-DIA-NN-predicted library and per-run fine-tuned retention time, MuMDIA reports on
-the order of 9,000 to 10,000 peptides at 1% FDR (mokapot), at roughly 97 to 98%
-sequence concordance with DIA-NN.
+All counts below are single-run on the ProteomeXchange E. coli AIF file
+`LFQ_Orbitrap_AIF_Ecoli_01`, at 1% target-decoy FDR (FDR-valid q-values). Each
+number states the rescorer used.
+
+- **Native FASTA digest (zero dependencies):** about 1,213 target peptides, using
+  the built-in models and the native rescorer (`native_tda`). Conservative and
+  high-precision.
+- **Imported DIA-NN library with per-run DeepLC fine-tune:** about 9,300 to 9,500
+  target peptides with the mokapot rescorer (`mokapot`), and about 10,300 with the
+  native PyTorch rescorer (`nn_torch`), which is nonlinear and outperforms the
+  linear mokapot model on the same feature set. Roughly 97 to 98% sequence
+  concordance with DIA-NN.
 
 ## License
 

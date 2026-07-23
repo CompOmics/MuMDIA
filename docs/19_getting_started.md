@@ -1,0 +1,299 @@
+# Getting started: local setup and a worked end-to-end run
+> Part of the MuMDIA developer documentation (see docs/README.md).
+
+This document is the practical on-ramp for running MuMDIA on this machine. It
+covers the local Python sidecar environments, converting vendor files to mzML,
+the pre-built E. coli test library in `lib/`, two copy-pasteable end-to-end runs
+(a zero-dependency native run and the best-sensitivity library run), and a smoke
+check. It complements the algorithmic docs (04-12) with the concrete inputs and
+commands that already exist on disk.
+
+The binary referenced below is the prebuilt release binary at
+`C:/Users/robbi/mumdia_build/release/mumdia.exe` (the target directory is
+redirected off the OneDrive tree by `rust/mumdia/.cargo/config.toml`; see
+`docs/14_build_test_deploy_gotchas.md`). Substitute your own path if you rebuild.
+
+Identification counts quoted here are taken from previously documented runs
+(`CLAUDE.md`, project memory). They are stated as regression targets and were
+not re-verified while writing this document.
+
+## 1. Local Python sidecar environments
+
+The engine runs end to end with zero external dependencies using the native
+predictors and the native `percolator_lite` rescorer. The real ML predictors and
+rescorers are opt-in Python sidecars invoked over a positional-CLI file contract
+(input Parquet/PIN as argv, output Parquet; see `docs/13_sidecars.md`). Each
+sidecar is a separate conda environment, wired into a run purely by pointing a
+config field at that environment's `python.exe`. The interpreter path is never
+hardcoded in Rust; it comes from the config
+(`predict_frag.ms2pip_python`, `predict_frag.deeplc_python`, `rescore.python`,
+defined at `rust/mumdia/crates/mumdia-core/src/config.rs:303`, `:305`, `:959`).
+
+The environments discovered on this machine under
+`C:/Users/robbi/anaconda3/envs/` are:
+
+| Env | Interpreter (`python.exe`) | Key packages (verified) | Used for |
+|---|---|---|---|
+| `py312_mumdia` | `C:/Users/robbi/anaconda3/envs/py312_mumdia/python.exe` | torch 2.5.1+cpu, pyarrow 11.0.0 | `nn_torch` rescorer (`nn_rescore_worker.py`); needs an interpreter with torch |
+| `deeplc_mt` | `C:/Users/robbi/anaconda3/envs/deeplc_mt/python.exe` | DeepLC 4.0.0a2 (multitask), pyarrow | DeepLC per-run fine-tune (`deeplc_finetune.py`) and DeepLC iRT prediction (`deeplc_worker.py`) |
+| `ms2rescore` (canonical name in `CLAUDE.md`) | not present on this machine | mokapot + MS2PIP | `mokapot` rescorer and MS2PIP intensity prediction |
+
+Notes:
+
+- The `nn_torch` rescorer requires `rescore.python` to point at an interpreter
+  with torch (`config.rs:134-139`); `py312_mumdia` satisfies this.
+- Use `deeplc_mt`, not the older `deeplc_multitask`, for the fine-tune: prediction
+  crashes in `deeplc_multitask` on this machine (`CLAUDE.md`, ML predictors
+  section). `deeplc_finetune.py` pins OpenMP/BLAS threads to avoid an
+  oversubscription crash specific to this env
+  (`scripts/deeplc_finetune.py:6-27`).
+- The `ms2rescore` environment named in `CLAUDE.md` is not present here. mokapot
+  and MS2PIP are importable in `py311_workshop` and in `deeplc_mt` if you want the
+  mokapot rescorer or the MS2PIP predictor. The best-workflow config in Section 4
+  uses `nn_torch` plus the imported library's own fragment intensities, so this
+  environment is not required for it.
+
+### Locating and creating environments
+
+List what exists and confirm an interpreter's contents:
+
+```
+conda env list
+C:/Users/robbi/anaconda3/envs/py312_mumdia/python.exe -c "import torch, pyarrow; print(torch.__version__, pyarrow.__version__)"
+C:/Users/robbi/anaconda3/envs/deeplc_mt/python.exe     -c "import deeplc; print(deeplc.__version__)"
+```
+
+Conda specs for the sidecar environments are under `env/` (the same specs the
+Docker image bakes). `mumdia doctor` probes the interpreters named in a config
+and reports which packages import, so run it after editing paths:
+
+```
+C:/Users/robbi/mumdia_build/release/mumdia.exe doctor --config config.local-diann-lib.json
+```
+
+### Environment to config-field mapping
+
+| Config field | Value on this machine | Effect |
+|---|---|---|
+| `rescore.python` | `py312_mumdia` python | interpreter for the `nn_torch` sidecar |
+| `rescore.classifier` | `nn_torch` | selects the PyTorch semi-supervised rescorer |
+| `predict_frag.deeplc_python` | `deeplc_mt` python | interpreter for the DeepLC fine-tune / prediction |
+| `rt_im_train.finetune_deeplc` | `true` | enables the per-run DeepLC fine-tune (requires `deeplc_python`, enforced at `rust/mumdia/crates/mumdia/src/stages/run.rs:63-65`) |
+| `predict_frag.ms2pip_python` | unset | would point at an env with MS2PIP; not used by the library run |
+
+## 2. Converting vendor files to centroided mzML
+
+MuMDIA reads only mzML. `convert` (Stage 0) is the sole point that touches a
+vendor format, and it goes through the `mzdata` crate built with the `mzml`
+feature only (`docs/04_convert.md`; `CLAUDE.md` build notes). Thermo `.raw`,
+Bruker `.d`/TDF, and SCIEX `.wiff` are not read natively (they are on the
+beyond-MVP roadmap, `CLAUDE.md`). Convert them first with ProteoWizard
+`msconvert`.
+
+Produce centroided mzML using the vendor peak-picking filter:
+
+```
+msconvert sample.raw --mzML --64 --zlib --filter "peakPicking vendor msLevel=1-"
+```
+
+- `peakPicking vendor msLevel=1-` applies the instrument vendor's centroiding to
+  all MS levels. Vendor peak-picking is higher quality than a generic algorithm.
+- For Bruker `.d`, point `msconvert` at the `.d` directory; vendor peak-picking
+  requires the Bruker vendor libraries in the ProteoWizard build.
+- MuMDIA also centroids profile spectra itself if it receives profile data (local
+  maxima plus parabolic apex, `rust/mumdia/crates/mumdia/src/stages/convert.rs`),
+  and synthesizes a full-range isolation window for zero-bounded AIF/all-ion
+  scans, so a profile mzML still runs. Centroiding at conversion is preferred
+  because the vendor algorithm is better and the files are smaller.
+
+## 3. The pre-built E. coli test library (`lib/`)
+
+`lib/` holds a ready-to-use imported library for the E. coli AIF test file, so
+you can run the library-input path without regenerating anything. All files are
+gitignored (large binaries kept on disk).
+
+| File | Rows | Role |
+|---|---|---|
+| `lib/lib_precursors.parquet` | 1,691,048 | Precursor library, `predicted_irt` = raw DIA-NN iRT |
+| `lib/lib_precursors_ft.parquet` | 1,691,048 | Same precursors, `predicted_irt` = DeepLC-fine-tuned (the one to use for direct library input) |
+| `lib/lib_fragments.parquet` | 19,998,666 | b/y fragment m/z + predicted intensities, keyed by `candidate_id` |
+| `lib/seed_psms.parquet` | 144,821 | Saved search-seed PSMs from the run that built the library |
+| `lib/seed_psms.parquet.masscal.json` | 1 | Per-run mass-recalibration sidecar for that seed |
+
+The precursor and fragment schemas match the library-input contract consumed by
+the fragment index (`rust/mumdia/crates/mumdia/src/index.rs:63`, `:121`):
+`candidate_id, peptidoform_id, base_peptide_id, peptidoform, charge,
+precursor_mz, predicted_irt, label, protein, n_fragments` for precursors, and
+`candidate_id, mz, predicted_intensity, name, ion_type, ordinal, frag_charge`
+for fragments. `candidate_id` is contiguous and precursors are sorted by
+`precursor_mz`, the preconditions the index build checks on load.
+
+### Provenance
+
+The library was built with the license-clean DIA-NN recipe (`CLAUDE.md`, DIA-NN
+library recipe): a DIA-NN predicted E. coli library was imported with
+`scripts/import_diann_lib.py`, then reverse decoys were added and the table
+re-sorted and re-indexed with `scripts/make_reverse_decoys.py`. Each target
+carries a paired `DECOY_`-prefixed reverse decoy, and contaminant entries are
+kept (visible as `Cont_` proteins). MuMDIA does not contain or redistribute
+DIA-NN; the user runs DIA-NN under their own academic license to predict the
+source library.
+
+### Raw vs `_ft`: which precursor file to use (easy to get wrong)
+
+Both precursor files have identical schemas and row counts and differ only in the
+`predicted_irt` column:
+
+- `lib_precursors.parquet` (raw) carries the DIA-NN iRT scale (small values,
+  roughly -50 to +150; e.g. the first target `YGC[Carbamidomethyl]AE` has
+  `predicted_irt = -22.9`).
+- `lib_precursors_ft.parquet` (`_ft`) has that column overwritten by a DeepLC
+  fine-tune, on a different, much larger scale (the same peptide reads
+  `predicted_irt = 1413.6`).
+
+You can tell them apart at a glance with `mumdia inspect lib/lib_precursors.parquet`
+vs `..._ft.parquet` and comparing the `predicted_irt` magnitudes. Raw DIA-NN iRT
+is locally noisy, so if you consume a precursor library directly the `_ft` file
+is the one to use: `rt-im-train` reads `predicted_irt` as-is to fit the RT
+calibration and set per-candidate windows
+(`rust/mumdia/crates/mumdia/src/stages/rt_im_train.rs:35`, `:75`), and raw iRT
+gives poor windows.
+
+Interaction with the per-run fine-tune (the best-workflow config sets
+`rt_im_train.finetune_deeplc = true`): when the fine-tune is on, `run` fine-tunes
+DeepLC on this run's confident seed PSMs and rewrites `predicted_irt` for every
+standard peptidoform before RT calibration
+(`rust/mumdia/crates/mumdia/src/stages/run.rs:187-208`;
+`scripts/deeplc_finetune.py:156-159`). The input file's `predicted_irt` is then
+only a fallback for non-standard peptidoforms (`deeplc_finetune.py:95`, `:156`),
+so raw and `_ft` produce equivalent results with the fine-tune on. The `_ft`
+distinction matters when `finetune_deeplc = false`.
+
+### The seed and mass-cal sidecars
+
+`lib/seed_psms.parquet` is the search-seed artifact saved from the full run that
+built this library (144,821 candidate PSMs: `peptidoform, charge, label, score,
+spectrum_q, observed_rt, predicted_irt, matched_peaks, scan_index`, ...). The
+`run` orchestrator recomputes its own seed each time and does not read this file
+(`run.rs` computes search-seed internally), so it is provided for standalone
+stages (`rt-im-train`, `align`, `mbr`, `audit`) and for inspection.
+`lib/seed_psms.parquet.masscal.json` is the per-run fragment mass recalibration
+written by `search-seed` (`{"frag_ppm_offset": 0.79, "frag_tol_ppm": 19.2,
+"n_dev": 65678}`); it likewise belongs to that prior run.
+
+## 4. Worked end-to-end runs
+
+Run from the repository root
+(`C:/Users/robbi/OneDrive - UGent/MuMDIA_NG`). Both inputs below exist on disk:
+`fasta/ecoli_22032024.fasta` and
+`mzml_files/LFQ_Orbitrap_AIF_Ecoli_01.mzML` (a 3.4 GB AIF file).
+
+### 4a. Zero-dependency native FASTA run
+
+No Python, no sidecars. `--profile dia` selects the Extended feature set,
+rolling-window apex counting (window 5), and the RT prior
+(`config.rs:1100-1104`). Native predictors and the native rescorer are used
+throughout.
+
+```
+C:/Users/robbi/mumdia_build/release/mumdia.exe run \
+  --fasta fasta/ecoli_22032024.fasta \
+  --mzml  mzml_files/LFQ_Orbitrap_AIF_Ecoli_01.mzML \
+  --out-dir out_native \
+  --profile dia
+```
+
+Expected result (documented, not re-verified here): approximately 1,213 target
+peptides (precursor rows in `out_native/peptides.tsv`) at 1% FDR. This path is
+deterministic across runs and high-precision.
+
+### 4b. Best-workflow library run
+
+Library-input mode plus the local sidecar config. `run` skips
+digest/peptidoforms/predict-frag and consumes the prebuilt library
+(`main.rs:204-207`). The config `config.local-diann-lib.json` (repository root)
+turns on: Extended features, `min_frag_corr = 0.2`, rolling-window apex (5) and
+RT prior (120 s), the per-run DeepLC fine-tune via `deeplc_mt`, the `nn_torch`
+rescorer via `py312_mumdia`, and `quant.q_filter = run_psm_q`.
+
+```
+C:/Users/robbi/mumdia_build/release/mumdia.exe run \
+  --lib-precursors lib/lib_precursors_ft.parquet \
+  --lib-fragments  lib/lib_fragments.parquet \
+  --mzml mzml_files/LFQ_Orbitrap_AIF_Ecoli_01.mzML \
+  --out-dir out_lib \
+  --config config.local-diann-lib.json
+```
+
+Expected result (documented, not re-verified here): approximately 10,300 target
+peptides at 1% FDR with the `nn_torch` rescorer. Runtime is roughly 10 minutes
+on this machine (the fine-tune dominates; without it the chain is under 3
+minutes). This run is nondeterministic: `deeplc_finetune.py` sets no torch/numpy
+seed, so the fine-tuned iRT and the final count vary slightly between runs
+(`CLAUDE.md`, ML predictors section).
+
+The `run` stdout ends with a one-line summary, for example:
+
+```
+MuMDIA: <N> peptides, <M> protein groups at q <= 0.01 (rescorer: NnTorch)
+```
+
+`N` is the number of precursor rows written to `peptides.tsv` (the report unit is
+peptidoform + charge, filtered to targets with peptide q <= the threshold;
+`rust/mumdia/crates/mumdia/src/stages/report.rs:89-107`, threshold from
+`quant.q_threshold`, default 0.01, `config.rs:862`; summary printed at
+`run.rs:317-320`).
+
+## 5. Acceptance and smoke check
+
+### Fast smoke run
+
+Use `--max-spectra` to cap conversion for a quick end-to-end sanity check. The
+early gradient of this file is void, so a small cap finds almost nothing; the
+point is to confirm the chain and the sidecars run to completion, not to get a
+meaningful count.
+
+```
+C:/Users/robbi/mumdia_build/release/mumdia.exe run \
+  --lib-precursors lib/lib_precursors_ft.parquet \
+  --lib-fragments  lib/lib_fragments.parquet \
+  --mzml mzml_files/LFQ_Orbitrap_AIF_Ecoli_01.mzML \
+  --out-dir out_smoke \
+  --config config.local-diann-lib.json \
+  --max-spectra 20000
+```
+
+What to look for:
+
+- The process exits 0 and prints the `MuMDIA: ... (rescorer: NnTorch)` summary
+  line, confirming the `nn_torch` sidecar in `py312_mumdia` ran (a sidecar
+  failure otherwise surfaces here).
+- The DeepLC fine-tune log lines appear (`fine-tune reference: <n> confident seed
+  peptides`, `wrote fine-tuned library`), confirming `deeplc_mt` ran.
+- `out_smoke/` contains `peptides.tsv`, `proteins.tsv`, `manifest.json`, and the
+  Parquet artifacts.
+
+Before the smoke run, `mumdia doctor --config config.local-diann-lib.json`
+confirms both interpreters import their packages without launching a full run.
+
+### Full-run regression guard
+
+Treat the Section 4 counts as regression targets on
+`LFQ_Orbitrap_AIF_Ecoli_01.mzML`:
+
+- Native FASTA run (`--profile dia`): approximately 1,213 target peptides at 1%
+  FDR, deterministic (exact match expected).
+- Best-workflow library run (`config.local-diann-lib.json`, `nn_torch`):
+  approximately 10,300 target peptides at 1% FDR, nondeterministic (expect small
+  run-to-run variation, so treat this as a band, not an exact number).
+
+Count the peptide (precursor) rows in a report, which is the header line plus one
+row per precursor:
+
+```
+wc -l out_lib/peptides.tsv   # subtract 1 for the header
+```
+
+A native count far below 1,213 or a library count far below 10,300 indicates a
+regression (or, for the library run, a missing or misconfigured sidecar). These
+numbers are documented from prior runs and were not re-verified in this document.

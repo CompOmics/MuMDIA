@@ -172,7 +172,7 @@ the read returns empty and refinement is inert. Writes `candidate_audit.parquet`
    elution window `(lo_rt, hi_rt, apex_rt)` via `peak_window` (`quant.rs:75`). The
    summed XIC across all of a candidate's fragments is built in a `BTreeMap` keyed by
    the f32 RT bit pattern, so both the union RT axis and the f64 summation order are
-   fixed (determinism, plan.md Section 7; non-negative RTs make bit order equal value
+   fixed (determinism, docs/18_findings_and_decisions.md contract B2; non-negative RTs make bit order equal value
    order). When the summed XIC has fewer than two distinct RT samples nothing can be
    bound: `peak_window` returns `(NEG_INFINITY, INFINITY)` with the lone RT as apex
    (or NaN when empty), an unbounded window (`quant.rs:95`). Otherwise the apex is

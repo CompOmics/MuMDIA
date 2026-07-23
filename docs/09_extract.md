@@ -372,8 +372,8 @@ retain_top_peaks`, `bound_fraction = 1/3` and `min_prominence_frac = 0.1`
 
 `enumerate_peaks(.., k=1, ..)` returns the single global-argmax peak, so callers
 can adopt it incrementally. The retained peaks rank by **co-eluting fragment
-breadth (count), not intensity**, per the finding that intensity is chimeric in
-DIA. Back in `extract`, each returned `PeakGroup` is mapped to a sidecar row
+breadth (count), not intensity**, per finding A6 in
+docs/18_findings_and_decisions.md (intensity is chimeric in DIA). Back in `extract`, each returned `PeakGroup` is mapped to a sidecar row
 (`extract.rs:1250`): `apex_rt`/`start_rt`/`end_rt` are the RTs of the
 apex/start/end scan groups, `evidence_count` is the distinct-fragment count at
 the apex group (`groups[pk.apex_idx].1.len()`), and `area` is `pk.area`. The main
@@ -445,6 +445,26 @@ not reintroduce them.
 Note: `emit_candidate_audit` is a declared knob but the candidate-audit write is
 not present in this `extract.rs`; the audit ladder is produced by the separate
 `mumdia audit` command. Treat the in-stage audit as unwired here.
+
+### Default-off sensitivity knobs (index)
+
+Every knob below is default-off, so the production PSM schema and per-candidate
+compute stay byte-identical unless the knob is set. None has an end-to-end
+identification-gain measurement yet; each must pass the entrapment-holdout gate
+on >=2 datasets before being enabled by default
+(`sensitivity_plan/NEXT_STEPS.md`). Two of the knobs live in other stages'
+configs (`search_seed`, `rt_im_train`) but are listed here for one index.
+
+| knob | extra columns / artifact | validation status |
+|---|---|---|
+| `extract.retain_top_peaks` (`config.rs:518`, default 1) | `<out_psms>.peaks.parquet` sidecar, unscored, written only when K>1 (`extract.rs:1415`); no PSM columns | ID loop not closed (sidecar peaks are unscored); gate pending |
+| `extract.emit_candidate_audit` (`config.rs:523`) | none in `extract.rs` (unused there); in `run` it gates the `audit` stage -> `candidate_audit.parquet` (`run.rs:276`) | diagnostic; no ID effect |
+| `extract.emit_gate_diagnostics` (`config.rs:538`) | 4 F32 cols `gate_apex`, `gate_peak_spectral`, `gate_coelution`, `gate_spectral_entropy` (`extract.rs:1388`) | diagnostic; no ID effect |
+| `extract.apex_evidence_rank` (`config.rs:532`) | none; changes the apex-selection score (`extract.rs:992`) | diagnostic support (finding A6, docs/18); no end-to-end gain measured |
+| `search_seed.two_pass_mass_cal` (`config.rs:346`) | none; refits the `<seed>.masscal.json` offset + tolerance | not measured; gate pending |
+| `rt_im_train.adaptive_rt_window` (`config.rs:402`) | none; per-region RT half-window widths in `run_windows` | not measured; gate pending |
+| `extract.emit_contested_features` (`config.rs:493`) | 2 F64 cols `contested_count_frac`, `apportioned_frac` (`extract.rs:1382`); forces the two-pass path (`extract.rs:656`) | not measured; gate pending |
+| `compete.mode` (`CompetitionMode`, `config.rs:680`, default `winner_take_all`) | retains more rows in `competed`; optional `<out>.compete_audit.parquet` via `emit_competition_audit` (`config.rs:690`) | not measured; gate pending |
 
 ## Invariants, determinism, gotchas
 

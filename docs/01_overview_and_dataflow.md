@@ -14,11 +14,26 @@ branches between them, the single-run `run` orchestration and its
 `manifest.json`, and the current best-performing workflow.
 
 The design principle is that every stage is an independent command over
-path-addressable inputs and outputs on disk (plan.md Section 3.5). No stage
-shares in-memory state with another; the orchestrator only threads file paths.
-This makes any stage runnable standalone on prior outputs, on a different
-configuration, or on hand-crafted minimal files. `run` is a convenience that
-chains the stages in order and records provenance; it computes nothing itself.
+path-addressable inputs and outputs on disk (the interstage contract, docs/18
+B1). No stage shares in-memory state with another; the orchestrator only threads
+file paths. This makes any stage runnable standalone on prior outputs, on a
+different configuration, or on hand-crafted minimal files. `run` is a convenience
+that chains the stages in order and records provenance; it computes nothing
+itself.
+
+`run` recomputes every stage on every invocation. There is no artifact caching,
+no skip-if-exists, and no resume: `run` calls each stage unconditionally and
+overwrites its outputs even when identical artifacts already exist in `--out-dir`
+(`run.rs:83-343`; no existence check precedes any stage call, and
+`std::fs::create_dir_all` at `run.rs:88` does not clear or skip). To reuse a
+prior artifact, invoke the downstream stage command standalone on it instead of
+rerunning `run`.
+
+The validated findings and the interstage, determinism, and sidecar contracts
+cited throughout this document are consolidated, self-contained, in
+`docs/18_findings_and_decisions.md` (sections A1-A7 for findings, B1-B3 for
+contracts); the citations below point there. plan.md holds the deeper
+algorithmic spec but is local-only and gitignored.
 
 ## Files
 
@@ -35,19 +50,60 @@ chains the stages in order and records provenance; it computes nothing itself.
 | `rust/mumdia/crates/mumdia-io/src/table.rs` | The `Col`/`Table` typed Parquet layer every stage writes through (`table.rs:23`). |
 | `rust/mumdia/crates/mumdia-io/src/lib.rs` | `record_artifact`, `inspect`, `init_logging`, blake3 hashing. |
 
+### Crate responsibilities and predictor plumbing
+
+Three crates, one direction of dependency (`mumdia` -> `mumdia-io` ->
+`mumdia-core`):
+
+```
+mumdia-core   types, mass model, Config (per-stage sections + strategy enums),
+              schema (frozen artifact names/versions), manifest, errors
+mumdia-io     Col/Table over arrow+parquet (SNAPPY), blake3 hashing, JSON,
+              inspect, per-artifact report.json
+mumdia        bin + lib: fragment index, stages/, predictor + rescorer traits,
+              sidecar dispatch; main.rs is a thin CLI over the lib
+```
+
+The two ML predictors are traits with a deterministic native fallback and an
+optional Python sidecar, selected by config (the sidecar replaces the native
+path without changing callers, `predict.rs:1-8`). The rescorer is not a trait: a
+free function plus the `RescorerKind` enum.
+
+```
+RtPredictor        (trait, predict.rs:13)
+   |-- NativeRt     (predict.rs:25, additive RT-coefficient model, deterministic)
+   \-- DeepLC       (Python sidecar; predict_frag.rt_predictor = deeplc)
+
+FragmentPredictor  (trait, predict.rs:19)
+   |-- NativeFrag   (predict.rs:73, heuristic b/y intensities, deterministic)
+   \-- MS2PIP       (Python sidecar; predict_frag.predictor = ms2pip)
+
+Rescorer           (free fn + RescorerKind enum, no trait)
+   native_tda (percolator_lite) | nn_torch | mokapot | entrapment
+   (the last three are Python sidecars via rescore.python)
+```
+
 ## Inputs and outputs
 
 The pipeline consumes an mzML file plus one of two library sources, and produces
 a fixed set of Parquet artifacts plus JSON sidecars. Every stage also writes a
 small `<artifact>.report.json` next to each Parquet output (row counts, key
-distributions, parameters, timing; plan.md Section 3.5), which is not listed
-below per artifact but always exists.
+distributions, parameters, timing; docs/18 B1), which is not listed below per
+artifact but always exists.
 
 External inputs:
 - `--mzml <file>` (mzML; `.raw`/`.d` must be converted upstream by msconvert).
 - FASTA mode: `--fasta <file>` (digested into the library).
 - Library-input mode: `--lib-precursors <parquet>` + `--lib-fragments <parquet>`
   (a prebuilt library, for example an imported DIA-NN speclib).
+
+Inputs on disk: a pre-built E. coli test library is already present under `lib/`:
+`lib_precursors.parquet` + `lib_fragments.parquet` (an imported DIA-NN speclib
+with fragment intensities and iRT) plus `lib_precursors_ft.parquet` (the DeepLC
+fine-tuned iRT variant, the recommended `--lib-precursors` per docs/18 A4), and a
+cached `seed_psms.parquet` (+ `.masscal.json`). See `docs/19_getting_started.md`
+for the local sidecar environments and two copy-pasteable end-to-end runs (a
+zero-dependency native FASTA run and the best-sensitivity library run).
 
 Parquet artifacts and their column schemas as written in the code:
 
@@ -112,7 +168,7 @@ when extraction accepts a very large candidate set.
 `<psms>.peaks.parquet` (`extract.rs:1419`, written only when
 `extract.retain_top_peaks > 1`): `candidate_id` u32, `peak_rank` i32, `apex_rt`
 f64, `start_rt` f64, `end_rt` f64, `evidence_count` f64, `area` f64. This is a
-diagnostic sidecar not yet scored downstream (see finding 8, Gotchas).
+diagnostic sidecar not yet scored downstream (see docs/18 A6, and Gotchas below).
 
 `features.parquet` (`features.rs:828`): bookkeeping columns `candidate_id`,
 `label`, `base_peptide_id`, `peptidoform`, `protein`, `apex_rt`, `elution_lo`,
@@ -160,8 +216,19 @@ subcommand per stage plus the `run` orchestrator, the experiment-level
 `align`/`mbr`, and the utilities `inspect`/`report`/`doctor`. Each stage arm
 loads the config, hashes its canonical JSON into a `config_hash`, and calls the
 stage `run`; every stage command is runnable standalone on prior outputs. Flags
-are `--kebab-case`; a `num_args = 1..` flag accepts several values. The full set,
-in source order:
+are `--kebab-case`; a `num_args = 1..` flag accepts several values.
+
+Which subcommands read `--config` (verified against `main.rs`):
+
+| Takes `--config` | No `--config` |
+|---|---|
+| `digest`, `peptidoforms`, `predict-frag`, `search-seed`, `rt-im-train`, `extract`, `features`, `compete`, `rescore`, `quant`, `run`, `align`, `mbr`, `doctor` (optional) | `convert`, `quant-lfq`, `inspect`, `audit`, `report` |
+
+The five with no `--config` are fixed-behavior: `convert` always runs on
+`Config::default()` (`main.rs:384`); `quant-lfq` takes typed string flags instead
+(`main.rs:617-624`); `inspect`, `audit`, and `report` load no config at all
+(`main.rs:658`, `main.rs:536`, `main.rs:661`). The full subcommand set, in source
+order:
 
 | `mumdia <cmd>` | Inputs (flags) | Outputs (flags / artifacts) |
 |---|---|---|
@@ -391,26 +458,26 @@ keys are recorded at `run.rs:323-332`: `rt_predictor`, `fragment_predictor`,
 `rescorer`, and `feature_schema_id`. The manifest is written last to
 `<out_dir>/manifest.json` (`run.rs:334`) with `mumdia_io::json::write_json`. The
 manifest is provenance recorded, not required: because inputs are
-path-addressable, no stage depends on it to run (plan.md Section 3.5).
+path-addressable, no stage depends on it to run (docs/18 B1).
 
 ### Current best workflow
 
-The validated best-performing configuration (plan.md preamble "Best workflow",
-finding 1) is library-input mode with:
+The validated best-performing configuration (docs/18 A1 and its "current best
+workflow") is library-input mode with:
 - an imported DIA-NN library (fragment intensities + iRT),
 - per-run DeepLC multitask fine-tune of iRT (`rt_im_train.finetune_deeplc = true`
   + `predict_frag.deeplc_python`), which is essential in library mode because raw
   DIA-NN iRT is locally noisy (~110 s MAD) and the fine-tune tightens it to
-  ~13-27 s (finding 5),
+  ~13-27 s (docs/18 A4),
 - the Extended feature set (`features.set = extended`, applied by `--profile dia`,
   `config.rs:1101`),
 - the `nn_torch` PyTorch MLP rescorer (`rescore.classifier = nn_torch` +
   `rescore.python`), which is the dominant sensitivity lever and beats the native
-  linear rescorer by ~8.5% (finding 1),
+  linear rescorer by ~8.5% (docs/18 A1),
 - a loose extraction gate (`extract.min_frag_corr ~= 0.2`, now the default), since
   a strong nonlinear rescorer prefers recall and absorbs the loose-gate flood
-  (finding 2),
-- the MS2 peak cap kept at 300 on AIF (finding 4).
+  (docs/18 A1/A2),
+- the MS2 peak cap kept at 300 on AIF (docs/18 A3).
 
 On `LFQ_Orbitrap_AIF_Ecoli_01.mzML` this reaches ~10,300 peptides at 1% FDR. The
 zero-dependency native FASTA-digest mode (~1,213 peptides) is the high-precision
@@ -455,7 +522,7 @@ config (`main.rs:581`) before `run`. The fields this overview area touches:
 | `predict_frag.deeplc_python` | `None` | Interpreter for DeepLC; required if `finetune_deeplc`; probed by `doctor`. |
 | `predict_frag.ms2pip_python` | `None` | Interpreter for MS2PIP; probed by `doctor` (`main.rs:323`). |
 | `predict_frag.sidecar_script_dir` | `"scripts"` | Where sidecar workers are resolved from (used by `rescore`/`mbr`). |
-| `search_seed.top_n_peaks` | `300` | Seed-only MS2 peak cap (keep 300 on AIF, finding 4). |
+| `search_seed.top_n_peaks` | `300` | Seed-only MS2 peak cap (keep 300 on AIF, docs/18 A3). |
 | `extract.bucket_size` | (see `ExtractConfig`) | Fragment-index bucket width; `search-seed` reads it too (`main.rs:456`). |
 | `rt_im_train.calibration_method` | `loess` | RT calibration; `none` is rejected by validation. |
 | `rt_im_train.q_train` | (see `RtImTrainConfig`) | Confident-seed q cutoff for the DeepLC fine-tune and the `align` reference set. |
@@ -475,8 +542,8 @@ config (`main.rs:581`) before `run`. The fields this overview area touches:
 | `mbr.python` | `None` | `mbr_worker.py` interpreter; required when `strategy != none` (`main.rs:647`). |
 | `quant.q_threshold` | `0.01` (`QuantConfig`) | q-value threshold for the human-readable report. |
 
-The config surface was recently pruned of dead or unwired fields (plan.md
-"Config-surface note"): `threads`, `extract.{k_select, max_fragment_charge,
+The config surface was recently pruned of dead or unwired fields (see
+`docs/02_config_and_data_model.md`): `threads`, `extract.{k_select, max_fragment_charge,
 scan_scale, scan_window_mode}` + `ScanWindowMode`, `digest.decoy.{ratio, source}`
 + `DecoySource`, `search_seed.precursor_tol_ppm`, `rt_im_train.tolerance_regime`
 + `ToleranceRegime`, `FeatureSet::Custom`, `MatcherKind::Naive`, and
@@ -489,8 +556,8 @@ not part of the `run` chain and needs >=2 runs.
 
 ## Invariants, determinism, gotchas
 
-- Determinism is required (plan.md Section 7): seed the RNG, keep numeric
-  summation order fixed. A HashMap f32 sum shifting the apex once broke
+- Determinism is required (docs/18 B2, the determinism contract): seed the RNG,
+  keep numeric summation order fixed. A HashMap f32 sum shifting the apex once broke
   reproducibility; use ordered maps or sorted iteration where floats are summed.
   The DeepLC fine-tune is the one deliberate exception (nondeterministic; no fixed
   torch seed), so a `run` with `finetune_deeplc = true` is not bit-reproducible.
@@ -498,7 +565,7 @@ not part of the `run` chain and needs >=2 runs.
   fragment index build in extract depends on it. An imported library must be
   re-indexed by `make_reverse_decoys.py` to satisfy this.
 - q-value columns in `psms_scored` are independent per level, not a rollup
-  (finding 6): `q_value` (== `experiment_psm_q`), `run_psm_q` (per source),
+  (docs/18 A5): `q_value` (== `experiment_psm_q`), `run_psm_q` (per source),
   `precursor_q` (peptidoform+charge), `peptide_q_value` (stripped sequence),
   `pg_q_value`. Coarser grouping pools evidence, so peptide counts can exceed
   precursor counts. Report at the correct context: `precursor_q` for a precursor
@@ -508,10 +575,10 @@ not part of the `run` chain and needs >=2 runs.
   `retain_top_peaks=1`, `emit_candidate_audit=false`, `emit_gate_diagnostics=false`,
   and the other sensitivity-program toggles all default to the legacy path.
 - The extraction gate is a training-pool and null-curation lever, not feature
-  work (finding 3). Loosening it floods the pool with decoy-enriched junk that
+  work (docs/18 A2). Loosening it floods the pool with decoy-enriched junk that
   corrupts a linear rescorer; a nonlinear rescorer absorbs it. The gate optimum
   therefore inverts by rescorer.
-- The selected apex is the strongest peak only ~48-52% of the time (finding 8);
+- The selected apex is the strongest peak only ~48-52% of the time (docs/18 A6);
   the `<psms>.peaks.parquet` top-K sidecar exists to expose alternative peaks but
   is not yet promoted through features/rescore.
 
