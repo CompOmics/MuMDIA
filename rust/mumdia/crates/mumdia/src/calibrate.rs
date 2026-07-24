@@ -125,7 +125,9 @@ fn local_linear(sx: &[f64], sy: &[f64], x0: f64, k: usize, slope: f64, intercept
         }
         count += 1;
     }
-    let dmax = ((x0 - sx[lo]).abs()).max((sx[hi - 1] - x0).abs()).max(1e-12);
+    let dmax = ((x0 - sx[lo]).abs())
+        .max((sx[hi - 1] - x0).abs())
+        .max(1e-12);
     let (mut sw, mut swx, mut swy, mut swxx, mut swxy) = (0.0, 0.0, 0.0, 0.0, 0.0);
     for i in lo..hi {
         let d = (sx[i] - x0).abs() / dmax;

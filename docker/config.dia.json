@@ -10,6 +10,7 @@
   },
   "rescore": {
     "classifier": "mokapot",
-    "python": "/opt/conda/envs/rescore/bin/python"
+    "python": "/opt/conda/envs/rescore/bin/python",
+    "strict": true
   }
 }

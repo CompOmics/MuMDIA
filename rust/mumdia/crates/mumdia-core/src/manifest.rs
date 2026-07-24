@@ -1,7 +1,7 @@
-//! Run manifest (PLAN.md Section 3.3, 3.5): per-artifact provenance so a chained
-//! run is reproducible and reruns skip unchanged work. Provenance is recorded,
-//! not required: because inputs are path-addressable, a stage never depends on
-//! the manifest to run.
+//! Run manifest (PLAN.md Section 3.3, 3.5): per-artifact provenance for a chained
+//! run. The current orchestrator records but does not consume the manifest: it
+//! does not cache, resume, or skip unchanged stages. Standalone stages remain
+//! reusable because their inputs are path-addressable.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;

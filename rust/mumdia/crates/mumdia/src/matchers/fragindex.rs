@@ -353,7 +353,10 @@ mod tests {
         assert_eq!(fi.len(), nv.len(), "matched-candidate set size differs");
         for ((fc, fn_, fd), (nc, nn, nd)) in fi.iter().zip(nv.iter()) {
             assert_eq!(fc, nc, "candidate id mismatch");
-            assert_eq!(fn_, nn, "count (matched-posting multiplicity) mismatch for cand {fc}");
+            assert_eq!(
+                fn_, nn,
+                "count (matched-posting multiplicity) mismatch for cand {fc}"
+            );
             assert!(
                 (fd - nd).abs() <= 1e-6 * (1.0 + fd.abs().max(nd.abs())),
                 "dot mismatch for cand {fc}: {fd} vs {nd}"
@@ -436,7 +439,11 @@ mod tests {
             for sign in [-1.0f64, 1.0] {
                 let peak = mz + sign * tol * 1e-6 * mz * 0.98; // just inside tolerance
                 let r = score_scan_count_dot(&idx, &[(peak, 1.0)], 0, 1);
-                assert_eq!(r.len(), 1, "missed within-tol peak: frag mz={mz} sign={sign}");
+                assert_eq!(
+                    r.len(),
+                    1,
+                    "missed within-tol peak: frag mz={mz} sign={sign}"
+                );
             }
             mz *= 1.0009;
         }

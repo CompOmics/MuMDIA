@@ -75,7 +75,10 @@ pub fn run(p: AuditParams) -> Result<u64> {
     let n = cid.len();
 
     // Survivor sets keyed by candidate_id from each downstream artifact.
-    let extracted: HashSet<u32> = Table::read(p.psms)?.u32("candidate_id")?.into_iter().collect();
+    let extracted: HashSet<u32> = Table::read(p.psms)?
+        .u32("candidate_id")?
+        .into_iter()
+        .collect();
     let competed: HashSet<u32> = Table::read(p.competed)?
         .u32("candidate_id")?
         .into_iter()
@@ -252,7 +255,10 @@ mod tests {
                     cids.iter().map(|c| format!("PEP{c}")).collect(),
                 ),
                 Col::I32("charge".into(), cids.iter().map(|_| 2i32).collect()),
-                Col::Str("label".into(), labels.iter().map(|s| s.to_string()).collect()),
+                Col::Str(
+                    "label".into(),
+                    labels.iter().map(|s| s.to_string()).collect(),
+                ),
                 Col::Str(
                     "protein".into(),
                     cids.iter().map(|_| "sp|X|ECOLI".to_string()).collect(),
@@ -316,7 +322,6 @@ mod tests {
             .iter()
             .cloned()
             .zip(reason.into_iter().zip(reported))
-            .map(|(c, (r, rep))| (c, (r, rep)))
             .collect();
         assert_eq!(by[&1].0, "REPORTED");
         assert!(by[&1].1);

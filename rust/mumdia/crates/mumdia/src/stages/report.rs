@@ -64,7 +64,9 @@ pub fn run(p: ReportParams) -> Result<(u64, u64)> {
             let qp = q.str("peptidoform")?;
             let qc = q.i32("charge")?;
             let qq = q.f64("quantity")?;
-            (0..q.nrows).map(|i| ((qp[i].clone(), qc[i]), qq[i])).collect()
+            (0..q.nrows)
+                .map(|i| ((qp[i].clone(), qc[i]), qq[i]))
+                .collect()
         }
         None => HashMap::new(),
     };
@@ -80,16 +82,23 @@ pub fn run(p: ReportParams) -> Result<(u64, u64)> {
 
     // Peptides, best q first, unique by (peptidoform, charge).
     let mut order: Vec<usize> = (0..n).collect();
-    order.sort_by(|&a, &b| pep_q[a].partial_cmp(&pep_q[b]).unwrap_or(std::cmp::Ordering::Equal));
+    order.sort_by(|&a, &b| {
+        pep_q[a]
+            .partial_cmp(&pep_q[b])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     let mut seen: HashSet<(String, i32)> = HashSet::new();
     let mut seen_strip: HashSet<String> = HashSet::new();
     let mut w = std::io::BufWriter::new(std::fs::File::create(p.out_peptides)?);
     // The row unit here is the precursor (peptidoform + charge), NOT the stripped
     // sequence; the header and the returned count reflect that.
-    writeln!(w, "precursor\tstripped_sequence\tcharge\tprotein\tq_value\tscore\tquantity")?;
+    writeln!(
+        w,
+        "precursor\tstripped_sequence\tcharge\tprotein\tq_value\tscore\tquantity"
+    )?;
     let mut npep = 0u64;
     for &i in &order {
-        if label[i] != "target" || !(pep_q[i] <= p.q_threshold) {
+        if !(label[i] == "target" && pep_q[i] <= p.q_threshold) {
             continue;
         }
         seen_strip.insert(strip(&pform[i]));
@@ -101,7 +110,13 @@ pub fn run(p: ReportParams) -> Result<(u64, u64)> {
         writeln!(
             w,
             "{}\t{}\t{}\t{}\t{:.6}\t{:.4}\t{}",
-            pform[i], strip(&pform[i]), charge[i], protein[i], pep_q[i], score[i], qcell(qv)
+            pform[i],
+            strip(&pform[i]),
+            charge[i],
+            protein[i],
+            pep_q[i],
+            score[i],
+            qcell(qv)
         )?;
         npep += 1;
     }
@@ -109,13 +124,17 @@ pub fn run(p: ReportParams) -> Result<(u64, u64)> {
 
     // Protein groups, best q first, unique.
     let mut porder: Vec<usize> = (0..n).collect();
-    porder.sort_by(|&a, &b| pg_q[a].partial_cmp(&pg_q[b]).unwrap_or(std::cmp::Ordering::Equal));
+    porder.sort_by(|&a, &b| {
+        pg_q[a]
+            .partial_cmp(&pg_q[b])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     let mut pseen: HashSet<String> = HashSet::new();
     let mut w2 = std::io::BufWriter::new(std::fs::File::create(p.out_proteins)?);
     writeln!(w2, "protein_group\tq_value\tquantity")?;
     let mut nprot = 0u64;
     for &i in &porder {
-        if label[i] != "target" || pg[i].is_empty() || !(pg_q[i] <= p.q_threshold) {
+        if !(label[i] == "target" && !pg[i].is_empty() && pg_q[i] <= p.q_threshold) {
             continue;
         }
         if !pseen.insert(pg[i].clone()) {

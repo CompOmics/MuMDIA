@@ -34,9 +34,9 @@ mod chromatographic;
 mod coelution;
 pub(crate) mod entropy;
 mod interference;
-mod mass_uncertainty;
 mod ion_series;
 mod mass_accuracy;
+mod mass_uncertainty;
 mod ms1;
 mod nonzero;
 mod novel;
@@ -70,7 +70,11 @@ const FAMILIES: &[(&[&str], FamilyFn)] = &[
 /// Names already used by the Minimal/Rich sets, which the extended battery must
 /// not shadow (a colliding extended feature is dropped, keeping the legacy one).
 fn reserved_names() -> std::collections::HashSet<&'static str> {
-    MINIMAL_FEATURES.iter().chain(RICH_EXTRA.iter()).copied().collect()
+    MINIMAL_FEATURES
+        .iter()
+        .chain(RICH_EXTRA.iter())
+        .copied()
+        .collect()
 }
 
 /// Extended-battery feature names as `&'static str`, registry order, globally
@@ -205,7 +209,7 @@ pub const RICH_EXTRA: &[&str] = &[
 /// The ordered active feature list for the configured set.
 pub fn active_features(set: FeatureSet) -> Vec<String> {
     let mut v: Vec<String> = MINIMAL_FEATURES.iter().map(|s| s.to_string()).collect();
-    if matches!(set, FeatureSet::Rich | FeatureSet::Custom | FeatureSet::Extended) {
+    if matches!(set, FeatureSet::Rich | FeatureSet::Extended) {
         v.extend(RICH_EXTRA.iter().map(|s| s.to_string()));
     }
     if matches!(set, FeatureSet::Extended) {
@@ -259,6 +263,17 @@ fn peptide_length(peptidoform: &str) -> i32 {
         }
     }
     n
+}
+
+/// Stage B marks unavailable RT calibration as NaN when fewer than two anchors
+/// exist. Treat that sentinel as no RT evidence instead of allowing NaN to
+/// contaminate the feature matrix or preliminary competition score.
+fn calibrated_rt_error(apex_rt: f64, rt_pred_cal: f64) -> f64 {
+    if apex_rt.is_finite() && rt_pred_cal.is_finite() {
+        (apex_rt - rt_pred_cal).abs()
+    } else {
+        0.0
+    }
 }
 
 struct ChromRow {
@@ -387,8 +402,14 @@ fn build_evidence(
         .iter()
         .map(|r| {
             let map: HashMap<u32, f32> =
-                r.rt.iter().zip(&r.inten).map(|(&t, &v)| (t.to_bits(), v)).collect();
-            axis_full.iter().map(|t| *map.get(&t.to_bits()).unwrap_or(&0.0) as f64).collect()
+                r.rt.iter()
+                    .zip(&r.inten)
+                    .map(|(&t, &v)| (t.to_bits(), v))
+                    .collect();
+            axis_full
+                .iter()
+                .map(|t| *map.get(&t.to_bits()).unwrap_or(&0.0) as f64)
+                .collect()
         })
         .collect();
 
@@ -409,7 +430,9 @@ fn build_evidence(
             None => {
                 let mut ord: Vec<usize> = (0..pred.len()).collect();
                 ord.sort_by(|&a, &b| {
-                    pred[b].partial_cmp(&pred[a]).unwrap_or(std::cmp::Ordering::Equal)
+                    pred[b]
+                        .partial_cmp(&pred[a])
+                        .unwrap_or(std::cmp::Ordering::Equal)
                 });
                 let k3: Vec<usize> = ord.into_iter().take(3).collect();
                 let prof_raw: Vec<f64> = (0..axis_full.len())
@@ -423,14 +446,20 @@ fn build_evidence(
         (0, axis_full.len().saturating_sub(1))
     };
     let axis: Vec<f64> = axis_full[lo_i..=hi_i].iter().map(|&x| x as f64).collect();
-    let traces: Vec<Vec<f64>> = traces_full.iter().map(|t| t[lo_i..=hi_i].to_vec()).collect();
+    let traces: Vec<Vec<f64>> = traces_full
+        .iter()
+        .map(|t| t[lo_i..=hi_i].to_vec())
+        .collect();
     let axis_full_f: Vec<f64> = axis_full.iter().map(|&x| x as f64).collect();
 
     let apex_idx = axis
         .iter()
         .enumerate()
         .min_by(|(_, a), (_, b)| {
-            (*a - apex_rt).abs().partial_cmp(&(*b - apex_rt).abs()).unwrap()
+            (*a - apex_rt)
+                .abs()
+                .partial_cmp(&(*b - apex_rt).abs())
+                .unwrap()
         })
         .map(|(i, _)| i)
         .unwrap_or(0);
@@ -452,9 +481,14 @@ fn build_evidence(
         for name in ["ms1_mono", "ms1_iso1", "ms1_iso2"] {
             if let Some(r) = ms1_rows.iter().find(|r| r.frag_name == name) {
                 let map: HashMap<u32, f32> =
-                    r.rt.iter().zip(&r.inten).map(|(&t, &v)| (t.to_bits(), v)).collect();
-                let full: Vec<f64> =
-                    axis_full.iter().map(|t| *map.get(&t.to_bits()).unwrap_or(&0.0) as f64).collect();
+                    r.rt.iter()
+                        .zip(&r.inten)
+                        .map(|(&t, &v)| (t.to_bits(), v))
+                        .collect();
+                let full: Vec<f64> = axis_full
+                    .iter()
+                    .map(|t| *map.get(&t.to_bits()).unwrap_or(&0.0) as f64)
+                    .collect();
                 out.push(full[lo_i..=hi_i].to_vec());
             }
         }
@@ -529,15 +563,29 @@ pub fn run(p: FeaturesParams) -> Result<u64> {
     let pform = ps.str("peptidoform")?;
     let protein = ps.str("protein")?;
     let mz = ps.f64("precursor_mz")?;
-    let contested = ps.f64("contested_frac").unwrap_or_else(|_| vec![0.0; ps.nrows]);
+    let contested = ps
+        .f64("contested_frac")
+        .unwrap_or_else(|_| vec![0.0; ps.nrows]);
     // Richer soft-competition columns (present only with emit_contested_features;
     // default to 0 so the feature vector length is stable when absent).
-    let contested_count = ps.f64("contested_count_frac").unwrap_or_else(|_| vec![0.0; ps.nrows]);
-    let apportioned = ps.f64("apportioned_frac").unwrap_or_else(|_| vec![0.0; ps.nrows]);
-    let ms1_m1 = ps.opt_f64("ms1_isom1").unwrap_or_else(|_| vec![None; ps.nrows]);
-    let ms1_mono = ps.opt_f64("ms1_mono").unwrap_or_else(|_| vec![None; ps.nrows]);
-    let ms1_i1 = ps.opt_f64("ms1_iso1").unwrap_or_else(|_| vec![None; ps.nrows]);
-    let ms1_i2 = ps.opt_f64("ms1_iso2").unwrap_or_else(|_| vec![None; ps.nrows]);
+    let contested_count = ps
+        .f64("contested_count_frac")
+        .unwrap_or_else(|_| vec![0.0; ps.nrows]);
+    let apportioned = ps
+        .f64("apportioned_frac")
+        .unwrap_or_else(|_| vec![0.0; ps.nrows]);
+    let ms1_m1 = ps
+        .opt_f64("ms1_isom1")
+        .unwrap_or_else(|_| vec![None; ps.nrows]);
+    let ms1_mono = ps
+        .opt_f64("ms1_mono")
+        .unwrap_or_else(|_| vec![None; ps.nrows]);
+    let ms1_i1 = ps
+        .opt_f64("ms1_iso1")
+        .unwrap_or_else(|_| vec![None; ps.nrows]);
+    let ms1_i2 = ps
+        .opt_f64("ms1_iso2")
+        .unwrap_or_else(|_| vec![None; ps.nrows]);
 
     // Group chromatograms by candidate_id.
     let ch = Table::read(p.chromatograms)?;
@@ -596,7 +644,11 @@ pub fn run(p: FeaturesParams) -> Result<u64> {
             }
             (sm, im, conf)
         }
-        None => (HashMap::new(), HashMap::new(), std::collections::HashSet::new()),
+        None => (
+            HashMap::new(),
+            HashMap::new(),
+            std::collections::HashSet::new(),
+        ),
     };
 
     // Global elution half-widths learned once from the confident set. Some((L, R)) in
@@ -662,11 +714,19 @@ pub fn run(p: FeaturesParams) -> Result<u64> {
     let mut pf_charges: HashMap<&str, std::collections::HashSet<i32>> = HashMap::new();
     let mut pf_int: HashMap<&str, f64> = HashMap::new();
     for i in 0..n {
-        pf_charges.entry(pform[i].as_str()).or_default().insert(charge[i]);
+        pf_charges
+            .entry(pform[i].as_str())
+            .or_default()
+            .insert(charge[i]);
         *pf_int.entry(pform[i].as_str()).or_insert(0.0) += apex_int[i] as f64;
     }
-    let f_n_charge: Vec<f64> = (0..n).map(|i| pf_charges[pform[i].as_str()].len() as f64).collect();
-    let f_charge_multi: Vec<f64> = f_n_charge.iter().map(|&c| if c >= 2.0 { 1.0 } else { 0.0 }).collect();
+    let f_n_charge: Vec<f64> = (0..n)
+        .map(|i| pf_charges[pform[i].as_str()].len() as f64)
+        .collect();
+    let f_charge_multi: Vec<f64> = f_n_charge
+        .iter()
+        .map(|&c| if c >= 2.0 { 1.0 } else { 0.0 })
+        .collect();
     // ln(1 + summed apex intensity of the OTHER charge states of this peptidoform):
     // how much independent charge-state evidence reinforces this PSM (unbounded).
     let f_cross_charge_int: Vec<f64> = (0..n)
@@ -675,7 +735,7 @@ pub fn run(p: FeaturesParams) -> Result<u64> {
 
     // Compute the full feature superset into a name->values map.
     let mut fmap: HashMap<&str, Vec<f64>> = HashMap::new();
-    let mut push = |m: &mut HashMap<&str, Vec<f64>>, k: &'static str, v: f64| {
+    let push = |m: &mut HashMap<&str, Vec<f64>>, k: &'static str, v: f64| {
         m.entry(k).or_insert_with(|| Vec::with_capacity(n)).push(v);
     };
     let mut prelim = vec![0.0f64; n];
@@ -713,10 +773,16 @@ pub fn run(p: FeaturesParams) -> Result<u64> {
                 match chrom.get(&cid[i]) {
                     Some(rows) if !rows.is_empty() => {
                         let ms1_rows = ms1x.get(&cid[i]).map(|v| v.as_slice()).unwrap_or(&[]);
-                        let mut ev =
-                            build_evidence(rows, ms1_rows, apex_rt[i], p.cfg.bound_peak_fraction, p.cfg.bound_peak_grace, global_bounds);
+                        let mut ev = build_evidence(
+                            rows,
+                            ms1_rows,
+                            apex_rt[i],
+                            p.cfg.bound_peak_fraction,
+                            p.cfg.bound_peak_grace,
+                            global_bounds,
+                        );
                         ev.rt_pred_cal = rt_cal[i];
-                        ev.rt_err = (apex_rt[i] - rt_cal[i]).abs();
+                        ev.rt_err = calibrated_rt_error(apex_rt[i], rt_cal[i]);
                         ev.gradient = gradient;
                         ev.precursor_mz = mz[i];
                         ev.charge = charge[i];
@@ -745,7 +811,7 @@ pub fn run(p: FeaturesParams) -> Result<u64> {
         let ff = &per[i].ff;
         elu_lo[i] = ff.elution_lo;
         elu_hi[i] = ff.elution_hi;
-        let rt_err = (apex_rt[i] - rt_cal[i]).abs();
+        let rt_err = calibrated_rt_error(apex_rt[i], rt_cal[i]);
         // MS1 isotope features.
         let neutral = mz[i] * charge[i] as f64 - charge[i] as f64 * PROTON;
         let (iso_corr, isom1_ratio, log_mono, has_ms1) =
@@ -755,7 +821,11 @@ pub fn run(p: FeaturesParams) -> Result<u64> {
         push(&mut fmap, "rt_error_rel", rt_err / gradient);
         push(&mut fmap, "n_matched_fragments", n_matched[i] as f64);
         push(&mut fmap, "coelution_run", corun[i] as f64);
-        push(&mut fmap, "log_apex_intensity", (1.0 + apex_int[i] as f64).ln());
+        push(
+            &mut fmap,
+            "log_apex_intensity",
+            (1.0 + apex_int[i] as f64).ln(),
+        );
         push(&mut fmap, "frag_corr", ff.frag_corr);
         push(&mut fmap, "frag_cosine", ff.frag_cosine);
         push(&mut fmap, "spectral_angle", ff.spectral_angle);
@@ -763,8 +833,16 @@ pub fn run(p: FeaturesParams) -> Result<u64> {
         push(&mut fmap, "coelution_best", ff.coelution_best);
         push(&mut fmap, "n_coelution_above", ff.n_coelution_above);
         push(&mut fmap, "charge", charge[i] as f64);
-        push(&mut fmap, "peptide_length", peptide_length(&pform[i]) as f64);
-        push(&mut fmap, "n_proteins", (protein[i].matches(';').count() + 1) as f64);
+        push(
+            &mut fmap,
+            "peptide_length",
+            peptide_length(&pform[i]) as f64,
+        );
+        push(
+            &mut fmap,
+            "n_proteins",
+            (protein[i].matches(';').count() + 1) as f64,
+        );
         push(&mut fmap, "library_norm_manhattan", ff.norm_manhattan);
         push(&mut fmap, "library_rmsd", ff.rmsd);
         push(&mut fmap, "xcorr_coelution", ff.xcorr_coelution);
@@ -783,8 +861,16 @@ pub fn run(p: FeaturesParams) -> Result<u64> {
         push(&mut fmap, "log_sn", ff.log_sn);
         push(&mut fmap, "n_observations", ff.n_observations);
         push(&mut fmap, "base_width_rt", ff.base_width_rt);
-        push(&mut fmap, "seed_score", *seed_score_map.get(&cid[i]).unwrap_or(&0.0));
-        push(&mut fmap, "seed_identified", *seed_id_map.get(&cid[i]).unwrap_or(&0.0));
+        push(
+            &mut fmap,
+            "seed_score",
+            *seed_score_map.get(&cid[i]).unwrap_or(&0.0),
+        );
+        push(
+            &mut fmap,
+            "seed_identified",
+            *seed_id_map.get(&cid[i]).unwrap_or(&0.0),
+        );
         push(
             &mut fmap,
             "matched_fraction",
@@ -838,7 +924,10 @@ pub fn run(p: FeaturesParams) -> Result<u64> {
     ];
     for name in &cols_active {
         let key: &str = name.as_str();
-        cols.push(Col::F64(name.clone(), fmap.get(key).cloned().unwrap_or_else(|| vec![0.0; n])));
+        cols.push(Col::F64(
+            name.clone(),
+            fmap.get(key).cloned().unwrap_or_else(|| vec![0.0; n]),
+        ));
     }
     let rows = write_table(p.out, cols)?;
 
@@ -854,9 +943,23 @@ pub fn run(p: FeaturesParams) -> Result<u64> {
 
     // PIN.
     let feat_matrix: Vec<Vec<f64>> = (0..n)
-        .map(|i| cols_active.iter().map(|c| fmap.get(c.as_str()).map(|v| v[i]).unwrap_or(0.0)).collect())
+        .map(|i| {
+            cols_active
+                .iter()
+                .map(|c| fmap.get(c.as_str()).map(|v| v[i]).unwrap_or(0.0))
+                .collect()
+        })
         .collect();
-    write_pin(p.out_pin, &cols_active, &cid, &label, &pform, &protein, &mz, &feat_matrix)?;
+    write_pin(
+        p.out_pin,
+        &cols_active,
+        &cid,
+        &label,
+        &pform,
+        &protein,
+        &mz,
+        &feat_matrix,
+    )?;
 
     let elapsed = t0.elapsed().as_millis();
     let mut stats = std::collections::BTreeMap::new();
@@ -908,11 +1011,11 @@ struct FragFeatures {
     best_ref_corr: f64, // strongest fragment-vs-reference correlation
     low_frag_coel: f64, // pResCorr proxy: co-elution of the low-intensity fragments
     // DIA-NN interference-correction-style features (OpenSWATH/mProphet analogs).
-    evidence: f64,      // summed fragment-vs-reference correlations (DIA-NN `Evidence`)
-    contrast_min: f64,  // min fragment-vs-(sum of others) correlation; low = interfered fragment
-    resid_corr: f64,    // mean pairwise corr of residuals f_k - proj_k*ref; high = shared interferent
-    coel_clean: f64,    // pairwise co-elution after interference capping at 1.5*r*ref
-    shadow_frac: f64,   // fraction of intensity above the 1.5*r*ref cap (interference shadow)
+    evidence: f64,     // summed fragment-vs-reference correlations (DIA-NN `Evidence`)
+    contrast_min: f64, // min fragment-vs-(sum of others) correlation; low = interfered fragment
+    resid_corr: f64, // mean pairwise corr of residuals f_k - proj_k*ref; high = shared interferent
+    coel_clean: f64, // pairwise co-elution after interference capping at 1.5*r*ref
+    shadow_frac: f64, // fraction of intensity above the 1.5*r*ref cap (interference shadow)
     // Elution-peak boundaries the engine computed and used to bound the features
     // above; emitted so downstream (and plotting) read them rather than re-derive.
     elution_lo: f64,
@@ -1032,9 +1135,9 @@ fn global_bound_indices(
 /// Per-candidate elution-peak RT bounds (seconds): reference = smoothed sum of the
 /// top-3 predicted-intensity fragments, walked from the apex-nearest scan while
 /// >= `frac` x apex height, bridging <= `grace` sub-threshold scans. Returns
-/// (lo_rt, hi_rt), or None when fewer than 3 distinct scans. Mirrors the boundary
-/// logic inside `fragment_features`/`build_evidence` so the confident-set half-widths
-/// match the per-candidate detector they replace when `bound_from_confident` is set.
+/// > (lo_rt, hi_rt), or None when fewer than 3 distinct scans. Mirrors the boundary
+/// > logic inside `fragment_features`/`build_evidence` so the confident-set half-widths
+/// > match the per-candidate detector they replace when `bound_from_confident` is set.
 fn elution_peak_rt_bounds(
     rows: &[ChromRow],
     apex_rt: f64,
@@ -1051,23 +1154,35 @@ fn elution_peak_rt_bounds(
         .iter()
         .map(|r| {
             let map: HashMap<u32, f32> =
-                r.rt.iter().zip(&r.inten).map(|(&t, &v)| (t.to_bits(), v)).collect();
-            axis.iter().map(|t| *map.get(&t.to_bits()).unwrap_or(&0.0) as f64).collect()
+                r.rt.iter()
+                    .zip(&r.inten)
+                    .map(|(&t, &v)| (t.to_bits(), v))
+                    .collect();
+            axis.iter()
+                .map(|t| *map.get(&t.to_bits()).unwrap_or(&0.0) as f64)
+                .collect()
         })
         .collect();
     let mut ord: Vec<usize> = (0..rows.len()).collect();
     ord.sort_by(|&a, &b| {
-        rows[b].pred_int.partial_cmp(&rows[a].pred_int).unwrap_or(std::cmp::Ordering::Equal)
+        rows[b]
+            .pred_int
+            .partial_cmp(&rows[a].pred_int)
+            .unwrap_or(std::cmp::Ordering::Equal)
     });
     let k3: Vec<usize> = ord.into_iter().take(3).collect();
-    let prof_raw: Vec<f64> =
-        (0..axis.len()).map(|k| k3.iter().map(|&i| traces[i][k]).sum::<f64>()).collect();
+    let prof_raw: Vec<f64> = (0..axis.len())
+        .map(|k| k3.iter().map(|&i| traces[i][k]).sum::<f64>())
+        .collect();
     let prof = smooth3(&prof_raw);
     let ai = axis
         .iter()
         .enumerate()
         .min_by(|(_, a), (_, b)| {
-            (**a as f64 - apex_rt).abs().partial_cmp(&((**b as f64 - apex_rt).abs())).unwrap()
+            (**a as f64 - apex_rt)
+                .abs()
+                .partial_cmp(&((**b as f64 - apex_rt).abs()))
+                .unwrap()
         })
         .map(|(i, _)| i)
         .unwrap_or(0);
@@ -1122,12 +1237,23 @@ fn fragment_features(
     let (on, pn) = (normalize_sum(&obs), normalize_sum(&pred));
     f.norm_manhattan = on.iter().zip(&pn).map(|(a, b)| (a - b).abs()).sum();
     let m = on.len().max(1) as f64;
-    f.rmsd = (on.iter().zip(&pn).map(|(a, b)| (a - b) * (a - b)).sum::<f64>() / m).sqrt();
+    f.rmsd = (on
+        .iter()
+        .zip(&pn)
+        .map(|(a, b)| (a - b) * (a - b))
+        .sum::<f64>()
+        / m)
+        .sqrt();
 
     // mass accuracy (intensity-weighted and unweighted mean |ppm|)
     let wsum: f64 = mass_w.iter().sum();
     f.weighted_mass_error = if wsum > 0.0 {
-        mass_err.iter().zip(&mass_w).map(|(e, w)| e * w).sum::<f64>() / wsum
+        mass_err
+            .iter()
+            .zip(&mass_w)
+            .map(|(e, w)| e * w)
+            .sum::<f64>()
+            / wsum
     } else {
         0.0
     };
@@ -1147,8 +1273,14 @@ fn fragment_features(
         .iter()
         .map(|r| {
             let map: HashMap<u32, f32> =
-                r.rt.iter().zip(&r.inten).map(|(&t, &v)| (t.to_bits(), v)).collect();
-            axis_full.iter().map(|t| *map.get(&t.to_bits()).unwrap_or(&0.0) as f64).collect()
+                r.rt.iter()
+                    .zip(&r.inten)
+                    .map(|(&t, &v)| (t.to_bits(), v))
+                    .collect();
+            axis_full
+                .iter()
+                .map(|t| *map.get(&t.to_bits()).unwrap_or(&0.0) as f64)
+                .collect()
         })
         .collect();
     let (lo_i, hi_i) = if bound && axis_full.len() >= 3 {
@@ -1169,7 +1301,9 @@ fn fragment_features(
             None => {
                 let mut ord: Vec<usize> = (0..pred.len()).collect();
                 ord.sort_by(|&a, &b| {
-                    pred[b].partial_cmp(&pred[a]).unwrap_or(std::cmp::Ordering::Equal)
+                    pred[b]
+                        .partial_cmp(&pred[a])
+                        .unwrap_or(std::cmp::Ordering::Equal)
                 });
                 let k3: Vec<usize> = ord.into_iter().take(3).collect();
                 let prof_raw: Vec<f64> = (0..axis_full.len())
@@ -1183,7 +1317,10 @@ fn fragment_features(
         (0, axis_full.len().saturating_sub(1))
     };
     let axis: Vec<f32> = axis_full[lo_i..=hi_i].to_vec();
-    let traces: Vec<Vec<f64>> = traces_full.iter().map(|t| t[lo_i..=hi_i].to_vec()).collect();
+    let traces: Vec<Vec<f64>> = traces_full
+        .iter()
+        .map(|t| t[lo_i..=hi_i].to_vec())
+        .collect();
     f.n_observations = axis.len() as f64;
     f.elution_lo = axis.first().map(|&x| x as f64).unwrap_or(0.0);
     f.elution_hi = axis.last().map(|&x| x as f64).unwrap_or(0.0);
@@ -1263,9 +1400,8 @@ fn fragment_features(
             contrasts.push(pearson(tr, &others));
         }
         f.contrast_min = contrasts.iter().cloned().fold(f64::MAX, f64::min);
-        if !contrasts.is_empty() && f.contrast_min == f64::MAX {
-            f.contrast_min = 0.0;
-        } else if contrasts.is_empty() {
+        // Empty contrasts fold to f64::MAX; treat "no contrast computed" as 0.0.
+        if f.contrast_min == f64::MAX {
             f.contrast_min = 0.0;
         }
         // Interference capping (shadow removal): r_k = <f_k,ref>/<ref,ref>, cap at 1.5*r*ref.
@@ -1276,10 +1412,12 @@ fn fragment_features(
         let mut total_int = 0.0;
         for tr in &traces {
             let rk: f64 = tr.iter().zip(&refp).map(|(a, b)| a * b).sum::<f64>() / rr;
-            let cl: Vec<f64> = (0..np).map(|k| {
-                let cap = (1.5 * rk * refp[k]).max(0.0);
-                tr[k].min(cap)
-            }).collect();
+            let cl: Vec<f64> = (0..np)
+                .map(|k| {
+                    let cap = (1.5 * rk * refp[k]).max(0.0);
+                    tr[k].min(cap)
+                })
+                .collect();
             let res: Vec<f64> = (0..np).map(|k| tr[k] - rk * refp[k]).collect();
             for k in 0..np {
                 shadow_num += (tr[k] - (1.5 * rk * refp[k]).max(0.0)).max(0.0);
@@ -1288,7 +1426,11 @@ fn fragment_features(
             cleaned.push(cl);
             residuals.push(res);
         }
-        f.shadow_frac = if total_int > 0.0 { shadow_num / total_int } else { 0.0 };
+        f.shadow_frac = if total_int > 0.0 {
+            shadow_num / total_int
+        } else {
+            0.0
+        };
         // co-elution of cleaned traces and correlation of residuals (shared interferent).
         let mut clean_corrs = Vec::new();
         let mut res_corrs = Vec::new();
@@ -1304,7 +1446,12 @@ fn fragment_features(
 
     // chromatographic log S/N: apex vs median trace point.
     let apex_val = obs.iter().cloned().fold(0.0, f64::max);
-    let mut all_points: Vec<f64> = traces.iter().flatten().cloned().filter(|v| *v > 0.0).collect();
+    let mut all_points: Vec<f64> = traces
+        .iter()
+        .flatten()
+        .cloned()
+        .filter(|v| *v > 0.0)
+        .collect();
     let noise = if all_points.is_empty() {
         1.0
     } else {
@@ -1347,6 +1494,7 @@ fn best_xcorr(a: &[f64], b: &[f64], maxlag: i32) -> (i32, f64) {
     let (mut best_lag, mut best_val) = (0i32, f64::MIN);
     for lag in -maxlag..=maxlag {
         let mut dot = 0.0;
+        #[allow(clippy::needless_range_loop)] // i also drives j = i + lag
         for i in 0..n {
             let j = i as i32 + lag;
             if j >= 0 && (j as usize) < n {
@@ -1385,6 +1533,7 @@ fn isotope_features(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_pin(
     path: &str,
     feature_cols: &[String],
@@ -1408,7 +1557,13 @@ fn write_pin(
     w.write_all(b"\tPeptide\tProteins\n")?;
     for i in 0..cid.len() {
         let lab = if label[i] == "decoy" { -1 } else { 1 };
-        write!(w, "cand_{}\t{}\t{}\t{:.5}\t{:.5}\t", cid[i], lab, cid[i], mz[i], mz[i])?;
+        write!(
+            w,
+            "cand_{}\t{}\t{}\t{:.5}\t{:.5}\t",
+            cid[i], lab, cid[i], mz[i], mz[i]
+        )?;
+        #[allow(clippy::needless_range_loop)]
+        // parallel index into feats[i] bounded by feature_cols
         for fi in 0..feature_cols.len() {
             write!(w, "{:.6}\t", feats[i][fi])?;
         }
@@ -1442,7 +1597,18 @@ mod tests {
         // + 3 charge-corroboration features.
         assert_eq!(ext.len(), 14 + 30 + extended_names().len() + 6);
         let uniq: std::collections::HashSet<&String> = ext.iter().collect();
-        assert_eq!(uniq.len(), ext.len(), "duplicate feature name in Extended set");
+        assert_eq!(
+            uniq.len(),
+            ext.len(),
+            "duplicate feature name in Extended set"
+        );
+    }
+
+    #[test]
+    fn unavailable_rt_calibration_contributes_zero_error() {
+        assert_eq!(calibrated_rt_error(600.0, f64::NAN), 0.0);
+        assert_eq!(calibrated_rt_error(600.0, f64::INFINITY), 0.0);
+        assert_eq!(calibrated_rt_error(600.0, 580.0), 20.0);
     }
 
     #[test]

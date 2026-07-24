@@ -100,7 +100,11 @@ const EPS: f64 = 1e-9;
 /// Replace non-finite with 0.0.
 #[inline]
 fn fin(x: f64) -> f64 {
-    if x.is_finite() { x } else { 0.0 }
+    if x.is_finite() {
+        x
+    } else {
+        0.0
+    }
 }
 
 /// Elementwise sqrt of the max(0,·) values.
@@ -312,7 +316,11 @@ pub fn values(e: &Evidence) -> Vec<f64> {
     // 14. library_recall_intensity
     let tot_l: f64 = l.iter().sum();
     let seen_l: f64 = (0..n).filter(|&i| o[i] > 0.0).map(|i| l[i]).sum();
-    let f_recall = if tot_l > 0.0 { fin(seen_l / tot_l) } else { 0.0 };
+    let f_recall = if tot_l > 0.0 {
+        fin(seen_l / tot_l)
+    } else {
+        0.0
+    };
 
     // Per-fragment |on - ln| and signed residual on sum-normalized vectors.
     let m = on.len().min(ln.len());
@@ -366,7 +374,11 @@ pub fn values(e: &Evidence) -> Vec<f64> {
             smin += on[i].min(ln[i]);
             smax += on[i].max(ln[i]);
         }
-        if smax > 0.0 { fin(smin / smax) } else { 0.0 }
+        if smax > 0.0 {
+            fin(smin / smax)
+        } else {
+            0.0
+        }
     };
     // 26. bray_curtis_sqrt (sqrt + max-normalized, min/max ratio)
     let f_bray_sqrt = {
@@ -383,7 +395,11 @@ pub fn values(e: &Evidence) -> Vec<f64> {
                 smin += a.min(b);
                 smax += a.max(b);
             }
-            if smax > 0.0 { fin(smin / smax) } else { 0.0 }
+            if smax > 0.0 {
+                fin(smin / smax)
+            } else {
+                0.0
+            }
         } else {
             0.0
         }
@@ -491,7 +507,11 @@ pub fn values(e: &Evidence) -> Vec<f64> {
     let f_jaccard = {
         let inter = (0..n).filter(|&i| set_pred[i] && set_obs_thr[i]).count();
         let uni = (0..n).filter(|&i| set_pred[i] || set_obs_thr[i]).count();
-        if uni > 0 { fin(inter as f64 / uni as f64) } else { 0.0 }
+        if uni > 0 {
+            fin(inter as f64 / uni as f64)
+        } else {
+            0.0
+        }
     };
     // 38. dice_presence (predicted vs observed-present)
     let f_dice = {
@@ -518,7 +538,11 @@ pub fn values(e: &Evidence) -> Vec<f64> {
                 cov += dl * (o[i] - mo);
                 var += dl * dl;
             }
-            if var > 0.0 { fin(cov / var) } else { 0.0 }
+            if var > 0.0 {
+                fin(cov / var)
+            } else {
+                0.0
+            }
         } else {
             0.0
         }
@@ -558,7 +582,11 @@ pub fn values(e: &Evidence) -> Vec<f64> {
             let ro = ranks(&neg_o);
             let disp: f64 = (0..n).map(|i| (rl[i] - ro[i]).abs()).sum();
             let denom = ((n * n) / 2) as f64;
-            if denom > 0.0 { fin(1.0 - disp / denom) } else { 0.0 }
+            if denom > 0.0 {
+                fin(1.0 - disp / denom)
+            } else {
+                0.0
+            }
         } else {
             0.0
         }
@@ -594,7 +622,9 @@ pub fn values(e: &Evidence) -> Vec<f64> {
     let max_l = l.iter().cloned().fold(0.0f64, f64::max);
     let f_strong_absent = {
         if max_l > 0.0 {
-            (0..n).filter(|&i| l[i] >= 0.1 * max_l && o[i] == 0.0).count() as f64
+            (0..n)
+                .filter(|&i| l[i] >= 0.1 * max_l && o[i] == 0.0)
+                .count() as f64
         } else {
             0.0
         }
@@ -603,7 +633,11 @@ pub fn values(e: &Evidence) -> Vec<f64> {
     let f_frac_absent = {
         let np = e.n_predicted as f64;
         let nm = e.n_matched as f64;
-        if np > 0.0 { fin((np - nm) / np) } else { 0.0 }
+        if np > 0.0 {
+            fin((np - nm) / np)
+        } else {
+            0.0
+        }
     };
 
     // Area vectors (peak window and full window) over all K predicted fragments.
@@ -678,7 +712,9 @@ pub fn values(e: &Evidence) -> Vec<f64> {
     // High-ordinal cosine: drop b1/b2/y1/y2 (ordinal <= 2), which are commonly
     // shared with a co-isolated precursor, then cosine over the rest.
     let f_cos_hi_ord = {
-        let keep: Vec<usize> = (0..n).filter(|&i| i < e.ordinal.len() && e.ordinal[i] >= 3).collect();
+        let keep: Vec<usize> = (0..n)
+            .filter(|&i| i < e.ordinal.len() && e.ordinal[i] >= 3)
+            .collect();
         if keep.len() >= 2 {
             let oh: Vec<f64> = keep.iter().map(|&i| o[i]).collect();
             let lh: Vec<f64> = keep.iter().map(|&i| l[i]).collect();
@@ -723,8 +759,8 @@ pub fn values(e: &Evidence) -> Vec<f64> {
                 break;
             }
             let c = fin(cosine(&ot, &lt));
-            for s in step..3 {
-                out[s] = c;
+            for value in out.iter_mut().skip(step) {
+                *value = c;
             }
         }
         (out[0], out[1], out[2])

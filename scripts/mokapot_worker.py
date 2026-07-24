@@ -3,9 +3,10 @@
 Usage:
     python mokapot_worker.py <input.pin> <output.parquet>
 
-Reads a Percolator PIN, runs mokapot.brew, writes candidate_id + mokapot score
-+ q-value. SpecId is `cand_<candidate_id>`. Run with an env that has mokapot +
-pyarrow (py312_mumdia).
+Reads a Percolator PIN, runs mokapot.brew, and writes the flat row ID in the
+legacy `candidate_id` column plus mokapot score and q-value. SpecId is
+`psm_<flat_row_id>` so library candidate IDs may safely repeat across runs. Run
+with an env that has mokapot + pyarrow (py312_mumdia).
 
 Model is env-switchable so the linear-vs-NN A/B needs no code edit:
     MUMDIA_RESCORE_MODEL = nn  (default)  -> sklearn MLPClassifier in mokapot.Model
@@ -118,19 +119,19 @@ def main():
     # so no per-fold dataset copy; results are unchanged, only faster.
     workers = int(os.environ.get("MUMDIA_MOKAPOT_WORKERS", "3"))
     if model is None:
-        _results, models = mokapot.brew(psms, rng=0, max_workers=workers)
+        _results, _models = mokapot.brew(psms, rng=0, max_workers=workers)
     else:
-        _results, models = mokapot.brew(psms, model=model, rng=0, max_workers=workers)
+        _results, _models = mokapot.brew(psms, model=model, rng=0, max_workers=workers)
 
     specids = psms.data["SpecId"].astype(str).to_numpy()
 
     # Prefer mokapot's OUT-OF-FOLD scores: brew returns held-out confidence tables
     # (targets in confidence_estimates, decoys in decoy_confidence_estimates), each
-    # PSM scored only by the fold that did not train on it. The previous approach
-    # (averaging all fold models over all rows) is NOT out-of-fold - 2 of 3 folds
-    # trained on each row - which inflates apparent sensitivity (~2.5% external FDR
-    # at a nominal 1% cut). Fall back to fold-model averaging only if the mokapot
-    # confidence API differs from what we expect.
+    # PSM scored only by the fold that did not train on it. Averaging all fold
+    # models over all rows is NOT out-of-fold - 2 of 3 folds trained on each row -
+    # and can make nominal q-values anti-conservative. Therefore an unavailable or
+    # incomplete confidence table is a hard error; there is deliberately no
+    # in-sample fallback.
     # NOTE: unvalidated in the unit suite (no mokapot there); confirm on a real run.
     def _oof_scores():
         conf = _results[0] if isinstance(_results, (list, tuple)) else _results
@@ -146,20 +147,23 @@ def main():
         m = {}
         for df in (ddf, tdf):
             m.update(dict(zip(df["SpecId"].astype(str), df[scol(df)].astype(float))))
-        if len(m) < 0.5 * len(specids):
-            raise RuntimeError(f"OOF tables cover only {len(m)}/{len(specids)} PSMs")
-        worst = min(m.values()) - 1.0
-        return np.array([m.get(s, worst) for s in specids], dtype=np.float64)
+        expected = set(specids)
+        returned = set(m)
+        if returned != expected or len(m) != len(specids):
+            missing = len(expected - returned)
+            extra = len(returned - expected)
+            raise RuntimeError(
+                "OOF confidence tables do not exactly cover the PIN: "
+                f"rows={len(specids)} unique_scores={len(m)} "
+                f"missing={missing} extra={extra}"
+            )
+        scores = np.array([m[s] for s in specids], dtype=np.float64)
+        if not np.isfinite(scores).all():
+            raise RuntimeError("OOF confidence tables contain non-finite scores")
+        return scores
 
-    try:
-        scores = _oof_scores()
-        print("mokapot_worker: using out-of-fold confidence scores", flush=True)
-    except Exception as e:
-        print(f"mokapot_worker: OOF unavailable ({e}); fold-model average fallback", flush=True)
-        ml = list(models) if hasattr(models, "__len__") else [models]
-        scores = np.vstack(
-            [np.asarray(m.predict(psms), dtype=np.float64) for m in ml]
-        ).mean(axis=0)
+    scores = _oof_scores()
+    print("mokapot_worker: using complete out-of-fold confidence scores", flush=True)
     if len(specids) != len(scores):
         raise RuntimeError(
             f"specid/score length mismatch: {len(specids)} vs {len(scores)}"

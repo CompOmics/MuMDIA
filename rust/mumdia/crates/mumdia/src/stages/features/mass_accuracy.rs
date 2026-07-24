@@ -46,7 +46,11 @@ const HALF_TOL_PPM: f64 = 0.5 * FRAG_TOL_PPM;
 
 /// Replace non-finite with 0.0.
 fn fin(x: f64) -> f64 {
-    if x.is_finite() { x } else { 0.0 }
+    if x.is_finite() {
+        x
+    } else {
+        0.0
+    }
 }
 
 /// Median of a slice (0.0 if empty). Does not mutate the input.
@@ -88,7 +92,11 @@ fn pop_std(v: &[f64]) -> f64 {
     }
     let m: f64 = v.iter().sum::<f64>() / n as f64;
     let var: f64 = v.iter().map(|x| (x - m) * (x - m)).sum::<f64>() / n as f64;
-    if var <= 0.0 { 0.0 } else { fin(var.sqrt()) }
+    if var <= 0.0 {
+        0.0
+    } else {
+        fin(var.sqrt())
+    }
 }
 
 /// Weighted mean of x with weights w (equal length). 0.0 if total weight <= 0.
@@ -186,7 +194,11 @@ pub fn values(e: &Evidence) -> Vec<f64> {
                 .map(|(p, w)| w * (p - wm) * (p - wm))
                 .sum::<f64>()
                 / sw;
-            if var <= 0.0 { 0.0 } else { fin(var.sqrt()) }
+            if var <= 0.0 {
+                0.0
+            } else {
+                fin(var.sqrt())
+            }
         }
     };
 
@@ -234,7 +246,11 @@ pub fn values(e: &Evidence) -> Vec<f64> {
         ev_den += w_lib[i];
         ev_acc += w_apex[i] * g;
     }
-    let mass_evidence_gauss = if ev_den > 0.0 { fin(ev_num / ev_den) } else { 0.0 };
+    let mass_evidence_gauss = if ev_den > 0.0 {
+        fin(ev_num / ev_den)
+    } else {
+        0.0
+    };
     let mass_log_evidence = fin((1.0 + ev_acc).ln());
 
     vec![

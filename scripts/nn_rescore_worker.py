@@ -110,6 +110,8 @@ def main():
     N_SEEDS = env_i("MUMDIA_NN_SEEDS", 1)
     CHUNK = env_i("MUMDIA_NN_CHUNK", 250000)
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+    if FOLDS < 2 or ITERS < 1 or EPOCHS < 1 or N_SEEDS < 1:
+        raise ValueError("folds>=2, iterations>=1, epochs>=1, and seeds>=1 are required")
 
     stream_env = os.environ.get("MUMDIA_NN_STREAM", "auto").lower()
     filesize = os.path.getsize(pin_path)
@@ -120,6 +122,8 @@ def main():
     header = pd.read_csv(pin_path, sep="\t", nrows=0).columns.tolist()
     feat_cols = [c for c in header if c not in NON_FEATURE]
     nf = len(feat_cols)
+    if nf == 0:
+        raise ValueError("PIN contains no rescoring feature columns")
     fold_of = lambda p: int(hashlib.md5(strip_pep(p).encode()).hexdigest(), 16) % FOLDS
 
     mm_path = None
@@ -138,7 +142,7 @@ def main():
         del X
         n = len(y)
         get = lambda idx: Xs[idx]
-        col = lambda j: Xs[:, j]
+        get_col = lambda idx, j: np.asarray(Xs[idx, j])
     else:
         # ---- streaming memmap backend (mean/std, one text pass) ----
         with open(pin_path, "rb") as fh:
@@ -170,22 +174,10 @@ def main():
             mm[i:i + CHUNK] = np.clip((mm[i:i + CHUNK] - mean) / std, -8, 8)
         mm.flush()
         get = lambda idx: np.ascontiguousarray(mm[idx])
-        col = lambda j: np.asarray(mm[:, j])
-
-    # initial direction: best single feature+sign by targets at TRAIN_FDR (on a sample)
-    SAMPLE = min(n, env_i("MUMDIA_NN_INIT_SAMPLE", 300000))
-    samp = np.arange(SAMPLE)
-    Xsamp, ysamp = get(samp), y[samp]
-    best_j, best_sign, best_n = 0, 1, -1
-    for j in range(nf):
-        for sign in (1, -1):
-            m_ = n_targets_at(sign * Xsamp[:, j], ysamp, TRAIN_FDR)
-            if m_ > best_n:
-                best_n, best_j, best_sign = m_, j, sign
-    init_score = (best_sign * col(best_j)).astype(np.float32)
+        get_col = lambda idx, j: np.asarray(mm[idx, j])
+    init_sample_limit = env_i("MUMDIA_NN_INIT_SAMPLE", 300000)
     print(f"nn_rescore_worker: device={DEVICE} backend={'stream' if stream else 'in-memory'} "
-          f"pool={n} feats={nf} init={feat_cols[best_j]} sign{best_sign:+d} "
-          f"({best_n}@{TRAIN_FDR:.0%} on {SAMPLE} sample)", flush=True)
+          f"pool={n} feats={nf}", flush=True)
 
     class MLP(nn.Module):
         def __init__(self, d_in, hidden, p):
@@ -237,12 +229,46 @@ def main():
             tr_idx = np.where(fold != f)[0]
             te_idx = np.where(fold == f)[0]
             ytr = y[tr_idx]
-            score_tr = init_score[tr_idx].copy()
+            if len(tr_idx) == 0 or len(te_idx) == 0:
+                raise RuntimeError(
+                    f"fold {f} is empty in training or holdout; reduce MUMDIA_NN_FOLDS"
+                )
+            if not (np.any(ytr == 1) and np.any(ytr == 0)):
+                raise RuntimeError(
+                    f"fold {f} training rows do not contain both targets and decoys"
+                )
+            # Select the initial feature and sign using this fold's training rows
+            # only. The old global selection inspected held-out labels and made
+            # the nominal OOF scores optimistic. For very large folds, sample
+            # evenly across the deterministic training order rather than taking
+            # only the file head.
+            sample_n = min(len(tr_idx), init_sample_limit)
+            if sample_n == len(tr_idx):
+                init_idx = tr_idx
+            else:
+                positions = np.linspace(0, len(tr_idx) - 1, sample_n, dtype=np.int64)
+                init_idx = tr_idx[positions]
+            Xsamp, ysamp = get(init_idx), y[init_idx]
+            best_j, best_sign, best_n = 0, 1, -1
+            for j in range(nf):
+                for sign in (1, -1):
+                    count = n_targets_at(sign * Xsamp[:, j], ysamp, TRAIN_FDR)
+                    if count > best_n:
+                        best_n, best_j, best_sign = count, j, sign
+            score_tr = (best_sign * get_col(tr_idx, best_j)).astype(np.float32)
+            print(f"  seed {seed} fold {f}: init={feat_cols[best_j]} "
+                  f"sign{best_sign:+d} ({best_n}@{TRAIN_FDR:.0%} "
+                  f"on {sample_n} training rows)", flush=True)
             model = None
             for _ in range(ITERS):
                 q = tda_q(score_tr, ytr)
                 pos = (q <= TRAIN_FDR) & (ytr == 1)
                 neg = ytr == 0
+                if not np.any(pos):
+                    raise RuntimeError(
+                        f"fold {f} selected no positive targets at training FDR "
+                        f"{TRAIN_FDR}; use a larger PSM pool or review the feature contract"
+                    )
                 sel = tr_idx[pos | neg]
                 pw = float(neg.sum()) / max(1.0, float(pos.sum()))
                 model = train_model(sel, pw, seed)

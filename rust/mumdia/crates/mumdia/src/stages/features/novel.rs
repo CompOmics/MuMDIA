@@ -31,7 +31,11 @@ pub const NAMES: &[&str] = &[
 /// Replace any non-finite (NaN/Inf) value with 0.0.
 #[inline]
 fn finite(x: f64) -> f64 {
-    if x.is_finite() { x } else { 0.0 }
+    if x.is_finite() {
+        x
+    } else {
+        0.0
+    }
 }
 
 pub fn values(e: &Evidence) -> Vec<f64> {
@@ -54,11 +58,7 @@ pub fn values(e: &Evidence) -> Vec<f64> {
     };
 
     // Matched apex intensity sum (only fragments observed at the apex).
-    let matched_sum: f64 = e
-        .obs_apex
-        .iter()
-        .filter(|&&a| a > 0.0)
-        .sum();
+    let matched_sum: f64 = e.obs_apex.iter().filter(|&&a| a > 0.0).sum();
     let log_total_matched_intensity = (1.0 + matched_sum.max(0.0)).ln();
 
     // Count passthroughs.

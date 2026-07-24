@@ -7,7 +7,11 @@ use mumdia::stages;
 use mumdia_core::config::Config;
 
 #[derive(Parser)]
-#[command(name = "mumdia", version, about = "MuMDIA DIA search engine (Rust MVP)")]
+#[command(
+    name = "mumdia",
+    version,
+    about = "MuMDIA DIA search engine (Rust MVP)"
+)]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -254,9 +258,7 @@ enum Cmd {
         config: Option<String>,
     },
     /// Print schema, head sample, and row count for any artifact.
-    Inspect {
-        artifact: String,
-    },
+    Inspect { artifact: String },
     /// Candidate audit: reconstruct per-candidate stage flags + earliest rejection
     /// reason across the artifact chain and write candidate_audit.parquet
     /// (sensitivity program, P0.3/P0.4). Non-destructive; reruns no compute.
@@ -315,12 +317,23 @@ fn doctor(cfg: &Config) -> Result<()> {
     // the PyTorch NN needs torch; mokapot/entrapment need mokapot + sklearn.
     let (rescore_label, rescore_pkgs) = match cfg.rescore.classifier {
         RescorerKind::NnTorch => ("rescore.python (nn_torch)", "torch,numpy,pandas,pyarrow"),
-        _ => ("rescore.python (mokapot)", "mokapot,sklearn,numpy,pandas,pyarrow"),
+        _ => (
+            "rescore.python (mokapot)",
+            "mokapot,sklearn,numpy,pandas,pyarrow",
+        ),
     };
     let checks = [
         (rescore_label, cfg.rescore.python.as_deref(), rescore_pkgs),
-        ("predict_frag.deeplc_python (DeepLC)", cfg.predict_frag.deeplc_python.as_deref(), "deeplc,numpy,pandas"),
-        ("predict_frag.ms2pip_python (MS2PIP)", cfg.predict_frag.ms2pip_python.as_deref(), "ms2pip,numpy,pandas"),
+        (
+            "predict_frag.deeplc_python (DeepLC)",
+            cfg.predict_frag.deeplc_python.as_deref(),
+            "deeplc,numpy,pandas",
+        ),
+        (
+            "predict_frag.ms2pip_python (MS2PIP)",
+            cfg.predict_frag.ms2pip_python.as_deref(),
+            "ms2pip,numpy,pandas",
+        ),
     ];
     let mut bad = false;
     for (label, py, pkgs) in checks {
@@ -410,7 +423,11 @@ fn main() -> Result<()> {
                 config_hash: &ch,
             })?;
         }
-        Cmd::Peptidoforms { peptides, out, config } => {
+        Cmd::Peptidoforms {
+            peptides,
+            out,
+            config,
+        } => {
             let cfg = load_config(&config)?;
             let ch = mumdia_io::hash::blake3_str(&cfg.canonical_json());
             stages::peptidoforms::run(stages::peptidoforms::PeptidoformsParams {
@@ -523,7 +540,11 @@ fn main() -> Result<()> {
                 config_hash: &ch,
             })?;
         }
-        Cmd::Compete { features, out, config } => {
+        Cmd::Compete {
+            features,
+            out,
+            config,
+        } => {
             let cfg = load_config(&config)?;
             let ch = mumdia_io::hash::blake3_str(&cfg.canonical_json());
             stages::compete::run(stages::compete::CompeteParams {
@@ -554,7 +575,11 @@ fn main() -> Result<()> {
                 entrapment_substr: &entrapment_substr,
             })?;
         }
-        Cmd::Rescore { competed, out, config } => {
+        Cmd::Rescore {
+            competed,
+            out,
+            config,
+        } => {
             let cfg = load_config(&config)?;
             let ch = mumdia_io::hash::blake3_str(&cfg.canonical_json());
             stages::rescore::run(stages::rescore::RescoreParams {
@@ -614,13 +639,22 @@ fn main() -> Result<()> {
                 config_hash: &ch,
             })?;
         }
-        Cmd::QuantLfq { inputs, method, normalize, out } => {
+        Cmd::QuantLfq {
+            inputs,
+            method,
+            normalize,
+            out,
+        } => {
             let by_fragment = method.eq_ignore_ascii_case("directlfq");
             if !by_fragment && !method.eq_ignore_ascii_case("maxlfq") {
                 anyhow::bail!("--method must be maxlfq or directlfq (got {method})");
             }
-            let norm = mumdia_core::config::NormalizeMethod::from_token(&normalize)
-                .ok_or_else(|| anyhow::anyhow!("--normalize must be median_ratio, median, or none (got {normalize})"))?;
+            let norm =
+                mumdia_core::config::NormalizeMethod::from_token(&normalize).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "--normalize must be median_ratio, median, or none (got {normalize})"
+                    )
+                })?;
             stages::quant::run_lfq_combine(&inputs, by_fragment, norm, &out)?;
         }
         Cmd::Align { seeds, out, config } => {
@@ -634,7 +668,14 @@ fn main() -> Result<()> {
                 config_hash: &ch,
             })?;
         }
-        Cmd::Mbr { scored, psms, out, out_scored, frag, config } => {
+        Cmd::Mbr {
+            scored,
+            psms,
+            out,
+            out_scored,
+            frag,
+            config,
+        } => {
             let cfg = load_config(&config)?;
             if cfg.mbr.strategy == mumdia_core::config::MbrStrategy::None {
                 anyhow::bail!(
@@ -645,20 +686,39 @@ fn main() -> Result<()> {
                 anyhow::bail!("MBR needs >= 2 runs; got {} psms path(s)", psms.len());
             }
             let python = cfg.mbr.python.as_deref().ok_or_else(|| {
-                anyhow::anyhow!("mbr.python (sidecar interpreter) is required when mbr.strategy != none")
+                anyhow::anyhow!(
+                    "mbr.python (sidecar interpreter) is required when mbr.strategy != none"
+                )
             })?;
-            let script =
-                mumdia::sidecar::resolve_script(&cfg.predict_frag.sidecar_script_dir, "mbr_worker.py");
+            let script = mumdia::sidecar::resolve_script(
+                &cfg.predict_frag.sidecar_script_dir,
+                "mbr_worker.py",
+            );
             mumdia::sidecar::run_mbr(
-                python, &script, &scored, &psms, &out, out_scored.as_deref(), &frag,
-                cfg.mbr.q_anchor, cfg.mbr.min_anchor_runs, cfg.mbr.q_transfer,
-                cfg.mbr.consensus_corr_min, cfg.rng_seed,
+                python,
+                &script,
+                &scored,
+                &psms,
+                &out,
+                out_scored.as_deref(),
+                &frag,
+                cfg.mbr.q_anchor,
+                cfg.mbr.min_anchor_runs,
+                cfg.mbr.q_transfer,
+                cfg.mbr.consensus_corr_min,
+                cfg.rng_seed,
             )?;
         }
         Cmd::Inspect { artifact } => {
             print!("{}", mumdia_io::inspect(&artifact)?);
         }
-        Cmd::Report { scored, out_dir, peptide_quant, protein_quant, q } => {
+        Cmd::Report {
+            scored,
+            out_dir,
+            peptide_quant,
+            protein_quant,
+            q,
+        } => {
             std::fs::create_dir_all(&out_dir)?;
             let pep = format!("{out_dir}/peptides.tsv");
             let prot = format!("{out_dir}/proteins.tsv");
@@ -670,7 +730,9 @@ fn main() -> Result<()> {
                 out_proteins: &prot,
                 q_threshold: q,
             })?;
-            println!("MuMDIA: {n_pep} peptides, {n_prot} protein groups at q <= {q}\n  {pep}\n  {prot}");
+            println!(
+                "MuMDIA: {n_pep} peptides, {n_prot} protein groups at q <= {q}\n  {pep}\n  {prot}"
+            );
         }
         Cmd::Doctor { config } => {
             doctor(&load_config(&config)?)?;

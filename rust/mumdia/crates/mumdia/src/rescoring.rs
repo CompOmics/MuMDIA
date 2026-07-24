@@ -41,7 +41,9 @@ fn fit_standardizer(x: &[Vec<f64>], idx: &[usize]) -> (Vec<f64>, Vec<f64>) {
 
 #[inline]
 fn std_row(row: &[f64], mean: &[f64], std: &[f64]) -> Vec<f64> {
-    (0..row.len()).map(|j| (row[j] - mean[j]) / std[j]).collect()
+    (0..row.len())
+        .map(|j| (row[j] - mean[j]) / std[j])
+        .collect()
 }
 
 /// Logistic regression by full-batch gradient descent with L2. Weight[0] = bias.
@@ -168,7 +170,9 @@ pub fn percolator_lite(inp: RescoreInput) -> Vec<f64> {
                     }
                 }
                 w = logreg_fit(&rows, &ys, 1e-3, 200, 0.5);
-                train_scores = (0..train_idx.len()).map(|k| score_row(&w, &xtr[k])).collect();
+                train_scores = (0..train_idx.len())
+                    .map(|k| score_row(&w, &xtr[k]))
+                    .collect();
             }
             // score the held-out test fold with this fold's scaler + weights
             test_idx

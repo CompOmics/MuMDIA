@@ -22,15 +22,35 @@ and proteins with target-decoy FDR control.
   models (DeepLC retention time, MS2PIP fragment intensities, mokapot rescoring,
   and an entrapment-based rescorer).
 
-Each stage is an independent subcommand that reads path-addressable inputs and
-writes Parquet plus a per-artifact `report.json`, so the pipeline is inspectable
-and resumable at any step.
+Each stage is an independent subcommand with path-addressable inputs and Parquet
+outputs. Primary artifacts carry adjacent `report.json` provenance. Standalone
+stage outputs can be reused manually; the `mumdia run` orchestrator itself does
+not cache or resume and always recomputes its named outputs.
+
+## Documentation
+
+`docs/` is the developer guide: a per-subsystem reference grounded in the current
+code (crates, each pipeline stage and its artifacts, the config and data model,
+the sidecars, and the build and deploy machinery); start at
+[`docs/README.md`](docs/README.md). For a practical local on-ramp with
+copy-pasteable end-to-end runs, see
+[`docs/19_getting_started.md`](docs/19_getting_started.md).
+For the distinction between identification sensitivity, FDR validity, and
+quantification accuracy, see
+[`docs/20_sensitivity_and_quantification_playbook.md`](docs/20_sensitivity_and_quantification_playbook.md).
 
 ## Pipeline
 
-```
-convert -> digest -> peptidoforms -> predict-frag -> search-seed ->
-rt-im-train -> extract -> features -> compete -> rescore
+```text
+FASTA -> digest -> peptidoforms -> predict-frag --+
+                                                   +-> search-seed
+imported spectral library ------------------------+       |
+mzML -> convert ----------------------------------+       v
+                                                  optional RT fine-tune
+                                                           |
+                                                           v
+                                      rt-im-train -> extract -> features
+                                      -> compete -> rescore -> quant -> report
 ```
 
 Conversion retains all MS2 peaks by default. The seed search independently probes
@@ -41,13 +61,15 @@ therefore also affects extraction, features, and quantification.
 
 `mumdia run` orchestrates the whole chain on one file and writes a
 `manifest.json`; `mumdia inspect <artifact>` prints schema, head, and row count
-for any Parquet output.
+for any Parquet output. Use a fresh output directory for every `run`: rerunning
+in place overwrites named outputs and can leave stale optional sidecars after a
+failed or differently configured run.
 
 ## Run with Docker (bundles all sidecars)
 
 The published image contains the engine plus the Python sidecars (mokapot,
-MS2PIP, DeepLC), so the full high-sensitivity recipe runs with nothing to install
-but Docker:
+PyTorch, MS2PIP, DeepLC), so the portable FASTA workflow runs with nothing to
+install but Docker:
 
 ```
 docker pull ghcr.io/compomics/mumdia:latest
@@ -64,13 +86,18 @@ and `proteins.tsv`) appear under `results/`. On Windows PowerShell, use
 `-v "${PWD}:/data"` (not `$PWD`, which PowerShell parses as a drive reference). The baked
 `/opt/mumdia/config.dia.json` selects the Extended feature set and the DIA apex
 settings, and wires DeepLC, MS2PIP, and mokapot (logistic regression) to the
-in-image conda environments. To run the native, dependency-free models instead,
-drop `--config` and add `--profile dia`.
+in-image conda environments. The image also includes
+`/opt/mumdia/config.diann-lib.json` for an imported library, per-run DeepLC
+fine-tuning, and the higher-sensitivity `nn_torch` rescorer. Both configs use
+strict rescoring, so a requested sidecar cannot silently become a native run. To
+run the native, dependency-free models instead, drop `--config` and add
+`--profile dia`.
 
 ## Build
 
-Requires Rust >= 1.85 (the dependencies use edition 2024; `rustup update` if
-older). All dependencies are pure Rust, so no C toolchain is needed.
+Requires Rust >= 1.85 (the workspace `Cargo.toml` pins `rust-version = 1.85`;
+`rustup update` if older). All dependencies are pure Rust, so no C toolchain is
+needed.
 
 ```
 cd rust/mumdia
@@ -89,9 +116,9 @@ One command from a FASTA and a DIA mzML, using the validated DIA preset:
 
 ```
 mumdia run \
-  --fasta  proteome.fasta \
-  --mzml   sample.mzML \
-  --out    results \
+  --fasta   proteome.fasta \
+  --mzml    sample.mzML \
+  --out-dir results \
   --profile dia
 ```
 
@@ -103,6 +130,11 @@ and quantities), alongside the Parquet artifacts and a `manifest.json`; use
 (`mumdia report --scored … --out-dir …`), can also be run standalone on prior
 outputs.
 
+This quickstart uses uncapped converted MS2 spectra. On the validated Orbitrap
+AIF benchmark, an explicit `--top-peaks-ms2 300` was slightly better; that cap
+is acquisition-specific, not a universal DIA default. It is separate from
+`search_seed.top_n_peaks = 300`, which limits only the calibration search.
+
 ## Optional Python sidecars
 
 The native predictors and rescorer run with zero external dependencies. For
@@ -110,10 +142,21 @@ higher sensitivity, MuMDIA can call Python sidecars over a simple file contract
 (input Parquet in, output Parquet out). The mokapot rescorer, for example, needs
 only a small environment (`mokapot`, `scikit-learn`, `numpy`, `pyarrow`,
 `pandas`); DeepLC and MS2PIP need their own environments. Sidecar selection and
-the Python interpreter path are set in the configuration. The Docker image above
-bundles all three so no manual environment setup is needed; the environment
+the Python interpreter path are set in the configuration. Production and
+benchmark configs should set `rescore.strict = true` and verify the actual
+classifier in `psms_scored.parquet.report.json`. The Docker image above
+bundles the required environments so no manual setup is needed; the environment
 specifications are under `env/` (`mumdia-rescore.yml`, `docker-rescore.yml`,
 `docker-deeplc.yml`).
+
+The `scripts/` directory holds ten Python programs. Seven are engine-invoked
+sidecar workers, called by the relevant stage over that file contract: MS2PIP
+(`ms2pip_worker.py`), DeepLC (`deeplc_worker.py`), the DeepLC fine-tune
+(`deeplc_finetune.py`), mokapot (`mokapot_worker.py`), the native-torch rescorer
+(`nn_rescore_worker.py`), the entrapment rescorer (`entrapment_worker.py`), and
+match-between-runs (`mbr_worker.py`). The other three are helpers for the DIA-NN
+library recipe below and are run by hand: `import_diann_lib.py`,
+`make_reverse_decoys.py`, and `make_shift_decoys.py`.
 
 ## Using a DIA-NN spectral library (highest sensitivity)
 
@@ -121,8 +164,9 @@ By default MuMDIA builds its library from a FASTA digest and predicts fragment
 intensities with the native model or MS2PIP. For the highest sensitivity, and to
 reproduce the benchmark numbers, you can supply a spectral library predicted by
 DIA-NN and have MuMDIA consume it directly. In this **library-input mode**, `run`
-skips the digest, MS2PIP, and DeepLC steps and uses DIA-NN's fragment intensities
-and retention times.
+skips digest, peptidoform expansion, and initial fragment/RT prediction and uses
+DIA-NN's fragment intensities and retention times. An optional per-run DeepLC
+fine-tune can still rewrite the imported iRT values after seed search.
 
 MuMDIA does not include or download DIA-NN. You run DIA-NN yourself, under your
 own license: the DIA-NN "Academia" build is free for non-profit academic research
@@ -171,10 +215,13 @@ both; in Docker use `/opt/conda/envs/rescore/bin/python`).
      --lib-fragments  lib_fragments.parquet \
      --mzml    sample.mzML \
      --out-dir results \
-     --profile dia
+     --profile dia \
+     --top-peaks-ms2 300
    ```
 
-   Everything downstream (search-seed, RT calibration, extraction, features,
+   The explicit 300 cap reproduces the validated AIF setting; omit or retune it
+   for another acquisition scheme. Everything downstream (search-seed, RT
+   calibration, extraction, features,
    competition, rescoring, quant, report) is unchanged. Because the DIA-NN
    library supplies both fragment intensities and retention times, no fragment
    or RT prediction sidecar is required in this mode.
@@ -191,11 +238,15 @@ in the config and point at a DeepLC 4.0 multitask environment:
 }
 ```
 
-Pass it with `--config`. `run` then fine-tunes on the confident seed PSMs and
-re-predicts iRT for the whole library between search-seed and RT calibration. A
-ready-made config for the Docker image is `docker/config.diann-lib.json` (it
-targets the image's bundled `deeplc` environment). The fine-tune uses no fixed
-random seed, so identification counts vary slightly between runs.
+Pass it with `--config` and supply the original imported precursor table, not a
+previous run's already-fine-tuned table. `run` then fine-tunes on the confident
+seed PSMs and re-predicts iRT for the whole library between search-seed and RT
+calibration. A ready-made config for the Docker image is
+`docker/config.diann-lib.json` (it targets the bundled `deeplc` environment and
+`nn_torch` rescorer). The DeepLC fine-tune is not guaranteed deterministic, so
+identification counts can vary slightly between runs. The NN rescorer seeds
+NumPy and PyTorch, but numerical kernels are likewise not guaranteed
+bit-for-bit reproducible.
 
 In Docker, mount the library files and point `--lib-precursors` /
 `--lib-fragments` at the mounted paths; steps 2-3 (and the fine-tune) run in the
@@ -203,19 +254,31 @@ image's bundled environments.
 
 ## FDR
 
-MuMDIA controls the false discovery rate with target-decoy competition (reverse
-or fragment-shift decoys), the standard, community-accepted approach, and reports
-target-decoy q-values at PSM, peptide, and protein-group level. An optional
-entrapment (foreign-proteome spike-in) rescorer is available as a
-decoy-independent cross-check for experiments that want one, but it is not
-required.
+MuMDIA estimates false discovery rates with paired target-decoy competition
+(reverse or scramble decoys for a native digest, or the paired decoys already
+present in an imported library) and reports q-values at PSM, precursor, peptide,
+and protein-group levels. Those estimates depend on a valid,
+exchangeable decoy population; the engine rejects malformed or decoy-free
+libraries. Entrapment (a foreign-proteome spike-in) is available as an empirical
+cross-check and should be part of validation before a new sensitivity setting is
+promoted across datasets.
 
 ## Benchmark
 
-On the ProteomeXchange E. coli AIF file `LFQ_Orbitrap_AIF_Ecoli_01`, with a
-DIA-NN-predicted library and per-run fine-tuned retention time, MuMDIA reports on
-the order of 9,000 to 10,000 peptides at 1% FDR (mokapot), at roughly 97 to 98%
-sequence concordance with DIA-NN.
+All counts below are historical single-run validation targets on the
+ProteomeXchange E. coli AIF file `LFQ_Orbitrap_AIF_Ecoli_01`, with converted MS2
+spectra capped at 300 peaks. The report count is a precursor-shaped
+`(peptidoform, charge)` row selected by stripped-peptide q-value, not a
+precursor-q-controlled count. Each number states the rescorer actually used.
+
+- **Native FASTA digest (zero dependencies):** about 1,213 confident report rows, using
+  the built-in models and the native rescorer (`native_tda`). Conservative and
+  high-precision.
+- **Imported DIA-NN library with per-run DeepLC fine-tune:** about 9,300 to 9,500
+  confident report rows with the mokapot rescorer (`mokapot`), and about 10,300 with the
+  native PyTorch rescorer (`nn_torch`), which is nonlinear and outperforms the
+  linear mokapot model on the same feature set. Roughly 97 to 98% sequence
+  concordance with DIA-NN.
 
 ## License
 

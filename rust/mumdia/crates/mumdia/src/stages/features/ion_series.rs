@@ -120,7 +120,7 @@ fn ordinal_concordance(mut items: Vec<(u32, f64, f64)>) -> f64 {
     if items.len() < 2 {
         return 0.0;
     }
-    items.sort_by(|a, b| a.0.cmp(&b.0));
+    items.sort_by_key(|a| a.0);
     let sign = |x: f64| -> i32 {
         if x > 0.0 {
             1
@@ -272,13 +272,13 @@ pub fn values(e: &Evidence) -> Vec<f64> {
         let mut sites: HashSet<i64> = HashSet::new();
         for &o in &b_ord_matched {
             let s = o as i64;
-            if s >= 1 && s <= l_i - 1 {
+            if s >= 1 && s < l_i {
                 sites.insert(s);
             }
         }
         for &o in &y_ord_matched {
             let s = l_i - o as i64;
-            if s >= 1 && s <= l_i - 1 {
+            if s >= 1 && s < l_i {
                 sites.insert(s);
             }
         }
@@ -315,10 +315,12 @@ pub fn values(e: &Evidence) -> Vec<f64> {
     let mut by_complement_count = 0.0;
     for &kord in &b_ord_matched {
         let comp = l_i - kord as i64;
-        if comp >= 1 && comp <= l_i - 1 && comp <= u32::MAX as i64 {
-            if y_ord_matched.contains(&(comp as u32)) {
-                by_complement_count += 1.0;
-            }
+        if comp >= 1
+            && comp < l_i
+            && comp <= u32::MAX as i64
+            && y_ord_matched.contains(&(comp as u32))
+        {
+            by_complement_count += 1.0;
         }
     }
 
@@ -524,8 +526,7 @@ pub fn values(e: &Evidence) -> Vec<f64> {
         } else {
             &y_ord_matched
         };
-        let has_neighbor = (ord > 0 && set.contains(&(ord - 1)))
-            || set.contains(&(ord + 1));
+        let has_neighbor = (ord > 0 && set.contains(&(ord - 1))) || set.contains(&(ord + 1));
         if has_neighbor {
             contig_apex += e.obs_apex[i].max(0.0);
             contig_lib += e.pred[i].max(0.0);

@@ -3,9 +3,9 @@
 //! -> compete -> rescore chain directly on files, asserting the planted target
 //! is recovered and the output is reproducible.
 
+use mumdia::stages;
 use mumdia_core::config::Config;
 use mumdia_io::table::{write_table, Col, Table};
-use mumdia::stages;
 
 fn tmp(name: &str) -> String {
     // Unique per call: cargo runs tests concurrently in one process, and several
@@ -17,7 +17,10 @@ fn tmp(name: &str) -> String {
     let dir = std::env::temp_dir().join(format!("mumdia_pipeline_test_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let n = CTR.fetch_add(1, Ordering::Relaxed);
-    dir.join(format!("{n}_{name}")).to_str().unwrap().to_string()
+    dir.join(format!("{n}_{name}"))
+        .to_str()
+        .unwrap()
+        .to_string()
 }
 
 /// Two candidates in the same isolation window: a target whose three fragments
@@ -31,7 +34,10 @@ fn craft_library() -> (String, String) {
             Col::U32("candidate_id".into(), vec![0, 1]),
             Col::U32("peptidoform_id".into(), vec![0, 1]),
             Col::U32("base_peptide_id".into(), vec![0, 0]),
-            Col::Str("peptidoform".into(), vec!["PEPTIDEK".into(), "EDITPEPK".into()]),
+            Col::Str(
+                "peptidoform".into(),
+                vec!["PEPTIDEK".into(), "EDITPEPK".into()],
+            ),
             Col::I32("charge".into(), vec![2, 2]),
             Col::F64("precursor_mz".into(), vec![500.0, 500.0]),
             Col::F32("predicted_irt".into(), vec![10.0, 10.0]),
@@ -46,9 +52,32 @@ fn craft_library() -> (String, String) {
         vec![
             Col::U32("candidate_id".into(), vec![0, 0, 0, 1, 1, 1]),
             Col::F64("mz".into(), vec![200.1, 300.2, 400.3, 250.7, 350.8, 450.9]),
-            Col::F32("predicted_intensity".into(), vec![1.0, 0.8, 0.6, 1.0, 0.8, 0.6]),
-            Col::Str("name".into(), vec!["b2".into(), "y3".into(), "y4".into(), "b2".into(), "y3".into(), "y4".into()]),
-            Col::Str("ion_type".into(), vec!["b".into(), "y".into(), "y".into(), "b".into(), "y".into(), "y".into()]),
+            Col::F32(
+                "predicted_intensity".into(),
+                vec![1.0, 0.8, 0.6, 1.0, 0.8, 0.6],
+            ),
+            Col::Str(
+                "name".into(),
+                vec![
+                    "b2".into(),
+                    "y3".into(),
+                    "y4".into(),
+                    "b2".into(),
+                    "y3".into(),
+                    "y4".into(),
+                ],
+            ),
+            Col::Str(
+                "ion_type".into(),
+                vec![
+                    "b".into(),
+                    "y".into(),
+                    "y".into(),
+                    "b".into(),
+                    "y".into(),
+                    "y".into(),
+                ],
+            ),
             Col::I32("ordinal".into(), vec![2, 3, 4, 2, 3, 4]),
             Col::I32("frag_charge".into(), vec![1, 1, 1, 1, 1, 1]),
         ],
@@ -60,6 +89,12 @@ fn craft_library() -> (String, String) {
 /// MS2 scans: five consecutive scans in one window carrying the target's three
 /// fragments; the decoy's fragments never appear.
 fn craft_ms2() -> String {
+    craft_ms2_with_decoy(false)
+}
+
+/// Variant used by the full rescoring test. A valid target-decoy FDR calculation
+/// requires at least one extracted example of each label.
+fn craft_ms2_with_decoy(include_decoy: bool) -> String {
     let path = tmp("ms2.parquet");
     let n = 5;
     let scan_index: Vec<u32> = (0..n).collect();
@@ -73,12 +108,22 @@ fn craft_ms2() -> String {
     let pz: Vec<Option<i32>> = vec![None; n as usize];
     // each scan: target's three fragments plus a couple of noise peaks
     let mz: Vec<Vec<f32>> = (0..n)
-        .map(|_| vec![120.0, 200.1, 300.2, 400.3, 600.0])
+        .map(|_| {
+            if include_decoy {
+                vec![120.0, 200.1, 250.7, 300.2, 350.8, 400.3, 450.9, 600.0]
+            } else {
+                vec![120.0, 200.1, 300.2, 400.3, 600.0]
+            }
+        })
         .collect();
     let inten: Vec<Vec<f32>> = (0..n)
         .map(|i| {
             let a = 1000.0 + 100.0 * i as f32;
-            vec![50.0, a, a * 0.8, a * 0.6, 40.0]
+            if include_decoy {
+                vec![50.0, a, a * 0.7, a * 0.8, a * 0.56, a * 0.6, a * 0.42, 40.0]
+            } else {
+                vec![50.0, a, a * 0.8, a * 0.6, 40.0]
+            }
         })
         .collect();
     write_table(
@@ -153,10 +198,16 @@ fn extract_recovers_planted_target_and_is_deterministic() {
     let t2 = Table::read(&psms2).unwrap();
     // The target (candidate 0) is accepted; the decoy (1) is not.
     let cids1 = t1.u32("candidate_id").unwrap();
-    assert!(cids1.contains(&0), "target candidate not extracted: {cids1:?}");
+    assert!(
+        cids1.contains(&0),
+        "target candidate not extracted: {cids1:?}"
+    );
     assert!(!cids1.contains(&1), "decoy should not be extracted");
     // Deterministic: same rows and apex across two runs.
-    assert_eq!(t1.u32("candidate_id").unwrap(), t2.u32("candidate_id").unwrap());
+    assert_eq!(
+        t1.u32("candidate_id").unwrap(),
+        t2.u32("candidate_id").unwrap()
+    );
     assert_eq!(t1.f64("apex_rt").unwrap(), t2.f64("apex_rt").unwrap());
     // Apex should be the last (most intense) scan at rt 140.
     let apex = t1.f64("apex_rt").unwrap();
@@ -166,7 +217,7 @@ fn extract_recovers_planted_target_and_is_deterministic() {
 #[test]
 fn features_compete_rescore_run_on_crafted_input() {
     let (prec, frag) = craft_library();
-    let ms2 = craft_ms2();
+    let ms2 = craft_ms2_with_decoy(true);
     let win = craft_windows();
     let (psms, chrom) = run_extract(&prec, &frag, &ms2, &win, "frc");
 

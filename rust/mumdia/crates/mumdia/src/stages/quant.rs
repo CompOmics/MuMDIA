@@ -9,7 +9,9 @@ use std::collections::{BTreeMap, HashMap};
 use std::time::Instant;
 
 use anyhow::Result;
-use mumdia_core::config::{NormalizeMethod, PeakWindowMode, QuantConfig, QuantQColumn, RollupMethod};
+use mumdia_core::config::{
+    NormalizeMethod, PeakWindowMode, QuantConfig, QuantQColumn, RollupMethod,
+};
 use mumdia_core::schema::artifact;
 use mumdia_io::report::ArtifactReport;
 use mumdia_io::table::{write_table, Col, Table};
@@ -68,16 +70,20 @@ fn trapezoid_window(rt: &[f32], inten: &[f32], lo: f64, hi: f64) -> f64 {
 /// all its fragment chromatograms. Fragments are aligned on the union of their RT
 /// samples via a BTreeMap keyed by the f32 RT bit pattern: for the non-negative
 /// RTs here the bit order matches the value order, so both the union axis and the
-/// f64 summation order are fixed (determinism, plan.md Section 7). The apex is the
-/// first RT of maximum summed intensity; [`super::features::peak_bounds`] then
-/// walks out with the given `frac`/`grace`. Returns an unbounded window when there
-/// are fewer than two distinct RT samples (nothing to bound).
+/// f64 summation order are fixed (determinism, plan.md Section 7). When a finite
+/// identification apex is available, the nearest sampled RT anchors the outward
+/// [`super::features::peak_bounds`] walk. This prevents a brighter off-apex
+/// interferent from moving quantification to a different peak. Older scored
+/// artifacts and missing/non-finite hints retain the legacy co-elution apex
+/// detector. Returns an unbounded window when there are fewer than two distinct
+/// RT samples (nothing to bound).
 fn peak_window(
     rows: &[usize],
     ch_rt: &[Vec<f32>],
     ch_int: &[Vec<f32>],
     frac: f64,
     grace: usize,
+    apex_hint: Option<f64>,
 ) -> (f64, f64, f64) {
     let mut prof_map: BTreeMap<u32, f64> = BTreeMap::new();
     // Per-scan count of co-eluting (nonzero) fragments, aligned to prof_map keys.
@@ -94,38 +100,60 @@ fn peak_window(
     }
     if prof_map.len() < 2 {
         // Nothing to bound; apex is the lone RT if present, else NaN.
-        let apex = prof_map.keys().next().map_or(f64::NAN, |b| f32::from_bits(*b) as f64);
+        let apex = prof_map
+            .keys()
+            .next()
+            .map_or(f64::NAN, |b| f32::from_bits(*b) as f64);
         return (f64::NEG_INFINITY, f64::INFINITY, apex);
     }
     let axis: Vec<f64> = prof_map.keys().map(|b| f32::from_bits(*b) as f64).collect();
     let prof: Vec<f64> = prof_map.values().cloned().collect();
-    let cnt: Vec<u32> = prof_map.keys().map(|b| *cnt_map.get(b).unwrap_or(&0)).collect();
-    // Robust apex: among scans whose co-eluting-fragment count is within 1 of the
-    // maximum ("-1 for robustness"), take the one with the highest summed intensity.
-    // This rejects a lone tall interferent fragment (which a plain summed-intensity
-    // argmax would pick in a low/absent run) in favor of a region where many
-    // fragments co-elute. Falls back to summed argmax only if no scan has a fragment.
-    let max_cnt = cnt.iter().copied().max().unwrap_or(0);
-    let thresh = max_cnt.saturating_sub(1).max(1);
-    let mut ai = 0usize;
-    let mut best = f64::NEG_INFINITY;
-    let mut found = false;
-    for (i, &v) in prof.iter().enumerate() {
-        if cnt[i] >= thresh && v > best {
-            best = v;
-            ai = i;
-            found = true;
-        }
-    }
-    if !found {
-        best = f64::NEG_INFINITY;
-        for (i, &v) in prof.iter().enumerate() {
-            if v > best {
-                best = v;
-                ai = i;
+    let cnt: Vec<u32> = prof_map
+        .keys()
+        .map(|b| *cnt_map.get(b).unwrap_or(&0))
+        .collect();
+    let ai = if let Some(hint) = apex_hint.filter(|v| v.is_finite()) {
+        // The identified apex need not exactly equal a chromatogram sample (for
+        // example after serialization/calibration), so anchor to the nearest RT.
+        let mut nearest = 0usize;
+        let mut distance = f64::INFINITY;
+        for (i, &rt) in axis.iter().enumerate() {
+            let d = (rt - hint).abs();
+            if d < distance {
+                nearest = i;
+                distance = d;
             }
         }
-    }
+        nearest
+    } else {
+        // Legacy robust apex: among scans whose co-eluting-fragment count is
+        // within 1 of the maximum ("-1 for robustness"), take the one with the
+        // highest summed intensity. This rejects a lone tall interferent fragment
+        // in favor of a region where many fragments co-elute. Falls back to the
+        // summed argmax only if no scan has a fragment.
+        let max_cnt = cnt.iter().copied().max().unwrap_or(0);
+        let thresh = max_cnt.saturating_sub(1).max(1);
+        let mut ai = 0usize;
+        let mut best = f64::NEG_INFINITY;
+        let mut found = false;
+        for (i, &v) in prof.iter().enumerate() {
+            if cnt[i] >= thresh && v > best {
+                best = v;
+                ai = i;
+                found = true;
+            }
+        }
+        if !found {
+            best = f64::NEG_INFINITY;
+            for (i, &v) in prof.iter().enumerate() {
+                if v > best {
+                    best = v;
+                    ai = i;
+                }
+            }
+        }
+        ai
+    };
     let (mut lo, mut hi) = super::features::peak_bounds(&prof, ai, frac, grace);
     // Guarantee a nonzero-width window. A near-1-scan summed XIC (both apex
     // shoulders below the threshold) collapses to lo==hi; trapezoid_window would
@@ -137,11 +165,95 @@ fn peak_window(
         if hi + 1 < prof.len() {
             hi += 1;
         }
-        if lo > 0 {
-            lo -= 1;
-        }
+        lo = lo.saturating_sub(1);
     }
     (axis[lo], axis[hi], axis[ai])
+}
+
+fn finite_option(value: f64) -> Option<f64> {
+    value.is_finite().then_some(value)
+}
+
+fn passes_quant_filter(label: &str, q_value: f64, threshold: f64) -> bool {
+    label != "decoy" && q_value.is_finite() && q_value <= threshold
+}
+
+/// Select positive, finite fragment areas and sum the top N. Missing traces and
+/// all-zero/non-finite traces are deliberately nullable, not quantitative zero:
+/// zero would be indistinguishable from a measured biological absence and would
+/// bias protein rollups and downstream ratios.
+fn summarize_fragment_areas(
+    areas: Option<&[f64]>,
+    top_n: usize,
+) -> (Option<f64>, usize, &'static str) {
+    let Some(areas) = areas else {
+        return (None, 0, "no_fragment_traces");
+    };
+    let mut positive: Vec<f64> = areas
+        .iter()
+        .copied()
+        .filter(|area| area.is_finite() && *area > 0.0)
+        .collect();
+    if positive.is_empty() {
+        return (None, 0, "no_positive_fragment_area");
+    }
+    if top_n == 0 {
+        return (None, 0, "no_fragments_selected");
+    }
+    positive.sort_by(|a, b| b.total_cmp(a));
+    let used = positive.len().min(top_n);
+    let quantity: f64 = positive.iter().take(used).sum();
+    if quantity.is_finite() && quantity > 0.0 {
+        (Some(quantity), used, "quantified")
+    } else {
+        (None, used, "nonfinite_quantity")
+    }
+}
+
+type ProteinBaseQuant = BTreeMap<String, BTreeMap<u32, f64>>;
+
+/// Record one identified row for protein rollup. Multiple charge/mod precursor
+/// rows belonging to the same base peptide contribute only their maximum
+/// quantity, preventing repeated identifications from inflating Top-N. This max
+/// is a single-run representative only; proper cross-run abundance estimation
+/// must combine per-run quant tables rather than roll pooled scored rows here.
+fn add_protein_base_quantity(
+    groups: &mut ProteinBaseQuant,
+    protein_group: &str,
+    base_peptide_id: u32,
+    quantity: Option<f64>,
+) {
+    let bases = groups.entry(protein_group.to_string()).or_default();
+    if let Some(quantity) = quantity.filter(|v| v.is_finite() && *v > 0.0) {
+        bases
+            .entry(base_peptide_id)
+            .and_modify(|current| *current = current.max(quantity))
+            .or_insert(quantity);
+    }
+}
+
+/// Roll up unique quantifiable base peptides. `n_peptides` is the number of
+/// unique positive bases before Top-N truncation, not the number of precursor
+/// rows and not the number selected into the sum.
+fn rollup_protein_bases(
+    bases: &BTreeMap<u32, f64>,
+    rollup: RollupMethod,
+    top_n: usize,
+) -> (Option<f64>, usize, &'static str) {
+    if bases.is_empty() {
+        return (None, 0, "no_quantifiable_peptide");
+    }
+    let mut values: Vec<f64> = bases.values().copied().collect();
+    values.sort_by(|a, b| b.total_cmp(a));
+    let quantity: f64 = match rollup {
+        RollupMethod::TopNSum => values.iter().take(top_n).sum(),
+        RollupMethod::Sum => values.iter().sum(),
+    };
+    if quantity.is_finite() && quantity > 0.0 {
+        (Some(quantity), bases.len(), "quantified")
+    } else {
+        (None, bases.len(), "no_quantifiable_peptide")
+    }
 }
 
 pub fn run(p: QuantParams) -> Result<(u64, u64)> {
@@ -154,14 +266,27 @@ pub fn run(p: QuantParams) -> Result<(u64, u64)> {
     let charge = ps.i32("charge")?;
     let label = ps.str("label")?;
     let pg = ps.str("protein_group")?;
-    // q-value column to filter on. Peptide q is per-run in a single-run rescore, but
-    // GLOBAL (best PSM per peptide across all runs) under an experiment-wide rescore,
-    // where the per-PSM q_value is the correct per-run choice for cross-run quant.
+    let base = ps.u32("base_peptide_id")?;
+    // Q-value column to filter on. Peptide/precursor q is per-run only when the
+    // rescore itself is single-run; grouped q-values are experiment-wide otherwise.
+    // For per-run slices of a pooled rescore, run_psm_q is the run-local FDR gate.
     let pep_q = match p.cfg.q_filter {
         QuantQColumn::PeptideQ => ps.f64("peptide_q_value")?,
+        QuantQColumn::PrecursorQ => ps.f64("precursor_q")?,
         QuantQColumn::PsmQ => ps.f64("q_value")?,
         QuantQColumn::RunPsmQ => ps.f64("run_psm_q")?,
     };
+    // Schema-v3 scored tables carry the exact identification apex. Keep input
+    // compatibility with older scored artifacts by treating a missing column,
+    // null (read as NaN), or non-finite value as "no hint".
+    let mut apex_by_cid: HashMap<u32, f64> = HashMap::new();
+    if let Ok(apex_rt) = ps.f64("apex_rt") {
+        for i in 0..ps.nrows {
+            if apex_rt[i].is_finite() {
+                apex_by_cid.entry(cid[i]).or_insert(apex_rt[i]);
+            }
+        }
+    }
 
     // Chromatograms grouped by candidate.
     let ch = Table::read(p.chromatograms)?;
@@ -188,15 +313,22 @@ pub fn run(p: QuantParams) -> Result<(u64, u64)> {
     let emit_bounds = p.out_peak_bounds.is_some() && p.cfg.bound_peak;
     let (mut pb_cid, mut pb_lo, mut pb_hi) = (Vec::new(), Vec::new(), Vec::new());
 
-    // Phase 1: per-candidate summed-XIC window (lo_rt, hi_rt, apex_rt). The window
-    // comes from the summed XIC across all fragments, so a lone off-apex interferent
-    // cannot define the bound. Kept keyed by candidate for the consensus estimate.
+    // Phase 1: per-candidate summed-XIC window (lo_rt, hi_rt, apex_rt), anchored at
+    // the identification apex when available and otherwise using the legacy robust
+    // co-elution detector. Kept keyed by candidate for the consensus estimate.
     let mut win: BTreeMap<u32, (f64, f64, f64)> = BTreeMap::new();
     if p.cfg.bound_peak {
         for (&c, rows) in &cand_rows {
             win.insert(
                 c,
-                peak_window(rows, &ch_rt, &ch_int, p.cfg.peak_fraction, p.cfg.peak_grace),
+                peak_window(
+                    rows,
+                    &ch_rt,
+                    &ch_int,
+                    p.cfg.peak_fraction,
+                    p.cfg.peak_grace,
+                    apex_by_cid.get(&c).copied(),
+                ),
             );
         }
     }
@@ -204,9 +336,9 @@ pub fn run(p: QuantParams) -> Result<(u64, u64)> {
     // Consensus mode: peak width is a near-constant instrument/gradient property, so
     // take the median left/right half-width over CONFIDENT peptides (q <= reliable_q)
     // and apply it around each candidate's apex. The median ignores the interference-
-    // stretched and collapsed per-candidate windows, and being global it is identical
-    // across runs, preserving fold changes. Falls back to per-candidate if too few
-    // confident anchors for a stable median.
+    // stretched and collapsed per-candidate windows. It is estimated independently
+    // for each quant invocation/run; cross-run-identical widths require an external
+    // shared policy. Falls back to per-candidate if too few confident anchors.
     let consensus: Option<(f64, f64)> =
         if p.cfg.bound_peak && p.cfg.peak_window_mode == PeakWindowMode::Consensus {
             let mut q_by_cid: HashMap<u32, f64> = HashMap::new();
@@ -232,27 +364,38 @@ pub fn run(p: QuantParams) -> Result<(u64, u64)> {
             if left.len() >= 20 {
                 let ml = median_sorted(&mut left);
                 let mr = median_sorted(&mut right);
-                info!(anchors = left.len(), med_left_s = ml, med_right_s = mr, "quant: consensus peak window");
+                info!(
+                    anchors = left.len(),
+                    med_left_s = ml,
+                    med_right_s = mr,
+                    "quant: consensus peak window"
+                );
                 Some((ml, mr))
             } else {
-                info!(anchors = left.len(), "quant: too few confident anchors, using per-candidate windows");
+                info!(
+                    anchors = left.len(),
+                    "quant: too few confident anchors, using per-candidate windows"
+                );
                 None
             }
         } else {
             None
         };
 
-    // Phase 2: integrate each fragment over the chosen window.
+    // Phase 2: integrate each fragment over the chosen window and retain the
+    // actually applied apex/bounds for the peptide-quant contract.
+    let mut applied_win: BTreeMap<u32, (f64, f64, f64)> = BTreeMap::new();
     for (&c, rows) in &cand_rows {
-        let (lo_rt, hi_rt) = if !p.cfg.bound_peak {
-            (f64::NEG_INFINITY, f64::INFINITY)
+        let (lo_rt, hi_rt, integration_apex) = if !p.cfg.bound_peak {
+            (f64::NEG_INFINITY, f64::INFINITY, f64::NAN)
         } else {
             let (lo, hi, apex) = win[&c];
             match consensus {
-                Some((ml, mr)) if apex.is_finite() => (apex - ml, apex + mr),
-                _ => (lo, hi),
+                Some((ml, mr)) if apex.is_finite() => (apex - ml, apex + mr, apex),
+                _ => (lo, hi, apex),
             }
         };
+        applied_win.insert(c, (lo_rt, hi_rt, integration_apex));
         if emit_bounds && lo_rt.is_finite() && hi_rt.is_finite() {
             pb_cid.push(c);
             pb_lo.push(lo_rt);
@@ -265,7 +408,10 @@ pub fn run(p: QuantParams) -> Result<(u64, u64)> {
                 trapezoid(&ch_rt[i], &ch_int[i])
             };
             areas.entry(c).or_default().push(a);
-            frag_areas.entry(c).or_default().push((ch_name[i].as_str(), a));
+            frag_areas
+                .entry(c)
+                .or_default()
+                .push((ch_name[i].as_str(), a));
         }
     }
 
@@ -283,80 +429,123 @@ pub fn run(p: QuantParams) -> Result<(u64, u64)> {
         )?;
     }
 
-    // Per-peptidoform quantity = sum of the top-N fragment areas.
-    let (mut q_cid, mut q_pform, mut q_z, mut q_pg, mut q_val, mut q_nfrag) =
-        (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
-    let mut per_group: HashMap<String, Vec<f64>> = HashMap::new();
+    // Per-peptidoform quantity = sum of the top-N positive fragment areas.
+    let (
+        mut q_cid,
+        mut q_base,
+        mut q_pform,
+        mut q_z,
+        mut q_pg,
+        mut q_val,
+        mut q_status,
+        mut q_nfrag,
+        mut q_apex,
+        mut q_lo,
+        mut q_hi,
+    ) = (
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+    );
+    let mut per_group: ProteinBaseQuant = BTreeMap::new();
+    let mut n_quantified_peptides = 0u64;
     for i in 0..ps.nrows {
-        if label[i] == "decoy" || pep_q[i] > p.cfg.q_threshold {
+        if !passes_quant_filter(&label[i], pep_q[i], p.cfg.q_threshold) {
             continue;
         }
-        // Sort the per-candidate area vector in place (by mutable reference) rather
-        // than cloning it per PSM; `areas` is not read again after this loop and a
-        // repeated candidate_id re-sorts an already-sorted vector (idempotent).
-        let (quantity, used): (f64, usize) = match areas.get_mut(&cid[i]) {
-            Some(a) => {
-                a.sort_by(|x, y| y.partial_cmp(x).unwrap());
-                let used = a.len().min(p.cfg.top_n_fragments);
-                (a.iter().take(used).sum(), used)
-            }
-            None => (0.0, 0),
+        let (quantity, used, status) =
+            summarize_fragment_areas(areas.get(&cid[i]).map(Vec::as_slice), p.cfg.top_n_fragments);
+        if quantity.is_some() {
+            n_quantified_peptides += 1;
+        }
+        let (integration_lo, integration_hi, integration_apex) = match applied_win.get(&cid[i]) {
+            Some(&(lo, hi, apex)) => (finite_option(lo), finite_option(hi), finite_option(apex)),
+            None => (None, None, None),
         };
         q_cid.push(cid[i]);
+        q_base.push(base[i]);
         q_pform.push(pform[i].clone());
         q_z.push(charge[i]);
         q_pg.push(pg[i].clone());
         q_val.push(quantity);
+        q_status.push(status.to_string());
         q_nfrag.push(used as i32);
-        per_group.entry(pg[i].clone()).or_default().push(quantity);
+        q_apex.push(integration_apex);
+        q_lo.push(integration_lo);
+        q_hi.push(integration_hi);
+        add_protein_base_quantity(&mut per_group, &pg[i], base[i], quantity);
     }
 
     let n_pep = write_table(
         p.out_peptide,
         vec![
             Col::U32("candidate_id".into(), q_cid),
+            Col::U32("base_peptide_id".into(), q_base),
             Col::Str("peptidoform".into(), q_pform),
             Col::I32("charge".into(), q_z),
             Col::Str("protein_group".into(), q_pg),
-            Col::F64("quantity".into(), q_val),
+            Col::OptF64("quantity".into(), q_val),
+            Col::Str("quant_status".into(), q_status),
             Col::I32("n_fragments_used".into(), q_nfrag),
+            Col::OptF64("integration_apex_rt".into(), q_apex),
+            Col::OptF64("integration_lo_rt".into(), q_lo),
+            Col::OptF64("integration_hi_rt".into(), q_hi),
         ],
     )?;
 
-    // Protein-group rollup.
-    let mut groups: Vec<String> = per_group.keys().cloned().collect();
-    groups.sort();
-    let (mut g_name, mut g_val, mut g_npep) = (Vec::new(), Vec::new(), Vec::new());
-    for g in &groups {
-        let mut v = per_group[g].clone();
-        v.sort_by(|a, b| b.partial_cmp(a).unwrap());
-        let quantity = match p.cfg.rollup {
-            RollupMethod::TopNSum => v.iter().take(p.cfg.top_n_peptides).sum(),
-            RollupMethod::Sum => v.iter().sum(),
-        };
-        g_name.push(g.clone());
+    // Protein-group rollup over unique, quantifiable base peptides only.
+    let (mut g_name, mut g_val, mut g_status, mut g_npep) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let mut n_quantified_protein_groups = 0u64;
+    for (group, bases) in &per_group {
+        let (quantity, n_bases, status) =
+            rollup_protein_bases(bases, p.cfg.rollup, p.cfg.top_n_peptides);
+        if quantity.is_some() {
+            n_quantified_protein_groups += 1;
+        }
+        g_name.push(group.clone());
         g_val.push(quantity);
-        g_npep.push(v.len() as i32);
+        g_status.push(status.to_string());
+        g_npep.push(n_bases as i32);
     }
     let n_pg = write_table(
         p.out_protein,
         vec![
             Col::Str("protein_group".into(), g_name),
-            Col::F64("quantity".into(), g_val),
+            Col::OptF64("quantity".into(), g_val),
+            Col::Str("quant_status".into(), g_status),
             Col::I32("n_peptides".into(), g_npep),
         ],
     )?;
 
     // Optional per-fragment area export for ion-level directLFQ across runs.
+    let mut fragment_output: Option<(&str, u64)> = None;
     if let Some(fpath) = p.out_fragment {
-        let (mut f_cid, mut f_pf, mut f_z, mut f_pg, mut f_name, mut f_area) =
-            (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let (mut f_cid, mut f_pf, mut f_z, mut f_pg, mut f_name, mut f_area) = (
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
         for i in 0..ps.nrows {
-            if label[i] == "decoy" || pep_q[i] > p.cfg.q_threshold {
+            if !passes_quant_filter(&label[i], pep_q[i], p.cfg.q_threshold) {
                 continue;
             }
             if let Some(fa) = frag_areas.get(&cid[i]) {
                 for (nm, a) in fa {
+                    if !a.is_finite() || *a <= 0.0 {
+                        continue;
+                    }
                     f_cid.push(cid[i]);
                     f_pf.push(pform[i].clone());
                     f_z.push(charge[i]);
@@ -366,7 +555,7 @@ pub fn run(p: QuantParams) -> Result<(u64, u64)> {
                 }
             }
         }
-        write_table(
+        let fragment_rows = write_table(
             fpath,
             vec![
                 Col::U32("candidate_id".into(), f_cid),
@@ -377,12 +566,40 @@ pub fn run(p: QuantParams) -> Result<(u64, u64)> {
                 Col::F64("quantity".into(), f_area),
             ],
         )?;
+        fragment_output = Some((fpath, fragment_rows));
     }
 
     let elapsed = t0.elapsed().as_millis();
     let mut stats = std::collections::BTreeMap::new();
-    stats.insert("quantified_peptides".to_string(), json!(n_pep));
-    stats.insert("quantified_protein_groups".to_string(), json!(n_pg));
+    stats.insert("peptide_rows".to_string(), json!(n_pep));
+    stats.insert(
+        "quantified_peptides".to_string(),
+        json!(n_quantified_peptides),
+    );
+    stats.insert(
+        "nonquantifiable_peptides".to_string(),
+        json!(n_pep.saturating_sub(n_quantified_peptides)),
+    );
+    stats.insert("protein_group_rows".to_string(), json!(n_pg));
+    stats.insert(
+        "quantified_protein_groups".to_string(),
+        json!(n_quantified_protein_groups),
+    );
+    let report_params = json!({
+        "q_threshold": p.cfg.q_threshold,
+        "top_n_fragments": p.cfg.top_n_fragments,
+        "top_n_peptides": p.cfg.top_n_peptides,
+        "rollup": format!("{:?}", p.cfg.rollup),
+        "bound_peak": p.cfg.bound_peak,
+        "peak_fraction": p.cfg.peak_fraction,
+        "peak_grace": p.cfg.peak_grace,
+        "peak_window_mode": format!("{:?}", p.cfg.peak_window_mode),
+        "reliable_q": p.cfg.reliable_q,
+        "q_filter": format!("{:?}", p.cfg.q_filter),
+        "config_hash": p.config_hash,
+        "psms_scored": p.psms_scored,
+        "chromatograms": p.chromatograms,
+    });
     for (path, schema, rows) in [
         (p.out_peptide, artifact::PEPTIDE_QUANT, n_pep),
         (p.out_protein, artifact::PROTEIN_GROUP_QUANT, n_pg),
@@ -394,10 +611,22 @@ pub fn run(p: QuantParams) -> Result<(u64, u64)> {
             stage: "quant".to_string(),
             rows,
             content_hash: mumdia_io::hash::blake3_file(path)?,
-            params: json!({"q_threshold": p.cfg.q_threshold, "top_n_fragments": p.cfg.top_n_fragments,
-                           "rollup": format!("{:?}", p.cfg.rollup), "bound_peak": p.cfg.bound_peak,
-                           "peak_fraction": p.cfg.peak_fraction, "peak_grace": p.cfg.peak_grace,
-                           "q_filter": format!("{:?}", p.cfg.q_filter)}),
+            params: report_params.clone(),
+            stats: stats.clone(),
+            model_identity: None,
+            elapsed_ms: elapsed,
+        }
+        .write_for(path)?;
+    }
+    if let Some((path, rows)) = fragment_output {
+        ArtifactReport {
+            logical_name: artifact::FRAGMENT_QUANT.0.to_string(),
+            schema_name: artifact::FRAGMENT_QUANT.0.to_string(),
+            schema_version: artifact::FRAGMENT_QUANT.1,
+            stage: "quant".to_string(),
+            rows,
+            content_hash: mumdia_io::hash::blake3_file(path)?,
+            params: report_params,
             stats: stats.clone(),
             model_identity: None,
             elapsed_ms: elapsed,
@@ -405,7 +634,14 @@ pub fn run(p: QuantParams) -> Result<(u64, u64)> {
         .write_for(path)?;
     }
 
-    info!(peptides = n_pep, protein_groups = n_pg, elapsed_ms = elapsed, "quant: done");
+    info!(
+        peptide_rows = n_pep,
+        quantified_peptides = n_quantified_peptides,
+        protein_group_rows = n_pg,
+        quantified_protein_groups = n_quantified_protein_groups,
+        elapsed_ms = elapsed,
+        "quant: done"
+    );
     Ok((n_pep, n_pg))
 }
 
@@ -433,17 +669,26 @@ pub fn run_lfq_combine(
         let pform = t.str("peptidoform")?;
         let z = t.i32("charge")?;
         let pgc = t.str("protein_group")?;
-        let q = t.f64("quantity")?;
-        let fname = if by_fragment { Some(t.str("fragment_name")?) } else { None };
+        let q = t.opt_f64("quantity")?;
+        let fname = if by_fragment {
+            Some(t.str("fragment_name")?)
+        } else {
+            None
+        };
         for i in 0..t.nrows {
+            let Some(quantity) = q[i].filter(|v| v.is_finite() && *v > 0.0) else {
+                continue;
+            };
             let key = match &fname {
                 Some(fnm) => format!("{}|{}|{}", pform[i], z[i], fnm[i]),
                 None => format!("{}|{}", pform[i], z[i]),
             };
-            data.entry(pgc[i].clone())
+            let slot = &mut data
+                .entry(pgc[i].clone())
                 .or_default()
                 .entry(key)
-                .or_insert_with(|| vec![None; n])[ri] = Some(q[i]);
+                .or_insert_with(|| vec![None; n])[ri];
+            *slot = Some(slot.map_or(quantity, |previous| previous.max(quantity)));
         }
     }
     // Cross-run normalization: one global size factor per run, estimated from the
@@ -461,8 +706,7 @@ pub fn run_lfq_combine(
             }
         }
     }
-    let (mut c_pg, mut c_run, mut c_q, mut c_nf) =
-        (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let (mut c_pg, mut c_run, mut c_q, mut c_nf) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     for (pgname, feats) in &data {
         let mat: Vec<Vec<Option<f64>>> = feats.values().cloned().collect();
         let prof = crate::quant_lfq::lfq_profile(&mat, n);
@@ -517,7 +761,7 @@ fn size_factors(
             let mut lr: Vec<Vec<f64>> = vec![Vec::new(); n];
             for feats in data.values() {
                 for vec in feats.values() {
-                    if vec.iter().all(|x| x.map_or(false, |v| v > 0.0)) {
+                    if vec.iter().all(|x| x.is_some_and(|v| v > 0.0)) {
                         let logs: Vec<f64> = vec.iter().map(|x| x.unwrap().log2()).collect();
                         let refm = logs.iter().sum::<f64>() / n as f64;
                         for r in 0..n {
@@ -550,10 +794,20 @@ fn size_factors(
                 }
             }
             let med: Vec<f64> = (0..n)
-                .map(|r| if logs[r].is_empty() { 0.0 } else { median_sorted(&mut logs[r]) })
+                .map(|r| {
+                    if logs[r].is_empty() {
+                        0.0
+                    } else {
+                        median_sorted(&mut logs[r])
+                    }
+                })
                 .collect();
             let mut m2 = med.clone();
-            let target = if m2.is_empty() { 0.0 } else { median_sorted(&mut m2) };
+            let target = if m2.is_empty() {
+                0.0
+            } else {
+                median_sorted(&mut m2)
+            };
             (0..n).map(|r| 2f64.powf(med[r] - target)).collect()
         }
     }
@@ -577,6 +831,17 @@ fn median_sorted(v: &mut [f64]) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn quant_test_path(name: &str) -> String {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!("mumdia_quant_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        dir.join(format!("{n}_{name}"))
+            .to_string_lossy()
+            .into_owned()
+    }
 
     #[test]
     fn trapezoid_area() {
@@ -608,11 +873,15 @@ mod tests {
         // SUMMED XIC apex lands on rt=6 and the window brackets the real peak only,
         // even though the interferent is tall.
         let grid: Vec<f32> = (0..12).map(|k| k as f32).collect();
-        let real = vec![0.0f32, 0.0, 0.0, 0.0, 2.0, 6.0, 10.0, 6.0, 2.0, 0.0, 0.0, 0.0];
-        let interf = vec![0.0f32, 9.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let real = vec![
+            0.0f32, 0.0, 0.0, 0.0, 2.0, 6.0, 10.0, 6.0, 2.0, 0.0, 0.0, 0.0,
+        ];
+        let interf = vec![
+            0.0f32, 9.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+        ];
         let ch_rt = vec![grid.clone(), grid.clone()];
         let ch_int = vec![real, interf];
-        let (lo, hi, _) = peak_window(&[0, 1], &ch_rt, &ch_int, 1.0 / 6.0, 1);
+        let (lo, hi, _) = peak_window(&[0, 1], &ch_rt, &ch_int, 1.0 / 6.0, 1, None);
         // Apex rt=6 (sum=10); 1/6 threshold ~1.67. Left: idx4(2)>=thr, idx3/idx2=0
         // -> 2 consecutive misses stop at rt=4. Right: symmetric stop at rt=8.
         assert_eq!(lo, 4.0);
@@ -630,8 +899,8 @@ mod tests {
         let prof = vec![0.0f32, 0.0, 1.0, 5.0, 10.0, 5.0, 1.0, 5.0, 0.0];
         let ch_rt = vec![grid.clone()];
         let ch_int = vec![prof];
-        let (_, hi1, _) = peak_window(&[0], &ch_rt, &ch_int, 1.0 / 3.0, 1);
-        let (_, hi0, _) = peak_window(&[0], &ch_rt, &ch_int, 1.0 / 3.0, 0);
+        let (_, hi1, _) = peak_window(&[0], &ch_rt, &ch_int, 1.0 / 3.0, 1, None);
+        let (_, hi0, _) = peak_window(&[0], &ch_rt, &ch_int, 1.0 / 3.0, 0, None);
         // grace=1 bridges the idx6 dip (1.0 < 3.33) and includes idx7 (5.0) -> rt 7.
         assert_eq!(hi1, 7.0);
         // grace=0 stops at the first sub-threshold scan -> last above-threshold rt 5.
@@ -664,12 +933,21 @@ mod tests {
         data.insert("PG".into(), feats);
 
         let f = size_factors(&data, 2, NormalizeMethod::MedianRatio);
-        assert!((f[1] / f[0] - 2.0).abs() < 0.02, "expected ~2x scale, got {f:?}");
+        assert!(
+            (f[1] / f[0] - 2.0).abs() < 0.02,
+            "expected ~2x scale, got {f:?}"
+        );
         // Bulk normalizes to ratio 1; the up/down real changes are preserved.
         let bulk = (100.0 / f[0], 200.0 / f[1]);
-        assert!((bulk.0 / bulk.1 - 1.0).abs() < 1e-9, "bulk should flatten to 1");
+        assert!(
+            (bulk.0 / bulk.1 - 1.0).abs() < 1e-9,
+            "bulk should flatten to 1"
+        );
         let up = (100.0 / f[0]) / (800.0 / f[1]);
-        assert!((up - 0.25).abs() < 1e-9, "up feature run0/run1 should stay 1:4");
+        assert!(
+            (up - 0.25).abs() < 1e-9,
+            "up feature run0/run1 should stay 1:4"
+        );
     }
 
     #[test]
@@ -679,7 +957,10 @@ mod tests {
         feats.insert("f".into(), vec![Some(10.0), Some(40.0)]);
         let mut data: BTreeMap<String, BTreeMap<String, Vec<Option<f64>>>> = BTreeMap::new();
         data.insert("PG".into(), feats);
-        assert_eq!(size_factors(&data, 2, NormalizeMethod::None), vec![1.0, 1.0]);
+        assert_eq!(
+            size_factors(&data, 2, NormalizeMethod::None),
+            vec![1.0, 1.0]
+        );
     }
 
     #[test]
@@ -692,10 +973,207 @@ mod tests {
         let grid: Vec<f32> = (0..9).map(|k| k as f32).collect();
         let real = vec![0.0f32, 0.0, 0.0, 0.0, 2.0, 3.0, 2.0, 0.0, 0.0];
         let interf = vec![0.0f32, 20.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
-        let ch_rt = vec![grid.clone(), grid.clone(), grid.clone(), grid.clone(), grid.clone()];
-        let ch_int = vec![real.clone(), real.clone(), real.clone(), real.clone(), interf];
-        let (_, _, apex) = peak_window(&[0, 1, 2, 3, 4], &ch_rt, &ch_int, 1.0 / 6.0, 1);
-        assert_eq!(apex, 5.0, "apex must be the 4-fragment co-elution scan, not the lone interferent spike");
+        let ch_rt = vec![
+            grid.clone(),
+            grid.clone(),
+            grid.clone(),
+            grid.clone(),
+            grid.clone(),
+        ];
+        let ch_int = vec![
+            real.clone(),
+            real.clone(),
+            real.clone(),
+            real.clone(),
+            interf,
+        ];
+        let (_, _, apex) = peak_window(&[0, 1, 2, 3, 4], &ch_rt, &ch_int, 1.0 / 6.0, 1, None);
+        assert_eq!(
+            apex, 5.0,
+            "apex must be the 4-fragment co-elution scan, not the lone interferent spike"
+        );
+    }
+
+    #[test]
+    fn identified_apex_anchors_window_against_brighter_off_apex_peak() {
+        // All fragments share a bright interference peak at rt=1, so even the
+        // legacy co-elution detector selects it. The identification apex at rt=5
+        // must instead anchor the descent walk around the identified peak.
+        let grid: Vec<f32> = (0..10).map(|k| k as f32).collect();
+        let trace = vec![0.0f32, 50.0, 0.0, 0.0, 5.0, 10.0, 5.0, 0.0, 0.0, 0.0];
+        let ch_rt = vec![grid.clone(), grid.clone(), grid.clone()];
+        let ch_int = vec![trace.clone(), trace.clone(), trace];
+
+        let (_, _, legacy_apex) = peak_window(&[0, 1, 2], &ch_rt, &ch_int, 1.0 / 6.0, 1, None);
+        assert_eq!(legacy_apex, 1.0);
+
+        let (lo, hi, anchored_apex) =
+            peak_window(&[0, 1, 2], &ch_rt, &ch_int, 1.0 / 6.0, 1, Some(5.1));
+        assert_eq!(anchored_apex, 5.0);
+        assert!(lo > 1.0 && hi >= 5.0, "anchored window was [{lo}, {hi}]");
+
+        let (_, _, nonfinite_fallback) =
+            peak_window(&[0, 1, 2], &ch_rt, &ch_int, 1.0 / 6.0, 1, Some(f64::NAN));
+        assert_eq!(nonfinite_fallback, legacy_apex);
+    }
+
+    #[test]
+    fn fragment_summary_distinguishes_missing_zero_and_positive_traces() {
+        assert_eq!(
+            summarize_fragment_areas(None, 3),
+            (None, 0, "no_fragment_traces")
+        );
+        assert_eq!(
+            summarize_fragment_areas(Some(&[0.0, -1.0, f64::NAN]), 3),
+            (None, 0, "no_positive_fragment_area")
+        );
+        assert_eq!(
+            summarize_fragment_areas(Some(&[0.0, 2.0, 5.0, f64::INFINITY]), 3),
+            (Some(7.0), 2, "quantified")
+        );
+    }
+
+    #[test]
+    fn protein_rollup_uses_one_maximum_per_base_peptide() {
+        let mut groups = ProteinBaseQuant::new();
+        add_protein_base_quantity(&mut groups, "PG", 10, Some(12.0));
+        add_protein_base_quantity(&mut groups, "PG", 10, Some(20.0));
+        add_protein_base_quantity(&mut groups, "PG", 11, Some(5.0));
+        add_protein_base_quantity(&mut groups, "PG", 12, None);
+
+        let bases = &groups["PG"];
+        assert_eq!(bases.len(), 2, "only quantifiable unique bases count");
+        assert_eq!(
+            rollup_protein_bases(bases, RollupMethod::Sum, 3),
+            (Some(25.0), 2, "quantified")
+        );
+        assert_eq!(
+            rollup_protein_bases(bases, RollupMethod::TopNSum, 1),
+            (Some(20.0), 2, "quantified")
+        );
+
+        add_protein_base_quantity(&mut groups, "NO_QUANT", 99, None);
+        assert_eq!(
+            rollup_protein_bases(&groups["NO_QUANT"], RollupMethod::Sum, 3),
+            (None, 0, "no_quantifiable_peptide")
+        );
+    }
+
+    #[test]
+    fn quant_run_preserves_unquantifiable_ids_and_applied_window_contract() {
+        let scored = quant_test_path("scored.parquet");
+        let chrom = quant_test_path("chrom.parquet");
+        let peptide = quant_test_path("peptide_quant.parquet");
+        let protein = quant_test_path("protein_quant.parquet");
+        let fragment = quant_test_path("fragment_quant.parquet");
+        let bounds = quant_test_path("peak_bounds.parquet");
+
+        write_table(
+            &scored,
+            vec![
+                Col::U32("candidate_id".into(), vec![1, 2, 3, 4]),
+                Col::U32("base_peptide_id".into(), vec![10, 10, 11, 12]),
+                Col::Str(
+                    "peptidoform".into(),
+                    vec!["PEP1".into(), "PEP2".into(), "PEP3".into(), "PEP4".into()],
+                ),
+                Col::I32("charge".into(), vec![2, 3, 2, 2]),
+                Col::Str("label".into(), vec!["target".into(); 4]),
+                Col::Str(
+                    "protein_group".into(),
+                    vec!["PG".into(), "PG".into(), "EMPTY".into(), "ZERO".into()],
+                ),
+                Col::F64("peptide_q_value".into(), vec![0.0; 4]),
+                Col::F64("apex_rt".into(), vec![5.0; 4]),
+                Col::F64("elution_lo".into(), vec![4.0; 4]),
+                Col::F64("elution_hi".into(), vec![6.0; 4]),
+            ],
+        )
+        .unwrap();
+
+        let grid: Vec<f32> = (0..10).map(|rt| rt as f32).collect();
+        let c1a = vec![0.0f32, 50.0, 0.0, 0.0, 5.0, 10.0, 5.0, 0.0, 0.0, 0.0];
+        let c1b = vec![0.0f32, 25.0, 0.0, 0.0, 2.5, 5.0, 2.5, 0.0, 0.0, 0.0];
+        let c2 = vec![0.0f32, 0.0, 0.0, 0.0, 10.0, 20.0, 10.0, 0.0, 0.0, 0.0];
+        let zero = vec![0.0f32; 10];
+        write_table(
+            &chrom,
+            vec![
+                Col::U32("candidate_id".into(), vec![1, 1, 2, 4]),
+                Col::Str(
+                    "frag_name".into(),
+                    vec!["b2".into(), "y3".into(), "b4".into(), "y5".into()],
+                ),
+                Col::ListF32(
+                    "rt".into(),
+                    vec![grid.clone(), grid.clone(), grid.clone(), grid],
+                ),
+                Col::ListF32("intensity".into(), vec![c1a, c1b, c2, zero]),
+            ],
+        )
+        .unwrap();
+
+        let cfg = QuantConfig::default();
+        let rows = run(QuantParams {
+            psms_scored: &scored,
+            chromatograms: &chrom,
+            out_peptide: &peptide,
+            out_protein: &protein,
+            out_fragment: Some(&fragment),
+            out_peak_bounds: Some(&bounds),
+            cfg: &cfg,
+            config_hash: "test",
+        })
+        .unwrap();
+        assert_eq!(rows, (4, 3));
+
+        let pq = Table::read(&peptide).unwrap();
+        assert_eq!(pq.u32("base_peptide_id").unwrap(), vec![10, 10, 11, 12]);
+        assert_eq!(
+            pq.str("quant_status").unwrap(),
+            vec![
+                "quantified",
+                "quantified",
+                "no_fragment_traces",
+                "no_positive_fragment_area"
+            ]
+        );
+        assert_eq!(pq.i32("n_fragments_used").unwrap(), vec![2, 1, 0, 0]);
+        let quantities = pq.opt_f64("quantity").unwrap();
+        assert_eq!(quantities[0], Some(22.5));
+        assert_eq!(quantities[1], Some(30.0));
+        assert_eq!(quantities[2], None);
+        assert_eq!(quantities[3], None);
+        assert_eq!(
+            pq.opt_f64("integration_apex_rt").unwrap(),
+            vec![Some(5.0), Some(5.0), None, Some(5.0)]
+        );
+        assert_eq!(pq.opt_f64("integration_lo_rt").unwrap()[0], Some(4.0));
+        assert_eq!(pq.opt_f64("integration_hi_rt").unwrap()[0], Some(6.0));
+
+        let gq = Table::read(&protein).unwrap();
+        let names = gq.str("protein_group").unwrap();
+        let values = gq.opt_f64("quantity").unwrap();
+        let statuses = gq.str("quant_status").unwrap();
+        let counts = gq.i32("n_peptides").unwrap();
+        let by_group: HashMap<_, _> = names
+            .into_iter()
+            .enumerate()
+            .map(|(i, name)| (name, (values[i], statuses[i].clone(), counts[i])))
+            .collect();
+        assert_eq!(by_group["PG"], (Some(30.0), "quantified".to_string(), 1));
+        assert_eq!(
+            by_group["EMPTY"],
+            (None, "no_quantifiable_peptide".to_string(), 0)
+        );
+        assert_eq!(
+            by_group["ZERO"],
+            (None, "no_quantifiable_peptide".to_string(), 0)
+        );
+
+        let fq = Table::read(&fragment).unwrap();
+        assert_eq!(fq.nrows, 3, "the all-zero ion must not be exported");
+        assert!(fq.f64("quantity").unwrap().iter().all(|area| *area > 0.0));
     }
 
     #[test]
@@ -709,10 +1187,13 @@ mod tests {
         let spike = vec![0.0f32, 0.0, 10.0, 0.0, 0.0];
         let ch_rt = vec![grid.clone()];
         let ch_int = vec![spike];
-        let (lo, hi, apex) = peak_window(&[0], &ch_rt, &ch_int, 1.0 / 6.0, 1);
+        let (lo, hi, apex) = peak_window(&[0], &ch_rt, &ch_int, 1.0 / 6.0, 1, None);
         assert_eq!(apex, 4.0, "apex should be the summed-XIC max rt");
         assert!(hi > lo, "window must have nonzero width: lo={lo} hi={hi}");
         let a = trapezoid_window(&ch_rt[0], &ch_int[0], lo, hi);
-        assert!((a - 20.0).abs() < 1e-9, "expected triangle area 20, not height 10, got {a}");
+        assert!(
+            (a - 20.0).abs() < 1e-9,
+            "expected triangle area 20, not height 10, got {a}"
+        );
     }
 }

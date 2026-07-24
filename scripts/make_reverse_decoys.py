@@ -8,8 +8,9 @@ sequence (recomputed from residue masses) and intensities are copied ion-for-ion
 
 No-overlap invariant: a reversed sequence whose stripped form collides with ANY
 real target stripped sequence (palindrome, or reverse == another target) is
-re-scrambled with a per-peptide-seeded Fisher-Yates on the interior; if still
-colliding after MAX_TRIES it is dropped. A final assertion enforces
+re-scrambled with a stable per-peptide-seeded Fisher-Yates on the interior; if
+still colliding after MAX_TRIES, its target/decoy precursor pair is dropped
+together. A final assertion enforces
 decoy_stripped ∩ target_stripped == {}. The decoy peptidoform is the reversed
 sequence itself (label matches its fragments), not DECOY_<target>.
 
@@ -70,6 +71,14 @@ def splitmix(seed):
         z = ((z ^ (z>>27)) * 0x94D049BB133111EB) & 0xFFFFFFFFFFFFFFFF
         yield (z ^ (z>>31)) & 0xFFFFFFFFFFFFFFFF
 
+def stable_seed(s):
+    """Process-independent FNV-1a seed (unlike Python's randomized hash())."""
+    h = 0xCBF29CE484222325
+    for b in s.encode("utf-8"):
+        h ^= b
+        h = (h * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
+    return h
+
 def scramble(toks, gen):
     inter = toks[:-1][:]
     for i in range(len(inter)-1, 0, -1):
@@ -99,29 +108,44 @@ def main():
 
     # --- reversed decoys with no-overlap invariant ---
     rev={}; palin=0; scr=0; drop=0; invalid=0
-    for cid,t in tgt_toks.items():
+    # Different target base sequences must not collapse onto the same decoy
+    # sequence. Repeated charge/modification rows of one base sequence may reuse
+    # that sequence, which preserves the precursor-level library structure.
+    decoy_owner={}
+    for cid in sorted(tgt_toks):
+        t=tgt_toks[cid]
         if not valid(t): rev[cid]=None; invalid+=1; continue
-        gen=splitmix((hash(stripped(t)) ^ 0xD1CE) & 0xFFFFFFFFFFFFFFFF)
+        source=stripped(t)
+        gen=splitmix(stable_seed(source) ^ 0xD1CE)
         cand=reverse_keep_cterm(t); tries=0
-        while stripped(cand) in target_stripped and tries<MAX_TRIES:
+        def conflicts(sequence):
+            owner=decoy_owner.get(sequence)
+            return sequence in target_stripped or (owner is not None and owner != source)
+        while conflicts(stripped(cand)) and tries<MAX_TRIES:
             if tries==0: palin+=1
             cand=scramble(t,gen); tries+=1
-        if stripped(cand) in target_stripped: rev[cid]=None; drop+=1
+        if conflicts(stripped(cand)): rev[cid]=None; drop+=1
         else:
             if tries>0: scr+=1
             rev[cid]=cand
+            decoy_owner.setdefault(stripped(cand), source)
     print(f"reverse: target-collisions={palin} resolved-by-scramble={scr} dropped={drop} skipped-nonstd={invalid}",flush=True)
 
     off=int(tprec.candidate_id.max())+1
     keep=[cid for cid in tprec.candidate_id if rev[cid] is not None]
     keepset=set(keep)
-    dprec=tprec[tprec.candidate_id.isin(keepset)].copy()
+    # Keep target and decoy populations paired. Retaining a target whose decoy
+    # could not be generated biases the null, even when the unresolved set is
+    # small, so remove its target precursor and fragments too.
+    tprec_out=tprec[tprec.candidate_id.isin(keepset)].copy()
+    tfrag_out=tfrag[tfrag.candidate_id.isin(keepset)].copy()
+    dprec=tprec_out.copy()
     dprec['candidate_id']=dprec['candidate_id']+off
     dprec['label']='decoy'
     dprec['protein']='DECOY_'+dprec['protein'].astype(str)
     dprec['peptidoform']=dprec['candidate_id'].map(lambda nc: 'DECOY_'+to_pform(rev[nc-off]))
 
-    df=tfrag[tfrag.candidate_id.isin(keepset)].copy()
+    df=tfrag_out.copy()
     df['candidate_id']=df['candidate_id']+off
     mz=np.empty(len(df))
     ci=(df['candidate_id']-off).to_numpy(); ion=df['ion_type'].to_numpy(); ordn=df['ordinal'].to_numpy(); ch=df['frag_charge'].to_numpy()
@@ -129,10 +153,10 @@ def main():
         t=rev[ci[i]]; mz[i]=frag_mz(t,ion[i],int(ordn[i]),int(ch[i]))
     df['mz']=mz
 
-    allp=pd.concat([tprec,dprec],ignore_index=True).sort_values('precursor_mz',kind='mergesort').reset_index(drop=True)
+    allp=pd.concat([tprec_out,dprec],ignore_index=True).sort_values('precursor_mz',kind='mergesort').reset_index(drop=True)
     o2n={o:n for n,o in enumerate(allp['candidate_id'].tolist())}
     allp['candidate_id']=np.arange(len(allp),dtype=np.uint32)
-    allf=pd.concat([tfrag,df],ignore_index=True)
+    allf=pd.concat([tfrag_out,df],ignore_index=True)
     allf['candidate_id']=allf['candidate_id'].map(o2n).astype(np.uint32)
     allf=allf.sort_values('candidate_id',kind='mergesort').reset_index(drop=True)
     for c,dt in [('peptidoform_id','uint32'),('base_peptide_id','uint32'),('charge','int32'),('predicted_irt','float32'),('n_fragments','int32')]:
@@ -143,9 +167,11 @@ def main():
     ov=dstr & target_stripped
     print(f"FINAL overlap decoy-vs-target stripped = {len(ov)} (must be 0)",flush=True)
     assert len(ov)==0, f"overlap invariant violated: {len(ov)}"
+    paired={stripped(tgt_toks[cid]): stripped(rev[cid]) for cid in keep}
+    assert len(set(paired.values())) == len(paired), "distinct targets share a decoy sequence"
 
     allp.to_parquet(outp,index=False); allf.to_parquet(outf,index=False)
-    print(f"targets={len(tprec)} decoys={len(dprec)} total_prec={len(allp)} total_frag={len(allf)}",flush=True)
+    print(f"targets_in={len(tprec)} targets_out={len(tprec_out)} decoys={len(dprec)} total_prec={len(allp)} total_frag={len(allf)}",flush=True)
 
 if __name__=='__main__':
     main()

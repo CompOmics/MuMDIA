@@ -89,7 +89,12 @@ pub fn values(e: &Evidence) -> Vec<f64> {
 
     // Unweighted sum trace over the peak.
     let usum: Vec<f64> = (0..tp)
-        .map(|t| e.traces.iter().map(|tr| tr.get(t).copied().unwrap_or(0.0)).sum::<f64>())
+        .map(|t| {
+            e.traces
+                .iter()
+                .map(|tr| tr.get(t).copied().unwrap_or(0.0))
+                .sum::<f64>()
+        })
         .collect();
 
     // --- Gaussian moment-match fit of R over the peak ---
@@ -123,8 +128,16 @@ pub fn values(e: &Evidence) -> Vec<f64> {
     } else {
         (x[tp - 1] - x[0]).max(0.0)
     };
-    let fwhm_to_window_ratio = if window_span > EPS { fwhm_seconds / window_span } else { 0.0 };
-    let width_ratio_10_50 = if fwhm_seconds > EPS { width_at_10pct / fwhm_seconds } else { 0.0 };
+    let fwhm_to_window_ratio = if window_span > EPS {
+        fwhm_seconds / window_span
+    } else {
+        0.0
+    };
+    let width_ratio_10_50 = if fwhm_seconds > EPS {
+        width_at_10pct / fwhm_seconds
+    } else {
+        0.0
+    };
 
     let left_hw = (apex_rt - l50).max(0.0);
     let right_hw = (r50 - apex_rt).max(0.0);
@@ -136,7 +149,11 @@ pub fn values(e: &Evidence) -> Vec<f64> {
 
     // USP tailing: W05 / (2 f), f = apex-to-left-5% distance.
     let f_left5 = (apex_rt - l05).max(0.0);
-    let tailing_factor_usp = if f_left5 > EPS { width5 / (2.0 * f_left5) } else { 0.0 };
+    let tailing_factor_usp = if f_left5 > EPS {
+        width5 / (2.0 * f_left5)
+    } else {
+        0.0
+    };
 
     // USP asymmetry at 10%: (right - apex) / (apex - left).
     let left10 = (apex_rt - l10).max(0.0);
@@ -167,12 +184,20 @@ pub fn values(e: &Evidence) -> Vec<f64> {
 
     let apex_to_boundary_ratio = {
         let edge = r[0].max(r[tp - 1]);
-        if edge > EPS { a_peak / edge } else { 0.0 }
+        if edge > EPS {
+            a_peak / edge
+        } else {
+            0.0
+        }
     };
 
     let apex_dominance = {
         let mfull = super::mean(&r_full);
-        if mfull > EPS { a_peak / mfull } else { 0.0 }
+        if mfull > EPS {
+            a_peak / mfull
+        } else {
+            0.0
+        }
     };
 
     // --- roughness family ---
@@ -188,7 +213,11 @@ pub fn values(e: &Evidence) -> Vec<f64> {
     let rt_skewness = rt_skew;
     let rt_excess_kurtosis = rt_kurt;
     let rt_std_seconds = rt_std;
-    let mean_mode_offset = if fwhm_seconds > EPS { (centroid - apex_rt) / fwhm_seconds } else { 0.0 };
+    let mean_mode_offset = if fwhm_seconds > EPS {
+        (centroid - apex_rt) / fwhm_seconds
+    } else {
+        0.0
+    };
 
     // --- area descriptors ---
     let total_area = trapz(x, &r);
@@ -200,7 +229,11 @@ pub fn values(e: &Evidence) -> Vec<f64> {
     };
     let triangle_area_similarity = {
         let tri = 0.5 * a_peak * width5;
-        if tri > EPS { (total_area - tri).abs() / (tri + EPS) } else { 0.0 }
+        if tri > EPS {
+            (total_area - tri).abs() / (tri + EPS)
+        } else {
+            0.0
+        }
     };
 
     // --- baseline / completeness / centering ---
@@ -235,7 +268,11 @@ pub fn values(e: &Evidence) -> Vec<f64> {
     // --- integrated intensity ---
     let sum_peak: f64 = e.traces.iter().flatten().sum();
     let sum_full: f64 = e.traces_full.iter().flatten().sum();
-    let intensity_score = if sum_full > EPS { (sum_peak / sum_full).clamp(0.0, 1.0) } else { 0.0 };
+    let intensity_score = if sum_full > EPS {
+        (sum_peak / sum_full).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
     let total_xic_log = (1.0 + sum_peak.max(0.0)).ln();
 
     // --- per-fragment descriptors over matched fragments ---
@@ -258,13 +295,21 @@ pub fn values(e: &Evidence) -> Vec<f64> {
         frag_w.push(e.pred.get(fi).copied().unwrap_or(0.0).max(0.0));
     }
     let frag_fwhm_mean = super::mean(&frag_fwhm);
-    let frag_fwhm_cv = if frag_fwhm_mean > EPS { std_dev(&frag_fwhm) / frag_fwhm_mean } else { 0.0 };
+    let frag_fwhm_cv = if frag_fwhm_mean > EPS {
+        std_dev(&frag_fwhm) / frag_fwhm_mean
+    } else {
+        0.0
+    };
     let frag_apex_rt_dispersion = std_dev(&frag_apex_rt);
     let frag_apex_rt_dispersion_weighted = weighted_std(&frag_apex_rt, &frag_w);
     let frag_apex_offset_from_profile_mean = if frag_apex_rt.is_empty() {
         0.0
     } else {
-        frag_apex_rt.iter().map(|&t| (t - apex_rt).abs()).sum::<f64>() / frag_apex_rt.len() as f64
+        frag_apex_rt
+            .iter()
+            .map(|&t| (t - apex_rt).abs())
+            .sum::<f64>()
+            / frag_apex_rt.len() as f64
     };
     let frag_gaussianity_mean = super::mean(&frag_gauss);
     let frag_gaussianity_weighted = weighted_mean(&frag_gauss, &frag_w);
@@ -277,8 +322,11 @@ pub fn values(e: &Evidence) -> Vec<f64> {
     // --- RT entropy of the reference profile ---
     let reference_profile_rt_entropy_peak = entropy(&r);
     let ent_full = entropy(&r_full);
-    let reference_profile_rt_entropy_ratio =
-        if ent_full > EPS { reference_profile_rt_entropy_peak / ent_full } else { 0.0 };
+    let reference_profile_rt_entropy_ratio = if ent_full > EPS {
+        reference_profile_rt_entropy_peak / ent_full
+    } else {
+        0.0
+    };
 
     let out = vec![
         gaussian_fit_r2,
@@ -327,7 +375,9 @@ pub fn values(e: &Evidence) -> Vec<f64> {
     ];
     debug_assert_eq!(out.len(), n_names);
     // Final finiteness guard.
-    out.into_iter().map(|v| if v.is_finite() { v } else { 0.0 }).collect()
+    out.into_iter()
+        .map(|v| if v.is_finite() { v } else { 0.0 })
+        .collect()
 }
 
 // ----------------------------------------------------------------------------
@@ -341,8 +391,9 @@ fn weighted_profile(traces: &[Vec<f64>], pred: &[f64], t: usize) -> Vec<f64> {
     if t == 0 {
         return r;
     }
-    let wts: Vec<f64> =
-        (0..traces.len()).map(|i| pred.get(i).copied().unwrap_or(0.0).max(0.0)).collect();
+    let wts: Vec<f64> = (0..traces.len())
+        .map(|i| pred.get(i).copied().unwrap_or(0.0).max(0.0))
+        .collect();
     let sumw: f64 = wts.iter().sum();
     for (i, tr) in traces.iter().enumerate() {
         let w = if sumw > 0.0 { wts[i] } else { 1.0 };
@@ -369,7 +420,10 @@ fn argmax(v: &[f64]) -> usize {
 }
 
 fn max_of(v: &[f64]) -> f64 {
-    v.iter().cloned().fold(f64::MIN, f64::max).max(0.0).min(f64::MAX)
+    v.iter()
+        .cloned()
+        .fold(f64::MIN, f64::max)
+        .clamp(0.0, f64::MAX)
 }
 
 fn min_of(v: &[f64]) -> f64 {
@@ -387,7 +441,11 @@ fn std_dev(v: &[f64]) -> f64 {
     }
     let m = v.iter().sum::<f64>() / n as f64;
     let var = v.iter().map(|x| (x - m) * (x - m)).sum::<f64>() / n as f64;
-    if var > 0.0 { var.sqrt() } else { 0.0 }
+    if var > 0.0 {
+        var.sqrt()
+    } else {
+        0.0
+    }
 }
 
 fn weighted_mean(vals: &[f64], w: &[f64]) -> f64 {
@@ -404,8 +462,17 @@ fn weighted_std(vals: &[f64], w: &[f64]) -> f64 {
         return std_dev(vals);
     }
     let m = vals.iter().zip(w).map(|(v, wi)| v * wi).sum::<f64>() / sw;
-    let var = vals.iter().zip(w).map(|(v, wi)| wi * (v - m) * (v - m)).sum::<f64>() / sw;
-    if var > 0.0 { var.sqrt() } else { 0.0 }
+    let var = vals
+        .iter()
+        .zip(w)
+        .map(|(v, wi)| wi * (v - m) * (v - m))
+        .sum::<f64>()
+        / sw;
+    if var > 0.0 {
+        var.sqrt()
+    } else {
+        0.0
+    }
 }
 
 fn median(mut v: Vec<f64>) -> f64 {
@@ -414,7 +481,11 @@ fn median(mut v: Vec<f64>) -> f64 {
     }
     v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let n = v.len();
-    if n % 2 == 1 { v[n / 2] } else { 0.5 * (v[n / 2 - 1] + v[n / 2]) }
+    if n % 2 == 1 {
+        v[n / 2]
+    } else {
+        0.5 * (v[n / 2 - 1] + v[n / 2])
+    }
 }
 
 fn trapz(x: &[f64], y: &[f64]) -> f64 {
@@ -457,7 +528,11 @@ fn entropy(y: &[f64]) -> f64 {
             e -= p * p.ln();
         }
     }
-    if e.is_finite() { e.max(0.0) } else { 0.0 }
+    if e.is_finite() {
+        e.max(0.0)
+    } else {
+        0.0
+    }
 }
 
 /// Coefficient of determination of `fit` against `y`.
@@ -473,7 +548,11 @@ fn r_squared(y: &[f64], fit: &[f64]) -> f64 {
     }
     let ssr: f64 = y.iter().zip(fit).map(|(a, b)| (a - b) * (a - b)).sum();
     let r = 1.0 - ssr / sst;
-    if r.is_finite() { r } else { 0.0 }
+    if r.is_finite() {
+        r
+    } else {
+        0.0
+    }
 }
 
 fn rmse(y: &[f64], fit: &[f64]) -> f64 {
@@ -497,9 +576,18 @@ fn gaussian_fit(x: &[f64], y: &[f64]) -> (Vec<f64>, f64) {
         return (vec![0.0; n], 0.0);
     }
     let mu = x.iter().zip(&w).map(|(xi, wi)| xi * wi).sum::<f64>() / sw;
-    let var = x.iter().zip(&w).map(|(xi, wi)| wi * (xi - mu) * (xi - mu)).sum::<f64>() / sw;
+    let var = x
+        .iter()
+        .zip(&w)
+        .map(|(xi, wi)| wi * (xi - mu) * (xi - mu))
+        .sum::<f64>()
+        / sw;
     let span = x[n - 1] - x[0];
-    let floor = if span > 0.0 { (span / n as f64).max(1e-6) } else { 1e-6 };
+    let floor = if span > 0.0 {
+        (span / n as f64).max(1e-6)
+    } else {
+        1e-6
+    };
     let s = var.sqrt();
     let sigma = if s.is_finite() && s > floor { s } else { floor };
     let g: Vec<f64> = x
@@ -510,7 +598,11 @@ fn gaussian_fit(x: &[f64], y: &[f64]) -> (Vec<f64>, f64) {
         })
         .collect();
     let gg: f64 = g.iter().map(|v| v * v).sum();
-    let a = if gg > EPS { y.iter().zip(&g).map(|(yi, gi)| yi * gi).sum::<f64>() / gg } else { 0.0 };
+    let a = if gg > EPS {
+        y.iter().zip(&g).map(|(yi, gi)| yi * gi).sum::<f64>() / gg
+    } else {
+        0.0
+    };
     let fit: Vec<f64> = g.iter().map(|gi| a * gi).collect();
     (fit.clone(), r_squared(y, &fit))
 }
@@ -547,9 +639,18 @@ fn emg_improvement(x: &[f64], y: &[f64], gfit: &[f64]) -> f64 {
         return 0.0;
     }
     let mu = x.iter().zip(&w).map(|(xi, wi)| xi * wi).sum::<f64>() / sw;
-    let var = x.iter().zip(&w).map(|(xi, wi)| wi * (xi - mu) * (xi - mu)).sum::<f64>() / sw;
+    let var = x
+        .iter()
+        .zip(&w)
+        .map(|(xi, wi)| wi * (xi - mu) * (xi - mu))
+        .sum::<f64>()
+        / sw;
     let span = x[n - 1] - x[0];
-    let floor = if span > 0.0 { (span / n as f64).max(1e-6) } else { 1e-6 };
+    let floor = if span > 0.0 {
+        (span / n as f64).max(1e-6)
+    } else {
+        1e-6
+    };
     let s = var.sqrt();
     let sigma = if s.is_finite() && s > floor { s } else { floor };
 
@@ -583,7 +684,11 @@ fn emg_shape(x: &[f64], mu: f64, sigma: f64, tau: f64) -> Vec<f64> {
             let arg = (0.5 * (sigma / tau) * (sigma / tau) + (mu - t) / tau).clamp(-30.0, 30.0);
             let z = (mu - t) / (sqrt2 * sigma) + sigma / (sqrt2 * tau);
             let v = arg.exp() * erfc(z);
-            if v.is_finite() { v.max(0.0) } else { 0.0 }
+            if v.is_finite() {
+                v.max(0.0)
+            } else {
+                0.0
+            }
         })
         .collect()
 }
@@ -627,7 +732,11 @@ fn crossings(x: &[f64], y: &[f64], frac: f64) -> (f64, f64, usize) {
         if y[i - 1] < thr {
             let (y0, y1) = (y[i - 1], y[i]);
             let (x0, x1) = (x[i - 1], x[i]);
-            left = if (y1 - y0).abs() > EPS { x0 + (thr - y0) / (y1 - y0) * (x1 - x0) } else { x0 };
+            left = if (y1 - y0).abs() > EPS {
+                x0 + (thr - y0) / (y1 - y0) * (x1 - x0)
+            } else {
+                x0
+            };
             break;
         }
         i -= 1;
@@ -639,8 +748,11 @@ fn crossings(x: &[f64], y: &[f64], frac: f64) -> (f64, f64, usize) {
         if y[j + 1] < thr {
             let (y0, y1) = (y[j], y[j + 1]);
             let (x0, x1) = (x[j], x[j + 1]);
-            right =
-                if (y1 - y0).abs() > EPS { x0 + (thr - y0) / (y1 - y0) * (x1 - x0) } else { x1 };
+            right = if (y1 - y0).abs() > EPS {
+                x0 + (thr - y0) / (y1 - y0) * (x1 - x0)
+            } else {
+                x1
+            };
             break;
         }
         j += 1;
@@ -686,7 +798,11 @@ fn zigzag(y: &[f64]) -> f64 {
         s += d * d;
     }
     let v = s / (n as f64 * a * a);
-    if v.is_finite() { v } else { 0.0 }
+    if v.is_finite() {
+        v
+    } else {
+        0.0
+    }
 }
 
 /// Jaggedness: sign changes in the first difference, minus one, per interior gap.
@@ -711,7 +827,11 @@ fn jaggedness(y: &[f64]) -> f64 {
         have = true;
     }
     let v = (changes - 1).max(0) as f64 / (n as f64 - 2.0);
-    if v.is_finite() { v } else { 0.0 }
+    if v.is_finite() {
+        v
+    } else {
+        0.0
+    }
 }
 
 /// Second-derivative energy normalized by signal energy.
@@ -728,7 +848,11 @@ fn roughness2(y: &[f64]) -> f64 {
     let den: f64 = y.iter().map(|v| v * v).sum();
     if den > EPS {
         let v = num / den;
-        if v.is_finite() { v } else { 0.0 }
+        if v.is_finite() {
+            v
+        } else {
+            0.0
+        }
     } else {
         0.0
     }
@@ -748,13 +872,28 @@ fn moments(x: &[f64], y: &[f64]) -> (f64, f64, f64, f64) {
         return (x[argmax(y)], 0.0, 0.0, 0.0);
     }
     let c = x.iter().zip(&w).map(|(xi, wi)| xi * wi).sum::<f64>() / sw;
-    let m2 = x.iter().zip(&w).map(|(xi, wi)| wi * (xi - c).powi(2)).sum::<f64>() / sw;
+    let m2 = x
+        .iter()
+        .zip(&w)
+        .map(|(xi, wi)| wi * (xi - c).powi(2))
+        .sum::<f64>()
+        / sw;
     let std = if m2 > 0.0 { m2.sqrt() } else { 0.0 };
     if std <= EPS {
         return (c, std, 0.0, 0.0);
     }
-    let m3 = x.iter().zip(&w).map(|(xi, wi)| wi * (xi - c).powi(3)).sum::<f64>() / sw;
-    let m4 = x.iter().zip(&w).map(|(xi, wi)| wi * (xi - c).powi(4)).sum::<f64>() / sw;
+    let m3 = x
+        .iter()
+        .zip(&w)
+        .map(|(xi, wi)| wi * (xi - c).powi(3))
+        .sum::<f64>()
+        / sw;
+    let m4 = x
+        .iter()
+        .zip(&w)
+        .map(|(xi, wi)| wi * (xi - c).powi(4))
+        .sum::<f64>()
+        / sw;
     let skew = m3 / std.powi(3);
     let kurt = m4 / std.powi(4) - 3.0;
     (
@@ -798,7 +937,11 @@ fn maxima_stats(y: &[f64]) -> (f64, f64) {
         let (lo, hi) = if p1 < p2 { (p1, p2) } else { (p2, p1) };
         let valley = y[lo..=hi].iter().cloned().fold(f64::MAX, f64::min);
         let minpk = y[p1].min(y[p2]);
-        if minpk > EPS { ((minpk - valley) / minpk).clamp(0.0, 1.0) } else { 0.0 }
+        if minpk > EPS {
+            ((minpk - valley) / minpk).clamp(0.0, 1.0)
+        } else {
+            0.0
+        }
     };
     (count, modality)
 }
@@ -898,13 +1041,19 @@ mod tests {
     fn gaussian_peak_scores_well() {
         // A clean symmetric peak should have high Gaussian R^2 and low roughness.
         let axis: Vec<f64> = (0..21).map(|i| i as f64).collect();
-        let trace: Vec<f64> =
-            axis.iter().map(|&t| (-(t - 10.0).powi(2) / (2.0 * 3.0 * 3.0)).exp()).collect();
+        let trace: Vec<f64> = axis
+            .iter()
+            .map(|&t| (-(t - 10.0).powi(2) / (2.0 * 3.0 * 3.0)).exp())
+            .collect();
         let e = ev(axis, vec![trace], vec![1.0]);
         let v = values(&e);
         let idx = |name: &str| NAMES.iter().position(|&n| n == name).unwrap();
         assert!(v.iter().all(|x| x.is_finite()));
-        assert!(v[idx("gaussian_fit_r2")] > 0.9, "r2={}", v[idx("gaussian_fit_r2")]);
+        assert!(
+            v[idx("gaussian_fit_r2")] > 0.9,
+            "r2={}",
+            v[idx("gaussian_fit_r2")]
+        );
         assert!(v[idx("gaussian_cosine")] > 0.9);
         assert!(v[idx("fwhm_seconds")] > 0.0);
         assert!(v[idx("jaggedness")] <= 1.0 && v[idx("jaggedness")] >= 0.0);
@@ -915,9 +1064,9 @@ mod tests {
     #[test]
     fn bimodal_detected() {
         let mut trace = vec![0.0; 21];
-        for i in 0..21 {
+        for (i, value) in trace.iter_mut().enumerate().take(21) {
             let t = i as f64;
-            trace[i] = (-(t - 5.0).powi(2) / 2.0).exp() + (-(t - 15.0).powi(2) / 2.0).exp();
+            *value = (-(t - 5.0).powi(2) / 2.0).exp() + (-(t - 15.0).powi(2) / 2.0).exp();
         }
         let axis: Vec<f64> = (0..21).map(|i| i as f64).collect();
         let e = ev(axis, vec![trace], vec![1.0]);

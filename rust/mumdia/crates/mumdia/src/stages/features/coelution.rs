@@ -234,14 +234,19 @@ pub fn values(e: &Evidence) -> Vec<f64> {
         xlags.iter().filter(|&&l| l == 0.0).count() as f64 / xlags.len() as f64
     };
     let f_lag_maxabs = abs_lags.iter().cloned().fold(0.0f64, f64::max);
-    let f_lag_ent = entropy_hist(&xlags, -(MAXLAG as f64) - 0.5, MAXLAG as f64 + 0.5, (2 * MAXLAG + 1) as usize);
+    let f_lag_ent = entropy_hist(
+        &xlags,
+        -(MAXLAG as f64) - 0.5,
+        MAXLAG as f64 + 0.5,
+        (2 * MAXLAG + 1) as usize,
+    );
 
     // 29-30. reference cross-correlation (each fragment vs R)
     let mut ref_lag_abs: Vec<f64> = Vec::new();
     let mut ref_xval: Vec<f64> = Vec::new();
     if has_traces {
-        for i in 0..k {
-            let (lag, xv) = best_xcorr(&traces[i], r, MAXLAG);
+        for trace in traces.iter().take(k) {
+            let (lag, xv) = best_xcorr(trace, r, MAXLAG);
             ref_lag_abs.push((lag as f64).abs());
             ref_xval.push(xv);
         }
@@ -261,8 +266,8 @@ pub fn values(e: &Evidence) -> Vec<f64> {
         let t = r.len();
         let mut s = vec![0.0f64; t];
         if sum_set.is_empty() {
-            for i in 0..k {
-                accumulate(&mut s, &traces[i]);
+            for trace in traces.iter().take(k) {
+                accumulate(&mut s, trace);
             }
         } else {
             for &i in sum_set {
@@ -273,21 +278,25 @@ pub fn values(e: &Evidence) -> Vec<f64> {
     } else {
         Vec::new()
     };
-    let f_sum_corr = if s_trace.is_empty() { 0.0 } else { pearson(&s_trace, r) };
+    let f_sum_corr = if s_trace.is_empty() {
+        0.0
+    } else {
+        pearson(&s_trace, r)
+    };
 
     // 32-33. leave-one-out ref correlation: R^{-f} = R - pred[f]*traces[f]
     let mut loo: Vec<f64> = Vec::new();
     if has_traces {
         let t = r.len();
-        for i in 0..k {
+        for (i, trace) in traces.iter().enumerate().take(k) {
             let mut rm = r.clone();
             let lf = e.pred[i];
             for (idx, val) in rm.iter_mut().enumerate().take(t) {
-                if idx < traces[i].len() {
-                    *val -= lf * traces[i][idx];
+                if idx < trace.len() {
+                    *val -= lf * trace[idx];
                 }
             }
-            loo.push(pearson(&traces[i], &rm));
+            loo.push(pearson(trace, &rm));
         }
     }
     let f_loo_mean = mean_all(&loo);
@@ -320,10 +329,18 @@ pub fn values(e: &Evidence) -> Vec<f64> {
 
     // 36-37. b x y cross coelution and lag
     let f_by = if by_cnt > 0.0 { by_sum / by_cnt } else { 0.0 };
-    let f_by_lag = if by_cnt > 0.0 { by_lag_sum / by_cnt } else { 0.0 };
+    let f_by_lag = if by_cnt > 0.0 {
+        by_lag_sum / by_cnt
+    } else {
+        0.0
+    };
 
     // 38. charge cross coelution
-    let f_chg = if chg_cnt > 0.0 { chg_sum / chg_cnt } else { 0.0 };
+    let f_chg = if chg_cnt > 0.0 {
+        chg_sum / chg_cnt
+    } else {
+        0.0
+    };
 
     let out = vec![
         f_mean,
@@ -495,8 +512,7 @@ fn weighted_reference(traces: &[Vec<f64>], pred: &[f64], t: usize) -> Vec<f64> {
 fn sort_idx_desc(v: &[f64]) -> Vec<usize> {
     let mut idx: Vec<usize> = (0..v.len()).collect();
     idx.sort_by(|&a, &b| {
-        v[b]
-            .partial_cmp(&v[a])
+        v[b].partial_cmp(&v[a])
             .unwrap_or(std::cmp::Ordering::Equal)
             .then(a.cmp(&b))
     });
@@ -554,12 +570,12 @@ fn subset_pair_mean(corr: &[Vec<f64>], idx: &[usize]) -> f64 {
 /// Shannon entropy (nats) of a histogram of `v` over `nbins` uniform bins in
 /// [lo, hi]. Values outside the range are clamped to the edge bins.
 fn entropy_hist(v: &[f64], lo: f64, hi: f64, nbins: usize) -> f64 {
-    if v.is_empty() || nbins == 0 || !(hi > lo) {
+    if v.is_empty() || nbins == 0 || hi.partial_cmp(&lo) != Some(std::cmp::Ordering::Greater) {
         return 0.0;
     }
     let mut counts = vec![0.0f64; nbins];
     let width = (hi - lo) / nbins as f64;
-    if !(width > 0.0) {
+    if width.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater) {
         return 0.0;
     }
     for &x in v {

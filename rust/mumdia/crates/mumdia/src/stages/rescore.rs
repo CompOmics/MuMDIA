@@ -40,6 +40,12 @@ pub struct RescoreParams<'a> {
 
 pub fn run(p: RescoreParams) -> Result<u64> {
     let t0 = Instant::now();
+    if p.competed.is_empty() {
+        anyhow::bail!("rescore requires at least one competed input");
+    }
+    if p.cfg.folds < 2 {
+        anyhow::bail!("rescore.folds must be >= 2 for out-of-fold scoring");
+    }
 
     // Concatenate competed inputs.
     let (mut cid, mut label, mut base, mut pform, mut protein, mut charge, mut prelim) = (
@@ -53,16 +59,23 @@ pub fn run(p: RescoreParams) -> Result<u64> {
     );
     let mut feats: Vec<Vec<f64>> = Vec::new();
     let mut mz: Vec<f64> = Vec::new();
+    let mut apex_rt: Vec<f64> = Vec::new();
+    let mut elution_lo: Vec<f64> = Vec::new();
+    let mut elution_hi: Vec<f64> = Vec::new();
     // `source` = index of the competed input each PSM came from (0..N). For a
     // single-run rescore this is all-zero; for an experiment-wide rescore over
     // several files it lets quant map each scored PSM back to its run, and it is
     // why the Mokapot PIN below keys on a unique row index rather than
     // candidate_id (which is the library index and repeats across runs).
     let mut source: Vec<u32> = Vec::new();
-    // Feature list is taken from the schema companion of the first input so the
-    // classifier input matches the set the features stage produced.
-    let feat_names = FeatureSchema::read(&p.competed[0])?.feature_columns;
+    // Feature list is taken from the schema companion of the first input. Every
+    // subsequent companion must match exactly: silently concatenating differing
+    // feature order/sets would train and score on semantically misaligned columns.
+    let expected_schema = FeatureSchema::read(&p.competed[0])?;
+    let feat_names = expected_schema.feature_columns.clone();
     for (src, path) in p.competed.iter().enumerate() {
+        let actual_schema = FeatureSchema::read(path)?;
+        validate_feature_schema(&expected_schema, &actual_schema, path)?;
         let t = Table::read(path)?;
         let c = t.u32("candidate_id")?;
         let l = t.str("label")?;
@@ -72,7 +85,10 @@ pub fn run(p: RescoreParams) -> Result<u64> {
         let z = t.f64("charge")?; // carried as an f64 feature
         let pl = t.f64("prelim_score")?;
         let pm = t.f64("precursor_mz")?;
-        let fcols: Vec<Vec<f64>> = feat_names.iter().map(|n| t.f64(n).unwrap()).collect();
+        let ar = t.f64("apex_rt")?;
+        let elo = t.f64("elution_lo")?;
+        let ehi = t.f64("elution_hi")?;
+        let fcols: Vec<Vec<f64>> = feat_names.iter().map(|n| t.f64(n)).collect::<Result<_>>()?;
         for i in 0..t.nrows {
             cid.push(c[i]);
             label.push(l[i].clone());
@@ -82,6 +98,9 @@ pub fn run(p: RescoreParams) -> Result<u64> {
             charge.push(z[i] as i32);
             prelim.push(pl[i]);
             mz.push(pm[i]);
+            apex_rt.push(ar[i]);
+            elution_lo.push(elo[i]);
+            elution_hi.push(ehi[i]);
             source.push(src as u32);
             feats.push((0..feat_names.len()).map(|k| fcols[k][i]).collect());
         }
@@ -90,6 +109,33 @@ pub fn run(p: RescoreParams) -> Result<u64> {
     let is_decoy: Vec<bool> = label.iter().map(|l| l == "decoy").collect();
     let (is_entrapment, is_real_target) = classify_entrapment(p.cfg, &protein, &is_decoy);
     let n = cid.len();
+    if n > 0 {
+        let n_decoys = is_decoy.iter().filter(|&&v| v).count();
+        let n_targets = n - n_decoys;
+        if n_targets == 0 || n_decoys == 0 {
+            anyhow::bail!(
+                "rescore requires both target and decoy PSMs for valid FDR \
+                 (targets={n_targets}, decoys={n_decoys})"
+            );
+        }
+        for (row, values) in feats.iter().enumerate() {
+            if let Some((feature, value)) = values
+                .iter()
+                .enumerate()
+                .find(|(_, value)| !value.is_finite())
+            {
+                anyhow::bail!(
+                    "rescore input contains non-finite feature '{}' at flat row {row}: {value}",
+                    feat_names[feature]
+                );
+            }
+            if !prelim[row].is_finite() || !mz[row].is_finite() {
+                anyhow::bail!(
+                    "rescore input contains non-finite prelim_score/precursor_mz at flat row {row}"
+                );
+            }
+        }
+    }
     info!(psms = n, "rescore: loaded competed PSMs");
 
     // Track the path actually taken so the report reflects reality rather than a
@@ -99,25 +145,51 @@ pub fn run(p: RescoreParams) -> Result<u64> {
     let mut qmode = QMode::Decoy;
 
     let scores = if n == 0 {
+        classifier_used = "not_run_empty";
+        model_identity = "none-empty-input".to_string();
         Vec::new()
     } else {
         match p.cfg.classifier {
-            RescorerKind::Mokapot => match run_pin_sidecar(&p, "mokapot_worker.py", &feat_names, &cid, &label, &pform, &protein, &mz, &feats) {
+            RescorerKind::Mokapot => match run_pin_sidecar(
+                &p,
+                "mokapot_worker.py",
+                &feat_names,
+                &cid,
+                &label,
+                &pform,
+                &protein,
+                &mz,
+                &feats,
+            ) {
                 Ok(s) => {
                     info!("rescore: using Mokapot scores");
                     classifier_used = "mokapot";
-                    model_identity = "mokapot".to_string();
+                    let estimator =
+                        std::env::var("MUMDIA_RESCORE_MODEL").unwrap_or_else(|_| "nn".to_string());
+                    model_identity = format!("mokapot-{estimator}");
                     s
                 }
                 Err(e) => {
                     if p.cfg.strict {
-                        anyhow::bail!("rescore: Mokapot sidecar failed ({e}) and rescore.strict=true");
+                        anyhow::bail!(
+                            "rescore: Mokapot sidecar failed ({e}) and rescore.strict=true"
+                        );
                     }
                     warn!("rescore: Mokapot failed ({e}); falling back to native_tda");
                     native_scores(&p, &feats, &is_decoy, &base, &prelim)
                 }
             },
-            RescorerKind::NnTorch => match run_pin_sidecar(&p, "nn_rescore_worker.py", &feat_names, &cid, &label, &pform, &protein, &mz, &feats) {
+            RescorerKind::NnTorch => match run_pin_sidecar(
+                &p,
+                "nn_rescore_worker.py",
+                &feat_names,
+                &cid,
+                &label,
+                &pform,
+                &protein,
+                &mz,
+                &feats,
+            ) {
                 Ok(s) => {
                     info!("rescore: using PyTorch NN sidecar scores");
                     classifier_used = "nn_torch";
@@ -126,7 +198,9 @@ pub fn run(p: RescoreParams) -> Result<u64> {
                 }
                 Err(e) => {
                     if p.cfg.strict {
-                        anyhow::bail!("rescore: NnTorch sidecar failed ({e}) and rescore.strict=true");
+                        anyhow::bail!(
+                            "rescore: NnTorch sidecar failed ({e}) and rescore.strict=true"
+                        );
                     }
                     warn!("rescore: NnTorch failed ({e}); falling back to native_tda");
                     native_scores(&p, &feats, &is_decoy, &base, &prelim)
@@ -159,9 +233,20 @@ pub fn run(p: RescoreParams) -> Result<u64> {
                     );
                     native_scores(&p, &feats, &is_decoy, &base, &prelim)
                 } else if p.cfg.python.is_some() {
-                    match run_entrapment_gbm(&p, &feat_names, &cid, &base, &is_entrapment, &is_decoy, &feats) {
+                    match run_entrapment_gbm(
+                        &p,
+                        &feat_names,
+                        &cid,
+                        &base,
+                        &is_entrapment,
+                        &is_decoy,
+                        &feats,
+                    ) {
                         Ok(s) => {
-                            info!(entrapment_psms = n_ent, "rescore: using entrapment GBM sidecar scores");
+                            info!(
+                                entrapment_psms = n_ent,
+                                "rescore: using entrapment GBM sidecar scores"
+                            );
                             classifier_used = "entrapment_gbm";
                             model_identity = "entrapment-gbm-sidecar-v1".to_string();
                             qmode = QMode::Entrapment;
@@ -191,23 +276,45 @@ pub fn run(p: RescoreParams) -> Result<u64> {
             }
         }
     };
+    if let Some((row, score)) = scores
+        .iter()
+        .enumerate()
+        .find(|(_, score)| !score.is_finite())
+    {
+        anyhow::bail!("rescore produced non-finite score at flat row {row}: {score}");
+    }
 
     // PSM-level q-values against the selected null.
     let psm_q = match qmode {
         QMode::Decoy => {
-            let sd: Vec<(f64, bool)> = scores.iter().cloned().zip(is_decoy.iter().cloned()).collect();
+            let sd: Vec<(f64, bool)> = scores
+                .iter()
+                .cloned()
+                .zip(is_decoy.iter().cloned())
+                .collect();
             target_decoy_q(&sd)
         }
-        QMode::Entrapment => {
-            entrapment_q(&scores, &is_entrapment, &is_real_target, p.cfg.entrapment_ratio)
-        }
+        QMode::Entrapment => entrapment_q(
+            &scores,
+            &is_entrapment,
+            &is_real_target,
+            p.cfg.entrapment_ratio,
+        ),
     };
 
     // Peptide-level q: reduce to best PSM per base peptide, q on that set, map
     // back. Protein-group q: same over the protein-accession-set string (the MVP
     // grouping; decoys carry a DECOY_ prefix). Full parsimony/razor is a later
     // option (PLAN.md Stage G). Group score = best member PSM score.
-    let peptide_q = grouped_q(&base, &scores, &is_decoy, &is_entrapment, &is_real_target, qmode, p.cfg.entrapment_ratio);
+    let peptide_q = grouped_q(
+        &base,
+        &scores,
+        &is_decoy,
+        &is_entrapment,
+        &is_real_target,
+        qmode,
+        p.cfg.entrapment_ratio,
+    );
     // Intern the protein-accession-set strings to dense u32 ids once (first-seen
     // order) so protein-group grouping runs over integers exactly like the peptide
     // path, avoiding hashing/cloning ~574k strings per grouped_q lookup. The map is
@@ -221,7 +328,15 @@ pub fn run(p: RescoreParams) -> Result<u64> {
         }
         ids
     };
-    let pg_q = grouped_q(&protein_id, &scores, &is_decoy, &is_entrapment, &is_real_target, qmode, p.cfg.entrapment_ratio);
+    let pg_q = grouped_q(
+        &protein_id,
+        &scores,
+        &is_decoy,
+        &is_entrapment,
+        &is_real_target,
+        qmode,
+        p.cfg.entrapment_ratio,
+    );
     // Multi-context q-values (PLAN.md Section 8 rescore; comment.md C1/C3). The
     // pooled per-PSM q is `experiment_psm_q`; `run_psm_q` re-runs TDA within each
     // source (run) so a per-run quant/report gets a real per-run FDR rather than the
@@ -233,7 +348,8 @@ pub fn run(p: RescoreParams) -> Result<u64> {
     // Single-run (source all-zero) => equals `q_value`. Sorted (BTree) source
     // iteration keeps it deterministic; no floats are summed.
     let run_psm_q = {
-        let mut by_src: std::collections::BTreeMap<u32, Vec<usize>> = std::collections::BTreeMap::new();
+        let mut by_src: std::collections::BTreeMap<u32, Vec<usize>> =
+            std::collections::BTreeMap::new();
         for (i, &s) in source.iter().enumerate() {
             by_src.entry(s).or_default().push(i);
         }
@@ -241,7 +357,8 @@ pub fn run(p: RescoreParams) -> Result<u64> {
         for (_s, idxs) in by_src {
             let q = match qmode {
                 QMode::Decoy => {
-                    let sd: Vec<(f64, bool)> = idxs.iter().map(|&i| (scores[i], is_decoy[i])).collect();
+                    let sd: Vec<(f64, bool)> =
+                        idxs.iter().map(|&i| (scores[i], is_decoy[i])).collect();
                     target_decoy_q(&sd)
                 }
                 QMode::Entrapment => {
@@ -268,7 +385,15 @@ pub fn run(p: RescoreParams) -> Result<u64> {
         }
         ids
     };
-    let precursor_q = grouped_q(&precursor_id, &scores, &is_decoy, &is_entrapment, &is_real_target, qmode, p.cfg.entrapment_ratio);
+    let precursor_q = grouped_q(
+        &precursor_id,
+        &scores,
+        &is_decoy,
+        &is_entrapment,
+        &is_real_target,
+        qmode,
+        p.cfg.entrapment_ratio,
+    );
 
     // Reported IDs: real targets in entrapment mode (spike-in excluded), else all
     // non-decoy targets.
@@ -277,7 +402,9 @@ pub fn run(p: RescoreParams) -> Result<u64> {
         QMode::Entrapment => is_real_target.clone(),
     };
 
-    let n_psm_1 = (0..n).filter(|&i| is_reported[i] && psm_q[i] <= 0.01).count();
+    let n_psm_1 = (0..n)
+        .filter(|&i| is_reported[i] && psm_q[i] <= 0.01)
+        .count();
     let n_pep_1 = {
         let mut seen = std::collections::HashSet::new();
         for i in 0..n {
@@ -327,6 +454,9 @@ pub fn run(p: RescoreParams) -> Result<u64> {
             // `protein` feeds two columns; clone once here and move the original below.
             Col::Str("protein".into(), protein.clone()),
             Col::U32("base_peptide_id".into(), base),
+            Col::F64("apex_rt".into(), apex_rt),
+            Col::F64("elution_lo".into(), elution_lo),
+            Col::F64("elution_hi".into(), elution_hi),
             Col::F64("score".into(), scores),
             Col::F64("q_value".into(), psm_q),
             Col::F64("peptide_q_value".into(), peptide_q),
@@ -355,7 +485,10 @@ pub fn run(p: RescoreParams) -> Result<u64> {
     stats.insert("target_protein_groups_at_1pct".to_string(), json!(n_pg_1));
     stats.insert("target_precursors_at_1pct".to_string(), json!(n_prec_1));
     if qmode == QMode::Entrapment {
-        stats.insert("entrapment_ratio".to_string(), json!(p.cfg.entrapment_ratio));
+        stats.insert(
+            "entrapment_ratio".to_string(),
+            json!(p.cfg.entrapment_ratio),
+        );
         stats.insert("entrapment_peptides_at_1pct".to_string(), json!(n_entrap_1));
     }
     ArtifactReport {
@@ -365,7 +498,17 @@ pub fn run(p: RescoreParams) -> Result<u64> {
         stage: "rescore".to_string(),
         rows,
         content_hash: mumdia_io::hash::blake3_file(p.out)?,
-        params: json!({"classifier": classifier_used, "folds": p.cfg.folds, "num_iter": p.cfg.num_iter, "train_fdr": p.cfg.train_fdr}),
+        params: json!({
+            "classifier": classifier_used,
+            "classifier_requested": format!("{:?}", p.cfg.classifier),
+            "strict": p.cfg.strict,
+            "folds": p.cfg.folds,
+            "num_iter": p.cfg.num_iter,
+            "train_fdr": p.cfg.train_fdr,
+            "feature_schema_id": expected_schema.schema_id,
+            "competed_inputs": p.competed,
+            "config_hash": p.config_hash,
+        }),
         stats,
         model_identity: Some(model_identity),
         elapsed_ms: elapsed,
@@ -380,6 +523,29 @@ pub fn run(p: RescoreParams) -> Result<u64> {
         "rescore: done"
     );
     Ok(rows)
+}
+
+/// Reject a concatenation whose feature companions differ in either identity or
+/// ordered feature columns. Both checks are intentional: the ID catches a
+/// declared contract mismatch, while the explicit column comparison protects
+/// against a malformed or manually edited companion.
+fn validate_feature_schema(
+    expected: &FeatureSchema,
+    actual: &FeatureSchema,
+    path: &str,
+) -> Result<()> {
+    if expected.schema_id != actual.schema_id || expected.feature_columns != actual.feature_columns
+    {
+        anyhow::bail!(
+            "rescore feature schema mismatch for '{path}': expected id '{}' columns {:?}, \
+             found id '{}' columns {:?}",
+            expected.schema_id,
+            expected.feature_columns,
+            actual.schema_id,
+            actual.feature_columns
+        );
+    }
+    Ok(())
 }
 
 /// Native semi-supervised rescorer scores.
@@ -426,7 +592,7 @@ fn classify_entrapment(
         let is_ent = match marker {
             Some(m) => {
                 protein[i].contains(m)
-                    && exclude.map_or(true, |e| !protein[i].contains(e))
+                    && exclude.is_none_or(|e| !protein[i].contains(e))
                     && !contaminants.iter().any(|c| protein[i].contains(c.as_str()))
             }
             None => false,
@@ -450,13 +616,28 @@ fn grouped_q<K: std::hash::Hash + Eq + Clone>(
     ratio: f64,
 ) -> Vec<f64> {
     let n = scores.len();
-    let mut best: HashMap<K, (f64, bool, bool, bool)> = HashMap::new();
+    // Keep the winning row index with each picked group. Exact target/null score
+    // ties go to the active null (decoy or entrapment) so input row order cannot
+    // make the accepted set anti-conservative.
+    let mut best: HashMap<K, (f64, bool, bool, bool, usize)> = HashMap::new();
     for i in 0..n {
-        let e = best
-            .entry(keys[i].clone())
-            .or_insert((f64::NEG_INFINITY, is_decoy[i], is_entrapment[i], is_real[i]));
-        if scores[i] > e.0 {
-            *e = (scores[i], is_decoy[i], is_entrapment[i], is_real[i]);
+        let e = best.entry(keys[i].clone()).or_insert((
+            f64::NEG_INFINITY,
+            is_decoy[i],
+            is_entrapment[i],
+            is_real[i],
+            i,
+        ));
+        let incoming_null = match qmode {
+            QMode::Decoy => is_decoy[i],
+            QMode::Entrapment => is_entrapment[i],
+        };
+        let current_null = match qmode {
+            QMode::Decoy => e.1,
+            QMode::Entrapment => e.2,
+        };
+        if scores[i] > e.0 || (scores[i] == e.0 && incoming_null && !current_null) {
+            *e = (scores[i], is_decoy[i], is_entrapment[i], is_real[i], i);
         }
     }
     let ks: Vec<K> = best.keys().cloned().collect();
@@ -473,23 +654,14 @@ fn grouped_q<K: std::hash::Hash + Eq + Clone>(
         }
     };
     let qmap: HashMap<K, f64> = ks.into_iter().zip(qv).collect();
-    // Assign the group q ONLY to the winning (max-score) row of each group. A
+    // Assign the group q ONLY to the picked winning row of each group. A
     // losing sibling (a lower-scoring charge/mod variant, which may itself be a
     // false target) must not inherit the winner's low q; it gets 1.0. The
     // report/counts dedup by key on the winner, so peptide/PG counts are
     // unchanged, but per-PSM peptide_q/pg_q no longer propagate to losers.
-    let mut winner: HashMap<K, (f64, usize)> = HashMap::new();
-    for i in 0..n {
-        let e = winner
-            .entry(keys[i].clone())
-            .or_insert((f64::NEG_INFINITY, i));
-        if scores[i] > e.0 {
-            *e = (scores[i], i);
-        }
-    }
     let mut out = vec![1.0f64; n];
-    for (k, (_, i)) in winner {
-        out[i] = qmap[&k];
+    for (key, (_, _, _, _, row)) in best {
+        out[row] = qmap[&key];
     }
     out
 }
@@ -525,11 +697,20 @@ fn run_entrapment_gbm(
         Col::U32("row_id".into(), (0..cid.len()).map(|i| i as u32).collect()),
         Col::U32("candidate_id".into(), cid.to_vec()),
         Col::U32("base_peptide_id".into(), base.to_vec()),
-        Col::I32("is_entrapment".into(), is_entrapment.iter().map(|&b| b as i32).collect()),
-        Col::I32("is_decoy".into(), is_decoy.iter().map(|&b| b as i32).collect()),
+        Col::I32(
+            "is_entrapment".into(),
+            is_entrapment.iter().map(|&b| b as i32).collect(),
+        ),
+        Col::I32(
+            "is_decoy".into(),
+            is_decoy.iter().map(|&b| b as i32).collect(),
+        ),
     ];
     for (fi, name) in feat_names.iter().enumerate() {
-        cols.push(Col::F64(name.clone(), (0..cid.len()).map(|i| feats[i][fi]).collect()));
+        cols.push(Col::F64(
+            name.clone(),
+            (0..cid.len()).map(|i| feats[i][fi]).collect(),
+        ));
     }
     write_table(&inp, cols)?;
 
@@ -548,11 +729,7 @@ fn run_entrapment_gbm(
     let t = Table::read(&outp)?;
     let orid = t.u32("row_id")?;
     let osc = t.f64("score")?;
-    let map: HashMap<u32, f64> = orid.into_iter().zip(osc).collect();
-    let min = map.values().cloned().fold(f64::INFINITY, f64::min);
-    Ok((0..cid.len())
-        .map(|i| *map.get(&(i as u32)).unwrap_or(&(min - 1.0)))
-        .collect())
+    align_sidecar_scores(&orid, &osc, cid.len(), "entrapment_worker")
 }
 
 /// Run a PIN-contract Python rescorer sidecar (`mokapot_worker.py` or
@@ -572,11 +749,9 @@ fn run_pin_sidecar(
     feats: &[Vec<f64>],
 ) -> Result<Vec<f64>> {
     use std::fmt::Write as _;
-    let python = p
-        .cfg
-        .python
-        .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("classifier sidecar {script_name} requires rescore.python"))?;
+    let python = p.cfg.python.as_deref().ok_or_else(|| {
+        anyhow::anyhow!("classifier sidecar {script_name} requires rescore.python")
+    })?;
     std::fs::create_dir_all(p.work_dir).ok();
     let pin = format!("{}/rescore.pin", p.work_dir);
     let outp = format!("{}/rescore_sidecar_out.parquet", p.work_dir);
@@ -594,6 +769,7 @@ fn run_pin_sidecar(
     for i in 0..cid.len() {
         let lab = if label[i] == "decoy" { -1 } else { 1 };
         write!(s, "psm_{}\t{}\t{}\t{:.5}\t{:.5}\t", i, lab, i, mz[i], mz[i]).ok();
+        #[allow(clippy::needless_range_loop)] // parallel index into feats[i] bounded by feat_names
         for fi in 0..feat_names.len() {
             write!(s, "{:.6}\t", feats[i][fi]).ok();
         }
@@ -620,12 +796,124 @@ fn run_pin_sidecar(
     }
 
     // The worker echoes the PIN's SpecId tail as `candidate_id`, which here is the
-    // row index i. Map scores back by row index; a missing row (should not happen
-    // now the worker scores all PSMs) gets the worst score.
+    // flat row index. Exact, unique, finite coverage is part of the classifier
+    // contract: silently assigning a worst score to missing rows changes the
+    // trained population and can invalidate sensitivity/FDR comparisons.
     let t = Table::read(&outp)?;
     let orow = t.u32("candidate_id")?;
     let osc = t.f64("score")?;
-    let map: HashMap<u32, f64> = orow.into_iter().zip(osc).collect();
-    let worst = map.values().cloned().fold(f64::INFINITY, f64::min) - 1.0;
-    Ok((0..cid.len() as u32).map(|i| *map.get(&i).unwrap_or(&worst)).collect())
+    align_sidecar_scores(&orow, &osc, cid.len(), script_name)
+}
+
+/// Validate and align a sidecar's `(flat_row_id, score)` response. Every input
+/// row must occur exactly once, there may be no extras, and all scores must be
+/// finite. This is shared by PIN and entrapment sidecars.
+fn align_sidecar_scores(
+    row_ids: &[u32],
+    scores: &[f64],
+    expected_rows: usize,
+    sidecar: &str,
+) -> Result<Vec<f64>> {
+    if row_ids.len() != scores.len() || row_ids.len() != expected_rows {
+        anyhow::bail!(
+            "{sidecar} output coverage mismatch: expected {expected_rows} rows, \
+             got {} ids and {} scores",
+            row_ids.len(),
+            scores.len()
+        );
+    }
+    let mut aligned = vec![0.0f64; expected_rows];
+    let mut seen = vec![false; expected_rows];
+    for (&row_id, &score) in row_ids.iter().zip(scores) {
+        let row = row_id as usize;
+        if row >= expected_rows {
+            anyhow::bail!(
+                "{sidecar} returned out-of-range row id {row_id}; expected 0..{expected_rows}"
+            );
+        }
+        if seen[row] {
+            anyhow::bail!("{sidecar} returned duplicate row id {row_id}");
+        }
+        if !score.is_finite() {
+            anyhow::bail!("{sidecar} returned non-finite score for row id {row_id}: {score}");
+        }
+        seen[row] = true;
+        aligned[row] = score;
+    }
+    if let Some(missing) = seen.iter().position(|present| !present) {
+        anyhow::bail!("{sidecar} did not return a score for row id {missing}");
+    }
+    Ok(aligned)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn competed_feature_schema_must_match_id_and_ordered_columns() {
+        let expected = FeatureSchema {
+            feature_columns: vec!["a".into(), "b".into()],
+            schema_id: "schema-a".into(),
+        };
+        let same = FeatureSchema {
+            feature_columns: vec!["a".into(), "b".into()],
+            schema_id: "schema-a".into(),
+        };
+        assert!(validate_feature_schema(&expected, &same, "same.parquet").is_ok());
+
+        let reordered = FeatureSchema {
+            feature_columns: vec!["b".into(), "a".into()],
+            schema_id: "schema-a".into(),
+        };
+        assert!(validate_feature_schema(&expected, &reordered, "reordered.parquet").is_err());
+
+        let different_id = FeatureSchema {
+            feature_columns: vec!["a".into(), "b".into()],
+            schema_id: "schema-b".into(),
+        };
+        assert!(validate_feature_schema(&expected, &different_id, "id.parquet").is_err());
+    }
+
+    #[test]
+    fn sidecar_scores_require_exact_unique_finite_coverage() {
+        assert_eq!(
+            align_sidecar_scores(&[1, 0], &[2.0, 1.0], 2, "test").unwrap(),
+            vec![1.0, 2.0]
+        );
+        assert!(align_sidecar_scores(&[0], &[1.0], 2, "test").is_err());
+        assert!(align_sidecar_scores(&[0, 0], &[1.0, 2.0], 2, "test").is_err());
+        assert!(align_sidecar_scores(&[0, 2], &[1.0, 2.0], 2, "test").is_err());
+        assert!(align_sidecar_scores(&[0, 1], &[1.0, f64::NAN], 2, "test").is_err());
+    }
+
+    #[test]
+    fn picked_peptide_exact_tie_is_won_by_decoy() {
+        // The target is deliberately first: row order must not win an exact
+        // paired target/decoy tie.
+        let mut keys = vec![0u32, 0u32];
+        let mut scores = vec![5.0, 5.0];
+        let mut decoys = vec![false, true];
+        let mut entrapments = vec![false, false];
+        let mut real = vec![true, false];
+        for key in 1..=100 {
+            keys.push(key);
+            scores.push(4.0 - key as f64 * 0.01);
+            decoys.push(false);
+            entrapments.push(false);
+            real.push(true);
+        }
+
+        let q = grouped_q(
+            &keys,
+            &scores,
+            &decoys,
+            &entrapments,
+            &real,
+            QMode::Decoy,
+            1.0,
+        );
+        assert_eq!(q[0], 1.0, "tied target must be the losing sibling");
+        assert!(q[1] < 0.05, "tied decoy should own the picked-group q");
+    }
 }

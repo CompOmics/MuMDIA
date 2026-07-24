@@ -18,11 +18,11 @@ use serde_json::json;
 use tracing::info;
 
 use crate::fdr::{count_targets_at_q, ln_factorial, target_decoy_q};
+use crate::index::Library;
 use crate::matchers::fragindex::{FragIndex, SeedScratch};
+use crate::spectra::load_ms2;
 use mumdia_core::types::Ms2Scan;
 use rayon::prelude::*;
-use crate::index::Library;
-use crate::spectra::load_ms2;
 
 pub struct SearchSeedParams<'a> {
     pub ms2: &'a str,
@@ -46,7 +46,11 @@ pub fn run(p: SearchSeedParams) -> Result<u64> {
     let t0 = Instant::now();
     let lib = Library::load(p.library_precursors, p.library_fragments, p.bucket_size)?;
     let scans = load_ms2(p.ms2)?;
-    info!(candidates = lib.n_candidates(), scans = scans.len(), "search-seed: loaded");
+    info!(
+        candidates = lib.n_candidates(),
+        scans = scans.len(),
+        "search-seed: loaded"
+    );
 
     // fragindex backend, built once at the seed's fragment tolerance when selected.
     let fidx = matches!(p.cfg.matcher, MatcherKind::Fragindex)
@@ -91,7 +95,12 @@ pub fn run(p: SearchSeedParams) -> Result<u64> {
                     scan_index: 0,
                 });
                 if score > entry.score {
-                    *entry = Best { score, rt: scan.rt_seconds, matched, scan_index: scan.scan_index };
+                    *entry = Best {
+                        score,
+                        rt: scan.rt_seconds,
+                        matched,
+                        scan_index: scan.scan_index,
+                    };
                 }
             }
         }
@@ -188,7 +197,11 @@ pub fn run(p: SearchSeedParams) -> Result<u64> {
         if p.cfg.two_pass_mass_cal {
             // Second pass: keep only deviations inside the first-pass window, so
             // random-match outliers cannot bias the offset, then re-fit.
-            let inl: Vec<f64> = devs.iter().cloned().filter(|d| (d - o1).abs() <= t1).collect();
+            let inl: Vec<f64> = devs
+                .iter()
+                .cloned()
+                .filter(|d| (d - o1).abs() <= t1)
+                .collect();
             if inl.len() >= 20 {
                 let (o2, t2) = fit(&inl);
                 (o2, t2, 2)
@@ -212,7 +225,10 @@ pub fn run(p: SearchSeedParams) -> Result<u64> {
             "cal_passes": cal_passes,
         }),
     )?;
-    info!(frag_ppm_offset, frag_tol_learned, cal_passes, "search-seed: mass recalibration");
+    info!(
+        frag_ppm_offset,
+        frag_tol_learned, cal_passes, "search-seed: mass recalibration"
+    );
 
     let n = write_table(
         p.out,
@@ -305,7 +321,10 @@ fn seed_fragindex_windows(
     let mut groups: BTreeMap<(u64, u64), Vec<usize>> = BTreeMap::new();
     for (si, scan) in scans.iter().enumerate() {
         groups
-            .entry((scan.window.lower_mz.to_bits(), scan.window.upper_mz.to_bits()))
+            .entry((
+                scan.window.lower_mz.to_bits(),
+                scan.window.upper_mz.to_bits(),
+            ))
             .or_default()
             .push(si);
     }
@@ -339,7 +358,11 @@ fn seed_fragindex_windows(
                         .iter()
                         .filter(|&&cid| scratch.count(cid) as usize >= cfg.min_matched_peaks)
                         .map(|&cid| {
-                            (cid, hyperscore(scratch.count(cid), scratch.obs_sum(cid)), scratch.count(cid))
+                            (
+                                cid,
+                                hyperscore(scratch.count(cid), scratch.obs_sum(cid)),
+                                scratch.count(cid),
+                            )
                         })
                         .collect();
                     scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap().then(a.0.cmp(&b.0)));
@@ -352,7 +375,12 @@ fn seed_fragindex_windows(
                             scan_index: 0,
                         });
                         if score > e.score {
-                            *e = Best { score, rt: scan.rt_seconds, matched, scan_index: scan.scan_index };
+                            *e = Best {
+                                score,
+                                rt: scan.rt_seconds,
+                                matched,
+                                scan_index: scan.scan_index,
+                            };
                         }
                     }
                 }

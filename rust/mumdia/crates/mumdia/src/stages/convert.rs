@@ -117,16 +117,10 @@ pub fn run(p: ConvertParams) -> Result<ConvertOutputs> {
     let (mut map_ms2, mut map_ms1) = (Vec::new(), Vec::new());
 
     let mut last_ms1_index: Option<u32> = None;
-    let mut count = 0usize;
-    let mut idx: u32 = 0;
-
-    for spec in reader {
+    for (count, (scan_index, spec)) in (0_u32..).zip(reader).enumerate() {
         if p.max_spectra > 0 && count >= p.max_spectra {
             break;
         }
-        count += 1;
-        let scan_index = idx;
-        idx += 1;
         let rt_s = spec.start_time() * 60.0; // mzdata returns minutes
         match spec.ms_level() {
             1 => {
@@ -221,7 +215,10 @@ pub fn run(p: ConvertParams) -> Result<ConvertOutputs> {
     let n_iw = write_table(
         &iw_path,
         vec![
-            Col::U32("window_id".into(), uniq.iter().map(|w| w.0 as u32).collect()),
+            Col::U32(
+                "window_id".into(),
+                uniq.iter().map(|w| w.0 as u32).collect(),
+            ),
             Col::F64("target".into(), uniq.iter().map(|w| w.1).collect()),
             Col::F64("lower".into(), uniq.iter().map(|w| w.2).collect()),
             Col::F64("upper".into(), uniq.iter().map(|w| w.3).collect()),
@@ -244,13 +241,13 @@ pub fn run(p: ConvertParams) -> Result<ConvertOutputs> {
             (&iw_path, artifact::ISOLATION_WINDOWS, n_iw),
             (&map_path, artifact::MS2_TO_MS1, n_map),
         ],
-        p.config_hash,
         elapsed,
         json!({
             "mzml": p.mzml,
             "max_spectra": p.max_spectra,
             "top_peaks_ms2": p.top_peaks_ms2,
             "top_peaks_ms1": p.top_peaks_ms1,
+            "config_hash": p.config_hash,
         }),
     )?;
 
@@ -271,7 +268,6 @@ pub fn run(p: ConvertParams) -> Result<ConvertOutputs> {
 
 fn write_reports(
     items: &[(&String, (&str, u32), u64)],
-    config_hash: &str,
     elapsed_ms: u128,
     params: serde_json::Value,
 ) -> Result<()> {

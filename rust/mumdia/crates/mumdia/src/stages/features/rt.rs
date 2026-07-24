@@ -27,7 +27,11 @@ pub const NAMES: &[&str] = &[
 
 /// Replace non-finite values with 0.0.
 fn finite(x: f64) -> f64 {
-    if x.is_finite() { x } else { 0.0 }
+    if x.is_finite() {
+        x
+    } else {
+        0.0
+    }
 }
 
 /// RT width (seconds) of the peak spanned by `prof` at `frac` of apex height,
@@ -43,7 +47,11 @@ fn rt_width(prof: &[f64], axis: &[f64], apex_idx: usize, frac: f64) -> f64 {
         return 0.0;
     }
     let w = axis[hi] - axis[lo];
-    if w > 0.0 { finite(w) } else { 0.0 }
+    if w > 0.0 {
+        finite(w)
+    } else {
+        0.0
+    }
 }
 
 /// RT (seconds) at the argmax of the predicted-intensity-weighted reference
@@ -58,29 +66,27 @@ fn profile_apex_rt_full(e: &Evidence) -> Option<f64> {
     // unweighted sum when no positive weight is available.
     let mut have_weight = false;
     let mut prof = vec![0.0f64; t];
-    for i in 0..k {
-        if e.traces_full[i].len() != t {
+    for (i, trace) in e.traces_full.iter().enumerate().take(k) {
+        if trace.len() != t {
             continue;
         }
         let w = e.pred.get(i).copied().unwrap_or(0.0);
         if w > 0.0 {
             have_weight = true;
-            for j in 0..t {
-                prof[j] += w * e.traces_full[i][j];
+            for (j, value) in prof.iter_mut().enumerate().take(t) {
+                *value += w * trace[j];
             }
         }
     }
     if !have_weight {
         // Unweighted fallback.
-        for j in 0..t {
-            prof[j] = 0.0;
-        }
-        for i in 0..k {
-            if e.traces_full[i].len() != t {
+        prof.fill(0.0);
+        for trace in e.traces_full.iter().take(k) {
+            if trace.len() != t {
                 continue;
             }
-            for j in 0..t {
-                prof[j] += e.traces_full[i][j];
+            for (j, value) in prof.iter_mut().enumerate().take(t) {
+                *value += trace[j];
             }
         }
     }
@@ -88,9 +94,9 @@ fn profile_apex_rt_full(e: &Evidence) -> Option<f64> {
     let mut best = 0usize;
     let mut best_v = f64::NEG_INFINITY;
     let mut any = false;
-    for j in 0..t {
-        if prof[j] > best_v {
-            best_v = prof[j];
+    for (j, &value) in prof.iter().enumerate().take(t) {
+        if value > best_v {
+            best_v = value;
             best = j;
             any = true;
         }
@@ -108,7 +114,12 @@ pub fn values(e: &Evidence) -> Vec<f64> {
 
     let grad = e.gradient;
     let (signed_ng, abs_ng, obs_frac, pred_frac) = if grad > 0.0 {
-        (signed / grad, abs / grad, e.apex_rt / grad, e.rt_pred_cal / grad)
+        (
+            signed / grad,
+            abs / grad,
+            e.apex_rt / grad,
+            e.rt_pred_cal / grad,
+        )
     } else {
         (0.0, 0.0, 0.0, 0.0)
     };
@@ -117,7 +128,11 @@ pub fn values(e: &Evidence) -> Vec<f64> {
     // both from the reference elution profile over the peak-bounded axis.
     let base_width = rt_width(&e.ref_profile, &e.axis, e.apex_idx, 0.1);
     let fwhm = rt_width(&e.ref_profile, &e.axis, e.apex_idx, 0.5);
-    let over_width = if base_width > 0.0 { abs / base_width } else { 0.0 };
+    let over_width = if base_width > 0.0 {
+        abs / base_width
+    } else {
+        0.0
+    };
     let over_fwhm = if fwhm > 0.0 { abs / fwhm } else { 0.0 };
 
     let profile_apex = match profile_apex_rt_full(e) {

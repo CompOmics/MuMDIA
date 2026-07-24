@@ -157,7 +157,10 @@ pub fn write_table(path: &str, cols: Vec<Col>) -> Result<u64> {
     let mut names = std::collections::HashSet::new();
     for c in &cols {
         if !names.insert(c.name()) {
-            return Err(anyhow!("write_table: duplicate column '{}' for {path}", c.name()));
+            return Err(anyhow!(
+                "write_table: duplicate column '{}' for {path}",
+                c.name()
+            ));
         }
     }
     let nrows = cols[0].len();
@@ -222,7 +225,11 @@ impl Table {
     }
 
     pub fn column_names(&self) -> Vec<String> {
-        self.schema.fields().iter().map(|f| f.name().clone()).collect()
+        self.schema
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect()
     }
 
     fn idx(&self, name: &str) -> Result<usize> {

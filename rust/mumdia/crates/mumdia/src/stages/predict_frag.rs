@@ -62,6 +62,7 @@ pub fn run(p: PredictFragParams) -> Result<(u64, u64)> {
     // the sequential accumulation below reproduces the exact serial `raws` order
     // and `n_parse_err` count (raws is re-sorted by precursor m/z at Stage D
     // build, whose stable sort then breaks m/z ties by this identical order).
+    #[allow(clippy::large_enum_variant)] // Raw dominates; boxing would churn the hot map/collect
     enum RowOut {
         Raw(Raw),
         ParseErr,
@@ -107,7 +108,11 @@ pub fn run(p: PredictFragParams) -> Result<(u64, u64)> {
             RowOut::Empty => {}
         }
     }
-    info!(candidates = raws.len(), parse_errors = n_parse_err, "predict-frag: parsed");
+    info!(
+        candidates = raws.len(),
+        parse_errors = n_parse_err,
+        "predict-frag: parsed"
+    );
 
     let rt_model_id = assign_rt(&p, &mut raws)?;
     let frag_model_id = assign_intensities(&p, &mut raws)?;
@@ -138,16 +143,22 @@ pub fn run(p: PredictFragParams) -> Result<(u64, u64)> {
 
     let n = raws.len();
     let total_frags: usize = raws.iter().map(|r| r.frags.len()).sum();
-    let (mut cid, mut pfid, mut baseid) =
-        (Vec::with_capacity(n), Vec::with_capacity(n), Vec::with_capacity(n));
+    let (mut cid, mut pfid, mut baseid) = (
+        Vec::with_capacity(n),
+        Vec::with_capacity(n),
+        Vec::with_capacity(n),
+    );
     let (mut pform_c, mut z_c, mut mz_c, mut irt_c) = (
         Vec::with_capacity(n),
         Vec::with_capacity(n),
         Vec::with_capacity(n),
         Vec::with_capacity(n),
     );
-    let (mut label_c, mut prot_c, mut nfrag_c) =
-        (Vec::with_capacity(n), Vec::with_capacity(n), Vec::with_capacity(n));
+    let (mut label_c, mut prot_c, mut nfrag_c) = (
+        Vec::with_capacity(n),
+        Vec::with_capacity(n),
+        Vec::with_capacity(n),
+    );
     let (mut f_cid, mut f_mz, mut f_int) = (
         Vec::with_capacity(total_frags),
         Vec::with_capacity(total_frags),
@@ -225,7 +236,11 @@ pub fn run(p: PredictFragParams) -> Result<(u64, u64)> {
             schema_name: schema.0.to_string(),
             schema_version: schema.1,
             stage: "predict-frag".to_string(),
-            rows: if path == p.out_precursors { n_prec } else { n_frag },
+            rows: if path == p.out_precursors {
+                n_prec
+            } else {
+                n_frag
+            },
             content_hash: mumdia_io::hash::blake3_file(path)?,
             params: json!({"top_n": p.cfg.top_n_fragments, "ms2pip_model": p.cfg.ms2pip_model,
                            "rt_predictor": format!("{:?}", p.cfg.rt_predictor),
@@ -237,7 +252,12 @@ pub fn run(p: PredictFragParams) -> Result<(u64, u64)> {
         .write_for(path)?;
     }
 
-    info!(candidates = n_prec, fragments = n_frag, elapsed_ms = elapsed, "predict-frag: done");
+    info!(
+        candidates = n_prec,
+        fragments = n_frag,
+        elapsed_ms = elapsed,
+        "predict-frag: done"
+    );
     Ok((n_prec, n_frag))
 }
 
@@ -252,12 +272,11 @@ fn assign_rt(p: &PredictFragParams, raws: &mut [Raw]) -> Result<String> {
             Ok(m.identity())
         }
         RtPredictorKind::Deeplc => {
-            let python = p
-                .cfg
-                .deeplc_python
-                .as_deref()
-                .ok_or_else(|| anyhow::anyhow!("rt_predictor=deeplc requires predict_frag.deeplc_python"))?;
-            let script = crate::sidecar::resolve_script(&p.cfg.sidecar_script_dir, "deeplc_worker.py");
+            let python = p.cfg.deeplc_python.as_deref().ok_or_else(|| {
+                anyhow::anyhow!("rt_predictor=deeplc requires predict_frag.deeplc_python")
+            })?;
+            let script =
+                crate::sidecar::resolve_script(&p.cfg.sidecar_script_dir, "deeplc_worker.py");
             // Dedup by peptidoform (RT is charge-independent).
             let mut uniq: HashMap<String, u32> = HashMap::new();
             let (mut ids, mut peps) = (Vec::new(), Vec::new());
@@ -303,16 +322,23 @@ fn assign_intensities(p: &PredictFragParams, raws: &mut [Raw]) -> Result<String>
             Ok(m.identity())
         }
         FragPredictorKind::Ms2pip => {
-            let python = p
-                .cfg
-                .ms2pip_python
-                .as_deref()
-                .ok_or_else(|| anyhow::anyhow!("predictor=ms2pip requires predict_frag.ms2pip_python"))?;
-            let script = crate::sidecar::resolve_script(&p.cfg.sidecar_script_dir, "ms2pip_worker.py");
+            let python = p.cfg.ms2pip_python.as_deref().ok_or_else(|| {
+                anyhow::anyhow!("predictor=ms2pip requires predict_frag.ms2pip_python")
+            })?;
+            let script =
+                crate::sidecar::resolve_script(&p.cfg.sidecar_script_dir, "ms2pip_worker.py");
             let ids: Vec<u32> = (0..raws.len() as u32).collect();
             let peps: Vec<String> = raws.iter().map(|r| r.peptidoform.clone()).collect();
             let charges: Vec<i32> = raws.iter().map(|r| r.charge).collect();
-            let map = sidecar::run_ms2pip(python, &script, p.work_dir, &ids, &peps, &charges, &p.cfg.ms2pip_model)?;
+            let map = sidecar::run_ms2pip(
+                python,
+                &script,
+                p.work_dir,
+                &ids,
+                &peps,
+                &charges,
+                &p.cfg.ms2pip_model,
+            )?;
             if map.is_empty() {
                 bail!("MS2PIP returned no predictions");
             }

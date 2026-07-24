@@ -169,7 +169,9 @@ pub fn parse_peptidoform(s: &str) -> Result<ParsedPeptidoform, MassError> {
                 i = next;
                 continue;
             }
-            return Err(MassError::Parse(format!("stray '-' at position {i} in '{s}'")));
+            return Err(MassError::Parse(format!(
+                "stray '-' at position {i} in '{s}'"
+            )));
         }
         if !c.is_ascii_alphabetic() {
             return Err(MassError::Parse(format!(
@@ -230,7 +232,11 @@ mod tests {
     fn peptide_mass_plain() {
         // PEPTIDE neutral monoisotopic mass = 799.35997 Da
         let p = parse_peptidoform("PEPTIDE").unwrap();
-        assert!((p.neutral_mass() - 799.359_965).abs() < 1e-3, "{}", p.neutral_mass());
+        assert!(
+            (p.neutral_mass() - 799.359_965).abs() < 1e-3,
+            "{}",
+            p.neutral_mass()
+        );
     }
 
     #[test]
