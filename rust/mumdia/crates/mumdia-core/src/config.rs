@@ -186,6 +186,12 @@ pub struct DigestConfig {
     pub min_len: usize,
     pub max_len: usize,
     pub decoy: DecoyConfig,
+    /// N-terminal methionine excision: when a protein begins with `M`, also emit
+    /// the initiator-Met-removed form of its N-terminal peptides. The initiator
+    /// methionine is cleaved in vivo for most proteins, so search engines
+    /// (including DIA-NN via `--met-excision`) enumerate both forms. Omitting it
+    /// makes the search database structurally miss those excised peptides.
+    pub n_term_met_excision: bool,
 }
 impl Default for DigestConfig {
     fn default() -> Self {
@@ -195,6 +201,7 @@ impl Default for DigestConfig {
             min_len: 5,
             max_len: 50,
             decoy: t(),
+            n_term_met_excision: true,
         }
     }
 }

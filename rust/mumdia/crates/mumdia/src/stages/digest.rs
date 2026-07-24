@@ -91,6 +91,23 @@ fn digest_protein(seq: &[u8], cfg: &DigestConfig) -> Vec<(usize, usize, String)>
                 continue;
             }
             out.push((start, end, String::from_utf8_lossy(sub).to_string()));
+
+            // N-terminal methionine excision: for a peptide anchored at the
+            // protein N-terminus whose first residue is the initiator Met, also
+            // emit the Met-removed form (start shifted to 1). The excised peptide
+            // is re-checked against the length bounds and standard-residue rule.
+            // This mirrors DIA-NN's `--met-excision`; without it the search
+            // database cannot contain these (biologically dominant) peptides.
+            if cfg.n_term_met_excision && start == 0 && seq.first() == Some(&b'M') {
+                let ex = &seq[1..end];
+                let ex_len = ex.len();
+                if ex_len >= cfg.min_len
+                    && ex_len <= cfg.max_len
+                    && ex.iter().all(|&c| is_standard_residue(c))
+                {
+                    out.push((1, end, String::from_utf8_lossy(ex).to_string()));
+                }
+            }
         }
     }
     out
@@ -361,6 +378,61 @@ mod tests {
         assert!(peps.contains(&"MK".to_string()), "{peps:?}");
         assert!(peps.contains(&"R".to_string()), "{peps:?}");
         assert!(peps.contains(&"PADEK".to_string()), "{peps:?}");
+    }
+
+    #[test]
+    fn met_excision_emits_both_n_term_forms() {
+        // MAKPEPTIDEK: cut after K(2) -> N-term peptide "MAK" (pos 0..3).
+        // With excision on, "AK" (pos 1..3) is also emitted; internal "PEPTIDEK"
+        // is unaffected. Off, only the Met-retained "MAK" appears.
+        let base = DigestConfig {
+            missed_cleavages: 0,
+            min_len: 1,
+            max_len: 50,
+            ..Default::default()
+        };
+        let on = DigestConfig {
+            n_term_met_excision: true,
+            ..base.clone()
+        };
+        let off = DigestConfig {
+            n_term_met_excision: false,
+            ..base
+        };
+        let peps = |c: &DigestConfig| -> Vec<String> {
+            digest_protein(b"MAKPEPTIDEK", c)
+                .into_iter()
+                .map(|(_, _, p)| p)
+                .collect()
+        };
+        let with = peps(&on);
+        assert!(with.contains(&"MAK".to_string()), "{with:?}");
+        assert!(with.contains(&"AK".to_string()), "{with:?}");
+        assert!(with.contains(&"PEPTIDEK".to_string()), "{with:?}");
+        let without = peps(&off);
+        assert!(without.contains(&"MAK".to_string()), "{without:?}");
+        assert!(!without.contains(&"AK".to_string()), "{without:?}");
+    }
+
+    #[test]
+    fn met_excision_only_at_protein_n_terminus() {
+        // The interior "M" in "AKMDER" (a fragment starting mid-protein) must not
+        // be excised: excision keys on protein position 0, not any leading M.
+        let cfg = DigestConfig {
+            missed_cleavages: 0,
+            min_len: 1,
+            max_len: 50,
+            n_term_met_excision: true,
+            ..Default::default()
+        };
+        // AKMDER: cut after K(2) -> "AK" (0..2) and "MDER" (2..6). "MDER" starts
+        // with M but at protein position 2, so no "DER" excision variant.
+        let peps: Vec<String> = digest_protein(b"AKMDER", &cfg)
+            .into_iter()
+            .map(|(_, _, p)| p)
+            .collect();
+        assert!(peps.contains(&"MDER".to_string()), "{peps:?}");
+        assert!(!peps.contains(&"DER".to_string()), "{peps:?}");
     }
 
     #[test]
