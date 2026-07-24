@@ -160,6 +160,90 @@ DIA (HYE). Where compared against DIA-NN, MuMDIA identifications are about 91 to
 gap, and it is closed most by the imported-library recipe plus the `nn_torch`
 rescorer.
 
+### Session findings, 2026-07-24 (provisional)
+
+Findings A8 through A12 are from one session (commit `f8f6c08`, on top of the
+previously synced `2cbbc20`) and carry shared caveats. They rest on a single
+dataset (`LFQ_Orbitrap_AIF_Ecoli_01`), on decoy-based FDR only (not
+entrapment-validated), and use the nondeterministic `nn_torch` rescorer. Any
+default change they motivate remains benchmark-gated per repository policy.
+Treat them as provisional signals below the validation bar of A1 through A7.
+
+### A8. N-terminal Met-excision closes the database-completeness gap
+
+The native digest now models cotranslational N-terminal methionine excision. A
+protein's initiator methionine is frequently cleaved in vivo, so a search
+database built without the Met-removed form structurally misses those peptides.
+`DigestConfig` gained `n_term_met_excision: bool` (default `true`,
+`rust/mumdia/crates/mumdia-core/src/config.rs:194`, matching DIA-NN
+`--met-excision`). In `digest_protein`, for a peptide anchored at protein
+position 0 whose first residue is M, the Met-removed form is also emitted (start
+shifted to 1) and re-checked against min_len/max_len and the standard-residue
+rule (`rust/mumdia/crates/mumdia/src/stages/digest.rs:101` through `:110`).
+Excision keys on protein position 0, not any leading M. The struct carries
+`#[serde(default, deny_unknown_fields)]` so existing configs still parse. Two
+unit tests fix the behavior: `met_excision_emits_both_n_term_forms` and
+`met_excision_only_at_protein_n_terminus` (interior M is not excised,
+`rust/mumdia/crates/mumdia/src/stages/digest.rs:384`, `:418`).
+
+On this benchmark every missed peptide absent from the search database (209 of
+them) was a Met-excision peptide. Augmenting the imported DIA-NN library with the
+missing FASTA peptides through the new `scripts/augment_library.py` helper, which
+reuses `mumdia digest` (Met-excision on) and `mumdia predict-frag` so peptidoform
+strings are byte-identical, drove the not-in-database count from 209 to 0.
+Met-excision is standard-proteomics-correct, but because it changes native-digest
+output it remains entrapment-plus-second-dataset gated before it is trusted as a
+default.
+
+### A9. The missed-peptide funnel after augmentation is a downstream, faint-signal ceiling
+
+With the database-completeness gap closed, the remaining missed peptides are
+downstream and faint, about 10x lower in abundance than identified peptides.
+Partitioning the misses by the stage that dropped them: extraction presence/apex
+accounts for about 49 percent (dominated by the presence_min_matched and
+minimum-co-elution checks, not the `min_frag_corr` gate), rescoring about 26
+percent, and seed search about 25 percent. The ceiling is therefore not one gate;
+it is split across extraction presence requirements, rescorer discrimination, and
+seed sensitivity, all on low-abundance precursors.
+
+### A10. The nn_torch rescorer is converged, not training-limited
+
+An epoch and round sweep of `nn_torch` on the augmented candidate pool shows the
+rescorer is feature-limited, not training-limited. 10 epochs undertrains (about
+150 to 180 fewer peptides); 25 epochs at 10 rounds is the knee and the default;
+50 epochs at 20 rounds gives no real gain (+5 peptides, within noise).
+Separately, removing the extraction presence/apex filters wholesale was a wash
+(+96 peptides net, roughly one-to-one churn) even though the candidate pool
+flooded about 18x, and decoy-based FDR stayed valid at 0.98 percent throughout.
+The lever is therefore better features or empirical-library spectra, not more
+training epochs or an opened gate.
+
+The `nn_torch` training loop is seed x fold x round x epoch. The knobs:
+`rescore.folds` maps to `MUMDIA_NN_FOLDS`, `rescore.num_iter` maps to
+`MUMDIA_NN_ITERS` (rounds), `MUMDIA_NN_EPOCHS` is an environment variable only
+(not engine-set, default 25), and `MUMDIA_NN_SEEDS` defaults to 1.
+
+### A11. Precursor grouping key: base peptide versus peptidoform-charge
+
+The `compete` default `group_by = Precursor` keys competition on
+`base_peptide_id`, which collapses charge and modification siblings into one base
+peptide. This is not a precursor-level count. `group_by = peptidoform_charge` is
+the true precursor-level competition and is the key needed for a precursor-level
+identification count or a precursor matrix submission. Selecting the grouping
+also changes the training and FDR population, so it remains benchmark-gated (see
+finding A5 on q-value units and the quantification rules in CLAUDE.md).
+
+### A12. Comparison against DIA-NN 2.2.0
+
+Against DIA-NN 2.2.0 run library-free from the same E. coli FASTA with a matched
+search space, both at 1 percent FDR, MuMDIA reached about 90 to 92 percent of the
+DIA-NN peptide count, about 89 to 91 percent of precursors (peptidoform plus
+charge), and about 99 to 101 percent of protein groups. The comparison is not
+symmetric: DIA-NN ran its full library-free double pass, while MuMDIA ran a
+single library-based pass on a library derived from DIA-NN. Protein-group parity
+alongside a peptide and precursor gap is consistent with MuMDIA being
+high-precision and recall-limited on faint precursors (finding A9).
+
 ---
 
 ## Part B: Contracts

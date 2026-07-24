@@ -266,7 +266,7 @@ data model has one `mods[i]` slot per residue plus separate terminal deltas
 
 | Name | file:line | What it does |
 |---|---|---|
-| `Config` | config.rs:971-1005 | Top-level config; 10 stage sections + `mbr` + `rng_seed` |
+| `Config` | config.rs:980 | Top-level config; 10 stage sections + `mbr` + `rng_seed` |
 | `Config::from_json` | config.rs:1009-1014 | Parse (deny unknown) then `validate` |
 | `Config::validate` | config.rs:1019-1100 | Ten hard-error checks |
 | `Config::apply_profile` | config.rs:1107-1121 | `dia` preset only |
@@ -484,7 +484,7 @@ complete-case features, robust to a minority of changing features (does not flat
 a spike-in design's real fold changes); `Median` aligns each run's median intensity
 (simpler, less robust to composition shifts); `None` uses raw areas.
 
-### `DigestConfig` (config.rs:181-200)
+### `DigestConfig` (config.rs:181-207)
 
 | Field | Default | Effect |
 |---|---|---|
@@ -493,6 +493,7 @@ a spike-in design's real fold changes); `Median` aligns each run's median intens
 | `min_len` | 5 | min peptide length |
 | `max_len` | 50 | max peptide length |
 | `decoy.strategy` | `reverse` | decoy scheme (`DecoyConfig`, config.rs:170-179) |
+| `n_term_met_excision` | `true` (bool) | when a protein begins with `M`, also emit the initiator-Met-removed form of its N-terminal peptides, re-checked against `min_len`/`max_len` and the standard-residue rule (matches DIA-NN `--met-excision`); keyed on protein position 0, not any leading `M`. Omitting it makes the search database structurally miss these excised peptides |
 
 ### `PeptidoformsConfig` (config.rs:202-231)
 

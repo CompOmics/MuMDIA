@@ -1,4 +1,4 @@
-# Python sidecars (the 10 scripts) + conda envs
+# Python sidecars (the 11 scripts) + conda envs
 > Part of the MuMDIA developer documentation (see docs/README.md).
 
 ## Purpose
@@ -19,13 +19,16 @@ only the rescore sidecars fall back to a native rescorer, and only when
 strict gate, so a crashed MS2PIP, DeepLC, or DeepLC fine-tune aborts the whole
 run. The matrix in **Failure behavior** below is authoritative.
 
-The 10 scripts split into four groups: **predictors** (`ms2pip_worker`,
+The 11 scripts split into four groups: **predictors** (`ms2pip_worker`,
 `deeplc_worker`, `deeplc_finetune`) feed the run-independent library;
 **rescorers** (`mokapot_worker`, `nn_rescore_worker`, `entrapment_worker`) score
 the competed PSMs in Stage F; **MBR** (`mbr_worker`) transfers identifications
 across runs (Stage D3); and the **DIA-NN recipe** (`import_diann_lib`,
-`make_reverse_decoys`, `make_shift_decoys`) is an offline, one-time toolchain to
-convert a user-produced DIA-NN library into MuMDIA's target+decoy library schema.
+`make_reverse_decoys`, `make_shift_decoys`, `augment_library`) is an offline,
+one-time toolchain that builds MuMDIA's target+decoy library schema. Three of the
+four convert a user-produced DIA-NN library into that schema; `augment_library`
+is the fourth, filling an imported library with the tryptic FASTA peptides it is
+missing (a completeness fix) before decoy generation.
 
 ## Failure behavior
 
@@ -82,6 +85,7 @@ For the mapping from each conda environment to the config field that points at i
 | `scripts/import_diann_lib.py` | Recipe: DIA-NN fragment-level parquet -> MuMDIA target `lib_precursors`+`lib_fragments` |
 | `scripts/make_reverse_decoys.py` | Recipe: reverse-sequence decoys with no-target-overlap invariant |
 | `scripts/make_shift_decoys.py` | Recipe: fragment-shift (CH2) decoys, DIA-NN-style terminal shift |
+| `scripts/augment_library.py` | Recipe: augment an imported library with its missing tryptic FASTA peptides, then hand off to a decoy builder |
 | `rust/mumdia/crates/mumdia/src/sidecar.rs` | Rust clients: `resolve_script`, `run_ms2pip`, `run_deeplc`, `run_deeplc_finetune`, `run_mbr`, `run_worker` |
 | `rust/mumdia/crates/mumdia/src/stages/predict_frag.rs` | Call sites for MS2PIP + DeepLC (Stage C) |
 | `rust/mumdia/crates/mumdia/src/stages/run.rs` | Call site for DeepLC fine-tune (between search-seed and rt-im-train) |
@@ -170,6 +174,22 @@ code.
 - IN/OUT the same precursor+fragment schema as `import_diann_lib`, reading a
   target-only (or target-half) library and emitting a target+decoy library
   re-sorted by `precursor_mz` with contiguous re-indexed `candidate_id`.
+
+**augment_library** (offline; no Rust caller, but shells out to the `mumdia`
+binary and to a decoy builder)
+- IN `--fasta` (protein FASTA), `--imported-precursors` / `--imported-fragments`
+  (the imported target+decoy library in the `import_diann_lib` schema), plus
+  `--mumdia-bin` and `--work-dir` (all required). The imported library supplies
+  the set of TARGET base sequences already present (rows with `label == "target"`,
+  `augment_library.py:100-114`); the FASTA plus `mumdia digest`/`peptidoforms`
+  supplies the candidate set to complete against.
+- OUT `--out-precursors` / `--out-fragments`: a full target+decoy library in the
+  same `import_diann_lib` schema, containing the imported targets plus the missing
+  tryptic peptides plus paired decoys. No schema/artifact-version bump: the output
+  is the same fragment_library precursor/fragment column layout, only re-indexed.
+- FLAGS: `--config` (default None), `--match-level {base_sequence(default),
+  peptidoform_charge}`, `--decoy-strategy {shift(default),reverse}`
+  (`augment_library.py:67-91`).
 
 ## How it works
 
@@ -373,6 +393,41 @@ concatenate
 target+decoy, re-sort by `precursor_mz`, reassign contiguous `candidate_id`, and
 re-sort fragments by `candidate_id` so the fragment index's contiguous-range
 precondition holds (`make_reverse_decoys.py:156-161`, `make_shift_decoys.py:47-55`).
+
+`augment_library.py` closes a different gap: an imported DIA-NN library can be
+missing tryptic peptides that are present in the FASTA, so the search DB
+structurally cannot find them. It fixes this completeness gap by reusing the
+engine's own stages, which guarantees the augmented peptidoform strings are
+byte-identical to what the native path would emit
+(`augment_library.py:1-37`). The flow is: (1) run `mumdia digest` (with
+N-terminal Met-excision on) then `peptidoforms` over the FASTA
+(`augment_library.py:96-98`); (2) set-diff the resulting base sequences against
+the imported library's TARGET base (stripped) sequences, keeping only the missing
+ones (`augment_library.py:103-104, 110-114`); (3) run `mumdia predict-frag` on the
+missing set to produce native predicted spectra and iRT
+(`augment_library.py:126-131`); (4) offset `peptidoform_id`/`base_peptide_id`/
+`candidate_id` so the new entries are disjoint from the imported ids
+(`augment_library.py:137-144`); (5) per-precursor (`groupby candidate_id`)
+max-normalize `predicted_intensity` (`augment_library.py:148-149`); (6) merge the
+imported targets with the missing targets (`augment_library.py:156-162`); (7) hand
+the merged target library to `make_shift_decoys.py` (default) or
+`make_reverse_decoys.py` for the paired, collision-free decoy population
+(`augment_library.py:166-171`); (8) validate load invariants on the final library:
+`candidate_id` contiguous over `0..N-1`, `precursor_mz` monotonically increasing,
+and both `target` and `decoy` labels present (`augment_library.py:178-193`). The
+pairing and collision-free guarantee lives in the downstream decoy builder, not in
+`augment_library.py` itself; its own validate step only checks contiguity,
+`precursor_mz` ordering, both-labels presence, and (for `--decoy-strategy reverse`
+only) target/decoy stripped-sequence non-overlap
+(`augment_library.py:190-193`). The predicted entries' RT axis need not match the
+imported DIA-NN iRT axis, because the per-run DeepLC fine-tune
+(`rt_im_train.finetune_deeplc`) re-predicts iRT for the whole library, putting
+every entry on one axis before extraction, so no explicit reconciliation is done
+(`augment_library.py:21-23`). CLI contract (all positional-style flags): required
+`--fasta --imported-precursors --imported-fragments --out-precursors
+--out-fragments --mumdia-bin --work-dir`, optional `--config` (default None),
+`--match-level {base_sequence(default),peptidoform_charge}`, and `--decoy-strategy
+{shift(default),reverse}` (`augment_library.py:67-91`).
 
 ## Key types and functions
 

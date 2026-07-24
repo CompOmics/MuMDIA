@@ -149,14 +149,19 @@ bundles the required environments so no manual setup is needed; the environment
 specifications are under `env/` (`mumdia-rescore.yml`, `docker-rescore.yml`,
 `docker-deeplc.yml`).
 
-The `scripts/` directory holds ten Python programs. Seven are engine-invoked
+The `scripts/` directory holds eleven Python programs. Seven are engine-invoked
 sidecar workers, called by the relevant stage over that file contract: MS2PIP
 (`ms2pip_worker.py`), DeepLC (`deeplc_worker.py`), the DeepLC fine-tune
 (`deeplc_finetune.py`), mokapot (`mokapot_worker.py`), the native-torch rescorer
 (`nn_rescore_worker.py`), the entrapment rescorer (`entrapment_worker.py`), and
-match-between-runs (`mbr_worker.py`). The other three are helpers for the DIA-NN
+match-between-runs (`mbr_worker.py`). The other four are helpers for the DIA-NN
 library recipe below and are run by hand: `import_diann_lib.py`,
-`make_reverse_decoys.py`, and `make_shift_decoys.py`.
+`make_reverse_decoys.py`, `make_shift_decoys.py`, and `augment_library.py`.
+`augment_library.py` extends an imported library with the tryptic FASTA peptides
+it is missing, reusing the engine's own native digest (which applies N-terminal
+methionine excision) and fragment prediction so the added entries carry
+byte-identical peptidoform strings, then hands off to `make_shift_decoys.py` (or
+`make_reverse_decoys.py`) for the paired decoys.
 
 ## Using a DIA-NN spectral library (highest sensitivity)
 

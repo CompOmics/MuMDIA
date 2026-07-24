@@ -122,6 +122,109 @@ MS1/grid evidence.
 one selected peak, so increasing K does not currently increase model-visible
 identifications.
 
+## Library completeness
+
+**Recommended guardrail.** Sensitivity is bounded by the search space. A peptide
+that is not in the library, or not enumerated by the digest, cannot be
+identified, and no downstream lever recovers it. Check and record library
+completeness before attributing a count gap to extraction or rescoring.
+
+N-terminal methionine excision (native digest). `digest.n_term_met_excision`
+(default `true`) makes the digest, for a peptide anchored at protein position 0
+whose first residue is `M`, also emit the initiator-Met-removed form. The
+initiator methionine is cleaved in vivo for most proteins, so this matches
+DIA-NN `--met-excision`; omitting it makes the search database structurally miss
+those peptides. Excision keys on protein position 0, not any interior or other
+non-terminal `M`. Old configs still parse (the struct carries `#[serde(default,
+deny_unknown_fields)]`). Met excision is standard-proteomics-correct, but it
+changes native-digest output, so treating it as a trusted default remains
+entrapment plus second-dataset gated per repository policy.
+
+Imported-library augmentation. MuMDIA does not digest an imported library, so
+the same gap is closed with `scripts/augment_library.py`. On the
+`LFQ_Orbitrap_AIF_Ecoli_01` benchmark, every peptide DIA-NN reported at 1% FDR
+but absent from the MuMDIA search database was an N-terminal Met-excision
+peptide (about 209 not-in-database peptides, reduced to 0 after augmentation).
+The script reuses the engine's own `digest`, `peptidoforms`, and `predict-frag`
+stages so the added peptidoform strings are byte identical to what the search
+consumes. It digests the FASTA (Met excision on), set-diffs against the imported
+library's target base sequences, predicts native spectra and iRT for the missing
+set, offsets `peptidoform_id`, `base_peptide_id`, and `candidate_id` to stay
+disjoint, per-precursor max-normalizes the predicted intensities to the
+base-peak convention, merges imported plus missing targets, hands off to
+`make_shift_decoys.py` (default) or `make_reverse_decoys.py` for paired decoys,
+then validates that `candidate_id` is contiguous, `precursor_mz` is ascending,
+and both labels are present.
+
+```text
+python scripts/augment_library.py \
+  --fasta fasta/ecoli.fasta \
+  --imported-precursors lib/lib_precursors.parquet \
+  --imported-fragments lib/lib_fragments.parquet \
+  --out-precursors lib/lib_precursors_aug.parquet \
+  --out-fragments lib/lib_fragments_aug.parquet \
+  --mumdia-bin <path to mumdia release binary> \
+  --config config.local-diann-lib.json \
+  --work-dir <scratch>
+```
+
+The augmented `lib_precursors_aug.parquet` and `lib_fragments_aug.parquet` then
+replace `--lib-precursors` and `--lib-fragments` in the `run` command. Pass the
+augmented raw library, not a `_ft` variant, so per-run fine-tuning still runs:
+the DeepLC fine-tune re-predicts iRT for the whole library, so imported and
+augmented entries share one RT axis with no explicit reconciliation.
+`--match-level base_sequence` (default) adds peptides whose stripped sequence is
+absent; `peptidoform_charge` also adds absent modforms or charges of present
+sequences, which changes the FDR population and is benchmark-gated.
+`--decoy-strategy` must match the strategy that built the imported library's
+decoys (`shift` by default); paired, collision-checked decoys are the property
+of that downstream builder, not of the augment step itself. Using augmentation
+as a routine step, rather than a diagnostic, remains benchmark and entrapment
+gated.
+
+## Where missing identifications are lost
+
+**Findings with caveats.** All figures below are from a single file
+(`LFQ_Orbitrap_AIF_Ecoli_01`), under decoy-based FDR only, not entrapment
+validated, with nondeterministic NnTorch. They motivate work; they do not
+license a default change.
+
+Against DIA-NN 2.2.0 run library-free from the E. coli FASTA (matched search
+space, 1% FDR), MuMDIA reached about 90-92% of DIA-NN peptides, about 89-91% of
+precursors (peptidoform plus charge), and about 99-101% of protein groups.
+DIA-NN ran its full library-free double pass; MuMDIA ran a single
+library-based pass on a DIA-NN-derived library.
+
+After Met-excision augmentation closed the database-completeness gap (209
+not-in-database to 0), the DIA-NN peptides MuMDIA still misses are downstream and
+faint, roughly 10x lower abundance than the shared set. The loss ranks:
+
+| Stage where the missed peptide is lost | Share of remaining misses |
+|---|---|
+| Extraction presence/apex | about 49% |
+| Rescore | about 26% |
+| Seed | about 25% |
+
+The extraction losses are mostly `presence_min_matched` and `min_coelution`, not
+the `min_frag_corr` apex gate. Extraction presence/apex is therefore the largest
+remaining lever, then rescore, then seed, all on faint signal.
+
+The rescorer is converged and feature-limited, not training-limited. An NnTorch
+epoch and round sweep on the augmented pool showed that 10 epochs undertrains
+(about -150 to -180 peptides), 25 epochs and 10 rounds is the knee (the default),
+and 50 epochs and 20 rounds gave no real gain (+5, within noise). Removing the
+extraction presence/apex filters wholesale was a wash (+96 net, roughly 1:1
+churn), though decoy FDR stayed valid at 0.98% even under an 18x candidate flood.
+The lever is better features or empirical-library spectra, not more epochs,
+rounds, or open gates. Do not chase epoch or round counts.
+
+For reference, the NnTorch training loop is seed x fold x round x epoch:
+
+- folds: `rescore.folds`, overridable via `MUMDIA_NN_FOLDS`;
+- rounds: `rescore.num_iter`, overridable via `MUMDIA_NN_ITERS`;
+- epochs: `MUMDIA_NN_EPOCHS` (environment only, not engine-set; default `25`);
+- seeds: `MUMDIA_NN_SEEDS` (default `1`).
+
 ## Competition and FDR
 
 Stage `compete` keeps target/decoy label in its key. It resolves redundant
@@ -230,6 +333,9 @@ IDs so selection effects remain visible.
 | Minimum clean-ion/interference rules | accuracy gain without unacceptable missingness |
 | MBR transfer/requantification | transfer-decoy FDR and known-ratio validation |
 | Acquisition peak caps | a separate cap sweep per acquisition class |
+| N-terminal Met excision as a trusted digest default | entrapment plus a second dataset, though it is standard-proteomics-correct |
+| Imported-library augmentation as a routine step | empirical-null FDR plus a second acquisition context |
+| Wholesale relaxation of extract presence/apex filters | multi-context empirical-null FDR; the single-file result was a wash |
 
 A one-file AIF count can nominate an experiment; it cannot establish a universal
 default.

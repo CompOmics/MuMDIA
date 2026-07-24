@@ -364,7 +364,7 @@ This area reads very little config directly; it mostly enforces config validity
 and wires interpreters. The config surface was recently pruned of dead fields, so
 do not reintroduce removed knobs. The fields relevant here:
 
-- `Config::validate` (`config.rs:1019`) rejects ten combinations, all of which
+- `Config::validate` (`config.rs:1026`) rejects ten combinations, all of which
   the committed defaults pass. Four are strategy/gate footguns:
   `digest.decoy.strategy = diann_shift` (threaded but realized nowhere; would
   yield zero decoys and an invalid FDR, `config.rs:1021`);

@@ -57,7 +57,7 @@ source rather than the spec.
 | [10_features.md](10_features.md) | Stage E: the minimal/rich/extended feature battery (~381 features), `prelim_score`, PIN emission, and the hashed feature schema. |
 | [11_compete_rescore_fdr.md](11_compete_rescore_fdr.md) | Stage F: within-group competition, semi-supervised rescoring (native / mokapot / PyTorch-NN / percolator / entrapment), and target-decoy q-values at PSM/run/precursor/peptide/protein level. |
 | [12_quant_lfq_align_mbr_report_audit.md](12_quant_lfq_align_mbr_report_audit.md) | The tail subcommands: `quant`, `quant-lfq` (MaxLFQ/directLFQ), `align`, `mbr`, `report`, and `audit`. |
-| [13_sidecars.md](13_sidecars.md) | The 10 Python sidecar workers (MS2PIP/DeepLC/mokapot/entrapment/diagnostics), the positional-CLI file contract, and the conda envs. |
+| [13_sidecars.md](13_sidecars.md) | The 11 Python scripts (7 engine-invoked sidecar workers: MS2PIP/DeepLC/mokapot/entrapment/NN/MBR; plus 4 imported-library helpers incl. `augment_library.py`), the positional-CLI file contract, and the conda envs. |
 | [14_build_test_deploy_gotchas.md](14_build_test_deploy_gotchas.md) | The Rust workspace build, test coverage and gaps, the determinism contract, the clean-room boundary, and CI/Docker/release. |
 | [15_data_dictionary.md](15_data_dictionary.md) | Consolidated Parquet data dictionary: every column of every artifact, its Arrow type and nullability, sourced from the `Col`/`write_table` construction with `file:line` citations. |
 | [16_glossary.md](16_glossary.md) | Alphabetical glossary of domain and codebase terms as MuMDIA uses them, each entry self-contained and cited to `file:line` where it asserts code behavior. |
