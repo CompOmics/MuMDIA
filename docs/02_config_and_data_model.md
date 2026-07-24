@@ -18,7 +18,7 @@ here.
 3. **Frozen artifact schema ids** (`schema.rs`): `(logical name, version)` pairs
    recorded in each artifact's `report.json` and in the `manifest.json`
    `ArtifactRecord`. They are provenance only: no stage reads them back, and
-   `Table::read` (`table.rs:204-222`) does no version check, so a schema id is
+   `Table::read` (`table.rs:207-225`) does no version check, so a schema id is
    never used to detect a mismatch or invalidate a downstream artifact.
 4. **Run manifest** (`manifest.rs`): per-artifact provenance (content hash,
    producing stage, config hash) written once by the `run` orchestrator.
@@ -31,10 +31,10 @@ The crate is declared in `lib.rs:6-13` (`config`, `constants`, `error`,
 
 | Path | Role |
 |---|---|
-| `rust/mumdia/crates/mumdia-core/src/config.rs` | All config structs + every strategy enum; `Config::from_json`, `validate`, `apply_profile`, `canonical_json` (1160 lines) |
+| `rust/mumdia/crates/mumdia-core/src/config.rs` | All config structs + every strategy enum; `Config::from_json`, `validate`, `apply_profile`, `canonical_json` (1188 lines) |
 | `rust/mumdia/crates/mumdia-core/src/constants.rs` | Physical constants (`PROTON`, `WATER`, `AMMONIA`, `ISOTOPE_SPACING`), `residue_mass`, `mass_to_mz`, ppm predicates |
 | `rust/mumdia/crates/mumdia-core/src/mass.rs` | `unimod_mass`, `IonType`, `Fragment`, `ParsedPeptidoform`, `parse_peptidoform`, b/y fragment generation |
-| `rust/mumdia/crates/mumdia-core/src/schema.rs` | Frozen `(name, version)` ids for every artifact; `PSMS_SCORED` is v2, all others v1 |
+| `rust/mumdia/crates/mumdia-core/src/schema.rs` | Frozen `(name, version)` ids for every artifact; `PSMS_SCORED` is v3, `PSMS_COMPETED`/`PEPTIDE_QUANT`/`PROTEIN_GROUP_QUANT` are v2, all others v1 |
 | `rust/mumdia/crates/mumdia-core/src/manifest.rs` | `Manifest` + `ArtifactRecord` (provenance) |
 | `rust/mumdia/crates/mumdia-core/src/types.rs` | `Peak`, `IsolationWindow`, `Label`, `Ms2Scan` |
 | `rust/mumdia/crates/mumdia-core/src/rejection.rs` | `RejectionReason` ladder for the candidate-audit table |
@@ -49,15 +49,15 @@ The crate is declared in `lib.rs:6-13` (`config`, `constants`, `error`,
 `mumdia-core` produces no artifacts of its own. It defines the types the other
 crates read and write. Two things it owns appear on disk:
 
-**`manifest.json`** (one per `run`, written at `run.rs:334-335`). Serialized
+**`manifest.json`** (one per `run`, written at `run.rs:500-501`). Serialized
 `Manifest`; fields (`manifest.rs:22-31`):
 
 | Field | Type | Meaning |
 |---|---|---|
-| `mumdia_version` | String | `CARGO_PKG_VERSION` at build time (`manifest.rs:37`) |
+| `mumdia_version` | String | `CARGO_PKG_VERSION` at build time (`manifest.rs:36`) |
 | `config_json` | String | Fully-resolved config, from `Config::canonical_json()` |
-| `config_hash` | String | `blake3_str(canonical_json)` (`run.rs:87`) |
-| `model_identities` | BTreeMap<String,String> | `rt_predictor`, `fragment_predictor`, `rescorer`, `feature_schema_id` (`run.rs:323-332`) |
+| `config_hash` | String | `blake3_str(canonical_json)` (`run.rs:89`) |
+| `model_identities` | BTreeMap<String,String> | `rt_predictor`, `fragment_predictor`, `rescorer`, `feature_schema_id` (`run.rs:489-498`) |
 | `artifacts` | BTreeMap<String,ArtifactRecord> | one entry per produced artifact, keyed by logical name |
 
 **`ArtifactRecord`** (`manifest.rs:9-20`), one per artifact:
@@ -65,7 +65,7 @@ crates read and write. Two things it owns appear on disk:
 `schema_version`, `rows`, `content_hash` (blake3 of the file bytes),
 `producing_stage`, `config_hash`. Built by `record_artifact`
 (`mumdia-io/src/lib.rs:20-39`), which hashes the written Parquet file with
-`blake3_file` (`hash.rs:8-19`, streamed in 64 KiB chunks).
+`blake3_file` (`hash.rs:8-20`, streamed in 64 KiB chunks).
 
 **`ArtifactReport`** / `<artifact>.report.json` (`report.rs:11-24`) is written
 alongside each artifact by its producing stage, not by core: `logical_name`,
@@ -73,12 +73,12 @@ alongside each artifact by its producing stage, not by core: `logical_name`,
 (resolved parameters), `stats` (key metrics), `model_identity`, `elapsed_ms`.
 `write_for` appends `.report.json` to the artifact path (`report.rs:26-31`).
 
-### Artifact schema ids (`schema.rs:6-24`)
+### Artifact schema ids (`schema.rs:7-24`)
 
 Every id is a `(&str, u32)` constant. A stage stamps `.0` and `.1` into its
 `ArtifactReport` and `ArtifactRecord`. Both are provenance records only; nothing
-reads them back to validate a downstream read (`Table::read`, `table.rs:204-222`,
-does no version check, and `write_table`, `table.rs:151-193`, does not stamp the
+reads them back to validate a downstream read (`Table::read`, `table.rs:207-225`,
+does no version check, and `write_table`, `table.rs:151-196`, does not stamp the
 id into the Parquet file itself).
 
 | Constant | Logical name | Version |
@@ -139,22 +139,22 @@ quant stage filters on.
 
 ### Config load path
 
-`load_config` (`main.rs:363-371`) reads the `--config` file to a string and
-calls `Config::from_json` (`config.rs:1046-1051`), which does
+`load_config` (`main.rs:376-384`) reads the `--config` file to a string and
+calls `Config::from_json` (`config.rs:1009-1014`), which does
 `serde_json::from_str` and then `validate()`. With no `--config` it returns
-`Config::default()` (`config.rs:1025-1042`), which is fully populated from the
+`Config::default()` (`config.rs:988-1005`), which is fully populated from the
 per-field defaults. `--profile <name>` then calls `apply_profile`
-(`main.rs:582`, `config.rs:1098-1112`) on top of the loaded config.
+(`main.rs:607`, `config.rs:1107-1121`) on top of the loaded config.
 
-`deny_unknown_fields` on every section (`config.rs:207`, `218`, `239`, ...) means
+`deny_unknown_fields` on every section (`config.rs:182`, `203`, `251`, ...) means
 a typo like `{"digest":{"min_len":7,"bogus":1}}` is a parse error, verified by
-`unknown_key_rejected` (`config.rs:1136-1139`). `#[serde(default)]` on every
+`unknown_key_rejected` (`config.rs:1146-1149`). `#[serde(default)]` on every
 section and field means a partial JSON overlays defaults: `{"digest":{"min_len":7}}`
-keeps `max_len=50`, `charge_max=3`, `top_n_peaks=300` (`config.rs:1142-1149`).
-The `t::<T>()` helper (`config.rs:199-204`) is a terse `T::default()` used inside
+keeps `max_len=50`, `charge_max=3`, `top_n_peaks=300` (`config.rs:1151-1159`).
+The `t::<T>()` helper (`config.rs:163-168`) is a terse `T::default()` used inside
 the per-struct `Default` impls.
 
-### `validate()` hard-error checks (`config.rs:1062-1137`)
+### `validate()` hard-error checks (`config.rs:1019-1100`)
 
 Known invalid combinations are rejected at load so they never silently produce a
 wrong result. This is targeted validation, not proof that every scientifically
@@ -162,28 +162,35 @@ poor setting is detectable. Defaults always pass.
 
 1. `digest.decoy.strategy == DiannShift` -> `Invalid`: the engine digest
    produces zero decoys under it, giving an invalid target-decoy FDR
-   (`config.rs:1058-1066`).
+   (`config.rs:1021-1029`).
 2. `rt_im_train.calibration_method == None` -> `Invalid`: `None` would silently
    fall through to the linear fit, so it is rejected and the user must pick
-   `linear` or `loess` (`config.rs:1067-1073`).
+   `linear` or `loess` (`config.rs:1030-1036`).
 3. `extract.retain_top_peaks == 0` -> `Invalid`: must be `>= 1` (1 = legacy
-   single apex) (`config.rs:1074-1080`).
+   single apex) (`config.rs:1037-1043`).
 4. `extract.min_frag_corr` not finite or outside `[0, 1]` -> `Invalid`
-   (`config.rs:1087-1095`). 0 disables the gate. Verified by
+   (`config.rs:1044-1052`). 0 disables the gate. Verified by
    `explicit_uncapped_seed_and_invalid_gate_are_distinguished`
-   (`config.rs:1152-1158`).
-5. `rescore.folds < 2` -> `Invalid`: every PSM needs an out-of-fold score.
-6. `rescore.train_fdr` non-finite or outside `(0, 1]` -> `Invalid`.
-7. Mokapot or NnTorch without `rescore.python` -> `Invalid`.
-8. `classifier = percolator` -> `Invalid`: the adapter is not wired.
-9. Entrapment without `rescore.entrapment_marker` -> `Invalid`.
+   (`config.rs:1180-1187`).
+5. `rescore.folds < 2` -> `Invalid`: every PSM needs an out-of-fold score
+   (`config.rs:1053-1059`).
+6. `rescore.num_iter == 0` -> `Invalid`: iterative model training needs at least
+   one iteration (`config.rs:1060-1064`).
+7. `rescore.train_fdr` non-finite or outside `(0, 1]` -> `Invalid`
+   (`config.rs:1065-1072`).
+8. Mokapot or NnTorch without `rescore.python` -> `Invalid`
+   (`config.rs:1073-1082`).
+9. `classifier = percolator` -> `Invalid`: the adapter is not wired
+   (`config.rs:1083-1089`).
+10. Entrapment without `rescore.entrapment_marker` -> `Invalid`
+    (`config.rs:1090-1098`).
 
-`canonical_json` (`config.rs:1116-1118`) serializes the fully-resolved config;
-`run` hashes it with `blake3_str` into `config_hash` (`run.rs:87`) and stores the
+`canonical_json` (`config.rs:1125-1127`) serializes the fully-resolved config;
+`run` hashes it with `blake3_str` into `config_hash` (`run.rs:89`) and stores the
 JSON verbatim in the manifest. There is no separate pretty vs canonical form; it
 is a plain `serde_json::to_string`.
 
-### `apply_profile` (`config.rs:1098-1112`)
+### `apply_profile` (`config.rs:1107-1121`)
 
 Only `dia` is defined. It sets `features.set = Extended`,
 `extract.apex_count_window = 5`, `extract.apex_rt_prior_s = 120.0`. Any other name
@@ -196,7 +203,7 @@ baselines; the profile is a convenience shortcut, not a full preset file.
 residue, `residue_mass(r) + mod_delta`. `residue_mass` (`constants.rs:26-51`) is
 the 20-standard-amino-acid table; `B, J, O, U, X, Z` return `None` (ambiguous /
 non-standard) and cause `MassError::AmbiguousResidue` at parse time. Leucine and
-isoleucine share `113.084064015` (`constants.rs:34-35`). `is_standard_residue`
+isoleucine share `113.084064015` (`constants.rs:35-36`). `is_standard_residue`
 (`constants.rs:54-56`) is the boolean form (`residue_mass(aa).is_some()`), used by
 the digest to reject peptides containing a non-standard residue byte.
 
@@ -231,8 +238,8 @@ difference; a maintainer must not treat them as interchangeable.
   it is algebraically `hi/lo <= 1 + delta` and `ln(hi) - ln(lo) <= ln(1 + delta)`,
   the last form being what makes log-space binning exact and is proven exact
   against the log-bin +/-1 probe. `within_ppm_three_forms_agree`
-  (`constants.rs:102-122`) checks the three forms round identically away from the
-  edge; `within_ppm_edges` (`constants.rs:124-132`) checks edge inclusivity and
+  (`constants.rs:102-126`) checks the three forms round identically away from the
+  edge; `within_ppm_edges` (`constants.rs:128-136`) checks edge inclusivity and
   argument-order symmetry.
 
 The three normalize by theoretical (`ppm_diff`), by query center (`ppm_bounds`),
@@ -244,14 +251,14 @@ tolerance edge. Index probing must use `within_ppm`; do not substitute a
 `Oxidation` 15.994914620, `Acetyl` 42.010564684, `Phospho` 79.966331090,
 `Deamidated` 0.984016106, `Methyl` 14.015650064, `Dimethyl` 28.031300128,
 `Carbamyl` 43.005813726. An unknown name is `MassError::UnknownModification`
-(`mass.rs:219`), never a silent zero.
+(`mass.rs:221`), never a silent zero.
 
-**ProForma-lite parse** (`parse_peptidoform`, `mass.rs:143-203`): optional
+**ProForma-lite parse** (`parse_peptidoform`, `mass.rs:143-205`): optional
 N-terminal `[Mod]-`, residues each optionally followed by `[Mod]`, optional
 trailing `-[Mod]`. A `[Mod]` is a UniMod name or a signed float such as
-`[+15.9949]` (`parse_bracket`, `mass.rs:207-223`, tries `unimod_mass` first then
+`[+15.9949]` (`parse_bracket`, `mass.rs:209-225`, tries `unimod_mass` first then
 `f64` parse). Non-alphabetic characters and ambiguous residues are errors. A
-second mod at the same residue position accumulates (`+=`, `mass.rs:189`); the
+second mod at the same residue position accumulates (`+=`, `mass.rs:191`); the
 data model has one `mods[i]` slot per residue plus separate terminal deltas
 (`ParsedPeptidoform`, `mass.rs:56-62`).
 
@@ -259,18 +266,18 @@ data model has one `mods[i]` slot per residue plus separate terminal deltas
 
 | Name | file:line | What it does |
 |---|---|---|
-| `Config` | config.rs:1008-1042 | Top-level config; 11 stage sections + `mbr` + `rng_seed` |
-| `Config::from_json` | config.rs:1046-1051 | Parse (deny unknown) then `validate` |
-| `Config::validate` | config.rs:1056-1091 | Four hard-error checks |
-| `Config::apply_profile` | config.rs:1098-1112 | `dia` preset only |
-| `Config::canonical_json` | config.rs:1116-1118 | Serialize for manifest hashing |
+| `Config` | config.rs:971-1005 | Top-level config; 10 stage sections + `mbr` + `rng_seed` |
+| `Config::from_json` | config.rs:1009-1014 | Parse (deny unknown) then `validate` |
+| `Config::validate` | config.rs:1019-1100 | Ten hard-error checks |
+| `Config::apply_profile` | config.rs:1107-1121 | `dia` preset only |
+| `Config::canonical_json` | config.rs:1125-1127 | Serialize for manifest hashing |
 | `residue_mass` | constants.rs:26-51 | 20-AA monoisotopic table; `None` for ambiguous |
 | `is_standard_residue` | constants.rs:54-56 | `residue_mass(aa).is_some()` boolean form |
 | `mass_to_mz` | constants.rs:59-62 | Neutral mass -> m/z |
 | `ppm_diff` / `ppm_match` | constants.rs:66-74 | Theoretical-relative signed ppm + tolerance test |
 | `ppm_bounds` | constants.rs:78-81 | Query-centered symmetric m/z window |
 | `within_ppm` | constants.rs:92-96 | Min-relative canonical index predicate |
-| `parse_peptidoform` | mass.rs:143-203 | ProForma-lite parser |
+| `parse_peptidoform` | mass.rs:143-205 | ProForma-lite parser |
 | `ParsedPeptidoform::fragments` | mass.rs:82-127 | b/y ions, drops b1/y1/y2 |
 | `IonType` | mass.rs:29-42 | `B`/`Y` enum; `symbol()` -> `'b'`/`'y'` |
 | `unimod_mass` | mass.rs:13-26 | 8-name UniMod subset |
@@ -299,11 +306,11 @@ docs/18_findings_and_decisions.md).
 
 | Variant | file:line | Raised when |
 |---|---|---|
-| `MassError::Parse(String)` | error.rs:8-9 | peptidoform parse failure: stray `-`, non-alphabetic char, unclosed `[`, or no residues (mass.rs:172, 175, 195, 212) |
-| `MassError::AmbiguousResidue(char)` | error.rs:10-11 | a residue with no monoisotopic mass (B/J/O/U/X/Z) at parse (mass.rs:181) |
-| `MassError::UnknownModification(String)` | error.rs:12-13 | a `[...]` mod that is neither a UniMod name nor a parseable signed float (mass.rs:219) |
-| `ConfigError::Parse(String)` | error.rs:18-19 | `serde_json` failure inside `Config::from_json` (config.rs:1048) |
-| `ConfigError::Invalid(String)` | error.rs:20-21 | a `validate()` rejection or unknown `--profile` (config.rs:1059-1088, 1106) |
+| `MassError::Parse(String)` | error.rs:8-9 | peptidoform parse failure: stray `-`, non-alphabetic char, unclosed `[`, or no residues (mass.rs:172, 177, 197, 214) |
+| `MassError::AmbiguousResidue(char)` | error.rs:10-11 | a residue with no monoisotopic mass (B/J/O/U/X/Z) at parse (mass.rs:183) |
+| `MassError::UnknownModification(String)` | error.rs:12-13 | a `[...]` mod that is neither a UniMod name nor a parseable signed float (mass.rs:221) |
+| `ConfigError::Parse(String)` | error.rs:18-19 | `serde_json` failure inside `Config::from_json` (config.rs:1011) |
+| `ConfigError::Invalid(String)` | error.rs:20-21 | a `validate()` rejection or unknown `--profile` (config.rs:1022-1098, 1115) |
 
 ### Candidate-audit reason ladder (`rejection.rs`)
 
@@ -348,52 +355,52 @@ called out explicitly.
 
 | Enum | file:line | Variants (default in bold) | Notes |
 |---|---|---|---|
-| `DecoyStrategy` | config.rs:17-27 | **`reverse`**, `scramble`, `diann_shift`, `none` | `diann_shift` rejected by validate; `none` produces no decoys (invalid FDR) |
-| `MatcherKind` | config.rs:42-45 | `bucketed`, **`fragindex`** | fragment-matcher backend for search-seed + extract |
-| `Enzyme` | config.rs:54-59 | **`trypsin_p`**, `trypsin` | cut after K/R, with/without before-P |
-| `CalibrationMethod` | config.rs:68-72 | **`loess`**, `linear`, `none` | `none` rejected by validate (falls through to linear) |
-| `FeatureSet` | config.rs:81-90 | **`minimal`** (14), `rich` (44), `extended` (381) | superset battery in `stages/features/`; count asserted at `features.rs:1443` |
-| `RtPredictorKind` | config.rs:99-105 | **`native`**, `deeplc` | DeepLC is a Python sidecar |
-| `FragPredictorKind` | config.rs:113-119 | **`native`**, `ms2pip` | MS2PIP is a Python sidecar |
-| `RescorerKind` | config.rs:128-150 | **`native_tda`**, `mokapot`, `nn_torch`, `percolator`, `entrapment` | see RescoreConfig |
-| `PeakClaim` | config.rs:164-188 | **`none`**, `winner_predicted_intensity`, `proportional`, `coelution_winner`, `coelution_proportional`, `coelution_winner_margin` | shared-peak apportionment |
-| `GateMode` | config.rs:591-614 | **`apex_pearson`**, `peak_spectral`, `spectral_entropy`, `coelution`, `combined` | which spectral score `min_frag_corr` thresholds |
-| `UnknownModPolicy` | config.rs:280-283 | **`error`**, `skip` | unknown-mod behavior |
-| `CompetitionMode` | config.rs:713-730 | **`winner_take_all`**, `none`, `features_only`, `unique_evidence`, `margin_gated` | within-group resolution |
-| `CompeteGroupBy` | config.rs:734-741 | **`precursor`**, `apex`, `peptidoform_charge` | competition grouping key |
-| `RollupMethod` | config.rs:745-750 | **`top_n_sum`**, `sum` | protein rollup |
-| `PeakWindowMode` | config.rs:760-771 | **`per_candidate`**, `consensus` | quant integration window |
-| `NormalizeMethod` | config.rs:779-792 | `none`, **`median_ratio`**, `median` | cross-run LFQ normalization; `from_token` at 796-803 |
-| `QuantQColumn` | config.rs:816-828 | **`peptide_q`**, `psm_q`, `run_psm_q` | which q column quant filters on |
-| `MbrStrategy` | config.rs:883-893 | **`none`**, `empirical_library`, `rt_transfer`, `full` | **stub**: only `none` runs; the rest are config hooks (Stage D3 not wired) |
-| `DecoyTransfer` | config.rs:900-907 | **`permuted_rt`**, `reverse_sequence`, `both` | MBR false-transfer null (**stub**, MBR-only) |
+| `DecoyStrategy` | config.rs:17-28 | **`reverse`**, `scramble`, `diann_shift`, `none` | `diann_shift` rejected by validate; `none` produces no decoys (invalid FDR) |
+| `MatcherKind` | config.rs:38-42 | `bucketed`, **`fragindex`** | fragment-matcher backend for search-seed + extract |
+| `Enzyme` | config.rs:46-52 | **`trypsin_p`**, `trypsin` | cut after K/R, with/without before-P |
+| `CalibrationMethod` | config.rs:56-61 | **`loess`**, `linear`, `none` | `none` rejected by validate (falls through to linear) |
+| `FeatureSet` | config.rs:65-75 | **`minimal`** (14), `rich` (44), `extended` (381) | superset battery in `stages/features/`; count asserted by the `feature_sets_sized` test (`features.rs:1590-1598`) |
+| `RtPredictorKind` | config.rs:79-86 | **`native`**, `deeplc` | DeepLC is a Python sidecar |
+| `FragPredictorKind` | config.rs:90-96 | **`native`**, `ms2pip` | MS2PIP is a Python sidecar |
+| `RescorerKind` | config.rs:100-123 | **`native_tda`**, `mokapot`, `nn_torch`, `percolator`, `entrapment` | see RescoreConfig |
+| `PeakClaim` | config.rs:132-157 | **`none`**, `winner_predicted_intensity`, `proportional`, `coelution_winner`, `coelution_proportional`, `coelution_winner_margin` | shared-peak apportionment |
+| `GateMode` | config.rs:551-574 | **`apex_pearson`**, `peak_spectral`, `spectral_entropy`, `coelution`, `combined` | which spectral score `min_frag_corr` thresholds |
+| `UnknownModPolicy` | config.rs:244-248 | **`error`**, `skip` | unknown-mod behavior |
+| `CompetitionMode` | config.rs:674-691 | **`winner_take_all`**, `none`, `features_only`, `unique_evidence`, `margin_gated` | within-group resolution |
+| `CompeteGroupBy` | config.rs:695-702 | **`precursor`**, `apex`, `peptidoform_charge` | competition grouping key |
+| `RollupMethod` | config.rs:706-712 | **`top_n_sum`**, `sum` | protein rollup |
+| `PeakWindowMode` | config.rs:717-729 | **`per_candidate`**, `consensus` | quant integration window |
+| `NormalizeMethod` | config.rs:737-750 | `none`, **`median_ratio`**, `median` | cross-run LFQ normalization; `from_token` at 754-761 |
+| `QuantQColumn` | config.rs:772-789 | **`peptide_q`**, `precursor_q`, `psm_q`, `run_psm_q` | which q column quant filters on |
+| `MbrStrategy` | config.rs:845-855 | **`none`**, `empirical_library`, `rt_transfer`, `full` | **stub**: only `none` runs; the rest are config hooks (Stage D3 not wired) |
+| `DecoyTransfer` | config.rs:864-869 | **`permuted_rt`**, `reverse_sequence`, `both` | MBR false-transfer null (**stub**, MBR-only) |
 
 #### Variant semantics (behaviorally-rich enums)
 
 The table names every variant; the ones below carry distinct behavior a
 maintainer must not confuse. Line refs are `config.rs`.
 
-**`MatcherKind`** (34-50). `Fragindex` (default) is the log-bin CSR matcher: on
+**`MatcherKind`** (30-42). `Fragindex` (default) is the log-bin CSR matcher: on
 narrow-window DIA it is ~1.95x faster in search-seed and ~1.26x in extract with
 essentially unchanged IDs (HYE B_01 peptides -0.1%). `Bucketed` is the previous
 `Library::page_search` path, retained for A/B comparison and for the AIF
 full-range-window case, where the min-relative vs query-relative predicate
 difference shifts IDs more.
 
-**`RescorerKind`** (128-150). `NativeTda` (default): native semi-supervised
-linear rescorer + target-decoy q, always available. `Mokapot` (133): mokapot
-Python sidecar over the PIN. `NnTorch` (134-140): PyTorch semi-supervised MLP
+**`RescorerKind`** (100-123). `NativeTda` (default): native semi-supervised
+linear rescorer + target-decoy q, always available. `Mokapot` (105-106): mokapot
+Python sidecar over the PIN. `NnTorch` (107-113): PyTorch semi-supervised MLP
 sidecar (`nn_rescore_worker.py`), a nonlinear Percolator/mokapot-style rescorer
 with CV folds + iterative positive re-selection; on the E.coli benchmark it beats
 linear mokapot on the same PIN and gains further when the extraction gate is
 opened; requires `rescore.python` to point at a torch interpreter. `Percolator`
-(141-142): external `percolator.exe` over the PIN. `Entrapment` (143-149): treats
+(114-115): external `percolator.exe` over the PIN. `Entrapment` (116-122): treats
 foreign-proteome PSMs (marked by `entrapment_marker`) as real negatives, trains a
 nonlinear GBM sidecar (out-of-fold by base peptide) or a native linear fallback,
 and reports entrapment-calibrated q-values; the chimeric false matches that
 in-silico decoys under-model appear as real negatives here.
 
-**`PeakClaim`** (157-193) apportions one observed MS2 peak that matches the
+**`PeakClaim`** (125-157) apportions one observed MS2 peak that matches the
 fragments of several co-isolated, co-eluting candidates (near-universal in
 wide-window DIA: ~98% of fragment m/z collide within tolerance), to stop a
 chimeric candidate borrowing a real peptide's peak wholesale. `None` (default,
@@ -408,7 +415,7 @@ corroborated by its OTHER fragments), not the one predicting the brightest ion.
 profile height dominates the runner-up by `peak_claim_margin`, else the peak
 stays shared (as `None`).
 
-**`GateMode`** (587-614) selects which spectral-agreement score `min_frag_corr`
+**`GateMode`** (547-574) selects which spectral-agreement score `min_frag_corr`
 thresholds, all computed at the gate from data in hand. `ApexPearson` (default,
 legacy): Pearson of observed-vs-predicted fragment intensities at the single apex
 scan (one chimeric scan can dominate). `PeakSpectral`: Pearson of the
@@ -422,7 +429,7 @@ correlation of each matched fragment's XIC to the signature reference over the
 peak (temporal agreement, orthogonal to intensity). `Combined`: require BOTH
 peak-integrated Pearson >= `min_frag_corr` AND co-elution >= `gate_coelution_min`.
 
-**`CompetitionMode`** (705-730). `WinnerTakeAll` (default, legacy): keep only the
+**`CompetitionMode`** (674-691). `WinnerTakeAll` (default, legacy): keep only the
 top `prelim_score` per group. `None`: keep every candidate (FDR handles
 ambiguity). `FeaturesOnly`: same retained set as `None`, with conflict/contested
 features carrying the interference signal into rescoring (the name documents
@@ -434,7 +441,7 @@ else keep it (conservative removal for the low-FDR region). Target/decoy labels
 stay in the competition key in every mode, so a target never competes against its
 own decoy.
 
-**`MbrStrategy`** (876-893) and **`DecoyTransfer`** (895-907) are stubs / config
+**`MbrStrategy`** (838-855) and **`DecoyTransfer`** (857-869) are stubs / config
 hooks (Stage D3 not wired; all require >= 2 runs). `MbrStrategy`: `None` (default)
 reproduces the chain byte-for-byte; `EmpiricalLibrary` builds the cross-run
 consensus anchor library only (M1); `RtTransfer` adds cross-run expected-RT
@@ -443,7 +450,7 @@ the MBR false-transfer null (M4): `PermutedRt` (default) transfers real precurso
 to a decoupled wrong expected RT; `ReverseSequence` transfers reverse/scramble
 decoys at the same expected RT; `Both` combines them.
 
-**`CompeteGroupBy`** (732-741). `Precursor` (default) groups charge/modification
+**`CompeteGroupBy`** (695-702). `Precursor` (default) groups charge/modification
 variants of one base peptide, separately within targets and within decoys;
 `Apex` additionally buckets by rounded apex RT (`apex_rt_tolerance_s`);
 `PeptidoformCharge` keeps each distinct peptidoform+charge as its own group
@@ -453,7 +460,7 @@ target never directly competes against its paired decoy in the `compete` stage.
 This does not remove target-decoy comparison from FDR: `rescore` later selects
 best representatives at each q-value unit and estimates the target-decoy null.
 
-**`PeakWindowMode`** (757-771). `PerCandidate` (default): each candidate's quant
+**`PeakWindowMode`** (714-729). `PerCandidate` (default): each candidate's quant
 window is anchored at the identified apex when available, with a summed-XIC
 fallback for older scored artifacts; its descent bounds can still be stretched by
 interference or collapse on sparse peaks. `Consensus`: the median left/right
@@ -469,15 +476,15 @@ run-local choice after an experiment-wide rescore. Quant has no source selector:
 slice the scored table by `source` before pairing it with each run's
 chromatograms. Changing the q column does not perform that slice.
 
-**`RollupMethod`** (743-750): `TopNSum` (default) sums the top-N most abundant
+**`RollupMethod`** (706-712): `TopNSum` (default) sums the top-N most abundant
 peptides per protein group (`top_n_peptides`); `Sum` sums all group peptides.
-**`NormalizeMethod`** (777-803, `quant-lfq` CLI token, not a config field):
+**`NormalizeMethod`** (735-761, `quant-lfq` CLI token, not a config field):
 `MedianRatio` (default) is a DESeq-style median-of-ratios size factor over
 complete-case features, robust to a minority of changing features (does not flatten
 a spike-in design's real fold changes); `Median` aligns each run's median intensity
 (simpler, less robust to composition shifts); `None` uses raw areas.
 
-### `DigestConfig` (config.rs:217-236)
+### `DigestConfig` (config.rs:181-200)
 
 | Field | Default | Effect |
 |---|---|---|
@@ -485,9 +492,9 @@ a spike-in design's real fold changes); `Median` aligns each run's median intens
 | `missed_cleavages` | 2 | max missed cleavages |
 | `min_len` | 5 | min peptide length |
 | `max_len` | 50 | max peptide length |
-| `decoy.strategy` | `reverse` | decoy scheme (`DecoyConfig`, config.rs:206-215) |
+| `decoy.strategy` | `reverse` | decoy scheme (`DecoyConfig`, config.rs:170-179) |
 
-### `PeptidoformsConfig` (config.rs:238-267)
+### `PeptidoformsConfig` (config.rs:202-231)
 
 | Field | Default | Effect |
 |---|---|---|
@@ -498,13 +505,13 @@ a spike-in design's real fold changes); `Median` aligns each run's median intens
 | `charge_max` | 3 | highest precursor charge |
 | `unknown_modification` | `error` | `error` or `skip` |
 
-`ResidueMod` (config.rs:269-276) is `{residue: char, name: String}` where `name`
+`ResidueMod` (config.rs:233-240) is `{residue: char, name: String}` where `name`
 is a UniMod name. The doc comment reserves `residue: '*'` for "any" and notes
-terminal mods are handled separately in the MVP (config.rs:272-273).
+terminal mods are handled separately in the MVP (config.rs:236).
 `deny_unknown_fields` applies but the struct has no `#[serde(default)]` (unlike
 every other section), so both keys are required inside a `ResidueMod` entry.
 
-### `PredictFragConfig` (config.rs:290-322)
+### `PredictFragConfig` (config.rs:250-282)
 
 | Field | Default | Effect |
 |---|---|---|
@@ -517,7 +524,7 @@ every other section), so both keys are required inside a `ResidueMod` entry.
 | `deeplc_python` | `None` | interpreter for DeepLC sidecar |
 | `sidecar_script_dir` | `"scripts"` | directory holding worker scripts |
 
-### `SearchSeedConfig` (config.rs:324-360)
+### `SearchSeedConfig` (config.rs:284-320)
 
 | Field | Default | Effect |
 |---|---|---|
@@ -529,7 +536,7 @@ every other section), so both keys are required inside a `ResidueMod` entry.
 | `matcher` | `fragindex` | matcher backend |
 | `two_pass_mass_cal` | `false` | **default-off** robust two-pass mass calibration (P3.1) |
 
-### `RtImTrainConfig` (config.rs:362-427)
+### `RtImTrainConfig` (config.rs:322-387)
 
 | Field | Default | Effect |
 |---|---|---|
@@ -548,7 +555,7 @@ every other section), so both keys are required inside a `ResidueMod` entry.
 | `adaptive_rt_bins` | 12 | RT bins for the adaptive window |
 | `rt_window_min_s` | 1.0 | lower clamp on any RT half-window |
 
-### `ExtractConfig` (config.rs:429-585)
+### `ExtractConfig` (config.rs:389-545)
 
 The largest section; the core extraction stage. Cascade thresholds and apex
 selection dominate.
@@ -563,7 +570,7 @@ selection dominate.
 | `presence_min_coelution` | 2 | min simultaneously-present fragments over the run |
 | `min_frag_corr` | 0.2 | tier-(d) spectral-agreement gate (0 disables; must be in [0,1]) |
 | `min_matched_fraction` | 0.0 | tier-(c) min fraction of predicted fragments observed |
-| `apex_top_fragments` | 0 | signature-fragment apex: sums the observed intensity of the top-K predicted fragments per scan; `0` falls back to a default of 3 (`extract.rs:969-973`), not all-matched |
+| `apex_top_fragments` | 0 | signature-fragment apex: sums the observed intensity of the top-K predicted fragments per scan; `0` falls back to a default of 3 (`extract.rs:1054-1058`), not all-matched |
 | `apex_rt_prior_s` | 0.0 | Gaussian RT prior sigma on apex (0 = off) |
 | `apex_count_tol` | 1 | fragment-count apex slack |
 | `apex_count_window` | 1 | rolling distinct-fragment count width (1 = none; profile `dia` sets 5) |
@@ -576,17 +583,17 @@ selection dominate.
 | `min_coelution_run` | 0 | **default-off** min consecutive co-elution scans |
 | `ms1_rescue` | `false` | **default-off** MS1-isotope rescue of gate failures |
 | `retain_top_peaks` | 1 | K peak groups per candidate (1 = legacy; must be >= 1) |
-| `emit_candidate_audit` | `false` | **default-off**; in `run` gates the separate `audit` stage that writes `candidate_audit.parquet` (`run.rs:276`); no stage writes `<psms>.audit.parquet`; no-op for standalone `mumdia extract` (P0.3) |
+| `emit_candidate_audit` | `false` | **default-off**; in `run` gates the separate `audit` stage that writes `candidate_audit.parquet` (`run.rs:405-406`); no stage writes `<psms>.audit.parquet`; no-op for standalone `mumdia extract` (P0.3) |
 | `apex_evidence_rank` | `false` | **default-off** evidence-count apex |
 | `emit_gate_diagnostics` | `false` | **default-off** four gate-score columns |
 | `gate_mode` | `apex_pearson` | which spectral score `min_frag_corr` thresholds |
 | `gate_coelution_min` | 0.5 | second threshold for `gate_mode = combined` |
 
 The `min_frag_corr` default was relaxed from a historical 0.5 to 0.2
-(config.rs:557-562). Every default-off knob is explicitly documented as
+(config.rs:517-522). Every default-off knob is explicitly documented as
 requiring entrapment/target-decoy FDR validation before use.
 
-### `FeaturesConfig` (config.rs:616-664)
+### `FeaturesConfig` (config.rs:576-624)
 
 | Field | Default | Effect |
 |---|---|---|
@@ -599,7 +606,7 @@ requiring entrapment/target-decoy FDR validation before use.
 | `bound_from_confident` | `true` | learn one global peak width from confident seed PSMs |
 | `bound_confident_pct` | 50.0 | percentile of confident half-widths as the shared width |
 
-### `CompeteConfig` (config.rs:666-703)
+### `CompeteConfig` (config.rs:626-664)
 
 | Field | Default | Effect |
 |---|---|---|
@@ -610,7 +617,7 @@ requiring entrapment/target-decoy FDR validation before use.
 | `unique_evidence_min_fragments` | 2 | min unique fragments for `unique_evidence` |
 | `emit_competition_audit` | `false` | **default-off** writes `<out>.compete_audit.parquet` |
 
-### `QuantConfig` (config.rs:830-874)
+### `QuantConfig` (config.rs:791-836)
 
 | Field | Default | Effect |
 |---|---|---|
@@ -625,7 +632,7 @@ requiring entrapment/target-decoy FDR validation before use.
 | `reliable_q` | 0.001 | confident-set q for the consensus width |
 | `q_filter` | `peptide_q` | `peptide_q`, `precursor_q` (single-run only), `psm_q`, or `run_psm_q` |
 
-### `RescoreConfig` (config.rs:951-1002)
+### `RescoreConfig` (config.rs:913-965)
 
 | Field | Default | Effect |
 |---|---|---|
@@ -641,19 +648,19 @@ requiring entrapment/target-decoy FDR validation before use.
 | `entrapment_ratio` | 1.0 | N_real_lib / N_entrap_lib scaling |
 | `strict` | `true` | fail on a rescorer sidecar failure or unsupported classifier; set false only for explicit compatibility fallback |
 
-### `MbrConfig` (config.rs:909-949), stub
+### `MbrConfig` (config.rs:871-911), stub
 
 Config hooks only; the MBR stage (D3) is not wired into the run chain. Fields:
 `strategy` (`none` default), `q_anchor` 0.01, `min_anchor_runs` 2,
 `q_transfer` 0.01, `rt_window_s` 20.0, `decoy_transfer` `permuted_rt`,
 `consensus_corr_min` 0.0, `requant_all` `false`, `python` `None`. `mbr` is the
 one top-level section with an explicit extra `#[serde(default)]` attribute
-(config.rs:1022-1023). With `strategy = none` the chain is byte-identical to no
+(config.rs:985-986). With `strategy = none` the chain is byte-identical to no
 MBR.
 
-### Top-level `Config` (config.rs:1008-1024)
+### Top-level `Config` (config.rs:971-1005)
 
-`rng_seed` (default 0) plus the eleven stage sections and `mbr`. `rng_seed`
+`rng_seed` (default 0) plus the ten stage sections and `mbr`. `rng_seed`
 seeds every RNG (decoy scramble, CV fold assignment) for determinism.
 
 ### Removed / not present
@@ -698,7 +705,7 @@ stale.
   (`mass.rs:70`), safe only because `parse_peptidoform` already rejected
   ambiguous residues. Constructing a `ParsedPeptidoform` by hand with a
   non-standard residue byte would panic.
-- **Second mod at the same position accumulates** (`mass.rs:189`), which is a
+- **Second mod at the same position accumulates** (`mass.rs:191`), which is a
   behavior difference from engines that drop it; terminal mods are separate
   fields, not part of `mods[i]`.
 - **Recent correctness changes bumped four schemas.** `PSMS_COMPETED` and
@@ -716,7 +723,7 @@ stale.
   the struct level), and document the effect inline. Do not hardcode a choice the
   config could express (project convention). If the field can be set to a value
   that would silently corrupt results, add a `validate()` check
-  (`config.rs:1056-1091`) that rejects it with `ConfigError::Invalid`.
+  (`config.rs:1019-1100`) that rejects it with `ConfigError::Invalid`.
 - **Add a strategy variant.** Extend the enum, keep `#[serde(rename_all =
   "snake_case")]`, and (if it is not implementable yet) reject it in `validate`
   the way `DiannShift` and `CalibrationMethod::None` are, rather than letting it
@@ -725,8 +732,8 @@ stale.
   (`mass.rs:13-26`). Use the PSI-MS/UniMod monoisotopic delta so the Python
   sidecar adapters map the name. No table is copied from another tool.
 - **Add an artifact / bump a schema.** Add or bump the constant in
-  `schema.rs:6-24`. Bump the version whenever the column set changes
-  (as `PSMS_SCORED` went to 2). Update the producing stage's `ArtifactReport`
+  `schema.rs:7-24`. Bump the version whenever the column set changes
+  (as `PSMS_SCORED` went to 3). Update the producing stage's `ArtifactReport`
   (`schema_name`, `schema_version`) and its `record_artifact` call so the manifest
   and the sidecar report agree.
 - **Add a manifest field.** Extend `Manifest` or `ArtifactRecord`

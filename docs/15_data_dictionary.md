@@ -8,7 +8,7 @@ not from prose. Citations are `file:line`.
 
 Columns are built from the `Col` enum in
 `rust/mumdia/crates/mumdia-io/src/table.rs`. Each variant maps to a fixed Arrow
-`DataType` and nullability (`table.rs:84-100`):
+`DataType` and nullability in `Col::field` (`table.rs:87-100`):
 
 | `Col` variant | Arrow type | nullable |
 |---|---|---|
@@ -41,7 +41,7 @@ their own sections at the end.
 
 ## Stage 0: `convert` (`stages/convert.rs`)
 
-### spectra_ms1 (`convert.rs:177-185`)
+### spectra_ms1 (`convert.rs:171-179`)
 
 | column | Arrow type | nullable | units | meaning |
 |---|---|---|---|---|
@@ -50,7 +50,7 @@ their own sections at the end.
 | `mz` | List\<Float32\> | yes | m/z | centroided, m/z-sorted peak m/z values |
 | `intensity` | List\<Float32\> | yes | counts | peak intensities aligned to `mz` |
 
-### spectra_ms2 (`convert.rs:204-219`)
+### spectra_ms2 (`convert.rs:198-213`)
 
 | column | Arrow type | nullable | units | meaning |
 |---|---|---|---|---|
@@ -66,9 +66,9 @@ their own sections at the end.
 | `mz` | List\<Float32\> | yes | m/z | centroided fragment m/z values |
 | `intensity` | List\<Float32\> | yes | counts | fragment intensities aligned to `mz` |
 
-### isolation_windows (`convert.rs:221-229`)
+### isolation_windows (`convert.rs:215-226`)
 
-The distinct-window column is `window_id` (verified: `convert.rs:224`).
+The distinct-window column is `window_id` (verified: `convert.rs:218`).
 
 | column | Arrow type | nullable | units | meaning |
 |---|---|---|---|---|
@@ -77,7 +77,7 @@ The distinct-window column is `window_id` (verified: `convert.rs:224`).
 | `lower` | Float64 | no | m/z | window lower bound |
 | `upper` | Float64 | no | m/z | window upper bound |
 
-### ms2_to_ms1 (`convert.rs:231-237`)
+### ms2_to_ms1 (`convert.rs:228-234`)
 
 | column | Arrow type | nullable | units | meaning |
 |---|---|---|---|---|
@@ -88,7 +88,7 @@ The distinct-window column is `window_id` (verified: `convert.rs:224`).
 
 ## Stage A: `digest` (`stages/digest.rs`)
 
-### peptides (`digest.rs:214-226`)
+### peptides (`digest.rs:286-298`)
 
 | column | Arrow type | nullable | units | meaning |
 |---|---|---|---|---|
@@ -105,7 +105,7 @@ The distinct-window column is `window_id` (verified: `convert.rs:224`).
 
 ## Stage A2: `peptidoforms` (`stages/peptidoforms.rs`)
 
-### peptidoforms (`peptidoforms.rs:135-147`)
+### peptidoforms (`peptidoforms.rs:253-265`)
 
 | column | Arrow type | nullable | units | meaning |
 |---|---|---|---|---|
@@ -122,7 +122,7 @@ The distinct-window column is `window_id` (verified: `convert.rs:224`).
 
 ## Stage C: `predict-frag` (`stages/predict_frag.rs`)
 
-### fragment_library precursors (`predict_frag.rs:186-200`)
+### fragment_library precursors (`predict_frag.rs:197-211`)
 
 | column | Arrow type | nullable | units | meaning |
 |---|---|---|---|---|
@@ -137,7 +137,7 @@ The distinct-window column is `window_id` (verified: `convert.rs:224`).
 | `protein` | Utf8 | no | - | protein accessions |
 | `n_fragments` | Int32 | no | - | number of fragments kept for this candidate after top-N |
 
-### fragment_library fragments (`predict_frag.rs:201-212`)
+### fragment_library fragments (`predict_frag.rs:212-223`)
 
 | column | Arrow type | nullable | units | meaning |
 |---|---|---|---|---|
@@ -153,7 +153,7 @@ The distinct-window column is `window_id` (verified: `convert.rs:224`).
 
 ## Stage S: `search-seed` (`stages/search_seed.rs`)
 
-### seed_psms (`search_seed.rs:217-234`)
+### seed_psms (`search_seed.rs:233-250`)
 
 | column | Arrow type | nullable | units | meaning |
 |---|---|---|---|---|
@@ -171,7 +171,7 @@ The distinct-window column is `window_id` (verified: `convert.rs:224`).
 | `matched_peaks` | Int32 | no | - | matched fragment count at the best scan |
 | `scan_index` | UInt32 | no | - | `scan_index` of the best-scoring MS2 scan |
 
-### `<seed>.masscal.json` (`search_seed.rs:204-214`)
+### `<seed>.masscal.json` (`search_seed.rs:217-227`)
 
 Per-run fragment mass recalibration sidecar consumed by `extract`.
 
@@ -187,7 +187,7 @@ Per-run fragment mass recalibration sidecar consumed by `extract`.
 
 ## Stage B: `rt-im-train` (`stages/rt_im_train.rs`)
 
-### run_windows (`rt_im_train.rs:182-193`)
+### run_windows (`rt_im_train.rs:266-277`)
 
 | column | Arrow type | nullable | units | meaning |
 |---|---|---|---|---|
@@ -199,15 +199,15 @@ Per-run fragment mass recalibration sidecar consumed by `extract`.
 | `im_lo` | Float64 | yes | 1/K0 | IM window lower bound; always null |
 | `im_hi` | Float64 | yes | 1/K0 | IM window upper bound; always null |
 
-### `<run_windows>` cal.json (`rt_im_train.rs:196-208`)
+### `<run_windows>` cal.json (`rt_im_train.rs:290-302`)
 
 RT-calibration sidecar (written to `out_cal`, not part of the Parquet contract).
 
 | field | JSON type | meaning |
 |---|---|---|
-| `method` | string | `loess` or `linear` |
-| `slope` | number | linear fit slope (iRT -> s) |
-| `intercept` | number | linear fit intercept (s) |
+| `method` | string | `loess`, `linear`, or `unavailable` (no calibration fit ran) |
+| `slope` | number or null | linear fit slope (iRT -> s); null when calibration is unavailable |
+| `intercept` | number or null | linear fit intercept (s); null when calibration is unavailable |
 | `w_rt` | number | global RT half-window width (s) |
 | `p_rt` | number | residual percentile used for the window |
 | `multiplier` | number | RT window multiplier |
@@ -218,7 +218,7 @@ RT-calibration sidecar (written to `out_cal`, not part of the Parquet contract).
 
 ## Stage D: `extract` (`stages/extract.rs`)
 
-### psms_extracted (`extract.rs:1358-1379`, base columns)
+### psms_extracted (`extract.rs:1474-1495`, base columns)
 
 One row per accepted candidate (the selected apex PSM).
 
@@ -246,7 +246,7 @@ One row per accepted candidate (the selected apex PSM).
 | `ms1_iso2` | Float64 | yes | counts | MS1 +2 isotope intensity; null when no MS1 |
 
 Conditional columns, appended only when `extract.emit_contested_features`
-(`extract.rs:1382-1385`):
+(`extract.rs:1498-1501`):
 
 | column | Arrow type | nullable | units | meaning |
 |---|---|---|---|---|
@@ -254,8 +254,9 @@ Conditional columns, appended only when `extract.emit_contested_features`
 | `apportioned_frac` | Float64 | no | fraction | fraction of contested intensity kept under proportional apportionment |
 
 Conditional columns, appended only when `extract.emit_gate_diagnostics`
-(`extract.rs:1388-1393`); all four gate scores are computed for every accepted
-candidate regardless of the active `gate_mode`:
+(`extract.rs:1504-1509`). All four gate scores are computed together only when
+this flag is set (`extract.rs:1224-1229`); when it is off they are not computed
+and the columns are not written, so the default schema stays byte-identical:
 
 | column | Arrow type | nullable | units | meaning |
 |---|---|---|---|---|
@@ -264,7 +265,7 @@ candidate regardless of the active `gate_mode`:
 | `gate_coelution` | Float32 | no | correlation | temporal co-elution score |
 | `gate_spectral_entropy` | Float32 | no | similarity | apex spectral-entropy similarity (sqrt) |
 
-### chromatograms (`extract.rs:1396-1410`)
+### chromatograms (`extract.rs:1512-1526`)
 
 One row per predicted transition per accepted candidate, plus MS1 isotope XIC
 pseudo-rows (`frag_name` = `ms1_mono`/`ms1_iso1`/`ms1_iso2`) when MS1 + window
@@ -283,7 +284,7 @@ grid are available.
 `rt`/`intensity` use `LargeList` (64-bit offsets) because the total list-value
 count can exceed the 32-bit `ListArray` offset ceiling on large candidate sets.
 
-### `<psms>.peaks.parquet`, top-K peak retention (`extract.rs:1416-1426`)
+### `<psms>.peaks.parquet`, top-K peak retention (`extract.rs:1532-1543`)
 
 Written next to the PSM table only when `extract.retain_top_peaks > 1`; one row
 per (candidate, peak).
@@ -302,7 +303,7 @@ per (candidate, peak).
 
 ## Stage E: `features` (`stages/features.rs`)
 
-### features.parquet (`features.rs:827-843`)
+### features.parquet (`features.rs:913-932`)
 
 Bookkeeping columns followed by the active feature columns. Every feature column
 is `Float64`.
@@ -322,21 +323,21 @@ is `Float64`.
 | ...feature columns... | Float64 | no | varies | one column per name in `active_features(set)` (see below) |
 
 The active feature list depends on `features.set`
-(`features.rs:206-227`): Minimal (14), Rich (14 + 30 = 44), or Extended
+(`features.rs:210-231`): Minimal (14), Rich (14 + 30 = 44), or Extended
 (14 + 30 + extended battery + 6 psms-derived; **381** columns total, the value of
 `active_features(FeatureSet::Extended).len()` confirmed by the runtime
-`features=381` log. The `feature_sets_sized` test (`features.rs:1435-1446`)
+`features=381` log. The `feature_sets_sized` test (`features.rs:1590-1605`)
 asserts the structural formula `14 + 30 + extended_names().len() + 6` and name
 uniqueness, not a literal count).
 
-**Minimal feature columns** (`features.rs:154-169`):
+**Minimal feature columns** (`features.rs:158-173`):
 `rt_error_abs`, `rt_error_rel`, `n_matched_fragments`, `coelution_run`,
 `log_apex_intensity`, `frag_corr`, `frag_cosine`, `spectral_angle`,
 `coelution_mean`, `coelution_best`, `n_coelution_above`, `charge`,
 `peptide_length`, `n_proteins`.
 
 **Rich-extra feature columns** (added for Rich and Extended,
-`features.rs:172-203`):
+`features.rs:176-207`):
 `library_norm_manhattan`, `library_rmsd`, `xcorr_coelution`, `xcorr_shape`,
 `sum_b_intensity`, `sum_y_intensity`, `diff_by_intensity`, `n_b_ions`,
 `n_y_ions`, `weighted_mass_error`, `mean_mass_error`, `isotope_corr`,
@@ -346,7 +347,7 @@ uniqueness, not a literal count).
 `contrast_min`, `resid_corr`, `coel_clean`, `shadow_frac`.
 
 **psms-derived Extended extras** (added only for Extended,
-`features.rs:216-224`):
+`features.rs:220-228`):
 `peak_contested_frac`, `peak_contested_count_frac`, `peak_apportioned_frac`,
 `n_charge_states`, `charge_multi_flag`, `cross_charge_intensity_log`.
 
@@ -354,7 +355,7 @@ uniqueness, not a literal count).
 `stages/features/` are concatenated in the registry order at
 `features.rs:52-68`. Each family exposes a `NAMES: &[&str]` array; the registry
 drops any name colliding with a Minimal/Rich name and any cross-family duplicate,
-keeping the first appearance (`features.rs:80-95`). The raw per-family names are
+keeping the first appearance (`features.rs:84-99`). The raw per-family names are
 listed below (raw total 335; the deduplicated survivors are the Extended battery
 columns).
 
@@ -488,7 +489,7 @@ columns).
   `frag_mass_err_max_abs`, `frag_mass_err_range`, `effective_frag_count`,
   `evidence_concentration`, `frac_top3_pred_observed`, `frac_top5_pred_observed`.
 
-### `<features>.schema.json` (`features.rs:846-853`)
+### `<features>.schema.json` (`features.rs:936-942`)
 
 Feature schema companion carried forward to compete/rescore so the classifier
 input is reproducible.
@@ -498,7 +499,7 @@ input is reproducible.
 | `feature_columns` | array of strings | ordered active feature list |
 | `schema_id` | string | blake3 hash of the joined column list |
 
-### PIN (`features.rs:1388-1419`)
+### PIN (`features.rs:1537-1573`)
 
 Percolator input, tab-separated text (written to `out_pin`). Header:
 `SpecId  Label  ScanNr  ExpMass  CalcMass  <feature cols...>  Peptide  Proteins`.
@@ -518,11 +519,11 @@ Percolator input, tab-separated text (written to `out_pin`). Header:
 
 ## Stage F: `compete` (`stages/compete.rs`)
 
-### psms_competed (`compete.rs:118-130`)
+### psms_competed (`compete.rs:121-151`)
 
 Bookkeeping columns plus the feature columns carried from the schema (each
 `Float64`). A `<out>.schema.json` companion is copied forward
-(`compete.rs:133`).
+(`compete.rs:153`).
 
 | column | Arrow type | nullable | units | meaning |
 |---|---|---|---|---|
@@ -538,7 +539,7 @@ Bookkeeping columns plus the feature columns carried from the schema (each
 | `prelim_score` | Float64 | no | - | preliminary composite score |
 | ...feature columns... | Float64 | no | varies | each `feature_columns` entry from the schema |
 
-### `<out>.compete_audit.parquet` (`compete.rs:147-179`)
+### `<out>.compete_audit.parquet` (`compete.rs:167-202`)
 
 Conditional, written only when `compete.emit_competition_audit`; one row per
 candidate removed by within-group competition.
@@ -557,7 +558,7 @@ candidate removed by within-group competition.
 
 ## Stage F: `rescore` (`stages/rescore.rs`)
 
-### psms_scored (schema v3)
+### psms_scored (schema v3, `rescore.rs:447-476`)
 
 | column | Arrow type | nullable | units | meaning |
 |---|---|---|---|---|
@@ -584,13 +585,15 @@ candidate removed by within-group competition.
 
 Which null the q-values use depends on the classifier: target-decoy for
 `NativeTda`/`Mokapot`/`NnTorch`/`Percolator`, entrapment for the `Entrapment`
-rescorer (`rescore.rs:196-204`).
+rescorer. The q-value branch is at `rescore.rs:289-297`; the `qmode` selector
+defaults to target-decoy (`rescore.rs:145`) and switches to entrapment only
+inside the `Entrapment` classifier arm (`rescore.rs:252-273`).
 
 ---
 
 ## Stage G: `quant` (`stages/quant.rs`)
 
-### peptide_quant (schema v2)
+### peptide_quant (schema v2, `quant.rs:487-502`)
 
 | column | Arrow type | nullable | units | meaning |
 |---|---|---|---|---|
@@ -606,7 +609,7 @@ rescorer (`rescore.rs:196-204`).
 | `integration_lo_rt` | Float64 | yes | s | integration lower bound actually used |
 | `integration_hi_rt` | Float64 | yes | s | integration upper bound actually used |
 
-### protein_group_quant (schema v2)
+### protein_group_quant (schema v2, `quant.rs:519-527`)
 
 | column | Arrow type | nullable | units | meaning |
 |---|---|---|---|---|
@@ -615,7 +618,7 @@ rescorer (`rescore.rs:196-204`).
 | `quant_status` | Utf8 | no | - | quantified or `no_quantifiable_peptide` |
 | `n_peptides` | Int32 | no | - | unique positive base peptides before Top-N truncation |
 
-### fragment_quant (optional, `quant.rs:369-379`)
+### fragment_quant (optional, `quant.rs:558-568`)
 
 Written only when `out_fragment` is set (ion-level directLFQ input).
 
@@ -628,7 +631,7 @@ Written only when `out_fragment` is set (ion-level directLFQ input).
 | `fragment_name` | Utf8 | no | - | fragment name |
 | `quantity` | Float64 | no | intensity x s | per-fragment trapezoid area over the peak window |
 
-### peak-bounds diagnostic (optional, `quant.rs:275-282`)
+### peak-bounds diagnostic (optional, `quant.rs:421-429`)
 
 Written only when `out_peak_bounds` is set and `bound_peak` is on.
 
@@ -639,7 +642,7 @@ Written only when `out_peak_bounds` is set and `bound_peak` is on.
 | `hi_rt` | Float64 | no | s | integration window upper RT |
 | `width_s` | Float64 | no | s | `hi_rt - lo_rt` |
 
-### quant-lfq cross-run output (`quant.rs:476-484`, `run_lfq_combine`)
+### quant-lfq cross-run output (`quant.rs:720-728`, `run_lfq_combine` at `quant.rs:657`)
 
 Long-form MaxLFQ (peptide-level) or directLFQ (ion-level) matrix.
 
@@ -652,9 +655,33 @@ Long-form MaxLFQ (peptide-level) or directLFQ (ion-level) matrix.
 
 ---
 
+## Stage D2: `align` (`stages/align.rs`)
+
+Experiment-level cross-run stage that prepares MBR. It puts every run on a common
+RT coordinate: the first input seed is the reference, and for each run it fits a
+monotone LOESS mapping from the run's observed RT to the reference RT over
+confidently shared peptides, then emits that mapping on a `grid_n`-point grid.
+The reference run (or a run with fewer than four shared peptides) uses the
+identity mapping. This artifact is written with an inline `alignment` (v1)
+`ArtifactReport` (`align.rs:141-153`); it is not registered in the frozen
+`schema.rs` artifact table.
+
+### alignment (`align.rs:130-138`)
+
+One row per (run, grid point).
+
+| column | Arrow type | nullable | units | meaning |
+|---|---|---|---|---|
+| `run_id` | UInt32 | no | - | 0-based input run index (position in the seed list); run 0 is the reference |
+| `source_rt` | Float64 | no | s | grid point in this run's own observed RT coordinate |
+| `reference_rt` | Float64 | no | s | RT mapped onto the reference coordinate; identity for the reference run or when fewer than four peptides are shared with the reference |
+| `residual_spread` | Float64 | no | s | 95th-percentile absolute LOESS residual on shared peptides for this run; 0.0 for the reference or an unfit run; bounds how tight an MBR window can be |
+
+---
+
 ## `audit` (`stages/audit.rs`)
 
-### candidate_audit.parquet (`audit.rs:177-197`)
+### candidate_audit.parquet (`audit.rs:180-200`)
 
 One row per library candidate (the full search space), with per-stage survival
 flags and the earliest rejection reason.
@@ -678,7 +705,7 @@ flags and the earliest rejection reason.
 | `reported` | Boolean | no | - | passed the precursor FDR gate |
 | `rejection_reason` | Utf8 | no | - | earliest-loss reason code (e.g. `REPORTED`, `NO_PEAK_GROUP`, `OUTCOMPETED_BY_TARGET`, `FAILED_PRECURSOR_FDR`) |
 
-### `<audit>.metrics.json` (`audit.rs:203-213`)
+### `<audit>.metrics.json` (`audit.rs:206-216`)
 
 | field | JSON type | meaning |
 |---|---|---|
@@ -716,7 +743,7 @@ experiment-level/Python-written outputs have partial or no coverage.
 
 ### manifest.json (`mumdia-core/src/manifest.rs:9-31`)
 
-Written by the `run` orchestrator (`run.rs:334-335`). Records per-artifact
+Written by the `run` orchestrator (`stages/run.rs:500-501`). Records per-artifact
 provenance for reproducibility. Top-level `Manifest`:
 
 | field | JSON type | meaning |
@@ -745,8 +772,8 @@ Each `ArtifactRecord`:
 
 ## Not covered here
 
-`report` writes `peptides.tsv` and `proteins.tsv` (`run.rs:307-316`), which are
-human-readable TSV, not Parquet, and are outside this Parquet data dictionary.
+`report` writes `peptides.tsv` and `proteins.tsv` (`stages/run.rs:459-461`), which
+are human-readable TSV, not Parquet, and are outside this Parquet data dictionary.
 Sidecar worker I/O in the working directory (the Mokapot/NN PIN, the entrapment
 GBM in/out Parquet, MS2PIP/DeepLC exchange files) are transient contract files,
 not engine artifacts.

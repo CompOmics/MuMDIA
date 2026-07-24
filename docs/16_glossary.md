@@ -10,7 +10,7 @@ that source to confirm details. Terms are alphabetical.
 window is applied, so every precursor in the scan range is co-fragmented into one
 highly chimeric MS2. When `convert` sees an MS2 whose isolation bounds are both
 zero, it synthesizes a full-range window `[0, 1e6]` so the scan is treated as
-covering all precursors (`rust/mumdia/crates/mumdia/src/stages/convert.rs:148`).
+covering all precursors (`rust/mumdia/crates/mumdia/src/stages/convert.rs:143`).
 The `LFQ_Orbitrap_AIF_Ecoli_01` benchmark file is AIF.
 
 **apex**. The retention-time point (a scan or a small scan group) where a
@@ -20,7 +20,7 @@ cascade and emits one apex-level PSM per surviving candidate
 (`rust/mumdia/crates/mumdia/src/stages/extract.rs:10`). Because a single fragment
 m/z channel is chimeric in DIA, the apex is chosen by co-eluting fragment breadth,
 optionally by only the top-K predicted (signature) fragments, rather than by raw
-maximum intensity (`rust/mumdia/crates/mumdia-core/src/config.rs:453`).
+maximum intensity (`rust/mumdia/crates/mumdia-core/src/config.rs:413`).
 
 **candidate_id**. The dense integer key for one library entry (a peptidoform at a
 charge). It is a precondition of the fragment index that `candidate_id` be the
@@ -35,7 +35,7 @@ the isolation-window candidate slice by a binary search over `candidate_id`, sin
 **chimeric spectrum**. An MS2 in which fragments from several co-isolated,
 co-eluting precursors overlap in one spectrum, the normal case in DIA (in
 wide-window DIA about 98% of fragment m/z collide within tolerance,
-`rust/mumdia/crates/mumdia-core/src/config.rs:158`). Chimeric interference is why
+`rust/mumdia/crates/mumdia-core/src/config.rs:127`). Chimeric interference is why
 intensity-based apex selection and single-scan gates are unreliable, and why
 in-silico decoys can under-model the true false-match population (motivating the
 entrapment cross-check, `rust/mumdia/crates/mumdia/src/fdr.rs:60`).
@@ -52,10 +52,10 @@ candidate; claiming is the policy (`PeakClaim`) that decides how its intensity i
 apportioned so a chimeric candidate cannot borrow a real peptide's peak wholesale,
 ranging from `None` (every claimant gets the full peak) through winner-take-all to
 co-elution-profile apportionment
-(`rust/mumdia/crates/mumdia-core/src/config.rs:162`). With
+(`rust/mumdia/crates/mumdia-core/src/config.rs:132`). With
 `emit_contested_features` the extractor records a non-destructive `contested_frac`
 per PSM: the fraction of a candidate's matched intensity a co-eluting competitor
-claims more strongly (`rust/mumdia/crates/mumdia-core/src/config.rs:489`). All peak
+claims more strongly (`rust/mumdia/crates/mumdia-core/src/config.rs:454`). All peak
 claiming is default-off.
 
 **co-elution**. Agreement in retention-time shape: a candidate's fragments should
@@ -70,12 +70,16 @@ temporal agreement, orthogonal to intensity-pattern agreement.
 estimate the false discovery rate. MuMDIA mints one paired decoy per target at
 digest time: `Reverse` reverses the interior residues keeping the C-terminal
 residue fixed, `Scramble` runs a seeded deterministic Fisher-Yates shuffle of the
-interior (`rust/mumdia/crates/mumdia/src/stages/digest.rs:99`). `DiannShift` (a
+interior (`rust/mumdia/crates/mumdia/src/stages/digest.rs:99`). Native decoys are
+collision-checked: a decoy that would collide with a target or an already-emitted
+decoy is re-scrambled with independent seeds while keeping the C terminus fixed,
+and dropped if no distinct sequence is found
+(`rust/mumdia/crates/mumdia/src/stages/digest.rs:137`). `DiannShift` (a
 terminal-residue fragment m/z shift) is threaded through config but realized
 nowhere and rejected by validation
-(`rust/mumdia/crates/mumdia/src/stages/digest.rs:117`,
-`rust/mumdia/crates/mumdia-core/src/config.rs:1058`). The default is `Reverse`
-(`rust/mumdia/crates/mumdia-core/src/config.rs:28`).
+(`rust/mumdia/crates/mumdia/src/stages/digest.rs:126`,
+`rust/mumdia/crates/mumdia-core/src/config.rs:1021`). The default is `Reverse`
+(`rust/mumdia/crates/mumdia-core/src/config.rs:20`).
 
 **DeepLC fine-tune**. An optional per-run adaptation of the DeepLC retention-time
 model on the confident seed PSMs, run between `search-seed` and RT calibration; it
@@ -90,7 +94,7 @@ proteome into the search library and treats those spike-in PSMs as real negative
 empirical-null analog of target-decoy q that also feels the chimeric interference
 in-silico decoys under-model (`rust/mumdia/crates/mumdia/src/fdr.rs:64`). A PSM is
 classified as entrapment when its protein contains `entrapment_marker` (with
-exclude/contaminant carve-outs, `rust/mumdia/crates/mumdia/src/stages/rescore.rs:405`).
+exclude/contaminant carve-outs, `rust/mumdia/crates/mumdia/src/stages/rescore.rs:577`).
 Opt-in via `RescorerKind::Entrapment`; the default path relies on target-decoy FDR.
 
 **final ID (vs seed)**. The identifications reported to the user, produced by
@@ -101,19 +105,19 @@ q-values. This is distinct from the seed search, whose only purpose is calibrati
 **gate (`min_frag_corr`) and GateMode**. The extraction acceptance gate: a
 candidate is rejected when its observed-vs-predicted fragment agreement falls below
 `extract.min_frag_corr` (default 0.2; 0 disables,
-`rust/mumdia/crates/mumdia-core/src/config.rs:446`,
-`rust/mumdia/crates/mumdia-core/src/config.rs:562`). `GateMode` selects which
+`rust/mumdia/crates/mumdia-core/src/config.rs:406`,
+`rust/mumdia/crates/mumdia-core/src/config.rs:522`). `GateMode` selects which
 agreement score is thresholded: `ApexPearson` (single-apex-scan intensity Pearson,
 the default), `PeakSpectral` (peak-integrated spectrum), `SpectralEntropy` (Li
 similarity on sqrt-transformed intensities), `Coelution` (temporal correlation), or
 `Combined` (spectral AND co-elution), at
-`rust/mumdia/crates/mumdia-core/src/config.rs:589`. Gating on the rescorer's single
+`rust/mumdia/crates/mumdia-core/src/config.rs:551`. Gating on the rescorer's single
 best discriminator regresses end-to-end, so a strong discriminator is the wrong
 criterion for a gate.
 
 **hyperscore**. The Sage-style score used by `search-seed`, defined as
 `ln(matched!) + ln(1 + summed matched intensity)`
-(`rust/mumdia/crates/mumdia/src/stages/search_seed.rs:384`). It ranks candidates in
+(`rust/mumdia/crates/mumdia/src/stages/search_seed.rs:413`). It ranks candidates in
 the broad seed search only; it is not the final rescoring score.
 
 **inverted fragment index**. A peak-major index mapping fragment m/z to the
@@ -131,14 +135,16 @@ natively or from a DeepLC sidecar
 (`rust/mumdia/crates/mumdia/src/stages/predict_frag.rs:3`); `rt-im-train` calibrates
 iRT onto this run's observed RT (linear or LOESS) and derives per-candidate RT
 windows from the residuals (`rust/mumdia/crates/mumdia/src/stages/rt_im_train.rs:1`).
-Peptidoforms with no predicted iRT are silently anchored at 0.0
-(`rust/mumdia/crates/mumdia/src/stages/predict_frag.rs:287`). See `DeepLC fine-tune`.
+Peptidoforms with no predicted iRT are anchored at 0.0: this is the silent
+construction default (`rust/mumdia/crates/mumdia/src/stages/predict_frag.rs:96`),
+and the DeepLC path additionally logs a warning when the sidecar returns no iRT
+(`rust/mumdia/crates/mumdia/src/stages/predict_frag.rs:298`). See `DeepLC fine-tune`.
 
 **isolation window**. The precursor m/z range the instrument selected for
 fragmentation in an MS2, given as `(target, lower, upper)`. `extract` and
 `search-seed` use it to restrict candidates to those whose precursor m/z falls
 inside the window (`Library::candidate_range`,
-`rust/mumdia/crates/mumdia/src/index.rs:233`). In AIF/all-ion scans there is no
+`rust/mumdia/crates/mumdia/src/index.rs:238`). In AIF/all-ion scans there is no
 quadrupole selection, so a full-range window stands in (see `AIF`).
 
 **manifest**. `manifest.json`, the per-run provenance record `run` writes: the
@@ -159,24 +165,24 @@ f32-stored / f64-verify ppm predicate.
 an identification confident in one run to a run where it scored below threshold,
 gaining sensitivity. In MuMDIA it is a stub with config hooks and a Python sidecar
 contract (`mbr_worker.py`); the default is no MBR and it needs at least two runs
-(`rust/mumdia/crates/mumdia/src/sidecar.rs:131`,
-`rust/mumdia/crates/mumdia-core/src/config.rs:884`). A transferred PSM is flagged
+(`rust/mumdia/crates/mumdia/src/sidecar.rs:157`,
+`rust/mumdia/crates/mumdia-core/src/config.rs:845`). A transferred PSM is flagged
 `is_transferred` with its q-value lowered
-(`rust/mumdia/crates/mumdia/src/main.rs:246`).
+(`rust/mumdia/crates/mumdia/src/main.rs:249`).
 
 **mokapot**. An opt-in Python rescoring sidecar (`RescorerKind::Mokapot`) run over
 the PIN file with a logistic-regression default; the default `rescore.strict=true`
 makes failure fatal. Setting strict false explicitly enables native compatibility
 fallback
-(`rust/mumdia/crates/mumdia-core/src/config.rs:132`,
-`rust/mumdia/crates/mumdia/src/stages/rescore.rs:105`). See `percolator_lite`.
+(`rust/mumdia/crates/mumdia-core/src/config.rs:941`,
+`rust/mumdia/crates/mumdia/src/stages/rescore.rs:172`). See `percolator_lite`.
 
 **nn_torch**. An opt-in PyTorch semi-supervised MLP rescoring sidecar
 (`RescorerKind::NnTorch`, `nn_rescore_worker.py`) over the same PIN contract as
 mokapot; a nonlinear Percolator/mokapot-style model with CV folds and iterative
 positive re-selection that beats the linear model on the E.coli benchmark and gains
 further when the extraction gate is opened
-(`rust/mumdia/crates/mumdia-core/src/config.rs:134`).
+(`rust/mumdia/crates/mumdia-core/src/config.rs:107`).
 
 **peptidoform**. A concrete modified peptide: a stripped sequence plus a specific
 placement of fixed and variable modifications and a charge state. `peptidoforms`
@@ -196,14 +202,14 @@ no external dependency.
 **precursor**. The intact peptide ion selected for fragmentation, i.e. a
 peptidoform at a charge, characterized by its precursor m/z. It is the grouping key
 for `precursor_q` (peptidoform + charge,
-`rust/mumdia/crates/mumdia/src/stages/rescore.rs:262`) and the reporting unit of
+`rust/mumdia/crates/mumdia/src/stages/rescore.rs:388`) and the reporting unit of
 `peptides.tsv`, whose rows are precursors, not stripped sequences
-(`rust/mumdia/crates/mumdia/src/stages/report.rs:134`).
+(`rust/mumdia/crates/mumdia/src/stages/report.rs:93`).
 
 **prelim_score**. A cheap preliminary PSM score computed in `features` before
 rescoring, combining matched-fragment count scaled by fragment correlation, mean
 co-elution, log apex intensity, and an RT-error penalty
-(`rust/mumdia/crates/mumdia/src/stages/features.rs:815`). It orders candidates for
+(`rust/mumdia/crates/mumdia/src/stages/features.rs:901`). It orders candidates for
 `compete` (winner-take-all and margin-gated modes use it) and seeds the native
 rescorer's positive-set selection; it is not the reported score.
 
@@ -218,7 +224,7 @@ library and PSM tables are ProForma-lite.
 unit for protein-level FDR. The MVP grouping keys on the protein-accession-set
 string (decoys carry a `DECOY_` prefix), and full parsimony/razor inference is a
 later option; `pg_q_value` is the target-decoy q over the best PSM per group
-(`rust/mumdia/crates/mumdia/src/stages/rescore.rs:206`).
+(`rust/mumdia/crates/mumdia/src/stages/rescore.rs:306`).
 
 **PSM (peptide-spectrum match)**. One hypothesis pairing a candidate peptidoform
 with observed spectral evidence at a retention-time apex. `extract` emits one
@@ -234,7 +240,7 @@ reports. The native estimator is the conservative no-pi0 target-decoy form
 blocks collapsed to one q and monotonized so q is non-increasing with score
 (`rust/mumdia/crates/mumdia/src/fdr.rs:7`,
 `rust/mumdia/crates/mumdia/src/fdr.rs:38`). `rescore` writes several q columns for
-different grouping contexts (`rust/mumdia/crates/mumdia/src/stages/rescore.rs:331`):
+different grouping contexts (`rust/mumdia/crates/mumdia/src/stages/rescore.rs:461`):
 
 | Column | Grouped over | Use when |
 |---|---|---|
@@ -246,14 +252,14 @@ different grouping contexts (`rust/mumdia/crates/mumdia/src/stages/rescore.rs:33
 | `pg_q_value` | best PSM per protein group | protein-level FDR |
 
 The `run_psm_q` / `experiment_psm_q` split and the `QuantQColumn` caveats are
-documented at `rust/mumdia/crates/mumdia/src/stages/rescore.rs:225` and
-`rust/mumdia/crates/mumdia-core/src/config.rs:806`.
+documented at `rust/mumdia/crates/mumdia/src/stages/rescore.rs:340` and
+`rust/mumdia/crates/mumdia-core/src/config.rs:772`.
 
 **schema id (`classifier_feature_schema_id`)**. A blake3 hash of the ordered active
 feature-column list, written to a companion `<features>.schema.json` so the
 rescorer input is reproducible and can never be applied under a mismatched feature
 set (`rust/mumdia/crates/mumdia/src/stages/features.rs:5`,
-`rust/mumdia/crates/mumdia/src/stages/features.rs:229`).
+`rust/mumdia/crates/mumdia/src/stages/features.rs:233`).
 
 **seed (search-seed)**. The native broad DIA-aware search whose purpose is
 calibration, not final identification: it scores candidates by hyperscore to
@@ -264,7 +270,7 @@ come from `extract` + `features` + `rescore` (see `final ID`).
 **stripped sequence**. The bare amino-acid sequence of a peptide with all
 modifications and charge removed (the base peptide). It is the grouping key for
 peptide-level FDR (`peptide_q_value`) and is reported alongside the precursor in
-`peptides.tsv` (`rust/mumdia/crates/mumdia/src/stages/report.rs:89`). Peptidoforms
+`peptides.tsv` (`rust/mumdia/crates/mumdia/src/stages/report.rs:95`). Peptidoforms
 are expanded from stripped peptides (see `peptidoform`).
 
 **target-decoy FDR**. The community-standard false discovery rate control MuMDIA
@@ -272,6 +278,6 @@ uses: score real (target) library entries against paired decoys and estimate the
 FDR at each score threshold from the decoy count. The engine reports native
 target-decoy q-values at PSM, peptide, and protein-group level as its trusted FDR
 estimate (`rust/mumdia/crates/mumdia/src/fdr.rs:1`). A decoy-free library makes
-these q-values invalid, so `Library::load` warns loudly when it finds no decoys
-(`rust/mumdia/crates/mumdia/src/index.rs:150`). See `q-value`, `decoy`,
+these q-values invalid, so `Library::load` fails loudly when it finds no decoys
+(`rust/mumdia/crates/mumdia/src/index.rs:152`). See `q-value`, `decoy`,
 `entrapment`.

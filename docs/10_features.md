@@ -17,7 +17,7 @@ corroboration grouped by peptidoform, and a global elution half-width learned
 from the confident seed set). This makes the heavy per-PSM work embarrassingly
 parallel (`rayon`) while keeping byte-identical output to a serial run.
 
-Everything is driven by `FeaturesConfig` (`mumdia-core/src/config.rs:618`). The
+Everything is driven by `FeaturesConfig` (`mumdia-core/src/config.rs:578`). The
 three feature sets are `Minimal` (14), `Rich` (44), and `Extended` (381). The
 default is `Minimal`; the tuned `--profile dia` preset and the DIA-NN-library
 recipe use `Extended`.
@@ -43,15 +43,15 @@ recipe use `Extended`.
 | `rust/mumdia/crates/mumdia/src/stages/features/apex_dispersion.rs` | Extended family: fragment apex dispersion + consensus peak shape (13 names) |
 | `rust/mumdia/crates/mumdia/src/stages/features/mass_uncertainty.rs` | Extended family: fragment mass-error dispersion + evidence breadth (10 names) |
 | `rust/mumdia/crates/mumdia/src/stats.rs` | shared `pearson`/`cosine`/`spectral_angle` kernels used by every family |
-| `rust/mumdia/crates/mumdia-core/src/config.rs:618` | `FeaturesConfig` |
+| `rust/mumdia/crates/mumdia-core/src/config.rs:578` | `FeaturesConfig` |
 
 ## Inputs and outputs
 
-`FeaturesParams` (`features.rs:503`) names the paths: `psms` (extracted PSMs),
+`FeaturesParams` (`features.rs:537`) names the paths: `psms` (extracted PSMs),
 `chromatograms`, optional `seed` (seed PSMs), `out` (features Parquet),
 `out_pin` (PIN), `cfg`, `config_hash`.
 
-### Consumed: psms_extracted (`features.rs:516`-`540`)
+### Consumed: psms_extracted (`features.rs:550`-`588`)
 
 Columns read (getter -> column): `candidate_id` (u32), `apex_rt` (f64),
 `apex_intensity` (f32), `n_matched_fragments` (i32), `n_predicted_fragments`
@@ -62,7 +62,7 @@ competition columns default to 0.0 when absent: `contested_frac`,
 `contested_count_frac`, `apportioned_frac`. Optional MS1 apex isotope columns
 (`opt_f64`, default `None`): `ms1_isom1`, `ms1_mono`, `ms1_iso1`, `ms1_iso2`.
 
-### Consumed: chromatograms (`features.rs:543`-`570`)
+### Consumed: chromatograms (`features.rs:591`-`618`)
 
 `candidate_id` (u32), `frag_name` (str), `frag_mz` (f64), `frag_obs_mz` (f64,
 optional; falls back to `frag_mz`), `predicted_intensity` (f32), `rt`
@@ -70,14 +70,14 @@ optional; falls back to `frag_mz`), `predicted_intensity` (f32), `rt`
 `ms1_` are routed to a separate `ms1x` map and fed to the MS1 XIC evidence;
 all others are the fragment chromatograms.
 
-### Consumed: seed PSMs (optional, `features.rs:576`-`600`)
+### Consumed: seed PSMs (optional, `features.rs:620`-`652`)
 
 `candidate_id` (u32), `score` (f64), `spectrum_q` (f64), `label` (str). Builds
 the `candidate_id -> seed score` and `-> identified flag` maps, and the
 confident-target set (`spectrum_q <= 0.01` and `label == "target"`) used for
 `bound_from_confident`.
 
-### Produced: features Parquet (`features.rs:827`-`843`)
+### Produced: features Parquet (`features.rs:912`-`931`)
 
 Bookkeeping columns, in order: `candidate_id` (u32), `label` (str),
 `base_peptide_id` (u32), `peptidoform` (str), `protein` (str), `apex_rt` (f64),
@@ -88,48 +88,48 @@ downstream and plotting read them rather than re-derive).
 
 ### Produced: companion + PIN + report
 
-- `<out>.schema.json` (`features.rs:846`): `FeatureSchema { feature_columns,
-  schema_id }`, read back by `FeatureSchema::read` (`features.rs:241`).
+- `<out>.schema.json` (`features.rs:936`): `FeatureSchema { feature_columns,
+  schema_id }`, read back by `FeatureSchema::read` (`features.rs:245`).
 - `<out_pin>`: Percolator PIN, header
   `SpecId Label ScanNr ExpMass CalcMass <features...> Peptide Proteins`
-  (`write_pin`, `features.rs:1388`).
-- `<out>.report.json` (`ArtifactReport`, `features.rs:866`): logical name
+  (`write_pin`, `features.rs:1537`).
+- `<out>.report.json` (`ArtifactReport`, `features.rs:969`): logical name
   `features`, schema version 1, `stats` carrying `feature_schema_id`,
   `n_features`, and `set`; `params` records `set` and
-  `coelution_corr_threshold` (`features.rs:873`); `content_hash` is the blake3 of
+  `coelution_corr_threshold` (`features.rs:976`); `content_hash` is the blake3 of
   the features Parquet; `model_identity` is `None`.
 
 ## How it works
 
-Control flow of `run` (`features.rs:514`):
+Control flow of `run` (`features.rs:548`):
 
-1. Read the PSM table and pull the scalar columns (`features.rs:516`-`540`).
+1. Read the PSM table and pull the scalar columns (`features.rs:550`-`588`).
 2. Read chromatograms and group `ChromRow`s by `candidate_id` into `chrom`,
-   splitting off `ms1_*` rows into `ms1x` (`features.rs:543`-`570`). A
-   `ChromRow` (`features.rs:264`) holds `frag_name`, `frag_mz`, `frag_obs_mz`,
+   splitting off `ms1_*` rows into `ms1x` (`features.rs:591`-`618`). A
+   `ChromRow` (`features.rs:279`) holds `frag_name`, `frag_mz`, `frag_obs_mz`,
    `pred_int`, and the `rt`/`inten` vectors.
 3. Build the seed maps and confident-target set from the optional seed table
-   (`features.rs:576`-`600`).
+   (`features.rs:620`-`652`).
 4. If `bound_from_confident` is set, learn a global elution half-width
    (see "bound_from_confident" below), producing `Option<(L, R)>` in seconds
-   (`features.rs:606`-`650`).
-5. Compute the gradient as `max(apex_rt).max(1.0)` (`features.rs:652`); this is
+   (`features.rs:658`-`702`).
+5. Compute the gradient as `max(apex_rt).max(1.0)` (`features.rs:704`); this is
    the run length used to normalize RT errors.
 6. Compute the three cross-charge corroboration columns by grouping rows by
-   `peptidoform` (`features.rs:662`-`674`).
-7. In parallel over rows (`features.rs:697`-`742`), compute the two expensive
+   `peptidoform` (`features.rs:714`-`734`).
+7. In parallel over rows (`features.rs:757`-`808`), compute the two expensive
    per-PSM pieces: `fragment_features` (the Minimal/Rich fragment battery) and,
    when Extended, `build_evidence` + `extended_values`. Results collect into a
    `Vec<PerPsm>` indexed by row, preserving order.
 8. Serially assemble `fmap` (name -> per-row value vector), `prelim`, and the
-   elution bounds (`features.rs:744`-`819`). The serial loop reads `per[i]` and
-   pushes each named value with the `push` closure (`features.rs:678`).
-9. Insert the three cross-charge columns (`features.rs:822`-`824`).
+   elution bounds (`features.rs:810`-`905`). The serial loop reads `per[i]` and
+   pushes each named value with the `push` closure (`features.rs:738`).
+9. Insert the three cross-charge columns (`features.rs:908`-`910`).
 10. Build the output columns (bookkeeping + `active_features`), write Parquet,
     write the schema JSON, build the feature matrix, write the PIN, and emit the
-    report (`features.rs:826`-`878`).
+    report (`features.rs:912`-`983`).
 
-### Fragment features (`fragment_features`, `features.rs:1078`)
+### Fragment features (`fragment_features`, `features.rs:1193`)
 
 For each fragment it takes the observed intensity at the scan nearest the apex
 RT (`obs`), the predicted intensity (`pred`), and `|ppm|`. It then computes:
@@ -152,15 +152,15 @@ weighted spectral cosine, `ref_corr` = mean fragment-vs-reference Pearson,
 
 ### Elution-boundary detection
 
-`peak_bounds` (`features.rs:946`) descends from the apex-nearest scan while the
+`peak_bounds` (`features.rs:1049`) descends from the apex-nearest scan while the
 smoothed profile stays `>= frac * apex_height`, bridging up to `grace`
 consecutive sub-threshold scans. If the supplied apex sits at zero height it is
-relocated to the global maximum first (`features.rs:955`), so a zero-height apex
+relocated to the global maximum first (`features.rs:1057`), so a zero-height apex
 does not collapse the window. The reference profile for boundary finding is the
-`smooth3` (`features.rs:925`) of the summed top-3-predicted-intensity fragment
+`smooth3` (`features.rs:1028`) of the summed top-3-predicted-intensity fragment
 XICs.
 
-### prelim_score (`features.rs:815`)
+### prelim_score (`features.rs:901`)
 
 ```
 prelim = n_matched * (0.5 + max(0, frag_corr))
@@ -173,39 +173,43 @@ A cheap heuristic (not a trained score) that rewards matched-fragment count
 scaled by spectral correlation, co-elution, and log intensity, penalized by
 gradient-normalized RT error. `compete` uses it as the within-group ranking key.
 
-### Directly-computed Minimal/Rich scalars (serial loop, `features.rs:744`-`818`)
+### Directly-computed Minimal/Rich scalars (serial loop, `features.rs:810`-`905`)
 
 Several Minimal/Rich columns are assembled inline in the serial loop rather than
 inside `fragment_features`:
 
-- `rt_error_abs` = `|apex_rt - rt_pred_cal|`; `rt_error_rel` = that over
-  `gradient` (`features.rs:754`-`755`).
-- `log_apex_intensity` = `ln(1 + apex_intensity)` (`features.rs:758`).
+- `rt_error_abs` = `calibrated_rt_error(apex_rt, rt_pred_cal)`
+  (`features.rs:271`), i.e. `|apex_rt - rt_pred_cal|` when both are finite and
+  `0.0` when either is non-finite; `rt_error_rel` = that over `gradient`
+  (`features.rs:820`-`821`). Stage B marks an unavailable RT calibration (fewer
+  than two anchors) as NaN, so this guard keeps the sentinel from leaking NaN
+  into the feature matrix or `prelim` (tested at `features.rs:1608`).
+- `log_apex_intensity` = `ln(1 + apex_intensity)` (`features.rs:824`).
 - `n_matched_fragments`, `coelution_run`, `charge` pass through from the PSM
   columns; `peptide_length` calls `peptide_length(peptidoform)`.
-- `n_proteins` = `protein.matches(';').count() + 1` (`features.rs:767`): the
+- `n_proteins` = `protein.matches(';').count() + 1` (`features.rs:842`): the
   `protein` string is semicolon-delimited, so this counts group membership.
-- `diff_by_intensity` = `sum_b_intensity - sum_y_intensity` (`features.rs:774`).
-- `matched_fraction` = `n_matched / max(1, n_predicted)` (`features.rs:788`-
-  `792`).
+- `diff_by_intensity` = `sum_b_intensity - sum_y_intensity` (`features.rs:852`).
+- `matched_fraction` = `n_matched / max(1, n_predicted)` (`features.rs:874`-
+  `878`).
 
-### MS1 isotope features (Rich set, `isotope_features`, `features.rs:1367`)
+### MS1 isotope features (Rich set, `isotope_features`, `features.rs:1515`)
 
 The four Rich MS1 columns (`isotope_corr`, `ms1_isom1_ratio`, `log_mono_ms1`,
-`has_ms1`) come from `isotope_features` (`features.rs:1367`) over the apex
+`has_ms1`) come from `isotope_features` (`features.rs:1515`) over the apex
 isotope intensities carried on the PSM rows. It fits a Poisson-averagine envelope
 `[1, lambda, lambda^2/2]` with `lambda = 0.00052 * neutral_mass`
-(`features.rs:1377`), the neutral mass being
-`precursor_mz * charge - charge * PROTON` (`features.rs:750`). This `0.00052`
+(`features.rs:1525`), the neutral mass being
+`precursor_mz * charge - charge * PROTON` (`features.rs:816`). This `0.00052`
 averagine differs from the `0.000594` used by the Extended `ms1` family
-(`ms1.rs:81`); the two MS1 code paths are independent and both are kept.
+(`ms1.rs:85`); the two MS1 code paths are independent and both are kept.
 `isotope_corr` = `pearson([mono, +1, +2], theo)`, `ms1_isom1_ratio` =
 `isom1 / (mono + 1)`, `log_mono_ms1` = `ln(1 + mono)`, `has_ms1` = 1.0 when
 `mono`/`+1`/`+2` are all present, else all four return 0.0.
 
-### The Evidence struct (`features.rs:278`)
+### The Evidence struct (`features.rs:293`)
 
-`build_evidence` (`features.rs:345`) constructs the per-PSM `Evidence` handed to
+`build_evidence` (`features.rs:360`) constructs the per-PSM `Evidence` handed to
 every Extended family. It mirrors the alignment and peak-bounding of
 `fragment_features` so families see the same elution peak. Fields:
 
@@ -217,18 +221,19 @@ every Extended family. It mirrors the alignment and peak-bounding of
   `obs_apex` (intensity at the apex scan; `> 0` defines "matched"), `is_b`,
   `ordinal`, `frag_charge`, `frag_mz` (theoretical), `frag_obs_mz` (intensity-
   weighted observed), `mass_err_ppm` (signed ppm).
-- `apex_rt` is set inside `build_evidence` itself (`features.rs:483`) from its
+- `apex_rt` is set inside `build_evidence` itself (`features.rs:517`) from its
   `apex_rt` argument, not by the caller.
-- Scalars filled by the caller after build (`features.rs:718`-`732`):
-  `rt_pred_cal`, `rt_err`, `gradient`, `precursor_mz`, `charge`, `seq_len`,
-  `n_matched`, `n_predicted`, `seed_score`, `seed_identified`, `apex_intensity`
-  (plus the MS1 apex isotopes below, `features.rs:729`-`732`). All start at a
-  zero/`None` default set by `build_evidence` (`features.rs:483`-`499`).
+- Scalars filled by the caller after build (`features.rs:784`-`798`):
+  `rt_pred_cal`, `rt_err` (via `calibrated_rt_error`), `gradient`,
+  `precursor_mz`, `charge`, `seq_len`, `n_matched`, `n_predicted`, `seed_score`,
+  `seed_identified`, `apex_intensity` (plus the MS1 apex isotopes below,
+  `features.rs:795`-`798`). All start at a zero/`None` default set by
+  `build_evidence` (`features.rs:517`-`533`).
 - MS1: `ms1_mono`/`ms1_iso1`/`ms1_iso2`/`ms1_isom1` (apex isotope intensities,
   `None` when no MS1) and `ms1_xic` (the `[mono,+1,+2]` XICs resampled onto
   `axis`; empty unless the extract stage persisted `ms1_*` chromatogram rows).
 
-`parse_ion` (`features.rs:331`) parses `b3`, `y7`, `b3^2` into
+`parse_ion` (`features.rs:346`) parses `b3`, `y7`, `b3^2` into
 `(is_b, ordinal, charge)`.
 
 ### The Extended battery
@@ -236,11 +241,11 @@ every Extended family. It mirrors the alignment and peak-bounding of
 `FAMILIES` (`features.rs:52`) is an ordered array of `(NAMES, values)` pairs;
 the order is part of the frozen schema and is append-only. Each family exposes
 `NAMES: &[&str]` and `values(&Evidence) -> Vec<f64>` of identical length and
-matching order. `extended_values` (`features.rs:134`) calls each family and
-applies the precomputed dedup plan (`extended_value_plan`, `features.rs:108`),
+matching order. `extended_values` (`features.rs:138`) calls each family and
+applies the precomputed dedup plan (`extended_value_plan`, `features.rs:112`),
 keeping names and values in lockstep, and coerces any non-finite value to 0.0.
 
-Deduplication (`extended_name_refs`, `features.rs:80`): a name that already
+Deduplication (`extended_name_refs`, `features.rs:84`): a name that already
 appears in `MINIMAL_FEATURES` or `RICH_EXTRA` (`reserved_names`,
 `features.rs:72`), or that repeats across families, is kept only on first
 appearance. In the current tree four Extended names are dropped as reserved
@@ -250,15 +255,15 @@ Minimal), `peptide_length` and `seed_identified` (novel vs Minimal/Rich). So the
 
 ## The three feature sets
 
-`active_features(set)` (`features.rs:206`) returns the ordered active column
+`active_features(set)` (`features.rs:210`) returns the ordered active column
 list:
 
-- `Minimal` (14, `MINIMAL_FEATURES` `features.rs:154`): `rt_error_abs`,
+- `Minimal` (14, `MINIMAL_FEATURES` `features.rs:158`): `rt_error_abs`,
   `rt_error_rel`, `n_matched_fragments`, `coelution_run`, `log_apex_intensity`,
   `frag_corr`, `frag_cosine`, `spectral_angle`, `coelution_mean`,
   `coelution_best`, `n_coelution_above`, `charge`, `peptide_length`,
   `n_proteins`.
-- `Rich` (44 = Minimal + 30, `RICH_EXTRA` `features.rs:172`): adds
+- `Rich` (44 = Minimal + 30, `RICH_EXTRA` `features.rs:176`): adds
   `library_norm_manhattan`, `library_rmsd`, `xcorr_coelution`, `xcorr_shape`,
   `sum_b_intensity`, `sum_y_intensity`, `diff_by_intensity`, `n_b_ions`,
   `n_y_ions`, `weighted_mass_error`, `mean_mass_error`, `isotope_corr`,
@@ -275,9 +280,9 @@ list:
   `charge_multi_flag`, `cross_charge_intensity_log`) aggregate across the charge
   states of one peptidoform, an axis invisible to the per-PSM Evidence families.
 
-The size invariant is asserted in `feature_sets_sized` (`features.rs:1434`):
+The size invariant is asserted in `feature_sets_sized` (`features.rs:1590`):
 `Extended.len() == 14 + 30 + extended_names().len() + 6`, and all Extended names
-are unique. `FeatureSet` (`config.rs:81`) has exactly `Minimal`, `Rich`,
+are unique. `FeatureSet` (`config.rs:65`) has exactly `Minimal`, `Rich`,
 `Extended`; the earlier `Custom` variant is gone (do not document it).
 
 ## Extended family reference
@@ -318,7 +323,7 @@ include tie-corrected `ranks`, `kendall_tau_b`, interpolated `quantile`, `gini`,
 ### entropy (18, `entropy.rs`)
 
 Li spectral-entropy similarity and information divergences between sum-
-normalized `o` and `l`. `entropy_sim` (`entropy.rs:91`) is
+normalized `o` and `l`. `entropy_sim` (`entropy.rs:107`) is
 `1 - (2 H(m) - H(o) - H(l)) / ln 4` with `m = (o+l)/2`, clamped to [0,1].
 Names: `spectral_entropy_similarity`, `weighted_spectral_entropy_similarity`
 (Li per-spectrum weighting), `spectral_entropy_similarity_sqrt`,
@@ -328,7 +333,7 @@ Names: `spectral_entropy_similarity`, `weighted_spectral_entropy_similarity`
 `obs_spectrum_entropy`, `pred_spectrum_entropy`, `entropy_diff`,
 `entropy_ratio`, `obs_normalized_entropy` (Pielou evenness),
 `normalized_entropy_diff`, `residual_spectrum_entropy`, `entropy_weight_obs`.
-The public `spectral_entropy_similarity_sqrt(obs, pred)` (`entropy.rs:82`) is
+The public `spectral_entropy_similarity_sqrt(obs, pred)` (`entropy.rs:92`) is
 reused by the extraction gate `GateMode::SpectralEntropy` so the kernel is not
 duplicated.
 
@@ -399,7 +404,7 @@ descriptors (`frag_fwhm_cv/_mean`, `frag_apex_rt_dispersion/_weighted`,
 `frag_apex_offset_from_profile_mean`, `frag_gaussianity_mean/_weighted`,
 `frag_zigzag_mean`), `sumtrace_unweighted_gaussian_r2`, and
 `reference_profile_rt_entropy_peak/_ratio`. Has unit tests
-(`chromatographic.rs:876`).
+(`chromatographic.rs:979`).
 
 ### mass_accuracy (17, `mass_accuracy.rs`)
 
@@ -488,7 +493,7 @@ across the peak (orthogonal to library-agreement families). Names:
 `rank_corr_vs_apex_mean`, `rank_corr_vs_apex_std`, `rank_corr_adjacent_mean`,
 `kendall_vs_apex_mean`, `top1_frag_persistence`, `top2_order_persistence`,
 `argmax_frag_entropy`, `self_cosine_vs_apex_mean`. Degenerate below 3 fragments
-or 3 non-empty scans. Has unit tests (`order_consistency.rs:271`).
+or 3 non-empty scans. Has unit tests (`order_consistency.rs:300`).
 
 ### peak_scans (2, `peak_scans.rs`)
 
@@ -507,7 +512,7 @@ Fragment apex dispersion and consensus peak shape, intensity-independent
 `peak_truncation`, `apex_frac_of_window`. `precursor_frag_apex_delta` reads the
 mono MS1 XIC (`ms1_xic[0]`) and is populated under the same MS1/grid conditions
 as the `ms1` XIC block; otherwise it is 0.0. Has unit tests
-(`apex_dispersion.rs:226`).
+(`apex_dispersion.rs:240`).
 
 ### mass_uncertainty (10, `mass_uncertainty.rs`)
 
@@ -516,9 +521,9 @@ Names: `frag_mass_err_median`, `frag_mass_err_abs_median`, `frag_mass_err_std`,
 `frag_mass_err_iqr`, `frag_mass_err_max_abs`, `frag_mass_err_range`,
 `effective_frag_count` (inverse participation ratio), `evidence_concentration`
 (fraction in the strongest fragment), `frac_top3_pred_observed`,
-`frac_top5_pred_observed`. Has unit tests (`mass_uncertainty.rs:133`).
+`frac_top5_pred_observed`. Has unit tests (`mass_uncertainty.rs:142`).
 
-## The Percolator PIN (`write_pin`, `features.rs:1388`)
+## The Percolator PIN (`write_pin`, `features.rs:1537`)
 
 Streamed row-by-row through a `BufWriter` (not materialized as one String).
 Header: `SpecId\tLabel\tScanNr\tExpMass\tCalcMass\t<features joined by tab>\t
@@ -527,10 +532,10 @@ Peptide\tProteins`. Per row: `SpecId = cand_<candidate_id>`,
 `ExpMass = CalcMass = precursor_mz` (`{:.5}`), each feature at `{:.6}`, then
 `Peptide = -.<peptidoform>.-` and `Proteins = <protein>`. The feature matrix
 passed to the PIN is built column-parallel from `fmap` in `active_features`
-order (`features.rs:856`), so the PIN and the Parquet share the same ordered
+order (`features.rs:945`), so the PIN and the Parquet share the same ordered
 feature list.
 
-## The feature-schema hash (`feature_schema_id`, `features.rs:229`)
+## The feature-schema hash (`feature_schema_id`, `features.rs:233`)
 
 `blake3_str(cols.join(","))` of the ordered active column list. Written to
 `<out>.schema.json` and recorded in the report `stats`. It is a content hash of
@@ -540,19 +545,19 @@ another. Because the family registry order is frozen and append-only, appending
 a new family or feature at the end changes the id predictably while leaving all
 prior positions stable.
 
-## bound_from_confident (elution-boundary calibration, `features.rs:606`)
+## bound_from_confident (elution-boundary calibration, `features.rs:658`)
 
 When `bound_from_confident` is true (the default), the stage learns one pair of
 elution half-widths `(L, R)` in seconds from the confident-target seed set
 (`spectrum_q <= 0.01`, `label == "target"`; the same anchor set used for RT
 calibration and DeepLC fine-tune). For each confident candidate it detects the
-per-candidate peak with `elution_peak_rt_bounds` (`features.rs:1038`, which
+per-candidate peak with `elution_peak_rt_bounds` (`features.rs:1141`, which
 returns `None` for a candidate with fewer than 3 distinct scans, so it does not
 contribute an anchor) and records `apex - lo` and `hi - apex`. If at least 20
 anchors resolve, it takes the `bound_confident_pct` percentile of the left and
 right half-widths (median by default) and returns `Some((L, R))`; every
 candidate is then bounded on `[apex - L, apex + R]` via `global_bound_indices`
-(`features.rs:1011`), which falls back to the single apex-nearest scan
+(`features.rs:1114`), which falls back to the single apex-nearest scan
 `(ai, ai)` when the mapped window collapses between grid points (sparse grid or
 a half-width below one cycle). This
 removes per-candidate boundary manipulation, so a chimeric decoy is scored over
@@ -574,16 +579,17 @@ vector is all-zero. `spectral_angle` (`stats.rs:44`) is
 `1 - 2 * acos(clamp(cosine, -1, 1)) / pi`, in [0,1] with 1 = identical. Families
 add local specializations that do not belong in the shared kernel (weighted
 Pearson, Spearman via `pearson` on average ranks, Kendall tau, windowed cross-
-correlation via `super::best_xcorr`, `features.rs:1337`, which returns the best
+correlation via `super::best_xcorr`, `features.rs:1484`, which returns the best
 normalized correlation and its integer lag over `[-maxlag, maxlag]` as
 `(lag_of_max, value.max(0.0))`), but the base Pearson/cosine call the shared
 functions.
 
 ## Configuration
 
-`FeaturesConfig` (`config.rs:618`) is `#[serde(default, deny_unknown_fields)]`,
+`FeaturesConfig` (`config.rs:578`) is `#[serde(default, deny_unknown_fields)]`,
 so every field defaults independently and an unknown config key is a hard load
-error. The `set` field's default is `t()` (`config.rs:654`), a generic
+error. The `set` field's default is `t()` (`config.rs:614`, helper at
+`config.rs:163`), a generic
 `Default`-forwarding helper, so it resolves to `FeatureSet::default()` =
 `Minimal`. The config was pruned of dead fields (the `FeatureSet::Custom`
 variant no longer exists).
@@ -606,19 +612,19 @@ not carry the configured fragment tolerance.
 ## Invariants, determinism, gotchas
 
 - Every family must return exactly `NAMES.len()` values in `NAMES` order; a
-  `debug_assert_eq!` in `extended_values` (`features.rs:139`) and in most
+  `debug_assert_eq!` in `extended_values` (`features.rs:143`) and in most
   families catches a mismatch in debug builds. Non-finite values are coerced to
   0.0 at family boundaries and again in `extended_values`.
 - The `FAMILIES` registry order and each family's `NAMES` order are the frozen
   schema; they are append-only. Reordering or renaming changes `schema_id` and
   invalidates any trained classifier.
 - Deduplication is stable and precomputed once (`extended_value_plan`,
-  `features.rs:108`), reproducing the same survivors and order as
+  `features.rs:112`), reproducing the same survivors and order as
   `extended_name_refs`, so names and values stay in lockstep across runs.
 - Determinism: the parallel per-PSM pass collects into a `Vec` indexed by row,
   so the serial assembly is byte-identical to a serial run regardless of thread
   count. RT-axis alignment maps intensities keyed by `f32::to_bits`
-  (`features.rs:389`), which is exact-equality safe because the same `rt`
+  (`features.rs:407`), which is exact-equality safe because the same `rt`
   values are reused, not recomputed.
 - "Matched" throughout the families means `obs_apex[i] > 0.0` (observed at the
   apex scan), which differs subtly from "present in the peak" used by the
@@ -626,23 +632,23 @@ not carry the configured fragment tolerance.
 - The apex scan samples a single grid point; a fragment peaking one scan off
   reads 0.0 at the apex. The `nonzero` family exists specifically to give the
   classifier zero-tolerant variants alongside the originals.
-- `peptide_length` (`features.rs:246`) strips a leading `DECOY_` prefix before
+- `peptide_length` (`features.rs:250`) strips a leading `DECOY_` prefix before
   counting residues, and ignores bracketed modifications, so the decoy marker is
-  not a length-based target/decoy label leak (tested at `features.rs:1425`).
+  not a length-based target/decoy label leak (tested at `features.rs:1581`).
 - MS1 XIC features require `ms1_*` chromatogram rows. Normal `run` supplies
   converted MS1 spectra to extract, which writes those rows when a usable grid is
   present; older artifacts or standalone extraction without `--ms1` legitimately
   leave the features at 0.0.
 - `bound_features` gates only the Minimal/Rich `fragment_features` path
-  (`features.rs:1154`): when false, that path scores over the whole extracted
-  window. The Extended `build_evidence` (`features.rs:345`) takes no such flag
+  (`features.rs:1286`): when false, that path scores over the whole extracted
+  window. The Extended `build_evidence` (`features.rs:360`) takes no such flag
   and always peak-bounds `axis`/`traces` while still retaining
   `axis_full`/`traces_full`, so Extended families read whichever window they
   name regardless of `bound_features`, and `global_bounds` from
   `bound_from_confident` always applies to them.
 - The peptidoform grouping for cross-charge features uses the ProForma string,
   which is charge-independent and keeps `DECOY_` peptidoforms grouped among
-  themselves, so it is not a target/decoy label leak (`features.rs:662`).
+  themselves, so it is not a target/decoy label leak (`features.rs:714`).
 
 ## How to extend / modify
 
@@ -655,17 +661,17 @@ not carry the configured fragment tolerance.
   reimplementing kernels. Add an arity unit test (`values(&e).len() ==
   NAMES.len()`) and a degenerate-evidence finiteness test.
 - To add a Minimal/Rich feature: append the name to `MINIMAL_FEATURES` or
-  `RICH_EXTRA` and push its value in the serial loop (`features.rs:754`); make
+  `RICH_EXTRA` and push its value in the serial loop (`features.rs:820`); make
   sure no Extended family already uses the name, or it will be dropped as a
   reserved collision.
 - New names must be globally unique across Minimal, Rich, and every family; a
   collision is silently dropped by the dedup filter, so run
-  `feature_sets_sized` (`features.rs:1434`) after any change to confirm the
+  `feature_sets_sized` (`features.rs:1590`) after any change to confirm the
   size and uniqueness invariants.
 - Do not reach into vendor formats or duplicate the mass model / stats kernel;
   Evidence is the sole per-PSM interface for families, and any new scalar a
-  family needs must be added to `Evidence` (`features.rs:278`) and filled by the
-  caller (`features.rs:718`).
+  family needs must be added to `Evidence` (`features.rs:293`) and filled by the
+  caller (`features.rs:784`).
 - Prefer adding a config field (backed by a default) over hardcoding a
   threshold, consistent with the project convention; the current hardcoded
   fragment tolerance in `mass_accuracy` is a documented exception awaiting a

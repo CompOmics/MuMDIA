@@ -61,7 +61,7 @@ represent a hard floor on the co-elution feature, so a pre-gate does real work
 for it; a strong nonlinear rescorer absorbs the loose-gate flood and just wants
 recall. The hard gate is a linear-rescorer crutch. The extraction gate is a
 finite floor in `[0, 1]` at `extract.min_frag_corr`, default 0.2
-(`rust/mumdia/crates/mumdia-core/src/config.rs:562`).
+(`rust/mumdia/crates/mumdia-core/src/config.rs:522`).
 
 ### A2. Mechanism of the gate
 
@@ -123,8 +123,9 @@ monotone rollup of one another. The columns written by `rescore` are:
 - `peptide_q_value`: FDR grouped on stripped sequence.
 - `pg_q_value`: protein-group FDR.
 
-See `rust/mumdia/crates/mumdia/src/stages/rescore.rs:225` through `:271` for the
-computation and `:331` through `:345` for the emitted columns. The estimator is
+See `rust/mumdia/crates/mumdia/src/stages/rescore.rs:288` through `:396` for the
+computation (PSM, peptide, protein-group, per-run, and precursor levels) and
+`:447` through `:477` for the emitted columns. The estimator is
 `q = (n_decoys + 1) / max(1, n_targets)`, monotonized, with tied-score blocks
 collapsed to one q (`rust/mumdia/crates/mumdia/src/fdr.rs:38`).
 
@@ -203,14 +204,19 @@ Concrete guarantees in code:
 - Decoy generation is seeded. The scramble decoy runs a deterministic
   Fisher-Yates shuffle driven by a splitmix64 PRNG seeded per peptide from the
   configured `rng_seed` XORed with an FNV-1a hash of the sequence
-  (`rust/mumdia/crates/mumdia/src/stages/digest.rs:92`, `:106`, `:143`).
+  (`rust/mumdia/crates/mumdia/src/stages/digest.rs:117` for the seeding, `:159`
+  for `splitmix64`, `:167` for `fnv1a`). Native digest decoys are additionally
+  collision-checked by `collision_safe_decoy`, which deterministically retries
+  with independently seeded interior scrambles when a transform collides with a
+  target or an already-emitted decoy while keeping the C-terminal residue fixed
+  (`rust/mumdia/crates/mumdia/src/stages/digest.rs:137`).
 - FDR q-values are order-independent. Tied-score blocks are processed together so
   every PSM in a block gets the same q regardless of its arbitrary within-tie
   order, and monotonization runs worst-to-best
   (`rust/mumdia/crates/mumdia/src/fdr.rs:26` through `:52`).
 - Per-run q-values iterate sources through a `BTreeMap` (sorted keys), and the
   code notes explicitly that no floats are summed there
-  (`rust/mumdia/crates/mumdia/src/stages/rescore.rs:233` through `:236`).
+  (`rust/mumdia/crates/mumdia/src/stages/rescore.rs:347` through `:376`).
 
 Two known exceptions are nondeterministic by design and are documented as such:
 
@@ -218,7 +224,7 @@ Two known exceptions are nondeterministic by design and are documented as such:
   numpy seed, so refitting the RT model is not bit-reproducible.
 - The `nn_torch` rescorer (`scripts/nn_rescore_worker.py`) sets
   `torch.manual_seed` and `np.random.seed` per pass
-  (`scripts/nn_rescore_worker.py:205`, `:258`, `:259`), but its own header states
+  (`scripts/nn_rescore_worker.py:197`, `:284`, `:285`), but its own header states
   that NN training is only approximately reproducible, and it offers
   `MUMDIA_NN_SEEDS > 1` to ensemble seeds and average rank-normalized
   out-of-fold scores for stability (`scripts/nn_rescore_worker.py:29` through
@@ -241,20 +247,20 @@ file; argv positions and the output schema are the contract.
 Concrete points in code:
 
 - The subprocess invocation is `python script arg...` with positional args
-  (`rust/mumdia/crates/mumdia/src/sidecar.rs:174` through `:190`).
+  (`rust/mumdia/crates/mumdia/src/sidecar.rs:217` through `:233`).
 - MS2PIP is invoked as `<in> <out> <model>` and its output is read back keyed by
-  `id` (`rust/mumdia/crates/mumdia/src/sidecar.rs:58`, `:66` through `:72`).
+  `id` (`rust/mumdia/crates/mumdia/src/sidecar.rs:63`, `:66` through `:76`).
 - DeepLC is invoked as `<in> <out>` and read back keyed by `id`
-  (`rust/mumdia/crates/mumdia/src/sidecar.rs:95` through `:100`).
+  (`rust/mumdia/crates/mumdia/src/sidecar.rs:99` through `:104`).
 - The DeepLC fine-tune is invoked as `<lib_in> <seed> <lib_out>` plus flags
-  (`rust/mumdia/crates/mumdia/src/sidecar.rs:106` through `:129`).
+  (`rust/mumdia/crates/mumdia/src/sidecar.rs:111` through `:155`).
 - The NN rescorer reads a PIN and writes the flat PIN-row ordinal back in its
   `candidate_id` column; Rust maps scores by that unique row index.
 
 Worker scripts are located by `sidecar::resolve_script`, which tries the
 configured directory relative to the working directory, then relative to the
 binary's own directory, then `<exe_dir>/scripts`
-(`rust/mumdia/crates/mumdia/src/sidecar.rs:18` through `:33`). On Windows, set
+(`rust/mumdia/crates/mumdia/src/sidecar.rs:20` through `:38`). On Windows, set
 `predict_frag.sidecar_script_dir` to an absolute path with a drive letter
 (`c:/...`), not a git-bash `/c/...` path, or the binary cannot find the worker
 and the strict default aborts. Only an explicit `rescore.strict=false`

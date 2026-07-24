@@ -52,10 +52,10 @@ a cmake/C toolchain requirement.
 ## Sidecar resolution and silent fallback
 
 **"Worker not found" and the git-bash path trap.** `resolve_script`
-(`sidecar.rs:18-33`) locates a worker by trying, in order: the configured dir
-relative to the CWD (`sidecar.rs:19-21`), then the same dir relative to the
+(`sidecar.rs:20-38`) locates a worker by trying, in order: the configured dir
+relative to the CWD (`sidecar.rs:21-22`), then the same dir relative to the
 binary's own directory, then `<exe_dir>/scripts`. If none exist it returns the
-CWD-relative path so the eventual spawn error names it (`sidecar.rs:32`). Because
+CWD-relative path so the eventual spawn error names it (`sidecar.rs:37`). Because
 the build target dir is redirected off OneDrive while `scripts/` lives under the
 project, `<exe_dir>/scripts` does not exist next to the binary on this machine, so
 resolution succeeds only via the CWD-relative branch. The specific trap: if
@@ -70,12 +70,12 @@ in the Docker configs.
 is the only stage that can fall back to `native_tda` when its sidecar fails. With
 `rescore.strict = false` (not the default), a failed or misconfigured
 mokapot/nn_torch sidecar is logged
-as a warning and the run continues on native scores (`rescore.rs:112-118` for
-mokapot, `rescore.rs:127-133` for nn_torch). This means a worker that never
+as a warning and the run continues on native scores (`rescore.rs:172-180` for
+mokapot, `rescore.rs:199-207` for nn_torch). This means a worker that never
 resolved (see the path trap above) or crashed produces a completed run whose
 scores are silently native, not the classifier the config named. Set
 `rescore.strict = true` so any sidecar failure is a hard error
-(`rescore.rs:114`, `rescore.rs:129`); this is the production default. Confirm
+(`rescore.rs:173`, `rescore.rs:200`); this is the production default. Confirm
 `params.classifier` and `model_identity` in
 `psms_scored.parquet.report.json` match what was intended.
 
@@ -85,15 +85,15 @@ Only `rescore` has a native fallback. The predictor, fine-tune, and MBR stages
 propagate worker errors with `?` and abort the whole run:
 
 - **MS2PIP** hard-bails with `bail!("MS2PIP returned no predictions")` when the
-  worker returns an empty map (`predict_frag.rs:316-318`); any other MS2PIP error
-  propagates through the `?` at `predict_frag.rs:315`. There is no whole-run
+  worker returns an empty map (`predict_frag.rs:342-344`); any other MS2PIP error
+  propagates through the `?` at `predict_frag.rs:341`. There is no whole-run
   native fallback (a single candidate that MS2PIP returned nothing for does fall
-  back per-candidate at `predict_frag.rs:361-363`, but an empty map aborts).
+  back per-candidate at `predict_frag.rs:387-389`, but an empty map aborts).
 - **DeepLC predict** propagates worker errors with the `?` at
-  `predict_frag.rs:272`. It does not bail on partial output: peptidoforms with no
+  `predict_frag.rs:291`. It does not bail on partial output: peptidoforms with no
   returned iRT are anchored at `0.0` with an `n_irt_missing` warning
-  (`predict_frag.rs:278-289`), which is a known foot-gun rather than a stop.
-- **DeepLC fine-tune** propagates errors with the `?` at `run.rs:194-204`, so a
+  (`predict_frag.rs:293-308`), which is a known foot-gun rather than a stop.
+- **DeepLC fine-tune** propagates errors with the `?` at `run.rs:253-263`, so a
   fine-tune failure aborts `run` with no fallback.
 - **MBR** likewise propagates its worker error and is not on the `run` chain.
 
@@ -105,7 +105,7 @@ false`, `mbr.strategy = none`).
 ## Truncated-run void
 
 `--max-spectra N` on `convert` or `run` reads only the first N spectra across all
-MS levels (`convert.rs:123`; the flag is documented at `docs/04_convert.md:243`).
+MS levels (`convert.rs:121`; the flag is documented at `docs/04_convert.md:245`).
 The early chromatographic gradient is void, so a few thousand leading spectra
 carry almost no identifiable peptides and a short cap will look like a broken
 engine. For meaningful identifications use the full file, or externally create a
@@ -116,15 +116,15 @@ an offset. This is expected behaviour, not a bug.
 
 Every config struct in `config.rs` carries `#[serde(deny_unknown_fields)]` (15
 occurrences), and `Config::from_json` parses with unknown-key rejection before
-validating (`config.rs:1046`). An unknown or misspelled key is therefore a hard
-load error, not a silently-ignored no-op (tested at `config.rs:1136`). This bites
+validating (`config.rs:1009`). An unknown or misspelled key is therefore a hard
+load error, not a silently-ignored no-op (tested at `config.rs:1146`). This bites
 most often after the config surface is pruned: a knob that was removed, or renamed,
 now fails the load. Check the offending key against the current `config.rs`, not
-against an older config file. Separately, `Config::validate` (`config.rs:1056`)
+against an older config file. Separately, `Config::validate` (`config.rs:1019`)
 rejects a few footgun combinations that would otherwise produce invalid results,
-for example `digest.decoy.strategy = diann_shift` (`config.rs:1058`, zero decoys
+for example `digest.decoy.strategy = diann_shift` (`config.rs:1021`, zero decoys
 and an invalid FDR) and `rt_im_train.calibration_method = none`
-(`config.rs:1067`, silently falls through to the linear fit); the committed
+(`config.rs:1030`, silently falls through to the linear fit); the committed
 defaults always pass.
 
 ## Run-to-run nondeterminism
@@ -133,7 +133,7 @@ The native engine is byte-reproducible; two opt-in paths are not, and neither is
 on the default path:
 
 - **DeepLC multitask fine-tune** (`scripts/deeplc_finetune.py`, invoked by
-  `sidecar::run_deeplc_finetune` at `sidecar.rs:106`) sets no torch or numpy seed,
+  `sidecar::run_deeplc_finetune` at `sidecar.rs:111`) sets no torch or numpy seed,
   so the rewritten iRT and every downstream artifact vary run to run.
 - **PyTorch NN rescorer** (`scripts/nn_rescore_worker.py`) seeds torch and numpy
   per seed and uses a content-hash fold split, but training is only approximately

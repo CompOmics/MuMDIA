@@ -52,7 +52,7 @@ set of named artifacts. It is the read/write mechanism that every stage uses.
 What is fixed here is the artifact **identity registry** and the shape of the
 two JSON sidecars.
 
-### Artifact schema registry (`mumdia-core/src/schema.rs:7-23`)
+### Artifact schema registry (`mumdia-core/src/schema.rs:7-24`)
 
 Each artifact carries a logical schema name and version. The intent is that a
 stage could validate its inputs and refuse to apply a model under a mismatched
@@ -77,12 +77,15 @@ They are `pub const` tuples in the `artifact` submodule, referenced as
 | `psms_extracted` | 1 | extract |
 | `chromatograms` | 1 | extract |
 | `features` | 1 | features |
-| `psms_competed` | 1 | compete |
-| `psms_scored` | 2 | rescore |
-| `peptide_quant` | 1 | quant |
-| `protein_group_quant` | 1 | quant |
+| `psms_competed` | 2 | compete |
+| `psms_scored` | 3 | rescore |
+| `peptide_quant` | 2 | quant |
+| `protein_group_quant` | 2 | quant |
+| `fragment_quant` | 1 | quant |
 
-Note only `psms_scored` is at version 2; everything else is version 1. The
+There are 18 registered artifacts. Four have been version-bumped past 1:
+`psms_competed`, `peptide_quant`, and `protein_group_quant` are at version 2, and
+`psms_scored` is at version 3; every other artifact is still version 1. The
 version is recorded in the report and the manifest but is not consumed anywhere:
 no stage reads a prior artifact's version back, so there is no schema-mismatch
 gate on read. A reader could compare the recorded version by hand, but the engine
@@ -93,12 +96,12 @@ does not.
 The IO crate stores no schema definitions; a stage's `write_table(path, vec![
 Col::… ])` is the schema. Two examples read from the actual code:
 
-`isolation_windows` (`stages/convert.rs:221-228`), one row per distinct window:
+`isolation_windows` (`stages/convert.rs:215-226`), one row per distinct window:
 `window_id: u32`, `target: f64`, `lower: f64`, `upper: f64`.
-`ms2_to_ms1` (`stages/convert.rs:231-237`): `ms2_scan_index: u32`,
+`ms2_to_ms1` (`stages/convert.rs:228-234`): `ms2_scan_index: u32`,
 `ms1_scan_index: i32`.
 
-`peptides` (`stages/digest.rs:216-225`): `id: u32`, `peptide: utf8`,
+`peptides` (`stages/digest.rs:286-298`): `id: u32`, `peptide: utf8`,
 `protein: utf8`, `start: i32`, `end: i32`, `label: utf8`, `target_id: i32`,
 `decoy_strategy: utf8`.
 
@@ -148,32 +151,32 @@ ion-mobility columns are written null throughout the 3D MVP.
 `write_table(path, cols)` (`table.rs:151`) is the single write entry point and
 returns the row count as `u64`:
 1. Reject an empty column set (`table.rs:152`).
-2. Reject duplicate column names via a `HashSet` (`table.rs:157-162`). Arrow
+2. Reject duplicate column names via a `HashSet` (`table.rs:157-165`). Arrow
    allows duplicate names but readers resolve a name to the first match, which
    would silently hide the second column, so this is a hard error.
 3. Take `nrows` from column 0 and require every column to match
-   (`table.rs:163-173`); a mismatch is a hard error naming the offending column.
-4. Build the `Schema` from `field()` over all columns (`table.rs:174-175`),
-   then consume the columns into `ArrayRef`s (`table.rs:178`). The `fields`
+   (`table.rs:166-176`); a mismatch is a hard error naming the offending column.
+4. Build the `Schema` from `field()` over all columns (`table.rs:177-178`),
+   then consume the columns into `ArrayRef`s (`table.rs:181`). The `fields`
    vector is captured before the consume so the schema still has everything.
-5. `RecordBatch::try_new` (`table.rs:179`), create parent dirs
-   (`create_dir_all(...).ok()`, best-effort, `table.rs:182-184`), create the
-   file, build `WriterProperties` with `Compression::SNAPPY` (`table.rs:186`),
+5. `RecordBatch::try_new` (`table.rs:182`), create parent dirs
+   (`create_dir_all(...).ok()`, best-effort, `table.rs:185-187`), create the
+   file, build `WriterProperties` with `Compression::SNAPPY` (`table.rs:189-191`),
    and write a single batch through `ArrowWriter`, then `close()`
-   (`table.rs:189-191`). One `write_table` call produces exactly one row group /
+   (`table.rs:192-194`). One `write_table` call produces exactly one row group /
    one logical batch.
 
 ### Read side: Parquet -> `Table` -> typed `Vec`
 
-`Table` (`table.rs:197-201`) holds the `Arc<Schema>`, the `Vec<RecordBatch>`,
-and `nrows`. `Table::read(path)` (`table.rs:204`) opens the file, builds a
+`Table` (`table.rs:200-204`) holds the `Arc<Schema>`, the `Vec<RecordBatch>`,
+and `nrows`. `Table::read(path)` (`table.rs:207`) opens the file, builds a
 `ParquetRecordBatchReaderBuilder`, captures the schema, then iterates the reader
 collecting every batch and summing `num_rows()`. It errors with context
 `"opening {path}"` if the file cannot be opened and `"reading parquet {path}"` if
 the builder cannot parse the Parquet footer. The whole file is materialized
 into memory; there is no streaming or predicate pushdown.
 
-Column access is by name. `idx(name)` (`table.rs:228`) resolves a name to a
+Column access is by name. `idx(name)` (`table.rs:235`) resolves a name to a
 column index via `schema.index_of`, returning a descriptive error listing all
 column names if the name is absent. The typed getters each downcast every
 batch's column to the concrete Arrow array type and concatenate across batches
@@ -182,29 +185,29 @@ time. The message wording is per getter: `"column '<name>' is not
 f64|f32|i64|i32|u32|bool"` for the scalar getters (and `opt_f64` reuses the f64
 message), `"column '<name>' is not utf8"` for `str` (note: `utf8`, not `str`),
 and for `list_f32` either `"column '<name>' is not a list"` when the column is
-neither a `List` nor a `LargeList` (`table.rs:419`) or `"list '<name>' inner is
-not f32"` when the inner element array is not f32 (`table.rs:396`).
+neither a `List` nor a `LargeList` (`table.rs:426`) or `"list '<name>' inner is
+not f32"` when the inner element array is not f32 (`table.rs:403`).
 
 The getters and their exact null behaviour:
 
-- `f64` (`table.rs:234`), `f32` (`table.rs:254`): fast path when
+- `f64` (`table.rs:241`), `f32` (`table.rs:261`): fast path when
   `null_count() == 0` uses `extend_from_slice(a.values())`; otherwise iterate
   and map a null to `f64::NAN` / `f32::NAN`. Nulls become NaN.
-- `i64` (`table.rs:274`), `i32` (`table.rs:294`), `u32` (`table.rs:314`): fast
+- `i64` (`table.rs:281`), `i32` (`table.rs:301`), `u32` (`table.rs:321`): fast
   path on no nulls; otherwise iterate pushing `a.value(k)` **without checking
   `is_null`**. A null therefore comes through as the underlying buffer value
   (typically 0), not as a sentinel. See the gotcha below.
-- `bool` (`table.rs:334`): always iterates `a.value(k)`; never checks null.
-- `str` (`table.rs:350`): iterates; a null maps to an empty `String`.
-- `opt_f64` (`table.rs:370`): the only null-preserving getter. Returns
+- `bool` (`table.rs:341`): always iterates `a.value(k)`; never checks null.
+- `str` (`table.rs:357`): iterates; a null maps to an empty `String`.
+- `opt_f64` (`table.rs:377`): the only null-preserving getter. Returns
   `Vec<Option<f64>>`, mapping a null to `None`.
-- `list_f32` (`table.rs:389`): reads an f32 list column and accepts **both**
+- `list_f32` (`table.rs:396`): reads an f32 list column and accepts **both**
   `List` (32-bit offsets) and `LargeList` (64-bit offsets) encodings, so a
   chromatogram artifact written by `Col::ListF32` or `Col::LargeListF32` reads
   back through the same call. An outer null list becomes an empty `Vec`; a
   present list is materialized via `f.values().to_vec()`.
 
-`column_names()` (`table.rs:224`) returns the schema field names in order.
+`column_names()` (`table.rs:227`) returns the schema field names in order.
 
 ### Hashing (`hash.rs`)
 
@@ -215,13 +218,13 @@ with context `"hashing {path}"` if the file cannot be opened or a read fails.
 `blake3_str(s)` (`hash.rs:23`) is a one-shot hex digest of a string, used for the
 `config_hash`; it is infallible and returns a plain `String` rather than a
 `Result`. The engine derives the
-config hash from `Config::canonical_json()` (`config.rs:1116`, a plain
-`serde_json::to_string`), for example at `main.rs:404`. The `convert` command is
+config hash from `Config::canonical_json()` (`config.rs:1125`, a plain
+`serde_json::to_string`), for example at `main.rs:417`. The `convert` command is
 a deliberate exception: because `--max-spectra`, `--top-peaks-ms2`, and
 `--top-peaks-ms1` are CLI caps that change the spectra output but are not part
 of `Config`, they are folded into the hash with a unit-separator (`\u{1f}`)
 alongside the canonical config JSON so two different caps do not collapse to the
-same `config_hash` (`main.rs:389-392`).
+same `config_hash` (`main.rs:402-404`).
 
 ### JSON (`json.rs`)
 
@@ -262,9 +265,12 @@ appends `.report.json` to the artifact path and writes it via
 
 `stats` is a `BTreeMap` (not a `HashMap`) so the JSON key order is
 deterministic. Concrete example: `digest` records `params` with enzyme, missed
-cleavages, length bounds, decoy strategy, and rng seed, and `stats` with
-`n_targets` / `n_decoys` (`stages/digest.rs:229-249`). `convert` has a
-stage-local helper `write_reports` (`stages/convert.rs:272-294`) that writes one
+cleavages, length bounds, decoy strategy, rng seed, and `max_decoy_attempts`,
+and `stats` with `n_targets`, `n_decoys`, `decoy_collision_retries`, and
+`dropped_target_decoy_pairs` (`stages/digest.rs:301-331`; the collision-retry and
+dropped-pair counters were added with the collision-safe decoy resolver in
+e7d7fa5). `convert` has a
+stage-local helper `write_reports` (`stages/convert.rs:269-290`) that writes one
 report per artifact with a shared `params` and empty `stats`; note this
 `write_reports` lives in `convert.rs`, it is not part of the `mumdia-io` public
 API. Stages with report coverage build their `ArtifactReport` directly (see the
@@ -296,10 +302,11 @@ sidecars, when implemented, but not a manifest.
 `  <name>: <DataType>` with a ` (nullable)` suffix when the field is nullable,
 and a `head:` block. The head is the first up-to-10 rows sliced from the
 **first batch only** (`first.slice(0, min(num_rows, 10))`, `lib.rs:57-59`),
-formatted with `arrow::util::pretty::pretty_format_batches`. If pretty-print
-fails, the head is silently omitted (`Err(_) => {}`, `lib.rs:66`). The CLI
-command `Cmd::Inspect { artifact }` (`main.rs:257`) simply prints the returned
-string (`main.rs:658-659`).
+formatted with `arrow::util::pretty::pretty_format_batches`. The result is
+appended only inside an `if let Ok(p) = ...` (`lib.rs:60`), so if pretty-print
+fails the head is silently omitted; there is no `else` branch. The CLI
+command `Cmd::Inspect { artifact }` (`main.rs:712`) simply prints the returned
+string (`main.rs:713`).
 
 ### Logging
 
@@ -315,15 +322,15 @@ string (`main.rs:658-659`).
 | `Col::field` | `table.rs:83` | Arrow `Field`; scalars non-nullable, `Opt*`/lists nullable |
 | `Col::into_array` | `table.rs:107` | consuming move of the `Vec` into an `ArrayRef` (copy once) |
 | `write_table` | `table.rs:151` | validate + write one SNAPPY Parquet batch; returns row count |
-| `Table` (struct) | `table.rs:197` | read-back table: schema, batches, nrows |
-| `Table::read` | `table.rs:204` | read a Parquet file fully into memory |
-| `Table::column_names` | `table.rs:224` | schema field names, in order |
-| `Table::f64` / `f32` | `table.rs:234` / `254` | float getters; null -> NaN |
-| `Table::i64`/`i32`/`u32` | `table.rs:274`/`294`/`314` | integer getters; null NOT checked (-> buffer value) |
-| `Table::bool` | `table.rs:334` | bool getter; null NOT checked |
-| `Table::str` | `table.rs:350` | string getter; null -> `""` |
-| `Table::opt_f64` | `table.rs:370` | only null-preserving getter; -> `Vec<Option<f64>>` |
-| `Table::list_f32` | `table.rs:389` | f32 list getter; reads `List` and `LargeList`; null row -> empty `Vec` |
+| `Table` (struct) | `table.rs:200` | read-back table: schema, batches, nrows |
+| `Table::read` | `table.rs:207` | read a Parquet file fully into memory |
+| `Table::column_names` | `table.rs:227` | schema field names, in order |
+| `Table::f64` / `f32` | `table.rs:241` / `261` | float getters; null -> NaN |
+| `Table::i64`/`i32`/`u32` | `table.rs:281`/`301`/`321` | integer getters; null NOT checked (-> buffer value) |
+| `Table::bool` | `table.rs:341` | bool getter; null NOT checked |
+| `Table::str` | `table.rs:357` | string getter; null -> `""` |
+| `Table::opt_f64` | `table.rs:377` | only null-preserving getter; -> `Vec<Option<f64>>` |
+| `Table::list_f32` | `table.rs:396` | f32 list getter; reads `List` and `LargeList`; null row -> empty `Vec` |
 | `ArtifactReport` | `report.rs:11` | per-artifact JSON summary struct |
 | `ArtifactReport::write_for` | `report.rs:28` | write `<artifact>.report.json` |
 | `blake3_file` | `hash.rs:8` | streamed blake3 hex digest of a file (`content_hash`) |
@@ -339,10 +346,10 @@ This subsystem reads no `Config` fields. It has no config surface of its own, so
 the recent pruning of dead config fields in `mumdia-core::config` did not touch
 it. Its behaviour is fixed at compile time:
 
-- Compression is `SNAPPY`, hard-coded in `write_table` (`table.rs:186-188`); it
+- Compression is `SNAPPY`, hard-coded in `write_table` (`table.rs:189-191`); it
   is not configurable and there is no other codec path.
 - The hash read buffer is 64 KiB (`hash.rs:11`).
-- Schema identifiers are the constants in `mumdia-core/src/schema.rs:7-23`; a
+- Schema identifiers are the constants in `mumdia-core/src/schema.rs:7-24`; a
   new artifact requires a new tuple there, not a config change.
 - Dependency features are pinned in the workspace `Cargo.toml`: `arrow` v59 with
   `["prettyprint"]` (needed by `inspect`), `parquet` v59 with
@@ -378,19 +385,19 @@ it. Its behaviour is fixed at compile time:
   append inner-element nulls; `list_f32` reads inner values with
   `values().to_vec()` and cannot surface an inner null. Only the outer
   list-level null (empty `Vec`) is modeled.
-- **Duplicate column names are rejected** at write time (`table.rs:157-162`)
+- **Duplicate column names are rejected** at write time (`table.rs:157-165`)
   because Arrow readers resolve to the first match and would hide the rest.
 - **Length equality is enforced**: all columns must have identical length or
-  `write_table` errors (`table.rs:163-173`).
+  `write_table` errors (`table.rs:166-176`).
 - **Everything is loaded into memory.** `Table::read` collects all batches and
   `inspect` reads the full table just to print 10 rows; there is no streaming
   path. For very large artifacts this is a real memory cost. `inspect`'s head is
   taken from the first batch only, so a file with tiny leading batches shows few
   rows even when later batches are large.
-- **`inspect` swallows pretty-print errors** (`lib.rs:66`): a formatting failure
-  omits the head silently rather than erroring, so absence of a head block is
-  not proof of an empty table.
-- **`create_dir_all` on write is best-effort** (`.ok()`, `table.rs:183`); a real
+- **`inspect` swallows pretty-print errors** (`lib.rs:60`, an `if let Ok(p)`
+  with no `else`): a formatting failure omits the head silently rather than
+  erroring, so absence of a head block is not proof of an empty table.
+- **`create_dir_all` on write is best-effort** (`.ok()`, `table.rs:186`); a real
   permission failure surfaces later at `File::create`, not at the mkdir.
 - **`record_artifact` hard-codes `format = "parquet"`** (`lib.rs:31`); it is not
   suitable for a non-Parquet artifact without a change there.
@@ -399,7 +406,7 @@ it. Its behaviour is fixed at compile time:
   64-bit offsets) still reads identically; do not assume a fixed offset width
   when consuming chromatograms.
 - **Test coverage is one round-trip.** The crate's only unit test is
-  `roundtrip_mixed_columns` (`table.rs:430`), which writes then reads back
+  `roundtrip_mixed_columns` (`table.rs:438`), which writes then reads back
   `U32`/`F64`/`Str`/`OptF64`/`ListF32`/`LargeListF32`, asserting among other
   things that a `LargeListF32` column cross-reads through `list_f32`. `hash.rs`,
   `json.rs`, `report.rs`, and `lib.rs` (`inspect`, `record_artifact`,
@@ -415,18 +422,20 @@ it. Its behaviour is fixed at compile time:
   null handling (prefer an `opt_*` return over a silent sentinel for anything
   that can be null in practice).
 - **Add a null-aware integer/string getter.** This is the standing correctness
-  item. Mirror `opt_f64` (`table.rs:370`): iterate `is_null(k)` and return
+  item. Mirror `opt_f64` (`table.rs:377`): iterate `is_null(k)` and return
   `Vec<Option<T>>`. Do not change the existing non-optional getters' signatures;
   add new ones so current call sites are unaffected.
 - **Register a new artifact.** Add a `(name, version)` tuple to
   `mumdia-core/src/schema.rs` and pass it to `write_table` (schema = the
   `Vec<Col>` you write) plus the `ArtifactReport`/`record_artifact` calls. Bump
   the version only on a breaking column-schema change (as was done for
-  `psms_scored` -> 2) and document the change. There is no read-side version
+  `psms_scored`, now at version 3, and for `psms_competed` / `peptide_quant` /
+  `protein_group_quant`, now at version 2) and document the change. There is no
+  read-side version
   check today, so the bump is provenance only; if you need a hard gate, add the
   check on the read path (it does not exist yet).
 - **Change compression.** It is a one-line change in `write_table`
-  (`table.rs:186`); keep it to a codec available under the pinned pure-Rust
+  (`table.rs:190`); keep it to a codec available under the pinned pure-Rust
   Parquet features, and re-measure round-trip and file size.
 - **Extend the report.** Add a field to `ArtifactReport` (`report.rs:11`). Keep
   `stats` a `BTreeMap` for deterministic key order. Since it is

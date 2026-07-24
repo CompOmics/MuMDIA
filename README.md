@@ -95,8 +95,9 @@ run the native, dependency-free models instead, drop `--config` and add
 
 ## Build
 
-Requires Rust >= 1.85 (the dependencies use edition 2024; `rustup update` if
-older). All dependencies are pure Rust, so no C toolchain is needed.
+Requires Rust >= 1.85 (the workspace `Cargo.toml` pins `rust-version = 1.85`;
+`rustup update` if older). All dependencies are pure Rust, so no C toolchain is
+needed.
 
 ```
 cd rust/mumdia
@@ -254,8 +255,9 @@ image's bundled environments.
 ## FDR
 
 MuMDIA estimates false discovery rates with paired target-decoy competition
-(reverse/scramble or fragment-shift decoys) and reports q-values at PSM,
-precursor, peptide, and protein-group levels. Those estimates depend on a valid,
+(reverse or scramble decoys for a native digest, or the paired decoys already
+present in an imported library) and reports q-values at PSM, precursor, peptide,
+and protein-group levels. Those estimates depend on a valid,
 exchangeable decoy population; the engine rejects malformed or decoy-free
 libraries. Entrapment (a foreign-proteome spike-in) is available as an empirical
 cross-check and should be part of validation before a new sensitivity setting is

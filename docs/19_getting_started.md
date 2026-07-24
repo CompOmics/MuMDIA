@@ -27,7 +27,7 @@ sidecar is a separate conda environment, wired into a run purely by pointing a
 config field at that environment's `python.exe`. The interpreter path is never
 hardcoded in Rust; it comes from the config
 (`predict_frag.ms2pip_python`, `predict_frag.deeplc_python`, `rescore.python`,
-defined at `rust/mumdia/crates/mumdia-core/src/config.rs:303`, `:305`, `:959`).
+defined at `rust/mumdia/crates/mumdia-core/src/config.rs:263`, `:265`, `:921`).
 
 The environments discovered on this machine under
 `C:/Users/robbi/anaconda3/envs/` are:
@@ -41,12 +41,13 @@ The environments discovered on this machine under
 Notes:
 
 - The `nn_torch` rescorer requires `rescore.python` to point at an interpreter
-  with torch (`config.rs:134-139`); `py312_mumdia` satisfies this.
+  with torch (validated at `config.rs:1073-1082`, and re-checked before compute in
+  `rust/mumdia/crates/mumdia/src/stages/run.rs:68-75`); `py312_mumdia` satisfies this.
 - Use `deeplc_mt`, not the older `deeplc_multitask`, for the fine-tune: prediction
   crashes in `deeplc_multitask` on this machine (`CLAUDE.md`, ML predictors
   section). `deeplc_finetune.py` pins OpenMP/BLAS threads to avoid an
   oversubscription crash specific to this env
-  (`scripts/deeplc_finetune.py:6-27`).
+  (`scripts/deeplc_finetune.py:22-28`).
 - The `ms2rescore` environment named in `CLAUDE.md` is not present here. mokapot
   and MS2PIP are importable in `py311_workshop` and in `deeplc_mt` if you want the
   mokapot rescorer or the MS2PIP predictor. The best-workflow config in Section 4
@@ -78,7 +79,7 @@ C:/Users/robbi/mumdia_build/release/mumdia.exe doctor --config config.local-dian
 | `rescore.python` | `py312_mumdia` python | interpreter for the `nn_torch` sidecar |
 | `rescore.classifier` | `nn_torch` | selects the PyTorch semi-supervised rescorer |
 | `predict_frag.deeplc_python` | `deeplc_mt` python | interpreter for the DeepLC fine-tune / prediction |
-| `rt_im_train.finetune_deeplc` | `true` | enables the per-run DeepLC fine-tune (requires `deeplc_python`, enforced at `rust/mumdia/crates/mumdia/src/stages/run.rs:63-65`) |
+| `rt_im_train.finetune_deeplc` | `true` | enables the per-run DeepLC fine-tune (requires `deeplc_python`, enforced at `rust/mumdia/crates/mumdia/src/stages/run.rs:62-67`) |
 | `predict_frag.ms2pip_python` | unset | would point at an env with MS2PIP; not used by the library run |
 
 ## 2. Converting vendor files to centroided mzML
@@ -121,7 +122,7 @@ gitignored (large binaries kept on disk).
 | `lib/seed_psms.parquet.masscal.json` | 1 | Per-run mass-recalibration sidecar for that seed |
 
 The precursor and fragment schemas match the library-input contract consumed by
-the fragment index (`rust/mumdia/crates/mumdia/src/index.rs:63`, `:121`):
+the fragment index (`rust/mumdia/crates/mumdia/src/index.rs:55-71`):
 `candidate_id, peptidoform_id, base_peptide_id, peptidoform, charge,
 precursor_mz, predicted_irt, label, protein, n_fragments` for precursors, and
 `candidate_id, mz, predicted_intensity, name, ion_type, ordinal, frag_charge`
@@ -157,14 +158,14 @@ is locally noisy, so if fine-tuning is disabled and you consume a precursor
 library directly, the `_ft` file is the one to use: `rt-im-train` reads
 `predicted_irt` as-is to fit the RT
 calibration and set per-candidate windows
-(`rust/mumdia/crates/mumdia/src/stages/rt_im_train.rs:35`, `:75`), and raw iRT
+(`rust/mumdia/crates/mumdia/src/stages/rt_im_train.rs:65-83`), and raw iRT
 gives poor windows.
 
 Interaction with the per-run fine-tune (the best-workflow config sets
 `rt_im_train.finetune_deeplc = true`): when the fine-tune is on, `run` fine-tunes
 DeepLC on this run's confident seed PSMs and writes a new output table with
 replaced `predicted_irt` for every standard peptidoform before RT calibration
-(`rust/mumdia/crates/mumdia/src/stages/run.rs:187-208`;
+(`rust/mumdia/crates/mumdia/src/stages/run.rs:242-280`;
 `scripts/deeplc_finetune.py:156-159`). The input file's `predicted_irt` is then
 only a fallback for non-standard peptidoforms (`deeplc_finetune.py:95`, `:156`),
 so raw and `_ft` may converge when the fine-tune is on. For a clean
@@ -195,7 +196,7 @@ Run from the repository root
 
 No Python, no sidecars. `--profile dia` selects the Extended feature set,
 rolling-window apex counting (window 5), and the RT prior
-(`config.rs:1100-1104`). Native predictors and the native rescorer are used
+(`config.rs:1109-1113`). Native predictors and the native rescorer are used
 throughout.
 
 ```
@@ -215,7 +216,7 @@ deterministic across runs and high-precision.
 
 Library-input mode plus the local sidecar config. `run` skips
 digest/peptidoforms/predict-frag and consumes the prebuilt library
-(`main.rs:204-207`). The config `config.local-diann-lib.json` (repository root)
+(`main.rs:208-215`). The config `config.local-diann-lib.json` (repository root)
 turns on: Extended features, `min_frag_corr = 0.2`, rolling-window apex (5) and
 RT prior (120 s), the per-run DeepLC fine-tune via `deeplc_mt`, the `nn_torch`
 rescorer via `py312_mumdia` with `rescore.strict = true`, an RT-window
@@ -257,9 +258,9 @@ MuMDIA: <N> precursor rows, <M> protein groups at peptide/PG q <= 0.01 (rescorer
 
 `N` is the number of precursor rows written to `peptides.tsv` (the report unit is
 peptidoform + charge, filtered to targets with peptide q <= the threshold;
-`rust/mumdia/crates/mumdia/src/stages/report.rs:89-107`, threshold from
-`quant.q_threshold`, default 0.01, `config.rs:862`; summary printed at
-`run.rs:317-320`).
+`rust/mumdia/crates/mumdia/src/stages/report.rs:100-122`, threshold from
+`quant.q_threshold`, default 0.01, `config.rs:824`; summary printed at
+`run.rs:469-472`).
 
 `peptides.tsv` is therefore not a stripped-peptide count and is not controlled by
 `precursor_q`. Confirm the actual classifier and model identity in
