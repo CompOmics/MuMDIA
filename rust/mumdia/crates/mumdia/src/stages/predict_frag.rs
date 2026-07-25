@@ -118,6 +118,26 @@ pub fn run(p: PredictFragParams) -> Result<(u64, u64)> {
     let frag_model_id = assign_intensities(&p, &mut raws)?;
     let model_identity = format!("{rt_model_id}; {frag_model_id}");
 
+    // Finite guard at the prediction sidecar boundary. A NaN/Inf predicted iRT or
+    // fragment intensity from a misbehaving MS2PIP/DeepLC run would silently
+    // corrupt the library and every downstream spectral-similarity feature (and
+    // would misorder the top-N intensity sort below). Fail loudly instead. The
+    // rescore sidecar boundary already guards its feature matrix the same way.
+    for r in &raws {
+        if !r.irt.is_finite() {
+            bail!(
+                "predict-frag: non-finite predicted iRT for '{}'",
+                r.peptidoform
+            );
+        }
+        if r.frag_int.iter().any(|v| !v.is_finite()) {
+            bail!(
+                "predict-frag: non-finite predicted fragment intensity for '{}'",
+                r.peptidoform
+            );
+        }
+    }
+
     // Keep top-N fragments by predicted intensity. Each candidate is independent
     // (operates only on its own frags/frag_int), so this parallelizes with no
     // cross-item state; the result per candidate is identical to the serial loop.
@@ -209,6 +229,12 @@ pub fn run(p: PredictFragParams) -> Result<(u64, u64)> {
             Col::I32("n_fragments".into(), nfrag_c),
         ],
     )?;
+    // Fragment cardinality: distinct precursors sharing each fragment m/z (0.01 Da
+    // bin), matching the imported-library path. Computed once over the whole
+    // library so downstream interference-aware feature/quant selection reads a
+    // deterministic precomputed column instead of a runtime heuristic. Diagnostic;
+    // no consumer yet.
+    let f_card = fragment_cardinality(&f_cid, &f_mz);
     let n_frag = write_table(
         p.out_fragments,
         vec![
@@ -219,6 +245,7 @@ pub fn run(p: PredictFragParams) -> Result<(u64, u64)> {
             Col::Str("ion_type".into(), f_type),
             Col::I32("ordinal".into(), f_ord),
             Col::I32("frag_charge".into(), f_chg),
+            Col::I32("cardinality".into(), f_card),
         ],
     )?;
 
@@ -391,5 +418,36 @@ fn assign_intensities(p: &PredictFragParams, raws: &mut [Raw]) -> Result<String>
             }
             Ok(format!("ms2pip-{}", p.cfg.ms2pip_model))
         }
+    }
+}
+
+/// Count distinct precursors (candidate_ids) whose fragments fall in each 0.01 Da
+/// m/z bin, and return that count per fragment row aligned to `mz`. This is the
+/// library fragment cardinality: a low value marks a clean, quantification-
+/// friendly ion, a high value an interference-prone non-unique ion. Deterministic
+/// (ordered maps, no HashMap iteration) and matched to the imported-library
+/// binning in `scripts/import_diann_lib.py`.
+fn fragment_cardinality(cid: &[u32], mz: &[f64]) -> Vec<i32> {
+    use std::collections::{BTreeMap, BTreeSet};
+    let bin = |m: f64| (m * 100.0).round() as i64;
+    let mut bins: BTreeMap<i64, BTreeSet<u32>> = BTreeMap::new();
+    for (c, m) in cid.iter().zip(mz) {
+        bins.entry(bin(*m)).or_default().insert(*c);
+    }
+    mz.iter().map(|m| bins[&bin(*m)].len() as i32).collect()
+}
+
+#[cfg(test)]
+mod cardinality_tests {
+    use super::fragment_cardinality;
+
+    #[test]
+    fn counts_distinct_precursors_per_mz_bin() {
+        // Fragment m/z 100.00 shared by precursors 0 and 1 (cardinality 2);
+        // 100.004 falls in the same 0.01 Da bin (still 2); 200.00 is unique to
+        // precursor 2 (cardinality 1). A precursor counted once per bin.
+        let cid = vec![0u32, 1, 2, 0];
+        let mz = vec![100.000, 100.004, 200.000, 100.001];
+        assert_eq!(fragment_cardinality(&cid, &mz), vec![2, 2, 1, 2]);
     }
 }

@@ -72,6 +72,13 @@ def main():
     name = df["Fragment.Type"].astype(str) + df["Fragment.Series.Number"].astype(str)
     fc = df["Fragment.Charge"].astype(np.int32)
     name = np.where(fc > 1, name + "^" + fc.astype(str), name)
+    # Fragment cardinality: how many distinct library precursors share each
+    # fragment m/z (0.01 Da bin). A high value marks a non-unique, interference
+    # prone ion; a low value marks a clean, quantification-friendly ion. Computed
+    # once here at import time so downstream interference-aware feature/quant
+    # selection reads a deterministic column instead of a runtime heuristic.
+    mz_bin = (df["Product.Mz"] * 100.0).round().astype("int64")
+    cardinality = df.groupby(mz_bin)["candidate_id"].transform("nunique").astype(np.int32)
     frag = pd.DataFrame({
         "candidate_id": df["candidate_id"],
         "mz": df["Product.Mz"].astype(np.float64),
@@ -80,6 +87,7 @@ def main():
         "ion_type": df["Fragment.Type"].astype(str).str.lower(),
         "ordinal": df["Fragment.Series.Number"].astype(np.int32),
         "frag_charge": fc,
+        "cardinality": cardinality,
     }).sort_values("candidate_id").reset_index(drop=True)
 
     prec.to_parquet(outp, index=False)
