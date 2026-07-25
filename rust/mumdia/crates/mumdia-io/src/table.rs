@@ -195,6 +195,28 @@ pub fn write_table(path: &str, cols: Vec<Col>) -> Result<u64> {
     Ok(nrows as u64)
 }
 
+/// Write pre-built Arrow record batches to a Snappy Parquet file, preserving
+/// their schema exactly. Unlike [`write_table`] (which builds columns from typed
+/// vecs) this is for passing an existing schema through unchanged, e.g. filtering
+/// a scored table by run without re-declaring its column set. Returns the row count.
+pub fn write_batches(path: &str, schema: Arc<Schema>, batches: &[RecordBatch]) -> Result<u64> {
+    if let Some(parent) = std::path::Path::new(path).parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    let file = std::fs::File::create(path).with_context(|| format!("creating {path}"))?;
+    let props = WriterProperties::builder()
+        .set_compression(Compression::SNAPPY)
+        .build();
+    let mut writer = ArrowWriter::try_new(file, schema, Some(props))?;
+    let mut n = 0u64;
+    for b in batches {
+        writer.write(b)?;
+        n += b.num_rows() as u64;
+    }
+    writer.close()?;
+    Ok(n)
+}
+
 /// A read-back table: all batches concatenated logically, accessed by column
 /// name with typed getters.
 pub struct Table {
