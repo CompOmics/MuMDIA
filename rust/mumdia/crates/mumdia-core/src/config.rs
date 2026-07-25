@@ -161,6 +161,15 @@ pub enum PeakClaim {
     /// 1.0 so this reduces to `CoelutionWinner` when no cue is enabled. Winner-take-all
     /// on the composite weight when `reassign` is set.
     CoelutionMultiCue,
+    /// Spectrum-centric demix redistribution (two-pass, destructive). At each scan the
+    /// co-isolated candidate x fragment design matrix is assembled and solved by
+    /// non-negative least squares; each shared peak's intensity is then split among its
+    /// claimants in proportion to `beta_c * D[peak,c]` (the joint deconvolution) instead
+    /// of stripped winner-take-all. The smooth, principled destructive mode - the CHIMERYS
+    /// coefficient split, made chromatographic and clean-room. Always redistributes; the
+    /// demix FEATURES are the separate `emit_demix_features` path. Deterministic (sorted
+    /// candidate columns, ridge NNLS).
+    CoelutionDemix,
 }
 
 /// Composable per-claimant weight cues for [`PeakClaim::CoelutionMultiCue`] (the

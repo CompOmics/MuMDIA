@@ -92,6 +92,10 @@ struct Hit {
 
 type ChromOutputRow = (u32, String, f64, f64, f32, Vec<f32>, Vec<f32>);
 
+/// One observed peak for the per-scan demix: (observed intensity, observed m/z, claimants
+/// as (candidate_id, fragment_ordinal, predicted_intensity)).
+type DemixRow = (f32, f64, Vec<(u32, u16, f32)>);
+
 /// Per-candidate contested-peak statistics from the co-elution arbitration
 /// (two-pass path). `won`/`lost` are the summed observed intensity of shared peaks
 /// this candidate won (was the most-eluting claimant) or lost to a better
@@ -846,10 +850,109 @@ fn extract_twopass_windows(
             // PASS 2: arbitrate each shared peak by which claimant is most eluting.
             let mut acc2: HashMap<u32, Vec<Hit>> = HashMap::new();
             let mut contested: HashMap<u32, Contested> = HashMap::new();
+            let demix_mode = matches!(cfg.peak_claim, PeakClaim::CoelutionDemix);
             for &si in ids {
                 let scan = &scans[si];
                 let rt = scan.rt_seconds;
                 let rtb = rt.to_bits();
+                // Spectrum-centric demix redistribution (CoelutionDemix): solve one NNLS
+                // over this scan's co-isolated candidate x fragment matrix and split each
+                // shared peak by beta_c * D[peak,c] (smooth joint deconvolution) rather than
+                // the per-peak profile-height arbitration below.
+                if demix_mode {
+                    let mut col_of: BTreeMap<u32, usize> = BTreeMap::new();
+                    let mut prows: Vec<DemixRow> = Vec::new();
+                    for peak in &scan.peaks {
+                        let q_mz = peak.mz / mass_off.factor_at(peak.mz);
+                        claimants.clear();
+                        {
+                            let mut push = |cid: u32, frag: u16, pi: f32| {
+                                let c = cid as usize;
+                                if rt < rt_lo[c] || rt > rt_hi[c] {
+                                    return;
+                                }
+                                if let Some(s) = restrict {
+                                    if !s.contains(&cid) {
+                                        return;
+                                    }
+                                }
+                                claimants.push((cid, frag, pi));
+                            };
+                            probe_matched(idx, lib, frag_tol, q_mz, lo, hi, &mut push);
+                        }
+                        if claimants.is_empty() {
+                            continue;
+                        }
+                        for &(cid, _, _) in &claimants {
+                            col_of.entry(cid).or_insert(0);
+                        }
+                        prows.push((peak.intensity, peak.mz, claimants.clone()));
+                    }
+                    if prows.is_empty() {
+                        continue;
+                    }
+                    let n = col_of.len();
+                    let m = prows.len();
+                    for (k, v) in col_of.values_mut().enumerate() {
+                        *v = k;
+                    }
+                    let mut amat = vec![0.0f64; m * n];
+                    let mut yv = vec![0.0f64; m];
+                    for (r, (obs, _, cl)) in prows.iter().enumerate() {
+                        yv[r] = *obs as f64;
+                        for &(cid, _, pi) in cl {
+                            let cell = &mut amat[r * n + col_of[&cid]];
+                            if (pi as f64) > *cell {
+                                *cell = pi as f64;
+                            }
+                        }
+                    }
+                    let beta = crate::solve::nnls(
+                        &amat,
+                        m,
+                        n,
+                        &yv,
+                        cfg.demix_lambda.max(1e-9),
+                        200 * n.max(1),
+                    );
+                    for (r, (obs, obs_mz, cl)) in prows.iter().enumerate() {
+                        let mut denom = 0.0f64;
+                        let mut winner = cl[0].0;
+                        let mut best_bd = f64::NEG_INFINITY;
+                        for &(cid, _, _) in cl {
+                            let bd = beta[col_of[&cid]] * amat[r * n + col_of[&cid]];
+                            denom += bd;
+                            if bd > best_bd || (bd == best_bd && cid < winner) {
+                                best_bd = bd;
+                                winner = cid;
+                            }
+                        }
+                        for &(cid, frag, _) in cl {
+                            let bd = beta[col_of[&cid]] * amat[r * n + col_of[&cid]];
+                            let share = if denom > 0.0 {
+                                *obs as f64 * (bd / denom)
+                            } else {
+                                *obs as f64 / cl.len() as f64
+                            };
+                            let e = contested.entry(cid).or_default();
+                            e.apportioned += share;
+                            if cid == winner {
+                                e.won += *obs as f64;
+                                e.n_won += 1;
+                            } else {
+                                e.lost += *obs as f64;
+                                e.n_lost += 1;
+                            }
+                            acc2.entry(cid).or_default().push(Hit {
+                                rt,
+                                frag,
+                                inten: share as f32,
+                                obs_mz: *obs_mz,
+                            });
+                        }
+                    }
+                    continue;
+                }
                 for peak in &scan.peaks {
                     let inten = peak.intensity;
                     let q_mz = peak.mz / mass_off.factor_at(peak.mz);
@@ -1140,6 +1243,7 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
             | PeakClaim::CoelutionProportional
             | PeakClaim::CoelutionWinnerMargin
             | PeakClaim::CoelutionMultiCue
+            | PeakClaim::CoelutionDemix
     ) || p.cfg.emit_contested_features;
     let claim_margin = p.cfg.peak_claim_margin as f32;
 
@@ -1246,6 +1350,7 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
             PeakClaim::CoelutionWinner
                 | PeakClaim::CoelutionProportional
                 | PeakClaim::CoelutionWinnerMargin
+                | PeakClaim::CoelutionDemix
         ) || (matches!(p.cfg.peak_claim, PeakClaim::CoelutionMultiCue)
             && p.cfg.claim_cues.reassign);
         let (a, c) = extract_twopass_windows(
