@@ -557,6 +557,19 @@ pub struct ExtractConfig {
     /// Composable claim-weight cues for `PeakClaim::CoelutionMultiCue` (modular
     /// fragment-competition framework). All default off (weight 1.0).
     pub claim_cues: ClaimCues,
+    /// Spectrum-centric NNLS demixing (D2, fragment-competition report). When true,
+    /// at each accepted candidate's apex scan, assemble the co-isolated candidate x
+    /// fragment design matrix, solve non-negative least squares (deterministic
+    /// ridge-regularized), and emit non-destructive demix features (deconv_explained_frac,
+    /// deconv_active, deconv_share) so the rescorer sees each candidate's
+    /// interference-corrected abundance. Default false; changes no extracted intensity.
+    pub emit_demix_features: bool,
+    /// Ridge for the demix NNLS passive solve (keeps it PD/deterministic under the
+    /// ~98% wide-window column collinearity). Default 1.0.
+    pub demix_lambda: f64,
+    /// Cap on the number of co-isolated candidates (design-matrix columns) in a single
+    /// demix solve, to bound compute on crowded windows. Default 64.
+    pub demix_max_candidates: usize,
     /// Emit a non-destructive `contested_frac` per PSM: the fraction of a
     /// candidate's matched intensity that a co-eluting competitor claims more
     /// strongly (by the two-pass elution-profile arbitration). Does not alter the
@@ -659,6 +672,9 @@ impl Default for ExtractConfig {
             bucket_size: 8192,
             peak_claim: PeakClaim::None,
             claim_cues: ClaimCues::default(),
+            emit_demix_features: false,
+            demix_lambda: 1.0,
+            demix_max_candidates: 64,
             emit_contested_features: false,
             peak_claim_margin: 2.0,
             matcher: MatcherKind::Fragindex,

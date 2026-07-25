@@ -32,6 +32,7 @@ use rayon::prelude::*;
 mod apex_dispersion;
 mod chromatographic;
 mod coelution;
+mod demix;
 pub(crate) mod entropy;
 mod interference;
 mod ion_series;
@@ -65,6 +66,7 @@ const FAMILIES: &[(&[&str], FamilyFn)] = &[
     (peak_scans::NAMES, peak_scans::values),
     (apex_dispersion::NAMES, apex_dispersion::values),
     (mass_uncertainty::NAMES, mass_uncertainty::values),
+    (demix::NAMES, demix::values),
 ];
 
 /// Names already used by the Minimal/Rich sets, which the extended battery must
@@ -344,6 +346,11 @@ pub struct Evidence {
     /// `ms1_isotope_height_corr` returns 0.0 (default), keeping the vector effect
     /// unchanged; when true it computes the apex-isotope Pearson.
     pub ms1_precursor_features: bool,
+    /// Spectrum-centric demix features (D2), from the extract stage. All 0 unless
+    /// `extract.emit_demix_features` populated the columns.
+    pub deconv_explained: f64,
+    pub deconv_active: f64,
+    pub deconv_share: f64,
 }
 
 /// Parse a fragment name like `b3`, `y7`, `b3^2` into (is_b, ordinal, charge).
@@ -536,6 +543,9 @@ fn build_evidence(
         ms1_isom1: None,
         ms1_xic,
         ms1_precursor_features: false,
+        deconv_explained: 0.0,
+        deconv_active: 0.0,
+        deconv_share: 0.0,
     }
 }
 
@@ -557,6 +567,16 @@ pub fn run(p: FeaturesParams) -> Result<u64> {
     // Top-K peak rank (#7), passed through untouched. Missing in pre-v2 extracted
     // artifacts -> 0 (the selected apex), so old inputs behave exactly as before.
     let peak_rank = ps.i32("peak_rank").unwrap_or_else(|_| vec![0; ps.nrows]);
+    // Demix features (D2), absent unless extract.emit_demix_features -> 0.
+    let deconv_expl = ps
+        .f32("deconv_explained_frac")
+        .unwrap_or_else(|_| vec![0.0; ps.nrows]);
+    let deconv_act = ps
+        .f32("deconv_active")
+        .unwrap_or_else(|_| vec![0.0; ps.nrows]);
+    let deconv_shr = ps
+        .f32("deconv_share")
+        .unwrap_or_else(|_| vec![0.0; ps.nrows]);
     let apex_rt = ps.f64("apex_rt")?;
     let apex_int = ps.f32("apex_intensity")?;
     let n_matched = ps.i32("n_matched_fragments")?;
@@ -805,6 +825,9 @@ pub fn run(p: FeaturesParams) -> Result<u64> {
                         ev.ms1_iso2 = ms1_i2[i];
                         ev.ms1_isom1 = ms1_m1[i];
                         ev.ms1_precursor_features = p.cfg.ms1_precursor_features;
+                        ev.deconv_explained = deconv_expl[i] as f64;
+                        ev.deconv_active = deconv_act[i] as f64;
+                        ev.deconv_share = deconv_shr[i] as f64;
                         extended_values(&ev)
                     }
                     _ => vec![0.0; ext_names.len()],

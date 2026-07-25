@@ -191,6 +191,125 @@ fn claim_cue_multiplier(
     w
 }
 
+/// Spectrum-centric NNLS demixing at a candidate's apex scan (D2, fragment-competition
+/// report). Assembles the co-isolated candidate x fragment-channel design matrix from the
+/// apex scan's observed peaks (rows = peaks, columns = candidates that claim a peak,
+/// `D[peak,cand]` = candidate's predicted intensity for its matching fragment), solves
+/// `min_{beta>=0} ||D beta - y||^2` (deterministic ridge NNLS), and returns
+/// `(deconv_explained_frac, deconv_active, deconv_share)` for candidate `cid`:
+/// the joint residual-explained fraction, whether cid survives the active set, and cid's
+/// fraction of the total demixed abundance (a borrower gets a low share). Returns zeros
+/// when the apex scan or candidate cannot be resolved. Deterministic: peaks in scan order,
+/// candidate columns in sorted `cid` order, ordered reductions.
+#[allow(clippy::too_many_arguments)]
+fn demix_at_apex(
+    idx: Option<&FragIndex>,
+    lib: &Library,
+    scans: &[Ms2Scan],
+    rt_scan: &HashMap<u64, Vec<u32>>,
+    mass_off: &MassOffset,
+    frag_tol: f64,
+    cid: u32,
+    apex_rt: f64,
+    prec_mz: f64,
+    rt_lo: &[f64],
+    rt_hi: &[f64],
+    cfg: &ExtractConfig,
+) -> (f64, f64, f64) {
+    // Locate the apex scan: an acquisition scan at apex_rt whose isolation window covers
+    // this candidate's precursor.
+    let si = match rt_scan.get(&apex_rt.to_bits()) {
+        Some(v) => v.iter().copied().find(|&s| {
+            let w = &scans[s as usize].window;
+            w.lower_mz <= prec_mz && prec_mz <= w.upper_mz
+        }),
+        None => None,
+    };
+    let scan = match si {
+        Some(s) => &scans[s as usize],
+        None => return (0.0, 0.0, 0.0),
+    };
+    let (lo, hi) = lib.candidate_range(scan.window.lower_mz, scan.window.upper_mz);
+    // Column set (candidates), deterministic by sorted cid. Rows carry (obs, claimants).
+    let mut col_of: std::collections::BTreeMap<u32, usize> = std::collections::BTreeMap::new();
+    let mut rows: Vec<(f64, Vec<(u32, f32)>)> = Vec::new();
+    let mut claimants: Vec<(u32, u16, f32)> = Vec::new();
+    for peak in &scan.peaks {
+        let q_mz = peak.mz / mass_off.factor_at(peak.mz);
+        claimants.clear();
+        {
+            let mut push = |c: u32, frag: u16, pi: f32| {
+                let cc = c as usize;
+                if apex_rt < rt_lo[cc] || apex_rt > rt_hi[cc] {
+                    return;
+                }
+                claimants.push((c, frag, pi));
+            };
+            probe_matched(idx, lib, frag_tol, q_mz, lo, hi, &mut push);
+        }
+        if claimants.is_empty() {
+            continue;
+        }
+        let mut entry: Vec<(u32, f32)> = Vec::with_capacity(claimants.len());
+        for &(c, _f, pi) in &claimants {
+            if col_of.len() < cfg.demix_max_candidates || col_of.contains_key(&c) {
+                col_of.entry(c).or_insert(0);
+                entry.push((c, pi));
+            }
+        }
+        if !entry.is_empty() {
+            rows.push((peak.intensity as f64, entry));
+        }
+    }
+    let n = col_of.len();
+    let m = rows.len();
+    if n == 0 || m == 0 || !col_of.contains_key(&cid) {
+        return (0.0, 0.0, 0.0);
+    }
+    for (k, v) in col_of.values_mut().enumerate() {
+        *v = k;
+    }
+    let mut a = vec![0.0f64; m * n];
+    let mut y = vec![0.0f64; m];
+    for (r, (obs, ents)) in rows.iter().enumerate() {
+        y[r] = *obs;
+        for &(c, pi) in ents {
+            if let Some(&col) = col_of.get(&c) {
+                // A candidate matching a peak via >1 fragment keeps its largest predicted
+                // intensity for that channel (deterministic, order-independent).
+                let cell = &mut a[r * n + col];
+                if (pi as f64) > *cell {
+                    *cell = pi as f64;
+                }
+            }
+        }
+    }
+    let lambda = cfg.demix_lambda.max(1e-9);
+    let beta = crate::solve::nnls(&a, m, n, &y, lambda, 200 * n.max(1));
+    let c_col = col_of[&cid];
+    let coef = beta[c_col].max(0.0);
+    let sum_beta: f64 = beta.iter().sum();
+    let share = if sum_beta > 0.0 { coef / sum_beta } else { 0.0 };
+    // Explained fraction = 1 - ||y - A beta||^2 / ||y||^2.
+    let (mut num, mut den) = (0.0f64, 0.0f64);
+    for (r, &yr) in y.iter().enumerate() {
+        let mut pred = 0.0;
+        for col in 0..n {
+            pred += a[r * n + col] * beta[col];
+        }
+        let d = yr - pred;
+        num += d * d;
+        den += yr * yr;
+    }
+    let explained = if den > 0.0 {
+        (1.0 - num / den).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let active = if coef > 1e-6 { 1.0 } else { 0.0 };
+    (explained, active, share)
+}
+
 /// Sum intensities of peaks within `tol_ppm` of `target` (m/z-sorted arrays).
 fn sum_near(mz: &[f64], inten: &[f32], target: f64, tol_ppm: f64) -> f32 {
     if mz.is_empty() {
@@ -1089,6 +1208,9 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
         Vec<f32>,
         Vec<f32>,
     ) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    // Demix (D2) feature columns.
+    let (mut deconv_expl_c, mut deconv_act_c, mut deconv_share_c): (Vec<f32>, Vec<f32>, Vec<f32>) =
+        (Vec::new(), Vec::new(), Vec::new());
 
     // chromatograms columns
     let (mut ch_cid, mut ch_name, mut ch_fmz, mut ch_pint) =
@@ -1148,6 +1270,12 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
         gate_peak_spectral: f32,
         gate_coelution: f32,
         gate_spectral_entropy: f32,
+        /// Spectrum-centric demix features (D2), all 0 unless `emit_demix_features`:
+        /// residual-explained fraction, active-set survival flag, and this candidate's
+        /// fraction of the total demixed abundance at its apex.
+        deconv_explained: f32,
+        deconv_active: f32,
+        deconv_share: f32,
         /// (cid, frag_name, frag_mz, frag_obs_mz, predicted_intensity, rt, intensity)
         chrom: Vec<ChromOutputRow>,
         /// Top-K retained peak groups (sensitivity_plan P1.1/P1.2), populated only
@@ -1158,6 +1286,18 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
         /// selection model. Empty for K=1.
         peaks: Vec<(u8, f64, f64, f64, f64, f64)>,
     }
+
+    // Apex-scan lookup for spectrum-centric demixing (D2): rt_bits -> scan indices.
+    // Built only when demixing is requested, so the default path pays nothing.
+    let rt_scan: HashMap<u64, Vec<u32>> = if p.cfg.emit_demix_features {
+        let mut m: HashMap<u64, Vec<u32>> = HashMap::new();
+        for (si, s) in scans.iter().enumerate() {
+            m.entry(s.rt_seconds.to_bits()).or_default().push(si as u32);
+        }
+        m
+    } else {
+        HashMap::new()
+    };
 
     let results: Vec<Vec<CandOut>> = cand_hits
         .into_par_iter()
@@ -1630,6 +1770,27 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
                 Vec::new()
             };
 
+            // Spectrum-centric NNLS demixing at the selected apex (D2). Non-destructive:
+            // emits interference-corrected features only. Gated; zero when off.
+            let (deconv_explained, deconv_active, deconv_share) = if p.cfg.emit_demix_features {
+                demix_at_apex(
+                    fidx.as_ref(),
+                    &lib,
+                    &scans,
+                    &rt_scan,
+                    &mass_off,
+                    frag_tol,
+                    cid,
+                    apex_rt,
+                    c.precursor_mz,
+                    &rt_lo,
+                    &rt_hi,
+                    p.cfg,
+                )
+            } else {
+                (0.0, 0.0, 0.0)
+            };
+
             let rank0 = CandOut {
                 cid,
                 peak_rank: 0, // selected apex; ranks >= 1 added when promote_top_peaks > 1
@@ -1657,6 +1818,9 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
                 gate_peak_spectral: gate_peak_spectral as f32,
                 gate_coelution: gate_coelution as f32,
                 gate_spectral_entropy: gate_spectral_entropy as f32,
+                deconv_explained: deconv_explained as f32,
+                deconv_active: deconv_active as f32,
+                deconv_share: deconv_share as f32,
                 chrom: chrom_rows,
                 peaks,
             };
@@ -1746,6 +1910,10 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
                     gate_peak_spectral: gate_peak_spectral as f32,
                     gate_coelution: gate_coelution as f32,
                     gate_spectral_entropy: gate_spectral_entropy as f32,
+                    // Demix is a rank-0 apex feature; alternate peaks carry 0.
+                    deconv_explained: 0.0,
+                    deconv_active: 0.0,
+                    deconv_share: 0.0,
                     chrom: Vec::new(), // shared per-candidate via the rank-0 row
                     peaks: Vec::new(),
                 });
@@ -1806,6 +1974,11 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
             gate_coel_c.push(r.gate_coelution);
             gate_se_c.push(r.gate_spectral_entropy);
         }
+        if p.cfg.emit_demix_features {
+            deconv_expl_c.push(r.deconv_explained);
+            deconv_act_c.push(r.deconv_active);
+            deconv_share_c.push(r.deconv_share);
+        }
         for (cc, nm, fmz, omz, pint, rt, it) in r.chrom {
             ch_cid.push(cc);
             ch_name.push(nm);
@@ -1853,6 +2026,11 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
         psms_cols.push(Col::F32("gate_peak_spectral".into(), gate_peakspec_c));
         psms_cols.push(Col::F32("gate_coelution".into(), gate_coel_c));
         psms_cols.push(Col::F32("gate_spectral_entropy".into(), gate_se_c));
+    }
+    if p.cfg.emit_demix_features {
+        psms_cols.push(Col::F32("deconv_explained_frac".into(), deconv_expl_c));
+        psms_cols.push(Col::F32("deconv_active".into(), deconv_act_c));
+        psms_cols.push(Col::F32("deconv_share".into(), deconv_share_c));
     }
     let n_psms = write_table(p.out_psms, psms_cols)?;
 
