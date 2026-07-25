@@ -228,8 +228,11 @@ fn profile_shape(prof: &[f64], apex_idx: usize) -> (f64, f64, f64, f64, f64, f64
     }
     let n_local = maxima.len().max(1) as f64;
     maxima.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
-    let shoulder = if maxima.len() >= 2 {
-        maxima[1] / apex_h
+    // Bounded + apex-height guarded: a ~0 apex height otherwise sends this to
+    // ~1e14. The shoulder score is a fraction of apex height (physically [0,1]);
+    // clamp to 2 to absorb the case where the passed-in apex is not the profile max.
+    let shoulder = if maxima.len() >= 2 && apex_h > 0.0 {
+        (maxima[1] / apex_h).clamp(0.0, 2.0)
     } else {
         0.0
     };

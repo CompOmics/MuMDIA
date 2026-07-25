@@ -8,9 +8,11 @@
 //! parent helpers `super::{mean, normalize_sum, best_xcorr, smooth3, peak_bounds}`.
 //!
 //! Precursor isotope-envelope agreement against a Poisson-averagine model
-//! (lambda ~= 0.000594 * M), plus MS1/MS2 co-elution features that read the
-//! (currently unpopulated) MS1 isotope XIC evidence and return 0.0 until it is
-//! persisted. All values are guarded finite.
+//! (lambda ~= 0.000594 * M), plus MS1/MS2 co-elution features over the MS1 isotope
+//! XIC. The XIC evidence is populated whenever extract runs with MS1 data and the
+//! window-grid chromatograms (`emit_window_grid`, default on); those features fall
+//! back to 0.0 only when MS1 is absent or the XIC is too short. All values are
+//! guarded finite and bounded (see `ratio`).
 use super::Evidence;
 use crate::stats::{cosine, pearson, spectral_angle};
 use mumdia_core::constants::PROTON;
@@ -35,7 +37,7 @@ pub const NAMES: &[&str] = &[
     // apex isotope entropy
     "ms1_isotope_apex_entropy_3",
     "ms1_m1_entropy_contribution",
-    // MS1 XIC co-elution / shape (need ms1_xic; 0.0 until persisted)
+    // MS1 XIC co-elution / shape (from ms1_xic; 0.0 only when MS1 absent/too short)
     "ms1_ms2_time_corr",
     "ms1_ms2_envelope_time_corr",
     "ms1_iso_coelution",
@@ -66,6 +68,22 @@ fn ln1p(x: f64) -> f64 {
     let a = 1.0 + x;
     if a > 0.0 {
         fin(a.ln())
+    } else {
+        0.0
+    }
+}
+
+/// Bounded nonnegative ratio `num/den` clamped to `[0, cap]`, and 0.0 when the
+/// denominator is not meaningfully positive. This replaces the `num/(den + EPS)`
+/// pattern, whose EPS (1e-9) is ~14 orders of magnitude below the intensity scale:
+/// when `den` is a genuinely-absent (0.0) isotope or elution width, that pattern
+/// returns ~1e15 instead of "no ratio", and a single such value dominates the
+/// rescorer's per-feature scaling (z-score/robust) and destroys the column's
+/// information. The cap additionally bounds the rare tiny-but-nonzero denominator.
+#[inline]
+fn ratio(num: f64, den: f64, cap: f64) -> f64 {
+    if den > 0.0 {
+        fin((num / den).clamp(0.0, cap))
     } else {
         0.0
     }
@@ -173,13 +191,17 @@ pub fn values(e: &Evidence) -> Vec<f64> {
     let iso_manh = fin(1.0 - 0.5 * l1);
 
     // --- apex isotope ratios and deviations ---
-    let r10 = fin(i1 / (i0 + EPS));
-    let r20 = fin(i2 / (i0 + EPS));
+    // Isotope intensity ratios are physically ~0-5 (averagine T1/T0 = lambda,
+    // T2/T0 = lambda^2/2, both < 5 up to ~5 kDa). Bound them to catch the
+    // absent-mono (i0 = 0) degenerate case; RATIO_CAP is well above any real ratio.
+    const RATIO_CAP: f64 = 10.0;
+    let r10 = ratio(i1, i0, RATIO_CAP);
+    let r20 = ratio(i2, i0, RATIO_CAP);
     let tr10 = t[1] / (t[0] + EPS);
     let tr20 = t[2] / (t[0] + EPS);
     let dev1 = fin((r10 - tr10).abs());
     let dev2 = fin((r20 - tr20).abs());
-    let m1_frac = fin(im1 / (i0 + i1 + i2 + EPS));
+    let m1_frac = ratio(im1, i0 + i1 + i2, RATIO_CAP);
     let overlap_flag = if im1 > 0.2 * i0 && i0 > 0.0 { 1.0 } else { 0.0 };
 
     // --- apex intensity / presence ---
@@ -236,7 +258,7 @@ pub fn values(e: &Evidence) -> Vec<f64> {
 }
 
 /// Compute the ten MS1-XIC-dependent features. Returns all zeros when the MS1
-/// isotope XIC evidence is absent (the current state) or too short.
+/// isotope XIC evidence is absent (no MS1 provided) or too short (< 3 scans).
 fn xic_features(e: &Evidence) -> (f64, f64, f64, f64, f64, f64, f64, f64, f64, f64) {
     let zeros = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
     if e.ms1_xic.len() < 3 {
@@ -357,12 +379,12 @@ fn xic_features(e: &Evidence) -> (f64, f64, f64, f64, f64, f64, f64, f64, f64, f
         }
     };
 
-    // ms1_ms2_fwhm_ratio: FWHM(mono)/FWHM(R)
-    let fwhm_ratio = {
-        let fm = fwhm(axis, mono);
-        let fr = fwhm(axis, r);
-        fin(fm / (fr + EPS))
-    };
+    // ms1_ms2_fwhm_ratio: FWHM(mono)/FWHM(R). Bounded: a degenerate (~0) reference
+    // width otherwise sends this to ~1e10 (the same failure the apex_rt_delta
+    // feature above already guards against). A width ratio above WIDTH_CAP is
+    // non-physical and clamped.
+    const WIDTH_CAP: f64 = 20.0;
+    let fwhm_ratio = ratio(fwhm(axis, mono), fwhm(axis, r), WIDTH_CAP);
 
     // averagine for XIC-integrated agreement
     let t = averagine3(neutral_mass(e));
