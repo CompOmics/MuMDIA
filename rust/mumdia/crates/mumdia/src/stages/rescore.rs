@@ -68,6 +68,8 @@ pub fn run(p: RescoreParams) -> Result<u64> {
     // why the Mokapot PIN below keys on a unique row index rather than
     // candidate_id (which is the library index and repeats across runs).
     let mut source: Vec<u32> = Vec::new();
+    // Top-K peak rank per row (#7), for the per-candidate best-peak collapse below.
+    let mut peak_rank: Vec<i32> = Vec::new();
     // Feature list is taken from the schema companion of the first input. Every
     // subsequent companion must match exactly: silently concatenating differing
     // feature order/sets would train and score on semantically misaligned columns.
@@ -88,9 +90,11 @@ pub fn run(p: RescoreParams) -> Result<u64> {
         let ar = t.f64("apex_rt")?;
         let elo = t.f64("elution_lo")?;
         let ehi = t.f64("elution_hi")?;
+        let pkr = t.i32("peak_rank").unwrap_or_else(|_| vec![0; t.nrows]);
         let fcols: Vec<Vec<f64>> = feat_names.iter().map(|n| t.f64(n)).collect::<Result<_>>()?;
         for i in 0..t.nrows {
             cid.push(c[i]);
+            peak_rank.push(pkr[i]);
             label.push(l[i].clone());
             base.push(b[i]);
             pform.push(pf[i].clone());
@@ -107,8 +111,9 @@ pub fn run(p: RescoreParams) -> Result<u64> {
     }
     crate::fdr::validate_labels(&label)?;
     let is_decoy: Vec<bool> = label.iter().map(|l| l == "decoy").collect();
-    let (is_entrapment, is_real_target) = classify_entrapment(p.cfg, &protein, &is_decoy);
-    let n = cid.len();
+    let (mut is_entrapment, mut is_real_target) = classify_entrapment(p.cfg, &protein, &is_decoy);
+    let mut is_decoy = is_decoy;
+    let mut n = cid.len();
     if n > 0 {
         let n_decoys = is_decoy.iter().filter(|&&v| v).count();
         let n_targets = n - n_decoys;
@@ -144,7 +149,7 @@ pub fn run(p: RescoreParams) -> Result<u64> {
     let mut model_identity = "native-percolator-lite-v1".to_string();
     let mut qmode = QMode::Decoy;
 
-    let scores = if n == 0 {
+    let mut scores = if n == 0 {
         classifier_used = "not_run_empty";
         model_identity = "none-empty-input".to_string();
         Vec::new()
@@ -282,6 +287,62 @@ pub fn run(p: RescoreParams) -> Result<u64> {
         .find(|(_, score)| !score.is_finite())
     {
         anyhow::bail!("rescore produced non-finite score at flat row {row}: {score}");
+    }
+
+    // Top-K per-candidate collapse (#7): keep only the best-scoring peak per
+    // (source, candidate_id), so the rescorer (not the up-front apex pick) selects
+    // the peak and the terminal q-null is exactly one row per candidate. Promoting K
+    // peaks therefore does not K-inflate the decoy null. Guarded: at
+    // promote_top_peaks = 1 every candidate has a single peak, `best.len() == n`, and
+    // the whole block is a no-op (byte-identical). Decoys collapse by the identical
+    // rule, so target/decoy exchangeability is preserved. Tie-break: lower peak_rank
+    // then lower row index (deterministic).
+    if n > 0 {
+        let mut best: HashMap<(u32, u32), usize> = HashMap::with_capacity(n);
+        for i in 0..n {
+            let key = (source[i], cid[i]);
+            match best.get(&key) {
+                Some(&j) => {
+                    let better = scores[i] > scores[j]
+                        || (scores[i] == scores[j] && (peak_rank[i], i) < (peak_rank[j], j));
+                    if better {
+                        best.insert(key, i);
+                    }
+                }
+                None => {
+                    best.insert(key, i);
+                }
+            }
+        }
+        if best.len() < n {
+            let mut keep: Vec<usize> = best.into_values().collect();
+            keep.sort_unstable();
+            macro_rules! keep_rows {
+                ($($v:ident),+ $(,)?) => {$(
+                    { let tmp: Vec<_> = keep.iter().map(|&i| $v[i].clone()).collect(); $v = tmp; }
+                )+};
+            }
+            keep_rows!(
+                cid,
+                label,
+                base,
+                pform,
+                protein,
+                charge,
+                prelim,
+                apex_rt,
+                elution_lo,
+                elution_hi,
+                source,
+                scores,
+                peak_rank,
+                is_decoy,
+                is_entrapment,
+                is_real_target
+            );
+            n = keep.len();
+            info!(kept = n, "rescore: top-K per-candidate best-peak collapse");
+        }
     }
 
     // PSM-level q-values against the selected null.
@@ -473,6 +534,9 @@ pub fn run(p: RescoreParams) -> Result<u64> {
             Col::F64("run_psm_q".into(), run_psm_q),
             Col::F64("experiment_psm_q".into(), experiment_psm_q),
             Col::F64("precursor_q".into(), precursor_q),
+            // Which chromatographic peak the rescorer selected for this candidate
+            // (#7). 0 = the up-front apex; > 0 = a promoted alternate peak won.
+            Col::I32("selected_peak_rank".into(), peak_rank),
         ],
     )?;
 

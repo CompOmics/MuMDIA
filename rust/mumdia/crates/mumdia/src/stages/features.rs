@@ -554,6 +554,9 @@ pub fn run(p: FeaturesParams) -> Result<u64> {
     let t0 = Instant::now();
     let ps = Table::read(p.psms)?;
     let cid = ps.u32("candidate_id")?;
+    // Top-K peak rank (#7), passed through untouched. Missing in pre-v2 extracted
+    // artifacts -> 0 (the selected apex), so old inputs behave exactly as before.
+    let peak_rank = ps.i32("peak_rank").unwrap_or_else(|_| vec![0; ps.nrows]);
     let apex_rt = ps.f64("apex_rt")?;
     let apex_int = ps.f32("apex_intensity")?;
     let n_matched = ps.i32("n_matched_fragments")?;
@@ -918,6 +921,7 @@ pub fn run(p: FeaturesParams) -> Result<u64> {
     // Build output columns: bookkeeping + active feature list.
     let mut cols: Vec<Col> = vec![
         Col::U32("candidate_id".into(), cid.clone()),
+        Col::I32("peak_rank".into(), peak_rank.clone()),
         Col::Str("label".into(), label.clone()),
         Col::U32("base_peptide_id".into(), base.clone()),
         Col::Str("peptidoform".into(), pform.clone()),
