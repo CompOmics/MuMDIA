@@ -351,6 +351,7 @@ pub struct Evidence {
     pub deconv_explained: f64,
     pub deconv_active: f64,
     pub deconv_share: f64,
+    pub deconv_max_collin: f64,
 }
 
 /// Parse a fragment name like `b3`, `y7`, `b3^2` into (is_b, ordinal, charge).
@@ -546,6 +547,7 @@ fn build_evidence(
         deconv_explained: 0.0,
         deconv_active: 0.0,
         deconv_share: 0.0,
+        deconv_max_collin: 0.0,
     }
 }
 
@@ -576,6 +578,9 @@ pub fn run(p: FeaturesParams) -> Result<u64> {
         .unwrap_or_else(|_| vec![0.0; ps.nrows]);
     let deconv_shr = ps
         .f32("deconv_share")
+        .unwrap_or_else(|_| vec![0.0; ps.nrows]);
+    let deconv_col = ps
+        .f32("deconv_max_collinearity")
         .unwrap_or_else(|_| vec![0.0; ps.nrows]);
     let apex_rt = ps.f64("apex_rt")?;
     let apex_int = ps.f32("apex_intensity")?;
@@ -828,6 +833,7 @@ pub fn run(p: FeaturesParams) -> Result<u64> {
                         ev.deconv_explained = deconv_expl[i] as f64;
                         ev.deconv_active = deconv_act[i] as f64;
                         ev.deconv_share = deconv_shr[i] as f64;
+                        ev.deconv_max_collin = deconv_col[i] as f64;
                         extended_values(&ev)
                     }
                     _ => vec![0.0; ext_names.len()],

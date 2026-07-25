@@ -19,6 +19,10 @@ pub const NAMES: &[&str] = &[
     // This candidate's fraction of the total demixed abundance at its apex (0-1); a
     // borrower explained away by better-supported co-eluters gets a low share.
     "deconv_share",
+    // Identifiability (D3): max cosine similarity of this candidate's design column with
+    // any co-isolated rival (0-1). Near 1 = near-degenerate, so the demix split is
+    // arbitrary and its coefficient should be distrusted. No incumbent engine emits this.
+    "deconv_max_collinearity",
 ];
 
 #[inline]
@@ -35,5 +39,6 @@ pub fn values(e: &Evidence) -> Vec<f64> {
         fin(e.deconv_explained).clamp(0.0, 1.0),
         fin(e.deconv_active).clamp(0.0, 1.0),
         fin(e.deconv_share).clamp(0.0, 1.0),
+        fin(e.deconv_max_collin).clamp(0.0, 1.0),
     ]
 }
