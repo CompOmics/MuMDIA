@@ -938,7 +938,11 @@ fn extract_twopass_windows(
                         }
                         if reassign {
                             match cfg.peak_claim {
-                                PeakClaim::CoelutionWinner => {
+                                // Destructive MultiCue: winner-take-all on the composite
+                                // cue weight (only the best-cue-weighted claimant keeps
+                                // the peak). CoelutionWinner is the same rule on the plain
+                                // profile height.
+                                PeakClaim::CoelutionWinner | PeakClaim::CoelutionMultiCue => {
                                     if cid == win {
                                         acc2.entry(cid).or_default().push(Hit {
                                             rt,
@@ -1233,17 +1237,17 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
         // Two-pass co-elution peak-claim, parallelized across isolation windows
         // (each window's candidates interact only within it, so the two expensive
         // probing passes fan out over the ~150 windows).
-        // CoelutionMultiCue is intentionally absent here: it ships NON-DESTRUCTIVELY,
-        // so its cue-weighted split flows into the contested/apportioned FEATURES
-        // (visible under emit_contested_features) without altering extracted
-        // intensities. A destructive variant is a separate, benchmark+entrapment-gated
-        // addition (report section 5.3 / CLAUDE.md).
+        // CoelutionMultiCue ships non-destructive by default (cue-weighted split flows
+        // into the contested/apportioned FEATURES only). It becomes destructive, rewriting
+        // the extracted intensities so ALL downstream features recompute on the competed
+        // evidence, only when `claim_cues.reassign` is set (entrapment-gated).
         let reassign = matches!(
             p.cfg.peak_claim,
             PeakClaim::CoelutionWinner
                 | PeakClaim::CoelutionProportional
                 | PeakClaim::CoelutionWinnerMargin
-        );
+        ) || (matches!(p.cfg.peak_claim, PeakClaim::CoelutionMultiCue)
+            && p.cfg.claim_cues.reassign);
         let (a, c) = extract_twopass_windows(
             fidx.as_ref(),
             &lib,

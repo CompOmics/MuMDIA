@@ -198,6 +198,13 @@ pub struct ClaimCues {
     /// impossible to fake. No-op when no MS1 is provided. Down-weights (never zeroes)
     /// so a genuinely MS1-poor real peptide is not eliminated.
     pub ms1_support: bool,
+    /// DESTRUCTIVE redistribution for `CoelutionMultiCue`. When true, the cue-weighted
+    /// arbitration rewrites the extracted peak intensities (winner-take-all on the
+    /// composite weight), instead of only emitting the apportioned/contested features.
+    /// The competed evidence then feeds EVERY downstream feature (co-elution, spectral,
+    /// mass-accuracy, ...), so this is the impactful form. Off by default; changes the
+    /// search/FDR evidence, so it is entrapment-gated per CLAUDE.md.
+    pub reassign: bool,
     /// Uniqueness-seeded EM apportionment (S2): number of fixed-point iterations that
     /// re-seed each candidate's per-scan elution profile from its APPORTIONED (not full)
     /// intensity before the final arbitration. The plain profile is built from full
@@ -216,6 +223,7 @@ impl Default for ClaimCues {
             rt_prior: false,
             rt_prior_tau_s: 30.0,
             ms1_support: false,
+            reassign: false,
             apportion_em_iters: 0,
         }
     }
