@@ -564,6 +564,76 @@ fn extract_twopass_windows(
                     *m.entry(h.rt.to_bits()).or_insert(0.0) += h.inten;
                 }
             }
+            // S2 uniqueness-seeded EM: re-seed each candidate's elution profile from its
+            // cue-weighted APPORTIONED intensity (not the full peak) for a fixed number of
+            // iterations, so a borrowing candidate's profile is no longer inflated by the
+            // peaks it borrows. A single-claimant (uncontested) peak contributes its full
+            // intensity every iteration -> an immovable anchor. Deterministic (fixed N,
+            // ordered f32 reductions). Only under CoelutionMultiCue; 0 iters = no-op.
+            let em_iters = if matches!(cfg.peak_claim, PeakClaim::CoelutionMultiCue) {
+                cfg.claim_cues.apportion_em_iters
+            } else {
+                0
+            };
+            for _ in 0..em_iters {
+                let mut next: HashMap<u32, HashMap<u64, f32>> = HashMap::new();
+                for &si in ids {
+                    let scan = &scans[si];
+                    let rt = scan.rt_seconds;
+                    let rtb = rt.to_bits();
+                    for peak in &scan.peaks {
+                        let inten = peak.intensity;
+                        let q_mz = peak.mz / mass_off.factor_at(peak.mz);
+                        let obs_mz = peak.mz;
+                        claimants.clear();
+                        {
+                            let mut push = |cid: u32, frag: u16, pi: f32| {
+                                let c = cid as usize;
+                                if rt < rt_lo[c] || rt > rt_hi[c] {
+                                    return;
+                                }
+                                if let Some(s) = restrict {
+                                    if !s.contains(&cid) {
+                                        return;
+                                    }
+                                }
+                                claimants.push((cid, frag, pi));
+                            };
+                            probe_matched(idx, lib, frag_tol, q_mz, lo, hi, &mut push);
+                        }
+                        if claimants.is_empty() {
+                            continue;
+                        }
+                        let weights: Vec<f32> = claimants
+                            .iter()
+                            .map(|&(cid, frag, _)| {
+                                let h = profile
+                                    .get(&cid)
+                                    .and_then(|m| m.get(&rtb))
+                                    .copied()
+                                    .unwrap_or(0.0);
+                                if h > 0.0 {
+                                    h * claim_cue_multiplier(
+                                        cfg, lib, cid, frag, obs_mz, rt, rt_cal, ms1_scans, ms1_rts,
+                                    )
+                                } else {
+                                    h
+                                }
+                            })
+                            .collect();
+                        let sum_w: f32 = weights.iter().copied().sum();
+                        for (i, &(cid, _, _)) in claimants.iter().enumerate() {
+                            let share = if sum_w > 0.0 {
+                                inten * (weights[i] / sum_w)
+                            } else {
+                                inten / claimants.len() as f32
+                            };
+                            *next.entry(cid).or_default().entry(rtb).or_insert(0.0) += share;
+                        }
+                    }
+                }
+                profile = next;
+            }
             // PASS 2: arbitrate each shared peak by which claimant is most eluting.
             let mut acc2: HashMap<u32, Vec<Hit>> = HashMap::new();
             let mut contested: HashMap<u32, Contested> = HashMap::new();

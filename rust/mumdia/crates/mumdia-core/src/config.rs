@@ -198,6 +198,15 @@ pub struct ClaimCues {
     /// impossible to fake. No-op when no MS1 is provided. Down-weights (never zeroes)
     /// so a genuinely MS1-poor real peptide is not eliminated.
     pub ms1_support: bool,
+    /// Uniqueness-seeded EM apportionment (S2): number of fixed-point iterations that
+    /// re-seed each candidate's per-scan elution profile from its APPORTIONED (not full)
+    /// intensity before the final arbitration. The plain profile is built from full
+    /// intensities, so a borrowing candidate's profile is inflated by the very peaks it
+    /// borrows; re-seeding from the cue-weighted share removes that feedback, while
+    /// uncontested (single-claimant) peaks contribute full intensity every iteration as
+    /// an immovable anchor. 0 (default) disables EM (single-pass profile). Deterministic
+    /// (fixed N); applies under `CoelutionMultiCue`.
+    pub apportion_em_iters: u32,
 }
 impl Default for ClaimCues {
     fn default() -> Self {
@@ -207,6 +216,7 @@ impl Default for ClaimCues {
             rt_prior: false,
             rt_prior_tau_s: 30.0,
             ms1_support: false,
+            apportion_em_iters: 0,
         }
     }
 }
