@@ -311,6 +311,13 @@ pub struct SearchSeedConfig {
     /// robust offset + local uncertainty. Falls back to the single-pass result when
     /// too few in-window calibrants remain. Default false (single pass unchanged).
     pub two_pass_mass_cal: bool,
+    /// m/z-dependent fragment mass calibration. When true, fit a LOESS of the
+    /// calibrant ppm deviation versus fragment m/z and emit a sampled correction
+    /// grid to `<seed>.masscal.json`; extract then applies an m/z-interpolated
+    /// offset per peak instead of the single scalar `frag_ppm_offset`. This
+    /// removes any m/z-correlated curvature the flat offset leaves. Default false
+    /// (scalar offset unchanged), opt-in and benchmark-gated.
+    pub mass_cal_loess: bool,
 }
 impl Default for SearchSeedConfig {
     fn default() -> Self {
@@ -322,6 +329,7 @@ impl Default for SearchSeedConfig {
             top_n_peaks: 300,
             matcher: MatcherKind::Fragindex,
             two_pass_mass_cal: false,
+            mass_cal_loess: false,
         }
     }
 }

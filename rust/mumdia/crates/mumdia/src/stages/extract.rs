@@ -261,12 +261,45 @@ fn coelution_gate_score(
 /// window, so the concatenation order does not affect the rt-sorted result. Only
 /// the PeakClaim::None / Winner / Proportional (non-two-pass) strategies use this;
 /// the co-elution two-pass path stays serial.
+/// Per-peak mass-offset correction applied to an observed peak m/z before library
+/// matching. Either a single scalar ppm offset (`grid_*` empty, the default) or an
+/// m/z-dependent grid (sorted ascending) that is linearly interpolated and clamped
+/// at the ends. `factor_at(mz)` returns the divisor `1 + ppm(mz) * 1e-6`.
+struct MassOffset {
+    scalar_ppm: f64,
+    grid_mz: Vec<f64>,
+    grid_ppm: Vec<f64>,
+}
+impl MassOffset {
+    #[inline]
+    fn factor_at(&self, mz: f64) -> f64 {
+        let ppm = if self.grid_mz.len() >= 2 {
+            match self
+                .grid_mz
+                .binary_search_by(|g| g.partial_cmp(&mz).unwrap_or(std::cmp::Ordering::Equal))
+            {
+                Ok(i) => self.grid_ppm[i],
+                Err(0) => self.grid_ppm[0],
+                Err(i) if i >= self.grid_mz.len() => self.grid_ppm[self.grid_mz.len() - 1],
+                Err(i) => {
+                    let (x0, x1) = (self.grid_mz[i - 1], self.grid_mz[i]);
+                    let (y0, y1) = (self.grid_ppm[i - 1], self.grid_ppm[i]);
+                    y0 + (y1 - y0) * (mz - x0) / (x1 - x0)
+                }
+            }
+        } else {
+            self.scalar_ppm
+        };
+        1.0 + ppm * 1e-6
+    }
+}
+
 fn extract_accumulate_windows(
     idx: &FragIndex,
     scans: &[Ms2Scan],
     rt_lo: &[f64],
     rt_hi: &[f64],
-    offset_factor: f64,
+    mass_off: &MassOffset,
     cfg: &ExtractConfig,
 ) -> HashMap<u32, Vec<Hit>> {
     use std::collections::BTreeMap;
@@ -300,7 +333,7 @@ fn extract_accumulate_windows(
                 let rt = scan.rt_seconds;
                 for peak in &scan.peaks {
                     let inten = peak.intensity;
-                    let q_mz = peak.mz / offset_factor;
+                    let q_mz = peak.mz / mass_off.factor_at(peak.mz);
                     let obs_mz = peak.mz;
                     claimants.clear();
                     idx.probe_peak(q_mz, lo, hi, |cid, _pmz, pint, frag| {
@@ -388,7 +421,7 @@ fn extract_twopass_windows(
     scans: &[Ms2Scan],
     rt_lo: &[f64],
     rt_hi: &[f64],
-    offset_factor: f64,
+    mass_off: &MassOffset,
     frag_tol: f64,
     cfg: &ExtractConfig,
     restrict: Option<&std::collections::HashSet<u32>>,
@@ -428,7 +461,7 @@ fn extract_twopass_windows(
                 let rt = scan.rt_seconds;
                 for peak in &scan.peaks {
                     let inten = peak.intensity;
-                    let q_mz = peak.mz / offset_factor;
+                    let q_mz = peak.mz / mass_off.factor_at(peak.mz);
                     let obs_mz = peak.mz;
                     claimants.clear();
                     {
@@ -472,7 +505,7 @@ fn extract_twopass_windows(
                 let rtb = rt.to_bits();
                 for peak in &scan.peaks {
                     let inten = peak.intensity;
-                    let q_mz = peak.mz / offset_factor;
+                    let q_mz = peak.mz / mass_off.factor_at(peak.mz);
                     let obs_mz = peak.mz;
                     claimants.clear();
                     {
@@ -674,8 +707,15 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
         Vec::new()
     };
 
-    // Per-run mass recalibration (optional).
-    let (frag_offset, frag_tol) = match p.mass_cal {
+    // Per-run mass recalibration (optional). Reads the scalar offset + learned
+    // tolerance, plus an optional m/z-dependent correction grid (mass_cal_loess).
+    let read_grid = |v: &serde_json::Value, key: &str| -> Vec<f64> {
+        v.get(key)
+            .and_then(|x| x.as_array())
+            .map(|a| a.iter().filter_map(|e| e.as_f64()).collect())
+            .unwrap_or_default()
+    };
+    let (frag_offset, frag_tol, grid_mz, grid_ppm) = match p.mass_cal {
         Some(path) if std::path::Path::new(path).exists() => {
             let v: serde_json::Value = mumdia_io::json::read_json(path)?;
             let off = v
@@ -686,16 +726,32 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
                 .get("frag_tol_ppm")
                 .and_then(|x| x.as_f64())
                 .unwrap_or(p.cfg.frag_tol_ppm);
+            let gmz = read_grid(&v, "mz_cal_grid_mz");
+            let gpp = read_grid(&v, "mz_cal_grid_ppm");
             info!(
                 frag_ppm_offset = off,
                 frag_tol_ppm = tol,
+                mz_cal_grid = gmz.len(),
                 "extract: using mass recalibration"
             );
-            (off, tol)
+            (off, tol, gmz, gpp)
         }
-        _ => (0.0, p.cfg.frag_tol_ppm),
+        _ => (0.0, p.cfg.frag_tol_ppm, Vec::new(), Vec::new()),
     };
-    let offset_factor = 1.0 + frag_offset * 1e-6;
+    // The grid is used only if both arrays agree in length and have >= 2 points.
+    let mass_off = if grid_mz.len() >= 2 && grid_mz.len() == grid_ppm.len() {
+        MassOffset {
+            scalar_ppm: frag_offset,
+            grid_mz,
+            grid_ppm,
+        }
+    } else {
+        MassOffset {
+            scalar_ppm: frag_offset,
+            grid_mz: Vec::new(),
+            grid_ppm: Vec::new(),
+        }
+    };
 
     // fragindex backend, built once at the learned fragment tolerance when selected
     // (`MatcherKind::Fragindex`); otherwise the bucketed `Library::page_search` path
@@ -727,7 +783,7 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
             // is no candidate allowlist; a `restrict` list routes to the serial path
             // below, which applies the allowlist filter and honors every peak_claim
             // strategy (Winner/Proportional/None).
-            acc = extract_accumulate_windows(idx, &scans, &rt_lo, &rt_hi, offset_factor, p.cfg);
+            acc = extract_accumulate_windows(idx, &scans, &rt_lo, &rt_hi, &mass_off, p.cfg);
         } else {
             for scan in &scans {
                 let (lo, hi) = lib.candidate_range(scan.window.lower_mz, scan.window.upper_mz);
@@ -737,7 +793,7 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
                 let rt = scan.rt_seconds;
                 for peak in &scan.peaks {
                     let inten = peak.intensity;
-                    let q_mz = peak.mz / offset_factor;
+                    let q_mz = peak.mz / mass_off.factor_at(peak.mz);
                     // Collect every co-isolated, in-RT-window candidate matching this
                     // peak, then apportion per the claim strategy. In wide DIA one peak
                     // matches many candidates (~98% of fragments collide).
@@ -826,7 +882,7 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
             &scans,
             &rt_lo,
             &rt_hi,
-            offset_factor,
+            &mass_off,
             frag_tol,
             p.cfg,
             restrict.as_ref(),
@@ -1609,6 +1665,32 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
         "extract: done"
     );
     Ok((n_psms, n_chrom))
+}
+
+#[cfg(test)]
+mod mass_offset_tests {
+    use super::MassOffset;
+
+    #[test]
+    fn scalar_and_grid_interpolation() {
+        // Scalar offset: constant factor regardless of m/z.
+        let s = MassOffset {
+            scalar_ppm: 5.0,
+            grid_mz: vec![],
+            grid_ppm: vec![],
+        };
+        assert!((s.factor_at(500.0) - (1.0 + 5e-6)).abs() < 1e-12);
+        // Grid: linear interpolation between points, clamped past the ends.
+        let g = MassOffset {
+            scalar_ppm: 0.0,
+            grid_mz: vec![200.0, 400.0, 600.0],
+            grid_ppm: vec![2.0, 4.0, 0.0],
+        };
+        assert!((g.factor_at(300.0) - (1.0 + 3e-6)).abs() < 1e-12); // 200->400: 2->4, mid = 3
+        assert!((g.factor_at(400.0) - (1.0 + 4e-6)).abs() < 1e-12); // exact grid point
+        assert!((g.factor_at(100.0) - (1.0 + 2e-6)).abs() < 1e-12); // clamp low
+        assert!((g.factor_at(900.0) - 1.0).abs() < 1e-12); // clamp high (ppm 0)
+    }
 }
 
 #[cfg(test)]
