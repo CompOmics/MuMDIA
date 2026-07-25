@@ -139,6 +139,8 @@ fn claim_cue_multiplier(
     cid: u32,
     frag: u16,
     obs_mz: f64,
+    rt: f64,
+    rt_cal: &[f64],
 ) -> f32 {
     let mut w = 1.0f32;
     if cfg.claim_cues.mz_close {
@@ -149,6 +151,17 @@ fn claim_cue_multiplier(
         let ppm = mumdia_core::constants::ppm_diff(obs_mz, pred_mz) as f32;
         let sigma = (cfg.claim_cues.mz_close_sigma_ppm as f32).max(1e-6);
         w *= (-(ppm / sigma).powi(2)).exp();
+    }
+    if cfg.claim_cues.rt_prior {
+        // DeepLC RT prior (S3): down-weight a claimant whose calibrated predicted RT is
+        // far from the current scan (a briefly-co-eluting interferent). No-op when the
+        // predicted RT is unset (0).
+        let rt_pred = rt_cal.get(cid as usize).copied().unwrap_or(0.0);
+        if rt_pred > 0.0 {
+            let tau = (cfg.claim_cues.rt_prior_tau_s as f32).max(1e-3);
+            let d = (rt - rt_pred) as f32;
+            w *= (-(d * d) / (2.0 * tau * tau)).exp();
+        }
     }
     w
 }
@@ -448,6 +461,7 @@ fn extract_twopass_windows(
     scans: &[Ms2Scan],
     rt_lo: &[f64],
     rt_hi: &[f64],
+    rt_cal: &[f64],
     mass_off: &MassOffset,
     frag_tol: f64,
     cfg: &ExtractConfig,
@@ -571,7 +585,7 @@ fn extract_twopass_windows(
                         .map(|&(cid, frag, _pi)| {
                             let h = ph(cid);
                             if multicue && h > 0.0 {
-                                h * claim_cue_multiplier(cfg, lib, cid, frag, obs_mz)
+                                h * claim_cue_multiplier(cfg, lib, cid, frag, obs_mz, rt, rt_cal)
                             } else {
                                 h
                             }
@@ -928,6 +942,7 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
             &scans,
             &rt_lo,
             &rt_hi,
+            &rt_cal,
             &mass_off,
             frag_tol,
             p.cfg,

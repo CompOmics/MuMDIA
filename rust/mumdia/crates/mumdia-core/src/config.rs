@@ -181,12 +181,23 @@ pub struct ClaimCues {
     pub mz_close: bool,
     /// Gaussian sigma (ppm) for the `mz_close` cue. Default 5 ppm.
     pub mz_close_sigma_ppm: f64,
+    /// DeepLC retention-time prior (S3): weight a claimant by
+    /// `exp(-(rt - rt_pred)^2 / 2 tau^2)`, where `rt_pred` is the candidate's
+    /// calibrated predicted RT. A co-isolated interferent whose predicted RT is far
+    /// from the current scan gets a low weight even if it briefly co-elutes, so a
+    /// shared peak is apportioned toward the candidate the RT model actually places
+    /// there. No-op where the predicted RT is unset (0).
+    pub rt_prior: bool,
+    /// Gaussian sigma (seconds) for the `rt_prior` cue. Default 30 s.
+    pub rt_prior_tau_s: f64,
 }
 impl Default for ClaimCues {
     fn default() -> Self {
         Self {
             mz_close: false,
             mz_close_sigma_ppm: 5.0,
+            rt_prior: false,
+            rt_prior_tau_s: 30.0,
         }
     }
 }
