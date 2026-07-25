@@ -851,6 +851,10 @@ fn extract_twopass_windows(
             let mut acc2: HashMap<u32, Vec<Hit>> = HashMap::new();
             let mut contested: HashMap<u32, Contested> = HashMap::new();
             let demix_mode = matches!(cfg.peak_claim, PeakClaim::CoelutionDemix);
+            let shadow_mode = matches!(cfg.peak_claim, PeakClaim::CoelutionShadow);
+            let demix_stride = cfg.demix_scan_stride.max(1);
+            let mut demix_abund: BTreeMap<u32, f64> = BTreeMap::new();
+            let mut demix_ctr = 0usize;
             for &si in ids {
                 let scan = &scans[si];
                 let rt = scan.rt_seconds;
@@ -860,7 +864,8 @@ fn extract_twopass_windows(
                 // shared peak by beta_c * D[peak,c] (smooth joint deconvolution) rather than
                 // the per-peak profile-height arbitration below.
                 if demix_mode {
-                    let mut col_of: BTreeMap<u32, usize> = BTreeMap::new();
+                    let mut cand: std::collections::BTreeSet<u32> =
+                        std::collections::BTreeSet::new();
                     let mut prows: Vec<DemixRow> = Vec::new();
                     for peak in &scan.peaks {
                         let q_mz = peak.mz / mass_off.factor_at(peak.mz);
@@ -884,51 +889,65 @@ fn extract_twopass_windows(
                             continue;
                         }
                         for &(cid, _, _) in &claimants {
-                            col_of.entry(cid).or_insert(0);
+                            cand.insert(cid);
                         }
                         prows.push((peak.intensity, peak.mz, claimants.clone()));
                     }
                     if prows.is_empty() {
                         continue;
                     }
-                    let n = col_of.len();
-                    let m = prows.len();
-                    for (k, v) in col_of.values_mut().enumerate() {
-                        *v = k;
-                    }
-                    let mut amat = vec![0.0f64; m * n];
-                    let mut yv = vec![0.0f64; m];
-                    for (r, (obs, _, cl)) in prows.iter().enumerate() {
-                        yv[r] = *obs as f64;
-                        for &(cid, _, pi) in cl {
-                            let cell = &mut amat[r * n + col_of[&cid]];
-                            if (pi as f64) > *cell {
-                                *cell = pi as f64;
+                    // Solve the NNLS every `demix_stride` scans or whenever a new candidate
+                    // enters the co-isolated set; reuse the stored abundances otherwise. The
+                    // abundances change slowly across a few scans (elution is gradual), while
+                    // each scan's own peaks + predicted intensities still drive the split.
+                    let new_cand = cand.iter().any(|c| !demix_abund.contains_key(c));
+                    if demix_abund.is_empty() || demix_ctr.is_multiple_of(demix_stride) || new_cand
+                    {
+                        let cols: Vec<u32> = cand.iter().copied().collect();
+                        let n = cols.len();
+                        let col_of: BTreeMap<u32, usize> =
+                            cols.iter().enumerate().map(|(i, &c)| (c, i)).collect();
+                        let m = prows.len();
+                        let mut amat = vec![0.0f64; m * n];
+                        let mut yv = vec![0.0f64; m];
+                        for (r, (obs, _, cl)) in prows.iter().enumerate() {
+                            yv[r] = *obs as f64;
+                            for &(cid, _, pi) in cl {
+                                let cell = &mut amat[r * n + col_of[&cid]];
+                                if (pi as f64) > *cell {
+                                    *cell = pi as f64;
+                                }
                             }
                         }
+                        let beta = crate::solve::nnls(
+                            &amat,
+                            m,
+                            n,
+                            &yv,
+                            cfg.demix_lambda.max(1e-9),
+                            200 * n.max(1),
+                        );
+                        demix_abund.clear();
+                        for (&c, &col) in &col_of {
+                            demix_abund.insert(c, beta[col]);
+                        }
                     }
-                    let beta = crate::solve::nnls(
-                        &amat,
-                        m,
-                        n,
-                        &yv,
-                        cfg.demix_lambda.max(1e-9),
-                        200 * n.max(1),
-                    );
-                    for (r, (obs, obs_mz, cl)) in prows.iter().enumerate() {
+                    demix_ctr += 1;
+                    // Apportion each peak by abundance_c * predicted_c (the joint split).
+                    for (obs, obs_mz, cl) in &prows {
                         let mut denom = 0.0f64;
                         let mut winner = cl[0].0;
                         let mut best_bd = f64::NEG_INFINITY;
-                        for &(cid, _, _) in cl {
-                            let bd = beta[col_of[&cid]] * amat[r * n + col_of[&cid]];
+                        for &(cid, _, pi) in cl {
+                            let bd = demix_abund.get(&cid).copied().unwrap_or(0.0) * pi as f64;
                             denom += bd;
                             if bd > best_bd || (bd == best_bd && cid < winner) {
                                 best_bd = bd;
                                 winner = cid;
                             }
                         }
-                        for &(cid, frag, _) in cl {
-                            let bd = beta[col_of[&cid]] * amat[r * n + col_of[&cid]];
+                        for &(cid, frag, pi) in cl {
+                            let bd = demix_abund.get(&cid).copied().unwrap_or(0.0) * pi as f64;
                             let share = if denom > 0.0 {
                                 *obs as f64 * (bd / denom)
                             } else {
@@ -947,6 +966,82 @@ fn extract_twopass_windows(
                                 rt,
                                 frag,
                                 inten: share as f32,
+                                obs_mz: *obs_mz,
+                            });
+                        }
+                    }
+                    continue;
+                }
+                if shadow_mode {
+                    // Shadow subtraction: estimate each candidate's abundance from its UNIQUE
+                    // channels, then clean every candidate's channels by subtracting the other
+                    // claimants' estimated contributions. No solve; several real co-eluters can
+                    // both keep signal at a shared peak.
+                    let mut prows: Vec<DemixRow> = Vec::new();
+                    for peak in &scan.peaks {
+                        let q_mz = peak.mz / mass_off.factor_at(peak.mz);
+                        claimants.clear();
+                        {
+                            let mut push = |cid: u32, frag: u16, pi: f32| {
+                                let c = cid as usize;
+                                if rt < rt_lo[c] || rt > rt_hi[c] {
+                                    return;
+                                }
+                                if let Some(s) = restrict {
+                                    if !s.contains(&cid) {
+                                        return;
+                                    }
+                                }
+                                claimants.push((cid, frag, pi));
+                            };
+                            probe_matched(idx, lib, frag_tol, q_mz, lo, hi, &mut push);
+                        }
+                        if claimants.is_empty() {
+                            continue;
+                        }
+                        prows.push((peak.intensity, peak.mz, claimants.clone()));
+                    }
+                    if prows.is_empty() {
+                        continue;
+                    }
+                    // Per-candidate abundance from unique (single-claimant) channels, median of
+                    // observed/predicted. Deterministic (sorted cid, median of sorted ratios).
+                    let mut uniq: BTreeMap<u32, Vec<f64>> = BTreeMap::new();
+                    for (obs, _, cl) in &prows {
+                        if cl.len() == 1 {
+                            let (cid, _, pi) = cl[0];
+                            if pi > 0.0 {
+                                uniq.entry(cid).or_default().push(*obs as f64 / pi as f64);
+                            }
+                        }
+                    }
+                    let mut a_p: BTreeMap<u32, f64> = BTreeMap::new();
+                    for (cid, mut v) in uniq {
+                        v.sort_by(|x, z| x.partial_cmp(z).unwrap_or(std::cmp::Ordering::Equal));
+                        a_p.insert(cid, v[v.len() / 2]);
+                    }
+                    for (obs, obs_mz, cl) in &prows {
+                        for &(cid, frag, _) in cl {
+                            let mut sub = 0.0f64;
+                            for &(pj, _, pij) in cl {
+                                if pj != cid {
+                                    sub += a_p.get(&pj).copied().unwrap_or(0.0) * pij as f64;
+                                }
+                            }
+                            let cleaned = (*obs as f64 - sub).max(0.0);
+                            let e = contested.entry(cid).or_default();
+                            e.apportioned += cleaned;
+                            if cleaned >= 0.5 * *obs as f64 {
+                                e.won += *obs as f64;
+                                e.n_won += 1;
+                            } else {
+                                e.lost += *obs as f64;
+                                e.n_lost += 1;
+                            }
+                            acc2.entry(cid).or_default().push(Hit {
+                                rt,
+                                frag,
+                                inten: cleaned as f32,
                                 obs_mz: *obs_mz,
                             });
                         }
@@ -1244,6 +1339,7 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
             | PeakClaim::CoelutionWinnerMargin
             | PeakClaim::CoelutionMultiCue
             | PeakClaim::CoelutionDemix
+            | PeakClaim::CoelutionShadow
     ) || p.cfg.emit_contested_features;
     let claim_margin = p.cfg.peak_claim_margin as f32;
 
@@ -1351,6 +1447,7 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
                 | PeakClaim::CoelutionProportional
                 | PeakClaim::CoelutionWinnerMargin
                 | PeakClaim::CoelutionDemix
+                | PeakClaim::CoelutionShadow
         ) || (matches!(p.cfg.peak_claim, PeakClaim::CoelutionMultiCue)
             && p.cfg.claim_cues.reassign);
         let (a, c) = extract_twopass_windows(

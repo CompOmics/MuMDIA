@@ -170,6 +170,15 @@ pub enum PeakClaim {
     /// demix FEATURES are the separate `emit_demix_features` path. Deterministic (sorted
     /// candidate columns, ridge NNLS).
     CoelutionDemix,
+    /// Shadow-subtraction redistribution (two-pass, destructive, no solver). At each scan,
+    /// each co-eluter's abundance is estimated from the channels it ALONE claims (its unique
+    /// ions, `a_p = median y/D` over those); every candidate then keeps, at each of its
+    /// channels, `max(0, y - sum_{p != c} a_p * D[peak,p])` - its intensity minus the
+    /// interferers' estimated contributions. Unlike winner-take-all, several real co-eluters
+    /// can both retain signal at a shared peak; unlike the NNLS demix it needs no solve, so
+    /// it is cheap. A candidate with no unique ion cannot be estimated and contributes no
+    /// subtraction. The gentle destructive mode. Deterministic; default off.
+    CoelutionShadow,
 }
 
 /// Composable per-claimant weight cues for [`PeakClaim::CoelutionMultiCue`] (the
@@ -587,6 +596,14 @@ pub struct ExtractConfig {
     /// Cap on the number of co-isolated candidates (design-matrix columns) in a single
     /// demix solve, to bound compute on crowded windows. Default 64.
     pub demix_max_candidates: usize,
+    /// Scan stride for the DESTRUCTIVE `CoelutionDemix` redistribution: solve the
+    /// per-scan NNLS every Nth scan and reuse the resulting candidate abundances to
+    /// apportion the intervening scans (a re-solve is forced whenever a new candidate
+    /// enters the co-isolated set, so accuracy is preserved where the population
+    /// changes). This is the practicality lever - a full per-scan solve over the ~465k
+    /// scans of a wide-window run is impractical. 1 (default) solves at every scan.
+    /// Only affects `CoelutionDemix`; the non-destructive demix FEATURES are unaffected.
+    pub demix_scan_stride: usize,
     /// Emit a non-destructive `contested_frac` per PSM: the fraction of a
     /// candidate's matched intensity that a co-eluting competitor claims more
     /// strongly (by the two-pass elution-profile arbitration). Does not alter the
@@ -692,6 +709,7 @@ impl Default for ExtractConfig {
             emit_demix_features: false,
             demix_lambda: 1.0,
             demix_max_candidates: 64,
+            demix_scan_stride: 1,
             emit_contested_features: false,
             peak_claim_margin: 2.0,
             matcher: MatcherKind::Fragindex,
