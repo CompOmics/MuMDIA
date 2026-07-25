@@ -11,6 +11,7 @@ pub mod predict;
 pub mod quant_lfq;
 pub mod rescoring;
 pub mod sidecar;
+pub mod solve;
 pub mod spectra;
 pub mod stages;
 pub mod stats;
