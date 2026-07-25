@@ -575,6 +575,7 @@ selection dominate.
 | `apex_rt_prior_s` | 0.0 | Gaussian RT prior sigma on apex (0 = off) |
 | `apex_count_tol` | 1 | fragment-count apex slack |
 | `apex_count_window` | 1 | rolling distinct-fragment count width (1 = none; profile `dia` sets 5) |
+| `apex_gaussian_sigma_scans` | 0.0 | Gaussian apex smoother sigma in scans (0 = rolling-sum unchanged; opt-in, benchmark-gated) |
 | `emit_window_grid` | `true` | zero-filled window-grid chromatograms |
 | `bucket_size` | 8192 | m/z bucket size (power of two) |
 | `peak_claim` | `none` | shared-peak apportionment mode |
@@ -632,6 +633,7 @@ requiring entrapment/target-decoy FDR validation before use.
 | `peak_window_mode` | `per_candidate` | per-candidate vs consensus window |
 | `reliable_q` | 0.001 | confident-set q for the consensus width |
 | `q_filter` | `peptide_q` | `peptide_q`, `precursor_q` (single-run only), `psm_q`, or `run_psm_q` |
+| `interference_envelope` | `false` | apex-outward interference envelope on fragment traces before integration (opt-in, benchmark-gated) |
 
 ### `RescoreConfig` (config.rs:913-965)
 
