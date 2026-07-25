@@ -215,7 +215,7 @@ fn demix_at_apex(
     rt_lo: &[f64],
     rt_hi: &[f64],
     cfg: &ExtractConfig,
-) -> (f64, f64, f64, f64) {
+) -> (f64, f64, f64, f64, f64) {
     // Locate the apex scan: an acquisition scan at apex_rt whose isolation window covers
     // this candidate's precursor.
     let si = match rt_scan.get(&apex_rt.to_bits()) {
@@ -227,7 +227,7 @@ fn demix_at_apex(
     };
     let scan = match si {
         Some(s) => &scans[s as usize],
-        None => return (0.0, 0.0, 0.0, 0.0),
+        None => return (0.0, 0.0, 0.0, 0.0, 0.0),
     };
     let (lo, hi) = lib.candidate_range(scan.window.lower_mz, scan.window.upper_mz);
     // Column set (candidates), deterministic by sorted cid. Rows carry (obs, claimants).
@@ -264,7 +264,7 @@ fn demix_at_apex(
     let n = col_of.len();
     let m = rows.len();
     if n == 0 || m == 0 || !col_of.contains_key(&cid) {
-        return (0.0, 0.0, 0.0, 0.0);
+        return (0.0, 0.0, 0.0, 0.0, 0.0);
     }
     for (k, v) in col_of.values_mut().enumerate() {
         *v = k;
@@ -307,6 +307,59 @@ fn demix_at_apex(
         0.0
     };
     let active = if coef > 1e-6 { 1.0 } else { 0.0 };
+    // D1 shadow-spectrum: estimate each OTHER candidate's abundance from the channels it
+    // ALONE claims (its unique ions), subtract those contributions from candidate c's
+    // channels, and measure how much of c's observed intensity survives. A real second
+    // peptide keeps most of its signal; a pure borrower is subtracted away. This sidesteps
+    // the shared-peak circularity by seeding abundances from unique ions only. 1.0 (kept
+    // all) when c has no interfering neighbor with unique ions.
+    let shadow_kept = {
+        // Per row, is it a UNIQUE channel (exactly one nonzero column) and whose?
+        let mut a_p = vec![f64::NAN; n]; // per-candidate abundance from its unique rows
+        {
+            // collect unique-row ratios per column, then take the median deterministically.
+            let mut ratios: Vec<Vec<f64>> = vec![Vec::new(); n];
+            for r in 0..m {
+                let mut nz = 0usize;
+                let mut col = 0usize;
+                for j in 0..n {
+                    if a[r * n + j] > 0.0 {
+                        nz += 1;
+                        col = j;
+                    }
+                }
+                if nz == 1 && a[r * n + col] > 0.0 {
+                    ratios[col].push(y[r] / a[r * n + col]);
+                }
+            }
+            for (j, rs) in ratios.iter_mut().enumerate() {
+                if !rs.is_empty() {
+                    rs.sort_by(|x, z| x.partial_cmp(z).unwrap_or(std::cmp::Ordering::Equal));
+                    a_p[j] = rs[rs.len() / 2];
+                }
+            }
+        }
+        let (mut kept, mut total) = (0.0f64, 0.0f64);
+        for r in 0..m {
+            let dc = a[r * n + c_col];
+            if dc <= 0.0 {
+                continue;
+            }
+            total += y[r];
+            let mut sub = 0.0;
+            for j in 0..n {
+                if j != c_col && a_p[j].is_finite() {
+                    sub += a_p[j] * a[r * n + j];
+                }
+            }
+            kept += (y[r] - sub).max(0.0);
+        }
+        if total > 0.0 {
+            (kept / total).clamp(0.0, 1.0)
+        } else {
+            1.0
+        }
+    };
     // Identifiability (D3): the maximum cosine similarity of candidate c's design column
     // with any other column. Near 1 = c is near-degenerate with a rival, so its
     // coefficient is an essentially arbitrary split (distrust the demix). No incumbent
@@ -338,7 +391,13 @@ fn demix_at_apex(
             }
         }
     }
-    (explained, active, share, max_collin.clamp(0.0, 1.0))
+    (
+        explained,
+        active,
+        share,
+        max_collin.clamp(0.0, 1.0),
+        shadow_kept,
+    )
 }
 
 /// Sum intensities of peaks within `tol_ppm` of `target` (m/z-sorted arrays).
@@ -1239,13 +1298,16 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
         Vec<f32>,
         Vec<f32>,
     ) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-    // Demix (D2/D3) feature columns.
-    let (mut deconv_expl_c, mut deconv_act_c, mut deconv_share_c, mut deconv_collin_c): (
-        Vec<f32>,
-        Vec<f32>,
-        Vec<f32>,
-        Vec<f32>,
-    ) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    // Demix (D1/D2/D3) feature columns.
+    #[allow(clippy::type_complexity)]
+    let (
+        mut deconv_expl_c,
+        mut deconv_act_c,
+        mut deconv_share_c,
+        mut deconv_collin_c,
+        mut deconv_shadow_c,
+    ): (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
 
     // chromatograms columns
     let (mut ch_cid, mut ch_name, mut ch_fmz, mut ch_pint) =
@@ -1312,6 +1374,7 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
         deconv_active: f32,
         deconv_share: f32,
         deconv_collin: f32,
+        deconv_shadow: f32,
         /// (cid, frag_name, frag_mz, frag_obs_mz, predicted_intensity, rt, intensity)
         chrom: Vec<ChromOutputRow>,
         /// Top-K retained peak groups (sensitivity_plan P1.1/P1.2), populated only
@@ -1808,7 +1871,7 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
 
             // Spectrum-centric NNLS demixing at the selected apex (D2). Non-destructive:
             // emits interference-corrected features only. Gated; zero when off.
-            let (deconv_explained, deconv_active, deconv_share, deconv_collin) =
+            let (deconv_explained, deconv_active, deconv_share, deconv_collin, deconv_shadow) =
                 if p.cfg.emit_demix_features {
                     demix_at_apex(
                         fidx.as_ref(),
@@ -1825,7 +1888,7 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
                         p.cfg,
                     )
                 } else {
-                    (0.0, 0.0, 0.0, 0.0)
+                    (0.0, 0.0, 0.0, 0.0, 0.0)
                 };
 
             let rank0 = CandOut {
@@ -1859,6 +1922,7 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
                 deconv_active: deconv_active as f32,
                 deconv_share: deconv_share as f32,
                 deconv_collin: deconv_collin as f32,
+                deconv_shadow: deconv_shadow as f32,
                 chrom: chrom_rows,
                 peaks,
             };
@@ -1953,6 +2017,7 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
                     deconv_active: 0.0,
                     deconv_share: 0.0,
                     deconv_collin: 0.0,
+                    deconv_shadow: 0.0,
                     chrom: Vec::new(), // shared per-candidate via the rank-0 row
                     peaks: Vec::new(),
                 });
@@ -2018,6 +2083,7 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
             deconv_act_c.push(r.deconv_active);
             deconv_share_c.push(r.deconv_share);
             deconv_collin_c.push(r.deconv_collin);
+            deconv_shadow_c.push(r.deconv_shadow);
         }
         for (cc, nm, fmz, omz, pint, rt, it) in r.chrom {
             ch_cid.push(cc);
@@ -2072,6 +2138,7 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
         psms_cols.push(Col::F32("deconv_active".into(), deconv_act_c));
         psms_cols.push(Col::F32("deconv_share".into(), deconv_share_c));
         psms_cols.push(Col::F32("deconv_max_collinearity".into(), deconv_collin_c));
+        psms_cols.push(Col::F32("shadow_kept_frac".into(), deconv_shadow_c));
     }
     let n_psms = write_table(p.out_psms, psms_cols)?;
 

@@ -339,6 +339,7 @@ mod tests {
             deconv_active: 0.0,
             deconv_share: 0.0,
             deconv_max_collin: 0.0,
+            deconv_shadow: 0.0,
         }
     }
 

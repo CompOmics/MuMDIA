@@ -23,6 +23,10 @@ pub const NAMES: &[&str] = &[
     // any co-isolated rival (0-1). Near 1 = near-degenerate, so the demix split is
     // arbitrary and its coefficient should be distrusted. No incumbent engine emits this.
     "deconv_max_collinearity",
+    // D1 shadow: fraction of the candidate's observed apex intensity that survives after
+    // subtracting each co-eluter's unique-ion-estimated contribution (0-1). A real second
+    // peptide keeps most of its signal; a pure borrower is subtracted toward 0.
+    "shadow_kept_frac",
 ];
 
 #[inline]
@@ -40,5 +44,6 @@ pub fn values(e: &Evidence) -> Vec<f64> {
         fin(e.deconv_active).clamp(0.0, 1.0),
         fin(e.deconv_share).clamp(0.0, 1.0),
         fin(e.deconv_max_collin).clamp(0.0, 1.0),
+        fin(e.deconv_shadow).clamp(0.0, 1.0),
     ]
 }
