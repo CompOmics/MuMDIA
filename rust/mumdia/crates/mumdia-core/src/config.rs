@@ -215,6 +215,16 @@ pub struct PeptidoformsConfig {
     pub max_variable_mods: usize,
     pub charge_min: i32,
     pub charge_max: i32,
+    /// Composition-based precursor charge range. When true, ignore
+    /// `charge_min`/`charge_max` and emit every charge from 1 up to
+    /// `1 (N-terminus) + (#R + #H + #K)`, the proton-carrying capacity of the
+    /// peptide. Peptides therefore never receive a charge state they cannot
+    /// physically hold, and each peptide's range depends on its own basic-residue
+    /// count. Default false (fixed `charge_min..=charge_max` for every peptide).
+    /// Pairs with `predict_frag.charge_by_basic_residues` for fragments. Changing
+    /// the enumerated charge states changes the search/training/FDR population, so
+    /// this remains benchmark-gated.
+    pub charge_by_basic_residues: bool,
     /// `error` (default) or `skip` for unknown modifications.
     pub unknown_modification: UnknownModPolicy,
 }
@@ -232,6 +242,7 @@ impl Default for PeptidoformsConfig {
             max_variable_mods: 1,
             charge_min: 2,
             charge_max: 3,
+            charge_by_basic_residues: false,
             unknown_modification: UnknownModPolicy::Error,
         }
     }
@@ -264,6 +275,13 @@ pub struct PredictFragConfig {
     /// doubly-charged fragments for ~16% of charge-2 precursors' transitions, so
     /// blocking them (the old default of 3) discarded real signal.
     pub charge2_from_precursor_charge: i32,
+    /// Composition-based fragment charge cap. When true, a b/y fragment is kept
+    /// at charge z only if `z <= 1 (its N-terminal amine) + (#R + #H + #K within
+    /// that fragment)`, and never above the precursor charge. This supersedes the
+    /// `charge2_from_precursor_charge` rule when set. Default false. Pairs with
+    /// `peptidoforms.charge_by_basic_residues` for precursors; benchmark-gated
+    /// because it changes the scored transition set.
+    pub charge_by_basic_residues: bool,
     pub top_n_fragments: usize,
     pub ms2pip_model: String,
     /// Python executable for the MS2PIP sidecar (env with ms2pip + pyarrow).
@@ -279,6 +297,7 @@ impl Default for PredictFragConfig {
             predictor: t(),
             rt_predictor: t(),
             charge2_from_precursor_charge: 2,
+            charge_by_basic_residues: false,
             top_n_fragments: 6,
             ms2pip_model: "HCD".to_string(),
             ms2pip_python: None,

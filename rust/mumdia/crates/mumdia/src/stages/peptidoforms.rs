@@ -200,6 +200,19 @@ pub fn run(p: PeptidoformsParams) -> Result<u64> {
 
     for row in 0..t.nrows {
         let pep = &peptide[row];
+        // Composition-based precursor charge range (opt-in). The maximum charge a
+        // peptide can physically hold is one proton on the N-terminus plus one per
+        // basic residue (Arg, His, Lys); when enabled, emit charges 1..=cap and
+        // ignore the fixed charge_min/charge_max. Otherwise use the fixed range.
+        let (z_lo, z_hi) = if p.cfg.charge_by_basic_residues {
+            let n_basic = pep
+                .bytes()
+                .filter(|b| matches!(b, b'R' | b'H' | b'K'))
+                .count() as i32;
+            (1, 1 + n_basic)
+        } else {
+            (p.cfg.charge_min, p.cfg.charge_max)
+        };
         let base_pep_id = if target_id[row] >= 0 {
             target_id[row] as u32
         } else {
@@ -236,7 +249,7 @@ pub fn run(p: PeptidoformsParams) -> Result<u64> {
             if !seen_forms.insert(form.clone()) {
                 continue;
             }
-            for z in p.cfg.charge_min..=p.cfg.charge_max {
+            for z in z_lo..=z_hi {
                 id_c.push(next);
                 next += 1;
                 pepid_c.push(pep_id[row]);

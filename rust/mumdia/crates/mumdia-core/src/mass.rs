@@ -125,6 +125,34 @@ impl ParsedPeptidoform {
         }
         out
     }
+
+    /// Number of proton-carrying basic residues (Arg, His, Lys) in the whole
+    /// peptide. Used for the composition-based charge cap: the maximum sensible
+    /// precursor charge is `1 (N-terminus) + basic_residue_count()`.
+    pub fn basic_residue_count(&self) -> usize {
+        self.residues
+            .iter()
+            .filter(|&&r| matches!(r, b'R' | b'H' | b'K'))
+            .count()
+    }
+
+    /// Number of basic residues (Arg, His, Lys) contained in the sub-sequence of
+    /// a b/y fragment of the given ordinal. A b-ion of ordinal `k` spans the
+    /// first `k` residues; a y-ion of ordinal `k` spans the last `k`. The
+    /// maximum sensible charge of that fragment is `1 (its N-terminal amine) +
+    /// this count`.
+    pub fn fragment_basic_sites(&self, ion: IonType, ordinal: usize) -> usize {
+        let n = self.residues.len();
+        let k = ordinal.min(n);
+        let slice = match ion {
+            IonType::B => &self.residues[0..k],
+            IonType::Y => &self.residues[n - k..n],
+        };
+        slice
+            .iter()
+            .filter(|&&r| matches!(r, b'R' | b'H' | b'K'))
+            .count()
+    }
 }
 
 fn frag_name(t: IonType, ordinal: usize, charge: i32) -> String {
@@ -263,6 +291,35 @@ mod tests {
         assert!(frags.iter().all(|f| f.name != "y2"));
         // y3 should exist for a 7-mer
         assert!(frags.iter().any(|f| f.name == "y3"));
+    }
+
+    #[test]
+    fn basic_residue_count_counts_rhk_only() {
+        assert_eq!(
+            parse_peptidoform("PEPTIDE").unwrap().basic_residue_count(),
+            0
+        );
+        assert_eq!(
+            parse_peptidoform("PEPTIDER").unwrap().basic_residue_count(),
+            1
+        );
+        // R, H, K each count once; D/E (acidic) do not.
+        assert_eq!(parse_peptidoform("HKRDE").unwrap().basic_residue_count(), 3);
+    }
+
+    #[test]
+    fn fragment_basic_sites_by_slice() {
+        // AAAKAAR: K at index 3, R at index 6 (n = 7).
+        let p = parse_peptidoform("AAAKAAR").unwrap();
+        // b-ions span the first `ordinal` residues.
+        assert_eq!(p.fragment_basic_sites(IonType::B, 3), 0); // AAA
+        assert_eq!(p.fragment_basic_sites(IonType::B, 4), 1); // AAAK
+        assert_eq!(p.fragment_basic_sites(IonType::B, 6), 1); // AAAKAA
+                                                              // y-ions span the last `ordinal` residues.
+        assert_eq!(p.fragment_basic_sites(IonType::Y, 1), 1); // R
+        assert_eq!(p.fragment_basic_sites(IonType::Y, 3), 1); // AAR
+        assert_eq!(p.fragment_basic_sites(IonType::Y, 4), 2); // KAAR -> K + R
+        assert_eq!(p.fragment_basic_sites(IonType::Y, 7), 2); // whole peptide: K + R
     }
 
     #[test]

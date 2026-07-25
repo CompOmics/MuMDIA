@@ -76,11 +76,25 @@ pub fn run(p: PredictFragParams) -> Result<(u64, u64)> {
                 Err(_) => return RowOut::ParseErr,
             };
             let z = charge[row];
-            let mut frag_charges = vec![1];
-            if z >= p.cfg.charge2_from_precursor_charge {
-                frag_charges.push(2);
-            }
-            let frags = parsed.fragments(&frag_charges);
+            let frags = if p.cfg.charge_by_basic_residues {
+                // Composition cap: request every charge up to the smaller of the
+                // precursor charge and the peptide's proton capacity, then keep
+                // each fragment only at charges its own basic sites (Arg/His/Lys
+                // within the fragment) plus its N-terminal amine can hold.
+                let max_z = (1 + parsed.basic_residue_count() as i32).min(z).max(1);
+                let all_charges: Vec<i32> = (1..=max_z).collect();
+                let mut fr = parsed.fragments(&all_charges);
+                fr.retain(|f| {
+                    f.charge <= 1 + parsed.fragment_basic_sites(f.ion_type, f.ordinal) as i32
+                });
+                fr
+            } else {
+                let mut frag_charges = vec![1];
+                if z >= p.cfg.charge2_from_precursor_charge {
+                    frag_charges.push(2);
+                }
+                parsed.fragments(&frag_charges)
+            };
             if frags.is_empty() {
                 return RowOut::Empty;
             }

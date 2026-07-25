@@ -504,7 +504,19 @@ a spike-in design's real fold changes); `Median` aligns each run's median intens
 | `max_variable_mods` | 1 | max simultaneous variable mods |
 | `charge_min` | 2 | lowest precursor charge |
 | `charge_max` | 3 | highest precursor charge |
+| `charge_by_basic_residues` | `false` | when true, ignore `charge_min`/`charge_max` and emit charges `1..=1+(#R+#H+#K)` per peptide (proton capacity: N-terminus plus one per basic residue) |
 | `unknown_modification` | `error` | `error` or `skip` |
+
+`charge_by_basic_residues` restricts the enumerated precursor charge states to
+what a peptide can physically hold (one proton on the N-terminus plus one per Arg,
+His, Lys). It replaces the fixed range rather than clamping within it, so a peptide
+with no basic residue is emitted only at charge 1, and a peptide that cannot reach
+`charge_min` is not dropped by `charge_min` but simply enumerated from 1. Pairs with
+`predict_frag.charge_by_basic_residues` (fragments). It changes the search /
+training / FDR population, so it is benchmark-gated and defaults off. On the
+imported path, `import_diann_lib.py --charge-by-basic-residues` applies the same
+rule (on the reference DIA-NN E. coli library it dropped 7.9% of precursors, almost
+all charge-3 with a single basic residue).
 
 `ResidueMod` (config.rs:233-240) is `{residue: char, name: String}` where `name`
 is a UniMod name. The doc comment reserves `residue: '*'` for "any" and notes
@@ -519,6 +531,7 @@ every other section), so both keys are required inside a `ResidueMod` entry.
 | `predictor` | `native` | fragment-intensity source (native heuristic or MS2PIP) |
 | `rt_predictor` | `native` | iRT source (native or DeepLC) |
 | `charge2_from_precursor_charge` | 2 | add charge-2 fragments for precursor charge >= this |
+| `charge_by_basic_residues` | `false` | when true, keep a b/y fragment at charge z only if `z <= 1+(basic residues within the fragment)` and `z <= precursor charge`; supersedes `charge2_from_precursor_charge` |
 | `top_n_fragments` | 6 | fragments kept per candidate |
 | `ms2pip_model` | `"HCD"` | MS2PIP model name |
 | `ms2pip_python` | `None` | interpreter for MS2PIP sidecar |
