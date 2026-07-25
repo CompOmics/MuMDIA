@@ -650,6 +650,13 @@ pub struct FeaturesConfig {
     /// right elution half-width when `bound_from_confident` is true. 50 = median
     /// (typical real peak width); higher percentiles widen the shared window.
     pub bound_confident_pct: f64,
+    /// Emit the MS1 apex-isotope precursor feature `ms1_isotope_height_corr`
+    /// (Pearson of the observed apex isotope heights [i0,i1,i2] against the
+    /// Poisson-averagine model). Default false (the feature is present in the
+    /// battery but returns 0.0, so the vector length is unchanged in effect). It
+    /// overlaps the existing `ms1_isotope_cosine_apex`, so it is opt-in and
+    /// benchmark-gated rather than default-on (AlphaDIA-plan item 12).
+    pub ms1_precursor_features: bool,
 }
 impl Default for FeaturesConfig {
     fn default() -> Self {
@@ -662,6 +669,7 @@ impl Default for FeaturesConfig {
             bound_peak_grace: 0, // stop at first sub-threshold scan (legacy)
             bound_from_confident: true, // fixed feature window from confident-seed norm
             bound_confident_pct: 50.0, // median confident half-width
+            ms1_precursor_features: false, // opt-in; overlaps ms1_isotope_cosine_apex
         }
     }
 }

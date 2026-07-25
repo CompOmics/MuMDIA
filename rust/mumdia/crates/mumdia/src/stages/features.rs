@@ -337,9 +337,13 @@ pub struct Evidence {
     pub ms1_iso1: Option<f64>,
     pub ms1_iso2: Option<f64>,
     pub ms1_isom1: Option<f64>,
-    /// MS1 isotope XICs [mono, +1, +2] resampled onto `axis`. Empty until the
-    /// extract stage persists them (evidence gap being closed separately).
+    /// MS1 isotope XICs [mono, +1, +2] resampled onto `axis`. Populated when the
+    /// extract stage emits MS1 window-grid chromatograms (default on with MS1).
     pub ms1_xic: Vec<Vec<f64>>,
+    /// Opt-in `ms1_precursor_features` gate (config). When false the ms1 family's
+    /// `ms1_isotope_height_corr` returns 0.0 (default), keeping the vector effect
+    /// unchanged; when true it computes the apex-isotope Pearson.
+    pub ms1_precursor_features: bool,
 }
 
 /// Parse a fragment name like `b3`, `y7`, `b3^2` into (is_b, ordinal, charge).
@@ -531,6 +535,7 @@ fn build_evidence(
         ms1_iso2: None,
         ms1_isom1: None,
         ms1_xic,
+        ms1_precursor_features: false,
     }
 }
 
@@ -796,6 +801,7 @@ pub fn run(p: FeaturesParams) -> Result<u64> {
                         ev.ms1_iso1 = ms1_i1[i];
                         ev.ms1_iso2 = ms1_i2[i];
                         ev.ms1_isom1 = ms1_m1[i];
+                        ev.ms1_precursor_features = p.cfg.ms1_precursor_features;
                         extended_values(&ev)
                     }
                     _ => vec![0.0; ext_names.len()],

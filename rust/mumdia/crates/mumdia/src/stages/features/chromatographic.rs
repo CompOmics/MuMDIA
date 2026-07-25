@@ -1018,6 +1018,7 @@ mod tests {
             ms1_iso2: None,
             ms1_isom1: None,
             ms1_xic: vec![],
+            ms1_precursor_features: false,
         }
     }
 

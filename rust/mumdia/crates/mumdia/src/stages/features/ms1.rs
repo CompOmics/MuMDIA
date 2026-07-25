@@ -48,6 +48,8 @@ pub const NAMES: &[&str] = &[
     "ms1_isotope_corr_xic",
     "ms1_envelope_over_time_corr",
     "ms1_isotope_xic_shape_consistency",
+    // apex-isotope precursor feature (opt-in `ms1_precursor_features`; 0.0 when off)
+    "ms1_isotope_height_corr",
 ];
 
 const EPS: f64 = 1e-9;
@@ -228,6 +230,15 @@ pub fn values(e: &Evidence) -> Vec<f64> {
         xic_shape_consistency,
     ) = xic_features(e);
 
+    // apex-isotope precursor feature (opt-in). Pearson of the observed apex isotope
+    // heights against the averagine model. Overlaps `ms1_isotope_cosine_apex` (cosine
+    // vs Pearson of the same 3-vector), so it is gated off by default and returns 0.0.
+    let height_corr = if e.ms1_precursor_features {
+        fin(pearson(&obs3, &t))
+    } else {
+        0.0
+    };
+
     vec![
         iso_cos,
         iso_sa,
@@ -254,6 +265,7 @@ pub fn values(e: &Evidence) -> Vec<f64> {
         iso_corr_xic,
         env_over_time_corr,
         xic_shape_consistency,
+        height_corr,
     ]
 }
 
