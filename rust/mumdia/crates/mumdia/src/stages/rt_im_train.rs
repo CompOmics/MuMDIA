@@ -286,6 +286,25 @@ pub fn run(p: RtImTrainParams) -> Result<u64> {
     let slope_report = calibration_available.then_some(slope);
     let intercept_report = calibration_available.then_some(intercept);
 
+    // RT calibration-quality residuals over the training anchors (seconds):
+    // signed median = residual bias, absolute median = typical accuracy, MAD =
+    // spread. Diagnostic only (the RT window already derives from these
+    // residuals); surfaced so a run's RT calibration can be judged good or biased.
+    let (rt_residual_median_s, rt_residual_abs_median_s, rt_residual_mad_s) =
+        if calibration_available {
+            let signed: Vec<f64> = train_irt
+                .iter()
+                .zip(&train_rt)
+                .map(|(x, y)| y - predict(*x))
+                .collect();
+            let med = percentile(&signed, 0.5);
+            let absres: Vec<f64> = signed.iter().map(|r| r.abs()).collect();
+            let mad: Vec<f64> = signed.iter().map(|r| (r - med).abs()).collect();
+            (med, percentile(&absres, 0.5), percentile(&mad, 0.5))
+        } else {
+            (f64::NAN, f64::NAN, f64::NAN)
+        };
+
     // cal.json
     mumdia_io::json::write_json(
         p.out_cal,
@@ -298,6 +317,10 @@ pub fn run(p: RtImTrainParams) -> Result<u64> {
             "multiplier": p.cfg.rt_window_multiplier,
             "n_train": n_train,
             "calibration_status": status,
+            // Calibration-quality diagnostics (post-fit RT residuals, seconds).
+            "rt_residual_median_s": rt_residual_median_s,
+            "rt_residual_abs_median_s": rt_residual_abs_median_s,
+            "rt_residual_mad_s": rt_residual_mad_s,
         }),
     )?;
 

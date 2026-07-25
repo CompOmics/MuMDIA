@@ -214,6 +214,20 @@ pub fn run(p: SearchSeedParams) -> Result<u64> {
     } else {
         (0.0, p.cfg.fragment_tol_ppm, 0)
     };
+    // Calibration-quality residual stats for the mass dimension: the median and
+    // MAD of the calibrant deviations AFTER the offset correction. A residual
+    // median far from zero means the single offset did not fully de-bias the mass
+    // axis (a case for an m/z-dependent calibration); the MAD is the achieved
+    // precision. Purely diagnostic; consumed by the per-run calibration-quality
+    // report, never by extraction.
+    let (ppm_residual_median, ppm_residual_mad) = if devs.is_empty() {
+        (0.0, 0.0)
+    } else {
+        let centered: Vec<f64> = devs.iter().map(|d| d - frag_ppm_offset).collect();
+        let med = crate::calibrate::percentile(&centered, 0.5);
+        let absdev: Vec<f64> = centered.iter().map(|c| (c - med).abs()).collect();
+        (med, crate::calibrate::percentile(&absdev, 0.5))
+    };
     mumdia_io::json::write_json(
         &format!("{}.masscal.json", p.out),
         &json!({
@@ -223,6 +237,9 @@ pub fn run(p: SearchSeedParams) -> Result<u64> {
             "frag_ppm_sigma": frag_tol_learned,
             "n_dev": devs.len(),
             "cal_passes": cal_passes,
+            // Calibration-quality diagnostics (post-correction residuals).
+            "ppm_residual_median": ppm_residual_median,
+            "ppm_residual_mad": ppm_residual_mad,
         }),
     )?;
     info!(
