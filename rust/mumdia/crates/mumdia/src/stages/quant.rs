@@ -766,15 +766,93 @@ pub fn run_lfq_combine(
             Col::I32("n_features".into(), c_nf),
         ],
     )?;
+
+    // Peptide- and precursor-level matrices from the SAME normalized features,
+    // written as sibling files next to the protein matrix (the protein output is
+    // unchanged). Precursor = one (peptidoform, charge); peptide = one stripped
+    // base sequence. Both roll their member features up with the same LFQ engine.
+    // Purely additive analysis granularity; strictly post-FDR, no identification
+    // or FDR change.
+    let mut prec: BTreeMap<(String, i32), Vec<Vec<Option<f64>>>> = BTreeMap::new();
+    let mut pep: BTreeMap<String, Vec<Vec<Option<f64>>>> = BTreeMap::new();
+    for feats in data.values() {
+        for (key, vec) in feats {
+            // key = "peptidoform|charge" (maxlfq) or "peptidoform|charge|fragment"
+            // (directlfq); peptidoform strings never contain '|'.
+            let mut it = key.splitn(3, '|');
+            let pform = it.next().unwrap_or("").to_string();
+            let charge: i32 = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+            prec.entry((pform.clone(), charge))
+                .or_default()
+                .push(vec.clone());
+            pep.entry(base_sequence(&pform))
+                .or_default()
+                .push(vec.clone());
+        }
+    }
+    // (group key, charge, feature-by-run matrix) for one sibling-matrix level.
+    type LevelGroup = (String, i32, Vec<Vec<Option<f64>>>);
+    let write_level = |path: String, groups: Vec<LevelGroup>| -> Result<()> {
+        let (mut g_key, mut g_z, mut g_run, mut g_q, mut g_nf) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        for (key, z, mat) in &groups {
+            let prof = crate::quant_lfq::lfq_profile(mat, n);
+            for (r, &v) in prof.iter().enumerate() {
+                g_key.push(key.clone());
+                g_z.push(*z);
+                g_run.push(r as i32);
+                g_q.push(v);
+                g_nf.push(mat.len() as i32);
+            }
+        }
+        write_table(
+            &path,
+            vec![
+                Col::Str("group".into(), g_key),
+                Col::I32("charge".into(), g_z),
+                Col::I32("run".into(), g_run),
+                Col::F64("quantity".into(), g_q),
+                Col::I32("n_features".into(), g_nf),
+            ],
+        )?;
+        Ok(())
+    };
+    write_level(
+        format!("{out}.precursor.parquet"),
+        prec.into_iter().map(|((p, z), m)| (p, z, m)).collect(),
+    )?;
+    write_level(
+        format!("{out}.peptide.parquet"),
+        pep.into_iter().map(|(p, m)| (p, -1, m)).collect(),
+    )?;
+
     info!(
         proteins = data.len(),
         runs = n,
         method = if by_fragment { "directlfq" } else { "maxlfq" },
         normalize = ?normalize,
         size_factors = ?factors,
-        "quant-lfq: done"
+        "quant-lfq: done (+ .peptide/.precursor sibling matrices)"
     );
     Ok(rows)
+}
+
+/// Stripped base amino-acid sequence of a peptidoform: drop bracketed or
+/// parenthesized modification blocks and any DECOY_ prefix, keep the residues.
+/// Used to roll precursors up to peptide-level LFQ groups.
+fn base_sequence(peptidoform: &str) -> String {
+    let s = peptidoform.strip_prefix("DECOY_").unwrap_or(peptidoform);
+    let mut out = String::new();
+    let mut depth = 0i32;
+    for c in s.chars() {
+        match c {
+            '[' | '(' => depth += 1,
+            ']' | ')' => depth = (depth - 1).max(0),
+            c if depth == 0 && c.is_ascii_alphabetic() => out.push(c),
+            _ => {}
+        }
+    }
+    out
 }
 
 /// Per-run size factors for cross-run normalization of the feature-by-run matrix.
@@ -903,6 +981,13 @@ mod tests {
         assert_eq!(trapezoid_window(&rt, &it, 2.0, 2.0, false), 10.0);
         // Empty window integrates to 0.
         assert_eq!(trapezoid_window(&rt, &it, 10.0, 20.0, false), 0.0);
+    }
+
+    #[test]
+    fn base_sequence_strips_mods_and_decoy() {
+        assert_eq!(base_sequence("PEPTIDEK"), "PEPTIDEK");
+        assert_eq!(base_sequence("M[Oxidation]PEC[Carbamidomethyl]K"), "MPECK");
+        assert_eq!(base_sequence("DECOY_VAVGDGVAK"), "VAVGDGVAK");
     }
 
     #[test]
