@@ -902,6 +902,9 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
 
     // psms_extracted columns
     let (mut cid_c, mut apexrt_c, mut apexint_c) = (Vec::new(), Vec::new(), Vec::new());
+    // Top-K peak promotion (AlphaDIA #7): the peak rank of each emitted PSM row. 0 is
+    // the selected apex (the only row per candidate until promote_top_peaks > 1).
+    let mut peakrank_c: Vec<i32> = Vec::new();
     let (mut nmatch_c, mut corun_c, mut npred_c) = (Vec::new(), Vec::new(), Vec::new());
     let (mut calrt_c, mut mz_c, mut z_c) = (Vec::new(), Vec::new(), Vec::new());
     let (mut label_c, mut base_c, mut pform_c, mut prot_c, mut irt_c) =
@@ -952,6 +955,8 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
 
     struct CandOut {
         cid: u32,
+        /// Chromatographic peak rank (0 = selected apex). Top-K promotion (#7).
+        peak_rank: u8,
         apex_rt: f64,
         apex_int: f32,
         n_match: i32,
@@ -1461,6 +1466,7 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
 
             Some(CandOut {
                 cid,
+                peak_rank: 0, // selected apex; ranks >= 1 added when promote_top_peaks > 1
                 apex_rt,
                 apex_int: apex_sum,
                 n_match: distinct.len() as i32,
@@ -1512,6 +1518,7 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
             pk_area.push(*area);
         }
         cid_c.push(r.cid);
+        peakrank_c.push(r.peak_rank as i32);
         apexrt_c.push(r.apex_rt);
         apexim_c.push(None);
         apexint_c.push(r.apex_int);
@@ -1554,6 +1561,7 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
 
     let mut psms_cols = vec![
         Col::U32("candidate_id".into(), cid_c),
+        Col::I32("peak_rank".into(), peakrank_c),
         Col::F64("apex_rt".into(), apexrt_c),
         Col::OptF64("apex_im".into(), apexim_c),
         Col::F32("apex_intensity".into(), apexint_c),

@@ -518,6 +518,24 @@ pub struct ExtractConfig {
     /// selected apex, so these extra hypotheses are not currently rescored or used
     /// to improve identifications. K=1 preserves the single-apex behaviour.
     pub retain_top_peaks: usize,
+    /// Number of chromatographic peaks PROMOTED to real feature/rescore rows per
+    /// candidate (AlphaDIA plan #7, top-K). `1` (default) emits only the selected
+    /// apex, so the pipeline is byte-identical. `>1` additionally emits the next
+    /// strongest non-overlapping `enumerate_peaks` groups (each a full re-sliced PSM
+    /// record carrying `peak_rank`), so the rescorer can pick the correct-but-not-apex
+    /// peak; the selected apex stays `peak_rank = 0`. Must be `<= retain_top_peaks`.
+    /// Behaviour-changing and benchmark/entrapment-gated: it changes the extracted
+    /// row population, and compete/rescore must collapse per candidate so the decoy
+    /// null is not K-inflated.
+    pub promote_top_peaks: usize,
+    /// Minimum integrated area of a promoted alternate peak (rank >= 1) as a fraction
+    /// of the rank-0 peak's area. Suppresses noise-level alternates. Only used when
+    /// `promote_top_peaks > 1`.
+    pub alt_peak_min_area_frac: f64,
+    /// Minimum apex-RT separation (seconds) between a promoted alternate peak and the
+    /// rank-0 apex, so a near-duplicate of the selected peak is not re-emitted. Only
+    /// used when `promote_top_peaks > 1`.
+    pub alt_peak_min_separation_s: f64,
     /// Diagnostic candidate-audit: when true, extraction records, for every probed
     /// candidate, either the survivor stage-flags or the earliest `RejectionReason`,
     /// and writes `<out-psms>.audit.parquet` (spec 01 §4 / P0.3). Near-zero cost
@@ -578,6 +596,9 @@ impl Default for ExtractConfig {
             min_coelution_run: 0, // disabled; scan_window floor still applies
             ms1_rescue: false,    // opt-in; relaxes acceptance, validate FDR first
             retain_top_peaks: 1,  // legacy single-apex behaviour (K=1)
+            promote_top_peaks: 1, // top-K promotion off (only the selected apex is a row)
+            alt_peak_min_area_frac: 0.10, // alternate peak >= 10% of rank-0 area
+            alt_peak_min_separation_s: 5.0, // alternate apex >= 5 s from rank-0 apex
             emit_candidate_audit: false, // diagnostic; off in production
             apex_evidence_rank: false, // legacy signature-intensity apex
             emit_gate_diagnostics: false, // diagnostic gate-score columns; off in production
