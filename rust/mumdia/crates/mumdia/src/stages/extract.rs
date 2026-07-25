@@ -1027,19 +1027,44 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
             let counts: Vec<usize> = groups.iter().map(|(_, m)| m.len()).collect();
             let w = p.cfg.apex_count_window.max(1);
             let r = w / 2;
-            let smoothed: Vec<usize> = if w <= 1 {
-                counts.clone()
+            let sigma = p.cfg.apex_gaussian_sigma_scans;
+            // Smoothed per-scan fragment-count score. Default is the truncated
+            // rolling SUM (`apex_count_window`); with `apex_gaussian_sigma_scans` > 0
+            // a Gaussian matched filter (radius 3*sigma) is used instead. Both are
+            // deterministic and reduce to the raw per-scan count when disabled.
+            let smoothed: Vec<f64> = if sigma > 0.0 {
+                let radius = (sigma * 3.0).ceil() as usize;
+                let kernel: Vec<f64> = (0..=2 * radius)
+                    .map(|k| {
+                        let d = k as f64 - radius as f64;
+                        (-0.5 * (d / sigma).powi(2)).exp()
+                    })
+                    .collect();
+                (0..counts.len())
+                    .map(|i| {
+                        let mut acc = 0.0;
+                        for (k, &wt) in kernel.iter().enumerate() {
+                            let idx = i as isize + k as isize - radius as isize;
+                            if idx >= 0 && (idx as usize) < counts.len() {
+                                acc += counts[idx as usize] as f64 * wt;
+                            }
+                        }
+                        acc
+                    })
+                    .collect()
+            } else if w <= 1 {
+                counts.iter().map(|&c| c as f64).collect()
             } else {
                 (0..counts.len())
                     .map(|i| {
                         let lo = i.saturating_sub(r);
                         let hi = (i + r).min(counts.len() - 1);
-                        counts[lo..=hi].iter().sum()
+                        counts[lo..=hi].iter().sum::<usize>() as f64
                     })
                     .collect()
             };
-            let maxc = smoothed.iter().copied().max().unwrap_or(0);
-            let thresh = maxc.saturating_sub(p.cfg.apex_count_tol);
+            let maxc = smoothed.iter().copied().fold(0.0f64, f64::max);
+            let thresh = (maxc - p.cfg.apex_count_tol as f64).max(0.0);
             // Optional Gaussian RT prior on the apex tiebreak: among count-qualified
             // scans, multiply the top-3 intensity by exp(-0.5*((rt - rt_pred_cal)/sigma)^2)
             // so a distant-from-prediction interferent inside a wide RT window cannot

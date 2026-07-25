@@ -444,6 +444,14 @@ pub struct ExtractConfig {
     /// the apex toward the RT-window centre (~= predicted RT) as a mild RT-prior;
     /// measured to beat a mean by ~+300 IDs on AIF. 1 = no smoothing (per-scan).
     pub apex_count_window: usize,
+    /// Gaussian matched-filter smoothing of the per-scan fragment-count series
+    /// before apex selection, as a sigma in scan units. 0.0 (default) keeps the
+    /// `apex_count_window` rolling-sum smoother unchanged. When > 0, the count
+    /// series is convolved with a Gaussian kernel (radius = 3*sigma) instead,
+    /// which localizes the apex more robustly than a uniform window against
+    /// scan-to-scan flicker. Opt-in and benchmark-gated: it changes apex
+    /// selection and therefore identifications.
+    pub apex_gaussian_sigma_scans: f64,
     /// Emit per-fragment chromatograms on the FULL isolation-window scan grid with
     /// 0.0 where a fragment is absent (aggregating scans of the same isolation
     /// window), so the elution profile drops to zero between peaks and the
@@ -531,6 +539,7 @@ impl Default for ExtractConfig {
             apex_top_fragments: 0, // superseded by apex_count_tol; kept for compat
             apex_rt_prior_s: 0.0,  // RT prior off by default
             apex_count_tol: 1,     // fragment-count apex with 1-fragment slack
+            apex_gaussian_sigma_scans: 0.0, // Gaussian apex smoother off by default (opt-in)
             apex_count_window: 1,  // no rolling smoothing by default (opt-in; window 5
             // cuts AIF apex misassignment, median |dRT| 131s->9s)
             emit_window_grid: true, // zero-filled window-grid chromatograms
@@ -824,6 +833,11 @@ pub struct QuantConfig {
     /// `precursor_q` is single-run only; use `run_psm_q` for per-run slices of an
     /// experiment-wide rescore). See [`QuantQColumn`].
     pub q_filter: QuantQColumn,
+    /// Apply an apex-outward interference-correction envelope to each fragment
+    /// trace before integrating its area, stripping co-eluting interference in the
+    /// peak wings. Off by default (identity on a clean peak). Opt-in and
+    /// benchmark-gated: it changes reported quantities.
+    pub interference_envelope: bool,
 }
 impl Default for QuantConfig {
     fn default() -> Self {
@@ -838,6 +852,7 @@ impl Default for QuantConfig {
             peak_window_mode: PeakWindowMode::PerCandidate,
             reliable_q: 0.001,
             q_filter: QuantQColumn::PeptideQ,
+            interference_envelope: false, // apex-outward interference envelope off by default
         }
     }
 }

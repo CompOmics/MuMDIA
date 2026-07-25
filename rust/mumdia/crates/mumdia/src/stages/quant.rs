@@ -47,10 +47,39 @@ fn trapezoid(rt: &[f32], inten: &[f32]) -> f64 {
     area
 }
 
+/// Apex-outward interference-correction envelope: walking outward from the apex
+/// (the max sample) in each direction, cap every sample at the running minimum so
+/// far. A co-eluting interferent that lifts the peak wings back up is clipped to
+/// the trough between it and the true peak, so it no longer inflates the
+/// integrated area. Returns the corrected intensities aligned to the input.
+/// Behavior-preserving when there is no wing interference (a clean monotone peak
+/// is unchanged). Deterministic.
+fn center_envelope_1d(inten: &[f32]) -> Vec<f32> {
+    let n = inten.len();
+    if n < 3 {
+        return inten.to_vec();
+    }
+    let apex = (0..n).fold(0usize, |b, i| if inten[i] > inten[b] { i } else { b });
+    let mut out = inten.to_vec();
+    let mut m = inten[apex];
+    for i in (0..apex).rev() {
+        m = m.min(inten[i]);
+        out[i] = m;
+    }
+    let mut m = inten[apex];
+    for i in (apex + 1)..n {
+        m = m.min(inten[i]);
+        out[i] = m;
+    }
+    out
+}
+
 /// Trapezoidal integral of one fragment trace restricted to RT in `[lo, hi]`.
 /// Reuses [`trapezoid`] on the in-window samples so the single-sample rule is
-/// identical; an empty window integrates to 0.
-fn trapezoid_window(rt: &[f32], inten: &[f32], lo: f64, hi: f64) -> f64 {
+/// identical; an empty window integrates to 0. When `envelope` is set, the
+/// in-window intensities are passed through [`center_envelope_1d`] first to strip
+/// co-eluting interference in the peak wings before integration.
+fn trapezoid_window(rt: &[f32], inten: &[f32], lo: f64, hi: f64, envelope: bool) -> f64 {
     let mut wr: Vec<f32> = Vec::new();
     let mut wi: Vec<f32> = Vec::new();
     for k in 0..rt.len() {
@@ -63,7 +92,12 @@ fn trapezoid_window(rt: &[f32], inten: &[f32], lo: f64, hi: f64) -> f64 {
     if wr.is_empty() {
         return 0.0;
     }
-    trapezoid(&wr, &wi)
+    if envelope {
+        let ev = center_envelope_1d(&wi);
+        trapezoid(&wr, &ev)
+    } else {
+        trapezoid(&wr, &wi)
+    }
 }
 
 /// Elution-peak RT window `[lo, hi]` for one candidate, from the summed XIC across
@@ -403,7 +437,13 @@ pub fn run(p: QuantParams) -> Result<(u64, u64)> {
         }
         for &i in rows {
             let a = if p.cfg.bound_peak {
-                trapezoid_window(&ch_rt[i], &ch_int[i], lo_rt, hi_rt)
+                trapezoid_window(
+                    &ch_rt[i],
+                    &ch_int[i],
+                    lo_rt,
+                    hi_rt,
+                    p.cfg.interference_envelope,
+                )
             } else {
                 trapezoid(&ch_rt[i], &ch_int[i])
             };
@@ -858,11 +898,33 @@ mod tests {
         // Whole trace: symmetric triangle, area = 20.
         assert!((trapezoid(&rt, &it) - 20.0).abs() < 1e-9);
         // Restricted to [1,3]: samples (1,5),(2,10),(3,5) -> 7.5 + 7.5 = 15.
-        assert!((trapezoid_window(&rt, &it, 1.0, 3.0) - 15.0).abs() < 1e-9);
+        assert!((trapezoid_window(&rt, &it, 1.0, 3.0, false) - 15.0).abs() < 1e-9);
         // Window with a single in-range sample returns that raw intensity.
-        assert_eq!(trapezoid_window(&rt, &it, 2.0, 2.0), 10.0);
+        assert_eq!(trapezoid_window(&rt, &it, 2.0, 2.0, false), 10.0);
         // Empty window integrates to 0.
-        assert_eq!(trapezoid_window(&rt, &it, 10.0, 20.0), 0.0);
+        assert_eq!(trapezoid_window(&rt, &it, 10.0, 20.0, false), 0.0);
+    }
+
+    #[test]
+    fn center_envelope_clips_wing_interference() {
+        // A clean rise-then-fall peak is left unchanged.
+        let clean = [1.0f32, 3.0, 6.0, 3.0, 1.0];
+        assert_eq!(center_envelope_1d(&clean), clean.to_vec());
+        // Interference bump in the right wing (idx4 rises back to 5.0 after the
+        // trough at idx3=2.0): apex idx2, the outward running-min caps it to 2.0.
+        let interf = [1.0f32, 4.0, 10.0, 2.0, 5.0, 1.0];
+        assert_eq!(
+            center_envelope_1d(&interf),
+            vec![1.0, 4.0, 10.0, 2.0, 2.0, 1.0]
+        );
+        // Enabling the envelope removes the bump, so the integrated area shrinks.
+        let rt = [0.0f32, 1.0, 2.0, 3.0, 4.0, 5.0];
+        let off = trapezoid_window(&rt, &interf, 0.0, 5.0, false);
+        let on = trapezoid_window(&rt, &interf, 0.0, 5.0, true);
+        assert!(
+            on < off,
+            "envelope should not increase the area (on={on}, off={off})"
+        );
     }
 
     #[test]
@@ -887,7 +949,7 @@ mod tests {
         assert_eq!(lo, 4.0);
         assert_eq!(hi, 8.0);
         // The interferent spike at rt=1 is outside [lo,hi], so its windowed area is 0.
-        assert_eq!(trapezoid_window(&ch_rt[1], &ch_int[1], lo, hi), 0.0);
+        assert_eq!(trapezoid_window(&ch_rt[1], &ch_int[1], lo, hi, false), 0.0);
     }
 
     #[test]
@@ -1190,7 +1252,7 @@ mod tests {
         let (lo, hi, apex) = peak_window(&[0], &ch_rt, &ch_int, 1.0 / 6.0, 1, None);
         assert_eq!(apex, 4.0, "apex should be the summed-XIC max rt");
         assert!(hi > lo, "window must have nonzero width: lo={lo} hi={hi}");
-        let a = trapezoid_window(&ch_rt[0], &ch_int[0], lo, hi);
+        let a = trapezoid_window(&ch_rt[0], &ch_int[0], lo, hi, false);
         assert!(
             (a - 20.0).abs() < 1e-9,
             "expected triangle area 20, not height 10, got {a}"
