@@ -126,6 +126,33 @@ fn nearest_index(rts: &[f64], t: f64) -> usize {
     }
 }
 
+/// Composite per-claimant weight-cue multiplier for `PeakClaim::CoelutionMultiCue`
+/// (modular fragment-competition framework). Each enabled [`ClaimCues`] cue contributes
+/// a factor in [0,1]; disabled cues contribute 1.0, so the product is 1.0 when no cue
+/// is on and the arbitration reduces exactly to the elution-profile-height weight.
+/// Label-blind (reads only observed/predicted fragment m/z), so target/decoy
+/// exchangeability is preserved.
+#[inline]
+fn claim_cue_multiplier(
+    cfg: &ExtractConfig,
+    lib: &Library,
+    cid: u32,
+    frag: u16,
+    obs_mz: f64,
+) -> f32 {
+    let mut w = 1.0f32;
+    if cfg.claim_cues.mz_close {
+        // Sub-tolerance m/z proximity (S3): the observed peak sits at the true owner's
+        // m/z, so a claimant whose predicted fragment m/z is closer wins more weight.
+        let (mzs, _, _) = lib.cand_frags(cid);
+        let pred_mz = mzs.get(frag as usize).copied().unwrap_or(obs_mz);
+        let ppm = mumdia_core::constants::ppm_diff(obs_mz, pred_mz) as f32;
+        let sigma = (cfg.claim_cues.mz_close_sigma_ppm as f32).max(1e-6);
+        w *= (-(ppm / sigma).powi(2)).exp();
+    }
+    w
+}
+
 /// Sum intensities of peaks within `tol_ppm` of `target` (m/z-sorted arrays).
 fn sum_near(mz: &[f64], inten: &[f32], target: f64, tol_ppm: f64) -> f32 {
     if mz.is_empty() {
@@ -533,31 +560,49 @@ fn extract_twopass_windows(
                             .copied()
                             .unwrap_or(0.0)
                     };
+                    // Modular per-claimant competition weight (fragment-competition
+                    // framework): the elution profile height, optionally multiplied by
+                    // the composable ClaimCues under CoelutionMultiCue. For every other
+                    // method the cue is 1.0, so `weights` reduces EXACTLY to `ph` and the
+                    // arbitration below is bit-identical to the profile-height version.
+                    let multicue = matches!(cfg.peak_claim, PeakClaim::CoelutionMultiCue);
+                    let weights: Vec<f32> = claimants
+                        .iter()
+                        .map(|&(cid, frag, _pi)| {
+                            let h = ph(cid);
+                            if multicue && h > 0.0 {
+                                h * claim_cue_multiplier(cfg, lib, cid, frag, obs_mz)
+                            } else {
+                                h
+                            }
+                        })
+                        .collect();
                     let mut best = 0usize;
                     for i in 1..claimants.len() {
                         let (ci, _, pii) = claimants[i];
                         let (cb, _, pib) = claimants[best];
-                        let (hi_, hb) = (ph(ci), ph(cb));
-                        if hi_ > hb || (hi_ == hb && (pii > pib || (pii == pib && ci < cb))) {
+                        let (wi, wb) = (weights[i], weights[best]);
+                        if wi > wb || (wi == wb && (pii > pib || (pii == pib && ci < cb))) {
                             best = i;
                         }
                     }
                     let win = claimants[best].0;
-                    let sum_ph: f32 = claimants.iter().map(|c| ph(c.0)).sum();
-                    let top_ph = ph(win);
-                    let second_ph = claimants
+                    let sum_w: f32 = weights.iter().copied().sum();
+                    let top_w = weights[best];
+                    let second_w = claimants
                         .iter()
-                        .filter(|c| c.0 != win)
-                        .map(|c| ph(c.0))
+                        .enumerate()
+                        .filter(|&(_, c)| c.0 != win)
+                        .map(|(i, _)| weights[i])
                         .fold(0.0f32, f32::max);
                     let dominant =
-                        top_ph > 0.0 && (second_ph <= 0.0 || top_ph >= claim_margin * second_ph);
-                    for &(cid, frag, _pi) in &claimants {
+                        top_w > 0.0 && (second_w <= 0.0 || top_w >= claim_margin * second_w);
+                    for (i, &(cid, frag, _pi)) in claimants.iter().enumerate() {
                         let e = contested.entry(cid).or_default();
-                        // Co-elution-weighted proportional share (retained intensity
-                        // under CoelutionProportional), tracked for every claimant.
-                        let share = if sum_ph > 0.0 {
-                            inten * (ph(cid) / sum_ph)
+                        // Weight-proportional share (retained intensity under a
+                        // proportional split), tracked for every claimant.
+                        let share = if sum_w > 0.0 {
+                            inten * (weights[i] / sum_w)
                         } else {
                             inten / claimants.len() as f32
                         };
@@ -582,11 +627,6 @@ fn extract_twopass_windows(
                                     }
                                 }
                                 PeakClaim::CoelutionProportional => {
-                                    let share = if sum_ph > 0.0 {
-                                        inten * (ph(cid) / sum_ph)
-                                    } else {
-                                        inten / claimants.len() as f32
-                                    };
                                     acc2.entry(cid).or_default().push(Hit {
                                         rt,
                                         frag,
@@ -773,6 +813,7 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
         PeakClaim::CoelutionWinner
             | PeakClaim::CoelutionProportional
             | PeakClaim::CoelutionWinnerMargin
+            | PeakClaim::CoelutionMultiCue
     ) || p.cfg.emit_contested_features;
     let claim_margin = p.cfg.peak_claim_margin as f32;
 
@@ -870,6 +911,11 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
         // Two-pass co-elution peak-claim, parallelized across isolation windows
         // (each window's candidates interact only within it, so the two expensive
         // probing passes fan out over the ~150 windows).
+        // CoelutionMultiCue is intentionally absent here: it ships NON-DESTRUCTIVELY,
+        // so its cue-weighted split flows into the contested/apportioned FEATURES
+        // (visible under emit_contested_features) without altering extracted
+        // intensities. A destructive variant is a separate, benchmark+entrapment-gated
+        // addition (report section 5.3 / CLAUDE.md).
         let reassign = matches!(
             p.cfg.peak_claim,
             PeakClaim::CoelutionWinner

@@ -154,6 +154,41 @@ pub enum PeakClaim {
     /// stripping real peptides at ambiguous peaks where no candidate clearly owns
     /// the elution.
     CoelutionWinnerMargin,
+    /// Multi-cue co-elution winner (two-pass, modular fragment-competition framework).
+    /// The per-claimant competition weight is the elution profile height multiplied
+    /// by the composable cues enabled in [`ClaimCues`] (sub-tolerance m/z proximity,
+    /// RT prior, isotope coherence, MS1 precursor support, ...), each defaulting to
+    /// 1.0 so this reduces to `CoelutionWinner` when no cue is enabled. Winner-take-all
+    /// on the composite weight when `reassign` is set.
+    CoelutionMultiCue,
+}
+
+/// Composable per-claimant weight cues for [`PeakClaim::CoelutionMultiCue`] (the
+/// modular fragment-competition framework). Each cue is label-blind (reads only
+/// observed/predicted m/z + intensity, RT, MS1) so target/decoy exchangeability is
+/// preserved, and each defaults OFF (weight 1.0) so the composite weight reduces to
+/// the plain elution-profile height. Enable cues incrementally and validate as
+/// non-destructive features before any destructive/default use.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ClaimCues {
+    /// Sub-tolerance m/z proximity (S3): weight a claimant by
+    /// `exp(-(ppm_err/sigma)^2)`, where `ppm_err` is the signed ppm offset of the
+    /// observed peak from this claimant's predicted fragment m/z. Two collided
+    /// fragments share a peak only because both fall within `frag_tol`, but the
+    /// observed peak sits at the true owner's m/z; the sub-tolerance offset is a
+    /// novel apportionment weight (engines use ppm only as a binary gate).
+    pub mz_close: bool,
+    /// Gaussian sigma (ppm) for the `mz_close` cue. Default 5 ppm.
+    pub mz_close_sigma_ppm: f64,
+}
+impl Default for ClaimCues {
+    fn default() -> Self {
+        Self {
+            mz_close: false,
+            mz_close_sigma_ppm: 5.0,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -489,6 +524,9 @@ pub struct ExtractConfig {
     /// How a shared observed peak's intensity is apportioned among co-isolated,
     /// co-eluting candidates that all match it (see [`PeakClaim`]).
     pub peak_claim: PeakClaim,
+    /// Composable claim-weight cues for `PeakClaim::CoelutionMultiCue` (modular
+    /// fragment-competition framework). All default off (weight 1.0).
+    pub claim_cues: ClaimCues,
     /// Emit a non-destructive `contested_frac` per PSM: the fraction of a
     /// candidate's matched intensity that a co-eluting competitor claims more
     /// strongly (by the two-pass elution-profile arbitration). Does not alter the
@@ -590,6 +628,7 @@ impl Default for ExtractConfig {
             emit_window_grid: true, // zero-filled window-grid chromatograms
             bucket_size: 8192,
             peak_claim: PeakClaim::None,
+            claim_cues: ClaimCues::default(),
             emit_contested_features: false,
             peak_claim_margin: 2.0,
             matcher: MatcherKind::Fragindex,
