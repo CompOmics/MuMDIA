@@ -190,6 +190,14 @@ pub struct ClaimCues {
     pub rt_prior: bool,
     /// Gaussian sigma (seconds) for the `rt_prior` cue. Default 30 s.
     pub rt_prior_tau_s: f64,
+    /// MS1 precursor-envelope support (S4, cross-dimension): weight a claimant by
+    /// whether its own precursor isotope envelope (mono + a plausible +1/mono ratio)
+    /// is actually present in the nearest MS1 scan. A shift/reverse decoy has a
+    /// well-defined precursor m/z but no real co-eluting MS1 precursor, so its support
+    /// is noise, starving its MS2 claim via an orthogonal dimension that is nearly
+    /// impossible to fake. No-op when no MS1 is provided. Down-weights (never zeroes)
+    /// so a genuinely MS1-poor real peptide is not eliminated.
+    pub ms1_support: bool,
 }
 impl Default for ClaimCues {
     fn default() -> Self {
@@ -198,6 +206,7 @@ impl Default for ClaimCues {
             mz_close_sigma_ppm: 5.0,
             rt_prior: false,
             rt_prior_tau_s: 30.0,
+            ms1_support: false,
         }
     }
 }

@@ -133,6 +133,7 @@ fn nearest_index(rts: &[f64], t: f64) -> usize {
 /// Label-blind (reads only observed/predicted fragment m/z), so target/decoy
 /// exchangeability is preserved.
 #[inline]
+#[allow(clippy::too_many_arguments)]
 fn claim_cue_multiplier(
     cfg: &ExtractConfig,
     lib: &Library,
@@ -141,6 +142,8 @@ fn claim_cue_multiplier(
     obs_mz: f64,
     rt: f64,
     rt_cal: &[f64],
+    ms1_scans: &[Ms1Scan],
+    ms1_rts: &[f64],
 ) -> f32 {
     let mut w = 1.0f32;
     if cfg.claim_cues.mz_close {
@@ -161,6 +164,28 @@ fn claim_cue_multiplier(
             let tau = (cfg.claim_cues.rt_prior_tau_s as f32).max(1e-3);
             let d = (rt - rt_pred) as f32;
             w *= (-(d * d) / (2.0 * tau * tau)).exp();
+        }
+    }
+    if cfg.claim_cues.ms1_support && !ms1_scans.is_empty() {
+        // MS1 precursor-envelope support (S4): the claimant's OWN precursor isotope
+        // envelope at the nearest MS1 scan. Absent mono precursor -> down-weight; a
+        // present mono with an implausible +1/mono ratio -> mild down-weight. A decoy's
+        // precursor m/z is well-defined but has no real co-eluting MS1 signal.
+        let cand = &lib.cands[cid as usize];
+        let j = nearest_index(ms1_rts, rt);
+        let s = &ms1_scans[j];
+        let z = (cand.charge.max(1)) as f64;
+        let sp = ISOTOPE_SPACING / z;
+        let tol = cfg.prec_tol_ppm;
+        let mono = sum_near(&s.mz, &s.intensity, cand.precursor_mz, tol);
+        if mono <= 0.0 {
+            w *= 0.5;
+        } else {
+            let i1 = sum_near(&s.mz, &s.intensity, cand.precursor_mz + sp, tol);
+            let ratio = i1 / mono;
+            if !(0.05..=2.0).contains(&ratio) {
+                w *= 0.75;
+            }
         }
     }
     w
@@ -462,6 +487,8 @@ fn extract_twopass_windows(
     rt_lo: &[f64],
     rt_hi: &[f64],
     rt_cal: &[f64],
+    ms1_scans: &[Ms1Scan],
+    ms1_rts: &[f64],
     mass_off: &MassOffset,
     frag_tol: f64,
     cfg: &ExtractConfig,
@@ -585,7 +612,9 @@ fn extract_twopass_windows(
                         .map(|&(cid, frag, _pi)| {
                             let h = ph(cid);
                             if multicue && h > 0.0 {
-                                h * claim_cue_multiplier(cfg, lib, cid, frag, obs_mz, rt, rt_cal)
+                                h * claim_cue_multiplier(
+                                    cfg, lib, cid, frag, obs_mz, rt, rt_cal, ms1_scans, ms1_rts,
+                                )
                             } else {
                                 h
                             }
@@ -943,6 +972,8 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
             &rt_lo,
             &rt_hi,
             &rt_cal,
+            &ms1_scans,
+            &ms1_rts,
             &mass_off,
             frag_tol,
             p.cfg,
