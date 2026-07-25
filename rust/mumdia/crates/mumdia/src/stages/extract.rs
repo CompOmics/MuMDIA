@@ -997,7 +997,7 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
         peaks: Vec<(u8, f64, f64, f64, f64, f64)>,
     }
 
-    let results: Vec<Option<CandOut>> = cand_hits
+    let results: Vec<Vec<CandOut>> = cand_hits
         .into_par_iter()
         .map(|(cid, mut hits)| {
             // distinct matched fragments (tier b)
@@ -1005,7 +1005,7 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
             distinct.sort_unstable();
             distinct.dedup();
             if distinct.len() < p.cfg.presence_min_matched.max(1) {
-                return None;
+                return Vec::new();
             }
 
             // Group hits into scan groups by RT (dedupe same fragment in a scan by max).
@@ -1208,18 +1208,21 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
                 || best_run < p.cfg.min_coelution_run
                 || matched_fraction < p.cfg.min_matched_fraction
             {
-                return None;
+                return Vec::new();
             }
 
             let c = &lib.cands[cid as usize];
 
-            // MS1 apex isotope intensities (nearest MS1 scan to the apex RT), computed
-            // BEFORE the acceptance gate so MS1 evidence can rescue a candidate the
-            // single-scan fragment-Pearson gate would otherwise reject.
-            let (o_ms1_m1, o_ms1_mono, o_ms1_i1, o_ms1_i2) = if ms1_scans.is_empty() {
-                (None, None, None, None)
-            } else {
-                let j = nearest_index(&ms1_rts, apex_rt);
+            // MS1 apex isotope intensities at a given RT (nearest MS1 scan). Factored
+            // so both the selected apex (rank 0) and any promoted alternate peak (#7)
+            // compute their own MS1 evidence at their own apex RT. Computed BEFORE the
+            // acceptance gate so MS1 evidence can rescue a candidate the single-scan
+            // fragment-Pearson gate would otherwise reject.
+            let ms1_at = |rt: f64| -> (Option<f64>, Option<f64>, Option<f64>, Option<f64>) {
+                if ms1_scans.is_empty() {
+                    return (None, None, None, None);
+                }
+                let j = nearest_index(&ms1_rts, rt);
                 let s = &ms1_scans[j];
                 let z = c.charge as f64;
                 let sp = ISOTOPE_SPACING / z;
@@ -1231,6 +1234,7 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
                     Some(sum_near(&s.mz, &s.intensity, c.precursor_mz + 2.0 * sp, tol) as f64),
                 )
             };
+            let (o_ms1_m1, o_ms1_mono, o_ms1_i1, o_ms1_i2) = ms1_at(apex_rt);
             // Cheap MS1 support: mono present and the +1/mono ratio in a plausible
             // averagine band. Used only as the rescue signal for the Pearson gate.
             let ms1_support = {
@@ -1297,7 +1301,7 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
                         && ms1_support
                         && distinct.len() >= p.cfg.presence_min_fragments.max(1);
                     if !rescued {
-                        return None;
+                        return Vec::new();
                     }
                 }
             }
@@ -1464,7 +1468,7 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
                 Vec::new()
             };
 
-            Some(CandOut {
+            let rank0 = CandOut {
                 cid,
                 peak_rank: 0, // selected apex; ranks >= 1 added when promote_top_peaks > 1
                 apex_rt,
@@ -1493,7 +1497,99 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
                 gate_spectral_entropy: gate_spectral_entropy as f32,
                 chrom: chrom_rows,
                 peaks,
-            })
+            };
+            if p.cfg.promote_top_peaks <= 1 || groups.is_empty() {
+                return vec![rank0];
+            }
+            // Promote alternate chromatographic peaks (#7). Enumerate on the same
+            // distinct-fragment COUNT profile as the diagnostic peaks (breadth of
+            // co-elution, interference-resistant), exclude the envelope holding the
+            // selected apex, gate each candidate peak by area fraction + apex-RT
+            // separation + matched-fragment floor, and emit up to promote_top_peaks - 1
+            // extra records. Each shares the candidate's chromatograms (emitted once on
+            // rank 0, looked up by candidate_id downstream) and re-slices only its own
+            // apex-dependent scalars + MS1; the features stage recomputes peak-shape and
+            // co-elution features from the shared chrom windowed to each row's own apex.
+            let count_prof: Vec<f32> = groups.iter().map(|(_, m)| m.len() as f32).collect();
+            let alt_peaks =
+                crate::peaks::enumerate_peaks(&count_prof, p.cfg.promote_top_peaks, 1.0 / 3.0, 0.1);
+            let apex_gi = groups
+                .iter()
+                .position(|(rt, _)| (*rt - apex_rt).abs() < 1e-9);
+            // Reference area for the area gate: the enumerated envelope holding the
+            // selected apex (0 disables the area gate if the apex is not a counted peak).
+            let rank0_area = apex_gi
+                .and_then(|gi| {
+                    alt_peaks
+                        .iter()
+                        .find(|pk| pk.start_idx <= gi && gi <= pk.end_idx)
+                })
+                .map(|pk| pk.area as f64)
+                .unwrap_or(0.0);
+            let mut out = vec![rank0];
+            let mut rank: u8 = 1;
+            for pk in &alt_peaks {
+                if out.len() >= p.cfg.promote_top_peaks {
+                    break;
+                }
+                // Exclude the envelope containing the selected apex (rank 0).
+                if let Some(gi) = apex_gi {
+                    if pk.start_idx <= gi && gi <= pk.end_idx {
+                        continue;
+                    }
+                }
+                let alt_apex_rt = groups[pk.apex_idx].0;
+                if (alt_apex_rt - apex_rt).abs() < p.cfg.alt_peak_min_separation_s {
+                    continue;
+                }
+                if rank0_area > 0.0 && (pk.area as f64) < p.cfg.alt_peak_min_area_frac * rank0_area
+                {
+                    continue;
+                }
+                let mut altset: std::collections::HashSet<u16> = std::collections::HashSet::new();
+                for (_, m) in &groups[pk.start_idx..=pk.end_idx] {
+                    for &f in m.keys() {
+                        altset.insert(f);
+                    }
+                }
+                if altset.len() < p.cfg.presence_min_matched.max(1) {
+                    continue;
+                }
+                let alt_apex_int: f32 = groups[pk.apex_idx].1.values().sum();
+                let (a_m1, a_mono, a_i1, a_i2) = ms1_at(alt_apex_rt);
+                out.push(CandOut {
+                    cid,
+                    peak_rank: rank,
+                    apex_rt: alt_apex_rt,
+                    apex_int: alt_apex_int,
+                    n_match: altset.len() as i32,
+                    corun: best_run as i32,
+                    npred: fmzs0.len() as i32,
+                    calrt: rt_cal[cid as usize],
+                    mz: c.precursor_mz,
+                    contested: contested_val,
+                    contested_count_frac,
+                    apportioned_frac,
+                    z: c.charge,
+                    label: if c.is_decoy { "decoy" } else { "target" }.to_string(),
+                    base: c.base_peptide_id,
+                    pform: c.peptidoform.clone(),
+                    prot: c.protein.clone(),
+                    irt: c.predicted_irt,
+                    ms1_m1: a_m1,
+                    ms1_mono: a_mono,
+                    ms1_i1: a_i1,
+                    ms1_i2: a_i2,
+                    gate_apex: gate_apex as f32,
+                    gate_peak_spectral: gate_peak_spectral as f32,
+                    gate_coelution: gate_coelution as f32,
+                    gate_spectral_entropy: gate_spectral_entropy as f32,
+                    chrom: Vec::new(), // shared per-candidate via the rank-0 row
+                    peaks: Vec::new(),
+                });
+                rank += 1;
+            }
+            out
         })
         .collect();
 
