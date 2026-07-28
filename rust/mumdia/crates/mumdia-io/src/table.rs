@@ -251,6 +251,23 @@ pub fn nrows(path: &str) -> Result<u64> {
     Ok(builder.metadata().file_metadata().num_rows() as u64)
 }
 
+/// Column names straight from the parquet footer metadata, in file order, without decoding
+/// any column data. The counterpart to [`nrows`] for callers that need the schema rather
+/// than the contents -- a features/competed artifact carries ~390 columns, so
+/// `Table::read(path)?.column_names()` decodes every one of them to answer a question the
+/// footer already contains.
+pub fn column_names(path: &str) -> Result<Vec<String>> {
+    let file = std::fs::File::open(path).with_context(|| format!("opening {path}"))?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+        .with_context(|| format!("reading parquet footer {path}"))?;
+    Ok(builder
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| f.name().clone())
+        .collect())
+}
+
 impl Table {
     pub fn read(path: &str) -> Result<Table> {
         Self::read_inner(path, None)

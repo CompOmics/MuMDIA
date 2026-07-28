@@ -452,34 +452,53 @@ pub fn run(p: QuantParams) -> Result<(u64, u64)> {
     // Phase 2: integrate each fragment over the chosen window and retain the
     // actually applied apex/bounds for the peptide-quant contract.
     let mut applied_win: BTreeMap<u32, (f64, f64, f64)> = BTreeMap::new();
-    for (&c, rows) in &cand_rows {
-        let (lo_rt, hi_rt, integration_apex) = if !p.cfg.bound_peak {
-            (f64::NEG_INFINITY, f64::INFINITY, f64::NAN)
-        } else {
-            let (lo, hi, apex) = win[&c];
-            match consensus {
-                Some((ml, mr)) if apex.is_finite() => (apex - ml, apex + mr, apex),
-                _ => (lo, hi, apex),
-            }
-        };
-        applied_win.insert(c, (lo_rt, hi_rt, integration_apex));
+    // `(candidate_id, (lo_rt, hi_rt, integration_apex), one area per chromatogram row)`.
+    type Integrated = (u32, (f64, f64, f64), Vec<f64>);
+    // Integrate each candidate's fragment traces. Parallel across candidates for the same
+    // reason the peak-window phase above is: a candidate reads only its own chromatogram
+    // rows and every float reduction happens inside one candidate's `trapezoid*` call.
+    // Rayon's indexed `collect` keeps candidate order, and `cand_rows` is a `BTreeMap`, so
+    // the maps below are filled in exactly the order the serial loop filled them.
+    let integrated: Vec<Integrated> = cand_rows
+        .par_iter()
+        .map(|(&c, rows)| {
+            let (lo_rt, hi_rt, integration_apex) = if !p.cfg.bound_peak {
+                (f64::NEG_INFINITY, f64::INFINITY, f64::NAN)
+            } else {
+                let (lo, hi, apex) = win[&c];
+                match consensus {
+                    Some((ml, mr)) if apex.is_finite() => (apex - ml, apex + mr, apex),
+                    _ => (lo, hi, apex),
+                }
+            };
+            let a: Vec<f64> = rows
+                .iter()
+                .map(|&i| {
+                    if p.cfg.bound_peak {
+                        trapezoid_window(
+                            &ch_rt[i],
+                            &ch_int[i],
+                            lo_rt,
+                            hi_rt,
+                            p.cfg.interference_envelope,
+                        )
+                    } else {
+                        trapezoid(&ch_rt[i], &ch_int[i])
+                    }
+                })
+                .collect();
+            (c, (lo_rt, hi_rt, integration_apex), a)
+        })
+        .collect();
+    for ((c, w, computed), rows) in integrated.into_iter().zip(cand_rows.values()) {
+        let (lo_rt, hi_rt, _) = w;
+        applied_win.insert(c, w);
         if emit_bounds && lo_rt.is_finite() && hi_rt.is_finite() {
             pb_cid.push(c);
             pb_lo.push(lo_rt);
             pb_hi.push(hi_rt);
         }
-        for &i in rows {
-            let a = if p.cfg.bound_peak {
-                trapezoid_window(
-                    &ch_rt[i],
-                    &ch_int[i],
-                    lo_rt,
-                    hi_rt,
-                    p.cfg.interference_envelope,
-                )
-            } else {
-                trapezoid(&ch_rt[i], &ch_int[i])
-            };
+        for (&i, a) in rows.iter().zip(computed) {
             areas.entry(c).or_default().push(a);
             frag_areas
                 .entry(c)

@@ -95,7 +95,14 @@ impl Library {
         // RSS wall (the fragment table alone is ~23 GB of Arrow batches at 657M rows).
         drop(pt);
 
-        let ft = Table::read(fragments)?;
+        // Projected: the fragment artifact also carries `ion_type`, `ordinal`,
+        // `frag_charge` and `cardinality`, none of which the library reads. Decoding them
+        // costs a full pass and a full copy of each at fragment-library scale (hundreds of
+        // millions of rows), and `ion_type` is a string column, so it also allocates.
+        let ft = Table::read_cols(
+            fragments,
+            &["candidate_id", "mz", "predicted_intensity", "name"],
+        )?;
         let f_cid = ft.u32("candidate_id")?;
         let f_mz = ft.f64("mz")?;
         let f_int = ft.f32("predicted_intensity")?;

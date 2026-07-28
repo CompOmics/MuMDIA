@@ -255,14 +255,14 @@ impl FeatureSchema {
                 // companion used to abort the run outright -- observed this session when a
                 // competed table was rewritten by an external tool that did not know to
                 // copy the sidecar. Reconstruct instead, and say so.
-                let t = Table::read(artifact_path).with_context(|| {
+                // Footer only: the column list lives in the parquet metadata, so there is
+                // no reason to decode ~390 columns of data to read their names.
+                let names = mumdia_io::table::column_names(artifact_path).with_context(|| {
                     format!(
-                        "reading {companion} failed ({e}) and the artifact itself could \
-                         not be read to reconstruct the feature schema"
+                        "reading {companion} failed ({e}) and the artifact itself could                          not be read to reconstruct the feature schema"
                     )
                 })?;
-                let feature_columns: Vec<String> = t
-                    .column_names()
+                let feature_columns: Vec<String> = names
                     .into_iter()
                     .filter(|c| !NON_FEATURE_COLUMNS.contains(&c.as_str()))
                     .collect();

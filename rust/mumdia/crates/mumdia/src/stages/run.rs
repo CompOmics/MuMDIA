@@ -224,7 +224,18 @@ pub fn run(p: RunParams) -> Result<()> {
         ("ms2_to_ms1", artifact::MS2_TO_MS1, &co.ms2_to_ms1),
     ] {
         let rows = mumdia_io::table::nrows(path)?;
-        man.record(record_artifact(name, schema, path, rows, "convert", &ch)?);
+        // `convert_hash`, not the bare config hash: the manifest is the provenance record,
+        // so it must carry the same cap-folded key the artifact's own report does. Stamping
+        // `ch` here made two runs differing only in `--top-peaks-ms2` record identical
+        // provenance for their spectra, and disagreed with the report written beside them.
+        man.record(record_artifact(
+            name,
+            schema,
+            path,
+            rows,
+            "convert",
+            &convert_hash,
+        )?);
     }
 
     let seed = d("seed_psms.parquet");

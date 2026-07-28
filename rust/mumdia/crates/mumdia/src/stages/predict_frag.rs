@@ -390,7 +390,14 @@ fn assign_intensities(p: &PredictFragParams, raws: &mut [Raw]) -> Result<String>
                 bail!("MS2PIP returned no predictions");
             }
             let native = NativeFrag;
-            for (i, r) in raws.iter_mut().enumerate() {
+            // Parallel across rows: each row writes only its own `frag_int` and reads only
+            // its own parsed peptidoform, fragment list and MS2PIP entry. `par_iter_mut`
+            // preserves the element-to-index mapping, and the per-row float work (the native
+            // charge-2 fallback and the two per-charge-group max-normalizations) is
+            // self-contained, so this is bit-identical to the serial loop. The MS2PIP sidecar
+            // call already happened above -- what is parallelized here is the per-row native
+            // prediction and normalization, which is real CPU work, not sidecar wait.
+            raws.par_iter_mut().enumerate().for_each(|(i, r)| {
                 let per = map.get(&(i as u32));
                 match per {
                     Some(per) if !per.is_empty() => {
@@ -435,7 +442,7 @@ fn assign_intensities(p: &PredictFragParams, raws: &mut [Raw]) -> Result<String>
                         r.frag_int = native.predict_intensities(&r.parsed, &r.frags);
                     }
                 }
-            }
+            });
             Ok(format!("ms2pip-{}", p.cfg.ms2pip_model))
         }
     }

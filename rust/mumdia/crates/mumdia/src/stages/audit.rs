@@ -74,16 +74,18 @@ pub fn run(p: AuditParams) -> Result<u64> {
     let protein = lib.str("protein")?;
     let n = cid.len();
 
-    // Survivor sets keyed by candidate_id from each downstream artifact.
-    let extracted: HashSet<u32> = Table::read(p.psms)?
+    // Survivor sets keyed by candidate_id from each downstream artifact. Projected: the
+    // competed and scored artifacts carry ~390 feature columns and the audit wants three of
+    // them, so an unprojected read decodes (and holds) the whole feature matrix for nothing.
+    let extracted: HashSet<u32> = Table::read_cols(p.psms, &["candidate_id"])?
         .u32("candidate_id")?
         .into_iter()
         .collect();
-    let competed: HashSet<u32> = Table::read(p.competed)?
+    let competed: HashSet<u32> = Table::read_cols(p.competed, &["candidate_id"])?
         .u32("candidate_id")?
         .into_iter()
         .collect();
-    let scored_t = Table::read(p.scored)?;
+    let scored_t = Table::read_cols(p.scored, &["candidate_id", "q_value", "peptide_q_value"])?;
     let scored_cid = scored_t.u32("candidate_id")?;
     let scored_q = scored_t.f64("q_value")?;
     // peptide-level q is optional (only present in some scored schemas).
