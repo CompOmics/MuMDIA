@@ -26,35 +26,57 @@ use tracing::info;
 use mumdia_core::constants::{ppm_bounds, ISOTOPE_SPACING};
 
 use crate::index::Library;
-use crate::matchers::fragindex::FragIndex;
+use crate::matchers::fragindex::{FragIndex, WindowNarrow};
 use crate::spectra::{load_ms1, load_ms2, Ms1Scan};
 use mumdia_core::config::MatcherKind;
 use mumdia_core::types::Ms2Scan;
 use rayon::prelude::*;
 
-/// Probe one (offset-corrected) query m/z against the selected matcher backend,
-/// invoking `f(candidate_id, candidate_local_fragment_ordinal, predicted_intensity)`
-/// for every verified match in the candidate window `[lo, hi)`. Bucketed resolves
-/// the fragment ordinal via `Library::local_frag_index` (nearest stored m/z);
-/// fragindex carries the true generating ordinal in `post_frag` (a semantic change
-/// for candidates with fragments at sub-f32-identical m/z, per the plan). Both apply
-/// the same tolerance; the fragindex index is already built at `frag_tol`.
-#[inline]
-fn probe_matched(
-    fidx: Option<&FragIndex>,
-    lib: &Library,
+/// The matcher backend plus the values that never change across a probe: which
+/// index is in use, the library, and the fragment tolerance. Bundling them keeps the
+/// per-peak call down to what actually varies.
+struct Prober<'a> {
+    fidx: Option<&'a FragIndex>,
+    lib: &'a Library,
     frag_tol: f64,
-    q_mz: f64,
-    lo: u32,
-    hi: u32,
-    f: &mut dyn FnMut(u32, u16, f32),
-) {
-    match fidx {
-        Some(idx) => idx.probe_peak(q_mz, lo, hi, |cid, _pmz, pint, frag| f(cid, frag, pint)),
-        None => lib.page_search(q_mz, frag_tol, lo, hi, |cid, frag_mz, pi| {
-            let frag = lib.local_frag_index(cid, frag_mz) as u16;
-            f(cid, frag, pi);
-        }),
+}
+
+impl Prober<'_> {
+    /// Probe one (offset-corrected) query m/z, invoking `f(candidate_id,
+    /// candidate_local_fragment_ordinal, predicted_intensity)` for every verified
+    /// match in the candidate window `[lo, hi)`. Bucketed resolves the fragment
+    /// ordinal via `Library::local_frag_index` (nearest stored m/z); fragindex
+    /// carries the true generating ordinal in `post_frag` (a semantic change for
+    /// candidates with fragments at sub-f32-identical m/z, per the plan). Both apply
+    /// the same tolerance; the fragindex index is already built at `frag_tol`.
+    ///
+    /// `nw` is an optional per-window narrowing cache for the fragindex path; it must
+    /// have been built for this same `(lo, hi)`. Passing `None` is always correct and
+    /// gives the uncached probe.
+    #[inline]
+    fn probe(
+        &self,
+        nw: Option<&mut WindowNarrow>,
+        q_mz: f64,
+        lo: u32,
+        hi: u32,
+        f: &mut dyn FnMut(u32, u16, f32),
+    ) {
+        match (self.fidx, nw) {
+            (Some(idx), Some(nw)) => {
+                idx.probe_peak_win(nw, q_mz, |cid, _pmz, pint, frag| f(cid, frag, pint))
+            }
+            (Some(idx), None) => {
+                idx.probe_peak(q_mz, lo, hi, |cid, _pmz, pint, frag| f(cid, frag, pint))
+            }
+            (None, _) => {
+                let lib = self.lib;
+                lib.page_search(q_mz, self.frag_tol, lo, hi, |cid, frag_mz, pi| {
+                    let frag = lib.local_frag_index(cid, frag_mz) as u16;
+                    f(cid, frag, pi);
+                })
+            }
+        }
     }
 }
 
@@ -195,43 +217,80 @@ fn claim_cue_multiplier(
     w
 }
 
-/// Spectrum-centric NNLS demixing at a candidate's apex scan (D2, fragment-competition
-/// report). Assembles the co-isolated candidate x fragment-channel design matrix from the
-/// apex scan's observed peaks (rows = peaks, columns = candidates that claim a peak,
-/// `D[peak,cand]` = candidate's predicted intensity for its matching fragment), solves
-/// `min_{beta>=0} ||D beta - y||^2` (deterministic ridge NNLS), and returns
-/// `(deconv_explained_frac, deconv_active, deconv_share)` for candidate `cid`:
-/// the joint residual-explained fraction, whether cid survives the active set, and cid's
-/// fraction of the total demixed abundance (a borrower gets a low share). Returns zeros
-/// when the apex scan or candidate cannot be resolved. Deterministic: peaks in scan order,
-/// candidate columns in sorted `cid` order, ordered reductions.
-#[allow(clippy::too_many_arguments)]
-fn demix_at_apex(
-    idx: Option<&FragIndex>,
-    lib: &Library,
+/// Everything the spectrum-centric NNLS demix (D2, fragment-competition report) derives
+/// from an apex SCAN alone: the co-isolated candidate x fragment-channel design matrix
+/// (rows = the scan's observed peaks, columns = candidates that claim a peak,
+/// `A[peak,cand]` = the candidate's predicted intensity for its matching fragment), the
+/// observed vector, the NNLS solution of `min_{beta>=0} ||A beta - y||^2`, and the
+/// quantities computed from those that do not depend on which candidate is asked about.
+///
+/// This used to be recomputed per CANDIDATE even though the candidate id only selects a
+/// column and gates an early return, so every candidate re-probed every peak of its apex
+/// scan and re-ran the NNLS. Solving once per scan and reading each candidate's column out
+/// is exactly equivalent: nothing above the column read depends on the candidate. The
+/// apex-scan lookup keys on the candidate's `apex_rt`, and the scan it resolves to has
+/// `scan.rt_seconds == apex_rt` by construction, so the RT admission test is
+/// scan-determined too.
+///
+/// Deterministic: peaks in scan order, candidate columns in sorted `cid` order, ordered
+/// reductions.
+struct DemixScan {
+    /// candidate id -> design-matrix column, ascending by id.
+    col_of: std::collections::BTreeMap<u32, usize>,
+    /// Row-major `m x n` design matrix.
+    a: Vec<f64>,
+    /// Observed intensity per row.
+    y: Vec<f64>,
+    m: usize,
+    n: usize,
+    /// NNLS solution, one coefficient per column.
+    beta: Vec<f64>,
+    sum_beta: f64,
+    /// Joint residual-explained fraction `1 - ||y - A beta||^2 / ||y||^2`.
+    explained: f64,
+    /// Per-column abundance seeded from the channels that column claims ALONE (its unique
+    /// ions), NaN where it has none. Feeds the D1 shadow subtraction.
+    a_p: Vec<f64>,
+}
+
+/// The acquisition scan at `apex_rt` whose isolation window covers `prec_mz`, if any.
+/// Two candidates sharing an apex RT but sitting in different windows resolve to
+/// different scans, so this index -- not the RT -- is what a solved problem is keyed by.
+fn demix_apex_scan(
     scans: &[Ms2Scan],
     rt_scan: &HashMap<u64, Vec<u32>>,
-    mass_off: &MassOffset,
-    frag_tol: f64,
-    cid: u32,
     apex_rt: f64,
     prec_mz: f64,
+) -> Option<usize> {
+    rt_scan.get(&apex_rt.to_bits()).and_then(|v| {
+        v.iter()
+            .copied()
+            .find(|&s| {
+                let w = &scans[s as usize].window;
+                w.lower_mz <= prec_mz && prec_mz <= w.upper_mz
+            })
+            .map(|s| s as usize)
+    })
+}
+
+/// Assemble and solve the demix problem for one apex scan. `None` when the scan yields no
+/// usable channels or columns.
+#[allow(clippy::too_many_arguments)]
+fn demix_solve_scan(
+    idx: Option<&FragIndex>,
+    lib: &Library,
+    scan: &Ms2Scan,
+    mass_off: &MassOffset,
+    frag_tol: f64,
+    apex_rt: f64,
     rt_lo: &[f64],
     rt_hi: &[f64],
     cfg: &ExtractConfig,
-) -> (f64, f64, f64, f64, f64) {
-    // Locate the apex scan: an acquisition scan at apex_rt whose isolation window covers
-    // this candidate's precursor.
-    let si = match rt_scan.get(&apex_rt.to_bits()) {
-        Some(v) => v.iter().copied().find(|&s| {
-            let w = &scans[s as usize].window;
-            w.lower_mz <= prec_mz && prec_mz <= w.upper_mz
-        }),
-        None => None,
-    };
-    let scan = match si {
-        Some(s) => &scans[s as usize],
-        None => return (0.0, 0.0, 0.0, 0.0, 0.0),
+) -> Option<DemixScan> {
+    let pr = Prober {
+        fidx: idx,
+        lib,
+        frag_tol,
     };
     let (lo, hi) = lib.candidate_range(scan.window.lower_mz, scan.window.upper_mz);
     // Column set (candidates), deterministic by sorted cid. Rows carry (obs, claimants).
@@ -249,7 +308,7 @@ fn demix_at_apex(
                 }
                 claimants.push((c, frag, pi));
             };
-            probe_matched(idx, lib, frag_tol, q_mz, lo, hi, &mut push);
+            pr.probe(None, q_mz, lo, hi, &mut push);
         }
         if claimants.is_empty() {
             continue;
@@ -267,8 +326,8 @@ fn demix_at_apex(
     }
     let n = col_of.len();
     let m = rows.len();
-    if n == 0 || m == 0 || !col_of.contains_key(&cid) {
-        return (0.0, 0.0, 0.0, 0.0, 0.0);
+    if n == 0 || m == 0 {
+        return None;
     }
     for (k, v) in col_of.values_mut().enumerate() {
         *v = k;
@@ -290,10 +349,7 @@ fn demix_at_apex(
     }
     let lambda = cfg.demix_lambda.max(1e-9);
     let beta = crate::solve::nnls(&a, m, n, &y, lambda, 200 * n.max(1));
-    let c_col = col_of[&cid];
-    let coef = beta[c_col].max(0.0);
     let sum_beta: f64 = beta.iter().sum();
-    let share = if sum_beta > 0.0 { coef / sum_beta } else { 0.0 };
     // Explained fraction = 1 - ||y - A beta||^2 / ||y||^2.
     let (mut num, mut den) = (0.0f64, 0.0f64);
     for (r, &yr) in y.iter().enumerate() {
@@ -310,39 +366,70 @@ fn demix_at_apex(
     } else {
         0.0
     };
-    let active = if coef > 1e-6 { 1.0 } else { 0.0 };
-    // D1 shadow-spectrum: estimate each OTHER candidate's abundance from the channels it
-    // ALONE claims (its unique ions), subtract those contributions from candidate c's
-    // channels, and measure how much of c's observed intensity survives. A real second
-    // peptide keeps most of its signal; a pure borrower is subtracted away. This sidesteps
-    // the shared-peak circularity by seeding abundances from unique ions only. 1.0 (kept
-    // all) when c has no interfering neighbor with unique ions.
-    let shadow_kept = {
-        // Per row, is it a UNIQUE channel (exactly one nonzero column) and whose?
-        let mut a_p = vec![f64::NAN; n]; // per-candidate abundance from its unique rows
-        {
-            // collect unique-row ratios per column, then take the median deterministically.
-            let mut ratios: Vec<Vec<f64>> = vec![Vec::new(); n];
-            for r in 0..m {
-                let mut nz = 0usize;
-                let mut col = 0usize;
-                for j in 0..n {
-                    if a[r * n + j] > 0.0 {
-                        nz += 1;
-                        col = j;
-                    }
-                }
-                if nz == 1 && a[r * n + col] > 0.0 {
-                    ratios[col].push(y[r] / a[r * n + col]);
+    // Per-column abundance from the rows it claims ALONE: collect the unique-row ratios per
+    // column, then take the median deterministically.
+    let mut a_p = vec![f64::NAN; n];
+    {
+        let mut ratios: Vec<Vec<f64>> = vec![Vec::new(); n];
+        for r in 0..m {
+            let mut nz = 0usize;
+            let mut col = 0usize;
+            for j in 0..n {
+                if a[r * n + j] > 0.0 {
+                    nz += 1;
+                    col = j;
                 }
             }
-            for (j, rs) in ratios.iter_mut().enumerate() {
-                if !rs.is_empty() {
-                    rs.sort_by(|x, z| x.partial_cmp(z).unwrap_or(std::cmp::Ordering::Equal));
-                    a_p[j] = rs[rs.len() / 2];
-                }
+            if nz == 1 && a[r * n + col] > 0.0 {
+                ratios[col].push(y[r] / a[r * n + col]);
             }
         }
+        for (j, rs) in ratios.iter_mut().enumerate() {
+            if !rs.is_empty() {
+                rs.sort_by(|x, z| x.partial_cmp(z).unwrap_or(std::cmp::Ordering::Equal));
+                a_p[j] = rs[rs.len() / 2];
+            }
+        }
+    }
+    Some(DemixScan {
+        col_of,
+        a,
+        y,
+        m,
+        n,
+        beta,
+        sum_beta,
+        explained,
+        a_p,
+    })
+}
+
+/// `(deconv_explained_frac, deconv_active, deconv_share, deconv_max_collinearity,
+/// shadow_kept_frac)` for one candidate.
+type DemixFeatures = (f64, f64, f64, f64, f64);
+
+/// Read candidate `cid`'s demix features out of its apex scan's solved problem:
+/// `(deconv_explained_frac, deconv_active, deconv_share, deconv_max_collinearity,
+/// shadow_kept_frac)`. Zeros when the candidate is not one of the scan's columns.
+fn demix_features_for(d: &DemixScan, cid: u32) -> DemixFeatures {
+    let c_col = match d.col_of.get(&cid) {
+        Some(&c) => c,
+        None => return (0.0, 0.0, 0.0, 0.0, 0.0),
+    };
+    let (a, y, m, n) = (&d.a, &d.y, d.m, d.n);
+    let coef = d.beta[c_col].max(0.0);
+    let share = if d.sum_beta > 0.0 {
+        coef / d.sum_beta
+    } else {
+        0.0
+    };
+    let active = if coef > 1e-6 { 1.0 } else { 0.0 };
+    // D1 shadow-spectrum: subtract every OTHER candidate's unique-ion-seeded contribution
+    // from candidate c's channels and measure how much of c's observed intensity survives.
+    // A real second peptide keeps most of its signal; a pure borrower is subtracted away.
+    // This sidesteps the shared-peak circularity by seeding abundances from unique ions
+    // only. 1.0 (kept all) when c has no interfering neighbor with unique ions.
+    let shadow_kept = {
         let (mut kept, mut total) = (0.0f64, 0.0f64);
         for r in 0..m {
             let dc = a[r * n + c_col];
@@ -352,8 +439,8 @@ fn demix_at_apex(
             total += y[r];
             let mut sub = 0.0;
             for j in 0..n {
-                if j != c_col && a_p[j].is_finite() {
-                    sub += a_p[j] * a[r * n + j];
+                if j != c_col && d.a_p[j].is_finite() {
+                    sub += d.a_p[j] * a[r * n + j];
                 }
             }
             kept += (y[r] - sub).max(0.0);
@@ -396,7 +483,7 @@ fn demix_at_apex(
         }
     }
     (
-        explained,
+        d.explained,
         active,
         share,
         max_collin.clamp(0.0, 1.0),
@@ -606,6 +693,10 @@ fn extract_accumulate_windows(
             }
             let mut local: HashMap<u32, Vec<Hit>> = HashMap::new();
             let mut claimants: Vec<(u32, u16, f32)> = Vec::new();
+            // `(lo, hi)` is fixed for this whole isolation window and every scan of it
+            // reprobes the same bins, so cache each bin's narrowed posting range once
+            // instead of binary-searching it per peak.
+            let mut nw = idx.window_narrow(lo, hi);
             for &si in ids {
                 let scan = &scans[si];
                 let rt = scan.rt_seconds;
@@ -614,7 +705,7 @@ fn extract_accumulate_windows(
                     let q_mz = peak.mz / mass_off.factor_at(peak.mz);
                     let obs_mz = peak.mz;
                     claimants.clear();
-                    idx.probe_peak(q_mz, lo, hi, |cid, _pmz, pint, frag| {
+                    idx.probe_peak_win(&mut nw, q_mz, |cid, _pmz, pint, frag| {
                         let c = cid as usize;
                         if rt < rt_lo[c] || rt > rt_hi[c] {
                             return;
@@ -721,6 +812,11 @@ fn extract_twopass_windows(
             .push(si);
     }
     let group_vec: Vec<Vec<usize>> = groups.into_values().collect();
+    let pr = Prober {
+        fidx: idx,
+        lib,
+        frag_tol,
+    };
 
     type Part = (Vec<(u32, Vec<Hit>)>, Vec<(u32, Contested)>);
     let partials: Vec<Part> = group_vec
@@ -735,6 +831,9 @@ fn extract_twopass_windows(
                 return (Vec::new(), Vec::new());
             }
             let mut claimants: Vec<(u32, u16, f32)> = Vec::new();
+            // `(lo, hi)` is fixed for this whole isolation window and both passes
+            // reprobe the same bins across every scan of it, so narrow each bin once.
+            let mut nw = idx.map(|i| i.window_narrow(lo, hi));
             // PASS 1: base accumulation (full peak intensity) for elution profiles.
             let mut acc1: HashMap<u32, Vec<Hit>> = HashMap::new();
             for &si in ids {
@@ -758,7 +857,7 @@ fn extract_twopass_windows(
                             }
                             claimants.push((cid, frag, pi));
                         };
-                        probe_matched(idx, lib, frag_tol, q_mz, lo, hi, &mut push);
+                        pr.probe(nw.as_mut(), q_mz, lo, hi, &mut push);
                     }
                     for &(cid, frag, _) in &claimants {
                         acc1.entry(cid).or_default().push(Hit {
@@ -812,7 +911,7 @@ fn extract_twopass_windows(
                                 }
                                 claimants.push((cid, frag, pi));
                             };
-                            probe_matched(idx, lib, frag_tol, q_mz, lo, hi, &mut push);
+                            pr.probe(nw.as_mut(), q_mz, lo, hi, &mut push);
                         }
                         if claimants.is_empty() {
                             continue;
@@ -883,7 +982,7 @@ fn extract_twopass_windows(
                                 }
                                 claimants.push((cid, frag, pi));
                             };
-                            probe_matched(idx, lib, frag_tol, q_mz, lo, hi, &mut push);
+                            pr.probe(nw.as_mut(), q_mz, lo, hi, &mut push);
                         }
                         if claimants.is_empty() {
                             continue;
@@ -994,7 +1093,7 @@ fn extract_twopass_windows(
                                 }
                                 claimants.push((cid, frag, pi));
                             };
-                            probe_matched(idx, lib, frag_tol, q_mz, lo, hi, &mut push);
+                            pr.probe(nw.as_mut(), q_mz, lo, hi, &mut push);
                         }
                         if claimants.is_empty() {
                             continue;
@@ -1066,7 +1165,7 @@ fn extract_twopass_windows(
                             }
                             claimants.push((cid, frag, pi));
                         };
-                        probe_matched(idx, lib, frag_tol, q_mz, lo, hi, &mut push);
+                        pr.probe(nw.as_mut(), q_mz, lo, hi, &mut push);
                     }
                     if claimants.is_empty() {
                         continue;
@@ -1328,7 +1427,7 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
 
     // fragindex backend, built once at the learned fragment tolerance when selected
     // (`MatcherKind::Fragindex`); otherwise the bucketed `Library::page_search` path
-    // is used. `probe_matched` dispatches on this per peak.
+    // is used. `Prober::probe` dispatches on this per peak.
     let fidx =
         matches!(p.cfg.matcher, MatcherKind::Fragindex).then(|| FragIndex::build(&lib, frag_tol));
 
@@ -1361,6 +1460,11 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
             // strategy (Winner/Proportional/None).
             acc = extract_accumulate_windows(idx, &scans, &rt_lo, &rt_hi, &mass_off, p.cfg);
         } else {
+            let pr = Prober {
+                fidx: fidx.as_ref(),
+                lib: &lib,
+                frag_tol,
+            };
             for scan in &scans {
                 let (lo, hi) = lib.candidate_range(scan.window.lower_mz, scan.window.upper_mz);
                 if hi <= lo {
@@ -1387,7 +1491,7 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
                             }
                             claimants.push((cid, frag, pi));
                         };
-                        probe_matched(fidx.as_ref(), &lib, frag_tol, q_mz, lo, hi, &mut push);
+                        pr.probe(None, q_mz, lo, hi, &mut push);
                     }
                     if claimants.is_empty() {
                         continue;
@@ -2089,25 +2193,12 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
 
             // Spectrum-centric NNLS demixing at the selected apex (D2). Non-destructive:
             // emits interference-corrected features only. Gated; zero when off.
+            //
+            // Filled in a second pass below, not here: the whole problem is a function of
+            // the apex SCAN, so solving it inside this per-candidate loop re-probed every
+            // peak of that scan and re-ran the NNLS once per candidate sharing it.
             let (deconv_explained, deconv_active, deconv_share, deconv_collin, deconv_shadow) =
-                if p.cfg.emit_demix_features {
-                    demix_at_apex(
-                        fidx.as_ref(),
-                        &lib,
-                        &scans,
-                        &rt_scan,
-                        &mass_off,
-                        frag_tol,
-                        cid,
-                        apex_rt,
-                        c.precursor_mz,
-                        &rt_lo,
-                        &rt_hi,
-                        p.cfg,
-                    )
-                } else {
-                    (0.0, 0.0, 0.0, 0.0, 0.0)
-                };
+                (0.0, 0.0, 0.0, 0.0, 0.0);
 
             let rank0 = CandOut {
                 cid,
@@ -2244,6 +2335,78 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
             out
         })
         .collect();
+
+    // Spectrum-centric NNLS demixing (D2), second pass: solve ONCE PER APEX SCAN.
+    //
+    // The design matrix, the observed vector and the NNLS solution depend only on the apex
+    // scan; the candidate id merely selects a column. Solving inside the per-candidate loop
+    // above therefore re-probed every peak of a scan, and re-ran the NNLS, once for every
+    // candidate that apexed in it -- on a wide-window run that is a second full pass over
+    // the spectra. Grouping by resolved scan index collapses it to one solve per scan.
+    //
+    // Exactly the same numbers as the per-candidate version: `demix_solve_scan` reproduces
+    // the assembly verbatim, `demix_features_for` reproduces the per-candidate reads, and
+    // the group key is the same scan the old code resolved from `(apex_rt, precursor_mz)`.
+    // Rows are patched by candidate id, so `results`' order is untouched.
+    let mut results = results;
+    if p.cfg.emit_demix_features {
+        // Which candidates need a demix, grouped by the scan that serves them. BTreeMap so
+        // the scan iteration order is deterministic.
+        let mut by_scan: BTreeMap<usize, Vec<u32>> = BTreeMap::new();
+        for r in results.iter().flatten() {
+            if r.peak_rank != 0 {
+                continue;
+            }
+            let prec_mz = r.mz;
+            if let Some(si) = demix_apex_scan(&scans, &rt_scan, r.apex_rt, prec_mz) {
+                by_scan.entry(si).or_default().push(r.cid);
+            }
+        }
+        let n_scans = by_scan.len();
+        let n_cands: usize = by_scan.values().map(|v| v.len()).sum();
+        let scan_jobs: Vec<(usize, Vec<u32>)> = by_scan.into_iter().collect();
+        let solved: Vec<Vec<(u32, DemixFeatures)>> = scan_jobs
+            .par_iter()
+            .map(|(si, cids)| {
+                let scan = &scans[*si];
+                match demix_solve_scan(
+                    fidx.as_ref(),
+                    &lib,
+                    scan,
+                    &mass_off,
+                    frag_tol,
+                    scan.rt_seconds,
+                    &rt_lo,
+                    &rt_hi,
+                    p.cfg,
+                ) {
+                    Some(d) => cids
+                        .iter()
+                        .map(|&cid| (cid, demix_features_for(&d, cid)))
+                        .collect(),
+                    None => Vec::new(),
+                }
+            })
+            .collect();
+        let feats: HashMap<u32, (f64, f64, f64, f64, f64)> = solved.into_iter().flatten().collect();
+        info!(
+            scans_solved = n_scans,
+            candidates = n_cands,
+            "extract: demix features (one NNLS per apex scan)"
+        );
+        for r in results.iter_mut().flatten() {
+            if r.peak_rank != 0 {
+                continue;
+            }
+            if let Some(&(expl, act, share, collin, shadow)) = feats.get(&r.cid) {
+                r.deconv_explained = expl as f32;
+                r.deconv_active = act as f32;
+                r.deconv_share = share as f32;
+                r.deconv_collin = collin as f32;
+                r.deconv_shadow = shadow as f32;
+            }
+        }
+    }
 
     // Append results in the deterministic cand_ids order (parallel work above was
     // order-preserving via `collect`), reproducing the serial push order exactly.

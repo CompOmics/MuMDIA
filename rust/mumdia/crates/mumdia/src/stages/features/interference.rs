@@ -306,17 +306,14 @@ pub fn values(e: &Evidence) -> Vec<f64> {
     // ---- 18. apex_purity ----
     let mut num18 = 0.0;
     let mut den18 = 0.0;
-    for f in 0..k {
-        if f >= e.traces.len() {
-            continue;
-        }
-        let v = if e.apex_idx < e.traces[f].len() {
-            e.traces[f][e.apex_idx]
+    for (trace, &corr) in e.traces.iter().zip(corr_ref.iter()).take(k) {
+        let v = if e.apex_idx < trace.len() {
+            trace[e.apex_idx]
         } else {
             0.0
         };
         den18 += v;
-        if corr_ref[f] >= COHERENT_THR {
+        if corr >= COHERENT_THR {
             num18 += v;
         }
     }
