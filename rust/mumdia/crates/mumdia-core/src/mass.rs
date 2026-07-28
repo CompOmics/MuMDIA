@@ -20,6 +20,12 @@ pub fn unimod_mass(name: &str) -> Option<f64> {
         "Methyl" => 14.015_650_064,
         "Dimethyl" => 28.031_300_128,
         "Carbamyl" => 43.005_813_726,
+        // Cysteine prenylation (UniMod 44/48/376). Deltas are the monoisotopic
+        // composition masses: Farnesyl C15H24, GeranylGeranyl C20H32,
+        // Hydroxyfarnesyl C15H24O. Enables a FASTA/imported prenylation search.
+        "Farnesyl" => 204.187_801_1,
+        "GeranylGeranyl" => 272.250_401_2,
+        "Hydroxyfarnesyl" => 220.182_715_7,
         _ => return None,
     };
     Some(m)

@@ -4,6 +4,10 @@ real species-flagged protein identifiers (e.g. ALBU_HUMAN, ..._YEAST, ..._ECOLI)
 needed for the ProteoBench species-ratio metric. Emits lib_precursors +
 lib_fragments; run make_shift_decoys.py afterwards to add the decoy population.
 
+Mapped modifications: Carbamidomethyl (UniMod:4), Oxidation (35), and the three
+cysteine prenylations Farnesyl (44), GeranylGeranyl (48), Hydroxyfarnesyl (376).
+Precursors carrying any other UniMod are dropped (their names are unmapped).
+
 Usage: python import_diann_lib.py <diann_lib.parquet> <out_precursors.parquet> <out_fragments.parquet>
               [--charge-by-basic-residues]
 
@@ -20,12 +24,27 @@ import numpy as np
 import pandas as pd
 
 
+# DIA-NN UniMod accession -> MuMDIA ProForma name. Carbamidomethyl/Oxidation are
+# the standard pair; the three cysteine prenylations (Farnesyl 44, GeranylGeranyl
+# 48, Hydroxyfarnesyl 376) enable a prenylation search. Each name must also exist
+# in the Rust `unimod_mass` table. Replacement is substring-exact including the
+# closing ")", so "(UniMod:4)" never matches inside "(UniMod:44)".
+_UNIMOD_TO_PROFORMA = {
+    "(UniMod:4)": "[Carbamidomethyl]",
+    "(UniMod:35)": "[Oxidation]",
+    "(UniMod:44)": "[Farnesyl]",
+    "(UniMod:48)": "[GeranylGeranyl]",
+    "(UniMod:376)": "[Hydroxyfarnesyl]",
+}
+# UniMod ids kept at import; any precursor carrying a mod outside this set is dropped.
+_KEPT_UNIMOD_IDS = ("4", "35", "44", "48", "376")
+
+
 def to_proforma(modseq):
-    return (
-        str(modseq)
-        .replace("(UniMod:4)", "[Carbamidomethyl]")
-        .replace("(UniMod:35)", "[Oxidation]")
-    )
+    s = str(modseq)
+    for unimod, name in _UNIMOD_TO_PROFORMA.items():
+        s = s.replace(unimod, name)
+    return s
 
 
 def _fragment_basic_sites(seq_s, typ_s, k_s):
@@ -72,8 +91,10 @@ def main():
     if lt in df.columns:
         df = df[df[lt].astype(str).str.lower().isin(["noloss", "", "none", "nan"])]
     df = df[df["Fragment.Type"].astype(str).str.lower().isin(["b", "y"])]
-    # drop precursors carrying mods we do not map (only Carbamidomethyl/Oxidation).
-    df = df[~df["Modified.Sequence"].astype(str).str.contains(r"\(UniMod:(?!4\)|35\))", regex=True)]
+    # drop precursors carrying any mod we do not map (keep _KEPT_UNIMOD_IDS only).
+    _kept_alt = "|".join(f"{i}\\)" for i in _KEPT_UNIMOD_IDS)
+    df = df[~df["Modified.Sequence"].astype(str).str.contains(
+        rf"\(UniMod:(?!{_kept_alt})", regex=True)]
 
     # Composition-based charge restriction (opt-in). Done before candidate_id
     # assignment so dropped rows never receive an id and n_fragments stays exact.
