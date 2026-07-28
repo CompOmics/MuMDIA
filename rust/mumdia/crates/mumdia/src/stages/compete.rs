@@ -107,23 +107,24 @@ pub fn run(p: CompeteParams) -> Result<u64> {
     let unique_ev_src = unique_evidence_with_source(&t);
     if matches!(p.cfg.mode, CompetitionMode::UniqueEvidence) {
         // The mode keeps any non-winner whose unique evidence >= unique_evidence_min_fragments.
-        // With only the RAW matched-count fallback available, every extracted candidate already
-        // satisfies extract's presence_min_matched (default 3) >= this threshold (default 2), so
-        // nothing is ever removed and the mode is silently identical to CompetitionMode::None.
-        // Say so rather than letting a configured mode quietly do nothing.
-        if let Some((_, src)) = unique_ev_src.as_ref() {
-            if *src == "n_matched_fragments"
-                && p.cfg.unique_evidence_min_fragments <= EXTRACT_PRESENCE_MIN_MATCHED_DEFAULT
-            {
+        // Warn when NOTHING in this run can fall below that threshold, because then the mode is
+        // silently identical to CompetitionMode::None.
+        //
+        // Tested on the VALUES, not on which column the estimate came from. Keying on the
+        // column name missed the common case: `peak_contested_frac` is part of the Extended
+        // feature set unconditionally, so the estimate always reports itself as
+        // "contested-discounted" even when that column is all zeros (competition features off),
+        // which discounts nothing and leaves the raw matched count -- exactly the no-op the
+        // warning exists to announce.
+        if let Some((ev, src)) = unique_ev_src.as_ref() {
+            let thr = p.cfg.unique_evidence_min_fragments as f64;
+            let below = ev.iter().filter(|v| **v < thr).count();
+            if below == 0 {
                 warn!(
                     source = src,
-                    threshold = p.cfg.unique_evidence_min_fragments,
-                    "compete mode=unique_evidence has only the raw matched-count fallback \
-                     available (no unique_fragment_count and no contested fraction), and the \
-                     threshold is at or below extract's presence_min_matched, so every candidate \
-                     passes and NOTHING will be removed - this run is equivalent to mode=none. \
-                     Enable the contested/competition features or raise \
-                     compete.unique_evidence_min_fragments."
+                    threshold = thr,
+                    candidates = ev.len(),
+                    "compete mode=unique_evidence: no candidate's unique evidence falls below                      compete.unique_evidence_min_fragments, so NOTHING will be removed and this                      run is equivalent to mode=none. Enable the contested/competition features                      so the evidence is actually discounted, or raise the threshold."
                 );
             }
         }
@@ -267,11 +268,6 @@ pub fn run(p: CompeteParams) -> Result<u64> {
     );
     Ok(rows)
 }
-
-/// Extract's default `presence_min_matched`. Used only to detect the degenerate
-/// `unique_evidence` configuration below; kept in sync with
-/// `ExtractConfig::default().presence_min_matched`.
-const EXTRACT_PRESENCE_MIN_MATCHED_DEFAULT: usize = 3;
 
 /// Per-candidate unique-fragment evidence for `CompetitionMode::UniqueEvidence`.
 /// Prefers an explicit `unique_fragment_count` column; otherwise approximates it as

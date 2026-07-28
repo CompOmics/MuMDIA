@@ -1041,8 +1041,16 @@ impl Default for QuantConfig {
 }
 
 /// Match-between-runs strategy (Stage D3, `mbr_plan.md`). Default `None` reproduces
-/// the current chain byte-for-byte. Later variants transfer identification evidence
-/// across a run set: `EmpiricalLibrary` builds the consensus anchor library only;
+/// the current chain byte-for-byte.
+///
+/// ONLY `None` VS NOT-`None` IS IMPLEMENTED. The three non-`None` variants are described
+/// below as the intended staging, but no code distinguishes them: every test in the tree is
+/// `strategy != None`, so selecting `RtTransfer` or `Full` today behaves exactly like
+/// `EmpiricalLibrary`. They are kept as the recorded design ladder rather than deleted
+/// because the MBR tier is planned and benchmark-gated (CLAUDE.md); `validate()` warns when
+/// a non-`None` variant is selected so a config cannot quietly expect more than it gets.
+///
+/// Intended staging: `EmpiricalLibrary` builds the consensus anchor library only;
 /// `RtTransfer` adds cross-run expected-RT transfer extraction; `Full` adds
 /// requantification. All require >= 2 runs and a decoy-transfer FDR (see the plan).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -1083,17 +1091,22 @@ pub struct MbrConfig {
     pub min_anchor_runs: usize,
     /// Accept threshold for a transferred identification's transfer q-value.
     pub q_transfer: f64,
-    /// Transfer RT half-window (seconds) around the cross-run-predicted RT. The M2
-    /// leave-target-out residual was ~17 s at p95, ~15x tighter than the search
-    /// window; this is the default so the false-transfer search space stays small.
+    /// NOT YET WIRED. Transfer RT half-window (seconds) around the cross-run-predicted
+    /// RT. The M2 leave-target-out residual was ~17 s at p95, ~15x tighter than the search
+    /// window, which is where this default comes from -- but no code reads this field yet,
+    /// so setting it has no effect. Kept as the recorded design value for the MBR transfer
+    /// tier; `validate()` warns if it is changed from the default. See CLAUDE.md, "MBR
+    /// transfer/re-extraction remains benchmark-gated".
     pub rt_window_s: f64,
-    /// Which decoy-transfer null estimates the false-transfer rate (M4).
+    /// NOT YET WIRED. Which decoy-transfer null would estimate the false-transfer rate
+    /// (M4). No code reads this field yet; `validate()` warns if it is changed.
     pub decoy_transfer: DecoyTransfer,
     /// Minimum correlation of the observed fragment pattern to the empirical
     /// consensus for a transfer to be accepted (interference guard; 0 disables).
     pub consensus_corr_min: f64,
-    /// Requantify already-identified precursors too (fill the matrix), not only
-    /// transferred ones. Only used when `strategy = Full`.
+    /// NOT YET WIRED. Would requantify already-identified precursors too (fill the
+    /// matrix), not only transferred ones, under `strategy = Full`. No code reads this
+    /// field yet; `validate()` warns if it is changed.
     pub requant_all: bool,
     /// Python interpreter for the `mbr_worker.py` sidecar (pandas/pyarrow/numpy;
     /// e.g. the `py312_mumdia` env). Required when `strategy != None`.
