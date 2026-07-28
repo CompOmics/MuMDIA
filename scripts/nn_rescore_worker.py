@@ -44,6 +44,25 @@ Env knobs (all optional):
     MUMDIA_NN_STREAM_GB   = 4        auto-stream when the PIN exceeds this many GB
     MUMDIA_NN_CHUNK       = 250000   PIN rows per read chunk (streaming backend)
     MUMDIA_NN_INIT_SAMPLE = 300000   rows used to pick the init feature (streaming)
+    MUMDIA_NN_EARLY_STOP  = 1        stop self-training once the positive set stabilises
+    MUMDIA_NN_EARLY_STOP_TOL = 0.01  churn tolerance for that stop; 0 means exact equality,
+                                     which measurably never triggers (dropout + retraining
+                                     flips a few borderline PSMs every iteration forever).
+                                     Measured on a 40k pool at iters=10: tol 0.01 -> 1.59x
+                                     for -0.4% peptides (within NN noise); 0.03 -> 2.15x
+                                     for -1.0%; 0.002 -> only 1.06x.
+    MUMDIA_NN_THREADS     = 16       torch CPU threads (0 = leave torch's default)
+    MUMDIA_NN_PREGATHER_GB= 8        pre-gather the fold's training rows when they fit in
+                                     this many GB (one gather per iteration instead of a
+                                     fancy-index copy per minibatch)
+
+Performance notes (measured on a 32-core CPU box, 1.3M-PSM rescore):
+    The MLP is tiny (387->128->64->1, ~58k params) but is executed ~160,500 times
+    (batches x epochs x iters x folds), so wall time is dominated by STEP COUNT, not by
+    model size: cutting the model to 15k params changed runtime by 1.02x, while
+    `ITERS` (linear) and `BATCH` (1.5x from 4096->16384, per-row cost 1.60->1.04 us) do
+    move it. Threads saturate at 16 (32 is slower than 16). The per-minibatch
+    `Xs[idx]` fancy-index gather was ~25% of runtime; `PREGATHER_GB` removes it.
 """
 
 import hashlib
@@ -109,14 +128,36 @@ def main():
     TRAIN_FDR = env_f("MUMDIA_NN_TRAIN_FDR", 0.01)
     N_SEEDS = env_i("MUMDIA_NN_SEEDS", 1)
     CHUNK = env_i("MUMDIA_NN_CHUNK", 250000)
+    EARLY_STOP = env_i("MUMDIA_NN_EARLY_STOP", 1) != 0
+    EARLY_STOP_TOL = env_f("MUMDIA_NN_EARLY_STOP_TOL", 0.01)
+    PREGATHER_GB = env_f("MUMDIA_NN_PREGATHER_GB", 8)
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
     if FOLDS < 2 or ITERS < 1 or EPOCHS < 1 or N_SEEDS < 1:
         raise ValueError("folds>=2, iterations>=1, epochs>=1, and seeds>=1 are required")
 
+    # Torch CPU threads. Measured: the tiny MLP saturates at ~16 threads and is SLOWER at
+    # 32 (oversubscription on small GEMMs), so cap rather than inherit all cores. An
+    # explicit OMP_NUM_THREADS from the caller wins.
+    if DEVICE == "cpu":
+        want = env_i("MUMDIA_NN_THREADS", 16)
+        if "OMP_NUM_THREADS" in os.environ:
+            want = env_i("OMP_NUM_THREADS", want)
+        if want > 0:
+            torch.set_num_threads(max(1, min(want, os.cpu_count() or want)))
+
     stream_env = os.environ.get("MUMDIA_NN_STREAM", "auto").lower()
     filesize = os.path.getsize(pin_path)
+    stream_gb = env_f("MUMDIA_NN_STREAM_GB", 4)
     stream = stream_env in ("1", "on", "true") or (
-        stream_env == "auto" and filesize > env_f("MUMDIA_NN_STREAM_GB", 4) * 1024 ** 3
+        stream_env == "auto" and filesize > stream_gb * 1024 ** 3
+    )
+    # Say WHY a backend was chosen. The auto-threshold is on PIN *text* size, so crossing
+    # ~1M PSMs silently switched to the disk-backed memmap and started requiring a
+    # writable path -- an invisible change of behaviour when it went wrong.
+    print(
+        f"nn_rescore_worker: PIN {filesize / 1024 ** 3:.2f} GB, threshold {stream_gb:.2f} GB, "
+        f"MUMDIA_NN_STREAM={stream_env} -> backend={'stream(memmap)' if stream else 'in-memory'}",
+        flush=True,
     )
 
     header = pd.read_csv(pin_path, sep="\t", nrows=0).columns.tolist()
@@ -147,7 +188,10 @@ def main():
         # ---- streaming memmap backend (mean/std, one text pass) ----
         with open(pin_path, "rb") as fh:
             n = sum(1 for _ in fh) - 1
-        mm_path = out_path + ".feat.mm"
+        # Resolve ABSOLUTELY: this used to be a path relative to the caller's cwd, so a
+        # rescore launched from a different directory failed with a bare
+        # `OSError: [Errno 22]` naming a path it could not create.
+        mm_path = os.path.abspath(out_path + ".feat.mm")
         mm = np.memmap(mm_path, dtype=np.float32, mode="w+", shape=(n, nf))
         y = np.empty(n, np.float32)
         cids = np.empty(n, np.int64)
@@ -193,22 +237,47 @@ def main():
             return self.net(x).squeeze(-1)
 
     def train_model(train_idx, pos_weight, seed):
-        """Minibatch train, drawing each batch's features through `get` (memmap or RAM)."""
+        """Minibatch train the MLP on `train_idx`.
+
+        The training row set is FIXED for all EPOCHS, so its features are gathered ONCE
+        into a contiguous tensor and each minibatch is then a cheap index into that
+        tensor. The previous code fancy-indexed the full feature matrix
+        (`Xs[idx]` / `mm[idx]`) once per minibatch, which measured ~25% of total runtime
+        at production scale. Falls back to the per-batch path when the gathered block
+        would exceed MUMDIA_NN_PREGATHER_GB, so the streaming backend keeps its low-RAM
+        guarantee on very large pools.
+        """
         torch.manual_seed(seed)
         m = MLP(nf, HIDDEN, DROPOUT).to(DEVICE)
         opt = torch.optim.Adam(m.parameters(), lr=LR, weight_decay=WD)
         lossf = nn.BCEWithLogitsLoss(pos_weight=torch.tensor(pos_weight, device=DEVICE))
         idx = np.asarray(train_idx)
+        ntr = len(idx)
+        pregather = (ntr * nf * 4) <= PREGATHER_GB * 1024 ** 3
+        if pregather:
+            Xt = torch.from_numpy(np.ascontiguousarray(get(idx))).to(DEVICE)
+            yt = torch.from_numpy(np.ascontiguousarray(y[idx])).to(DEVICE)
         for _ in range(EPOCHS):
             m.train()
-            perm = idx[np.random.permutation(len(idx))]
-            for i in range(0, len(perm), BATCH):
-                b = perm[i:i + BATCH]
-                Xb = torch.from_numpy(get(b)).to(DEVICE)
-                yb = torch.from_numpy(y[b]).to(DEVICE)
-                opt.zero_grad()
-                lossf(m(Xb), yb).backward()
-                opt.step()
+            # numpy RNG drives the shuffle in both paths, so the training trajectory
+            # stays tied to the existing np.random.seed(seed) stream.
+            order = np.random.permutation(ntr)
+            if pregather:
+                perm_t = torch.from_numpy(order).to(DEVICE)
+                for i in range(0, ntr, BATCH):
+                    b = perm_t[i:i + BATCH]
+                    opt.zero_grad()
+                    lossf(m(Xt[b]), yt[b]).backward()
+                    opt.step()
+            else:
+                perm = idx[order]
+                for i in range(0, ntr, BATCH):
+                    b = perm[i:i + BATCH]
+                    Xb = torch.from_numpy(get(b)).to(DEVICE)
+                    yb = torch.from_numpy(y[b]).to(DEVICE)
+                    opt.zero_grad()
+                    lossf(m(Xb), yb).backward()
+                    opt.step()
         return m
 
     @torch.no_grad()
@@ -249,10 +318,15 @@ def main():
                 positions = np.linspace(0, len(tr_idx) - 1, sample_n, dtype=np.int64)
                 init_idx = tr_idx[positions]
             Xsamp, ysamp = get(init_idx), y[init_idx]
+            # One column at a time, both signs from the SAME column read. This is the
+            # same 2*nf q-value evaluations as before (argsort dominates and is kept
+            # per sign so tie-ordering is unchanged), but it stops re-slicing the
+            # sample matrix twice per feature.
             best_j, best_sign, best_n = 0, 1, -1
             for j in range(nf):
+                col = np.ascontiguousarray(Xsamp[:, j])
                 for sign in (1, -1):
-                    count = n_targets_at(sign * Xsamp[:, j], ysamp, TRAIN_FDR)
+                    count = n_targets_at(sign * col, ysamp, TRAIN_FDR)
                     if count > best_n:
                         best_n, best_j, best_sign = count, j, sign
             score_tr = (best_sign * get_col(tr_idx, best_j)).astype(np.float32)
@@ -260,6 +334,8 @@ def main():
                   f"sign{best_sign:+d} ({best_n}@{TRAIN_FDR:.0%} "
                   f"on {sample_n} training rows)", flush=True)
             model = None
+            prev_pos = None
+            used_iters = 0
             for _ in range(ITERS):
                 q = tda_q(score_tr, ytr)
                 pos = (q <= TRAIN_FDR) & (ytr == 1)
@@ -269,10 +345,31 @@ def main():
                         f"fold {f} selected no positive targets at training FDR "
                         f"{TRAIN_FDR}; use a larger PSM pool or review the feature contract"
                     )
+                # Convergence on the selected positive set (Percolator's criterion). Exact
+                # equality is too strict to ever trigger in practice: dropout plus the
+                # retrained-from-scratch model perturbs scores enough that a handful of
+                # borderline PSMs flip every iteration forever (measured: it never fired
+                # on a 40k pool over 10 iterations). So stop when the CHURN - the symmetric
+                # difference as a fraction of the selected set - falls below a tolerance,
+                # i.e. the training set has stabilised to within noise.
+                # MUMDIA_NN_EARLY_STOP_TOL=0 restores exact-equality; EARLY_STOP=0 disables.
+                if model is not None and prev_pos is not None:
+                    churn = int(np.count_nonzero(pos != prev_pos))
+                    frac = churn / max(1, int(pos.sum()))
+                    print(f"  seed {seed} fold {f}: iter {used_iters} positive-set churn "
+                          f"{churn} ({frac:.3%} of {int(pos.sum())})", flush=True)
+                    if EARLY_STOP and frac <= EARLY_STOP_TOL:
+                        print(f"  seed {seed} fold {f}: converged after {used_iters} "
+                              f"iteration(s) (churn {frac:.3%} <= tol "
+                              f"{EARLY_STOP_TOL:.3%}); skipping "
+                              f"{ITERS - used_iters} remaining", flush=True)
+                        break
+                prev_pos = pos
                 sel = tr_idx[pos | neg]
                 pw = float(neg.sum()) / max(1.0, float(pos.sum()))
                 model = train_model(sel, pw, seed)
                 score_tr = score_idx(model, tr_idx)
+                used_iters += 1
             oof[te_idx] = score_idx(model, te_idx)
             print(f"  seed {seed} fold {f}: train targets@{TRAIN_FDR:.0%} = "
                   f"{n_targets_at(score_tr, ytr, TRAIN_FDR)}", flush=True)
