@@ -324,7 +324,14 @@ pub fn run(p: QuantParams) -> Result<(u64, u64)> {
     }
 
     // Chromatograms grouped by candidate.
-    let ch = Table::read(p.chromatograms)?;
+    // Project: quant reads only these four of the chromatogram table's seven columns, and
+    // the table is the largest artifact in the run (tens of millions of rows with two big
+    // list columns). Unprojected, frag_mz / frag_obs_mz / predicted_intensity were decoded
+    // and held for nothing.
+    let ch = Table::read_cols(
+        p.chromatograms,
+        &["candidate_id", "frag_name", "rt", "intensity"],
+    )?;
     let ch_cid = ch.u32("candidate_id")?;
     let ch_name = ch.str("frag_name")?;
     let ch_rt = ch.list_f32("rt")?;

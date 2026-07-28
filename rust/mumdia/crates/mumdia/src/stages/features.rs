@@ -690,7 +690,20 @@ pub fn run(p: FeaturesParams) -> Result<u64> {
         .unwrap_or_else(|_| vec![None; ps.nrows]);
 
     // Group chromatograms by candidate_id.
-    let ch = Table::read(p.chromatograms)?;
+    // Project explicitly. features uses all of these; naming them means a future extra
+    // column in the artifact is not silently decoded on this hot path.
+    let ch = Table::read_cols(
+        p.chromatograms,
+        &[
+            "candidate_id",
+            "frag_name",
+            "frag_mz",
+            "frag_obs_mz",
+            "predicted_intensity",
+            "rt",
+            "intensity",
+        ],
+    )?;
     let ch_cid = ch.u32("candidate_id")?;
     let ch_name = ch.str("frag_name")?;
     let ch_fmz = ch.f64("frag_mz")?;
