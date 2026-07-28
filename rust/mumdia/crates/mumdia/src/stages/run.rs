@@ -104,8 +104,8 @@ pub fn run(p: RunParams) -> Result<()> {
                 lib_fragments = lf,
                 "run: library-input mode (skipping digest/peptidoforms/predict-frag)"
             );
-            let np = mumdia_io::table::Table::read(lp)?.nrows as u64;
-            let nf = mumdia_io::table::Table::read(lf)?.nrows as u64;
+            let np = mumdia_io::table::nrows(lp)?;
+            let nf = mumdia_io::table::nrows(lf)?;
             man.record(record_artifact(
                 artifact::FRAGMENT_LIBRARY_PRECURSORS.0,
                 artifact::FRAGMENT_LIBRARY_PRECURSORS,
@@ -211,7 +211,7 @@ pub fn run(p: RunParams) -> Result<()> {
         ),
         ("ms2_to_ms1", artifact::MS2_TO_MS1, &co.ms2_to_ms1),
     ] {
-        let rows = mumdia_io::table::Table::read(path)?.nrows as u64;
+        let rows = mumdia_io::table::nrows(path)?;
         man.record(record_artifact(name, schema, path, rows, "convert", &ch)?);
     }
 
@@ -265,7 +265,7 @@ pub fn run(p: RunParams) -> Result<()> {
         // RT calibration and extraction. Replace the base-library manifest entry
         // so provenance points at the downstream input instead of only at the
         // pre-fine-tune table.
-        let n_ft = mumdia_io::table::Table::read(&lib_p_ft)?.nrows as u64;
+        let n_ft = mumdia_io::table::nrows(&lib_p_ft)?;
         man.record(record_artifact(
             artifact::FRAGMENT_LIBRARY_PRECURSORS.0,
             artifact::FRAGMENT_LIBRARY_PRECURSORS,
@@ -445,7 +445,7 @@ pub fn run(p: RunParams) -> Result<()> {
         "quant",
         &ch,
     )?);
-    let n_frag_quant = mumdia_io::table::Table::read(&frag_q)?.nrows as u64;
+    let n_frag_quant = mumdia_io::table::nrows(&frag_q)?;
     man.record(record_artifact(
         artifact::FRAGMENT_QUANT.0,
         artifact::FRAGMENT_QUANT,

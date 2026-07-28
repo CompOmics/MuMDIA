@@ -225,6 +225,17 @@ pub struct Table {
     pub nrows: usize,
 }
 
+/// Row count straight from the parquet footer metadata, without decoding any column
+/// data. `Table::read(path)?.nrows` materialises the whole file (hundreds of millions of
+/// rows for a fragment library) just to learn its length; use this instead whenever only
+/// the count is needed.
+pub fn nrows(path: &str) -> Result<u64> {
+    let file = std::fs::File::open(path).with_context(|| format!("opening {path}"))?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+        .with_context(|| format!("reading parquet footer {path}"))?;
+    Ok(builder.metadata().file_metadata().num_rows() as u64)
+}
+
 impl Table {
     pub fn read(path: &str) -> Result<Table> {
         let file = std::fs::File::open(path).with_context(|| format!("opening {path}"))?;

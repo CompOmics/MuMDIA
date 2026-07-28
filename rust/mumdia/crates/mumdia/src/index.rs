@@ -64,13 +64,20 @@ impl Library {
         let protein = pt.str("protein")?;
         crate::fdr::validate_labels(&label)?;
 
+        let ncand = pt.nrows;
+        // The typed getters above returned owned Vecs, so the decoded Arrow batches are
+        // dead weight from here on. Release them before the fragment table is read:
+        // holding both tables plus every derived Vec is what makes library load the peak-
+        // RSS wall (the fragment table alone is ~23 GB of Arrow batches at 657M rows).
+        drop(pt);
+
         let ft = Table::read(fragments)?;
         let f_cid = ft.u32("candidate_id")?;
         let f_mz = ft.f64("mz")?;
         let f_int = ft.f32("predicted_intensity")?;
-        let f_name = ft.str("name")?;
-
-        let ncand = pt.nrows;
+        let mut f_name = ft.str("name")?;
+        let n_frag_rows = ft.nrows;
+        drop(ft);
         // Precondition: candidate_id is the contiguous, row-aligned range 0..ncand
         // (the library + decoy builders guarantee this). An external library that
         // violates it would misgroup fragments or panic on the index below, so
@@ -87,7 +94,7 @@ impl Library {
         }
         // Group fragments by candidate_id, preserving stored order.
         let mut per_cand_frags: Vec<Vec<usize>> = vec![Vec::new(); ncand];
-        for (i, &candidate_id) in f_cid.iter().enumerate().take(ft.nrows) {
+        for (i, &candidate_id) in f_cid.iter().enumerate().take(n_frag_rows) {
             let c = candidate_id as usize;
             if c >= ncand {
                 anyhow::bail!(
@@ -98,9 +105,9 @@ impl Library {
         }
 
         let mut cands = Vec::with_capacity(ncand);
-        let mut frag_mz = Vec::with_capacity(ft.nrows);
-        let mut frag_int = Vec::with_capacity(ft.nrows);
-        let mut frag_name = Vec::with_capacity(ft.nrows);
+        let mut frag_mz = Vec::with_capacity(n_frag_rows);
+        let mut frag_int = Vec::with_capacity(n_frag_rows);
+        let mut frag_name = Vec::with_capacity(n_frag_rows);
         let mut prec_mz = Vec::with_capacity(ncand);
 
         for c in 0..ncand {
@@ -108,7 +115,16 @@ impl Library {
             for &fi in &per_cand_frags[c] {
                 frag_mz.push(f_mz[fi]);
                 frag_int.push(f_int[fi]);
-                frag_name.push(f_name[fi].clone());
+                // MOVE the name out of the source vector rather than cloning it: each
+                // fragment name was otherwise heap-allocated twice (once by `Table::str`
+                // and again here), i.e. two live copies of every name in the library at
+                // peak. `f_name` is dropped right after this loop.
+                // NOTE: the deeper cost is `Vec<String>` itself -- 24 bytes of String
+                // struct per fragment regardless of content, ~16 GB at 657M fragments per
+                // copy. Interning names to `Vec<u16>` + a dictionary is the real fix, but
+                // it changes the public `Library::frag_name` contract and its consumers,
+                // so it is left as a separate change.
+                frag_name.push(std::mem::take(&mut f_name[fi]));
             }
             let n = frag_mz.len() - start;
             cands.push(Candidate {
@@ -126,6 +142,10 @@ impl Library {
             });
             prec_mz.push(pmz[c]);
         }
+        // Names have all been moved out; free the (now empty) source vector and the
+        // per-candidate grouping before the index build allocates `entries`.
+        drop(f_name);
+        drop(per_cand_frags);
 
         // Precondition for `candidate_range`: precursors ascending by m/z. The
         // fragment-index `partition_point` search over `prec_mz` assumes this;
@@ -158,7 +178,7 @@ impl Library {
         }
 
         // Build flat index entries.
-        let mut entries: Vec<(f32, u32, f32)> = Vec::with_capacity(ft.nrows);
+        let mut entries: Vec<(f32, u32, f32)> = Vec::with_capacity(n_frag_rows);
         for cd in cands.iter().take(ncand) {
             for k in 0..cd.n_frag {
                 let gi = cd.frag_start + k;
