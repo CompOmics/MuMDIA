@@ -1186,6 +1186,27 @@ impl Default for RescoreConfig {
 // Top-level config
 // ---------------------------------------------------------------------------
 
+/// How many DeepLC fine-tunes an experiment pays for.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FinetuneScope {
+    /// Fine-tune DeepLC once, on the FIRST run's confident seeds, and reuse that
+    /// library for every run. Each run still fits its OWN retention-time calibration
+    /// (LOESS by default) on top of it, which is what absorbs run-to-run
+    /// chromatographic drift. Default: the fine-tune is by far the most expensive step
+    /// of a large experiment (tens of minutes per run), so paying it once instead of N
+    /// times is the difference between hours and days on an 80-run batch.
+    #[default]
+    FirstRunOnly,
+    /// Fine-tune separately for every run. Adapts the model weights to each run's own
+    /// chromatography rather than only calibrating a shared model, which measured
+    /// slightly more identifications on a 6-run set (+0.9%, FDR-safe, versus reusing a
+    /// STALE fine-tune from another dataset -- an upper bound on the loss here, since
+    /// `FirstRunOnly` reuses a fine-tune from the same experiment and still calibrates
+    /// per run). Costs one full DeepLC fine-tune per run.
+    PerRun,
+}
+
 /// Options for the experiment-wide orchestrator (`mumdia run-experiment`).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -1200,11 +1221,17 @@ pub struct ExperimentConfig {
     /// large-memory machine. Results are unaffected: chunks are processed in index
     /// order and completion order never reaches the output.
     pub parallel_runs: usize,
+    /// Whether the DeepLC fine-tune runs once for the experiment or once per run.
+    /// Only consulted when `rt_im_train.finetune_deeplc` is set.
+    pub finetune_scope: FinetuneScope,
 }
 
 impl Default for ExperimentConfig {
     fn default() -> Self {
-        Self { parallel_runs: 1 }
+        Self {
+            parallel_runs: 1,
+            finetune_scope: FinetuneScope::FirstRunOnly,
+        }
     }
 }
 
@@ -1406,6 +1433,25 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn experiment_finetune_scope_defaults_to_first_run_only() {
+        // The expensive default must be the cheap one: paying a DeepLC fine-tune per run
+        // is hours-to-days on a large experiment, and each run calibrates itself anyway.
+        assert_eq!(
+            Config::default().experiment.finetune_scope,
+            FinetuneScope::FirstRunOnly
+        );
+        let c = Config::from_json("{}").expect("empty config parses");
+        assert_eq!(c.experiment.finetune_scope, FinetuneScope::FirstRunOnly);
+        let c = Config::from_json(r#"{"experiment":{"finetune_scope":"per_run"}}"#)
+            .expect("per_run parses");
+        assert_eq!(c.experiment.finetune_scope, FinetuneScope::PerRun);
+        // Old configs that predate the section keep working.
+        let c = Config::from_json(r#"{"experiment":{"parallel_runs":3}}"#).expect("parses");
+        assert_eq!(c.experiment.parallel_runs, 3);
+        assert_eq!(c.experiment.finetune_scope, FinetuneScope::FirstRunOnly);
+    }
 
     #[test]
     fn experiment_parallel_runs_defaults_to_sequential() {

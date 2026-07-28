@@ -4,20 +4,25 @@
 //! cross-run LFQ. This reifies the multi-run flow that was previously a manual
 //! script sequence, keeping the rescuable-tier MBR first-class.
 //!
-//! The library is built or imported once and shared. Each run gets its own
-//! optional DeepLC fine-tune (RT is per-run), its own extraction (chromatograms
-//! kept for quantification), and its own competed table. The competed tables of
-//! all runs feed one rescore so the classifier and FDR are experiment-wide.
+//! The library is built or imported once and shared. Each run gets its own retention-time
+//! calibration, its own extraction (chromatograms kept for quantification), and its own
+//! competed table. The competed tables of all runs feed one rescore so the classifier and
+//! FDR are experiment-wide.
+//!
+//! The DeepLC fine-tune defaults to running ONCE, on the first run, with every other run
+//! reusing that library and fitting its own calibration against it
+//! (`experiment.finetune_scope`). It is the most expensive step of a large experiment, and
+//! per-run weight adaptation buys little once each run is calibrated separately.
 
 use std::time::Instant;
 
 use anyhow::Result;
 use arrow::array::{Array, BooleanArray, UInt32Array};
 use arrow::compute::filter_record_batch;
-use mumdia_core::config::{Config, QuantQColumn};
+use mumdia_core::config::{Config, FinetuneScope, QuantQColumn};
 use rayon::prelude::*;
 use serde_json::json;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::stages::*;
 
@@ -85,8 +90,12 @@ fn preflight(p: &RunExperimentParams) -> Result<()> {
 }
 
 /// The per-run search chain: convert -> seed -> optional fine-tune -> rt-cal ->
-/// extract -> features -> compete. Returns (competed_path, chrom_path). The
-/// chromatograms are kept for the later per-run quantification.
+/// extract -> features -> compete. The chromatograms are kept for the later per-run
+/// quantification.
+/// `shared_ft` is a precursor library that has ALREADY been
+/// DeepLC-fine-tuned (by an earlier run of this same experiment); when present this run
+/// uses it as-is instead of fine-tuning again, and still fits its own retention-time
+/// calibration on top. Returns `(competed, chromatograms, fine_tuned_library_if_produced)`.
 #[allow(clippy::too_many_arguments)]
 fn process_run(
     cfg: &Config,
@@ -97,7 +106,8 @@ fn process_run(
     out: &str,
     top_peaks_ms2: usize,
     max_spectra: usize,
-) -> Result<(String, String)> {
+    shared_ft: Option<&str>,
+) -> Result<(String, String, Option<String>)> {
     let d = |name: &str| format!("{out}/{name}");
     std::fs::create_dir_all(out).ok();
     // Fold the conversion caps into the convert artifacts' provenance key, exactly as
@@ -129,8 +139,15 @@ fn process_run(
         bucket_size: cfg.extract.bucket_size,
         config_hash: ch,
     })?;
-    // Per-run DeepLC fine-tune (RT is per-run); reuse the base library otherwise.
-    let lib_p = if cfg.rt_im_train.finetune_deeplc {
+    // DeepLC fine-tune. Under `FinetuneScope::FirstRunOnly` the caller hands every run
+    // after the first the library the first run produced, so the fine-tune -- the most
+    // expensive step in the whole experiment -- is paid once. Run-to-run chromatographic
+    // drift is then absorbed by `rt_im_train`'s per-run calibration below, which is fitted
+    // separately for every run regardless.
+    let mut produced_ft: Option<String> = None;
+    let lib_p = if let Some(ft) = shared_ft {
+        ft.to_string()
+    } else if cfg.rt_im_train.finetune_deeplc {
         let python = cfg
             .predict_frag
             .deeplc_python
@@ -152,6 +169,7 @@ fn process_run(
             cfg.rt_im_train.q_train,
             cfg.rt_im_train.finetune_batch,
         )?;
+        produced_ft = Some(lib_p_ft.clone());
         lib_p_ft
     } else {
         lib_p_base.to_string()
@@ -197,7 +215,7 @@ fn process_run(
         cfg: &cfg.compete,
         config_hash: ch,
     })?;
-    Ok((competed, chrom))
+    Ok((competed, chrom, produced_ft))
 }
 
 /// Split an experiment-wide scored table into per-run tables by the `source`
@@ -289,18 +307,66 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
     let par = cfg.experiment.parallel_runs.max(1);
     let mut competed: Vec<String> = Vec::with_capacity(n_runs);
     let mut chroms: Vec<String> = Vec::with_capacity(n_runs);
+
+    // Under `FinetuneScope::FirstRunOnly` (the default) the first run is processed alone so
+    // its DeepLC fine-tune can be handed to all the others. That fine-tune is the most
+    // expensive step in a large experiment -- tens of minutes per run -- so paying it N
+    // times instead of once is the difference between hours and days on an 80-run batch.
+    // Every run still fits its OWN retention-time calibration (LOESS by default) against
+    // that shared library, and that per-run fit is what absorbs chromatographic drift.
+    let share_ft = cfg.rt_im_train.finetune_deeplc
+        && matches!(cfg.experiment.finetune_scope, FinetuneScope::FirstRunOnly)
+        && n_runs > 1;
+    let mut shared_ft: Option<String> = None;
+    let mut first: usize = 0;
+    if share_ft {
+        info!(
+            run = %names[0],
+            n = n_runs,
+            "run-experiment: fine-tuning DeepLC on the first run only; the remaining runs              reuse that library and fit their own RT calibration on it              (experiment.finetune_scope = per_run to fine-tune every run instead)"
+        );
+        let (comp, chrom, ft) = process_run(
+            cfg,
+            &ch,
+            &lib_p_base,
+            &lib_f,
+            &p.mzmls[0],
+            &d(&names[0]),
+            p.top_peaks_ms2,
+            p.max_spectra,
+            None,
+        )?;
+        competed.push(comp);
+        chroms.push(chrom);
+        match ft {
+            Some(path) => {
+                info!(library = %path, "run-experiment: reusing this fine-tuned library for the remaining runs");
+                shared_ft = Some(path);
+            }
+            // Defensive: `share_ft` implies the first run fine-tunes, so this should not
+            // happen. Falling through with `None` means the rest fine-tune themselves --
+            // slower, but never silently wrong.
+            None => warn!(
+                "run-experiment: the first run produced no fine-tuned library; the                  remaining runs will each fine-tune"
+            ),
+        }
+        first = 1;
+    }
+
+    let rest: Vec<usize> = (first..n_runs).collect();
     if par == 1 {
-        for (i, mzml) in p.mzmls.iter().enumerate() {
+        for &i in &rest {
             info!(run = %names[i], i = i + 1, n = n_runs, "run-experiment: per-run chain");
-            let (comp, chrom) = process_run(
+            let (comp, chrom, _) = process_run(
                 cfg,
                 &ch,
                 &lib_p_base,
                 &lib_f,
-                mzml,
+                &p.mzmls[i],
                 &d(&names[i]),
                 p.top_peaks_ms2,
                 p.max_spectra,
+                shared_ft.as_deref(),
             )?;
             competed.push(comp);
             chroms.push(chrom);
@@ -309,11 +375,10 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         info!(
             parallel_runs = par,
             n = n_runs,
-            "run-experiment: per-run chains in parallel (each run can hold tens of GB; \
-             lower experiment.parallel_runs if memory is tight)"
+            "run-experiment: per-run chains in parallel (each run can hold tens of GB;              lower experiment.parallel_runs if memory is tight)"
         );
-        for chunk in (0..n_runs).collect::<Vec<_>>().chunks(par) {
-            let done: Vec<(String, String)> = chunk
+        for chunk in rest.chunks(par) {
+            let done: Vec<(String, String, Option<String>)> = chunk
                 .par_iter()
                 .map(|&i| {
                     info!(run = %names[i], i = i + 1, n = n_runs, "run-experiment: per-run chain");
@@ -326,10 +391,11 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
                         &d(&names[i]),
                         p.top_peaks_ms2,
                         p.max_spectra,
+                        shared_ft.as_deref(),
                     )
                 })
                 .collect::<Result<Vec<_>>>()?;
-            for (comp, chrom) in done {
+            for (comp, chrom, _) in done {
                 competed.push(comp);
                 chroms.push(chrom);
             }
