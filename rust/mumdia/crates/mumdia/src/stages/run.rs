@@ -193,13 +193,25 @@ pub fn run(p: RunParams) -> Result<()> {
 
     // --- per-run artifacts ---
     let spectra_dir = d("spectra");
+    // Fold the conversion caps into the convert artifacts' provenance key, exactly as the
+    // standalone `convert` subcommand does. They change the spectra output but are not part
+    // of the config, so passing the bare config hash here made two runs with different caps
+    // record an identical config_hash for their convert artifacts -- provenance that
+    // disagreed with the standalone entry point for the same inputs.
+    let convert_hash = mumdia_io::hash::blake3_str(&format!(
+        "{}\u{1f}max_spectra={}\u{1f}top_peaks_ms2={}\u{1f}top_peaks_ms1={}",
+        cfg.canonical_json(),
+        p.max_spectra,
+        p.top_peaks_ms2,
+        0
+    ));
     let co = convert::run(convert::ConvertParams {
         mzml: p.mzml,
         out_dir: &spectra_dir,
         max_spectra: p.max_spectra,
         top_peaks_ms2: p.top_peaks_ms2,
         top_peaks_ms1: 0,
-        config_hash: &ch,
+        config_hash: &convert_hash,
     })?;
     for (name, schema, path) in [
         ("spectra_ms1", artifact::SPECTRA_MS1, &co.ms1),

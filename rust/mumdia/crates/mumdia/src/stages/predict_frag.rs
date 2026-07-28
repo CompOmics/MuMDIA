@@ -173,7 +173,9 @@ pub fn run(p: PredictFragParams) -> Result<(u64, u64)> {
     raws.retain(|r| !r.frags.is_empty());
 
     // candidate_id = precursor-m/z sort key (PLAN.md Stage D build step 1).
-    raws.sort_by(|a, b| a.precursor_mz.partial_cmp(&b.precursor_mz).unwrap());
+    // Parallel STABLE sort: rayon's par_sort_by is stable, so ties keep input order exactly
+    // as the serial sort_by did. The fragment index requires this ascending-m/z ordering.
+    raws.par_sort_by(|a, b| a.precursor_mz.partial_cmp(&b.precursor_mz).unwrap());
 
     let n = raws.len();
     let total_frags: usize = raws.iter().map(|r| r.frags.len()).sum();
@@ -307,9 +309,10 @@ fn assign_rt(p: &PredictFragParams, raws: &mut [Raw]) -> Result<String> {
     match p.cfg.rt_predictor {
         RtPredictorKind::Native => {
             let m = NativeRt;
-            for r in raws.iter_mut() {
+            // Per-row and independent (no cross-row reduction) -> bit-identical in parallel.
+            raws.par_iter_mut().for_each(|r| {
                 r.irt = m.predict_irt(&r.parsed);
-            }
+            });
             Ok(m.identity())
         }
         RtPredictorKind::Deeplc => {
@@ -357,9 +360,12 @@ fn assign_intensities(p: &PredictFragParams, raws: &mut [Raw]) -> Result<String>
     match p.cfg.predictor {
         FragPredictorKind::Native => {
             let m = NativeFrag;
-            for r in raws.iter_mut() {
+            // Per-row and independent: each candidate's intensities depend only on its own
+            // parsed peptidoform and fragment list, with no cross-row reduction, so this is
+            // bit-identical in parallel (no float accumulation order to change).
+            raws.par_iter_mut().for_each(|r| {
                 r.frag_int = m.predict_intensities(&r.parsed, &r.frags);
-            }
+            });
             Ok(m.identity())
         }
         FragPredictorKind::Ms2pip => {
@@ -442,13 +448,44 @@ fn assign_intensities(p: &PredictFragParams, raws: &mut [Raw]) -> Result<String>
 /// (ordered maps, no HashMap iteration) and matched to the imported-library
 /// binning in `scripts/import_diann_lib.py`.
 fn fragment_cardinality(cid: &[u32], mz: &[f64]) -> Vec<i32> {
-    use std::collections::{BTreeMap, BTreeSet};
+    // Sort-based count rather than a BTreeMap<bin, BTreeSet<candidate>>: at library scale
+    // (~86M fragment rows) that map allocated a tree node per bin plus a whole set per bin
+    // and did O(log n) descents per row twice over. Sorting (bin, candidate) pairs once and
+    // counting distinct candidates in each run of equal bins is the same computation with
+    // flat memory. Values are unchanged: the bin key and the distinct-precursor-per-bin
+    // definition are identical, and the result stays deterministic (total order on the
+    // sorted pairs, no hashing).
     let bin = |m: f64| (m * 100.0).round() as i64;
-    let mut bins: BTreeMap<i64, BTreeSet<u32>> = BTreeMap::new();
-    for (c, m) in cid.iter().zip(mz) {
-        bins.entry(bin(*m)).or_default().insert(*c);
+    let n = mz.len();
+    let mut pairs: Vec<(i64, u32)> = (0..n).map(|i| (bin(mz[i]), cid[i])).collect();
+    pairs.par_sort_unstable();
+    // Walk each equal-bin run once, counting distinct candidate_ids (sorted, so distinct
+    // == adjacent-different), and record the count against the bin.
+    let mut counts: Vec<(i64, i32)> = Vec::new();
+    let mut i = 0usize;
+    while i < n {
+        let b = pairs[i].0;
+        let mut j = i;
+        let mut distinct = 0i32;
+        let mut last: Option<u32> = None;
+        while j < n && pairs[j].0 == b {
+            if last != Some(pairs[j].1) {
+                distinct += 1;
+                last = Some(pairs[j].1);
+            }
+            j += 1;
+        }
+        counts.push((b, distinct));
+        i = j;
     }
-    mz.iter().map(|m| bins[&bin(*m)].len() as i32).collect()
+    // counts is ascending in `b`, so each row's bin resolves by binary search.
+    mz.iter()
+        .map(|m| {
+            let b = bin(*m);
+            let k = counts.partition_point(|&(bb, _)| bb < b);
+            counts[k].1
+        })
+        .collect()
 }
 
 #[cfg(test)]

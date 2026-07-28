@@ -15,6 +15,7 @@ use mumdia_core::config::{
 use mumdia_core::schema::artifact;
 use mumdia_io::report::ArtifactReport;
 use mumdia_io::table::{write_table, Col, Table};
+use rayon::prelude::*;
 use serde_json::json;
 use tracing::info;
 
@@ -352,19 +353,28 @@ pub fn run(p: QuantParams) -> Result<(u64, u64)> {
     // co-elution detector. Kept keyed by candidate for the consensus estimate.
     let mut win: BTreeMap<u32, (f64, f64, f64)> = BTreeMap::new();
     if p.cfg.bound_peak {
-        for (&c, rows) in &cand_rows {
-            win.insert(
-                c,
-                peak_window(
-                    rows,
-                    &ch_rt,
-                    &ch_int,
-                    p.cfg.peak_fraction,
-                    p.cfg.peak_grace,
-                    apex_by_cid.get(&c).copied(),
-                ),
-            );
-        }
+        // Each candidate's window depends only on its own chromatogram rows, so this is
+        // embarrassingly parallel. Results are collected into a Vec and only then folded
+        // into the BTreeMap, so the map is built from a deterministically ordered sequence
+        // and every float inside `peak_window` is still reduced per candidate in the same
+        // order as before -- bit-identical, not merely equivalent.
+        let computed: Vec<(u32, (f64, f64, f64))> = cand_rows
+            .par_iter()
+            .map(|(&c, rows)| {
+                (
+                    c,
+                    peak_window(
+                        rows,
+                        &ch_rt,
+                        &ch_int,
+                        p.cfg.peak_fraction,
+                        p.cfg.peak_grace,
+                        apex_by_cid.get(&c).copied(),
+                    ),
+                )
+            })
+            .collect();
+        win.extend(computed);
     }
 
     // Consensus mode: peak width is a near-constant instrument/gradient property, so

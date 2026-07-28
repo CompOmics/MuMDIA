@@ -1301,6 +1301,39 @@ impl Config {
                     .into(),
             ));
         }
+        // MBR fields that are accepted and documented but not yet read by any stage. Setting
+        // them has NO effect, which is worse than rejecting them: the run looks configured.
+        // Warn rather than error so existing configs keep parsing (serde uses
+        // deny_unknown_fields, so deleting the fields outright would break them).
+        {
+            let d = MbrConfig::default();
+            let mut inert: Vec<&str> = Vec::new();
+            if (self.mbr.rt_window_s - d.rt_window_s).abs() > f64::EPSILON {
+                inert.push("mbr.rt_window_s");
+            }
+            if self.mbr.decoy_transfer != d.decoy_transfer {
+                inert.push("mbr.decoy_transfer");
+            }
+            if self.mbr.requant_all != d.requant_all {
+                inert.push("mbr.requant_all");
+            }
+            if !inert.is_empty() {
+                tracing::warn!(
+                    fields = ?inert,
+                    "these MBR config fields are parsed but not read by any stage yet, so \
+                     setting them has no effect on this run"
+                );
+            }
+            // Only `strategy == None` vs `!= None` is ever tested, so the non-None variants
+            // are indistinguishable in behaviour.
+            if self.mbr.strategy != MbrStrategy::None {
+                tracing::warn!(
+                    strategy = ?self.mbr.strategy,
+                    "mbr.strategy currently only distinguishes none vs not-none; the \
+                     individual non-none variants behave identically"
+                );
+            }
+        }
         Ok(())
     }
 

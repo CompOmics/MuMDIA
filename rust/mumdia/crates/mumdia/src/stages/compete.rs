@@ -104,7 +104,31 @@ pub fn run(p: CompeteParams) -> Result<u64> {
     // an explicit `unique_fragment_count` feature; otherwise approximates it as
     // matched-fragment count discounted by the contested fraction; None if neither
     // is available (mode then falls back to winner-take-all).
-    let unique_ev = unique_evidence(&t);
+    let unique_ev_src = unique_evidence_with_source(&t);
+    if matches!(p.cfg.mode, CompetitionMode::UniqueEvidence) {
+        // The mode keeps any non-winner whose unique evidence >= unique_evidence_min_fragments.
+        // With only the RAW matched-count fallback available, every extracted candidate already
+        // satisfies extract's presence_min_matched (default 3) >= this threshold (default 2), so
+        // nothing is ever removed and the mode is silently identical to CompetitionMode::None.
+        // Say so rather than letting a configured mode quietly do nothing.
+        if let Some((_, src)) = unique_ev_src.as_ref() {
+            if *src == "n_matched_fragments"
+                && p.cfg.unique_evidence_min_fragments <= EXTRACT_PRESENCE_MIN_MATCHED_DEFAULT
+            {
+                warn!(
+                    source = src,
+                    threshold = p.cfg.unique_evidence_min_fragments,
+                    "compete mode=unique_evidence has only the raw matched-count fallback \
+                     available (no unique_fragment_count and no contested fraction), and the \
+                     threshold is at or below extract's presence_min_matched, so every candidate \
+                     passes and NOTHING will be removed - this run is equivalent to mode=none. \
+                     Enable the contested/competition features or raise \
+                     compete.unique_evidence_min_fragments."
+                );
+            }
+        }
+    }
+    let unique_ev = unique_ev_src.map(|(v, _)| v);
     if matches!(p.cfg.mode, CompetitionMode::UniqueEvidence) && unique_ev.is_none() {
         warn!(
             "compete mode=unique_evidence: no unique_fragment_count / \
@@ -244,14 +268,21 @@ pub fn run(p: CompeteParams) -> Result<u64> {
     Ok(rows)
 }
 
+/// Extract's default `presence_min_matched`. Used only to detect the degenerate
+/// `unique_evidence` configuration below; kept in sync with
+/// `ExtractConfig::default().presence_min_matched`.
+const EXTRACT_PRESENCE_MIN_MATCHED_DEFAULT: usize = 3;
+
 /// Per-candidate unique-fragment evidence for `CompetitionMode::UniqueEvidence`.
 /// Prefers an explicit `unique_fragment_count` column; otherwise approximates it as
 /// `n_matched_fragments * (1 - peak_contested_frac)` (contested-discounted matched
 /// count). The legacy `contested_frac` spelling remains a fallback; raw matched
 /// count is used if neither fraction exists, and `None` if no matched count exists.
-fn unique_evidence(t: &Table) -> Option<Vec<f64>> {
+/// Also reports which column the estimate came from, so the caller can warn when the
+/// weakest fallback would make the mode a silent no-op.
+fn unique_evidence_with_source(t: &Table) -> Option<(Vec<f64>, &'static str)> {
     if let Some(u) = col_f64(t, "unique_fragment_count") {
-        return Some(u);
+        return Some((u, "unique_fragment_count"));
     }
     let nm = col_f64(t, "n_matched_fragments")?;
     let contested = prefer_peak_contested_fraction(
@@ -259,13 +290,14 @@ fn unique_evidence(t: &Table) -> Option<Vec<f64>> {
         col_f64(t, "contested_frac"),
     );
     match contested {
-        Some(cf) => Some(
+        Some(cf) => Some((
             nm.iter()
                 .zip(cf)
                 .map(|(n, c)| n * (1.0 - c).clamp(0.0, 1.0))
                 .collect(),
-        ),
-        None => Some(nm),
+            "contested-discounted n_matched_fragments",
+        )),
+        None => Some((nm, "n_matched_fragments")),
     }
 }
 

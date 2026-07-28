@@ -231,24 +231,37 @@ pub fn run(p: PeptidoformsParams) -> Result<u64> {
         // Variable-mod candidate sites, each with zero-or-one alternatives.
         let mut var_sites: Vec<(usize, Vec<&str>)> = Vec::new();
         for (i, c) in pep.chars().enumerate() {
-            let alternatives: Vec<&str> = variable_rules
+            let mut alternatives: Vec<&str> = variable_rules
                 .iter()
                 .filter_map(|&(residue, name)| (c == residue).then_some(name))
                 .collect();
+            // Deduplicate the per-site alternatives (order-preserving). A config that
+            // lists the same variable modification twice for one residue would otherwise
+            // generate the identical peptidoform more than once. This used to be caught
+            // downstream by hashing every emitted ProForma string into a `seen_forms`
+            // HashSet -- tens of millions of String clones and hashes to guard against a
+            // degenerate config. Deduping the handful of names per site is equivalent and
+            // free: `variable_combos` picks distinct position subsets and one alternative
+            // per chosen position, so once the alternatives are unique every emitted form
+            // is unique by construction.
+            let mut seen_alt = 0usize;
+            while seen_alt < alternatives.len() {
+                if alternatives[..seen_alt].contains(&alternatives[seen_alt]) {
+                    alternatives.remove(seen_alt);
+                } else {
+                    seen_alt += 1;
+                }
+            }
             if !alternatives.is_empty() {
                 var_sites.push((i, alternatives));
             }
         }
 
-        let mut seen_forms: HashSet<String> = HashSet::new();
         for combo in variable_combos(&var_sites, p.cfg.max_variable_mods) {
             let mut mods = fixed.clone();
             mods.extend(combo);
             mods.sort_by_key(|(pos, _)| *pos);
             let form = proforma(pep, &mods);
-            if !seen_forms.insert(form.clone()) {
-                continue;
-            }
             for z in z_lo..=z_hi {
                 id_c.push(next);
                 next += 1;
