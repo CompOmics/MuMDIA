@@ -100,13 +100,24 @@ fn process_run(
 ) -> Result<(String, String)> {
     let d = |name: &str| format!("{out}/{name}");
     std::fs::create_dir_all(out).ok();
+    // Fold the conversion caps into the convert artifacts' provenance key, exactly as
+    // both the standalone `convert` subcommand and single-run `run` do. The caps change
+    // the spectra output but are not part of the config, so the bare config hash made
+    // two experiments with different caps record identical convert provenance.
+    let convert_hash = mumdia_io::hash::blake3_str(&format!(
+        "{}\u{1f}max_spectra={}\u{1f}top_peaks_ms2={}\u{1f}top_peaks_ms1={}",
+        cfg.canonical_json(),
+        max_spectra,
+        top_peaks_ms2,
+        0
+    ));
     let co = convert::run(convert::ConvertParams {
         mzml,
         out_dir: &d("spectra"),
         max_spectra,
         top_peaks_ms2,
         top_peaks_ms1: 0,
-        config_hash: ch,
+        config_hash: &convert_hash,
     })?;
     let seed = d("seed_psms.parquet");
     search_seed::run(search_seed::SearchSeedParams {
