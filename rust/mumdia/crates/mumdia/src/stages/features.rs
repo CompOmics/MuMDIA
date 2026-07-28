@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use mumdia_core::config::{FeatureSet, FeaturesConfig};
 use mumdia_core::constants::{ppm_diff, PROTON};
 use mumdia_core::schema::artifact;
@@ -245,9 +245,73 @@ pub struct FeatureSchema {
 
 impl FeatureSchema {
     pub fn read(artifact_path: &str) -> Result<FeatureSchema> {
-        mumdia_io::json::read_json(&format!("{artifact_path}.schema.json"))
+        let companion = format!("{artifact_path}.schema.json");
+        match mumdia_io::json::read_json::<FeatureSchema>(&companion) {
+            Ok(s) => Ok(s),
+            Err(e) => {
+                // The companion is a convenience, not the source of truth: the feature
+                // column list is recoverable from the parquet's own schema (every column
+                // that is not one of the fixed metadata columns). A missing/corrupt
+                // companion used to abort the run outright -- observed this session when a
+                // competed table was rewritten by an external tool that did not know to
+                // copy the sidecar. Reconstruct instead, and say so.
+                let t = Table::read(artifact_path).with_context(|| {
+                    format!(
+                        "reading {companion} failed ({e}) and the artifact itself could \
+                         not be read to reconstruct the feature schema"
+                    )
+                })?;
+                let feature_columns: Vec<String> = t
+                    .column_names()
+                    .into_iter()
+                    .filter(|c| !NON_FEATURE_COLUMNS.contains(&c.as_str()))
+                    .collect();
+                if feature_columns.is_empty() {
+                    anyhow::bail!(
+                        "reading {companion} failed ({e}) and {artifact_path} contains no \
+                         feature columns to reconstruct it from"
+                    );
+                }
+                tracing::warn!(
+                    companion = %companion,
+                    n_features = feature_columns.len(),
+                    "feature schema companion unreadable; reconstructed the feature list \
+                     from the artifact's own parquet schema"
+                );
+                // schema_id is provenance only; mark it as reconstructed rather than
+                // inventing a hash that would collide with a real one.
+                Ok(FeatureSchema {
+                    feature_columns,
+                    schema_id: "reconstructed-from-parquet".to_string(),
+                })
+            }
+        }
     }
 }
+
+/// Columns of a competed/features artifact that are metadata, not rescoring features.
+/// Used to reconstruct a feature list when the `.schema.json` companion is missing.
+///
+/// Verified against a real artifact: excluding exactly these reproduces the recorded
+/// `feature_columns` list byte-for-byte. Two traps this encodes: `charge` IS a feature
+/// (carried as an f64), while `elution_lo`/`elution_hi` are peak-bound metadata carried
+/// for quantification, not features. Getting either wrong changes the trained population.
+pub const NON_FEATURE_COLUMNS: &[&str] = &[
+    "candidate_id",
+    "peptidoform_id",
+    "base_peptide_id",
+    "peptidoform",
+    "protein",
+    "label",
+    "precursor_mz",
+    "prelim_score",
+    "apex_rt",
+    "elution_lo",
+    "elution_hi",
+    "peak_rank",
+    "source",
+    "unique_evidence",
+];
 
 fn peptide_length(peptidoform: &str) -> i32 {
     // Strip the decoy marker so its letters (D,E,C,O,Y) are not counted as residues.
@@ -986,25 +1050,34 @@ pub fn run(p: FeaturesParams) -> Result<u64> {
         },
     )?;
 
-    // PIN.
-    let feat_matrix: Vec<Vec<f64>> = (0..n)
-        .map(|i| {
-            cols_active
-                .iter()
-                .map(|c| fmap.get(c.as_str()).map(|v| v[i]).unwrap_or(0.0))
-                .collect()
-        })
-        .collect();
-    write_pin(
-        p.out_pin,
-        &cols_active,
-        &cid,
-        &label,
-        &pform,
-        &protein,
-        &mz,
-        &feat_matrix,
-    )?;
+    // PIN. Nothing in the pipeline reads this artifact (`rescore` builds its own PIN for
+    // the sidecars); it exists for external Percolator-style tooling, so it is gated.
+    // When it IS written we resolve each feature column ONCE into a slice reference and
+    // stream rows from those, instead of transposing the whole matrix into a
+    // Vec<Vec<f64>> first: at 1.5M rows x 387 features that transpose allocated ~4.6 GB
+    // and performed ~580M string-keyed HashMap lookups. Byte output is unchanged.
+    if p.cfg.emit_pin {
+        let empty: Vec<f64> = Vec::new();
+        let fcols: Vec<&Vec<f64>> = cols_active
+            .iter()
+            .map(|c| fmap.get(c.as_str()).unwrap_or(&empty))
+            .collect();
+        write_pin(
+            p.out_pin,
+            &cols_active,
+            &cid,
+            &label,
+            &pform,
+            &protein,
+            &mz,
+            &fcols,
+        )?;
+    } else {
+        tracing::debug!(
+            path = %p.out_pin,
+            "features: PIN emission disabled (features.emit_pin = false)"
+        );
+    }
 
     let elapsed = t0.elapsed().as_millis();
     let mut stats = std::collections::BTreeMap::new();
@@ -1587,7 +1660,7 @@ fn write_pin(
     pform: &[String],
     protein: &[String],
     mz: &[f64],
-    feats: &[Vec<f64>],
+    feats: &[&Vec<f64>],
 ) -> Result<()> {
     use std::io::Write as _;
     // Stream row by row through a BufWriter instead of materializing the whole
@@ -1607,10 +1680,13 @@ fn write_pin(
             "cand_{}\t{}\t{}\t{:.5}\t{:.5}\t",
             cid[i], lab, cid[i], mz[i], mz[i]
         )?;
+        // `feats` is now COLUMN-major (one slice per feature, resolved once by the
+        // caller), so the row value is feats[fi][i]. Absent columns are empty slices and
+        // print 0.000000, matching the previous `.unwrap_or(0.0)` behaviour exactly.
         #[allow(clippy::needless_range_loop)]
-        // parallel index into feats[i] bounded by feature_cols
         for fi in 0..feature_cols.len() {
-            write!(w, "{:.6}\t", feats[i][fi])?;
+            let v = feats[fi].get(i).copied().unwrap_or(0.0);
+            write!(w, "{v:.6}\t")?;
         }
         writeln!(w, "-.{}.-\t{}", pform[i], protein[i])?;
     }

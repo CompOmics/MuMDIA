@@ -761,6 +761,12 @@ pub enum GateMode {
 #[serde(default, deny_unknown_fields)]
 pub struct FeaturesConfig {
     pub set: FeatureSet,
+    /// Write the Percolator-style `.pin` text file requested by `--out-pin`. No MuMDIA
+    /// stage consumes it (`rescore` builds its own PIN for the sidecars); it exists for
+    /// external tooling. At 1.5M rows x 387 features it is a ~5.4 GB text write, so set
+    /// this to false to skip it when nothing downstream needs it. Default true, so the
+    /// artifact keeps appearing unless it is explicitly turned off.
+    pub emit_pin: bool,
     pub coelution_corr_threshold: f64,
     pub prec_tol_ppm: f64,
     /// Restrict trace-based features (co-elution, profile, xcorr, interference,
@@ -803,6 +809,7 @@ impl Default for FeaturesConfig {
     fn default() -> Self {
         Self {
             set: t(),
+            emit_pin: true, // preserve the artifact; set false to skip a ~5.4 GB text write
             coelution_corr_threshold: 0.9,
             prec_tol_ppm: 20.0,
             bound_features: true,
