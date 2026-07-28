@@ -44,7 +44,14 @@ struct Best {
 
 pub fn run(p: SearchSeedParams) -> Result<u64> {
     let t0 = Instant::now();
-    let lib = Library::load(p.library_precursors, p.library_fragments, p.bucket_size)?;
+    // See extract: the bucketed index is dead weight on the fragindex path.
+    let build_bucketed = !matches!(p.cfg.matcher, MatcherKind::Fragindex);
+    let lib = Library::load_with(
+        p.library_precursors,
+        p.library_fragments,
+        p.bucket_size,
+        build_bucketed,
+    )?;
     let scans = load_ms2(p.ms2)?;
     info!(
         candidates = lib.n_candidates(),
@@ -376,12 +383,25 @@ fn seed_fragindex_windows(
             .push(si);
     }
     let group_vec: Vec<Vec<usize>> = groups.into_values().collect();
-    let n_cand = idx.n_cand();
+    // Size each worker's scratch to the WIDEST candidate window, not the whole library.
+    // The scratch is indexed window-relative, so 16 B x n_cand per worker (877 MB per
+    // worker at 54.8M candidates) was almost entirely untouched. It grows on demand, so an
+    // underestimate here is safe.
+    let max_window_width = group_vec
+        .iter()
+        .filter_map(|ids| ids.first())
+        .map(|&si| {
+            let w = &scans[si].window;
+            let (lo, hi) = idx.candidate_range(w.lower_mz, w.upper_mz);
+            hi.saturating_sub(lo) as usize + 1
+        })
+        .max()
+        .unwrap_or(1);
 
     let partials: Vec<Vec<(u32, Best)>> = group_vec
         .par_iter()
         .map_init(
-            || SeedScratch::new(n_cand),
+            || SeedScratch::new(max_window_width),
             |scratch, ids| {
                 if ids.is_empty() {
                     return Vec::new();

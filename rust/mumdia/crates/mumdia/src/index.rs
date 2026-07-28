@@ -51,7 +51,24 @@ pub struct Library {
 }
 
 impl Library {
+    /// Load a library and build the bucketed inverted index.
+    ///
+    /// Prefer [`Library::load_with`] and pass `build_bucketed = false` when the caller
+    /// uses the `fragindex` backend (the default), since that backend never reads the
+    /// bucketed arrays and building them costs a full sort of every library fragment.
     pub fn load(precursors: &str, fragments: &str, bucket_size: usize) -> Result<Library> {
+        Self::load_with(precursors, fragments, bucket_size, true)
+    }
+
+    /// As [`Library::load`], but skips the bucketed `page_search` index when
+    /// `build_bucketed` is false. `page_search` already early-returns on an empty index,
+    /// so skipping is safe for callers that only use the fragindex matcher.
+    pub fn load_with(
+        precursors: &str,
+        fragments: &str,
+        bucket_size: usize,
+        build_bucketed: bool,
+    ) -> Result<Library> {
         let pt = Table::read(precursors)?;
         let cid = pt.u32("candidate_id")?;
         let pfid = pt.u32("peptidoform_id")?;
@@ -92,8 +109,13 @@ impl Library {
                 );
             }
         }
-        // Group fragments by candidate_id, preserving stored order.
-        let mut per_cand_frags: Vec<Vec<usize>> = vec![Vec::new(); ncand];
+        // Group fragments by candidate_id, preserving stored order, via a counting sort
+        // into two flat arrays. The previous `Vec<Vec<usize>>` performed one heap
+        // allocation per candidate (54.8M of them on the profiled library) to express a
+        // grouping that a counting sort does with exactly two allocations. Scattering in
+        // ascending row order keeps each candidate's fragments in stored order, so the
+        // resulting layout is identical to before.
+        let mut frag_offsets: Vec<u32> = vec![0; ncand + 1];
         for (i, &candidate_id) in f_cid.iter().enumerate().take(n_frag_rows) {
             let c = candidate_id as usize;
             if c >= ncand {
@@ -101,7 +123,19 @@ impl Library {
                     "fragment row {i} references candidate_id {c} >= precursor count {ncand}"
                 );
             }
-            per_cand_frags[c].push(i);
+            frag_offsets[c + 1] += 1;
+        }
+        for c in 0..ncand {
+            frag_offsets[c + 1] += frag_offsets[c];
+        }
+        let mut frag_order: Vec<u32> = vec![0; n_frag_rows];
+        {
+            let mut cursor = frag_offsets.clone();
+            for (i, &candidate_id) in f_cid.iter().enumerate().take(n_frag_rows) {
+                let c = candidate_id as usize;
+                frag_order[cursor[c] as usize] = i as u32;
+                cursor[c] += 1;
+            }
         }
 
         let mut cands = Vec::with_capacity(ncand);
@@ -112,7 +146,8 @@ impl Library {
 
         for c in 0..ncand {
             let start = frag_mz.len();
-            for &fi in &per_cand_frags[c] {
+            for &fi32 in &frag_order[frag_offsets[c] as usize..frag_offsets[c + 1] as usize] {
+                let fi = fi32 as usize;
                 frag_mz.push(f_mz[fi]);
                 frag_int.push(f_int[fi]);
                 // MOVE the name out of the source vector rather than cloning it: each
@@ -143,9 +178,10 @@ impl Library {
             prec_mz.push(pmz[c]);
         }
         // Names have all been moved out; free the (now empty) source vector and the
-        // per-candidate grouping before the index build allocates `entries`.
+        // grouping arrays before the index build allocates `entries`.
         drop(f_name);
-        drop(per_cand_frags);
+        drop(frag_order);
+        drop(frag_offsets);
 
         // Precondition for `candidate_range`: precursors ascending by m/z. The
         // fragment-index `partition_point` search over `prec_mz` assumes this;
@@ -177,34 +213,41 @@ impl Library {
             );
         }
 
-        // Build flat index entries.
-        let mut entries: Vec<(f32, u32, f32)> = Vec::with_capacity(n_frag_rows);
-        for cd in cands.iter().take(ncand) {
-            for k in 0..cd.n_frag {
-                let gi = cd.frag_start + k;
-                entries.push((frag_mz[gi] as f32, cd.candidate_id, frag_int[gi]));
-            }
-        }
-        // Global sort by fragment m/z. Parallel stable sort: identical result to
-        // the serial stable `sort_by` (same comparator, ties keep input order).
-        entries.par_sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-
-        // Chunk into buckets; within a bucket sort by candidate_id.
+        // Build the bucketed inverted index, unless the caller only uses the fragindex
+        // backend. This is a full copy of every library fragment as a (f32, u32, f32)
+        // triple plus a global sort plus three more full arrays -- at 657M fragments that
+        // is tens of GB and a large fraction of library-load time, all of it dead when
+        // `page_search` is never called. `page_search` early-returns on an empty index.
         let bs = bucket_size.max(1);
-        let mut bucket_min = Vec::new();
-        for chunk_start in (0..entries.len()).step_by(bs) {
-            let end = (chunk_start + bs).min(entries.len());
-            bucket_min.push(entries[chunk_start].0);
-            entries[chunk_start..end].sort_by_key(|e| e.1);
-        }
+        let (mut idx_mz, mut idx_cid, mut idx_int, mut bucket_min) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        if build_bucketed {
+            let mut entries: Vec<(f32, u32, f32)> = Vec::with_capacity(n_frag_rows);
+            for cd in cands.iter().take(ncand) {
+                for k in 0..cd.n_frag {
+                    let gi = cd.frag_start + k;
+                    entries.push((frag_mz[gi] as f32, cd.candidate_id, frag_int[gi]));
+                }
+            }
+            // Global sort by fragment m/z. Parallel stable sort: identical result to
+            // the serial stable `sort_by` (same comparator, ties keep input order).
+            entries.par_sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
 
-        let mut idx_mz = Vec::with_capacity(entries.len());
-        let mut idx_cid = Vec::with_capacity(entries.len());
-        let mut idx_int = Vec::with_capacity(entries.len());
-        for (m, c, i) in entries {
-            idx_mz.push(m);
-            idx_cid.push(c);
-            idx_int.push(i);
+            // Chunk into buckets; within a bucket sort by candidate_id.
+            for chunk_start in (0..entries.len()).step_by(bs) {
+                let end = (chunk_start + bs).min(entries.len());
+                bucket_min.push(entries[chunk_start].0);
+                entries[chunk_start..end].sort_by_key(|e| e.1);
+            }
+
+            idx_mz.reserve(entries.len());
+            idx_cid.reserve(entries.len());
+            idx_int.reserve(entries.len());
+            for (m, c, i) in entries {
+                idx_mz.push(m);
+                idx_cid.push(c);
+                idx_int.push(i);
+            }
         }
 
         Ok(Library {

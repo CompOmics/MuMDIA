@@ -1200,7 +1200,16 @@ fn extract_twopass_windows(
 
 pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
     let t0 = Instant::now();
-    let lib = Library::load(p.library_precursors, p.library_fragments, p.cfg.bucket_size)?;
+    // Skip the bucketed page_search index when the fragindex backend is selected (the
+    // default): it is never read on that path and costs a full sort plus several full
+    // copies of every library fragment.
+    let build_bucketed = !matches!(p.cfg.matcher, MatcherKind::Fragindex);
+    let lib = Library::load_with(
+        p.library_precursors,
+        p.library_fragments,
+        p.cfg.bucket_size,
+        build_bucketed,
+    )?;
 
     // Optional candidate allowlist (gate-first-then-compete): restrict extraction to
     // the accepted survivors of a prior gate-on run so the two-pass peak-claim profile

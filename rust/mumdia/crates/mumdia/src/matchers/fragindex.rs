@@ -194,16 +194,35 @@ pub struct SeedScratch {
     stamp: Vec<u32>,
     touched: Vec<u32>,
     epoch: u32,
+    /// `candidate_id` that maps to slot 0. The arrays are indexed WINDOW-RELATIVE, so
+    /// they only need to span the widest isolation window rather than the whole library:
+    /// sized by `n_cand` they cost 16 B x n_cand PER rayon worker (877 MB per worker on
+    /// the profiled 54.8M-candidate library), almost all of it never touched because a
+    /// worker only ever sees candidates inside one window.
+    base: u32,
 }
 
 impl SeedScratch {
-    pub fn new(n_cand: usize) -> SeedScratch {
+    /// `cap` is the expected maximum candidate-window width, not the library size.
+    /// Passing a smaller value is safe: the arrays grow on demand.
+    pub fn new(cap: usize) -> SeedScratch {
         SeedScratch {
-            count: vec![0; n_cand],
-            obs_sum: vec![0.0; n_cand],
-            stamp: vec![0; n_cand], // 0 is never a live epoch (epoch increments before scan 1)
+            count: vec![0; cap],
+            obs_sum: vec![0.0; cap],
+            stamp: vec![0; cap], // 0 is never a live epoch (epoch increments before scan 1)
             touched: Vec::new(),
             epoch: 0,
+            base: 0,
+        }
+    }
+
+    /// Ensure the window-relative arrays span `width` slots.
+    fn ensure(&mut self, width: usize) {
+        if self.count.len() < width {
+            self.count.resize(width, 0);
+            self.obs_sum.resize(width, 0.0);
+            // New slots must not appear stamped for the current epoch.
+            self.stamp.resize(width, 0);
         }
     }
 
@@ -220,10 +239,14 @@ impl SeedScratch {
     ) {
         self.epoch += 1;
         self.touched.clear();
+        // Index relative to this window's first candidate.
+        self.base = cand_lo;
+        self.ensure((cand_hi.saturating_sub(cand_lo)) as usize + 1);
         let epoch = self.epoch;
+        let base = self.base;
         for &(mz, inten) in peaks {
             idx.probe_peak(mz, cand_lo, cand_hi, |cid, _pmz, _pint, _pfrag| {
-                let cc = cid as usize;
+                let cc = (cid - base) as usize;
                 if self.stamp[cc] != epoch {
                     self.stamp[cc] = epoch;
                     self.count[cc] = 0;
@@ -242,14 +265,17 @@ impl SeedScratch {
         &self.touched
     }
 
+    /// Valid only for candidate ids from the most recent [`SeedScratch::accumulate`]
+    /// window (which is what [`SeedScratch::touched`] returns).
     #[inline]
     pub fn count(&self, cid: u32) -> u32 {
-        self.count[cid as usize]
+        self.count[(cid - self.base) as usize]
     }
 
+    /// See [`SeedScratch::count`] for the validity window.
     #[inline]
     pub fn obs_sum(&self, cid: u32) -> f64 {
-        self.obs_sum[cid as usize]
+        self.obs_sum[(cid - self.base) as usize]
     }
 }
 
