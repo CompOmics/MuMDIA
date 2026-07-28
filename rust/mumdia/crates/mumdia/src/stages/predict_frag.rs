@@ -223,7 +223,7 @@ pub fn run(p: PredictFragParams) -> Result<(u64, u64)> {
             f_cid.push(candidate_id);
             f_mz.push(fr.mz);
             f_int.push(fi);
-            f_name.push(fr.name);
+            f_name.push(fr.name());
             f_type.push(fr.ion_type.symbol().to_string());
             f_ord.push(fr.ordinal as i32);
             f_chg.push(fr.charge);

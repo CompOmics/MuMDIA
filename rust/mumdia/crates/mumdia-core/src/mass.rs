@@ -54,8 +54,20 @@ pub struct Fragment {
     pub ordinal: usize,
     pub charge: i32,
     pub mz: f64,
+}
+
+impl Fragment {
     /// Stable name such as `b3` (charge 1) or `y5^2` (charge 2).
-    pub name: String,
+    ///
+    /// Derived on demand rather than stored: it is a pure function of the three fields
+    /// above, and fragment generation runs over every theoretical ion of every
+    /// peptidoform in the library, of which the top-N truncation then discards the large
+    /// majority. Storing it allocated one `String` per generated ion -- hundreds of
+    /// millions of them on a real library -- almost all only to be dropped. Callers that
+    /// need the text (the library writer) materialise it for the rows they keep.
+    pub fn name(&self) -> String {
+        frag_name(self.ion_type, self.ordinal, self.charge)
+    }
 }
 
 /// A parsed peptidoform: residues plus per-residue and terminal mass deltas.
@@ -106,7 +118,6 @@ impl ParsedPeptidoform {
                     ordinal,
                     charge: z,
                     mz,
-                    name: frag_name(IonType::B, ordinal, z),
                 });
             }
         }
@@ -125,7 +136,6 @@ impl ParsedPeptidoform {
                     ordinal,
                     charge: z,
                     mz,
-                    name: frag_name(IonType::Y, ordinal, z),
                 });
             }
         }
@@ -292,11 +302,11 @@ mod tests {
         let p = parse_peptidoform("PEPTIDE").unwrap();
         let frags = p.fragments(&[1]);
         // no b1, y1, y2
-        assert!(frags.iter().all(|f| f.name != "b1"));
-        assert!(frags.iter().all(|f| f.name != "y1"));
-        assert!(frags.iter().all(|f| f.name != "y2"));
+        assert!(frags.iter().all(|f| f.name() != "b1"));
+        assert!(frags.iter().all(|f| f.name() != "y1"));
+        assert!(frags.iter().all(|f| f.name() != "y2"));
         // y3 should exist for a 7-mer
-        assert!(frags.iter().any(|f| f.name == "y3"));
+        assert!(frags.iter().any(|f| f.name() == "y3"));
     }
 
     #[test]
