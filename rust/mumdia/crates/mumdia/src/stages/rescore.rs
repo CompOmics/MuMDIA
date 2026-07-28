@@ -796,6 +796,28 @@ fn run_entrapment_gbm(
     align_sidecar_scores(&orid, &osc, cid.len(), "entrapment_worker")
 }
 
+/// Owns a spawned sidecar child and kills it on drop unless it was already awaited.
+/// Without this, a `mumdia` process that dies mid-rescore (Ctrl-C, kill, panic) leaves
+/// the Python worker alive holding its feature memmap, and every later rescore then fails
+/// on a file it cannot delete.
+struct ChildGuard(Option<std::process::Child>);
+
+impl ChildGuard {
+    fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        let mut c = self.0.take().expect("child awaited twice");
+        c.wait()
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        if let Some(mut c) = self.0.take() {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+    }
+}
+
 /// Run a PIN-contract Python rescorer sidecar (`mokapot_worker.py` or
 /// `nn_rescore_worker.py`) over a PIN written from the competed set; return scores
 /// aligned to the input candidate order (PLAN.md Section 3.2 file contract). Both
@@ -812,18 +834,35 @@ fn run_pin_sidecar(
     mz: &[f64],
     feats: &[Vec<f64>],
 ) -> Result<Vec<f64>> {
-    use std::fmt::Write as _;
+    use std::io::Write as _;
     let python = p.cfg.python.as_deref().ok_or_else(|| {
         anyhow::anyhow!("classifier sidecar {script_name} requires rescore.python")
     })?;
     std::fs::create_dir_all(p.work_dir).ok();
-    let pin = format!("{}/rescore.pin", p.work_dir);
-    let outp = format!("{}/rescore_sidecar_out.parquet", p.work_dir);
+    // Per-invocation sidecar filenames. Fixed names (`rescore.pin`,
+    // `rescore_sidecar_out.parquet`) made two concurrent rescores clobber each other and
+    // let a killed run's orphaned Python worker hold `*.feat.mm` open forever, so every
+    // later rescore failed with `OSError: [Errno 22]` on a path it did not own. Keying on
+    // the output artifact plus the PID makes collisions impossible, and the guard below
+    // reaps the child so a killed parent cannot orphan it.
+    let tag = format!(
+        "{}_{}",
+        std::path::Path::new(p.out)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("rescore"),
+        std::process::id()
+    );
+    let pin = format!("{}/rescore_{tag}.pin", p.work_dir);
+    let outp = format!("{}/rescore_{tag}_out.parquet", p.work_dir);
 
-    let mut s = String::new();
-    s.push_str("SpecId\tLabel\tScanNr\tExpMass\tCalcMass\t");
-    s.push_str(&feat_names.join("\t"));
-    s.push_str("\tPeptide\tProteins\n");
+    // Stream the PIN through a BufWriter. It was previously accumulated in ONE
+    // un-reserved String: at ~1M rows x 387 features that is a >5 GB allocation (plus
+    // realloc churn) held entirely in RAM before the first byte reaches disk.
+    let mut w = std::io::BufWriter::with_capacity(1 << 20, std::fs::File::create(&pin)?);
+    w.write_all(b"SpecId\tLabel\tScanNr\tExpMass\tCalcMass\t")?;
+    w.write_all(feat_names.join("\t").as_bytes())?;
+    w.write_all(b"\tPeptide\tProteins\n")?;
     // Key the PIN on the unique row index i (SpecId=psm_i, ScanNr=i), NOT
     // candidate_id: candidate_id is the library index and repeats across runs, so
     // an experiment-wide (multi-file) PIN would collide on ScanNr and mokapot's
@@ -832,17 +871,22 @@ fn run_pin_sidecar(
     // mapping is bijective and mokapot does not use SpecId/ScanNr as features).
     for i in 0..cid.len() {
         let lab = if label[i] == "decoy" { -1 } else { 1 };
-        write!(s, "psm_{}\t{}\t{}\t{:.5}\t{:.5}\t", i, lab, i, mz[i], mz[i]).ok();
+        write!(w, "psm_{}\t{}\t{}\t{:.5}\t{:.5}\t", i, lab, i, mz[i], mz[i])?;
         #[allow(clippy::needless_range_loop)] // parallel index into feats[i] bounded by feat_names
         for fi in 0..feat_names.len() {
-            write!(s, "{:.6}\t", feats[i][fi]).ok();
+            write!(w, "{:.6}\t", feats[i][fi])?;
         }
-        writeln!(s, "-.{}.-\t{}", pform[i], protein[i]).ok();
+        writeln!(w, "-.{}.-\t{}", pform[i], protein[i])?;
     }
-    std::fs::write(&pin, s)?;
+    w.flush()?;
+    drop(w);
 
     let script = crate::sidecar::resolve_script(p.script_dir, script_name);
-    let status = std::process::Command::new(python)
+    // Spawn (not `status()`) so the child handle is owned by a guard that kills it if we
+    // unwind or are dropped: a killed `mumdia` used to leave the Python worker running,
+    // holding its multi-GB memmap open, which made every subsequent rescore fail on a
+    // stale lock with no hint about which PID held it.
+    let child = std::process::Command::new(python)
         .arg(&script)
         .arg(&pin)
         .arg(&outp)
@@ -854,7 +898,9 @@ fn run_pin_sidecar(
         .env("MUMDIA_NN_FOLDS", p.cfg.folds.to_string())
         .env("MUMDIA_NN_ITERS", p.cfg.num_iter.to_string())
         .env("MUMDIA_NN_TRAIN_FDR", p.cfg.train_fdr.to_string())
-        .status()?;
+        .spawn()?;
+    let mut guard = ChildGuard(Some(child));
+    let status = guard.wait()?;
     if !status.success() {
         anyhow::bail!("{script_name} exited with {status}");
     }
