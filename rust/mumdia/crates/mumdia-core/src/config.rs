@@ -1190,20 +1190,32 @@ impl Default for RescoreConfig {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FinetuneScope {
-    /// Fine-tune DeepLC once, on the FIRST run's confident seeds, and reuse that
-    /// library for every run. Each run still fits its OWN retention-time calibration
-    /// (LOESS by default) on top of it, which is what absorbs run-to-run
-    /// chromatographic drift. Default: the fine-tune is by far the most expensive step
-    /// of a large experiment (tens of minutes per run), so paying it once instead of N
-    /// times is the difference between hours and days on an 80-run batch.
+    /// Fine-tune DeepLC once, on the FIRST run's confident seeds, and reuse that library
+    /// for every run. Each run still fits its OWN retention-time calibration (LOESS by
+    /// default) on top of it.
+    ///
+    /// MEASURED COST (6-run ProteoBench HYE AIF set, 2026-07-28). Reuse is NOT free: the
+    /// run that owned the fine-tune reached a median |RT residual| of 15.2 s, while the
+    /// five reusing runs reached 20.3, 20.5, 20.9, 24.9 and 25.4 s -- +7.2 s, +47% on
+    /// average -- and their calibrated RT windows widened from 145 s to 179-227 s. The
+    /// degradation is MONOTONIC in acquisition order, i.e. real chromatographic drift that
+    /// a single fine-tune cannot track; per-run LOESS corrects the slope (0.96-0.99) but
+    /// not the scatter. Wider windows also cost compute downstream: extract roughly
+    /// doubled (126 s -> 203-242 s) and features up to tripled (116 s -> 215-388 s),
+    /// which claws back part of the saving.
+    ///
+    /// It is still the default because the fine-tune dominates a large experiment: one
+    /// 36.5 min fine-tune instead of N. On an 80-run batch that is ~48 h saved against
+    /// ~6.5 h of extra extract/features. But on a long batch the drift keeps growing, so
+    /// prefer `PerRun` when the extra hours are affordable, and treat periodic
+    /// re-fine-tuning (not yet implemented) as the better answer for very large batches.
     #[default]
     FirstRunOnly,
     /// Fine-tune separately for every run. Adapts the model weights to each run's own
-    /// chromatography rather than only calibrating a shared model, which measured
-    /// slightly more identifications on a 6-run set (+0.9%, FDR-safe, versus reusing a
-    /// STALE fine-tune from another dataset -- an upper bound on the loss here, since
-    /// `FirstRunOnly` reuses a fine-tune from the same experiment and still calibrates
-    /// per run). Costs one full DeepLC fine-tune per run.
+    /// chromatography instead of only calibrating a shared model, which measurably
+    /// tightens retention time: see the numbers on `FirstRunOnly`. Costs one full DeepLC
+    /// fine-tune per run (36.5 min on the HYE library: 5.7 min training plus 30.8 min
+    /// predicting 4.9M peptidoforms).
     PerRun,
 }
 
