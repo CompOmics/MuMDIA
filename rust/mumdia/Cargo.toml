@@ -24,9 +24,17 @@ arrow = { version = "59", features = ["prettyprint"] }
 parquet = { version = "59", default-features = false, features = ["arrow", "snap"] }
 # Pure-Rust zlib backend (miniz_oxide) instead of zlib-ng-compat (needs cmake).
 mzdata = { version = "0.65", default-features = false, features = ["mzml", "miniz_oxide"] }
+# Per-thread-arena allocator. The extraction accumulation is allocation-heavy and only
+# scaled ~1.07x across cores under the Windows system allocator's shared heap lock;
+# mimalloc is pure Rust (no cmake) and removes that serialisation. No behaviour change.
+mimalloc = { version = "0.1", default-features = false }
 
 [profile.release]
 opt-level = 3
+# Cross-crate inlining. "thin" keeps build times reasonable while still letting the hot
+# per-fragment/per-candidate loops inline across the io/core crate boundaries.
+lto = "thin"
+codegen-units = 1
 
 # arrow-ipc's generated flatbuffer code reliably crashes rustc codegen at
 # opt-level 3 on this Windows toolchain (STATUS_ILLEGAL_INSTRUCTION). MuMDIA

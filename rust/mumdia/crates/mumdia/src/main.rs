@@ -6,6 +6,12 @@ use clap::{Parser, Subcommand};
 use mumdia::stages;
 use mumdia_core::config::Config;
 
+/// Per-thread-arena allocator. The extraction accumulation allocates heavily inside
+/// rayon workers and measured only ~1.07x parallel scaling under the Windows system
+/// allocator's shared heap lock. Swapping the allocator changes no results.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[derive(Parser)]
 #[command(
     name = "mumdia",
