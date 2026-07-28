@@ -15,6 +15,7 @@ use anyhow::Result;
 use arrow::array::{Array, BooleanArray, UInt32Array};
 use arrow::compute::filter_record_batch;
 use mumdia_core::config::{Config, QuantQColumn};
+use rayon::prelude::*;
 use serde_json::json;
 use tracing::info;
 
@@ -264,22 +265,64 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
     };
 
     // --- per-run search chains ---
+    // Runs are independent: `process_run` derives every path from its own per-run output
+    // directory, so nothing is shared between them. Concurrency is OPT-IN and bounded
+    // because each run's extract can hold tens of GB -- running all 83 files of an
+    // experiment at once would exhaust memory long before it saturated the CPU.
+    // `parallel_runs = 1` (the default) is the previous sequential behaviour exactly.
+    //
+    // Ordering: `competed`/`chroms` must stay in run index order, since the downstream
+    // combined rescore keys rows by `source` index. Chunks are processed in order and
+    // rayon's indexed `collect` preserves within-chunk order, so the result is identical
+    // to the sequential build regardless of completion order.
+    let par = cfg.experiment.parallel_runs.max(1);
     let mut competed: Vec<String> = Vec::with_capacity(n_runs);
     let mut chroms: Vec<String> = Vec::with_capacity(n_runs);
-    for (i, mzml) in p.mzmls.iter().enumerate() {
-        info!(run = %names[i], i = i + 1, n = n_runs, "run-experiment: per-run chain");
-        let (comp, chrom) = process_run(
-            cfg,
-            &ch,
-            &lib_p_base,
-            &lib_f,
-            mzml,
-            &d(&names[i]),
-            p.top_peaks_ms2,
-            p.max_spectra,
-        )?;
-        competed.push(comp);
-        chroms.push(chrom);
+    if par == 1 {
+        for (i, mzml) in p.mzmls.iter().enumerate() {
+            info!(run = %names[i], i = i + 1, n = n_runs, "run-experiment: per-run chain");
+            let (comp, chrom) = process_run(
+                cfg,
+                &ch,
+                &lib_p_base,
+                &lib_f,
+                mzml,
+                &d(&names[i]),
+                p.top_peaks_ms2,
+                p.max_spectra,
+            )?;
+            competed.push(comp);
+            chroms.push(chrom);
+        }
+    } else {
+        info!(
+            parallel_runs = par,
+            n = n_runs,
+            "run-experiment: per-run chains in parallel (each run can hold tens of GB; \
+             lower experiment.parallel_runs if memory is tight)"
+        );
+        for chunk in (0..n_runs).collect::<Vec<_>>().chunks(par) {
+            let done: Vec<(String, String)> = chunk
+                .par_iter()
+                .map(|&i| {
+                    info!(run = %names[i], i = i + 1, n = n_runs, "run-experiment: per-run chain");
+                    process_run(
+                        cfg,
+                        &ch,
+                        &lib_p_base,
+                        &lib_f,
+                        &p.mzmls[i],
+                        &d(&names[i]),
+                        p.top_peaks_ms2,
+                        p.max_spectra,
+                    )
+                })
+                .collect::<Result<Vec<_>>>()?;
+            for (comp, chrom) in done {
+                competed.push(comp);
+                chroms.push(chrom);
+            }
+        }
     }
 
     // --- one experiment-wide rescore over all competed tables ---

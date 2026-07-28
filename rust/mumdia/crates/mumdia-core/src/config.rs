@@ -1173,6 +1173,28 @@ impl Default for RescoreConfig {
 // Top-level config
 // ---------------------------------------------------------------------------
 
+/// Options for the experiment-wide orchestrator (`mumdia run-experiment`).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ExperimentConfig {
+    /// How many per-run search chains to execute concurrently.
+    ///
+    /// 1 (default) is strictly sequential, i.e. the historical behaviour. Runs are
+    /// independent, so raising this scales nearly linearly in wall time, but EACH
+    /// concurrent run holds its own extraction working set (tens of GB on a large
+    /// library), so the practical ceiling is memory, not cores. Raise it deliberately
+    /// after checking peak RSS for a single run; 2-4 is a reasonable start on a
+    /// large-memory machine. Results are unaffected: chunks are processed in index
+    /// order and completion order never reaches the output.
+    pub parallel_runs: usize,
+}
+
+impl Default for ExperimentConfig {
+    fn default() -> Self {
+        Self { parallel_runs: 1 }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -1189,6 +1211,8 @@ pub struct Config {
     pub quant: QuantConfig,
     #[serde(default)]
     pub mbr: MbrConfig,
+    #[serde(default)]
+    pub experiment: ExperimentConfig,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -1205,6 +1229,7 @@ impl Default for Config {
             rescore: t(),
             quant: t(),
             mbr: t(),
+            experiment: t(),
         }
     }
 }
@@ -1368,6 +1393,19 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn experiment_parallel_runs_defaults_to_sequential() {
+        // The default must stay 1: concurrent per-run chains multiply peak memory,
+        // so opting in is the caller's decision, and 1 reproduces the historical
+        // sequential orchestrator exactly.
+        assert_eq!(Config::default().experiment.parallel_runs, 1);
+        // Old configs written before the section existed must still parse.
+        let c = Config::from_json("{}").expect("empty config parses");
+        assert_eq!(c.experiment.parallel_runs, 1);
+        let c = Config::from_json(r#"{"experiment":{"parallel_runs":4}}"#).expect("parses");
+        assert_eq!(c.experiment.parallel_runs, 4);
+    }
 
     #[test]
     fn default_roundtrips() {
