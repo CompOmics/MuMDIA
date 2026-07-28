@@ -29,6 +29,7 @@ os.environ["NUMEXPR_NUM_THREADS"] = "1"
 
 import argparse
 import re
+import time
 import deeplc                                    # import before numpy (OpenMP load order)
 import numpy as np
 import pyarrow as pa
@@ -42,7 +43,16 @@ strip_mods = lambda s: re.sub(r"\[[^\]]*\]", "", s)
 # its underlying sequence, else is_std rejects it (the '_') and the decoy keeps the base
 # (un-fine-tuned) iRT, landing on a different scale than the fine-tuned targets.
 base_pf = lambda s: s[6:] if s.startswith("DECOY_") else s
-is_std = lambda pf: all(c in STD for c in strip_mods(base_pf(pf)))
+
+
+def is_std(pf):
+    # Same predicate as `all(c in STD for c in strip_mods(base_pf(pf)))`, but the regex
+    # substitution only runs when there is actually a bracketed modification to strip.
+    # This is called once per library row (tens of millions), and most rows are unmodified.
+    b = base_pf(pf)
+    if "[" in b:
+        b = strip_mods(b)
+    return not (set(b) - STD)
 
 
 def agg(a):
@@ -59,6 +69,14 @@ def main():
                     help="cuda moves training/inference onto the GPU; sidesteps the CPU OpenMP crash entirely")
     ap.add_argument("--threads", type=int, default=int(_THREADS),
                     help="torch CPU threads for training (bounded to avoid OpenMP oversubscription; cpu only)")
+    ap.add_argument("--predict-threads", type=int, default=0,
+                    help="torch CPU threads for the whole-library prediction phase; "
+                         "0 (default) reuses --threads, i.e. no change in behaviour. The "
+                         "documented crash was OpenMP oversubscription during fine-tuning's "
+                         "sustained BACKWARD pass; prediction is forward-only, and it is the "
+                         "phase that dominates wall clock on a large library, so it can "
+                         "usually take more threads. Raise it deliberately and watch the "
+                         "per-chunk rate logged below.")
     ap.add_argument("--epochs", type=int, default=25)
     ap.add_argument("--batch", type=int, default=0,
                     help="fine-tune batch size; 0 (default) auto-scales to the reference "
@@ -143,16 +161,31 @@ def main():
             uniq.append(b)
     if args.predict_limit:
         uniq = uniq[: args.predict_limit]
-    print(f"predicting {len(uniq)} unique standard peptidoforms with fine-tuned model", flush=True)
+    pt = args.predict_threads if args.predict_threads > 0 else args.threads
+    if pt != torch.get_num_threads():
+        torch.set_num_threads(max(1, pt))
+    print(f"predicting {len(uniq)} unique standard peptidoforms with fine-tuned model "
+          f"(torch threads={torch.get_num_threads()})", flush=True)
     preds = {}
     chunk = 100_000
+    t_pred0 = time.time()
     for s in range(0, len(uniq), chunk):
+        t0 = time.time()
         batch = uniq[s:s + chunk]
         p = agg(deeplc.predict(batch, model=ft_model))
         for pf, v in zip(batch, p):
             preds[pf] = float(v)
-        print(f"  {min(s + chunk, len(uniq))}/{len(uniq)}", flush=True)
+        done = min(s + chunk, len(uniq))
+        dt = time.time() - t0
+        rate = len(batch) / dt if dt > 0 else float("inf")
+        eta = (len(uniq) - done) / rate if rate > 0 else float("nan")
+        print(f"  {done}/{len(uniq)}  {dt:.1f}s for this chunk "
+              f"({rate:.0f} peptidoforms/s, ETA {eta / 60:.1f} min)", flush=True)
+    print(f"prediction phase: {time.time() - t_pred0:.1f}s total", flush=True)
 
+    # `base_pf` is recomputed here rather than cached from the pass above on purpose:
+    # caching it would retain one extra string per library row (hundreds of MB at
+    # library scale) to avoid a `startswith` and a slice.
     new = np.array([preds.get(base_pf(pf), orig[i]) for i, pf in enumerate(pform)], dtype=np.float32)
     idx = lib.schema.get_field_index("predicted_irt")
     lib = lib.set_column(idx, "predicted_irt", pa.array(new, pa.float32()))
