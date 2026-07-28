@@ -17,7 +17,7 @@ use mumdia_io::report::ArtifactReport;
 use mumdia_io::table::{write_table, Col, Table};
 use rayon::prelude::*;
 use serde_json::json;
-use tracing::info;
+use tracing::{info, warn};
 
 pub struct QuantParams<'a> {
     pub psms_scored: &'a str,
@@ -311,16 +311,32 @@ pub fn run(p: QuantParams) -> Result<(u64, u64)> {
         QuantQColumn::PsmQ => ps.f64("q_value")?,
         QuantQColumn::RunPsmQ => ps.f64("run_psm_q")?,
     };
-    // Schema-v3 scored tables carry the exact identification apex. Keep input
-    // compatibility with older scored artifacts by treating a missing column,
-    // null (read as NaN), or non-finite value as "no hint".
+    // `psms_scored` carries the exact identification apex (schema psms_scored v4;
+    // the column has been present since v3). Older artifacts, or rows whose apex is
+    // null (read as NaN) or non-finite, carry no hint, and quant then re-detects the
+    // apex from the chromatogram itself.
+    //
+    // That fallback is not equivalent: re-detection reproduces the identification's
+    // apex only about half the time (CLAUDE.md, "the selected apex was historically
+    // correct/strongest only about 48-52% of the time"), so a quantity integrated
+    // around a re-detected apex can belong to a different peak than the one that was
+    // identified. It must therefore be visible rather than silent: warn, and record
+    // the coverage in the artifact report so a downstream reader can tell which apex
+    // source a quantity actually used.
     let mut apex_by_cid: HashMap<u32, f64> = HashMap::new();
+    let apex_column_present = ps.f64("apex_rt").is_ok();
     if let Ok(apex_rt) = ps.f64("apex_rt") {
         for i in 0..ps.nrows {
             if apex_rt[i].is_finite() {
                 apex_by_cid.entry(cid[i]).or_insert(apex_rt[i]);
             }
         }
+    }
+    if !apex_column_present {
+        warn!(
+            psms_scored = p.psms_scored,
+            "quant: scored table has no apex_rt column (pre-v3 artifact); every              quantity will be integrated around a RE-DETECTED apex, which reproduces              the identification apex only about half the time"
+        );
     }
 
     // Chromatograms grouped by candidate.
@@ -656,6 +672,10 @@ pub fn run(p: QuantParams) -> Result<(u64, u64)> {
         "config_hash": p.config_hash,
         "psms_scored": p.psms_scored,
         "chromatograms": p.chromatograms,
+        // Which apex each quantity was integrated around: `scored_apex` rows reuse the
+        // identification apex, `redetected` rows fell back to quant's own peak pick.
+        "apex_rt_column_present": apex_column_present,
+        "candidates_with_scored_apex": apex_by_cid.len(),
     });
     for (path, schema, rows) in [
         (p.out_peptide, artifact::PEPTIDE_QUANT, n_pep),
