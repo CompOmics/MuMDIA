@@ -39,7 +39,14 @@ pub struct Library {
     /// Per-candidate fragment arrays, contiguous, grouped by candidate.
     pub frag_mz: Vec<f64>,
     pub frag_int: Vec<f32>,
-    pub frag_name: Vec<String>,
+    /// Fragment names, INTERNED: one dictionary index per fragment rather than one
+    /// `String` per fragment. Library fragment names are drawn from a tiny vocabulary
+    /// (`b1`, `y7`, `y12^2`, ...) that repeats across every candidate, while a
+    /// `Vec<String>` costs ~24 bytes of `String` struct per fragment before any text --
+    /// about 16 GB per copy at 657M fragments. Resolve with [`Library::frag_name_str`].
+    pub frag_name_id: Vec<u16>,
+    /// Distinct fragment names, indexed by [`Library::frag_name_id`].
+    pub frag_name_dict: Vec<String>,
     /// Flat inverted index sorted by fragment m/z, bucketed.
     pub idx_mz: Vec<f32>,
     pub idx_cid: Vec<u32>,
@@ -141,7 +148,10 @@ impl Library {
         let mut cands = Vec::with_capacity(ncand);
         let mut frag_mz = Vec::with_capacity(n_frag_rows);
         let mut frag_int = Vec::with_capacity(n_frag_rows);
-        let mut frag_name = Vec::with_capacity(n_frag_rows);
+        let mut frag_name_id: Vec<u16> = Vec::with_capacity(n_frag_rows);
+        let mut frag_name_dict: Vec<String> = Vec::new();
+        let mut name_lookup: std::collections::HashMap<String, u16> =
+            std::collections::HashMap::new();
         let mut prec_mz = Vec::with_capacity(ncand);
 
         for c in 0..ncand {
@@ -150,16 +160,27 @@ impl Library {
                 let fi = fi32 as usize;
                 frag_mz.push(f_mz[fi]);
                 frag_int.push(f_int[fi]);
-                // MOVE the name out of the source vector rather than cloning it: each
-                // fragment name was otherwise heap-allocated twice (once by `Table::str`
-                // and again here), i.e. two live copies of every name in the library at
-                // peak. `f_name` is dropped right after this loop.
-                // NOTE: the deeper cost is `Vec<String>` itself -- 24 bytes of String
-                // struct per fragment regardless of content, ~16 GB at 657M fragments per
-                // copy. Interning names to `Vec<u16>` + a dictionary is the real fix, but
-                // it changes the public `Library::frag_name` contract and its consumers,
-                // so it is left as a separate change.
-                frag_name.push(std::mem::take(&mut f_name[fi]));
+                // Intern the name: fragment names come from a tiny repeating vocabulary
+                // (b1, y7, y12^2, ...), so store a u16 dictionary index per fragment
+                // instead of a String. A `Vec<String>` costs ~24 B of struct per fragment
+                // before any text -- ~16 GB per copy at 657M fragments -- and the old code
+                // additionally held a second copy while moving names across.
+                let name = std::mem::take(&mut f_name[fi]);
+                let id = match name_lookup.get(&name) {
+                    Some(&id) => id,
+                    None => {
+                        let id = u16::try_from(frag_name_dict.len()).map_err(|_| {
+                            anyhow::anyhow!(
+                                "library has more than {} distinct fragment names; the                                  interned name id is a u16",
+                                u16::MAX
+                            )
+                        })?;
+                        name_lookup.insert(name.clone(), id);
+                        frag_name_dict.push(name);
+                        id
+                    }
+                };
+                frag_name_id.push(id);
             }
             let n = frag_mz.len() - start;
             cands.push(Candidate {
@@ -180,6 +201,7 @@ impl Library {
         // Names have all been moved out; free the (now empty) source vector and the
         // grouping arrays before the index build allocates `entries`.
         drop(f_name);
+        drop(name_lookup);
         drop(frag_order);
         drop(frag_offsets);
 
@@ -254,7 +276,8 @@ impl Library {
             cands,
             frag_mz,
             frag_int,
-            frag_name,
+            frag_name_id,
+            frag_name_dict,
             idx_mz,
             idx_cid,
             idx_int,
@@ -269,14 +292,24 @@ impl Library {
     }
 
     /// Fragments of a candidate as (m/z, predicted intensity, name) slices.
-    pub fn cand_frags(&self, cid: u32) -> (&[f64], &[f32], &[String]) {
+    /// Resolve an interned fragment-name id from [`Library::cand_frags`].
+    pub fn frag_name_str(&self, id: u16) -> &str {
+        self.frag_name_dict
+            .get(id as usize)
+            .map(|s| s.as_str())
+            .unwrap_or("")
+    }
+
+    /// Per-candidate fragment m/z, predicted intensity, and INTERNED name ids (resolve
+    /// with [`Library::frag_name_str`]).
+    pub fn cand_frags(&self, cid: u32) -> (&[f64], &[f32], &[u16]) {
         let c = &self.cands[cid as usize];
         let s = c.frag_start;
         let e = s + c.n_frag;
         (
             &self.frag_mz[s..e],
             &self.frag_int[s..e],
-            &self.frag_name[s..e],
+            &self.frag_name_id[s..e],
         )
     }
 

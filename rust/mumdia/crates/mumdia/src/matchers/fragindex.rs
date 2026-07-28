@@ -314,7 +314,7 @@ mod tests {
     fn lib_from(cands: &[(Vec<(f64, f32)>, f64)]) -> Library {
         let mut frag_mz = Vec::new();
         let mut frag_int = Vec::new();
-        let mut frag_name = Vec::new();
+        let mut frag_name_id: Vec<u16> = Vec::new();
         let mut prec_mz = Vec::new();
         let mut cs = Vec::new();
         for (i, (frags, pmz)) in cands.iter().enumerate() {
@@ -322,7 +322,7 @@ mod tests {
             for &(mz, int) in frags {
                 frag_mz.push(mz);
                 frag_int.push(int);
-                frag_name.push("f".to_string());
+                frag_name_id.push(0);
             }
             cs.push(Candidate {
                 candidate_id: i as u32,
@@ -343,7 +343,8 @@ mod tests {
             cands: cs,
             frag_mz,
             frag_int,
-            frag_name,
+            frag_name_id,
+            frag_name_dict: vec!["f".to_string()],
             idx_mz: Vec::new(),
             idx_cid: Vec::new(),
             idx_int: Vec::new(),

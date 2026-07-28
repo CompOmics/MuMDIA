@@ -2027,7 +2027,10 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
                 };
                 chrom_rows.push((
                     cid,
-                    fnames[fi].clone(),
+                    // Fragment names are interned in the library (a u16 dictionary id per
+                    // fragment instead of a String); materialise the String only here, for
+                    // the emitted chromatogram row.
+                    lib.frag_name_str(fnames[fi]).to_string(),
                     fmzs[fi],
                     obs_mz,
                     fints[fi],
