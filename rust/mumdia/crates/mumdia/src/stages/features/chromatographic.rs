@@ -185,7 +185,10 @@ pub fn values(e: &Evidence) -> Vec<f64> {
     let apex_to_boundary_ratio = {
         let edge = r[0].max(r[tp - 1]);
         if edge > EPS {
-            a_peak / edge
+            // Bounded: a near-zero boundary otherwise sends this to ~1e16. An apex
+            // more than 1000x the peak boundary is already fully isolated; the
+            // distinction beyond that carries no information for the rescorer.
+            (a_peak / edge).min(1000.0)
         } else {
             0.0
         }
@@ -709,7 +712,9 @@ fn peak_snr(a_peak: f64, axis_full: &[f64], r_full: &[f64], lo: f64, hi: f64) ->
     let mad = median(out.iter().map(|v| (v - med).abs()).collect());
     let noise = 1.4826 * mad;
     let denom = if noise > EPS { noise } else { 1.0 };
-    (a_peak / denom).max(0.0)
+    // Bounded: a near-flat out-of-peak baseline gives noise ~ 1e-9 and otherwise
+    // sends S/N to ~1e15. A ratio above 1000 already means "essentially noiseless".
+    (a_peak / denom).clamp(0.0, 1000.0)
 }
 
 /// Fractional-height crossings on `y` over the RT axis `x` by linear
@@ -1013,6 +1018,12 @@ mod tests {
             ms1_iso2: None,
             ms1_isom1: None,
             ms1_xic: vec![],
+            ms1_precursor_features: false,
+            deconv_explained: 0.0,
+            deconv_active: 0.0,
+            deconv_share: 0.0,
+            deconv_max_collin: 0.0,
+            deconv_shadow: 0.0,
         }
     }
 

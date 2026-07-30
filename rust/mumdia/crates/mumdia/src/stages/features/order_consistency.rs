@@ -334,6 +334,12 @@ mod tests {
             ms1_iso2: None,
             ms1_isom1: None,
             ms1_xic: vec![],
+            ms1_precursor_features: false,
+            deconv_explained: 0.0,
+            deconv_active: 0.0,
+            deconv_share: 0.0,
+            deconv_max_collin: 0.0,
+            deconv_shadow: 0.0,
         }
     }
 

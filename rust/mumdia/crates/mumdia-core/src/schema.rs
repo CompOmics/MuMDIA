@@ -14,11 +14,11 @@ pub mod artifact {
     pub const FRAGMENT_LIBRARY_FRAGMENTS: (&str, u32) = ("fragment_library_fragments", 1);
     pub const SEED_PSMS: (&str, u32) = ("seed_psms", 1);
     pub const RUN_WINDOWS: (&str, u32) = ("run_windows", 1);
-    pub const PSMS_EXTRACTED: (&str, u32) = ("psms_extracted", 1);
+    pub const PSMS_EXTRACTED: (&str, u32) = ("psms_extracted", 2);
     pub const CHROMATOGRAMS: (&str, u32) = ("chromatograms", 1);
     pub const FEATURES: (&str, u32) = ("features", 1);
-    pub const PSMS_COMPETED: (&str, u32) = ("psms_competed", 2);
-    pub const PSMS_SCORED: (&str, u32) = ("psms_scored", 3);
+    pub const PSMS_COMPETED: (&str, u32) = ("psms_competed", 3);
+    pub const PSMS_SCORED: (&str, u32) = ("psms_scored", 4);
     pub const PEPTIDE_QUANT: (&str, u32) = ("peptide_quant", 2);
     pub const PROTEIN_GROUP_QUANT: (&str, u32) = ("protein_group_quant", 2);
     pub const FRAGMENT_QUANT: (&str, u32) = ("fragment_quant", 1);

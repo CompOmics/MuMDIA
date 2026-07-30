@@ -20,6 +20,12 @@ pub fn unimod_mass(name: &str) -> Option<f64> {
         "Methyl" => 14.015_650_064,
         "Dimethyl" => 28.031_300_128,
         "Carbamyl" => 43.005_813_726,
+        // Cysteine prenylation (UniMod 44/48/376). Deltas are the monoisotopic
+        // composition masses: Farnesyl C15H24, GeranylGeranyl C20H32,
+        // Hydroxyfarnesyl C15H24O. Enables a FASTA/imported prenylation search.
+        "Farnesyl" => 204.187_801_1,
+        "GeranylGeranyl" => 272.250_401_2,
+        "Hydroxyfarnesyl" => 220.182_715_7,
         _ => return None,
     };
     Some(m)
@@ -48,8 +54,20 @@ pub struct Fragment {
     pub ordinal: usize,
     pub charge: i32,
     pub mz: f64,
+}
+
+impl Fragment {
     /// Stable name such as `b3` (charge 1) or `y5^2` (charge 2).
-    pub name: String,
+    ///
+    /// Derived on demand rather than stored: it is a pure function of the three fields
+    /// above, and fragment generation runs over every theoretical ion of every
+    /// peptidoform in the library, of which the top-N truncation then discards the large
+    /// majority. Storing it allocated one `String` per generated ion -- hundreds of
+    /// millions of them on a real library -- almost all only to be dropped. Callers that
+    /// need the text (the library writer) materialise it for the rows they keep.
+    pub fn name(&self) -> String {
+        frag_name(self.ion_type, self.ordinal, self.charge)
+    }
 }
 
 /// A parsed peptidoform: residues plus per-residue and terminal mass deltas.
@@ -100,7 +118,6 @@ impl ParsedPeptidoform {
                     ordinal,
                     charge: z,
                     mz,
-                    name: frag_name(IonType::B, ordinal, z),
                 });
             }
         }
@@ -119,11 +136,38 @@ impl ParsedPeptidoform {
                     ordinal,
                     charge: z,
                     mz,
-                    name: frag_name(IonType::Y, ordinal, z),
                 });
             }
         }
         out
+    }
+
+    /// Number of proton-carrying basic residues (Arg, His, Lys) in the whole
+    /// peptide. Used for the composition-based charge cap: the maximum sensible
+    /// precursor charge is `1 (N-terminus) + basic_residue_count()`.
+    pub fn basic_residue_count(&self) -> usize {
+        self.residues
+            .iter()
+            .filter(|&&r| matches!(r, b'R' | b'H' | b'K'))
+            .count()
+    }
+
+    /// Number of basic residues (Arg, His, Lys) contained in the sub-sequence of
+    /// a b/y fragment of the given ordinal. A b-ion of ordinal `k` spans the
+    /// first `k` residues; a y-ion of ordinal `k` spans the last `k`. The
+    /// maximum sensible charge of that fragment is `1 (its N-terminal amine) +
+    /// this count`.
+    pub fn fragment_basic_sites(&self, ion: IonType, ordinal: usize) -> usize {
+        let n = self.residues.len();
+        let k = ordinal.min(n);
+        let slice = match ion {
+            IonType::B => &self.residues[0..k],
+            IonType::Y => &self.residues[n - k..n],
+        };
+        slice
+            .iter()
+            .filter(|&&r| matches!(r, b'R' | b'H' | b'K'))
+            .count()
     }
 }
 
@@ -258,11 +302,40 @@ mod tests {
         let p = parse_peptidoform("PEPTIDE").unwrap();
         let frags = p.fragments(&[1]);
         // no b1, y1, y2
-        assert!(frags.iter().all(|f| f.name != "b1"));
-        assert!(frags.iter().all(|f| f.name != "y1"));
-        assert!(frags.iter().all(|f| f.name != "y2"));
+        assert!(frags.iter().all(|f| f.name() != "b1"));
+        assert!(frags.iter().all(|f| f.name() != "y1"));
+        assert!(frags.iter().all(|f| f.name() != "y2"));
         // y3 should exist for a 7-mer
-        assert!(frags.iter().any(|f| f.name == "y3"));
+        assert!(frags.iter().any(|f| f.name() == "y3"));
+    }
+
+    #[test]
+    fn basic_residue_count_counts_rhk_only() {
+        assert_eq!(
+            parse_peptidoform("PEPTIDE").unwrap().basic_residue_count(),
+            0
+        );
+        assert_eq!(
+            parse_peptidoform("PEPTIDER").unwrap().basic_residue_count(),
+            1
+        );
+        // R, H, K each count once; D/E (acidic) do not.
+        assert_eq!(parse_peptidoform("HKRDE").unwrap().basic_residue_count(), 3);
+    }
+
+    #[test]
+    fn fragment_basic_sites_by_slice() {
+        // AAAKAAR: K at index 3, R at index 6 (n = 7).
+        let p = parse_peptidoform("AAAKAAR").unwrap();
+        // b-ions span the first `ordinal` residues.
+        assert_eq!(p.fragment_basic_sites(IonType::B, 3), 0); // AAA
+        assert_eq!(p.fragment_basic_sites(IonType::B, 4), 1); // AAAK
+        assert_eq!(p.fragment_basic_sites(IonType::B, 6), 1); // AAAKAA
+                                                              // y-ions span the last `ordinal` residues.
+        assert_eq!(p.fragment_basic_sites(IonType::Y, 1), 1); // R
+        assert_eq!(p.fragment_basic_sites(IonType::Y, 3), 1); // AAR
+        assert_eq!(p.fragment_basic_sites(IonType::Y, 4), 2); // KAAR -> K + R
+        assert_eq!(p.fragment_basic_sites(IonType::Y, 7), 2); // whole peptide: K + R
     }
 
     #[test]

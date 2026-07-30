@@ -44,7 +44,14 @@ struct Best {
 
 pub fn run(p: SearchSeedParams) -> Result<u64> {
     let t0 = Instant::now();
-    let lib = Library::load(p.library_precursors, p.library_fragments, p.bucket_size)?;
+    // See extract: the bucketed index is dead weight on the fragindex path.
+    let build_bucketed = !matches!(p.cfg.matcher, MatcherKind::Fragindex);
+    let lib = Library::load_with(
+        p.library_precursors,
+        p.library_fragments,
+        p.bucket_size,
+        build_bucketed,
+    )?;
     let scans = load_ms2(p.ms2)?;
     info!(
         candidates = lib.n_candidates(),
@@ -157,6 +164,9 @@ pub fn run(p: SearchSeedParams) -> Result<u64> {
         scan_by_index.insert(s.scan_index, s);
     }
     let mut devs: Vec<f64> = Vec::new();
+    // Fragment m/z paired to each ppm deviation, for the optional m/z-dependent
+    // (LOESS) mass calibration. Only populated/used when `mass_cal_loess` is set.
+    let mut dev_mz: Vec<f64> = Vec::new();
     for (i, (cid, b)) in rows.iter().enumerate() {
         if is_dec[i] || q[i] > p.cfg.fdr_seed {
             continue;
@@ -178,6 +188,7 @@ pub fn run(p: SearchSeedParams) -> Result<u64> {
                 }
                 if let Some(pp) = bestppm {
                     devs.push(pp);
+                    dev_mz.push(fmz);
                 }
             }
         }
@@ -214,6 +225,43 @@ pub fn run(p: SearchSeedParams) -> Result<u64> {
     } else {
         (0.0, p.cfg.fragment_tol_ppm, 0)
     };
+    // Calibration-quality residual stats for the mass dimension: the median and
+    // MAD of the calibrant deviations AFTER the offset correction. A residual
+    // median far from zero means the single offset did not fully de-bias the mass
+    // axis (a case for an m/z-dependent calibration); the MAD is the achieved
+    // precision. Purely diagnostic; consumed by the per-run calibration-quality
+    // report, never by extraction.
+    let (ppm_residual_median, ppm_residual_mad) = if devs.is_empty() {
+        (0.0, 0.0)
+    } else {
+        let centered: Vec<f64> = devs.iter().map(|d| d - frag_ppm_offset).collect();
+        let med = crate::calibrate::percentile(&centered, 0.5);
+        let absdev: Vec<f64> = centered.iter().map(|c| (c - med).abs()).collect();
+        (med, crate::calibrate::percentile(&absdev, 0.5))
+    };
+    // Optional m/z-dependent (LOESS) mass calibration grid: fit the calibrant
+    // ppm deviation versus fragment m/z and sample it on a fixed 25-Th grid that
+    // extract interpolates per peak. Empty unless `mass_cal_loess` is set and
+    // enough calibrants exist; extract then falls back to the scalar offset.
+    // Deterministic: pairs are sorted by m/z before the fit.
+    let (mz_cal_grid_mz, mz_cal_grid_ppm): (Vec<f64>, Vec<f64>) = if p.cfg.mass_cal_loess
+        && dev_mz.len() >= 50
+    {
+        let mut pairs: Vec<(f64, f64)> = dev_mz.iter().cloned().zip(devs.iter().cloned()).collect();
+        pairs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        let xs: Vec<f64> = pairs.iter().map(|(m, _)| *m).collect();
+        let ys: Vec<f64> = pairs.iter().map(|(_, pp)| *pp).collect();
+        let loess = crate::calibrate::Loess::fit(&xs, &ys, 0.3, 200);
+        let lo = xs.first().copied().unwrap_or(150.0);
+        let hi = xs.last().copied().unwrap_or(2000.0);
+        let step = 25.0;
+        let n = (((hi - lo) / step).floor() as usize).max(1);
+        let gm: Vec<f64> = (0..=n).map(|k| lo + k as f64 * step).collect();
+        let gp: Vec<f64> = gm.iter().map(|&m| loess.predict(m)).collect();
+        (gm, gp)
+    } else {
+        (Vec::new(), Vec::new())
+    };
     mumdia_io::json::write_json(
         &format!("{}.masscal.json", p.out),
         &json!({
@@ -223,6 +271,12 @@ pub fn run(p: SearchSeedParams) -> Result<u64> {
             "frag_ppm_sigma": frag_tol_learned,
             "n_dev": devs.len(),
             "cal_passes": cal_passes,
+            // Calibration-quality diagnostics (post-correction residuals).
+            "ppm_residual_median": ppm_residual_median,
+            "ppm_residual_mad": ppm_residual_mad,
+            // Optional m/z-dependent correction grid (empty = scalar offset only).
+            "mz_cal_grid_mz": mz_cal_grid_mz,
+            "mz_cal_grid_ppm": mz_cal_grid_ppm,
         }),
     )?;
     info!(
@@ -329,12 +383,25 @@ fn seed_fragindex_windows(
             .push(si);
     }
     let group_vec: Vec<Vec<usize>> = groups.into_values().collect();
-    let n_cand = idx.n_cand();
+    // Size each worker's scratch to the WIDEST candidate window, not the whole library.
+    // The scratch is indexed window-relative, so 16 B x n_cand per worker (877 MB per
+    // worker at 54.8M candidates) was almost entirely untouched. It grows on demand, so an
+    // underestimate here is safe.
+    let max_window_width = group_vec
+        .iter()
+        .filter_map(|ids| ids.first())
+        .map(|&si| {
+            let w = &scans[si].window;
+            let (lo, hi) = idx.candidate_range(w.lower_mz, w.upper_mz);
+            hi.saturating_sub(lo) as usize + 1
+        })
+        .max()
+        .unwrap_or(1);
 
     let partials: Vec<Vec<(u32, Best)>> = group_vec
         .par_iter()
         .map_init(
-            || SeedScratch::new(n_cand),
+            || SeedScratch::new(max_window_width),
             |scratch, ids| {
                 if ids.is_empty() {
                     return Vec::new();

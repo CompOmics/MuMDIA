@@ -15,4 +15,5 @@ pub mod report;
 pub mod rescore;
 pub mod rt_im_train;
 pub mod run;
+pub mod run_experiment;
 pub mod search_seed;

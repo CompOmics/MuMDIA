@@ -38,6 +38,11 @@ pub fn run(p: CompeteParams) -> Result<u64> {
     let elution_hi = t.f64("elution_hi")?;
     let mz = t.f64("precursor_mz")?;
     let prelim = t.f64("prelim_score")?;
+    // Top-K peak rank (#7). Part of the competition key so peaks of one candidate
+    // compete only within their own rank (a lower-scoring peak of a candidate must
+    // not eliminate a sibling's better peak on prelim score before rescore picks).
+    // Missing -> 0 (single-apex), so the grouping is unchanged when promotion is off.
+    let peak_rank = t.i32("peak_rank").unwrap_or_else(|_| vec![0; t.nrows]);
     let schema = FeatureSchema::read(p.features)?;
     let feat_names = &schema.feature_columns;
     let feat_cols: Vec<Vec<f64>> = feat_names.iter().map(|c| t.f64(c).unwrap()).collect();
@@ -71,24 +76,25 @@ pub fn run(p: CompeteParams) -> Result<u64> {
     // Key is a fixed-size tuple (base-or-pform id, label_code, bucket) instead of a
     // freshly-allocated String per PSM. Precursor grouping uses a constant bucket
     // (0) so its equivalence classes are unchanged.
-    let mut groups: HashMap<(u32, u8, i64), Vec<usize>> = HashMap::new();
+    let mut groups: HashMap<(u32, u8, i64, i32), Vec<usize>> = HashMap::new();
     for i in 0..t.nrows {
         let label_code = match label[i].as_str() {
             "target" => 0u8,
             "decoy" => 1u8,
             _ => 2u8,
         };
+        let pk = peak_rank[i];
         let key = match p.cfg.group_by {
-            CompeteGroupBy::Precursor => (base[i], label_code, 0i64),
+            CompeteGroupBy::Precursor => (base[i], label_code, 0i64, pk),
             CompeteGroupBy::Apex => {
                 let bucket = (apex_rt[i] / p.cfg.apex_rt_tolerance_s).round() as i64;
-                (base[i], label_code, bucket)
+                (base[i], label_code, bucket, pk)
             }
             CompeteGroupBy::PeptidoformCharge => {
                 // pform_id separates modforms; charge in the bucket separates
                 // charges -> one group per peptidoform+charge (precursor-level).
                 let c = charge.as_ref().unwrap()[i].round() as i64;
-                (pform_id[i], label_code, c)
+                (pform_id[i], label_code, c, pk)
             }
         };
         groups.entry(key).or_default().push(i);
@@ -98,7 +104,32 @@ pub fn run(p: CompeteParams) -> Result<u64> {
     // an explicit `unique_fragment_count` feature; otherwise approximates it as
     // matched-fragment count discounted by the contested fraction; None if neither
     // is available (mode then falls back to winner-take-all).
-    let unique_ev = unique_evidence(&t);
+    let unique_ev_src = unique_evidence_with_source(&t);
+    if matches!(p.cfg.mode, CompetitionMode::UniqueEvidence) {
+        // The mode keeps any non-winner whose unique evidence >= unique_evidence_min_fragments.
+        // Warn when NOTHING in this run can fall below that threshold, because then the mode is
+        // silently identical to CompetitionMode::None.
+        //
+        // Tested on the VALUES, not on which column the estimate came from. Keying on the
+        // column name missed the common case: `peak_contested_frac` is part of the Extended
+        // feature set unconditionally, so the estimate always reports itself as
+        // "contested-discounted" even when that column is all zeros (competition features off),
+        // which discounts nothing and leaves the raw matched count -- exactly the no-op the
+        // warning exists to announce.
+        if let Some((ev, src)) = unique_ev_src.as_ref() {
+            let thr = p.cfg.unique_evidence_min_fragments as f64;
+            let below = ev.iter().filter(|v| **v < thr).count();
+            if below == 0 {
+                warn!(
+                    source = src,
+                    threshold = thr,
+                    candidates = ev.len(),
+                    "compete mode=unique_evidence: no candidate's unique evidence falls below                      compete.unique_evidence_min_fragments, so NOTHING will be removed and this                      run is equivalent to mode=none. Enable the contested/competition features                      so the evidence is actually discounted, or raise the threshold."
+                );
+            }
+        }
+    }
+    let unique_ev = unique_ev_src.map(|(v, _)| v);
     if matches!(p.cfg.mode, CompetitionMode::UniqueEvidence) && unique_ev.is_none() {
         warn!(
             "compete mode=unique_evidence: no unique_fragment_count / \
@@ -122,6 +153,10 @@ pub fn run(p: CompeteParams) -> Result<u64> {
         Col::U32(
             "candidate_id".into(),
             keep.iter().map(|&i| cid[i]).collect(),
+        ),
+        Col::I32(
+            "peak_rank".into(),
+            keep.iter().map(|&i| peak_rank[i]).collect(),
         ),
         Col::Str(
             "label".into(),
@@ -239,9 +274,11 @@ pub fn run(p: CompeteParams) -> Result<u64> {
 /// `n_matched_fragments * (1 - peak_contested_frac)` (contested-discounted matched
 /// count). The legacy `contested_frac` spelling remains a fallback; raw matched
 /// count is used if neither fraction exists, and `None` if no matched count exists.
-fn unique_evidence(t: &Table) -> Option<Vec<f64>> {
+/// Also reports which column the estimate came from, so the caller can warn when the
+/// weakest fallback would make the mode a silent no-op.
+fn unique_evidence_with_source(t: &Table) -> Option<(Vec<f64>, &'static str)> {
     if let Some(u) = col_f64(t, "unique_fragment_count") {
-        return Some(u);
+        return Some((u, "unique_fragment_count"));
     }
     let nm = col_f64(t, "n_matched_fragments")?;
     let contested = prefer_peak_contested_fraction(
@@ -249,13 +286,14 @@ fn unique_evidence(t: &Table) -> Option<Vec<f64>> {
         col_f64(t, "contested_frac"),
     );
     match contested {
-        Some(cf) => Some(
+        Some(cf) => Some((
             nm.iter()
                 .zip(cf)
                 .map(|(n, c)| n * (1.0 - c).clamp(0.0, 1.0))
                 .collect(),
-        ),
-        None => Some(nm),
+            "contested-discounted n_matched_fragments",
+        )),
+        None => Some((nm, "n_matched_fragments")),
     }
 }
 
@@ -281,7 +319,7 @@ fn col_f64(t: &Table, name: &str) -> Option<Vec<f64>> {
 /// Deterministic: groups are visited in sorted key order; the winner is the
 /// highest `prelim` (ties broken by smallest index).
 fn resolve_competition(
-    groups: &HashMap<(u32, u8, i64), Vec<usize>>,
+    groups: &HashMap<(u32, u8, i64, i32), Vec<usize>>,
     prelim: &[f64],
     mode: CompetitionMode,
     margin: f64,
@@ -289,7 +327,7 @@ fn resolve_competition(
     unique_ev: Option<&[f64]>,
 ) -> (Vec<usize>, Vec<(usize, usize)>) {
     use std::cmp::Ordering::Equal;
-    let mut group_keys: Vec<&(u32, u8, i64)> = groups.keys().collect();
+    let mut group_keys: Vec<&(u32, u8, i64, i32)> = groups.keys().collect();
     group_keys.sort_unstable();
     let mut keep: Vec<usize> = Vec::new();
     let mut removed: Vec<(usize, usize)> = Vec::new();
@@ -356,9 +394,9 @@ fn resolve_competition(
 mod tests {
     use super::*;
 
-    fn one_group(members: Vec<usize>) -> HashMap<(u32, u8, i64), Vec<usize>> {
+    fn one_group(members: Vec<usize>) -> HashMap<(u32, u8, i64, i32), Vec<usize>> {
         let mut g = HashMap::new();
-        g.insert((0u32, 0u8, 0i64), members);
+        g.insert((0u32, 0u8, 0i64, 0i32), members);
         g
     }
 
@@ -432,8 +470,8 @@ mod tests {
     #[test]
     fn winner_take_all_is_deterministic_across_groups() {
         let mut g = HashMap::new();
-        g.insert((0u32, 0u8, 0i64), vec![0, 1]);
-        g.insert((1u32, 1u8, 0i64), vec![2, 3]);
+        g.insert((0u32, 0u8, 0i64, 0i32), vec![0, 1]);
+        g.insert((1u32, 1u8, 0i64, 0i32), vec![2, 3]);
         let prelim = [0.2, 0.8, 0.9, 0.3];
         let (keep, _) =
             resolve_competition(&g, &prelim, CompetitionMode::WinnerTakeAll, 0.0, 2, None);

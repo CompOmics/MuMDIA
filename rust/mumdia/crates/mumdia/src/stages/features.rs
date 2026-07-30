@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use mumdia_core::config::{FeatureSet, FeaturesConfig};
 use mumdia_core::constants::{ppm_diff, PROTON};
 use mumdia_core::schema::artifact;
@@ -32,6 +32,7 @@ use rayon::prelude::*;
 mod apex_dispersion;
 mod chromatographic;
 mod coelution;
+mod demix;
 pub(crate) mod entropy;
 mod interference;
 mod ion_series;
@@ -65,6 +66,7 @@ const FAMILIES: &[(&[&str], FamilyFn)] = &[
     (peak_scans::NAMES, peak_scans::values),
     (apex_dispersion::NAMES, apex_dispersion::values),
     (mass_uncertainty::NAMES, mass_uncertainty::values),
+    (demix::NAMES, demix::values),
 ];
 
 /// Names already used by the Minimal/Rich sets, which the extended battery must
@@ -243,9 +245,73 @@ pub struct FeatureSchema {
 
 impl FeatureSchema {
     pub fn read(artifact_path: &str) -> Result<FeatureSchema> {
-        mumdia_io::json::read_json(&format!("{artifact_path}.schema.json"))
+        let companion = format!("{artifact_path}.schema.json");
+        match mumdia_io::json::read_json::<FeatureSchema>(&companion) {
+            Ok(s) => Ok(s),
+            Err(e) => {
+                // The companion is a convenience, not the source of truth: the feature
+                // column list is recoverable from the parquet's own schema (every column
+                // that is not one of the fixed metadata columns). A missing/corrupt
+                // companion used to abort the run outright -- observed this session when a
+                // competed table was rewritten by an external tool that did not know to
+                // copy the sidecar. Reconstruct instead, and say so.
+                // Footer only: the column list lives in the parquet metadata, so there is
+                // no reason to decode ~390 columns of data to read their names.
+                let names = mumdia_io::table::column_names(artifact_path).with_context(|| {
+                    format!(
+                        "reading {companion} failed ({e}) and the artifact itself could                          not be read to reconstruct the feature schema"
+                    )
+                })?;
+                let feature_columns: Vec<String> = names
+                    .into_iter()
+                    .filter(|c| !NON_FEATURE_COLUMNS.contains(&c.as_str()))
+                    .collect();
+                if feature_columns.is_empty() {
+                    anyhow::bail!(
+                        "reading {companion} failed ({e}) and {artifact_path} contains no \
+                         feature columns to reconstruct it from"
+                    );
+                }
+                tracing::warn!(
+                    companion = %companion,
+                    n_features = feature_columns.len(),
+                    "feature schema companion unreadable; reconstructed the feature list \
+                     from the artifact's own parquet schema"
+                );
+                // schema_id is provenance only; mark it as reconstructed rather than
+                // inventing a hash that would collide with a real one.
+                Ok(FeatureSchema {
+                    feature_columns,
+                    schema_id: "reconstructed-from-parquet".to_string(),
+                })
+            }
+        }
     }
 }
+
+/// Columns of a competed/features artifact that are metadata, not rescoring features.
+/// Used to reconstruct a feature list when the `.schema.json` companion is missing.
+///
+/// Verified against a real artifact: excluding exactly these reproduces the recorded
+/// `feature_columns` list byte-for-byte. Two traps this encodes: `charge` IS a feature
+/// (carried as an f64), while `elution_lo`/`elution_hi` are peak-bound metadata carried
+/// for quantification, not features. Getting either wrong changes the trained population.
+pub const NON_FEATURE_COLUMNS: &[&str] = &[
+    "candidate_id",
+    "peptidoform_id",
+    "base_peptide_id",
+    "peptidoform",
+    "protein",
+    "label",
+    "precursor_mz",
+    "prelim_score",
+    "apex_rt",
+    "elution_lo",
+    "elution_hi",
+    "peak_rank",
+    "source",
+    "unique_evidence",
+];
 
 fn peptide_length(peptidoform: &str) -> i32 {
     // Strip the decoy marker so its letters (D,E,C,O,Y) are not counted as residues.
@@ -337,9 +403,20 @@ pub struct Evidence {
     pub ms1_iso1: Option<f64>,
     pub ms1_iso2: Option<f64>,
     pub ms1_isom1: Option<f64>,
-    /// MS1 isotope XICs [mono, +1, +2] resampled onto `axis`. Empty until the
-    /// extract stage persists them (evidence gap being closed separately).
+    /// MS1 isotope XICs [mono, +1, +2] resampled onto `axis`. Populated when the
+    /// extract stage emits MS1 window-grid chromatograms (default on with MS1).
     pub ms1_xic: Vec<Vec<f64>>,
+    /// Opt-in `ms1_precursor_features` gate (config). When false the ms1 family's
+    /// `ms1_isotope_height_corr` returns 0.0 (default), keeping the vector effect
+    /// unchanged; when true it computes the apex-isotope Pearson.
+    pub ms1_precursor_features: bool,
+    /// Spectrum-centric demix features (D2), from the extract stage. All 0 unless
+    /// `extract.emit_demix_features` populated the columns.
+    pub deconv_explained: f64,
+    pub deconv_active: f64,
+    pub deconv_share: f64,
+    pub deconv_max_collin: f64,
+    pub deconv_shadow: f64,
 }
 
 /// Parse a fragment name like `b3`, `y7`, `b3^2` into (is_b, ordinal, charge).
@@ -531,6 +608,12 @@ fn build_evidence(
         ms1_iso2: None,
         ms1_isom1: None,
         ms1_xic,
+        ms1_precursor_features: false,
+        deconv_explained: 0.0,
+        deconv_active: 0.0,
+        deconv_share: 0.0,
+        deconv_max_collin: 0.0,
+        deconv_shadow: 0.0,
     }
 }
 
@@ -549,6 +632,25 @@ pub fn run(p: FeaturesParams) -> Result<u64> {
     let t0 = Instant::now();
     let ps = Table::read(p.psms)?;
     let cid = ps.u32("candidate_id")?;
+    // Top-K peak rank (#7), passed through untouched. Missing in pre-v2 extracted
+    // artifacts -> 0 (the selected apex), so old inputs behave exactly as before.
+    let peak_rank = ps.i32("peak_rank").unwrap_or_else(|_| vec![0; ps.nrows]);
+    // Demix features (D2), absent unless extract.emit_demix_features -> 0.
+    let deconv_expl = ps
+        .f32("deconv_explained_frac")
+        .unwrap_or_else(|_| vec![0.0; ps.nrows]);
+    let deconv_act = ps
+        .f32("deconv_active")
+        .unwrap_or_else(|_| vec![0.0; ps.nrows]);
+    let deconv_shr = ps
+        .f32("deconv_share")
+        .unwrap_or_else(|_| vec![0.0; ps.nrows]);
+    let deconv_col = ps
+        .f32("deconv_max_collinearity")
+        .unwrap_or_else(|_| vec![0.0; ps.nrows]);
+    let deconv_sha = ps
+        .f32("shadow_kept_frac")
+        .unwrap_or_else(|_| vec![0.0; ps.nrows]);
     let apex_rt = ps.f64("apex_rt")?;
     let apex_int = ps.f32("apex_intensity")?;
     let n_matched = ps.i32("n_matched_fragments")?;
@@ -588,7 +690,20 @@ pub fn run(p: FeaturesParams) -> Result<u64> {
         .unwrap_or_else(|_| vec![None; ps.nrows]);
 
     // Group chromatograms by candidate_id.
-    let ch = Table::read(p.chromatograms)?;
+    // Project explicitly. features uses all of these; naming them means a future extra
+    // column in the artifact is not silently decoded on this hot path.
+    let ch = Table::read_cols(
+        p.chromatograms,
+        &[
+            "candidate_id",
+            "frag_name",
+            "frag_mz",
+            "frag_obs_mz",
+            "predicted_intensity",
+            "rt",
+            "intensity",
+        ],
+    )?;
     let ch_cid = ch.u32("candidate_id")?;
     let ch_name = ch.str("frag_name")?;
     let ch_fmz = ch.f64("frag_mz")?;
@@ -796,6 +911,12 @@ pub fn run(p: FeaturesParams) -> Result<u64> {
                         ev.ms1_iso1 = ms1_i1[i];
                         ev.ms1_iso2 = ms1_i2[i];
                         ev.ms1_isom1 = ms1_m1[i];
+                        ev.ms1_precursor_features = p.cfg.ms1_precursor_features;
+                        ev.deconv_explained = deconv_expl[i] as f64;
+                        ev.deconv_active = deconv_act[i] as f64;
+                        ev.deconv_share = deconv_shr[i] as f64;
+                        ev.deconv_max_collin = deconv_col[i] as f64;
+                        ev.deconv_shadow = deconv_sha[i] as f64;
                         extended_values(&ev)
                     }
                     _ => vec![0.0; ext_names.len()],
@@ -912,6 +1033,7 @@ pub fn run(p: FeaturesParams) -> Result<u64> {
     // Build output columns: bookkeeping + active feature list.
     let mut cols: Vec<Col> = vec![
         Col::U32("candidate_id".into(), cid.clone()),
+        Col::I32("peak_rank".into(), peak_rank.clone()),
         Col::Str("label".into(), label.clone()),
         Col::U32("base_peptide_id".into(), base.clone()),
         Col::Str("peptidoform".into(), pform.clone()),
@@ -941,25 +1063,34 @@ pub fn run(p: FeaturesParams) -> Result<u64> {
         },
     )?;
 
-    // PIN.
-    let feat_matrix: Vec<Vec<f64>> = (0..n)
-        .map(|i| {
-            cols_active
-                .iter()
-                .map(|c| fmap.get(c.as_str()).map(|v| v[i]).unwrap_or(0.0))
-                .collect()
-        })
-        .collect();
-    write_pin(
-        p.out_pin,
-        &cols_active,
-        &cid,
-        &label,
-        &pform,
-        &protein,
-        &mz,
-        &feat_matrix,
-    )?;
+    // PIN. Nothing in the pipeline reads this artifact (`rescore` builds its own PIN for
+    // the sidecars); it exists for external Percolator-style tooling, so it is gated.
+    // When it IS written we resolve each feature column ONCE into a slice reference and
+    // stream rows from those, instead of transposing the whole matrix into a
+    // Vec<Vec<f64>> first: at 1.5M rows x 387 features that transpose allocated ~4.6 GB
+    // and performed ~580M string-keyed HashMap lookups. Byte output is unchanged.
+    if p.cfg.emit_pin {
+        let empty: Vec<f64> = Vec::new();
+        let fcols: Vec<&Vec<f64>> = cols_active
+            .iter()
+            .map(|c| fmap.get(c.as_str()).unwrap_or(&empty))
+            .collect();
+        write_pin(
+            p.out_pin,
+            &cols_active,
+            &cid,
+            &label,
+            &pform,
+            &protein,
+            &mz,
+            &fcols,
+        )?;
+    } else {
+        tracing::debug!(
+            path = %p.out_pin,
+            "features: PIN emission disabled (features.emit_pin = false)"
+        );
+    }
 
     let elapsed = t0.elapsed().as_millis();
     let mut stats = std::collections::BTreeMap::new();
@@ -1542,7 +1673,7 @@ fn write_pin(
     pform: &[String],
     protein: &[String],
     mz: &[f64],
-    feats: &[Vec<f64>],
+    feats: &[&Vec<f64>],
 ) -> Result<()> {
     use std::io::Write as _;
     // Stream row by row through a BufWriter instead of materializing the whole
@@ -1562,10 +1693,13 @@ fn write_pin(
             "cand_{}\t{}\t{}\t{:.5}\t{:.5}\t",
             cid[i], lab, cid[i], mz[i], mz[i]
         )?;
+        // `feats` is now COLUMN-major (one slice per feature, resolved once by the
+        // caller), so the row value is feats[fi][i]. Absent columns are empty slices and
+        // print 0.000000, matching the previous `.unwrap_or(0.0)` behaviour exactly.
         #[allow(clippy::needless_range_loop)]
-        // parallel index into feats[i] bounded by feature_cols
         for fi in 0..feature_cols.len() {
-            write!(w, "{:.6}\t", feats[i][fi])?;
+            let v = feats[fi].get(i).copied().unwrap_or(0.0);
+            write!(w, "{v:.6}\t")?;
         }
         writeln!(w, "-.{}.-\t{}", pform[i], protein[i])?;
     }

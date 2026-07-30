@@ -68,6 +68,8 @@ pub fn run(p: RescoreParams) -> Result<u64> {
     // why the Mokapot PIN below keys on a unique row index rather than
     // candidate_id (which is the library index and repeats across runs).
     let mut source: Vec<u32> = Vec::new();
+    // Top-K peak rank per row (#7), for the per-candidate best-peak collapse below.
+    let mut peak_rank: Vec<i32> = Vec::new();
     // Feature list is taken from the schema companion of the first input. Every
     // subsequent companion must match exactly: silently concatenating differing
     // feature order/sets would train and score on semantically misaligned columns.
@@ -88,9 +90,11 @@ pub fn run(p: RescoreParams) -> Result<u64> {
         let ar = t.f64("apex_rt")?;
         let elo = t.f64("elution_lo")?;
         let ehi = t.f64("elution_hi")?;
+        let pkr = t.i32("peak_rank").unwrap_or_else(|_| vec![0; t.nrows]);
         let fcols: Vec<Vec<f64>> = feat_names.iter().map(|n| t.f64(n)).collect::<Result<_>>()?;
         for i in 0..t.nrows {
             cid.push(c[i]);
+            peak_rank.push(pkr[i]);
             label.push(l[i].clone());
             base.push(b[i]);
             pform.push(pf[i].clone());
@@ -107,8 +111,9 @@ pub fn run(p: RescoreParams) -> Result<u64> {
     }
     crate::fdr::validate_labels(&label)?;
     let is_decoy: Vec<bool> = label.iter().map(|l| l == "decoy").collect();
-    let (is_entrapment, is_real_target) = classify_entrapment(p.cfg, &protein, &is_decoy);
-    let n = cid.len();
+    let (mut is_entrapment, mut is_real_target) = classify_entrapment(p.cfg, &protein, &is_decoy);
+    let mut is_decoy = is_decoy;
+    let mut n = cid.len();
     if n > 0 {
         let n_decoys = is_decoy.iter().filter(|&&v| v).count();
         let n_targets = n - n_decoys;
@@ -144,7 +149,7 @@ pub fn run(p: RescoreParams) -> Result<u64> {
     let mut model_identity = "native-percolator-lite-v1".to_string();
     let mut qmode = QMode::Decoy;
 
-    let scores = if n == 0 {
+    let mut scores = if n == 0 {
         classifier_used = "not_run_empty";
         model_identity = "none-empty-input".to_string();
         Vec::new()
@@ -282,6 +287,62 @@ pub fn run(p: RescoreParams) -> Result<u64> {
         .find(|(_, score)| !score.is_finite())
     {
         anyhow::bail!("rescore produced non-finite score at flat row {row}: {score}");
+    }
+
+    // Top-K per-candidate collapse (#7): keep only the best-scoring peak per
+    // (source, candidate_id), so the rescorer (not the up-front apex pick) selects
+    // the peak and the terminal q-null is exactly one row per candidate. Promoting K
+    // peaks therefore does not K-inflate the decoy null. Guarded: at
+    // promote_top_peaks = 1 every candidate has a single peak, `best.len() == n`, and
+    // the whole block is a no-op (byte-identical). Decoys collapse by the identical
+    // rule, so target/decoy exchangeability is preserved. Tie-break: lower peak_rank
+    // then lower row index (deterministic).
+    if n > 0 {
+        let mut best: HashMap<(u32, u32), usize> = HashMap::with_capacity(n);
+        for i in 0..n {
+            let key = (source[i], cid[i]);
+            match best.get(&key) {
+                Some(&j) => {
+                    let better = scores[i] > scores[j]
+                        || (scores[i] == scores[j] && (peak_rank[i], i) < (peak_rank[j], j));
+                    if better {
+                        best.insert(key, i);
+                    }
+                }
+                None => {
+                    best.insert(key, i);
+                }
+            }
+        }
+        if best.len() < n {
+            let mut keep: Vec<usize> = best.into_values().collect();
+            keep.sort_unstable();
+            macro_rules! keep_rows {
+                ($($v:ident),+ $(,)?) => {$(
+                    { let tmp: Vec<_> = keep.iter().map(|&i| $v[i].clone()).collect(); $v = tmp; }
+                )+};
+            }
+            keep_rows!(
+                cid,
+                label,
+                base,
+                pform,
+                protein,
+                charge,
+                prelim,
+                apex_rt,
+                elution_lo,
+                elution_hi,
+                source,
+                scores,
+                peak_rank,
+                is_decoy,
+                is_entrapment,
+                is_real_target
+            );
+            n = keep.len();
+            info!(kept = n, "rescore: top-K per-candidate best-peak collapse");
+        }
     }
 
     // PSM-level q-values against the selected null.
@@ -473,6 +534,9 @@ pub fn run(p: RescoreParams) -> Result<u64> {
             Col::F64("run_psm_q".into(), run_psm_q),
             Col::F64("experiment_psm_q".into(), experiment_psm_q),
             Col::F64("precursor_q".into(), precursor_q),
+            // Which chromatographic peak the rescorer selected for this candidate
+            // (#7). 0 = the up-front apex; > 0 = a promoted alternate peak won.
+            Col::I32("selected_peak_rank".into(), peak_rank),
         ],
     )?;
 
@@ -732,6 +796,115 @@ fn run_entrapment_gbm(
     align_sidecar_scores(&orid, &osc, cid.len(), "entrapment_worker")
 }
 
+/// Owns a spawned sidecar child and kills it on drop unless it was already awaited.
+/// Without this, a `mumdia` process that dies mid-rescore (Ctrl-C, kill, panic) leaves
+/// the Python worker alive holding its feature memmap, and every later rescore then fails
+/// on a file it cannot delete.
+struct ChildGuard(Option<std::process::Child>);
+
+impl ChildGuard {
+    fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        let mut c = self.0.take().expect("child awaited twice");
+        c.wait()
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        if let Some(mut c) = self.0.take() {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+    }
+}
+
+/// Write the sidecar feature table as Parquet, streaming a batch at a time.
+///
+/// Same logical contract as the tab-separated PIN - `SpecId`, `Label`, `ScanNr`, `ExpMass`,
+/// `CalcMass`, the feature columns, `Peptide`, `Proteins` - so the worker reads either format
+/// from the same column names.
+///
+/// Features are `f32`: the TSV wrote `{:.6}` and the worker casts to float32 anyway, so f32
+/// matches what is actually used, halves the file, and does not silently increase precision
+/// relative to the validated TSV reference.
+///
+/// Batched because `feats` is already resident (Vec<Vec<f64>>, ~27 GB on an experiment-wide
+/// pool); materialising 387 full columns as well would add ~12.8 GB for nothing.
+fn write_features_parquet(
+    path: &str,
+    feat_names: &[String],
+    label: &[String],
+    pform: &[String],
+    protein: &[String],
+    mz: &[f64],
+    feats: &[Vec<f64>],
+) -> Result<u64> {
+    use arrow::array::{ArrayRef, Float32Array, Float64Array, Int32Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use std::sync::Arc;
+
+    let mut fields: Vec<Field> = vec![
+        Field::new("SpecId", DataType::Utf8, false),
+        Field::new("Label", DataType::Int32, false),
+        Field::new("ScanNr", DataType::Int32, false),
+        Field::new("ExpMass", DataType::Float64, false),
+        Field::new("CalcMass", DataType::Float64, false),
+    ];
+    for n in feat_names {
+        fields.push(Field::new(n, DataType::Float32, false));
+    }
+    fields.push(Field::new("Peptide", DataType::Utf8, false));
+    fields.push(Field::new("Proteins", DataType::Utf8, false));
+    let schema = Arc::new(Schema::new(fields));
+
+    let n = label.len();
+    let nf = feat_names.len();
+    // ~250k rows x 387 f32 is about 390 MB per batch, which keeps the encoder's working set
+    // modest while still giving parquet large row groups.
+    const BATCH: usize = 250_000;
+    let mut w = mumdia_io::table::BatchWriter::new(path, schema.clone())?;
+    let mut start = 0usize;
+    while start < n {
+        let end = (start + BATCH).min(n);
+        let k = end - start;
+        let mut arrays: Vec<ArrayRef> = Vec::with_capacity(nf + 7);
+        // SpecId / ScanNr key on the row index, NOT candidate_id: candidate_id is the library
+        // index and repeats across runs, so an experiment-wide table would collide.
+        arrays.push(Arc::new(StringArray::from(
+            (start..end).map(|i| format!("psm_{i}")).collect::<Vec<_>>(),
+        )));
+        arrays.push(Arc::new(Int32Array::from(
+            (start..end)
+                .map(|i| if label[i] == "decoy" { -1 } else { 1 })
+                .collect::<Vec<_>>(),
+        )));
+        arrays.push(Arc::new(Int32Array::from(
+            (start..end).map(|i| i as i32).collect::<Vec<_>>(),
+        )));
+        let mzv: Vec<f64> = mz[start..end].to_vec();
+        arrays.push(Arc::new(Float64Array::from(mzv.clone())));
+        arrays.push(Arc::new(Float64Array::from(mzv)));
+        // Transpose this row block into one column per feature. `feats` is row-major, so a
+        // column read strides it; doing that per batch keeps the working set to one block.
+        let block = &feats[start..end];
+        for fi in 0..nf {
+            let col: Vec<f32> = block.iter().map(|row| row[fi] as f32).collect();
+            arrays.push(Arc::new(Float32Array::from(col)));
+        }
+        let _ = k;
+        arrays.push(Arc::new(StringArray::from(
+            (start..end)
+                .map(|i| format!("-.{}.-", pform[i]))
+                .collect::<Vec<_>>(),
+        )));
+        arrays.push(Arc::new(StringArray::from(protein[start..end].to_vec())));
+        w.write(&RecordBatch::try_new(schema.clone(), arrays)?)?;
+        start = end;
+    }
+    w.close()
+}
+
 /// Run a PIN-contract Python rescorer sidecar (`mokapot_worker.py` or
 /// `nn_rescore_worker.py`) over a PIN written from the competed set; return scores
 /// aligned to the input candidate order (PLAN.md Section 3.2 file contract). Both
@@ -748,37 +921,86 @@ fn run_pin_sidecar(
     mz: &[f64],
     feats: &[Vec<f64>],
 ) -> Result<Vec<f64>> {
-    use std::fmt::Write as _;
+    use std::io::Write as _;
     let python = p.cfg.python.as_deref().ok_or_else(|| {
         anyhow::anyhow!("classifier sidecar {script_name} requires rescore.python")
     })?;
     std::fs::create_dir_all(p.work_dir).ok();
-    let pin = format!("{}/rescore.pin", p.work_dir);
-    let outp = format!("{}/rescore_sidecar_out.parquet", p.work_dir);
-
-    let mut s = String::new();
-    s.push_str("SpecId\tLabel\tScanNr\tExpMass\tCalcMass\t");
-    s.push_str(&feat_names.join("\t"));
-    s.push_str("\tPeptide\tProteins\n");
-    // Key the PIN on the unique row index i (SpecId=psm_i, ScanNr=i), NOT
-    // candidate_id: candidate_id is the library index and repeats across runs, so
-    // an experiment-wide (multi-file) PIN would collide on ScanNr and mokapot's
-    // per-spectrum competition would collapse the runs. The row index is unique
-    // across the whole concatenation. Single-run behaviour is unchanged (the
-    // mapping is bijective and mokapot does not use SpecId/ScanNr as features).
-    for i in 0..cid.len() {
-        let lab = if label[i] == "decoy" { -1 } else { 1 };
-        write!(s, "psm_{}\t{}\t{}\t{:.5}\t{:.5}\t", i, lab, i, mz[i], mz[i]).ok();
-        #[allow(clippy::needless_range_loop)] // parallel index into feats[i] bounded by feat_names
-        for fi in 0..feat_names.len() {
-            write!(s, "{:.6}\t", feats[i][fi]).ok();
-        }
-        writeln!(s, "-.{}.-\t{}", pform[i], protein[i]).ok();
+    // Per-invocation sidecar filenames. Fixed names (`rescore.pin`,
+    // `rescore_sidecar_out.parquet`) made two concurrent rescores clobber each other and
+    // let a killed run's orphaned Python worker hold `*.feat.mm` open forever, so every
+    // later rescore failed with `OSError: [Errno 22]` on a path it did not own. Keying on
+    // the output artifact plus the PID makes collisions impossible, and the guard below
+    // reaps the child so a killed parent cannot orphan it.
+    let tag = format!(
+        "{}_{}",
+        std::path::Path::new(p.out)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("rescore"),
+        std::process::id()
+    );
+    // Parquet applies to nn_torch only: mokapot_worker.py goes through
+    // `mokapot.read_pin()`, which requires the tab-separated form. Falling back with a
+    // warning beats failing a configured run.
+    let want_pq = matches!(p.cfg.handoff, mumdia_core::config::Handoff::Parquet);
+    let use_pq = want_pq && script_name.contains("nn_rescore");
+    if want_pq && !use_pq {
+        tracing::warn!(
+            script = script_name,
+            "rescore.handoff=parquet is supported only by the nn_torch sidecar (mokapot reads \
+             a PIN through mokapot.read_pin); writing the tab-separated PIN instead"
+        );
     }
-    std::fs::write(&pin, s)?;
+    let pin = if use_pq {
+        format!("{}/rescore_{tag}.features.parquet", p.work_dir)
+    } else {
+        format!("{}/rescore_{tag}.pin", p.work_dir)
+    };
+    let outp = format!("{}/rescore_{tag}_out.parquet", p.work_dir);
+
+    // Stream the PIN through a BufWriter. It was previously accumulated in ONE
+    // un-reserved String: at ~1M rows x 387 features that is a >5 GB allocation (plus
+    // realloc churn) held entirely in RAM before the first byte reaches disk.
+    if use_pq {
+        let rows = write_features_parquet(&pin, feat_names, label, pform, protein, mz, feats)?;
+        tracing::info!(
+            path = %pin,
+            rows,
+            features = feat_names.len(),
+            "rescore: wrote the sidecar feature table as parquet"
+        );
+    } else {
+        let mut w = std::io::BufWriter::with_capacity(1 << 20, std::fs::File::create(&pin)?);
+        w.write_all(b"SpecId\tLabel\tScanNr\tExpMass\tCalcMass\t")?;
+        w.write_all(feat_names.join("\t").as_bytes())?;
+        w.write_all(b"\tPeptide\tProteins\n")?;
+        // Key the PIN on the unique row index i (SpecId=psm_i, ScanNr=i), NOT
+        // candidate_id: candidate_id is the library index and repeats across runs, so
+        // an experiment-wide (multi-file) PIN would collide on ScanNr and mokapot's
+        // per-spectrum competition would collapse the runs. The row index is unique
+        // across the whole concatenation. Single-run behaviour is unchanged (the
+        // mapping is bijective and mokapot does not use SpecId/ScanNr as features).
+        for i in 0..cid.len() {
+            let lab = if label[i] == "decoy" { -1 } else { 1 };
+            write!(w, "psm_{}\t{}\t{}\t{:.5}\t{:.5}\t", i, lab, i, mz[i], mz[i])?;
+            #[allow(clippy::needless_range_loop)]
+            // parallel index into feats[i] bounded by feat_names
+            for fi in 0..feat_names.len() {
+                write!(w, "{:.6}\t", feats[i][fi])?;
+            }
+            writeln!(w, "-.{}.-\t{}", pform[i], protein[i])?;
+        }
+        w.flush()?;
+        drop(w);
+    }
 
     let script = crate::sidecar::resolve_script(p.script_dir, script_name);
-    let status = std::process::Command::new(python)
+    // Spawn (not `status()`) so the child handle is owned by a guard that kills it if we
+    // unwind or are dropped: a killed `mumdia` used to leave the Python worker running,
+    // holding its multi-GB memmap open, which made every subsequent rescore fail on a
+    // stale lock with no hint about which PID held it.
+    let child = std::process::Command::new(python)
         .arg(&script)
         .arg(&pin)
         .arg(&outp)
@@ -790,7 +1012,15 @@ fn run_pin_sidecar(
         .env("MUMDIA_NN_FOLDS", p.cfg.folds.to_string())
         .env("MUMDIA_NN_ITERS", p.cfg.num_iter.to_string())
         .env("MUMDIA_NN_TRAIN_FDR", p.cfg.train_fdr.to_string())
-        .status()?;
+        .spawn()
+        .map_err(|e| {
+            // A bare `.spawn()?` reported only "No such file or directory (os error 2)" with
+            // no indication of WHICH path was missing - the usual failure when a config moves
+            // between machines.
+            anyhow::anyhow!("spawning sidecar failed: {python} {script}: {e}")
+        })?;
+    let mut guard = ChildGuard(Some(child));
+    let status = guard.wait()?;
     if !status.success() {
         anyhow::bail!("{script_name} exited with {status}");
     }

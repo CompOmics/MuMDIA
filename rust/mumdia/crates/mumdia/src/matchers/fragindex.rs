@@ -163,23 +163,107 @@ impl FragIndex {
         let lo_bin = b.saturating_sub(1);
         let hi_bin = (b + 1).min(self.bins.n_bins - 1);
         for nb in lo_bin..=hi_bin {
-            let s = self.bin_start[nb] as usize;
-            let e = self.bin_start[nb + 1] as usize;
-            if e <= s {
-                continue;
-            }
-            // within-bin post_cand ascending -> narrow to [cand_lo, cand_hi)
-            let slice = &self.post_cand[s..e];
-            let a = s + slice.partition_point(|&c| c < cand_lo);
-            let z = s + slice.partition_point(|&c| c < cand_hi);
-            for p in a..z {
-                let pmz = self.post_mz[p] as f64;
-                if within_ppm(pmz, peak_mz, self.tol_ppm) {
-                    f(self.post_cand[p], pmz, self.post_int[p], self.post_frag[p]);
+            let (a, z) = self.narrow_bin(nb, cand_lo, cand_hi);
+            self.emit_range(a, z, peak_mz, &mut f);
+        }
+    }
+
+    /// Probe one peak using a per-window narrowing cache. Identical semantics and
+    /// identical callback order to [`FragIndex::probe_peak`] for the `(cand_lo,
+    /// cand_hi)` the cache was built with; the only difference is that the two
+    /// binary searches per bin are amortized (see [`WindowNarrow`]).
+    #[inline]
+    pub fn probe_peak_win<F: FnMut(u32, f64, f32, u16)>(
+        &self,
+        nw: &mut WindowNarrow,
+        peak_mz: f64,
+        mut f: F,
+    ) {
+        if nw.cand_hi <= nw.cand_lo {
+            return;
+        }
+        let b = self.bins.bin(peak_mz);
+        let lo_bin = b.saturating_sub(1);
+        let hi_bin = (b + 1).min(self.bins.n_bins - 1);
+        for nb in lo_bin..=hi_bin {
+            let (a, z) = match nw.range[nb] {
+                (u32::MAX, _) => {
+                    let r = self.narrow_bin(nb, nw.cand_lo, nw.cand_hi);
+                    nw.range[nb] = (r.0 as u32, r.1 as u32);
+                    r
                 }
+                (a, z) => (a as usize, z as usize),
+            };
+            self.emit_range(a, z, peak_mz, &mut f);
+        }
+    }
+
+    /// Sub-range `[a, z)` of bin `nb`'s postings whose candidate lies in
+    /// `[cand_lo, cand_hi)`. Within a bin `post_cand` is ascending, so this is a
+    /// binary search rather than a scan.
+    #[inline]
+    fn narrow_bin(&self, nb: usize, cand_lo: u32, cand_hi: u32) -> (usize, usize) {
+        let s = self.bin_start[nb] as usize;
+        let e = self.bin_start[nb + 1] as usize;
+        if e <= s {
+            return (s, s);
+        }
+        let slice = &self.post_cand[s..e];
+        let a = s + slice.partition_point(|&c| c < cand_lo);
+        let z = s + slice.partition_point(|&c| c < cand_hi);
+        (a, z)
+    }
+
+    /// Verify each posting in `[a, z)` against the exact f64 tolerance predicate and
+    /// emit the survivors.
+    #[inline]
+    fn emit_range<F: FnMut(u32, f64, f32, u16)>(
+        &self,
+        a: usize,
+        z: usize,
+        peak_mz: f64,
+        f: &mut F,
+    ) {
+        for p in a..z {
+            let pmz = self.post_mz[p] as f64;
+            if within_ppm(pmz, peak_mz, self.tol_ppm) {
+                f(self.post_cand[p], pmz, self.post_int[p], self.post_frag[p]);
             }
         }
     }
+
+    /// Build an empty narrowing cache for the candidate window `[cand_lo, cand_hi)`.
+    pub fn window_narrow(&self, cand_lo: u32, cand_hi: u32) -> WindowNarrow {
+        WindowNarrow {
+            cand_lo,
+            cand_hi,
+            range: vec![(u32::MAX, u32::MAX); self.bins.n_bins],
+        }
+    }
+}
+
+/// Per-isolation-window cache of each fragment bin's `[cand_lo, cand_hi)` posting
+/// sub-range.
+///
+/// `probe_peak` spends two binary searches per probed bin (six per peak) narrowing
+/// a bin's postings to the precursor window. Those searches dominate the useful
+/// work: an isolation window holds well under 1% of the library's candidates, so a
+/// bin of a few dozen postings typically narrows to none or one. Since `cand_lo`
+/// and `cand_hi` are fixed for a whole isolation window and every scan of that
+/// window revisits the same bins, the searches only need to happen once per
+/// `(window, bin)` instead of once per peak.
+///
+/// Entries are filled lazily, so a window only pays for the bins its peaks actually
+/// reach. `u32::MAX` marks "not yet computed"; it cannot collide with a real posting
+/// index because `bin_start` is itself `u32`, so an index that large could not be
+/// represented in the first place.
+///
+/// Cost is 8 bytes per bin (order of 1 MB for a 20 ppm index over the usual
+/// fragment m/z range), held by one worker for the duration of one window.
+pub struct WindowNarrow {
+    cand_lo: u32,
+    cand_hi: u32,
+    range: Vec<(u32, u32)>,
 }
 
 /// Epoch-stamped dense accumulator for the seed's fused `(count, obs_sum)` semiring
@@ -194,16 +278,35 @@ pub struct SeedScratch {
     stamp: Vec<u32>,
     touched: Vec<u32>,
     epoch: u32,
+    /// `candidate_id` that maps to slot 0. The arrays are indexed WINDOW-RELATIVE, so
+    /// they only need to span the widest isolation window rather than the whole library:
+    /// sized by `n_cand` they cost 16 B x n_cand PER rayon worker (877 MB per worker on
+    /// the profiled 54.8M-candidate library), almost all of it never touched because a
+    /// worker only ever sees candidates inside one window.
+    base: u32,
 }
 
 impl SeedScratch {
-    pub fn new(n_cand: usize) -> SeedScratch {
+    /// `cap` is the expected maximum candidate-window width, not the library size.
+    /// Passing a smaller value is safe: the arrays grow on demand.
+    pub fn new(cap: usize) -> SeedScratch {
         SeedScratch {
-            count: vec![0; n_cand],
-            obs_sum: vec![0.0; n_cand],
-            stamp: vec![0; n_cand], // 0 is never a live epoch (epoch increments before scan 1)
+            count: vec![0; cap],
+            obs_sum: vec![0.0; cap],
+            stamp: vec![0; cap], // 0 is never a live epoch (epoch increments before scan 1)
             touched: Vec::new(),
             epoch: 0,
+            base: 0,
+        }
+    }
+
+    /// Ensure the window-relative arrays span `width` slots.
+    fn ensure(&mut self, width: usize) {
+        if self.count.len() < width {
+            self.count.resize(width, 0);
+            self.obs_sum.resize(width, 0.0);
+            // New slots must not appear stamped for the current epoch.
+            self.stamp.resize(width, 0);
         }
     }
 
@@ -220,10 +323,14 @@ impl SeedScratch {
     ) {
         self.epoch += 1;
         self.touched.clear();
+        // Index relative to this window's first candidate.
+        self.base = cand_lo;
+        self.ensure((cand_hi.saturating_sub(cand_lo)) as usize + 1);
         let epoch = self.epoch;
+        let base = self.base;
         for &(mz, inten) in peaks {
             idx.probe_peak(mz, cand_lo, cand_hi, |cid, _pmz, _pint, _pfrag| {
-                let cc = cid as usize;
+                let cc = (cid - base) as usize;
                 if self.stamp[cc] != epoch {
                     self.stamp[cc] = epoch;
                     self.count[cc] = 0;
@@ -242,14 +349,17 @@ impl SeedScratch {
         &self.touched
     }
 
+    /// Valid only for candidate ids from the most recent [`SeedScratch::accumulate`]
+    /// window (which is what [`SeedScratch::touched`] returns).
     #[inline]
     pub fn count(&self, cid: u32) -> u32 {
-        self.count[cid as usize]
+        self.count[(cid - self.base) as usize]
     }
 
+    /// See [`SeedScratch::count`] for the validity window.
     #[inline]
     pub fn obs_sum(&self, cid: u32) -> f64 {
-        self.obs_sum[cid as usize]
+        self.obs_sum[(cid - self.base) as usize]
     }
 }
 
@@ -288,7 +398,7 @@ mod tests {
     fn lib_from(cands: &[(Vec<(f64, f32)>, f64)]) -> Library {
         let mut frag_mz = Vec::new();
         let mut frag_int = Vec::new();
-        let mut frag_name = Vec::new();
+        let mut frag_name_id: Vec<u16> = Vec::new();
         let mut prec_mz = Vec::new();
         let mut cs = Vec::new();
         for (i, (frags, pmz)) in cands.iter().enumerate() {
@@ -296,7 +406,7 @@ mod tests {
             for &(mz, int) in frags {
                 frag_mz.push(mz);
                 frag_int.push(int);
-                frag_name.push("f".to_string());
+                frag_name_id.push(0);
             }
             cs.push(Candidate {
                 candidate_id: i as u32,
@@ -317,13 +427,71 @@ mod tests {
             cands: cs,
             frag_mz,
             frag_int,
-            frag_name,
+            frag_name_id,
+            frag_name_dict: vec!["f".to_string()],
             idx_mz: Vec::new(),
             idx_cid: Vec::new(),
             idx_int: Vec::new(),
             bucket_min: Vec::new(),
             bucket_size: 1,
             prec_mz,
+        }
+    }
+
+    #[test]
+    fn probe_peak_win_matches_probe_peak_callback_for_callback() {
+        // The cached probe must be a drop-in: same postings, same order, same values,
+        // including on repeat probes (which is where the cache is actually exercised)
+        // and on empty / out-of-window bins.
+        let tol = 20.0;
+        let mut cands: Vec<(Vec<(f64, f32)>, f64)> = Vec::new();
+        let mut pmz = 400.0f64;
+        for i in 0..40 {
+            let base = 300.0 + (i as f64) * 17.3;
+            cands.push((
+                vec![
+                    (base, 1.0 + i as f32),
+                    (base + 0.0004, 0.5),  // same bin as `base`
+                    (base * 1.00001, 0.7), // adjacent bin
+                    (900.0 + i as f64, 0.3),
+                ],
+                pmz,
+            ));
+            pmz += 3.0;
+        }
+        let lib = lib_from(&cands);
+        let idx = FragIndex::build(&lib, tol);
+
+        for &(win_lo, win_hi) in &[(400.0, 520.0), (0.0, 1e9), (401.5, 402.5), (1e9, 2e9)] {
+            let (lo, hi) = idx.candidate_range(win_lo, win_hi);
+            let mut nw = idx.window_narrow(lo, hi);
+            // Two passes over the same peaks: pass 2 reads the filled cache.
+            for _pass in 0..2 {
+                let mut probes: Vec<f64> = Vec::new();
+                for i in 0..40 {
+                    let base = 300.0 + (i as f64) * 17.3;
+                    probes.push(base);
+                    probes.push(base * (1.0 + tol * 1e-6 * 0.98)); // just inside tol
+                    probes.push(base * (1.0 + tol * 1e-6 * 4.0)); // outside tol
+                    probes.push(900.0 + i as f64);
+                }
+                probes.push(50.0); // below the indexed range
+                probes.push(5000.0); // above it
+                for &q in &probes {
+                    let mut a: Vec<(u32, u64, u32, u16)> = Vec::new();
+                    idx.probe_peak(q, lo, hi, |c, m, it, fr| {
+                        a.push((c, m.to_bits(), it.to_bits(), fr))
+                    });
+                    let mut b: Vec<(u32, u64, u32, u16)> = Vec::new();
+                    idx.probe_peak_win(&mut nw, q, |c, m, it, fr| {
+                        b.push((c, m.to_bits(), it.to_bits(), fr))
+                    });
+                    assert_eq!(
+                        a, b,
+                        "cached probe diverged at q={q} window=({win_lo},{win_hi})"
+                    );
+                }
+            }
         }
     }
 

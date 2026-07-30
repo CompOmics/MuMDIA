@@ -154,6 +154,97 @@ pub enum PeakClaim {
     /// stripping real peptides at ambiguous peaks where no candidate clearly owns
     /// the elution.
     CoelutionWinnerMargin,
+    /// Multi-cue co-elution winner (two-pass, modular fragment-competition framework).
+    /// The per-claimant competition weight is the elution profile height multiplied
+    /// by the composable cues enabled in [`ClaimCues`] (sub-tolerance m/z proximity,
+    /// RT prior, isotope coherence, MS1 precursor support, ...), each defaulting to
+    /// 1.0 so this reduces to `CoelutionWinner` when no cue is enabled. Winner-take-all
+    /// on the composite weight when `reassign` is set.
+    CoelutionMultiCue,
+    /// Spectrum-centric demix redistribution (two-pass, destructive). At each scan the
+    /// co-isolated candidate x fragment design matrix is assembled and solved by
+    /// non-negative least squares; each shared peak's intensity is then split among its
+    /// claimants in proportion to `beta_c * D[peak,c]` (the joint deconvolution) instead
+    /// of stripped winner-take-all. The smooth, principled destructive mode - the CHIMERYS
+    /// coefficient split, made chromatographic and clean-room. Always redistributes; the
+    /// demix FEATURES are the separate `emit_demix_features` path. Deterministic (sorted
+    /// candidate columns, ridge NNLS).
+    CoelutionDemix,
+    /// Shadow-subtraction redistribution (two-pass, destructive, no solver). At each scan,
+    /// each co-eluter's abundance is estimated from the channels it ALONE claims (its unique
+    /// ions, `a_p = median y/D` over those); every candidate then keeps, at each of its
+    /// channels, `max(0, y - sum_{p != c} a_p * D[peak,p])` - its intensity minus the
+    /// interferers' estimated contributions. Unlike winner-take-all, several real co-eluters
+    /// can both retain signal at a shared peak; unlike the NNLS demix it needs no solve, so
+    /// it is cheap. A candidate with no unique ion cannot be estimated and contributes no
+    /// subtraction. The gentle destructive mode. Deterministic; default off.
+    CoelutionShadow,
+}
+
+/// Composable per-claimant weight cues for [`PeakClaim::CoelutionMultiCue`] (the
+/// modular fragment-competition framework). Each cue is label-blind (reads only
+/// observed/predicted m/z + intensity, RT, MS1) so target/decoy exchangeability is
+/// preserved, and each defaults OFF (weight 1.0) so the composite weight reduces to
+/// the plain elution-profile height. Enable cues incrementally and validate as
+/// non-destructive features before any destructive/default use.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ClaimCues {
+    /// Sub-tolerance m/z proximity (S3): weight a claimant by
+    /// `exp(-(ppm_err/sigma)^2)`, where `ppm_err` is the signed ppm offset of the
+    /// observed peak from this claimant's predicted fragment m/z. Two collided
+    /// fragments share a peak only because both fall within `frag_tol`, but the
+    /// observed peak sits at the true owner's m/z; the sub-tolerance offset is a
+    /// novel apportionment weight (engines use ppm only as a binary gate).
+    pub mz_close: bool,
+    /// Gaussian sigma (ppm) for the `mz_close` cue. Default 5 ppm.
+    pub mz_close_sigma_ppm: f64,
+    /// DeepLC retention-time prior (S3): weight a claimant by
+    /// `exp(-(rt - rt_pred)^2 / 2 tau^2)`, where `rt_pred` is the candidate's
+    /// calibrated predicted RT. A co-isolated interferent whose predicted RT is far
+    /// from the current scan gets a low weight even if it briefly co-elutes, so a
+    /// shared peak is apportioned toward the candidate the RT model actually places
+    /// there. No-op where the predicted RT is unset (0).
+    pub rt_prior: bool,
+    /// Gaussian sigma (seconds) for the `rt_prior` cue. Default 30 s.
+    pub rt_prior_tau_s: f64,
+    /// MS1 precursor-envelope support (S4, cross-dimension): weight a claimant by
+    /// whether its own precursor isotope envelope (mono + a plausible +1/mono ratio)
+    /// is actually present in the nearest MS1 scan. A shift/reverse decoy has a
+    /// well-defined precursor m/z but no real co-eluting MS1 precursor, so its support
+    /// is noise, starving its MS2 claim via an orthogonal dimension that is nearly
+    /// impossible to fake. No-op when no MS1 is provided. Down-weights (never zeroes)
+    /// so a genuinely MS1-poor real peptide is not eliminated.
+    pub ms1_support: bool,
+    /// DESTRUCTIVE redistribution for `CoelutionMultiCue`. When true, the cue-weighted
+    /// arbitration rewrites the extracted peak intensities (winner-take-all on the
+    /// composite weight), instead of only emitting the apportioned/contested features.
+    /// The competed evidence then feeds EVERY downstream feature (co-elution, spectral,
+    /// mass-accuracy, ...), so this is the impactful form. Off by default; changes the
+    /// search/FDR evidence, so it is entrapment-gated per CLAUDE.md.
+    pub reassign: bool,
+    /// Uniqueness-seeded EM apportionment (S2): number of fixed-point iterations that
+    /// re-seed each candidate's per-scan elution profile from its APPORTIONED (not full)
+    /// intensity before the final arbitration. The plain profile is built from full
+    /// intensities, so a borrowing candidate's profile is inflated by the very peaks it
+    /// borrows; re-seeding from the cue-weighted share removes that feedback, while
+    /// uncontested (single-claimant) peaks contribute full intensity every iteration as
+    /// an immovable anchor. 0 (default) disables EM (single-pass profile). Deterministic
+    /// (fixed N); applies under `CoelutionMultiCue`.
+    pub apportion_em_iters: u32,
+}
+impl Default for ClaimCues {
+    fn default() -> Self {
+        Self {
+            mz_close: false,
+            mz_close_sigma_ppm: 5.0,
+            rt_prior: false,
+            rt_prior_tau_s: 30.0,
+            ms1_support: false,
+            reassign: false,
+            apportion_em_iters: 0,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -215,6 +306,16 @@ pub struct PeptidoformsConfig {
     pub max_variable_mods: usize,
     pub charge_min: i32,
     pub charge_max: i32,
+    /// Composition-based precursor charge range. When true, ignore
+    /// `charge_min`/`charge_max` and emit every charge from 1 up to
+    /// `1 (N-terminus) + (#R + #H + #K)`, the proton-carrying capacity of the
+    /// peptide. Peptides therefore never receive a charge state they cannot
+    /// physically hold, and each peptide's range depends on its own basic-residue
+    /// count. Default false (fixed `charge_min..=charge_max` for every peptide).
+    /// Pairs with `predict_frag.charge_by_basic_residues` for fragments. Changing
+    /// the enumerated charge states changes the search/training/FDR population, so
+    /// this remains benchmark-gated.
+    pub charge_by_basic_residues: bool,
     /// `error` (default) or `skip` for unknown modifications.
     pub unknown_modification: UnknownModPolicy,
 }
@@ -232,6 +333,7 @@ impl Default for PeptidoformsConfig {
             max_variable_mods: 1,
             charge_min: 2,
             charge_max: 3,
+            charge_by_basic_residues: false,
             unknown_modification: UnknownModPolicy::Error,
         }
     }
@@ -264,6 +366,13 @@ pub struct PredictFragConfig {
     /// doubly-charged fragments for ~16% of charge-2 precursors' transitions, so
     /// blocking them (the old default of 3) discarded real signal.
     pub charge2_from_precursor_charge: i32,
+    /// Composition-based fragment charge cap. When true, a b/y fragment is kept
+    /// at charge z only if `z <= 1 (its N-terminal amine) + (#R + #H + #K within
+    /// that fragment)`, and never above the precursor charge. This supersedes the
+    /// `charge2_from_precursor_charge` rule when set. Default false. Pairs with
+    /// `peptidoforms.charge_by_basic_residues` for precursors; benchmark-gated
+    /// because it changes the scored transition set.
+    pub charge_by_basic_residues: bool,
     pub top_n_fragments: usize,
     pub ms2pip_model: String,
     /// Python executable for the MS2PIP sidecar (env with ms2pip + pyarrow).
@@ -279,6 +388,7 @@ impl Default for PredictFragConfig {
             predictor: t(),
             rt_predictor: t(),
             charge2_from_precursor_charge: 2,
+            charge_by_basic_residues: false,
             top_n_fragments: 6,
             ms2pip_model: "HCD".to_string(),
             ms2pip_python: None,
@@ -311,6 +421,13 @@ pub struct SearchSeedConfig {
     /// robust offset + local uncertainty. Falls back to the single-pass result when
     /// too few in-window calibrants remain. Default false (single pass unchanged).
     pub two_pass_mass_cal: bool,
+    /// m/z-dependent fragment mass calibration. When true, fit a LOESS of the
+    /// calibrant ppm deviation versus fragment m/z and emit a sampled correction
+    /// grid to `<seed>.masscal.json`; extract then applies an m/z-interpolated
+    /// offset per peak instead of the single scalar `frag_ppm_offset`. This
+    /// removes any m/z-correlated curvature the flat offset leaves. Default false
+    /// (scalar offset unchanged), opt-in and benchmark-gated.
+    pub mass_cal_loess: bool,
 }
 impl Default for SearchSeedConfig {
     fn default() -> Self {
@@ -322,6 +439,7 @@ impl Default for SearchSeedConfig {
             top_n_peaks: 300,
             matcher: MatcherKind::Fragindex,
             two_pass_mass_cal: false,
+            mass_cal_loess: false,
         }
     }
 }
@@ -444,6 +562,14 @@ pub struct ExtractConfig {
     /// the apex toward the RT-window centre (~= predicted RT) as a mild RT-prior;
     /// measured to beat a mean by ~+300 IDs on AIF. 1 = no smoothing (per-scan).
     pub apex_count_window: usize,
+    /// Gaussian matched-filter smoothing of the per-scan fragment-count series
+    /// before apex selection, as a sigma in scan units. 0.0 (default) keeps the
+    /// `apex_count_window` rolling-sum smoother unchanged. When > 0, the count
+    /// series is convolved with a Gaussian kernel (radius = 3*sigma) instead,
+    /// which localizes the apex more robustly than a uniform window against
+    /// scan-to-scan flicker. Opt-in and benchmark-gated: it changes apex
+    /// selection and therefore identifications.
+    pub apex_gaussian_sigma_scans: f64,
     /// Emit per-fragment chromatograms on the FULL isolation-window scan grid with
     /// 0.0 where a fragment is absent (aggregating scans of the same isolation
     /// window), so the elution profile drops to zero between peaks and the
@@ -454,6 +580,30 @@ pub struct ExtractConfig {
     /// How a shared observed peak's intensity is apportioned among co-isolated,
     /// co-eluting candidates that all match it (see [`PeakClaim`]).
     pub peak_claim: PeakClaim,
+    /// Composable claim-weight cues for `PeakClaim::CoelutionMultiCue` (modular
+    /// fragment-competition framework). All default off (weight 1.0).
+    pub claim_cues: ClaimCues,
+    /// Spectrum-centric NNLS demixing (D2, fragment-competition report). When true,
+    /// at each accepted candidate's apex scan, assemble the co-isolated candidate x
+    /// fragment design matrix, solve non-negative least squares (deterministic
+    /// ridge-regularized), and emit non-destructive demix features (deconv_explained_frac,
+    /// deconv_active, deconv_share) so the rescorer sees each candidate's
+    /// interference-corrected abundance. Default false; changes no extracted intensity.
+    pub emit_demix_features: bool,
+    /// Ridge for the demix NNLS passive solve (keeps it PD/deterministic under the
+    /// ~98% wide-window column collinearity). Default 1.0.
+    pub demix_lambda: f64,
+    /// Cap on the number of co-isolated candidates (design-matrix columns) in a single
+    /// demix solve, to bound compute on crowded windows. Default 64.
+    pub demix_max_candidates: usize,
+    /// Scan stride for the DESTRUCTIVE `CoelutionDemix` redistribution: solve the
+    /// per-scan NNLS every Nth scan and reuse the resulting candidate abundances to
+    /// apportion the intervening scans (a re-solve is forced whenever a new candidate
+    /// enters the co-isolated set, so accuracy is preserved where the population
+    /// changes). This is the practicality lever - a full per-scan solve over the ~465k
+    /// scans of a wide-window run is impractical. 1 (default) solves at every scan.
+    /// Only affects `CoelutionDemix`; the non-destructive demix FEATURES are unaffected.
+    pub demix_scan_stride: usize,
     /// Emit a non-destructive `contested_frac` per PSM: the fraction of a
     /// candidate's matched intensity that a co-eluting competitor claims more
     /// strongly (by the two-pass elution-profile arbitration). Does not alter the
@@ -483,6 +633,24 @@ pub struct ExtractConfig {
     /// selected apex, so these extra hypotheses are not currently rescored or used
     /// to improve identifications. K=1 preserves the single-apex behaviour.
     pub retain_top_peaks: usize,
+    /// Number of chromatographic peaks PROMOTED to real feature/rescore rows per
+    /// candidate (AlphaDIA plan #7, top-K). `1` (default) emits only the selected
+    /// apex, so the pipeline is byte-identical. `>1` additionally emits the next
+    /// strongest non-overlapping `enumerate_peaks` groups (each a full re-sliced PSM
+    /// record carrying `peak_rank`), so the rescorer can pick the correct-but-not-apex
+    /// peak; the selected apex stays `peak_rank = 0`. Must be `<= retain_top_peaks`.
+    /// Behaviour-changing and benchmark/entrapment-gated: it changes the extracted
+    /// row population, and compete/rescore must collapse per candidate so the decoy
+    /// null is not K-inflated.
+    pub promote_top_peaks: usize,
+    /// Minimum integrated area of a promoted alternate peak (rank >= 1) as a fraction
+    /// of the rank-0 peak's area. Suppresses noise-level alternates. Only used when
+    /// `promote_top_peaks > 1`.
+    pub alt_peak_min_area_frac: f64,
+    /// Minimum apex-RT separation (seconds) between a promoted alternate peak and the
+    /// rank-0 apex, so a near-duplicate of the selected peak is not re-emitted. Only
+    /// used when `promote_top_peaks > 1`.
+    pub alt_peak_min_separation_s: f64,
     /// Diagnostic candidate-audit: when true, extraction records, for every probed
     /// candidate, either the survivor stage-flags or the earliest `RejectionReason`,
     /// and writes `<out-psms>.audit.parquet` (spec 01 §4 / P0.3). Near-zero cost
@@ -531,17 +699,26 @@ impl Default for ExtractConfig {
             apex_top_fragments: 0, // superseded by apex_count_tol; kept for compat
             apex_rt_prior_s: 0.0,  // RT prior off by default
             apex_count_tol: 1,     // fragment-count apex with 1-fragment slack
+            apex_gaussian_sigma_scans: 0.0, // Gaussian apex smoother off by default (opt-in)
             apex_count_window: 1,  // no rolling smoothing by default (opt-in; window 5
             // cuts AIF apex misassignment, median |dRT| 131s->9s)
             emit_window_grid: true, // zero-filled window-grid chromatograms
             bucket_size: 8192,
             peak_claim: PeakClaim::None,
+            claim_cues: ClaimCues::default(),
+            emit_demix_features: false,
+            demix_lambda: 1.0,
+            demix_max_candidates: 64,
+            demix_scan_stride: 1,
             emit_contested_features: false,
             peak_claim_margin: 2.0,
             matcher: MatcherKind::Fragindex,
             min_coelution_run: 0, // disabled; scan_window floor still applies
             ms1_rescue: false,    // opt-in; relaxes acceptance, validate FDR first
             retain_top_peaks: 1,  // legacy single-apex behaviour (K=1)
+            promote_top_peaks: 1, // top-K promotion off (only the selected apex is a row)
+            alt_peak_min_area_frac: 0.10, // alternate peak >= 10% of rank-0 area
+            alt_peak_min_separation_s: 5.0, // alternate apex >= 5 s from rank-0 apex
             emit_candidate_audit: false, // diagnostic; off in production
             apex_evidence_rank: false, // legacy signature-intensity apex
             emit_gate_diagnostics: false, // diagnostic gate-score columns; off in production
@@ -584,6 +761,12 @@ pub enum GateMode {
 #[serde(default, deny_unknown_fields)]
 pub struct FeaturesConfig {
     pub set: FeatureSet,
+    /// Write the Percolator-style `.pin` text file requested by `--out-pin`. No MuMDIA
+    /// stage consumes it (`rescore` builds its own PIN for the sidecars); it exists for
+    /// external tooling. At 1.5M rows x 387 features it is a ~5.4 GB text write, so set
+    /// this to false to skip it when nothing downstream needs it. Default true, so the
+    /// artifact keeps appearing unless it is explicitly turned off.
+    pub emit_pin: bool,
     pub coelution_corr_threshold: f64,
     pub prec_tol_ppm: f64,
     /// Restrict trace-based features (co-elution, profile, xcorr, interference,
@@ -614,11 +797,19 @@ pub struct FeaturesConfig {
     /// right elution half-width when `bound_from_confident` is true. 50 = median
     /// (typical real peak width); higher percentiles widen the shared window.
     pub bound_confident_pct: f64,
+    /// Emit the MS1 apex-isotope precursor feature `ms1_isotope_height_corr`
+    /// (Pearson of the observed apex isotope heights [i0,i1,i2] against the
+    /// Poisson-averagine model). Default false (the feature is present in the
+    /// battery but returns 0.0, so the vector length is unchanged in effect). It
+    /// overlaps the existing `ms1_isotope_cosine_apex`, so it is opt-in and
+    /// benchmark-gated rather than default-on (AlphaDIA-plan item 12).
+    pub ms1_precursor_features: bool,
 }
 impl Default for FeaturesConfig {
     fn default() -> Self {
         Self {
             set: t(),
+            emit_pin: true, // preserve the artifact; set false to skip a ~5.4 GB text write
             coelution_corr_threshold: 0.9,
             prec_tol_ppm: 20.0,
             bound_features: true,
@@ -626,6 +817,7 @@ impl Default for FeaturesConfig {
             bound_peak_grace: 0, // stop at first sub-threshold scan (legacy)
             bound_from_confident: true, // fixed feature window from confident-seed norm
             bound_confident_pct: 50.0, // median confident half-width
+            ms1_precursor_features: false, // opt-in; overlaps ms1_isotope_cosine_apex
         }
     }
 }
@@ -824,6 +1016,11 @@ pub struct QuantConfig {
     /// `precursor_q` is single-run only; use `run_psm_q` for per-run slices of an
     /// experiment-wide rescore). See [`QuantQColumn`].
     pub q_filter: QuantQColumn,
+    /// Apply an apex-outward interference-correction envelope to each fragment
+    /// trace before integrating its area, stripping co-eluting interference in the
+    /// peak wings. Off by default (identity on a clean peak). Opt-in and
+    /// benchmark-gated: it changes reported quantities.
+    pub interference_envelope: bool,
 }
 impl Default for QuantConfig {
     fn default() -> Self {
@@ -838,13 +1035,22 @@ impl Default for QuantConfig {
             peak_window_mode: PeakWindowMode::PerCandidate,
             reliable_q: 0.001,
             q_filter: QuantQColumn::PeptideQ,
+            interference_envelope: false, // apex-outward interference envelope off by default
         }
     }
 }
 
 /// Match-between-runs strategy (Stage D3, `mbr_plan.md`). Default `None` reproduces
-/// the current chain byte-for-byte. Later variants transfer identification evidence
-/// across a run set: `EmpiricalLibrary` builds the consensus anchor library only;
+/// the current chain byte-for-byte.
+///
+/// ONLY `None` VS NOT-`None` IS IMPLEMENTED. The three non-`None` variants are described
+/// below as the intended staging, but no code distinguishes them: every test in the tree is
+/// `strategy != None`, so selecting `RtTransfer` or `Full` today behaves exactly like
+/// `EmpiricalLibrary`. They are kept as the recorded design ladder rather than deleted
+/// because the MBR tier is planned and benchmark-gated (CLAUDE.md); `validate()` warns when
+/// a non-`None` variant is selected so a config cannot quietly expect more than it gets.
+///
+/// Intended staging: `EmpiricalLibrary` builds the consensus anchor library only;
 /// `RtTransfer` adds cross-run expected-RT transfer extraction; `Full` adds
 /// requantification. All require >= 2 runs and a decoy-transfer FDR (see the plan).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -885,17 +1091,22 @@ pub struct MbrConfig {
     pub min_anchor_runs: usize,
     /// Accept threshold for a transferred identification's transfer q-value.
     pub q_transfer: f64,
-    /// Transfer RT half-window (seconds) around the cross-run-predicted RT. The M2
-    /// leave-target-out residual was ~17 s at p95, ~15x tighter than the search
-    /// window; this is the default so the false-transfer search space stays small.
+    /// NOT YET WIRED. Transfer RT half-window (seconds) around the cross-run-predicted
+    /// RT. The M2 leave-target-out residual was ~17 s at p95, ~15x tighter than the search
+    /// window, which is where this default comes from -- but no code reads this field yet,
+    /// so setting it has no effect. Kept as the recorded design value for the MBR transfer
+    /// tier; `validate()` warns if it is changed from the default. See CLAUDE.md, "MBR
+    /// transfer/re-extraction remains benchmark-gated".
     pub rt_window_s: f64,
-    /// Which decoy-transfer null estimates the false-transfer rate (M4).
+    /// NOT YET WIRED. Which decoy-transfer null would estimate the false-transfer rate
+    /// (M4). No code reads this field yet; `validate()` warns if it is changed.
     pub decoy_transfer: DecoyTransfer,
     /// Minimum correlation of the observed fragment pattern to the empirical
     /// consensus for a transfer to be accepted (interference guard; 0 disables).
     pub consensus_corr_min: f64,
-    /// Requantify already-identified precursors too (fill the matrix), not only
-    /// transferred ones. Only used when `strategy = Full`.
+    /// NOT YET WIRED. Would requantify already-identified precursors too (fill the
+    /// matrix), not only transferred ones, under `strategy = Full`. No code reads this
+    /// field yet; `validate()` warns if it is changed.
     pub requant_all: bool,
     /// Python interpreter for the `mbr_worker.py` sidecar (pandas/pyarrow/numpy;
     /// e.g. the `py312_mumdia` env). Required when `strategy != None`.
@@ -952,6 +1163,10 @@ pub struct RescoreConfig {
     /// silently execute a different model; set false only for explicit legacy
     /// compatibility.
     pub strict: bool,
+    /// How the feature matrix reaches a sidecar rescorer. See [`Handoff`]. `parquet` is
+    /// dramatically faster on large pools but applies to nn_torch only.
+    #[serde(default)]
+    pub handoff: Handoff,
 }
 impl Default for RescoreConfig {
     fn default() -> Self {
@@ -967,6 +1182,7 @@ impl Default for RescoreConfig {
             entrapment_contaminant_markers: Vec::new(),
             entrapment_ratio: 1.0,
             strict: true,
+            handoff: Handoff::Tsv,
         }
     }
 }
@@ -974,6 +1190,86 @@ impl Default for RescoreConfig {
 // ---------------------------------------------------------------------------
 // Top-level config
 // ---------------------------------------------------------------------------
+
+/// How many DeepLC fine-tunes an experiment pays for.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FinetuneScope {
+    /// Fine-tune DeepLC once, on the FIRST run's confident seeds, and reuse that library
+    /// for every run. Each run still fits its OWN retention-time calibration (LOESS by
+    /// default) on top of it.
+    ///
+    /// MEASURED COST (6-run ProteoBench HYE AIF set, 2026-07-28). Reuse is NOT free: the
+    /// run that owned the fine-tune reached a median |RT residual| of 15.2 s, while the
+    /// five reusing runs reached 20.3, 20.5, 20.9, 24.9 and 25.4 s -- +7.2 s, +47% on
+    /// average -- and their calibrated RT windows widened from 145 s to 179-227 s. The
+    /// degradation is MONOTONIC in acquisition order, i.e. real chromatographic drift that
+    /// a single fine-tune cannot track; per-run LOESS corrects the slope (0.96-0.99) but
+    /// not the scatter. Wider windows also cost compute downstream: extract roughly
+    /// doubled (126 s -> 203-242 s) and features up to tripled (116 s -> 215-388 s),
+    /// which claws back part of the saving.
+    ///
+    /// It is still the default because the fine-tune dominates a large experiment: one
+    /// 36.5 min fine-tune instead of N. On an 80-run batch that is ~48 h saved against
+    /// ~6.5 h of extra extract/features. But on a long batch the drift keeps growing, so
+    /// prefer `PerRun` when the extra hours are affordable, and treat periodic
+    /// re-fine-tuning (not yet implemented) as the better answer for very large batches.
+    #[default]
+    FirstRunOnly,
+    /// Fine-tune separately for every run. Adapts the model weights to each run's own
+    /// chromatography instead of only calibrating a shared model, which measurably
+    /// tightens retention time: see the numbers on `FirstRunOnly`. Costs one full DeepLC
+    /// fine-tune per run (36.5 min on the HYE library: 5.7 min training plus 30.8 min
+    /// predicting 4.9M peptidoforms).
+    PerRun,
+}
+
+/// How the feature matrix crosses the Rust -> Python boundary for a sidecar rescorer.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Handoff {
+    /// Tab-separated PIN. Percolator's format, and what `mokapot.read_pin` requires.
+    #[default]
+    Tsv,
+    /// Parquet feature table with f32 features. Measured on an 8,858,206-PSM
+    /// experiment-wide rescore: the 30.18 GB TSV exceeded the worker's streaming threshold,
+    /// so every iteration re-read a 12.77 GB memmap; Parquet kept the matrix in memory and
+    /// the rescore went from 671.6 min to 12 min with the decoy fraction unchanged at
+    /// 0.988%. Features are f32 because the TSV was already lossy (`{:.6}`) and the worker
+    /// casts to f32 regardless.
+    ///
+    /// nn_torch only: `mokapot_worker.py` calls `mokapot.read_pin()` and cannot read
+    /// Parquet, so a mokapot run falls back to `Tsv` with a warning instead of failing.
+    Parquet,
+}
+
+/// Options for the experiment-wide orchestrator (`mumdia run-experiment`).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ExperimentConfig {
+    /// How many per-run search chains to execute concurrently.
+    ///
+    /// 1 (default) is strictly sequential, i.e. the historical behaviour. Runs are
+    /// independent, so raising this scales nearly linearly in wall time, but EACH
+    /// concurrent run holds its own extraction working set (tens of GB on a large
+    /// library), so the practical ceiling is memory, not cores. Raise it deliberately
+    /// after checking peak RSS for a single run; 2-4 is a reasonable start on a
+    /// large-memory machine. Results are unaffected: chunks are processed in index
+    /// order and completion order never reaches the output.
+    pub parallel_runs: usize,
+    /// Whether the DeepLC fine-tune runs once for the experiment or once per run.
+    /// Only consulted when `rt_im_train.finetune_deeplc` is set.
+    pub finetune_scope: FinetuneScope,
+}
+
+impl Default for ExperimentConfig {
+    fn default() -> Self {
+        Self {
+            parallel_runs: 1,
+            finetune_scope: FinetuneScope::FirstRunOnly,
+        }
+    }
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -991,6 +1287,8 @@ pub struct Config {
     pub quant: QuantConfig,
     #[serde(default)]
     pub mbr: MbrConfig,
+    #[serde(default)]
+    pub experiment: ExperimentConfig,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -1007,6 +1305,7 @@ impl Default for Config {
             rescore: t(),
             quant: t(),
             mbr: t(),
+            experiment: t(),
         }
     }
 }
@@ -1103,6 +1402,39 @@ impl Config {
                     .into(),
             ));
         }
+        // MBR fields that are accepted and documented but not yet read by any stage. Setting
+        // them has NO effect, which is worse than rejecting them: the run looks configured.
+        // Warn rather than error so existing configs keep parsing (serde uses
+        // deny_unknown_fields, so deleting the fields outright would break them).
+        {
+            let d = MbrConfig::default();
+            let mut inert: Vec<&str> = Vec::new();
+            if (self.mbr.rt_window_s - d.rt_window_s).abs() > f64::EPSILON {
+                inert.push("mbr.rt_window_s");
+            }
+            if self.mbr.decoy_transfer != d.decoy_transfer {
+                inert.push("mbr.decoy_transfer");
+            }
+            if self.mbr.requant_all != d.requant_all {
+                inert.push("mbr.requant_all");
+            }
+            if !inert.is_empty() {
+                tracing::warn!(
+                    fields = ?inert,
+                    "these MBR config fields are parsed but not read by any stage yet, so \
+                     setting them has no effect on this run"
+                );
+            }
+            // Only `strategy == None` vs `!= None` is ever tested, so the non-None variants
+            // are indistinguishable in behaviour.
+            if self.mbr.strategy != MbrStrategy::None {
+                tracing::warn!(
+                    strategy = ?self.mbr.strategy,
+                    "mbr.strategy currently only distinguishes none vs not-none; the \
+                     individual non-none variants behave identically"
+                );
+            }
+        }
         Ok(())
     }
 
@@ -1137,6 +1469,38 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn experiment_finetune_scope_defaults_to_first_run_only() {
+        // The expensive default must be the cheap one: paying a DeepLC fine-tune per run
+        // is hours-to-days on a large experiment, and each run calibrates itself anyway.
+        assert_eq!(
+            Config::default().experiment.finetune_scope,
+            FinetuneScope::FirstRunOnly
+        );
+        let c = Config::from_json("{}").expect("empty config parses");
+        assert_eq!(c.experiment.finetune_scope, FinetuneScope::FirstRunOnly);
+        let c = Config::from_json(r#"{"experiment":{"finetune_scope":"per_run"}}"#)
+            .expect("per_run parses");
+        assert_eq!(c.experiment.finetune_scope, FinetuneScope::PerRun);
+        // Old configs that predate the section keep working.
+        let c = Config::from_json(r#"{"experiment":{"parallel_runs":3}}"#).expect("parses");
+        assert_eq!(c.experiment.parallel_runs, 3);
+        assert_eq!(c.experiment.finetune_scope, FinetuneScope::FirstRunOnly);
+    }
+
+    #[test]
+    fn experiment_parallel_runs_defaults_to_sequential() {
+        // The default must stay 1: concurrent per-run chains multiply peak memory,
+        // so opting in is the caller's decision, and 1 reproduces the historical
+        // sequential orchestrator exactly.
+        assert_eq!(Config::default().experiment.parallel_runs, 1);
+        // Old configs written before the section existed must still parse.
+        let c = Config::from_json("{}").expect("empty config parses");
+        assert_eq!(c.experiment.parallel_runs, 1);
+        let c = Config::from_json(r#"{"experiment":{"parallel_runs":4}}"#).expect("parses");
+        assert_eq!(c.experiment.parallel_runs, 4);
+    }
 
     #[test]
     fn default_roundtrips() {

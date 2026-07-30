@@ -148,6 +148,7 @@ The distinct-window column is `window_id` (verified: `convert.rs:218`).
 | `ion_type` | Utf8 | no | - | ion-type symbol (`b`/`y`) |
 | `ordinal` | Int32 | no | - | ion ordinal (residue position) |
 | `frag_charge` | Int32 | no | - | fragment charge state |
+| `cardinality` | Int32 | no | count | distinct library precursors sharing this fragment m/z (0.01 Da bin); low = clean/quantification-friendly ion, high = interference-prone. Precomputed at library build |
 
 ---
 

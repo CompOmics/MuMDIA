@@ -9,7 +9,9 @@ from a FASTA file, before any spectra are touched. They run once per experiment
 and their outputs are reused across all runs.
 
 - **digest** (Stage A, PLAN.md) performs a fully-tryptic in-silico digest of the
-  input proteins, deduplicates the resulting peptides by stripped sequence, and
+  input proteins (also emitting the initiator-methionine-excised form of each
+  protein-N-terminal peptide by default, see "How it works"), deduplicates the
+  resulting peptides by stripped sequence, and
   mints a collision-checked, paired target-decoy null (reverse or seeded
   scramble). Output is one `peptides.parquet` table of stripped target and decoy
   sequences with a `target`/`decoy` label.
@@ -114,7 +116,17 @@ recipe").
    is dropped entirely if any residue is not one of the 20 standard amino acids
    (`is_standard_residue`, digest.rs:90 -> constants.rs:54), which is how `X`, `B`,
    `Z`, `U`, and `*` get excluded (lowercase is already upper-cased in
-   `read_fasta`, so it is not dropped here).
+   `read_fasta`, so it is not dropped here). After a peptide is accepted,
+   `digest_protein` also applies **N-terminal methionine excision**
+   (digest.rs:101-110): when `cfg.n_term_met_excision` is set (the default), a
+   peptide anchored at protein position `0` whose protein begins with `M`
+   additionally emits the Met-removed form, with `start` shifted to `1`. That
+   excised form is re-checked against `min_len`/`max_len` and the standard-residue
+   allowlist (digest.rs:104-106) before it is pushed, and excision keys on protein
+   position 0 and the protein's first residue, not any interior `M`. The initiator
+   methionine is cleaved in vivo for most proteins, so both forms belong in the
+   search space; this mirrors DIA-NN `--met-excision`, and omitting it makes the
+   database structurally miss those (biologically dominant) peptides.
 4. **Dedup by stripped sequence** (digest.rs:189-209). Three structures: a
    `HashMap<String, Vec<String>>` mapping peptide to accessions, a `HashMap` from
    peptide to its first `(start, end)`, and an insertion-order `Vec<String>`
@@ -244,7 +256,7 @@ a live silent-drop path.
 | `digest::run` | digest.rs:184 | Stage A entry point; parse, digest, dedup, mint decoys, write `peptides.parquet` |
 | `read_fasta` | digest.rs:25 | Minimal FASTA parser to `(accession, sequence)` pairs; upper-cases sequence |
 | `cleavage_sites` | digest.rs:52 | Trypsin/P vs Trypsin cut-site indices for one sequence |
-| `digest_protein` | digest.rs:75 | Enumerate length-bounded, missed-cleavage-bounded, standard-residue-only peptides |
+| `digest_protein` | digest.rs:75 | Enumerate length-bounded, missed-cleavage-bounded, standard-residue-only peptides, plus the initiator-Met-excised N-terminal form when `n_term_met_excision` is set (digest.rs:101-110) |
 | `collision_safe_decoy` | digest.rs:137 | Wrap `make_decoy` with target/other-decoy collision checks and up to `MAX_DECOY_ATTEMPTS` reseeded-scramble retries; `None` drops the pair |
 | `make_decoy` | digest.rs:101 | One transform: reverse or seeded-scramble decoy of the interior, C-term fixed; `None` if `len < 3` or strategy `None`/`DiannShift` |
 | `splitmix64` | digest.rs:159 | Deterministic PRNG step for the scramble shuffle |
@@ -276,6 +288,7 @@ run.rs:136).
 | `min_len` | digest | `5` | Minimum peptide length (residues) |
 | `max_len` | digest | `50` | Maximum peptide length (residues) |
 | `decoy.strategy` | digest | `reverse` | `reverse` / `scramble` realized; `diann_shift` and `none` produce no decoy (`diann_shift` rejected by `validate`) |
+| `n_term_met_excision` | digest | `true` | When a protein begins with `M`, also emit the initiator-Met-removed form of its N-terminal peptides (re-checked against `min_len`/`max_len` and the residue allowlist); mirrors DIA-NN `--met-excision`. Field config.rs:194, default config.rs:204 |
 | `fixed_mods` | peptidoforms | `[{C: Carbamidomethyl}]` | Applied to every matching residue |
 | `variable_mods` | peptidoforms | `[{M: Oxidation}]` | Enumerated as optional subsets |
 | `max_variable_mods` | peptidoforms | `1` | Max simultaneous variable mods per peptidoform |
@@ -322,6 +335,17 @@ types elsewhere, not here). `DecoyConfig` (config.rs:172) carries only
   the only place ambiguity codes (`X`/`B`/`Z`/`U`) are handled. Lowercase is not
   an ambiguity case here: `read_fasta` upper-cases sequence lines first
   (digest.rs:41), so a lowercase-but-standard residue survives.
+- **N-terminal methionine excision is on by default.** For a protein-N-terminal
+  peptide whose protein begins with `M`, `digest_protein` emits both the
+  Met-retained and the Met-removed form (digest.rs:101-110), each subject to the
+  same length and standard-residue filters. Because `DigestConfig` is
+  `#[serde(default, deny_unknown_fields)]` (config.rs:182), a config predating the
+  `n_term_met_excision` field still loads and silently gains the behavior; set
+  `n_term_met_excision = false` to reproduce a Met-retained-only digest. Excision
+  keys on protein position 0 and the first residue, so an interior `M` is never
+  excised (test `met_excision_only_at_protein_n_terminus`). This is
+  standard-proteomics-correct, but per repository policy any digest-output default
+  change is entrapment plus second-dataset gated before it is trusted as a default.
 - **Collision-checked decoys.** `collision_safe_decoy` (digest.rs:137) does
   guarantee the decoy differs from its target, equals no target sequence, and is
   unique among emitted decoys, retrying with reseeded scrambles up to
@@ -408,9 +432,13 @@ types elsewhere, not here). `DecoyConfig` (config.rs:172) carries only
   `artifact::PEPTIDES` / `artifact::PEPTIDOFORMS` (schema.rs:11-12) and update the
   downstream readers (`Table::read` callers in predict-frag and later stages).
 - **Testing.** Existing unit tests live at the bottom of each file
-  (digest.rs:343, peptidoforms.rs:291). digest: `trypsin_p_cleaves_after_kr`
-  (digest.rs:348) pins Trypsin/P cut sites; `reverse_decoy_keeps_cterm`
-  (digest.rs:367) and `scramble_is_deterministic` (digest.rs:374) pin the fixed
+  (digest.rs:360, peptidoforms.rs:291). digest: `trypsin_p_cleaves_after_kr`
+  (digest.rs:365) pins Trypsin/P cut sites; `met_excision_emits_both_n_term_forms`
+  (digest.rs:384) pins that a protein-N-terminal `M` peptide yields both the
+  Met-retained and the Met-excised form with excision on and only the retained
+  form with it off, and `met_excision_only_at_protein_n_terminus` (digest.rs:418)
+  pins that an interior `M` is not excised; `reverse_decoy_keeps_cterm`
+  (digest.rs:439) and `scramble_is_deterministic` (digest.rs:446) pin the fixed
   C-terminus plus scramble reproducibility;
   `collision_safe_decoy_avoids_targets_and_other_decoys` (digest.rs:382) pins the
   retry-on-collision behavior; and `impossible_low_complexity_decoy_drops_pair`

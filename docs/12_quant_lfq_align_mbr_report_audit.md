@@ -88,7 +88,12 @@ Produces a long-form matrix (`quant.rs:720`): `protein_group` (str), `run` (i32,
 0-based input index), `quantity` (f64), `n_features` (i32). `n_features` is the
 count of feature keys for that protein group, constant across its rows (`quant.rs:717`),
 not the per-run non-missing count. One row per `(protein_group, run)` is written for
-every run, including runs where the protein's profile is 0. Unlike `quant` and
+every run, including runs where the protein's profile is 0. Two sibling matrices are
+also written next to `<out>`: `<out>.peptide.parquet` (rolled up by stripped base
+sequence) and `<out>.precursor.parquet` (by peptidoform + charge), each with columns
+`group` (str), `charge` (i32; -1 for peptide level), `run`, `quantity`, `n_features`,
+from the same normalized feature matrix and LFQ engine. The protein output is
+unchanged. Unlike `quant` and
 `align`, `run_lfq_combine` writes no `<out>.report.json`: it calls `write_table` and
 logs, with no `ArtifactReport` (`quant.rs:720`).
 

@@ -57,7 +57,7 @@ source rather than the spec.
 | [10_features.md](10_features.md) | Stage E: the minimal/rich/extended feature battery (~381 features), `prelim_score`, PIN emission, and the hashed feature schema. |
 | [11_compete_rescore_fdr.md](11_compete_rescore_fdr.md) | Stage F: within-group competition, semi-supervised rescoring (native / mokapot / PyTorch-NN / percolator / entrapment), and target-decoy q-values at PSM/run/precursor/peptide/protein level. |
 | [12_quant_lfq_align_mbr_report_audit.md](12_quant_lfq_align_mbr_report_audit.md) | The tail subcommands: `quant`, `quant-lfq` (MaxLFQ/directLFQ), `align`, `mbr`, `report`, and `audit`. |
-| [13_sidecars.md](13_sidecars.md) | The 10 Python sidecar workers (MS2PIP/DeepLC/mokapot/entrapment/diagnostics), the positional-CLI file contract, and the conda envs. |
+| [13_sidecars.md](13_sidecars.md) | The 11 Python scripts (7 engine-invoked sidecar workers: MS2PIP/DeepLC/mokapot/entrapment/NN/MBR; plus 4 imported-library helpers incl. `augment_library.py`), the positional-CLI file contract, and the conda envs. |
 | [14_build_test_deploy_gotchas.md](14_build_test_deploy_gotchas.md) | The Rust workspace build, test coverage and gaps, the determinism contract, the clean-room boundary, and CI/Docker/release. |
 | [15_data_dictionary.md](15_data_dictionary.md) | Consolidated Parquet data dictionary: every column of every artifact, its Arrow type and nullability, sourced from the `Col`/`write_table` construction with `file:line` citations. |
 | [16_glossary.md](16_glossary.md) | Alphabetical glossary of domain and codebase terms as MuMDIA uses them, each entry self-contained and cited to `file:line` where it asserts code behavior. |
@@ -65,3 +65,4 @@ source rather than the spec.
 | [18_findings_and_decisions.md](18_findings_and_decisions.md) | Self-contained findings and contracts: validated results, interstage/determinism/sidecar contracts, current best workflow, and ranked roadmap, with no dependency on `plan.md`. |
 | [19_getting_started.md](19_getting_started.md) | Reproducible getting-started: local sidecar environments, the pre-built E. coli test library, and two copy-pasteable end-to-end runs plus a smoke check. |
 | [20_sensitivity_and_quantification_playbook.md](20_sensitivity_and_quantification_playbook.md) | Operational playbook separating validated AIF sensitivity, acquisition-specific choices, FDR/entrapment promotion gates, quantification accuracy, and benchmark-gated research. |
+| [21_linux_deployment.md](21_linux_deployment.md) | Linux CPU-only deployment runbook: build traps, sidecar environments, the data-transfer checklist, memory and `parallel_runs` guidance, rescore handoff at scale, and the DeepLC scope tradeoff. |

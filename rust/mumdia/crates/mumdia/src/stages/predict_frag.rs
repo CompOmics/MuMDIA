@@ -76,11 +76,25 @@ pub fn run(p: PredictFragParams) -> Result<(u64, u64)> {
                 Err(_) => return RowOut::ParseErr,
             };
             let z = charge[row];
-            let mut frag_charges = vec![1];
-            if z >= p.cfg.charge2_from_precursor_charge {
-                frag_charges.push(2);
-            }
-            let frags = parsed.fragments(&frag_charges);
+            let frags = if p.cfg.charge_by_basic_residues {
+                // Composition cap: request every charge up to the smaller of the
+                // precursor charge and the peptide's proton capacity, then keep
+                // each fragment only at charges its own basic sites (Arg/His/Lys
+                // within the fragment) plus its N-terminal amine can hold.
+                let max_z = (1 + parsed.basic_residue_count() as i32).min(z).max(1);
+                let all_charges: Vec<i32> = (1..=max_z).collect();
+                let mut fr = parsed.fragments(&all_charges);
+                fr.retain(|f| {
+                    f.charge <= 1 + parsed.fragment_basic_sites(f.ion_type, f.ordinal) as i32
+                });
+                fr
+            } else {
+                let mut frag_charges = vec![1];
+                if z >= p.cfg.charge2_from_precursor_charge {
+                    frag_charges.push(2);
+                }
+                parsed.fragments(&frag_charges)
+            };
             if frags.is_empty() {
                 return RowOut::Empty;
             }
@@ -118,6 +132,26 @@ pub fn run(p: PredictFragParams) -> Result<(u64, u64)> {
     let frag_model_id = assign_intensities(&p, &mut raws)?;
     let model_identity = format!("{rt_model_id}; {frag_model_id}");
 
+    // Finite guard at the prediction sidecar boundary. A NaN/Inf predicted iRT or
+    // fragment intensity from a misbehaving MS2PIP/DeepLC run would silently
+    // corrupt the library and every downstream spectral-similarity feature (and
+    // would misorder the top-N intensity sort below). Fail loudly instead. The
+    // rescore sidecar boundary already guards its feature matrix the same way.
+    for r in &raws {
+        if !r.irt.is_finite() {
+            bail!(
+                "predict-frag: non-finite predicted iRT for '{}'",
+                r.peptidoform
+            );
+        }
+        if r.frag_int.iter().any(|v| !v.is_finite()) {
+            bail!(
+                "predict-frag: non-finite predicted fragment intensity for '{}'",
+                r.peptidoform
+            );
+        }
+    }
+
     // Keep top-N fragments by predicted intensity. Each candidate is independent
     // (operates only on its own frags/frag_int), so this parallelizes with no
     // cross-item state; the result per candidate is identical to the serial loop.
@@ -139,7 +173,9 @@ pub fn run(p: PredictFragParams) -> Result<(u64, u64)> {
     raws.retain(|r| !r.frags.is_empty());
 
     // candidate_id = precursor-m/z sort key (PLAN.md Stage D build step 1).
-    raws.sort_by(|a, b| a.precursor_mz.partial_cmp(&b.precursor_mz).unwrap());
+    // Parallel STABLE sort: rayon's par_sort_by is stable, so ties keep input order exactly
+    // as the serial sort_by did. The fragment index requires this ascending-m/z ordering.
+    raws.par_sort_by(|a, b| a.precursor_mz.partial_cmp(&b.precursor_mz).unwrap());
 
     let n = raws.len();
     let total_frags: usize = raws.iter().map(|r| r.frags.len()).sum();
@@ -187,7 +223,7 @@ pub fn run(p: PredictFragParams) -> Result<(u64, u64)> {
             f_cid.push(candidate_id);
             f_mz.push(fr.mz);
             f_int.push(fi);
-            f_name.push(fr.name);
+            f_name.push(fr.name());
             f_type.push(fr.ion_type.symbol().to_string());
             f_ord.push(fr.ordinal as i32);
             f_chg.push(fr.charge);
@@ -209,6 +245,12 @@ pub fn run(p: PredictFragParams) -> Result<(u64, u64)> {
             Col::I32("n_fragments".into(), nfrag_c),
         ],
     )?;
+    // Fragment cardinality: distinct precursors sharing each fragment m/z (0.01 Da
+    // bin), matching the imported-library path. Computed once over the whole
+    // library so downstream interference-aware feature/quant selection reads a
+    // deterministic precomputed column instead of a runtime heuristic. Diagnostic;
+    // no consumer yet.
+    let f_card = fragment_cardinality(&f_cid, &f_mz);
     let n_frag = write_table(
         p.out_fragments,
         vec![
@@ -219,6 +261,7 @@ pub fn run(p: PredictFragParams) -> Result<(u64, u64)> {
             Col::Str("ion_type".into(), f_type),
             Col::I32("ordinal".into(), f_ord),
             Col::I32("frag_charge".into(), f_chg),
+            Col::I32("cardinality".into(), f_card),
         ],
     )?;
 
@@ -266,9 +309,10 @@ fn assign_rt(p: &PredictFragParams, raws: &mut [Raw]) -> Result<String> {
     match p.cfg.rt_predictor {
         RtPredictorKind::Native => {
             let m = NativeRt;
-            for r in raws.iter_mut() {
+            // Per-row and independent (no cross-row reduction) -> bit-identical in parallel.
+            raws.par_iter_mut().for_each(|r| {
                 r.irt = m.predict_irt(&r.parsed);
-            }
+            });
             Ok(m.identity())
         }
         RtPredictorKind::Deeplc => {
@@ -316,9 +360,12 @@ fn assign_intensities(p: &PredictFragParams, raws: &mut [Raw]) -> Result<String>
     match p.cfg.predictor {
         FragPredictorKind::Native => {
             let m = NativeFrag;
-            for r in raws.iter_mut() {
+            // Per-row and independent: each candidate's intensities depend only on its own
+            // parsed peptidoform and fragment list, with no cross-row reduction, so this is
+            // bit-identical in parallel (no float accumulation order to change).
+            raws.par_iter_mut().for_each(|r| {
                 r.frag_int = m.predict_intensities(&r.parsed, &r.frags);
-            }
+            });
             Ok(m.identity())
         }
         FragPredictorKind::Ms2pip => {
@@ -343,7 +390,14 @@ fn assign_intensities(p: &PredictFragParams, raws: &mut [Raw]) -> Result<String>
                 bail!("MS2PIP returned no predictions");
             }
             let native = NativeFrag;
-            for (i, r) in raws.iter_mut().enumerate() {
+            // Parallel across rows: each row writes only its own `frag_int` and reads only
+            // its own parsed peptidoform, fragment list and MS2PIP entry. `par_iter_mut`
+            // preserves the element-to-index mapping, and the per-row float work (the native
+            // charge-2 fallback and the two per-charge-group max-normalizations) is
+            // self-contained, so this is bit-identical to the serial loop. The MS2PIP sidecar
+            // call already happened above -- what is parallelized here is the per-row native
+            // prediction and normalization, which is real CPU work, not sidecar wait.
+            raws.par_iter_mut().enumerate().for_each(|(i, r)| {
                 let per = map.get(&(i as u32));
                 match per {
                     Some(per) if !per.is_empty() => {
@@ -388,8 +442,70 @@ fn assign_intensities(p: &PredictFragParams, raws: &mut [Raw]) -> Result<String>
                         r.frag_int = native.predict_intensities(&r.parsed, &r.frags);
                     }
                 }
-            }
+            });
             Ok(format!("ms2pip-{}", p.cfg.ms2pip_model))
         }
+    }
+}
+
+/// Count distinct precursors (candidate_ids) whose fragments fall in each 0.01 Da
+/// m/z bin, and return that count per fragment row aligned to `mz`. This is the
+/// library fragment cardinality: a low value marks a clean, quantification-
+/// friendly ion, a high value an interference-prone non-unique ion. Deterministic
+/// (ordered maps, no HashMap iteration) and matched to the imported-library
+/// binning in `scripts/import_diann_lib.py`.
+fn fragment_cardinality(cid: &[u32], mz: &[f64]) -> Vec<i32> {
+    // Sort-based count rather than a BTreeMap<bin, BTreeSet<candidate>>: at library scale
+    // (~86M fragment rows) that map allocated a tree node per bin plus a whole set per bin
+    // and did O(log n) descents per row twice over. Sorting (bin, candidate) pairs once and
+    // counting distinct candidates in each run of equal bins is the same computation with
+    // flat memory. Values are unchanged: the bin key and the distinct-precursor-per-bin
+    // definition are identical, and the result stays deterministic (total order on the
+    // sorted pairs, no hashing).
+    let bin = |m: f64| (m * 100.0).round() as i64;
+    let n = mz.len();
+    let mut pairs: Vec<(i64, u32)> = (0..n).map(|i| (bin(mz[i]), cid[i])).collect();
+    pairs.par_sort_unstable();
+    // Walk each equal-bin run once, counting distinct candidate_ids (sorted, so distinct
+    // == adjacent-different), and record the count against the bin.
+    let mut counts: Vec<(i64, i32)> = Vec::new();
+    let mut i = 0usize;
+    while i < n {
+        let b = pairs[i].0;
+        let mut j = i;
+        let mut distinct = 0i32;
+        let mut last: Option<u32> = None;
+        while j < n && pairs[j].0 == b {
+            if last != Some(pairs[j].1) {
+                distinct += 1;
+                last = Some(pairs[j].1);
+            }
+            j += 1;
+        }
+        counts.push((b, distinct));
+        i = j;
+    }
+    // counts is ascending in `b`, so each row's bin resolves by binary search.
+    mz.iter()
+        .map(|m| {
+            let b = bin(*m);
+            let k = counts.partition_point(|&(bb, _)| bb < b);
+            counts[k].1
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod cardinality_tests {
+    use super::fragment_cardinality;
+
+    #[test]
+    fn counts_distinct_precursors_per_mz_bin() {
+        // Fragment m/z 100.00 shared by precursors 0 and 1 (cardinality 2);
+        // 100.004 falls in the same 0.01 Da bin (still 2); 200.00 is unique to
+        // precursor 2 (cardinality 1). A precursor counted once per bin.
+        let cid = vec![0u32, 1, 2, 0];
+        let mz = vec![100.000, 100.004, 200.000, 100.001];
+        assert_eq!(fragment_cardinality(&cid, &mz), vec![2, 2, 1, 2]);
     }
 }

@@ -87,6 +87,22 @@ pub fn values(e: &Evidence) -> Vec<f64> {
         .filter(|&f| f < e.obs_apex.len() && e.obs_apex[f] > 0.0 && f < e.traces.len())
         .collect();
 
+    // pearson(trace_f, R) for every fragment, computed ONCE. Features 15, 16, 17 and 18
+    // each asked for this same (trace, reference) pair in their own loop, so the identical
+    // correlation was recomputed four times per fragment per PSM. Hoisting is exactly
+    // value-preserving: `pearson` is pure, and the guards below mean the `0.0` filler for
+    // an absent trace is never read (features 15-17 iterate `matched`, which already
+    // requires `f < e.traces.len()`, and feature 18 keeps its own bounds check).
+    let corr_ref: Vec<f64> = (0..k)
+        .map(|f| {
+            if f < e.traces.len() {
+                pearson(&e.traces[f], r)
+            } else {
+                0.0
+            }
+        })
+        .collect();
+
     // ---- 1. explained_variance_ref ----
     let mut num1 = 0.0;
     let mut den1 = 0.0;
@@ -247,7 +263,7 @@ pub fn values(e: &Evidence) -> Vec<f64> {
     let mut sf_corr = 0.0;
     let mut c_corr = 0usize;
     for &f in &matched {
-        sp_corr += pearson(&e.traces[f], r);
+        sp_corr += corr_ref[f];
         let full_corr = if f < e.traces_full.len() {
             pearson(&e.traces_full[f], &rfull)
         } else {
@@ -265,7 +281,7 @@ pub fn values(e: &Evidence) -> Vec<f64> {
     // ---- 16. frac_frag_ref_corr_below_0_5 ----
     let mut below = 0.0;
     for &f in &matched {
-        if pearson(&e.traces[f], r) < 0.5 {
+        if corr_ref[f] < 0.5 {
             below += 1.0;
         }
     }
@@ -281,7 +297,7 @@ pub fn values(e: &Evidence) -> Vec<f64> {
     for &f in &matched {
         let a = e.obs_apex[f];
         den17 += a;
-        if pearson(&e.traces[f], r) >= COHERENT_THR {
+        if corr_ref[f] >= COHERENT_THR {
             num17 += a;
         }
     }
@@ -290,17 +306,14 @@ pub fn values(e: &Evidence) -> Vec<f64> {
     // ---- 18. apex_purity ----
     let mut num18 = 0.0;
     let mut den18 = 0.0;
-    for f in 0..k {
-        if f >= e.traces.len() {
-            continue;
-        }
-        let v = if e.apex_idx < e.traces[f].len() {
-            e.traces[f][e.apex_idx]
+    for (trace, &corr) in e.traces.iter().zip(corr_ref.iter()).take(k) {
+        let v = if e.apex_idx < trace.len() {
+            trace[e.apex_idx]
         } else {
             0.0
         };
         den18 += v;
-        if pearson(&e.traces[f], r) >= COHERENT_THR {
+        if corr >= COHERENT_THR {
             num18 += v;
         }
     }

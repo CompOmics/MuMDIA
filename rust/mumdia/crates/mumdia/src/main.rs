@@ -6,6 +6,12 @@ use clap::{Parser, Subcommand};
 use mumdia::stages;
 use mumdia_core::config::Config;
 
+/// Per-thread-arena allocator. The extraction accumulation allocates heavily inside
+/// rayon workers and measured only ~1.07x parallel scaling under the Windows system
+/// allocator's shared heap lock. Swapping the allocator changes no results.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[derive(Parser)]
 #[command(
     name = "mumdia",
@@ -223,6 +229,33 @@ enum Cmd {
         max_spectra: usize,
         /// Irreversible conversion-time MS2 cap (0 = all). Seed-only peak limiting
         /// is configured by `search_seed.top_n_peaks`.
+        #[arg(long, default_value_t = 0)]
+        top_peaks_ms2: usize,
+    },
+    /// Experiment-wide orchestrator: run the per-file search chain over N runs,
+    /// then one combined rescore, optional rescuable MBR transfer, per-run quant,
+    /// and cross-run LFQ. Pass --mzml once per run (>= 2).
+    RunExperiment {
+        #[arg(long)]
+        fasta: Option<String>,
+        /// One per run; repeat the flag (>= 2 runs).
+        #[arg(long)]
+        mzml: Vec<String>,
+        /// Optional per-run labels / subdir names (default r0..rN-1).
+        #[arg(long)]
+        run_names: Vec<String>,
+        #[arg(long)]
+        out_dir: String,
+        #[arg(long)]
+        lib_precursors: Option<String>,
+        #[arg(long)]
+        lib_fragments: Option<String>,
+        #[arg(long)]
+        config: Option<String>,
+        #[arg(long)]
+        profile: Option<String>,
+        #[arg(long, default_value_t = 0)]
+        max_spectra: usize,
         #[arg(long, default_value_t = 0)]
         top_peaks_ms2: usize,
     },
@@ -610,6 +643,39 @@ fn main() -> Result<()> {
                 config: &cfg,
                 fasta: fasta.as_deref(),
                 mzml: &mzml,
+                out_dir: &out_dir,
+                lib_precursors: lib_precursors.as_deref(),
+                lib_fragments: lib_fragments.as_deref(),
+                max_spectra,
+                top_peaks_ms2,
+            })?;
+        }
+        Cmd::RunExperiment {
+            fasta,
+            mzml,
+            run_names,
+            out_dir,
+            lib_precursors,
+            lib_fragments,
+            config,
+            profile,
+            max_spectra,
+            top_peaks_ms2,
+        } => {
+            let mut cfg = load_config(&config)?;
+            if let Some(pf) = &profile {
+                cfg.apply_profile(pf)?;
+            }
+            let run_names = if run_names.is_empty() {
+                None
+            } else {
+                Some(run_names.as_slice())
+            };
+            stages::run_experiment::run(stages::run_experiment::RunExperimentParams {
+                config: &cfg,
+                fasta: fasta.as_deref(),
+                mzmls: &mzml,
+                run_names,
                 out_dir: &out_dir,
                 lib_precursors: lib_precursors.as_deref(),
                 lib_fragments: lib_fragments.as_deref(),

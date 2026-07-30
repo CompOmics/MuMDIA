@@ -266,7 +266,7 @@ data model has one `mods[i]` slot per residue plus separate terminal deltas
 
 | Name | file:line | What it does |
 |---|---|---|
-| `Config` | config.rs:971-1005 | Top-level config; 10 stage sections + `mbr` + `rng_seed` |
+| `Config` | config.rs:980 | Top-level config; 10 stage sections + `mbr` + `rng_seed` |
 | `Config::from_json` | config.rs:1009-1014 | Parse (deny unknown) then `validate` |
 | `Config::validate` | config.rs:1019-1100 | Ten hard-error checks |
 | `Config::apply_profile` | config.rs:1107-1121 | `dia` preset only |
@@ -484,7 +484,7 @@ complete-case features, robust to a minority of changing features (does not flat
 a spike-in design's real fold changes); `Median` aligns each run's median intensity
 (simpler, less robust to composition shifts); `None` uses raw areas.
 
-### `DigestConfig` (config.rs:181-200)
+### `DigestConfig` (config.rs:181-207)
 
 | Field | Default | Effect |
 |---|---|---|
@@ -493,6 +493,7 @@ a spike-in design's real fold changes); `Median` aligns each run's median intens
 | `min_len` | 5 | min peptide length |
 | `max_len` | 50 | max peptide length |
 | `decoy.strategy` | `reverse` | decoy scheme (`DecoyConfig`, config.rs:170-179) |
+| `n_term_met_excision` | `true` (bool) | when a protein begins with `M`, also emit the initiator-Met-removed form of its N-terminal peptides, re-checked against `min_len`/`max_len` and the standard-residue rule (matches DIA-NN `--met-excision`); keyed on protein position 0, not any leading `M`. Omitting it makes the search database structurally miss these excised peptides |
 
 ### `PeptidoformsConfig` (config.rs:202-231)
 
@@ -503,7 +504,19 @@ a spike-in design's real fold changes); `Median` aligns each run's median intens
 | `max_variable_mods` | 1 | max simultaneous variable mods |
 | `charge_min` | 2 | lowest precursor charge |
 | `charge_max` | 3 | highest precursor charge |
+| `charge_by_basic_residues` | `false` | when true, ignore `charge_min`/`charge_max` and emit charges `1..=1+(#R+#H+#K)` per peptide (proton capacity: N-terminus plus one per basic residue) |
 | `unknown_modification` | `error` | `error` or `skip` |
+
+`charge_by_basic_residues` restricts the enumerated precursor charge states to
+what a peptide can physically hold (one proton on the N-terminus plus one per Arg,
+His, Lys). It replaces the fixed range rather than clamping within it, so a peptide
+with no basic residue is emitted only at charge 1, and a peptide that cannot reach
+`charge_min` is not dropped by `charge_min` but simply enumerated from 1. Pairs with
+`predict_frag.charge_by_basic_residues` (fragments). It changes the search /
+training / FDR population, so it is benchmark-gated and defaults off. On the
+imported path, `import_diann_lib.py --charge-by-basic-residues` applies the same
+rule (on the reference DIA-NN E. coli library it dropped 7.9% of precursors, almost
+all charge-3 with a single basic residue).
 
 `ResidueMod` (config.rs:233-240) is `{residue: char, name: String}` where `name`
 is a UniMod name. The doc comment reserves `residue: '*'` for "any" and notes
@@ -518,6 +531,7 @@ every other section), so both keys are required inside a `ResidueMod` entry.
 | `predictor` | `native` | fragment-intensity source (native heuristic or MS2PIP) |
 | `rt_predictor` | `native` | iRT source (native or DeepLC) |
 | `charge2_from_precursor_charge` | 2 | add charge-2 fragments for precursor charge >= this |
+| `charge_by_basic_residues` | `false` | when true, keep a b/y fragment at charge z only if `z <= 1+(basic residues within the fragment)` and `z <= precursor charge`; supersedes `charge2_from_precursor_charge` |
 | `top_n_fragments` | 6 | fragments kept per candidate |
 | `ms2pip_model` | `"HCD"` | MS2PIP model name |
 | `ms2pip_python` | `None` | interpreter for MS2PIP sidecar |
@@ -574,6 +588,7 @@ selection dominate.
 | `apex_rt_prior_s` | 0.0 | Gaussian RT prior sigma on apex (0 = off) |
 | `apex_count_tol` | 1 | fragment-count apex slack |
 | `apex_count_window` | 1 | rolling distinct-fragment count width (1 = none; profile `dia` sets 5) |
+| `apex_gaussian_sigma_scans` | 0.0 | Gaussian apex smoother sigma in scans (0 = rolling-sum unchanged; opt-in, benchmark-gated) |
 | `emit_window_grid` | `true` | zero-filled window-grid chromatograms |
 | `bucket_size` | 8192 | m/z bucket size (power of two) |
 | `peak_claim` | `none` | shared-peak apportionment mode |
@@ -631,6 +646,7 @@ requiring entrapment/target-decoy FDR validation before use.
 | `peak_window_mode` | `per_candidate` | per-candidate vs consensus window |
 | `reliable_q` | 0.001 | confident-set q for the consensus width |
 | `q_filter` | `peptide_q` | `peptide_q`, `precursor_q` (single-run only), `psm_q`, or `run_psm_q` |
+| `interference_envelope` | `false` | apex-outward interference envelope on fragment traces before integration (opt-in, benchmark-gated) |
 
 ### `RescoreConfig` (config.rs:913-965)
 

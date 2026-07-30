@@ -118,26 +118,41 @@ impl Col {
             Col::OptI32(_, v) => Arc::new(Int32Array::from(v)),
             Col::OptStr(_, v) => Arc::new(StringArray::from(v)),
             Col::ListF32(_, v) => {
-                let mut b = ListBuilder::new(Float32Builder::new());
-                for row in &v {
-                    b.values().append_slice(row);
+                // Reserve the exact total up front and CONSUME the source rows, so each
+                // inner Vec is freed as it is copied. Building without capacity reallocated
+                // the values buffer repeatedly, and borrowing kept the whole source
+                // Vec<Vec<f32>> alive alongside the finished array -- two full copies of
+                // the chromatogram values at peak.
+                let total: usize = v.iter().map(|r| r.len()).sum();
+                let mut b =
+                    ListBuilder::with_capacity(Float32Builder::with_capacity(total), v.len());
+                for row in v {
+                    b.values().append_slice(&row);
                     b.append(true);
                 }
                 Arc::new(b.finish())
             }
             Col::ListF64(_, v) => {
                 use arrow::array::Float64Builder;
-                let mut b = ListBuilder::new(Float64Builder::new());
-                for row in &v {
-                    b.values().append_slice(row);
+                // See ListF32: reserve exactly, and consume so inner Vecs free as copied.
+                let total: usize = v.iter().map(|r| r.len()).sum();
+                let mut b =
+                    ListBuilder::with_capacity(Float64Builder::with_capacity(total), v.len());
+                for row in v {
+                    b.values().append_slice(&row);
                     b.append(true);
                 }
                 Arc::new(b.finish())
             }
             Col::LargeListF32(_, v) => {
-                let mut b = LargeListBuilder::new(Float32Builder::new());
-                for row in &v {
-                    b.values().append_slice(row);
+                // Same as ListF32, and this is the variant that carries the very large
+                // chromatogram columns (tens of millions of rows), so the reserve and the
+                // progressive free matter most here.
+                let total: usize = v.iter().map(|r| r.len()).sum();
+                let mut b =
+                    LargeListBuilder::with_capacity(Float32Builder::with_capacity(total), v.len());
+                for row in v {
+                    b.values().append_slice(&row);
                     b.append(true);
                 }
                 Arc::new(b.finish())
@@ -195,6 +210,73 @@ pub fn write_table(path: &str, cols: Vec<Col>) -> Result<u64> {
     Ok(nrows as u64)
 }
 
+/// Write pre-built Arrow record batches to a Snappy Parquet file, preserving
+/// their schema exactly. Unlike [`write_table`] (which builds columns from typed
+/// vecs) this is for passing an existing schema through unchanged, e.g. filtering
+/// a scored table by run without re-declaring its column set. Returns the row count.
+/// Incremental parquet writer: feed `RecordBatch`es one at a time and the rows are encoded
+/// and flushed as they arrive, so peak memory is one batch rather than the whole table.
+///
+/// [`write_table`] and [`write_batches`] both need every column materialised up front, which
+/// is fine for ordinary artifacts but not for the rescoring feature matrix - hundreds of
+/// columns over millions of rows, where the caller already holds the data once.
+pub struct BatchWriter {
+    writer: Option<ArrowWriter<std::fs::File>>,
+    rows: u64,
+}
+
+impl BatchWriter {
+    pub fn new(path: &str, schema: Arc<Schema>) -> Result<BatchWriter> {
+        if let Some(parent) = std::path::Path::new(path).parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        let file = std::fs::File::create(path).with_context(|| format!("creating {path}"))?;
+        let props = WriterProperties::builder()
+            .set_compression(Compression::SNAPPY)
+            .build();
+        Ok(BatchWriter {
+            writer: Some(ArrowWriter::try_new(file, schema, Some(props))?),
+            rows: 0,
+        })
+    }
+
+    pub fn write(&mut self, batch: &RecordBatch) -> Result<()> {
+        self.rows += batch.num_rows() as u64;
+        self.writer
+            .as_mut()
+            .expect("writer closed")
+            .write(batch)
+            .context("writing parquet batch")?;
+        Ok(())
+    }
+
+    /// Finish the file and return the row count. Must be called: the footer is written here.
+    pub fn close(mut self) -> Result<u64> {
+        if let Some(w) = self.writer.take() {
+            w.close().context("closing parquet writer")?;
+        }
+        Ok(self.rows)
+    }
+}
+
+pub fn write_batches(path: &str, schema: Arc<Schema>, batches: &[RecordBatch]) -> Result<u64> {
+    if let Some(parent) = std::path::Path::new(path).parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    let file = std::fs::File::create(path).with_context(|| format!("creating {path}"))?;
+    let props = WriterProperties::builder()
+        .set_compression(Compression::SNAPPY)
+        .build();
+    let mut writer = ArrowWriter::try_new(file, schema, Some(props))?;
+    let mut n = 0u64;
+    for b in batches {
+        writer.write(b)?;
+        n += b.num_rows() as u64;
+    }
+    writer.close()?;
+    Ok(n)
+}
+
 /// A read-back table: all batches concatenated logically, accessed by column
 /// name with typed getters.
 pub struct Table {
@@ -203,13 +285,77 @@ pub struct Table {
     pub nrows: usize,
 }
 
+/// Row count straight from the parquet footer metadata, without decoding any column
+/// data. `Table::read(path)?.nrows` materialises the whole file (hundreds of millions of
+/// rows for a fragment library) just to learn its length; use this instead whenever only
+/// the count is needed.
+pub fn nrows(path: &str) -> Result<u64> {
+    let file = std::fs::File::open(path).with_context(|| format!("opening {path}"))?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+        .with_context(|| format!("reading parquet footer {path}"))?;
+    Ok(builder.metadata().file_metadata().num_rows() as u64)
+}
+
+/// Column names straight from the parquet footer metadata, in file order, without decoding
+/// any column data. The counterpart to [`nrows`] for callers that need the schema rather
+/// than the contents -- a features/competed artifact carries ~390 columns, so
+/// `Table::read(path)?.column_names()` decodes every one of them to answer a question the
+/// footer already contains.
+pub fn column_names(path: &str) -> Result<Vec<String>> {
+    let file = std::fs::File::open(path).with_context(|| format!("opening {path}"))?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+        .with_context(|| format!("reading parquet footer {path}"))?;
+    Ok(builder
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| f.name().clone())
+        .collect())
+}
+
 impl Table {
     pub fn read(path: &str) -> Result<Table> {
+        Self::read_inner(path, None)
+    }
+
+    /// Read only the named columns. Every other column is skipped in the parquet reader,
+    /// so its pages are never fetched or decoded. Useful for the wide artifacts: a
+    /// competed/features table carries ~390 columns and most callers want a handful, but
+    /// `read` decodes all of them and holds the batches for the table's lifetime.
+    ///
+    /// Names not present in the file are ignored (the resulting `Table` simply will not
+    /// have them, and the typed getters report the missing column as they always do).
+    pub fn read_cols(path: &str, columns: &[&str]) -> Result<Table> {
+        Self::read_inner(path, Some(columns))
+    }
+
+    fn read_inner(path: &str, columns: Option<&[&str]>) -> Result<Table> {
         let file = std::fs::File::open(path).with_context(|| format!("opening {path}"))?;
         let builder = ParquetRecordBatchReaderBuilder::try_new(file)
             .with_context(|| format!("reading parquet {path}"))?;
-        let schema = builder.schema().clone();
+        let builder = match columns {
+            None => builder,
+            Some(want) => {
+                // Map requested names to leaf indices in the parquet schema. A projection
+                // mask over root fields is enough here: all artifact columns are flat
+                // primitives or a single list level.
+                let parquet_schema = builder.parquet_schema();
+                let mut roots: Vec<usize> = Vec::new();
+                for (i, f) in parquet_schema.root_schema().get_fields().iter().enumerate() {
+                    if want.contains(&f.name()) {
+                        roots.push(i);
+                    }
+                }
+                let mask = parquet::arrow::ProjectionMask::roots(parquet_schema, roots);
+                builder.with_projection(mask)
+            }
+        };
         let reader = builder.build()?;
+        // Take the schema from the READER, not the builder: the builder reports the full
+        // file schema, so under a projection it would disagree with the batches (which
+        // carry only the selected columns) and the typed getters would resolve a name to
+        // the wrong column index.
+        let schema = arrow::array::RecordBatchReader::schema(&reader);
         let mut batches = Vec::new();
         let mut nrows = 0;
         for b in reader {
@@ -464,5 +610,51 @@ mod tests {
         // LargeListF32 (64-bit offsets) reads back through the same list_f32 path.
         assert_eq!(t.list_f32("big").unwrap()[1], vec![6.0, 7.0]);
         assert!(t.list_f32("big").unwrap()[2].is_empty());
+    }
+}
+
+#[cfg(test)]
+mod projection_tests {
+    use super::*;
+
+    /// `read_cols` must return byte-identical data to `read` for the columns it selects.
+    /// Projection is a read-path optimisation; if it altered values, every stage that
+    /// adopts it would silently change results.
+    #[test]
+    fn read_cols_matches_read_for_selected_columns() {
+        let dir = std::env::temp_dir().join("mumdia_projection_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.parquet");
+        let p = path.to_str().unwrap();
+        write_table(
+            p,
+            vec![
+                Col::U32("id".into(), vec![1, 2, 3]),
+                Col::F64("keep_f64".into(), vec![1.5, -2.25, f64::MIN_POSITIVE]),
+                Col::Str(
+                    "keep_str".into(),
+                    vec!["a".into(), "".into(), "yz^2".into()],
+                ),
+                Col::F32("skip_me".into(), vec![9.0, 9.0, 9.0]),
+                Col::ListF32("keep_list".into(), vec![vec![1.0, 2.0], vec![], vec![3.5]]),
+            ],
+        )
+        .unwrap();
+
+        let full = Table::read(p).unwrap();
+        let proj = Table::read_cols(p, &["id", "keep_f64", "keep_str", "keep_list"]).unwrap();
+
+        assert_eq!(full.nrows, proj.nrows);
+        assert_eq!(full.u32("id").unwrap(), proj.u32("id").unwrap());
+        assert_eq!(full.f64("keep_f64").unwrap(), proj.f64("keep_f64").unwrap());
+        assert_eq!(full.str("keep_str").unwrap(), proj.str("keep_str").unwrap());
+        assert_eq!(
+            full.list_f32("keep_list").unwrap(),
+            proj.list_f32("keep_list").unwrap()
+        );
+        // The unprojected column is absent, not silently zero-filled.
+        assert!(proj.f32("skip_me").is_err());
+        assert!(full.f32("skip_me").is_ok());
+        std::fs::remove_file(p).ok();
     }
 }

@@ -104,8 +104,8 @@ pub fn run(p: RunParams) -> Result<()> {
                 lib_fragments = lf,
                 "run: library-input mode (skipping digest/peptidoforms/predict-frag)"
             );
-            let np = mumdia_io::table::Table::read(lp)?.nrows as u64;
-            let nf = mumdia_io::table::Table::read(lf)?.nrows as u64;
+            let np = mumdia_io::table::nrows(lp)?;
+            let nf = mumdia_io::table::nrows(lf)?;
             man.record(record_artifact(
                 artifact::FRAGMENT_LIBRARY_PRECURSORS.0,
                 artifact::FRAGMENT_LIBRARY_PRECURSORS,
@@ -193,13 +193,25 @@ pub fn run(p: RunParams) -> Result<()> {
 
     // --- per-run artifacts ---
     let spectra_dir = d("spectra");
+    // Fold the conversion caps into the convert artifacts' provenance key, exactly as the
+    // standalone `convert` subcommand does. They change the spectra output but are not part
+    // of the config, so passing the bare config hash here made two runs with different caps
+    // record an identical config_hash for their convert artifacts -- provenance that
+    // disagreed with the standalone entry point for the same inputs.
+    let convert_hash = mumdia_io::hash::blake3_str(&format!(
+        "{}\u{1f}max_spectra={}\u{1f}top_peaks_ms2={}\u{1f}top_peaks_ms1={}",
+        cfg.canonical_json(),
+        p.max_spectra,
+        p.top_peaks_ms2,
+        0
+    ));
     let co = convert::run(convert::ConvertParams {
         mzml: p.mzml,
         out_dir: &spectra_dir,
         max_spectra: p.max_spectra,
         top_peaks_ms2: p.top_peaks_ms2,
         top_peaks_ms1: 0,
-        config_hash: &ch,
+        config_hash: &convert_hash,
     })?;
     for (name, schema, path) in [
         ("spectra_ms1", artifact::SPECTRA_MS1, &co.ms1),
@@ -211,8 +223,19 @@ pub fn run(p: RunParams) -> Result<()> {
         ),
         ("ms2_to_ms1", artifact::MS2_TO_MS1, &co.ms2_to_ms1),
     ] {
-        let rows = mumdia_io::table::Table::read(path)?.nrows as u64;
-        man.record(record_artifact(name, schema, path, rows, "convert", &ch)?);
+        let rows = mumdia_io::table::nrows(path)?;
+        // `convert_hash`, not the bare config hash: the manifest is the provenance record,
+        // so it must carry the same cap-folded key the artifact's own report does. Stamping
+        // `ch` here made two runs differing only in `--top-peaks-ms2` record identical
+        // provenance for their spectra, and disagreed with the report written beside them.
+        man.record(record_artifact(
+            name,
+            schema,
+            path,
+            rows,
+            "convert",
+            &convert_hash,
+        )?);
     }
 
     let seed = d("seed_psms.parquet");
@@ -265,7 +288,7 @@ pub fn run(p: RunParams) -> Result<()> {
         // RT calibration and extraction. Replace the base-library manifest entry
         // so provenance points at the downstream input instead of only at the
         // pre-fine-tune table.
-        let n_ft = mumdia_io::table::Table::read(&lib_p_ft)?.nrows as u64;
+        let n_ft = mumdia_io::table::nrows(&lib_p_ft)?;
         man.record(record_artifact(
             artifact::FRAGMENT_LIBRARY_PRECURSORS.0,
             artifact::FRAGMENT_LIBRARY_PRECURSORS,
@@ -445,7 +468,7 @@ pub fn run(p: RunParams) -> Result<()> {
         "quant",
         &ch,
     )?);
-    let n_frag_quant = mumdia_io::table::Table::read(&frag_q)?.nrows as u64;
+    let n_frag_quant = mumdia_io::table::nrows(&frag_q)?;
     man.record(record_artifact(
         artifact::FRAGMENT_QUANT.0,
         artifact::FRAGMENT_QUANT,
