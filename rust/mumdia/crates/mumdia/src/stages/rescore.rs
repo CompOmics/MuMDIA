@@ -1012,7 +1012,13 @@ fn run_pin_sidecar(
         .env("MUMDIA_NN_FOLDS", p.cfg.folds.to_string())
         .env("MUMDIA_NN_ITERS", p.cfg.num_iter.to_string())
         .env("MUMDIA_NN_TRAIN_FDR", p.cfg.train_fdr.to_string())
-        .spawn()?;
+        .spawn()
+        .map_err(|e| {
+            // A bare `.spawn()?` reported only "No such file or directory (os error 2)" with
+            // no indication of WHICH path was missing - the usual failure when a config moves
+            // between machines.
+            anyhow::anyhow!("spawning sidecar failed: {python} {script}: {e}")
+        })?;
     let mut guard = ChildGuard(Some(child));
     let status = guard.wait()?;
     if !status.success() {

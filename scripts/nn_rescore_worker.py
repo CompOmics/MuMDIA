@@ -263,14 +263,29 @@ def main():
         raise ValueError("folds>=2, iterations>=1, epochs>=1, and seeds>=1 are required")
 
     # Torch CPU threads. Measured: the tiny MLP saturates at ~16 threads and is SLOWER at
-    # 32 (oversubscription on small GEMMs), so cap rather than inherit all cores. An
-    # explicit OMP_NUM_THREADS from the caller wins.
+    # 32 (oversubscription on small GEMMs), so cap rather than inherit all cores.
+    #
+    # Precedence: an EXPLICIT MUMDIA_NN_THREADS wins over OMP_NUM_THREADS. It used to be the
+    # other way round, which meant a site-wide OMP_NUM_THREADS=1 - a common cluster module
+    # default - silently pinned the rescore to one thread with no way to override it from
+    # MuMDIA's own knob. OMP_NUM_THREADS is still honoured when MUMDIA_NN_THREADS is unset, so
+    # a caller who sets only the generic variable still gets what they asked for.
     if DEVICE == "cpu":
-        want = env_i("MUMDIA_NN_THREADS", 16)
-        if "OMP_NUM_THREADS" in os.environ:
-            want = env_i("OMP_NUM_THREADS", want)
+        if "MUMDIA_NN_THREADS" in os.environ:
+            want = env_i("MUMDIA_NN_THREADS", 16)
+            src = "MUMDIA_NN_THREADS"
+        elif "OMP_NUM_THREADS" in os.environ:
+            want = env_i("OMP_NUM_THREADS", 16)
+            src = "OMP_NUM_THREADS"
+        else:
+            want, src = 16, "default"
         if want > 0:
             torch.set_num_threads(max(1, min(want, os.cpu_count() or want)))
+        print(
+            "nn_rescore_worker: torch cpu threads=%d (from %s; %d cores visible)"
+            % (torch.get_num_threads(), src, os.cpu_count() or -1),
+            flush=True,
+        )
 
     stream_env = os.environ.get("MUMDIA_NN_STREAM", "auto").lower()
     filesize = os.path.getsize(pin_path)
@@ -497,16 +512,24 @@ def main():
             # numpy RNG drives the shuffle in both paths, so the training trajectory
             # stays tied to the existing np.random.seed(seed) stream.
             order = np.random.permutation(ntr)
+            # A trailing minibatch of exactly one row makes BatchNorm1d raise "Expected more
+            # than 1 value per channel when training" (it cannot compute a batch variance
+            # from one sample). ntr changes with the selected positive set every iteration, so
+            # this is otherwise a lurking crash that could land in the final experiment-wide
+            # rescore, after every run's compute has been spent. Drop that single row for this
+            # epoch; the permutation is reshuffled next epoch, so no row is systematically
+            # excluded from training.
+            n_use = ntr - 1 if (ntr % BATCH) == 1 and ntr > BATCH else ntr
             if pregather:
                 perm_t = torch.from_numpy(order).to(DEVICE)
-                for i in range(0, ntr, BATCH):
+                for i in range(0, n_use, BATCH):
                     b = perm_t[i:i + BATCH]
                     opt.zero_grad()
                     lossf(m(Xt[b]), yt[b]).backward()
                     opt.step()
             else:
                 perm = idx[order]
-                for i in range(0, ntr, BATCH):
+                for i in range(0, n_use, BATCH):
                     b = perm[i:i + BATCH]
                     Xb = torch.from_numpy(get(b)).to(DEVICE)
                     yb = torch.from_numpy(y[b]).to(DEVICE)

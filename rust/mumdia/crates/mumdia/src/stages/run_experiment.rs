@@ -73,6 +73,27 @@ fn preflight(p: &RunExperimentParams) -> Result<()> {
     if cfg.rt_im_train.finetune_deeplc && cfg.predict_frag.deeplc_python.is_none() {
         anyhow::bail!("rt_im_train.finetune_deeplc requires predict_frag.deeplc_python");
     }
+    // Check the interpreters EXIST, not merely that the fields are set. The rescore runs
+    // after every per-run chain, so on an 83-file batch a mistyped `rescore.python` used to
+    // discard days of compute at the final stage. A wrong path is also the most likely error
+    // when moving a config between machines.
+    for (field, path) in [
+        (
+            "predict_frag.deeplc_python",
+            cfg.predict_frag.deeplc_python.as_deref(),
+        ),
+        ("rescore.python", cfg.rescore.python.as_deref()),
+        ("mbr.python", cfg.mbr.python.as_deref()),
+    ] {
+        if let Some(exe) = path {
+            if !std::path::Path::new(exe).exists() {
+                anyhow::bail!(
+                    "{field} points at an interpreter that does not exist: {exe}
+                     (config written for another machine? run `mumdia doctor --config <cfg>`                      to probe every configured sidecar environment before a long batch)"
+                );
+            }
+        }
+    }
     if matches!(
         cfg.rescore.classifier,
         RescorerKind::Mokapot | RescorerKind::NnTorch
