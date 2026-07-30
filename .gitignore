@@ -40,3 +40,10 @@ scripts/_probe*.py
 !/CLAUDE.md
 # local archive of superseded working docs (not published)
 /_archive/
+
+# Collaborator-specific material stays local: the Strasbourg prenylation work is
+# unpublished, so its configs and deployment notes must never reach the remote.
+# (`/*.md` above already keeps root-level notes local; these cover the configs.)
+config.strasbourg*.json
+config.*-local.json
+deploy_local/

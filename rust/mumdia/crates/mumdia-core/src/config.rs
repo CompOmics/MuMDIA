@@ -1471,6 +1471,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn shipped_configs_parse() {
+        // `Config` is `deny_unknown_fields`, so a documentation key such as `_comment` in a
+        // shipped config is a hard PARSE error -- the whole config is rejected before any
+        // value is read. That shipped once and was only caught by running `doctor` on the
+        // deployment target. The workspace suite passing while a shipped config was unusable
+        // is the gap this closes: a config is an artifact the engine must accept, not merely
+        // a file that happens to be valid JSON.
+        //
+        // Only TRACKED configs are listed. Machine- or collaborator-specific configs stay
+        // untracked (see .gitignore), so they are checked by `mumdia doctor`, not here.
+        let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../..");
+        for name in [
+            "config.local-diann-lib.json",
+            "docker/config.dia.json",
+            "docker/config.diann-lib.json",
+        ] {
+            let path = format!("{root}/{name}");
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue; // absent in some checkout layouts
+            };
+            Config::from_json(&text)
+                .unwrap_or_else(|e| panic!("shipped config {name} does not parse: {e}"));
+        }
+    }
+
+    #[test]
     fn experiment_finetune_scope_defaults_to_first_run_only() {
         // The expensive default must be the cheap one: paying a DeepLC fine-tune per run
         // is hours-to-days on a large experiment, and each run calibrates itself anyway.
