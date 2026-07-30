@@ -818,6 +818,93 @@ impl Drop for ChildGuard {
     }
 }
 
+/// Write the sidecar feature table as Parquet, streaming a batch at a time.
+///
+/// Same logical contract as the tab-separated PIN - `SpecId`, `Label`, `ScanNr`, `ExpMass`,
+/// `CalcMass`, the feature columns, `Peptide`, `Proteins` - so the worker reads either format
+/// from the same column names.
+///
+/// Features are `f32`: the TSV wrote `{:.6}` and the worker casts to float32 anyway, so f32
+/// matches what is actually used, halves the file, and does not silently increase precision
+/// relative to the validated TSV reference.
+///
+/// Batched because `feats` is already resident (Vec<Vec<f64>>, ~27 GB on an experiment-wide
+/// pool); materialising 387 full columns as well would add ~12.8 GB for nothing.
+fn write_features_parquet(
+    path: &str,
+    feat_names: &[String],
+    label: &[String],
+    pform: &[String],
+    protein: &[String],
+    mz: &[f64],
+    feats: &[Vec<f64>],
+) -> Result<u64> {
+    use arrow::array::{ArrayRef, Float32Array, Float64Array, Int32Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use std::sync::Arc;
+
+    let mut fields: Vec<Field> = vec![
+        Field::new("SpecId", DataType::Utf8, false),
+        Field::new("Label", DataType::Int32, false),
+        Field::new("ScanNr", DataType::Int32, false),
+        Field::new("ExpMass", DataType::Float64, false),
+        Field::new("CalcMass", DataType::Float64, false),
+    ];
+    for n in feat_names {
+        fields.push(Field::new(n, DataType::Float32, false));
+    }
+    fields.push(Field::new("Peptide", DataType::Utf8, false));
+    fields.push(Field::new("Proteins", DataType::Utf8, false));
+    let schema = Arc::new(Schema::new(fields));
+
+    let n = label.len();
+    let nf = feat_names.len();
+    // ~250k rows x 387 f32 is about 390 MB per batch, which keeps the encoder's working set
+    // modest while still giving parquet large row groups.
+    const BATCH: usize = 250_000;
+    let mut w = mumdia_io::table::BatchWriter::new(path, schema.clone())?;
+    let mut start = 0usize;
+    while start < n {
+        let end = (start + BATCH).min(n);
+        let k = end - start;
+        let mut arrays: Vec<ArrayRef> = Vec::with_capacity(nf + 7);
+        // SpecId / ScanNr key on the row index, NOT candidate_id: candidate_id is the library
+        // index and repeats across runs, so an experiment-wide table would collide.
+        arrays.push(Arc::new(StringArray::from(
+            (start..end).map(|i| format!("psm_{i}")).collect::<Vec<_>>(),
+        )));
+        arrays.push(Arc::new(Int32Array::from(
+            (start..end)
+                .map(|i| if label[i] == "decoy" { -1 } else { 1 })
+                .collect::<Vec<_>>(),
+        )));
+        arrays.push(Arc::new(Int32Array::from(
+            (start..end).map(|i| i as i32).collect::<Vec<_>>(),
+        )));
+        let mzv: Vec<f64> = mz[start..end].to_vec();
+        arrays.push(Arc::new(Float64Array::from(mzv.clone())));
+        arrays.push(Arc::new(Float64Array::from(mzv)));
+        // Transpose this row block into one column per feature. `feats` is row-major, so a
+        // column read strides it; doing that per batch keeps the working set to one block.
+        let block = &feats[start..end];
+        for fi in 0..nf {
+            let col: Vec<f32> = block.iter().map(|row| row[fi] as f32).collect();
+            arrays.push(Arc::new(Float32Array::from(col)));
+        }
+        let _ = k;
+        arrays.push(Arc::new(StringArray::from(
+            (start..end)
+                .map(|i| format!("-.{}.-", pform[i]))
+                .collect::<Vec<_>>(),
+        )));
+        arrays.push(Arc::new(StringArray::from(protein[start..end].to_vec())));
+        w.write(&RecordBatch::try_new(schema.clone(), arrays)?)?;
+        start = end;
+    }
+    w.close()
+}
+
 /// Run a PIN-contract Python rescorer sidecar (`mokapot_worker.py` or
 /// `nn_rescore_worker.py`) over a PIN written from the competed set; return scores
 /// aligned to the input candidate order (PLAN.md Section 3.2 file contract). Both
@@ -853,33 +940,60 @@ fn run_pin_sidecar(
             .unwrap_or("rescore"),
         std::process::id()
     );
-    let pin = format!("{}/rescore_{tag}.pin", p.work_dir);
+    // Parquet applies to nn_torch only: mokapot_worker.py goes through
+    // `mokapot.read_pin()`, which requires the tab-separated form. Falling back with a
+    // warning beats failing a configured run.
+    let want_pq = matches!(p.cfg.handoff, mumdia_core::config::Handoff::Parquet);
+    let use_pq = want_pq && script_name.contains("nn_rescore");
+    if want_pq && !use_pq {
+        tracing::warn!(
+            script = script_name,
+            "rescore.handoff=parquet is supported only by the nn_torch sidecar (mokapot reads \
+             a PIN through mokapot.read_pin); writing the tab-separated PIN instead"
+        );
+    }
+    let pin = if use_pq {
+        format!("{}/rescore_{tag}.features.parquet", p.work_dir)
+    } else {
+        format!("{}/rescore_{tag}.pin", p.work_dir)
+    };
     let outp = format!("{}/rescore_{tag}_out.parquet", p.work_dir);
 
     // Stream the PIN through a BufWriter. It was previously accumulated in ONE
     // un-reserved String: at ~1M rows x 387 features that is a >5 GB allocation (plus
     // realloc churn) held entirely in RAM before the first byte reaches disk.
-    let mut w = std::io::BufWriter::with_capacity(1 << 20, std::fs::File::create(&pin)?);
-    w.write_all(b"SpecId\tLabel\tScanNr\tExpMass\tCalcMass\t")?;
-    w.write_all(feat_names.join("\t").as_bytes())?;
-    w.write_all(b"\tPeptide\tProteins\n")?;
-    // Key the PIN on the unique row index i (SpecId=psm_i, ScanNr=i), NOT
-    // candidate_id: candidate_id is the library index and repeats across runs, so
-    // an experiment-wide (multi-file) PIN would collide on ScanNr and mokapot's
-    // per-spectrum competition would collapse the runs. The row index is unique
-    // across the whole concatenation. Single-run behaviour is unchanged (the
-    // mapping is bijective and mokapot does not use SpecId/ScanNr as features).
-    for i in 0..cid.len() {
-        let lab = if label[i] == "decoy" { -1 } else { 1 };
-        write!(w, "psm_{}\t{}\t{}\t{:.5}\t{:.5}\t", i, lab, i, mz[i], mz[i])?;
-        #[allow(clippy::needless_range_loop)] // parallel index into feats[i] bounded by feat_names
-        for fi in 0..feat_names.len() {
-            write!(w, "{:.6}\t", feats[i][fi])?;
+    if use_pq {
+        let rows = write_features_parquet(&pin, feat_names, label, pform, protein, mz, feats)?;
+        tracing::info!(
+            path = %pin,
+            rows,
+            features = feat_names.len(),
+            "rescore: wrote the sidecar feature table as parquet"
+        );
+    } else {
+        let mut w = std::io::BufWriter::with_capacity(1 << 20, std::fs::File::create(&pin)?);
+        w.write_all(b"SpecId\tLabel\tScanNr\tExpMass\tCalcMass\t")?;
+        w.write_all(feat_names.join("\t").as_bytes())?;
+        w.write_all(b"\tPeptide\tProteins\n")?;
+        // Key the PIN on the unique row index i (SpecId=psm_i, ScanNr=i), NOT
+        // candidate_id: candidate_id is the library index and repeats across runs, so
+        // an experiment-wide (multi-file) PIN would collide on ScanNr and mokapot's
+        // per-spectrum competition would collapse the runs. The row index is unique
+        // across the whole concatenation. Single-run behaviour is unchanged (the
+        // mapping is bijective and mokapot does not use SpecId/ScanNr as features).
+        for i in 0..cid.len() {
+            let lab = if label[i] == "decoy" { -1 } else { 1 };
+            write!(w, "psm_{}\t{}\t{}\t{:.5}\t{:.5}\t", i, lab, i, mz[i], mz[i])?;
+            #[allow(clippy::needless_range_loop)]
+            // parallel index into feats[i] bounded by feat_names
+            for fi in 0..feat_names.len() {
+                write!(w, "{:.6}\t", feats[i][fi])?;
+            }
+            writeln!(w, "-.{}.-\t{}", pform[i], protein[i])?;
         }
-        writeln!(w, "-.{}.-\t{}", pform[i], protein[i])?;
+        w.flush()?;
+        drop(w);
     }
-    w.flush()?;
-    drop(w);
 
     let script = crate::sidecar::resolve_script(p.script_dir, script_name);
     // Spawn (not `status()`) so the child handle is owned by a guard that kills it if we

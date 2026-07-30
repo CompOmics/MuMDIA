@@ -214,6 +214,51 @@ pub fn write_table(path: &str, cols: Vec<Col>) -> Result<u64> {
 /// their schema exactly. Unlike [`write_table`] (which builds columns from typed
 /// vecs) this is for passing an existing schema through unchanged, e.g. filtering
 /// a scored table by run without re-declaring its column set. Returns the row count.
+/// Incremental parquet writer: feed `RecordBatch`es one at a time and the rows are encoded
+/// and flushed as they arrive, so peak memory is one batch rather than the whole table.
+///
+/// [`write_table`] and [`write_batches`] both need every column materialised up front, which
+/// is fine for ordinary artifacts but not for the rescoring feature matrix - hundreds of
+/// columns over millions of rows, where the caller already holds the data once.
+pub struct BatchWriter {
+    writer: Option<ArrowWriter<std::fs::File>>,
+    rows: u64,
+}
+
+impl BatchWriter {
+    pub fn new(path: &str, schema: Arc<Schema>) -> Result<BatchWriter> {
+        if let Some(parent) = std::path::Path::new(path).parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        let file = std::fs::File::create(path).with_context(|| format!("creating {path}"))?;
+        let props = WriterProperties::builder()
+            .set_compression(Compression::SNAPPY)
+            .build();
+        Ok(BatchWriter {
+            writer: Some(ArrowWriter::try_new(file, schema, Some(props))?),
+            rows: 0,
+        })
+    }
+
+    pub fn write(&mut self, batch: &RecordBatch) -> Result<()> {
+        self.rows += batch.num_rows() as u64;
+        self.writer
+            .as_mut()
+            .expect("writer closed")
+            .write(batch)
+            .context("writing parquet batch")?;
+        Ok(())
+    }
+
+    /// Finish the file and return the row count. Must be called: the footer is written here.
+    pub fn close(mut self) -> Result<u64> {
+        if let Some(w) = self.writer.take() {
+            w.close().context("closing parquet writer")?;
+        }
+        Ok(self.rows)
+    }
+}
+
 pub fn write_batches(path: &str, schema: Arc<Schema>, batches: &[RecordBatch]) -> Result<u64> {
     if let Some(parent) = std::path::Path::new(path).parent() {
         std::fs::create_dir_all(parent).ok();

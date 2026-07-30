@@ -1163,6 +1163,10 @@ pub struct RescoreConfig {
     /// silently execute a different model; set false only for explicit legacy
     /// compatibility.
     pub strict: bool,
+    /// How the feature matrix reaches a sidecar rescorer. See [`Handoff`]. `parquet` is
+    /// dramatically faster on large pools but applies to nn_torch only.
+    #[serde(default)]
+    pub handoff: Handoff,
 }
 impl Default for RescoreConfig {
     fn default() -> Self {
@@ -1178,6 +1182,7 @@ impl Default for RescoreConfig {
             entrapment_contaminant_markers: Vec::new(),
             entrapment_ratio: 1.0,
             strict: true,
+            handoff: Handoff::Tsv,
         }
     }
 }
@@ -1217,6 +1222,25 @@ pub enum FinetuneScope {
     /// fine-tune per run (36.5 min on the HYE library: 5.7 min training plus 30.8 min
     /// predicting 4.9M peptidoforms).
     PerRun,
+}
+
+/// How the feature matrix crosses the Rust -> Python boundary for a sidecar rescorer.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Handoff {
+    /// Tab-separated PIN. Percolator's format, and what `mokapot.read_pin` requires.
+    #[default]
+    Tsv,
+    /// Parquet feature table with f32 features. Measured on an 8,858,206-PSM
+    /// experiment-wide rescore: the 30.18 GB TSV exceeded the worker's streaming threshold,
+    /// so every iteration re-read a 12.77 GB memmap; Parquet kept the matrix in memory and
+    /// the rescore went from 671.6 min to 12 min with the decoy fraction unchanged at
+    /// 0.988%. Features are f32 because the TSV was already lossy (`{:.6}`) and the worker
+    /// casts to f32 regardless.
+    ///
+    /// nn_torch only: `mokapot_worker.py` calls `mokapot.read_pin()` and cannot read
+    /// Parquet, so a mokapot run falls back to `Tsv` with a warning instead of failing.
+    Parquet,
 }
 
 /// Options for the experiment-wide orchestrator (`mumdia run-experiment`).
