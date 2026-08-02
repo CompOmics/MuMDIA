@@ -477,7 +477,25 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
     split_by_source(&scored_for_quant, &split_paths)?;
 
     let mut qcfg = cfg.quant.clone();
-    qcfg.q_filter = QuantQColumn::PsmQ; // per-run confident PSMs from the pooled q_value
+    // Per-run quant gates on the pooled `q_value`, not on whatever `quant.q_filter` says. The
+    // grouped q columns (peptide_q_value / precursor_q / pg_q_value) are assigned only to the
+    // single experiment-wide winning row of each group (see `grouped_q` in rescore.rs), so a
+    // per-run table can only gate on a per-PSM column. `run_psm_q` would be the natural choice,
+    // but the pooled column is what the cross-run LFQ step downstream assumes.
+    //
+    // Warn rather than override in silence: a user who explicitly configured a different
+    // `q_filter` otherwise gets quantities gated on a column they did not select, and there is
+    // no record of the substitution in any artifact. Changing `q_filter` also does not select a
+    // source, which is a separate documented trap.
+    if !matches!(qcfg.q_filter, QuantQColumn::PsmQ) {
+        warn!(
+            configured = ?qcfg.q_filter,
+            used = ?QuantQColumn::PsmQ,
+            "run-experiment: per-run quant ignores the configured quant.q_filter and gates on the \
+             pooled q_value; grouped q columns exist only on each group's experiment-wide winner"
+        );
+    }
+    qcfg.q_filter = QuantQColumn::PsmQ;
     let mut peptide_quants: Vec<String> = Vec::with_capacity(n_runs);
     for i in 0..n_runs {
         let pq = d(&format!("{}/peptide_quant.parquet", names[i]));
