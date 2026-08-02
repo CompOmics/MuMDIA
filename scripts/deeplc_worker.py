@@ -11,6 +11,19 @@ default multitask model, uncalibrated (the per-run LOESS calibration in
 rt-im-train maps these predictions onto observed RT).
 """
 import sys
+# `deeplc` MUST be imported before numpy/pyarrow. DeepLC 4.x is torch-backed, and on Windows
+# importing numpy (and the pyarrow that follows it) first makes torch's DLL initialisation fail
+# outright:
+#
+#   OSError: [WinError 1114] A dynamic link library (DLL) initialization routine failed.
+#   Error loading "...\torch\lib\c10.dll" or one of its dependencies.
+#
+# `deeplc_finetune.py` already ordered its imports this way for the same reason. This worker
+# instead deferred `import deeplc` into main(), which put it after the module-level numpy/pyarrow
+# and reproduced the crash. The bug stayed hidden because imported-library mode skips predict-frag
+# entirely, so the native RT-prediction path is not exercised by the usual runs; it surfaced only
+# when building a library from FASTA. The ordering is load-bearing, not stylistic -- do not sort it.
+import deeplc  # noqa: F401  (imported for its side effect of loading torch first)
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -18,7 +31,6 @@ import pyarrow.parquet as pq
 
 def main():
     in_path, out_path = sys.argv[1], sys.argv[2]
-    import deeplc
 
     tbl = pq.read_table(in_path)
     ids = tbl.column("id").to_pylist()
