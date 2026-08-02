@@ -358,9 +358,16 @@ fn doctor(cfg: &Config) -> Result<()> {
     let checks = [
         (rescore_label, cfg.rescore.python.as_deref(), rescore_pkgs),
         (
+            // The DeepLC interpreter runs both `deeplc_worker.py` (prediction) and
+            // `deeplc_finetune.py` (transfer learning), and the latter imports pyarrow, torch and
+            // psm_utils on top of deeplc itself. Probing only `deeplc,numpy,pandas` let a green
+            // doctor precede a crash at the fine-tune step, which on an experiment-wide batch is
+            // discovered long after the run is launched. DeepLC 4.x pulls torch and psm-utils
+            // itself, so in practice this catches a missing pyarrow, but the check should assert
+            // what the scripts actually import rather than what the dependency tree implies.
             "predict_frag.deeplc_python (DeepLC)",
             cfg.predict_frag.deeplc_python.as_deref(),
-            "deeplc,numpy,pandas",
+            "deeplc,numpy,pandas,pyarrow,torch,psm_utils",
         ),
         (
             "predict_frag.ms2pip_python (MS2PIP)",
