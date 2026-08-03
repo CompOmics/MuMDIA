@@ -10,6 +10,34 @@ per peptide, while any single run supports only a small fraction of those hypoth
 file means extraction and rescoring see a search space sized to the evidence rather than to the
 enumeration.
 
+## Only modification-bearing candidates are ever pruned
+
+Every library row is tokenised, but `anchored_tris` emits trimers only for positions carrying an
+`anchor_mods` modification. A candidate with no anchored modification therefore yields an empty tag
+set and is absent from the output: the survivor list is, by construction, exclusively
+anchor-bearing candidates. Library assembly then adds the whole unanchored remainder back
+unconditionally and applies the survivor list only to the anchored part.
+
+Measured on a 54.8M-row library with three cysteine modifications as anchors:
+
+| | rows | share |
+|---|---|---|
+| library total | 54,821,556 | |
+| eligible (carries an anchor mod) | 41,434,790 | 75.6% |
+| never at risk (unmodified, or only non-anchor mods) | 13,386,766 | 24.4% |
+| survivors | 4,906,730 | 11.8% of eligible |
+| survivors NOT carrying an anchor mod | 0 | |
+
+The consequence is the safety property that makes this stage cheap to experiment with: an ordinary
+proteome result cannot be damaged by prescan tuning. Changing `tol_da`, `rt_slack_s` or
+`top_peaks` can only add or remove modified hypotheses, because unmodified candidates never reach
+the screen's decision at all.
+
+Note that the stage still walks every row rather than pre-filtering to anchor-bearing ones. That
+costs about a second on a 54.8M-row library and keeps the eligibility rule in exactly one place,
+`anchored_tris`, instead of duplicating it as a string match over peptidoforms that could drift
+out of agreement with the configured anchors.
+
 ## What it is not
 
 The screen cannot separate a true modified peptide from its decoy, and no tuning will make it.
