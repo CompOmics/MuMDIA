@@ -269,6 +269,49 @@ impl Default for DecoyConfig {
     }
 }
 
+/// Sequence-tag prescan (`mumdia prescan`). Prunes modification-bearing candidates that have no
+/// anchored tag support in a given run, before the per-run library is assembled.
+///
+/// The screen is deliberately blind to target/decoy label: tags are emitted in both orientations
+/// and a reverse decoy preserves composition and precursor m/z, so a decoy survives exactly when
+/// its target does. That keeps exchangeability, and therefore downstream FDR, intact.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PrescanConfig {
+    /// Peak-delta match tolerance in Da. Permissive on purpose: a false tag only fails to prune,
+    /// while a missed tag discards a real candidate with no way to recover it downstream.
+    pub tol_da: f64,
+    /// Widen each candidate's RT window by this many seconds before binning. The window comes
+    /// from a calibration fitted on a different run, and `cal.json` residuals are in-sample and
+    /// roughly 3x optimistic, so size this from out-of-sample RT error, not from the reported fit.
+    pub rt_slack_s: f64,
+    /// RT bin width for the observed-tag index.
+    pub rt_bin_s: f64,
+    /// Most intense peaks per MS2 used to build tags (0 = all). This bounds the O(peaks^2) delta
+    /// search and is NOT destructive: it only affects tag construction, never the spectra artifact
+    /// that extraction later reads.
+    pub top_peaks: usize,
+    /// Residue:UniModName entries that may appear in a screened peptidoform, e.g. `C:Carbamidomethyl`.
+    /// A peptidoform carrying anything outside this set plus `anchor_mods` is dropped rather than
+    /// screened on a partially understood sequence.
+    pub mods: Vec<String>,
+    /// Residue:UniModName entries the screen anchors ON. Only trimers covering one of these
+    /// positions count as evidence, so backbone signal cannot keep a modified hypothesis alive.
+    pub anchor_mods: Vec<String>,
+}
+impl Default for PrescanConfig {
+    fn default() -> Self {
+        Self {
+            tol_da: 0.005,
+            rt_slack_s: 150.0,
+            rt_bin_s: 25.0,
+            top_peaks: 150,
+            mods: vec!["C:Carbamidomethyl".to_string(), "M:Oxidation".to_string()],
+            anchor_mods: Vec::new(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct DigestConfig {
@@ -1274,6 +1317,7 @@ impl Default for ExperimentConfig {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
+    pub prescan: PrescanConfig,
     pub rng_seed: u64,
     pub digest: DigestConfig,
     pub peptidoforms: PeptidoformsConfig,
@@ -1294,6 +1338,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             rng_seed: 0,
+            prescan: t(),
             digest: t(),
             peptidoforms: t(),
             predict_frag: t(),

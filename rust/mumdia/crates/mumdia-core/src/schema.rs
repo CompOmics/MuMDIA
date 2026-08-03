@@ -12,6 +12,7 @@ pub mod artifact {
     pub const PEPTIDOFORMS: (&str, u32) = ("peptidoforms", 1);
     pub const FRAGMENT_LIBRARY_PRECURSORS: (&str, u32) = ("fragment_library_precursors", 1);
     pub const FRAGMENT_LIBRARY_FRAGMENTS: (&str, u32) = ("fragment_library_fragments", 1);
+    pub const PRESCAN_SURVIVORS: (&str, u32) = ("prescan_survivors", 1);
     pub const SEED_PSMS: (&str, u32) = ("seed_psms", 1);
     pub const RUN_WINDOWS: (&str, u32) = ("run_windows", 1);
     pub const PSMS_EXTRACTED: (&str, u32) = ("psms_extracted", 2);

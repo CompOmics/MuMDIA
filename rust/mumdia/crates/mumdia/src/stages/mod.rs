@@ -10,6 +10,7 @@ pub mod extract;
 pub mod features;
 pub mod peptidoforms;
 pub mod predict_frag;
+pub mod prescan;
 pub mod quant;
 pub mod report;
 pub mod rescore;

@@ -77,6 +77,24 @@ enum Cmd {
         #[arg(long)]
         config: Option<String>,
     },
+    /// Sequence-tag prescan: keep only modification-bearing candidates whose anchored trimers are
+    /// observed in this run -> prescan_survivors.parquet. Label-blind by construction, so it
+    /// prunes search space without touching target-decoy exchangeability.
+    Prescan {
+        #[arg(long)]
+        ms2: String,
+        #[arg(long)]
+        isolation_windows: String,
+        #[arg(long)]
+        library_precursors: String,
+        /// Per-candidate RT bounds (candidate_id, rt_lo, rt_hi); a run_windows-shaped table.
+        #[arg(long)]
+        run_windows: String,
+        #[arg(long)]
+        out: String,
+        #[arg(long)]
+        config: Option<String>,
+    },
     /// Native broad DIA seed search over the fragment index -> seed_psms.parquet.
     SearchSeed {
         #[arg(long)]
@@ -577,6 +595,26 @@ fn main() -> Result<()> {
                 out: &out,
                 out_pin: &out_pin,
                 cfg: &cfg.features,
+                config_hash: &ch,
+            })?;
+        }
+        Cmd::Prescan {
+            ms2,
+            isolation_windows,
+            library_precursors,
+            run_windows,
+            out,
+            config,
+        } => {
+            let cfg = load_config(&config)?;
+            let ch = mumdia_io::hash::blake3_str(&cfg.canonical_json());
+            stages::prescan::run(stages::prescan::PrescanParams {
+                ms2: &ms2,
+                isolation_windows: &isolation_windows,
+                library_precursors: &library_precursors,
+                run_windows: &run_windows,
+                out: &out,
+                cfg: &cfg.prescan,
                 config_hash: &ch,
             })?;
         }
