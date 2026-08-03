@@ -19,7 +19,8 @@ stages that operate across multiple runs.
 - **mbr** (Stage D3, `mumdia mbr`): partially wired match-between-runs identification
   transfer. A Rust CLI + config gate that shells out to `scripts/mbr_worker.py`.
 - **report** (`mumdia report`): emit human-readable `peptides.tsv` + `proteins.tsv`
-  from the scored PSM table, joined to quant.
+  from the scored PSM table, joined to quant. Invoked by the single-run `run`
+  chain and by the CLI subcommand only; `run-experiment` never runs it.
 - **audit** (`mumdia audit`): reconstruct, per candidate, the pipeline stage flags and
   the earliest rejection reason across the artifact chain, without re-running compute.
 
@@ -126,13 +127,18 @@ per-run `transfer_targets_<i>.parquet` and `transfer_decoys_<i>.parquet` in
 ### report
 Consumes `psms_scored.parquet` and optionally the two quant tables. The CLI takes
 `--out-dir` and derives `<out-dir>/peptides.tsv` + `<out-dir>/proteins.tsv`
-(`main.rs:723`); `run` passes the run out-dir and `q_threshold = quant.q_threshold`
-(`run.rs:467`). `peptides.tsv` header (`report.rs:95`): `precursor`,
-`stripped_sequence`, `charge`, `protein`, `q_value`, `score`, `quantity`.
-`proteins.tsv` header (`report.rs:134`): `protein_group`, `q_value`, `quantity`. No
-Parquet or `report.json` is written; `report::run` returns `(n_precursors,
-n_protein_groups)`, and the `mumdia report` handler prints a one-line summary
-(`main.rs:733`).
+(`main.rs:796-797`); `run` passes the run out-dir and
+`q_threshold = quant.q_threshold` (`run.rs:484-491`). `peptides.tsv` header
+(`report.rs:95`): `precursor`, `stripped_sequence`, `charge`, `protein`,
+`q_value`, `score`, `quantity`. `proteins.tsv` header (`report.rs:134`):
+`protein_group`, `q_value`, `quantity`. No Parquet or `report.json` is written;
+`report::run` returns `(n_precursors, n_protein_groups)`, and the `mumdia report`
+handler prints a one-line summary (`main.rs:806`).
+
+The only two call sites are `run.rs:484` and the `mumdia report` handler at
+`main.rs:798`. The experiment orchestrator does not call the stage, so a
+`run-experiment` output tree contains no `peptides.tsv` and no `proteins.tsv` at
+any level.
 
 ### audit
 Consumes `library_precursors.parquet` (the full search space) plus `psms`
@@ -173,13 +179,27 @@ the read returns empty and refinement is inert. Writes `candidate_audit.parquet`
 ### quant (`quant.rs:259`, `run`)
 
 1. Load `psms_scored`. The q-value column to filter on is selected by
-   `cfg.q_filter`: `PeptideQ` -> `peptide_q_value`, `PrecursorQ` ->
-   `precursor_q`, `PsmQ` -> pooled `q_value`, `RunPsmQ` -> `run_psm_q`.
-   `PeptideQ`/`PrecursorQ` are grouped values suitable for a single-run rescore;
-   `RunPsmQ` is the run-local gate for a slice of an experiment-wide rescore.
-   Quant has no source selector: before per-run quantification, slice a pooled
-   scored table by `source` and pair that slice with the matching chromatograms.
-   Changing `q_filter` does not select a run.
+   `cfg.q_filter`:
+
+   | `q_filter` | column read | row unit that q is computed over | valid context |
+   |---|---|---|---|
+   | `PeptideQ` (default) | `peptide_q_value` | stripped/base peptide | single-run rescore |
+   | `PrecursorQ` | `precursor_q` | peptidoform + charge | single-run rescore |
+   | `PsmQ` | pooled `q_value` | PSM, pooled over all `source` values | any, but the gate stays experiment-wide |
+   | `RunPsmQ` | `run_psm_q` | PSM within one `source` | a `source` slice of an experiment-wide rescore |
+
+   The three grouped columns (`peptide_q_value`, `precursor_q`, `pg_q_value`) are
+   sparse: `grouped_q` assigns the computed q only to each group's single
+   best-scoring row and writes 1.0 to every losing sibling (`rescore.rs:721-728`).
+   After an experiment-wide rescore the grouping is experiment-wide too, so each
+   group's winner lives in exactly one run and a per-run slice retains only about
+   `1/n_runs` of the populated rows. `PeptideQ`/`PrecursorQ` are therefore
+   meaningful only when rescore itself was single-run; for a slice of a pooled
+   rescore use `RunPsmQ`. Quant has no source selector: before per-run
+   quantification, slice a pooled scored table by `source` and pair that slice
+   with the matching chromatograms. Changing `q_filter` does not select a run.
+   `run-experiment` performs that split itself but forces `PsmQ`; see the
+   gotchas.
 2. Group chromatogram rows by `candidate_id` into `cand_rows` (`quant.rs:301`). Rows
    whose `frag_name` starts with `ms1_` are MS1 isotope XIC pseudo-traces, not
    fragment ions; they are excluded from both peak detection and the top-N sum.
@@ -417,7 +437,7 @@ The waterfall counts per reason and is logged sorted by descending count
 (`audit.rs:220`); `<out>.metrics.json` records the fields listed under
 `## Inputs and outputs`. This stage never re-runs compute and never mutates a pipeline
 output, so it is safe to run after any search. In the `run` orchestrator the stage is
-invoked only when `extract.emit_candidate_audit` is set (`run.rs:405`), with
+invoked only when `extract.emit_candidate_audit` is set (`run.rs:428`), with
 `q_threshold = 0.01`, `run_id = out_dir`, and no entrapment substring; standalone,
 `mumdia audit` takes those as CLI args.
 
@@ -478,10 +498,11 @@ FDR/reporting).
 - `peak_window_mode` (`PerCandidate`): `PerCandidate` or `Consensus` (`config.rs:717`).
 - `reliable_q` (0.001): confident-set cutoff calibrating the consensus half-widths.
 - `q_filter` (`PeptideQ`): which q column to filter on:
-  `PeptideQ`/`PrecursorQ`/`PsmQ`/`RunPsmQ`. Use `PrecursorQ` only after a
-  single-run rescore. For
-  experiment-wide rescoring, slice by `source` and normally use `RunPsmQ`;
-  `q_filter` alone does not select the run.
+  `PeptideQ`/`PrecursorQ`/`PsmQ`/`RunPsmQ`. Use `PeptideQ`/`PrecursorQ` only
+  after a single-run rescore, because the grouped columns are populated on group
+  winners only (`rescore.rs:721-728`). For experiment-wide rescoring, slice by
+  `source` and normally use `RunPsmQ`; `q_filter` alone does not select the run.
+  `run-experiment` ignores this field and forces `PsmQ` (`run_experiment.rs:498`).
 
 **`quant-lfq`** takes no config struct; `--method` (maxlfq/directlfq) and `--normalize`
 (median_ratio/median/none, parsed by `NormalizeMethod::from_token`, `config.rs:754`)
@@ -529,6 +550,29 @@ but do not affect the wired `mumdia mbr` path.
   population and must be benchmarked before production use.
 - **MS1 traces excluded.** `ms1_*` chromatogram rows are precursor channels and never
   enter peak detection or the top-N sum (`quant.rs:303`).
+- **Grouped q columns are populated on group winners only.** `grouped_q`
+  (`rescore.rs:673`) writes the computed q to the single best-scoring row of each
+  group and 1.0 to every loser (`rescore.rs:721-728`). This keeps a losing
+  charge/modification sibling from inheriting the winner's q, but it means
+  `peptide_q_value`, `precursor_q`, and `pg_q_value` are sparse. After an
+  experiment-wide rescore each group has one winner across the whole experiment,
+  so filtering or counting a single run's slice on one of those columns keeps
+  roughly `1/n_runs` of the rows it should and is not a per-run number. The
+  correct per-file PSM unit for a pooled rescore is `run_psm_q`.
+- **`run-experiment` overrides `quant.q_filter`.** The experiment orchestrator
+  splits the scored table by `source` (`run_experiment.rs:474-477`) and then sets
+  `q_filter = PsmQ` for every per-run quant call (`run_experiment.rs:498`),
+  because the downstream cross-run LFQ step assumes the pooled column. A
+  configured value other than `psm_q` is logged as a warning
+  (`run_experiment.rs:490-497`) and then ignored; no artifact records the
+  substitution. Per-run quantities out of `run-experiment` are therefore gated on
+  the pooled `q_value`, not on `run_psm_q` and not on the configured column.
+- **`run-experiment` produces no TSV report.** `report::run` is called only from
+  `run.rs:484` and the `mumdia report` handler (`main.rs:798`), so an experiment
+  output tree has scored, per-run split, quant, and LFQ artifacts but no
+  `peptides.tsv` or `proteins.tsv`. Take per-run identification counts from the
+  split `<run>/scored.parquet` tables gated on `run_psm_q`, or run `mumdia report`
+  by hand on a split table.
 - **report row unit.** `peptides.tsv` rows are precursors (peptidoform + charge), not
   stripped sequences, but selection is by `peptide_q_value`, not `precursor_q`.
   A separate stripped-sequence count is only logged. TSV quantity is rounded; use
@@ -538,7 +582,7 @@ but do not affect the wired `mumdia mbr` path.
   current tree writes it (grep: only `compete` writes `<out>.compete_audit.parquet` and
   the `audit` stage writes `candidate_audit.parquet`). What `emit_candidate_audit`
   actually does in `run` is gate whether the `audit` STAGE is invoked at all
-  (`run.rs:405`), not emit an in-extract per-candidate sidecar. So `load_extract_reasons`
+  (`run.rs:428`), not emit an in-extract per-candidate sidecar. So `load_extract_reasons`
   always reads nothing and the refined extract reasons are unreachable today.
 - **audit artifact resolution.** `peak_generated`, `peak_selected`, and
   `traces_extracted` are all set from the same `traces` flag (`audit.rs:170`) because
@@ -565,8 +609,9 @@ but do not affect the wired `mumdia mbr` path.
   report.
 - **align / mbr need >=2 runs.** align degenerates to identity on one run; `mumdia mbr`
   hard-bails on `<2` psms paths (`main.rs:685`). Neither is in the single-run `run`
-  chain; from `run`, only `quant` (with fragment export, no peak-bounds), `report`, and
-  the optional `audit` stage (`run.rs:422`/`461`/`405`) fire.
+  chain; from `run`, only `quant` (with fragment export, no peak-bounds,
+  `run.rs:445`), `report` (`run.rs:484`), and the optional `audit` stage
+  (`run.rs:430`) fire.
 - **quant-lfq single input** reduces to the per-run sum; MaxLFQ/directLFQ have only
   synthetic-matrix unit tests, no real multi-run validation.
 - **two median helpers.** `quant::median_sorted` (`quant.rs:818`) and

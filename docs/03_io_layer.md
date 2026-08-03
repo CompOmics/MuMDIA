@@ -176,7 +176,7 @@ collecting every batch and summing `num_rows()`. It errors with context
 the builder cannot parse the Parquet footer. The whole file is materialized
 into memory; there is no streaming or predicate pushdown.
 
-Column access is by name. `idx(name)` (`table.rs:235`) resolves a name to a
+Column access is by name. `idx(name)` (`table.rs:381`) resolves a name to a
 column index via `schema.index_of`, returning a descriptive error listing all
 column names if the name is absent. The typed getters each downcast every
 batch's column to the concrete Arrow array type and concatenate across batches
@@ -185,29 +185,64 @@ time. The message wording is per getter: `"column '<name>' is not
 f64|f32|i64|i32|u32|bool"` for the scalar getters (and `opt_f64` reuses the f64
 message), `"column '<name>' is not utf8"` for `str` (note: `utf8`, not `str`),
 and for `list_f32` either `"column '<name>' is not a list"` when the column is
-neither a `List` nor a `LargeList` (`table.rs:426`) or `"list '<name>' inner is
-not f32"` when the inner element array is not f32 (`table.rs:403`).
+neither a `List` nor a `LargeList` (`table.rs:572`) or `"list '<name>' inner is
+not f32"` when the inner element array is not f32 (`table.rs:549`). The `str`
+getter downcasts to `StringArray` only (`table.rs:503-511`), that is Arrow
+`Utf8` with 32-bit offsets. An Arrow `LargeUtf8` (`large_utf8`) column fails
+with the same `"is not utf8"` message even though it holds strings; unlike
+`list_f32`, the string path has no large-offset fallback.
 
 The getters and their exact null behaviour:
 
-- `f64` (`table.rs:241`), `f32` (`table.rs:261`): fast path when
+- `f64` (`table.rs:387`), `f32` (`table.rs:407`): fast path when
   `null_count() == 0` uses `extend_from_slice(a.values())`; otherwise iterate
   and map a null to `f64::NAN` / `f32::NAN`. Nulls become NaN.
-- `i64` (`table.rs:281`), `i32` (`table.rs:301`), `u32` (`table.rs:321`): fast
+- `i64` (`table.rs:427`), `i32` (`table.rs:447`), `u32` (`table.rs:467`): fast
   path on no nulls; otherwise iterate pushing `a.value(k)` **without checking
   `is_null`**. A null therefore comes through as the underlying buffer value
   (typically 0), not as a sentinel. See the gotcha below.
-- `bool` (`table.rs:341`): always iterates `a.value(k)`; never checks null.
-- `str` (`table.rs:357`): iterates; a null maps to an empty `String`.
-- `opt_f64` (`table.rs:377`): the only null-preserving getter. Returns
+- `bool` (`table.rs:487`): always iterates `a.value(k)`; never checks null.
+- `str` (`table.rs:503`): iterates; a null maps to an empty `String`.
+- `opt_f64` (`table.rs:523`): the only null-preserving getter. Returns
   `Vec<Option<f64>>`, mapping a null to `None`.
-- `list_f32` (`table.rs:396`): reads an f32 list column and accepts **both**
+- `list_f32` (`table.rs:542`): reads an f32 list column and accepts **both**
   `List` (32-bit offsets) and `LargeList` (64-bit offsets) encodings, so a
   chromatogram artifact written by `Col::ListF32` or `Col::LargeListF32` reads
   back through the same call. An outer null list becomes an empty `Vec`; a
   present list is materialized via `f.values().to_vec()`.
 
-`column_names()` (`table.rs:227`) returns the schema field names in order.
+`column_names()` (`table.rs:373`) returns the schema field names in order.
+
+### Parquet written outside this crate
+
+Several tables the engine reads are produced by a Python helper rather than by
+`write_table`: an imported spectral library, an augmented library, a decoy
+build. The reader is deliberately narrow, so those files must match it exactly.
+Matching the column names and types is not sufficient.
+
+- **Codec.** The workspace pins `parquet` with `default-features = false,
+  features = ["arrow", "snap"]`, so the reader decodes SNAPPY and uncompressed
+  files only. Any other codec fails at read with a message of the form
+  `"Parquet error: Disabled feature at compile time: zstd"`. Polars writes zstd
+  by default, so an externally produced table must set snappy explicitly.
+- **String encoding.** Write string columns as arrow `utf8`. Polars defaults to
+  `large_utf8`, which the `str` getter rejects with `"column 'peptidoform' is
+  not utf8"` (see the read side above).
+- **Library ids and row order.** A library precursor table has two further
+  preconditions, both checked when the fragment index loads the library in the
+  `mumdia` crate and both hard errors: `candidate_id` must be the contiguous,
+  row-aligned range `0..ncand` (`index.rs:112-125`), and rows must be ascending
+  by `precursor_mz` (`index.rs:215-231`, the precondition for the
+  `partition_point` candidate-range search; an unsorted import silently returns
+  wrong candidate windows if the check is removed). The fragment table is
+  grouped by a counting sort over `candidate_id` (`index.rs:132-153`), so its
+  rows need valid ids but no particular order, and each candidate's fragments
+  keep their stored order.
+
+`mumdia inspect` prints the schema but not the codec, so it does not by itself
+confirm a file is readable. Read the row-group metadata (for example with
+`pyarrow.parquet.ParquetFile`) to check compression, or rewrite the file with
+snappy before feeding it to the engine.
 
 ### Hashing (`hash.rs`)
 
@@ -346,8 +381,10 @@ This subsystem reads no `Config` fields. It has no config surface of its own, so
 the recent pruning of dead config fields in `mumdia-core::config` did not touch
 it. Its behaviour is fixed at compile time:
 
-- Compression is `SNAPPY`, hard-coded in `write_table` (`table.rs:189-191`); it
-  is not configurable and there is no other codec path.
+- Compression is `SNAPPY`, hard-coded in `write_table` (`table.rs:204-206`); it
+  is not configurable and there is no other codec path. The read side is equally
+  narrow, so this is a contract on externally written inputs too, not only on
+  this crate's outputs (see "Parquet written outside this crate").
 - The hash read buffer is 64 KiB (`hash.rs:11`).
 - Schema identifiers are the constants in `mumdia-core/src/schema.rs:7-24`; a
   new artifact requires a new tuple there, not a config change.
@@ -356,7 +393,9 @@ it. Its behaviour is fixed at compile time:
   `default-features = false, features = ["arrow", "snap"]` (pure-Rust snap, no
   cmake/C toolchain), `blake3` v1. Do not re-enable Parquet default features;
   they pull in a C compression backend that breaks the pure-Rust build
-  constraint (see CLAUDE.md environment gotchas).
+  constraint (see CLAUDE.md environment gotchas). The same pin also bounds what
+  the engine can read: a Parquet file compressed with any other codec is a read
+  error, whoever wrote it.
 
 ## Invariants, determinism, gotchas
 
@@ -401,6 +440,14 @@ it. Its behaviour is fixed at compile time:
   permission failure surfaces later at `File::create`, not at the mkdir.
 - **`record_artifact` hard-codes `format = "parquet"`** (`lib.rs:31`); it is not
   suitable for a non-Parquet artifact without a change there.
+- **Externally written Parquet must match the reader, not just the schema.** A
+  table produced outside `mumdia-io` must be SNAPPY-compressed with arrow `utf8`
+  string columns. zstd and `large_utf8` are both Polars defaults and both are
+  hard read errors (`"Parquet error: Disabled feature at compile time: zstd"`,
+  `"column 'peptidoform' is not utf8"`). A library table must additionally
+  satisfy the `candidate_id` contiguity (`index.rs:112-125`) and `precursor_mz`
+  ordering (`index.rs:215-231`) preconditions. See "Parquet written outside this
+  crate".
 - **LargeList transparency.** `list_f32` intentionally reads both `List` and
   `LargeList`, so an artifact whose encoding differs between two builds (32- vs
   64-bit offsets) still reads identically; do not assume a fixed offset width
@@ -435,8 +482,10 @@ it. Its behaviour is fixed at compile time:
   check today, so the bump is provenance only; if you need a hard gate, add the
   check on the read path (it does not exist yet).
 - **Change compression.** It is a one-line change in `write_table`
-  (`table.rs:190`); keep it to a codec available under the pinned pure-Rust
-  Parquet features, and re-measure round-trip and file size.
+  (`table.rs:205`); keep it to a codec available under the pinned pure-Rust
+  Parquet features, and re-measure round-trip and file size. It is not a
+  write-side-only change: every externally written input has to move to the same
+  codec, since the reader decodes only what the pin enables.
 - **Extend the report.** Add a field to `ArtifactReport` (`report.rs:11`). Keep
   `stats` a `BTreeMap` for deterministic key order. Since it is
   `Serialize`/`Deserialize`, adding a field is backward compatible only if it is

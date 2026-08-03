@@ -359,7 +359,7 @@ takes `--ms2`, `--library-precursors`, `--library-fragments`, `--out`, and
   fragindex match, epoch reset, precursor gate, and the naive-equivalence gate are
   tested in `fragindex.rs` (`:280-451`).
   There is no stage-level test for `search_seed::run`, the masscal output, or
-  bucketed-vs-fragindex equivalence at the stage level (see CLAUDE.md "test gaps").
+  bucketed-vs-fragindex equivalence at the stage level (see docs/14_build_test_deploy_gotchas.md).
 
 ## How to extend / modify
 

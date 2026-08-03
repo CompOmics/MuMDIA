@@ -66,6 +66,22 @@ family scores each fragment's XIC against a predicted-intensity-weighted referen
 profile (`rust/mumdia/crates/mumdia/src/stages/features/coelution.rs:3`). It is
 temporal agreement, orthogonal to intensity-pattern agreement.
 
+**competition key (`compete.group_by`)**. The grouping over which `compete`
+resolves rival candidates, keeping only the highest `prelim_score` member of each
+group and deleting the rest before rescore and before any FDR estimate
+(`rust/mumdia/crates/mumdia/src/stages/compete.rs:319-340`). The default variant
+is named `precursor` but is a misnomer: the key is
+`(base_peptide_id, label_code, 0, peak_rank)`
+(`rust/mumdia/crates/mumdia/src/stages/compete.rs:88`), and `base_peptide_id` is
+the stripped-sequence identity, so every charge and every modification variant of
+one peptide collapses to a single winner. `peptidoform_charge`
+(`rust/mumdia/crates/mumdia/src/stages/compete.rs:93-98`) keys
+`(pform_id, label, charge, peak_rank)` instead and is required, not optional, for
+a PTM or modification search, where the default would delete the modified form
+whenever an unmodified sibling scored higher. Competition is within label, so it
+never eliminates a target against its own decoy. See
+`docs/11_compete_rescore_fdr.md`.
+
 **decoy (reverse / scramble / shift)**. A deliberately false library entry used to
 estimate the false discovery rate. MuMDIA mints one paired decoy per target at
 digest time: `Reverse` reverses the interior residues keeping the C-terminal
@@ -204,7 +220,12 @@ peptidoform at a charge, characterized by its precursor m/z. It is the grouping 
 for `precursor_q` (peptidoform + charge,
 `rust/mumdia/crates/mumdia/src/stages/rescore.rs:388`) and the reporting unit of
 `peptides.tsv`, whose rows are precursors, not stripped sequences
-(`rust/mumdia/crates/mumdia/src/stages/report.rs:93`).
+(`rust/mumdia/crates/mumdia/src/stages/report.rs:93`). Under the default
+`compete.group_by = precursor`, however, competition has already deleted the
+charge and modification siblings by stripped peptide before rescore, so the
+surviving rows are precursor-shaped but effectively one per base peptide, and
+`precursor_q` then counts base peptides rather than precursors. See
+`competition key` and `docs/11_compete_rescore_fdr.md`.
 
 **prelim_score**. A cheap preliminary PSM score computed in `features` before
 rescoring, combining matched-fragment count scaled by fragment correlation, mean
@@ -247,13 +268,22 @@ different grouping contexts (`rust/mumdia/crates/mumdia/src/stages/rescore.rs:46
 | `q_value` | per-PSM, pooled across all runs (alias of `global_q_value` / `experiment_psm_q`) | experiment-wide PSM FDR; cross-run precursor quant off a pooled rescore (`QuantQColumn::PsmQ`) |
 | `experiment_psm_q` | per-PSM, pooled across all runs (identical to `q_value`) | explicit experiment-wide PSM FDR |
 | `run_psm_q` | per-PSM, target-decoy re-run within each source run separately | per-run PSM FDR; the correct filter for cross-run quant off an experiment-wide rescore (`QuantQColumn::RunPsmQ`) |
-| `precursor_q` | best PSM per (peptidoform + charge) | precursor-level FDR; valid as a per-run quant filter only when rescore itself was single-run |
+| `precursor_q` | best PSM per (peptidoform + charge), among the rows competition left | precursor-level FDR, but a genuine precursor unit only under `compete.group_by = peptidoform_charge`; valid as a per-run quant filter only when rescore itself was single-run |
 | `peptide_q_value` | best PSM per base (stripped) peptide | peptide-level FDR; single-run quant (`QuantQColumn::PeptideQ`, default). Note: under an experiment-wide rescore this is a GLOBAL per-peptide value carried on one best PSM, so it is wrong for per-run cross-run quant |
 | `pg_q_value` | best PSM per protein group | protein-level FDR |
 
 The `run_psm_q` / `experiment_psm_q` split and the `QuantQColumn` caveats are
 documented at `rust/mumdia/crates/mumdia/src/stages/rescore.rs:340` and
 `rust/mumdia/crates/mumdia-core/src/config.rs:772`.
+
+The three grouped columns (`precursor_q`, `peptide_q_value`, `pg_q_value`) are
+written only to each group's single winning row; every losing sibling keeps 1.0
+(`rust/mumdia/crates/mumdia/src/stages/rescore.rs:721-728`). After an
+experiment-wide rescore the grouping spans the whole experiment, so counting one
+run on a grouped column understates it by roughly `1/n_runs`. Use `run_psm_q` as
+the per-file unit there. Always name both the row unit and the q column when
+reporting a count; see `docs/15_data_dictionary.md` for the per-column grouping
+and `docs/17_troubleshooting.md` for the symptom.
 
 **schema id (`classifier_feature_schema_id`)**. A blake3 hash of the ordered active
 feature-column list, written to a companion `<features>.schema.json` so the
@@ -272,6 +302,19 @@ modifications and charge removed (the base peptide). It is the grouping key for
 peptide-level FDR (`peptide_q_value`) and is reported alongside the precursor in
 `peptides.tsv` (`rust/mumdia/crates/mumdia/src/stages/report.rs:95`). Peptidoforms
 are expanded from stripped peptides (see `peptidoform`).
+
+**top-peaks cap (`--top-peaks-ms2`)**. The conversion-time limit on how many of
+the most intense peaks of each MS2 spectrum are kept. It is destructive: the
+truncation is written into `spectra_ms2.parquet`
+(`rust/mumdia/crates/mumdia/src/stages/convert.rs:76-79`) and `extract` applies no
+cap of its own, so the flag sets the MS2 peak budget for extraction, features, and
+quantification, and peaks removed here can only be recovered by reconverting. It
+defaults to `0` (uncapped) at both conversion entry points and is
+acquisition-specific: a value tuned on one acquisition scheme can delete the
+majority of another run's fragment evidence. Distinct from
+`search_seed.top_n_peaks` (default 300), which is non-destructive and bounds only
+the seed's index-probing cost. See `docs/04_convert.md` for the canonical
+treatment.
 
 **target-decoy FDR**. The community-standard false discovery rate control MuMDIA
 uses: score real (target) library entries against paired decoys and estimate the

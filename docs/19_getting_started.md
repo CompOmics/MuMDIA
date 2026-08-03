@@ -239,7 +239,10 @@ The raw precursor table is intentional: enabled fine-tuning writes a new
 downstream stages to it without modifying the input. The explicit conversion cap
 is also essential to this reproduction. Both `run` and standalone `convert`
 otherwise default to uncapped MS2 spectra; `search_seed.top_n_peaks=300` is a
-separate seed-only probe cap.
+separate seed-only probe cap. Do not carry `--top-peaks-ms2 300` to your own
+data. It is specific to this chimeric AIF file, and on a 50-window Orbitrap DIA
+run the same value discarded 78.6% of MS2 peaks and cost 60% of the peptides.
+See docs/04_convert.md ("Choosing `--top-peaks-ms2`") before setting any cap.
 
 Expected result (documented, not re-verified here): approximately 10,300
 precursor-shaped report rows at peptide q <= 1% with the `nn_torch` rescorer.

@@ -38,7 +38,7 @@ the conda specs in `env/`, the container definition in `Dockerfile` +
 | `env/docker-deeplc.yml` | Conda spec for the in-image `deeplc` env (`python=3.11`, `torch==2.12.1+cpu` + DeepLC 4.0 multitask pinned git commit) |
 | `env/mumdia-rescore.yml` | Minimal host env for the default mokapot rescorer only (`python=3.12`, no torch/DeepLC/MS2PIP) |
 | `rust/mumdia/crates/mumdia/src/sidecar.rs` | Sidecar subprocess clients + `resolve_script` path resolution |
-| `rust/mumdia/crates/mumdia/src/main.rs` | Thin CLI; `doctor` subcommand probes configured sidecar interpreters (`main.rs:313`) |
+| `rust/mumdia/crates/mumdia/src/main.rs` | Thin CLI; `doctor` subcommand probes configured sidecar interpreters (`main.rs:346`) |
 | `rust/mumdia/crates/mumdia-core/src/config.rs` | `Config::validate` (`config.rs:1019`) + `apply_profile` (`config.rs:1107`) |
 | `rust/mumdia/crates/mumdia-core/src/constants.rs` | Physical constants; the clean-room provenance note (`constants.rs:1-6`) |
 
@@ -103,6 +103,18 @@ no C toolchain**: `parquet` uses `default-features = false, features =
 pure-Rust SNAPPY codec (`Cargo.toml:23-24`); `mzdata` uses `["mzml",
 "miniz_oxide"]` for a pure-Rust zlib backend (`Cargo.toml:25-26`); `arrow` adds
 `["prettyprint"]` for `inspect` (`Cargo.toml:22`).
+
+The dropped codecs are visible at the read side, not only at build time. SNAPPY
+is the only codec compiled in, so any Parquet the engine is asked to read must be
+SNAPPY (or uncompressed); a zstd file fails with `Parquet error: Disabled feature
+at compile time: zstd`. `mumdia-io` always writes SNAPPY
+(`mumdia-io/src/table.rs:205`), so this only bites on tables produced outside the
+engine. The same applies to string columns: `Table::str` downcasts to arrow
+`StringArray` and rejects anything else with `column '<name>' is not utf8`
+(`mumdia-io/src/table.rs:503-511`), so a `large_utf8` column is refused. pandas
+and pyarrow default to SNAPPY plus `utf8`; Polars defaults to zstd plus
+`large_utf8` and produces a file the engine cannot load. See
+`docs/13_sidecars.md` for the sidecar-side statement of the same contract.
 
 The release profile is `opt-level = 3` (`Cargo.toml:28-29`) with one exception:
 `arrow-ipc` is pinned to `opt-level = 1` (`Cargo.toml:34-35`). Its generated
@@ -279,16 +291,24 @@ CWD. `run_worker` (`sidecar.rs:217`) sets `PYTHONUTF8=1` and
 because Keras crashes on the Windows cp1252 console otherwise
 (`sidecar.rs:223-224`).
 
-**Doctor.** `mumdia doctor` (`main.rs:313`) probes three interpreters
-(`main.rs:325-337`) with an inline `importlib.util.find_spec` check and reports
+**Doctor.** `mumdia doctor` (`main.rs:346`) probes three interpreters
+(`main.rs:358-377`) with an inline `importlib.util.find_spec` check and reports
 `[ ok ]` / `[FAIL]` / `[skip]` per interpreter; `[skip]` means the interpreter is
-not configured, so the native path is used (`main.rs:341`). The rescore
+not configured, so the native path is used (`main.rs:381`). The rescore
 interpreter's required packages depend on the selected classifier: `NnTorch`
 needs `torch,numpy,pandas,pyarrow`; mokapot and entrapment (the `_` arm) need
-`mokapot,sklearn,numpy,pandas,pyarrow` (`main.rs:318-324`). The other two are
-fixed: `predict_frag.deeplc_python` needs `deeplc,numpy,pandas` (`main.rs:328-331`)
-and `predict_frag.ms2pip_python` needs `ms2pip,numpy,pandas` (`main.rs:333-336`). It
-exits non-zero if any configured env is unusable (`main.rs:369`).
+`mokapot,sklearn,numpy,pandas,pyarrow` (`main.rs:351-357`). The other two are
+fixed: `predict_frag.deeplc_python` needs
+`deeplc,numpy,pandas,pyarrow,torch,psm_utils` (`main.rs:368-371`) and
+`predict_frag.ms2pip_python` needs `ms2pip,numpy,pandas` (`main.rs:372-376`). The
+DeepLC list is longer than that script's own imports on purpose: the same
+interpreter also runs `deeplc_finetune.py`, which imports pyarrow, torch and
+psm_utils. The probe asserts what the scripts import rather than what the
+dependency tree implies, so a green `doctor` no longer precedes a crash at the
+fine-tune step. It exits non-zero if any configured env is unusable
+(`main.rs:409-411`). `find_spec` only answers whether a module is importable, so
+`doctor` cannot detect an import-order fault of the kind described under
+**Build gotchas** below.
 
 **Docker image.** Two-stage build. Stage 1 (`Dockerfile:15-21`) builds the
 release binary on `rust:1.96-bookworm` with `cargo build --release --locked
@@ -348,7 +368,7 @@ tag pushes `ghcr.io/compomics/mumdia:<tag>` + `:latest` + `:sha`
 | `Config::validate` | `config.rs:1019` | Rejects footgun combinations at load; defaults always pass |
 | `Config::apply_profile` | `config.rs:1107` | Applies the `dia` preset (Extended features, apex window 5, RT prior 120 s) |
 | `Config::canonical_json` | `config.rs:1125` | Canonical config JSON for the manifest hash |
-| `doctor` | `main.rs:313` | Probes configured sidecar interpreters; exits non-zero if any is unusable |
+| `doctor` | `main.rs:346` | Probes configured sidecar interpreters; exits non-zero if any is unusable |
 | `sidecar::resolve_script` | `sidecar.rs:20` | CWD/exe-dir/`scripts` path resolution for workers |
 | `sidecar::run_worker` | `sidecar.rs:217` | Spawns `python <script> <args>`; forces UTF-8 I/O only when its `utf8` arg is set (DeepLC calls) |
 | `sidecar::run_deeplc_finetune` | `sidecar.rs:111` | Positional-CLI DeepLC multitask fine-tune; a known nondeterministic path (no torch/numpy seed) |
@@ -449,20 +469,31 @@ imports the predicted library via `scripts/import_diann_lib.py` +
 cloud-synced tree; the symptom of getting this wrong is intermittent compiler
 access-violation crashes, not a clean error. (2) Keep the pure-Rust dep features
 (`parquet` no-default + `snap`, `mzdata` `miniz_oxide`); adding a C-backed codec
-reintroduces a cmake/C toolchain requirement. (3) Keep `arrow-ipc` at
+reintroduces a cmake/C toolchain requirement, and note the read-side consequence
+above (SNAPPY-only input). (3) Keep `arrow-ipc` at
 `opt-level = 1`; raising it crashes rustc codegen on Windows. (4) Keep the
 toolchain at or above 1.85; the edition-2024 dependencies will not compile on
 older rustc. (5) `cargo test` runs tests concurrently in one process, so any new
 test that writes files must use a unique path per call (see `tmp`), not a shared
-fixed name.
+fixed name. (6) Do not sort the imports in `scripts/deeplc_worker.py` or
+`scripts/deeplc_finetune.py`. `import deeplc` must run before numpy and pyarrow:
+DeepLC 4.x is torch-backed, and on Windows importing numpy first aborts torch's
+DLL initialisation with `OSError: [WinError 1114] ... Error loading
+"...\torch\lib\c10.dll"`. Neither the Rust test suite nor `mumdia doctor` can
+catch this, and imported-library mode never reaches `deeplc_worker.py` at all, so
+the only thing that exercises it is a FASTA-mode library build.
 
 **Test-coverage gaps (what green does NOT prove).** The suite exercises native
 paths only. There is no stage-level test for `convert`, `search-seed`,
 `predict-frag`, the `run` orchestrator, `manifest.json`, `inspect`, `report`, or
 the library-input path. The real sidecar strategies (MS2PIP, DeepLC, DeepLC
 fine-tune, mokapot, percolator) never run in the test suite; only the native
-fallbacks are covered. MS1 extraction and mass-calibration paths are exercised
-only in full runs, not unit tests. There is no multi-run coverage (align, MBR,
+fallbacks are covered. This gap has already shipped one real defect: a
+module-level import reordering in `scripts/deeplc_worker.py` made every
+FASTA-mode DeepLC prediction abort on Windows, and a green workspace suite plus a
+green `mumdia doctor` both reported no problem. Treat any sidecar change as
+validated only by running it. MS1 extraction and mass-calibration paths are
+exercised only in full runs, not unit tests. There is no multi-run coverage (align, MBR,
 quant-lfq cross-run beyond the single-file unit tests) and no entrapment-rescorer
 coverage. `--locked` in CI means a stale `Cargo.lock` fails the build, so update
 the lockfile in the same commit as a dependency bump.
@@ -491,9 +522,12 @@ and the mzML/library/FASTA inputs always need a data mount.
   determinism. Prefer covering one of the untested stages listed above.
 - **Add a Python sidecar:** put the worker in `scripts/`, add its client to
   `sidecar.rs` over the positional-CLI Parquet contract, add a `doctor` check row
-  (`main.rs:325`), pin its packages in a new `env/*.yml`, and add it to the
-  Docker envs if it should ship in the image. If it trains a model, either seed it
-  for determinism or document it as nondeterministic like the DeepLC/NN paths.
+  (`main.rs:358`) listing every package the worker actually imports (not what its
+  dependency tree implies), pin its packages in a new `env/*.yml`, and add it to
+  the Docker envs if it should ship in the image. Write its output Parquet with
+  SNAPPY and arrow `utf8` columns. If it imports a torch-backed package, import
+  that package before numpy. If it trains a model, either seed it for determinism
+  or document it as nondeterministic like the DeepLC/NN paths.
 - **Cut a release:** push a `v*` tag. That triggers both `release.yml` (per-platform
   archives on the GitHub Release) and `docker.yml` (GHCR push of `<tag>` + `latest`).
   To validate the image without publishing, run `docker.yml` via

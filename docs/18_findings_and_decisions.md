@@ -81,32 +81,100 @@ borderline candidates, and pass the gate score through to the rescorer as a
   to the default apex-intensity Pearson gate used in the benchmark, not a
   chromatographic co-elution threshold.
 
-### A3. MS2 peak cap: keep 300 on AIF
+### A3. The MS2 peak cap is destructive and acquisition-specific
 
-Uncapping the per-scan MS2 peak count (from a cap of 300 up to roughly 970 peaks
-on some scans) is neutral to slightly negative under both rescorers on this
-chimeric AIF file. For example, at gate 0.2 `nn_torch` gives 10,308 peptides
-capped versus 10,251 uncapped. On chimeric all-ion-fragmentation data the extra
-low-intensity peaks are interference, not signal, so the cap helps. This is
-instrument-dependent: narrow-window Orbitrap-Astral data behaves differently and
-should be re-evaluated on its own. The cap is applied at conversion time by
-`peaks_of`, which keeps the top-N most intense peaks with 0 meaning no cap.
-Both `run --top-peaks-ms2` and standalone `convert --top-peaks-ms2` default to
-0 (uncapped). Reproducing this AIF result therefore requires the explicit
-conversion flag `--top-peaks-ms2 300`. This is independent of
-`search_seed.top_n_peaks=300`, which limits seed probing only and does not remove
-peaks from downstream extraction or quantification.
+This finding is restated here as a decision record, self-contained by the charter
+of this document. The canonical reference for the flag itself is
+docs/04_convert.md ("Choosing `--top-peaks-ms2`"), and docs/20 holds the
+pre-flight saturation check to run before setting any cap.
 
-### A4. DeepLC multitask fine-tune of iRT is essential in library mode
+The cap is applied at conversion time by `peaks_of`, which sorts each MS2
+spectrum by intensity, truncates to the top N, and writes only the survivors
+(`rust/mumdia/crates/mumdia/src/stages/convert.rs:76` through `:79`). The
+truncation is baked into the `spectra_ms2.parquet` artifact: extraction applies
+no cap of its own and consumes whatever `convert` wrote. This is a different
+mechanism from `search_seed.top_n_peaks` (default 300,
+`rust/mumdia/crates/mumdia-core/src/config.rs:410` through `:415`), which is
+non-destructive and only bounds the per-peak index-probing cost of the seed
+search. The independence is measured, not just documented: on one file the seed
+output was identical (80,474 PSMs, 14,877 confident) with and without the
+conversion cap.
+
+On the chimeric AIF benchmark a cap of 300 is neutral to slightly positive. At
+gate 0.2, `nn_torch` gives 10,308 peptides capped versus 10,251 uncapped, the
+uncapped scans reach roughly 970 peaks, and only 47.8 percent of MS2 spectra
+there hold more than 300 peaks. On chimeric all-ion-fragmentation data the extra
+low-intensity peaks are largely interference.
+
+That result does not transfer, and applying it blindly is destructive. On a
+50-window Orbitrap DIA run (32,950 MS2 and 660 MS1 spectra) the uncapped peak
+count per MS2 spectrum is p25 572, p50 1,320, p95 2,756, max 3,596, for 43.4M
+peaks in total. A cap of 300 keeps 9.3M of them: 78.6 percent of all MS2 peaks
+are discarded and 85.5 percent of spectra are truncated, because even the 25th
+percentile spectrum exceeds the cap. End-to-end on that file, with only this flag
+changed:
+
+| conversion cap | `peptides.tsv` rows @ `peptide_q_value` <= 0.01 | protein groups | share of DIA-NN 2.2.0 library-free |
+|---|---|---|---|
+| 300 | 25,425 | 4,554 | 32.3% |
+| uncapped | **63,237** | **7,336** | 80.3% |
+
+The empirical decoy fraction was 0.99 percent in both arms, so this is a
+sensitivity difference, not a loosened threshold.
+
+The mechanism is peak-group formation, not scoring. With most peaks removed,
+`extract.presence_min_fragments = 3`
+(`rust/mumdia/crates/mumdia-core/src/config.rs:523`, default at `:690`) cannot be
+satisfied, so real peptides never form a peak group. `mumdia audit` on the capped
+arm, restricted to peptides DIA-NN confirms are present, shows 49,105 of 78,782
+(62.3 percent) stopped at `candidate_generated` with `NO_PEAK_GROUP`, against
+only 5,380 lost to FDR and 355 lost to competition. A counterfactual replay on
+the uncapped artifact recovered 41,948 of those 49,105 (85.4 percent).
+
+The response to the cap is smooth, so a cap remains usable when peak volume is
+constrained. Fraction of the lost peptides recovered on that file:
+
+| cap | 300 | 400 | 600 | 900 | 1400 | 2000 | uncapped |
+|---|---|---|---|---|---|---|---|
+| recovered | 0% | 17.8% | 44.3% | 69.0% | 83.1% | 86.8% | 87.2% |
+
+A cap of 1,400 buys 83 of the 87 achievable percentage points at about 77 percent
+of the peak volume. Uncapping is not free but is cheap on that file: accepted candidates
+rose from 188,027 to 2,286,840 (12.2x) and extract wall clock from 57.9 s to
+91.9 s.
+
+Both `run --top-peaks-ms2` and standalone `convert --top-peaks-ms2` default to 0
+(uncapped), which is the correct default. Reproducing the AIF result requires
+passing `--top-peaks-ms2 300` explicitly, and that flag must not be carried to
+another acquisition without the per-acquisition pre-flight and cap sweep in
+docs/20.
+
+### A4. DeepLC fine-tune of iRT is essential in library mode, but not per file
 
 Raw DIA-NN predicted iRT is locally noisy, with a residual around 110 seconds MAD
-against observed RT on both the E. coli and HYE datasets. A per-run DeepLC 4.0
-multitask fine-tune on the confident seed PSMs tightens this to roughly 13 to 27
-seconds MAD, which narrows the RT windows and materially lifts identifications.
-The fine-tune is therefore essential, not optional, in library-input mode. Do not
-use an already-fine-tuned library (a `_ft` or reversed-decoy library) as a "raw
-DIA-NN" baseline; the raw baseline is the un-fine-tuned precursor library. The
-fine-tune runs between search-seed and RT calibration and writes a new
+against observed RT on both the E. coli and HYE datasets. A DeepLC 4.0 multitask
+fine-tune on confident seed PSMs tightens this to roughly 13 to 27 seconds MAD,
+which narrows the RT windows and materially lifts identifications. Fine-tuning is
+therefore essential, not optional, in library-input mode. Do not use an
+already-fine-tuned library (a `_ft` or reversed-decoy library) as a "raw DIA-NN"
+baseline; the raw baseline is the un-fine-tuned precursor library.
+
+What is not established is that the fine-tune must be repeated for every file.
+Measured: a library whose `predicted_irt` was fine-tuned once and then predicted
+across every peptidoform in that library, combined with the ordinary per-run
+LOESS calibration in `rt-im-train` and `rt_im_train.finetune_deeplc = false`,
+gives median absolute RT residual 6.06 s, MAD 6.11 s, slope 0.9907, intercept
+16.4 s, against 6.14 s and 6.18 s with per-file fine-tuning. That is equal or
+marginally better, and it removes about 36 minutes per file (2,166 s of a 5,127 s
+single-file run, covering the fine-tune plus whole-library iRT prediction over
+roughly 5M peptidoforms). The distinction that matters is between a library
+fine-tuned once and re-predicted in full, which is what was measured, and a stale
+per-run `_ft` table produced on one file and reused on another, which has
+previously underperformed a fresh per-run fit. Per-run fine-tuning remains the
+default in the AIF reference recipe; on a multi-file experiment against a fixed
+library, the once-per-library variant is the cheaper equal-quality option.
+
+The fine-tune runs between search-seed and RT calibration and writes a new
 `fragment_library_precursors_ft.parquet` with replaced `predicted_irt`; the input
 library is unchanged and downstream stages are rebound to the new table. It is
 nondeterministic (see Part B).
@@ -128,6 +196,14 @@ computation (PSM, peptide, protein-group, per-run, and precursor levels) and
 `:447` through `:477` for the emitted columns. The estimator is
 `q = (n_decoys + 1) / max(1, n_targets)`, monotonized, with tied-score blocks
 collapsed to one q (`rust/mumdia/crates/mumdia/src/fdr.rs:38`).
+
+Pooling more runs into one rescore does not tighten q. That estimator is
+scale-invariant: replicating the population leaves the decoy-to-target ratio
+unchanged. The only pool-size-dependent term is the `+1` pseudocount, whose
+relative weight shrinks as the pool grows, so a larger pool is if anything
+marginally looser at a given score. Do not attribute a per-run count change to
+the number of runs pooled; the cause is the score distribution or the q column
+used, not the pool size.
 
 Because coarser grouping pools evidence across PSMs, a peptide count can exceed a
 precursor count at the same threshold (here precursors run about 1 percent below
@@ -223,15 +299,36 @@ The `nn_torch` training loop is seed x fold x round x epoch. The knobs:
 `MUMDIA_NN_ITERS` (rounds), `MUMDIA_NN_EPOCHS` is an environment variable only
 (not engine-set, default 25), and `MUMDIA_NN_SEEDS` defaults to 1.
 
-### A11. Precursor grouping key: base peptide versus peptidoform-charge
+### A11. `compete.group_by = precursor` is a misnomer and deletes modforms
 
-The `compete` default `group_by = Precursor` keys competition on
-`base_peptide_id`, which collapses charge and modification siblings into one base
-peptide. This is not a precursor-level count. `group_by = peptidoform_charge` is
-the true precursor-level competition and is the key needed for a precursor-level
-identification count or a precursor matrix submission. Selecting the grouping
-also changes the training and FDR population, so it remains benchmark-gated (see
-finding A5 on q-value units and the quantification rules in CLAUDE.md).
+The enum variant is named `Precursor`, but the group key it builds is
+`(base_peptide_id, label_code, 0, peak_rank)`
+(`rust/mumdia/crates/mumdia/src/stages/compete.rs:88`), and `base_peptide_id` is
+the stripped sequence: `scripts/import_diann_lib.py:137` factorizes
+`Stripped.Sequence` into it. `resolve_competition` then keeps only the highest
+`prelim` row per group and deletes the rest
+(`rust/mumdia/crates/mumdia/src/stages/compete.rs:321` through `:344`), before
+rescoring. Every charge and every modification variant of one peptide therefore
+collapses to a single winner pre-FDR, and the default is not a precursor-level
+count.
+
+`group_by = peptidoform_charge` keys `(peptidoform_id, label_code, charge,
+peak_rank)` (`rust/mumdia/crates/mumdia/src/stages/compete.rs:93` through `:98`)
+and is the true precursor-level competition. Measured on a modification-rich
+imported library, the default deleted 880,464 of 1,890,239 extracted candidates
+(46.6 percent). Under `peptidoform_charge`, competition removed 0 rows and
+precursors per peptide moved from 1.000 to 1.174 (DIA-NN reports about 1.126 on
+comparable data). The peptide count was unchanged, so the precursor-level key
+cost nothing on that library.
+
+The consequence for a modification search is not cosmetic. The modified form is
+deleted whenever an unmodified or otherwise-modified sibling of the same stripped
+sequence scores higher, which is the common case. Treat `peptidoform_charge` as
+required for PTM work rather than benchmark-gated, and required for any
+precursor-level identification count or precursor matrix submission. Changing the
+key still changes the training and FDR population, so for base-peptide
+sensitivity benchmarks the default remains the comparison baseline (see finding
+A5 on q-value units and the quantification rules in CLAUDE.md).
 
 ### A12. Comparison against DIA-NN 2.2.0
 
@@ -360,9 +457,12 @@ Library-input mode is the recipe that wins:
    paired decoys (license-clean: MuMDIA ships no DIA-NN; the user runs DIA-NN
    under their own license, then `import_diann_lib.py` and `make_reverse_decoys.py`
    or `make_shift_decoys.py`).
-2. Enable the per-run DeepLC multitask fine-tune of iRT
-   (`rt_im_train.finetune_deeplc = true`). Rationale: finding A4, raw iRT is too
-   noisy.
+2. Make sure the library iRT is DeepLC fine-tuned. The reference recipe does this
+   per run (`rt_im_train.finetune_deeplc = true`). Rationale: finding A4, raw iRT
+   is too noisy. On a multi-file experiment against a fixed library, fine-tuning
+   the library once and predicting it in full, then leaving
+   `finetune_deeplc = false`, matched the per-file residuals and saved about 36
+   minutes per file (finding A4).
 3. Use the Extended feature set (`features.set = extended`).
 4. Use the `nn_torch` rescorer (`rescore.classifier = nn_torch`, with
    `rescore.python` pointing at a torch-capable interpreter and
@@ -371,9 +471,12 @@ Library-input mode is the recipe that wins:
    model. Verify `params.classifier` in `psms_scored.parquet.report.json`.
 5. Use a loose extraction gate (`extract.min_frag_corr` near 0.2). Rationale:
    finding A1 and A2, the nonlinear rescorer prefers looser-is-better.
-6. Keep the conversion-time MS2 peak cap at 300 on AIF by passing
+6. On this AIF file only, set the conversion-time MS2 peak cap to 300 by passing
    `--top-peaks-ms2 300`. Rationale: finding A3, uncapping adds interference on
-   chimeric data. The seed-only `search_seed.top_n_peaks=300` is separate.
+   chimeric data. The seed-only `search_seed.top_n_peaks=300` is separate. On any
+   other acquisition, leave the cap at the default 0 until a per-acquisition
+   sweep says otherwise; finding A3 measures a 300 cap costing 60 percent of the
+   peptides on a 50-window Orbitrap DIA run.
 
 On `LFQ_Orbitrap_AIF_Ecoli_01` this historically reaches about 10,300
 `(peptidoform, charge)` rows in `peptides.tsv`, selected with

@@ -26,8 +26,8 @@ artifacts. convert writes no IM columns at all; the in-memory `Peak`/
 | Path | Role |
 |---|---|
 | `rust/mumdia/crates/mumdia/src/stages/convert.rs` | The whole stage: mzML reading, centroiding, peak capping, window synthesis, artifact writing. |
-| `rust/mumdia/crates/mumdia/src/main.rs` (`Cmd::Convert`, lines 22-41, 390-414) | CLI subcommand; builds the provenance `config_hash` and calls `convert::run`. |
-| `rust/mumdia/crates/mumdia/src/stages/run.rs` (lines 196-203) | The `run` orchestrator's call into convert (top_peaks_ms1 hardcoded to 0). |
+| `rust/mumdia/crates/mumdia/src/main.rs` (`Cmd::Convert` flags at lines 28-47, dispatch at 430-454) | CLI subcommand; builds the provenance `config_hash` and calls `convert::run`. |
+| `rust/mumdia/crates/mumdia/src/stages/run.rs` (lines 201-215) | The `run` orchestrator's call into convert (top_peaks_ms1 hardcoded to 0). |
 | `rust/mumdia/crates/mumdia/src/spectra.rs` | The read-back side: `load_ms1` / `load_ms2` turn the artifacts back into in-memory scans for downstream stages. |
 | `rust/mumdia/crates/mumdia-core/src/schema.rs` (lines 7-10) | Frozen `(logical name, version)` identifiers for the four output artifacts. |
 | `rust/mumdia/crates/mumdia-io/src/table.rs` | `Col` / `write_table` typed Parquet writer used to emit the artifacts. |
@@ -44,12 +44,13 @@ config file (see Configuration).
 
 Outputs: four Parquet artifacts written to `--out-dir`, each with a sibling
 `<file>.report.json`. All are written with SNAPPY compression via
-`write_table` (`table.rs:151`). List columns (`mz`, `intensity`) are Arrow
+`write_table` (`table.rs:166`; the compression is set at `table.rs:205`). List
+columns (`mz`, `intensity`) are Arrow
 `List<Float32>` (the `Col::ListF32` variant); both the outer list column and its
 inner `item` element are marked nullable in the Arrow schema (`table.rs:84`
 builds the nullable inner `item` field, `table.rs:98` the nullable list column),
 but convert writes neither as null. An empty scan is a non-null empty list
-(`ListBuilder::append(true)` at `table.rs:124`).
+(`ListBuilder::append(true)` at `table.rs:131`).
 
 ### `spectra_ms1.parquet` (`SPECTRA_MS1`, schema v1; written at `convert.rs:171`)
 
@@ -160,6 +161,10 @@ reader plus four table writes.
    Drop peaks with intensity `<= 0`. If `top_n > 0` and there are more than
    `top_n` peaks,
    sort descending by intensity and truncate to `top_n` (`convert.rs:76-79`).
+   The truncation is baked into `spectra_ms2.parquet` and no later stage can undo
+   it: `extract` applies no peak cap of its own and consumes whatever convert
+   wrote. Sizing this cap is therefore a per-acquisition decision, not a portable
+   default (see "Choosing `--top-peaks-ms2`").
    Then always sort ascending by m/z (`convert.rs:80`). Finally, cast m/z to
    `f32` for output (`*m as f32`, `convert.rs:81`) while intensity stays `f32`.
    Storing observed m/z as f32 halves peak storage; the read side widens back to
@@ -223,7 +228,7 @@ read side: `spectra::load_ms2` / `load_ms1` sort by `rt_seconds` after loading
 | `run` | `convert.rs:103` | The stage entry point; single pass over mzML, then four table writes. |
 | `write_reports` | `convert.rs:269` | Writes the per-artifact `report.json` sidecars. |
 | `artifact::SPECTRA_MS1/_MS2/ISOLATION_WINDOWS/MS2_TO_MS1` | `schema.rs:7-10` | Frozen `(name, version)` schema identifiers, all v1. |
-| `Col` / `write_table` | `table.rs:23` / `table.rs:151` | Typed columns and the SNAPPY Parquet writer; validates equal lengths and rejects duplicate names. |
+| `Col` / `write_table` | `table.rs:23` / `table.rs:166` | Typed columns and the SNAPPY Parquet writer; rejects duplicate names (`table.rs:172-180`) and unequal column lengths (`table.rs:181-191`). |
 | `ArtifactReport` | `report.rs:11` | The report struct written next to each artifact. |
 | `load_ms2` / `load_ms1` | `spectra.rs:20` / `spectra.rs:100` | Read-back into `Ms2Scan` / `Ms1Scan`, RT-sorted, m/z widened to f64; per-scan peak count is `mf.len().min(iff.len())` (`spectra.rs:68`), tolerant of an m/z vs intensity length mismatch. |
 | `Ms1Scan` / `Ms2Scan` | `spectra.rs:12` / `types.rs:55` | Read-back structs. `Ms1Scan` (scan_index, rt_seconds, mz, intensity) is defined in `spectra.rs`, not `types.rs`; `Ms2Scan` (adds `id`, `window`, `peaks`) is in `types.rs`. |
@@ -231,11 +236,11 @@ read side: `spectra::load_ms2` / `load_ms1` sort by `rt_seconds` after loading
 ## Configuration
 
 convert reads no `Config` fields, and its subcommand has no `--config` flag
-(`main.rs:22-41`). The stage function signature does not take a `Config`; the
+(`main.rs:28-47`). The stage function signature does not take a `Config`; the
 `config_hash` it receives is only recorded for provenance. The CLI wrapper still
-loads the default config via `load_config(&None)` (`main.rs:397`) purely to seed
+loads the default config via `load_config(&None)` (`main.rs:437`) purely to seed
 that hash: `config_hash = blake3(cfg.canonical_json() + separators + caps)`
-(`main.rs:402-405`), so the default config's canonical JSON is embedded in the
+(`main.rs:442-445`), so the default config's canonical JSON is embedded in the
 hash even though no config field alters the output.
 
 | CLI flag | Default | Effect |
@@ -243,30 +248,106 @@ hash even though no config field alters the output.
 | `--mzml` | (required) | Input mzML path. |
 | `--out-dir` | (required) | Output directory for the four artifacts. |
 | `--max-spectra` | `0` (all) | Read at most N spectra, for fast iteration. Counts all MS levels. |
-| `--top-peaks-ms2` | `0` (uncapped) | Keep at most N most-intense MS2 peaks per scan. Irreversible conversion-time cap. |
+| `--top-peaks-ms2` | `0` (uncapped) | Keep at most N most-intense MS2 peaks per scan. Irreversible conversion-time cap; acquisition-specific, see below. |
 | `--top-peaks-ms1` | `0` (uncapped) | Keep at most N most-intense MS1 peaks per scan. Irreversible. |
 
-Defaults are asserted by `conversion_caps_default_to_uncapped` (`main.rs:750`) and
-the explicit-cap case by `explicit_conversion_cap_is_preserved` (`main.rs:790`).
+Defaults are asserted by `conversion_caps_default_to_uncapped` (`main.rs:823`) and
+the explicit-cap case by `explicit_conversion_cap_is_preserved` (`main.rs:863`).
 The `run` orchestrator exposes `--max-spectra` and `--top-peaks-ms2` but not
 `--top-peaks-ms1`; it hardcodes `top_peaks_ms1: 0` when calling convert
-(`run.rs:201`). The MS2 cap is documented as "irreversible" because it discards
-peaks before they reach extraction, features, and quantification; for a seed-only
-peak limit use `search_seed.top_n_peaks` instead (`main.rs:31-35`,
-`config.rs:298`).
+(`run.rs:213`). The MS2 cap is documented as "irreversible" because it discards
+peaks before they reach extraction, features, and quantification
+(`main.rs:37-41`).
+
+`--top-peaks-ms2` and `search_seed.top_n_peaks` (`config.rs:410-415`, default
+300) are different quantities. The seed limit bounds only how many peaks per
+scan the seed probes against the fragment index (`select_peaks`,
+`search_seed.rs:342`); it is non-destructive and never touches the spectra
+artifact. It is not fully independent of the conversion cap, because the seed
+selects its peaks from whatever convert already wrote, so a conversion cap below
+`top_n_peaks` also shrinks the seed's input. Above it the two do not interact:
+on a 50-window Orbitrap DIA run, changing `--top-peaks-ms2` from 300 to uncapped
+left the seed output identical (80,474 seed PSMs, 14,877 confident) because both
+arms funnel to the same 300 most intense peaks per scan, while the end-to-end
+result changed substantially.
 
 Provenance handling of the caps: because the caps change the spectra output but
-are not part of the `Config`, `main.rs:402-405` folds them into the blake3
+are not part of the `Config`, `main.rs:442-445` folds them into the blake3
 `config_hash` with a unit-separator (`\u{1f}`) so two different caps do not
-collapse to an identical hash. The same values are recorded in the convert report
+collapse to an identical hash. `run` does the same for its own convert call
+(`run.rs:201-207`). The same values are recorded in the convert report
 `params` (`convert.rs:245-251`).
 
 The centroid noise floor (`1e-4` relative, `convert.rs:25`) and the full-range AIF
 window value (`1.0e6`, `convert.rs:143`) are hardcoded constants, not config
-fields. There is no `ScanWindowMode` or centroiding strategy knob for this stage;
-the project config was recently pruned of dead fields, and convert exposes no
+fields. `Config` contains no convert-stage field at all and no centroiding
 strategy enum. Any change to centroiding or window synthesis is a code change
 here, not a config toggle.
+
+### Choosing `--top-peaks-ms2`
+
+The default (`0`, uncapped) is the only portable setting. Any non-zero value
+depends on how many peaks the acquisition actually produces per MS2 spectrum, so
+it must be measured per acquisition scheme rather than carried over from another
+run.
+
+Uncapped peak census on one 50-window Orbitrap DIA run (32,950 MS2 spectra, 660
+MS1, 43.4M MS2 peaks in total):
+
+| statistic | peaks per MS2 spectrum |
+|---|---|
+| p25 | 572 |
+| p50 | 1320 |
+| p95 | 2756 |
+| max | 3596 |
+
+At `--top-peaks-ms2 300` on that run, 9.3M of the 43.4M peaks survive: 78.6% of
+all MS2 peaks are discarded and 85.5% of spectra are truncated, since even the
+p25 spectrum exceeds the cap. On the chimeric AIF benchmark run where 300 was
+originally chosen, only 47.8% of spectra reach the cap. The same value therefore
+behaves very differently on the two acquisitions.
+
+End-to-end effect on the 50-window run, with only this flag changed, so both
+arms are counted on the same row and q-value unit:
+
+| setting | peptides.tsv rows at `peptide_q_value` <= 0.01 | protein groups | empirical decoy fraction |
+|---|---|---|---|
+| `--top-peaks-ms2 300` | 25,425 | 4,554 | 0.99% |
+| uncapped | 63,237 | 7,336 | 0.99% |
+
+The empirical decoy fraction is the same in both arms, so the difference is
+sensitivity and not a loosened threshold. For scale, the two counts are 32.3%
+and 80.3% of what a library-free DIA-NN 2.2.0 search reports on the same file.
+The mechanism is downstream: with most peaks gone, candidates cannot assemble
+enough distinct matched fragments to satisfy `extract.presence_min_fragments`
+(`config.rs:523`, default 3 at `config.rs:690`), so they fail peak-group
+formation and are recorded with rejection code `NO_PEAK_GROUP`
+(`rejection.rs:62`). This was confirmed with `mumdia audit` on the capped arm,
+restricted to the peptides that same DIA-NN search reports as present (78,782
+distinct `Stripped.Sequence` at DIA-NN `Q.Value` <= 0.01): 49,105 of 78,782 (62.3%) stopped at `candidate_generated` with `NO_PEAK_GROUP`, against only
+5,380 lost to FDR and 355 to competition, and a counterfactual replay on the
+uncapped artifact recovered 41,948 (85.4%) of them. The loss is therefore
+extraction-side, not a scoring or competition effect. See docs/09_extract.md for
+that side of the interaction.
+
+Dose-response on the same run, expressed as the fraction of the peptides lost at
+cap 300 that a larger cap recovers:
+
+| `--top-peaks-ms2` | lost peptides recovered |
+|---|---|
+| 300 | 0% |
+| 400 | 17.8% |
+| 600 | 44.3% |
+| 900 | 69.0% |
+| 1400 | 83.1% |
+| 2000 | 86.8% |
+| uncapped | 87.2% |
+
+The curve saturates well below the uncapped peak volume. A cap of 1400 buys 83
+of the 87 achievable points at about 77% of the peak volume, which is the
+cheaper setting when storage or memory is the binding constraint. Uncapping is
+not free at extraction time: on that run accepted candidates went from 188,027
+to 2,286,840 (12.2x) and extract wall clock from 57.9 s to 91.9 s.
 
 ## Invariants, determinism, gotchas
 
@@ -285,6 +366,14 @@ here, not a config toggle.
   missing precursor. If a future non-AIF format reports a genuinely absent window,
   it will be silently treated as full-range. `window_target = 0.0` is the marker
   for a synthesized window.
+- **`--top-peaks-ms2` is destructive and acquisition-specific.** The truncation
+  at `convert.rs:76-79` is written into `spectra_ms2.parquet`, and `extract`
+  applies no peak cap of its own, so this flag sets the MS2 peak budget for the
+  whole chain. A value tuned on one acquisition scheme can discard the majority
+  of another run's peaks (78.6% of MS2 peaks on a 50-window Orbitrap DIA run at
+  cap 300) and cost more than half the identifications at an unchanged decoy
+  fraction. Measure the per-spectrum peak census before setting it; see
+  "Choosing `--top-peaks-ms2`".
 - **Observed m/z is f32 on disk.** `convert.rs:81` casts to f32; `spectra.rs`
   widens back to f64. This is intentional (storage) and fine at DIA ppm
   tolerances, but do not round-trip observed m/z through convert expecting f64
@@ -296,15 +385,16 @@ here, not a config toggle.
   Rare, but a downstream stage could then see profile-shaped data for that scan.
 - **List columns are nullable in the Arrow schema but never null in practice.**
   An empty scan is written as a non-null empty list; the read side treats null and
-  empty identically (`spectra.rs:55`, `table.rs:419`).
+  empty identically (`spectra.rs:55`, `table.rs:557-559` and `table.rs:565-567`).
 - **`partial_cmp().unwrap()` on sorts** (`convert.rs:77`, `:80`,
   `spectra.rs` sorts) would panic on NaN. Convert filters intensity `<= 0` before
   sorting and does not sort on m/z NaN in practice, so this is safe for real mzML
   but is a latent trap if malformed data ever reaches it.
 - **Out-dir creation errors are swallowed.** `std::fs::create_dir_all(p.out_dir)
-  .ok()` (`convert.rs:105`) discards a creation failure; a genuinely unwritable
-  out-dir does not fail here but surfaces later as a file-create error from
-  `write_table` (`table.rs:188`).
+  .ok()` (`convert.rs:105`) discards a creation failure; `write_table` retries the
+  parent-directory creation and also discards the result (`table.rs:199-201`), so a
+  genuinely unwritable out-dir does not fail at either point and surfaces only as
+  the `File::create` error (`table.rs:203`).
 - **Observability.** The stage is otherwise side-effect-free apart from its file
   writes; it emits two `tracing::info!` records, one on open
   (`convert.rs:106`) and one on completion carrying the MS1/MS2/window counts and
@@ -312,10 +402,11 @@ here, not a config toggle.
 - **`elapsed_ms` is shared, not per-artifact.** A single `Instant` started at
   `convert.rs:104` times the whole stage; the same value is written into all four
   `report.json` sidecars, so per-artifact timing cannot be read from them.
-- **Test coverage.** Only the two CLI-parsing tests above exercise this area. The
-  centroiding math, window synthesis, and artifact writing have no stage-level
-  unit test (see CLAUDE.md "test gaps"). MS1 extraction and mass-calibration paths
-  that depend on convert output are exercised only in full runs.
+- **Test coverage.** Only the two CLI-parsing tests above exercise this area.
+  `convert.rs` has no `#[cfg(test)]` module at all, so the centroiding math,
+  window synthesis, and artifact writing have no stage-level unit test. MS1
+  extraction and mass-calibration paths that depend on convert output are
+  exercised only in full runs.
 
 ## How to extend / modify
 
