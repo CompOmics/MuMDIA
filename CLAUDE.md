@@ -34,7 +34,7 @@ policy for tuning and validation.
   helpers (eleven scripts total), including `augment_library.py`, which adds the
   tryptic FASTA peptides an imported library is missing. Sidecars use positional
   file contracts.
-- `docs/`: tracked developer guide (`01` through `20`); start at
+- `docs/`: tracked developer guide (`01` through `21`); start at
   `docs/README.md`.
 - `env/`, `docker/`, `Dockerfile`: sidecar environments and deployable configs.
 - `lib/`, `fasta/`, `mzml_files/`: large local inputs, intentionally untracked.
@@ -69,6 +69,8 @@ FASTA -> digest -> peptidoforms -> predict-frag --+
                                                    +-> search-seed
 imported library ---------------------------------+       |
 mzML -> convert ----------------------------------+       v
+        (optional: prescan, per-run tag pruning    |
+         of modform hypotheses for a PTM search)   |
                                                   optional DeepLC fine-tune
                                                            |
                                                            v

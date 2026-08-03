@@ -77,6 +77,7 @@ measurement locally, so the same finding cannot drift into two versions.
 | [04_convert.md](04_convert.md) | Stage 0: mzML read through `mzdata`, profile centroiding, AIF full-range window fallback, the normalized spectra artifacts, and the canonical treatment of the destructive `--top-peaks-ms2` cap. |
 | [05_digest_peptidoforms.md](05_digest_peptidoforms.md) | Stage A and A2: fully-tryptic in-silico digest with reverse/scramble decoys, then expansion into concrete peptidoforms with mods and charges. |
 | [06_predict_frag_index_matchers.md](06_predict_frag_index_matchers.md) | Stage C: the run-independent library (b/y m/z, intensities, iRT), the peak-major inverted fragment index, and the fragment matchers. |
+| [21_prescan.md](21_prescan.md) | Optional per-run sequence-tag prescan for modification searches: prunes modform hypotheses with no anchored tag support, why it is label-blind by construction, and why the decoy screen must be symmetric. |
 | [07_search_seed.md](07_search_seed.md) | Stage S: the native Sage-lite broad DIA search that produces calibration anchors and per-run mass recalibration, not final IDs. |
 | [08_rt_im_train.md](08_rt_im_train.md) | Stage B: per-run LOESS/linear RT calibration, residual-percentile RT windows, and the optional DeepLC multitask fine-tune. |
 | [09_extract.md](09_extract.md) | Stage D: the core peak-major targeted extraction cascade, apex selection, chromatograms, MS1 isotope XICs, and the sensitivity knobs. |
