@@ -535,3 +535,30 @@ and the mzML/library/FASTA inputs always need a data mount.
   (`release.yml:20-30`) and add any required cross-compile tooling step.
 - **Change the Docker default rescorer:** edit the baked `docker/config.dia.json`
   (`rescore.classifier`) and/or the `MUMDIA_RESCORE_MODEL` env in `Dockerfile:47`.
+
+## `set -e` plus `cmd && echo` in a command substitution exits silently
+
+An orchestration script that collects a run list like this looks harmless and is not:
+
+```bash
+set -euo pipefail
+RUNS=($(for d in "$OUT"/p*/; do
+          r=$(basename "$d")
+          [ -f "$d/psms_competed.parquet" ] && echo "$r"     # WRONG under set -e
+        done | sort))
+```
+
+The test returns false for any run that has not completed. If the LAST directory in the glob is
+one of those, the subshell's final command fails, the command substitution returns non-zero, and
+`set -e` terminates the script. Nothing is written to stderr, so a redirected log contains only
+`nohup: ignoring input` and the exit status is 1 with no diagnosis. Observed in production after a
+batch left five of eighty-three runs incomplete, the last of them being the final glob entry.
+
+Use an explicit conditional, which never leaves a failing command last:
+
+```bash
+          if [ -f "$d/psms_competed.parquet" ]; then echo "$r"; fi
+```
+
+`bash -x <script>` is the fastest way to find this class of failure: the trace stops exactly where
+the shell gives up, whereas the log shows nothing at all.
