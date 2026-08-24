@@ -137,7 +137,21 @@ carry it to another acquisition; see the next subsection.
 The historical result is about 10.3k confident precursor-shaped report rows,
 selected by stripped-peptide q at 1%, versus roughly 9.3-9.5k with linear/native
 or mokapot rescoring. It is a benchmark target, not a CI assertion or a universal
-instrument preset.
+instrument preset. Measured 2026-08-24 against DIA-NN 2.2.0 library-free with
+`--reanalyse` on the same file (11,817 stripped peptides at 1%), this workflow
+reached 90.4-91.6% depending on the DeepLC version and window sizing.
+
+Prefer the `augment_library.py`-completed precursor/fragment tables over the raw
+imported library when both exist. The raw imported DIA-NN library is missing 209
+of DIA-NN's own 1% peptides on this benchmark, all N-terminal Met-excision forms;
+the augmented tables (+18,903 tryptic base peptides) recover about 80 of them at
+an unchanged 0.98% empirical decoy fraction and identification parity elsewhere.
+The remaining ~130 enter the search space but stay below threshold, which is an
+abundance limit, not a library hole. One caveat measured on the same day: DeepLC
+per-run fine-tuning is not deterministic, and under held-out window sizing a poor
+fine-tune draw widens `w_rt` (held-out p95 varied 150-211 s across two draws of
+one arm) and can cost about 2% of peptides; judge any single-run comparison of
+window sizing or library variants against that draw variance before concluding.
 
 ### The peak cap is acquisition-specific, and 300 is not a default
 
