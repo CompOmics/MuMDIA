@@ -11,7 +11,7 @@
   },
   "predict_frag": {
     "deeplc_python": "C:/Users/robbi/anaconda3/envs/deeplc_mt/python.exe",
-    "sidecar_script_dir": "c:/Users/robbi/OneDrive - UGent/MuMDIA_NG/scripts"
+    "sidecar_script_dir": "H:/OneDrive - UGent/MuMDIA_NG/scripts"
   },
   "rescore": {
     "classifier": "nn_torch",

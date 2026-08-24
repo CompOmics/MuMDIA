@@ -246,12 +246,57 @@ downstream. The fixed fallback avoids that collapse; the unbounded case below tw
 anchors avoids fitting a mapping from a single point at all.
 
 The same in-sample property holds at full anchor counts, less severely. The
-residuals at rt_im_train.rs:177-181 are formed on the anchors the fit consumed,
-and under LOESS on the points the smoother interpolated (rt_im_train.rs:137), so
-`w_rt` is systematically narrower than the RT error on library candidates that
-were not anchors. `p_rt = 0.95` and `rt_window_multiplier` absorb part of that
-gap. Do not read `w_rt` as a measured 95th percentile of prediction error over
-the whole library.
+residuals are formed on the anchors the fit consumed, and under LOESS on the
+points the smoother interpolated, so `w_rt` is systematically narrower than the
+RT error on library candidates that were not anchors. `p_rt = 0.95` and
+`rt_window_multiplier` absorb part of that gap. Do not read `w_rt` as a measured
+95th percentile of prediction error over the whole library.
+`window_holdout_frac` (next subsection) replaces this in-sample estimate with a
+measured one.
+
+### 4b. Held-out window sizing (`window_holdout_frac`, default off)
+
+In-sample sizing has a second defect beyond optimism: it inverts under model
+capacity. A high-capacity RT model that memorizes its anchors gets small
+in-sample residuals and therefore a narrow window, exactly when its error on
+unseen library peptides is largest. Measured on the AIF benchmark with two
+DeepLC versions, in-sample residuals ranked them backwards relative to held-out
+residuals (in-sample abs-median 15.9 s vs 24.9 s; held-out median 195.1 s vs
+46.4 s for the same two models).
+
+`window_holdout_frac = f` (0 < f <= 0.9) sizes the window out-of-sample:
+
+- anchor peptides with `base_peptide_id % 1000 < round(f*1000)` are held out
+  (`is_holdout`, rt_im_train.rs). Keying on the base peptide keeps all
+  charge/modform rows of one peptide on the same side; the modulo rule is
+  deterministic and duplicated verbatim in `deeplc_finetune.py` so the
+  orchestrated fine-tune excludes exactly the same peptides from its reference
+  (`--window-holdout-frac`, passed by `run`/`run-experiment`). Without that
+  exclusion, adapter memorization leaks into the "held-out" residuals.
+- the sizing fit (same method selection as the main fit) is trained on the
+  non-held-out anchors only, and `w_rt = percentile(|holdout residuals|, p_rt)
+  * rt_window_multiplier`.
+- the calibration curve applied to the library still uses every anchor; only
+  the width is sized held-out, which is marginally conservative.
+- guards: fewer than 20 held-out anchors (`MIN_HOLDOUT_ANCHORS`) or fewer than
+  `min_anchors` sizing-train anchors falls back to in-sample sizing with a
+  warning; `cal.json.w_rt_sizing` records `"holdout"`,
+  `"holdout_fallback_in_sample"`, or `"in_sample"`, with `n_sizing_train`,
+  `n_holdout`, `holdout_resid_p_rt_s` (pre-multiplier), and
+  `holdout_resid_abs_median_s` alongside.
+- mutually exclusive with `adaptive_rt_window` (hard error): the adaptive
+  per-bin percentiles are in-sample and would silently undo the held-out
+  sizing.
+- standalone `rt-im-train` warns when the flag is set without
+  `finetune_deeplc`: the holdout is honest against this stage's fit, but a
+  library iRT produced by a fine-tune that saw these anchors still leaks.
+
+Measured (AIF benchmark, `LFQ_Orbitrap_AIF_Ecoli_01`, frac 0.3): with DeepLC
+4.1.0 the window moved 141.5 -> 204.9 s (held-out p95 136.6 s x 1.5) and
+peptides at 1% moved 10,703 -> 10,822 (+1.1%) at an unchanged 0.98% decoy
+fraction; with the overfitting 4.0.0a2 model the honest window is ~950 s and
+costs 1.5% of peptides, so the option only pays with a generalizing RT model.
+It stays benchmark-gated and off by default (see CLAUDE.md).
 
 ### 5. Optional adaptive per-region window (default off)
 
@@ -423,6 +468,7 @@ though the enum variant still exists.
 | `adaptive_rt_window` | `false` | Per-region window instead of one global width (rt_im_train.rs:192-229). Sensitivity-program knob, not yet default-on. |
 | `adaptive_rt_bins` | `12` | Number of equal-width calibrated-RT bins for the adaptive window (rt_im_train.rs:202). |
 | `rt_window_min_s` | `1.0` | Lower clamp (seconds) for any adaptive half-window (rt_im_train.rs:210); mirrors the 1s floor on the global window. |
+| `window_holdout_frac` | `0.0` | Size `w_rt` from held-out anchor residuals instead of in-sample ones (section 4b). `base_peptide_id % 1000 < round(frac*1000)` selects the holdout; the same rule excludes those peptides from the orchestrated DeepLC fine-tune. Range `[0.0, 0.9]`, `0.0` = off; mutually exclusive with `adaptive_rt_window`. Benchmark-gated. |
 
 ## Invariants, determinism, gotchas
 

@@ -118,6 +118,7 @@ pub fn run_deeplc_finetune(
     patience: usize,
     q_train: f64,
     batch: usize,
+    window_holdout_frac: f64,
 ) -> Result<()> {
     info!(
         lib_in,
@@ -127,12 +128,14 @@ pub fn run_deeplc_finetune(
         patience,
         q_train,
         batch,
+        window_holdout_frac,
         "sidecar: running DeepLC multitask fine-tune"
     );
     let ep = epochs.to_string();
     let pa = patience.to_string();
     let qt = q_train.to_string();
     let ba = batch.to_string();
+    let hf = window_holdout_frac.to_string();
     run_worker(
         python,
         script,
@@ -148,6 +151,8 @@ pub fn run_deeplc_finetune(
             &qt,
             "--batch",
             &ba,
+            "--window-holdout-frac",
+            &hf,
         ],
         true,
     )

@@ -88,6 +88,12 @@ def main():
                     help="max spectrum_q for a seed PSM to enter the fine-tune reference set")
     ap.add_argument("--max-ref", type=int, default=0,
                     help="cap reference PSMs (0 = all); use a small value for a smoke test")
+    ap.add_argument("--window-holdout-frac", dest="window_holdout_frac", type=float, default=0.0,
+                    help="exclude anchor peptides with base_peptide_id %% 1000 < round(frac*1000) "
+                         "from the fine-tune reference. MUST match rt_im_train.window_holdout_frac: "
+                         "rt-im-train sizes the RT window on exactly these held-out peptides, and "
+                         "fine-tuning on them would leak adapter memorization into the residuals "
+                         "(the rule is duplicated in rt_im_train.rs is_holdout; keep in sync)")
     ap.add_argument("--predict-limit", type=int, default=0,
                     help="cap number of unique peptidoforms predicted (0 = all)")
     ap.add_argument("--skip-predict", action="store_true",
@@ -114,11 +120,27 @@ def main():
 
     # reference: confident target seed PSMs (peptidoform + observed RT, seconds)
     seed = pq.read_table(args.seed_path).to_pydict()
+    # Held-out window sizing: the same rule as rt_im_train.rs::is_holdout, on the same
+    # base_peptide_id, so the peptides rt-im-train scores as held-out never enter the
+    # fine-tune. Pin the shared contract with the exact cases the Rust unit test uses.
+    hf = args.window_holdout_frac
+    if not (0.0 <= hf <= 0.9):
+        raise SystemExit(f"--window-holdout-frac must be in [0.0, 0.9], got {hf}")
+    is_holdout = lambda bid: bid % 1000 < round(hf * 1000)
+    if hf > 0.0:
+        assert [299 % 1000 < round(0.3 * 1000), 300 % 1000 < round(0.3 * 1000)] == [True, False]
     ref = {}
+    n_held = 0
     for i in range(len(seed["peptidoform"])):
         pf = seed["peptidoform"][i]
         if seed["label"][i] == "target" and seed["spectrum_q"][i] <= args.q_train and is_std(pf):
+            if hf > 0.0 and is_holdout(seed["base_peptide_id"][i]):
+                n_held += 1
+                continue
             ref[pf] = seed["observed_rt"][i]
+    if hf > 0.0:
+        print(f"window holdout: excluded {n_held} confident seed rows "
+              f"(base_peptide_id %% 1000 < {round(hf * 1000)}) from the fine-tune reference", flush=True)
     ref_items = list(ref.items())
     if args.max_ref and len(ref_items) > args.max_ref:
         ref_items = ref_items[: args.max_ref]

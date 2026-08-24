@@ -189,6 +189,9 @@ fn process_run(
             cfg.rt_im_train.finetune_patience,
             cfg.rt_im_train.q_train,
             cfg.rt_im_train.finetune_batch,
+            // Keep the fine-tune exclusion aligned with rt-im-train's holdout
+            // split (see run.rs); 0.0 (default) changes nothing.
+            cfg.rt_im_train.window_holdout_frac,
         )?;
         produced_ft = Some(lib_p_ft.clone());
         lib_p_ft

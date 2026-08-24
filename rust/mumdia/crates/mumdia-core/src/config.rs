@@ -532,6 +532,19 @@ pub struct RtImTrainConfig {
     pub adaptive_rt_bins: usize,
     /// Lower clamp (seconds) for any RT half-window (the existing 1 s floor).
     pub rt_window_min_s: f64,
+    /// Size `w_rt` from HELD-OUT residuals instead of in-sample ones. A fraction of
+    /// anchor peptides (`base_peptide_id % 1000 < round(frac*1000)`, so the split is
+    /// deterministic and shared with `deeplc_finetune.py`) is excluded from the sizing
+    /// fit and, when `finetune_deeplc` runs, from the fine-tune reference; `w_rt` is
+    /// then the residual percentile of those held-out anchors against the fit they
+    /// never entered. The final calibration curve still uses every anchor. In-sample
+    /// sizing underestimates the tail and rewards a memorizing RT model with a window
+    /// it does not deserve (measured: it inverted the 4.0.0a2/4.1.0 ranking); held-out
+    /// sizing measured +0.9% peptides with DeepLC 4.1.0 and -1.5% with 4.0.0a2 on the
+    /// AIF benchmark, both at 0.98% decoy, so enable it only with a generalizing RT
+    /// model. 0.0 (default) keeps in-sample sizing. Mutually exclusive with
+    /// `adaptive_rt_window`. Benchmark-gated; do not default on.
+    pub window_holdout_frac: f64,
 }
 impl Default for RtImTrainConfig {
     fn default() -> Self {
@@ -550,6 +563,7 @@ impl Default for RtImTrainConfig {
             adaptive_rt_window: false,
             adaptive_rt_bins: 12,
             rt_window_min_s: 1.0,
+            window_holdout_frac: 0.0,
         }
     }
 }

@@ -540,6 +540,25 @@ fn main() -> Result<()> {
             config,
         } => {
             let cfg = load_config(&config)?;
+            // `finetune_deeplc` is honored only by the `run` / `run-experiment`
+            // orchestrators, which invoke the sidecar BEFORE this stage. The
+            // standalone stage never fine-tunes, and silently ignoring the flag
+            // made 83 production runs read as fine-tuned when they were not.
+            if cfg.rt_im_train.finetune_deeplc {
+                tracing::warn!(
+                    "rt_im_train.finetune_deeplc is set but `mumdia rt-im-train` never \
+                     fine-tunes; only `run`/`run-experiment` invoke the DeepLC sidecar. \
+                     Pass a pre-fine-tuned --library-precursors table, or use `run`."
+                );
+            }
+            if cfg.rt_im_train.window_holdout_frac > 0.0 && !cfg.rt_im_train.finetune_deeplc {
+                tracing::warn!(
+                    "rt_im_train.window_holdout_frac is set without finetune_deeplc: the \
+                     holdout is honest against this stage's calibration fit, but if the \
+                     library iRT came from a fine-tune that saw these anchors, the sizing \
+                     is still optimistic"
+                );
+            }
             let ch = mumdia_io::hash::blake3_str(&cfg.canonical_json());
             stages::rt_im_train::run(stages::rt_im_train::RtImTrainParams {
                 seed_psms: &seed_psms,

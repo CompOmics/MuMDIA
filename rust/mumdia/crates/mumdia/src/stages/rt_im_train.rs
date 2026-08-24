@@ -51,12 +51,39 @@ fn window_plan(n_train: usize, min_anchors: usize, fallback_width: f64) -> Windo
 
 /// Convert the best-per-base-peptide map into a fixed anchor order before any
 /// floating-point fit or reduction. HashMap iteration order is randomized.
-fn sorted_anchor_vectors(best_per_pep: HashMap<u32, (f64, f64, f64)>) -> (Vec<f64>, Vec<f64>) {
+fn sorted_anchor_vectors(
+    best_per_pep: HashMap<u32, (f64, f64, f64)>,
+) -> (Vec<u32>, Vec<f64>, Vec<f64>) {
     let mut anchors: Vec<(u32, (f64, f64, f64))> = best_per_pep.into_iter().collect();
     anchors.sort_by_key(|(base_peptide_id, _)| *base_peptide_id);
+    let ids = anchors.iter().map(|(id, _)| *id).collect();
     let train_irt = anchors.iter().map(|(_, values)| values.1).collect();
     let train_rt = anchors.iter().map(|(_, values)| values.2).collect();
-    (train_irt, train_rt)
+    (ids, train_irt, train_rt)
+}
+
+/// Deterministic anchor-peptide holdout for window sizing. The rule
+/// (`base_peptide_id % 1000 < round(frac*1000)`) is duplicated verbatim in
+/// `deeplc_finetune.py` so the fine-tune reference excludes exactly these
+/// peptides; keying on the base peptide keeps every charge/modform of one
+/// peptide on the same side of the split (a row-wise split leaks).
+fn is_holdout(base_peptide_id: u32, frac: f64) -> bool {
+    base_peptide_id % 1000 < (frac * 1000.0).round() as u32
+}
+
+/// Minimum held-out anchors for a trustworthy p95; below this, sizing falls
+/// back to in-sample with a warning rather than trusting a noisy tail estimate.
+const MIN_HOLDOUT_ANCHORS: usize = 20;
+
+/// Result of held-out window sizing, kept for `cal.json` so a run records both
+/// which sizing produced `w_rt` and the held-out residual scale it came from.
+struct HoldoutSizing {
+    width: f64,
+    n_sizing_train: usize,
+    n_holdout: usize,
+    /// Held-out residual at the configured `p_rt` percentile, pre-multiplier.
+    resid_p_rt_s: f64,
+    resid_abs_median_s: f64,
 }
 
 /// Materialize one candidate's RT metadata. `None` means calibration is
@@ -71,6 +98,21 @@ fn candidate_window(calibrated_rt: Option<f64>, width: Option<f64>) -> (f64, f64
 
 pub fn run(p: RtImTrainParams) -> Result<u64> {
     let t0 = Instant::now();
+
+    let holdout_frac = p.cfg.window_holdout_frac;
+    if !(0.0..=0.9).contains(&holdout_frac) {
+        anyhow::bail!(
+            "rt_im_train.window_holdout_frac must be in [0.0, 0.9], got {holdout_frac}; \
+             0.0 disables held-out window sizing"
+        );
+    }
+    if holdout_frac > 0.0 && p.cfg.adaptive_rt_window {
+        anyhow::bail!(
+            "rt_im_train.window_holdout_frac and rt_im_train.adaptive_rt_window are mutually \
+             exclusive: the adaptive per-bin percentiles are in-sample and would silently undo \
+             the held-out sizing; disable one of them"
+        );
+    }
 
     // Library predicted iRT, keyed by candidate_id (single source of truth, so
     // a patched/updated library iRT is used for both training and application).
@@ -118,7 +160,7 @@ pub fn run(p: RtImTrainParams) -> Result<u64> {
             *e = (s_score[i], irt, s_rt[i]);
         }
     }
-    let (train_irt, train_rt) = sorted_anchor_vectors(best_per_pep);
+    let (anchor_ids, train_irt, train_rt) = sorted_anchor_vectors(best_per_pep);
     let n_train = train_irt.len();
     info!(n_train, "rt-im-train: training points");
 
@@ -155,35 +197,106 @@ pub fn run(p: RtImTrainParams) -> Result<u64> {
     // the 1s floor (which then discards nearly every true co-elution). Below the
     // threshold, use the configured fixed fallback instead.
     let min_anchors = p.cfg.min_seed_for_calibration.max(2);
-    let (w_rt, status): (Option<f64>, String) =
-        match window_plan(n_train, min_anchors, p.cfg.fallback_rt_window_s) {
-            WindowPlan::Unbounded => {
-                warn!(
-                    n_train,
-                    min_anchors,
-                    "rt-im-train: fewer than two target anchors; using unbounded RT windows"
-                );
-                (None, INSUFFICIENT_ANCHORS_STATUS.to_string())
+    let plan = window_plan(n_train, min_anchors, p.cfg.fallback_rt_window_s);
+
+    // Held-out window sizing (`window_holdout_frac > 0`): fit the sizing curve on
+    // the non-held-out anchors only and take the residual percentile of the
+    // held-out anchors against it. In-sample residuals underestimate the tail an
+    // unseen library peptide actually has, and they reward a memorizing RT model
+    // with a narrower window; the held-out anchors never entered this fit nor
+    // (when `finetune_deeplc` ran with the same fraction) the DeepLC fine-tune,
+    // so their residuals are an honest error estimate. The final calibration
+    // curve applied to the library still uses every anchor; only the width is
+    // sized out-of-sample, which is slightly conservative (the all-anchor curve
+    // is marginally better than the sizing curve).
+    let holdout_sizing: Option<HoldoutSizing> = if holdout_frac > 0.0
+        && plan == WindowPlan::Calibrated
+    {
+        let (mut tr_x, mut tr_y, mut ho_x, mut ho_y) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        for k in 0..n_train {
+            if is_holdout(anchor_ids[k], holdout_frac) {
+                ho_x.push(train_irt[k]);
+                ho_y.push(train_rt[k]);
+            } else {
+                tr_x.push(train_irt[k]);
+                tr_y.push(train_rt[k]);
             }
-            WindowPlan::Fixed(width) => {
-                warn!(
-                    n_train,
-                    min_anchors,
-                    "rt-im-train: too few target anchors; using fallback fixed RT window"
-                );
-                (Some(width), "fallback_fixed".to_string())
-            }
-            WindowPlan::Calibrated => {
-                let resid: Vec<f64> = train_irt
-                    .iter()
-                    .zip(&train_rt)
-                    .map(|(x, y)| (y - predict(*x)).abs())
-                    .collect();
-                let width = (percentile(&resid, p.cfg.p_rt) * p.cfg.rt_window_multiplier).max(1.0);
-                let status = if use_loess { "loess" } else { "linear" };
-                (Some(width), status.to_string())
-            }
-        };
+        }
+        if ho_x.len() < MIN_HOLDOUT_ANCHORS || tr_x.len() < min_anchors {
+            warn!(
+                n_holdout = ho_x.len(),
+                n_sizing_train = tr_x.len(),
+                min_holdout = MIN_HOLDOUT_ANCHORS,
+                min_anchors,
+                "rt-im-train: too few anchors on one side of the holdout split; \
+                 falling back to in-sample window sizing"
+            );
+            None
+        } else {
+            // Same method selection as the main fit, refit on the sizing subset.
+            let sizing_loess = use_loess.then(|| Loess::fit(&tr_x, &tr_y, p.cfg.loess_span, 200));
+            let (s_slope, s_intercept) = if sizing_loess.is_none() {
+                linear_fit(&tr_x, &tr_y)
+            } else {
+                (f64::NAN, f64::NAN)
+            };
+            let sizing_predict = |x: f64| -> f64 {
+                match &sizing_loess {
+                    Some(l) => l.predict(x),
+                    None => s_slope * x + s_intercept,
+                }
+            };
+            let resid: Vec<f64> = ho_x
+                .iter()
+                .zip(&ho_y)
+                .map(|(x, y)| (y - sizing_predict(*x)).abs())
+                .collect();
+            let p_rt_s = percentile(&resid, p.cfg.p_rt);
+            Some(HoldoutSizing {
+                width: (p_rt_s * p.cfg.rt_window_multiplier).max(1.0),
+                n_sizing_train: tr_x.len(),
+                n_holdout: ho_x.len(),
+                resid_p_rt_s: p_rt_s,
+                resid_abs_median_s: percentile(&resid, 0.5),
+            })
+        }
+    } else {
+        None
+    };
+
+    let (w_rt, status): (Option<f64>, String) = match plan {
+        WindowPlan::Unbounded => {
+            warn!(
+                n_train,
+                min_anchors,
+                "rt-im-train: fewer than two target anchors; using unbounded RT windows"
+            );
+            (None, INSUFFICIENT_ANCHORS_STATUS.to_string())
+        }
+        WindowPlan::Fixed(width) => {
+            warn!(
+                n_train,
+                min_anchors, "rt-im-train: too few target anchors; using fallback fixed RT window"
+            );
+            (Some(width), "fallback_fixed".to_string())
+        }
+        WindowPlan::Calibrated => {
+            let width = match &holdout_sizing {
+                Some(h) => h.width,
+                None => {
+                    let resid: Vec<f64> = train_irt
+                        .iter()
+                        .zip(&train_rt)
+                        .map(|(x, y)| (y - predict(*x)).abs())
+                        .collect();
+                    (percentile(&resid, p.cfg.p_rt) * p.cfg.rt_window_multiplier).max(1.0)
+                }
+            };
+            let status = if use_loess { "loess" } else { "linear" };
+            (Some(width), status.to_string())
+        }
+    };
 
     // Optional adaptive window: local residual-percentile half-width per
     // calibrated-RT bin, so well-calibrated regions get a tight window (less
@@ -317,6 +430,20 @@ pub fn run(p: RtImTrainParams) -> Result<u64> {
             "multiplier": p.cfg.rt_window_multiplier,
             "n_train": n_train,
             "calibration_status": status,
+            // Window sizing provenance. "holdout" means w_rt came from held-out
+            // residuals; "holdout_fallback_in_sample" means it was requested but
+            // an anchor-count guard fell back; "in_sample" is the historical
+            // behavior. The holdout_* fields are null unless sizing ran held-out.
+            "w_rt_sizing": match (&holdout_sizing, holdout_frac > 0.0) {
+                (Some(_), _) => "holdout",
+                (None, true) => "holdout_fallback_in_sample",
+                (None, false) => "in_sample",
+            },
+            "window_holdout_frac": holdout_frac,
+            "n_sizing_train": holdout_sizing.as_ref().map(|h| h.n_sizing_train),
+            "n_holdout": holdout_sizing.as_ref().map(|h| h.n_holdout),
+            "holdout_resid_p_rt_s": holdout_sizing.as_ref().map(|h| h.resid_p_rt_s),
+            "holdout_resid_abs_median_s": holdout_sizing.as_ref().map(|h| h.resid_abs_median_s),
             // Calibration-quality diagnostics (post-fit RT residuals, seconds).
             "rt_residual_median_s": rt_residual_median_s,
             "rt_residual_abs_median_s": rt_residual_abs_median_s,
@@ -369,9 +496,29 @@ mod tests {
         shuffled.insert(30, (9.0, 3.0, 300.0));
         shuffled.insert(10, (7.0, 1.0, 100.0));
 
-        let expected = (vec![1.0, 2.0, 3.0], vec![100.0, 200.0, 300.0]);
+        let expected = (
+            vec![10, 20, 30],
+            vec![1.0, 2.0, 3.0],
+            vec![100.0, 200.0, 300.0],
+        );
         assert_eq!(sorted_anchor_vectors(first), expected);
         assert_eq!(sorted_anchor_vectors(shuffled), expected);
+    }
+
+    #[test]
+    fn holdout_split_is_deterministic_and_fraction_shaped() {
+        // frac 0.0 holds out nothing; frac 0.9 (the cap) holds out ids 0..899 mod 1000.
+        assert!(!is_holdout(0, 0.0));
+        assert!(!is_holdout(999, 0.0));
+        // The documented rule, verbatim: base_peptide_id % 1000 < round(frac*1000).
+        // deeplc_finetune.py pins these same four cases; keep them in sync.
+        assert!(is_holdout(299, 0.3));
+        assert!(!is_holdout(300, 0.3));
+        assert!(is_holdout(1_000_299, 0.3));
+        assert!(!is_holdout(1_000_300, 0.3));
+        // Empirical fraction over a contiguous id range is exactly frac.
+        let n_held = (0u32..1_000_000).filter(|id| is_holdout(*id, 0.3)).count();
+        assert_eq!(n_held, 300_000);
     }
 
     #[test]

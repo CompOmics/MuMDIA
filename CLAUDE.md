@@ -186,12 +186,17 @@ failure side in `docs/17_troubleshooting.md`:
   residuals than per-file fine-tuning while removing about 36 minutes per file.
   This does not license reusing a stale per-run `_ft` table built on a different
   file, which has previously underperformed a fresh fit.
-- The `cal.json` RT residuals are in-sample and optimistic. `rt_im_train.rs:137`
-  fits the loess and `rt_im_train.rs:177-185` derives `w_rt` from a residual
-  percentile on the same anchor points, so the reported
+- The `cal.json` RT residuals are in-sample and optimistic. The loess is fit and
+  `w_rt` derived from a residual percentile on the same anchor points (see
+  `docs/08_rt_im_train.md` section 4), so the reported
   `rt_residual_abs_median_s` was roughly 3x better than the same calibration
-  scored out-of-sample. Treat it as a fit diagnostic, not an error estimate, and
-  size any external RT tolerance from out-of-sample numbers.
+  scored out-of-sample. Worse than optimism: in-sample residuals can rank two RT
+  models backwards, because a higher-capacity model memorizes anchors (measured
+  2026-08-24: in-sample 15.9 s vs 24.9 s, held-out 195.1 s vs 46.4 s, for the
+  same model pair). Treat them as fit diagnostics, never as error estimates or
+  model rankings; size any external RT tolerance from out-of-sample numbers.
+  `rt_im_train.window_holdout_frac` (benchmark-gated, default off) sizes `w_rt`
+  itself from held-out anchors; `cal.json.w_rt_sizing` records which sizing ran.
 - Check modform iRT variance before trusting RT windows in a PTM search. On one
   modification-expanded imported library most stripped-peptide groups shared an
   identical raw `predicted_irt` across all their modforms: the modified forms had
@@ -323,6 +328,12 @@ Do not enable these by default from a single AIF count:
 
 - model-visible top-K peaks (currently diagnostic sidecar only);
 - adaptive RT windows;
+- held-out RT window sizing (`rt_im_train.window_holdout_frac`). Implemented and
+  measured on the AIF benchmark: +1.1% peptides with DeepLC 4.1.0 at unchanged
+  0.98% decoy, but -1.5% with the overfitting 4.0.0a2 model, so it interacts
+  with RT-model quality and must not ship as default without the model switch
+  plus entrapment and a second acquisition. `docs/08_rt_im_train.md` section 4b
+  has the mechanism and numbers;
 - alternative hard/soft extraction gates or peak apportionment;
 - `peptidoform_charge` competition as a general default, margin competition, or
   unique-evidence competition;

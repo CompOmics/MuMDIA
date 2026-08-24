@@ -283,6 +283,11 @@ pub fn run(p: RunParams) -> Result<()> {
             cfg.rt_im_train.finetune_patience,
             cfg.rt_im_train.q_train,
             cfg.rt_im_train.finetune_batch,
+            // Held-out window sizing: the sidecar must exclude the same peptides
+            // from the fine-tune reference that rt-im-train later scores as
+            // held-out, else adapter memorization leaks into the "held-out"
+            // residuals and the window shrinks back toward in-sample optimism.
+            cfg.rt_im_train.window_holdout_frac,
         )?;
         // The fine-tuned precursor table is the artifact actually consumed by
         // RT calibration and extraction. Replace the base-library manifest entry
