@@ -1,28 +1,29 @@
-//! Typed configuration (PLAN.md Section 7, Section 9).
+//! Typed configuration (docs/02_config_and_data_model.md).
 //!
 //! One serde structure with per-stage sections, `#[serde(default)]` on every
 //! field, and `deny_unknown_fields` so misconfiguration fails loudly. Every
-//! choice point is an enum backed by a strategy (Section 9.1); MVP ships only
-//! the strategies MVP needs, with MVP-conservative defaults (Section 10):
-//! fixed tolerances, one documented decoy scheme, the `minimal` feature set.
+//! choice point is an enum backed by a strategy; MVP ships only the strategies
+//! MVP needs, with MVP-conservative defaults: fixed tolerances, one documented
+//! decoy scheme, the `minimal` feature set.
 
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
-// Strategy enums (Section 9)
+// Strategy enums
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DecoyStrategy {
     /// Reverse the sequence keeping the C-terminal residue fixed. Documented,
-    /// clean-room default for MVP (PLAN.md Section 11). No borrowed map.
+    /// clean-room default for MVP (docs/14_build_test_deploy_gotchas.md). No
+    /// borrowed map.
     #[default]
     Reverse,
     /// Deterministic seeded shuffle of the interior residues.
     Scramble,
     /// DIA-NN terminal-residue fragment m/z shift. Deferred: license-checked
-    /// addition (PLAN.md Section 11), not part of MVP.
+    /// addition (docs/14_build_test_deploy_gotchas.md), not part of MVP.
     DiannShift,
     None,
 }
@@ -63,7 +64,7 @@ pub enum CalibrationMethod {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FeatureSet {
-    /// MVP feature set (PLAN.md Section 10).
+    /// MVP feature set (docs/10_features.md).
     #[default]
     Minimal,
     Rich,
@@ -81,7 +82,7 @@ pub enum RtPredictorKind {
     /// the engine runs with zero external runtime dependencies.
     #[default]
     Native,
-    /// DeepLC Python sidecar (PLAN.md Section 0, Section 3.2).
+    /// DeepLC Python sidecar (docs/13_sidecars.md).
     Deeplc,
 }
 
@@ -91,7 +92,7 @@ pub enum FragPredictorKind {
     /// Native heuristic intensity model (no Python). MVP default.
     #[default]
     Native,
-    /// MS2PIP Python sidecar (PLAN.md Section 0, Section 3.2).
+    /// MS2PIP Python sidecar (docs/13_sidecars.md).
     Ms2pip,
 }
 
@@ -102,7 +103,7 @@ pub enum RescorerKind {
     /// default (always available).
     #[default]
     NativeTda,
-    /// Mokapot Python sidecar (PLAN.md Section 0).
+    /// Mokapot Python sidecar (docs/13_sidecars.md).
     Mokapot,
     /// PyTorch semi-supervised MLP sidecar (`nn_rescore_worker.py`): a nonlinear
     /// Percolator/mokapot-style rescorer (CV folds + iterative positive
@@ -405,9 +406,10 @@ pub struct PredictFragConfig {
     pub predictor: FragPredictorKind,
     pub rt_predictor: RtPredictorKind,
     /// Fragment charges rule: charge 1 always; charge 2 added for precursor
-    /// charge >= this threshold (PLAN.md Decision 3). Default 2: DIA-NN uses
-    /// doubly-charged fragments for ~16% of charge-2 precursors' transitions, so
-    /// blocking them (the old default of 3) discarded real signal.
+    /// charge >= this threshold (docs/18_findings_and_decisions.md). Default 2:
+    /// DIA-NN uses doubly-charged fragments for ~16% of charge-2 precursors'
+    /// transitions, so blocking them (the old default of 3) discarded real
+    /// signal.
     pub charge2_from_precursor_charge: i32,
     /// Composition-based fragment charge cap. When true, a b/y fragment is kept
     /// at charge z only if `z <= 1 (its N-terminal amine) + (#R + #H + #K within
@@ -446,7 +448,7 @@ impl Default for PredictFragConfig {
 pub struct SearchSeedConfig {
     pub fdr_seed: f64,
     pub fragment_tol_ppm: f64,
-    /// Max reported PSMs per spectrum (wide-window DIA, PLAN.md Stage S).
+    /// Max reported PSMs per spectrum (wide-window DIA, docs/07_search_seed.md).
     pub report_psms: usize,
     /// Minimum matched fragments for a seed PSM.
     pub min_matched_peaks: usize,
@@ -750,7 +752,8 @@ impl Default for ExtractConfig {
             // validation is required before treating any threshold as FDR-safe.
             // Relaxed from the historical 0.5 to 0.2 to recover low-abundance
             // candidates the hard single-scan Pearson gate was dropping
-            // (comment.md S1); still a hard gate, not the soft/budgeted redesign.
+            // (docs/18_findings_and_decisions.md); still a hard gate, not the
+            // soft/budgeted redesign.
             min_frag_corr: 0.2,
             min_matched_fraction: 0.0,
             apex_top_fragments: 0, // superseded by apex_count_tol; kept for compat
@@ -1142,8 +1145,8 @@ impl Default for QuantConfig {
     }
 }
 
-/// Match-between-runs strategy (Stage D3, `mbr_plan.md`). Default `None` reproduces
-/// the current chain byte-for-byte.
+/// Match-between-runs strategy (Stage D3, docs/12_quant_lfq_align_mbr_report_audit.md).
+/// Default `None` reproduces the current chain byte-for-byte.
 ///
 /// ONLY `None` VS NOT-`None` IS IMPLEMENTED. The three non-`None` variants are described
 /// below as the intended staging, but no code distinguishes them: every test in the tree is
@@ -1596,7 +1599,7 @@ impl Config {
     }
 
     /// Canonical JSON of the fully-resolved config, for hashing into the
-    /// manifest (PLAN.md Section 9.1).
+    /// manifest (docs/02_config_and_data_model.md).
     pub fn canonical_json(&self) -> String {
         serde_json::to_string(self).expect("config serializes")
     }

@@ -1,11 +1,11 @@
-//! Stage D `mumdia extract`: targeted 3D extraction (PLAN.md Stage D).
+//! Stage D `mumdia extract`: targeted 3D extraction (docs/09_extract.md).
 //!
 //! Data-driven and peak-major: observed peaks probe the inverted fragment index,
 //! and a candidate hypothesis is materialized only where fragment evidence
 //! exists (a sparse accumulator keyed by `candidate_id`, entries created on first
 //! collision). Work scales with peak-candidate collisions, not library size.
-//! RT is applied as a per-candidate window post-filter (the documented fallback,
-//! PLAN.md Stage D part 2); MVP is 3D so IM is absent.
+//! RT is applied as a per-candidate window post-filter (the documented
+//! fallback); MVP is 3D so IM is absent.
 //!
 //! The cascade: (a) isolation-window candidate range + RT window membership,
 //! (b) cheap matched-fragment presence gate, (c) matched-fragment count + a
@@ -85,8 +85,8 @@ pub struct ExtractParams<'a> {
     pub library_precursors: &'a str,
     pub library_fragments: &'a str,
     pub run_windows: &'a str,
-    /// Optional MS1 spectra for precursor isotope-envelope features (PLAN.md
-    /// Stage E). When absent, MS1 columns are null.
+    /// Optional MS1 spectra for precursor isotope-envelope features
+    /// (docs/10_features.md). When absent, MS1 columns are null.
     pub ms1: Option<&'a str>,
     /// Optional per-run mass recalibration (search-seed `<seed>.masscal.json`):
     /// systematic fragment ppm offset + learned tolerance.
@@ -2003,10 +2003,10 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
 
             if p.cfg.min_frag_corr > 0.0 {
                 // Acceptance gate. `min_frag_corr` thresholds the ACTIVE gate_mode's
-                // spectral-agreement score (plan Section 9): the legacy single-apex-scan
-                // Pearson (one chimeric scan can dominate), the peak-integrated spectral
-                // Pearson, the apex spectral-entropy similarity, the temporal co-elution
-                // score, or Combined (both, more specific). Only the active score computes.
+                // spectral-agreement score: the legacy single-apex-scan Pearson (one
+                // chimeric scan can dominate), the peak-integrated spectral Pearson, the
+                // apex spectral-entropy similarity, the temporal co-elution score, or
+                // Combined (both, more specific). Only the active score computes.
                 let rejected = match p.cfg.gate_mode {
                     GateMode::ApexPearson => apex_pearson() < p.cfg.min_frag_corr,
                     GateMode::PeakSpectral => peak_spec() < p.cfg.min_frag_corr,

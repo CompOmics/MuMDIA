@@ -1,6 +1,5 @@
-//! Candidate audit `mumdia audit` (sensitivity program, spec
-//! `01_workflow_and_gap_analysis.md` §4, `02_sensitivity_diagnostic_plan.md` §5,
-//! backlog P0.3 / P0.4).
+//! Candidate audit `mumdia audit` (sensitivity program,
+//! docs/20_sensitivity_and_quantification_playbook.md, backlog P0.3 / P0.4).
 //!
 //! Non-destructive, post-hoc observability: reconstruct, for every candidate in
 //! the search space (the library precursors), the pipeline stage flags and the

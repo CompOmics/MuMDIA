@@ -1,4 +1,4 @@
-//! mumdia-core: the shared vocabulary of every stage (PLAN.md Section 2).
+//! mumdia-core: the shared vocabulary of every stage (docs/02_config_and_data_model.md).
 //!
 //! Types, config, the run manifest, a ProForma/UniMod mass model, physical
 //! constants, and error types. No stage-specific logic lives here.

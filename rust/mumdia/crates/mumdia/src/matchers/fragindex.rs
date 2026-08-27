@@ -41,12 +41,13 @@ pub struct FragIndex {
 
 impl FragIndex {
     /// Build the CSR index from a loaded library at a fixed tolerance
-    /// (fragindex_spec Section 3.2, two-pass counting sort). Deterministic:
-    /// candidate-order scatter, no parallel sort, no hashing.
+    /// (docs/06_predict_frag_index_matchers.md, two-pass counting sort).
+    /// Deterministic: candidate-order scatter, no parallel sort, no hashing.
     pub fn build(lib: &Library, tol_ppm: f64) -> FragIndex {
         let n_cand = lib.cands.len();
-        // Precondition (fragindex_spec / CLAUDE.md index.rs:73): candidate_id is
-        // dense 0..n_cand so it indexes the accumulator and post_cand directly.
+        // Precondition (docs/06_predict_frag_index_matchers.md, CLAUDE.md
+        // index.rs:73): candidate_id is dense 0..n_cand so it indexes the
+        // accumulator and post_cand directly.
         for (c, cand) in lib.cands.iter().enumerate() {
             assert_eq!(
                 cand.candidate_id as usize, c,
@@ -267,11 +268,11 @@ pub struct WindowNarrow {
 }
 
 /// Epoch-stamped dense accumulator for the seed's fused `(count, obs_sum)` semiring
-/// (fragindex_spec Section 3.5). `obs_sum` sums the OBSERVED peak intensity per
-/// matched posting (predicted intensity deliberately dropped, reproducing the
-/// seed's existing `_pi` discard); `count` is the per-posting match count. Reused
-/// across all scans of a block; the accumulator is reset lazily via `epoch`, so
-/// only touched candidates are ever written or read.
+/// (docs/06_predict_frag_index_matchers.md). `obs_sum` sums the OBSERVED peak
+/// intensity per matched posting (predicted intensity deliberately dropped,
+/// reproducing the seed's existing `_pi` discard); `count` is the per-posting match
+/// count. Reused across all scans of a block; the accumulator is reset lazily via
+/// `epoch`, so only touched candidates are ever written or read.
 pub struct SeedScratch {
     count: Vec<u32>,
     obs_sum: Vec<f64>,
@@ -495,7 +496,8 @@ mod tests {
         }
     }
 
-    // fragindex_spec Section 4.2: fragindex == naive at K=C, same predicate.
+    // docs/06_predict_frag_index_matchers.md: fragindex == naive at K=C, same
+    // predicate.
     #[test]
     fn equivalence_gate_vs_naive() {
         let tol = 20.0;

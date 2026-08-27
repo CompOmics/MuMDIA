@@ -2,8 +2,9 @@
 //! and reads its declared schema without hand-rolling RecordBatches.
 //!
 //! Tables are written as Parquet (SNAPPY), the open, self-describing interstage
-//! format (PLAN.md Section 3.3). Ion-mobility and other conditional columns are
-//! nullable via the `Opt*` variants (PLAN.md Section 2 missing-value policy).
+//! format (docs/03_io_layer.md). Ion-mobility and other conditional columns are
+//! nullable via the `Opt*` variants (docs/02_config_and_data_model.md
+//! missing-value policy).
 
 use std::sync::Arc;
 

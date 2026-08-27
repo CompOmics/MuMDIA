@@ -1,5 +1,5 @@
 //! Stage 0 `mumdia convert`: read an mzML run into the normalized spectra
-//! artifact set (PLAN.md Stage 0). MVP is mzML-only and 3D, so ion-mobility
+//! artifact set (docs/04_convert.md). MVP is mzML-only and 3D, so ion-mobility
 //! columns are absent. Profile spectra are centroided (simple local-maxima)
 //! so downstream matching sees discrete peaks.
 

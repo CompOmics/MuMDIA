@@ -303,16 +303,17 @@ takes `--ms2`, `--library-precursors`, `--library-fragments`, `--out`, and
 
 ## Invariants, determinism, gotchas
 
-- **Determinism** (PLAN.md Section 7): the fragindex parallel path is bit-identical
-  to the *serial fragindex* best-per-candidate (this is a parallel-vs-serial claim
-  about the same backend, not a fragindex-vs-bucketed claim; the two backends use
-  different edge predicates, see the accumulation section). Groups run in `BTreeMap`
-  key order, within a group scans run in RT-ascending order (guaranteed by
-  `load_ms2`'s `sort_by rt_seconds`, `spectra.rs:95`) with a strictly-greater
-  update, and the cross-group merge is a total order (`max score`, tie earliest RT,
-  tie min scan_index; `search_seed.rs:392-409`). `select_peaks` re-sorts the top-N
-  back to index-ascending (`:299`) so the `obs_sum` float reduction is summed in a
-  fixed order. The `HashMap` is only ever reduced through this total order, never
+- **Determinism** (`docs/14_build_test_deploy_gotchas.md`): the fragindex parallel
+  path is bit-identical to the *serial fragindex* best-per-candidate (this is a
+  parallel-vs-serial claim about the same backend, not a fragindex-vs-bucketed
+  claim; the two backends use different edge predicates, see the accumulation
+  section). Groups run in `BTreeMap` key order, within a group scans run in
+  RT-ascending order (guaranteed by `load_ms2`'s `sort_by rt_seconds`,
+  `spectra.rs:95`) with a strictly-greater update, and the cross-group merge is a
+  total order (`max score`, tie earliest RT, tie min scan_index;
+  `search_seed.rs:392-409`). `select_peaks` re-sorts the top-N back to
+  index-ascending (`:299`) so the `obs_sum` float reduction is summed in a fixed
+  order. The `HashMap` is only ever reduced through this total order, never
   iterated for a float sum.
 - **Best-per-candidate, not best-per-spectrum.** One output row per candidate that,
   in at least one scan, cleared `min_matched_peaks` **and** ranked within that

@@ -12,8 +12,8 @@ orientation (layout, build commands, the rules that hold across the tree).
 these documents, not `CLAUDE.md`, carry the numbers. For the validated findings
 and the interstage, determinism, and sidecar contracts, read
 `docs/18_findings_and_decisions.md`, which is self-contained and depends on no
-gitignored file. `plan.md` (gitignored, local-only) holds the deeper algorithmic
-specification but is not required to use these docs. These docs sit between
+gitignored file. The deeper algorithmic specification lives in local-only design
+notes that are not required to use these docs. These docs sit between
 `CLAUDE.md` and the code: more detail than `CLAUDE.md`, grounded in the actual
 source rather than the spec.
 
@@ -89,7 +89,7 @@ measurement locally, so the same finding cannot drift into two versions.
 | [15_data_dictionary.md](15_data_dictionary.md) | Consolidated Parquet data dictionary: every column of every artifact, its Arrow type and nullability, sourced from the `Col`/`write_table` construction with `file:line` citations. |
 | [16_glossary.md](16_glossary.md) | Alphabetical glossary of domain and codebase terms as MuMDIA uses them, each entry self-contained and cited to `file:line` where it asserts code behavior. |
 | [17_troubleshooting.md](17_troubleshooting.md) | Symptom -> cause -> fix lookup for the quiet failure modes (silent fallbacks, nondeterminism, void results, peak truncation, deleted modforms, misread q units, sidecar import order and Parquet encoding), cited to `file:line`. Read it early. |
-| [18_findings_and_decisions.md](18_findings_and_decisions.md) | Self-contained findings and contracts: validated results, interstage/determinism/sidecar contracts, current best workflow, and ranked roadmap, with no dependency on `plan.md`. |
+| [18_findings_and_decisions.md](18_findings_and_decisions.md) | Self-contained findings and contracts: validated results, interstage/determinism/sidecar contracts, current best workflow, and ranked roadmap, with no dependency on untracked design notes. |
 | [19_getting_started.md](19_getting_started.md) | Reproducible getting-started: local sidecar environments, the pre-built E. coli test library, and two copy-pasteable end-to-end runs plus a smoke check. |
 | [20_sensitivity_and_quantification_playbook.md](20_sensitivity_and_quantification_playbook.md) | Operational playbook separating validated AIF sensitivity, acquisition-specific choices, FDR/entrapment promotion gates, quantification accuracy, and benchmark-gated research. |
 | [22_release_plan.md](22_release_plan.md) | Release plan (2026-08-27): tree state versus the stated gates, why the engine is hard to run today, the two-release scope (`v0.1.0` installable engine, `v0.2.0` second-pass workflow), work packages with acceptance criteria, sequencing, and the definition of done. |

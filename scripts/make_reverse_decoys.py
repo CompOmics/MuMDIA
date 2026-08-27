@@ -1,5 +1,5 @@
 """Build reverse-sequence decoys from the target half of a library, with a
-guaranteed no-overlap-with-targets invariant (clean-room; PLAN.md 9.2).
+guaranteed no-overlap-with-targets invariant (clean-room; docs/13_sidecars.md).
 
 Each target is reversed keeping the C-terminal residue fixed. Reversal preserves
 residue composition, so the decoy keeps the target's precursor m/z + iRT

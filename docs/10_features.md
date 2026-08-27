@@ -417,8 +417,8 @@ Fragment ppm-error distribution over matched fragments (uses a fixed
 `ppm_intensity_anticorr`, `mass_error_mz_trend`, `mean_abs_mz_error_da`, and the
 positive DIA-NN-style evidence `mass_evidence_gauss` (predicted-weighted
 Gaussian concentration, sigma 10 ppm) and `mass_log_evidence`.
-`precursor_mass_error_ppm` (in the plan.md feature spec, local only) is
-deliberately skipped (no theoretical precursor m/z in Evidence).
+`precursor_mass_error_ppm` is deliberately skipped (no theoretical precursor m/z
+in Evidence).
 
 ### ion_series (34, `ion_series.rs`)
 

@@ -1,5 +1,5 @@
 //! mumdia-io: on-disk contracts (Parquet, JSON), content hashing, logging, and
-//! the `inspect` helper (PLAN.md Section 3.3, 3.5).
+//! the `inspect` helper (docs/03_io_layer.md).
 
 pub mod hash;
 pub mod json;
@@ -16,7 +16,7 @@ pub fn init_logging() {
     let _ = fmt().with_env_filter(filter).with_target(false).try_init();
 }
 
-/// Build an [`ArtifactRecord`] by hashing the written file (PLAN.md Section 3.3).
+/// Build an [`ArtifactRecord`] by hashing the written file (docs/03_io_layer.md).
 pub fn record_artifact(
     logical_name: &str,
     schema: (&str, u32),
@@ -39,7 +39,7 @@ pub fn record_artifact(
 }
 
 /// Human-readable schema + head sample + row count for any Parquet artifact
-/// (`mumdia inspect`, PLAN.md Section 3.5 rule 2).
+/// (`mumdia inspect`, docs/03_io_layer.md).
 pub fn inspect(path: &str) -> Result<String> {
     let t = table::Table::read(path)?;
     let mut s = String::new();

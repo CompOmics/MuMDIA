@@ -434,13 +434,13 @@ do not reintroduce removed knobs. The fields relevant here:
 
 ## Invariants, determinism, gotchas
 
-**Determinism (PLAN.md Section 7).** The native engine must be byte-reproducible
-across runs. Concretely: no `rand` crate is used anywhere; the only randomness is
-the decoy scramble, which is a hand-rolled `splitmix64` (`digest.rs:159`) seeded
-per peptide by `seed ^ fnv1a(peptide)` (`digest.rs:117`) so it does not depend on
-iteration order. Float summation order is fixed: a HashMap-order f32 sum once
-shifted an apex and broke reproducibility, so ordered maps / sorted iteration are
-used where floats are summed (for example the digest stats use a `BTreeMap`,
+**Determinism.** The native engine must be byte-reproducible across runs.
+Concretely: no `rand` crate is used anywhere; the only randomness is the decoy
+scramble, which is a hand-rolled `splitmix64` (`digest.rs:159`) seeded per peptide
+by `seed ^ fnv1a(peptide)` (`digest.rs:117`) so it does not depend on iteration
+order. Float summation order is fixed: a HashMap-order f32 sum once shifted an
+apex and broke reproducibility, so ordered maps / sorted iteration are used where
+floats are summed (for example the digest stats use a `BTreeMap`,
 `digest.rs:301`). The integration test asserts this directly by comparing
 `apex_rt` across two extract runs (`tests/pipeline.rs:211`).
 
@@ -454,13 +454,13 @@ ensemble seeds and average out-of-fold scores as mitigation. Enabling either
 breaks byte-reproducibility of the run; that is a known and accepted trade for the
 identification gain.
 
-**Clean-room boundary (PLAN.md Section 11).** No coefficient vector, intensity
-model, or constant table is copied from another proteomics engine. Physical
-constants are public-domain facts derived from CODATA / AME atomic masses, with
-the provenance stated in the file header (`constants.rs:1-6`); the proton mass is
-deliberately the physically correct value, not DIA-NN's H-atom value
-(`constants.rs:8-10`). Decoys use a documented reverse/scramble scheme
-(`digest.rs:99-129`), not an imported scheme. DIA-NN itself is never vendored
+**Clean-room boundary.** No coefficient vector, intensity model, or constant table
+is copied from another proteomics engine. Physical constants are public-domain
+facts derived from CODATA / AME atomic masses, with the provenance stated in the
+file header (`constants.rs:1-6`); the proton mass is deliberately the physically
+correct value, not DIA-NN's H-atom value (`constants.rs:8-10`). Decoys use a
+documented reverse/scramble scheme (`digest.rs:99-129`), not an imported scheme.
+DIA-NN itself is never vendored
 (1.8.1+ / 2.x are proprietary); the user runs DIA-NN under their own license and
 imports the predicted library via `scripts/import_diann_lib.py` +
 `scripts/make_reverse_decoys.py`.

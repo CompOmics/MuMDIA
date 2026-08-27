@@ -1,10 +1,10 @@
-//! Stage E `mumdia features` (PLAN.md Stage E, Section 8.3 enriched catalogue).
+//! Stage E `mumdia features` (docs/10_features.md).
 //! Reads psms_extracted + chromatograms (+ MS1 apex isotopes carried on the
 //! PSM rows) and computes a fixed, named, versioned feature vector per PSM.
 //! The active feature set is config-driven (`minimal` or `rich`); its ordered
 //! list is hashed into a `classifier_feature_schema_id` and written to a
 //! companion `<features>.schema.json` so the classifier input is reproducible
-//! and never applied under a mismatched set (PLAN.md Section 2, 5, 9.1).
+//! and never applied under a mismatched set (docs/02_config_and_data_model.md).
 
 use std::collections::HashMap;
 use std::time::Instant;
@@ -156,7 +156,7 @@ fn extended_values(e: &Evidence) -> Vec<f64> {
     out
 }
 
-/// The minimal feature set (PLAN.md Section 10).
+/// The minimal feature set (docs/10_features.md).
 pub const MINIMAL_FEATURES: &[&str] = &[
     "rt_error_abs",
     "rt_error_rel",
@@ -174,7 +174,7 @@ pub const MINIMAL_FEATURES: &[&str] = &[
     "n_proteins",
 ];
 
-/// Additional features for the `rich`/`standard` set (PLAN.md Section 8.3).
+/// Additional features for the `rich`/`standard` set (docs/10_features.md).
 pub const RICH_EXTRA: &[&str] = &[
     "library_norm_manhattan",
     "library_rmsd",
@@ -620,7 +620,8 @@ fn build_evidence(
 pub struct FeaturesParams<'a> {
     pub psms: &'a str,
     pub chromatograms: &'a str,
-    /// Optional seed_psms for search-engine corroboration features (PLAN.md 8.3).
+    /// Optional seed_psms for search-engine corroboration features
+    /// (docs/10_features.md).
     pub seed: Option<&'a str>,
     pub out: &'a str,
     pub out_pin: &'a str,

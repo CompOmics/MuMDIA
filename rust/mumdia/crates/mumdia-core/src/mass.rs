@@ -1,15 +1,16 @@
 //! ProForma-lite peptidoform parsing and a UniMod-backed mass model
-//! (PLAN.md Section 2 "Peptidoform", Section 5 improvement 2).
+//! (docs/02_config_and_data_model.md).
 //!
-//! All fragment m/z derive from one shared mass model (PLAN.md Section 4 Stage E,
-//! Section 7 "Numerics"). Modifications are UniMod names or explicit signed mass
-//! deltas; an unknown name is a typed error, never a silent drop.
+//! All fragment m/z derive from one shared mass model
+//! (docs/14_build_test_deploy_gotchas.md). Modifications are UniMod names or
+//! explicit signed mass deltas; an unknown name is a typed error, never a silent
+//! drop.
 
 use crate::constants::{mass_to_mz, residue_mass, PROTON, WATER};
 use crate::error::MassError;
 
-/// A modification MuMDIA understands by name. MVP subset (PLAN.md Section 4
-/// Stage A2 notes: names must be UniMod/PSI-MS so the sidecar adapters map them).
+/// A modification MuMDIA understands by name. MVP subset; names must be
+/// UniMod/PSI-MS so the sidecar adapters map them (docs/05_digest_peptidoforms.md).
 pub fn unimod_mass(name: &str) -> Option<f64> {
     let m = match name {
         "Carbamidomethyl" => 57.021_463_735,
@@ -31,7 +32,7 @@ pub fn unimod_mass(name: &str) -> Option<f64> {
     Some(m)
 }
 
-/// Ion series MuMDIA scores in the MVP (b and y, PLAN.md Decision 3).
+/// Ion series MuMDIA scores in the MVP (b and y, docs/18_findings_and_decisions.md).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IonType {
     B,
@@ -96,7 +97,7 @@ impl ParsedPeptidoform {
     }
 
     /// All b and y fragments at the requested fragment charges, dropping the
-    /// low-information b1/y1/y2 (PLAN.md Section 4 Stage C).
+    /// low-information b1/y1/y2 (docs/06_predict_frag_index_matchers.md).
     pub fn fragments(&self, frag_charges: &[i32]) -> Vec<Fragment> {
         let n = self.residues.len();
         let mut out = Vec::new();

@@ -1,9 +1,10 @@
-//! Stage G `mumdia quant` (PLAN.md Stage G): quantify identified peptidoforms
-//! and roll up to protein groups. Integrate each fragment chromatogram over the
-//! apex region by the trapezoidal rule, sum the top-N fragments into a per-run
-//! peptidoform quantity, then roll up to protein groups. MVP is single-run, so
-//! cross-run normalization and MaxLFQ/directLFQ (which need multiple runs)
-//! reduce to a top-N sum; the method is a config strategy for later.
+//! Stage G `mumdia quant` (docs/12_quant_lfq_align_mbr_report_audit.md): quantify
+//! identified peptidoforms and roll up to protein groups. Integrate each fragment
+//! chromatogram over the apex region by the trapezoidal rule, sum the top-N
+//! fragments into a per-run peptidoform quantity, then roll up to protein groups.
+//! MVP is single-run, so cross-run normalization and MaxLFQ/directLFQ (which need
+//! multiple runs) reduce to a top-N sum; the method is a config strategy for
+//! later.
 
 use std::collections::{BTreeMap, HashMap};
 use std::time::Instant;
@@ -227,8 +228,9 @@ fn select_fragment_areas(
 /// all its fragment chromatograms. Fragments are aligned on the union of their RT
 /// samples via a BTreeMap keyed by the f32 RT bit pattern: for the non-negative
 /// RTs here the bit order matches the value order, so both the union axis and the
-/// f64 summation order are fixed (determinism, plan.md Section 7). When a finite
-/// identification apex is available, the nearest sampled RT anchors the outward
+/// f64 summation order are fixed (determinism,
+/// docs/14_build_test_deploy_gotchas.md). When a finite identification apex is
+/// available, the nearest sampled RT anchors the outward
 /// [`super::features::peak_bounds`] walk. This prevents a brighter off-apex
 /// interferent from moving quantification to a different peak. Older scored
 /// artifacts and missing/non-finite hints retain the legacy co-elution apex
@@ -1136,7 +1138,7 @@ fn base_sequence(peptidoform: &str) -> String {
 /// - `None`: all factors 1.0.
 ///
 /// Medians are taken over sorted values and the matrix is iterated in `BTreeMap`
-/// key order, so the result is deterministic (plan.md Section 7).
+/// key order, so the result is deterministic (docs/14_build_test_deploy_gotchas.md).
 fn size_factors(
     data: &std::collections::BTreeMap<String, std::collections::BTreeMap<String, Vec<Option<f64>>>>,
     n: usize,

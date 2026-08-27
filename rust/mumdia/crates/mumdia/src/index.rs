@@ -1,5 +1,5 @@
-//! The inverted fragment index (PLAN.md Stage D part 1) shared by search-seed
-//! and extract.
+//! The inverted fragment index (docs/06_predict_frag_index_matchers.md), shared
+//! by search-seed and extract.
 //!
 //! Structure-of-Arrays, flat and contiguous: three parallel arrays
 //! (`idx_mz`, `idx_cid`, `idx_int`) globally sorted by fragment m/z, then
@@ -9,10 +9,10 @@
 //! query, a second over `candidate_id` narrows to the isolation-window slice,
 //! and a linear tail applies the exact ppm bound (mirrors Sage `page_search`).
 //!
-//! MVP stores the index m/z as f32 and does all ppm math in f64 (PLAN.md
-//! Stage D precision note). RT is applied as a per-candidate window post-filter
-//! at probe time rather than a pre-partition (the documented fallback, PLAN.md
-//! Stage D part 2), which keeps the index run-independent.
+//! MVP stores the index m/z as f32 and does all ppm math in f64
+//! (docs/06_predict_frag_index_matchers.md). RT is applied as a per-candidate
+//! window post-filter at probe time rather than a pre-partition (the documented
+//! fallback, docs/09_extract.md), which keeps the index run-independent.
 
 use anyhow::Result;
 use mumdia_core::constants::{ppm_bounds, PROTON};
@@ -346,7 +346,7 @@ impl Library {
 
     /// Probe the index for observed neutral m/z `q` within `tol_ppm`, restricted
     /// to candidate ids in [cand_lo, cand_hi). Calls `f(candidate_id, frag_mz,
-    /// predicted_intensity)` for each match (PLAN.md Stage D `page_search`).
+    /// predicted_intensity)` for each match (docs/06_predict_frag_index_matchers.md).
     pub fn page_search<F: FnMut(u32, f32, f32)>(
         &self,
         q: f64,
@@ -388,8 +388,8 @@ impl Library {
     }
 }
 
-/// Deconvolve an observed z-charged peak m/z to neutral m/z (PLAN.md Stage D
-/// point 3). Done in f64.
+/// Deconvolve an observed z-charged peak m/z to neutral m/z
+/// (docs/06_predict_frag_index_matchers.md). Done in f64.
 #[inline]
 pub fn deconvolve(peak_mz: f64, z: i32) -> f64 {
     peak_mz * z as f64 - (z as f64 - 1.0) * PROTON

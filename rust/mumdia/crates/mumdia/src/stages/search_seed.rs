@@ -1,7 +1,7 @@
 //! Stage S `mumdia search-seed`: a native broad DIA-aware seed search over the
-//! inverted fragment index (PLAN.md Stage S). Its purpose is calibration, not
-//! final identification. It sits behind the file contract, so a Sage adapter can
-//! replace it later (the plan's default); MVP uses a native Sage-lite hyperscore.
+//! inverted fragment index (docs/07_search_seed.md). Its purpose is calibration,
+//! not final identification. It sits behind the file contract, so a Sage adapter
+//! can replace it later; MVP uses a native Sage-lite hyperscore.
 //!
 //! Library-level decoys are the single source of truth (no separate engine
 //! decoy generation), so target-decoy counting is never mixed-method.
@@ -154,8 +154,8 @@ pub fn run(p: SearchSeedParams) -> Result<u64> {
     let is_dec: Vec<bool> = label_c.iter().map(|l| l == "decoy").collect();
     let n_at_1pct = count_targets_at_q(&q_c, &is_dec, p.cfg.fdr_seed);
 
-    // Per-run fragment mass recalibration + learned tolerance (PLAN.md Section 5
-    // improvement 3, Section 8.4). Collect matched-fragment ppm deviations from
+    // Per-run fragment mass recalibration + learned tolerance
+    // (docs/07_search_seed.md). Collect matched-fragment ppm deviations from
     // confident target PSMs; the median is the systematic offset, a high
     // percentile of the centered deviations sets the tolerance. Written to
     // <seed>.masscal.json and consumed by extract.

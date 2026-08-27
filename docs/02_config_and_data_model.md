@@ -946,8 +946,8 @@ stale.
 - **Add a manifest field.** Extend `Manifest` or `ArtifactRecord`
   (`manifest.rs`); both are plain serde structs. Keep new maps as `BTreeMap` for
   deterministic key order.
-- **`plan.md` is untracked design history, not the contract.** It is excluded by
-  the root-Markdown ignore rule, so it is not the place to record current
-  behavior: where it disagrees with the code, the tests and this tracked `docs/`
+- **Local design notes are not the contract.** The root-Markdown ignore rule
+  keeps them out of the repository, so they are not the place to record current
+  behavior: where they disagree with the code, the tests and this tracked `docs/`
   guide are authoritative. Keep validated numbers consistent across `README`,
-  `COMPARISON.md`, and `CLAUDE.md`.
+  `CLAUDE.md`, and `docs/18_findings_and_decisions.md`.

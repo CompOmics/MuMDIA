@@ -1,7 +1,7 @@
-//! Orchestrator `mumdia run` (PLAN.md Section 4 Orchestration): sequence the MVP
+//! Orchestrator `mumdia run` (docs/01_overview_and_dataflow.md): sequence the MVP
 //! stage chain on one run and write a JSON run manifest. The orchestrator only
 //! threads file paths; all computation lives in the stage commands, so each
-//! remains independently runnable (PLAN.md Section 3.5).
+//! remains independently runnable.
 
 use std::time::Instant;
 

@@ -8,13 +8,13 @@ These two stages build the run-independent, experiment-wide peptide search space
 from a FASTA file, before any spectra are touched. They run once per experiment
 and their outputs are reused across all runs.
 
-- **digest** (Stage A, PLAN.md) performs a fully-tryptic in-silico digest of the
-  input proteins (also emitting the initiator-methionine-excised form of each
+- **digest** (Stage A) performs a fully-tryptic in-silico digest of the input
+  proteins (also emitting the initiator-methionine-excised form of each
   protein-N-terminal peptide by default, see "How it works"), deduplicates the
-  resulting peptides by stripped sequence, and
-  mints a collision-checked, paired target-decoy null (reverse or seeded
-  scramble). Output is one `peptides.parquet` table of stripped target and decoy
-  sequences with a `target`/`decoy` label.
+  resulting peptides by stripped sequence, and mints a collision-checked, paired
+  target-decoy null (reverse or seeded scramble). Output is one
+  `peptides.parquet` table of stripped target and decoy sequences with a
+  `target`/`decoy` label.
 - **peptidoforms** (Stage A2) expands each stripped peptide into concrete
   peptidoforms by enumerating fixed and variable modifications and precursor
   charge states, emitting each as a ProForma-lite string with UniMod modification
@@ -185,9 +185,10 @@ strategies keep the C-terminal residue fixed and rewrite the interior `b[..n-1]`
   distinct but deterministic scramble.
 - `DecoyStrategy::DiannShift` and `DecoyStrategy::None` return `None`
   (digest.rs:126-127); `DiannShift` is unrealized here by design (the comment
-  notes it would be a predict-frag fragment-shift, PLAN.md Section 11) and is
-  additionally rejected by `Config::validate` (config.rs:1021) because it would
-  yield zero decoys and an invalid FDR.
+  notes it would be a predict-frag fragment-shift; see the clean-room boundary in
+  `docs/14_build_test_deploy_gotchas.md`) and is additionally rejected by
+  `Config::validate` (config.rs:1021) because it would yield zero decoys and an
+  invalid FDR.
 
 ### peptidoforms (peptidoforms.rs:186 `run`)
 

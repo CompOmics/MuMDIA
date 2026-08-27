@@ -143,7 +143,7 @@ new engineering.
 | 4 | Primary install path | Docker as the reference environment; binary + pinned conda env as the native path. Both smoke-tested in CI. |
 | 5 | Recommended profile in README | Imported DIA-NN library (highest measured sensitivity) with the FASTA-native path documented as the licence-free alternative. |
 | 6 | Defaults promoted in `v0.1.0` | None. Ship the new quant options documented and off. Promote in `v0.2.0` after entrapment (see WP7). |
-| 7 | `plan.md` | Track it as `docs/00_design_history.md` and fix the 30+ references, or strip the references. Tracking is cheaper and keeps the clean-room provenance. |
+| 7 | `plan.md` | Track it and fix the 30+ references, or strip the references. Tracking is cheaper and keeps the clean-room provenance. |
 | 8 | Citation | Add `CITATION.cff` now; connect the GitHub repository to Zenodo so `v0.1.0` gets a DOI. |
 | 9 | Python floor | Python 3.11 or 3.12, DeepLC >= 4.1.0 (4.0.0a2 overfits, `docs/08` section 4b), mokapot 0.10, torch 2.x CPU. |
 | 10 | Environment variables | Keep the ~10 NN knobs that matter as config fields passed to the worker; leave the rest as documented env vars. |

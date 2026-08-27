@@ -34,8 +34,7 @@ failed rerun can leave an old manifest beside partially replaced outputs.
 The validated findings and the interstage, determinism, and sidecar contracts
 cited throughout this document are consolidated, self-contained, in
 `docs/18_findings_and_decisions.md` (sections A1-A7 for findings, B1-B3 for
-contracts); the citations below point there. plan.md holds the deeper
-algorithmic spec but is local-only and gitignored.
+contracts); the citations below point there.
 
 ## Files
 
@@ -269,7 +268,8 @@ Per-subcommand specifics that are easy to miss:
 - `convert` is the only stage command with no `--config`; it always runs on
   `Config::default()` (`main.rs:397`). Because the three caps are not part of the
   config, `convert` folds them into the artifact `config_hash` (`main.rs:402`,
-  comment.md A2/C4) so two different caps do not collide on an identical hash.
+  docs/18_findings_and_decisions.md) so two different caps do not collide on an
+  identical hash.
   `top_peaks_ms2` is an irreversible conversion-time cap that also affects
   extraction/features/quant; `search_seed.top_n_peaks` is the seed-only
   alternative.

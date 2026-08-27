@@ -1,4 +1,4 @@
-//! MuMDIA CLI: one binary, one subcommand per stage (PLAN.md Section 3.1, 3.5).
+//! MuMDIA CLI: one binary, one subcommand per stage (docs/01_overview_and_dataflow.md).
 //! Every stage runs standalone on path-addressable inputs.
 
 use anyhow::Result;
@@ -456,7 +456,8 @@ fn main() -> Result<()> {
             // Fold the conversion CLI caps into the convert artifacts' provenance
             // key: they change the spectra output but are not part of the config, so
             // two different caps would otherwise produce an identical config_hash
-            // (comment.md A2/C4). The caps are also recorded in the convert report.
+            // (docs/18_findings_and_decisions.md). The caps are also recorded in
+            // the convert report.
             let config_hash = mumdia_io::hash::blake3_str(&format!(
                 "{}\u{1f}max_spectra={max_spectra}\u{1f}top_peaks_ms2={top_peaks_ms2}\u{1f}top_peaks_ms1={top_peaks_ms1}",
                 cfg.canonical_json()

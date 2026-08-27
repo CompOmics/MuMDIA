@@ -2,8 +2,9 @@
 
 Repository guide for coding agents and maintainers. Read this first, then use
 `docs/README.md` to route to the code-grounded subsystem reference. `plan.md` is
-the long algorithmic design history; when it disagrees with executable code,
-tests and the tracked `docs/` guide describe current behavior.
+the long algorithmic design history, untracked and local-only; when it disagrees
+with executable code, tests and the tracked `docs/` guide describe current
+behavior.
 
 ## Project and scientific objective
 

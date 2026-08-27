@@ -4,8 +4,8 @@
 
 ## Purpose
 
-This subsystem is the tail of the identification chain (plan.md Stage F). It
-turns the per-PSM feature table produced by the `features` stage into a scored,
+This subsystem is the tail of the identification chain (Stage F). It turns the
+per-PSM feature table produced by the `features` stage into a scored,
 FDR-controlled result set. It has three parts:
 
 1. **compete** (`mumdia compete`): within each competition group, resolve
@@ -487,8 +487,9 @@ rescore.rs:498-506, 551-557).
 1. Sort record indices by descending score (fdr.rs:12-18).
 2. Walk in score order, processing **tied-score blocks together** so every PSM in
    a block gets the same FDR regardless of its arbitrary within-tie order
-   (fdr.rs:27-43). This is a determinism requirement (plan.md Section 7): a
-   target/decoy interleave inside one tie block must not change the q.
+   (fdr.rs:27-43). This is a determinism requirement
+   (`docs/14_build_test_deploy_gotchas.md`): a target/decoy interleave inside one
+   tie block must not change the q.
 3. FDR at rank = `(td + 1) / max(1, tt)` where `td`, `tt` are cumulative decoy and
    target counts at that score (fdr.rs:38). The `+1` is the conservative
    finite-sample pseudocount; the bare `n_decoys/n_targets` is optimistic in the

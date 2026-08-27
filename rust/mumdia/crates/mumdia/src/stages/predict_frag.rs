@@ -1,9 +1,10 @@
-//! Stage C `mumdia predict-frag`: spectral library generation (PLAN.md Stage C).
-//! Experiment-wide and run-independent. Computes precursor and b/y fragment m/z
-//! from the UniMod-backed mass model, predicted fragment intensities and iRT
-//! (native or MS2PIP/DeepLC sidecars over the file contract), keeps top-N
-//! fragments, and assigns `candidate_id` as the precursor-m/z sort key so the
-//! extractor's index build is a contiguous range (PLAN.md Stage D build step 1).
+//! Stage C `mumdia predict-frag`: spectral library generation
+//! (docs/06_predict_frag_index_matchers.md). Experiment-wide and run-independent.
+//! Computes precursor and b/y fragment m/z from the UniMod-backed mass model,
+//! predicted fragment intensities and iRT (native or MS2PIP/DeepLC sidecars over
+//! the file contract), keeps top-N fragments, and assigns `candidate_id` as the
+//! precursor-m/z sort key so the extractor's index build is a contiguous range
+//! (docs/09_extract.md).
 
 use std::collections::HashMap;
 use std::time::Instant;
@@ -172,7 +173,7 @@ pub fn run(p: PredictFragParams) -> Result<(u64, u64)> {
     });
     raws.retain(|r| !r.frags.is_empty());
 
-    // candidate_id = precursor-m/z sort key (PLAN.md Stage D build step 1).
+    // candidate_id = precursor-m/z sort key (docs/09_extract.md).
     // Parallel STABLE sort: rayon's par_sort_by is stable, so ties keep input order exactly
     // as the serial sort_by did. The fragment index requires this ascending-m/z ordering.
     raws.par_sort_by(|a, b| a.precursor_mz.partial_cmp(&b.precursor_mz).unwrap());

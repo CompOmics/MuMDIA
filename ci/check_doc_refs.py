@@ -60,9 +60,11 @@ POLICY_FILES = {
 # Extensions worth scanning. Everything else in the repo is data or build input.
 SCANNED_SUFFIXES = (".rs", ".py", ".md", ".toml", ".yml", ".yaml", ".json", ".sh")
 
-# A Markdown filename, optionally with a path in front of it. `[\w./-]` keeps
-# section anchors and trailing punctuation out of the match.
-REF = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_./-]*\.md\b")
+# A Markdown filename, optionally with a path in front of it. The lookbehind
+# keeps a glob out of the match: `.gitignore` patterns such as the unanchored
+# rule that once swallowed docs/22 are quoted in prose here and in the
+# changelog, and they name a rule rather than a document.
+REF = re.compile(r"(?<![*?\[A-Za-z0-9_./-])[A-Za-z0-9_][A-Za-z0-9_./-]*\.md\b")
 
 
 def tracked_files() -> list[str]:

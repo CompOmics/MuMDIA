@@ -26,8 +26,9 @@ MEMORY (multi-run / large PINs): two feature backends behind one accessor.
       This is what makes combining many runs into one rescoring tractable: the full
       PIN never lives in RAM at once.
 
-Determinism note (plan.md Section 7): NN training is only approximately reproducible.
-Set MUMDIA_NN_SEEDS>1 to ensemble seeds and average out-of-fold scores.
+Determinism note (docs/14_build_test_deploy_gotchas.md): NN training is only
+approximately reproducible. Set MUMDIA_NN_SEEDS>1 to ensemble seeds and average
+out-of-fold scores.
 
 Input format: either the legacy tab-separated PIN or a Parquet feature table, chosen by the
 file extension (.parquet / .pq). Parquet avoids serialising the whole feature matrix as text -

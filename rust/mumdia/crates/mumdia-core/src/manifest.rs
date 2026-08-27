@@ -1,4 +1,4 @@
-//! Run manifest (PLAN.md Section 3.3, 3.5): per-artifact provenance for a chained
+//! Run manifest (docs/03_io_layer.md): per-artifact provenance for a chained
 //! run. The current orchestrator records but does not consume the manifest: it
 //! does not cache, resume, or skip unchanged stages. Standalone stages remain
 //! reusable because their inputs are path-addressable.

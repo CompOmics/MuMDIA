@@ -1,5 +1,5 @@
-//! Typed errors for the mass model and core config (PLAN.md Section 7:
-//! misconfiguration fails loudly).
+//! Typed errors for the mass model and core config: misconfiguration fails
+//! loudly (docs/02_config_and_data_model.md).
 
 use thiserror::Error;
 

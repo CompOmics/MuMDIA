@@ -1,5 +1,5 @@
-//! RT calibration models (PLAN.md Stage B): a LOESS local-linear smoother with
-//! a least-squares linear fallback. Maps predicted iRT (arbitrary units) to
+//! RT calibration models (docs/08_rt_im_train.md): a LOESS local-linear smoother
+//! with a least-squares linear fallback. Maps predicted iRT (arbitrary units) to
 //! observed RT (seconds) for this run.
 
 /// Ordinary least-squares line y = slope*x + intercept.

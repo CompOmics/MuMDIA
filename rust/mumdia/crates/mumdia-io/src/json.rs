@@ -1,4 +1,4 @@
-//! JSON read/write for scalars, config, and reports (PLAN.md Section 3.3).
+//! JSON read/write for scalars, config, and reports (docs/03_io_layer.md).
 
 use anyhow::{Context, Result};
 use serde::de::DeserializeOwned;

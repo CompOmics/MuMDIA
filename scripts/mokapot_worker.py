@@ -1,4 +1,4 @@
-"""Mokapot rescorer sidecar (PLAN.md Section 0, Stage F).
+"""Mokapot rescorer sidecar (docs/13_sidecars.md).
 
 Usage:
     python mokapot_worker.py <input.pin> <output.parquet>
@@ -19,10 +19,10 @@ NN hyperparameters (only read when MODEL=nn):
     MUMDIA_NN_ALPHA      = "1e-4"    L2 penalty
     MUMDIA_BREW_ITERS    = "5"       mokapot semi-supervised iterations (Model.max_iter)
 
-Determinism note (plan.md Section 7): NN training is only approximately
-reproducible. random_state/rng are pinned to 0, but with solver=adam and BLAS
-threading the scores can drift slightly run to run. Use solver=lbfgs + a single
-BLAS thread for the closest thing to bit-exact.
+Determinism note (docs/14_build_test_deploy_gotchas.md): NN training is only
+approximately reproducible. random_state/rng are pinned to 0, but with solver=adam
+and BLAS threading the scores can drift slightly run to run. Use solver=lbfgs + a
+single BLAS thread for the closest thing to bit-exact.
 """
 
 import os

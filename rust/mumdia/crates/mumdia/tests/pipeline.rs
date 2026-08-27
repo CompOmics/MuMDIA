@@ -1,4 +1,4 @@
-//! Standalone + determinism tests (PLAN.md Section 3.5, Section 7 determinism).
+//! Standalone + determinism tests (docs/14_build_test_deploy_gotchas.md).
 //! Craft a tiny library and MS2 set by hand, then drive the extract -> features
 //! -> compete -> rescore chain directly on files, asserting the planted target
 //! is recovered and the output is reproducible.

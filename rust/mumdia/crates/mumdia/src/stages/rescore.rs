@@ -1,7 +1,7 @@
-//! Stage F `mumdia rescore` (PLAN.md Stage F): rescore competed PSMs across the
-//! experiment and compute native target-decoy q-values at PSM and peptide level.
-//! MVP default is the native semi-supervised rescorer; Mokapot / percolator.exe
-//! are optional strategies over the same PIN/feature contract.
+//! Stage F `mumdia rescore` (docs/11_compete_rescore_fdr.md): rescore competed
+//! PSMs across the experiment and compute native target-decoy q-values at PSM and
+//! peptide level. MVP default is the native semi-supervised rescorer; Mokapot /
+//! percolator.exe are optional strategies over the same PIN/feature contract.
 
 use std::collections::HashMap;
 use std::time::Instant;
@@ -366,7 +366,8 @@ pub fn run(p: RescoreParams) -> Result<u64> {
     // Peptide-level q: reduce to best PSM per base peptide, q on that set, map
     // back. Protein-group q: same over the protein-accession-set string (the MVP
     // grouping; decoys carry a DECOY_ prefix). Full parsimony/razor is a later
-    // option (PLAN.md Stage G). Group score = best member PSM score.
+    // option (docs/12_quant_lfq_align_mbr_report_audit.md). Group score = best
+    // member PSM score.
     let peptide_q = grouped_q(
         &base,
         &scores,
@@ -398,11 +399,11 @@ pub fn run(p: RescoreParams) -> Result<u64> {
         qmode,
         p.cfg.entrapment_ratio,
     );
-    // Multi-context q-values (PLAN.md Section 8 rescore; comment.md C1/C3). The
-    // pooled per-PSM q is `experiment_psm_q`; `run_psm_q` re-runs TDA within each
-    // source (run) so a per-run quant/report gets a real per-run FDR rather than the
-    // pooled value; `precursor_q` groups on peptidoform+charge. `global_q` is kept
-    // as a byte-identical alias of the pooled q for backward-compat.
+    // Multi-context q-values (docs/11_compete_rescore_fdr.md). The pooled per-PSM q
+    // is `experiment_psm_q`; `run_psm_q` re-runs TDA within each source (run) so a
+    // per-run quant/report gets a real per-run FDR rather than the pooled value;
+    // `precursor_q` groups on peptidoform+charge. `global_q` is kept as a
+    // byte-identical alias of the pooled q for backward-compat.
     let global_q = psm_q.clone();
     let experiment_psm_q = psm_q.clone();
     // Per-run PSM q: TDA within each source separately, scattered back by row index.
@@ -528,9 +529,10 @@ pub fn run(p: RescoreParams) -> Result<u64> {
             // Run identity for experiment-wide rescore (index into --competed);
             // all-zero for a single-run rescore. Lets quant map scores per file.
             Col::U32("source".into(), source),
-            // Multi-context q columns (comment.md C1/C3). run_psm_q = per-run PSM
-            // FDR; experiment_psm_q = pooled PSM FDR (== q_value/global_q_value);
-            // precursor_q = per (peptidoform+charge) FDR.
+            // Multi-context q columns (docs/11_compete_rescore_fdr.md).
+            // run_psm_q = per-run PSM FDR; experiment_psm_q = pooled PSM FDR
+            // (== q_value/global_q_value); precursor_q = per (peptidoform+charge)
+            // FDR.
             Col::F64("run_psm_q".into(), run_psm_q),
             Col::F64("experiment_psm_q".into(), experiment_psm_q),
             Col::F64("precursor_q".into(), precursor_q),
@@ -733,8 +735,9 @@ fn grouped_q<K: std::hash::Hash + Eq + Clone>(
 /// Run the entrapment GBM sidecar: write a Parquet of features + meta columns,
 /// invoke `entrapment_worker.py`, read back candidate_id + score. Positives are
 /// real targets, negatives are spike-in (entrapment) targets; the worker fits a
-/// gradient-boosted classifier out-of-fold by base peptide (PLAN.md Section 3.2
-/// positional-CLI file contract, as for the MS2PIP/DeepLC/Mokapot sidecars).
+/// gradient-boosted classifier out-of-fold by base peptide (the positional-CLI
+/// file contract in docs/13_sidecars.md, as for the MS2PIP/DeepLC/Mokapot
+/// sidecars).
 #[allow(clippy::too_many_arguments)]
 fn run_entrapment_gbm(
     p: &RescoreParams,
@@ -907,8 +910,9 @@ fn write_features_parquet(
 
 /// Run a PIN-contract Python rescorer sidecar (`mokapot_worker.py` or
 /// `nn_rescore_worker.py`) over a PIN written from the competed set; return scores
-/// aligned to the input candidate order (PLAN.md Section 3.2 file contract). Both
-/// sidecars share this exact contract: PIN in, `candidate_id`+`score` parquet out.
+/// aligned to the input candidate order (the file contract in
+/// docs/13_sidecars.md). Both sidecars share this exact contract: PIN in,
+/// `candidate_id`+`score` parquet out.
 #[allow(clippy::too_many_arguments)]
 fn run_pin_sidecar(
     p: &RescoreParams,
@@ -1007,8 +1011,9 @@ fn run_pin_sidecar(
         .env("PYTHONUTF8", "1")
         // Pass the configured NN hyperparameters so the worker uses them instead
         // of its own defaults, and so the folds/num_iter/train_fdr recorded in the
-        // report reflect the values actually used (comment.md C4). Ignored by
-        // mokapot_worker.py, which shares this PIN contract.
+        // report reflect the values actually used
+        // (docs/18_findings_and_decisions.md). Ignored by mokapot_worker.py,
+        // which shares this PIN contract.
         .env("MUMDIA_NN_FOLDS", p.cfg.folds.to_string())
         .env("MUMDIA_NN_ITERS", p.cfg.num_iter.to_string())
         .env("MUMDIA_NN_TRAIN_FDR", p.cfg.train_fdr.to_string())

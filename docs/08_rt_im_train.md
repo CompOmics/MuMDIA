@@ -4,11 +4,11 @@
 
 ## Purpose
 
-Stage B (`mumdia rt-im-train`, PLAN.md Stage B) turns the run-independent
-predicted iRT carried on each library candidate into a per-run predicted
-retention time in seconds, and derives a per-candidate RT acceptance window that
-the extractor uses to bound its scan search. It is the bridge between the
-library (built once, run-independent) and this run's chromatography.
+Stage B (`mumdia rt-im-train`) turns the run-independent predicted iRT carried on
+each library candidate into a per-run predicted retention time in seconds, and
+derives a per-candidate RT acceptance window that the extractor uses to bound its
+scan search. It is the bridge between the library (built once, run-independent)
+and this run's chromatography.
 
 The stage does two things:
 

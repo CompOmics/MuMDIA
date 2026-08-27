@@ -1,8 +1,8 @@
-//! Compete step `mumdia compete` (PLAN.md Section 4 Stage F, the compete step):
-//! within each competition group keep only the best-scoring candidate before
-//! target-decoy counting, so multiple plausible candidates for one elution peak
-//! cannot inflate discoveries. MVP groups by base peptide (target + its decoy +
-//! charge/mod variants); the grouping is configurable.
+//! Compete step `mumdia compete` (docs/11_compete_rescore_fdr.md): within each
+//! competition group keep only the best-scoring candidate before target-decoy
+//! counting, so multiple plausible candidates for one elution peak cannot inflate
+//! discoveries. MVP groups by base peptide (target + its decoy + charge/mod
+//! variants); the grouping is configurable.
 
 use std::collections::HashMap;
 use std::time::Instant;

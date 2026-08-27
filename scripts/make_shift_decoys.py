@@ -1,6 +1,6 @@
 """Build a fragment-shift decoy library from the target half of an existing
-library (clean-room realization of the DIA-NN terminal-shift decoy idea, PLAN.md
-Section 8.4 / 9.2).
+library (clean-room realization of the DIA-NN terminal-shift decoy idea,
+docs/13_sidecars.md).
 
 Each decoy copies a target's predicted intensities and iRT and keeps the target
 precursor m/z (so the decoy co-isolates in the same window / RT and experiences

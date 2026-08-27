@@ -1,8 +1,9 @@
-//! Stage D2 `mumdia align` (PLAN.md Stage D2): put all runs on a common RT
-//! coordinate. Choose a reference run; for peptides confidently identified in
-//! both a run and the reference, fit a smooth monotone RT mapping (LOESS) from
-//! the run's observed RT to the reference RT, and record the residual spread
-//! (which sets how tight an MBR window can be). MVP is 3D, so IM is omitted.
+//! Stage D2 `mumdia align` (docs/12_quant_lfq_align_mbr_report_audit.md): put
+//! all runs on a common RT coordinate. Choose a reference run; for peptides
+//! confidently identified in both a run and the reference, fit a smooth monotone
+//! RT mapping (LOESS) from the run's observed RT to the reference RT, and record
+//! the residual spread (which sets how tight an MBR window can be). MVP is 3D, so
+//! IM is omitted.
 //!
 //! This is an experiment-level stage. With a single run it degenerates to the
 //! identity mapping; it is exercised on multiple runs (unit-tested on crafted

@@ -3,12 +3,12 @@
 
 ## Purpose
 
-`convert` is Stage 0 of the pipeline (PLAN.md Stage 0). It is the single point in
-the engine that touches the vendor mass-spectrometry format. It reads one mzML
-run through the `mzdata` crate and writes a normalized, self-describing spectra
-artifact set (four Parquet files) that every downstream stage consumes instead of
-the raw file. Everything after this stage (`search-seed`, `rt-im-train`,
-`extract`, `features`, `quant`) reads spectra only through
+`convert` is Stage 0 of the pipeline. It is the single point in the engine that
+touches the vendor mass-spectrometry format. It reads one mzML run through the
+`mzdata` crate and writes a normalized, self-describing spectra artifact set (four
+Parquet files) that every downstream stage consumes instead of the raw file.
+Everything after this stage (`search-seed`, `rt-im-train`, `extract`, `features`,
+`quant`) reads spectra only through
 `crates/mumdia/src/spectra.rs`, never through `mzdata`. Consequences: the
 vendor-format dependency is isolated here, and any format quirk (profile vs
 centroid, AIF/all-ion windows, missing precursor) must be resolved at this stage

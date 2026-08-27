@@ -1,6 +1,6 @@
-//! Native target-decoy FDR / q-values (PLAN.md Section 4 Stage F, Section 8:
-//! no-pi0 estimator `q = (n_decoys + 1) / max(1, n_targets)`, monotonized, with
-//! tied scores collapsed to a single block q). Shared by search-seed and rescore.
+//! Native target-decoy FDR / q-values (docs/11_compete_rescore_fdr.md): no-pi0
+//! estimator `q = (n_decoys + 1) / max(1, n_targets)`, monotonized, with tied
+//! scores collapsed to a single block q. Shared by search-seed and rescore.
 
 /// Compute per-record q-values from (score, is_decoy). Higher score is better.
 /// Returns q aligned to the input order.
@@ -81,8 +81,9 @@ pub fn entrapment_q(
     let (mut ne, mut nr) = (0usize, 0usize);
     let mut fdr_at = vec![1.0f64; n];
     // Process tied-score blocks together so every row in a block gets the same
-    // FDP regardless of its arbitrary within-tie order (determinism, PLAN.md
-    // Section 7). Mirrors the tied-block walk in `target_decoy_q`.
+    // FDP regardless of its arbitrary within-tie order (determinism,
+    // docs/14_build_test_deploy_gotchas.md). Mirrors the tied-block walk in
+    // `target_decoy_q`.
     let mut rank = 0usize;
     while rank < n {
         let s = scores[order[rank]];
@@ -120,10 +121,10 @@ pub fn count_targets_at_q(q: &[f64], is_decoy: &[bool], threshold: f64) -> usize
 }
 
 /// Validate that every PSM label is a known class. An unknown or malformed
-/// label must not silently count as a target (comment.md C16): the target-decoy
-/// null depends on exact labeling. Entrapment status is derived from the protein
-/// accession (see `classify_entrapment`), not the label, so the only valid label
-/// values here are "target" and "decoy".
+/// label must not silently count as a target (docs/18_findings_and_decisions.md):
+/// the target-decoy null depends on exact labeling. Entrapment status is derived
+/// from the protein accession (see `classify_entrapment`), not the label, so the
+/// only valid label values here are "target" and "decoy".
 pub fn validate_labels(labels: &[String]) -> anyhow::Result<()> {
     for l in labels {
         if l != "target" && l != "decoy" {

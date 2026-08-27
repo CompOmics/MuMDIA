@@ -1,6 +1,6 @@
 //! Shared spectrum reading: load the normalized spectra artifacts (Stage 0
 //! output) back into memory for the seed search and extractor. Downstream
-//! stages consume this artifact set, never the raw vendor file (PLAN.md Stage 0).
+//! stages consume this artifact set, never the raw vendor file (docs/04_convert.md).
 
 use anyhow::{anyhow, Context, Result};
 use arrow::array::{Array, Float32Array, ListArray};

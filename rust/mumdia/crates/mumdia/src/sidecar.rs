@@ -1,4 +1,4 @@
-//! Sidecar clients over the file contract (PLAN.md Section 3.2): write an input
+//! Sidecar clients over the file contract (docs/13_sidecars.md): write an input
 //! Parquet, invoke the Python worker as a subprocess, read the output Parquet.
 //! The contract is the files and their schema, so a sidecar can be replaced by a
 //! native implementation without changing callers.

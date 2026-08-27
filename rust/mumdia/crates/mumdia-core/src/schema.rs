@@ -1,4 +1,4 @@
-//! Frozen artifact schema identifiers (PLAN.md Section 3.3, 3.5). Each artifact
+//! Frozen artifact schema identifiers (docs/03_io_layer.md). Each artifact
 //! carries a logical schema name and version so a stage can validate its inputs
 //! and a model is never applied under a mismatched schema.
 
