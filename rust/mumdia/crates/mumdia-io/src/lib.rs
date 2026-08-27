@@ -11,8 +11,22 @@ use mumdia_core::manifest::ArtifactRecord;
 
 /// Initialize tracing once, honoring `RUST_LOG` (default `info`).
 pub fn init_logging() {
+    init_logging_level(None)
+}
+
+/// Initialize tracing with an explicit level, falling back to `RUST_LOG` and then
+/// to `info`.
+///
+/// `RUST_LOG` was the only way to change verbosity, which is not discoverable
+/// from `--help` and is awkward on Windows. An explicit level wins over it, so
+/// `--log-level` and `-v/-q` behave as the flags a user expects; `RUST_LOG` still
+/// works, and still offers per-module filtering that a single level cannot.
+pub fn init_logging_level(level: Option<&str>) {
     use tracing_subscriber::{fmt, EnvFilter};
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let filter = match level {
+        Some(l) => EnvFilter::new(l),
+        None => EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+    };
     let _ = fmt().with_env_filter(filter).with_target(false).try_init();
 }
 

@@ -21,6 +21,72 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
+
+    /// Maximum worker threads. Default: every core.
+    ///
+    /// Bounds the engine's rayon pool and is forwarded to the Python sidecars as
+    /// `MUMDIA_NN_THREADS` and `OMP_NUM_THREADS` unless those are already set.
+    /// Without this there was no way to bound MuMDIA at all except the
+    /// undocumented `RAYON_NUM_THREADS`, which the engine never read and which
+    /// does not reach the sidecars; on a shared machine that made a run
+    /// antisocial. Note the NN rescore worker measured FASTER on 8 threads than
+    /// on 32 (docs/13_sidecars.md).
+    #[arg(long, global = true, value_name = "N")]
+    threads: Option<usize>,
+
+    /// Log level: `error`, `warn`, `info` (default), `debug`, or `trace`. Accepts
+    /// any `RUST_LOG` filter, so `mumdia=debug,extract=trace` also works.
+    #[arg(long, global = true, value_name = "LEVEL")]
+    log_level: Option<String>,
+
+    /// More detail: `-v` for debug, `-vv` for trace. Overridden by --log-level.
+    #[arg(short = 'v', long, global = true, action = clap::ArgAction::Count)]
+    verbose: u8,
+
+    /// Warnings and errors only. Overridden by --log-level.
+    #[arg(short = 'q', long, global = true, conflicts_with = "verbose")]
+    quiet: bool,
+}
+
+impl Cli {
+    /// The tracing filter these flags ask for, or `None` to leave `RUST_LOG` in
+    /// charge. `--log-level` is explicit and wins; otherwise the counted `-v` and
+    /// `-q` map onto levels.
+    fn log_filter(&self) -> Option<String> {
+        if let Some(l) = &self.log_level {
+            return Some(l.clone());
+        }
+        match (self.quiet, self.verbose) {
+            (true, _) => Some("warn".into()),
+            (false, 0) => None,
+            (false, 1) => Some("debug".into()),
+            (false, _) => Some("trace".into()),
+        }
+    }
+}
+
+/// Apply `--threads` to the engine's own pool and to the sidecars.
+///
+/// Rayon's global pool can only be built once and only before first use, so this
+/// runs before any subcommand. An existing environment variable is left alone: a
+/// user who set `OMP_NUM_THREADS` for a reason should not have it silently
+/// replaced.
+fn apply_threads(threads: Option<usize>) -> Result<()> {
+    let Some(n) = threads else { return Ok(()) };
+    if n == 0 {
+        anyhow::bail!("--threads must be >= 1");
+    }
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(n)
+        .build_global()
+        .map_err(|e| anyhow::anyhow!("cannot set --threads {n}: {e}"))?;
+    for var in ["MUMDIA_NN_THREADS", "OMP_NUM_THREADS"] {
+        if std::env::var_os(var).is_none() {
+            std::env::set_var(var, n.to_string());
+        }
+    }
+    tracing::info!(threads = n, "threads: engine pool and sidecar hints set");
+    Ok(())
 }
 
 #[derive(Subcommand)]
@@ -573,8 +639,9 @@ fn load_config(_path: &Option<String>) -> Result<Config> {
 }
 
 fn main() -> Result<()> {
-    mumdia_io::init_logging();
     let cli = Cli::parse();
+    mumdia_io::init_logging_level(cli.log_filter().as_deref());
+    apply_threads(cli.threads)?;
     match cli.cmd {
         Cmd::Convert {
             mzml,
@@ -1008,7 +1075,56 @@ fn main() -> Result<()> {
 
 #[cfg(test)]
 mod cli_tests {
-    use super::{Cli, Cmd};
+    use super::*;
+
+    /// The verbosity flags have to keep working after the subcommand as well as
+    /// before it, which is what `global = true` buys and what a user will type.
+    #[test]
+    fn global_flags_parse_on_either_side_of_the_subcommand() {
+        let a = Cli::parse_from(["mumdia", "--threads", "8", "doctor"]);
+        let b = Cli::parse_from(["mumdia", "doctor", "--threads", "8"]);
+        assert_eq!(a.threads, Some(8));
+        assert_eq!(b.threads, Some(8));
+        assert!(matches!(a.cmd, Cmd::Doctor { .. }));
+    }
+
+    #[test]
+    fn log_filter_maps_the_verbosity_flags() {
+        let f = |args: &[&str]| {
+            let mut v = vec!["mumdia"];
+            v.extend_from_slice(args);
+            v.push("doctor");
+            Cli::parse_from(v).log_filter()
+        };
+        // Nothing given: leave RUST_LOG in charge.
+        assert_eq!(f(&[]), None);
+        assert_eq!(f(&["-v"]), Some("debug".to_string()));
+        assert_eq!(f(&["-vv"]), Some("trace".to_string()));
+        assert_eq!(f(&["-vvv"]), Some("trace".to_string()));
+        assert_eq!(f(&["-q"]), Some("warn".to_string()));
+        // An explicit level wins over the counted flags, and a full RUST_LOG
+        // filter passes through unchanged.
+        assert_eq!(
+            f(&["-vv", "--log-level", "error"]),
+            Some("error".to_string())
+        );
+        assert_eq!(
+            f(&["--log-level", "mumdia=debug,extract=trace"]),
+            Some("mumdia=debug,extract=trace".to_string())
+        );
+        // -q and -v contradict each other, so they are rejected rather than
+        // silently ordered.
+        assert!(Cli::try_parse_from(["mumdia", "-q", "-v", "doctor"]).is_err());
+    }
+
+    #[test]
+    fn threads_must_be_at_least_one() {
+        let err = apply_threads(Some(0)).unwrap_err().to_string();
+        assert!(err.contains("--threads"), "{err}");
+        // `None` is always fine and must not touch the global pool.
+        assert!(apply_threads(None).is_ok());
+    }
+
     use clap::Parser;
 
     #[test]

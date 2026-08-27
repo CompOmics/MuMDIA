@@ -47,6 +47,13 @@ than a number. Both are recorded in every run's `manifest.json`.
   imports what that role's workers import. A role is resolved only if the
   configuration uses it, so a default native run still needs no Python at all.
   Explicit paths behave exactly as before.
+- Global CLI flags, accepted before or after the subcommand: `--threads N`
+  bounds the engine's rayon pool and is forwarded to the sidecars as
+  `MUMDIA_NN_THREADS` and `OMP_NUM_THREADS` when those are unset;
+  `--log-level`, `-v`/`-vv` and `-q` set verbosity. Previously the only control
+  was `RUST_LOG`, which is not discoverable from `--help`, and thread count could
+  not be bounded at all: the engine never read `RAYON_NUM_THREADS`, so a run took
+  every core on a shared machine.
 - `configs/examples/{native,fasta-sidecars,diann-library}.json`, portable
   starting points that use `"auto"`, with `configs/README.md` explaining the
   resolution order and the environment specs. These replace the only tracked

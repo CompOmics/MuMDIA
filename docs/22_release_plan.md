@@ -237,27 +237,32 @@ Acceptance: a PR that breaks any stated gate is red.
 
 Goal: one config runs unchanged on Windows, Linux, macOS, and in Docker.
 
-- [ ] Interpreter discovery: accept `"python": "auto"` (or absent with
-      `strict = false`) and resolve through, in order, `MUMDIA_PYTHON_<ROLE>`
-      environment variables, an active conda/venv (`CONDA_PREFIX`,
-      `VIRTUAL_ENV`), then `python3`/`python` on PATH. Record the resolved path
-      in `report.json`. Keep explicit paths working.
-- [ ] `sidecar_script_dir`: default to the scripts shipped next to the binary
-      (release archive layout) and to `/opt/mumdia/scripts` in Docker; resolve
-      relative paths against the config file location, not the CWD.
+- [x] Interpreter discovery: `"auto"` or absent resolves through
+      `MUMDIA_PYTHON_<ROLE>`, `MUMDIA_PYTHON`, `CONDA_PREFIX`, `VIRTUAL_ENV`,
+      then `python3`/`python` on PATH, accepting a candidate only after it
+      imports the role's modules. Explicit paths keep working. The resolved path
+      lands in `manifest.json` (via the resolved config) rather than in each
+      stage's `report.json`.
+- [x] `sidecar_script_dir`: resolved against the config file's directory and the
+      executable's directory as well as the CWD; the release archive and the
+      image both satisfy it.
 - [ ] `mumdia init-config --profile fasta|diann-lib --out config.json`: writes
       a commented config with discovered interpreters and no machine-specific
       strings.
-- [ ] `mumdia doctor` extensions: probe `mbr.python` and `percolator_bin`;
-      check `sidecar_script_dir` and each worker file; report package versions
-      and enforce floors (DeepLC >= 4.1.0, numpy < 2 where the env requires it);
-      execute each worker with `--selftest` so the DeepLC import order is
-      exercised; with `--mzml`/`--lib-precursors`/`--fasta` check readability
-      and the library contract (`candidate_id` contiguous, `precursor_mz`
-      sorted, snappy + utf8).
-- [ ] Global CLI flags: `--threads N` (rayon global pool, forwarded to workers
-      as `MUMDIA_NN_THREADS`/`OMP_NUM_THREADS`), `-v/-q` or `--log-level`,
-      `--config` on every subcommand that reads config.
+- [x] `mumdia doctor`: probes `mbr.python`, checks `sidecar_script_dir` and each
+      worker file, reports package versions, and warns below the DeepLC 4.1.1
+      floor.
+- [ ] `doctor` remainder: probe `percolator_bin`; execute each worker with a
+      `--selftest` so the DeepLC import order is exercised (a module-presence
+      probe cannot see it; the container CI job covers it for the image); and
+      with `--mzml`/`--lib-precursors`/`--fasta` check readability and the
+      library contract (`candidate_id` contiguous, `precursor_mz` sorted,
+      snappy + utf8).
+- [x] Global CLI flags: `--threads N` (rayon global pool, forwarded to workers as
+      `MUMDIA_NN_THREADS`/`OMP_NUM_THREADS`), `--log-level`, `-v`/`-vv`, `-q`,
+      all accepted on either side of the subcommand.
+- [ ] `--config` on every subcommand that reads config (still absent on
+      `convert`, `quant-lfq`, `inspect`, `audit`, `report`).
 - [ ] Progress: periodic `info!` lines with counts and elapsed time inside the
       long loops (extract, features, rescore worker relay), plus a per-stage
       wall-clock summary at the end of `run` and `run-experiment`.
