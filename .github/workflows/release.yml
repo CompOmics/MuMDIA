@@ -57,7 +57,6 @@ jobs:
       # than shipping an archive whose --version or --help is broken.
       - name: Smoke-test the binary
         shell: bash
-        if: matrix.target != 'aarch64-apple-darwin'
         run: |
           set -euo pipefail
           bin="target/${{ matrix.target }}/release/mumdia${{ matrix.exe }}"

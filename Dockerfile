@@ -9,8 +9,11 @@
 #           --out-dir /data/out \
 #           --config /opt/mumdia/config.dia.json
 #
-# --user makes the results owned by you rather than by the container's user;
-# the image runs unprivileged either way. Check the sidecar environments first:
+# --user is REQUIRED whenever the engine writes into a bind mount: the image runs
+# as an unprivileged user whose uid does not match yours, so without it even the
+# mount point fails with `mkdir: cannot create directory '/data': Permission
+# denied` (measured 2026-08-27). With it, the results are owned by you.
+# Check the sidecar environments before a long run:
 #   docker run --rm ghcr.io/compomics/mumdia \
 #       doctor --config /opt/mumdia/config.dia.json
 #

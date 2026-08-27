@@ -61,10 +61,20 @@ produces bit-identical results.
   commit on the 4.0 multitask branch, and no longer caps `numpy<2`, which 4.1.1
   does not require. 4.1.1 is a floor, not merely the current release: the 4.0.0a2
   multitask preview overfits per-run fine-tuning badly enough to invert RT-model
-  rankings.
+  rankings. Verified by building the image and importing the workers' graph in
+  the worker's own order: DeepLC 4.1.1, torch 2.12.1+cpu, numpy 2.4.6 in the
+  `deeplc` environment and mokapot 0.10.0 in `rescore`, with `mumdia doctor`
+  passing on both baked configurations.
+- The image no longer runs as root after setup. It needs
+  `--user "$(id -u):$(id -g)"` to write into a bind mount, which the documented
+  invocation now passes and the Docker workflow now asserts.
 - Under a fixed integration window, the reported `integration_lo_rt` and
   `integration_hi_rt` are now the retention-time extent actually integrated
-  rather than the walked bounds that were ignored.
+  rather than the walked bounds that were ignored. Measured on the AIF benchmark
+  run behind the ProteoBench submission: 72,168 quantified precursors, every
+  `quantity`, `n_fragments_used`, `quant_status` and `integration_apex_rt`
+  bit-identical, and the reported window corrected from a 29.1 s median (the
+  descent walk) to 34.9 s (the fixed window that produced the numbers).
 - `mumdia doctor` probes the packages the DeepLC sidecars really import
   (`deeplc`, `numpy`, `pandas`, `pyarrow`, `torch`, `psm_utils`), not a shorter
   list that let a broken environment pass.
