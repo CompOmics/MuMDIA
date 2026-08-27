@@ -1832,6 +1832,77 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_chromatogram_table_preserves_every_identification() {
+        // Extraction can accept a candidate and still write no chromatogram for
+        // it, and a run can legitimately produce an empty chromatogram table. The
+        // identification must survive with an explicit unquantifiable status: an
+        // accepted PSM silently vanishing from the peptide table would be a
+        // reported identification lost to a quantification detail, which is the
+        // opposite of the contract that identification and quantifiability are
+        // separate.
+        let scored = quant_test_path("empty_scored.parquet");
+        let chrom = quant_test_path("empty_chrom.parquet");
+        write_table(
+            &scored,
+            vec![
+                Col::U32("candidate_id".into(), vec![1, 2]),
+                Col::U32("base_peptide_id".into(), vec![10, 11]),
+                Col::Str("peptidoform".into(), vec!["PEP1".into(), "PEP2".into()]),
+                Col::I32("charge".into(), vec![2, 2]),
+                Col::Str("label".into(), vec!["target".into(); 2]),
+                Col::Str("protein_group".into(), vec!["PG".into(), "PG".into()]),
+                Col::F64("peptide_q_value".into(), vec![0.0, 0.0]),
+                Col::F64("apex_rt".into(), vec![5.0, 5.0]),
+                Col::F64("elution_lo".into(), vec![4.0, 4.0]),
+                Col::F64("elution_hi".into(), vec![6.0, 6.0]),
+            ],
+        )
+        .unwrap();
+        write_table(
+            &chrom,
+            vec![
+                Col::U32("candidate_id".into(), Vec::new()),
+                Col::Str("frag_name".into(), Vec::new()),
+                Col::ListF32("rt".into(), Vec::new()),
+                Col::ListF32("intensity".into(), Vec::new()),
+            ],
+        )
+        .unwrap();
+
+        let peptide = quant_test_path("empty_peptide.parquet");
+        let protein = quant_test_path("empty_protein.parquet");
+        let cfg = QuantConfig::default();
+        let rows = run(QuantParams {
+            psms_scored: &scored,
+            chromatograms: &chrom,
+            out_peptide: &peptide,
+            out_protein: &protein,
+            out_fragment: None,
+            out_peak_bounds: None,
+            cfg: &cfg,
+            config_hash: "test",
+        })
+        .unwrap();
+        assert_eq!(rows.0, 2, "both identifications must be reported");
+
+        let pq = Table::read(&peptide).unwrap();
+        assert_eq!(
+            pq.str("quant_status").unwrap(),
+            vec!["no_fragment_traces"; 2]
+        );
+        assert_eq!(pq.opt_f64("quantity").unwrap(), vec![None, None]);
+        assert_eq!(pq.i32("n_fragments_used").unwrap(), vec![0, 0]);
+        // The protein group has no quantifiable peptide, and must say so rather
+        // than reporting a quantity of zero.
+        let gq = Table::read(&protein).unwrap();
+        assert_eq!(
+            gq.str("quant_status").unwrap(),
+            vec!["no_quantifiable_peptide"]
+        );
+        assert_eq!(gq.opt_f64("quantity").unwrap(), vec![None]);
+    }
+
+    #[test]
     fn predicted_selection_without_the_column_is_a_clear_error() {
         let (scored, chrom) = selection_fixture(false);
         let cfg = QuantConfig {

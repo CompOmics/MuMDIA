@@ -157,11 +157,188 @@ pub fn run(p: ReportParams) -> Result<(u64, u64)> {
 
 #[cfg(test)]
 mod tests {
-    use super::strip;
+    use super::*;
+    use mumdia_io::table::{write_table, Col};
+
     #[test]
     fn strip_mods_and_decoy() {
         assert_eq!(strip("PEPTIDEK"), "PEPTIDEK");
         assert_eq!(strip("M[Oxidation]EGC[Carbamidomethyl]VDGHK"), "MEGCVDGHK");
         assert_eq!(strip("DECOY_VAVGDGVAK"), "VAVGDGVAK");
+    }
+
+    fn tmp(name: &str) -> String {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!("mumdia_report_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        dir.join(format!("{n}_{name}"))
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    /// A scored table with one confident target, one target above threshold, and
+    /// one decoy that would win on score if the label were ignored.
+    fn scored_table() -> String {
+        let path = tmp("scored.parquet");
+        write_table(
+            &path,
+            vec![
+                Col::Str(
+                    "peptidoform".into(),
+                    vec![
+                        "PEPTIDEK".into(),
+                        "M[Oxidation]EGVDGHK".into(),
+                        "DECOY_KEDITPEP".into(),
+                        "LATEPEPTIDEK".into(),
+                    ],
+                ),
+                Col::I32("charge".into(), vec![2, 3, 2, 2]),
+                Col::Str(
+                    "protein".into(),
+                    vec!["P1".into(), "P2".into(), "DECOY_P1".into(), "P1".into()],
+                ),
+                Col::Str(
+                    "label".into(),
+                    vec![
+                        "target".into(),
+                        "target".into(),
+                        "decoy".into(),
+                        "target".into(),
+                    ],
+                ),
+                Col::F64("peptide_q_value".into(), vec![0.001, 0.005, 0.0001, 0.5]),
+                Col::Str(
+                    "protein_group".into(),
+                    vec!["PG1".into(), "PG2".into(), "DECOY_PG1".into(), "".into()],
+                ),
+                Col::F64("pg_q_value".into(), vec![0.002, 0.9, 0.0001, 1.0]),
+                Col::F64("score".into(), vec![3.5, 2.5, 9.9, 0.1]),
+            ],
+        )
+        .unwrap();
+        path
+    }
+
+    #[test]
+    fn report_filters_by_label_and_threshold_and_never_writes_a_decoy() {
+        let scored = scored_table();
+        let out = tmp("report_dir");
+        std::fs::create_dir_all(&out).unwrap();
+        let peptides = format!("{out}/peptides.tsv");
+        let proteins = format!("{out}/proteins.tsv");
+        let (n_pep, n_prot) = run(ReportParams {
+            scored: &scored,
+            peptide_quant: None,
+            protein_quant: None,
+            out_peptides: &peptides,
+            out_proteins: &proteins,
+            q_threshold: 0.01,
+        })
+        .unwrap();
+
+        // Two targets pass; the decoy has the best q and the best score and must
+        // still be excluded. A decoy in a user-facing report is not a cosmetic
+        // problem: it is reported as an identification.
+        assert_eq!((n_pep, n_prot), (2, 1));
+        let text = std::fs::read_to_string(&peptides).unwrap();
+        assert!(
+            !text.contains("DECOY_"),
+            "decoy leaked into peptides.tsv:\n{text}"
+        );
+        assert!(text.contains("PEPTIDEK"));
+        assert!(text.contains("M[Oxidation]EGVDGHK"));
+        // Above-threshold target excluded.
+        assert!(!text.contains("LATEPEPTIDEK"));
+        // The stripped column must be the modification-free sequence, since that
+        // is the unit `peptide_q_value` controls.
+        assert!(
+            text.contains("MEGVDGHK"),
+            "stripped sequence missing:\n{text}"
+        );
+        // Quantity is empty when no quant table was supplied, not zero: absence of
+        // a measurement is not a measurement of zero.
+        let data_line = text.lines().nth(1).unwrap();
+        assert!(
+            data_line.ends_with('\t'),
+            "expected an empty quantity cell: {data_line:?}"
+        );
+
+        let prot = std::fs::read_to_string(&proteins).unwrap();
+        assert!(prot.contains("PG1"));
+        assert!(!prot.contains("DECOY_PG1"));
+        // An empty protein_group must not become a row.
+        assert_eq!(prot.lines().count(), 2, "header plus one group:\n{prot}");
+    }
+
+    #[test]
+    fn report_writes_header_only_when_nothing_passes() {
+        // A run that identifies nothing at the threshold still has to produce the
+        // files, with headers, so a downstream reader fails on empty data rather
+        // than on a missing file. This is the state the fixture run hits for
+        // proteins.tsv, where 16 groups cannot reach 1 percent FDR.
+        let scored = scored_table();
+        let out = tmp("report_empty");
+        std::fs::create_dir_all(&out).unwrap();
+        let peptides = format!("{out}/peptides.tsv");
+        let proteins = format!("{out}/proteins.tsv");
+        let (n_pep, n_prot) = run(ReportParams {
+            scored: &scored,
+            peptide_quant: None,
+            protein_quant: None,
+            out_peptides: &peptides,
+            out_proteins: &proteins,
+            q_threshold: 0.0,
+        })
+        .unwrap();
+        assert_eq!((n_pep, n_prot), (0, 0));
+        for path in [&peptides, &proteins] {
+            let text = std::fs::read_to_string(path).unwrap();
+            assert_eq!(text.lines().count(), 1, "expected header only in {path}");
+            assert!(text.starts_with("precursor\t") || text.starts_with("protein_group\t"));
+        }
+    }
+
+    #[test]
+    fn report_joins_quantities_and_leaves_unquantified_rows_empty() {
+        let scored = scored_table();
+        let quant = tmp("peptide_quant.parquet");
+        // Only the first passing precursor is quantified.
+        write_table(
+            &quant,
+            vec![
+                Col::Str("peptidoform".into(), vec!["PEPTIDEK".into()]),
+                Col::I32("charge".into(), vec![2]),
+                Col::F64("quantity".into(), vec![1234.5]),
+            ],
+        )
+        .unwrap();
+        let out = tmp("report_quant");
+        std::fs::create_dir_all(&out).unwrap();
+        let peptides = format!("{out}/peptides.tsv");
+        let proteins = format!("{out}/proteins.tsv");
+        run(ReportParams {
+            scored: &scored,
+            peptide_quant: Some(&quant),
+            protein_quant: None,
+            out_peptides: &peptides,
+            out_proteins: &proteins,
+            q_threshold: 0.01,
+        })
+        .unwrap();
+        let text = std::fs::read_to_string(&peptides).unwrap();
+        let mut quantified = 0;
+        let mut empty = 0;
+        for line in text.lines().skip(1) {
+            let cell = line.rsplit('\t').next().unwrap();
+            if cell.is_empty() {
+                empty += 1;
+            } else {
+                assert_eq!(cell, "1234.5");
+                quantified += 1;
+            }
+        }
+        assert_eq!((quantified, empty), (1, 1));
     }
 }

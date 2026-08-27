@@ -38,6 +38,25 @@ pub struct RescoreParams<'a> {
     pub config_hash: &'a str,
 }
 
+/// Refuse a rescore whose population cannot support target-decoy FDR.
+///
+/// A one-sided population is not a hard rescore failure in any technical sense:
+/// the classifier would train and q-values would come out. They would simply be
+/// meaningless, because the estimator counts one class against the other. Failing
+/// here is the difference between an error and a plausible-looking result that
+/// nothing downstream can detect. The message names both counts, since which side
+/// is missing points at a different cause: no decoys usually means the library
+/// lost its decoy half, no targets means the labels are inverted.
+fn require_both_labels(n_targets: usize, n_decoys: usize) -> Result<()> {
+    if n_targets == 0 || n_decoys == 0 {
+        anyhow::bail!(
+            "rescore requires both target and decoy PSMs for valid FDR \
+             (targets={n_targets}, decoys={n_decoys})"
+        );
+    }
+    Ok(())
+}
+
 pub fn run(p: RescoreParams) -> Result<u64> {
     let t0 = Instant::now();
     if p.competed.is_empty() {
@@ -117,12 +136,7 @@ pub fn run(p: RescoreParams) -> Result<u64> {
     if n > 0 {
         let n_decoys = is_decoy.iter().filter(|&&v| v).count();
         let n_targets = n - n_decoys;
-        if n_targets == 0 || n_decoys == 0 {
-            anyhow::bail!(
-                "rescore requires both target and decoy PSMs for valid FDR \
-                 (targets={n_targets}, decoys={n_decoys})"
-            );
-        }
+        require_both_labels(n_targets, n_decoys)?;
         for (row, values) in feats.iter().enumerate() {
             if let Some((feature, value)) = values
                 .iter()
@@ -1084,6 +1098,19 @@ fn align_sidecar_scores(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_one_sided_population_is_refused_with_both_counts_named() {
+        assert!(require_both_labels(10, 5).is_ok());
+        for (t, d) in [(10usize, 0usize), (0, 10), (0, 0)] {
+            let err = require_both_labels(t, d).unwrap_err().to_string();
+            // Which side is missing points at a different cause, so both counts
+            // have to appear in the message.
+            assert!(err.contains(&format!("targets={t}")), "{err}");
+            assert!(err.contains(&format!("decoys={d}")), "{err}");
+            assert!(err.contains("valid FDR"), "{err}");
+        }
+    }
 
     #[test]
     fn competed_feature_schema_must_match_id_and_ordered_columns() {

@@ -239,11 +239,35 @@ fn run_worker(python: &str, script: &str, args: &[&str], utf8: bool) -> Result<(
     if utf8 {
         cmd.env("PYTHONUTF8", "1").env("PYTHONIOENCODING", "utf-8");
     }
+    // Output is INHERITED, not captured, on purpose: the NN rescorer prints
+    // per-iteration progress across hours and a user watching a run needs to see
+    // it live. The cost is that on failure the worker's traceback has already
+    // scrolled past, so the error has to say enough to act on: which interpreter,
+    // which script, and with what arguments. It previously said only
+    // "exited with status", which named neither the environment nor the call.
     let status = cmd
         .status()
         .with_context(|| format!("spawning {python} {script}"))?;
     if !status.success() {
-        bail!("worker {script} exited with {status}");
+        let argv = args
+            .iter()
+            .map(|a| {
+                if a.contains(' ') {
+                    format!("\"{a}\"")
+                } else {
+                    (*a).to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        bail!(
+            "sidecar worker failed: {script} exited with {status}.\n\
+             interpreter: {python}\n\
+             command: {python} {script} {argv}\n\
+             The worker's own output, including any Python traceback, is above this \
+             error. Reproduce it by running that command directly. \
+             `mumdia doctor --config <config>` checks the environment."
+        );
     }
     Ok(())
 }
