@@ -59,6 +59,26 @@ than a number. Both are recorded in every run's `manifest.json`.
   resolution order and the environment specs. These replace the only tracked
   config, which named one developer's interpreters and OneDrive path and was the
   config the documentation told everyone to run.
+- End-to-end smoke test, run in CI on Linux and Windows: `ci/smoke.sh` builds a
+  synthetic library from `test_data/fixture.fasta`, generates a matching mzML from
+  the engine's own library so the planted peaks cannot disagree with the mass
+  model, runs the pipeline twice and asserts 112 things. It covers mzML parsing,
+  the library build, the `run` orchestrator and its manifest, retention-time
+  calibration and the report writers, none of which had any test.
+- A further CI job asserts the two platforms produced byte-identical
+  `peptides.tsv` and `proteins.tsv`. The native pipeline turns out to be
+  byte-reproducible across operating systems, not only across runs.
+- `tests/python`: 71 tests over the Python worker contracts, run in CI. Tests
+  needing torch, mokapot, deeplc or ms2pip skip rather than fail.
+- `docs/23_cli_reference.md` and `docs/24_config_reference.md`, generated from
+  `--help` and from `config.rs` by `ci/gen_*_reference.py` and checked for
+  freshness in CI, so a new flag or field lands with its documentation. The second
+  includes the environment-variable table that existed nowhere: 47 variables read
+  across engine and sidecars, plus the 11 the code sets.
+- `bench/`: the portable part of the ProteoBench scoring path, the two recorded
+  results with their row units and q columns, and the measured resource profile of
+  a reference run (85 minutes and 13.1 GB of artifacts from a 1.94 GB mzML,
+  rescoring 80% of it).
 - `ci/check_doc_refs.py`, run in CI: fails when a tracked file cites a Markdown
   document the repository does not ship.
 - `CONTRIBUTING.md`, `SECURITY.md`, this changelog, and
@@ -112,6 +132,14 @@ produces bit-identical results.
 
 ### Fixed
 
+- The library helpers write parquet the engine can read on any pandas.
+  `DataFrame.to_parquet` chooses the arrow string width itself, and pandas 3
+  writes `large_string`, which the engine rejects at load with
+  `column 'peptidoform' is not utf8`. Every library built by
+  `import_diann_lib.py`, `make_shift_decoys.py`, `make_reverse_decoys.py` or
+  `augment_library.py` on a current pandas was therefore unreadable, breaking the
+  imported-library path. They now write through `scripts/_lib_io.py`. Found by the
+  new sidecar contract tests.
 - MBR transfers are now quantified. The augmented scored table lowered only
   `q_value`, while quantification gates on `quant.q_filter`, which the experiment
   path sets to `run_psm_q`. An accepted transfer therefore kept a sub-threshold
@@ -136,8 +164,11 @@ produces bit-identical results.
 
 ### Known limitations
 
-- The Python sidecars are not exercised by CI, and there is no checked-in fixture
-  or end-to-end smoke test. A passing test run is not sidecar validation.
+- The sidecar contract tests cover the workers' file contracts, not the science:
+  the tests that need torch, mokapot, DeepLC or MS2PIP skip on a runner without
+  them, so CI does not validate rescoring or retention-time prediction behaviour.
+- The end-to-end smoke test runs on Linux and Windows, not macOS, and uses the
+  native predictors only; no CI job exercises the sidecar path end to end.
 - A configuration names Python interpreters by absolute path, so it is not
   portable between machines without editing.
 - `run` processes a single mzML file. `run-experiment` does not call the report
