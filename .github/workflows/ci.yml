@@ -110,6 +110,14 @@ jobs:
         working-directory: rust/mumdia
         run: cargo build --release --locked --bin mumdia
 
+      # docs/23 is generated from `--help`, so it can only be checked where a
+      # binary exists. Running it on both matrix legs is also a free
+      # cross-platform check on the help text: the generator normalises the
+      # binary name, so a Windows and a Linux build must produce identical output.
+      - name: CLI reference is current
+        shell: bash
+        run: python ci/gen_cli_reference.py --check
+
       # bash on the Windows runner too, so one script covers both platforms.
       - name: Smoke test
         shell: bash
@@ -200,6 +208,12 @@ jobs:
               || { echo "invalid YAML: $f"; exit 1; }
             echo "ok $f"
           done
+
+      # docs/24 is generated from config.rs, so a new field or a changed default
+      # must land with its documentation or CI fails. A reference nobody
+      # regenerates is worse than none, because it reads as current.
+      - name: Config reference is current
+        run: python ci/gen_config_reference.py --check
 
       # Source comments cite the document that specifies each behavior. Several of
       # those documents are local-only design notes, so a public clone used to hold

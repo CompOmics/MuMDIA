@@ -613,6 +613,18 @@ Only measured quantities are stated here; no RAM figure is published yet.
   ProteoBench results with their row and q units, and how to reproduce them.
 - [`CHANGELOG.md`](CHANGELOG.md): what changed, in Keep a Changelog format.
 
+### Generated references
+
+Two documents are generated from the code and checked for freshness in CI, so
+they cannot drift from it:
+
+- [`docs/23_cli_reference.md`](docs/23_cli_reference.md): every subcommand's help,
+  the four global flags, and which subcommands accept `--config`.
+- [`docs/24_config_reference.md`](docs/24_config_reference.md): all 166
+  configuration fields with their types, defaults and gating status, the 21
+  enumerations, and every environment variable the engine and the sidecars read
+  or set.
+
 ## Citation
 
 A `CITATION.cff` and a Zenodo DOI are pending for the first tagged release. Until

@@ -95,12 +95,17 @@ FLOAT_TYPES = ("f32", "f64")
 # ---------------------------------------------------------------------------
 
 
+# A Rust char literal. A bare `'` that does not match this is a lifetime tick
+# (`&'static str`, `'a`), which must NOT open a literal: treating it as one
+# desynchronizes every quote and brace after it.
+CHAR_LIT = re.compile(r"'(?:[^'\\\n]|\\.)'")
+
+
 def strip_comments(line: str) -> str:
     """Remove a trailing `//` comment, respecting string and char literals."""
     out: list[str] = []
     i = 0
     in_str = False
-    in_chr = False
     while i < len(line):
         c = line[i]
         if in_str:
@@ -111,31 +116,30 @@ def strip_comments(line: str) -> str:
             if c == '"':
                 in_str = False
             out.append(c)
-        elif in_chr:
-            if c == "\\":
-                out.append(line[i : i + 2])
-                i += 2
+            i += 1
+            continue
+        if c == "/" and line[i : i + 2] == "//":
+            break
+        if c == '"':
+            in_str = True
+            out.append(c)
+            i += 1
+            continue
+        if c == "'":
+            m = CHAR_LIT.match(line, i)
+            if m:
+                out.append(m.group(0))
+                i = m.end()
                 continue
-            if c == "'":
-                in_chr = False
-            out.append(c)
-        else:
-            if c == "/" and line[i : i + 2] == "//":
-                break
-            if c == '"':
-                in_str = True
-            elif c == "'":
-                in_chr = True
-            out.append(c)
+        out.append(c)
         i += 1
     return "".join(out)
 
 
 def code_chars(text: str):
-    """Yield the characters of `text` that are outside string and char literals."""
+    """Yield `(index, char)` for the characters outside string and char literals."""
     i = 0
     in_str = False
-    in_chr = False
     while i < len(text):
         c = text[i]
         if in_str:
@@ -144,19 +148,24 @@ def code_chars(text: str):
                 continue
             if c == '"':
                 in_str = False
-        elif in_chr:
-            if c == "\\":
-                i += 2
-                continue
-            if c == "'":
-                in_chr = False
-        elif c == '"':
+            i += 1
+            continue
+        if c == '"':
             in_str = True
-        elif c == "'":
-            in_chr = True
-        else:
-            yield i, c
+            i += 1
+            continue
+        if c == "'":
+            m = CHAR_LIT.match(text, i)
+            if m:
+                i = m.end()
+                continue
+        yield i, c
         i += 1
+
+
+def decomment(text: str) -> str:
+    """Strip `//` comments line by line, keeping every line so numbers hold."""
+    return "\n".join(strip_comments(ln) for ln in text.split("\n"))
 
 
 def collect_block(lines: list[str], start: int) -> tuple[int, str]:
@@ -196,53 +205,23 @@ def match_brace(text: str, open_at: int) -> int | None:
 
 
 def split_top_level(text: str, sep: str = ",") -> list[str]:
-    """Split on `sep` at nesting depth zero, respecting quotes and brackets."""
+    """Split on `sep` at bracket depth zero, ignoring separators inside literals.
+
+    Angle brackets are deliberately NOT counted: a comparison operator would
+    unbalance them, and no expression this parser splits needs generic nesting.
+    """
     parts: list[str] = []
     depth = 0
-    buf: list[str] = []
-    i = 0
-    in_str = False
-    in_chr = False
-    while i < len(text):
-        c = text[i]
-        if in_str:
-            if c == "\\":
-                buf.append(text[i : i + 2])
-                i += 2
-                continue
-            if c == '"':
-                in_str = False
-            buf.append(c)
-        elif in_chr:
-            if c == "\\":
-                buf.append(text[i : i + 2])
-                i += 2
-                continue
-            if c == "'":
-                in_chr = False
-            buf.append(c)
-        else:
-            if c == '"':
-                in_str = True
-                buf.append(c)
-            elif c == "'":
-                in_chr = True
-                buf.append(c)
-            elif c in "([{<":
-                depth += 1
-                buf.append(c)
-            elif c in ")]}>":
-                depth -= 1
-                buf.append(c)
-            elif c == sep and depth == 0:
-                parts.append("".join(buf))
-                buf = []
-            else:
-                buf.append(c)
-        i += 1
-    tail = "".join(buf).strip()
-    if tail:
-        parts.append(tail)
+    last = 0
+    for idx, c in code_chars(text):
+        if c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth -= 1
+        elif c == sep and depth == 0:
+            parts.append(text[last:idx])
+            last = idx + 1
+    parts.append(text[last:])
     return [p.strip() for p in parts if p.strip()]
 
 
@@ -583,7 +562,7 @@ def type_default(rtype: str, enums: dict[str, Enum], structs: dict[str, Struct])
             return f"`{enums[t].serde_name(variant.name)}`"
         return None
     if t in structs:
-        return f"the `{t}` defaults below"
+        return f"the `{t}` section's own defaults"
     return None
 
 
@@ -686,18 +665,20 @@ def inner_types(rtype: str) -> list[str]:
 
 def walk_sections(
     structs: dict[str, Struct]
-) -> tuple[list[tuple[str, str, Struct]], list[tuple[str, Struct]]]:
+) -> tuple[list[tuple[str, str, Struct]], list[tuple[list[str], Struct]]]:
     """Depth-first walk from `Config`, returning (path, kind, struct) sections.
 
-    Declaration order is pipeline order, so it is preserved. A struct that is only
-    reachable inside a `Vec` is returned separately as an item struct.
+    Declaration order is pipeline order, so it is preserved. A struct reachable
+    only inside a `Vec` is returned separately as an item struct, together with
+    EVERY field path whose elements it types (`ResidueMod` types both
+    `fixed_mods` and `variable_mods`).
     """
     root = structs.get("Config")
     if root is None:
         sys.exit(f"error: no `pub struct Config` found in {CONFIG_RS_REL}")
     sections: list[tuple[str, str, Struct]] = [("", "section", root)]
-    items: list[tuple[str, Struct]] = []
-    seen_items: set[str] = set()
+    item_paths: dict[str, list[str]] = {}
+    item_structs: dict[str, Struct] = {}
 
     def visit(prefix: str, struct: Struct) -> None:
         for field in struct.fields:
@@ -707,20 +688,22 @@ def walk_sections(
                     continue
                 path = f"{prefix}.{field.name}" if prefix else field.name
                 if field.rtype.startswith("Vec<"):
-                    if tname not in seen_items:
-                        seen_items.add(tname)
-                        items.append((path, child))
+                    item_structs[tname] = child
+                    item_paths.setdefault(tname, []).append(path)
                 else:
                     sections.append((path, "section", child))
                     visit(path, child)
 
     visit("", root)
+    items = [
+        (item_paths[name], item_structs[name]) for name in sorted(item_structs)
+    ]
     return sections, items
 
 
 def reachable_enums(
     sections: list[tuple[str, str, Struct]],
-    items: list[tuple[str, Struct]],
+    items: list[tuple[list[str], Struct]],
     enums: dict[str, Enum],
 ) -> list[Enum]:
     used: set[str] = set()
@@ -757,13 +740,40 @@ def parse_profiles(text: str) -> dict[str, list[tuple[str, str]]]:
 # Environment variables
 # ---------------------------------------------------------------------------
 
-RUST_READ = re.compile(r"std::env::(var|var_os)\(\s*([^)]*?)\s*\)")
-RUST_SET = re.compile(r"std::env::set_var\(\s*([^,]+?)\s*,")
-RUST_CHILD_ENV = re.compile(r'\.env\(\s*"([A-Z0-9_]+)"\s*,\s*(.*?)\s*\)')
-RUST_FOR_LIST = re.compile(r"for\s+(?:\(\s*([a-z_]+)\s*,[^)]*\)|([a-z_]+))\s+in\s+\[")
+RUST_READ = re.compile(r"std::env::(?:var|var_os)\(")
+RUST_SET = re.compile(r"std::env::set_var\(")
+RUST_CHILD_ENV = re.compile(r"\.env\(")
+RUST_FOR_LIST = re.compile(
+    r"for\s+(?:\(\s*([a-z_]+)\s*,[^)]*\)|([a-z_]+))\s+in\s+\[", re.M
+)
 RUST_FN_STR = re.compile(r"fn\s+([a-z_][a-z0-9_]*)\s*\([^)]*\)\s*->\s*&'static str")
 RUST_ENV_CLOSURE = re.compile(r"let\s+mut\s+([a-z_][a-z0-9_]*)\s*=\s*\|\s*([a-z_]+)\s*:")
 ENV_NAME = re.compile(r"^[A-Z][A-Z0-9_]{2,}$")
+
+
+def call_arguments(text: str, open_paren: int) -> list[str] | None:
+    """Split the argument list of the call whose `(` is at `open_paren`."""
+    depth = 0
+    for idx, c in code_chars(text):
+        if idx < open_paren:
+            continue
+        if c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth -= 1
+            if depth == 0:
+                return split_top_level(text[open_paren + 1 : idx])
+    return None
+
+
+def find_calls(text: str, pattern: re.Pattern[str]) -> list[tuple[int, list[str]]]:
+    """Every match of `pattern` (which must end at a `(`) with its arguments."""
+    out: list[tuple[int, list[str]]] = []
+    for m in pattern.finditer(text):
+        args = call_arguments(text, m.end() - 1)
+        if args is not None:
+            out.append((m.start(), args))
+    return out
 
 PY_GET = re.compile(
     r"os\.(?:environ\.get|getenv)\(\s*\"([A-Z0-9_]+)\"\s*(?:,\s*(.*?)\s*)?\)"
@@ -777,93 +787,168 @@ PY_ENV_FN = re.compile(
 
 
 class EnvVar:
+    """One variable, with every distinct default the code shows for it.
+
+    Two workers can disagree: `MUMDIA_NN_HIDDEN` falls back to `128,64,64,32` in
+    `mokapot_worker.py` and `128,64` in `nn_rescore_worker.py`. Collapsing that to
+    one value would be wrong, so every distinct fallback is kept with its site.
+    """
+
     def __init__(self, name: str):
         self.name = name
-        self.default: str | None = None
+        self.defaults: dict[str, set[str]] = {}
         self.sites: set[str] = set()
 
-    def note_default(self, value: str | None) -> None:
+    def note_default(self, value: str | None, site: str) -> None:
         if value is None:
             return
         value = " ".join(value.split()).strip().rstrip(",")
-        if value and (self.default is None or len(value) < len(self.default)):
-            self.default = value
+        if value:
+            self.defaults.setdefault(value, set()).add(site)
+
+    def render_default(self) -> str:
+        if not self.defaults:
+            return "none (unset means off)"
+        if len(self.defaults) == 1:
+            return f"`{md_cell(next(iter(self.defaults)))}`"
+        parts = []
+        for value in sorted(self.defaults):
+            where = sorted(
+                {Path(s.split(":")[0]).name for s in self.defaults[value]}
+            )
+            parts.append(f"`{md_cell(value)}` in {', '.join(where)}")
+        return "; ".join(parts)
 
 
 def add(store: dict[str, EnvVar], name: str, default: str | None, site: str) -> None:
     if not ENV_NAME.match(name):
         return
     var = store.setdefault(name, EnvVar(name))
-    var.note_default(default)
+    var.note_default(default, site)
     var.sites.add(site)
 
 
-def scan_rust_env(paths: list[Path]) -> tuple[dict[str, EnvVar], dict[str, EnvVar], list[str]]:
+def scan_rust_env(
+    paths: list[Path],
+) -> tuple[dict[str, EnvVar], dict[str, EnvVar], list[str]]:
+    """Collect engine-side environment reads, sets, and child-process injections.
+
+    Three indirections in the tree have to be followed or the table would be
+    wrong rather than merely incomplete:
+
+    - `for var in ["A", "B"] { env::var_os(var) }`: the names are in the loop
+      list. Resolved only for reads INSIDE that loop's own line range, since the
+      same identifier is a closure parameter elsewhere in the same file.
+    - `push_env(role.env_var())`: `push_env` is a closure that reads env from its
+      parameter, so the read is resolved at each call site instead.
+    - `role.env_var()`: a `-> &'static str` helper whose body is a match over
+      variable-name literals. Its body is brace-matched and harvested.
+
+    Anything that resolves to no literal is returned as unresolved and printed in
+    the document, never dropped.
+    """
     reads: dict[str, EnvVar] = {}
     sets: dict[str, EnvVar] = {}
     unresolved: list[str] = []
     for path in paths:
-        text = path.read_text(encoding="utf-8", errors="replace")
-        lines = text.split("\n")
+        # Comments are stripped line by line, so `//` prose cannot contribute a
+        # stray quote (an apostrophe in "engine's") and line numbers still hold.
+        text = decomment(path.read_text(encoding="utf-8", errors="replace"))
         rel = path.relative_to(REPO_ROOT).as_posix()
-        # Names a helper `fn ... -> &'static str` can return, and the loop lists
-        # or closures an indirect read resolves through.
+        lines = text.split("\n")
+
+        def line_of(offset: int) -> int:
+            return text.count("\n", 0, offset) + 1
+
+        # `fn name(..) -> &'static str` bodies, harvested for variable-name literals.
         fn_literals: dict[str, list[str]] = {}
         for m in RUST_FN_STR.finditer(text):
-            block = text[m.end() : m.end() + 800]
-            fn_literals[m.group(1)] = [
-                s for s in re.findall(r'"([A-Z0-9_]+)"', block) if ENV_NAME.match(s)
-            ]
-        env_closures = {m.group(1): m.group(2) for m in RUST_ENV_CLOSURE.finditer(text)}
-        loop_vars: dict[str, list[str]] = {}
-        for m in RUST_FOR_LIST.finditer(text):
-            var = m.group(1) or m.group(2)
-            block = text[m.end() : text.find("]", m.end())]
-            loop_vars.setdefault(var, []).extend(
-                s for s in re.findall(r'"([A-Z0-9_]+)"', block) if ENV_NAME.match(s)
+            open_at = text.find("{", m.end())
+            close_at = match_brace(text, open_at) if open_at != -1 else None
+            body = text[open_at:close_at] if close_at else ""
+            fn_literals[m.group(1)] = sorted(
+                {s for s in re.findall(r'"([A-Z0-9_]+)"', body) if ENV_NAME.match(s)}
             )
 
-        def resolve(arg: str) -> list[str] | None:
+        # Closures that read env from a parameter: resolved at their call sites.
+        env_closures = {m.group(1): m.group(2) for m in RUST_ENV_CLOSURE.finditer(text)}
+        closure_params = set(env_closures.values())
+
+        # `for <var> in [ "A", "B" ] { ... }` scopes, with their line range.
+        loop_scopes: list[tuple[str, list[str], int, int]] = []
+        for m in RUST_FOR_LIST.finditer(text):
+            var = m.group(1) or m.group(2)
+            end_bracket = text.find("]", m.end())
+            names = [
+                s
+                for s in re.findall(r'"([A-Z0-9_]+)"', text[m.end() : end_bracket])
+                if ENV_NAME.match(s)
+            ]
+            open_at = text.find("{", end_bracket)
+            close_at = match_brace(text, open_at) if open_at != -1 else None
+            loop_scopes.append(
+                (
+                    var,
+                    names,
+                    line_of(m.start()),
+                    line_of(close_at) if close_at else len(lines),
+                )
+            )
+
+        def resolve(arg: str, at_line: int) -> list[str] | None:
             arg = arg.strip()
             m = re.fullmatch(r'"([A-Z0-9_]+)"', arg)
             if m:
                 return [m.group(1)]
-            if arg in loop_vars:
-                return loop_vars[arg]
+            for var, names, start, end in loop_scopes:
+                if var == arg and start <= at_line <= end and names:
+                    return names
             m = re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*\.([a-z_]+)\(\)", arg)
-            if m and m.group(1) in fn_literals:
+            if m and fn_literals.get(m.group(1)):
                 return fn_literals[m.group(1)]
-            m = re.fullmatch(r"([a-z_][a-z0-9_]*)", arg)
-            if m and m.group(1) in fn_literals:
-                return fn_literals[m.group(1)]
+            if re.fullmatch(r"[a-z_][a-z0-9_]*", arg) and fn_literals.get(arg):
+                return fn_literals[arg]
             return None
 
-        for i, line in enumerate(lines, 1):
-            site = f"{rel}:{i}"
-            for m in RUST_READ.finditer(line):
-                names = resolve(m.group(2))
-                if names is None:
-                    unresolved.append(f"{site}: env read of `{m.group(2).strip()}`")
+        def record(
+            store: dict[str, EnvVar],
+            args: list[str],
+            offset: int,
+            kind: str,
+            value_index: int | None = None,
+        ) -> None:
+            at_line = line_of(offset)
+            site = f"{rel}:{at_line}"
+            arg = args[0] if args else ""
+            names = resolve(arg, at_line)
+            if names is None:
+                if arg.strip() in closure_params:
+                    # Read through a closure parameter: covered at the call sites.
+                    # Checked only AFTER resolution, because the same identifier is
+                    # a loop variable elsewhere in `python.rs` and that read is real.
+                    return
+                unresolved.append(f"{site}: env {kind} of `{arg.strip()}`")
+                return
+            value = (
+                args[value_index]
+                if value_index is not None and len(args) > value_index
+                else None
+            )
+            for name in names:
+                add(store, name, value, site)
+
+        for offset, args in find_calls(text, RUST_READ):
+            record(reads, args, offset, "read")
+        for offset, args in find_calls(text, RUST_SET):
+            record(sets, args, offset, "set", value_index=1)
+        for offset, args in find_calls(text, RUST_CHILD_ENV):
+            record(sets, args, offset, "child-process set", value_index=1)
+        for name, param in env_closures.items():
+            call_re = re.compile(rf"(?<![\w.]){re.escape(name)}\(")
+            for offset, args in find_calls(text, call_re):
+                if args and args[0].strip() == param:
                     continue
-                for name in names:
-                    add(reads, name, None, site)
-            for m in RUST_SET.finditer(line):
-                names = resolve(m.group(1))
-                if names is None:
-                    unresolved.append(f"{site}: env set of `{m.group(1).strip()}`")
-                    continue
-                for name in names:
-                    add(sets, name, None, site)
-            for m in RUST_CHILD_ENV.finditer(line):
-                add(sets, m.group(1), m.group(2), site)
-            for name, param in env_closures.items():
-                for m in re.finditer(rf"(?<![\w.]){re.escape(name)}\(\s*([^)]*?)\s*\)", line):
-                    if m.group(1).strip() == param:
-                        continue
-                    resolved = resolve(m.group(1))
-                    if resolved:
-                        for n in resolved:
-                            add(reads, n, None, site)
+                record(reads, args, offset, "read via closure")
     return reads, sets, unresolved
 
 
@@ -907,41 +992,58 @@ def scan_python_env(paths: list[Path]) -> tuple[dict[str, EnvVar], dict[str, Env
 # ---------------------------------------------------------------------------
 
 
+def gh_anchor(heading: str) -> str:
+    """GitHub's heading anchor: lowercase, punctuation dropped, spaces hyphenated."""
+    s = re.sub(r"[^a-z0-9 _-]", "", heading.strip().lower())
+    return s.replace(" ", "-")
+
+
+def item_heading(paths: list[str]) -> str:
+    """Heading for a `Vec` element struct, naming every list it types."""
+    return " / ".join(f"{p}[]" for p in paths)
+
+
 def field_rows(
     struct: Struct,
     path: str,
     enums: dict[str, Enum],
     structs: dict[str, Struct],
     unresolved: list[str],
+    no_default: list[str],
+    undocumented: list[str],
 ) -> list[str]:
     rows = ["| Field | Type | Default | Gated | Description |", "|---|---|---|---|---|"]
     for field in struct.fields:
         rendered = None
         if field.default_expr is not None:
             rendered = render_default(field.default_expr, field.rtype, enums, structs)
-        elif struct.has_default_impl:
-            rendered = None
         field.default_rendered = rendered
+        key = f"{path}.{field.name}" if path else field.name
         if rendered is None:
-            key = f"{path}.{field.name}" if path else field.name
-            reason = (
-                "no `impl Default` for the owning struct"
-                if not struct.has_default_impl
-                else (
+            if not struct.has_default_impl:
+                no_default.append(f"`{key}` (`{field.rtype}`)")
+                shown = "none: must be set"
+            else:
+                reason = (
                     f"unresolved expression `{md_cell(field.default_expr)}`"
                     if field.default_expr
                     else "not assigned in the `impl Default` block"
                 )
-            )
-            unresolved.append(f"`{key}` ({field.rtype}): {reason}")
-            shown = "unresolved"
+                unresolved.append(f"`{key}` (`{field.rtype}`): {reason}")
+                shown = "unresolved"
+        elif "`" in rendered:
+            # Already carries its own code span (an enum value, or prose naming a
+            # struct); wrapping it again would nest backticks.
+            shown = rendered
         else:
-            shown = rendered if rendered.startswith("`") else f"`{rendered}`"
+            shown = f"`{rendered}`"
         markers = gate_markers(field.doc)
         gate = ", ".join(markers) if markers else ""
-        doc = md_cell(field.doc) if field.doc else ""
+        if not field.doc:
+            undocumented.append(f"`{key}`")
         rows.append(
-            f"| `{field.name}` | `{md_cell(field.rtype)}` | {shown} | {gate} | {doc} |"
+            f"| `{field.name}` | `{md_cell(field.rtype)}` | {shown} | {gate} | "
+            f"{md_cell(field.doc)} |"
         )
     return rows
 
@@ -956,6 +1058,9 @@ def build_document() -> tuple[str, dict[str, object]]:
     for path, target in STAGE_DOC.items():
         if not (REPO_ROOT / target).is_file():
             sys.exit(f"error: STAGE_DOC['{path}'] points at missing {target}")
+    for name, target in ITEM_STRUCT_DOC.items():
+        if not (REPO_ROOT / target).is_file():
+            sys.exit(f"error: ITEM_STRUCT_DOC['{name}'] points at missing {target}")
 
     rust_files = sorted(
         p for p in CRATES_DIR.rglob("*.rs") if "target" not in p.parts
@@ -964,7 +1069,17 @@ def build_document() -> tuple[str, dict[str, object]]:
     rust_reads, rust_sets, env_unresolved = scan_rust_env(rust_files)
     py_reads, py_sets = scan_python_env(py_files)
 
+    # Field type by JSON path, so a profile override can be rendered as the value a
+    # config file would carry rather than as the Rust expression.
+    field_types = {
+        (f"{path}.{field.name}" if path else field.name): field.rtype
+        for path, _kind, struct in sections
+        for field in struct.fields
+    }
+
     unresolved: list[str] = []
+    no_default: list[str] = []
+    undocumented: list[str] = []
     out: list[str] = []
     a = out.append
 
@@ -1014,7 +1129,9 @@ def build_document() -> tuple[str, dict[str, object]]:
     a("  paragraph. Nothing is paraphrased.")
     a("")
     a("Enum-valued fields show their default as the serde spelling; the accepted")
-    a("values of every enum are in \"Enumerations\" at the end.")
+    a("values of every enum are in \"Enumerations\" at the end. An empty description")
+    a("means the field carries no doc comment in the source, not that it is")
+    a("undocumented on purpose; those fields are counted under \"Coverage\".")
     a("")
 
     # ---- section index -----------------------------------------------------
@@ -1023,14 +1140,20 @@ def build_document() -> tuple[str, dict[str, object]]:
     a("| Section | Struct | Fields | Stage document |")
     a("|---|---|---|---|")
     for path, _kind, struct in sections:
-        label = "(top level)" if path == "" else f"`{path}`"
+        heading = "(top level)" if path == "" else path
+        label = f"[{'(top level)' if path == '' else '`' + path + '`'}]"
+        label += f"(#{gh_anchor(heading)})"
         doc_ref = STAGE_DOC.get(path, "")
         ref = f"[{doc_ref}]({Path(doc_ref).name})" if doc_ref else ""
         a(f"| {label} | `{struct.name}` | {len(struct.fields)} | {ref} |")
-    for path, struct in items:
+    for paths, struct in items:
+        heading = item_heading(paths)
         ref_target = ITEM_STRUCT_DOC.get(struct.name, "")
         ref = f"[{ref_target}]({Path(ref_target).name})" if ref_target else ""
-        a(f"| `{path}[]` | `{struct.name}` | {len(struct.fields)} | {ref} |")
+        a(
+            f"| [`{heading}`](#{gh_anchor(heading)}) | `{struct.name}` | "
+            f"{len(struct.fields)} | {ref} |"
+        )
     a("")
 
     # ---- per-section tables ------------------------------------------------
@@ -1050,11 +1173,18 @@ def build_document() -> tuple[str, dict[str, object]]:
         if not struct.has_default_impl:
             a(f"`{struct.name}` has no `impl Default` block in the source.")
             a("")
-        a("\n".join(field_rows(struct, path, enums, structs, unresolved)))
+        a(
+            "\n".join(
+                field_rows(
+                    struct, path, enums, structs, unresolved, no_default, undocumented
+                )
+            )
+        )
         a("")
 
-    for path, struct in items:
-        a(f"## {path}[]")
+    for paths, struct in items:
+        heading = item_heading(paths)
+        a(f"## {heading}")
         a("")
         meta = [f"`{struct.name}` ({CONFIG_RS_REL}:{struct.line})"]
         ref_target = ITEM_STRUCT_DOC.get(struct.name)
@@ -1063,8 +1193,10 @@ def build_document() -> tuple[str, dict[str, object]]:
         a(". ".join(meta) + ".")
         a("")
         a(
-            f"Element type of `{path}`. Each element is a JSON object with these keys; "
-            "the list default is on the owning field."
+            "Element type of "
+            + " and ".join(f"`{p}`" for p in paths)
+            + ". Each element is a JSON object with these keys; the list default is"
+            " on the owning field."
         )
         a("")
         if struct.doc:
@@ -1072,11 +1204,23 @@ def build_document() -> tuple[str, dict[str, object]]:
             a("")
         if not struct.has_default_impl:
             a(
-                f"`{struct.name}` has no `impl Default` block: an element must set "
+                f"`{struct.name}` has no `impl Default` block, so an element must set "
                 "every key."
             )
             a("")
-        a("\n".join(field_rows(struct, f"{path}[]", enums, structs, unresolved)))
+        a(
+            "\n".join(
+                field_rows(
+                    struct,
+                    paths[0] + "[]",
+                    enums,
+                    structs,
+                    unresolved,
+                    no_default,
+                    undocumented,
+                )
+            )
+        )
         a("")
 
     # ---- profiles ----------------------------------------------------------
@@ -1089,8 +1233,14 @@ def build_document() -> tuple[str, dict[str, object]]:
         a("| Profile | Overrides |")
         a("|---|---|")
         for name in sorted(profiles):
-            overrides = "; ".join(f"`{k}` = `{v}`" for k, v in profiles[name])
-            a(f"| `{name}` | {md_cell(overrides)} |")
+            parts = []
+            for key, value in profiles[name]:
+                rtype = field_types.get(key, "")
+                shown = render_default(value, rtype, enums, structs) or value
+                if "`" not in shown:
+                    shown = f"`{shown}`"
+                parts.append(f"`{key}` = {shown}")
+            a(f"| `{name}` | {md_cell('; '.join(parts))} |")
         a("")
         a("A profile is applied after the config file is parsed, so it wins over a")
         a("value the config file set for the same field.")
@@ -1147,29 +1297,35 @@ def build_document() -> tuple[str, dict[str, object]]:
     a("and which therefore inherits the engine's environment. A variable read on")
     a("both sides is marked **both**.")
     a("")
+    a("`Default in code` is the fallback the reading code supplies when the variable")
+    a("is unset. Two workers can disagree, in which case every distinct fallback is")
+    a("listed with the file it is in.")
+    a("")
+    injected = sorted(set(py_reads) & set(rust_sets))
+    if injected:
+        a(
+            f"{len(injected)} of these are also SET by the engine before the worker "
+            "starts, so the worker's own fallback applies only when the engine did not "
+            "set it: " + ", ".join(f"`{n}`" for n in injected) + ". See the next table."
+        )
+        a("")
     a("| Variable | Side | Default in code | Read at |")
     a("|---|---|---|---|")
     for name in all_read:
         in_rust = name in rust_reads
         in_py = name in py_reads
         side = "both" if in_rust and in_py else ("engine" if in_rust else "sidecar")
-        default = None
-        for store in (py_reads, rust_reads):
-            if name in store and store[name].default:
-                default = store[name].default
-                break
-        sites = sorted(
-            (rust_reads[name].sites if in_rust else set())
-            | (py_reads[name].sites if in_py else set())
-        )
+        merged = EnvVar(name)
+        for store in (rust_reads, py_reads):
+            if name in store:
+                for value, sites in store[name].defaults.items():
+                    merged.defaults.setdefault(value, set()).update(sites)
+                merged.sites |= store[name].sites
+        sites = sorted(merged.sites)
         shown_sites = ", ".join(f"`{s}`" for s in sites[:3])
         if len(sites) > 3:
             shown_sites += f", +{len(sites) - 3} more"
-        a(
-            f"| `{name}` | {side} | "
-            f"{('`' + default + '`') if default else 'none (unset means off)'} | "
-            f"{shown_sites} |"
-        )
+        a(f"| `{name}` | {side} | {merged.render_default()} | {shown_sites} |")
     a("")
     a(
         f"{len(all_read)} variables are read: "
@@ -1190,18 +1346,18 @@ def build_document() -> tuple[str, dict[str, object]]:
     a("|---|---|---|---|")
     for name in all_set:
         in_rust = name in rust_sets
-        setter = "engine" if in_rust and name not in py_sets else (
-            "sidecar" if not in_rust else "both"
-        )
-        store = rust_sets if in_rust else py_sets
-        value = store[name].default or ""
-        sites = sorted(
-            (rust_sets[name].sites if in_rust else set())
-            | (py_sets[name].sites if name in py_sets else set())
-        )
+        in_py = name in py_sets
+        setter = "both" if in_rust and in_py else ("engine" if in_rust else "sidecar")
+        merged = EnvVar(name)
+        for store in (rust_sets, py_sets):
+            if name in store:
+                for value, sites in store[name].defaults.items():
+                    merged.defaults.setdefault(value, set()).update(sites)
+                merged.sites |= store[name].sites
+        sites = sorted(merged.sites)
+        value_cell = merged.render_default() if merged.defaults else ""
         a(
-            f"| `{name}` | {setter} | "
-            f"{('`' + md_cell(value) + '`') if value else ''} | "
+            f"| `{name}` | {setter} | {value_cell} | "
             f"{', '.join(f'`{s}`' for s in sites[:3])} |"
         )
     a("")
@@ -1213,13 +1369,23 @@ def build_document() -> tuple[str, dict[str, object]]:
     a("instead of looking like an absent field.")
     a("")
     if unresolved:
-        a(f"{len(unresolved)} field default(s) could not be resolved:")
+        a(f"{len(set(unresolved))} field default(s) could not be resolved:")
         a("")
         for entry in sorted(set(unresolved)):
             a(f"- {entry}")
     else:
-        a("Every field's default resolved from the source.")
+        a("Every field whose struct has an `impl Default` resolved from the source.")
     a("")
+    if no_default:
+        a(
+            f"{len(set(no_default))} field(s) have no default because the owning struct "
+            "has no `impl Default`. That is the source's intent, not a parsing gap: a "
+            "list element must carry every key."
+        )
+        a("")
+        for entry in sorted(set(no_default)):
+            a(f"- {entry}")
+        a("")
     if warnings:
         a(f"{len(warnings)} structural warning(s) while parsing the config source:")
         a("")
@@ -1238,14 +1404,26 @@ def build_document() -> tuple[str, dict[str, object]]:
         len(s.fields) for _, s in items
     )
     n_structs = len(sections) + len(items)
+    n_gated = sum(
+        1
+        for s in [st for _, _, st in sections] + [st for _, st in items]
+        for f in s.fields
+        if gate_markers(f.doc)
+    )
     a("## Coverage")
     a("")
     a(
         f"{n_structs} structs and {n_fields} fields emitted from "
         f"`{CONFIG_RS_REL}`, plus {len(section_enums)} enumerations, "
         f"{len(profiles)} named profile(s), {len(all_read)} environment variables "
-        f"read and {len(all_set)} set. "
-        f"{len(set(unresolved))} default(s) unresolved."
+        f"read and {len(all_set)} set."
+    )
+    a("")
+    a(
+        f"{n_gated} field(s) carry a gating marker in their doc comment. "
+        f"{len(set(undocumented))} field(s) carry no doc comment at all, so their "
+        f"description is empty above. {len(set(unresolved))} default(s) could not be "
+        f"resolved and {len(set(no_default))} have none by design."
     )
 
     while out and not out[-1]:
