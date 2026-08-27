@@ -22,6 +22,10 @@ Usage: python make_reverse_decoys.py <in_prec> <in_frag> <out_prec> <out_frag>
 import sys, re
 import numpy as np
 import pandas as pd
+# The engine rejects `large_string` parquet columns ("column 'peptidoform' is not
+# utf8"), and `to_parquet` picks the width itself: pandas 3.x chooses the large
+# variant, so this helper silently emitted libraries the engine would not load.
+from _lib_io import write_engine_parquet
 
 RES = {
     'G':57.021463735,'A':71.037113805,'S':87.032028435,'P':97.052763875,'V':99.068413945,
@@ -170,7 +174,7 @@ def main():
     paired={stripped(tgt_toks[cid]): stripped(rev[cid]) for cid in keep}
     assert len(set(paired.values())) == len(paired), "distinct targets share a decoy sequence"
 
-    allp.to_parquet(outp,index=False); allf.to_parquet(outf,index=False)
+    write_engine_parquet(allp, outp); write_engine_parquet(allf, outf)
     print(f"targets_in={len(tprec)} targets_out={len(tprec_out)} decoys={len(dprec)} total_prec={len(allp)} total_frag={len(allf)}",flush=True)
 
 if __name__=='__main__':

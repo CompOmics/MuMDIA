@@ -13,6 +13,10 @@ Usage: python make_shift_decoys.py <in_precursors> <in_fragments> <out_precursor
 import sys
 import numpy as np
 import pandas as pd
+# The engine rejects `large_string` parquet columns ("column 'peptidoform' is not
+# utf8"), and `to_parquet` picks the width itself: pandas 3.x chooses the large
+# variant, so this helper silently emitted libraries the engine would not load.
+from _lib_io import write_engine_parquet
 
 DELTA = 14.015650  # CH2, neutral-mass shift
 
@@ -65,8 +69,8 @@ def main():
     allf["ordinal"] = allf["ordinal"].astype(np.int32)
     allf["frag_charge"] = allf["frag_charge"].astype(np.int32)
 
-    allp.to_parquet(outp, index=False)
-    allf.to_parquet(outf, index=False)
+    write_engine_parquet(allp, outp)
+    write_engine_parquet(allf, outf)
     print(f"targets={len(tprec)} decoys={len(dprec)} total_prec={len(allp)} total_frag={len(allf)}")
 
 

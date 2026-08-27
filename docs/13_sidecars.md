@@ -1,4 +1,4 @@
-# Python sidecars (the 11 scripts) + conda envs
+# Python sidecars (11 scripts + one shared writer) + conda envs
 > Part of the MuMDIA developer documentation (see docs/README.md).
 
 ## Purpose
