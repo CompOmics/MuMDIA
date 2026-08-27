@@ -1,0 +1,41 @@
+# Dependency updates. Cargo.lock is tracked and both CI and the Docker build use
+# `--locked`, so a dependency only moves when a pull request moves it here.
+#
+# Grouped, monthly, and capped on purpose: the dependency surface is small (arrow,
+# parquet, mzdata, clap, serde, rayon and a handful of leaves) and an unreviewed
+# arrow or parquet bump can change artifact encoding, which is a data-format change
+# rather than a routine upgrade. Every bump still has to pass the full CI gate.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /rust/mumdia
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 5
+    groups:
+      # The Arrow/Parquet pair must move together: they share a version line, and
+      # the engine's on-disk contract (snappy, utf8, list columns) rides on them.
+      arrow-parquet:
+        patterns:
+          - arrow*
+          - parquet*
+      # Everything else, batched so review is one pull request rather than ten.
+      rust-minor-and-patch:
+        patterns:
+          - "*"
+        exclude-patterns:
+          - arrow*
+          - parquet*
+        update-types:
+          - minor
+          - patch
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 3
+    groups:
+      actions:
+        patterns:
+          - "*"

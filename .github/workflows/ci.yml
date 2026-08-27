@@ -10,6 +10,38 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # The gate CLAUDE.md states, which CI did not previously enforce: formatting and
+  # clippy were a local responsibility, so `main` could carry a tree that failed
+  # them. One Linux runner is enough; neither check is platform-dependent.
+  lint:
+    name: fmt + clippy
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: rust/mumdia
+    steps:
+      - uses: actions/checkout@v4
+
+      # rust-toolchain.toml (in rust/mumdia) pins the exact toolchain and requests
+      # the rustfmt and clippy components; rustup installs them on first use.
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/mumdia/target
+          key: ${{ runner.os }}-cargo-lint-${{ hashFiles('rust/mumdia/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-lint-
+
+      - name: Format
+        run: cargo fmt --check
+
+      # --all-targets so tests and benches are linted too: dead code reachable only
+      # from a test module still fails the build under -D warnings.
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
   build-test:
     name: build + test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -23,8 +55,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # rust-toolchain.toml (in rust/mumdia) pins the exact toolchain; rustup
-      # installs it automatically on first cargo invocation.
       - name: Cache cargo
         uses: actions/cache@v4
         with:
@@ -38,5 +68,55 @@ jobs:
       - name: Build (release)
         run: cargo build --release --locked
 
+      # --workspace is explicit: the release binary is only one member, and the
+      # config and IO contracts live in the other two.
       - name: Test
-        run: cargo test --locked
+        run: cargo test --workspace --locked
+
+  sidecars:
+    name: python sidecars + configs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # The Python workers are invoked over a positional-file contract and are not
+      # exercised by the Rust suite, so a syntax error in one of them surfaces only
+      # mid-run, hours in. This is the cheap floor, not sidecar validation: real
+      # DeepLC, mokapot, nn_torch and MBR behavior is still untested in CI.
+      - name: Compile sidecars
+        run: python -m compileall -q scripts ci
+
+      # A config is an artifact the engine must accept. `Config` is
+      # deny_unknown_fields, so the Rust test `shipped_configs_parse` is the real
+      # check; this one catches plain JSON syntax errors in any tracked config,
+      # including ones that test does not list.
+      - name: Parse tracked JSON
+        run: |
+          set -euo pipefail
+          for f in $(git ls-files '*.json'); do
+            python -c "import json,sys; json.load(open(sys.argv[1]))" "$f" \
+              || { echo "invalid JSON: $f"; exit 1; }
+            echo "ok $f"
+          done
+
+      # The conda specs are the only installation instructions for the sidecars;
+      # a malformed one fails the Docker build rather than CI.
+      - name: Parse env specs
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet pyyaml
+          for f in $(git ls-files 'env/*.yml' 'docker/*.yml'); do
+            python -c "import yaml,sys; yaml.safe_load(open(sys.argv[1]))" "$f" \
+              || { echo "invalid YAML: $f"; exit 1; }
+            echo "ok $f"
+          done
+
+      # Source comments cite the document that specifies each behavior. Several of
+      # those documents are local-only design notes, so a public clone used to hold
+      # ~141 references to files it does not ship.
+      - name: Check documentation references
+        run: python ci/check_doc_refs.py
