@@ -1078,6 +1078,45 @@ pub struct QuantConfig {
     /// peak wings. Off by default (identity on a clean peak). Opt-in and
     /// benchmark-gated: it changes reported quantities.
     pub interference_envelope: bool,
+    /// Which fragments enter the top-N sum. `observed_area` (default, legacy) ranks
+    /// by the integrated area itself, which preferentially selects interfered
+    /// fragments (their areas are inflated) and so varies run to run.
+    /// `predicted` ranks by the library (predicted or empirical) fragment intensity,
+    /// a per-precursor constant, so every run sums the same fragments. Astral HYE
+    /// 2026-08-26: CV 0.163 -> 0.112 on 6/6 ions at top-3. Benchmark-gated.
+    pub fragment_selection: FragmentSelection,
+    /// When > 0, integrate each fragment over the `2k+1` scans centred on the
+    /// identification apex instead of the descent-walk window (`bound_peak`
+    /// window ignored; falls back to it when the apex is unknown). A fixed narrow
+    /// window is far less sensitive to interference in the peak wings than the
+    /// walked bounds. 0 (default) = off.
+    pub fixed_scan_halfwidth: usize,
+    /// Subtract a per-fragment local background before integrating (fixed-scan
+    /// window only). The background is the `baseline_quantile` quantile of the
+    /// intensities in the two flanks (`baseline_flank_scans` samples on each side
+    /// of the integration window); window intensities are clipped at zero after
+    /// subtraction. Targets the additive floor that compresses ratios in the
+    /// low-abundance condition. Off by default; benchmark-gated.
+    pub baseline_subtract: bool,
+    /// Flank length (samples per side) used to estimate the background.
+    pub baseline_flank_scans: usize,
+    /// Quantile of the flank intensities taken as the background level.
+    pub baseline_quantile: f64,
+    /// When > 0, integrate each fragment over the samples within `fixed_window_s`
+    /// seconds of the identification apex (instrument-independent alternative to
+    /// `fixed_scan_halfwidth`, which it overrides). 0 (default) = off.
+    pub fixed_window_s: f64,
+}
+
+/// Fragment ranking for the quant top-N sum. See [`QuantConfig::fragment_selection`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum FragmentSelection {
+    /// Rank fragments by their own integrated area (legacy).
+    #[default]
+    ObservedArea,
+    /// Rank fragments by library intensity (`predicted_intensity` in the chromatogram table).
+    Predicted,
 }
 impl Default for QuantConfig {
     fn default() -> Self {
@@ -1093,6 +1132,12 @@ impl Default for QuantConfig {
             reliable_q: 0.001,
             q_filter: QuantQColumn::PeptideQ,
             interference_envelope: false, // apex-outward interference envelope off by default
+            fragment_selection: FragmentSelection::ObservedArea,
+            fixed_scan_halfwidth: 0,
+            baseline_subtract: false,
+            baseline_flank_scans: 12,
+            baseline_quantile: 0.25,
+            fixed_window_s: 0.0,
         }
     }
 }
@@ -1415,6 +1460,20 @@ impl Config {
                     .into(),
             ));
         }
+        if !self.quant.fixed_window_s.is_finite() || self.quant.fixed_window_s < 0.0 {
+            return Err(Invalid(
+                "quant.fixed_window_s must be finite and >= 0 (0 disables the fixed \
+                 integration window)."
+                    .into(),
+            ));
+        }
+        if !self.quant.baseline_quantile.is_finite()
+            || !(0.0..=1.0).contains(&self.quant.baseline_quantile)
+        {
+            return Err(Invalid(
+                "quant.baseline_quantile must be finite and in [0, 1].".into(),
+            ));
+        }
         if self.rescore.folds < 2 {
             return Err(Invalid(
                 "rescore.folds must be >= 2 so every PSM can receive an \
@@ -1494,6 +1553,24 @@ impl Config {
                 );
             }
         }
+        if self.quant.fixed_window_s > 0.0 && self.quant.fixed_scan_halfwidth > 0 {
+            tracing::warn!(
+                fixed_window_s = self.quant.fixed_window_s,
+                fixed_scan_halfwidth = self.quant.fixed_scan_halfwidth,
+                "quant: both fixed-window forms are set; the seconds form wins and \
+                 fixed_scan_halfwidth is ignored"
+            );
+        }
+        if self.quant.baseline_subtract
+            && self.quant.fixed_scan_halfwidth == 0
+            && self.quant.fixed_window_s == 0.0
+        {
+            tracing::warn!(
+                "quant.baseline_subtract applies only to the fixed-window integration, \
+                 which is off (fixed_scan_halfwidth = 0 and fixed_window_s = 0), so no \
+                 baseline is subtracted"
+            );
+        }
         Ok(())
     }
 
@@ -1528,6 +1605,42 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quant_fixed_window_fields_round_trip_and_are_validated() {
+        let c = Config::from_json(
+            r#"{"quant":{"fragment_selection":"predicted","top_n_fragments":12,
+                 "fixed_window_s":5.0,"fixed_scan_halfwidth":3,"baseline_subtract":true,
+                 "baseline_flank_scans":8,"baseline_quantile":0.5}}"#,
+        )
+        .unwrap();
+        assert_eq!(c.quant.fragment_selection, FragmentSelection::Predicted);
+        assert_eq!(c.quant.top_n_fragments, 12);
+        assert_eq!(c.quant.fixed_window_s, 5.0);
+        assert_eq!(c.quant.fixed_scan_halfwidth, 3);
+        assert!(c.quant.baseline_subtract);
+        assert_eq!(c.quant.baseline_flank_scans, 8);
+        assert_eq!(c.quant.baseline_quantile, 0.5);
+
+        // The defaults must reproduce the pre-2026-08 integration exactly: neither fixed
+        // form on, ranking by observed area, no baseline. A config written before these
+        // fields existed therefore quantifies as it did before.
+        let d = QuantConfig::default();
+        assert_eq!(d.fragment_selection, FragmentSelection::ObservedArea);
+        assert_eq!(d.fixed_scan_halfwidth, 0);
+        assert_eq!(d.fixed_window_s, 0.0);
+        assert!(!d.baseline_subtract);
+        assert_eq!(
+            Config::default().quant.fragment_selection,
+            d.fragment_selection
+        );
+
+        assert!(Config::from_json(r#"{"quant":{"fixed_window_s":-1.0}}"#).is_err());
+        assert!(Config::from_json(r#"{"quant":{"baseline_quantile":1.5}}"#).is_err());
+        assert!(Config::from_json(r#"{"quant":{"baseline_quantile":-0.5}}"#).is_err());
+        // Unknown enum variants must fail rather than fall back to the default ranking.
+        assert!(Config::from_json(r#"{"quant":{"fragment_selection":"library"}}"#).is_err());
+    }
 
     #[test]
     fn shipped_configs_parse() {

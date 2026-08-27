@@ -10,11 +10,11 @@ use std::time::Instant;
 
 use anyhow::Result;
 use mumdia_core::config::{
-    NormalizeMethod, PeakWindowMode, QuantConfig, QuantQColumn, RollupMethod,
+    FragmentSelection, NormalizeMethod, PeakWindowMode, QuantConfig, QuantQColumn, RollupMethod,
 };
 use mumdia_core::schema::artifact;
 use mumdia_io::report::ArtifactReport;
-use mumdia_io::table::{write_table, Col, Table};
+use mumdia_io::table::{column_names, write_table, Col, Table};
 use rayon::prelude::*;
 use serde_json::json;
 use tracing::{info, warn};
@@ -98,6 +98,128 @@ fn trapezoid_window(rt: &[f32], inten: &[f32], lo: f64, hi: f64, envelope: bool)
         trapezoid(&wr, &ev)
     } else {
         trapezoid(&wr, &wi)
+    }
+}
+
+/// Background level for a fixed-scan window `[lo, hi)`: the `quantile` quantile of
+/// the intensities in the flanks (`flank` samples on each side, clipped to the
+/// trace). Returns 0 when no flank sample exists.
+fn flank_baseline(inten: &[f32], lo: usize, hi: usize, flank: usize, quantile: f64) -> f32 {
+    let mut v: Vec<f32> = Vec::with_capacity(2 * flank);
+    let fl = lo.saturating_sub(flank);
+    v.extend_from_slice(&inten[fl..lo]);
+    let fh = (hi + flank).min(inten.len());
+    if hi < fh {
+        v.extend_from_slice(&inten[hi..fh]);
+    }
+    if v.is_empty() {
+        return 0.0;
+    }
+    v.sort_by(|a, b| a.total_cmp(b));
+    let pos = ((v.len() - 1) as f64 * quantile.clamp(0.0, 1.0)).round() as usize;
+    v[pos.min(v.len() - 1)]
+}
+
+/// Sample index range `[lo, hi)` covered by a fixed window centred on the sample
+/// nearest to `apex`. `half_s > 0` selects the samples within `half_s` seconds of
+/// the apex (always at least that nearest sample) and overrides `half`, which
+/// otherwise takes `half` scans on each side. `None` for an empty trace.
+///
+/// Shared by the integration below and by the applied-window contract in [`run`],
+/// so the bounds reported for a quantity are the bounds it was integrated over.
+fn fixed_window_indices(rt: &[f32], apex: f64, half: usize, half_s: f64) -> Option<(usize, usize)> {
+    if rt.is_empty() {
+        return None;
+    }
+    let mut k = 0usize;
+    let mut best = f64::INFINITY;
+    for (i, &r) in rt.iter().enumerate() {
+        let d = (r as f64 - apex).abs();
+        if d < best {
+            best = d;
+            k = i;
+        }
+    }
+    if half_s > 0.0 {
+        let mut lo = k;
+        while lo > 0 && (apex - rt[lo - 1] as f64) <= half_s {
+            lo -= 1;
+        }
+        let mut hi = k + 1;
+        while hi < rt.len() && (rt[hi] as f64 - apex) <= half_s {
+            hi += 1;
+        }
+        Some((lo, hi))
+    } else {
+        Some((k.saturating_sub(half), (k + half + 1).min(rt.len())))
+    }
+}
+
+/// Fixed-window integration over the samples chosen by [`fixed_window_indices`],
+/// with optional apex-outward envelope and optional flank-baseline subtraction
+/// (`baseline = Some((flank, quantile))`). Empty trace integrates to 0.
+fn trapezoid_fixed_opts(
+    rt: &[f32],
+    inten: &[f32],
+    apex: f64,
+    half: usize,
+    half_s: f64,
+    envelope: bool,
+    baseline: Option<(usize, f64)>,
+) -> f64 {
+    let Some((lo, hi)) = fixed_window_indices(rt, apex, half, half_s) else {
+        return 0.0;
+    };
+    let mut w: Vec<f32> = inten[lo..hi].to_vec();
+    if let Some((flank, quantile)) = baseline {
+        let b = flank_baseline(inten, lo, hi, flank, quantile);
+        for x in w.iter_mut() {
+            *x = (*x - b).max(0.0);
+        }
+    }
+    if envelope {
+        w = center_envelope_1d(&w);
+    }
+    trapezoid(&rt[lo..hi], &w)
+}
+
+/// Top-N sum with the fragment ranking chosen by `selection`. `observed_area`
+/// delegates to [`summarize_fragment_areas`] (legacy, byte-identical); `predicted`
+/// ranks the positive finite areas by library intensity and sums the top N.
+fn select_fragment_areas(
+    areas: Option<&[(f64, f32)]>,
+    top_n: usize,
+    selection: FragmentSelection,
+) -> (Option<f64>, usize, &'static str) {
+    match selection {
+        FragmentSelection::ObservedArea => {
+            let plain: Option<Vec<f64>> = areas.map(|a| a.iter().map(|x| x.0).collect());
+            summarize_fragment_areas(plain.as_deref(), top_n)
+        }
+        FragmentSelection::Predicted => {
+            let Some(areas) = areas else {
+                return (None, 0, "no_fragment_traces");
+            };
+            let mut positive: Vec<(f64, f32)> = areas
+                .iter()
+                .copied()
+                .filter(|(area, _)| area.is_finite() && *area > 0.0)
+                .collect();
+            if positive.is_empty() {
+                return (None, 0, "no_positive_fragment_area");
+            }
+            if top_n == 0 {
+                return (None, 0, "no_fragments_selected");
+            }
+            positive.sort_by(|a, b| b.1.total_cmp(&a.1).then(b.0.total_cmp(&a.0)));
+            let used = positive.len().min(top_n);
+            let quantity: f64 = positive.iter().take(used).map(|x| x.0).sum();
+            if quantity.is_finite() && quantity > 0.0 {
+                (Some(quantity), used, "quantified")
+            } else {
+                (None, used, "nonfinite_quantity")
+            }
+        }
     }
 }
 
@@ -340,16 +462,53 @@ pub fn run(p: QuantParams) -> Result<(u64, u64)> {
     }
 
     // Chromatograms grouped by candidate.
-    // Project: quant reads only these four of the chromatogram table's seven columns, and
-    // the table is the largest artifact in the run (tens of millions of rows with two big
-    // list columns). Unprojected, frag_mz / frag_obs_mz / predicted_intensity were decoded
-    // and held for nothing.
-    let ch = Table::read_cols(
-        p.chromatograms,
-        &["candidate_id", "frag_name", "rt", "intensity"],
-    )?;
+    // Project: quant reads at most five of the chromatogram table's seven columns, and the
+    // table is the largest artifact in the run (tens of millions of rows with two big list
+    // columns). Unprojected, frag_mz / frag_obs_mz were decoded and held for nothing.
+    //
+    // `predicted_intensity` is OPTIONAL. Chromatogram artifacts written before that column
+    // existed do not carry it, and the default `observed_area` ranking never reads it, so
+    // probe the footer (which decodes no data) and project only what is present. Demanding
+    // the column unconditionally made every older artifact unquantifiable.
+    let has_pred = column_names(p.chromatograms)?
+        .iter()
+        .any(|c| c == "predicted_intensity");
+    if !has_pred && p.cfg.fragment_selection == FragmentSelection::Predicted {
+        anyhow::bail!(
+            "quant.fragment_selection = predicted ranks fragments by the \
+             `predicted_intensity` column, which {} does not carry. Re-run `extract` to \
+             write a current chromatogram artifact, or set \
+             quant.fragment_selection = observed_area.",
+            p.chromatograms
+        );
+    }
+    let ch = if has_pred {
+        Table::read_cols(
+            p.chromatograms,
+            &[
+                "candidate_id",
+                "frag_name",
+                "predicted_intensity",
+                "rt",
+                "intensity",
+            ],
+        )?
+    } else {
+        Table::read_cols(
+            p.chromatograms,
+            &["candidate_id", "frag_name", "rt", "intensity"],
+        )?
+    };
     let ch_cid = ch.u32("candidate_id")?;
     let ch_name = ch.str("frag_name")?;
+    // Zero, not NaN, for the absent column: the value is only a ranking key, and
+    // `total_cmp` orders NaN above every real intensity, which would silently invert the
+    // `predicted` ranking rather than fail.
+    let ch_pred: Vec<f32> = if has_pred {
+        ch.f32("predicted_intensity")?
+    } else {
+        vec![0.0; ch_cid.len()]
+    };
     let ch_rt = ch.list_f32("rt")?;
     let ch_int = ch.list_f32("intensity")?;
     // Group the b/y fragment chromatogram rows by candidate. The MS1 isotope XIC
@@ -363,7 +522,7 @@ pub fn run(p: QuantParams) -> Result<(u64, u64)> {
         }
         cand_rows.entry(ch_cid[i]).or_default().push(i);
     }
-    let mut areas: HashMap<u32, Vec<f64>> = HashMap::new();
+    let mut areas: HashMap<u32, Vec<(f64, f32)>> = HashMap::new();
     // Store the fragment name by reference (borrowed from `ch_name`, which outlives
     // this map) to avoid a per-row String clone; it is materialized once at export.
     let mut frag_areas: HashMap<u32, Vec<(&str, f64)>> = HashMap::new();
@@ -471,10 +630,28 @@ pub fn run(p: QuantParams) -> Result<(u64, u64)> {
                     _ => (lo, hi, apex),
                 }
             };
+            // A fixed window replaces the walked bounds entirely; it needs a finite apex
+            // to centre on, so an unknown apex falls back to the configured window.
+            let fixed = (p.cfg.fixed_scan_halfwidth > 0 || p.cfg.fixed_window_s > 0.0)
+                && integration_apex.is_finite();
             let a: Vec<f64> = rows
                 .iter()
                 .map(|&i| {
-                    if p.cfg.bound_peak {
+                    if fixed {
+                        trapezoid_fixed_opts(
+                            &ch_rt[i],
+                            &ch_int[i],
+                            integration_apex,
+                            p.cfg.fixed_scan_halfwidth,
+                            p.cfg.fixed_window_s,
+                            p.cfg.interference_envelope,
+                            if p.cfg.baseline_subtract {
+                                Some((p.cfg.baseline_flank_scans, p.cfg.baseline_quantile))
+                            } else {
+                                None
+                            },
+                        )
+                    } else if p.cfg.bound_peak {
                         trapezoid_window(
                             &ch_rt[i],
                             &ch_int[i],
@@ -487,6 +664,33 @@ pub fn run(p: QuantParams) -> Result<(u64, u64)> {
                     }
                 })
                 .collect();
+            // Applied-window contract: under a fixed window the walked bounds are NOT the
+            // integration range, so report the RT extent actually covered (union over this
+            // candidate's traces, whose sample grids may differ). Otherwise
+            // `integration_lo_rt`/`integration_hi_rt` and the peak-bounds diagnostic would
+            // describe a window that produced no part of `quantity`.
+            let (lo_rt, hi_rt) = if fixed {
+                let mut flo = f64::INFINITY;
+                let mut fhi = f64::NEG_INFINITY;
+                for &i in rows.iter() {
+                    if let Some((lo, hi)) = fixed_window_indices(
+                        &ch_rt[i],
+                        integration_apex,
+                        p.cfg.fixed_scan_halfwidth,
+                        p.cfg.fixed_window_s,
+                    ) {
+                        flo = flo.min(ch_rt[i][lo] as f64);
+                        fhi = fhi.max(ch_rt[i][hi - 1] as f64);
+                    }
+                }
+                if flo.is_finite() && fhi.is_finite() {
+                    (flo, fhi)
+                } else {
+                    (lo_rt, hi_rt)
+                }
+            } else {
+                (lo_rt, hi_rt)
+            };
             (c, (lo_rt, hi_rt, integration_apex), a)
         })
         .collect();
@@ -499,7 +703,7 @@ pub fn run(p: QuantParams) -> Result<(u64, u64)> {
             pb_hi.push(hi_rt);
         }
         for (&i, a) in rows.iter().zip(computed) {
-            areas.entry(c).or_default().push(a);
+            areas.entry(c).or_default().push((a, ch_pred[i]));
             frag_areas
                 .entry(c)
                 .or_default()
@@ -553,8 +757,11 @@ pub fn run(p: QuantParams) -> Result<(u64, u64)> {
         if !passes_quant_filter(&label[i], pep_q[i], p.cfg.q_threshold) {
             continue;
         }
-        let (quantity, used, status) =
-            summarize_fragment_areas(areas.get(&cid[i]).map(Vec::as_slice), p.cfg.top_n_fragments);
+        let (quantity, used, status) = select_fragment_areas(
+            areas.get(&cid[i]).map(Vec::as_slice),
+            p.cfg.top_n_fragments,
+            p.cfg.fragment_selection,
+        );
         if quantity.is_some() {
             n_quantified_peptides += 1;
         }
@@ -680,6 +887,12 @@ pub fn run(p: QuantParams) -> Result<(u64, u64)> {
     let report_params = json!({
         "q_threshold": p.cfg.q_threshold,
         "top_n_fragments": p.cfg.top_n_fragments,
+        "fragment_selection": format!("{:?}", p.cfg.fragment_selection),
+        "fixed_scan_halfwidth": p.cfg.fixed_scan_halfwidth,
+        "fixed_window_s": p.cfg.fixed_window_s,
+        "baseline_subtract": p.cfg.baseline_subtract,
+        "baseline_flank_scans": p.cfg.baseline_flank_scans,
+        "baseline_quantile": p.cfg.baseline_quantile,
         "top_n_peptides": p.cfg.top_n_peptides,
         "rollup": format!("{:?}", p.cfg.rollup),
         "bound_peak": p.cfg.bound_peak,
@@ -1262,6 +1475,9 @@ mod tests {
         );
     }
 
+    // Also the legacy-artifact regression: this chromatogram table carries no
+    // `predicted_intensity` column, as every artifact written before that column existed
+    // does. Quant must still read it and quantify from it unchanged.
     #[test]
     fn quant_run_preserves_unquantifiable_ids_and_applied_window_contract() {
         let scored = quant_test_path("scored.parquet");
@@ -1398,5 +1614,243 @@ mod tests {
             (a - 20.0).abs() < 1e-9,
             "expected triangle area 20, not height 10, got {a}"
         );
+    }
+
+    #[test]
+    fn fixed_window_scan_and_second_forms_select_the_apex_subwindow() {
+        // 1 s grid, triangle apex at 5 s.
+        let rt: Vec<f32> = (0..11).map(|i| i as f32).collect();
+        let it = vec![0.0f32, 0.0, 0.0, 0.0, 5.0, 10.0, 5.0, 0.0, 0.0, 0.0, 0.0];
+        // +/-1 scan around the apex sample: (4,5),(5,10),(6,5) -> 7.5 + 7.5 = 15.
+        assert!((trapezoid_fixed_opts(&rt, &it, 5.0, 1, 0.0, false, None) - 15.0).abs() < 1e-9);
+        // +/-1 s is the same three samples on this grid.
+        assert!((trapezoid_fixed_opts(&rt, &it, 5.0, 0, 1.0, false, None) - 15.0).abs() < 1e-9);
+        // The seconds form overrides the scan count, as its doc comment claims.
+        assert!((trapezoid_fixed_opts(&rt, &it, 5.0, 5, 1.0, false, None) - 15.0).abs() < 1e-9);
+        // Half-width 0 keeps only the nearest sample, so `trapezoid`'s single-sample rule
+        // returns the raw height. This is why the AIF/Astral configs never use 0.
+        assert_eq!(
+            trapezoid_fixed_opts(&rt, &it, 5.0, 0, 0.0, false, None),
+            10.0
+        );
+        // A window wider than the trace integrates the whole trace (area 20).
+        assert!((trapezoid_fixed_opts(&rt, &it, 5.0, 0, 100.0, false, None) - 20.0).abs() < 1e-9);
+        // An apex off the sampled range still integrates around the nearest sample.
+        assert_eq!(
+            trapezoid_fixed_opts(&rt, &it, -50.0, 0, 0.0, false, None),
+            0.0
+        );
+        // Empty trace integrates to 0 rather than panicking on the index math.
+        assert_eq!(
+            trapezoid_fixed_opts(&[], &[], 5.0, 3, 0.0, false, None),
+            0.0
+        );
+        assert_eq!(fixed_window_indices(&[], 5.0, 3, 0.0), None);
+        assert_eq!(fixed_window_indices(&rt, 5.0, 1, 0.0), Some((4, 7)));
+        assert_eq!(fixed_window_indices(&rt, 5.0, 0, 1.0), Some((4, 7)));
+    }
+
+    #[test]
+    fn flank_baseline_uses_the_flank_quantile() {
+        let it = vec![1.0f32, 3.0, 100.0, 100.0, 100.0, 5.0, 7.0];
+        // Window [2,5) with 2-sample flanks -> flank pool [1,3,5,7].
+        // Median: position round(3 * 0.5) = 2 -> 5.
+        assert_eq!(flank_baseline(&it, 2, 5, 2, 0.5), 5.0);
+        // Lower quartile: position round(3 * 0.25) = 1 -> 3.
+        assert_eq!(flank_baseline(&it, 2, 5, 2, 0.25), 3.0);
+        // No flank sample exists (the window covers the trace) -> no background.
+        assert_eq!(flank_baseline(&it, 0, 7, 3, 0.5), 0.0);
+
+        // End to end: subtracting the median flank level lowers the area by
+        // baseline * width and clips at zero.
+        let rt: Vec<f32> = (0..7).map(|i| i as f32).collect();
+        let plain = trapezoid_fixed_opts(&rt, &it, 3.0, 1, 0.0, false, None);
+        let debased = trapezoid_fixed_opts(&rt, &it, 3.0, 1, 0.0, false, Some((2, 0.5)));
+        assert!((plain - 200.0).abs() < 1e-9, "got {plain}");
+        assert!((debased - 190.0).abs() < 1e-9, "got {debased}");
+    }
+
+    #[test]
+    fn select_fragment_areas_ranks_by_predicted_intensity() {
+        // Fragment 0 has the largest observed area but the smallest library intensity:
+        // the interference case `fragment_selection = predicted` exists to avoid.
+        let areas = [(100.0f64, 0.1f32), (40.0, 1.0), (30.0, 0.8)];
+        assert_eq!(
+            select_fragment_areas(Some(&areas), 2, FragmentSelection::ObservedArea),
+            (Some(140.0), 2, "quantified")
+        );
+        assert_eq!(
+            select_fragment_areas(Some(&areas), 2, FragmentSelection::Predicted),
+            (Some(70.0), 2, "quantified")
+        );
+        // `observed_area` must stay byte-identical to the legacy summariser.
+        let plain: Vec<f64> = areas.iter().map(|a| a.0).collect();
+        assert_eq!(
+            select_fragment_areas(Some(&areas), 2, FragmentSelection::ObservedArea),
+            summarize_fragment_areas(Some(&plain), 2)
+        );
+        // Both rankings report the same statuses on the degenerate inputs.
+        for sel in [
+            FragmentSelection::ObservedArea,
+            FragmentSelection::Predicted,
+        ] {
+            assert_eq!(
+                select_fragment_areas(None, 3, sel),
+                (None, 0, "no_fragment_traces")
+            );
+            assert_eq!(
+                select_fragment_areas(Some(&[(0.0, 1.0)]), 3, sel),
+                (None, 0, "no_positive_fragment_area")
+            );
+            assert_eq!(
+                select_fragment_areas(Some(&areas), 0, sel),
+                (None, 0, "no_fragments_selected")
+            );
+            // Non-finite areas are dropped, not summed into a NaN quantity.
+            assert_eq!(
+                select_fragment_areas(Some(&[(f64::NAN, 1.0), (10.0, 0.5)]), 3, sel),
+                (Some(10.0), 1, "quantified")
+            );
+        }
+    }
+
+    /// Scored + chromatogram pair for the fragment-selection tests: one candidate, three
+    /// fragments on a 1 s grid with a 5 s apex and a wide 0-10 s elution hint. The
+    /// brightest fragment by observed area (`b2`, which also carries a late interferent)
+    /// is the dimmest by library intensity.
+    fn selection_fixture(with_predicted: bool) -> (String, String) {
+        let scored = quant_test_path("sel_scored.parquet");
+        let chrom = quant_test_path("sel_chrom.parquet");
+        write_table(
+            &scored,
+            vec![
+                Col::U32("candidate_id".into(), vec![1]),
+                Col::U32("base_peptide_id".into(), vec![10]),
+                Col::Str("peptidoform".into(), vec!["PEP1".into()]),
+                Col::I32("charge".into(), vec![2]),
+                Col::Str("label".into(), vec!["target".into()]),
+                Col::Str("protein_group".into(), vec!["PG".into()]),
+                Col::F64("peptide_q_value".into(), vec![0.0]),
+                Col::F64("apex_rt".into(), vec![5.0]),
+                Col::F64("elution_lo".into(), vec![0.0]),
+                Col::F64("elution_hi".into(), vec![10.0]),
+            ],
+        )
+        .unwrap();
+        let grid: Vec<f32> = (0..11).map(|rt| rt as f32).collect();
+        let b2 = vec![
+            0.0f32, 0.0, 0.0, 0.0, 50.0, 100.0, 50.0, 0.0, 300.0, 600.0, 300.0,
+        ];
+        let y3 = vec![0.0f32, 0.0, 0.0, 0.0, 20.0, 40.0, 20.0, 0.0, 0.0, 0.0, 0.0];
+        let y5 = vec![0.0f32, 0.0, 0.0, 0.0, 15.0, 30.0, 15.0, 0.0, 0.0, 0.0, 0.0];
+        let mut cols = vec![
+            Col::U32("candidate_id".into(), vec![1, 1, 1]),
+            Col::Str(
+                "frag_name".into(),
+                vec!["b2".into(), "y3".into(), "y5".into()],
+            ),
+            Col::ListF32("rt".into(), vec![grid.clone(), grid.clone(), grid]),
+            Col::ListF32("intensity".into(), vec![b2, y3, y5]),
+        ];
+        if with_predicted {
+            cols.push(Col::F32("predicted_intensity".into(), vec![0.1, 1.0, 0.8]));
+        }
+        write_table(&chrom, cols).unwrap();
+        (scored, chrom)
+    }
+
+    #[test]
+    fn fixed_window_and_predicted_selection_use_the_library_fragments_at_the_apex() {
+        let (scored, chrom) = selection_fixture(true);
+        let peptide = quant_test_path("sel_peptide.parquet");
+        let protein = quant_test_path("sel_protein.parquet");
+        let cfg = QuantConfig {
+            top_n_fragments: 2,
+            fragment_selection: FragmentSelection::Predicted,
+            fixed_window_s: 1.0,
+            ..QuantConfig::default()
+        };
+        let rows = run(QuantParams {
+            psms_scored: &scored,
+            chromatograms: &chrom,
+            out_peptide: &peptide,
+            out_protein: &protein,
+            out_fragment: None,
+            out_peak_bounds: None,
+            cfg: &cfg,
+            config_hash: "test",
+        })
+        .unwrap();
+        assert_eq!(rows, (1, 1));
+
+        // +/-1 s of the 5 s apex integrates y3 to 60 and y5 to 45; b2 integrates to 150
+        // there but ranks last by library intensity, so `predicted` must exclude it.
+        let pq = Table::read(&peptide).unwrap();
+        assert_eq!(pq.opt_f64("quantity").unwrap(), vec![Some(105.0)]);
+        assert_eq!(pq.i32("n_fragments_used").unwrap(), vec![2]);
+        // The reported window must be the one that was integrated, not the 0-10 s hint.
+        assert_eq!(pq.opt_f64("integration_apex_rt").unwrap(), vec![Some(5.0)]);
+        assert_eq!(pq.opt_f64("integration_lo_rt").unwrap(), vec![Some(4.0)]);
+        assert_eq!(pq.opt_f64("integration_hi_rt").unwrap(), vec![Some(6.0)]);
+    }
+
+    #[test]
+    fn adding_predicted_intensity_does_not_move_a_default_quantity() {
+        // Compatibility contract: the column's presence must not change a legacy result,
+        // and its absence must not stop one. Same traces, same default config, both ways.
+        let cfg = QuantConfig::default();
+        let mut out = Vec::new();
+        for with_predicted in [false, true] {
+            let (scored, chrom) = selection_fixture(with_predicted);
+            let peptide = quant_test_path("cmp_peptide.parquet");
+            let protein = quant_test_path("cmp_protein.parquet");
+            let rows = run(QuantParams {
+                psms_scored: &scored,
+                chromatograms: &chrom,
+                out_peptide: &peptide,
+                out_protein: &protein,
+                out_fragment: None,
+                out_peak_bounds: None,
+                cfg: &cfg,
+                config_hash: "test",
+            })
+            .unwrap();
+            let pq = Table::read(&peptide).unwrap();
+            out.push((
+                rows,
+                pq.opt_f64("quantity").unwrap(),
+                pq.str("quant_status").unwrap(),
+                pq.i32("n_fragments_used").unwrap(),
+                pq.opt_f64("integration_lo_rt").unwrap(),
+                pq.opt_f64("integration_hi_rt").unwrap(),
+            ));
+        }
+        assert_eq!(out[0], out[1]);
+        assert!(out[0].1[0].is_some(), "the fixture must be quantifiable");
+    }
+
+    #[test]
+    fn predicted_selection_without_the_column_is_a_clear_error() {
+        let (scored, chrom) = selection_fixture(false);
+        let cfg = QuantConfig {
+            fragment_selection: FragmentSelection::Predicted,
+            ..QuantConfig::default()
+        };
+        let err = run(QuantParams {
+            psms_scored: &scored,
+            chromatograms: &chrom,
+            out_peptide: &quant_test_path("err_peptide.parquet"),
+            out_protein: &quant_test_path("err_protein.parquet"),
+            out_fragment: None,
+            out_peak_bounds: None,
+            cfg: &cfg,
+            config_hash: "test",
+        })
+        .unwrap_err()
+        .to_string();
+        // The message must name the missing column and the way out, because the artifact
+        // is silently older rather than malformed.
+        assert!(err.contains("predicted_intensity"), "{err}");
+        assert!(err.contains("observed_area"), "{err}");
     }
 }
