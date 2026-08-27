@@ -135,6 +135,14 @@ Use the original imported precursor library here. Do not pass
 `--top-peaks-ms2 300` in that command reproduces this one benchmark. Do not
 carry it to another acquisition; see the next subsection.
 
+`configs/examples/diann-library.json` sets both interpreters to `"auto"`, so it
+runs unchanged only where an environment with torch and DeepLC is discoverable
+(an activated conda env, or `MUMDIA_PYTHON_RESCORE` / `MUMDIA_PYTHON_DEEPLC`).
+Run `mumdia doctor --config ...` first: it prints the interpreter it resolved and
+the versions, or names exactly what is missing. On a machine with several
+candidate environments, copy the example and write the two paths in, which is
+what the untracked `config.local-*.json` files are for.
+
 The historical result is about 10.3k confident precursor-shaped report rows,
 selected by stripped-peptide q at 1%, versus roughly 9.3-9.5k with linear/native
 or mokapot rescoring. It is a benchmark target, not a CI assertion or a universal
