@@ -118,10 +118,13 @@ jobs:
         shell: bash
         run: python ci/gen_cli_reference.py --check
 
-      # bash on the Windows runner too, so one script covers both platforms.
+      # bash on the Windows runner too, so one script covers both platforms, and
+      # invoked through `bash` rather than relying on the file mode: the execute bit
+      # is meaningless on the Windows runner, and a checkout that loses it would
+      # otherwise fail here with "Permission denied" rather than with a test result.
       - name: Smoke test
         shell: bash
-        run: ci/smoke.sh
+        run: bash ci/smoke.sh
 
       - name: Upload output hashes
         uses: actions/upload-artifact@v4
