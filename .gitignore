@@ -42,6 +42,10 @@ scripts/_probe*.py
 /*.md
 !/README.md
 !/CLAUDE.md
+!/CHANGELOG.md
+!/CONTRIBUTING.md
+!/SECURITY.md
+!/CODE_OF_CONDUCT.md
 # local archive of superseded working docs (not published)
 /_archive/
 # Local benchmark inputs and scratch outputs (tens of GB; never source). The
