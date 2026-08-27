@@ -32,12 +32,13 @@ feature, so it does not wrap help text to the terminal width and the text is
 identical piped or not.
 
 Global flags. The four `global = true` flags are accepted on either side of the
-subcommand, so clap repeats them in all 21 subcommand help texts. Repeating
-them here would add roughly 300 lines of noise, so this script computes the
-global set as the intersection of the option specs present in EVERY subcommand,
-documents that set once, and removes those entries from the per-subcommand
-blocks. The set is derived, not hardcoded: a flag that stops being global stops
-being filtered.
+subcommand, so clap repeats them in every subcommand help text, as it repeats
+`-h, --help`. Reproducing all of that would add roughly 300 lines of noise, so
+this script takes the intersection of the option entries present in EVERY
+subcommand, splits `-h, --help` out of it (that one is clap's own, not a
+`global = true` declaration), documents the rest once, and removes both from the
+per-subcommand blocks. The set is derived, not hardcoded: a flag that stops
+being global stops being filtered.
 """
 
 from __future__ import annotations
@@ -281,16 +282,22 @@ def build_document(binary: Path) -> str:
     ]
     top_head, top_preamble, top_entries = split_options(top)
     top_keys = {entry_key(e): e for e in top_entries}
-    global_keys = set.intersection(*per_cmd_keys) if per_cmd_keys else set()
-    global_keys &= set(top_keys)
+    repeated_keys = set.intersection(*per_cmd_keys) if per_cmd_keys else set()
+    repeated_keys &= set(top_keys)
+    # `-h, --help` is repeated in every subcommand too, but clap adds it itself
+    # rather than from a `global = true` declaration, so it is reported apart.
+    help_keys = {k for k in repeated_keys if "--help" in k}
+    global_keys = repeated_keys - help_keys
     global_entries = [top_keys[k] for k in sorted(global_keys)]
+    help_entries = [top_keys[k] for k in sorted(help_keys)]
+    help_specs = ", ".join(f"`{entry_spec(e)}`" for e in help_entries)
 
     # `--config` is per-subcommand, so it must never be in the global set.
     def own_flags(name: str) -> set[str]:
         return {
             flag
             for e in parsed[name][2]
-            if entry_key(e) not in global_keys
+            if entry_key(e) not in repeated_keys
             for flag in FLAG_TOKEN.findall(e[0])
         }
 
@@ -301,19 +308,12 @@ def build_document(binary: Path) -> str:
 
     a("# MuMDIA command-line reference")
     a("")
-    a(
-        f"GENERATED FILE. Do not edit. `{GENERATOR}` writes it from the `mumdia`"
-    )
-    a(
-        "binary's own `--help` output, so the interface described here is the interface"
-    )
-    a(
-        f"the binary actually has. The source of truth is the `clap` derive in"
-    )
-    a(
-        f"`{SOURCE_OF_TRUTH}`: change the flag or its doc comment there, rebuild, and"
-    )
-    a("regenerate. An edit made to this file is lost on the next run.")
+    a(f"GENERATED FILE. Do not edit. `{GENERATOR}` writes it from the")
+    a(f"`{PROG}` binary's own `--help` output, so the interface described here is")
+    a("the interface the binary actually has. The source of truth is the `clap`")
+    a(f"derive in `{SOURCE_OF_TRUTH}`: change the flag")
+    a("or its doc comment there, rebuild, and regenerate. An edit made to this")
+    a("file is lost on the next run.")
     a("")
     a("```text")
     a("python ci/gen_cli_reference.py            # regenerate")
@@ -331,29 +331,15 @@ def build_document(binary: Path) -> str:
 
     a("## How to read this document")
     a("")
-    a(
-        f"Every block below is the binary's own help text, right-stripped and with the"
-    )
-    a(
-        f"program name normalized to `{PROG}` (a Windows build reports `{PROG}.exe`)."
-    )
-    a(
-        "Nothing is paraphrased. Two mechanical edits are applied:"
-    )
+    a("Every block below is the binary's own help text, right-stripped and with")
+    a(f"the program name normalized to `{PROG}` (a Windows build reports")
+    a(f"`{PROG}.exe`). Nothing is paraphrased. Two mechanical edits are applied:")
     a("")
-    a(
-        f"- the {len(global_entries)} flags that clap marks `global = true` are removed from the"
-    )
-    a(
-        "  per-subcommand blocks and documented once under \"Global flags\" below,"
-    )
-    a("  because clap otherwise repeats them in every subcommand;")
-    a(
-        f"- `{PROG} help` gets a table row but no section, because"
-    )
-    a(
-        f"  `{PROG} help --help` reprints the top-level help unchanged."
-    )
+    a(f"- the {len(global_entries)} flags clap marks `global = true`, and {help_specs}, are removed")
+    a("  from the per-subcommand blocks and documented once under \"Global flags\"")
+    a("  below, because clap repeats them in every subcommand;")
+    a(f"- `{PROG} help` gets a table row but no section, because")
+    a(f"  `{PROG} help --help` reprints the top-level help unchanged.")
     a("")
 
     a("## Top-level help")
@@ -363,25 +349,20 @@ def build_document(binary: Path) -> str:
 
     a("## Global flags")
     a("")
-    a(
-        f"These {len(global_entries)} options are declared `global = true`, so they are accepted on"
-    )
-    a(
-        "EITHER side of the subcommand: `mumdia --threads 8 extract ...` and"
-    )
-    a(
-        "`mumdia extract --threads 8 ...` are equivalent. They are removed from the"
-    )
-    a("per-subcommand blocks below to keep this document readable.")
+    a(f"These {len(global_entries)} options are declared `global = true`, so they are accepted on")
+    a(f"EITHER side of the subcommand: `{PROG} --threads 8 extract ...` and")
+    a(f"`{PROG} extract --threads 8 ...` are equivalent and reach the same value.")
+    a("They are removed from the per-subcommand blocks below to keep this document")
+    a(f"readable, as is {help_specs}, which every subcommand also accepts.")
     a("")
     a("| Flag | Purpose |")
     a("|---|---|")
-    for entry in global_entries:
+    for entry in global_entries + help_entries:
         a(f"| `{md_cell(entry_spec(entry))}` | {md_cell(entry_body(entry))} |")
     a("")
     a("The same text as the binary prints it:")
     a("")
-    a(fence(reassemble(["Options:"], [], global_entries)))
+    a(fence(reassemble(["Options:"], [], global_entries + help_entries)))
     a("")
 
     a("## Subcommands")
@@ -398,10 +379,11 @@ def build_document(binary: Path) -> str:
     a("|---|---|---|")
     for name, desc in commands:
         if name in SKIP_SECTIONS:
-            cfg = "n/a"
+            cell, cfg = f"`{name}`", "n/a"
         else:
+            cell = f"[`{name}`](#{name})"
             cfg = "yes" if takes_config[name] else "no"
-        a(f"| [`{name}`](#{name}) | {cfg} | {md_cell(first_sentence(desc))} |")
+        a(f"| {cell} | {cfg} | {md_cell(first_sentence(desc))} |")
     a("")
 
     with_cfg = sorted(n for n, v in takes_config.items() if v)
@@ -417,23 +399,18 @@ def build_document(binary: Path) -> str:
     a(" " + ", ".join(f"`{n}`" for n in without_cfg) + ".")
     a("")
 
-    for name, desc in commands:
+    for name, _desc in commands:
         if name in SKIP_SECTIONS:
             continue
         head, preamble, entries = parsed[name]
-        kept = [e for e in entries if entry_key(e) not in global_keys]
+        kept = [e for e in entries if entry_key(e) not in repeated_keys]
         dropped = len(entries) - len(kept)
         a(f"## {name}")
         a("")
-        if desc:
-            a(md_cell(desc))
-            a("")
         a(fence(reassemble(list(head), preamble, kept)))
         a("")
         if dropped:
-            a(
-                f"Plus the {dropped} global flags (see \"Global flags\" above)."
-            )
+            a(f'Plus the {dropped} repeated flags removed above: see "Global flags".')
             a("")
 
     while out and not out[-1]:

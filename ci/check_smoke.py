@@ -116,6 +116,35 @@ def main() -> int:
          "manifest config_hash is a blake3 hex digest")
     c.ok(bool(manifest.get("config_json")), "manifest embeds the resolved config")
 
+    # Source identity. A benchmark record is supposed to name the commit it came
+    # from; before this the manifest could only say "0.1.0", which every build says.
+    sha = manifest.get("git_sha", "")
+    c.ok(bool(sha), "manifest records git_sha", sha)
+    if sha == "unknown":
+        print("  [note] git_sha is 'unknown': built without git available")
+    else:
+        c.ok(
+            re.match(r"^[0-9a-f]{7,40}(-dirty)?$", sha) is not None,
+            "git_sha looks like a short commit, optionally -dirty",
+            sha,
+        )
+    c.ok(bool(manifest.get("commit_date")), "manifest records commit_date",
+         str(manifest.get("commit_date")))
+    args = manifest.get("cli_args", [])
+    c.ok(len(args) > 1 and "run" in args,
+         "manifest records the command line", f"{len(args)} arguments")
+
+    # Hashed inputs: recording only a path does not tie a result to the bytes it
+    # came from, because a path gets reused.
+    inputs = manifest.get("inputs", {})
+    for role in ("mzml", "fasta"):
+        rec = inputs.get(role)
+        if c.ok(rec is not None, f"manifest hashed the {role} input"):
+            c.ok(BLAKE3_HEX.match(rec.get("content_hash", "") or "") is not None,
+                 f"{role} input hash is a blake3 hex digest")
+            c.ok(int(rec.get("bytes", 0)) > 0, f"{role} input records its size",
+                 str(rec.get("bytes")))
+
     models = manifest.get("model_identities", {})
     for key in ("rt_predictor", "fragment_predictor", "rescorer", "feature_schema_id"):
         c.ok(key in models and bool(models[key]), f"manifest model_identities has {key}",

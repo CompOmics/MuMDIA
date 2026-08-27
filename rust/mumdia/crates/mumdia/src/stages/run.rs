@@ -11,7 +11,7 @@ use mumdia_core::manifest::Manifest;
 use mumdia_core::schema::artifact;
 use mumdia_io::record_artifact;
 use mumdia_io::report::ArtifactReport;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::stages::*;
 
@@ -108,6 +108,30 @@ pub fn run(p: RunParams) -> Result<()> {
     let d = |name: &str| format!("{}/{}", p.out_dir, name);
 
     let mut man = Manifest::new(cfg.canonical_json(), ch.clone());
+    info!(provenance = %man.provenance(), "run: build provenance");
+    // Hash the inputs before any of them is read for compute. This is what lets a
+    // result be tied back to the exact bytes it came from; recording only the path
+    // does not, because a path is reused. Cost is one sequential read per input at
+    // blake3 speed, and the file is about to be read again anyway, so it comes off
+    // a warm cache.
+    for (role, path) in [
+        ("mzml", Some(p.mzml)),
+        ("fasta", p.fasta),
+        ("lib_precursors", p.lib_precursors),
+        ("lib_fragments", p.lib_fragments),
+    ] {
+        let Some(path) = path else { continue };
+        match (
+            std::fs::metadata(path).map(|m| m.len()),
+            mumdia_io::hash::blake3_file(path),
+        ) {
+            (Ok(bytes), Ok(hash)) => man.record_input(role, path, bytes, hash),
+            // A missing or unreadable input is already a preflight error; if it
+            // somehow becomes unreadable here, an incomplete manifest is a worse
+            // outcome than a warning.
+            _ => warn!(role, path, "run: could not hash input for the manifest"),
+        }
+    }
 
     // --- experiment-wide artifacts: the spectral library ---
     // Either digest the FASTA (default) or consume a prebuilt library
@@ -305,6 +329,7 @@ pub fn run(p: RunParams) -> Result<()> {
             // held-out, else adapter memorization leaks into the "held-out"
             // residuals and the window shrinks back toward in-sample optimism.
             cfg.rt_im_train.window_holdout_frac,
+            cfg.rng_seed,
         )?;
         // The fine-tuned precursor table is the artifact actually consumed by
         // RT calibration and extraction. Replace the base-library manifest entry

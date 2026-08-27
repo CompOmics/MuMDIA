@@ -20,6 +20,7 @@ use anyhow::Result;
 use arrow::array::{Array, BooleanArray, UInt32Array};
 use arrow::compute::filter_record_batch;
 use mumdia_core::config::{Config, FinetuneScope, QuantQColumn};
+use mumdia_core::manifest::Manifest;
 use rayon::prelude::*;
 use serde_json::json;
 use tracing::{info, warn};
@@ -194,6 +195,7 @@ fn process_run(
             // Keep the fine-tune exclusion aligned with rt-im-train's holdout
             // split (see run.rs); 0.0 (default) changes nothing.
             cfg.rt_im_train.window_holdout_frac,
+            cfg.rng_seed,
         )?;
         produced_ft = Some(lib_p_ft.clone());
         lib_p_ft
@@ -545,6 +547,41 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         "mbr": format!("{:?}", cfg.mbr.strategy),
         "lfq": lfq,
         "peptide_quants": peptide_quants,
+    });
+    // Provenance parity with the single-run manifest. The experiment manifest is
+    // still thinner: it carries no per-artifact records, because the per-run
+    // chains do not thread a shared manifest. What it must not lack is the
+    // identity of the code and the inputs, which is what makes a result
+    // attributable at all.
+    let mut prov = Manifest::new(cfg.canonical_json(), ch.clone());
+    for (i, m) in p.mzmls.iter().enumerate() {
+        if let (Ok(bytes), Ok(hash)) = (
+            std::fs::metadata(m).map(|x| x.len()),
+            mumdia_io::hash::blake3_file(m),
+        ) {
+            prov.record_input(&format!("mzml[{i}]"), m, bytes, hash);
+        }
+    }
+    for (role, path) in [
+        ("fasta", p.fasta),
+        ("lib_precursors", p.lib_precursors),
+        ("lib_fragments", p.lib_fragments),
+    ] {
+        let Some(path) = path else { continue };
+        if let (Ok(bytes), Ok(hash)) = (
+            std::fs::metadata(path).map(|x| x.len()),
+            mumdia_io::hash::blake3_file(path),
+        ) {
+            prov.record_input(role, path, bytes, hash);
+        }
+    }
+    let manifest = serde_json::json!({
+        "mumdia_version": prov.mumdia_version,
+        "git_sha": prov.git_sha,
+        "commit_date": prov.commit_date,
+        "cli_args": prov.cli_args,
+        "inputs": prov.inputs,
+        "experiment": manifest,
     });
     mumdia_io::json::write_json(&d("experiment_manifest.json"), &manifest)?;
     info!(

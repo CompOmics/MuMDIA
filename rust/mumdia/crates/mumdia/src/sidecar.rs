@@ -119,6 +119,7 @@ pub fn run_deeplc_finetune(
     q_train: f64,
     batch: usize,
     window_holdout_frac: f64,
+    rng_seed: u64,
 ) -> Result<()> {
     info!(
         lib_in,
@@ -129,6 +130,7 @@ pub fn run_deeplc_finetune(
         q_train,
         batch,
         window_holdout_frac,
+        rng_seed,
         "sidecar: running DeepLC multitask fine-tune"
     );
     let ep = epochs.to_string();
@@ -136,6 +138,13 @@ pub fn run_deeplc_finetune(
     let qt = q_train.to_string();
     let ba = batch.to_string();
     let hf = window_holdout_frac.to_string();
+    // Seed the fine-tune. Unseeded, the draw varies enough to change results: the
+    // held-out RT window p95 moved 150-211 s across two draws of one benchmark arm,
+    // worth about 2 percent of peptides, which made single-run comparisons of
+    // window sizing or library variants unreadable. Kernel-level nondeterminism
+    // remains, so this narrows the variance rather than removing it
+    // (docs/14_build_test_deploy_gotchas.md).
+    let rs = rng_seed.to_string();
     run_worker(
         python,
         script,
@@ -153,6 +162,8 @@ pub fn run_deeplc_finetune(
             &ba,
             "--window-holdout-frac",
             &hf,
+            "--seed",
+            &rs,
         ],
         true,
     )
