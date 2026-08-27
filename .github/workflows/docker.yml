@@ -1,8 +1,16 @@
 name: Docker image
 
 # Builds the self-contained image (engine + mokapot/MS2PIP/DeepLC sidecars).
-# - On a version tag (v*): builds AND pushes ghcr.io/compomics/mumdia:<tag> + :latest.
-# - Manual (workflow_dispatch): builds only (no push) to validate the image.
+# - On a version tag (v*): builds, smoke-tests, then pushes
+#   ghcr.io/compomics/mumdia:<tag> + :latest.
+# - Manual (workflow_dispatch): builds and smoke-tests only, no push.
+#
+# The smoke test is the point of this workflow outside a release. The image is the
+# only distribution where the Python sidecars are guaranteed present, and nothing
+# else in CI installs DeepLC, mokapot or MS2PIP, so `mumdia doctor` inside the
+# image is the one check that the sidecar environments actually import. It also
+# catches the DeepLC-before-numpy import order, which a module-presence probe
+# cannot see.
 on:
   push:
     tags: ["v*"]
@@ -38,14 +46,65 @@ jobs:
             type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
             type=sha
 
-      - name: Build (and push on a version tag)
+      # Build once into the local daemon so the smoke test runs against exactly
+      # the image that will be pushed. `load` needs a single platform, which is
+      # what we publish anyway.
+      - name: Build
         uses: docker/build-push-action@v6
         with:
           context: .
           file: Dockerfile
           platforms: linux/amd64
-          push: ${{ startsWith(github.ref, 'refs/tags/v') }}
-          tags: ${{ steps.meta.outputs.tags }}
+          load: true
+          push: false
+          tags: mumdia:ci
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Smoke-test the image
+        run: |
+          set -euo pipefail
+          echo "--- version and help ---"
+          docker run --rm mumdia:ci --version
+          docker run --rm mumdia:ci --help > /dev/null
+
+          echo "--- the image must not run as root ---"
+          uid=$(docker run --rm --entrypoint id mumdia:ci -u)
+          test "$uid" != "0" || { echo "image runs as root"; exit 1; }
+          echo "runtime uid: $uid"
+
+          echo "--- both baked configs must parse, and their sidecars must import ---"
+          docker run --rm mumdia:ci doctor --config /opt/mumdia/config.dia.json
+          docker run --rm mumdia:ci doctor --config /opt/mumdia/config.diann-lib.json
+
+          echo "--- the sidecar workers must be importable in their own envs ---"
+          # `doctor` only asks whether a module can be found. Import DeepLC for
+          # real, in the order the worker uses, because the failure this catches
+          # (torch DLL init after numpy) happens at import time and not at probe
+          # time.
+          docker run --rm --entrypoint /opt/conda/envs/deeplc/bin/python mumdia:ci \
+            -c "import deeplc, numpy, pyarrow, torch, psm_utils; print('deeplc', deeplc.__version__, '| torch', torch.__version__)"
+          docker run --rm --entrypoint /opt/conda/envs/rescore/bin/python mumdia:ci \
+            -c "import mokapot, sklearn, numpy, pandas, pyarrow; print('mokapot', mokapot.__version__)"
+
+          echo "--- a bind-mounted output directory must be writable as the host user ---"
+          # This is the documented invocation. If it breaks, the image is unusable
+          # for its primary purpose regardless of what the other checks say.
+          work=$(mktemp -d)
+          docker run --rm -v "$work:/data" --user "$(id -u):$(id -g)" \
+            --entrypoint sh mumdia:ci -c 'mkdir -p /data/out && echo ok > /data/out/probe'
+          test -f "$work/out/probe" || { echo "bind-mount write failed"; exit 1; }
+          echo "bind-mount write OK (file owned by $(stat -c '%u:%g' "$work/out/probe"))"
+
+      - name: Push (version tags only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha

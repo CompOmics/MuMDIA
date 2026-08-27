@@ -4,6 +4,12 @@ name: Release
 #   git tag v0.1.0 && git push origin v0.1.0
 # Then builds a release binary per platform and attaches archives to the
 # GitHub Release for that tag.
+#
+# The archive is a working installation, not just an executable: MuMDIA's ML
+# predictors and rescorers are Python sidecars that the engine launches by path,
+# so a binary on its own cannot fine-tune retention times or rescore with
+# mokapot or the neural network. scripts/, env/ and the example configs ship
+# alongside it, and the checksum file lets a user verify what they downloaded.
 on:
   push:
     tags: ["v*"]
@@ -25,6 +31,9 @@ jobs:
           - os: macos-latest
             target: aarch64-apple-darwin
             exe: ""
+          - os: macos-13
+            target: x86_64-apple-darwin
+            exe: ""
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             exe: ".exe"
@@ -44,20 +53,55 @@ jobs:
       - name: Build
         run: cargo build --release --locked --bin mumdia --target ${{ matrix.target }}
 
+      # A binary that cannot run the pipeline is not a release. Fail here rather
+      # than shipping an archive whose --version or --help is broken.
+      - name: Smoke-test the binary
+        shell: bash
+        if: matrix.target != 'aarch64-apple-darwin'
+        run: |
+          set -euo pipefail
+          bin="target/${{ matrix.target }}/release/mumdia${{ matrix.exe }}"
+          "$bin" --version
+          "$bin" --help >/dev/null
+          "$bin" doctor >/dev/null
+
       - name: Package
         shell: bash
         run: |
+          set -euo pipefail
           name="mumdia-${{ github.ref_name }}-${{ matrix.target }}"
           stage="dist/$name"
+          root=../..
           mkdir -p "$stage"
           cp "target/${{ matrix.target }}/release/mumdia${{ matrix.exe }}" "$stage/"
-          cp ../../README.md ../../LICENSE "$stage/"
+          # Documentation and licence.
+          cp "$root/README.md" "$root/LICENSE" "$root/CHANGELOG.md" "$stage/"
+          cp -r "$root/docs" "$stage/docs"
+          # The Python sidecars the engine invokes, and the environment specs that
+          # make them installable. Without these the binary is native-only.
+          cp -r "$root/scripts" "$stage/scripts"
+          cp -r "$root/env" "$stage/env"
+          # Example configurations, if the tag carries them.
+          if [ -d "$root/configs" ]; then cp -r "$root/configs" "$stage/configs"; fi
           cd dist
           if [ -n "${{ matrix.exe }}" ]; then
             7z a "$name.zip" "$name" >/dev/null
+            archive="$name.zip"
           else
             tar czf "$name.tar.gz" "$name"
+            archive="$name.tar.gz"
           fi
+          # Portable across the three runners: coreutils on Linux and Git Bash,
+          # BSD shasum on macOS.
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$archive" > "$archive.sha256"
+          else
+            shasum -a 256 "$archive" > "$archive.sha256"
+          fi
+          echo "--- archive contents ---"
+          ls -R "$name" | head -40
+          echo "--- checksum ---"
+          cat "$archive.sha256"
 
       - name: Upload to release
         uses: softprops/action-gh-release@v2
@@ -65,4 +109,5 @@ jobs:
           files: |
             rust/mumdia/dist/*.tar.gz
             rust/mumdia/dist/*.zip
+            rust/mumdia/dist/*.sha256
           generate_release_notes: true

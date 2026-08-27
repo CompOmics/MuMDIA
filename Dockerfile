@@ -2,11 +2,17 @@
 # sidecars (mokapot rescoring, MS2PIP fragment intensities, DeepLC retention
 # time) so the full high-sensitivity DIA recipe runs with no host setup:
 #
-#   docker run --rm -v "$PWD:/data" ghcr.io/compomics/mumdia \
+#   docker run --rm -v "$PWD:/data" --user "$(id -u):$(id -g)" \
+#       ghcr.io/compomics/mumdia \
 #       run --fasta /data/proteome.fasta \
 #           --mzml  /data/run.mzML \
 #           --out-dir /data/out \
 #           --config /opt/mumdia/config.dia.json
+#
+# --user makes the results owned by you rather than by the container's user;
+# the image runs unprivileged either way. Check the sidecar environments first:
+#   docker run --rm ghcr.io/compomics/mumdia \
+#       doctor --config /opt/mumdia/config.dia.json
 #
 # The baked /opt/mumdia/config.dia.json wires the FASTA workflow to the in-image
 # conda envs. /opt/mumdia/config.diann-lib.json selects imported-library
@@ -25,9 +31,10 @@ FROM mambaorg/micromamba:1.5.10-bookworm-slim
 USER root
 ENV MAMBA_ROOT_PREFIX=/opt/conda
 
-# git is needed to pip-install DeepLC from its pinned commit; build-essential
-# lets pip compile any sidecar dependency that ships only as an sdist.
-RUN apt-get update && apt-get install -y --no-install-recommends git build-essential \
+# build-essential lets pip compile any sidecar dependency that ships only as an
+# sdist. git is no longer required: DeepLC is pinned to a PyPI version rather than
+# a repository commit (env/docker-deeplc.yml).
+RUN apt-get update && apt-get install -y --no-install-recommends build-essential \
     && rm -rf /var/lib/apt/lists/*
 
 # Two sidecar envs (rescore = mokapot + MS2PIP, deeplc = DeepLC + torch).
@@ -46,6 +53,25 @@ COPY docker/config.diann-lib.json /opt/mumdia/config.diann-lib.json
 # mokapot logistic-regression is the recommended default rescorer.
 ENV MUMDIA_RESCORE_MODEL=logreg
 
+# Standard OCI metadata, so the published image says what it is and links back to
+# the source. The version label is filled from the tag by the build workflow.
+LABEL org.opencontainers.image.title="MuMDIA" \
+      org.opencontainers.image.description="DIA proteomics search engine with bundled Python sidecars" \
+      org.opencontainers.image.source="https://github.com/CompOmics/MuMDIA" \
+      org.opencontainers.image.licenses="Apache-2.0" \
+      org.opencontainers.image.vendor="CompOmics (Ghent University / VIB)"
+
 WORKDIR /data
+
+# Drop back to the base image's unprivileged user. Root was needed only to install
+# apt packages and to create the conda envs under /opt/conda, which are read-only
+# at run time.
+#
+# The container user's uid is assigned by the base image and will not match your
+# host uid, so pass `--user "$(id -u):$(id -g)"` (as the usage example above does)
+# whenever you bind-mount a directory the engine has to write to. Everything
+# MuMDIA writes lands under --out-dir inside that mount, so no path in the image
+# needs to be writable at run time.
+USER $MAMBA_USER
 ENTRYPOINT ["mumdia"]
 CMD ["--help"]
