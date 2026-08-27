@@ -1660,7 +1660,9 @@ mod tests {
         // untracked (see .gitignore), so they are checked by `mumdia doctor`, not here.
         let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../..");
         for name in [
-            "config.local-diann-lib.json",
+            "configs/examples/native.json",
+            "configs/examples/fasta-sidecars.json",
+            "configs/examples/diann-library.json",
             "docker/config.dia.json",
             "docker/config.diann-lib.json",
         ] {

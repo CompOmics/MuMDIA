@@ -41,6 +41,17 @@ than a number. Both are recorded in every run's `manifest.json`.
 - `env/mumdia-deeplc.yml`: a portable conda spec for the DeepLC sidecars. They
   previously had no committed local environment, so running them meant
   reconstructing a developer machine by hand.
+- Sidecar interpreter discovery. A `python` field may be `"auto"` or absent, and
+  the engine finds an interpreter from `MUMDIA_PYTHON_<ROLE>`, `MUMDIA_PYTHON`,
+  `CONDA_PREFIX`, `VIRTUAL_ENV`, or `PATH`, accepting a candidate only after it
+  imports what that role's workers import. A role is resolved only if the
+  configuration uses it, so a default native run still needs no Python at all.
+  Explicit paths behave exactly as before.
+- `configs/examples/{native,fasta-sidecars,diann-library}.json`, portable
+  starting points that use `"auto"`, with `configs/README.md` explaining the
+  resolution order and the environment specs. These replace the only tracked
+  config, which named one developer's interpreters and OneDrive path and was the
+  config the documentation told everyone to run.
 - `ci/check_doc_refs.py`, run in CI: fails when a tracked file cites a Markdown
   document the repository does not ship.
 - `CONTRIBUTING.md`, `SECURITY.md`, this changelog, and
@@ -75,9 +86,17 @@ produces bit-identical results.
   `quantity`, `n_fragments_used`, `quant_status` and `integration_apex_rt`
   bit-identical, and the reported window corrected from a 29.1 s median (the
   descent walk) to 34.9 s (the fixed window that produced the numbers).
-- `mumdia doctor` probes the packages the DeepLC sidecars really import
-  (`deeplc`, `numpy`, `pandas`, `pyarrow`, `torch`, `psm_utils`), not a shorter
-  list that let a broken environment pass.
+- `mumdia doctor` reports whether the configuration can actually run: the
+  interpreter each role resolves to and how it was found, the versions of the
+  packages whose version changes results, whether the worker scripts are where
+  the engine will look, and a warning when DeepLC is older than 4.1.1. It now
+  covers `mbr.python` and the script directory, neither of which it checked
+  before, and it no longer fails a native configuration over a worker directory
+  that configuration never opens.
+- `predict_frag.sidecar_script_dir` is resolved against the config file's own
+  directory and against the executable's directory, not only the current working
+  directory. The same config invoked from elsewhere used to silently change which
+  worker scripts ran.
 - `run-experiment` warns when it overrides the configured `quant.q_filter` to
   gate per-run quantification on the pooled q value, instead of doing it
   silently.

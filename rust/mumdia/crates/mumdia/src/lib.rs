@@ -8,6 +8,7 @@ pub mod index;
 pub mod matchers;
 pub mod peaks;
 pub mod predict;
+pub mod python;
 pub mod quant_lfq;
 pub mod rescoring;
 pub mod sidecar;

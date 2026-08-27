@@ -359,76 +359,207 @@ enum Cmd {
     },
 }
 
-/// Probe each configured sidecar interpreter for its required packages, so a
-/// broken or missing environment is reported clearly instead of failing mid-run.
-fn doctor(cfg: &Config) -> Result<()> {
-    use mumdia_core::config::RescorerKind;
-    use std::process::Command;
-    // The rescore sidecar's required packages depend on the selected classifier:
-    // the PyTorch NN needs torch; mokapot/entrapment need mokapot + sklearn.
-    let (rescore_label, rescore_pkgs) = match cfg.rescore.classifier {
-        RescorerKind::NnTorch => ("rescore.python (nn_torch)", "torch,numpy,pandas,pyarrow"),
-        _ => (
-            "rescore.python (mokapot)",
-            "mokapot,sklearn,numpy,pandas,pyarrow",
-        ),
-    };
-    let checks = [
-        (rescore_label, cfg.rescore.python.as_deref(), rescore_pkgs),
-        (
-            // The DeepLC interpreter runs both `deeplc_worker.py` (prediction) and
-            // `deeplc_finetune.py` (transfer learning), and the latter imports pyarrow, torch and
-            // psm_utils on top of deeplc itself. Probing only `deeplc,numpy,pandas` let a green
-            // doctor precede a crash at the fine-tune step, which on an experiment-wide batch is
-            // discovered long after the run is launched. DeepLC 4.x pulls torch and psm-utils
-            // itself, so in practice this catches a missing pyarrow, but the check should assert
-            // what the scripts actually import rather than what the dependency tree implies.
-            "predict_frag.deeplc_python (DeepLC)",
-            cfg.predict_frag.deeplc_python.as_deref(),
-            "deeplc,numpy,pandas,pyarrow,torch,psm_utils",
-        ),
-        (
-            "predict_frag.ms2pip_python (MS2PIP)",
-            cfg.predict_frag.ms2pip_python.as_deref(),
-            "ms2pip,numpy,pandas",
-        ),
-    ];
+/// Report whether this configuration can actually run: which interpreter each
+/// sidecar role resolves to, whether it can import what its workers import, which
+/// versions it has, and whether the worker scripts are where the engine will look
+/// for them.
+///
+/// What this replaces: the previous version probed three hard-coded interpreters
+/// and reported `[skip]` for anything unset. It never probed `mbr.python`, never
+/// checked that `sidecar_script_dir` existed (the most common misconfiguration,
+/// and the one baked into the tracked example config), and reported no versions,
+/// so a DeepLC old enough to change results looked identical to a current one.
+fn doctor(cfg: &Config, config_path: Option<&str>) -> Result<()> {
+    use mumdia::python::{self, Role, ALL_ROLES};
+
+    let mut cfg = cfg.clone();
+    let script_dir = python::resolve_script_dir(&cfg.predict_frag.sidecar_script_dir, config_path);
+    let dir_moved = script_dir != cfg.predict_frag.sidecar_script_dir;
+    cfg.predict_frag.sidecar_script_dir = script_dir.clone();
+
     let mut bad = false;
-    for (label, py, pkgs) in checks {
-        match py {
-            None => println!("  [skip] {label}: not configured (native path used)"),
-            Some(interp) => {
-                let code = format!(
-                    "import importlib.util as u; m=[p for p in '{pkgs}'.split(',') if u.find_spec(p) is None]; print('MISSING '+','.join(m) if m else 'OK')"
+    let any_sidecar = ALL_ROLES.iter().any(|r| r.required_by(&cfg));
+
+    // 1. Worker scripts, checked before the interpreters because a missing script
+    //    directory makes every interpreter irrelevant. Skipped entirely when the
+    //    configuration needs no sidecar: the native predictors and `native_tda`
+    //    rescorer are the default, and that run must not be failed for a directory
+    //    it never opens.
+    println!("worker scripts");
+    let dir = std::path::Path::new(&script_dir);
+    if !any_sidecar {
+        println!("  [skip] no Python sidecar is needed by this configuration");
+    } else if !dir.is_dir() {
+        bad = true;
+        println!(
+            "  [FAIL] predict_frag.sidecar_script_dir: {script_dir} is not a directory.\n\
+             \x20        Point it at the `scripts/` directory that ships beside the binary."
+        );
+    } else {
+        if dir_moved {
+            println!("  [note] resolved sidecar_script_dir to {script_dir}");
+        }
+        let mut missing: Vec<&str> = Vec::new();
+        for role in ALL_ROLES {
+            if !role.required_by(&cfg) {
+                continue;
+            }
+            for worker in role.workers() {
+                if !dir.join(worker).exists() {
+                    missing.push(worker);
+                }
+            }
+        }
+        if missing.is_empty() {
+            println!("  [ ok ] {script_dir}");
+        } else {
+            bad = true;
+            missing.sort_unstable();
+            missing.dedup();
+            println!("  [FAIL] {script_dir}: missing {}", missing.join(", "));
+        }
+    }
+
+    // 2. Interpreters, one line per role, resolving `auto` exactly as a run would.
+    println!("sidecar interpreters");
+    for role in ALL_ROLES {
+        let configured = match role {
+            Role::Rescore => cfg.rescore.python.clone(),
+            Role::DeepLc => cfg.predict_frag.deeplc_python.clone(),
+            Role::Ms2pip => cfg.predict_frag.ms2pip_python.clone(),
+            Role::Mbr => cfg.mbr.python.clone(),
+        };
+        let required = role.required_by(&cfg);
+        let modules = role.modules(&cfg);
+        let explicit = configured
+            .as_deref()
+            .map(|v| !v.eq_ignore_ascii_case(python::AUTO))
+            .unwrap_or(false);
+        let label = role.field();
+
+        // Neither needed nor named: say so and probe nothing. Discovery here used
+        // to run for every role and then report the interpreter it happened to
+        // find as "configured but not needed", which described neither the config
+        // nor the outcome.
+        if !required && !explicit {
+            println!("  [skip] {label}: not needed by this config");
+            continue;
+        }
+
+        let (path, provenance) = if explicit {
+            (configured.clone(), "configured")
+        } else {
+            match python::discover(role, &cfg) {
+                Some((p, src)) => (Some(p), src),
+                None => (None, "not found"),
+            }
+        };
+        match (&path, required) {
+            (None, true) => {
+                bad = true;
+                println!(
+                    "  [FAIL] {label}: required by this config, and no usable interpreter was \
+                     found.\n\x20        Set it, set {}, or activate an environment that can \
+                     import {}.",
+                    role.env_var(),
+                    modules.join(", ")
                 );
-                match Command::new(interp).args(["-c", &code]).output() {
-                    Ok(o) => {
-                        let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
-                        if o.status.success() && s == "OK" {
-                            println!("  [ ok ] {label}: {interp}");
-                        } else {
-                            bad = true;
-                            let detail = if s.is_empty() {
-                                String::from_utf8_lossy(&o.stderr).trim().to_string()
+            }
+            (None, false) => println!("  [skip] {label}: not needed by this config"),
+            (Some(p), _) => {
+                let interp = std::path::Path::new(p);
+                match python::missing_modules(interp, modules) {
+                    Ok(missing) if missing.is_empty() => {
+                        // Versions of the packages whose version changes results.
+                        let mut notes: Vec<String> = Vec::new();
+                        for m in ["deeplc", "torch", "mokapot", "ms2pip", "numpy"] {
+                            if modules.contains(&m) {
+                                if let Some(v) = python::module_version(interp, m) {
+                                    notes.push(format!("{m} {v}"));
+                                }
+                            }
+                        }
+                        let tag = if required { " ok " } else { "note" };
+                        println!(
+                            "  [{tag}] {label}: {p} ({provenance}){}",
+                            if notes.is_empty() {
+                                String::new()
                             } else {
-                                s
-                            };
-                            println!("  [FAIL] {label}: {interp}\n         {detail}");
+                                format!("\n\x20        {}", notes.join(", "))
+                            }
+                        );
+                        if !required {
+                            println!("\x20        (configured but not needed by this config)");
+                        }
+                        // DeepLC below 4.1.1 changes results rather than only
+                        // performance: the 4.0.0a2 multitask preview overfits
+                        // per-run fine-tuning badly enough to invert RT-model
+                        // rankings (docs/08_rt_im_train.md).
+                        if role == Role::DeepLc && required {
+                            if let Some(v) = python::module_version(interp, "deeplc") {
+                                if version_below(&v, &[4, 1, 1]) {
+                                    println!(
+                                        "\x20        [warn] DeepLC {v} is older than the \
+                                         supported floor 4.1.1; results, not just speed, differ"
+                                    );
+                                }
+                            }
                         }
                     }
+                    Ok(missing) => {
+                        if required {
+                            bad = true;
+                        }
+                        println!(
+                            "  [{}] {label}: {p} ({provenance}) cannot import {}",
+                            if required { "FAIL" } else { "warn" },
+                            missing.join(", ")
+                        );
+                    }
                     Err(e) => {
-                        bad = true;
-                        println!("  [FAIL] {label}: cannot run {interp}: {e}");
+                        if required {
+                            bad = true;
+                        }
+                        println!(
+                            "  [{}] {label}: {e}",
+                            if required { "FAIL" } else { "warn" }
+                        );
                     }
                 }
             }
         }
     }
+
     if bad {
-        anyhow::bail!("mumdia doctor: one or more configured sidecar environments are not usable");
+        anyhow::bail!(
+            "mumdia doctor: this configuration cannot run as it stands (see the FAIL lines above)"
+        );
     }
-    println!("mumdia doctor: all configured sidecar environments OK");
+    println!("mumdia doctor: configuration is runnable");
     Ok(())
+}
+
+/// True when the dotted version `v` is below `floor`. Unparseable components
+/// compare as 0, so a pre-release such as `4.0.0a2` reads as 4.0.0 and stays below
+/// a 4.1.1 floor, which is the direction that matters here.
+fn version_below(v: &str, floor: &[u32]) -> bool {
+    let parts: Vec<u32> = v
+        .split(['.', '-', '+'])
+        .map(|p| {
+            p.chars()
+                .take_while(char::is_ascii_digit)
+                .collect::<String>()
+                .parse()
+                .unwrap_or(0)
+        })
+        .collect();
+    for (i, want) in floor.iter().enumerate() {
+        let got = parts.get(i).copied().unwrap_or(0);
+        if got != *want {
+            return got < *want;
+        }
+    }
+    false
 }
 
 fn load_config(_path: &Option<String>) -> Result<Config> {
@@ -706,6 +837,7 @@ fn main() -> Result<()> {
             }
             stages::run::run(stages::run::RunParams {
                 config: &cfg,
+                config_path: config.as_deref(),
                 fasta: fasta.as_deref(),
                 mzml: &mzml,
                 out_dir: &out_dir,
@@ -738,6 +870,7 @@ fn main() -> Result<()> {
             };
             stages::run_experiment::run(stages::run_experiment::RunExperimentParams {
                 config: &cfg,
+                config_path: config.as_deref(),
                 fasta: fasta.as_deref(),
                 mzmls: &mzml,
                 run_names,
@@ -866,7 +999,8 @@ fn main() -> Result<()> {
             );
         }
         Cmd::Doctor { config } => {
-            doctor(&load_config(&config)?)?;
+            let cfg = load_config(&config)?;
+            doctor(&cfg, config.as_deref())?;
         }
     }
     Ok(())

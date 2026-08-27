@@ -667,7 +667,7 @@ every other section), so both keys are required inside a `ResidueMod` entry.
 | `charge_by_basic_residues` | `false` | when true, keep a b/y fragment at charge z only if `z <= 1+(basic residues within the fragment)` and `z <= precursor charge`; supersedes `charge2_from_precursor_charge` |
 | `top_n_fragments` | 6 | fragments kept per candidate |
 | `ms2pip_model` | `"HCD"` | MS2PIP model name |
-| `ms2pip_python` | `None` | interpreter for MS2PIP sidecar |
+| `ms2pip_python` | `None` | interpreter for MS2PIP sidecar; `"auto"` discovers one (`docs/13_sidecars.md`) |
 | `deeplc_python` | `None` | interpreter for DeepLC sidecar |
 | `sidecar_script_dir` | `"scripts"` | directory holding worker scripts |
 

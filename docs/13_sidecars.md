@@ -461,6 +461,56 @@ every entry on one axis before extraction, so no explicit reconciliation is done
 | `expected_rt` | `mbr_worker.py:116` | Cross-run predicted RT of a candidate in a run from the other runs' anchors |
 | `frag_mz` / `reverse_keep_cterm` / `stable_seed` / `splitmix` | `make_reverse_decoys.py:58/56/74/65` | Residue-mass b/y m/z; C-term-fixed reversal; process-independent FNV-1a seed; seeded PRNG for scramble |
 
+## Interpreter resolution
+
+Each sidecar role has one config field naming the Python that runs it:
+`rescore.python`, `predict_frag.deeplc_python`, `predict_frag.ms2pip_python`,
+`mbr.python`. Implemented in `rust/mumdia/crates/mumdia/src/python.rs`.
+
+A field may hold an absolute path, which is used as given and never
+second-guessed, or the string `"auto"` (or be absent), which asks the engine to
+find one. Discovery order, from `python.rs`:
+
+| order | source | provenance reported |
+|---|---|---|
+| 1 | `MUMDIA_PYTHON_RESCORE` / `_DEEPLC` / `_MS2PIP` / `_MBR` | the variable name |
+| 2 | `MUMDIA_PYTHON` (all roles) | `MUMDIA_PYTHON` |
+| 3 | `CONDA_PREFIX`: `bin/python`, `python.exe`, `Scripts/python.exe` | `CONDA_PREFIX` |
+| 4 | `VIRTUAL_ENV`, same three layouts | `VIRTUAL_ENV` |
+| 5 | `python3`, then `python`, on `PATH` | `PATH` |
+
+A candidate is accepted only after it imports the role's own module list, so
+discovery cannot pick a Python without torch and defer the failure to the rescore
+stage hours later. The module lists live on `Role::modules` and are the same ones
+`doctor` probes:
+
+| role | modules |
+|---|---|
+| `Rescore`, `classifier = nn_torch` | torch, numpy, pandas, pyarrow |
+| `Rescore`, mokapot or entrapment | mokapot, sklearn, numpy, pandas, pyarrow |
+| `DeepLc` | deeplc, numpy, pandas, pyarrow, torch, psm_utils |
+| `Ms2pip` | ms2pip, numpy, pandas |
+| `Mbr` | numpy, pyarrow |
+
+A role is resolved only when the configuration actually uses it
+(`Role::required_by`): the rescorer classifier, `rt_predictor`/`finetune_deeplc`,
+`predictor`, and `mbr.strategy` respectively. A default native run therefore
+needs no interpreter, probes nothing, and works on a machine with no Python. A
+role that is needed but unresolvable is a hard error in preflight, naming the
+field, the environment variable, and the modules required.
+
+Resolution runs before the config hash is computed, so `manifest.json` records
+the interpreter that actually ran rather than the word `auto`. This makes the hash
+machine-specific for an `auto` config, which is the honest outcome: two runs whose
+rescorer came from different environments are not the same configuration.
+
+`predict_frag.sidecar_script_dir` is resolved the same way
+(`python::resolve_script_dir`): the configured value if it holds the workers, then
+the same path relative to the config file's own directory, then `scripts/` beside
+the executable, which is the release-archive layout. Previously it was interpreted
+against the current working directory alone, so invoking the same config from
+another directory silently changed which scripts ran.
+
 ## Configuration
 
 Config was recently pruned; every field below exists in `mumdia-core/src/config.rs`

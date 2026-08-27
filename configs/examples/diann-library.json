@@ -10,12 +10,12 @@
     "rt_window_multiplier": 1.5
   },
   "predict_frag": {
-    "deeplc_python": "C:/Users/robbi/anaconda3/envs/deeplc_mt/python.exe",
-    "sidecar_script_dir": "H:/OneDrive - UGent/MuMDIA_NG/scripts"
+    "deeplc_python": "auto",
+    "sidecar_script_dir": "scripts"
   },
   "rescore": {
     "classifier": "nn_torch",
-    "python": "C:/Users/robbi/anaconda3/envs/py312_mumdia/python.exe",
+    "python": "auto",
     "strict": true
   },
   "quant": {

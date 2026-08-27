@@ -42,14 +42,14 @@ decoys, per-run DeepLC fine-tuning, Extended features, the default
 Run from the repository root, using a fresh output directory:
 
 ```text
-mumdia doctor --config config.local-diann-lib.json
+mumdia doctor --config configs/examples/diann-library.json
 
 mumdia run \
   --lib-precursors lib/lib_precursors.parquet \
   --lib-fragments lib/lib_fragments.parquet \
   --mzml mzml_files/LFQ_Orbitrap_AIF_Ecoli_01.mzML \
   --out-dir out_aif_nn \
-  --config config.local-diann-lib.json \
+  --config configs/examples/diann-library.json \
   --top-peaks-ms2 300
 ```
 
@@ -247,7 +247,7 @@ python scripts/augment_library.py \
   --out-precursors lib/lib_precursors_aug.parquet \
   --out-fragments lib/lib_fragments_aug.parquet \
   --mumdia-bin <path to mumdia release binary> \
-  --config config.local-diann-lib.json \
+  --config configs/examples/diann-library.json \
   --work-dir <scratch>
 ```
 

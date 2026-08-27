@@ -69,7 +69,7 @@ Docker image bakes). `mumdia doctor` probes the interpreters named in a config
 and reports which packages import, so run it after editing paths:
 
 ```
-C:/Users/robbi/mumdia_build/release/mumdia.exe doctor --config config.local-diann-lib.json
+C:/Users/robbi/mumdia_build/release/mumdia.exe doctor --config configs/examples/diann-library.json
 ```
 
 ### Environment to config-field mapping
@@ -216,11 +216,14 @@ deterministic across runs and high-precision.
 
 Library-input mode plus the local sidecar config. `run` skips
 digest/peptidoforms/predict-frag and consumes the prebuilt library
-(`main.rs:208-215`). The config `config.local-diann-lib.json` (repository root)
-turns on: Extended features, `min_frag_corr = 0.2`, rolling-window apex (5) and
-RT prior (120 s), the per-run DeepLC fine-tune via `deeplc_mt`, the `nn_torch`
-rescorer via `py312_mumdia` with `rescore.strict = true`, an RT-window
-multiplier of 1.5, and `quant.q_filter = run_psm_q`. Use a new output directory:
+(`main.rs:208-215`). The config `configs/examples/diann-library.json` turns on:
+Extended features, `min_frag_corr = 0.2`, rolling-window apex (5) and RT prior
+(120 s), the per-run DeepLC fine-tune, the `nn_torch` rescorer with
+`rescore.strict = true`, an RT-window multiplier of 1.5, and
+`quant.q_filter = run_psm_q`. Both interpreters are `"auto"`, so they are
+discovered from `MUMDIA_PYTHON_*`, an activated environment, or `PATH`, and a
+candidate is accepted only if it can import what the worker imports; name an
+absolute path instead if you prefer to pin one. Use a new output directory:
 `run` has no cache/resume and does not clear stale optional files from a reused
 directory.
 
@@ -230,7 +233,7 @@ C:/Users/robbi/mumdia_build/release/mumdia.exe run \
   --lib-fragments  lib/lib_fragments.parquet \
   --mzml mzml_files/LFQ_Orbitrap_AIF_Ecoli_01.mzML \
   --out-dir out_lib \
-  --config config.local-diann-lib.json \
+  --config configs/examples/diann-library.json \
   --top-peaks-ms2 300
 ```
 
@@ -274,7 +277,7 @@ failure fatal, and the report is the source of truth.
 
 ### Fast smoke checks
 
-Start with `mumdia doctor --config config.local-diann-lib.json`; it validates
+Start with `mumdia doctor --config configs/examples/diann-library.json`; it validates
 imports without launching a full run.
 
 Do not use `--max-spectra 20000` with the fine-tuning recipe as a sidecar smoke
@@ -301,7 +304,7 @@ Treat the Section 4 counts as regression targets on
 
 - Native FASTA run (`--profile dia`): approximately 1,213 precursor-shaped
   report rows passing peptide q <= 1%, deterministic (exact match expected).
-- Best-workflow library run (`config.local-diann-lib.json`, strict `nn_torch`,
+- Best-workflow library run (`configs/examples/diann-library.json`, strict `nn_torch`,
   explicit `--top-peaks-ms2 300`): approximately 10,300 rows under the same
   report definition. Treat this as a band because DeepLC fine-tuning is unseeded
   and NnTorch is seeded but not bit-deterministic.

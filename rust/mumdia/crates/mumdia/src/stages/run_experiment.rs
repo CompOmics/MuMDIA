@@ -28,6 +28,8 @@ use crate::stages::*;
 
 pub struct RunExperimentParams<'a> {
     pub config: &'a Config,
+    /// Path the config was loaded from; see `RunParams::config_path`.
+    pub config_path: Option<&'a str>,
     pub fasta: Option<&'a str>,
     pub mzmls: &'a [String],
     /// Optional per-run labels (default `r0..rN-1`); also the per-run subdir names.
@@ -269,6 +271,17 @@ fn split_by_source(scored: &str, out_paths: &[String]) -> Result<()> {
 
 pub fn run(p: RunExperimentParams) -> Result<()> {
     let t0 = Instant::now();
+    // Same contract as the single-run orchestrator, and it matters more here: an
+    // 83-file batch must not fail on a missing interpreter after the first run has
+    // already been searched.
+    let mut resolved = p.config.clone();
+    resolved.predict_frag.sidecar_script_dir =
+        crate::python::resolve_script_dir(&resolved.predict_frag.sidecar_script_dir, p.config_path);
+    crate::python::resolve(&mut resolved)?;
+    let p = RunExperimentParams {
+        config: &resolved,
+        ..p
+    };
     let cfg = p.config;
     preflight(&p)?;
     let ch = mumdia_io::hash::blake3_str(&cfg.canonical_json());

@@ -203,9 +203,11 @@ Goal: `main` is green on the full gate and contains all validated code.
       ignoring this document.
 - [ ] Move the two or three configs worth keeping into `configs/examples/` with
       placeholders instead of machine paths (see WP3).
-- [ ] Remove `config.local-diann-lib.json` from tracking after WP3 provides a
-      portable replacement; update the references in `README.md`, `CLAUDE.md`,
-      `docs/19`, `docs/20`.
+- [x] Remove `config.local-diann-lib.json` from tracking after WP3 provides a
+      portable replacement; update the references in `CLAUDE.md`, `docs/19`,
+      `docs/20`. Replaced by `configs/examples/{native,fasta-sidecars,diann-library}.json`,
+      all using `"auto"`; the old file stays on disk but ignored. `README.md`
+      never named it.
 - [x] Decide `plan.md` (WP0 #7) and act on it: it stays untracked, and the 130
       citations that pointed at it and at other local notes now point at the
       tracked guide (`ec89265`).

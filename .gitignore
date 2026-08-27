@@ -66,4 +66,7 @@ scripts/_probe*.py
 # (`/*.md` above already keeps root-level notes local; these cover the configs.)
 config.strasbourg*.json
 config.*-local.json
+# Superseded by configs/examples/*.json, which resolve interpreters with "auto".
+# Kept ignored so an existing local copy keeps working without being committed.
+config.local-*.json
 deploy_local/

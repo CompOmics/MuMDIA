@@ -30,7 +30,7 @@ Usage:
     --out-precursors lib/lib_precursors_aug.parquet \
     --out-fragments  lib/lib_fragments_aug.parquet \
     --mumdia-bin /path/to/mumdia.exe \
-    --config config.local-diann-lib.json \
+    --config configs/examples/diann-library.json \
     --work-dir <scratch> \
     [--match-level base_sequence|peptidoform_charge] \
     [--decoy-strategy shift|reverse]

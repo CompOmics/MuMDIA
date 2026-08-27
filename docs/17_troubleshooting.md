@@ -124,6 +124,36 @@ itself, so the extra names usually catch a missing pyarrow; the check asserts
 what the scripts import rather than what the dependency tree implies. Re-run
 doctor after any environment change instead of trusting an earlier green result.
 
+## Sidecar interpreter not found, or the wrong one used
+
+**Symptom.** `... is required by this configuration but no usable interpreter was
+found`, or a run that reaches rescore and fails on a missing module.
+
+**Cause and fix.** The role's field is absent or `"auto"` and nothing on the
+machine could import what the worker imports. The message lists every place that
+was searched and every module that was required. In order of directness: name the
+interpreter in the config; export the role's variable
+(`MUMDIA_PYTHON_RESCORE`, `MUMDIA_PYTHON_DEEPLC`, `MUMDIA_PYTHON_MS2PIP`,
+`MUMDIA_PYTHON_MBR`); or activate an environment so `CONDA_PREFIX` or
+`VIRTUAL_ENV` points at it. `env/mumdia-rescore.yml` and `env/mumdia-deeplc.yml`
+build suitable environments.
+
+**Symptom.** Discovery picks an interpreter you did not expect.
+
+**Cause and fix.** An activated environment (`CONDA_PREFIX`) outranks `PATH`, and
+a role-specific variable outranks both. Run
+`mumdia doctor --config <your config>`: it reports the resolved path, the
+provenance (which rule matched), and the versions found. Pin the path in the
+config when the machine has several candidate environments.
+
+**Symptom.** `doctor` is green but a DeepLC run's retention-time windows look
+wrong.
+
+**Cause and fix.** Check the DeepLC version `doctor` prints. Below 4.1.1 it warns,
+because the 4.0.0a2 multitask preview overfits per-run fine-tuning badly enough to
+invert RT-model rankings (see the retention-time section below). That is a
+different result, not a slower one.
+
 ## No fallback outside rescore
 
 Only `rescore` has a native fallback. The predictor, fine-tune, and MBR stages
