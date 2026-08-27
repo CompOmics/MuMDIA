@@ -325,9 +325,11 @@ succeeds without editing any path.
 - [ ] `docs/15`: add the TSV columns (currently excluded, `docs/15:816-826`).
 - [ ] `docs/14`: refresh the test counts (states 126, actual 152) and describe
       the new CI gates.
-- [ ] Reference-run resource table: wall clock, peak RSS, disk per stage for one
-      AIF file and for the six-file HYE experiment, from the `elapsed_ms` values
-      already in `report.json`.
+- [x] Reference-run resource table, in `bench/README.md`: per-stage wall clock
+      and artifact sizes for one AIF file, taken from each artifact's
+      `report.json`. Measured 85 minutes and 13.1 GB of artifacts from a 1.94 GB
+      mzML, with rescoring 80% of the run. Peak RSS is still not recorded, and the
+      six-file experiment profile is not yet measured.
 - [ ] `CHANGELOG.md` (Keep a Changelog format), `CITATION.cff`,
       `CONTRIBUTING.md` (build, gates, clean-room rule, how to add a stage),
       `SECURITY.md`, issue and PR templates.
@@ -338,31 +340,46 @@ quickstart on their machine using only the docs. Record who did it and when in
 
 ### WP6. Validation assets (5 to 8 days, partly parallel with WP3 to WP5)
 
-- [ ] Fixture: a small public DIA slice (mid-gradient, a few hundred MS2
-      spectra from the PRIDE AIF E. coli file or the ProteoBench Astral raws)
-      plus a matching library subset of a few thousand precursors, under
-      `test_data/` with a licence note. If larger than a few MB, fetch in CI
-      from a fixed URL with a checksum.
-- [ ] End-to-end smoke test in CI: `mumdia run` on the fixture in FASTA-native
-      mode (no sidecars) with count bands; a second job with the conda env for
-      the sidecar path. Assert `manifest.json` completeness and the documented
-      artifact schema versions.
+- [x] Fixture, solved differently and better: nothing binary is committed and
+      nothing is fetched. `test_data/fixture.fasta` (16 synthetic proteins, 160
+      peptides, 3,820 library candidates) plus `ci/make_fixture_mzml.py`, which
+      reads the library the engine itself just built and plants exactly those m/z
+      values. The fixture therefore cannot disagree with the mass model, and no
+      licence question arises.
+- [x] End-to-end smoke test in CI (`ci/smoke.sh`, `ci/check_smoke.py`, 112
+      assertions, Linux and Windows): `mumdia run` on the fixture in native mode,
+      manifest completeness, all 17 artifact schema versions, and byte-identical
+      output across two runs. Measured 99.3% planted-peptide recovery, zero decoys
+      at 1% peptide q, LOESS calibration on 110 anchors.
+- [ ] A second smoke job with a conda env for the sidecar path; macOS coverage for
+      the smoke job.
 - [ ] Python tests (`pytest`) for each worker on a synthetic 200-row PIN or
       table: contract coverage (every input row scored once, finite scores),
       the M5 q-lowering in `mbr_worker.py`, the DeepLC import order.
-- [ ] Robustness audit of production `unwrap` sites (`quant.rs` 21,
-      `audit.rs` 15, `prescan.rs` 12) and tests for missing optional columns,
-      empty runs, runs with no decoys, and a failing sidecar.
-- [ ] Determinism: seed `deeplc_finetune.py` (numpy and torch, record the seed
-      in `report.json`); document remaining non-determinism in `docs/14`.
-- [ ] Provenance: manifest gains git SHA and build date (`build.rs` or
-      `vergen`), hashes of the input mzML, FASTA, and library, and the CLI
-      arguments; `experiment_manifest.json` gains the same fields as
-      `manifest.json`.
-- [ ] Benchmark suite under `bench/`: scripts that reproduce the AIF E. coli
-      count, the HYE AIF ProteoBench scores, and the Astral ProteoBench scores
-      against the recorded DIA-NN references, using the ProteoBench offline
-      scorer. Results and the exact commit go into `docs/18`.
+- [x] Tests for the degenerate inputs: a missing optional column (`quant` reads
+      `predicted_intensity` optionally), an empty chromatogram table, a one-sided
+      target/decoy population, and `report` with nothing above threshold. A
+      failing sidecar now names the interpreter, the script and the argv.
+- [ ] The `unwrap` audit itself (`quant.rs` 21, `audit.rs` 15, `prescan.rs` 12)
+      is not done; the degenerate-input tests cover the paths those sites sit on,
+      but the sites were not individually reviewed.
+- [x] Determinism: `deeplc_finetune.py` takes `--seed`, wired from `rng_seed`,
+      and seeds numpy and torch. The seed is logged and reaches `manifest.json`
+      through the resolved config rather than a separate `report.json` field.
+      Training kernels remain non-deterministic, which both the flag help and the
+      log line state.
+- [x] Provenance: `mumdia-core/build.rs` stamps the short commit (with `-dirty`)
+      and the commit date; the manifest gains `git_sha`, `commit_date`,
+      `cli_args`, hashed `inputs` and `provenance()`. `experiment_manifest.json`
+      gains the same provenance, though still no per-artifact records.
+- [x] `bench/`: the portable part of the scoring path (submission builder,
+      offline scorer with `--module`, condition-evidence filter), the two recorded
+      ProteoBench results with their units and the DIA-NN references, and the
+      resource profile. `prov_filter.py` is verified to reproduce the recorded F1
+      counts exactly. The second-pass shell pipeline is deliberately not vendored:
+      it becomes engine code in WP7.
+- [ ] Record the results in `docs/18` as well, and re-measure at the tagged
+      commit.
 
 Acceptance: CI runs the fixture on every PR; the benchmark suite reproduces
 the numbers in `docs/18` on the reference machine at the tagged commit.

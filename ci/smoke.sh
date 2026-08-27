@@ -86,4 +86,27 @@ echo "=== smoke: also check inspect and report run standalone"
     --peptide-quant "$work/out/peptide_quant.parquet" --q 0.05 > /dev/null
 test -s "$work/report_only/peptides.tsv"
 
+# Hashes of the user-facing outputs, for the cross-platform comparison in CI.
+# Measured 2026-08-27: these are IDENTICAL on Windows and Linux, down to the
+# quantity digits, so the native pipeline is byte-reproducible across operating
+# systems and not merely across runs on one machine. That is a property worth
+# keeping, and the only way to keep it is to check it.
+#
+# No expected value is committed. A golden hash would have to be updated by every
+# legitimate change to scoring, which turns an improvement into a chore and
+# eventually into a rubber stamp. CI compares the two platforms against each
+# other instead.
+hashfile="$repo/smoke_output_hashes.txt"
+: > "$hashfile"
+for f in peptides.tsv proteins.tsv; do
+    if command -v sha256sum >/dev/null 2>&1; then
+        h=$(sha256sum "$work/out/$f" | cut -d" " -f1)
+    else
+        h=$(shasum -a 256 "$work/out/$f" | cut -d" " -f1)
+    fi
+    echo "$h  $f" >> "$hashfile"
+done
+echo "=== smoke: output hashes"
+cat "$hashfile"
+
 echo "SMOKE_OK"

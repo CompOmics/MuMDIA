@@ -48,6 +48,8 @@ scripts/_probe*.py
 !/CODE_OF_CONDUCT.md
 # local archive of superseded working docs (not published)
 /_archive/
+# Emitted by ci/smoke.sh for the cross-platform comparison in CI.
+/smoke_output_hashes.txt
 # Local benchmark inputs and scratch outputs (tens of GB; never source). The
 # imported spectral libraries under lib/ are irreplaceable local data, not build
 # output: ignoring them keeps them out of commits without risking deletion.

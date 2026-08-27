@@ -115,6 +115,50 @@ jobs:
         shell: bash
         run: ci/smoke.sh
 
+      - name: Upload output hashes
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-hashes-${{ matrix.os }}
+          path: smoke_output_hashes.txt
+          if-no-files-found: error
+
+  # The native pipeline is byte-reproducible across operating systems, not only
+  # across runs on one machine: measured 2026-08-27, `peptides.tsv` and
+  # `proteins.tsv` hash identically on Windows and Linux down to the quantity
+  # digits. Nothing enforced that, so a platform-dependent float reduction or a
+  # HashMap-order sum could reintroduce a difference silently.
+  #
+  # The two platforms are compared against each other rather than against a
+  # committed hash. A golden value would have to be updated by every legitimate
+  # change to scoring, which turns an improvement into a chore and the check into a
+  # rubber stamp.
+  smoke-cross-platform:
+    name: cross-platform byte equality
+    runs-on: ubuntu-latest
+    needs: smoke
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: smoke-hashes-*
+          path: hashes
+
+      - name: Compare
+        run: |
+          set -euo pipefail
+          echo "--- collected ---"
+          for f in hashes/*/smoke_output_hashes.txt; do echo "== $f"; cat "$f"; done
+          n=$(ls -d hashes/*/ | wc -l)
+          test "$n" -ge 2 || { echo "need at least two platforms, got $n"; exit 1; }
+          first=""
+          for f in hashes/*/smoke_output_hashes.txt; do
+            if [ -z "$first" ]; then first="$f"; continue; fi
+            diff "$first" "$f" || {
+              echo "outputs differ between platforms; see the hashes above" >&2
+              exit 1
+            }
+          done
+          echo "all platforms produced byte-identical peptides.tsv and proteins.tsv"
+
   sidecars:
     name: python sidecars + configs
     runs-on: ubuntu-latest
