@@ -92,8 +92,9 @@ For the mapping from each conda environment to the config field that points at i
 | `rust/mumdia/crates/mumdia/src/stages/rescore.rs` | Call sites for mokapot/nn_torch (PIN) + entrapment (Parquet) sidecars |
 | `rust/mumdia/crates/mumdia/src/main.rs` | Call site for MBR (`Cmd::Mbr`) + `doctor` env probe |
 | `env/docker-rescore.yml` | Docker env `rescore`: mokapot 0.10.0 + ms2pip 4.0.0.dev9 (py3.11) |
-| `env/docker-deeplc.yml` | Docker env `deeplc`: DeepLC 4.0 multitask (pinned commit) + CPU torch (py3.11) |
+| `env/docker-deeplc.yml` | Docker env `deeplc`: DeepLC 4.1.1 + CPU torch (py3.11) |
 | `env/mumdia-rescore.yml` | Minimal portable env for the mokapot logreg rescore path (py3.12) |
+| `env/mumdia-deeplc.yml` | Portable local env for the DeepLC sidecars: DeepLC 4.1.1 + CPU torch (py3.11) |
 
 ## Inputs and outputs
 
@@ -681,17 +682,18 @@ MLP. Set it explicitly for the logreg path.
   change so `mumdia doctor` stays truthful.
 - **Conda envs.** The committed reproducible specs are `env/docker-rescore.yml`
   (env `rescore`: mokapot 0.10.0 + ms2pip 4.0.0.dev9, py3.11) and
-  `env/docker-deeplc.yml` (env `deeplc`: DeepLC 4.0 multitask at a pinned commit +
-  CPU torch, py3.11); the Docker configs point interpreters at
-  `/opt/conda/envs/{rescore,deeplc}/bin/python` (`docker/config.dia.json`,
-  `docker/config.diann-lib.json`). `env/mumdia-rescore.yml` is the minimal
-  portable env for the mokapot logreg path (no torch/DeepLC/MS2PIP). On the
-  developer machine the workers also import from the local `py312_mumdia` env
-  (general env: torch + mokapot + ms2pip + sklearn + pyarrow), `ms2rescore`
-  (mokapot + MS2PIP), and `deeplc_mt` for fine-tune (the a2 build; NOT
-  `deeplc_multitask`/a1, whose predict crashes, nor `py310_deeplc`, whose ms2pip
-  is broken). Anchor only the tool version and let pip resolve its scientific-Python
-  graph, since exact old pins (pandas < 2) have no cp312 wheel.
+  `env/docker-deeplc.yml` (env `deeplc`: DeepLC 4.1.1 + CPU torch, py3.11); the
+  Docker configs point interpreters at `/opt/conda/envs/{rescore,deeplc}/bin/python`
+  (`docker/config.dia.json`, `docker/config.diann-lib.json`). For a native install
+  the portable equivalents are `env/mumdia-rescore.yml` (mokapot logreg path, no
+  torch/DeepLC/MS2PIP) and `env/mumdia-deeplc.yml` (the DeepLC sidecars).
+  **DeepLC 4.1.1 is a floor, not merely the current release**: the 4.0.0a2
+  multitask preview overfits per-run fine-tuning badly enough to invert RT-model
+  rankings (`docs/08_rt_im_train.md` section 4b), so an older DeepLC changes
+  results and not only performance. Anchor the tool version and let pip resolve
+  its scientific-Python graph; do not re-add an exact `pandas < 2` style pin,
+  which has no cp312 wheel. A developer machine may also have older local envs
+  (`deeplc_mt` holds the superseded a2 build); prefer the committed specs.
 - **nn_torch scaling.** For a many-run experiment-wide rescore, force the streaming
   backend with `MUMDIA_NN_STREAM=1` (or rely on the `MUMDIA_NN_STREAM_GB`
   threshold, default 4 GB) so peak RAM is one minibatch, not the whole feature
