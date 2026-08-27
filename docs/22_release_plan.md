@@ -133,20 +133,50 @@ new engineering.
 - Release and Docker workflows exist and only need to be exercised.
 - Pure-Rust build (no C toolchain), `Cargo.lock` tracked, `--locked` builds.
 
-## 2. Decisions needed before work starts (WP0)
+## 2. Decisions (WP0, settled 2026-08-27)
 
-| # | Decision | Recommendation |
+| # | Decision | Settled as |
 |---|---|---|
 | 1 | Scope of the first release | Two releases as described above. `v0.1.0` = today's engine made installable. `v0.2.0` = second-pass workflow. |
 | 2 | Version number | `0.1.0` (matches `Cargo.toml`; the Python predecessor is tagged `legacy-python-v1`). |
-| 3 | Supported platforms | Binaries: Linux x86_64 (musl), Windows x86_64, macOS arm64 (already in `release.yml`). Docker `linux/amd64`. GPU optional, never required. |
-| 4 | Primary install path | Docker as the reference environment; binary + pinned conda env as the native path. Both smoke-tested in CI. |
+| 3 | Supported platforms | Linux, Windows and macOS. Binaries for `x86_64-unknown-linux-musl`, `x86_64-pc-windows-msvc`, `aarch64-apple-darwin` and `x86_64-apple-darwin`, each smoke-tested on its own architecture. Docker `linux/amd64`. GPU optional, never required. |
+| 4 | Primary install path | Docker as the reference environment; binary plus pinned conda env as the native path. Both smoke-tested in CI. |
 | 5 | Recommended profile in README | Imported DIA-NN library (highest measured sensitivity) with the FASTA-native path documented as the licence-free alternative. |
 | 6 | Defaults promoted in `v0.1.0` | None. Ship the new quant options documented and off. Promote in `v0.2.0` after entrapment (see WP7). |
-| 7 | `plan.md` | Track it and fix the 30+ references, or strip the references. Tracking is cheaper and keeps the clean-room provenance. |
-| 8 | Citation | Add `CITATION.cff` now; connect the GitHub repository to Zenodo so `v0.1.0` gets a DOI. |
-| 9 | Python floor | Python 3.11 or 3.12, DeepLC >= 4.1.0 (4.0.0a2 overfits, `docs/08` section 4b), mokapot 0.10, torch 2.x CPU. |
+| 7 | `plan.md` | **Stays untracked.** Reversed from the original recommendation to track it, on inspection of its contents: section 8 is a comparative dossier that quotes proprietary constants and internal line numbers from a closed-source engine (for example the DIA-NN terminal-residue decoy mutation map, verbatim from `diann.cpp`), and section 11 itself warns that reuse needs licence clearance. Publishing it would contradict the clean-room boundary the README claims. The 130 dangling citations were redirected to the tracked `docs/` guide instead, and `ci/check_doc_refs.py` now prevents new ones. |
+| 8 | Citation | Add `CITATION.cff`; connect the repository to Zenodo so `v0.1.0` gets a DOI. **Blocked on the author list**, which is not derivable from the repository and must not be guessed. |
+| 9 | Python floor | Python >= 3.11, **DeepLC 4.1.1** (Robbin's preference and now the pinned version; 4.0.0a2 overfits, `docs/08` section 4b), mokapot 0.10, torch >= 2.6 CPU. Verified: DeepLC 4.1.1 resolves with torch 2.12.1+cpu, numpy 2.4.6 and pandas 2.3.3 on Python 3.11, both in the image and from `env/mumdia-deeplc.yml`. |
 | 10 | Environment variables | Keep the ~10 NN knobs that matter as config fields passed to the worker; leave the rest as documented env vars. |
+
+## 2b. Progress (2026-08-27)
+
+WP1, WP2 and most of WP4 are done; the full gate is green on the branch. What
+landed, and what each item was verified against:
+
+| commit | change | verification |
+|---|---|---|
+| `83ba81d` | quant: library-ranked fragments, fixed integration window, optional `predicted_intensity`, honest reported bounds | 6 new unit tests; `quantity` bit-identical to the submission output on 72,168 real precursors, reported window corrected 29.1 s -> 34.9 s |
+| `9d584ba` | MBR: lower every PSM q column for an accepted transfer | the 34,280-of-34,664 dropped-transfer measurement |
+| `000f22d` | ignore the build dir, experiment configs and local data | `git check-ignore`; `docs/22` itself was being silently ignored |
+| `16cfbd7` | DeepLC 4.1.1 pin and `env/mumdia-deeplc.yml` | conda resolved the spec and the worker's import graph loads on Linux |
+| `46ed1aa` | CONTRIBUTING, SECURITY, CHANGELOG | - |
+| `8b70855` | CI runs fmt, clippy, compileall, config and env parsing, and the doc-reference check; Dependabot | the gate caught two unformatted hunks, two dead functions and one failing test on a branch treated as ready |
+| `0b4133f` | Cargo metadata, MSRV aligned to the tested toolchain, stripped binaries | `cargo metadata`; `Cargo.lock` unchanged |
+| `a3ce684`, `140c79b` | release archive is a working installation with checksums; image smoke-tested and non-root | built on a Linux host: 4.62 GB, uid 57439, `doctor` passes on both configs, bind mount writable with `--user` and refused without it |
+| `ec89265` | 130 citations redirected off untracked design notes | `ci/check_doc_refs.py`: 305 references, all resolvable |
+| `ed87157` | TSV report columns documented, schema-version drift fixed | read against `report.rs` and `schema.rs` |
+
+Not done, in the order the sequencing below puts them: WP3 (portability and
+usability) entirely; WP4's Python packaging (`scripts/pyproject.toml`, pinning
+`env/mumdia-rescore.yml`); WP5 (README rewrite, generated CLI and config
+references, resource table); WP6 (fixture, end-to-end smoke test, Python tests,
+`unwrap` audit, seeding DeepLC, provenance in the manifest, benchmark suite);
+`CITATION.cff` pending an author list; and the branch is not merged or pushed.
+
+Two consequences of not having pushed: the new CI workflow has never executed on
+a GitHub runner, and neither has the Docker workflow. The equivalent checks were
+run locally and on a Linux host, so the gate itself is verified, but the YAML
+that drives it is not.
 
 ## 3. Work packages
 
@@ -154,27 +184,31 @@ new engineering.
 
 Goal: `main` is green on the full gate and contains all validated code.
 
-- [ ] Fix the quant patch: read `predicted_intensity` optionally
+- [x] Fix the quant patch: read `predicted_intensity` optionally
       (`Table::read_cols` with a fallback; require it only when
       `fragment_selection = predicted`); delete or use `trapezoid_scans` and
-      `trapezoid_scans_opts`; run `cargo fmt`.
-- [ ] Add tests for `select_fragment_areas`, `trapezoid_fixed_opts` (scan and
+      `trapezoid_scans_opts`; run `cargo fmt`. Also corrected the reported
+      integration bounds, which described the walked window the fixed-window path
+      never integrated.
+- [x] Add tests for `select_fragment_areas`, `trapezoid_fixed_opts` (scan and
       second forms), `flank_baseline`, and a `QuantConfig` round-trip of the six
       new fields. Add one test for the legacy path being bit-identical with the
-      new fields at defaults.
-- [ ] Commit in two commits: `feat(quant): predicted fragment selection and
-      fixed integration window (default off)`; `fix(mbr): lower run_psm_q and
-      experiment_psm_q for accepted transfers`.
-- [ ] Merge the branch into `main`; delete stale branches.
-- [ ] `.gitignore`: `**/target/`, `config_*.json`, `config.aif-*.json`,
-      `config.hye-*.json`, `lib/`, `lib_capped/`, `raw_files/`, `val*/`,
-      `mbr_*/`, `missed_xics*/`, `alphadia/`. Move the two or three configs
-      worth keeping into `configs/examples/` with placeholders instead of
-      machine paths (see WP3).
+      new fields at defaults. 159 tests now pass, up from 152 with one failing.
+- [x] Commit the validated code (`83ba81d`, `9d584ba`).
+- [ ] Merge the branch into `main`; delete stale branches. Not started: the
+      branch is 20 commits ahead and has not been pushed.
+- [x] `.gitignore`: `**/target/`, the experiment configs, and the local data
+      directories. Also re-included the standard root files, which `/*.md` had
+      excluded, and root-anchored the note rules, one of which was silently
+      ignoring this document.
+- [ ] Move the two or three configs worth keeping into `configs/examples/` with
+      placeholders instead of machine paths (see WP3).
 - [ ] Remove `config.local-diann-lib.json` from tracking after WP3 provides a
       portable replacement; update the references in `README.md`, `CLAUDE.md`,
       `docs/19`, `docs/20`.
-- [ ] Decide `plan.md` (WP0 #7) and act on it.
+- [x] Decide `plan.md` (WP0 #7) and act on it: it stays untracked, and the 130
+      citations that pointed at it and at other local notes now point at the
+      tracked guide (`ec89265`).
 
 Acceptance: `cargo fmt --check`, `cargo clippy --workspace --all-targets -D
 warnings`, `cargo test --workspace`, `python -m compileall -q scripts` all
@@ -183,14 +217,16 @@ files.
 
 ### WP2. CI and quality gates (1 to 2 days)
 
-- [ ] `ci.yml`: add `cargo fmt --check`, `cargo clippy ... -D warnings`,
-      `python -m compileall -q scripts`, a config-parse step over
-      `configs/examples/*.json` and `docker/*.json` (the unit test
-      `shipped_configs_parse` already exists; point it at the new directory).
+- [x] `ci.yml`: added `cargo fmt --check`, `cargo clippy ... -D warnings`,
+      `python -m compileall`, a JSON parse over every tracked config, a YAML
+      parse over the env specs, and the documentation-reference check. Point
+      `shipped_configs_parse` at `configs/examples/` once WP3 creates it.
 - [ ] Add a `doctor` unit test and a CLI `--help` snapshot test so subcommand
       renames are caught.
 - [ ] Add the fixture smoke job from WP6 once the fixture exists.
-- [ ] `dependabot.yml` for Cargo and GitHub Actions; optional `cargo audit`.
+- [x] `dependabot.yml` for Cargo and GitHub Actions, with `arrow`/`parquet`
+      grouped apart because they carry the on-disk contract. `cargo audit` not
+      added.
 - [ ] Branch protection on `main`: CI required.
 
 Acceptance: a PR that breaks any stated gate is red.
@@ -239,23 +275,23 @@ green and completes the fixture run on the three OSes and in Docker.
 
 ### WP4. Packaging (3 to 5 days)
 
-- [ ] Cargo metadata: `description`, `repository`, `homepage`, `readme`,
-      `keywords`, `categories`, `publish = false` (or a crates.io decision);
-      `rust-version` aligned with the tested toolchain (`rust-toolchain.toml`
-      pins 1.96.1, manifest says 1.85); `[profile.release] strip = true`.
-- [ ] Release archive layout: `mumdia` binary, `scripts/`, `env/*.yml`,
-      `configs/examples/`, `README.md`, `LICENSE`, `CHANGELOG.md`. The binary
-      alone is not a working installation. Add sha256 checksums. Consider
-      `aarch64-unknown-linux-gnu`.
+- [x] Cargo metadata: description, repository, homepage, keywords, categories,
+      `publish = false`, `rust-version` aligned to the tested toolchain, and
+      `strip = "symbols"`. `readme` omitted, since nothing is published to
+      crates.io.
+- [x] Release archive layout: binary, `scripts/`, `env/`, `docs/`, `README.md`,
+      `LICENSE`, `CHANGELOG.md`, `configs/` when present, plus sha256 checksums
+      and a per-target binary smoke test. `aarch64-unknown-linux-gnu` not added;
+      `x86_64-apple-darwin` was.
 - [ ] Python sidecars: `scripts/pyproject.toml` for a `mumdia-sidecars`
       package with extras `rescore`, `deeplc`, `ms2pip`, `mbr`, `helpers`;
       pinned lower bounds; console entry points for the helpers. Pin the conda
       specs (`deeplc==4.1.0`, torch CPU, `mokapot==0.10.0`, `psm_utils`,
       `pyarrow`, `numpy<2` where required); add `xgboost` as optional.
-- [ ] Docker: drop to a non-root user; keep `micromamba clean`; add OCI
-      labels; run the image in CI (`workflow_dispatch` and on tags):
-      `mumdia doctor --config /opt/mumdia/config.dia.json` plus the fixture
-      run. Publish to GHCR on tags (already configured).
+- [x] Docker: non-root user, OCI labels, `git` dropped from the image, and the
+      image built and checked in CI before any push. Verified on a Linux host
+      rather than assumed. The fixture run cannot be added until WP6 creates a
+      fixture.
 - [ ] Windows: verify the release binary runs without the OneDrive target-dir
       redirect and that `mimalloc` and `PYTHONUTF8` behave from a plain shell.
 
