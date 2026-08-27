@@ -102,6 +102,50 @@ bench/pb_eval.py submission.tsv --format Custom \
 Uploading is a separate, manual step through the ProteoBench web form; these
 scripts never submit anything.
 
+## Resource profile of a reference run
+
+Measured, not estimated: one AIF file from the HYE set on a 128-core shared Linux
+server, imported DIA-NN library, per-run DeepLC fine-tune, Extended features,
+`nn_torch` rescoring. Input 1.94 GB mzML, 232,976 MS2 spectra, 1,815,610 PSMs
+after extraction. Per-stage figures come from each artifact's `report.json`
+`elapsed_ms`, and the disk figures from the artifacts themselves.
+
+| stage | wall clock | note |
+|---|---|---|
+| convert | 20 s | 232,976 MS2 spectra, uncapped |
+| search-seed | 53 s | 270,879 seed PSMs |
+| rt-im-train | 4 s | LOESS on the seed anchors |
+| extract | 320 s | 27.1M chromatograms |
+| features | 432 s | 387 features x 1.82M rows |
+| compete | 43 s | |
+| rescore | 4,100 s | `nn_torch`, single run, 32 threads under load |
+| quant | 124 s | peptide, protein and fragment output |
+| **total** | **about 85 min** | |
+
+Rescoring is 80% of it. Two things follow. Threads matter more there than
+anywhere else and not in the direction one expects: the NN worker measured faster
+on 8 threads than on 32, so `--threads` is worth setting. And an experiment-wide
+pooled rescore is the right shape for a multi-run analysis, because it replaces
+one rescore per run with one for the batch, at a measured 0.834 ms per PSM.
+
+Disk is the other surprise. The run wrote 13.1 GB of artifacts from a 1.94 GB
+input, a factor of 6.8:
+
+| artifact | size | rows |
+|---|---|---|
+| chromatograms | 4.53 GB | 27,109,906 |
+| features | 3.78 GB | 1,815,610 |
+| psms_competed | 3.78 GB | 1,815,610 |
+| spectra_ms2 | 0.34 GB | 232,976 |
+| run_windows | 0.32 GB | 10,881,402 |
+| everything else | 0.36 GB | |
+
+For RAM, the figure to size from is the pooled rescore's feature matrix:
+`n_psms x n_features x 4` bytes. `MUMDIA_NN_STREAM_GB` (default 4) chooses between
+holding it in memory and a much slower disk-backed memmap, and a matrix marginally
+over the threshold silently takes the slow path, so set it deliberately for a large
+pool.
+
 ## When adding a result here
 
 State the module, the commit, the row unit, the q-value column, and the inputs.
