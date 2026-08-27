@@ -216,6 +216,14 @@ def main() -> int:
         help="noise peaks per MS2 scan drawn from the library's own fragment m/z pool",
     )
     ap.add_argument("--seed", type=int, default=20260827)
+    ap.add_argument(
+        "--quiet",
+        action="store_true",
+        help="print the summary but not the per-precursor listing. Exists so a caller "
+             "never has to truncate this output with `head`: closing the pipe early "
+             "raises OSError [Errno 22] on a Windows console at interpreter shutdown "
+             "(not EPIPE), which exits 120 and reads as a mystery CI failure.",
+    )
     a = ap.parse_args()
 
     prec = pq.read_table(
@@ -413,11 +421,12 @@ def main() -> int:
         f"{lo:.1f}-{hi:.1f} m/z, {total_seconds:.0f} s gradient, "
         f"{len(planted)} planted target precursors"
     )
-    for p in planted:
-        print(
-            f"  planted {p['peptidoform']}/{p['charge']} at {p['precursor_mz']:.4f} m/z, "
-            f"apex {p['apex_seconds']:.1f} s, {len(p['fragments'])} fragments"
-        )
+    if not a.quiet:
+        for p in planted:
+            print(
+                f"  planted {p['peptidoform']}/{p['charge']} at {p['precursor_mz']:.4f} m/z, "
+                f"apex {p['apex_seconds']:.1f} s, {len(p['fragments'])} fragments"
+            )
 
     if a.manifest:
         Path(a.manifest).parent.mkdir(parents=True, exist_ok=True)

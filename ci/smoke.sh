@@ -57,10 +57,15 @@ echo "=== smoke: build the fixture library"
 
 # 2. The mzML.
 echo "=== smoke: generate the fixture mzML"
+# --quiet rather than `| head -3`: truncating the generator's output closes its
+# stdout early, and on a Windows console that surfaces as
+# `OSError: [Errno 22] Invalid argument` during interpreter shutdown rather than as
+# EPIPE, so the script exited 120 with no failing assertion to point at. It passed
+# on Linux and locally and failed only on the CI Windows runner.
 "$PY" ci/make_fixture_mzml.py \
     --precursors "$work/lib_prec.parquet" --fragments "$work/lib_frag.parquet" \
     --out "$work/fixture.mzML" --manifest "$work/planted.json" \
-    --n-planted 160 --windows 8 | head -3
+    --n-planted 160 --windows 8 --quiet
 
 # 3. The full single-run orchestrator, from the FASTA, so digest runs inside `run`
 #    as well and the library it builds is compared against the one the fixture was
