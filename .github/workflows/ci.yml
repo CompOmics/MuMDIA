@@ -73,6 +73,48 @@ jobs:
       - name: Test
         run: cargo test --workspace --locked
 
+  # The only end-to-end coverage there is. The Rust suite builds its inputs in
+  # process and starts at `extract`, so mzML parsing, the library build, the `run`
+  # orchestrator, the manifest, RT calibration on real anchors, and quant/report
+  # writing files were all untested. The fixture is generated, not committed: it is
+  # built from `test_data/fixture.fasta` and from the library the engine itself
+  # derives from it, so the planted peaks cannot disagree with the mass model.
+  smoke:
+    name: end-to-end smoke (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install pyarrow
+        run: python -m pip install --quiet pyarrow
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/mumdia/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('rust/mumdia/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Build the binary
+        working-directory: rust/mumdia
+        run: cargo build --release --locked --bin mumdia
+
+      # bash on the Windows runner too, so one script covers both platforms.
+      - name: Smoke test
+        shell: bash
+        run: ci/smoke.sh
+
   sidecars:
     name: python sidecars + configs
     runs-on: ubuntu-latest
