@@ -1,5 +1,5 @@
 //! `fragindex`: log-space-binned CSR inverted fragment index with an epoch-stamped
-//! dense accumulator (fragindex_spec Sections 2-3). Clean-room reimplementation
+//! dense accumulator (docs/06_predict_frag_index_matchers.md). Clean-room reimplementation
 //! from the spec; no code or constants copied from Sage/MSFragger.
 //!
 //! Posting m/z is stored f32 (adequate for MuMDIA's 20-50 ppm regime: f32 ULP is
@@ -364,10 +364,11 @@ impl SeedScratch {
     }
 }
 
-/// Score one scan under both the Count and Dot semirings (fragindex_spec Section
-/// 1.3), returning `(candidate_id, count, dot)` for every touched candidate. Used
-/// by the equivalence gate against [`super::naive`]. Dot = sum over matched
-/// postings of `predicted_intensity * peak_intensity` (both widened to f64).
+/// Score one scan under both the Count and Dot semirings
+/// (docs/06_predict_frag_index_matchers.md), returning `(candidate_id, count, dot)`
+/// for every touched candidate. Used by the equivalence gate against
+/// [`super::naive`]. Dot = sum over matched postings of
+/// `predicted_intensity * peak_intensity` (both widened to f64).
 pub fn score_scan_count_dot(
     idx: &FragIndex,
     peaks: &[(f64, f32)],

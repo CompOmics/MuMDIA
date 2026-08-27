@@ -41,7 +41,7 @@ DeepLC.
 | `rust/mumdia/crates/mumdia/src/sidecar.rs` | Python sidecar clients (MS2PIP, DeepLC, DeepLC fine-tune, MBR) over the file contract |
 | `rust/mumdia/crates/mumdia/src/index.rs` | `Library` (SoA model + optional bucketed inverted index), `load`/`load_with` preconditions, `page_search`, `candidate_range`, `local_frag_index`, `deconvolve` |
 | `rust/mumdia/crates/mumdia/src/matchers/mod.rs` | matcher module tree; `MatcherKind` selects the backend |
-| `rust/mumdia/crates/mumdia/src/matchers/binning.rs` | `LogBins`: log-space bin geometry (fragindex_spec Section 2.2) |
+| `rust/mumdia/crates/mumdia/src/matchers/binning.rs` | `LogBins`: log-space bin geometry (this document) |
 | `rust/mumdia/crates/mumdia/src/matchers/fragindex.rs` | `FragIndex` CSR index, `WindowNarrow` per-window narrowing cache, `SeedScratch` epoch-stamped accumulator, `probe_peak`/`probe_peak_win`, equivalence-gate scorer |
 | `rust/mumdia/crates/mumdia/src/matchers/naive.rs` | band-join reference for the equivalence gate |
 | `rust/mumdia/crates/mumdia-core/src/constants.rs` | `within_ppm` (min-relative predicate), `ppm_bounds` (query-relative), `PROTON` |
@@ -301,7 +301,7 @@ an isolation window into `[lo, hi)` over `prec_mz` by two `partition_point`s (`m
 win_lo` for `lo`, `m <= win_hi` for `hi`, so `win_hi` is inclusive and `win_lo`
 exclusive).
 
-### The fragindex CSR matcher (`matchers/fragindex.rs`, fragindex_spec Section 2-3)
+### The fragindex CSR matcher (`matchers/fragindex.rs`)
 
 `FragIndex::build` (`fragindex.rs:46`) is a two-pass counting sort into a CSR
 layout keyed by log-space bin. It first derives the m/z range by scanning
@@ -499,7 +499,7 @@ Matcher selection (both stages default to `Fragindex`):
   gate disagreement source; build and verify use the same f32-rounded value.
 - **per-posting accumulation.** A candidate with two fragments within tolerance of
   one peak counts twice; a peak within tolerance of two candidate fragments counts
-  twice (fragindex_spec Section 1.4). Do not deduplicate. Tests
+  twice (see the duplicate-fragment note below). Do not deduplicate. Tests
   `two_frags_one_peak_counts_both` (`fragindex.rs:539`) and the count assertion in
   `equivalence_gate_vs_naive` (`fragindex.rs:524-527`) guard this.
 - **epoch, not value, for first touch.** First touch is `stamp[cc] != epoch`, never

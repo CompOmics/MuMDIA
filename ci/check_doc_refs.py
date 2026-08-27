@@ -49,6 +49,20 @@ ALLOWED_MISSING = {
 # these files must also state that the document is not distributed, otherwise a
 # reader is still sent looking for a file they do not have.
 UNTRACKED_BY_POLICY = {"plan.md", "PLAN.md"}
+
+# Untracked documents that the source used to cite WITHOUT the `.md` suffix, e.g.
+# "(fragindex_spec Section 2.1)". Eleven of those survived the first sweep because
+# the filename pattern above requires the extension. Each stem here is specific
+# enough that a bare occurrence in prose is a citation, not an ordinary word.
+UNTRACKED_STEMS = (
+    "fragindex_spec",
+    "mbr_plan",
+    "sensitivity_diagnostic_plan",
+    "workflow_and_gap_analysis",
+    "peak_and_peptide_competition",
+    "fragment_competition_strategies",
+)
+STEM_REF = re.compile(r"\b(?:" + "|".join(UNTRACKED_STEMS) + r")\b")
 POLICY_FILES = {
     "ci/check_doc_refs.py",
     "CLAUDE.md",
@@ -126,10 +140,17 @@ def main() -> int:
             line = text.count("\n", 0, match.start()) + 1
             dangling[base].add(f"{path}:{line}")
 
+        # Extension-less citations of the same untracked documents.
+        if path not in POLICY_FILES:
+            for match in STEM_REF.finditer(text):
+                line = text.count("\n", 0, match.start()) + 1
+                dangling[match.group(0)].add(f"{path}:{line}")
+
     if not dangling:
         print(
             f"doc references OK: {resolved} references in tracked files, "
-            f"all resolvable ({len(known_md)} tracked Markdown documents)."
+            f"all resolvable ({len(known_md)} tracked Markdown documents); "
+            f"no extension-less citation of a local design note."
         )
         return 0
 

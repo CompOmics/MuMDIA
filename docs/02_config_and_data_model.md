@@ -279,7 +279,7 @@ difference; a maintainer must not treat them as interchangeable.
   normalized by the query itself.
 - `within_ppm(a, b, tol)` (`constants.rs:92-96`): `lo = min(a,b)`, `hi = max(a,b)`,
   true iff `hi - lo <= tol * 1e-6 * lo`. **Min-relative**, symmetric in argument
-  order. This is the canonical fragment-index predicate (fragindex_spec 2.1):
+  order. This is the canonical fragment-index predicate (`docs/06_predict_frag_index_matchers.md`):
   it is algebraically `hi/lo <= 1 + delta` and `ln(hi) - ln(lo) <= ln(1 + delta)`,
   the last form being what makes log-space binning exact and is proven exact
   against the log-bin +/-1 probe. `within_ppm_three_forms_agree`

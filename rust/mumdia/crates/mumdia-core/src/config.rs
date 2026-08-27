@@ -28,7 +28,7 @@ pub enum DecoyStrategy {
     None,
 }
 
-/// Fragment-matcher backend for search-seed and extract (fragindex_spec).
+/// Fragment-matcher backend for search-seed and extract (docs/06_predict_frag_index_matchers.md).
 /// Default `Fragindex` (log-bin CSR matcher): on narrow-window DIA it is ~1.95x
 /// faster in search-seed and ~1.26x in extract with essentially unchanged IDs
 /// (HYE B_01: peptides -0.1%); `Bucketed` is the previous `Library::page_search`
@@ -458,7 +458,8 @@ pub struct SearchSeedConfig {
     /// probing cost without discarding peaks from the downstream extraction
     /// artifact. Default 300; set to 0 to probe every converted peak.
     pub top_n_peaks: usize,
-    /// Fragment-matcher backend (fragindex_spec). Default `Fragindex`.
+    /// Fragment-matcher backend (docs/06_predict_frag_index_matchers.md).
+    /// Default `Fragindex`.
     pub matcher: MatcherKind,
     /// Robust two-pass fragment mass calibration (sensitivity_plan P3.1). After the
     /// first median-offset + tolerance fit, re-fit on only the deviations inside the
@@ -672,7 +673,8 @@ pub struct ExtractConfig {
     /// winner-take-all only if the top eluter's profile height is at least this
     /// multiple of the runner-up's; otherwise the peak stays shared.
     pub peak_claim_margin: f64,
-    /// Fragment-matcher backend (fragindex_spec). Default `Fragindex`.
+    /// Fragment-matcher backend (docs/06_predict_frag_index_matchers.md).
+    /// Default `Fragindex`.
     pub matcher: MatcherKind,
     /// Minimum-PSMs-per-peptide evidence filter: reject a candidate whose fragments
     /// co-elute over fewer than this many consecutive scan groups (`coelution_run`).
