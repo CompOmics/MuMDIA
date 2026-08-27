@@ -5,9 +5,22 @@ members = ["crates/mumdia-core", "crates/mumdia-io", "crates/mumdia"]
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.85"
+# Tracks rust-toolchain.toml, which is the only Rust version CI builds and tests.
+# A lower floor may well work, but claiming one we do not verify is a guess; lower
+# this together with an MSRV job that proves it.
+rust-version = "1.96"
 license = "Apache-2.0"
 authors = ["CompOmics"]
+description = "MuMDIA: a data-independent-acquisition (DIA) proteomics search engine"
+repository = "https://github.com/CompOmics/MuMDIA"
+homepage = "https://github.com/CompOmics/MuMDIA"
+keywords = ["proteomics", "mass-spectrometry", "dia", "bioinformatics"]
+categories = ["science", "command-line-utilities"]
+# Not published to crates.io: mumdia-core and mumdia-io are internal boundaries of
+# one application, not libraries with independent consumers, and the binary needs
+# the Python sidecars and configs that a crate cannot carry. Distribution is the
+# GitHub release archive and the container image.
+publish = false
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -31,6 +44,9 @@ mimalloc = { version = "0.1", default-features = false }
 
 [profile.release]
 opt-level = 3
+# Release archives shipped unstripped debug symbols, which is most of the binary
+# size for no user benefit; a backtrace still names the functions.
+strip = "symbols"
 # Cross-crate inlining. "thin" keeps build times reasonable while still letting the hot
 # per-fragment/per-candidate loops inline across the io/core crate boundaries.
 lto = "thin"
