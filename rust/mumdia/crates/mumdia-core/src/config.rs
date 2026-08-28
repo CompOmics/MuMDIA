@@ -1285,6 +1285,21 @@ pub struct RescoreConfig {
     pub train_fdr: f64,
     /// number of semi-supervised iterations for the native rescorer.
     pub num_iter: usize,
+    /// Refuse a rescore whose in-memory feature matrix would exceed this many GiB.
+    /// 0 (default) means no ceiling, which is the previous behaviour.
+    ///
+    /// The matrix is `Vec<Vec<f64>>`: eight bytes per value, plus a heap allocation and a
+    /// 24-byte spine entry per PSM. Nothing in the workspace estimates or checks available
+    /// memory (there is deliberately no `sysinfo` dependency), so an experiment-wide
+    /// rescore over enough runs was simply killed by the OS after however long it took to
+    /// get there. `native_tda` additionally runs all folds in parallel, each holding an
+    /// owned standardised copy of its training slice, so the true peak is roughly
+    /// `(1 + folds) x` this figure.
+    ///
+    /// Setting a ceiling converts that into an error at startup, naming the estimate and
+    /// the two ways out. It is not a batching implementation: sub-batching changes which
+    /// PSMs share a pooled `q_value`, so it is the operator's decision, not a silent one.
+    pub max_feature_matrix_gib: f64,
     pub python: Option<String>,
     /// Path to an external `percolator` executable.
     ///
@@ -1330,6 +1345,7 @@ impl Default for RescoreConfig {
             folds: 3,
             train_fdr: 0.01,
             num_iter: 10,
+            max_feature_matrix_gib: 0.0, // no ceiling; previous behaviour
             python: None,
             percolator_bin: None,
             entrapment_marker: None,

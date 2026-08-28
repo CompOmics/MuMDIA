@@ -38,6 +38,24 @@ pub struct RescoreParams<'a> {
     pub config_hash: &'a str,
 }
 
+/// A byte count in the largest unit that keeps it readable.
+///
+/// The matrix spans six orders of magnitude between the smoke fixture and a 40-run
+/// experiment, so a fixed unit is unhelpful at one end or the other: `0.00 GiB` says
+/// nothing, and `270336.0 MiB` says it badly.
+fn human_bytes(bytes: f64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = KIB * 1024.0;
+    const GIB: f64 = MIB * 1024.0;
+    if bytes >= GIB {
+        format!("{:.2} GiB", bytes / GIB)
+    } else if bytes >= MIB {
+        format!("{:.1} MiB", bytes / MIB)
+    } else {
+        format!("{:.0} KiB", bytes / KIB)
+    }
+}
+
 /// Refuse a rescore whose population cannot support target-decoy FDR.
 ///
 /// A one-sided population is not a hard rescore failure in any technical sense:
@@ -155,7 +173,37 @@ pub fn run(p: RescoreParams) -> Result<u64> {
             }
         }
     }
-    info!(psms = n, "rescore: loaded competed PSMs");
+    // Say how big the feature matrix is, and refuse it if a ceiling is configured.
+    //
+    // `feats` is `Vec<Vec<f64>>`, so eight bytes per value plus a heap allocation and a
+    // 24-byte spine entry per PSM -- twice the width CLAUDE.md documented, because that
+    // figure describes the Python worker's f32 matrix. On an experiment-wide pool this is
+    // the peak-RSS wall (the code's own comment says ~27 GB), `native_tda` runs all folds
+    // in parallel each holding an owned standardised copy of its training slice, and
+    // nothing here estimates available memory. So the failure mode was an OS kill after
+    // however long the run took to reach it, with no number to plan against.
+    let matrix_bytes = (n as f64) * (feat_names.len() as f64) * 8.0 + (n as f64) * 24.0;
+    let matrix_gib = matrix_bytes / (1024.0 * 1024.0 * 1024.0);
+    info!(
+        psms = n,
+        features = feat_names.len(),
+        feature_matrix = %human_bytes(matrix_bytes),
+        folds = p.cfg.folds,
+        "rescore: loaded competed PSMs"
+    );
+    if p.cfg.max_feature_matrix_gib > 0.0 && matrix_gib > p.cfg.max_feature_matrix_gib {
+        anyhow::bail!(
+            "rescore feature matrix would be {} ({n} PSMs x {} features x 8 bytes), over \
+             the configured rescore.max_feature_matrix_gib of {:.2}. The native rescorer \
+             holds roughly (1 + folds) times this at peak. Either raise the ceiling, or \
+             rescore fewer runs per invocation -- `run_psm_q` is computed per source, so \
+             sub-batching costs no per-run FDR, though it does change which PSMs share \
+             the pooled q_value.",
+            human_bytes(matrix_bytes),
+            feat_names.len(),
+            p.cfg.max_feature_matrix_gib
+        );
+    }
 
     // Track the path actually taken so the report reflects reality rather than a
     // hardcoded label, and pick the null the q-values are computed against.

@@ -15,7 +15,7 @@ use mumdia_core::schema::artifact;
 use mumdia_io::report::ArtifactReport;
 use mumdia_io::table::{write_table, Col};
 use serde_json::json;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::fdr::{count_targets_at_q, ln_factorial, target_decoy_q};
 use crate::index::Library;
@@ -383,11 +383,23 @@ fn seed_fragindex_windows(
             .push(si);
     }
     let group_vec: Vec<Vec<usize>> = groups.into_values().collect();
-    // Size each worker's scratch to the WIDEST candidate window, not the whole library.
-    // The scratch is indexed window-relative, so 16 B x n_cand per worker (877 MB per
-    // worker at 54.8M candidates) was almost entirely untouched. It grows on demand, so an
-    // underestimate here is safe.
-    let max_window_width = group_vec
+    // Size each worker's scratch to the MEDIAN candidate window, not the widest one and
+    // certainly not the whole library. The scratch is indexed window-relative, and it
+    // grows on demand, so an underestimate costs a few reallocations while an
+    // overestimate costs 16 B x width per rayon worker up front.
+    //
+    // The max is the wrong statistic because one window can be the whole library:
+    // `convert.rs` maps BOTH a zero-width reported isolation window and a missing
+    // precursor to the full range (0, 1e6), which `candidate_range` resolves to every
+    // candidate. So a single malformed or all-ion scan in an otherwise 50-window run
+    // sized every worker's scratch to the library -- 877 MB per worker on the profiled
+    // 54.8M-candidate library, about 28 GB of commit charge on 32 cores, for arrays a
+    // worker inside one narrow window never touches. The only mitigation was `--threads`,
+    // which the user had to know to reach for.
+    //
+    // The median is robust to that outlier and needs no configuration. Widths are
+    // collected in group order, so the value is deterministic.
+    let mut widths: Vec<usize> = group_vec
         .iter()
         .filter_map(|ids| ids.first())
         .map(|&si| {
@@ -395,13 +407,30 @@ fn seed_fragindex_windows(
             let (lo, hi) = idx.candidate_range(w.lower_mz, w.upper_mz);
             hi.saturating_sub(lo) as usize + 1
         })
-        .max()
-        .unwrap_or(1);
+        .collect();
+    widths.sort_unstable();
+    let median_window_width = widths.get(widths.len() / 2).copied().unwrap_or(1).max(1);
+    // Say so when the two disagree by a lot: a window spanning most of the library is
+    // either a genuine all-ion acquisition or a malformed scan, and both are worth
+    // knowing about before wondering why extraction is slow.
+    if let Some(&widest) = widths.last() {
+        if widest > 8 * median_window_width {
+            warn!(
+                median_window_candidates = median_window_width,
+                widest_window_candidates = widest,
+                library_candidates = idx.n_cand(),
+                "search-seed: one isolation window covers far more candidates than the \
+                 median. An all-ion acquisition does this legitimately; otherwise check \
+                 for a scan with a zero-width or missing isolation window, which convert \
+                 maps to the full m/z range"
+            );
+        }
+    }
 
     let partials: Vec<Vec<(u32, Best)>> = group_vec
         .par_iter()
         .map_init(
-            || SeedScratch::new(max_window_width),
+            || SeedScratch::new(median_window_width),
             |scratch, ids| {
                 if ids.is_empty() {
                     return Vec::new();
