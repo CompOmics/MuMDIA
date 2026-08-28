@@ -152,6 +152,35 @@ def render(meta: dict) -> str:
     return json.dumps(bom, indent=2, sort_keys=False, ensure_ascii=False) + "\n"
 
 
+def report_stale(out, current: str, text: str, regen: str) -> int:
+    """Print a bounded diff, not just "it is stale".
+
+    A gate that says a generated file disagrees with the generator, without saying
+    how, is unactionable when the disagreement is environmental rather than in the
+    tree: the reader cannot tell a missing regeneration from a runner that reads a
+    different cargo registry. Both have happened here.
+    """
+    import difflib
+
+    print(f"{out} is stale. Regenerate with:\n    {regen}", file=sys.stderr)
+    diff = list(difflib.unified_diff(
+        current.splitlines(), text.splitlines(),
+        fromfile=f"{out.name} (committed)", tofile=f"{out.name} (regenerated here)",
+        lineterm="", n=1,
+    ))
+    if not diff:
+        print("no textual difference: the files differ only in line endings, "
+              "which the comparison already normalises. This should not happen.",
+              file=sys.stderr)
+        return 1
+    LIMIT = 200
+    for line in diff[:LIMIT]:
+        print(line, file=sys.stderr)
+    if len(diff) > LIMIT:
+        print(f"... {len(diff) - LIMIT} more diff lines suppressed", file=sys.stderr)
+    return 1
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -163,9 +192,8 @@ def main() -> int:
     if args.check:
         current = OUT.read_text(encoding="utf-8") if OUT.exists() else ""
         if current.replace("\r\n", "\n") != text:
-            print(f"{OUT} is stale. Regenerate with:\n"
-                  f"    python ci/gen_sbom.py", file=sys.stderr)
-            return 1
+            return report_stale(OUT, current.replace("\r\n", "\n"), text,
+                                "python ci/gen_sbom.py")
         n = len(json.loads(text)["components"])
         print(f"{OUT} is up to date ({n} components).")
         return 0
