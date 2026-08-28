@@ -227,7 +227,14 @@ jobs:
         if: steps.touched.outputs.run == 'true'
         shell: micromamba-shell {0}
         run: |
+          set -euo pipefail
           python -c "import deeplc, numpy, pandas, pyarrow, torch, psm_utils;                      print('deeplc', deeplc.__version__, '| torch', torch.__version__)"
+          # pytest is not part of the runtime env spec, so install it HERE rather than
+          # adding a test-only dependency to the image's environment. The point of
+          # running the suite in this env is that the torch- and DeepLC-dependent
+          # tests actually execute instead of skipping, so `-rs` should report far
+          # fewer skips than the `sidecars` job does.
+          python -m pip install --quiet pytest
           python -m pytest tests/python -q -rs
 
       - uses: mamba-org/setup-micromamba@add3a49764cedee8ee24e82dfde87f5bc2914462 # v2
@@ -242,7 +249,9 @@ jobs:
         if: steps.touched.outputs.run == 'true'
         shell: micromamba-shell {0}
         run: |
+          set -euo pipefail
           python -c "import mokapot, ms2pip, numpy, pyarrow; print('mokapot', mokapot.__version__)"
+          python -m pip install --quiet pytest
           python -m pytest tests/python -q -rs
 
   smoke-cross-platform:

@@ -21,21 +21,42 @@ cd "$repo"
 work="${1:-${TMPDIR:-/tmp}/mumdia_smoke}"
 cfg="configs/examples/native.json"
 
+# Locate the release binary.
+#
+# The CARGO-REPORTED target directory comes first, because a redirected
+# `build.target-dir` -- which `.cargo/config.toml.example` documents, to keep build
+# artifacts out of a synced folder -- means `rust/mumdia/target/` can still hold a
+# months-old binary from before the redirect. Not hypothetical: that is exactly how a
+# writer/reader mismatch (convert moved to LargeList, spectra.rs still downcast to
+# List) passed here and failed in CI. An in-tree path that shadows the real build
+# output is worse than no path at all.
 find_bin() {
     if [ -n "${MUMDIA_BIN:-}" ]; then echo "$MUMDIA_BIN"; return; fi
+    target=""
+    if command -v cargo > /dev/null 2>&1; then
+        # Run cargo from INSIDE the workspace, not with --manifest-path from the repo
+        # root: cargo discovers `.cargo/config.toml` by walking up from the CURRENT
+        # DIRECTORY, not from the manifest, so from the root it reports the in-tree
+        # `target/` and misses the redirect entirely. That is the bug this whole
+        # function exists to avoid, so getting it wrong here defeats the point.
+        target=$( (cd rust/mumdia && cargo metadata --format-version 1 --no-deps 2>/dev/null) \
+                 | "$PY" -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])' \
+                 2>/dev/null || true)
+    fi
     for cand in \
+        "${target:+$target/release/mumdia}" \
+        "${target:+$target/release/mumdia.exe}" \
         rust/mumdia/target/release/mumdia \
-        rust/mumdia/target/release/mumdia.exe \
-        "$HOME/mumdia_build/release/mumdia" \
-        "${MUMDIA_BIN:-}"
+        rust/mumdia/target/release/mumdia.exe
     do
-        [ -x "$cand" ] && { echo "$cand"; return; }
+        [ -n "$cand" ] && [ -x "$cand" ] && { echo "$cand"; return; }
     done
     command -v mumdia || { echo "no mumdia binary found; set MUMDIA_BIN" >&2; exit 2; }
 }
 
-BIN="$(find_bin)"
+# Before find_bin, which shells out to it.
 PY="${PYTHON:-python}"
+BIN="$(find_bin)"
 echo "=== smoke: binary $BIN"
 "$BIN" --version
 rm -rf "$work"
