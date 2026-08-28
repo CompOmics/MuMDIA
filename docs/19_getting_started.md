@@ -39,7 +39,7 @@ pyarrow. No sidecar, no network, no data file.
 It runs from a release archive too, not only from a checkout: the archive carries
 `ci/smoke.sh`, its two helper scripts and `test_data/fixture.fasta`, and
 `ci/smoke.sh` finds the `mumdia` binary sitting beside them. `release.yml` runs
-exactly this from a freshly unpacked archive on all four targets before publishing,
+exactly this from a freshly unpacked archive on every target before publishing,
 so the procedure in this section is tested on the artifact you download rather than
 on the tree it was built from.
 

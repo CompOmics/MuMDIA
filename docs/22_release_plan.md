@@ -141,7 +141,7 @@ new engineering.
 |---|---|---|
 | 1 | Scope of the first release | Two releases as described above. `v0.1.0` = today's engine made installable. `v0.2.0` = second-pass workflow. |
 | 2 | Version number | `0.1.0` (matches `Cargo.toml`; the Python predecessor is tagged `legacy-python-v1`). |
-| 3 | Supported platforms | Linux, Windows and macOS. Binaries for `x86_64-unknown-linux-musl`, `x86_64-pc-windows-msvc`, `aarch64-apple-darwin` and `x86_64-apple-darwin`, each smoke-tested on its own architecture. Docker `linux/amd64`. GPU optional, never required. |
+| 3 | Supported platforms | Linux, Windows and macOS. Binaries for `x86_64-unknown-linux-musl`, `x86_64-pc-windows-msvc` and `aarch64-apple-darwin`, each built AND end-to-end verified on its own architecture. No Intel Mac binary: `macos-13` no longer receives a runner (2026-08-28), and cross-compiling it would publish the one archive nobody executed. Docker `linux/amd64`. GPU optional, never required. |
 | 4 | Primary install path | Docker as the reference environment; binary plus pinned conda env as the native path. Both smoke-tested in CI. |
 | 5 | Recommended profile in README | Imported DIA-NN library (highest measured sensitivity) with the FASTA-native path documented as the licence-free alternative. |
 | 6 | Defaults promoted in `v0.1.0` | None. Ship the new quant options documented and off. Promote in `v0.2.0` after entrapment (see WP7). |
@@ -292,7 +292,10 @@ green and completes the fixture run on the three OSes and in Docker.
       `LICENSE`, `CHANGELOG.md`, `THIRD_PARTY_LICENSES.md`, `configs/` when
       present, plus `ci/smoke.sh` with its two helpers and
       `test_data/fixture.fasta`, sha256 checksums, and a per-target binary smoke
-      test. `aarch64-unknown-linux-gnu` not added; `x86_64-apple-darwin` was.
+      test. `aarch64-unknown-linux-gnu` not added. `x86_64-apple-darwin` was added
+      and then removed: it required the `macos-13` label, which no longer receives a
+      runner, so the job queued indefinitely and would have failed a real tag at the
+      six-hour timeout.
       The fixture and its runner were documented in `docs/19` as the way to
       verify an installation while being excluded from the archive, so the
       documented procedure could not be followed from the archive; they now ship.
@@ -312,7 +315,7 @@ Acceptance: downloading the release archive on a clean machine, creating the
 conda env from the shipped spec, and running `mumdia doctor` then the fixture
 succeeds without editing any path. The archive half of this is now enforced
 rather than checked by hand: `release.yml` unpacks each archive it builds into a
-clean directory and runs that archive's own `ci/smoke.sh`, on all four targets.
+clean directory and runs that archive's own `ci/smoke.sh`, on every target.
 That also gives macOS its first end-to-end coverage, which the repository CI
 does not provide.
 

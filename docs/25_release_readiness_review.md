@@ -96,8 +96,8 @@ closed, and two of them were real defects in this review's own output:
   `test_data/`. Rather than weaken the documentation, the archive now carries the
   three scripts the smoke test needs plus `test_data/fixture.fasta`, `ci/smoke.sh`
   discovers a binary sitting beside it, and `release.yml` unpacks each archive it
-  builds into a clean directory and runs that archive's own smoke test on all four
-  targets. That also gives macOS its first end-to-end coverage. Verified twice: locally
+  builds into a clean directory and runs that archive's own smoke test on every
+  target. That also gives macOS its first end-to-end coverage. Verified twice: locally
   by staging the layout and running it with no `MUMDIA_BIN` (136 assertions, output
   hashes identical to the repository run), and then in a release rehearsal, where the
   linux-musl, windows-msvc and aarch64-darwin archives each unpacked and passed their

@@ -32,7 +32,7 @@ configurations in `configs/`, the container definition in `Dockerfile` +
 | `rust/mumdia/crates/mumdia/tests/pipeline.rs` | The only integration test file: extract -> features -> compete -> rescore on crafted Parquet |
 | `rust/mumdia/crates/mumdia-core/build.rs` | Stamps the git commit and build date into the crate so `manifest.json` can record them |
 | `.github/workflows/ci.yml` | Seven jobs: `lint` (fmt + clippy `-D warnings` + rustdoc), `audit` (`cargo audit`/`cargo deny`), `build-test` matrix on ubuntu/macos/windows, `smoke` (end-to-end `run` and `run-experiment` on a generated fixture, ubuntu + windows), `sidecar-imports` (a real conda env per sidecar, matrixed, plus `pip-audit`), `smoke-cross-platform` (asserts the two platforms produced byte-identical `peptides.tsv` and `proteins.tsv`), `sidecars` (compileall + JSON/YAML parse + doc-reference check + generated-document freshness); on push-to-`main`, every PR, weekly, and on demand |
-| `.github/workflows/release.yml` | Dormant until a `v*` tag; `validate-tag` gates on tag-equals-workspace-version, ancestry from `main` and a green `ci.yml` for that exact SHA, then builds four target binaries, smoke-tests each, unpacks each archive into a clean directory and runs that archive's own `ci/smoke.sh`, and attaches archives + `.sha256` to the Release. `workflow_dispatch` rehearses everything except the upload |
+| `.github/workflows/release.yml` | Dormant until a `v*` tag; `validate-tag` gates on tag-equals-workspace-version, ancestry from `main` and a green `ci.yml` for that exact SHA, then builds three target binaries, smoke-tests each, unpacks each archive into a clean directory and runs that archive's own `ci/smoke.sh`, and attaches archives + `.sha256` to the Release. `workflow_dispatch` rehearses everything except the upload |
 | `.github/workflows/docker.yml` | Builds the image into the local daemon, smoke-tests it, then pushes to GHCR only on a `v*` tag; build-and-smoke-only on `workflow_dispatch` |
 | `.github/dependabot.yml` | Monthly grouped Cargo + GitHub Actions + Docker base-image updates; `arrow*`/`parquet*` grouped apart because they carry the on-disk contract. No `pip` entry: the Python pins live in the pip sections of the `env/` conda specifications, which Dependabot cannot parse |
 | `ci/check_doc_refs.py` | Fails when a tracked file cites a Markdown document the repository does not ship |
@@ -520,29 +520,59 @@ of the worker contracts is still outstanding
 real config check is the Rust test `shipped_configs_parse` (`config.rs:1651`),
 which loads every shipped config under `deny_unknown_fields`.
 
-**Release workflow.** `release.yml` fires only on `v*` tags (`release.yml:13-15`)
-and declares `permissions: contents: write` so it can attach archives
-(`release.yml:17-18`). It builds four targets (`release.yml:26-39`):
-`x86_64-unknown-linux-musl` on `ubuntu-latest` (with a `musl-tools` install step,
-`release.yml:46-48`), `aarch64-apple-darwin` on `macos-latest`,
-`x86_64-apple-darwin` on `macos-13`, and `x86_64-pc-windows-msvc` on
-`windows-latest`, each with `fail-fast: false`. Every target then:
+**Release workflow.** `release.yml` fires on `v*` tags and on a manual
+`workflow_dispatch` rehearsal (`release.yml:13-35`). Permissions are per job
+(`release.yml:37-38`, `51-54`, `112`): the workflow default is `contents: read`,
+the tag gate adds `actions: read` because it reads workflow-run conclusions, and
+only the publishing job holds `contents: write`.
 
-1. smoke-tests its own binary on its own architecture (`release.yml:58-65`):
+`validate-tag` (`release.yml:47`) runs first and every build job depends on it. It
+requires the tag to equal the workspace version in `rust/mumdia/Cargo.toml`, the
+tagged commit to be an ancestor of `origin/main`, and `ci.yml` to have a successful
+run for that exact SHA. The last one is the substantive check: a tag push does not
+trigger `ci.yml`, so without it the only checks behind a release were `--version`,
+`--help` and `doctor`. The job is skipped for a rehearsal, which has no tag, so the
+build's condition allows exactly `success` or `skipped` -- not "anything but
+failure", because a cancelled gate is not a passed gate.
+
+It builds three targets (`release.yml:135-151`): `x86_64-unknown-linux-musl` on
+`ubuntu-latest` (with a `musl-tools` install step, `release.yml:153`),
+`aarch64-apple-darwin` on `macos-latest`, and `x86_64-pc-windows-msvc` on
+`windows-latest`, each with `fail-fast: false`. `x86_64-apple-darwin` was removed:
+it needed the `macos-13` label, which no longer receives a runner. Measured
+2026-08-28, that job sat queued over two hours in two separate rehearsals with no
+runner ever assigned, while every other target finished in about three minutes, so
+a real tag would have hung to the six-hour timeout and failed. Cross-compiling it on
+the arm64 runner was rejected because the result cannot be executed there, and an
+unverifiable archive is what the verification step below exists to prevent.
+
+Every target then:
+
+1. smoke-tests its own binary on its own architecture (`release.yml:165`):
    `--version`, `--help` and `doctor` must all succeed. A binary whose `--help` or
    `doctor` is broken fails the release instead of shipping;
 2. stages a working installation rather than a bare executable
-   (`release.yml:67-84`): the binary, `README.md`, `LICENSE`, `CHANGELOG.md`,
-   `docs/`, `scripts/`, `env/`, and `configs/` when the tag carries it. The reason
-   is stated in the workflow header (`release.yml:8-12`): the ML predictors and
-   rescorers are Python sidecars the engine launches by path, so a binary alone
-   cannot fine-tune retention times or rescore with mokapot or the NN;
-3. archives it (`7z a` to `.zip` on Windows, `tar czf` to `.tar.gz` elsewhere,
-   `release.yml:86-92`) and writes a sha256 sidecar using whichever of
-   `sha256sum` or `shasum -a 256` the runner provides (`release.yml:95-99`);
-4. prints the archive tree and the checksum into the job log
-   (`release.yml:100-103`), then uploads `*.tar.gz`, `*.zip` and `*.sha256` to the
-   Release with `generate_release_notes: true` (`release.yml:105-112`).
+   (`release.yml:174`): the binary, `README.md`, `LICENSE`, `CHANGELOG.md`,
+   `THIRD_PARTY_LICENSES.md`, `sbom.cdx.json`, `docs/`, `scripts/`, `env/`,
+   `configs/` when the tag carries it, and `ci/smoke.sh` with its two helpers plus
+   `test_data/fixture.fasta`. The sidecar reason is in the workflow header: the ML
+   predictors and rescorers are Python workers the engine launches by path, so a
+   binary alone cannot fine-tune retention times or rescore with mokapot or the NN.
+   The smoke test and fixture ship because `docs/19` tells the reader to run them to
+   verify an installation, and for a while the archive did not contain them;
+3. archives it (`7z a` to `.zip` on Windows, `tar czf` to `.tar.gz` elsewhere) and
+   writes a sha256 sidecar using whichever of `sha256sum` or `shasum -a 256` the
+   runner provides (`release.yml:239-247`);
+4. unpacks the archive it just built into a clean directory and runs THAT archive's
+   `ci/smoke.sh` (`release.yml:264`). This tests the artifact rather than the tree
+   it came from, and it is the only step that can catch a packaging mistake: a
+   missing script, a config that did not travel, a binary that runs from a cargo
+   target directory but not from a clean unpack. Because each runner executes its
+   own architecture, it also gives macOS its first end-to-end coverage; the
+   repository smoke job runs only on ubuntu and windows;
+5. uploads `*.tar.gz`, `*.zip` and `*.sha256` to the Release with
+   `generate_release_notes: true` (`release.yml:314`), or, on a rehearsal, uploads
+   them as a workflow artifact instead (`release.yml:332-333`).
 
 **Docker workflow.** `docker.yml` declares
 `permissions: contents: read, packages: write` (`docker.yml:19-21`), runs on `v*`

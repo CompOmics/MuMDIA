@@ -102,9 +102,12 @@ Silicon.
 ### Release archive
 
 Each tagged release attaches one archive per platform
-(`x86_64-unknown-linux-musl`, `x86_64-pc-windows-msvc`, `aarch64-apple-darwin`,
-`x86_64-apple-darwin`) plus a `.sha256` checksum file per archive. Windows ships
-a `.zip`, the others a `.tar.gz`. An archive contains:
+(`x86_64-unknown-linux-musl`, `x86_64-pc-windows-msvc`, `aarch64-apple-darwin`)
+plus a `.sha256` checksum file per archive. Windows ships a `.zip`, the others a
+`.tar.gz`. There is no Intel Mac archive: it required a GitHub runner label that
+is no longer served, and cross-compiling it would mean publishing the one binary
+nobody had executed. Build from source or use the container image on an Intel
+Mac. An archive contains:
 
 - the `mumdia` binary, smoke-tested on its own architecture before upload;
 - `scripts/`, the Python sidecar workers the engine launches by path;

@@ -120,6 +120,18 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
+      # Three targets, each built on a runner that executes its own binary, so every
+      # archive is verified before it is published.
+      #
+      # `x86_64-apple-darwin` was here and is deliberately gone. It needed the
+      # `macos-13` label, which no longer receives a runner: measured 2026-08-28, that
+      # job sat queued for over two hours in two separate rehearsals while every other
+      # target finished in about three minutes, with no runner ever assigned. A real
+      # tag would have hung to the six-hour timeout and failed the release. The
+      # alternative was cross-compiling it on the arm64 runner, which produces an
+      # archive that cannot be executed there and so cannot be verified; a published
+      # binary nobody has run is what this workflow now exists to prevent. Intel Mac
+      # users build from source or use the container image.
       matrix:
         include:
           - os: ubuntu-latest
@@ -128,8 +140,6 @@ jobs:
           - os: macos-latest
             target: aarch64-apple-darwin
             exe: ""
-          - os: macos-13
-            target: x86_64-apple-darwin
             exe: ""
           - os: windows-latest
             target: x86_64-pc-windows-msvc
@@ -245,7 +255,7 @@ jobs:
       # that runs from a cargo target directory but not from a clean unpack.
       #
       # Every matrix target runs on a host that executes its own binary natively, so
-      # this covers all four -- including macOS, which the repository smoke test does
+      # this covers all three -- including macOS, which the repository smoke test does
       # not reach.
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:

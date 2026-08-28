@@ -68,8 +68,8 @@ sed -i 's/"min_frag_corr"/"gate_min_score"/; s/"group_by": *"precursor"/"group_b
 
 - The release archive verifies itself. It now carries `ci/smoke.sh`, its two helper
   scripts and `test_data/fixture.fasta`, and `release.yml` unpacks every archive it
-  builds into a clean directory and runs that archive's own smoke test, on all four
-  targets. `docs/19` told the reader to run exactly this while the archive shipped
+  builds into a clean directory and runs that archive's own smoke test, on every
+  target. `docs/19` told the reader to run exactly this while the archive shipped
   neither `ci/` nor `test_data/`; testing the artifact rather than the tree it came
   from is also the only check that can catch a packaging mistake, and it gives macOS
   its first end-to-end coverage.
@@ -99,6 +99,14 @@ sed -i 's/"min_frag_corr"/"gate_min_score"/; s/"group_by": *"precursor"/"group_b
   the `env/` conda specifications, which Dependabot cannot parse, and a mirror
   requirements file would be a second list that nothing installs. Reasoning in
   `docs/14`.
+- Release platforms are now Linux (musl), Windows and Apple silicon. The Intel Mac
+  target was removed: it required GitHub's `macos-13` label, which no longer receives
+  a runner (measured 2026-08-28: queued over two hours with none assigned, in two
+  separate rehearsals, while every other target finished in about three minutes), so
+  a real tag would have hung to the six-hour timeout and failed. Cross-compiling it on
+  the Apple silicon runner was rejected because the result cannot be executed there,
+  and publishing the one archive nobody ran is what the verification step above exists
+  to prevent. Intel Mac users build from source or use the container image.
 - Docker base images pinned by digest, with a Dependabot `docker` entry to keep the
   pins current. A tag is mutable, so a rebuild of the same commit could previously
   produce a different image.
