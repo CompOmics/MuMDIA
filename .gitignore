@@ -63,8 +63,7 @@ scripts/_probe*.py
 # Vendored third-party source read for comparison only; not ours to redistribute.
 /alphadia/
 
-# Collaborator-specific material stays local: the Strasbourg prenylation work is
-# unpublished, so its configs and deployment notes must never reach the remote.
+# Collaborator-specific configs and deployment notes stay local.
 # (`/*.md` above already keeps root-level notes local; these cover the configs.)
 config.strasbourg*.json
 config.*-local.json
