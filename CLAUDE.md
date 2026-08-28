@@ -196,8 +196,16 @@ is the decision record.
 `extract.min_frag_corr` is named historically. Under the default
 `gate_mode = apex_pearson`, it thresholds observed-versus-predicted fragment
 intensities at one apex; it is not a chromatographic co-elution correlation.
-The observed optimum was about 0.2 with the NN and tighter with the native
+The observed optimum was about 0.2 with the NN and about 0.6 with the native
 linear model.
+
+**The default is 0.6, matched to the default rescorer.** It was 0.2, the NN's
+optimum, while the default classifier is `native_tda`: the shipped gate was tuned
+for a rescorer the shipped configuration does not use. All three
+`configs/examples/*.json` set the key explicitly, so the validated `nn_torch`
+workflow is unchanged at 0.2; only a configuration that says nothing moves, and
+one that says nothing is using the native rescorer. Set it explicitly whenever
+you change the classifier.
 
 Three RT rules, each measured in `docs/08_rt_im_train.md` and restated from the
 failure side in `docs/17_troubleshooting.md`:
@@ -345,6 +353,30 @@ Use Parquet quantities for analysis; TSV values are rounded for presentation.
 Cross-run consensus ions, interference-aware ion selection, minimum clean-ion
 rules, connected-component LFQ diagnostics, and coherent MBR requantification
 remain open high-priority work.
+
+## Defaults promoted on correctness grounds, not on a count
+
+Three defaults changed because the previous value was wrong on its own terms, not
+because a benchmark improved. None was promoted from a sensitivity measurement,
+and each still needs entrapment plus a second acquisition before anyone claims a
+sensitivity result for it.
+
+- `extract.apex_evidence_rank` is now `true`. The legacy signature-intensity
+  apex scores a scan group by the summed observed intensity of only the top-K
+  *predicted* fragments, so when none of those K is observed at any qualifying
+  scan the score is `0.0` everywhere, the strict `>` never replaces the first
+  candidate, and the apex silently becomes the *lowest-RT qualifying scan*: up to
+  a full RT window away, or anywhere in the gradient for a candidate with no
+  window row. The RT prior cannot rescue it, because the combination is
+  multiplicative and a zero annihilates the prior in exactly the case the prior
+  exists for. Evidence rank scores `(n_distinct_fragments + tie) * prior`, which
+  is always positive, so the fallback is unreachable. The wrong apex propagated
+  into `prelim_score`, which decides the pre-FDR competition winner, and into
+  quant's integration centre.
+- `extract.min_frag_corr` is now `0.6`; see the extraction-gate section above.
+- `features.emit_pin` is now `false`. No MuMDIA stage reads the file, because
+  rescore builds its own PIN, and it is a ~5.4 GB text write per run on a real
+  library.
 
 ## Changes that remain benchmark-gated
 

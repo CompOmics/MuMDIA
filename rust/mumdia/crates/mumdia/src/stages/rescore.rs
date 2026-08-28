@@ -179,6 +179,7 @@ pub fn run(p: RescoreParams) -> Result<u64> {
                 &protein,
                 &mz,
                 &feats,
+                &base,
             ) {
                 Ok(s) => {
                     info!("rescore: using Mokapot scores");
@@ -208,6 +209,7 @@ pub fn run(p: RescoreParams) -> Result<u64> {
                 &protein,
                 &mz,
                 &feats,
+                &base,
             ) {
                 Ok(s) => {
                     info!("rescore: using PyTorch NN sidecar scores");
@@ -963,6 +965,7 @@ fn run_pin_sidecar(
     protein: &[String],
     mz: &[f64],
     feats: &[Vec<f64>],
+    base: &[u32],
 ) -> Result<Vec<f64>> {
     use std::io::Write as _;
     let python = p.cfg.python.as_deref().ok_or_else(|| {
@@ -1038,6 +1041,23 @@ fn run_pin_sidecar(
         drop(w);
     }
 
+    // Cross-validation fold keys, row-aligned to the PIN.
+    //
+    // The NN worker derived its fold from `md5(strip_pep(Peptide))`, and `strip_pep`
+    // removes bracketed mods and flanking residues but not the `DECOY_` marker, so a
+    // target and its paired decoy landed in DIFFERENT folds -- while `percolator_lite`
+    // keys on `base_peptide_id` and pairs them, and docs/11 claimed the two used "the
+    // same CV-fold scheme". Stripping the prefix would only fix the shift-decoy library:
+    // a reverse decoy's peptidoform is the reversed sequence, so no string derived from
+    // it can reach its target. `base_peptide_id` is the pairing both builders preserve
+    // (`dprec = tprec.copy()`), so pass it explicitly.
+    //
+    // By environment variable rather than argv: the sidecar contract is positional and
+    // shared with `mokapot_worker.py`, and the NN hyperparameters already travel this way.
+    // A worker that does not read it simply keeps its previous behaviour.
+    let foldkeys = format!("{}/rescore_{tag}.foldkeys.parquet", p.work_dir);
+    write_table(&foldkeys, vec![Col::U32("fold_key".into(), base.to_vec())])?;
+
     let script = crate::sidecar::resolve_script(p.script_dir, script_name);
     // Spawn (not `status()`) so the child handle is owned by a guard that kills it if we
     // unwind or are dropped: a killed `mumdia` used to leave the Python worker running,
@@ -1056,6 +1076,7 @@ fn run_pin_sidecar(
         .env("MUMDIA_NN_FOLDS", p.cfg.folds.to_string())
         .env("MUMDIA_NN_ITERS", p.cfg.num_iter.to_string())
         .env("MUMDIA_NN_TRAIN_FDR", p.cfg.train_fdr.to_string())
+        .env("MUMDIA_NN_FOLD_KEYS", &foldkeys)
         .spawn()
         .map_err(|e| {
             // A bare `.spawn()?` reported only "No such file or directory (os error 2)" with

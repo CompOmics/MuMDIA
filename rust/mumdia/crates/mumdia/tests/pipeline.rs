@@ -221,7 +221,12 @@ fn features_compete_rescore_run_on_crafted_input() {
     let win = craft_windows();
     let (psms, chrom) = run_extract(&prec, &frag, &ms2, &win, "frc");
 
-    let cfg = Config::default();
+    let mut cfg = Config::default();
+    // `features.emit_pin` is opt-in now: no MuMDIA stage reads the file (rescore builds
+    // its own PIN) and it is a ~5.4 GB text write per run on a real library. This test
+    // asserts the PIN's header format, so it asks for the artifact explicitly rather
+    // than depending on a default whose point is that it costs nothing when unused.
+    cfg.features.emit_pin = true;
     let feats = tmp("features.parquet");
     let pin = tmp("run.pin");
     stages::features::run(stages::features::FeaturesParams {

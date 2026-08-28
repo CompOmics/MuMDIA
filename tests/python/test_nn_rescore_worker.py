@@ -184,3 +184,70 @@ def test_unknown_feature_subset_fails_before_training(torch_available, psms, tmp
     )
     assert rc != 0
     assert "MUMDIA_NN_FEATURES" in err
+
+
+def _import_worker():
+    """Import `nn_rescore_worker` as a module, for the helpers that need no torch.
+
+    The worker imports torch lazily inside `main`, so the module itself loads with
+    numpy and pyarrow alone. That keeps this test running in CI, where the rest of
+    this file skips.
+    """
+    import importlib.util
+    import pathlib
+
+    importorskip_any("numpy", "folds_for returns a numpy array")
+    path = pathlib.Path(__file__).resolve().parents[2] / "scripts" / "nn_rescore_worker.py"
+    spec = importlib.util.spec_from_file_location("nn_rescore_worker_under_test", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_explicit_fold_keys_pair_a_target_with_its_decoy():
+    """A target and its paired decoy must share a CV fold.
+
+    `docs/11` states this worker uses "the same CV-fold scheme" as `percolator_lite`,
+    which keys on `base_peptide_id`. It did not: the fold came from
+    `md5(strip_pep(Peptide))`, and `strip_pep` leaves the `DECOY_` marker in place, so
+    `DECOY_PEPTIDE` and `PEPTIDE` hashed apart. Stripping the marker would only have
+    fixed a shift-decoy library; a reverse decoy's peptidoform is the reversed sequence,
+    so no string derived from it can reach its target. The engine now writes
+    `base_peptide_id` per row and names the file in `MUMDIA_NN_FOLD_KEYS`.
+    """
+    w = _import_worker()
+    np = pytest.importorskip("numpy")
+
+    # Rows 0 and 1 are a target and its REVERSE decoy: different sequences, one
+    # base_peptide_id. Row 2 is an unrelated peptide.
+    keys = np.array([7, 7, 9], dtype=np.uint32)
+    peptides = ["-.PEPTIDEK.-", "-.DECOY_KEDITPEP.-", "-.SAMPLER.-"]
+
+    folds = w.folds_for(peptides, keys, 3)
+    assert folds[0] == folds[1], (
+        "a target and its paired decoy must train in the same fold, else the model "
+        "sees one of the pair while scoring the other"
+    )
+    assert len(folds) == 3
+    assert folds.dtype == np.int16
+
+    # The hashed fallback is what the fold-key file exists to replace: it splits the
+    # pair. Asserted so the regression is visible if the file is ever dropped.
+    hashed = w.folds_for(peptides, None, 3)
+    assert hashed[0] != hashed[1]
+
+
+def test_fold_keys_respect_the_streaming_row_offset():
+    """The chunked backend passes a flat row offset; the keys must be sliced by it.
+
+    Without the offset the streaming backend would fold every chunk as if it started
+    at row 0, so the same PSM would land in a different fold depending on which
+    backend the size heuristic chose.
+    """
+    w = _import_worker()
+    np = pytest.importorskip("numpy")
+
+    keys = np.arange(10, dtype=np.uint32)
+    whole = w.folds_for([f"p{i}" for i in range(10)], keys, 3)
+    chunk = w.folds_for([f"p{i}" for i in range(4, 7)], keys, 3, off=4)
+    assert list(chunk) == list(whole[4:7])

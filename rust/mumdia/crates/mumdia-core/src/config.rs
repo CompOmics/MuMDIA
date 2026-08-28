@@ -722,9 +722,13 @@ pub struct ExtractConfig {
     /// signature-ion intensity only as a sub-integer tiebreak. In wide-window DIA a
     /// single fragment m/z channel is chimeric, so the tallest scan is often a
     /// co-isolated interferent; the scan where the most of the peptide's own
-    /// predicted transitions co-elute is a more reliable apex. `false` (default)
-    /// keeps the legacy signature-intensity apex. The rolling distinct-fragment
-    /// count (`apex_count_window`) still gates which scans qualify in both modes.
+    /// predicted transitions co-elute is a more reliable apex. Default `true`, on
+    /// correctness grounds rather than a count: `false` keeps the legacy
+    /// signature-intensity apex, whose score is 0.0 at every qualifying scan when none
+    /// of the top-K predicted fragments is observed, so the strict `>` never replaces
+    /// the first candidate and the apex silently becomes the LOWEST-RT qualifying scan.
+    /// The rolling distinct-fragment count (`apex_count_window`) still gates which scans
+    /// qualify in both modes.
     pub apex_evidence_rank: bool,
     /// Emit the four gate-diagnostic scores (`gate_apex`, `gate_peak_spectral`,
     /// `gate_coelution`, `gate_spectral_entropy`) as extra `psms.parquet` columns,
@@ -756,7 +760,14 @@ impl Default for ExtractConfig {
             // candidates the hard single-scan Pearson gate was dropping
             // (docs/18_findings_and_decisions.md); still a hard gate, not the
             // soft/budgeted redesign.
-            min_frag_corr: 0.2,
+            // 0.6, the documented optimum for the DEFAULT rescorer. This was 0.2, the
+            // optimum measured for `nn_torch`, while the default classifier is
+            // `native_tda`: the shipped gate was tuned for a rescorer the shipped
+            // configuration does not use. All three `configs/examples/*.json` set this
+            // key explicitly, so the validated nn_torch workflow is unchanged; only a
+            // config that says nothing moves, and one that says nothing is using the
+            // native rescorer.
+            min_frag_corr: 0.6,
             min_matched_fraction: 0.0,
             apex_top_fragments: 0, // superseded by apex_count_tol; kept for compat
             apex_rt_prior_s: 0.0,  // RT prior off by default
@@ -782,10 +793,22 @@ impl Default for ExtractConfig {
             alt_peak_min_area_frac: 0.10, // alternate peak >= 10% of rank-0 area
             alt_peak_min_separation_s: 5.0, // alternate apex >= 5 s from rank-0 apex
             emit_candidate_audit: false, // diagnostic; off in production
-            apex_evidence_rank: false, // legacy signature-intensity apex
+            // On. The legacy signature-intensity apex scores a scan group by the summed
+            // OBSERVED intensity of only the top-K PREDICTED fragments, so when none of
+            // those K is observed at any qualifying scan the score is 0.0 everywhere, the
+            // strict `>` never replaces the first candidate, and the apex silently becomes
+            // the LOWEST-RT qualifying scan -- up to a full RT window away, or anywhere in
+            // the gradient for a candidate with no window row. The RT prior cannot rescue
+            // it, because the combination is multiplicative and a zero annihilates the
+            // prior in exactly the case the prior exists for. Evidence rank scores
+            // `(n_distinct_fragments + tie) * prior`, which is always positive, so the
+            // fallback is unreachable. The wrong apex propagates into `prelim_score`
+            // (which decides the pre-FDR competition winner), `rt_error_abs`,
+            // `log_apex_intensity`, and quant's integration centre.
+            apex_evidence_rank: true,
             emit_gate_diagnostics: false, // diagnostic gate-score columns; off in production
             gate_mode: GateMode::ApexPearson, // legacy single-scan intensity Pearson
-            gate_coelution_min: 0.5, // used only by GateMode::Combined
+            gate_coelution_min: 0.5,      // used only by GateMode::Combined
         }
     }
 }
@@ -825,9 +848,9 @@ pub struct FeaturesConfig {
     pub set: FeatureSet,
     /// Write the Percolator-style `.pin` text file requested by `--out-pin`. No MuMDIA
     /// stage consumes it (`rescore` builds its own PIN for the sidecars); it exists for
-    /// external tooling. At 1.5M rows x 387 features it is a ~5.4 GB text write, so set
-    /// this to false to skip it when nothing downstream needs it. Default true, so the
-    /// artifact keeps appearing unless it is explicitly turned off.
+    /// external tooling. At 1.5M rows x 387 features it is a ~5.4 GB text write.
+    /// Default false: nothing in MuMDIA reads it, which makes the write pure cost unless
+    /// an external tool wants the file. Set true to get the artifact back.
     pub emit_pin: bool,
     pub coelution_corr_threshold: f64,
     pub prec_tol_ppm: f64,
@@ -871,7 +894,12 @@ impl Default for FeaturesConfig {
     fn default() -> Self {
         Self {
             set: t(),
-            emit_pin: true, // preserve the artifact; set false to skip a ~5.4 GB text write
+            // Off. No MuMDIA stage reads this file: `rescore` builds its own PIN
+            // (features.rs, "the PIN is not consumed by any stage"). It is a ~5.4 GB text
+            // write per run on a real library, so a 40-run experiment wrote hundreds of GB
+            // that nothing read back, by default. Set true when a PIN is wanted for an
+            // external tool.
+            emit_pin: false,
             coelution_corr_threshold: 0.9,
             prec_tol_ppm: 20.0,
             bound_features: true,
