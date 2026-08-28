@@ -285,14 +285,38 @@ pub fn discover(role: Role, cfg: &Config) -> Option<(String, &'static str)> {
     None
 }
 
+/// How hard to insist that a role the CONFIGURATION needs actually resolves.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Strictness {
+    /// A role the configuration uses but which cannot be resolved is a hard error.
+    ///
+    /// For the orchestrators, where preflight exists so a misconfiguration costs
+    /// seconds rather than the hours already spent by the time rescore is reached.
+    Require,
+    /// Resolve what can be resolved; leave the rest as `None` and carry on.
+    ///
+    /// For a single stage, where `Role::required_by` answers the wrong question. It says
+    /// "does this CONFIGURATION use the role", not "does the stage I am about to run use
+    /// it" -- so under `Require` a `mumdia search-seed` with
+    /// `rescore.classifier = entrapment` failed at config load demanding a mokapot
+    /// interpreter, for a rescorer that stage never invokes. Found by running a
+    /// benchmark, not by a test.
+    ///
+    /// An unresolvable role becomes `None` rather than staying as the literal `"auto"`,
+    /// so a stage that DOES need it still fails with "this classifier requires
+    /// rescore.python" instead of trying to execute a program called `auto`, which is
+    /// the confusion this whole mechanism exists to remove.
+    BestEffort,
+}
+
 /// Resolve every interpreter this run needs, mutating `cfg` so downstream stages
 /// see concrete paths. Absent or `"auto"` triggers discovery; an explicit path is
 /// taken as given. Returns one [`Resolution`] per role for logging.
-///
-/// A role that is needed but cannot be resolved is a hard error here rather than
-/// at the stage that needs it: preflight exists so a misconfiguration costs
-/// seconds, not the hours already spent when rescore is reached.
 pub fn resolve(cfg: &mut Config) -> Result<Vec<Resolution>> {
+    resolve_with(cfg, Strictness::Require)
+}
+
+pub fn resolve_with(cfg: &mut Config, strictness: Strictness) -> Result<Vec<Resolution>> {
     let mut out = Vec::new();
     for role in ALL_ROLES {
         let required = role.required_by(cfg);
@@ -309,13 +333,19 @@ pub fn resolve(cfg: &mut Config) -> Result<Vec<Resolution>> {
             // question, because a user may knowingly point at an environment they
             // are about to fix.
             if required && !Path::new(&path).exists() {
-                bail!(
+                let msg = format!(
                     "{} points at {}, which does not exist. Fix the path, set it to \
                      \"auto\" to discover an interpreter, or set {}.",
                     role.field(),
                     path,
                     role.env_var()
                 );
+                if strictness == Strictness::Require {
+                    bail!(msg);
+                }
+                // The stage being run may not touch this role at all; let the one that
+                // does report it.
+                warn!(field = role.field(), "python: {msg}");
             }
             out.push(Resolution {
                 role,
@@ -353,16 +383,30 @@ pub fn resolve(cfg: &mut Config) -> Result<Vec<Resolution>> {
                     source,
                 });
             }
-            None => bail!(
-                "{} is required by this configuration but no usable interpreter was found. \
-                 Tried {}, CONDA_PREFIX, VIRTUAL_ENV, and python3/python on PATH; each must \
-                 import {}. Install one (see env/ for conda specs), then either activate it, \
-                 set {}, or name it in the config.",
-                role.field(),
-                role.env_var(),
-                role.modules(cfg).join(", "),
-                role.env_var()
-            ),
+            None => {
+                let msg = format!(
+                    "{} is required by this configuration but no usable interpreter was \
+                     found. Tried {}, CONDA_PREFIX, VIRTUAL_ENV, and python3/python on \
+                     PATH; each must import {}. Install one (see env/ for conda specs), \
+                     then either activate it, set {}, or name it in the config.",
+                    role.field(),
+                    role.env_var(),
+                    role.modules(cfg).join(", "),
+                    role.env_var()
+                );
+                if strictness == Strictness::Require {
+                    bail!(msg);
+                }
+                // Clear rather than leave `"auto"` behind, so a stage that does need this
+                // role fails on the missing interpreter and not on a program named `auto`.
+                role.clear(cfg);
+                warn!(field = role.field(), "python: {msg}");
+                out.push(Resolution {
+                    role,
+                    python: None,
+                    source: "unresolved",
+                });
+            }
         }
     }
 
@@ -614,5 +658,58 @@ mod tests {
         cfg.mbr.python = Some("/some/explicit/python".to_string());
         resolve(&mut cfg).expect("an unused explicit path must not be validated");
         assert_eq!(cfg.mbr.python.as_deref(), Some("/some/explicit/python"));
+    }
+
+    #[test]
+    fn best_effort_does_not_demand_a_role_the_running_stage_never_uses() {
+        // Regression, found by running a benchmark rather than by a test.
+        //
+        // `Role::required_by` answers "does this CONFIGURATION use the role", which is
+        // not "does the subcommand I am about to run use it". Resolving strictly inside
+        // `load_config` therefore made `mumdia search-seed` with
+        // `rescore.classifier = entrapment` fail at config load, demanding a mokapot
+        // interpreter for a rescorer that stage never invokes.
+        //
+        // Under BestEffort an unresolvable role must NOT error, and must be left as None
+        // rather than as the literal "auto" -- so a stage that does need it fails on the
+        // missing interpreter instead of trying to execute a program called `auto`.
+        let mut cfg = Config::default();
+        cfg.rescore.classifier = RescorerKind::Mokapot;
+        cfg.rescore.python = Some("/definitely/not/an/interpreter".to_string());
+        assert!(Role::Rescore.required_by(&cfg));
+
+        let res = resolve_with(&mut cfg, Strictness::BestEffort)
+            .expect("BestEffort must not fail on an unresolvable required role");
+        assert!(res.iter().any(|r| r.role == Role::Rescore));
+
+        // Require, on the same config, still fails: that is what the orchestrators use,
+        // and early failure is the whole point there.
+        let mut strict_cfg = Config::default();
+        strict_cfg.rescore.classifier = RescorerKind::Mokapot;
+        strict_cfg.rescore.python = Some("/definitely/not/an/interpreter".to_string());
+        let err = resolve_with(&mut strict_cfg, Strictness::Require)
+            .expect_err("Require must reject an interpreter path that does not exist");
+        assert!(
+            format!("{err}").contains("rescore.python"),
+            "the error should name the field: {err}"
+        );
+    }
+
+    #[test]
+    fn best_effort_clears_an_auto_it_cannot_resolve() {
+        // A role asking for discovery that finds nothing must end up None, never "auto".
+        let mut cfg = Config::default();
+        cfg.rescore.classifier = RescorerKind::Mokapot;
+        cfg.rescore.python = Some(AUTO.to_string());
+        // Point discovery at nothing so it cannot succeed regardless of the host.
+        std::env::set_var("MUMDIA_PYTHON_RESCORE", "/definitely/not/an/interpreter");
+        let out = resolve_with(&mut cfg, Strictness::BestEffort);
+        std::env::remove_var("MUMDIA_PYTHON_RESCORE");
+        out.expect("BestEffort must not fail");
+        assert_ne!(
+            cfg.rescore.python.as_deref(),
+            Some(AUTO),
+            "an unresolved \"auto\" must not survive into the resolved config"
+        );
     }
 }

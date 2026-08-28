@@ -49,6 +49,122 @@ Both taken with MuMDIA at the second-pass workflow described in
 machine and not yet in the engine. DIA-NN 2.2.0 was run library-free with
 `--reanalyse` on the same files. All figures are `min_obs = 3` ion-level.
 
+### Identification, `LFQ_Orbitrap_AIF_Ecoli_01.mzML` (2026-08-28, post-audit engine)
+
+Measured after the `docs/25_release_readiness_review.md` fixes, to re-establish the
+identification number under the three promoted defaults and the NnTorch fold-key
+change. Engine at `9fc1c06` plus the two fixes this run itself produced.
+
+Command: `mumdia run` with the AUGMENTED imported DIA-NN library
+(`lib_precursors_aug.parquet`, 1,798,200 candidates), DeepLC 4.1.0 per-run
+fine-tune, Extended features, `extract.gate_min_score = 0.2` set explicitly,
+`nn_torch`, `--top-peaks-ms2 300`. 7 min 54 s wall on the development machine.
+
+| row unit | q column | threshold | count |
+|---|---|---|---|
+| stripped peptides | `peptide_q_value` | 0.01 | **10,914** |
+| stripped peptides | `run_psm_q` | 0.01 | 10,825 |
+| (peptidoform, charge) | `peptide_q_value` | 0.01 | 10,914 |
+| protein groups | `pg_q_value` | 0.01 | 1,634 |
+
+Empirical decoy fraction at the 1% threshold: **0.0098**, on every q column. The
+(peptidoform, charge) count equals the stripped-peptide count exactly -- 1.000
+precursors per peptide -- because the default `compete.group_by = base_peptide`
+collapses every charge and modification sibling before FDR. That is not a precursor
+count; use `peptidoform_charge` if a precursor unit is wanted.
+
+**Two corrections to the record this run forced.** The file is NOT all-ion: it has
+152 contiguous 4 m/z isolation windows over 396.4-1004.7 m/z. And the 300-peak cap
+is nearly inert on it -- 4.7% of MS2 spectra saturate 300, with p25 = 15, p50 = 44,
+p75 = 135 peaks per spectrum -- against the 47.8% saturation `CLAUDE.md` records for
+"the chimeric AIF benchmark run". Either the local file was re-converted since that
+measurement or the characterisation was wrong; do not carry either figure forward
+without re-deriving it. The narrow windows are also why the search takes ~70 s of the
+wall time rather than the tens of minutes previously recorded.
+
+#### A/B: `extract.apex_evidence_rank`, the promoted default
+
+Both arms reuse ONE set of upstream artifacts from the run above -- same spectra,
+same seed PSMs and mass calibration, same DeepLC-fine-tuned library, same RT windows
+-- so the apex change is isolated from DeepLC draw variance, which alone has moved
+held-out window sizing by 150-211 s across two draws of one arm. Both arms were
+re-run rather than reusing the numbers above, because `nn_torch` is not
+bit-deterministic.
+
+| `apex_evidence_rank` | accepted by extract | stripped peptides, `peptide_q_value` <= 0.01 | decoy fraction |
+|---|---|---|---|
+| `true` (promoted default) | 45,338 | 10,914 | 0.0098 |
+| `false` (previous default) | 51,111 | 10,921 | 0.0098 |
+
+**Identification is flat**: a 7-peptide difference (0.06%), with 96.6% of the union
+shared. The promotion neither gains nor costs sensitivity here, which is the evidence
+it needed; it is not a sensitivity win, and it was not promoted as one.
+
+**Quantification is not flat.** Of the 10,727 peptides both arms identify, **48.3%
+have an apex more than 1 s apart** -- median 2.9 s, p90 9.9 s, max 104.8 s. Quant
+integrates around that apex, so quantities from before this change are not comparable
+with quantities after it.
+
+Which apex is better, scored against `rt_pred_cal` from the shared window table
+(independent of both arms): evidence rank is closer at every percentile -- median
+27.67 s vs 29.69 s, beyond 30 s 47.06% vs 49.61%, beyond 60 s 20.40% vs 21.41%.
+Consistent in direction, small in size, and a weak instrument: with `w_rt` at 187 s
+the reference's own error dominates that ~28 s median, so it can show direction but
+cannot resolve the apex improvement precisely.
+
+### FDR validity: entrapment, E. coli + human 1:1 (2026-08-28)
+
+The empirical-null experiment `docs/20` requires before promoting anything, run
+specifically to test the three entrapment-path defects in `docs/25` section 3.
+
+Spike-in built from `fasta/ecoli_22032024.fasta` plus a seeded 1:1-by-protein-count
+sample of `fasta/human.fasta` (seed 20260828), real accessions prefixed `REAL_` and
+spike-in accessions `ENTRAP_`. The prefixes are not cosmetic: the E. coli FASTA
+already bundles 358 contaminants with a `Cont_` accession prefix, **150 of them
+`_HUMAN`**, so using `_HUMAN` as the marker would have scored real contaminants as
+entrapment negatives and inflated the measured FDR.
+
+Declared before scoring, as the playbook requires: marker `ENTRAP_`, exclude `REAL_`
+(protecting the 13,258 candidates shared between the two proteomes), contaminant
+markers `KRT`, `K1C`, `K2C`, `ALBU`, `TRYP`.
+
+`entrapment_ratio` **measured from the built library, not assumed**: 1,046,870 real
+against 1,867,304 entrapment target candidates gives **0.560632**. A 1:1 protein
+count does not give a 1:1 peptide count, because human proteins are longer -- which
+is exactly what the ratio exists to correct.
+
+Native predictors, native linear entrapment rescorer (`rescore.python` deliberately
+unset, because that is the path the defect lived on), 5,828,348 candidates,
+`gate_min_score = 0.6`, same converted spectra as the arm above.
+
+| | count |
+|---|---|
+| accepted real targets, `peptide_q_value` <= 0.01 | 786 |
+| accepted entrapment | 12 |
+| accepted decoys, `peptide_q_value` <= 0.01 | **0** |
+| accepted decoys, `q_value` <= 0.01 | 15 |
+
+Empirical FDP = `(0.560632 x 12 + 1) / 786` = **0.0098** against a 1% threshold:
+calibrated.
+
+What each number tests:
+
+- **0 decoys on `peptide_q_value` against 15 on `q_value`** is the signature of the
+  grouped-q fix. Only the grouped path excludes decoys from the competition, so a
+  decoy can no longer win a base-peptide group, take its q, and leave the real target
+  at 1.0.
+- **The score distribution** tests the training fix. Entrapment median -4.701 sits
+  on top of the decoy median -4.693, both far below the real-target tail (real p99
+  24.28, entrapment p99 -3.34), and the top 500 rows by score are 496 real / 2
+  entrapment / 2 decoy. Entrapment behaves as a held-out negative class, which it
+  could not do while being recruited as a positive training example.
+- **The ratio** is accepted because it is positive; 0 or negative is now rejected at
+  config validation, where it used to make every PSM pass at any threshold.
+
+Not comparable with the identification arm above: different library (5.8M
+native-predicted candidates against 1.8M DeepLC-fine-tuned), different rescorer, and
+a strictly harder null. The number to read here is the FDP, not the 786.
+
 ### ProteoBench Astral, `LFQ_Astral_DIA_15min_50ng` (module `quant_lfq_DIA_ion_Astral`)
 
 | | features | median abs eps, global | species-equalised | E. coli | CV median |

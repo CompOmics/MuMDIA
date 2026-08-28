@@ -351,12 +351,19 @@ default key as its comparison baseline, and a change of default remains
 benchmark-gated.
 
 Pooling more runs into one rescore does not tighten q. The estimator is
-`q = (n_decoys + 1) / max(1, n_targets)`
-(`rust/mumdia/crates/mumdia/src/fdr.rs:38`), which is scale-invariant under
-replicating the population. The only pool-size-dependent term is the `+1`
-pseudocount, whose relative weight shrinks as the pool grows, so a larger pool is
-if anything marginally looser. Never explain a per-run count difference by the
-number of runs pooled; check the q column and the score distribution instead.
+`q = (n_decoys + 1) / max(1, n_targets)`, whose only pool-size-dependent term is
+the `+1` pseudocount, so a larger pool is if anything marginally looser. Never
+explain a per-run count difference by the number of runs pooled; check the q
+column and the score distribution instead.
+
+It is not scale-INVARIANT, though, which an earlier version of this section
+claimed: the floor is exactly `1/T`, so it moves with the pool. Measured on the
+kernel, replicating a five-row population once takes q from
+`[0.5, 0.5, 0.667, 0.667, 1.0]` to `[0.25, 0.25, 0.5, 0.5, 0.833]`. The
+per-source `run_psm_q` is exactly per-run and genuinely unaffected; the pooled
+`q_value`, which is what `run-experiment` gates per-run quant on, is not. So
+sub-batching a large experiment is free in `run_psm_q` terms and does not
+reproduce the same `q_value` column.
 
 A sensitivity setting may be promoted only when:
 

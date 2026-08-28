@@ -672,7 +672,13 @@ fn load_config(path: &Option<String>) -> Result<Config> {
     let mut cfg = load_config_raw(path)?;
     cfg.predict_frag.sidecar_script_dir =
         python::resolve_script_dir(&cfg.predict_frag.sidecar_script_dir, path.as_deref());
-    python::resolve(&mut cfg)?;
+    // BEST EFFORT, not Require. `Role::required_by` answers "does this configuration use
+    // the role", which is not the same question as "does the subcommand I am about to run
+    // use it": a `mumdia search-seed` with `rescore.classifier = entrapment` would
+    // otherwise fail at config load demanding a mokapot interpreter for a rescorer that
+    // stage never invokes. The two orchestrators call `python::resolve` themselves, and
+    // keep the strict behaviour, which is where early failure actually pays.
+    python::resolve_with(&mut cfg, python::Strictness::BestEffort)?;
     Ok(cfg)
 }
 
