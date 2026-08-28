@@ -13,6 +13,23 @@ name: Release
 on:
   push:
     tags: ["v*"]
+  # Rehearsal. This workflow had never executed: there is no `v*` tag in the
+  # repository, so the first `v0.1.0` push would have been the first run of every
+  # step in it -- including the packaging, which now stages THIRD_PARTY_LICENSES.md
+  # and prunes two working documents, and the checksum step. A release path that has
+  # never run is not a release path.
+  #
+  # A dispatch run builds, packages, verifies and uploads the archives as a workflow
+  # ARTIFACT, and skips creating a GitHub Release: the upload step below is gated on
+  # a tag ref. So the whole path is exercised without publishing anything.
+  workflow_dispatch:
+    inputs:
+      version_name:
+        description: >-
+          Name to stamp into the archive filenames for this rehearsal
+          (a real tag run uses the tag name).
+        required: false
+        default: dryrun
 
 permissions:
   contents: write
@@ -72,7 +89,13 @@ jobs:
         # tag needs write access, so this is defence in depth rather than an open door,
         # but the fix costs nothing.
         env:
-          REF_NAME: ${{ github.ref_name }}
+          # On a tag run this is the tag; on a rehearsal it is the supplied name, so
+          # the archive is named `mumdia-dryrun-<target>` and cannot be mistaken for a
+          # real release artifact.
+          REF_NAME: >-
+            ${{ github.event_name == 'workflow_dispatch'
+                && (inputs.version_name || 'dryrun')
+                || github.ref_name }}
         run: |
           set -euo pipefail
           name="mumdia-$REF_NAME-${{ matrix.target }}"
@@ -119,7 +142,11 @@ jobs:
           echo "--- checksum ---"
           cat "$archive.sha256"
 
+      # Only a real tag creates a GitHub Release. Without this gate a rehearsal would
+      # try to publish a release for a branch ref, which is both wrong and the kind of
+      # thing that is only discovered by doing it.
       - name: Upload to release
+        if: startsWith(github.ref, 'refs/tags/v')
         # Pinned to a commit, not the mutable `v2` tag. This is the only
         # third-party action in the tree (the other nine are actions/* and
         # docker/*), it receives the release token and the built archives, and a
@@ -133,3 +160,17 @@ jobs:
             rust/mumdia/dist/*.zip
             rust/mumdia/dist/*.sha256
           generate_release_notes: true
+
+      # The rehearsal's output, so the archives can actually be inspected rather than
+      # merely reported as built.
+      - name: Upload archives as a workflow artifact (rehearsal only)
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-dryrun-${{ matrix.target }}
+          path: |
+            rust/mumdia/dist/*.tar.gz
+            rust/mumdia/dist/*.zip
+            rust/mumdia/dist/*.sha256
+          if-no-files-found: error
+          retention-days: 7
