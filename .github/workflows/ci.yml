@@ -395,6 +395,14 @@ jobs:
             echo "ok $f"
           done
 
+      # A workflow that GitHub refuses to parse fails when it is DISPATCHED, not when
+      # it is pushed: for release.yml that is the moment a release is attempted. And
+      # PyYAML accepts a duplicate mapping key silently, so a local parse check does
+      # not see the one error that actually reached the remote (an orphaned `exe: ""`
+      # left behind by deleting a matrix entry).
+      - name: Check the workflows GitHub has to parse
+        run: python ci/check_workflows.py
+
       # The conda specs are the only installation instructions for the sidecars;
       # a malformed one fails the Docker build rather than CI.
       - name: Parse env specs
