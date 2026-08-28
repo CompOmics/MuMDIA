@@ -173,8 +173,16 @@ pub fn run(p: SearchSeedParams) -> Result<u64> {
         }
         if let Some(scan) = scan_by_index.get(&b.scan_index) {
             let (mzs, _, _) = lib.cand_frags(*cid);
+            // The calibrant collection window has to be at least as wide as the search
+            // tolerance, or the deviation percentile that SETS the learned tolerance is
+            // truncated by the collection window itself. A literal 50 ppm silently did
+            // that on any wide-tolerance configuration: a TOF run searched at 100 ppm
+            // could not observe a deviation beyond 50, so its p95 was bounded at 50 and
+            // the learned tolerance came out too tight. The 50 ppm floor is kept for the
+            // narrow-tolerance case, where a wider window would just admit noise.
+            let collect_ppm = 50.0_f64.max(p.cfg.fragment_tol_ppm);
             for &fmz in mzs {
-                let (lo, hi) = mumdia_core::constants::ppm_bounds(fmz, 50.0);
+                let (lo, hi) = mumdia_core::constants::ppm_bounds(fmz, collect_ppm);
                 let s = scan.peaks.partition_point(|pk| pk.mz < lo);
                 let (mut bestd, mut bestppm) = (f64::MAX, None);
                 let mut j = s;

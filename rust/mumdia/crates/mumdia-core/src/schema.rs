@@ -1,5 +1,14 @@
 //! Frozen artifact schema identifiers (docs/03_io_layer.md). Each artifact
-//! carries a logical schema name and version so a stage can validate its inputs
+//! carries a logical schema name and version, recorded in the artifact's
+//! `report.json` and in the run manifest.
+//!
+//! What this is NOT, despite the previous wording here: input validation. No code
+//! anywhere reads a `schema_version` back and compares it -- all uses are writes. The
+//! version is provenance, so a reader of a finished artifact can tell which shape it
+//! is; a stage handed an incompatible artifact still fails on the missing or retyped
+//! column, not on the version. Claiming otherwise mattered because `CONTRIBUTING.md`
+//! stated a compatibility policy that nothing enforced. Making the check real is
+//! worthwhile and is a separate change; until then the honest statement is this one
 //! and a model is never applied under a mismatched schema.
 
 /// (logical name, schema version) for every MVP artifact.

@@ -231,16 +231,52 @@ the read returns empty and refinement is inert. Writes `candidate_audit.parquet`
    per-candidate windows. The consensus is local to one quant invocation; separate
    runs estimate separate widths unless an external workflow supplies a shared
    policy.
-5. **Phase 2** (`quant.rs:385`): integrate each fragment trace. With `bound_peak` off,
-   integrate the whole trace with `trapezoid` (`quant.rs:38`). With it on, restrict to
-   the chosen window via `trapezoid_window` (`quant.rs:53`). Areas are accumulated per
-   candidate in `areas` and `frag_areas`.
-6. **Top-N sum:** for each accepted target (`passes_quant_filter`, `quant.rs:177`),
-   `summarize_fragment_areas` (`quant.rs:185`) retains only positive finite fragment
-   areas, sorts descending, and sums the top `top_n_fragments`. Missing traces,
+5. **Phase 2:** integrate each fragment trace. Three integration modes, in the order
+   the code decides between them:
+
+   - **fixed window**, when `fixed_scan_halfwidth > 0` or `fixed_window_s > 0` and a
+     finite apex is available: `trapezoid_fixed_opts` integrates a window centred on
+     the apex, ignoring the walked bounds entirely. This is the mode the recorded
+     ProteoBench Astral submission used. The apex comes from `psms_scored`'s `apex_rt`
+     (the identification apex) and, when `bound_peak` is off, is taken directly from
+     it rather than from the peak walk. Two forms, and they are **not** interchangeable:
+     `fixed_scan_halfwidth = h` always integrates `2h+1` samples, while
+     `fixed_window_s = H` integrates `floor(2H/c)` or one more depending on where the
+     apex falls on the scan grid, so the integrated span varies by one full cycle
+     between otherwise identical precursors (6 versus 7 samples at 5 s on a 1.64 s
+     cycle). The window is skipped entirely when no sample lies within it, and widened
+     to two samples when only one does, because `trapezoid` returns a HEIGHT for a
+     single sample and mixing that with areas in one run corrupts relative quantities.
+   - **bounded**, when `bound_peak` is on and no fixed window is configured:
+     `trapezoid_window` restricts to the walked or consensus window.
+   - **whole trace**, otherwise: `trapezoid` over every sample.
+
+   Two optional transforms apply inside the fixed window: `interference_envelope`
+   passes the in-window intensities through an apex-outward monotone envelope before
+   integration, and `baseline_subtract` subtracts a flank baseline estimated from
+   `baseline_flank_scans` samples either side at the `baseline_quantile` quantile,
+   clamped at zero. Areas are accumulated per candidate in `areas` and `frag_areas`.
+6. **Top-N sum:** for each accepted target (`passes_quant_filter`),
+   `select_fragment_areas` retains only positive finite fragment areas and sums the
+   top `top_n_fragments`. `fragment_selection` chooses the ranking:
+   `observed_area` (default) ranks by the measured area and delegates to
+   `summarize_fragment_areas`, byte-identically to the legacy path;
+   `predicted` ranks by the library's predicted intensity instead, so the same
+   fragments are summed across runs regardless of which happened to be brightest,
+   with the observed area as tie-break. A non-finite predicted intensity is excluded
+   from the ranking rather than sorted to the front. Missing traces,
    all-zero/non-finite areas, or `top_n_fragments=0` produce a null quantity plus
-   an explicit `quant_status`; they are not converted to biological zero. The
-   applied apex and bounds are written with the row.
+   an explicit `quant_status`; they are not converted to biological zero.
+
+   `passes_quant_filter` also admits a row flagged `is_transferred` by
+   `mbr_worker.py`, whatever `q_filter` selects: MBR lowers only the PSM-level q
+   columns, so a transfer would otherwise fail the default `peptide_q` filter and
+   match-between-runs would appear to have done nothing. A decoy is never quantified,
+   transferred or not.
+
+   The applied apex and bounds are written with the row, and they describe the window
+   actually integrated -- under a fixed window that is the fixed window, not the
+   descent-walk bounds the fixed window replaced.
 7. **Protein rollup:** within each protein group, `add_protein_base_quantity`
    (`quant.rs:220`) deduplicates charge/modification siblings by `base_peptide_id`
    using their maximum positive quantity. `rollup_protein_bases` (`quant.rs:238`)

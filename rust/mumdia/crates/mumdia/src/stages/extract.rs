@@ -21,7 +21,7 @@ use mumdia_core::schema::artifact;
 use mumdia_io::report::ArtifactReport;
 use mumdia_io::table::{write_table, Col, Table};
 use serde_json::json;
-use tracing::info;
+use tracing::{info, warn};
 
 use mumdia_core::constants::{ppm_bounds, ISOTOPE_SPACING};
 
@@ -1430,6 +1430,21 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
                 mz_cal_grid = gmz.len(),
                 "extract: using mass recalibration"
             );
+            // `extract.frag_tol_ppm` is a FALLBACK, not a setting, in any orchestrated
+            // run: search-seed always writes `frag_tol_ppm` into masscal.json --
+            // including in its calibration-failure branch, where it writes
+            // `search_seed.fragment_tol_ppm` -- and both orchestrators always pass
+            // `--mass-cal`. So a config carrying `extract.frag_tol_ppm = 40` extracted at
+            // the learned value with nothing said about it. Say it, because a config key
+            // that is read and then ignored is worse than one that is absent.
+            if (tol - p.cfg.frag_tol_ppm).abs() > 1e-9 {
+                warn!(
+                    configured_frag_tol_ppm = p.cfg.frag_tol_ppm,
+                    learned_frag_tol_ppm = tol,
+                    mass_cal = path,
+                    "extract: extract.frag_tol_ppm is overridden by the learned tolerance                      from mass calibration. It applies only when no --mass-cal is passed;                      to widen the search tolerance, set search_seed.fragment_tol_ppm"
+                );
+            }
             (off, tol, gmz, gpp)
         }
         _ => (0.0, p.cfg.frag_tol_ppm, Vec::new(), Vec::new()),

@@ -168,9 +168,10 @@ produces bit-identical results.
   the tests that need torch, mokapot, DeepLC or MS2PIP skip on a runner without
   them, so CI does not validate rescoring or retention-time prediction behaviour.
 - The end-to-end smoke test runs on Linux and Windows, not macOS, and uses the
-  native predictors only; no CI job exercises the sidecar path end to end.
-- A configuration names Python interpreters by absolute path, so it is not
-  portable between machines without editing.
+  native predictors only. A separate job imports DeepLC, mokapot and MS2PIP in
+  real conda environments on any pull request touching `scripts/`, `env/`,
+  `tests/python/` or the Dockerfile, but no CI job runs the sidecar path end to
+  end on data.
 - `run` processes a single mzML file. `run-experiment` does not call the report
   stage, so it writes no `peptides.tsv` or `proteins.tsv`.
 - `mbr.strategy` distinguishes only none from not-none; `rt_window_s`,

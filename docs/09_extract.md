@@ -327,11 +327,21 @@ rejected before any gate or score is reached. Measured on a 50-window Orbitrap
 DIA run, `--top-peaks-ms2 300` discarded 78.6% of MS2 peaks; a `mumdia audit`
 ladder restricted to peptides that an external library-free search confirms are
 present in the run showed 49,105 of 78,782 (62.3%) stopping at
-`candidate_generated` with rejection code `NO_PEAK_GROUP` (`rejection.rs:62`),
-that is, never assembling `presence_min_fragments` distinct fragments. Only
-5,380 were lost to FDR and 355 to competition. Replaying those candidates
-against the uncapped artifact recovered 41,948 of the 49,105 (85.4%). When
-`NO_PEAK_GROUP` dominates an audit ladder, check the conversion cap before
+`candidate_generated` with rejection code `NO_PEAK_GROUP` (`rejection.rs:62`).
+Only 5,380 were lost to FDR and 355 to competition. Replaying those candidates
+against the uncapped artifact recovered 41,948 of the 49,105 (85.4%), which is
+what identifies the cap as the cause.
+
+`NO_PEAK_GROUP` does not mean "never assembled `presence_min_fragments` distinct
+fragments", although this document previously said so. `audit.rs` reads a
+per-candidate audit table that `extract` does not write -- `emit_candidate_audit`
+is unwired -- so the reason map is always empty and the `_ => NoPeakGroup`
+catch-all absorbs presence failures, matched-fraction failures and every
+extraction-gate rejection alike. Read it as "did not survive extract". The
+attribution to the peak cap above stands on the replay experiment, not on the
+label.
+
+When `NO_PEAK_GROUP` dominates an audit ladder, check the conversion cap before
 tuning the presence thresholds or gates here; see docs/04_convert.md for the
 peak census and the cap dose-response.
 

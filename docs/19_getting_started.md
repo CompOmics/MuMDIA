@@ -364,7 +364,8 @@ Treat the Section 4 counts as regression targets on
   report rows passing peptide q <= 1%, deterministic (exact match expected).
 - Best-workflow library run (`configs/examples/diann-library.json`, strict `nn_torch`,
   explicit `--top-peaks-ms2 300`): approximately 10,300 rows under the same
-  report definition. Treat this as a band because DeepLC fine-tuning is unseeded
+  report definition. Treat this as a band because DeepLC fine-tuning, although
+  seeded from `rng_seed`, is not bit-for-bit reproducible
   and NnTorch is seeded but not bit-deterministic.
 
 Count the report rows, which are one per `(peptidoform, charge)` but selected by

@@ -26,7 +26,18 @@ For Python changes:
 
 ```bash
 python -m compileall -q scripts ci
+python -m pytest tests/python -q -rs
 python ci/check_doc_refs.py
+```
+
+And whenever a config field, a CLI flag or a dependency changes, the generated
+documents have to be regenerated in the same commit. CI fails on a stale one,
+because a reference nobody regenerates is worse than none: it reads as current.
+
+```bash
+python ci/gen_cli_reference.py            # docs/23, from the binary's --help
+python ci/gen_config_reference.py         # docs/24, from config.rs
+python ci/gen_third_party_licenses.py     # THIRD_PARTY_LICENSES.md, from Cargo.lock
 ```
 
 CI runs all of the above on Linux, and the build and tests also on macOS and
@@ -44,15 +55,36 @@ validation, the IO layer, the fragment index, extraction, features, competition,
 FDR, quantification, and a small end-to-end extract-to-rescore integration test
 that builds its inputs in process.
 
-It does **not** exercise the Python sidecars. DeepLC, MS2PIP, mokapot, the
-PyTorch rescorer and the MBR worker never run in CI, so a passing test run is not
-evidence that a sidecar change works. Say so explicitly when you report results:
-if you changed a sidecar and only ran the Rust suite, the sidecar is untested.
+It does **not** exercise the Python sidecars on data. `tests/python` covers their
+file contracts, but every test needing torch, mokapot, DeepLC or MS2PIP skips on a
+runner without them, so a passing suite is not evidence that a sidecar's science
+works. A separate CI job does import DeepLC, mokapot and MS2PIP in real conda
+environments, and does so on any pull request touching `scripts/`, `env/`,
+`tests/python/` or the Dockerfile -- which catches an import-order or dependency
+break, not a behaviour change. Say so explicitly when you report results: if you
+changed a sidecar and only ran the Rust suite, the sidecar is untested.
 
-There is currently no checked-in mzML or Parquet fixture and no end-to-end smoke
-test over real data. Adding both is planned release work
-([`docs/22_release_plan.md`](docs/22_release_plan.md), WP6); until then, validate
-data-path changes on a real run and report the numbers.
+There **is** an end-to-end smoke test, on Linux and Windows:
+
+```bash
+bash ci/smoke.sh
+```
+
+It generates its own mzML fixture rather than committing one, and generates it
+from the library the engine has just built, so the planted peaks cannot disagree
+with the mass model. 117 assertions cover mzML parsing, the library build, the
+`run` orchestrator, the manifest, retention-time calibration, FDR and recovery,
+quantification, and byte-identical output between two runs -- compared across
+every artifact via the manifest's per-artifact content hashes, not just the two
+rounded TSVs.
+
+What it still cannot see is documented in
+[`docs/25_release_readiness_review.md`](docs/25_release_readiness_review.md)
+section 8: it runs FASTA mode only, so the imported-library production path is
+uncovered; its noise is synthetic, so interference and chimeric spectra are not
+represented; and its 3,820 candidates put the FDR pseudocount in charge, so it
+says nothing about calibration at scale. Validate data-path changes on a real run
+and report the numbers.
 
 ## Rules that are easy to break
 

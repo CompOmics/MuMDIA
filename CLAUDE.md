@@ -171,8 +171,16 @@ Orbitrap DIA run the same cap discarded 78.6% of all MS2 peaks and cost 60% of
 the peptides (25,425 capped versus 63,237 uncapped) at an unchanged 0.99%
 empirical decoy fraction, so the loss is sensitivity, not a loosened threshold.
 The mechanism is peak-group formation rather than scoring: with most peaks gone,
-`presence_min_fragments` cannot be met and real peptides are recorded
-`NO_PEAK_GROUP`.
+`presence_min_fragments` cannot be met and real peptides never assemble a peak
+group.
+
+That reading comes from the cap dose-response, not from the audit ladder's own
+label. `NO_PEAK_GROUP` cannot be used as evidence for it: `audit.rs` reads a
+per-candidate audit table that `extract` does not write (`emit_candidate_audit`
+is unwired), so the reason map is always empty and the `_ => NoPeakGroup`
+catch-all absorbs presence failures, matched-fraction failures AND every
+extraction-gate rejection alike. Treat the label as "did not survive extract",
+and do not decompose it further until the audit table is actually produced.
 
 Rules that follow from this:
 
@@ -267,11 +275,17 @@ fine-tuning also is not guaranteed deterministic.
   get 1.0. Under an experiment-wide rescore the grouping is experiment-wide, so
   a per-run count on those columns is diluted by roughly 1/n_runs and is
   meaningless. The correct per-file unit there is `run_psm_q`.
-- Pooling more runs does not tighten q. `fdr.rs:38` computes
-  `q = (decoys + 1) / max(1, targets)`, which is scale-invariant under
-  replicating the population. The only pool-size term is the +1 pseudocount,
-  which makes a larger pool marginally looser. Do not attribute per-run count
-  changes to pool size.
+- Pooling more runs does not tighten q. `fdr.rs` computes
+  `q = (decoys + 1) / max(1, targets)`, whose only pool-size term is the `+1`
+  pseudocount, and that makes a larger pool marginally LOOSER, never tighter.
+  Do not attribute per-run count changes to pool size.
+
+  "Scale-invariant" overstates it, though, and the overstatement matters at the
+  top of the list: the floor is exactly `1/T`, so it scales with the pool.
+  Measured on the real kernel, replicating a five-row population once moved q
+  from `[0.5, 0.5, 0.667, 0.667, 1.0]` to `[0.25, 0.25, 0.5, 0.5, 0.833]`. The
+  per-source `run_psm_q` is exactly per-run and genuinely unaffected; the pooled
+  `q_value` -- which is what `run-experiment` gates quant on -- is not.
 - Reported benchmark counts must name their row and q-value unit. `peptides.tsv`
   contains `(peptidoform, charge)` rows but is selected with
   `peptide_q_value`; it is not a precursor-q report.
@@ -290,10 +304,19 @@ fine-tuning also is not guaranteed deterministic.
   the input table each PSM came from (`rescore.rs:65-70,108`), and computes a
   per-source `run_psm_q` alongside the pooled `q_value`
   (`rescore.rs:403-408`). Pooling therefore never costs per-run FDR, and
-  sub-batching a large experiment is statistically free. Batch only to fit RAM.
+  sub-batching is free in `run_psm_q` terms. It is not free in pooled-`q_value`
+  terms, because the `1/T` floor moves with the pool, so a batched run and a
+  single pooled run do not produce identical `q_value` columns. Batch to fit RAM,
+  and compare per-run counts on `run_psm_q`.
 - Pooled rescore scales linearly, measured 0.834 ms/PSM on the streaming
-  backend. The feature matrix is `n_psms x n_features x 4` bytes; size batches
-  from that.
+  backend. Two feature matrices, two widths: the Python worker's is
+  `n_psms x n_features x 4` bytes (f32), while the Rust `feats` that `rescore`
+  builds is `Vec<Vec<f64>>`, so `n_psms x n_features x 8` plus a heap allocation
+  and 24 bytes of spine per PSM. `native_tda` additionally runs all folds in
+  parallel, each holding an owned standardised copy of its training slice, so its
+  peak is roughly `(1 + folds)x` the matrix. The stage logs the figure before it
+  allocates, and `rescore.max_feature_matrix_gib` turns exceeding a ceiling into
+  an error at startup rather than an OS kill hours in.
 
 ### Sidecar and IO contracts
 

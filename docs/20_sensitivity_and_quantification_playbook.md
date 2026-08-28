@@ -97,7 +97,8 @@ target-decoy sanity check, not an independent empirical-null validation.
 - Record the exact library and decoy provenance. Counts are uninterpretable
   without the search-space definition.
 - Repeat stochastic runs when comparing small gains. NnTorch seeds NumPy/Torch
-  but is not bit-deterministic; DeepLC fine-tuning is unseeded.
+  but is not bit-deterministic; DeepLC fine-tuning is seeded from `rng_seed` and
+  still not bit-for-bit reproducible, because torch's training kernels are not.
 
 ## Acquisition-specific choices
 

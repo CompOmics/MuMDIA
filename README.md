@@ -350,7 +350,9 @@ four are run by hand for the imported-library recipe above:
 Neither the DeepLC fine-tune nor the PyTorch rescorer is bit-reproducible. The
 rescorer seeds NumPy and PyTorch but its training kernels are not guaranteed
 deterministic (`MUMDIA_NN_SEEDS > 1` ensembles seeds as mitigation); the DeepLC
-fine-tune is unseeded. Identification counts therefore vary slightly between runs
+fine-tune is seeded from `rng_seed` (`deeplc_finetune.py --seed`, which seeds both
+numpy and torch), but torch's training kernels are not guaranteed bit-for-bit
+reproducible. Identification counts therefore vary slightly between runs
 of the same configuration, which matters when comparing small gains.
 
 ## Output
@@ -365,7 +367,8 @@ A `run` writes into `--out-dir`:
 | `protein_group_quant.parquet` | protein-group quantities for analysis |
 | `fragment_quant.parquet` | per-fragment areas, for ion-level LFQ |
 | `psms_scored.parquet` | the scored PSM table with every q column; the analysis unit |
-| `psms_competed.parquet`, `features.parquet`, `run.pin` | the feature matrix as competed and as fed to the rescorer |
+| `psms_competed.parquet`, `features.parquet` | the feature matrix, before and after competition |
+| `run.pin` | Percolator-style text export of `features.parquet`, for external tools. NOT what the rescorer reads: `rescore` builds its own PIN from the competed table. Off by default (`features.emit_pin`) |
 | `psms_extracted.parquet`, `chromatograms.parquet` | extraction results and the extracted traces |
 | `run_windows.parquet`, `cal.json` | per-run RT calibration and windows |
 | `seed_psms.parquet` | the broad calibration search, not final identifications |
@@ -616,8 +619,11 @@ Only measured quantities are stated here; no RAM figure is published yet.
 
 ### Generated references
 
-Two documents are generated from the code and checked for freshness in CI, so
-they cannot drift from it:
+Two documents are generated from the code, and CI regenerates them and fails on a
+difference. That pins everything the generator derives -- every flag, field, type,
+default and enum value -- but not the hand-written prose around it, and not a
+column the generator computes from a heuristic (`docs/24`'s benchmark-gated
+marker reads doc comments, so it is as right as they are):
 
 - [`docs/23_cli_reference.md`](docs/23_cli_reference.md): every subcommand's help,
   the four global flags, and which subcommands accept `--config`.
