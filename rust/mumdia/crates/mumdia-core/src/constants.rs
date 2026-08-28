@@ -89,8 +89,17 @@ pub fn ppm_bounds(mz: f64, tol_ppm: f64) -> (f64, f64) {
 /// is a min-relative form and differs at the tolerance edge from the query-relative
 /// [`ppm_bounds`] and the theoretical-relative [`ppm_diff`]; it is the predicate the
 /// log-bin +/-1 probe is proven exact against.
+///
+/// Non-finite input returns `false`. `f64::min`/`max` return the *non-NaN* operand, so
+/// without the guard `within_ppm(NaN, b, tol)` collapses to `0.0 <= tol*1e-6*b`, which is
+/// true for any positive `b`: one NULL m/z in a fragment table would make every peak
+/// "verify" against it and fabricate matched-fragment counts. Library load now rejects
+/// non-finite m/z outright, so this is the second line of defence rather than the first.
 #[inline]
 pub fn within_ppm(a: f64, b: f64, tol_ppm: f64) -> bool {
+    if !a.is_finite() || !b.is_finite() {
+        return false;
+    }
     let lo = a.min(b);
     let hi = a.max(b);
     hi - lo <= tol_ppm * 1e-6 * lo
@@ -134,5 +143,22 @@ mod ppm_tests {
         assert!(within_ppm(lo, hi, 10.0));
         assert!(!within_ppm(lo, hi, 9.9));
         assert!(within_ppm(hi, lo, 10.0)); // symmetric in argument order
+    }
+
+    #[test]
+    fn within_ppm_rejects_non_finite() {
+        // `f64::min`/`max` return the non-NaN operand, so without the guard this
+        // collapsed to `0.0 <= tol*1e-6*b`, i.e. TRUE for any positive b. This is the
+        // canonical predicate the whole fragment-index verify path uses, so one NULL m/z
+        // in a fragment table would have made every low-m/z peak "verify" against it and
+        // fabricated matched-fragment counts.
+        assert!(!within_ppm(f64::NAN, 500.0, 20.0));
+        assert!(!within_ppm(500.0, f64::NAN, 20.0));
+        assert!(!within_ppm(f64::INFINITY, 500.0, 20.0));
+        assert!(!within_ppm(f64::NEG_INFINITY, 500.0, 20.0));
+        assert!(!within_ppm(f64::NAN, f64::NAN, 20.0));
+        // Finite behaviour is unchanged.
+        assert!(within_ppm(500.0, 500.005, 20.0));
+        assert!(!within_ppm(500.0, 500.5, 20.0));
     }
 }

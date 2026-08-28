@@ -1514,7 +1514,18 @@ fn fragment_features(
         // pResCorr proxy: co-elution of the low-predicted-intensity fragments.
         // Real peptides show their minor fragments co-eluting; chimeras do not.
         let mut order: Vec<usize> = (0..pred.len()).collect();
-        order.sort_by(|&a, &b| pred[a].partial_cmp(&pred[b]).unwrap());
+        // `unwrap_or(Equal)`, matching the two other sorts of this same array in this file.
+        // The bare `unwrap()` here panicked on a non-finite predicted intensity, inside a
+        // rayon closure and after extract, so one NULL cell in a library discarded the most
+        // expensive stage in the pipeline with a message that named neither the column nor
+        // the row. Library load now rejects non-finite intensities, which is the real fix;
+        // this keeps the three sorts consistent so the next reader does not have to work
+        // out why one of them differed.
+        order.sort_by(|&a, &b| {
+            pred[a]
+                .partial_cmp(&pred[b])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         let take = (order.len() / 2).max(1);
         let low: Vec<f64> = order.iter().take(take).map(|&i| rc[i]).collect();
         f.low_frag_coel = mean(&low);

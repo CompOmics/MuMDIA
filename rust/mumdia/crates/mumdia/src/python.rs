@@ -116,6 +116,21 @@ impl Role {
         }
     }
 
+    /// Drop the field entirely. Used for a role that asked for discovery but is not
+    /// used by this configuration: leaving the literal "auto" in place made the
+    /// resolved config self-inconsistent, and every later `Path::exists` check on it
+    /// then failed on a program named "auto" for a sidecar that never runs. That is
+    /// how `run-experiment` came to reject a config `run` accepted. None also records
+    /// the truth in the manifest: no interpreter was selected, because none was needed.
+    fn clear(self, cfg: &mut Config) {
+        match self {
+            Role::Rescore => cfg.rescore.python = None,
+            Role::DeepLc => cfg.predict_frag.deeplc_python = None,
+            Role::Ms2pip => cfg.predict_frag.ms2pip_python = None,
+            Role::Mbr => cfg.mbr.python = None,
+        }
+    }
+
     /// Whether this run needs the role at all. A role that is not needed is never
     /// discovered and never probed, so a FASTA-free native run still works on a
     /// machine with no Python.
@@ -311,7 +326,10 @@ pub fn resolve(cfg: &mut Config) -> Result<Vec<Resolution>> {
         }
 
         if !required {
-            // Nothing to do, and nothing to probe: the native path is in use.
+            // Nothing to probe: the native path is in use. Clear the field so the
+            // literal "auto" does not survive into the resolved config, where a later
+            // existence check would try to stat a program called "auto".
+            role.clear(cfg);
             out.push(Resolution {
                 role,
                 python: None,
@@ -527,5 +545,41 @@ mod tests {
         // Nothing found: the configured value is returned so the error names it.
         assert_eq!(resolve_script_dir("no_such_dir", None), "no_such_dir");
         std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn resolve_clears_an_unused_auto_role() {
+        // Regression: `run` accepted a config that `run-experiment` rejected with
+        // "mbr.python points at an interpreter that does not exist: auto", because
+        // resolution left the literal "auto" in place for a role this configuration
+        // never uses, and the experiment preflight then stat'ed it. After resolution an
+        // unused role must be None: no interpreter was selected, because none is needed.
+        let mut cfg = Config::default();
+        cfg.mbr.python = Some(AUTO.to_string());
+        cfg.rescore.python = Some(AUTO.to_string());
+        assert!(
+            !Role::Mbr.required_by(&cfg),
+            "default config must not need MBR"
+        );
+        assert!(
+            !Role::Rescore.required_by(&cfg),
+            "default classifier must be native"
+        );
+
+        let res = resolve(&mut cfg).expect("resolving unused roles must not fail");
+        assert_eq!(cfg.mbr.python, None);
+        assert_eq!(cfg.rescore.python, None);
+        assert!(res.iter().all(|r| r.python.is_none()));
+        assert!(res.iter().all(|r| r.source == "not required"));
+    }
+
+    #[test]
+    fn resolve_honours_a_configured_path_for_an_unused_role() {
+        // An explicit path is not discovery, so it is preserved rather than cleared --
+        // the run still warns that it is unused, which is the useful signal.
+        let mut cfg = Config::default();
+        cfg.mbr.python = Some("/some/explicit/python".to_string());
+        resolve(&mut cfg).expect("an unused explicit path must not be validated");
+        assert_eq!(cfg.mbr.python.as_deref(), Some("/some/explicit/python"));
     }
 }

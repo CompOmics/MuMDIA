@@ -61,7 +61,18 @@ impl FragIndex {
         // m/z range from the library fragments (guard > 0), spec geometry in f64.
         let mut mz_min = f64::INFINITY;
         let mut mz_max = f64::NEG_INFINITY;
+        // Skip non-finite values rather than letting one of them decide the range. A single
+        // +inf fragment m/z used to make `mz_max` infinite, which tripped the fallback
+        // below and collapsed the range for the WHOLE library to [1.0, 2.0]: `LogBins`
+        // then clamps every real fragment into one bin and the +/-1 probe degenerates into
+        // a linear scan of the entire posting list per peak. No panic and no wrong answer,
+        // just an unbounded hang. Library load rejects non-finite m/z now, so this is the
+        // second line of defence; dropping the offending value is the right shape either
+        // way, because the range is a property of the real fragments.
         for &mz in &lib.frag_mz {
+            if !mz.is_finite() {
+                continue;
+            }
             if mz < mz_min {
                 mz_min = mz;
             }
@@ -69,6 +80,9 @@ impl FragIndex {
                 mz_max = mz;
             }
         }
+        // Reached only when the library has no finite fragment m/z at all (in practice: no
+        // fragments). A placeholder range keeps `LogBins::new` well-defined; `page_search`
+        // early-returns on the resulting empty index.
         if !mz_min.is_finite() || !mz_max.is_finite() {
             mz_min = 1.0;
             mz_max = 2.0;

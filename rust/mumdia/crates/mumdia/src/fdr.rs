@@ -2,6 +2,29 @@
 //! estimator `q = (n_decoys + 1) / max(1, n_targets)`, monotonized, with tied
 //! scores collapsed to a single block q. Shared by search-seed and rescore.
 
+/// Rank key for the q-value kernels: finite scores pass through, non-finite ones
+/// (NaN, +/-inf) become the worst possible key.
+///
+/// Two reasons this exists rather than trusting the caller. First, a NaN score used to
+/// make the tied-block walk below spin forever, because the walk advances on
+/// `score == s` and `NaN == NaN` is false, so a garbage feature value in an
+/// unvalidated caller (`rescoring.rs` train scores, `search_seed.rs` hyperscore) turned
+/// into a silent hang in a long batch job rather than an error. Second, mapping to
+/// `NEG_INFINITY` rather than sorting NaN natively is the conservative direction: under
+/// `total_cmp` a positive NaN sorts *above* every real score and would rank first.
+/// After this mapping every key is finite or `NEG_INFINITY`, so `==` is well-behaved and
+/// `total_cmp` is a genuine total order, which also removes the `sort_by`
+/// "comparison function does not correctly implement a total order" panic hazard that
+/// `unwrap_or(Equal)` on NaN created.
+#[inline]
+fn rank_key(x: f64) -> f64 {
+    if x.is_finite() {
+        x
+    } else {
+        f64::NEG_INFINITY
+    }
+}
+
 /// Compute per-record q-values from (score, is_decoy). Higher score is better.
 /// Returns q aligned to the input order.
 pub fn target_decoy_q(scores: &[(f64, bool)]) -> Vec<f64> {
@@ -9,13 +32,9 @@ pub fn target_decoy_q(scores: &[(f64, bool)]) -> Vec<f64> {
     if n == 0 {
         return Vec::new();
     }
+    let key: Vec<f64> = scores.iter().map(|&(s, _)| rank_key(s)).collect();
     let mut order: Vec<usize> = (0..n).collect();
-    order.sort_by(|&a, &b| {
-        scores[b]
-            .0
-            .partial_cmp(&scores[a].0)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    order.sort_by(|&a, &b| key[b].total_cmp(&key[a]));
     let (mut td, mut tt) = (0usize, 0usize);
     let mut fdr_at = vec![1.0f64; n];
     // Walk in score order, processing tied-score blocks together so every PSM in
@@ -25,9 +44,9 @@ pub fn target_decoy_q(scores: &[(f64, bool)]) -> Vec<f64> {
     // the low-count regime.
     let mut rank = 0usize;
     while rank < n {
-        let s = scores[order[rank]].0;
+        let s = key[order[rank]];
         let mut end = rank;
-        while end < n && scores[order[end]].0 == s {
+        while end < n && key[order[end]] == s {
             if scores[order[end]].1 {
                 td += 1;
             } else {
@@ -71,13 +90,11 @@ pub fn entrapment_q(
     if n == 0 {
         return Vec::new();
     }
+    let key: Vec<f64> = scores.iter().map(|&s| rank_key(s)).collect();
     let mut order: Vec<usize> = (0..n).collect();
-    // Stable sort: ties keep input order, so q values are deterministic.
-    order.sort_by(|&a, &b| {
-        scores[b]
-            .partial_cmp(&scores[a])
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    // Stable sort: ties keep input order, so q values are deterministic. Keyed on
+    // `rank_key` so a non-finite score cannot hang the tied-block walk below.
+    order.sort_by(|&a, &b| key[b].total_cmp(&key[a]));
     let (mut ne, mut nr) = (0usize, 0usize);
     let mut fdr_at = vec![1.0f64; n];
     // Process tied-score blocks together so every row in a block gets the same
@@ -86,9 +103,9 @@ pub fn entrapment_q(
     // `target_decoy_q`.
     let mut rank = 0usize;
     while rank < n {
-        let s = scores[order[rank]];
+        let s = key[order[rank]];
         let mut end = rank;
-        while end < n && scores[order[end]] == s {
+        while end < n && key[order[end]] == s {
             let i = order[end];
             if is_entrapment[i] {
                 ne += 1;
@@ -204,5 +221,51 @@ mod tests {
         let is_real = vec![true, false, true];
         let q = entrapment_q(&scores, &is_entrap, &is_real, 1.0);
         assert!((q[0] - q[1]).abs() < 1e-12 && (q[1] - q[2]).abs() < 1e-12);
+    }
+
+    #[test]
+    fn non_finite_scores_terminate_and_rank_last() {
+        // Regression: the tied-block walk advances on `score == s`, and `NaN == NaN` is
+        // false, so a NaN score made both kernels spin forever. `rescore.rs` validates
+        // finiteness before calling in, but `rescoring.rs` (train scores) and
+        // `search_seed.rs` (raw hyperscore) do not, so the failure mode was a silent
+        // hang in a long batch job. This test would not terminate before the fix.
+        // Four finite targets, then a +inf decoy and a NaN target. Enough finite targets
+        // that q is informative: with only one the (n_decoys+1)/n_targets pseudocount
+        // pins it at 1.0 and the test could not discriminate.
+        let s = vec![
+            (10.0, false),
+            (9.0, false),
+            (8.0, false),
+            (7.0, false),
+            (f64::INFINITY, true),
+            (f64::NAN, false),
+        ];
+        let q = target_decoy_q(&s);
+        assert_eq!(q.len(), 6);
+        assert!(q.iter().all(|v| v.is_finite()), "q must be finite: {q:?}");
+        // Every non-finite score maps to the worst key, so the +inf decoy is ranked last
+        // rather than first. That is the conservative direction and the reason for not
+        // sorting NaN natively: under `total_cmp` a positive NaN outranks every real
+        // score, which would have put a garbage row at the top of the list.
+        for (i, v) in q.iter().take(4).enumerate() {
+            assert!(
+                *v <= 0.25 + 1e-12,
+                "finite target {i} should keep q = 1/4, got {v} (a non-finite score                  outranking it would raise this): {q:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn entrapment_q_terminates_on_non_finite_scores() {
+        let scores = vec![f64::NAN, 5.0, 3.0, f64::INFINITY];
+        let is_entrap = vec![false, false, true, false];
+        let is_real = vec![true, true, false, true];
+        let q = entrapment_q(&scores, &is_entrap, &is_real, 1.0);
+        assert_eq!(q.len(), 4);
+        assert!(
+            q.iter().all(|v| v.is_finite() && *v >= 0.0 && *v <= 1.0),
+            "{q:?}"
+        );
     }
 }

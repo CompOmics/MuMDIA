@@ -9,6 +9,12 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+# Nothing in this workflow needs a token beyond checkout. Without this block every
+# job inherits the repository default, which on many repositories is read/write on
+# all scopes.
+permissions:
+  contents: read
+
 jobs:
   # The gate CLAUDE.md states, which CI did not previously enforce: formatting and
   # clippy were a local responsibility, so `main` could carry a tree that failed
@@ -41,6 +47,36 @@ jobs:
       # from a test module still fails the build under -D warnings.
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  # Dependency advisories. SECURITY.md declares these in scope and invites pin-bump
+  # pull requests, so the project needs a way to see them: without this job, two
+  # CVSS 7.5 advisories sat on the mzML parser (quick-xml, reached through mzdata)
+  # through every green CI run. The schedule matters as much as the PR trigger,
+  # because an advisory published after a merge would otherwise never surface.
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: rust/mumdia
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache cargo-audit
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-audit
+          key: ${{ runner.os }}-cargo-audit-bin
+
+      - name: Install cargo-audit
+        run: command -v cargo-audit || cargo install cargo-audit --locked
+
+      # Vulnerabilities fail the build. Unmaintained-crate warnings do not: `paste`
+      # is a compile-time proc macro whose 1.0.15 is its final release, so there is
+      # nothing to bump to and a hard failure would only train people to ignore
+      # this job. Deny the class that has a fix.
+      - name: Audit
+        run: cargo audit --deny unsound --deny yanked
 
   build-test:
     name: build + test (${{ matrix.os }})

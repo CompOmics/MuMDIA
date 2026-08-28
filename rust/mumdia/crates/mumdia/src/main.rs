@@ -1,8 +1,9 @@
 //! MuMDIA CLI: one binary, one subcommand per stage (docs/01_overview_and_dataflow.md).
 //! Every stage runs standalone on path-addressable inputs.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use mumdia::python;
 use mumdia::stages;
 use mumdia_core::config::Config;
 
@@ -628,14 +629,42 @@ fn version_below(v: &str, floor: &[u32]) -> bool {
     false
 }
 
-fn load_config(_path: &Option<String>) -> Result<Config> {
-    match _path {
+/// Parse a config file without touching the sidecar interpreter fields.
+///
+/// Only `doctor` wants this. Its whole job is to report what a configuration would
+/// resolve to and why, including when resolution would fail, so it must see the file
+/// as written.
+fn load_config_raw(path: &Option<String>) -> Result<Config> {
+    match path {
         Some(p) => {
-            let s = std::fs::read_to_string(p)?;
-            Ok(Config::from_json(&s)?)
+            let s = std::fs::read_to_string(p).with_context(|| {
+                format!("failed to read config file {p} (check the path and spelling)")
+            })?;
+            Config::from_json(&s).with_context(|| format!("invalid config in {p}"))
         }
         None => Ok(Config::default()),
     }
+}
+
+/// Parse a config file and resolve everything path-shaped in it: the sidecar
+/// interpreters (including the `"auto"` sentinel) and the worker script directory.
+///
+/// Every subcommand except `doctor` goes through here, which is the point. Resolution
+/// used to happen only inside the two orchestrators, so `mumdia rescore`,
+/// `mumdia predict-frag` and `mumdia mbr` took the word "auto" literally and tried to
+/// execute a program by that name — while all three shipped example configs, and the
+/// documented standalone-stage workflow, use `"auto"`. Resolving here means one
+/// behaviour for every entry point.
+///
+/// Cost on the native path is nil: `python::resolve` probes only the roles that
+/// `Role::required_by` says this configuration actually uses, and the default
+/// configuration uses none.
+fn load_config(path: &Option<String>) -> Result<Config> {
+    let mut cfg = load_config_raw(path)?;
+    cfg.predict_frag.sidecar_script_dir =
+        python::resolve_script_dir(&cfg.predict_frag.sidecar_script_dir, path.as_deref());
+    python::resolve(&mut cfg)?;
+    Ok(cfg)
 }
 
 fn main() -> Result<()> {
@@ -1066,7 +1095,10 @@ fn main() -> Result<()> {
             );
         }
         Cmd::Doctor { config } => {
-            let cfg = load_config(&config)?;
+            // Deliberately the raw loader: doctor must be able to diagnose a
+            // configuration whose interpreters do not resolve, so it cannot go
+            // through the resolving loader that would bail first.
+            let cfg = load_config_raw(&config)?;
             doctor(&cfg, config.as_deref())?;
         }
     }
