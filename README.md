@@ -126,7 +126,10 @@ cd MuMDIA/rust/mumdia
 cargo build --release --locked
 ```
 
-The build is pure Rust: no C toolchain, no cmake. The toolchain is pinned by
+The build needs no cmake and no system C libraries, but it does need a C compiler:
+`libmimalloc-sys` compiles the vendored mimalloc allocator and `blake3` compiles its
+SIMD paths, both via the `cc` build dependency. Every supported platform's default
+toolchain provides one. The Rust toolchain is pinned by
 `rust/mumdia/rust-toolchain.toml`, so rustup installs the right version on the
 first `cargo` invocation. The binary lands in `target/release/mumdia`
 (`mumdia.exe` on Windows). If you build on a cloud-synced drive (OneDrive,

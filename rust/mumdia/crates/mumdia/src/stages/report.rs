@@ -100,7 +100,14 @@ pub fn run(p: ReportParams) -> Result<(u64, u64)> {
     });
     let mut seen: HashSet<(String, i32)> = HashSet::new();
     let mut seen_strip: HashSet<String> = HashSet::new();
-    let mut w = std::io::BufWriter::new(std::fs::File::create(p.out_peptides)?);
+    // Atomic, like every parquet and json artifact. These two TSVs were the only
+    // outputs still written straight to their final path, so an interruption left a
+    // truncated `peptides.tsv` under the canonical name -- and unlike a truncated
+    // parquet, which fails to open because its footer is missing, a short TSV parses
+    // perfectly and simply has fewer peptides in it. That is the worst failure shape
+    // available: a plausible wrong answer.
+    let pep_target = mumdia_io::table::AtomicPath::new(p.out_peptides)?;
+    let mut w = std::io::BufWriter::new(std::fs::File::create(pep_target.tmp())?);
     // The row unit here is the precursor (peptidoform + charge), NOT the stripped
     // sequence; the header and the returned count reflect that.
     writeln!(
@@ -132,6 +139,8 @@ pub fn run(p: ReportParams) -> Result<(u64, u64)> {
         npep += 1;
     }
     w.flush()?;
+    drop(w);
+    pep_target.publish()?;
 
     // Protein groups, best q first, unique.
     let mut porder: Vec<usize> = (0..n).collect();
@@ -141,7 +150,8 @@ pub fn run(p: ReportParams) -> Result<(u64, u64)> {
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     let mut pseen: HashSet<String> = HashSet::new();
-    let mut w2 = std::io::BufWriter::new(std::fs::File::create(p.out_proteins)?);
+    let prot_target = mumdia_io::table::AtomicPath::new(p.out_proteins)?;
+    let mut w2 = std::io::BufWriter::new(std::fs::File::create(prot_target.tmp())?);
     writeln!(w2, "protein_group\tq_value\tquantity")?;
     let mut nprot = 0u64;
     for &i in &porder {
@@ -156,6 +166,8 @@ pub fn run(p: ReportParams) -> Result<(u64, u64)> {
         nprot += 1;
     }
     w2.flush()?;
+    drop(w2);
+    prot_target.publish()?;
 
     tracing::info!(
         precursors = npep,

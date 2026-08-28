@@ -130,6 +130,35 @@ impl Library {
         // where the offending row can still be named.
         require_finite_f64(&pmz, "precursor_mz", precursors)?;
         require_finite_f32(&irt, "predicted_irt", precursors)?;
+        // Charge must be positive. `ISOTOPE_SPACING / z` divides by it in three places in
+        // extract, so a 0 gives an infinite spacing and every MS1 isotope channel lands
+        // at the same m/z; a negative charge mirrors the envelope. Since a NULL in an
+        // integer column used to decode as the raw buffer value -- in practice 0 -- an
+        // imported library with a missing charge produced exactly that, silently. The
+        // NULL is rejected by the accessor now, but an explicit 0 or -1 in the file still
+        // has to be caught here.
+        if let Some(row) = charge.iter().position(|&z| z <= 0) {
+            anyhow::bail!(
+                "library column 'charge' is {} at row {row} in {precursors}, but charge \
+                 must be >= 1: extract divides the isotope spacing by it, so a 0 collapses \
+                 every isotope channel onto one m/z and a negative value mirrors the \
+                 envelope",
+                charge[row]
+            );
+        }
+        // Required strings must carry something. The accessor rejects a NULL, but an
+        // explicitly empty string is a different thing and still reaches here: an empty
+        // `peptidoform` cannot be parsed into residues, and an empty `protein` silently
+        // joins every such candidate into one protein group.
+        for (col, values) in [("peptidoform", &pform), ("protein", &protein)] {
+            if let Some(row) = values.iter().position(|v| v.trim().is_empty()) {
+                anyhow::bail!(
+                    "library column '{col}' is empty at row {row} in {precursors}; it is \
+                     required, and an empty value would be carried silently into \
+                     peptidoform parsing or protein grouping"
+                );
+            }
+        }
 
         let ncand = pt.nrows;
         // The typed getters above returned owned Vecs, so the decoded Arrow batches are
@@ -647,6 +676,105 @@ mod tests {
         let (p, f) = build_lib_values(&dir, vec![400.0, 500.0], vec![200.1, 250.5]);
         let lib = Library::load(&p, &f, 8).unwrap();
         assert_eq!(lib.n_candidates(), 2);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn non_positive_charge_is_rejected() {
+        // `ISOTOPE_SPACING / z` divides by charge in three places in extract, so a 0
+        // collapses every isotope channel onto one m/z. A NULL in an integer column used
+        // to decode as the raw buffer value -- in practice 0 -- so an imported library
+        // with a missing charge produced exactly that, silently.
+        let dir = unique_dir("bad_charge");
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("prec.parquet").to_str().unwrap().to_string();
+        let f = dir.join("frag.parquet").to_str().unwrap().to_string();
+        write_table(
+            &p,
+            vec![
+                Col::U32("candidate_id".into(), vec![0, 1]),
+                Col::U32("peptidoform_id".into(), vec![0, 1]),
+                Col::U32("base_peptide_id".into(), vec![0, 1]),
+                Col::Str(
+                    "peptidoform".into(),
+                    vec!["PEPTIDEK".into(), "SAMPLER".into()],
+                ),
+                Col::I32("charge".into(), vec![2, 0]),
+                Col::F64("precursor_mz".into(), vec![400.0, 500.0]),
+                Col::F32("predicted_irt".into(), vec![10.0, 20.0]),
+                Col::Str("label".into(), vec!["target".into(), "decoy".into()]),
+                Col::Str("protein".into(), vec!["P1".into(), "P2".into()]),
+                Col::I32("n_fragments".into(), vec![1, 1]),
+            ],
+        )
+        .unwrap();
+        write_table(
+            &f,
+            vec![
+                Col::U32("candidate_id".into(), vec![0, 1]),
+                Col::F64("mz".into(), vec![200.1, 250.5]),
+                Col::F32("predicted_intensity".into(), vec![1.0, 0.9]),
+                Col::Str("name".into(), vec!["b2".into(), "y3".into()]),
+                Col::Str("ion_type".into(), vec!["b".into(), "y".into()]),
+                Col::I32("ordinal".into(), vec![2, 3]),
+                Col::I32("frag_charge".into(), vec![1, 1]),
+            ],
+        )
+        .unwrap();
+        let err = match Library::load(&p, &f, 8) {
+            Ok(_) => panic!("charge 0 must be rejected at load"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("'charge'"), "{err}");
+        assert!(err.contains("row 1"), "should name the row: {err}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn empty_required_string_is_rejected() {
+        // The accessor rejects a NULL now, but an explicitly empty string is a different
+        // thing: an empty `protein` silently joins every such candidate into one group.
+        let dir = unique_dir("empty_protein");
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("prec.parquet").to_str().unwrap().to_string();
+        let f = dir.join("frag.parquet").to_str().unwrap().to_string();
+        write_table(
+            &p,
+            vec![
+                Col::U32("candidate_id".into(), vec![0, 1]),
+                Col::U32("peptidoform_id".into(), vec![0, 1]),
+                Col::U32("base_peptide_id".into(), vec![0, 1]),
+                Col::Str(
+                    "peptidoform".into(),
+                    vec!["PEPTIDEK".into(), "SAMPLER".into()],
+                ),
+                Col::I32("charge".into(), vec![2, 2]),
+                Col::F64("precursor_mz".into(), vec![400.0, 500.0]),
+                Col::F32("predicted_irt".into(), vec![10.0, 20.0]),
+                Col::Str("label".into(), vec!["target".into(), "decoy".into()]),
+                Col::Str("protein".into(), vec!["P1".into(), "".into()]),
+                Col::I32("n_fragments".into(), vec![1, 1]),
+            ],
+        )
+        .unwrap();
+        write_table(
+            &f,
+            vec![
+                Col::U32("candidate_id".into(), vec![0, 1]),
+                Col::F64("mz".into(), vec![200.1, 250.5]),
+                Col::F32("predicted_intensity".into(), vec![1.0, 0.9]),
+                Col::Str("name".into(), vec!["b2".into(), "y3".into()]),
+                Col::Str("ion_type".into(), vec!["b".into(), "y".into()]),
+                Col::I32("ordinal".into(), vec![2, 3]),
+                Col::I32("frag_charge".into(), vec![1, 1]),
+            ],
+        )
+        .unwrap();
+        let err = match Library::load(&p, &f, 8) {
+            Ok(_) => panic!("an empty required string must be rejected at load"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("'protein'"), "{err}");
         std::fs::remove_dir_all(&dir).ok();
     }
 }

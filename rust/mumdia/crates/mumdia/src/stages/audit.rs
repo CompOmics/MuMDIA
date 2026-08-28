@@ -13,7 +13,7 @@
 //! "no fragment traces" and "traces but no accepted peak" into a single observable
 //! event (a candidate is in `psms` or it is not); when a future in-extract audit
 //! sidecar `<psms>.audit.parquet` is present, its precise per-candidate reason
-//! refines the extract-stage bucket (see [`load_extract_reasons`]).
+//! refines the extract-stage bucket (see `load_extract_reasons`).
 
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;

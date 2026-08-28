@@ -40,7 +40,7 @@ pub fn cosine(a: &[f64], b: &[f64]) -> f64 {
     dot / (na.sqrt() * nb.sqrt())
 }
 
-/// Spectral angle in [0,1] (1 = identical), derived from cosine.
+/// Spectral angle in `[0, 1]` (1 = identical), derived from cosine.
 pub fn spectral_angle(a: &[f64], b: &[f64]) -> f64 {
     let c = cosine(a, b).clamp(-1.0, 1.0);
     1.0 - 2.0 * c.acos() / std::f64::consts::PI

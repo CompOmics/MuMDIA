@@ -1079,7 +1079,7 @@ pub fn run(p: QuantParams) -> Result<(u64, u64)> {
 /// quantity, n_features. With one input this reduces to the per-run sum.
 ///
 /// `normalize` applies a cross-run size factor to the feature-by-run matrix
-/// before rollup (see [`size_factors`]).
+/// before rollup (see `size_factors`).
 pub fn run_lfq_combine(
     inputs: &[String],
     by_fragment: bool,

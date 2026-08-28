@@ -4,6 +4,13 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Weekly, for the advisory scan. An earlier commit message claimed a scheduled run
+  # and there was none: `cargo audit` only ran on a push or a PR, so an advisory
+  # published after a merge would not have surfaced until the next unrelated change.
+  # Monday 06:00 UTC.
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -47,6 +54,16 @@ jobs:
       # from a test module still fails the build under -D warnings.
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      # Rustdoc, warnings as errors. Not previously run anywhere, and it was failing:
+      # four bracketed prose expressions (`[i0,i1,i2]`, `[0,1]`) were parsed as
+      # intra-doc links to items that do not exist, and three public doc comments
+      # linked to private items. Cheap to keep green, and the docs are this project's
+      # contract.
+      - name: Rustdoc
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --workspace --no-deps --locked
 
   # Dependency advisories. SECURITY.md declares these in scope and invites pin-bump
   # pull requests, so the project needs a way to see them: without this job, two

@@ -354,7 +354,7 @@ struct ChromRow {
 /// Per-PSM evidence handed to the extended feature families. All arrays are
 /// f64. Fragment-indexed arrays share one order; time-series share `axis`
 /// (elution-peak-bounded) or `axis_full` (whole extracted window). Built once
-/// per PSM by [`build_evidence`], then scalar fields are filled by the caller.
+/// per PSM by `build_evidence`, then scalar fields are filled by the caller.
 /// The family modules in `stages/features/` read this and return feature values.
 pub struct Evidence {
     /// RT axis (seconds) restricted to the detected elution peak.

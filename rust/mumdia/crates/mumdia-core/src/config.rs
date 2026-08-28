@@ -900,7 +900,7 @@ pub struct FeaturesConfig {
     /// (typical real peak width); higher percentiles widen the shared window.
     pub bound_confident_pct: f64,
     /// Emit the MS1 apex-isotope precursor feature `ms1_isotope_height_corr`
-    /// (Pearson of the observed apex isotope heights [i0,i1,i2] against the
+    /// (Pearson of the observed apex isotope heights `[i0,i1,i2]` against the
     /// Poisson-averagine model). Default false (the feature is present in the
     /// battery but returns 0.0, so the vector length is unchanged in effect). It
     /// overlaps the existing `ms1_isotope_cosine_apex`, so it is opt-in and
@@ -1561,6 +1561,49 @@ impl Config {
         // a negative q as passing. This is the failure mode of computing the ratio the
         // wrong way round (N_entrap/N_real, a small number), which silently reports a
         // near-zero FDR on the tool whose whole job is to validate the FDR.
+        // ── divisors and window widths ──────────────────────────────────────────
+        //
+        // Every field below is either divided by or used as a bin width, so a zero or a
+        // negative value does not degrade the result, it destroys it: a zero divisor
+        // gives an infinite or NaN bucket index that then goes through `as i64`, which in
+        // Rust is a saturating cast, so every row lands in one bucket silently. There is
+        // no error and no warning, just a stage that quietly stops distinguishing
+        // anything.
+        //
+        // `Config::validate` grew field by field around whatever had most recently gone
+        // wrong (`min_frag_corr`, `fixed_window_s`, `baseline_quantile`, `train_fdr`,
+        // `entrapment_ratio`), so the rest of the numeric surface was never covered. This
+        // is the divisor set, audited together.
+        for (name, value) in [
+            // `prescan.rs`: `(rt - lo) / bin` selects the retention-time cell.
+            ("prescan.rt_bin_s", self.prescan.rt_bin_s),
+            // `compete.rs`: `(apex_rt / tolerance).round()` is the apex bucket under
+            // `group_by = apex`.
+            (
+                "compete.apex_rt_tolerance_s",
+                self.compete.apex_rt_tolerance_s,
+            ),
+            // `prescan.rs`: fragment match half-width in Da.
+            ("prescan.tol_da", self.prescan.tol_da),
+            // Fragment/precursor tolerances. Zero admits nothing and overflows the
+            // log-bin count in `binning.rs`; negative completes the run and reports zero
+            // identifications with no error.
+            (
+                "search_seed.fragment_tol_ppm",
+                self.search_seed.fragment_tol_ppm,
+            ),
+            ("extract.frag_tol_ppm", self.extract.frag_tol_ppm),
+            ("extract.prec_tol_ppm", self.extract.prec_tol_ppm),
+        ] {
+            if !value.is_finite() || value <= 0.0 {
+                return Err(Invalid(format!(
+                    "{name} must be finite and > 0 (got {value}); it is used as a divisor \
+                     or a bin width, and a zero or negative value collapses every row \
+                     into one bucket instead of failing"
+                )));
+            }
+        }
+
         if !self.rescore.entrapment_ratio.is_finite() || self.rescore.entrapment_ratio <= 0.0 {
             return Err(Invalid(
                 "rescore.entrapment_ratio must be finite and > 0. It is \
@@ -1887,6 +1930,42 @@ mod tests {
             );
         }
         cfg.rescore.entrapment_ratio = 3.5;
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn divisors_must_be_finite_and_positive() {
+        // Each of these is divided by or used as a bin width. A zero divisor produces an
+        // infinite or NaN bucket index, and `as i64` in Rust saturates rather than
+        // trapping, so every row silently lands in one bucket: the stage stops
+        // distinguishing anything and reports no error at all.
+        let mut cfg = Config::default();
+        assert!(cfg.validate().is_ok(), "default must be valid");
+
+        for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            let mut c = Config::default();
+            c.prescan.rt_bin_s = bad;
+            let e = c
+                .validate()
+                .expect_err("prescan.rt_bin_s must reject {bad}");
+            assert!(format!("{e}").contains("prescan.rt_bin_s"), "{e}");
+
+            let mut c = Config::default();
+            c.compete.apex_rt_tolerance_s = bad;
+            let e = c
+                .validate()
+                .expect_err("compete.apex_rt_tolerance_s must reject");
+            assert!(format!("{e}").contains("apex_rt_tolerance_s"), "{e}");
+
+            let mut c = Config::default();
+            c.search_seed.fragment_tol_ppm = bad;
+            let e = c.validate().expect_err("fragment_tol_ppm must reject");
+            assert!(format!("{e}").contains("fragment_tol_ppm"), "{e}");
+        }
+
+        // A legitimate change still passes.
+        cfg.prescan.rt_bin_s = 10.0;
+        cfg.compete.apex_rt_tolerance_s = 2.5;
         assert!(cfg.validate().is_ok());
     }
 }

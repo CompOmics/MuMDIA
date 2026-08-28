@@ -12,7 +12,7 @@ use mumdia_io::table::{write_table, Col};
 use mzdata::prelude::*;
 use mzdata::spectrum::SignalContinuity;
 use serde_json::json;
-use tracing::info;
+use tracing::{info, warn};
 
 /// Centroid a profile spectrum by local maxima with 3-point parabolic m/z
 /// refinement. Peaks below `noise_floor` (relative to the max) are dropped.
@@ -60,7 +60,7 @@ fn centroid(mz: &[f64], inten: &[f32]) -> (Vec<f64>, Vec<f32>) {
 
 /// Extract (m/z, intensity) as centroided, m/z-sorted, non-zero peaks, capped
 /// to `top_n` most intense (0 = no cap).
-fn peaks_of<S: SpectrumLike>(spec: &S, top_n: usize) -> (Vec<f32>, Vec<f32>) {
+fn peaks_of<S: SpectrumLike>(spec: &S, top_n: usize) -> (Vec<f32>, Vec<f32>, usize) {
     let (mut mz, mut inten): (Vec<f64>, Vec<f32>) = match spec.raw_arrays() {
         Some(arrays) => {
             let m = arrays.mzs().map(|c| c.to_vec()).unwrap_or_default();
@@ -78,20 +78,38 @@ fn peaks_of<S: SpectrumLike>(spec: &S, top_n: usize) -> (Vec<f32>, Vec<f32>) {
         mz = cm;
         inten = ci;
     }
-    // Drop zero/negative intensity.
+    // Drop zero/negative intensity, and NON-FINITE m/z or intensity.
+    //
+    // The intensity filter `*i > 0.0` is already false for NaN, so a NaN intensity was
+    // dropped by accident. A NaN m/z with a positive intensity was not, and reached the
+    // sorts below, where `partial_cmp(...).unwrap()` panics: a single malformed value in
+    // an mzML aborted `mumdia convert` with an unwrap message naming neither the spectrum
+    // nor the value. An infinite m/z was worse than a panic -- it survived, and one
+    // non-finite fragment m/z collapses the whole fragment index range (see
+    // `FragIndex::build`).
+    //
+    // Dropping rather than erroring, because a peak list is a measurement and one bad
+    // peak in one spectrum is not a reason to refuse a whole run; the caller reports the
+    // count so the loss is visible rather than silent.
+    let n_before = mz.len();
     let mut pairs: Vec<(f64, f32)> = mz
         .into_iter()
         .zip(inten)
-        .filter(|(_, i)| *i > 0.0)
+        .filter(|(m, i)| *i > 0.0 && m.is_finite() && i.is_finite())
         .collect();
+    let dropped_nonfinite = n_before.saturating_sub(pairs.len());
     if top_n > 0 && pairs.len() > top_n {
-        pairs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        // `total_cmp` rather than `partial_cmp(..).unwrap()`. Every value here is finite
+        // by the filter above, so the two agree; `total_cmp` is a genuine total order, so
+        // it cannot panic and cannot trip the "comparison function does not correctly
+        // implement a total order" check that `sort_by` has had since Rust 1.81.
+        pairs.sort_by(|a, b| b.1.total_cmp(&a.1));
         pairs.truncate(top_n);
     }
-    pairs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+    pairs.sort_by(|a, b| a.0.total_cmp(&b.0));
     let out_mz: Vec<f32> = pairs.iter().map(|(m, _)| *m as f32).collect();
     let out_in: Vec<f32> = pairs.iter().map(|(_, i)| *i).collect();
-    (out_mz, out_in)
+    (out_mz, out_in, dropped_nonfinite)
 }
 
 pub struct ConvertParams<'a> {
@@ -167,6 +185,11 @@ pub fn run(p: ConvertParams) -> Result<ConvertOutputs> {
 
     let mut last_ms1_index: Option<u32> = None;
     let mut read = 0usize;
+    // Peaks dropped for a non-finite m/z or intensity. Counted rather than ignored:
+    // a handful is a damaged spectrum, and a large fraction means the file or the
+    // converter that produced it is wrong, which is worth knowing before the numbers
+    // are believed.
+    let mut nonfinite_peaks = 0usize;
     for (count, (scan_index, spec)) in (0_u32..).zip(reader).enumerate() {
         if p.max_spectra > 0 && count >= p.max_spectra {
             break;
@@ -174,7 +197,8 @@ pub fn run(p: ConvertParams) -> Result<ConvertOutputs> {
         let rt_s = spec.start_time() * 60.0; // mzdata returns minutes
         match spec.ms_level() {
             1 => {
-                let (mz, inten) = peaks_of(&spec, p.top_peaks_ms1);
+                let (mz, inten, nf) = peaks_of(&spec, p.top_peaks_ms1);
+                nonfinite_peaks += nf;
                 ms1_idx.push(scan_index);
                 ms1_rt.push(rt_s);
                 ms1_mz.push(mz);
@@ -182,7 +206,8 @@ pub fn run(p: ConvertParams) -> Result<ConvertOutputs> {
                 last_ms1_index = Some(scan_index);
             }
             2 => {
-                let (mz, inten) = peaks_of(&spec, p.top_peaks_ms2);
+                let (mz, inten, nf) = peaks_of(&spec, p.top_peaks_ms2);
+                nonfinite_peaks += nf;
                 let prec = spec.precursor();
                 let iw = prec.map(|pr| pr.isolation_window.clone());
                 let (wt, wl, wu) = match &iw {
@@ -236,6 +261,13 @@ pub fn run(p: ConvertParams) -> Result<ConvertOutputs> {
     // silently tolerates: search-seed finds nothing, extract runs the whole library
     // against an empty spectrum list, and report writes a header-only peptides.tsv, all
     // at exit 0. Fail here, where the cause is still visible.
+    if nonfinite_peaks > 0 {
+        warn!(
+            nonfinite_peaks,
+            mzml = p.mzml,
+            "convert: dropped peaks with a non-finite m/z or intensity. A few indicate a              damaged spectrum; a large number indicates a problem with the file or with              the converter that wrote it"
+        );
+    }
     if m2_idx.is_empty() {
         anyhow::bail!(
             concat!(

@@ -118,14 +118,21 @@ resolver (`resolver = "2"`, `Cargo.toml:2`) and lists three members
 depends on `serde`/`serde_json`/`thiserror` only (no arrow/parquet, so the core
 types stay I/O-free); `mumdia-io` adds `arrow`/`parquet`/`blake3` over
 `mumdia-core`; the `mumdia` bin+lib crate pulls the full set including `clap`,
-`rayon`, `mzdata`, and `tracing`. The engine is a **pure-Rust build with
-no C toolchain**: `parquet` uses `default-features = false, features =
+`rayon`, `mzdata`, and `tracing`. The engine needs **no cmake and no system C libraries**, which is what the feature
+selection buys: `parquet` uses `default-features = false, features =
 ["arrow","snap"]` to drop the C zlib-ng backend that needs cmake and to use the
 pure-Rust SNAPPY codec (`Cargo.toml:36-37`); `mzdata` uses `["mzml",
 "miniz_oxide"]` for a pure-Rust zlib backend (`Cargo.toml:38-39`); `arrow` adds
-`["prettyprint"]` for `inspect` (`Cargo.toml:35`); `mimalloc` is the pure-Rust
-per-thread-arena allocator the binary installs globally (`Cargo.toml:40-43`,
-`main.rs:12-13`).
+`["prettyprint"]` for `inspect` (`Cargo.toml:35`).
+
+It is **not** a pure-Rust build, which this section previously claimed. `cc` is a
+build dependency of exactly two crates, and `cargo tree -i cc` shows both:
+`libmimalloc-sys` compiles the vendored mimalloc C allocator that the binary
+installs globally (`Cargo.toml:40-43`, `main.rs:12-13`), and `blake3` compiles its
+SIMD paths. So a C compiler is required, though nothing external to the dependency
+tree is: no cmake, no system zlib, no vendored library to install first. Every
+supported platform's default toolchain provides the compiler, which is why this went
+unnoticed.
 
 The dropped codecs are visible at the read side, not only at build time. SNAPPY
 is the only codec compiled in, so any Parquet the engine is asked to read must be

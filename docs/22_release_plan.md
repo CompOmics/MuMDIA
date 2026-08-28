@@ -131,7 +131,9 @@ new engineering.
   `docs/15` documents every Parquet column; `docs/17` covers quiet failure
   modes.
 - Release and Docker workflows exist and only need to be exercised.
-- Pure-Rust build (no C toolchain), `Cargo.lock` tracked, `--locked` builds.
+- No cmake and no system C libraries; `Cargo.lock` tracked, `--locked` builds. (A C
+  compiler IS required: `cc` is a build dependency of `libmimalloc-sys` and
+  `blake3`. The earlier "pure-Rust build, no C toolchain" wording was wrong.)
 
 ## 2. Decisions (WP0, settled 2026-08-27)
 

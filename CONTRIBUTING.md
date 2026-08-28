@@ -12,7 +12,10 @@ material and states the invariants a change must not violate.
 
 The workspace lives in `rust/mumdia`. The toolchain is pinned by
 `rust/mumdia/rust-toolchain.toml`, so rustup installs the right version on the
-first `cargo` invocation. The build is pure Rust: no C toolchain, no cmake.
+first `cargo` invocation. No cmake and no system C libraries are needed, but a C
+COMPILER is: `libmimalloc-sys` compiles the vendored mimalloc allocator and
+`blake3` compiles its SIMD paths, both through the `cc` build dependency. Every
+supported platform's default toolchain provides one.
 
 ```bash
 cd rust/mumdia

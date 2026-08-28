@@ -135,7 +135,7 @@ pub fn load_ms2(path: &str) -> Result<Vec<Ms2Scan>> {
             i += 1;
         }
     }
-    out.sort_by(|a, b| a.rt_seconds.partial_cmp(&b.rt_seconds).unwrap());
+    out.sort_by(|a, b| a.rt_seconds.total_cmp(&b.rt_seconds));
     Ok(out)
 }
 
@@ -196,6 +196,6 @@ pub fn load_ms1(path: &str) -> Result<Vec<Ms1Scan>> {
             i += 1;
         }
     }
-    out.sort_by(|a, b| a.rt_seconds.partial_cmp(&b.rt_seconds).unwrap());
+    out.sort_by(|a, b| a.rt_seconds.total_cmp(&b.rt_seconds));
     Ok(out)
 }

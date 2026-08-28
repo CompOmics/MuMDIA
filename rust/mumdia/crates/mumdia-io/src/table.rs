@@ -228,14 +228,14 @@ pub fn write_table(path: &str, cols: Vec<Col>) -> Result<u64> {
 /// rename is atomic on both POSIX and Windows for a same-directory target, so a reader
 /// sees either the old artifact or the new one, never a partial one. A killed run
 /// leaves at most a recognisable `.tmp-<pid>` file, which is inert.
-pub(crate) struct AtomicPath {
+pub struct AtomicPath {
     tmp: std::path::PathBuf,
     final_path: std::path::PathBuf,
     published: bool,
 }
 
 impl AtomicPath {
-    pub(crate) fn new(path: &str) -> Result<AtomicPath> {
+    pub fn new(path: &str) -> Result<AtomicPath> {
         let final_path = std::path::PathBuf::from(path);
         if let Some(parent) = final_path.parent() {
             if !parent.as_os_str().is_empty() {
@@ -251,12 +251,12 @@ impl AtomicPath {
         })
     }
 
-    pub(crate) fn tmp(&self) -> &std::path::Path {
+    pub fn tmp(&self) -> &std::path::Path {
         &self.tmp
     }
 
     /// Move the completed temp file onto the final path.
-    pub(crate) fn publish(mut self) -> Result<()> {
+    pub fn publish(mut self) -> Result<()> {
         // Windows `rename` fails when the destination exists, unlike POSIX. Removing
         // first opens a window in which neither file is at the final path; that is
         // strictly better than the previous behaviour, where the window lasted for the
@@ -524,6 +524,28 @@ impl Table {
         Ok(out)
     }
 
+    /// Reject a NULL in a column read through a non-optional accessor.
+    ///
+    /// The `Col` enum has `OptF64`, `OptF32`, `OptI32` and `OptStr` for genuinely
+    /// nullable columns, so a plain accessor is a statement that the column is
+    /// required. It did not behave like one: `i32`/`i64`/`u32` pushed
+    /// `a.value(k)` for a null row, which is the raw buffer value and in practice 0,
+    /// and `str` pushed an empty `String`. Both are silent substitutions of a
+    /// plausible value for a missing one.
+    ///
+    /// The concrete consequence, and the reason this is not merely tidiness: a null
+    /// `charge` in an imported library became 0, and a 0 charge reaches an
+    /// isotope-spacing division in extract. `bool` did not check nulls at all.
+    fn reject_null(&self, name: &str, row: usize) -> anyhow::Error {
+        anyhow!(
+            "column '{name}' has a NULL at row {row} in {}, but it is a required \
+             column. Nullable columns are written through the Opt* variants and read \
+             through the opt_* accessors; a NULL here would otherwise be substituted \
+             with 0 or an empty string. Fix or drop the row",
+            self.path
+        )
+    }
+
     pub fn i64(&self, name: &str) -> Result<Vec<i64>> {
         let i = self.idx(name)?;
         let mut out = Vec::with_capacity(self.nrows);
@@ -537,6 +559,9 @@ impl Table {
                 out.extend_from_slice(a.values());
             } else {
                 for k in 0..a.len() {
+                    if a.is_null(k) {
+                        return Err(self.reject_null(name, out.len()));
+                    }
                     out.push(a.value(k));
                 }
             }
@@ -557,6 +582,9 @@ impl Table {
                 out.extend_from_slice(a.values());
             } else {
                 for k in 0..a.len() {
+                    if a.is_null(k) {
+                        return Err(self.reject_null(name, out.len()));
+                    }
                     out.push(a.value(k));
                 }
             }
@@ -577,6 +605,9 @@ impl Table {
                 out.extend_from_slice(a.values());
             } else {
                 for k in 0..a.len() {
+                    if a.is_null(k) {
+                        return Err(self.reject_null(name, out.len()));
+                    }
                     out.push(a.value(k));
                 }
             }
@@ -594,6 +625,9 @@ impl Table {
                 .downcast_ref::<BooleanArray>()
                 .ok_or_else(|| anyhow!("column '{name}' is not bool"))?;
             for k in 0..a.len() {
+                if a.is_null(k) {
+                    return Err(self.reject_null(name, out.len()));
+                }
                 out.push(a.value(k));
             }
         }
@@ -610,11 +644,10 @@ impl Table {
                 .downcast_ref::<StringArray>()
                 .ok_or_else(|| anyhow!("column '{name}' is not utf8"))?;
             for k in 0..a.len() {
-                out.push(if a.is_null(k) {
-                    String::new()
-                } else {
-                    a.value(k).to_string()
-                });
+                if a.is_null(k) {
+                    return Err(self.reject_null(name, out.len()));
+                }
+                out.push(a.value(k).to_string());
             }
         }
         Ok(out)

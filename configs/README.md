@@ -47,12 +47,25 @@ one.
 ## Where the worker scripts have to be
 
 `predict_frag.sidecar_script_dir` names the directory holding the Python workers.
-A relative value is resolved against, in order, the current working directory,
-the directory the config file itself lives in, and `scripts/` next to the
-`mumdia` executable, which is the layout of the release archive. So `"scripts"`
-works both from a git checkout and from an unpacked release, and a config that
-sits next to its own `scripts/` directory keeps working when invoked from
-elsewhere.
+
+An ABSOLUTE value is taken as given. A relative value is resolved against, in order:
+
+1. the directory the config file itself lives in,
+2. `scripts/` next to the `mumdia` executable, which is the layout of the release
+   archive,
+3. the current working directory, with a warning.
+
+So `"scripts"` works both from a git checkout and from an unpacked release, and a
+config that sits next to its own `scripts/` directory keeps working when invoked
+from elsewhere.
+
+The working directory is deliberately LAST. It used to be first, and the shipped
+default is the relative `"scripts"`, so unpacking an untrusted dataset archive that
+happened to contain a `scripts/` directory with a worker file in it and running
+`mumdia` from inside it would have executed those workers. That needs no hostile
+configuration -- which `SECURITY.md` treats as trusted, like a shell script -- only
+an untrusted input directory. Prefer an absolute path, or keep the scripts beside
+the config.
 
 ## The configurations shipped in the container image
 
