@@ -153,7 +153,7 @@ enum Cmd {
         #[arg(long)]
         isolation_windows: String,
         #[arg(long)]
-        library_precursors: String,
+        lib_precursors: String,
         /// Per-candidate RT bounds (candidate_id, rt_lo, rt_hi); a run_windows-shaped table.
         #[arg(long)]
         run_windows: String,
@@ -167,9 +167,9 @@ enum Cmd {
         #[arg(long)]
         ms2: String,
         #[arg(long)]
-        library_precursors: String,
+        lib_precursors: String,
         #[arg(long)]
-        library_fragments: String,
+        lib_fragments: String,
         #[arg(long)]
         out: String,
         #[arg(long)]
@@ -180,7 +180,7 @@ enum Cmd {
         #[arg(long)]
         seed_psms: String,
         #[arg(long)]
-        library_precursors: String,
+        lib_precursors: String,
         #[arg(long)]
         out_windows: String,
         #[arg(long)]
@@ -193,9 +193,9 @@ enum Cmd {
         #[arg(long)]
         ms2: String,
         #[arg(long)]
-        library_precursors: String,
+        lib_precursors: String,
         #[arg(long)]
-        library_fragments: String,
+        lib_fragments: String,
         #[arg(long)]
         run_windows: String,
         /// Optional MS1 spectra for isotope-envelope features.
@@ -207,7 +207,7 @@ enum Cmd {
         #[arg(long)]
         out_psms: String,
         #[arg(long)]
-        out_chrom: String,
+        out_chromatograms: String,
         /// Optional candidate allowlist (a prior run's psms.parquet): restrict
         /// extraction to these candidate_ids. For "gate first, then compete" -
         /// re-extract with a peak_claim strategy over only the gate-accepted
@@ -220,12 +220,12 @@ enum Cmd {
     /// Compute the minimal feature set -> features.parquet + PIN.
     Features {
         #[arg(long)]
-        psms: String,
+        psms_extracted: String,
         #[arg(long)]
         chromatograms: String,
         /// Optional seed_psms for search-engine corroboration features.
         #[arg(long)]
-        seed: Option<String>,
+        seed_psms: Option<String>,
         #[arg(long)]
         out: String,
         #[arg(long)]
@@ -348,7 +348,7 @@ enum Cmd {
     Align {
         /// One seed_psms.parquet per run; the first is the reference.
         #[arg(long, num_args = 1..)]
-        seeds: Vec<String>,
+        seed_psms: Vec<String>,
         #[arg(long)]
         out: String,
         #[arg(long)]
@@ -358,16 +358,16 @@ enum Cmd {
     Mbr {
         /// Experiment-wide scored_combined.parquet (has the `source` column).
         #[arg(long)]
-        scored: String,
+        psms_scored: String,
         /// Per-run psms.parquet in `source` order (one per run).
         #[arg(long, num_args = 1..)]
-        psms: Vec<String>,
+        psms_extracted: Vec<String>,
         #[arg(long)]
         out: String,
         /// Optional augmented scored table: input scored with accepted transfers'
         /// q_value lowered + is_transferred flag (for quant/report with q_filter=psm_q).
         #[arg(long)]
-        out_scored: Option<String>,
+        out_psms_scored: Option<String>,
         /// Optional per-run fragment_quant.parquet (source order) for the
         /// fragment-consensus guard (needs mbr.consensus_corr_min > 0).
         #[arg(long, num_args = 0..)]
@@ -383,16 +383,16 @@ enum Cmd {
     Audit {
         /// Library precursors parquet (the full candidate search space).
         #[arg(long)]
-        library_precursors: String,
+        lib_precursors: String,
         /// psms parquet from `extract`.
         #[arg(long)]
-        psms: String,
+        psms_extracted: String,
         /// competed parquet from `compete`.
         #[arg(long)]
         competed: String,
         /// scored parquet from `rescore`.
         #[arg(long)]
-        scored: String,
+        psms_scored: String,
         /// Output candidate_audit.parquet.
         #[arg(long)]
         out: String,
@@ -409,15 +409,24 @@ enum Cmd {
     /// Write peptides.tsv + proteins.tsv from a scored PSM table.
     Report {
         #[arg(long)]
-        scored: String,
+        psms_scored: String,
         #[arg(long)]
         out_dir: String,
         #[arg(long)]
         peptide_quant: Option<String>,
         #[arg(long)]
         protein_quant: Option<String>,
-        #[arg(long, default_value_t = 0.01)]
-        q: f64,
+        /// Reported q threshold. Defaults to `quant.q_threshold` from `--config`
+        /// when that is given, otherwise 0.01. An explicit value always wins.
+        #[arg(long)]
+        q: Option<f64>,
+        /// Read `quant.q_threshold` from this config, so a standalone report uses the
+        /// same threshold as the `run` that produced the table.
+        ///
+        /// Without it, a config setting `quant.q_threshold = 0.05` yielded 0.05 from
+        /// `run` and 0.01 from `report` on the same scored table, silently.
+        #[arg(long)]
+        config: Option<String>,
     },
     /// Check that the configured Python sidecar environments are usable.
     Doctor {
@@ -743,8 +752,8 @@ fn main() -> Result<()> {
         }
         Cmd::SearchSeed {
             ms2,
-            library_precursors,
-            library_fragments,
+            lib_precursors,
+            lib_fragments,
             out,
             config,
         } => {
@@ -752,8 +761,8 @@ fn main() -> Result<()> {
             let ch = mumdia_io::hash::blake3_str(&cfg.canonical_json());
             stages::search_seed::run(stages::search_seed::SearchSeedParams {
                 ms2: &ms2,
-                library_precursors: &library_precursors,
-                library_fragments: &library_fragments,
+                library_precursors: &lib_precursors,
+                library_fragments: &lib_fragments,
                 out: &out,
                 cfg: &cfg.search_seed,
                 bucket_size: cfg.extract.bucket_size,
@@ -762,7 +771,7 @@ fn main() -> Result<()> {
         }
         Cmd::RtImTrain {
             seed_psms,
-            library_precursors,
+            lib_precursors,
             out_windows,
             out_cal,
             config,
@@ -790,7 +799,7 @@ fn main() -> Result<()> {
             let ch = mumdia_io::hash::blake3_str(&cfg.canonical_json());
             stages::rt_im_train::run(stages::rt_im_train::RtImTrainParams {
                 seed_psms: &seed_psms,
-                library_precursors: &library_precursors,
+                library_precursors: &lib_precursors,
                 out_windows: &out_windows,
                 out_cal: &out_cal,
                 cfg: &cfg.rt_im_train,
@@ -799,13 +808,13 @@ fn main() -> Result<()> {
         }
         Cmd::Extract {
             ms2,
-            library_precursors,
-            library_fragments,
+            lib_precursors,
+            lib_fragments,
             run_windows,
             ms1,
             mass_cal,
             out_psms,
-            out_chrom,
+            out_chromatograms,
             restrict_candidates,
             config,
         } => {
@@ -813,22 +822,22 @@ fn main() -> Result<()> {
             let ch = mumdia_io::hash::blake3_str(&cfg.canonical_json());
             stages::extract::run(stages::extract::ExtractParams {
                 ms2: &ms2,
-                library_precursors: &library_precursors,
-                library_fragments: &library_fragments,
+                library_precursors: &lib_precursors,
+                library_fragments: &lib_fragments,
                 run_windows: &run_windows,
                 ms1: ms1.as_deref(),
                 mass_cal: mass_cal.as_deref(),
                 out_psms: &out_psms,
-                out_chrom: &out_chrom,
+                out_chrom: &out_chromatograms,
                 restrict_candidates: restrict_candidates.as_deref(),
                 cfg: &cfg.extract,
                 config_hash: &ch,
             })?;
         }
         Cmd::Features {
-            psms,
+            psms_extracted,
             chromatograms,
-            seed,
+            seed_psms,
             out,
             out_pin,
             config,
@@ -836,9 +845,9 @@ fn main() -> Result<()> {
             let cfg = load_config(&config)?;
             let ch = mumdia_io::hash::blake3_str(&cfg.canonical_json());
             stages::features::run(stages::features::FeaturesParams {
-                psms: &psms,
+                psms: &psms_extracted,
                 chromatograms: &chromatograms,
-                seed: seed.as_deref(),
+                seed: seed_psms.as_deref(),
                 out: &out,
                 out_pin: &out_pin,
                 cfg: &cfg.features,
@@ -848,7 +857,7 @@ fn main() -> Result<()> {
         Cmd::Prescan {
             ms2,
             isolation_windows,
-            library_precursors,
+            lib_precursors,
             run_windows,
             out,
             config,
@@ -858,7 +867,7 @@ fn main() -> Result<()> {
             stages::prescan::run(stages::prescan::PrescanParams {
                 ms2: &ms2,
                 isolation_windows: &isolation_windows,
-                library_precursors: &library_precursors,
+                library_precursors: &lib_precursors,
                 run_windows: &run_windows,
                 out: &out,
                 cfg: &cfg.prescan,
@@ -880,20 +889,20 @@ fn main() -> Result<()> {
             })?;
         }
         Cmd::Audit {
-            library_precursors,
-            psms,
+            lib_precursors,
+            psms_extracted,
             competed,
-            scored,
+            psms_scored,
             out,
             q,
             run_id,
             entrapment_substr,
         } => {
             stages::audit::run(stages::audit::AuditParams {
-                library_precursors: &library_precursors,
-                psms: &psms,
+                library_precursors: &lib_precursors,
+                psms: &psms_extracted,
                 competed: &competed,
-                scored: &scored,
+                scored: &psms_scored,
                 out: &out,
                 q_threshold: q,
                 run_id: &run_id,
@@ -1017,11 +1026,15 @@ fn main() -> Result<()> {
                 })?;
             stages::quant::run_lfq_combine(&inputs, by_fragment, norm, &out)?;
         }
-        Cmd::Align { seeds, out, config } => {
+        Cmd::Align {
+            seed_psms,
+            out,
+            config,
+        } => {
             let cfg = load_config(&config)?;
             let ch = mumdia_io::hash::blake3_str(&cfg.canonical_json());
             stages::align::run(stages::align::AlignParams {
-                seeds: &seeds,
+                seeds: &seed_psms,
                 out: &out,
                 q_train: cfg.rt_im_train.q_train,
                 grid_n: 100,
@@ -1029,10 +1042,10 @@ fn main() -> Result<()> {
             })?;
         }
         Cmd::Mbr {
-            scored,
-            psms,
+            psms_scored,
+            psms_extracted,
             out,
-            out_scored,
+            out_psms_scored,
             frag,
             config,
         } => {
@@ -1042,8 +1055,11 @@ fn main() -> Result<()> {
                     "mbr.strategy is `none`; set empirical_library / rt_transfer / full to run MBR"
                 );
             }
-            if psms.len() < 2 {
-                anyhow::bail!("MBR needs >= 2 runs; got {} psms path(s)", psms.len());
+            if psms_extracted.len() < 2 {
+                anyhow::bail!(
+                    "MBR needs >= 2 runs; got {} psms path(s)",
+                    psms_extracted.len()
+                );
             }
             let python = cfg.mbr.python.as_deref().ok_or_else(|| {
                 anyhow::anyhow!(
@@ -1057,10 +1073,10 @@ fn main() -> Result<()> {
             mumdia::sidecar::run_mbr(
                 python,
                 &script,
-                &scored,
-                &psms,
+                &psms_scored,
+                &psms_extracted,
                 &out,
-                out_scored.as_deref(),
+                out_psms_scored.as_deref(),
                 &frag,
                 cfg.mbr.q_anchor,
                 cfg.mbr.min_anchor_runs,
@@ -1073,17 +1089,28 @@ fn main() -> Result<()> {
             print!("{}", mumdia_io::inspect(&artifact)?);
         }
         Cmd::Report {
-            scored,
+            psms_scored,
             out_dir,
             peptide_quant,
             protein_quant,
             q,
+            config,
         } => {
+            // Precedence: an explicit --q, then quant.q_threshold from --config, then
+            // the historical 0.01. Reading the config is what stops a standalone report
+            // silently disagreeing with the `run` that produced the same table.
+            let q = match q {
+                Some(v) => v,
+                None => match &config {
+                    Some(_) => load_config(&config)?.quant.q_threshold,
+                    None => 0.01,
+                },
+            };
             std::fs::create_dir_all(&out_dir)?;
             let pep = format!("{out_dir}/peptides.tsv");
             let prot = format!("{out_dir}/proteins.tsv");
             let (n_pep, n_prot) = stages::report::run(stages::report::ReportParams {
-                scored: &scored,
+                scored: &psms_scored,
                 peptide_quant: peptide_quant.as_deref(),
                 protein_quant: protein_quant.as_deref(),
                 out_peptides: &pep,

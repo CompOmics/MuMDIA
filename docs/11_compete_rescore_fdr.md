@@ -184,7 +184,7 @@ could evict its paired decoy, the decoy population would be depleted and the
 target-decoy null would collapse, badly underestimating FDR. This is stated at
 compete.rs:71-78 and re-stated on `CompetitionMode` in config.rs:865-870.
 
-#### `group_by = precursor` does not group by precursor
+#### `group_by = base_peptide` was called `precursor`, which it never was
 
 The default variant is named `Precursor`, but element 0 of its key is
 `base_peptide_id` (compete.rs:88), which is a **stripped-sequence** id in both
@@ -260,7 +260,7 @@ rows are projected into the output columns (compete.rs:151-185), and the schema
 is forwarded. The report records `group_by`, `mode`, `input_rows`, `kept`,
 `removed` (compete.rs:241-255). `removed` is the number to read when checking
 whether a grouping choice is silently discarding evidence: under
-`group_by = precursor` on a modification-rich library it reached 46.6% of the
+`group_by = base_peptide` on a modification-rich library it reached 46.6% of the
 input rows, and under `group_by = peptidoform_charge` on the same input it was 0.
 
 ### rescore: input concat and classifier dispatch
@@ -425,7 +425,7 @@ derived from one another, they are separately calibrated nulls.
 
 `precursor_q` groups on `(peptidoform, charge)` at this stage, but what reaches
 this stage depends on `compete.group_by`. Under the default
-`group_by = precursor`, compete has already collapsed every charge and
+`group_by = base_peptide`, compete has already collapsed every charge and
 modification variant of a stripped peptide to one row, so the precursor grouping
 sees roughly one form per peptide and `precursor_q` reports a base-peptide
 population. It is a precursor-level unit only under
@@ -461,7 +461,7 @@ least the precursor-level floor. Beyond that floor the ordering is an empirical
 property of the score distribution, not a guarantee, and has not been measured
 here. Reporting both lets a consumer pick the FDR granularity that matches its
 claim (a peptide-level ID list vs a precursor-level one). Under the default
-`compete.group_by = precursor` the two levels see almost the same one-row-per-
+`compete.group_by = base_peptide` the two levels see almost the same one-row-per-
 peptide population, so the distinction only becomes real under
 `compete.group_by = peptidoform_charge`.
 
@@ -573,7 +573,7 @@ one dead field kept in the struct (the `percolator` classifier is unwired).
 
 | field | default | effect |
 |---|---|---|
-| `group_by` | `precursor` | despite the name, groups by stripped peptide: all charge **and** modification variants of one `base_peptide_id` share a group, separately within target and decoy labels; `apex` also buckets by rounded apex RT; `peptidoform_charge` keeps each peptidoform+charge separate and is required for a PTM search |
+| `group_by` | `base_peptide` | despite the name, groups by stripped peptide: all charge **and** modification variants of one `base_peptide_id` share a group, separately within target and decoy labels; `apex` also buckets by rounded apex RT; `peptidoform_charge` keeps each peptidoform+charge separate and is required for a PTM search |
 | `apex_rt_tolerance_s` | `5.0` | RT bucket width (s) for `group_by = apex` (compete.rs:90) |
 | `mode` | `winner_take_all` | within-group resolution (`CompetitionMode`, config.rs:873): `winner_take_all`, `none`, `features_only`, `unique_evidence`, `margin_gated` |
 | `margin` | `0.0` | score margin required to remove a loser under `margin_gated` (compete.rs:379) |
@@ -603,7 +603,7 @@ unless a knob is set.
 
 ## Invariants, determinism, gotchas
 
-- **`group_by = precursor` is peptide-level, not precursor-level** (compete.rs:88).
+- **`group_by = base_peptide` is peptide-level, not precursor-level** (compete.rs:88).
   Its key is `base_peptide_id`, the stripped-sequence id, so `winner_take_all`
   deletes every lower-scoring charge and modification sibling before rescore. On a
   modification-rich imported library that removed 46.6% of extracted candidates,

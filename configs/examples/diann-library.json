@@ -1,9 +1,11 @@
 {
-  "features": { "set": "extended" },
+  "features": {
+    "set": "extended"
+  },
   "extract": {
-    "min_frag_corr": 0.2,
     "apex_count_window": 5,
-    "apex_rt_prior_s": 120.0
+    "apex_rt_prior_s": 120.0,
+    "gate_min_score": 0.2
   },
   "rt_im_train": {
     "finetune_deeplc": true,

@@ -193,7 +193,7 @@ is the decision record.
 
 ### Extraction gate and retention time
 
-`extract.min_frag_corr` is named historically. Under the default
+`extract.gate_min_score` is named historically. Under the default
 `gate_mode = apex_pearson`, it thresholds observed-versus-predicted fragment
 intensities at one apex; it is not a chromatographic co-elution correlation.
 The observed optimum was about 0.2 with the NN and about 0.6 with the native
@@ -339,7 +339,8 @@ Current correctness contract:
   invoking quant with each run's chromatograms. Changing `q_filter` does not
   select a source.
 
-The default competition key `precursor` is a misnomer. `compete.rs:88` keys the
+The default competition key is `base_peptide`, renamed from `precursor`, which it
+was not. `compete.rs:88` keys the
 group on `(base_peptide_id, label_code, 0, peak_rank)`, and `base_peptide_id`
 comes from the stripped sequence (`import_diann_lib.py:137` factorises
 `Stripped.Sequence`). `compete.rs:319-340` keeps only the highest `prelim_score`
@@ -373,7 +374,7 @@ sensitivity result for it.
   is always positive, so the fallback is unreachable. The wrong apex propagated
   into `prelim_score`, which decides the pre-FDR competition winner, and into
   quant's integration centre.
-- `extract.min_frag_corr` is now `0.6`; see the extraction-gate section above.
+- `extract.gate_min_score` is now `0.6`; see the extraction-gate section above.
 - `features.emit_pin` is now `false`. No MuMDIA stage reads the file, because
   rescore builds its own PIN, and it is a ~5.4 GB text write per run on a real
   library.

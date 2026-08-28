@@ -99,7 +99,7 @@ unchanged. Unlike `quant` and
 logs, with no `ArtifactReport` (`quant.rs:720`).
 
 ### align
-Consumes one `seed_psms.parquet` per run (`--seeds`, first is the reference).
+Consumes one `seed_psms.parquet` per run (`--seed-psms`, first is the reference).
 Produces `alignment.parquet` (`align.rs:130`): `run_id` (u32), `source_rt` (f64),
 `reference_rt` (f64), `residual_spread` (f64). The mapping is emitted on a grid of
 `grid_n` points per run (`grid_n = 100`, hardcoded in `main.rs:667`).
@@ -112,7 +112,7 @@ per accepted transfer (`mbr_worker.py:254`): `candidate_id`, `source`, `peptidof
 `transfer_q` (10 columns). When there are no transfer candidates at all the worker
 short-circuits and writes a placeholder table with a single empty `candidate_id`
 column (`pa_write_empty`, `mbr_worker.py:289`), so `<out>.parquet` always exists.
-Optionally writes an augmented scored table (`--out-scored`) that lowers each accepted
+Optionally writes an augmented scored table (`--out-psms-scored`) that lowers each accepted
 transfer's `q_value` to `min(q_value, transfer_q)` on the matching `(candidate_id,
 source)` row and adds an `is_transferred` bool (`mbr_worker.py:272`); this requires the
 scored table to carry a `source` column. All MBR outputs are written by Python and

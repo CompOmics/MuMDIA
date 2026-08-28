@@ -246,21 +246,21 @@ order:
 | `digest` (`main.rs:43`) | `--fasta`, `--config` | `--out` = `peptides.parquet` |
 | `peptidoforms` (`main.rs:52`) | `--peptides`, `--config` | `--out` = `peptidoforms.parquet` |
 | `predict-frag` (`main.rs:61`) | `--peptidoforms`, `--work-dir` (default `sidecar_work`), `--config` | `--out-precursors`, `--out-fragments` (the library pair) |
-| `search-seed` (`main.rs:75`) | `--ms2`, `--library-precursors`, `--library-fragments`, `--config` | `--out` = `seed_psms.parquet` (+ `<out>.masscal.json`) |
-| `rt-im-train` (`main.rs:88`) | `--seed-psms`, `--library-precursors`, `--config` | `--out-windows` = `run_windows.parquet`, `--out-cal` = `cal.json` |
-| `extract` (`main.rs:101`) | `--ms2`, `--library-precursors`, `--library-fragments`, `--run-windows`, `--ms1` (opt), `--mass-cal` (opt), `--restrict-candidates` (opt allowlist), `--config` | `--out-psms` = `psms_extracted.parquet`, `--out-chrom` = `chromatograms.parquet` (+ `<psms>.peaks.parquet` when `retain_top_peaks>1`) |
-| `features` (`main.rs:130`) | `--psms`, `--chromatograms`, `--seed` (opt), `--config` | `--out` = `features.parquet` (+ `.schema.json`), `--out-pin` = PIN |
+| `search-seed` (`main.rs:75`) | `--ms2`, `--lib-precursors`, `--lib-fragments`, `--config` | `--out` = `seed_psms.parquet` (+ `<out>.masscal.json`) |
+| `rt-im-train` (`main.rs:88`) | `--seed-psms`, `--lib-precursors`, `--config` | `--out-windows` = `run_windows.parquet`, `--out-cal` = `cal.json` |
+| `extract` (`main.rs:101`) | `--ms2`, `--lib-precursors`, `--lib-fragments`, `--run-windows`, `--ms1` (opt), `--mass-cal` (opt), `--restrict-candidates` (opt allowlist), `--config` | `--out-psms` = `psms_extracted.parquet`, `--out-chromatograms` = `chromatograms.parquet` (+ `<psms>.peaks.parquet` when `retain_top_peaks>1`) |
+| `features` (`main.rs:130`) | `--psms-extracted`, `--chromatograms`, `--seed-psms` (opt), `--config` | `--out` = `features.parquet` (+ `.schema.json`), `--out-pin` = PIN |
 | `compete` (`main.rs:146`) | `--features`, `--config` | `--out` = `psms_competed.parquet` (+ `.schema.json`) |
 | `rescore` (`main.rs:155`) | `--competed` (1+ competed tables), `--config` | `--out` = `psms_scored.parquet` |
 | `quant` (`main.rs:165`) | `--psms-scored`, `--chromatograms`, `--config` | `--out-peptide`, `--out-protein`, `--out-fragment` (opt), `--out-peak-bounds` (opt) |
 | `quant-lfq` (`main.rs:184`) | `--inputs` (1+ per-run tables), `--method` (`maxlfq` default / `directlfq`), `--normalize` (`median_ratio` default / `median` / `none`) | `--out` = protein-by-run matrix; no `--config` |
 | `run` (`main.rs:199`) | `--mzml`, `--out-dir`; `--fasta` xor (`--lib-precursors` + `--lib-fragments`); `--config`, `--profile`, `--max-spectra`, `--top-peaks-ms2` | the full chain + `manifest.json` |
 | `run-experiment` (`main.rs:238`) | `--mzml` once per run (>=2), `--run-names` (opt, default `r0..rN-1`), `--out-dir`; `--fasta` xor (`--lib-precursors` + `--lib-fragments`); `--config`, `--profile`, `--max-spectra`, `--top-peaks-ms2` | per-run chains under `<out-dir>/<run>/`, one `scored_combined.parquet`, optional MBR tables, per-run `scored`/quant splits, `lfq_maxlfq.parquet`, `experiment_manifest.json`; no report TSVs |
-| `align` (`main.rs:230`) | `--seeds` (1+ `seed_psms`, first = reference), `--config` | `--out` = `alignment.parquet` |
-| `mbr` (`main.rs:240`) | `--scored` (experiment-wide `scored_combined`), `--psms` (1+ per-run in `source` order), `--frag` (0+ per-run `fragment_quant`), `--config` | `--out` = `transferred.parquet`, `--out-scored` (opt augmented scored) |
+| `align` (`main.rs:230`) | `--seed-psms` (1+ `seed_psms`, first = reference), `--config` | `--out` = `alignment.parquet` |
+| `mbr` (`main.rs:240`) | `--psms-scored` (experiment-wide `scored_combined`), `--psms-extracted` (1+ per-run in `source` order), `--frag` (0+ per-run `fragment_quant`), `--config` | `--out` = `transferred.parquet`, `--out-psms-scored` (opt augmented scored) |
 | `inspect` (`main.rs:261`) | positional `artifact` (any parquet) | schema + head + row count to stdout; no `--config` |
-| `audit` (`main.rs:265`) | `--library-precursors`, `--psms`, `--competed`, `--scored`, `--q` (0.01), `--run-id` (`run`), `--entrapment-substr` (`""`) | `--out` = `candidate_audit.parquet`; no `--config` |
-| `report` (`main.rs:292`) | `--scored`, `--peptide-quant` (opt), `--protein-quant` (opt), `--q` (0.01) | `peptides.tsv` + `proteins.tsv` in `--out-dir` |
+| `audit` (`main.rs:265`) | `--lib-precursors`, `--psms-extracted`, `--competed`, `--psms-scored`, `--q` (0.01), `--run-id` (`run`), `--entrapment-substr` (`""`) | `--out` = `candidate_audit.parquet`; no `--config` |
+| `report` (`main.rs:292`) | `--psms-scored`, `--peptide-quant` (opt), `--protein-quant` (opt), `--q` (0.01), `--config` (opt) | `peptides.tsv` + `proteins.tsv` in `--out-dir` |
 | `doctor` (`main.rs:305`) | `--config` (opt) | probes the configured sidecar interpreters; nonzero exit if any FAIL |
 
 Per-subcommand specifics that are easy to miss:
@@ -296,7 +296,7 @@ Per-subcommand specifics that are easy to miss:
   grid (`main.rs:666-667`); it needs >=2 seeds and is not part of the `run` chain.
 - `mbr` (`main.rs:671`) is a wired standalone command, not part of `run`. It
   hard-errors when `mbr.strategy = none` (`main.rs:680`), when fewer than two
-  `--psms` are supplied (`main.rs:685`), or when `mbr.python` is unset
+  `--psms-extracted` are supplied (`main.rs:685`), or when `mbr.python` is unset
   (`main.rs:688`), then runs the `mbr_worker.py` sidecar with the `mbr.*`
   thresholds (`main.rs:697`). It transfers identifications across a run set
   (Stage D3); see the extend section for its stub status inside `run`.
@@ -498,7 +498,8 @@ workflow") is library-input mode with:
   `rescore.python`, with `rescore.strict = true`), which is the dominant
   sensitivity lever and beats the native linear rescorer by ~8.5% (docs/18 A1),
 - a loose default apex-intensity Pearson gate
-  (`extract.gate_mode = apex_pearson`, `extract.min_frag_corr ~= 0.2`), since
+  (`extract.gate_mode = apex_pearson`, `extract.gate_min_score = 0.2` set explicitly
+  by that arm's config), since
   a strong nonlinear rescorer prefers recall and absorbs the loose-gate flood
   (docs/18 A1/A2),
 - the conversion-time MS2 peak cap explicitly kept at 300 on AIF
@@ -557,7 +558,7 @@ config (`main.rs:607`) before `run`. The fields this overview area touches:
 | `rt_im_train.finetune_deeplc` | `false` | Enables the per-run DeepLC fine-tune of iRT (best workflow). |
 | `rt_im_train.finetune_epochs` / `finetune_patience` | (see config) | DeepLC fine-tune schedule (`run.rs:259-260`). |
 | `rt_im_train.finetune_batch` | `0` | `0` auto-scales the fine-tune batch to seed size. |
-| `extract.min_frag_corr` | `0.2` | Spectral-agreement gate threshold; loose default suits `nn_torch`. |
+| `extract.gate_min_score` | `0.6` | Spectral-agreement gate threshold, matched to the default `native_tda` rescorer. The loose 0.2 that suits `nn_torch` is set explicitly by the shipped example configs. |
 | `extract.gate_mode` | `apex_pearson` | Which spectral score the gate thresholds (`GateMode`, `config.rs:591`). |
 | `extract.retain_top_peaks` | `1` | `>1` writes the `<psms>.peaks.parquet` sidecar (not yet scored). |
 | `extract.emit_candidate_audit` | `false` | Emits `candidate_audit.parquet` in `run`. |

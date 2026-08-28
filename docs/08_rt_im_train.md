@@ -131,7 +131,7 @@ is `None` (this stage applies no serialized model, rt_im_train.rs:341). Params
 ## How it works
 
 The stage entry point is `run(p: RtImTrainParams)` (rt_im_train.rs:72). Standalone
-it is invoked as `mumdia rt-im-train --seed-psms <p> --library-precursors <p>
+it is invoked as `mumdia rt-im-train --seed-psms <p> --lib-precursors <p>
 --out-windows <p> --out-cal <p> [--config <p>]` (the `RtImTrain` subcommand,
 main.rs:94-105, dispatched at main.rs:517-534); the `run` orchestrator calls the
 same `run` function directly (run.rs:307-314). Both call sites build the config

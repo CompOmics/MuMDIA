@@ -162,7 +162,7 @@ sidecar) also gets an `<artifact>.report.json` (`extract.rs:2569`) recording the
 row count, blake3 content hash, stage name, schema name+version, and
 `elapsed_ms`. The `params` object (`extract.rs:2577`) carries `frag_tol_ppm`
 (nominal), `effective_frag_tol_ppm` (post mass-cal), `frag_ppm_offset`,
-`presence_min_fragments`, `presence_min_coelution`, `min_frag_corr`, `gate_mode`,
+`presence_min_fragments`, `presence_min_coelution`, `gate_min_score`, `gate_mode`,
 `gate_coelution_min`, and `scan_window`. The `stats` map (`extract.rs:2562`)
 carries `accepted` (the accepted-candidate count) and `scan_window`.
 `model_identity` is `None` (no model in this stage).
@@ -313,7 +313,7 @@ The cheap-to-expensive acceptance cascade, in order:
    so it can rescue a candidate. `ms1_support` requires a present mono and a +1/mono
    ratio in `[0.1, 1.5]` (`extract.rs:1960`).
 8. **Pearson gate (tier d, optional)** (`extract.rs:2004`): only when
-   `min_frag_corr > 0.0`. It thresholds the score of the **active** `GateMode`
+   `gate_min_score > 0.0`. It thresholds the score of the **active** `GateMode`
    and only the active score is computed (the closures at `extract.rs:1989` are
    lazy). If `ms1_rescue` is set, a gate failure is overridden when the candidate
    has MS1 support and enough matched fragments (`extract.rs:2020`).
@@ -385,7 +385,7 @@ elution peak itself (`extract.rs:520`). `GateMode` scores:
   predicted-intensity-weighted mean Pearson of each matched fragment's XIC to the
   signature-ion reference profile, restricted to the elution peak. Orthogonal to
   intensity agreement (temporal, not shape).
-- `Combined`: requires `peak_spectral >= min_frag_corr` **and** `coelution >=
+- `Combined`: requires `peak_spectral >= gate_min_score` **and** `coelution >=
   gate_coelution_min` (`extract.rs:2016`).
 
 All four diagnostic scores are computed for every accepted candidate only when
@@ -502,14 +502,14 @@ declutter" commit: `extract.scan_window_mode` (and the `ScanWindowMode` enum),
 | `presence_min_matched` | 3 | Tier-b: minimum distinct matched fragments (`extract.rs:1727`) |
 | `presence_min_fragments` | 3 | Acceptance: minimum distinct fragments (`extract.rs:1926`) |
 | `presence_min_coelution` | 2 | Min simultaneously-present fragments to extend a run (`extract.rs:1915`) |
-| `min_frag_corr` | **0.2** | Pearson/gate threshold; 0 disables the gate. Relaxed from a historical 0.5 to recover low-abundance candidates (`config.rs:531`) |
+| `gate_min_score` | **0.6** | Pearson/gate threshold; 0 disables the gate. 0.6 is the documented optimum for the default `native_tda` rescorer; the 0.2 that suits `nn_torch` is set explicitly by the shipped example configs. Renamed from `min_frag_corr`, which is not a correlation under any `gate_mode` except by coincidence |
 | `min_matched_fraction` | 0.0 | Acceptance: min matched/predicted fraction (default off) |
 | `apex_top_fragments` | 0 | Signature-ion count for apex; 0 -> default 3 (`extract.rs:1860`). Config marks it superseded by `apex_count_tol`, kept for compat (`config.rs:545`) |
 | `apex_rt_prior_s` | 0.0 | Gaussian RT-prior sigma on apex tiebreak; 0 = off |
 | `apex_count_tol` | 1 | Count slack for qualifying apex scans |
 | `apex_count_window` | 1 | Rolling-sum width for the count profile; 1 = no smoothing. Window 5 cut AIF apex misassignment (median \|dRT\| 131s -> 9s) |
 | `apex_gaussian_sigma_scans` | 0.0 | Opt-in Gaussian apex smoother; 0 = off (`config.rs:572`) |
-| `apex_evidence_rank` | false | Breadth-of-evidence apex vs legacy signature-intensity apex |
+| `apex_evidence_rank` | **true** | Breadth-of-evidence apex. The legacy signature-intensity apex silently falls back to the lowest-RT qualifying scan when none of the top-K predicted fragments is observed |
 | `emit_window_grid` | true | Zero-filled full-window-grid chromatograms |
 | `bucket_size` | 8192 | m/z bucket size (power of two) |
 | `peak_claim` | `None` | Shared-peak apportionment strategy (`PeakClaim`, `config.rs:132`) |
@@ -529,7 +529,7 @@ declutter" commit: `extract.scan_window_mode` (and the `ScanWindowMode` enum),
 | `alt_peak_min_separation_s` | 5.0 | Alternate apex must sit >= 5 s from the rank-0 apex (`config.rs:653`) |
 | `emit_candidate_audit` | false | Candidate-audit sidecar (diagnostic) |
 | `emit_gate_diagnostics` | false | Adds the four `gate_*` diagnostic columns |
-| `gate_mode` | `ApexPearson` | Which score `min_frag_corr` thresholds (`GateMode`, `config.rs:735`) |
+| `gate_mode` | `ApexPearson` | Which score `gate_min_score` thresholds (`GateMode`, `config.rs:735`) |
 | `gate_coelution_min` | 0.5 | Second threshold for `GateMode::Combined` |
 
 Note: `emit_candidate_audit` is a declared knob but the candidate-audit write is
@@ -552,7 +552,7 @@ here for one index.
 | `extract.promote_top_peaks` (`config.rs:645`, default 1) | extra `psms_extracted` rows with `peak_rank >= 1` (`extract.rs:2297`); no new columns | **not schema-neutral in rows**: changes the scored population and therefore FDR; gate pending |
 | `extract.emit_candidate_audit` (`config.rs:658`) | none in `extract.rs` (unused there); in `run` it gates the `audit` stage -> `candidate_audit.parquet` (`run.rs:428`) | diagnostic; no ID effect |
 | `extract.emit_gate_diagnostics` (`config.rs:673`) | 4 F32 cols `gate_apex`, `gate_peak_spectral`, `gate_coelution`, `gate_spectral_entropy` (`extract.rs:2511`) | diagnostic; no ID effect |
-| `extract.apex_evidence_rank` (`config.rs:667`) | none; changes the apex-selection score (`extract.rs:1890`) | diagnostic support (finding A6, docs/18); no end-to-end gain measured |
+| `extract.apex_evidence_rank` (`config.rs:667`) | none; changes the apex-selection score (`extract.rs:1890`) | **now the default**, promoted on correctness grounds rather than a count (docs/25 section 2): the legacy score cannot distinguish "no signature fragment observed anywhere" from "the earliest qualifying scan is the apex" |
 | `extract.apex_gaussian_sigma_scans` (`config.rs:572`) | none; smooths the apex count profile | not measured; gate pending |
 | `search_seed.two_pass_mass_cal` (`config.rs:423`) | none; refits the `<seed>.masscal.json` offset + tolerance | not measured; gate pending |
 | `rt_im_train.adaptive_rt_window` (`config.rs:487`) | none; per-region RT half-window widths in `run_windows` | not measured; gate pending |

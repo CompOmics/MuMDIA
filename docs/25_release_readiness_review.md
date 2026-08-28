@@ -191,7 +191,7 @@ and **the leak count is under-reported**. Fix: exclude `is_decoy` rows from the
 group competition when `qmode == Entrapment`.
 
 **3.3 `rescore.entrapment_ratio` is unvalidated, and `0` makes every PSM pass.**
-`Config::validate` checks `min_frag_corr`, `fixed_window_s`, `baseline_quantile`
+`Config::validate` checks `gate_min_score`, `fixed_window_s`, `baseline_quantile`
 and `train_fdr`, but not this. Measured by compiling the `entrapment_q` kernel
 standalone:
 
@@ -308,9 +308,9 @@ accepted, does nothing, and warns nothing**, and no document lists it. Under
 `deny_unknown_fields` a user reasonably assumes an accepted key is honoured.
 
 **5.3 Naming inconsistencies. MAJOR, and free to fix now.**
-`--library-precursors` on five subcommands versus `--lib-precursors` on the
+`--lib-precursors` on five subcommands versus `--lib-precursors` on the
 orchestrators; `--out` on eleven versus `--out-dir` on four plus ten bespoke
-`--out-*`; extract writes `--out-chrom` while features and quant read
+`--out-*`; extract writes `--out-chromatograms` while features and quant read
 `--chromatograms`; `--psms-scored` versus `--scored`; `--psms` meaning two
 different tables; `--seed`, `--seed-psms` and `--seeds` for one artifact.
 Separately, standalone `report` takes no `--config`, so a config setting
@@ -319,17 +319,17 @@ same scored table, silently. `quant`'s `run_lfq_combine` also writes two
 **undeclared** siblings, `{out}.precursor.parquet` and `{out}.peptide.parquet`,
 invisible in `--help`.
 
-**5.4 Two frozen misnomers. MAJOR.** `extract.min_frag_corr` is not a correlation
+**5.4 Two frozen misnomers. MAJOR.** `extract.gate_min_score` is not a correlation
 under the default gate, and `compete.group_by = precursor` keys on the base
 peptide. Both are documented as misnomers, which does not make them cheap to rename
-after a tag. Related default oddity: `min_frag_corr` defaults to 0.2, documented as
+after a tag. Related default oddity: `gate_min_score` defaults to 0.2, documented as
 the optimum for `nn_torch`, while the default rescorer is `native_tda`, whose
 documented optimum is 0.6. The shipped default gate is tuned for a non-default
 rescorer.
 
 **5.5 No output-path guard anywhere. MAJOR.** There is no path-equality check in
 the workspace, so
-`mumdia prescan --library-precursors lib/x.parquet --out lib/x.parquet` replaces a
+`mumdia prescan --lib-precursors lib/x.parquet --out lib/x.parquet` replaces a
 full precursor library with a two-column survivors table and exits 0, because the
 library was already resident. `align.rs:57/131` has the same shape, and in FASTA
 mode `run --out-dir lib` truncates `lib/fragment_library_precursors.parquet` before

@@ -616,7 +616,7 @@ protein-group counts are unaffected because they select the winner anyway.
 
 One further caveat applies to `precursor_q` specifically. It groups on
 `(peptidoform, charge)` over the rows that reach rescore, and under the default
-`compete.group_by = precursor` competition has already collapsed the charge and
+`compete.group_by = base_peptide` competition has already collapsed the charge and
 modification siblings by stripped peptide, so the surviving population holds
 roughly one form per peptide and the column then reports a base-peptide count.
 It is a genuine precursor unit only under `compete.group_by = peptidoform_charge`

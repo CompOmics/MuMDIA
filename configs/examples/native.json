@@ -3,8 +3,8 @@
     "set": "extended"
   },
   "extract": {
-    "min_frag_corr": 0.6,
     "apex_count_window": 5,
-    "apex_rt_prior_s": 120.0
+    "apex_rt_prior_s": 120.0,
+    "gate_min_score": 0.6
   }
 }

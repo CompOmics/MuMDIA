@@ -57,7 +57,7 @@ DeepLC fine-tune (`run.rs:237-280`).
   into `Vec<Ms2Scan>`. Each `Ms2Scan` carries `scan_index`, `id`, `rt_seconds`,
   an `IsolationWindow { target_mz, lower_mz, upper_mz, im_lower, im_upper }`, and
   `peaks: Vec<Peak { mz: f64, intensity: f32, ion_mobility }>`.
-- **Library** (`--library-precursors` + `--library-fragments`), loaded by
+- **Library** (`--lib-precursors` + `--lib-fragments`), loaded by
   `Library::load` (`index.rs:54`). Provides `cands: Vec<Candidate>`
   (`candidate_id`, `peptidoform`, `charge`, `precursor_mz`, `base_peptide_id`,
   `protein`, `is_decoy`, `predicted_irt: f32`, `frag_start`, `n_frag`), the flat
@@ -296,7 +296,7 @@ deviation threshold are hardcoded in `search_seed.rs` (`:167`, `:192`, `:195`),
 not config fields.
 
 The standalone subcommand `Cmd::SearchSeed` (`main.rs:75-86`, dispatch `:458-476`)
-takes `--ms2`, `--library-precursors`, `--library-fragments`, `--out`, and
+takes `--ms2`, `--lib-precursors`, `--lib-fragments`, `--out`, and
 `--config` (all `String`; `--config` optional). There is no `--bucket-size` flag;
 `bucket_size` is read from the resolved config's `extract.bucket_size`
 (`main.rs:473`).

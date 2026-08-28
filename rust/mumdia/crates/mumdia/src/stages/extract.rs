@@ -2025,19 +2025,19 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
             let peak_spec = || peak_spectral_score(&groups, &sig, fints0);
             let coel = || coelution_gate_score(&groups, &distinct, &sig, fints0);
 
-            if p.cfg.min_frag_corr > 0.0 {
-                // Acceptance gate. `min_frag_corr` thresholds the ACTIVE gate_mode's
+            if p.cfg.gate_min_score > 0.0 {
+                // Acceptance gate. `gate_min_score` thresholds the ACTIVE gate_mode's
                 // spectral-agreement score: the legacy single-apex-scan Pearson (one
                 // chimeric scan can dominate), the peak-integrated spectral Pearson, the
                 // apex spectral-entropy similarity, the temporal co-elution score, or
                 // Combined (both, more specific). Only the active score computes.
                 let rejected = match p.cfg.gate_mode {
-                    GateMode::ApexPearson => apex_pearson() < p.cfg.min_frag_corr,
-                    GateMode::PeakSpectral => peak_spec() < p.cfg.min_frag_corr,
-                    GateMode::SpectralEntropy => apex_entropy() < p.cfg.min_frag_corr,
-                    GateMode::Coelution => coel() < p.cfg.min_frag_corr,
+                    GateMode::ApexPearson => apex_pearson() < p.cfg.gate_min_score,
+                    GateMode::PeakSpectral => peak_spec() < p.cfg.gate_min_score,
+                    GateMode::SpectralEntropy => apex_entropy() < p.cfg.gate_min_score,
+                    GateMode::Coelution => coel() < p.cfg.gate_min_score,
                     GateMode::Combined => {
-                        peak_spec() < p.cfg.min_frag_corr || coel() < p.cfg.gate_coelution_min
+                        peak_spec() < p.cfg.gate_min_score || coel() < p.cfg.gate_coelution_min
                     }
                 };
                 if rejected {
@@ -2603,7 +2603,7 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
                 "frag_ppm_offset": frag_offset,
                 "presence_min_fragments": p.cfg.presence_min_fragments,
                 "presence_min_coelution": p.cfg.presence_min_coelution,
-                "min_frag_corr": p.cfg.min_frag_corr,
+                "gate_min_score": p.cfg.gate_min_score,
                 "gate_mode": p.cfg.gate_mode,
                 "gate_coelution_min": p.cfg.gate_coelution_min,
                 "scan_window": scan_window,

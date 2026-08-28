@@ -63,7 +63,7 @@ The effective reference settings are:
 |---|---|
 | `features.set` | `extended` |
 | `extract.gate_mode` | `apex_pearson` |
-| `extract.min_frag_corr` | `0.2` |
+| `extract.gate_min_score` | `0.2` (explicit; the default is `0.6`) |
 | `extract.apex_count_window` | `5` |
 | `extract.apex_rt_prior_s` | `120` seconds |
 | `rt_im_train.finetune_deeplc` | `true` |
@@ -289,7 +289,7 @@ faint, roughly 10x lower abundance than the shared set. The loss ranks:
 | Seed | about 25% |
 
 The extraction losses are mostly `presence_min_matched` and `min_coelution`, not
-the `min_frag_corr` apex gate. Extraction presence/apex is therefore the largest
+the `gate_min_score` apex gate. Extraction presence/apex is therefore the largest
 remaining lever, then rescore, then seed, all on faint signal.
 
 Before reading a presence/apex loss on any other run as an extraction problem,

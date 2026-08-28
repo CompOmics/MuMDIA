@@ -583,12 +583,19 @@ pub struct ExtractConfig {
     pub presence_min_fragments: usize,
     /// minimum simultaneously-present fragments over the consecutive-scan run.
     pub presence_min_coelution: usize,
-    /// tier-(d) spectral-agreement gate: reject a candidate whose apex observed
-    /// fragment intensities correlate with the predicted pattern below this.
+    /// tier-(d) spectral-agreement gate: reject a candidate whose observed fragment
+    /// intensities agree with the predicted pattern below this score.
+    ///
+    /// Renamed from `gate_min_score`, which was accurate for none of the four
+    /// `gate_mode` values: under the default `apex_pearson` it is an intensity
+    /// correlation at ONE apex scan rather than a chromatographic co-elution
+    /// correlation, and under `spectral_entropy` it is not a correlation at all. The
+    /// old name is not accepted (`deny_unknown_fields`), so an old config fails loudly
+    /// with the offending key named rather than silently reverting to a default.
     /// Applied symmetrically to targets and decoys, but that alone does not prove
     /// null exchangeability in chimeric DIA; validate every threshold with an
     /// independent entrapment. 0 disables.
-    pub min_frag_corr: f64,
+    pub gate_min_score: f64,
     /// tier-(c) minimum fraction of the candidate's predicted fragments that
     /// must be observed. With enough predicted fragments (top_n>=~10) this is a
     /// strong, symmetric discriminator: real peptides match a large fraction,
@@ -736,12 +743,12 @@ pub struct ExtractConfig {
     /// like `emit_candidate_audit`): when off, neither the columns nor the extra
     /// per-candidate score computation happen, so the default chain is byte-identical.
     pub emit_gate_diagnostics: bool,
-    /// Which spectral-agreement score the `min_frag_corr` gate thresholds
+    /// Which spectral-agreement score the `gate_min_score` gate thresholds
     /// (sensitivity program). The legacy gate uses a single apex-scan intensity
     /// Pearson, which one chimeric scan can dominate. See [`GateMode`].
     pub gate_mode: GateMode,
     /// Second threshold for `GateMode::Combined`: the co-elution score must exceed
-    /// this while the peak-integrated spectral score exceeds `min_frag_corr`.
+    /// this while the peak-integrated spectral score exceeds `gate_min_score`.
     /// Requiring BOTH is more specific (rejects interferents that pass one axis).
     pub gate_coelution_min: f64,
 }
@@ -767,7 +774,7 @@ impl Default for ExtractConfig {
             // key explicitly, so the validated nn_torch workflow is unchanged; only a
             // config that says nothing moves, and one that says nothing is using the
             // native rescorer.
-            min_frag_corr: 0.6,
+            gate_min_score: 0.6,
             min_matched_fraction: 0.0,
             apex_top_fragments: 0, // superseded by apex_count_tol; kept for compat
             apex_rt_prior_s: 0.0,  // RT prior off by default
@@ -813,7 +820,7 @@ impl Default for ExtractConfig {
     }
 }
 
-/// Spectral-agreement score the extraction acceptance gate (`min_frag_corr`)
+/// Spectral-agreement score the extraction acceptance gate (`gate_min_score`)
 /// thresholds. All are computed at the gate from data already in hand.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -836,7 +843,7 @@ pub enum GateMode {
     /// fragment's XIC to the signature reference over the elution peak (temporal
     /// agreement, orthogonal to intensity agreement).
     Coelution,
-    /// Require BOTH: peak-integrated spectral Pearson >= `min_frag_corr` AND the
+    /// Require BOTH: peak-integrated spectral Pearson >= `gate_min_score` AND the
     /// co-elution score >= `gate_coelution_min`. More specific (an interferent
     /// passing one axis is still rejected), for a cleaner FDR pool.
     Combined,
@@ -942,7 +949,7 @@ pub struct CompeteConfig {
 impl Default for CompeteConfig {
     fn default() -> Self {
         Self {
-            group_by: CompeteGroupBy::Precursor,
+            group_by: CompeteGroupBy::BasePeptide,
             apex_rt_tolerance_s: 5.0,
             mode: CompetitionMode::WinnerTakeAll,
             margin: 0.0,
@@ -982,7 +989,14 @@ pub enum CompetitionMode {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CompeteGroupBy {
-    Precursor,
+    /// One winner per stripped base peptide, per label. Renamed from `precursor`,
+    /// which it is not: `compete.rs` keys the group on `base_peptide_id`, which comes
+    /// from the stripped sequence, so every charge state AND every modification
+    /// variant of one peptide collapses to a single winner before FDR. Use
+    /// `peptidoform_charge` for a genuine precursor unit, and note that it is
+    /// REQUIRED for a PTM search. The old name is not accepted, so an old config
+    /// fails loudly rather than silently changing the competition unit.
+    BasePeptide,
     Apex,
     /// Precursor-level: separate every distinct peptidoform+charge. Recovers
     /// sibling charges the peptide-level `Precursor` grouping collapses; the
@@ -1484,11 +1498,11 @@ impl Config {
                     .into(),
             ));
         }
-        if !self.extract.min_frag_corr.is_finite()
-            || !(0.0..=1.0).contains(&self.extract.min_frag_corr)
+        if !self.extract.gate_min_score.is_finite()
+            || !(0.0..=1.0).contains(&self.extract.gate_min_score)
         {
             return Err(Invalid(
-                "extract.min_frag_corr must be finite and in [0, 1] (0 disables \
+                "extract.gate_min_score must be finite and in [0, 1] (0 disables \
                 the gate)."
                     .into(),
             ));
@@ -1627,7 +1641,7 @@ impl Config {
     /// Apply a named tuning profile on top of the current config. `dia` is the
     /// validated DIA preset (Extended features + rolling-window apex + RT prior);
     /// the other extraction defaults (emit_window_grid, reverse decoys,
-    /// min_frag_corr) remain conservative baselines. Lets one command reach a
+    /// gate_min_score) remain conservative baselines. Lets one command reach a
     /// respectable result without hand-authoring the full config JSON.
     pub fn apply_profile(&mut self, name: &str) -> Result<(), crate::error::ConfigError> {
         match name {
@@ -1803,8 +1817,8 @@ mod tests {
         let c = Config::from_json(r#"{"search_seed":{"top_n_peaks":0}}"#).unwrap();
         assert_eq!(c.search_seed.top_n_peaks, 0);
 
-        assert!(Config::from_json(r#"{"extract":{"min_frag_corr":-0.1}}"#).is_err());
-        assert!(Config::from_json(r#"{"extract":{"min_frag_corr":1.1}}"#).is_err());
+        assert!(Config::from_json(r#"{"extract":{"gate_min_score":-0.1}}"#).is_err());
+        assert!(Config::from_json(r#"{"extract":{"gate_min_score":1.1}}"#).is_err());
     }
 
     #[test]

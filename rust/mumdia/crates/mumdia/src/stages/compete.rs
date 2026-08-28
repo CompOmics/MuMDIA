@@ -85,7 +85,7 @@ pub fn run(p: CompeteParams) -> Result<u64> {
         };
         let pk = peak_rank[i];
         let key = match p.cfg.group_by {
-            CompeteGroupBy::Precursor => (base[i], label_code, 0i64, pk),
+            CompeteGroupBy::BasePeptide => (base[i], label_code, 0i64, pk),
             CompeteGroupBy::Apex => {
                 let bucket = (apex_rt[i] / p.cfg.apex_rt_tolerance_s).round() as i64;
                 (base[i], label_code, bucket, pk)

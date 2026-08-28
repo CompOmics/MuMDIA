@@ -228,7 +228,7 @@ _`mumdia-core`:_
   token; the invalid-rescore contracts are rejected (`folds<2`, `num_iter=0`,
   `nn_torch` without `python`, `percolator`, `entrapment` without a marker); an
   explicit uncapped seed (`search_seed.top_n_peaks=0`, allowed) is distinguished
-  from an invalid gate (`extract.min_frag_corr` outside `[0,1]`, rejected); the
+  from an invalid gate (`extract.gate_min_score` outside `[0,1]`, rejected); the
   six quant fixed-window fields round-trip and their invalid values are rejected;
   every configuration the repository ships (`configs/examples/*.json`,
   `docker/*.json`) loads under `deny_unknown_fields`, which is the real guard
@@ -605,7 +605,7 @@ do not reintroduce removed knobs. The fields relevant here:
   yield zero decoys and an invalid FDR, `config.rs:1436`);
   `rt_im_train.calibration_method = none` (silently falls through to the linear
   fit, `config.rs:1445`); `extract.retain_top_peaks = 0` (must be >= 1, where 1 is
-  the legacy single-apex behaviour, `config.rs:1452`); `extract.min_frag_corr`
+  the legacy single-apex behaviour, `config.rs:1452`); `extract.gate_min_score`
   outside `[0,1]` or non-finite (0 disables the gate, `config.rs:1459`);
   `quant.fixed_window_s` non-finite or negative (`config.rs:1468`); and
   `quant.baseline_quantile` non-finite or outside its range

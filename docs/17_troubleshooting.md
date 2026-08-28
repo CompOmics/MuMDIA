@@ -28,7 +28,7 @@ is the source of truth if it has moved.
 | Peptidoforms silently get iRT 0.0 | DeepLC returned no iRT for some peptidoforms; they are anchored at 0.0 with a warning | Check the DeepLC env and the `n_irt_missing` warning; unmatched peptidoforms are a known foot-gun |
 | Peptide count is a fraction of expectation while the empirical decoy fraction still sits at the target | `--top-peaks-ms2` truncated the MS2 peaks at convert time and baked the truncation into the spectra artifact (`convert.rs:76-79`) | Reconvert uncapped or with a much larger cap; the right cap is acquisition-specific, not a universal preset |
 | `mumdia audit` attributes most missed peptides to `NO_PEAK_GROUP` at `candidate_generated` | The same peak truncation leaves too few surviving fragments to satisfy `extract.presence_min_fragments` (`extract.rs:1926-1931`) | Raise or remove `--top-peaks-ms2` and reconvert; do not lower `presence_min_fragments` to compensate |
-| Every modified form of a peptide is missing from the output; `precursor_q` reports exactly 1.000 precursors per peptide | `compete.group_by = precursor` keys the stripped sequence, not the precursor (`compete.rs:88`), and deletes all but the top-scoring sibling before rescore (`compete.rs:319-340`) | Set `compete.group_by = peptidoform_charge` (`compete.rs:93-98`); required for any PTM search |
+| Every modified form of a peptide is missing from the output; `precursor_q` reports exactly 1.000 precursors per peptide | `compete.group_by = base_peptide` keys the stripped sequence, not the precursor (`compete.rs:88`), and deletes all but the top-scoring sibling before rescore (`compete.rs:319-340`) | Set `compete.group_by = peptidoform_charge` (`compete.rs:93-98`); required for any PTM search |
 | `cal.json` reports a small `rt_residual_abs_median_s` but RT windows still miss peptides | The residual is measured on the same anchors the calibration was fitted to (`rt_im_train.rs:137`, `rt_im_train.rs:177-185`), so it is in-sample | Treat it as a fit diagnostic; size external RT tolerances from an out-of-sample comparison |
 | RT windows in a PTM search behave as if the modification were absent | The imported library gave every modform of a stripped peptide the same `predicted_irt` | Check per-stripped-peptide variance of `predicted_irt` in the library; re-predict iRT per peptidoform |
 | A single-file run spends over half an hour before extract starts | `rt_im_train.finetune_deeplc = true` fine-tunes and then re-predicts iRT over the whole library on every file | Fine-tune once into the library's `predicted_irt`, then run with `finetune_deeplc = false` and the per-run LOESS |
@@ -237,7 +237,7 @@ saturation check to run before trusting any cap.
 
 ## Competition deletes modforms before rescore
 
-**`compete.group_by = precursor` is a misnomer.** The enum variant is named
+**`compete.group_by = base_peptide` is a misnomer.** The enum variant is named
 `Precursor`, but the group key built at `compete.rs:88` is
 `(base_peptide_id, label_code, 0, peak_rank)`, and `base_peptide_id` is the
 stripped-sequence identity (`import_diann_lib.py:137` factorises

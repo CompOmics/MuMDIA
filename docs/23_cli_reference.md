@@ -146,15 +146,15 @@ first sentence of the description, with the full text in the section below.
 | [`mbr`](#mbr) | yes | Match-between-runs identification transfer (Stage D3) -> transferred.parquet |
 | [`inspect`](#inspect) | no | Print schema, head sample, and row count for any artifact |
 | [`audit`](#audit) | no | Candidate audit: reconstruct per-candidate stage flags + earliest rejection reason across the artifact chain and write candidate_audit.parquet (sensitivity program, P0.3/P0.4). |
-| [`report`](#report) | no | Write peptides.tsv + proteins.tsv from a scored PSM table |
+| [`report`](#report) | yes | Write peptides.tsv + proteins.tsv from a scored PSM table |
 | [`doctor`](#doctor) | yes | Check that the configured Python sidecar environments are usable |
 | `help` | n/a | Print this message or the help of the given subcommand(s) |
 
-16 of the 21 documented subcommands accept `--config`:
- `align`, `compete`, `digest`, `doctor`, `extract`, `features`, `mbr`, `peptidoforms`, `predict-frag`, `prescan`, `quant`, `rescore`, `rt-im-train`, `run`, `run-experiment`, `search-seed`.
+17 of the 21 documented subcommands accept `--config`:
+ `align`, `compete`, `digest`, `doctor`, `extract`, `features`, `mbr`, `peptidoforms`, `predict-frag`, `prescan`, `quant`, `report`, `rescore`, `rt-im-train`, `run`, `run-experiment`, `search-seed`.
 
-5 do not, so every setting they use comes from their own flags:
- `audit`, `convert`, `inspect`, `quant-lfq`, `report`.
+4 do not, so every setting they use comes from their own flags:
+ `audit`, `convert`, `inspect`, `quant-lfq`.
 
 ## convert
 
@@ -251,14 +251,14 @@ Plus the 5 repeated flags removed above: see "Global flags".
 ```text
 Sequence-tag prescan: keep only modification-bearing candidates whose anchored trimers are observed in this run -> prescan_survivors.parquet. Label-blind by construction, so it prunes search space without touching target-decoy exchangeability
 
-Usage: mumdia prescan [OPTIONS] --ms2 <MS2> --isolation-windows <ISOLATION_WINDOWS> --library-precursors <LIBRARY_PRECURSORS> --run-windows <RUN_WINDOWS> --out <OUT>
+Usage: mumdia prescan [OPTIONS] --ms2 <MS2> --isolation-windows <ISOLATION_WINDOWS> --lib-precursors <LIB_PRECURSORS> --run-windows <RUN_WINDOWS> --out <OUT>
 
 Options:
       --ms2 <MS2>
 
       --isolation-windows <ISOLATION_WINDOWS>
 
-      --library-precursors <LIBRARY_PRECURSORS>
+      --lib-precursors <LIB_PRECURSORS>
 
       --run-windows <RUN_WINDOWS>
           Per-candidate RT bounds (candidate_id, rt_lo, rt_hi); a run_windows-shaped table
@@ -275,14 +275,14 @@ Plus the 5 repeated flags removed above: see "Global flags".
 ```text
 Native broad DIA seed search over the fragment index -> seed_psms.parquet
 
-Usage: mumdia search-seed [OPTIONS] --ms2 <MS2> --library-precursors <LIBRARY_PRECURSORS> --library-fragments <LIBRARY_FRAGMENTS> --out <OUT>
+Usage: mumdia search-seed [OPTIONS] --ms2 <MS2> --lib-precursors <LIB_PRECURSORS> --lib-fragments <LIB_FRAGMENTS> --out <OUT>
 
 Options:
       --ms2 <MS2>
 
-      --library-precursors <LIBRARY_PRECURSORS>
+      --lib-precursors <LIB_PRECURSORS>
 
-      --library-fragments <LIBRARY_FRAGMENTS>
+      --lib-fragments <LIB_FRAGMENTS>
 
       --out <OUT>
 
@@ -296,12 +296,12 @@ Plus the 5 repeated flags removed above: see "Global flags".
 ```text
 Per-run RT calibration + windows -> run_windows.parquet, cal.json
 
-Usage: mumdia rt-im-train [OPTIONS] --seed-psms <SEED_PSMS> --library-precursors <LIBRARY_PRECURSORS> --out-windows <OUT_WINDOWS> --out-cal <OUT_CAL>
+Usage: mumdia rt-im-train [OPTIONS] --seed-psms <SEED_PSMS> --lib-precursors <LIB_PRECURSORS> --out-windows <OUT_WINDOWS> --out-cal <OUT_CAL>
 
 Options:
       --seed-psms <SEED_PSMS>
 
-      --library-precursors <LIBRARY_PRECURSORS>
+      --lib-precursors <LIB_PRECURSORS>
 
       --out-windows <OUT_WINDOWS>
 
@@ -317,14 +317,14 @@ Plus the 5 repeated flags removed above: see "Global flags".
 ```text
 Targeted 3D extraction (peak-major cascade) -> psms_extracted, chromatograms
 
-Usage: mumdia extract [OPTIONS] --ms2 <MS2> --library-precursors <LIBRARY_PRECURSORS> --library-fragments <LIBRARY_FRAGMENTS> --run-windows <RUN_WINDOWS> --out-psms <OUT_PSMS> --out-chrom <OUT_CHROM>
+Usage: mumdia extract [OPTIONS] --ms2 <MS2> --lib-precursors <LIB_PRECURSORS> --lib-fragments <LIB_FRAGMENTS> --run-windows <RUN_WINDOWS> --out-psms <OUT_PSMS> --out-chromatograms <OUT_CHROMATOGRAMS>
 
 Options:
       --ms2 <MS2>
 
-      --library-precursors <LIBRARY_PRECURSORS>
+      --lib-precursors <LIB_PRECURSORS>
 
-      --library-fragments <LIBRARY_FRAGMENTS>
+      --lib-fragments <LIB_FRAGMENTS>
 
       --run-windows <RUN_WINDOWS>
 
@@ -336,7 +336,7 @@ Options:
 
       --out-psms <OUT_PSMS>
 
-      --out-chrom <OUT_CHROM>
+      --out-chromatograms <OUT_CHROMATOGRAMS>
 
       --restrict-candidates <RESTRICT_CANDIDATES>
           Optional candidate allowlist (a prior run's psms.parquet): restrict extraction to these candidate_ids. For "gate first, then compete" - re-extract with a peak_claim strategy over only the gate-accepted survivors, keeping the two-pass profile map small
@@ -351,14 +351,14 @@ Plus the 5 repeated flags removed above: see "Global flags".
 ```text
 Compute the minimal feature set -> features.parquet + PIN
 
-Usage: mumdia features [OPTIONS] --psms <PSMS> --chromatograms <CHROMATOGRAMS> --out <OUT> --out-pin <OUT_PIN>
+Usage: mumdia features [OPTIONS] --psms-extracted <PSMS_EXTRACTED> --chromatograms <CHROMATOGRAMS> --out <OUT> --out-pin <OUT_PIN>
 
 Options:
-      --psms <PSMS>
+      --psms-extracted <PSMS_EXTRACTED>
 
       --chromatograms <CHROMATOGRAMS>
 
-      --seed <SEED>
+      --seed-psms <SEED_PSMS>
           Optional seed_psms for search-engine corroboration features
 
       --out <OUT>
@@ -538,7 +538,7 @@ Cross-run RT alignment (experiment-level) -> alignment.parquet
 Usage: mumdia align [OPTIONS] --out <OUT>
 
 Options:
-      --seeds <SEEDS>...
+      --seed-psms <SEED_PSMS>...
           One seed_psms.parquet per run; the first is the reference
 
       --out <OUT>
@@ -553,18 +553,18 @@ Plus the 5 repeated flags removed above: see "Global flags".
 ```text
 Match-between-runs identification transfer (Stage D3) -> transferred.parquet
 
-Usage: mumdia mbr [OPTIONS] --scored <SCORED> --out <OUT>
+Usage: mumdia mbr [OPTIONS] --psms-scored <PSMS_SCORED> --out <OUT>
 
 Options:
-      --scored <SCORED>
+      --psms-scored <PSMS_SCORED>
           Experiment-wide scored_combined.parquet (has the `source` column)
 
-      --psms <PSMS>...
+      --psms-extracted <PSMS_EXTRACTED>...
           Per-run psms.parquet in `source` order (one per run)
 
       --out <OUT>
 
-      --out-scored <OUT_SCORED>
+      --out-psms-scored <OUT_PSMS_SCORED>
           Optional augmented scored table: input scored with accepted transfers' q_value lowered + is_transferred flag (for quant/report with q_filter=psm_q)
 
       --frag [<FRAG>...]
@@ -593,19 +593,19 @@ Plus the 5 repeated flags removed above: see "Global flags".
 ```text
 Candidate audit: reconstruct per-candidate stage flags + earliest rejection reason across the artifact chain and write candidate_audit.parquet (sensitivity program, P0.3/P0.4). Non-destructive; reruns no compute
 
-Usage: mumdia audit [OPTIONS] --library-precursors <LIBRARY_PRECURSORS> --psms <PSMS> --competed <COMPETED> --scored <SCORED> --out <OUT>
+Usage: mumdia audit [OPTIONS] --lib-precursors <LIB_PRECURSORS> --psms-extracted <PSMS_EXTRACTED> --competed <COMPETED> --psms-scored <PSMS_SCORED> --out <OUT>
 
 Options:
-      --library-precursors <LIBRARY_PRECURSORS>
+      --lib-precursors <LIB_PRECURSORS>
           Library precursors parquet (the full candidate search space)
 
-      --psms <PSMS>
+      --psms-extracted <PSMS_EXTRACTED>
           psms parquet from `extract`
 
       --competed <COMPETED>
           competed parquet from `compete`
 
-      --scored <SCORED>
+      --psms-scored <PSMS_SCORED>
           scored parquet from `rescore`
 
       --out <OUT>
@@ -634,10 +634,10 @@ Plus the 5 repeated flags removed above: see "Global flags".
 ```text
 Write peptides.tsv + proteins.tsv from a scored PSM table
 
-Usage: mumdia report [OPTIONS] --scored <SCORED> --out-dir <OUT_DIR>
+Usage: mumdia report [OPTIONS] --psms-scored <PSMS_SCORED> --out-dir <OUT_DIR>
 
 Options:
-      --scored <SCORED>
+      --psms-scored <PSMS_SCORED>
 
       --out-dir <OUT_DIR>
 
@@ -646,7 +646,12 @@ Options:
       --protein-quant <PROTEIN_QUANT>
 
       --q <Q>
-          [default: 0.01]
+          Reported q threshold. Defaults to `quant.q_threshold` from `--config` when that is given, otherwise 0.01. An explicit value always wins
+
+      --config <CONFIG>
+          Read `quant.q_threshold` from this config, so a standalone report uses the same threshold as the `run` that produced the table.
+
+          Without it, a config setting `quant.q_threshold = 0.05` yielded 0.05 from `run` and 0.01 from `report` on the same scored table, silently.
 ```
 
 Plus the 5 repeated flags removed above: see "Global flags".

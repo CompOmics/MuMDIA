@@ -211,7 +211,7 @@ with mokapot.
 
 ```bash
 # any stage runs standalone on prior outputs
-mumdia report --scored results/psms_scored.parquet --out-dir results \
+mumdia report --psms-scored results/psms_scored.parquet --out-dir results \
               --peptide-quant results/peptide_quant.parquet \
               --protein-quant results/protein_group_quant.parquet --q 0.01
 
@@ -439,7 +439,8 @@ Two traps:
 
 - **`precursor_q` is a precursor unit only under
   `compete.group_by = peptidoform_charge`.** The default competition key
-  `precursor` is a misnomer: it groups on the stripped sequence, so every charge
+  `base_peptide` (renamed from `precursor`, which it was not) groups on the
+  stripped sequence, so every charge
   and every modification variant of one peptide collapses to a single winner
   before FDR. Under that key `precursor_q` therefore counts base peptides
   (measured 1.000 precursors per peptide, against 1.174 with

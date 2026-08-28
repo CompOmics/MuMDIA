@@ -87,7 +87,7 @@ echo "=== smoke: assertions"
 
 echo "=== smoke: also check inspect and report run standalone"
 "$BIN" inspect "$work/out/psms_scored.parquet" > /dev/null
-"$BIN" report --scored "$work/out/psms_scored.parquet" --out-dir "$work/report_only" \
+"$BIN" report --psms-scored "$work/out/psms_scored.parquet" --out-dir "$work/report_only" \
     --peptide-quant "$work/out/peptide_quant.parquet" --q 0.05 > /dev/null
 test -s "$work/report_only/peptides.tsv"
 
