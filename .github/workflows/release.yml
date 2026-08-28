@@ -41,7 +41,7 @@ jobs:
       run:
         working-directory: rust/mumdia
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Install musl tools (linux)
         if: matrix.target == 'x86_64-unknown-linux-musl'
@@ -66,16 +66,33 @@ jobs:
 
       - name: Package
         shell: bash
+        # `github.ref_name` reaches the script through the environment, not through
+        # `${{ }}` interpolation into a `run:` line. Git ref names may contain `;`,
+        # backticks, `$`, `&` and `|`, so a crafted tag was a shell injection. Pushing a
+        # tag needs write access, so this is defence in depth rather than an open door,
+        # but the fix costs nothing.
+        env:
+          REF_NAME: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          name="mumdia-${{ github.ref_name }}-${{ matrix.target }}"
+          name="mumdia-$REF_NAME-${{ matrix.target }}"
           stage="dist/$name"
           root=../..
           mkdir -p "$stage"
           cp "target/${{ matrix.target }}/release/mumdia${{ matrix.exe }}" "$stage/"
           # Documentation and licence.
-          cp "$root/README.md" "$root/LICENSE" "$root/CHANGELOG.md" "$stage/"
+          # THIRD_PARTY_LICENSES.md is not optional: the binary is statically
+          # linked, so it contains 173 third-party crates whose Apache-2.0 and MIT
+          # terms require their notices to travel with it.
+          cp "$root/README.md" "$root/LICENSE" "$root/CHANGELOG.md" \
+             "$root/THIRD_PARTY_LICENSES.md" "$stage/"
           cp -r "$root/docs" "$stage/docs"
+          # The release plan and the pre-release audit are working documents about
+          # getting to this release: they state which gates were failing, what was
+          # blocked, and unpublished benchmark numbers. Useful in the repository,
+          # odd inside the archive of the release they plan.
+          rm -f "$stage/docs/22_release_plan.md" \
+                "$stage/docs/25_release_readiness_review.md"
           # The Python sidecars the engine invokes, and the environment specs that
           # make them installable. Without these the binary is native-only.
           cp -r "$root/scripts" "$stage/scripts"
@@ -103,7 +120,13 @@ jobs:
           cat "$archive.sha256"
 
       - name: Upload to release
-        uses: softprops/action-gh-release@v2
+        # Pinned to a commit, not the mutable `v2` tag. This is the only
+        # third-party action in the tree (the other nine are actions/* and
+        # docker/*), it receives the release token and the built archives, and a
+        # moved tag would run new code with repository write access on every tag
+        # push. Dependabot covers `github-actions`, so the SHA keeps moving on a
+        # reviewed PR instead of silently.
+        uses: softprops/action-gh-release@da05d552573ad5aba039eaac05058a918a7bf631 # v2.2.2
         with:
           files: |
             rust/mumdia/dist/*.tar.gz

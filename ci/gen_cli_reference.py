@@ -19,7 +19,7 @@ Binary resolution order, first hit wins:
     2. `$MUMDIA_BIN`
     3. `rust/mumdia/target/release/mumdia`
     4. `rust/mumdia/target/release/mumdia.exe`
-    5. `C:/Users/robbi/mumdia_build/release/mumdia.exe`  (dev machine, target dir
+    5. `$MUMDIA_BIN`, if set  (a target directory redirected off the repository,
        redirected off OneDrive; see CLAUDE.md "Build and validation")
     6. `mumdia` on `PATH`
 
@@ -67,7 +67,9 @@ SKIP_SECTIONS = ("help",)
 BIN_CANDIDATES = (
     "rust/mumdia/target/release/mumdia",
     "rust/mumdia/target/release/mumdia.exe",
-    "C:/Users/robbi/mumdia_build/release/mumdia.exe",
+    # A redirected target directory, named by the environment rather than baked in:
+    # this used to be one contributor's absolute Windows path, in a public repo.
+    os.environ.get("MUMDIA_BIN", ""),
 )
 
 # An option entry in clap's long help starts at 2 to 6 spaces followed by a dash;

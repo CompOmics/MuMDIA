@@ -46,6 +46,7 @@ scripts/_probe*.py
 !/CONTRIBUTING.md
 !/SECURITY.md
 !/CODE_OF_CONDUCT.md
+!/THIRD_PARTY_LICENSES.md
 # local archive of superseded working docs (not published)
 /_archive/
 # Emitted by ci/smoke.sh for the cross-platform comparison in CI.

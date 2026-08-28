@@ -1,17 +1,38 @@
-# Keep the build context small and free of machine-specific / large files.
-.git
-**/target
-**/.cargo/config.toml
-out_*/
-mzml_files/
-fasta/
-notebooks/
-sidecar_work/
-*.parquet
-*.mzML
-*.mzml
-*.raw
-*.pin
-*.log
-__pycache__/
-*.pyc
+# ALLOWLIST, not a deny list.
+#
+# A deny list is the wrong shape for a build context: it has to be updated every time
+# something new appears in the tree, and the thing that appears is exactly the thing
+# nobody thought to exclude. Two concrete cases it was already missing:
+#
+#   - `.gitignore` excludes `scripts/run_*.sh` and `scripts/_probe*.py` as "throwaway;
+#     hardcoded paths", but the Docker build context is the WORKING TREE, not the git
+#     tree, and the Dockerfile does `COPY scripts /opt/mumdia/scripts`. A locally built
+#     image would have baked them in. (CI builds from a clean checkout, so the published
+#     image was never affected -- it was latent, not live.)
+#   - untracked local data and vendored comparison sources (`alphadia/`, `lib/`,
+#     `raw_files/`, `val*/`, `mbr_work/`) all entered the context and were sent to the
+#     daemon on every local build.
+#
+# Everything is excluded, then the four things the Dockerfile actually COPYs are
+# re-included. Adding a new COPY now requires adding it here, which is the failure
+# direction we want: a build that misses a file, not an image that carries one.
+*
+
+# The workspace the release binary is built from.
+!rust
+rust/**/target
+rust/**/.cargo/config.toml
+
+# The Python sidecar workers the engine invokes, and their environment specs.
+!scripts
+scripts/__pycache__
+scripts/*.pyc
+# Local-only helpers with hardcoded paths (mirrors .gitignore).
+scripts/run_*.sh
+scripts/_probe*.py
+!env
+
+# The two baked configs, and the notices that must travel with the binary.
+!docker
+!LICENSE
+!THIRD_PARTY_LICENSES.md

@@ -26,12 +26,12 @@ jobs:
       run:
         working-directory: rust/mumdia
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       # rust-toolchain.toml (in rust/mumdia) pins the exact toolchain and requests
       # the rustfmt and clippy components; rustup installs them on first use.
       - name: Cache cargo
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.cargo/registry
@@ -60,10 +60,10 @@ jobs:
       run:
         working-directory: rust/mumdia
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Cache cargo-audit
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ~/.cargo/bin/cargo-audit
           key: ${{ runner.os }}-cargo-audit-bin
@@ -89,10 +89,10 @@ jobs:
       run:
         working-directory: rust/mumdia
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Cache cargo
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.cargo/registry
@@ -123,9 +123,9 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.12"
 
@@ -133,7 +133,7 @@ jobs:
         run: python -m pip install --quiet pyarrow
 
       - name: Cache cargo
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.cargo/registry
@@ -163,7 +163,7 @@ jobs:
         run: bash ci/smoke.sh
 
       - name: Upload output hashes
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: smoke-hashes-${{ matrix.os }}
           path: smoke_output_hashes.txt
@@ -179,12 +179,78 @@ jobs:
   # committed hash. A golden value would have to be updated by every legitimate
   # change to scoring, which turns an improvement into a chore and the check into a
   # rubber stamp.
+  # Real sidecar imports, in a real environment.
+  #
+  # Every torch/mokapot/DeepLC test in `tests/python` SKIPS on the runner, so the entire
+  # external-classifier contract that `rescore.strict` exists to protect executed nowhere
+  # on a pull request -- and that is where the worst defect in this project's history
+  # lived, when mokapot returned a targets-only table and the engine reported ~331,000
+  # "identified" peptides against a correct figure near 51,000. The DeepLC import-order
+  # failure (`OSError: [WinError 1114] ... c10.dll`) also only shows up against a real
+  # torch-backed DeepLC, and it has shipped once.
+  #
+  # Runs only when the sidecars, their environments or the image definition change, so
+  # the ~10 minute conda solve is not paid on every documentation PR.
+  sidecar-imports:
+    name: real sidecar imports
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Do the sidecars, envs or Dockerfile change?
+        id: touched
+        run: |
+          set -euo pipefail
+          base="${{ github.event.pull_request.base.sha || 'HEAD~1' }}"
+          if git diff --name-only "$base" HEAD              | grep -Eq '^(scripts/|env/|tests/python/|Dockerfile$)'; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "no sidecar-relevant change; skipping"
+          fi
+
+      - uses: mamba-org/setup-micromamba@add3a49764cedee8ee24e82dfde87f5bc2914462 # v2
+        if: steps.touched.outputs.run == 'true'
+        with:
+          micromamba-version: latest
+          environment-file: env/docker-deeplc.yml
+          environment-name: deeplc
+          cache-environment: true
+
+      # The import ORDER is the contract: `deeplc` must come before numpy/pyarrow,
+      # because DeepLC 4.x is torch-backed and the wrong order aborts torch DLL
+      # initialisation on Windows. Importing it first here is what proves the worker
+      # files still order it that way.
+      - name: DeepLC imports, in the order the workers use
+        if: steps.touched.outputs.run == 'true'
+        shell: micromamba-shell {0}
+        run: |
+          python -c "import deeplc, numpy, pandas, pyarrow, torch, psm_utils;                      print('deeplc', deeplc.__version__, '| torch', torch.__version__)"
+          python -m pytest tests/python -q -rs
+
+      - uses: mamba-org/setup-micromamba@add3a49764cedee8ee24e82dfde87f5bc2914462 # v2
+        if: steps.touched.outputs.run == 'true'
+        with:
+          micromamba-version: latest
+          environment-file: env/docker-rescore.yml
+          environment-name: rescore
+          cache-environment: true
+
+      - name: mokapot and MS2PIP import, and their worker tests run
+        if: steps.touched.outputs.run == 'true'
+        shell: micromamba-shell {0}
+        run: |
+          python -c "import mokapot, ms2pip, numpy, pyarrow; print('mokapot', mokapot.__version__)"
+          python -m pytest tests/python -q -rs
+
   smoke-cross-platform:
     name: cross-platform byte equality
     runs-on: ubuntu-latest
     needs: smoke
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: smoke-hashes-*
           path: hashes
@@ -210,9 +276,9 @@ jobs:
     name: python sidecars + configs
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.12"
 
@@ -264,6 +330,13 @@ jobs:
       # regenerates is worse than none, because it reads as current.
       - name: Config reference is current
         run: python ci/gen_config_reference.py --check
+
+      # The release binary is statically linked, so it carries 173 third-party crates
+      # whose Apache-2.0 and MIT terms require their notices to ship with it. Generated
+      # from Cargo.lock, so a dependency change that alters the licence inventory has to
+      # land with the regenerated notice file.
+      - name: Third-party licences are current
+        run: python ci/gen_third_party_licenses.py --check
 
       # Source comments cite the document that specifies each behavior. Several of
       # those documents are local-only design notes, so a public clone used to hold

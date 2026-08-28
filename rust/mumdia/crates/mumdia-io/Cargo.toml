@@ -23,3 +23,6 @@ tracing-subscriber.workspace = true
 blake3.workspace = true
 arrow.workspace = true
 parquet.workspace = true
+
+[lints]
+workspace = true

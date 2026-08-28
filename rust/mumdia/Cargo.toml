@@ -57,3 +57,11 @@ codegen-units = 1
 # never uses Arrow IPC, so compile just this crate at a lighter opt-level.
 [profile.release.package.arrow-ipc]
 opt-level = 1
+
+# The workspace has zero `unsafe` today, including in build.rs and not even in a
+# comment. Forbid rather than deny, so a crate cannot opt back in with an
+# `#[allow]`: the property is worth being able to state in SECURITY.md, and
+# stating it is only honest if something enforces it. A tool that parses hostile
+# files for a living gets a lot of its safety argument from this one line.
+[workspace.lints.rust]
+unsafe_code = "forbid"

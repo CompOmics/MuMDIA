@@ -27,7 +27,7 @@ find_bin() {
         rust/mumdia/target/release/mumdia \
         rust/mumdia/target/release/mumdia.exe \
         "$HOME/mumdia_build/release/mumdia" \
-        "C:/Users/robbi/mumdia_build/release/mumdia.exe"
+        "${MUMDIA_BIN:-}"
     do
         [ -x "$cand" ] && { echo "$cand"; return; }
     done

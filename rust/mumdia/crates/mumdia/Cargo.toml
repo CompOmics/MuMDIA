@@ -32,3 +32,6 @@ arrow.workspace = true
 parquet.workspace = true
 mzdata.workspace = true
 mimalloc.workspace = true
+
+[lints]
+workspace = true

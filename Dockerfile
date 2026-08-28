@@ -34,24 +34,32 @@ FROM mambaorg/micromamba:1.5.10-bookworm-slim
 USER root
 ENV MAMBA_ROOT_PREFIX=/opt/conda
 
-# build-essential lets pip compile any sidecar dependency that ships only as an
-# sdist. git is no longer required: DeepLC is pinned to a PyPI version rather than
-# a repository commit (env/docker-deeplc.yml).
-RUN apt-get update && apt-get install -y --no-install-recommends build-essential \
-    && rm -rf /var/lib/apt/lists/*
-
 # Two sidecar envs (rescore = mokapot + MS2PIP, deeplc = DeepLC + torch).
+#
+# build-essential is installed for the pip step and PURGED in the same layer. It lets
+# pip compile a sidecar dependency that ships only as an sdist, and it has no business
+# surviving into a runtime image whose only job is one static binary plus two prebuilt
+# conda envs: it shipped gcc, make and the C headers to every user, which is both a
+# large surface and a post-exploitation convenience. Same layer, so the bytes never
+# reach the published image rather than being deleted from a later one.
+# git is not required: DeepLC is pinned to a PyPI version, not a repository commit
+# (env/docker-deeplc.yml).
 COPY env/docker-rescore.yml env/docker-deeplc.yml /tmp/env/
-RUN micromamba create -y -n rescore -f /tmp/env/docker-rescore.yml \
+RUN apt-get update && apt-get install -y --no-install-recommends build-essential \
+    && micromamba create -y -n rescore -f /tmp/env/docker-rescore.yml \
     && micromamba create -y -n deeplc -f /tmp/env/docker-deeplc.yml \
     && micromamba clean -a -y \
-    && rm -rf /tmp/env
+    && rm -rf /tmp/env \
+    && apt-get purge -y --auto-remove build-essential \
+    && rm -rf /var/lib/apt/lists/*
 
 # Engine binary, sidecar workers, and the baked FASTA/library DIA configs.
 COPY --from=build /build/release/mumdia /usr/local/bin/mumdia
 COPY scripts /opt/mumdia/scripts
 COPY docker/config.dia.json /opt/mumdia/config.dia.json
 COPY docker/config.diann-lib.json /opt/mumdia/config.diann-lib.json
+# Notices for the statically linked crates, as in the release archive.
+COPY LICENSE THIRD_PARTY_LICENSES.md /opt/mumdia/
 
 # mokapot logistic-regression is the recommended default rescorer.
 ENV MUMDIA_RESCORE_MODEL=logreg
