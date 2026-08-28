@@ -515,7 +515,10 @@ mod tests {
 
     #[test]
     fn page_search_finds_only_in_window_and_tol() {
-        let dir = std::env::temp_dir().join("mumdia_index_test");
+        // Unique per process: a fixed name races when two `cargo test` runs share a
+        // machine, which is the convention docs/14 states and four other test modules
+        // already follow.
+        let dir = std::env::temp_dir().join(format!("mumdia_index_test_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let (p, f) = build_tiny_lib(&dir);
         let lib = Library::load(&p, &f, 8).unwrap();

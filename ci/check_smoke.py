@@ -276,6 +276,24 @@ def main() -> int:
     ]
     c.ok(not zeros, "unquantifiable rows are null, not zero", f"{len(zeros)} zero-valued rows")
 
+    # Quantification must have used the IDENTIFICATION apex, not a re-detected one.
+    #
+    # `quant` records this and warns when the column is missing, because without it every
+    # quantity is integrated around a re-detected apex that reproduces the identification
+    # apex only about half the time. Nothing asserted it, so a schema change that dropped
+    # `apex_rt` from the scored table would have made every quantity wrong while all the
+    # other assertions here stayed green.
+    qrep = json.loads((out / "peptide_quant.parquet.report.json").read_text(encoding="utf-8"))
+    # The stage records these under `params`; fall back to the report root so a schema
+    # move fails on the assertion rather than on a KeyError here.
+    qstats = qrep.get("params", qrep)
+    c.ok(qstats.get("apex_rt_column_present") is True,
+         "quant used the identification apex, not a re-detected one",
+         f"apex_rt_column_present={qstats.get('apex_rt_column_present')!r}")
+    c.ok(int(qstats.get("candidates_with_scored_apex", 0)) > 0,
+         "at least one candidate carried a scored apex into quant",
+         str(qstats.get("candidates_with_scored_apex")))
+
     # ---------------------------------------------------------------- determinism
     if a.compare_peptides:
         print("determinism")
@@ -284,6 +302,42 @@ def main() -> int:
         c.ok(first == second,
              "a second identical run produces a byte-identical peptides.tsv",
              f"{len(first)} vs {len(second)} bytes")
+
+        # Whole-tree byte identity, not just the two rounded TSVs.
+        #
+        # `peptides.tsv` is presentation-rounded, so a nondeterministic quantity differing
+        # in the fifth significant figure was invisible, and features.parquet /
+        # chromatograms.parquet / psms_scored.parquet were never compared at all. Both runs
+        # already write a manifest with a blake3 `content_hash` per artifact, so comparing
+        # those maps upgrades a two-column check into every artifact the run produced --
+        # which is what the determinism contract actually claims.
+        other = Path(a.compare_peptides).parent / "manifest.json"
+        mine = out / "manifest.json"
+        if other.exists() and mine.exists():
+            def hashes(path):
+                # `artifacts` is a map keyed by logical name, each value an
+                # ArtifactRecord carrying a blake3 `content_hash`.
+                m = json.loads(path.read_text(encoding="utf-8"))
+                arts = m.get("artifacts", {})
+                items = arts.values() if isinstance(arts, dict) else arts
+                return {
+                    a_["logical_name"]: a_["content_hash"]
+                    for a_ in items
+                    if isinstance(a_, dict) and a_.get("content_hash")
+                }
+
+            h1, h2 = hashes(mine), hashes(other)
+            c.ok(len(h1) > 0, "the manifest records per-artifact content hashes", str(len(h1)))
+            c.ok(set(h1) == set(h2),
+                 "both runs produced the same artifact set",
+                 f"{len(h1)} vs {len(h2)}")
+            differing = sorted(k for k in set(h1) & set(h2) if h1[k] != h2[k])
+            c.ok(not differing,
+                 "every artifact is byte-identical between the two runs",
+                 ", ".join(differing) if differing else f"{len(h1)} artifacts")
+        else:
+            c.ok(False, "both runs wrote a manifest.json to compare",
+                 f"mine={mine.exists()} other={other.exists()}")
 
     print()
     if c.failures:

@@ -241,7 +241,10 @@ mod tests {
     use super::*;
 
     fn tmp(name: &str) -> String {
-        let dir = std::env::temp_dir().join("mumdia_audit_test");
+        // Unique per process: a fixed name races when two `cargo test` runs share a
+        // machine, which is the convention docs/14 states and four other test modules
+        // already follow.
+        let dir = std::env::temp_dir().join(format!("mumdia_audit_test_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir.join(name).to_str().unwrap().to_string()
     }

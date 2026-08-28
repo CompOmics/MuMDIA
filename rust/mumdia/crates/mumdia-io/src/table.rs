@@ -682,7 +682,10 @@ mod tests {
 
     #[test]
     fn roundtrip_mixed_columns() {
-        let dir = std::env::temp_dir().join("mumdia_table_test");
+        // Unique per process: a fixed name races when two `cargo test` runs share a
+        // machine, which is the convention docs/14 states and four other test modules
+        // already follow.
+        let dir = std::env::temp_dir().join(format!("mumdia_table_test_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("t.parquet");
         let p = path.to_str().unwrap();
@@ -722,7 +725,11 @@ mod projection_tests {
     /// adopts it would silently change results.
     #[test]
     fn read_cols_matches_read_for_selected_columns() {
-        let dir = std::env::temp_dir().join("mumdia_projection_test");
+        // Unique per process: a fixed name races when two `cargo test` runs share a
+        // machine, which is the convention docs/14 states and four other test modules
+        // already follow.
+        let dir =
+            std::env::temp_dir().join(format!("mumdia_projection_test_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("t.parquet");
         let p = path.to_str().unwrap();
