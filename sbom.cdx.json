@@ -2674,7 +2674,7 @@
       "name": "strsim",
       "version": "0.11.1",
       "purl": "pkg:cargo/strsim@0.11.1",
-      "description": "Implementations of string similarity metrics. Includes Hamming, Levenshtein, OSA, Damerau-Levenshtein, Jaro, Jaro-Winkler, and SÃ¸rensen-Dice.",
+      "description": "Implementations of string similarity metrics. Includes Hamming, Levenshtein, OSA, Damerau-Levenshtein, Jaro, Jaro-Winkler, and Sørensen-Dice.",
       "licenses": [
         {
           "expression": "MIT"

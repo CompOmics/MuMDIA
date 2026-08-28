@@ -159,6 +159,12 @@ def collect() -> list[dict]:
         ["cargo", "metadata", "--format-version", "1", "--locked",
          "--manifest-path", str(MANIFEST)],
         capture_output=True, text=True, check=True,
+        # Explicit UTF-8, not the locale codepage. `text=True` decodes with
+        # `locale.getpreferredencoding()`, which is cp1252 on Windows, so a crate
+        # description containing "Sorensen-Dice" (with the Danish o) came back as
+        # mojibake and the generated file differed from the same file generated on
+        # Linux. Cargo emits UTF-8 JSON on every platform.
+        encoding="utf-8",
     )
     meta = json.loads(out.stdout)
     pkgs = []

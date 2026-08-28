@@ -877,3 +877,55 @@ Use an explicit conditional, which never leaves a failing command last:
 
 `bash -x <script>` is the fastest way to find this class of failure: the trace stops exactly where
 the shell gives up, whereas the log shows nothing at all.
+
+### The same class, in a workflow step: a glob that matches nothing
+
+`ls *.tar.gz *.zip 2>/dev/null | head -1` is the same failure wearing different
+clothes. Exactly one of those globs matches, `ls` exits 2 on the other,
+`pipefail` propagates that, `set -e` ends the step, and `2>/dev/null` discards the
+only explanation. It cost one release rehearsal, which failed with `exit code 2`
+and no other output.
+
+Use a nullglob array and check it, which cannot fail silently and says what it
+found:
+
+```bash
+shopt -s nullglob
+archives=(*.tar.gz *.zip)
+shopt -u nullglob
+if [ ${#archives[@]} -eq 0 ]; then echo "::error::no archive"; ls -la; exit 1; fi
+```
+
+The general rule for a `run:` block: any command whose failure is EXPECTED needs an
+explicit conditional, and discarding its stderr removes the only evidence of why
+the step died.
+
+## A generated file must not depend on the operating system that generated it
+
+`ci/gen_third_party_licenses.py` reads each crate's own `LICENSE`/`COPYING`/`NOTICE`
+files out of the cargo registry. Three platform differences made its output, and that of `ci/gen_sbom.py`, and
+therefore the `--check` gates, depend on the machine:
+
+- **Filename case.** `Path.glob("LICENSE*")` and `fnmatch.fnmatch` follow the
+  platform: case-insensitive on Windows, case-sensitive on Linux. The seven
+  `windows-*` crates ship `license-mit` and `license-apache-2.0` in lower case, so
+  the document listed 126 crates with a recovered notice when generated on Windows
+  and 119 on Linux. The generator now routes every filename through one explicitly
+  case-insensitive predicate.
+- **The decoding of cargo's own output.** `subprocess.run(..., text=True)` decodes
+  with `locale.getpreferredencoding()`, which is cp1252 on Windows, so a crate
+  description carrying a non-ASCII character became mojibake in the SBOM and the
+  file differed from the same file generated on Linux. Both generators now pass
+  `encoding="utf-8"` explicitly; cargo emits UTF-8 JSON everywhere.
+- **Whether the machine has built.** Notices were read only from the unpacked
+  `registry/src` tree, which exists after a build. The `sidecars` CI job never
+  compiles, so it recovered nothing at all. The generator now falls back to the
+  `.crate` tarball in `registry/cache`, which `cargo fetch --locked` populates, and
+  that job runs the fetch first.
+
+Both were invisible until `--check` started printing a diff. A staleness gate that
+says only "this file is stale" cannot distinguish a missing regeneration from an
+environmental difference, and the second is the one that makes the gate fail on
+every run until someone deletes it. Any generated artifact with a `--check` in CI
+should print what differs.
+
