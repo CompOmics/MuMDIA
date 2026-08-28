@@ -110,7 +110,14 @@ a `.zip`, the others a `.tar.gz`. An archive contains:
 - `scripts/`, the Python sidecar workers the engine launches by path;
 - `env/`, the conda environment specifications for those workers;
 - `configs/`, the example configurations;
-- `docs/`, `README.md`, `CHANGELOG.md`, `LICENSE`.
+- `docs/`, `README.md`, `CHANGELOG.md`, `LICENSE`,
+  `THIRD_PARTY_LICENSES.md` (the notices of the 173 crates linked into the
+  binary) and `sbom.cdx.json` (the same inventory as CycloneDX 1.5, for
+  vulnerability scanners and software inventories);
+- `ci/smoke.sh` with its two helpers and `test_data/fixture.fasta`, so the
+  installation check in `docs/19_getting_started.md` can be run from the archive.
+  Every archive is unpacked and put through that check on its own platform before
+  it is published.
 
 The binary alone cannot run the Python sidecars. Without a Python environment it
 is limited to the native predictors and the native `native_tda` rescorer, which
@@ -653,6 +660,14 @@ must not be guessed.
 ## License
 
 Apache-2.0. See [LICENSE](LICENSE).
+
+The engine is statically linked, so a distributed binary contains 173 Rust
+crates. Their notices are reproduced in
+[THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md), generated from `Cargo.lock`
+and from the crates' own licence files; `sbom.cdx.json` is the machine-readable
+form. Both ship in every release archive and in the container image, and both are
+checked for staleness in CI. The extraction is mechanical: whether it satisfies a
+given distribution's obligations is a question for whoever signs off the release.
 
 ## Attribution
 
