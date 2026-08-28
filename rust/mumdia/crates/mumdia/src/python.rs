@@ -391,10 +391,28 @@ pub fn resolve_script_dir(configured: &str, config_path: Option<&str>) -> String
     let has_workers =
         |dir: &Path| dir.join("mbr_worker.py").exists() || dir.join("deeplc_worker.py").exists();
 
+    // An ABSOLUTE configured path is taken as given: the user named a directory, and
+    // naming one is the way to be unambiguous.
     let direct = Path::new(configured);
-    if has_workers(direct) {
+    if direct.is_absolute() && has_workers(direct) {
         return configured.to_string();
     }
+
+    // A RELATIVE path resolves against the config file first, then the executable, and
+    // only then against the current working directory.
+    //
+    // The old order tried the working directory first, and the shipped default is the
+    // relative `"scripts"`, which both sidecar example configs carry literally. So:
+    // unpack a dataset archive, `cd` into it, run
+    // `mumdia run --config configs/examples/diann-library.json`, and if that archive
+    // happens to contain a `scripts/` directory with a worker file in it, the whole
+    // directory won resolution and every worker in it ran as the user. That needs no
+    // hostile CONFIGURATION -- which the security policy treats as trusted, like a shell
+    // script -- only an untrusted input directory, which is an ordinary Tuesday in this
+    // field.
+    //
+    // Config-relative first is also the more useful order: it makes a config portable
+    // with its scripts, which is what the resolution exists for.
     if let Some(cfg_path) = config_path {
         if let Some(base) = Path::new(cfg_path).parent() {
             let rel = base.join(configured);
@@ -411,6 +429,21 @@ pub fn resolve_script_dir(configured: &str, config_path: Option<&str>) -> String
                 }
             }
         }
+    }
+    // Working directory last. Still reached, because running from a checkout with a
+    // relative `scripts` is the normal development case, but now only when neither the
+    // config's directory nor the executable's supplies the workers -- so a planted
+    // directory can no longer displace the ones that ship with the configuration or the
+    // binary.
+    if has_workers(direct) {
+        tracing::warn!(
+            script_dir = configured,
+            "python: resolved the sidecar script directory against the current working \
+             directory, because neither the config file's directory nor the executable's \
+             contains the workers. Prefer an absolute sidecar_script_dir, or keep the \
+             scripts beside the config"
+        );
+        return configured.to_string();
     }
     configured.to_string()
 }

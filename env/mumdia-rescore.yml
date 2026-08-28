@@ -18,4 +18,7 @@ dependencies:
   - scikit-learn
   - pip
   - pip:
-      - mokapot
+      # Pinned to match env/docker-rescore.yml. Left floating, a local install and
+      # the published image could run different rescorer versions, which is exactly
+      # the difference a reported benchmark cannot see.
+      - mokapot==0.10.0

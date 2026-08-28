@@ -97,14 +97,27 @@ jobs:
           test -f "$work/out/probe" || { echo "bind-mount write failed"; exit 1; }
           echo "bind-mount write OK (file owned by $(stat -c '%u:%g' "$work/out/probe"))"
 
-      - name: Push (version tags only)
+      # Tag and push the image that was just SMOKE-TESTED, rather than building a
+      # second time.
+      #
+      # The previous step comment claimed "build once ... so the smoke test runs against
+      # exactly the image that will be pushed", and then a second
+      # `build-push-action` invocation built again. Neither `FROM` is digest-pinned, and
+      # `apt-get update` and the pip resolutions are unpinned, so the two builds were
+      # identical only to the extent the layer cache made them so: the image that passed
+      # the uid check, the two `doctor` runs, the DeepLC/mokapot import checks and the
+      # bind-mount write was not provably the image users pulled.
+      #
+      # `docker tag` + `docker push` on the locally loaded `mumdia:ci` closes that: same
+      # image id, by construction.
+      - name: Push the tested image (version tags only)
         if: startsWith(github.ref, 'refs/tags/v')
-        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
-        with:
-          context: .
-          file: Dockerfile
-          platforms: linux/amd64
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
+        run: |
+          set -euo pipefail
+          echo "${{ steps.meta.outputs.tags }}" | while read -r tag; do
+            [ -n "$tag" ] || continue
+            docker tag mumdia:ci "$tag"
+            docker push "$tag"
+            echo "pushed $tag"
+          done
+          echo "image id: $(docker image inspect --format '{{.Id}}' mumdia:ci)"

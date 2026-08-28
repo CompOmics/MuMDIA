@@ -146,11 +146,17 @@ pub fn load_ms1(path: &str) -> Result<Vec<Ms1Scan>> {
                     .ok_or_else(|| anyhow!("list 'intensity' inner is not f32"))?;
                 (0..iff.len()).map(|j| iff.value(j)).collect()
             };
+            // Truncate to the shorter list, as `load_ms2` does at :68. The two list
+            // columns are decoded independently and either can be null, so a spectra
+            // artifact whose m/z and intensity lists disagree in length would otherwise
+            // be carried into `sum_near` and the MS1 isotope features, where the loop
+            // bound comes from one array and the body indexes the other.
+            let n = mz.len().min(intensity.len());
             out.push(Ms1Scan {
                 scan_index: scan_index[i],
                 rt_seconds: rt[i],
-                mz,
-                intensity,
+                mz: mz[..n].to_vec(),
+                intensity: intensity[..n].to_vec(),
             });
             i += 1;
         }
