@@ -428,6 +428,16 @@ jobs:
       # whose Apache-2.0 and MIT terms require their notices to ship with it. Generated
       # from Cargo.lock, so a dependency change that alters the licence inventory has to
       # land with the regenerated notice file.
+      # Both generators below read the local cargo registry, and this job never
+      # compiles anything, so on a fresh runner the registry is empty. Without this
+      # step the licence generator recovered zero per-crate notices and `--check`
+      # reported the committed file as stale: a difference in the environment, not in
+      # the tree. `cargo fetch` populates `registry/cache` with the .crate tarballs,
+      # which the generator reads directly, so its output is the same here as on a
+      # machine that has built.
+      - name: Fetch the crate sources the generators read
+        run: cargo fetch --locked --manifest-path rust/mumdia/Cargo.toml
+
       - name: Third-party licences are current
         run: python ci/gen_third_party_licenses.py --check
 

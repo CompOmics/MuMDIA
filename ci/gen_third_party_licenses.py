@@ -42,9 +42,11 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import json
 import os
 import re
+import tarfile
 import subprocess
 import sys
 from pathlib import Path
@@ -169,9 +171,10 @@ def collect() -> list[dict]:
         })
     pkgs.sort(key=lambda p: (p["name"].lower(), p["version"]))
     srcdirs = registry_src_dirs()
+    tarballs = registry_tarballs()
     for p in pkgs:
         p["copyrights"], p["notices"] = notices_for(
-            p["name"], p["version"], srcdirs
+            p["name"], p["version"], srcdirs, tarballs
         )
     return pkgs
 
@@ -179,10 +182,40 @@ def collect() -> list[dict]:
 def registry_src_dirs() -> list[Path]:
     """Cargo's unpacked crate sources, where each crate's own licence files live."""
     home = Path(os.environ.get("CARGO_HOME") or (Path.home() / ".cargo"))
-    return sorted((home / "registry" / "src").glob("*")) if (home / "registry" / "src").exists() else []
+    src = home / "registry" / "src"
+    return sorted(src.glob("*")) if src.exists() else []
+
+
+def registry_tarballs() -> dict[tuple[str, str], Path]:
+    """`(name, version) -> .crate tarball`, from cargo's download cache.
+
+    The unpacked `registry/src` tree only exists after a BUILD. `cargo fetch --locked`
+    populates `registry/cache` with the `.crate` tarballs and nothing else, and a
+    documentation or CI job that never compiles has exactly that. Reading the tarballs
+    keeps this generator's output identical in both situations, which is what makes
+    `--check` a check rather than a statement about which machine ran it.
+
+    This is not a detail: with only the unpacked tree, the check failed on a runner
+    that had fetched but not built, reporting the file as stale when the difference was
+    that the runner recovered zero notices.
+    """
+    home = Path(os.environ.get("CARGO_HOME") or (Path.home() / ".cargo"))
+    cache = home / "registry" / "cache"
+    found: dict[tuple[str, str], Path] = {}
+    if not cache.exists():
+        return found
+    for f in sorted(cache.glob("*/*.crate")):
+        stem = f.name[: -len(".crate")]
+        # `name-1.2.3`: split at the last hyphen, since crate names contain hyphens.
+        name, _, version = stem.rpartition("-")
+        if name and version and (name, version) not in found:
+            found[(name, version)] = f
+    return found
 
 
 NOTICE_GLOBS = ("LICENSE*", "LICENCE*", "COPYING*", "NOTICE*", "AUTHORS*")
+# A licence file larger than this is not a notice, it is vendored content.
+MAX_NOTICE_BYTES = 200_000
 # An actual copyright ASSERTION: "Copyright" followed by (c), the symbol, or a year.
 #
 # A looser `Copyright\b` also matches the body of the Apache-2.0 text itself -- "the
@@ -193,7 +226,76 @@ NOTICE_GLOBS = ("LICENSE*", "LICENCE*", "COPYING*", "NOTICE*", "AUTHORS*")
 COPYRIGHT = re.compile(r"^\s*(?:[#*/]+\s*)?(Copyright\s*(?:\((?:c|C)\)|©|\d{4}).*)$")
 
 
-def notices_for(name: str, version: str, srcdirs: list[Path]) -> tuple[list[str], list[str]]:
+def _scan(files: list[tuple[str, str]]) -> tuple[list[str], list[str]]:
+    """(copyright lines, NOTICE texts) from `(filename, text)` pairs."""
+    copyrights: list[str] = []
+    notices: list[str] = []
+    for fname, text in files:
+        if fname.upper().startswith("NOTICE"):
+            stripped = text.strip()
+            if stripped:
+                notices.append(stripped)
+            continue
+        for line in text.splitlines():
+            m = COPYRIGHT.match(line)
+            if not m:
+                continue
+            c = " ".join(m.group(1).split())
+            # Skip the placeholder line inside the verbatim Apache-2.0 appendix,
+            # which is boilerplate rather than an assertion.
+            if "[yyyy] [name of copyright owner]" in c:
+                continue
+            if c not in copyrights:
+                copyrights.append(c)
+    return copyrights, notices
+
+
+def _from_src(crate: Path) -> list[tuple[str, str]]:
+    files = []
+    for pattern in NOTICE_GLOBS:
+        for f in sorted(crate.glob(pattern)):
+            if not f.is_file() or f.stat().st_size > MAX_NOTICE_BYTES:
+                continue
+            try:
+                files.append((f.name, f.read_text(encoding="utf-8", errors="replace")))
+            except OSError:
+                continue
+    return files
+
+
+def _from_tarball(tar_path: Path, name: str, version: str) -> list[tuple[str, str]]:
+    """Notice files at the top level of `name-version/` inside the .crate tarball."""
+    prefix = f"{name}-{version}/"
+    files = []
+    try:
+        with tarfile.open(tar_path, "r:gz") as tf:
+            for m in sorted(tf.getmembers(), key=lambda m: m.name):
+                if not m.isfile() or m.size > MAX_NOTICE_BYTES:
+                    continue
+                if not m.name.startswith(prefix):
+                    continue
+                base = m.name[len(prefix):]
+                # Top level only, matching the `crate.glob(pattern)` scan above, so
+                # both sources see the same set of files and produce the same output.
+                if "/" in base or not any(
+                    fnmatch.fnmatch(base, pattern) for pattern in NOTICE_GLOBS
+                ):
+                    continue
+                fh = tf.extractfile(m)
+                if fh is None:
+                    continue
+                files.append((base, fh.read().decode("utf-8", errors="replace")))
+    except (OSError, tarfile.TarError):
+        return []
+    return files
+
+
+def notices_for(
+    name: str,
+    version: str,
+    srcdirs: list[Path],
+    tarballs: dict[tuple[str, str], Path] | None = None,
+) -> tuple[list[str], list[str]]:
     """(copyright lines, full NOTICE texts) taken from the crate's own files.
 
     This is what turns the inventory into a NOTICE bundle. Reproducing licence TEXT is
@@ -202,44 +304,25 @@ def notices_for(name: str, version: str, srcdirs: list[Path]) -> tuple[list[str]
     contents of any NOTICE file to be propagated. An SPDX identifier plus a generic
     licence body satisfies none of those on its own.
 
-    Read from the local registry cache rather than the network, so the generator stays
-    offline and reproducible. Coverage is therefore whatever has been unpacked on this
-    machine, which is every crate in the lockfile after a build -- and the count is
-    reported in the document, so a gap is visible rather than implied.
+    Read from the local registry rather than the network, so the generator stays
+    offline. Two sources, checked in order: the unpacked `registry/src` tree, which
+    exists after a build, then the `.crate` tarball in `registry/cache`, which exists
+    after a bare `cargo fetch`. They hold the same bytes, so the output does not depend
+    on which one is present -- without the second, this generator produced a different
+    document on a runner that had fetched but not built, and `--check` reported the
+    committed file as stale.
     """
-    copyrights: list[str] = []
-    notices: list[str] = []
     for base in srcdirs:
         crate = base / f"{name}-{version}"
         if not crate.is_dir():
             continue
-        for pattern in NOTICE_GLOBS:
-            for f in sorted(crate.glob(pattern)):
-                if not f.is_file() or f.stat().st_size > 200_000:
-                    continue
-                try:
-                    text = f.read_text(encoding="utf-8", errors="replace")
-                except OSError:
-                    continue
-                if f.name.upper().startswith("NOTICE"):
-                    stripped = text.strip()
-                    if stripped:
-                        notices.append(stripped)
-                    continue
-                for line in text.splitlines():
-                    m = COPYRIGHT.match(line)
-                    if m:
-                        c = " ".join(m.group(1).split())
-                        # Skip the placeholder line inside the verbatim Apache-2.0
-                        # appendix, which is boilerplate rather than an assertion.
-                        if "[yyyy] [name of copyright owner]" in c:
-                            continue
-                        if c not in copyrights:
-                            copyrights.append(c)
-        break_outer = bool(copyrights or notices)
-        if break_outer:
-            break
-    return copyrights, notices
+        copyrights, notices = _scan(_from_src(crate))
+        if copyrights or notices:
+            return copyrights, notices
+    tar = (tarballs or {}).get((name, version))
+    if tar is not None:
+        return _scan(_from_tarball(tar, name, version))
+    return [], []
 
 
 def render(pkgs: list[dict]) -> str:
