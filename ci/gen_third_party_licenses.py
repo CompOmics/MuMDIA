@@ -26,9 +26,11 @@ used to be.
 Why not `cargo about` or `cargo-bundle-licenses`: they are good tools, but they are
 extra binaries a contributor has to install, and reading the registry cache gets the
 same notices with no new dependency and no network. The limitation is that coverage is
-whatever has been unpacked locally, which after a `--locked` build is every crate in
+whatever the local registry holds, which after `cargo fetch --locked` is every crate in
 the lockfile; the count is printed in the document, so a gap is visible rather than
-implied.
+implied. Filename matching is deliberately case-insensitive and the registry is read
+from either the unpacked tree or the `.crate` tarball, so the document does not depend
+on the operating system or on whether the machine has built.
 
 This is a mechanical extraction, not a legal opinion. It reproduces what the crates
 ship. Whether that satisfies a given distribution's obligations is a question for
@@ -216,6 +218,22 @@ def registry_tarballs() -> dict[tuple[str, str], Path]:
 NOTICE_GLOBS = ("LICENSE*", "LICENCE*", "COPYING*", "NOTICE*", "AUTHORS*")
 # A licence file larger than this is not a notice, it is vendored content.
 MAX_NOTICE_BYTES = 200_000
+
+
+def is_notice_file(name: str) -> bool:
+    """Case-INSENSITIVELY, is this filename a notice file?
+
+    The case-insensitivity is the whole point of the function existing. `Path.glob`
+    and `fnmatch` follow the platform: on Windows `glob("LICENSE*")` matches
+    `license-mit`, on Linux it does not. That made this generator produce a DIFFERENT
+    document on Linux than on Windows -- 119 crates with a recovered notice instead of
+    126, the difference being the seven `windows-*` crates, which ship lowercase
+    `license-mit` and `license-apache-2.0` -- and `--check` then reported the
+    committed file as stale on every CI run. A notice bundle whose contents depend on
+    the operating system that generated it is not a notice bundle.
+    """
+    up = name.upper()
+    return any(fnmatch.fnmatchcase(up, pattern) for pattern in NOTICE_GLOBS)
 # An actual copyright ASSERTION: "Copyright" followed by (c), the symbol, or a year.
 #
 # A looser `Copyright\b` also matches the body of the Apache-2.0 text itself -- "the
@@ -251,15 +269,21 @@ def _scan(files: list[tuple[str, str]]) -> tuple[list[str], list[str]]:
 
 
 def _from_src(crate: Path) -> list[tuple[str, str]]:
+    """Notice files at the top level of an unpacked crate, name-sorted.
+
+    Sorted by name rather than by glob pattern, so a crate carrying both a `LICENSE`
+    and a `NOTICE` yields them in one fixed order regardless of directory order.
+    """
     files = []
-    for pattern in NOTICE_GLOBS:
-        for f in sorted(crate.glob(pattern)):
-            if not f.is_file() or f.stat().st_size > MAX_NOTICE_BYTES:
-                continue
-            try:
-                files.append((f.name, f.read_text(encoding="utf-8", errors="replace")))
-            except OSError:
-                continue
+    for f in sorted(crate.iterdir(), key=lambda p: p.name):
+        if not is_notice_file(f.name):
+            continue
+        if not f.is_file() or f.stat().st_size > MAX_NOTICE_BYTES:
+            continue
+        try:
+            files.append((f.name, f.read_text(encoding="utf-8", errors="replace")))
+        except OSError:
+            continue
     return files
 
 
@@ -275,11 +299,10 @@ def _from_tarball(tar_path: Path, name: str, version: str) -> list[tuple[str, st
                 if not m.name.startswith(prefix):
                     continue
                 base = m.name[len(prefix):]
-                # Top level only, matching the `crate.glob(pattern)` scan above, so
-                # both sources see the same set of files and produce the same output.
-                if "/" in base or not any(
-                    fnmatch.fnmatch(base, pattern) for pattern in NOTICE_GLOBS
-                ):
+                # Top level only, and the same case-insensitive predicate as the
+                # unpacked scan, so both sources see the same set of files and produce
+                # the same output.
+                if "/" in base or not is_notice_file(base):
                     continue
                 fh = tf.extractfile(m)
                 if fh is None:
