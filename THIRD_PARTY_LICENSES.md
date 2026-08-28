@@ -319,6 +319,584 @@ code, and the canonical text ships with the crate:
 These impose no reproduction requirement, and are recorded so it is clear they
 were considered: `0BSD`, `CC0-1.0`, `MIT-0`, `Unlicense`.
 
+## Copyright notices
+
+Reproduced from each crate's own `LICENSE`/`COPYING`/`NOTICE` files, because the
+licence text alone does not discharge the obligation: MIT requires the copyright
+notice in all copies, BSD requires it retained, and Apache-2.0 section 4(d)
+requires the contents of a NOTICE file to be propagated.
+
+Notices recovered for 126 of 173 crates (the remainder ship no copyright line in a licence file; see their repositories, linked above).
+
+**adler2 2.0.1**
+
+- Copyright (C) Jonas Schievink <jonasschievink@gmail.com>
+
+**ahash 0.8.12**
+
+- Copyright (c) 2018 Tom Kaitchuck
+
+**aho-corasick 1.1.4**
+
+- Copyright (c) 2015 Andrew Gallant
+
+**android_system_properties 0.1.5**
+
+- Copyright 2016 Nicolas Silva
+- Copyright (c) 2013 Nicolas Silva
+
+**anstream 1.0.0**
+
+- Copyright (c) Individual contributors
+
+**anstyle 1.0.14**
+
+- Copyright (c) Individual contributors
+
+**anstyle-parse 1.0.0**
+
+- Copyright (c) Individual contributors
+
+**anstyle-query 1.1.5**
+
+- Copyright (c) Individual contributors
+
+**anstyle-wincon 3.0.11**
+
+- Copyright (c) Individual contributors
+
+**arrayref 0.3.9**
+
+- Copyright (c) 2015 David Roundy <roundyd@physics.oregonstate.edu>
+
+**arrayvec 0.7.7**
+
+- Copyright (c) Ulrik Sverdrup "bluss" 2015-2023
+
+**arrow-array 59.0.0**
+
+- Copyright (c) 2020-2022 Oliver Margetts
+
+**atoi 2.0.0**
+
+- Copyright (c) 2017
+
+**autocfg 1.5.1**
+
+- Copyright (c) 2018 Josh Stone
+
+**base64 0.22.1**
+
+- Copyright (c) 2015 Alice Maz
+
+**bitflags 2.13.0**
+
+- Copyright (c) 2014 The Rust Project Developers
+
+**blake3 1.8.5**
+
+- Copyright 2019 Jack O'Connor and Samuel Neves
+
+**block-buffer 0.10.4**
+
+- Copyright (c) 2018-2019 The RustCrypto Project Developers
+
+**bumpalo 3.20.3**
+
+- Copyright (c) 2019 Nick Fitzgerald
+
+**bytemuck 1.25.0**
+
+- Copyright (c) 2019 Daniel "Lokathor" Gee.
+
+**bytes 1.12.0**
+
+- Copyright (c) 2018 Carl Lerche
+
+**cc 1.2.65**
+
+- Copyright (c) 2014 Alex Crichton
+
+**cfg-if 1.0.4**
+
+- Copyright (c) 2014 Alex Crichton
+
+**chrono 0.4.45**
+
+- Copyright (c) 2014, Kang Seonghoon.
+
+**clap 4.6.1**
+
+- Copyright (c) Individual contributors
+
+**clap_builder 4.6.0**
+
+- Copyright (c) Individual contributors
+
+**clap_derive 4.6.1**
+
+- Copyright (c) Individual contributors
+
+**clap_lex 1.1.0**
+
+- Copyright (c) Individual contributors
+
+**colorchoice 1.0.5**
+
+- Copyright (c) Individual contributors
+
+**comfy-table 7.2.2**
+
+- Copyright (c) 2019 Arne Beer
+
+**const-random 0.1.18**
+
+- Copyright (c) 2016 Amanieu d'Antras
+
+**const-random-macro 0.1.16**
+
+- Copyright (c) 2016 Amanieu d'Antras
+
+**core-foundation-sys 0.8.7**
+
+- Copyright (c) 2012-2013 Mozilla Foundation
+
+**cpufeatures 0.2.17**
+
+- Copyright (c) 2020-2025 The RustCrypto Project Developers
+
+**cpufeatures 0.3.0**
+
+- Copyright (c) 2020-2025 The RustCrypto Project Developers
+
+**crc32fast 1.5.0**
+
+- Copyright (c) 2018 Sam Rijs, Alex Crichton and contributors
+
+**crossbeam-deque 0.8.6**
+
+- Copyright (c) 2019 The Crossbeam Project Developers
+
+**crossbeam-epoch 0.9.20**
+
+- Copyright (c) 2019 The Crossbeam Project Developers
+
+**crossbeam-utils 0.8.21**
+
+- Copyright (c) 2019 The Crossbeam Project Developers
+
+**crunchy 0.2.4**
+
+- Copyright 2017-2023 Eira Fransham.
+
+**crypto-common 0.1.7**
+
+- Copyright (c) 2021 RustCrypto Developers
+
+**csv 1.4.0**
+
+- Copyright (c) 2015 Andrew Gallant
+
+**csv-core 0.1.13**
+
+- Copyright (c) 2015 Andrew Gallant
+
+**digest 0.10.7**
+
+- Copyright (c) 2017 Artyom Pavlov
+
+**either 1.16.0**
+
+- Copyright (c) 2015
+
+**encoding_rs 0.8.35**
+
+- Copyright © WHATWG (Apple, Google, Mozilla, Microsoft).
+
+**equivalent 1.0.2**
+
+- Copyright (c) 2016--2023
+
+**find-msvc-tools 0.1.9**
+
+- Copyright (c) 2014 Alex Crichton
+
+**flate2 1.1.9**
+
+- Copyright (c) 2014-2026 Alex Crichton
+
+**futures-core 0.3.32**
+
+- Copyright (c) 2016 Alex Crichton
+- Copyright (c) 2017 The Tokio Authors
+
+**futures-task 0.3.32**
+
+- Copyright (c) 2016 Alex Crichton
+- Copyright (c) 2017 The Tokio Authors
+
+**futures-util 0.3.32**
+
+- Copyright (c) 2016 Alex Crichton
+- Copyright (c) 2017 The Tokio Authors
+
+**generic-array 0.14.7**
+
+- Copyright (c) 2015 Bartłomiej Kamiński
+
+**getrandom 0.2.17**
+
+- Copyright (c) 2018-2024 The rust-random Project Developers
+- Copyright (c) 2014 The Rust Project Developers
+
+**getrandom 0.3.4**
+
+- Copyright (c) 2018-2025 The rust-random Project Developers
+- Copyright (c) 2014 The Rust Project Developers
+
+**hashbrown 0.17.1**
+
+- Copyright (c) 2016 Amanieu d'Antras
+
+**heck 0.5.0**
+
+- Copyright (c) 2015 The Rust Project Developers
+
+**iana-time-zone 0.1.65**
+
+- Copyright 2020 Andrew Straw
+- Copyright (c) 2020 Andrew D. Straw
+
+**iana-time-zone-haiku 0.1.2**
+
+- Copyright 2020 Andrew Straw
+- Copyright (c) 2020 Andrew D. Straw
+
+**identity-hash 0.1.0**
+
+- Copyright 2018 Parity Technologies (UK) Ltd.
+- Copyright 2023 Team Offsetting
+
+**indexmap 2.14.0**
+
+- Copyright (c) 2016--2017
+
+**is_terminal_polyfill 1.70.2**
+
+- Copyright (c) Individual contributors
+
+**js-sys 0.3.103**
+
+- Copyright (c) 2014 Alex Crichton
+
+**lazy_static 1.5.0**
+
+- Copyright (c) 2010 The Rust Project Developers
+
+**lexical-core 1.0.6**
+
+- Copyright (c) 2009 The Go Authors. All rights reserved.
+- Copyright 2014, the V8 project authors. All rights reserved.
+- Copyright (c) 2013 Andreas Samoljuk
+
+**lexical-parse-float 1.0.6**
+
+- Copyright (c) 2009 The Go Authors. All rights reserved.
+- Copyright 2014, the V8 project authors. All rights reserved.
+- Copyright (c) 2013 Andreas Samoljuk
+
+**lexical-parse-integer 1.0.6**
+
+- Copyright (c) 2009 The Go Authors. All rights reserved.
+- Copyright 2014, the V8 project authors. All rights reserved.
+- Copyright (c) 2013 Andreas Samoljuk
+
+**lexical-write-float 1.0.6**
+
+- Copyright (c) 2009 The Go Authors. All rights reserved.
+- Copyright 2014, the V8 project authors. All rights reserved.
+- Copyright (c) 2013 Andreas Samoljuk
+
+**lexical-write-integer 1.0.6**
+
+- Copyright (c) 2009 The Go Authors. All rights reserved.
+- Copyright 2014, the V8 project authors. All rights reserved.
+- Copyright (c) 2013 Andreas Samoljuk
+
+**libc 0.2.186**
+
+- Copyright (c) The Rust Project Developers
+
+**libm 0.2.16**
+
+- Copyright (c) 2018 Jorge Aparicio
+- Copyright © 2005-2020 Rich Felker, et al.
+- Copyright © 1993,2004 Sun Microsystems or
+- Copyright © 2003-2011 David Schultz or
+- Copyright © 2003-2009 Steven G. Kargl or
+- Copyright © 2003-2009 Bruce D. Evans or
+- Copyright © 2008 Stephen L. Moshier or
+- Copyright © 2017-2018 Arm Limited
+
+**libmimalloc-sys 0.1.49**
+
+- Copyright 2019 Octavian Oncescu
+
+**log 0.4.33**
+
+- Copyright (c) 2014 The Rust Project Developers
+
+**matchers 0.2.0**
+
+- Copyright (c) 2019 Eliza Weisman
+
+**memchr 2.8.2**
+
+- Copyright (c) 2015 Andrew Gallant
+
+**mimalloc 0.1.52**
+
+- Copyright 2019 Octavian Oncescu
+
+**miniz_oxide 0.8.9**
+
+- Copyright 2013-2014 RAD Game Tools and Valve Software
+- Copyright 2010-2014 Rich Geldreich and Tenacious Software LLC
+- Copyright (c) 2017 Frommi
+- Copyright (c) 2017-2024 oyvindln
+- Copyright (c) 2020 Frommi
+
+**nu-ansi-term 0.50.3**
+
+- Copyright (c) 2014 Benjamin Sago
+- Copyright (c) 2021-2022 The Nushell Project Developers
+
+**num-bigint 0.4.6**
+
+- Copyright (c) 2014 The Rust Project Developers
+
+**num-complex 0.4.6**
+
+- Copyright (c) 2014 The Rust Project Developers
+
+**num-integer 0.1.46**
+
+- Copyright (c) 2014 The Rust Project Developers
+
+**num-traits 0.2.19**
+
+- Copyright (c) 2014 The Rust Project Developers
+
+**once_cell_polyfill 1.70.2**
+
+- Copyright (c) Individual contributors
+
+**outref 0.5.2**
+
+- Copyright (c) 2022 Nugine
+
+**quick-xml 0.41.0**
+
+- Copyright (c) 2016 Johann Tuffe
+
+**r-efi 5.3.0**
+
+- Copyright (C) 2017-2023 Red Hat, Inc.
+- Copyright (C) 2019-2023 Microsoft Corporation
+- Copyright (C) 2022-2023 David Rheinsberg
+
+**rayon 1.12.0**
+
+- Copyright (c) 2010 The Rust Project Developers
+
+**rayon-core 1.13.0**
+
+- Copyright (c) 2010 The Rust Project Developers
+
+**regex 1.12.4**
+
+- Copyright (c) 2014 The Rust Project Developers
+
+**regex-automata 0.4.14**
+
+- Copyright (c) 2014 The Rust Project Developers
+
+**regex-syntax 0.8.11**
+
+- Copyright (c) 2014 The Rust Project Developers
+
+**rustc_version 0.4.1**
+
+- Copyright (c) 2016 The Rust Project Developers
+
+**sha1 0.10.6**
+
+- Copyright (c) 2006-2009 Graydon Hoare
+- Copyright (c) 2009-2013 Mozilla Foundation
+- Copyright (c) 2016 Artyom Pavlov
+
+**sharded-slab 0.1.7**
+
+- Copyright (c) 2019 Eliza Weisman
+
+**shlex 2.0.1**
+
+- Copyright 2015 Nicholas Allegra (comex).
+- Copyright (c) 2015 Nicholas Allegra (comex).
+
+**simd-adler32 0.3.9**
+
+- Copyright (c) [2021] [Marvin Countryman]
+
+**slab 0.4.12**
+
+- Copyright (c) 2019 Carl Lerche
+
+**smallvec 1.15.2**
+
+- Copyright (c) 2018 The Servo Project Developers
+
+**snap 1.1.1**
+
+- Copyright 2011, The Snappy-Rust Authors. All rights reserved.
+
+**strsim 0.11.1**
+
+- Copyright (c) 2015 Danny Guo
+- Copyright (c) 2016 Titus Wormer <tituswormer@gmail.com>
+- Copyright (c) 2018 Akash Kurdekar
+
+**thread_local 1.1.9**
+
+- Copyright (c) 2016 The Rust Project Developers
+
+**tracing 0.1.44**
+
+- Copyright (c) 2019 Tokio Contributors
+
+**tracing-attributes 0.1.31**
+
+- Copyright (c) 2019 Tokio Contributors
+
+**tracing-core 0.1.36**
+
+- Copyright (c) 2019 Tokio Contributors
+
+**tracing-log 0.2.0**
+
+- Copyright (c) 2019 Tokio Contributors
+
+**tracing-subscriber 0.3.23**
+
+- Copyright (c) 2019 Tokio Contributors
+
+**twox-hash 2.1.2**
+
+- Copyright (c) 2015 Jake Goulding
+
+**typenum 1.20.1**
+
+- Copyright 2014 Paho Lurie-Gregg
+- Copyright (c) 2014 Paho Lurie-Gregg
+
+**unicode-ident 1.0.24**
+
+- Copyright © 1991-2023 Unicode, Inc.
+
+**unicode-segmentation 1.13.3**
+
+- Copyright (c) 2015 The Rust Project Developers
+
+**unicode-width 0.2.2**
+
+- Copyright (c) 2015 The Rust Project Developers
+
+**utf8parse 0.2.2**
+
+- Copyright (c) 2016 Joe Wilm
+
+**version_check 0.9.5**
+
+- Copyright (c) 2017-2018 Sergio Benitez
+
+**wasm-bindgen 0.2.126**
+
+- Copyright (c) 2014 Alex Crichton
+
+**wasm-bindgen-macro 0.2.126**
+
+- Copyright (c) 2014 Alex Crichton
+
+**wasm-bindgen-macro-support 0.2.126**
+
+- Copyright (c) 2014 Alex Crichton
+
+**wasm-bindgen-shared 0.2.126**
+
+- Copyright (c) 2014 Alex Crichton
+
+**windows-core 0.62.2**
+
+- Copyright (c) Microsoft Corporation.
+
+**windows-implement 0.60.2**
+
+- Copyright (c) Microsoft Corporation.
+
+**windows-interface 0.59.3**
+
+- Copyright (c) Microsoft Corporation.
+
+**windows-link 0.2.1**
+
+- Copyright (c) Microsoft Corporation.
+
+**windows-result 0.4.1**
+
+- Copyright (c) Microsoft Corporation.
+
+**windows-strings 0.5.1**
+
+- Copyright (c) Microsoft Corporation.
+
+**windows-sys 0.61.2**
+
+- Copyright (c) Microsoft Corporation.
+
+**zerocopy 0.8.52**
+
+- Copyright 2023 The Fuchsia Authors
+- Copyright 2019 The Fuchsia Authors.
+
+**zerocopy-derive 0.8.52**
+
+- Copyright 2023 The Fuchsia Authors
+- Copyright 2019 The Fuchsia Authors.
+
+### NOTICE files, verbatim
+
+Apache-2.0 section 4(d) requires these to travel with the distribution.
+
+#### arrow 59.0.0, and 14 more
+
+Shared by: `arrow 59.0.0`, `arrow-arith 59.0.0`, `arrow-array 59.0.0`, `arrow-buffer 59.0.0`, `arrow-cast 59.0.0`, `arrow-csv 59.0.0`, `arrow-data 59.0.0`, `arrow-ipc 59.0.0`, `arrow-json 59.0.0`, `arrow-ord 59.0.0`, `arrow-row 59.0.0`, `arrow-schema 59.0.0`, `arrow-select 59.0.0`, `arrow-string 59.0.0`, `parquet 59.0.0`.
+
+```text
+Apache Arrow
+Copyright 2016-2026 The Apache Software Foundation
+
+This product includes software developed at
+The Apache Software Foundation (http://www.apache.org/).
+
+This product includes software from the chronoutil crate (MIT)
+ * Copyright (c) 2020-2022 Oliver Margetts
+ * https://github.com/olliemath/chronoutil
+
+This product includes software from the compact-thrift project (Apache 2.0)
+ * Copyright Jörn Horstmann
+ * https://github.com/jhorstmann/compact-thrift
+```
+
 ## Python sidecars
 
 The Python workers in `scripts/` are MuMDIA's own code under `LICENSE`. Their

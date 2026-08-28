@@ -9,14 +9,30 @@ terms require the copyright notice "in all copies or substantial portions of the
 Software". Before this the tracked tree contained `LICENSE` (MuMDIA's own Apache-2.0)
 and nothing else, so a distributed binary carried no third-party notice at all.
 
-Why generated from `cargo metadata` rather than `cargo about` or
-`cargo-bundle-licenses`. Those are better tools and produce per-crate licence TEXT, but
-they are extra binaries a contributor has to install, and this project already has two
-generated references kept fresh by a CI `--check`. Every one of the crates in the
-lockfile declares an SPDX expression (verified: zero unspecified), so the licence
-inventory is exact without another tool. What this file does not do is reproduce each
-crate's individual copyright line; it points at the crate's own repository for that,
-which is where the canonical notice lives.
+What it produces, in three parts. An INVENTORY, from `cargo metadata`: every crate
+with its version, SPDX expression and repository, plus which arm of a disjunctive
+expression is relied on. The licence TEXTS for the families that are not Apache-2.0,
+which `LICENSE` already reproduces verbatim. And the actual NOTICES: per-crate
+copyright assertions and any `NOTICE` file, read from the crate's own
+`LICENSE`/`COPYING`/`NOTICE` files in the local cargo registry cache.
+
+The notices are the part that discharges the obligation, and an earlier version of
+this file did not have them. MIT requires the copyright notice "in all copies or
+substantial portions", BSD requires it retained, and Apache-2.0 section 4(d) requires
+a NOTICE file's contents to be propagated. An SPDX identifier plus a generic licence
+body satisfies none of those on its own, which is a fair reading of what this file
+used to be.
+
+Why not `cargo about` or `cargo-bundle-licenses`: they are good tools, but they are
+extra binaries a contributor has to install, and reading the registry cache gets the
+same notices with no new dependency and no network. The limitation is that coverage is
+whatever has been unpacked locally, which after a `--locked` build is every crate in
+the lockfile; the count is printed in the document, so a gap is visible rather than
+implied.
+
+This is a mechanical extraction, not a legal opinion. It reproduces what the crates
+ship. Whether that satisfies a given distribution's obligations is a question for
+whoever signs off the release.
 
 Usage:
     python ci/gen_third_party_licenses.py            # write the file
@@ -27,6 +43,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
@@ -151,7 +168,78 @@ def collect() -> list[dict]:
             "repository": p.get("repository") or "",
         })
     pkgs.sort(key=lambda p: (p["name"].lower(), p["version"]))
+    srcdirs = registry_src_dirs()
+    for p in pkgs:
+        p["copyrights"], p["notices"] = notices_for(
+            p["name"], p["version"], srcdirs
+        )
     return pkgs
+
+
+def registry_src_dirs() -> list[Path]:
+    """Cargo's unpacked crate sources, where each crate's own licence files live."""
+    home = Path(os.environ.get("CARGO_HOME") or (Path.home() / ".cargo"))
+    return sorted((home / "registry" / "src").glob("*")) if (home / "registry" / "src").exists() else []
+
+
+NOTICE_GLOBS = ("LICENSE*", "LICENCE*", "COPYING*", "NOTICE*", "AUTHORS*")
+# An actual copyright ASSERTION: "Copyright" followed by (c), the symbol, or a year.
+#
+# A looser `Copyright\b` also matches the body of the Apache-2.0 text itself -- "the
+# copyright notice that is included in or attached to the work", "a copyright license to
+# reproduce, prepare Derivative Works of" -- which turns the notice list into licence
+# prose and buries the real assertions. Case-sensitive on the leading word for the same
+# reason: prose says "copyright", a notice says "Copyright".
+COPYRIGHT = re.compile(r"^\s*(?:[#*/]+\s*)?(Copyright\s*(?:\((?:c|C)\)|©|\d{4}).*)$")
+
+
+def notices_for(name: str, version: str, srcdirs: list[Path]) -> tuple[list[str], list[str]]:
+    """(copyright lines, full NOTICE texts) taken from the crate's own files.
+
+    This is what turns the inventory into a NOTICE bundle. Reproducing licence TEXT is
+    not the whole obligation: MIT requires "the above copyright notice" in all copies,
+    BSD requires the copyright notice retained, and Apache-2.0 section 4(d) requires the
+    contents of any NOTICE file to be propagated. An SPDX identifier plus a generic
+    licence body satisfies none of those on its own.
+
+    Read from the local registry cache rather than the network, so the generator stays
+    offline and reproducible. Coverage is therefore whatever has been unpacked on this
+    machine, which is every crate in the lockfile after a build -- and the count is
+    reported in the document, so a gap is visible rather than implied.
+    """
+    copyrights: list[str] = []
+    notices: list[str] = []
+    for base in srcdirs:
+        crate = base / f"{name}-{version}"
+        if not crate.is_dir():
+            continue
+        for pattern in NOTICE_GLOBS:
+            for f in sorted(crate.glob(pattern)):
+                if not f.is_file() or f.stat().st_size > 200_000:
+                    continue
+                try:
+                    text = f.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    continue
+                if f.name.upper().startswith("NOTICE"):
+                    stripped = text.strip()
+                    if stripped:
+                        notices.append(stripped)
+                    continue
+                for line in text.splitlines():
+                    m = COPYRIGHT.match(line)
+                    if m:
+                        c = " ".join(m.group(1).split())
+                        # Skip the placeholder line inside the verbatim Apache-2.0
+                        # appendix, which is boilerplate rather than an assertion.
+                        if "[yyyy] [name of copyright owner]" in c:
+                            continue
+                        if c not in copyrights:
+                            copyrights.append(c)
+        break_outer = bool(copyrights or notices)
+        if break_outer:
+            break
+    return copyrights, notices
 
 
 def render(pkgs: list[dict]) -> str:
@@ -255,6 +343,49 @@ def render(pkgs: list[dict]) -> str:
         a("These impose no reproduction requirement, and are recorded so it is clear they")
         a("were considered: " + ", ".join(f"`{n}`" for n in present_free) + ".")
         a("")
+
+    with_cr = [p for p in pkgs if p["copyrights"]]
+    with_notice = [p for p in pkgs if p["notices"]]
+    a("## Copyright notices")
+    a("")
+    a("Reproduced from each crate's own `LICENSE`/`COPYING`/`NOTICE` files, because the")
+    a("licence text alone does not discharge the obligation: MIT requires the copyright")
+    a("notice in all copies, BSD requires it retained, and Apache-2.0 section 4(d)")
+    a("requires the contents of a NOTICE file to be propagated.")
+    a("")
+    a(f"Notices recovered for {len(with_cr)} of {len(pkgs)} crates"
+      f"{'' if len(with_cr) == len(pkgs) else ' (the remainder ship no copyright line in a licence file; see their repositories, linked above)'}.")
+    a("")
+    for p in with_cr:
+        a(f"**{p['name']} {p['version']}**")
+        a("")
+        for c in p["copyrights"]:
+            a(f"- {c}")
+        a("")
+    if with_notice:
+        a("### NOTICE files, verbatim")
+        a("")
+        a("Apache-2.0 section 4(d) requires these to travel with the distribution.")
+        a("")
+        # Identical texts once, with the crates that share them: every `arrow-*` crate
+        # ships the same NOTICE, and repeating it per crate adds length without adding
+        # notice.
+        by_text: dict[str, list[str]] = {}
+        for p in with_notice:
+            for n in p["notices"]:
+                by_text.setdefault(n, []).append(f"{p['name']} {p['version']}")
+        for text in sorted(by_text, key=lambda k: (-len(by_text[k]), k[:40])):
+            crates = by_text[text]
+            extra = f", and {len(crates) - 1} more" if len(crates) > 1 else ""
+            a(f"#### {crates[0]}{extra}")
+            a("")
+            if len(crates) > 1:
+                a("Shared by: " + ", ".join(f"`{c}`" for c in crates) + ".")
+                a("")
+            a("```text")
+            a(text)
+            a("```")
+            a("")
 
     a("## Python sidecars")
     a("")

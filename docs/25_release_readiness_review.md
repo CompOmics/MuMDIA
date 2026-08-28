@@ -46,6 +46,34 @@ artifacts byte-identical (8.3, 8.4). The real sidecar-import CI job (8.5). The
 the pushed image now being the tested image by construction (7). All twelve
 documentation claims (9).
 
+**Decided, 2026-08-28.** Two items that needed a call from the maintainer:
+
+- **`main` is protected.** Eight always-running CI checks required (fmt+clippy,
+  cargo audit, build+test on all three platforms, both smoke jobs, python
+  sidecars+configs), branches must be up to date, force pushes and deletions
+  blocked. Deliberately NOT enforced on admins and no required approvals, so a
+  single maintainer is never locked out of their own repository; the two
+  conditional jobs (`cross-platform byte equality`, which depends on the smoke
+  jobs, and the two `real sidecar imports` jobs) are not required, because a
+  skipped required check blocks a pull request indefinitely.
+- **Licensing stays Apache-2.0**, and the notice bundle now reproduces actual
+  notices rather than metadata: per-crate copyright assertions for 126 of 173
+  crates and every distinct `NOTICE` file verbatim, extracted from the crates' own
+  files in the cargo registry cache. `cargo-about` and formal legal sign-off were
+  declined as a decision, not missed. The extraction is mechanical and says so:
+  whether it satisfies a given distribution's obligations is a question for
+  whoever signs the release off.
+
+  The 47 crates without a recovered line ship no copyright assertion in a licence
+  file at all; their repositories are linked in the inventory. An earlier run
+  claimed 166 of 173, which was wrong: the pattern was matching the body of the
+  Apache-2.0 text itself ("the copyright notice that is included in or attached to
+  the work") as though it were an assertion.
+
+The remaining governance items from the same review -- default Actions token
+permissions still `write`, and Actions still permitted to approve pull requests --
+were not part of that decision and are untouched.
+
 **Deliberately still open**, and why:
 
 | finding | why not now |
