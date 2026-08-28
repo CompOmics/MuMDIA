@@ -277,9 +277,19 @@ pub fn run(p: RescoreParams) -> Result<u64> {
                             }
                             warn!("rescore: entrapment GBM sidecar failed ({e}); using native linear entrapment fallback");
                             classifier_used = "entrapment_native";
+                            // `is_decoy`, not `is_entrapment`: the negative class for
+                            // TRAINING is the in-silico decoy population, exactly as on
+                            // every other classifier path. Entrapment is the evaluation
+                            // null and must stay held out -- training on it makes the
+                            // leak estimate a measure of the fit rather than of the FDR.
+                            // Passing `is_entrapment` here also inverted the semantics of
+                            // `percolator_lite`'s positive set, which selects on
+                            // `is_decoy == false`: every entrapment row with a low
+                            // internal q was recruited as a POSITIVE training example and
+                            // counted as a target inside the loop's own q estimate.
                             model_identity = "native-percolator-lite-entrapment-v1".to_string();
                             qmode = QMode::Entrapment;
-                            native_scores(&p, &feats, &is_entrapment, &base, &prelim)
+                            native_scores(&p, &feats, &is_decoy, &base, &prelim)
                         }
                     }
                 } else {
@@ -290,7 +300,7 @@ pub fn run(p: RescoreParams) -> Result<u64> {
                     classifier_used = "entrapment_native";
                     model_identity = "native-percolator-lite-entrapment-v1".to_string();
                     qmode = QMode::Entrapment;
-                    native_scores(&p, &feats, &is_entrapment, &base, &prelim)
+                    native_scores(&p, &feats, &is_decoy, &base, &prelim)
                 }
             }
         }
@@ -701,6 +711,21 @@ fn grouped_q<K: std::hash::Hash + Eq + Clone>(
     // make the accepted set anti-conservative.
     let mut best: HashMap<K, (f64, bool, bool, bool, usize)> = HashMap::new();
     for i in 0..n {
+        // In entrapment mode the in-silico decoys are not the null, so they must not
+        // compete for the group. A target and its paired decoy SHARE `base_peptide_id`
+        // by construction (`make_shift_decoys.py`, `make_reverse_decoys.py` and the
+        // native `peptidoforms.rs` all copy it), so a decoy that outscored its target
+        // won the group -- and its tuple is `is_entrapment = false, is_real = false`, so
+        // it counted toward neither the entrapment nor the real population and the group
+        // vanished from the analysis entirely, while the real target was assigned 1.0.
+        // Both `target_peptides_at_1pct` and the entrapment leak metric are computed
+        // from this q, so the FDR-validity instrument was measured on a population that
+        // decoys had partially deleted, and the leak count was under-reported.
+        // Skipped rows keep the default 1.0 below, which is right: a decoy has no
+        // meaningful entrapment-calibrated group q.
+        if matches!(qmode, QMode::Entrapment) && is_decoy[i] {
+            continue;
+        }
         let e = best.entry(keys[i].clone()).or_insert((
             f64::NEG_INFINITY,
             is_decoy[i],
@@ -1177,5 +1202,59 @@ mod tests {
         );
         assert_eq!(q[0], 1.0, "tied target must be the losing sibling");
         assert!(q[1] < 0.05, "tied decoy should own the picked-group q");
+    }
+
+    #[test]
+    fn entrapment_group_competition_excludes_decoys() {
+        // A target and its paired decoy SHARE `base_peptide_id`, which is the grouping
+        // key. Under entrapment q, `incoming_null` is `is_entrapment`, false for both, so
+        // the group winner used to be whichever simply scored higher. When that was the
+        // decoy, its tuple counted toward neither the entrapment nor the real population
+        // -- the group vanished from the analysis -- and the real target was assigned 1.0.
+        // The leak metric and the target count are both computed from this q, so the
+        // FDR-validity instrument was measured on a decoy-thinned population.
+        //
+        // Group 7: a decoy outscoring its real target. Group 8: a real target alone.
+        let keys = vec![7u32, 7u32, 8u32];
+        let scores = vec![1.0, 9.0, 5.0];
+        let is_decoy = vec![false, true, false];
+        let is_entrapment = vec![false, false, false];
+        let is_real = vec![true, false, true];
+
+        let q = grouped_q(
+            &keys,
+            &scores,
+            &is_decoy,
+            &is_entrapment,
+            &is_real,
+            QMode::Entrapment,
+            1.0,
+        );
+        // The real target of group 7 keeps a meaningful q: the decoy did not delete it.
+        assert!(
+            q[0] < 1.0,
+            "the real target must survive the group, got q = {:?}",
+            q
+        );
+        // The decoy itself gets no entrapment-calibrated group q.
+        assert_eq!(q[1], 1.0);
+        assert!(q[2] < 1.0);
+
+        // Decoy mode is unchanged: there the decoy IS the null and must compete, and an
+        // exact tie goes to it.
+        let qd = grouped_q(
+            &keys,
+            &scores,
+            &is_decoy,
+            &is_entrapment,
+            &is_real,
+            QMode::Decoy,
+            1.0,
+        );
+        assert_eq!(
+            qd[0], 1.0,
+            "picked-TDC: the higher-scoring decoy wins group 7"
+        );
+        assert!(qd[1] <= 1.0);
     }
 }

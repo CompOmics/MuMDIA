@@ -27,6 +27,13 @@ import numpy as np
 import pyarrow.parquet as pq
 import pyarrow as pa
 
+# Both outputs are read back by the engine, so they go through the shared writer
+# rather than a bare `pq.write_table`. Under pandas 3 / pyarrow 25 the string columns
+# come out `large_string` and the engine rejects the file with
+# `column 'peptidoform' is not utf8` -- the exact failure `_lib_io` exists to prevent,
+# and which was fixed in the four library helpers while this worker was missed.
+from _lib_io import write_engine_parquet, write_engine_table
+
 
 def binned_map(x, y, nb=80):
     """Monotone binned-median calibration x -> y."""
@@ -263,7 +270,7 @@ def main():
         "rt_delta": pa.array(target_delta[accept], pa.float64()),
         "transfer_q": pa.array(q[accept], pa.float64()),
     })
-    pq.write_table(out, a.out)
+    write_engine_table(out, a.out)
     print(f"wrote {a.out} ({out.num_rows} accepted transfers)")
 
     # M5: augmented scored table. Lower the accepted transfers' PSM q-values to their
@@ -287,12 +294,12 @@ def main():
             if col in full.columns:
                 full[col] = np.minimum(full[col].to_numpy(dtype=float), tq)
         full["is_transferred"] = is_tr
-        pq.write_table(pa.Table.from_pandas(full, preserve_index=False), a.out_scored)
+        write_engine_parquet(full, a.out_scored)
         print(f"wrote {a.out_scored} (augmented scored; {int(is_tr.sum())} rows flagged transferred)")
 
 
 def pa_write_empty(path):
-    pq.write_table(pa.table({"candidate_id": pa.array([], pa.uint32())}), path)
+    write_engine_table(pa.table({"candidate_id": pa.array([], pa.uint32())}), path)
 
 
 if __name__ == "__main__":

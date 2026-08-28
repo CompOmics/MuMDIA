@@ -1479,6 +1479,23 @@ impl Config {
                 "quant.baseline_quantile must be finite and in [0, 1].".into(),
             ));
         }
+        // The entrapment estimate is
+        // `(ratio * n_entrap + 1) / max(1, n_real)`, so `ratio` scales the entire
+        // numerator. At 0 it collapses to `1/n_real`: with more than 100 real targets
+        // every row passes at 1% FDR with no null contributing at all. Negative values
+        // make q negative, and both `count_targets_at_q` and `passes_quant_filter` accept
+        // a negative q as passing. This is the failure mode of computing the ratio the
+        // wrong way round (N_entrap/N_real, a small number), which silently reports a
+        // near-zero FDR on the tool whose whole job is to validate the FDR.
+        if !self.rescore.entrapment_ratio.is_finite() || self.rescore.entrapment_ratio <= 0.0 {
+            return Err(Invalid(
+                "rescore.entrapment_ratio must be finite and > 0. It is \
+                 N_real_library / N_entrapment_library, so it is >= 1 for the usual \
+                 spike-in proportions; 0 or a negative value makes every PSM pass at any \
+                 q threshold. Check you have not inverted the ratio."
+                    .into(),
+            ));
+        }
         if self.rescore.folds < 2 {
             return Err(Invalid(
                 "rescore.folds must be >= 2 so every PSM can receive an \
@@ -1760,5 +1777,29 @@ mod tests {
 
         assert!(Config::from_json(r#"{"extract":{"min_frag_corr":-0.1}}"#).is_err());
         assert!(Config::from_json(r#"{"extract":{"min_frag_corr":1.1}}"#).is_err());
+    }
+
+    #[test]
+    fn entrapment_ratio_must_be_positive() {
+        // `(ratio * n_entrap + 1) / max(1, n_real)`: at ratio 0 this collapses to
+        // 1/n_real, so above ~100 real targets every row passes at 1% with no null
+        // contributing. A negative ratio makes q negative, which both
+        // `count_targets_at_q` and `passes_quant_filter` accept as passing. That is the
+        // failure mode of inverting the ratio, on the tool whose job is validating FDR.
+        let mut cfg = Config::default();
+        assert!(cfg.validate().is_ok(), "default must be valid");
+
+        for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            cfg.rescore.entrapment_ratio = bad;
+            let err = cfg
+                .validate()
+                .expect_err(&format!("{bad} must be rejected"));
+            assert!(
+                format!("{err}").contains("entrapment_ratio"),
+                "error should name the field: {err}"
+            );
+        }
+        cfg.rescore.entrapment_ratio = 3.5;
+        assert!(cfg.validate().is_ok());
     }
 }

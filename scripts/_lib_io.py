@@ -43,13 +43,23 @@ def narrow_type(ty: pa.DataType) -> pa.DataType:
     return ty
 
 
-def to_engine_table(df) -> pa.Table:
-    """A pandas DataFrame as an arrow Table the engine will accept."""
-    table = pa.Table.from_pandas(df, preserve_index=False)
+def narrow_table(table: pa.Table) -> pa.Table:
+    """An arrow Table cast to the 32-bit-offset encoding the engine accepts.
+
+    Separate from `to_engine_table` because not every producer starts from pandas:
+    `mbr_worker.py` builds its transfers table with `pa.array` calls directly, and a
+    string built by `pa.array` from a numpy object array is just as likely to come out
+    `large_string` as one pandas chose.
+    """
     schema = pa.schema(
         [pa.field(f.name, narrow_type(f.type), f.nullable) for f in table.schema]
     )
     return table.cast(schema) if schema != table.schema else table
+
+
+def to_engine_table(df) -> pa.Table:
+    """A pandas DataFrame as an arrow Table the engine will accept."""
+    return narrow_table(pa.Table.from_pandas(df, preserve_index=False))
 
 
 def write_engine_parquet(df, path) -> None:
@@ -59,3 +69,8 @@ def write_engine_parquet(df, path) -> None:
     read back by the engine.
     """
     pq.write_table(to_engine_table(df), str(path), compression="snappy")
+
+
+def write_engine_table(table, path) -> None:
+    """As `write_engine_parquet`, for a caller that already holds an arrow Table."""
+    pq.write_table(narrow_table(table), str(path), compression="snappy")

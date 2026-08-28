@@ -57,6 +57,17 @@ pub fn run(p: ReportParams) -> Result<(u64, u64)> {
     let pg_q = t.f64("pg_q_value")?;
     let score = t.f64("score")?;
     let n = t.nrows;
+    // Match-between-runs acceptance, when this table has been through `mumdia mbr`.
+    // MBR lowers the three PSM-level q columns and neither of the two grouped columns
+    // this stage filters on, so without this a `mumdia mbr` followed by `mumdia report`
+    // showed no transfers at all. Same contract as `quant`: a transfer has already
+    // passed `mbr.q_transfer`, and a decoy is still never reported.
+    let is_transferred: Vec<bool> = match t.bool("is_transferred") {
+        Ok(v) => v,
+        Err(_) => vec![false; n],
+    };
+    let accepted =
+        |i: usize, q: &[f64]| label[i] == "target" && (is_transferred[i] || q[i] <= p.q_threshold);
 
     let pep_quant: HashMap<(String, i32), f64> = match p.peptide_quant {
         Some(path) => {
@@ -98,7 +109,7 @@ pub fn run(p: ReportParams) -> Result<(u64, u64)> {
     )?;
     let mut npep = 0u64;
     for &i in &order {
-        if !(label[i] == "target" && pep_q[i] <= p.q_threshold) {
+        if !accepted(i, &pep_q) {
             continue;
         }
         seen_strip.insert(strip(&pform[i]));
@@ -134,7 +145,7 @@ pub fn run(p: ReportParams) -> Result<(u64, u64)> {
     writeln!(w2, "protein_group\tq_value\tquantity")?;
     let mut nprot = 0u64;
     for &i in &porder {
-        if !(label[i] == "target" && !pg[i].is_empty() && pg_q[i] <= p.q_threshold) {
+        if !accepted(i, &pg_q) || pg[i].is_empty() {
             continue;
         }
         if !pseen.insert(pg[i].clone()) {
