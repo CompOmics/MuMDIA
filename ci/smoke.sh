@@ -30,6 +30,10 @@ cfg="configs/examples/native.json"
 # writer/reader mismatch (convert moved to LargeList, spectra.rs still downcast to
 # List) passed here and failed in CI. An in-tree path that shadows the real build
 # output is worse than no path at all.
+#
+# `./mumdia` comes LAST, for the release archive, where the binary sits beside
+# `ci/` and there is no cargo and no `rust/` tree. In a source checkout it would be
+# a stray copy of unknown age, which is why it does not come first.
 find_bin() {
     if [ -n "${MUMDIA_BIN:-}" ]; then echo "$MUMDIA_BIN"; return; fi
     target=""
@@ -47,7 +51,9 @@ find_bin() {
         "${target:+$target/release/mumdia}" \
         "${target:+$target/release/mumdia.exe}" \
         rust/mumdia/target/release/mumdia \
-        rust/mumdia/target/release/mumdia.exe
+        rust/mumdia/target/release/mumdia.exe \
+        ./mumdia \
+        ./mumdia.exe
     do
         [ -n "$cand" ] && [ -x "$cand" ] && { echo "$cand"; return; }
     done
@@ -101,10 +107,29 @@ echo "=== smoke: run again for determinism"
     --out-dir "$work/out2" --config "$cfg" --threads 2 > "$work/run2.log" 2>&1 \
     || { tail -20 "$work/run2.log"; exit 1; }
 
-# 5. Assertions.
+# 5. The multi-run orchestrator. Nothing tested it: `run-experiment` has a pooled
+#    rescore, a by-source split, per-run quant and a cross-run LFQ that the
+#    single-run path never reaches, and a split that drops rows produces plausible
+#    numbers rather than an error. Two copies of the same fixture also make the
+#    per-run outputs directly comparable: identical input must give identical rows.
+echo "=== smoke: run-experiment over two runs"
+cp "$work/fixture.mzML" "$work/fixture_b.mzML"
+"$BIN" run-experiment --fasta test_data/fixture.fasta \
+    --mzml "$work/fixture.mzML" --mzml "$work/fixture_b.mzML" \
+    --run-names a --run-names b \
+    --out-dir "$work/exp" --config "$cfg" > "$work/exp.log" 2>&1 \
+    || { tail -30 "$work/exp.log"; exit 1; }
+
+# 6. Assertions.
 echo "=== smoke: assertions"
+#
+# --min-assertions is the count cited in CHANGELOG.md and docs/19_getting_started.md.
+# It said 112 in both while 117 actually ran, because nothing checked. It also
+# catches a guard block that silently stopped executing, which fails no assertion
+# and so reads as a pass.
 "$PY" ci/check_smoke.py --out-dir "$work/out" --planted "$work/planted.json" \
-    --compare-peptides "$work/out2/peptides.tsv"
+    --compare-peptides "$work/out2/peptides.tsv" --experiment "$work/exp" \
+    --min-assertions 136
 
 echo "=== smoke: also check inspect and report run standalone"
 "$BIN" inspect "$work/out/psms_scored.parquet" > /dev/null

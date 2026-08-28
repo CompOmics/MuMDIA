@@ -31,15 +31,17 @@ configurations in `configs/`, the container definition in `Dockerfile` +
 | `rust/mumdia/crates/mumdia-io/Cargo.toml` | I/O crate; adds `arrow`/`parquet`/`blake3` over `mumdia-core` |
 | `rust/mumdia/crates/mumdia/tests/pipeline.rs` | The only integration test file: extract -> features -> compete -> rescore on crafted Parquet |
 | `rust/mumdia/crates/mumdia-core/build.rs` | Stamps the git commit and build date into the crate so `manifest.json` can record them |
-| `.github/workflows/ci.yml` | Five jobs: `lint` (fmt + clippy `-D warnings`), `build-test` matrix on ubuntu/macos/windows, `smoke` (end-to-end `run` on a generated fixture, ubuntu + windows), `smoke-cross-platform` (asserts the two platforms produced byte-identical `peptides.tsv` and `proteins.tsv`), `sidecars` (compileall + JSON/YAML parse + doc-reference check); on push-to-`main` + every PR |
-| `.github/workflows/release.yml` | Dormant until a `v*` tag; builds four target binaries, smoke-tests each, and attaches archives + `.sha256` to the Release |
+| `.github/workflows/ci.yml` | Seven jobs: `lint` (fmt + clippy `-D warnings` + rustdoc), `audit` (`cargo audit`/`cargo deny`), `build-test` matrix on ubuntu/macos/windows, `smoke` (end-to-end `run` and `run-experiment` on a generated fixture, ubuntu + windows), `sidecar-imports` (a real conda env per sidecar, matrixed, plus `pip-audit`), `smoke-cross-platform` (asserts the two platforms produced byte-identical `peptides.tsv` and `proteins.tsv`), `sidecars` (compileall + JSON/YAML parse + doc-reference check + generated-document freshness); on push-to-`main`, every PR, weekly, and on demand |
+| `.github/workflows/release.yml` | Dormant until a `v*` tag; `validate-tag` gates on tag-equals-workspace-version, ancestry from `main` and a green `ci.yml` for that exact SHA, then builds four target binaries, smoke-tests each, unpacks each archive into a clean directory and runs that archive's own `ci/smoke.sh`, and attaches archives + `.sha256` to the Release. `workflow_dispatch` rehearses everything except the upload |
 | `.github/workflows/docker.yml` | Builds the image into the local daemon, smoke-tests it, then pushes to GHCR only on a `v*` tag; build-and-smoke-only on `workflow_dispatch` |
-| `.github/dependabot.yml` | Monthly grouped Cargo + GitHub Actions updates; `arrow*`/`parquet*` grouped apart because they carry the on-disk contract |
+| `.github/dependabot.yml` | Monthly grouped Cargo + GitHub Actions + Docker base-image updates; `arrow*`/`parquet*` grouped apart because they carry the on-disk contract. No `pip` entry: the Python pins live in the pip sections of the `env/` conda specifications, which Dependabot cannot parse |
 | `ci/check_doc_refs.py` | Fails when a tracked file cites a Markdown document the repository does not ship |
 | `ci/smoke.sh` | End-to-end smoke test: builds the fixture, runs `convert` and `run`, then `ci/check_smoke.py`; runnable locally as well as in CI |
 | `ci/make_fixture_mzml.py` | Generates the fixture mzML from `test_data/fixture.fasta` and the library the engine builds from it, so the planted peaks cannot disagree with the mass model |
 | `ci/check_smoke.py` | Asserts the smoke run's artifacts, manifest completeness, and schema versions |
 | `ci/gen_cli_reference.py`, `ci/gen_config_reference.py` | Generate the CLI and config reference documents from `--help` and the `config.rs` doc comments |
+| `ci/gen_third_party_licenses.py` | Generates `THIRD_PARTY_LICENSES.md` from `Cargo.lock` plus the crates' own notice files; `--check` fails when stale |
+| `ci/gen_sbom.py` | Generates `sbom.cdx.json` (CycloneDX 1.5) from `cargo metadata --locked`, components plus dependency graph; `--check` fails when stale |
 | `test_data/fixture.fasta` | The only committed input datum: a few proteins the fixture generator digests. No mzML or Parquet is committed |
 | `Dockerfile` | Two-stage image: Rust build stage + micromamba runtime with two sidecar envs |
 | `docker/config.dia.json` | Baked FASTA-digest config (MS2PIP + DeepLC + strict mokapot wired to in-image envs) |
@@ -569,12 +571,43 @@ into a bind mount as the host user, passing the host uid and gid through docker'
 `--user` flag. That last assertion exists because if it breaks the image is
 unusable for its primary purpose regardless of what the other checks say.
 
-**Dependabot.** `.github/dependabot.yml` keeps Cargo (`/rust/mumdia`) and GitHub
-Actions (`/`) current, monthly and grouped, with `arrow*`/`parquet*` in their own
-group because they carry the on-disk contract and an unreviewed bump is a
-data-format change rather than a routine upgrade. Every bump still has to pass the
-full gate, and a dependency change must commit the updated `Cargo.lock` in the
-same pull request because both CI and the Docker build use `--locked`.
+**Dependabot.** `.github/dependabot.yml` keeps Cargo (`/rust/mumdia`), GitHub
+Actions (`/`) and the Docker base images (`/`) current, monthly and grouped, with
+`arrow*`/`parquet*` in their own group because they carry the on-disk contract and
+an unreviewed bump is a data-format change rather than a routine upgrade. Every bump
+still has to pass the full gate, and a dependency change must commit the updated
+`Cargo.lock` in the same pull request because both CI and the Docker build use
+`--locked`.
+
+**The Python side has no Dependabot coverage, by construction.** The sidecar pins
+live in the `pip:` sections of the conda specifications under `env/`, and
+Dependabot's pip ecosystem reads `requirements.txt`, `pyproject.toml`, `Pipfile` or
+`poetry.lock`. A mirror requirements file added to satisfy the scanner would be a
+second list that nothing installs and that drifts from the one that does. What
+covers the gap instead is `pip-audit` in the `sidecar-imports` job, which audits the
+RESOLVED environment (so transitive packages no specification names are included).
+It is strict on the weekly scheduled run and advisory on a pull request, because an
+advisory lands independently of any pull request and a strict gate would fail
+changes that did not cause it. The same job uploads `pip freeze --all` per
+environment as a 90-day artifact, which is the only record of what a given build
+actually installed. The permanent fix is `scripts/pyproject.toml` (docs/22, WP4).
+
+**Base images are pinned by digest.** A tag is mutable, so `rust:1.96-bookworm` is
+repointed by its publisher and a rebuild of the same commit can produce a different
+image. Both `FROM` lines carry `@sha256:...` with the tag kept for readability, and
+the Dependabot `docker` entry is what stops a digest pin from quietly becoming an
+unpatched base.
+
+**Two generated inventories, for two readers.** `THIRD_PARTY_LICENSES.md` is the
+notice document: 173 crates with SPDX expressions, the licence texts, and the actual
+per-crate copyright lines and NOTICE files, which is what MIT, BSD and Apache-2.0
+section 4(d) require to travel with a distributed binary. `sbom.cdx.json` is the
+machine inventory: the same 173 components as CycloneDX 1.5 with purls and the
+dependency graph, which is what a vulnerability scanner or an institutional software
+inventory consumes. Both are generated from the same lockfile, both are checked for
+staleness in CI, and both ship in the release archive and the image. The SBOM carries
+no timestamp or serial number on purpose: either would change on every regeneration
+and defeat the staleness check.
 
 ## Key types and functions
 

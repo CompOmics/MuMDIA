@@ -242,8 +242,20 @@ jobs:
 
       - name: Do the sidecars, envs or Dockerfile change?
         id: touched
+        env:
+          EVENT: ${{ github.event_name }}
         run: |
           set -euo pipefail
+          # A scheduled or manually dispatched run ALWAYS resolves the environments.
+          # The point of the weekly run is the vulnerability sweep below, and the
+          # advisory database moves on its own; gating it on a diff meant it looked at
+          # `HEAD~1..HEAD` on main, which is almost never a sidecar change, so the
+          # sweep would have skipped nearly every week while appearing to be scheduled.
+          if [ "$EVENT" = "schedule" ] || [ "$EVENT" = "workflow_dispatch" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "$EVENT run: resolving the environments regardless of the diff"
+            exit 0
+          fi
           base="${{ github.event.pull_request.base.sha || 'HEAD~1' }}"
           if git diff --name-only "$base" HEAD \
              | grep -Eq '^(scripts/|env/|tests/python/|Dockerfile$)'; then
@@ -267,6 +279,51 @@ jobs:
         env:
           IMPORT_CHECK: ${{ matrix.import_check }}
         run: python -c "$IMPORT_CHECK"
+
+      # The Python dependency surface has no Dependabot coverage: the pins live in the
+      # pip sections of the conda specifications, which Dependabot cannot parse (see
+      # .github/dependabot.yml). This is what covers it instead, and it audits the
+      # RESOLVED environment, so transitive packages no specification names are
+      # included.
+      #
+      # Strict on the weekly schedule and on a manual dispatch; advisory on a pull
+      # request. A new advisory lands independently of any pull request, so a strict
+      # gate here fails changes that did not cause it, which is how teams end up
+      # deleting the scanner. The weekly run is where a new advisory has to be dealt
+      # with, and it fails loudly.
+      - name: Audit the resolved environment for known vulnerabilities
+        if: steps.touched.outputs.run == 'true'
+        shell: micromamba-shell {0}
+        continue-on-error: ${{ github.event_name == 'pull_request' }}
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet pip-audit
+          # --strict fails on a package pip-audit cannot resolve, rather than passing
+          # over it in silence, which would make a clean report meaningless.
+          pip-audit --strict --progress-spinner off
+
+      # The exact package set the audit above ran against. The specifications pin the
+      # tools that matter (mokapot, ms2pip, deeplc, torch) and leave the scientific
+      # stack to the resolver, so this is the only record of what a given build
+      # actually installed. Retained per build rather than committed: a lockfile that
+      # nothing installs from drifts from the specification that does.
+      - name: Record the resolved package set
+        if: steps.touched.outputs.run == 'true'
+        shell: micromamba-shell {0}
+        run: |
+          set -euo pipefail
+          mkdir -p resolved
+          python -m pip freeze --all > "resolved/pip-freeze-${{ matrix.env_name }}.txt"
+          micromamba list -n "${{ matrix.env_name }}" \
+            > "resolved/conda-list-${{ matrix.env_name }}.txt" || true
+          wc -l resolved/*
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: steps.touched.outputs.run == 'true'
+        with:
+          name: resolved-env-${{ matrix.env_name }}
+          path: resolved/
+          retention-days: 90
 
       - name: Worker contract tests, in a real environment
         if: steps.touched.outputs.run == 'true'
@@ -373,6 +430,14 @@ jobs:
       # land with the regenerated notice file.
       - name: Third-party licences are current
         run: python ci/gen_third_party_licenses.py --check
+
+      # THIRD_PARTY_LICENSES.md is a notice document for a human reader. The SBOM
+      # answers the machine question: given a published binary, which exact versions
+      # are inside it and how are they connected. That is what a vulnerability
+      # scanner and an institutional software inventory consume, and prose cannot be
+      # queried. Generated from the same lockfile, so both move together.
+      - name: The SBOM is current
+        run: python ci/gen_sbom.py --check
 
       # Source comments cite the document that specifies each behavior. Several of
       # those documents are local-only design notes, so a public clone used to hold

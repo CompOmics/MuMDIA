@@ -74,6 +74,65 @@ The remaining governance items from the same review -- default Actions token
 permissions still `write`, and Actions still permitted to approve pull requests --
 were not part of that decision and are untouched.
 
+**Second review, 2026-08-28 (external).** A second agent audited the tree at
+`345a7b9` and raised thirteen findings. Four it called blockers; all four are
+closed, and two of them were real defects in this review's own output:
+
+- **A fabricated line in a generated document.** `docs/24_config_reference.md`
+  stated that the engine sets `MUMDIA_PYTHON_RESCORE=/definitely/not/an/interpreter`,
+  which is a value from one of my own tests. `ci/gen_config_reference.py` scanned
+  the Rust sources for environment-variable reads without skipping `#[cfg(test)]`,
+  and the freshness check could not catch it because it compares the generator to
+  its own output. The scanner now blanks `#[cfg(test)]` blocks, preserving line
+  numbers so cited positions stay correct.
+- **Wrong git provenance in every manifest.** `mumdia-core/build.rs` guessed at
+  `../../../.git/HEAD` and emitted no `rerun-if-changed`, so a stale commit was
+  baked into the binary: an AIF manifest recorded `c13a623a8d33-dirty` while HEAD
+  was `9fc1c06`, and one recorded sha was not a valid object at all. It now asks
+  git (`rev-parse --absolute-git-dir`) and registers the real trigger files.
+  Verified across a commit.
+- **The release archive could not be verified from itself.** `docs/19` tells the
+  reader to run `ci/smoke.sh`, and the archive shipped neither `ci/` nor
+  `test_data/`. Rather than weaken the documentation, the archive now carries the
+  three scripts the smoke test needs plus `test_data/fixture.fasta`, `ci/smoke.sh`
+  discovers a binary sitting beside it, and `release.yml` unpacks each archive it
+  builds into a clean directory and runs that archive's own smoke test on all four
+  targets. That also gives macOS its first end-to-end coverage. Verified locally by
+  staging the layout and running it with no `MUMDIA_BIN`: 136 assertions, output
+  hashes identical to the repository run.
+- **A `v*` tag could publish anything.** A tag push does not trigger `ci.yml`, so
+  the only checks behind a release were `--version`, `--help` and `doctor`. The new
+  `validate-tag` job, which every build job depends on, requires the tag to equal
+  the workspace version, the commit to be an ancestor of `main`, and a successful
+  `ci.yml` run for that exact SHA.
+
+Of the nine remaining findings, the substantive ones are closed too:
+
+- **`run-experiment` had no test and a silent data-loss path.** `split_by_source`
+  returned `Ok` while dropping any PSM whose `source` index had no output table, so
+  every per-run quantity and the cross-run LFQ were computed from a smaller
+  population with nothing logged. It now counts and refuses. Three unit tests cover
+  the partition, the refusal, and the legitimate empty-run case; `ci/smoke.sh` runs
+  `run-experiment` over two copies of the fixture and asserts nineteen things about
+  the result, including that the split accounts for every pooled row.
+- **The experiment manifest recorded no artifacts.** It listed output paths and
+  nothing else, so an experiment result had no content hash, no row count and no
+  schema version anywhere. It now records one artifact per output it writes, with
+  the new `lfq_maxlfq` schema identity for the cross-run table.
+- **Supply chain, the remainder.** Both Docker base images are pinned by digest
+  with a Dependabot `docker` entry to keep them current; `pip-audit` audits both
+  resolved sidecar environments (strict weekly, advisory on pull requests) and the
+  resolved package set is uploaded per build; and `ci/gen_sbom.py` generates
+  `sbom.cdx.json`, a CycloneDX 1.5 inventory of all 173 components plus the
+  dependency graph, checked for staleness in CI and shipped in both the archive and
+  the image. No `pip` Dependabot entry: the pins live in conda specifications
+  Dependabot cannot parse, and a mirror requirements file would be a second list
+  that nothing installs. `docs/14` records the reasoning.
+- **The documented assertion count was wrong** (112 claimed, 117 actual). Fixed,
+  and `--min-assertions` now fails the smoke run if fewer assertions execute than
+  the documented count, which also catches a guard block that silently stops
+  running.
+
 **Deliberately still open**, and why:
 
 | finding | why not now |
@@ -82,7 +141,7 @@ were not part of that decision and are untouched.
 | incremental manifest (6.2) | a crash still discards the provenance of completed stages. Real, but it is a design change to the manifest's write points, not a guard. |
 | `--work-dir` on standalone stages (6.4) | the fixed handoff FILENAMES were the corruption risk and are now PID-qualified. A configurable directory is convenience. |
 | transparent rescore batching (6.7) | sub-batching changes which PSMs share a pooled `q_value`, so it is an operator decision. The size is now logged and boundable, which turns an OS kill into an error at startup. |
-| `convert`, `align`, `run`, `run_experiment`, `sidecar` unit tests (8.2) | the coverage inversion is real and unaddressed. The end-to-end test is the only cover for these. |
+| `convert`, `align`, `sidecar` unit tests (8.2) | the coverage inversion is real and unaddressed for these three. `run` and `run_experiment` are now covered end to end by `ci/smoke.sh`, and `run_experiment`'s by-source split has unit tests. |
 | `bench/README.md` and four `docs/19` `file:line` citations (9) | needs re-deriving each number against its arm, which is measurement work rather than editing. |
 | the 9.5 GB of stale `sidecar_work/` in the repository root (6.4) | untracked scratch on the developer's disk; deleting it is the owner's call, not this branch's. |
 | FDR calibration at scale, entrapment validity as a result, interference, quantification bias | needs real data and entrapment arms. Note the ordering: section 3 had to land first, or those measurements meant nothing. |

@@ -22,6 +22,16 @@ found three release blockers and about thirty further defects. All three blocker
 and most of the rest are fixed; that document's status section records what is
 deliberately still open. The entries below fold into the sections that follow.
 
+**Second audit (2026-08-28, external).** A second review of the same tree raised
+four further blockers, two of which were defects in the first audit's own output: a
+generated document quoting a value from a test as though the engine set it
+(`ci/gen_config_reference.py` did not skip `#[cfg(test)]`), and a `build.rs` that
+guessed at the git directory and stamped a stale commit into every manifest. Both
+fixed, the second verified across a commit. The other two were release mechanics and
+are covered under Added below: a release archive that could not run the verification
+its own documentation prescribes, and a `v*` tag that could publish any commit with
+no CI behind it.
+
 **Two changes require re-measurement rather than only review.**
 
 - Three defaults changed on correctness grounds, not from a count:
@@ -56,6 +66,46 @@ sed -i 's/"min_frag_corr"/"gate_min_score"/; s/"group_by": *"precursor"/"group_b
 
 ### Added
 
+- The release archive verifies itself. It now carries `ci/smoke.sh`, its two helper
+  scripts and `test_data/fixture.fasta`, and `release.yml` unpacks every archive it
+  builds into a clean directory and runs that archive's own smoke test, on all four
+  targets. `docs/19` told the reader to run exactly this while the archive shipped
+  neither `ci/` nor `test_data/`; testing the artifact rather than the tree it came
+  from is also the only check that can catch a packaging mistake, and it gives macOS
+  its first end-to-end coverage.
+- `validate-tag`, a release job every build depends on: the tag must equal the
+  workspace version, the tagged commit must be an ancestor of `main`, and `ci.yml`
+  must have a successful run for that exact SHA. A tag push does not trigger
+  `ci.yml`, so the only checks behind a release were previously `--version`,
+  `--help` and `doctor`.
+- `run-experiment` coverage: `ci/smoke.sh` now runs the multi-run orchestrator over
+  two copies of the fixture and asserts the pooled rescore, the by-source split, the
+  per-run quantification and the cross-run LFQ. The multi-run path had no test of
+  any kind, and its split had a silent data-loss case (see Fixed).
+- The experiment manifest records one artifact per output it writes, each with a
+  content hash, row count and schema version. It previously listed output paths and
+  nothing else, so two experiment results could not be compared. New artifact
+  identity `lfq_maxlfq` for the cross-run table.
+- `sbom.cdx.json`: a CycloneDX 1.5 software bill of materials generated from
+  `cargo metadata --locked` by `ci/gen_sbom.py`, covering all 173 components with
+  purls and the full dependency graph. Shipped in the release archive and at
+  `/opt/mumdia/sbom.cdx.json` in the image, and checked for staleness in CI.
+  `THIRD_PARTY_LICENSES.md` is a notice document for a human reader; this is the
+  machine inventory a vulnerability scanner or a software inventory consumes.
+- `pip-audit` over both resolved sidecar environments, strict on the weekly
+  scheduled run and advisory on pull requests, plus `pip freeze --all` uploaded per
+  environment as a 90-day artifact. This is what covers the Python dependency
+  surface, which has no Dependabot support: the pins live in the `pip:` sections of
+  the `env/` conda specifications, which Dependabot cannot parse, and a mirror
+  requirements file would be a second list that nothing installs. Reasoning in
+  `docs/14`.
+- Docker base images pinned by digest, with a Dependabot `docker` entry to keep the
+  pins current. A tag is mutable, so a rebuild of the same commit could previously
+  produce a different image.
+- `--min-assertions` on `ci/check_smoke.py`: the smoke run fails if fewer assertions
+  execute than the count quoted in the documentation. The documented count was 112
+  while 117 ran, and a guard block that stops executing fails no assertion, so it
+  reads as a pass.
 - `quant.fragment_selection = predicted` ranks a precursor's fragments for the
   top-N sum by their library intensity instead of by their own integrated area.
   Ranking by observed area preferentially selects interfered fragments, because
@@ -101,9 +151,13 @@ sed -i 's/"min_frag_corr"/"gate_min_score"/; s/"group_by": *"precursor"/"group_b
 - End-to-end smoke test, run in CI on Linux and Windows: `ci/smoke.sh` builds a
   synthetic library from `test_data/fixture.fasta`, generates a matching mzML from
   the engine's own library so the planted peaks cannot disagree with the mass
-  model, runs the pipeline twice and asserts 112 things. It covers mzML parsing,
-  the library build, the `run` orchestrator and its manifest, retention-time
-  calibration and the report writers, none of which had any test.
+  model, runs the single-run pipeline twice, runs `run-experiment` over two copies
+  of the fixture, and asserts 136 things. It covers mzML parsing, the library
+  build, the `run` orchestrator and its manifest, retention-time calibration, the
+  report writers, and the multi-run path (pooled rescore, by-source split, per-run
+  quant, cross-run LFQ), none of which had any test. `--min-assertions` fails the
+  run if fewer assertions execute than the count quoted here, so a guard block
+  that stops running cannot pass silently.
 - A further CI job asserts the two platforms produced byte-identical
   `peptides.tsv` and `proteins.tsv`. The native pipeline turns out to be
   byte-reproducible across operating systems, not only across runs.
@@ -171,6 +225,12 @@ produces bit-identical results.
 
 ### Fixed
 
+- `run-experiment` dropped PSMs silently when splitting the pooled scored table by
+  run. `split_by_source` filtered on `source == i` for each output table and returned
+  `Ok` regardless, so any row whose `source` had no output table went nowhere: every
+  per-run quantity and the cross-run LFQ were then computed from a smaller population
+  with no error and no warning. It now counts the rows it placed and refuses if that
+  is not all of them.
 - The library helpers write parquet the engine can read on any pandas.
   `DataFrame.to_parquet` chooses the arrow string width itself, and pandas 3
   writes `large_string`, which the engine rejects at load with

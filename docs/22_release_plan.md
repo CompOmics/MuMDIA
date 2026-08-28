@@ -289,9 +289,13 @@ green and completes the fixture run on the three OSes and in Docker.
       `strip = "symbols"`. `readme` omitted, since nothing is published to
       crates.io.
 - [x] Release archive layout: binary, `scripts/`, `env/`, `docs/`, `README.md`,
-      `LICENSE`, `CHANGELOG.md`, `configs/` when present, plus sha256 checksums
-      and a per-target binary smoke test. `aarch64-unknown-linux-gnu` not added;
-      `x86_64-apple-darwin` was.
+      `LICENSE`, `CHANGELOG.md`, `THIRD_PARTY_LICENSES.md`, `configs/` when
+      present, plus `ci/smoke.sh` with its two helpers and
+      `test_data/fixture.fasta`, sha256 checksums, and a per-target binary smoke
+      test. `aarch64-unknown-linux-gnu` not added; `x86_64-apple-darwin` was.
+      The fixture and its runner were documented in `docs/19` as the way to
+      verify an installation while being excluded from the archive, so the
+      documented procedure could not be followed from the archive; they now ship.
 - [ ] Python sidecars: `scripts/pyproject.toml` for a `mumdia-sidecars`
       package with extras `rescore`, `deeplc`, `ms2pip`, `mbr`, `helpers`;
       pinned lower bounds; console entry points for the helpers. Pin the conda
@@ -306,7 +310,11 @@ green and completes the fixture run on the three OSes and in Docker.
 
 Acceptance: downloading the release archive on a clean machine, creating the
 conda env from the shipped spec, and running `mumdia doctor` then the fixture
-succeeds without editing any path.
+succeeds without editing any path. The archive half of this is now enforced
+rather than checked by hand: `release.yml` unpacks each archive it builds into a
+clean directory and runs that archive's own `ci/smoke.sh`, on all four targets.
+That also gives macOS its first end-to-end coverage, which the repository CI
+does not provide.
 
 ### WP5. User documentation (4 to 6 days)
 
@@ -449,8 +457,15 @@ script; `docs/20` promotion gates satisfied and recorded.
       `Cargo.toml` and `pyproject.toml`.
 - [ ] Tag `v0.1.0`; confirm `release.yml` produces the three archives and
       `docker.yml` pushes `ghcr.io/compomics/mumdia:v0.1.0`.
-- [ ] Download each archive on a clean machine or CI runner, run `doctor` and
-      the fixture. Pull the image and do the same.
+- [x] Download each archive on a clean machine or CI runner, run `doctor` and
+      the fixture: done in `release.yml` itself, from the unpacked archive, on
+      every target, so a packaging regression fails the release rather than
+      reaching a user. Pull the image and do the same: still manual.
+- [x] Tag hygiene, enforced by the `validate-tag` job every build depends on:
+      the tag must equal the workspace version, the commit must be an ancestor
+      of `main`, and `ci.yml` must have a successful run for that exact SHA. A
+      tag push does not trigger `ci.yml`, so without this a release rested on
+      `--version`, `--help` and `doctor` alone.
 - [ ] Publish the GitHub release with notes: what is supported, what is
       experimental, known limitations (mzML only, no ion mobility, DIA-NN
       library needs a DIA-NN licence), benchmark table with q units.

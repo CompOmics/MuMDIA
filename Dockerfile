@@ -22,7 +22,17 @@
 # fine-tuning plus the torch rescorer.
 
 # ---------- Stage 1: build the Rust binary ----------
-FROM rust:1.96-bookworm AS build
+#
+# Both base images are pinned by DIGEST, with the tag kept in the reference for
+# readability. A tag is mutable: `rust:1.96-bookworm` and
+# `mambaorg/micromamba:1.5.10-bookworm-slim` are repointed by their publishers, so
+# a tag-only build is not reproducible and a rebuild of the same commit can produce
+# a different image. Digests are what `--locked` is to Cargo.lock.
+#
+# Dependabot's `docker` ecosystem (.github/dependabot.yml) proposes digest updates,
+# so pinning does not mean going stale silently.
+# Resolved 2026-08-28 from registry-1.docker.io.
+FROM rust:1.96-bookworm@sha256:a339861ae23e9abb272cea45dfafde21760d2ce6577a70f8a926153677902663 AS build
 # Override any (gitignored, machine-specific) .cargo/config.toml target dir.
 ENV CARGO_TARGET_DIR=/build
 WORKDIR /src
@@ -30,7 +40,7 @@ COPY rust/mumdia ./
 RUN cargo build --release --locked --bin mumdia
 
 # ---------- Stage 2: runtime with the sidecar conda envs ----------
-FROM mambaorg/micromamba:1.5.10-bookworm-slim
+FROM mambaorg/micromamba:1.5.10-bookworm-slim@sha256:e3797091302382ea841498bc93a7b0a50f7c1448333d5e946d2d1608d0c5f43d
 USER root
 ENV MAMBA_ROOT_PREFIX=/opt/conda
 
@@ -59,7 +69,7 @@ COPY scripts /opt/mumdia/scripts
 COPY docker/config.dia.json /opt/mumdia/config.dia.json
 COPY docker/config.diann-lib.json /opt/mumdia/config.diann-lib.json
 # Notices for the statically linked crates, as in the release archive.
-COPY LICENSE THIRD_PARTY_LICENSES.md /opt/mumdia/
+COPY LICENSE THIRD_PARTY_LICENSES.md sbom.cdx.json /opt/mumdia/
 
 # mokapot logistic-regression is the recommended default rescorer.
 ENV MUMDIA_RESCORE_MODEL=logreg

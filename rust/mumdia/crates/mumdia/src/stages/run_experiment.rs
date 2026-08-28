@@ -21,6 +21,7 @@ use arrow::array::{Array, BooleanArray, UInt32Array};
 use arrow::compute::filter_record_batch;
 use mumdia_core::config::{Config, FinetuneScope, QuantQColumn};
 use mumdia_core::manifest::Manifest;
+use mumdia_core::schema::artifact;
 use rayon::prelude::*;
 use serde_json::json;
 use tracing::{info, warn};
@@ -261,6 +262,7 @@ fn split_by_source(scored: &str, out_paths: &[String]) -> Result<()> {
         .schema
         .index_of("source")
         .map_err(|_| anyhow::anyhow!("scored table has no `source` column for split"))?;
+    let mut written = 0usize;
     for (i, out) in out_paths.iter().enumerate() {
         let mut filtered = Vec::with_capacity(t.batches.len());
         for b in &t.batches {
@@ -270,9 +272,27 @@ fn split_by_source(scored: &str, out_paths: &[String]) -> Result<()> {
                 .downcast_ref::<UInt32Array>()
                 .ok_or_else(|| anyhow::anyhow!("`source` column is not u32"))?;
             let mask: BooleanArray = (0..src.len()).map(|k| src.value(k) == i as u32).collect();
-            filtered.push(filter_record_batch(b, &mask)?);
+            let f = filter_record_batch(b, &mask)?;
+            written += f.num_rows();
+            filtered.push(f);
         }
         mumdia_io::table::write_batches(out, t.schema.clone(), &filtered)?;
+    }
+    // The split is a partition, so it must account for every input row. Nothing
+    // enforced that: a `source` value outside `0..out_paths.len()` -- which a
+    // hand-assembled or externally rescored table can carry, and which the MBR
+    // worker could reintroduce -- dropped those PSMs into no output at all. Every
+    // downstream number is then computed from a silently smaller population, with
+    // no error and no warning. A count is the whole check.
+    let total: usize = t.batches.iter().map(|b| b.num_rows()).sum();
+    if written != total {
+        anyhow::bail!(
+            "splitting {scored} by `source` placed {written} of {total} rows into \
+             {} per-run tables; the rest carry a source index outside 0..{}, so they \
+             would be dropped from every per-run quantity",
+            out_paths.len(),
+            out_paths.len()
+        );
     }
     Ok(())
 }
@@ -580,22 +600,25 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
     }
     qcfg.q_filter = QuantQColumn::PsmQ;
     let mut peptide_quants: Vec<String> = Vec::with_capacity(n_runs);
+    let mut protein_quants: Vec<String> = Vec::with_capacity(n_runs);
     for i in 0..n_runs {
         let pq = d(&format!("{}/peptide_quant.parquet", names[i]));
+        let gq = d(&format!("{}/protein_group_quant.parquet", names[i]));
         quant::run(quant::QuantParams {
             psms_scored: &split_paths[i],
             chromatograms: &chroms[i],
             out_peptide: &pq,
-            out_protein: &d(&format!("{}/protein_group_quant.parquet", names[i])),
+            out_protein: &gq,
             out_fragment: None,
             out_peak_bounds: None,
             cfg: &qcfg,
             config_hash: &ch,
         })?;
         peptide_quants.push(pq);
+        protein_quants.push(gq);
     }
     let lfq = d("lfq_maxlfq.parquet");
-    quant::run_lfq_combine(
+    let n_lfq = quant::run_lfq_combine(
         &peptide_quants,
         false,
         mumdia_core::config::NormalizeMethod::MedianRatio,
@@ -613,11 +636,16 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         "lfq": lfq,
         "peptide_quants": peptide_quants,
     });
-    // Provenance parity with the single-run manifest. The experiment manifest is
-    // still thinner: it carries no per-artifact records, because the per-run
-    // chains do not thread a shared manifest. What it must not lack is the
-    // identity of the code and the inputs, which is what makes a result
-    // attributable at all.
+    // Provenance parity with the single-run manifest: the identity of the code, of
+    // the inputs, and of every artifact this stage produced.
+    //
+    // The per-artifact records were the gap. The experiment manifest listed output
+    // PATHS in its `experiment` block and nothing else, so an experiment result had
+    // no content hash, no row count and no schema version anywhere -- exactly the
+    // three things the single-run manifest exists to provide, and the three things
+    // needed to tell whether two experiment outputs are the same data. Files written
+    // by the per-run chains are not covered here (those chains do not thread a shared
+    // manifest); what is covered is everything `run-experiment` itself writes.
     let mut prov = Manifest::new(cfg.canonical_json(), ch.clone());
     for (i, m) in p.mzmls.iter().enumerate() {
         if let (Ok(bytes), Ok(hash)) = (
@@ -640,12 +668,69 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
             prov.record_input(role, path, bytes, hash);
         }
     }
+    // Recorded in a fixed order, and every record hashes its file. `Manifest`
+    // stores them in a BTreeMap, so the serialised order is by logical name and
+    // does not depend on this sequence.
+    let mut artifacts: Vec<(String, (&str, u32), String, &str)> = vec![(
+        "scored_combined".to_string(),
+        artifact::PSMS_SCORED,
+        scored_combined.clone(),
+        "rescore",
+    )];
+    // Only when MBR actually produced a different table; otherwise
+    // `scored_for_quant` IS `scored_combined` and recording it twice would claim two
+    // artifacts where one file exists.
+    if scored_for_quant != scored_combined {
+        artifacts.push((
+            "scored_for_quant".to_string(),
+            artifact::PSMS_SCORED,
+            scored_for_quant.clone(),
+            "mbr",
+        ));
+    }
+    for (i, name) in names.iter().enumerate() {
+        artifacts.push((
+            format!("scored[{name}]"),
+            artifact::PSMS_SCORED,
+            split_paths[i].clone(),
+            "split-by-source",
+        ));
+        artifacts.push((
+            format!("peptide_quant[{name}]"),
+            artifact::PEPTIDE_QUANT,
+            peptide_quants[i].clone(),
+            "quant",
+        ));
+        artifacts.push((
+            format!("protein_group_quant[{name}]"),
+            artifact::PROTEIN_GROUP_QUANT,
+            protein_quants[i].clone(),
+            "quant",
+        ));
+    }
+    for (logical, schema, path, stage) in artifacts {
+        let rows = mumdia_io::table::nrows(&path)
+            .with_context(|| format!("counting rows of {path} for the experiment manifest"))?;
+        prov.record(mumdia_io::record_artifact(
+            &logical, schema, &path, rows, stage, &ch,
+        )?);
+    }
+    prov.record(mumdia_io::record_artifact(
+        artifact::LFQ_MAXLFQ.0,
+        artifact::LFQ_MAXLFQ,
+        &lfq,
+        n_lfq,
+        "quant-lfq",
+        &ch,
+    )?);
+
     let manifest = serde_json::json!({
         "mumdia_version": prov.mumdia_version,
         "git_sha": prov.git_sha,
         "commit_date": prov.commit_date,
         "cli_args": prov.cli_args,
         "inputs": prov.inputs,
+        "artifacts": prov.artifacts,
         "experiment": manifest,
     });
     mumdia_io::json::write_json(&d("experiment_manifest.json"), &manifest)?;
@@ -654,4 +739,84 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         n_runs, "run-experiment: complete"
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mumdia_io::table::{write_table, Col, Table};
+
+    fn tmp(name: &str) -> String {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static CTR: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!("mumdia_runexp_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let n = CTR.fetch_add(1, Ordering::Relaxed);
+        dir.join(format!("{n}_{name}"))
+            .to_str()
+            .unwrap()
+            .to_string()
+    }
+
+    fn scored_with_sources(sources: Vec<u32>) -> String {
+        let n = sources.len();
+        let path = tmp("scored.parquet");
+        write_table(
+            &path,
+            vec![
+                Col::U32("source".into(), sources),
+                Col::U32("candidate_id".into(), (0..n as u32).collect()),
+                Col::F64("q_value".into(), vec![0.001; n]),
+            ],
+        )
+        .unwrap();
+        path
+    }
+
+    #[test]
+    fn split_by_source_partitions_every_row() {
+        let scored = scored_with_sources(vec![0, 1, 0, 2, 1, 0]);
+        let outs: Vec<String> = (0..3).map(|i| tmp(&format!("run{i}.parquet"))).collect();
+        split_by_source(&scored, &outs).unwrap();
+        let counts: Vec<usize> = outs.iter().map(|o| Table::read(o).unwrap().nrows).collect();
+        assert_eq!(counts, vec![3, 2, 1]);
+        // Each output must hold only its own run, or a per-run quantity is computed
+        // from another run's PSMs.
+        for (i, o) in outs.iter().enumerate() {
+            let t = Table::read(o).unwrap();
+            let idx = t.schema.index_of("source").unwrap();
+            for b in &t.batches {
+                let src = b
+                    .column(idx)
+                    .as_any()
+                    .downcast_ref::<UInt32Array>()
+                    .unwrap();
+                for k in 0..src.len() {
+                    assert_eq!(src.value(k), i as u32);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_source_index_with_no_output_table_is_an_error_not_a_silent_drop() {
+        // Source 2 with only two runs: the old code wrote two tables holding five of
+        // the six rows and returned Ok, so every per-run quantity and the cross-run
+        // LFQ were computed from a population one row short, with nothing logged.
+        let scored = scored_with_sources(vec![0, 1, 0, 2, 1, 0]);
+        let outs: Vec<String> = (0..2).map(|i| tmp(&format!("run{i}.parquet"))).collect();
+        let err = split_by_source(&scored, &outs).unwrap_err().to_string();
+        assert!(err.contains("5 of 6 rows"), "{err}");
+    }
+
+    #[test]
+    fn a_run_that_identified_nothing_yields_an_empty_table_not_an_error() {
+        // Legitimate and must stay legitimate: run 1 contributed no PSMs. The
+        // downstream quant reads an empty table; it must not read run 0's rows.
+        let scored = scored_with_sources(vec![0, 0]);
+        let outs: Vec<String> = (0..2).map(|i| tmp(&format!("run{i}.parquet"))).collect();
+        split_by_source(&scored, &outs).unwrap();
+        assert_eq!(Table::read(&outs[0]).unwrap().nrows, 2);
+        assert_eq!(Table::read(&outs[1]).unwrap().nrows, 0);
+    }
 }

@@ -51,6 +51,10 @@ EXPECTED_SCHEMA_VERSIONS = {
     "psms_scored": 4,
     "peptide_quant": 2,
     "protein_group_quant": 2,
+    # Written only by `run-experiment` / `quant-lfq`, so it never appears in a
+    # single-run manifest. Listed because this dict is the frozen record of
+    # schema.rs, and the loop below only checks the schemas it actually sees.
+    "lfq_maxlfq": 1,
 }
 
 BLAKE3_HEX = re.compile(r"^[0-9a-f]{64}$")
@@ -97,6 +101,12 @@ def main() -> int:
                     help="minimum fraction of planted stripped peptides in peptides.tsv")
     ap.add_argument("--max-decoy-fraction", type=float, default=0.02,
                     help="maximum decoy fraction among accepted PSMs at 1 percent")
+    ap.add_argument("--experiment", default=None,
+                    help="run-experiment output directory to assert as well")
+    ap.add_argument("--min-assertions", type=int, default=0,
+                    help="fail if fewer than N assertions ran; keeps the count cited "
+                         "in CHANGELOG.md and docs/19 from silently rotting, and "
+                         "catches a guard block that stopped executing at all")
     a = ap.parse_args()
 
     out = Path(a.out_dir)
@@ -339,11 +349,94 @@ def main() -> int:
             c.ok(False, "both runs wrote a manifest.json to compare",
                  f"mine={mine.exists()} other={other.exists()}")
 
+    # --------------------------------------------------------------- experiment
+    if a.experiment:
+        print()
+        print("run-experiment")
+        exp = Path(a.experiment)
+        em = exp / "experiment_manifest.json"
+        c.ok(em.is_file(), "the experiment wrote experiment_manifest.json")
+        if em.is_file():
+            m = json.loads(em.read_text(encoding="utf-8"))
+            c.ok(bool(m.get("git_sha")), "the experiment manifest records a git sha",
+                 str(m.get("git_sha")))
+            c.ok(len(m.get("inputs", {})) >= 2,
+                 "it records an input per mzML plus the fasta", str(len(m.get("inputs", {}))))
+            arts = m.get("artifacts", {})
+            # This was the gap: the manifest listed output PATHS and nothing else, so
+            # two experiment results could not be compared at all.
+            c.ok(len(arts) >= 8,
+                 "it records one artifact entry per output it wrote", str(len(arts)))
+            bad_hash = [k for k, v in arts.items() if not v.get("content_hash")]
+            c.ok(not bad_hash, "every artifact record carries a content hash",
+                 ", ".join(bad_hash))
+            bad_rows = [k for k, v in arts.items() if int(v.get("rows", 0)) <= 0]
+            c.ok(not bad_rows, "every artifact record carries a positive row count",
+                 ", ".join(bad_rows))
+            bad_schema = [k for k, v in arts.items()
+                          if EXPECTED_SCHEMA_VERSIONS.get(v.get("schema_name"))
+                          not in (None, v.get("schema_version"))]
+            c.ok(not bad_schema, "every artifact record names a frozen schema version",
+                 ", ".join(bad_schema))
+            c.ok("lfq_maxlfq" in arts, "the cross-run LFQ table is recorded",
+                 ", ".join(sorted(arts)[:4]))
+
+        combined = exp / "scored_combined.parquet"
+        c.ok(combined.is_file(), "the pooled rescore wrote scored_combined.parquet")
+        per_run = [exp / r / "scored.parquet" for r in ("a", "b")]
+        c.ok(all(p.is_file() for p in per_run),
+             "the split wrote one scored table per run",
+             ", ".join(str(p.exists()) for p in per_run))
+        if combined.is_file() and all(p.is_file() for p in per_run):
+            n_comb = pq.read_metadata(combined).num_rows
+            n_split = [pq.read_metadata(p).num_rows for p in per_run]
+            # A partition. `split_by_source` used to return Ok while dropping any row
+            # whose `source` had no output table, and every per-run quantity was then
+            # computed from a silently smaller population.
+            c.ok(sum(n_split) == n_comb,
+                 "the by-run split accounts for every pooled row",
+                 f"{sum(n_split)} split vs {n_comb} pooled")
+            # The two runs are byte-identical copies of one mzML, so a difference
+            # between them is order dependence or state leaking across runs.
+            c.ok(n_split[0] == n_split[1],
+                 "identical input files give the two runs the same row count",
+                 f"{n_split[0]} vs {n_split[1]}")
+            src = pq.read_table(per_run[1], columns=["source"]).column(0).to_pylist()
+            c.ok(all(s == 1 for s in src),
+                 "run b's table contains only run b's PSMs",
+                 f"{len(set(src))} distinct source values")
+
+        for r in ("a", "b"):
+            for name in ("peptide_quant.parquet", "protein_group_quant.parquet"):
+                p = exp / r / name
+                c.ok(p.is_file() and pq.read_metadata(p).num_rows > 0,
+                     f"run {r} wrote a non-empty {name}",
+                     str(p.exists()))
+        lfq = exp / "lfq_maxlfq.parquet"
+        c.ok(lfq.is_file() and pq.read_metadata(lfq).num_rows > 0,
+             "the cross-run LFQ table is non-empty",
+             str(pq.read_metadata(lfq).num_rows) if lfq.is_file() else "missing")
+        # run-experiment deliberately never calls the report stage. Asserting the
+        # absence keeps a documented behaviour documented: per-run counts have to come
+        # from the split tables or from `mumdia report` invoked by hand.
+        c.ok(not (exp / "peptides.tsv").exists(),
+             "run-experiment writes no peptides.tsv, as documented")
+
     print()
     if c.failures:
         print(f"smoke check FAILED: {len(c.failures)} of {c.passed + len(c.failures)} assertions")
         for f in c.failures:
             print(f"  - {f}")
+        return 1
+    # A block of assertions can stop running without any of them failing: an early
+    # `return`, a loop over an empty list, a file that is no longer written. The
+    # output then reads as a pass. The floor is the only thing that notices.
+    if a.min_assertions and c.passed < a.min_assertions:
+        print(f"smoke check FAILED: {c.passed} assertions ran, at least "
+              f"{a.min_assertions} expected.")
+        print("  Either a guard block stopped executing, or coverage genuinely")
+        print("  changed -- in which case update --min-assertions in ci/smoke.sh")
+        print("  and the counts in CHANGELOG.md and docs/19_getting_started.md.")
         return 1
     print(f"smoke check OK: {c.passed} assertions passed")
     return 0

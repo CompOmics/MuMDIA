@@ -30,6 +30,27 @@ updates:
           - minor
           - patch
 
+  # Base images, so the digest pins in the Dockerfile stay current instead of
+  # freezing the image on a base that stops receiving security updates. Pinning
+  # without an update path is how a reproducible image becomes an unpatched one.
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 2
+
+  # No `pip` entry, deliberately. The Python dependency surface lives in the pip
+  # sections of the conda specifications under `env/`, which Dependabot does not
+  # parse: its pip ecosystem reads requirements.txt, pyproject.toml, Pipfile or
+  # poetry.lock. Adding a mirror requirements file to satisfy the scanner would
+  # create a second list that nothing installs and that drifts from the one that
+  # does, which is worse than no entry.
+  #
+  # What covers the gap meanwhile: the `sidecar-imports` CI job resolves both
+  # environments for real and runs `pip-audit` over them, so a known
+  # vulnerability in a sidecar dependency fails a build. The permanent fix is
+  # `scripts/pyproject.toml` (docs/22, WP4), after which a `pip` entry pointing
+  # at /scripts belongs here.
   - package-ecosystem: github-actions
     directory: /
     schedule:

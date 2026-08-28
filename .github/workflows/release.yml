@@ -35,8 +35,73 @@ permissions:
   contents: write
 
 jobs:
+  # A `v*` tag could publish any commit, from any branch, with no CI behind it. The
+  # workflow's own checks were `--version`, `--help` and `doctor`, and a tag push does
+  # not trigger `ci.yml` at all, which only covers pull requests and pushes to `main`.
+  #
+  # This job is the gate. Every build job depends on it, so a tag that fails any check
+  # below publishes nothing. Skipped for a rehearsal, which has no tag to validate.
+  validate-tag:
+    name: validate the tag
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          # Full history, so reachability from `main` can actually be tested.
+          fetch-depth: 0
+
+      - name: The tag must match the workspace version
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          tag="${REF_NAME#v}"
+          crate=$(grep -m1 '^version' rust/mumdia/Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
+          echo "tag=$tag workspace=$crate"
+          if [ "$tag" != "$crate" ]; then
+            echo "::error::tag v$tag does not match the workspace version $crate."
+            echo "Bump rust/mumdia/Cargo.toml or retag; a release whose archive reports a"
+            echo "different version than its tag is not traceable."
+            exit 1
+          fi
+
+      - name: The tagged commit must be reachable from main
+        run: |
+          set -euo pipefail
+          git fetch -q origin main
+          if ! git merge-base --is-ancestor HEAD origin/main; then
+            echo "::error::the tagged commit is not an ancestor of origin/main."
+            echo "Releases come from main, which is protected and requires CI; tagging a"
+            echo "side branch bypasses both."
+            exit 1
+          fi
+          echo "reachable from main: yes"
+
+      - name: CI must have passed for this exact commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          sha=$(git rev-parse HEAD)
+          # The CI workflow's conclusion for this SHA, not for the branch tip. A tag
+          # push does not run ci.yml, so without this the only evidence a release
+          # rests on is that someone believed it was fine.
+          runs=$(gh api "repos/${{ github.repository }}/actions/workflows/ci.yml/runs?head_sha=$sha&per_page=20" \
+                 --jq '[.workflow_runs[] | select(.conclusion != null) | .conclusion] | join(",")')
+          echo "ci.yml conclusions for $sha: ${runs:-<none>}"
+          case ",$runs," in
+            *",success,"*) echo "CI passed for this commit" ;;
+            *) echo "::error::no successful ci.yml run for $sha."
+               echo "Push the commit to a PR, let CI pass, merge to main, then tag."
+               exit 1 ;;
+          esac
   release:
     name: ${{ matrix.target }}
+    needs: [validate-tag]
+    # `always()` plus an explicit failure test: `validate-tag` is SKIPPED on a
+    # rehearsal, and a skipped dependency would otherwise skip this job too.
+    if: always() && needs.validate-tag.result != 'failure'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -107,8 +172,12 @@ jobs:
           # THIRD_PARTY_LICENSES.md is not optional: the binary is statically
           # linked, so it contains 173 third-party crates whose Apache-2.0 and MIT
           # terms require their notices to travel with it.
+          # sbom.cdx.json travels with the binary for the same reason, one reader
+          # further along: a scanner or a software inventory needs the exact
+          # component versions inside the artifact it has, not inside the
+          # repository it does not have.
           cp "$root/README.md" "$root/LICENSE" "$root/CHANGELOG.md" \
-             "$root/THIRD_PARTY_LICENSES.md" "$stage/"
+             "$root/THIRD_PARTY_LICENSES.md" "$root/sbom.cdx.json" "$stage/"
           cp -r "$root/docs" "$stage/docs"
           # The release plan and the pre-release audit are working documents about
           # getting to this release: they state which gates were failing, what was
@@ -122,6 +191,16 @@ jobs:
           cp -r "$root/env" "$stage/env"
           # Example configurations, if the tag carries them.
           if [ -d "$root/configs" ]; then cp -r "$root/configs" "$stage/configs"; fi
+          # The verification procedure the packaged docs/19 tells users to run. It was
+          # documented and not shipped: `ci/` and `test_data/` were excluded, so the
+          # archive's own getting-started guide could not be followed from the archive.
+          # Only the three scripts the smoke test needs; the `gen_*` generators and the
+          # documentation-reference checker are development tooling that needs the
+          # repository and would be meaningless here.
+          mkdir -p "$stage/ci" "$stage/test_data"
+          cp "$root/ci/smoke.sh" "$root/ci/check_smoke.py" \
+             "$root/ci/make_fixture_mzml.py" "$stage/ci/"
+          cp "$root/test_data/fixture.fasta" "$stage/test_data/"
           cd dist
           if [ -n "${{ matrix.exe }}" ]; then
             7z a "$name.zip" "$name" >/dev/null
@@ -145,6 +224,41 @@ jobs:
       # Only a real tag creates a GitHub Release. Without this gate a rehearsal would
       # try to publish a release for a branch ref, which is both wrong and the kind of
       # thing that is only discovered by doing it.
+      # Test the ARTIFACT, not the tree it came from. The definition of done in
+      # docs/22 asks for exactly this, and it is the only step that can catch a
+      # packaging mistake: a missing script, a config that did not travel, a binary
+      # that runs from a cargo target directory but not from a clean unpack.
+      #
+      # Every matrix target runs on a host that executes its own binary natively, so
+      # this covers all four -- including macOS, which the repository smoke test does
+      # not reach.
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+
+      - name: Verify the unpacked archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet pyarrow
+          unpacked="$RUNNER_TEMP/unpacked"
+          rm -rf "$unpacked"; mkdir -p "$unpacked"
+          cd dist
+          archive=$(ls *.tar.gz *.zip 2>/dev/null | head -1)
+          echo "verifying $archive"
+          case "$archive" in
+            *.tar.gz) tar xzf "$archive" -C "$unpacked" ;;
+            *.zip)    7z x -o"$unpacked" "$archive" > /dev/null ;;
+          esac
+          root=$(ls -d "$unpacked"/*/ | head -1)
+          cd "$root"
+          echo "--- the archive must be self-sufficient from here ---"
+          ls
+          # MUMDIA_BIN is set explicitly for determinism, but `ci/smoke.sh` also
+          # discovers `./mumdia` in an unpacked archive on its own, which is what a
+          # user following docs/19 relies on.
+          MUMDIA_BIN="$PWD/mumdia${{ matrix.exe }}" bash ci/smoke.sh "$RUNNER_TEMP/smoke"
+
       - name: Upload to release
         if: startsWith(github.ref, 'refs/tags/v')
         # Pinned to a commit, not the mutable `v2` tag. This is the only

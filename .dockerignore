@@ -36,3 +36,4 @@ scripts/_probe*.py
 !docker
 !LICENSE
 !THIRD_PARTY_LICENSES.md
+!sbom.cdx.json
