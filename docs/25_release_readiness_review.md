@@ -11,7 +11,54 @@ its frequency on real data is not, that is stated. Severity: **BLOCKER** means d
 not tag; **MAJOR** means fix before tagging or record as a known limitation;
 **MINOR** and **NIT** can follow the release.
 
-## Verdict
+## Status, 2026-08-28 (later the same day)
+
+Everything below was found at `d1f3f3e`. The findings have since been worked
+through; this section records what changed, so the report can be read as a record
+of the audit rather than a to-do list. Section numbers refer to the sections below.
+
+**All four blockers are closed.** One finiteness pass at library load, with the
+NaN-permeable guards fixed behind it (section 1); interpreter and script-directory
+resolution moved into `load_config`, so every entry point behaves alike, and an
+unused `"auto"` role is cleared rather than left as a literal (2, 5.1);
+`cargo update -p mzdata -p crossbeam-epoch` clearing all three advisories, with
+`cargo audit` now a required CI job (7.1, 7.2); and the two disclosure lines
+rewritten (`4f999a0`).
+
+**Also closed.** The apex fallback, by promoting `apex_evidence_rank` (2). All
+three entrapment defects, so the FDR-validity instrument can be trusted again (3).
+All seven quantification findings, including the pooled-table refusal and the
+inert fixed window (4). Every interface decision, as hard renames with no aliases
+(5.2-5.5). Every robustness finding except the two named below (6). The mass and
+constants reference test, verified to catch a substituted proton mass (8.1). The
+apex-source assertion and whole-tree determinism comparison, which found all 18
+artifacts byte-identical (8.3, 8.4). The real sidecar-import CI job (8.5). The
+`THIRD_PARTY_LICENSES.md` bundle, `forbid(unsafe_code)`, all 23 actions SHA-pinned,
+`build-essential` purged from the runtime image, the `.dockerignore` allowlist, and
+the pushed image now being the tested image by construction (7). All twelve
+documentation claims (9).
+
+**Deliberately still open**, and why:
+
+| finding | why not now |
+|---|---|
+| signal handling (6.2) | needs a `ctrlc` dependency. Atomic writes make cancellation leave at most an inert `.tmp-<pid>` file rather than rubble under the canonical name, which was the substantive harm; a handler only tidies up. |
+| incremental manifest (6.2) | a crash still discards the provenance of completed stages. Real, but it is a design change to the manifest's write points, not a guard. |
+| `--work-dir` on standalone stages (6.4) | the fixed handoff FILENAMES were the corruption risk and are now PID-qualified. A configurable directory is convenience. |
+| transparent rescore batching (6.7) | sub-batching changes which PSMs share a pooled `q_value`, so it is an operator decision. The size is now logged and boundable, which turns an OS kill into an error at startup. |
+| `convert`, `align`, `run`, `run_experiment`, `sidecar` unit tests (8.2) | the coverage inversion is real and unaddressed. The end-to-end test is the only cover for these. |
+| `bench/README.md` and four `docs/19` `file:line` citations (9) | needs re-deriving each number against its arm, which is measurement work rather than editing. |
+| the 9.5 GB of stale `sidecar_work/` in the repository root (6.4) | untracked scratch on the developer's disk; deleting it is the owner's call, not this branch's. |
+| FDR calibration at scale, entrapment validity as a result, interference, quantification bias | needs real data and entrapment arms. Note the ordering: section 3 had to land first, or those measurements meant nothing. |
+
+Two things worth flagging that this work introduced rather than fixed. Three
+defaults changed (`apex_evidence_rank`, `gate_min_score`, `emit_pin`) and the
+NnTorch CV-fold key changed, so **`nn_torch` counts and every entrapment number
+need re-measuring**. And the CLI and two config keys were renamed with no
+compatibility aliases, so an old invocation or config fails loudly; local configs
+need two edits, given in the rename commit.
+
+## Verdict at the time of the audit
 
 **Do not tag `v0.1.0` yet.** The engine's core is in better shape than its
 perimeter: zero `unsafe` in any workspace crate, byte-reproducible output across

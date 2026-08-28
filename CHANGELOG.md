@@ -15,6 +15,42 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ## [Unreleased]
 
+### Pre-release audit (2026-08-28)
+
+A six-way audit of the tree ([`docs/25_release_readiness_review.md`](docs/25_release_readiness_review.md))
+found three release blockers and about thirty further defects. All three blockers
+and most of the rest are fixed; that document's status section records what is
+deliberately still open. The entries below fold into the sections that follow.
+
+**Two changes require re-measurement rather than only review.**
+
+- Three defaults changed on correctness grounds, not from a count:
+  `extract.apex_evidence_rank` to `true` (the legacy apex silently selected the
+  lowest-RT qualifying scan when none of the top-K predicted fragments was
+  observed anywhere), `extract.gate_min_score` to `0.6` (0.2 is the `nn_torch`
+  optimum, while the default rescorer is `native_tda`), and `features.emit_pin` to
+  `false` (no stage reads the file; it is a ~5.4 GB write per run).
+- The `nn_torch` CV fold is keyed on `base_peptide_id` supplied by the engine
+  rather than on a hash of the peptidoform, so a target and its paired decoy now
+  share a fold as `percolator_lite` always did and as `docs/11` always claimed.
+
+Both move `nn_torch` counts, and the entrapment fixes below invalidate any
+entrapment measurement previously taken through the native rescorer.
+
+**Breaking: interface renames with no compatibility aliases.** A tag freezes
+these, so they are free now and a major bump later. CLI:
+`--library-precursors`/`--library-fragments` to `--lib-`, `--out-chrom` to
+`--out-chromatograms`, `--scored` to `--psms-scored`, `--out-scored` to
+`--out-psms-scored`, `--psms` to `--psms-extracted`, and `--seed`/`--seeds` to
+`--seed-psms`. Config: `extract.min_frag_corr` to `extract.gate_min_score` (it is
+not a correlation under any `gate_mode`), and `compete.group_by = "precursor"` to
+`"base_peptide"` (it keys on the stripped sequence). An old name now fails with
+the offending key and the valid alternatives listed. Local configs need:
+
+```bash
+sed -i 's/"min_frag_corr"/"gate_min_score"/; s/"group_by": *"precursor"/"group_by": "base_peptide"/' config.*.json
+```
+
 ### Added
 
 - `quant.fragment_selection = predicted` ranks a precursor's fragments for the
