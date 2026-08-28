@@ -53,7 +53,17 @@ fn confident_rts(path: &str, q_train: f64) -> Result<HashMap<u32, f64>> {
 
 pub fn run(p: AlignParams) -> Result<u64> {
     let t0 = Instant::now();
-    assert!(!p.seeds.is_empty(), "align needs at least one run");
+    if p.seeds.is_empty() {
+        anyhow::bail!("align needs at least one --seed-psms table");
+    }
+    // Same contract as prescan: every seed table is read before the alignment is
+    // written, so writing over one of them would destroy it silently.
+    let seed_inputs: Vec<(&str, &str)> = p
+        .seeds
+        .iter()
+        .map(|s| ("--seed-psms", s.as_str()))
+        .collect();
+    mumdia_io::refuse_output_over_input(p.out, &seed_inputs)?;
     let ref_rts = confident_rts(&p.seeds[0], p.q_train)?;
     let ref_rt_values: Vec<f64> = ref_rts.values().cloned().collect();
     let (grid_lo, grid_hi) = (
@@ -77,11 +87,23 @@ pub fn run(p: AlignParams) -> Result<u64> {
         // shared peptides with the reference
         let mut xs = Vec::new(); // this run RT
         let mut ys = Vec::new(); // reference RT
-        for (base, rt) in &this {
-            if let Some(rref) = ref_rts.get(base) {
-                xs.push(*rt);
-                ys.push(*rref);
-            }
+                                 // Sorted by the grouping key before the fit. Observed RTs tie EXACTLY for
+                                 // peptides in the same MS2 scan, and tied x values keep their input order
+                                 // through the LOESS k-nearest window, so HashMap iteration order could admit a
+                                 // different pair at the window boundary and move the fitted curve. This was the
+                                 // one place in the workspace violating the ordering convention in docs/14;
+                                 // `rt_im_train.rs:55-64` already solves the same problem the same way, with an
+                                 // order-invariance test. `alignment.parquet` is written and read by no stage
+                                 // today, so the blast radius is nil and becomes real the moment align is wired
+                                 // into MBR.
+        let mut shared: Vec<(&_, f64, f64)> = this
+            .iter()
+            .filter_map(|(base, rt)| ref_rts.get(base).map(|rref| (base, *rt, *rref)))
+            .collect();
+        shared.sort_by(|a, b| a.0.cmp(b.0));
+        for (_, rt, rref) in shared {
+            xs.push(rt);
+            ys.push(rref);
         }
         let (lo, hi) = if run_id == 0 {
             (grid_lo, grid_hi)

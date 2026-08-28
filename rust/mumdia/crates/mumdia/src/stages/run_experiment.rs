@@ -16,7 +16,7 @@
 
 use std::time::Instant;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use arrow::array::{Array, BooleanArray, UInt32Array};
 use arrow::compute::filter_record_batch;
 use mumdia_core::config::{Config, FinetuneScope, QuantQColumn};
@@ -91,8 +91,14 @@ fn preflight(p: &RunExperimentParams) -> Result<()> {
         if let Some(exe) = path {
             if !std::path::Path::new(exe).exists() {
                 anyhow::bail!(
-                    "{field} points at an interpreter that does not exist: {exe}
-                     (config written for another machine? run `mumdia doctor --config <cfg>`                      to probe every configured sidecar environment before a long batch)"
+                    concat!(
+                        "{} points at an interpreter that does not exist: {}. A config ",
+                        "written for another machine is the usual cause; run ",
+                        "`mumdia doctor --config <cfg>` to probe every configured sidecar ",
+                        "environment before starting a long batch."
+                    ),
+                    field,
+                    exe
                 );
             }
         }
@@ -290,9 +296,46 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
     std::fs::create_dir_all(p.out_dir).ok();
     let d = |name: &str| format!("{}/{}", p.out_dir, name);
     let n_runs = p.mzmls.len();
+    // Reject a bad --run-names rather than silently substituting r0..rN-1.
+    //
+    // The old `_ =>` arm swallowed any count mismatch with no warning, and accepted
+    // duplicates outright. Duplicates are the dangerous half: two runs then share
+    // `d(&names[i])`, so above one parallel run two `process_run` calls concurrently
+    // write the same spectra_ms2 / seed_psms / psms_extracted / chromatograms into one
+    // directory, and the split and quant paths collide too. The output is an interleaving
+    // of two runs with no error anywhere. Reachable by naming runs after their basenames
+    // when an experiment spans two directories holding same-named files.
     let names: Vec<String> = match p.run_names {
-        Some(ns) if ns.len() == n_runs => ns.to_vec(),
-        _ => (0..n_runs).map(|i| format!("r{i}")).collect(),
+        Some(ns) => {
+            if ns.len() != n_runs {
+                anyhow::bail!(
+                    "--run-names has {} entries but there are {n_runs} runs; pass one name \
+                     per --mzml, in the same order, or omit it to get r0..r{}",
+                    ns.len(),
+                    n_runs - 1
+                );
+            }
+            let mut sorted = ns.to_vec();
+            sorted.sort();
+            sorted.dedup();
+            if sorted.len() != ns.len() {
+                anyhow::bail!(
+                    "--run-names must be unique: each name is a per-run output \
+                     subdirectory, so a repeat makes two runs write the same artifacts \
+                     into one directory and interleave their results with no error"
+                );
+            }
+            if let Some(bad) = ns.iter().find(|n| {
+                n.is_empty() || n.contains('/') || n.contains('\\') || *n == "." || *n == ".."
+            }) {
+                anyhow::bail!(
+                    "--run-names entry {bad:?} is not usable as a directory name; each \
+                     becomes a subdirectory of --out-dir"
+                );
+            }
+            ns.to_vec()
+        }
+        None => (0..n_runs).map(|i| format!("r{i}")).collect(),
     };
 
     // --- shared library (imported or digested once) ---
@@ -459,6 +502,19 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
             crate::sidecar::resolve_script(&cfg.predict_frag.sidecar_script_dir, "mbr_worker.py");
         let transferred = d("mbr_transferred.parquet");
         let scored_mbr = d("scored_mbr.parquet");
+        // Remove any stale copy BEFORE the worker runs, so that the `exists()` check
+        // afterwards is a statement about THIS run. The worker writes this file only when
+        // it accepts at least one transfer, so without the removal a rerun into the same
+        // --out-dir that accepted transfers last time and none this time would silently
+        // feed the previous experiment's scored table to the split and to every per-run
+        // quant. It joins cleanly, because candidate_id and source are stable across
+        // reruns of the same library, so the failure is plausible numbers from the wrong
+        // data, logged as "MBR transfers applied".
+        if std::path::Path::new(&scored_mbr).exists() {
+            std::fs::remove_file(&scored_mbr).with_context(|| {
+                format!("removing a previous run's {scored_mbr} before running MBR")
+            })?;
+        }
         // The competed tables carry candidate_id + apex_rt in `source` order.
         crate::sidecar::run_mbr(
             python,
@@ -477,6 +533,15 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         // The worker writes the augmented scored table only when it accepts at
         // least one transfer; with none, fall back to the un-augmented combined
         // table so quantification still runs.
+        //
+        // `exists()` is only a signal because the stale file was removed before the
+        // worker ran (see above). Without that, it could not tell "this run wrote it"
+        // from "a previous run left it": rerunning the same --out-dir with different
+        // mzMLs or a tighter mbr.q_transfer, and finding no transfers this time, made
+        // the split and every per-run quant consume the OLD scored table. It joins
+        // successfully, because candidate_id and source are stable across reruns of the
+        // same library, so the result was plausible quantities from the wrong data while
+        // the log said "MBR transfers applied".
         if std::path::Path::new(&scored_mbr).exists() {
             info!("run-experiment: MBR transfers applied");
             scored_mbr

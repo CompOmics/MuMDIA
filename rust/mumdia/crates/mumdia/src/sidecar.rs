@@ -49,8 +49,15 @@ pub fn run_ms2pip(
     model: &str,
 ) -> Result<FragmentIntensityMap> {
     std::fs::create_dir_all(workdir).ok();
-    let inp = format!("{workdir}/ms2pip_in.parquet");
-    let outp = format!("{workdir}/ms2pip_out.parquet");
+    // Per-invocation names. Fixed ones made two concurrent runs clobber each other, and
+    // silently rather than loudly: the readback key is a row index into each process's own
+    // request, so two runs over tables of the SAME row count -- which is the most likely
+    // reason to run two at once -- swapped each other's results instead of erroring.
+    // `align_sidecar_scores` catches a coverage mismatch, not an equal-length swap. The
+    // PIN/NN path was already PID-qualified for exactly this reason; these three were not.
+    let pid = std::process::id();
+    let inp = format!("{workdir}/ms2pip_in_{pid}.parquet");
+    let outp = format!("{workdir}/ms2pip_out_{pid}.parquet");
     write_table(
         &inp,
         vec![
@@ -86,8 +93,10 @@ pub fn run_deeplc(
     peptidoforms: &[String],
 ) -> Result<HashMap<u32, f32>> {
     std::fs::create_dir_all(workdir).ok();
-    let inp = format!("{workdir}/deeplc_in.parquet");
-    let outp = format!("{workdir}/deeplc_out.parquet");
+    // Per-invocation names; see the note in the MS2PIP helper above.
+    let pid = std::process::id();
+    let inp = format!("{workdir}/deeplc_in_{pid}.parquet");
+    let outp = format!("{workdir}/deeplc_out_{pid}.parquet");
     write_table(
         &inp,
         vec![

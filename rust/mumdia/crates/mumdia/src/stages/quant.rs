@@ -804,7 +804,14 @@ pub fn run(p: QuantParams) -> Result<(u64, u64)> {
             (c, (lo_rt, hi_rt, integration_apex), a)
         })
         .collect();
-    for ((c, w, computed), rows) in integrated.into_iter().zip(cand_rows.values()) {
+    for ((c, w, computed), (key, rows)) in integrated.into_iter().zip(cand_rows.iter()) {
+        // The pairing is positional. It holds because both sides derive from the same
+        // `BTreeMap` and rayon's `collect` into a `Vec` preserves order, but the comment
+        // that justified it named the wrong reason (`BTreeMap::par_iter()` is not an
+        // `IndexedParallelIterator`; the order survives incidentally). If it ever
+        // diverged, one candidate's areas would attach to another's fragment rows with no
+        // error at all, so assert the invariant instead of arguing it.
+        debug_assert_eq!(c, *key, "quant: integrated order diverged from cand_rows");
         let (lo_rt, hi_rt, _) = w;
         applied_win.insert(c, w);
         if emit_bounds && lo_rt.is_finite() && hi_rt.is_finite() {

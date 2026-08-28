@@ -1286,6 +1286,12 @@ pub struct RescoreConfig {
     /// number of semi-supervised iterations for the native rescorer.
     pub num_iter: usize,
     pub python: Option<String>,
+    /// Path to an external `percolator` executable.
+    ///
+    /// Parsed and never read: no stage launches percolator, and `RescorerKind` has no
+    /// variant that would. It is the only silently inert config field in the tree, since
+    /// the three MBR ones warn (see `validate`). Kept rather than deleted because the
+    /// external-percolator path is still intended; `validate` now warns when it is set.
     pub percolator_bin: Option<String>,
     /// Protein-accession substring marking spike-in (entrapment) negatives, e.g.
     /// "_HUMAN". Required when `classifier = entrapment`; PSMs whose protein
@@ -1607,6 +1613,19 @@ impl Config {
                      setting them has no effect on this run"
                 );
             }
+        }
+        // The fourth inert field, and the only one that used to warn about nothing. Under
+        // `deny_unknown_fields` a user reasonably reads an accepted key as an honoured
+        // one, so silence here means a run that looks configured for external percolator
+        // and is not.
+        if self.rescore.percolator_bin.is_some() {
+            tracing::warn!(
+                "rescore.percolator_bin is parsed but no stage launches percolator, so \
+                 setting it has no effect. Use rescore.classifier = mokapot or nn_torch \
+                 for an external classifier."
+            );
+        }
+        {
             // Only `strategy == None` vs `!= None` is ever tested, so the non-None variants
             // are indistinguishable in behaviour.
             if self.mbr.strategy != MbrStrategy::None {

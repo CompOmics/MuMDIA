@@ -795,8 +795,10 @@ fn run_entrapment_gbm(
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("classifier=entrapment GBM requires rescore.python"))?;
     std::fs::create_dir_all(p.work_dir).ok();
-    let inp = format!("{}/entrapment_in.parquet", p.work_dir);
-    let outp = format!("{}/entrapment_out.parquet", p.work_dir);
+    // Per-invocation names; see the note in `sidecar::run_ms2pip`.
+    let pid = std::process::id();
+    let inp = format!("{}/entrapment_in_{pid}.parquet", p.work_dir);
+    let outp = format!("{}/entrapment_out_{pid}.parquet", p.work_dir);
 
     let mut cols = vec![
         // Unique per-row id for score readback: candidate_id repeats across
