@@ -97,14 +97,19 @@ closed, and two of them were real defects in this review's own output:
   three scripts the smoke test needs plus `test_data/fixture.fasta`, `ci/smoke.sh`
   discovers a binary sitting beside it, and `release.yml` unpacks each archive it
   builds into a clean directory and runs that archive's own smoke test on all four
-  targets. That also gives macOS its first end-to-end coverage. Verified locally by
-  staging the layout and running it with no `MUMDIA_BIN`: 136 assertions, output
-  hashes identical to the repository run.
+  targets. That also gives macOS its first end-to-end coverage. Verified twice: locally
+  by staging the layout and running it with no `MUMDIA_BIN` (136 assertions, output
+  hashes identical to the repository run), and then in a release rehearsal, where the
+  linux-musl, windows-msvc and aarch64-darwin archives each unpacked and passed their
+  own 136 assertions on their own runner.
 - **A `v*` tag could publish anything.** A tag push does not trigger `ci.yml`, so
   the only checks behind a release were `--version`, `--help` and `doctor`. The new
   `validate-tag` job, which every build job depends on, requires the tag to equal
   the workspace version, the commit to be an ancestor of `main`, and a successful
-  `ci.yml` run for that exact SHA.
+  `ci.yml` run for that exact SHA. The last check was tested against this
+  repository's own history in both directions: a green commit passes, and `457b93c`,
+  which failed CI, is refused. The job also needs `actions: read`, which the
+  workflow's single `contents: write` did not grant; permissions are now per job.
 
 Of the nine remaining findings, the substantive ones are closed too:
 
@@ -128,6 +133,16 @@ Of the nine remaining findings, the substantive ones are closed too:
   the image. No `pip` Dependabot entry: the pins live in conda specifications
   Dependabot cannot parse, and a mirror requirements file would be a second list
   that nothing installs. `docs/14` records the reasoning.
+- **Two generated files depended on the machine that generated them**, which the
+  staleness gates turned into a permanently red CI job. `THIRD_PARTY_LICENSES.md`
+  listed 126 crates with a recovered notice on Windows and 119 on Linux, because
+  `Path.glob("LICENSE*")` is case-insensitive only on Windows and the seven
+  `windows-*` crates ship `license-mit` in lower case; it also recovered nothing at
+  all in a job that never compiles, because notices were read only from cargo's
+  unpacked tree. `sbom.cdx.json` carried mojibake, because `subprocess(text=True)`
+  decodes with the locale codepage rather than UTF-8. All three fixed, and both
+  `--check` paths now print a bounded diff: the first two were invisible while the
+  gate said only "stale", which is how a gate gets deleted rather than fixed.
 - **The documented assertion count was wrong** (112 claimed, 117 actual). Fixed,
   and `--min-assertions` now fails the smoke run if fewer assertions execute than
   the documented count, which also catches a guard block that silently stops
