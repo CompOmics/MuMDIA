@@ -512,7 +512,7 @@ declutter" commit: `extract.scan_window_mode` (and the `ScanWindowMode` enum),
 | `presence_min_matched` | 3 | Tier-b: minimum distinct matched fragments (`extract.rs:1727`) |
 | `presence_min_fragments` | 3 | Acceptance: minimum distinct fragments (`extract.rs:1926`) |
 | `presence_min_coelution` | 2 | Min simultaneously-present fragments to extend a run (`extract.rs:1915`) |
-| `gate_min_score` | **0.6** | Pearson/gate threshold; 0 disables the gate. 0.6 is the documented optimum for the default `native_tda` rescorer; the 0.2 that suits `nn_torch` is set explicitly by the shipped example configs. Renamed from `min_frag_corr`, which is not a correlation under any `gate_mode` except by coincidence |
+| `gate_min_score` | **0.2** | Pearson/gate threshold; 0 disables the gate. Measured better than 0.6 for both rescorers under the current defaults; see docs/18. Renamed from `min_frag_corr`, which is not a correlation under any `gate_mode` except by coincidence |
 | `min_matched_fraction` | 0.0 | Acceptance: min matched/predicted fraction (default off) |
 | `apex_top_fragments` | 0 | Signature-ion count for apex; 0 -> default 3 (`extract.rs:1860`). Config marks it superseded by `apex_count_tol`, kept for compat (`config.rs:545`) |
 | `apex_rt_prior_s` | 0.0 | Gaussian RT-prior sigma on apex tiebreak; 0 = off |

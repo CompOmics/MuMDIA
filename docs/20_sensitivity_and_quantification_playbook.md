@@ -63,7 +63,7 @@ The effective reference settings are:
 |---|---|
 | `features.set` | `extended` |
 | `extract.gate_mode` | `apex_pearson` |
-| `extract.gate_min_score` | `0.2` (explicit; the default is `0.6`) |
+| `extract.gate_min_score` | `0.2` (also the default) |
 | `extract.apex_count_window` | `5` |
 | `extract.apex_rt_prior_s` | `120` seconds |
 | `rt_im_train.finetune_deeplc` | `true` |

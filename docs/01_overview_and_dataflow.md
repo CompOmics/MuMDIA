@@ -558,7 +558,7 @@ config (`main.rs:607`) before `run`. The fields this overview area touches:
 | `rt_im_train.finetune_deeplc` | `false` | Enables the per-run DeepLC fine-tune of iRT (best workflow). |
 | `rt_im_train.finetune_epochs` / `finetune_patience` | (see config) | DeepLC fine-tune schedule (`run.rs:259-260`). |
 | `rt_im_train.finetune_batch` | `0` | `0` auto-scales the fine-tune batch to seed size. |
-| `extract.gate_min_score` | `0.6` | Spectral-agreement gate threshold, matched to the default `native_tda` rescorer. The loose 0.2 that suits `nn_torch` is set explicitly by the shipped example configs. |
+| `extract.gate_min_score` | `0.2` | Spectral-agreement gate threshold. Measured better than 0.6 for BOTH rescorers under the current defaults (docs/18, "the gate optimum moved"). |
 | `extract.gate_mode` | `apex_pearson` | Which spectral score the gate thresholds (`GateMode`, `config.rs:591`). |
 | `extract.retain_top_peaks` | `1` | `>1` writes the `<psms>.peaks.parquet` sidecar (not yet scored). |
 | `extract.emit_candidate_audit` | `false` | Emits `candidate_audit.parquet` in `run`. |

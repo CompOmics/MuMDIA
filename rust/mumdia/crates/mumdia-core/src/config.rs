@@ -586,7 +586,7 @@ pub struct ExtractConfig {
     /// tier-(d) spectral-agreement gate: reject a candidate whose observed fragment
     /// intensities agree with the predicted pattern below this score.
     ///
-    /// Renamed from `gate_min_score`, which was accurate for none of the four
+    /// Renamed from `min_frag_corr`, which was accurate for none of the four
     /// `gate_mode` values: under the default `apex_pearson` it is an intensity
     /// correlation at ONE apex scan rather than a chromatographic co-elution
     /// correlation, and under `spectral_entropy` it is not a correlation at all. The
@@ -767,14 +767,24 @@ impl Default for ExtractConfig {
             // candidates the hard single-scan Pearson gate was dropping
             // (docs/18_findings_and_decisions.md); still a hard gate, not the
             // soft/budgeted redesign.
-            // 0.6, the documented optimum for the DEFAULT rescorer. This was 0.2, the
-            // optimum measured for `nn_torch`, while the default classifier is
-            // `native_tda`: the shipped gate was tuned for a rescorer the shipped
-            // configuration does not use. All three `configs/examples/*.json` set this
-            // key explicitly, so the validated nn_torch workflow is unchanged; only a
-            // config that says nothing moves, and one that says nothing is using the
-            // native rescorer.
-            gate_min_score: 0.6,
+            // 0.2. Briefly set to 0.6 on the strength of the gate sweep in docs/18,
+            // where `native_tda` peaked at 0.6 (9,503 peptides) while `nn_torch` peaked
+            // at the loosest gate tested. Since `native_tda` is the default classifier,
+            // 0.6 looked like the matching default.
+            //
+            // Measured, and it is not. Same AIF file, current defaults (augmented
+            // library, `apex_evidence_rank = true`, paired CV folds), 2x2 of gate x
+            // rescorer at an unchanged empirical decoy fraction of 0.0097-0.0098:
+            //
+            //     gate 0.2   native_tda 10,847   nn_torch 10,914
+            //     gate 0.6   native_tda 10,369   nn_torch 10,399
+            //
+            // 0.6 costs 4.4% of peptides for `native_tda` and 4.7% for `nn_torch`, and
+            // halves what extract accepts (45,338 -> 21,979). `native_tda`'s inverted-U
+            // flattened from below -- its count rose from 9,503 to 10,847 and the optimum
+            // moved to the loose end -- so the sweep that motivated 0.6 no longer
+            // describes this configuration, and loose is now better for BOTH rescorers.
+            gate_min_score: 0.2,
             min_matched_fraction: 0.0,
             apex_top_fragments: 0, // superseded by apex_count_tol; kept for compat
             apex_rt_prior_s: 0.0,  // RT prior off by default

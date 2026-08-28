@@ -27,9 +27,12 @@ deliberately still open. The entries below fold into the sections that follow.
 - Three defaults changed on correctness grounds, not from a count:
   `extract.apex_evidence_rank` to `true` (the legacy apex silently selected the
   lowest-RT qualifying scan when none of the top-K predicted fragments was
-  observed anywhere), `extract.gate_min_score` to `0.6` (0.2 is the `nn_torch`
-  optimum, while the default rescorer is `native_tda`), and `features.emit_pin` to
-  `false` (no stage reads the file; it is a ~5.4 GB write per run).
+  observed anywhere) and `features.emit_pin` to `false` (no stage reads the file;
+  it is a ~5.4 GB write per run). `extract.gate_min_score` was also briefly changed
+  to `0.6` and then measured back to `0.2`: 0.6 costs 4.4% of peptides for
+  `native_tda` and 4.7% for `nn_torch` at an unchanged decoy fraction, because the
+  gate sweep that motivated it predates the current defaults and its optimum has
+  moved to the loose end for both rescorers.
 - The `nn_torch` CV fold is keyed on `base_peptide_id` supplied by the engine
   rather than on a hash of the peptidoform, so a target and its paired decoy now
   share a fold as `percolator_lite` always did and as `docs/11` always claimed.

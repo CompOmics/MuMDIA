@@ -25,6 +25,14 @@ unused `"auto"` role is cleared rather than left as a literal (2, 5.1);
 `cargo audit` now a required CI job (7.1, 7.2); and the two disclosure lines
 rewritten (`4f999a0`).
 
+**Measured after the fact, and one default reverted.** The AIF identification arm
+and a 2x2 gate-by-rescorer A/B (`bench/README.md`) showed that
+`extract.gate_min_score = 0.6` -- promoted here from a documentation claim about
+`native_tda`'s optimum -- costs 4.4-4.7% of peptides at an unchanged decoy
+fraction, because the sweep behind that claim predates the current defaults. It is
+back to 0.2. An entrapment arm then measured the section-3 fixes as calibrated
+(empirical FDP 0.0098 at a 1% threshold).
+
 **Also closed.** The apex fallback, by promoting `apex_evidence_rank` (2). All
 three entrapment defects, so the FDR-validity instrument can be trusted again (3).
 All seven quantification findings, including the pooled-table refusal and the

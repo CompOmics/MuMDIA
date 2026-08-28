@@ -82,6 +82,32 @@ measurement or the characterisation was wrong; do not carry either figure forwar
 without re-deriving it. The narrow windows are also why the search takes ~70 s of the
 wall time rather than the tens of minutes previously recorded.
 
+#### A/B: `extract.gate_min_score` x rescorer, which reverted a promoted default
+
+Same reused artifacts as the apex A/B below. Two extracts (the gate affects extract,
+the rescorer does not) feeding four rescores.
+
+| gate | `native_tda` | `nn_torch` | accepted by extract |
+|---|---|---|---|
+| 0.2 | **10,847** | **10,914** | 45,338 |
+| 0.6 | 10,369 | 10,399 | 21,979 |
+
+Stripped peptides at `peptide_q_value <= 0.01`. Empirical decoy fraction 0.0098 at
+gate 0.2 and 0.0097 at 0.6, so the difference is sensitivity, not a moved threshold.
+
+`gate_min_score` had been promoted from 0.2 to 0.6 during the audit work, on the
+strength of the `docs/18` gate sweep in which `native_tda` peaked at 0.6 (9,503
+peptides) while `nn_torch` peaked at the loose end -- 0.6 being the apparent match
+for the default classifier. **It measured 4.4% worse for `native_tda` and 4.7% worse
+for `nn_torch`**, and halves what extract accepts. The default is back to 0.2.
+
+Two record claims fall with it. `native_tda` is no longer 9,300-9,500 but 10,847,
+so its inverted-U has flattened from below and its optimum has moved to the loose
+end. And the rescorer is no longer the dominant lever: `nn_torch` over `native_tda`
+was +8.5% and is now **+0.6%** (10,914 against 10,847). Both earlier figures were
+taken on the raw imported library before the augmented tables,
+`apex_evidence_rank` and the paired CV folds; neither describes this configuration.
+
 #### A/B: `extract.apex_evidence_rank`, the promoted default
 
 Both arms reuse ONE set of upstream artifacts from the run above -- same spectra,

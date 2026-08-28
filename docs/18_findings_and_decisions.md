@@ -53,14 +53,37 @@ else. The cost of `nn_torch`: it needs a Python interpreter with PyTorch, and it
 training is only approximately reproducible (see the determinism contract in Part
 B).
 
-The gate optimum inverts by rescorer. `native_tda` shows an inverted-U: the count
-rises to a peak at a tight gate near 0.6, then falls. `nn_torch` is monotonic
-across the tested range, looser-is-better, peaking at the loosest gate tested
-(0.2), and would likely gain further below 0.2. A linear rescorer cannot
+**The gate optimum moved (measured 2026-08-28).** The sweep above was taken on the
+RAW imported library, before the augmented tables, before
+`extract.apex_evidence_rank` became the default, and before the `nn_torch` CV fold
+was keyed on `base_peptide_id`. Re-measured on the same file under the current
+defaults, at an unchanged empirical decoy fraction of 0.0097-0.0098:
+
+| gate | `native_tda` | `nn_torch` |
+|---|---|---|
+| 0.2 | **10,847** | **10,914** |
+| 0.6 | 10,369 | 10,399 |
+
+`native_tda`'s inverted-U has flattened from below: its count rose from 9,503 to
+10,847 and its optimum moved to the loose end. Loose is now better for BOTH
+rescorers -- 0.6 costs 4.4% of peptides for `native_tda` and 4.7% for `nn_torch`,
+and halves what extract accepts (45,338 against 21,979). The shipped default is
+therefore 0.2.
+
+The `native_tda`-`nn_torch` gap has also narrowed sharply, from +8.5% to +0.6%
+(10,847 against 10,914), so "invest in the rescorer before almost anything else"
+no longer follows from these numbers either. Both statements below described the
+configuration they were measured on and no longer describe this one; they are kept
+because the sweep is a real measurement and because the shape of the change is the
+point.
+
+Historical reading, superseded: the gate optimum inverts by rescorer. `native_tda`
+showed an inverted-U peaking near 0.6; `nn_torch` was monotonic across the tested
+range, looser-is-better, peaking at the loosest gate tested (0.2). A linear rescorer cannot
 represent a hard floor on the co-elution feature, so a pre-gate does real work
 for it; a strong nonlinear rescorer absorbs the loose-gate flood and just wants
 recall. The hard gate is a linear-rescorer crutch. The extraction gate is a
-finite floor in `[0, 1]` at `extract.gate_min_score`, default 0.6
+finite floor in `[0, 1]` at `extract.gate_min_score`, default 0.2
 (`rust/mumdia/crates/mumdia-core/src/config.rs:522`).
 
 ### A2. Mechanism of the gate

@@ -738,7 +738,7 @@ selection dominate.
 | `presence_min_matched` | 3 | tier-(b) min matched fragment count |
 | `presence_min_fragments` | 3 | min distinct fragments for acceptance |
 | `presence_min_coelution` | 2 | min simultaneously-present fragments over the run |
-| `gate_min_score` | 0.6 | tier-(d) spectral-agreement gate (0 disables; must be in [0,1]). Renamed from `min_frag_corr` |
+| `gate_min_score` | 0.2 | tier-(d) spectral-agreement gate (0 disables; must be in [0,1]). Renamed from `min_frag_corr` |
 | `min_matched_fraction` | 0.0 | tier-(c) min fraction of predicted fragments observed |
 | `apex_top_fragments` | 0 | signature-fragment apex: sums the observed intensity of the top-K predicted fragments per scan; `0` falls back to a default of 3 (`extract.rs:1857-1861`), not all-matched |
 | `apex_rt_prior_s` | 0.0 | Gaussian RT prior sigma on apex (0 = off) |
@@ -768,7 +768,8 @@ selection dominate.
 | `gate_mode` | `apex_pearson` | which spectral score `gate_min_score` thresholds |
 | `gate_coelution_min` | 0.5 | second threshold for `gate_mode = combined` |
 
-The gate default was relaxed from a historical 0.5 to 0.2, then set to 0.6
+The gate default was relaxed from a historical 0.5 to 0.2, briefly set to 0.6
+and measured back to 0.2 (docs/18)
 (config.rs:692-697). Every default-off knob is explicitly documented as
 requiring entrapment/target-decoy FDR validation before use.
 

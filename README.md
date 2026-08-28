@@ -482,10 +482,18 @@ sanity check and not an independent empirical null.
 | configuration | rescorer | rows |
 |---|---|---|
 | native FASTA digest, zero dependencies | `native_tda` | about 1,213 |
-| imported library, per-run DeepLC fine-tune | `native_tda` or `mokapot` | about 9,300 to 9,500 (`native_tda` best 9,503, at extraction gate 0.6) |
-| imported library, per-run DeepLC fine-tune | `nn_torch` | about 10,300 (best 10,308, at extraction gate 0.2) |
+| imported library, per-run DeepLC fine-tune | `native_tda` | 10,847 |
+| imported library, per-run DeepLC fine-tune | `nn_torch` | 10,914 |
 
-The rescorer is the dominant lever: `nn_torch` over `native_tda` is +8.5% on the
+Both re-measured 2026-08-28 on the augmented library under the current defaults, at
+an extraction gate of 0.2 and an empirical decoy fraction of 0.0098. The earlier
+figures for this row -- about 9,300 to 9,500 for `native_tda` and about 10,300 for
+`nn_torch` -- were taken on the raw imported library before the augmented tables,
+`apex_evidence_rank` and the paired CV folds.
+
+The rescorer was previously the dominant lever, at +8.5% for `nn_torch` over
+`native_tda`; that gap is now +0.6% (10,914 against 10,847), so it no longer is.
+On the
 same feature set. The gate optimum inverts by rescorer, so tune the extraction
 gate and the classifier together. Source:
 [`docs/18_findings_and_decisions.md`](docs/18_findings_and_decisions.md) finding

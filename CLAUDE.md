@@ -204,16 +204,26 @@ is the decision record.
 `extract.gate_min_score` is named historically. Under the default
 `gate_mode = apex_pearson`, it thresholds observed-versus-predicted fragment
 intensities at one apex; it is not a chromatographic co-elution correlation.
-The observed optimum was about 0.2 with the NN and about 0.6 with the native
-linear model.
+**The default is 0.2, and loose is now better for both rescorers.** Measured
+2026-08-28 on the AIF file under the current defaults, at an unchanged empirical
+decoy fraction of 0.0097-0.0098:
 
-**The default is 0.6, matched to the default rescorer.** It was 0.2, the NN's
-optimum, while the default classifier is `native_tda`: the shipped gate was tuned
-for a rescorer the shipped configuration does not use. All three
-`configs/examples/*.json` set the key explicitly, so the validated `nn_torch`
-workflow is unchanged at 0.2; only a configuration that says nothing moves, and
-one that says nothing is using the native rescorer. Set it explicitly whenever
-you change the classifier.
+| gate | `native_tda` | `nn_torch` |
+|---|---|---|
+| 0.2 | 10,847 | 10,914 |
+| 0.6 | 10,369 | 10,399 |
+
+0.6 costs 4.4% of peptides for `native_tda` and 4.7% for `nn_torch`, and halves
+what extract accepts (45,338 against 21,979).
+
+This corrects an earlier reading. The `docs/18` gate sweep, taken on the RAW
+imported library before the augmented tables, before `apex_evidence_rank` became
+the default and before the CV fold was paired, showed `native_tda` peaking at 0.6
+(9,503) and `nn_torch` at the loose end. On that basis the default was briefly
+changed to 0.6 to match the default classifier. `native_tda` has since risen to
+10,847 and its optimum has moved to the loose end, so the sweep no longer
+describes this configuration and the default is back to 0.2. Re-derive the optimum
+rather than inheriting it if you change the library, the apex mode or the folds.
 
 Three RT rules, each measured in `docs/08_rt_im_train.md` and restated from the
 failure side in `docs/17_troubleshooting.md`:
@@ -397,7 +407,13 @@ sensitivity result for it.
   is always positive, so the fallback is unreachable. The wrong apex propagated
   into `prelim_score`, which decides the pre-FDR competition winner, and into
   quant's integration centre.
-- `extract.gate_min_score` is now `0.6`; see the extraction-gate section above.
+- `extract.gate_min_score` stays `0.2`. It was briefly changed to `0.6`, the
+  documented optimum for the default `native_tda` rescorer, and then measured: 0.6
+  costs 4.4% of peptides for `native_tda` and 4.7% for `nn_torch` at an unchanged
+  decoy fraction, because the gate sweep in `docs/18` was taken on the raw library
+  before the current defaults and its optimum has since moved to the loose end for
+  both rescorers. A default changed from a documentation claim, reverted by
+  measurement.
 - `features.emit_pin` is now `false`. No MuMDIA stage reads the file, because
   rescore builds its own PIN, and it is a ~5.4 GB text write per run on a real
   library.
