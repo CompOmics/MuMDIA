@@ -110,9 +110,13 @@ jobs:
     permissions:
       # Creating the release and attaching the archives.
       contents: write
-    # `always()` plus an explicit failure test: `validate-tag` is SKIPPED on a
-    # rehearsal, and a skipped dependency would otherwise skip this job too.
-    if: always() && needs.validate-tag.result != 'failure'
+    # `always()` because `validate-tag` is SKIPPED on a rehearsal (it has no tag to
+    # validate) and a skipped dependency would otherwise skip this job too.
+    #
+    # The condition allows exactly two outcomes, rather than excluding 'failure':
+    # a cancelled gate is not a failed gate, and treating it as permission to build
+    # would let a tag publish with the checks half-run.
+    if: always() && contains(fromJSON('["success", "skipped"]'), needs.validate-tag.result)
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
