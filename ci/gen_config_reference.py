@@ -828,6 +828,46 @@ def add(store: dict[str, EnvVar], name: str, default: str | None, site: str) -> 
     var.sites.add(site)
 
 
+def blank_cfg_test(text: str) -> str:
+    """Blank out `#[cfg(test)]` blocks, preserving line numbers.
+
+    The environment-variable table is built by scanning the Rust sources for reads and
+    sets. Test code is not the engine, so a `std::env::set_var` inside a test must not
+    appear in a user-facing table -- and one did: a regression test that points discovery
+    at a deliberately bogus interpreter made the generated reference state that MuMDIA
+    sets `MUMDIA_PYTHON_RESCORE=/definitely/not/an/interpreter`, cited to the test's own
+    line. A generated document whose selling point is that it cannot drift from the code
+    is worse than a hand-written one when it faithfully reports a fixture.
+
+    Blanked rather than deleted because the generator cites `file:line` for every site,
+    so the numbering has to survive. `parse_config_rs` truncates at the first
+    `#[cfg(test)]` instead, which is fine for one file that keeps its tests at the end;
+    this has to cope with any source file, including an inline test module followed by
+    more real code.
+    """
+    lines = text.split(chr(10))
+    i = 0
+    while i < len(lines):
+        if lines[i].lstrip().startswith("#[cfg(test)]"):
+            # Find the opening brace of the item the attribute applies to, then
+            # brace-match to its end. Runs after `decomment`, and a test module's own
+            # braces balance, so counting is enough.
+            j, depth, started = i, 0, False
+            while j < len(lines):
+                depth += lines[j].count("{") - lines[j].count("}")
+                if "{" in lines[j]:
+                    started = True
+                if started and depth <= 0:
+                    break
+                j += 1
+            for k in range(i, min(j + 1, len(lines))):
+                lines[k] = ""
+            i = j + 1
+        else:
+            i += 1
+    return chr(10).join(lines)
+
+
 def scan_rust_env(
     paths: list[Path],
 ) -> tuple[dict[str, EnvVar], dict[str, EnvVar], list[str]]:
@@ -853,7 +893,9 @@ def scan_rust_env(
     for path in paths:
         # Comments are stripped line by line, so `//` prose cannot contribute a
         # stray quote (an apostrophe in "engine's") and line numbers still hold.
-        text = decomment(path.read_text(encoding="utf-8", errors="replace"))
+        text = blank_cfg_test(
+            decomment(path.read_text(encoding="utf-8", errors="replace"))
+        )
         rel = path.relative_to(REPO_ROOT).as_posix()
         lines = text.split("\n")
 

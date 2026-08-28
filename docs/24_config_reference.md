@@ -710,7 +710,6 @@ one exception noted in its own help text: it sets `MUMDIA_NN_THREADS` and
 | `MUMDIA_NN_ITERS` | engine | `p.cfg.num_iter.to_string()` | `rust/mumdia/crates/mumdia/src/stages/rescore.rs:1127` |
 | `MUMDIA_NN_THREADS` | engine | `n.to_string()` | `rust/mumdia/crates/mumdia/src/main.rs:86` |
 | `MUMDIA_NN_TRAIN_FDR` | engine | `p.cfg.train_fdr.to_string()` | `rust/mumdia/crates/mumdia/src/stages/rescore.rs:1128` |
-| `MUMDIA_PYTHON_RESCORE` | engine | `"/definitely/not/an/interpreter"` | `rust/mumdia/crates/mumdia/src/python.rs:705` |
 | `NUMEXPR_NUM_THREADS` | sidecar | `"1"` | `scripts/deeplc_finetune.py:28` |
 | `OMP_NUM_THREADS` | both | `"1"` in deeplc_finetune.py; `n.to_string()` in main.rs | `rust/mumdia/crates/mumdia/src/main.rs:86`, `scripts/deeplc_finetune.py:25` |
 | `OPENBLAS_NUM_THREADS` | sidecar | `"1"` | `scripts/deeplc_finetune.py:26` |
@@ -731,6 +730,6 @@ Every field whose struct has an `impl Default` resolved from the source.
 
 ## Coverage
 
-17 structs and 167 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 21 enumerations, 1 named profile(s), 48 environment variables read and 13 set.
+17 structs and 167 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 21 enumerations, 1 named profile(s), 48 environment variables read and 12 set.
 
 20 field(s) carry a gating marker in their doc comment. 47 field(s) carry no doc comment at all, so their description is empty above. 0 default(s) could not be resolved and 2 have none by design.

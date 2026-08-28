@@ -51,16 +51,44 @@ fn main() {
     println!("cargo:rustc-env=MUMDIA_GIT_SHA={sha}");
     println!("cargo:rustc-env=MUMDIA_COMMIT_DATE={date}");
 
-    // Re-run when the checked-out commit or the index changes, so the stamp does
-    // not go stale in an incremental build. Paths are relative to this crate.
-    for p in [
-        "../../../.git/HEAD",
-        "../../../.git/index",
-        "../../.git/HEAD",
-        "../../.git/index",
-    ] {
-        if std::path::Path::new(p).exists() {
-            println!("cargo:rerun-if-changed={p}");
+    // Re-run when the checked-out commit changes, so the stamp does not go stale in an
+    // incremental build.
+    //
+    // This used to guess relative paths (`../../../.git/HEAD`, `../../.git/HEAD`). A
+    // build script runs with its CWD at the CRATE root, and this crate is
+    // `rust/mumdia/crates/mumdia-core`, so the repository's `.git` is FOUR levels up:
+    // both guesses resolved to `rust/.git` and `rust/mumdia/.git`, neither of which
+    // exists. Every path failed the `exists()` test, no `rerun-if-changed` was emitted
+    // for git state at all, and the stamp then survived arbitrarily many commits.
+    //
+    // That was not cosmetic. A benchmark run on this branch recorded
+    // `git_sha = c13a623a8d33-dirty` in its manifest while HEAD was nine commits later
+    // at `9fc1c06`, and another build stamped a sha that is not a valid object in this
+    // repository at all. Provenance that silently names the wrong commit is worse than
+    // none, because the manifest is what a result is supposed to be traceable through.
+    //
+    // Ask git for the directory instead of guessing at it. `--absolute-git-dir` also
+    // handles a worktree or a submodule, where `.git` is a file rather than a directory.
+    if let Some(gitdir) = git(&["rev-parse", "--absolute-git-dir"]) {
+        let gitdir = std::path::Path::new(&gitdir);
+        println!("cargo:rerun-if-changed={}", gitdir.join("HEAD").display());
+        // The commit a branch points at changes the ref file, not HEAD, so watch both.
+        if let Some(head_ref) = git(&["symbolic-ref", "--quiet", "HEAD"]) {
+            let refpath = gitdir.join(&head_ref);
+            if refpath.exists() {
+                println!("cargo:rerun-if-changed={}", refpath.display());
+            }
+            // A packed ref has no loose file; `packed-refs` is where it moves.
+            let packed = gitdir.join("packed-refs");
+            if packed.exists() {
+                println!("cargo:rerun-if-changed={}", packed.display());
+            }
+        }
+        // The index is what `git status --porcelain` compares against, so it is the
+        // closest available proxy for the `-dirty` marker.
+        let index = gitdir.join("index");
+        if index.exists() {
+            println!("cargo:rerun-if-changed={}", index.display());
         }
     }
     println!("cargo:rerun-if-changed=build.rs");
