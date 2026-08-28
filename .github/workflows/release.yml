@@ -244,20 +244,47 @@ jobs:
           unpacked="$RUNNER_TEMP/unpacked"
           rm -rf "$unpacked"; mkdir -p "$unpacked"
           cd dist
-          archive=$(ls *.tar.gz *.zip 2>/dev/null | head -1)
+          # Not `ls *.tar.gz *.zip 2>/dev/null | head -1`: exactly one of those globs
+          # matches, so `ls` exits 2 on the other, and under `pipefail` plus `set -e`
+          # with stderr discarded the step died with no message at all. That is the
+          # failure mode docs/14 already records for `cmd && echo` inside a command
+          # substitution, and it cost one rehearsal.
+          shopt -s nullglob
+          archives=(*.tar.gz *.zip)
+          shopt -u nullglob
+          if [ ${#archives[@]} -eq 0 ]; then
+            echo "::error::the Package step produced no archive in dist/"
+            ls -la
+            exit 1
+          fi
+          archive="${archives[0]}"
           echo "verifying $archive"
           case "$archive" in
             *.tar.gz) tar xzf "$archive" -C "$unpacked" ;;
-            *.zip)    7z x -o"$unpacked" "$archive" > /dev/null ;;
+            # Python rather than 7z or unzip: the interpreter is already set up above,
+            # and it behaves identically on every runner image. Losing the executable
+            # bit does not matter, because only the Windows archive is a zip.
+            *.zip)    python -c "import sys, zipfile; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])" \
+                        "$archive" "$unpacked" ;;
+            *) echo "::error::unrecognised archive $archive"; exit 1 ;;
           esac
-          root=$(ls -d "$unpacked"/*/ | head -1)
+          root=$(find "$unpacked" -mindepth 1 -maxdepth 1 -type d | head -1)
+          if [ -z "$root" ]; then
+            echo "::error::the archive did not unpack to a single top-level directory"
+            find "$unpacked" -maxdepth 2
+            exit 1
+          fi
           cd "$root"
           echo "--- the archive must be self-sufficient from here ---"
           ls
           # MUMDIA_BIN is set explicitly for determinism, but `ci/smoke.sh` also
           # discovers `./mumdia` in an unpacked archive on its own, which is what a
           # user following docs/19 relies on.
-          MUMDIA_BIN="$PWD/mumdia${{ matrix.exe }}" bash ci/smoke.sh "$RUNNER_TEMP/smoke"
+          # No work-directory argument: the default (`$TMPDIR/mumdia_smoke`) is what
+          # the ci.yml smoke job already uses on all three platforms. Passing
+          # `$RUNNER_TEMP` would hand a Windows path with backslashes to a bash
+          # script, which is a needless difference between the two invocations.
+          MUMDIA_BIN="$PWD/mumdia${{ matrix.exe }}" bash ci/smoke.sh
 
       - name: Upload to release
         if: startsWith(github.ref, 'refs/tags/v')
