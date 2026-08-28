@@ -395,6 +395,12 @@ jobs:
             echo "ok $f"
           done
 
+      # Both YAML checks below need it. It used to be installed inside "Parse env
+      # specs", so adding an earlier YAML step broke with ModuleNotFoundError: the
+      # dependency belongs to the job, not to whichever step reached it first.
+      - name: Install the YAML parser
+        run: python -m pip install --quiet pyyaml
+
       # A workflow that GitHub refuses to parse fails when it is DISPATCHED, not when
       # it is pushed: for release.yml that is the moment a release is attempted. And
       # PyYAML accepts a duplicate mapping key silently, so a local parse check does
@@ -408,7 +414,6 @@ jobs:
       - name: Parse env specs
         run: |
           set -euo pipefail
-          python -m pip install --quiet pyyaml
           for f in $(git ls-files 'env/*.yml' 'docker/*.yml'); do
             python -c "import yaml,sys; yaml.safe_load(open(sys.argv[1]))" "$f" \
               || { echo "invalid YAML: $f"; exit 1; }
