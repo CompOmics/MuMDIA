@@ -158,7 +158,7 @@ pub fn run(p: PredictFragParams) -> Result<(u64, u64)> {
     // cross-item state; the result per candidate is identical to the serial loop.
     raws.par_iter_mut().for_each(|r| {
         let mut order: Vec<usize> = (0..r.frags.len()).collect();
-        order.sort_by(|&a, &b| r.frag_int[b].partial_cmp(&r.frag_int[a]).unwrap());
+        order.sort_by(|&a, &b| r.frag_int[b].total_cmp(&r.frag_int[a]));
         order.truncate(p.cfg.top_n_fragments);
         order.sort_unstable();
         // In-place gather: `order` is ascending and `order[dst] >= dst`, so a
@@ -176,7 +176,7 @@ pub fn run(p: PredictFragParams) -> Result<(u64, u64)> {
     // candidate_id = precursor-m/z sort key (docs/09_extract.md).
     // Parallel STABLE sort: rayon's par_sort_by is stable, so ties keep input order exactly
     // as the serial sort_by did. The fragment index requires this ascending-m/z ordering.
-    raws.par_sort_by(|a, b| a.precursor_mz.partial_cmp(&b.precursor_mz).unwrap());
+    raws.par_sort_by(|a, b| a.precursor_mz.total_cmp(&b.precursor_mz));
 
     let n = raws.len();
     let total_frags: usize = raws.iter().map(|r| r.frags.len()).sum();

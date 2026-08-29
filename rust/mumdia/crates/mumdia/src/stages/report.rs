@@ -93,11 +93,7 @@ pub fn run(p: ReportParams) -> Result<(u64, u64)> {
 
     // Peptides, best q first, unique by (peptidoform, charge).
     let mut order: Vec<usize> = (0..n).collect();
-    order.sort_by(|&a, &b| {
-        pep_q[a]
-            .partial_cmp(&pep_q[b])
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    order.sort_by(|&a, &b| pep_q[a].total_cmp(&pep_q[b]));
     let mut seen: HashSet<(String, i32)> = HashSet::new();
     let mut seen_strip: HashSet<String> = HashSet::new();
     // Atomic, like every parquet and json artifact. These two TSVs were the only
@@ -144,11 +140,7 @@ pub fn run(p: ReportParams) -> Result<(u64, u64)> {
 
     // Protein groups, best q first, unique.
     let mut porder: Vec<usize> = (0..n).collect();
-    porder.sort_by(|&a, &b| {
-        pg_q[a]
-            .partial_cmp(&pg_q[b])
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    porder.sort_by(|&a, &b| pg_q[a].total_cmp(&pg_q[b]));
     let mut pseen: HashSet<String> = HashSet::new();
     let prot_target = mumdia_io::table::AtomicPath::new(p.out_proteins)?;
     let mut w2 = std::io::BufWriter::new(std::fs::File::create(prot_target.tmp())?);

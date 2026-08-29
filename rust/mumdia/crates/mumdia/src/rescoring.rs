@@ -154,7 +154,7 @@ pub fn percolator_lite(inp: RescoreInput) -> Vec<f64> {
                 // fallback: if too few confident targets, take the top-scoring half
                 if n_pos < 10 {
                     let mut order: Vec<usize> = (0..train_idx.len()).collect();
-                    order.sort_by(|&a, &b| train_scores[b].partial_cmp(&train_scores[a]).unwrap());
+                    order.sort_by(|&a, &b| train_scores[b].total_cmp(&train_scores[a]));
                     let take = (train_idx.len() / 2).max(1);
                     rows.clear();
                     ys.clear();

@@ -233,6 +233,37 @@ produces bit-identical results.
 
 ### Fixed
 
+- A single malformed retention time in an mzML aborted the whole run. `convert`
+  validated peak m/z and intensity but not the scan start time, so one `NaN` value
+  passed unchecked into the spectra artifact and then panicked inside extract with
+  `called `Option::unwrap()` on a `None` value`, naming neither the file, nor the
+  scan, nor the value. Reproduced by editing one value in the fixture mzML. Such
+  spectra are now dropped with a count and the first offending scan id, which loses
+  nothing (a spectrum with no retention time cannot be placed in a chromatogram) and
+  leaves identifications unchanged; `ci/smoke.sh` asserts all three.
+- Every float ordering in the workspace now uses `total_cmp` rather than
+  `partial_cmp(..).unwrap()` (25 sites) or `partial_cmp(..).unwrap_or(Equal)` (36
+  sites). The first panics on NaN; the second is worse, because `Equal`-on-NaN is an
+  intransitive comparator and `sort_by` has detected that and panicked since Rust
+  1.81, so it converted a deterministic failure into an intermittent one. `total_cmp`
+  agrees with both on every finite value: the fixture's `peptides.tsv` and
+  `proteins.tsv` hashes are byte-identical across the change. One of the rewritten
+  comparators picks the competition winner, where treating every NaN as equal made
+  the surviving row depend on iteration order.
+- `compete` panicked instead of erroring when a `.schema.json` companion named a
+  feature column the parquet does not have, which a stale companion beside a
+  rewritten table produces. It now names the column and the file and says to delete
+  the companion.
+- `scripts/make_reverse_decoys.py` silently assigned 0 Da to any modification outside
+  its eight-name table, so those decoys got fragment m/z for the wrong molecule and
+  could never match. A decoy that cannot match does not compete, which makes the
+  target-decoy null optimistic for exactly the peptides carrying that modification,
+  and nothing in the output distinguished such a decoy from a good one. The sampled
+  calculator check could not catch it: it compares 500 precursors at the 99th
+  percentile. Unknown modifications now raise, `valid()` rejects the peptidoform so
+  no decoy is written for it, and the script reports the names and counts. This
+  matches the engine's own parser, which has always returned
+  `MassError::UnknownModification`.
 - `run-experiment` dropped PSMs silently when splitting the pooled scored table by
   run. `split_by_source` filtered on `source == i` for each output table and returned
   `Ok` regardless, so any row whose `source` had no output table went nowhere: every

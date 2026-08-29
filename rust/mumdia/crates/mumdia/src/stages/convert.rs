@@ -190,11 +190,36 @@ pub fn run(p: ConvertParams) -> Result<ConvertOutputs> {
     // converter that produced it is wrong, which is worth knowing before the numbers
     // are believed.
     let mut nonfinite_peaks = 0usize;
+    // Spectra dropped for a non-finite retention time, and the first one's id.
+    //
+    // Retention time was the one externally supplied float this stage did not check,
+    // and it is the value everything downstream keys on. A single `NaN` scan start time
+    // in one scan of an mzML -- reproduced by editing one `scan start time` value in the
+    // fixture -- passed convert without a warning, was written into the spectra
+    // artifact, and then aborted `mumdia run` inside extract with
+    // `called `Option::unwrap()` on a `None` value` at `extract.rs`, naming neither the
+    // file, nor the scan, nor the value. The peak filter in `peaks_of` had exactly this
+    // hole closed for m/z and intensity; RT was missed.
+    //
+    // Dropped rather than fatal, for the same reason as a bad peak: one unusable scan is
+    // not a reason to refuse a run, and a spectrum with no retention time cannot be
+    // placed in a chromatogram, so there is nothing else to do with it. The count and
+    // the first offending scan id are reported, and the existing "no MS2 spectra" bail
+    // below is the backstop for a file whose retention times are ALL unusable.
+    let mut nonfinite_rt = 0usize;
+    let mut first_bad_rt: Option<String> = None;
     for (count, (scan_index, spec)) in (0_u32..).zip(reader).enumerate() {
         if p.max_spectra > 0 && count >= p.max_spectra {
             break;
         }
         let rt_s = spec.start_time() * 60.0; // mzdata returns minutes
+        if !rt_s.is_finite() {
+            nonfinite_rt += 1;
+            if first_bad_rt.is_none() {
+                first_bad_rt = Some(format!("{} (rt={})", spec.id(), rt_s));
+            }
+            continue;
+        }
         match spec.ms_level() {
             1 => {
                 let (mz, inten, nf) = peaks_of(&spec, p.top_peaks_ms1);
@@ -266,6 +291,18 @@ pub fn run(p: ConvertParams) -> Result<ConvertOutputs> {
             nonfinite_peaks,
             mzml = p.mzml,
             "convert: dropped peaks with a non-finite m/z or intensity. A few indicate a              damaged spectrum; a large number indicates a problem with the file or with              the converter that wrote it"
+        );
+    }
+    if nonfinite_rt > 0 {
+        warn!(
+            nonfinite_rt,
+            first = first_bad_rt.as_deref().unwrap_or("?"),
+            mzml = p.mzml,
+            concat!(
+                "convert: dropped spectra whose scan start time is not finite. Such a ",
+                "spectrum cannot be placed in a chromatogram, and left in place it ",
+                "propagates NaN into the retention-time windows and aborts a later stage"
+            )
         );
     }
     if m2_idx.is_empty() {

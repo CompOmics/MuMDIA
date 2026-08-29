@@ -92,7 +92,7 @@ pub fn run(p: SearchSeedParams) -> Result<u64> {
                 .filter(|(_, v)| v.0 as usize >= p.cfg.min_matched_peaks)
                 .map(|(cid, v)| (cid, hyperscore(v.0, v.1), v.0))
                 .collect();
-            scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap().then(a.0.cmp(&b.0)));
+            scored.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
             scored.truncate(p.cfg.report_psms);
             for (cid, score, matched) in scored {
                 let entry = best.entry(cid).or_insert(Best {
@@ -205,7 +205,7 @@ pub fn run(p: SearchSeedParams) -> Result<u64> {
     // optional robust second pass on the outlier-trimmed calibrants.
     let fit = |d: &[f64]| -> (f64, f64) {
         let mut sorted = d.to_vec();
-        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        sorted.sort_by(|a, b| a.total_cmp(b));
         let offset = sorted[sorted.len() / 2];
         let centered: Vec<f64> = d.iter().map(|x| (x - offset).abs()).collect();
         let tol = (crate::calibrate::percentile(&centered, 0.95) * 1.5).max(5.0);
@@ -256,7 +256,7 @@ pub fn run(p: SearchSeedParams) -> Result<u64> {
         && dev_mz.len() >= 50
     {
         let mut pairs: Vec<(f64, f64)> = dev_mz.iter().cloned().zip(devs.iter().cloned()).collect();
-        pairs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        pairs.sort_by(|a, b| a.0.total_cmp(&b.0));
         let xs: Vec<f64> = pairs.iter().map(|(m, _)| *m).collect();
         let ys: Vec<f64> = pairs.iter().map(|(_, pp)| *pp).collect();
         let loess = crate::calibrate::Loess::fit(&xs, &ys, 0.3, 200);
@@ -353,8 +353,7 @@ fn select_peaks(scan: &Ms2Scan, top_n: usize) -> Vec<usize> {
         idx.sort_by(|&a, &b| {
             scan.peaks[b]
                 .intensity
-                .partial_cmp(&scan.peaks[a].intensity)
-                .unwrap_or(std::cmp::Ordering::Equal)
+                .total_cmp(&scan.peaks[a].intensity)
                 .then(a.cmp(&b))
         });
         idx.truncate(top_n);
@@ -469,7 +468,7 @@ fn seed_fragindex_windows(
                             )
                         })
                         .collect();
-                    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap().then(a.0.cmp(&b.0)));
+                    scored.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
                     scored.truncate(cfg.report_psms);
                     for (cid, score, matched) in scored {
                         let e = local.entry(cid).or_insert(Best {

@@ -357,7 +357,7 @@ impl Library {
             }
             // Global sort by fragment m/z. Parallel stable sort: identical result to
             // the serial stable `sort_by` (same comparator, ties keep input order).
-            entries.par_sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+            entries.par_sort_by(|a, b| a.0.total_cmp(&b.0));
 
             // Chunk into buckets; within a bucket sort by candidate_id.
             for chunk_start in (0..entries.len()).step_by(bs) {

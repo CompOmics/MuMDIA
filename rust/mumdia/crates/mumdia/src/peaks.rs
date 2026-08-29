@@ -124,13 +124,8 @@ pub fn enumerate_peaks(
     //    Sort strongest-first by area, then apex intensity, then earliest apex.
     peaks.sort_by(|a, b| {
         b.area
-            .partial_cmp(&a.area)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then(
-                b.apex_intensity
-                    .partial_cmp(&a.apex_intensity)
-                    .unwrap_or(std::cmp::Ordering::Equal),
-            )
+            .total_cmp(&a.area)
+            .then(b.apex_intensity.total_cmp(&a.apex_intensity))
             .then(a.apex_idx.cmp(&b.apex_idx))
     });
     let mut kept: Vec<PeakGroup> = Vec::new();

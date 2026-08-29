@@ -107,6 +107,40 @@ echo "=== smoke: run again for determinism"
     --out-dir "$work/out2" --config "$cfg" --threads 2 > "$work/run2.log" 2>&1 \
     || { tail -20 "$work/run2.log"; exit 1; }
 
+# 4b. A malformed retention time must not abort the run.
+#
+#     Regression test for a reproduced crash: one `NaN` scan start time in one scan of
+#     an mzML passed `convert` unchecked, was written into the spectra artifact, and
+#     aborted `mumdia run` inside extract with `called `Option::unwrap()` on a `None`
+#     value`, naming neither the file, nor the scan, nor the value. The peak filter had
+#     this hole closed for m/z and intensity; retention time was missed, and it is the
+#     value every later stage keys on.
+#
+#     Asserts the three things that matter: the run completes, convert says what it
+#     dropped, and the result is the same as from the clean file (the poisoned scan is
+#     one of 480, and dropping it must not change which peptides are found).
+echo "=== smoke: a NaN retention time must be dropped, not fatal"
+"$PY" - "$work/fixture.mzML" "$work/fixture_nan_rt.mzML" <<'PYEOF'
+import io, sys
+src, dst = sys.argv[1], sys.argv[2]
+s = io.open(src, encoding="utf-8").read()
+marker = 'scan start time" value="0.003704"'
+if marker not in s:
+    sys.exit(f"fixture no longer contains {marker!r}; update this check")
+io.open(dst, "w", encoding="utf-8", newline="").write(
+    s.replace(marker, 'scan start time" value="NaN"', 1))
+PYEOF
+"$BIN" run --fasta test_data/fixture.fasta --mzml "$work/fixture_nan_rt.mzML" \
+    --out-dir "$work/out_nan_rt" --config "$cfg" --threads 2 \
+    > "$work/run_nan_rt.log" 2>&1 \
+    || { echo "a single NaN retention time aborted the run"; tail -20 "$work/run_nan_rt.log"; exit 1; }
+grep -q "nonfinite_rt=1" "$work/run_nan_rt.log" \
+    || { echo "convert did not report the dropped spectrum"; exit 1; }
+diff <(cut -f1-3 "$work/out/peptides.tsv") <(cut -f1-3 "$work/out_nan_rt/peptides.tsv") \
+    > /dev/null \
+    || { echo "dropping one unusable scan changed the identifications"; exit 1; }
+echo "    ok: run completed, drop reported, identifications unchanged"
+
 # 5. The multi-run orchestrator. Nothing tested it: `run-experiment` has a pooled
 #    rescore, a by-source split, per-run quant and a cross-run LFQ that the
 #    single-run path never reaches, and a split that drops rows produces plausible

@@ -473,7 +473,7 @@ fn build_evidence(
     }
 
     let mut axis_full: Vec<f32> = rows.iter().flat_map(|r| r.rt.iter().cloned()).collect();
-    axis_full.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    axis_full.sort_by(|a, b| a.total_cmp(b));
     axis_full.dedup();
     let traces_full: Vec<Vec<f64>> = rows
         .iter()
@@ -497,8 +497,7 @@ fn build_evidence(
             .min_by(|(_, a), (_, b)| {
                 (**a as f64 - apex_rt)
                     .abs()
-                    .partial_cmp(&((**b as f64 - apex_rt).abs()))
-                    .unwrap()
+                    .total_cmp(&(**b as f64 - apex_rt).abs())
             })
             .map(|(i, _)| i)
             .unwrap_or(0);
@@ -506,11 +505,7 @@ fn build_evidence(
             Some((l, r)) => global_bound_indices(&axis_full, apex_rt, ai, l, r),
             None => {
                 let mut ord: Vec<usize> = (0..pred.len()).collect();
-                ord.sort_by(|&a, &b| {
-                    pred[b]
-                        .partial_cmp(&pred[a])
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
+                ord.sort_by(|&a, &b| pred[b].total_cmp(&pred[a]));
                 let k3: Vec<usize> = ord.into_iter().take(3).collect();
                 let prof_raw: Vec<f64> = (0..axis_full.len())
                     .map(|k| k3.iter().map(|&i| traces_full[i][k]).sum::<f64>())
@@ -532,12 +527,7 @@ fn build_evidence(
     let apex_idx = axis
         .iter()
         .enumerate()
-        .min_by(|(_, a), (_, b)| {
-            (*a - apex_rt)
-                .abs()
-                .partial_cmp(&(*b - apex_rt).abs())
-                .unwrap()
-        })
+        .min_by(|(_, a), (_, b)| (*a - apex_rt).abs().total_cmp(&(*b - apex_rt).abs()))
         .map(|(i, _)| i)
         .unwrap_or(0);
 
@@ -1277,7 +1267,7 @@ fn elution_peak_rt_bounds(
     grace: usize,
 ) -> Option<(f32, f32)> {
     let mut axis: Vec<f32> = rows.iter().flat_map(|r| r.rt.iter().cloned()).collect();
-    axis.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    axis.sort_by(|a, b| a.total_cmp(b));
     axis.dedup();
     if axis.len() < 3 {
         return None;
@@ -1296,12 +1286,7 @@ fn elution_peak_rt_bounds(
         })
         .collect();
     let mut ord: Vec<usize> = (0..rows.len()).collect();
-    ord.sort_by(|&a, &b| {
-        rows[b]
-            .pred_int
-            .partial_cmp(&rows[a].pred_int)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    ord.sort_by(|&a, &b| rows[b].pred_int.total_cmp(&rows[a].pred_int));
     let k3: Vec<usize> = ord.into_iter().take(3).collect();
     let prof_raw: Vec<f64> = (0..axis.len())
         .map(|k| k3.iter().map(|&i| traces[i][k]).sum::<f64>())
@@ -1313,8 +1298,7 @@ fn elution_peak_rt_bounds(
         .min_by(|(_, a), (_, b)| {
             (**a as f64 - apex_rt)
                 .abs()
-                .partial_cmp(&((**b as f64 - apex_rt).abs()))
-                .unwrap()
+                .total_cmp(&(**b as f64 - apex_rt).abs())
         })
         .map(|(i, _)| i)
         .unwrap_or(0);
@@ -1399,7 +1383,7 @@ fn fragment_features(
     // trace-based features below are computed over the peak, not the whole extracted
     // RT window (which spans +/- w_rt and would dilute co-elution/profile scores).
     let mut axis_full: Vec<f32> = rows.iter().flat_map(|r| r.rt.iter().cloned()).collect();
-    axis_full.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    axis_full.sort_by(|a, b| a.total_cmp(b));
     axis_full.dedup();
     let traces_full: Vec<Vec<f64>> = rows
         .iter()
@@ -1423,8 +1407,7 @@ fn fragment_features(
             .min_by(|(_, a), (_, b)| {
                 (**a as f64 - apex_rt)
                     .abs()
-                    .partial_cmp(&((**b as f64 - apex_rt).abs()))
-                    .unwrap()
+                    .total_cmp(&(**b as f64 - apex_rt).abs())
             })
             .map(|(i, _)| i)
             .unwrap_or(0);
@@ -1432,11 +1415,7 @@ fn fragment_features(
             Some((l, r)) => global_bound_indices(&axis_full, apex_rt, ai, l, r),
             None => {
                 let mut ord: Vec<usize> = (0..pred.len()).collect();
-                ord.sort_by(|&a, &b| {
-                    pred[b]
-                        .partial_cmp(&pred[a])
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
+                ord.sort_by(|&a, &b| pred[b].total_cmp(&pred[a]));
                 let k3: Vec<usize> = ord.into_iter().take(3).collect();
                 let prof_raw: Vec<f64> = (0..axis_full.len())
                     .map(|k| k3.iter().map(|&i| traces_full[i][k]).sum::<f64>())
@@ -1521,11 +1500,7 @@ fn fragment_features(
         // the row. Library load now rejects non-finite intensities, which is the real fix;
         // this keeps the three sorts consistent so the next reader does not have to work
         // out why one of them differed.
-        order.sort_by(|&a, &b| {
-            pred[a]
-                .partial_cmp(&pred[b])
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        order.sort_by(|&a, &b| pred[a].total_cmp(&pred[b]));
         let take = (order.len() / 2).max(1);
         let low: Vec<f64> = order.iter().take(take).map(|&i| rc[i]).collect();
         f.low_frag_coel = mean(&low);
@@ -1598,7 +1573,7 @@ fn fragment_features(
     let noise = if all_points.is_empty() {
         1.0
     } else {
-        all_points.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        all_points.sort_by(|a, b| a.total_cmp(b));
         all_points[all_points.len() / 2].max(1.0)
     };
     f.log_sn = ((apex_val + 1.0) / (noise + 1.0)).ln();

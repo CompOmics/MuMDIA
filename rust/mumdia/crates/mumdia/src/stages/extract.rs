@@ -386,7 +386,7 @@ fn demix_solve_scan(
         }
         for (j, rs) in ratios.iter_mut().enumerate() {
             if !rs.is_empty() {
-                rs.sort_by(|x, z| x.partial_cmp(z).unwrap_or(std::cmp::Ordering::Equal));
+                rs.sort_by(|x, z| x.total_cmp(z));
                 a_p[j] = rs[rs.len() / 2];
             }
         }
@@ -639,10 +639,7 @@ impl MassOffset {
     #[inline]
     fn factor_at(&self, mz: f64) -> f64 {
         let ppm = if self.grid_mz.len() >= 2 {
-            match self
-                .grid_mz
-                .binary_search_by(|g| g.partial_cmp(&mz).unwrap_or(std::cmp::Ordering::Equal))
-            {
+            match self.grid_mz.binary_search_by(|g| g.total_cmp(&mz)) {
                 Ok(i) => self.grid_ppm[i],
                 Err(0) => self.grid_ppm[0],
                 Err(i) if i >= self.grid_mz.len() => self.grid_ppm[self.grid_mz.len() - 1],
@@ -1116,7 +1113,7 @@ fn extract_twopass_windows(
                     }
                     let mut a_p: BTreeMap<u32, f64> = BTreeMap::new();
                     for (cid, mut v) in uniq {
-                        v.sort_by(|x, z| x.partial_cmp(z).unwrap_or(std::cmp::Ordering::Equal));
+                        v.sort_by(|x, z| x.total_cmp(z));
                         a_p.insert(cid, v[v.len() / 2]);
                     }
                     for (obs, obs_mz, cl) in &prows {
@@ -1393,11 +1390,11 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
         let mut w: Vec<(f64, f64, Vec<f64>)> = tmp
             .into_iter()
             .map(|((lb, ub), mut v)| {
-                v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                v.sort_by(|a, b| a.total_cmp(b));
                 (f64::from_bits(lb), f64::from_bits(ub), v)
             })
             .collect();
-        w.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        w.sort_by(|a, b| a.0.total_cmp(&b.0));
         w
     } else {
         Vec::new()
@@ -1768,7 +1765,7 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
             }
 
             // Group hits into scan groups by RT (dedupe same fragment in a scan by max).
-            hits.sort_by(|a, b| a.rt.partial_cmp(&b.rt).unwrap());
+            hits.sort_by(|a, b| a.rt.total_cmp(&b.rt));
             // scan groups: Vec<(rt, BTreeMap<frag,intensity>)>. A BTreeMap keeps the
             // per-scan fragment order fixed so the f32 apex sum is deterministic.
             let mut groups: Vec<(f64, BTreeMap<u16, f32>)> = Vec::new();
@@ -1806,7 +1803,7 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
                         g.extend_from_slice(&rts[a..b]);
                     }
                 }
-                g.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                g.sort_by(|a, b| a.total_cmp(b));
                 g.dedup();
                 g
             } else {
@@ -1903,11 +1900,7 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
             };
             let sig: Vec<u16> = {
                 let mut ord: Vec<usize> = (0..fints0.len()).collect();
-                ord.sort_by(|&a, &b| {
-                    fints0[b]
-                        .partial_cmp(&fints0[a])
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
+                ord.sort_by(|&a, &b| fints0[b].total_cmp(&fints0[a]));
                 ord.into_iter().take(k_sig).map(|o| o as u16).collect()
             };
             let mut apex_rt = groups[0].0;
@@ -2160,7 +2153,7 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
                     }
                     Some(v) => {
                         let mut s = v.clone();
-                        s.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+                        s.sort_by(|a, b| a.0.total_cmp(&b.0));
                         (
                             s.iter().map(|(r, _)| *r as f32).collect(),
                             s.iter().map(|(_, i)| *i).collect(),

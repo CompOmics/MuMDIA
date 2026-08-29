@@ -1323,7 +1323,7 @@ fn median_sorted(v: &mut [f64]) -> f64 {
     if v.is_empty() {
         return 0.0;
     }
-    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    v.sort_by(|a, b| a.total_cmp(b));
     let m = v.len();
     if m % 2 == 1 {
         v[m / 2]
