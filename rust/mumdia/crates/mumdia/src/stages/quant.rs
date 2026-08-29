@@ -603,6 +603,28 @@ pub fn run(p: QuantParams) -> Result<(u64, u64)> {
     };
     let ch_rt = ch.list_f32("rt")?;
     let ch_int = ch.list_f32("intensity")?;
+    // `rt` and `intensity` are two independent list columns, and every integration
+    // below slices `intensity` with indices computed from the LENGTH OF `rt`
+    // (`fixed_window_indices` bounds against `rt.len()` only). Extract writes them from
+    // paired vectors so they always match, but a chromatograms table is
+    // path-addressable: `mumdia quant --chromatograms` accepts one written by anything,
+    // and a shorter intensity trace would panic with a slice-index message naming no
+    // candidate. Checked once here rather than at each slice site, and it is the same
+    // pairing check `convert` applies to an mzML's m/z and intensity arrays.
+    if let Some(row) = (0..ch.nrows).find(|&i| ch_rt[i].len() != ch_int[i].len()) {
+        anyhow::bail!(
+            concat!(
+                "chromatogram row {} has {} retention-time points but {} intensity ",
+                "points; every integration window is derived from the retention-time ",
+                "trace and applied to the intensity trace, so the two must be the same ",
+                "length in {}"
+            ),
+            row,
+            ch_rt[row].len(),
+            ch_int[row].len(),
+            p.chromatograms
+        );
+    }
     // Group the b/y fragment chromatogram rows by candidate. The MS1 isotope XIC
     // pseudo-traces (frag_name "ms1_*") are precursor channels, not fragment ions,
     // and are excluded from both the peak-window detection and the top-N sum. The
