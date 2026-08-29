@@ -543,7 +543,10 @@ It builds three targets (`release.yml:135-151`): `x86_64-unknown-linux-musl` on
 it needed the `macos-13` label, which no longer receives a runner. Measured
 2026-08-28, that job sat queued over two hours in two separate rehearsals with no
 runner ever assigned, while every other target finished in about three minutes, so
-a real tag would have hung to the six-hour timeout and failed. Cross-compiling it on
+a real tag would have hung until GitHub's 24-hour QUEUE timeout and then failed; a
+rehearsal job was observed reporting exactly `24h0m0s`. That is the limit on waiting
+for a runner, not the six-hour limit on a running job, because nothing ever started.
+Cross-compiling it on
 the arm64 runner was rejected because the result cannot be executed there, and an
 unverifiable archive is what the verification step below exists to prevent.
 

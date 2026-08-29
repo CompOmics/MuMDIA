@@ -103,7 +103,9 @@ sed -i 's/"min_frag_corr"/"gate_min_score"/; s/"group_by": *"precursor"/"group_b
   target was removed: it required GitHub's `macos-13` label, which no longer receives
   a runner (measured 2026-08-28: queued over two hours with none assigned, in two
   separate rehearsals, while every other target finished in about three minutes), so
-  a real tag would have hung to the six-hour timeout and failed. Cross-compiling it on
+  a real tag would have hung until GitHub's 24-hour queue timeout and then failed (a
+  rehearsal job was observed reporting exactly `24h0m0s`; that is the limit on waiting
+  for a runner, not the six-hour limit on a running job). Cross-compiling it on
   the Apple silicon runner was rejected because the result cannot be executed there,
   and publishing the one archive nobody ran is what the verification step above exists
   to prevent. Intel Mac users build from source or use the container image.

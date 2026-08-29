@@ -127,7 +127,10 @@ jobs:
       # `macos-13` label, which no longer receives a runner: measured 2026-08-28, that
       # job sat queued for over two hours in two separate rehearsals while every other
       # target finished in about three minutes, with no runner ever assigned. A real
-      # tag would have hung to the six-hour timeout and failed the release. The
+      # tag would have hung until GitHub's 24-hour QUEUE timeout and then failed the
+      # release; one of the cancelled rehearsal jobs was observed reporting exactly
+      # `24h0m0s`. Note that is the queue limit, not the six-hour limit on a job that
+      # is actually running: nothing ever started. The
       # alternative was cross-compiling it on the arm64 runner, which produces an
       # archive that cannot be executed there and so cannot be verified; a published
       # binary nobody has run is what this workflow now exists to prevent. Intel Mac

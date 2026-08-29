@@ -295,7 +295,9 @@ green and completes the fixture run on the three OSes and in Docker.
       test. `aarch64-unknown-linux-gnu` not added. `x86_64-apple-darwin` was added
       and then removed: it required the `macos-13` label, which no longer receives a
       runner, so the job queued indefinitely and would have failed a real tag at the
-      six-hour timeout.
+      24-hour queue timeout (observed: a rehearsal job reporting `24h0m0s`, which is
+      the limit on waiting for a runner rather than the six-hour limit on a running
+      job, because nothing ever started).
       The fixture and its runner were documented in `docs/19` as the way to
       verify an installation while being excluded from the archive, so the
       documented procedure could not be followed from the archive; they now ship.
