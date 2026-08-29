@@ -407,6 +407,16 @@ sensitivity result for it.
   is always positive, so the fallback is unreachable. The wrong apex propagated
   into `prelim_score`, which decides the pre-FDR competition winner, and into
   quant's integration centre.
+
+  The quantification question this left open is now measured (`bench/README.md`,
+  HYE 3+3, 2026-08-29): quantification does not distinguish the two settings, every
+  accuracy difference being under 0.013 in median |epsilon| and 0.002 in median CV,
+  which is inside the DeepLC fine-tune draw variance the two arms carry. Extraction
+  does distinguish them, in the promoted default's favour: the legacy apex pushes
+  27.6% MORE candidates through extract (14.29 M against 11.20 M over six runs) and
+  returns 1.0% FEWER peptides from them, costing an hour of pooled rescore. That is
+  the fallback showing up as measured cost. Still one acquisition and no entrapment,
+  so the promotion stays a correctness result rather than a sensitivity one.
 - `extract.gate_min_score` stays `0.2`. It was briefly changed to `0.6`, the
   documented optimum for the default `native_tda` rescorer, and then measured: 0.6
   costs 4.4% of peptides for `native_tda` and 4.7% for `nn_torch` at an unchanged

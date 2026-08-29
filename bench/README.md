@@ -14,6 +14,7 @@ library, and hours of compute. The end-to-end test CI does run is
 | `make_proteobench_submission.py` | Build a ProteoBench "Custom" input TSV from per-run `pepquant_<run>.parquet`. Expands MuMDIA's protein entry names back to full FASTA identifiers so ProteoBench's own `Cont_` contaminant flag and `_HUMAN`/`_YEAST`/`_ECOLI` species flags apply unchanged. |
 | `pb_eval.py` | Score a submission offline with ProteoBench's own parser and scoring code. Nothing is uploaded and no token is used. `--module` selects the module, which fixes the run names and the expected ratios; an unknown id is rejected with the available list. |
 | `prov_filter.py` | Condition-evidence filters (F1 to F4) deciding which run values may be reported. Withholding transferred values in a condition with no direct identification is what removes low-abundance ratio compression; see the docstring for the measurements. |
+| `qab_score.py` | Score one arm of a quantification A/B directly from the per-run `peptide_quant.parquet` of a `run-experiment` output tree: features, completeness, median abs epsilon against the HYE expected ratios, and CV. Not ProteoBench's own numbers (see its docstring); the point is that two arms are scored identically. |
 
 Requires `proteobench` (0.18.4 was used), `pyarrow`, `pandas`, `numpy`. That
 version provides the DIA ion modules `quant_lfq_DIA_ion_AIF`, `_Astral`,
@@ -137,6 +138,72 @@ Which apex is better, scored against `rt_pred_cal` from the shared window table
 Consistent in direction, small in size, and a weak instrument: with `w_rt` at 187 s
 the reference's own error dominates that ~28 s median, so it can show direction but
 cannot resolve the apex improvement precisely.
+
+#### The quantification arm, HYE 3+3 (2026-08-29)
+
+The sentence above -- "quantities from before this change are not comparable with
+quantities after it" -- said the apex move was unmeasured where it matters most. This
+measures it, on known ratios rather than on a retention-time proxy.
+
+`mumdia run-experiment` over the six ProteoBench AIF HYE files
+(`LFQ_Orbitrap_AIF_Condition_{A,B}_Sample_Alpha_0{1,2,3}`, with `A_02` under its local
+name), imported DIA-NN library, `nn_torch`, MBR off, one arm per value of
+`extract.apex_evidence_rank` and nothing else changed. MBR is off deliberately:
+transferred rows would add a second variable to a comparison about the apex alone.
+Both arms ran with `MUMDIA_NN_STREAM_GB=64` so both used the in-memory rescore
+backend; they are therefore comparable to each other, but not to HYE numbers recorded
+on the streaming memmap path.
+
+Metrics from `bench/qab_score.py` over the per-run `peptide_quant.parquet`: feature = (peptidoform, charge),
+`quant_status == "quantified"` only, species from the `_HUMAN`/`_YEAST`/`_ECOLI`
+suffixes with multi-species groups dropped (about 900 per arm), expected log2 A/B of
+0 / +1 / -2 from the module's `module_settings.toml`. These are not ProteoBench's own
+numbers: its parser works on precursor ions from a Custom TSV and drops contaminants
+by an accession flag MuMDIA's protein strings do not carry. The point is that both
+arms are scored identically.
+
+| | `true` (promoted default) | `false` (previous default) |
+|---|---|---|
+| accepted by extract, all six runs | 11,196,514 | **14,286,598** |
+| target PSMs at 1% | **431,951** | 430,120 |
+| stripped peptides at 1% | **79,517** | 78,718 |
+| quantified features | **109,234** | 108,260 |
+| features in >= 3 runs / all 6 | **79,280** / 43,039 | 79,036 / **43,127** |
+| median abs epsilon, global | 0.265 | **0.258** |
+| median abs epsilon, species-equalised | 0.464 | **0.452** |
+| median CV | 0.335 | **0.333** |
+| HUMAN median log2 A/B (expected 0) | **-0.008** | -0.009 |
+| YEAST median log2 A/B (expected +1) | 0.843 | 0.843 |
+| ECOLI median log2 A/B (expected -2) | **-1.238** | -1.258 |
+| pooled rescore wall clock | **4 h 16 m** | 5 h 14 m |
+
+**Quantification does not distinguish the two.** Every accuracy difference is under
+0.013 in epsilon and 0.002 in CV, in a comparison whose two arms drew independent
+DeepLC fine-tunes -- a source of variance that has moved held-out window sizing by
+150-211 s and about 2% of peptides elsewhere in this document. The species medians are
+identical to three decimals for yeast and differ in opposite directions for human and
+E. coli. Nothing here separates the arms.
+
+**Extraction does.** The legacy apex pushes 27.6% MORE candidates through extract
+(14.29 M against 11.20 M) and returns FEWER identifications from them: 0.4% fewer PSMs
+and 1.0% fewer peptides. This is the predicted consequence of the fallback the
+promotion was about. When none of the top-K predicted fragments is observed at any
+qualifying scan, the legacy signature-intensity score is 0.0 everywhere, the strict
+`>` never replaces the first candidate, and the apex becomes the lowest-RT qualifying
+scan; the gate is then evaluated at a scan the evidence does not support, and admits
+candidates that competition and FDR later discard. The extra 3.09 M candidates cost an
+hour of rescore and produce nothing.
+
+Read together with the identification arm above: the promoted default keeps
+identification flat, leaves quantification accuracy unchanged within draw variance,
+and reaches that with 22% fewer candidates and an hour less compute. It remains a
+correctness promotion, not a sensitivity result, and the entrapment-plus-second-
+acquisition requirement in `CLAUDE.md` is unaffected -- this is one acquisition, no
+entrapment.
+
+The E. coli compression (-1.24 against an expected -2.0) is present in both arms and
+is not an apex effect. It reproduces the 2026-08-26 pooled HYE result and is tracked
+separately as the low-abundance ratio-compression problem.
 
 ### FDR validity: entrapment, E. coli + human 1:1 (2026-08-28)
 
