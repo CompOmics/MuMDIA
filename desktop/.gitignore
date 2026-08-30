@@ -8,3 +8,4 @@ src-tauri/binaries/*
 
 # Tauri writes generated permission schemas here.
 src-tauri/gen/
+src-tauri/resources/

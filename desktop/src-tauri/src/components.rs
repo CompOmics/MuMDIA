@@ -181,20 +181,26 @@ pub fn find_uv() -> Option<PathBuf> {
         .find(|p| p.is_file())
 }
 
-/// The requirements file describing the managed environment.
+/// The two requirement sets, compiled in for the same reason as the settings
+/// schema: a file that is not a file cannot go missing from a bundle, and these
+/// change only when the application itself is rebuilt.
+const REQUIREMENTS_PRIMARY: &str = include_str!("../../../env/console-requirements.txt");
+const REQUIREMENTS_MS2PIP: &str = include_str!("../../../env/console-ms2pip-requirements.txt");
+
+/// Write the requirements for `env` where `uv` can read them, and return the path.
 ///
-/// Shipped beside the application in `env/`, which is what the release archive
-/// already stages; the development fallback reaches into the repository.
-pub fn requirements(env: Env) -> Option<PathBuf> {
-    let name = env.requirements_name();
-    let mut cands = Vec::new();
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            cands.push(dir.join("env").join(name));
-            cands.push(dir.join("../../../../env").join(name));
-        }
-    }
-    cands.into_iter().find(|p| p.is_file())
+/// Into the managed data directory rather than a temporary file, so that when an
+/// installation fails the exact input is still on disk to look at.
+pub fn requirements(env: Env) -> Result<PathBuf, String> {
+    let text = match env {
+        Env::Primary => REQUIREMENTS_PRIMARY,
+        Env::Ms2pip => REQUIREMENTS_MS2PIP,
+    };
+    let dir = data_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    let path = dir.join(env.requirements_name());
+    std::fs::write(&path, text).map_err(|e| format!("could not write {}: {e}", path.display()))?;
+    Ok(path)
 }
 
 /// Ask an interpreter which of `modules` it cannot import.
@@ -332,8 +338,7 @@ pub fn install(installer: Arc<Installer>, env: Env) -> Result<(), String> {
     let uv = find_uv().ok_or_else(|| {
         "the installer component `uv` was not found beside the application or on PATH".to_string()
     })?;
-    let reqs = requirements(env)
-        .ok_or_else(|| format!("env/{} was not found", env.requirements_name()))?;
+    let reqs = requirements(env)?;
     let venv = venv_dir(env);
     std::fs::create_dir_all(data_dir())
         .map_err(|e| format!("cannot create {}: {e}", data_dir().display()))?;
@@ -480,6 +485,39 @@ pub fn install(installer: Arc<Installer>, env: Env) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn both_requirement_sets_are_compiled_in_and_look_right() {
+        // Requirement lines only. The comments legitimately discuss MS2PIP at
+        // length, explaining why it is absent, and a substring search over the whole
+        // file reads that prose as a dependency.
+        fn requirement_lines(text: &str) -> Vec<&str> {
+            text.lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty() && !l.starts_with('#') && !l.starts_with("--"))
+                .collect()
+        }
+        let primary = requirement_lines(REQUIREMENTS_PRIMARY);
+        assert!(
+            primary.iter().any(|l| l.starts_with("deeplc==")),
+            "the primary set pins DeepLC: {primary:?}"
+        );
+        assert!(
+            primary.iter().any(|l| l.starts_with("torch==")),
+            "the primary set pins torch: {primary:?}"
+        );
+        // The whole reason there are two environments: they cannot be one.
+        assert!(
+            !primary.iter().any(|l| l.starts_with("ms2pip")),
+            "MS2PIP must not be in the primary set; it conflicts with DeepLC: {primary:?}"
+        );
+        assert!(
+            requirement_lines(REQUIREMENTS_MS2PIP)
+                .iter()
+                .any(|l| l.starts_with("ms2pip==")),
+            "the optional set pins MS2PIP"
+        );
+    }
 
     #[test]
     fn the_two_environments_do_not_share_a_directory() {

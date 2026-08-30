@@ -135,7 +135,32 @@ settings today. Every save is validated by the engine before it is offered for u
     # the real component installation; downloads several hundred megabytes
     MUMDIA_TEST_INSTALL=1 cargo test the_primary_environment
 
+## Packaging
+
+`cargo tauri build` produces an `.msi` on Windows and an `.AppImage` on Linux. Only
+two files are shipped as Tauri resources, both executables: the engine and `uv`, in
+`binaries/` beside the application.
+
+Everything else the application needs from the repository is compiled in with
+`include_str!`: the settings schema, and the two requirement sets. That is both
+simpler and more robust than shipping them as files, and it costs nothing in
+freshness, because all three are generated from sources that require a rebuild
+anyway. It also avoids two Tauri packaging traps found while building the first
+installer:
+
+- in the resource LIST form, a `..` source keeps its shape, so `"../../configs/*"`
+  installs to `<install>/_up_/_up_/configs/`, where nothing looks for it. This was
+  read out of the generated WiX source, not guessed;
+- in the resource MAP form, which does let a destination be named, a `..` source
+  fails the build outright with `Access is denied`.
+
+Verified on Windows: a 29 MB installer containing `mumdia-console.exe` with
+`binaries/mumdia.exe` and `binaries/uv.exe` beside it, and no `_up_` directory.
+
 ## What is not here yet
 
-Pre-flight disk-space and peak-cap checks, and run history, from milestone 3. The
-release bundles exist in `release.yml` but have not been through a rehearsal.
+Pre-flight disk-space and peak-cap checks, and run history, from milestone 3.
+
+The Linux `.AppImage` has never been built. An AppImage's resource directory is not
+laid out like an MSI's, so `engine.rs` may need a `resource_dir()` lookup in addition
+to the two it has. That is the first thing to check in a release rehearsal.

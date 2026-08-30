@@ -46,25 +46,22 @@ pub struct Schema {
     pub fields: Vec<Field>,
 }
 
-/// Find `config-schema.json`: beside the application, then in the repository.
-pub fn schema_path() -> Option<PathBuf> {
-    let mut cands = Vec::new();
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            cands.push(dir.join("configs").join("config-schema.json"));
-            cands.push(dir.join("../../../../configs/config-schema.json"));
-        }
-    }
-    cands.into_iter().find(|p| p.is_file())
-}
+/// The settings schema, compiled in.
+///
+/// Embedded rather than shipped beside the application, for two reasons. It cannot
+/// then go missing from a bundle, which is a real failure mode: the first Windows
+/// installer built here put `..`-rooted resources in a literal `_up_` directory
+/// where nothing would have found them. And it costs nothing in freshness, because
+/// the schema is generated from `config.rs` and any change to it requires a rebuild
+/// anyway.
+///
+/// `ci/gen_config_reference.py` writes this file and CI fails when it is stale, so
+/// the compiled-in copy is the same one the reference document describes.
+const SCHEMA_JSON: &str = include_str!("../../../configs/config-schema.json");
 
 pub fn load_schema() -> Result<Schema, String> {
-    let path = schema_path().ok_or_else(|| {
-        "configs/config-schema.json was not found beside the application".to_string()
-    })?;
-    let text = std::fs::read_to_string(&path)
-        .map_err(|e| format!("could not read {}: {e}", path.display()))?;
-    serde_json::from_str(&text).map_err(|e| format!("could not parse {}: {e}", path.display()))
+    serde_json::from_str(SCHEMA_JSON)
+        .map_err(|e| format!("the compiled-in settings schema could not be parsed: {e}"))
 }
 
 /// Turn `{"extract.gate_min_score": 0.3}` into the nested JSON the engine reads.

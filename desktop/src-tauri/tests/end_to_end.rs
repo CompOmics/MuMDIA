@@ -199,8 +199,8 @@ fn the_primary_environment_installs_and_imports() {
         "uv must be bundled or on PATH for the installer to work"
     );
     assert!(
-        components::requirements(Env::Primary).is_some(),
-        "env/console-requirements.txt must ship beside the application"
+        components::requirements(Env::Primary).is_ok(),
+        "the compiled-in requirements must be writable to the data directory"
     );
 
     let installer = std::sync::Arc::new(components::Installer::default());

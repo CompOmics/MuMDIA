@@ -1,11 +1,10 @@
 # The single environment the desktop application installs, covering every sidecar
 # role at once.
 #
-# Why one environment and not the two conda specifications beside this file: the
-# union of what the four roles import is a single dependency set, so one
-# interpreter path satisfies rescoring, DeepLC, MS2PIP and match-between-runs
-# alike. Two environments would mean two downloads of torch-sized wheels, two
-# things to keep in step, and four config fields pointing at two places.
+# Why this instead of the two conda specifications beside this file: rescoring,
+# DeepLC and match-between-runs share one dependency set happily, and that is the
+# whole recommended workflow, so one interpreter serves all three. MS2PIP is the
+# exception, and is dealt with below.
 #
 # Why pip and not conda: reading env/mumdia-deeplc.yml, conda contributes
 # `python=3.11` and `pip`, and everything that matters is already pip. `uv` supplies
