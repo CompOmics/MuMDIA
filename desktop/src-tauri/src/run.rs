@@ -164,18 +164,56 @@ fn kill_tree(pid: u32) {
     }
     #[cfg(unix)]
     {
-        // Negative pid addresses the process group. TERM first so the engine can
-        // unwind and clean up its own temp files, KILL shortly after for anything
-        // that ignored it.
-        let group = format!("-{pid}");
+        // Signalling a process group is how the engine's Python workers get
+        // included, and it is also how you kill everything you are running inside
+        // if the group turns out to be your own. That is not hypothetical: an
+        // earlier version of this function, exercised by its own test, terminated a
+        // CI runner.
+        //
+        // So the group is verified before it is signalled. `Command::process_group`
+        // is asked for at spawn time, but if it did not take effect the child sits
+        // in OUR group, and a group kill would take down the application, the shell
+        // that started it, and on a shared machine whatever else shares that group.
+        // When the guard trips the child is still killed, just individually.
+        let target_pgid = pgid_of(pid);
+        let own_pgid = pgid_of(std::process::id());
+        let group_is_safe = match (target_pgid, own_pgid) {
+            // A group of its own: signal the group, which is the whole point.
+            (Some(t), Some(o)) => t != o && t == pid,
+            // Unknown either way: do not guess with SIGKILL.
+            _ => false,
+        };
+        let target = if group_is_safe {
+            format!("-{pid}")
+        } else {
+            pid.to_string()
+        };
+        // TERM first so the engine can unwind and remove its own temp files, KILL
+        // shortly after for anything that ignored it.
         let _ = std::process::Command::new("kill")
-            .args(["-TERM", &group])
+            .args(["-TERM", &target])
             .status();
         std::thread::sleep(Duration::from_millis(1500));
         let _ = std::process::Command::new("kill")
-            .args(["-KILL", &group])
+            .args(["-KILL", &target])
             .status();
     }
+}
+
+/// The process-group id of `pid`, via `ps`, or `None` if it cannot be determined.
+///
+/// Shelling out rather than calling `getpgid`, which would need `unsafe` in a crate
+/// that has none. This runs twice per cancellation, not in a loop.
+#[cfg(unix)]
+fn pgid_of(pid: u32) -> Option<u32> {
+    let out = std::process::Command::new("ps")
+        .args(["-o", "pgid=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse::<u32>()
+        .ok()
 }
 
 /// Remove `*.tmp-<pid>` files left by a killed run, recursively.
@@ -739,6 +777,41 @@ mod tests {
     ///
     /// The end-to-end cancel test cannot cover this: the fixture search finishes in
     /// under a second, faster than a stop can be issued.
+    /// The guard that stops a cancellation killing the application itself.
+    ///
+    /// This is the check whose absence terminated a CI runner: without it,
+    /// `kill_tree` would signal whatever group the child happened to be in, and if
+    /// that is our own group the kill reaches the process doing the killing.
+    #[cfg(unix)]
+    #[test]
+    fn a_process_in_our_own_group_is_never_group_killed() {
+        // A child spawned WITHOUT `process_group` inherits ours, which is exactly
+        // the situation the guard exists for.
+        let mut cmd = std::process::Command::new("sh");
+        cmd.args(["-c", "sleep 30"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut child = cmd.spawn().expect("could not spawn the test process");
+        let own = pgid_of(std::process::id());
+        let theirs = pgid_of(child.id());
+        assert_eq!(
+            own, theirs,
+            "a child spawned without process_group should share our group"
+        );
+        // The decision the guard makes, without acting on it: this must NOT be a
+        // group kill.
+        let group_is_safe = match (theirs, own) {
+            (Some(t), Some(o)) => t != o && t == child.id(),
+            _ => false,
+        };
+        assert!(
+            !group_is_safe,
+            "killing this group would kill the test process itself"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
     #[test]
     fn kill_tree_terminates_the_process_it_is_given() {
         let mut cmd = if cfg!(windows) {
