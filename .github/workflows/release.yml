@@ -360,8 +360,19 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # GNU, not musl, and measured rather than assumed. The engine's own
+          # release archives are musl and stay musl; inside an AppImage they do not
+          # survive. `linuxdeploy` runs `patchelf` over every ELF binary it bundles,
+          # and a static-pie musl binary comes out with a `RUNPATH [$ORIGIN]` entry
+          # injected into it and segfaults immediately. Verified by extracting a
+          # built AppImage and running the engine inside it; `uv`, dynamically
+          # linked, survived the same treatment untouched.
+          #
+          # Nothing is lost. musl would buy portability only if the bundle had no
+          # other glibc floor, and the Tauri host links WebKitGTK, so the
+          # application sets that floor whatever the engine is built against.
           - os: ubuntu-latest
-            target: x86_64-unknown-linux-musl
+            target: x86_64-unknown-linux-gnu
             engine_exe: ""
             bundle_glob: "desktop/target/release/bundle/appimage/*.AppImage"
           - os: windows-latest
@@ -380,7 +391,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf \
-            libssl-dev musl-tools
+            libssl-dev
 
       # Inside `rust/mumdia`, not at the repository root. That directory pins its
       # toolchain with `rust-toolchain.toml`, and `rustup target add` adds the target
