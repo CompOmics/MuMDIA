@@ -135,6 +135,21 @@ settings today. Every save is validated by the engine before it is offered for u
     # the real component installation; downloads several hundred megabytes
     MUMDIA_TEST_INSTALL=1 cargo test the_primary_environment
 
+    # the process-tree kill. NOT run in CI, and not on a machine you share
+    MUMDIA_TEST_KILL=1 cargo test kill_tree
+
+`MUMDIA_TEST_KILL` is opt-in because that test terminated a GitHub runner twice. The
+first time is explained: the group kill had no guard and could signal the runner's
+own process group. The second time it did it again with the guard in place, which
+should have permitted a group signal only for a child verifiably in its own group,
+and that is not accounted for. The gating follows from not knowing rather than from
+a diagnosis.
+
+The consequence, stated plainly: the Unix group-kill path in `kill_tree` is covered
+by nothing automated. The guard's decision is tested without acting on it, and the
+kill itself is verified on Windows, where `taskkill /T` addresses a process tree
+rather than a group.
+
 ## Packaging
 
 `cargo tauri build` produces an `.msi` on Windows and an `.AppImage` on Linux. Only

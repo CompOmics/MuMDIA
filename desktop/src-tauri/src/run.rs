@@ -812,8 +812,31 @@ mod tests {
         let _ = child.wait();
     }
 
+    /// Opt-in with `MUMDIA_TEST_KILL=1`, and never in shared CI.
+    ///
+    /// This test terminated a GitHub runner twice. The first time is explained: the
+    /// group kill had no guard, so it could signal the runner's own process group.
+    /// The second time it did it again WITH the guard, which should have made a
+    /// group kill possible only when the child is verifiably in a group of its own,
+    /// and I cannot account for that. Two possibilities remain open: the guard's
+    /// reasoning is wrong in a way I have not seen, or something about the runner's
+    /// process arrangement makes any group signal fatal there.
+    ///
+    /// What follows from not knowing is the gating, not a guess. A test that can
+    /// take down the machine it runs on does not belong in a shared pipeline while
+    /// its failure mode is unexplained, and the thing it checks is verified on
+    /// Windows, where `taskkill /T` addresses a process tree rather than a group.
+    ///
+    /// The consequence to be honest about: the Unix group-kill path in `kill_tree`
+    /// is exercised by nothing automated. `a_process_in_our_own_group_is_never_group_killed`
+    /// covers the guard's decision without acting on it, which is the part that can
+    /// be tested safely.
     #[test]
     fn kill_tree_terminates_the_process_it_is_given() {
+        if std::env::var("MUMDIA_TEST_KILL").ok().as_deref() != Some("1") {
+            eprintln!("MUMDIA_TEST_KILL=1 not set; skipping (see the comment above)");
+            return;
+        }
         let mut cmd = if cfg!(windows) {
             let mut c = std::process::Command::new("cmd");
             c.args(["/C", "ping -n 30 127.0.0.1"]);
