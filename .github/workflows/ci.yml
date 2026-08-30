@@ -338,6 +338,44 @@ jobs:
           python -m pip install --quiet pytest
           python -m pytest tests/python -q -rs
 
+  # The desktop application. A separate Cargo workspace, so nothing above builds it,
+  # and without this job it could break while every other check stayed green.
+  #
+  # It is not independent of the engine either: the settings schema and both
+  # requirement files are compiled into it with `include_str!`, so a change to
+  # `config.rs` that regenerates `configs/config-schema.json` reaches this crate.
+  # That coupling is what makes the job worth its minutes.
+  desktop:
+    name: desktop app
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      # Tauri links WebKitGTK, whose development headers the runner does not carry.
+      - name: Install the build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends             libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+
+      - name: Format
+        working-directory: desktop/src-tauri
+        run: cargo fmt --check
+
+      - name: Clippy
+        working-directory: desktop/src-tauri
+        run: cargo clippy --all-targets -- -D warnings
+
+      # Library tests only. The end-to-end tests skip themselves without an engine
+      # binary, which would make this job look like it covered more than it does; a
+      # real bundle is exercised by the release rehearsal instead.
+      - name: Unit tests
+        working-directory: desktop/src-tauri
+        run: cargo test --lib
+
+      # The frontend has no build step, so this is its whole check.
+      - name: Frontend agrees with the backend
+        run: python ci/check_desktop_ui.py
+
   smoke-cross-platform:
     name: cross-platform byte equality
     runs-on: ubuntu-latest
