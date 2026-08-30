@@ -157,10 +157,31 @@ installer:
 Verified on Windows: a 29 MB installer containing `mumdia-console.exe` with
 `binaries/mumdia.exe` and `binaries/uv.exe` beside it, and no `_up_` directory.
 
+### The Linux engine is a GNU build, not musl
+
+The engine's own release archives are musl and stay musl. Inside an AppImage they do
+not survive: `linuxdeploy` runs `patchelf` over every ELF binary it bundles, and a
+static-pie musl binary comes out with `RUNPATH [$ORIGIN]` injected and segfaults
+immediately. Verified by extracting a built AppImage and running the engine inside
+it; `uv`, dynamically linked, survived the same treatment untouched.
+
+Nothing is lost. musl would buy portability if the bundle had no other glibc floor,
+but the Tauri host links WebKitGTK and sets that floor regardless.
+
+### Where the engine actually sits in each bundle
+
+    MSI       <install>/mumdia-console.exe
+              <install>/binaries/mumdia.exe
+
+    AppImage  usr/bin/mumdia-console
+              usr/lib/MuMDIA/binaries/mumdia
+
+Note that the AppImage does NOT put the engine beside the executable. That is why
+the lookup asks Tauri for the resource directory first; without it the application
+would search `usr/bin/` and report that it cannot find its own engine.
+
 ## What is not here yet
 
-Pre-flight disk-space and peak-cap checks, and run history, from milestone 3.
-
-The Linux `.AppImage` has never been built. An AppImage's resource directory is not
-laid out like an MSI's, so `engine.rs` may need a `resource_dir()` lookup in addition
-to the two it has. That is the first thing to check in a release rehearsal.
+Nobody has clicked through the interface. The backend it drives is covered by tests,
+and both bundles have been built and inspected, but the buttons themselves rest on
+inspection.
