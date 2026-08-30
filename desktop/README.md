@@ -78,11 +78,64 @@ echoing the request.
 
 Plain ES modules, no framework and no build step, so the release pipeline needs no
 Node. `ui/` is served as static files. If this grows to include the generated
-settings editor, revisit that decision then — it is much easier to add a bundler
+settings editor, revisit that decision then: it is much easier to add a bundler
 later than to remove one.
+
+## Analysis components
+
+The application installs its own Python environment with `uv`, so conda is never
+needed. It goes under the per-user data directory (`%LOCALAPPDATA%\MuMDIA` or
+`~/.local/share/MuMDIA`), not beside the executable, because on Windows that is
+Program Files and an installer that needs administrator rights on first run is not
+an easy install.
+
+**Searching without the components is refused.** MuMDIA does run with no Python at
+all, but the recorded numbers make that a bad default to offer: on the same file the
+fully native FASTA path returns about 1,213 report rows against about 10,300 for the
+imported-library workflow with DeepLC and neural rescoring. The refusal predicate is
+narrow on purpose -- "this configuration requires no sidecar at all", asked of
+`mumdia doctor --json` rather than kept as a list here. Refusing anything mentioning
+`native_tda` would be wrong: on an imported library it measured 10,847 against
+`nn_torch`'s 10,914.
+
+### Two environments, not one
+
+MS2PIP cannot share an environment with DeepLC at the versions this project tests:
+
+    deeplc==4.1.1  -> psm-utils>=1.5 -> sqlalchemy>=2
+    ms2pip==4.0.0  ->                   sqlalchemy>=1.3,<2
+
+`uv` reports the pair as unsatisfiable. `ms2pip>=4.1` does resolve alongside DeepLC,
+but MS2PIP's version changes predicted fragment intensities, and
+`env/docker-rescore.yml` pins 4.0.0 deliberately as "a separate, testable upgrade".
+So the primary environment covers rescoring, DeepLC and match-between-runs, which is
+the whole recommended workflow, and MS2PIP gets its own, installed on request and
+needed only for FASTA-mode library building with predicted intensities.
+
+## Settings
+
+The editor is generated from `configs/config-schema.json`, which
+`ci/gen_config_reference.py` emits from the same parse of `config.rs` that produces
+the reference document, staleness-checked in CI beside it. Nothing about a setting
+is written in the interface, so it cannot describe a parameter the engine does not
+have.
+
+Saving writes only the difference from the defaults. `Config` is
+`deny_unknown_fields` with serde defaults, so that is a valid configuration, and it
+means a later release that improves a default still reaches someone who saved
+settings today. Every save is validated by the engine before it is offered for use.
+
+## Testing
+
+    cargo test --lib                 # unit tests, no engine needed
+
+    # end to end, against a real engine and the fixture ci/smoke.sh generates
+    MUMDIA_BIN=... MUMDIA_TEST_MZML=... MUMDIA_TEST_FASTA=... cargo test
+
+    # the real component installation; downloads several hundred megabytes
+    MUMDIA_TEST_INSTALL=1 cargo test the_primary_environment
 
 ## What is not here yet
 
-This is milestone 1 of the plan: it runs a search and shows the result. Component
-installation (bundled `uv`), the generated settings editor, pre-flight disk and
-peak-cap checks, and the release bundles are milestones 2 to 4.
+Pre-flight disk-space and peak-cap checks, and run history, from milestone 3. The
+release bundles exist in `release.yml` but have not been through a rehearsal.

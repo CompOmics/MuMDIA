@@ -342,3 +342,128 @@ jobs:
             rust/mumdia/dist/*.sha256
           if-no-files-found: error
           retention-days: 7
+
+  # The desktop application, built for the two platforms it targets.
+  #
+  # A separate job rather than steps inside `release`: it needs Node-free but
+  # webview-ful build dependencies on Linux, its own cargo workspace, and it must not
+  # slow down or fail the engine archives, which are the primary artifact. macOS is
+  # deliberately absent -- an unsigned bundle is blocked outright by Gatekeeper, so
+  # shipping one would be worse than shipping none.
+  desktop:
+    name: desktop ${{ matrix.target }}
+    needs: [validate-tag]
+    if: always() && contains(fromJSON('["success", "skipped"]'), needs.validate-tag.result)
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            engine_exe: ""
+            bundle_glob: "desktop/target/release/bundle/appimage/*.AppImage"
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            engine_exe: ".exe"
+            bundle_glob: "desktop/target/release/bundle/msi/*.msi"
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      # Tauri needs the platform webview headers at build time on Linux. The
+      # produced AppImage carries what it needs at runtime.
+      - name: Install the Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf \
+            libssl-dev musl-tools
+
+      - name: Add the engine target
+        run: rustup target add ${{ matrix.target }}
+
+      # The application ships the engine it was built alongside. Building both from
+      # one checkout is what makes a version mismatch impossible.
+      - name: Build the engine
+        working-directory: rust/mumdia
+        run: cargo build --release --locked --target ${{ matrix.target }} --bin mumdia
+
+      # Everything the application expects to find beside itself. `binaries/` is
+      # where `engine.rs` and `components.rs` look, and `uv` is what installs the
+      # analysis components without conda.
+      - name: Stage the bundled binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p desktop/src-tauri/binaries
+          cp "rust/mumdia/target/${{ matrix.target }}/release/mumdia${{ matrix.engine_exe }}" \
+             desktop/src-tauri/binaries/
+          # uv publishes static binaries per platform; take the pinned release rather
+          # than whatever `latest` happens to be on the day of a build.
+          UV_VERSION=0.10.6
+          case "${{ runner.os }}" in
+            Linux)   UV_ASSET="uv-x86_64-unknown-linux-gnu.tar.gz" ;;
+            Windows) UV_ASSET="uv-x86_64-pc-windows-msvc.zip" ;;
+          esac
+          curl -fsSL -o uv-asset \
+            "https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/${UV_ASSET}"
+          case "$UV_ASSET" in
+            *.tar.gz) tar xzf uv-asset --strip-components=1 -C desktop/src-tauri/binaries ;;
+            *.zip)    python -c "import sys,zipfile;zipfile.ZipFile('uv-asset').extractall('desktop/src-tauri/binaries')" ;;
+          esac
+          ls -la desktop/src-tauri/binaries
+
+      # The bundler that produces the .msi and .AppImage. Installed rather than
+      # vendored, and pinned, so a bundler change arrives as a reviewed version bump.
+      - name: Install the Tauri bundler
+        run: cargo install tauri-cli --version "^2" --locked
+
+      - name: Build the installer
+        working-directory: desktop
+        run: cargo tauri build
+
+      - name: Collect the installers
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p desktop/dist
+          shopt -s nullglob
+          found=(${{ matrix.bundle_glob }})
+          shopt -u nullglob
+          if [ ${#found[@]} -eq 0 ]; then
+            echo "::error::the bundler produced no installer"
+            find desktop/target/release/bundle -maxdepth 2 -type f || true
+            exit 1
+          fi
+          for f in "${found[@]}"; do
+            cp "$f" desktop/dist/
+          done
+          cd desktop/dist
+          for f in *; do
+            if command -v sha256sum > /dev/null 2>&1; then
+              sha256sum "$f" > "$f.sha256"
+            else
+              shasum -a 256 "$f" > "$f.sha256"
+            fi
+          done
+          ls -la
+
+      - name: Upload to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@da05d552573ad5aba039eaac05058a918a7bf631 # v2.2.2
+        with:
+          files: |
+            desktop/dist/*
+          generate_release_notes: true
+
+      - name: Upload installers as a workflow artifact (rehearsal only)
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: desktop-dryrun-${{ matrix.target }}
+          path: desktop/dist/*
+          if-no-files-found: error
+          retention-days: 7

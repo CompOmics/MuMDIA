@@ -3,7 +3,8 @@ target/
 
 # Engine and installer binaries staged into the bundle by CI, never committed:
 # they are build artifacts of another workspace and are megabytes each.
-src-tauri/binaries/
+src-tauri/binaries/*
+!src-tauri/binaries/README.md
 
 # Tauri writes generated permission schemas here.
 src-tauri/gen/
