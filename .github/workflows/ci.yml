@@ -434,7 +434,10 @@ jobs:
       # docs/24 is generated from config.rs, so a new field or a changed default
       # must land with its documentation or CI fails. A reference nobody
       # regenerates is worse than none, because it reads as current.
-      - name: Config reference is current
+      # One parse of config.rs produces two artifacts: the reference document a
+      # person reads, and configs/config-schema.json, which the desktop settings
+      # editor renders its form from. They go stale together, so --check covers both.
+      - name: Config reference and schema are current
         run: python ci/gen_config_reference.py --check
 
       # The release binary is statically linked, so it carries 173 third-party crates
