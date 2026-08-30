@@ -2,7 +2,7 @@
 // builds keep it, because that is where the developer's own `println!` goes.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use mumdia_console::{components, engine, run, settings};
+use mumdia_console::{components, engine, preflight as pf, run, settings};
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -90,11 +90,34 @@ fn preflight(
         ));
     }
 
+    // Room on disk. The engine cannot resume, so filling the volume at hour three
+    // loses the whole search; this is the cheapest possible moment to notice.
+    let disk = pf::disk(&req.mzml, &req.out_dir);
+    let mut warnings: Vec<String> = Vec::new();
+    if !disk.unknown && !disk.enough {
+        let gb = |b: u64| format!("{:.1} GB", b as f64 / 1e9);
+        warnings.push(format!(
+            "This search may need about {} and the drive has {} free. A search cannot \
+             resume, so running out part-way loses all of it.",
+            gb(disk.estimated_output_bytes),
+            gb(disk.free_bytes)
+        ));
+    }
+
     Ok(serde_json::json!({
         "ok": blockers.is_empty(),
         "blockers": blockers,
+        "warnings": warnings,
+        "disk": disk,
         "components_complete": comp.complete,
     }))
+}
+
+/// Peaks per MS2 spectrum for a chosen file, so the peak cap can be set from the
+/// file rather than from another acquisition.
+#[tauri::command]
+fn peak_census(mzml: String) -> Result<serde_json::Value, String> {
+    pf::peak_census(&mzml)
 }
 
 /// The settings schema the editor renders its form from.
@@ -224,12 +247,24 @@ fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(AppState::default())
+        .setup(|app| {
+            // Tell the engine and component lookups where the bundler put things.
+            // Without this an AppImage cannot find its own engine: its resources live
+            // under `usr/lib/<app>/`, not beside the executable, so every
+            // `exe.parent()` candidate misses.
+            match app.path().resource_dir() {
+                Ok(dir) => engine::set_resource_dir(dir),
+                Err(e) => eprintln!("could not resolve the resource directory: {e}"),
+            }
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             engine_info,
             components_status,
             components_install,
             config_schema,
             save_settings,
+            peak_census,
             preflight,
             start_run,
             run_state,

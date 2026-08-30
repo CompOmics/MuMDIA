@@ -429,6 +429,7 @@ async function pick(what) {
   if (!chosen) return;
   const path = Array.isArray(chosen) ? chosen[0] : chosen;
   state.picks[what] = path;
+  if (what === "mzml") showPeakCensus(path);
   const el = $(LABEL[what]);
   // Shown right-to-left so the filename stays visible on a long path; the full
   // path is the tooltip.
@@ -436,6 +437,51 @@ async function pick(what) {
   el.title = path;
   el.classList.add("set");
   banner($("start-error"), "");
+}
+
+// ── the peak cap, answered from the file ────────────────────────────────────
+// The documentation is emphatic that a peak cap is acquisition-specific, and that
+// one carried from another run deletes fragment evidence rather than failing: on a
+// 50-window Orbitrap DIA run a 300-peak cap discarded 78.6% of MS2 peaks and cost
+// 60% of the peptides. The application has the file, so it answers the question
+// rather than leaving a number box for someone to guess into.
+async function showPeakCensus(mzml) {
+  const panel = $("peak-note");
+  const body = $("peak-body");
+  body.textContent = "Reading the file…";
+  show(panel, true);
+  let c;
+  try {
+    c = await invoke("peak_census", { mzml });
+  } catch {
+    // Not being able to read it here is not a reason to say anything alarming; the
+    // engine will report the real problem if the file is unusable.
+    show(panel, false);
+    return;
+  }
+  const p = c.peaks_per_ms2;
+  const at300 = (c.caps || []).find((x) => x.cap === 300);
+  const lines = [
+    `${fmtInt(c.ms2_spectra)} MS2 spectra sampled. Peaks per spectrum: ` +
+      `p25 ${fmtInt(p.p25)}, median ${fmtInt(p.p50)}, p95 ${fmtInt(p.p95)}, ` +
+      `max ${fmtInt(p.max)}.`,
+  ];
+  if (at300 && at300.fraction_of_peaks_discarded > 0.02) {
+    lines.push(
+      `A 300-peak cap would truncate ${(at300.fraction_of_spectra_truncated * 100).toFixed(0)}% ` +
+        `of spectra and discard ${(at300.fraction_of_peaks_discarded * 100).toFixed(0)}% of all ` +
+        `peaks. Uncapped is the default, and is right for this file.`
+    );
+  } else {
+    lines.push("No cap is applied by default, which is right for this file.");
+  }
+  if (c.profile_ms2_spectra > 0) {
+    lines.push(
+      `${fmtInt(c.profile_ms2_spectra)} spectra are profile mode, so these are raw ` +
+        `sample counts rather than centroided peaks.`
+    );
+  }
+  body.textContent = lines.join(" ");
 }
 
 // ── starting and polling ────────────────────────────────────────────────────
@@ -467,6 +513,8 @@ async function start() {
       );
       return;
     }
+    // Not blocking, but worth saying before an hour is spent on it.
+    banner($("preflight-note"), (pf.warnings || []).join("\n\n"));
   } catch (e) {
     // A preflight that cannot run is not a reason to refuse: say so and let the
     // engine be the judge, since it reports its own errors perfectly well.

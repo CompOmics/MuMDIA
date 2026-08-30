@@ -166,6 +166,15 @@ pub fn managed_python(env: Env) -> PathBuf {
 /// use it would mean nobody could test this without building a bundle.
 pub fn find_uv() -> Option<PathBuf> {
     let exe_name = if cfg!(windows) { "uv.exe" } else { "uv" };
+    // Same reasoning as the engine lookup: an AppImage's resources are not beside
+    // the executable, and only the shell knows where they are.
+    if let Some(res) = crate::engine::resource_dir() {
+        for cand in [res.join("binaries").join(exe_name), res.join(exe_name)] {
+            if cand.is_file() {
+                return Some(cand);
+            }
+        }
+    }
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
             for cand in [dir.join(exe_name), dir.join("binaries").join(exe_name)] {

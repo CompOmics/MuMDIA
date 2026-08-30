@@ -7,8 +7,32 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
 
 use serde::Serialize;
+
+/// Where the bundler put this application's resources, once the shell knows.
+///
+/// Needed because the answer is not "beside the executable" on every platform. An
+/// MSI installs resources next to the exe; an AppImage mounts them under
+/// `usr/lib/<app>/`, which no amount of `exe.parent()` will find. Tauri knows the
+/// right directory, so `main` records it here at startup and the lookups below
+/// consult it first.
+///
+/// A `OnceLock` rather than threading the handle through every call: resolution
+/// happens on background threads that have no `AppHandle`, and the value is set once
+/// and never changes.
+static RESOURCE_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+/// Record the bundle's resource directory. Called once, from `main`.
+pub fn set_resource_dir(dir: PathBuf) {
+    let _ = RESOURCE_DIR.set(dir);
+}
+
+/// The bundle's resource directory, if the shell has told us.
+pub fn resource_dir() -> Option<&'static PathBuf> {
+    RESOURCE_DIR.get()
+}
 
 /// Name of the engine executable on this platform.
 pub const EXE: &str = if cfg!(windows) {
@@ -40,6 +64,12 @@ fn candidates() -> Vec<(PathBuf, &'static str)> {
 
     if let Some(p) = std::env::var_os("MUMDIA_BIN") {
         out.push((PathBuf::from(p), "MUMDIA_BIN"));
+    }
+    // The bundler's own answer first, because on Linux it is the only correct one:
+    // an AppImage keeps resources under `usr/lib/<app>/`, not beside the executable.
+    if let Some(res) = resource_dir() {
+        out.push((res.join("binaries").join(EXE), "bundled"));
+        out.push((res.join(EXE), "bundled"));
     }
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {

@@ -377,6 +377,19 @@ enum Cmd {
     },
     /// Print schema, head sample, and row count for any artifact.
     Inspect { artifact: String },
+    /// Peaks per MS2 spectrum for an mzML, as JSON: percentiles plus what each
+    /// candidate `--top-peaks-ms2` cap would discard.
+    ///
+    /// The pre-flight for a decision the documentation says must be made per
+    /// acquisition. Reading it before setting a cap is the difference between
+    /// bounding peak volume and deleting fragment evidence from most spectra.
+    PeakCensus {
+        #[arg(long)]
+        mzml: String,
+        /// Stop after this many spectra from the head of the file (0 = all).
+        #[arg(long, default_value_t = 0)]
+        max_spectra: usize,
+    },
     /// Candidate audit: reconstruct per-candidate stage flags + earliest rejection
     /// reason across the artifact chain and write candidate_audit.parquet
     /// (sensitivity program, P0.3/P0.4). Non-destructive; reruns no compute.
@@ -488,6 +501,92 @@ struct DoctorReport {
     ok: bool,
     scripts: ScriptsReport,
     roles: Vec<RoleReport>,
+}
+
+/// Peaks-per-MS2-spectrum percentiles for one mzML.
+///
+/// The pre-flight the peak-cap decision needs. `docs/04_convert.md` is emphatic that
+/// `--top-peaks-ms2` is acquisition-specific and that a value carried from another
+/// run deletes fragment evidence: on one 50-window Orbitrap DIA run a 300-peak cap
+/// discarded 78.6% of all MS2 peaks and cost 60% of the peptides. The playbook's
+/// advice is to compute the percentiles before setting a cap, and this is that
+/// computation, callable rather than described.
+///
+/// Reads peaks and counts them; it does not centroid, so a profile-mode file reports
+/// raw sample counts and says so.
+fn peak_census(mzml: &str, max_spectra: usize) -> Result<serde_json::Value> {
+    use mzdata::prelude::*;
+
+    // The same reader  uses, so this sees exactly the spectra a run would.
+    let reader = mzdata::MZReader::open_path(mzml).with_context(|| format!("opening {mzml}"))?;
+
+    let mut counts: Vec<usize> = Vec::new();
+    let mut profile = 0usize;
+    let mut ms1 = 0usize;
+    for (i, spec) in reader.enumerate() {
+        if max_spectra > 0 && i >= max_spectra {
+            break;
+        }
+        if spec.ms_level() != 2 {
+            if spec.ms_level() == 1 {
+                ms1 += 1;
+            }
+            continue;
+        }
+        if spec.signal_continuity() == mzdata::spectrum::SignalContinuity::Profile {
+            profile += 1;
+        }
+        let n = spec
+            .raw_arrays()
+            .and_then(|a| a.mzs().ok().map(|m| m.len()))
+            .unwrap_or(0);
+        counts.push(n);
+    }
+
+    if counts.is_empty() {
+        anyhow::bail!("{mzml} contains no MS2 spectra, so there is nothing to cap");
+    }
+    counts.sort_unstable();
+    let pct = |p: f64| -> usize {
+        let idx = ((counts.len() - 1) as f64 * p).round() as usize;
+        counts[idx.min(counts.len() - 1)]
+    };
+    let total: u64 = counts.iter().map(|&c| c as u64).sum();
+
+    // Computed before the macro: `json!` parses its values as literals and cannot
+    // take an iterator chain in value position.
+    let caps: Vec<serde_json::Value> = [50usize, 100, 200, 300, 500, 1000]
+        .iter()
+        .map(|&cap| {
+            let kept: u64 = counts.iter().map(|&c| c.min(cap) as u64).sum();
+            let truncated = counts.iter().filter(|&&c| c > cap).count();
+            serde_json::json!({
+                "cap": cap,
+                "spectra_truncated": truncated,
+                "fraction_of_spectra_truncated": truncated as f64 / counts.len() as f64,
+                "fraction_of_peaks_discarded":
+                    if total == 0 { 0.0 } else { 1.0 - kept as f64 / total as f64 },
+            })
+        })
+        .collect();
+
+    Ok(serde_json::json!({
+        "mzml": mzml,
+        "ms1_spectra": ms1,
+        "ms2_spectra": counts.len(),
+        "profile_ms2_spectra": profile,
+        "total_ms2_peaks": total,
+        "peaks_per_ms2": {
+            "min": counts[0],
+            "p25": pct(0.25),
+            "p50": pct(0.50),
+            "p75": pct(0.75),
+            "p95": pct(0.95),
+            "max": counts[counts.len() - 1],
+        },
+        // What a cap would actually cost, which is the question being asked.
+        "caps": caps,
+    }))
 }
 
 /// Report whether this configuration can actually run: which interpreter each
@@ -1217,6 +1316,12 @@ fn main() -> Result<()> {
         }
         Cmd::Inspect { artifact } => {
             print!("{}", mumdia_io::inspect(&artifact)?);
+        }
+        Cmd::PeakCensus { mzml, max_spectra } => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&peak_census(&mzml, max_spectra)?)?
+            );
         }
         Cmd::Report {
             psms_scored,
