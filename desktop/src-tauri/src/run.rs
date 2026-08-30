@@ -278,6 +278,50 @@ fn quote(s: &str) -> String {
     }
 }
 
+/// Does this request describe a search that needs no Python at all?
+///
+/// That is the configuration the application refuses to run. The predicate is
+/// deliberately narrow. The measured gap that motivates the refusal is about 1,213
+/// report rows against about 10,300 on the same file, and that is the fully native
+/// FASTA path against the imported-library workflow -- but the rescorer is not what
+/// separates them. On an imported library with retention-time modelling in place,
+/// `native_tda` measured 10,847 against `nn_torch`'s 10,914, a difference of 0.6%.
+/// Refusing every configuration that mentions `native_tda` would block one that is
+/// within noise of the best.
+///
+/// So the rule is "needs no sidecar at all", which is exactly the zero-component
+/// path the 1,213 figure describes.
+///
+/// The authority for this is the engine, not a list kept here: `mumdia doctor
+/// --json` reports `required` per role from the configuration it is given, and if
+/// every role is unrequired then the run is the minimal path.
+pub fn needs_no_sidecar(engine: &Path, config: Option<&str>) -> Result<bool, String> {
+    let mut cmd = engine::command(engine);
+    cmd.arg("doctor").arg("--json");
+    if let Some(c) = config {
+        if !c.trim().is_empty() {
+            cmd.arg("--config").arg(c);
+        }
+    }
+    let out = cmd
+        .output()
+        .map_err(|e| format!("could not ask the engine what this configuration needs: {e}"))?;
+    // `doctor` exits non-zero when the configuration cannot run, which is exactly
+    // the case where an interpreter is required and missing. The report on stdout is
+    // still valid and still says which roles are required, so the exit status is
+    // deliberately not checked here.
+    let text = String::from_utf8_lossy(&out.stdout);
+    let v: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|e| format!("could not read the engine's configuration report: {e}"))?;
+    let roles = v
+        .get("roles")
+        .and_then(|r| r.as_array())
+        .ok_or_else(|| "the engine's configuration report has no roles section".to_string())?;
+    Ok(!roles
+        .iter()
+        .any(|r| r.get("required").and_then(|b| b.as_bool()).unwrap_or(false)))
+}
+
 /// Start a search. Returns immediately with a handle; progress arrives by polling.
 pub fn start(id: String, req: Request) -> Result<Arc<Run>, String> {
     let args = argv(&req)?;

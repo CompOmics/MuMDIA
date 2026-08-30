@@ -40,6 +40,11 @@ const state = {
   timer: null,
   lastStatus: null,
   outDir: "",
+  componentsReady: false,
+  setupTimer: null,
+  schema: null,
+  overrides: {},
+  savedConfig: null,
 };
 
 // ── small helpers ───────────────────────────────────────────────────────────
@@ -112,7 +117,12 @@ async function init() {
   }
 
   for (const b of document.querySelectorAll(".nav")) {
-    b.addEventListener("click", () => !b.disabled && screen(b.dataset.screen));
+    b.addEventListener("click", () => {
+      if (b.disabled) return;
+      screen(b.dataset.screen);
+      if (b.dataset.screen === "setup") refreshComponents();
+      if (b.dataset.screen === "settings") loadSettings();
+    });
   }
   for (const t of document.querySelectorAll(".tab")) {
     t.addEventListener("click", () => setMode(t.dataset.mode));
@@ -121,6 +131,9 @@ async function init() {
     b.addEventListener("click", () => pick(b.dataset.pick));
   }
   $("start").addEventListener("click", start);
+  $("install-primary").addEventListener("click", () => installComponents("primary"));
+  $("install-ms2pip").addEventListener("click", () => installComponents("ms2pip"));
+  refreshComponents();
   $("stop").addEventListener("click", stop);
   $("another").addEventListener("click", () => screen("input"));
   $("open-folder").addEventListener("click", () => invoke("reveal", { path: state.outDir }));
@@ -129,6 +142,261 @@ async function init() {
     $("copy-cmd").textContent = "Copied";
     setTimeout(() => ($("copy-cmd").textContent = "Copy"), 1200);
   });
+}
+
+
+// ── settings editor ─────────────────────────────────────────────────────────
+// The form is generated from configs/config-schema.json, which the engine's own
+// documentation generator emits from config.rs. Nothing about a setting -- its
+// name, type, default or help text -- is written here, so this cannot describe a
+// parameter the engine does not have.
+
+async function loadSettings() {
+  if (state.schema) return;
+  try {
+    state.schema = await invoke("config_schema");
+  } catch (e) {
+    banner($("settings-error"), String(e));
+    return;
+  }
+  $("settings-search").addEventListener("input", renderSettings);
+  $("only-changed").addEventListener("change", renderSettings);
+  $("save-settings").addEventListener("click", saveSettings);
+  renderSettings();
+}
+
+/// The value currently shown for a setting: an override if one was typed, else the
+/// engine's default.
+function currentValue(f) {
+  return f.path in state.overrides ? state.overrides[f.path] : f.default;
+}
+
+function renderSettings() {
+  const q = $("settings-search").value.trim().toLowerCase();
+  const onlyChanged = $("only-changed").checked;
+  const bySection = new Map();
+
+  for (const f of state.schema.fields) {
+    const changed = f.path in state.overrides;
+    if (onlyChanged && !changed) continue;
+    if (q && !(f.path.toLowerCase().includes(q) || f.help.toLowerCase().includes(q))) continue;
+    const sec = f.section || "(top level)";
+    if (!bySection.has(sec)) bySection.set(sec, []);
+    bySection.get(sec).push(f);
+  }
+
+  const esc = (t) =>
+    String(t).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+             .replace(/"/g, "&quot;");
+
+  const parts = [];
+  for (const [sec, fields] of bySection) {
+    parts.push(`<div class="sec-title">${esc(sec)}</div><div class="card">`);
+    for (const f of fields) {
+      const changed = f.path in state.overrides;
+      const v = currentValue(f);
+      let control;
+      if (f.kind === "bool") {
+        control =
+          `<select data-path="${esc(f.path)}">` +
+          `<option value="true"${v === true ? " selected" : ""}>true</option>` +
+          `<option value="false"${v === false ? " selected" : ""}>false</option></select>`;
+      } else if (f.kind === "enum" && f.choices) {
+        control =
+          `<select data-path="${esc(f.path)}">` +
+          f.choices
+            .map((c) => `<option value="${esc(c)}"${c === v ? " selected" : ""}>${esc(c)}</option>`)
+            .join("") +
+          `</select>`;
+      } else {
+        control = `<input type="text" data-path="${esc(f.path)}" value="${esc(v ?? "")}">`;
+      }
+      // A gated parameter is one the project documents as not to be changed from a
+      // single benchmark count. Saying so where the decision is made is the whole
+      // reason the schema carries the marker.
+      const gate = f.gates.length
+        ? `<span class="pill warn" title="${esc(f.gates.join(", "))}">gated</span>`
+        : "";
+      const badge = changed ? `<span class="pill info">changed</span>` : "";
+      parts.push(
+        `<div class="setting${changed ? " changed" : ""}">` +
+          `<div class="sname">${esc(f.path)} ${gate} ${badge}</div>` +
+          `<div class="shelp">${esc(f.help || "No description in the engine source.")}` +
+          (f.default !== null && f.default !== undefined
+            ? ` <em>Default: ${esc(f.default)}</em>`
+            : "") +
+          `</div><div class="sctl">${control}</div></div>`
+      );
+    }
+    parts.push(`</div>`);
+  }
+
+  const list = $("settings-list");
+  list.innerHTML =
+    parts.join("") || `<p class="hint">Nothing matches that search.</p>`;
+
+  for (const el of list.querySelectorAll("[data-path]")) {
+    el.addEventListener("change", () => onSettingChanged(el));
+  }
+
+  const n = Object.keys(state.overrides).length;
+  $("settings-sub").textContent =
+    `${state.schema.fields.length} settings. ` +
+    (n ? `${n} changed from the defaults; only those are saved.` : "None changed.");
+}
+
+/// Record a change, or drop it when the value returns to the default.
+///
+/// Dropping matters: a saved configuration is meant to be the difference from the
+/// defaults, and a value typed and then typed back should leave nothing behind.
+function onSettingChanged(el) {
+  const path = el.dataset.path;
+  const f = state.schema.fields.find((x) => x.path === path);
+  if (!f) return;
+  let raw = el.value;
+  let value = raw;
+  if (f.kind === "bool") value = raw === "true";
+  else if (f.kind === "integer" || f.kind === "float") {
+    const n = Number(raw);
+    if (raw.trim() === "" || Number.isNaN(n)) {
+      banner($("settings-error"), `${path} must be a number.`);
+      return;
+    }
+    value = n;
+  }
+  banner($("settings-error"), "");
+  if (JSON.stringify(value) === JSON.stringify(f.default)) delete state.overrides[path];
+  else state.overrides[path] = value;
+  renderSettings();
+}
+
+async function saveSettings() {
+  banner($("settings-error"), "");
+  banner($("settings-saved"), "");
+  try {
+    const path = await invoke("save_settings", {
+      name: "console",
+      overrides: state.overrides,
+    });
+    state.savedConfig = path;
+    // The saved file becomes the preset the next search uses, so the settings on
+    // this screen and the settings a run uses cannot diverge.
+    const sel = $("preset");
+    let opt = [...sel.options].find((o) => o.value === path);
+    if (!opt) {
+      opt = document.createElement("option");
+      opt.value = path;
+      opt.textContent = "My settings";
+      sel.appendChild(opt);
+    }
+    sel.value = path;
+    banner(
+      $("settings-saved"),
+      `Saved and accepted by the engine. The next search will use these settings.`
+    );
+  } catch (e) {
+    banner($("settings-error"), String(e));
+  }
+}
+
+// ── components ──────────────────────────────────────────────────────────────
+// Polled while an installation runs, then left alone. The backend owns the state,
+// so closing and reopening this screen shows the truth rather than a stale copy.
+async function refreshComponents() {
+  let c;
+  try {
+    c = await invoke("components_status");
+  } catch (e) {
+    banner($("setup-error"), String(e));
+    return;
+  }
+  const p = c.primary;
+  state.componentsReady = !!p.complete;
+
+  const pill = $("primary-pill");
+  const btn = $("install-primary");
+  const installing = p.install_status === "installing";
+  show($("primary-bar"), installing);
+  show($("install-log-card"), installing || p.install_status === "failed");
+
+  if (installing) {
+    pill.textContent = "installing…";
+    pill.className = "pill warn";
+    btn.disabled = true;
+  } else if (p.complete) {
+    pill.textContent = "installed";
+    pill.className = "pill ok";
+    btn.disabled = true;
+    btn.textContent = "Installed";
+  } else {
+    pill.textContent = "not installed";
+    pill.className = "pill bad";
+    btn.disabled = !c.primary.uv;
+    btn.textContent = "Install";
+  }
+
+  if (!c.primary.uv && !p.complete) {
+    banner(
+      $("setup-error"),
+      "The installer component `uv` was not found beside the application or on PATH, " +
+        "so components cannot be installed automatically."
+    );
+  } else if (p.error) {
+    banner($("setup-error"), p.error);
+  } else {
+    banner($("setup-error"), "");
+  }
+
+  const m = c.ms2pip;
+  const mpill = $("ms2pip-pill");
+  const mbtn = $("install-ms2pip");
+  if (m.install_status === "installing") {
+    mpill.textContent = "installing…";
+    mpill.className = "pill warn";
+    mbtn.disabled = true;
+  } else if (m.complete) {
+    mpill.textContent = "installed";
+    mpill.className = "pill ok";
+    mbtn.disabled = true;
+    mbtn.textContent = "Installed";
+  } else {
+    mpill.textContent = "optional";
+    mpill.className = "pill mute";
+    mbtn.disabled = false;
+  }
+
+  // One log pane, showing whichever installation is talking.
+  const active = m.install_status === "installing" ? m : p;
+  const logEl = $("install-log");
+  const text = (active.install_log || []).join("\n");
+  if (logEl.textContent !== text) {
+    logEl.textContent = text;
+    logEl.scrollTop = logEl.scrollHeight;
+  }
+
+  const versions = Object.entries(p.versions || {});
+  $("setup-versions").textContent = versions.length
+    ? versions.map(([k, v]) => `${k} ${v}`).join(" · ")
+    : "";
+
+  const busy = installing || m.install_status === "installing";
+  if (busy && !state.setupTimer) {
+    state.setupTimer = setInterval(refreshComponents, 900);
+  } else if (!busy && state.setupTimer) {
+    clearInterval(state.setupTimer);
+    state.setupTimer = null;
+  }
+}
+
+async function installComponents(env) {
+  banner($("setup-error"), "");
+  try {
+    await invoke("components_install", { env });
+  } catch (e) {
+    banner($("setup-error"), String(e));
+    return;
+  }
+  refreshComponents();
 }
 
 function setMode(mode) {
@@ -184,6 +452,26 @@ async function start() {
     config: $("preset").value || null,
     threads: Number.isFinite(threads) && threads > 0 ? threads : null,
   };
+
+  // Ask the backend whether this is runnable before starting it, so a missing
+  // component or a configuration that needs no components at all is explained here
+  // rather than failing once the engine is under way.
+  banner($("preflight-block"), "");
+  try {
+    const pf = await invoke("preflight", { req });
+    if (!pf.ok) {
+      banner(
+        $("preflight-block"),
+        pf.blockers.join("\n\n") +
+          (pf.components_complete ? "" : "\n\nOpen Setup to install the components.")
+      );
+      return;
+    }
+  } catch (e) {
+    // A preflight that cannot run is not a reason to refuse: say so and let the
+    // engine be the judge, since it reports its own errors perfectly well.
+    banner($("preflight-block"), `Could not check before starting: ${e}`);
+  }
 
   try {
     state.runId = await invoke("start_run", { req });

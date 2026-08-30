@@ -11,7 +11,9 @@
 <aside class="rail">
   <div class="brand">MuMDIA</div>
   <nav>
+    <button class="nav" data-screen="setup">Setup</button>
     <button class="nav on" data-screen="input">Search</button>
+    <button class="nav" data-screen="settings">Settings</button>
     <button class="nav" data-screen="progress" id="nav-progress" disabled>Progress</button>
     <button class="nav" data-screen="results" id="nav-results" disabled>Results</button>
   </nav>
@@ -21,6 +23,58 @@
 </aside>
 
 <main>
+
+  <!-- ─────────────────────────────── Setup ──────────────────────────────── -->
+  <section class="screen" id="screen-setup">
+    <h1>Analysis components</h1>
+    <p class="sub">
+      MuMDIA needs a small Python environment for retention-time modelling and
+      rescoring. It is installed once, into your user folder, and needs no
+      administrator rights.
+    </p>
+
+    <div id="setup-error" class="banner bad" hidden></div>
+
+    <div class="card" id="primary-card">
+      <div class="card-head">
+        <div>
+          <div class="card-title">
+            Required components <span class="pill" id="primary-pill">checking…</span>
+          </div>
+          <div class="card-sub" id="primary-sub">
+            Retention-time modelling (DeepLC) and rescoring. Downloads a few hundred
+            megabytes the first time.
+          </div>
+        </div>
+        <button class="btn" id="install-primary">Install</button>
+      </div>
+      <div class="bar" id="primary-bar" hidden><i></i></div>
+    </div>
+
+    <div class="card">
+      <div class="card-head">
+        <div>
+          <div class="card-title">
+            MS2PIP <span class="pill mute" id="ms2pip-pill">optional</span>
+          </div>
+          <div class="card-sub">
+            Only for building a library from a FASTA with predicted fragment
+            intensities. Installed separately because MS2PIP and DeepLC require
+            incompatible versions of a shared dependency and cannot share an
+            environment.
+          </div>
+        </div>
+        <button class="btn quiet" id="install-ms2pip">Install</button>
+      </div>
+    </div>
+
+    <div class="card logcard" id="install-log-card" hidden>
+      <div class="card-title">Installation log</div>
+      <pre class="log" id="install-log"></pre>
+    </div>
+
+    <p class="hint" id="setup-versions"></p>
+  </section>
 
   <!-- ─────────────────────────────── Search ─────────────────────────────── -->
   <section class="screen on" id="screen-input">
@@ -97,11 +151,38 @@
     </div>
 
     <div id="start-error" class="banner bad" hidden></div>
+    <div id="preflight-block" class="banner warn" hidden></div>
 
     <div class="actions">
       <button class="btn big" id="start">Start search</button>
       <span class="hint inline">Runs take from minutes to hours.</span>
     </div>
+  </section>
+
+  <!-- ────────────────────────────── Settings ────────────────────────────── -->
+  <section class="screen" id="screen-settings">
+    <div class="head-row">
+      <div>
+        <h1>All settings</h1>
+        <p class="sub" id="settings-sub">
+          Every engine parameter, with its default and the explanation from the source.
+        </p>
+      </div>
+      <button class="btn" id="save-settings">Save and use</button>
+    </div>
+
+    <div id="settings-error" class="banner bad" hidden></div>
+    <div id="settings-saved" class="banner ok" hidden></div>
+
+    <div class="row" style="margin-bottom:12px">
+      <input id="settings-search" type="search" placeholder="Search settings…"
+             style="flex:1;min-width:0">
+      <label class="toggle-label">
+        <input type="checkbox" id="only-changed"> only changed
+      </label>
+    </div>
+
+    <div id="settings-list"></div>
   </section>
 
   <!-- ────────────────────────────── Progress ────────────────────────────── -->

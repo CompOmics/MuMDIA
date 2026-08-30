@@ -180,3 +180,56 @@ fn stopping_a_run_kills_it_and_leaves_no_temp_files() {
 
     let _ = std::fs::remove_dir_all(&out);
 }
+
+/// Create the primary environment for real and check every role can import.
+///
+/// This is the milestone-2 acceptance criterion: no conda, no pre-existing Python,
+/// just the bundled installer and the pinned requirements. Opt in with
+/// MUMDIA_TEST_INSTALL=1, because it downloads several hundred megabytes.
+#[test]
+fn the_primary_environment_installs_and_imports() {
+    if std::env::var("MUMDIA_TEST_INSTALL").ok().as_deref() != Some("1") {
+        eprintln!("MUMDIA_TEST_INSTALL=1 not set; skipping the real installation");
+        return;
+    }
+    use mumdia_console::components::{self, Env};
+
+    assert!(
+        components::find_uv().is_some(),
+        "uv must be bundled or on PATH for the installer to work"
+    );
+    assert!(
+        components::requirements(Env::Primary).is_some(),
+        "env/console-requirements.txt must ship beside the application"
+    );
+
+    let installer = std::sync::Arc::new(components::Installer::default());
+    components::install(std::sync::Arc::clone(&installer), Env::Primary)
+        .expect("the installation should start");
+
+    let start = Instant::now();
+    loop {
+        let s = installer.refresh(Env::Primary);
+        if s.install_status == "done" {
+            assert!(s.complete, "installed but not importable: {:?}", s.missing);
+            assert!(
+                s.versions.contains_key("torch") && s.versions.contains_key("deeplc"),
+                "the versions that change results should be reported: {:?}",
+                s.versions
+            );
+            break;
+        }
+        if s.install_status == "failed" {
+            panic!(
+                "installation failed: {}\n{}",
+                s.error.unwrap_or_default(),
+                s.install_log.join("\n")
+            );
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(1800),
+            "installation did not finish within 30 minutes"
+        );
+        std::thread::sleep(Duration::from_secs(2));
+    }
+}

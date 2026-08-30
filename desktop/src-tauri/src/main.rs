@@ -2,7 +2,7 @@
 // builds keep it, because that is where the developer's own `println!` goes.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use mumdia_console::{engine, run};
+use mumdia_console::{components, engine, run, settings};
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -15,12 +15,106 @@ use tauri::Manager;
 struct AppState {
     runs: Mutex<HashMap<String, Arc<run::Run>>>,
     next_id: AtomicU64,
+    installer: Arc<components::Installer>,
 }
 
 /// Which engine will be used, and does it execute.
 #[tauri::command]
 fn engine_info() -> Result<engine::Info, String> {
     engine::info()
+}
+
+/// The state of the managed Python environment.
+#[tauri::command]
+fn components_status(state: tauri::State<'_, AppState>) -> serde_json::Value {
+    serde_json::json!({
+        "primary": state.installer.refresh(components::Env::Primary),
+        // Reported separately because it is optional and cannot share the primary
+        // environment: MS2PIP and DeepLC pin incompatible sqlalchemy majors.
+        "ms2pip": state.installer.refresh(components::Env::Ms2pip),
+    })
+}
+
+/// Create the managed environment and install the analysis packages into it.
+///
+/// Returns as soon as the work is under way; the interface polls
+/// `components_status` for the log and the outcome.
+#[tauri::command]
+fn components_install(
+    state: tauri::State<'_, AppState>,
+    env: Option<components::Env>,
+) -> Result<(), String> {
+    components::install(
+        Arc::clone(&state.installer),
+        env.unwrap_or(components::Env::Primary),
+    )
+}
+
+/// Everything that must be true before a search can start.
+///
+/// Checked here rather than at the moment of starting, so the interface can explain
+/// and offer a fix instead of reporting a failure.
+#[tauri::command]
+fn preflight(
+    state: tauri::State<'_, AppState>,
+    req: run::Request,
+) -> Result<serde_json::Value, String> {
+    let (exe, _) = engine::resolve()?;
+    let mut blockers: Vec<String> = Vec::new();
+
+    // The minimal path is not offered. See `run::needs_no_sidecar` for why the
+    // predicate is "needs no sidecar at all" rather than anything about the
+    // rescorer.
+    match run::needs_no_sidecar(&exe, req.config.as_deref()) {
+        Ok(true) => blockers.push(
+            "This configuration would run without any of the analysis components, which \
+             identifies far fewer peptides. Choose a preset that uses retention-time \
+             modelling, or install the components."
+                .into(),
+        ),
+        Ok(false) => {}
+        // A configuration the engine cannot even read is a real problem, but it is
+        // the engine's message that says what is wrong with it.
+        Err(e) => blockers.push(e),
+    }
+
+    let comp = state.installer.refresh(components::Env::Primary);
+    if !comp.complete {
+        blockers.push(format!(
+            "The analysis components are not installed{}.",
+            if comp.missing.is_empty() {
+                String::new()
+            } else {
+                format!(" (missing {})", comp.missing.join(", "))
+            }
+        ));
+    }
+
+    Ok(serde_json::json!({
+        "ok": blockers.is_empty(),
+        "blockers": blockers,
+        "components_complete": comp.complete,
+    }))
+}
+
+/// The settings schema the editor renders its form from.
+#[tauri::command]
+fn config_schema() -> Result<settings::Schema, String> {
+    settings::load_schema()
+}
+
+/// Write an override set, then ask the engine whether it accepts it.
+///
+/// Validating here rather than at run time is the point: a value the engine would
+/// reject is reported next to the field while it is being edited.
+#[tauri::command]
+fn save_settings(
+    name: String,
+    overrides: std::collections::BTreeMap<String, serde_json::Value>,
+) -> Result<String, String> {
+    let path = settings::save(&name, overrides)?;
+    settings::validate(&path)?;
+    Ok(path)
 }
 
 /// Start a search. Returns the run id used by every subsequent call.
@@ -132,6 +226,11 @@ fn main() {
         .manage(AppState::default())
         .invoke_handler(tauri::generate_handler![
             engine_info,
+            components_status,
+            components_install,
+            config_schema,
+            save_settings,
+            preflight,
             start_run,
             run_state,
             cancel_run,

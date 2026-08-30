@@ -170,6 +170,48 @@ select { min-width: 220px; }
   font-family: ui-monospace, "Cascadia Mono", monospace;
   font-size: 10.5px; color: var(--ink-faint); margin-top: 5px;
 }
+.card-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 14px; flex-wrap: wrap; }
+.card-sub { font-size: 12px; color: var(--ink-faint); margin-top: 4px; line-height: 1.5; max-width: 62ch; }
+.pill { display: inline-flex; align-items: center; font-size: 11px; font-weight: 600;
+        padding: 1px 9px; border-radius: 20px; vertical-align: 1px; }
+.pill.ok   { background: var(--ok-soft);     color: var(--ok); }
+.pill.warn { background: var(--warn-soft);   color: var(--warn); }
+.pill.bad  { background: var(--danger-soft); color: var(--danger); }
+.pill.mute { background: var(--sunk);        color: var(--ink-faint); }
+.bar { height: 4px; border-radius: 3px; background: var(--sunk); overflow: hidden; margin-top: 12px; }
+.bar > i { display: block; height: 100%; width: 40%; background: var(--accent);
+           animation: slide 1.4s ease-in-out infinite; }
+@keyframes slide { 0% { margin-left: -40%; } 100% { margin-left: 100%; } }
+@media (prefers-reduced-motion: reduce) { .bar > i { animation: none; width: 100%; } }
+
+/* ── settings editor ──────────────────────────────────────────────────── */
+input[type="search"] {
+  font: inherit; font-size: 12.5px; padding: 6px 10px;
+  border: 1px solid var(--rule); border-radius: 5px;
+  background: var(--panel); color: var(--ink);
+}
+.toggle-label { display: flex; align-items: center; gap: 6px; font-size: 12.5px;
+                color: var(--ink-soft); white-space: nowrap; }
+.sec-title { font-size: 12px; font-weight: 600; letter-spacing: .06em;
+             text-transform: uppercase; color: var(--ink-faint);
+             margin: 18px 0 6px; font-family: ui-monospace, monospace; }
+.setting { display: grid; grid-template-columns: 1fr auto; gap: 3px 14px;
+           padding: 10px 0; border-bottom: 1px solid var(--rule); align-items: start; }
+.setting:last-child { border-bottom: none; }
+.setting .sname { font-family: ui-monospace, "Cascadia Mono", monospace;
+                  font-size: 12.5px; font-weight: 500; }
+.setting .shelp { grid-column: 1; font-size: 11.5px; color: var(--ink-faint);
+                  line-height: 1.45; max-width: 62ch; }
+.setting .sctl { grid-column: 2; grid-row: 1 / span 2; display: flex;
+                 align-items: center; gap: 8px; }
+.setting .sctl input[type="text"], .setting .sctl select {
+  font-family: ui-monospace, monospace; font-size: 12.5px;
+  border: 1px solid var(--rule); border-radius: 5px; padding: 4px 8px;
+  background: var(--panel); color: var(--ink); min-width: 130px;
+}
+.setting.changed .sname { color: var(--accent); }
+.banner.ok { background: var(--ok-soft); border-color: var(--ok); color: var(--ink); }
+
 .files { display: flex; flex-direction: column; gap: 5px; font-size: 12.5px; }
 .files code {
   font-family: ui-monospace, "Cascadia Mono", monospace; font-size: 11.5px;
