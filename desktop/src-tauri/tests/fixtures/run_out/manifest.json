@@ -1,0 +1,239 @@
+{
+  "mumdia_version": "0.1.0",
+  "git_sha": "8ea79be03399-dirty",
+  "commit_date": "2026-08-29T07:25:51+02:00",
+  "cli_args": [
+    "C:\\Users\\robbi\\mumdia_build\\release\\mumdia.exe",
+    "run",
+    "--fasta",
+    "test_data/fixture.fasta",
+    "--mzml",
+    "C:/Users/robbi/AppData/Local/Temp/claude/H--OneDrive---UGent-MuMDIA-NG/ed948dad-9d5a-423e-9f52-cf197cbee207/scratchpad/smoke_final/fixture.mzML",
+    "--out-dir",
+    "C:/Users/robbi/AppData/Local/Temp/claude/H--OneDrive---UGent-MuMDIA-NG/ed948dad-9d5a-423e-9f52-cf197cbee207/scratchpad/smoke_final/out",
+    "--config",
+    "configs/examples/native.json",
+    "--threads",
+    "2"
+  ],
+  "config_json": "{\"prescan\":{\"tol_da\":0.005,\"rt_slack_s\":150.0,\"rt_bin_s\":25.0,\"top_peaks\":150,\"mods\":[\"C:Carbamidomethyl\",\"M:Oxidation\"],\"anchor_mods\":[]},\"rng_seed\":0,\"digest\":{\"enzyme\":\"trypsin_p\",\"missed_cleavages\":2,\"min_len\":5,\"max_len\":50,\"decoy\":{\"strategy\":\"reverse\"},\"n_term_met_excision\":true},\"peptidoforms\":{\"fixed_mods\":[{\"residue\":\"C\",\"name\":\"Carbamidomethyl\"}],\"variable_mods\":[{\"residue\":\"M\",\"name\":\"Oxidation\"}],\"max_variable_mods\":1,\"charge_min\":2,\"charge_max\":3,\"charge_by_basic_residues\":false,\"unknown_modification\":\"error\"},\"predict_frag\":{\"predictor\":\"native\",\"rt_predictor\":\"native\",\"charge2_from_precursor_charge\":2,\"charge_by_basic_residues\":false,\"top_n_fragments\":6,\"ms2pip_model\":\"HCD\",\"ms2pip_python\":null,\"deeplc_python\":null,\"sidecar_script_dir\":\"scripts\"},\"search_seed\":{\"fdr_seed\":0.01,\"fragment_tol_ppm\":20.0,\"report_psms\":5,\"min_matched_peaks\":4,\"top_n_peaks\":300,\"matcher\":\"fragindex\",\"two_pass_mass_cal\":false,\"mass_cal_loess\":false},\"rt_im_train\":{\"calibration_method\":\"loess\",\"q_train\":0.01,\"p_rt\":0.95,\"rt_window_multiplier\":1.0,\"min_seed_for_calibration\":50,\"loess_span\":0.3,\"fallback_rt_window_s\":120.0,\"finetune_deeplc\":false,\"finetune_epochs\":25,\"finetune_patience\":10,\"finetune_batch\":0,\"adaptive_rt_window\":false,\"adaptive_rt_bins\":12,\"rt_window_min_s\":1.0,\"window_holdout_frac\":0.0},\"extract\":{\"fixed_scan_window\":3,\"frag_tol_ppm\":20.0,\"prec_tol_ppm\":20.0,\"presence_min_matched\":3,\"presence_min_fragments\":3,\"presence_min_coelution\":2,\"gate_min_score\":0.2,\"min_matched_fraction\":0.0,\"apex_top_fragments\":0,\"apex_rt_prior_s\":120.0,\"apex_count_tol\":1,\"apex_count_window\":5,\"apex_gaussian_sigma_scans\":0.0,\"emit_window_grid\":true,\"bucket_size\":8192,\"peak_claim\":\"none\",\"claim_cues\":{\"mz_close\":false,\"mz_close_sigma_ppm\":5.0,\"rt_prior\":false,\"rt_prior_tau_s\":30.0,\"ms1_support\":false,\"reassign\":false,\"apportion_em_iters\":0},\"emit_demix_features\":false,\"demix_lambda\":1.0,\"demix_max_candidates\":64,\"demix_scan_stride\":1,\"emit_contested_features\":false,\"peak_claim_margin\":2.0,\"matcher\":\"fragindex\",\"min_coelution_run\":0,\"ms1_rescue\":false,\"retain_top_peaks\":1,\"promote_top_peaks\":1,\"alt_peak_min_area_frac\":0.1,\"alt_peak_min_separation_s\":5.0,\"emit_candidate_audit\":false,\"apex_evidence_rank\":true,\"emit_gate_diagnostics\":false,\"gate_mode\":\"apex_pearson\",\"gate_coelution_min\":0.5},\"features\":{\"set\":\"extended\",\"emit_pin\":false,\"coelution_corr_threshold\":0.9,\"prec_tol_ppm\":20.0,\"bound_features\":true,\"bound_peak_fraction\":0.3333333333333333,\"bound_peak_grace\":0,\"bound_from_confident\":true,\"bound_confident_pct\":50.0,\"ms1_precursor_features\":false},\"compete\":{\"group_by\":\"base_peptide\",\"apex_rt_tolerance_s\":5.0,\"mode\":\"winner_take_all\",\"margin\":0.0,\"unique_evidence_min_fragments\":2,\"emit_competition_audit\":false},\"rescore\":{\"classifier\":\"native_tda\",\"folds\":3,\"train_fdr\":0.01,\"num_iter\":10,\"max_feature_matrix_gib\":0.0,\"python\":null,\"percolator_bin\":null,\"entrapment_marker\":null,\"entrapment_exclude\":null,\"entrapment_contaminant_markers\":[],\"entrapment_ratio\":1.0,\"strict\":true,\"handoff\":\"tsv\"},\"quant\":{\"q_threshold\":0.01,\"top_n_fragments\":3,\"top_n_peptides\":3,\"rollup\":\"top_n_sum\",\"bound_peak\":true,\"peak_fraction\":0.16666666666666666,\"peak_grace\":1,\"peak_window_mode\":\"per_candidate\",\"reliable_q\":0.001,\"q_filter\":\"peptide_q\",\"interference_envelope\":false,\"fragment_selection\":\"observed_area\",\"fixed_scan_halfwidth\":0,\"baseline_subtract\":false,\"baseline_flank_scans\":12,\"baseline_quantile\":0.25,\"fixed_window_s\":0.0},\"mbr\":{\"strategy\":\"none\",\"q_anchor\":0.01,\"min_anchor_runs\":2,\"q_transfer\":0.01,\"rt_window_s\":20.0,\"decoy_transfer\":\"permuted_rt\",\"consensus_corr_min\":0.0,\"requant_all\":false,\"python\":null},\"experiment\":{\"parallel_runs\":1,\"finetune_scope\":\"first_run_only\"}}",
+  "config_hash": "7dfde09c5047373b95038420ca4248fd4aadf46942bdd8630c30ce1b13403ef2",
+  "model_identities": {
+    "feature_schema_id": "e5b4eff0133e411dbf406947c89466619ec557ab37874bc3948792d9890afe8e",
+    "fragment_predictor": "Native",
+    "rescorer": "native-percolator-lite-v1",
+    "rt_predictor": "Native"
+  },
+  "inputs": {
+    "fasta": {
+      "path": "test_data/fixture.fasta",
+      "bytes": 2670,
+      "content_hash": "ff9ba5b1e9367f8641bec0a9e7eb438c62991ef935acf44c2c48618c73d06f2a"
+    },
+    "mzml": {
+      "path": "C:/Users/robbi/AppData/Local/Temp/claude/H--OneDrive---UGent-MuMDIA-NG/ed948dad-9d5a-423e-9f52-cf197cbee207/scratchpad/smoke_final/fixture.mzML",
+      "bytes": 1761106,
+      "content_hash": "f5187d0c1d35be705377d9db90ce0fae5d22ae062c02d42cd1a63dd291907cf9"
+    }
+  },
+  "artifacts": {
+    "chromatograms": {
+      "logical_name": "chromatograms",
+      "path": "C:/Users/robbi/AppData/Local/Temp/claude/H--OneDrive---UGent-MuMDIA-NG/ed948dad-9d5a-423e-9f52-cf197cbee207/scratchpad/smoke_final/out/chromatograms.parquet",
+      "format": "parquet",
+      "schema_name": "chromatograms",
+      "schema_version": 1,
+      "rows": 2556,
+      "content_hash": "884d4dba966c1d4168180150ec9c09579d2cd883fac7b854a266a8c76dd63346",
+      "producing_stage": "extract",
+      "config_hash": "7dfde09c5047373b95038420ca4248fd4aadf46942bdd8630c30ce1b13403ef2"
+    },
+    "features": {
+      "logical_name": "features",
+      "path": "C:/Users/robbi/AppData/Local/Temp/claude/H--OneDrive---UGent-MuMDIA-NG/ed948dad-9d5a-423e-9f52-cf197cbee207/scratchpad/smoke_final/out/features.parquet",
+      "format": "parquet",
+      "schema_name": "features",
+      "schema_version": 1,
+      "rows": 284,
+      "content_hash": "686820b41516510286c9c94f753940f26fb9a748435e7c9864f281a231267bf1",
+      "producing_stage": "features",
+      "config_hash": "7dfde09c5047373b95038420ca4248fd4aadf46942bdd8630c30ce1b13403ef2"
+    },
+    "fragment_library_fragments": {
+      "logical_name": "fragment_library_fragments",
+      "path": "C:/Users/robbi/AppData/Local/Temp/claude/H--OneDrive---UGent-MuMDIA-NG/ed948dad-9d5a-423e-9f52-cf197cbee207/scratchpad/smoke_final/out/fragment_library_fragments.parquet",
+      "format": "parquet",
+      "schema_name": "fragment_library_fragments",
+      "schema_version": 1,
+      "rows": 22920,
+      "content_hash": "b1e6fd23482df40ddd81f13c133eab8d44c28016004a56eb8f0b6efd1c03291b",
+      "producing_stage": "predict-frag",
+      "config_hash": "7dfde09c5047373b95038420ca4248fd4aadf46942bdd8630c30ce1b13403ef2"
+    },
+    "fragment_library_precursors": {
+      "logical_name": "fragment_library_precursors",
+      "path": "C:/Users/robbi/AppData/Local/Temp/claude/H--OneDrive---UGent-MuMDIA-NG/ed948dad-9d5a-423e-9f52-cf197cbee207/scratchpad/smoke_final/out/fragment_library_precursors.parquet",
+      "format": "parquet",
+      "schema_name": "fragment_library_precursors",
+      "schema_version": 1,
+      "rows": 3820,
+      "content_hash": "9516998ec891009f8131080baac32c108d58dbff11f382556601d54f084d9394",
+      "producing_stage": "predict-frag",
+      "config_hash": "7dfde09c5047373b95038420ca4248fd4aadf46942bdd8630c30ce1b13403ef2"
+    },
+    "fragment_quant": {
+      "logical_name": "fragment_quant",
+      "path": "C:/Users/robbi/AppData/Local/Temp/claude/H--OneDrive---UGent-MuMDIA-NG/ed948dad-9d5a-423e-9f52-cf197cbee207/scratchpad/smoke_final/out/fragment_quant.parquet",
+      "format": "parquet",
+      "schema_name": "fragment_quant",
+      "schema_version": 1,
+      "rows": 906,
+      "content_hash": "0f5ef625af43bf8a88cf09fb24c185951674666d42a427eed2ab2aea39b5c5e7",
+      "producing_stage": "quant",
+      "config_hash": "7dfde09c5047373b95038420ca4248fd4aadf46942bdd8630c30ce1b13403ef2"
+    },
+    "isolation_windows": {
+      "logical_name": "isolation_windows",
+      "path": "C:/Users/robbi/AppData/Local/Temp/claude/H--OneDrive---UGent-MuMDIA-NG/ed948dad-9d5a-423e-9f52-cf197cbee207/scratchpad/smoke_final/out/spectra/isolation_windows.parquet",
+      "format": "parquet",
+      "schema_name": "isolation_windows",
+      "schema_version": 1,
+      "rows": 8,
+      "content_hash": "3ceab06d7b4d1ed3d814722235920d2677bb6877535fa02767a67519de0ea32f",
+      "producing_stage": "convert",
+      "config_hash": "e11217cb603b8854a93c176b421cd926fb371ab35ee4647c4301b3f1c7631c3b"
+    },
+    "ms2_to_ms1": {
+      "logical_name": "ms2_to_ms1",
+      "path": "C:/Users/robbi/AppData/Local/Temp/claude/H--OneDrive---UGent-MuMDIA-NG/ed948dad-9d5a-423e-9f52-cf197cbee207/scratchpad/smoke_final/out/spectra/ms2_to_ms1.parquet",
+      "format": "parquet",
+      "schema_name": "ms2_to_ms1",
+      "schema_version": 1,
+      "rows": 480,
+      "content_hash": "c60988ab4d075d9655fb7406169ee92e804c7dff05b42124e818ccc9f249346f",
+      "producing_stage": "convert",
+      "config_hash": "e11217cb603b8854a93c176b421cd926fb371ab35ee4647c4301b3f1c7631c3b"
+    },
+    "peptide_quant": {
+      "logical_name": "peptide_quant",
+      "path": "C:/Users/robbi/AppData/Local/Temp/claude/H--OneDrive---UGent-MuMDIA-NG/ed948dad-9d5a-423e-9f52-cf197cbee207/scratchpad/smoke_final/out/peptide_quant.parquet",
+      "format": "parquet",
+      "schema_name": "peptide_quant",
+      "schema_version": 2,
+      "rows": 151,
+      "content_hash": "db6dee23c4e5f1b40fad156b10a16f3a3748b3c83016770370933282ee36af88",
+      "producing_stage": "quant",
+      "config_hash": "7dfde09c5047373b95038420ca4248fd4aadf46942bdd8630c30ce1b13403ef2"
+    },
+    "peptides": {
+      "logical_name": "peptides",
+      "path": "C:/Users/robbi/AppData/Local/Temp/claude/H--OneDrive---UGent-MuMDIA-NG/ed948dad-9d5a-423e-9f52-cf197cbee207/scratchpad/smoke_final/out/peptides.parquet",
+      "format": "parquet",
+      "schema_name": "peptides",
+      "schema_version": 1,
+      "rows": 876,
+      "content_hash": "b88380d3934a4f87e4c65b900f1a8e2edfc156eb599f967859a4f70d91ef7106",
+      "producing_stage": "digest",
+      "config_hash": "7dfde09c5047373b95038420ca4248fd4aadf46942bdd8630c30ce1b13403ef2"
+    },
+    "peptidoforms": {
+      "logical_name": "peptidoforms",
+      "path": "C:/Users/robbi/AppData/Local/Temp/claude/H--OneDrive---UGent-MuMDIA-NG/ed948dad-9d5a-423e-9f52-cf197cbee207/scratchpad/smoke_final/out/peptidoforms.parquet",
+      "format": "parquet",
+      "schema_name": "peptidoforms",
+      "schema_version": 1,
+      "rows": 3820,
+      "content_hash": "b8c0df35a3ba1faa0ac44736aa95e31563735a93b6b5f99c9a0749b2445b04f3",
+      "producing_stage": "peptidoforms",
+      "config_hash": "7dfde09c5047373b95038420ca4248fd4aadf46942bdd8630c30ce1b13403ef2"
+    },
+    "protein_group_quant": {
+      "logical_name": "protein_group_quant",
+      "path": "C:/Users/robbi/AppData/Local/Temp/claude/H--OneDrive---UGent-MuMDIA-NG/ed948dad-9d5a-423e-9f52-cf197cbee207/scratchpad/smoke_final/out/protein_group_quant.parquet",
+      "format": "parquet",
+      "schema_name": "protein_group_quant",
+      "schema_version": 2,
+      "rows": 16,
+      "content_hash": "1eb8ddb19566390bc59e17ede88b0d7264d48b3831079346b74c73aeaa8b5920",
+      "producing_stage": "quant",
+      "config_hash": "7dfde09c5047373b95038420ca4248fd4aadf46942bdd8630c30ce1b13403ef2"
+    },
+    "psms_competed": {
+      "logical_name": "psms_competed",
+      "path": "C:/Users/robbi/AppData/Local/Temp/claude/H--OneDrive---UGent-MuMDIA-NG/ed948dad-9d5a-423e-9f52-cf197cbee207/scratchpad/smoke_final/out/psms_competed.parquet",
+      "format": "parquet",
+      "schema_name": "psms_competed",
+      "schema_version": 3,
+      "rows": 152,
+      "content_hash": "f5d11d59f94a46211bcddcf5b2ce49de95ed4192d5ee361aa61e7b1d5ef9d518",
+      "producing_stage": "compete",
+      "config_hash": "7dfde09c5047373b95038420ca4248fd4aadf46942bdd8630c30ce1b13403ef2"
+    },
+    "psms_extracted": {
+      "logical_name": "psms_extracted",
+      "path": "C:/Users/robbi/AppData/Local/Temp/claude/H--OneDrive---UGent-MuMDIA-NG/ed948dad-9d5a-423e-9f52-cf197cbee207/scratchpad/smoke_final/out/psms_extracted.parquet",
+      "format": "parquet",
+      "schema_name": "psms_extracted",
+      "schema_version": 2,
+      "rows": 284,
+      "content_hash": "7f2eae351f0d936467458d3ef2942b020f93fc9b72d7484e2c3a08942f44d033",
+      "producing_stage": "extract",
+      "config_hash": "7dfde09c5047373b95038420ca4248fd4aadf46942bdd8630c30ce1b13403ef2"
+    },
+    "psms_scored": {
+      "logical_name": "psms_scored",
+      "path": "C:/Users/robbi/AppData/Local/Temp/claude/H--OneDrive---UGent-MuMDIA-NG/ed948dad-9d5a-423e-9f52-cf197cbee207/scratchpad/smoke_final/out/psms_scored.parquet",
+      "format": "parquet",
+      "schema_name": "psms_scored",
+      "schema_version": 4,
+      "rows": 152,
+      "content_hash": "9c92be4ad83b794db312831fb8797877e0230156cd297624f9120401b5fb82a7",
+      "producing_stage": "rescore",
+      "config_hash": "7dfde09c5047373b95038420ca4248fd4aadf46942bdd8630c30ce1b13403ef2"
+    },
+    "run_windows": {
+      "logical_name": "run_windows",
+      "path": "C:/Users/robbi/AppData/Local/Temp/claude/H--OneDrive---UGent-MuMDIA-NG/ed948dad-9d5a-423e-9f52-cf197cbee207/scratchpad/smoke_final/out/run_windows.parquet",
+      "format": "parquet",
+      "schema_name": "run_windows",
+      "schema_version": 1,
+      "rows": 3820,
+      "content_hash": "cec9473ba70a0955e310cdc9ceb1a1962bbf3fcce67d354f6dfe09ca00885c73",
+      "producing_stage": "rt-im-train",
+      "config_hash": "7dfde09c5047373b95038420ca4248fd4aadf46942bdd8630c30ce1b13403ef2"
+    },
+    "seed_psms": {
+      "logical_name": "seed_psms",
+      "path": "C:/Users/robbi/AppData/Local/Temp/claude/H--OneDrive---UGent-MuMDIA-NG/ed948dad-9d5a-423e-9f52-cf197cbee207/scratchpad/smoke_final/out/seed_psms.parquet",
+      "format": "parquet",
+      "schema_name": "seed_psms",
+      "schema_version": 1,
+      "rows": 179,
+      "content_hash": "a12ee0d4627587e8c2dfb7fda55a0258ec4563c3e0067a3c93effa7edbf64686",
+      "producing_stage": "search-seed",
+      "config_hash": "7dfde09c5047373b95038420ca4248fd4aadf46942bdd8630c30ce1b13403ef2"
+    },
+    "spectra_ms1": {
+      "logical_name": "spectra_ms1",
+      "path": "C:/Users/robbi/AppData/Local/Temp/claude/H--OneDrive---UGent-MuMDIA-NG/ed948dad-9d5a-423e-9f52-cf197cbee207/scratchpad/smoke_final/out/spectra/spectra_ms1.parquet",
+      "format": "parquet",
+      "schema_name": "spectra_ms1",
+      "schema_version": 1,
+      "rows": 60,
+      "content_hash": "c70bba2b31203c20d8108d47c3f802c0ac5b79bb797701cf1b29041d5cd0fa6d",
+      "producing_stage": "convert",
+      "config_hash": "e11217cb603b8854a93c176b421cd926fb371ab35ee4647c4301b3f1c7631c3b"
+    },
+    "spectra_ms2": {
+      "logical_name": "spectra_ms2",
+      "path": "C:/Users/robbi/AppData/Local/Temp/claude/H--OneDrive---UGent-MuMDIA-NG/ed948dad-9d5a-423e-9f52-cf197cbee207/scratchpad/smoke_final/out/spectra/spectra_ms2.parquet",
+      "format": "parquet",
+      "schema_name": "spectra_ms2",
+      "schema_version": 1,
+      "rows": 480,
+      "content_hash": "6228d8b36e3931ed6271122e735494957c8217dbd33d8a81d1fef568b775cf26",
+      "producing_stage": "convert",
+      "config_hash": "e11217cb603b8854a93c176b421cd926fb371ab35ee4647c4301b3f1c7631c3b"
+    }
+  }
+}

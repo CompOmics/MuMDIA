@@ -1,0 +1,25 @@
+{
+  "logical_name": "peptides",
+  "schema_name": "peptides",
+  "schema_version": 1,
+  "stage": "digest",
+  "rows": 876,
+  "content_hash": "b88380d3934a4f87e4c65b900f1a8e2edfc156eb599f967859a4f70d91ef7106",
+  "params": {
+    "decoy_strategy": "Reverse",
+    "enzyme": "TrypsinP",
+    "max_decoy_attempts": 64,
+    "max_len": 50,
+    "min_len": 5,
+    "missed_cleavages": 2,
+    "rng_seed": 0
+  },
+  "stats": {
+    "decoy_collision_retries": 0,
+    "dropped_target_decoy_pairs": 0,
+    "n_decoys": 438,
+    "n_targets": 438
+  },
+  "model_identity": null,
+  "elapsed_ms": 2
+}

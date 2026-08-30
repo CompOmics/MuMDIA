@@ -1,0 +1,18 @@
+{
+  "logical_name": "spectra_ms2",
+  "schema_name": "spectra_ms2",
+  "schema_version": 1,
+  "stage": "convert",
+  "rows": 480,
+  "content_hash": "6228d8b36e3931ed6271122e735494957c8217dbd33d8a81d1fef568b775cf26",
+  "params": {
+    "config_hash": "e11217cb603b8854a93c176b421cd926fb371ab35ee4647c4301b3f1c7631c3b",
+    "max_spectra": 0,
+    "mzml": "C:/Users/robbi/AppData/Local/Temp/claude/H--OneDrive---UGent-MuMDIA-NG/ed948dad-9d5a-423e-9f52-cf197cbee207/scratchpad/smoke_final/fixture.mzML",
+    "top_peaks_ms1": 0,
+    "top_peaks_ms2": 0
+  },
+  "stats": {},
+  "model_identity": null,
+  "elapsed_ms": 12
+}

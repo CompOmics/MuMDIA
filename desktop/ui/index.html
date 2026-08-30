@@ -1,0 +1,163 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MuMDIA</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+
+<aside class="rail">
+  <div class="brand">MuMDIA</div>
+  <nav>
+    <button class="nav on" data-screen="input">Search</button>
+    <button class="nav" data-screen="progress" id="nav-progress" disabled>Progress</button>
+    <button class="nav" data-screen="results" id="nav-results" disabled>Results</button>
+  </nav>
+  <div class="rail-foot">
+    <div class="engine-line" id="engine-line">checking engine…</div>
+  </div>
+</aside>
+
+<main>
+
+  <!-- ─────────────────────────────── Search ─────────────────────────────── -->
+  <section class="screen on" id="screen-input">
+    <h1>New search</h1>
+    <p class="sub">Select the data, choose where results go, and start.</p>
+
+    <div id="engine-error" class="banner bad" hidden></div>
+
+    <div class="card">
+      <div class="card-title">Spectra</div>
+      <div class="picker">
+        <div class="picked" id="p-mzml">No file selected</div>
+        <button class="btn quiet" data-pick="mzml">Choose mzML…</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-title">Search space</div>
+      <div class="tabs" role="tablist">
+        <button class="tab on" data-mode="fasta" role="tab">From a FASTA</button>
+        <button class="tab" data-mode="library" role="tab">From a spectral library</button>
+      </div>
+
+      <div class="mode" id="mode-fasta">
+        <div class="picker">
+          <div class="picked" id="p-fasta">No file selected</div>
+          <button class="btn quiet" data-pick="fasta">Choose FASTA…</button>
+        </div>
+        <p class="hint">
+          The engine digests the FASTA and predicts the library itself. Simplest to
+          start from, and considerably less sensitive than an imported library.
+        </p>
+      </div>
+
+      <div class="mode" id="mode-library" hidden>
+        <div class="picker">
+          <div class="picked" id="p-libp">No precursor table selected</div>
+          <button class="btn quiet" data-pick="lib_precursors">Precursors…</button>
+        </div>
+        <div class="picker">
+          <div class="picked" id="p-libf">No fragment table selected</div>
+          <button class="btn quiet" data-pick="lib_fragments">Fragments…</button>
+        </div>
+        <p class="hint">
+          Two Parquet tables from an imported library. This is the configuration the
+          published benchmarks use.
+        </p>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-title">Results folder</div>
+      <div class="picker">
+        <div class="picked" id="p-out">No folder selected</div>
+        <button class="btn quiet" data-pick="out_dir">Choose folder…</button>
+      </div>
+      <p class="hint">
+        Use an empty folder. A search overwrites its own outputs and cannot resume, so
+        starting a second search here replaces the first.
+      </p>
+    </div>
+
+    <div class="card">
+      <div class="card-title">Settings</div>
+      <div class="row">
+        <label for="preset">Preset</label>
+        <select id="preset"><option value="">Engine defaults</option></select>
+      </div>
+      <div class="row">
+        <label for="threads">Threads</label>
+        <input id="threads" type="number" min="1" step="1" placeholder="all cores">
+        <span class="hint inline" id="cores"></span>
+      </div>
+    </div>
+
+    <div id="start-error" class="banner bad" hidden></div>
+
+    <div class="actions">
+      <button class="btn big" id="start">Start search</button>
+      <span class="hint inline">Runs take from minutes to hours.</span>
+    </div>
+  </section>
+
+  <!-- ────────────────────────────── Progress ────────────────────────────── -->
+  <section class="screen" id="screen-progress">
+    <div class="head-row">
+      <div>
+        <h1 id="prog-title">Searching</h1>
+        <p class="sub" id="prog-sub">Starting…</p>
+      </div>
+      <button class="btn quiet" id="stop">Stop</button>
+    </div>
+
+    <div id="run-error" class="banner bad" hidden></div>
+
+    <div class="card">
+      <div class="stages" id="stages"></div>
+    </div>
+
+    <details class="card details" id="cmd-card">
+      <summary>Command being run</summary>
+      <pre class="cmd" id="cmd"></pre>
+      <button class="btn quiet small" id="copy-cmd">Copy</button>
+    </details>
+
+    <div class="card logcard">
+      <div class="card-title">Log</div>
+      <pre class="log" id="log"></pre>
+    </div>
+  </section>
+
+  <!-- ─────────────────────────────── Results ────────────────────────────── -->
+  <section class="screen" id="screen-results">
+    <div class="head-row">
+      <div>
+        <h1 id="res-title">Results</h1>
+        <p class="sub" id="res-sub"></p>
+      </div>
+      <button class="btn" id="open-folder">Open folder</button>
+    </div>
+
+    <div id="res-warn" class="banner warn" hidden></div>
+
+    <div class="kpis" id="kpis"></div>
+
+    <div class="card">
+      <div class="card-title">Files</div>
+      <div id="files" class="files"></div>
+    </div>
+
+    <div class="actions">
+      <button class="btn quiet" id="another">New search</button>
+    </div>
+  </section>
+
+</main>
+
+<script type="module" src="app.js"></script>
+</body>
+</html>
