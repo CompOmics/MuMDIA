@@ -298,9 +298,17 @@ jobs:
         run: |
           set -euo pipefail
           python -m pip install --quiet pip-audit
-          # --strict fails on a package pip-audit cannot resolve, rather than passing
-          # over it in silence, which would make a clean report meaningless.
-          pip-audit --strict --progress-spinner off
+          # NOT --strict, and the reason is specific rather than a shrug. --strict
+          # fails when a package cannot be resolved on PyPI at all, and `torch` is
+          # installed from the PyTorch index as `2.12.1+cpu`, a local version that by
+          # construction does not exist on PyPI. That is not a finding, it is how CPU
+          # torch is distributed, and failing on it would train everyone to ignore
+          # this job. Real advisories still fail the run.
+          #
+          # The gap this leaves is torch itself. Watch
+          # https://github.com/pytorch/pytorch/security/advisories directly; nothing
+          # here can audit a wheel PyPI has never seen.
+          pip-audit --progress-spinner off
 
       # The exact package set the audit above ran against. The specifications pin the
       # tools that matter (mokapot, ms2pip, deeplc, torch) and leave the scientific
