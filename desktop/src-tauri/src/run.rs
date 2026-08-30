@@ -485,6 +485,59 @@ pub fn start(id: String, req: Request) -> Result<Arc<Run>, String> {
     Ok(run)
 }
 
+/// One past run, reconstructed from what it left on disk.
+///
+/// There is no history database. A finished run already carries a complete record
+/// in its own output folder: `manifest.json` for the engine version, the commit and
+/// the hashed inputs, and `psms_scored.parquet.report.json` for the counts and the
+/// classifier that actually ran. Reading those back is both less code and more
+/// honest than a separate index, which could disagree with the folder it describes.
+#[derive(Serialize, Clone, Debug)]
+pub struct HistoryEntry {
+    pub out_dir: String,
+    pub name: String,
+    pub finished_unix_ms: u64,
+    pub results: Option<Results>,
+    /// Present when the run wrote a manifest, which is every completed run.
+    pub engine_version: Option<String>,
+}
+
+/// Read one output directory as a history entry, or `None` if it is not one.
+pub fn history_entry(dir: &Path) -> Option<HistoryEntry> {
+    let scored = dir.join("psms_scored.parquet.report.json");
+    let manifest = dir.join("manifest.json");
+    if !scored.is_file() && !manifest.is_file() {
+        return None;
+    }
+    let finished = scored
+        .metadata()
+        .or_else(|_| manifest.metadata())
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let engine_version = std::fs::read_to_string(&manifest)
+        .ok()
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        .and_then(|v| {
+            v.get("mumdia_version")
+                .and_then(|s| s.as_str())
+                .map(|s| s.to_string())
+        });
+    Some(HistoryEntry {
+        name: dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("run")
+            .to_string(),
+        out_dir: dir.display().to_string(),
+        finished_unix_ms: finished,
+        results: read_results(dir),
+        engine_version,
+    })
+}
+
 /// Fold every `*.report.json` under `dir` into one row per producing stage.
 fn scan_stages(dir: &Path) -> Vec<Stage> {
     let mut by_stage: BTreeMap<String, Stage> = BTreeMap::new();
@@ -740,6 +793,44 @@ mod tests {
         assert!(keep.is_file(), "a real output must survive the sweep");
         assert!(!kill.is_file(), "the temp file must go");
         assert!(!kill_nested.is_file(), "the sweep must recurse");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod history_tests {
+    use super::*;
+
+    #[test]
+    fn a_finished_run_folder_reads_back_as_history() {
+        // The same real artifact reports the stage test uses: a history entry must
+        // come from the folder, not from anything the application remembered.
+        let dir =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/run_out");
+        if !dir.is_dir() {
+            eprintln!("fixture missing, skipping");
+            return;
+        }
+        let e = history_entry(&dir).expect("a completed run folder is a history entry");
+        assert_eq!(e.name, "run_out");
+        let r = e.results.expect("results come from the scored report");
+        assert_eq!(r.classifier, "native_tda");
+        assert_eq!(r.peptides_1pct, 151);
+        assert!(
+            e.engine_version.is_some(),
+            "the manifest names the engine version"
+        );
+        assert!(e.finished_unix_ms > 0);
+    }
+
+    #[test]
+    fn a_folder_that_is_not_a_run_is_not_history() {
+        // A user picks output folders by hand, so the list will contain directories
+        // that never held a search. They must drop out rather than appear empty.
+        let dir = std::env::temp_dir().join(format!("mumdia_not_a_run_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("notes.txt"), b"hello").unwrap();
+        assert!(history_entry(&dir).is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

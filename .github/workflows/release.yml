@@ -382,7 +382,14 @@ jobs:
             libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf \
             libssl-dev musl-tools
 
+      # Inside `rust/mumdia`, not at the repository root. That directory pins its
+      # toolchain with `rust-toolchain.toml`, and `rustup target add` adds the target
+      # to whichever toolchain is active where it runs. From the root it added musl
+      # to the DEFAULT toolchain while the build used the pinned one, which then
+      # failed with "can't find crate for `core`" and advice to run the command that
+      # had just succeeded.
       - name: Add the engine target
+        working-directory: rust/mumdia
         run: rustup target add ${{ matrix.target }}
 
       # The application ships the engine it was built alongside. Building both from

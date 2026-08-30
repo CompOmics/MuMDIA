@@ -16,6 +16,7 @@
     <button class="nav" data-screen="settings">Settings</button>
     <button class="nav" data-screen="progress" id="nav-progress" disabled>Progress</button>
     <button class="nav" data-screen="results" id="nav-results" disabled>Results</button>
+    <button class="nav" data-screen="history">History</button>
   </nav>
   <div class="rail-foot">
     <div class="engine-line" id="engine-line">checking engine…</div>
@@ -240,6 +241,16 @@
     <div class="actions">
       <button class="btn quiet" id="another">New search</button>
     </div>
+  </section>
+
+  <!-- ─────────────────────────────── History ────────────────────────────── -->
+  <section class="screen" id="screen-history">
+    <h1>Past searches</h1>
+    <p class="sub">
+      Read back from the folders themselves, so a search moved or deleted on disk
+      simply stops appearing.
+    </p>
+    <div id="history-list"></div>
   </section>
 
 </main>

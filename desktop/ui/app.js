@@ -45,7 +45,21 @@ const state = {
   schema: null,
   overrides: {},
   savedConfig: null,
+  // Output folders this application has used. The only thing it remembers; what
+  // each one contains is read back from the folder.
+  known: JSON.parse(localStorage.getItem("mumdia.folders") || "[]"),
 };
+
+function rememberFolder(dir) {
+  if (!dir || state.known.includes(dir)) return;
+  state.known.unshift(dir);
+  state.known = state.known.slice(0, 50);
+  try {
+    localStorage.setItem("mumdia.folders", JSON.stringify(state.known));
+  } catch {
+    // A browser storage that refuses to write is not worth failing a search over.
+  }
+}
 
 // ── small helpers ───────────────────────────────────────────────────────────
 const fmtInt = (n) => (n ?? 0).toLocaleString("en-GB");
@@ -122,6 +136,7 @@ async function init() {
       screen(b.dataset.screen);
       if (b.dataset.screen === "setup") refreshComponents();
       if (b.dataset.screen === "settings") loadSettings();
+      if (b.dataset.screen === "history") loadHistory();
     });
   }
   for (const t of document.querySelectorAll(".tab")) {
@@ -529,6 +544,7 @@ async function start() {
   }
 
   state.outDir = p.out_dir;
+  rememberFolder(p.out_dir);
   state.lastStatus = null;
   $("nav-progress").disabled = false;
   $("nav-results").disabled = true;
@@ -574,6 +590,48 @@ async function poll() {
       renderResults(s);
       screen("results");
     }
+  }
+}
+
+// ── history ─────────────────────────────────────────────────────────────────
+async function loadHistory() {
+  const list = $("history-list");
+  let entries = [];
+  try {
+    entries = await invoke("history", { dirs: state.known });
+  } catch (e) {
+    list.innerHTML = `<p class="hint">Could not read past searches: ${e}</p>`;
+    return;
+  }
+  if (!entries.length) {
+    list.innerHTML = `<p class="hint">No past searches yet.</p>`;
+    return;
+  }
+  const esc = (t) =>
+    String(t).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  list.innerHTML = entries
+    .map((e) => {
+      const r = e.results;
+      const when = e.finished_unix_ms
+        ? new Date(e.finished_unix_ms).toLocaleString()
+        : "";
+      const counts = r
+        ? `${fmtInt(r.peptides_1pct)} peptides at peptide_q_value 0.01 · ` +
+          `${fmtInt(r.protein_groups_1pct)} protein groups · ${esc(r.classifier)}`
+        : "no scored table in this folder";
+      return (
+        `<div class="card"><div class="card-head"><div>` +
+        `<div class="card-title">${esc(e.name)}</div>` +
+        `<div class="card-sub">${counts}<br>${esc(when)} · ${esc(e.out_dir)}` +
+        (e.engine_version ? ` · ${esc(e.engine_version)}` : "") +
+        `</div></div>` +
+        `<button class="btn quiet" data-open="${esc(e.out_dir)}">Open folder</button>` +
+        `</div></div>`
+      );
+    })
+    .join("");
+  for (const b of list.querySelectorAll("[data-open]")) {
+    b.addEventListener("click", () => invoke("reveal", { path: b.dataset.open }));
   }
 }
 

@@ -113,6 +113,22 @@ fn preflight(
     }))
 }
 
+/// Past runs, read back from the folders they wrote.
+///
+/// The interface remembers which folders it has used; the content of each entry
+/// comes from the folder itself, so a run deleted or moved on disk simply stops
+/// appearing rather than lingering as a stale row.
+#[tauri::command]
+fn history(dirs: Vec<String>) -> Vec<run::HistoryEntry> {
+    let mut out: Vec<run::HistoryEntry> = dirs
+        .iter()
+        .filter_map(|d| run::history_entry(Path::new(d)))
+        .collect();
+    // Newest first.
+    out.sort_by_key(|e| std::cmp::Reverse(e.finished_unix_ms));
+    out
+}
+
 /// Peaks per MS2 spectrum for a chosen file, so the peak cap can be set from the
 /// file rather than from another acquisition.
 #[tauri::command]
@@ -265,6 +281,7 @@ fn main() {
             config_schema,
             save_settings,
             peak_census,
+            history,
             preflight,
             start_run,
             run_state,
