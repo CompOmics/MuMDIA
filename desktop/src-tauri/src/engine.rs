@@ -75,11 +75,12 @@ fn candidates() -> Vec<(PathBuf, &'static str)> {
         if let Some(dir) = exe.parent() {
             out.push((dir.join(EXE), "bundled"));
             out.push((dir.join("binaries").join(EXE), "bundled"));
-            // `cargo run` from src-tauri puts the app in target/debug, with the
-            // repository three levels up. Convenient during development and
+            // A `cargo run`/`cargo tauri build` binary sits in
+            // `desktop/target/<profile>/`, which is three levels below the
+            // repository root, not four. Convenient during development and
             // harmless in a release, where the path simply does not exist.
             out.push((
-                dir.join("../../../../rust/mumdia/target/release").join(EXE),
+                dir.join("../../../rust/mumdia/target/release").join(EXE),
                 "repository build",
             ));
         }

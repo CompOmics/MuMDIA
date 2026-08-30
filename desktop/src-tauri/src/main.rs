@@ -228,7 +228,9 @@ fn presets() -> Vec<serde_json::Value> {
     if let Ok(exe) = std::env::current_exe() {
         if let Some(d) = exe.parent() {
             dirs.push(d.join("configs").join("examples"));
-            dirs.push(d.join("../../../../configs/examples"));
+            // Three levels from `desktop/target/<profile>/` to the repository
+            // root, not four.
+            dirs.push(d.join("../../../configs/examples"));
         }
     }
     for dir in dirs {
