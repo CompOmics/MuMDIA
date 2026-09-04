@@ -1,0 +1,571 @@
+# 28. Feature selection for rescoring: analysis
+
+Status: analysis only. No engine code changes. Scripts in `bench/feature_selection/`,
+outputs under `C:/Users/robbi/mumdia_bench/fs/` (off OneDrive; large). Measured
+2026-09-04.
+
+## 0. Summary
+
+- Of the 387 Extended features, 43 carry no information the classifier can see: 10 are
+  constant under the default configuration, 20 are bit-identical to another column, 13 are
+  affine images of another column. The live set is 344, and it has an effective dimension
+  of about 120 (PCA: 123 components for 95% of the variance; 239 Spearman clusters at
+  |rho| >= 0.90).
+- On the full pools, two seeds each, the subsets that hold on both A01 (where they were
+  built) and B01 (held out) are: the 344 live features (+0.1% / -0.1%), the 150 most
+  important by permutation (+0.1% / +0.1%), and the unions of permutation top-75/100 with
+  the L1 set at 138, 122 and 114 features (0.0 to -0.3% on both). Below that the loss is
+  real and consistent on the held-out set: 100 features -0.9%, 86 features -1.6%. The
+  engine's `rich` set (44) costs 7.5-8.3% and `minimal` (14) costs 22-28%. Cluster
+  representatives transfer worst (239 at -1.2%, 189 at -1.4% held out). The decoy fraction
+  at 1% is 1.00% in every one of the 130 runs, as target-decoy competition guarantees.
+- The real worker confirms it: `nn_rescore_worker.py` on the B01 PIN with
+  `MUMDIA_NN_FEATURES` = the 122-feature union gives 58,962 peptides and 66,174 target PSMs
+  at 1% against 58,978 and 66,081 for the engine run's own 387-feature pass on the same PIN
+  (section 6.4).
+- No feature family is indispensable: removing any one family alone costs at most 2.1%
+  (coelution) and most cost nothing measurable, because every family is covered by others.
+  No family is sufficient alone (each alone loses 14% to 100%).
+- Feature selection buys memory and I/O, not training time. The Rust matrix, the PIN and the
+  worker's matrices scale with the feature count (a 122-feature set is 3.2x smaller than
+  387), but the MLP's CPU training time per row is flat in the feature count: 4.1-4.6 us per
+  row per epoch at 32 threads for every width from 387 down to 100, measured uncontended on
+  doxy, and the real worker trained for 2,879 s on 122 features against 2,753 s on 387.
+  Per-batch overhead dominates, not the first-layer GEMM. Training speed has to come from
+  the knobs already measured in August (warm start, batch size, GPU), not from fewer
+  features.
+- The largest memory lever in rescoring is not feature selection but the handoff format:
+  `rescore.handoff = tsv` (the default) makes the worker parse a 9.5 GB text file through
+  `pandas.read_csv` into a float64 frame before it builds its float32 matrix, and on that
+  path a feature subset does not reduce the parse. `Handoff::Parquet` already exists and
+  reads only the requested columns; with it, a subset shrinks every Python allocation.
+- Recommended next step, if pursued: the 114-feature deduplicated union set (section 6.3;
+  its 122-feature parent is the one validated through the real worker), together with
+  `rescore.handoff = parquet`, gated on the AIF benchmark and an entrapment run before it
+  touches any default (CLAUDE.md, "Validate new sensitivity defaults"). Expected gain on
+  the HYE run: rescore stage peak from 33 GiB to roughly 10 GiB and the PIN from 9.5 GB to
+  3 GB (or a 1.2 GB parquet); expected time gain: a few percent.
+
+## 1. Question and why it matters
+
+The Extended feature set is 387 columns. Rescore is the tallest stage of a single run
+(33.04 GiB, docs/27 section 0) and 79% of its wall clock (3,187 of 4,050 s on the HYE
+benchmark), and every byte of it scales with the feature count `D`:
+
+| quantity | at D = 387, N = 2,603,894 PSMs | scaling |
+|---|---|---|
+| Rust `FeatureMatrix` (f32) | 3.75 GiB (measured, `mem: rescore feature matrix`) | N x D x 4 |
+| PIN TSV handed to the sidecar | 9.54 GB, 3,663 B/row, ~9.3 B per value | N x D x ~9.3 |
+| worker `pandas.read_csv` frame (TSV handoff) | ~8 GB of float64 feature columns plus object columns | N x D x 8 |
+| worker float32 matrices `X` and `Xs` (TSV in-memory path holds both while standardising) | 3.75 GiB each | N x D x 4 |
+| per-fold training gather | 2/3 x N x D x 4 = 2.5 GiB | N x D |
+| rescore tree peak (Rust + worker) | 33.04 GiB | ~ N x D |
+
+So a feature count of 120 would, to first order, cut the stage peak, the PIN and the
+features table by 3.2x. Whether it also cuts time, and what it costs in identifications,
+are the two measured questions below. The objective is the quantity the engine optimises:
+stripped peptides at 1% FDR, with the decoy fraction as the validity check.
+
+## 2. Data and protocol
+
+Two HYE runs from the current engine with the imported HYE library, `nn_torch` strict,
+Extended features, `compete.group_by = peptidoform_charge`:
+
+| tag | file | competed PSMs | targets | decoys |
+|---|---|---|---|---|
+| A01 | `LFQ_Orbitrap_AIF_Condition_A_Sample_Alpha_01` (August run, `~/hye/out_hye41/A_01/run.pin`) | 1,815,610 | 973,483 | 842,127 |
+| B01 | `LFQ_Orbitrap_AIF_Condition_B_Sample_Alpha_01` (2026-09-04 profile run, `out_inst/run.pin`) | 2,603,894 | 1,364,317 | 1,239,577 |
+
+The PINs are converted to float32 parquet (`~/hye/pin2parquet.py`). Everything below is
+computed from the PIN alone; the features stage is not re-run. The features-stage PIN
+(`run.pin`, SpecId `cand_<id>`) and the rescore-stage PIN the worker consumed
+(`sidecar_work/*.pin`, SpecId `psm_<row>`) were verified row-aligned on B01: identical
+labels, masses and peptides in the same order.
+
+The objective is measured with `bench/feature_selection/fs_lib.py::run_rescoring`, a
+re-implementation of `scripts/nn_rescore_worker.py` under the configuration the engine
+ships: md5(stripped peptide) folds (3), per-fold init-feature scan over both signs,
+Percolator-style self-training on targets at 1% vs all decoys for `num_iter = 10`
+iterations (the `RescoreConfig` default, passed as `MUMDIA_NN_ITERS`; the worker's own
+docstring default of 5 is never what the engine runs), a fresh MLP 128-64 with dropout 0.3
+per iteration, churn early stop at 1% (never triggered here, as in the real run), mean/std
+standardisation clipped at +-8, rank averaging over seeds. A feature subset is evaluated by
+running that loop on the subset's columns only, so the init scan, the self-training
+trajectory and the model all see the reduced set.
+
+Faithfulness checks: on A01 the harness gives 59,046 peptides at 1% (seed 0), the number
+the August notebook baseline recorded for the real worker on this PIN. On B01 the engine
+run's own worker output, scored with the same picked-peptide metric, gives 58,978 peptides
+and 66,081 target PSMs (the engine reported 66,081); the harness gives 59,246 and 59,773
+for two seeds.
+
+Runs were on an RTX 4090, several at a time; wall times are indicative only. The noise
+floor is two seeds of the full set: 59,046 vs 59,611 on A01 (0.95% apart), 59,246 vs
+59,773 on B01 (0.9%). On the 400k-row screening subsample three seeds of the full set
+spanned 0.64%. Differences inside those bands are not differences.
+
+## 3. What the 387 features are, structurally
+
+Both datasets agree on every count below to within one feature, and the per-feature
+univariate strength correlates at Spearman 0.971 across them: the structure is a property
+of the feature definitions, not of one run.
+
+### 3.1 Dead by construction: 43 columns
+
+Ten columns are constant, for configuration reasons rather than data:
+
+| feature | family | why |
+|---|---|---|
+| has_ms1 | rich | always 1 (MS1 present on every row) |
+| ms1_isotope_height_corr | ms1 | `ms1_precursor_features` off (default) |
+| deconv_explained_frac | demix | `emit_demix_features` off (default) |
+| deconv_active | demix | `emit_demix_features` off (default) |
+| deconv_share | demix | `emit_demix_features` off (default) |
+| deconv_max_collinearity | demix | `emit_demix_features` off (default) |
+| shadow_kept_frac | demix | `emit_demix_features` off (default) |
+| peak_contested_frac | psm_extra | `emit_contested_features` off (default) |
+| peak_contested_count_frac | psm_extra | `emit_contested_features` off (default) |
+| peak_apportioned_frac | psm_extra | `emit_contested_features` off (default) |
+
+Twenty columns are bit-identical to another column: the same quantity computed twice
+under two names, once by a legacy set and once by an extended family.
+
+| feature | family | identical to |
+|---|---|---|
+| rmsd_norm | similarity | library_rmsd |
+| bhattacharyya_coef | similarity | spectrum_cosine_sqrt |
+| cosine_high_ordinal | similarity | frag_cosine |
+| xcorr_shape_mean | coelution | xcorr_shape |
+| xcorr_lag_mean_abs | coelution | xcorr_coelution |
+| apex_purity | interference | explained_apex_intensity_frac |
+| matched_pred_intensity_fraction | interference | library_recall_intensity |
+| top_pred_frag_matched | interference | top1_predicted_observed |
+| intensity_weighted_abs_ppm | mass_accuracy | weighted_mass_error |
+| log_ms1_mono | ms1 | log_mono_ms1 |
+| ms1_isotope_xic_shape_consistency | ms1 | ms1_iso_coelution |
+| rt_error_abs_norm_gradient | rt | rt_error_rel |
+| precursor_charge | novel | charge |
+| n_matched_frags | novel | n_matched_fragments |
+| profile_cos_nz | nonzero | profile_cos |
+| frag_mass_err_abs_median | mass_uncertainty | median_abs_frag_ppm |
+| frag_mass_err_iqr | mass_uncertainty | ppm_iqr |
+| frag_mass_err_max_abs | mass_uncertainty | max_abs_frag_ppm |
+| frag_mass_err_range | mass_uncertainty | ppm_range |
+| frac_top3_pred_observed | mass_uncertainty | frac_top3_predicted_observed |
+
+Thirteen more are affine images of another column (|Pearson| >= 0.9999): a rescaling, a
+sign flip, or a division by a per-run constant such as the gradient length. A standardised
+linear layer cannot tell them from their source.
+
+| feature | family | affine image of | also in B01 |
+|---|---|---|---|
+| rt_error_rel | minimal | rt_error_abs | yes |
+| manhattan_sim | similarity | library_norm_manhattan | yes |
+| squared_chord | similarity | spectrum_cosine_sqrt | yes |
+| harmonic_mean_sim | similarity | chi_square_symmetric | yes |
+| frac_predicted_absent | similarity | matched_fraction | no (0.9998) |
+| jensen_shannon_divergence | entropy | spectral_entropy_similarity | yes |
+| out_of_peak_intensity_frac | interference | peak_to_full_area_ratio_profile | yes |
+| fwhm_to_window_ratio | chromatographic | fwhm_seconds | yes |
+| rt_error_signed_norm_gradient | rt | rt_error_signed | yes |
+| observed_rt_fraction | rt | observed_rt_raw | yes |
+| predicted_rt_fraction | rt | predicted_rt_raw | yes |
+| rt_diff_profile_apex | rt | apex_centering_offset | yes |
+| log_total_matched_intensity | novel | log_apex_intensity | yes |
+
+387 - 43 = 344 live features. Two of those are near-constant (`predicted_rt_in_gradient`,
+`peak_window_degenerate`: modal value on 99.99% of rows).
+
+### 3.2 Redundancy among the live 344
+
+Spearman correlation on a 300k-row sample, average-linkage clusters at a |rho| threshold:
+
+| \|rho\| >= | clusters (A01) | clusters (B01) |
+|---|---|---|
+| 0.98 | 302 | 304 |
+| 0.95 | 274 | 286 |
+| 0.90 | 239 | 254 |
+| 0.80 | 189 | 191 |
+| 0.70 | 154 | 162 |
+
+615 pairs (A01; 570 on B01) have |correlation| >= 0.95. The largest cluster at 0.90 has 23
+members and is one idea, intensity-profile similarity, computed 23 ways
+(`spectrum_cosine_sqrt`, `spectral_angle_sqrt`, `library_norm_manhattan`, `bray_curtis`,
+`hellinger`, `spectral_entropy_similarity` and its four variants, `jeffreys_divergence`,
+`kl_pred_obs`, ...). Other 7-member clusters: the log-intensity family
+(`log_apex_intensity`, `dot_product_raw`, `log_dot_product`, `total_xic_log`, ...), the
+xcorr-shape family, the b-ion count family, the ppm-spread family.
+
+PCA of the standardised live matrix: 48 components carry 80% of the variance, 86 carry
+90%, 123 carry 95%, 194 carry 99%.
+
+### 3.3 Univariate strength
+
+The worker's own criterion (targets at 1% FDR using one feature alone, better sign) on the
+full A01 pool: 277 of 387 features give zero targets at 1% on their own; the best give
+41,116 (`spectral_entropy_similarity_topk`), 39,022 (`library_rmsd`), 38,915
+(`minkowski_p3`), 38,807 (`bray_curtis_sqrt`). Every one of the top 30 is a spectrum
+similarity or entropy measure. That is what the init scan picks (it chose
+`spectral_entropy_similarity_topk` or `bray_curtis_sqrt` in every fold of the real run),
+and it says nothing about what the multivariate model needs: `rt_error_abs`, the strongest
+feature multivariately (3.4), gives zero targets alone. Subsets chosen by univariate
+strength are the worst in section 5 (-13% to -19% at 25-100 features): they select 100
+copies of the same signal.
+
+### 3.4 Multivariate importance, and why it is a weak guide here
+
+Importance is measured on the population the worker trains on: targets with out-of-fold
+q <= 0.01 under the full model (68,054 on A01) against decoys (400k sampled). That problem
+is nearly separable: an L1 logistic regression reaches holdout AUC 0.9996 with 31 features
+and 0.9999 with 82, and gradient boosting reaches 0.9999 with all of them. Every importance
+measure therefore works on a saturated objective; the values are tiny (the largest
+permutation drop is 1.6e-4 AUC) and the rankings disagree: Spearman correlations between
+permutation importance, linear leave-one-out drop, linear weight, L1 entry order and
+univariate strength are between 0.01 and 0.51. Rankings are usable to build candidate
+subsets and to pick a representative inside a cluster; they are not evidence that a subset
+is sufficient. Only sections 5 and 6 are.
+
+What the rankings agree on:
+
+- `rt_error_abs` is the strongest single feature multivariately by a factor of 6 and is
+  invisible univariately.
+- Permutation importance mass is concentrated: the top 10 live features carry 68% of the
+  total positive drop, the top 50 carry 91%, the top 100 carry 97.5%. 131 of the 344 live
+  features have a permutation drop <= 0 on this saturated problem.
+- 36 features enter the L1 path at C <= 0.001, 78 at C <= 0.005, 202 at 0.02; 12 never
+  enter even at C = 0.5.
+
+Per family (A01, live features only):
+
+| family | features | live | best univariate | univariate zero | perm share | in perm top 100 | in L1 at C=0.005 |
+|---|---|---|---|---|---|---|---|
+| minimal | 14 | 13 | 27,207 | 10 | 0.414 | 7 | 4 |
+| entropy | 18 | 17 | 41,116 | 7 | 0.122 | 5 | 3 |
+| similarity | 63 | 56 | 39,022 | 24 | 0.111 | 19 | 17 |
+| interference | 26 | 22 | 22,870 | 21 | 0.071 | 8 | 5 |
+| rich | 30 | 29 | 39,022 | 18 | 0.054 | 9 | 1 |
+| chromatographic | 43 | 42 | 0 | 43 | 0.045 | 8 | 5 |
+| nonzero | 12 | 11 | 27,530 | 5 | 0.041 | 4 | 2 |
+| coelution | 38 | 36 | 28,485 | 16 | 0.036 | 7 | 11 |
+| ion_series | 34 | 34 | 25,464 | 27 | 0.026 | 7 | 7 |
+| mass_accuracy | 17 | 16 | 0 | 17 | 0.021 | 4 | 2 |
+| ms1 | 26 | 23 | 0 | 26 | 0.021 | 7 | 10 |
+| mass_uncertainty | 10 | 5 | 22,523 | 8 | 0.012 | 3 | 2 |
+| rt | 12 | 7 | 0 | 12 | 0.007 | 3 | 1 |
+| novel | 10 | 7 | 24,026 | 9 | 0.007 | 2 | 3 |
+| psm_extra | 6 | 3 | 0 | 6 | 0.005 | 2 | 2 |
+| apex_dispersion | 13 | 13 | 0 | 13 | 0.004 | 3 | 3 |
+| order_consistency | 8 | 8 | 0 | 8 | 0.002 | 1 | 0 |
+| demix | 5 | 0 | 0 | 5 | 0 | 0 | 0 |
+| peak_scans | 2 | 2 | 0 | 2 | 0 | 0 | 0 |
+
+Top 25 by permutation importance (A01):
+
+| feature | family | perm drop x 1e5 | L1 first C | univariate targets |
+|---|---|---|---|---|
+| rt_error_abs | minimal | 15.7 | 0.0005 | 0 |
+| spectral_entropy_similarity_topk | entropy | 2.4 | 0.0005 | 41,116 |
+| spectral_entropy_similarity_area | entropy | 2.1 | 0.0005 | 32,023 |
+| peak_to_full_area_ratio_weighted | interference | 2.0 | 0.0005 | 0 |
+| n_frag_present_inpeak | nonzero | 1.2 | 0.0005 | 26,055 |
+| regression_slope | similarity | 1.0 | 0.5 | 0 |
+| canberra_matched | similarity | 0.9 | 0.0005 | 0 |
+| n_y_ions | rich | 0.8 | 0.001 | 0 |
+| gaussian_cosine | chromatographic | 0.8 | 0.0005 | 0 |
+| charge | minimal | 0.6 | 0.001 | 0 |
+| profile_peak_snr | chromatographic | 0.5 | 0.002 | 0 |
+| mae_weighted_pred | similarity | 0.5 | 0.0005 | 25,001 |
+| mass_evidence_gauss | mass_accuracy | 0.4 | 0.0005 | 0 |
+| diff_by_intensity | rich | 0.4 | 0.5 | 0 |
+| frac_top5_pred_observed | mass_uncertainty | 0.4 | 0.0005 | 0 |
+| seed_score | rich | 0.4 | 0.02 | 24,026 |
+| pairwise_coelution_hi | coelution | 0.4 | 0.005 | 28,485 |
+| peak_to_full_area_ratio_frag_mean | interference | 0.3 | 0.005 | 0 |
+| series_gap_fraction | ion_series | 0.3 | 0.002 | 0 |
+| wave_hedges | similarity | 0.3 | 0.01 | 23,164 |
+| pairwise_coelution_weighted | coelution | 0.3 | 0.0005 | 14,045 |
+| by_ion_contiguous_intensity | ion_series | 0.3 | 0.01 | 0 |
+| lib_weighted_abs_ppm | mass_accuracy | 0.3 | 0.01 | 0 |
+| ms1_isotope_corr_xic | ms1 | 0.3 | 0.0005 | 0 |
+| coelution_corr_entropy | coelution | 0.2 | 0.0005 | 3,841 |
+
+## 4. Candidate subsets
+
+`bench/feature_selection/fs_subsets.py` builds, from the tables above:
+
+- `dedup` (344): the live set;
+- `clust_t` (302, 274, 239, 189, 154): one representative per Spearman cluster at |rho| >=
+  0.98, 0.95, 0.90, 0.80, 0.70, the representative being the member with the largest
+  permutation importance;
+- `topK_perm` (10 to 200) by permutation importance; `topK_univ` (25, 50, 100) by
+  univariate strength;
+- `l1_C` (42, 86, 224): the non-zero set of the L1 path at C = 0.001, 0.005, 0.02;
+- `no_<family>` and `only_<family>`: every family removed alone, every family alone;
+- the engine's own `minimal` (14) and `rich` (44);
+- second round, from the first round's results: unions of the permutation top-75/top-100
+  with the L1 C=0.005 set (122, 138), intersections of cluster representatives with the
+  permutation top-200 (160, 131), all six "cheap" families removed together (292), and the
+  122-feature union with its 8 remaining duplicates removed (114).
+
+## 5. Screening on a 400k-row subsample of A01
+
+One seed per subset, 10 iterations; the full set was run with three seeds (mean 14,442
+peptides, spread 0.64%) and the subsets marked * with three seeds. Relative to that mean:
+
+| subset | D | peptides at 1% | rel. | note |
+|---|---|---|---|---|
+| all * | 387 | 14,442 | 0 | |
+| dedup * | 344 | 14,339 | -0.7% | |
+| clust_0.98 | 302 | 14,337 | -0.7% | |
+| no_cheap_families * | 292 | 14,322 | -0.8% | |
+| clust_0.95 | 274 | 14,287 | -1.1% | |
+| clust_0.90 * | 239 | 14,316 | -0.9% | |
+| l1_C0.02 | 224 | 14,217 | -1.6% | |
+| top200_perm | 200 | 14,346 | -0.7% | |
+| clust_0.80 * | 189 | 14,330 | -0.8% | |
+| clust090_x_top200 * | 160 | 14,309 | -0.9% | |
+| clust_0.70 | 154 | 14,283 | -1.1% | |
+| top150_perm | 150 | 14,219 | -1.5% | |
+| union_top100_l1005 * | 138 | 14,383 | -0.4% | |
+| clust080_x_top200 * | 131 | 14,331 | -0.8% | |
+| union_top75_l1005 * | 122 | 14,432 | -0.1% | best compact set |
+| top100_perm * | 100 | 14,242 | -1.4% | |
+| l1_C0.005 * | 86 | 14,312 | -0.9% | |
+| top75_perm | 75 | 14,285 | -1.1% | |
+| top50_perm | 50 | 13,974 | -3.2% | real loss begins |
+| l1_C0.001 | 42 | 13,942 | -3.5% | |
+| top25_perm | 25 | 13,631 | -5.6% | |
+| top10_perm | 10 | 12,794 | -11.4% | |
+| top100_univ | 100 | 12,603 | -12.7% | univariate ranking is the wrong criterion |
+| top50_univ | 50 | 12,039 | -16.6% | |
+| top25_univ | 25 | 11,717 | -18.9% | |
+
+Every subset of 75 or more features that was chosen multivariately sits between -1.6% and
+-0.1%, i.e. at or just below the noise floor; real losses start below 75. The consistent
+-0.7% to -0.9% of the large subsets (dedup, cluster representatives) across three seeds each
+is at the edge of the noise band and may be a small real effect: duplicated inputs act as an
+implicit re-weighting of the first layer at initialisation. It does not reproduce on the
+full pool (section 6, dedup +0.1%).
+
+Family ablations, one seed each, relative to the same mean:
+
+| removed family | D | rel. | removed family | D | rel. |
+|---|---|---|---|---|---|
+| rich | 315 | +0.7% | mass_accuracy | 328 | -0.9% |
+| rt | 337 | +0.1% | ms1 | 321 | -1.0% |
+| peak_scans | 342 | -0.1% | novel | 337 | -1.1% |
+| mass_uncertainty | 339 | -0.4% | interference | 322 | -1.2% |
+| order_consistency | 336 | -0.4% | entropy | 327 | -1.3% |
+| ion_series | 310 | -0.5% | apex_dispersion | 331 | -1.4% |
+| similarity | 288 | -0.5% | chromatographic | 302 | -1.9% |
+| minimal | 331 | -0.6% | coelution | 308 | -2.1% |
+| psm_extra | 341 | -0.6% | demix | 344 | -0.9% (= dedup) |
+| nonzero | 333 | -0.8% | | | |
+
+No family is indispensable: removing the 63-member similarity family costs 0.5%, removing
+the 14 minimal features that carry 41% of the permutation importance costs 0.6%, because
+in each case the others cover it. The two elution-shape families, chromatographic and
+coelution, are the most expensive to lose and are the least redundant with the rest. Every
+family alone is far worse than the full set (best: rich alone -13.8%, similarity alone
+-17.3%; mass_accuracy, ms1, order_consistency, peak_scans, rt, psm_extra, apex_dispersion
+alone give zero peptides at 1%, because without a spectrum-similarity or RT-error feature
+the init scan has nothing to bootstrap from).
+
+## 6. Confirmation on the full pools
+
+### 6.1 A01, full pool (1,815,610 PSMs), 10 iterations, two seeds each
+
+| subset | D | peptides at 1% (mean of 2) | min / max | PSMs at 1% | decoy frac | rel. |
+|---|---|---|---|---|---|---|
+| all | 387 | 59,328 | 59,046 / 59,611 | 70,490 | 0.0100 | 0 |
+| dedup | 344 | 59,370 | 59,253 / 59,488 | 70,534 | 0.0100 | +0.1% |
+| top150_perm | 150 | 59,398 | 59,375 / 59,421 | 70,632 | 0.0100 | +0.1% |
+| clust_0.90 | 239 | 59,122 | 59,003 / 59,241 | 70,250 | 0.0100 | -0.4% |
+| top100_perm | 100 | 59,113 | 59,050 / 59,177 | 70,016 | 0.0100 | -0.4% |
+| union_top100_l1005 | 138 | 59,332 | 59,322 / 59,342 | 70,438 | 0.0100 | 0.0% |
+| union_top75_l1005 | 122 | 59,230 | 59,057 / 59,403 | 70,313 | 0.0100 | -0.2% |
+| union75_dedup | 114 | 59,159 | 59,087 / 59,231 | 70,193 | 0.0100 | -0.3% |
+| l1_C0.005 | 86 | 58,890 | 58,862 / 58,918 | 70,022 | 0.0100 | -0.7% |
+| clust_0.80 | 189 | 58,817 | 58,787 / 58,847 | 69,935 | 0.0100 | -0.9% |
+| rich | 44 | 54,889 | 54,865 / 54,913 | 64,802 | 0.0100 | -7.5% |
+| minimal | 14 | 46,039 | 46,019 / 46,059 | 54,019 | 0.0100 | -22.4% |
+
+Every multivariately chosen subset of 100 or more features is inside the seed band
+(59,046 to 59,611); the three union sets (138, 122, 114) sit at 0.0%, -0.2% and -0.3%.
+The 86-feature L1 set and, oddly, the 189 cluster representatives at 0.80 are the first to
+show a consistent loss, both seeds below every seed of the full set. The two large sets
+(dedup, top150) are marginally above the full set, so the -0.7% they showed on the 400k
+subsample was subsample noise, not a redundancy effect.
+
+### 6.2 B01, full pool (2,603,894 PSMs), 10 iterations, two seeds each
+
+B01 is the held-out set: every subset was built from A01 tables only.
+
+| subset | D | peptides at 1% (mean of 2) | min / max | PSMs at 1% | rel. |
+|---|---|---|---|---|---|
+| all | 387 | 59,510 | 59,246 / 59,773 | 66,769 | 0 |
+| dedup | 344 | 59,470 | 59,430 / 59,509 | 66,725 | -0.1% |
+| top150_perm | 150 | 59,547 | 59,471 / 59,622 | 66,895 | +0.1% |
+| clust_0.90 | 239 | 58,790 | 58,616 / 58,964 | 65,921 | -1.2% |
+| clust_0.80 | 189 | 58,707 | 58,697 / 58,716 | 65,750 | -1.4% |
+| union_top100_l1005 | 138 | 59,447 | 59,318 / 59,575 | 66,762 | -0.1% |
+| union_top75_l1005 | 122 | 59,399 | 59,211 / 59,586 | 66,600 | -0.2% |
+| union75_dedup | 114 | 59,306 | 59,170 / 59,441 | 66,438 | -0.3% |
+| top100_perm | 100 | 58,990 | 58,827 / 59,152 | 66,210 | -0.9% |
+| l1_C0.005 | 86 | 58,552 | 58,461 / 58,643 | 65,661 | -1.6% |
+| rich | 44 | 54,566 | 54,536 / 54,595 | 60,827 | -8.3% |
+| minimal | 14 | 42,672 | 42,351 / 42,992 | 47,481 | -28.3% |
+
+Held out, the picture sharpens. Dropping the 43 dead columns costs nothing (-0.1%), and
+the 150 most important features by permutation still match the full set (+0.1%, both seeds
+inside the band). Below that the losses that were at the noise edge on A01 become
+consistent: 100 features -0.9%, 86 features -1.6%, with both seeds below every seed of the
+full set. The cluster-representative sets transfer worst of all: 239 representatives at
+|rho| >= 0.90 lose 1.2% here against 0.4% on A01, i.e. choosing one member per correlation
+cluster by A01 importance picks representatives that are not the best member on B01,
+whereas an importance ranking degrades gracefully. The three union sets transfer: 138,
+122 and 114 features at -0.1%, -0.2% and -0.3%, each with at least one seed inside the
+full set's band and the other within 0.15% of it. Decoy fraction 1.00% throughout.
+
+### 6.3 The 114-feature deduplicated union
+
+The best compact set from screening is the union of the permutation top 75 with the L1
+C = 0.005 set (122 features; 39 in both, 36 only in the first, 47 only in the second),
+minus the 8 members that section 3.1 shows to be duplicates of other members
+(`rt_error_rel`, `rt_error_abs_norm_gradient`, `precursor_charge`,
+`log_total_matched_intensity`, `fwhm_to_window_ratio`, `predicted_rt_fraction`,
+`frac_top3_pred_observed`, `ms1_isotope_xic_shape_consistency`). It draws on 16 of the 19
+families (not demix, order_consistency, peak_scans):
+
+- minimal (6): charge, coelution_best, coelution_run, log_apex_intensity, peptide_length, rt_error_abs
+- rich (7): diff_by_intensity, evidence, ms1_isom1_ratio, n_y_ions, seed_score, sum_y_intensity, xcorr_shape
+- similarity (24): abs_diff_q3, bray_curtis, bray_curtis_sqrt, canberra_matched, chi_square_pearson, cosine_fullwindow, dot_product_norm, dot_product_raw, footrule_norm, frac_top3_predicted_observed, intensity_weighted_pearson, log_dot_product, mae_norm, mae_weighted_pred, max_positive_residual, regression_slope, scribe_score_area, spectral_angle_area, spectral_log_evidence, spectral_log_evidence_area, spectrum_cosine_log, stein_scott_weighted_dot, wasserstein_mz, wave_hedges
+- entropy (6): cross_entropy_obs_pred, obs_spectrum_entropy, pred_spectrum_entropy, spectral_entropy_similarity_area, spectral_entropy_similarity_topk, weighted_spectral_entropy_similarity
+- coelution (13): coelution_corr_entropy, coelution_hi_lo_contrast, frac_frag_ref_corr_above_0_8, frag_loo_ref_corr_min, frag_ref_corr_obsweighted, frag_ref_corr_std, full_vs_peak_corr_gain, observed_sum_vs_template_corr, pairwise_coelution_hi, pairwise_coelution_weighted, ref_xcorr_lag_mean, top3_frag_ref_corr, xcorr_lag_frac_zero
+- interference (8): corrected_vs_raw_cos, explained_apex_intensity_frac, explained_variance_ref, ifs_removed_count, ifs_removed_intensity_frac, peak_to_full_area_ratio_frag_mean, peak_to_full_area_ratio_weighted, second_component_fraction
+- chromatographic (7): frag_apex_rt_dispersion, frag_zigzag_mean, fwhm_seconds, gaussian_cosine, profile_peak_snr, roughness_2nd_deriv, width_at_10pct
+- ion_series (10): by_complement_coelution, by_intensity_ratio, by_ion_contiguous_intensity, cosine_charge2, frac_matched_b, mean_matched_ordinal_norm, ordinal_intensity_concordance_y, series_gap_fraction, spectral_angle_b, spectral_angle_y
+- ms1 (12): has_ms1_signal, iso_minus_one_fraction, iso_overlap_flag, ms1_iso_coelution, ms1_iso_ratio_stability, ms1_isotope_apex_entropy_3, ms1_isotope_corr_xic, ms1_isotope_cosine_apex, ms1_isotope_spectral_angle_apex, ms1_ms2_apex_rt_delta, ms1_ms2_fwhm_ratio, ms1_ms2_time_corr
+- rt (3): observed_rt_raw, predicted_rt_raw, rt_error_over_peak_width
+- novel (4): charge_is_4plus, log_seed_hyperscore, n_predicted_frags, precursor_mass
+- nonzero (4): frac_frag_present_inpeak, frag_corr_matched_nz, frag_cosine_matched_nz, n_frag_present_inpeak
+- mass_accuracy (3): high_ppm_intensity_frac, lib_weighted_abs_ppm, mass_evidence_gauss
+- mass_uncertainty (2): effective_frag_count, frac_top5_pred_observed
+- apex_dispersion (3): frag_apex_rt_std, peak_fwhm_scans, peak_shoulder_score
+- psm_extra (2): cross_charge_intensity_log, n_charge_states
+
+The list is `C:/Users/robbi/mumdia_bench/fs/fs_union75_dedup.txt`, one name per line, in
+PIN column order, i.e. directly usable as `MUMDIA_NN_FEATURES`.
+
+### 6.4 The real worker on B01 with the 122-feature union
+
+`scripts/nn_rescore_worker.py` itself, on `out_inst/run.pin` (TSV, in-memory backend, 32
+threads, `MUMDIA_NN_FOLDS=3 MUMDIA_NN_ITERS=10 MUMDIA_NN_TRAIN_FDR=0.01` as `rescore.rs`
+passes them) with `MUMDIA_NN_FEATURES` naming the 122-feature union, against the engine
+run's own worker output on the same PIN, both scored with the same metric:
+
+| | all 387 (engine run) | 122-feature union | change |
+|---|---|---|---|
+| target PSMs at 1% | 66,081 | 66,174 | +0.1% |
+| decoys at 1% / decoy fraction | 659 / 1.00% | 660 / 1.00% | |
+| peptides at 1% | 58,978 | 58,962 | -0.03% |
+| worker wall (measured phases) | 3,062.8 s | 3,009.1 s | -1.8% |
+| of which train | 2,752.5 s | 2,878.8 s | +4.6% |
+| of which PIN read + standardise | 192.6 s | 80.3 s | -58% |
+| of which init feature scan | 54.2 s | 17.3 s | -68% |
+| worker max RSS | about 29 GiB (33.04 GiB stage peak minus the Rust share) | 24.0 GiB | about -17% |
+
+The identifications are the same to three decimals. The time is the same: training, 96%
+of the worker, did not get faster with a third of the columns (section 7), and the only
+phases that did are the ones that move the data. The memory dropped by a sixth, not by two
+thirds, because on the TSV in-memory path the worker still parses all 394 columns into a
+float64 frame before it selects (section 8).
+
+## 7. Time: feature count does not set the training cost
+
+`~/hye/memprof/nn_cpu_scaling.py` trains the worker's exact MLP (128-64, BatchNorm,
+dropout 0.3, Adam, batch 4096, BCE) for one epoch over 400,000 rows of the B01 PIN at
+several widths, CPU only, on an otherwise idle doxy:
+
+| D | 32 threads, us per row per epoch | 16 threads |
+|---|---|---|
+| 387 | 4.11 | 4.55 |
+| 344 | 4.65 | 4.24 |
+| 300 | 4.22 | 4.37 |
+| 240 | 4.55 | 4.26 |
+| 200 | 4.08 | 4.42 |
+| 150 | 4.32 | 4.33 |
+| 120 | 4.20 | 3.70 |
+| 100 | 4.25 | 3.84 |
+| 75 | | 3.96 |
+| 50 | | 3.91 |
+| 25 | | 3.79 |
+
+Flat, with run-to-run noise larger than any trend. At batch 4096 the per-batch fixed cost
+(kernel launches, thread synchronisation on small GEMMs, BatchNorm, the optimiser step)
+dominates, and the first layer's D x 128 GEMM, which is 86% of the arithmetic, is not
+what the CPU spends its time on. A 122-feature set will therefore not make the 53-minute
+rescore of the HYE run faster by any useful amount; the August measurements
+(`rescoring-speed-bench`: warm start 2.4x, batch 16384 2.3x, GPU 17x) are where the time
+is. What selection removes from the time budget is the PIN write and parse (3% of the
+worker's wall clock at full width) and the standardisation pass.
+
+The real worker agrees (section 6.4): 2,879 s of training on 122 features against 2,753 s
+on 387, on the same machine, the same PIN and the same iteration count. The same flatness
+holds on the GPU in the harness (train time 97 s at 387 vs 80 s at 14 features on A01, 5
+iterations), for the same reason.
+
+## 8. Where a selection could be applied
+
+Three places, increasing in scope and in what they save:
+
+1. Worker only. `MUMDIA_NN_FEATURES=<file with one name per line>` exists in
+   `scripts/nn_rescore_worker.py`. On the parquet handoff and on the streaming TSV path the
+   listed columns are the only ones parsed, standardised and moved. On the default in-memory
+   TSV path the whole PIN is still read with `pandas.read_csv` (all 394 columns, float64),
+   and only the float32 matrices and the training shrink; the largest Python allocation
+   does not. No engine change, no schema change.
+2. Rescore projection. Read only the selected columns from the competed table into
+   `FeatureMatrix` and write a narrower PIN. Removes the Rust matrix and the PIN size too.
+   Needs a config field naming the subset, and `psms_scored.parquet.report.json` must record
+   the classifier's actual feature list (it is the source of truth for what was used).
+3. Features stage set. A new `FeatureSet` variant computing only the selected features:
+   `features.parquet` (5.5 GB here), compete, rescore and the PIN all shrink, and families
+   that are dropped entirely stop being computed. A schema change (`feature_schema_id`) and
+   the largest surface; the least attractive, because feature computation is now 7 minutes
+   and 3 GiB (docs/27) and the 114-feature set still touches 16 of 19 families.
+
+Independent of feature selection, and larger: `rescore.handoff = parquet` already exists
+(`Handoff::Parquet`, documented from an 8.9M-PSM experiment-wide rescore: 671.6 min to 12
+min because the TSV exceeded the worker's streaming threshold). It replaces the pandas
+float64 parse with a columnar read of only the requested columns, so it is both the biggest
+single memory saving in this stage and the thing that makes option 1 save memory at all.
+It is nn_torch only; mokapot falls back to TSV.
+
+None of these change FDR mechanics: target-decoy competition and q-values are computed
+from scores exactly as now, so the decoy fraction at 1% stays 1% by construction (it did
+in all 100+ runs here). What a reduced set changes is sensitivity, which section 6
+measures, and the risk of the self-training loop overfitting, which fewer features can
+only reduce.
+
+## 9. Caveats and what this analysis does not establish
+
+- Two HYE runs on one instrument type. The playbook rule (validate on at least two
+  acquisition contexts plus an empirical null) means the AIF E. coli benchmark and an
+  entrapment run are required before any subset becomes a default. The July AIF PIN under
+  `out_aif_nn/` has the older 159-column schema and could not be reused here.
+- The constant columns are constant because of the default configuration. A search with
+  `emit_demix_features`, `emit_contested_features` or `ms1_precursor_features` turned on
+  needs those columns back; a selection must be expressed per configuration, or keep the
+  gated families whenever their gate is on.
+- The re-implemented worker matches the real one (section 2) but uses mean/std
+  standardisation where the in-memory TSV backend uses median/IQR. Section 6.4 is the
+  check through the real worker.
+- Subset construction used A01 only; B01 is a held-out test of those subsets, not a second
+  training set. Subsets built on B01 would differ in detail (the univariate rankings
+  correlate at 0.97, not 1.0).
+- The screening subsample has 400k rows; its peptide counts are comparable to one another,
+  not to full-pool counts.
+- Nothing here is a statement about the Minimal or Rich sets as *classifiers*: they lose
+  7.5% and 22% because they omit information the Extended families carry, not because the
+  Extended set is 387 wide. The finding is that ~120 of the 387 carry that information.
