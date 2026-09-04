@@ -13,7 +13,7 @@ use std::time::Instant;
 
 use anyhow::Result;
 use mumdia_io::report::ArtifactReport;
-use mumdia_io::table::{write_table, Col, Table};
+use mumdia_io::table::{write_table, Col, TableFile};
 use serde_json::json;
 use tracing::info;
 
@@ -30,7 +30,7 @@ pub struct AlignParams<'a> {
 
 /// (base_peptide_id -> observed RT) for confident target seed PSMs, best per peptide.
 fn confident_rts(path: &str, q_train: f64) -> Result<HashMap<u32, f64>> {
-    let t = Table::read(path)?;
+    let t = TableFile::open(path)?;
     let base = t.u32("base_peptide_id")?;
     let q = t.f64("spectrum_q")?;
     let rt = t.f64("observed_rt")?;

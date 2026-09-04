@@ -8,13 +8,14 @@
 use std::collections::{BTreeMap, HashMap};
 use std::time::Instant;
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
+use arrow::array::{Array, StringArray, UInt32Array};
 use mumdia_core::config::{
     NormalizeMethod, PeakWindowMode, QuantConfig, QuantQColumn, RollupMethod,
 };
 use mumdia_core::schema::artifact;
 use mumdia_io::report::ArtifactReport;
-use mumdia_io::table::{write_table, Col, Table};
+use mumdia_io::table::{write_table, Col, ListF32, TableFile};
 use rayon::prelude::*;
 use serde_json::json;
 use tracing::{info, warn};
@@ -295,7 +296,7 @@ pub fn run(p: QuantParams) -> Result<(u64, u64)> {
     let t0 = Instant::now();
 
     // Identified target PSMs below the peptide q threshold.
-    let ps = Table::read(p.psms_scored)?;
+    let ps = TableFile::open(p.psms_scored)?;
     let cid = ps.u32("candidate_id")?;
     let pform = ps.str("peptidoform")?;
     let charge = ps.i32("charge")?;
@@ -324,8 +325,9 @@ pub fn run(p: QuantParams) -> Result<(u64, u64)> {
     // the coverage in the artifact report so a downstream reader can tell which apex
     // source a quantity actually used.
     let mut apex_by_cid: HashMap<u32, f64> = HashMap::new();
-    let apex_column_present = ps.f64("apex_rt").is_ok();
-    if let Ok(apex_rt) = ps.f64("apex_rt") {
+    let apex_rt_col = ps.f64("apex_rt").ok();
+    let apex_column_present = apex_rt_col.is_some();
+    if let Some(apex_rt) = apex_rt_col {
         for i in 0..ps.nrows {
             if apex_rt[i].is_finite() {
                 apex_by_cid.entry(cid[i]).or_insert(apex_rt[i]);
@@ -339,25 +341,91 @@ pub fn run(p: QuantParams) -> Result<(u64, u64)> {
         );
     }
 
-    // Chromatograms grouped by candidate.
-    // Project: quant reads only these four of the chromatogram table's seven columns, and
-    // the table is the largest artifact in the run (tens of millions of rows with two big
-    // list columns). Unprojected, frag_mz / frag_obs_mz / predicted_intensity were decoded
-    // and held for nothing.
-    let ch = Table::read_cols(
-        p.chromatograms,
-        &["candidate_id", "frag_name", "rt", "intensity"],
-    )?;
-    let ch_cid = ch.u32("candidate_id")?;
-    let ch_name = ch.str("frag_name")?;
-    let ch_rt = ch.list_f32("rt")?;
-    let ch_int = ch.list_f32("intensity")?;
+    // Chromatograms, grouped by candidate, for the candidates quant actually uses.
+    //
+    // The chromatogram table is the largest artifact of a run (every extracted candidate,
+    // two traces per fragment), but the outputs below consult only (a) the rows that pass
+    // the quant filter and (b), in consensus mode, the reliable anchors whose windows set
+    // the median half-widths; every other candidate's window and areas were computed and
+    // discarded. So collect that candidate set first and keep only its rows while streaming
+    // the table batch by batch. Each candidate's window and areas depend only on its own
+    // rows (in stored order) and the consensus median only on the anchor set, so the outputs
+    // are identical to reading everything, while the resident set is proportional to the
+    // accepted rows (a few percent of the table). The peak-window diagnostic export is the
+    // one consumer that wants every candidate, so it keeps the full read.
+    let consensus_mode = p.cfg.bound_peak && p.cfg.peak_window_mode == PeakWindowMode::Consensus;
+    let keep_all = p.out_peak_bounds.is_some() && p.cfg.bound_peak;
+    let wanted: std::collections::HashSet<u32> = if keep_all {
+        std::collections::HashSet::new()
+    } else {
+        let mut w = std::collections::HashSet::new();
+        for i in 0..ps.nrows {
+            if passes_quant_filter(&label[i], pep_q[i], p.cfg.q_threshold)
+                || (consensus_mode && label[i] == "target" && pep_q[i] <= p.cfg.reliable_q)
+            {
+                w.insert(cid[i]);
+            }
+        }
+        w
+    };
+    let ch = TableFile::open(p.chromatograms)?;
+    let mut ch_cid: Vec<u32> = Vec::new();
+    let mut ch_name: Vec<String> = Vec::new();
+    let mut ch_rt: Vec<Vec<f32>> = Vec::new();
+    let mut ch_int: Vec<Vec<f32>> = Vec::new();
+    {
+        let reader = ch.batches(
+            Some(&["candidate_id", "frag_name", "rt", "intensity"]),
+            4096,
+        )?;
+        let sch = reader.schema();
+        let ix = |n: &str| {
+            sch.index_of(n)
+                .map_err(|_| anyhow!("chromatogram table has no column '{n}'"))
+        };
+        let (i_cid, i_name, i_rt, i_int) = (
+            ix("candidate_id")?,
+            ix("frag_name")?,
+            ix("rt")?,
+            ix("intensity")?,
+        );
+        for b in reader {
+            let b = b?;
+            let a_cid = b
+                .column(i_cid)
+                .as_any()
+                .downcast_ref::<UInt32Array>()
+                .ok_or_else(|| anyhow!("column 'candidate_id' is not u32"))?;
+            let a_name = b
+                .column(i_name)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| anyhow!("column 'frag_name' is not utf8"))?;
+            let a_rt = ListF32::of(b.column(i_rt), "rt")?;
+            let a_int = ListF32::of(b.column(i_int), "intensity")?;
+            for k in 0..b.num_rows() {
+                let c = a_cid.value(k);
+                if !keep_all && !wanted.contains(&c) {
+                    continue;
+                }
+                ch_cid.push(c);
+                ch_name.push(if a_name.is_null(k) {
+                    String::new()
+                } else {
+                    a_name.value(k).to_string()
+                });
+                ch_rt.push(a_rt.row(k, "rt")?);
+                ch_int.push(a_int.row(k, "intensity")?);
+            }
+        }
+    }
+    drop(wanted);
     // Group the b/y fragment chromatogram rows by candidate. The MS1 isotope XIC
     // pseudo-traces (frag_name "ms1_*") are precursor channels, not fragment ions,
     // and are excluded from both the peak-window detection and the top-N sum. The
     // BTreeMap keeps candidate iteration order deterministic.
     let mut cand_rows: BTreeMap<u32, Vec<usize>> = BTreeMap::new();
-    for i in 0..ch.nrows {
+    for i in 0..ch_cid.len() {
         if ch_name[i].starts_with("ms1_") {
             continue;
         }
@@ -761,7 +829,7 @@ pub fn run_lfq_combine(
     // protein_group -> feature key -> per-run intensity
     let mut data: BTreeMap<String, BTreeMap<String, Vec<Option<f64>>>> = BTreeMap::new();
     for (ri, path) in inputs.iter().enumerate() {
-        let t = Table::read(path)?;
+        let t = TableFile::open(path)?;
         let pform = t.str("peptidoform")?;
         let z = t.i32("charge")?;
         let pgc = t.str("protein_group")?;
@@ -1005,6 +1073,7 @@ fn median_sorted(v: &mut [f64]) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mumdia_io::table::Table;
 
     fn quant_test_path(name: &str) -> String {
         use std::sync::atomic::{AtomicU64, Ordering};

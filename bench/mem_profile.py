@@ -35,7 +35,8 @@ except ImportError:  # pragma: no cover
     sys.exit("mem_profile.py needs psutil: pip install psutil")
 
 GB = 1024**3
-DEFAULT_STAGE_REGEX = r"(?i)\bstage[=: ]+\s*([A-Za-z_][A-Za-z0-9_\-]*)"
+ANSI_RE = re.compile(r"\[[0-9;]*[A-Za-z]")
+DEFAULT_STAGE_REGEX = r"(?i)\bstage[=: ]+\s*\"?([A-Za-z_][A-Za-z0-9_\-]*)"
 
 
 def tree_rss(root: psutil.Process) -> tuple[int, int]:
@@ -110,7 +111,9 @@ def run_profiled(cmd: list[str], interval: float, stage_re: re.Pattern | None, b
     for line in proc.stdout:
         sys.stdout.write(line)
         if stage_re is not None:
-            m = stage_re.search(line)
+            # tracing's default formatter colours "INFO" and the stage prefix; match on the
+            # plain text so a regex like r"INFO\s+(extract|features):" works.
+            m = stage_re.search(ANSI_RE.sub("", line))
             if m:
                 book.begin(m.group(1))
     rc = proc.wait()

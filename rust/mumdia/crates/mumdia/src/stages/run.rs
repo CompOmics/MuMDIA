@@ -205,6 +205,7 @@ pub fn run(p: RunParams) -> Result<()> {
         p.top_peaks_ms2,
         0
     ));
+    info!(stage = %"convert", "run: stage start");
     let co = convert::run(convert::ConvertParams {
         mzml: p.mzml,
         out_dir: &spectra_dir,
@@ -239,6 +240,7 @@ pub fn run(p: RunParams) -> Result<()> {
     }
 
     let seed = d("seed_psms.parquet");
+    info!(stage = %"search-seed", "run: stage start");
     let n = search_seed::run(search_seed::SearchSeedParams {
         ms2: &co.ms2,
         library_precursors: &lib_p,
@@ -273,6 +275,7 @@ pub fn run(p: RunParams) -> Result<()> {
             "deeplc_finetune.py",
         );
         let lib_p_ft = d("fragment_library_precursors_ft.parquet");
+        info!(stage = %"deeplc-finetune", "run: stage start");
         crate::sidecar::run_deeplc_finetune(
             python,
             &script,
@@ -309,6 +312,7 @@ pub fn run(p: RunParams) -> Result<()> {
 
     let windows = d("run_windows.parquet");
     let cal = d("cal.json");
+    info!(stage = %"rt-im-train", "run: stage start");
     let n = rt_im_train::run(rt_im_train::RtImTrainParams {
         seed_psms: &seed,
         library_precursors: &lib_p,
@@ -328,6 +332,7 @@ pub fn run(p: RunParams) -> Result<()> {
 
     let psms = d("psms_extracted.parquet");
     let chrom = d("chromatograms.parquet");
+    info!(stage = %"extract", "run: stage start");
     let (npsm, nchr) = extract::run(extract::ExtractParams {
         ms2: &co.ms2,
         library_precursors: &lib_p,
@@ -360,6 +365,7 @@ pub fn run(p: RunParams) -> Result<()> {
 
     let feats = d("features.parquet");
     let pin = d("run.pin");
+    info!(stage = %"features", "run: stage start");
     let n = features::run(features::FeaturesParams {
         psms: &psms,
         chromatograms: &chrom,
@@ -379,6 +385,7 @@ pub fn run(p: RunParams) -> Result<()> {
     )?);
 
     let competed = d("psms_competed.parquet");
+    info!(stage = %"compete", "run: stage start");
     let n = compete::run(compete::CompeteParams {
         features: &feats,
         out: &competed,
@@ -395,6 +402,7 @@ pub fn run(p: RunParams) -> Result<()> {
     )?);
 
     let scored = d("psms_scored.parquet");
+    info!(stage = %"rescore", "run: stage start");
     let n = rescore::run(rescore::RescoreParams {
         competed: std::slice::from_ref(&competed),
         out: &scored,
@@ -432,6 +440,7 @@ pub fn run(p: RunParams) -> Result<()> {
     // default (gated on extract.emit_candidate_audit); adds one cheap join pass.
     if cfg.extract.emit_candidate_audit {
         let audit_out = d("candidate_audit.parquet");
+        info!(stage = %"audit", "run: stage start");
         audit::run(audit::AuditParams {
             library_precursors: &lib_p,
             psms: &psms,
@@ -447,6 +456,7 @@ pub fn run(p: RunParams) -> Result<()> {
     let pep_q = d("peptide_quant.parquet");
     let pg_q = d("protein_group_quant.parquet");
     let frag_q = d("fragment_quant.parquet");
+    info!(stage = %"quant", "run: stage start");
     let (nq1, nq2) = quant::run(quant::QuantParams {
         psms_scored: &scored,
         chromatograms: &chrom,
@@ -486,6 +496,7 @@ pub fn run(p: RunParams) -> Result<()> {
     // Human-readable report (peptides.tsv + proteins.tsv) + stdout summary.
     let pep_tsv = d("peptides.tsv");
     let prot_tsv = d("proteins.tsv");
+    info!(stage = %"report", "run: stage start");
     let (n_pep, n_prot) = report::run(report::ReportParams {
         scored: &scored,
         peptide_quant: Some(&pep_q),

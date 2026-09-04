@@ -174,6 +174,8 @@ pub fn run(p: SearchSeedParams) -> Result<u64> {
         if let Some(scan) = scan_by_index.get(&b.scan_index) {
             let (mzs, _, _) = lib.cand_frags(*cid);
             for &fmz in mzs {
+                // library m/z is stored f32; widen once, the value is unchanged
+                let fmz = fmz as f64;
                 let (lo, hi) = mumdia_core::constants::ppm_bounds(fmz, 50.0);
                 let s = scan.peaks.partition_point(|pk| pk.mz < lo);
                 let (mut bestd, mut bestppm) = (f64::MAX, None);

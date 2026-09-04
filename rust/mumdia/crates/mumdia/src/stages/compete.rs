@@ -5,14 +5,19 @@
 //! charge/mod variants); the grouping is configurable.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Instant;
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
+use arrow::array::{Array, ArrayRef, Float64Array, Int32Array, StringArray, UInt32Array};
+use arrow::compute::take;
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow::record_batch::RecordBatch;
 use mumdia_core::config::{CompeteConfig, CompeteGroupBy, CompetitionMode};
 use mumdia_core::rejection::RejectionReason;
 use mumdia_core::schema::artifact;
 use mumdia_io::report::ArtifactReport;
-use mumdia_io::table::{write_table, Col, Table};
+use mumdia_io::table::{write_table, BatchWriter, Col, TableFile};
 use serde_json::json;
 use tracing::{info, warn};
 
@@ -27,39 +32,56 @@ pub struct CompeteParams<'a> {
 
 pub fn run(p: CompeteParams) -> Result<u64> {
     let t0 = Instant::now();
-    let t = Table::read(p.features)?;
+    // Footer-only open. The key columns below stream one at a time and the feature columns
+    // (hundreds of them) are never materialised: the previous path read the whole features
+    // table into Arrow and then copied every column into an owned Vec, so compete held two
+    // full copies of the widest artifact in the run. Now it holds the key columns plus one
+    // batch while the surviving rows are copied through to the output.
+    let t = TableFile::open(p.features)?;
+    let n = t.nrows;
     let cid = t.u32("candidate_id")?;
     let label = t.str("label")?;
     let base = t.u32("base_peptide_id")?;
-    let pform = t.str("peptidoform")?;
-    let protein = t.str("protein")?;
-    let apex_rt = t.f64("apex_rt")?;
-    let elution_lo = t.f64("elution_lo")?;
-    let elution_hi = t.f64("elution_hi")?;
-    let mz = t.f64("precursor_mz")?;
     let prelim = t.f64("prelim_score")?;
     // Top-K peak rank (#7). Part of the competition key so peaks of one candidate
     // compete only within their own rank (a lower-scoring peak of a candidate must
     // not eliminate a sibling's better peak on prelim score before rescore picks).
-    // Missing -> 0 (single-apex), so the grouping is unchanged when promotion is off.
-    let peak_rank = t.i32("peak_rank").unwrap_or_else(|_| vec![0; t.nrows]);
+    // Missing -> 0 (single-apex), so the grouping is unchanged when promotion is off;
+    // the output then carries a synthesised all-zero column, as before.
+    let peak_rank_col = t.i32("peak_rank").ok();
+    let synth_peak_rank = peak_rank_col.is_none();
+    let peak_rank: Vec<i32> = peak_rank_col.unwrap_or_else(|| vec![0; n]);
     let schema = FeatureSchema::read(p.features)?;
     let feat_names = &schema.feature_columns;
-    let feat_cols: Vec<Vec<f64>> = feat_names.iter().map(|c| t.f64(c).unwrap()).collect();
 
+    let by_pform_charge = matches!(p.cfg.group_by, CompeteGroupBy::PeptidoformCharge);
+    // Only read what the grouping (and the optional audit) needs.
+    let pform: Vec<String> = if by_pform_charge || p.cfg.emit_competition_audit {
+        t.str("peptidoform")?
+    } else {
+        Vec::new()
+    };
+    let apex_rt: Vec<f64> = if matches!(p.cfg.group_by, CompeteGroupBy::Apex) {
+        t.f64("apex_rt")?
+    } else {
+        Vec::new()
+    };
     // `charge` is a minimal feature column (present in every set), stored as f64.
     // Only the peptidoform-charge grouping needs it.
-    let charge = t.f64("charge").ok();
-    if matches!(p.cfg.group_by, CompeteGroupBy::PeptidoformCharge) && charge.is_none() {
-        anyhow::bail!("compete group_by=peptidoform_charge requires a 'charge' feature column");
-    }
+    let charge: Option<Vec<f64>> = if by_pform_charge {
+        Some(t.f64("charge").map_err(|_| {
+            anyhow!("compete group_by=peptidoform_charge requires a 'charge' feature column")
+        })?)
+    } else {
+        None
+    };
     // Dense peptidoform id by first appearance (deterministic) so the fixed-size
     // tuple key can separate modforms without allocating a String per PSM. Built
     // only for the peptidoform-charge grouping; empty otherwise.
-    let pform_id: Vec<u32> = if matches!(p.cfg.group_by, CompeteGroupBy::PeptidoformCharge) {
-        let mut ids = Vec::with_capacity(t.nrows);
+    let pform_id: Vec<u32> = if by_pform_charge {
+        let mut ids = Vec::with_capacity(n);
         let mut seen: HashMap<&str, u32> = HashMap::new();
-        for peptidoform in pform.iter().take(t.nrows) {
+        for peptidoform in pform.iter().take(n) {
             let next = seen.len() as u32;
             ids.push(*seen.entry(peptidoform.as_str()).or_insert(next));
         }
@@ -77,7 +99,7 @@ pub fn run(p: CompeteParams) -> Result<u64> {
     // freshly-allocated String per PSM. Precursor grouping uses a constant bucket
     // (0) so its equivalence classes are unchanged.
     let mut groups: HashMap<(u32, u8, i64, i32), Vec<usize>> = HashMap::new();
-    for i in 0..t.nrows {
+    for i in 0..n {
         let label_code = match label[i].as_str() {
             "target" => 0u8,
             "decoy" => 1u8,
@@ -103,9 +125,10 @@ pub fn run(p: CompeteParams) -> Result<u64> {
     // Per-candidate unique-fragment evidence for the `unique_evidence` mode. Prefers
     // an explicit `unique_fragment_count` feature; otherwise approximates it as
     // matched-fragment count discounted by the contested fraction; None if neither
-    // is available (mode then falls back to winner-take-all).
-    let unique_ev_src = unique_evidence_with_source(&t);
-    if matches!(p.cfg.mode, CompetitionMode::UniqueEvidence) {
+    // is available (mode then falls back to winner-take-all). Read only in that mode:
+    // the other modes never consult it.
+    let unique_ev: Option<Vec<f64>> = if matches!(p.cfg.mode, CompetitionMode::UniqueEvidence) {
+        let unique_ev_src = unique_evidence_with_source(&t);
         // The mode keeps any non-winner whose unique evidence >= unique_evidence_min_fragments.
         // Warn when NOTHING in this run can fall below that threshold, because then the mode is
         // silently identical to CompetitionMode::None.
@@ -124,21 +147,26 @@ pub fn run(p: CompeteParams) -> Result<u64> {
                     source = src,
                     threshold = thr,
                     candidates = ev.len(),
-                    "compete mode=unique_evidence: no candidate's unique evidence falls below                      compete.unique_evidence_min_fragments, so NOTHING will be removed and this                      run is equivalent to mode=none. Enable the contested/competition features                      so the evidence is actually discounted, or raise the threshold."
+                    "compete mode=unique_evidence: no candidate's unique evidence falls below \
+                     compete.unique_evidence_min_fragments, so NOTHING will be removed and this \
+                     run is equivalent to mode=none. Enable the contested/competition features \
+                     so the evidence is actually discounted, or raise the threshold."
                 );
             }
         }
-    }
-    let unique_ev = unique_ev_src.map(|(v, _)| v);
-    if matches!(p.cfg.mode, CompetitionMode::UniqueEvidence) && unique_ev.is_none() {
-        warn!(
-            "compete mode=unique_evidence: no unique_fragment_count / \
-             (n_matched_fragments, peak_contested_frac/contested_frac) columns; \
-             falling back to winner-take-all"
-        );
-    }
+        if unique_ev_src.is_none() {
+            warn!(
+                "compete mode=unique_evidence: no unique_fragment_count / \
+                 (n_matched_fragments, peak_contested_frac/contested_frac) columns; \
+                 falling back to winner-take-all"
+            );
+        }
+        unique_ev_src.map(|(v, _)| v)
+    } else {
+        None
+    };
 
-    // Resolve each group per competition mode (pure function; unit tested below).
+    // Resolve each group under the configured competition mode.
     let (keep, removed) = resolve_competition(
         &groups,
         &prelim,
@@ -147,49 +175,14 @@ pub fn run(p: CompeteParams) -> Result<u64> {
         p.cfg.unique_evidence_min_fragments,
         unique_ev.as_deref(),
     );
+    drop(groups);
 
-    let sel = |v: &[f64]| keep.iter().map(|&i| v[i]).collect::<Vec<_>>();
-    let mut cols: Vec<Col> = vec![
-        Col::U32(
-            "candidate_id".into(),
-            keep.iter().map(|&i| cid[i]).collect(),
-        ),
-        Col::I32(
-            "peak_rank".into(),
-            keep.iter().map(|&i| peak_rank[i]).collect(),
-        ),
-        Col::Str(
-            "label".into(),
-            keep.iter().map(|&i| label[i].clone()).collect(),
-        ),
-        Col::U32(
-            "base_peptide_id".into(),
-            keep.iter().map(|&i| base[i]).collect(),
-        ),
-        Col::Str(
-            "peptidoform".into(),
-            keep.iter().map(|&i| pform[i].clone()).collect(),
-        ),
-        Col::Str(
-            "protein".into(),
-            keep.iter().map(|&i| protein[i].clone()).collect(),
-        ),
-        Col::F64("apex_rt".into(), sel(&apex_rt)),
-        Col::F64("elution_lo".into(), sel(&elution_lo)),
-        Col::F64("elution_hi".into(), sel(&elution_hi)),
-        Col::F64("precursor_mz".into(), sel(&mz)),
-        Col::F64("prelim_score".into(), sel(&prelim)),
-    ];
-    for (fi, name) in feat_names.iter().enumerate() {
-        cols.push(Col::F64(name.clone(), sel(&feat_cols[fi])));
-    }
-    let rows = write_table(p.out, cols)?;
-    // Carry the feature schema forward for rescore.
+    let rows = copy_kept_rows(&t, p.out, feat_names, synth_peak_rank, &keep)?;
+    // Feature schema companion: unchanged feature list, so rescore validates the same schema.
     mumdia_io::json::write_json(&format!("{}.schema.json", p.out), &schema)?;
 
-    // Optional per-removal competition audit (spec 04 §2): every candidate removed
-    // by within-group competition, with its winner and removal reason. Within-label
-    // competition, so the sibling that outcompeted a loser shares its label.
+    // Competition audit sidecar (opt-in): one row per removed PSM with its winner. Lets a
+    // post-hoc analysis see what competition removed without re-running the stage.
     if p.cfg.emit_competition_audit {
         let reason_of = |i: usize| {
             if label[i] == "decoy" {
@@ -239,7 +232,7 @@ pub fn run(p: CompeteParams) -> Result<u64> {
 
     let elapsed = t0.elapsed().as_millis();
     let mut stats = std::collections::BTreeMap::new();
-    stats.insert("input_rows".to_string(), json!(t.nrows));
+    stats.insert("input_rows".to_string(), json!(n));
     stats.insert("kept".to_string(), json!(rows));
     stats.insert("removed".to_string(), json!(removed.len()));
     ArtifactReport {
@@ -260,7 +253,7 @@ pub fn run(p: CompeteParams) -> Result<u64> {
     .write_for(p.out)?;
 
     info!(
-        input = t.nrows,
+        input = n,
         kept = rows,
         removed = removed.len(),
         mode = ?p.cfg.mode,
@@ -269,14 +262,165 @@ pub fn run(p: CompeteParams) -> Result<u64> {
     Ok(rows)
 }
 
-/// Per-candidate unique-fragment evidence for `CompetitionMode::UniqueEvidence`.
-/// Prefers an explicit `unique_fragment_count` column; otherwise approximates it as
-/// `n_matched_fragments * (1 - peak_contested_frac)` (contested-discounted matched
-/// count). The legacy `contested_frac` spelling remains a fallback; raw matched
-/// count is used if neither fraction exists, and `None` if no matched count exists.
-/// Also reports which column the estimate came from, so the caller can warn when the
-/// weakest fallback would make the mode a silent no-op.
-fn unique_evidence_with_source(t: &Table) -> Option<(Vec<f64>, &'static str)> {
+/// The bookkeeping columns every competed table starts with, in order, with the types the
+/// features stage writes them in. One place, so the pass-through below cannot drift from
+/// the typed schema this stage used to re-declare column by column.
+const META_COLUMNS: [(&str, DataType); 11] = [
+    ("candidate_id", DataType::UInt32),
+    ("peak_rank", DataType::Int32),
+    ("label", DataType::Utf8),
+    ("base_peptide_id", DataType::UInt32),
+    ("peptidoform", DataType::Utf8),
+    ("protein", DataType::Utf8),
+    ("apex_rt", DataType::Float64),
+    ("elution_lo", DataType::Float64),
+    ("elution_hi", DataType::Float64),
+    ("precursor_mz", DataType::Float64),
+    ("prelim_score", DataType::Float64),
+];
+
+/// Input rows per streamed batch of the pass-through copy (~50 MB at ~400 f64 columns).
+const COPY_BATCH_ROWS: usize = 1 << 14;
+
+/// Copy the surviving rows (`keep`, sorted ascending) of the features table into `out`,
+/// one input batch at a time, in exactly the column set and order the previous typed
+/// rewrite produced: the 11 bookkeeping columns, then the schema's feature columns, all
+/// non-nullable. The kept rows of a batch are one contiguous slice of `keep`, and `take`
+/// preserves their order, so the output row order is unchanged.
+fn copy_kept_rows(
+    t: &TableFile,
+    out: &str,
+    feat_names: &[String],
+    synth_peak_rank: bool,
+    keep: &[usize],
+) -> Result<u64> {
+    let mut fields: Vec<Field> = Vec::with_capacity(META_COLUMNS.len() + feat_names.len());
+    // Source column per output field; None = synthesised zeros (a pre-v2 features table
+    // without `peak_rank`, which the typed path also emitted as zeros).
+    let mut source: Vec<Option<String>> = Vec::with_capacity(fields.capacity());
+    for (name, dt) in META_COLUMNS.iter() {
+        fields.push(Field::new(*name, dt.clone(), false));
+        source.push(if *name == "peak_rank" && synth_peak_rank {
+            None
+        } else {
+            Some(name.to_string())
+        });
+    }
+    for name in feat_names {
+        fields.push(Field::new(name, DataType::Float64, false));
+        source.push(Some(name.clone()));
+    }
+    for (f, src) in fields.iter().zip(&source) {
+        if let Some(s) = src {
+            let i = t
+                .schema
+                .index_of(s)
+                .map_err(|_| anyhow!("compete: features table has no column '{s}'"))?;
+            let dt = t.schema.field(i).data_type();
+            if dt != f.data_type() {
+                anyhow::bail!(
+                    "compete: column '{s}' is {dt:?} in the features table, expected {:?}",
+                    f.data_type()
+                );
+            }
+        }
+    }
+    let out_schema = Arc::new(Schema::new(fields));
+    let proj: Vec<&str> = source.iter().flatten().map(String::as_str).collect();
+    let reader = t.batches(Some(&proj), COPY_BATCH_ROWS)?;
+    let in_schema = reader.schema();
+    let src_idx: Vec<Option<usize>> = source
+        .iter()
+        .map(|s| {
+            s.as_ref()
+                .map(|s| in_schema.index_of(s).expect("validated above"))
+        })
+        .collect();
+    let mut w = BatchWriter::new(out, out_schema.clone())?;
+    let (mut row0, mut kp) = (0usize, 0usize);
+    for b in reader {
+        let b = b?;
+        let row1 = row0 + b.num_rows();
+        let start = kp;
+        while kp < keep.len() && keep[kp] < row1 {
+            kp += 1;
+        }
+        if kp > start {
+            let idx = UInt32Array::from(
+                keep[start..kp]
+                    .iter()
+                    .map(|&r| (r - row0) as u32)
+                    .collect::<Vec<u32>>(),
+            );
+            let mut arrays: Vec<ArrayRef> = Vec::with_capacity(src_idx.len());
+            for (si, f) in src_idx.iter().zip(out_schema.fields()) {
+                arrays.push(match si {
+                    Some(i) => densify(take(b.column(*i).as_ref(), &idx, None)?, f)?,
+                    None => Arc::new(Int32Array::from(vec![0i32; idx.len()])),
+                });
+            }
+            w.write(&RecordBatch::try_new(out_schema.clone(), arrays)?)?;
+        }
+        row0 = row1;
+    }
+    w.close()
+}
+
+/// Apply the typed getters' null policy to a taken column so the output stays non-nullable,
+/// exactly as the old typed rewrite made it: f64 null -> NaN, utf8 null -> "", integer null
+/// -> the buffer value. Columns without nulls (the normal case) pass through untouched.
+fn densify(a: ArrayRef, f: &Field) -> Result<ArrayRef> {
+    if a.null_count() == 0 {
+        return Ok(a);
+    }
+    let n = a.len();
+    Ok(match f.data_type() {
+        DataType::Float64 => {
+            let x = a
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .expect("type validated");
+            Arc::new(Float64Array::from_iter_values((0..n).map(|k| {
+                if x.is_null(k) {
+                    f64::NAN
+                } else {
+                    x.value(k)
+                }
+            })))
+        }
+        DataType::Utf8 => {
+            let x = a
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("type validated");
+            Arc::new(StringArray::from_iter_values((0..n).map(|k| {
+                if x.is_null(k) {
+                    ""
+                } else {
+                    x.value(k)
+                }
+            })))
+        }
+        DataType::Int32 => {
+            let x = a
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .expect("type validated");
+            Arc::new(Int32Array::from_iter_values((0..n).map(|k| x.value(k))))
+        }
+        DataType::UInt32 => {
+            let x = a
+                .as_any()
+                .downcast_ref::<UInt32Array>()
+                .expect("type validated");
+            Arc::new(UInt32Array::from_iter_values((0..n).map(|k| x.value(k))))
+        }
+        other => anyhow::bail!("compete: unsupported column type {other:?}"),
+    })
+}
+
+/// Per-candidate unique-evidence estimate plus the name of the column it came from.
+fn unique_evidence_with_source(t: &TableFile) -> Option<(Vec<f64>, &'static str)> {
     if let Some(u) = col_f64(t, "unique_fragment_count") {
         return Some((u, "unique_fragment_count"));
     }
@@ -297,7 +441,8 @@ fn unique_evidence_with_source(t: &Table) -> Option<(Vec<f64>, &'static str)> {
     }
 }
 
-/// Prefer the Extended-feature spelling while accepting older feature tables.
+/// The Extended set carries the contested fraction as `peak_contested_frac`; older
+/// artifacts as `contested_frac`. Prefer the former.
 fn prefer_peak_contested_fraction(
     peak_contested: Option<Vec<f64>>,
     legacy_contested: Option<Vec<f64>>,
@@ -305,8 +450,8 @@ fn prefer_peak_contested_fraction(
     peak_contested.or(legacy_contested)
 }
 
-/// Read a numeric column as f64, accepting an f64 or i32 encoding.
-fn col_f64(t: &Table, name: &str) -> Option<Vec<f64>> {
+/// Read a column as f64, accepting an i32 column (widened) as well.
+fn col_f64(t: &TableFile, name: &str) -> Option<Vec<f64>> {
     t.f64(name).ok().or_else(|| {
         t.i32(name)
             .ok()

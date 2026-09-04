@@ -13,7 +13,7 @@ use mumdia_core::config::{FragPredictorKind, PredictFragConfig, RtPredictorKind}
 use mumdia_core::mass::{parse_peptidoform, Fragment, ParsedPeptidoform};
 use mumdia_core::schema::artifact;
 use mumdia_io::report::ArtifactReport;
-use mumdia_io::table::{write_table, Col, Table};
+use mumdia_io::table::{write_table, Col, TableFile};
 use serde_json::json;
 use tracing::info;
 
@@ -49,7 +49,7 @@ struct Raw {
 
 pub fn run(p: PredictFragParams) -> Result<(u64, u64)> {
     let t0 = Instant::now();
-    let t = Table::read(p.peptidoforms)?;
+    let t = TableFile::open(p.peptidoforms)?;
     let pf_id = t.u32("id")?;
     let base_id = t.u32("base_peptide_id")?;
     let pform = t.str("peptidoform")?;

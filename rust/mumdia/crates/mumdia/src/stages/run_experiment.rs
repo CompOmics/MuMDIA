@@ -246,23 +246,35 @@ fn process_run(
 /// column (0..n-1), preserving the schema exactly (arrow row filter). Quant then
 /// runs per run with `q_filter = psm_q`, keeping each run's own confident PSMs.
 fn split_by_source(scored: &str, out_paths: &[String]) -> Result<()> {
-    let t = mumdia_io::table::Table::read(scored)?;
+    // One streaming pass: every output has its writer open, each input batch is filtered
+    // once per run and appended, so the resident set is one batch rather than the whole
+    // experiment-wide scored table that the old read-then-filter held in full.
+    let t = mumdia_io::table::TableFile::open(scored)?;
     let src_idx = t
         .schema
         .index_of("source")
         .map_err(|_| anyhow::anyhow!("scored table has no `source` column for split"))?;
-    for (i, out) in out_paths.iter().enumerate() {
-        let mut filtered = Vec::with_capacity(t.batches.len());
-        for b in &t.batches {
-            let src = b
-                .column(src_idx)
-                .as_any()
-                .downcast_ref::<UInt32Array>()
-                .ok_or_else(|| anyhow::anyhow!("`source` column is not u32"))?;
+    let mut writers: Vec<mumdia_io::table::BatchWriter> = out_paths
+        .iter()
+        .map(|out| mumdia_io::table::BatchWriter::new(out, t.schema.clone()))
+        .collect::<Result<_>>()?;
+    t.for_each_batch(None, 1 << 14, |b| {
+        let src = b
+            .column(src_idx)
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .ok_or_else(|| anyhow::anyhow!("`source` column is not u32"))?;
+        for (i, w) in writers.iter_mut().enumerate() {
             let mask: BooleanArray = (0..src.len()).map(|k| src.value(k) == i as u32).collect();
-            filtered.push(filter_record_batch(b, &mask)?);
+            let filtered = filter_record_batch(b, &mask)?;
+            if filtered.num_rows() > 0 {
+                w.write(&filtered)?;
+            }
         }
-        mumdia_io::table::write_batches(out, t.schema.clone(), &filtered)?;
+        Ok(())
+    })?;
+    for w in writers {
+        w.close()?;
     }
     Ok(())
 }

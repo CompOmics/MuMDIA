@@ -29,7 +29,7 @@ use mumdia_core::constants::residue_mass;
 use mumdia_core::mass::unimod_mass;
 use mumdia_core::schema::artifact;
 use mumdia_io::report::ArtifactReport;
-use mumdia_io::table::{write_table, Col, Table};
+use mumdia_io::table::{write_table, Col, TableFile};
 use rayon::prelude::*;
 use serde_json::json;
 use tracing::info;
@@ -231,7 +231,7 @@ pub fn run(p: PrescanParams) -> Result<u64> {
     }
 
     // ---- observed tag index, parallel over spectra ----
-    let ms2 = Table::read(p.ms2)?;
+    let ms2 = TableFile::open(p.ms2)?;
     let wid = ms2.u32("window_id")?;
     let rts = ms2.f64("rt_seconds")?;
     let mzs = ms2.list_f32("mz")?;
@@ -287,18 +287,18 @@ pub fn run(p: PrescanParams) -> Result<u64> {
     drop(ms2);
 
     // ---- isolation windows ----
-    let win = Table::read(p.isolation_windows)?;
+    let win = TableFile::open(p.isolation_windows)?;
     let w_id = win.u32("window_id")?;
     let w_lo = win.f64("lower")?;
     let w_hi = win.f64("upper")?;
 
     // ---- library + per-candidate RT bounds ----
-    let lib = Table::read(p.library_precursors)?;
+    let lib = TableFile::open(p.library_precursors)?;
     let cid = lib.u32("candidate_id")?;
     let pform = lib.str("peptidoform")?;
     let pmz = lib.f64("precursor_mz")?;
     let label = lib.str("label")?;
-    let rw = Table::read(p.run_windows)?;
+    let rw = TableFile::open(p.run_windows)?;
     let r_cid = rw.u32("candidate_id")?;
     let r_lo = rw.f64("rt_lo")?;
     let r_hi = rw.f64("rt_hi")?;

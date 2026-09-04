@@ -61,6 +61,7 @@ impl FragIndex {
         let mut mz_min = f64::INFINITY;
         let mut mz_max = f64::NEG_INFINITY;
         for &mz in &lib.frag_mz {
+            let mz = mz as f64;
             if mz < mz_min {
                 mz_min = mz;
             }
@@ -82,7 +83,7 @@ impl FragIndex {
         // posting two bins from the peak.
         let mut bin_start = vec![0u32; bins.n_bins + 1];
         for &mz in &lib.frag_mz {
-            bin_start[bins.bin(mz as f32 as f64) + 1] += 1;
+            bin_start[bins.bin(mz as f64) + 1] += 1;
         }
         // prefix sum -> CSR start offsets.
         for b in 0..bins.n_bins {
@@ -99,10 +100,10 @@ impl FragIndex {
             for k in 0..cand.n_frag {
                 let gi = cand.frag_start + k;
                 let mz = lib.frag_mz[gi];
-                let b = bins.bin(mz as f32 as f64); // bin by the stored (f32) value
+                let b = bins.bin(mz as f64); // bin by the stored (f32) value
                 let slot = cursor[b] as usize;
                 post_cand[slot] = c as u32;
-                post_mz[slot] = mz as f32;
+                post_mz[slot] = mz;
                 post_int[slot] = lib.frag_int[gi];
                 post_frag[slot] = k as u16;
                 cursor[b] += 1;
@@ -404,7 +405,8 @@ mod tests {
         for (i, (frags, pmz)) in cands.iter().enumerate() {
             let start = frag_mz.len();
             for &(mz, int) in frags {
-                frag_mz.push(mz);
+                // the library stores fragment m/z as f32
+                frag_mz.push(mz as f32);
                 frag_int.push(int);
                 frag_name_id.push(0);
             }

@@ -21,7 +21,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use mumdia_core::rejection::RejectionReason;
-use mumdia_io::table::{write_table, Col, Table};
+use mumdia_io::table::{write_table, Col, TableFile};
 use serde_json::json;
 use tracing::info;
 
@@ -51,7 +51,7 @@ pub struct AuditParams<'a> {
 fn load_extract_reasons(psms_path: &str) -> HashMap<u32, String> {
     let sidecar = format!("{psms_path}.audit.parquet");
     let mut out = HashMap::new();
-    if let Ok(t) = Table::read(&sidecar) {
+    if let Ok(t) = TableFile::open(&sidecar) {
         if let (Ok(cid), Ok(reason)) = (t.u32("candidate_id"), t.str("rejection_reason")) {
             for (c, r) in cid.into_iter().zip(reason) {
                 out.insert(c, r);
@@ -65,7 +65,7 @@ pub fn run(p: AuditParams) -> Result<u64> {
     let t0 = Instant::now();
 
     // Search space = all library precursors.
-    let lib = Table::read(p.library_precursors)
+    let lib = TableFile::open(p.library_precursors)
         .with_context(|| format!("audit: reading library precursors {}", p.library_precursors))?;
     let cid = lib.u32("candidate_id")?;
     let pform = lib.str("peptidoform")?;
@@ -77,15 +77,15 @@ pub fn run(p: AuditParams) -> Result<u64> {
     // Survivor sets keyed by candidate_id from each downstream artifact. Projected: the
     // competed and scored artifacts carry ~390 feature columns and the audit wants three of
     // them, so an unprojected read decodes (and holds) the whole feature matrix for nothing.
-    let extracted: HashSet<u32> = Table::read_cols(p.psms, &["candidate_id"])?
+    let extracted: HashSet<u32> = TableFile::open(p.psms)?
         .u32("candidate_id")?
         .into_iter()
         .collect();
-    let competed: HashSet<u32> = Table::read_cols(p.competed, &["candidate_id"])?
+    let competed: HashSet<u32> = TableFile::open(p.competed)?
         .u32("candidate_id")?
         .into_iter()
         .collect();
-    let scored_t = Table::read_cols(p.scored, &["candidate_id", "q_value", "peptide_q_value"])?;
+    let scored_t = TableFile::open(p.scored)?;
     let scored_cid = scored_t.u32("candidate_id")?;
     let scored_q = scored_t.f64("q_value")?;
     // peptide-level q is optional (only present in some scored schemas).
@@ -316,7 +316,7 @@ mod tests {
         .unwrap();
         assert_eq!(rows, 6);
 
-        let a = Table::read(&out).unwrap();
+        let a = TableFile::open(&out).unwrap();
         let cid = a.u32("precursor_id").unwrap();
         let reason = a.str("rejection_reason").unwrap();
         let reported = a.bool("reported").unwrap();
@@ -378,7 +378,7 @@ mod tests {
             entrapment_substr: "_HUMAN",
         })
         .unwrap();
-        let a = Table::read(&out).unwrap();
+        let a = TableFile::open(&out).unwrap();
         let entrap = a.bool("entrapment_label").unwrap();
         assert_eq!(entrap, vec![false, true]);
     }

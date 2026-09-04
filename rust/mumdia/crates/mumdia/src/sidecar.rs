@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::process::Command;
 
 use anyhow::{bail, Context, Result};
-use mumdia_io::table::{write_table, Col, Table};
+use mumdia_io::table::{write_table, Col, TableFile};
 use tracing::info;
 
 type FragmentIntensityMap = HashMap<u32, HashMap<(u8, u16), f32>>;
@@ -62,7 +62,7 @@ pub fn run_ms2pip(
     info!(n = ids.len(), model, "sidecar: running MS2PIP");
     run_worker(python, script, &[&inp, &outp, model], false).context("MS2PIP worker failed")?;
 
-    let t = Table::read(&outp)?;
+    let t = TableFile::open(&outp)?;
     let oid = t.u32("id")?;
     let ion = t.str("ion_type")?;
     let ord = t.i32("ordinal")?;
@@ -98,7 +98,7 @@ pub fn run_deeplc(
     info!(n = ids.len(), "sidecar: running DeepLC");
     run_worker(python, script, &[&inp, &outp], true).context("DeepLC worker failed")?;
 
-    let t = Table::read(&outp)?;
+    let t = TableFile::open(&outp)?;
     let oid = t.u32("id")?;
     let rt = t.f32("predicted_rt")?;
     Ok(oid.into_iter().zip(rt).collect())

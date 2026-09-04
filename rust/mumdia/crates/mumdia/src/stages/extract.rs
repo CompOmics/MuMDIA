@@ -19,7 +19,7 @@ use anyhow::Result;
 use mumdia_core::config::{ExtractConfig, GateMode, PeakClaim};
 use mumdia_core::schema::artifact;
 use mumdia_io::report::ArtifactReport;
-use mumdia_io::table::{write_table, Col, Table};
+use mumdia_io::table::{write_table, Col, TableFile, TableWriter};
 use serde_json::json;
 use tracing::info;
 
@@ -114,6 +114,43 @@ struct Hit {
 
 type ChromOutputRow = (u32, String, f64, f64, f32, Vec<f32>, Vec<f32>);
 
+/// Candidates per parallel chunk of the per-candidate pass: large enough to keep every
+/// core busy within a chunk, small enough that a chunk's chromatogram rows are tens of MB.
+const CAND_CHUNK: usize = 8192;
+/// Rows per parquet row group of the chromatogram table (~64k rows of two ~60-point traces
+/// is ~30 MB uncompressed), which bounds the encoder's in-progress buffer.
+const CHROM_ROW_GROUP_ROWS: usize = 1 << 16;
+
+/// One chunk of chromatogram rows, drained into exactly the column set
+/// `chromatograms.parquet` has always had.
+#[derive(Default)]
+struct ChromChunk {
+    cid: Vec<u32>,
+    name: Vec<String>,
+    fmz: Vec<f64>,
+    obsmz: Vec<f64>,
+    pint: Vec<f32>,
+    rt: Vec<Vec<f32>>,
+    int: Vec<Vec<f32>>,
+}
+
+impl ChromChunk {
+    fn cols(self) -> Vec<Col> {
+        vec![
+            Col::U32("candidate_id".into(), self.cid),
+            Col::Str("frag_name".into(), self.name),
+            Col::F64("frag_mz".into(), self.fmz),
+            Col::F64("frag_obs_mz".into(), self.obsmz),
+            Col::F32("predicted_intensity".into(), self.pint),
+            // LargeList (64-bit offsets): the total chromatogram list-value count can exceed
+            // the ~2.1B limit of a 32-bit ListArray offset buffer when extraction accepts a
+            // very large candidate set (e.g. gates opened up).
+            Col::LargeListF32("rt".into(), self.rt),
+            Col::LargeListF32("intensity".into(), self.int),
+        ]
+    }
+}
+
 /// One observed peak for the per-scan demix: (observed intensity, observed m/z, claimants
 /// as (candidate_id, fragment_ordinal, predicted_intensity)).
 type DemixRow = (f32, f64, Vec<(u32, u16, f32)>);
@@ -176,7 +213,7 @@ fn claim_cue_multiplier(
         // Sub-tolerance m/z proximity (S3): the observed peak sits at the true owner's
         // m/z, so a claimant whose predicted fragment m/z is closer wins more weight.
         let (mzs, _, _) = lib.cand_frags(cid);
-        let pred_mz = mzs.get(frag as usize).copied().unwrap_or(obs_mz);
+        let pred_mz = mzs.get(frag as usize).map(|m| *m as f64).unwrap_or(obs_mz);
         let ppm = mumdia_core::constants::ppm_diff(obs_mz, pred_mz) as f32;
         let sigma = (cfg.claim_cues.mz_close_sigma_ppm as f32).max(1e-6);
         w *= (-(ppm / sigma).powi(2)).exp();
@@ -492,15 +529,17 @@ fn demix_features_for(d: &DemixScan, cid: u32) -> DemixFeatures {
 }
 
 /// Sum intensities of peaks within `tol_ppm` of `target` (m/z-sorted arrays).
-fn sum_near(mz: &[f64], inten: &[f32], target: f64, tol_ppm: f64) -> f32 {
+fn sum_near(mz: &[f32], inten: &[f32], target: f64, tol_ppm: f64) -> f32 {
     if mz.is_empty() {
         return 0.0;
     }
     let (lo, hi) = ppm_bounds(target, tol_ppm);
-    let s = mz.partition_point(|&m| m < lo);
+    // MS1 m/z is stored as f32 (the artifact's precision); widening at the comparison
+    // yields exactly the values the previous `Vec<f64>` copy held.
+    let s = mz.partition_point(|&m| (m as f64) < lo);
     let mut acc = 0.0f32;
     let mut i = s;
-    while i < mz.len() && mz[i] <= hi {
+    while i < mz.len() && (mz[i] as f64) <= hi {
         acc += inten[i];
         i += 1;
     }
@@ -1315,7 +1354,7 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
     // map stays small.
     let restrict: Option<std::collections::HashSet<u32>> = match p.restrict_candidates {
         Some(path) => {
-            let t = Table::read(path)?;
+            let t = TableFile::open(path)?;
             let s: std::collections::HashSet<u32> = t.u32("candidate_id")?.into_iter().collect();
             info!(
                 restrict_candidates = s.len(),
@@ -1327,7 +1366,7 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
     };
 
     // run windows indexed by candidate_id
-    let rw = Table::read(p.run_windows)?;
+    let rw = TableFile::open(p.run_windows)?;
     let rw_cid = rw.u32("candidate_id")?;
     let rw_cal = rw.f64("rt_pred_cal")?;
     let rw_lo = rw.f64("rt_lo")?;
@@ -1628,11 +1667,8 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
     ): (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) =
         (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
 
-    // chromatograms columns
-    let (mut ch_cid, mut ch_name, mut ch_fmz, mut ch_pint) =
-        (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-    let (mut ch_obsmz, mut ch_rt, mut ch_int): (Vec<f64>, Vec<Vec<f32>>, Vec<Vec<f32>>) =
-        (Vec::new(), Vec::new(), Vec::new());
+    // Chromatogram rows stream to parquet chunk by chunk (see the candidate loop below).
+    let chrom_writer = TableWriter::new(p.out_chrom).with_row_group_rows(CHROM_ROW_GROUP_ROWS);
 
     // Deterministic output order (a HashMap's iteration order is randomized,
     // and downstream floating-point sums in the rescorer are order-sensitive).
@@ -1648,7 +1684,7 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
     // loop. The optional Pearson gate now allocates its two scratch vectors per
     // candidate (was a hoisted reused buffer) because buffers cannot be shared
     // across parallel candidates.
-    let cand_hits: Vec<(u32, Vec<Hit>)> = cand_ids
+    let mut cand_hits: Vec<(u32, Vec<Hit>)> = cand_ids
         .iter()
         .map(|&cid| (cid, acc.remove(&cid).unwrap()))
         .collect();
@@ -1717,462 +1753,458 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
         HashMap::new()
     };
 
-    let results: Vec<Vec<CandOut>> = cand_hits
-        .into_par_iter()
-        .map(|(cid, mut hits)| {
-            // distinct matched fragments (tier b)
-            let mut distinct: Vec<u16> = hits.iter().map(|h| h.frag).collect();
-            distinct.sort_unstable();
-            distinct.dedup();
-            if distinct.len() < p.cfg.presence_min_matched.max(1) {
-                return Vec::new();
-            }
+    let per_candidate = |cid: u32, mut hits: Vec<Hit>| -> Vec<CandOut> {
+        // distinct matched fragments (tier b)
+        let mut distinct: Vec<u16> = hits.iter().map(|h| h.frag).collect();
+        distinct.sort_unstable();
+        distinct.dedup();
+        if distinct.len() < p.cfg.presence_min_matched.max(1) {
+            return Vec::new();
+        }
 
-            // Group hits into scan groups by RT (dedupe same fragment in a scan by max).
-            hits.sort_by(|a, b| a.rt.partial_cmp(&b.rt).unwrap());
-            // scan groups: Vec<(rt, BTreeMap<frag,intensity>)>. A BTreeMap keeps the
-            // per-scan fragment order fixed so the f32 apex sum is deterministic.
-            let mut groups: Vec<(f64, BTreeMap<u16, f32>)> = Vec::new();
-            for h in &hits {
-                match groups.last_mut() {
-                    Some((rt, map)) if (*rt - h.rt).abs() < 1e-9 => {
-                        let e = map.entry(h.frag).or_insert(0.0);
-                        if h.inten > *e {
-                            *e = h.inten;
-                        }
-                    }
-                    _ => {
-                        let mut m = BTreeMap::new();
-                        m.insert(h.frag, h.inten);
-                        groups.push((h.rt, m));
+        // Group hits into scan groups by RT (dedupe same fragment in a scan by max).
+        hits.sort_by(|a, b| a.rt.partial_cmp(&b.rt).unwrap());
+        // scan groups: Vec<(rt, BTreeMap<frag,intensity>)>. A BTreeMap keeps the
+        // per-scan fragment order fixed so the f32 apex sum is deterministic.
+        let mut groups: Vec<(f64, BTreeMap<u16, f32>)> = Vec::new();
+        for h in &hits {
+            match groups.last_mut() {
+                Some((rt, map)) if (*rt - h.rt).abs() < 1e-9 => {
+                    let e = map.entry(h.frag).or_insert(0.0);
+                    if h.inten > *e {
+                        *e = h.inten;
                     }
                 }
-            }
-
-            let (fmzs0, fints0, _) = lib.cand_frags(cid);
-
-            // Acquisition scan grid: the covering isolation-window scans within the
-            // RT window. Project the sparse hit-groups onto it so apex counting and
-            // the co-elution run see MISSING acquisition scans (count 0, and they
-            // break a run) rather than only scans that happened to carry a hit. When
-            // no covering-window grid is available, fall back to the sparse groups.
-            let grid: Vec<f64> = if !windows.is_empty() {
-                let pm = lib.cands[cid as usize].precursor_mz;
-                let (lo, hi) = (rt_lo[cid as usize], rt_hi[cid as usize]);
-                let mut g: Vec<f64> = Vec::new();
-                for (wl, wu, rts) in &windows {
-                    if *wl <= pm && pm <= *wu {
-                        let a = rts.partition_point(|&r| r < lo);
-                        let b = rts.partition_point(|&r| r <= hi);
-                        g.extend_from_slice(&rts[a..b]);
-                    }
-                }
-                g.sort_by(|a, b| a.partial_cmp(b).unwrap());
-                g.dedup();
-                g
-            } else {
-                Vec::new()
-            };
-            if !grid.is_empty() {
-                let g2i: HashMap<u64, usize> = grid
-                    .iter()
-                    .enumerate()
-                    .map(|(j, r)| (r.to_bits(), j))
-                    .collect();
-                let mut aligned: Vec<(f64, BTreeMap<u16, f32>)> =
-                    grid.iter().map(|&r| (r, BTreeMap::new())).collect();
-                for (rt, map) in std::mem::take(&mut groups) {
-                    if let Some(&j) = g2i.get(&rt.to_bits()) {
-                        aligned[j].1 = map;
-                    }
-                }
-                groups = aligned;
-            }
-
-            // Apex: the scan group with the most distinct matched fragments, allowing
-            // scans within `apex_count_tol` of that maximum (so a slightly-lower-count
-            // but much more intense scan can still win), then the one maximizing the
-            // summed intensity of its 3 most intense fragments. This is the diagnostic-
-            // plot apex; robust to a bright single-fragment interferent that would win a
-            // pure max-summed-intensity apex in chimeric DIA.
-            // Distinct-fragment count per scan group, optionally smoothed by a centered
-            // rolling SUM (`apex_count_window`). Low-intensity fragments flicker in/out
-            // scan-to-scan; a single-scan count then spikes at noise scans and misplaces
-            // the apex. The rolling sum makes the apex land in the region of *sustained*
-            // fragment presence. It is deliberately a sum, not a mean: the window is
-            // truncated at the profile edges, so interior positions accumulate more than
-            // edge positions, which center-weights the apex toward the RT-window centre
-            // (~= the predicted RT). That mild RT-prior steers off off-centre interfering
-            // peaks; measured, sum beats mean by ~+300 IDs on the AIF file. Window 1
-            // reproduces the exact per-scan-count behavior.
-            let counts: Vec<usize> = groups.iter().map(|(_, m)| m.len()).collect();
-            let w = p.cfg.apex_count_window.max(1);
-            let r = w / 2;
-            let sigma = p.cfg.apex_gaussian_sigma_scans;
-            // Smoothed per-scan fragment-count score. Default is the truncated
-            // rolling SUM (`apex_count_window`); with `apex_gaussian_sigma_scans` > 0
-            // a Gaussian matched filter (radius 3*sigma) is used instead. Both are
-            // deterministic and reduce to the raw per-scan count when disabled.
-            let smoothed: Vec<f64> = if sigma > 0.0 {
-                let radius = (sigma * 3.0).ceil() as usize;
-                let kernel: Vec<f64> = (0..=2 * radius)
-                    .map(|k| {
-                        let d = k as f64 - radius as f64;
-                        (-0.5 * (d / sigma).powi(2)).exp()
-                    })
-                    .collect();
-                (0..counts.len())
-                    .map(|i| {
-                        let mut acc = 0.0;
-                        for (k, &wt) in kernel.iter().enumerate() {
-                            let idx = i as isize + k as isize - radius as isize;
-                            if idx >= 0 && (idx as usize) < counts.len() {
-                                acc += counts[idx as usize] as f64 * wt;
-                            }
-                        }
-                        acc
-                    })
-                    .collect()
-            } else if w <= 1 {
-                counts.iter().map(|&c| c as f64).collect()
-            } else {
-                (0..counts.len())
-                    .map(|i| {
-                        let lo = i.saturating_sub(r);
-                        let hi = (i + r).min(counts.len() - 1);
-                        counts[lo..=hi].iter().sum::<usize>() as f64
-                    })
-                    .collect()
-            };
-            let maxc = smoothed.iter().copied().fold(0.0f64, f64::max);
-            let thresh = (maxc - p.cfg.apex_count_tol as f64).max(0.0);
-            // Optional Gaussian RT prior on the apex tiebreak: among count-qualified
-            // scans, multiply the top-3 intensity by exp(-0.5*((rt - rt_pred_cal)/sigma)^2)
-            // so a distant-from-prediction interferent inside a wide RT window cannot
-            // define the apex. sigma = `apex_rt_prior_s`; 0 (or an unset rt_cal) disables it.
-            let rt_prior_sigma = p.cfg.apex_rt_prior_s;
-            let rt_cal_c = rt_cal[cid as usize];
-            let use_prior = rt_prior_sigma > 0.0 && rt_cal_c > 0.0;
-            // Signature-ion apex tiebreak: sum the OBSERVED intensity of the top-K
-            // PREDICTED fragments (`apex_top_fragments`; 0 -> a default of 3) at each
-            // qualifying scan, instead of the 3 brightest observed peaks. A bright
-            // interferent on a non-signature ion can then no longer define the apex.
-            let k_sig = if p.cfg.apex_top_fragments > 0 {
-                p.cfg.apex_top_fragments
-            } else {
-                3
-            };
-            let sig: Vec<u16> = {
-                let mut ord: Vec<usize> = (0..fints0.len()).collect();
-                ord.sort_by(|&a, &b| {
-                    fints0[b]
-                        .partial_cmp(&fints0[a])
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
-                ord.into_iter().take(k_sig).map(|o| o as u16).collect()
-            };
-            let mut apex_rt = groups[0].0;
-            let mut apex_sum = 0.0f32;
-            let mut best_sig = f32::NEG_INFINITY;
-            for (i, (rt, map)) in groups.iter().enumerate() {
-                if map.is_empty() || smoothed[i] < thresh {
-                    continue;
-                }
-                let sig_sum: f32 = sig
-                    .iter()
-                    .map(|&o| map.get(&o).copied().unwrap_or(0.0))
-                    .sum();
-                let prior = if use_prior {
-                    (-0.5 * ((*rt - rt_cal_c) / rt_prior_sigma).powi(2)).exp() as f32
-                } else {
-                    1.0
-                };
-                let score = if p.cfg.apex_evidence_rank {
-                    // Breadth-of-evidence apex: the count of distinct co-eluting
-                    // predicted fragments at this scan dominates; observed signature
-                    // intensity only breaks ties within [0,1). Interference-resistant
-                    // in wide-window DIA (a chimeric-intensity spike cannot outvote a
-                    // scan where more of the peptide's own transitions co-elute).
-                    let n_frag = map.len() as f32;
-                    let tie = sig_sum / (sig_sum + 1.0);
-                    (n_frag + tie) * prior
-                } else {
-                    // Legacy: signature-ion observed intensity (x RT prior). Bit-identical
-                    // to the previous behaviour (prior = 1.0 when the RT prior is off).
-                    sig_sum * prior
-                };
-                if score > best_sig {
-                    best_sig = score;
-                    apex_rt = *rt;
-                    apex_sum = map.values().sum(); // report full apex intensity
+                _ => {
+                    let mut m = BTreeMap::new();
+                    m.insert(h.frag, h.inten);
+                    groups.push((h.rt, m));
                 }
             }
+        }
 
-            // Co-elution run: max consecutive scan groups with >= min_coelution frags.
-            let mut best_run = 0usize;
-            let mut cur = 0usize;
-            for (_, map) in &groups {
-                if map.len() >= p.cfg.presence_min_coelution.max(1) {
-                    cur += 1;
-                    best_run = best_run.max(cur);
-                } else {
-                    cur = 0;
+        let (fmzs0, fints0, _) = lib.cand_frags(cid);
+
+        // Acquisition scan grid: the covering isolation-window scans within the
+        // RT window. Project the sparse hit-groups onto it so apex counting and
+        // the co-elution run see MISSING acquisition scans (count 0, and they
+        // break a run) rather than only scans that happened to carry a hit. When
+        // no covering-window grid is available, fall back to the sparse groups.
+        let grid: Vec<f64> = if !windows.is_empty() {
+            let pm = lib.cands[cid as usize].precursor_mz;
+            let (lo, hi) = (rt_lo[cid as usize], rt_hi[cid as usize]);
+            let mut g: Vec<f64> = Vec::new();
+            for (wl, wu, rts) in &windows {
+                if *wl <= pm && pm <= *wu {
+                    let a = rts.partition_point(|&r| r < lo);
+                    let b = rts.partition_point(|&r| r <= hi);
+                    g.extend_from_slice(&rts[a..b]);
                 }
             }
-
-            // Acceptance (tier c): presence, consecutive-scan run, and matched
-            // fraction of the predicted fragments (symmetric discriminator).
-            let matched_fraction = distinct.len() as f64 / (fmzs0.len().max(1) as f64);
-            if distinct.len() < p.cfg.presence_min_fragments.max(1)
-                || best_run < scan_window
-                || best_run < p.cfg.min_coelution_run
-                || matched_fraction < p.cfg.min_matched_fraction
-            {
-                return Vec::new();
-            }
-
-            let c = &lib.cands[cid as usize];
-
-            // MS1 apex isotope intensities at a given RT (nearest MS1 scan). Factored
-            // so both the selected apex (rank 0) and any promoted alternate peak (#7)
-            // compute their own MS1 evidence at their own apex RT. Computed BEFORE the
-            // acceptance gate so MS1 evidence can rescue a candidate the single-scan
-            // fragment-Pearson gate would otherwise reject.
-            let ms1_at = |rt: f64| -> (Option<f64>, Option<f64>, Option<f64>, Option<f64>) {
-                if ms1_scans.is_empty() {
-                    return (None, None, None, None);
-                }
-                let j = nearest_index(&ms1_rts, rt);
-                let s = &ms1_scans[j];
-                let z = c.charge as f64;
-                let sp = ISOTOPE_SPACING / z;
-                let tol = p.cfg.prec_tol_ppm;
-                (
-                    Some(sum_near(&s.mz, &s.intensity, c.precursor_mz - sp, tol) as f64),
-                    Some(sum_near(&s.mz, &s.intensity, c.precursor_mz, tol) as f64),
-                    Some(sum_near(&s.mz, &s.intensity, c.precursor_mz + sp, tol) as f64),
-                    Some(sum_near(&s.mz, &s.intensity, c.precursor_mz + 2.0 * sp, tol) as f64),
-                )
-            };
-            let (o_ms1_m1, o_ms1_mono, o_ms1_i1, o_ms1_i2) = ms1_at(apex_rt);
-            // Cheap MS1 support: mono present and the +1/mono ratio in a plausible
-            // averagine band. Used only as the rescue signal for the Pearson gate.
-            let ms1_support = {
-                let mono = o_ms1_mono.unwrap_or(0.0);
-                let i1 = o_ms1_i1.unwrap_or(0.0);
-                mono > 0.0 && i1 > 0.0 && {
-                    let r = i1 / mono;
-                    (0.1..=1.5).contains(&r)
-                }
-            };
-
-            // Optional tier-d Pearson gate (kept for configurability; matched fraction
-            // above is the primary symmetric discriminator). With `ms1_rescue`, a
-            // candidate that fails the single-scan fragment Pearson is kept when it has
-            // adequate matched fragments AND MS1 isotope-pattern support.
-            let apex_map = groups
+            g.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            g.dedup();
+            g
+        } else {
+            Vec::new()
+        };
+        if !grid.is_empty() {
+            let g2i: HashMap<u64, usize> = grid
                 .iter()
-                .find(|(rt, _)| (*rt - apex_rt).abs() < 1e-9)
-                .map(|(_, m)| m);
-            // Spectral-agreement score closures, evaluated lazily: the acceptance gate
-            // needs only the ACTIVE `gate_mode`'s score, and the four diagnostic scores
-            // are computed only when `emit_gate_diagnostics` is set (see below), so the
-            // default chain pays the same per-candidate cost as before this feature.
-            let apex_obs: Option<Vec<f64>> = apex_map.map(|map| {
-                (0..fmzs0.len())
-                    .map(|k| *map.get(&(k as u16)).unwrap_or(&0.0) as f64)
-                    .collect()
+                .enumerate()
+                .map(|(j, r)| (r.to_bits(), j))
+                .collect();
+            let mut aligned: Vec<(f64, BTreeMap<u16, f32>)> =
+                grid.iter().map(|&r| (r, BTreeMap::new())).collect();
+            for (rt, map) in std::mem::take(&mut groups) {
+                if let Some(&j) = g2i.get(&rt.to_bits()) {
+                    aligned[j].1 = map;
+                }
+            }
+            groups = aligned;
+        }
+
+        // Apex: the scan group with the most distinct matched fragments, allowing
+        // scans within `apex_count_tol` of that maximum (so a slightly-lower-count
+        // but much more intense scan can still win), then the one maximizing the
+        // summed intensity of its 3 most intense fragments. This is the diagnostic-
+        // plot apex; robust to a bright single-fragment interferent that would win a
+        // pure max-summed-intensity apex in chimeric DIA.
+        // Distinct-fragment count per scan group, optionally smoothed by a centered
+        // rolling SUM (`apex_count_window`). Low-intensity fragments flicker in/out
+        // scan-to-scan; a single-scan count then spikes at noise scans and misplaces
+        // the apex. The rolling sum makes the apex land in the region of *sustained*
+        // fragment presence. It is deliberately a sum, not a mean: the window is
+        // truncated at the profile edges, so interior positions accumulate more than
+        // edge positions, which center-weights the apex toward the RT-window centre
+        // (~= the predicted RT). That mild RT-prior steers off off-centre interfering
+        // peaks; measured, sum beats mean by ~+300 IDs on the AIF file. Window 1
+        // reproduces the exact per-scan-count behavior.
+        let counts: Vec<usize> = groups.iter().map(|(_, m)| m.len()).collect();
+        let w = p.cfg.apex_count_window.max(1);
+        let r = w / 2;
+        let sigma = p.cfg.apex_gaussian_sigma_scans;
+        // Smoothed per-scan fragment-count score. Default is the truncated
+        // rolling SUM (`apex_count_window`); with `apex_gaussian_sigma_scans` > 0
+        // a Gaussian matched filter (radius 3*sigma) is used instead. Both are
+        // deterministic and reduce to the raw per-scan count when disabled.
+        let smoothed: Vec<f64> = if sigma > 0.0 {
+            let radius = (sigma * 3.0).ceil() as usize;
+            let kernel: Vec<f64> = (0..=2 * radius)
+                .map(|k| {
+                    let d = k as f64 - radius as f64;
+                    (-0.5 * (d / sigma).powi(2)).exp()
+                })
+                .collect();
+            (0..counts.len())
+                .map(|i| {
+                    let mut acc = 0.0;
+                    for (k, &wt) in kernel.iter().enumerate() {
+                        let idx = i as isize + k as isize - radius as isize;
+                        if idx >= 0 && (idx as usize) < counts.len() {
+                            acc += counts[idx as usize] as f64 * wt;
+                        }
+                    }
+                    acc
+                })
+                .collect()
+        } else if w <= 1 {
+            counts.iter().map(|&c| c as f64).collect()
+        } else {
+            (0..counts.len())
+                .map(|i| {
+                    let lo = i.saturating_sub(r);
+                    let hi = (i + r).min(counts.len() - 1);
+                    counts[lo..=hi].iter().sum::<usize>() as f64
+                })
+                .collect()
+        };
+        let maxc = smoothed.iter().copied().fold(0.0f64, f64::max);
+        let thresh = (maxc - p.cfg.apex_count_tol as f64).max(0.0);
+        // Optional Gaussian RT prior on the apex tiebreak: among count-qualified
+        // scans, multiply the top-3 intensity by exp(-0.5*((rt - rt_pred_cal)/sigma)^2)
+        // so a distant-from-prediction interferent inside a wide RT window cannot
+        // define the apex. sigma = `apex_rt_prior_s`; 0 (or an unset rt_cal) disables it.
+        let rt_prior_sigma = p.cfg.apex_rt_prior_s;
+        let rt_cal_c = rt_cal[cid as usize];
+        let use_prior = rt_prior_sigma > 0.0 && rt_cal_c > 0.0;
+        // Signature-ion apex tiebreak: sum the OBSERVED intensity of the top-K
+        // PREDICTED fragments (`apex_top_fragments`; 0 -> a default of 3) at each
+        // qualifying scan, instead of the 3 brightest observed peaks. A bright
+        // interferent on a non-signature ion can then no longer define the apex.
+        let k_sig = if p.cfg.apex_top_fragments > 0 {
+            p.cfg.apex_top_fragments
+        } else {
+            3
+        };
+        let sig: Vec<u16> = {
+            let mut ord: Vec<usize> = (0..fints0.len()).collect();
+            ord.sort_by(|&a, &b| {
+                fints0[b]
+                    .partial_cmp(&fints0[a])
+                    .unwrap_or(std::cmp::Ordering::Equal)
             });
-            let pred_f64: Vec<f64> = fints0.iter().map(|x| *x as f64).collect();
-            // Single-apex-scan intensity Pearson (1.0 when no apex scan resolved -> do
-            // not reject on spectral agreement).
-            let apex_pearson = || match &apex_obs {
-                Some(obs) => crate::stats::pearson(obs, &pred_f64),
-                None => 1.0,
+            ord.into_iter().take(k_sig).map(|o| o as u16).collect()
+        };
+        let mut apex_rt = groups[0].0;
+        let mut apex_sum = 0.0f32;
+        let mut best_sig = f32::NEG_INFINITY;
+        for (i, (rt, map)) in groups.iter().enumerate() {
+            if map.is_empty() || smoothed[i] < thresh {
+                continue;
+            }
+            let sig_sum: f32 = sig
+                .iter()
+                .map(|&o| map.get(&o).copied().unwrap_or(0.0))
+                .sum();
+            let prior = if use_prior {
+                (-0.5 * ((*rt - rt_cal_c) / rt_prior_sigma).powi(2)).exp() as f32
+            } else {
+                1.0
             };
-            // spectral_entropy_similarity_sqrt of the apex spectrum (shared kernel in
-            // features::entropy; best single target/decoy gate discriminator).
-            let apex_entropy = || match &apex_obs {
-                Some(obs) => crate::stages::features::entropy::spectral_entropy_similarity_sqrt(
-                    obs, &pred_f64,
-                ),
-                None => 1.0,
+            let score = if p.cfg.apex_evidence_rank {
+                // Breadth-of-evidence apex: the count of distinct co-eluting
+                // predicted fragments at this scan dominates; observed signature
+                // intensity only breaks ties within [0,1). Interference-resistant
+                // in wide-window DIA (a chimeric-intensity spike cannot outvote a
+                // scan where more of the peptide's own transitions co-elute).
+                let n_frag = map.len() as f32;
+                let tie = sig_sum / (sig_sum + 1.0);
+                (n_frag + tie) * prior
+            } else {
+                // Legacy: signature-ion observed intensity (x RT prior). Bit-identical
+                // to the previous behaviour (prior = 1.0 when the RT prior is off).
+                sig_sum * prior
             };
-            let peak_spec = || peak_spectral_score(&groups, &sig, fints0);
-            let coel = || coelution_gate_score(&groups, &distinct, &sig, fints0);
+            if score > best_sig {
+                best_sig = score;
+                apex_rt = *rt;
+                apex_sum = map.values().sum(); // report full apex intensity
+            }
+        }
 
-            if p.cfg.min_frag_corr > 0.0 {
-                // Acceptance gate. `min_frag_corr` thresholds the ACTIVE gate_mode's
-                // spectral-agreement score (plan Section 9): the legacy single-apex-scan
-                // Pearson (one chimeric scan can dominate), the peak-integrated spectral
-                // Pearson, the apex spectral-entropy similarity, the temporal co-elution
-                // score, or Combined (both, more specific). Only the active score computes.
-                let rejected = match p.cfg.gate_mode {
-                    GateMode::ApexPearson => apex_pearson() < p.cfg.min_frag_corr,
-                    GateMode::PeakSpectral => peak_spec() < p.cfg.min_frag_corr,
-                    GateMode::SpectralEntropy => apex_entropy() < p.cfg.min_frag_corr,
-                    GateMode::Coelution => coel() < p.cfg.min_frag_corr,
-                    GateMode::Combined => {
-                        peak_spec() < p.cfg.min_frag_corr || coel() < p.cfg.gate_coelution_min
-                    }
-                };
-                if rejected {
-                    let rescued = p.cfg.ms1_rescue
-                        && ms1_support
-                        && distinct.len() >= p.cfg.presence_min_fragments.max(1);
-                    if !rescued {
-                        return Vec::new();
-                    }
+        // Co-elution run: max consecutive scan groups with >= min_coelution frags.
+        let mut best_run = 0usize;
+        let mut cur = 0usize;
+        for (_, map) in &groups {
+            if map.len() >= p.cfg.presence_min_coelution.max(1) {
+                cur += 1;
+                best_run = best_run.max(cur);
+            } else {
+                cur = 0;
+            }
+        }
+
+        // Acceptance (tier c): presence, consecutive-scan run, and matched
+        // fraction of the predicted fragments (symmetric discriminator).
+        let matched_fraction = distinct.len() as f64 / (fmzs0.len().max(1) as f64);
+        if distinct.len() < p.cfg.presence_min_fragments.max(1)
+            || best_run < scan_window
+            || best_run < p.cfg.min_coelution_run
+            || matched_fraction < p.cfg.min_matched_fraction
+        {
+            return Vec::new();
+        }
+
+        let c = &lib.cands[cid as usize];
+
+        // MS1 apex isotope intensities at a given RT (nearest MS1 scan). Factored
+        // so both the selected apex (rank 0) and any promoted alternate peak (#7)
+        // compute their own MS1 evidence at their own apex RT. Computed BEFORE the
+        // acceptance gate so MS1 evidence can rescue a candidate the single-scan
+        // fragment-Pearson gate would otherwise reject.
+        let ms1_at = |rt: f64| -> (Option<f64>, Option<f64>, Option<f64>, Option<f64>) {
+            if ms1_scans.is_empty() {
+                return (None, None, None, None);
+            }
+            let j = nearest_index(&ms1_rts, rt);
+            let s = &ms1_scans[j];
+            let z = c.charge as f64;
+            let sp = ISOTOPE_SPACING / z;
+            let tol = p.cfg.prec_tol_ppm;
+            (
+                Some(sum_near(&s.mz, &s.intensity, c.precursor_mz - sp, tol) as f64),
+                Some(sum_near(&s.mz, &s.intensity, c.precursor_mz, tol) as f64),
+                Some(sum_near(&s.mz, &s.intensity, c.precursor_mz + sp, tol) as f64),
+                Some(sum_near(&s.mz, &s.intensity, c.precursor_mz + 2.0 * sp, tol) as f64),
+            )
+        };
+        let (o_ms1_m1, o_ms1_mono, o_ms1_i1, o_ms1_i2) = ms1_at(apex_rt);
+        // Cheap MS1 support: mono present and the +1/mono ratio in a plausible
+        // averagine band. Used only as the rescue signal for the Pearson gate.
+        let ms1_support = {
+            let mono = o_ms1_mono.unwrap_or(0.0);
+            let i1 = o_ms1_i1.unwrap_or(0.0);
+            mono > 0.0 && i1 > 0.0 && {
+                let r = i1 / mono;
+                (0.1..=1.5).contains(&r)
+            }
+        };
+
+        // Optional tier-d Pearson gate (kept for configurability; matched fraction
+        // above is the primary symmetric discriminator). With `ms1_rescue`, a
+        // candidate that fails the single-scan fragment Pearson is kept when it has
+        // adequate matched fragments AND MS1 isotope-pattern support.
+        let apex_map = groups
+            .iter()
+            .find(|(rt, _)| (*rt - apex_rt).abs() < 1e-9)
+            .map(|(_, m)| m);
+        // Spectral-agreement score closures, evaluated lazily: the acceptance gate
+        // needs only the ACTIVE `gate_mode`'s score, and the four diagnostic scores
+        // are computed only when `emit_gate_diagnostics` is set (see below), so the
+        // default chain pays the same per-candidate cost as before this feature.
+        let apex_obs: Option<Vec<f64>> = apex_map.map(|map| {
+            (0..fmzs0.len())
+                .map(|k| *map.get(&(k as u16)).unwrap_or(&0.0) as f64)
+                .collect()
+        });
+        let pred_f64: Vec<f64> = fints0.iter().map(|x| *x as f64).collect();
+        // Single-apex-scan intensity Pearson (1.0 when no apex scan resolved -> do
+        // not reject on spectral agreement).
+        let apex_pearson = || match &apex_obs {
+            Some(obs) => crate::stats::pearson(obs, &pred_f64),
+            None => 1.0,
+        };
+        // spectral_entropy_similarity_sqrt of the apex spectrum (shared kernel in
+        // features::entropy; best single target/decoy gate discriminator).
+        let apex_entropy = || match &apex_obs {
+            Some(obs) => {
+                crate::stages::features::entropy::spectral_entropy_similarity_sqrt(obs, &pred_f64)
+            }
+            None => 1.0,
+        };
+        let peak_spec = || peak_spectral_score(&groups, &sig, fints0);
+        let coel = || coelution_gate_score(&groups, &distinct, &sig, fints0);
+
+        if p.cfg.min_frag_corr > 0.0 {
+            // Acceptance gate. `min_frag_corr` thresholds the ACTIVE gate_mode's
+            // spectral-agreement score (plan Section 9): the legacy single-apex-scan
+            // Pearson (one chimeric scan can dominate), the peak-integrated spectral
+            // Pearson, the apex spectral-entropy similarity, the temporal co-elution
+            // score, or Combined (both, more specific). Only the active score computes.
+            let rejected = match p.cfg.gate_mode {
+                GateMode::ApexPearson => apex_pearson() < p.cfg.min_frag_corr,
+                GateMode::PeakSpectral => peak_spec() < p.cfg.min_frag_corr,
+                GateMode::SpectralEntropy => apex_entropy() < p.cfg.min_frag_corr,
+                GateMode::Coelution => coel() < p.cfg.min_frag_corr,
+                GateMode::Combined => {
+                    peak_spec() < p.cfg.min_frag_corr || coel() < p.cfg.gate_coelution_min
+                }
+            };
+            if rejected {
+                let rescued = p.cfg.ms1_rescue
+                    && ms1_support
+                    && distinct.len() >= p.cfg.presence_min_fragments.max(1);
+                if !rescued {
+                    return Vec::new();
                 }
             }
+        }
 
-            // Diagnostic scores (all four metrics, for the offline gate-metric
-            // comparison). Computed and emitted ONLY when `emit_gate_diagnostics` is set,
-            // so the default psms.parquet schema and per-candidate compute are unchanged
-            // (sensitivity-program: default-off, byte-identical). Zero when off (the four
-            // columns are not written).
-            let (gate_apex, gate_peak_spectral, gate_coelution, gate_spectral_entropy) =
-                if p.cfg.emit_gate_diagnostics {
-                    (apex_pearson(), peak_spec(), coel(), apex_entropy())
-                } else {
-                    (0.0, 0.0, 0.0, 0.0)
-                };
-
-            // Soft competition features from the co-elution arbitration (all 0 when the
-            // two-pass path did not run). contested_frac: fraction of contested INTENSITY
-            // lost to better co-eluters. contested_count_frac: fraction of contested
-            // fragment-PEAKS lost. apportioned_frac: fraction of contested intensity the
-            // candidate retains under proportional apportionment (1 = keeps all, ~0 = a
-            // peak-borrower stripped by its co-eluting competitors).
-            let cst = contested.get(&cid).copied().unwrap_or_default();
-            let contested_val = {
-                let t = cst.won + cst.lost;
-                if t > 0.0 {
-                    cst.lost / t
-                } else {
-                    0.0
-                }
-            };
-            let contested_count_frac = {
-                let n = cst.n_won + cst.n_lost;
-                if n > 0 {
-                    cst.n_lost as f64 / n as f64
-                } else {
-                    0.0
-                }
-            };
-            let apportioned_frac = {
-                let t = cst.won + cst.lost;
-                if t > 0.0 {
-                    cst.apportioned / t
-                } else {
-                    0.0
-                }
+        // Diagnostic scores (all four metrics, for the offline gate-metric
+        // comparison). Computed and emitted ONLY when `emit_gate_diagnostics` is set,
+        // so the default psms.parquet schema and per-candidate compute are unchanged
+        // (sensitivity-program: default-off, byte-identical). Zero when off (the four
+        // columns are not written).
+        let (gate_apex, gate_peak_spectral, gate_coelution, gate_spectral_entropy) =
+            if p.cfg.emit_gate_diagnostics {
+                (apex_pearson(), peak_spec(), coel(), apex_entropy())
+            } else {
+                (0.0, 0.0, 0.0, 0.0)
             };
 
-            // Per-fragment intensity-weighted observed m/z (for mass accuracy).
-            let mut wsum: HashMap<u16, (f64, f64)> = HashMap::new(); // frag -> (sum w*mz, sum w)
-            for h in &hits {
-                let e = wsum.entry(h.frag).or_insert((0.0, 0.0));
-                e.0 += h.obs_mz * h.inten as f64;
-                e.1 += h.inten as f64;
+        // Soft competition features from the co-elution arbitration (all 0 when the
+        // two-pass path did not run). contested_frac: fraction of contested INTENSITY
+        // lost to better co-eluters. contested_count_frac: fraction of contested
+        // fragment-PEAKS lost. apportioned_frac: fraction of contested intensity the
+        // candidate retains under proportional apportionment (1 = keeps all, ~0 = a
+        // peak-borrower stripped by its co-eluting competitors).
+        let cst = contested.get(&cid).copied().unwrap_or_default();
+        let contested_val = {
+            let t = cst.won + cst.lost;
+            if t > 0.0 {
+                cst.lost / t
+            } else {
+                0.0
             }
+        };
+        let contested_count_frac = {
+            let n = cst.n_won + cst.n_lost;
+            if n > 0 {
+                cst.n_lost as f64 / n as f64
+            } else {
+                0.0
+            }
+        };
+        let apportioned_frac = {
+            let t = cst.won + cst.lost;
+            if t > 0.0 {
+                cst.apportioned / t
+            } else {
+                0.0
+            }
+        };
 
-            let mut chrom_rows: Vec<ChromOutputRow> = Vec::new();
+        // Per-fragment intensity-weighted observed m/z (for mass accuracy).
+        let mut wsum: HashMap<u16, (f64, f64)> = HashMap::new(); // frag -> (sum w*mz, sum w)
+        for h in &hits {
+            let e = wsum.entry(h.frag).or_insert((0.0, 0.0));
+            e.0 += h.obs_mz * h.inten as f64;
+            e.1 += h.inten as f64;
+        }
 
-            // Emit chromatograms. When emit_window_grid is set, each fragment is sampled
-            // on the full isolation-window scan grid (all scans of the covering window(s)
-            // within the RT window), with 0.0 where the fragment is absent, so the elution
-            // profile drops to zero between peaks (correct boundary calling downstream).
-            let (fmzs, fints, fnames) = lib.cand_frags(cid);
-            let mut per_frag: HashMap<u16, Vec<(f64, f32)>> = HashMap::new();
-            for (rt, map) in &groups {
-                for (&frag, &inten) in map {
-                    per_frag.entry(frag).or_default().push((*rt, inten));
+        let mut chrom_rows: Vec<ChromOutputRow> = Vec::new();
+
+        // Emit chromatograms. When emit_window_grid is set, each fragment is sampled
+        // on the full isolation-window scan grid (all scans of the covering window(s)
+        // within the RT window), with 0.0 where the fragment is absent, so the elution
+        // profile drops to zero between peaks (correct boundary calling downstream).
+        let (fmzs, fints, fnames) = lib.cand_frags(cid);
+        let mut per_frag: HashMap<u16, Vec<(f64, f32)>> = HashMap::new();
+        for (rt, map) in &groups {
+            for (&frag, &inten) in map {
+                per_frag.entry(frag).or_default().push((*rt, inten));
+            }
+        }
+        // (the acquisition-scan `grid` was computed above, before apex/co-elution)
+        // Emit a row for EVERY predicted transition so the feature families see the
+        // full predicted set (a missing strong ion is penalized). An OBSERVED
+        // fragment carries its grid-sampled (or sorted) trace; a NEVER-OBSERVED one
+        // carries an EMPTY trace, NOT a grid-length zero vector. The empty trace
+        // still yields obs_apex = 0 downstream, and keeps the total chromatogram
+        // list-value count down (a grid-length zero per absent fragment would
+        // bloat it needlessly; the column itself is now a 64-bit LargeList, so the
+        // old ~2.1B 32-bit offset ceiling no longer applies).
+        // obs m/z falls back to theoretical; harmless since mass-accuracy counts
+        // only fragments with obs_apex > 0.
+        for fi in 0..fmzs.len() {
+            let frag = fi as u16;
+            let obs_mz = wsum
+                .get(&frag)
+                .map(|(sm, sw)| if *sw > 0.0 { sm / sw } else { fmzs[fi] as f64 })
+                .unwrap_or(fmzs[fi] as f64);
+            let (rts, ints): (Vec<f32>, Vec<f32>) = match per_frag.get(&frag) {
+                Some(v) if !grid.is_empty() => {
+                    let m: HashMap<u64, f32> = v.iter().map(|(r, i)| (r.to_bits(), *i)).collect();
+                    (
+                        grid.iter().map(|r| *r as f32).collect(),
+                        grid.iter()
+                            .map(|r| *m.get(&r.to_bits()).unwrap_or(&0.0))
+                            .collect(),
+                    )
                 }
-            }
-            // (the acquisition-scan `grid` was computed above, before apex/co-elution)
-            // Emit a row for EVERY predicted transition so the feature families see the
-            // full predicted set (a missing strong ion is penalized). An OBSERVED
-            // fragment carries its grid-sampled (or sorted) trace; a NEVER-OBSERVED one
-            // carries an EMPTY trace, NOT a grid-length zero vector. The empty trace
-            // still yields obs_apex = 0 downstream, and keeps the total chromatogram
-            // list-value count down (a grid-length zero per absent fragment would
-            // bloat it needlessly; the column itself is now a 64-bit LargeList, so the
-            // old ~2.1B 32-bit offset ceiling no longer applies).
-            // obs m/z falls back to theoretical; harmless since mass-accuracy counts
-            // only fragments with obs_apex > 0.
-            for fi in 0..fmzs.len() {
-                let frag = fi as u16;
-                let obs_mz = wsum
-                    .get(&frag)
-                    .map(|(sm, sw)| if *sw > 0.0 { sm / sw } else { fmzs[fi] })
-                    .unwrap_or(fmzs[fi]);
-                let (rts, ints): (Vec<f32>, Vec<f32>) = match per_frag.get(&frag) {
-                    Some(v) if !grid.is_empty() => {
-                        let m: HashMap<u64, f32> =
-                            v.iter().map(|(r, i)| (r.to_bits(), *i)).collect();
-                        (
-                            grid.iter().map(|r| *r as f32).collect(),
-                            grid.iter()
-                                .map(|r| *m.get(&r.to_bits()).unwrap_or(&0.0))
-                                .collect(),
-                        )
-                    }
-                    Some(v) => {
-                        let mut s = v.clone();
-                        s.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-                        (
-                            s.iter().map(|(r, _)| *r as f32).collect(),
-                            s.iter().map(|(_, i)| *i).collect(),
-                        )
-                    }
-                    None => (Vec::new(), Vec::new()), // absent predicted transition
-                };
-                chrom_rows.push((
-                    cid,
-                    // Fragment names are interned in the library (a u16 dictionary id per
-                    // fragment instead of a String); materialise the String only here, for
-                    // the emitted chromatogram row.
-                    lib.frag_name_str(fnames[fi]).to_string(),
-                    fmzs[fi],
-                    obs_mz,
-                    fints[fi],
-                    rts,
-                    ints,
-                ));
-            }
-
-            // MS1 isotope XICs (mono/+1/+2) sampled on the same scan grid as the
-            // fragments, so the features stage can correlate the MS1 precursor
-            // envelope against the MS2 fragments over the elution peak (DIA-NN
-            // Ms1.Profile.Corr class). Grid mode only; nearest MS1 scan per grid RT.
-            if !ms1_scans.is_empty() && !grid.is_empty() {
-                let sp = ISOTOPE_SPACING / c.charge as f64;
-                let tol = p.cfg.prec_tol_ppm;
-                let grid_rt: Vec<f32> = grid.iter().map(|&r| r as f32).collect();
-                for (nm, dmz) in [("ms1_mono", 0.0), ("ms1_iso1", sp), ("ms1_iso2", 2.0 * sp)] {
-                    let mz = c.precursor_mz + dmz;
-                    let ints: Vec<f32> = grid
-                        .iter()
-                        .map(|&r| {
-                            let j = nearest_index(&ms1_rts, r);
-                            sum_near(&ms1_scans[j].mz, &ms1_scans[j].intensity, mz, tol) as f32
-                        })
-                        .collect();
-                    chrom_rows.push((cid, nm.to_string(), mz, mz, 0.0, grid_rt.clone(), ints));
+                Some(v) => {
+                    let mut s = v.clone();
+                    s.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+                    (
+                        s.iter().map(|(r, _)| *r as f32).collect(),
+                        s.iter().map(|(_, i)| *i).collect(),
+                    )
                 }
-            }
+                None => (Vec::new(), Vec::new()), // absent predicted transition
+            };
+            chrom_rows.push((
+                cid,
+                // Fragment names are interned in the library (a u16 dictionary id per
+                // fragment instead of a String); materialise the String only here, for
+                // the emitted chromatogram row.
+                lib.frag_name_str(fnames[fi]).to_string(),
+                fmzs[fi] as f64,
+                obs_mz,
+                fints[fi],
+                rts,
+                ints,
+            ));
+        }
 
-            // Top-K peak retention (opt-in; sensitivity_plan P1.1/P1.2). Enumerate peak
-            // groups over the per-scan distinct-fragment COUNT profile (co-eluting
-            // breadth, interference-resistant per the intensity-is-chimeric argument),
-            // ranked by breadth-area. The PSM above still carries the selected apex, so
-            // FDR is unchanged; these are extra candidate peaks for an offline peak-
-            // selection model. Empty for K=1 (the default).
-            let peaks: Vec<(u8, f64, f64, f64, f64, f64)> = if p.cfg.retain_top_peaks > 1
-                && !groups.is_empty()
-            {
+        // MS1 isotope XICs (mono/+1/+2) sampled on the same scan grid as the
+        // fragments, so the features stage can correlate the MS1 precursor
+        // envelope against the MS2 fragments over the elution peak (DIA-NN
+        // Ms1.Profile.Corr class). Grid mode only; nearest MS1 scan per grid RT.
+        if !ms1_scans.is_empty() && !grid.is_empty() {
+            let sp = ISOTOPE_SPACING / c.charge as f64;
+            let tol = p.cfg.prec_tol_ppm;
+            let grid_rt: Vec<f32> = grid.iter().map(|&r| r as f32).collect();
+            for (nm, dmz) in [("ms1_mono", 0.0), ("ms1_iso1", sp), ("ms1_iso2", 2.0 * sp)] {
+                let mz = c.precursor_mz + dmz;
+                let ints: Vec<f32> = grid
+                    .iter()
+                    .map(|&r| {
+                        let j = nearest_index(&ms1_rts, r);
+                        sum_near(&ms1_scans[j].mz, &ms1_scans[j].intensity, mz, tol) as f32
+                    })
+                    .collect();
+                chrom_rows.push((cid, nm.to_string(), mz, mz, 0.0, grid_rt.clone(), ints));
+            }
+        }
+
+        // Top-K peak retention (opt-in; sensitivity_plan P1.1/P1.2). Enumerate peak
+        // groups over the per-scan distinct-fragment COUNT profile (co-eluting
+        // breadth, interference-resistant per the intensity-is-chimeric argument),
+        // ranked by breadth-area. The PSM above still carries the selected apex, so
+        // FDR is unchanged; these are extra candidate peaks for an offline peak-
+        // selection model. Empty for K=1 (the default).
+        let peaks: Vec<(u8, f64, f64, f64, f64, f64)> =
+            if p.cfg.retain_top_peaks > 1 && !groups.is_empty() {
                 let count_prof: Vec<f32> = groups.iter().map(|(_, m)| m.len() as f32).collect();
                 crate::peaks::enumerate_peaks(&count_prof, p.cfg.retain_top_peaks, 1.0 / 3.0, 0.1)
                     .into_iter()
@@ -2191,21 +2223,114 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
                 Vec::new()
             };
 
-            // Spectrum-centric NNLS demixing at the selected apex (D2). Non-destructive:
-            // emits interference-corrected features only. Gated; zero when off.
-            //
-            // Filled in a second pass below, not here: the whole problem is a function of
-            // the apex SCAN, so solving it inside this per-candidate loop re-probed every
-            // peak of that scan and re-ran the NNLS once per candidate sharing it.
-            let (deconv_explained, deconv_active, deconv_share, deconv_collin, deconv_shadow) =
-                (0.0, 0.0, 0.0, 0.0, 0.0);
+        // Spectrum-centric NNLS demixing at the selected apex (D2). Non-destructive:
+        // emits interference-corrected features only. Gated; zero when off.
+        //
+        // Filled in a second pass below, not here: the whole problem is a function of
+        // the apex SCAN, so solving it inside this per-candidate loop re-probed every
+        // peak of that scan and re-ran the NNLS once per candidate sharing it.
+        let (deconv_explained, deconv_active, deconv_share, deconv_collin, deconv_shadow) =
+            (0.0, 0.0, 0.0, 0.0, 0.0);
 
-            let rank0 = CandOut {
+        let rank0 = CandOut {
+            cid,
+            peak_rank: 0, // selected apex; ranks >= 1 added when promote_top_peaks > 1
+            apex_rt,
+            apex_int: apex_sum,
+            n_match: distinct.len() as i32,
+            corun: best_run as i32,
+            npred: fmzs0.len() as i32,
+            calrt: rt_cal[cid as usize],
+            mz: c.precursor_mz,
+            contested: contested_val,
+            contested_count_frac,
+            apportioned_frac,
+            z: c.charge,
+            label: if c.is_decoy { "decoy" } else { "target" }.to_string(),
+            base: c.base_peptide_id,
+            pform: c.peptidoform.clone(),
+            prot: c.protein.clone(),
+            irt: c.predicted_irt,
+            ms1_m1: o_ms1_m1,
+            ms1_mono: o_ms1_mono,
+            ms1_i1: o_ms1_i1,
+            ms1_i2: o_ms1_i2,
+            gate_apex: gate_apex as f32,
+            gate_peak_spectral: gate_peak_spectral as f32,
+            gate_coelution: gate_coelution as f32,
+            gate_spectral_entropy: gate_spectral_entropy as f32,
+            deconv_explained: deconv_explained as f32,
+            deconv_active: deconv_active as f32,
+            deconv_share: deconv_share as f32,
+            deconv_collin: deconv_collin as f32,
+            deconv_shadow: deconv_shadow as f32,
+            chrom: chrom_rows,
+            peaks,
+        };
+        if p.cfg.promote_top_peaks <= 1 || groups.is_empty() {
+            return vec![rank0];
+        }
+        // Promote alternate chromatographic peaks (#7). Enumerate on the same
+        // distinct-fragment COUNT profile as the diagnostic peaks (breadth of
+        // co-elution, interference-resistant), exclude the envelope holding the
+        // selected apex, gate each candidate peak by area fraction + apex-RT
+        // separation + matched-fragment floor, and emit up to promote_top_peaks - 1
+        // extra records. Each shares the candidate's chromatograms (emitted once on
+        // rank 0, looked up by candidate_id downstream) and re-slices only its own
+        // apex-dependent scalars + MS1; the features stage recomputes peak-shape and
+        // co-elution features from the shared chrom windowed to each row's own apex.
+        let count_prof: Vec<f32> = groups.iter().map(|(_, m)| m.len() as f32).collect();
+        let alt_peaks =
+            crate::peaks::enumerate_peaks(&count_prof, p.cfg.promote_top_peaks, 1.0 / 3.0, 0.1);
+        let apex_gi = groups
+            .iter()
+            .position(|(rt, _)| (*rt - apex_rt).abs() < 1e-9);
+        // Reference area for the area gate: the enumerated envelope holding the
+        // selected apex (0 disables the area gate if the apex is not a counted peak).
+        let rank0_area = apex_gi
+            .and_then(|gi| {
+                alt_peaks
+                    .iter()
+                    .find(|pk| pk.start_idx <= gi && gi <= pk.end_idx)
+            })
+            .map(|pk| pk.area as f64)
+            .unwrap_or(0.0);
+        let mut out = vec![rank0];
+        let mut rank: u8 = 1;
+        for pk in &alt_peaks {
+            if out.len() >= p.cfg.promote_top_peaks {
+                break;
+            }
+            // Exclude the envelope containing the selected apex (rank 0).
+            if let Some(gi) = apex_gi {
+                if pk.start_idx <= gi && gi <= pk.end_idx {
+                    continue;
+                }
+            }
+            let alt_apex_rt = groups[pk.apex_idx].0;
+            if (alt_apex_rt - apex_rt).abs() < p.cfg.alt_peak_min_separation_s {
+                continue;
+            }
+            if rank0_area > 0.0 && (pk.area as f64) < p.cfg.alt_peak_min_area_frac * rank0_area {
+                continue;
+            }
+            let mut altset: std::collections::HashSet<u16> = std::collections::HashSet::new();
+            for (_, m) in &groups[pk.start_idx..=pk.end_idx] {
+                for &f in m.keys() {
+                    altset.insert(f);
+                }
+            }
+            if altset.len() < p.cfg.presence_min_matched.max(1) {
+                continue;
+            }
+            let alt_apex_int: f32 = groups[pk.apex_idx].1.values().sum();
+            let (a_m1, a_mono, a_i1, a_i2) = ms1_at(alt_apex_rt);
+            out.push(CandOut {
                 cid,
-                peak_rank: 0, // selected apex; ranks >= 1 added when promote_top_peaks > 1
-                apex_rt,
-                apex_int: apex_sum,
-                n_match: distinct.len() as i32,
+                peak_rank: rank,
+                apex_rt: alt_apex_rt,
+                apex_int: alt_apex_int,
+                n_match: altset.len() as i32,
                 corun: best_run as i32,
                 npred: fmzs0.len() as i32,
                 calrt: rt_cal[cid as usize],
@@ -2219,122 +2344,129 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
                 pform: c.peptidoform.clone(),
                 prot: c.protein.clone(),
                 irt: c.predicted_irt,
-                ms1_m1: o_ms1_m1,
-                ms1_mono: o_ms1_mono,
-                ms1_i1: o_ms1_i1,
-                ms1_i2: o_ms1_i2,
+                ms1_m1: a_m1,
+                ms1_mono: a_mono,
+                ms1_i1: a_i1,
+                ms1_i2: a_i2,
                 gate_apex: gate_apex as f32,
                 gate_peak_spectral: gate_peak_spectral as f32,
                 gate_coelution: gate_coelution as f32,
                 gate_spectral_entropy: gate_spectral_entropy as f32,
-                deconv_explained: deconv_explained as f32,
-                deconv_active: deconv_active as f32,
-                deconv_share: deconv_share as f32,
-                deconv_collin: deconv_collin as f32,
-                deconv_shadow: deconv_shadow as f32,
-                chrom: chrom_rows,
-                peaks,
-            };
-            if p.cfg.promote_top_peaks <= 1 || groups.is_empty() {
-                return vec![rank0];
+                // Demix is a rank-0 apex feature; alternate peaks carry 0.
+                deconv_explained: 0.0,
+                deconv_active: 0.0,
+                deconv_share: 0.0,
+                deconv_collin: 0.0,
+                deconv_shadow: 0.0,
+                chrom: Vec::new(), // shared per-candidate via the rank-0 row
+                peaks: Vec::new(),
+            });
+            rank += 1;
+        }
+        out
+    };
+
+    // Process candidates in cid-ordered chunks: each chunk is parallel over its candidates
+    // and, once collected (order-preserving), appended serially -- PSM scalars to the column
+    // Vecs, chromatogram rows to a parquet writer running on its own thread. Output order is
+    // exactly the old "collect everything, then flatten" order, but a chunk's trace payload
+    // is freed as soon as it is encoded, instead of every trace of the run (plus a second
+    // copy in the Arrow builders) being resident at one final write. The bounded channel
+    // keeps at most a few chunks in flight between the extraction threads and the encoder.
+    let mut n_accepted = 0u64;
+    // Top-K retained peaks (opt-in; empty for K=1).
+    let (mut pk_cid, mut pk_rank): (Vec<u32>, Vec<i32>) = (Vec::new(), Vec::new());
+    let (mut pk_apex, mut pk_start, mut pk_end): (Vec<f64>, Vec<f64>, Vec<f64>) =
+        (Vec::new(), Vec::new(), Vec::new());
+    let (mut pk_ev, mut pk_area): (Vec<f64>, Vec<f64>) = (Vec::new(), Vec::new());
+    let n_chrom = std::thread::scope(|sc| -> Result<u64> {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<Col>>(2);
+        let writer = sc.spawn(move || -> Result<u64> {
+            let mut w = chrom_writer;
+            for cols in rx {
+                w.write_cols(cols)?;
             }
-            // Promote alternate chromatographic peaks (#7). Enumerate on the same
-            // distinct-fragment COUNT profile as the diagnostic peaks (breadth of
-            // co-elution, interference-resistant), exclude the envelope holding the
-            // selected apex, gate each candidate peak by area fraction + apex-RT
-            // separation + matched-fragment floor, and emit up to promote_top_peaks - 1
-            // extra records. Each shares the candidate's chromatograms (emitted once on
-            // rank 0, looked up by candidate_id downstream) and re-slices only its own
-            // apex-dependent scalars + MS1; the features stage recomputes peak-shape and
-            // co-elution features from the shared chrom windowed to each row's own apex.
-            let count_prof: Vec<f32> = groups.iter().map(|(_, m)| m.len() as f32).collect();
-            let alt_peaks =
-                crate::peaks::enumerate_peaks(&count_prof, p.cfg.promote_top_peaks, 1.0 / 3.0, 0.1);
-            let apex_gi = groups
-                .iter()
-                .position(|(rt, _)| (*rt - apex_rt).abs() < 1e-9);
-            // Reference area for the area gate: the enumerated envelope holding the
-            // selected apex (0 disables the area gate if the apex is not a counted peak).
-            let rank0_area = apex_gi
-                .and_then(|gi| {
-                    alt_peaks
-                        .iter()
-                        .find(|pk| pk.start_idx <= gi && gi <= pk.end_idx)
-                })
-                .map(|pk| pk.area as f64)
-                .unwrap_or(0.0);
-            let mut out = vec![rank0];
-            let mut rank: u8 = 1;
-            for pk in &alt_peaks {
-                if out.len() >= p.cfg.promote_top_peaks {
-                    break;
+            w.close()
+        });
+        for chunk in cand_hits.chunks_mut(CAND_CHUNK) {
+            let outs: Vec<Vec<CandOut>> = chunk
+                .par_iter_mut()
+                .map(|(cid, hits)| per_candidate(*cid, std::mem::take(hits)))
+                .collect();
+            let mut ch = ChromChunk::default();
+            for r in outs.into_iter().flatten() {
+                n_accepted += 1;
+                let rcid = r.cid;
+                for (rank, apex, start, end, ev, area) in &r.peaks {
+                    pk_cid.push(rcid);
+                    pk_rank.push(*rank as i32);
+                    pk_apex.push(*apex);
+                    pk_start.push(*start);
+                    pk_end.push(*end);
+                    pk_ev.push(*ev);
+                    pk_area.push(*area);
                 }
-                // Exclude the envelope containing the selected apex (rank 0).
-                if let Some(gi) = apex_gi {
-                    if pk.start_idx <= gi && gi <= pk.end_idx {
-                        continue;
-                    }
+                cid_c.push(r.cid);
+                peakrank_c.push(r.peak_rank as i32);
+                apexrt_c.push(r.apex_rt);
+                apexim_c.push(None);
+                apexint_c.push(r.apex_int);
+                nmatch_c.push(r.n_match);
+                corun_c.push(r.corun);
+                npred_c.push(r.npred);
+                calrt_c.push(r.calrt);
+                mz_c.push(r.mz);
+                contested_c.push(r.contested);
+                if p.cfg.emit_contested_features {
+                    contested_count_c.push(r.contested_count_frac);
+                    apportioned_c.push(r.apportioned_frac);
                 }
-                let alt_apex_rt = groups[pk.apex_idx].0;
-                if (alt_apex_rt - apex_rt).abs() < p.cfg.alt_peak_min_separation_s {
-                    continue;
+                z_c.push(r.z);
+                label_c.push(r.label);
+                base_c.push(r.base);
+                pform_c.push(r.pform);
+                prot_c.push(r.prot);
+                irt_c.push(r.irt);
+                ms1_m1.push(r.ms1_m1);
+                ms1_mono.push(r.ms1_mono);
+                ms1_i1.push(r.ms1_i1);
+                ms1_i2.push(r.ms1_i2);
+                if p.cfg.emit_gate_diagnostics {
+                    gate_apex_c.push(r.gate_apex);
+                    gate_peakspec_c.push(r.gate_peak_spectral);
+                    gate_coel_c.push(r.gate_coelution);
+                    gate_se_c.push(r.gate_spectral_entropy);
                 }
-                if rank0_area > 0.0 && (pk.area as f64) < p.cfg.alt_peak_min_area_frac * rank0_area
-                {
-                    continue;
+                if p.cfg.emit_demix_features {
+                    deconv_expl_c.push(r.deconv_explained);
+                    deconv_act_c.push(r.deconv_active);
+                    deconv_share_c.push(r.deconv_share);
+                    deconv_collin_c.push(r.deconv_collin);
+                    deconv_shadow_c.push(r.deconv_shadow);
                 }
-                let mut altset: std::collections::HashSet<u16> = std::collections::HashSet::new();
-                for (_, m) in &groups[pk.start_idx..=pk.end_idx] {
-                    for &f in m.keys() {
-                        altset.insert(f);
-                    }
+                for (cc, nm, fmz, omz, pint, rt, it) in r.chrom {
+                    ch.cid.push(cc);
+                    ch.name.push(nm);
+                    ch.fmz.push(fmz);
+                    ch.obsmz.push(omz);
+                    ch.pint.push(pint);
+                    ch.rt.push(rt);
+                    ch.int.push(it);
                 }
-                if altset.len() < p.cfg.presence_min_matched.max(1) {
-                    continue;
-                }
-                let alt_apex_int: f32 = groups[pk.apex_idx].1.values().sum();
-                let (a_m1, a_mono, a_i1, a_i2) = ms1_at(alt_apex_rt);
-                out.push(CandOut {
-                    cid,
-                    peak_rank: rank,
-                    apex_rt: alt_apex_rt,
-                    apex_int: alt_apex_int,
-                    n_match: altset.len() as i32,
-                    corun: best_run as i32,
-                    npred: fmzs0.len() as i32,
-                    calrt: rt_cal[cid as usize],
-                    mz: c.precursor_mz,
-                    contested: contested_val,
-                    contested_count_frac,
-                    apportioned_frac,
-                    z: c.charge,
-                    label: if c.is_decoy { "decoy" } else { "target" }.to_string(),
-                    base: c.base_peptide_id,
-                    pform: c.peptidoform.clone(),
-                    prot: c.protein.clone(),
-                    irt: c.predicted_irt,
-                    ms1_m1: a_m1,
-                    ms1_mono: a_mono,
-                    ms1_i1: a_i1,
-                    ms1_i2: a_i2,
-                    gate_apex: gate_apex as f32,
-                    gate_peak_spectral: gate_peak_spectral as f32,
-                    gate_coelution: gate_coelution as f32,
-                    gate_spectral_entropy: gate_spectral_entropy as f32,
-                    // Demix is a rank-0 apex feature; alternate peaks carry 0.
-                    deconv_explained: 0.0,
-                    deconv_active: 0.0,
-                    deconv_share: 0.0,
-                    deconv_collin: 0.0,
-                    deconv_shadow: 0.0,
-                    chrom: Vec::new(), // shared per-candidate via the rank-0 row
-                    peaks: Vec::new(),
-                });
-                rank += 1;
             }
-            out
-        })
-        .collect();
+            // Hand the chunk's chromatogram rows to the writer thread. A send error means
+            // the writer failed; its error surfaces at the join below.
+            if tx.send(ch.cols()).is_err() {
+                break;
+            }
+        }
+        // A final empty chunk fixes the schema when no candidate was accepted at all.
+        let _ = tx.send(ChromChunk::default().cols());
+        drop(tx);
+        writer
+            .join()
+            .map_err(|_| anyhow::anyhow!("chromatogram writer thread panicked"))?
+    })?;
 
     // Spectrum-centric NNLS demixing (D2), second pass: solve ONCE PER APEX SCAN.
     //
@@ -2347,19 +2479,17 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
     // Exactly the same numbers as the per-candidate version: `demix_solve_scan` reproduces
     // the assembly verbatim, `demix_features_for` reproduces the per-candidate reads, and
     // the group key is the same scan the old code resolved from `(apex_rt, precursor_mz)`.
-    // Rows are patched by candidate id, so `results`' order is untouched.
-    let mut results = results;
+    // Rows are patched by candidate id in the output columns, so row order is untouched.
     if p.cfg.emit_demix_features {
         // Which candidates need a demix, grouped by the scan that serves them. BTreeMap so
         // the scan iteration order is deterministic.
         let mut by_scan: BTreeMap<usize, Vec<u32>> = BTreeMap::new();
-        for r in results.iter().flatten() {
-            if r.peak_rank != 0 {
+        for i in 0..cid_c.len() {
+            if peakrank_c[i] != 0 {
                 continue;
             }
-            let prec_mz = r.mz;
-            if let Some(si) = demix_apex_scan(&scans, &rt_scan, r.apex_rt, prec_mz) {
-                by_scan.entry(si).or_default().push(r.cid);
+            if let Some(si) = demix_apex_scan(&scans, &rt_scan, apexrt_c[i], mz_c[i]) {
+                by_scan.entry(si).or_default().push(cid_c[i]);
             }
         }
         let n_scans = by_scan.len();
@@ -2394,86 +2524,18 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
             candidates = n_cands,
             "extract: demix features (one NNLS per apex scan)"
         );
-        for r in results.iter_mut().flatten() {
-            if r.peak_rank != 0 {
+        // Patch the rank-0 rows in place; the columns were filled in the chunk loop above.
+        for i in 0..cid_c.len() {
+            if peakrank_c[i] != 0 {
                 continue;
             }
-            if let Some(&(expl, act, share, collin, shadow)) = feats.get(&r.cid) {
-                r.deconv_explained = expl as f32;
-                r.deconv_active = act as f32;
-                r.deconv_share = share as f32;
-                r.deconv_collin = collin as f32;
-                r.deconv_shadow = shadow as f32;
+            if let Some(&(expl, act, share, collin, shadow)) = feats.get(&cid_c[i]) {
+                deconv_expl_c[i] = expl as f32;
+                deconv_act_c[i] = act as f32;
+                deconv_share_c[i] = share as f32;
+                deconv_collin_c[i] = collin as f32;
+                deconv_shadow_c[i] = shadow as f32;
             }
-        }
-    }
-
-    // Append results in the deterministic cand_ids order (parallel work above was
-    // order-preserving via `collect`), reproducing the serial push order exactly.
-    let mut n_accepted = 0u64;
-    // Top-K retained peaks (opt-in; empty for K=1).
-    let (mut pk_cid, mut pk_rank): (Vec<u32>, Vec<i32>) = (Vec::new(), Vec::new());
-    let (mut pk_apex, mut pk_start, mut pk_end): (Vec<f64>, Vec<f64>, Vec<f64>) =
-        (Vec::new(), Vec::new(), Vec::new());
-    let (mut pk_ev, mut pk_area): (Vec<f64>, Vec<f64>) = (Vec::new(), Vec::new());
-    for r in results.into_iter().flatten() {
-        n_accepted += 1;
-        let rcid = r.cid;
-        for (rank, apex, start, end, ev, area) in &r.peaks {
-            pk_cid.push(rcid);
-            pk_rank.push(*rank as i32);
-            pk_apex.push(*apex);
-            pk_start.push(*start);
-            pk_end.push(*end);
-            pk_ev.push(*ev);
-            pk_area.push(*area);
-        }
-        cid_c.push(r.cid);
-        peakrank_c.push(r.peak_rank as i32);
-        apexrt_c.push(r.apex_rt);
-        apexim_c.push(None);
-        apexint_c.push(r.apex_int);
-        nmatch_c.push(r.n_match);
-        corun_c.push(r.corun);
-        npred_c.push(r.npred);
-        calrt_c.push(r.calrt);
-        mz_c.push(r.mz);
-        contested_c.push(r.contested);
-        if p.cfg.emit_contested_features {
-            contested_count_c.push(r.contested_count_frac);
-            apportioned_c.push(r.apportioned_frac);
-        }
-        z_c.push(r.z);
-        label_c.push(r.label);
-        base_c.push(r.base);
-        pform_c.push(r.pform);
-        prot_c.push(r.prot);
-        irt_c.push(r.irt);
-        ms1_m1.push(r.ms1_m1);
-        ms1_mono.push(r.ms1_mono);
-        ms1_i1.push(r.ms1_i1);
-        ms1_i2.push(r.ms1_i2);
-        if p.cfg.emit_gate_diagnostics {
-            gate_apex_c.push(r.gate_apex);
-            gate_peakspec_c.push(r.gate_peak_spectral);
-            gate_coel_c.push(r.gate_coelution);
-            gate_se_c.push(r.gate_spectral_entropy);
-        }
-        if p.cfg.emit_demix_features {
-            deconv_expl_c.push(r.deconv_explained);
-            deconv_act_c.push(r.deconv_active);
-            deconv_share_c.push(r.deconv_share);
-            deconv_collin_c.push(r.deconv_collin);
-            deconv_shadow_c.push(r.deconv_shadow);
-        }
-        for (cc, nm, fmz, omz, pint, rt, it) in r.chrom {
-            ch_cid.push(cc);
-            ch_name.push(nm);
-            ch_fmz.push(fmz);
-            ch_obsmz.push(omz);
-            ch_pint.push(pint);
-            ch_rt.push(rt);
-            ch_int.push(it);
         }
     }
 
@@ -2523,21 +2585,7 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
     }
     let n_psms = write_table(p.out_psms, psms_cols)?;
 
-    let n_chrom = write_table(
-        p.out_chrom,
-        vec![
-            Col::U32("candidate_id".into(), ch_cid),
-            Col::Str("frag_name".into(), ch_name),
-            Col::F64("frag_mz".into(), ch_fmz),
-            Col::F64("frag_obs_mz".into(), ch_obsmz),
-            Col::F32("predicted_intensity".into(), ch_pint),
-            // LargeList (64-bit offsets): the total chromatogram list-value count
-            // can exceed the ~2.1B limit of a 32-bit ListArray offset buffer when
-            // extraction accepts a very large candidate set (e.g. gates opened up).
-            Col::LargeListF32("rt".into(), ch_rt),
-            Col::LargeListF32("intensity".into(), ch_int),
-        ],
-    )?;
+    // (chromatograms were streamed to `p.out_chrom` during the candidate loop above)
 
     // Top-K retained peaks (opt-in, sensitivity_plan P1.1/P1.2). Written next to
     // the psms table only when retain_top_peaks > 1; one row per (candidate, peak).

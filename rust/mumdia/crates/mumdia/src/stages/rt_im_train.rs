@@ -10,7 +10,7 @@ use anyhow::Result;
 use mumdia_core::config::{CalibrationMethod, RtImTrainConfig};
 use mumdia_core::schema::artifact;
 use mumdia_io::report::ArtifactReport;
-use mumdia_io::table::{write_table, Col, Table};
+use mumdia_io::table::{write_table, Col, TableFile};
 use serde_json::json;
 use tracing::{info, warn};
 
@@ -116,7 +116,7 @@ pub fn run(p: RtImTrainParams) -> Result<u64> {
 
     // Library predicted iRT, keyed by candidate_id (single source of truth, so
     // a patched/updated library iRT is used for both training and application).
-    let lib = Table::read(p.library_precursors)?;
+    let lib = TableFile::open(p.library_precursors)?;
     let lib_cid = lib.u32("candidate_id")?;
     let lib_irt = lib.f32("predicted_irt")?;
     let mut irt_by_cid: HashMap<u32, f64> = HashMap::with_capacity(lib.nrows);
@@ -126,7 +126,7 @@ pub fn run(p: RtImTrainParams) -> Result<u64> {
 
     // Training rows: confident seed PSMs, one apex (best score) per peptide;
     // predicted iRT is joined from the library by candidate_id.
-    let seed = Table::read(p.seed_psms)?;
+    let seed = TableFile::open(p.seed_psms)?;
     let s_cid = seed.u32("candidate_id")?;
     let s_base = seed.u32("base_peptide_id")?;
     let s_q = seed.f64("spectrum_q")?;

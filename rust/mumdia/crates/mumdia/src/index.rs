@@ -15,9 +15,13 @@
 //! Stage D part 2), which keeps the index run-independent.
 
 use anyhow::Result;
+use arrow::array::{Array, Float32Array, Float64Array, StringArray, UInt32Array};
 use mumdia_core::constants::{ppm_bounds, PROTON};
-use mumdia_io::table::Table;
+use mumdia_io::table::TableFile;
 use rayon::prelude::*;
+
+/// Fragment rows per decoded batch while streaming the fragment table (a few MB).
+const FRAG_BATCH_ROWS: usize = 1 << 16;
 
 #[derive(Clone, Debug)]
 pub struct Candidate {
@@ -37,7 +41,12 @@ pub struct Candidate {
 pub struct Library {
     pub cands: Vec<Candidate>,
     /// Per-candidate fragment arrays, contiguous, grouped by candidate.
-    pub frag_mz: Vec<f64>,
+    /// Fragment m/z, f32. Both matchers already quantise to f32 before use (the
+    /// fragindex bins and stores `mz as f32`, the naive matcher compares
+    /// `mz as f32 as f64`), so storing f32 is exact for matching and saves 4 B of the
+    /// 26 B per fragment row. f32 resolves 0.06 ppm at m/z 1000, two orders below the
+    /// 5-20 ppm matching tolerances.
+    pub frag_mz: Vec<f32>,
     pub frag_int: Vec<f32>,
     /// Fragment names, INTERNED: one dictionary index per fragment rather than one
     /// `String` per fragment. Library fragment names are drawn from a tiny vocabulary
@@ -76,39 +85,20 @@ impl Library {
         bucket_size: usize,
         build_bucketed: bool,
     ) -> Result<Library> {
-        let pt = Table::read(precursors)?;
+        let pt = TableFile::open(precursors)?;
         let cid = pt.u32("candidate_id")?;
         let pfid = pt.u32("peptidoform_id")?;
         let baseid = pt.u32("base_peptide_id")?;
-        let pform = pt.str("peptidoform")?;
+        let mut pform = pt.str("peptidoform")?;
         let charge = pt.i32("charge")?;
         let pmz = pt.f64("precursor_mz")?;
         let irt = pt.f32("predicted_irt")?;
         let label = pt.str("label")?;
-        let protein = pt.str("protein")?;
+        let mut protein = pt.str("protein")?;
         crate::fdr::validate_labels(&label)?;
 
         let ncand = pt.nrows;
-        // The typed getters above returned owned Vecs, so the decoded Arrow batches are
-        // dead weight from here on. Release them before the fragment table is read:
-        // holding both tables plus every derived Vec is what makes library load the peak-
-        // RSS wall (the fragment table alone is ~23 GB of Arrow batches at 657M rows).
         drop(pt);
-
-        // Projected: the fragment artifact also carries `ion_type`, `ordinal`,
-        // `frag_charge` and `cardinality`, none of which the library reads. Decoding them
-        // costs a full pass and a full copy of each at fragment-library scale (hundreds of
-        // millions of rows), and `ion_type` is a string column, so it also allocates.
-        let ft = Table::read_cols(
-            fragments,
-            &["candidate_id", "mz", "predicted_intensity", "name"],
-        )?;
-        let f_cid = ft.u32("candidate_id")?;
-        let f_mz = ft.f64("mz")?;
-        let f_int = ft.f32("predicted_intensity")?;
-        let mut f_name = ft.str("name")?;
-        let n_frag_rows = ft.nrows;
-        drop(ft);
         // Precondition: candidate_id is the contiguous, row-aligned range 0..ncand
         // (the library + decoy builders guarantee this). An external library that
         // violates it would misgroup fragments or panic on the index below, so
@@ -123,93 +113,171 @@ impl Library {
                 );
             }
         }
-        // Group fragments by candidate_id, preserving stored order, via a counting sort
-        // into two flat arrays. The previous `Vec<Vec<usize>>` performed one heap
-        // allocation per candidate (54.8M of them on the profiled library) to express a
-        // grouping that a counting sort does with exactly two allocations. Scattering in
-        // ascending row order keeps each candidate's fragments in stored order, so the
-        // resulting layout is identical to before.
+
+        // Fragment table: two streaming passes over the four columns the library needs (the
+        // artifact also carries `ion_type`, `ordinal`, `frag_charge` and `cardinality`, which
+        // are never fetched). Pass 1 decodes only `candidate_id` and counts fragments per
+        // candidate; pass 2 decodes the four columns batch by batch and scatters each row
+        // straight into its final grouped slot, interning the fragment name on the way.
+        //
+        // This is the same counting sort as before -- rows scattered in ascending file order
+        // keep each candidate's fragments in stored order, so the resulting layout is
+        // identical -- but with the file as the source instead of owned copies: no
+        // whole-table Arrow batches (23 GB at 657M rows), no owned copy of the four columns,
+        // no `frag_order` permutation and no `Vec<String>` with one heap allocation per
+        // fragment. The resident peak is the final arrays plus one batch, which is what lets
+        // a modification-expanded library load on a 32 GB machine.
+        let ft = TableFile::open(fragments)?;
+        let n_frag_rows = ft.nrows;
+        if n_frag_rows > u32::MAX as usize {
+            anyhow::bail!(
+                "fragment library has {n_frag_rows} rows; per-candidate fragment offsets are u32"
+            );
+        }
         let mut frag_offsets: Vec<u32> = vec![0; ncand + 1];
-        for (i, &candidate_id) in f_cid.iter().enumerate().take(n_frag_rows) {
-            let c = candidate_id as usize;
-            if c >= ncand {
-                anyhow::bail!(
-                    "fragment row {i} references candidate_id {c} >= precursor count {ncand}"
-                );
+        {
+            let mut row = 0usize;
+            for b in ft.batches(Some(&["candidate_id"]), FRAG_BATCH_ROWS)? {
+                let b = b?;
+                let a = b
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<UInt32Array>()
+                    .ok_or_else(|| anyhow::anyhow!("fragment column 'candidate_id' is not u32"))?;
+                for &candidate_id in a.values().iter() {
+                    let c = candidate_id as usize;
+                    if c >= ncand {
+                        anyhow::bail!(
+                            "fragment row {row} references candidate_id {c} >= precursor count {ncand}"
+                        );
+                    }
+                    frag_offsets[c + 1] += 1;
+                    row += 1;
+                }
             }
-            frag_offsets[c + 1] += 1;
         }
         for c in 0..ncand {
             frag_offsets[c + 1] += frag_offsets[c];
         }
-        let mut frag_order: Vec<u32> = vec![0; n_frag_rows];
-        {
-            let mut cursor = frag_offsets.clone();
-            for (i, &candidate_id) in f_cid.iter().enumerate().take(n_frag_rows) {
-                let c = candidate_id as usize;
-                frag_order[cursor[c] as usize] = i as u32;
-                cursor[c] += 1;
-            }
-        }
 
-        let mut cands = Vec::with_capacity(ncand);
-        let mut frag_mz = Vec::with_capacity(n_frag_rows);
-        let mut frag_int = Vec::with_capacity(n_frag_rows);
-        let mut frag_name_id: Vec<u16> = Vec::with_capacity(n_frag_rows);
+        let mut frag_mz: Vec<f32> = vec![0.0; n_frag_rows];
+        let mut frag_int: Vec<f32> = vec![0.0; n_frag_rows];
+        // Fragment names are INTERNED (see the struct field docs): a u16 dictionary id per
+        // fragment, assigned by first appearance in file order.
+        let mut frag_name_id: Vec<u16> = vec![0; n_frag_rows];
         let mut frag_name_dict: Vec<String> = Vec::new();
         let mut name_lookup: std::collections::HashMap<String, u16> =
             std::collections::HashMap::new();
-        let mut prec_mz = Vec::with_capacity(ncand);
-
-        for c in 0..ncand {
-            let start = frag_mz.len();
-            for &fi32 in &frag_order[frag_offsets[c] as usize..frag_offsets[c + 1] as usize] {
-                let fi = fi32 as usize;
-                frag_mz.push(f_mz[fi]);
-                frag_int.push(f_int[fi]);
-                // Intern the name: fragment names come from a tiny repeating vocabulary
-                // (b1, y7, y12^2, ...), so store a u16 dictionary index per fragment
-                // instead of a String. A `Vec<String>` costs ~24 B of struct per fragment
-                // before any text -- ~16 GB per copy at 657M fragments -- and the old code
-                // additionally held a second copy while moving names across.
-                let name = std::mem::take(&mut f_name[fi]);
-                let id = match name_lookup.get(&name) {
-                    Some(&id) => id,
-                    None => {
-                        let id = u16::try_from(frag_name_dict.len()).map_err(|_| {
-                            anyhow::anyhow!(
-                                "library has more than {} distinct fragment names; the                                  interned name id is a u16",
-                                u16::MAX
-                            )
-                        })?;
-                        name_lookup.insert(name.clone(), id);
-                        frag_name_dict.push(name);
-                        id
+        {
+            let mut cursor = frag_offsets.clone();
+            let reader = ft.batches(
+                Some(&["candidate_id", "mz", "predicted_intensity", "name"]),
+                FRAG_BATCH_ROWS,
+            )?;
+            let schema = reader.schema();
+            let ix = |n: &str| {
+                schema
+                    .index_of(n)
+                    .map_err(|_| anyhow::anyhow!("fragment library has no column '{n}'"))
+            };
+            let (i_cid, i_mz, i_int, i_name) = (
+                ix("candidate_id")?,
+                ix("mz")?,
+                ix("predicted_intensity")?,
+                ix("name")?,
+            );
+            for b in reader {
+                let b = b?;
+                let a_cid = b
+                    .column(i_cid)
+                    .as_any()
+                    .downcast_ref::<UInt32Array>()
+                    .ok_or_else(|| anyhow::anyhow!("fragment column 'candidate_id' is not u32"))?;
+                let a_mz = b
+                    .column(i_mz)
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .ok_or_else(|| anyhow::anyhow!("fragment column 'mz' is not f64"))?;
+                let a_int = b
+                    .column(i_int)
+                    .as_any()
+                    .downcast_ref::<Float32Array>()
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("fragment column 'predicted_intensity' is not f32")
+                    })?;
+                let a_name = b
+                    .column(i_name)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .ok_or_else(|| anyhow::anyhow!("fragment column 'name' is not utf8"))?;
+                for k in 0..b.num_rows() {
+                    let c = a_cid.value(k) as usize;
+                    if c >= ncand {
+                        anyhow::bail!(
+                            "fragment table changed between passes: candidate_id {c} >= {ncand}"
+                        );
                     }
-                };
-                frag_name_id.push(id);
+                    let pos = cursor[c] as usize;
+                    cursor[c] += 1;
+                    // Null policy matches the typed getters (null f64/f32 -> NaN, null utf8
+                    // -> ""); the artifact has no nulls, this only keeps the contract exact.
+                    frag_mz[pos] = if a_mz.is_null(k) {
+                        f32::NAN
+                    } else {
+                        a_mz.value(k) as f32
+                    };
+                    frag_int[pos] = if a_int.is_null(k) {
+                        f32::NAN
+                    } else {
+                        a_int.value(k)
+                    };
+                    let name = if a_name.is_null(k) {
+                        ""
+                    } else {
+                        a_name.value(k)
+                    };
+                    let id = match name_lookup.get(name) {
+                        Some(&id) => id,
+                        None => {
+                            let id = u16::try_from(frag_name_dict.len()).map_err(|_| {
+                                anyhow::anyhow!(
+                                    "library has more than {} distinct fragment names; the \
+                                     interned name id is a u16",
+                                    u16::MAX
+                                )
+                            })?;
+                            name_lookup.insert(name.to_string(), id);
+                            frag_name_dict.push(name.to_string());
+                            id
+                        }
+                    };
+                    frag_name_id[pos] = id;
+                }
             }
-            let n = frag_mz.len() - start;
+        }
+        drop(name_lookup);
+
+        let mut cands = Vec::with_capacity(ncand);
+        let mut prec_mz = Vec::with_capacity(ncand);
+        for c in 0..ncand {
+            let start = frag_offsets[c] as usize;
+            let n = frag_offsets[c + 1] as usize - start;
             cands.push(Candidate {
                 candidate_id: cid[c],
                 peptidoform_id: pfid[c],
                 base_peptide_id: baseid[c],
-                peptidoform: pform[c].clone(),
+                // Move the strings out of the column Vecs instead of cloning them.
+                peptidoform: std::mem::take(&mut pform[c]),
                 charge: charge[c],
                 precursor_mz: pmz[c],
                 predicted_irt: irt[c],
                 is_decoy: label[c] == "decoy",
-                protein: protein[c].clone(),
+                protein: std::mem::take(&mut protein[c]),
                 frag_start: start,
                 n_frag: n,
             });
             prec_mz.push(pmz[c]);
         }
-        // Names have all been moved out; free the (now empty) source vector and the
-        // grouping arrays before the index build allocates `entries`.
-        drop(f_name);
-        drop(name_lookup);
-        drop(frag_order);
         drop(frag_offsets);
 
         // Precondition for `candidate_range`: precursors ascending by m/z. The
@@ -255,7 +323,7 @@ impl Library {
             for cd in cands.iter().take(ncand) {
                 for k in 0..cd.n_frag {
                     let gi = cd.frag_start + k;
-                    entries.push((frag_mz[gi] as f32, cd.candidate_id, frag_int[gi]));
+                    entries.push((frag_mz[gi], cd.candidate_id, frag_int[gi]));
                 }
             }
             // Global sort by fragment m/z. Parallel stable sort: identical result to
@@ -309,7 +377,7 @@ impl Library {
 
     /// Per-candidate fragment m/z, predicted intensity, and INTERNED name ids (resolve
     /// with [`Library::frag_name_str`]).
-    pub fn cand_frags(&self, cid: u32) -> (&[f64], &[f32], &[u16]) {
+    pub fn cand_frags(&self, cid: u32) -> (&[f32], &[f32], &[u16]) {
         let c = &self.cands[cid as usize];
         let s = c.frag_start;
         let e = s + c.n_frag;
@@ -327,7 +395,7 @@ impl Library {
         let mut best = 0usize;
         let mut bestd = f32::MAX;
         for (i, &m) in mzs.iter().enumerate() {
-            let d = ((m as f32) - frag_mz_f32).abs();
+            let d = (m - frag_mz_f32).abs();
             if d < bestd {
                 bestd = d;
                 best = i;

@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::Write;
 
 use anyhow::Result;
-use mumdia_io::table::Table;
+use mumdia_io::table::TableFile;
 
 pub struct ReportParams<'a> {
     pub scored: &'a str,
@@ -47,7 +47,7 @@ fn qcell(q: f64) -> String {
 /// Write peptides.tsv + proteins.tsv from a scored PSM table. Returns
 /// (n_peptides, n_protein_groups) at the FDR threshold.
 pub fn run(p: ReportParams) -> Result<(u64, u64)> {
-    let t = Table::read(p.scored)?;
+    let t = TableFile::open(p.scored)?;
     let pform = t.str("peptidoform")?;
     let charge = t.i32("charge")?;
     let protein = t.str("protein")?;
@@ -60,7 +60,7 @@ pub fn run(p: ReportParams) -> Result<(u64, u64)> {
 
     let pep_quant: HashMap<(String, i32), f64> = match p.peptide_quant {
         Some(path) => {
-            let q = Table::read(path)?;
+            let q = TableFile::open(path)?;
             let qp = q.str("peptidoform")?;
             let qc = q.i32("charge")?;
             let qq = q.f64("quantity")?;
@@ -72,7 +72,7 @@ pub fn run(p: ReportParams) -> Result<(u64, u64)> {
     };
     let prot_quant: HashMap<String, f64> = match p.protein_quant {
         Some(path) => {
-            let q = Table::read(path)?;
+            let q = TableFile::open(path)?;
             let qg = q.str("protein_group")?;
             let qq = q.f64("quantity")?;
             (0..q.nrows).map(|i| (qg[i].clone(), qq[i])).collect()

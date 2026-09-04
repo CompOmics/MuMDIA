@@ -14,7 +14,7 @@ use mumdia_core::config::{FeatureSet, FeaturesConfig};
 use mumdia_core::constants::{ppm_diff, PROTON};
 use mumdia_core::schema::artifact;
 use mumdia_io::report::ArtifactReport;
-use mumdia_io::table::{write_table, Col, Table};
+use mumdia_io::table::{write_table, Col, TableFile};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tracing::{info, warn};
@@ -630,7 +630,7 @@ pub struct FeaturesParams<'a> {
 
 pub fn run(p: FeaturesParams) -> Result<u64> {
     let t0 = Instant::now();
-    let ps = Table::read(p.psms)?;
+    let ps = TableFile::open(p.psms)?;
     let cid = ps.u32("candidate_id")?;
     // Top-K peak rank (#7), passed through untouched. Missing in pre-v2 extracted
     // artifacts -> 0 (the selected apex), so old inputs behave exactly as before.
@@ -689,23 +689,13 @@ pub fn run(p: FeaturesParams) -> Result<u64> {
         .opt_f64("ms1_iso2")
         .unwrap_or_else(|_| vec![None; ps.nrows]);
 
-    // Group chromatograms by candidate_id.
-    // Project explicitly. features uses all of these; naming them means a future extra
-    // column in the artifact is not silently decoded on this hot path.
-    let ch = Table::read_cols(
-        p.chromatograms,
-        &[
-            "candidate_id",
-            "frag_name",
-            "frag_mz",
-            "frag_obs_mz",
-            "predicted_intensity",
-            "rt",
-            "intensity",
-        ],
-    )?;
+    // Group chromatograms by candidate. The table is the largest artifact of the run: each
+    // getter streams its own column (nothing else is decoded), and the trace Vecs are MOVED
+    // into the rows rather than cloned, so the traces exist once here instead of three
+    // times (Arrow batches, owned column, cloned row).
+    let ch = TableFile::open(p.chromatograms)?;
     let ch_cid = ch.u32("candidate_id")?;
-    let ch_name = ch.str("frag_name")?;
+    let mut ch_name = ch.str("frag_name")?;
     let ch_fmz = ch.f64("frag_mz")?;
     let ch_obsmz = ch.f64("frag_obs_mz").unwrap_or_else(|_| ch_fmz.clone());
     let ch_pint = ch.f32("predicted_intensity")?;
@@ -716,21 +706,23 @@ pub fn run(p: FeaturesParams) -> Result<u64> {
     // separate so they never enter the fragment-based features; they feed the
     // extended MS1-profile family via Evidence.ms1_xic. Absent in older artifacts.
     let mut ms1x: HashMap<u32, Vec<ChromRow>> = HashMap::new();
-    for i in 0..ch.nrows {
+    for (i, (rt, inten)) in ch_rt.into_iter().zip(ch_int).enumerate() {
+        let is_ms1 = ch_name[i].starts_with("ms1_");
         let row = ChromRow {
-            frag_name: ch_name[i].clone(),
+            frag_name: std::mem::take(&mut ch_name[i]),
             frag_mz: ch_fmz[i],
             frag_obs_mz: ch_obsmz[i],
             pred_int: ch_pint[i],
-            rt: ch_rt[i].clone(),
-            inten: ch_int[i].clone(),
+            rt,
+            inten,
         };
-        if ch_name[i].starts_with("ms1_") {
+        if is_ms1 {
             ms1x.entry(ch_cid[i]).or_default().push(row);
         } else {
             chrom.entry(ch_cid[i]).or_default().push(row);
         }
     }
+    drop((ch_cid, ch_name, ch_fmz, ch_obsmz, ch_pint));
 
     // Seed corroboration maps (candidate_id -> seed score / identified flag) plus the
     // confident-target candidate set (spectrum_q <= 0.01, label == target) used to
@@ -742,7 +734,7 @@ pub fn run(p: FeaturesParams) -> Result<u64> {
         std::collections::HashSet<u32>,
     ) = match p.seed {
         Some(path) => {
-            let s = Table::read(path)?;
+            let s = TableFile::open(path)?;
             let scid = s.u32("candidate_id")?;
             let ssc = s.f64("score")?;
             let sq = s.f64("spectrum_q")?;
@@ -1025,50 +1017,25 @@ pub fn run(p: FeaturesParams) -> Result<u64> {
             - rt_err / gradient;
     }
 
+    // The per-PSM evidence and the trace maps are dead from here on; free them before the
+    // output columns are assembled so they never coexist with the Arrow arrays.
+    drop(per);
+    drop(chrom);
+    drop(ms1x);
+
     // Cross-charge corroboration features (populated directly; not per-PSM Evidence).
     fmap.insert("n_charge_states", f_n_charge);
     fmap.insert("charge_multi_flag", f_charge_multi);
     fmap.insert("cross_charge_intensity_log", f_cross_charge_int);
-
-    // Build output columns: bookkeeping + active feature list.
-    let mut cols: Vec<Col> = vec![
-        Col::U32("candidate_id".into(), cid.clone()),
-        Col::I32("peak_rank".into(), peak_rank.clone()),
-        Col::Str("label".into(), label.clone()),
-        Col::U32("base_peptide_id".into(), base.clone()),
-        Col::Str("peptidoform".into(), pform.clone()),
-        Col::Str("protein".into(), protein.clone()),
-        Col::F64("apex_rt".into(), apex_rt.clone()),
-        Col::F64("elution_lo".into(), elu_lo.clone()),
-        Col::F64("elution_hi".into(), elu_hi.clone()),
-        Col::F64("precursor_mz".into(), mz.clone()),
-        Col::F64("prelim_score".into(), prelim.clone()),
-    ];
-    for name in &cols_active {
-        let key: &str = name.as_str();
-        cols.push(Col::F64(
-            name.clone(),
-            fmap.get(key).cloned().unwrap_or_else(|| vec![0.0; n]),
-        ));
-    }
-    let rows = write_table(p.out, cols)?;
-
-    // Feature schema companion.
-    let schema_id = feature_schema_id(&cols_active);
-    mumdia_io::json::write_json(
-        &format!("{}.schema.json", p.out),
-        &FeatureSchema {
-            feature_columns: cols_active.clone(),
-            schema_id: schema_id.clone(),
-        },
-    )?;
 
     // PIN. Nothing in the pipeline reads this artifact (`rescore` builds its own PIN for
     // the sidecars); it exists for external Percolator-style tooling, so it is gated.
     // When it IS written we resolve each feature column ONCE into a slice reference and
     // stream rows from those, instead of transposing the whole matrix into a
     // Vec<Vec<f64>> first: at 1.5M rows x 387 features that transpose allocated ~4.6 GB
-    // and performed ~580M string-keyed HashMap lookups. Byte output is unchanged.
+    // and performed ~580M string-keyed HashMap lookups. Byte output is unchanged. It is
+    // written before the table because the table build below MOVES the feature columns out
+    // of the map instead of cloning them.
     if p.cfg.emit_pin {
         let empty: Vec<f64> = Vec::new();
         let fcols: Vec<&Vec<f64>> = cols_active
@@ -1091,6 +1058,41 @@ pub fn run(p: FeaturesParams) -> Result<u64> {
             "features: PIN emission disabled (features.emit_pin = false)"
         );
     }
+
+    // Build output columns: bookkeeping + active feature list. Every Vec is moved, not
+    // cloned: nothing below needs them again, and cloning the feature map alone doubled the
+    // 8 x rows x features bytes of the matrix at the moment of the write.
+    let mut cols: Vec<Col> = vec![
+        Col::U32("candidate_id".into(), cid),
+        Col::I32("peak_rank".into(), peak_rank),
+        Col::Str("label".into(), label),
+        Col::U32("base_peptide_id".into(), base),
+        Col::Str("peptidoform".into(), pform),
+        Col::Str("protein".into(), protein),
+        Col::F64("apex_rt".into(), apex_rt),
+        Col::F64("elution_lo".into(), elu_lo),
+        Col::F64("elution_hi".into(), elu_hi),
+        Col::F64("precursor_mz".into(), mz),
+        Col::F64("prelim_score".into(), prelim),
+    ];
+    for name in &cols_active {
+        cols.push(Col::F64(
+            name.clone(),
+            fmap.remove(name.as_str()).unwrap_or_else(|| vec![0.0; n]),
+        ));
+    }
+    drop(fmap);
+    let rows = write_table(p.out, cols)?;
+
+    // Feature schema companion.
+    let schema_id = feature_schema_id(&cols_active);
+    mumdia_io::json::write_json(
+        &format!("{}.schema.json", p.out),
+        &FeatureSchema {
+            feature_columns: cols_active.clone(),
+            schema_id: schema_id.clone(),
+        },
+    )?;
 
     let elapsed = t0.elapsed().as_millis();
     let mut stats = std::collections::BTreeMap::new();

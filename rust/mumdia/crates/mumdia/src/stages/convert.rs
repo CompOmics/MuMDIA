@@ -8,7 +8,7 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use mumdia_core::schema::artifact;
 use mumdia_io::report::ArtifactReport;
-use mumdia_io::table::{write_table, Col};
+use mumdia_io::table::{write_table, Col, TableWriter};
 use mzdata::prelude::*;
 use mzdata::spectrum::SignalContinuity;
 use serde_json::json;
@@ -100,20 +100,90 @@ pub struct ConvertOutputs {
     pub ms2_to_ms1: String,
 }
 
+/// Spectra per flushed chunk and per parquet row group. MS2 scans at ~2,000 peaks are
+/// ~8 MB per list column per chunk before compression, so the conversion's resident set is
+/// a few tens of MB regardless of run length.
+const SPECTRA_CHUNK: usize = 2048;
+
+/// Column accumulators for one chunk of MS1 scans. `cols()` drains them into exactly the
+/// column set `spectra_ms1.parquet` has always had.
+#[derive(Default)]
+struct Ms1Chunk {
+    idx: Vec<u32>,
+    rt: Vec<f64>,
+    mz: Vec<Vec<f32>>,
+    inten: Vec<Vec<f32>>,
+}
+
+impl Ms1Chunk {
+    fn cols(&mut self) -> Vec<Col> {
+        vec![
+            Col::U32("scan_index".into(), std::mem::take(&mut self.idx)),
+            Col::F64("rt_seconds".into(), std::mem::take(&mut self.rt)),
+            Col::ListF32("mz".into(), std::mem::take(&mut self.mz)),
+            Col::ListF32("intensity".into(), std::mem::take(&mut self.inten)),
+        ]
+    }
+}
+
+/// Column accumulators for one chunk of MS2 scans (the `spectra_ms2.parquet` columns).
+#[derive(Default)]
+struct Ms2Chunk {
+    idx: Vec<u32>,
+    id: Vec<String>,
+    rt: Vec<f64>,
+    win_id: Vec<u32>,
+    wt: Vec<f64>,
+    wl: Vec<f64>,
+    wu: Vec<f64>,
+    pmz: Vec<Option<f64>>,
+    pz: Vec<Option<i32>>,
+    mz: Vec<Vec<f32>>,
+    inten: Vec<Vec<f32>>,
+}
+
+impl Ms2Chunk {
+    fn cols(&mut self) -> Vec<Col> {
+        vec![
+            Col::U32("scan_index".into(), std::mem::take(&mut self.idx)),
+            Col::Str("id".into(), std::mem::take(&mut self.id)),
+            Col::F64("rt_seconds".into(), std::mem::take(&mut self.rt)),
+            Col::U32("window_id".into(), std::mem::take(&mut self.win_id)),
+            Col::F64("window_target".into(), std::mem::take(&mut self.wt)),
+            Col::F64("window_lower".into(), std::mem::take(&mut self.wl)),
+            Col::F64("window_upper".into(), std::mem::take(&mut self.wu)),
+            Col::OptF64("precursor_mz".into(), std::mem::take(&mut self.pmz)),
+            Col::OptI32("precursor_charge".into(), std::mem::take(&mut self.pz)),
+            Col::ListF32("mz".into(), std::mem::take(&mut self.mz)),
+            Col::ListF32("intensity".into(), std::mem::take(&mut self.inten)),
+        ]
+    }
+}
+
 pub fn run(p: ConvertParams) -> Result<ConvertOutputs> {
     let t0 = Instant::now();
     std::fs::create_dir_all(p.out_dir).ok();
     info!(mzml = p.mzml, "convert: opening mzML");
     let reader = mzdata::MZReader::open_path(p.mzml).with_context(|| format!("open {}", p.mzml))?;
 
-    // MS1 accumulators
-    let (mut ms1_idx, mut ms1_rt) = (Vec::new(), Vec::new());
-    let (mut ms1_mz, mut ms1_in): (Vec<Vec<f32>>, Vec<Vec<f32>>) = (Vec::new(), Vec::new());
-    // MS2 accumulators
-    let (mut m2_idx, mut m2_id, mut m2_rt) = (Vec::new(), Vec::new(), Vec::new());
-    let (mut m2_wt, mut m2_wl, mut m2_wu) = (Vec::new(), Vec::new(), Vec::new());
-    let (mut m2_pmz, mut m2_pz): (Vec<Option<f64>>, Vec<Option<i32>>) = (Vec::new(), Vec::new());
-    let (mut m2_mz, mut m2_in): (Vec<Vec<f32>>, Vec<Vec<f32>>) = (Vec::new(), Vec::new());
+    let ms1_path = format!("{}/spectra_ms1.parquet", p.out_dir);
+    let ms2_path = format!("{}/spectra_ms2.parquet", p.out_dir);
+    let iw_path = format!("{}/isolation_windows.parquet", p.out_dir);
+    let map_path = format!("{}/ms2_to_ms1.parquet", p.out_dir);
+
+    // Spectra stream to parquet in SPECTRA_CHUNK-scan row groups as they are decoded, so
+    // the run is never resident as a whole: the previous single `write_table` per MS level
+    // held every peak of the run, plus the encoder's copy, before the first byte reached
+    // disk. Rows and their order are unchanged; only the row-group layout differs.
+    let mut ms1_w = TableWriter::new(&ms1_path).with_row_group_rows(SPECTRA_CHUNK);
+    let mut ms2_w = TableWriter::new(&ms2_path).with_row_group_rows(SPECTRA_CHUNK);
+    let mut ms1 = Ms1Chunk::default();
+    let mut ms2 = Ms2Chunk::default();
+    // Distinct isolation windows (id, target, lower, upper); ids by first appearance in
+    // scan order, as before, now assigned on the fly.
+    let mut uniq: Vec<(u64, f64, f64, f64)> = Vec::new();
+    let mut seen: std::collections::HashMap<(u64, u64), u32> = std::collections::HashMap::new();
+    // MS2 -> preceding MS1 scan map (two ints per MS2 scan; kept whole).
     let (mut map_ms2, mut map_ms1) = (Vec::new(), Vec::new());
 
     let mut last_ms1_index: Option<u32> = None;
@@ -125,11 +195,14 @@ pub fn run(p: ConvertParams) -> Result<ConvertOutputs> {
         match spec.ms_level() {
             1 => {
                 let (mz, inten) = peaks_of(&spec, p.top_peaks_ms1);
-                ms1_idx.push(scan_index);
-                ms1_rt.push(rt_s);
-                ms1_mz.push(mz);
-                ms1_in.push(inten);
+                ms1.idx.push(scan_index);
+                ms1.rt.push(rt_s);
+                ms1.mz.push(mz);
+                ms1.inten.push(inten);
                 last_ms1_index = Some(scan_index);
+                if ms1.idx.len() >= SPECTRA_CHUNK {
+                    ms1_w.write_cols(ms1.cols())?;
+                }
             }
             2 => {
                 let (mz, inten) = peaks_of(&spec, p.top_peaks_ms2);
@@ -146,71 +219,36 @@ pub fn run(p: ConvertParams) -> Result<ConvertOutputs> {
                     Some(ion) => (Some(ion.mz), ion.charge),
                     None => (None, None),
                 };
-                m2_idx.push(scan_index);
-                m2_id.push(spec.id().to_string());
-                m2_rt.push(rt_s);
-                m2_wt.push(wt);
-                m2_wl.push(wl);
-                m2_wu.push(wu);
-                m2_pmz.push(pmz);
-                m2_pz.push(pz);
-                m2_mz.push(mz);
-                m2_in.push(inten);
+                let win_id = *seen.entry((wl.to_bits(), wu.to_bits())).or_insert_with(|| {
+                    let id = uniq.len() as u32;
+                    uniq.push((id as u64, wt, wl, wu));
+                    id
+                });
+                ms2.idx.push(scan_index);
+                ms2.id.push(spec.id().to_string());
+                ms2.rt.push(rt_s);
+                ms2.win_id.push(win_id);
+                ms2.wt.push(wt);
+                ms2.wl.push(wl);
+                ms2.wu.push(wu);
+                ms2.pmz.push(pmz);
+                ms2.pz.push(pz);
+                ms2.mz.push(mz);
+                ms2.inten.push(inten);
                 map_ms2.push(scan_index);
                 map_ms1.push(last_ms1_index.map(|x| x as i32).unwrap_or(-1));
+                if ms2.idx.len() >= SPECTRA_CHUNK {
+                    ms2_w.write_cols(ms2.cols())?;
+                }
             }
             _ => {}
         }
     }
-
-    let ms1_path = format!("{}/spectra_ms1.parquet", p.out_dir);
-    let ms2_path = format!("{}/spectra_ms2.parquet", p.out_dir);
-    let iw_path = format!("{}/isolation_windows.parquet", p.out_dir);
-    let map_path = format!("{}/ms2_to_ms1.parquet", p.out_dir);
-
-    let n_ms1 = write_table(
-        &ms1_path,
-        vec![
-            Col::U32("scan_index".into(), ms1_idx),
-            Col::F64("rt_seconds".into(), ms1_rt),
-            Col::ListF32("mz".into(), ms1_mz),
-            Col::ListF32("intensity".into(), ms1_in),
-        ],
-    )?;
-
-    // Distinct isolation windows (id, target, lower, upper).
-    let mut uniq: Vec<(u64, f64, f64, f64)> = Vec::new();
-    let mut win_id_col = Vec::with_capacity(m2_idx.len());
-    {
-        use std::collections::HashMap;
-        let mut seen: HashMap<(u64, u64), u32> = HashMap::new();
-        for i in 0..m2_idx.len() {
-            let key = (m2_wl[i].to_bits(), m2_wu[i].to_bits());
-            let id = *seen.entry(key).or_insert_with(|| {
-                let id = uniq.len() as u32;
-                uniq.push((id as u64, m2_wt[i], m2_wl[i], m2_wu[i]));
-                id
-            });
-            win_id_col.push(id);
-        }
-    }
-
-    let n_ms2 = write_table(
-        &ms2_path,
-        vec![
-            Col::U32("scan_index".into(), m2_idx),
-            Col::Str("id".into(), m2_id),
-            Col::F64("rt_seconds".into(), m2_rt),
-            Col::U32("window_id".into(), win_id_col),
-            Col::F64("window_target".into(), m2_wt),
-            Col::F64("window_lower".into(), m2_wl),
-            Col::F64("window_upper".into(), m2_wu),
-            Col::OptF64("precursor_mz".into(), m2_pmz),
-            Col::OptI32("precursor_charge".into(), m2_pz),
-            Col::ListF32("mz".into(), m2_mz),
-            Col::ListF32("intensity".into(), m2_in),
-        ],
-    )?;
+    // Final chunks (possibly empty: they fix the schema for a level with no scans).
+    ms1_w.write_cols(ms1.cols())?;
+    ms2_w.write_cols(ms2.cols())?;
+    let n_ms1 = ms1_w.close()?;
+    let n_ms2 = ms2_w.close()?;
 
     let n_iw = write_table(
         &iw_path,
@@ -265,7 +303,6 @@ pub fn run(p: ConvertParams) -> Result<ConvertOutputs> {
         ms2_to_ms1: map_path,
     })
 }
-
 fn write_reports(
     items: &[(&String, (&str, u32), u64)],
     elapsed_ms: u128,
