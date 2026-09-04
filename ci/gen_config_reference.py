@@ -38,6 +38,7 @@ from __future__ import annotations
 import argparse
 import ast
 import difflib
+import json
 import re
 import sys
 from pathlib import Path
@@ -47,6 +48,7 @@ CONFIG_RS = REPO_ROOT / "rust" / "mumdia" / "crates" / "mumdia-core" / "src" / "
 CRATES_DIR = REPO_ROOT / "rust" / "mumdia" / "crates"
 SCRIPTS_DIR = REPO_ROOT / "scripts"
 DEFAULT_OUT = REPO_ROOT / "docs" / "24_config_reference.md"
+DEFAULT_SCHEMA_OUT = REPO_ROOT / "configs" / "config-schema.json"
 GENERATOR = "ci/gen_config_reference.py"
 CONFIG_RS_REL = "rust/mumdia/crates/mumdia-core/src/config.rs"
 
@@ -1533,9 +1535,137 @@ def check(out_path: Path, generated: str) -> int:
     return 1
 
 
+
+# ---------------------------------------------------------------------------
+# Machine-readable schema, for the desktop application's settings editor
+# ---------------------------------------------------------------------------
+
+
+def build_schema() -> dict:
+    """The same parse the reference document uses, as data instead of prose.
+
+    The desktop application renders one form control per field, and it must not
+    carry its own copy of the field list, the types, the defaults or the help text:
+    a second copy is a second thing to keep in step, and the one that drifts is the
+    one a user reads. So the form is generated from this, and this is generated from
+    `config.rs`, checked for staleness in CI exactly as the Markdown is.
+
+    Every field carries the doc comment verbatim as `help`, and `gates` carries the
+    markers already used in the reference ("benchmark-gated", "experimental", ...),
+    so the interface can mark a parameter that must not be changed casually.
+    """
+    text = CONFIG_RS.read_text(encoding="utf-8")
+    structs, enums, _warnings = parse_config_rs(text)
+    sections, items = walk_sections(structs)
+
+    def field_entry(path: str, field: Field) -> dict:
+        base = base_type(field.rtype)
+        # `default_rendered` is populated by the Markdown row builder, which the
+        # schema does not run. Render it here with the same function, so the value
+        # the form shows and the value the table shows are produced by one code
+        # path and cannot disagree.
+        rendered = (
+            render_default(field.default_expr, field.rtype, enums, structs)
+            if field.default_expr is not None
+            else None
+        )
+        # `render_default` produces a Markdown cell, so an enum arrives as
+        # `` `base_peptide` `` and a number as text. The schema is data: strip the
+        # formatting and give the value its JSON type, so a form control can be
+        # populated without the interface having to unpick Markdown.
+        def typed_default(text_value: str | None, kind: str):
+            if text_value is None:
+                return None
+            v = text_value.strip().strip("`").strip()
+            # A computed default is rendered for prose as `1.0 / 3.0 (0.333333)`.
+            # The parenthesised value is the number a form needs.
+            m = re.fullmatch(r".*\(([-+0-9.eE]+)\)", v)
+            if m:
+                v = m.group(1)
+            if kind == "bool":
+                return {"true": True, "false": False}.get(v, v)
+            if kind in ("integer", "float"):
+                try:
+                    return int(v) if kind == "integer" else float(v)
+                except ValueError:
+                    return v
+            return v
+
+        kind = (
+            "enum"
+            if base in enums
+            else "bool"
+            if base == "bool"
+            else "float"
+            if base in ("f32", "f64")
+            else "integer"
+            if base in ("u8", "u16", "u32", "u64", "usize", "i8", "i16", "i32", "i64")
+            else "string"
+            if base in ("String", "str")
+            else "other"
+        )
+        entry: dict = {
+            "path": f"{path}.{field.name}" if path else field.name,
+            "name": field.name,
+            "section": path,
+            "rust_type": field.rtype,
+            "kind": kind,
+            "optional": field.rtype.startswith("Option<"),
+            "default": typed_default(rendered, kind),
+            "default_text": rendered,
+            "help": field.doc.strip(),
+            "gates": gate_markers(field.doc),
+            "source_line": field.line,
+        }
+        if base in enums:
+            entry["choices"] = [snake_case(v.name) for v in enums[base].variants]
+        return entry
+
+    fields: list[dict] = []
+    for path, _kind, struct in sections:
+        for field in struct.fields:
+            if base_type(field.rtype) in structs:
+                continue  # a nested section, not a leaf setting
+            fields.append(field_entry(path, field))
+
+    # Vec<T> item structs are reachable settings too, but they are edited as lists
+    # rather than as single controls; name them so the interface can say so instead
+    # of silently omitting them.
+    list_sections = []
+    for paths, struct in items:
+        list_sections.append(
+            {
+                "paths": paths,
+                "item": struct.name,
+                "fields": [field_entry("", f) for f in struct.fields],
+            }
+        )
+
+    return {
+        "generated_by": GENERATOR,
+        "source": CONFIG_RS_REL,
+        "sections": [p for p, _k, _s in sections],
+        "fields": fields,
+        "list_sections": list_sections,
+        "profiles": {
+            name: [{"path": p, "value": v} for p, v in changes]
+            for name, changes in parse_profiles(text).items()
+        },
+    }
+
+
+def schema_text() -> str:
+    return json.dumps(build_schema(), indent=2, ensure_ascii=False) + "\n"
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--out", default=str(DEFAULT_OUT), help="output Markdown path")
+    ap.add_argument(
+        "--schema-out",
+        default=str(DEFAULT_SCHEMA_OUT),
+        help="output JSON schema path, read by the desktop settings editor",
+    )
     ap.add_argument(
         "--check",
         action="store_true",
@@ -1548,13 +1678,38 @@ def main(argv: list[str] | None = None) -> int:
 
     generated, stats = build_document()
     out_path = Path(args.out)
+    schema = schema_text()
+    schema_path = Path(args.schema_out)
 
     if args.check:
-        return check(out_path, generated)
+        rc = check(out_path, generated)
+        # Both artifacts come from one parse of one file, so they go stale together
+        # and must be checked together.
+        current = (
+            schema_path.read_text(encoding="utf-8") if schema_path.is_file() else ""
+        )
+        if current.replace("\r\n", "\n") != schema:
+            print(
+                f"{schema_path.as_posix()} is stale. Regenerate with:\n"
+                f"    python {GENERATOR}",
+                file=sys.stderr,
+            )
+            rc = 1
+        else:
+            n = len(json.loads(schema)["fields"])
+            print(f"{schema_path.as_posix()} is up to date ({n} settings).")
+        return rc
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with open(out_path, "w", encoding="utf-8", newline="\n") as handle:
         handle.write(generated)
+    schema_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(schema_path, "w", encoding="utf-8", newline="\n") as handle:
+        handle.write(schema)
+    print(
+        f"wrote {schema_path.as_posix()}: "
+        f"{len(json.loads(schema)['fields'])} settings."
+    )
     print(
         f"wrote {out_path.as_posix()}: {len(generated.splitlines())} lines, "
         f"{generated.count(chr(10) + '## ')} sections, "

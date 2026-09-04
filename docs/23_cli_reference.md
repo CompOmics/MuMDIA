@@ -54,6 +54,7 @@ Commands:
   align           Cross-run RT alignment (experiment-level) -> alignment.parquet
   mbr             Match-between-runs identification transfer (Stage D3) -> transferred.parquet
   inspect         Print schema, head sample, and row count for any artifact
+  peak-census     Peaks per MS2 spectrum for an mzML, as JSON: percentiles plus what each candidate `--top-peaks-ms2` cap would discard
   audit           Candidate audit: reconstruct per-candidate stage flags + earliest rejection reason across the artifact chain and write candidate_audit.parquet (sensitivity program, P0.3/P0.4). Non-destructive; reruns no compute
   report          Write peptides.tsv + proteins.tsv from a scored PSM table
   doctor          Check that the configured Python sidecar environments are usable
@@ -145,16 +146,17 @@ first sentence of the description, with the full text in the section below.
 | [`align`](#align) | yes | Cross-run RT alignment (experiment-level) -> alignment.parquet |
 | [`mbr`](#mbr) | yes | Match-between-runs identification transfer (Stage D3) -> transferred.parquet |
 | [`inspect`](#inspect) | no | Print schema, head sample, and row count for any artifact |
+| [`peak-census`](#peak-census) | no | Peaks per MS2 spectrum for an mzML, as JSON: percentiles plus what each candidate `--top-peaks-ms2` cap would discard |
 | [`audit`](#audit) | no | Candidate audit: reconstruct per-candidate stage flags + earliest rejection reason across the artifact chain and write candidate_audit.parquet (sensitivity program, P0.3/P0.4). |
 | [`report`](#report) | yes | Write peptides.tsv + proteins.tsv from a scored PSM table |
 | [`doctor`](#doctor) | yes | Check that the configured Python sidecar environments are usable |
 | `help` | n/a | Print this message or the help of the given subcommand(s) |
 
-17 of the 21 documented subcommands accept `--config`:
+17 of the 22 documented subcommands accept `--config`:
  `align`, `compete`, `digest`, `doctor`, `extract`, `features`, `mbr`, `peptidoforms`, `predict-frag`, `prescan`, `quant`, `report`, `rescore`, `rt-im-train`, `run`, `run-experiment`, `search-seed`.
 
-4 do not, so every setting they use comes from their own flags:
- `audit`, `convert`, `inspect`, `quant-lfq`.
+5 do not, so every setting they use comes from their own flags:
+ `audit`, `convert`, `inspect`, `peak-census`, `quant-lfq`.
 
 ## convert
 
@@ -588,6 +590,26 @@ Arguments:
 
 Plus the 5 repeated flags removed above: see "Global flags".
 
+## peak-census
+
+```text
+Peaks per MS2 spectrum for an mzML, as JSON: percentiles plus what each candidate `--top-peaks-ms2` cap would discard.
+
+The pre-flight for a decision the documentation says must be made per acquisition. Reading it before setting a cap is the difference between bounding peak volume and deleting fragment evidence from most spectra.
+
+Usage: mumdia peak-census [OPTIONS] --mzml <MZML>
+
+Options:
+      --mzml <MZML>
+
+      --max-spectra <MAX_SPECTRA>
+          Stop after this many spectra from the head of the file (0 = all)
+
+          [default: 0]
+```
+
+Plus the 5 repeated flags removed above: see "Global flags".
+
 ## audit
 
 ```text
@@ -665,6 +687,11 @@ Usage: mumdia doctor [OPTIONS]
 
 Options:
       --config <CONFIG>
+
+      --json
+          Emit the report as JSON on stdout instead of prose on stdout.
+
+          For a caller that has to act on the result rather than read it: the desktop application renders one row per role and offers to install what is missing, which means it needs the modules and versions as data, not a paragraph to regex. The exit status is unchanged.
 ```
 
 Plus the 5 repeated flags removed above: see "Global flags".
