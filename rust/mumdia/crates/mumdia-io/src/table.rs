@@ -778,6 +778,28 @@ impl<'a> ListF32<'a> {
         self.len() == 0
     }
 
+    /// Append row `k` to `out` and return the number of values appended (0 for a null
+    /// row). The caller keeps one flat buffer plus its own offsets, so a column of tens
+    /// of millions of short traces costs one allocation instead of one per row, which
+    /// [`ListF32::row`] cannot avoid.
+    pub fn append_row(&self, k: usize, out: &mut Vec<f32>, name: &str) -> Result<usize> {
+        let v: Option<ArrayRef> = match self {
+            ListF32::Small(a) => (!a.is_null(k)).then(|| a.value(k)),
+            ListF32::Large(a) => (!a.is_null(k)).then(|| a.value(k)),
+        };
+        match v {
+            None => Ok(0),
+            Some(v) => {
+                let a = v
+                    .as_any()
+                    .downcast_ref::<Float32Array>()
+                    .ok_or_else(|| anyhow!("list '{name}' inner is not f32"))?;
+                out.extend_from_slice(a.values());
+                Ok(a.len())
+            }
+        }
+    }
+
     /// Row `k` as an owned `Vec<f32>`; a null row is empty.
     pub fn row(&self, k: usize, name: &str) -> Result<Vec<f32>> {
         let v: Option<ArrayRef> = match self {

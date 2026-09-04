@@ -9,12 +9,14 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
-use anyhow::{Context as _, Result};
+use anyhow::{anyhow, Context as _, Result};
+use arrow::array::{Array, ArrayRef, Float32Array, Float64Array, StringArray, UInt32Array};
+use arrow::record_batch::RecordBatch;
 use mumdia_core::config::{FeatureSet, FeaturesConfig};
 use mumdia_core::constants::{ppm_diff, PROTON};
 use mumdia_core::schema::artifact;
 use mumdia_io::report::ArtifactReport;
-use mumdia_io::table::{write_table, Col, TableFile};
+use mumdia_io::table::{Col, ListF32, TableFile, TableWriter};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tracing::{info, warn};
@@ -342,13 +344,17 @@ fn calibrated_rt_error(apex_rt: f64, rt_pred_cal: f64) -> f64 {
     }
 }
 
-struct ChromRow {
-    frag_name: String,
+/// One chromatogram row as the feature code sees it. The trace slices and the fragment
+/// name are borrowed from the chunk store ([`ChromChunk`]), which owns one flat buffer
+/// per array instead of a `Vec` per row, and shares one RT axis across the rows of a
+/// candidate (extract samples every fragment of a candidate on the same window grid).
+struct ChromRow<'a> {
+    frag_name: &'a str,
     frag_mz: f64,
     frag_obs_mz: f64,
     pred_int: f32,
-    rt: Vec<f32>,
-    inten: Vec<f32>,
+    rt: &'a [f32],
+    inten: &'a [f32],
 }
 
 /// Per-PSM evidence handed to the extended feature families. All arrays are
@@ -463,7 +469,7 @@ fn build_evidence(
         }
         obs_apex.push(best as f64);
         pred.push(r.pred_int as f64);
-        let (b, o, c) = parse_ion(&r.frag_name);
+        let (b, o, c) = parse_ion(r.frag_name);
         is_b.push(b);
         ordinal.push(o);
         frag_charge.push(c);
@@ -480,7 +486,7 @@ fn build_evidence(
         .map(|r| {
             let map: HashMap<u32, f32> =
                 r.rt.iter()
-                    .zip(&r.inten)
+                    .zip(r.inten.iter())
                     .map(|(&t, &v)| (t.to_bits(), v))
                     .collect();
             axis_full
@@ -559,7 +565,7 @@ fn build_evidence(
             if let Some(r) = ms1_rows.iter().find(|r| r.frag_name == name) {
                 let map: HashMap<u32, f32> =
                     r.rt.iter()
-                        .zip(&r.inten)
+                        .zip(r.inten.iter())
                         .map(|(&t, &v)| (t.to_bits(), v))
                         .collect();
                 let full: Vec<f64> = axis_full
@@ -628,7 +634,605 @@ pub struct FeaturesParams<'a> {
     pub config_hash: &'a str,
 }
 
+/// Chromatogram rows resident at once in the chunked feature pass. At the ~200-point
+/// traces of a 2 h gradient a chunk of 2^20 rows is about 1 GiB of trace payload; the
+/// whole-run store this replaced held 62.7 GiB at 31.1M rows on the HYE benchmark.
+const CHUNK_CHROM_ROWS: usize = 1 << 20;
+
+/// Rows per parquet row group of the features table: the encoder buffers
+/// `rows x n_features x 8` bytes, so 2^16 rows of the 387-feature Extended set is
+/// ~200 MB in flight instead of the writer default's ~3 GB.
+const FEATURE_ROW_GROUP_ROWS: usize = 1 << 16;
+
+/// Rows per decoded chromatogram batch. Matches the list-column batch size of the IO
+/// layer, so a batch is tens of MB whatever the chunk size is.
+const CHROM_BATCH_ROWS: usize = 1 << 12;
+
+/// Interned fragment names. A chromatogram table has tens of millions of rows but only
+/// a few dozen distinct names (`y1`..`y30`, `b1`.., `ms1_mono`..), so rows carry a name
+/// id and each string is stored once.
+#[derive(Default)]
+struct NameTab {
+    ids: HashMap<String, u32>,
+    names: Vec<String>,
+}
+
+impl NameTab {
+    fn intern(&mut self, s: &str) -> u32 {
+        if let Some(&i) = self.ids.get(s) {
+            return i;
+        }
+        let i = self.names.len() as u32;
+        self.names.push(s.to_string());
+        self.ids.insert(s.to_string(), i);
+        i
+    }
+
+    fn get(&self, id: u32) -> &str {
+        &self.names[id as usize]
+    }
+}
+
+/// Marker for an empty trace: the row carries no RT axis at all (extract emits an empty
+/// trace, not a zero-filled one, for a predicted fragment that was never observed).
+const NO_AXIS: u32 = u32::MAX;
+
+/// One flat set of chromatogram rows (fragments, or the MS1 isotope XICs), grouped by
+/// candidate. One allocation per array instead of two `Vec`s per row.
+#[derive(Default)]
+struct RowSet {
+    name_id: Vec<u32>,
+    frag_mz: Vec<f64>,
+    frag_obs_mz: Vec<f64>,
+    pred_int: Vec<f32>,
+    /// Index into [`ChromChunk::axis_off`], or [`NO_AXIS`] for an empty trace.
+    axis_id: Vec<u32>,
+    /// Row `r`'s intensities are `int_vals[int_off[r]..int_off[r + 1]]`.
+    int_off: Vec<usize>,
+    int_vals: Vec<f32>,
+    /// Candidate `c`'s rows are `cand_off[c]..cand_off[c + 1]`.
+    cand_off: Vec<usize>,
+}
+
+impl RowSet {
+    fn new() -> RowSet {
+        RowSet {
+            int_off: vec![0],
+            cand_off: vec![0],
+            ..Default::default()
+        }
+    }
+
+    fn nrows(&self) -> usize {
+        self.name_id.len()
+    }
+
+    fn payload_bytes(&self) -> usize {
+        crate::memlog::bytes_of(&self.name_id)
+            + crate::memlog::bytes_of(&self.frag_mz)
+            + crate::memlog::bytes_of(&self.frag_obs_mz)
+            + crate::memlog::bytes_of(&self.pred_int)
+            + crate::memlog::bytes_of(&self.axis_id)
+            + crate::memlog::bytes_of(&self.int_off)
+            + crate::memlog::bytes_of(&self.int_vals)
+            + crate::memlog::bytes_of(&self.cand_off)
+    }
+}
+
+/// One chunk of the chromatogram table: a contiguous run of candidates, with the RT axis
+/// shared by every row of a candidate that samples the same grid (extract's window-grid
+/// mode gives every fragment of a candidate the identical axis, so this halves the store)
+/// and one flat buffer per array.
+#[derive(Default)]
+struct ChromChunk {
+    /// Candidate ids in table order.
+    cids: Vec<u32>,
+    index: HashMap<u32, usize>,
+    frag: RowSet,
+    ms1: RowSet,
+    /// Axis `a` is `axis_vals[axis_off[a]..axis_off[a + 1]]`.
+    axis_off: Vec<usize>,
+    axis_vals: Vec<f32>,
+    /// First axis of the candidate being filled, so dedup only compares within it.
+    open_axis_lo: usize,
+}
+
+impl ChromChunk {
+    fn new() -> ChromChunk {
+        ChromChunk {
+            frag: RowSet::new(),
+            ms1: RowSet::new(),
+            axis_off: vec![0],
+            ..Default::default()
+        }
+    }
+
+    fn open_candidate(&mut self, cid: u32) {
+        self.index.insert(cid, self.cids.len());
+        self.cids.push(cid);
+        self.open_axis_lo = self.axis_off.len() - 1;
+    }
+
+    fn close_candidate(&mut self) {
+        self.frag.cand_off.push(self.frag.nrows());
+        self.ms1.cand_off.push(self.ms1.nrows());
+    }
+
+    /// Store `rt` as an axis id, reusing an axis already stored for the open candidate
+    /// when the values are identical (the common case: one grid per candidate).
+    fn axis_for(&mut self, rt: &[f32]) -> u32 {
+        if rt.is_empty() {
+            return NO_AXIS;
+        }
+        for a in self.open_axis_lo..self.axis_off.len() - 1 {
+            let (lo, hi) = (self.axis_off[a], self.axis_off[a + 1]);
+            if hi - lo == rt.len() && self.axis_vals[lo..hi] == *rt {
+                return a as u32;
+            }
+        }
+        self.axis_vals.extend_from_slice(rt);
+        self.axis_off.push(self.axis_vals.len());
+        (self.axis_off.len() - 2) as u32
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn push_row(
+        &mut self,
+        is_ms1: bool,
+        name_id: u32,
+        frag_mz: f64,
+        frag_obs_mz: f64,
+        pred_int: f32,
+        rt: &[f32],
+        inten: &[f32],
+    ) {
+        let axis_id = self.axis_for(rt);
+        let set = if is_ms1 {
+            &mut self.ms1
+        } else {
+            &mut self.frag
+        };
+        set.name_id.push(name_id);
+        set.frag_mz.push(frag_mz);
+        set.frag_obs_mz.push(frag_obs_mz);
+        set.pred_int.push(pred_int);
+        set.axis_id.push(axis_id);
+        set.int_vals.extend_from_slice(inten);
+        set.int_off.push(set.int_vals.len());
+    }
+
+    fn axis(&self, id: u32) -> &[f32] {
+        if id == NO_AXIS {
+            return &[];
+        }
+        let a = id as usize;
+        &self.axis_vals[self.axis_off[a]..self.axis_off[a + 1]]
+    }
+
+    /// Candidate `ci`'s rows of one set as the borrowed view the feature code takes.
+    fn rows<'a>(&'a self, set: &'a RowSet, ci: usize, names: &'a NameTab) -> Vec<ChromRow<'a>> {
+        (set.cand_off[ci]..set.cand_off[ci + 1])
+            .map(|r| ChromRow {
+                frag_name: names.get(set.name_id[r]),
+                frag_mz: set.frag_mz[r],
+                frag_obs_mz: set.frag_obs_mz[r],
+                pred_int: set.pred_int[r],
+                rt: self.axis(set.axis_id[r]),
+                inten: &set.int_vals[set.int_off[r]..set.int_off[r + 1]],
+            })
+            .collect()
+    }
+
+    fn payload_bytes(&self) -> (usize, usize) {
+        let axes =
+            crate::memlog::bytes_of(&self.axis_vals) + crate::memlog::bytes_of(&self.axis_off);
+        (self.frag.payload_bytes() + axes, self.ms1.payload_bytes())
+    }
+}
+
+/// Sequential reader over the chromatogram table that hands out one [`ChromChunk`] of a
+/// requested row count at a time. One decoded batch is resident beyond the chunk; a batch
+/// straddling a chunk boundary is sliced and its remainder kept for the next chunk.
+struct ChromStream {
+    inner: mumdia_io::table::BatchReader,
+    pending: Option<RecordBatch>,
+    has_obs_mz: bool,
+}
+
+impl ChromStream {
+    fn open(ch: &TableFile, path: &str) -> Result<ChromStream> {
+        let has_obs_mz = mumdia_io::table::column_names(path)?
+            .iter()
+            .any(|c| c == "frag_obs_mz");
+        let mut cols = vec![
+            "candidate_id",
+            "frag_name",
+            "frag_mz",
+            "predicted_intensity",
+            "rt",
+            "intensity",
+        ];
+        if has_obs_mz {
+            cols.push("frag_obs_mz");
+        }
+        Ok(ChromStream {
+            inner: ch.batches(Some(&cols), CHROM_BATCH_ROWS)?,
+            pending: None,
+            has_obs_mz,
+        })
+    }
+
+    fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
+        if let Some(b) = self.pending.take() {
+            return Ok(Some(b));
+        }
+        match self.inner.next() {
+            None => Ok(None),
+            Some(b) => Ok(Some(b?)),
+        }
+    }
+
+    /// Read exactly `want` rows into a chunk. `names` is shared across chunks so the same
+    /// fragment name interns to the same id for the whole run.
+    fn read_chunk(&mut self, want: usize, names: &mut NameTab) -> Result<ChromChunk> {
+        self.read_chunk_filtered(want, names, None)
+    }
+
+    /// [`ChromStream::read_chunk`], keeping only the candidates in `keep`. The rows of a
+    /// dropped candidate are still decoded (parquet gives no cheaper way to skip a row
+    /// inside a page) but never copied, which is what makes the global-bounds pass over
+    /// the whole table affordable: it needs a few thousand confident candidates.
+    fn read_chunk_filtered(
+        &mut self,
+        want: usize,
+        names: &mut NameTab,
+        keep: Option<&std::collections::HashSet<u32>>,
+    ) -> Result<ChromChunk> {
+        let mut chunk = ChromChunk::new();
+        let mut open: Option<u32> = None;
+        let mut taken = 0usize;
+        while taken < want {
+            let b = match self.next_batch()? {
+                Some(b) => b,
+                None => break,
+            };
+            let n = b.num_rows().min(want - taken);
+            if n < b.num_rows() {
+                self.pending = Some(b.slice(n, b.num_rows() - n));
+            }
+            let s = b.schema();
+            let col = |name: &str| -> Result<&ArrayRef> {
+                let i = s
+                    .index_of(name)
+                    .map_err(|_| anyhow!("chromatograms batch has no column '{name}'"))?;
+                Ok(b.column(i))
+            };
+            let cid = col("candidate_id")?
+                .as_any()
+                .downcast_ref::<UInt32Array>()
+                .ok_or_else(|| anyhow!("chromatograms column 'candidate_id' is not u32"))?;
+            let name = col("frag_name")?
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| anyhow!("chromatograms column 'frag_name' is not utf8"))?;
+            let fmz = col("frag_mz")?
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .ok_or_else(|| anyhow!("chromatograms column 'frag_mz' is not f64"))?;
+            let obsmz = if self.has_obs_mz {
+                Some(
+                    col("frag_obs_mz")?
+                        .as_any()
+                        .downcast_ref::<Float64Array>()
+                        .ok_or_else(|| anyhow!("chromatograms column 'frag_obs_mz' is not f64"))?,
+                )
+            } else {
+                None
+            };
+            let pint = col("predicted_intensity")?
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .ok_or_else(|| anyhow!("chromatograms column 'predicted_intensity' is not f32"))?;
+            let rt = ListF32::of(col("rt")?, "rt")?;
+            let inten = ListF32::of(col("intensity")?, "intensity")?;
+            // Trace values are appended into scratch buffers and then copied into the
+            // chunk, because the axis is deduplicated against the candidate's earlier
+            // rows before it is stored.
+            let mut rt_buf: Vec<f32> = Vec::new();
+            let mut int_buf: Vec<f32> = Vec::new();
+            for k in 0..n {
+                let c = cid.value(k);
+                if keep.is_some_and(|s| !s.contains(&c)) {
+                    continue;
+                }
+                if open != Some(c) {
+                    if open.is_some() {
+                        chunk.close_candidate();
+                    }
+                    chunk.open_candidate(c);
+                    open = Some(c);
+                }
+                rt_buf.clear();
+                int_buf.clear();
+                rt.append_row(k, &mut rt_buf, "rt")?;
+                inten.append_row(k, &mut int_buf, "intensity")?;
+                let nm = name.value(k);
+                let id = names.intern(nm);
+                chunk.push_row(
+                    nm.starts_with("ms1_"),
+                    id,
+                    fmz.value(k),
+                    obsmz.map(|a| a.value(k)).unwrap_or_else(|| fmz.value(k)),
+                    pint.value(k),
+                    &rt_buf,
+                    &int_buf,
+                );
+            }
+            taken += n;
+        }
+        if open.is_some() {
+            chunk.close_candidate();
+        }
+        Ok(chunk)
+    }
+}
+
+/// One unit of work: a contiguous run of PSM rows and the chromatogram rows they own.
+#[derive(Debug)]
+struct Chunk {
+    psm_lo: usize,
+    psm_hi: usize,
+    chrom_rows: usize,
+}
+
+/// Split the run into chunks that never cut a candidate.
+///
+/// Extract emits a PSM row and that row's chromatogram rows in one pass, so both tables
+/// carry the same candidates in the same order and each candidate's rows are contiguous
+/// (`extract.rs`, the per-candidate emission loop). The chunked pass depends on that, so
+/// it is verified here rather than assumed: a violation is a hard error naming the
+/// artifact, not a silently mis-joined feature table.
+fn plan_chunks(
+    psm_cid: &[u32],
+    ch_cid: &[u32],
+    chrom_path: &str,
+    chunk_rows: usize,
+) -> Result<Vec<Chunk>> {
+    // Run-length groups of both tables, with a contiguity check on each.
+    let groups = |v: &[u32], what: &str| -> Result<Vec<(u32, usize, usize)>> {
+        let mut out: Vec<(u32, usize, usize)> = Vec::new();
+        let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        let mut i = 0usize;
+        while i < v.len() {
+            let c = v[i];
+            let lo = i;
+            while i < v.len() && v[i] == c {
+                i += 1;
+            }
+            if !seen.insert(c) {
+                return Err(anyhow!(
+                    "{what}: candidate {c} appears in more than one run; the chunked \
+                     feature pass needs each candidate's rows contiguous. Re-run extract \
+                     to regenerate {chrom_path} and psms_extracted.parquet."
+                ));
+            }
+            out.push((c, lo, i - lo));
+        }
+        Ok(out)
+    };
+    let pg = groups(psm_cid, "psms_extracted.parquet")?;
+    let cg = groups(ch_cid, chrom_path)?;
+
+    // The chromatogram candidates must be a subsequence of the PSM candidates, in order
+    // (a PSM row can have no chromatogram rows; the reverse cannot happen).
+    let mut chunks: Vec<Chunk> = Vec::new();
+    let mut ci = 0usize;
+    let (mut lo, mut acc) = (0usize, 0usize);
+    for (gi, &(pc, plo, plen)) in pg.iter().enumerate() {
+        if ci < cg.len() && cg[ci].0 == pc {
+            acc += cg[ci].2;
+            ci += 1;
+        }
+        let last = gi + 1 == pg.len();
+        if acc >= chunk_rows || last {
+            chunks.push(Chunk {
+                psm_lo: lo,
+                psm_hi: plo + plen,
+                chrom_rows: acc,
+            });
+            lo = plo + plen;
+            acc = 0;
+        }
+    }
+    if ci != cg.len() {
+        return Err(anyhow!(
+            "{chrom_path} holds candidate {} which is not in psms_extracted.parquet in \
+             table order; the chunked feature pass needs both tables emitted by the same \
+             extract run.",
+            cg[ci].0
+        ));
+    }
+    if chunks.is_empty() {
+        chunks.push(Chunk {
+            psm_lo: 0,
+            psm_hi: psm_cid.len(),
+            chrom_rows: 0,
+        });
+    }
+    Ok(chunks)
+}
+
+/// Feature values of one chunk, column-major in one flat buffer: `vals[c * rows + r]`.
+/// Replaces the `HashMap<&str, Vec<f64>>` that held one `Vec` per feature for the whole
+/// run (7.5 GiB at 2.6M rows x 387 features). A column is contiguous, so handing it to
+/// the writer is one copy and no transpose.
+struct ValueMatrix {
+    idx: HashMap<String, usize>,
+    rows: usize,
+    vals: Vec<f64>,
+}
+
+impl ValueMatrix {
+    fn new(cols: &[String], rows: usize) -> ValueMatrix {
+        ValueMatrix {
+            idx: cols
+                .iter()
+                .enumerate()
+                .map(|(i, c)| (c.clone(), i))
+                .collect(),
+            rows,
+            vals: vec![0.0; cols.len() * rows],
+        }
+    }
+
+    /// Set feature `name` for chunk-local row `r`. A name outside the active set is
+    /// dropped, exactly as the old map was filtered by `cols_active` at write time.
+    fn set(&mut self, name: &str, r: usize, v: f64) {
+        if let Some(&c) = self.idx.get(name) {
+            self.vals[c * self.rows + r] = v;
+        }
+    }
+
+    fn column(&self, c: usize) -> &[f64] {
+        &self.vals[c * self.rows..(c + 1) * self.rows]
+    }
+
+    fn payload_bytes(&self) -> usize {
+        crate::memlog::bytes_of(&self.vals)
+    }
+}
+
+/// Percolator-style PIN written row by row as the chunks are computed. Nothing in the
+/// pipeline reads it (rescore builds its own), so it is gated by `features.emit_pin`;
+/// the byte output is unchanged from the single-shot writer it replaced.
+struct PinWriter {
+    w: std::io::BufWriter<std::fs::File>,
+}
+
+impl PinWriter {
+    fn create(path: &str, feature_cols: &[String]) -> Result<PinWriter> {
+        use std::io::Write as _;
+        if let Some(parent) = std::path::Path::new(path).parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        let mut w = std::io::BufWriter::new(std::fs::File::create(path)?);
+        w.write_all(b"SpecId\tLabel\tScanNr\tExpMass\tCalcMass\t")?;
+        w.write_all(feature_cols.join("\t").as_bytes())?;
+        w.write_all(b"\tPeptide\tProteins\n")?;
+        Ok(PinWriter { w })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn write_chunk(
+        &mut self,
+        n_cols: usize,
+        m: &ValueMatrix,
+        cid: &[u32],
+        label: &[String],
+        pform: &[String],
+        protein: &[String],
+        mz: &[f64],
+    ) -> Result<()> {
+        use std::io::Write as _;
+        for i in 0..cid.len() {
+            let lab = if label[i] == "decoy" { -1 } else { 1 };
+            write!(
+                self.w,
+                "cand_{}\t{}\t{}\t{:.5}\t{:.5}\t",
+                cid[i], lab, cid[i], mz[i], mz[i]
+            )?;
+            for c in 0..n_cols {
+                let v = m.column(c)[i];
+                write!(self.w, "{v:.6}\t")?;
+            }
+            writeln!(self.w, "-.{}.-\t{}", pform[i], protein[i])?;
+        }
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<()> {
+        use std::io::Write as _;
+        self.w.flush()?;
+        Ok(())
+    }
+}
+
+/// Global elution half-widths from the confident set, computed in one streaming pass that
+/// holds a single candidate's rows at a time. Returns None when fewer than 20 confident
+/// anchors have a resolvable peak (the caller then keeps per-candidate detection).
+fn confident_global_bounds(
+    ch: &TableFile,
+    chrom_path: &str,
+    confident_rows: &HashMap<u32, Vec<usize>>,
+    apex_rt: &[f64],
+    cfg: &FeaturesConfig,
+    chunk_rows: usize,
+) -> Result<Option<(f64, f64)>> {
+    let mut lefts: Vec<f64> = Vec::new();
+    let mut rights: Vec<f64> = Vec::new();
+    let mut names = NameTab::default();
+    let mut stream = ChromStream::open(ch, chrom_path)?;
+    let keep: std::collections::HashSet<u32> = confident_rows.keys().copied().collect();
+    // Chunk reading already groups rows by candidate, so this reuses it and keeps only
+    // the confident candidates' rows long enough to bound their peak.
+    let mut read = 0usize;
+    while read < ch.nrows {
+        let chunk = stream.read_chunk_filtered(chunk_rows, &mut names, Some(&keep))?;
+        read += chunk_rows;
+        for (ci, &c) in chunk.cids.iter().enumerate() {
+            let Some(psm_rows) = confident_rows.get(&c) else {
+                continue;
+            };
+            let rows = chunk.rows(&chunk.frag, ci, &names);
+            if rows.is_empty() {
+                continue;
+            }
+            for &i in psm_rows {
+                if let Some((lo, hi)) = elution_peak_rt_bounds(
+                    &rows,
+                    apex_rt[i],
+                    cfg.bound_peak_fraction,
+                    cfg.bound_peak_grace,
+                ) {
+                    let l = apex_rt[i] - lo as f64;
+                    let r = hi as f64 - apex_rt[i];
+                    if l >= 0.0 && r >= 0.0 {
+                        lefts.push(l);
+                        rights.push(r);
+                    }
+                }
+            }
+        }
+    }
+    if lefts.len() >= 20 {
+        let q = (cfg.bound_confident_pct / 100.0).clamp(0.0, 1.0);
+        let (l, r) = (percentile(&lefts, q), percentile(&rights, q));
+        info!(
+            n_confident = lefts.len(),
+            left_hw_s = l,
+            right_hw_s = r,
+            pct = cfg.bound_confident_pct,
+            "features: global elution half-widths from confident set"
+        );
+        Ok(Some((l, r)))
+    } else {
+        warn!(
+            n_confident = lefts.len(),
+            "features: bound_from_confident set but < 20 confident anchors; \
+             falling back to per-candidate boundary"
+        );
+        Ok(None)
+    }
+}
+
 pub fn run(p: FeaturesParams) -> Result<u64> {
+    run_with_chunk_rows(p, CHUNK_CHROM_ROWS)
+}
+
+/// [`run`] with an explicit chunk size. Only the chunk boundaries change with it: the
+/// feature values, the row order and the PIN bytes do not, which is what the
+/// `features_chunking_is_value_preserving` test asserts by hashing both artifacts.
+pub fn run_with_chunk_rows(p: FeaturesParams, chunk_rows: usize) -> Result<u64> {
     let t0 = Instant::now();
     let ps = TableFile::open(p.psms)?;
     let cid = ps.u32("candidate_id")?;
@@ -689,73 +1293,17 @@ pub fn run(p: FeaturesParams) -> Result<u64> {
         .opt_f64("ms1_iso2")
         .unwrap_or_else(|_| vec![None; ps.nrows]);
 
-    // Group chromatograms by candidate. The table is the largest artifact of the run: each
-    // getter streams its own column (nothing else is decoded), and the trace Vecs are MOVED
-    // into the rows rather than cloned, so the traces exist once here instead of three
-    // times (Arrow batches, owned column, cloned row).
+    // The chromatogram table is the largest artifact of the run: 62.7 GiB of traces at
+    // 2.6M candidates on the HYE benchmark, where the whole store used to be materialised
+    // before the first feature was computed. It is now processed in chunks of
+    // CHUNK_CHROM_ROWS rows, so what is resident is one chunk of traces (about 1 GiB) plus
+    // that chunk's feature values. The plan below fixes the chunk boundaries from the
+    // candidate_id column alone, which is the only part of the table read up front.
     let ch = TableFile::open(p.chromatograms)?;
     let ch_cid = ch.u32("candidate_id")?;
-    let mut ch_name = ch.str("frag_name")?;
-    let ch_fmz = ch.f64("frag_mz")?;
-    let ch_obsmz = ch.f64("frag_obs_mz").unwrap_or_else(|_| ch_fmz.clone());
-    let ch_pint = ch.f32("predicted_intensity")?;
-    let ch_rt = ch.list_f32("rt")?;
-    let ch_int = ch.list_f32("intensity")?;
-    let mut chrom: HashMap<u32, Vec<ChromRow>> = HashMap::new();
-    // MS1 isotope XIC rows (frag_name "ms1_mono"/"ms1_iso1"/"ms1_iso2") are kept
-    // separate so they never enter the fragment-based features; they feed the
-    // extended MS1-profile family via Evidence.ms1_xic. Absent in older artifacts.
-    let mut ms1x: HashMap<u32, Vec<ChromRow>> = HashMap::new();
-    for (i, (rt, inten)) in ch_rt.into_iter().zip(ch_int).enumerate() {
-        let is_ms1 = ch_name[i].starts_with("ms1_");
-        let row = ChromRow {
-            frag_name: std::mem::take(&mut ch_name[i]),
-            frag_mz: ch_fmz[i],
-            frag_obs_mz: ch_obsmz[i],
-            pred_int: ch_pint[i],
-            rt,
-            inten,
-        };
-        if is_ms1 {
-            ms1x.entry(ch_cid[i]).or_default().push(row);
-        } else {
-            chrom.entry(ch_cid[i]).or_default().push(row);
-        }
-    }
-    drop((ch_cid, ch_name, ch_fmz, ch_obsmz, ch_pint));
-    {
-        // Traces of the whole run, grouped by candidate: the structure the audit ranks
-        // third, and the one plan item 3.4 (chunked features) would remove.
-        let store = |m: &HashMap<u32, Vec<ChromRow>>| -> (usize, usize) {
-            let mut rows = 0usize;
-            let mut bytes = 0usize;
-            for v in m.values() {
-                rows += v.len();
-                bytes += std::mem::size_of_val(v.as_slice());
-                for r in v {
-                    bytes += crate::memlog::bytes_of(&r.rt)
-                        + crate::memlog::bytes_of(&r.inten)
-                        + r.frag_name.len();
-                }
-            }
-            (rows, bytes)
-        };
-        let (frag_rows, frag_bytes) = store(&chrom);
-        let (ms1_rows, ms1_bytes) = store(&ms1x);
-        crate::memlog::report(
-            "features chromatogram store",
-            &[
-                ("fragment_traces", frag_bytes),
-                ("ms1_xic_traces", ms1_bytes),
-            ],
-        );
-        info!(
-            candidates = chrom.len(),
-            fragment_rows = frag_rows,
-            ms1_rows = ms1_rows,
-            "mem: features chromatogram store shape"
-        );
-    }
+    let chrom_rows_total = ch_cid.len();
+    let chunks = plan_chunks(&cid, &ch_cid, p.chromatograms, chunk_rows.max(1))?;
+    drop(ch_cid);
 
     // Seed corroboration maps (candidate_id -> seed score / identified flag) plus the
     // confident-target candidate set (spectrum_q <= 0.01, label == target) used to
@@ -794,49 +1342,24 @@ pub fn run(p: FeaturesParams) -> Result<u64> {
     // Global elution half-widths learned once from the confident set. Some((L, R)) in
     // seconds when `bound_from_confident` and >= 20 confident anchors have a resolvable
     // peak; then every candidate's feature region is [apex - L, apex + R]. None keeps
-    // the per-candidate boundary detection (default).
+    // the per-candidate boundary detection (default). This is a global quantity, so it
+    // costs one extra streaming pass over the chromatogram table before the chunked pass
+    // below; only the confident candidates' rows are ever held.
     let global_bounds: Option<(f64, f64)> = if p.cfg.bound_from_confident {
-        let mut lefts: Vec<f64> = Vec::new();
-        let mut rights: Vec<f64> = Vec::new();
-        for i in 0..ps.nrows {
-            if !confident_cids.contains(&cid[i]) {
-                continue;
-            }
-            if let Some(rows) = chrom.get(&cid[i]) {
-                if let Some((lo, hi)) = elution_peak_rt_bounds(
-                    rows,
-                    apex_rt[i],
-                    p.cfg.bound_peak_fraction,
-                    p.cfg.bound_peak_grace,
-                ) {
-                    let l = apex_rt[i] - lo as f64;
-                    let r = hi as f64 - apex_rt[i];
-                    if l >= 0.0 && r >= 0.0 {
-                        lefts.push(l);
-                        rights.push(r);
-                    }
-                }
+        let mut confident_rows: HashMap<u32, Vec<usize>> = HashMap::new();
+        for (i, &c) in cid.iter().enumerate() {
+            if confident_cids.contains(&c) {
+                confident_rows.entry(c).or_default().push(i);
             }
         }
-        if lefts.len() >= 20 {
-            let q = (p.cfg.bound_confident_pct / 100.0).clamp(0.0, 1.0);
-            let (l, r) = (percentile(&lefts, q), percentile(&rights, q));
-            info!(
-                n_confident = lefts.len(),
-                left_hw_s = l,
-                right_hw_s = r,
-                pct = p.cfg.bound_confident_pct,
-                "features: global elution half-widths from confident set"
-            );
-            Some((l, r))
-        } else {
-            warn!(
-                n_confident = lefts.len(),
-                "features: bound_from_confident set but < 20 confident anchors; \
-                 falling back to per-candidate boundary"
-            );
-            None
-        }
+        confident_global_bounds(
+            &ch,
+            p.chromatograms,
+            &confident_rows,
+            &apex_rt,
+            p.cfg,
+            chunk_rows.max(1),
+        )?
     } else {
         None
     };
@@ -850,7 +1373,8 @@ pub fn run(p: FeaturesParams) -> Result<u64> {
     // independent; DECOY_ peptidoforms group among themselves, so this is not a
     // target/decoy label leak). A real peptide co-occurs at multiple charge states
     // more than a shift decoy, and this evidence axis is invisible to the per-PSM
-    // Evidence families since each charge is a separate candidate.
+    // Evidence families since each charge is a separate candidate. It is a whole-run
+    // reduction over PSM columns only, so it is computed before the chunk loop.
     let mut pf_charges: HashMap<&str, std::collections::HashSet<i32>> = HashMap::new();
     let mut pf_int: HashMap<&str, f64> = HashMap::new();
     for i in 0..n {
@@ -872,50 +1396,83 @@ pub fn run(p: FeaturesParams) -> Result<u64> {
     let f_cross_charge_int: Vec<f64> = (0..n)
         .map(|i| (1.0 + (pf_int[pform[i].as_str()] - apex_int[i] as f64).max(0.0)).ln())
         .collect();
+    drop((pf_charges, pf_int));
 
-    // Compute the full feature superset into a name->values map.
-    let mut fmap: HashMap<&str, Vec<f64>> = HashMap::new();
-    let push = |m: &mut HashMap<&str, Vec<f64>>, k: &'static str, v: f64| {
-        m.entry(k).or_insert_with(|| Vec::with_capacity(n)).push(v);
-    };
-    let mut prelim = vec![0.0f64; n];
-    let mut elu_lo = vec![0.0f64; n];
-    let mut elu_hi = vec![0.0f64; n];
     let extended = matches!(p.cfg.set, FeatureSet::Extended);
     let ext_names = extended_name_refs();
 
     // The two expensive per-PSM computations (`fragment_features` and, when the
     // extended set is active, `build_evidence` + `extended_values`) are pure
-    // functions of that PSM's own inputs, so precompute them in parallel and
-    // index by row. Collecting into a Vec preserves row order; the serial
-    // assembly below reads `per[i]` and is otherwise byte-for-byte unchanged, so
-    // fmap / prelim / output columns are identical to the serial version.
+    // functions of that PSM's own inputs, so they are computed in parallel over the
+    // chunk and indexed by row. The serial assembly below reads `per[r]` and is
+    // otherwise unchanged, so the feature values are identical to the whole-run
+    // version this replaced.
     struct PerPsm {
         ff: FragFeatures,
         ext: Vec<f64>,
     }
-    let per: Vec<PerPsm> = (0..n)
-        .into_par_iter()
-        .map(|i| {
-            let ff = match chrom.get(&cid[i]) {
-                Some(rows) if !rows.is_empty() => fragment_features(
-                    rows,
-                    apex_rt[i],
-                    p.cfg.coelution_corr_threshold,
-                    p.cfg.bound_features,
-                    p.cfg.bound_peak_fraction,
-                    p.cfg.bound_peak_grace,
-                    global_bounds,
-                ),
-                _ => FragFeatures::default(),
-            };
-            let ext = if extended {
-                match chrom.get(&cid[i]) {
-                    Some(rows) if !rows.is_empty() => {
-                        let ms1_rows = ms1x.get(&cid[i]).map(|v| v.as_slice()).unwrap_or(&[]);
+
+    let mut writer = TableWriter::new(p.out).with_row_group_rows(FEATURE_ROW_GROUP_ROWS);
+    let mut pin = if p.cfg.emit_pin {
+        Some(PinWriter::create(p.out_pin, &cols_active)?)
+    } else {
+        tracing::debug!(
+            path = %p.out_pin,
+            "features: PIN emission disabled (features.emit_pin = false)"
+        );
+        None
+    };
+    let mut stream = ChromStream::open(&ch, p.chromatograms)?;
+    let mut names = NameTab::default();
+    // Accounting for the audit (docs/27): the largest chunk in flight against the run
+    // total streamed is exactly the quantity chunking changes.
+    let (mut max_frag_bytes, mut max_ms1_bytes, mut max_matrix_bytes) = (0usize, 0usize, 0usize);
+    let (mut tot_frag_bytes, mut tot_ms1_bytes) = (0usize, 0usize);
+    let (mut n_cand, mut n_frag_rows, mut n_ms1_rows) = (0usize, 0usize, 0usize);
+
+    for chunk in &chunks {
+        let store = stream.read_chunk(chunk.chrom_rows, &mut names)?;
+        let (lo, hi) = (chunk.psm_lo, chunk.psm_hi);
+        let rows_in_chunk = hi - lo;
+        let (fb, mb) = store.payload_bytes();
+        max_frag_bytes = max_frag_bytes.max(fb);
+        max_ms1_bytes = max_ms1_bytes.max(mb);
+        tot_frag_bytes += fb;
+        tot_ms1_bytes += mb;
+        n_cand += store.cids.len();
+        n_frag_rows += store.frag.nrows();
+        n_ms1_rows += store.ms1.nrows();
+
+        let per: Vec<PerPsm> = (lo..hi)
+            .into_par_iter()
+            .map(|i| {
+                let ci = store.index.get(&cid[i]).copied();
+                let rows = ci
+                    .map(|c| store.rows(&store.frag, c, &names))
+                    .unwrap_or_default();
+                let ff = if rows.is_empty() {
+                    FragFeatures::default()
+                } else {
+                    fragment_features(
+                        &rows,
+                        apex_rt[i],
+                        p.cfg.coelution_corr_threshold,
+                        p.cfg.bound_features,
+                        p.cfg.bound_peak_fraction,
+                        p.cfg.bound_peak_grace,
+                        global_bounds,
+                    )
+                };
+                let ext = if extended {
+                    if rows.is_empty() {
+                        vec![0.0; ext_names.len()]
+                    } else {
+                        let ms1_rows = ci
+                            .map(|c| store.rows(&store.ms1, c, &names))
+                            .unwrap_or_default();
                         let mut ev = build_evidence(
-                            rows,
-                            ms1_rows,
+                            &rows,
+                            &ms1_rows,
                             apex_rt[i],
                             p.cfg.bound_peak_fraction,
                             p.cfg.bound_peak_grace,
@@ -944,188 +1501,169 @@ pub fn run(p: FeaturesParams) -> Result<u64> {
                         ev.deconv_shadow = deconv_sha[i] as f64;
                         extended_values(&ev)
                     }
-                    _ => vec![0.0; ext_names.len()],
+                } else {
+                    Vec::new()
+                };
+                PerPsm { ff, ext }
+            })
+            .collect();
+
+        let mut m = ValueMatrix::new(&cols_active, rows_in_chunk);
+        let mut prelim = vec![0.0f64; rows_in_chunk];
+        let mut elu_lo = vec![0.0f64; rows_in_chunk];
+        let mut elu_hi = vec![0.0f64; rows_in_chunk];
+        for (r, i) in (lo..hi).enumerate() {
+            let ff = &per[r].ff;
+            elu_lo[r] = ff.elution_lo;
+            elu_hi[r] = ff.elution_hi;
+            let rt_err = calibrated_rt_error(apex_rt[i], rt_cal[i]);
+            // MS1 isotope features.
+            let neutral = mz[i] * charge[i] as f64 - charge[i] as f64 * PROTON;
+            let (iso_corr, isom1_ratio, log_mono, has_ms1) =
+                isotope_features(ms1_m1[i], ms1_mono[i], ms1_i1[i], ms1_i2[i], neutral);
+
+            m.set("rt_error_abs", r, rt_err);
+            m.set("rt_error_rel", r, rt_err / gradient);
+            m.set("n_matched_fragments", r, n_matched[i] as f64);
+            m.set("coelution_run", r, corun[i] as f64);
+            m.set("log_apex_intensity", r, (1.0 + apex_int[i] as f64).ln());
+            m.set("frag_corr", r, ff.frag_corr);
+            m.set("frag_cosine", r, ff.frag_cosine);
+            m.set("spectral_angle", r, ff.spectral_angle);
+            m.set("coelution_mean", r, ff.coelution_mean);
+            m.set("coelution_best", r, ff.coelution_best);
+            m.set("n_coelution_above", r, ff.n_coelution_above);
+            m.set("charge", r, charge[i] as f64);
+            m.set("peptide_length", r, peptide_length(&pform[i]) as f64);
+            m.set(
+                "n_proteins",
+                r,
+                (protein[i].matches(';').count() + 1) as f64,
+            );
+            m.set("library_norm_manhattan", r, ff.norm_manhattan);
+            m.set("library_rmsd", r, ff.rmsd);
+            m.set("xcorr_coelution", r, ff.xcorr_coelution);
+            m.set("xcorr_shape", r, ff.xcorr_shape);
+            m.set("sum_b_intensity", r, ff.sum_b);
+            m.set("sum_y_intensity", r, ff.sum_y);
+            m.set("diff_by_intensity", r, ff.sum_b - ff.sum_y);
+            m.set("n_b_ions", r, ff.n_b);
+            m.set("n_y_ions", r, ff.n_y);
+            m.set("weighted_mass_error", r, ff.weighted_mass_error);
+            m.set("mean_mass_error", r, ff.mean_mass_error);
+            m.set("isotope_corr", r, iso_corr);
+            m.set("ms1_isom1_ratio", r, isom1_ratio);
+            m.set("log_mono_ms1", r, log_mono);
+            m.set("has_ms1", r, has_ms1);
+            m.set("log_sn", r, ff.log_sn);
+            m.set("n_observations", r, ff.n_observations);
+            m.set("base_width_rt", r, ff.base_width_rt);
+            m.set(
+                "seed_score",
+                r,
+                *seed_score_map.get(&cid[i]).unwrap_or(&0.0),
+            );
+            m.set(
+                "seed_identified",
+                r,
+                *seed_id_map.get(&cid[i]).unwrap_or(&0.0),
+            );
+            m.set(
+                "matched_fraction",
+                r,
+                n_matched[i] as f64 / (n_pred[i].max(1) as f64),
+            );
+            m.set("profile_cos", r, ff.profile_cos);
+            m.set("ref_corr", r, ff.ref_corr);
+            m.set("best_ref_corr", r, ff.best_ref_corr);
+            m.set("low_frag_coel", r, ff.low_frag_coel);
+            m.set("evidence", r, ff.evidence);
+            m.set("contrast_min", r, ff.contrast_min);
+            m.set("resid_corr", r, ff.resid_corr);
+            m.set("coel_clean", r, ff.coel_clean);
+            m.set("shadow_frac", r, ff.shadow_frac);
+            m.set("peak_contested_frac", r, contested[i]);
+            m.set("peak_contested_count_frac", r, contested_count[i]);
+            m.set("peak_apportioned_frac", r, apportioned[i]);
+
+            // Extended battery (opt-in). Built once per PSM above and fanned out to the
+            // family modules; pushed here under the fixed registry-order names.
+            if extended {
+                for (k, v) in ext_names.iter().zip(&per[r].ext) {
+                    m.set(k, r, *v);
                 }
-            } else {
-                Vec::new()
-            };
-            PerPsm { ff, ext }
-        })
-        .collect();
-
-    for i in 0..n {
-        let ff = &per[i].ff;
-        elu_lo[i] = ff.elution_lo;
-        elu_hi[i] = ff.elution_hi;
-        let rt_err = calibrated_rt_error(apex_rt[i], rt_cal[i]);
-        // MS1 isotope features.
-        let neutral = mz[i] * charge[i] as f64 - charge[i] as f64 * PROTON;
-        let (iso_corr, isom1_ratio, log_mono, has_ms1) =
-            isotope_features(ms1_m1[i], ms1_mono[i], ms1_i1[i], ms1_i2[i], neutral);
-
-        push(&mut fmap, "rt_error_abs", rt_err);
-        push(&mut fmap, "rt_error_rel", rt_err / gradient);
-        push(&mut fmap, "n_matched_fragments", n_matched[i] as f64);
-        push(&mut fmap, "coelution_run", corun[i] as f64);
-        push(
-            &mut fmap,
-            "log_apex_intensity",
-            (1.0 + apex_int[i] as f64).ln(),
-        );
-        push(&mut fmap, "frag_corr", ff.frag_corr);
-        push(&mut fmap, "frag_cosine", ff.frag_cosine);
-        push(&mut fmap, "spectral_angle", ff.spectral_angle);
-        push(&mut fmap, "coelution_mean", ff.coelution_mean);
-        push(&mut fmap, "coelution_best", ff.coelution_best);
-        push(&mut fmap, "n_coelution_above", ff.n_coelution_above);
-        push(&mut fmap, "charge", charge[i] as f64);
-        push(
-            &mut fmap,
-            "peptide_length",
-            peptide_length(&pform[i]) as f64,
-        );
-        push(
-            &mut fmap,
-            "n_proteins",
-            (protein[i].matches(';').count() + 1) as f64,
-        );
-        push(&mut fmap, "library_norm_manhattan", ff.norm_manhattan);
-        push(&mut fmap, "library_rmsd", ff.rmsd);
-        push(&mut fmap, "xcorr_coelution", ff.xcorr_coelution);
-        push(&mut fmap, "xcorr_shape", ff.xcorr_shape);
-        push(&mut fmap, "sum_b_intensity", ff.sum_b);
-        push(&mut fmap, "sum_y_intensity", ff.sum_y);
-        push(&mut fmap, "diff_by_intensity", ff.sum_b - ff.sum_y);
-        push(&mut fmap, "n_b_ions", ff.n_b);
-        push(&mut fmap, "n_y_ions", ff.n_y);
-        push(&mut fmap, "weighted_mass_error", ff.weighted_mass_error);
-        push(&mut fmap, "mean_mass_error", ff.mean_mass_error);
-        push(&mut fmap, "isotope_corr", iso_corr);
-        push(&mut fmap, "ms1_isom1_ratio", isom1_ratio);
-        push(&mut fmap, "log_mono_ms1", log_mono);
-        push(&mut fmap, "has_ms1", has_ms1);
-        push(&mut fmap, "log_sn", ff.log_sn);
-        push(&mut fmap, "n_observations", ff.n_observations);
-        push(&mut fmap, "base_width_rt", ff.base_width_rt);
-        push(
-            &mut fmap,
-            "seed_score",
-            *seed_score_map.get(&cid[i]).unwrap_or(&0.0),
-        );
-        push(
-            &mut fmap,
-            "seed_identified",
-            *seed_id_map.get(&cid[i]).unwrap_or(&0.0),
-        );
-        push(
-            &mut fmap,
-            "matched_fraction",
-            n_matched[i] as f64 / (n_pred[i].max(1) as f64),
-        );
-        push(&mut fmap, "profile_cos", ff.profile_cos);
-        push(&mut fmap, "ref_corr", ff.ref_corr);
-        push(&mut fmap, "best_ref_corr", ff.best_ref_corr);
-        push(&mut fmap, "low_frag_coel", ff.low_frag_coel);
-        push(&mut fmap, "evidence", ff.evidence);
-        push(&mut fmap, "contrast_min", ff.contrast_min);
-        push(&mut fmap, "resid_corr", ff.resid_corr);
-        push(&mut fmap, "coel_clean", ff.coel_clean);
-        push(&mut fmap, "shadow_frac", ff.shadow_frac);
-        push(&mut fmap, "peak_contested_frac", contested[i]);
-        push(&mut fmap, "peak_contested_count_frac", contested_count[i]);
-        push(&mut fmap, "peak_apportioned_frac", apportioned[i]);
-
-        // Extended battery (opt-in). Build the shared Evidence once per PSM and
-        // fan it out to the family modules; push their values under the fixed
-        // registry-order names.
-        if extended {
-            for (k, v) in ext_names.iter().zip(&per[i].ext) {
-                push(&mut fmap, k, *v);
             }
+
+            // Cross-charge corroboration features (whole-run reductions, indexed by row).
+            m.set("n_charge_states", r, f_n_charge[i]);
+            m.set("charge_multi_flag", r, f_charge_multi[i]);
+            m.set("cross_charge_intensity_log", r, f_cross_charge_int[i]);
+
+            prelim[r] = n_matched[i] as f64 * (0.5 + ff.frag_corr.max(0.0))
+                + ff.coelution_mean.max(0.0)
+                + (1.0 + apex_int[i] as f64).ln() * 0.1
+                - rt_err / gradient;
+        }
+        drop(per);
+        max_matrix_bytes = max_matrix_bytes.max(m.payload_bytes());
+
+        // PIN first: it reads the same values the columns below move into Arrow.
+        if let Some(w) = pin.as_mut() {
+            w.write_chunk(
+                cols_active.len(),
+                &m,
+                &cid[lo..hi],
+                &label[lo..hi],
+                &pform[lo..hi],
+                &protein[lo..hi],
+                &mz[lo..hi],
+            )?;
         }
 
-        prelim[i] = n_matched[i] as f64 * (0.5 + ff.frag_corr.max(0.0))
-            + ff.coelution_mean.max(0.0)
-            + (1.0 + apex_int[i] as f64).ln() * 0.1
-            - rt_err / gradient;
+        let mut cols: Vec<Col> = vec![
+            Col::U32("candidate_id".into(), cid[lo..hi].to_vec()),
+            Col::I32("peak_rank".into(), peak_rank[lo..hi].to_vec()),
+            Col::Str("label".into(), label[lo..hi].to_vec()),
+            Col::U32("base_peptide_id".into(), base[lo..hi].to_vec()),
+            Col::Str("peptidoform".into(), pform[lo..hi].to_vec()),
+            Col::Str("protein".into(), protein[lo..hi].to_vec()),
+            Col::F64("apex_rt".into(), apex_rt[lo..hi].to_vec()),
+            Col::F64("elution_lo".into(), elu_lo),
+            Col::F64("elution_hi".into(), elu_hi),
+            Col::F64("precursor_mz".into(), mz[lo..hi].to_vec()),
+            Col::F64("prelim_score".into(), prelim),
+        ];
+        for (c, name) in cols_active.iter().enumerate() {
+            cols.push(Col::F64(name.clone(), m.column(c).to_vec()));
+        }
+        drop(m);
+        writer.write_cols(cols)?;
     }
+    if let Some(w) = pin {
+        w.finish()?;
+    }
+    let rows = writer.close()?;
 
-    // The per-PSM evidence and the trace maps are dead from here on; free them before the
-    // output columns are assembled so they never coexist with the Arrow arrays.
-    drop(per);
-    drop(chrom);
-    drop(ms1x);
-
-    // Cross-charge corroboration features (populated directly; not per-PSM Evidence).
-    fmap.insert("n_charge_states", f_n_charge);
-    fmap.insert("charge_multi_flag", f_charge_multi);
-    fmap.insert("cross_charge_intensity_log", f_cross_charge_int);
-
-    // PIN. Nothing in the pipeline reads this artifact (`rescore` builds its own PIN for
-    // the sidecars); it exists for external Percolator-style tooling, so it is gated.
-    // When it IS written we resolve each feature column ONCE into a slice reference and
-    // stream rows from those, instead of transposing the whole matrix into a
-    // Vec<Vec<f64>> first: at 1.5M rows x 387 features that transpose allocated ~4.6 GB
-    // and performed ~580M string-keyed HashMap lookups. Byte output is unchanged. It is
-    // written before the table because the table build below MOVES the feature columns out
-    // of the map instead of cloning them.
+    crate::memlog::report(
+        "features chromatogram store",
+        &[
+            ("largest_chunk_fragment_traces", max_frag_bytes),
+            ("largest_chunk_ms1_xic_traces", max_ms1_bytes),
+            ("run_total_streamed", tot_frag_bytes + tot_ms1_bytes),
+        ],
+    );
+    info!(
+        chunks = chunks.len(),
+        candidates = n_cand,
+        fragment_rows = n_frag_rows,
+        ms1_rows = n_ms1_rows,
+        chrom_rows = chrom_rows_total,
+        "mem: features chromatogram store shape"
+    );
     crate::memlog::report(
         "features value matrix",
-        &[(
-            "fmap",
-            fmap.values()
-                .map(|v| crate::memlog::bytes_of(v))
-                .sum::<usize>()
-                + fmap.len() * std::mem::size_of::<Vec<f64>>(),
-        )],
+        &[("largest_chunk", max_matrix_bytes)],
     );
-    if p.cfg.emit_pin {
-        let empty: Vec<f64> = Vec::new();
-        let fcols: Vec<&Vec<f64>> = cols_active
-            .iter()
-            .map(|c| fmap.get(c.as_str()).unwrap_or(&empty))
-            .collect();
-        write_pin(
-            p.out_pin,
-            &cols_active,
-            &cid,
-            &label,
-            &pform,
-            &protein,
-            &mz,
-            &fcols,
-        )?;
-    } else {
-        tracing::debug!(
-            path = %p.out_pin,
-            "features: PIN emission disabled (features.emit_pin = false)"
-        );
-    }
-
-    // Build output columns: bookkeeping + active feature list. Every Vec is moved, not
-    // cloned: nothing below needs them again, and cloning the feature map alone doubled the
-    // 8 x rows x features bytes of the matrix at the moment of the write.
-    let mut cols: Vec<Col> = vec![
-        Col::U32("candidate_id".into(), cid),
-        Col::I32("peak_rank".into(), peak_rank),
-        Col::Str("label".into(), label),
-        Col::U32("base_peptide_id".into(), base),
-        Col::Str("peptidoform".into(), pform),
-        Col::Str("protein".into(), protein),
-        Col::F64("apex_rt".into(), apex_rt),
-        Col::F64("elution_lo".into(), elu_lo),
-        Col::F64("elution_hi".into(), elu_hi),
-        Col::F64("precursor_mz".into(), mz),
-        Col::F64("prelim_score".into(), prelim),
-    ];
-    for name in &cols_active {
-        cols.push(Col::F64(
-            name.clone(),
-            fmap.remove(name.as_str()).unwrap_or_else(|| vec![0.0; n]),
-        ));
-    }
-    drop(fmap);
-    let rows = write_table(p.out, cols)?;
 
     // Feature schema companion.
     let schema_id = feature_schema_id(&cols_active);
@@ -1331,7 +1869,7 @@ fn elution_peak_rt_bounds(
         .map(|r| {
             let map: HashMap<u32, f32> =
                 r.rt.iter()
-                    .zip(&r.inten)
+                    .zip(r.inten.iter())
                     .map(|(&t, &v)| (t.to_bits(), v))
                     .collect();
             axis.iter()
@@ -1450,7 +1988,7 @@ fn fragment_features(
         .map(|r| {
             let map: HashMap<u32, f32> =
                 r.rt.iter()
-                    .zip(&r.inten)
+                    .zip(r.inten.iter())
                     .map(|(&t, &v)| (t.to_bits(), v))
                     .collect();
             axis_full
@@ -1709,52 +2247,43 @@ fn isotope_features(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn write_pin(
-    path: &str,
-    feature_cols: &[String],
-    cid: &[u32],
-    label: &[String],
-    pform: &[String],
-    protein: &[String],
-    mz: &[f64],
-    feats: &[&Vec<f64>],
-) -> Result<()> {
-    use std::io::Write as _;
-    // Stream row by row through a BufWriter instead of materializing the whole
-    // ~574k-row PIN as one String. Byte output is unchanged: same header, same
-    // per-row field order, same {:.5}/{:.6} precision and tab/newline separators.
-    if let Some(parent) = std::path::Path::new(path).parent() {
-        std::fs::create_dir_all(parent).ok();
-    }
-    let mut w = std::io::BufWriter::new(std::fs::File::create(path)?);
-    w.write_all(b"SpecId\tLabel\tScanNr\tExpMass\tCalcMass\t")?;
-    w.write_all(feature_cols.join("\t").as_bytes())?;
-    w.write_all(b"\tPeptide\tProteins\n")?;
-    for i in 0..cid.len() {
-        let lab = if label[i] == "decoy" { -1 } else { 1 };
-        write!(
-            w,
-            "cand_{}\t{}\t{}\t{:.5}\t{:.5}\t",
-            cid[i], lab, cid[i], mz[i], mz[i]
-        )?;
-        // `feats` is now COLUMN-major (one slice per feature, resolved once by the
-        // caller), so the row value is feats[fi][i]. Absent columns are empty slices and
-        // print 0.000000, matching the previous `.unwrap_or(0.0)` behaviour exactly.
-        #[allow(clippy::needless_range_loop)]
-        for fi in 0..feature_cols.len() {
-            let v = feats[fi].get(i).copied().unwrap_or(0.0);
-            write!(w, "{v:.6}\t")?;
-        }
-        writeln!(w, "-.{}.-\t{}", pform[i], protein[i])?;
-    }
-    w.flush()?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plan_chunks_cuts_only_at_candidate_boundaries() {
+        // Three PSM rows for candidate 1 (top-K), one each for 2 and 3; candidate 2 has
+        // no chromatogram rows at all.
+        let psm = [1, 1, 1, 2, 3];
+        let chrom = [1, 1, 1, 1, 3, 3];
+        // One row per chunk requested: the planner must still keep a candidate whole.
+        let cs = plan_chunks(&psm, &chrom, "c.parquet", 1).unwrap();
+        assert_eq!(
+            cs.len(),
+            2,
+            "one chunk per candidate that has chromatogram rows"
+        );
+        assert_eq!((cs[0].psm_lo, cs[0].psm_hi, cs[0].chrom_rows), (0, 3, 4));
+        assert_eq!((cs[1].psm_lo, cs[1].psm_hi, cs[1].chrom_rows), (3, 5, 2));
+        // Every PSM row lands in exactly one chunk, in order.
+        assert_eq!(cs[0].psm_lo, 0);
+        assert_eq!(cs.last().unwrap().psm_hi, psm.len());
+        // A chunk larger than the table is one chunk over everything.
+        let one = plan_chunks(&psm, &chrom, "c.parquet", 1 << 20).unwrap();
+        assert_eq!(one.len(), 1);
+        assert_eq!((one[0].psm_lo, one[0].psm_hi, one[0].chrom_rows), (0, 5, 6));
+    }
+
+    #[test]
+    fn plan_chunks_rejects_artifacts_it_cannot_join() {
+        // A chromatogram candidate the PSM table does not have.
+        let e = plan_chunks(&[1, 2], &[1, 9], "c.parquet", 1 << 20).unwrap_err();
+        assert!(format!("{e}").contains("candidate 9"), "{e}");
+        // A candidate whose rows are not contiguous.
+        let e = plan_chunks(&[1, 2, 1], &[1], "c.parquet", 1 << 20).unwrap_err();
+        assert!(format!("{e}").contains("more than one run"), "{e}");
+    }
 
     #[test]
     fn peptide_length_ignores_mods() {
