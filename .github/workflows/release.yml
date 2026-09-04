@@ -54,7 +54,7 @@ jobs:
       actions: read
     if: startsWith(github.ref, 'refs/tags/v')
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # Full history, so reachability from `main` can actually be tested.
           fetch-depth: 0
@@ -150,7 +150,7 @@ jobs:
       run:
         working-directory: rust/mumdia
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install musl tools (linux)
         if: matrix.target == 'x86_64-unknown-linux-musl'
@@ -259,7 +259,7 @@ jobs:
       # Every matrix target runs on a host that executes its own binary natively, so
       # this covers all three -- including macOS, which the repository smoke test does
       # not reach.
-      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
 
@@ -321,7 +321,7 @@ jobs:
         # moved tag would run new code with repository write access on every tag
         # push. Dependabot covers `github-actions`, so the SHA keeps moving on a
         # reviewed PR instead of silently.
-        uses: softprops/action-gh-release@da05d552573ad5aba039eaac05058a918a7bf631 # v2.2.2
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           files: |
             rust/mumdia/dist/*.tar.gz
@@ -333,7 +333,7 @@ jobs:
       # merely reported as built.
       - name: Upload archives as a workflow artifact (rehearsal only)
         if: github.event_name == 'workflow_dispatch'
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: release-dryrun-${{ matrix.target }}
           path: |
