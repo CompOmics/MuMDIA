@@ -52,7 +52,12 @@ Per-buffer payload from `mumdia::memlog` on the instrumented build (`1d1ed7f`), 
 The incremental writer removed extract's whole-run trace residency as intended, and the
 peak moved to features, which re-materialised the traces the writer had just streamed out.
 The gap between the 70.2 GiB of named payload and the 86.6 GiB sampled peak is Arrow
-batches, the per-PSM extended-value vectors, and allocator slack.
+batches, the per-PSM extended-value vectors, and allocator slack. A dhat profile of that
+features stage at full scale (`bench/dhat_top.py`, 81.9 GiB live at the dhat peak, 5.5 h
+under instrumentation) attributed it directly: two `TableFile::list_f32` calls, the `rt` and
+`intensity` trace columns as one `Vec<f32>` per row, held 30.2 GiB each (73.8% of the
+peak), the `fmap` closure 6.7 GiB and `Vec::push` growth 4.8 GiB. That is the structure
+section 3.4 replaced.
 
 Per stage, from the instrumented build's complete run (1:07:30 wall, whole-run peak
 86.6 GiB, 66,081 target PSMs and 59,515 peptides at 1%). This is the first profile with
