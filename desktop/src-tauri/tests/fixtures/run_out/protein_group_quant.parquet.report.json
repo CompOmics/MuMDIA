@@ -1,0 +1,40 @@
+{
+  "logical_name": "protein_group_quant",
+  "schema_name": "protein_group_quant",
+  "schema_version": 2,
+  "stage": "quant",
+  "rows": 16,
+  "content_hash": "1eb8ddb19566390bc59e17ede88b0d7264d48b3831079346b74c73aeaa8b5920",
+  "params": {
+    "apex_rt_column_present": true,
+    "baseline_flank_scans": 12,
+    "baseline_quantile": 0.25,
+    "baseline_subtract": false,
+    "bound_peak": true,
+    "candidates_with_scored_apex": 152,
+    "chromatograms": "C:/Users/robbi/AppData/Local/Temp/claude/H--OneDrive---UGent-MuMDIA-NG/ed948dad-9d5a-423e-9f52-cf197cbee207/scratchpad/smoke_final/out/chromatograms.parquet",
+    "config_hash": "7dfde09c5047373b95038420ca4248fd4aadf46942bdd8630c30ce1b13403ef2",
+    "fixed_scan_halfwidth": 0,
+    "fixed_window_s": 0.0,
+    "fragment_selection": "ObservedArea",
+    "peak_fraction": 0.16666666666666666,
+    "peak_grace": 1,
+    "peak_window_mode": "PerCandidate",
+    "psms_scored": "C:/Users/robbi/AppData/Local/Temp/claude/H--OneDrive---UGent-MuMDIA-NG/ed948dad-9d5a-423e-9f52-cf197cbee207/scratchpad/smoke_final/out/psms_scored.parquet",
+    "q_filter": "PeptideQ",
+    "q_threshold": 0.01,
+    "reliable_q": 0.001,
+    "rollup": "TopNSum",
+    "top_n_fragments": 3,
+    "top_n_peptides": 3
+  },
+  "stats": {
+    "nonquantifiable_peptides": 0,
+    "peptide_rows": 151,
+    "protein_group_rows": 16,
+    "quantified_peptides": 151,
+    "quantified_protein_groups": 16
+  },
+  "model_identity": null,
+  "elapsed_ms": 4
+}

@@ -1,0 +1,17 @@
+# Optional MS2PIP environment for the desktop application.
+#
+# Separate from env/console-requirements.txt because it has to be: at the versions
+# this project tests, MS2PIP and DeepLC cannot share an environment.
+#
+#   deeplc==4.1.1 -> psm-utils>=1.5 -> sqlalchemy>=2
+#   ms2pip==4.0.0 -> sqlalchemy>=1.3,<2
+#
+# Needed only for FASTA-mode library building with predicted fragment intensities.
+# The recommended workflow imports a library instead and never invokes MS2PIP.
+#
+# Pinned to the version the project tests. `ms2pip>=4.1` resolves alongside DeepLC
+# and would collapse this back into one environment, but it changes predicted
+# intensities, so it is an upgrade to measure rather than to assume.
+ms2pip==4.0.0
+numpy
+pandas

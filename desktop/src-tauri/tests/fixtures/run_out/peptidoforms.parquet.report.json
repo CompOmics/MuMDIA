@@ -1,0 +1,21 @@
+{
+  "logical_name": "peptidoforms",
+  "schema_name": "peptidoforms",
+  "schema_version": 1,
+  "stage": "peptidoforms",
+  "rows": 3820,
+  "content_hash": "b8c0df35a3ba1faa0ac44736aa95e31563735a93b6b5f99c9a0749b2445b04f3",
+  "params": {
+    "charges": "2..3",
+    "fixed_mods": [
+      "C:Carbamidomethyl"
+    ],
+    "max_variable_mods": 1,
+    "variable_mods": [
+      "M:Oxidation"
+    ]
+  },
+  "stats": {},
+  "model_identity": null,
+  "elapsed_ms": 3
+}
