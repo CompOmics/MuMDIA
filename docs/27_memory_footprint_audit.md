@@ -54,10 +54,24 @@ peak moved to features, which re-materialised the traces the writer had just str
 The gap between the 70.2 GiB of named payload and the 86.6 GiB sampled peak is Arrow
 batches, the per-PSM extended-value vectors, and allocator slack.
 
-Sampler rows of the streaming/f32 arm, in stage order (that run predates the `stage=` regex
-fix in `5aa0eb6`, so the TSV labels are unusable and this mapping is by order, not label):
-convert 0.20 GiB / 13 s, search-seed 6.78 / 20 s, rt-im-train 5.19 / 2 s, extract 61.31 /
-312 s, features 86.64 / 305 s, compete 4.53 / 29 s, rescore 31.48 / killed.
+Per stage, from the instrumented build's complete run (1:07:30 wall, whole-run peak
+86.6 GiB, 66,081 target PSMs and 59,515 peptides at 1%). This is the first profile with
+usable stage labels; the earlier A/B arms predate the `stage=` regex fix in `5aa0eb6`:
+
+| stage | wall s | peak tree RSS GiB |
+|-------|--------|-------------------|
+| convert | 15.9 | 0.20 |
+| search-seed | 23.9 | 6.81 |
+| rt-im-train | 2.4 | 5.19 |
+| extract | 335.6 | 61.38 |
+| features | 348.7 | 86.62 |
+| compete | 34.9 | 4.55 |
+| rescore | 3186.8 | 33.04 |
+| quant | 100.9 | 2.81 |
+| report | 1.0 | 2.80 |
+
+Rescore is 79% of the wall clock and the second tallest stage; its 33.04 GiB is the Rust
+process and the NN sidecar together, which is what item 3.5 addresses.
 
 State of the plan in section 3:
 
@@ -73,8 +87,9 @@ State of the plan in section 3:
 | 3.8 convert batched write | shipped `503eadb` | |
 | 3.9 library streamed load | shipped `503eadb` | removes the 23 GiB Arrow transient |
 
-With features fixed, the tallest stage on this file is extract at about 61 GiB, which is
-the next ceiling (section 4, window-streaming extract).
+With features fixed at 3.03 GiB, the tallest stage on this file is extract at 61.38 GiB,
+which is the next ceiling (section 4, window-streaming extract), followed by rescore at
+33.04 GiB.
 
 ## 1. Static memory model per stage
 
@@ -422,5 +437,5 @@ sampling interval.
 Status as of 2026-09-04: section 1 remains the code-derived (static) model; section 0
 carries the measured numbers and the state of each plan item. Sections 3.1-3.3 and
 3.6-3.9 shipped in `503eadb`, 3.4 in the commit that added this paragraph, and 3.5 is
-half done. The next measurement to take is a full `mumdia run` on the current build,
-which should show extract as the tallest stage at about 61 GiB.
+half done. The next measurement to take is a full `mumdia run` on the current build, which should
+show extract as the tallest stage at 61.38 GiB.
