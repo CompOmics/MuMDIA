@@ -298,9 +298,17 @@ jobs:
         run: |
           set -euo pipefail
           python -m pip install --quiet pip-audit
-          # --strict fails on a package pip-audit cannot resolve, rather than passing
-          # over it in silence, which would make a clean report meaningless.
-          pip-audit --strict --progress-spinner off
+          # NOT --strict, and the reason is specific rather than a shrug. --strict
+          # fails when a package cannot be resolved on PyPI at all, and `torch` is
+          # installed from the PyTorch index as `2.12.1+cpu`, a local version that by
+          # construction does not exist on PyPI. That is not a finding, it is how CPU
+          # torch is distributed, and failing on it would train everyone to ignore
+          # this job. Real advisories still fail the run.
+          #
+          # The gap this leaves is torch itself. Watch
+          # https://github.com/pytorch/pytorch/security/advisories directly; nothing
+          # here can audit a wheel PyPI has never seen.
+          pip-audit --progress-spinner off
 
       # The exact package set the audit above ran against. The specifications pin the
       # tools that matter (mokapot, ms2pip, deeplc, torch) and leave the scientific
@@ -337,6 +345,44 @@ jobs:
           set -euo pipefail
           python -m pip install --quiet pytest
           python -m pytest tests/python -q -rs
+
+  # The desktop application. A separate Cargo workspace, so nothing above builds it,
+  # and without this job it could break while every other check stayed green.
+  #
+  # It is not independent of the engine either: the settings schema and both
+  # requirement files are compiled into it with `include_str!`, so a change to
+  # `config.rs` that regenerates `configs/config-schema.json` reaches this crate.
+  # That coupling is what makes the job worth its minutes.
+  desktop:
+    name: desktop app
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      # Tauri links WebKitGTK, whose development headers the runner does not carry.
+      - name: Install the build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends             libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+
+      - name: Format
+        working-directory: desktop/src-tauri
+        run: cargo fmt --check
+
+      - name: Clippy
+        working-directory: desktop/src-tauri
+        run: cargo clippy --all-targets -- -D warnings
+
+      # Library tests only. The end-to-end tests skip themselves without an engine
+      # binary, which would make this job look like it covered more than it does; a
+      # real bundle is exercised by the release rehearsal instead.
+      - name: Unit tests
+        working-directory: desktop/src-tauri
+        run: cargo test --lib
+
+      # The frontend has no build step, so this is its whole check.
+      - name: Frontend agrees with the backend
+        run: python ci/check_desktop_ui.py
 
   smoke-cross-platform:
     name: cross-platform byte equality
@@ -434,7 +480,10 @@ jobs:
       # docs/24 is generated from config.rs, so a new field or a changed default
       # must land with its documentation or CI fails. A reference nobody
       # regenerates is worse than none, because it reads as current.
-      - name: Config reference is current
+      # One parse of config.rs produces two artifacts: the reference document a
+      # person reads, and configs/config-schema.json, which the desktop settings
+      # editor renders its form from. They go stale together, so --check covers both.
+      - name: Config reference and schema are current
         run: python ci/gen_config_reference.py --check
 
       # The release binary is statically linked, so it carries 173 third-party crates

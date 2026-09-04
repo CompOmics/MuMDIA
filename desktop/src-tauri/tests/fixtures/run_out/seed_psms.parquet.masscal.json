@@ -1,0 +1,11 @@
+{
+  "cal_passes": 1,
+  "frag_ppm_offset": -0.00026103398249893126,
+  "frag_ppm_sigma": 5.0,
+  "frag_tol_ppm": 5.0,
+  "mz_cal_grid_mz": [],
+  "mz_cal_grid_ppm": [],
+  "n_dev": 1068,
+  "ppm_residual_mad": 0.019232855968052062,
+  "ppm_residual_median": 0.0
+}
