@@ -1,0 +1,19 @@
+{
+  "logical_name": "features",
+  "schema_name": "features",
+  "schema_version": 1,
+  "stage": "features",
+  "rows": 284,
+  "content_hash": "686820b41516510286c9c94f753940f26fb9a748435e7c9864f281a231267bf1",
+  "params": {
+    "coelution_corr_threshold": 0.9,
+    "set": "Extended"
+  },
+  "stats": {
+    "feature_schema_id": "e5b4eff0133e411dbf406947c89466619ec557ab37874bc3948792d9890afe8e",
+    "n_features": 387,
+    "set": "Extended"
+  },
+  "model_identity": null,
+  "elapsed_ms": 18
+}
