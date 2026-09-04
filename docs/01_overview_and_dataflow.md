@@ -34,8 +34,7 @@ failed rerun can leave an old manifest beside partially replaced outputs.
 The validated findings and the interstage, determinism, and sidecar contracts
 cited throughout this document are consolidated, self-contained, in
 `docs/18_findings_and_decisions.md` (sections A1-A7 for findings, B1-B3 for
-contracts); the citations below point there. plan.md holds the deeper
-algorithmic spec but is local-only and gitignored.
+contracts); the citations below point there.
 
 ## Files
 
@@ -44,7 +43,8 @@ algorithmic spec but is local-only and gitignored.
 | `rust/mumdia/crates/mumdia/src/main.rs` | CLI: one `clap` subcommand per stage (`Cmd` enum, `main.rs:20`); each arm loads config, hashes it, and calls the stage `run`. |
 | `rust/mumdia/crates/mumdia/src/stages/run.rs` | `run` orchestrator: preflight, library-source branch, per-run chain, manifest assembly (`run.rs:85`). |
 | `rust/mumdia/crates/mumdia/src/stages/mod.rs` | Re-exports every stage module. |
-| `rust/mumdia/crates/mumdia/src/stages/*.rs` | The stage implementations (`convert`, `digest`, `peptidoforms`, `predict_frag`, `search_seed`, `rt_im_train`, `extract`, `features`, `compete`, `rescore`, `quant`, `report`, `align`, `audit`). |
+| `rust/mumdia/crates/mumdia/src/stages/*.rs` | The stage implementations (`convert`, `digest`, `peptidoforms`, `predict_frag`, `prescan`, `search_seed`, `rt_im_train`, `extract`, `features`, `compete`, `rescore`, `quant`, `report`, `align`, `audit`). |
+| `rust/mumdia/crates/mumdia/src/stages/run_experiment.rs` | `run-experiment` orchestrator: N per-run chains, one combined rescore, optional MBR, per-run quant, cross-run LFQ, `experiment_manifest.json` (`run_experiment.rs:267`). |
 | `rust/mumdia/crates/mumdia/src/lib.rs` | Crate lib root (bin+lib split, `lib.rs:5-16`): re-exports the pipeline modules so integration tests can drive stages directly. Public modules: `stages`, `matchers` (fragment matchers, doc 06), `index` (`Library` + inverted index, doc 06), `predict` (predictor traits + native fallbacks, doc 06), `rescoring` (`percolator_lite` + native NN, doc 11), `calibrate` (LOESS/linear/percentile, doc 08), `peaks` (peak enumeration, doc 09), `spectra` (in-memory spectrum model + loaders), `sidecar` (Python worker dispatch, doc 13), `stats` (pearson/cosine/spectral_angle kernel), `fdr` (target-decoy + entrapment q, doc 11). |
 | `rust/mumdia/crates/mumdia-core/src/schema.rs` | Frozen `(logical name, schema version)` for every artifact (`artifact` module, `schema.rs:6`). |
 | `rust/mumdia/crates/mumdia-core/src/manifest.rs` | `Manifest` and `ArtifactRecord` (`manifest.rs:10`, `manifest.rs:22`). |
@@ -213,12 +213,16 @@ protein-by-run matrix (`quant.rs:479`): `protein_group`, `run` i32, `quantity`,
 reason).
 
 Human-readable outputs: `peptides.tsv`, `proteins.tsv` (report), and
-`manifest.json` (orchestrator).
+`manifest.json` (orchestrator). The experiment-wide orchestrator
+`run-experiment` writes `experiment_manifest.json`
+(`run_experiment.rs:522-533`) and no TSVs at all, because it never calls the
+report stage (see the CLI notes below).
 
 ## CLI subcommands
 
 `main.rs` is a thin `clap` layer: the `Cmd` enum (`main.rs:20`) defines one
-subcommand per stage plus the `run` orchestrator, the experiment-level
+subcommand per stage plus the single-run `run` orchestrator, the experiment-wide
+`run-experiment` orchestrator (`main.rs:238`), the experiment-level
 `align`/`mbr`, and the utilities `inspect`/`report`/`doctor`. Each stage arm
 loads the config, hashes its canonical JSON into a `config_hash`, and calls the
 stage `run`; every stage command is runnable standalone on prior outputs. Flags
@@ -228,7 +232,7 @@ Which subcommands read `--config` (verified against `main.rs`):
 
 | Takes `--config` | No `--config` |
 |---|---|
-| `digest`, `peptidoforms`, `predict-frag`, `search-seed`, `rt-im-train`, `extract`, `features`, `compete`, `rescore`, `quant`, `run`, `align`, `mbr`, `doctor` (optional) | `convert`, `quant-lfq`, `inspect`, `audit`, `report` |
+| `digest`, `peptidoforms`, `predict-frag`, `search-seed`, `rt-im-train`, `extract`, `features`, `compete`, `rescore`, `quant`, `run`, `run-experiment`, `align`, `mbr`, `doctor` (optional) | `convert`, `quant-lfq`, `inspect`, `audit`, `report` |
 
 The five with no `--config` are fixed-behavior: `convert` always runs on
 `Config::default()` (`main.rs:397`); `quant-lfq` takes typed string flags instead
@@ -242,20 +246,21 @@ order:
 | `digest` (`main.rs:43`) | `--fasta`, `--config` | `--out` = `peptides.parquet` |
 | `peptidoforms` (`main.rs:52`) | `--peptides`, `--config` | `--out` = `peptidoforms.parquet` |
 | `predict-frag` (`main.rs:61`) | `--peptidoforms`, `--work-dir` (default `sidecar_work`), `--config` | `--out-precursors`, `--out-fragments` (the library pair) |
-| `search-seed` (`main.rs:75`) | `--ms2`, `--library-precursors`, `--library-fragments`, `--config` | `--out` = `seed_psms.parquet` (+ `<out>.masscal.json`) |
-| `rt-im-train` (`main.rs:88`) | `--seed-psms`, `--library-precursors`, `--config` | `--out-windows` = `run_windows.parquet`, `--out-cal` = `cal.json` |
-| `extract` (`main.rs:101`) | `--ms2`, `--library-precursors`, `--library-fragments`, `--run-windows`, `--ms1` (opt), `--mass-cal` (opt), `--restrict-candidates` (opt allowlist), `--config` | `--out-psms` = `psms_extracted.parquet`, `--out-chrom` = `chromatograms.parquet` (+ `<psms>.peaks.parquet` when `retain_top_peaks>1`) |
-| `features` (`main.rs:130`) | `--psms`, `--chromatograms`, `--seed` (opt), `--config` | `--out` = `features.parquet` (+ `.schema.json`), `--out-pin` = PIN |
+| `search-seed` (`main.rs:75`) | `--ms2`, `--lib-precursors`, `--lib-fragments`, `--config` | `--out` = `seed_psms.parquet` (+ `<out>.masscal.json`) |
+| `rt-im-train` (`main.rs:88`) | `--seed-psms`, `--lib-precursors`, `--config` | `--out-windows` = `run_windows.parquet`, `--out-cal` = `cal.json` |
+| `extract` (`main.rs:101`) | `--ms2`, `--lib-precursors`, `--lib-fragments`, `--run-windows`, `--ms1` (opt), `--mass-cal` (opt), `--restrict-candidates` (opt allowlist), `--config` | `--out-psms` = `psms_extracted.parquet`, `--out-chromatograms` = `chromatograms.parquet` (+ `<psms>.peaks.parquet` when `retain_top_peaks>1`) |
+| `features` (`main.rs:130`) | `--psms-extracted`, `--chromatograms`, `--seed-psms` (opt), `--config` | `--out` = `features.parquet` (+ `.schema.json`), `--out-pin` = PIN |
 | `compete` (`main.rs:146`) | `--features`, `--config` | `--out` = `psms_competed.parquet` (+ `.schema.json`) |
 | `rescore` (`main.rs:155`) | `--competed` (1+ competed tables), `--config` | `--out` = `psms_scored.parquet` |
 | `quant` (`main.rs:165`) | `--psms-scored`, `--chromatograms`, `--config` | `--out-peptide`, `--out-protein`, `--out-fragment` (opt), `--out-peak-bounds` (opt) |
 | `quant-lfq` (`main.rs:184`) | `--inputs` (1+ per-run tables), `--method` (`maxlfq` default / `directlfq`), `--normalize` (`median_ratio` default / `median` / `none`) | `--out` = protein-by-run matrix; no `--config` |
 | `run` (`main.rs:199`) | `--mzml`, `--out-dir`; `--fasta` xor (`--lib-precursors` + `--lib-fragments`); `--config`, `--profile`, `--max-spectra`, `--top-peaks-ms2` | the full chain + `manifest.json` |
-| `align` (`main.rs:230`) | `--seeds` (1+ `seed_psms`, first = reference), `--config` | `--out` = `alignment.parquet` |
-| `mbr` (`main.rs:240`) | `--scored` (experiment-wide `scored_combined`), `--psms` (1+ per-run in `source` order), `--frag` (0+ per-run `fragment_quant`), `--config` | `--out` = `transferred.parquet`, `--out-scored` (opt augmented scored) |
+| `run-experiment` (`main.rs:238`) | `--mzml` once per run (>=2), `--run-names` (opt, default `r0..rN-1`), `--out-dir`; `--fasta` xor (`--lib-precursors` + `--lib-fragments`); `--config`, `--profile`, `--max-spectra`, `--top-peaks-ms2` | per-run chains under `<out-dir>/<run>/`, one `scored_combined.parquet`, optional MBR tables, per-run `scored`/quant splits, `lfq_maxlfq.parquet`, `experiment_manifest.json`; no report TSVs |
+| `align` (`main.rs:230`) | `--seed-psms` (1+ `seed_psms`, first = reference), `--config` | `--out` = `alignment.parquet` |
+| `mbr` (`main.rs:240`) | `--psms-scored` (experiment-wide `scored_combined`), `--psms-extracted` (1+ per-run in `source` order), `--frag` (0+ per-run `fragment_quant`), `--config` | `--out` = `transferred.parquet`, `--out-psms-scored` (opt augmented scored) |
 | `inspect` (`main.rs:261`) | positional `artifact` (any parquet) | schema + head + row count to stdout; no `--config` |
-| `audit` (`main.rs:265`) | `--library-precursors`, `--psms`, `--competed`, `--scored`, `--q` (0.01), `--run-id` (`run`), `--entrapment-substr` (`""`) | `--out` = `candidate_audit.parquet`; no `--config` |
-| `report` (`main.rs:292`) | `--scored`, `--peptide-quant` (opt), `--protein-quant` (opt), `--q` (0.01) | `peptides.tsv` + `proteins.tsv` in `--out-dir` |
+| `audit` (`main.rs:265`) | `--lib-precursors`, `--psms-extracted`, `--competed`, `--psms-scored`, `--q` (0.01), `--run-id` (`run`), `--entrapment-substr` (`""`) | `--out` = `candidate_audit.parquet`; no `--config` |
+| `report` (`main.rs:292`) | `--psms-scored`, `--peptide-quant` (opt), `--protein-quant` (opt), `--q` (0.01), `--config` (opt) | `peptides.tsv` + `proteins.tsv` in `--out-dir` |
 | `doctor` (`main.rs:305`) | `--config` (opt) | probes the configured sidecar interpreters; nonzero exit if any FAIL |
 
 Per-subcommand specifics that are easy to miss:
@@ -263,7 +268,8 @@ Per-subcommand specifics that are easy to miss:
 - `convert` is the only stage command with no `--config`; it always runs on
   `Config::default()` (`main.rs:397`). Because the three caps are not part of the
   config, `convert` folds them into the artifact `config_hash` (`main.rs:402`,
-  comment.md A2/C4) so two different caps do not collide on an identical hash.
+  docs/18_findings_and_decisions.md) so two different caps do not collide on an
+  identical hash.
   `top_peaks_ms2` is an irreversible conversion-time cap that also affects
   extraction/features/quant; `search_seed.top_n_peaks` is the seed-only
   alternative.
@@ -277,11 +283,20 @@ Per-subcommand specifics that are easy to miss:
 - `rescore` standalone accepts several `--competed` tables for experiment-wide
   scoring and uses a fixed `sidecar_work` working directory (`main.rs:588`);
   inside `run` it is passed exactly one table and a per-out-dir work directory.
+- `run-experiment` (`main.rs:660`, `run_experiment.rs:267`) runs the per-file
+  chain over N runs, rescores all competed tables in one pass
+  (`run_experiment.rs:428`), then splits the scored table by `source` for per-run
+  quant (`run_experiment.rs:474-477`) and cross-run LFQ. It never calls the
+  report stage: `report::run` has exactly two call sites, the `run` orchestrator
+  (`run.rs:484`) and the standalone `report` command (`main.rs:798`). An
+  experiment output tree therefore contains no `peptides.tsv` and no
+  `proteins.tsv` anywhere. Take per-run counts from the per-run split
+  `scored.parquet`, or invoke `mumdia report` by hand on it.
 - `align` uses `rt_im_train.q_train` for its training set and a hardcoded 100-knot
   grid (`main.rs:666-667`); it needs >=2 seeds and is not part of the `run` chain.
 - `mbr` (`main.rs:671`) is a wired standalone command, not part of `run`. It
   hard-errors when `mbr.strategy = none` (`main.rs:680`), when fewer than two
-  `--psms` are supplied (`main.rs:685`), or when `mbr.python` is unset
+  `--psms-extracted` are supplied (`main.rs:685`), or when `mbr.python` is unset
   (`main.rs:688`), then runs the `mbr_worker.py` sidecar with the `mbr.*`
   thresholds (`main.rs:697`). It transfers identifications across a run set
   (Stage D3); see the extend section for its stub status inside `run`.
@@ -483,7 +498,8 @@ workflow") is library-input mode with:
   `rescore.python`, with `rescore.strict = true`), which is the dominant
   sensitivity lever and beats the native linear rescorer by ~8.5% (docs/18 A1),
 - a loose default apex-intensity Pearson gate
-  (`extract.gate_mode = apex_pearson`, `extract.min_frag_corr ~= 0.2`), since
+  (`extract.gate_mode = apex_pearson`, `extract.gate_min_score = 0.2` set explicitly
+  by that arm's config), since
   a strong nonlinear rescorer prefers recall and absorbs the loose-gate flood
   (docs/18 A1/A2),
 - the conversion-time MS2 peak cap explicitly kept at 300 on AIF
@@ -535,14 +551,14 @@ config (`main.rs:607`) before `run`. The fields this overview area touches:
 | `predict_frag.deeplc_python` | `None` | Interpreter for DeepLC; required if `finetune_deeplc`; probed by `doctor`. |
 | `predict_frag.ms2pip_python` | `None` | Interpreter for MS2PIP; probed by `doctor` (`main.rs:332`). |
 | `predict_frag.sidecar_script_dir` | `"scripts"` | Where sidecar workers are resolved from (used by `rescore`/`mbr`). |
-| `search_seed.top_n_peaks` | `300` | Seed-only MS2 peak cap (keep 300 on AIF, docs/18 A3). |
+| `search_seed.top_n_peaks` | `300` | Seed-only, non-destructive peak cap; keep the default. Not the conversion cap `--top-peaks-ms2` (docs/04). |
 | `extract.bucket_size` | (see `ExtractConfig`) | Fragment-index bucket width; `search-seed` reads it too (`main.rs:473`). |
 | `rt_im_train.calibration_method` | `loess` | RT calibration; `none` is rejected by validation. |
 | `rt_im_train.q_train` | (see `RtImTrainConfig`) | Confident-seed q cutoff for the DeepLC fine-tune and the `align` reference set. |
 | `rt_im_train.finetune_deeplc` | `false` | Enables the per-run DeepLC fine-tune of iRT (best workflow). |
 | `rt_im_train.finetune_epochs` / `finetune_patience` | (see config) | DeepLC fine-tune schedule (`run.rs:259-260`). |
 | `rt_im_train.finetune_batch` | `0` | `0` auto-scales the fine-tune batch to seed size. |
-| `extract.min_frag_corr` | `0.2` | Spectral-agreement gate threshold; loose default suits `nn_torch`. |
+| `extract.gate_min_score` | `0.2` | Spectral-agreement gate threshold. Measured better than 0.6 for BOTH rescorers under the current defaults (docs/18, "the gate optimum moved"). |
 | `extract.gate_mode` | `apex_pearson` | Which spectral score the gate thresholds (`GateMode`, `config.rs:591`). |
 | `extract.retain_top_peaks` | `1` | `>1` writes the `<psms>.peaks.parquet` sidecar (not yet scored). |
 | `extract.emit_candidate_audit` | `false` | Emits `candidate_audit.parquet` in `run`. |
@@ -574,9 +590,15 @@ not part of the `run` chain and needs >=2 runs.
   reproducibility; use ordered maps or sorted iteration where floats are summed.
   The DeepLC fine-tune is the one deliberate exception (nondeterministic; no fixed
   torch seed), so a `run` with `finetune_deeplc = true` is not bit-reproducible.
-- `candidate_id` must be a contiguous 0-based index sorted by precursor m/z; the
-  fragment index build in extract depends on it. An imported library must be
-  re-indexed by `make_reverse_decoys.py` to satisfy this.
+- The library carries two separate row-order preconditions and the fragment
+  index build checks both, hard-erroring on either: `candidate_id` must be the
+  contiguous, row-aligned range `0..ncand` (`index.rs:112-125`), and precursor
+  rows must be ascending by `precursor_mz` (`index.rs:215-231`). An imported
+  library must be re-indexed by the decoy-builder scripts (for example
+  `make_reverse_decoys.py`) to satisfy them. Fragment rows need valid
+  `candidate_id`s but no particular order. docs/03 lists the remaining
+  constraints on Parquet written outside `mumdia-io`, including the SNAPPY and
+  arrow `utf8` requirements.
 - q-value columns in `psms_scored` are independent per level, not a rollup
   (docs/18 A5): `q_value` (== `experiment_psm_q`), `run_psm_q` (per source),
   `precursor_q` (peptidoform+charge), `peptide_q_value` (stripped sequence),

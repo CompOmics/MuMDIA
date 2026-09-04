@@ -1,4 +1,4 @@
-//! Core data-model types (PLAN.md Section 2). Ion mobility is `Option` /
+//! Core data-model types (docs/02_config_and_data_model.md). Ion mobility is `Option` /
 //! nullable throughout so the same model serves 3D and 4D runs; MVP is 3D so
 //! IM is always `None`.
 

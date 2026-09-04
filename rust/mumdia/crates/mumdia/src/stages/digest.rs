@@ -1,7 +1,8 @@
 //! Stage A `mumdia digest`: fully-tryptic enumeration + decoy pairing
-//! (PLAN.md Stage A). Experiment-wide, computed once. MVP uses a documented,
-//! clean-room decoy scheme (reverse or seeded scramble); the DIA-NN terminal
-//! shift map is a later license-checked addition (PLAN.md Section 11).
+//! (docs/05_digest_peptidoforms.md). Experiment-wide, computed once. MVP uses a
+//! documented, clean-room decoy scheme (reverse or seeded scramble); the DIA-NN
+//! terminal shift map is a later license-checked addition
+//! (docs/14_build_test_deploy_gotchas.md).
 
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
@@ -113,8 +114,8 @@ fn digest_protein(seq: &[u8], cfg: &DigestConfig) -> Vec<(usize, usize, String)>
     out
 }
 
-/// Make a decoy sequence from a target (PLAN.md Section 9.2). Reverse keeps the
-/// C-terminal residue fixed; scramble seeded-shuffles the interior.
+/// Make a decoy sequence from a target (docs/05_digest_peptidoforms.md). Reverse
+/// keeps the C-terminal residue fixed; scramble seeded-shuffles the interior.
 fn make_decoy(pep: &str, strategy: DecoyStrategy, seed: u64) -> Option<String> {
     let b = pep.as_bytes();
     let n = b.len();
@@ -276,7 +277,7 @@ pub fn run(p: DigestParams) -> Result<u64> {
         target_c.push(-1i32);
         strat_c.push(format!("{:?}", p.cfg.decoy.strategy).to_lowercase());
 
-        // Materialize sequence-rewrite decoys here (PLAN.md Stage A).
+        // Materialize sequence-rewrite decoys here (docs/05_digest_peptidoforms.md).
         if let Some(dec) = decoy {
             let did = next_id;
             next_id += 1;

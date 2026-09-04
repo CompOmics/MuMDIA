@@ -482,7 +482,7 @@ fn median(mut v: Vec<f64>) -> f64 {
     if v.is_empty() {
         return 0.0;
     }
-    v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    v.sort_by(|a, b| a.total_cmp(b));
     let n = v.len();
     if n % 2 == 1 {
         v[n / 2]
@@ -937,7 +937,7 @@ fn maxima_stats(y: &[f64]) -> (f64, f64) {
         0.0
     } else {
         let mut sorted = peaks.clone();
-        sorted.sort_by(|&a, &b| y[b].partial_cmp(&y[a]).unwrap_or(std::cmp::Ordering::Equal));
+        sorted.sort_by(|&a, &b| y[b].total_cmp(&y[a]));
         let (p1, p2) = (sorted[0], sorted[1]);
         let (lo, hi) = if p1 < p2 { (p1, p2) } else { (p2, p1) };
         let valley = y[lo..=hi].iter().cloned().fold(f64::MAX, f64::min);

@@ -1,5 +1,5 @@
-//! RT calibration models (PLAN.md Stage B): a LOESS local-linear smoother with
-//! a least-squares linear fallback. Maps predicted iRT (arbitrary units) to
+//! RT calibration models (docs/08_rt_im_train.md): a LOESS local-linear smoother
+//! with a least-squares linear fallback. Maps predicted iRT (arbitrary units) to
 //! observed RT (seconds) for this run.
 
 /// Ordinary least-squares line y = slope*x + intercept.
@@ -43,7 +43,7 @@ impl Loess {
         let (slope, intercept) = linear_fit(xs, ys);
         // sort points by x
         let mut idx: Vec<usize> = (0..xs.len()).collect();
-        idx.sort_by(|&a, &b| xs[a].partial_cmp(&xs[b]).unwrap());
+        idx.sort_by(|&a, &b| xs[a].total_cmp(&xs[b]));
         let sx: Vec<f64> = idx.iter().map(|&i| xs[i]).collect();
         let sy: Vec<f64> = idx.iter().map(|&i| ys[i]).collect();
         let n = sx.len();
@@ -158,7 +158,7 @@ pub fn percentile(values: &[f64], p: f64) -> f64 {
         return 0.0;
     }
     let mut v = values.to_vec();
-    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    v.sort_by(|a, b| a.total_cmp(b));
     let rank = (p.clamp(0.0, 1.0) * (v.len() as f64 - 1.0)).round() as usize;
     v[rank]
 }

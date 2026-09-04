@@ -1,4 +1,4 @@
-"""MS2PIP sidecar worker (PLAN.md Section 3.2 file contract).
+"""MS2PIP sidecar worker (the file contract in docs/13_sidecars.md).
 
 Usage:
     python ms2pip_worker.py <input.parquet> <output.parquet> [model]

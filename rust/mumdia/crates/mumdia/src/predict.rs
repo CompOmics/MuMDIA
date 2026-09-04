@@ -1,4 +1,4 @@
-//! Predictor traits + native fallback implementations (PLAN.md Section 0, 3.2).
+//! Predictor traits + native fallback implementations (docs/13_sidecars.md).
 //!
 //! The three ML predictors are Python sidecars behind stable interfaces. So the
 //! engine also runs with zero external runtime dependencies, MVP ships native

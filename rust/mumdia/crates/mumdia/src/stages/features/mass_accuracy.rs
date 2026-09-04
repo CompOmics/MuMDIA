@@ -59,7 +59,7 @@ fn median(v: &[f64]) -> f64 {
         return 0.0;
     }
     let mut s: Vec<f64> = v.to_vec();
-    s.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    s.sort_by(|a, b| a.total_cmp(b));
     let n = s.len();
     let m = if n % 2 == 1 {
         s[n / 2]
@@ -150,7 +150,7 @@ pub fn values(e: &Evidence) -> Vec<f64> {
 
     // Sorted copy of signed ppm for quantiles.
     let mut sorted = ppm.clone();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    sorted.sort_by(|a, b| a.total_cmp(b));
 
     // 1. median absolute ppm
     let median_abs = median(&absppm);

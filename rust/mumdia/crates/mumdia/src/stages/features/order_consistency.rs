@@ -51,7 +51,7 @@ fn fin(x: f64) -> f64 {
 fn avg_rank(v: &[f64]) -> Vec<f64> {
     let n = v.len();
     let mut idx: Vec<usize> = (0..n).collect();
-    idx.sort_by(|&i, &j| v[i].partial_cmp(&v[j]).unwrap_or(std::cmp::Ordering::Equal));
+    idx.sort_by(|&i, &j| v[i].total_cmp(&v[j]));
     let mut r = vec![0.0f64; n];
     let mut i = 0;
     while i < n {
@@ -80,12 +80,8 @@ fn kendall(a: &[f64], b: &[f64]) -> f64 {
     let (mut c, mut d) = (0i64, 0i64);
     for i in 0..n {
         for j in (i + 1)..n {
-            let sa = (a[i] - a[j])
-                .partial_cmp(&0.0)
-                .unwrap_or(std::cmp::Ordering::Equal);
-            let sb = (b[i] - b[j])
-                .partial_cmp(&0.0)
-                .unwrap_or(std::cmp::Ordering::Equal);
+            let sa = (a[i] - a[j]).total_cmp(&0.0);
+            let sb = (b[i] - b[j]).total_cmp(&0.0);
             use std::cmp::Ordering::*;
             if sa == Equal || sb == Equal {
                 continue;
@@ -172,11 +168,7 @@ pub fn values(e: &Evidence) -> Vec<f64> {
     // ref top-2 order (indices of largest, second largest)
     let ref_top2: Option<(usize, usize)> = {
         let mut order: Vec<usize> = (0..refv.len()).collect();
-        order.sort_by(|&i, &j| {
-            refv[j]
-                .partial_cmp(&refv[i])
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        order.sort_by(|&i, &j| refv[j].total_cmp(&refv[i]));
         if order.len() >= 2 && refv[order[0]] > 0.0 && refv[order[1]] > 0.0 {
             Some((order[0], order[1]))
         } else {

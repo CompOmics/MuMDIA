@@ -1,5 +1,5 @@
 """Build reverse-sequence decoys from the target half of a library, with a
-guaranteed no-overlap-with-targets invariant (clean-room; PLAN.md 9.2).
+guaranteed no-overlap-with-targets invariant (clean-room; docs/13_sidecars.md).
 
 Each target is reversed keeping the C-terminal residue fixed. Reversal preserves
 residue composition, so the decoy keeps the target's precursor m/z + iRT
@@ -22,6 +22,10 @@ Usage: python make_reverse_decoys.py <in_prec> <in_frag> <out_prec> <out_frag>
 import sys, re
 import numpy as np
 import pandas as pd
+# The engine rejects `large_string` parquet columns ("column 'peptidoform' is not
+# utf8"), and `to_parquet` picks the width itself: pandas 3.x chooses the large
+# variant, so this helper silently emitted libraries the engine would not load.
+from _lib_io import write_engine_parquet
 
 RES = {
     'G':57.021463735,'A':71.037113805,'S':87.032028435,'P':97.052763875,'V':99.068413945,
@@ -41,16 +45,68 @@ def parse(pform):
     pform = pform.replace('DECOY_','')
     return [(res, mod[1:-1] if mod else '') for res,mod in TOK.findall(pform)]
 
+class UnknownMod(Exception):
+    """A modification this script cannot assign a mass to."""
+
+
 def mod_mass(name):
-    if not name: return 0.0
+    """Monoisotopic delta for a modification token, or raise.
+
+    Raising rather than returning 0.0 is the whole point. The previous behaviour was
+    `except: d = 0.0`, so any modification outside the eight names in UNIMOD, and any
+    bracket content that is not a bare number, silently became a MASSLESS modification.
+    The decoy's fragment m/z were then computed for the wrong molecule, so those decoys
+    could not match anything, and a decoy that cannot match does not compete: the
+    target-decoy null loses exactly the peptides carrying that modification and the
+    reported q-values are optimistic for them. Nothing in the output distinguishes such
+    a decoy from a good one.
+
+    The sampled calculator check in `main` does not cover this. It compares 500
+    precursors at the 99th percentile, so a modification on a small fraction of the
+    library keeps p99 under the 5 ppm abort threshold and passes.
+
+    The engine's own parser already treats this as an error
+    (`MassError::UnknownModification`, `mumdia-core/src/mass.rs`), and
+    `import_diann_lib.py` drops precursors carrying modifications it does not map. This
+    is the third implementation of the same decision and was the only one that guessed.
+    """
+    if not name:
+        return 0.0
     d = UNIMOD.get(name)
-    if d is None:
-        try: d = float(name.lstrip('+'))
-        except: d = 0.0
-    return d
+    if d is not None:
+        return d
+    try:
+        # A numeric delta, as ProForma writes it: `[+79.966331]`, `[-17.026549]`.
+        return float(name.lstrip('+'))
+    except ValueError:
+        raise UnknownMod(name) from None
 
 def tmass(tok): return RES[tok[0]] + mod_mass(tok[1])
-def valid(toks): return len(toks) > 0 and all(r in RES for r,_ in toks)
+def valid(toks):
+    """Every residue has a mass AND every modification has a mass.
+
+    The modification half was missing, so a peptidoform with an unmodellable mod was
+    called valid and went on to be reversed with that mod silently weighing nothing.
+    """
+    if len(toks) == 0 or not all(r in RES for r, _ in toks):
+        return False
+    for _, m in toks:
+        try:
+            mod_mass(m)
+        except UnknownMod:
+            return False
+    return True
+
+
+def unknown_mods(toks):
+    """The modification names in `toks` that have no mass, for reporting."""
+    out = []
+    for _, m in toks:
+        try:
+            mod_mass(m)
+        except UnknownMod:
+            out.append(m)
+    return out
 def stripped(toks): return ''.join(r for r,_ in toks)
 def to_pform(toks): return ''.join(r + (f'[{m}]' if m else '') for r,m in toks)
 def reverse_keep_cterm(t): return t[:-1][::-1] + t[-1:] if len(t) >= 2 else t[:]
@@ -93,6 +149,21 @@ def main():
     tids = set(tprec.candidate_id); tfrag = frag[frag.candidate_id.isin(tids)].copy()
     tgt_toks = {cid: parse(pf) for cid,pf in zip(tprec.candidate_id, tprec.peptidoform)}
     target_stripped = {stripped(t) for t in tgt_toks.values()}
+
+    # Name the modifications this script cannot model, before anything is written.
+    # `valid()` excludes these precursors below, so they get no decoy; without the
+    # message the only symptom would be a smaller decoy population than target
+    # population, which is easy to miss and biases every q-value that depends on it.
+    unmapped = {}
+    for cid, t in tgt_toks.items():
+        for m in unknown_mods(t):
+            unmapped[m] = unmapped.get(m, 0) + 1
+    if unmapped:
+        listed = ", ".join(f"{k!r} x{v}" for k, v in sorted(unmapped.items()))
+        print(f"WARNING: {sum(unmapped.values())} precursors carry a modification with no "
+              f"mass in this script's table and will get NO decoy: {listed}", flush=True)
+        print("         Add the monoisotopic delta to UNIMOD in this file, or use a "
+              "library whose modifications are written as numeric deltas.", flush=True)
 
     # --- validate m/z calculator against library target fragments ---
     fg = {cid:g for cid,g in tfrag.groupby('candidate_id')}
@@ -170,7 +241,7 @@ def main():
     paired={stripped(tgt_toks[cid]): stripped(rev[cid]) for cid in keep}
     assert len(set(paired.values())) == len(paired), "distinct targets share a decoy sequence"
 
-    allp.to_parquet(outp,index=False); allf.to_parquet(outf,index=False)
+    write_engine_parquet(allp, outp); write_engine_parquet(allf, outf)
     print(f"targets_in={len(tprec)} targets_out={len(tprec_out)} decoys={len(dprec)} total_prec={len(allp)} total_frag={len(allf)}",flush=True)
 
 if __name__=='__main__':

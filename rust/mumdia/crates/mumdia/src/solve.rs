@@ -1,5 +1,5 @@
 //! Deterministic pure-Rust non-negative least squares for spectrum-centric fragment
-//! demixing (fragment_competition_strategies.md, family I3 / D2-D3).
+//! demixing (docs/11_compete_rescore_fdr.md).
 //!
 //! Solves `min_{x >= 0} ||A x - b||^2` where `A` (row-major `m x n`) is the co-isolated
 //! candidate design matrix (rows = observed fragment channels, columns = candidates,

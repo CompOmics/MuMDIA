@@ -1,15 +1,15 @@
-//! Top-K chromatographic peak enumeration (sensitivity program, spec
-//! `04_peak_and_peptide_competition.md` §3, backlog P1).
+//! Top-K chromatographic peak enumeration (sensitivity program,
+//! docs/11_compete_rescore_fdr.md, backlog P1).
 //!
 //! The central sensitivity hypothesis is that MuMDIA selects one chromatographic
 //! apex too early, so the correct peak is discarded before the scorer ever sees it
-//! (spec 01 §3.1). This module is the non-destructive alternative: given a
-//! candidate's consensus elution profile (summed observed fragment intensity per
-//! acquisition-scan group, aligned to a monotonic RT axis), it enumerates up to `K`
-//! local-maximum peak groups, each with an apex, peak boundaries, an integrated
-//! evidence score, and a rank. Downstream code can then compute features for every
-//! retained peak and let an out-of-fold peak-selection model choose, instead of
-//! committing to one apex up front.
+//! (docs/20_sensitivity_and_quantification_playbook.md). This module is the
+//! non-destructive alternative: given a candidate's consensus elution profile
+//! (summed observed fragment intensity per acquisition-scan group, aligned to a
+//! monotonic RT axis), it enumerates up to `K` local-maximum peak groups, each with
+//! an apex, peak boundaries, an integrated evidence score, and a rank. Downstream
+//! code can then compute features for every retained peak and let an out-of-fold
+//! peak-selection model choose, instead of committing to one apex up front.
 //!
 //! This module is intentionally pure and side-effect free so it is cheap to unit
 //! test with synthetic chromatograms (see the tests) and carries no dependency on
@@ -124,13 +124,8 @@ pub fn enumerate_peaks(
     //    Sort strongest-first by area, then apex intensity, then earliest apex.
     peaks.sort_by(|a, b| {
         b.area
-            .partial_cmp(&a.area)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then(
-                b.apex_intensity
-                    .partial_cmp(&a.apex_intensity)
-                    .unwrap_or(std::cmp::Ordering::Equal),
-            )
+            .total_cmp(&a.area)
+            .then(b.apex_intensity.total_cmp(&a.apex_intensity))
             .then(a.apex_idx.cmp(&b.apex_idx))
     });
     let mut kept: Vec<PeakGroup> = Vec::new();

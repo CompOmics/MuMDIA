@@ -121,7 +121,7 @@ fn vlog1p(v: &[f64]) -> Vec<f64> {
 fn ranks(v: &[f64]) -> Vec<f64> {
     let n = v.len();
     let mut idx: Vec<usize> = (0..n).collect();
-    idx.sort_by(|&a, &b| v[a].partial_cmp(&v[b]).unwrap_or(std::cmp::Ordering::Equal));
+    idx.sort_by(|&a, &b| v[a].total_cmp(&v[b]));
     let mut r = vec![0.0f64; n];
     let mut i = 0;
     while i < n {
@@ -176,7 +176,7 @@ fn quantile(v: &[f64], q: f64) -> f64 {
         return 0.0;
     }
     let mut s = v.to_vec();
-    s.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    s.sort_by(|a, b| a.total_cmp(b));
     let pos = q.clamp(0.0, 1.0) * (s.len() - 1) as f64;
     let lo = pos.floor() as usize;
     let hi = pos.ceil() as usize;
@@ -197,7 +197,7 @@ fn gini(v: &[f64]) -> f64 {
     if sum <= 0.0 {
         return 0.0;
     }
-    x.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    x.sort_by(|a, b| a.total_cmp(b));
     let mut acc = 0.0f64;
     for (i, &xi) in x.iter().enumerate() {
         acc += (i as f64 + 1.0) * xi;
@@ -249,7 +249,7 @@ fn trapz(x: &[f64], y: &[f64]) -> f64 {
 /// Indices of the `k` largest strictly-positive entries, descending.
 fn topk_pos(v: &[f64], k: usize) -> Vec<usize> {
     let mut idx: Vec<usize> = (0..v.len()).filter(|&i| v[i] > 0.0).collect();
-    idx.sort_by(|&a, &b| v[b].partial_cmp(&v[a]).unwrap_or(std::cmp::Ordering::Equal));
+    idx.sort_by(|&a, &b| v[b].total_cmp(&v[a]));
     idx.truncate(k);
     idx
 }
@@ -554,11 +554,7 @@ pub fn values(e: &Evidence) -> Vec<f64> {
         let mz_n = n.min(e.frag_mz.len());
         if mz_n >= 2 {
             let mut idx: Vec<usize> = (0..mz_n).collect();
-            idx.sort_by(|&a, &b| {
-                e.frag_mz[a]
-                    .partial_cmp(&e.frag_mz[b])
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
+            idx.sort_by(|&a, &b| e.frag_mz[a].total_cmp(&e.frag_mz[b]));
             let mut cumo = 0.0f64;
             let mut cuml = 0.0f64;
             let mut w = 0.0f64;

@@ -439,7 +439,7 @@ fn median(v: &[f64]) -> f64 {
         return 0.0;
     }
     let mut s = v.to_vec();
-    s.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    s.sort_by(|a, b| a.total_cmp(b));
     let n = s.len();
     if n % 2 == 1 {
         s[n / 2]
@@ -472,7 +472,7 @@ fn iqr(v: &[f64]) -> f64 {
         return 0.0;
     }
     let mut s = v.to_vec();
-    s.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    s.sort_by(|a, b| a.total_cmp(b));
     quantile_sorted(&s, 0.75) - quantile_sorted(&s, 0.25)
 }
 
@@ -511,11 +511,7 @@ fn weighted_reference(traces: &[Vec<f64>], pred: &[f64], t: usize) -> Vec<f64> {
 /// Indices of `v` sorted by value descending (stable on ties by index).
 fn sort_idx_desc(v: &[f64]) -> Vec<usize> {
     let mut idx: Vec<usize> = (0..v.len()).collect();
-    idx.sort_by(|&a, &b| {
-        v[b].partial_cmp(&v[a])
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then(a.cmp(&b))
-    });
+    idx.sort_by(|&a, &b| v[b].total_cmp(&v[a]).then(a.cmp(&b)));
     idx
 }
 

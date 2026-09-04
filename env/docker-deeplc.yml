@@ -1,12 +1,14 @@
-# Conda env "deeplc" for the MuMDIA Docker image: DeepLC 4.0 (multitask, PR #99,
-# pinned commit) + a CPU-only PyTorch. torch and the DeepLC commit are anchored;
-# DeepLC pulls its own scientific-Python dependencies (numpy, pandas, psm-utils,
-# deeplcretrainer, onnx2torch) at compatible versions. The multitask model weight
-# ships inside the DeepLC package, so no separate download is needed. Built into
-# the image as /opt/conda/envs/deeplc; the baked docker/config.dia.json points
-# predict_frag.deeplc_python at its interpreter.
-# python 3.11: DeepLC pulls pandas<2 (no cp312 wheel -> fragile source build);
-# 3.11 has prebuilt wheels for torch-cpu, pandas, and the whole DeepLC graph.
+# Conda env "deeplc" for the MuMDIA Docker image: DeepLC 4.1.1 from PyPI plus a
+# CPU-only PyTorch. Both are pinned; DeepLC pulls its own scientific-Python
+# dependencies (numpy, pandas, scikit-learn, psm-utils) at compatible versions,
+# and its model weights ship inside the package, so nothing is downloaded at run
+# time. Built into the image as /opt/conda/envs/deeplc; the baked
+# docker/config.dia.json points predict_frag.deeplc_python at its interpreter.
+#
+# 4.1.1 is a floor, not merely the current version: the 4.0.0a2 multitask preview
+# overfits per-run fine-tuning badly enough to invert RT-model rankings
+# (docs/08_rt_im_train.md section 4b), so an older DeepLC changes results rather
+# than only performance. DeepLC 4.1.1 requires Python >= 3.11 and torch >= 2.6.
 name: deeplc
 channels:
   - conda-forge
@@ -16,6 +18,5 @@ dependencies:
   - pip:
       - --extra-index-url https://download.pytorch.org/whl/cpu
       - torch==2.12.1+cpu
-      - "numpy<2"
       - pyarrow
-      - deeplc @ git+https://github.com/CompOmics/DeepLC.git@5c6a94e3a0d1f22a6b237642c21b97b918b10fc0
+      - deeplc==4.1.1

@@ -1,9 +1,9 @@
-//! Native semi-supervised rescorer (PLAN.md Stage F, MVP `native_tda`): a
-//! Percolator/Mokapot-style linear model. Standardize features, then for each
-//! cross-validation fold train a logistic regression on a positive set of
-//! confident targets versus all decoys, iterating the positive-set selection.
-//! Deterministic (weights start at zero, no RNG). Port features, not classifiers
-//! (PLAN.md Section 8.5 item; the model is intentionally simple and swappable).
+//! Native semi-supervised rescorer (docs/11_compete_rescore_fdr.md, MVP
+//! `native_tda`): a Percolator/Mokapot-style linear model. Standardize features,
+//! then for each cross-validation fold train a logistic regression on a positive
+//! set of confident targets versus all decoys, iterating the positive-set
+//! selection. Deterministic (weights start at zero, no RNG). Port features, not
+//! classifiers; the model is intentionally simple and swappable.
 
 use crate::fdr::target_decoy_q;
 use rayon::prelude::*;
@@ -154,7 +154,7 @@ pub fn percolator_lite(inp: RescoreInput) -> Vec<f64> {
                 // fallback: if too few confident targets, take the top-scoring half
                 if n_pos < 10 {
                     let mut order: Vec<usize> = (0..train_idx.len()).collect();
-                    order.sort_by(|&a, &b| train_scores[b].partial_cmp(&train_scores[a]).unwrap());
+                    order.sort_by(|&a, &b| train_scores[b].total_cmp(&train_scores[a]));
                     let take = (train_idx.len() / 2).max(1);
                     rows.clear();
                     ys.clear();

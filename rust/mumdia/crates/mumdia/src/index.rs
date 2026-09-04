@@ -1,5 +1,5 @@
-//! The inverted fragment index (PLAN.md Stage D part 1) shared by search-seed
-//! and extract.
+//! The inverted fragment index (docs/06_predict_frag_index_matchers.md), shared
+//! by search-seed and extract.
 //!
 //! Structure-of-Arrays, flat and contiguous: three parallel arrays
 //! (`idx_mz`, `idx_cid`, `idx_int`) globally sorted by fragment m/z, then
@@ -9,10 +9,10 @@
 //! query, a second over `candidate_id` narrows to the isolation-window slice,
 //! and a linear tail applies the exact ppm bound (mirrors Sage `page_search`).
 //!
-//! MVP stores the index m/z as f32 and does all ppm math in f64 (PLAN.md
-//! Stage D precision note). RT is applied as a per-candidate window post-filter
-//! at probe time rather than a pre-partition (the documented fallback, PLAN.md
-//! Stage D part 2), which keeps the index run-independent.
+//! MVP stores the index m/z as f32 and does all ppm math in f64
+//! (docs/06_predict_frag_index_matchers.md). RT is applied as a per-candidate
+//! window post-filter at probe time rather than a pre-partition (the documented
+//! fallback, docs/09_extract.md), which keeps the index run-independent.
 
 use anyhow::Result;
 use mumdia_core::constants::{ppm_bounds, PROTON};
@@ -57,6 +57,39 @@ pub struct Library {
     pub prec_mz: Vec<f64>,
 }
 
+/// Reject a non-finite value in a numeric library column, naming the row, the column
+/// and the file so the user can find the cell.
+///
+/// The engine validates finiteness at every internal and sidecar boundary
+/// (`predict_frag.rs` on sidecar output, `rescore.rs` on the feature matrix and on
+/// returned scores) and, before this, at neither external-input boundary. A NULL in a
+/// user-supplied Parquet becomes NaN, and NaN is *accepted* by the comparison-based
+/// guards downstream rather than rejected by them, so the failure is silent and
+/// directional. These two helpers are the missing half of that contract.
+fn require_finite_f64(v: &[f64], column: &str, path: &str) -> Result<()> {
+    if let Some(row) = v.iter().position(|x| !x.is_finite()) {
+        anyhow::bail!(
+            "library column '{column}' has a non-finite value ({}) at row {row} in {path}; \
+             a Parquet NULL decodes to NaN, and a NaN here silently means \"unbounded\" or \
+             \"matches everything\" downstream rather than an error. Fix or drop the row",
+            v[row]
+        );
+    }
+    Ok(())
+}
+
+fn require_finite_f32(v: &[f32], column: &str, path: &str) -> Result<()> {
+    if let Some(row) = v.iter().position(|x| !x.is_finite()) {
+        anyhow::bail!(
+            "library column '{column}' has a non-finite value ({}) at row {row} in {path}; \
+             a Parquet NULL decodes to NaN, and a NaN here silently means \"unbounded\" or \
+             \"matches everything\" downstream rather than an error. Fix or drop the row",
+            v[row]
+        );
+    }
+    Ok(())
+}
+
 impl Library {
     /// Load a library and build the bucketed inverted index.
     ///
@@ -87,6 +120,45 @@ impl Library {
         let label = pt.str("label")?;
         let protein = pt.str("protein")?;
         crate::fdr::validate_labels(&label)?;
+        // A Parquet NULL decodes to NaN (mumdia-io `Table::f64`/`f32`), and NaN is
+        // accepted rather than rejected by every downstream guard that should catch it:
+        // the ascending-m/z check below is `<`, the extract RT-window guards are
+        // `rt < lo || rt > hi`, and `within_ppm` compares against `min`/`max`, all of
+        // which are false for NaN. So a single empty cell in a converted third-party
+        // library does not produce a NaN result, it produces a candidate that is absent
+        // from its own isolation window or one that matches every peak. Reject at load,
+        // where the offending row can still be named.
+        require_finite_f64(&pmz, "precursor_mz", precursors)?;
+        require_finite_f32(&irt, "predicted_irt", precursors)?;
+        // Charge must be positive. `ISOTOPE_SPACING / z` divides by it in three places in
+        // extract, so a 0 gives an infinite spacing and every MS1 isotope channel lands
+        // at the same m/z; a negative charge mirrors the envelope. Since a NULL in an
+        // integer column used to decode as the raw buffer value -- in practice 0 -- an
+        // imported library with a missing charge produced exactly that, silently. The
+        // NULL is rejected by the accessor now, but an explicit 0 or -1 in the file still
+        // has to be caught here.
+        if let Some(row) = charge.iter().position(|&z| z <= 0) {
+            anyhow::bail!(
+                "library column 'charge' is {} at row {row} in {precursors}, but charge \
+                 must be >= 1: extract divides the isotope spacing by it, so a 0 collapses \
+                 every isotope channel onto one m/z and a negative value mirrors the \
+                 envelope",
+                charge[row]
+            );
+        }
+        // Required strings must carry something. The accessor rejects a NULL, but an
+        // explicitly empty string is a different thing and still reaches here: an empty
+        // `peptidoform` cannot be parsed into residues, and an empty `protein` silently
+        // joins every such candidate into one protein group.
+        for (col, values) in [("peptidoform", &pform), ("protein", &protein)] {
+            if let Some(row) = values.iter().position(|v| v.trim().is_empty()) {
+                anyhow::bail!(
+                    "library column '{col}' is empty at row {row} in {precursors}; it is \
+                     required, and an empty value would be carried silently into \
+                     peptidoform parsing or protein grouping"
+                );
+            }
+        }
 
         let ncand = pt.nrows;
         // The typed getters above returned owned Vecs, so the decoded Arrow batches are
@@ -109,6 +181,26 @@ impl Library {
         let mut f_name = ft.str("name")?;
         let n_frag_rows = ft.nrows;
         drop(ft);
+        // Same contract as the precursor columns above. A non-finite fragment m/z is
+        // worse than a wrong value: `FragIndex::build` collapses its whole m/z range to
+        // a two-Da placeholder when the observed min or max is not finite, which clamps
+        // every real fragment into one bin and turns the probe into a linear scan of the
+        // entire posting list. A non-finite predicted_intensity sorts ahead of every real
+        // value under `total_cmp`, so it is preferentially selected for quantification.
+        require_finite_f64(&f_mz, "mz", fragments)?;
+        require_finite_f32(&f_int, "predicted_intensity", fragments)?;
+        // The fragment index addresses postings with a u32. `FragIndex::build` asserts
+        // this, but only after the whole library is resident, so the failure was a bare
+        // assert at the end of a long load. Check it here, where it is a normal error with
+        // the count in it.
+        if n_frag_rows > u32::MAX as usize {
+            anyhow::bail!(
+                "fragment library has {n_frag_rows} rows, more than the u32::MAX ({}) the \
+                 fragment index can address; split the library or reduce the predicted \
+                 fragments per precursor",
+                u32::MAX
+            );
+        }
         // Precondition: candidate_id is the contiguous, row-aligned range 0..ncand
         // (the library + decoy builders guarantee this). An external library that
         // violates it would misgroup fragments or panic on the index below, so
@@ -217,8 +309,13 @@ impl Library {
         // an unsorted import (e.g. `import_diann_lib.py` output fed directly,
         // skipping the sorting decoy builder) would silently return wrong
         // candidate windows. Check explicitly and fail loudly.
+        // The `is_nan()` arm is not redundant with the finiteness pass at the top of this
+        // function: a bare `<` is false for NaN, so without it a NaN would pass the very
+        // check whose purpose is to stop `partition_point` running on a slice that is not
+        // partitioned by its predicate. Keeping both means neither guard is load-bearing
+        // alone.
         for c in 1..ncand {
-            if prec_mz[c] < prec_mz[c - 1] {
+            if prec_mz[c] < prec_mz[c - 1] || prec_mz[c].is_nan() {
                 anyhow::bail!(
                     "library precursors must be ascending by precursor_mz (row {c} m/z \
                      {} < row {} m/z {}); sort/reindex the library (the decoy-builder \
@@ -260,7 +357,7 @@ impl Library {
             }
             // Global sort by fragment m/z. Parallel stable sort: identical result to
             // the serial stable `sort_by` (same comparator, ties keep input order).
-            entries.par_sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+            entries.par_sort_by(|a, b| a.0.total_cmp(&b.0));
 
             // Chunk into buckets; within a bucket sort by candidate_id.
             for chunk_start in (0..entries.len()).step_by(bs) {
@@ -346,7 +443,7 @@ impl Library {
 
     /// Probe the index for observed neutral m/z `q` within `tol_ppm`, restricted
     /// to candidate ids in [cand_lo, cand_hi). Calls `f(candidate_id, frag_mz,
-    /// predicted_intensity)` for each match (PLAN.md Stage D `page_search`).
+    /// predicted_intensity)` for each match (docs/06_predict_frag_index_matchers.md).
     pub fn page_search<F: FnMut(u32, f32, f32)>(
         &self,
         q: f64,
@@ -388,8 +485,8 @@ impl Library {
     }
 }
 
-/// Deconvolve an observed z-charged peak m/z to neutral m/z (PLAN.md Stage D
-/// point 3). Done in f64.
+/// Deconvolve an observed z-charged peak m/z to neutral m/z
+/// (docs/06_predict_frag_index_matchers.md). Done in f64.
 #[inline]
 pub fn deconvolve(peak_mz: f64, z: i32) -> f64 {
     peak_mz * z as f64 - (z as f64 - 1.0) * PROTON
@@ -447,7 +544,10 @@ mod tests {
 
     #[test]
     fn page_search_finds_only_in_window_and_tol() {
-        let dir = std::env::temp_dir().join("mumdia_index_test");
+        // Unique per process: a fixed name races when two `cargo test` runs share a
+        // machine, which is the convention docs/14 states and four other test modules
+        // already follow.
+        let dir = std::env::temp_dir().join(format!("mumdia_index_test_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let (p, f) = build_tiny_lib(&dir);
         let lib = Library::load(&p, &f, 8).unwrap();
@@ -473,5 +573,208 @@ mod tests {
         let mut hits3 = Vec::new();
         lib.page_search(250.5, 20.0, lo1, hi1, |cid, _, _| hits3.push(cid));
         assert_eq!(hits3, vec![1]);
+    }
+
+    /// Write a library whose numeric columns can be poisoned, into a caller-unique
+    /// directory. Mirrors `build_tiny_lib` but parameterised on the two values whose
+    /// non-finite forms the loader must reject.
+    fn build_lib_values(
+        dir: &std::path::Path,
+        pmz: Vec<f64>,
+        frag_mz: Vec<f64>,
+    ) -> (String, String) {
+        std::fs::create_dir_all(dir).unwrap();
+        let p = dir.join("prec.parquet").to_str().unwrap().to_string();
+        let f = dir.join("frag.parquet").to_str().unwrap().to_string();
+        write_table(
+            &p,
+            vec![
+                Col::U32("candidate_id".into(), vec![0, 1]),
+                Col::U32("peptidoform_id".into(), vec![0, 1]),
+                Col::U32("base_peptide_id".into(), vec![0, 1]),
+                Col::Str(
+                    "peptidoform".into(),
+                    vec!["PEPTIDEK".into(), "SAMPLER".into()],
+                ),
+                Col::I32("charge".into(), vec![2, 2]),
+                Col::F64("precursor_mz".into(), pmz),
+                Col::F32("predicted_irt".into(), vec![10.0, 20.0]),
+                Col::Str("label".into(), vec!["target".into(), "decoy".into()]),
+                Col::Str("protein".into(), vec!["P1".into(), "P2".into()]),
+                Col::I32("n_fragments".into(), vec![1, 1]),
+            ],
+        )
+        .unwrap();
+        write_table(
+            &f,
+            vec![
+                Col::U32("candidate_id".into(), vec![0, 1]),
+                Col::F64("mz".into(), frag_mz),
+                Col::F32("predicted_intensity".into(), vec![1.0, 0.9]),
+                Col::Str("name".into(), vec!["b2".into(), "y3".into()]),
+                Col::Str("ion_type".into(), vec!["b".into(), "y".into()]),
+                Col::I32("ordinal".into(), vec![2, 3]),
+                Col::I32("frag_charge".into(), vec![1, 1]),
+            ],
+        )
+        .unwrap();
+        (p, f)
+    }
+
+    fn unique_dir(tag: &str) -> std::path::PathBuf {
+        // Unique per process so two concurrent `cargo test` runs cannot race, per the
+        // convention in docs/14.
+        std::env::temp_dir().join(format!("mumdia_index_{tag}_{}", std::process::id()))
+    }
+
+    #[test]
+    fn non_finite_precursor_mz_is_rejected_with_the_row() {
+        // A Parquet NULL decodes to NaN. Before the finiteness pass, NaN passed the
+        // ascending-m/z check (a bare `<` is false for NaN), and `candidate_range`'s
+        // `partition_point` then ran on a slice that was not partitioned by its
+        // predicate: with [400, NaN] a window around 400 could return an empty range,
+        // so a precursor genuinely inside the isolation window was never extracted in
+        // any scan of that window for the whole run.
+        let dir = unique_dir("nan_pmz");
+        let (p, f) = build_lib_values(&dir, vec![400.0, f64::NAN], vec![200.1, 250.5]);
+        // `unwrap_err` would require Debug on Library, which is a large SoA type.
+        let err = match Library::load(&p, &f, 8) {
+            Ok(_) => panic!("a non-finite library value must be rejected at load"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("precursor_mz"), "{err}");
+        assert!(err.contains("non-finite"), "{err}");
+        assert!(
+            err.contains("row 1"),
+            "should name the offending row: {err}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn non_finite_fragment_mz_is_rejected() {
+        // An infinite fragment m/z used to collapse the fragment index's whole m/z range
+        // to a two-Da placeholder, clamping every real fragment into one bin and turning
+        // the +/-1 probe into a linear scan of the entire posting list per peak: no error,
+        // no wrong answer, an unbounded hang.
+        let dir = unique_dir("inf_frag");
+        let (p, f) = build_lib_values(&dir, vec![400.0, 500.0], vec![200.1, f64::INFINITY]);
+        // `unwrap_err` would require Debug on Library, which is a large SoA type.
+        let err = match Library::load(&p, &f, 8) {
+            Ok(_) => panic!("a non-finite library value must be rejected at load"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("'mz'"), "{err}");
+        assert!(err.contains("non-finite"), "{err}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn finite_library_still_loads() {
+        // Guard against the finiteness pass rejecting a valid library.
+        let dir = unique_dir("ok");
+        let (p, f) = build_lib_values(&dir, vec![400.0, 500.0], vec![200.1, 250.5]);
+        let lib = Library::load(&p, &f, 8).unwrap();
+        assert_eq!(lib.n_candidates(), 2);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn non_positive_charge_is_rejected() {
+        // `ISOTOPE_SPACING / z` divides by charge in three places in extract, so a 0
+        // collapses every isotope channel onto one m/z. A NULL in an integer column used
+        // to decode as the raw buffer value -- in practice 0 -- so an imported library
+        // with a missing charge produced exactly that, silently.
+        let dir = unique_dir("bad_charge");
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("prec.parquet").to_str().unwrap().to_string();
+        let f = dir.join("frag.parquet").to_str().unwrap().to_string();
+        write_table(
+            &p,
+            vec![
+                Col::U32("candidate_id".into(), vec![0, 1]),
+                Col::U32("peptidoform_id".into(), vec![0, 1]),
+                Col::U32("base_peptide_id".into(), vec![0, 1]),
+                Col::Str(
+                    "peptidoform".into(),
+                    vec!["PEPTIDEK".into(), "SAMPLER".into()],
+                ),
+                Col::I32("charge".into(), vec![2, 0]),
+                Col::F64("precursor_mz".into(), vec![400.0, 500.0]),
+                Col::F32("predicted_irt".into(), vec![10.0, 20.0]),
+                Col::Str("label".into(), vec!["target".into(), "decoy".into()]),
+                Col::Str("protein".into(), vec!["P1".into(), "P2".into()]),
+                Col::I32("n_fragments".into(), vec![1, 1]),
+            ],
+        )
+        .unwrap();
+        write_table(
+            &f,
+            vec![
+                Col::U32("candidate_id".into(), vec![0, 1]),
+                Col::F64("mz".into(), vec![200.1, 250.5]),
+                Col::F32("predicted_intensity".into(), vec![1.0, 0.9]),
+                Col::Str("name".into(), vec!["b2".into(), "y3".into()]),
+                Col::Str("ion_type".into(), vec!["b".into(), "y".into()]),
+                Col::I32("ordinal".into(), vec![2, 3]),
+                Col::I32("frag_charge".into(), vec![1, 1]),
+            ],
+        )
+        .unwrap();
+        let err = match Library::load(&p, &f, 8) {
+            Ok(_) => panic!("charge 0 must be rejected at load"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("'charge'"), "{err}");
+        assert!(err.contains("row 1"), "should name the row: {err}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn empty_required_string_is_rejected() {
+        // The accessor rejects a NULL now, but an explicitly empty string is a different
+        // thing: an empty `protein` silently joins every such candidate into one group.
+        let dir = unique_dir("empty_protein");
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("prec.parquet").to_str().unwrap().to_string();
+        let f = dir.join("frag.parquet").to_str().unwrap().to_string();
+        write_table(
+            &p,
+            vec![
+                Col::U32("candidate_id".into(), vec![0, 1]),
+                Col::U32("peptidoform_id".into(), vec![0, 1]),
+                Col::U32("base_peptide_id".into(), vec![0, 1]),
+                Col::Str(
+                    "peptidoform".into(),
+                    vec!["PEPTIDEK".into(), "SAMPLER".into()],
+                ),
+                Col::I32("charge".into(), vec![2, 2]),
+                Col::F64("precursor_mz".into(), vec![400.0, 500.0]),
+                Col::F32("predicted_irt".into(), vec![10.0, 20.0]),
+                Col::Str("label".into(), vec!["target".into(), "decoy".into()]),
+                Col::Str("protein".into(), vec!["P1".into(), "".into()]),
+                Col::I32("n_fragments".into(), vec![1, 1]),
+            ],
+        )
+        .unwrap();
+        write_table(
+            &f,
+            vec![
+                Col::U32("candidate_id".into(), vec![0, 1]),
+                Col::F64("mz".into(), vec![200.1, 250.5]),
+                Col::F32("predicted_intensity".into(), vec![1.0, 0.9]),
+                Col::Str("name".into(), vec!["b2".into(), "y3".into()]),
+                Col::Str("ion_type".into(), vec!["b".into(), "y".into()]),
+                Col::I32("ordinal".into(), vec![2, 3]),
+                Col::I32("frag_charge".into(), vec![1, 1]),
+            ],
+        )
+        .unwrap();
+        let err = match Library::load(&p, &f, 8) {
+            Ok(_) => panic!("an empty required string must be rejected at load"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("'protein'"), "{err}");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

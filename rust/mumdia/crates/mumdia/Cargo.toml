@@ -2,7 +2,15 @@
 name = "mumdia"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+publish.workspace = true
+description = "MuMDIA command-line DIA proteomics search engine"
 
 [[bin]]
 name = "mumdia"
@@ -24,3 +32,6 @@ arrow.workspace = true
 parquet.workspace = true
 mzdata.workspace = true
 mimalloc.workspace = true
+
+[lints]
+workspace = true

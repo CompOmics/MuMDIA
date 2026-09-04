@@ -1,5 +1,14 @@
-//! Frozen artifact schema identifiers (PLAN.md Section 3.3, 3.5). Each artifact
-//! carries a logical schema name and version so a stage can validate its inputs
+//! Frozen artifact schema identifiers (docs/03_io_layer.md). Each artifact
+//! carries a logical schema name and version, recorded in the artifact's
+//! `report.json` and in the run manifest.
+//!
+//! What this is NOT, despite the previous wording here: input validation. No code
+//! anywhere reads a `schema_version` back and compares it -- all uses are writes. The
+//! version is provenance, so a reader of a finished artifact can tell which shape it
+//! is; a stage handed an incompatible artifact still fails on the missing or retyped
+//! column, not on the version. Claiming otherwise mattered because `CONTRIBUTING.md`
+//! stated a compatibility policy that nothing enforced. Making the check real is
+//! worthwhile and is a separate change; until then the honest statement is this one
 //! and a model is never applied under a mismatched schema.
 
 /// (logical name, schema version) for every MVP artifact.
@@ -12,6 +21,7 @@ pub mod artifact {
     pub const PEPTIDOFORMS: (&str, u32) = ("peptidoforms", 1);
     pub const FRAGMENT_LIBRARY_PRECURSORS: (&str, u32) = ("fragment_library_precursors", 1);
     pub const FRAGMENT_LIBRARY_FRAGMENTS: (&str, u32) = ("fragment_library_fragments", 1);
+    pub const PRESCAN_SURVIVORS: (&str, u32) = ("prescan_survivors", 1);
     pub const SEED_PSMS: (&str, u32) = ("seed_psms", 1);
     pub const RUN_WINDOWS: (&str, u32) = ("run_windows", 1);
     pub const PSMS_EXTRACTED: (&str, u32) = ("psms_extracted", 2);
@@ -22,4 +32,6 @@ pub mod artifact {
     pub const PEPTIDE_QUANT: (&str, u32) = ("peptide_quant", 2);
     pub const PROTEIN_GROUP_QUANT: (&str, u32) = ("protein_group_quant", 2);
     pub const FRAGMENT_QUANT: (&str, u32) = ("fragment_quant", 1);
+    /// Cross-run MaxLFQ table, written only by `run-experiment` and `quant-lfq`.
+    pub const LFQ_MAXLFQ: (&str, u32) = ("lfq_maxlfq", 1);
 }

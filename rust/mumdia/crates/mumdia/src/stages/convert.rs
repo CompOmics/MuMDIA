@@ -1,5 +1,5 @@
 //! Stage 0 `mumdia convert`: read an mzML run into the normalized spectra
-//! artifact set (PLAN.md Stage 0). MVP is mzML-only and 3D, so ion-mobility
+//! artifact set (docs/04_convert.md). MVP is mzML-only and 3D, so ion-mobility
 //! columns are absent. Profile spectra are centroided (simple local-maxima)
 //! so downstream matching sees discrete peaks.
 
@@ -12,12 +12,19 @@ use mumdia_io::table::{write_table, Col};
 use mzdata::prelude::*;
 use mzdata::spectrum::SignalContinuity;
 use serde_json::json;
-use tracing::info;
+use tracing::{info, warn};
 
 /// Centroid a profile spectrum by local maxima with 3-point parabolic m/z
 /// refinement. Peaks below `noise_floor` (relative to the max) are dropped.
 fn centroid(mz: &[f64], inten: &[f32]) -> (Vec<f64>, Vec<f32>) {
-    let n = mz.len();
+    // `.min()`, not `mz.len()`. The two arrays are decoded independently from the file
+    // and either decode is allowed to fail (`unwrap_or_default` in `peaks_of`), while
+    // mzdata never checks `defaultArrayLength` on read. So a profile spectrum with at
+    // least 3 m/z values and a shorter or undecodable intensity array indexed
+    // `inten[i + 1]` out of bounds and panicked on the first iteration. Checked Rust, so
+    // the outcome was always a panic rather than an out-of-bounds read; still a crash on
+    // a plain `mumdia convert` of a damaged file. `spectra.rs:68` already had this guard.
+    let n = mz.len().min(inten.len());
     if n < 3 {
         return (mz.to_vec(), inten.to_vec());
     }
@@ -53,12 +60,16 @@ fn centroid(mz: &[f64], inten: &[f32]) -> (Vec<f64>, Vec<f32>) {
 
 /// Extract (m/z, intensity) as centroided, m/z-sorted, non-zero peaks, capped
 /// to `top_n` most intense (0 = no cap).
-fn peaks_of<S: SpectrumLike>(spec: &S, top_n: usize) -> (Vec<f32>, Vec<f32>) {
+fn peaks_of<S: SpectrumLike>(spec: &S, top_n: usize) -> (Vec<f32>, Vec<f32>, usize) {
     let (mut mz, mut inten): (Vec<f64>, Vec<f32>) = match spec.raw_arrays() {
         Some(arrays) => {
             let m = arrays.mzs().map(|c| c.to_vec()).unwrap_or_default();
             let it = arrays.intensities().map(|c| c.to_vec()).unwrap_or_default();
-            (m, it)
+            // Truncate both to the shorter length rather than carrying a mismatch
+            // downstream. `zip` below would silently drop the tail anyway; doing it here
+            // means `centroid` and every later reader see a consistent pair.
+            let k = m.len().min(it.len());
+            (m[..k].to_vec(), it[..k].to_vec())
         }
         None => (Vec::new(), Vec::new()),
     };
@@ -67,20 +78,38 @@ fn peaks_of<S: SpectrumLike>(spec: &S, top_n: usize) -> (Vec<f32>, Vec<f32>) {
         mz = cm;
         inten = ci;
     }
-    // Drop zero/negative intensity.
+    // Drop zero/negative intensity, and NON-FINITE m/z or intensity.
+    //
+    // The intensity filter `*i > 0.0` is already false for NaN, so a NaN intensity was
+    // dropped by accident. A NaN m/z with a positive intensity was not, and reached the
+    // sorts below, where `partial_cmp(...).unwrap()` panics: a single malformed value in
+    // an mzML aborted `mumdia convert` with an unwrap message naming neither the spectrum
+    // nor the value. An infinite m/z was worse than a panic -- it survived, and one
+    // non-finite fragment m/z collapses the whole fragment index range (see
+    // `FragIndex::build`).
+    //
+    // Dropping rather than erroring, because a peak list is a measurement and one bad
+    // peak in one spectrum is not a reason to refuse a whole run; the caller reports the
+    // count so the loss is visible rather than silent.
+    let n_before = mz.len();
     let mut pairs: Vec<(f64, f32)> = mz
         .into_iter()
         .zip(inten)
-        .filter(|(_, i)| *i > 0.0)
+        .filter(|(m, i)| *i > 0.0 && m.is_finite() && i.is_finite())
         .collect();
+    let dropped_nonfinite = n_before.saturating_sub(pairs.len());
     if top_n > 0 && pairs.len() > top_n {
-        pairs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        // `total_cmp` rather than `partial_cmp(..).unwrap()`. Every value here is finite
+        // by the filter above, so the two agree; `total_cmp` is a genuine total order, so
+        // it cannot panic and cannot trip the "comparison function does not correctly
+        // implement a total order" check that `sort_by` has had since Rust 1.81.
+        pairs.sort_by(|a, b| b.1.total_cmp(&a.1));
         pairs.truncate(top_n);
     }
-    pairs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+    pairs.sort_by(|a, b| a.0.total_cmp(&b.0));
     let out_mz: Vec<f32> = pairs.iter().map(|(m, _)| *m as f32).collect();
     let out_in: Vec<f32> = pairs.iter().map(|(_, i)| *i).collect();
-    (out_mz, out_in)
+    (out_mz, out_in, dropped_nonfinite)
 }
 
 pub struct ConvertParams<'a> {
@@ -100,11 +129,49 @@ pub struct ConvertOutputs {
     pub ms2_to_ms1: String,
 }
 
+/// The `count` attribute of `<spectrumList>`, read from the head of an mzML.
+///
+/// `None` when the file is compressed, the attribute is absent, or the head cannot be
+/// read: the caller then skips the completeness check rather than guessing.
+fn declared_spectrum_count(path: &str) -> Option<usize> {
+    use std::io::Read as _;
+    let mut head = vec![0u8; 1 << 20];
+    let mut f = std::fs::File::open(path).ok()?;
+    let n = f.read(&mut head).ok()?;
+    let text = String::from_utf8_lossy(&head[..n]);
+    let at = text.find("<spectrumList")?;
+    let rest = &text[at..];
+    let c = rest.find("count=")? + "count=".len();
+    let rest = rest[c..].trim_start();
+    let quote = rest.chars().next()?;
+    if quote != '"' && quote != '\'' {
+        return None;
+    }
+    let digits: String = rest[1..]
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    digits.parse().ok()
+}
+
 pub fn run(p: ConvertParams) -> Result<ConvertOutputs> {
     let t0 = Instant::now();
     std::fs::create_dir_all(p.out_dir).ok();
     info!(mzml = p.mzml, "convert: opening mzML");
     let reader = mzdata::MZReader::open_path(p.mzml).with_context(|| format!("open {}", p.mzml))?;
+    // The number of spectra the file SAYS it has, read from its own header.
+    //
+    // The iteration below yields `Spectrum`, not `Result<Spectrum>`, so a parse error
+    // part-way through a file simply ends the iterator: a truncated download or a
+    // dropped network share produced a complete-looking artifact set covering the first
+    // fraction of the gradient, at exit 0, with no error. mzdata does log the parse
+    // failure, but a log line does not stop the pipeline and is easy to miss in a batch.
+    //
+    // Deliberately NOT `SpectrumSource::len()`: that comes from the index, and in an
+    // indexedmzML the index is at the END of the file, so exactly the truncation this
+    // guard is for makes it read 0. `spectrumList count` is in the header, a few hundred
+    // KiB in at most, so it survives any truncation long enough to be worth checking.
+    let declared = declared_spectrum_count(p.mzml).unwrap_or(0);
 
     // MS1 accumulators
     let (mut ms1_idx, mut ms1_rt) = (Vec::new(), Vec::new());
@@ -117,14 +184,46 @@ pub fn run(p: ConvertParams) -> Result<ConvertOutputs> {
     let (mut map_ms2, mut map_ms1) = (Vec::new(), Vec::new());
 
     let mut last_ms1_index: Option<u32> = None;
+    let mut read = 0usize;
+    // Peaks dropped for a non-finite m/z or intensity. Counted rather than ignored:
+    // a handful is a damaged spectrum, and a large fraction means the file or the
+    // converter that produced it is wrong, which is worth knowing before the numbers
+    // are believed.
+    let mut nonfinite_peaks = 0usize;
+    // Spectra dropped for a non-finite retention time, and the first one's id.
+    //
+    // Retention time was the one externally supplied float this stage did not check,
+    // and it is the value everything downstream keys on. A single `NaN` scan start time
+    // in one scan of an mzML -- reproduced by editing one `scan start time` value in the
+    // fixture -- passed convert without a warning, was written into the spectra
+    // artifact, and then aborted `mumdia run` inside extract with
+    // `called `Option::unwrap()` on a `None` value` at `extract.rs`, naming neither the
+    // file, nor the scan, nor the value. The peak filter in `peaks_of` had exactly this
+    // hole closed for m/z and intensity; RT was missed.
+    //
+    // Dropped rather than fatal, for the same reason as a bad peak: one unusable scan is
+    // not a reason to refuse a run, and a spectrum with no retention time cannot be
+    // placed in a chromatogram, so there is nothing else to do with it. The count and
+    // the first offending scan id are reported, and the existing "no MS2 spectra" bail
+    // below is the backstop for a file whose retention times are ALL unusable.
+    let mut nonfinite_rt = 0usize;
+    let mut first_bad_rt: Option<String> = None;
     for (count, (scan_index, spec)) in (0_u32..).zip(reader).enumerate() {
         if p.max_spectra > 0 && count >= p.max_spectra {
             break;
         }
         let rt_s = spec.start_time() * 60.0; // mzdata returns minutes
+        if !rt_s.is_finite() {
+            nonfinite_rt += 1;
+            if first_bad_rt.is_none() {
+                first_bad_rt = Some(format!("{} (rt={})", spec.id(), rt_s));
+            }
+            continue;
+        }
         match spec.ms_level() {
             1 => {
-                let (mz, inten) = peaks_of(&spec, p.top_peaks_ms1);
+                let (mz, inten, nf) = peaks_of(&spec, p.top_peaks_ms1);
+                nonfinite_peaks += nf;
                 ms1_idx.push(scan_index);
                 ms1_rt.push(rt_s);
                 ms1_mz.push(mz);
@@ -132,7 +231,8 @@ pub fn run(p: ConvertParams) -> Result<ConvertOutputs> {
                 last_ms1_index = Some(scan_index);
             }
             2 => {
-                let (mz, inten) = peaks_of(&spec, p.top_peaks_ms2);
+                let (mz, inten, nf) = peaks_of(&spec, p.top_peaks_ms2);
+                nonfinite_peaks += nf;
                 let prec = spec.precursor();
                 let iw = prec.map(|pr| pr.isolation_window.clone());
                 let (wt, wl, wu) = match &iw {
@@ -161,8 +261,71 @@ pub fn run(p: ConvertParams) -> Result<ConvertOutputs> {
             }
             _ => {}
         }
+        read = count + 1;
     }
 
+    // A short read means the file ended before the index said it would. `--max-spectra`
+    // truncates deliberately, so it is excluded.
+    let capped = p.max_spectra > 0 && read >= p.max_spectra;
+    if !capped && declared > 0 && read < declared {
+        anyhow::bail!(
+            concat!(
+                "{} declares {} spectra in its header but only {} could be read, so it ",
+                "is truncated or corrupt. An interrupted transfer of a large mzML is the ",
+                "usual cause. Continuing would produce a complete-looking artifact set ",
+                "covering only the first {:.0}% of the run. Re-transfer or re-convert ",
+                "the file and compare sizes."
+            ),
+            p.mzml,
+            declared,
+            read,
+            100.0 * read as f64 / declared as f64
+        );
+    }
+    // Zero MS2 is never a legitimate DIA run, and it is the shape every downstream stage
+    // silently tolerates: search-seed finds nothing, extract runs the whole library
+    // against an empty spectrum list, and report writes a header-only peptides.tsv, all
+    // at exit 0. Fail here, where the cause is still visible.
+    if nonfinite_peaks > 0 {
+        warn!(
+            nonfinite_peaks,
+            mzml = p.mzml,
+            "convert: dropped peaks with a non-finite m/z or intensity. A few indicate a              damaged spectrum; a large number indicates a problem with the file or with              the converter that wrote it"
+        );
+    }
+    if nonfinite_rt > 0 {
+        warn!(
+            nonfinite_rt,
+            first = first_bad_rt.as_deref().unwrap_or("?"),
+            mzml = p.mzml,
+            concat!(
+                "convert: dropped spectra whose scan start time is not finite. Such a ",
+                "spectrum cannot be placed in a chromatogram, and left in place it ",
+                "propagates NaN into the retention-time windows and aborts a later stage"
+            )
+        );
+    }
+    if m2_idx.is_empty() {
+        anyhow::bail!(
+            concat!(
+                "{} yielded no MS2 spectra ({} MS1). A DIA run must contain MS2, so this ",
+                "is the wrong file, an MS1-only acquisition, or a conversion that dropped ",
+                "the MS2 level. Every later stage tolerates an empty spectrum list ",
+                "silently -- search-seed finds nothing, extract runs the whole library ",
+                "against nothing, report writes a header-only peptides.tsv -- so this has ",
+                "to fail here."
+            ),
+            p.mzml,
+            ms1_idx.len()
+        );
+    }
+
+    // The peak columns below are `LargeListF32`, not `ListF32`: a 32-bit arrow
+    // `ListArray` offset saturates above 2^31-1 total values and
+    // `GenericListBuilder::finish` unwraps the `None`, so the panic is inside arrow with
+    // no useful message. `extract.rs` already migrated the chromatogram columns for this
+    // reason. A 50-window Orbitrap run has ~50x headroom, but a long Astral or timsTOF
+    // run at ~500k MS2 spectra x ~2000 peaks is within 2x.
     let ms1_path = format!("{}/spectra_ms1.parquet", p.out_dir);
     let ms2_path = format!("{}/spectra_ms2.parquet", p.out_dir);
     let iw_path = format!("{}/isolation_windows.parquet", p.out_dir);
@@ -173,8 +336,8 @@ pub fn run(p: ConvertParams) -> Result<ConvertOutputs> {
         vec![
             Col::U32("scan_index".into(), ms1_idx),
             Col::F64("rt_seconds".into(), ms1_rt),
-            Col::ListF32("mz".into(), ms1_mz),
-            Col::ListF32("intensity".into(), ms1_in),
+            Col::LargeListF32("mz".into(), ms1_mz),
+            Col::LargeListF32("intensity".into(), ms1_in),
         ],
     )?;
 
@@ -207,8 +370,8 @@ pub fn run(p: ConvertParams) -> Result<ConvertOutputs> {
             Col::F64("window_upper".into(), m2_wu),
             Col::OptF64("precursor_mz".into(), m2_pmz),
             Col::OptI32("precursor_charge".into(), m2_pz),
-            Col::ListF32("mz".into(), m2_mz),
-            Col::ListF32("intensity".into(), m2_in),
+            Col::LargeListF32("mz".into(), m2_mz),
+            Col::LargeListF32("intensity".into(), m2_in),
         ],
     )?;
 

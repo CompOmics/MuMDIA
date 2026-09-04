@@ -1,0 +1,10 @@
+{
+  "features": {
+    "set": "extended"
+  },
+  "extract": {
+    "apex_count_window": 5,
+    "apex_rt_prior_s": 120.0,
+    "gate_min_score": 0.2
+  }
+}

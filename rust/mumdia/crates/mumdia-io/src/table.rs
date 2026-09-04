@@ -2,8 +2,9 @@
 //! and reads its declared schema without hand-rolling RecordBatches.
 //!
 //! Tables are written as Parquet (SNAPPY), the open, self-describing interstage
-//! format (PLAN.md Section 3.3). Ion-mobility and other conditional columns are
-//! nullable via the `Opt*` variants (PLAN.md Section 2 missing-value policy).
+//! format (docs/03_io_layer.md). Ion-mobility and other conditional columns are
+//! nullable via the `Opt*` variants (docs/02_config_and_data_model.md
+//! missing-value policy).
 
 use std::sync::Arc;
 
@@ -197,17 +198,93 @@ pub fn write_table(path: &str, cols: Vec<Col>) -> Result<u64> {
     let batch = RecordBatch::try_new(schema.clone(), arrays)
         .with_context(|| format!("building record batch for {path}"))?;
 
-    if let Some(parent) = std::path::Path::new(path).parent() {
-        std::fs::create_dir_all(parent).ok();
-    }
-    let file = std::fs::File::create(path).with_context(|| format!("creating {path}"))?;
+    let target = AtomicPath::new(path)?;
+    let file = std::fs::File::create(target.tmp())
+        .with_context(|| format!("creating {}", target.tmp().display()))?;
     let props = WriterProperties::builder()
         .set_compression(Compression::SNAPPY)
         .build();
     let mut writer = ArrowWriter::try_new(file, schema, Some(props))?;
     writer.write(&batch)?;
     writer.close()?;
+    target.publish()?;
     Ok(nrows as u64)
+}
+
+/// A sibling temp path for an artifact, and the rename that publishes it.
+///
+/// Every artifact used to be written with `File::create` directly AT its final path,
+/// which truncates on open. Three consequences, all real:
+///
+/// - a rerun destroyed the previous good artifact BEFORE producing a replacement, so
+///   an interrupted rerun left neither;
+/// - Ctrl-C or a crash part-way through a multi-gigabyte write left rubble under the
+///   canonical name. The parquet footer is written last and every reader requires it,
+///   so such a file fails to open rather than reading as a short table, but a
+///   directory of unopenable artifacts is still worse than a directory of intact ones;
+/// - nothing distinguished "this run wrote it" from "a previous run left it".
+///
+/// Writing to `<path>.tmp-<pid>` and renaming on success addresses all three: the
+/// rename is atomic on both POSIX and Windows for a same-directory target, so a reader
+/// sees either the old artifact or the new one, never a partial one. A killed run
+/// leaves at most a recognisable `.tmp-<pid>` file, which is inert.
+pub struct AtomicPath {
+    tmp: std::path::PathBuf,
+    final_path: std::path::PathBuf,
+    published: bool,
+}
+
+impl AtomicPath {
+    pub fn new(path: &str) -> Result<AtomicPath> {
+        let final_path = std::path::PathBuf::from(path);
+        if let Some(parent) = final_path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("creating output directory {}", parent.display()))?;
+            }
+        }
+        let tmp = std::path::PathBuf::from(format!("{path}.tmp-{}", std::process::id()));
+        Ok(AtomicPath {
+            tmp,
+            final_path,
+            published: false,
+        })
+    }
+
+    pub fn tmp(&self) -> &std::path::Path {
+        &self.tmp
+    }
+
+    /// Move the completed temp file onto the final path.
+    pub fn publish(mut self) -> Result<()> {
+        // Windows `rename` fails when the destination exists, unlike POSIX. Removing
+        // first opens a window in which neither file is at the final path; that is
+        // strictly better than the previous behaviour, where the window lasted for the
+        // whole write.
+        if self.final_path.exists() {
+            std::fs::remove_file(&self.final_path)
+                .with_context(|| format!("replacing {}", self.final_path.display()))?;
+        }
+        std::fs::rename(&self.tmp, &self.final_path).with_context(|| {
+            format!(
+                "publishing {} -> {}",
+                self.tmp.display(),
+                self.final_path.display()
+            )
+        })?;
+        self.published = true;
+        Ok(())
+    }
+}
+
+impl Drop for AtomicPath {
+    fn drop(&mut self) {
+        // Abandoned write (an error return or an unwind): take the rubble with us so
+        // the output directory does not accumulate temp files.
+        if !self.published {
+            let _ = std::fs::remove_file(&self.tmp);
+        }
+    }
 }
 
 /// Write pre-built Arrow record batches to a Snappy Parquet file, preserving
@@ -223,20 +300,21 @@ pub fn write_table(path: &str, cols: Vec<Col>) -> Result<u64> {
 pub struct BatchWriter {
     writer: Option<ArrowWriter<std::fs::File>>,
     rows: u64,
+    target: Option<AtomicPath>,
 }
 
 impl BatchWriter {
     pub fn new(path: &str, schema: Arc<Schema>) -> Result<BatchWriter> {
-        if let Some(parent) = std::path::Path::new(path).parent() {
-            std::fs::create_dir_all(parent).ok();
-        }
-        let file = std::fs::File::create(path).with_context(|| format!("creating {path}"))?;
+        let target = AtomicPath::new(path)?;
+        let file = std::fs::File::create(target.tmp())
+            .with_context(|| format!("creating {}", target.tmp().display()))?;
         let props = WriterProperties::builder()
             .set_compression(Compression::SNAPPY)
             .build();
         Ok(BatchWriter {
             writer: Some(ArrowWriter::try_new(file, schema, Some(props))?),
             rows: 0,
+            target: Some(target),
         })
     }
 
@@ -255,15 +333,17 @@ impl BatchWriter {
         if let Some(w) = self.writer.take() {
             w.close().context("closing parquet writer")?;
         }
+        if let Some(t) = self.target.take() {
+            t.publish()?;
+        }
         Ok(self.rows)
     }
 }
 
 pub fn write_batches(path: &str, schema: Arc<Schema>, batches: &[RecordBatch]) -> Result<u64> {
-    if let Some(parent) = std::path::Path::new(path).parent() {
-        std::fs::create_dir_all(parent).ok();
-    }
-    let file = std::fs::File::create(path).with_context(|| format!("creating {path}"))?;
+    let target = AtomicPath::new(path)?;
+    let file = std::fs::File::create(target.tmp())
+        .with_context(|| format!("creating {}", target.tmp().display()))?;
     let props = WriterProperties::builder()
         .set_compression(Compression::SNAPPY)
         .build();
@@ -274,6 +354,7 @@ pub fn write_batches(path: &str, schema: Arc<Schema>, batches: &[RecordBatch]) -
         n += b.num_rows() as u64;
     }
     writer.close()?;
+    target.publish()?;
     Ok(n)
 }
 
@@ -283,6 +364,12 @@ pub struct Table {
     pub schema: Arc<Schema>,
     pub batches: Vec<RecordBatch>,
     pub nrows: usize,
+    /// The file this was read from, kept only for error messages.
+    ///
+    /// Without it, a missing or mistyped column reported `column 'x' not found in [...]`
+    /// and dumped up to 390 column names with no indication of WHICH artifact was being
+    /// read -- in a pipeline where several tables share most of their schema.
+    path: String,
 }
 
 /// Row count straight from the parquet footer metadata, without decoding any column
@@ -367,6 +454,7 @@ impl Table {
             schema,
             batches,
             nrows,
+            path: path.to_string(),
         })
     }
 
@@ -379,9 +467,21 @@ impl Table {
     }
 
     fn idx(&self, name: &str) -> Result<usize> {
-        self.schema
-            .index_of(name)
-            .map_err(|_| anyhow!("column '{name}' not found in {:?}", self.column_names()))
+        self.schema.index_of(name).map_err(|_| {
+            // Name the file first, then the columns it does have. A long list is still
+            // useful, but only once the reader knows which artifact produced it.
+            let have = self.column_names();
+            let shown = if have.len() > 24 {
+                format!("{:?} ... and {} more", &have[..24], have.len() - 24)
+            } else {
+                format!("{have:?}")
+            };
+            anyhow!(
+                "column '{name}' not found in {} ({} columns: {shown})",
+                self.path,
+                have.len()
+            )
+        })
     }
 
     pub fn f64(&self, name: &str) -> Result<Vec<f64>> {
@@ -424,6 +524,28 @@ impl Table {
         Ok(out)
     }
 
+    /// Reject a NULL in a column read through a non-optional accessor.
+    ///
+    /// The `Col` enum has `OptF64`, `OptF32`, `OptI32` and `OptStr` for genuinely
+    /// nullable columns, so a plain accessor is a statement that the column is
+    /// required. It did not behave like one: `i32`/`i64`/`u32` pushed
+    /// `a.value(k)` for a null row, which is the raw buffer value and in practice 0,
+    /// and `str` pushed an empty `String`. Both are silent substitutions of a
+    /// plausible value for a missing one.
+    ///
+    /// The concrete consequence, and the reason this is not merely tidiness: a null
+    /// `charge` in an imported library became 0, and a 0 charge reaches an
+    /// isotope-spacing division in extract. `bool` did not check nulls at all.
+    fn reject_null(&self, name: &str, row: usize) -> anyhow::Error {
+        anyhow!(
+            "column '{name}' has a NULL at row {row} in {}, but it is a required \
+             column. Nullable columns are written through the Opt* variants and read \
+             through the opt_* accessors; a NULL here would otherwise be substituted \
+             with 0 or an empty string. Fix or drop the row",
+            self.path
+        )
+    }
+
     pub fn i64(&self, name: &str) -> Result<Vec<i64>> {
         let i = self.idx(name)?;
         let mut out = Vec::with_capacity(self.nrows);
@@ -437,6 +559,9 @@ impl Table {
                 out.extend_from_slice(a.values());
             } else {
                 for k in 0..a.len() {
+                    if a.is_null(k) {
+                        return Err(self.reject_null(name, out.len()));
+                    }
                     out.push(a.value(k));
                 }
             }
@@ -457,6 +582,9 @@ impl Table {
                 out.extend_from_slice(a.values());
             } else {
                 for k in 0..a.len() {
+                    if a.is_null(k) {
+                        return Err(self.reject_null(name, out.len()));
+                    }
                     out.push(a.value(k));
                 }
             }
@@ -477,6 +605,9 @@ impl Table {
                 out.extend_from_slice(a.values());
             } else {
                 for k in 0..a.len() {
+                    if a.is_null(k) {
+                        return Err(self.reject_null(name, out.len()));
+                    }
                     out.push(a.value(k));
                 }
             }
@@ -494,6 +625,9 @@ impl Table {
                 .downcast_ref::<BooleanArray>()
                 .ok_or_else(|| anyhow!("column '{name}' is not bool"))?;
             for k in 0..a.len() {
+                if a.is_null(k) {
+                    return Err(self.reject_null(name, out.len()));
+                }
                 out.push(a.value(k));
             }
         }
@@ -510,11 +644,10 @@ impl Table {
                 .downcast_ref::<StringArray>()
                 .ok_or_else(|| anyhow!("column '{name}' is not utf8"))?;
             for k in 0..a.len() {
-                out.push(if a.is_null(k) {
-                    String::new()
-                } else {
-                    a.value(k).to_string()
-                });
+                if a.is_null(k) {
+                    return Err(self.reject_null(name, out.len()));
+                }
+                out.push(a.value(k).to_string());
             }
         }
         Ok(out)
@@ -582,7 +715,10 @@ mod tests {
 
     #[test]
     fn roundtrip_mixed_columns() {
-        let dir = std::env::temp_dir().join("mumdia_table_test");
+        // Unique per process: a fixed name races when two `cargo test` runs share a
+        // machine, which is the convention docs/14 states and four other test modules
+        // already follow.
+        let dir = std::env::temp_dir().join(format!("mumdia_table_test_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("t.parquet");
         let p = path.to_str().unwrap();
@@ -622,7 +758,11 @@ mod projection_tests {
     /// adopts it would silently change results.
     #[test]
     fn read_cols_matches_read_for_selected_columns() {
-        let dir = std::env::temp_dir().join("mumdia_projection_test");
+        // Unique per process: a fixed name races when two `cargo test` runs share a
+        // machine, which is the convention docs/14 states and four other test modules
+        // already follow.
+        let dir =
+            std::env::temp_dir().join(format!("mumdia_projection_test_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("t.parquet");
         let p = path.to_str().unwrap();

@@ -559,7 +559,7 @@ candidate removed by within-group competition.
 
 ## Stage F: `rescore` (`stages/rescore.rs`)
 
-### psms_scored (schema v3, `rescore.rs:447-476`)
+### psms_scored (schema v3, `rescore.rs:508-541`)
 
 | column | Arrow type | nullable | units | meaning |
 |---|---|---|---|---|
@@ -576,19 +576,61 @@ candidate removed by within-group competition.
 | `q_value` | Float64 | no | - | PSM-level q-value (pooled target-decoy or entrapment null) |
 | `peptide_q_value` | Float64 | no | - | peptide-level q (best PSM per base peptide); losers get 1.0 |
 | `protein_group` | Utf8 | no | - | protein-accession-set string (decoys carry `DECOY_`) |
-| `pg_q_value` | Float64 | no | - | protein-group-level q |
+| `pg_q_value` | Float64 | no | - | protein-group-level q (best PSM per protein group); losers get 1.0 |
 | `global_q_value` | Float64 | no | - | byte-identical alias of pooled `q_value` (backward-compat) |
 | `prelim_score` | Float64 | no | - | preliminary composite score carried forward |
 | `source` | UInt32 | no | - | index into `--competed` inputs (run identity); all-zero single-run |
 | `run_psm_q` | Float64 | no | - | per-run PSM q (TDA within each `source`) |
 | `experiment_psm_q` | Float64 | no | - | pooled PSM q (equals `q_value`) |
-| `precursor_q` | Float64 | no | - | per-precursor q (grouped on peptidoform + charge) |
+| `precursor_q` | Float64 | no | - | per-precursor q (best PSM per peptidoform + charge); losers get 1.0 |
 
 Which null the q-values use depends on the classifier: target-decoy for
 `NativeTda`/`Mokapot`/`NnTorch`/`Percolator`, entrapment for the `Entrapment`
 rescorer. The q-value branch is at `rescore.rs:289-297`; the `qmode` selector
 defaults to target-decoy (`rescore.rs:145`) and switches to entrapment only
 inside the `Entrapment` classifier arm (`rescore.rs:252-273`).
+
+#### q-value column units
+
+The table carries seven q columns and they are not interchangeable. A reported
+count is only interpretable when both the row unit and the q column used to
+select it are named.
+
+| column | q computed over | populated on | produced at |
+|---|---|---|---|
+| `q_value` | every PSM row, pooled across all `source` values | every row | `rescore.rs:522` |
+| `experiment_psm_q` | same population as `q_value` | every row | `rescore.rs:535` |
+| `global_q_value` | same population as `q_value` (backward-compat alias) | every row | `rescore.rs:526` |
+| `run_psm_q` | PSM rows within one `source`, target-decoy re-run per run | every row | `rescore.rs:411`, written at `rescore.rs:534` |
+| `precursor_q` | best PSM per `(peptidoform, charge)` | that group's winning row only; losers 1.0 | `rescore.rs:449`, written at `rescore.rs:536` |
+| `peptide_q_value` | best PSM per `base_peptide_id` (stripped sequence) | that group's winning row only; losers 1.0 | `rescore.rs:370`, written at `rescore.rs:523` |
+| `pg_q_value` | best PSM per `protein_group` | that group's winning row only; losers 1.0 | `rescore.rs:392`, written at `rescore.rs:525` |
+
+The three grouped columns are sparse by construction. `grouped_q`
+(`rescore.rs:673`) picks the best-scoring row of each group, computes the q over
+that reduced set, and then scatters the value back to the winning row alone,
+leaving 1.0 on every losing sibling (`rescore.rs:721-728`). This is deliberate: a
+lower-scoring charge or modification variant, which may itself be a false target,
+must not inherit the winner's q. Deduplicated peptide, precursor, and
+protein-group counts are unaffected because they select the winner anyway.
+
+One further caveat applies to `precursor_q` specifically. It groups on
+`(peptidoform, charge)` over the rows that reach rescore, and under the default
+`compete.group_by = base_peptide` competition has already collapsed the charge and
+modification siblings by stripped peptide, so the surviving population holds
+roughly one form per peptide and the column then reports a base-peptide count.
+It is a genuine precursor unit only under `compete.group_by = peptidoform_charge`
+(docs/11_compete_rescore_fdr.md).
+
+The consequence for multi-run work is that grouping in an experiment-wide rescore
+is also experiment-wide, so each group has exactly one populated row across the
+whole experiment. Splitting the pooled table by `source` and counting a single
+run's rows on a grouped column keeps only about `1/n_runs` of the rows it should
+and is not a per-run number. Use `run_psm_q` for a per-file PSM count or a
+per-file quant gate; use the grouped columns only when rescore itself was
+single-run. `quant.q_filter` selects among `peptide_q_value`, `precursor_q`,
+pooled `q_value`, and `run_psm_q`, and does not select a run
+(docs/12_quant_lfq_align_mbr_report_audit.md).
 
 ---
 
@@ -771,16 +813,72 @@ Each `ArtifactRecord`:
 
 ---
 
+## TSV reports (`peptides.tsv`, `proteins.tsv`)
+
+Not Parquet, but these are the files most users actually read, so they are
+documented here rather than left to the source. Written by `report`
+(`stages/report.rs`), which has two call sites: inside `run` (`run.rs:484`) and
+the `mumdia report` handler (`main.rs:798`). `run-experiment` never calls it, so
+an experiment output tree contains neither TSV at any level; take per-run counts
+from the per-run split `scored.parquet` tables on `run_psm_q`, or invoke
+`mumdia report` yourself.
+
+Values are formatted for reading, not for analysis: `q_value` is printed to six
+decimals, `score` to four, and `quantity` to one
+(`report.rs:39-45,110-120,144`). Use `peptide_quant.parquet` and
+`protein_group_quant.parquet` for anything quantitative.
+
+### `peptides.tsv` (`report.rs:95-122`)
+
+One row per confident precursor, deduplicated on `(peptidoform, charge)` keeping
+the best q (`report.rs:90,105-108`). Targets only, filtered on
+`peptide_q_value <= --q` (default 0.01, `report.rs:101`).
+
+| column | source | notes |
+|---|---|---|
+| `precursor` | `peptidoform` | ProForma peptidoform, modifications included |
+| `stripped_sequence` | `strip(peptidoform)` | residues only; drops a `DECOY_` prefix and every bracketed or parenthesised modification block (`report.rs:24-37`) |
+| `charge` | `charge` | precursor charge |
+| `protein` | `protein` | the PSM's protein string, not the inferred group |
+| `q_value` | `peptide_q_value` | **base-peptide** q, six decimals |
+| `score` | `score` | rescorer score, four decimals |
+| `quantity` | `peptide_quant.parquet` joined on `(peptidoform, charge)` | empty when the precursor was not quantifiable or no `--peptide-quant` was passed (`report.rs:39-45,61-72`) |
+
+The row unit and the filter column deliberately disagree, and this is the single
+most common misreading of MuMDIA output: rows are precursors
+`(peptidoform, charge)` while the threshold is applied to `peptide_q_value`,
+which is a base-peptide q. A row count is therefore **not** a
+precursor-q-controlled count. The stage logs both numbers, `precursors` and
+`stripped_sequences` (`report.rs:149-154`); quote whichever you mean and name it.
+
+### `proteins.tsv` (`report.rs:133-146`)
+
+One row per confident protein group, deduplicated keeping the best q. Targets
+with a non-empty group, filtered on `pg_q_value <= --q` (`report.rs:137`).
+
+| column | source | notes |
+|---|---|---|
+| `protein_group` | `protein_group` | accession set as grouped by rescore |
+| `q_value` | `pg_q_value` | protein-group q, six decimals |
+| `quantity` | `protein_group_quant.parquet` joined on `protein_group` | empty when not quantifiable or no `--protein-quant` was passed |
+
+Both grouped q columns (`peptide_q_value`, `pg_q_value`) are written only to each
+group's single winning row, so under an experiment-wide rescore the grouping is
+experiment-wide and a per-run count taken from them is diluted by roughly one over
+the number of runs. See `docs/11_compete_rescore_fdr.md`.
+
 ## Not covered here
 
-`report` writes `peptides.tsv` and `proteins.tsv` (`stages/run.rs:459-461`), which
-are human-readable TSV, not Parquet, and are outside this Parquet data dictionary.
-Sidecar worker I/O in the working directory (the Mokapot/NN PIN, the entrapment
-GBM in/out Parquet, MS2PIP/DeepLC exchange files) are transient contract files,
-not engine artifacts.
+Sidecar worker I/O in the working directory (the mokapot/NN PIN, the entrapment
+GBM input and output Parquet, the MS2PIP and DeepLC exchange files) are transient
+contract files, not engine artifacts.
 
 ## Schema-version registry
 
-`mumdia-core/src/schema.rs` freezes the `(logical name, version)` pairs.
-`psms_competed`, `peptide_quant`, and `protein_group_quant` are v2;
-`psms_scored` is v3; the remaining registered artifacts are v1.
+`mumdia-core/src/schema.rs` freezes the `(logical name, version)` pairs. As of
+`schema.rs:7-25`: `psms_scored` is v4, `psms_competed` v3, and `psms_extracted`,
+`peptide_quant` and `protein_group_quant` v2; every other registered artifact is
+v1. Each artifact stamps its version into its own `report.json`
+(`mumdia-io/src/report.rs:14`) and into `manifest.json`
+(`mumdia-core/src/manifest.rs:15`), so an artifact on disk states its own version
+rather than inheriting the engine's.

@@ -1,7 +1,7 @@
-//! Orchestrator `mumdia run` (PLAN.md Section 4 Orchestration): sequence the MVP
+//! Orchestrator `mumdia run` (docs/01_overview_and_dataflow.md): sequence the MVP
 //! stage chain on one run and write a JSON run manifest. The orchestrator only
 //! threads file paths; all computation lives in the stage commands, so each
-//! remains independently runnable (PLAN.md Section 3.5).
+//! remains independently runnable.
 
 use std::time::Instant;
 
@@ -11,12 +11,17 @@ use mumdia_core::manifest::Manifest;
 use mumdia_core::schema::artifact;
 use mumdia_io::record_artifact;
 use mumdia_io::report::ArtifactReport;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::stages::*;
 
 pub struct RunParams<'a> {
     pub config: &'a Config,
+    /// Path the config was loaded from, if any. Used only to resolve a relative
+    /// `predict_frag.sidecar_script_dir` against the config's own directory
+    /// instead of against the current working directory, which silently changed
+    /// which worker scripts ran depending on where the command was invoked.
+    pub config_path: Option<&'a str>,
     /// FASTA to digest into the spectral library. Required unless a prebuilt
     /// library is supplied via `lib_precursors` + `lib_fragments`.
     pub fasta: Option<&'a str>,
@@ -35,7 +40,7 @@ pub struct RunParams<'a> {
 /// Validate inputs and sidecar configuration before any multi-minute compute,
 /// so a missing file or a misconfigured rescorer fails immediately with an
 /// actionable message.
-fn preflight(p: &RunParams) -> Result<()> {
+fn preflight(p: &RunParams, cfg: &Config) -> Result<()> {
     use mumdia_core::config::RescorerKind;
     // Inputs depend on the mode: library-input supplies a prebuilt library and
     // skips the FASTA; otherwise the FASTA is digested into the library.
@@ -59,21 +64,26 @@ fn preflight(p: &RunParams) -> Result<()> {
             anyhow::bail!("{flag} not found or unreadable: {path}");
         }
     }
-    if p.config.rt_im_train.finetune_deeplc && p.config.predict_frag.deeplc_python.is_none() {
+    // The interpreter fields were filled in by `python::resolve` before this point,
+    // so a field still empty here means the role is unused or discovery failed.
+    // The messages name the field and the alternative, which is what a user acts on.
+    if cfg.rt_im_train.finetune_deeplc && cfg.predict_frag.deeplc_python.is_none() {
         anyhow::bail!(
             "rt_im_train.finetune_deeplc requires predict_frag.deeplc_python (a Python \
-             interpreter with DeepLC 4.0 multitask installed)"
+             interpreter with DeepLC installed; see env/mumdia-deeplc.yml), or set that \
+             field to \"auto\" to discover one"
         );
     }
-    match p.config.rescore.classifier {
-        RescorerKind::Mokapot | RescorerKind::NnTorch if p.config.rescore.python.is_none() => {
+    match cfg.rescore.classifier {
+        RescorerKind::Mokapot | RescorerKind::NnTorch if cfg.rescore.python.is_none() => {
             anyhow::bail!(
                 "rescore.classifier={:?} requires rescore.python (a Python interpreter \
-                 with the selected rescorer's dependencies), or use classifier=native_tda",
-                p.config.rescore.classifier
+                 with the selected rescorer's dependencies), or \"auto\" to discover one, \
+                 or use classifier=native_tda",
+                cfg.rescore.classifier
             )
         }
-        RescorerKind::Entrapment if p.config.rescore.entrapment_marker.is_none() => anyhow::bail!(
+        RescorerKind::Entrapment if cfg.rescore.entrapment_marker.is_none() => anyhow::bail!(
             "rescore.classifier=entrapment requires rescore.entrapment_marker (the spike-in \
              accession substring, e.g. \"_HUMAN\")"
         ),
@@ -84,13 +94,44 @@ fn preflight(p: &RunParams) -> Result<()> {
 
 pub fn run(p: RunParams) -> Result<()> {
     let t0 = Instant::now();
-    let cfg = p.config;
-    preflight(&p)?;
+    // Fill in the sidecar interpreters and the worker directory before anything is
+    // validated or hashed, so every stage sees a concrete path and the manifest
+    // records the interpreter that actually ran rather than the word "auto".
+    let mut resolved = p.config.clone();
+    resolved.predict_frag.sidecar_script_dir =
+        crate::python::resolve_script_dir(&resolved.predict_frag.sidecar_script_dir, p.config_path);
+    crate::python::resolve(&mut resolved)?;
+    let cfg = &resolved;
+    preflight(&p, cfg)?;
     let ch = mumdia_io::hash::blake3_str(&cfg.canonical_json());
     std::fs::create_dir_all(p.out_dir).ok();
     let d = |name: &str| format!("{}/{}", p.out_dir, name);
 
     let mut man = Manifest::new(cfg.canonical_json(), ch.clone());
+    info!(provenance = %man.provenance(), "run: build provenance");
+    // Hash the inputs before any of them is read for compute. This is what lets a
+    // result be tied back to the exact bytes it came from; recording only the path
+    // does not, because a path is reused. Cost is one sequential read per input at
+    // blake3 speed, and the file is about to be read again anyway, so it comes off
+    // a warm cache.
+    for (role, path) in [
+        ("mzml", Some(p.mzml)),
+        ("fasta", p.fasta),
+        ("lib_precursors", p.lib_precursors),
+        ("lib_fragments", p.lib_fragments),
+    ] {
+        let Some(path) = path else { continue };
+        match (
+            std::fs::metadata(path).map(|m| m.len()),
+            mumdia_io::hash::blake3_file(path),
+        ) {
+            (Ok(bytes), Ok(hash)) => man.record_input(role, path, bytes, hash),
+            // A missing or unreadable input is already a preflight error; if it
+            // somehow becomes unreadable here, an incomplete manifest is a worse
+            // outcome than a warning.
+            _ => warn!(role, path, "run: could not hash input for the manifest"),
+        }
+    }
 
     // --- experiment-wide artifacts: the spectral library ---
     // Either digest the FASTA (default) or consume a prebuilt library
@@ -283,6 +324,12 @@ pub fn run(p: RunParams) -> Result<()> {
             cfg.rt_im_train.finetune_patience,
             cfg.rt_im_train.q_train,
             cfg.rt_im_train.finetune_batch,
+            // Held-out window sizing: the sidecar must exclude the same peptides
+            // from the fine-tune reference that rt-im-train later scores as
+            // held-out, else adapter memorization leaks into the "held-out"
+            // residuals and the window shrinks back toward in-sample optimism.
+            cfg.rt_im_train.window_holdout_frac,
+            cfg.rng_seed,
         )?;
         // The fine-tuned precursor table is the artifact actually consumed by
         // RT calibration and extraction. Replace the base-library manifest entry

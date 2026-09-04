@@ -1,4 +1,4 @@
-"""Entrapment (spike-in negative) rescorer sidecar (PLAN.md Stage F).
+"""Entrapment (spike-in negative) rescorer sidecar (docs/11_compete_rescore_fdr.md).
 
 Usage:
     python entrapment_worker.py <input.parquet> <output.parquet> [folds]

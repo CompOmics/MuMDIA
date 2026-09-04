@@ -1,8 +1,16 @@
 name: Docker image
 
 # Builds the self-contained image (engine + mokapot/MS2PIP/DeepLC sidecars).
-# - On a version tag (v*): builds AND pushes ghcr.io/compomics/mumdia:<tag> + :latest.
-# - Manual (workflow_dispatch): builds only (no push) to validate the image.
+# - On a version tag (v*): builds, smoke-tests, then pushes
+#   ghcr.io/compomics/mumdia:<tag> + :latest.
+# - Manual (workflow_dispatch): builds and smoke-tests only, no push.
+#
+# The smoke test is the point of this workflow outside a release. The image is the
+# only distribution where the Python sidecars are guaranteed present, and nothing
+# else in CI installs DeepLC, mokapot or MS2PIP, so `mumdia doctor` inside the
+# image is the one check that the sidecar environments actually import. It also
+# catches the DeepLC-before-numpy import order, which a module-presence probe
+# cannot see.
 on:
   push:
     tags: ["v*"]
@@ -16,13 +24,13 @@ jobs:
   docker:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
       - name: Log in to GHCR
         if: startsWith(github.ref, 'refs/tags/v')
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -30,7 +38,7 @@ jobs:
 
       - name: Image metadata
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
         with:
           images: ghcr.io/compomics/mumdia
           tags: |
@@ -38,14 +46,78 @@ jobs:
             type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
             type=sha
 
-      - name: Build (and push on a version tag)
-        uses: docker/build-push-action@v6
+      # Build once into the local daemon so the smoke test runs against exactly
+      # the image that will be pushed. `load` needs a single platform, which is
+      # what we publish anyway.
+      - name: Build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
           file: Dockerfile
           platforms: linux/amd64
-          push: ${{ startsWith(github.ref, 'refs/tags/v') }}
-          tags: ${{ steps.meta.outputs.tags }}
+          load: true
+          push: false
+          tags: mumdia:ci
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Smoke-test the image
+        run: |
+          set -euo pipefail
+          echo "--- version and help ---"
+          docker run --rm mumdia:ci --version
+          docker run --rm mumdia:ci --help > /dev/null
+
+          echo "--- the image must not run as root ---"
+          uid=$(docker run --rm --entrypoint id mumdia:ci -u)
+          test "$uid" != "0" || { echo "image runs as root"; exit 1; }
+          echo "runtime uid: $uid"
+
+          echo "--- both baked configs must parse, and their sidecars must import ---"
+          docker run --rm mumdia:ci doctor --config /opt/mumdia/config.dia.json
+          docker run --rm mumdia:ci doctor --config /opt/mumdia/config.diann-lib.json
+
+          echo "--- the sidecar workers must be importable in their own envs ---"
+          # `doctor` only asks whether a module can be found. Import DeepLC for
+          # real, in the order the worker uses, because the failure this catches
+          # (torch DLL init after numpy) happens at import time and not at probe
+          # time.
+          docker run --rm --entrypoint /opt/conda/envs/deeplc/bin/python mumdia:ci \
+            -c "import deeplc, numpy, pyarrow, torch, psm_utils; print('deeplc', deeplc.__version__, '| torch', torch.__version__)"
+          docker run --rm --entrypoint /opt/conda/envs/rescore/bin/python mumdia:ci \
+            -c "import mokapot, sklearn, numpy, pandas, pyarrow; print('mokapot', mokapot.__version__)"
+
+          echo "--- a bind-mounted output directory must be writable as the host user ---"
+          # This is the documented invocation. If it breaks, the image is unusable
+          # for its primary purpose regardless of what the other checks say.
+          work=$(mktemp -d)
+          docker run --rm -v "$work:/data" --user "$(id -u):$(id -g)" \
+            --entrypoint sh mumdia:ci -c 'mkdir -p /data/out && echo ok > /data/out/probe'
+          test -f "$work/out/probe" || { echo "bind-mount write failed"; exit 1; }
+          echo "bind-mount write OK (file owned by $(stat -c '%u:%g' "$work/out/probe"))"
+
+      # Tag and push the image that was just SMOKE-TESTED, rather than building a
+      # second time.
+      #
+      # The previous step comment claimed "build once ... so the smoke test runs against
+      # exactly the image that will be pushed", and then a second
+      # `build-push-action` invocation built again. Neither `FROM` is digest-pinned, and
+      # `apt-get update` and the pip resolutions are unpinned, so the two builds were
+      # identical only to the extent the layer cache made them so: the image that passed
+      # the uid check, the two `doctor` runs, the DeepLC/mokapot import checks and the
+      # bind-mount write was not provably the image users pulled.
+      #
+      # `docker tag` + `docker push` on the locally loaded `mumdia:ci` closes that: same
+      # image id, by construction.
+      - name: Push the tested image (version tags only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          set -euo pipefail
+          echo "${{ steps.meta.outputs.tags }}" | while read -r tag; do
+            [ -n "$tag" ] || continue
+            docker tag mumdia:ci "$tag"
+            docker push "$tag"
+            echo "pushed $tag"
+          done
+          echo "image id: $(docker image inspect --format '{{.Id}}' mumdia:ci)"

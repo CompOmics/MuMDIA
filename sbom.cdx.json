@@ -1,0 +1,4620 @@
+{
+  "bomFormat": "CycloneDX",
+  "specVersion": "1.5",
+  "version": 1,
+  "metadata": {
+    "component": {
+      "type": "application",
+      "bom-ref": "pkg:cargo/mumdia@0.1.0",
+      "name": "mumdia",
+      "version": "0.1.0",
+      "description": "Clean-room Rust DIA proteomics search engine",
+      "licenses": [
+        {
+          "expression": "Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/mumdia@0.1.0"
+    },
+    "tools": [
+      {
+        "name": "ci/gen_sbom.py",
+        "vendor": "CompOmics"
+      }
+    ]
+  },
+  "components": [
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/adler2@2.0.1",
+      "name": "adler2",
+      "version": "2.0.1",
+      "purl": "pkg:cargo/adler2@2.0.1",
+      "description": "A simple clean-room implementation of the Adler-32 checksum",
+      "licenses": [
+        {
+          "expression": "0BSD OR MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/oyvindln/adler2"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/ahash@0.8.12",
+      "name": "ahash",
+      "version": "0.8.12",
+      "purl": "pkg:cargo/ahash@0.8.12",
+      "description": "A non-cryptographic hash function using AES-NI for high performance",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/tkaitchuck/ahash"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/aho-corasick@1.1.4",
+      "name": "aho-corasick",
+      "version": "1.1.4",
+      "purl": "pkg:cargo/aho-corasick@1.1.4",
+      "description": "Fast multiple substring searching.",
+      "licenses": [
+        {
+          "expression": "Unlicense OR MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/BurntSushi/aho-corasick"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/android_system_properties@0.1.5",
+      "name": "android_system_properties",
+      "version": "0.1.5",
+      "purl": "pkg:cargo/android_system_properties@0.1.5",
+      "description": "Minimal Android system properties wrapper",
+      "licenses": [
+        {
+          "expression": "MIT/Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/nical/android_system_properties"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/anstream@1.0.0",
+      "name": "anstream",
+      "version": "1.0.0",
+      "purl": "pkg:cargo/anstream@1.0.0",
+      "description": "IO stream adapters for writing colored text that will gracefully degrade according to your terminal's capabilities.",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rust-cli/anstyle.git"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/anstyle@1.0.14",
+      "name": "anstyle",
+      "version": "1.0.14",
+      "purl": "pkg:cargo/anstyle@1.0.14",
+      "description": "ANSI text styling",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rust-cli/anstyle.git"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/anstyle-parse@1.0.0",
+      "name": "anstyle-parse",
+      "version": "1.0.0",
+      "purl": "pkg:cargo/anstyle-parse@1.0.0",
+      "description": "Parse ANSI Style Escapes",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rust-cli/anstyle.git"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/anstyle-query@1.1.5",
+      "name": "anstyle-query",
+      "version": "1.1.5",
+      "purl": "pkg:cargo/anstyle-query@1.1.5",
+      "description": "Look up colored console capabilities",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rust-cli/anstyle.git"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/anstyle-wincon@3.0.11",
+      "name": "anstyle-wincon",
+      "version": "3.0.11",
+      "purl": "pkg:cargo/anstyle-wincon@3.0.11",
+      "description": "Styling legacy Windows terminals",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rust-cli/anstyle.git"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/anyhow@1.0.103",
+      "name": "anyhow",
+      "version": "1.0.103",
+      "purl": "pkg:cargo/anyhow@1.0.103",
+      "description": "Flexible concrete Error type built on std::error::Error",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/dtolnay/anyhow"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/arrayref@0.3.9",
+      "name": "arrayref",
+      "version": "0.3.9",
+      "purl": "pkg:cargo/arrayref@0.3.9",
+      "description": "Macros to take array references of slices",
+      "licenses": [
+        {
+          "expression": "BSD-2-Clause"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/droundy/arrayref"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/arrayvec@0.7.7",
+      "name": "arrayvec",
+      "version": "0.7.7",
+      "purl": "pkg:cargo/arrayvec@0.7.7",
+      "description": "A vector with fixed capacity, backed by an array (it can be stored on the stack too). Implements fixed capacity ArrayVec and ArrayString.",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/bluss/arrayvec"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/arrow@59.0.0",
+      "name": "arrow",
+      "version": "59.0.0",
+      "purl": "pkg:cargo/arrow@59.0.0",
+      "description": "Rust implementation of Apache Arrow",
+      "licenses": [
+        {
+          "expression": "Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/apache/arrow-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/arrow-arith@59.0.0",
+      "name": "arrow-arith",
+      "version": "59.0.0",
+      "purl": "pkg:cargo/arrow-arith@59.0.0",
+      "description": "Arrow arithmetic kernels",
+      "licenses": [
+        {
+          "expression": "Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/apache/arrow-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/arrow-array@59.0.0",
+      "name": "arrow-array",
+      "version": "59.0.0",
+      "purl": "pkg:cargo/arrow-array@59.0.0",
+      "description": "Array abstractions for Apache Arrow",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 AND MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/apache/arrow-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/arrow-buffer@59.0.0",
+      "name": "arrow-buffer",
+      "version": "59.0.0",
+      "purl": "pkg:cargo/arrow-buffer@59.0.0",
+      "description": "Buffer abstractions for Apache Arrow",
+      "licenses": [
+        {
+          "expression": "Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/apache/arrow-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/arrow-cast@59.0.0",
+      "name": "arrow-cast",
+      "version": "59.0.0",
+      "purl": "pkg:cargo/arrow-cast@59.0.0",
+      "description": "Cast kernel and utilities for Apache Arrow",
+      "licenses": [
+        {
+          "expression": "Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/apache/arrow-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/arrow-csv@59.0.0",
+      "name": "arrow-csv",
+      "version": "59.0.0",
+      "purl": "pkg:cargo/arrow-csv@59.0.0",
+      "description": "Support for parsing CSV format to and from the Arrow format",
+      "licenses": [
+        {
+          "expression": "Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/apache/arrow-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/arrow-data@59.0.0",
+      "name": "arrow-data",
+      "version": "59.0.0",
+      "purl": "pkg:cargo/arrow-data@59.0.0",
+      "description": "Array data abstractions for Apache Arrow",
+      "licenses": [
+        {
+          "expression": "Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/apache/arrow-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/arrow-ipc@59.0.0",
+      "name": "arrow-ipc",
+      "version": "59.0.0",
+      "purl": "pkg:cargo/arrow-ipc@59.0.0",
+      "description": "Support for the Arrow IPC format",
+      "licenses": [
+        {
+          "expression": "Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/apache/arrow-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/arrow-json@59.0.0",
+      "name": "arrow-json",
+      "version": "59.0.0",
+      "purl": "pkg:cargo/arrow-json@59.0.0",
+      "description": "Support for parsing JSON format to and from the Arrow format",
+      "licenses": [
+        {
+          "expression": "Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/apache/arrow-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/arrow-ord@59.0.0",
+      "name": "arrow-ord",
+      "version": "59.0.0",
+      "purl": "pkg:cargo/arrow-ord@59.0.0",
+      "description": "Ordering kernels for arrow arrays",
+      "licenses": [
+        {
+          "expression": "Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/apache/arrow-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/arrow-row@59.0.0",
+      "name": "arrow-row",
+      "version": "59.0.0",
+      "purl": "pkg:cargo/arrow-row@59.0.0",
+      "description": "Arrow row format",
+      "licenses": [
+        {
+          "expression": "Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/apache/arrow-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/arrow-schema@59.0.0",
+      "name": "arrow-schema",
+      "version": "59.0.0",
+      "purl": "pkg:cargo/arrow-schema@59.0.0",
+      "description": "Defines the logical types for arrow arrays",
+      "licenses": [
+        {
+          "expression": "Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/apache/arrow-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/arrow-select@59.0.0",
+      "name": "arrow-select",
+      "version": "59.0.0",
+      "purl": "pkg:cargo/arrow-select@59.0.0",
+      "description": "Selection kernels for arrow arrays",
+      "licenses": [
+        {
+          "expression": "Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/apache/arrow-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/arrow-string@59.0.0",
+      "name": "arrow-string",
+      "version": "59.0.0",
+      "purl": "pkg:cargo/arrow-string@59.0.0",
+      "description": "String kernels for arrow arrays",
+      "licenses": [
+        {
+          "expression": "Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/apache/arrow-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/atoi@2.0.0",
+      "name": "atoi",
+      "version": "2.0.0",
+      "purl": "pkg:cargo/atoi@2.0.0",
+      "description": "Parse integers directly from `[u8]` slices in safe code",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/pacman82/atoi-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/autocfg@1.5.1",
+      "name": "autocfg",
+      "version": "1.5.1",
+      "purl": "pkg:cargo/autocfg@1.5.1",
+      "description": "Automatic cfg for Rust compiler features",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 OR MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/cuviper/autocfg"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/base64@0.22.1",
+      "name": "base64",
+      "version": "0.22.1",
+      "purl": "pkg:cargo/base64@0.22.1",
+      "description": "encodes and decodes base64 as bytes or utf8",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/marshallpierce/rust-base64"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/base64-simd@0.8.0",
+      "name": "base64-simd",
+      "version": "0.8.0",
+      "purl": "pkg:cargo/base64-simd@0.8.0",
+      "description": "SIMD-accelerated base64 encoding and decoding",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/Nugine/simd"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/bitflags@2.13.0",
+      "name": "bitflags",
+      "version": "2.13.0",
+      "purl": "pkg:cargo/bitflags@2.13.0",
+      "description": "A macro to generate structures which behave like bitflags.",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/bitflags/bitflags"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/blake3@1.8.5",
+      "name": "blake3",
+      "version": "1.8.5",
+      "purl": "pkg:cargo/blake3@1.8.5",
+      "description": "the BLAKE3 hash function",
+      "licenses": [
+        {
+          "expression": "CC0-1.0 OR Apache-2.0 OR Apache-2.0 WITH LLVM-exception"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/BLAKE3-team/BLAKE3"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/block-buffer@0.10.4",
+      "name": "block-buffer",
+      "version": "0.10.4",
+      "purl": "pkg:cargo/block-buffer@0.10.4",
+      "description": "Buffer type for block processing of data",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/RustCrypto/utils"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/bumpalo@3.20.3",
+      "name": "bumpalo",
+      "version": "3.20.3",
+      "purl": "pkg:cargo/bumpalo@3.20.3",
+      "description": "A fast bump allocation arena for Rust.",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/fitzgen/bumpalo"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/bytemuck@1.25.0",
+      "name": "bytemuck",
+      "version": "1.25.0",
+      "purl": "pkg:cargo/bytemuck@1.25.0",
+      "description": "A crate for mucking around with piles of bytes.",
+      "licenses": [
+        {
+          "expression": "Zlib OR Apache-2.0 OR MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/Lokathor/bytemuck"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/bytes@1.12.0",
+      "name": "bytes",
+      "version": "1.12.0",
+      "purl": "pkg:cargo/bytes@1.12.0",
+      "description": "Types and traits for working with bytes",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/tokio-rs/bytes"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/cc@1.2.65",
+      "name": "cc",
+      "version": "1.2.65",
+      "purl": "pkg:cargo/cc@1.2.65",
+      "description": "A build-time dependency for Cargo build scripts to assist in invoking the native C compiler to compile native C code into a static archive to be linked into Rust code.",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rust-lang/cc-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/cfg-if@1.0.4",
+      "name": "cfg-if",
+      "version": "1.0.4",
+      "purl": "pkg:cargo/cfg-if@1.0.4",
+      "description": "A macro to ergonomically define an item depending on a large number of #[cfg] parameters. Structured like an if-else chain, the first matching branch is the item that gets emitted.",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rust-lang/cfg-if"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/chrono@0.4.45",
+      "name": "chrono",
+      "version": "0.4.45",
+      "purl": "pkg:cargo/chrono@0.4.45",
+      "description": "Date and time library for Rust",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/chronotope/chrono"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/clap@4.6.1",
+      "name": "clap",
+      "version": "4.6.1",
+      "purl": "pkg:cargo/clap@4.6.1",
+      "description": "A simple to use, efficient, and full-featured Command Line Argument Parser",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/clap-rs/clap"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/clap_builder@4.6.0",
+      "name": "clap_builder",
+      "version": "4.6.0",
+      "purl": "pkg:cargo/clap_builder@4.6.0",
+      "description": "A simple to use, efficient, and full-featured Command Line Argument Parser",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/clap-rs/clap"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/clap_derive@4.6.1",
+      "name": "clap_derive",
+      "version": "4.6.1",
+      "purl": "pkg:cargo/clap_derive@4.6.1",
+      "description": "Parse command line argument by defining a struct, derive crate.",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/clap-rs/clap"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/clap_lex@1.1.0",
+      "name": "clap_lex",
+      "version": "1.1.0",
+      "purl": "pkg:cargo/clap_lex@1.1.0",
+      "description": "Minimal, flexible command line parser",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/clap-rs/clap"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/colorchoice@1.0.5",
+      "name": "colorchoice",
+      "version": "1.0.5",
+      "purl": "pkg:cargo/colorchoice@1.0.5",
+      "description": "Global override of color control",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rust-cli/anstyle.git"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/comfy-table@7.2.2",
+      "name": "comfy-table",
+      "version": "7.2.2",
+      "purl": "pkg:cargo/comfy-table@7.2.2",
+      "description": "An easy to use library for building beautiful tables with automatic content wrapping",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/nukesor/comfy-table"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/const-random@0.1.18",
+      "name": "const-random",
+      "version": "0.1.18",
+      "purl": "pkg:cargo/const-random@0.1.18",
+      "description": "Provides compile time random number generation.",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/tkaitchuck/constrandom"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/const-random-macro@0.1.16",
+      "name": "const-random-macro",
+      "version": "0.1.16",
+      "purl": "pkg:cargo/const-random-macro@0.1.16",
+      "description": "Provides the procedural macro used by const-random",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/tkaitchuck/constrandom"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/constant_time_eq@0.4.2",
+      "name": "constant_time_eq",
+      "version": "0.4.2",
+      "purl": "pkg:cargo/constant_time_eq@0.4.2",
+      "description": "Compares two equal-sized byte strings in constant time.",
+      "licenses": [
+        {
+          "expression": "CC0-1.0 OR MIT-0 OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/cesarb/constant_time_eq"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/core-foundation-sys@0.8.7",
+      "name": "core-foundation-sys",
+      "version": "0.8.7",
+      "purl": "pkg:cargo/core-foundation-sys@0.8.7",
+      "description": "Bindings to Core Foundation for macOS",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/servo/core-foundation-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/cpufeatures@0.2.17",
+      "name": "cpufeatures",
+      "version": "0.2.17",
+      "purl": "pkg:cargo/cpufeatures@0.2.17",
+      "description": "Lightweight runtime CPU feature detection for aarch64, loongarch64, and x86/x86_64 targets, with no_std support and support for mobile targets including Android and iOS",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/RustCrypto/utils"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/cpufeatures@0.3.0",
+      "name": "cpufeatures",
+      "version": "0.3.0",
+      "purl": "pkg:cargo/cpufeatures@0.3.0",
+      "description": "Lightweight runtime CPU feature detection for aarch64, loongarch64, and x86/x86_64 targets, with no_std support and support for mobile targets including Android and iOS",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/RustCrypto/utils"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/crc32fast@1.5.0",
+      "name": "crc32fast",
+      "version": "1.5.0",
+      "purl": "pkg:cargo/crc32fast@1.5.0",
+      "description": "Fast, SIMD-accelerated CRC32 (IEEE) checksum computation",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/srijs/rust-crc32fast"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/crossbeam-deque@0.8.6",
+      "name": "crossbeam-deque",
+      "version": "0.8.6",
+      "purl": "pkg:cargo/crossbeam-deque@0.8.6",
+      "description": "Concurrent work-stealing deque",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/crossbeam-rs/crossbeam"
+        },
+        {
+          "type": "website",
+          "url": "https://github.com/crossbeam-rs/crossbeam/tree/master/crossbeam-deque"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/crossbeam-epoch@0.9.20",
+      "name": "crossbeam-epoch",
+      "version": "0.9.20",
+      "purl": "pkg:cargo/crossbeam-epoch@0.9.20",
+      "description": "Epoch-based garbage collection",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/crossbeam-rs/crossbeam"
+        },
+        {
+          "type": "website",
+          "url": "https://github.com/crossbeam-rs/crossbeam/tree/master/crossbeam-epoch"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/crossbeam-utils@0.8.21",
+      "name": "crossbeam-utils",
+      "version": "0.8.21",
+      "purl": "pkg:cargo/crossbeam-utils@0.8.21",
+      "description": "Utilities for concurrent programming",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/crossbeam-rs/crossbeam"
+        },
+        {
+          "type": "website",
+          "url": "https://github.com/crossbeam-rs/crossbeam/tree/master/crossbeam-utils"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/crunchy@0.2.4",
+      "name": "crunchy",
+      "version": "0.2.4",
+      "purl": "pkg:cargo/crunchy@0.2.4",
+      "description": "Crunchy unroller: deterministically unroll constant loops",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/eira-fransham/crunchy"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/crypto-common@0.1.7",
+      "name": "crypto-common",
+      "version": "0.1.7",
+      "purl": "pkg:cargo/crypto-common@0.1.7",
+      "description": "Common cryptographic traits",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/RustCrypto/traits"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/csv@1.4.0",
+      "name": "csv",
+      "version": "1.4.0",
+      "purl": "pkg:cargo/csv@1.4.0",
+      "description": "Fast CSV parsing with support for serde.",
+      "licenses": [
+        {
+          "expression": "Unlicense/MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/BurntSushi/rust-csv"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/csv-core@0.1.13",
+      "name": "csv-core",
+      "version": "0.1.13",
+      "purl": "pkg:cargo/csv-core@0.1.13",
+      "description": "Bare bones CSV parsing with no_std support.",
+      "licenses": [
+        {
+          "expression": "Unlicense/MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/BurntSushi/rust-csv"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/digest@0.10.7",
+      "name": "digest",
+      "version": "0.10.7",
+      "purl": "pkg:cargo/digest@0.10.7",
+      "description": "Traits for cryptographic hash functions and message authentication codes",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/RustCrypto/traits"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/either@1.16.0",
+      "name": "either",
+      "version": "1.16.0",
+      "purl": "pkg:cargo/either@1.16.0",
+      "description": "The enum `Either` with variants `Left` and `Right` is a general purpose sum type with two cases.",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rayon-rs/either"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/encoding_rs@0.8.35",
+      "name": "encoding_rs",
+      "version": "0.8.35",
+      "purl": "pkg:cargo/encoding_rs@0.8.35",
+      "description": "A Gecko-oriented implementation of the Encoding Standard",
+      "licenses": [
+        {
+          "expression": "(Apache-2.0 OR MIT) AND BSD-3-Clause"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/hsivonen/encoding_rs"
+        },
+        {
+          "type": "website",
+          "url": "https://docs.rs/encoding_rs/"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/equivalent@1.0.2",
+      "name": "equivalent",
+      "version": "1.0.2",
+      "purl": "pkg:cargo/equivalent@1.0.2",
+      "description": "Traits for key comparison in maps.",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 OR MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/indexmap-rs/equivalent"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/find-msvc-tools@0.1.9",
+      "name": "find-msvc-tools",
+      "version": "0.1.9",
+      "purl": "pkg:cargo/find-msvc-tools@0.1.9",
+      "description": "Find windows-specific tools, read MSVC versions from the registry and from COM interfaces",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rust-lang/cc-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/flatbuffers@25.12.19",
+      "name": "flatbuffers",
+      "version": "25.12.19",
+      "purl": "pkg:cargo/flatbuffers@25.12.19",
+      "description": "Official FlatBuffers Rust runtime library.",
+      "licenses": [
+        {
+          "expression": "Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/google/flatbuffers"
+        },
+        {
+          "type": "website",
+          "url": "https://google.github.io/flatbuffers/"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/flate2@1.1.9",
+      "name": "flate2",
+      "version": "1.1.9",
+      "purl": "pkg:cargo/flate2@1.1.9",
+      "description": "DEFLATE compression and decompression exposed as Read/BufRead/Write streams. Supports miniz_oxide and multiple zlib implementations. Supports zlib, gzip, and raw deflate streams.",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rust-lang/flate2-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/futures-core@0.3.32",
+      "name": "futures-core",
+      "version": "0.3.32",
+      "purl": "pkg:cargo/futures-core@0.3.32",
+      "description": "The core traits and types in for the `futures` library.",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rust-lang/futures-rs"
+        },
+        {
+          "type": "website",
+          "url": "https://rust-lang.github.io/futures-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/futures-task@0.3.32",
+      "name": "futures-task",
+      "version": "0.3.32",
+      "purl": "pkg:cargo/futures-task@0.3.32",
+      "description": "Tools for working with tasks.",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rust-lang/futures-rs"
+        },
+        {
+          "type": "website",
+          "url": "https://rust-lang.github.io/futures-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/futures-util@0.3.32",
+      "name": "futures-util",
+      "version": "0.3.32",
+      "purl": "pkg:cargo/futures-util@0.3.32",
+      "description": "Common utilities and extension traits for the futures-rs library.",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rust-lang/futures-rs"
+        },
+        {
+          "type": "website",
+          "url": "https://rust-lang.github.io/futures-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/generic-array@0.14.7",
+      "name": "generic-array",
+      "version": "0.14.7",
+      "purl": "pkg:cargo/generic-array@0.14.7",
+      "description": "Generic types implementing functionality of arrays",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/fizyk20/generic-array.git"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/getrandom@0.2.17",
+      "name": "getrandom",
+      "version": "0.2.17",
+      "purl": "pkg:cargo/getrandom@0.2.17",
+      "description": "A small cross-platform library for retrieving random data from system source",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rust-random/getrandom"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/getrandom@0.3.4",
+      "name": "getrandom",
+      "version": "0.3.4",
+      "purl": "pkg:cargo/getrandom@0.3.4",
+      "description": "A small cross-platform library for retrieving random data from system source",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rust-random/getrandom"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/half@2.7.1",
+      "name": "half",
+      "version": "2.7.1",
+      "purl": "pkg:cargo/half@2.7.1",
+      "description": "Half-precision floating point f16 and bf16 types for Rust implementing the IEEE 754-2008 standard binary16 and bfloat16 types.",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/VoidStarKat/half-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/hashbrown@0.17.1",
+      "name": "hashbrown",
+      "version": "0.17.1",
+      "purl": "pkg:cargo/hashbrown@0.17.1",
+      "description": "A Rust port of Google's SwissTable hash map",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rust-lang/hashbrown"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/heck@0.5.0",
+      "name": "heck",
+      "version": "0.5.0",
+      "purl": "pkg:cargo/heck@0.5.0",
+      "description": "heck is a case conversion library.",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/withoutboats/heck"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/iana-time-zone@0.1.65",
+      "name": "iana-time-zone",
+      "version": "0.1.65",
+      "purl": "pkg:cargo/iana-time-zone@0.1.65",
+      "description": "get the IANA time zone for the current system",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/strawlab/iana-time-zone"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/iana-time-zone-haiku@0.1.2",
+      "name": "iana-time-zone-haiku",
+      "version": "0.1.2",
+      "purl": "pkg:cargo/iana-time-zone-haiku@0.1.2",
+      "description": "iana-time-zone support crate for Haiku OS",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/strawlab/iana-time-zone"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/identity-hash@0.1.0",
+      "name": "identity-hash",
+      "version": "0.1.0",
+      "purl": "pkg:cargo/identity-hash@0.1.0",
+      "description": "An implementation of `std::hash::Hasher` which does not hash at all.",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 OR MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/offsetting/identity-hash"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/indexmap@2.14.0",
+      "name": "indexmap",
+      "version": "2.14.0",
+      "purl": "pkg:cargo/indexmap@2.14.0",
+      "description": "A hash table with consistent order and fast iteration.",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 OR MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/indexmap-rs/indexmap"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/is_terminal_polyfill@1.70.2",
+      "name": "is_terminal_polyfill",
+      "version": "1.70.2",
+      "purl": "pkg:cargo/is_terminal_polyfill@1.70.2",
+      "description": "Polyfill for `is_terminal` stdlib feature for use with older MSRVs",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/polyfill-rs/is_terminal_polyfill"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/itoa@1.0.18",
+      "name": "itoa",
+      "version": "1.0.18",
+      "purl": "pkg:cargo/itoa@1.0.18",
+      "description": "Fast integer primitive to string conversion",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/dtolnay/itoa"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/js-sys@0.3.103",
+      "name": "js-sys",
+      "version": "0.3.103",
+      "purl": "pkg:cargo/js-sys@0.3.103",
+      "description": "Bindings for all JS global objects and functions in all JS environments like Node.js and browsers, built on `#[wasm_bindgen]` using the `wasm-bindgen` crate.",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/wasm-bindgen/wasm-bindgen/tree/master/crates/js-sys"
+        },
+        {
+          "type": "website",
+          "url": "https://wasm-bindgen.github.io/wasm-bindgen/"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/lazy_static@1.5.0",
+      "name": "lazy_static",
+      "version": "1.5.0",
+      "purl": "pkg:cargo/lazy_static@1.5.0",
+      "description": "A macro for declaring lazily evaluated statics in Rust.",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rust-lang-nursery/lazy-static.rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/lexical-core@1.0.6",
+      "name": "lexical-core",
+      "version": "1.0.6",
+      "purl": "pkg:cargo/lexical-core@1.0.6",
+      "description": "Lexical, to- and from-string conversion routines.",
+      "licenses": [
+        {
+          "expression": "MIT/Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/Alexhuszagh/rust-lexical"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/lexical-parse-float@1.0.6",
+      "name": "lexical-parse-float",
+      "version": "1.0.6",
+      "purl": "pkg:cargo/lexical-parse-float@1.0.6",
+      "description": "Efficient parsing of floats from strings.",
+      "licenses": [
+        {
+          "expression": "MIT/Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/Alexhuszagh/rust-lexical"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/lexical-parse-integer@1.0.6",
+      "name": "lexical-parse-integer",
+      "version": "1.0.6",
+      "purl": "pkg:cargo/lexical-parse-integer@1.0.6",
+      "description": "Efficient parsing of integers from strings.",
+      "licenses": [
+        {
+          "expression": "MIT/Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/Alexhuszagh/rust-lexical"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/lexical-util@1.0.7",
+      "name": "lexical-util",
+      "version": "1.0.7",
+      "purl": "pkg:cargo/lexical-util@1.0.7",
+      "description": "Shared utilities for lexical creates.",
+      "licenses": [
+        {
+          "expression": "MIT/Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/Alexhuszagh/rust-lexical"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/lexical-write-float@1.0.6",
+      "name": "lexical-write-float",
+      "version": "1.0.6",
+      "purl": "pkg:cargo/lexical-write-float@1.0.6",
+      "description": "Efficient formatting of floats to strings.",
+      "licenses": [
+        {
+          "expression": "MIT/Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/Alexhuszagh/rust-lexical"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/lexical-write-integer@1.0.6",
+      "name": "lexical-write-integer",
+      "version": "1.0.6",
+      "purl": "pkg:cargo/lexical-write-integer@1.0.6",
+      "description": "Efficient formatting of integers to strings.",
+      "licenses": [
+        {
+          "expression": "MIT/Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/Alexhuszagh/rust-lexical"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/libc@0.2.186",
+      "name": "libc",
+      "version": "0.2.186",
+      "purl": "pkg:cargo/libc@0.2.186",
+      "description": "Raw FFI bindings to platform libraries like libc.",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rust-lang/libc"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/libm@0.2.16",
+      "name": "libm",
+      "version": "0.2.16",
+      "purl": "pkg:cargo/libm@0.2.16",
+      "description": "libm in pure Rust",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rust-lang/compiler-builtins"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/libmimalloc-sys@0.1.49",
+      "name": "libmimalloc-sys",
+      "version": "0.1.49",
+      "purl": "pkg:cargo/libmimalloc-sys@0.1.49",
+      "description": "Sys crate wrapping the mimalloc allocator",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/purpleprotocol/mimalloc_rust/tree/master/libmimalloc-sys"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/log@0.4.33",
+      "name": "log",
+      "version": "0.4.33",
+      "purl": "pkg:cargo/log@0.4.33",
+      "description": "A lightweight logging facade for Rust",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rust-lang/log"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/matchers@0.2.0",
+      "name": "matchers",
+      "version": "0.2.0",
+      "purl": "pkg:cargo/matchers@0.2.0",
+      "description": "Regex matching on character and byte streams.",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/hawkw/matchers"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/memchr@2.8.2",
+      "name": "memchr",
+      "version": "2.8.2",
+      "purl": "pkg:cargo/memchr@2.8.2",
+      "description": "Provides extremely fast (uses SIMD on x86_64, aarch64 and wasm32) routines for 1, 2 or 3 byte search and single substring search.",
+      "licenses": [
+        {
+          "expression": "Unlicense OR MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/BurntSushi/memchr"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/mimalloc@0.1.52",
+      "name": "mimalloc",
+      "version": "0.1.52",
+      "purl": "pkg:cargo/mimalloc@0.1.52",
+      "description": "Performance and security oriented drop-in allocator",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/purpleprotocol/mimalloc_rust"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/miniz_oxide@0.8.9",
+      "name": "miniz_oxide",
+      "version": "0.8.9",
+      "purl": "pkg:cargo/miniz_oxide@0.8.9",
+      "description": "DEFLATE compression and decompression library rewritten in Rust based on miniz",
+      "licenses": [
+        {
+          "expression": "MIT OR Zlib OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/Frommi/miniz_oxide/tree/master/miniz_oxide"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/mzdata@0.65.5",
+      "name": "mzdata",
+      "version": "0.65.5",
+      "purl": "pkg:cargo/mzdata@0.65.5",
+      "description": "A library to read mass spectrometry data formats and a data model for mass spectra",
+      "licenses": [
+        {
+          "expression": "Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/mobiusklein/mzdata"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/mzpeaks@1.0.9",
+      "name": "mzpeaks",
+      "version": "1.0.9",
+      "purl": "pkg:cargo/mzpeaks@1.0.9",
+      "description": "A library representing peaks in mass spectrometry data",
+      "licenses": [
+        {
+          "expression": "Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/mobiusklein/mzpeaks"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/nu-ansi-term@0.50.3",
+      "name": "nu-ansi-term",
+      "version": "0.50.3",
+      "purl": "pkg:cargo/nu-ansi-term@0.50.3",
+      "description": "Library for ANSI terminal colors and styles (bold, underline)",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/nushell/nu-ansi-term"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/num-bigint@0.4.6",
+      "name": "num-bigint",
+      "version": "0.4.6",
+      "purl": "pkg:cargo/num-bigint@0.4.6",
+      "description": "Big integer implementation for Rust",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rust-num/num-bigint"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/num-complex@0.4.6",
+      "name": "num-complex",
+      "version": "0.4.6",
+      "purl": "pkg:cargo/num-complex@0.4.6",
+      "description": "Complex numbers implementation for Rust",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rust-num/num-complex"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/num-integer@0.1.46",
+      "name": "num-integer",
+      "version": "0.1.46",
+      "purl": "pkg:cargo/num-integer@0.1.46",
+      "description": "Integer traits and functions",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rust-num/num-integer"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/num-traits@0.2.19",
+      "name": "num-traits",
+      "version": "0.2.19",
+      "purl": "pkg:cargo/num-traits@0.2.19",
+      "description": "Numeric traits for generic mathematics",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rust-num/num-traits"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/once_cell@1.21.4",
+      "name": "once_cell",
+      "version": "1.21.4",
+      "purl": "pkg:cargo/once_cell@1.21.4",
+      "description": "Single assignment cells and lazy values.",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/matklad/once_cell"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/once_cell_polyfill@1.70.2",
+      "name": "once_cell_polyfill",
+      "version": "1.70.2",
+      "purl": "pkg:cargo/once_cell_polyfill@1.70.2",
+      "description": "Polyfill for `OnceCell` stdlib feature for use with older MSRVs",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/polyfill-rs/once_cell_polyfill"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/outref@0.5.2",
+      "name": "outref",
+      "version": "0.5.2",
+      "purl": "pkg:cargo/outref@0.5.2",
+      "description": "Out reference",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/Nugine/outref"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/parquet@59.0.0",
+      "name": "parquet",
+      "version": "59.0.0",
+      "purl": "pkg:cargo/parquet@59.0.0",
+      "description": "Apache Parquet implementation in Rust",
+      "licenses": [
+        {
+          "expression": "Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/apache/arrow-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/paste@1.0.15",
+      "name": "paste",
+      "version": "1.0.15",
+      "purl": "pkg:cargo/paste@1.0.15",
+      "description": "Macros for all your token pasting needs",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/dtolnay/paste"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/pin-project-lite@0.2.17",
+      "name": "pin-project-lite",
+      "version": "0.2.17",
+      "purl": "pkg:cargo/pin-project-lite@0.2.17",
+      "description": "A lightweight version of pin-project written with declarative macros.",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 OR MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/taiki-e/pin-project-lite"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/proc-macro2@1.0.106",
+      "name": "proc-macro2",
+      "version": "1.0.106",
+      "purl": "pkg:cargo/proc-macro2@1.0.106",
+      "description": "A substitute implementation of the compiler's `proc_macro` API to decouple token-based libraries from the procedural macro use case.",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/dtolnay/proc-macro2"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/quick-xml@0.41.0",
+      "name": "quick-xml",
+      "version": "0.41.0",
+      "purl": "pkg:cargo/quick-xml@0.41.0",
+      "description": "High performance xml reader and writer",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/tafia/quick-xml"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/quote@1.0.46",
+      "name": "quote",
+      "version": "1.0.46",
+      "purl": "pkg:cargo/quote@1.0.46",
+      "description": "Quasi-quoting macro quote!(...)",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/dtolnay/quote"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/r-efi@5.3.0",
+      "name": "r-efi",
+      "version": "5.3.0",
+      "purl": "pkg:cargo/r-efi@5.3.0",
+      "description": "UEFI Reference Specification Protocol Constants and Definitions",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0 OR LGPL-2.1-or-later"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/r-efi/r-efi"
+        },
+        {
+          "type": "website",
+          "url": "https://github.com/r-efi/r-efi/wiki"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/rayon@1.12.0",
+      "name": "rayon",
+      "version": "1.12.0",
+      "purl": "pkg:cargo/rayon@1.12.0",
+      "description": "Simple work-stealing parallelism for Rust",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rayon-rs/rayon"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/rayon-core@1.13.0",
+      "name": "rayon-core",
+      "version": "1.13.0",
+      "purl": "pkg:cargo/rayon-core@1.13.0",
+      "description": "Core APIs for Rayon",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rayon-rs/rayon"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/regex@1.12.4",
+      "name": "regex",
+      "version": "1.12.4",
+      "purl": "pkg:cargo/regex@1.12.4",
+      "description": "An implementation of regular expressions for Rust. This implementation uses finite automata and guarantees linear time matching on all inputs.",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rust-lang/regex"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/regex-automata@0.4.14",
+      "name": "regex-automata",
+      "version": "0.4.14",
+      "purl": "pkg:cargo/regex-automata@0.4.14",
+      "description": "Automata construction and matching using regular expressions.",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rust-lang/regex"
+        },
+        {
+          "type": "website",
+          "url": "https://github.com/rust-lang/regex/tree/master/regex-automata"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/regex-syntax@0.8.11",
+      "name": "regex-syntax",
+      "version": "0.8.11",
+      "purl": "pkg:cargo/regex-syntax@0.8.11",
+      "description": "A regular expression parser.",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rust-lang/regex"
+        },
+        {
+          "type": "website",
+          "url": "https://github.com/rust-lang/regex/tree/master/regex-syntax"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/rustc_version@0.4.1",
+      "name": "rustc_version",
+      "version": "0.4.1",
+      "purl": "pkg:cargo/rustc_version@0.4.1",
+      "description": "A library for querying the version of a installed rustc compiler",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/djc/rustc-version-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/rustversion@1.0.22",
+      "name": "rustversion",
+      "version": "1.0.22",
+      "purl": "pkg:cargo/rustversion@1.0.22",
+      "description": "Conditional compilation according to rustc compiler version",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/dtolnay/rustversion"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/ryu@1.0.23",
+      "name": "ryu",
+      "version": "1.0.23",
+      "purl": "pkg:cargo/ryu@1.0.23",
+      "description": "Fast floating point to string conversion",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 OR BSL-1.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/dtolnay/ryu"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/semver@1.0.28",
+      "name": "semver",
+      "version": "1.0.28",
+      "purl": "pkg:cargo/semver@1.0.28",
+      "description": "Parser and evaluator for Cargo's flavor of Semantic Versioning",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/dtolnay/semver"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/seq-macro@0.3.6",
+      "name": "seq-macro",
+      "version": "0.3.6",
+      "purl": "pkg:cargo/seq-macro@0.3.6",
+      "description": "Macro to repeat sequentially indexed copies of a fragment of code.",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/dtolnay/seq-macro"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/serde@1.0.228",
+      "name": "serde",
+      "version": "1.0.228",
+      "purl": "pkg:cargo/serde@1.0.228",
+      "description": "A generic serialization/deserialization framework",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/serde-rs/serde"
+        },
+        {
+          "type": "website",
+          "url": "https://serde.rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/serde_core@1.0.228",
+      "name": "serde_core",
+      "version": "1.0.228",
+      "purl": "pkg:cargo/serde_core@1.0.228",
+      "description": "Serde traits only, with no support for derive -- use the `serde` crate instead",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/serde-rs/serde"
+        },
+        {
+          "type": "website",
+          "url": "https://serde.rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/serde_derive@1.0.228",
+      "name": "serde_derive",
+      "version": "1.0.228",
+      "purl": "pkg:cargo/serde_derive@1.0.228",
+      "description": "Macros 1.1 implementation of #[derive(Serialize, Deserialize)]",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/serde-rs/serde"
+        },
+        {
+          "type": "website",
+          "url": "https://serde.rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/serde_json@1.0.150",
+      "name": "serde_json",
+      "version": "1.0.150",
+      "purl": "pkg:cargo/serde_json@1.0.150",
+      "description": "A JSON serialization file format",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/serde-rs/json"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/sha1@0.10.6",
+      "name": "sha1",
+      "version": "0.10.6",
+      "purl": "pkg:cargo/sha1@0.10.6",
+      "description": "SHA-1 hash function",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/RustCrypto/hashes"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/sharded-slab@0.1.7",
+      "name": "sharded-slab",
+      "version": "0.1.7",
+      "purl": "pkg:cargo/sharded-slab@0.1.7",
+      "description": "A lock-free concurrent slab.",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/hawkw/sharded-slab"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/shlex@2.0.1",
+      "name": "shlex",
+      "version": "2.0.1",
+      "purl": "pkg:cargo/shlex@2.0.1",
+      "description": "Split a string into shell words, like Python's shlex.",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/comex/rust-shlex"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/simd-adler32@0.3.9",
+      "name": "simd-adler32",
+      "version": "0.3.9",
+      "purl": "pkg:cargo/simd-adler32@0.3.9",
+      "description": "A SIMD-accelerated Adler-32 hash algorithm implementation.",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/mcountryman/simd-adler32"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/simdutf8@0.1.5",
+      "name": "simdutf8",
+      "version": "0.1.5",
+      "purl": "pkg:cargo/simdutf8@0.1.5",
+      "description": "SIMD-accelerated UTF-8 validation.",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rusticstuff/simdutf8"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/slab@0.4.12",
+      "name": "slab",
+      "version": "0.4.12",
+      "purl": "pkg:cargo/slab@0.4.12",
+      "description": "Pre-allocated storage for a uniform data type",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/tokio-rs/slab"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/smallvec@1.15.2",
+      "name": "smallvec",
+      "version": "1.15.2",
+      "purl": "pkg:cargo/smallvec@1.15.2",
+      "description": "'Small vector' optimization: store up to a small number of items on the stack",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/servo/rust-smallvec"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/snap@1.1.1",
+      "name": "snap",
+      "version": "1.1.1",
+      "purl": "pkg:cargo/snap@1.1.1",
+      "description": "A pure Rust implementation of the Snappy compression algorithm. Includes streaming compression and decompression.",
+      "licenses": [
+        {
+          "expression": "BSD-3-Clause"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/BurntSushi/rust-snappy"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/strsim@0.11.1",
+      "name": "strsim",
+      "version": "0.11.1",
+      "purl": "pkg:cargo/strsim@0.11.1",
+      "description": "Implementations of string similarity metrics. Includes Hamming, Levenshtein, OSA, Damerau-Levenshtein, Jaro, Jaro-Winkler, and Sørensen-Dice.",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rapidfuzz/strsim-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/syn@2.0.118",
+      "name": "syn",
+      "version": "2.0.118",
+      "purl": "pkg:cargo/syn@2.0.118",
+      "description": "Parser for Rust source code",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/dtolnay/syn"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/thiserror@2.0.18",
+      "name": "thiserror",
+      "version": "2.0.18",
+      "purl": "pkg:cargo/thiserror@2.0.18",
+      "description": "derive(Error)",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/dtolnay/thiserror"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/thiserror-impl@2.0.18",
+      "name": "thiserror-impl",
+      "version": "2.0.18",
+      "purl": "pkg:cargo/thiserror-impl@2.0.18",
+      "description": "Implementation detail of the `thiserror` crate",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/dtolnay/thiserror"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/thread_local@1.1.9",
+      "name": "thread_local",
+      "version": "1.1.9",
+      "purl": "pkg:cargo/thread_local@1.1.9",
+      "description": "Per-object thread-local storage",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/Amanieu/thread_local-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/tiny-keccak@2.0.2",
+      "name": "tiny-keccak",
+      "version": "2.0.2",
+      "purl": "pkg:cargo/tiny-keccak@2.0.2",
+      "description": "An implementation of Keccak derived functions.",
+      "licenses": [
+        {
+          "expression": "CC0-1.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "website",
+          "url": "https://github.com/debris/tiny-keccak"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/tracing@0.1.44",
+      "name": "tracing",
+      "version": "0.1.44",
+      "purl": "pkg:cargo/tracing@0.1.44",
+      "description": "Application-level tracing for Rust.",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/tokio-rs/tracing"
+        },
+        {
+          "type": "website",
+          "url": "https://tokio.rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/tracing-attributes@0.1.31",
+      "name": "tracing-attributes",
+      "version": "0.1.31",
+      "purl": "pkg:cargo/tracing-attributes@0.1.31",
+      "description": "Procedural macro attributes for automatically instrumenting functions.",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/tokio-rs/tracing"
+        },
+        {
+          "type": "website",
+          "url": "https://tokio.rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/tracing-core@0.1.36",
+      "name": "tracing-core",
+      "version": "0.1.36",
+      "purl": "pkg:cargo/tracing-core@0.1.36",
+      "description": "Core primitives for application-level tracing.",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/tokio-rs/tracing"
+        },
+        {
+          "type": "website",
+          "url": "https://tokio.rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/tracing-log@0.2.0",
+      "name": "tracing-log",
+      "version": "0.2.0",
+      "purl": "pkg:cargo/tracing-log@0.2.0",
+      "description": "Provides compatibility between `tracing` and the `log` crate.",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/tokio-rs/tracing"
+        },
+        {
+          "type": "website",
+          "url": "https://tokio.rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/tracing-subscriber@0.3.23",
+      "name": "tracing-subscriber",
+      "version": "0.3.23",
+      "purl": "pkg:cargo/tracing-subscriber@0.3.23",
+      "description": "Utilities for implementing and composing `tracing` subscribers.",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/tokio-rs/tracing"
+        },
+        {
+          "type": "website",
+          "url": "https://tokio.rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/twox-hash@2.1.2",
+      "name": "twox-hash",
+      "version": "2.1.2",
+      "purl": "pkg:cargo/twox-hash@2.1.2",
+      "description": "A Rust implementation of the XXHash and XXH3 algorithms",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/shepmaster/twox-hash"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/typenum@1.20.1",
+      "name": "typenum",
+      "version": "1.20.1",
+      "purl": "pkg:cargo/typenum@1.20.1",
+      "description": "Typenum is a Rust library for type-level numbers evaluated at compile time. It currently supports bits, unsigned integers, and signed integers. It also provides a type-level array of type-level numbers, but its implementation is incomplete.",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/paholg/typenum"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/unicode-ident@1.0.24",
+      "name": "unicode-ident",
+      "version": "1.0.24",
+      "purl": "pkg:cargo/unicode-ident@1.0.24",
+      "description": "Determine whether characters have the XID_Start or XID_Continue properties according to Unicode Standard Annex #31",
+      "licenses": [
+        {
+          "expression": "(MIT OR Apache-2.0) AND Unicode-3.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/dtolnay/unicode-ident"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/unicode-segmentation@1.13.3",
+      "name": "unicode-segmentation",
+      "version": "1.13.3",
+      "purl": "pkg:cargo/unicode-segmentation@1.13.3",
+      "description": "This crate provides Grapheme Cluster, Word and Sentence boundaries according to Unicode Standard Annex #29 rules.",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/unicode-rs/unicode-segmentation"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/unicode-width@0.2.2",
+      "name": "unicode-width",
+      "version": "0.2.2",
+      "purl": "pkg:cargo/unicode-width@0.2.2",
+      "description": "Determine displayed width of `char` and `str` types according to Unicode Standard Annex #11 rules.",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/unicode-rs/unicode-width"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/utf8parse@0.2.2",
+      "name": "utf8parse",
+      "version": "0.2.2",
+      "purl": "pkg:cargo/utf8parse@0.2.2",
+      "description": "Table-driven UTF-8 parser",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 OR MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/alacritty/vte"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/valuable@0.1.1",
+      "name": "valuable",
+      "version": "0.1.1",
+      "purl": "pkg:cargo/valuable@0.1.1",
+      "description": "Object-safe value inspection, used to pass un-typed structured data across trait-object boundaries.",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/tokio-rs/valuable"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/version_check@0.9.5",
+      "name": "version_check",
+      "version": "0.9.5",
+      "purl": "pkg:cargo/version_check@0.9.5",
+      "description": "Tiny crate to check the version of the installed/running rustc.",
+      "licenses": [
+        {
+          "expression": "MIT/Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/SergioBenitez/version_check"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/vsimd@0.8.0",
+      "name": "vsimd",
+      "version": "0.8.0",
+      "purl": "pkg:cargo/vsimd@0.8.0",
+      "description": "SIMD utilities",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/Nugine/simd"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/wasi@0.11.1+wasi-snapshot-preview1",
+      "name": "wasi",
+      "version": "0.11.1+wasi-snapshot-preview1",
+      "purl": "pkg:cargo/wasi@0.11.1+wasi-snapshot-preview1",
+      "description": "Experimental WASI API bindings for Rust",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/bytecodealliance/wasi"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/wasip2@1.0.4+wasi-0.2.12",
+      "name": "wasip2",
+      "version": "1.0.4+wasi-0.2.12",
+      "purl": "pkg:cargo/wasip2@1.0.4+wasi-0.2.12",
+      "description": "WASIp2 API bindings for Rust",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/bytecodealliance/wasi-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/wasm-bindgen@0.2.126",
+      "name": "wasm-bindgen",
+      "version": "0.2.126",
+      "purl": "pkg:cargo/wasm-bindgen@0.2.126",
+      "description": "Easy support for interacting between JS and Rust.",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/wasm-bindgen/wasm-bindgen"
+        },
+        {
+          "type": "website",
+          "url": "https://wasm-bindgen.github.io/wasm-bindgen"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/wasm-bindgen-macro@0.2.126",
+      "name": "wasm-bindgen-macro",
+      "version": "0.2.126",
+      "purl": "pkg:cargo/wasm-bindgen-macro@0.2.126",
+      "description": "Definition of the `#[wasm_bindgen]` attribute, an internal dependency",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/wasm-bindgen/wasm-bindgen/tree/master/crates/macro"
+        },
+        {
+          "type": "website",
+          "url": "https://wasm-bindgen.github.io/wasm-bindgen/"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/wasm-bindgen-macro-support@0.2.126",
+      "name": "wasm-bindgen-macro-support",
+      "version": "0.2.126",
+      "purl": "pkg:cargo/wasm-bindgen-macro-support@0.2.126",
+      "description": "Implementation APIs for the `#[wasm_bindgen]` attribute",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/wasm-bindgen/wasm-bindgen/tree/master/crates/macro-support"
+        },
+        {
+          "type": "website",
+          "url": "https://wasm-bindgen.github.io/wasm-bindgen/"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/wasm-bindgen-shared@0.2.126",
+      "name": "wasm-bindgen-shared",
+      "version": "0.2.126",
+      "purl": "pkg:cargo/wasm-bindgen-shared@0.2.126",
+      "description": "Shared support between wasm-bindgen and wasm-bindgen cli, an internal dependency.",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/wasm-bindgen/wasm-bindgen/tree/master/crates/shared"
+        },
+        {
+          "type": "website",
+          "url": "https://wasm-bindgen.github.io/wasm-bindgen/"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/windows-core@0.62.2",
+      "name": "windows-core",
+      "version": "0.62.2",
+      "purl": "pkg:cargo/windows-core@0.62.2",
+      "description": "Core type support for COM and Windows",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/microsoft/windows-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/windows-implement@0.60.2",
+      "name": "windows-implement",
+      "version": "0.60.2",
+      "purl": "pkg:cargo/windows-implement@0.60.2",
+      "description": "The implement macro for the Windows crates",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/microsoft/windows-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/windows-interface@0.59.3",
+      "name": "windows-interface",
+      "version": "0.59.3",
+      "purl": "pkg:cargo/windows-interface@0.59.3",
+      "description": "The interface macro for the Windows crates",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/microsoft/windows-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/windows-link@0.2.1",
+      "name": "windows-link",
+      "version": "0.2.1",
+      "purl": "pkg:cargo/windows-link@0.2.1",
+      "description": "Linking for Windows",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/microsoft/windows-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/windows-result@0.4.1",
+      "name": "windows-result",
+      "version": "0.4.1",
+      "purl": "pkg:cargo/windows-result@0.4.1",
+      "description": "Windows error handling",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/microsoft/windows-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/windows-strings@0.5.1",
+      "name": "windows-strings",
+      "version": "0.5.1",
+      "purl": "pkg:cargo/windows-strings@0.5.1",
+      "description": "Windows string types",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/microsoft/windows-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/windows-sys@0.61.2",
+      "name": "windows-sys",
+      "version": "0.61.2",
+      "purl": "pkg:cargo/windows-sys@0.61.2",
+      "description": "Rust for Windows",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/microsoft/windows-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/wit-bindgen@0.57.1",
+      "name": "wit-bindgen",
+      "version": "0.57.1",
+      "purl": "pkg:cargo/wit-bindgen@0.57.1",
+      "description": "Rust bindings generator and runtime support for WIT and the component model. Used when compiling Rust programs to the component model.",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/bytecodealliance/wit-bindgen"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/zerocopy@0.8.52",
+      "name": "zerocopy",
+      "version": "0.8.52",
+      "purl": "pkg:cargo/zerocopy@0.8.52",
+      "description": "Zerocopy makes zero-cost memory manipulation effortless. We write \"unsafe\" so you don't have to.",
+      "licenses": [
+        {
+          "expression": "BSD-2-Clause OR Apache-2.0 OR MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/google/zerocopy"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/zerocopy-derive@0.8.52",
+      "name": "zerocopy-derive",
+      "version": "0.8.52",
+      "purl": "pkg:cargo/zerocopy-derive@0.8.52",
+      "description": "Custom derive for traits from the zerocopy crate",
+      "licenses": [
+        {
+          "expression": "BSD-2-Clause OR Apache-2.0 OR MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/google/zerocopy"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/zmij@1.0.21",
+      "name": "zmij",
+      "version": "1.0.21",
+      "purl": "pkg:cargo/zmij@1.0.21",
+      "description": "A double-to-string conversion algorithm based on Schubfach and yy",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/dtolnay/zmij"
+        }
+      ]
+    }
+  ],
+  "dependencies": [
+    {
+      "ref": "pkg:cargo/adler2@2.0.1",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:cargo/ahash@0.8.12",
+      "dependsOn": [
+        "pkg:cargo/cfg-if@1.0.4",
+        "pkg:cargo/const-random@0.1.18",
+        "pkg:cargo/getrandom@0.3.4",
+        "pkg:cargo/once_cell@1.21.4",
+        "pkg:cargo/version_check@0.9.5",
+        "pkg:cargo/zerocopy@0.8.52"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/aho-corasick@1.1.4",
+      "dependsOn": [
+        "pkg:cargo/memchr@2.8.2"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/android_system_properties@0.1.5",
+      "dependsOn": [
+        "pkg:cargo/libc@0.2.186"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/anstream@1.0.0",
+      "dependsOn": [
+        "pkg:cargo/anstyle-parse@1.0.0",
+        "pkg:cargo/anstyle-query@1.1.5",
+        "pkg:cargo/anstyle-wincon@3.0.11",
+        "pkg:cargo/anstyle@1.0.14",
+        "pkg:cargo/colorchoice@1.0.5",
+        "pkg:cargo/is_terminal_polyfill@1.70.2",
+        "pkg:cargo/utf8parse@0.2.2"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/anstyle-parse@1.0.0",
+      "dependsOn": [
+        "pkg:cargo/utf8parse@0.2.2"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/anstyle-query@1.1.5",
+      "dependsOn": [
+        "pkg:cargo/windows-sys@0.61.2"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/anstyle-wincon@3.0.11",
+      "dependsOn": [
+        "pkg:cargo/anstyle@1.0.14",
+        "pkg:cargo/once_cell_polyfill@1.70.2",
+        "pkg:cargo/windows-sys@0.61.2"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/anstyle@1.0.14",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:cargo/anyhow@1.0.103",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:cargo/arrayref@0.3.9",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:cargo/arrayvec@0.7.7",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:cargo/arrow-arith@59.0.0",
+      "dependsOn": [
+        "pkg:cargo/arrow-array@59.0.0",
+        "pkg:cargo/arrow-buffer@59.0.0",
+        "pkg:cargo/arrow-data@59.0.0",
+        "pkg:cargo/arrow-schema@59.0.0",
+        "pkg:cargo/chrono@0.4.45",
+        "pkg:cargo/num-traits@0.2.19"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/arrow-array@59.0.0",
+      "dependsOn": [
+        "pkg:cargo/ahash@0.8.12",
+        "pkg:cargo/arrow-buffer@59.0.0",
+        "pkg:cargo/arrow-data@59.0.0",
+        "pkg:cargo/arrow-schema@59.0.0",
+        "pkg:cargo/chrono@0.4.45",
+        "pkg:cargo/half@2.7.1",
+        "pkg:cargo/hashbrown@0.17.1",
+        "pkg:cargo/num-complex@0.4.6",
+        "pkg:cargo/num-integer@0.1.46",
+        "pkg:cargo/num-traits@0.2.19"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/arrow-buffer@59.0.0",
+      "dependsOn": [
+        "pkg:cargo/bytes@1.12.0",
+        "pkg:cargo/half@2.7.1",
+        "pkg:cargo/num-bigint@0.4.6",
+        "pkg:cargo/num-traits@0.2.19"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/arrow-cast@59.0.0",
+      "dependsOn": [
+        "pkg:cargo/arrow-array@59.0.0",
+        "pkg:cargo/arrow-buffer@59.0.0",
+        "pkg:cargo/arrow-data@59.0.0",
+        "pkg:cargo/arrow-ord@59.0.0",
+        "pkg:cargo/arrow-schema@59.0.0",
+        "pkg:cargo/arrow-select@59.0.0",
+        "pkg:cargo/atoi@2.0.0",
+        "pkg:cargo/base64@0.22.1",
+        "pkg:cargo/chrono@0.4.45",
+        "pkg:cargo/comfy-table@7.2.2",
+        "pkg:cargo/half@2.7.1",
+        "pkg:cargo/lexical-core@1.0.6",
+        "pkg:cargo/num-traits@0.2.19",
+        "pkg:cargo/ryu@1.0.23"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/arrow-csv@59.0.0",
+      "dependsOn": [
+        "pkg:cargo/arrow-array@59.0.0",
+        "pkg:cargo/arrow-cast@59.0.0",
+        "pkg:cargo/arrow-schema@59.0.0",
+        "pkg:cargo/chrono@0.4.45",
+        "pkg:cargo/csv-core@0.1.13",
+        "pkg:cargo/csv@1.4.0",
+        "pkg:cargo/regex@1.12.4"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/arrow-data@59.0.0",
+      "dependsOn": [
+        "pkg:cargo/arrow-buffer@59.0.0",
+        "pkg:cargo/arrow-schema@59.0.0",
+        "pkg:cargo/half@2.7.1",
+        "pkg:cargo/num-integer@0.1.46",
+        "pkg:cargo/num-traits@0.2.19"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/arrow-ipc@59.0.0",
+      "dependsOn": [
+        "pkg:cargo/arrow-array@59.0.0",
+        "pkg:cargo/arrow-buffer@59.0.0",
+        "pkg:cargo/arrow-data@59.0.0",
+        "pkg:cargo/arrow-schema@59.0.0",
+        "pkg:cargo/arrow-select@59.0.0",
+        "pkg:cargo/flatbuffers@25.12.19"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/arrow-json@59.0.0",
+      "dependsOn": [
+        "pkg:cargo/arrow-array@59.0.0",
+        "pkg:cargo/arrow-buffer@59.0.0",
+        "pkg:cargo/arrow-cast@59.0.0",
+        "pkg:cargo/arrow-ord@59.0.0",
+        "pkg:cargo/arrow-schema@59.0.0",
+        "pkg:cargo/arrow-select@59.0.0",
+        "pkg:cargo/chrono@0.4.45",
+        "pkg:cargo/half@2.7.1",
+        "pkg:cargo/indexmap@2.14.0",
+        "pkg:cargo/itoa@1.0.18",
+        "pkg:cargo/lexical-core@1.0.6",
+        "pkg:cargo/memchr@2.8.2",
+        "pkg:cargo/num-traits@0.2.19",
+        "pkg:cargo/ryu@1.0.23",
+        "pkg:cargo/serde_core@1.0.228",
+        "pkg:cargo/serde_json@1.0.150",
+        "pkg:cargo/simdutf8@0.1.5"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/arrow-ord@59.0.0",
+      "dependsOn": [
+        "pkg:cargo/arrow-array@59.0.0",
+        "pkg:cargo/arrow-buffer@59.0.0",
+        "pkg:cargo/arrow-data@59.0.0",
+        "pkg:cargo/arrow-schema@59.0.0",
+        "pkg:cargo/arrow-select@59.0.0"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/arrow-row@59.0.0",
+      "dependsOn": [
+        "pkg:cargo/arrow-array@59.0.0",
+        "pkg:cargo/arrow-buffer@59.0.0",
+        "pkg:cargo/arrow-data@59.0.0",
+        "pkg:cargo/arrow-schema@59.0.0",
+        "pkg:cargo/half@2.7.1"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/arrow-schema@59.0.0",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:cargo/arrow-select@59.0.0",
+      "dependsOn": [
+        "pkg:cargo/ahash@0.8.12",
+        "pkg:cargo/arrow-array@59.0.0",
+        "pkg:cargo/arrow-buffer@59.0.0",
+        "pkg:cargo/arrow-data@59.0.0",
+        "pkg:cargo/arrow-schema@59.0.0",
+        "pkg:cargo/num-traits@0.2.19"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/arrow-string@59.0.0",
+      "dependsOn": [
+        "pkg:cargo/arrow-array@59.0.0",
+        "pkg:cargo/arrow-buffer@59.0.0",
+        "pkg:cargo/arrow-data@59.0.0",
+        "pkg:cargo/arrow-schema@59.0.0",
+        "pkg:cargo/arrow-select@59.0.0",
+        "pkg:cargo/memchr@2.8.2",
+        "pkg:cargo/num-traits@0.2.19",
+        "pkg:cargo/regex-syntax@0.8.11",
+        "pkg:cargo/regex@1.12.4"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/arrow@59.0.0",
+      "dependsOn": [
+        "pkg:cargo/arrow-arith@59.0.0",
+        "pkg:cargo/arrow-array@59.0.0",
+        "pkg:cargo/arrow-buffer@59.0.0",
+        "pkg:cargo/arrow-cast@59.0.0",
+        "pkg:cargo/arrow-csv@59.0.0",
+        "pkg:cargo/arrow-data@59.0.0",
+        "pkg:cargo/arrow-ipc@59.0.0",
+        "pkg:cargo/arrow-json@59.0.0",
+        "pkg:cargo/arrow-ord@59.0.0",
+        "pkg:cargo/arrow-row@59.0.0",
+        "pkg:cargo/arrow-schema@59.0.0",
+        "pkg:cargo/arrow-select@59.0.0",
+        "pkg:cargo/arrow-string@59.0.0"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/atoi@2.0.0",
+      "dependsOn": [
+        "pkg:cargo/num-traits@0.2.19"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/autocfg@1.5.1",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:cargo/base64-simd@0.8.0",
+      "dependsOn": [
+        "pkg:cargo/outref@0.5.2",
+        "pkg:cargo/vsimd@0.8.0"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/base64@0.22.1",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:cargo/bitflags@2.13.0",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:cargo/blake3@1.8.5",
+      "dependsOn": [
+        "pkg:cargo/arrayref@0.3.9",
+        "pkg:cargo/arrayvec@0.7.7",
+        "pkg:cargo/cc@1.2.65",
+        "pkg:cargo/cfg-if@1.0.4",
+        "pkg:cargo/constant_time_eq@0.4.2",
+        "pkg:cargo/cpufeatures@0.3.0"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/block-buffer@0.10.4",
+      "dependsOn": [
+        "pkg:cargo/generic-array@0.14.7"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/bumpalo@3.20.3",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:cargo/bytemuck@1.25.0",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:cargo/bytes@1.12.0",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:cargo/cc@1.2.65",
+      "dependsOn": [
+        "pkg:cargo/find-msvc-tools@0.1.9",
+        "pkg:cargo/shlex@2.0.1"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/cfg-if@1.0.4",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:cargo/chrono@0.4.45",
+      "dependsOn": [
+        "pkg:cargo/iana-time-zone@0.1.65",
+        "pkg:cargo/js-sys@0.3.103",
+        "pkg:cargo/num-traits@0.2.19",
+        "pkg:cargo/wasm-bindgen@0.2.126",
+        "pkg:cargo/windows-link@0.2.1"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/clap@4.6.1",
+      "dependsOn": [
+        "pkg:cargo/clap_builder@4.6.0",
+        "pkg:cargo/clap_derive@4.6.1"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/clap_builder@4.6.0",
+      "dependsOn": [
+        "pkg:cargo/anstream@1.0.0",
+        "pkg:cargo/anstyle@1.0.14",
+        "pkg:cargo/clap_lex@1.1.0",
+        "pkg:cargo/strsim@0.11.1"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/clap_derive@4.6.1",
+      "dependsOn": [
+        "pkg:cargo/heck@0.5.0",
+        "pkg:cargo/proc-macro2@1.0.106",
+        "pkg:cargo/quote@1.0.46",
+        "pkg:cargo/syn@2.0.118"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/clap_lex@1.1.0",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:cargo/colorchoice@1.0.5",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:cargo/comfy-table@7.2.2",
+      "dependsOn": [
+        "pkg:cargo/unicode-segmentation@1.13.3",
+        "pkg:cargo/unicode-width@0.2.2"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/const-random-macro@0.1.16",
+      "dependsOn": [
+        "pkg:cargo/getrandom@0.2.17",
+        "pkg:cargo/once_cell@1.21.4",
+        "pkg:cargo/tiny-keccak@2.0.2"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/const-random@0.1.18",
+      "dependsOn": [
+        "pkg:cargo/const-random-macro@0.1.16"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/constant_time_eq@0.4.2",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:cargo/core-foundation-sys@0.8.7",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:cargo/cpufeatures@0.2.17",
+      "dependsOn": [
+        "pkg:cargo/libc@0.2.186"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/cpufeatures@0.3.0",
+      "dependsOn": [
+        "pkg:cargo/libc@0.2.186"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/crc32fast@1.5.0",
+      "dependsOn": [
+        "pkg:cargo/cfg-if@1.0.4"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/crossbeam-deque@0.8.6",
+      "dependsOn": [
+        "pkg:cargo/crossbeam-epoch@0.9.20",
+        "pkg:cargo/crossbeam-utils@0.8.21"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/crossbeam-epoch@0.9.20",
+      "dependsOn": [
+        "pkg:cargo/crossbeam-utils@0.8.21"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/crossbeam-utils@0.8.21",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:cargo/crunchy@0.2.4",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:cargo/crypto-common@0.1.7",
+      "dependsOn": [
+        "pkg:cargo/generic-array@0.14.7",
+        "pkg:cargo/typenum@1.20.1"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/csv-core@0.1.13",
+      "dependsOn": [
+        "pkg:cargo/memchr@2.8.2"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/csv@1.4.0",
+      "dependsOn": [
+        "pkg:cargo/csv-core@0.1.13",
+        "pkg:cargo/itoa@1.0.18",
+        "pkg:cargo/ryu@1.0.23",
+        "pkg:cargo/serde_core@1.0.228"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/digest@0.10.7",
+      "dependsOn": [
+        "pkg:cargo/block-buffer@0.10.4",
+        "pkg:cargo/crypto-common@0.1.7"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/either@1.16.0",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:cargo/encoding_rs@0.8.35",
+      "dependsOn": [
+        "pkg:cargo/cfg-if@1.0.4"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/equivalent@1.0.2",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:cargo/find-msvc-tools@0.1.9",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:cargo/flatbuffers@25.12.19",
+      "dependsOn": [
+        "pkg:cargo/bitflags@2.13.0",
+        "pkg:cargo/rustc_version@0.4.1"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/flate2@1.1.9",
+      "dependsOn": [
+        "pkg:cargo/crc32fast@1.5.0",
+        "pkg:cargo/miniz_oxide@0.8.9"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/futures-core@0.3.32",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:cargo/futures-task@0.3.32",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:cargo/futures-util@0.3.32",
+      "dependsOn": [
+        "pkg:cargo/futures-core@0.3.32",
+        "pkg:cargo/futures-task@0.3.32",
+        "pkg:cargo/pin-project-lite@0.2.17",
+        "pkg:cargo/slab@0.4.12"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/generic-array@0.14.7",
+      "dependsOn": [
+        "pkg:cargo/typenum@1.20.1",
+        "pkg:cargo/version_check@0.9.5"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/getrandom@0.2.17",
+      "dependsOn": [
+        "pkg:cargo/cfg-if@1.0.4",
+        "pkg:cargo/libc@0.2.186",
+        "pkg:cargo/wasi@0.11.1+wasi-snapshot-preview1"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/getrandom@0.3.4",
+      "dependsOn": [
+        "pkg:cargo/cfg-if@1.0.4",
+        "pkg:cargo/libc@0.2.186",
+        "pkg:cargo/r-efi@5.3.0",
+        "pkg:cargo/wasip2@1.0.4+wasi-0.2.12"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/half@2.7.1",
+      "dependsOn": [
+        "pkg:cargo/cfg-if@1.0.4",
+        "pkg:cargo/crunchy@0.2.4",
+        "pkg:cargo/num-traits@0.2.19",
+        "pkg:cargo/zerocopy@0.8.52"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/hashbrown@0.17.1",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:cargo/heck@0.5.0",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:cargo/iana-time-zone-haiku@0.1.2",
+      "dependsOn": [
+        "pkg:cargo/cc@1.2.65"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/iana-time-zone@0.1.65",
+      "dependsOn": [
+        "pkg:cargo/android_system_properties@0.1.5",
+        "pkg:cargo/core-foundation-sys@0.8.7",
+        "pkg:cargo/iana-time-zone-haiku@0.1.2",
+        "pkg:cargo/js-sys@0.3.103",
+        "pkg:cargo/log@0.4.33",
+        "pkg:cargo/wasm-bindgen@0.2.126",
+        "pkg:cargo/windows-core@0.62.2"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/identity-hash@0.1.0",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:cargo/indexmap@2.14.0",
+      "dependsOn": [
+        "pkg:cargo/equivalent@1.0.2",
+        "pkg:cargo/hashbrown@0.17.1",
+        "pkg:cargo/serde@1.0.228",
+        "pkg:cargo/serde_core@1.0.228"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/is_terminal_polyfill@1.70.2",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:cargo/itoa@1.0.18",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:cargo/js-sys@0.3.103",
+      "dependsOn": [
+        "pkg:cargo/cfg-if@1.0.4",
+        "pkg:cargo/futures-util@0.3.32",
+        "pkg:cargo/wasm-bindgen@0.2.126"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/lazy_static@1.5.0",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:cargo/lexical-core@1.0.6",
+      "dependsOn": [
+        "pkg:cargo/lexical-parse-float@1.0.6",
+        "pkg:cargo/lexical-parse-integer@1.0.6",
+        "pkg:cargo/lexical-util@1.0.7",
+        "pkg:cargo/lexical-write-float@1.0.6",
+        "pkg:cargo/lexical-write-integer@1.0.6"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/lexical-parse-float@1.0.6",
+      "dependsOn": [
+        "pkg:cargo/lexical-parse-integer@1.0.6",
+        "pkg:cargo/lexical-util@1.0.7"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/lexical-parse-integer@1.0.6",
+      "dependsOn": [
+        "pkg:cargo/lexical-util@1.0.7"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/lexical-util@1.0.7",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:cargo/lexical-write-float@1.0.6",
+      "dependsOn": [
+        "pkg:cargo/lexical-util@1.0.7",
+        "pkg:cargo/lexical-write-integer@1.0.6"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/lexical-write-integer@1.0.6",
+      "dependsOn": [
+        "pkg:cargo/lexical-util@1.0.7"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/libc@0.2.186",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:cargo/libm@0.2.16",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:cargo/libmimalloc-sys@0.1.49",
+      "dependsOn": [
+        "pkg:cargo/cc@1.2.65"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/log@0.4.33",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:cargo/matchers@0.2.0",
+      "dependsOn": [
+        "pkg:cargo/regex-automata@0.4.14"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/memchr@2.8.2",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:cargo/mimalloc@0.1.52",
+      "dependsOn": [
+        "pkg:cargo/libmimalloc-sys@0.1.49"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/miniz_oxide@0.8.9",
+      "dependsOn": [
+        "pkg:cargo/adler2@2.0.1",
+        "pkg:cargo/simd-adler32@0.3.9"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/mumdia-core@0.1.0",
+      "dependsOn": [
+        "pkg:cargo/serde@1.0.228",
+        "pkg:cargo/serde_json@1.0.150",
+        "pkg:cargo/thiserror@2.0.18",
+        "pkg:cargo/tracing@0.1.44"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/mumdia-io@0.1.0",
+      "dependsOn": [
+        "pkg:cargo/anyhow@1.0.103",
+        "pkg:cargo/arrow@59.0.0",
+        "pkg:cargo/blake3@1.8.5",
+        "pkg:cargo/mumdia-core@0.1.0",
+        "pkg:cargo/parquet@59.0.0",
+        "pkg:cargo/serde@1.0.228",
+        "pkg:cargo/serde_json@1.0.150",
+        "pkg:cargo/thiserror@2.0.18",
+        "pkg:cargo/tracing-subscriber@0.3.23",
+        "pkg:cargo/tracing@0.1.44"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/mumdia@0.1.0",
+      "dependsOn": [
+        "pkg:cargo/anyhow@1.0.103",
+        "pkg:cargo/arrow@59.0.0",
+        "pkg:cargo/blake3@1.8.5",
+        "pkg:cargo/clap@4.6.1",
+        "pkg:cargo/mimalloc@0.1.52",
+        "pkg:cargo/mumdia-core@0.1.0",
+        "pkg:cargo/mumdia-io@0.1.0",
+        "pkg:cargo/mzdata@0.65.5",
+        "pkg:cargo/parquet@59.0.0",
+        "pkg:cargo/rayon@1.12.0",
+        "pkg:cargo/serde@1.0.228",
+        "pkg:cargo/serde_json@1.0.150",
+        "pkg:cargo/thiserror@2.0.18",
+        "pkg:cargo/tracing-subscriber@0.3.23",
+        "pkg:cargo/tracing@0.1.44"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/mzdata@0.65.5",
+      "dependsOn": [
+        "pkg:cargo/base64-simd@0.8.0",
+        "pkg:cargo/bitflags@2.13.0",
+        "pkg:cargo/bytemuck@1.25.0",
+        "pkg:cargo/chrono@0.4.45",
+        "pkg:cargo/encoding_rs@0.8.35",
+        "pkg:cargo/flate2@1.1.9",
+        "pkg:cargo/identity-hash@0.1.0",
+        "pkg:cargo/indexmap@2.14.0",
+        "pkg:cargo/log@0.4.33",
+        "pkg:cargo/memchr@2.8.2",
+        "pkg:cargo/mzpeaks@1.0.9",
+        "pkg:cargo/num-traits@0.2.19",
+        "pkg:cargo/quick-xml@0.41.0",
+        "pkg:cargo/regex@1.12.4",
+        "pkg:cargo/sha1@0.10.6",
+        "pkg:cargo/thiserror@2.0.18"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/mzpeaks@1.0.9",
+      "dependsOn": [
+        "pkg:cargo/num-traits@0.2.19"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/nu-ansi-term@0.50.3",
+      "dependsOn": [
+        "pkg:cargo/windows-sys@0.61.2"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/num-bigint@0.4.6",
+      "dependsOn": [
+        "pkg:cargo/num-integer@0.1.46",
+        "pkg:cargo/num-traits@0.2.19"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/num-complex@0.4.6",
+      "dependsOn": [
+        "pkg:cargo/num-traits@0.2.19"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/num-integer@0.1.46",
+      "dependsOn": [
+        "pkg:cargo/num-traits@0.2.19"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/num-traits@0.2.19",
+      "dependsOn": [
+        "pkg:cargo/autocfg@1.5.1",
+        "pkg:cargo/libm@0.2.16"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/once_cell@1.21.4",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:cargo/once_cell_polyfill@1.70.2",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:cargo/outref@0.5.2",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:cargo/parquet@59.0.0",
+      "dependsOn": [
+        "pkg:cargo/ahash@0.8.12",
+        "pkg:cargo/arrow-array@59.0.0",
+        "pkg:cargo/arrow-buffer@59.0.0",
+        "pkg:cargo/arrow-data@59.0.0",
+        "pkg:cargo/arrow-ipc@59.0.0",
+        "pkg:cargo/arrow-schema@59.0.0",
+        "pkg:cargo/arrow-select@59.0.0",
+        "pkg:cargo/base64@0.22.1",
+        "pkg:cargo/bytes@1.12.0",
+        "pkg:cargo/chrono@0.4.45",
+        "pkg:cargo/half@2.7.1",
+        "pkg:cargo/hashbrown@0.17.1",
+        "pkg:cargo/num-bigint@0.4.6",
+        "pkg:cargo/num-integer@0.1.46",
+        "pkg:cargo/num-traits@0.2.19",
+        "pkg:cargo/paste@1.0.15",
+        "pkg:cargo/seq-macro@0.3.6",
+        "pkg:cargo/snap@1.1.1",
+        "pkg:cargo/twox-hash@2.1.2"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/paste@1.0.15",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:cargo/pin-project-lite@0.2.17",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:cargo/proc-macro2@1.0.106",
+      "dependsOn": [
+        "pkg:cargo/unicode-ident@1.0.24"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/quick-xml@0.41.0",
+      "dependsOn": [
+        "pkg:cargo/memchr@2.8.2",
+        "pkg:cargo/serde@1.0.228"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/quote@1.0.46",
+      "dependsOn": [
+        "pkg:cargo/proc-macro2@1.0.106"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/r-efi@5.3.0",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:cargo/rayon-core@1.13.0",
+      "dependsOn": [
+        "pkg:cargo/crossbeam-deque@0.8.6",
+        "pkg:cargo/crossbeam-utils@0.8.21"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/rayon@1.12.0",
+      "dependsOn": [
+        "pkg:cargo/either@1.16.0",
+        "pkg:cargo/rayon-core@1.13.0"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/regex-automata@0.4.14",
+      "dependsOn": [
+        "pkg:cargo/aho-corasick@1.1.4",
+        "pkg:cargo/memchr@2.8.2",
+        "pkg:cargo/regex-syntax@0.8.11"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/regex-syntax@0.8.11",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:cargo/regex@1.12.4",
+      "dependsOn": [
+        "pkg:cargo/aho-corasick@1.1.4",
+        "pkg:cargo/memchr@2.8.2",
+        "pkg:cargo/regex-automata@0.4.14",
+        "pkg:cargo/regex-syntax@0.8.11"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/rustc_version@0.4.1",
+      "dependsOn": [
+        "pkg:cargo/semver@1.0.28"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/rustversion@1.0.22",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:cargo/ryu@1.0.23",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:cargo/semver@1.0.28",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:cargo/seq-macro@0.3.6",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:cargo/serde@1.0.228",
+      "dependsOn": [
+        "pkg:cargo/serde_core@1.0.228",
+        "pkg:cargo/serde_derive@1.0.228"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/serde_core@1.0.228",
+      "dependsOn": [
+        "pkg:cargo/serde_derive@1.0.228"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/serde_derive@1.0.228",
+      "dependsOn": [
+        "pkg:cargo/proc-macro2@1.0.106",
+        "pkg:cargo/quote@1.0.46",
+        "pkg:cargo/syn@2.0.118"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/serde_json@1.0.150",
+      "dependsOn": [
+        "pkg:cargo/itoa@1.0.18",
+        "pkg:cargo/memchr@2.8.2",
+        "pkg:cargo/serde@1.0.228",
+        "pkg:cargo/serde_core@1.0.228",
+        "pkg:cargo/zmij@1.0.21"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/sha1@0.10.6",
+      "dependsOn": [
+        "pkg:cargo/cfg-if@1.0.4",
+        "pkg:cargo/cpufeatures@0.2.17",
+        "pkg:cargo/digest@0.10.7"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/sharded-slab@0.1.7",
+      "dependsOn": [
+        "pkg:cargo/lazy_static@1.5.0"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/shlex@2.0.1",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:cargo/simd-adler32@0.3.9",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:cargo/simdutf8@0.1.5",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:cargo/slab@0.4.12",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:cargo/smallvec@1.15.2",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:cargo/snap@1.1.1",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:cargo/strsim@0.11.1",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:cargo/syn@2.0.118",
+      "dependsOn": [
+        "pkg:cargo/proc-macro2@1.0.106",
+        "pkg:cargo/quote@1.0.46",
+        "pkg:cargo/unicode-ident@1.0.24"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/thiserror-impl@2.0.18",
+      "dependsOn": [
+        "pkg:cargo/proc-macro2@1.0.106",
+        "pkg:cargo/quote@1.0.46",
+        "pkg:cargo/syn@2.0.118"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/thiserror@2.0.18",
+      "dependsOn": [
+        "pkg:cargo/thiserror-impl@2.0.18"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/thread_local@1.1.9",
+      "dependsOn": [
+        "pkg:cargo/cfg-if@1.0.4"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/tiny-keccak@2.0.2",
+      "dependsOn": [
+        "pkg:cargo/crunchy@0.2.4"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/tracing-attributes@0.1.31",
+      "dependsOn": [
+        "pkg:cargo/proc-macro2@1.0.106",
+        "pkg:cargo/quote@1.0.46",
+        "pkg:cargo/syn@2.0.118"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/tracing-core@0.1.36",
+      "dependsOn": [
+        "pkg:cargo/once_cell@1.21.4",
+        "pkg:cargo/valuable@0.1.1"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/tracing-log@0.2.0",
+      "dependsOn": [
+        "pkg:cargo/log@0.4.33",
+        "pkg:cargo/once_cell@1.21.4",
+        "pkg:cargo/tracing-core@0.1.36"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/tracing-subscriber@0.3.23",
+      "dependsOn": [
+        "pkg:cargo/matchers@0.2.0",
+        "pkg:cargo/nu-ansi-term@0.50.3",
+        "pkg:cargo/once_cell@1.21.4",
+        "pkg:cargo/regex-automata@0.4.14",
+        "pkg:cargo/sharded-slab@0.1.7",
+        "pkg:cargo/smallvec@1.15.2",
+        "pkg:cargo/thread_local@1.1.9",
+        "pkg:cargo/tracing-core@0.1.36",
+        "pkg:cargo/tracing-log@0.2.0",
+        "pkg:cargo/tracing@0.1.44"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/tracing@0.1.44",
+      "dependsOn": [
+        "pkg:cargo/pin-project-lite@0.2.17",
+        "pkg:cargo/tracing-attributes@0.1.31",
+        "pkg:cargo/tracing-core@0.1.36"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/twox-hash@2.1.2",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:cargo/typenum@1.20.1",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:cargo/unicode-ident@1.0.24",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:cargo/unicode-segmentation@1.13.3",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:cargo/unicode-width@0.2.2",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:cargo/utf8parse@0.2.2",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:cargo/valuable@0.1.1",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:cargo/version_check@0.9.5",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:cargo/vsimd@0.8.0",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:cargo/wasi@0.11.1+wasi-snapshot-preview1",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:cargo/wasip2@1.0.4+wasi-0.2.12",
+      "dependsOn": [
+        "pkg:cargo/wit-bindgen@0.57.1"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/wasm-bindgen-macro-support@0.2.126",
+      "dependsOn": [
+        "pkg:cargo/bumpalo@3.20.3",
+        "pkg:cargo/proc-macro2@1.0.106",
+        "pkg:cargo/quote@1.0.46",
+        "pkg:cargo/syn@2.0.118",
+        "pkg:cargo/wasm-bindgen-shared@0.2.126"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/wasm-bindgen-macro@0.2.126",
+      "dependsOn": [
+        "pkg:cargo/quote@1.0.46",
+        "pkg:cargo/wasm-bindgen-macro-support@0.2.126"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/wasm-bindgen-shared@0.2.126",
+      "dependsOn": [
+        "pkg:cargo/unicode-ident@1.0.24"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/wasm-bindgen@0.2.126",
+      "dependsOn": [
+        "pkg:cargo/cfg-if@1.0.4",
+        "pkg:cargo/once_cell@1.21.4",
+        "pkg:cargo/rustversion@1.0.22",
+        "pkg:cargo/wasm-bindgen-macro@0.2.126",
+        "pkg:cargo/wasm-bindgen-shared@0.2.126"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/windows-core@0.62.2",
+      "dependsOn": [
+        "pkg:cargo/windows-implement@0.60.2",
+        "pkg:cargo/windows-interface@0.59.3",
+        "pkg:cargo/windows-link@0.2.1",
+        "pkg:cargo/windows-result@0.4.1",
+        "pkg:cargo/windows-strings@0.5.1"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/windows-implement@0.60.2",
+      "dependsOn": [
+        "pkg:cargo/proc-macro2@1.0.106",
+        "pkg:cargo/quote@1.0.46",
+        "pkg:cargo/syn@2.0.118"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/windows-interface@0.59.3",
+      "dependsOn": [
+        "pkg:cargo/proc-macro2@1.0.106",
+        "pkg:cargo/quote@1.0.46",
+        "pkg:cargo/syn@2.0.118"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/windows-link@0.2.1",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:cargo/windows-result@0.4.1",
+      "dependsOn": [
+        "pkg:cargo/windows-link@0.2.1"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/windows-strings@0.5.1",
+      "dependsOn": [
+        "pkg:cargo/windows-link@0.2.1"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/windows-sys@0.61.2",
+      "dependsOn": [
+        "pkg:cargo/windows-link@0.2.1"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/wit-bindgen@0.57.1",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:cargo/zerocopy-derive@0.8.52",
+      "dependsOn": [
+        "pkg:cargo/proc-macro2@1.0.106",
+        "pkg:cargo/quote@1.0.46",
+        "pkg:cargo/syn@2.0.118"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/zerocopy@0.8.52",
+      "dependsOn": [
+        "pkg:cargo/zerocopy-derive@0.8.52"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/zmij@1.0.21",
+      "dependsOn": []
+    }
+  ]
+}

@@ -1,4 +1,4 @@
-# Python sidecars (the 11 scripts) + conda envs
+# Python sidecars (11 scripts + one shared writer) + conda envs
 > Part of the MuMDIA developer documentation (see docs/README.md).
 
 ## Purpose
@@ -61,7 +61,7 @@ the column it keys the readback on.
 |---|---|---|---|
 | ms2pip_worker | `<in.parquet> <out.parquet> <model>` (`sidecar.rs:63`) | `ms2pip_out.parquet` | `id` |
 | deeplc_worker | `<in.parquet> <out.parquet>` (`sidecar.rs:99`) | `deeplc_out.parquet` | `id` |
-| deeplc_finetune | `<lib_in> <seed> <lib_out> --epochs --patience --q-train --batch` (`sidecar.rs:139-151`) | `<lib_out>` (= `fragment_library_precursors_ft.parquet`) | `peptidoform` (new table with replaced `predicted_irt`; input unchanged) |
+| deeplc_finetune | `<lib_in> <seed> <lib_out> --epochs --patience --q-train --batch --window-holdout-frac` (`sidecar.rs`) | `<lib_out>` (= `fragment_library_precursors_ft.parquet`) | `peptidoform` (new table with replaced `predicted_irt`; input unchanged) |
 | mokapot_worker / nn_rescore_worker | `<rescore.pin> <out.parquet>` + env `MUMDIA_NN_FOLDS/ITERS/TRAIN_FDR` (`rescore.rs:781-792`) | `rescore_sidecar_out.parquet` | `candidate_id` (echoes the flat row index) |
 | entrapment_worker | `<in.parquet> <out.parquet> <folds>` (`rescore.rs:718-724`) | `entrapment_out.parquet` | `row_id` |
 | mbr_worker | `<scored> <psms_csv> <out> --q-anchor --min-anchor-runs --q-transfer --seed [--out-scored] [--frag-csv --consensus-corr-min]` (`sidecar.rs:193-211`) | `<out>.parquet` | `candidate_id` |
@@ -92,8 +92,9 @@ For the mapping from each conda environment to the config field that points at i
 | `rust/mumdia/crates/mumdia/src/stages/rescore.rs` | Call sites for mokapot/nn_torch (PIN) + entrapment (Parquet) sidecars |
 | `rust/mumdia/crates/mumdia/src/main.rs` | Call site for MBR (`Cmd::Mbr`) + `doctor` env probe |
 | `env/docker-rescore.yml` | Docker env `rescore`: mokapot 0.10.0 + ms2pip 4.0.0.dev9 (py3.11) |
-| `env/docker-deeplc.yml` | Docker env `deeplc`: DeepLC 4.0 multitask (pinned commit) + CPU torch (py3.11) |
+| `env/docker-deeplc.yml` | Docker env `deeplc`: DeepLC 4.1.1 + CPU torch (py3.11) |
 | `env/mumdia-rescore.yml` | Minimal portable env for the mokapot logreg rescore path (py3.12) |
+| `env/mumdia-deeplc.yml` | Portable local env for the DeepLC sidecars: DeepLC 4.1.1 + CPU torch (py3.11) |
 
 ## Inputs and outputs
 
@@ -223,9 +224,11 @@ peptidoform (RT is charge-independent, `predict_frag.rs:281-290`), calls
 at `0.0` with a warning (`predict_frag.rs:293-308`; this is the "unmatched
 peptidoforms silently get iRT 0.0" foot-gun noted in CLAUDE.md). The worker calls
 `deeplc.predict` in 200k chunks and, when the multitask model returns an
-ensemble matrix `(N, n_models)`, averages across models (`deeplc_worker.py:34-35`).
+ensemble matrix `(N, n_models)`, averages across models (`deeplc_worker.py:44-47`).
 Predictions are uncalibrated; rt-im-train's per-run LOESS/linear maps them onto
-observed RT.
+observed RT. Its module-level imports are order-dependent: `import deeplc` must
+precede numpy and pyarrow (`deeplc_worker.py:13-29`, see **DeepLC import order**
+under gotchas).
 
 **DeepLC fine-tune** (`run.rs:242-263`, worker `deeplc_finetune.py`). Wired into
 `run` only when `rt_im_train.finetune_deeplc = true`; runs **between**
@@ -243,7 +246,7 @@ that is non-standard (`is_std` false, e.g. a terminal mod outside `STD`) or was
 not predicted keeps its **original** `predicted_irt` unchanged, because the
 write-back is `preds.get(base_pf(pf), orig[i])` (`deeplc_finetune.py:156`), so
 only the sequences DeepLC actually re-predicted move onto the fine-tuned scale.
-Beyond the four flags Rust passes (`--epochs/--patience/--q-train/--batch`,
+Beyond the five flags Rust passes (`--epochs/--patience/--q-train/--batch/--window-holdout-frac`,
 `sidecar.rs:139-151`), the worker exposes CLI-only knobs that `run` never sets:
 `--device cpu|cuda` (cuda aborts with `SystemExit` if `torch.cuda.is_available()`
 is false, `deeplc_finetune.py:79-81`), `--threads` (torch CPU pool, defaults to
@@ -294,10 +297,17 @@ production default. The authoritative actual path is recorded in
   single-class, and zero-positive training folds hard-error; held-out labels do
   not influence model selection. Two feature
   backends behind one accessor `get`: in-memory (median/IQR standardisation,
-  `:130-145`) or a disk-backed float32 **memmap** streamed in `MUMDIA_NN_CHUNK`
-  chunks with mean/std accumulated in one text pass (`:146-177`), auto-selected
-  when the PIN exceeds `MUMDIA_NN_STREAM_GB` (4 GB). This is what makes an
-  experiment-wide multi-run rescore tractable: the full PIN never lives in RAM.
+  `:358-413`) or a disk-backed float32 **memmap** streamed in `MUMDIA_NN_CHUNK`
+  chunks with mean/std accumulated in one pass (`:415-463`), selected at
+  `nn_rescore_worker.py:290-302` by comparing an estimated decoded size against
+  `MUMDIA_NN_STREAM_GB` (default 4 GB). For a tab-separated PIN the compared
+  quantity is the on-disk file size; for a Parquet feature table
+  (`rescore.handoff = parquet`, accepted by this worker only, `rescore.rs:943-959`)
+  it is `num_rows * (num_columns - 3) * 4`, the decoded float32 feature matrix,
+  because the column store on disk is several times smaller than the memory a
+  full read needs (`nn_rescore_worker.py:292-298`). The streaming backend is what
+  makes an experiment-wide multi-run rescore tractable: the full matrix never
+  lives in RAM.
   `tda_q` (`:77-87`) is the shared q formula `(decoys+1)/max(1,targets)`, running
   min from the tail. Seeds are ensembled by averaging rank-normalised OOF scores
   (`:281-288`).
@@ -390,9 +400,11 @@ target strings prefixed with `DECOY_` (`make_shift_decoys.py:35-36`); the revers
 builder instead sets `peptidoform = "DECOY_" + <reversed-sequence ProForma>` and
 `protein = "DECOY_" + <target protein>` (`make_reverse_decoys.py:145-146`). Both
 concatenate
-target+decoy, re-sort by `precursor_mz`, reassign contiguous `candidate_id`, and
-re-sort fragments by `candidate_id` so the fragment index's contiguous-range
-precondition holds (`make_reverse_decoys.py:156-161`, `make_shift_decoys.py:47-55`).
+target+decoy, re-sort by `precursor_mz`, and reassign contiguous `candidate_id`,
+which is what satisfies `index.rs load()`'s contiguous-id and m/z-ordering
+preconditions; they also re-sort fragments by `candidate_id`, which the index no
+longer requires (`make_reverse_decoys.py:156-161`,
+`make_shift_decoys.py:47-55`).
 
 `augment_library.py` closes a different gap: an imported DIA-NN library can be
 missing tryptic peptides that are present in the FASTA, so the search DB
@@ -437,7 +449,7 @@ every entry on one axis before extraction, so no explicit reconciliation is done
 | `run_worker` | `sidecar.rs:217` | Spawn `python <script> <argv...>`; `utf8=true` sets `PYTHONUTF8`/`PYTHONIOENCODING` (DeepLC/Keras crash on Windows cp1252) |
 | `run_ms2pip` | `sidecar.rs:42` | Write ms2pip_in.parquet, run worker, fold output to `HashMap<u32,HashMap<(u8,u16),f32>>` |
 | `run_deeplc` | `sidecar.rs:81` | Write deeplc_in.parquet, run worker, return `HashMap<u32,f32>` (`utf8=true`) |
-| `run_deeplc_finetune` | `sidecar.rs:111` | Run `deeplc_finetune.py <lib_in> <seed> <lib_out> --epochs --patience --q-train --batch` (`utf8=true`) |
+| `run_deeplc_finetune` | `sidecar.rs:111` | Run `deeplc_finetune.py <lib_in> <seed> <lib_out> --epochs --patience --q-train --batch --window-holdout-frac` (`utf8=true`) |
 | `run_mbr` | `sidecar.rs:162` | Run `mbr_worker.py <scored> <psms_csv> <out> [--out-scored] [--frag-csv --consensus-corr-min] --q-anchor --min-anchor-runs --q-transfer --seed` |
 | `run_pin_sidecar` | `rescore.rs:740` | Write PIN keyed by row index, run mokapot/nn worker, map `score` back by row index |
 | `run_entrapment_gbm` | `rescore.rs:675` | Write features+meta Parquet, run entrapment worker, map `score` back by `row_id` |
@@ -448,6 +460,56 @@ every entry on one axis before extraction, so no explicit reconciliation is done
 | `binned_map` | `mbr_worker.py:31` | Monotone binned-median RT calibration x->y (80 bins) |
 | `expected_rt` | `mbr_worker.py:116` | Cross-run predicted RT of a candidate in a run from the other runs' anchors |
 | `frag_mz` / `reverse_keep_cterm` / `stable_seed` / `splitmix` | `make_reverse_decoys.py:58/56/74/65` | Residue-mass b/y m/z; C-term-fixed reversal; process-independent FNV-1a seed; seeded PRNG for scramble |
+
+## Interpreter resolution
+
+Each sidecar role has one config field naming the Python that runs it:
+`rescore.python`, `predict_frag.deeplc_python`, `predict_frag.ms2pip_python`,
+`mbr.python`. Implemented in `rust/mumdia/crates/mumdia/src/python.rs`.
+
+A field may hold an absolute path, which is used as given and never
+second-guessed, or the string `"auto"` (or be absent), which asks the engine to
+find one. Discovery order, from `python.rs`:
+
+| order | source | provenance reported |
+|---|---|---|
+| 1 | `MUMDIA_PYTHON_RESCORE` / `_DEEPLC` / `_MS2PIP` / `_MBR` | the variable name |
+| 2 | `MUMDIA_PYTHON` (all roles) | `MUMDIA_PYTHON` |
+| 3 | `CONDA_PREFIX`: `bin/python`, `python.exe`, `Scripts/python.exe` | `CONDA_PREFIX` |
+| 4 | `VIRTUAL_ENV`, same three layouts | `VIRTUAL_ENV` |
+| 5 | `python3`, then `python`, on `PATH` | `PATH` |
+
+A candidate is accepted only after it imports the role's own module list, so
+discovery cannot pick a Python without torch and defer the failure to the rescore
+stage hours later. The module lists live on `Role::modules` and are the same ones
+`doctor` probes:
+
+| role | modules |
+|---|---|
+| `Rescore`, `classifier = nn_torch` | torch, numpy, pandas, pyarrow |
+| `Rescore`, mokapot or entrapment | mokapot, sklearn, numpy, pandas, pyarrow |
+| `DeepLc` | deeplc, numpy, pandas, pyarrow, torch, psm_utils |
+| `Ms2pip` | ms2pip, numpy, pandas |
+| `Mbr` | numpy, pyarrow |
+
+A role is resolved only when the configuration actually uses it
+(`Role::required_by`): the rescorer classifier, `rt_predictor`/`finetune_deeplc`,
+`predictor`, and `mbr.strategy` respectively. A default native run therefore
+needs no interpreter, probes nothing, and works on a machine with no Python. A
+role that is needed but unresolvable is a hard error in preflight, naming the
+field, the environment variable, and the modules required.
+
+Resolution runs before the config hash is computed, so `manifest.json` records
+the interpreter that actually ran rather than the word `auto`. This makes the hash
+machine-specific for an `auto` config, which is the honest outcome: two runs whose
+rescorer came from different environments are not the same configuration.
+
+`predict_frag.sidecar_script_dir` is resolved the same way
+(`python::resolve_script_dir`): the configured value if it holds the workers, then
+the same path relative to the config file's own directory, then `scripts/` beside
+the executable, which is the release-archive layout. Previously it was interpreted
+against the current working directory alone, so invoking the same config from
+another directory silently changed which scripts ran.
 
 ## Configuration
 
@@ -469,6 +531,7 @@ configured.
 | `rt_im_train.finetune_patience` | `10` | `--patience` epochs without val-loss improvement |
 | `rt_im_train.finetune_batch` | `0` | `--batch`; 0 = auto-scale to seed size in the worker |
 | `rt_im_train.q_train` | `0.01` | `--q-train` max seed `spectrum_q` for the fine-tune reference |
+| `rt_im_train.window_holdout_frac` | `0.0` | `--window-holdout-frac`; excludes `base_peptide_id %% 1000 < round(frac*1000)` anchors from the fine-tune reference so rt-im-train can size `w_rt` on them held-out (rule duplicated in `rt_im_train.rs::is_holdout`; see `docs/08` section 4b) |
 | `rescore.classifier` | `native_tda` | `mokapot`/`nn_torch` -> PIN sidecar; `entrapment` -> Parquet sidecar; `percolator` -> unwired |
 | `rescore.python` | `None` | interpreter for the rescore/entrapment sidecar |
 | `rescore.folds` | `3` | passed as `MUMDIA_NN_FOLDS` + entrapment `folds` argv |
@@ -533,6 +596,39 @@ MLP. Set it explicitly for the logreg path.
 - **UTF-8.** `run_deeplc`/`run_deeplc_finetune` pass `utf8=true`; the PIN and
   entrapment sidecars set `PYTHONUTF8=1` directly. MS2PIP and MBR do not
   (`sidecar.rs:63, 99, 152, 212`).
+- **DeepLC import order is load-bearing.** In both DeepLC workers `import deeplc`
+  must execute before numpy and pyarrow at module scope
+  (`deeplc_worker.py:13-29`; `deeplc_finetune.py` was already ordered this way).
+  DeepLC 4.x is torch-backed, and on Windows importing numpy (and the pyarrow
+  that follows it) first aborts torch's DLL initialisation with
+  `OSError: [WinError 1114] ... Error loading "...\torch\lib\c10.dll"`.
+  `deeplc_worker.py` previously deferred `import deeplc` into `main()`, which put
+  it after the module-level numpy/pyarrow and reproduced the crash. The fault was
+  latent because imported-library mode skips predict-frag entirely, so only a
+  FASTA-mode library build exercises `deeplc_worker.py`. Do not let an import
+  sorter reorder these lines.
+- **Parquet written outside `mumdia-io` must be SNAPPY plus arrow `utf8`.** The
+  engine's `parquet` dependency is built with `default-features = false,
+  features = ["arrow","snap"]` (`rust/mumdia/Cargo.toml:23-24`), so SNAPPY is the
+  only codec compiled in and a zstd file fails at read with
+  `Parquet error: Disabled feature at compile time: zstd`. `Table::str`
+  downcasts to arrow `StringArray` only and rejects anything else with
+  `column '<name>' is not utf8` (`mumdia-io/src/table.rs:503-511`), so a
+  64-bit-offset `large_utf8` string column is also refused. `mumdia-io` itself
+  always writes SNAPPY (`mumdia-io/src/table.rs:205`), and the pandas-based
+  recipe scripts get both defaults right through pyarrow
+  (`import_diann_lib.py:175-176`). A hand-written helper does not: Polars
+  defaults to zstd and `large_utf8` and produces a library the engine cannot
+  load. Cast string columns to `pa.string()` and write with
+  `compression="snappy"`.
+- **The nn_torch backend threshold is a cliff, not a preference.** A feature
+  matrix marginally over `MUMDIA_NN_STREAM_GB` takes the disk-backed memmap path,
+  which is much slower than in-memory; a 4.31 GB matrix against the 4.00 GB
+  default was observed doing so. The worker prints the size, the threshold, and
+  the chosen backend before it starts (`nn_rescore_worker.py:306-311`), so check
+  that line rather than inferring the backend from the wall clock. Raise
+  `MUMDIA_NN_STREAM_GB` when the RAM is available, or force the choice with
+  `MUMDIA_NN_STREAM=1`/`0`.
 - **Determinism (`docs/18_findings_and_decisions.md`, determinism contract).** MS2PIP predictions are deterministic
   regardless of process count (`ms2pip_worker.py:40-41`). DeepLC predict is
   deterministic given fixed weights. **DeepLC fine-tune is nondeterministic**: no
@@ -553,12 +649,23 @@ MLP. Set it explicitly for the logreg path.
   `make_reverse_decoys.py:119`), not Python's randomized builtin `hash`. The
   scrambled decoys for those few peptides are therefore reproducible across
   library-build runs without setting `PYTHONHASHSEED`.
-- **DIA-NN index precondition.** Both decoy builders and the importer re-sort by
-  `precursor_mz` (stable mergesort) and reassign contiguous `candidate_id`, and
-  sort fragments by `candidate_id`, so `index.rs load()`'s
-  contiguous-id + m/z-sorted precondition holds. Do not reorder afterward.
-  `make_reverse_decoys.py` additionally aborts if its residue-mass calculator
-  disagrees with the library's own target fragment m/z by > 5 ppm at p99.
+- **DIA-NN index precondition.** `index.rs load()` enforces two hard
+  preconditions on any library, imported or native, and bails with a message
+  naming the offending row rather than degrading silently. First, precursor
+  `candidate_id` must be the contiguous row-aligned range `0..ncand`, checked
+  row by row (`index.rs:112-125`). Second, precursors must be ascending by
+  `precursor_mz`, because the fragment index's `partition_point` search over
+  `prec_mz` assumes it and an unsorted import would return wrong candidate
+  windows (`index.rs:215-231`). Both decoy builders and the importer satisfy
+  these by re-sorting on `precursor_mz` (stable mergesort) and reassigning
+  contiguous ids; do not reorder the precursor table afterward. Fragment **order**
+  is not a precondition: fragments are grouped by a counting sort that preserves
+  stored order (`index.rs:126-153`), so a fragment table only needs every
+  `candidate_id` to be less than the precursor count (`index.rs:133-139`). The
+  recipe scripts still sort fragments by `candidate_id`, which is harmless but no
+  longer load-bearing. `make_reverse_decoys.py` additionally aborts if its
+  residue-mass calculator disagrees with the library's own target fragment m/z by
+  > 5 ppm at p99.
 - **Fallback exists only when explicitly requested (rescore only).** With
   `rescore.strict = false` a crashed or misconfigured **rescore** sidecar is
   logged and the run continues on `native_tda`; the default `strict = true`
@@ -598,35 +705,50 @@ MLP. Set it explicitly for the logreg path.
   interpreter, a dispatch arm in `predict_frag.rs`/`rescore.rs`, and a thin client
   in `sidecar.rs` (or reuse `run_pin_sidecar` if it consumes the PIN and emits
   `candidate_id`+`score`). Keep the positional-CLI-plus-Parquet contract; do not
-  add a JSON request file or a server.
+  add a JSON request file or a server. Write the output Parquet with SNAPPY
+  compression and arrow `utf8` string columns (pyarrow and pandas defaults
+  satisfy both; Polars does not, see the gotcha above), and if the worker loads a
+  torch-backed package, import that package first.
 - **Reuse the PIN contract.** A new rescorer that reads the PIN and writes
   `candidate_id`+`score`+`q_value` needs no new Rust plumbing beyond a
   `RescorerKind` arm calling `run_pin_sidecar` with its script name; the
   `MUMDIA_NN_*` env vars are already injected.
-- **Change env probing.** `doctor` (`main.rs:313-374`) hard-codes the package list
+- **Change env probing.** `doctor` (`main.rs:346-413`) hard-codes the package list
   per interpreter and switches the rescore packages on the classifier: `nn_torch`
   -> `torch,numpy,pandas,pyarrow`; every other classifier (mokapot, entrapment,
   percolator, native) -> `mokapot,sklearn,numpy,pandas,pyarrow`
-  (`main.rs:318-324`); `predict_frag.deeplc_python` -> `deeplc,numpy,pandas`;
-  `predict_frag.ms2pip_python` -> `ms2pip,numpy,pandas` (`main.rs:327-336`). An
-  interpreter left `None` prints `[skip]` (native path). It probes with
-  `importlib.util.find_spec` and reports `MISSING <pkgs>`; note `mbr.python` is
-  **not** probed by `doctor`. Update these lists when a worker's imports change so
-  `mumdia doctor` stays truthful.
+  (`main.rs:351-357`); `predict_frag.deeplc_python` ->
+  `deeplc,numpy,pandas,pyarrow,torch,psm_utils` (`main.rs:368-371`);
+  `predict_frag.ms2pip_python` -> `ms2pip,numpy,pandas` (`main.rs:372-376`). The
+  DeepLC list covers both scripts that run on that interpreter, because
+  `deeplc_finetune.py` imports pyarrow, torch and psm_utils on top of deeplc
+  itself; probing only `deeplc,numpy,pandas` let a green `doctor` precede a crash
+  at the fine-tune step, which on an experiment-wide batch surfaces long after the
+  run is launched. An interpreter left `None` prints `[skip]` (native path,
+  `main.rs:381`). It probes with `importlib.util.find_spec` and reports
+  `MISSING <pkgs>`; note `mbr.python` is **not** probed by `doctor`. The probe
+  only asks whether a module is importable, so it cannot catch an ordering fault
+  like the DeepLC/torch one above. Update these lists when a worker's imports
+  change so `mumdia doctor` stays truthful.
 - **Conda envs.** The committed reproducible specs are `env/docker-rescore.yml`
   (env `rescore`: mokapot 0.10.0 + ms2pip 4.0.0.dev9, py3.11) and
-  `env/docker-deeplc.yml` (env `deeplc`: DeepLC 4.0 multitask at a pinned commit +
-  CPU torch, py3.11); the Docker configs point interpreters at
-  `/opt/conda/envs/{rescore,deeplc}/bin/python` (`docker/config.dia.json`,
-  `docker/config.diann-lib.json`). `env/mumdia-rescore.yml` is the minimal
-  portable env for the mokapot logreg path (no torch/DeepLC/MS2PIP). On the
-  developer machine the workers also import from the local `py312_mumdia` env
-  (general env: torch + mokapot + ms2pip + sklearn + pyarrow), `ms2rescore`
-  (mokapot + MS2PIP), and `deeplc_mt` for fine-tune (the a2 build; NOT
-  `deeplc_multitask`/a1, whose predict crashes, nor `py310_deeplc`, whose ms2pip
-  is broken). Anchor only the tool version and let pip resolve its scientific-Python
-  graph, since exact old pins (pandas < 2) have no cp312 wheel.
+  `env/docker-deeplc.yml` (env `deeplc`: DeepLC 4.1.1 + CPU torch, py3.11); the
+  Docker configs point interpreters at `/opt/conda/envs/{rescore,deeplc}/bin/python`
+  (`docker/config.dia.json`, `docker/config.diann-lib.json`). For a native install
+  the portable equivalents are `env/mumdia-rescore.yml` (mokapot logreg path, no
+  torch/DeepLC/MS2PIP) and `env/mumdia-deeplc.yml` (the DeepLC sidecars).
+  **DeepLC 4.1.1 is a floor, not merely the current release**: the 4.0.0a2
+  multitask preview overfits per-run fine-tuning badly enough to invert RT-model
+  rankings (`docs/08_rt_im_train.md` section 4b), so an older DeepLC changes
+  results and not only performance. Anchor the tool version and let pip resolve
+  its scientific-Python graph; do not re-add an exact `pandas < 2` style pin,
+  which has no cp312 wheel. A developer machine may also have older local envs
+  (`deeplc_mt` holds the superseded a2 build); prefer the committed specs.
 - **nn_torch scaling.** For a many-run experiment-wide rescore, force the streaming
-  backend with `MUMDIA_NN_STREAM=1` (or rely on the 4 GB auto threshold) so peak
-  RAM is one minibatch, not the whole PIN; the memmap sidecar file is written next
-  to the output and deleted on exit (`nn_rescore_worker.py:270-275`).
+  backend with `MUMDIA_NN_STREAM=1` (or rely on the `MUMDIA_NN_STREAM_GB`
+  threshold, default 4 GB) so peak RAM is one minibatch, not the whole feature
+  matrix; the memmap sidecar file is written next to the output as
+  `<out>.feat.mm` and deleted on exit (`nn_rescore_worker.py:424-425, 719-722`).
+  Going the other way is also a deliberate choice: raising `MUMDIA_NN_STREAM_GB`
+  above the estimated matrix size keeps a merely large rescore in memory, and the
+  worker's startup line reports which side of the threshold it landed on.

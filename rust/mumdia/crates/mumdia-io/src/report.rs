@@ -1,4 +1,4 @@
-//! Per-artifact `<artifact>.report.json` (PLAN.md Section 3.5 rule 2) so a stage
+//! Per-artifact `<artifact>.report.json` (docs/03_io_layer.md) so a stage
 //! can be evaluated without loading the full table: row counts, key
 //! distributions, the parameters used, model identity, and timing.
 

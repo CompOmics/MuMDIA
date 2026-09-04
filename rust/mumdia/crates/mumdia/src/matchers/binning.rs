@@ -1,10 +1,10 @@
-//! Log-space binning for the fragment index (fragindex_spec Section 2.2).
+//! Log-space binning for the fragment index (docs/06_predict_frag_index_matchers.md).
 //!
 //! Bins are exactly one ppm-tolerance wide in log space, so two m/z values that
 //! are within tolerance fall in bins that differ by at most 1. A query therefore
 //! probes `bin-1, bin, bin+1` and verifies each posting with the exact
-//! [`mumdia_core::constants::within_ppm`] predicate (Section 2.3). All geometry is
-//! f64 regardless of how posting m/z is stored.
+//! [`mumdia_core::constants::within_ppm`] predicate. All geometry is f64
+//! regardless of how posting m/z is stored.
 
 /// Precomputed log-space bin geometry for one tolerance and m/z range.
 #[derive(Clone, Debug)]

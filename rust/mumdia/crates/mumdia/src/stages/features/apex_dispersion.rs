@@ -49,7 +49,7 @@ fn median(v: &[f64]) -> f64 {
         return 0.0;
     }
     let mut s = v.to_vec();
-    s.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    s.sort_by(|a, b| a.total_cmp(b));
     let n = s.len();
     if n % 2 == 1 {
         s[n / 2]
@@ -227,7 +227,7 @@ fn profile_shape(prof: &[f64], apex_idx: usize) -> (f64, f64, f64, f64, f64, f64
         }
     }
     let n_local = maxima.len().max(1) as f64;
-    maxima.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+    maxima.sort_by(|a, b| b.total_cmp(a));
     // Bounded + apex-height guarded: a ~0 apex height otherwise sends this to
     // ~1e14. The shoulder score is a fraction of apex height (physically [0,1]);
     // clamp to 2 to absorb the case where the passed-in apex is not the profile max.

@@ -1,13 +1,13 @@
-//! Compete step `mumdia compete` (PLAN.md Section 4 Stage F, the compete step):
-//! within each competition group keep only the best-scoring candidate before
-//! target-decoy counting, so multiple plausible candidates for one elution peak
-//! cannot inflate discoveries. MVP groups by base peptide (target + its decoy +
-//! charge/mod variants); the grouping is configurable.
+//! Compete step `mumdia compete` (docs/11_compete_rescore_fdr.md): within each
+//! competition group keep only the best-scoring candidate before target-decoy
+//! counting, so multiple plausible candidates for one elution peak cannot inflate
+//! discoveries. MVP groups by base peptide (target + its decoy + charge/mod
+//! variants); the grouping is configurable.
 
 use std::collections::HashMap;
 use std::time::Instant;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use mumdia_core::config::{CompeteConfig, CompeteGroupBy, CompetitionMode};
 use mumdia_core::rejection::RejectionReason;
 use mumdia_core::schema::artifact;
@@ -45,7 +45,29 @@ pub fn run(p: CompeteParams) -> Result<u64> {
     let peak_rank = t.i32("peak_rank").unwrap_or_else(|_| vec![0; t.nrows]);
     let schema = FeatureSchema::read(p.features)?;
     let feat_names = &schema.feature_columns;
-    let feat_cols: Vec<Vec<f64>> = feat_names.iter().map(|c| t.f64(c).unwrap()).collect();
+    // `?`, not `.unwrap()`. The names come from the `.schema.json` companion and the
+    // values from the parquet, which are two separately addressable files: a stale
+    // companion left beside a rewritten table names a column the parquet no longer
+    // has, and that used to abort with `called `Option::unwrap()` on a `None` value`
+    // naming neither the column nor the file. `FeatureSchema::read` already falls
+    // back to the parquet's own columns when the companion is MISSING; this covers
+    // the case where it is present and wrong.
+    let feat_cols: Vec<Vec<f64>> = feat_names
+        .iter()
+        .map(|c| {
+            t.f64(c).with_context(|| {
+                format!(
+                    concat!(
+                        "feature column {c:?} is named by {f}.schema.json but is not in ",
+                        "{f}; the companion is stale, delete it to reconstruct the column ",
+                        "list from the parquet itself"
+                    ),
+                    c = c,
+                    f = p.features
+                )
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
 
     // `charge` is a minimal feature column (present in every set), stored as f64.
     // Only the peptidoform-charge grouping needs it.
@@ -85,7 +107,7 @@ pub fn run(p: CompeteParams) -> Result<u64> {
         };
         let pk = peak_rank[i];
         let key = match p.cfg.group_by {
-            CompeteGroupBy::Precursor => (base[i], label_code, 0i64, pk),
+            CompeteGroupBy::BasePeptide => (base[i], label_code, 0i64, pk),
             CompeteGroupBy::Apex => {
                 let bucket = (apex_rt[i] / p.cfg.apex_rt_tolerance_s).round() as i64;
                 (base[i], label_code, bucket, pk)
@@ -326,7 +348,6 @@ fn resolve_competition(
     unique_min: usize,
     unique_ev: Option<&[f64]>,
 ) -> (Vec<usize>, Vec<(usize, usize)>) {
-    use std::cmp::Ordering::Equal;
     let mut group_keys: Vec<&(u32, u8, i64, i32)> = groups.keys().collect();
     group_keys.sort_unstable();
     let mut keep: Vec<usize> = Vec::new();
@@ -335,12 +356,13 @@ fn resolve_competition(
         let members = &groups[gk];
         let win = *members
             .iter()
-            .min_by(|&&a, &&b| {
-                prelim[b]
-                    .partial_cmp(&prelim[a])
-                    .unwrap_or(Equal)
-                    .then(a.cmp(&b))
-            })
+            // `total_cmp`, not `partial_cmp(..).unwrap_or(Equal)`: this picks the
+            // single row that survives competition, and treating every NaN
+            // prelim_score as equal to every other score made that choice depend on
+            // iteration order. `total_cmp` is a genuine total order, so the winner
+            // is well defined even then, and the `.then(a.cmp(&b))` index tiebreak
+            // keeps it deterministic.
+            .min_by(|&&a, &&b| prelim[b].total_cmp(&prelim[a]).then(a.cmp(&b)))
             .unwrap();
         match mode {
             CompetitionMode::None | CompetitionMode::FeaturesOnly => {

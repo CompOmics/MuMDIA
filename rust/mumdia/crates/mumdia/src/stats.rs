@@ -1,6 +1,6 @@
-//! Shared numeric kernels (PLAN.md Section 7 "Numerics"): population-variance
-//! Pearson with a zero-variance guard returning 0, cosine similarity, spectral
-//! angle. One implementation, unit-tested (PLAN.md Section 5 improvement 7).
+//! Shared numeric kernels (docs/14_build_test_deploy_gotchas.md):
+//! population-variance Pearson with a zero-variance guard returning 0, cosine
+//! similarity, spectral angle. One implementation, unit-tested.
 
 /// Population Pearson correlation; returns 0 on zero variance (documented guard).
 pub fn pearson(a: &[f64], b: &[f64]) -> f64 {
@@ -40,7 +40,7 @@ pub fn cosine(a: &[f64], b: &[f64]) -> f64 {
     dot / (na.sqrt() * nb.sqrt())
 }
 
-/// Spectral angle in [0,1] (1 = identical), derived from cosine.
+/// Spectral angle in `[0, 1]` (1 = identical), derived from cosine.
 pub fn spectral_angle(a: &[f64], b: &[f64]) -> f64 {
     let c = cosine(a, b).clamp(-1.0, 1.0);
     1.0 - 2.0 * c.acos() / std::f64::consts::PI

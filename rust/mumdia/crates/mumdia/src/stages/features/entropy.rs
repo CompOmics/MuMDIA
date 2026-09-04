@@ -175,11 +175,7 @@ pub fn values(e: &Evidence) -> Vec<f64> {
 
     // 4. spectral_entropy_similarity_topk (top-6 fragments by predicted intensity)
     let mut idx: Vec<usize> = (0..k).collect();
-    idx.sort_by(|&a, &b| {
-        l[b].partial_cmp(&l[a])
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then(a.cmp(&b))
-    });
+    idx.sort_by(|&a, &b| l[b].total_cmp(&l[a]).then(a.cmp(&b)));
     let topn = idx.len().min(6);
     let o_top: Vec<f64> = idx[..topn].iter().map(|&i| o[i]).collect();
     let l_top: Vec<f64> = idx[..topn].iter().map(|&i| l[i]).collect();

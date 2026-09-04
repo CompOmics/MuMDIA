@@ -1,7 +1,7 @@
 //! Stage S `mumdia search-seed`: a native broad DIA-aware seed search over the
-//! inverted fragment index (PLAN.md Stage S). Its purpose is calibration, not
-//! final identification. It sits behind the file contract, so a Sage adapter can
-//! replace it later (the plan's default); MVP uses a native Sage-lite hyperscore.
+//! inverted fragment index (docs/07_search_seed.md). Its purpose is calibration,
+//! not final identification. It sits behind the file contract, so a Sage adapter
+//! can replace it later; MVP uses a native Sage-lite hyperscore.
 //!
 //! Library-level decoys are the single source of truth (no separate engine
 //! decoy generation), so target-decoy counting is never mixed-method.
@@ -15,7 +15,7 @@ use mumdia_core::schema::artifact;
 use mumdia_io::report::ArtifactReport;
 use mumdia_io::table::{write_table, Col};
 use serde_json::json;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::fdr::{count_targets_at_q, ln_factorial, target_decoy_q};
 use crate::index::Library;
@@ -92,7 +92,7 @@ pub fn run(p: SearchSeedParams) -> Result<u64> {
                 .filter(|(_, v)| v.0 as usize >= p.cfg.min_matched_peaks)
                 .map(|(cid, v)| (cid, hyperscore(v.0, v.1), v.0))
                 .collect();
-            scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap().then(a.0.cmp(&b.0)));
+            scored.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
             scored.truncate(p.cfg.report_psms);
             for (cid, score, matched) in scored {
                 let entry = best.entry(cid).or_insert(Best {
@@ -154,8 +154,8 @@ pub fn run(p: SearchSeedParams) -> Result<u64> {
     let is_dec: Vec<bool> = label_c.iter().map(|l| l == "decoy").collect();
     let n_at_1pct = count_targets_at_q(&q_c, &is_dec, p.cfg.fdr_seed);
 
-    // Per-run fragment mass recalibration + learned tolerance (PLAN.md Section 5
-    // improvement 3, Section 8.4). Collect matched-fragment ppm deviations from
+    // Per-run fragment mass recalibration + learned tolerance
+    // (docs/07_search_seed.md). Collect matched-fragment ppm deviations from
     // confident target PSMs; the median is the systematic offset, a high
     // percentile of the centered deviations sets the tolerance. Written to
     // <seed>.masscal.json and consumed by extract.
@@ -173,8 +173,16 @@ pub fn run(p: SearchSeedParams) -> Result<u64> {
         }
         if let Some(scan) = scan_by_index.get(&b.scan_index) {
             let (mzs, _, _) = lib.cand_frags(*cid);
+            // The calibrant collection window has to be at least as wide as the search
+            // tolerance, or the deviation percentile that SETS the learned tolerance is
+            // truncated by the collection window itself. A literal 50 ppm silently did
+            // that on any wide-tolerance configuration: a TOF run searched at 100 ppm
+            // could not observe a deviation beyond 50, so its p95 was bounded at 50 and
+            // the learned tolerance came out too tight. The 50 ppm floor is kept for the
+            // narrow-tolerance case, where a wider window would just admit noise.
+            let collect_ppm = 50.0_f64.max(p.cfg.fragment_tol_ppm);
             for &fmz in mzs {
-                let (lo, hi) = mumdia_core::constants::ppm_bounds(fmz, 50.0);
+                let (lo, hi) = mumdia_core::constants::ppm_bounds(fmz, collect_ppm);
                 let s = scan.peaks.partition_point(|pk| pk.mz < lo);
                 let (mut bestd, mut bestppm) = (f64::MAX, None);
                 let mut j = s;
@@ -197,7 +205,7 @@ pub fn run(p: SearchSeedParams) -> Result<u64> {
     // optional robust second pass on the outlier-trimmed calibrants.
     let fit = |d: &[f64]| -> (f64, f64) {
         let mut sorted = d.to_vec();
-        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        sorted.sort_by(|a, b| a.total_cmp(b));
         let offset = sorted[sorted.len() / 2];
         let centered: Vec<f64> = d.iter().map(|x| (x - offset).abs()).collect();
         let tol = (crate::calibrate::percentile(&centered, 0.95) * 1.5).max(5.0);
@@ -248,7 +256,7 @@ pub fn run(p: SearchSeedParams) -> Result<u64> {
         && dev_mz.len() >= 50
     {
         let mut pairs: Vec<(f64, f64)> = dev_mz.iter().cloned().zip(devs.iter().cloned()).collect();
-        pairs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        pairs.sort_by(|a, b| a.0.total_cmp(&b.0));
         let xs: Vec<f64> = pairs.iter().map(|(m, _)| *m).collect();
         let ys: Vec<f64> = pairs.iter().map(|(_, pp)| *pp).collect();
         let loess = crate::calibrate::Loess::fit(&xs, &ys, 0.3, 200);
@@ -345,8 +353,7 @@ fn select_peaks(scan: &Ms2Scan, top_n: usize) -> Vec<usize> {
         idx.sort_by(|&a, &b| {
             scan.peaks[b]
                 .intensity
-                .partial_cmp(&scan.peaks[a].intensity)
-                .unwrap_or(std::cmp::Ordering::Equal)
+                .total_cmp(&scan.peaks[a].intensity)
                 .then(a.cmp(&b))
         });
         idx.truncate(top_n);
@@ -383,11 +390,23 @@ fn seed_fragindex_windows(
             .push(si);
     }
     let group_vec: Vec<Vec<usize>> = groups.into_values().collect();
-    // Size each worker's scratch to the WIDEST candidate window, not the whole library.
-    // The scratch is indexed window-relative, so 16 B x n_cand per worker (877 MB per
-    // worker at 54.8M candidates) was almost entirely untouched. It grows on demand, so an
-    // underestimate here is safe.
-    let max_window_width = group_vec
+    // Size each worker's scratch to the MEDIAN candidate window, not the widest one and
+    // certainly not the whole library. The scratch is indexed window-relative, and it
+    // grows on demand, so an underestimate costs a few reallocations while an
+    // overestimate costs 16 B x width per rayon worker up front.
+    //
+    // The max is the wrong statistic because one window can be the whole library:
+    // `convert.rs` maps BOTH a zero-width reported isolation window and a missing
+    // precursor to the full range (0, 1e6), which `candidate_range` resolves to every
+    // candidate. So a single malformed or all-ion scan in an otherwise 50-window run
+    // sized every worker's scratch to the library -- 877 MB per worker on the profiled
+    // 54.8M-candidate library, about 28 GB of commit charge on 32 cores, for arrays a
+    // worker inside one narrow window never touches. The only mitigation was `--threads`,
+    // which the user had to know to reach for.
+    //
+    // The median is robust to that outlier and needs no configuration. Widths are
+    // collected in group order, so the value is deterministic.
+    let mut widths: Vec<usize> = group_vec
         .iter()
         .filter_map(|ids| ids.first())
         .map(|&si| {
@@ -395,13 +414,30 @@ fn seed_fragindex_windows(
             let (lo, hi) = idx.candidate_range(w.lower_mz, w.upper_mz);
             hi.saturating_sub(lo) as usize + 1
         })
-        .max()
-        .unwrap_or(1);
+        .collect();
+    widths.sort_unstable();
+    let median_window_width = widths.get(widths.len() / 2).copied().unwrap_or(1).max(1);
+    // Say so when the two disagree by a lot: a window spanning most of the library is
+    // either a genuine all-ion acquisition or a malformed scan, and both are worth
+    // knowing about before wondering why extraction is slow.
+    if let Some(&widest) = widths.last() {
+        if widest > 8 * median_window_width {
+            warn!(
+                median_window_candidates = median_window_width,
+                widest_window_candidates = widest,
+                library_candidates = idx.n_cand(),
+                "search-seed: one isolation window covers far more candidates than the \
+                 median. An all-ion acquisition does this legitimately; otherwise check \
+                 for a scan with a zero-width or missing isolation window, which convert \
+                 maps to the full m/z range"
+            );
+        }
+    }
 
     let partials: Vec<Vec<(u32, Best)>> = group_vec
         .par_iter()
         .map_init(
-            || SeedScratch::new(max_window_width),
+            || SeedScratch::new(median_window_width),
             |scratch, ids| {
                 if ids.is_empty() {
                     return Vec::new();
@@ -432,7 +468,7 @@ fn seed_fragindex_windows(
                             )
                         })
                         .collect();
-                    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap().then(a.0.cmp(&b.0)));
+                    scored.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
                     scored.truncate(cfg.report_psms);
                     for (cid, score, matched) in scored {
                         let e = local.entry(cid).or_insert(Best {

@@ -26,8 +26,9 @@ MEMORY (multi-run / large PINs): two feature backends behind one accessor.
       This is what makes combining many runs into one rescoring tractable: the full
       PIN never lives in RAM at once.
 
-Determinism note (plan.md Section 7): NN training is only approximately reproducible.
-Set MUMDIA_NN_SEEDS>1 to ensemble seeds and average out-of-fold scores.
+Determinism note (docs/14_build_test_deploy_gotchas.md): NN training is only
+approximately reproducible. Set MUMDIA_NN_SEEDS>1 to ensemble seeds and average
+out-of-fold scores.
 
 Input format: either the legacy tab-separated PIN or a Parquet feature table, chosen by the
 file extension (.parquet / .pq). Parquet avoids serialising the whole feature matrix as text -
@@ -135,6 +136,31 @@ def strip_pep(p):
     s = re.sub(r"^[A-Z-]\.", "", s)
     s = re.sub(r"\.[A-Z-]$", "", s)
     return s
+
+
+def peptide_fold(peptide, folds):
+    """Fallback fold index, hashed from the mod-stripped peptidoform.
+
+    Does NOT place a target and its paired decoy in the same fold: `strip_pep` leaves
+    the `DECOY_` marker in place, and for a reverse-decoy library the decoy peptidoform
+    is the reversed sequence, so no string derived from it reaches its target. Kept only
+    for a PIN written without fold keys.
+    """
+    return int(hashlib.md5(strip_pep(peptide).encode()).hexdigest(), 16) % folds
+
+
+def folds_for(peptides, fold_keys, folds, off=0):
+    """Fold index per row, preferring the engine's explicit keys.
+
+    `fold_keys` is `base_peptide_id` per PIN row, which a target and its paired decoy
+    share on every library path, so keying on it puts them in the same fold. That is
+    what `percolator_lite` does and what docs/11 claims this worker does; the hashed
+    fallback did not. `off` is the flat row offset, which is what makes one helper
+    serve the chunked streaming backend as well as the two whole-table ones.
+    """
+    if fold_keys is not None:
+        return (fold_keys[off:off + len(peptides)] % folds).astype(np.int16)
+    return np.array([peptide_fold(x, folds) for x in peptides], np.int16)
 
 
 PHASE = {}
@@ -351,7 +377,40 @@ def main():
     nf = len(feat_cols)
     if nf == 0:
         raise ValueError("PIN contains no rescoring feature columns")
-    fold_of = lambda p: int(hashlib.md5(strip_pep(p).encode()).hexdigest(), 16) % FOLDS
+    # Cross-validation fold assignment.
+    #
+    # The engine writes a fold key per PIN row (`base_peptide_id`) and names the file in
+    # MUMDIA_NN_FOLD_KEYS. Use it when present: a target and its paired decoy share
+    # base_peptide_id, so they land in the same fold, which is what `percolator_lite` does
+    # and what docs/11 claims this worker does.
+    #
+    # The fallback hashes the mod-stripped peptidoform, which does NOT pair them: the
+    # DECOY_ marker survives `strip_pep`, so `DECOY_PEPTIDE` and `PEPTIDE` hash apart, and
+    # for a reverse-decoy library the decoy peptidoform is the reversed sequence and no
+    # string derived from it can reach its target at all. Cross-fold memorisation of a
+    # peptide then depresses its own pair, which is conservative but costs sensitivity and
+    # makes the fold split depend on the decoy recipe.
+    fold_keys = None
+    _fk_path = os.environ.get("MUMDIA_NN_FOLD_KEYS", "")
+    if _fk_path and os.path.exists(_fk_path):
+        try:
+            fold_keys = pq.read_table(_fk_path).column("fold_key").to_numpy()
+        except Exception as exc:  # pragma: no cover - unreadable companion file
+            print(
+                "nn_rescore_worker: could not read MUMDIA_NN_FOLD_KEYS (%s: %s); "
+                "falling back to the peptidoform hash, which does not pair a target "
+                "with its decoy" % (_fk_path, exc),
+                flush=True,
+            )
+            fold_keys = None
+    if fold_keys is None:
+        print(
+            "nn_rescore_worker: no fold-key file; folding on the peptidoform hash, which "
+            "does not place a target and its paired decoy in the same fold",
+            flush=True,
+        )
+
+    _folds = lambda peptides, off=0: folds_for(peptides, fold_keys, FOLDS, off)
 
     mm_path = None
     if not stream:
@@ -363,7 +422,7 @@ def main():
             y = (_tb.column("Label").to_numpy() == 1).astype(np.float32)
             _spec = _tb.column("SpecId").to_pylist()
             cids = np.array([int(x.rsplit("_", 1)[-1]) for x in _spec], np.int64)
-            fold = np.array([fold_of(x) for x in _tb.column("Peptide").to_pylist()], np.int16)
+            fold = _folds(_tb.column("Peptide").to_pylist())
             del _tb, _spec
             n = len(y)
             Xs = np.empty((n, nf), np.float32)
@@ -398,7 +457,7 @@ def main():
             cids = np.array(
                 [int(s.rsplit("_", 1)[-1]) for s in pin["SpecId"].astype(str)], np.int64
             )
-            fold = pin["Peptide"].map(fold_of).to_numpy()
+            fold = _folds(pin["Peptide"].tolist())
             X = np.nan_to_num(
                 pin[feat_cols].to_numpy(np.float32), nan=0.0, posinf=0.0, neginf=0.0
             )
@@ -450,7 +509,7 @@ def main():
             s2 += (xf.astype(np.float64) ** 2).sum(axis=0)
             y[off:off + k] = (chunk["Label"].to_numpy() == 1).astype(np.float32)
             cids[off:off + k] = [int(s.rsplit("_", 1)[-1]) for s in chunk["SpecId"].astype(str)]
-            fold[off:off + k] = chunk["Peptide"].map(fold_of).to_numpy()
+            fold[off:off + k] = _folds(chunk["Peptide"].tolist(), off)
             off += k
         mean = (s1 / n).astype(np.float32)
         std = np.sqrt(np.maximum(s2 / n - (s1 / n) ** 2, 1e-12)).astype(np.float32)

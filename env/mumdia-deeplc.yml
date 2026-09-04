@@ -1,0 +1,41 @@
+# Portable local environment for the DeepLC sidecars: retention-time prediction
+# (scripts/deeplc_worker.py) and per-run fine-tuning (scripts/deeplc_finetune.py).
+# The Docker image builds the same tool version from env/docker-deeplc.yml; this
+# spec is the equivalent for a native install.
+#
+#   conda env create -f env/mumdia-deeplc.yml
+#   # then point the config at this env's interpreter:
+#   #   "predict_frag": { "deeplc_python": ".../envs/mumdia-deeplc/bin/python" }
+#   #   (on Windows: ...\\envs\\mumdia-deeplc\\python.exe)
+#   mumdia doctor --config <your config>
+#
+# DeepLC 4.1.1 is a floor, not merely the current release. The 4.0.0a2 multitask
+# preview overfits per-run fine-tuning badly enough to invert RT-model rankings
+# (docs/08_rt_im_train.md section 4b), so an older DeepLC changes results and not
+# only performance. 4.1.1 requires Python >= 3.11 and torch >= 2.6.
+#
+# CPU torch is deliberate: DeepLC fine-tuning is not the bottleneck in a run, and
+# a CPU wheel keeps the environment installable on machines without CUDA. Drop the
+# `--extra-index-url` line and the `+cpu` suffix to use a GPU build instead.
+#
+# `psm_utils` and `pyarrow` are listed explicitly because `deeplc_finetune.py`
+# imports both directly (see `mumdia doctor`, which probes
+# deeplc,numpy,pandas,pyarrow,torch,psm_utils for this interpreter). DeepLC pulls
+# psm_utils itself, but naming it here keeps the contract visible.
+#
+# Import order caveat, not expressible in this file: `deeplc` must be imported
+# before numpy/pyarrow in the workers, or torch DLL initialization aborts on
+# Windows with `OSError: [WinError 1114] ... c10.dll`. Both workers already order
+# their imports that way; keep them that way (docs/13_sidecars.md, CLAUDE.md).
+name: mumdia-deeplc
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - pip:
+      - --extra-index-url https://download.pytorch.org/whl/cpu
+      - torch==2.12.1+cpu
+      - deeplc==4.1.1
+      - psm-utils
+      - pyarrow
