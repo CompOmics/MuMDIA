@@ -698,14 +698,18 @@ impl MassOffset {
     }
 }
 
-fn extract_accumulate_windows(
-    idx: &FragIndex,
-    scans: &[Ms2Scan],
-    rt_lo: &[f64],
-    rt_hi: &[f64],
-    mass_off: &MassOffset,
-    cfg: &ExtractConfig,
-) -> HashMap<u32, Vec<Hit>> {
+/// One isolation window and the scans acquired in it, with the candidate range that
+/// window can match. Ascending by window m/z, which (precursors being sorted by m/z)
+/// makes the candidate ranges ascending too: that is what lets the driver decide a
+/// candidate is final and flush it (see `GROUPS_IN_FLIGHT`).
+struct WinGroup {
+    lo_cid: u32,
+    hi_cid: u32,
+    scans: Vec<usize>,
+}
+
+/// Group the run's scans by isolation window, ascending.
+fn window_groups(idx: &FragIndex, scans: &[Ms2Scan]) -> Vec<WinGroup> {
     use std::collections::BTreeMap;
     let mut groups: BTreeMap<(u64, u64), Vec<usize>> = BTreeMap::new();
     for (si, scan) in scans.iter().enumerate() {
@@ -717,19 +721,38 @@ fn extract_accumulate_windows(
             .or_default()
             .push(si);
     }
-    let group_vec: Vec<Vec<usize>> = groups.into_values().collect();
-
-    let partials: Vec<Vec<(u32, Vec<Hit>)>> = group_vec
-        .par_iter()
-        .map(|ids| {
-            if ids.is_empty() {
-                return Vec::new();
-            }
-            let w = &scans[ids[0]].window;
+    groups
+        .into_values()
+        .filter_map(|ids| {
+            let w = &scans[*ids.first()?].window;
             let (lo, hi) = idx.candidate_range(w.lower_mz, w.upper_mz);
-            if hi <= lo {
-                return Vec::new();
-            }
+            (hi > lo).then_some(WinGroup {
+                lo_cid: lo,
+                hi_cid: hi,
+                scans: ids,
+            })
+        })
+        .collect()
+}
+
+/// Probe one batch of isolation windows, in parallel across windows, and merge the hits
+/// in window order. Merging in window order (not thread completion order) is what keeps
+/// each candidate's hit sequence, and therefore every float reduction downstream, the
+/// same as the serial path.
+fn accumulate_groups(
+    idx: &FragIndex,
+    groups: &[WinGroup],
+    scans: &[Ms2Scan],
+    rt_lo: &[f64],
+    rt_hi: &[f64],
+    mass_off: &MassOffset,
+    cfg: &ExtractConfig,
+) -> HashMap<u32, Vec<Hit>> {
+    let partials: Vec<Vec<(u32, Vec<Hit>)>> = groups
+        .par_iter()
+        .map(|g| {
+            let ids = &g.scans;
+            let (lo, hi) = (g.lo_cid, g.hi_cid);
             let mut local: HashMap<u32, Vec<Hit>> = HashMap::new();
             let mut claimants: Vec<(u32, u16, f32)> = Vec::new();
             // `(lo, hi)` is fixed for this whole isolation window and every scan of it
@@ -812,6 +835,30 @@ fn extract_accumulate_windows(
         }
     }
     acc
+}
+
+/// Isolation windows probed before the driver flushes the candidates that are now final.
+/// Memory scales with this: the accumulator holds the hits of the windows in flight, so a
+/// batch of `n` windows of width `w` stepping `s` keeps about `n * s + w` Th of the
+/// precursor axis open. It is at least the thread count, because the batch is also the
+/// unit of parallelism.
+fn groups_in_flight() -> usize {
+    rayon::current_num_threads().max(4)
+}
+
+/// Take every candidate below `bound` out of the accumulator, ascending. Windows are
+/// processed in ascending m/z and precursors are sorted by m/z, so once the next window's
+/// candidate range starts at `bound`, no later window can add a hit below it: those
+/// candidates are complete and can be scored and written.
+fn drain_below(acc: &mut HashMap<u32, Vec<Hit>>, bound: u32) -> Vec<(u32, Vec<Hit>)> {
+    let mut ids: Vec<u32> = acc.keys().copied().filter(|&c| c < bound).collect();
+    ids.sort_unstable();
+    ids.into_iter()
+        .map(|cid| {
+            let hits = acc.remove(&cid).expect("id came from the map");
+            (cid, hits)
+        })
+        .collect()
 }
 
 /// Parallel two-pass co-elution peak-claim. Each isolation-window group is
@@ -1470,8 +1517,11 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
     let fidx =
         matches!(p.cfg.matcher, MatcherKind::Fragindex).then(|| FragIndex::build(&lib, frag_tol));
 
-    // Peak-major accumulation.
+    // Peak-major accumulation. The fast path (single pass, fragment index, no candidate
+    // allowlist) leaves `acc` empty and fills `stream_groups` instead; every other path
+    // materialises the whole run here and is handed to the driver as one batch.
     let mut acc: HashMap<u32, Vec<Hit>> = HashMap::new();
+    let mut stream_groups: Option<Vec<WinGroup>> = None;
     // Reused per-peak buffer of (candidate_id, local_frag_index, predicted_intensity).
     let mut claimants: Vec<(u32, u16, f32)> = Vec::new();
     // Per-candidate contested-peak stats under the co-elution arbitration, for the
@@ -1497,7 +1547,11 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
             // is no candidate allowlist; a `restrict` list routes to the serial path
             // below, which applies the allowlist filter and honors every peak_claim
             // strategy (Winner/Proportional/None).
-            acc = extract_accumulate_windows(idx, &scans, &rt_lo, &rt_hi, &mass_off, p.cfg);
+            // Streamed: the driver below probes the windows in batches and writes each
+            // candidate out as soon as no later window can add a hit to it, so the whole
+            // run's hits are never resident. Measured at 1.6 billion hits (35.9 GiB of
+            // payload) on the HYE benchmark, which was 60% of extract's 61.3 GiB peak.
+            stream_groups = Some(window_groups(idx, &scans));
         } else {
             let pr = Prober {
                 fidx: fidx.as_ref(),
@@ -1621,10 +1675,44 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
         acc = a;
         contested = c;
     }
-    info!(
-        materialized = acc.len(),
-        "extract: candidates with evidence"
-    );
+    if stream_groups.is_none() {
+        info!(
+            materialized = acc.len(),
+            "extract: candidates with evidence"
+        );
+    }
+    if stream_groups.is_none() {
+        // The whole-run hit accumulator is the largest unattributed structure of the
+        // stage: extract's sampled peak was 61.38 GiB against 3.8 GiB of named buffers
+        // (docs/27 section 0). Payload, growth slack and the per-candidate spine are
+        // reported apart because every hit arrives through `entry().or_default().push()`,
+        // which grows geometrically, so the slack is not a rounding error.
+        let (mut hits, mut cap) = (0usize, 0usize);
+        for v in acc.values() {
+            hits += v.len();
+            cap += v.capacity();
+        }
+        let sz = std::mem::size_of::<Hit>();
+        crate::memlog::report(
+            "extract hit accumulator",
+            &[
+                ("hits_payload", hits * sz),
+                ("growth_slack", cap.saturating_sub(hits) * sz),
+                ("vec_spine", acc.len() * std::mem::size_of::<Vec<Hit>>()),
+                (
+                    "hashmap_table",
+                    acc.capacity() * (std::mem::size_of::<(u32, Vec<Hit>)>() + 1),
+                ),
+            ],
+        );
+        info!(
+            hits,
+            candidates = acc.len(),
+            hit_bytes = sz,
+            hits_per_candidate = hits as f64 / acc.len().max(1) as f64,
+            "mem: extract hit accumulator shape"
+        );
+    }
 
     // Cascade + apex per candidate.
     let scan_window = p.cfg.fixed_scan_window.max(1);
@@ -1674,6 +1762,7 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
     // and downstream floating-point sums in the rescorer are order-sensitive).
     let mut cand_ids: Vec<u32> = acc.keys().cloned().collect();
     cand_ids.sort_unstable();
+    // Empty on the streamed path; the driver builds one of these per flush instead.
 
     // Drain the accumulator into (cid, hits) in the deterministic sorted order,
     // then process candidates in parallel. Each candidate's work depends only on
@@ -2374,6 +2463,9 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
     // copy in the Arrow builders) being resident at one final write. The bounded channel
     // keeps at most a few chunks in flight between the extraction threads and the encoder.
     let mut n_accepted = 0u64;
+    // Candidates that had at least one hit; counted as they are flushed on the streamed
+    // path, where no whole-run accumulator exists to size.
+    let mut n_materialized = 0u64;
     // Trace payload accounting: what one chunk holds between extraction and encoding is
     // the whole point of the incremental writer, so record the largest chunk alongside
     // the run total that the old "accumulate everything, then write" path held at once.
@@ -2393,86 +2485,144 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
             }
             w.close()
         });
-        for chunk in cand_hits.chunks_mut(CAND_CHUNK) {
-            let outs: Vec<Vec<CandOut>> = chunk
-                .par_iter_mut()
-                .map(|(cid, hits)| per_candidate(*cid, std::mem::take(hits)))
-                .collect();
-            let mut ch = ChromChunk::default();
-            for r in outs.into_iter().flatten() {
-                n_accepted += 1;
-                let rcid = r.cid;
-                for (rank, apex, start, end, ev, area) in &r.peaks {
-                    pk_cid.push(rcid);
-                    pk_rank.push(*rank as i32);
-                    pk_apex.push(*apex);
-                    pk_start.push(*start);
-                    pk_end.push(*end);
-                    pk_ev.push(*ev);
-                    pk_area.push(*area);
+        // One flush of finished candidates: score them in parallel, append their PSM
+        // rows, and hand their chromatogram rows to the writer thread. Called once per
+        // window batch on the streamed path and once on the eager paths, so the code
+        // that produces a row is the same either way. Returns false when the writer has
+        // gone away; its error surfaces at the join below.
+        let mut emit_batch = |cand_hits: &mut Vec<(u32, Vec<Hit>)>| -> bool {
+            for chunk in cand_hits.chunks_mut(CAND_CHUNK) {
+                let outs: Vec<Vec<CandOut>> = chunk
+                    .par_iter_mut()
+                    .map(|(cid, hits)| per_candidate(*cid, std::mem::take(hits)))
+                    .collect();
+                let mut ch = ChromChunk::default();
+                for r in outs.into_iter().flatten() {
+                    n_accepted += 1;
+                    let rcid = r.cid;
+                    for (rank, apex, start, end, ev, area) in &r.peaks {
+                        pk_cid.push(rcid);
+                        pk_rank.push(*rank as i32);
+                        pk_apex.push(*apex);
+                        pk_start.push(*start);
+                        pk_end.push(*end);
+                        pk_ev.push(*ev);
+                        pk_area.push(*area);
+                    }
+                    cid_c.push(r.cid);
+                    peakrank_c.push(r.peak_rank as i32);
+                    apexrt_c.push(r.apex_rt);
+                    apexim_c.push(None);
+                    apexint_c.push(r.apex_int);
+                    nmatch_c.push(r.n_match);
+                    corun_c.push(r.corun);
+                    npred_c.push(r.npred);
+                    calrt_c.push(r.calrt);
+                    mz_c.push(r.mz);
+                    contested_c.push(r.contested);
+                    if p.cfg.emit_contested_features {
+                        contested_count_c.push(r.contested_count_frac);
+                        apportioned_c.push(r.apportioned_frac);
+                    }
+                    z_c.push(r.z);
+                    label_c.push(r.label);
+                    base_c.push(r.base);
+                    pform_c.push(r.pform);
+                    prot_c.push(r.prot);
+                    irt_c.push(r.irt);
+                    ms1_m1.push(r.ms1_m1);
+                    ms1_mono.push(r.ms1_mono);
+                    ms1_i1.push(r.ms1_i1);
+                    ms1_i2.push(r.ms1_i2);
+                    if p.cfg.emit_gate_diagnostics {
+                        gate_apex_c.push(r.gate_apex);
+                        gate_peakspec_c.push(r.gate_peak_spectral);
+                        gate_coel_c.push(r.gate_coelution);
+                        gate_se_c.push(r.gate_spectral_entropy);
+                    }
+                    if p.cfg.emit_demix_features {
+                        deconv_expl_c.push(r.deconv_explained);
+                        deconv_act_c.push(r.deconv_active);
+                        deconv_share_c.push(r.deconv_share);
+                        deconv_collin_c.push(r.deconv_collin);
+                        deconv_shadow_c.push(r.deconv_shadow);
+                    }
+                    for (cc, nm, fmz, omz, pint, rt, it) in r.chrom {
+                        ch.cid.push(cc);
+                        ch.name.push(nm);
+                        ch.fmz.push(fmz);
+                        ch.obsmz.push(omz);
+                        ch.pint.push(pint);
+                        ch.rt.push(rt);
+                        ch.int.push(it);
+                    }
                 }
-                cid_c.push(r.cid);
-                peakrank_c.push(r.peak_rank as i32);
-                apexrt_c.push(r.apex_rt);
-                apexim_c.push(None);
-                apexint_c.push(r.apex_int);
-                nmatch_c.push(r.n_match);
-                corun_c.push(r.corun);
-                npred_c.push(r.npred);
-                calrt_c.push(r.calrt);
-                mz_c.push(r.mz);
-                contested_c.push(r.contested);
-                if p.cfg.emit_contested_features {
-                    contested_count_c.push(r.contested_count_frac);
-                    apportioned_c.push(r.apportioned_frac);
-                }
-                z_c.push(r.z);
-                label_c.push(r.label);
-                base_c.push(r.base);
-                pform_c.push(r.pform);
-                prot_c.push(r.prot);
-                irt_c.push(r.irt);
-                ms1_m1.push(r.ms1_m1);
-                ms1_mono.push(r.ms1_mono);
-                ms1_i1.push(r.ms1_i1);
-                ms1_i2.push(r.ms1_i2);
-                if p.cfg.emit_gate_diagnostics {
-                    gate_apex_c.push(r.gate_apex);
-                    gate_peakspec_c.push(r.gate_peak_spectral);
-                    gate_coel_c.push(r.gate_coelution);
-                    gate_se_c.push(r.gate_spectral_entropy);
-                }
-                if p.cfg.emit_demix_features {
-                    deconv_expl_c.push(r.deconv_explained);
-                    deconv_act_c.push(r.deconv_active);
-                    deconv_share_c.push(r.deconv_share);
-                    deconv_collin_c.push(r.deconv_collin);
-                    deconv_shadow_c.push(r.deconv_shadow);
-                }
-                for (cc, nm, fmz, omz, pint, rt, it) in r.chrom {
-                    ch.cid.push(cc);
-                    ch.name.push(nm);
-                    ch.fmz.push(fmz);
-                    ch.obsmz.push(omz);
-                    ch.pint.push(pint);
-                    ch.rt.push(rt);
-                    ch.int.push(it);
+                let chunk_bytes = crate::memlog::bytes_of_nested(&ch.rt)
+                    + crate::memlog::bytes_of_nested(&ch.int)
+                    + crate::memlog::bytes_of(&ch.cid)
+                    + crate::memlog::bytes_of(&ch.fmz)
+                    + crate::memlog::bytes_of(&ch.obsmz)
+                    + crate::memlog::bytes_of(&ch.pint)
+                    + ch.name.iter().map(|s| s.len()).sum::<usize>();
+                chrom_bytes_total += chunk_bytes;
+                chrom_bytes_max_chunk = chrom_bytes_max_chunk.max(chunk_bytes);
+                // Hand the chunk's chromatogram rows to the writer thread. A send error means
+                // the writer failed; its error surfaces at the join below.
+                if tx.send(ch.cols()).is_err() {
+                    return false;
                 }
             }
-            let chunk_bytes = crate::memlog::bytes_of_nested(&ch.rt)
-                + crate::memlog::bytes_of_nested(&ch.int)
-                + crate::memlog::bytes_of(&ch.cid)
-                + crate::memlog::bytes_of(&ch.fmz)
-                + crate::memlog::bytes_of(&ch.obsmz)
-                + crate::memlog::bytes_of(&ch.pint)
-                + ch.name.iter().map(|s| s.len()).sum::<usize>();
-            chrom_bytes_total += chunk_bytes;
-            chrom_bytes_max_chunk = chrom_bytes_max_chunk.max(chunk_bytes);
-            // Hand the chunk's chromatogram rows to the writer thread. A send error means
-            // the writer failed; its error surfaces at the join below.
-            if tx.send(ch.cols()).is_err() {
-                break;
+            true
+        };
+
+        // Streamed path: probe a batch of windows, then flush everything the next batch
+        // cannot touch. `acc_stream` therefore holds the hits of the windows in flight
+        // rather than the hits of the run.
+        let mut acc_stream: HashMap<u32, Vec<Hit>> = HashMap::new();
+        let mut open_hits_max = 0usize;
+        if let Some(groups) = stream_groups.as_ref() {
+            let step = groups_in_flight();
+            let mut gi = 0usize;
+            while gi < groups.len() {
+                let upto = (gi + step).min(groups.len());
+                let batch = accumulate_groups(
+                    fidx.as_ref()
+                        .expect("streamed path implies a fragment index"),
+                    &groups[gi..upto],
+                    &scans,
+                    &rt_lo,
+                    &rt_hi,
+                    &mass_off,
+                    p.cfg,
+                );
+                for (cid, hits) in batch {
+                    acc_stream.entry(cid).or_default().extend(hits);
+                }
+                gi = upto;
+                open_hits_max = open_hits_max.max(acc_stream.values().map(|v| v.len()).sum());
+                // Everything below the next window's first candidate is final.
+                let bound = groups.get(gi).map(|g| g.lo_cid).unwrap_or(u32::MAX);
+                let mut flushed = drain_below(&mut acc_stream, bound);
+                n_materialized += flushed.len() as u64;
+                if !emit_batch(&mut flushed) {
+                    break;
+                }
             }
+            crate::memlog::report(
+                "extract hit accumulator (streamed)",
+                &[(
+                    "largest_open_payload",
+                    open_hits_max * std::mem::size_of::<Hit>(),
+                )],
+            );
+            info!(
+                materialized = n_materialized,
+                windows = groups.len(),
+                windows_in_flight = step,
+                "extract: candidates with evidence"
+            );
+        } else {
+            emit_batch(&mut cand_hits);
         }
         // A final empty chunk fixes the schema when no candidate was accepted at all.
         let _ = tx.send(ChromChunk::default().cols());
