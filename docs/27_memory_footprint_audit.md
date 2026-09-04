@@ -19,6 +19,63 @@ Two facts frame the whole plan:
    That doubling is the single most common cause of peak RSS in the codebase and
    is fixable once, in one crate.
 
+## 0. Measured status (2026-09-04)
+
+Section 1 below is the code-derived model the plan was written from. This section is what
+was then measured, on doxy (128 cores, 755 GB) with 32 threads, one HYE file
+(`LFQ_Orbitrap_AIF_Condition_B_Sample_Alpha_01.mzML`), the imported HYE library, a
+pre-fine-tuned precursor table (`rt_im_train.finetune_deeplc = false`, so the RT model is
+identical across arms), Extended features, `compete.group_by = peptidoform_charge` and
+`nn_torch`. Peak resident set is `/usr/bin/time -v` "Maximum resident set size", which is
+authoritative; `bench/mem_profile.py` sampled the process tree in parallel.
+
+Whole-run A/B, both arms stopped at 42 min during rescore, after the peak was set:
+
+| arm | peak RSS |
+|-----|----------|
+| before (`52c2927`) | 231.0 GiB |
+| streaming + f32 (`503eadb`) | 86.6 GiB |
+
+Per-buffer payload from `mumdia::memlog` on the instrumented build (`1d1ed7f`), at
+2,603,894 candidates and 38.9M chromatogram rows:
+
+| buffer | GiB |
+|--------|-----|
+| library steady state | 2.26 |
+| MS2 scans | 1.41 |
+| MS1 scans | 0.02 |
+| extract traces, largest chunk in flight | 0.074 (61.8 streamed) |
+| features chromatogram store | 62.68 (fragment 48.22 + MS1 XIC 14.46) |
+| features `fmap` value matrix | 7.51 |
+| rescore feature matrix | 4.05 (features 3.75 + metadata 0.30) |
+
+The incremental writer removed extract's whole-run trace residency as intended, and the
+peak moved to features, which re-materialised the traces the writer had just streamed out.
+The gap between the 70.2 GiB of named payload and the 86.6 GiB sampled peak is Arrow
+batches, the per-PSM extended-value vectors, and allocator slack.
+
+Sampler rows of the streaming/f32 arm, in stage order (that run predates the `stage=` regex
+fix in `5aa0eb6`, so the TSV labels are unusable and this mapping is by order, not label):
+convert 0.20 GiB / 13 s, search-seed 6.78 / 20 s, rt-im-train 5.19 / 2 s, extract 61.31 /
+312 s, features 86.64 / 305 s, compete 4.53 / 29 s, rescore 31.48 / killed.
+
+State of the plan in section 3:
+
+| item | state | measured effect |
+|------|-------|-----------------|
+| 3.1 streaming typed readers | shipped `503eadb` | part of 231.0 -> 86.6 GiB |
+| 3.2 extract incremental write | shipped `503eadb` | trace residency 61.8 GiB -> 0.074 GiB in flight |
+| 3.3 f32 bulk arrays | shipped `503eadb` | library 26 -> 22 B per fragment row; rescore matrix halved |
+| 3.4 features chunked | shipped | features stage 86.6 -> 3.03 GiB |
+| 3.5 rescore flat f32 matrix | half shipped `503eadb` | matrix is flat f32; the binary sidecar handoff and the early drop are not done |
+| 3.6 quant reads accepted rows | shipped `503eadb` | |
+| 3.7 compete key columns | shipped `503eadb` | |
+| 3.8 convert batched write | shipped `503eadb` | |
+| 3.9 library streamed load | shipped `503eadb` | removes the 23 GiB Arrow transient |
+
+With features fixed, the tallest stage on this file is extract at about 61 GiB, which is
+the next ceiling (section 4, window-streaming extract).
+
 ## 1. Static memory model per stage
 
 All sizes are resident-set estimates derived from the code. Symbols: `P` = MS2
@@ -220,15 +277,38 @@ The task note allows a precision change; the direction that saves memory is
 f64 to f32 for storage, with f64 kept for arithmetic, and that is what this
 plan does.
 
-### 3.4 features: chunked computation
+### 3.4 features: chunked computation (shipped)
 
-With 3.1 in place, iterate the chromatogram table batch by batch (candidate
-groups do not span batches if extract writes one row group per window, 3.2),
-compute the `D` features for that chunk, and append a row group to the features
-parquet. Resident: one chunk of traces plus `D x chunk` feature values. Removes
-the `8 N D` matrix entirely. Requires the "rank-0 row carries the shared
-chromatogram" convention (`extract.rs:2330`) to be satisfied within a chunk,
-which it is when chunks align with extract's row groups.
+The stage processes the run in chunks of at most `CHUNK_CHROM_ROWS` (2^20)
+chromatogram rows, cut so that a candidate is never split, and appends one row
+group per chunk. Three parts:
+
+- `plan_chunks` fixes the boundaries from the `candidate_id` column of both
+  tables, which is all that is read up front. Extract emits a PSM row and that
+  row's chromatogram rows in one pass, so both tables carry the same candidates
+  in the same order with each candidate's rows contiguous. That invariant is
+  verified, not assumed: a table that cannot be joined this way is a hard error
+  naming the artifact.
+- the chunk store shares one RT axis across the rows of a candidate (window-grid
+  extraction gives every fragment of a candidate the identical axis) and holds
+  one flat buffer per array with interned fragment names, instead of two `Vec`s
+  and a `String` per row. That halves the traces by itself: a 62.7 GiB store
+  became 33.2 GiB streamed.
+- `ValueMatrix` is one flat column-major buffer per chunk in place of the
+  `HashMap<&str, Vec<f64>>`, and the PIN is written row by row as chunks are
+  computed.
+
+Cost: `bound_from_confident` (default on) needs the global elution half-widths
+before the first feature, so it takes one extra streaming pass, which decodes but
+never copies the rows of non-confident candidates.
+
+Measured on the artifacts of the arm in section 0, against the features table
+that arm wrote: peak RSS 86.6 -> 3.03 GiB, 38 chunks, largest chunk 0.92 GiB of
+traces plus 0.21 GiB of feature values, all 398 columns of 2,603,894 rows
+identical. Wall time 7:15 against 5:05; the extra pass is the difference.
+`run_with_chunk_rows` exposes the chunk size, and the pipeline test runs one
+chunk against one candidate per chunk, comparing every f64 column bit for bit
+plus the PIN bytes.
 
 ### 3.5 rescore: flat f32 matrix and a binary sidecar handoff
 
@@ -339,7 +419,8 @@ On the Linux server the same can be cross-checked per stage with
 authoritative number; the sampler can undercount transients shorter than the
 sampling interval.
 
-Status as of 2026-09-04: this document is a code-derived (static) profile. The
-harness is written but the baseline run has not been executed in this repository
-yet; fill section 1 with measured numbers from the first run before changing
-code, so that each item in section 3 can be credited with a measured delta.
+Status as of 2026-09-04: section 1 remains the code-derived (static) model; section 0
+carries the measured numbers and the state of each plan item. Sections 3.1-3.3 and
+3.6-3.9 shipped in `503eadb`, 3.4 in the commit that added this paragraph, and 3.5 is
+half done. The next measurement to take is a full `mumdia run` on the current build,
+which should show extract as the tallest stage at about 61 GiB.
