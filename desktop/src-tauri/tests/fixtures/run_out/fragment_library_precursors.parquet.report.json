@@ -1,0 +1,21 @@
+{
+  "logical_name": "fragment_library_precursors",
+  "schema_name": "fragment_library_precursors",
+  "schema_version": 1,
+  "stage": "predict-frag",
+  "rows": 3820,
+  "content_hash": "9516998ec891009f8131080baac32c108d58dbff11f382556601d54f084d9394",
+  "params": {
+    "fragment_predictor": "Native",
+    "ms2pip_model": "HCD",
+    "rt_predictor": "Native",
+    "top_n": 6
+  },
+  "stats": {
+    "candidates": 3820,
+    "fragments": 22920,
+    "parse_errors": 0
+  },
+  "model_identity": "native-rt-v1; native-frag-v1",
+  "elapsed_ms": 15
+}

@@ -1,0 +1,25 @@
+{
+  "logical_name": "psms_extracted",
+  "schema_name": "psms_extracted",
+  "schema_version": 2,
+  "stage": "extract",
+  "rows": 284,
+  "content_hash": "7f2eae351f0d936467458d3ef2942b020f93fc9b72d7484e2c3a08942f44d033",
+  "params": {
+    "effective_frag_tol_ppm": 5.0,
+    "frag_ppm_offset": -0.00026103398249893126,
+    "frag_tol_ppm": 20.0,
+    "gate_coelution_min": 0.5,
+    "gate_min_score": 0.2,
+    "gate_mode": "apex_pearson",
+    "presence_min_coelution": 2,
+    "presence_min_fragments": 3,
+    "scan_window": 3
+  },
+  "stats": {
+    "accepted": 284,
+    "scan_window": 3
+  },
+  "model_identity": null,
+  "elapsed_ms": 11
+}
