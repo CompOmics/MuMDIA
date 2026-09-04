@@ -1,0 +1,26 @@
+[package]
+name = "mumdia-console"
+version = "0.1.0"
+edition = "2021"
+description = "Desktop interface for the MuMDIA DIA search engine"
+license = "Apache-2.0"
+publish = false
+
+[lib]
+name = "mumdia_console"
+path = "src/lib.rs"
+
+# The Tauri shell. Named with a hyphen because that is the executable users see;
+# the library keeps the underscore Rust requires.
+[[bin]]
+name = "mumdia-console"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

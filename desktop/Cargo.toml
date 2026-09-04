@@ -1,0 +1,21 @@
+# Separate workspace, deliberately.
+#
+# The desktop application is NOT a member of `rust/mumdia`'s workspace and does not
+# depend on the `mumdia` crate. Two reasons:
+#
+#   1. It spawns the engine as a child process rather than linking it, so there is
+#      nothing to depend on. See src-tauri/src/run.rs for why (the engine has no
+#      signal handling, and a linked engine could not be stopped).
+#   2. Keeping Tauri out of the engine workspace means `cargo test --workspace` and
+#      the CI lint job never compile a webview.
+[workspace]
+members = ["src-tauri"]
+resolver = "2"
+
+# Optimise the shipped application for size rather than speed: it is a window and a
+# process supervisor, and every millisecond of real work happens in the engine.
+[profile.release]
+strip = true
+opt-level = "s"
+lto = true
+codegen-units = 1
