@@ -81,15 +81,27 @@ State of the plan in section 3:
 | 3.2 extract incremental write | shipped `503eadb` | trace residency 61.8 GiB -> 0.074 GiB in flight |
 | 3.3 f32 bulk arrays | shipped `503eadb` | library 26 -> 22 B per fragment row; rescore matrix halved |
 | 3.4 features chunked | shipped | features stage 86.6 -> 3.03 GiB |
+| 3.10 extract window-closing flush | shipped | extract stage 61.33 -> 28.13 GiB |
 | 3.5 rescore flat f32 matrix | half shipped `503eadb` | matrix is flat f32; the binary sidecar handoff and the early drop are not done |
 | 3.6 quant reads accepted rows | shipped `503eadb` | |
 | 3.7 compete key columns | shipped `503eadb` | |
 | 3.8 convert batched write | shipped `503eadb` | |
 | 3.9 library streamed load | shipped `503eadb` | removes the 23 GiB Arrow transient |
 
-With features fixed at 3.03 GiB, the tallest stage on this file is extract at 61.38 GiB,
-which is the next ceiling (section 4, window-streaming extract), followed by rescore at
-33.04 GiB.
+Extract was then instrumented the same way, because only 3.8 GiB of its 61.38 GiB was
+named. The whole-run hit accumulator (`acc: HashMap<u32, Vec<Hit>>`) holds
+1,607,661,233 hits over 8,761,136 candidates, 183 per candidate:
+
+| part | GiB |
+|------|-----|
+| hits payload (24 B per `Hit`) | 35.93 |
+| growth slack | 1.83 |
+| `Vec` spine | 0.20 |
+| hash table | 0.45 |
+
+Flushing candidates as their windows close (section 3.10) took that stage to 28.13 GiB at
+identical output. The tallest stage on this file is now rescore at 33.04 GiB, which is the
+Rust process and the NN sidecar together, i.e. item 3.5.
 
 ## 1. Static memory model per stage
 
@@ -370,6 +382,31 @@ one batch, i.e. about 26 B per fragment row (22 after 3.3) with no 23 GB Arrow
 transient. This is what makes the modification-expanded library fit on 32 GB
 (657M rows x 22 B = 14.5 GB).
 
+### 3.10 extract: flush candidates as their windows close (shipped)
+
+Extract probed every isolation window, merged all hits into one accumulator, and only then
+scored candidates. Windows are probed in ascending m/z and precursors are sorted by m/z,
+so once the next window's candidate range starts at some id, no later window can add a hit
+below it: every candidate below that bound is final. The stage now probes a batch of
+windows, merges the partials in window order, then scores and writes everything the next
+batch cannot touch.
+
+The ascending-bound argument does not assume disjoint windows, which matters here: the
+benchmark acquisition is 151 staggered 8 Th windows stepping 4 Th, so every window overlaps
+its neighbour and each candidate is matched by two of them. A decomposition that assumed
+one window per candidate would be wrong on this data.
+
+`GROUPS_IN_FLIGHT` is the thread count, because a window is both the unit of parallelism
+and the unit of memory. Measured: 61.33 -> 28.13 GiB, largest open accumulator 11.94 GiB,
+wall 6:08 against 6:10, both output tables identical value for value (2,603,894 PSM rows
+over 21 columns, 38,889,646 chromatogram rows over 7, traces included).
+
+What remains in this stage: a batch's partials coexist with the accumulator during the
+merge, which is most of the 28.13 GiB that is not the 11.94 GiB of open hits. Merging each
+window's partial as it completes (in window order, to keep the hit sequence) or
+parallelising within a window instead of across windows would both cut it, the latter at
+the cost of rebuilding the per-window narrowing cache per scan chunk.
+
 ## 4. Rewrite candidates (structural changes beyond the items above)
 
 - **Extract as a window-streaming pipeline.** Load only the scans of the
@@ -436,6 +473,7 @@ sampling interval.
 
 Status as of 2026-09-04: section 1 remains the code-derived (static) model; section 0
 carries the measured numbers and the state of each plan item. Sections 3.1-3.3 and
-3.6-3.9 shipped in `503eadb`, 3.4 in the commit that added this paragraph, and 3.5 is
-half done. The next measurement to take is a full `mumdia run` on the current build, which should
-show extract as the tallest stage at 61.38 GiB.
+3.6-3.9 shipped in `503eadb`, 3.4 and 3.10 in the commits that added those sections, and
+3.5 is half done. Stage peaks on the benchmark are now rescore 33.04 GiB, extract 28.13
+GiB and features 3.03 GiB, so the next lever is 3.5, the rescore sidecar handoff, and the
+measurement to take is a full `mumdia run` on the current build.
