@@ -32,7 +32,7 @@
 # Dependabot's `docker` ecosystem (.github/dependabot.yml) proposes digest updates,
 # so pinning does not mean going stale silently.
 # Resolved 2026-08-28 from registry-1.docker.io.
-FROM rust:1.96-bookworm@sha256:a339861ae23e9abb272cea45dfafde21760d2ce6577a70f8a926153677902663 AS build
+FROM rust:1.98-bookworm@sha256:82150a52ec202c1b14d7817e14516c392bb7f5cfebd88f1ed531cb37ebd39922 AS build
 # Override any (gitignored, machine-specific) .cargo/config.toml target dir.
 ENV CARGO_TARGET_DIR=/build
 WORKDIR /src
