@@ -36,7 +36,9 @@ except ImportError:  # pragma: no cover
 
 GB = 1024**3
 ANSI_RE = re.compile(r"\[[0-9;]*[A-Za-z]")
-DEFAULT_STAGE_REGEX = r"(?i)\bstage[=: ]+\s*\"?([A-Za-z_][A-Za-z0-9_\-]*)"
+# Match the tracing FIELD `stage=extract`, not the message text "stage start". The
+# previous pattern accepted the words "stage start" and labelled every stage `start`.
+DEFAULT_STAGE_REGEX = r"(?i)\bstage=\"?([A-Za-z_][A-Za-z0-9_\-]*)"
 
 
 def tree_rss(root: psutil.Process) -> tuple[int, int]:
