@@ -9,8 +9,16 @@ use mumdia_core::config::Config;
 /// Per-thread-arena allocator. The extraction accumulation allocates heavily inside
 /// rayon workers and measured only ~1.07x parallel scaling under the Windows system
 /// allocator's shared heap lock. Swapping the allocator changes no results.
+#[cfg(not(feature = "dhat-heap"))]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+/// Heap-profiling build (`--features dhat-heap`): dhat has to own the global allocator,
+/// so mimalloc steps aside. Results are unchanged; speed is not, which is why this is a
+/// build-time opt-in and not a flag.
+#[cfg(feature = "dhat-heap")]
+#[global_allocator]
+static GLOBAL: dhat::Alloc = dhat::Alloc;
 
 #[derive(Parser)]
 #[command(
@@ -442,6 +450,10 @@ fn load_config(_path: &Option<String>) -> Result<Config> {
 }
 
 fn main() -> Result<()> {
+    // Held for the whole process: dropping the guard is what writes dhat-heap.json into
+    // the working directory, so it must outlive the stage that is being profiled.
+    #[cfg(feature = "dhat-heap")]
+    let _dhat = dhat::Profiler::new_heap();
     mumdia_io::init_logging();
     let cli = Cli::parse();
     match cli.cmd {

@@ -347,6 +347,19 @@ impl Library {
             }
         }
 
+        crate::memlog::report(
+            "library steady state",
+            &[
+                ("frag_mz", crate::memlog::bytes_of(&frag_mz)),
+                ("frag_int", crate::memlog::bytes_of(&frag_int)),
+                ("frag_name_id", crate::memlog::bytes_of(&frag_name_id)),
+                ("idx_mz", crate::memlog::bytes_of(&idx_mz)),
+                ("idx_cid", crate::memlog::bytes_of(&idx_cid)),
+                ("idx_int", crate::memlog::bytes_of(&idx_int)),
+                ("cands", crate::memlog::bytes_of(&cands)),
+                ("prec_mz", crate::memlog::bytes_of(&prec_mz)),
+            ],
+        );
         Ok(Library {
             cands,
             frag_mz,

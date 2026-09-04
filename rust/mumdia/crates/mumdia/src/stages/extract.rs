@@ -2374,6 +2374,11 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
     // copy in the Arrow builders) being resident at one final write. The bounded channel
     // keeps at most a few chunks in flight between the extraction threads and the encoder.
     let mut n_accepted = 0u64;
+    // Trace payload accounting: what one chunk holds between extraction and encoding is
+    // the whole point of the incremental writer, so record the largest chunk alongside
+    // the run total that the old "accumulate everything, then write" path held at once.
+    let mut chrom_bytes_total = 0usize;
+    let mut chrom_bytes_max_chunk = 0usize;
     // Top-K retained peaks (opt-in; empty for K=1).
     let (mut pk_cid, mut pk_rank): (Vec<u32>, Vec<i32>) = (Vec::new(), Vec::new());
     let (mut pk_apex, mut pk_start, mut pk_end): (Vec<f64>, Vec<f64>, Vec<f64>) =
@@ -2454,6 +2459,15 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
                     ch.int.push(it);
                 }
             }
+            let chunk_bytes = crate::memlog::bytes_of_nested(&ch.rt)
+                + crate::memlog::bytes_of_nested(&ch.int)
+                + crate::memlog::bytes_of(&ch.cid)
+                + crate::memlog::bytes_of(&ch.fmz)
+                + crate::memlog::bytes_of(&ch.obsmz)
+                + crate::memlog::bytes_of(&ch.pint)
+                + ch.name.iter().map(|s| s.len()).sum::<usize>();
+            chrom_bytes_total += chunk_bytes;
+            chrom_bytes_max_chunk = chrom_bytes_max_chunk.max(chunk_bytes);
             // Hand the chunk's chromatogram rows to the writer thread. A send error means
             // the writer failed; its error surfaces at the join below.
             if tx.send(ch.cols()).is_err() {
@@ -2463,9 +2477,17 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
         // A final empty chunk fixes the schema when no candidate was accepted at all.
         let _ = tx.send(ChromChunk::default().cols());
         drop(tx);
-        writer
+        let n = writer
             .join()
-            .map_err(|_| anyhow::anyhow!("chromatogram writer thread panicked"))?
+            .map_err(|_| anyhow::anyhow!("chromatogram writer thread panicked"))?;
+        crate::memlog::report(
+            "extract chromatogram traces",
+            &[
+                ("largest_chunk_in_flight", chrom_bytes_max_chunk),
+                ("run_total_streamed", chrom_bytes_total),
+            ],
+        );
+        n
     })?;
 
     // Spectrum-centric NNLS demixing (D2), second pass: solve ONCE PER APEX SCAN.

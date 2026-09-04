@@ -103,6 +103,17 @@ pub fn load_ms2(path: &str) -> Result<Vec<Ms2Scan>> {
         Ok(())
     })?;
     out.sort_by(|a, b| a.rt_seconds.partial_cmp(&b.rt_seconds).unwrap());
+    let peak_bytes: usize = out
+        .iter()
+        .map(|s| std::mem::size_of_val(s.peaks.as_slice()))
+        .sum();
+    crate::memlog::report(
+        "ms2 scans",
+        &[
+            ("peaks", peak_bytes),
+            ("scan_spine", std::mem::size_of_val(out.as_slice())),
+        ],
+    );
     Ok(out)
 }
 
@@ -142,5 +153,21 @@ pub fn load_ms1(path: &str) -> Result<Vec<Ms1Scan>> {
         Ok(())
     })?;
     out.sort_by(|a, b| a.rt_seconds.partial_cmp(&b.rt_seconds).unwrap());
+    let mz_bytes: usize = out
+        .iter()
+        .map(|s| std::mem::size_of_val(s.mz.as_slice()))
+        .sum();
+    let int_bytes: usize = out
+        .iter()
+        .map(|s| std::mem::size_of_val(s.intensity.as_slice()))
+        .sum();
+    crate::memlog::report(
+        "ms1 scans",
+        &[
+            ("mz", mz_bytes),
+            ("intensity", int_bytes),
+            ("scan_spine", std::mem::size_of_val(out.as_slice())),
+        ],
+    );
     Ok(out)
 }

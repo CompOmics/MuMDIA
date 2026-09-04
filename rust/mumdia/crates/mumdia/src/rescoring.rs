@@ -58,6 +58,11 @@ impl FeatureMatrix {
         Ok(self)
     }
 
+    /// Payload bytes of the value buffer, for the memory accounting.
+    pub fn bytes(&self) -> usize {
+        std::mem::size_of_val(self.values.as_slice())
+    }
+
     pub fn n_features(&self) -> usize {
         self.n_features
     }

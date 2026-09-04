@@ -723,6 +723,39 @@ pub fn run(p: FeaturesParams) -> Result<u64> {
         }
     }
     drop((ch_cid, ch_name, ch_fmz, ch_obsmz, ch_pint));
+    {
+        // Traces of the whole run, grouped by candidate: the structure the audit ranks
+        // third, and the one plan item 3.4 (chunked features) would remove.
+        let store = |m: &HashMap<u32, Vec<ChromRow>>| -> (usize, usize) {
+            let mut rows = 0usize;
+            let mut bytes = 0usize;
+            for v in m.values() {
+                rows += v.len();
+                bytes += std::mem::size_of_val(v.as_slice());
+                for r in v {
+                    bytes += crate::memlog::bytes_of(&r.rt)
+                        + crate::memlog::bytes_of(&r.inten)
+                        + r.frag_name.len();
+                }
+            }
+            (rows, bytes)
+        };
+        let (frag_rows, frag_bytes) = store(&chrom);
+        let (ms1_rows, ms1_bytes) = store(&ms1x);
+        crate::memlog::report(
+            "features chromatogram store",
+            &[
+                ("fragment_traces", frag_bytes),
+                ("ms1_xic_traces", ms1_bytes),
+            ],
+        );
+        info!(
+            candidates = chrom.len(),
+            fragment_rows = frag_rows,
+            ms1_rows = ms1_rows,
+            "mem: features chromatogram store shape"
+        );
+    }
 
     // Seed corroboration maps (candidate_id -> seed score / identified flag) plus the
     // confident-target candidate set (spectrum_q <= 0.01, label == target) used to
@@ -1036,6 +1069,16 @@ pub fn run(p: FeaturesParams) -> Result<u64> {
     // and performed ~580M string-keyed HashMap lookups. Byte output is unchanged. It is
     // written before the table because the table build below MOVES the feature columns out
     // of the map instead of cloning them.
+    crate::memlog::report(
+        "features value matrix",
+        &[(
+            "fmap",
+            fmap.values()
+                .map(|v| crate::memlog::bytes_of(v))
+                .sum::<usize>()
+                + fmap.len() * std::mem::size_of::<Vec<f64>>(),
+        )],
+    );
     if p.cfg.emit_pin {
         let empty: Vec<f64> = Vec::new();
         let fcols: Vec<&Vec<f64>> = cols_active

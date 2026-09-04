@@ -23,6 +23,15 @@ use crate::stages::features::FeatureSchema;
 /// (~16k rows x 387 f64 is about 50 MB per batch).
 const FEATURE_BATCH_ROWS: usize = 1 << 14;
 
+/// Payload bytes of the per-PSM metadata columns that stay resident beside the feature
+/// matrix for the whole stage (the strings dominate: one heap allocation per PSM each).
+fn meta_bytes(cid: &[u32], label: &[String], pform: &[String], protein: &[String]) -> usize {
+    let strs = |v: &[String]| -> usize {
+        std::mem::size_of_val(v) + v.iter().map(|s| s.len()).sum::<usize>()
+    };
+    std::mem::size_of_val(cid) + strs(label) + strs(pform) + strs(protein)
+}
+
 /// Which empirical null the q-values are computed against.
 #[derive(Clone, Copy, PartialEq)]
 enum QMode {
@@ -162,6 +171,16 @@ pub fn run(p: RescoreParams) -> Result<u64> {
         }
     }
     let feats = matrix.finish()?;
+    crate::memlog::report(
+        "rescore feature matrix",
+        &[
+            ("feats", feats.bytes()),
+            (
+                "metadata_columns",
+                meta_bytes(&cid, &label, &pform, &protein),
+            ),
+        ],
+    );
     crate::fdr::validate_labels(&label)?;
     let is_decoy: Vec<bool> = label.iter().map(|l| l == "decoy").collect();
     let (mut is_entrapment, mut is_real_target) = classify_entrapment(p.cfg, &protein, &is_decoy);
