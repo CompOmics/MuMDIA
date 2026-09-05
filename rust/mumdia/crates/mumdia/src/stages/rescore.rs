@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context as _, Result};
 use arrow::array::{Array, Float64Array};
 use mumdia_core::config::{RescoreConfig, RescorerKind};
 use mumdia_core::schema::artifact;
@@ -87,7 +87,19 @@ pub fn run(p: RescoreParams) -> Result<u64> {
     // subsequent companion must match exactly: silently concatenating differing
     // feature order/sets would train and score on semantically misaligned columns.
     let expected_schema = FeatureSchema::read(&p.competed[0])?;
-    let feat_names = expected_schema.feature_columns.clone();
+    // The classifier's input columns. Without `rescore.features`/`features_file` this is
+    // every feature the competed table carries; with them it is a projection of that list,
+    // in schema order, and the matrix, the sidecar handoff and the training all shrink
+    // with it. The list actually used is recorded in the artifact report below, which is
+    // the source of truth for what the classifier saw.
+    let feat_names = resolve_feature_subset(p.cfg, &expected_schema.feature_columns)?;
+    if feat_names.len() != expected_schema.feature_columns.len() {
+        info!(
+            selected = feat_names.len(),
+            available = expected_schema.feature_columns.len(),
+            "rescore: feature subset active"
+        );
+    }
     // Total rows across the inputs, from the parquet footers, so the flat matrix is
     // allocated once at its final size.
     let mut total_rows = 0usize;
@@ -642,6 +654,18 @@ pub fn run(p: RescoreParams) -> Result<u64> {
             "num_iter": p.cfg.num_iter,
             "train_fdr": p.cfg.train_fdr,
             "feature_schema_id": expected_schema.schema_id,
+            "train_neg_ratio": p.cfg.train_neg_ratio,
+            "train_neg_select": format!("{:?}", p.cfg.train_neg_select).to_lowercase(),
+            "train_subsample": p.cfg.train_subsample,
+            "train_warm_epochs": p.cfg.train_warm_epochs,
+            "n_features_used": feat_names.len(),
+            "n_features_available": expected_schema.feature_columns.len(),
+            "feature_selection_id": crate::stages::features::feature_schema_id(&feat_names),
+            "features_used": if feat_names.len() == expected_schema.feature_columns.len() {
+                serde_json::Value::Null
+            } else {
+                json!(feat_names)
+            },
             "competed_inputs": p.competed,
             "config_hash": p.config_hash,
         }),
@@ -665,6 +689,51 @@ pub fn run(p: RescoreParams) -> Result<u64> {
 /// ordered feature columns. Both checks are intentional: the ID catches a
 /// declared contract mismatch, while the explicit column comparison protects
 /// against a malformed or manually edited companion.
+/// The classifier's feature columns: every column of the schema, or the projection named
+/// by `rescore.features` / `rescore.features_file`.
+///
+/// The result keeps SCHEMA order, not the order the caller listed, so a selection can
+/// never silently reorder the matrix (the sidecar contract is positional). A name that is
+/// not in the schema is an error rather than a silent drop: a typo in a 100-name list
+/// would otherwise train a different model than the one asked for.
+fn resolve_feature_subset(cfg: &RescoreConfig, available: &[String]) -> Result<Vec<String>> {
+    let wanted: Vec<String> = match (&cfg.features, &cfg.features_file) {
+        (Some(_), Some(_)) => anyhow::bail!(
+            "rescore.features and rescore.features_file are mutually exclusive; set one"
+        ),
+        (None, None) => return Ok(available.to_vec()),
+        (Some(list), None) => list.clone(),
+        (None, Some(path)) => std::fs::read_to_string(path)
+            .with_context(|| format!("reading rescore.features_file {path}"))?
+            .lines()
+            .map(|l| l.split('#').next().unwrap_or("").trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect(),
+    };
+    if wanted.is_empty() {
+        anyhow::bail!("rescore feature selection resolved to an empty list");
+    }
+    let have: std::collections::HashSet<&str> = available.iter().map(String::as_str).collect();
+    let missing: Vec<&String> = wanted
+        .iter()
+        .filter(|w| !have.contains(w.as_str()))
+        .collect();
+    if !missing.is_empty() {
+        anyhow::bail!(
+            "rescore feature selection names {} column(s) absent from the competed table's \
+             feature schema, first few: {:?}",
+            missing.len(),
+            missing.iter().take(5).collect::<Vec<_>>()
+        );
+    }
+    let keep: std::collections::HashSet<&str> = wanted.iter().map(String::as_str).collect();
+    Ok(available
+        .iter()
+        .filter(|a| keep.contains(a.as_str()))
+        .cloned()
+        .collect())
+}
+
 fn validate_feature_schema(
     expected: &FeatureSchema,
     actual: &FeatureSchema,
@@ -1083,6 +1152,28 @@ fn run_pin_sidecar(
         .env("MUMDIA_NN_FOLDS", p.cfg.folds.to_string())
         .env("MUMDIA_NN_ITERS", p.cfg.num_iter.to_string())
         .env("MUMDIA_NN_TRAIN_FDR", p.cfg.train_fdr.to_string())
+        // Training-set reduction. Passed unconditionally so the report and the worker
+        // agree on what ran; the defaults (0 / random) are the worker's own, so an
+        // unconfigured run behaves exactly as before.
+        .env("MUMDIA_NN_NEG_RATIO", p.cfg.train_neg_ratio.to_string())
+        .env(
+            "MUMDIA_NN_NEG_SELECT",
+            match p.cfg.train_neg_select {
+                mumdia_core::config::NegSelect::Random => "random",
+                mumdia_core::config::NegSelect::Margin => "margin",
+                mumdia_core::config::NegSelect::Hybrid => "hybrid",
+            },
+        )
+        .env("MUMDIA_NN_TRAIN_SUB", p.cfg.train_subsample.to_string())
+        .env(
+            "MUMDIA_NN_WARM_START",
+            if p.cfg.train_warm_epochs > 0 {
+                "1"
+            } else {
+                "0"
+            },
+        )
+        .env("MUMDIA_NN_WARM_EPOCHS", p.cfg.train_warm_epochs.to_string())
         .spawn()
         .map_err(|e| {
             // A bare `.spawn()?` reported only "No such file or directory (os error 2)" with
@@ -1150,6 +1241,61 @@ fn align_sidecar_scores(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn cfg_with(features: Option<Vec<&str>>, file: Option<&str>) -> RescoreConfig {
+        RescoreConfig {
+            features: features.map(|v| v.into_iter().map(String::from).collect()),
+            features_file: file.map(String::from),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn feature_subset_projects_in_schema_order_and_defaults_to_all() {
+        let avail: Vec<String> = ["a", "b", "c", "d"].iter().map(|s| s.to_string()).collect();
+        // No selection: every column, untouched.
+        assert_eq!(
+            resolve_feature_subset(&cfg_with(None, None), &avail).unwrap(),
+            avail
+        );
+        // A selection is a projection: schema order wins over the order asked for, and
+        // duplicates collapse, because the sidecar contract is positional.
+        let got =
+            resolve_feature_subset(&cfg_with(Some(vec!["d", "a", "d"]), None), &avail).unwrap();
+        assert_eq!(got, vec!["a".to_string(), "d".to_string()]);
+    }
+
+    #[test]
+    fn feature_subset_rejects_unknown_names_and_bad_configuration() {
+        let avail: Vec<String> = ["a", "b"].iter().map(|s| s.to_string()).collect();
+        let e = resolve_feature_subset(&cfg_with(Some(vec!["a", "zz"]), None), &avail).unwrap_err();
+        assert!(format!("{e}").contains("zz"), "{e}");
+        let e = resolve_feature_subset(&cfg_with(Some(vec![]), None), &avail).unwrap_err();
+        assert!(format!("{e}").contains("empty"), "{e}");
+        let e =
+            resolve_feature_subset(&cfg_with(Some(vec!["a"]), Some("f.txt")), &avail).unwrap_err();
+        assert!(format!("{e}").contains("mutually exclusive"), "{e}");
+    }
+
+    #[test]
+    fn feature_subset_reads_a_list_file_ignoring_blanks_and_comments() {
+        let dir = std::env::temp_dir().join("mumdia_fs_subset_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("feats_{}.txt", std::process::id()));
+        std::fs::write(
+            &path,
+            "# picked by docs/28
+
+b
+  c  # trailing note
+",
+        )
+        .unwrap();
+        let avail: Vec<String> = ["a", "b", "c"].iter().map(|s| s.to_string()).collect();
+        let got =
+            resolve_feature_subset(&cfg_with(None, Some(path.to_str().unwrap())), &avail).unwrap();
+        assert_eq!(got, vec!["b".to_string(), "c".to_string()]);
+    }
 
     #[test]
     fn competed_feature_schema_must_match_id_and_ordered_columns() {

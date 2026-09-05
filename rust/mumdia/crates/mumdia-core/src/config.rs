@@ -1224,6 +1224,64 @@ pub struct RescoreConfig {
     /// dramatically faster on large pools but applies to nn_torch only.
     #[serde(default)]
     pub handoff: Handoff,
+    /// Restrict the classifier's input to these feature columns, by name. Absent (the
+    /// default) uses every feature the competed table carries.
+    ///
+    /// The restriction is a projection, not a reordering: the columns keep the order of
+    /// the feature schema, only those named are read out of the competed table, and the
+    /// matrix, the sidecar handoff and the training all shrink with the list. Feature
+    /// selection is a memory and I/O lever, not a speed one (docs/28 section 7), and any
+    /// list must clear the sensitivity gate before it becomes a default.
+    ///
+    /// Mutually exclusive with [`RescoreConfig::features_file`]. Every name must exist in
+    /// the competed table's schema; a missing one is an error, never a silent drop.
+    #[serde(default)]
+    pub features: Option<Vec<String>>,
+    /// The same restriction, read from a file with one feature name per line (blank lines
+    /// and `#` comments ignored), which is how a 100+ name list stays readable.
+    #[serde(default)]
+    pub features_file: Option<String>,
+    /// Cap the decoys the sidecar TRAINS on at this multiple of the targets it selected
+    /// that iteration; 0 (the default) trains on every decoy, which is about 19:1 on a
+    /// DIA pool and is where the rescore spends its time.
+    ///
+    /// This thins gradient steps only. Selection, scoring, target-decoy competition and
+    /// q-values still run over the full pool, so the cap cannot loosen the q threshold;
+    /// what it can move is the learned boundary, hence a knob and not a default.
+    #[serde(default)]
+    pub train_neg_ratio: f64,
+    /// Which decoys survive [`RescoreConfig::train_neg_ratio`]. See [`NegSelect`].
+    #[serde(default)]
+    pub train_neg_select: NegSelect,
+    /// Stratified thinning of whatever survived the cap: a fraction in (0, 1], or a row
+    /// cap when > 1. Positives and negatives are thinned by the same factor, so the class
+    /// balance is unchanged. 0 (the default) keeps every row.
+    #[serde(default)]
+    pub train_subsample: f64,
+    /// Reuse the previous iteration's weights and optimiser state, running this many
+    /// epochs from the second self-training iteration on instead of a full fresh fit.
+    /// 0 (the default) refits from scratch every iteration, which is 25 epochs x 10
+    /// iterations x 3 folds of the whole training set.
+    #[serde(default)]
+    pub train_warm_epochs: usize,
+}
+
+/// Which decoys survive the training-set negative cap.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NegSelect {
+    /// A uniform random sample of the fold's decoys. The population the model sees keeps
+    /// the shape of the real decoy distribution, only thinner.
+    #[default]
+    Random,
+    /// The highest-scoring decoys under the current model: the part of the decoy
+    /// distribution that still competes with accepted targets, and the only part the
+    /// decision boundary depends on. Trains on hard negatives only, so the model never
+    /// sees the easy bulk it must also keep rejecting.
+    Margin,
+    /// Half the budget from the margin, half sampled at random from the rest, so the
+    /// boundary is informed by the hard cases without losing the shape of the bulk.
+    Hybrid,
 }
 impl Default for RescoreConfig {
     fn default() -> Self {
@@ -1240,6 +1298,12 @@ impl Default for RescoreConfig {
             entrapment_ratio: 1.0,
             strict: true,
             handoff: Handoff::Tsv,
+            features: None,
+            features_file: None,
+            train_neg_ratio: 0.0,
+            train_neg_select: NegSelect::Random,
+            train_subsample: 0.0,
+            train_warm_epochs: 0,
         }
     }
 }

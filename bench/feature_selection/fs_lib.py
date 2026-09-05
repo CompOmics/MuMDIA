@@ -45,6 +45,23 @@ WORKER_DEFAULTS = dict(
     seed_base=0,
     device="cuda",
     score_step=4096 * 4,
+    # --- training-set reduction (all off by default = the shipped behaviour) ---
+    # neg_ratio: cap TRAINING negatives at this multiple of the positives selected this
+    # iteration (0 = every decoy, which is ~19:1 on HYE). neg_select decides WHICH decoys
+    # survive the cap: "random" is the worker's existing behaviour, "margin" keeps the
+    # highest-scoring (most target-like, hardest) ones, "hybrid" splits the budget between
+    # the two so the model still sees the easy bulk it must keep rejecting.
+    neg_ratio=0.0,
+    neg_select="random",
+    margin_frac=0.5,
+    # train_sub: stratified thinning of whatever survived the cap (fraction, or a row cap
+    # if > 1). Positives and negatives are thinned by the same factor, so pos_weight and
+    # the class balance are unchanged and only the number of gradient steps falls.
+    train_sub=0.0,
+    # warm start: reuse the previous iteration's weights and Adam state, running
+    # warm_epochs instead of epochs from the second iteration on.
+    warm_start=False,
+    warm_epochs=0,
 )
 
 
@@ -229,15 +246,19 @@ def run_rescoring(d: dict, cols: list[int] | None = None, cfg: dict | None = Non
         def forward(self, x):
             return self.net(x).squeeze(-1)
 
-    def train_model(train_idx, pos_weight, seed):
+    def train_model(train_idx, pos_weight, seed, warm=None, epochs=None):
         torch.manual_seed(seed)
-        m = MLP(nf, list(cfg["hidden"]), cfg["dropout"]).to(dev)
-        opt = torch.optim.Adam(m.parameters(), lr=cfg["lr"], weight_decay=cfg["wd"])
+        if warm is None:
+            m = MLP(nf, list(cfg["hidden"]), cfg["dropout"]).to(dev)
+            opt = torch.optim.Adam(m.parameters(), lr=cfg["lr"], weight_decay=cfg["wd"])
+        else:
+            m, opt = warm
         lossf = nn.BCEWithLogitsLoss(pos_weight=torch.tensor(pos_weight, device=dev))
         idx_t = torch.as_tensor(np.asarray(train_idx), device=dev)
         Xb, yb = Xt[idx_t], yt[idx_t]
         ntr, B = len(idx_t), cfg["batch"]
-        for _ in range(cfg["epochs"]):
+        n_ep = cfg["epochs"] if epochs is None else max(1, int(epochs))
+        for _ in range(n_ep):
             m.train()
             order = torch.from_numpy(np.random.permutation(ntr)).to(dev)
             n_use = ntr - 1 if (ntr % B) == 1 and ntr > B else ntr
@@ -247,7 +268,7 @@ def run_rescoring(d: dict, cols: list[int] | None = None, cfg: dict | None = Non
                 loss = lossf(m(Xb[b]).float(), yb[b])
                 loss.backward()
                 opt.step()
-        return m
+        return m, opt
 
     @torch.no_grad()
     def score_idx(m, idx):
@@ -266,6 +287,8 @@ def run_rescoring(d: dict, cols: list[int] | None = None, cfg: dict | None = Non
 
     iters_used = []
     inits = []
+    rows_per_fit: list[int] = []
+    row_epochs: list[int] = []
     t_start = time.time()
 
     def one_pass(seed):
@@ -281,7 +304,7 @@ def run_rescoring(d: dict, cols: list[int] | None = None, cfg: dict | None = Non
             inits.append((d["feat_cols"][cols[best_j]], best_sign, best_n))
             score_tr = (best_sign * X[tr_idx, best_j]).astype(np.float32)
             t = tick("init", t)
-            model = prev_pos = None
+            model = optim = prev_pos = None
             used = 0
             for _ in range(cfg["iters"]):
                 t = time.time()
@@ -294,9 +317,56 @@ def run_rescoring(d: dict, cols: list[int] | None = None, cfg: dict | None = Non
                     if cfg["early_stop"] and frac <= cfg["early_stop_tol"]:
                         break
                 prev_pos = pos
-                sel = tr_idx[pos | neg]
-                pw = float(neg.sum()) / max(1.0, float(pos.sum()))
-                model = train_model(sel, pw, seed)
+                pos_i, neg_i = tr_idx[pos], tr_idx[neg]
+                # Negative budget. The FDR-relevant selection above still ran over EVERY
+                # row of the fold; this only thins the rows the optimiser sees, which is
+                # why it cannot loosen the q threshold (scoring, competition and q-values
+                # all still use the full pool).
+                if cfg["neg_ratio"] > 0 and len(neg_i) > cfg["neg_ratio"] * len(pos_i):
+                    keep_n = max(1, int(round(cfg["neg_ratio"] * len(pos_i))))
+                    rs_n = np.random.RandomState(
+                        (int(seed) * 7919 + int(f) * 104729 + used * 31) % (2**32)
+                    )
+                    how = cfg["neg_select"]
+                    if how == "random":
+                        neg_i = rs_n.choice(neg_i, size=min(keep_n, len(neg_i)), replace=False)
+                    else:
+                        # Rank this fold's decoys by the CURRENT score: the top of that
+                        # ranking is the part of the decoy distribution that still competes
+                        # with accepted targets, i.e. the only part the boundary depends on.
+                        s_neg = score_tr[neg]
+                        order = np.argsort(-s_neg, kind="stable")
+                        if how == "margin":
+                            take = order[:keep_n]
+                        elif how == "hybrid":
+                            k_hard = max(1, int(round(cfg["margin_frac"] * keep_n)))
+                            hard = order[:k_hard]
+                            rest = order[k_hard:]
+                            k_rand = min(max(0, keep_n - k_hard), len(rest))
+                            rand = rs_n.choice(rest, size=k_rand, replace=False) if k_rand else np.empty(0, np.int64)
+                            take = np.concatenate([hard, rand]).astype(np.int64)
+                        else:
+                            raise ValueError(f"neg_select must be random|margin|hybrid, got {how!r}")
+                        neg_i = neg_i[np.sort(take)]
+                if cfg["train_sub"] > 0:
+                    tot = len(pos_i) + len(neg_i)
+                    frac_s = (
+                        cfg["train_sub"] if cfg["train_sub"] <= 1.0 else min(1.0, cfg["train_sub"] / max(1, tot))
+                    )
+                    rs = np.random.RandomState(
+                        (int(seed) * 1000003 + int(f) * 1009 + used) % (2**32)
+                    )
+                    kp = max(1, int(round(len(pos_i) * frac_s)))
+                    kn = max(1, int(round(len(neg_i) * frac_s)))
+                    pos_i = rs.choice(pos_i, size=min(kp, len(pos_i)), replace=False)
+                    neg_i = rs.choice(neg_i, size=min(kn, len(neg_i)), replace=False)
+                sel = np.sort(np.concatenate([pos_i, neg_i]))
+                rows_per_fit.append(len(sel))
+                pw = float(len(neg_i)) / max(1.0, float(len(pos_i)))
+                warm_in = (model, optim) if (cfg["warm_start"] and model is not None) else None
+                ep = cfg["warm_epochs"] if (cfg["warm_start"] and model is not None and cfg["warm_epochs"] > 0) else None
+                row_epochs.append(len(sel) * (cfg["epochs"] if ep is None else int(ep)))
+                model, optim = train_model(sel, pw, seed, warm=warm_in, epochs=ep)
                 if dev != "cpu":
                     torch.cuda.synchronize()
                 t = tick("train", t)
@@ -320,7 +390,16 @@ def run_rescoring(d: dict, cols: list[int] | None = None, cfg: dict | None = Non
     del Xt, yt
     if dev != "cpu":
         torch.cuda.empty_cache()
-    return dict(score=final, phase=phase, wall=wall, iters_used=iters_used, inits=inits, n_features=nf)
+    return dict(
+        score=final,
+        phase=phase,
+        wall=wall,
+        iters_used=iters_used,
+        inits=inits,
+        n_features=nf,
+        rows_per_fit=rows_per_fit,
+        row_epochs=row_epochs,
+    )
 
 
 def bench_subset(name: str, d: dict, cols: list[int] | None, cfg: dict | None = None, verbose: bool = False) -> dict:
@@ -333,6 +412,8 @@ def bench_subset(name: str, d: dict, cols: list[int] | None, cfg: dict | None = 
         wall_s=round(r["wall"], 1),
         train_s=round(r["phase"].get("train", 0.0), 1),
         iters=sum(r["iters_used"]),
+        rows_per_fit=int(np.mean(r["rows_per_fit"])) if r["rows_per_fit"] else 0,
+        row_epochs_m=round(sum(r["row_epochs"]) / 1e6, 1),
         init=";".join(sorted({i[0] for i in r["inits"]})),
     )
     print(row, flush=True)
