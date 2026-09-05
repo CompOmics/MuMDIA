@@ -708,7 +708,8 @@ docs/04_convert.md before setting the destructive one.
 | `min_seed_for_calibration` | 50 | min anchors before calibrating |
 | `loess_span` | 0.3 | LOESS local-fit fraction |
 | `fallback_rt_window_s` | 120.0 | fixed window when calibration cannot fit |
-| `finetune_deeplc` | `false` | **default-off** DeepLC multitask fine-tune (nondeterministic; needs `deeplc_python`) |
+| `finetune_deeplc` | `false` | **default-off** DeepLC fine-tune (nondeterministic; needs `deeplc_python`); the default RT path is prediction plus per-run LOESS calibration |
+| `library_irt` | `auto` | library-input mode only: `auto` re-predicts the imported iRT with the DeepLC base model when `deeplc_python` is set (else keeps it, with a warning), `deeplc` requires the interpreter, `library` keeps the imported values. Ignored under `finetune_deeplc`. `run-experiment` predicts once per experiment (docs/08 section 4c) |
 | `finetune_epochs` | 25 | fine-tune epoch cap (early stopping usually halts earlier) |
 | `finetune_patience` | 10 | early-stopping patience |
 | `finetune_batch` | 0 | 0 = auto-scale batch to seed size |
@@ -829,7 +830,15 @@ requiring entrapment/target-decoy FDR validation before use.
 | `entrapment_contaminant_markers` | `[]` | substrings that keep a spike-in hit as a real target |
 | `entrapment_ratio` | 1.0 | N_real_lib / N_entrap_lib scaling |
 | `strict` | `true` | fail on a rescorer sidecar failure or unsupported classifier; set false only for explicit compatibility fallback |
-| `handoff` | `tsv` | how the feature matrix reaches a sidecar rescorer (`Handoff`); `parquet` is dramatically faster on large pools but applies to `nn_torch` only |
+| `handoff` | `parquet` | how the feature matrix reaches a sidecar rescorer (`Handoff`); mokapot/entrapment fall back to TSV automatically (docs/28 section 11) |
+| `features` / `features_file` | `None` | explicit feature projection by name (inline list or one-name-per-line file); strict: a missing name is an error |
+| `feature_preset` | `all` | named list used when no explicit list is set: `all` every column, `compact` the embedded 114-feature list of docs/28 section 12 (3.4x smaller rescore matrix; the option for pooled rescoring on small machines, -1.2% on the held-out HYE B01 pool). Preset names the table lacks are skipped with a log line |
+| `train_neg_ratio` | 3.0 | cap on decoys per positive in each training fold (0 = every decoy) |
+| `train_neg_select` | `hybrid` | which decoys survive the cap: `random`, `margin` (highest-scoring), `hybrid` (`train_margin_frac` from the margin, rest random) |
+| `train_margin_frac` | 0.5 | margin share under `hybrid` |
+| `train_subsample` | 0.0 | random fraction of training rows kept after the cap (0 = all) |
+| `train_warm_epochs` | 5 | epochs per self-training iteration when reusing the previous iteration's weights (0 = cold refit, 25 epochs, every iteration) |
+| `seeds` | 1 | independent self-training passes rank-averaged out of fold; 3 is the sensitivity recipe of docs/28 section 15 |
 
 ### `MbrConfig` (config.rs:1084-1129), partly inert
 

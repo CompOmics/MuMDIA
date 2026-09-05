@@ -231,23 +231,25 @@ both; in Docker use `/opt/conda/envs/rescore/bin/python`).
    library supplies both fragment intensities and retention times, no fragment
    or RT prediction sidecar is required in this mode.
 
-**Optional: fine-tune retention time (matches the benchmark).** You can adapt
-DeepLC's multitask retention-time model to this run and rewrite the library's
-retention times before extraction (the benchmark's per-run RT lever). Enable it
-in the config and point at a DeepLC environment. DeepLC 4.1.1 or newer is required
-(`mumdia doctor` and the workers refuse older versions; see `env/mumdia-deeplc.yml`):
+**Retention time in library mode.** Point the config at a DeepLC environment
+(DeepLC 4.1.1 or newer is required; `mumdia doctor` and the workers refuse older
+versions, see `env/mumdia-deeplc.yml`):
 
 ```json
 {
-  "rt_im_train": { "finetune_deeplc": true, "rt_window_multiplier": 1.5 },
+  "rt_im_train": { "rt_window_multiplier": 1.5 },
   "predict_frag": { "deeplc_python": "/path/to/deeplc/python", "sidecar_script_dir": "scripts" }
 }
 ```
 
-Pass it with `--config` and supply the original imported precursor table, not a
-previous run's already-fine-tuned table. `run` then fine-tunes on the confident
-seed PSMs and re-predicts iRT for the whole library between search-seed and RT
-calibration. A ready-made config for the Docker image is
+By default (`rt_im_train.library_irt = auto`) `run` then replaces the library's
+retention times with DeepLC base-model predictions once and calibrates them per run;
+without a DeepLC interpreter it keeps the imported values and says so. On the AIF
+benchmark this gave 10,416 peptides at 1% against 10,015 from the imported DIA-NN
+iRT and 10,181 from a per-run fine-tune. The fine-tune stays available
+(`"finetune_deeplc": true`, supply the original imported precursor table, not a
+previous run's `_ft` table) and adapts the model to the run's confident seed PSMs
+between search-seed and RT calibration. A ready-made config for the Docker image is
 `docker/config.diann-lib.json` (it targets the bundled `deeplc` environment and
 `nn_torch` rescorer). The DeepLC fine-tune is not guaranteed deterministic, so
 identification counts can vary slightly between runs. The NN rescorer seeds

@@ -1276,7 +1276,7 @@ pub struct RescoreConfig {
     #[serde(default)]
     pub handoff: Handoff,
     /// Restrict the classifier's input to these feature columns, by name. Absent (the
-    /// default) uses every feature the competed table carries.
+    /// default) falls through to `feature_preset`.
     ///
     /// The restriction is a projection, not a reordering: the columns keep the order of
     /// the feature schema, only those named are read out of the competed table, and the
@@ -1300,7 +1300,10 @@ pub struct RescoreConfig {
     /// spike-in FDP unchanged) at 3.4x less rescore memory. Preset names the table lacks
     /// are skipped with a log line rather than an error, so a preset tolerates a smaller
     /// `features.set`; the intersection must not be empty. Explicit lists stay strict.
-    #[serde(default)]
+    /// Default `all`: the projection is a memory lever (3.4x smaller rescore matrix), not a
+    /// sensitivity one, and it cost 1.2% on the held-out HYE B01 pool under the default
+    /// training (+0.2% / -0.1% / +1.5% on A01 / AIF / entrapment), so it is the option for
+    /// pooled rescoring on small machines (docs/28 section 21), not the default.
     pub feature_preset: FeaturePreset,
     /// Cap the decoys the sidecar TRAINS on at this multiple of the targets it selected
     /// that iteration; 0 (the default) trains on every decoy, which is about 19:1 on a
@@ -1309,10 +1312,8 @@ pub struct RescoreConfig {
     /// This thins gradient steps only. Selection, scoring, target-decoy competition and
     /// q-values still run over the full pool, so the cap cannot loosen the q threshold;
     /// what it can move is the learned boundary, hence a knob and not a default.
-    #[serde(default)]
     pub train_neg_ratio: f64,
     /// Which decoys survive [`RescoreConfig::train_neg_ratio`]. See [`NegSelect`].
-    #[serde(default)]
     pub train_neg_select: NegSelect,
     /// Stratified thinning of whatever survived the cap: a fraction in (0, 1], or a row
     /// cap when > 1. Positives and negatives are thinned by the same factor, so the class
@@ -1323,7 +1324,6 @@ pub struct RescoreConfig {
     /// epochs from the second self-training iteration on instead of a full fresh fit.
     /// 0 (the default) refits from scratch every iteration, which is 25 epochs x 10
     /// iterations x 3 folds of the whole training set.
-    #[serde(default)]
     pub train_warm_epochs: usize,
     /// Under `train_neg_select = hybrid`, the share of the negative budget taken from the
     /// margin (highest-scoring decoys); the rest is sampled at random. Default 0.5.
@@ -1389,11 +1389,17 @@ impl Default for RescoreConfig {
             handoff: Handoff::Parquet,
             features: None,
             features_file: None,
+            // The training recipe of docs/28 section 15, default since 2026-09-05: measured
+            // with seeds on four pools against the previous defaults (every decoy, cold
+            // refits): HYE A01 +1.0%, HYE B01 +2.2%, AIF -0.1%, entrapment +3.3% with the
+            // spike-in FDP unchanged, at 9-19x less training time. `train_neg_ratio = 0`,
+            // `train_neg_select = random`, `train_warm_epochs = 0` restore the previous
+            // behaviour exactly. The compact feature preset stays opt-in (see its field).
             feature_preset: FeaturePreset::All,
-            train_neg_ratio: 0.0,
-            train_neg_select: NegSelect::Random,
+            train_neg_ratio: 3.0,
+            train_neg_select: NegSelect::Hybrid,
             train_subsample: 0.0,
-            train_warm_epochs: 0,
+            train_warm_epochs: 5,
             train_margin_frac: 0.5,
             seeds: 1,
         }
@@ -1720,6 +1726,30 @@ mod tests {
             Config::from_json(&text)
                 .unwrap_or_else(|e| panic!("shipped config {name} does not parse: {e}"));
         }
+    }
+
+    #[test]
+    fn rescore_defaults_are_the_training_recipe_and_json_omission_keeps_them() {
+        let d = RescoreConfig::default();
+        assert_eq!(d.feature_preset, FeaturePreset::All);
+        assert_eq!(d.train_neg_ratio, 3.0);
+        assert_eq!(d.train_neg_select, NegSelect::Hybrid);
+        assert_eq!(d.train_warm_epochs, 5);
+        // A config that does not mention them gets the same values (no field-level
+        // serde default shadowing the struct default), and each can be switched off.
+        let c = Config::from_json(r#"{"rescore":{"classifier":"native_tda"}}"#).expect("parses");
+        assert_eq!(c.rescore.feature_preset, FeaturePreset::All);
+        assert_eq!(c.rescore.train_neg_ratio, 3.0);
+        assert_eq!(c.rescore.train_neg_select, NegSelect::Hybrid);
+        assert_eq!(c.rescore.train_warm_epochs, 5);
+        let c = Config::from_json(
+            r#"{"rescore":{"feature_preset":"compact","train_neg_ratio":0.0,"train_neg_select":"random","train_warm_epochs":0}}"#,
+        )
+        .expect("parses");
+        assert_eq!(c.rescore.feature_preset, FeaturePreset::Compact);
+        assert_eq!(c.rescore.train_neg_ratio, 0.0);
+        assert_eq!(c.rescore.train_neg_select, NegSelect::Random);
+        assert_eq!(c.rescore.train_warm_epochs, 0);
     }
 
     #[test]

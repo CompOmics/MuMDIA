@@ -71,7 +71,8 @@ imported library ---------------------------------+       |
 mzML -> convert ----------------------------------+       v
         (optional: prescan, per-run tag pruning    |
          of modform hypotheses for a PTM search)   |
-                                                  optional DeepLC fine-tune
+                                    library iRT re-prediction (DeepLC 4.1.1 base
+                                    model, default) or optional DeepLC fine-tune
                                                            |
                                                            v
                                       rt-im-train -> extract -> features
@@ -101,8 +102,16 @@ Key semantics:
   still parse because the field defaults on. `augment_library.py` reuses this
   same digest to fill an imported library's missing tryptic peptides.
 - Imported-library mode skips digest, peptidoform expansion, and initial
-  prediction. Optional DeepLC fine-tuning still runs after seed search and
-  writes a new precursor table rather than modifying the input.
+  prediction. Under the default `rt_im_train.library_irt = auto` the imported
+  iRT is re-predicted with the DeepLC base model when a DeepLC interpreter is
+  configured (a new precursor table; once per experiment under `run-experiment`),
+  because the imported DIA-NN iRT is the worst RT source measured: AIF 10,015
+  peptides raw, 10,181 per-run fine-tuned, 10,416 re-predicted with DeepLC 4.1.1;
+  HYE B01 55,090 raw, 59,124 with a once-fine-tuned library, 58,813 re-predicted
+  (`docs/08_rt_im_train.md` section 4c). The re-prediction is deterministic and
+  costs about 27 minutes once for the 10.9M-row HYE library on 64 threads. Optional DeepLC fine-tuning still runs
+  after seed search and writes a new precursor table rather than modifying the
+  input.
 - Stage-level candidate competition is within label, so it does not directly
   eliminate a target against its decoy. Peptide-level q estimation subsequently
   performs picked target-decoy competition through the shared
@@ -307,14 +316,23 @@ sections 10-16:
   not: `train_neg_ratio: 5` never binds on a balanced pool and is 2.2x on an imbalanced one.
 - Feature selection buys memory, not time: MLP training time per row is flat in the feature
   count from 387 down to 25. Training-set reduction buys time.
-- Combined (`parquet` + 114 features + `train_neg_ratio: 3, train_neg_select: hybrid,
-  train_warm_epochs: 5`), the full-scale rescore went from 33.04 GiB / 53:07 to 5.49 GB / 3:19
-  at -0.66% peptides, inside that pool's 0.9% seed band, with the spike-in FDP unchanged.
-  That is the "fast" recipe of docs/28 section 15. The "sensitivity" recipe adds `folds: 5,
-  train_margin_frac: 0.75, seeds: 3`: +1.6% / +0.2% / +5.5% peptides against the shipped
-  configuration on HYE A01 / AIF / entrapment with the spike-in FDP unchanged, for about 6x
-  the fast recipe's training, which is still 1.5x less than the shipped configuration's.
-  Both are opt-in.
+- The training recipe (`train_neg_ratio: 3, train_neg_select: hybrid, train_warm_epochs: 5`)
+  is the shipped default since 2026-09-05: measured with seeds against the previous defaults
+  (every decoy, cold refits) on four pools, HYE A01 +1.0%, HYE B01 +2.2%, AIF -0.1%,
+  entrapment +3.3% with the spike-in FDP unchanged, at 9-19x less training time (docs/28
+  section 21; B01's baseline training took 50 minutes per seed against 2.6). `train_neg_ratio:
+  0, train_neg_select: random, train_warm_epochs: 0` restore the previous behaviour exactly.
+- `rescore.feature_preset = compact` (the embedded 114-feature list) stays opt-in. It is a
+  memory lever, not a sensitivity one: the rescore matrix shrinks 3.4x (full-scale HYE
+  rescore 5.49 GB / 3:19 against 13.5 GB / 6:20 with every feature, process-tree peaks; both
+  sit under extract's 16.5 GiB), but under the
+  default training it measured +0.2% / -1.2% / -0.1% / +1.5% on A01 / B01 / AIF / entrapment,
+  and B01 is the pool the list was never fitted on. Use it for pooled rescoring on machines
+  where the matrix would not fit (six HYE runs: 15.9 GB with it), not by default.
+- The "sensitivity" recipe adds `folds: 5, train_margin_frac: 0.75, seeds: 3`: +0.4 / +0.4 /
+  +0.6 pp over the fast recipe on HYE A01 / AIF / entrapment with the FDP unchanged, for 5.3x
+  the rescore wall through the engine (18:38 against 3:31 on HYE B01, +0.2% peptides there);
+  it is the option for a final pass, not a default.
 - Do not set `train_neg_select: margin` with `train_neg_ratio: 1`. It is the fastest recipe
   and +1.27% on HYE, and it loses 10.35% on the entrapment pool.
 - Judge any of these on at least two pools and with seeds. Seed 0 of the HYE baseline scored

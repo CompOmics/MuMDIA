@@ -77,7 +77,7 @@ For the mapping from each conda environment to the config field that points at i
 |---|---|
 | `scripts/ms2pip_worker.py` | Predictor: MS2PIP b/y fragment intensities per peptidoform+charge |
 | `scripts/deeplc_worker.py` | Predictor: DeepLC iRT per peptidoform (uncalibrated) |
-| `scripts/deeplc_finetune.py` | Predictor: transfer-learn DeepLC on this run's seed, rewrite library iRT |
+| `scripts/deeplc_finetune.py` | Predictor: transfer-learn DeepLC on this run's seed and rewrite the library iRT; with `--no-finetune` (seed `-`) rewrite it with base-model predictions instead (`rt_im_train.library_irt`) |
 | `scripts/mokapot_worker.py` | Rescorer: mokapot brew over a PIN (model env-switchable: nn/logreg/xgb/percolator) |
 | `scripts/nn_rescore_worker.py` | Rescorer: PyTorch semi-supervised MLP over a PIN, in-memory or streaming memmap |
 | `scripts/entrapment_worker.py` | Rescorer: GBM/NN on real-target-vs-spike-in negatives, out-of-fold by base peptide |
@@ -245,8 +245,11 @@ that is non-standard (`is_std` false, e.g. a terminal mod outside `STD`) or was
 not predicted keeps its **original** `predicted_irt` unchanged, because the
 write-back is `preds.get(base_pf(pf), orig[i])` (`deeplc_finetune.py:156`), so
 only the sequences DeepLC actually re-predicted move onto the fine-tuned scale.
-Beyond the five flags Rust passes (`--epochs/--patience/--q-train/--batch/--window-holdout-frac`,
-`sidecar.rs:139-151`), the worker exposes CLI-only knobs that `run` never sets:
+Beyond the five flags Rust passes for a fine-tune (`--epochs/--patience/--q-train/--batch/
+--window-holdout-frac`), and the three it passes for a base-model re-prediction
+(`--no-finetune --threads N --predict-threads N` with `-` as the seed path,
+`sidecar::run_deeplc_repredict`, N = the engine's rayon thread count because prediction is
+forward-only), the worker exposes CLI-only knobs that `run` never sets:
 `--device cpu|cuda` (cuda aborts with `SystemExit` if `torch.cuda.is_available()`
 is false, `deeplc_finetune.py:79-81`), `--threads` (torch CPU pool, defaults to
 `DEEPLC_FT_THREADS`), `--max-ref N` (cap reference PSMs), `--predict-limit N`

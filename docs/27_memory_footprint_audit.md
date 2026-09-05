@@ -127,6 +127,9 @@ fast rescore recipe of docs/28), same file, 32 threads:
 
 From 1:07:30 and 86.6 GiB two days earlier (231 GiB before the first commit), at 59,124
 against 59,515 peptides at 1%, inside the pool's seed band. The run fits the 32 GB target.
+This table used the compact feature preset; under the shipped defaults (every feature, the
+same training recipe) the rescore stage measured 6:20 at 13.5 GB instead of 3:31 at 5.57 GB,
+so a default run is about 20:40 at the same 16.5 GiB peak (docs/28 section 21).
 
 ## 1. Static memory model per stage
 

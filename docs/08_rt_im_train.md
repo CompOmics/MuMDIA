@@ -298,6 +298,67 @@ fraction; with the overfitting 4.0.0a2 model the honest window is ~950 s and
 costs 1.5% of peptides, so the option only pays with a generalizing RT model.
 It stays benchmark-gated and off by default (see CLAUDE.md).
 
+### 4c. Library iRT source: DeepLC 4.1.1 base predictions against the imported iRT and the fine-tune (2026-09-05)
+
+`rt_im_train.library_irt` (default `auto`) decides what the calibration in sections 1-4
+calibrates in library-input mode. Three sources were run on the AIF benchmark
+(`LFQ_Orbitrap_AIF_Ecoli_01`, imported DIA-NN library, calibration only, `native_tda` so the
+arms differ in RT alone, one seed each):
+
+| library iRT | peptides at 1% | `w_rt` | in-sample residual median | PSMs extracted | run wall |
+|---|---|---|---|---|---|
+| DIA-NN library (raw) | 10,015 | 632 s | 117.9 s | 104,025 | 2:11 |
+| per-run DeepLC fine-tune (`finetune_deeplc`) | 10,181 | 472 s | 61.4 s | 89,531 | - |
+| **DeepLC 4.1.1 base model (`library_irt = deeplc`)** | **10,416** | **343 s** | 65.5 s | 72,453 | 1:19 |
+
+The base-model prediction beats the fine-tune by 2.3% and the imported iRT by 4.0%, with the
+narrowest window and the fewest candidates to extract. The in-sample residual median does not
+rank the arms (61.4 s for the fine-tune against 65.5 s for the base model): the fine-tune
+adapts to its own anchors, which the in-sample number rewards and the held-out window does
+not (section 4b). The DIA-NN iRT is the worst source, so "calibration only" on a raw imported
+library is not the default this option describes: `auto` re-predicts whenever a DeepLC
+interpreter is configured, and warns when it keeps the imported values because none is.
+
+The prediction is run-independent, so `run-experiment` computes it once for the whole
+experiment (`fragment_library_precursors_deeplc.parquet` in the experiment directory) and
+`run` once per invocation. Cost: 845k target peptidoforms in about 8 minutes on 32 CPU threads
+(DeepLC 4.1.1, torch CPU). A re-predicted table is a plain precursor table; pass it as
+`--lib-precursors` with `library_irt = library` to skip the step on later invocations. The
+worker is `deeplc_finetune.py --no-finetune` (docs/13), so every row is predicted on its
+`DECOY_`-stripped sequence (a shift decoy therefore shares its target's value, a reversed
+decoy gets its own) and rows with non-standard residues keep the imported value, exactly as
+under a fine-tune. Both label populations must move to the new scale together: a table whose
+targets carry DeepLC values and whose decoys keep the imported iRT is not exchangeable and
+its decoy-based q is invalid. This is the reason DeepLC 4.1.1 is the engine's floor: the default path calibrates
+base-model predictions and 4.0.0a2's base model memorised anchors.
+
+HYE B01 (`LFQ_Orbitrap_AIF_Condition_B_Sample_Alpha_01`, 10.9M-row imported library, fast
+rescore recipe with `nn_torch`, `window_holdout_frac 0.3`, one seed each) with the same three
+sources; the base-model arm ran through the engine's own `library_irt = auto` path:
+
+| library iRT | peptides at 1% | `w_rt` | in-sample residual median | held-out p95 | candidates extracted | run wall | peak |
+|---|---|---|---|---|---|---|---|
+| DIA-NN library (raw) | 55,090 | 691 s | 130.0 s | 461 s | 2,744,896 | 30:28 | 24.6 GB |
+| library fine-tuned once on A_01, reused | 59,124 | 345 s | 35.8 s | 230 s | 2,603,894 | 17:52 | 16.5 GiB |
+| **DeepLC 4.1.1 base model (`auto`)** | 58,813 | 414 s | 78.3 s | 276 s | 2,497,844 | 46:36 (27 min is the one-off prediction) | 18.1 GB |
+
+On this acquisition the base model is +6.8% over the imported iRT and 0.5% under the
+once-fine-tuned library, inside the pool's 0.9% seed band; on AIF it was 2.3% over the
+fine-tune. The in-sample residual again exaggerates the fine-tune's advantage (35.8 s against
+78.3 s for a 0.5% difference in peptides): held-out p95 (230 against 276 s) is the honest
+comparison. The wide raw windows also cost compute: extract ran 10.6 minutes at 24.6 GB
+against 5.9 minutes at 18.1 GB. The one-off prediction of the HYE library (4,910,158 unique
+stripped sequences, targets and reversed decoys) took 27 minutes on 64 CPU threads; under
+`run-experiment` that is paid once for the six runs, and a saved re-predicted table with
+`library_irt = library` skips it entirely.
+
+The first HYE attempt at this arm was made with a scratch script that paired decoys as
+`DECOY_` + target sequence. The HYE library's decoys are reversed sequences, so all 5.44M
+of them kept the imported iRT while the targets moved to DeepLC's scale, and the arm gave
+57,501 under an invalid, non-exchangeable decoy population. The engine path predicts every
+stripped sequence and does not have this failure mode; the AIF library's decoys are shift
+decoys (99.96% paired), so its arm was unaffected.
+
 ### 5. Optional adaptive per-region window (default off)
 
 When `adaptive_rt_window` is set (and `n_train >= min_anchors`, which guarantees the
@@ -334,7 +395,10 @@ The table is written (rt_im_train.rs:266-277), `cal.json` is written
 
 This is not part of `rt_im_train::run`; it runs in the `run` orchestrator between
 `search-seed` and Stage B, guarded by `cfg.rt_im_train.finetune_deeplc`
-(run.rs:265-303). Preflight (`run.rs:62-67`) rejects `finetune_deeplc` unless
+(run.rs:265-303). The same hook, when the fine-tune is off, runs the base-model
+re-prediction of section 4c (`sidecar::run_deeplc_repredict`, `library_irt = auto|deeplc`);
+`run-experiment` hoists that re-prediction above its per-run fan-out because it does not
+depend on the run. Preflight (`run.rs:62-67`) rejects `finetune_deeplc` unless
 `predict_frag.deeplc_python` is set; it only checks that the field is present, not
 that the interpreter can import DeepLC. The import probe lives in `mumdia doctor`,
 which checks `deeplc,numpy,pandas,pyarrow,torch,psm_utils` on that interpreter
@@ -468,6 +532,7 @@ though the enum variant still exists.
 | `adaptive_rt_window` | `false` | Per-region window instead of one global width (rt_im_train.rs:192-229). Sensitivity-program knob, not yet default-on. |
 | `adaptive_rt_bins` | `12` | Number of equal-width calibrated-RT bins for the adaptive window (rt_im_train.rs:202). |
 | `rt_window_min_s` | `1.0` | Lower clamp (seconds) for any adaptive half-window (rt_im_train.rs:210); mirrors the 1s floor on the global window. |
+| `library_irt` | `auto` | Library-input mode only. `auto` re-predicts the imported `predicted_irt` with the DeepLC base model when `predict_frag.deeplc_python` is set and keeps it, with a warning, when not; `deeplc` requires the interpreter (preflight); `library` keeps the imported values. Ignored under `finetune_deeplc` and in FASTA mode. Section 4c has the measurement. |
 | `window_holdout_frac` | `0.0` | Size `w_rt` from held-out anchor residuals instead of in-sample ones (section 4b). `base_peptide_id % 1000 < round(frac*1000)` selects the holdout; the same rule excludes those peptides from the orchestrated DeepLC fine-tune. Range `[0.0, 0.9]`, `0.0` = off; mutually exclusive with `adaptive_rt_window`. Benchmark-gated. |
 
 ## Invariants, determinism, gotchas

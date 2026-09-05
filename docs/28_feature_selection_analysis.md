@@ -12,7 +12,7 @@ outputs under `C:/Users/robbi/mumdia_bench/fs/` (off OneDrive; large). Measured
 > **17:52 at 16.5 GiB** (was 67:30 at 86.6 GiB the day before). A seeded sweep of the
 > rescorer's hyperparameters (section 17) and of the pipeline's extraction/RT factors
 > (section 18) found the shipped values at a local optimum on every pool. Sections 1-9 are
-> the original analysis and stand unchanged.
+> the original analysis and stand unchanged. Section 21 records what shipped as default.
 
 ## 0. Summary
 
@@ -693,35 +693,33 @@ Note that rescore is no longer the stage that sets the run's peak. With extract 
 
 ## 15. Recommended configuration
 
-Shipped as the new default:
+Shipped as the default (the second and third items since the end of 2026-09-05; section 21 has
+the decision record):
 
 - **`rescore.handoff = parquet`.** 70% less memory, 24% less wall, identical identifications,
   no configuration required, and mokapot/entrapment sidecars keep receiving the TSV they need.
+- **The training recipe: `train_neg_ratio: 3`, `train_neg_select: hybrid`,
+  `train_warm_epochs: 5`.** Against the previous training (every decoy, cold refits), with
+  seeds: HYE A01 +0.97%, HYE B01 +2.19%, AIF -0.09%, entrapment +3.33% at an unchanged
+  spike-in FDP, for 9-19x less training time. `train_neg_ratio: 0, train_neg_select: random,
+  train_warm_epochs: 0` restore the previous training exactly.
+- **Every feature (`feature_preset: all`).**
 
-Recommended but NOT default, because they change what the classifier sees and therefore need a
-deliberate choice. Two recipes, measured on three pools with seeds (section 17.1):
+Opt-in, each for a stated reason:
 
-**Fast** (~9x less training than the shipped configuration; +1.2% HYE A01, -0.2% AIF, +4.9%
-entrapment):
+**Compact features** (`"feature_preset": "compact"`, the embedded 114-name list of section 12;
+`features_file` still accepts any list). A memory lever: the rescore matrix is 3.4x smaller
+(full-scale HYE rescore 5.49 GB / 3:19 against 13.5 GB / 6:20 with every feature; six pooled
+HYE runs 15.9 GB where every feature would need roughly 30 GB). Under the default training it measured +0.2% (A01), -1.2% (B01, the pool
+it was never fitted on), -0.1% (AIF), +1.5% (entrapment), so it is for pooled rescoring on
+machines where the matrix does not fit.
+
+**Sensitivity** (about 5x the default's rescore wall; +0.4 / +0.4 / +0.6 pp over the default
+on HYE A01 / AIF / entrapment, spike-in FDP unchanged; +0.2% on HYE B01 through the engine at
+18:38 against 3:31):
 
 ```json
 "rescore": {
-  "features_file": "bench/feature_selection/fs_union75_dedup.txt",
-  "train_neg_ratio": 3.0,
-  "train_neg_select": "hybrid",
-  "train_warm_epochs": 5
-}
-```
-
-**Sensitivity** (~1.5x less training than the shipped configuration; +1.6% HYE A01, +0.2% AIF,
-+5.5% entrapment, spike-in FDP unchanged):
-
-```json
-"rescore": {
-  "features_file": "bench/feature_selection/fs_union75_dedup.txt",
-  "train_neg_ratio": 3.0,
-  "train_neg_select": "hybrid",
-  "train_warm_epochs": 5,
   "folds": 5,
   "train_margin_frac": 0.75,
   "seeds": 3
@@ -729,19 +727,19 @@ entrapment):
 ```
 
 Evidence per pool, peptides at 1% against that pool's own 387-feature all-decoy baseline, two
-seeds each:
+seeds each unless marked:
 
-| pool | 114 features alone | recipe alone | both |
+| pool | 114 features alone | training recipe alone | both |
 |---|---|---|---|
-| HYE A01 | -0.3% | +0.97% | - |
-| HYE B01 | -0.3% | - | -0.66% (engine, full scale) |
-| AIF E. coli | +0.04% | -0.18% | +0.09% |
-| entrapment | -2.14% | +4.20% | -0.74% (FDP 0.50% vs 0.57%) |
+| HYE A01 | -0.3% | +0.97% | +1.16% |
+| HYE B01 | -0.3% | +2.19% | +0.98% |
+| AIF E. coli | +0.04% | -0.09% | -0.18% |
+| entrapment | -2.14% | +3.33% | +4.87% (FDP 0.57% vs 0.56%) |
 
 The conservative variant, for a caller who wants the memory but not a changed training
-trajectory, is `features_file` plus `train_neg_ratio: 5, train_neg_select: hybrid`: the 5:1 cap
-never binds on a balanced pool (identical rows and identical output on AIF) and still gives 2.2x
-on HYE, for the `full` arm's 13:06 and 5.51 GB.
+trajectory, is the compact preset plus `train_neg_ratio: 5, train_neg_select: hybrid`: the 5:1
+cap never binds on a balanced pool (identical rows and identical output on AIF) and still gives
+2.2x on HYE, for the `full` arm's 13:06 and 5.51 GB.
 
 What NOT to do:
 
@@ -773,35 +771,39 @@ What NOT to do:
 Training at 3-20 s per fit instead of 165 s made a systematic sweep of the classifier
 affordable for the first time. Every arm is the fast recipe (3:1 hybrid cap, warm start 5)
 with one knob changed, two seeds per arm (three on the combination grid), on three pools;
-`recipe` is the reference each pool is read against, and `baseline` is the shipped
-configuration before any of this work. Peptides at 1%; B01 is still running on hippogriff.
+`recipe` is the reference each pool is read against, and `baseline` is the configuration
+shipped before any of this work. Peptides at 1%. The B01 column (seeds 1 and 2, baseline
+59,213) landed later: its baseline training took 2,924-3,065 s against 156 s for the recipe,
+the recipe is +2.2% there, and the B01 ranking agrees with A01 (iterations 20, folds 5 and
+seeds 3 above the recipe; iterations 6 below it) while still disagreeing with AIF and the
+entrapment pool on iterations 20, which is why none of them moved.
 
-| arm | HYE A01 | AIF | entrapment (FDP) |
-|---|---|---|---|
-| baseline (all decoys, fresh fits, 128-64) | 59,615 | 10,512 | 2,837 (0.49%) |
-| **recipe** | **60,192 (+0.97%)** | 10,502 (-0.09%) | 2,932 (+3.33%, 0.60%) |
-| hidden 256-128 | +0.81% | -0.15% | +2.50% |
-| hidden 256-128-64 | +0.66% | -0.42% | +4.34% |
-| hidden 512-256 | +0.53% | -0.53% | +0.09% |
-| hidden 64-32 | +0.50% | +0.01% | -1.67% |
-| dropout 0.1 | +0.41% | 0.00% | +1.99% |
-| dropout 0.5 | +0.26% | -0.11% | +3.05% |
-| epochs 50 / warm 10 | +0.42% | -0.63% | +2.03% |
-| epochs 12 / warm 3 | -0.16% | -0.08% | -0.23% |
-| lr 3e-4 | -0.02% | -0.03% | **-7.10%** |
-| lr 3e-3 | +0.45% | -0.20% | +2.86% |
-| batch 1024 | +0.90% | -0.17% | +1.50% |
-| batch 16384, lr 2e-3 | +0.28% | -0.54% | +1.15% |
-| folds 5 | +0.55% | +0.04% | +3.33% |
-| seeds 3 (rank ensemble) | **+1.27%** | +0.10% | +3.24% |
-| iterations 20 | **+1.42%** | -0.09% | +1.64% |
-| iterations 6 | -1.62% | +0.02% | **-4.65%** |
-| train FDR 0.02 | +0.80% | -0.65% | +3.95% |
-| train FDR 0.005 | +0.04% | -0.01% | **-5.09%** |
-| margin fraction 0.75 | +0.63% | -0.08% | +3.70% |
-| margin fraction 0.25 | +0.77% | -0.10% | +2.94% |
-| weight decay 1e-3 | -0.31% | -0.20% | +3.84% |
-| weight decay 0 | +0.42% | 0.00% | +3.40% |
+| arm | HYE A01 | HYE B01 | AIF | entrapment (FDP) |
+|---|---|---|---|---|
+| baseline (all decoys, fresh fits, 128-64) | 59,615 | 59,213 | 10,512 | 2,837 (0.49%) |
+| **recipe** | **60,192 (+0.97%)** | **60,510 (+2.19%)** | 10,502 (-0.09%) | 2,932 (+3.33%, 0.60%) |
+| hidden 256-128 | +0.81% | +2.35% | -0.15% | +2.50% |
+| hidden 256-128-64 | +0.66% | +1.81% | -0.42% | +4.34% |
+| hidden 512-256 | +0.53% | +2.21% | -0.53% | +0.09% |
+| hidden 64-32 | +0.50% | +1.06% | +0.01% | -1.67% |
+| dropout 0.1 | +0.41% | +1.90% | 0.00% | +1.99% |
+| dropout 0.5 | +0.26% | +1.55% | -0.11% | +3.05% |
+| epochs 50 / warm 10 | +0.42% | +2.55% | -0.63% | +2.03% |
+| epochs 12 / warm 3 | -0.16% | +1.18% | -0.08% | -0.23% |
+| lr 3e-4 | -0.02% | +1.35% | -0.03% | **-7.10%** |
+| lr 3e-3 | +0.45% | +1.70% | -0.20% | +2.86% |
+| batch 1024 | +0.90% | +2.35% | -0.17% | +1.50% |
+| batch 16384, lr 2e-3 | +0.28% | +1.14% | -0.54% | +1.15% |
+| folds 5 | +0.55% | +2.72% | +0.04% | +3.33% |
+| seeds 3 (rank ensemble) | **+1.27%** | +2.68% | +0.10% | +3.24% |
+| iterations 20 | **+1.42%** | **+3.12%** | -0.09% | +1.64% |
+| iterations 6 | -1.62% | **-0.54%** | +0.02% | **-4.65%** |
+| train FDR 0.02 | +0.80% | +2.58% | -0.65% | +3.95% |
+| train FDR 0.005 | +0.04% | +1.68% | -0.01% | **-5.09%** |
+| margin fraction 0.75 | +0.63% | +2.19% | -0.08% | +3.70% |
+| margin fraction 0.25 | +0.77% | +2.36% | -0.10% | +2.94% |
+| weight decay 1e-3 | -0.31% | +1.09% | -0.20% | +3.84% |
+| weight decay 0 | +0.42% | +1.83% | 0.00% | +3.40% |
 
 Read across the pools, nothing beats the recipe consistently:
 
@@ -936,9 +938,81 @@ and 391,087 that took a multi-hour TSV-path rescore. With the per-run chain at ~
 | 3 | ~50 min | ~50 GB |
 | 6 | ~40 min | ~100 GB |
 
-The per-run figure is from one file (the others are 1.8-2.1M competed rows, so +-10%), and
-the like-for-like pooled baseline under today's default (parquet, no recipe) is still
-computing at the time of writing.
+The per-run figure is from one file (the others are 1.8-2.1M competed rows, so +-10%).
+
+The sensitivity recipe (section 15) through the engine on the same competed table: rescore
+**18:38 at 5.57 GB for 59,242 peptides**, +0.2% over the fast recipe's 59,124 at 5.3x its
+rescore wall (3 seeds x 5 folds x 10 iterations), so the whole run would be about 33 minutes.
+That is an option for a final pass, not a default.
+
+The like-for-like six-run pooled baseline landed: the same 11,637,874 competed PSMs under
+the pre-recipe default (parquet handoff, all 387 features, every decoy, cold refits, one seed)
+took **4:34:42 at 40.1 GB** for 71,926 peptides and 390,266 target PSMs at 1%, of which 97%
+was training (15,675 s). The fast recipe's 18:05 at 15.9 GB for 72,344 peptides is therefore
+15x faster, 2.5x smaller and +0.6% on the pooled experiment, consistent with the per-run
+pools of section 17.
+
+## 21. Shipped defaults (2026-09-05)
+
+What became default, and what did not, from everything above:
+
+- **Rescore: the training recipe.** `train_neg_ratio = 3`, `train_neg_select = hybrid`,
+  `train_warm_epochs = 5`, on top of `handoff = parquet`, with every feature. Measured with
+  seeds against the previous defaults (every decoy, cold refits):
+
+  | pool | previous default | training recipe | training time |
+  |---|---|---|---|
+  | HYE A01 (2.4M PSMs) | 59,615 | 60,192 (+0.97%) | 164 s -> 18 s |
+  | HYE B01 (2.6M PSMs) | 59,213 | 60,510 (+2.19%) | 2,994 s -> 156 s |
+  | AIF (chimeric, 97k PSMs) | 10,512 | 10,502 (-0.09%) | flat |
+  | entrapment (FASTA-built, spike-in FDP) | 2,837 (0.49%) | 2,932 (+3.33%, 0.60%) | 3x faster |
+
+  (The A01 and AIF training times are the harness's; B01's are the real worker's.) The
+  recipe is positive or flat on every pool including the empirical null, and the FDP is
+  unchanged. `train_neg_ratio = 0, train_neg_select = random, train_warm_epochs = 0` restore
+  the previous input exactly.
+- **Not the compact feature preset.** With the training recipe in place, projecting to the
+  114-feature list measured +0.2% (A01), **-1.2% (B01, seeds 59,754 / 59,829 against
+  60,342 / 60,678)**, -0.1% (AIF) and +1.5% (entrapment). B01 is the one pool the list was
+  never fitted on and its loss is four times the seed spread, so the projection is not free.
+  What it buys is memory and handoff I/O: the rescore matrix is 3.4x smaller, and the
+  full-scale HYE rescore stage measured 5.49 GB / 3:19 with it against **13.5 GB / 6:20**
+  with every feature under the same training (process-tree peaks; 8.8 GB for the largest
+  single process; 59,293 peptides, one seed). Six pooled HYE runs: 15.9 GB with it, roughly
+  30 GB estimated with every feature. `rescore.feature_preset = compact` is
+  therefore the documented option for pooled rescoring on machines where the matrix does not
+  fit, not the default. The single-run peak is set by extract (16.5 GiB) either way.
+- **Not the sensitivity recipe** (`folds 5, train_margin_frac 0.75, seeds 3`): +0.2 to +0.6
+  pp over the fast recipe, at 5.3x the rescore wall through the engine (section 19). Documented
+  in section 15 as the option for a final pass.
+- **Retention time: calibration of DeepLC base-model predictions, DeepLC >= 4.1.1 required.**
+  `rt_im_train.library_irt = auto` re-predicts an imported library's iRT with the base model
+  when a DeepLC interpreter is configured (docs/08 section 4c: AIF 10,416 peptides against
+  10,015 raw and 10,181 fine-tuned; HYE B01 58,813 against 55,090 raw and 59,124 with a
+  once-fine-tuned library; `w_rt` 343 s against 632 s and 472 s on AIF), once per
+  experiment. `finetune_deeplc` stays off; the fine-tune remains available. The floor is
+  enforced by `doctor`, by the sidecar launch and by both worker scripts, because the default
+  path is only sound on a base model that does not memorise its anchors.
+- **Features stage: no cut.** The stage's cost is not the feature arithmetic. On the HYE B01
+  competed table (2.6M candidates, 32 threads) the Extended set (387 features) took 380 s at
+  3.11 GiB, `rich` (44) 255 s at 2.64 GB and `minimal` (14) 239 s at 2.59 GB, so removing
+  96% of the features saves 37% of the wall and no memory; about 230 s is chromatogram decode,
+  RT-axis and peak-shape work that every set pays. `rich` and `minimal` also cost 7.5-8.3%
+  and 22-28% of the peptides (section 6). The stage keeps computing Extended and the
+  projection happens at rescore, where it is free. The 43 dead columns (section 3) could be
+  dropped from Extended for 11% less PIN I/O at zero sensitivity cost, but that is a schema
+  version bump for about 15 s and is not done here.
+- **Pooled experiment:** six HYE runs rescored together, previous default 4:34:42 at 40.1 GB
+  for 71,926 peptides; fast recipe 18:05 at 15.9 GB for 72,344 (section 19).
+- **Unchanged:** the rescorer's hyperparameters (section 17), the extraction and RT window
+  defaults (section 18), `extract.windows_in_flight` (auto), and every benchmark-gated item
+  in CLAUDE.md.
+
+Reference point on the 2026-09-05 build, HYE B01, 32 threads: a complete `mumdia run` with
+the compact preset is 17:52 at 16.5 GiB (extract is the tallest stage at 16.5 GiB, features
+the longest at 6:20); under the shipped defaults (every feature) the rescore stage is 6:20
+instead of 3:31, so about 20:40 at the same 16.5 GiB peak. The six-run pooled rescore with the
+compact preset is 18 minutes at 15.9 GB for 72,344 peptides.
 
 ## 20. Caveats of the original (2026-09-04) analysis
 
