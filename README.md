@@ -234,7 +234,8 @@ both; in Docker use `/opt/conda/envs/rescore/bin/python`).
 **Optional: fine-tune retention time (matches the benchmark).** You can adapt
 DeepLC's multitask retention-time model to this run and rewrite the library's
 retention times before extraction (the benchmark's per-run RT lever). Enable it
-in the config and point at a DeepLC 4.0 multitask environment:
+in the config and point at a DeepLC environment. DeepLC 4.1.1 or newer is required
+(`mumdia doctor` and the workers refuse older versions; see `env/mumdia-deeplc.yml`):
 
 ```json
 {

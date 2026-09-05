@@ -403,6 +403,29 @@ fn doctor(cfg: &Config) -> Result<()> {
     ];
     let mut bad = false;
     for (label, py, pkgs) in checks {
+        // DeepLC has a floor, not just a presence check: the default RT workflow calibrates
+        // base-model predictions without a fine-tune, which is only sound from 4.1.1 on.
+        if label.contains("DeepLC") {
+            if let Some(interp) = py {
+                match mumdia::sidecar::module_version(interp, "deeplc") {
+                    Some(v) => {
+                        let ok = mumdia_core::constants::parse_version3(&v)
+                            .is_some_and(|t| t >= mumdia_core::constants::MIN_DEEPLC_VERSION);
+                        let (ma, mi, pa) = mumdia_core::constants::MIN_DEEPLC_VERSION;
+                        if ok {
+                            println!("  [ok]   {label}: deeplc {v} (>= {ma}.{mi}.{pa})");
+                        } else {
+                            println!("  [FAIL] {label}: deeplc {v} is older than the required {ma}.{mi}.{pa}");
+                            bad = true;
+                        }
+                    }
+                    None => {
+                        println!("  [FAIL] {label}: cannot determine the deeplc version");
+                        bad = true;
+                    }
+                }
+            }
+        }
         match py {
             None => println!("  [skip] {label}: not configured (native path used)"),
             Some(interp) => {

@@ -10,7 +10,7 @@
     "rt_window_multiplier": 1.5
   },
   "predict_frag": {
-    "deeplc_python": "C:/Users/robbi/anaconda3/envs/deeplc_mt/python.exe",
+    "deeplc_python": "C:/Users/robbi/deeplc_411/Scripts/python.exe",
     "sidecar_script_dir": "H:/OneDrive - UGent/MuMDIA_NG/scripts"
   },
   "rescore": {

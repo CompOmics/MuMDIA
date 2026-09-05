@@ -92,7 +92,7 @@ For the mapping from each conda environment to the config field that points at i
 | `rust/mumdia/crates/mumdia/src/stages/rescore.rs` | Call sites for mokapot/nn_torch (PIN) + entrapment (Parquet) sidecars |
 | `rust/mumdia/crates/mumdia/src/main.rs` | Call site for MBR (`Cmd::Mbr`) + `doctor` env probe |
 | `env/docker-rescore.yml` | Docker env `rescore`: mokapot 0.10.0 + ms2pip 4.0.0.dev9 (py3.11) |
-| `env/docker-deeplc.yml` | Docker env `deeplc`: DeepLC 4.0 multitask (pinned commit) + CPU torch (py3.11) |
+| `env/docker-deeplc.yml` | Docker env `deeplc`: `deeplc==4.1.1` (PyPI; the engine's floor) + CPU torch (py3.11) |
 | `env/mumdia-rescore.yml` | Minimal portable env for the mokapot logreg rescore path (py3.12) |
 
 ## Inputs and outputs
@@ -681,8 +681,8 @@ MLP. Set it explicitly for the logreg path.
   change so `mumdia doctor` stays truthful.
 - **Conda envs.** The committed reproducible specs are `env/docker-rescore.yml`
   (env `rescore`: mokapot 0.10.0 + ms2pip 4.0.0.dev9, py3.11) and
-  `env/docker-deeplc.yml` (env `deeplc`: DeepLC 4.0 multitask at a pinned commit +
-  CPU torch, py3.11); the Docker configs point interpreters at
+  `env/docker-deeplc.yml` (env `deeplc`: `deeplc==4.1.1` from PyPI, the engine's
+  minimum, + CPU torch, py3.11); the Docker configs point interpreters at
   `/opt/conda/envs/{rescore,deeplc}/bin/python` (`docker/config.dia.json`,
   `docker/config.diann-lib.json`). `env/mumdia-rescore.yml` is the minimal
   portable env for the mokapot logreg path (no torch/DeepLC/MS2PIP). On the

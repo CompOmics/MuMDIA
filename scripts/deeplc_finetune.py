@@ -31,6 +31,42 @@ import argparse
 import re
 import time
 import deeplc                                    # import before numpy (OpenMP load order)
+import sys
+
+# The engine's default retention-time workflow calibrates DeepLC's base-model predictions
+# per run without a fine-tune. That is only sound from 4.1.1 on (4.0.0a2 memorised anchors:
+# in-sample 15.9 s against held-out 195 s residuals), so an older DeepLC is refused here as
+# well as by `mumdia doctor`, which cannot see a version that changes under its feet.
+_MIN_DEEPLC = (4, 1, 1)
+
+
+def _check_deeplc_version():
+    raw = getattr(deeplc, "__version__", None)
+    if raw is None:
+        try:
+            import importlib.metadata as _m
+            raw = _m.version("deeplc")
+        except Exception:  # pragma: no cover
+            raw = ""
+    parts = []
+    for piece in str(raw).split(".")[:3]:
+        digits = ""
+        for ch in piece:
+            if ch.isdigit():
+                digits += ch
+            else:
+                break
+        parts.append(int(digits) if digits else 0)
+    while len(parts) < 3:
+        parts.append(0)
+    if tuple(parts) < _MIN_DEEPLC:
+        sys.exit(
+            "deeplc %s is older than the required %d.%d.%d (pip install 'deeplc>=4.1.1')"
+            % (raw, *_MIN_DEEPLC)
+        )
+
+
+_check_deeplc_version()
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq

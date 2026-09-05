@@ -33,9 +33,9 @@ the conda specs in `env/`, the container definition in `Dockerfile` +
 | `.github/workflows/docker.yml` | Builds the image; pushes to GHCR only on a `v*` tag, build-only on `workflow_dispatch` |
 | `Dockerfile` | Two-stage image: Rust build stage + micromamba runtime with two sidecar envs |
 | `docker/config.dia.json` | Baked FASTA-digest config (MS2PIP + DeepLC + strict mokapot wired to in-image envs) |
-| `docker/config.diann-lib.json` | Baked library-input config (DeepLC fine-tune + strict NnTorch through the torch-capable DeepLC env) |
+| `docker/config.diann-lib.json` | Baked library-input config (per-run RT calibration of the library iRT, no fine-tune; strict NnTorch through the torch-capable DeepLC env) |
 | `env/docker-rescore.yml` | Conda spec for the in-image `rescore` env (`python=3.11`, `mokapot==0.10.0` + `ms2pip==4.0.0.dev9`) |
-| `env/docker-deeplc.yml` | Conda spec for the in-image `deeplc` env (`python=3.11`, `torch==2.12.1+cpu` + DeepLC 4.0 multitask pinned git commit) |
+| `env/docker-deeplc.yml` | Conda spec for the in-image `deeplc` env (`python=3.11`, `torch==2.12.1+cpu` + `deeplc==4.1.1`, the engine's minimum) |
 | `env/mumdia-rescore.yml` | Minimal host env for the default mokapot rescorer only (`python=3.12`, no torch/DeepLC/MS2PIP) |
 | `rust/mumdia/crates/mumdia/src/sidecar.rs` | Sidecar subprocess clients + `resolve_script` path resolution |
 | `rust/mumdia/crates/mumdia/src/main.rs` | Thin CLI; `doctor` subcommand probes configured sidecar interpreters (`main.rs:346`) |
@@ -331,10 +331,9 @@ fragile source build (`docker-rescore.yml:8-9`, `docker-deeplc.yml:8-9`). The
 `rescore` env anchors only the two tools (`mokapot==0.10.0`,
 `ms2pip==4.0.0.dev9`) plus `numpy<2`/`pyarrow`/`scikit-learn`, leaving their
 scientific-Python graph to pip (`docker-rescore.yml:16-21`). The `deeplc` env
-installs `torch==2.12.1+cpu` from the PyTorch CPU index-url, `numpy<2`/`pyarrow`,
-and DeepLC from a pinned git commit (`5c6a94e3...`); the multitask model weight
-ships inside the DeepLC package, so no separate download is needed
-(`docker-deeplc.yml:4-5`, `16-21`).
+installs `torch==2.12.1+cpu` from the PyTorch CPU index-url, `pyarrow`, and
+`deeplc==4.1.1` from PyPI (the engine refuses anything older, see below); the model
+weights ship inside the DeepLC package, so no separate download is needed.
 
 **CI / release / docker workflows.** `ci.yml` triggers on push to `main` and on
 every pull request (`ci.yml:3-6`), with a `concurrency` group per ref and
@@ -426,7 +425,7 @@ do not reintroduce removed knobs. The fields relevant here:
   `rescore.strict = true`.
 - The pip pins in the two in-image envs are exact and reproducibility-load-bearing:
   `rescore` = `mokapot==0.10.0` + `ms2pip==4.0.0.dev9` + `numpy<2` (rest via pip);
-  `deeplc` = `torch==2.12.1+cpu` + DeepLC pinned git commit `5c6a94e3...` + `numpy<2`.
+  `deeplc` = `torch==2.12.1+cpu` + `deeplc==4.1.1` + `pyarrow`.
   The host-only `env/mumdia-rescore.yml` is a different pin set: `python=3.12`
   with conda `numpy`/`pandas`/`pyarrow`/`scikit-learn` and pip `mokapot`
   (unpinned, and no `pandas<2` constraint because it installs neither MS2PIP nor

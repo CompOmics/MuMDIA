@@ -38,7 +38,7 @@ written null; there is no IM calibration or IM window.
 | `rust/mumdia/crates/mumdia/src/calibrate.rs` | Calibration math: `linear_fit`, the `Loess` local-linear smoother, and `percentile`. Shared, no external deps. |
 | `rust/mumdia/crates/mumdia/src/stages/run.rs` | Orchestrator. Runs the optional DeepLC fine-tune between `search-seed` and this stage, then calls `rt_im_train::run` (see `run.rs:265-314`). |
 | `rust/mumdia/crates/mumdia/src/sidecar.rs` | `run_deeplc_finetune` (sidecar.rs:110-155): the file-contract client that invokes the fine-tune worker. |
-| `scripts/deeplc_finetune.py` | The fine-tune worker: transfer-learns DeepLC 4.0 on the seed and writes a new library parquet with replaced `predicted_irt`. |
+| `scripts/deeplc_finetune.py` | The fine-tune worker: transfer-learns DeepLC (4.1.1 or newer; older versions are refused) on the seed and writes a new library parquet with replaced `predicted_irt`. |
 | `rust/mumdia/crates/mumdia-core/src/config.rs` | `RtImTrainConfig` (config.rs:447-512), `CalibrationMethod` enum (config.rs:56-61), and the load-time validation that rejects `calibration_method=none` (config.rs:1336-1342). |
 | `rust/mumdia/crates/mumdia-core/src/schema.rs` | `artifact::RUN_WINDOWS = ("run_windows", 1)` (schema.rs:16). |
 
@@ -374,7 +374,7 @@ at least about 30 gradient steps; a fixed large batch underfits small references
 (deeplc_finetune.py:132-135). `deeplc.finetune(ref_psms, train_kwargs=...)`
 transfer-learns the model (deeplc_finetune.py:137-146); predictions come from
 `deeplc.predict(batch, model=ft_model)` over the unique standard peptidoforms in
-chunks of 100_000 (deeplc_finetune.py:169-184). DeepLC 4.0 multitask returns a 2D
+chunks of 100_000 (deeplc_finetune.py:169-184). DeepLC's multitask models return a 2D
 array (one column per task head); `agg` reduces it to one iRT by averaging across
 heads (`a.mean(axis=1)`, deeplc_finetune.py:58-60, called at 175). Prediction is on
 the DECOY_-stripped underlying sequence so decoys land on the same iRT scale as

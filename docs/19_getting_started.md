@@ -35,7 +35,7 @@ The environments discovered on this machine under
 | Env | Interpreter (`python.exe`) | Key packages (verified) | Used for |
 |---|---|---|---|
 | `py312_mumdia` | `C:/Users/robbi/anaconda3/envs/py312_mumdia/python.exe` | torch 2.5.1+cpu, pyarrow 11.0.0 | `nn_torch` rescorer (`nn_rescore_worker.py`); needs an interpreter with torch |
-| `deeplc_mt` | `C:/Users/robbi/anaconda3/envs/deeplc_mt/python.exe` | DeepLC 4.0.0a2 (multitask), pyarrow | DeepLC per-run fine-tune (`deeplc_finetune.py`) and DeepLC iRT prediction (`deeplc_worker.py`) |
+| `deeplc_411` (venv) | `C:/Users/robbi/deeplc_411/Scripts/python.exe` | DeepLC 4.1.1, torch (CPU), pyarrow | DeepLC iRT prediction (`deeplc_worker.py`) and the optional fine-tune (`deeplc_finetune.py`). The older `deeplc_mt` (4.0.0a2) and `deeplc_410` (4.1.0) interpreters are refused: the engine requires DeepLC >= 4.1.1 |
 | `ms2rescore` (canonical name in `CLAUDE.md`) | not present on this machine | mokapot + MS2PIP | `mokapot` rescorer and MS2PIP intensity prediction |
 
 Notes:

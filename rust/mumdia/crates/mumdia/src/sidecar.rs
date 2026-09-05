@@ -77,6 +77,41 @@ pub fn run_ms2pip(
     Ok(map)
 }
 
+/// Installed version of a Python distribution as the interpreter reports it, read from
+/// package metadata so the probe does not import the package (importing DeepLC loads
+/// torch, which takes seconds and on Windows has an import-order hazard of its own).
+/// None when the interpreter cannot be run or the distribution is not installed.
+pub fn module_version(python: &str, module: &str) -> Option<String> {
+    let code = format!("import importlib.metadata as m; print(m.version('{module}'))");
+    let out = Command::new(python).args(["-c", &code]).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let v = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!v.is_empty()).then_some(v)
+}
+
+/// Refuse a DeepLC interpreter older than `MIN_DEEPLC_VERSION`. The default
+/// retention-time workflow calibrates base-model predictions per run without a
+/// fine-tune, and that rests on the base model not memorising its anchors, which
+/// 4.0.0a2 did (docs/08 section 4b). Both worker scripts repeat the check, but
+/// failing here is cheaper than failing after the input table has been written.
+pub fn require_deeplc_version(python: &str) -> Result<String> {
+    use mumdia_core::constants::{parse_version3, MIN_DEEPLC_VERSION};
+    let (ma, mi, pa) = MIN_DEEPLC_VERSION;
+    let v = module_version(python, "deeplc").ok_or_else(|| {
+        anyhow::anyhow!(
+            "cannot determine the deeplc version through {python} (is DeepLC >= {ma}.{mi}.{pa} installed there?)"
+        )
+    })?;
+    match parse_version3(&v) {
+        Some(t) if t >= MIN_DEEPLC_VERSION => Ok(v),
+        _ => bail!(
+            "deeplc {v} at {python} is older than the required {ma}.{mi}.{pa};              upgrade with `pip install 'deeplc>={ma}.{mi}.{pa}'`"
+        ),
+    }
+}
+
 /// DeepLC: predict retention time per peptidoform. Returns `id -> predicted_rt`.
 pub fn run_deeplc(
     python: &str,
@@ -85,6 +120,7 @@ pub fn run_deeplc(
     ids: &[u32],
     peptidoforms: &[String],
 ) -> Result<HashMap<u32, f32>> {
+    require_deeplc_version(python)?;
     std::fs::create_dir_all(workdir).ok();
     let inp = format!("{workdir}/deeplc_in.parquet");
     let outp = format!("{workdir}/deeplc_out.parquet");
@@ -120,6 +156,7 @@ pub fn run_deeplc_finetune(
     batch: usize,
     window_holdout_frac: f64,
 ) -> Result<()> {
+    require_deeplc_version(python)?;
     info!(
         lib_in,
         seed,

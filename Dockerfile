@@ -25,7 +25,7 @@ FROM mambaorg/micromamba:1.5.10-bookworm-slim
 USER root
 ENV MAMBA_ROOT_PREFIX=/opt/conda
 
-# git is needed to pip-install DeepLC from its pinned commit; build-essential
+# git lets pip install a sidecar dependency pinned to a commit; build-essential
 # lets pip compile any sidecar dependency that ships only as an sdist.
 RUN apt-get update && apt-get install -y --no-install-recommends git build-essential \
     && rm -rf /var/lib/apt/lists/*

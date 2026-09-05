@@ -189,6 +189,13 @@ intensities at one apex; it is not a chromatographic co-elution correlation.
 The observed optimum was about 0.2 with the NN and tighter with the native
 linear model.
 
+DeepLC 4.1.1 or newer is required wherever DeepLC runs (`predict-frag` in FASTA mode, the
+optional fine-tune): `mumdia doctor` fails on an older one, `sidecar::require_deeplc_version`
+refuses to launch either worker, and both worker scripts repeat the check
+(`mumdia_core::constants::MIN_DEEPLC_VERSION` is the single Rust constant). The default retention-time workflow is
+prediction plus per-run LOESS calibration with `finetune_deeplc = false`, and that default
+is only sound on a base model that does not memorise its anchors (4.0.0a2 did).
+
 Three RT rules, each measured in `docs/08_rt_im_train.md` and restated from the
 failure side in `docs/17_troubleshooting.md`:
 
@@ -440,8 +447,9 @@ entrapment validation before default activation.
 The Docker image contains:
 
 - `/opt/mumdia/config.dia.json`: FASTA + MS2PIP/DeepLC + strict mokapot;
-- `/opt/mumdia/config.diann-lib.json`: imported library + per-run DeepLC
-  fine-tune + strict `nn_torch`.
+- `/opt/mumdia/config.diann-lib.json`: imported library + per-run LOESS calibration of
+  the library's retention times (no fine-tune; `rt_im_train.finetune_deeplc` is available
+  for a once-per-library fine-tune) + strict `nn_torch`.
 
 The Dockerfile copies both configs. MuMDIA consumes but does not ship or invoke a
 DIA-NN binary; users create imported libraries under their own DIA-NN license.
