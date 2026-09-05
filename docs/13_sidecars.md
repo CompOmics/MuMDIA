@@ -513,7 +513,7 @@ semi-supervised count), `MUMDIA_NN_HIDDEN` (`128,64,64,32`), `MUMDIA_NN_SOLVER`
 cores); `MUMDIA_MOKAPOT_WORKERS` (3, thread-based CV-fold parallelism).
 `nn_rescore_worker.py`: `MUMDIA_NN_EPOCHS` (25), `MUMDIA_NN_HIDDEN` (`128,64`),
 `MUMDIA_NN_DROPOUT` (0.3), `MUMDIA_NN_LR` (1e-3), `MUMDIA_NN_WD` (1e-4),
-`MUMDIA_NN_BATCH` (4096), `MUMDIA_NN_SEEDS` (1), `MUMDIA_NN_STREAM` (auto),
+`MUMDIA_NN_BATCH` (4096), `MUMDIA_NN_SEEDS` (1), `MUMDIA_NN_SEED` (0, base seed; ensemble member s uses SEED + s, so seeded repeats of one configuration set it to 1, 2, ...), `MUMDIA_NN_STREAM` (auto),
 `MUMDIA_NN_STREAM_GB` (4), `MUMDIA_NN_CHUNK` (250000), `MUMDIA_NN_INIT_SAMPLE`
 (300000) plus the three the Rust caller injects: `MUMDIA_NN_FOLDS` (worker default
 3), `MUMDIA_NN_ITERS` (worker default 5, but `run_pin_sidecar` overrides it with

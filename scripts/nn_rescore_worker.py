@@ -45,6 +45,7 @@ Env knobs (all optional):
     MUMDIA_NN_BATCH       = 4096
     MUMDIA_NN_TRAIN_FDR   = 0.01     positive-selection FDR during training
     MUMDIA_NN_SEEDS       = 1        seed models to ensemble (average OOF)
+    MUMDIA_NN_SEED        = 0        base seed; ensemble member s uses SEED + s (seeded repeats)
     MUMDIA_NN_STREAM      = auto     auto|1|0  force the streaming memmap backend
     MUMDIA_NN_STREAM_GB   = 4        auto-stream when the PIN exceeds this many GB
     MUMDIA_NN_CHUNK       = 250000   PIN rows per read chunk (streaming backend)
@@ -253,6 +254,7 @@ def main():
     BATCH = env_i("MUMDIA_NN_BATCH", 4096)
     TRAIN_FDR = env_f("MUMDIA_NN_TRAIN_FDR", 0.01)
     N_SEEDS = env_i("MUMDIA_NN_SEEDS", 1)
+    BASE_SEED = env_i("MUMDIA_NN_SEED", 0)
     CHUNK = env_i("MUMDIA_NN_CHUNK", 250000)
     EARLY_STOP = env_i("MUMDIA_NN_EARLY_STOP", 1) != 0
     EARLY_STOP_TOL = env_f("MUMDIA_NN_EARLY_STOP_TOL", 0.01)
@@ -737,7 +739,7 @@ def main():
 
     # seed ensemble: average rank-normalised out-of-fold scores across seeds
     acc = np.zeros(n, np.float64)
-    for s in range(N_SEEDS):
+    for s in range(BASE_SEED, BASE_SEED + N_SEEDS):
         np.random.seed(s)
         torch.manual_seed(s)
         oof = one_pass(s)
