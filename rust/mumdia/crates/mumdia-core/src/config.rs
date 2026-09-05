@@ -571,6 +571,15 @@ impl Default for RtImTrainConfig {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ExtractConfig {
+    /// Isolation windows probed per batch before the candidates no later window can touch
+    /// are scored and written. `None` (the default) uses the rayon thread count capped at
+    /// 16. The hit accumulator holds the windows in flight, so this sets the stage's peak
+    /// almost linearly, while the accumulation phase it parallelises is a small part of the
+    /// wall clock: on the HYE benchmark at 32 threads, 32 in flight is 24.65 GiB / 5:00, 16
+    /// is 16.57 GiB / 5:04 and 8 is 12.31 GiB / 5:26, with identical output (docs/27 section
+    /// 3.10). Set 8 or 4 on a memory-bound machine. Not a sensitivity knob.
+    #[serde(default)]
+    pub windows_in_flight: Option<usize>,
     pub fixed_scan_window: usize,
     pub frag_tol_ppm: f64,
     pub prec_tol_ppm: f64,
@@ -740,6 +749,7 @@ pub struct ExtractConfig {
 impl Default for ExtractConfig {
     fn default() -> Self {
         Self {
+            windows_in_flight: None,
             fixed_scan_window: 3,
             frag_tol_ppm: 20.0,
             prec_tol_ppm: 20.0,

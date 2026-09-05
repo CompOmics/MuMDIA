@@ -87,6 +87,7 @@ State of the plan in section 3:
 | 3.3 f32 bulk arrays | shipped `503eadb` | library 26 -> 22 B per fragment row; rescore matrix halved |
 | 3.4 features chunked | shipped | features stage 86.6 -> 3.03 GiB |
 | 3.10 extract window-closing flush | shipped | extract stage 61.33 -> 28.13 GiB |
+| 3.10 incremental merge + `windows_in_flight` cap | shipped 2026-09-05 | extract stage 28.13 -> 16.57 GiB (12.31 at 8 in flight) |
 | 3.5 rescore flat f32 matrix | half shipped `503eadb` | matrix is flat f32; the binary sidecar handoff and the early drop are not done |
 | 3.6 quant reads accepted rows | shipped `503eadb` | |
 | 3.7 compete key columns | shipped `503eadb` | |
@@ -406,11 +407,31 @@ and the unit of memory. Measured: 61.33 -> 28.13 GiB, largest open accumulator 1
 wall 6:08 against 6:10, both output tables identical value for value (2,603,894 PSM rows
 over 21 columns, 38,889,646 chromatogram rows over 7, traces included).
 
-What remains in this stage: a batch's partials coexist with the accumulator during the
-merge, which is most of the 28.13 GiB that is not the 11.94 GiB of open hits. Merging each
-window's partial as it completes (in window order, to keep the hit sequence) or
-parallelising within a window instead of across windows would both cut it, the latter at
-the cost of rebuilding the per-window narrowing cache per scan chunk.
+Two follow-ups shipped on 2026-09-05, both value-preserving (PSM and chromatogram tables
+identical to the byte, 2,603,894 and 38,889,646 rows):
+
+- **Partials merged as windows complete.** The batch accumulator collected every window's
+  partial map and only then merged, so the batch's hits existed twice at that moment.
+  Workers now hand each finished partial over a channel and the calling thread merges in
+  window order (a reorder buffer holds the ones that finished early), dropping each partial
+  as it is merged. 28.13 -> 24.65 GiB, wall 6:08 -> 5:00.
+- **`extract.windows_in_flight`.** The batch is the unit of accumulation parallelism, but
+  that phase is a small, memory-bound part of the stage, so following the thread count
+  bought little and cost a lot. Measured at 32 threads:
+
+  | windows in flight | largest open hits | stage peak | wall |
+  |---|---|---|---|
+  | 32 (old default: thread count) | 11.94 GiB | 24.65 GiB | 5:00 |
+  | **16 (new default cap)** | 6.16 GiB | **16.57 GiB** | 5:04 |
+  | 8 | 3.29 GiB | 12.31 GiB | 5:26 |
+
+  The default is now `min(threads, 16)`; a memory-bound machine sets 8 or 4 explicitly.
+  With that, the tallest stage of a single HYE run is 16.6 GiB, inside the 32 GB laptop
+  this audit set as its target, and 12.3 GiB is available for a 9% wall cost.
+
+What remains: the open hits (6.16 GiB at 16 in flight) are the `Vec<Hit>` payload plus its
+growth slack, and `Hit` is 24 bytes where 16 would do (`obs_mz` as an f32 ppm offset from
+the theoretical m/z, `rt` as a scan index). That is a precision change and gated.
 
 ## 4. Rewrite candidates (structural changes beyond the items above)
 
@@ -479,6 +500,7 @@ sampling interval.
 Status as of 2026-09-04: section 1 remains the code-derived (static) model; section 0
 carries the measured numbers and the state of each plan item. Sections 3.1-3.3 and
 3.6-3.9 shipped in `503eadb`, 3.4 and 3.10 in the commits that added those sections, and
-3.5 is half done. Stage peaks on the benchmark are now rescore 33.04 GiB, extract 28.13
-GiB and features 3.03 GiB, so the next lever is 3.5, the rescore sidecar handoff, and the
-measurement to take is a full `mumdia run` on the current build.
+3.5 is half done. Stage peaks on the benchmark are now extract 16.57 GiB (default) or 12.31
+(8 windows in flight), rescore 8.95 GiB by default (parquet handoff, docs/28 section 11) or
+5.5 GiB with the opt-in recipe, and features 3.03 GiB. A single HYE run fits the 32 GB target
+machine. The measurement to take is a full `mumdia run` on the current build.

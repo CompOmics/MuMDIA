@@ -739,6 +739,7 @@ fn window_groups(idx: &FragIndex, scans: &[Ms2Scan]) -> Vec<WinGroup> {
 /// in window order. Merging in window order (not thread completion order) is what keeps
 /// each candidate's hit sequence, and therefore every float reduction downstream, the
 /// same as the serial path.
+#[allow(clippy::too_many_arguments)]
 fn accumulate_groups(
     idx: &FragIndex,
     groups: &[WinGroup],
@@ -747,10 +748,18 @@ fn accumulate_groups(
     rt_hi: &[f64],
     mass_off: &MassOffset,
     cfg: &ExtractConfig,
-) -> HashMap<u32, Vec<Hit>> {
-    let partials: Vec<Vec<(u32, Vec<Hit>)>> = groups
-        .par_iter()
-        .map(|g| {
+    acc: &mut HashMap<u32, Vec<Hit>>,
+) {
+    // Partials are merged into `acc` in window order as they complete, not collected first
+    // and merged after: with a collect, every window's hits existed twice at the merge (in
+    // the partials and, growing, in the merged map). The channel hands each finished
+    // partial to this thread; the reorder buffer holds the ones that finished ahead of an
+    // earlier window, so the merge order, and with it every candidate's hit sequence, is
+    // exactly the serial one.
+    let (tx, rx) = std::sync::mpsc::channel::<(usize, Vec<(u32, Vec<Hit>)>)>();
+    let probe = |gi: usize, g: &WinGroup| -> Vec<(u32, Vec<Hit>)> {
+        let _ = gi;
+        {
             let ids = &g.scans;
             let (lo, hi) = (g.lo_cid, g.hi_cid);
             let mut local: HashMap<u32, Vec<Hit>> = HashMap::new();
@@ -825,25 +834,64 @@ fn accumulate_groups(
                 }
             }
             local.into_iter().collect()
-        })
-        .collect();
-
-    let mut acc: HashMap<u32, Vec<Hit>> = HashMap::new();
-    for part in partials {
-        for (cid, hits) in part {
-            acc.entry(cid).or_default().extend(hits);
         }
-    }
-    acc
+    };
+    let n = groups.len();
+    // `move`: the receiver is Send but not Sync, so it has to be owned by the scope closure
+    // (the consumer) rather than borrowed into it.
+    rayon::scope(move |sc| {
+        // The workers run under rayon; this thread is the single consumer. `spawn` so the
+        // scope does not block the consumer loop below until every window has finished.
+        sc.spawn(move |_| {
+            groups
+                .par_iter()
+                .enumerate()
+                .for_each_with(tx, |tx, (gi, g)| {
+                    let part = probe(gi, g);
+                    // A closed receiver only happens if the consumer panicked; nothing to do.
+                    let _ = tx.send((gi, part));
+                });
+        });
+        let mut next = 0usize;
+        let mut pending: std::collections::BTreeMap<usize, Vec<(u32, Vec<Hit>)>> =
+            std::collections::BTreeMap::new();
+        let merge = |part: Vec<(u32, Vec<Hit>)>, acc: &mut HashMap<u32, Vec<Hit>>| {
+            for (cid, hits) in part {
+                acc.entry(cid).or_default().extend(hits);
+            }
+        };
+        for _ in 0..n {
+            let (gi, part) = rx.recv().expect("every window sends exactly one partial");
+            if gi == next {
+                merge(part, acc);
+                next += 1;
+                while let Some(p) = pending.remove(&next) {
+                    merge(p, acc);
+                    next += 1;
+                }
+            } else {
+                pending.insert(gi, part);
+            }
+        }
+        debug_assert!(pending.is_empty() && next == n);
+    });
 }
 
 /// Isolation windows probed before the driver flushes the candidates that are now final.
 /// Memory scales with this: the accumulator holds the hits of the windows in flight, so a
 /// batch of `n` windows of width `w` stepping `s` keeps about `n * s + w` Th of the
-/// precursor axis open. It is at least the thread count, because the batch is also the
-/// unit of parallelism.
-fn groups_in_flight() -> usize {
-    rayon::current_num_threads().max(4)
+/// precursor axis open. The batch is also the unit of accumulation parallelism, but that
+/// phase is a small part of the stage and is not compute-bound, so the default is capped at
+/// 16 rather than following the thread count. Measured on the HYE benchmark at 32 threads
+/// (docs/27 section 3.10): 32 in flight 24.65 GiB / 5:00, 16 in flight 16.57 GiB / 5:04,
+/// 8 in flight 12.31 GiB / 5:26, identical output throughout.
+const DEFAULT_MAX_WINDOWS_IN_FLIGHT: usize = 16;
+
+fn groups_in_flight(cfg: &ExtractConfig) -> usize {
+    cfg.windows_in_flight
+        .filter(|&n| n > 0)
+        .unwrap_or_else(|| rayon::current_num_threads().min(DEFAULT_MAX_WINDOWS_IN_FLIGHT))
+        .max(1)
 }
 
 /// Take every candidate below `bound` out of the accumulator, ascending. Windows are
@@ -2581,11 +2629,11 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
         let mut acc_stream: HashMap<u32, Vec<Hit>> = HashMap::new();
         let mut open_hits_max = 0usize;
         if let Some(groups) = stream_groups.as_ref() {
-            let step = groups_in_flight();
+            let step = groups_in_flight(p.cfg);
             let mut gi = 0usize;
             while gi < groups.len() {
                 let upto = (gi + step).min(groups.len());
-                let batch = accumulate_groups(
+                accumulate_groups(
                     fidx.as_ref()
                         .expect("streamed path implies a fragment index"),
                     &groups[gi..upto],
@@ -2594,10 +2642,8 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
                     &rt_hi,
                     &mass_off,
                     p.cfg,
+                    &mut acc_stream,
                 );
-                for (cid, hits) in batch {
-                    acc_stream.entry(cid).or_default().extend(hits);
-                }
                 gi = upto;
                 open_hits_max = open_hits_max.max(acc_stream.values().map(|v| v.len()).sum());
                 // Everything below the next window's first candidate is final.
