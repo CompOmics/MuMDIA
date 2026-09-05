@@ -333,24 +333,39 @@ its decoy-based q is invalid. This is the reason DeepLC 4.1.1 is the engine's fl
 base-model predictions and 4.0.0a2's base model memorised anchors.
 
 HYE B01 (`LFQ_Orbitrap_AIF_Condition_B_Sample_Alpha_01`, 10.9M-row imported library, fast
-rescore recipe with `nn_torch`, `window_holdout_frac 0.3`, one seed each) with the same three
-sources; the base-model arm ran through the engine's own `library_irt = auto` path:
+rescore recipe with `nn_torch`, `window_holdout_frac 0.3`) with the same three sources; the
+base-model arm ran through the engine's own `library_irt = auto` path. The chain up to
+compete is deterministic, so the rescore was repeated under NN seeds 1-3 on each arm's
+competed table (`MUMDIA_NN_SEED`); peptides are the seed 1-3 mean with the range, and the
+seed-0 value of the original single run is in brackets:
 
-| library iRT | peptides at 1% | `w_rt` | in-sample residual median | held-out p95 | candidates extracted | run wall | peak |
+| library iRT | peptides at 1%, seeds 1-3 (seed 0) | `w_rt` | in-sample residual median | held-out p95 | candidates extracted | run wall | peak |
 |---|---|---|---|---|---|---|---|
-| DIA-NN library (raw) | 55,090 | 691 s | 130.0 s | 461 s | 2,744,896 | 30:28 | 24.6 GB |
-| library fine-tuned once on A_01, reused | 59,124 | 345 s | 35.8 s | 230 s | 2,603,894 | 17:52 | 16.5 GiB |
-| **DeepLC 4.1.1 base model (`auto`)** | 58,813 | 414 s | 78.3 s | 276 s | 2,497,844 | 46:36 (27 min is the one-off prediction) | 18.1 GB |
+| DIA-NN library (raw) | 56,556, 56,455-56,686 (55,090) | 691 s | 130.0 s | 461 s | 2,744,896 | 30:28 | 24.6 GB |
+| **library fine-tuned once on A_01, reused** | **60,278, 60,211-60,360** (59,124) | 345 s | 35.8 s | 230 s | 2,603,894 | 17:52 | 16.5 GiB |
+| DeepLC 4.1.1 base model (`auto`) | 58,842, 58,805-58,906 (58,813) | 414 s | 78.3 s | 276 s | 2,497,844 | 46:36 (27 min is the one-off prediction) | 18.1 GB |
 
-On this acquisition the base model is +6.8% over the imported iRT and 0.5% under the
-once-fine-tuned library, inside the pool's 0.9% seed band; on AIF it was 2.3% over the
-fine-tune. The in-sample residual again exaggerates the fine-tune's advantage (35.8 s against
-78.3 s for a 0.5% difference in peptides): held-out p95 (230 against 276 s) is the honest
-comparison. The wide raw windows also cost compute: extract ran 10.6 minutes at 24.6 GB
-against 5.9 minutes at 18.1 GB. The one-off prediction of the HYE library (4,910,158 unique
-stripped sequences, targets and reversed decoys) took 27 minutes on 64 CPU threads; under
-`run-experiment` that is paid once for the six runs, and a saved re-predicted table with
-`library_irt = library` skips it entirely.
+Seed 0 depressed the raw and fine-tuned arms by 1,100-1,400 peptides and the base-model arm
+by none, so the single-seed comparison (base model 0.5% under the fine-tune) was wrong by
+two points: on this acquisition the base model is **+4.0% over the imported iRT and 2.4%
+under the once-fine-tuned library**, both well outside the within-arm seed range of about
+150. On AIF the base model was 2.3% over a per-run fine-tune. The two acquisitions differ in
+how much the fine-tune has to learn from: 5,552 calibration anchors on the E. coli AIF run
+against 18,619 (plus 5,603 held out) on HYE. That is consistent with a fine-tune generalising
+when the reference is large and overfitting when it is small (section 4b), but it is two data
+points, not a rule; check it on your own data before relying on either sign. The held-out p95
+(230 against 276 s) ranks the HYE arms the way the peptides do while the in-sample median
+(35.8 against 78.3 s) exaggerates the gap, as in section 4b.
+
+What follows for the defaults: `auto` is the right default for a library with no fine-tune,
+because it beats the imported iRT by 4.0-4.7% on both acquisitions, is deterministic, and
+costs one prediction pass; the once-per-library fine-tune (`finetune_deeplc`, then reuse the
+`_ft` table with `library_irt = library`) remains the recommended extra step on a large
+reference, worth +2.4% on HYE. The wide raw windows also cost compute: extract ran 10.6
+minutes at 24.6 GB against 5.9 minutes at 18.1 GB. The one-off prediction of the HYE library
+(4,910,158 unique stripped sequences, targets and reversed decoys) took 27 minutes on 64 CPU
+threads; under `run-experiment` that is paid once for the six runs, and a saved re-predicted
+table with `library_irt = library` skips it entirely.
 
 The first HYE attempt at this arm was made with a scratch script that paired decoys as
 `DECOY_` + target sequence. The HYE library's decoys are reversed sequences, so all 5.44M

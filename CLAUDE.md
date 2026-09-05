@@ -107,9 +107,12 @@ Key semantics:
   configured (a new precursor table; once per experiment under `run-experiment`),
   because the imported DIA-NN iRT is the worst RT source measured: AIF 10,015
   peptides raw, 10,181 per-run fine-tuned, 10,416 re-predicted with DeepLC 4.1.1;
-  HYE B01 55,090 raw, 59,124 with a once-fine-tuned library, 58,813 re-predicted
-  (`docs/08_rt_im_train.md` section 4c). The re-prediction is deterministic and
-  costs about 27 minutes once for the 10.9M-row HYE library on 64 threads. Optional DeepLC fine-tuning still runs
+  HYE B01 (NN seeds 1-3) 56,556 raw, 60,278 with a once-fine-tuned library, 58,842
+  re-predicted (`docs/08_rt_im_train.md` section 4c). The re-prediction is
+  deterministic and costs about 27 minutes once for the 10.9M-row HYE library on
+  64 threads. The once-per-library fine-tune is still +2.4% on HYE (18.6k anchors)
+  and -2.3% on AIF (5.6k anchors), so it stays the recommended extra step on a
+  large reference rather than the default. Optional DeepLC fine-tuning still runs
   after seed search and writes a new precursor table rather than modifying the
   input.
 - Stage-level candidate competition is within label, so it does not directly
@@ -209,8 +212,9 @@ Three RT rules, each measured in `docs/08_rt_im_train.md` and restated from the
 failure side in `docs/17_troubleshooting.md`:
 
 - DeepLC fine-tuning of library iRT is the largest RT lever (historically
-  reducing residuals from about 110 s to 13-27 s) and must happen, but it need
-  not happen per file. A library fine-tuned once and predicted over every
+  reducing residuals from about 110 s to 13-27 s) after the base-model
+  re-prediction that `library_irt = auto` now does by default, and it need not
+  happen per file. A library fine-tuned once and predicted over every
   peptidoform, combined with the per-run LOESS calibration and
   `rt_im_train.finetune_deeplc = false`, measured equal or marginally better
   residuals than per-file fine-tuning while removing about 36 minutes per file.

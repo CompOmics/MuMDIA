@@ -988,9 +988,10 @@ What became default, and what did not, from everything above:
 - **Retention time: calibration of DeepLC base-model predictions, DeepLC >= 4.1.1 required.**
   `rt_im_train.library_irt = auto` re-predicts an imported library's iRT with the base model
   when a DeepLC interpreter is configured (docs/08 section 4c: AIF 10,416 peptides against
-  10,015 raw and 10,181 fine-tuned; HYE B01 58,813 against 55,090 raw and 59,124 with a
-  once-fine-tuned library; `w_rt` 343 s against 632 s and 472 s on AIF), once per
-  experiment. `finetune_deeplc` stays off; the fine-tune remains available. The floor is
+  10,015 raw and 10,181 fine-tuned; HYE B01 over NN seeds 1-3 58,842 against 56,556 raw and
+  60,278 with a once-fine-tuned library; `w_rt` 343 s against 632 s and 472 s on AIF), once
+  per experiment. The once-per-library fine-tune remains the recommended extra step on a
+  large reference (+2.4% on HYE, -2.3% on AIF). `finetune_deeplc` stays off; the fine-tune remains available. The floor is
   enforced by `doctor`, by the sidecar launch and by both worker scripts, because the default
   path is only sound on a base model that does not memorise its anchors.
 - **Features stage: no cut.** The stage's cost is not the feature arithmetic. On the HYE B01

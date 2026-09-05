@@ -159,6 +159,15 @@ therefore essential, not optional, in library-input mode. Do not use an
 already-fine-tuned library (a `_ft` or reversed-decoy library) as a "raw DIA-NN"
 baseline; the raw baseline is the un-fine-tuned precursor library.
 
+Addendum 2026-09-05 (docs/08 section 4c): most of that gain is available without a
+fine-tune. Re-predicting the imported iRT with the DeepLC 4.1.1 base model
+(`rt_im_train.library_irt = auto`, the default) is +4.0% peptides over the raw iRT on
+HYE B01 (NN seeds 1-3) and +4.0% on AIF; the once-per-library fine-tune is a further
++2.4% on HYE (18.6k anchors) and -2.3% on AIF (5.6k anchors). The essential step is
+therefore DeepLC 4.1.1 predictions, with the fine-tune as the recommended extra on a
+large reference. Single-seed comparisons of these arms misled by two points because NN
+seed 0 depressed two of the three arms; compare with seeds.
+
 What is not established is that the fine-tune must be repeated for every file.
 Measured: a library whose `predicted_irt` was fine-tuned once and then predicted
 across every peptidoform in that library, combined with the ordinary per-run
