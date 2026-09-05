@@ -1275,6 +1275,23 @@ pub struct RescoreConfig {
     /// iterations x 3 folds of the whole training set.
     #[serde(default)]
     pub train_warm_epochs: usize,
+    /// Under `train_neg_select = hybrid`, the share of the negative budget taken from the
+    /// margin (highest-scoring decoys); the rest is sampled at random. Default 0.5.
+    #[serde(default = "default_margin_frac")]
+    pub train_margin_frac: f64,
+    /// Independent self-training passes whose out-of-fold scores are rank-averaged. 1 (the
+    /// default) is a single pass. 3 was the one knob positive on every pool of the seeded
+    /// sweep (docs/28 section 17), at three times the training cost.
+    #[serde(default = "default_seeds")]
+    pub seeds: usize,
+}
+
+fn default_margin_frac() -> f64 {
+    0.5
+}
+
+fn default_seeds() -> usize {
+    1
 }
 
 /// Which decoys survive the training-set negative cap.
@@ -1315,6 +1332,8 @@ impl Default for RescoreConfig {
             train_neg_select: NegSelect::Random,
             train_subsample: 0.0,
             train_warm_epochs: 0,
+            train_margin_frac: 0.5,
+            seeds: 1,
         }
     }
 }

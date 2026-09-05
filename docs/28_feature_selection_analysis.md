@@ -699,7 +699,10 @@ Shipped as the new default:
   no configuration required, and mokapot/entrapment sidecars keep receiving the TSV they need.
 
 Recommended but NOT default, because they change what the classifier sees and therefore need a
-deliberate choice:
+deliberate choice. Two recipes, measured on three pools with seeds (section 17.1):
+
+**Fast** (~9x less training than the shipped configuration; +1.2% HYE A01, -0.2% AIF, +4.9%
+entrapment):
 
 ```json
 "rescore": {
@@ -707,6 +710,21 @@ deliberate choice:
   "train_neg_ratio": 3.0,
   "train_neg_select": "hybrid",
   "train_warm_epochs": 5
+}
+```
+
+**Sensitivity** (~1.5x less training than the shipped configuration; +1.6% HYE A01, +0.2% AIF,
++5.5% entrapment, spike-in FDP unchanged):
+
+```json
+"rescore": {
+  "features_file": "bench/feature_selection/fs_union75_dedup.txt",
+  "train_neg_ratio": 3.0,
+  "train_neg_select": "hybrid",
+  "train_warm_epochs": 5,
+  "folds": 5,
+  "train_margin_frac": 0.75,
+  "seeds": 3
 }
 ```
 
@@ -829,11 +847,27 @@ Entrapment pool, seeds 3-5, against the 387-feature all-decoy baseline of those 
 AIF, the same seeds (baseline 10,523): recipe -0.23%, folds 5 +0.01%, margin 0.75 -0.19%,
 folds 5 + margin 0.75 +0.14%, folds 5 + seeds 3 +0.16%, all three +0.22%.
 
-HYE A01, seeds 3-5: running at the time of writing; the table is appended when it lands.
+HYE A01, seeds 3-5 (baseline 59,421):
 
-Conclusion: the recipe stays as recommended in section 15. If a caller wants the last
-fraction of a percent and can afford 3x the (now small) training time, `MUMDIA_NN_SEEDS=3`
-is the one knob with a positive sign on every pool.
+| arm | peptides | vs baseline | training |
+|---|---|---|---|
+| recipe | 60,109 | +1.16% | 18.0 s |
+| recipe + folds 5 | 60,136 | +1.20% | 35.7 s |
+| recipe + margin 0.75 | 60,017 | +1.00% | 18.0 s |
+| recipe + folds 5 + margin 0.75 | 60,193 | +1.30% | 35.6 s |
+| recipe + folds 5 + seeds 3 | 60,317 | +1.51% | 107.4 s |
+| **recipe + folds 5 + margin 0.75 + seeds 3** | **60,352** | **+1.57%** | 107.2 s |
+
+The full combination is the best arm on all three pools: +1.57% (A01), +0.22% (AIF), +5.49%
+(entrapment, FDP 0.57% against the baseline's 0.56%), against the shipped baseline, and its
+training (107 s on A01) is still 1.5x faster than the baseline's 164 s. That makes two
+recipes worth naming rather than one; section 15 has both.
+
+Conclusion: individually, no knob beats the recipe consistently; together, 5 folds, a 0.75
+margin fraction and a 3-seed rank ensemble do, on every pool, for about 6x the recipe's
+training time, which is still less than the shipped baseline's. Both recipes are in section
+15; `rescore.seeds` and `rescore.train_margin_frac` were added so the second one is
+configurable rather than an environment recipe.
 
 ## 18. Pipeline factors, end to end (2026-09-05)
 

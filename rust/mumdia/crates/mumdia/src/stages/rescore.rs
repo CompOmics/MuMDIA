@@ -658,6 +658,8 @@ pub fn run(p: RescoreParams) -> Result<u64> {
             "train_neg_select": format!("{:?}", p.cfg.train_neg_select).to_lowercase(),
             "train_subsample": p.cfg.train_subsample,
             "train_warm_epochs": p.cfg.train_warm_epochs,
+            "train_margin_frac": p.cfg.train_margin_frac,
+            "seeds": p.cfg.seeds.max(1),
             "n_features_used": feat_names.len(),
             "n_features_available": expected_schema.feature_columns.len(),
             "feature_selection_id": crate::stages::features::feature_schema_id(&feat_names),
@@ -1174,6 +1176,8 @@ fn run_pin_sidecar(
             },
         )
         .env("MUMDIA_NN_WARM_EPOCHS", p.cfg.train_warm_epochs.to_string())
+        .env("MUMDIA_NN_MARGIN_FRAC", p.cfg.train_margin_frac.to_string())
+        .env("MUMDIA_NN_SEEDS", p.cfg.seeds.max(1).to_string())
         .spawn()
         .map_err(|e| {
             // A bare `.spawn()?` reported only "No such file or directory (os error 2)" with
