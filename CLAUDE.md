@@ -303,6 +303,11 @@ sections 10-16:
 - Combined (`parquet` + 114 features + `train_neg_ratio: 3, train_neg_select: hybrid,
   train_warm_epochs: 5`), the full-scale rescore went from 33.04 GiB / 53:07 to 5.49 GB / 3:19
   at -0.66% peptides, inside that pool's 0.9% seed band, with the spike-in FDP unchanged.
+  That is the "fast" recipe of docs/28 section 15. The "sensitivity" recipe adds `folds: 5,
+  train_margin_frac: 0.75, seeds: 3`: +1.6% / +0.2% / +5.5% peptides against the shipped
+  configuration on HYE A01 / AIF / entrapment with the spike-in FDP unchanged, for about 6x
+  the fast recipe's training, which is still 1.5x less than the shipped configuration's.
+  Both are opt-in.
 - Do not set `train_neg_select: margin` with `train_neg_ratio: 1`. It is the fastest recipe
   and +1.27% on HYE, and it loses 10.35% on the entrapment pool.
 - Judge any of these on at least two pools and with seeds. Seed 0 of the HYE baseline scored
