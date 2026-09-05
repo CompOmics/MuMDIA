@@ -8,7 +8,7 @@ use std::time::Instant;
 
 use anyhow::{anyhow, Context as _, Result};
 use arrow::array::{Array, Float64Array};
-use mumdia_core::config::{RescoreConfig, RescorerKind};
+use mumdia_core::config::{FeaturePreset, RescoreConfig, RescorerKind};
 use mumdia_core::schema::artifact;
 use mumdia_io::report::ArtifactReport;
 use mumdia_io::table::{write_table, Col, TableFile};
@@ -662,6 +662,11 @@ pub fn run(p: RescoreParams) -> Result<u64> {
             "seeds": p.cfg.seeds.max(1),
             "n_features_used": feat_names.len(),
             "n_features_available": expected_schema.feature_columns.len(),
+            "feature_preset": if p.cfg.features.is_some() || p.cfg.features_file.is_some() {
+                "explicit".to_string()
+            } else {
+                format!("{:?}", p.cfg.feature_preset).to_lowercase()
+            },
             "feature_selection_id": crate::stages::features::feature_schema_id(&feat_names),
             "features_used": if feat_names.len() == expected_schema.feature_columns.len() {
                 serde_json::Value::Null
@@ -698,19 +703,68 @@ pub fn run(p: RescoreParams) -> Result<u64> {
 /// never silently reorder the matrix (the sidecar contract is positional). A name that is
 /// not in the schema is an error rather than a silent drop: a typo in a 100-name list
 /// would otherwise train a different model than the one asked for.
+/// The `compact` preset, one name per line; see `FeaturePreset::Compact`.
+const COMPACT_FEATURES: &str = include_str!("feature_presets/compact.txt");
+
+/// One feature name per line, blank lines and `#` comments ignored.
+fn parse_feature_list(text: &str) -> Vec<String> {
+    text.lines()
+        .map(|l| l.split('#').next().unwrap_or("").trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect()
+}
+
+fn preset_names(preset: FeaturePreset) -> Option<Vec<String>> {
+    match preset {
+        FeaturePreset::All => None,
+        FeaturePreset::Compact => Some(parse_feature_list(COMPACT_FEATURES)),
+    }
+}
+
 fn resolve_feature_subset(cfg: &RescoreConfig, available: &[String]) -> Result<Vec<String>> {
     let wanted: Vec<String> = match (&cfg.features, &cfg.features_file) {
         (Some(_), Some(_)) => anyhow::bail!(
             "rescore.features and rescore.features_file are mutually exclusive; set one"
         ),
-        (None, None) => return Ok(available.to_vec()),
+        (None, None) => {
+            let Some(names) = preset_names(cfg.feature_preset) else {
+                return Ok(available.to_vec());
+            };
+            // A preset is a default, not a contract with one feature set: names the
+            // table lacks (a smaller `features.set`) are skipped, visibly.
+            let have: std::collections::HashSet<&str> =
+                available.iter().map(String::as_str).collect();
+            let keep: std::collections::HashSet<&str> = names
+                .iter()
+                .map(String::as_str)
+                .filter(|n| have.contains(n))
+                .collect();
+            if keep.is_empty() {
+                anyhow::bail!(
+                    "rescore.feature_preset {:?} shares no column with the competed table's \
+                     feature schema",
+                    cfg.feature_preset
+                );
+            }
+            if keep.len() < names.len() {
+                info!(
+                    preset = ?cfg.feature_preset,
+                    skipped = names.len() - keep.len(),
+                    kept = keep.len(),
+                    "rescore: preset names absent from this feature set are skipped"
+                );
+            }
+            return Ok(available
+                .iter()
+                .filter(|a| keep.contains(a.as_str()))
+                .cloned()
+                .collect());
+        }
         (Some(list), None) => list.clone(),
-        (None, Some(path)) => std::fs::read_to_string(path)
-            .with_context(|| format!("reading rescore.features_file {path}"))?
-            .lines()
-            .map(|l| l.split('#').next().unwrap_or("").trim().to_string())
-            .filter(|l| !l.is_empty())
-            .collect(),
+        (None, Some(path)) => parse_feature_list(
+            &std::fs::read_to_string(path)
+                .with_context(|| format!("reading rescore.features_file {path}"))?,
+        ),
     };
     if wanted.is_empty() {
         anyhow::bail!("rescore feature selection resolved to an empty list");
@@ -1250,8 +1304,46 @@ mod tests {
         RescoreConfig {
             features: features.map(|v| v.into_iter().map(String::from).collect()),
             features_file: file.map(String::from),
+            feature_preset: FeaturePreset::All,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn compact_preset_is_114_unique_names_and_intersects_the_schema() {
+        let names = preset_names(FeaturePreset::Compact).unwrap();
+        assert_eq!(names.len(), 114);
+        let uniq: std::collections::HashSet<&String> = names.iter().collect();
+        assert_eq!(
+            uniq.len(),
+            114,
+            "duplicate name in the embedded compact list"
+        );
+        let cfg = RescoreConfig {
+            feature_preset: FeaturePreset::Compact,
+            ..cfg_with(None, None)
+        };
+        // Schema order is kept and names the table lacks are skipped, not fatal.
+        let avail: Vec<String> = ["zz", "rt_error_abs", "coelution_run", "yy"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(
+            resolve_feature_subset(&cfg, &avail).unwrap(),
+            vec!["rt_error_abs".to_string(), "coelution_run".to_string()]
+        );
+        let none: Vec<String> = vec!["zz".to_string()];
+        let e = resolve_feature_subset(&cfg, &none).unwrap_err();
+        assert!(e.to_string().contains("shares no column"), "{e}");
+        // An explicit list wins over the preset.
+        let explicit = RescoreConfig {
+            feature_preset: FeaturePreset::Compact,
+            ..cfg_with(Some(vec!["zz"]), None)
+        };
+        assert_eq!(
+            resolve_feature_subset(&explicit, &avail).unwrap(),
+            vec!["zz".to_string()]
+        );
     }
 
     #[test]

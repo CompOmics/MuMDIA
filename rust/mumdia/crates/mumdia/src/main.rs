@@ -413,7 +413,7 @@ fn doctor(cfg: &Config) -> Result<()> {
                             .is_some_and(|t| t >= mumdia_core::constants::MIN_DEEPLC_VERSION);
                         let (ma, mi, pa) = mumdia_core::constants::MIN_DEEPLC_VERSION;
                         if ok {
-                            println!("  [ok]   {label}: deeplc {v} (>= {ma}.{mi}.{pa})");
+                            println!("  [ ok ] {label}: deeplc {v} (>= {ma}.{mi}.{pa})");
                         } else {
                             println!("  [FAIL] {label}: deeplc {v} is older than the required {ma}.{mi}.{pa}");
                             bad = true;

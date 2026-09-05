@@ -62,7 +62,20 @@ fn preflight(p: &RunParams) -> Result<()> {
     if p.config.rt_im_train.finetune_deeplc && p.config.predict_frag.deeplc_python.is_none() {
         anyhow::bail!(
             "rt_im_train.finetune_deeplc requires predict_frag.deeplc_python (a Python \
-             interpreter with DeepLC 4.0 multitask installed)"
+             interpreter with DeepLC >= 4.1.1 installed)"
+        );
+    }
+    if p.lib_precursors.is_some()
+        && matches!(
+            p.config.rt_im_train.library_irt,
+            mumdia_core::config::LibraryIrt::Deeplc
+        )
+        && p.config.predict_frag.deeplc_python.is_none()
+    {
+        anyhow::bail!(
+            "rt_im_train.library_irt = deeplc requires predict_frag.deeplc_python (a Python \
+             interpreter with DeepLC >= 4.1.1); set library_irt = library to keep the \
+             imported iRT"
         );
     }
     match p.config.rescore.classifier {
@@ -306,7 +319,54 @@ pub fn run(p: RunParams) -> Result<()> {
             &ch,
         )?);
         lib_p_ft
+    } else if cfg.rt_im_train.repredicts_library_irt(
+        p.lib_precursors.is_some(),
+        cfg.predict_frag.deeplc_python.is_some(),
+    ) {
+        // Library-input mode without a fine-tune: replace the imported iRT with DeepLC
+        // base-model predictions before calibration. The prediction does not depend on
+        // the run, so `run-experiment` computes it once for all runs instead.
+        let python = cfg
+            .predict_frag
+            .deeplc_python
+            .as_deref()
+            .expect("repredicts_library_irt implies deeplc_python");
+        let script = crate::sidecar::resolve_script(
+            &cfg.predict_frag.sidecar_script_dir,
+            "deeplc_finetune.py",
+        );
+        let lib_p_dl = d("fragment_library_precursors_deeplc.parquet");
+        info!(stage = %"deeplc-repredict", "run: stage start");
+        crate::sidecar::run_deeplc_repredict(
+            python,
+            &script,
+            &lib_p,
+            &lib_p_dl,
+            rayon::current_num_threads(),
+        )?;
+        let n_dl = mumdia_io::table::nrows(&lib_p_dl)?;
+        man.record(record_artifact(
+            artifact::FRAGMENT_LIBRARY_PRECURSORS.0,
+            artifact::FRAGMENT_LIBRARY_PRECURSORS,
+            &lib_p_dl,
+            n_dl,
+            "deeplc-repredict",
+            &ch,
+        )?);
+        lib_p_dl
     } else {
+        if p.lib_precursors.is_some()
+            && matches!(
+                cfg.rt_im_train.library_irt,
+                mumdia_core::config::LibraryIrt::Auto
+            )
+        {
+            tracing::warn!(
+                "run: keeping the imported library iRT because no predict_frag.deeplc_python \
+                 is configured; configure one to re-predict with DeepLC, or set \
+                 rt_im_train.library_irt = library to silence this"
+            );
+        }
         lib_p
     };
 
@@ -515,6 +575,11 @@ pub fn run(p: RunParams) -> Result<()> {
     let library_input = p.lib_precursors.is_some();
     let rt_identity = if cfg.rt_im_train.finetune_deeplc {
         "deeplc-finetuned".to_string()
+    } else if cfg
+        .rt_im_train
+        .repredicts_library_irt(library_input, cfg.predict_frag.deeplc_python.is_some())
+    {
+        "deeplc-base-model".to_string()
     } else if library_input {
         "imported-library".to_string()
     } else {

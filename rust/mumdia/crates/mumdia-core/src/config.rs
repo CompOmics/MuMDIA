@@ -545,6 +545,45 @@ pub struct RtImTrainConfig {
     /// model. 0.0 (default) keeps in-sample sizing. Mutually exclusive with
     /// `adaptive_rt_window`. Benchmark-gated; do not default on.
     pub window_holdout_frac: f64,
+    /// Where an imported library's `predicted_irt` comes from. `auto` (the default)
+    /// re-predicts every peptidoform with the DeepLC base model when
+    /// `predict_frag.deeplc_python` is configured and keeps the imported values, with a
+    /// warning, when it is not; `deeplc` requires the interpreter; `library` keeps the
+    /// imported values. Ignored under `finetune_deeplc` (the fine-tune re-predicts every
+    /// peptidoform itself) and in FASTA mode (predict-frag already produces DeepLC
+    /// predictions). Measured on the AIF benchmark with calibration only and native_tda:
+    /// 10,416 peptides at 1% from DeepLC 4.1.1 base predictions against 10,015 from the
+    /// DIA-NN library iRT and 10,181 from a per-run fine-tune, with `w_rt` 343 s against
+    /// 632 s and 472 s (docs/08 section 4c). `run-experiment` predicts once per experiment.
+    pub library_irt: LibraryIrt,
+}
+
+/// Source of `predicted_irt` for an imported library; see `RtImTrainConfig::library_irt`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LibraryIrt {
+    #[default]
+    Auto,
+    Library,
+    Deeplc,
+}
+
+impl RtImTrainConfig {
+    /// Whether an imported library's `predicted_irt` is re-predicted with the DeepLC base
+    /// model before RT calibration. False in FASTA mode, under a fine-tune (which
+    /// re-predicts by itself), under `library_irt = library`, and under `auto` without a
+    /// DeepLC interpreter (the orchestrator warns in that case). `deeplc` without an
+    /// interpreter is a preflight error, so it resolves to true here.
+    pub fn repredicts_library_irt(&self, library_input: bool, has_deeplc: bool) -> bool {
+        if !library_input || self.finetune_deeplc {
+            return false;
+        }
+        match self.library_irt {
+            LibraryIrt::Library => false,
+            LibraryIrt::Deeplc => true,
+            LibraryIrt::Auto => has_deeplc,
+        }
+    }
 }
 impl Default for RtImTrainConfig {
     fn default() -> Self {
@@ -564,6 +603,7 @@ impl Default for RtImTrainConfig {
             adaptive_rt_bins: 12,
             rt_window_min_s: 1.0,
             window_holdout_frac: 0.0,
+            library_irt: LibraryIrt::Auto,
         }
     }
 }
@@ -1252,6 +1292,16 @@ pub struct RescoreConfig {
     /// and `#` comments ignored), which is how a 100+ name list stays readable.
     #[serde(default)]
     pub features_file: Option<String>,
+    /// Named feature list used when neither `features` nor `features_file` is set. `all`
+    /// is every feature the competed table carries. `compact` is the 114-name list of
+    /// docs/28 section 12 (`bench/feature_selection/fs_union75_dedup.txt`, embedded in the
+    /// binary), which with the hard-negative training recipe reproduced the full Extended
+    /// set within seed noise on three pools (HYE A01 +1.2%, AIF -0.2%, entrapment +4.9%,
+    /// spike-in FDP unchanged) at 3.4x less rescore memory. Preset names the table lacks
+    /// are skipped with a log line rather than an error, so a preset tolerates a smaller
+    /// `features.set`; the intersection must not be empty. Explicit lists stay strict.
+    #[serde(default)]
+    pub feature_preset: FeaturePreset,
     /// Cap the decoys the sidecar TRAINS on at this multiple of the targets it selected
     /// that iteration; 0 (the default) trains on every decoy, which is about 19:1 on a
     /// DIA pool and is where the rescore spends its time.
@@ -1294,6 +1344,17 @@ fn default_seeds() -> usize {
     1
 }
 
+/// Named feature list for `RescoreConfig::feature_preset`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FeaturePreset {
+    /// Every feature column of the competed table.
+    #[default]
+    All,
+    /// The 114-feature list of docs/28 section 12, embedded in the engine.
+    Compact,
+}
+
 /// Which decoys survive the training-set negative cap.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1328,6 +1389,7 @@ impl Default for RescoreConfig {
             handoff: Handoff::Parquet,
             features: None,
             features_file: None,
+            feature_preset: FeaturePreset::All,
             train_neg_ratio: 0.0,
             train_neg_select: NegSelect::Random,
             train_subsample: 0.0,
@@ -1658,6 +1720,38 @@ mod tests {
             Config::from_json(&text)
                 .unwrap_or_else(|e| panic!("shipped config {name} does not parse: {e}"));
         }
+    }
+
+    #[test]
+    fn library_irt_resolves_per_mode_and_interpreter() {
+        let mut rt = RtImTrainConfig::default();
+        assert_eq!(rt.library_irt, LibraryIrt::Auto);
+        assert!(rt.repredicts_library_irt(true, true));
+        assert!(
+            !rt.repredicts_library_irt(true, false),
+            "auto without an interpreter keeps the library iRT"
+        );
+        assert!(
+            !rt.repredicts_library_irt(false, true),
+            "FASTA mode never re-predicts"
+        );
+        rt.finetune_deeplc = true;
+        assert!(
+            !rt.repredicts_library_irt(true, true),
+            "the fine-tune re-predicts by itself"
+        );
+        rt.finetune_deeplc = false;
+        rt.library_irt = LibraryIrt::Library;
+        assert!(!rt.repredicts_library_irt(true, true));
+        rt.library_irt = LibraryIrt::Deeplc;
+        assert!(
+            rt.repredicts_library_irt(true, false),
+            "explicit deeplc is a preflight matter, not a fallback"
+        );
+        let c = Config::from_json(r#"{"rt_im_train":{"library_irt":"deeplc"}}"#).expect("parses");
+        assert_eq!(c.rt_im_train.library_irt, LibraryIrt::Deeplc);
+        let c = Config::from_json("{}").expect("parses");
+        assert_eq!(c.rt_im_train.library_irt, LibraryIrt::Auto);
     }
 
     #[test]

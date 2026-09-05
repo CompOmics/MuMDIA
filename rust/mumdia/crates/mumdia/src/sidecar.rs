@@ -196,6 +196,43 @@ pub fn run_deeplc_finetune(
     .context("DeepLC fine-tune failed")
 }
 
+/// DeepLC base-model re-prediction of an imported library's `predicted_irt`: the
+/// fine-tune worker with `--no-finetune`, so the table rewrite (targets predicted on their
+/// peptidoform, decoys on the DECOY_-stripped sequence, rows with non-standard residues
+/// keeping the imported value) is the one the fine-tune path uses. Positional contract:
+/// `deeplc_finetune.py <lib_in> - <lib_out> --no-finetune`. Prediction is forward-only,
+/// so it takes the engine's full thread count rather than the fine-tune's bounded pool.
+pub fn run_deeplc_repredict(
+    python: &str,
+    script: &str,
+    lib_in: &str,
+    lib_out: &str,
+    threads: usize,
+) -> Result<()> {
+    require_deeplc_version(python)?;
+    info!(
+        lib_in,
+        lib_out, threads, "sidecar: re-predicting the library iRT with the DeepLC base model"
+    );
+    let th = threads.max(1).to_string();
+    run_worker(
+        python,
+        script,
+        &[
+            lib_in,
+            "-",
+            lib_out,
+            "--no-finetune",
+            "--threads",
+            &th,
+            "--predict-threads",
+            &th,
+        ],
+        true,
+    )
+    .context("DeepLC library re-prediction failed")
+}
+
 /// MBR transfer (Stage D3): match-between-runs identification transfer over the
 /// experiment-wide scored table + per-run psms. Positional contract:
 /// `mbr_worker.py <scored_combined> <psms_csv> <out_transferred> [flags]`, where
