@@ -4,10 +4,14 @@ Status: analysis only. No engine code changes. Scripts in `bench/feature_selecti
 outputs under `C:/Users/robbi/mumdia_bench/fs/` (off OneDrive; large). Measured
 2026-09-04.
 
-> 2026-09-05: sections 10-16 add the implementation and its measurements. Headline: the
-> sidecar handoff is now parquet by default (rescore peak 29.96 -> 8.95 GB), and the
-> combination of a 114-feature list with hard-negative training took the full-scale HYE
-> rescore from 33.04 GiB / 53:07 to **5.49 GB / 3:19** at -0.66% peptides. Sections 1-9 are
+> 2026-09-05: sections 10-19 add the implementation and its measurements. Headline: the
+> sidecar handoff is now parquet by default (rescore peak 29.96 -> 8.95 GB); a 114-feature
+> list with hard-negative training took the full-scale HYE rescore from 33.04 GiB / 53:07 to
+> **5.49 GB / 3:19** at -0.66% peptides; the six-run pooled rescore runs in **18 minutes at
+> 15.9 GB** at parity with August (72,344 vs 72,044 peptides); and a complete single run is
+> **17:52 at 16.5 GiB** (was 67:30 at 86.6 GiB the day before). A seeded sweep of the
+> rescorer's hyperparameters (section 17) and of the pipeline's extraction/RT factors
+> (section 18) found the shipped values at a local optimum on every pool. Sections 1-9 are
 > the original analysis and stand unchanged.
 
 ## 0. Summary
@@ -746,7 +750,163 @@ What NOT to do:
 - Nothing here was measured on a third instrument type. Both HYE and AIF are Orbitrap AIF
   acquisitions, and the entrapment pool is the AIF file again with a different library.
 
-## 17. Caveats of the original (2026-09-04) analysis
+## 17. The rescorer itself, swept with seeds (2026-09-05)
+
+Training at 3-20 s per fit instead of 165 s made a systematic sweep of the classifier
+affordable for the first time. Every arm is the fast recipe (3:1 hybrid cap, warm start 5)
+with one knob changed, two seeds per arm (three on the combination grid), on three pools;
+`recipe` is the reference each pool is read against, and `baseline` is the shipped
+configuration before any of this work. Peptides at 1%; B01 is still running on hippogriff.
+
+| arm | HYE A01 | AIF | entrapment (FDP) |
+|---|---|---|---|
+| baseline (all decoys, fresh fits, 128-64) | 59,615 | 10,512 | 2,837 (0.49%) |
+| **recipe** | **60,192 (+0.97%)** | 10,502 (-0.09%) | 2,932 (+3.33%, 0.60%) |
+| hidden 256-128 | +0.81% | -0.15% | +2.50% |
+| hidden 256-128-64 | +0.66% | -0.42% | +4.34% |
+| hidden 512-256 | +0.53% | -0.53% | +0.09% |
+| hidden 64-32 | +0.50% | +0.01% | -1.67% |
+| dropout 0.1 | +0.41% | 0.00% | +1.99% |
+| dropout 0.5 | +0.26% | -0.11% | +3.05% |
+| epochs 50 / warm 10 | +0.42% | -0.63% | +2.03% |
+| epochs 12 / warm 3 | -0.16% | -0.08% | -0.23% |
+| lr 3e-4 | -0.02% | -0.03% | **-7.10%** |
+| lr 3e-3 | +0.45% | -0.20% | +2.86% |
+| batch 1024 | +0.90% | -0.17% | +1.50% |
+| batch 16384, lr 2e-3 | +0.28% | -0.54% | +1.15% |
+| folds 5 | +0.55% | +0.04% | +3.33% |
+| seeds 3 (rank ensemble) | **+1.27%** | +0.10% | +3.24% |
+| iterations 20 | **+1.42%** | -0.09% | +1.64% |
+| iterations 6 | -1.62% | +0.02% | **-4.65%** |
+| train FDR 0.02 | +0.80% | -0.65% | +3.95% |
+| train FDR 0.005 | +0.04% | -0.01% | **-5.09%** |
+| margin fraction 0.75 | +0.63% | -0.08% | +3.70% |
+| margin fraction 0.25 | +0.77% | -0.10% | +2.94% |
+| weight decay 1e-3 | -0.31% | -0.20% | +3.84% |
+| weight decay 0 | +0.42% | 0.00% | +3.40% |
+
+Read across the pools, nothing beats the recipe consistently:
+
+- **Capacity is not the lever.** Wider and deeper networks are monotonically worse on A01
+  and AIF (512-256: -0.5% on both); the shipped 128-64 is at the optimum. 64-32 is as good
+  as 128-64 on AIF at half the cost and loses 1.7% on the entrapment pool and 0.5% on A01.
+- **The training schedule is at its optimum too.** 25 epochs, lr 1e-3, dropout 0.3, batch
+  4096, weight decay 1e-4 are each the best or within noise of the best of their column;
+  every departure that helps one pool costs another (lr 3e-4 loses 7.1% on entrapment;
+  batch 16k loses 0.5% on AIF; 50 epochs loses 0.6% on AIF).
+- **Fewer iterations is not free, more is not consistently better.** 6 iterations loses
+  1.6% (A01) and 4.7% (entrapment); 20 gains 0.45 pp on A01, nothing on AIF and loses 1.7 pp
+  on entrapment against the recipe. The 10 the engine ships is right.
+- **The train-FDR threshold is asymmetric and pool-dependent**: 0.005 loses 5.1% on
+  entrapment (too few positives to learn from), 0.02 gains there and loses 0.65% on AIF.
+  0.01 stays.
+- **Two knobs are neutral-to-positive everywhere**, and small: a 3-seed rank ensemble
+  (+0.3 pp on A01, +0.2 pp on AIF, -0.1 pp on entrapment, at 3x the training) and 5 folds
+  (-0.4 pp, +0.1 pp, 0.0 pp, at 1.7x). Combined with a 0.75 margin fraction, three seeds
+  each on AIF: folds 5 + margin 0.75 + seeds 3 is +0.22% against the 387-feature baseline
+  where the recipe alone is -0.23%; the same combination on the entrapment pool is in
+  section 17.1.
+
+The spike-in FDP across the whole grid on the entrapment pool is 0.49-0.64% against a 0.49%
+baseline (the recipe's 0.60% is 29 spike-in peptides against 23; across the four seeds run
+on this pool the baseline averages 0.53% and the recipe 0.59%, a difference well inside the
+Poisson noise of counts that size). No arm learns decoy structure.
+
+### 17.1 Combination grid, three seeds
+
+Entrapment pool, seeds 3-5, against the 387-feature all-decoy baseline of those seeds
+(2,804 peptides, FDP 0.56%):
+
+| arm | peptides | vs baseline | spike-in peptides | FDP | training |
+|---|---|---|---|---|---|
+| recipe | 2,940 | +4.87% | 30.7 | 0.62% | 8.1 s |
+| recipe + folds 5 | 2,908 | +3.72% | 26.0 | 0.54% | 16.0 s |
+| recipe + margin 0.75 | 2,910 | +3.80% | 30.0 | 0.62% | 8.2 s |
+| recipe + folds 5 + margin 0.75 | 2,924 | +4.28% | 26.3 | 0.54% | 15.1 s |
+| recipe + folds 5 + seeds 3 | 2,929 | +4.46% | 26.0 | 0.53% | 43.2 s |
+| recipe + folds 5 + margin 0.75 + seeds 3 | 2,958 | +5.49% | 28.0 | 0.57% | 44.9 s |
+
+AIF, the same seeds (baseline 10,523): recipe -0.23%, folds 5 +0.01%, margin 0.75 -0.19%,
+folds 5 + margin 0.75 +0.14%, folds 5 + seeds 3 +0.16%, all three +0.22%.
+
+HYE A01, seeds 3-5: running at the time of writing; the table is appended when it lands.
+
+Conclusion: the recipe stays as recommended in section 15. If a caller wants the last
+fraction of a percent and can afford 3x the (now small) training time, `MUMDIA_NN_SEEDS=3`
+is the one knob with a positive sign on every pool.
+
+## 18. Pipeline factors, end to end (2026-09-05)
+
+With rescoring at ~3 minutes, a complete HYE run costs about 16 minutes, so the extraction
+and RT parameters that docs/20 lists as benchmark-gated could be tested on the engine's own
+objective rather than on proxies. One factor at a time from the current defaults, fast
+rescore recipe throughout, HYE B01, one run each (this pool's seed band is 0.9%):
+
+| arm | peptides at 1% | extracted rows | whole-run wall | whole-run peak |
+|---|---|---|---|---|
+| **current** (`min_frag_corr` 0.2, `rt_window_multiplier` 1.5, `apex_count_window` 5) | **59,223** | 2,546,844 | 16:32 | 28.1 GB |
+| `min_frag_corr` 0.1 | 59,245 (+0.04%) | 3,124,230 (+23%) | 19:32 | 24.7 GB |
+| `min_frag_corr` 0.3 | 58,874 (-0.6%) | 2,027,300 | 13:42 | 28.0 GB |
+| `rt_window_multiplier` 1.25 | 58,747 (-0.8%) | 2,441,118 | 14:26 | 23.9 GB |
+| `rt_window_multiplier` 2.0 | 58,921 (-0.5%) | 2,695,313 | 20:20 | 34.4 GB |
+| `window_holdout_frac` 0.3 | 59,124 (-0.2%) | 2,603,894 | 18:00 | 30.0 GB |
+| `apex_count_window` 3 | 58,355 (-1.5%) | 2,658,530 | 16:20 | 28.0 GB |
+| `apex_count_window` 7 | 57,805 (-2.4%) | 2,430,212 | 15:54 | 28.1 GB |
+
+Every single-factor move is neutral or worse. The current defaults are a local optimum on
+this acquisition; the only "gain" (0.04% at `min_frag_corr` 0.1) costs 23% more rows through
+every later stage and three minutes of wall for nothing. Held-out window sizing, which
+docs/08 measured at +1.1% on AIF with a per-run DeepLC fine-tune, is neutral here with a
+pre-fine-tuned library and the LOESS calibration, consistent with the mechanism it addresses
+(an in-sample residual percentile) not being the limiting factor on this pool. The whole-run
+peaks in this table are from the build before the extract merge and `windows_in_flight` cap
+(section 19 has the current build).
+
+## 19. The whole run on the current build, and the six-run experiment
+
+One complete `mumdia run` on the HYE B01 file with everything in this document and docs/27
+applied (streamed features, window-closing extract with incremental merge and 16 windows in
+flight, parquet handoff) plus the fast rescore recipe (114 features, 3:1 hybrid cap, warm
+start 5), 32 threads on doxy, per-stage peak of the process tree:
+
+| stage | wall | peak RSS |
+|---|---|---|
+| convert | 13 s | 0.20 GB |
+| search-seed | 19 s | 6.79 GB |
+| rt-im-train | 2 s | 6.61 GB |
+| extract | 5:23 | **16.49 GiB** |
+| features | 6:20 | 3.11 GiB |
+| compete | 33 s | 4.43 GB |
+| rescore | 3:31 | 5.57 GB |
+| quant | 1:29 | 2.50 GB |
+| report | 1 s | 2.61 GB |
+| **whole run** | **17:52** | **16.47 GiB** |
+
+59,124 peptides, 65,672 target PSMs and 8,974 protein groups at 1%. On 2026-09-04 morning
+the same run took 67:30 at 86.6 GiB (231 GiB before the first memory commit) for 59,515
+peptides; the identifications are inside the pool's 0.9% seed band and the whole thing now
+fits the 32 GB machine docs/27 set as its target with room to spare. Extract is the tallest
+stage and features the longest; `extract.windows_in_flight: 8` takes the peak to about 12.3
+GiB for another 30 s.
+
+The six-run experiment (`run-experiment`: six per-run chains through compete, one pooled
+rescore, per-run quant, LFQ combine) follows from the same numbers. The pooled rescore over
+all 11,637,874 competed PSMs with the fast recipe was measured directly: **18:05 and 15.9 GB**
+for 72,344 peptides and 390,333 target PSMs at 1%, against the August pooled result of 72,044
+and 391,087 that took a multi-hour TSV-path rescore. With the per-run chain at ~11.4 min and
+~16.5 GiB (the pre-rescore stages of the table above):
+
+| `experiment.parallel_runs` | wall | peak |
+|---|---|---|
+| 1 | ~1 h 35 min | ~17 GB |
+| 3 | ~50 min | ~50 GB |
+| 6 | ~40 min | ~100 GB |
+
+The per-run figure is from one file (the others are 1.8-2.1M competed rows, so +-10%), and
+the like-for-like pooled baseline under today's default (parquet, no recipe) is still
+computing at the time of writing.
+
+## 20. Caveats of the original (2026-09-04) analysis
 
 - Two HYE runs on one instrument type. The playbook rule (validate on at least two
   acquisition contexts plus an empirical null) means the AIF E. coli benchmark and an

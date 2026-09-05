@@ -308,6 +308,18 @@ sections 10-16:
 - Judge any of these on at least two pools and with seeds. Seed 0 of the HYE baseline scored
   59,046 against 59,611 and 59,619 for seeds 1 and 2, which inflated every seed-0 comparison
   by about a percent.
+- The rescorer's own hyperparameters (hidden 128-64, lr 1e-3, 25 epochs, dropout 0.3, batch
+  4096, 10 iterations, train FDR 0.01, weight decay 1e-4) were swept with seeds on three
+  pools (docs/28 section 17): every one is at or within noise of the optimum of its column,
+  and every departure that helps one pool costs another. Do not retune them from a single
+  benchmark. The only knob positive on every pool is `MUMDIA_NN_SEEDS=3` (+0.1 to +0.3 pp at
+  3x training).
+- The extraction and RT defaults (`min_frag_corr` 0.2, `rt_window_multiplier` 1.5,
+  `apex_count_window` 5) are likewise a measured local optimum on HYE end to end (docs/28
+  section 18); `window_holdout_frac` is neutral there with a pre-fine-tuned library.
+- Reference point, 2026-09-05: a complete HYE single run is 17:52 at 16.5 GiB on 32 threads
+  (extract 16.5 GiB is the tallest stage, `extract.windows_in_flight: 8` takes it to 12.3),
+  and the six-run pooled rescore is 18 minutes at 15.9 GB for 72,344 peptides.
 
 ### Sidecar and IO contracts
 

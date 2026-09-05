@@ -109,6 +109,25 @@ Flushing candidates as their windows close (section 3.10) took that stage to 28.
 identical output. The tallest stage on this file is now rescore at 33.04 GiB, which is the
 Rust process and the NN sidecar together, i.e. item 3.5.
 
+Complete run on the 2026-09-05 build (every item above plus the parquet handoff and the
+fast rescore recipe of docs/28), same file, 32 threads:
+
+| stage | wall | peak tree RSS |
+|---|---|---|
+| convert | 13.0 s | 0.20 GB |
+| search-seed | 19.0 s | 6.79 GB |
+| rt-im-train | 1.8 s | 6.61 GB |
+| extract | 322.7 s | **16.49 GiB** |
+| features | 380.4 s | 3.11 GiB |
+| compete | 33.1 s | 4.43 GB |
+| rescore | 211.3 s | 5.57 GB |
+| quant | 88.8 s | 2.50 GB |
+| report | 0.8 s | 2.61 GB |
+| **whole run** | **17:52** | **16.47 GiB** |
+
+From 1:07:30 and 86.6 GiB two days earlier (231 GiB before the first commit), at 59,124
+against 59,515 peptides at 1%, inside the pool's seed band. The run fits the 32 GB target.
+
 ## 1. Static memory model per stage
 
 All sizes are resident-set estimates derived from the code. Symbols: `P` = MS2

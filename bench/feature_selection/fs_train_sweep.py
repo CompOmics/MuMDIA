@@ -61,6 +61,48 @@ def grid(name: str) -> list[tuple[str, dict]]:
             ("warm5_neg3_hybrid", dict(warm_start=True, warm_epochs=5, neg_ratio=3, neg_select="hybrid")),
             ("neg1_margin", dict(neg_ratio=1, neg_select="margin")),
         ]
+    if name == "nn":
+        # The rescorer itself, which has never been swept with seeds. Everything is on top of
+        # the fast recipe (3:1 hybrid cap, warm start 5), because that is what makes a 2x
+        # bigger model or 2x more epochs affordable at all.
+        R = dict(neg_ratio=3, neg_select="hybrid", warm_start=True, warm_epochs=5)
+        out += [
+            ("recipe", dict(R)),
+            ("recipe_h256_128", dict(R, hidden=(256, 128))),
+            ("recipe_h256_128_64", dict(R, hidden=(256, 128, 64))),
+            ("recipe_h512_256", dict(R, hidden=(512, 256))),
+            ("recipe_h64_32", dict(R, hidden=(64, 32))),
+            ("recipe_drop0.1", dict(R, dropout=0.1)),
+            ("recipe_drop0.5", dict(R, dropout=0.5)),
+            ("recipe_ep50_w10", dict(R, epochs=50, warm_epochs=10)),
+            ("recipe_ep12_w3", dict(R, epochs=12, warm_epochs=3)),
+            ("recipe_lr3e-4", dict(R, lr=3e-4)),
+            ("recipe_lr3e-3", dict(R, lr=3e-3)),
+            ("recipe_b1024", dict(R, batch=1024)),
+            ("recipe_b16k_lr2e-3", dict(R, batch=16384, lr=2e-3)),
+            ("recipe_folds5", dict(R, folds=5)),
+            ("recipe_seeds3", dict(R, seeds=3)),
+            ("recipe_iters20", dict(R, iters=20)),
+            ("recipe_iters6", dict(R, iters=6)),
+            ("recipe_tfdr0.02", dict(R, train_fdr=0.02)),
+            ("recipe_tfdr0.005", dict(R, train_fdr=0.005)),
+            ("recipe_mfrac0.75", dict(R, margin_frac=0.75)),
+            ("recipe_mfrac0.25", dict(R, margin_frac=0.25)),
+            ("recipe_wd1e-3", dict(R, wd=1e-3)),
+            ("recipe_wd0", dict(R, wd=0.0)),
+        ]
+    if name == "combo":
+        # The few knobs that were neutral-to-positive on every pool in the `nn` grid, alone
+        # and together, against the recipe and the shipped baseline, with more seeds.
+        R = dict(neg_ratio=3, neg_select="hybrid", warm_start=True, warm_epochs=5)
+        out += [
+            ("recipe", dict(R)),
+            ("recipe_folds5", dict(R, folds=5)),
+            ("recipe_mfrac0.75", dict(R, margin_frac=0.75)),
+            ("recipe_folds5_mfrac0.75", dict(R, folds=5, margin_frac=0.75)),
+            ("recipe_folds5_seeds3", dict(R, folds=5, seeds=3)),
+            ("recipe_folds5_mfrac0.75_seeds3", dict(R, folds=5, margin_frac=0.75, seeds=3)),
+        ]
     if name == "confirm":
         out += [
             ("neg3_random", dict(neg_ratio=3, neg_select="random")),
