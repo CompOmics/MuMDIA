@@ -1220,8 +1220,9 @@ pub struct RescoreConfig {
     /// silently execute a different model; set false only for explicit legacy
     /// compatibility.
     pub strict: bool,
-    /// How the feature matrix reaches a sidecar rescorer. See [`Handoff`]. `parquet` is
-    /// dramatically faster on large pools but applies to nn_torch only.
+    /// How the feature matrix reaches a sidecar rescorer. See [`Handoff`]. Defaults to
+    /// `parquet`, which applies to nn_torch only; mokapot and entrapment sidecars always
+    /// receive the tab-separated PIN.
     #[serde(default)]
     pub handoff: Handoff,
     /// Restrict the classifier's input to these feature columns, by name. Absent (the
@@ -1297,7 +1298,7 @@ impl Default for RescoreConfig {
             entrapment_contaminant_markers: Vec::new(),
             entrapment_ratio: 1.0,
             strict: true,
-            handoff: Handoff::Tsv,
+            handoff: Handoff::Parquet,
             features: None,
             features_file: None,
             train_neg_ratio: 0.0,
@@ -1349,18 +1350,29 @@ pub enum FinetuneScope {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Handoff {
-    /// Tab-separated PIN. Percolator's format, and what `mokapot.read_pin` requires.
-    #[default]
+    /// Tab-separated PIN. Percolator's format, and what `mokapot.read_pin` requires, so it
+    /// is what a mokapot or entrapment sidecar receives whatever this is set to.
     Tsv,
-    /// Parquet feature table with f32 features. Measured on an 8,858,206-PSM
-    /// experiment-wide rescore: the 30.18 GB TSV exceeded the worker's streaming threshold,
-    /// so every iteration re-read a 12.77 GB memmap; Parquet kept the matrix in memory and
-    /// the rescore went from 671.6 min to 12 min with the decoy fraction unchanged at
-    /// 0.988%. Features are f32 because the TSV was already lossy (`{:.6}`) and the worker
-    /// casts to f32 regardless.
+    /// Parquet feature table with f32 features, and the default since 2026-09-05.
+    ///
+    /// The TSV path makes the worker parse every column into a float64 pandas frame before
+    /// it builds its float32 matrix, so the text file, the frame and the matrix are alive
+    /// together. Measured on the HYE competed table (2,603,894 PSMs x 387 features, one
+    /// self-training iteration, 32 threads), parquet against tsv: rescore peak 29.96 ->
+    /// 8.95 GB, wall 8:35 -> 6:33, sidecar file 9.53 -> 3.28 GB, the worker's read and
+    /// standardise phase 111.7 -> 16.9 s, and 47,752 against 47,762 peptides at 1% with the
+    /// decoy fraction 1.00% either way (docs/28 section 11). An earlier 8,858,206-PSM
+    /// experiment-wide rescore went from 671.6 min to 12 min, because there the 30.18 GB
+    /// TSV crossed the worker's streaming threshold and every iteration re-read a 12.77 GB
+    /// memmap.
+    ///
+    /// Features are f32 because the TSV was already lossy (`{:.6}`) and the worker casts to
+    /// f32 regardless; the two paths therefore feed marginally different values into a
+    /// chaotic self-training loop, which is where that 10-peptide difference comes from.
     ///
     /// nn_torch only: `mokapot_worker.py` calls `mokapot.read_pin()` and cannot read
     /// Parquet, so a mokapot run falls back to `Tsv` with a warning instead of failing.
+    #[default]
     Parquet,
 }
 

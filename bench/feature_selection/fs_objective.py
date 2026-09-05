@@ -46,13 +46,15 @@ def main():
     ap.add_argument("--only", default=None, help="comma-separated subset names to run")
     ap.add_argument("--seeds", default="0")
     ap.add_argument("--rows", type=int, default=None)
+    ap.add_argument("--entrapment", action="store_true",
+                    help="classify spike-in targets from the Proteins column and report the empirical FDP")
     ap.add_argument("--save-oof", default=None)
     ap.add_argument("--iters", type=int, default=None)
     ap.add_argument("--repo", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
     args = ap.parse_args()
     os.makedirs(args.out_dir, exist_ok=True)
 
-    d = fs_lib.load_pin(args.pin)
+    d = fs_lib.load_pin(args.pin, entrapment=args.entrapment)
     if args.rows:
         d = fs_lib.subsample(d, args.rows, seed=0)
         print(f"subsampled to {len(d['y'])} rows", flush=True)

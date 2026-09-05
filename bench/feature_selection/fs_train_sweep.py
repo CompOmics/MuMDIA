@@ -50,6 +50,17 @@ def grid(name: str) -> list[tuple[str, dict]]:
         out.append(("warm5_neg3_random", dict(warm_start=True, warm_epochs=5, neg_ratio=3, neg_select="random")))
         out.append(("warm5_neg3_hybrid", dict(warm_start=True, warm_epochs=5, neg_ratio=3, neg_select="hybrid")))
         out.append(("warm5_neg1_hybrid", dict(warm_start=True, warm_epochs=5, neg_ratio=1, neg_select="hybrid")))
+    if name == "candidates":
+        # The recipes worth seeds: a self-limiting cap (neg5 never binds on a pool that is
+        # already balanced), the same with warm start, and the aggressive variants that
+        # won on HYE but cost a little on AIF.
+        out += [
+            ("neg5_hybrid", dict(neg_ratio=5, neg_select="hybrid")),
+            ("warm5", dict(warm_start=True, warm_epochs=5)),
+            ("warm5_neg5_hybrid", dict(warm_start=True, warm_epochs=5, neg_ratio=5, neg_select="hybrid")),
+            ("warm5_neg3_hybrid", dict(warm_start=True, warm_epochs=5, neg_ratio=3, neg_select="hybrid")),
+            ("neg1_margin", dict(neg_ratio=1, neg_select="margin")),
+        ]
     if name == "confirm":
         out += [
             ("neg3_random", dict(neg_ratio=3, neg_select="random")),
@@ -68,12 +79,14 @@ def main():
     ap.add_argument("--features", default=None, help="file with one feature name per line")
     ap.add_argument("--seeds", default="0")
     ap.add_argument("--rows", type=int, default=None)
+    ap.add_argument("--entrapment", action="store_true",
+                    help="classify spike-in targets from the Proteins column and report the empirical FDP")
     ap.add_argument("--grid", default="quick")
     ap.add_argument("--only", default=None)
     args = ap.parse_args()
     os.makedirs(args.out_dir, exist_ok=True)
 
-    d = fs_lib.load_pin(args.pin)
+    d = fs_lib.load_pin(args.pin, entrapment=args.entrapment)
     if args.rows:
         d = fs_lib.subsample(d, args.rows, seed=0)
         print(f"subsampled to {len(d['y'])} rows", flush=True)

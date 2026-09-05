@@ -277,6 +277,38 @@ fine-tuning also is not guaranteed deterministic.
   backend. The feature matrix is `n_psms x n_features x 4` bytes; size batches
   from that.
 
+### Rescore cost: handoff, feature selection, training-set reduction
+
+Measured 2026-09-05 on the HYE competed table (2,603,894 PSMs x 387 features), docs/28
+sections 10-16:
+
+- `rescore.handoff` defaults to `parquet` since 2026-09-05. The TSV path made the worker
+  parse every column into a float64 pandas frame before building its float32 matrix; parquet
+  took the rescore peak from 29.96 to 8.95 GB and the wall from 8:35 to 6:33 at identical
+  identifications. mokapot and entrapment sidecars still receive the tab-separated PIN
+  (`mokapot.read_pin` cannot read parquet), automatically and with a warning.
+- `rescore.features` / `features_file` project the classifier's input columns. 43 of the 387
+  Extended features are dead by construction (10 constant under the default configuration, 20
+  bit-identical, 13 affine duplicates), and about 114 chosen multivariately reproduce all 387
+  within seed noise on both DIA-NN-library benchmarks. The shipped list is
+  `bench/feature_selection/fs_union75_dedup.txt`. It was selected on a DIA-NN-library search
+  and costs 2.1% on a FASTA-built entrapment library, so re-derive it per library type.
+- `rescore.train_neg_ratio` / `train_neg_select` / `train_subsample` / `train_warm_epochs`
+  thin what the sidecar trains on. The worker refits 30 times over the targets at 1% plus
+  every decoy in the fold, which is 12-18 decoys per positive on HYE and 3:1 on AIF, and the
+  gain from thinning is proportional to that imbalance. A cap is self-limiting and a quota is
+  not: `train_neg_ratio: 5` never binds on a balanced pool and is 2.2x on an imbalanced one.
+- Feature selection buys memory, not time: MLP training time per row is flat in the feature
+  count from 387 down to 25. Training-set reduction buys time.
+- Combined (`parquet` + 114 features + `train_neg_ratio: 3, train_neg_select: hybrid,
+  train_warm_epochs: 5`), the full-scale rescore went from 33.04 GiB / 53:07 to 5.49 GB / 3:19
+  at -0.66% peptides, inside that pool's 0.9% seed band, with the spike-in FDP unchanged.
+- Do not set `train_neg_select: margin` with `train_neg_ratio: 1`. It is the fastest recipe
+  and +1.27% on HYE, and it loses 10.35% on the entrapment pool.
+- Judge any of these on at least two pools and with seeds. Seed 0 of the HYE baseline scored
+  59,046 against 59,611 and 59,619 for seeds 1 and 2, which inflated every seed-0 comparison
+  by about a percent.
+
 ### Sidecar and IO contracts
 
 - `scripts/deeplc_worker.py` must `import deeplc` before numpy/pyarrow. DeepLC

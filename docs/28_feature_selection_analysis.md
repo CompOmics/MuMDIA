@@ -4,6 +4,12 @@ Status: analysis only. No engine code changes. Scripts in `bench/feature_selecti
 outputs under `C:/Users/robbi/mumdia_bench/fs/` (off OneDrive; large). Measured
 2026-09-04.
 
+> 2026-09-05: sections 10-16 add the implementation and its measurements. Headline: the
+> sidecar handoff is now parquet by default (rescore peak 29.96 -> 8.95 GB), and the
+> combination of a 114-feature list with hard-negative training took the full-scale HYE
+> rescore from 33.04 GiB / 53:07 to **5.49 GB / 3:19** at -0.66% peptides. Sections 1-9 are
+> the original analysis and stand unchanged.
+
 ## 0. Summary
 
 - Of the 387 Extended features, 43 carry no information the classifier can see: 10 are
@@ -548,7 +554,199 @@ in all 100+ runs here). What a reduced set changes is sensitivity, which section
 measures, and the risk of the self-training loop overfitting, which fewer features can
 only reduce.
 
-## 9. Caveats and what this analysis does not establish
+## 10. What was implemented (2026-09-05)
+
+Three levers, all default-off until section 15 says otherwise, so an unconfigured run behaves
+exactly as before:
+
+| lever | where | what it does |
+|---|---|---|
+| `rescore.handoff = parquet` | already existed, `rescore.rs` | the sidecar reads a columnar feature table instead of a 9.5 GB text PIN |
+| `rescore.features` / `features_file` | new, `rescore.rs::resolve_feature_subset` | projects the classifier's input columns in schema order; the matrix, the handoff and the training all shrink with the list |
+| `rescore.train_neg_ratio` / `train_neg_select` / `train_subsample` / `train_warm_epochs` | new, plumbed to `MUMDIA_NN_*` | cap and choose the decoys the sidecar trains on, and warm-start the model between self-training iterations |
+
+`train_neg_select` adds two strategies to the worker's existing random cap:
+
+- **margin**: keep the highest-scoring decoys under the current model, i.e. the only part of
+  the decoy distribution still competing with accepted targets;
+- **hybrid**: half the budget from the margin, half sampled at random from the rest, so the
+  boundary is informed by hard cases without losing the shape of the bulk.
+
+None of this touches FDR. Selection, scoring, target-decoy competition and q-values still run
+over the full pool with every decoy; only the rows the optimiser sees change. The decoy
+fraction at 1% was 0.94-1.00% in all 150+ runs below, as that design guarantees.
+
+## 11. The sidecar handoff is the largest memory lever
+
+Same competed table (2,603,894 PSMs x 387 features), one self-training iteration per arm so the
+comparison is the data path rather than the training, 32 threads, sequential:
+
+| | TSV (shipped default) | Parquet |
+|---|---|---|
+| rescore peak RSS (Rust + worker) | 29.96 GB | **8.95 GB** |
+| wall | 8:34.9 | **6:33.2** |
+| sidecar file on disk | 9.53 GB | 3.28 GB |
+| worker PIN read + standardise | 111.7 s (26.4% of the worker) | 16.9 s (4.8%) |
+| peptides at 1% | 47,762 | 47,752 |
+| decoy fraction | 1.00% | 1.00% |
+
+A 70% memory cut for a config field that already existed. The mechanism is in section 8: on the
+TSV path the worker parses all 394 columns into a float64 pandas frame before it builds its
+float32 matrix, so the text file, the frame and the matrix are alive together. Parquet reads
+only the requested columns, already typed.
+
+The 10-peptide difference (0.02%) is the NN's own nondeterminism, not the data path: the TSV is
+lossy at `{:.6}` while parquet carries f32, so the two arms see marginally different inputs and
+the self-training trajectory diverges. Score correlation between the arms is 0.63 while the
+accepted sets differ by 0.02%, which is the usual picture for this model.
+
+## 12. Training-set reduction: it pays in proportion to the imbalance
+
+The worker refits 30 times (3 folds x 10 iterations, 25 epochs) on the targets currently at 1%
+plus **every** decoy in the fold. How lopsided that is varies enormously by dataset, and that
+single number predicts everything below:
+
+| pool | PSMs | targets passing at 1% | decoys per positive in training |
+|---|---|---|---|
+| HYE A01 | 1,815,610 | 7.2% | ~12-18 : 1 |
+| AIF E. coli | 89,531 | 22.7% | ~3 : 1 |
+| entrapment (E. coli + 1:1 human) | 129,692 | 3.1% | ~22 : 1 |
+
+Peptides at 1%, two seeds per cell, against each pool's own baseline:
+
+| recipe | HYE A01 | AIF | entrapment | training speed-up (HYE / entrap) |
+|---|---|---|---|---|
+| baseline (all decoys, fresh fit) | 59,615 | 10,523 | 2,831 | 1.0x |
+| neg5 hybrid | **+0.61%** | 0.00% (never binds) | -0.81% | 2.2x / 6.0x |
+| warm5 | -0.61% | -0.18% | +2.16% | 3.4x / 3.0x |
+| warm5 + neg5 hybrid | +0.41% | 0.00% | +3.99% | 7.0x / 12x |
+| **warm5 + neg3 hybrid** | **+0.97%** | -0.18% | **+4.20%** | **8.9x / 16.4x** |
+| neg1 margin | +1.27% | -0.17% | **-10.35%** | 5.2x / 20x |
+
+Three findings:
+
+1. **Which decoys you keep matters more than how many.** At a matched budget, margin and hybrid
+   selection beat random by 0.5-2% on HYE, and land above the full-decoy baseline; random
+   thinning degrades monotonically (-0.3% at 3:1, -1.4% at 1:1). The easy decoy bulk is not
+   informative after the first iteration, but the model still needs *some* of it: pure margin
+   at 1:1 is the worst recipe tested.
+2. **A cap is self-limiting, a quota is not.** `neg5` never binds on AIF (identical rows per
+   fit, identical output) and binds hard on HYE. That is the property to ship: it does nothing
+   where there is nothing to gain.
+3. **Too aggressive fails, and only the third dataset showed it.** `neg1_margin` was the best
+   recipe on HYE (+2.67% at seed 0) and the fastest anywhere, and it loses 10.3% on the
+   entrapment pool. One benchmark would have shipped it.
+
+Seed discipline matters here: on HYE, seed 0 of the baseline scored 59,046 while seeds 1 and 2
+scored 59,611 and 59,619. Every headline number above is a two-seed mean against a two-seed
+baseline; the single-seed grid that first suggested +1.6 to +2.7% overstated the gains.
+
+## 13. The empirical null: entrapment
+
+Target-decoy q cannot detect a model that has learned to separate targets from *decoys* rather
+than true from false, which is exactly the risk when training only on hard decoys. The E. coli
+AIF file searched against an E. coli + 1:1 human entrapment library gives that null: the human
+peptides are absent from the vial, so any that pass at 1% are false by construction. 41,041 of
+67,304 target rows are spike-ins.
+
+FDP is the engine's own estimator (`fdr.rs::entrapment_q`, `(ratio * entrapment + 1) / real`,
+ratio 0.560632), at the peptide level, two seeds:
+
+| recipe | peptides | decoy fraction | spike-in peptides | FDP |
+|---|---|---|---|---|
+| baseline | 2,831 | 0.97% | 26.5 | 0.57% |
+| neg5 hybrid | 2,808 | 0.95% | 22.0 | 0.48% |
+| warm5 | 2,892 | 0.96% | 26.5 | 0.55% |
+| warm5 + neg5 hybrid | 2,944 | 0.96% | 30.5 | 0.62% |
+| warm5 + neg3 hybrid | 2,950 | 0.95% | 28.5 | 0.58% |
+| neg1 margin | 2,538 | 0.95% | 24.0 | 0.57% |
+
+FDP moves between 0.48% and 0.62% around a 0.57% baseline, on counts of 22-30 spike-in peptides
+where Poisson noise alone is +-0.1 percentage points. There is no evidence that hard-negative
+training buys identifications by exploiting decoy structure: the extra peptides are as real as
+the baseline's.
+
+## 14. Full scale, through the engine
+
+The same HYE competed table the audit profiled (2,603,894 PSMs x 387 features), rescored by
+`mumdia rescore` on 32 threads, one arm per configuration, sequential:
+
+| arm | peptides at 1% | PSMs at 1% | peak RSS | wall |
+|---|---|---|---|---|
+| shipped: TSV, 387 features, every decoy, fresh fits | 59,515 | 66,081 | 33.04 GiB | 53:07 |
+| `full`: parquet + 114 features + 5:1 hybrid cap | 59,285 (-0.39%) | 65,824 | **5.51 GB** | **13:06** |
+| `fast`: + warm start 5, 3:1 hybrid cap | 59,124 (-0.66%) | 65,672 | **5.49 GB** | **3:19** |
+
+**6x less memory and 16x less time, at -0.66% peptides**, which is inside this pool's 0.9%
+seed band. The sidecar handoff shrank from 9.53 GB of text to 1.1 GB of parquet.
+
+Both arms recorded their provenance: `psms_scored.parquet.report.json` carries
+`n_features_used: 114`, `n_features_available: 387`, the `feature_selection_id`, the full
+feature list, and the training knobs actually used.
+
+Note that rescore is no longer the stage that sets the run's peak. With extract at 28.13 GiB
+(docs/27 section 3.10) and features at 3.03 GiB, a single run's ceiling moves back to extract.
+
+## 15. Recommended configuration
+
+Shipped as the new default:
+
+- **`rescore.handoff = parquet`.** 70% less memory, 24% less wall, identical identifications,
+  no configuration required, and mokapot/entrapment sidecars keep receiving the TSV they need.
+
+Recommended but NOT default, because they change what the classifier sees and therefore need a
+deliberate choice:
+
+```json
+"rescore": {
+  "features_file": "bench/feature_selection/fs_union75_dedup.txt",
+  "train_neg_ratio": 3.0,
+  "train_neg_select": "hybrid",
+  "train_warm_epochs": 5
+}
+```
+
+Evidence per pool, peptides at 1% against that pool's own 387-feature all-decoy baseline, two
+seeds each:
+
+| pool | 114 features alone | recipe alone | both |
+|---|---|---|---|
+| HYE A01 | -0.3% | +0.97% | - |
+| HYE B01 | -0.3% | - | -0.66% (engine, full scale) |
+| AIF E. coli | +0.04% | -0.18% | +0.09% |
+| entrapment | -2.14% | +4.20% | -0.74% (FDP 0.50% vs 0.57%) |
+
+The conservative variant, for a caller who wants the memory but not a changed training
+trajectory, is `features_file` plus `train_neg_ratio: 5, train_neg_select: hybrid`: the 5:1 cap
+never binds on a balanced pool (identical rows and identical output on AIF) and still gives 2.2x
+on HYE, for the `full` arm's 13:06 and 5.51 GB.
+
+What NOT to do:
+
+- `train_neg_select: margin` at `train_neg_ratio: 1`. Fastest of everything tested (20x) and
+  +1.27% on HYE, and it loses **10.35%** on the entrapment pool. Hard negatives sharpen the
+  boundary; they cannot be the only thing the model sees, and how much bulk a pool can spare
+  depends on how imbalanced it is.
+- `train_warm_epochs` on its own. -0.61% on HYE and -0.18% on AIF with seeds; it only pays in
+  combination with a cap (+0.97% at 3:1 hybrid).
+- Reading a single-seed sweep as a result. Seed 0 of the HYE baseline scored 59,046 against
+  59,611 and 59,619 for seeds 1 and 2, which turned a +0.6% recipe into an apparent +1.6% one.
+
+## 16. Caveats specific to the 2026-09-05 work
+
+- The 114-feature list was selected on a DIA-NN-library search and transfers well to another
+  such search (AIF, +0.04%) but costs 2.1% on the FASTA-built entrapment library, whose feature
+  distributions differ. A production selection should be re-derived per library type, or the
+  list should be treated as tuned for imported-library workflows.
+- The entrapment FDP rests on 22-30 spike-in peptides per arm. It is sensitive enough to exclude
+  a gross artifact (and did exclude `neg1_margin` on sensitivity grounds), but it cannot resolve
+  FDP differences below about 0.1 percentage points.
+- Every training-reduction number is from the harness except the two full-scale arms; the
+  harness reproduces the real worker to within 0.03% (section 6.4) but is not the worker.
+- Nothing here was measured on a third instrument type. Both HYE and AIF are Orbitrap AIF
+  acquisitions, and the entrapment pool is the AIF file again with a different library.
+
+## 17. Caveats of the original (2026-09-04) analysis
 
 - Two HYE runs on one instrument type. The playbook rule (validate on at least two
   acquisition contexts plus an empirical null) means the AIF E. coli benchmark and an

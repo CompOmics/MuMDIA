@@ -72,7 +72,12 @@ def strip_pep(p: str) -> str:
     return s
 
 
-def load_pin(path: str, chunk: int = 250_000, standardise: bool = False) -> dict:
+def load_pin(
+    path: str,
+    chunk: int = 250_000,
+    standardise: bool = False,
+    entrapment: bool = False,
+) -> dict:
     """Return X (float32, NaN/inf -> 0), y (1 = target), fold hash, stripped sequence, names.
 
     `standardise=False` keeps the raw values for the structural statistics; the objective
@@ -82,12 +87,14 @@ def load_pin(path: str, chunk: int = 250_000, standardise: bool = False) -> dict
     t0 = time.time()
     header = list(pq.read_schema(path).names)
     feat_cols = [c for c in header if c not in NON_FEATURE]
-    tb = pq.read_table(path, columns=["SpecId", "Label", "Peptide"])
+    cols = ["SpecId", "Label", "Peptide"] + (["Proteins"] if entrapment else [])
+    tb = pq.read_table(path, columns=cols)
     y = (tb.column("Label").to_numpy() == 1).astype(np.float32)
     cids = np.array([int(x.rsplit("_", 1)[-1]) for x in tb.column("SpecId").to_pylist()], np.int64)
     peps = [strip_pep(p) for p in tb.column("Peptide").to_pylist()]
     pep_hash = np.array([int(hashlib.md5(p.encode()).hexdigest(), 16) for p in peps], dtype=object)
     base_seq = np.array([p[6:] if p.startswith("DECOY_") else p for p in peps], dtype=object)
+    tb_prot = tb.column("Proteins").to_pylist() if entrapment else None
     del tb
     n, nf = len(y), len(feat_cols)
     X = np.empty((n, nf), np.float32)
@@ -106,6 +113,14 @@ def load_pin(path: str, chunk: int = 250_000, standardise: bool = False) -> dict
         flush=True,
     )
     d = dict(X=X, y=y, cids=cids, pep_hash=pep_hash, base_seq=base_seq, feat_cols=feat_cols, nan_frac=nan_frac)
+    if entrapment:
+        prot = tb_prot
+        d["is_entrap"] = classify_entrapment(prot, y == 0)
+        print(
+            "entrapment rows: %d of %d targets"
+            % (int(d["is_entrap"].sum()), int((y == 1).sum())),
+            flush=True,
+        )
     if standardise:
         d["X"] = standardise_inplace(d["X"])
     return d
@@ -193,6 +208,47 @@ def n_targets_at_many(X, is_target, fdr, topk=0):
     return best_j, best_sign, best_n
 
 
+# Entrapment defaults matching bench/config.entrap-ecoli-human.json, the August E. coli +
+# 1:1 human spike-in run.
+ENTRAP_MARKER = "ENTRAP_"
+ENTRAP_EXCLUDE = "REAL_"
+ENTRAP_CONTAMINANTS = ("KRT", "K1C", "K2C", "ALBU", "TRYP")
+ENTRAP_RATIO = 0.560632
+
+
+def classify_entrapment(
+    proteins,
+    is_decoy,
+    marker: str = ENTRAP_MARKER,
+    exclude: str | None = ENTRAP_EXCLUDE,
+    contaminants=ENTRAP_CONTAMINANTS,
+) -> np.ndarray:
+    """True for a target row whose protein is a spike-in. Mirrors `classify_entrapment`
+    in rescore.rs: contains the marker, does not contain the exclude string, and is not a
+    known contaminant (a keratin in the spike-in proteome is plausibly really there)."""
+    out = np.zeros(len(proteins), bool)
+    for i, prot in enumerate(proteins):
+        if is_decoy[i]:
+            continue
+        t = str(prot)
+        out[i] = (
+            marker in t
+            and (exclude is None or exclude not in t)
+            and not any(c in t for c in contaminants)
+        )
+    return out
+
+
+def entrapment_fdp(n_entrap: int, n_real: int, ratio: float = ENTRAP_RATIO) -> float:
+    """The engine's estimator (fdr.rs::entrapment_q): (ratio * entrapment + 1) / real.
+
+    An empirical null the target-decoy q cannot give: the spike-in peptides are absent from
+    the sample by construction, so any that pass are false, whatever the decoys say. This
+    is the check that catches a model which has learned to separate targets from DECOYS
+    rather than true from false -- exactly the risk when training only on hard decoys."""
+    return (ratio * n_entrap + 1.0) / max(1, n_real)
+
+
 def evaluate(score: np.ndarray, d: dict, fdr: float = 0.01) -> dict:
     """PSMs and picked stripped peptides at `fdr`, plus the decoy fraction among accepted PSMs."""
     y = d["y"]
@@ -204,7 +260,29 @@ def evaluate(score: np.ndarray, d: dict, fdr: float = 0.01) -> dict:
     best = df.sort_values("score", ascending=False).drop_duplicates("seq")
     qp = tda_q(best["score"].to_numpy(np.float64), best["y"].to_numpy())
     n_pep = int(((qp <= fdr) & (best["y"].to_numpy() == 1)).sum())
-    return dict(psms_1pct=n_psm, decoys_1pct=n_dec, decoy_frac=round(n_dec / max(1, n_psm), 4), peptides_1pct=n_pep)
+    out = dict(
+        psms_1pct=n_psm,
+        decoys_1pct=n_dec,
+        decoy_frac=round(n_dec / max(1, n_psm), 4),
+        peptides_1pct=n_pep,
+    )
+    ent = d.get("is_entrap")
+    if ent is not None:
+        acc_t = acc & (y == 1)
+        n_ent = int((acc_t & ent).sum())
+        n_real = int((acc_t & ~ent).sum())
+        out["entrap_psms"] = n_ent
+        out["real_psms"] = n_real
+        out["entrap_fdp"] = round(entrapment_fdp(n_ent, n_real), 4)
+        # Peptide level, on the same picked set.
+        bidx = best.index.to_numpy()
+        bacc = (qp <= fdr) & (best["y"].to_numpy() == 1)
+        bent = ent[bidx]
+        out["entrap_peptides"] = int((bacc & bent).sum())
+        out["entrap_fdp_pep"] = round(
+            entrapment_fdp(int((bacc & bent).sum()), int((bacc & ~bent).sum())), 4
+        )
+    return out
 
 
 # ----------------------------------------------------------------------------- the worker, re-implemented
