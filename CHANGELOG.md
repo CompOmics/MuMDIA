@@ -15,6 +15,13 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ## [Unreleased]
 
+### Fixed
+
+- A SCIEX `.wiff` without its `.wiff.scan` companion fails in msconvert with
+  `Could not open data stream. Is a required 'scan' file missing?`, which names no
+  file. The engine now appends the missing companion's path to that error. Measured on
+  PRIDE-archived `.wiff` files that had been downloaded without their companions.
+
 ## [0.1.0] - 2026-09-06
 
 ### Pre-release audit (2026-08-28)
