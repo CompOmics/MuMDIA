@@ -310,10 +310,10 @@ fine-tuning also is not guaranteed deterministic.
 - Q-value columns have different units:
   - `q_value` / `experiment_psm_q`: pooled PSM;
   - `run_psm_q`: within-run PSM;
-  - `precursor_q`: peptidoform plus charge, but only under
-    `compete.group_by = peptidoform_charge`. The default key already deleted the
-    sibling rows, so it then counts base peptides (measured 1.000 precursors per
-    peptide, against 1.174 with `peptidoform_charge`);
+  - `precursor_q`: peptidoform plus charge under the default
+    `compete.group_by = peptidoform_charge`. Under `base_peptide` the sibling rows
+    were already deleted, so it then counts base peptides (measured 1.000
+    precursors per peptide, against 1.174 with `peptidoform_charge`);
   - `peptide_q_value`: base/stripped peptide;
   - `pg_q_value`: protein-accession-set group.
 - The grouped q columns (`peptide_q_value`, `precursor_q`, `pg_q_value`) are
@@ -465,23 +465,26 @@ Current correctness contract:
   status), not a valid abundance of zero;
 - protein Top-N operates on unique `base_peptide_id` values rather than counting
   charge/modification rows as separate peptides;
-- `precursor_q` is available for a single-run precursor output, but it is a
-  genuine precursor unit only under `compete.group_by = peptidoform_charge` (see
+- `precursor_q` is available for a single-run precursor output and is a genuine
+  precursor unit under the default `compete.group_by = peptidoform_charge` (see
   the competition key below);
 - for an experiment-wide rescore, split the scored table by `source` before
   invoking quant with each run's chromatograms. Changing `q_filter` does not
   select a source.
 
-The default competition key is `base_peptide`, renamed from `precursor`, which it
-was not. `compete.rs:88` keys the
-group on `(base_peptide_id, label_code, 0, peak_rank)`, and `base_peptide_id`
-comes from the stripped sequence (`import_diann_lib.py:137` factorises
-`Stripped.Sequence`). `compete.rs:319-340` keeps only the highest `prelim_score`
-per group and deletes the rest before rescore, so every charge and every
-modification variant of one peptide collapses to a single winner pre-FDR.
-`peptidoform_charge` (`compete.rs:93-98`, keys
-`(pform_id, label, charge, peak_rank)`) is the quant-oriented alternative; see
-the benchmark-gating section for when it is required rather than optional.
+The default competition key is `peptidoform_charge` since 2026-09-06 (keys
+`(pform_id, label, charge, peak_rank)`): sibling charge states and modforms of
+one peptide are separate precursors that compete only against their own
+alternative peaks, which is the unit DIA-NN reports at and the key every
+docs/28 benchmark ran under (entrapment FDP flat at 0.48-0.64%, HYE, AIF). The
+previous default `base_peptide` (renamed from `precursor`, which it was not)
+keys the group on `(base_peptide_id, label_code, 0, peak_rank)`, and
+`base_peptide_id` comes from the stripped sequence, so `compete.rs` deleted
+every charge and every modification variant of one peptide but the highest
+`prelim_score` before rescore: 23% of the extracted candidates on HYE B01, 46.6%
+on a modification-rich library, at an unchanged peptide count. It remains
+available as an explicit peptide-level population; never use it for a PTM
+search.
 
 Use Parquet quantities for analysis; TSV values are rounded for presentation.
 Cross-run consensus ions, interference-aware ion selection, minimum clean-ion
@@ -541,21 +544,20 @@ Do not enable these by default from a single AIF count:
   plus entrapment and a second acquisition. `docs/08_rt_im_train.md` section 4b
   has the mechanism and numbers;
 - alternative hard/soft extraction gates or peak apportionment;
-- `peptidoform_charge` competition as a general default, margin competition, or
-  unique-evidence competition;
+- margin competition or unique-evidence competition;
 - MBR transfer/re-extraction;
 - acquisition-specific fragment/peak caps. The shipped default stays uncapped;
   see the peak-cap subsection above.
 
-`compete.group_by = peptidoform_charge` is required, not optional, for a PTM or
-modification search. Under the default key the modified form is deleted whenever
-an unmodified or alkylated sibling scores higher, which is usually. Measured on
-a modification-rich library, the default key deleted 880,464 of 1,890,239
-extracted candidates (46.6%); `peptidoform_charge` removed 0 rows and moved
-precursors per peptide from 1.000 to 1.174 (DIA-NN reports about 1.126 on
-comparable data), with an unchanged peptide count. It stays gated only as a
-change to the shipped default for non-PTM searches, because it changes the
-training and FDR population.
+`compete.group_by = peptidoform_charge` is the default (2026-09-06) and is
+required, not optional, for a PTM or modification search. Under `base_peptide`
+the modified form is deleted whenever an unmodified or alkylated sibling scores
+higher, which is usually. Measured on a modification-rich library, `base_peptide`
+deleted 880,464 of 1,890,239 extracted candidates (46.6%); `peptidoform_charge`
+removed 0 rows and moved precursors per peptide from 1.000 to 1.174 (DIA-NN
+reports about 1.126 on comparable data), with an unchanged peptide count. The
+gate for making it the default was the one CLAUDE.md sets for a changed training
+and FDR population: the entrapment pool, HYE and AIF of docs/28 all ran under it.
 
 The selected apex was historically correct/strongest only about 48-52% of the
 time while the correct peak appeared in the top five about 86-88%. Promoting

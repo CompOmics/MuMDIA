@@ -153,10 +153,10 @@ Three properties of these columns are easy to misread.
   statistically stronger. Batch a large experiment to fit memory; the split does
   not change the FDR each run receives, and a per-run count difference must not be
   attributed to pool size.
-- `precursor_q` is a precursor-level unit only when compete was run with
-  `group_by = peptidoform_charge`. Under the default `group_by = base_peptide` the
-  charge and modification siblings were already collapsed by stripped peptide, so
-  the column counts base peptides. See docs/11_compete_rescore_fdr.md.
+- `precursor_q` is a precursor-level unit under the default
+  `group_by = peptidoform_charge`. Under `group_by = base_peptide` the charge and
+  modification siblings were already collapsed by stripped peptide, so the column
+  then counts base peptides. See docs/11_compete_rescore_fdr.md.
 
 ## How it works
 
@@ -417,7 +417,7 @@ listed with its default and effect. Fields marked **default-off**, **inert**, or
 | `GateMode` | config.rs:735-758 | **`apex_pearson`**, `peak_spectral`, `spectral_entropy`, `coelution`, `combined` | which spectral score `gate_min_score` thresholds |
 | `UnknownModPolicy` | config.rs:353-357 | **`error`**, `skip` | unknown-mod behavior |
 | `CompetitionMode` | config.rs:873-890 | **`winner_take_all`**, `none`, `features_only`, `unique_evidence`, `margin_gated` | within-group resolution |
-| `CompeteGroupBy` | config.rs:894-901 | **`base_peptide`**, `apex`, `peptidoform_charge` | competition grouping key; renamed from `precursor`, which named stripped-peptide grouping inaccurately (see below) |
+| `CompeteGroupBy` | config.rs:894-901 | `base_peptide`, `apex`, **`peptidoform_charge`** | competition grouping key; `peptidoform_charge` (precursor-level) is the default since 2026-09-06, `base_peptide` was renamed from `precursor`, which named stripped-peptide grouping inaccurately (see below) |
 | `RollupMethod` | config.rs:905-911 | **`top_n_sum`**, `sum` | protein rollup |
 | `PeakWindowMode` | config.rs:916-928 | **`per_candidate`**, `consensus` | quant integration window |
 | `NormalizeMethod` | config.rs:936-949 | `none`, **`median_ratio`**, `median` | cross-run LFQ normalization; `from_token` at 953-960 |
@@ -793,7 +793,7 @@ requiring entrapment/target-decoy FDR validation before use.
 
 | Field | Default | Effect |
 |---|---|---|
-| `group_by` | `base_peptide` | competition grouping key; `precursor` groups by stripped peptide (all charge and modification siblings collapse), `peptidoform_charge` is the real precursor-level key and is required for a PTM search |
+| `group_by` | `peptidoform_charge` | competition grouping key: the default keeps every peptidoform + charge as its own precursor group; `base_peptide` groups by stripped peptide (all charge and modification siblings collapse) and must not be used for a PTM search |
 | `apex_rt_tolerance_s` | 5.0 | RT bucket for `apex` grouping |
 | `mode` | `winner_take_all` | within-group resolution |
 | `margin` | 0.0 | score margin for `margin_gated` |

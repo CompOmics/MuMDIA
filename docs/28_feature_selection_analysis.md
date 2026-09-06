@@ -1005,9 +1005,14 @@ What became default, and what did not, from everything above:
   version bump for about 15 s and is not done here.
 - **Pooled experiment:** six HYE runs rescored together, previous default 4:34:42 at 40.1 GB
   for 71,926 peptides; fast recipe 18:05 at 15.9 GB for 72,344 (section 19).
+- **Competition key (2026-09-06): `compete.group_by = peptidoform_charge`.** Every
+  benchmark in this document, the entrapment pool included, ran under it; `base_peptide`
+  collapses sibling charge states and modforms to one winner per stripped peptide (23% of
+  HYE B01's extracted candidates) and stays available as an explicit peptide-level
+  population.
 - **Unchanged:** the rescorer's hyperparameters (section 17), the extraction and RT window
-  defaults (section 18), `extract.windows_in_flight` (auto), and every benchmark-gated item
-  in CLAUDE.md.
+  defaults (section 18), `extract.windows_in_flight` (auto), and every other
+  benchmark-gated item in CLAUDE.md.
 
 Reference point on the 2026-09-05 build, HYE B01, 32 threads: a complete `mumdia run` with
 the compact preset is 17:52 at 16.5 GiB (extract is the tallest stage at 16.5 GiB, features

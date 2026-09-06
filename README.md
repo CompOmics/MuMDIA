@@ -456,20 +456,19 @@ it.
 |---|---|
 | `q_value`, `experiment_psm_q` | pooled PSM, across every table given to `rescore` |
 | `run_psm_q` | PSM within one run; the correct per-file unit under a pooled rescore |
-| `precursor_q` | peptidoform plus charge, but only under `compete.group_by = peptidoform_charge` |
+| `precursor_q` | peptidoform plus charge under the default `compete.group_by = peptidoform_charge` (base peptides under `base_peptide`) |
 | `peptide_q_value` | base (stripped) peptide; what `peptides.tsv` is filtered on |
 | `pg_q_value` | protein-accession-set group; what `proteins.tsv` is filtered on |
 
 Two traps:
 
 - **`precursor_q` is a precursor unit only under
-  `compete.group_by = peptidoform_charge`.** The default competition key
+  `compete.group_by = peptidoform_charge`, the default.** The alternative key
   `base_peptide` (renamed from `precursor`, which it was not) groups on the
-  stripped sequence, so every charge
-  and every modification variant of one peptide collapses to a single winner
-  before FDR. Under that key `precursor_q` therefore counts base peptides
-  (measured 1.000 precursors per peptide, against 1.174 with
-  `peptidoform_charge`).
+  stripped sequence, so every charge and every modification variant of one
+  peptide collapses to a single winner before FDR. Under that key `precursor_q`
+  therefore counts base peptides (measured 1.000 precursors per peptide, against
+  1.174 with `peptidoform_charge`).
 - **The grouped columns are written only to each group's single winning row.**
   `peptide_q_value`, `precursor_q`, and `pg_q_value` are 1.0 on every loser.
   Under an experiment-wide rescore the grouping is experiment-wide, so a per-run
@@ -583,7 +582,7 @@ are listed so the documentation cannot imply a capability that is not there.
 | model-visible top-K peaks | `extract.retain_top_peaks > 1` writes diagnostic peak alternatives only. They do not become feature or rescore rows. The selected apex was historically strongest only about 48 to 52% of the time while the correct peak was in the top five about 86 to 88%, so promoting alternatives is plausible future work, not a present capability |
 | adaptive RT windows | not enabled by default |
 | held-out RT window sizing | `rt_im_train.window_holdout_frac`, default off. Gained 1.1% of peptides with DeepLC 4.1.0 at an unchanged 0.98% decoy fraction, but lost 1.5% with the overfitting 4.0.0a2 model, so it interacts with retention-time model quality |
-| `compete.group_by = peptidoform_charge` | accepted and correct, but not the shipped default. It is **required**, not optional, for a PTM or modification search: under the default key the modified form is deleted whenever an unmodified or alkylated sibling scores higher, which is usually. Measured on a modification-rich library, the default key deleted 880,464 of 1,890,239 extracted candidates (46.6%) while `peptidoform_charge` removed none |
+| `compete.group_by = base_peptide` | the previous default, kept as an explicit peptide-level population. Never for a PTM or modification search: under it the modified form is deleted whenever an unmodified or alkylated sibling scores higher, which is usually (880,464 of 1,890,239 extracted candidates, 46.6%, on a modification-rich library; `peptidoform_charge`, the default since 2026-09-06, removed none) |
 | MBR tiers | `mbr.strategy` distinguishes only none from not-none. `mbr.rt_window_s`, `mbr.decoy_transfer`, and `mbr.requant_all` are accepted by the config but not wired; setting them changes nothing, and the engine warns that it did nothing |
 | fixed-window and library-ranked quantification | `quant.fragment_selection`, `fixed_scan_halfwidth`, `fixed_window_s`, and `baseline_subtract` all default to off pending entrapment validation |
 | acquisition-specific peak caps | the shipped default is uncapped at both conversion entry points. A cap must come from a sweep on the acquisition it will be used on |

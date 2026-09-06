@@ -72,7 +72,7 @@ undocumented on purpose; those fields are counted under "Coverage".
 
 ## (top level)
 
-`Config` (rust/mumdia/crates/mumdia-core/src/config.rs:1692). stage document: [docs/02_config_and_data_model.md](02_config_and_data_model.md).
+`Config` (rust/mumdia/crates/mumdia-core/src/config.rs:1699). stage document: [docs/02_config_and_data_model.md](02_config_and_data_model.md).
 
 | Field | Type | Default | Gated | Description |
 |---|---|---|---|---|
@@ -291,7 +291,7 @@ Composable per-claimant weight cues for `PeakClaim::CoelutionMultiCue` (the modu
 
 | Field | Type | Default | Gated | Description |
 |---|---|---|---|---|
-| `group_by` | `CompeteGroupBy` | `base_peptide` |  | Competition grouping: `precursor` collapses charge/modification siblings separately within each target/decoy label; targets and decoys therefore do not compete directly. `apex` also groups by rounded apex RT; `peptidoform_charge` keeps each peptidoform+charge as its own group (precursor-level, as DIA-NN/Spectronaut report), so sibling charges of one peptide are not collapsed. |
+| `group_by` | `CompeteGroupBy` | `peptidoform_charge` |  | Competition grouping: `precursor` collapses charge/modification siblings separately within each target/decoy label; targets and decoys therefore do not compete directly. `apex` also groups by rounded apex RT; `peptidoform_charge` keeps each peptidoform+charge as its own group (precursor-level, as DIA-NN/Spectronaut report), so sibling charges of one peptide are not collapsed. |
 | `apex_rt_tolerance_s` | `f64` | `5.0` |  |  |
 | `mode` | `CompetitionMode` | `winner_take_all` |  | How within-group competition resolves (sensitivity program, spec 04 §6 / P2.4). `winner_take_all` = legacy (keep only the top `prelim_score` per group). The other modes preserve more candidate evidence for the rescorer/ FDR to arbitrate. Default `winner_take_all` (unchanged behaviour). |
 | `margin` | `f64` | `0.0` | gated | Score margin (in `prelim_score` units) required to remove a loser under `margin_gated`. A loser closer than this to the winner is kept. |
@@ -300,7 +300,7 @@ Composable per-claimant weight cues for `PeakClaim::CoelutionMultiCue` (the modu
 
 ## rescore
 
-`RescoreConfig` (rust/mumdia/crates/mumdia-core/src/config.rs:1404). stage document: [docs/11_compete_rescore_fdr.md](11_compete_rescore_fdr.md).
+`RescoreConfig` (rust/mumdia/crates/mumdia-core/src/config.rs:1411). stage document: [docs/11_compete_rescore_fdr.md](11_compete_rescore_fdr.md).
 
 | Field | Type | Default | Gated | Description |
 |---|---|---|---|---|
@@ -329,7 +329,7 @@ Composable per-claimant weight cues for `PeakClaim::CoelutionMultiCue` (the modu
 
 ## quant
 
-`QuantConfig` (rust/mumdia/crates/mumdia-core/src/config.rs:1218). stage document: [docs/12_quant_lfq_align_mbr_report_audit.md](12_quant_lfq_align_mbr_report_audit.md).
+`QuantConfig` (rust/mumdia/crates/mumdia-core/src/config.rs:1225). stage document: [docs/12_quant_lfq_align_mbr_report_audit.md](12_quant_lfq_align_mbr_report_audit.md).
 
 | Field | Type | Default | Gated | Description |
 |---|---|---|---|---|
@@ -353,7 +353,7 @@ Composable per-claimant weight cues for `PeakClaim::CoelutionMultiCue` (the modu
 
 ## mbr
 
-`MbrConfig` (rust/mumdia/crates/mumdia-core/src/config.rs:1357). stage document: [docs/12_quant_lfq_align_mbr_report_audit.md](12_quant_lfq_align_mbr_report_audit.md).
+`MbrConfig` (rust/mumdia/crates/mumdia-core/src/config.rs:1364). stage document: [docs/12_quant_lfq_align_mbr_report_audit.md](12_quant_lfq_align_mbr_report_audit.md).
 
 | Field | Type | Default | Gated | Description |
 |---|---|---|---|---|
@@ -369,7 +369,7 @@ Composable per-claimant weight cues for `PeakClaim::CoelutionMultiCue` (the modu
 
 ## experiment
 
-`ExperimentConfig` (rust/mumdia/crates/mumdia-core/src/config.rs:1665). stage document: [docs/01_overview_and_dataflow.md](01_overview_and_dataflow.md).
+`ExperimentConfig` (rust/mumdia/crates/mumdia-core/src/config.rs:1672). stage document: [docs/01_overview_and_dataflow.md](01_overview_and_dataflow.md).
 
 Options for the experiment-wide orchestrator (`mumdia run-experiment`).
 
@@ -424,9 +424,9 @@ config file must use. The default variant is marked. Sorted by type name.
 
 | Value | Default | Description |
 |---|---|---|
-| `base_peptide` |  | One winner per stripped base peptide, per label. Renamed from `precursor`, which it is not: `compete.rs` keys the group on `base_peptide_id`, which comes from the stripped sequence, so every charge state AND every modification variant of one peptide collapses to a single winner before FDR. Use `peptidoform_charge` for a genuine precursor unit, and note that it is REQUIRED for a PTM search. The old name is not accepted, so an old config fails loudly rather than silently changing the competition unit. |
+| `base_peptide` |  | One winner per stripped base peptide, per label: every charge state AND every modification variant of one peptide collapses to a single winner before FDR (`compete.rs` keys the group on `base_peptide_id`, which comes from the stripped sequence). The default until 2026-09-06 and renamed from `precursor`, which it is not; the old name is not accepted, so an old config fails loudly rather than silently changing the competition unit. Opt in to it for a peptide-level population; never use it for a PTM search, where it deletes the modified form whenever an unmodified sibling scores higher. |
 | `apex` |  |  |
-| `peptidoform_charge` |  | Precursor-level: separate every distinct peptidoform+charge. Recovers sibling charges the peptide-level `Precursor` grouping collapses; the label stays in the key so a target never competes against its own decoy. |
+| `peptidoform_charge` |  | Precursor-level, the default: every distinct peptidoform + charge is its own group, so sibling charge states and modforms of one peptide are kept and compete only against their own alternative peaks; the label stays in the key so a target never competes against its own decoy. This is the unit DIA-NN and Spectronaut report at, and the key every benchmark of docs/28 ran under: entrapment (spike-in FDP 0.48-0.64%, flat), HYE and AIF. Measured against `base_peptide` on a modification-rich library it removed 0 instead of 46.6% of the extracted candidates at an unchanged peptide count, with 1.174 precursors per peptide (DIA-NN about 1.126). |
 
 ### `CompetitionMode`
 
@@ -455,7 +455,7 @@ Within-group competition resolution (spec 04 §6). Only `WinnerTakeAll` removes 
 
 ### `DecoyTransfer`
 
-(rust/mumdia/crates/mumdia-core/src/config.rs:1348)
+(rust/mumdia/crates/mumdia-core/src/config.rs:1355)
 
 Decoy-transfer null for the MBR false-transfer FDR (M4). `ReverseSequence` transfers reverse/scramble decoys at the same expected RT; `PermutedRt` transfers real precursors to a decoupled (wrong) expected RT; `Both` combines them. The prototype's shuffled-RT null gave a ~0.6% in-window false rate vs 66.6% true (113x separation), so the transfer q-value is well-calibrated.
 
@@ -476,7 +476,7 @@ Decoy-transfer null for the MBR false-transfer FDR (M4). `ReverseSequence` trans
 
 ### `FeaturePreset`
 
-(rust/mumdia/crates/mumdia-core/src/config.rs:1535)
+(rust/mumdia/crates/mumdia-core/src/config.rs:1542)
 
 Named feature list for `RescoreConfig::feature_preset`.
 
@@ -497,7 +497,7 @@ Named feature list for `RescoreConfig::feature_preset`.
 
 ### `FinetuneScope`
 
-(rust/mumdia/crates/mumdia-core/src/config.rs:1602)
+(rust/mumdia/crates/mumdia-core/src/config.rs:1609)
 
 How many DeepLC fine-tunes an experiment pays for.
 
@@ -517,7 +517,7 @@ How many DeepLC fine-tunes an experiment pays for.
 
 ### `FragmentSelection`
 
-(rust/mumdia/crates/mumdia-core/src/config.rs:1283)
+(rust/mumdia/crates/mumdia-core/src/config.rs:1290)
 
 Fragment ranking for the quant top-N sum. See `QuantConfig::fragment_selection`.
 
@@ -542,7 +542,7 @@ Spectral-agreement score the extraction acceptance gate (`gate_min_score`) thres
 
 ### `Handoff`
 
-(rust/mumdia/crates/mumdia-core/src/config.rs:1635)
+(rust/mumdia/crates/mumdia-core/src/config.rs:1642)
 
 How the feature matrix crosses the Rust -> Python boundary for a sidecar rescorer.
 
@@ -576,7 +576,7 @@ Fragment-matcher backend for search-seed and extract (docs/06_predict_frag_index
 
 ### `MbrStrategy`
 
-(rust/mumdia/crates/mumdia-core/src/config.rs:1329)
+(rust/mumdia/crates/mumdia-core/src/config.rs:1336)
 
 Match-between-runs strategy (Stage D3, docs/12_quant_lfq_align_mbr_report_audit.md). Default `None` reproduces the current chain byte-for-byte. ONLY `None` VS NOT-`None` IS IMPLEMENTED. The three non-`None` variants are described below as the intended staging, but no code distinguishes them: every test in the tree is `strategy != None`, so selecting `RtTransfer` or `Full` today behaves exactly like `EmpiricalLibrary`. They are kept as the recorded design ladder rather than deleted because the MBR tier is planned and benchmark-gated (CLAUDE.md); `validate()` warns when a non-`None` variant is selected so a config cannot quietly expect more than it gets. Intended staging: `EmpiricalLibrary` builds the consensus anchor library only; `RtTransfer` adds cross-run expected-RT transfer extraction; `Full` adds requantification. All require >= 2 runs and a decoy-transfer FDR (see the plan).
 
@@ -589,7 +589,7 @@ Match-between-runs strategy (Stage D3, docs/12_quant_lfq_align_mbr_report_audit.
 
 ### `NegSelect`
 
-(rust/mumdia/crates/mumdia-core/src/config.rs:1546)
+(rust/mumdia/crates/mumdia-core/src/config.rs:1553)
 
 Which decoys survive the training-set negative cap.
 
@@ -619,7 +619,7 @@ Fragment-peak apportionment when one observed MS2 peak matches the fragments of 
 
 ### `PeakWindowMode`
 
-(rust/mumdia/crates/mumdia-core/src/config.rs:1142)
+(rust/mumdia/crates/mumdia-core/src/config.rs:1149)
 
 How the elution-peak integration window is chosen per candidate in quant.
 
@@ -630,7 +630,7 @@ How the elution-peak integration window is chosen per candidate in quant.
 
 ### `QuantQColumn`
 
-(rust/mumdia/crates/mumdia-core/src/config.rs:1197)
+(rust/mumdia/crates/mumdia-core/src/config.rs:1204)
 
 Which q-value column quant filters candidates on. Peptide- or precursor-level q is appropriate for a single-run rescore. Under experiment-wide rescoring, those grouped q-values are pooled and carried only on the best PSM across all runs, so filtering per-run slices on them creates disjoint quant sets. `RunPsmQ` is the run-local FDR gate for that cross-run workflow; `PsmQ` keeps the pooled per-PSM gate available when that is explicitly intended.
 
@@ -655,7 +655,7 @@ Which q-value column quant filters candidates on. Peptide- or precursor-level q 
 
 ### `RollupMethod`
 
-(rust/mumdia/crates/mumdia-core/src/config.rs:1131)
+(rust/mumdia/crates/mumdia-core/src/config.rs:1138)
 
 | Value | Default | Description |
 |---|---|---|

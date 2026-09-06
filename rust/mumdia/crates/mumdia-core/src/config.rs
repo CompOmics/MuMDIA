@@ -1071,7 +1071,7 @@ pub struct CompeteConfig {
 impl Default for CompeteConfig {
     fn default() -> Self {
         Self {
-            group_by: CompeteGroupBy::BasePeptide,
+            group_by: CompeteGroupBy::PeptidoformCharge,
             apex_rt_tolerance_s: 5.0,
             mode: CompetitionMode::WinnerTakeAll,
             margin: 0.0,
@@ -1111,18 +1111,25 @@ pub enum CompetitionMode {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CompeteGroupBy {
-    /// One winner per stripped base peptide, per label. Renamed from `precursor`,
-    /// which it is not: `compete.rs` keys the group on `base_peptide_id`, which comes
-    /// from the stripped sequence, so every charge state AND every modification
-    /// variant of one peptide collapses to a single winner before FDR. Use
-    /// `peptidoform_charge` for a genuine precursor unit, and note that it is
-    /// REQUIRED for a PTM search. The old name is not accepted, so an old config
-    /// fails loudly rather than silently changing the competition unit.
+    /// One winner per stripped base peptide, per label: every charge state AND every
+    /// modification variant of one peptide collapses to a single winner before FDR
+    /// (`compete.rs` keys the group on `base_peptide_id`, which comes from the
+    /// stripped sequence). The default until 2026-09-06 and renamed from `precursor`,
+    /// which it is not; the old name is not accepted, so an old config fails loudly
+    /// rather than silently changing the competition unit. Opt in to it for a
+    /// peptide-level population; never use it for a PTM search, where it deletes the
+    /// modified form whenever an unmodified sibling scores higher.
     BasePeptide,
     Apex,
-    /// Precursor-level: separate every distinct peptidoform+charge. Recovers
-    /// sibling charges the peptide-level `Precursor` grouping collapses; the
-    /// label stays in the key so a target never competes against its own decoy.
+    /// Precursor-level, the default: every distinct peptidoform + charge is its own
+    /// group, so sibling charge states and modforms of one peptide are kept and
+    /// compete only against their own alternative peaks; the label stays in the key so
+    /// a target never competes against its own decoy. This is the unit DIA-NN and
+    /// Spectronaut report at, and the key every benchmark of docs/28 ran under:
+    /// entrapment (spike-in FDP 0.48-0.64%, flat), HYE and AIF. Measured against
+    /// `base_peptide` on a modification-rich library it removed 0 instead of 46.6% of
+    /// the extracted candidates at an unchanged peptide count, with 1.174 precursors
+    /// per peptide (DIA-NN about 1.126).
     PeptidoformCharge,
 }
 
