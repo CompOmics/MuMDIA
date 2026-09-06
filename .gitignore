@@ -72,3 +72,12 @@ config.*-local.json
 # Kept ignored so an existing local copy keeps working without being committed.
 config.local-*.json
 deploy_local/
+
+# stopgate
+.stopgate/state/
+.stopgate/log.jsonl
+.stopgate/loop.jsonl
+.stopgate/bench.json
+.stopgate/tmp/
+.claude/settings.local.json
+.stopgate.toml

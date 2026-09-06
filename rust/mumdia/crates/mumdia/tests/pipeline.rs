@@ -266,3 +266,164 @@ fn features_compete_rescore_run_on_crafted_input() {
     assert!(t.nrows >= 1);
     assert!(t.column_names().contains(&"q_value".to_string()));
 }
+
+/// Synthetic `psms_extracted` + `chromatograms` pair with enough candidates to span
+/// several chunks: varying fragment counts, varying trace lengths, MS1 XIC rows, one
+/// never-observed fragment with an empty trace, and one candidate with no chromatogram
+/// rows at all.
+fn craft_feature_inputs(n_cand: u32) -> (String, String) {
+    let psms = tmp("psms_chunk.parquet");
+    let chrom = tmp("chrom_chunk.parquet");
+    let (mut cid, mut base): (Vec<u32>, Vec<u32>) = (Vec::new(), Vec::new());
+    let (mut apex_rt, mut cal, mut mz): (Vec<f64>, Vec<f64>, Vec<f64>) =
+        (Vec::new(), Vec::new(), Vec::new());
+    let mut apex_int: Vec<f32> = Vec::new();
+    let (mut nmatch, mut corun, mut z): (Vec<i32>, Vec<i32>, Vec<i32>) =
+        (Vec::new(), Vec::new(), Vec::new());
+    let (mut label, mut pform, mut prot): (Vec<String>, Vec<String>, Vec<String>) =
+        (Vec::new(), Vec::new(), Vec::new());
+    let (mut ccid, mut cname): (Vec<u32>, Vec<String>) = (Vec::new(), Vec::new());
+    let mut cfmz: Vec<f64> = Vec::new();
+    let mut cpint: Vec<f32> = Vec::new();
+    let (mut crt, mut cint): (Vec<Vec<f32>>, Vec<Vec<f32>>) = (Vec::new(), Vec::new());
+    for c in 0..n_cand {
+        let apex = 100.0 + c as f64 * 7.0;
+        cid.push(c);
+        base.push(c / 2); // two charges of one peptide share a base id
+        apex_rt.push(apex);
+        cal.push(apex - 1.5);
+        mz.push(500.0 + c as f64);
+        apex_int.push(1000.0 + c as f32);
+        nmatch.push(3);
+        corun.push(2);
+        z.push(2 + (c % 2) as i32);
+        label.push(if c % 3 == 0 { "decoy" } else { "target" }.to_string());
+        pform.push(format!("PEPTIDEK{}", c / 2));
+        prot.push(format!("P{c};Q{c}"));
+        if c % 5 == 4 {
+            continue; // candidate with no chromatogram rows
+        }
+        // Shared window grid for this candidate; length varies with the candidate.
+        let npts = 5 + (c % 4) as usize;
+        let grid: Vec<f32> = (0..npts).map(|k| (apex - 4.0 + k as f64) as f32).collect();
+        let nfrag = 2 + (c % 3);
+        for f in 0..nfrag {
+            ccid.push(c);
+            cname.push(format!("y{}", f + 1));
+            cfmz.push(200.0 + f as f64 * 30.0);
+            cpint.push(1.0 / (f + 1) as f32);
+            if f == nfrag - 1 && c % 4 == 0 {
+                crt.push(Vec::new()); // predicted but never observed
+                cint.push(Vec::new());
+            } else {
+                crt.push(grid.clone());
+                cint.push(
+                    (0..npts)
+                        .map(|k| ((k + 1) as f32) * (100.0 - f as f32 * 10.0))
+                        .collect(),
+                );
+            }
+        }
+        for (iso, nm) in ["ms1_mono", "ms1_iso1", "ms1_iso2"].iter().enumerate() {
+            ccid.push(c);
+            cname.push(nm.to_string());
+            cfmz.push(500.0 + c as f64 + iso as f64 * 0.5);
+            cpint.push(0.0);
+            crt.push(grid.clone());
+            cint.push((0..npts).map(|k| (k as f32 + 1.0) * 50.0).collect());
+        }
+    }
+    let n = cid.len();
+    write_table(
+        &psms,
+        vec![
+            Col::U32("candidate_id".into(), cid),
+            Col::F64("apex_rt".into(), apex_rt),
+            Col::F32("apex_intensity".into(), apex_int),
+            Col::I32("n_matched_fragments".into(), nmatch),
+            Col::I32("coelution_run".into(), corun),
+            Col::F64("rt_pred_cal".into(), cal),
+            Col::I32("charge".into(), z),
+            Col::Str("label".into(), label),
+            Col::U32("base_peptide_id".into(), base),
+            Col::Str("peptidoform".into(), pform),
+            Col::Str("protein".into(), prot),
+            Col::F64("precursor_mz".into(), mz),
+            Col::OptF64("ms1_mono".into(), vec![Some(900.0); n]),
+            Col::OptF64("ms1_iso1".into(), vec![Some(450.0); n]),
+            Col::OptF64("ms1_iso2".into(), vec![Some(120.0); n]),
+            Col::OptF64("ms1_isom1".into(), vec![Some(30.0); n]),
+        ],
+    )
+    .unwrap();
+    write_table(
+        &chrom,
+        vec![
+            Col::U32("candidate_id".into(), ccid),
+            Col::Str("frag_name".into(), cname),
+            Col::F64("frag_mz".into(), cfmz),
+            Col::F32("predicted_intensity".into(), cpint),
+            Col::LargeListF32("rt".into(), crt),
+            Col::LargeListF32("intensity".into(), cint),
+        ],
+    )
+    .unwrap();
+    (psms, chrom)
+}
+
+/// The chunk size is a memory knob, not a semantic one: one chunk for the whole run and
+/// one candidate per chunk must produce the same feature values, the same row order and
+/// the same PIN bytes. Only the parquet row-group boundaries may differ, so the tables
+/// are compared column by column rather than by file hash.
+#[test]
+fn features_chunking_is_value_preserving() {
+    let (psms, chrom) = craft_feature_inputs(23);
+    // The PIN is opt-in since the parquet handoff became the default; this test compares
+    // both artifacts across chunk sizes, so ask for it.
+    let mut cfg = Config::default();
+    cfg.features.emit_pin = true;
+    let run = |tag: &str, chunk_rows: usize| -> (String, String) {
+        let feats = tmp(&format!("features_{tag}.parquet"));
+        let pin = tmp(&format!("features_{tag}.pin"));
+        stages::features::run_with_chunk_rows(
+            stages::features::FeaturesParams {
+                psms: &psms,
+                chromatograms: &chrom,
+                seed: None,
+                out: &feats,
+                out_pin: &pin,
+                cfg: &cfg.features,
+                config_hash: "test",
+            },
+            chunk_rows,
+        )
+        .unwrap();
+        (feats, pin)
+    };
+    let (f_one, pin_one) = run("one", 1_000_000);
+    let (f_many, pin_many) = run("many", 1);
+
+    assert_eq!(
+        std::fs::read_to_string(&pin_one).unwrap(),
+        std::fs::read_to_string(&pin_many).unwrap(),
+        "PIN bytes differ between chunk sizes"
+    );
+    let a = Table::read(&f_one).unwrap();
+    let b = Table::read(&f_many).unwrap();
+    assert_eq!(a.nrows, b.nrows);
+    assert!(a.nrows > 1);
+    assert_eq!(a.column_names(), b.column_names());
+    assert_eq!(
+        a.u32("candidate_id").unwrap(),
+        b.u32("candidate_id").unwrap()
+    );
+    assert_eq!(a.str("peptidoform").unwrap(), b.str("peptidoform").unwrap());
+    // Every f64 column bit for bit, so a feature that only differs in the last ulp fails.
+    for name in a.column_names() {
+        if let (Ok(x), Ok(y)) = (a.f64(&name), b.f64(&name)) {
+            let xb: Vec<u64> = x.iter().map(|v| v.to_bits()).collect();
+            let yb: Vec<u64> = y.iter().map(|v| v.to_bits()).collect();
+            assert_eq!(xb, yb, "column '{name}' differs between chunk sizes");
+        }
+    }
+}

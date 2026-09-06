@@ -286,12 +286,13 @@ Per-subcommand specifics that are easy to miss:
 - `run-experiment` (`main.rs:660`, `run_experiment.rs:267`) runs the per-file
   chain over N runs, rescores all competed tables in one pass
   (`run_experiment.rs:428`), then splits the scored table by `source` for per-run
-  quant (`run_experiment.rs:474-477`) and cross-run LFQ. It never calls the
-  report stage: `report::run` has exactly two call sites, the `run` orchestrator
-  (`run.rs:484`) and the standalone `report` command (`main.rs:798`). An
-  experiment output tree therefore contains no `peptides.tsv` and no
-  `proteins.tsv` anywhere. Take per-run counts from the per-run split
-  `scored.parquet`, or invoke `mumdia report` by hand on it.
+  quant (`run_experiment.rs:474-477`), cross-run LFQ, and then the
+  experiment-wide report (`report::run_experiment`): one `peptides.tsv` and one
+  `proteins.tsv` at the experiment root, selected on the experiment-wide q
+  columns with one quantity column per run. It writes no per-run TSVs; take
+  per-run counts from the per-run split `scored.parquet` on `run_psm_q`.
+  `mumdia report --experiment-dir` rewrites the pair from the experiment
+  manifest.
 - `align` uses `rt_im_train.q_train` for its training set and a hardcoded 100-knot
   grid (`main.rs:666-667`); it needs >=2 seeds and is not part of the `run` chain.
 - `mbr` (`main.rs:671`) is a wired standalone command, not part of `run`. It

@@ -77,7 +77,7 @@ For the mapping from each conda environment to the config field that points at i
 |---|---|
 | `scripts/ms2pip_worker.py` | Predictor: MS2PIP b/y fragment intensities per peptidoform+charge |
 | `scripts/deeplc_worker.py` | Predictor: DeepLC iRT per peptidoform (uncalibrated) |
-| `scripts/deeplc_finetune.py` | Predictor: transfer-learn DeepLC on this run's seed, rewrite library iRT |
+| `scripts/deeplc_finetune.py` | Predictor: transfer-learn DeepLC on this run's seed and rewrite the library iRT; with `--no-finetune` (seed `-`) rewrite it with base-model predictions instead (`rt_im_train.library_irt`) |
 | `scripts/mokapot_worker.py` | Rescorer: mokapot brew over a PIN (model env-switchable: nn/logreg/xgb/percolator) |
 | `scripts/nn_rescore_worker.py` | Rescorer: PyTorch semi-supervised MLP over a PIN, in-memory or streaming memmap |
 | `scripts/entrapment_worker.py` | Rescorer: GBM/NN on real-target-vs-spike-in negatives, out-of-fold by base peptide |
@@ -92,7 +92,7 @@ For the mapping from each conda environment to the config field that points at i
 | `rust/mumdia/crates/mumdia/src/stages/rescore.rs` | Call sites for mokapot/nn_torch (PIN) + entrapment (Parquet) sidecars |
 | `rust/mumdia/crates/mumdia/src/main.rs` | Call site for MBR (`Cmd::Mbr`) + `doctor` env probe |
 | `env/docker-rescore.yml` | Docker env `rescore`: mokapot 0.10.0 + ms2pip 4.0.0.dev9 (py3.11) |
-| `env/docker-deeplc.yml` | Docker env `deeplc`: DeepLC 4.1.1 + CPU torch (py3.11) |
+| `env/docker-deeplc.yml` | Docker env `deeplc`: `deeplc==4.1.1` (PyPI; the engine's floor) + CPU torch (py3.11) |
 | `env/mumdia-rescore.yml` | Minimal portable env for the mokapot logreg rescore path (py3.12) |
 | `env/mumdia-deeplc.yml` | Portable local env for the DeepLC sidecars: DeepLC 4.1.1 + CPU torch (py3.11) |
 
@@ -246,8 +246,11 @@ that is non-standard (`is_std` false, e.g. a terminal mod outside `STD`) or was
 not predicted keeps its **original** `predicted_irt` unchanged, because the
 write-back is `preds.get(base_pf(pf), orig[i])` (`deeplc_finetune.py:156`), so
 only the sequences DeepLC actually re-predicted move onto the fine-tuned scale.
-Beyond the five flags Rust passes (`--epochs/--patience/--q-train/--batch/--window-holdout-frac`,
-`sidecar.rs:139-151`), the worker exposes CLI-only knobs that `run` never sets:
+Beyond the five flags Rust passes for a fine-tune (`--epochs/--patience/--q-train/--batch/
+--window-holdout-frac`), and the three it passes for a base-model re-prediction
+(`--no-finetune --threads N --predict-threads N` with `-` as the seed path,
+`sidecar::run_deeplc_repredict`, N = the engine's rayon thread count because prediction is
+forward-only), the worker exposes CLI-only knobs that `run` never sets:
 `--device cpu|cuda` (cuda aborts with `SystemExit` if `torch.cuda.is_available()`
 is false, `deeplc_finetune.py:79-81`), `--threads` (torch CPU pool, defaults to
 `DEEPLC_FT_THREADS`), `--max-ref N` (cap reference PSMs), `--predict-limit N`
@@ -561,7 +564,7 @@ semi-supervised count), `MUMDIA_NN_HIDDEN` (`128,64,64,32`), `MUMDIA_NN_SOLVER`
 cores); `MUMDIA_MOKAPOT_WORKERS` (3, thread-based CV-fold parallelism).
 `nn_rescore_worker.py`: `MUMDIA_NN_EPOCHS` (25), `MUMDIA_NN_HIDDEN` (`128,64`),
 `MUMDIA_NN_DROPOUT` (0.3), `MUMDIA_NN_LR` (1e-3), `MUMDIA_NN_WD` (1e-4),
-`MUMDIA_NN_BATCH` (4096), `MUMDIA_NN_SEEDS` (1), `MUMDIA_NN_STREAM` (auto),
+`MUMDIA_NN_BATCH` (4096), `MUMDIA_NN_SEEDS` (1), `MUMDIA_NN_SEED` (0, base seed; ensemble member s uses SEED + s, so seeded repeats of one configuration set it to 1, 2, ...), `MUMDIA_NN_STREAM` (auto),
 `MUMDIA_NN_STREAM_GB` (4), `MUMDIA_NN_CHUNK` (250000), `MUMDIA_NN_INIT_SAMPLE`
 (300000) plus the three the Rust caller injects: `MUMDIA_NN_FOLDS` (worker default
 3), `MUMDIA_NN_ITERS` (worker default 5, but `run_pin_sidecar` overrides it with
@@ -740,7 +743,9 @@ MLP. Set it explicitly for the logreg path.
   **DeepLC 4.1.1 is a floor, not merely the current release**: the 4.0.0a2
   multitask preview overfits per-run fine-tuning badly enough to invert RT-model
   rankings (`docs/08_rt_im_train.md` section 4b), so an older DeepLC changes
-  results and not only performance. Anchor the tool version and let pip resolve
+  results and not only performance. The engine enforces it: `mumdia doctor` fails
+  below 4.1.1 and `sidecar::require_deeplc_version` refuses to launch a DeepLC worker
+  (one constant, `mumdia_core::constants::MIN_DEEPLC_VERSION`). Anchor the tool version and let pip resolve
   its scientific-Python graph; do not re-add an exact `pandas < 2` style pin,
   which has no cp312 wheel. A developer machine may also have older local envs
   (`deeplc_mt` holds the superseded a2 build); prefer the committed specs.

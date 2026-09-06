@@ -416,11 +416,39 @@ def main() -> int:
         c.ok(lfq.is_file() and pq.read_metadata(lfq).num_rows > 0,
              "the cross-run LFQ table is non-empty",
              str(pq.read_metadata(lfq).num_rows) if lfq.is_file() else "missing")
-        # run-experiment deliberately never calls the report stage. Asserting the
-        # absence keeps a documented behaviour documented: per-run counts have to come
-        # from the split tables or from `mumdia report` invoked by hand.
-        c.ok(not (exp / "peptides.tsv").exists(),
-             "run-experiment writes no peptides.tsv, as documented")
+        # The experiment-wide report: one peptides.tsv and one proteins.tsv at the
+        # experiment root, selected on the experiment-wide q columns, with one quantity
+        # column per run. There is deliberately no per-run TSV (the grouped q columns are
+        # experiment-wide); the per-run unit is run_psm_q in the split tables.
+        rep_pep, rep_prot = exp / "peptides.tsv", exp / "proteins.tsv"
+        c.ok(rep_pep.is_file() and rep_prot.is_file(),
+             "run-experiment writes the experiment-wide peptides.tsv and proteins.tsv")
+        if rep_pep.is_file():
+            hdr = rep_pep.read_text(encoding="utf-8").splitlines()[0].split("\t")
+            c.ok(hdr == ["precursor", "stripped_sequence", "charge", "protein", "q_value",
+                         "score", "n_runs", "quantity_a", "quantity_b"],
+                 "experiment peptides.tsv has the experiment-wide columns and one quantity "
+                 "column per run", "\t".join(hdr))
+        # Rows are asserted on the standalone rewrite at q 0.05 (smoke.sh): the pooled
+        # peptide-level q of this fixture cannot reach 1 percent, so the root pair is
+        # legitimately header-only at the default threshold.
+        rep05 = exp.parent / "exp_report" / "peptides.tsv"
+        if c.ok(rep05.is_file(),
+                "`mumdia report --experiment-dir` rewrote the experiment-wide report"):
+            rows = rep05.read_text(encoding="utf-8").splitlines()[1:]
+            c.ok(len(rows) > 0, "experiment peptides.tsv at q 0.05 has rows", str(len(rows)))
+            # Two identical inputs: every reported precursor is identified in both runs.
+            c.ok(all(r.split("\t")[6] == "2" for r in rows),
+                 "identical inputs: every precursor is identified in both runs (n_runs = 2)")
+            c.ok(all(r.split("\t")[7] != "" and r.split("\t")[8] != "" for r in rows),
+                 "identical inputs: every precursor is quantified in both runs")
+        if rep_prot.is_file():
+            hdr = rep_prot.read_text(encoding="utf-8").splitlines()[0].split("\t")
+            c.ok(hdr == ["protein_group", "q_value", "n_runs", "lfq_a", "lfq_b"],
+                 "experiment proteins.tsv has one LFQ column per run", "\t".join(hdr))
+        for r in ("a", "b"):
+            c.ok(not (exp / r / "peptides.tsv").exists(),
+                 f"no per-run peptides.tsv under {r}: the grouped q is experiment-wide")
 
     print()
     if c.failures:

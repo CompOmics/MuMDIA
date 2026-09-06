@@ -35,7 +35,24 @@ const SKIP_IN_LIBRARY_MODE = new Set(["digest", "peptidoforms", "predict-frag"])
 
 const state = {
   mode: "fasta",
-  picks: { mzml: "", fasta: "", lib_precursors: "", lib_fragments: "", out_dir: "" },
+  picks: {
+    // A list. Several spectra files mean one of two different analyses, chosen by
+    // `runMode`; a single file is an ordinary search either way.
+    mzml: [], fasta: "", lib_precursors: "", lib_fragments: "", out_dir: "",
+    lib_fasta: "", lib_out: "",
+  },
+  diannTimer: null,
+  diannGetTimer: null,
+  thermoTimer: null,
+  thermoReady: false,
+  msconvert: null,
+  libSrc: "builtin",
+  buildingLibrary: false,
+  // "separate" = one search per file; "experiment" = one pooled run-experiment.
+  runMode: "experiment",
+  // Batch progress: which file of how many, and what each one produced.
+  batch: null,
+  diannOffer: null,
   runId: null,
   timer: null,
   lastStatus: null,
@@ -134,7 +151,7 @@ async function init() {
     b.addEventListener("click", () => {
       if (b.disabled) return;
       screen(b.dataset.screen);
-      if (b.dataset.screen === "setup") refreshComponents();
+      if (b.dataset.screen === "setup") { refreshComponents(); refreshDiann(); refreshThermo(); }
       if (b.dataset.screen === "settings") loadSettings();
       if (b.dataset.screen === "history") loadHistory();
     });
@@ -142,13 +159,40 @@ async function init() {
   for (const t of document.querySelectorAll(".tab")) {
     t.addEventListener("click", () => setMode(t.dataset.mode));
   }
+  for (const r of document.querySelectorAll('input[name="runmode"]')) {
+    r.addEventListener("change", () => (state.runMode = r.value));
+  }
+  for (const r of document.querySelectorAll('input[name="libsrc"]')) {
+    r.addEventListener("change", () => {
+      selectLibSrc(r.value);
+      if (r.value === "diann") refreshLibSrcNote();
+    });
+  }
   for (const b of document.querySelectorAll("[data-pick]")) {
     b.addEventListener("click", () => pick(b.dataset.pick));
   }
   $("start").addEventListener("click", start);
   $("install-primary").addEventListener("click", () => installComponents("primary"));
   $("install-ms2pip").addEventListener("click", () => installComponents("ms2pip"));
+  $("install-thermo").addEventListener("click", installThermo);
+  $("msconvert-get").addEventListener("click", () =>
+    invoke("open_url", { url: "https://proteowizard.sourceforge.io/" }).catch((e) =>
+      banner($("setup-error"), String(e))
+    )
+  );
+  $("diann-locate").addEventListener("click", locateDiann);
+  $("diann-download").addEventListener("click", downloadDiann);
+  $("diann-ack").addEventListener("change", async (e) => {
+    try {
+      await invoke("diann_acknowledge", { accepted: e.target.checked });
+    } catch (err) {
+      banner($("setup-error"), String(err));
+    }
+    refreshDiann();
+  });
   refreshComponents();
+  refreshDiann();
+  refreshThermo();
   $("stop").addEventListener("click", stop);
   $("another").addEventListener("click", () => screen("input"));
   $("open-folder").addEventListener("click", () => invoke("reveal", { path: state.outDir }));
@@ -394,6 +438,8 @@ async function refreshComponents() {
     ? versions.map(([k, v]) => `${k} ${v}`).join(" · ")
     : "";
 
+  // The DIA-NN card's build button depends on `componentsReady`, which is only
+  // known here.
   const busy = installing || m.install_status === "installing";
   if (busy && !state.setupTimer) {
     state.setupTimer = setInterval(refreshComponents, 900);
@@ -414,6 +460,308 @@ async function installComponents(env) {
   refreshComponents();
 }
 
+// -- DIA-NN --------------------------------------------------------------
+// Detection, not installation. DIA-NN is closed source and its licence forbids
+// redistribution from 1.9 onward, so MuMDIA cannot fetch it the way it fetches
+// DeepLC and torch; it can only drive a copy the user licensed themselves. The
+// notice is shown here because that distinction is invisible from a screen whose
+// other cards do install things.
+async function refreshDiann() {
+  let r;
+  try {
+    r = await invoke("diann_status");
+  } catch (e) {
+    banner($("setup-error"), String(e));
+    return;
+  }
+  const d = r.status;
+  $("diann-notice-body").textContent = r.notice;
+  $("diann-ack").checked = !!d.licence_acknowledged;
+
+  const pill = $("diann-pill");
+  if (d.runs) {
+    pill.textContent = "found";
+    pill.className = "pill ok";
+  } else if (d.path) {
+    pill.textContent = "does not run";
+    pill.className = "pill bad";
+  } else {
+    pill.textContent = "not found";
+    pill.className = "pill mute";
+  }
+
+  // Which copy, and why that one: with an environment variable, a PATH entry and
+  // an installer directory all possible, "found" alone does not say what will run,
+  // and DIA-NN's version changes the library it predicts.
+  const where = $("diann-where");
+  if (d.error) {
+    where.textContent = d.error;
+  } else if (d.path) {
+    const via = { configured: "you chose it", environment: "MUMDIA_DIANN", path: "on PATH", installed: "installed" };
+    where.textContent = `${d.version || "DIA-NN"} — ${d.path} (${via[d.source] || d.source})`;
+  } else {
+    where.textContent =
+      "No DIA-NN found. Install it yourself from github.com/vdemichev/DiaNN, then " +
+      "use Locate. MuMDIA does not download it.";
+  }
+
+  // Building a library happens on the Search screen now; Setup only decides whether
+  // DIA-NN is available and licensed.
+
+  refreshDiannOffer(d);
+}
+
+async function refreshDiannOffer(d) {
+  if (!state.diannOffer) {
+    try {
+      state.diannOffer = await invoke("diann_offer");
+    } catch {
+      return;
+    }
+  }
+  const o = state.diannOffer;
+  // Only worth showing when there is nothing working already.
+  show($("diann-get"), !!o.available && !d.runs);
+  if (!o.available || d.runs) return;
+
+  const gb = (b) => (b >= 1e9 ? `${(b / 1e9).toFixed(1)} GB` : `${Math.round(b / 1e6)} MB`);
+  $("diann-get-sub").textContent =
+    `DIA-NN ${o.version} from the vendor's release page. ${gb(o.download_bytes)} download, ` +
+    `about ${gb(o.disk_bytes)} on disk. MuMDIA does not host or modify these files, and ` +
+    `verifies their checksum before use.` +
+    (o.hands_off ? "" : " The DIA-NN installer opens at the end and you complete it there.");
+  $("diann-download").disabled = !$("diann-ack").checked;
+  if (!$("diann-ack").checked) {
+    $("diann-get-step").textContent = "Acknowledge the licence above first.";
+  }
+  refreshDiannInstall();
+}
+
+async function refreshDiannInstall() {
+  let s;
+  try {
+    s = await invoke("diann_install_state");
+  } catch {
+    return;
+  }
+  const running = s.status === "running";
+  const bar = $("diann-get-bar");
+  show(bar, running);
+  bar.classList.toggle("pct", s.percent > 0);
+  bar.firstElementChild.style.width = s.percent > 0 ? `${s.percent}%` : "";
+
+  show($("diann-get-log-card"), s.log.length > 0);
+  const logEl = $("diann-get-log");
+  const text = (s.log || []).join("\n");
+  if (logEl.textContent !== text) {
+    logEl.textContent = text;
+    logEl.scrollTop = logEl.scrollHeight;
+  }
+
+  $("diann-download").disabled = running || !$("diann-ack").checked;
+  if (running) {
+    $("diann-get-step").textContent = s.percent > 0 ? `${s.step} — ${s.percent}%` : s.step;
+  } else if (s.status === "handoff") {
+    // Windows: the vendor's installer is now the thing the user is talking to.
+    $("diann-get-step").textContent =
+      "The DIA-NN installer is open. Finish it, then press Locate.";
+  } else if (s.status === "done") {
+    $("diann-get-step").textContent = "Installed.";
+  } else if (!$("diann-ack").checked) {
+    $("diann-get-step").textContent = "Acknowledge the licence above first.";
+  } else {
+    $("diann-get-step").textContent = "";
+  }
+  banner($("diann-get-error"), s.status === "failed" ? s.error || "The download failed." : "");
+
+  if (running && !state.diannGetTimer) {
+    state.diannGetTimer = setInterval(refreshDiannInstall, 700);
+  } else if (!running && state.diannGetTimer) {
+    clearInterval(state.diannGetTimer);
+    state.diannGetTimer = null;
+    // A finished install changes what detection sees.
+    if (s.status === "done" || s.status === "handoff") refreshDiann();
+  }
+}
+
+async function downloadDiann() {
+  banner($("diann-get-error"), "");
+  try {
+    await invoke("diann_install");
+  } catch (e) {
+    banner($("diann-get-error"), String(e));
+    return;
+  }
+  refreshDiannInstall();
+}
+
+async function locateDiann() {
+  const chosen = await dialog.open({
+    multiple: false,
+    filters: window.navigator.userAgent.includes("Windows")
+      ? [{ name: "Programs", extensions: ["exe"] }]
+      : undefined,
+  });
+  if (!chosen) return;
+  const path = Array.isArray(chosen) ? chosen[0] : chosen;
+  try {
+    await invoke("diann_set_path", { path });
+  } catch (e) {
+    banner($("setup-error"), String(e));
+  }
+  refreshDiann();
+}
+
+async function refreshThermo() {
+  let t;
+  try {
+    t = await invoke("thermo_status");
+  } catch (e) {
+    banner($("setup-error"), String(e));
+    return;
+  }
+  state.thermoReady = !!t.ready;
+
+  const pill = $("thermo-pill");
+  const btn = $("install-thermo");
+  const installing = t.install_status === "installing";
+  show($("thermo-bar"), installing);
+  const bar = $("thermo-bar");
+  bar.classList.toggle("pct", t.percent > 0);
+  bar.firstElementChild.style.width = t.percent > 0 ? `${t.percent}%` : "";
+
+  if (!t.available) {
+    pill.textContent = "unavailable";
+    pill.className = "pill mute";
+    btn.disabled = true;
+    $("thermo-where").textContent =
+      "No build is published for this platform. Convert .raw to mzML with msconvert instead.";
+  } else if (installing) {
+    pill.textContent = t.percent > 0 ? `${t.percent}%` : "installing…";
+    pill.className = "pill warn";
+    btn.disabled = true;
+    $("thermo-where").textContent = t.step;
+  } else if (t.ready) {
+    pill.textContent = "installed";
+    pill.className = "pill ok";
+    btn.disabled = true;
+    btn.textContent = "Installed";
+    $("thermo-where").textContent = `${t.version || "ThermoRawFileParser"} — ${t.path}`;
+  } else {
+    pill.textContent = "optional";
+    pill.className = "pill mute";
+    btn.disabled = false;
+    $("thermo-where").textContent = t.error
+      ? t.error
+      : `About ${Math.round(t.download_bytes / 1e6)} MB. Includes its own runtime, so nothing else is needed.`;
+  }
+
+  // msconvert is detect-only: MuMDIA does not install it, so there is no button
+  // state to manage beyond found / not found.
+  try {
+    state.msconvert = await invoke("msconvert_status");
+  } catch {
+    state.msconvert = null;
+  }
+  const mp = $("msconvert-pill");
+  if (state.msconvert) {
+    mp.textContent = "found";
+    mp.className = "pill ok";
+    $("msconvert-where").textContent = state.msconvert;
+  } else {
+    mp.textContent = "not found";
+    mp.className = "pill mute";
+    $("msconvert-where").textContent =
+      "Not found. Install ProteoWizard, or set MUMDIA_MSCONVERT to its msconvert.";
+  }
+  banner(
+    $("bruker-note"),
+    "Bruker diaPASEF: MuMDIA's pipeline is 3D and discards ion mobility, so a " +
+      "diaPASEF file loses the mobility separation that makes it selective. It will " +
+      "search, with calibrated q values, but with considerably fewer identifications " +
+      "than a 4D engine on the same data."
+  );
+
+  if (installing && !state.thermoTimer) {
+    state.thermoTimer = setInterval(refreshThermo, 700);
+  } else if (!installing && state.thermoTimer) {
+    clearInterval(state.thermoTimer);
+    state.thermoTimer = null;
+  }
+  // Files may already be selected on the search screen, and whether they can be
+  // searched has just changed -- both the note and the per-file tags.
+  updateRawNote();
+  renderMzmlList();
+}
+
+async function installThermo() {
+  banner($("setup-error"), "");
+  try {
+    await invoke("thermo_install");
+  } catch (e) {
+    banner($("setup-error"), String(e));
+    return;
+  }
+  refreshThermo();
+}
+
+// Mirrors `thermo::needs` in the backend. A `.raw` that is a directory is Waters,
+// not Thermo, and routes to a different converter -- but the frontend cannot stat a
+// path, so it asks the backend which converter a file needs rather than guessing.
+function isRaw(path) {
+  return /\.raw$/i.test(path || "");
+}
+function isVendor(path) {
+  return /\.(raw|d|wiff|wiff2)$/i.test(path || "");
+}
+
+// Shown when a .raw is selected. Two things the user needs and cannot infer: that
+// conversion happens and costs minutes, and that the peak statistics shown for an
+// mzML are not available until it has.
+async function updateRawNote() {
+  // The note describes the selection as a whole, so it speaks about the first vendor
+  // file in it; the per-file list carries the detail.
+  const path = state.picks.mzml.find((f) => isVendor(f)) || state.picks.mzml[0] || "";
+  const vendor = isVendor(path);
+  show($("raw-note"), vendor);
+  if (!vendor) return;
+
+  // The backend owns the file-versus-directory distinction, so it decides which
+  // converter this needs and what to call the format.
+  let v;
+  try {
+    v = await invoke("vendor_of", { path });
+  } catch {
+    return;
+  }
+  $("raw-note-title").textContent = v.label;
+  const body = $("raw-note-body");
+  const common =
+    " Conversion takes several minutes and writes an mzML next to the input, which " +
+    "later searches of the same file reuse. Peak statistics are reported during the run.";
+
+  if (v.needs === "ThermoParser") {
+    body.textContent = state.thermoReady
+      ? `MuMDIA reads mzML, so this is converted first with ThermoRawFileParser.${common}`
+      : "This needs the Thermo .raw converter, which is not installed. Go to Setup and " +
+        "install it, or convert to mzML yourself and select that.";
+  } else {
+    let extra = "";
+    if (v.label === "Bruker .d") {
+      // The thing a diaPASEF user must be told, and cannot infer.
+      extra =
+        " Note that MuMDIA's pipeline is 3D and discards ion mobility. For diaPASEF " +
+        "that removes the separation the acquisition exists to produce, so expect " +
+        "considerably fewer identifications than a 4D engine. The q values stay " +
+        "calibrated; the sensitivity does not.";
+    }
+    body.textContent = state.msconvert
+      ? `MuMDIA reads mzML, so this is converted first with msconvert.${common}${extra}`
+      : "This needs ProteoWizard msconvert, which was not found. MuMDIA does not " +
+        "install it; see Setup." + extra;
+  }
+}
+
 function setMode(mode) {
   state.mode = mode;
   for (const t of document.querySelectorAll(".tab")) t.classList.toggle("on", t.dataset.mode === mode);
@@ -423,10 +771,16 @@ function setMode(mode) {
 
 // ── file pickers ────────────────────────────────────────────────────────────
 const FILTERS = {
-  mzml: [{ name: "mzML", extensions: ["mzML", "mzml"] }],
+  mzml: [
+    {
+      name: "Spectra",
+      extensions: ["mzML", "mzml", "raw", "RAW", "wiff", "wiff2"],
+    },
+  ],
   fasta: [{ name: "FASTA", extensions: ["fasta", "fa", "fas"] }],
   lib_precursors: [{ name: "Parquet", extensions: ["parquet"] }],
   lib_fragments: [{ name: "Parquet", extensions: ["parquet"] }],
+  lib_fasta: [{ name: "FASTA", extensions: ["fasta", "fa", "fas"] }],
 };
 const LABEL = {
   mzml: "p-mzml",
@@ -434,17 +788,125 @@ const LABEL = {
   lib_precursors: "p-libp",
   lib_fragments: "p-libf",
   out_dir: "p-out",
+  mzml_dir: "p-mzml",
+  lib_fasta: "p-lib-fasta",
+  lib_out: "p-lib-out",
 };
+// Pickers that choose a folder rather than a file.
+// `mzml_dir` is here because Bruker/Agilent `.d` and Waters `.raw` are
+// directories, and a file dialog cannot select one.
+const DIR_PICKS = new Set(["out_dir", "lib_out", "mzml_dir"]);
+
+// Render the selected spectra, with the vendor note each one needs.
+//
+// The list is the whole selection UI: a single `.picked` line could not show which
+// of eight files is a Bruker directory that needs a converter, and that is exactly
+// what preflight will refuse on.
+async function renderMzmlList() {
+  const list = $("mzml-list");
+  const files = state.picks.mzml;
+  show(list, files.length > 0);
+  show($("multi-mode"), files.length > 1);
+
+  const label = $("p-mzml");
+  if (files.length === 0) {
+    label.textContent = "Nothing selected";
+    label.classList.remove("set");
+  } else {
+    label.textContent =
+      files.length === 1 ? baseName(files[0]) : `${files.length} files selected`;
+    label.classList.add("set");
+  }
+
+  list.innerHTML = "";
+  for (const [i, f] of files.entries()) {
+    const li = document.createElement("li");
+
+    const name = document.createElement("span");
+    name.className = "fname";
+    name.textContent = baseName(f);
+    li.appendChild(name);
+
+    const path = document.createElement("span");
+    path.className = "fpath";
+    path.textContent = f;
+    path.title = f;
+    li.appendChild(path);
+
+    // Say which files need something that is not installed, per file, here rather
+    // than as one aggregate blocker after Start.
+    let v = null;
+    try {
+      v = await invoke("vendor_of", { path: f });
+    } catch {
+      /* Detection is advisory; preflight is the authority. */
+    }
+    if (v && v.needs !== "Nothing") {
+      const ok =
+        v.needs === "ThermoParser" ? state.thermoReady : !!state.msconvert;
+      const tag = document.createElement("span");
+      tag.className = ok ? "hint inline" : "fbad";
+      tag.textContent = ok ? v.label : `${v.label} — converter missing`;
+      li.appendChild(tag);
+    }
+
+    const drop = document.createElement("button");
+    drop.className = "fdrop";
+    drop.type = "button";
+    drop.textContent = "\u00d7";
+    drop.title = "Remove";
+    drop.setAttribute("aria-label", `Remove ${baseName(f)}`);
+    drop.addEventListener("click", () => {
+      state.picks.mzml.splice(i, 1);
+      renderMzmlList();
+      updateRawNote();
+    });
+    li.appendChild(drop);
+
+    list.appendChild(li);
+  }
+}
+
+function currentRunMode() {
+  // One file is a plain search whatever the radio says; the backend refuses a
+  // one-file experiment rather than quietly demoting it, so do not send one.
+  return state.picks.mzml.length > 1 && state.runMode === "experiment"
+    ? "experiment"
+    : "separate";
+}
 
 async function pick(what) {
-  const chosen =
-    what === "out_dir"
-      ? await dialog.open({ directory: true, multiple: false })
-      : await dialog.open({ multiple: false, filters: FILTERS[what] });
+  // Spectra accept several at once; everything else is a single choice.
+  const many = what === "mzml";
+  const chosen = DIR_PICKS.has(what)
+    ? await dialog.open({ directory: true, multiple: false })
+    : await dialog.open({ multiple: many, filters: FILTERS[what] });
   if (!chosen) return;
+
+  if (what === "mzml" || what === "mzml_dir") {
+    const added = (Array.isArray(chosen) ? chosen : [chosen]).filter(Boolean);
+    // Silently dropping a duplicate is right: the backend refuses the same path
+    // twice (it would search one file twice and pool the result with itself), and a
+    // user who picks a file again means "have it", not "have it twice".
+    for (const f of added) {
+      if (!state.picks.mzml.includes(f)) state.picks.mzml.push(f);
+    }
+    await renderMzmlList();
+    updateRawNote();
+    // The peak census reads one file, and only an mzML: with several selected there
+    // is no single answer to show, and for a vendor path it would convert first.
+    if (state.picks.mzml.length === 1 && !isVendor(state.picks.mzml[0])) {
+      showPeakCensus(state.picks.mzml[0]);
+    } else {
+      show($("peak-note"), false);
+    }
+    banner($("start-error"), "");
+    return;
+  }
+
   const path = Array.isArray(chosen) ? chosen[0] : chosen;
   state.picks[what] = path;
-  if (what === "mzml") showPeakCensus(path);
+  if (what === "fasta") refreshLibSrcNote();
   const el = $(LABEL[what]);
   // Shown right-to-left so the filename stays visible on a long path; the full
   // path is the tooltip.
@@ -500,16 +962,315 @@ async function showPeakCensus(mzml) {
 }
 
 // ── starting and polling ────────────────────────────────────────────────────
+// -- FASTA -> DIA-NN library, driven from the Search tab -----------------
+// The library depends only on the FASTA and the digest parameters, so it is built
+// into a content-addressed cache and reused. That is what makes offering this on the
+// search screen honest: it is a one-time cost per FASTA, not a cost per search.
+//
+// Chained here rather than in the backend, deliberately. `start_run` is the one path
+// with end-to-end tests and it stays untouched; the cost is that a webview reload
+// mid-build loses the chain. The cache makes that harmless: press Start again and the
+// library is already there.
+// Read from the Search screen, where these inputs now live.
+//
+// They used to sit on the Setup screen inside a separate "Predict a library" card
+// while the control that consumed them was here, so invisible state on a screen the
+// user need never have opened decided the search space, the cache key, and whether
+// the "already built" note was even true. The `if (!el) return dflt` guards made
+// every mismatch silent. That card is gone; this flow is the only way to build one.
+function libraryParams(fasta) {
+  const n = (id, dflt) => {
+    const el = $(id);
+    if (!el) return dflt;
+    const v = parseInt(el.value, 10);
+    return Number.isFinite(v) ? v : dflt;
+  };
+  const cb = (id, dflt) => {
+    const el = $(id);
+    return el ? el.checked : dflt;
+  };
+  return {
+    fasta,
+    out_dir: "",
+    missed_cleavages: n("d-missed", 1),
+    min_pep_len: n("d-minlen", 7),
+    max_pep_len: n("d-maxlen", 30),
+    min_charge: n("d-minz", 2),
+    max_charge: n("d-maxz", 4),
+    threads: n("d-threads", 8),
+    carbamidomethyl: cb("d-cam", true),
+    oxidation: cb("d-ox", true),
+  };
+}
+
+// Say, on the search screen, whether choosing DIA-NN means waiting.
+async function refreshLibSrcNote() {
+  const note = $("libsrc-diann-note");
+  const radio = $("libsrc-diann");
+  if (!note || !radio) return;
+  const fasta = state.picks.fasta;
+  if (!fasta) {
+    radio.disabled = true;
+    note.textContent = "Choose a FASTA first.";
+    return;
+  }
+  let plan;
+  try {
+    plan = await invoke("diann_library_plan", { req: libraryParams(fasta) });
+  } catch (e) {
+    radio.disabled = true;
+    // The reason is the backend's: no DIA-NN, or the licence not acknowledged.
+    note.textContent = `Unavailable: ${e}`;
+    if (state.libSrc === "diann") selectLibSrc("builtin");
+    return;
+  }
+  radio.disabled = false;
+  note.textContent = plan.ready
+    ? `Already built for this FASTA — the search will start immediately (${plan.diann_version}).`
+    : `Not built yet: DIA-NN will predict it first, which takes a while on a whole proteome (${plan.diann_version}).`;
+}
+
+function selectLibSrc(which) {
+  state.libSrc = which;
+  const r = $(which === "diann" ? "libsrc-diann" : "libsrc-builtin");
+  if (r) r.checked = true;
+  show($("libsrc-params"), which === "diann");
+}
+
+/// Build the library if needed and return its two tables, or null on failure.
+// Put the progress screen back the way a search expects to find it.
+function leaveLibraryPhase() {
+  state.buildingLibrary = false;
+  $("prog-title").textContent = "Searching";
+}
+
+async function ensureLibrary(fasta) {
+  const req = libraryParams(fasta);
+  let plan;
+  try {
+    plan = await invoke("diann_library_plan", { req });
+  } catch (e) {
+    banner($("start-error"), String(e));
+    return null;
+  }
+  if (plan.cached) {
+    return [plan.cached.precursors, plan.cached.fragments];
+  }
+
+  // Not cached: build into the cache directory the backend chose.
+  req.out_dir = plan.cache_dir;
+  // The progress screen's own log and subtitle, not the Setup screen's DIA-NN panes:
+  // those live inside #screen-setup and would not be visible from here.
+  screen("progress");
+  state.buildingLibrary = true;
+  $("stages").innerHTML = "";
+  $("prog-title").textContent = "Predicting the library";
+  $("prog-sub").textContent = "DIA-NN is predicting the spectral library";
+  $("log").textContent = "";
+  try {
+    await invoke("diann_build", { req });
+  } catch (e) {
+    banner($("start-error"), String(e));
+    leaveLibraryPhase();
+    screen("input");
+    return null;
+  }
+
+  // Poll to completion, mirroring the build log onto the progress screen.
+  for (;;) {
+    await new Promise((r) => setTimeout(r, 1000));
+    let b;
+    try {
+      b = await invoke("diann_build_state");
+    } catch {
+      continue;
+    }
+    const logEl = $("log");
+    const text = (b.log || []).join("\n");
+    if (logEl && logEl.textContent !== text) {
+      logEl.textContent = text;
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+    $("prog-sub").textContent = b.step || "working";
+    if (b.status === "failed") {
+      banner($("start-error"), b.error || "The library build failed.");
+      leaveLibraryPhase();
+      screen("input");
+      return null;
+    }
+    if (b.status === "done" && b.precursors) {
+      // Hand the screen back to the search, which is about to start on it.
+      leaveLibraryPhase();
+      $("prog-sub").textContent = "Starting";
+      $("log").textContent = "";
+      return [b.precursors, b.fragments];
+    }
+  }
+}
+
+// One search per file, in sequence.
+//
+// Sequential and not parallel on purpose: a search already saturates the machine, and
+// two at once would compete for the same cores and memory while making the progress
+// display meaningless. The engine's own `experiment.parallel_runs` exists for the
+// pooled case where it can be reasoned about.
+async function runBatch(p, built, threads) {
+  const files = p.mzml.slice();
+  state.batch = { total: files.length, done: 0, failed: 0, results: [] };
+
+  for (const [i, file] of files.entries()) {
+    if (state.batch.stopped) break;
+    state.batch.done = i;
+
+    // Its own folder, named after the file, so results are findable and two runs
+    // cannot overwrite each other. A stem collision between two directories is
+    // possible, so the index disambiguates.
+    const stem = baseName(file).replace(/\.[^.]+$/, "");
+    const sub = `${String(i + 1).padStart(2, "0")}_${stem}`;
+    const req = {
+      mzml: [file],
+      experiment: false,
+      out_dir: `${p.out_dir}/${sub}`,
+      fasta: state.mode === "fasta" && !built ? p.fasta || null : null,
+      lib_precursors: built ? built[0] : state.mode === "library" ? p.lib_precursors || null : null,
+      lib_fragments: built ? built[1] : state.mode === "library" ? p.lib_fragments || null : null,
+      config: $("preset").value || null,
+      threads: Number.isFinite(threads) && threads > 0 ? threads : null,
+    };
+
+    // Preflight each file. A converter missing for file 5 should not be discovered
+    // after files 1 to 4 have been searched.
+    try {
+      const pf = await invoke("preflight", { req });
+      if (!pf.ok) {
+        state.batch.failed += 1;
+        state.batch.results.push({ file, error: pf.blockers.join(" ") });
+        continue;
+      }
+    } catch {
+      /* Preflight that cannot run is not a reason to refuse; the engine reports. */
+    }
+
+    try {
+      state.runId = await invoke("start_run", { req });
+    } catch (e) {
+      state.batch.failed += 1;
+      state.batch.results.push({ file, error: String(e) });
+      continue;
+    }
+
+    state.outDir = req.out_dir;
+    rememberFolder(req.out_dir);
+    screen("progress");
+    $("prog-title").textContent = `Searching ${i + 1} of ${files.length}`;
+    $("prog-sub").textContent = baseName(file);
+    for (const b of document.querySelectorAll(".nav")) {
+      if (b.dataset.screen === "progress") b.disabled = false;
+    }
+
+    // Wait for this one before starting the next.
+    const outcome = await awaitRun();
+    state.batch.results.push({ file, ...outcome });
+    if (outcome.error) state.batch.failed += 1;
+  }
+
+  state.batch.done = files.length;
+  renderBatchSummary();
+}
+
+/// Poll the current run to a terminal state, resolving with what it produced.
+function awaitRun() {
+  return new Promise((resolve) => {
+    const tick = async () => {
+      let s;
+      try {
+        s = await invoke("run_state", { id: state.runId });
+      } catch (e) {
+        return resolve({ error: String(e) });
+      }
+      render(s);
+      if (s.status === "done") return resolve({ results: s.results });
+      if (s.status === "failed" || s.status === "cancelled") {
+        return resolve({ error: s.error || s.status });
+      }
+      setTimeout(tick, 1000);
+    };
+    tick();
+  });
+}
+
+// What the batch produced, per file, once every run has finished.
+function renderBatchSummary() {
+  const b = state.batch;
+  if (!b) return;
+  screen("results");
+  $("res-title").textContent = `${b.total} searches`;
+  const ok = b.total - b.failed;
+  $("res-sub").textContent =
+    b.failed === 0
+      ? `All ${b.total} finished.`
+      : `${ok} finished, ${b.failed} did not. Each file has its own folder.`;
+
+  // Reuse the results screen's file list area for a per-file breakdown, because a
+  // single set of counts would be a lie: these runs share no FDR.
+  show($("res-batch-card"), true);
+  show($("kpis"), false);
+  const host = $("res-files");
+  if (!host) return;
+  host.innerHTML = "";
+  for (const r of b.results) {
+    const row = document.createElement("div");
+    const n = r.results ? fmtInt(r.results.peptides_1pct) : null;
+    row.textContent = r.error
+      ? `${baseName(r.file)} — failed: ${r.error}`
+      : `${baseName(r.file)} — ${n ?? "?"} peptides at 1%`;
+    host.appendChild(row);
+  }
+}
+
 async function start() {
   banner($("start-error"), "");
   const p = state.picks;
   const threads = parseInt($("threads").value, 10);
+
+  if (p.mzml.length === 0) {
+    banner($("start-error"), "Add at least one spectra file.");
+    return;
+  }
+
+  // FASTA mode with DIA-NN: the search is a library-mode search whose library is
+  // produced first. Everything after this point is the ordinary library path, which
+  // is also the tested one. Built ONCE for the whole selection, not per file: the
+  // library depends on the FASTA and the digest parameters, not on the spectra.
+  let built = null;
+  if (state.mode === "fasta" && state.libSrc === "diann") {
+    if (!p.fasta) {
+      banner($("start-error"), "Choose a FASTA first.");
+      return;
+    }
+    built = await ensureLibrary(p.fasta);
+    if (!built) return;
+  }
+
+  // Several files searched separately are N independent runs. Queued in the frontend
+  // so `start_run` stays the single tested path and each run is an ordinary one; the
+  // cost is that closing the window ends the queue, which the per-file output folders
+  // make recoverable.
+  if (p.mzml.length > 1 && currentRunMode() === "separate") {
+    return runBatch(p, built, threads);
+  }
+
   const req = {
+    // A sequence: `run::Request.mzml` is `Vec<String>`. Sending the bare string made
+    // serde reject every payload, so preflight AND start_run both failed and the Start
+    // button did nothing in every mode. `ci/check_desktop_ui.py` cannot catch this --
+    // it checks element ids and command names, never payload types.
     mzml: p.mzml,
+    experiment: currentRunMode() === "experiment",
     out_dir: p.out_dir,
-    fasta: state.mode === "fasta" ? p.fasta || null : null,
-    lib_precursors: state.mode === "library" ? p.lib_precursors || null : null,
-    lib_fragments: state.mode === "library" ? p.lib_fragments || null : null,
+    fasta: state.mode === "fasta" && !built ? p.fasta || null : null,
+    lib_precursors: built ? built[0] : state.mode === "library" ? p.lib_precursors || null : null,
+    lib_fragments: built ? built[1] : state.mode === "library" ? p.lib_fragments || null : null,
     config: $("preset").value || null,
     threads: Number.isFinite(threads) && threads > 0 ? threads : null,
   };
@@ -526,6 +1287,11 @@ async function start() {
         pf.blockers.join("\n\n") +
           (pf.components_complete ? "" : "\n\nOpen Setup to install the components.")
       );
+      // The library build may already have moved us to the progress screen, and both
+      // banners live on the input screen. Without this the message rendered onto a
+      // hidden screen: the user sat on "Searching" with an empty log, Progress still
+      // disabled, and `state.runId` null so Stop and the poller both did nothing.
+      screen("input");
       return;
     }
     // Not blocking, but worth saying before an hour is spent on it.
@@ -540,6 +1306,7 @@ async function start() {
     state.runId = await invoke("start_run", { req });
   } catch (e) {
     banner($("start-error"), String(e));
+    screen("input");
     return;
   }
 
@@ -559,6 +1326,22 @@ async function start() {
 }
 
 async function stop() {
+  // During the library phase there is no run to cancel: `cancel_run` only knows about
+  // engine runs, so Stop did nothing at all through a whole-proteome prediction.
+  // A batch: stop the queue as well as the current run, or the next file starts the
+  // moment this one is cancelled.
+  if (state.batch && state.batch.done < state.batch.total) {
+    state.batch.stopped = true;
+  }
+  if (state.buildingLibrary) {
+    try {
+      await invoke("diann_cancel");
+    } catch (e) {
+      banner($("run-error"), String(e));
+    }
+    return;
+  }
+
   if (!state.runId) return;
   $("stop").disabled = true;
   $("stop").textContent = "Stopping…";
@@ -715,6 +1498,9 @@ function render(s) {
 }
 
 function renderResults(s) {
+  // The per-file breakdown belongs to a batch; a single run shows its own counts.
+  show($("res-batch-card"), false);
+  show($("kpis"), true);
   const r = s.results;
   $("res-title").textContent = "Finished";
   const bits = [fmtDuration(s.elapsed_ms)];
@@ -732,6 +1518,19 @@ function renderResults(s) {
       $("res-warn"),
       `Rescoring fell back to ${r.classifier}; ${r.classifier_requested} was requested. ` +
         `The counts below come from ${r.classifier}.`
+    );
+  } else if (r && r.experiment_wide) {
+    // Not a caveat, a unit change. `run-experiment` groups the q columns across the
+    // whole experiment, so these counts are experiment-wide and a per-file reading of
+    // them is diluted by roughly 1/n_runs. Its peptides.tsv and proteins.tsv are the
+    // experiment-wide report, with one quantity column per run.
+    banner(
+      $("res-warn"),
+      "These are EXPERIMENT-WIDE counts, pooled across every run, not per file. " +
+        "An experiment-wide rescore groups the q values across the whole experiment, " +
+        "so dividing by the number of runs does not give a per-file number; the " +
+        "per-file unit is run_psm_q in the split tables. peptides.tsv and proteins.tsv " +
+        "here are the experiment-wide report, with one quantity column per run."
     );
   } else {
     banner($("res-warn"), "");

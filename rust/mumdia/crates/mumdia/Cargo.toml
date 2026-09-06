@@ -32,6 +32,14 @@ arrow.workspace = true
 parquet.workspace = true
 mzdata.workspace = true
 mimalloc.workspace = true
+# Heap profiler, off by default. `--features dhat-heap` swaps the global allocator for
+# dhat's and writes dhat-heap.json (per-call-site bytes and the peak), which is the only
+# way to attribute a stage peak to allocation sites rather than to the buffers memlog
+# names explicitly. Costs a large slowdown, so profile a truncated input.
+dhat = { version = "0.3", optional = true }
+
+[features]
+dhat-heap = ["dep:dhat"]
 
 [lints]
 workspace = true

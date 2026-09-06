@@ -7,8 +7,8 @@
 MuMDIA is a data-independent-acquisition (DIA) peptide search engine written in
 Rust, with optional Python sidecars for the machine-learning components (DeepLC
 retention time, MS2PIP fragment intensities, mokapot and a PyTorch rescorer). It
-reads DIA `mzML`, searches against either an in-silico FASTA digest or an
-imported predicted spectral library, and reports peptides and protein groups
+reads DIA `mzML` (and vendor formats, converted on the way in), searches against
+either an in-silico FASTA digest or an imported predicted spectral library, and reports peptides and protein groups
 under target-decoy FDR control together with label-free quantities. This is early
 software. The engine runs end to end and is validated on public DIA data, but the
 Python sidecars are not exercised by continuous integration, and the
@@ -24,7 +24,7 @@ path-addressable inputs:
 FASTA -> digest -> peptidoforms -> predict-frag --+
                                                    +-> search-seed
 imported spectral library ------------------------+       |
-mzML -> convert ----------------------------------+       v
+mzML or vendor format -> convert -----------------+       v
                                                   optional RT fine-tune
                                                            |
                                                            v
@@ -238,8 +238,10 @@ mumdia quant-lfq --inputs exp/r0/peptide_quant.parquet exp/r1/peptide_quant.parq
 ```
 
 `run-experiment` writes one subdirectory per run (`r0`, `r1`, ... unless
-`--run-names` is given) and never calls the report stage, so it produces no
-`peptides.tsv` or `proteins.tsv` anywhere in its output tree. See
+`--run-names` is given) and one experiment-wide `peptides.tsv` and `proteins.tsv`
+at the root: rows selected on the experiment-wide q columns, `n_runs`, and one
+quantity column per run (`quantity_<run>` for precursors, `lfq_<run>` for protein
+groups). There are no per-run TSVs; see
 [Status of experimental features](#status-of-experimental-features).
 
 ## Configuration
@@ -278,9 +280,16 @@ restricts output to warnings and errors.
 ### Imported spectral library (highest measured sensitivity)
 
 In library-input mode `run` skips digest, peptidoform expansion, and initial
-fragment and retention-time prediction, and uses the imported library's fragment
-intensities and retention times. An optional per-run DeepLC fine-tune can still
-rewrite the imported iRT values after the seed search.
+fragment prediction, and uses the imported library's fragment intensities. For
+retention time the default (`rt_im_train.library_irt = auto`) re-predicts the
+imported iRT once with the DeepLC base model when a DeepLC interpreter is
+configured, then calibrates it per run; without an interpreter the imported values
+are kept and a warning says so. DeepLC 4.1.1 or newer is required (`mumdia doctor`
+and the workers refuse older versions). Measured at 1%: AIF 10,416 peptides against
+10,015 from the imported iRT and 10,181 from a per-run fine-tune; HYE B01 (NN seeds
+1-3) 58,842 against 56,556, and 60,278 with a library fine-tuned once. The optional
+fine-tune (`finetune_deeplc`, on the original imported table) remains the
+recommended extra step on a large reference.
 
 MuMDIA neither ships nor invokes DIA-NN, and never redistributes it. You run
 DIA-NN yourself under your own licence; the DIA-NN "Academia" build is free for
@@ -322,9 +331,9 @@ environment has both; in Docker use `/opt/conda/envs/rescore/bin/python`).
    ```
 
 4. **Run MuMDIA in library-input mode** (no `--fasta`), as in the quickstart
-   above. Everything downstream is unchanged. Because the imported library
-   supplies both fragment intensities and retention times, no fragment or RT
-   prediction sidecar is required in this mode.
+   above. Everything downstream is unchanged. No fragment prediction sidecar is
+   required in this mode; a DeepLC interpreter is needed for the default
+   retention-time re-prediction, and without one the imported iRT is used.
 
 **Prefer the augmented tables when you can build them.** An imported DIA-NN
 library is missing the N-terminal methionine-excised peptides that DIA-NN's own
@@ -447,20 +456,19 @@ it.
 |---|---|
 | `q_value`, `experiment_psm_q` | pooled PSM, across every table given to `rescore` |
 | `run_psm_q` | PSM within one run; the correct per-file unit under a pooled rescore |
-| `precursor_q` | peptidoform plus charge, but only under `compete.group_by = peptidoform_charge` |
+| `precursor_q` | peptidoform plus charge under the default `compete.group_by = peptidoform_charge` (base peptides under `base_peptide`) |
 | `peptide_q_value` | base (stripped) peptide; what `peptides.tsv` is filtered on |
 | `pg_q_value` | protein-accession-set group; what `proteins.tsv` is filtered on |
 
 Two traps:
 
 - **`precursor_q` is a precursor unit only under
-  `compete.group_by = peptidoform_charge`.** The default competition key
+  `compete.group_by = peptidoform_charge`, the default.** The alternative key
   `base_peptide` (renamed from `precursor`, which it was not) groups on the
-  stripped sequence, so every charge
-  and every modification variant of one peptide collapses to a single winner
-  before FDR. Under that key `precursor_q` therefore counts base peptides
-  (measured 1.000 precursors per peptide, against 1.174 with
-  `peptidoform_charge`).
+  stripped sequence, so every charge and every modification variant of one
+  peptide collapses to a single winner before FDR. Under that key `precursor_q`
+  therefore counts base peptides (measured 1.000 precursors per peptide, against
+  1.174 with `peptidoform_charge`).
 - **The grouped columns are written only to each group's single winning row.**
   `peptide_q_value`, `precursor_q`, and `pg_q_value` are 1.0 on every loser.
   Under an experiment-wide rescore the grouping is experiment-wide, so a per-run
@@ -574,7 +582,7 @@ are listed so the documentation cannot imply a capability that is not there.
 | model-visible top-K peaks | `extract.retain_top_peaks > 1` writes diagnostic peak alternatives only. They do not become feature or rescore rows. The selected apex was historically strongest only about 48 to 52% of the time while the correct peak was in the top five about 86 to 88%, so promoting alternatives is plausible future work, not a present capability |
 | adaptive RT windows | not enabled by default |
 | held-out RT window sizing | `rt_im_train.window_holdout_frac`, default off. Gained 1.1% of peptides with DeepLC 4.1.0 at an unchanged 0.98% decoy fraction, but lost 1.5% with the overfitting 4.0.0a2 model, so it interacts with retention-time model quality |
-| `compete.group_by = peptidoform_charge` | accepted and correct, but not the shipped default. It is **required**, not optional, for a PTM or modification search: under the default key the modified form is deleted whenever an unmodified or alkylated sibling scores higher, which is usually. Measured on a modification-rich library, the default key deleted 880,464 of 1,890,239 extracted candidates (46.6%) while `peptidoform_charge` removed none |
+| `compete.group_by = base_peptide` | the previous default, kept as an explicit peptide-level population. Never for a PTM or modification search: under it the modified form is deleted whenever an unmodified or alkylated sibling scores higher, which is usually (880,464 of 1,890,239 extracted candidates, 46.6%, on a modification-rich library; `peptidoform_charge`, the default since 2026-09-06, removed none) |
 | MBR tiers | `mbr.strategy` distinguishes only none from not-none. `mbr.rt_window_s`, `mbr.decoy_transfer`, and `mbr.requant_all` are accepted by the config but not wired; setting them changes nothing, and the engine warns that it did nothing |
 | fixed-window and library-ranked quantification | `quant.fragment_selection`, `fixed_scan_halfwidth`, `fixed_window_s`, and `baseline_subtract` all default to off pending entrapment validation |
 | acquisition-specific peak caps | the shipped default is uncapped at both conversion entry points. A cap must come from a sweep on the acquisition it will be used on |
@@ -582,17 +590,28 @@ are listed so the documentation cannot imply a capability that is not there.
 
 Hard limits of this release:
 
-- **mzML input only.** No vendor formats.
+- **mzML input, plus vendor formats by external conversion.** The engine reads
+  mzML. A vendor path passed to `--mzml` is converted first: Thermo `.raw` by
+  ThermoRawFileParser (which the desktop application installs), and Bruker `.d`,
+  SCIEX `.wiff`, Agilent `.d` and Waters `.raw` by ProteoWizard `msconvert` (which
+  MuMDIA locates but does not install). `mumdia doctor` reports both converters.
+  Only Thermo is exercised end to end; the other four are wired and unverified
+  (`docs/04_convert.md`, "Vendor formats").
 - **No ion mobility.** The pipeline is 3D; the ion-mobility columns exist in the
-  artifacts and are always null.
+  artifacts and are always null. Bruker diaPASEF input is accepted but loses the
+  mobility separation the acquisition exists to produce.
 - **No wildcard or terminal variable modifications.** Both are rejected at
   peptidoform expansion.
-- **`run` processes one mzML file.** Use `run-experiment` for a pooled multi-run
+- **Several files are one experiment by default.** `run` with several `--mzml`, like
+  `run-experiment`, rescores them together; only one `--mzml` is a single-file search.
+  Use `run-experiment` directly for a pooled multi-run
   search.
-- **`run-experiment` does not write the TSV reports.** It never calls the report
-  stage, so there is no `peptides.tsv` or `proteins.tsv` anywhere in its output
-  tree. Take per-run counts from the split scored tables on `run_psm_q`, or
-  invoke `mumdia report` yourself. It also overrides the configured
+- **`run-experiment` writes experiment-wide TSV reports, not per-run ones.** Its
+  `peptides.tsv` and `proteins.tsv` select on the experiment-wide q columns and
+  carry one quantity column per run; a per-run reading of the grouped q columns
+  is diluted by about 1/n_runs, so take per-run counts from the split scored
+  tables on `run_psm_q`. `mumdia report --experiment-dir` rewrites the pair at
+  another threshold. It also overrides the configured
   `quant.q_filter` to gate per-run quantification on the pooled `q_value`, and
   warns when it does.
 - **The Python sidecars are not covered by continuous integration.** CI builds

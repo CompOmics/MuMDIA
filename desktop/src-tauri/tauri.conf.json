@@ -36,7 +36,8 @@
     "shortDescription": "MuMDIA DIA search engine",
     "longDescription": "Desktop interface for the MuMDIA data-independent acquisition proteomics search engine.",
     "resources": {
-      "binaries/*": "binaries/"
+      "binaries/*": "binaries/",
+      "binaries/scripts/*": "binaries/scripts/"
     }
   }
 }

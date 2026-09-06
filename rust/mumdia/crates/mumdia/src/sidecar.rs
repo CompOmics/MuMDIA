@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::process::Command;
 
 use anyhow::{bail, Context, Result};
-use mumdia_io::table::{write_table, Col, Table};
+use mumdia_io::table::{write_table, Col, TableFile};
 use tracing::info;
 
 type FragmentIntensityMap = HashMap<u32, HashMap<(u8, u16), f32>>;
@@ -69,7 +69,7 @@ pub fn run_ms2pip(
     info!(n = ids.len(), model, "sidecar: running MS2PIP");
     run_worker(python, script, &[&inp, &outp, model], false).context("MS2PIP worker failed")?;
 
-    let t = Table::read(&outp)?;
+    let t = TableFile::open(&outp)?;
     let oid = t.u32("id")?;
     let ion = t.str("ion_type")?;
     let ord = t.i32("ordinal")?;
@@ -84,6 +84,35 @@ pub fn run_ms2pip(
     Ok(map)
 }
 
+/// Installed version of a Python distribution as the interpreter reports it
+/// (`crate::python::module_version`, read from package metadata so the probe does not
+/// import the package). None when the interpreter cannot be run or the distribution is
+/// not installed.
+pub fn module_version(python: &str, module: &str) -> Option<String> {
+    crate::python::module_version(std::path::Path::new(python), module)
+}
+
+/// Refuse a DeepLC interpreter older than `MIN_DEEPLC_VERSION`. The default
+/// retention-time workflow calibrates base-model predictions per run without a
+/// fine-tune, and that rests on the base model not memorising its anchors, which
+/// 4.0.0a2 did (docs/08 section 4b). Both worker scripts repeat the check, but
+/// failing here is cheaper than failing after the input table has been written.
+pub fn require_deeplc_version(python: &str) -> Result<String> {
+    use mumdia_core::constants::{parse_version3, MIN_DEEPLC_VERSION};
+    let (ma, mi, pa) = MIN_DEEPLC_VERSION;
+    let v = module_version(python, "deeplc").ok_or_else(|| {
+        anyhow::anyhow!(
+            "cannot determine the deeplc version through {python} (is DeepLC >= {ma}.{mi}.{pa} installed there?)"
+        )
+    })?;
+    match parse_version3(&v) {
+        Some(t) if t >= MIN_DEEPLC_VERSION => Ok(v),
+        _ => bail!(
+            "deeplc {v} at {python} is older than the required {ma}.{mi}.{pa};              upgrade with `pip install 'deeplc>={ma}.{mi}.{pa}'`"
+        ),
+    }
+}
+
 /// DeepLC: predict retention time per peptidoform. Returns `id -> predicted_rt`.
 pub fn run_deeplc(
     python: &str,
@@ -92,6 +121,7 @@ pub fn run_deeplc(
     ids: &[u32],
     peptidoforms: &[String],
 ) -> Result<HashMap<u32, f32>> {
+    require_deeplc_version(python)?;
     std::fs::create_dir_all(workdir).ok();
     // Per-invocation names; see the note in the MS2PIP helper above.
     let pid = std::process::id();
@@ -107,7 +137,7 @@ pub fn run_deeplc(
     info!(n = ids.len(), "sidecar: running DeepLC");
     run_worker(python, script, &[&inp, &outp], true).context("DeepLC worker failed")?;
 
-    let t = Table::read(&outp)?;
+    let t = TableFile::open(&outp)?;
     let oid = t.u32("id")?;
     let rt = t.f32("predicted_rt")?;
     Ok(oid.into_iter().zip(rt).collect())
@@ -130,6 +160,7 @@ pub fn run_deeplc_finetune(
     window_holdout_frac: f64,
     rng_seed: u64,
 ) -> Result<()> {
+    require_deeplc_version(python)?;
     info!(
         lib_in,
         seed,
@@ -177,6 +208,43 @@ pub fn run_deeplc_finetune(
         true,
     )
     .context("DeepLC fine-tune failed")
+}
+
+/// DeepLC base-model re-prediction of an imported library's `predicted_irt`: the
+/// fine-tune worker with `--no-finetune`, so the table rewrite (targets predicted on their
+/// peptidoform, decoys on the DECOY_-stripped sequence, rows with non-standard residues
+/// keeping the imported value) is the one the fine-tune path uses. Positional contract:
+/// `deeplc_finetune.py <lib_in> - <lib_out> --no-finetune`. Prediction is forward-only,
+/// so it takes the engine's full thread count rather than the fine-tune's bounded pool.
+pub fn run_deeplc_repredict(
+    python: &str,
+    script: &str,
+    lib_in: &str,
+    lib_out: &str,
+    threads: usize,
+) -> Result<()> {
+    require_deeplc_version(python)?;
+    info!(
+        lib_in,
+        lib_out, threads, "sidecar: re-predicting the library iRT with the DeepLC base model"
+    );
+    let th = threads.max(1).to_string();
+    run_worker(
+        python,
+        script,
+        &[
+            lib_in,
+            "-",
+            lib_out,
+            "--no-finetune",
+            "--threads",
+            &th,
+            "--predict-threads",
+            &th,
+        ],
+        true,
+    )
+    .context("DeepLC library re-prediction failed")
 }
 
 /// MBR transfer (Stage D3): match-between-runs identification transfer over the

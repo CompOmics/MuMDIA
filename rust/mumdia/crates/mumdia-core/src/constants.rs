@@ -9,6 +9,32 @@
 /// DIA-NN's H-atom value 1.007825035 (docs/18_findings_and_decisions.md).
 pub const PROTON: f64 = 1.007_276_466_812;
 
+/// Oldest DeepLC the engine accepts, as (major, minor, patch). The default retention-time
+/// workflow is prediction plus per-run LOESS calibration with no fine-tune, and that rests
+/// on the base model being good: 4.0.0a2 memorised anchors (in-sample 15.9 s against
+/// held-out 195 s residuals, docs/08 section 4b) and would silently degrade every window
+/// under that default. Enforced by interpreter discovery, `doctor`, and the two DeepLC
+/// worker scripts.
+pub const MIN_DEEPLC_VERSION: (u32, u32, u32) = (4, 1, 1);
+
+/// Parse a PEP 440-ish version string's leading numeric components. Pre-release suffixes
+/// ("4.0.0a2") are dropped, so "4.1.1rc1" compares as 4.1.1; anything unparsable is None.
+pub fn parse_version3(s: &str) -> Option<(u32, u32, u32)> {
+    let mut parts = [0u32; 3];
+    for (i, piece) in s.trim().split('.').take(3).enumerate() {
+        let digits: String = piece.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if digits.is_empty() {
+            return if i == 0 {
+                None
+            } else {
+                Some((parts[0], parts[1], parts[2]))
+            };
+        }
+        parts[i] = digits.parse().ok()?;
+    }
+    Some((parts[0], parts[1], parts[2]))
+}
+
 /// Monoisotopic mass of a neutral water molecule (H2O), Da.
 pub const WATER: f64 = 18.010_564_684;
 
@@ -160,5 +186,29 @@ mod ppm_tests {
         // Finite behaviour is unchanged.
         assert!(within_ppm(500.0, 500.005, 20.0));
         assert!(!within_ppm(500.0, 500.5, 20.0));
+    }
+}
+
+#[cfg(test)]
+mod version_tests {
+    use super::*;
+
+    #[test]
+    fn parse_version3_handles_release_prerelease_and_junk() {
+        assert_eq!(parse_version3("4.1.1"), Some((4, 1, 1)));
+        assert_eq!(
+            parse_version3(
+                "4.2.0
+"
+            ),
+            Some((4, 2, 0))
+        );
+        assert_eq!(parse_version3("4.0.0a2"), Some((4, 0, 0)));
+        assert_eq!(parse_version3("4.1"), Some((4, 1, 0)));
+        assert_eq!(parse_version3("4.1.1rc1"), Some((4, 1, 1)));
+        assert_eq!(parse_version3("dev"), None);
+        assert!(parse_version3("4.0.0a2").unwrap() < MIN_DEEPLC_VERSION);
+        assert!(parse_version3("4.1.1").unwrap() >= MIN_DEEPLC_VERSION);
+        assert!(parse_version3("4.2.0").unwrap() >= MIN_DEEPLC_VERSION);
     }
 }

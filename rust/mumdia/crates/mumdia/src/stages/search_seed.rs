@@ -182,6 +182,8 @@ pub fn run(p: SearchSeedParams) -> Result<u64> {
             // narrow-tolerance case, where a wider window would just admit noise.
             let collect_ppm = 50.0_f64.max(p.cfg.fragment_tol_ppm);
             for &fmz in mzs {
+                // library m/z is stored f32; widen once, the value is unchanged
+                let fmz = fmz as f64;
                 let (lo, hi) = mumdia_core::constants::ppm_bounds(fmz, collect_ppm);
                 let s = scan.peaks.partition_point(|pk| pk.mz < lo);
                 let (mut bestd, mut bestppm) = (f64::MAX, None);

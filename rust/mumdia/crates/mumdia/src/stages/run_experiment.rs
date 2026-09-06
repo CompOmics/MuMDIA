@@ -77,6 +77,18 @@ fn preflight(p: &RunExperimentParams) -> Result<()> {
     if cfg.rt_im_train.finetune_deeplc && cfg.predict_frag.deeplc_python.is_none() {
         anyhow::bail!("rt_im_train.finetune_deeplc requires predict_frag.deeplc_python");
     }
+    if p.lib_precursors.is_some()
+        && matches!(
+            cfg.rt_im_train.library_irt,
+            mumdia_core::config::LibraryIrt::Deeplc
+        )
+        && cfg.predict_frag.deeplc_python.is_none()
+    {
+        anyhow::bail!(
+            "rt_im_train.library_irt = deeplc requires predict_frag.deeplc_python; set \
+             library_irt = library to keep the imported iRT"
+        );
+    }
     // Check the interpreters EXIST, not merely that the fields are set. The rescore runs
     // after every per-run chain, so on an 83-file batch a mistyped `rescore.python` used to
     // discard days of compute at the final stage. A wrong path is also the most likely error
@@ -257,26 +269,37 @@ fn process_run(
 /// column (0..n-1), preserving the schema exactly (arrow row filter). Quant then
 /// runs per run with `q_filter = psm_q`, keeping each run's own confident PSMs.
 fn split_by_source(scored: &str, out_paths: &[String]) -> Result<()> {
-    let t = mumdia_io::table::Table::read(scored)?;
+    // One streaming pass: every output has its writer open, each input batch is filtered
+    // once per run and appended, so the resident set is one batch rather than the whole
+    // experiment-wide scored table that the old read-then-filter held in full.
+    let t = mumdia_io::table::TableFile::open(scored)?;
     let src_idx = t
         .schema
         .index_of("source")
         .map_err(|_| anyhow::anyhow!("scored table has no `source` column for split"))?;
+    let mut writers: Vec<mumdia_io::table::BatchWriter> = out_paths
+        .iter()
+        .map(|out| mumdia_io::table::BatchWriter::new(out, t.schema.clone()))
+        .collect::<Result<_>>()?;
     let mut written = 0usize;
-    for (i, out) in out_paths.iter().enumerate() {
-        let mut filtered = Vec::with_capacity(t.batches.len());
-        for b in &t.batches {
-            let src = b
-                .column(src_idx)
-                .as_any()
-                .downcast_ref::<UInt32Array>()
-                .ok_or_else(|| anyhow::anyhow!("`source` column is not u32"))?;
+    t.for_each_batch(None, 1 << 14, |b| {
+        let src = b
+            .column(src_idx)
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .ok_or_else(|| anyhow::anyhow!("`source` column is not u32"))?;
+        for (i, w) in writers.iter_mut().enumerate() {
             let mask: BooleanArray = (0..src.len()).map(|k| src.value(k) == i as u32).collect();
-            let f = filter_record_batch(b, &mask)?;
-            written += f.num_rows();
-            filtered.push(f);
+            let filtered = filter_record_batch(b, &mask)?;
+            written += filtered.num_rows();
+            if filtered.num_rows() > 0 {
+                w.write(&filtered)?;
+            }
         }
-        mumdia_io::table::write_batches(out, t.schema.clone(), &filtered)?;
+        Ok(())
+    })?;
+    for w in writers {
+        w.close()?;
     }
     // The split is a partition, so it must account for every input row. Nothing
     // enforced that: a `source` value outside `0..out_paths.len()` -- which a
@@ -284,7 +307,7 @@ fn split_by_source(scored: &str, out_paths: &[String]) -> Result<()> {
     // worker could reintroduce -- dropped those PSMs into no output at all. Every
     // downstream number is then computed from a silently smaller population, with
     // no error and no warning. A count is the whole check.
-    let total: usize = t.batches.iter().map(|b| b.num_rows()).sum();
+    let total: usize = t.nrows;
     if written != total {
         anyhow::bail!(
             "splitting {scored} by `source` placed {written} of {total} rows into \
@@ -393,6 +416,52 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
             })?;
             (lib_p, lib_f)
         }
+    };
+
+    // Library-input mode without a fine-tune: the DeepLC base-model re-prediction of the
+    // imported iRT does not depend on any run, so it is computed once here and every
+    // per-run chain fits its own RT calibration against the same table.
+    let lib_p_base = if cfg.rt_im_train.repredicts_library_irt(
+        p.lib_precursors.is_some(),
+        cfg.predict_frag.deeplc_python.is_some(),
+    ) {
+        let python = cfg
+            .predict_frag
+            .deeplc_python
+            .as_deref()
+            .expect("repredicts_library_irt implies deeplc_python");
+        let script = crate::sidecar::resolve_script(
+            &cfg.predict_frag.sidecar_script_dir,
+            "deeplc_finetune.py",
+        );
+        let out = d("fragment_library_precursors_deeplc.parquet");
+        info!(
+            library = %lib_p_base,
+            "run-experiment: re-predicting the library iRT once with the DeepLC base model"
+        );
+        crate::sidecar::run_deeplc_repredict(
+            python,
+            &script,
+            &lib_p_base,
+            &out,
+            rayon::current_num_threads(),
+        )?;
+        out
+    } else {
+        if p.lib_precursors.is_some()
+            && !cfg.rt_im_train.finetune_deeplc
+            && matches!(
+                cfg.rt_im_train.library_irt,
+                mumdia_core::config::LibraryIrt::Auto
+            )
+        {
+            warn!(
+                "run-experiment: keeping the imported library iRT because no \
+                 predict_frag.deeplc_python is configured; configure one to re-predict with \
+                 DeepLC, or set rt_im_train.library_irt = library to silence this"
+            );
+        }
+        lib_p_base
     };
 
     // --- per-run search chains ---
@@ -625,6 +694,26 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         &lfq,
     )?;
 
+    // --- experiment-wide report ---
+    // peptides.tsv and proteins.tsv at the experiment root, selected on the
+    // experiment-wide grouped q columns (the one unit that is valid across a pooled
+    // rescore), with one quantity column per run: each run's own precursor quantity, and
+    // the cross-run MaxLFQ protein quantity. There is deliberately no per-run TSV: the
+    // grouped q columns are written to each group's experiment-wide winner only, so a
+    // per-run report would be diluted by about 1/n_runs; the per-run unit is `run_psm_q`
+    // in the split tables.
+    let pep_tsv = d("peptides.tsv");
+    let prot_tsv = d("proteins.tsv");
+    let (n_rep_pep, n_rep_prot) = report::run_experiment(report::ExperimentReportParams {
+        scored: &scored_for_quant,
+        run_names: &names,
+        peptide_quants: &peptide_quants,
+        protein_lfq: Some(&lfq),
+        out_peptides: &pep_tsv,
+        out_proteins: &prot_tsv,
+        q_threshold: cfg.quant.q_threshold,
+    })?;
+
     // --- experiment manifest ---
     let manifest = json!({
         "config_hash": ch,
@@ -635,6 +724,14 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         "mbr": format!("{:?}", cfg.mbr.strategy),
         "lfq": lfq,
         "peptide_quants": peptide_quants,
+        "report": {
+            "peptides": pep_tsv,
+            "proteins": prot_tsv,
+            "n_precursors": n_rep_pep,
+            "n_protein_groups": n_rep_prot,
+            "q_threshold": cfg.quant.q_threshold,
+            "unit": "experiment-wide peptide_q_value / pg_q_value; n_runs on run_psm_q",
+        },
     });
     // Provenance parity with the single-run manifest: the identity of the code, of
     // the inputs, and of every artifact this stage produced.
@@ -736,7 +833,10 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
     mumdia_io::json::write_json(&d("experiment_manifest.json"), &manifest)?;
     info!(
         elapsed_ms = t0.elapsed().as_millis(),
-        n_runs, "run-experiment: complete"
+        n_runs,
+        report_precursors = n_rep_pep,
+        report_protein_groups = n_rep_prot,
+        "run-experiment: complete"
     );
     Ok(())
 }

@@ -70,10 +70,11 @@ Library construction/import and mzML conversion are independent branches:
 FASTA -> digest -> peptidoforms -> predict-frag --+
                                                    +-> search-seed
 imported library ---------------------------------+       |
-mzML -> convert ----------------------------------+       v
+mzML or vendor file -> convert -------------------+       v
         (optional: prescan, per-run tag pruning    |
          of modform hypotheses for a PTM search)   |
-                                                  optional DeepLC fine-tune
+                                    library iRT re-prediction (DeepLC 4.1.1 base
+                                    model, default) or optional DeepLC fine-tune
                                                            |
                                                            v
                                       rt-im-train -> extract -> features
@@ -82,9 +83,12 @@ mzML -> convert ----------------------------------+       v
 
 Key semantics:
 
-- `run` is a single-run orchestrator. It always recomputes and overwrites its
-  named outputs; the manifest is provenance, not a cache or resume database.
-  Use a fresh output directory.
+- `run` is a single-run orchestrator when given one `--mzml`; given several it
+  dispatches to `run-experiment`, because files provided together are rescored
+  together by default (one pooled FDR, per-run quant, cross-run LFQ). Searching
+  files separately is the opt-in: one `run` per file. `run` always recomputes and
+  overwrites its named outputs; the manifest is provenance, not a cache or resume
+  database. Use a fresh output directory.
 - Standalone stages can be reused manually because inputs are path-addressable.
 - Both `convert` and `run` default `--top-peaks-ms2` to `0` (uncapped). The cap
   is destructive: `convert.rs:76-79` keeps only the top N peaks per MS2 spectrum
@@ -96,6 +100,19 @@ Key semantics:
   output was identical with and without a 300-peak conversion cap.
 - `--max-spectra N` reads the head of the mzML. It does not select a
   mid-gradient slice.
+- A vendor path given as `--mzml` is converted to mzML first by
+  `raw::ensure_mzml` (`convert`, `run`, `run-experiment`, `peak-census`): Thermo
+  `.raw` by ThermoRawFileParser, Bruker/Agilent `.d`, SCIEX `.wiff` and Waters
+  `.raw` by ProteoWizard `msconvert`, both located (`convert.thermo_raw_parser`,
+  `convert.msconvert`, `auto` by default) and never shipped. The mzML lands
+  beside the input and is reused when newer than it (`convert.reuse_converted`).
+  `mumdia doctor` reports both converters and never fails for their absence.
+  Only Thermo is exercised end to end; `docs/04_convert.md` "Vendor formats" has
+  the table, the ion-mobility caveat for Bruker, and the extension collisions.
+- An imported library row with an empty `protein` is grouped as `UNASSIGNED` at
+  load, with a warning that counts the rows (DIA-NN writes the iRT-kit standards
+  without a protein); `scripts/import_diann_lib.py` writes the same group at
+  import time. An empty `peptidoform` is still a hard error.
 - The native digest emits N-terminal Met-excised forms by default
   (`digest.n_term_met_excision = true`, matching DIA-NN `--met-excision`).
   Excision keys on protein position 0 with a leading `M`, not any interior `M`.
@@ -103,8 +120,19 @@ Key semantics:
   still parse because the field defaults on. `augment_library.py` reuses this
   same digest to fill an imported library's missing tryptic peptides.
 - Imported-library mode skips digest, peptidoform expansion, and initial
-  prediction. Optional DeepLC fine-tuning still runs after seed search and
-  writes a new precursor table rather than modifying the input.
+  prediction. Under the default `rt_im_train.library_irt = auto` the imported
+  iRT is re-predicted with the DeepLC base model when a DeepLC interpreter is
+  configured (a new precursor table; once per experiment under `run-experiment`),
+  because the imported DIA-NN iRT is the worst RT source measured: AIF 10,015
+  peptides raw, 10,181 per-run fine-tuned, 10,416 re-predicted with DeepLC 4.1.1;
+  HYE B01 (NN seeds 1-3) 56,556 raw, 60,278 with a once-fine-tuned library, 58,842
+  re-predicted (`docs/08_rt_im_train.md` section 4c). The re-prediction is
+  deterministic and costs about 27 minutes once for the 10.9M-row HYE library on
+  64 threads. The once-per-library fine-tune is still +2.4% on HYE (18.6k anchors)
+  and -2.3% on AIF (5.6k anchors), so it stays the recommended extra step on a
+  large reference rather than the default. Optional DeepLC fine-tuning still runs
+  after seed search and writes a new precursor table rather than modifying the
+  input.
 - Stage-level candidate competition is within label, so it does not directly
   eliminate a target against its decoy. Peptide-level q estimation subsequently
   performs picked target-decoy competition through the shared
@@ -225,12 +253,20 @@ changed to 0.6 to match the default classifier. `native_tda` has since risen to
 describes this configuration and the default is back to 0.2. Re-derive the optimum
 rather than inheriting it if you change the library, the apex mode or the folds.
 
+DeepLC 4.1.1 or newer is required wherever DeepLC runs (`predict-frag` in FASTA mode, the
+optional fine-tune): `mumdia doctor` fails on an older one, `sidecar::require_deeplc_version`
+refuses to launch either worker, and both worker scripts repeat the check
+(`mumdia_core::constants::MIN_DEEPLC_VERSION` is the single Rust constant). The default retention-time workflow is
+prediction plus per-run LOESS calibration with `finetune_deeplc = false`, and that default
+is only sound on a base model that does not memorise its anchors (4.0.0a2 did).
+
 Three RT rules, each measured in `docs/08_rt_im_train.md` and restated from the
 failure side in `docs/17_troubleshooting.md`:
 
 - DeepLC fine-tuning of library iRT is the largest RT lever (historically
-  reducing residuals from about 110 s to 13-27 s) and must happen, but it need
-  not happen per file. A library fine-tuned once and predicted over every
+  reducing residuals from about 110 s to 13-27 s) after the base-model
+  re-prediction that `library_irt = auto` now does by default, and it need not
+  happen per file. A library fine-tuned once and predicted over every
   peptidoform, combined with the per-run LOESS calibration and
   `rt_im_train.finetune_deeplc = false`, measured equal or marginally better
   residuals than per-file fine-tuning while removing about 36 minutes per file.
@@ -274,10 +310,10 @@ fine-tuning also is not guaranteed deterministic.
 - Q-value columns have different units:
   - `q_value` / `experiment_psm_q`: pooled PSM;
   - `run_psm_q`: within-run PSM;
-  - `precursor_q`: peptidoform plus charge, but only under
-    `compete.group_by = peptidoform_charge`. The default key already deleted the
-    sibling rows, so it then counts base peptides (measured 1.000 precursors per
-    peptide, against 1.174 with `peptidoform_charge`);
+  - `precursor_q`: peptidoform plus charge under the default
+    `compete.group_by = peptidoform_charge`. Under `base_peptide` the sibling rows
+    were already deleted, so it then counts base peptides (measured 1.000
+    precursors per peptide, against 1.174 with `peptidoform_charge`);
   - `peptide_q_value`: base/stripped peptide;
   - `pg_q_value`: protein-accession-set group.
 - The grouped q columns (`peptide_q_value`, `precursor_q`, `pg_q_value`) are
@@ -305,9 +341,15 @@ fine-tuning also is not guaranteed deterministic.
 
 ### Experiment-wide rescore
 
-- `run-experiment` never calls the report stage. There is no `peptides.tsv` or
-  `proteins.tsv` anywhere in its output tree. Per-run counts come from the split
-  scored tables or from `mumdia report` invoked manually.
+- `run-experiment` writes one experiment-wide `peptides.tsv` and `proteins.tsv`
+  at the experiment root (`report::run_experiment`): rows selected on the
+  experiment-wide `peptide_q_value` / `pg_q_value`, an `n_runs` column counting
+  per-run acceptances on `run_psm_q`, and one quantity column per run
+  (`quantity_<run>` from each run's quant, `lfq_<run>` from the cross-run MaxLFQ
+  matrix). It writes no per-run TSVs, because the grouped q columns are written
+  to each group's experiment-wide winner only. Per-run counts come from the
+  split scored tables on `run_psm_q`; `mumdia report --experiment-dir` rewrites
+  the experiment-wide pair at another threshold.
 - `run-experiment` overrides the configured `quant.q_filter` and gates per-run
   quant on the pooled `q_value`. It warns rather than doing so silently.
 - `rescore --competed` accepts many tables, stamps `source` with the index of
@@ -327,6 +369,64 @@ fine-tuning also is not guaranteed deterministic.
   peak is roughly `(1 + folds)x` the matrix. The stage logs the figure before it
   allocates, and `rescore.max_feature_matrix_gib` turns exceeding a ceiling into
   an error at startup rather than an OS kill hours in.
+
+### Rescore cost: handoff, feature selection, training-set reduction
+
+Measured 2026-09-05 on the HYE competed table (2,603,894 PSMs x 387 features), docs/28
+sections 10-16:
+
+- `rescore.handoff` defaults to `parquet` since 2026-09-05. The TSV path made the worker
+  parse every column into a float64 pandas frame before building its float32 matrix; parquet
+  took the rescore peak from 29.96 to 8.95 GB and the wall from 8:35 to 6:33 at identical
+  identifications. mokapot and entrapment sidecars still receive the tab-separated PIN
+  (`mokapot.read_pin` cannot read parquet), automatically and with a warning.
+- `rescore.features` / `features_file` project the classifier's input columns. 43 of the 387
+  Extended features are dead by construction (10 constant under the default configuration, 20
+  bit-identical, 13 affine duplicates), and about 114 chosen multivariately reproduce all 387
+  within seed noise on both DIA-NN-library benchmarks. The shipped list is
+  `bench/feature_selection/fs_union75_dedup.txt`. It was selected on a DIA-NN-library search
+  and costs 2.1% on a FASTA-built entrapment library, so re-derive it per library type.
+- `rescore.train_neg_ratio` / `train_neg_select` / `train_subsample` / `train_warm_epochs`
+  thin what the sidecar trains on. The worker refits 30 times over the targets at 1% plus
+  every decoy in the fold, which is 12-18 decoys per positive on HYE and 3:1 on AIF, and the
+  gain from thinning is proportional to that imbalance. A cap is self-limiting and a quota is
+  not: `train_neg_ratio: 5` never binds on a balanced pool and is 2.2x on an imbalanced one.
+- Feature selection buys memory, not time: MLP training time per row is flat in the feature
+  count from 387 down to 25. Training-set reduction buys time.
+- The training recipe (`train_neg_ratio: 3, train_neg_select: hybrid, train_warm_epochs: 5`)
+  is the shipped default since 2026-09-05: measured with seeds against the previous defaults
+  (every decoy, cold refits) on four pools, HYE A01 +1.0%, HYE B01 +2.2%, AIF -0.1%,
+  entrapment +3.3% with the spike-in FDP unchanged, at 9-19x less training time (docs/28
+  section 21; B01's baseline training took 50 minutes per seed against 2.6). `train_neg_ratio:
+  0, train_neg_select: random, train_warm_epochs: 0` restore the previous behaviour exactly.
+- `rescore.feature_preset = compact` (the embedded 114-feature list) stays opt-in. It is a
+  memory lever, not a sensitivity one: the rescore matrix shrinks 3.4x (full-scale HYE
+  rescore 5.49 GB / 3:19 against 13.5 GB / 6:20 with every feature, process-tree peaks; both
+  sit under extract's 16.5 GiB), but under the
+  default training it measured +0.2% / -1.2% / -0.1% / +1.5% on A01 / B01 / AIF / entrapment,
+  and B01 is the pool the list was never fitted on. Use it for pooled rescoring on machines
+  where the matrix would not fit (six HYE runs: 15.9 GB with it), not by default.
+- The "sensitivity" recipe adds `folds: 5, train_margin_frac: 0.75, seeds: 3`: +0.4 / +0.4 /
+  +0.6 pp over the fast recipe on HYE A01 / AIF / entrapment with the FDP unchanged, for 5.3x
+  the rescore wall through the engine (18:38 against 3:31 on HYE B01, +0.2% peptides there);
+  it is the option for a final pass, not a default.
+- Do not set `train_neg_select: margin` with `train_neg_ratio: 1`. It is the fastest recipe
+  and +1.27% on HYE, and it loses 10.35% on the entrapment pool.
+- Judge any of these on at least two pools and with seeds. Seed 0 of the HYE baseline scored
+  59,046 against 59,611 and 59,619 for seeds 1 and 2, which inflated every seed-0 comparison
+  by about a percent.
+- The rescorer's own hyperparameters (hidden 128-64, lr 1e-3, 25 epochs, dropout 0.3, batch
+  4096, 10 iterations, train FDR 0.01, weight decay 1e-4) were swept with seeds on three
+  pools (docs/28 section 17): every one is at or within noise of the optimum of its column,
+  and every departure that helps one pool costs another. Do not retune them from a single
+  benchmark. The only knob positive on every pool is `MUMDIA_NN_SEEDS=3` (+0.1 to +0.3 pp at
+  3x training).
+- The extraction and RT defaults (`gate_min_score` 0.2, `rt_window_multiplier` 1.5,
+  `apex_count_window` 5) are likewise a measured local optimum on HYE end to end (docs/28
+  section 18); `window_holdout_frac` is neutral there with a pre-fine-tuned library.
+- Reference point, 2026-09-05: a complete HYE single run is 17:52 at 16.5 GiB on 32 threads
+  (extract 16.5 GiB is the tallest stage, `extract.windows_in_flight: 8` takes it to 12.3),
+  and the six-run pooled rescore is 18 minutes at 15.9 GB for 72,344 peptides.
 
 ### Sidecar and IO contracts
 
@@ -365,23 +465,26 @@ Current correctness contract:
   status), not a valid abundance of zero;
 - protein Top-N operates on unique `base_peptide_id` values rather than counting
   charge/modification rows as separate peptides;
-- `precursor_q` is available for a single-run precursor output, but it is a
-  genuine precursor unit only under `compete.group_by = peptidoform_charge` (see
+- `precursor_q` is available for a single-run precursor output and is a genuine
+  precursor unit under the default `compete.group_by = peptidoform_charge` (see
   the competition key below);
 - for an experiment-wide rescore, split the scored table by `source` before
   invoking quant with each run's chromatograms. Changing `q_filter` does not
   select a source.
 
-The default competition key is `base_peptide`, renamed from `precursor`, which it
-was not. `compete.rs:88` keys the
-group on `(base_peptide_id, label_code, 0, peak_rank)`, and `base_peptide_id`
-comes from the stripped sequence (`import_diann_lib.py:137` factorises
-`Stripped.Sequence`). `compete.rs:319-340` keeps only the highest `prelim_score`
-per group and deletes the rest before rescore, so every charge and every
-modification variant of one peptide collapses to a single winner pre-FDR.
-`peptidoform_charge` (`compete.rs:93-98`, keys
-`(pform_id, label, charge, peak_rank)`) is the quant-oriented alternative; see
-the benchmark-gating section for when it is required rather than optional.
+The default competition key is `peptidoform_charge` since 2026-09-06 (keys
+`(pform_id, label, charge, peak_rank)`): sibling charge states and modforms of
+one peptide are separate precursors that compete only against their own
+alternative peaks, which is the unit DIA-NN reports at and the key every
+docs/28 benchmark ran under (entrapment FDP flat at 0.48-0.64%, HYE, AIF). The
+previous default `base_peptide` (renamed from `precursor`, which it was not)
+keys the group on `(base_peptide_id, label_code, 0, peak_rank)`, and
+`base_peptide_id` comes from the stripped sequence, so `compete.rs` deleted
+every charge and every modification variant of one peptide but the highest
+`prelim_score` before rescore: 23% of the extracted candidates on HYE B01, 46.6%
+on a modification-rich library, at an unchanged peptide count. It remains
+available as an explicit peptide-level population; never use it for a PTM
+search.
 
 Use Parquet quantities for analysis; TSV values are rounded for presentation.
 Cross-run consensus ions, interference-aware ion selection, minimum clean-ion
@@ -441,21 +544,20 @@ Do not enable these by default from a single AIF count:
   plus entrapment and a second acquisition. `docs/08_rt_im_train.md` section 4b
   has the mechanism and numbers;
 - alternative hard/soft extraction gates or peak apportionment;
-- `peptidoform_charge` competition as a general default, margin competition, or
-  unique-evidence competition;
+- margin competition or unique-evidence competition;
 - MBR transfer/re-extraction;
 - acquisition-specific fragment/peak caps. The shipped default stays uncapped;
   see the peak-cap subsection above.
 
-`compete.group_by = peptidoform_charge` is required, not optional, for a PTM or
-modification search. Under the default key the modified form is deleted whenever
-an unmodified or alkylated sibling scores higher, which is usually. Measured on
-a modification-rich library, the default key deleted 880,464 of 1,890,239
-extracted candidates (46.6%); `peptidoform_charge` removed 0 rows and moved
-precursors per peptide from 1.000 to 1.174 (DIA-NN reports about 1.126 on
-comparable data), with an unchanged peptide count. It stays gated only as a
-change to the shipped default for non-PTM searches, because it changes the
-training and FDR population.
+`compete.group_by = peptidoform_charge` is the default (2026-09-06) and is
+required, not optional, for a PTM or modification search. Under `base_peptide`
+the modified form is deleted whenever an unmodified or alkylated sibling scores
+higher, which is usually. Measured on a modification-rich library, `base_peptide`
+deleted 880,464 of 1,890,239 extracted candidates (46.6%); `peptidoform_charge`
+removed 0 rows and moved precursors per peptide from 1.000 to 1.174 (DIA-NN
+reports about 1.126 on comparable data), with an unchanged peptide count. The
+gate for making it the default was the one CLAUDE.md sets for a changed training
+and FDR population: the entrapment pool, HYE and AIF of docs/28 all ran under it.
 
 The selected apex was historically correct/strongest only about 48-52% of the
 time while the correct peak appeared in the top five about 86-88%. Promoting
@@ -483,8 +585,9 @@ entrapment validation before default activation.
 The Docker image contains:
 
 - `/opt/mumdia/config.dia.json`: FASTA + MS2PIP/DeepLC + strict mokapot;
-- `/opt/mumdia/config.diann-lib.json`: imported library + per-run DeepLC
-  fine-tune + strict `nn_torch`.
+- `/opt/mumdia/config.diann-lib.json`: imported library + per-run LOESS calibration of
+  the library's retention times (no fine-tune; `rt_im_train.finetune_deeplc` is available
+  for a once-per-library fine-tune) + strict `nn_torch`.
 
 The Dockerfile copies both configs. MuMDIA consumes but does not ship or invoke a
 DIA-NN binary; users create imported libraries under their own DIA-NN license.

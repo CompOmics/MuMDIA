@@ -46,6 +46,7 @@ Env knobs (all optional):
     MUMDIA_NN_BATCH       = 4096
     MUMDIA_NN_TRAIN_FDR   = 0.01     positive-selection FDR during training
     MUMDIA_NN_SEEDS       = 1        seed models to ensemble (average OOF)
+    MUMDIA_NN_SEED        = 0        base seed; ensemble member s uses SEED + s (seeded repeats)
     MUMDIA_NN_STREAM      = auto     auto|1|0  force the streaming memmap backend
     MUMDIA_NN_STREAM_GB   = 4        auto-stream when the PIN exceeds this many GB
     MUMDIA_NN_CHUNK       = 250000   PIN rows per read chunk (streaming backend)
@@ -79,6 +80,11 @@ Env knobs (all optional):
                                      pos_weight are preserved; positive SELECTION still runs
                                      over the full fold, so this trades gradient steps for
                                      wall time without narrowing what can be discovered.
+    MUMDIA_NN_NEG_SELECT  = random   which decoys survive NEG_RATIO: random | margin |
+                                     hybrid. `margin` keeps the highest-scoring (hardest)
+                                     decoys under the current model, `hybrid` splits the
+                                     budget half hard / half random. Only meaningful with
+                                     NEG_RATIO > 0.
     MUMDIA_NN_NEG_RATIO   = 0        cap TRAINING negatives at this multiple of the
                                      positives selected in the same iteration (e.g. 3 = at
                                      most 3 decoys per positive). 0 (default) trains on every
@@ -259,6 +265,12 @@ def main():
     WARM = env_i("MUMDIA_NN_WARM_START", 0) != 0
     WARM_EPOCHS = env_i("MUMDIA_NN_WARM_EPOCHS", 0)
     NEG_RATIO = env_f("MUMDIA_NN_NEG_RATIO", 0.0)
+    NEG_SELECT = os.environ.get("MUMDIA_NN_NEG_SELECT", "random").strip().lower()
+    if NEG_SELECT not in ("random", "margin", "hybrid"):
+        raise ValueError(
+            "MUMDIA_NN_NEG_SELECT must be random, margin or hybrid (got %r)" % NEG_SELECT
+        )
+    MARGIN_FRAC = env_f("MUMDIA_NN_MARGIN_FRAC", 0.5)
     ITERS = env_i("MUMDIA_NN_ITERS", 5)
     EPOCHS = env_i("MUMDIA_NN_EPOCHS", 25)
     HIDDEN = [int(x) for x in os.environ.get("MUMDIA_NN_HIDDEN", "128,64").split(",") if x]
@@ -268,6 +280,7 @@ def main():
     BATCH = env_i("MUMDIA_NN_BATCH", 4096)
     TRAIN_FDR = env_f("MUMDIA_NN_TRAIN_FDR", 0.01)
     N_SEEDS = env_i("MUMDIA_NN_SEEDS", 1)
+    BASE_SEED = env_i("MUMDIA_NN_SEED", 0)
     CHUNK = env_i("MUMDIA_NN_CHUNK", 250000)
     EARLY_STOP = env_i("MUMDIA_NN_EARLY_STOP", 1) != 0
     EARLY_STOP_TOL = env_f("MUMDIA_NN_EARLY_STOP_TOL", 0.01)
@@ -689,7 +702,7 @@ def main():
                 neg_i = tr_idx[neg]
                 if NEG_RATIO > 0 and len(neg_i) > NEG_RATIO * len(pos_i):
                     # Cap negatives at NEG_RATIO x the positives selected THIS iteration.
-                    # Training on every decoy in the fold is ~15:1 in practice, so most
+                    # Training on every decoy in the fold is ~15-19:1 in practice, so most
                     # gradient steps are spent on negatives. `pos_weight` below is recomputed
                     # from the capped set, so the loss stays balanced for what is actually
                     # trained on.
@@ -697,16 +710,39 @@ def main():
                     # This does NOT touch the FDR: decoys are thinned for TRAINING only, while
                     # scoring, target/decoy competition and q-values still use the full pool.
                     # It can move the learned boundary, hence a knob rather than a default.
+                    #
+                    # NEG_SELECT decides WHICH decoys survive. `random` keeps the shape of the
+                    # decoy distribution. `margin` keeps the highest-scoring ones, i.e. the
+                    # only part of that distribution still competing with accepted targets,
+                    # at the cost of never showing the model the easy bulk. `hybrid` splits
+                    # the budget between the two.
                     keep_n = max(1, int(round(NEG_RATIO * len(pos_i))))
                     rs_n = np.random.RandomState(
                         (int(seed) * 7919 + int(f) * 104729 + used_iters * 31) % (2 ** 32)
                     )
-                    neg_i = rs_n.choice(neg_i, size=min(keep_n, len(neg_i)), replace=False)
+                    if NEG_SELECT == "random":
+                        neg_i = rs_n.choice(neg_i, size=min(keep_n, len(neg_i)), replace=False)
+                    else:
+                        s_neg = score_tr[neg]
+                        order = np.argsort(-s_neg, kind="stable")
+                        if NEG_SELECT == "margin":
+                            take = order[:keep_n]
+                        else:
+                            k_hard = max(1, int(round(MARGIN_FRAC * keep_n)))
+                            hard, rest = order[:k_hard], order[k_hard:]
+                            k_rand = min(max(0, keep_n - k_hard), len(rest))
+                            rand = (
+                                rs_n.choice(rest, size=k_rand, replace=False)
+                                if k_rand
+                                else np.empty(0, np.int64)
+                            )
+                            take = np.concatenate([hard, rand]).astype(np.int64)
+                        neg_i = neg_i[np.sort(take)]
                     sel = np.sort(np.concatenate([pos_i, neg_i]))
                     sel_pos, sel_neg = len(pos_i), len(neg_i)
                     print(
-                        "  seed %s fold %s: negative cap %.2fx -> %d neg for %d pos"
-                        % (seed, f, NEG_RATIO, sel_neg, sel_pos),
+                        "  seed %s fold %s: negative cap %.2fx (%s) -> %d neg for %d pos"
+                        % (seed, f, NEG_RATIO, NEG_SELECT, sel_neg, sel_pos),
                         flush=True,
                     )
                 if TRAIN_SUB > 0:
@@ -762,7 +798,7 @@ def main():
 
     # seed ensemble: average rank-normalised out-of-fold scores across seeds
     acc = np.zeros(n, np.float64)
-    for s in range(N_SEEDS):
+    for s in range(BASE_SEED, BASE_SEED + N_SEEDS):
         np.random.seed(s)
         torch.manual_seed(s)
         oof = one_pass(s)

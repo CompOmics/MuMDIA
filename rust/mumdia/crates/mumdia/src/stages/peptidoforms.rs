@@ -11,7 +11,7 @@ use mumdia_core::config::{PeptidoformsConfig, ResidueMod, UnknownModPolicy};
 use mumdia_core::mass::unimod_mass;
 use mumdia_core::schema::artifact;
 use mumdia_io::report::ArtifactReport;
-use mumdia_io::table::{write_table, Col, Table};
+use mumdia_io::table::{write_table, Col, TableFile};
 use serde_json::json;
 use tracing::{info, warn};
 
@@ -187,7 +187,7 @@ pub struct PeptidoformsParams<'a> {
 pub fn run(p: PeptidoformsParams) -> Result<u64> {
     let t0 = Instant::now();
     let (fixed_rules, variable_rules) = validated_rules(p.cfg)?;
-    let t = Table::read(p.peptides)?;
+    let t = TableFile::open(p.peptides)?;
     let pep_id = t.u32("id")?;
     let peptide = t.str("peptide")?;
     let protein = t.str("protein")?;

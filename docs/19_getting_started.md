@@ -83,8 +83,8 @@ conda env create -f env/mumdia-deeplc.yml
 
 DeepLC must be 4.1.1 or newer. The 4.0.0a2 multitask preview overfits per-run
 fine-tuning badly enough to invert retention-time model rankings, so an older
-version changes results and not only speed; `mumdia doctor` warns when it finds
-one. MS2PIP is pinned only in the Docker specification
+version changes results and not only speed; `mumdia doctor` fails on one, and the
+engine refuses to launch the DeepLC workers with it. MS2PIP is pinned only in the Docker specification
 (`env/docker-rescore.yml`), because the native fragment predictor is the default
 and MS2PIP is opt-in.
 
@@ -94,7 +94,10 @@ which is what `configs/examples/*.json` use, resolves through
 `python3` and `python` on `PATH`, accepting a candidate only after it imports what
 that role's workers import, so activating the environment is normally enough. Name
 an absolute path when a machine has several candidates and you want to pin one; an
-explicit path is never second-guessed.
+explicit path is never second-guessed. DeepLC is discovered opportunistically under the
+default `rt_im_train.library_irt = auto`: found (and 4.1.1 or newer), a library-input
+run re-predicts the imported iRT with it; not found, the run keeps the imported values
+and says so, and `doctor` shows a `[note]` rather than a failure.
 
 Notes:
 
@@ -142,12 +145,25 @@ mumdia doctor --config configs/examples/diann-library.json
 
 ## 2. Converting vendor files to centroided mzML
 
-MuMDIA reads only mzML. `convert` (Stage 0) is the sole point that touches a
-vendor format, and it goes through the `mzdata` crate built with the `mzml`
-feature only (`docs/04_convert.md`; `CLAUDE.md` build notes). Thermo `.raw`,
-Bruker `.d`/TDF, and SCIEX `.wiff` are not read natively (they are on the
-beyond-MVP roadmap, `CLAUDE.md`). Convert them first with ProteoWizard
-`msconvert`.
+The engine itself reads only mzML, through the `mzdata` crate built with the
+`mzml` feature only (`docs/04_convert.md`; `CLAUDE.md` build notes). `convert`
+(Stage 0) is the sole point that touches a vendor format.
+
+**Thermo `.raw` needs no manual step.** Pass it to `--mzml` and the engine converts
+it to mzML first with ThermoRawFileParser, reusing the result on later runs. It
+needs the converter installed once; `mumdia doctor` says whether it is, and
+`convert.thermo_raw_parser` or `MUMDIA_THERMO_PARSER` points at it.
+
+Bruker `.d`, SCIEX `.wiff`, Agilent `.d` and Waters `.raw` are also accepted, through
+ProteoWizard `msconvert`, which MuMDIA locates but does not install: its vendor
+readers carry each instrument maker's own licence terms. **These four are wired but
+unverified** -- no such file has been converted by this code -- so converting them
+yourself with `msconvert` first is the safer route today, and remains valid for
+Thermo too. See `docs/04_convert.md`, "Vendor formats".
+
+If your data is Bruker diaPASEF, read the ion-mobility warning in that section
+before drawing conclusions from the identification count: this pipeline is 3D and
+discards the mobility dimension.
 
 Produce centroided mzML using the vendor peak-picking filter:
 

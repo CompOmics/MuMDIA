@@ -135,10 +135,15 @@ Consumes `psms_scored.parquet` and optionally the two quant tables. The CLI take
 `report::run` returns `(n_precursors, n_protein_groups)`, and the `mumdia report`
 handler prints a one-line summary (`main.rs:806`).
 
-The only two call sites are `run.rs:484` and the `mumdia report` handler at
-`main.rs:798`. The experiment orchestrator does not call the stage, so a
-`run-experiment` output tree contains no `peptides.tsv` and no `proteins.tsv` at
-any level.
+`report::run` is called by the `run` orchestrator and by `mumdia report
+--psms-scored`. The experiment orchestrator calls `report::run_experiment` instead
+(also reachable as `mumdia report --experiment-dir`): the same two files at the
+experiment root, rows selected on the experiment-wide `peptide_q_value` /
+`pg_q_value`, an `n_runs` column counting the runs whose own `run_psm_q` accepts
+the precursor or group, and one quantity column per run (`quantity_<run>` from each
+run's `peptide_quant.parquet`, `lfq_<run>` from `lfq_maxlfq.parquet`). No per-run
+TSV is written, because the grouped q columns are assigned to each group's
+experiment-wide winner only.
 
 ### audit
 Consumes `library_precursors.parquet` (the full search space) plus `psms`

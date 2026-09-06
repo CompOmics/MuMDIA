@@ -130,6 +130,17 @@ def main():
     # metric can drop multi-species precursors.
     prot_col = "Protein.Names" if "Protein.Names" in df.columns else "Protein.Ids"
     df["protein_str"] = df[prot_col].astype(str)
+    # DIA-NN leaves the protein empty for peptides it did not map to the FASTA, the
+    # Biognosys iRT-kit standards above all (LGGNEQVTR, GTFIIDPGGVIR, ...). The engine
+    # refuses a library with an empty required string, because an empty protein would
+    # silently merge every such peptide into one anonymous protein group. Name that
+    # group explicitly instead, so the peptides stay searchable and visibly unassigned.
+    unassigned = df["protein_str"].str.strip().isin(["", "nan", "None", "<NA>"])
+    if unassigned.any():
+        n_prec_unassigned = df.loc[unassigned, "key"].nunique()
+        df.loc[unassigned, "protein_str"] = "UNASSIGNED"
+        print(f"protein: {n_prec_unassigned} precursors had no protein in {prot_col}; "
+              f"written as UNASSIGNED (typically the iRT-kit standards)")
 
     # Sort precursors by m/z before assigning candidate_id, so the emitted library
     # is monotonic in precursor_mz (the fragment index's candidate_range assumes

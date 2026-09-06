@@ -47,7 +47,7 @@ configurations in `configs/`, the container definition in `Dockerfile` +
 | `test_data/fixture.fasta` | The only committed input datum: a few proteins the fixture generator digests. No mzML or Parquet is committed |
 | `Dockerfile` | Two-stage image: Rust build stage + micromamba runtime with two sidecar envs |
 | `docker/config.dia.json` | Baked FASTA-digest config (MS2PIP + DeepLC + strict mokapot wired to in-image envs) |
-| `docker/config.diann-lib.json` | Baked library-input config (DeepLC fine-tune + strict NnTorch through the torch-capable DeepLC env) |
+| `docker/config.diann-lib.json` | Baked library-input config (per-run RT calibration of the library iRT, no fine-tune; strict NnTorch through the torch-capable DeepLC env) |
 | `env/docker-rescore.yml` | Conda spec for the in-image `rescore` env (`python=3.11`, `mokapot==0.10.0` + `ms2pip==4.0.0.dev9`) |
 | `env/docker-deeplc.yml` | Conda spec for the in-image `deeplc` env (`python=3.11`, `torch==2.12.1+cpu` + `deeplc==4.1.1` from PyPI) |
 | `env/mumdia-rescore.yml` | Minimal host env for the default mokapot rescorer only (`python=3.12`, no torch/DeepLC/MS2PIP) |

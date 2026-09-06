@@ -270,6 +270,68 @@ impl Default for DecoyConfig {
     }
 }
 
+/// Vendor-format conversion, read by every subcommand that takes a spectra path
+/// (`raw.rs`; docs/04_convert.md, "Vendor formats").
+///
+/// The engine itself reads mzML only, deliberately: `mzdata` is pinned to its
+/// pure-Rust `mzml` + `miniz_oxide` features so the build needs no C or .NET
+/// toolchain, and its vendor readers would reintroduce both. A vendor file is
+/// therefore converted to mzML first by an external converter run as a child
+/// process, in the same way the Python sidecars are: ThermoRawFileParser for Thermo
+/// `.raw`, ProteoWizard `msconvert` for everything else and as the Thermo fallback.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ConvertConfig {
+    /// Path to the ThermoRawFileParser executable, or `"auto"` to search.
+    ///
+    /// `"auto"` looks at `MUMDIA_THERMO_PARSER`, then beside the engine binary,
+    /// then on `PATH`. Empty means the same as `"auto"`; a real path is used
+    /// verbatim and its absence is an error rather than a silent fallback, because
+    /// a fallback would convert with a different program than the one asked for and
+    /// vendor conversion is not reproducible across converters.
+    pub thermo_raw_parser: String,
+    /// Path to ProteoWizard `msconvert`, or `"auto"` to search.
+    ///
+    /// Used for every vendor format except Thermo, which prefers
+    /// ThermoRawFileParser: Bruker `.d`, SCIEX `.wiff`, Agilent `.d` and Waters
+    /// `.raw`. It is also the Thermo fallback when no ThermoRawFileParser is found.
+    ///
+    /// `"auto"` searches `MUMDIA_MSCONVERT`, beside the engine binary, the
+    /// version-stamped ProteoWizard directories under Program Files on Windows
+    /// (newest first), then `PATH`.
+    ///
+    /// MuMDIA never ships or downloads ProteoWizard. Its vendor readers bundle the
+    /// instrument vendors' own libraries under the vendors' licence terms, which the
+    /// user accepts when obtaining it, and automating that acceptance is not
+    /// MuMDIA's to do.
+    pub msconvert: String,
+    /// Extra arguments appended to every `msconvert` invocation.
+    ///
+    /// An escape hatch, not a tuning surface. The per-vendor defaults already
+    /// request indexed 64-bit zlib mzML, vendor peak picking where it exists, and
+    /// `--combineIonMobilitySpectra` for Bruker. Use this for something the defaults
+    /// cannot express, such as an `--filter` that trims an acquisition. Arguments
+    /// are passed through verbatim and are not validated.
+    pub msconvert_args: Vec<String>,
+    /// Reuse an mzML that already sits beside the `.raw` and is newer than it.
+    ///
+    /// On by default: conversion is minutes per file and its output is
+    /// deterministic given the same converter, so re-running a search should not
+    /// pay for it twice. Turn it off when the neighbouring mzML may have come from
+    /// a different converter or a different `.raw` of the same name.
+    pub reuse_converted: bool,
+}
+impl Default for ConvertConfig {
+    fn default() -> Self {
+        Self {
+            thermo_raw_parser: "auto".to_string(),
+            msconvert: "auto".to_string(),
+            msconvert_args: Vec::new(),
+            reuse_converted: true,
+        }
+    }
+}
+
 /// Sequence-tag prescan (`mumdia prescan`). Prunes modification-bearing candidates that have no
 /// anchored tag support in a given run, before the per-run library is assembled.
 ///
@@ -548,6 +610,45 @@ pub struct RtImTrainConfig {
     /// model. 0.0 (default) keeps in-sample sizing. Mutually exclusive with
     /// `adaptive_rt_window`. Benchmark-gated; do not default on.
     pub window_holdout_frac: f64,
+    /// Where an imported library's `predicted_irt` comes from. `auto` (the default)
+    /// re-predicts every peptidoform with the DeepLC base model when
+    /// `predict_frag.deeplc_python` is configured and keeps the imported values, with a
+    /// warning, when it is not; `deeplc` requires the interpreter; `library` keeps the
+    /// imported values. Ignored under `finetune_deeplc` (the fine-tune re-predicts every
+    /// peptidoform itself) and in FASTA mode (predict-frag already produces DeepLC
+    /// predictions). Measured on the AIF benchmark with calibration only and native_tda:
+    /// 10,416 peptides at 1% from DeepLC 4.1.1 base predictions against 10,015 from the
+    /// DIA-NN library iRT and 10,181 from a per-run fine-tune, with `w_rt` 343 s against
+    /// 632 s and 472 s (docs/08 section 4c). `run-experiment` predicts once per experiment.
+    pub library_irt: LibraryIrt,
+}
+
+/// Source of `predicted_irt` for an imported library; see `RtImTrainConfig::library_irt`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LibraryIrt {
+    #[default]
+    Auto,
+    Library,
+    Deeplc,
+}
+
+impl RtImTrainConfig {
+    /// Whether an imported library's `predicted_irt` is re-predicted with the DeepLC base
+    /// model before RT calibration. False in FASTA mode, under a fine-tune (which
+    /// re-predicts by itself), under `library_irt = library`, and under `auto` without a
+    /// DeepLC interpreter (the orchestrator warns in that case). `deeplc` without an
+    /// interpreter is a preflight error, so it resolves to true here.
+    pub fn repredicts_library_irt(&self, library_input: bool, has_deeplc: bool) -> bool {
+        if !library_input || self.finetune_deeplc {
+            return false;
+        }
+        match self.library_irt {
+            LibraryIrt::Library => false,
+            LibraryIrt::Deeplc => true,
+            LibraryIrt::Auto => has_deeplc,
+        }
+    }
 }
 impl Default for RtImTrainConfig {
     fn default() -> Self {
@@ -567,6 +668,7 @@ impl Default for RtImTrainConfig {
             adaptive_rt_bins: 12,
             rt_window_min_s: 1.0,
             window_holdout_frac: 0.0,
+            library_irt: LibraryIrt::Auto,
         }
     }
 }
@@ -574,6 +676,15 @@ impl Default for RtImTrainConfig {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ExtractConfig {
+    /// Isolation windows probed per batch before the candidates no later window can touch
+    /// are scored and written. `None` (the default) uses the rayon thread count capped at
+    /// 16. The hit accumulator holds the windows in flight, so this sets the stage's peak
+    /// almost linearly, while the accumulation phase it parallelises is a small part of the
+    /// wall clock: on the HYE benchmark at 32 threads, 32 in flight is 24.65 GiB / 5:00, 16
+    /// is 16.57 GiB / 5:04 and 8 is 12.31 GiB / 5:26, with identical output (docs/27 section
+    /// 3.10). Set 8 or 4 on a memory-bound machine. Not a sensitivity knob.
+    #[serde(default)]
+    pub windows_in_flight: Option<usize>,
     pub fixed_scan_window: usize,
     pub frag_tol_ppm: f64,
     pub prec_tol_ppm: f64,
@@ -755,6 +866,7 @@ pub struct ExtractConfig {
 impl Default for ExtractConfig {
     fn default() -> Self {
         Self {
+            windows_in_flight: None,
             fixed_scan_window: 3,
             frag_tol_ppm: 20.0,
             prec_tol_ppm: 20.0,
@@ -959,7 +1071,7 @@ pub struct CompeteConfig {
 impl Default for CompeteConfig {
     fn default() -> Self {
         Self {
-            group_by: CompeteGroupBy::BasePeptide,
+            group_by: CompeteGroupBy::PeptidoformCharge,
             apex_rt_tolerance_s: 5.0,
             mode: CompetitionMode::WinnerTakeAll,
             margin: 0.0,
@@ -999,18 +1111,25 @@ pub enum CompetitionMode {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CompeteGroupBy {
-    /// One winner per stripped base peptide, per label. Renamed from `precursor`,
-    /// which it is not: `compete.rs` keys the group on `base_peptide_id`, which comes
-    /// from the stripped sequence, so every charge state AND every modification
-    /// variant of one peptide collapses to a single winner before FDR. Use
-    /// `peptidoform_charge` for a genuine precursor unit, and note that it is
-    /// REQUIRED for a PTM search. The old name is not accepted, so an old config
-    /// fails loudly rather than silently changing the competition unit.
+    /// One winner per stripped base peptide, per label: every charge state AND every
+    /// modification variant of one peptide collapses to a single winner before FDR
+    /// (`compete.rs` keys the group on `base_peptide_id`, which comes from the
+    /// stripped sequence). The default until 2026-09-06 and renamed from `precursor`,
+    /// which it is not; the old name is not accepted, so an old config fails loudly
+    /// rather than silently changing the competition unit. Opt in to it for a
+    /// peptide-level population; never use it for a PTM search, where it deletes the
+    /// modified form whenever an unmodified sibling scores higher.
     BasePeptide,
     Apex,
-    /// Precursor-level: separate every distinct peptidoform+charge. Recovers
-    /// sibling charges the peptide-level `Precursor` grouping collapses; the
-    /// label stays in the key so a target never competes against its own decoy.
+    /// Precursor-level, the default: every distinct peptidoform + charge is its own
+    /// group, so sibling charge states and modforms of one peptide are kept and
+    /// compete only against their own alternative peaks; the label stays in the key so
+    /// a target never competes against its own decoy. This is the unit DIA-NN and
+    /// Spectronaut report at, and the key every benchmark of docs/28 ran under:
+    /// entrapment (spike-in FDP 0.48-0.64%, flat), HYE and AIF. Measured against
+    /// `base_peptide` on a modification-rich library it removed 0 instead of 46.6% of
+    /// the extracted candidates at an unchanged peptide count, with 1.174 precursors
+    /// per peptide (DIA-NN about 1.126).
     PeptidoformCharge,
 }
 
@@ -1343,10 +1462,107 @@ pub struct RescoreConfig {
     /// silently execute a different model; set false only for explicit legacy
     /// compatibility.
     pub strict: bool,
-    /// How the feature matrix reaches a sidecar rescorer. See [`Handoff`]. `parquet` is
-    /// dramatically faster on large pools but applies to nn_torch only.
+    /// How the feature matrix reaches a sidecar rescorer. See [`Handoff`]. Defaults to
+    /// `parquet`, which applies to nn_torch only; mokapot and entrapment sidecars always
+    /// receive the tab-separated PIN.
     #[serde(default)]
     pub handoff: Handoff,
+    /// Restrict the classifier's input to these feature columns, by name. Absent (the
+    /// default) falls through to `feature_preset`.
+    ///
+    /// The restriction is a projection, not a reordering: the columns keep the order of
+    /// the feature schema, only those named are read out of the competed table, and the
+    /// matrix, the sidecar handoff and the training all shrink with the list. Feature
+    /// selection is a memory and I/O lever, not a speed one (docs/28 section 7), and any
+    /// list must clear the sensitivity gate before it becomes a default.
+    ///
+    /// Mutually exclusive with [`RescoreConfig::features_file`]. Every name must exist in
+    /// the competed table's schema; a missing one is an error, never a silent drop.
+    #[serde(default)]
+    pub features: Option<Vec<String>>,
+    /// The same restriction, read from a file with one feature name per line (blank lines
+    /// and `#` comments ignored), which is how a 100+ name list stays readable.
+    #[serde(default)]
+    pub features_file: Option<String>,
+    /// Named feature list used when neither `features` nor `features_file` is set. `all`
+    /// is every feature the competed table carries. `compact` is the 114-name list of
+    /// docs/28 section 12 (`bench/feature_selection/fs_union75_dedup.txt`, embedded in the
+    /// binary), which with the hard-negative training recipe reproduced the full Extended
+    /// set within seed noise on three pools (HYE A01 +1.2%, AIF -0.2%, entrapment +4.9%,
+    /// spike-in FDP unchanged) at 3.4x less rescore memory. Preset names the table lacks
+    /// are skipped with a log line rather than an error, so a preset tolerates a smaller
+    /// `features.set`; the intersection must not be empty. Explicit lists stay strict.
+    /// Default `all`: the projection is a memory lever (3.4x smaller rescore matrix), not a
+    /// sensitivity one, and it cost 1.2% on the held-out HYE B01 pool under the default
+    /// training (+0.2% / -0.1% / +1.5% on A01 / AIF / entrapment), so it is the option for
+    /// pooled rescoring on small machines (docs/28 section 21), not the default.
+    pub feature_preset: FeaturePreset,
+    /// Cap the decoys the sidecar TRAINS on at this multiple of the targets it selected
+    /// that iteration; 0 (the default) trains on every decoy, which is about 19:1 on a
+    /// DIA pool and is where the rescore spends its time.
+    ///
+    /// This thins gradient steps only. Selection, scoring, target-decoy competition and
+    /// q-values still run over the full pool, so the cap cannot loosen the q threshold;
+    /// what it can move is the learned boundary, hence a knob and not a default.
+    pub train_neg_ratio: f64,
+    /// Which decoys survive [`RescoreConfig::train_neg_ratio`]. See [`NegSelect`].
+    pub train_neg_select: NegSelect,
+    /// Stratified thinning of whatever survived the cap: a fraction in (0, 1], or a row
+    /// cap when > 1. Positives and negatives are thinned by the same factor, so the class
+    /// balance is unchanged. 0 (the default) keeps every row.
+    #[serde(default)]
+    pub train_subsample: f64,
+    /// Reuse the previous iteration's weights and optimiser state, running this many
+    /// epochs from the second self-training iteration on instead of a full fresh fit.
+    /// 0 (the default) refits from scratch every iteration, which is 25 epochs x 10
+    /// iterations x 3 folds of the whole training set.
+    pub train_warm_epochs: usize,
+    /// Under `train_neg_select = hybrid`, the share of the negative budget taken from the
+    /// margin (highest-scoring decoys); the rest is sampled at random. Default 0.5.
+    #[serde(default = "default_margin_frac")]
+    pub train_margin_frac: f64,
+    /// Independent self-training passes whose out-of-fold scores are rank-averaged. 1 (the
+    /// default) is a single pass. 3 was the one knob positive on every pool of the seeded
+    /// sweep (docs/28 section 17), at three times the training cost.
+    #[serde(default = "default_seeds")]
+    pub seeds: usize,
+}
+
+fn default_margin_frac() -> f64 {
+    0.5
+}
+
+fn default_seeds() -> usize {
+    1
+}
+
+/// Named feature list for `RescoreConfig::feature_preset`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FeaturePreset {
+    /// Every feature column of the competed table.
+    #[default]
+    All,
+    /// The 114-feature list of docs/28 section 12, embedded in the engine.
+    Compact,
+}
+
+/// Which decoys survive the training-set negative cap.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NegSelect {
+    /// A uniform random sample of the fold's decoys. The population the model sees keeps
+    /// the shape of the real decoy distribution, only thinner.
+    #[default]
+    Random,
+    /// The highest-scoring decoys under the current model: the part of the decoy
+    /// distribution that still competes with accepted targets, and the only part the
+    /// decision boundary depends on. Trains on hard negatives only, so the model never
+    /// sees the easy bulk it must also keep rejecting.
+    Margin,
+    /// Half the budget from the margin, half sampled at random from the rest, so the
+    /// boundary is informed by the hard cases without losing the shape of the bulk.
+    Hybrid,
 }
 impl Default for RescoreConfig {
     fn default() -> Self {
@@ -1363,7 +1579,22 @@ impl Default for RescoreConfig {
             entrapment_contaminant_markers: Vec::new(),
             entrapment_ratio: 1.0,
             strict: true,
-            handoff: Handoff::Tsv,
+            handoff: Handoff::Parquet,
+            features: None,
+            features_file: None,
+            // The training recipe of docs/28 section 15, default since 2026-09-05: measured
+            // with seeds on four pools against the previous defaults (every decoy, cold
+            // refits): HYE A01 +1.0%, HYE B01 +2.2%, AIF -0.1%, entrapment +3.3% with the
+            // spike-in FDP unchanged, at 9-19x less training time. `train_neg_ratio = 0`,
+            // `train_neg_select = random`, `train_warm_epochs = 0` restore the previous
+            // behaviour exactly. The compact feature preset stays opt-in (see its field).
+            feature_preset: FeaturePreset::All,
+            train_neg_ratio: 3.0,
+            train_neg_select: NegSelect::Hybrid,
+            train_subsample: 0.0,
+            train_warm_epochs: 5,
+            train_margin_frac: 0.5,
+            seeds: 1,
         }
     }
 }
@@ -1409,18 +1640,29 @@ pub enum FinetuneScope {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Handoff {
-    /// Tab-separated PIN. Percolator's format, and what `mokapot.read_pin` requires.
-    #[default]
+    /// Tab-separated PIN. Percolator's format, and what `mokapot.read_pin` requires, so it
+    /// is what a mokapot or entrapment sidecar receives whatever this is set to.
     Tsv,
-    /// Parquet feature table with f32 features. Measured on an 8,858,206-PSM
-    /// experiment-wide rescore: the 30.18 GB TSV exceeded the worker's streaming threshold,
-    /// so every iteration re-read a 12.77 GB memmap; Parquet kept the matrix in memory and
-    /// the rescore went from 671.6 min to 12 min with the decoy fraction unchanged at
-    /// 0.988%. Features are f32 because the TSV was already lossy (`{:.6}`) and the worker
-    /// casts to f32 regardless.
+    /// Parquet feature table with f32 features, and the default since 2026-09-05.
+    ///
+    /// The TSV path makes the worker parse every column into a float64 pandas frame before
+    /// it builds its float32 matrix, so the text file, the frame and the matrix are alive
+    /// together. Measured on the HYE competed table (2,603,894 PSMs x 387 features, one
+    /// self-training iteration, 32 threads), parquet against tsv: rescore peak 29.96 ->
+    /// 8.95 GB, wall 8:35 -> 6:33, sidecar file 9.53 -> 3.28 GB, the worker's read and
+    /// standardise phase 111.7 -> 16.9 s, and 47,752 against 47,762 peptides at 1% with the
+    /// decoy fraction 1.00% either way (docs/28 section 11). An earlier 8,858,206-PSM
+    /// experiment-wide rescore went from 671.6 min to 12 min, because there the 30.18 GB
+    /// TSV crossed the worker's streaming threshold and every iteration re-read a 12.77 GB
+    /// memmap.
+    ///
+    /// Features are f32 because the TSV was already lossy (`{:.6}`) and the worker casts to
+    /// f32 regardless; the two paths therefore feed marginally different values into a
+    /// chaotic self-training loop, which is where that 10-peptide difference comes from.
     ///
     /// nn_torch only: `mokapot_worker.py` calls `mokapot.read_pin()` and cannot read
     /// Parquet, so a mokapot run falls back to `Tsv` with a warning instead of failing.
+    #[default]
     Parquet,
 }
 
@@ -1455,6 +1697,7 @@ impl Default for ExperimentConfig {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
+    pub convert: ConvertConfig,
     pub prescan: PrescanConfig,
     pub rng_seed: u64,
     pub digest: DigestConfig,
@@ -1476,6 +1719,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             rng_seed: 0,
+            convert: t(),
             prescan: t(),
             digest: t(),
             peptidoforms: t(),
@@ -1820,6 +2064,62 @@ mod tests {
             Config::from_json(&text)
                 .unwrap_or_else(|e| panic!("shipped config {name} does not parse: {e}"));
         }
+    }
+
+    #[test]
+    fn rescore_defaults_are_the_training_recipe_and_json_omission_keeps_them() {
+        let d = RescoreConfig::default();
+        assert_eq!(d.feature_preset, FeaturePreset::All);
+        assert_eq!(d.train_neg_ratio, 3.0);
+        assert_eq!(d.train_neg_select, NegSelect::Hybrid);
+        assert_eq!(d.train_warm_epochs, 5);
+        // A config that does not mention them gets the same values (no field-level
+        // serde default shadowing the struct default), and each can be switched off.
+        let c = Config::from_json(r#"{"rescore":{"classifier":"native_tda"}}"#).expect("parses");
+        assert_eq!(c.rescore.feature_preset, FeaturePreset::All);
+        assert_eq!(c.rescore.train_neg_ratio, 3.0);
+        assert_eq!(c.rescore.train_neg_select, NegSelect::Hybrid);
+        assert_eq!(c.rescore.train_warm_epochs, 5);
+        let c = Config::from_json(
+            r#"{"rescore":{"feature_preset":"compact","train_neg_ratio":0.0,"train_neg_select":"random","train_warm_epochs":0}}"#,
+        )
+        .expect("parses");
+        assert_eq!(c.rescore.feature_preset, FeaturePreset::Compact);
+        assert_eq!(c.rescore.train_neg_ratio, 0.0);
+        assert_eq!(c.rescore.train_neg_select, NegSelect::Random);
+        assert_eq!(c.rescore.train_warm_epochs, 0);
+    }
+
+    #[test]
+    fn library_irt_resolves_per_mode_and_interpreter() {
+        let mut rt = RtImTrainConfig::default();
+        assert_eq!(rt.library_irt, LibraryIrt::Auto);
+        assert!(rt.repredicts_library_irt(true, true));
+        assert!(
+            !rt.repredicts_library_irt(true, false),
+            "auto without an interpreter keeps the library iRT"
+        );
+        assert!(
+            !rt.repredicts_library_irt(false, true),
+            "FASTA mode never re-predicts"
+        );
+        rt.finetune_deeplc = true;
+        assert!(
+            !rt.repredicts_library_irt(true, true),
+            "the fine-tune re-predicts by itself"
+        );
+        rt.finetune_deeplc = false;
+        rt.library_irt = LibraryIrt::Library;
+        assert!(!rt.repredicts_library_irt(true, true));
+        rt.library_irt = LibraryIrt::Deeplc;
+        assert!(
+            rt.repredicts_library_irt(true, false),
+            "explicit deeplc is a preflight matter, not a fallback"
+        );
+        let c = Config::from_json(r#"{"rt_im_train":{"library_irt":"deeplc"}}"#).expect("parses");
+        assert_eq!(c.rt_im_train.library_irt, LibraryIrt::Deeplc);
+        let c = Config::from_json("{}").expect("parses");
+        assert_eq!(c.rt_im_train.library_irt, LibraryIrt::Auto);
     }
 
     #[test]

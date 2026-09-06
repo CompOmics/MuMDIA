@@ -16,6 +16,10 @@ Usage:
   python deeplc_finetune.py <lib_t_precursors_in> <seed_psms> <lib_t_precursors_out>
                             [--threads N] [--epochs E] [--batch B] [--patience P]
                             [--max-ref N] [--predict-limit N] [--skip-predict]
+  python deeplc_finetune.py <lib_t_precursors_in> - <lib_t_precursors_out> --no-finetune
+      (engine path for rt_im_train.library_irt = deeplc: predict with the DeepLC base
+      model, no seed needed; per-run LOESS calibration then maps the predictions onto
+      observed RT)
 """
 import os
 
@@ -31,6 +35,42 @@ import argparse
 import re
 import time
 import deeplc                                    # import before numpy (OpenMP load order)
+import sys
+
+# The engine's default retention-time workflow calibrates DeepLC's base-model predictions
+# per run without a fine-tune. That is only sound from 4.1.1 on (4.0.0a2 memorised anchors:
+# in-sample 15.9 s against held-out 195 s residuals), so an older DeepLC is refused here as
+# well as by `mumdia doctor`, which cannot see a version that changes under its feet.
+_MIN_DEEPLC = (4, 1, 1)
+
+
+def _check_deeplc_version():
+    raw = getattr(deeplc, "__version__", None)
+    if raw is None:
+        try:
+            import importlib.metadata as _m
+            raw = _m.version("deeplc")
+        except Exception:  # pragma: no cover
+            raw = ""
+    parts = []
+    for piece in str(raw).split(".")[:3]:
+        digits = ""
+        for ch in piece:
+            if ch.isdigit():
+                digits += ch
+            else:
+                break
+        parts.append(int(digits) if digits else 0)
+    while len(parts) < 3:
+        parts.append(0)
+    if tuple(parts) < _MIN_DEEPLC:
+        sys.exit(
+            "deeplc %s is older than the required %d.%d.%d (pip install 'deeplc>=4.1.1')"
+            % (raw, *_MIN_DEEPLC)
+        )
+
+
+_check_deeplc_version()
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -60,83 +100,8 @@ def agg(a):
     return a.mean(axis=1) if a.ndim == 2 else a
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("lib_in")
-    ap.add_argument("seed_path")
-    ap.add_argument("lib_out")
-    ap.add_argument("--device", default="cpu", choices=["cpu", "cuda"],
-                    help="cuda moves training/inference onto the GPU; sidesteps the CPU OpenMP crash entirely")
-    ap.add_argument("--threads", type=int, default=int(_THREADS),
-                    help="torch CPU threads for training (bounded to avoid OpenMP oversubscription; cpu only)")
-    ap.add_argument("--predict-threads", type=int, default=0,
-                    help="torch CPU threads for the whole-library prediction phase; "
-                         "0 (default) reuses --threads, i.e. no change in behaviour. The "
-                         "documented crash was OpenMP oversubscription during fine-tuning's "
-                         "sustained BACKWARD pass; prediction is forward-only, and it is the "
-                         "phase that dominates wall clock on a large library, so it can "
-                         "usually take more threads. Raise it deliberately and watch the "
-                         "per-chunk rate logged below.")
-    ap.add_argument("--epochs", type=int, default=25)
-    ap.add_argument("--batch", type=int, default=0,
-                    help="fine-tune batch size; 0 (default) auto-scales to the reference "
-                         "size so every epoch has >= ~30 gradient steps. A fixed large "
-                         "batch (e.g. 512) underfits small seeds: a ~4k-peptide E.coli "
-                         "reference gives only ~8 steps/epoch and never converges.")
-    ap.add_argument("--patience", type=int, default=10)
-    ap.add_argument("--q-train", dest="q_train", type=float, default=0.01,
-                    help="max spectrum_q for a seed PSM to enter the fine-tune reference set")
-    ap.add_argument("--max-ref", type=int, default=0,
-                    help="cap reference PSMs (0 = all); use a small value for a smoke test")
-    ap.add_argument("--window-holdout-frac", dest="window_holdout_frac", type=float, default=0.0,
-                    help="exclude anchor peptides with base_peptide_id %% 1000 < round(frac*1000) "
-                         "from the fine-tune reference. MUST match rt_im_train.window_holdout_frac: "
-                         "rt-im-train sizes the RT window on exactly these held-out peptides, and "
-                         "fine-tuning on them would leak adapter memorization into the residuals "
-                         "(the rule is duplicated in rt_im_train.rs is_holdout; keep in sync)")
-    ap.add_argument("--predict-limit", type=int, default=0,
-                    help="cap number of unique peptidoforms predicted (0 = all)")
-    ap.add_argument("--skip-predict", action="store_true",
-                    help="fine-tune only, skip the full-library prediction (crash-path smoke test)")
-    ap.add_argument("--seed", type=int, default=0,
-                    help="seed numpy and torch before fine-tuning, so two runs on the same "
-                         "input draw the same weights. Unseeded, the draw varies enough to "
-                         "change results: on the AIF benchmark the held-out RT window p95 "
-                         "varied 150-211 s across two draws of one arm, worth about 2 percent "
-                         "of peptides, which made single-run comparisons of window sizing or "
-                         "library variants unreadable. Kernel-level nondeterminism remains, "
-                         "so this narrows the variance rather than removing it.")
-    args = ap.parse_args()
-
-    if args.device == "cuda" and not torch.cuda.is_available():
-        raise SystemExit("--device cuda requested but torch.cuda.is_available() is False "
-                         "(wrong env? need a +cuXXX torch build)")
-    # Seed before anything touches an RNG: DeepLC's transfer learning shuffles and
-    # initialises, and an unseeded draw is the largest source of run-to-run
-    # variation in the whole pipeline (docs/14_build_test_deploy_gotchas.md).
-    np.random.seed(args.seed)
-    torch.manual_seed(args.seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(args.seed)
-    print(f"seed={args.seed} (numpy, torch"
-          f"{', cuda' if torch.cuda.is_available() else ''}); "
-          "training kernels are not guaranteed bit-for-bit deterministic", flush=True)
-
-    # bound torch's own thread pool; only one OpenMP pool spins now (matters on cpu)
-    torch.set_num_threads(max(1, args.threads))
-    try:
-        torch.set_num_interop_threads(1)
-    except RuntimeError:
-        pass  # already initialized
-    if args.device == "cuda":
-        print(f"device=cuda gpu={torch.cuda.get_device_name(0)}; compute off the CPU OpenMP pools", flush=True)
-    else:
-        print(f"device=cpu torch threads={torch.get_num_threads()} interop=1; OMP/BLAS pinned to 1", flush=True)
-
-    lib = pq.read_table(args.lib_in)
-    pform = lib.column("peptidoform").to_pylist()
-    orig = np.asarray(lib.column("predicted_irt"), dtype=np.float32)
-
+def build_finetuned_model(args):
+    """Transfer-learn on the confident seed PSMs named by args.seed_path."""
     # reference: confident target seed PSMs (peptidoform + observed RT, seconds)
     seed = pq.read_table(args.seed_path).to_pydict()
     # Held-out window sizing: the same rule as rt_im_train.rs::is_holdout, on the same
@@ -186,6 +151,97 @@ def main():
         train_kwargs["num_threads"] = max(1, args.threads)   # cpu-only knob; absent in some deeplc builds
     ft_model = deeplc.finetune(ref_psms, train_kwargs=train_kwargs)   # <-- transfer learning
     print("fine-tuned model ready", flush=True)
+    return ft_model
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("lib_in")
+    ap.add_argument("seed_path")
+    ap.add_argument("lib_out")
+    ap.add_argument("--device", default="cpu", choices=["cpu", "cuda"],
+                    help="cuda moves training/inference onto the GPU; sidesteps the CPU OpenMP crash entirely")
+    ap.add_argument("--threads", type=int, default=int(_THREADS),
+                    help="torch CPU threads for training (bounded to avoid OpenMP oversubscription; cpu only)")
+    ap.add_argument("--predict-threads", type=int, default=0,
+                    help="torch CPU threads for the whole-library prediction phase; "
+                         "0 (default) reuses --threads, i.e. no change in behaviour. The "
+                         "documented crash was OpenMP oversubscription during fine-tuning's "
+                         "sustained BACKWARD pass; prediction is forward-only, and it is the "
+                         "phase that dominates wall clock on a large library, so it can "
+                         "usually take more threads. Raise it deliberately and watch the "
+                         "per-chunk rate logged below.")
+    ap.add_argument("--epochs", type=int, default=25)
+    ap.add_argument("--batch", type=int, default=0,
+                    help="fine-tune batch size; 0 (default) auto-scales to the reference "
+                         "size so every epoch has >= ~30 gradient steps. A fixed large "
+                         "batch (e.g. 512) underfits small seeds: a ~4k-peptide E.coli "
+                         "reference gives only ~8 steps/epoch and never converges.")
+    ap.add_argument("--patience", type=int, default=10)
+    ap.add_argument("--q-train", dest="q_train", type=float, default=0.01,
+                    help="max spectrum_q for a seed PSM to enter the fine-tune reference set")
+    ap.add_argument("--max-ref", type=int, default=0,
+                    help="cap reference PSMs (0 = all); use a small value for a smoke test")
+    ap.add_argument("--window-holdout-frac", dest="window_holdout_frac", type=float, default=0.0,
+                    help="exclude anchor peptides with base_peptide_id %% 1000 < round(frac*1000) "
+                         "from the fine-tune reference. MUST match rt_im_train.window_holdout_frac: "
+                         "rt-im-train sizes the RT window on exactly these held-out peptides, and "
+                         "fine-tuning on them would leak adapter memorization into the residuals "
+                         "(the rule is duplicated in rt_im_train.rs is_holdout; keep in sync)")
+    ap.add_argument("--predict-limit", type=int, default=0,
+                    help="cap number of unique peptidoforms predicted (0 = all)")
+    ap.add_argument("--skip-predict", action="store_true",
+                    help="fine-tune only, skip the full-library prediction (crash-path smoke test)")
+    ap.add_argument("--no-finetune", action="store_true",
+                    help="skip the transfer learning and predict every peptidoform with the "
+                         "DeepLC base model; seed_psms is ignored (pass '-'). The engine uses "
+                         "this for rt_im_train.library_irt = deeplc, replacing an imported "
+                         "library's iRT with predictions that per-run calibration then maps "
+                         "onto observed RT")
+    ap.add_argument("--seed", type=int, default=0,
+                    help="seed numpy and torch before fine-tuning, so two runs on the same "
+                         "input draw the same weights. Unseeded, the draw varies enough to "
+                         "change results: on the AIF benchmark the held-out RT window p95 "
+                         "varied 150-211 s across two draws of one arm, worth about 2 percent "
+                         "of peptides, which made single-run comparisons of window sizing or "
+                         "library variants unreadable. Kernel-level nondeterminism remains, "
+                         "so this narrows the variance rather than removing it.")
+    args = ap.parse_args()
+
+    if args.device == "cuda" and not torch.cuda.is_available():
+        raise SystemExit("--device cuda requested but torch.cuda.is_available() is False "
+                         "(wrong env? need a +cuXXX torch build)")
+    # Seed before anything touches an RNG: DeepLC's transfer learning shuffles and
+    # initialises, and an unseeded draw is the largest source of run-to-run
+    # variation in the whole pipeline (docs/14_build_test_deploy_gotchas.md).
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+    print(f"seed={args.seed} (numpy, torch"
+          f"{', cuda' if torch.cuda.is_available() else ''}); "
+          "training kernels are not guaranteed bit-for-bit deterministic", flush=True)
+
+    # bound torch's own thread pool; only one OpenMP pool spins now (matters on cpu)
+    torch.set_num_threads(max(1, args.threads))
+    try:
+        torch.set_num_interop_threads(1)
+    except RuntimeError:
+        pass  # already initialized
+    if args.device == "cuda":
+        print(f"device=cuda gpu={torch.cuda.get_device_name(0)}; compute off the CPU OpenMP pools", flush=True)
+    else:
+        print(f"device=cpu torch threads={torch.get_num_threads()} interop=1; OMP/BLAS pinned to 1", flush=True)
+
+    lib = pq.read_table(args.lib_in)
+    pform = lib.column("peptidoform").to_pylist()
+    orig = np.asarray(lib.column("predicted_irt"), dtype=np.float32)
+
+    if args.no_finetune:
+        ft_model = None
+        print("no-finetune: predicting with the DeepLC base model (seed ignored)", flush=True)
+    else:
+        ft_model = build_finetuned_model(args)
 
     if args.skip_predict:
         print("skip-predict set; fine-tune smoke test complete (crash path exercised)", flush=True)
@@ -205,7 +261,8 @@ def main():
     pt = args.predict_threads if args.predict_threads > 0 else args.threads
     if pt != torch.get_num_threads():
         torch.set_num_threads(max(1, pt))
-    print(f"predicting {len(uniq)} unique standard peptidoforms with fine-tuned model "
+    which = "the DeepLC base model" if ft_model is None else "the fine-tuned model"
+    print(f"predicting {len(uniq)} unique standard peptidoforms with {which} "
           f"(torch threads={torch.get_num_threads()})", flush=True)
     preds = {}
     chunk = 100_000
@@ -213,7 +270,7 @@ def main():
     for s in range(0, len(uniq), chunk):
         t0 = time.time()
         batch = uniq[s:s + chunk]
-        p = agg(deeplc.predict(batch, model=ft_model))
+        p = agg(deeplc.predict(batch) if ft_model is None else deeplc.predict(batch, model=ft_model))
         for pf, v in zip(batch, p):
             preds[pf] = float(v)
         done = min(s + chunk, len(uniq))
@@ -231,7 +288,7 @@ def main():
     idx = lib.schema.get_field_index("predicted_irt")
     lib = lib.set_column(idx, "predicted_irt", pa.array(new, pa.float32()))
     pq.write_table(lib, args.lib_out)
-    print(f"wrote fine-tuned library: {args.lib_out}")
+    print(f"wrote library with re-predicted iRT ({which}): {args.lib_out}")
 
 
 if __name__ == "__main__":

@@ -41,7 +41,19 @@ const LOG_TAIL: usize = 4000;
 /// What the interface asks for when it starts a search.
 #[derive(Deserialize, Debug, Clone)]
 pub struct Request {
-    pub mzml: String,
+    /// One or more spectra files. Each may be an mzML or a vendor path.
+    ///
+    /// A single entry is an ordinary `run`. Several entries mean one of two very
+    /// different things, chosen by `experiment`, and conflating them would be a
+    /// scientific error rather than a UI simplification: separate searches share
+    /// nothing, while an experiment pools the FDR across runs.
+    pub mzml: Vec<String>,
+    /// Pool the runs into one `run-experiment`: combined rescore, optional MBR
+    /// transfer, per-run quant and cross-run LFQ.
+    ///
+    /// Ignored for a single file, where there is nothing to pool.
+    #[serde(default)]
+    pub experiment: bool,
     pub out_dir: String,
     /// FASTA mode. Mutually exclusive with the library pair.
     pub fasta: Option<String>,
@@ -80,6 +92,16 @@ pub struct Results {
     pub psms: u64,
     pub has_peptides_tsv: bool,
     pub has_proteins_tsv: bool,
+    /// True when these counts came from a pooled `run-experiment`.
+    ///
+    /// They are then EXPERIMENT-WIDE, not per file, and the difference is not
+    /// cosmetic: an experiment-wide rescore groups the q columns experiment-wide, so
+    /// `peptide_q_value`, `precursor_q` and `pg_q_value` are written only to each
+    /// group's single winning row across the whole experiment. A per-run count on
+    /// those columns is diluted by roughly 1/n_runs and is meaningless; the correct
+    /// per-file unit there is `run_psm_q`, from the split tables. The interface has to
+    /// say which it is showing.
+    pub experiment_wide: bool,
 }
 
 /// The whole observable state of a run. Serialised to the interface on every poll.
@@ -100,6 +122,12 @@ pub struct Snapshot {
     pub results: Option<Results>,
     /// True in library-input mode, which skips digest, peptidoforms and predict-frag.
     pub library_mode: bool,
+    /// True when this is a pooled `run-experiment` rather than a single `run`.
+    ///
+    /// The interface needs this to label the result counts: an experiment-wide
+    /// rescore groups the q columns experiment-wide, so those counts are NOT per
+    /// file, and `run-experiment` writes no report at all.
+    pub experiment: bool,
 }
 
 pub struct Run {
@@ -152,7 +180,7 @@ impl Run {
 /// would need `unsafe`, and this is not on any hot path. `taskkill /T` walks the
 /// tree at kill time and `kill` on a negative pid signals the whole group, so a
 /// Python worker the application never knew about is included either way.
-fn kill_tree(pid: u32) {
+pub fn kill_tree(pid: u32) {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -269,16 +297,51 @@ fn argv(req: &Request) -> Result<Vec<String>, String> {
     if lib && (req.lib_precursors.is_none() || req.lib_fragments.is_none()) {
         return Err("a spectral library needs both the precursor and the fragment table".into());
     }
-    if req.mzml.trim().is_empty() {
-        return Err("select an mzML file".into());
+    if req.mzml.is_empty() || req.mzml.iter().all(|m| m.trim().is_empty()) {
+        return Err("select at least one spectra file".into());
+    }
+    if req.experiment && req.mzml.len() < 2 {
+        return Err("a pooled experiment needs at least two files".into());
+    }
+    // The engine's `run` takes a single `--mzml` (main.rs: `mzml: String`, no append
+    // action), so emitting several would produce "the argument '--mzml <MZML>' cannot
+    // be used multiple times" -- an error the user cannot act on. Separate searches
+    // over several files are N single-file requests, which is the interface's job;
+    // this refuses the invalid state rather than letting clap report it.
+    if !req.experiment && req.mzml.len() > 1 {
+        return Err(format!(
+            "{} files were given for a single search. Either search them separately,              which runs one search per file, or choose a pooled experiment.",
+            req.mzml.len()
+        ));
+    }
+    // Two runs pointed at the same file would collide: `run-experiment` derives each
+    // run's subdirectory from its name, and the engine's own duplicate-name guard
+    // catches the name collision but not two entries for one path.
+    {
+        let mut seen = std::collections::HashSet::new();
+        for m in &req.mzml {
+            if !seen.insert(m.as_str()) {
+                return Err(format!("{m} was selected more than once"));
+            }
+        }
     }
     if req.out_dir.trim().is_empty() {
         return Err("choose a folder for the results".into());
     }
 
-    let mut a: Vec<String> = vec!["run".into()];
-    a.push("--mzml".into());
-    a.push(req.mzml.clone());
+    // `req.experiment` alone: the check above already rejected an experiment with
+    // fewer than two files, so re-testing the length here would be a second, quieter
+    // rule that disagreed with the first. It did, and a test caught it.
+    let mut a: Vec<String> = vec![if req.experiment {
+        "run-experiment"
+    } else {
+        "run"
+    }
+    .into()];
+    for m in &req.mzml {
+        a.push("--mzml".into());
+        a.push(m.clone());
+    }
     a.push("--out-dir".into());
     a.push(req.out_dir.clone());
     if let Some(f) = &req.fasta {
@@ -335,6 +398,9 @@ fn quote(s: &str) -> String {
 /// every role is unrequired then the run is the minimal path.
 pub fn needs_no_sidecar(engine: &Path, config: Option<&str>) -> Result<bool, String> {
     let mut cmd = engine::command(engine);
+    // The same environment the run itself gets. Asking `doctor` without it would
+    // answer for a different engine than the one that will run.
+    crate::components::stamp_env(&mut cmd);
     cmd.arg("doctor").arg("--json");
     if let Some(c) = config {
         if !c.trim().is_empty() {
@@ -375,6 +441,7 @@ pub fn start(id: String, req: Request) -> Result<Arc<Run>, String> {
     );
 
     let library_mode = req.lib_precursors.is_some();
+    let experiment = req.experiment;
     let run = Arc::new(Run {
         snapshot: Mutex::new(Snapshot {
             id: id.clone(),
@@ -389,12 +456,16 @@ pub fn start(id: String, req: Request) -> Result<Arc<Run>, String> {
             elapsed_ms: 0,
             results: None,
             library_mode,
+            experiment,
         }),
         pid: Mutex::new(None),
         cancelled: AtomicBool::new(false),
     });
 
     let mut cmd = engine::command(&exe);
+    // Without this the managed Python environment and the managed .raw converter
+    // are invisible to the engine; see `components::stamp_env`.
+    crate::components::stamp_env(&mut cmd);
     cmd.args(&args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -609,7 +680,18 @@ fn scan_stages(dir: &Path) -> Vec<Stage> {
 
 /// Read the results panel out of the scored table's report.
 fn read_results(dir: &Path) -> Option<Results> {
-    let path = dir.join("psms_scored.parquet.report.json");
+    // A single `run` writes `psms_scored.parquet`; a pooled `run-experiment` writes
+    // `scored_combined.parquet` (its counts) plus an experiment-wide `peptides.tsv`
+    // and `proteins.tsv` at the root, one quantity column per run. Reading only the
+    // first name left the results screen blank after every experiment.
+    let (path, experiment_wide) = {
+        let single = dir.join("psms_scored.parquet.report.json");
+        if single.is_file() {
+            (single, false)
+        } else {
+            (dir.join("scored_combined.parquet.report.json"), true)
+        }
+    };
     let text = std::fs::read_to_string(path).ok()?;
     let v: serde_json::Value = serde_json::from_str(&text).ok()?;
     let params = v.get("params");
@@ -635,6 +717,7 @@ fn read_results(dir: &Path) -> Option<Results> {
         psms: n(stats, "psms"),
         has_peptides_tsv: dir.join("peptides.tsv").is_file(),
         has_proteins_tsv: dir.join("proteins.tsv").is_file(),
+        experiment_wide,
     })
 }
 
@@ -644,7 +727,8 @@ mod tests {
 
     fn req() -> Request {
         Request {
-            mzml: "a.mzML".into(),
+            mzml: vec!["a.mzML".into()],
+            experiment: false,
             out_dir: "out".into(),
             fasta: None,
             lib_precursors: None,
@@ -927,6 +1011,126 @@ mod history_tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("notes.txt"), b"hello").unwrap();
         assert!(history_entry(&dir).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// Multi-file semantics, in their own module because the two meanings of "several
+/// files" are the thing most likely to be conflated by a later change.
+#[cfg(test)]
+mod multifile_tests {
+    use super::*;
+
+    fn req() -> Request {
+        Request {
+            mzml: vec!["a.mzML".into()],
+            experiment: false,
+            out_dir: "out".into(),
+            fasta: Some("f.fasta".into()),
+            lib_precursors: None,
+            lib_fragments: None,
+            config: None,
+            threads: None,
+        }
+    }
+
+    #[test]
+    fn a_one_file_experiment_is_refused_rather_than_quietly_demoted() {
+        // Refused, not silently turned into a single run. Pooled and separate are
+        // scientifically different -- that difference is the whole reason the
+        // interface offers a choice -- so a user who asked for an experiment and got
+        // one plain run must be told, not left to infer it from the output tree.
+        let mut r = req();
+        r.experiment = true;
+        let e = argv(&r).unwrap_err();
+        assert!(e.contains("at least two files"), "{e}");
+
+        // Without the flag the same single file is an ordinary run.
+        r.experiment = false;
+        let a = argv(&r).unwrap();
+        assert_eq!(a[0], "run");
+        assert_eq!(a.iter().filter(|x| *x == "--mzml").count(), 1);
+    }
+
+    #[test]
+    fn several_files_are_separate_runs_unless_pooling_is_asked_for() {
+        // The distinction the interface must not blur. Separate searches share
+        // nothing; an experiment pools the FDR across runs. Batch mode is N calls
+        // with one file each, so a multi-file request WITHOUT the flag is a mistake
+        // rather than an implicit experiment.
+        let mut r = req();
+        r.mzml = vec!["a.mzML".into(), "b.mzML".into()];
+
+        r.experiment = true;
+        let pooled = argv(&r).unwrap();
+        assert_eq!(pooled[0], "run-experiment");
+        assert_eq!(pooled.iter().filter(|x| *x == "--mzml").count(), 2);
+
+        // Without the flag, several files are REFUSED rather than emitted as one
+        // `run`. The engine's `run` takes a single `--mzml` (`mzml: String`, no append
+        // action), so N of them would die on "cannot be used multiple times" -- an
+        // error a user cannot act on. Separate searches are N single-file requests,
+        // which is the interface's job, so a multi-file non-experiment request is a
+        // mistake and is named as one.
+        r.experiment = false;
+        let e = argv(&r).unwrap_err();
+        assert!(e.contains("search them separately"), "{e}");
+    }
+
+    #[test]
+    fn a_pooled_experiment_needs_at_least_two_files() {
+        let mut r = req();
+        r.experiment = true;
+        // Zero files is an error whatever the flag says.
+        r.mzml = Vec::new();
+        let e = argv(&r).unwrap_err();
+        assert!(e.contains("at least one"), "{e}");
+    }
+
+    #[test]
+    fn the_same_file_twice_is_refused() {
+        // `run-experiment` derives each run's output subdirectory from its name, and
+        // the engine guards duplicate NAMES. Two entries for one path is a different
+        // mistake it does not catch, and it would search the same file twice and
+        // pool the result with itself, inflating the evidence for those peptides.
+        let mut r = req();
+        r.experiment = true;
+        r.mzml = vec!["a.mzML".into(), "b.mzML".into(), "a.mzML".into()];
+        let e = argv(&r).unwrap_err();
+        assert!(e.contains("more than once"), "{e}");
+    }
+
+    #[test]
+    fn a_pooled_experiment_reports_its_combined_table_and_says_so() {
+        // `run-experiment` writes `scored_combined.parquet` and never calls the report
+        // stage, so reading only `psms_scored.parquet.report.json` left the results
+        // screen blank after every experiment. And the counts it does yield are
+        // experiment-wide: the grouped q columns are grouped across the whole
+        // experiment, so a per-file reading of them is diluted by ~1/n_runs.
+        let dir = std::env::temp_dir().join("mumdia-results-experiment");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        assert!(
+            read_results(&dir).is_none(),
+            "no report at all is no results"
+        );
+
+        let body = r#"{"stats":{"classifier":"nn_torch","psms":10,
+            "target_peptides_at_1pct":7,"target_precursors_at_1pct":8,
+            "target_protein_groups_at_1pct":3}}"#;
+        std::fs::write(dir.join("scored_combined.parquet.report.json"), body).unwrap();
+        let r = read_results(&dir).expect("the combined table must be read");
+        assert!(r.experiment_wide, "a combined table is experiment-wide");
+        assert_eq!(r.peptides_1pct, 7);
+        assert_eq!(r.precursors_1pct, 8);
+        // And it writes no report, so neither TSV exists.
+        assert!(!r.has_peptides_tsv && !r.has_proteins_tsv);
+
+        // A single run's own report wins, and is not labelled experiment-wide.
+        std::fs::write(dir.join("psms_scored.parquet.report.json"), body).unwrap();
+        let r = read_results(&dir).unwrap();
+        assert!(!r.experiment_wide);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
