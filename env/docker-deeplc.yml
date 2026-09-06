@@ -15,6 +15,11 @@ channels:
 dependencies:
   - python=3.11
   - pip
+  # setuptools >= 83.0.0 closes PYSEC-2026-3447 (CVE-2026-59890: FileList ignored
+  # MANIFEST.in exclusion patterns). Pinned here because the CI audit runs against
+  # the RESOLVED environment, and a solve that carried 81.0.0 failed the main branch
+  # on 2026-09-06.
+  - setuptools>=83
   - pip:
       - --extra-index-url https://download.pytorch.org/whl/cpu
       - torch==2.12.1+cpu
