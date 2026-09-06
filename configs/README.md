@@ -8,7 +8,7 @@ edit it, and pass it with `--config`. Every field not mentioned keeps its defaul
 |---|---|---|
 | `examples/native.json` | nothing beyond the binary | Extended features, the DIA apex settings, and the native predictors and `native_tda` rescorer. Runs on a machine with no Python at all. |
 | `examples/fasta-sidecars.json` | MS2PIP, DeepLC, mokapot | Digest a FASTA, predict fragment intensities with MS2PIP and retention time with DeepLC, rescore with mokapot. |
-| `examples/diann-library.json` | DeepLC, PyTorch | Consume an imported DIA-NN library, fine-tune DeepLC per run, rescore with the PyTorch NN. This is the highest-sensitivity workflow measured so far (`docs/20_sensitivity_and_quantification_playbook.md`). |
+| `examples/diann-library.json` | DeepLC, PyTorch | Consume an imported DIA-NN library, re-predict its retention times once with the DeepLC base model (`rt_im_train.library_irt = auto`; DeepLC >= 4.1.1) and calibrate them per run, rescore with the PyTorch NN. This is the highest-sensitivity workflow measured so far (`docs/20_sensitivity_and_quantification_playbook.md`). |
 
 Check any of them before a long run:
 
