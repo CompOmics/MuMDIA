@@ -56,7 +56,7 @@ Commands:
   inspect         Print schema, head sample, and row count for any artifact
   peak-census     Peaks per MS2 spectrum for an mzML, as JSON: percentiles plus what each candidate `--top-peaks-ms2` cap would discard
   audit           Candidate audit: reconstruct per-candidate stage flags + earliest rejection reason across the artifact chain and write candidate_audit.parquet (sensitivity program, P0.3/P0.4). Non-destructive; reruns no compute
-  report          Write peptides.tsv + proteins.tsv from a scored PSM table
+  report          Write peptides.tsv + proteins.tsv from a scored PSM table, or the experiment-wide pair for a `run-experiment` output directory
   doctor          Check that the configured Python sidecar environments are usable
   help            Print this message or the help of the given subcommand(s)
 
@@ -148,7 +148,7 @@ first sentence of the description, with the full text in the section below.
 | [`inspect`](#inspect) | no | Print schema, head sample, and row count for any artifact |
 | [`peak-census`](#peak-census) | no | Peaks per MS2 spectrum for an mzML, as JSON: percentiles plus what each candidate `--top-peaks-ms2` cap would discard |
 | [`audit`](#audit) | no | Candidate audit: reconstruct per-candidate stage flags + earliest rejection reason across the artifact chain and write candidate_audit.parquet (sensitivity program, P0.3/P0.4). |
-| [`report`](#report) | yes | Write peptides.tsv + proteins.tsv from a scored PSM table |
+| [`report`](#report) | yes | Write peptides.tsv + proteins.tsv from a scored PSM table, or the experiment-wide pair for a `run-experiment` output directory |
 | [`doctor`](#doctor) | yes | Check that the configured Python sidecar environments are usable |
 | `help` | n/a | Print this message or the help of the given subcommand(s) |
 
@@ -655,14 +655,19 @@ Plus the 5 repeated flags removed above: see "Global flags".
 ## report
 
 ```text
-Write peptides.tsv + proteins.tsv from a scored PSM table
+Write peptides.tsv + proteins.tsv from a scored PSM table, or the experiment-wide pair for a `run-experiment` output directory
 
-Usage: mumdia report [OPTIONS] --psms-scored <PSMS_SCORED> --out-dir <OUT_DIR>
+Usage: mumdia report [OPTIONS]
 
 Options:
       --psms-scored <PSMS_SCORED>
+          A single run's scored table. Either this or --experiment-dir
+
+      --experiment-dir <EXPERIMENT_DIR>
+          A `run-experiment` output directory: rewrite its experiment-wide peptides.tsv and proteins.tsv (one quantity column per run) from the pooled scored table, per-run quantities and cross-run LFQ named in its experiment_manifest.json, at another --q if wanted
 
       --out-dir <OUT_DIR>
+          Where the two TSVs go. Defaults to --experiment-dir in experiment mode
 
       --peptide-quant <PEPTIDE_QUANT>
 

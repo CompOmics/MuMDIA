@@ -432,15 +432,28 @@ enum Cmd {
         #[arg(long, default_value = "")]
         entrapment_substr: String,
     },
-    /// Write peptides.tsv + proteins.tsv from a scored PSM table.
+    /// Write peptides.tsv + proteins.tsv from a scored PSM table, or the
+    /// experiment-wide pair for a `run-experiment` output directory.
     Report {
+        /// A single run's scored table. Either this or --experiment-dir.
+        #[arg(
+            long,
+            conflicts_with = "experiment_dir",
+            required_unless_present = "experiment_dir"
+        )]
+        psms_scored: Option<String>,
+        /// A `run-experiment` output directory: rewrite its experiment-wide
+        /// peptides.tsv and proteins.tsv (one quantity column per run) from the
+        /// pooled scored table, per-run quantities and cross-run LFQ named in its
+        /// experiment_manifest.json, at another --q if wanted.
         #[arg(long)]
-        psms_scored: String,
-        #[arg(long)]
-        out_dir: String,
-        #[arg(long)]
+        experiment_dir: Option<String>,
+        /// Where the two TSVs go. Defaults to --experiment-dir in experiment mode.
+        #[arg(long, required_unless_present = "experiment_dir")]
+        out_dir: Option<String>,
+        #[arg(long, conflicts_with = "experiment_dir")]
         peptide_quant: Option<String>,
-        #[arg(long)]
+        #[arg(long, conflicts_with = "experiment_dir")]
         protein_quant: Option<String>,
         /// Reported q threshold. Defaults to `quant.q_threshold` from `--config`
         /// when that is given, otherwise 0.01. An explicit value always wins.
@@ -1382,6 +1395,7 @@ fn main() -> Result<()> {
         }
         Cmd::Report {
             psms_scored,
+            experiment_dir,
             out_dir,
             peptide_quant,
             protein_quant,
@@ -1398,20 +1412,74 @@ fn main() -> Result<()> {
                     None => 0.01,
                 },
             };
-            std::fs::create_dir_all(&out_dir)?;
-            let pep = format!("{out_dir}/peptides.tsv");
-            let prot = format!("{out_dir}/proteins.tsv");
-            let (n_pep, n_prot) = stages::report::run(stages::report::ReportParams {
-                scored: &psms_scored,
-                peptide_quant: peptide_quant.as_deref(),
-                protein_quant: protein_quant.as_deref(),
-                out_peptides: &pep,
-                out_proteins: &prot,
-                q_threshold: q,
-            })?;
-            println!(
-                "MuMDIA: {n_pep} peptides, {n_prot} protein groups at q <= {q}\n  {pep}\n  {prot}"
-            );
+            if let Some(exp) = experiment_dir {
+                // Everything the report needs is named in the experiment manifest, so the
+                // user points at the directory rather than at four files.
+                let manifest_path = format!("{exp}/experiment_manifest.json");
+                let text = std::fs::read_to_string(&manifest_path)
+                    .map_err(|e| anyhow::anyhow!("reading {manifest_path}: {e}"))?;
+                let m: serde_json::Value = serde_json::from_str(&text)
+                    .map_err(|e| anyhow::anyhow!("parsing {manifest_path}: {e}"))?;
+                let e = m
+                    .get("experiment")
+                    .ok_or_else(|| anyhow::anyhow!("{manifest_path} has no `experiment` block"))?;
+                let strs = |key: &str| -> Result<Vec<String>> {
+                    e.get(key)
+                        .and_then(|v| v.as_array())
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|x| x.as_str().map(String::from))
+                                .collect()
+                        })
+                        .ok_or_else(|| anyhow::anyhow!("{manifest_path}: experiment.{key} missing"))
+                };
+                let runs = strs("runs")?;
+                let peptide_quants = strs("peptide_quants")?;
+                let scored = e
+                    .get("scored_for_quant")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("{manifest_path}: experiment.scored_for_quant missing")
+                    })?
+                    .to_string();
+                let lfq = e.get("lfq").and_then(|v| v.as_str()).map(String::from);
+                let out = out_dir.unwrap_or_else(|| exp.clone());
+                std::fs::create_dir_all(&out)?;
+                let pep = format!("{out}/peptides.tsv");
+                let prot = format!("{out}/proteins.tsv");
+                let (n_pep, n_prot) =
+                    stages::report::run_experiment(stages::report::ExperimentReportParams {
+                        scored: &scored,
+                        run_names: &runs,
+                        peptide_quants: &peptide_quants,
+                        protein_lfq: lfq.as_deref(),
+                        out_peptides: &pep,
+                        out_proteins: &prot,
+                        q_threshold: q,
+                    })?;
+                println!(
+                    "MuMDIA: {n_pep} precursors, {n_prot} protein groups at experiment-wide \
+                     q <= {q} over {} runs\n  {pep}\n  {prot}",
+                    runs.len()
+                );
+            } else {
+                let psms_scored = psms_scored.expect("clap: required unless --experiment-dir");
+                let out_dir = out_dir.expect("clap: required unless --experiment-dir");
+                std::fs::create_dir_all(&out_dir)?;
+                let pep = format!("{out_dir}/peptides.tsv");
+                let prot = format!("{out_dir}/proteins.tsv");
+                let (n_pep, n_prot) = stages::report::run(stages::report::ReportParams {
+                    scored: &psms_scored,
+                    peptide_quant: peptide_quant.as_deref(),
+                    protein_quant: protein_quant.as_deref(),
+                    out_peptides: &pep,
+                    out_proteins: &prot,
+                    q_threshold: q,
+                })?;
+                println!(
+                    "MuMDIA: {n_pep} peptides, {n_prot} protein groups at q <= {q}\n  {pep}\n  {prot}"
+                );
+            }
         }
         Cmd::Doctor { config, json } => {
             // Deliberately the raw loader: doctor must be able to diagnose a

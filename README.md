@@ -238,8 +238,10 @@ mumdia quant-lfq --inputs exp/r0/peptide_quant.parquet exp/r1/peptide_quant.parq
 ```
 
 `run-experiment` writes one subdirectory per run (`r0`, `r1`, ... unless
-`--run-names` is given) and never calls the report stage, so it produces no
-`peptides.tsv` or `proteins.tsv` anywhere in its output tree. See
+`--run-names` is given) and one experiment-wide `peptides.tsv` and `proteins.tsv`
+at the root: rows selected on the experiment-wide q columns, `n_runs`, and one
+quantity column per run (`quantity_<run>` for precursors, `lfq_<run>` for protein
+groups). There are no per-run TSVs; see
 [Status of experimental features](#status-of-experimental-features).
 
 ## Configuration
@@ -598,10 +600,12 @@ Hard limits of this release:
   `run-experiment`, rescores them together; only one `--mzml` is a single-file search.
   Use `run-experiment` directly for a pooled multi-run
   search.
-- **`run-experiment` does not write the TSV reports.** It never calls the report
-  stage, so there is no `peptides.tsv` or `proteins.tsv` anywhere in its output
-  tree. Take per-run counts from the split scored tables on `run_psm_q`, or
-  invoke `mumdia report` yourself. It also overrides the configured
+- **`run-experiment` writes experiment-wide TSV reports, not per-run ones.** Its
+  `peptides.tsv` and `proteins.tsv` select on the experiment-wide q columns and
+  carry one quantity column per run; a per-run reading of the grouped q columns
+  is diluted by about 1/n_runs, so take per-run counts from the split scored
+  tables on `run_psm_q`. `mumdia report --experiment-dir` rewrites the pair at
+  another threshold. It also overrides the configured
   `quant.q_filter` to gate per-run quantification on the pooled `q_value`, and
   warns when it does.
 - **The Python sidecars are not covered by continuous integration.** CI builds

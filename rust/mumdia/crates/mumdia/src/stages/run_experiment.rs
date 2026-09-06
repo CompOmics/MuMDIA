@@ -694,6 +694,26 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         &lfq,
     )?;
 
+    // --- experiment-wide report ---
+    // peptides.tsv and proteins.tsv at the experiment root, selected on the
+    // experiment-wide grouped q columns (the one unit that is valid across a pooled
+    // rescore), with one quantity column per run: each run's own precursor quantity, and
+    // the cross-run MaxLFQ protein quantity. There is deliberately no per-run TSV: the
+    // grouped q columns are written to each group's experiment-wide winner only, so a
+    // per-run report would be diluted by about 1/n_runs; the per-run unit is `run_psm_q`
+    // in the split tables.
+    let pep_tsv = d("peptides.tsv");
+    let prot_tsv = d("proteins.tsv");
+    let (n_rep_pep, n_rep_prot) = report::run_experiment(report::ExperimentReportParams {
+        scored: &scored_for_quant,
+        run_names: &names,
+        peptide_quants: &peptide_quants,
+        protein_lfq: Some(&lfq),
+        out_peptides: &pep_tsv,
+        out_proteins: &prot_tsv,
+        q_threshold: cfg.quant.q_threshold,
+    })?;
+
     // --- experiment manifest ---
     let manifest = json!({
         "config_hash": ch,
@@ -704,6 +724,14 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         "mbr": format!("{:?}", cfg.mbr.strategy),
         "lfq": lfq,
         "peptide_quants": peptide_quants,
+        "report": {
+            "peptides": pep_tsv,
+            "proteins": prot_tsv,
+            "n_precursors": n_rep_pep,
+            "n_protein_groups": n_rep_prot,
+            "q_threshold": cfg.quant.q_threshold,
+            "unit": "experiment-wide peptide_q_value / pg_q_value; n_runs on run_psm_q",
+        },
     });
     // Provenance parity with the single-run manifest: the identity of the code, of
     // the inputs, and of every artifact this stage produced.
@@ -805,7 +833,10 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
     mumdia_io::json::write_json(&d("experiment_manifest.json"), &manifest)?;
     info!(
         elapsed_ms = t0.elapsed().as_millis(),
-        n_runs, "run-experiment: complete"
+        n_runs,
+        report_precursors = n_rep_pep,
+        report_protein_groups = n_rep_prot,
+        "run-experiment: complete"
     );
     Ok(())
 }

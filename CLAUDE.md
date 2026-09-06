@@ -328,9 +328,15 @@ fine-tuning also is not guaranteed deterministic.
 
 ### Experiment-wide rescore
 
-- `run-experiment` never calls the report stage. There is no `peptides.tsv` or
-  `proteins.tsv` anywhere in its output tree. Per-run counts come from the split
-  scored tables or from `mumdia report` invoked manually.
+- `run-experiment` writes one experiment-wide `peptides.tsv` and `proteins.tsv`
+  at the experiment root (`report::run_experiment`): rows selected on the
+  experiment-wide `peptide_q_value` / `pg_q_value`, an `n_runs` column counting
+  per-run acceptances on `run_psm_q`, and one quantity column per run
+  (`quantity_<run>` from each run's quant, `lfq_<run>` from the cross-run MaxLFQ
+  matrix). It writes no per-run TSVs, because the grouped q columns are written
+  to each group's experiment-wide winner only. Per-run counts come from the
+  split scored tables on `run_psm_q`; `mumdia report --experiment-dir` rewrites
+  the experiment-wide pair at another threshold.
 - `run-experiment` overrides the configured `quant.q_filter` and gates per-run
   quant on the pooled `q_value`. It warns rather than doing so silently.
 - `rescore --competed` accepts many tables, stamps `source` with the index of

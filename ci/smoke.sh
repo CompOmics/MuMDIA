@@ -153,6 +153,12 @@ cp "$work/fixture.mzML" "$work/fixture_b.mzML"
     --run-names a --run-names b \
     --out-dir "$work/exp" --config "$cfg" > "$work/exp.log" 2>&1 \
     || { tail -30 "$work/exp.log"; exit 1; }
+# The experiment-wide report once more, at a looser threshold, through the standalone
+# command: on this fixture the pooled peptide-level q never reaches 1 percent (one decoy
+# peptide against 151 targets is 1.3 percent), so the root pair run-experiment writes is
+# header-only at the default threshold and the rows are asserted on this copy instead.
+"$BIN" report --experiment-dir "$work/exp" --out-dir "$work/exp_report" --q 0.05 \
+    > "$work/exp_report.log" 2>&1 || { tail -20 "$work/exp_report.log"; exit 1; }
 
 # 6. Assertions.
 echo "=== smoke: assertions"

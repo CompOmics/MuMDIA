@@ -1522,15 +1522,15 @@ function renderResults(s) {
   } else if (r && r.experiment_wide) {
     // Not a caveat, a unit change. `run-experiment` groups the q columns across the
     // whole experiment, so these counts are experiment-wide and a per-file reading of
-    // them is diluted by roughly 1/n_runs. It also never calls the report stage, so
-    // there is no peptides.tsv or proteins.tsv to fall back on.
+    // them is diluted by roughly 1/n_runs. Its peptides.tsv and proteins.tsv are the
+    // experiment-wide report, with one quantity column per run.
     banner(
       $("res-warn"),
       "These are EXPERIMENT-WIDE counts, pooled across every run, not per file. " +
         "An experiment-wide rescore groups the q values across the whole experiment, " +
         "so dividing by the number of runs does not give a per-file number; the " +
-        "per-file unit is run_psm_q in the split tables. This mode writes no " +
-        "peptides.tsv or proteins.tsv."
+        "per-file unit is run_psm_q in the split tables. peptides.tsv and proteins.tsv " +
+        "here are the experiment-wide report, with one quantity column per run."
     );
   } else {
     banner($("res-warn"), "");

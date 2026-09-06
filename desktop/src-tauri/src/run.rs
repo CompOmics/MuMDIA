@@ -681,9 +681,9 @@ fn scan_stages(dir: &Path) -> Vec<Stage> {
 /// Read the results panel out of the scored table's report.
 fn read_results(dir: &Path) -> Option<Results> {
     // A single `run` writes `psms_scored.parquet`; a pooled `run-experiment` writes
-    // `scored_combined.parquet` and no report stage at all, so there is no
-    // `peptides.tsv` or `proteins.tsv` anywhere in its tree. Reading only the first
-    // name left the results screen blank after every experiment.
+    // `scored_combined.parquet` (its counts) plus an experiment-wide `peptides.tsv`
+    // and `proteins.tsv` at the root, one quantity column per run. Reading only the
+    // first name left the results screen blank after every experiment.
     let (path, experiment_wide) = {
         let single = dir.join("psms_scored.parquet.report.json");
         if single.is_file() {
