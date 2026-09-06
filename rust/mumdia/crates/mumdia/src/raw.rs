@@ -478,6 +478,30 @@ fn stem_is_ambiguous(dir: &Path, stem: &str, this: &Path) -> bool {
 /// otherwise (a read-only share being the ordinary case). With
 /// `convert.reuse_converted` an mzML already sitting beside the input and newer
 /// than it is used as-is.
+/// Name the missing `.wiff.scan` when a SCIEX conversion fails without one.
+///
+/// SCIEX keeps the spectra in a `.wiff.scan` companion beside the `.wiff`; the `.wiff`
+/// alone holds metadata and chromatograms, so a `.wiff` downloaded on its own converts to
+/// nothing. msconvert reports that as `[ExperimentImpl::initializeBPC()] Error processing
+/// ... Could not open data stream. Is a required 'scan' file missing?` (measured
+/// 2026-09-06 on PRIDE-archived `.wiff` files that had no companion), which does not name
+/// the file. `.wiff2` carries its own data and gets no hint.
+fn sciex_scan_hint(src: &Path) -> Option<String> {
+    let name = src.file_name()?.to_string_lossy().into_owned();
+    if !name.to_ascii_lowercase().ends_with(".wiff") {
+        return None;
+    }
+    let scan = src.with_file_name(format!("{name}.scan"));
+    if scan.exists() {
+        return None;
+    }
+    Some(format!(
+        "\n\nNo {} beside the input. SCIEX stores the spectra in that companion file and \
+         msconvert cannot convert a .wiff without it; copy both files together.",
+        scan.display()
+    ))
+}
+
 /// The name a conversion writes to before the rename to `out_name`.
 ///
 /// The marker sits in the stem and the `.mzML` extension stays last, because both
@@ -719,14 +743,20 @@ msconvert was not usable either: {e}"
         .with_context(|| format!("waiting for {}", exe.display()))?;
     if !status.success() {
         let _ = std::fs::remove_file(&tmp);
+        let hint = if vendor == Vendor::Sciex {
+            sciex_scan_hint(src).unwrap_or_default()
+        } else {
+            String::new()
+        };
         bail!(
-            "{} failed ({}). Last output:\n{}",
+            "{} failed ({}). Last output:\n{}{}",
             exe.file_name().unwrap_or_default().to_string_lossy(),
             status
                 .code()
                 .map(|c| format!("exit {c}"))
                 .unwrap_or_else(|| "killed by a signal".into()),
-            tail.join("\n")
+            tail.join("\n"),
+            hint
         );
     }
     // A zero exit with no file is a real outcome, not a hypothetical: both
@@ -765,6 +795,27 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    #[test]
+    fn a_wiff_without_its_scan_companion_gets_a_named_hint() {
+        // msconvert's own message for this is "Is a required 'scan' file missing?", which
+        // names no file; the hint names the one that is missing, and only for `.wiff`.
+        let d = tmp("wiff_scan_hint");
+        let wiff = d.join("run.wiff");
+        std::fs::write(&wiff, b"").unwrap();
+        let hint = sciex_scan_hint(&wiff).expect("a lone .wiff must produce a hint");
+        assert!(hint.contains("run.wiff.scan"), "{hint}");
+        std::fs::write(d.join("run.wiff.scan"), b"").unwrap();
+        assert!(
+            sciex_scan_hint(&wiff).is_none(),
+            "companion present: no hint"
+        );
+        assert!(
+            sciex_scan_hint(&d.join("run.wiff2")).is_none(),
+            ".wiff2 needs none"
+        );
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]
