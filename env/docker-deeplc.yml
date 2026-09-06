@@ -16,12 +16,15 @@ dependencies:
   - python=3.11
   - pip
   # setuptools >= 83.0.0 closes PYSEC-2026-3447 (CVE-2026-59890: FileList ignored
-  # MANIFEST.in exclusion patterns). Pinned here because the CI audit runs against
-  # the RESOLVED environment, and a solve that carried 81.0.0 failed the main branch
-  # on 2026-09-06.
+  # MANIFEST.in exclusion patterns). The CI audit runs against the RESOLVED
+  # environment, and this conda pin alone did not hold: torch 2.12.1 declared
+  # `setuptools<82`, so pip downgraded the conda-installed 84.0.0 to 81.0.0 underneath
+  # it (main, 2026-09-06). torch 2.14.0 declares `setuptools>=77.0.3`, and the pip
+  # section repeats the floor so pip cannot undo it again.
   - setuptools>=83
   - pip:
       - --extra-index-url https://download.pytorch.org/whl/cpu
-      - torch==2.12.1+cpu
+      - torch==2.14.0+cpu
+      - setuptools>=83
       - pyarrow
       - deeplc==4.1.1

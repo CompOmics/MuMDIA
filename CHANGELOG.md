@@ -192,6 +192,15 @@ produces bit-identical results.
 
 ### Changed
 
+- CPU PyTorch in the three DeepLC-bearing environment sets (`env/docker-deeplc.yml`,
+  `env/mumdia-deeplc.yml`, `env/console-requirements.txt`) moves from `2.12.1+cpu` to
+  `2.14.0+cpu`, the first version whose metadata allows a `setuptools` without
+  PYSEC-2026-3447 (`>=77.0.3` instead of `<82`). Resolved on 2026-09-06 with
+  `deeplc==4.1.1`: numpy 2.4.6, pandas 2.3.3, psm-utils 1.5.5, scikit-learn 1.9.0,
+  setuptools 84.0.0, i.e. the same scientific stack as before with only torch
+  changed. DeepLC 4.1.1 declares `torch<3,>=2.6.0`. Neural-network training is not
+  bit-deterministic across torch versions, so expect seed-level, not result-level,
+  differences in `nn_torch` rescoring.
 - CI now enforces the full stated gate: `cargo fmt --check` and
   `cargo clippy --workspace --all-targets -- -D warnings` in addition to the
   build and tests, plus `python -m compileall` over the sidecars, a JSON parse of
@@ -238,9 +247,12 @@ produces bit-identical results.
 - The sidecar environment specifications pin `setuptools>=83`. The CI audit of the
   resolved DeepLC environment found `setuptools 81.0.0` (PYSEC-2026-3447,
   CVE-2026-59890, fixed in 83.0.0) and failed the main branch after the merge of #54.
-  The audit step is now advisory on pushes to main as well as on pull requests, as
-  its comment already intended; the weekly scheduled run and a manual dispatch stay
-  strict.
+  The conda-level pin alone did not hold: `torch 2.12.1` declares `setuptools<82`, so
+  pip downgraded the conda-installed 84.0.0 to 81.0.0 underneath it. torch is now
+  2.14.0 (see Changed) and the floor is repeated in the pip sections and in the
+  desktop requirement set. The audit step is advisory on pushes to main as well as
+  on pull requests, as its comment already intended; the weekly scheduled run and a
+  manual dispatch stay strict.
 - A single malformed retention time in an mzML aborted the whole run. `convert`
   validated peak m/z and intensity but not the scan start time, so one `NaN` value
   passed unchecked into the spectra artifact and then panicked inside extract with
