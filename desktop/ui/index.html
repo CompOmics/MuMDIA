@@ -190,22 +190,22 @@
         <div class="rule"></div>
         <div class="card-title">Several files selected</div>
         <label class="check">
-          <input type="radio" name="runmode" id="runmode-separate" value="separate" checked />
+          <input type="radio" name="runmode" id="runmode-experiment" value="experiment" checked />
           <span>
-            <b>Search each separately</b> — one search per file, into its own subfolder.
-            The files share nothing.
+            <b>One experiment</b> (default) — a single pooled rescore across all runs, with
+            match-between-runs and cross-run quantification.
+            <span class="hint inline">
+              The FDR is estimated across the whole experiment rather than per file, so
+              the reported counts are experiment-wide; the per-file unit is
+              <code>run_psm_q</code> in the split tables. It writes no per-file report.
+            </span>
           </span>
         </label>
         <label class="check">
-          <input type="radio" name="runmode" id="runmode-experiment" value="experiment" />
+          <input type="radio" name="runmode" id="runmode-separate" value="separate" />
           <span>
-            <b>One experiment</b> — a single pooled rescore across all runs, with
-            match-between-runs and cross-run quantification.
-            <span class="hint inline">
-              This is not the same analysis: the FDR is estimated across the whole
-              experiment rather than per file, so the reported counts are
-              experiment-wide. It writes no per-file report.
-            </span>
+            <b>Search each separately</b> — one search per file, into its own subfolder.
+            The files share nothing, and the counts are not additive.
           </span>
         </label>
       </div>

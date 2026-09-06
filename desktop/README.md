@@ -231,8 +231,10 @@ clean-room boundary is unchanged.
 ## Several files
 
 The Spectra picker takes a list. One file is an ordinary search; several mean one of
-two different analyses, and the interface makes you choose because conflating them
-would be a scientific error rather than a UI simplification.
+two different analyses, and the interface shows the choice because conflating them
+would be a scientific error rather than a UI simplification. **One experiment is the
+default**: files provided together are rescored together, which is also what
+`mumdia run` does with several `--mzml`. Searching each separately is the opt-in.
 
 **Search each separately** runs one `run` per file into its own numbered subfolder,
 queued in the frontend. Sequential rather than parallel on purpose: a search already

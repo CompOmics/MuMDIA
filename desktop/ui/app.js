@@ -49,7 +49,7 @@ const state = {
   libSrc: "builtin",
   buildingLibrary: false,
   // "separate" = one search per file; "experiment" = one pooled run-experiment.
-  runMode: "separate",
+  runMode: "experiment",
   // Batch progress: which file of how many, and what each one produced.
   batch: null,
   diannOffer: null,

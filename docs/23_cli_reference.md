@@ -49,7 +49,7 @@ Commands:
   rescore         Rescore + native target-decoy q-values -> psms_scored.parquet
   quant           Quantify identified peptides + roll up to protein groups
   quant-lfq       Combine per-run quant tables into a protein-by-run matrix (cross-run LFQ)
-  run             Orchestrate the full MVP pipeline on one run and write a manifest
+  run             Orchestrate the full pipeline on one run and write a manifest. Given several --mzml, the files are searched as ONE pooled experiment (`run-experiment`: one combined rescore, per-run quant, cross-run LFQ), which is the default treatment of a multi-file input; use `run-experiment` directly for run names
   run-experiment  Experiment-wide orchestrator: run the per-file search chain over N runs, then one combined rescore, optional rescuable MBR transfer, per-run quant, and cross-run LFQ. Pass --mzml once per run (>= 2)
   align           Cross-run RT alignment (experiment-level) -> alignment.parquet
   mbr             Match-between-runs identification transfer (Stage D3) -> transferred.parquet
@@ -141,7 +141,7 @@ first sentence of the description, with the full text in the section below.
 | [`rescore`](#rescore) | yes | Rescore + native target-decoy q-values -> psms_scored.parquet |
 | [`quant`](#quant) | yes | Quantify identified peptides + roll up to protein groups |
 | [`quant-lfq`](#quant-lfq) | no | Combine per-run quant tables into a protein-by-run matrix (cross-run LFQ) |
-| [`run`](#run) | yes | Orchestrate the full MVP pipeline on one run and write a manifest |
+| [`run`](#run) | yes | Orchestrate the full pipeline on one run and write a manifest. |
 | [`run-experiment`](#run-experiment) | yes | Experiment-wide orchestrator: run the per-file search chain over N runs, then one combined rescore, optional rescuable MBR transfer, per-run quant, and cross-run LFQ. |
 | [`align`](#align) | yes | Cross-run RT alignment (experiment-level) -> alignment.parquet |
 | [`mbr`](#mbr) | yes | Match-between-runs identification transfer (Stage D3) -> transferred.parquet |
@@ -463,7 +463,7 @@ Plus the 5 repeated flags removed above: see "Global flags".
 ## run
 
 ```text
-Orchestrate the full MVP pipeline on one run and write a manifest
+Orchestrate the full pipeline on one run and write a manifest. Given several --mzml, the files are searched as ONE pooled experiment (`run-experiment`: one combined rescore, per-run quant, cross-run LFQ), which is the default treatment of a multi-file input; use `run-experiment` directly for run names
 
 Usage: mumdia run [OPTIONS] --mzml <MZML> --out-dir <OUT_DIR>
 
@@ -472,6 +472,7 @@ Options:
           FASTA to digest into the library. Omit when supplying a prebuilt library via --lib-precursors + --lib-fragments (library-input mode)
 
       --mzml <MZML>
+          Spectra file. Repeat the flag for several files; they are then rescored together as one experiment rather than searched separately
 
       --out-dir <OUT_DIR>
 

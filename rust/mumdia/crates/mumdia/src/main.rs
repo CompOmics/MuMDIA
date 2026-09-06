@@ -294,14 +294,19 @@ enum Cmd {
         #[arg(long)]
         out: String,
     },
-    /// Orchestrate the full MVP pipeline on one run and write a manifest.
+    /// Orchestrate the full pipeline on one run and write a manifest. Given several
+    /// --mzml, the files are searched as ONE pooled experiment (`run-experiment`:
+    /// one combined rescore, per-run quant, cross-run LFQ), which is the default
+    /// treatment of a multi-file input; use `run-experiment` directly for run names.
     Run {
         /// FASTA to digest into the library. Omit when supplying a prebuilt
         /// library via --lib-precursors + --lib-fragments (library-input mode).
         #[arg(long)]
         fasta: Option<String>,
-        #[arg(long)]
-        mzml: String,
+        /// Spectra file. Repeat the flag for several files; they are then rescored
+        /// together as one experiment rather than searched separately.
+        #[arg(long, required = true)]
+        mzml: Vec<String>,
         #[arg(long)]
         out_dir: String,
         /// Library-input mode: consume a prebuilt precursor library (e.g. an
@@ -1197,17 +1202,41 @@ fn main() -> Result<()> {
             if let Some(pf) = &profile {
                 cfg.apply_profile(pf)?;
             }
-            stages::run::run(stages::run::RunParams {
-                config: &cfg,
-                config_path: config.as_deref(),
-                fasta: fasta.as_deref(),
-                mzml: &mzml,
-                out_dir: &out_dir,
-                lib_precursors: lib_precursors.as_deref(),
-                lib_fragments: lib_fragments.as_deref(),
-                max_spectra,
-                top_peaks_ms2,
-            })?;
+            if mzml.len() > 1 {
+                // Files provided together are rescored together. Searching them one by
+                // one would give N unrelated FDR estimates and count a peptide found in
+                // three files three times; pooling is the default and the separate
+                // searches are the opt-in (`run` once per file).
+                tracing::info!(
+                    runs = mzml.len(),
+                    "run: several --mzml given; searching them as one pooled experiment \
+                     (run-experiment: combined rescore, per-run quant, cross-run LFQ)"
+                );
+                stages::run_experiment::run(stages::run_experiment::RunExperimentParams {
+                    config: &cfg,
+                    config_path: config.as_deref(),
+                    fasta: fasta.as_deref(),
+                    mzmls: &mzml,
+                    run_names: None,
+                    out_dir: &out_dir,
+                    lib_precursors: lib_precursors.as_deref(),
+                    lib_fragments: lib_fragments.as_deref(),
+                    max_spectra,
+                    top_peaks_ms2,
+                })?;
+            } else {
+                stages::run::run(stages::run::RunParams {
+                    config: &cfg,
+                    config_path: config.as_deref(),
+                    fasta: fasta.as_deref(),
+                    mzml: &mzml[0],
+                    out_dir: &out_dir,
+                    lib_precursors: lib_precursors.as_deref(),
+                    lib_fragments: lib_fragments.as_deref(),
+                    max_spectra,
+                    top_peaks_ms2,
+                })?;
+            }
         }
         Cmd::RunExperiment {
             fasta,

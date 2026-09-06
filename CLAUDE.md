@@ -83,9 +83,12 @@ mzML -> convert ----------------------------------+       v
 
 Key semantics:
 
-- `run` is a single-run orchestrator. It always recomputes and overwrites its
-  named outputs; the manifest is provenance, not a cache or resume database.
-  Use a fresh output directory.
+- `run` is a single-run orchestrator when given one `--mzml`; given several it
+  dispatches to `run-experiment`, because files provided together are rescored
+  together by default (one pooled FDR, per-run quant, cross-run LFQ). Searching
+  files separately is the opt-in: one `run` per file. `run` always recomputes and
+  overwrites its named outputs; the manifest is provenance, not a cache or resume
+  database. Use a fresh output directory.
 - Standalone stages can be reused manually because inputs are path-addressable.
 - Both `convert` and `run` default `--top-peaks-ms2` to `0` (uncapped). The cap
   is destructive: `convert.rs:76-79` keeps only the top N peaks per MS2 spectrum

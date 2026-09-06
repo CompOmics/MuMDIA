@@ -594,7 +594,9 @@ Hard limits of this release:
   artifacts and are always null.
 - **No wildcard or terminal variable modifications.** Both are rejected at
   peptidoform expansion.
-- **`run` processes one mzML file.** Use `run-experiment` for a pooled multi-run
+- **Several files are one experiment by default.** `run` with several `--mzml`, like
+  `run-experiment`, rescores them together; only one `--mzml` is a single-file search.
+  Use `run-experiment` directly for a pooled multi-run
   search.
 - **`run-experiment` does not write the TSV reports.** It never calls the report
   stage, so there is no `peptides.tsv` or `proteins.tsv` anywhere in its output
