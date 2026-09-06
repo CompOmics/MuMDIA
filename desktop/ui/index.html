@@ -69,12 +69,99 @@
       </div>
     </div>
 
+    <div class="card">
+      <div class="card-head">
+        <div>
+          <div class="card-title">
+            Thermo .raw <span class="pill mute" id="thermo-pill">optional</span>
+          </div>
+          <div class="card-sub">
+            MuMDIA reads mzML, so a Thermo .raw is converted first with
+            ThermoRawFileParser (Apache-2.0, from CompOmics). Only needed if you have
+            .raw files.
+          </div>
+        </div>
+        <button class="btn quiet" id="install-thermo">Install</button>
+      </div>
+      <div class="bar" id="thermo-bar" hidden><i></i></div>
+      <p class="hint" id="thermo-where"></p>
+
+      <div class="rule"></div>
+      <div class="card-head">
+        <div>
+          <div class="card-title">
+            Bruker, SCIEX, Agilent, Waters
+            <span class="pill mute" id="msconvert-pill">checking…</span>
+          </div>
+          <div class="card-sub">
+            These go through ProteoWizard <code>msconvert</code>, which MuMDIA does not
+            install: its vendor readers bundle each instrument maker's own libraries
+            under their licence terms, which you accept when you obtain it. Install
+            ProteoWizard yourself and MuMDIA will find it.
+          </div>
+        </div>
+        <button class="btn quiet" id="msconvert-get">Get ProteoWizard</button>
+      </div>
+      <p class="hint" id="msconvert-where"></p>
+      <div id="bruker-note" class="banner warn" hidden></div>
+    </div>
+
     <div class="card logcard" id="install-log-card" hidden>
       <div class="card-title">Installation log</div>
       <pre class="log" id="install-log"></pre>
     </div>
 
     <p class="hint" id="setup-versions"></p>
+
+    <h1 class="section-h">Spectral libraries</h1>
+    <p class="sub">
+      An imported spectral library identifies considerably more peptides than
+      digesting a FASTA with the built-in predictors. If you have DIA-NN, MuMDIA can
+      use your copy of it to predict one from a FASTA.
+    </p>
+
+    <div class="card" id="diann-card">
+      <div class="card-head">
+        <div>
+          <div class="card-title">
+            DIA-NN <span class="pill mute" id="diann-pill">checking…</span>
+          </div>
+          <div class="card-sub" id="diann-sub">
+            Not installed by MuMDIA. Point this at a copy you installed yourself.
+          </div>
+        </div>
+        <button class="btn quiet" id="diann-locate">Locate…</button>
+      </div>
+
+      <div class="notice" id="diann-notice">
+        <div class="notice-title">Licence</div>
+        <p class="notice-body" id="diann-notice-body"></p>
+        <label class="check">
+          <input type="checkbox" id="diann-ack" />
+          I have read this and my use of DIA-NN complies with its licence.
+        </label>
+      </div>
+
+      <p class="hint" id="diann-where"></p>
+
+      <div id="diann-get" hidden>
+        <div class="rule"></div>
+        <div class="card-head">
+          <div>
+            <div class="card-title">Don't have it? Download 1.8.1</div>
+            <div class="card-sub" id="diann-get-sub"></div>
+          </div>
+          <button class="btn quiet" id="diann-download">Download</button>
+        </div>
+        <div class="bar" id="diann-get-bar" hidden><i></i></div>
+        <p class="hint" id="diann-get-step"></p>
+        <div id="diann-get-error" class="banner bad" hidden></div>
+        <div class="card logcard sub-card" id="diann-get-log-card" hidden>
+          <pre class="log" id="diann-get-log"></pre>
+        </div>
+      </div>
+    </div>
+
   </section>
 
   <!-- ─────────────────────────────── Search ─────────────────────────────── -->
@@ -87,8 +174,44 @@
     <div class="card">
       <div class="card-title">Spectra</div>
       <div class="picker">
-        <div class="picked" id="p-mzml">No file selected</div>
-        <button class="btn quiet" data-pick="mzml">Choose mzML…</button>
+        <div class="picked" id="p-mzml">Nothing selected</div>
+        <button class="btn quiet" data-pick="mzml">Add files…</button>
+        <button class="btn quiet" data-pick="mzml_dir">Add folder…</button>
+      </div>
+      <p class="hint">
+        Files for mzML, Thermo <code>.raw</code> or SCIEX <code>.wiff</code>; several at
+        once is fine. A folder for the formats that are directories: Bruker and Agilent
+        <code>.d</code>, and Waters <code>.raw</code>, one at a time.
+      </p>
+
+      <ul class="filelist" id="mzml-list" hidden></ul>
+
+      <div id="multi-mode" hidden>
+        <div class="rule"></div>
+        <div class="card-title">Several files selected</div>
+        <label class="check">
+          <input type="radio" name="runmode" id="runmode-separate" value="separate" checked />
+          <span>
+            <b>Search each separately</b> — one search per file, into its own subfolder.
+            The files share nothing.
+          </span>
+        </label>
+        <label class="check">
+          <input type="radio" name="runmode" id="runmode-experiment" value="experiment" />
+          <span>
+            <b>One experiment</b> — a single pooled rescore across all runs, with
+            match-between-runs and cross-run quantification.
+            <span class="hint inline">
+              This is not the same analysis: the FDR is estimated across the whole
+              experiment rather than per file, so the reported counts are
+              experiment-wide. It writes no per-file report.
+            </span>
+          </span>
+        </label>
+      </div>
+      <div class="notice" id="raw-note" hidden>
+        <div class="notice-title" id="raw-note-title">Vendor format</div>
+        <p class="notice-body" id="raw-note-body"></p>
       </div>
     </div>
 
@@ -104,10 +227,71 @@
           <div class="picked" id="p-fasta">No file selected</div>
           <button class="btn quiet" data-pick="fasta">Choose FASTA…</button>
         </div>
-        <p class="hint">
-          The engine digests the FASTA and predicts the library itself. Simplest to
-          start from, and considerably less sensitive than an imported library.
-        </p>
+
+        <div class="rule"></div>
+        <div class="card-title">How to build the library from it</div>
+        <label class="check">
+          <input type="radio" name="libsrc" id="libsrc-diann" value="diann" />
+          <span>
+            <b>Predict it with DIA-NN</b> — far more sensitive, and done for you before
+            the search starts. Built once per FASTA and reused afterwards.
+            <span class="hint inline" id="libsrc-diann-note"></span>
+          </span>
+        </label>
+        <div id="libsrc-params" hidden>
+      <div class="grid2">
+        <div class="row">
+          <label for="d-missed">Missed cleavages</label>
+          <input type="number" id="d-missed" value="1" min="0" max="5" />
+        </div>
+        <div class="row">
+          <label for="d-threads">Threads</label>
+          <input type="number" id="d-threads" value="8" min="1" max="256" />
+        </div>
+        <div class="row">
+          <label for="d-minlen">Peptide length</label>
+          <input type="number" id="d-minlen" value="7" min="4" max="60" />
+          <span class="dash">to</span>
+          <input type="number" id="d-maxlen" value="30" min="4" max="60" />
+        </div>
+        <div class="row">
+          <label for="d-minz">Charge</label>
+          <input type="number" id="d-minz" value="2" min="1" max="10" />
+          <span class="dash">to</span>
+          <input type="number" id="d-maxz" value="4" min="1" max="10" />
+        </div>
+      </div>
+
+      <label class="check">
+        <input type="checkbox" id="d-cam" checked />
+        Carbamidomethyl on cysteine (fixed)
+      </label>
+      <label class="check">
+        <input type="checkbox" id="d-ox" checked />
+        Oxidation of methionine (variable)
+      </label>
+          <label class="check">
+            <input type="checkbox" id="d-cam" checked />
+            Carbamidomethyl on cysteine (fixed)
+          </label>
+          <label class="check">
+            <input type="checkbox" id="d-ox" checked />
+            Oxidation of methionine (variable)
+          </label>
+          <p class="hint">
+            These decide the search space and are part of the library's identity: change
+            one and a different library is built and cached. MuMDIA imports only these
+            two modifications; precursors carrying others are dropped on conversion.
+          </p>
+        </div>
+
+        <label class="check">
+          <input type="radio" name="libsrc" id="libsrc-builtin" value="builtin" checked />
+          <span>
+            <b>Built-in predictors</b> — the engine digests the FASTA itself. No DIA-NN
+            needed, and considerably less sensitive.
+          </span>
+        </label>
       </div>
 
       <div class="mode" id="mode-library" hidden>
@@ -232,6 +416,16 @@
     <div id="res-warn" class="banner warn" hidden></div>
 
     <div class="kpis" id="kpis"></div>
+
+    <div class="card" id="res-batch-card" hidden>
+      <div class="card-title">Per file</div>
+      <div id="res-files" class="files"></div>
+      <p class="hint">
+        These searches were run separately and share no FDR estimate, so the counts are
+        per file and are not additive: a peptide found in three files is counted three
+        times. Use one experiment if you want a single pooled answer.
+      </p>
+    </div>
 
     <div class="card">
       <div class="card-title">Files</div>

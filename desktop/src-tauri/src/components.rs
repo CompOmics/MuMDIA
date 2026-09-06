@@ -160,6 +160,83 @@ pub fn managed_python(env: Env) -> PathBuf {
     }
 }
 
+/// Point an engine child process at every tool this application manages.
+///
+/// # Why this is needed at all
+///
+/// The engine resolves `"auto"` interpreters from `MUMDIA_PYTHON_*`, then an
+/// activated conda/virtualenv, then `PATH` (`python.rs::candidates`). It does not
+/// know about this application's data directory and should not: the engine is
+/// usable without it.
+///
+/// So without this, an environment installed by the Setup screen was invisible to
+/// every search it was installed for. `preflight` reported the components ready,
+/// the run started, and the engine's own discovery fell through to whatever
+/// `python` happened to be on `PATH` -- which is either absent, or present and
+/// lacking DeepLC and torch. Under `rescore.strict = true` that is a failure hours
+/// in; without it, a silent downgrade to `native_tda`.
+///
+/// Every engine invocation must go through this, `doctor` included, or the
+/// application asks one question of an engine that can see the environment and
+/// another of one that cannot, and gets inconsistent answers.
+pub fn stamp_env(cmd: &mut std::process::Command) {
+    // Per-role rather than the blanket `MUMDIA_PYTHON`, because the two
+    // environments are not interchangeable: MS2PIP cannot share the primary one.
+    let primary = managed_python(Env::Primary);
+    if primary.is_file() {
+        for var in [
+            "MUMDIA_PYTHON_RESCORE",
+            "MUMDIA_PYTHON_DEEPLC",
+            "MUMDIA_PYTHON_MBR",
+        ] {
+            cmd.env(var, &primary);
+        }
+    }
+    let ms2pip = managed_python(Env::Ms2pip);
+    if ms2pip.is_file() {
+        cmd.env("MUMDIA_PYTHON_MS2PIP", &ms2pip);
+    }
+    // The Thermo .raw converter -- but only if it RUNS.
+    //
+    // The engine accepts `MUMDIA_THERMO_PARSER` on `is_file()` alone
+    // (`raw::locate`), and `ensure_mzml` falls back to msconvert only when locating
+    // the Thermo parser returns an error. So exporting a half-unpacked or
+    // non-startable converter made `locate_parser` succeed, which made the msconvert
+    // fallback unreachable and killed the run inside a converter that never worked --
+    // while `ConvertConfig::msconvert`'s own documentation promises it is "the Thermo
+    // fallback when no ThermoRawFileParser is found".
+    if let Some(p) = runnable_thermo_parser() {
+        cmd.env("MUMDIA_THERMO_PARSER", p);
+    }
+}
+
+/// Where a managed ThermoRawFileParser is unpacked.
+pub fn thermo_dir() -> PathBuf {
+    data_dir().join("ThermoRawFileParser")
+}
+
+/// The managed ThermoRawFileParser, but only when it actually executes.
+///
+/// `thermo_parser` answers "is it on disk", which is the right question for showing
+/// install state. This answers "will it convert", which is the only question worth
+/// putting in an environment variable the engine treats as an explicit choice.
+pub fn runnable_thermo_parser() -> Option<PathBuf> {
+    let p = thermo_parser()?;
+    crate::thermo::runs(&p).then_some(p)
+}
+
+/// The managed ThermoRawFileParser executable, if it is installed.
+pub fn thermo_parser() -> Option<PathBuf> {
+    let dir = thermo_dir();
+    for name in ["ThermoRawFileParser.exe", "ThermoRawFileParser"] {
+        let c = dir.join(name);
+        if c.is_file() {
+            return Some(c);
+        }
+    }
+    None
+}
+
 /// Locate `uv`: bundled beside the application first, then whatever is on PATH.
 ///
 /// PATH is accepted because a developer very likely has it already, and refusing to
@@ -613,5 +690,74 @@ mod tests {
             "ms2pip==4.0.0 needs sqlalchemy<2 and deeplc==4.1.1 needs sqlalchemy>=2;              they cannot share an environment"
         );
         assert!(MS2PIP_MODULES.contains(&"ms2pip"));
+    }
+
+    #[test]
+    fn the_engine_environment_names_every_role_the_engine_reads() {
+        // The bug this guards: the Setup screen installed an environment the engine
+        // could not see. The engine resolves `"auto"` from `MUMDIA_PYTHON_*`, an
+        // activated conda/virtualenv, then PATH -- never this application's data
+        // directory -- so without a stamped environment the managed interpreter was
+        // invisible to every search it was installed for, and the engine fell
+        // through to whatever `python` was on PATH.
+        //
+        // Asserted against the same role list the engine defines, so a new role
+        // cannot be added there and silently left unstamped here.
+        let mut cmd = std::process::Command::new("cmd-that-is-never-run");
+        stamp_env(&mut cmd);
+
+        let stamped: Vec<String> = cmd
+            .get_envs()
+            .filter_map(|(k, v)| v.map(|_| k.to_string_lossy().into_owned()))
+            .collect();
+
+        // Only meaningful once something is installed; on a bare machine there is
+        // nothing to point at and stamping nothing is correct.
+        if managed_python(Env::Primary).is_file() {
+            for var in [
+                "MUMDIA_PYTHON_RESCORE",
+                "MUMDIA_PYTHON_DEEPLC",
+                "MUMDIA_PYTHON_MBR",
+            ] {
+                assert!(
+                    stamped.iter().any(|s| s == var),
+                    "the primary environment must be stamped as {var}: {stamped:?}"
+                );
+            }
+            // MS2PIP must NOT get the primary interpreter: the two environments are
+            // not interchangeable, which is why there are two.
+            assert!(
+                !stamped.iter().any(|s| s == "MUMDIA_PYTHON_MS2PIP")
+                    || managed_python(Env::Ms2pip).is_file(),
+                "MS2PIP was stamped without its own environment existing"
+            );
+            // The blanket variable would apply the primary interpreter to MS2PIP too.
+            assert!(
+                !stamped.iter().any(|s| s == "MUMDIA_PYTHON"),
+                "the blanket MUMDIA_PYTHON must not be used: {stamped:?}"
+            );
+        }
+        if thermo_parser().is_some() {
+            assert!(stamped.iter().any(|s| s == "MUMDIA_THERMO_PARSER"));
+        }
+    }
+
+    #[test]
+    fn nothing_installed_means_nothing_is_stamped() {
+        // A stamped variable pointing at a path that does not exist would be worse
+        // than no variable: the engine treats an explicit interpreter as a
+        // deliberate choice and fails on it rather than searching on.
+        let mut cmd = std::process::Command::new("cmd-that-is-never-run");
+        stamp_env(&mut cmd);
+        for (k, v) in cmd.get_envs() {
+            let Some(v) = v else { continue };
+            let key = k.to_string_lossy();
+            if key.starts_with("MUMDIA_") {
+                assert!(
+                    std::path::Path::new(v).is_file(),
+                    "{key} was stamped with {v:?}, which is not a file"
+                );
+            }
+        }
     }
 }

@@ -134,7 +134,14 @@ pub fn save(name: &str, flat: BTreeMap<String, serde_json::Value>) -> Result<Str
 /// make every configuration look invalid until the components are installed.
 pub fn validate(config_path: &str) -> Result<(), String> {
     let (exe, _) = crate::engine::resolve()?;
-    let out = crate::engine::command(&exe)
+    // The same environment every other engine invocation gets. This was the one
+    // spawn site that omitted it, which breaks the invariant `stamp_env`'s own doc
+    // states: validating a configuration against an engine that cannot see the
+    // managed interpreters answers a different question from the one the run will
+    // ask, and would report a perfectly good sidecar configuration as unusable.
+    let mut cmd = crate::engine::command(&exe);
+    crate::components::stamp_env(&mut cmd);
+    let out = cmd
         .args(["doctor", "--config", config_path, "--json"])
         .output()
         .map_err(|e| format!("could not run the engine: {e}"))?;

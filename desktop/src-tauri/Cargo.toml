@@ -24,3 +24,15 @@ tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Fetching the one pinned DIA-NN release the user may opt into. `ureq` rather than
+# `reqwest` because this is a single blocking download on a background thread and
+# does not justify pulling in tokio; rustls rather than native-tls so the Linux
+# bundle does not acquire an OpenSSL runtime dependency.
+ureq = { version = "3", default-features = false, features = ["rustls"] }
+# The downloaded bytes are executed, so they are checksummed against a pinned
+# digest first.
+sha2 = "0.10"
+# Unpacking the ThermoRawFileParser release, which is a zip. Pure Rust, and
+# `deflate` only: shelling out would mean `unzip` on Linux and `tar`/PowerShell on
+# Windows, neither of which is guaranteed present.
+zip = { version = "2", default-features = false, features = ["deflate"] }
