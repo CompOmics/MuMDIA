@@ -235,6 +235,12 @@ produces bit-identical results.
 
 ### Fixed
 
+- The sidecar environment specifications pin `setuptools>=83`. The CI audit of the
+  resolved DeepLC environment found `setuptools 81.0.0` (PYSEC-2026-3447,
+  CVE-2026-59890, fixed in 83.0.0) and failed the main branch after the merge of #54.
+  The audit step is now advisory on pushes to main as well as on pull requests, as
+  its comment already intended; the weekly scheduled run and a manual dispatch stay
+  strict.
 - A single malformed retention time in an mzML aborted the whole run. `convert`
   validated peak m/z and intensity but not the scan start time, so one `NaN` value
   passed unchecked into the spectra artifact and then panicked inside extract with
