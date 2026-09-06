@@ -302,7 +302,7 @@ jobs:
           python -m pip install --quiet pip-audit
           # NOT --strict, and the reason is specific rather than a shrug. --strict
           # fails when a package cannot be resolved on PyPI at all, and `torch` is
-          # installed from the PyTorch index as `2.12.1+cpu`, a local version that by
+          # installed from the PyTorch index as `2.14.0+cpu`, a local version that by
           # construction does not exist on PyPI. That is not a finding, it is how CPU
           # torch is distributed, and failing on it would train everyone to ignore
           # this job. Real advisories still fail the run.

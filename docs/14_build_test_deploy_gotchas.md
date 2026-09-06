@@ -49,9 +49,9 @@ configurations in `configs/`, the container definition in `Dockerfile` +
 | `docker/config.dia.json` | Baked FASTA-digest config (MS2PIP + DeepLC + strict mokapot wired to in-image envs) |
 | `docker/config.diann-lib.json` | Baked library-input config (per-run RT calibration of the library iRT, no fine-tune; strict NnTorch through the torch-capable DeepLC env) |
 | `env/docker-rescore.yml` | Conda spec for the in-image `rescore` env (`python=3.11`, `mokapot==0.10.0` + `ms2pip==4.0.0.dev9`) |
-| `env/docker-deeplc.yml` | Conda spec for the in-image `deeplc` env (`python=3.11`, `torch==2.12.1+cpu` + `deeplc==4.1.1` from PyPI) |
+| `env/docker-deeplc.yml` | Conda spec for the in-image `deeplc` env (`python=3.11`, `torch==2.14.0+cpu` + `deeplc==4.1.1` from PyPI) |
 | `env/mumdia-rescore.yml` | Minimal host env for the default mokapot rescorer only (`python=3.12`, no torch/DeepLC/MS2PIP) |
-| `env/mumdia-deeplc.yml` | Host env for the DeepLC sidecars (`python=3.11`, `torch==2.12.1+cpu`, `deeplc==4.1.1`, `psm-utils`, `pyarrow`) |
+| `env/mumdia-deeplc.yml` | Host env for the DeepLC sidecars (`python=3.11`, `torch==2.14.0+cpu`, `deeplc==4.1.1`, `psm-utils`, `pyarrow`) |
 | `configs/examples/*.json` | Portable example configs (`native`, `fasta-sidecars`, `diann-library`), all using `"auto"` interpreters |
 | `rust/mumdia/crates/mumdia/src/sidecar.rs` | Sidecar subprocess clients + `resolve_script` path resolution |
 | `rust/mumdia/crates/mumdia/src/main.rs` | Thin CLI + global flags (`--threads`, `--log-level`, `-v`, `-q`); `doctor` reports whether the config can run (`main.rs:438`) |
@@ -464,7 +464,7 @@ The two conda envs both pin `python=3.11` on purpose: mokapot and MS2PIP pull
 (`docker-deeplc.yml:11`). The `rescore` env anchors only the two tools
 (`mokapot==0.10.0`, `ms2pip==4.0.0.dev9`) plus `numpy<2`/`pyarrow`/`scikit-learn`,
 leaving their scientific-Python graph to pip (`docker-rescore.yml:16-21`). The
-`deeplc` env installs `torch==2.12.1+cpu` from the PyTorch CPU index-url plus
+`deeplc` env installs `torch==2.14.0+cpu` from the PyTorch CPU index-url plus
 `deeplc==4.1.1` and `pyarrow` (`docker-deeplc.yml:18-22`); it no longer caps
 `numpy<2`, which 4.1.1 does not require, and the multitask model weight ships
 inside the DeepLC package, so nothing is downloaded at run time.
@@ -741,7 +741,7 @@ do not reintroduce removed knobs. The fields relevant here:
   Python. `configs/README.md` documents the resolution order for users.
 - The pip pins in the two in-image envs are exact and reproducibility-load-bearing:
   `rescore` = `mokapot==0.10.0` + `ms2pip==4.0.0.dev9` + `numpy<2` (rest via pip,
-  `docker-rescore.yml:16-21`); `deeplc` = `torch==2.12.1+cpu` + `deeplc==4.1.1`
+  `docker-rescore.yml:16-21`); `deeplc` = `torch==2.14.0+cpu` + `deeplc==4.1.1`
   from PyPI + `pyarrow` (`docker-deeplc.yml:18-22`), with no `numpy<2` cap, which
   4.1.1 does not require. The two host envs differ:
   `env/mumdia-deeplc.yml` mirrors the image's DeepLC pins and adds `psm-utils`

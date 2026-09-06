@@ -160,7 +160,7 @@ conda env create -f env/mumdia-rescore.yml
 conda env create -f env/mumdia-deeplc.yml
 ```
 
-`env/mumdia-deeplc.yml` pins `deeplc==4.1.1` and `torch==2.12.1+cpu`. DeepLC
+`env/mumdia-deeplc.yml` pins `deeplc==4.1.1` and `torch==2.14.0+cpu`. DeepLC
 4.1.1 is a floor rather than merely the current release: the 4.0.0a2 multitask
 preview overfits per-run fine-tuning badly enough to invert retention-time model
 rankings, so an older version changes results and not only speed.
