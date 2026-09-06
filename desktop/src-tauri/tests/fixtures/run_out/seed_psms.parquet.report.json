@@ -1,0 +1,21 @@
+{
+  "logical_name": "seed_psms",
+  "schema_name": "seed_psms",
+  "schema_version": 1,
+  "stage": "search-seed",
+  "rows": 179,
+  "content_hash": "a12ee0d4627587e8c2dfb7fda55a0258ec4563c3e0067a3c93effa7edbf64686",
+  "params": {
+    "fdr_seed": 0.01,
+    "fragment_tol_ppm": 20.0,
+    "min_matched_peaks": 4,
+    "report_psms": 5,
+    "top_n_peaks": 300
+  },
+  "stats": {
+    "psms": 179,
+    "targets_at_q0.01": 179
+  },
+  "model_identity": "native-seed-hyperscore-v1",
+  "elapsed_ms": 6
+}

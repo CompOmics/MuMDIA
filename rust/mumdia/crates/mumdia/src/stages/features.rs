@@ -1,10 +1,10 @@
-//! Stage E `mumdia features` (PLAN.md Stage E, Section 8.3 enriched catalogue).
+//! Stage E `mumdia features` (docs/10_features.md).
 //! Reads psms_extracted + chromatograms (+ MS1 apex isotopes carried on the
 //! PSM rows) and computes a fixed, named, versioned feature vector per PSM.
 //! The active feature set is config-driven (`minimal` or `rich`); its ordered
 //! list is hashed into a `classifier_feature_schema_id` and written to a
 //! companion `<features>.schema.json` so the classifier input is reproducible
-//! and never applied under a mismatched set (PLAN.md Section 2, 5, 9.1).
+//! and never applied under a mismatched set (docs/02_config_and_data_model.md).
 
 use std::collections::HashMap;
 use std::time::Instant;
@@ -158,7 +158,7 @@ fn extended_values(e: &Evidence) -> Vec<f64> {
     out
 }
 
-/// The minimal feature set (PLAN.md Section 10).
+/// The minimal feature set (docs/10_features.md).
 pub const MINIMAL_FEATURES: &[&str] = &[
     "rt_error_abs",
     "rt_error_rel",
@@ -176,7 +176,7 @@ pub const MINIMAL_FEATURES: &[&str] = &[
     "n_proteins",
 ];
 
-/// Additional features for the `rich`/`standard` set (PLAN.md Section 8.3).
+/// Additional features for the `rich`/`standard` set (docs/10_features.md).
 pub const RICH_EXTRA: &[&str] = &[
     "library_norm_manhattan",
     "library_rmsd",
@@ -360,7 +360,7 @@ struct ChromRow<'a> {
 /// Per-PSM evidence handed to the extended feature families. All arrays are
 /// f64. Fragment-indexed arrays share one order; time-series share `axis`
 /// (elution-peak-bounded) or `axis_full` (whole extracted window). Built once
-/// per PSM by [`build_evidence`], then scalar fields are filled by the caller.
+/// per PSM by `build_evidence`, then scalar fields are filled by the caller.
 /// The family modules in `stages/features/` read this and return feature values.
 pub struct Evidence {
     /// RT axis (seconds) restricted to the detected elution peak.
@@ -479,7 +479,7 @@ fn build_evidence(
     }
 
     let mut axis_full: Vec<f32> = rows.iter().flat_map(|r| r.rt.iter().cloned()).collect();
-    axis_full.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    axis_full.sort_by(|a, b| a.total_cmp(b));
     axis_full.dedup();
     let traces_full: Vec<Vec<f64>> = rows
         .iter()
@@ -503,8 +503,7 @@ fn build_evidence(
             .min_by(|(_, a), (_, b)| {
                 (**a as f64 - apex_rt)
                     .abs()
-                    .partial_cmp(&((**b as f64 - apex_rt).abs()))
-                    .unwrap()
+                    .total_cmp(&(**b as f64 - apex_rt).abs())
             })
             .map(|(i, _)| i)
             .unwrap_or(0);
@@ -512,11 +511,7 @@ fn build_evidence(
             Some((l, r)) => global_bound_indices(&axis_full, apex_rt, ai, l, r),
             None => {
                 let mut ord: Vec<usize> = (0..pred.len()).collect();
-                ord.sort_by(|&a, &b| {
-                    pred[b]
-                        .partial_cmp(&pred[a])
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
+                ord.sort_by(|&a, &b| pred[b].total_cmp(&pred[a]));
                 let k3: Vec<usize> = ord.into_iter().take(3).collect();
                 let prof_raw: Vec<f64> = (0..axis_full.len())
                     .map(|k| k3.iter().map(|&i| traces_full[i][k]).sum::<f64>())
@@ -538,12 +533,7 @@ fn build_evidence(
     let apex_idx = axis
         .iter()
         .enumerate()
-        .min_by(|(_, a), (_, b)| {
-            (*a - apex_rt)
-                .abs()
-                .partial_cmp(&(*b - apex_rt).abs())
-                .unwrap()
-        })
+        .min_by(|(_, a), (_, b)| (*a - apex_rt).abs().total_cmp(&(*b - apex_rt).abs()))
         .map(|(i, _)| i)
         .unwrap_or(0);
 
@@ -626,7 +616,8 @@ fn build_evidence(
 pub struct FeaturesParams<'a> {
     pub psms: &'a str,
     pub chromatograms: &'a str,
-    /// Optional seed_psms for search-engine corroboration features (PLAN.md 8.3).
+    /// Optional seed_psms for search-engine corroboration features
+    /// (docs/10_features.md).
     pub seed: Option<&'a str>,
     pub out: &'a str,
     pub out_pin: &'a str,
@@ -1859,7 +1850,7 @@ fn elution_peak_rt_bounds(
     grace: usize,
 ) -> Option<(f32, f32)> {
     let mut axis: Vec<f32> = rows.iter().flat_map(|r| r.rt.iter().cloned()).collect();
-    axis.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    axis.sort_by(|a, b| a.total_cmp(b));
     axis.dedup();
     if axis.len() < 3 {
         return None;
@@ -1878,12 +1869,7 @@ fn elution_peak_rt_bounds(
         })
         .collect();
     let mut ord: Vec<usize> = (0..rows.len()).collect();
-    ord.sort_by(|&a, &b| {
-        rows[b]
-            .pred_int
-            .partial_cmp(&rows[a].pred_int)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    ord.sort_by(|&a, &b| rows[b].pred_int.total_cmp(&rows[a].pred_int));
     let k3: Vec<usize> = ord.into_iter().take(3).collect();
     let prof_raw: Vec<f64> = (0..axis.len())
         .map(|k| k3.iter().map(|&i| traces[i][k]).sum::<f64>())
@@ -1895,8 +1881,7 @@ fn elution_peak_rt_bounds(
         .min_by(|(_, a), (_, b)| {
             (**a as f64 - apex_rt)
                 .abs()
-                .partial_cmp(&((**b as f64 - apex_rt).abs()))
-                .unwrap()
+                .total_cmp(&(**b as f64 - apex_rt).abs())
         })
         .map(|(i, _)| i)
         .unwrap_or(0);
@@ -1981,7 +1966,7 @@ fn fragment_features(
     // trace-based features below are computed over the peak, not the whole extracted
     // RT window (which spans +/- w_rt and would dilute co-elution/profile scores).
     let mut axis_full: Vec<f32> = rows.iter().flat_map(|r| r.rt.iter().cloned()).collect();
-    axis_full.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    axis_full.sort_by(|a, b| a.total_cmp(b));
     axis_full.dedup();
     let traces_full: Vec<Vec<f64>> = rows
         .iter()
@@ -2005,8 +1990,7 @@ fn fragment_features(
             .min_by(|(_, a), (_, b)| {
                 (**a as f64 - apex_rt)
                     .abs()
-                    .partial_cmp(&((**b as f64 - apex_rt).abs()))
-                    .unwrap()
+                    .total_cmp(&(**b as f64 - apex_rt).abs())
             })
             .map(|(i, _)| i)
             .unwrap_or(0);
@@ -2014,11 +1998,7 @@ fn fragment_features(
             Some((l, r)) => global_bound_indices(&axis_full, apex_rt, ai, l, r),
             None => {
                 let mut ord: Vec<usize> = (0..pred.len()).collect();
-                ord.sort_by(|&a, &b| {
-                    pred[b]
-                        .partial_cmp(&pred[a])
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
+                ord.sort_by(|&a, &b| pred[b].total_cmp(&pred[a]));
                 let k3: Vec<usize> = ord.into_iter().take(3).collect();
                 let prof_raw: Vec<f64> = (0..axis_full.len())
                     .map(|k| k3.iter().map(|&i| traces_full[i][k]).sum::<f64>())
@@ -2096,7 +2076,14 @@ fn fragment_features(
         // pResCorr proxy: co-elution of the low-predicted-intensity fragments.
         // Real peptides show their minor fragments co-eluting; chimeras do not.
         let mut order: Vec<usize> = (0..pred.len()).collect();
-        order.sort_by(|&a, &b| pred[a].partial_cmp(&pred[b]).unwrap());
+        // `unwrap_or(Equal)`, matching the two other sorts of this same array in this file.
+        // The bare `unwrap()` here panicked on a non-finite predicted intensity, inside a
+        // rayon closure and after extract, so one NULL cell in a library discarded the most
+        // expensive stage in the pipeline with a message that named neither the column nor
+        // the row. Library load now rejects non-finite intensities, which is the real fix;
+        // this keeps the three sorts consistent so the next reader does not have to work
+        // out why one of them differed.
+        order.sort_by(|&a, &b| pred[a].total_cmp(&pred[b]));
         let take = (order.len() / 2).max(1);
         let low: Vec<f64> = order.iter().take(take).map(|&i| rc[i]).collect();
         f.low_frag_coel = mean(&low);
@@ -2169,7 +2156,7 @@ fn fragment_features(
     let noise = if all_points.is_empty() {
         1.0
     } else {
-        all_points.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        all_points.sort_by(|a, b| a.total_cmp(b));
         all_points[all_points.len() / 2].max(1.0)
     };
     f.log_sn = ((apex_val + 1.0) / (noise + 1.0)).ln();

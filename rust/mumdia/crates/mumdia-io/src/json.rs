@@ -1,15 +1,20 @@
-//! JSON read/write for scalars, config, and reports (PLAN.md Section 3.3).
+//! JSON read/write for scalars, config, and reports (docs/03_io_layer.md).
 
 use anyhow::{Context, Result};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
+/// Write JSON atomically: to a sibling temp file, then rename.
+///
+/// Same contract as the parquet writers (`table::AtomicPath`). It matters most for
+/// `manifest.json`, which is the provenance record: a half-written manifest is worse
+/// than none, because it parses far enough to look authoritative.
 pub fn write_json<T: Serialize>(path: &str, value: &T) -> Result<()> {
-    if let Some(parent) = std::path::Path::new(path).parent() {
-        std::fs::create_dir_all(parent).ok();
-    }
+    let target = crate::table::AtomicPath::new(path)?;
     let s = serde_json::to_string_pretty(value)?;
-    std::fs::write(path, s).with_context(|| format!("writing json {path}"))?;
+    std::fs::write(target.tmp(), s)
+        .with_context(|| format!("writing json {}", target.tmp().display()))?;
+    target.publish()?;
     Ok(())
 }
 

@@ -1,8 +1,9 @@
-//! MuMDIA CLI: one binary, one subcommand per stage (PLAN.md Section 3.1, 3.5).
+//! MuMDIA CLI: one binary, one subcommand per stage (docs/01_overview_and_dataflow.md).
 //! Every stage runs standalone on path-addressable inputs.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use mumdia::python;
 use mumdia::stages;
 use mumdia_core::config::Config;
 
@@ -29,6 +30,72 @@ static GLOBAL: dhat::Alloc = dhat::Alloc;
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
+
+    /// Maximum worker threads. Default: every core.
+    ///
+    /// Bounds the engine's rayon pool and is forwarded to the Python sidecars as
+    /// `MUMDIA_NN_THREADS` and `OMP_NUM_THREADS` unless those are already set.
+    /// Without this there was no way to bound MuMDIA at all except the
+    /// undocumented `RAYON_NUM_THREADS`, which the engine never read and which
+    /// does not reach the sidecars; on a shared machine that made a run
+    /// antisocial. Note the NN rescore worker measured FASTER on 8 threads than
+    /// on 32 (docs/13_sidecars.md).
+    #[arg(long, global = true, value_name = "N")]
+    threads: Option<usize>,
+
+    /// Log level: `error`, `warn`, `info` (default), `debug`, or `trace`. Accepts
+    /// any `RUST_LOG` filter, so `mumdia=debug,extract=trace` also works.
+    #[arg(long, global = true, value_name = "LEVEL")]
+    log_level: Option<String>,
+
+    /// More detail: `-v` for debug, `-vv` for trace. Overridden by --log-level.
+    #[arg(short = 'v', long, global = true, action = clap::ArgAction::Count)]
+    verbose: u8,
+
+    /// Warnings and errors only. Overridden by --log-level.
+    #[arg(short = 'q', long, global = true, conflicts_with = "verbose")]
+    quiet: bool,
+}
+
+impl Cli {
+    /// The tracing filter these flags ask for, or `None` to leave `RUST_LOG` in
+    /// charge. `--log-level` is explicit and wins; otherwise the counted `-v` and
+    /// `-q` map onto levels.
+    fn log_filter(&self) -> Option<String> {
+        if let Some(l) = &self.log_level {
+            return Some(l.clone());
+        }
+        match (self.quiet, self.verbose) {
+            (true, _) => Some("warn".into()),
+            (false, 0) => None,
+            (false, 1) => Some("debug".into()),
+            (false, _) => Some("trace".into()),
+        }
+    }
+}
+
+/// Apply `--threads` to the engine's own pool and to the sidecars.
+///
+/// Rayon's global pool can only be built once and only before first use, so this
+/// runs before any subcommand. An existing environment variable is left alone: a
+/// user who set `OMP_NUM_THREADS` for a reason should not have it silently
+/// replaced.
+fn apply_threads(threads: Option<usize>) -> Result<()> {
+    let Some(n) = threads else { return Ok(()) };
+    if n == 0 {
+        anyhow::bail!("--threads must be >= 1");
+    }
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(n)
+        .build_global()
+        .map_err(|e| anyhow::anyhow!("cannot set --threads {n}: {e}"))?;
+    for var in ["MUMDIA_NN_THREADS", "OMP_NUM_THREADS"] {
+        if std::env::var_os(var).is_none() {
+            std::env::set_var(var, n.to_string());
+        }
+    }
+    tracing::info!(threads = n, "threads: engine pool and sidecar hints set");
+    Ok(())
 }
 
 #[derive(Subcommand)]
@@ -94,7 +161,7 @@ enum Cmd {
         #[arg(long)]
         isolation_windows: String,
         #[arg(long)]
-        library_precursors: String,
+        lib_precursors: String,
         /// Per-candidate RT bounds (candidate_id, rt_lo, rt_hi); a run_windows-shaped table.
         #[arg(long)]
         run_windows: String,
@@ -108,9 +175,9 @@ enum Cmd {
         #[arg(long)]
         ms2: String,
         #[arg(long)]
-        library_precursors: String,
+        lib_precursors: String,
         #[arg(long)]
-        library_fragments: String,
+        lib_fragments: String,
         #[arg(long)]
         out: String,
         #[arg(long)]
@@ -121,7 +188,7 @@ enum Cmd {
         #[arg(long)]
         seed_psms: String,
         #[arg(long)]
-        library_precursors: String,
+        lib_precursors: String,
         #[arg(long)]
         out_windows: String,
         #[arg(long)]
@@ -134,9 +201,9 @@ enum Cmd {
         #[arg(long)]
         ms2: String,
         #[arg(long)]
-        library_precursors: String,
+        lib_precursors: String,
         #[arg(long)]
-        library_fragments: String,
+        lib_fragments: String,
         #[arg(long)]
         run_windows: String,
         /// Optional MS1 spectra for isotope-envelope features.
@@ -148,7 +215,7 @@ enum Cmd {
         #[arg(long)]
         out_psms: String,
         #[arg(long)]
-        out_chrom: String,
+        out_chromatograms: String,
         /// Optional candidate allowlist (a prior run's psms.parquet): restrict
         /// extraction to these candidate_ids. For "gate first, then compete" -
         /// re-extract with a peak_claim strategy over only the gate-accepted
@@ -161,12 +228,12 @@ enum Cmd {
     /// Compute the minimal feature set -> features.parquet + PIN.
     Features {
         #[arg(long)]
-        psms: String,
+        psms_extracted: String,
         #[arg(long)]
         chromatograms: String,
         /// Optional seed_psms for search-engine corroboration features.
         #[arg(long)]
-        seed: Option<String>,
+        seed_psms: Option<String>,
         #[arg(long)]
         out: String,
         #[arg(long)]
@@ -289,7 +356,7 @@ enum Cmd {
     Align {
         /// One seed_psms.parquet per run; the first is the reference.
         #[arg(long, num_args = 1..)]
-        seeds: Vec<String>,
+        seed_psms: Vec<String>,
         #[arg(long)]
         out: String,
         #[arg(long)]
@@ -299,16 +366,16 @@ enum Cmd {
     Mbr {
         /// Experiment-wide scored_combined.parquet (has the `source` column).
         #[arg(long)]
-        scored: String,
+        psms_scored: String,
         /// Per-run psms.parquet in `source` order (one per run).
         #[arg(long, num_args = 1..)]
-        psms: Vec<String>,
+        psms_extracted: Vec<String>,
         #[arg(long)]
         out: String,
         /// Optional augmented scored table: input scored with accepted transfers'
         /// q_value lowered + is_transferred flag (for quant/report with q_filter=psm_q).
         #[arg(long)]
-        out_scored: Option<String>,
+        out_psms_scored: Option<String>,
         /// Optional per-run fragment_quant.parquet (source order) for the
         /// fragment-consensus guard (needs mbr.consensus_corr_min > 0).
         #[arg(long, num_args = 0..)]
@@ -318,22 +385,35 @@ enum Cmd {
     },
     /// Print schema, head sample, and row count for any artifact.
     Inspect { artifact: String },
+    /// Peaks per MS2 spectrum for an mzML, as JSON: percentiles plus what each
+    /// candidate `--top-peaks-ms2` cap would discard.
+    ///
+    /// The pre-flight for a decision the documentation says must be made per
+    /// acquisition. Reading it before setting a cap is the difference between
+    /// bounding peak volume and deleting fragment evidence from most spectra.
+    PeakCensus {
+        #[arg(long)]
+        mzml: String,
+        /// Stop after this many spectra from the head of the file (0 = all).
+        #[arg(long, default_value_t = 0)]
+        max_spectra: usize,
+    },
     /// Candidate audit: reconstruct per-candidate stage flags + earliest rejection
     /// reason across the artifact chain and write candidate_audit.parquet
     /// (sensitivity program, P0.3/P0.4). Non-destructive; reruns no compute.
     Audit {
         /// Library precursors parquet (the full candidate search space).
         #[arg(long)]
-        library_precursors: String,
+        lib_precursors: String,
         /// psms parquet from `extract`.
         #[arg(long)]
-        psms: String,
+        psms_extracted: String,
         /// competed parquet from `compete`.
         #[arg(long)]
         competed: String,
         /// scored parquet from `rescore`.
         #[arg(long)]
-        scored: String,
+        psms_scored: String,
         /// Output candidate_audit.parquet.
         #[arg(long)]
         out: String,
@@ -350,126 +430,483 @@ enum Cmd {
     /// Write peptides.tsv + proteins.tsv from a scored PSM table.
     Report {
         #[arg(long)]
-        scored: String,
+        psms_scored: String,
         #[arg(long)]
         out_dir: String,
         #[arg(long)]
         peptide_quant: Option<String>,
         #[arg(long)]
         protein_quant: Option<String>,
-        #[arg(long, default_value_t = 0.01)]
-        q: f64,
+        /// Reported q threshold. Defaults to `quant.q_threshold` from `--config`
+        /// when that is given, otherwise 0.01. An explicit value always wins.
+        #[arg(long)]
+        q: Option<f64>,
+        /// Read `quant.q_threshold` from this config, so a standalone report uses the
+        /// same threshold as the `run` that produced the table.
+        ///
+        /// Without it, a config setting `quant.q_threshold = 0.05` yielded 0.05 from
+        /// `run` and 0.01 from `report` on the same scored table, silently.
+        #[arg(long)]
+        config: Option<String>,
     },
     /// Check that the configured Python sidecar environments are usable.
     Doctor {
         #[arg(long)]
         config: Option<String>,
+        /// Emit the report as JSON on stdout instead of prose on stdout.
+        ///
+        /// For a caller that has to act on the result rather than read it: the
+        /// desktop application renders one row per role and offers to install what
+        /// is missing, which means it needs the modules and versions as data, not a
+        /// paragraph to regex. The exit status is unchanged.
+        #[arg(long)]
+        json: bool,
     },
 }
 
-/// Probe each configured sidecar interpreter for its required packages, so a
-/// broken or missing environment is reported clearly instead of failing mid-run.
-fn doctor(cfg: &Config) -> Result<()> {
-    use mumdia_core::config::RescorerKind;
-    use std::process::Command;
-    // The rescore sidecar's required packages depend on the selected classifier:
-    // the PyTorch NN needs torch; mokapot/entrapment need mokapot + sklearn.
-    let (rescore_label, rescore_pkgs) = match cfg.rescore.classifier {
-        RescorerKind::NnTorch => ("rescore.python (nn_torch)", "torch,numpy,pandas,pyarrow"),
-        _ => (
-            "rescore.python (mokapot)",
-            "mokapot,sklearn,numpy,pandas,pyarrow",
-        ),
-    };
-    let checks = [
-        (rescore_label, cfg.rescore.python.as_deref(), rescore_pkgs),
-        (
-            // The DeepLC interpreter runs both `deeplc_worker.py` (prediction) and
-            // `deeplc_finetune.py` (transfer learning), and the latter imports pyarrow, torch and
-            // psm_utils on top of deeplc itself. Probing only `deeplc,numpy,pandas` let a green
-            // doctor precede a crash at the fine-tune step, which on an experiment-wide batch is
-            // discovered long after the run is launched. DeepLC 4.x pulls torch and psm-utils
-            // itself, so in practice this catches a missing pyarrow, but the check should assert
-            // what the scripts actually import rather than what the dependency tree implies.
-            "predict_frag.deeplc_python (DeepLC)",
-            cfg.predict_frag.deeplc_python.as_deref(),
-            "deeplc,numpy,pandas,pyarrow,torch,psm_utils",
-        ),
-        (
-            "predict_frag.ms2pip_python (MS2PIP)",
-            cfg.predict_frag.ms2pip_python.as_deref(),
-            "ms2pip,numpy,pandas",
-        ),
-    ];
-    let mut bad = false;
-    for (label, py, pkgs) in checks {
-        // DeepLC has a floor, not just a presence check: the default RT workflow calibrates
-        // base-model predictions without a fine-tune, which is only sound from 4.1.1 on.
-        if label.contains("DeepLC") {
-            if let Some(interp) = py {
-                match mumdia::sidecar::module_version(interp, "deeplc") {
-                    Some(v) => {
-                        let ok = mumdia_core::constants::parse_version3(&v)
-                            .is_some_and(|t| t >= mumdia_core::constants::MIN_DEEPLC_VERSION);
-                        let (ma, mi, pa) = mumdia_core::constants::MIN_DEEPLC_VERSION;
-                        if ok {
-                            println!("  [ ok ] {label}: deeplc {v} (>= {ma}.{mi}.{pa})");
-                        } else {
-                            println!("  [FAIL] {label}: deeplc {v} is older than the required {ma}.{mi}.{pa}");
-                            bad = true;
-                        }
-                    }
-                    None => {
-                        println!("  [FAIL] {label}: cannot determine the deeplc version");
-                        bad = true;
-                    }
-                }
-            }
-        }
-        match py {
-            None => println!("  [skip] {label}: not configured (native path used)"),
-            Some(interp) => {
-                let code = format!(
-                    "import importlib.util as u; m=[p for p in '{pkgs}'.split(',') if u.find_spec(p) is None]; print('MISSING '+','.join(m) if m else 'OK')"
-                );
-                match Command::new(interp).args(["-c", &code]).output() {
-                    Ok(o) => {
-                        let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
-                        if o.status.success() && s == "OK" {
-                            println!("  [ ok ] {label}: {interp}");
-                        } else {
-                            bad = true;
-                            let detail = if s.is_empty() {
-                                String::from_utf8_lossy(&o.stderr).trim().to_string()
-                            } else {
-                                s
-                            };
-                            println!("  [FAIL] {label}: {interp}\n         {detail}");
-                        }
-                    }
-                    Err(e) => {
-                        bad = true;
-                        println!("  [FAIL] {label}: cannot run {interp}: {e}");
-                    }
-                }
-            }
-        }
-    }
-    if bad {
-        anyhow::bail!("mumdia doctor: one or more configured sidecar environments are not usable");
-    }
-    println!("mumdia doctor: all configured sidecar environments OK");
-    Ok(())
+/// One sidecar role, as `doctor` found it.
+#[derive(serde::Serialize)]
+struct RoleReport {
+    /// `rescore` | `deeplc` | `ms2pip` | `mbr`
+    role: String,
+    /// The configuration field that names this interpreter.
+    field: String,
+    /// Does THIS configuration need the role at all.
+    required: bool,
+    /// `ok` | `fail` | `skip` | `warn`
+    status: String,
+    python: Option<String>,
+    /// `configured`, an environment variable name, `CONDA_PREFIX`, `PATH`, ...
+    provenance: String,
+    /// What the workers for this role import.
+    modules: Vec<String>,
+    /// Of those, the ones this interpreter cannot import.
+    missing: Vec<String>,
+    /// Versions of the packages whose version changes results.
+    versions: std::collections::BTreeMap<String, String>,
+    /// The environment variable that overrides this role.
+    env_var: String,
+    /// Anything worth saying that is not a failure, such as a DeepLC below the floor.
+    warnings: Vec<String>,
 }
 
-fn load_config(_path: &Option<String>) -> Result<Config> {
-    match _path {
+/// The worker-script directory check, which runs before any interpreter.
+#[derive(serde::Serialize)]
+struct ScriptsReport {
+    /// `ok` | `fail` | `skip`
+    status: String,
+    dir: String,
+    /// Worker files the directory should contain but does not.
+    missing: Vec<String>,
+    /// False when the configuration needs no sidecar, in which case the directory
+    /// is never opened and its absence is not a problem.
+    needed: bool,
+}
+
+/// The whole report. `ok` is the same verdict the exit status carries.
+#[derive(serde::Serialize)]
+struct DoctorReport {
+    ok: bool,
+    scripts: ScriptsReport,
+    roles: Vec<RoleReport>,
+}
+
+/// Peaks-per-MS2-spectrum percentiles for one mzML.
+///
+/// The pre-flight the peak-cap decision needs. `docs/04_convert.md` is emphatic that
+/// `--top-peaks-ms2` is acquisition-specific and that a value carried from another
+/// run deletes fragment evidence: on one 50-window Orbitrap DIA run a 300-peak cap
+/// discarded 78.6% of all MS2 peaks and cost 60% of the peptides. The playbook's
+/// advice is to compute the percentiles before setting a cap, and this is that
+/// computation, callable rather than described.
+///
+/// Reads peaks and counts them; it does not centroid, so a profile-mode file reports
+/// raw sample counts and says so.
+fn peak_census(mzml: &str, max_spectra: usize) -> Result<serde_json::Value> {
+    use mzdata::prelude::*;
+
+    // The same reader  uses, so this sees exactly the spectra a run would.
+    let reader = mzdata::MZReader::open_path(mzml).with_context(|| format!("opening {mzml}"))?;
+
+    let mut counts: Vec<usize> = Vec::new();
+    let mut profile = 0usize;
+    let mut ms1 = 0usize;
+    for (i, spec) in reader.enumerate() {
+        if max_spectra > 0 && i >= max_spectra {
+            break;
+        }
+        if spec.ms_level() != 2 {
+            if spec.ms_level() == 1 {
+                ms1 += 1;
+            }
+            continue;
+        }
+        if spec.signal_continuity() == mzdata::spectrum::SignalContinuity::Profile {
+            profile += 1;
+        }
+        let n = spec
+            .raw_arrays()
+            .and_then(|a| a.mzs().ok().map(|m| m.len()))
+            .unwrap_or(0);
+        counts.push(n);
+    }
+
+    if counts.is_empty() {
+        anyhow::bail!("{mzml} contains no MS2 spectra, so there is nothing to cap");
+    }
+    counts.sort_unstable();
+    let pct = |p: f64| -> usize {
+        let idx = ((counts.len() - 1) as f64 * p).round() as usize;
+        counts[idx.min(counts.len() - 1)]
+    };
+    let total: u64 = counts.iter().map(|&c| c as u64).sum();
+
+    // Computed before the macro: `json!` parses its values as literals and cannot
+    // take an iterator chain in value position.
+    let caps: Vec<serde_json::Value> = [50usize, 100, 200, 300, 500, 1000]
+        .iter()
+        .map(|&cap| {
+            let kept: u64 = counts.iter().map(|&c| c.min(cap) as u64).sum();
+            let truncated = counts.iter().filter(|&&c| c > cap).count();
+            serde_json::json!({
+                "cap": cap,
+                "spectra_truncated": truncated,
+                "fraction_of_spectra_truncated": truncated as f64 / counts.len() as f64,
+                "fraction_of_peaks_discarded":
+                    if total == 0 { 0.0 } else { 1.0 - kept as f64 / total as f64 },
+            })
+        })
+        .collect();
+
+    Ok(serde_json::json!({
+        "mzml": mzml,
+        "ms1_spectra": ms1,
+        "ms2_spectra": counts.len(),
+        "profile_ms2_spectra": profile,
+        "total_ms2_peaks": total,
+        "peaks_per_ms2": {
+            "min": counts[0],
+            "p25": pct(0.25),
+            "p50": pct(0.50),
+            "p75": pct(0.75),
+            "p95": pct(0.95),
+            "max": counts[counts.len() - 1],
+        },
+        // What a cap would actually cost, which is the question being asked.
+        "caps": caps,
+    }))
+}
+
+/// Report whether this configuration can actually run: which interpreter each
+/// sidecar role resolves to, whether it can import what its workers import, which
+/// versions it has, and whether the worker scripts are where the engine will look
+/// for them.
+///
+/// What this replaces: the previous version probed three hard-coded interpreters
+/// and reported `[skip]` for anything unset. It never probed `mbr.python`, never
+/// checked that `sidecar_script_dir` existed (the most common misconfiguration,
+/// and the one baked into the tracked example config), and reported no versions,
+/// so a DeepLC old enough to change results looked identical to a current one.
+fn doctor_report(cfg: &Config, config_path: Option<&str>) -> DoctorReport {
+    use mumdia::python::{self, Role, ALL_ROLES};
+
+    let mut cfg = cfg.clone();
+    let script_dir = python::resolve_script_dir(&cfg.predict_frag.sidecar_script_dir, config_path);
+    let dir_moved = script_dir != cfg.predict_frag.sidecar_script_dir;
+    cfg.predict_frag.sidecar_script_dir = script_dir.clone();
+
+    let mut ok = true;
+    let any_sidecar = ALL_ROLES.iter().any(|r| r.required_by(&cfg));
+
+    // 1. Worker scripts, checked before the interpreters because a missing script
+    //    directory makes every interpreter irrelevant. Skipped entirely when the
+    //    configuration needs no sidecar: the native predictors and `native_tda`
+    //    rescorer are the default, and that run must not be failed for a directory
+    //    it never opens.
+    let dir = std::path::Path::new(&script_dir);
+    let scripts = if !any_sidecar {
+        ScriptsReport {
+            status: "skip".into(),
+            dir: script_dir.clone(),
+            missing: Vec::new(),
+            needed: false,
+        }
+    } else if !dir.is_dir() {
+        ok = false;
+        ScriptsReport {
+            status: "fail".into(),
+            dir: script_dir.clone(),
+            missing: Vec::new(),
+            needed: true,
+        }
+    } else {
+        let mut missing: Vec<String> = Vec::new();
+        for role in ALL_ROLES {
+            if !role.required_by(&cfg) {
+                continue;
+            }
+            for worker in role.workers() {
+                if !dir.join(worker).exists() {
+                    missing.push(worker.to_string());
+                }
+            }
+        }
+        missing.sort_unstable();
+        missing.dedup();
+        if !missing.is_empty() {
+            ok = false;
+        }
+        ScriptsReport {
+            status: if missing.is_empty() { "ok" } else { "fail" }.into(),
+            dir: script_dir.clone(),
+            missing,
+            needed: true,
+        }
+    };
+    let _ = dir_moved;
+
+    // 2. Interpreters, one entry per role, resolving `auto` exactly as a run would.
+    let mut roles = Vec::new();
+    for role in ALL_ROLES {
+        let configured = match role {
+            Role::Rescore => cfg.rescore.python.clone(),
+            Role::DeepLc => cfg.predict_frag.deeplc_python.clone(),
+            Role::Ms2pip => cfg.predict_frag.ms2pip_python.clone(),
+            Role::Mbr => cfg.mbr.python.clone(),
+        };
+        let required = role.required_by(&cfg);
+        let modules: Vec<String> = role.modules(&cfg).iter().map(|m| m.to_string()).collect();
+        let explicit = configured
+            .as_deref()
+            .map(|v| !v.eq_ignore_ascii_case(python::AUTO))
+            .unwrap_or(false);
+
+        let mut r = RoleReport {
+            role: format!("{role:?}").to_lowercase(),
+            field: role.field().to_string(),
+            required,
+            status: "skip".into(),
+            python: None,
+            provenance: "not required".into(),
+            modules,
+            missing: Vec::new(),
+            versions: std::collections::BTreeMap::new(),
+            env_var: role.env_var().to_string(),
+            warnings: Vec::new(),
+        };
+
+        // Neither needed nor named: say so and probe nothing. Discovery here used to
+        // run for every role and then report the interpreter it happened to find as
+        // "configured but not needed", which described neither the config nor the
+        // outcome.
+        if !required && !explicit {
+            roles.push(r);
+            continue;
+        }
+
+        let (path, provenance) = if explicit {
+            (configured.clone(), "configured")
+        } else {
+            match python::discover(role, &cfg) {
+                Some((p, src)) => (Some(p), src),
+                None => (None, "not found"),
+            }
+        };
+        r.provenance = provenance.to_string();
+        r.python = path.clone();
+
+        match (&path, required) {
+            (None, true) => {
+                ok = false;
+                r.status = "fail".into();
+            }
+            (None, false) => r.status = "skip".into(),
+            (Some(p), _) => {
+                let interp = std::path::Path::new(p);
+                let module_refs: Vec<&str> = r.modules.iter().map(|s| s.as_str()).collect();
+                match python::missing_modules(interp, &module_refs) {
+                    Ok(missing) if missing.is_empty() => {
+                        for m in ["deeplc", "torch", "mokapot", "ms2pip", "numpy"] {
+                            if module_refs.contains(&m) {
+                                if let Some(v) = python::module_version(interp, m) {
+                                    r.versions.insert(m.to_string(), v);
+                                }
+                            }
+                        }
+                        r.status = if required { "ok" } else { "note" }.into();
+                        // DeepLC below the floor changes results rather than only
+                        // performance: the default RT workflow calibrates base-model
+                        // predictions, and the 4.0.0a2 multitask preview memorised its
+                        // anchors badly enough to invert RT-model rankings
+                        // (docs/08_rt_im_train.md). The engine refuses to launch a DeepLC
+                        // worker below `MIN_DEEPLC_VERSION`, so doctor fails here too
+                        // rather than warning about a run that cannot start.
+                        if role == Role::DeepLc && required {
+                            let floor = mumdia_core::constants::MIN_DEEPLC_VERSION;
+                            let (ma, mi, pa) = floor;
+                            match r.versions.get("deeplc") {
+                                Some(v)
+                                    if mumdia_core::constants::parse_version3(v)
+                                        .is_some_and(|t| t >= floor) => {}
+                                Some(v) => {
+                                    ok = false;
+                                    r.status = "fail".into();
+                                    r.warnings.push(format!(
+                                        "DeepLC {v} is older than the required {ma}.{mi}.{pa}; \
+                                         the engine refuses to launch the DeepLC workers with it \
+                                         (pip install 'deeplc>={ma}.{mi}.{pa}')"
+                                    ));
+                                }
+                                None => {
+                                    ok = false;
+                                    r.status = "fail".into();
+                                    r.warnings.push(format!(
+                                        "cannot determine the deeplc version; {ma}.{mi}.{pa} or \
+                                         newer is required"
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    Ok(missing) => {
+                        if required {
+                            ok = false;
+                        }
+                        r.status = if required { "fail" } else { "warn" }.into();
+                        r.missing = missing;
+                    }
+                    Err(e) => {
+                        if required {
+                            ok = false;
+                        }
+                        r.status = if required { "fail" } else { "warn" }.into();
+                        r.warnings.push(e.to_string());
+                    }
+                }
+            }
+        }
+        roles.push(r);
+    }
+
+    DoctorReport { ok, scripts, roles }
+}
+
+/// Render the report as the prose a person reads in a terminal.
+fn print_doctor(rep: &DoctorReport) {
+    println!("worker scripts");
+    match rep.scripts.status.as_str() {
+        "skip" => println!("  [skip] no Python sidecar is needed by this configuration"),
+        "ok" => println!("  [ ok ] {}", rep.scripts.dir),
+        _ if !rep.scripts.missing.is_empty() => println!(
+            "  [FAIL] {}: missing {}",
+            rep.scripts.dir,
+            rep.scripts.missing.join(", ")
+        ),
+        _ => println!(
+            "  [FAIL] predict_frag.sidecar_script_dir: {} is not a directory.\n\
+             \x20        Point it at the `scripts/` directory that ships beside the binary.",
+            rep.scripts.dir
+        ),
+    }
+
+    println!("sidecar interpreters");
+    for r in &rep.roles {
+        let label = &r.field;
+        match (r.status.as_str(), &r.python) {
+            ("skip", _) => println!("  [skip] {label}: not needed by this config"),
+            ("fail", None) => println!(
+                "  [FAIL] {label}: required by this config, and no usable interpreter was \
+                 found.\n\x20        Set it, set {}, or activate an environment that can \
+                 import {}.",
+                r.env_var,
+                r.modules.join(", ")
+            ),
+            (status, Some(p))
+                if r.missing.is_empty() && r.warnings.iter().all(|w| w.contains("DeepLC")) =>
+            {
+                let tag = if status == "ok" { " ok " } else { "note" };
+                let notes: Vec<String> =
+                    r.versions.iter().map(|(k, v)| format!("{k} {v}")).collect();
+                println!(
+                    "  [{tag}] {label}: {p} ({}){}",
+                    r.provenance,
+                    if notes.is_empty() {
+                        String::new()
+                    } else {
+                        format!("\n\x20        {}", notes.join(", "))
+                    }
+                );
+                if !r.required {
+                    println!("\x20        (configured but not needed by this config)");
+                }
+                for w in &r.warnings {
+                    println!("\x20        [warn] {w}");
+                }
+            }
+            (status, Some(p)) if !r.missing.is_empty() => println!(
+                "  [{}] {label}: {p} ({}) cannot import {}",
+                if status == "fail" { "FAIL" } else { "warn" },
+                r.provenance,
+                r.missing.join(", ")
+            ),
+            (status, _) => {
+                for w in &r.warnings {
+                    println!(
+                        "  [{}] {label}: {w}",
+                        if status == "fail" { "FAIL" } else { "warn" }
+                    );
+                }
+            }
+        }
+    }
+
+    if rep.ok {
+        println!("mumdia doctor: configuration is runnable");
+    }
+}
+
+/// Parse a config file without touching the sidecar interpreter fields.
+///
+/// Only `doctor` wants this. Its whole job is to report what a configuration would
+/// resolve to and why, including when resolution would fail, so it must see the file
+/// as written.
+fn load_config_raw(path: &Option<String>) -> Result<Config> {
+    match path {
         Some(p) => {
-            let s = std::fs::read_to_string(p)?;
-            Ok(Config::from_json(&s)?)
+            let s = std::fs::read_to_string(p).with_context(|| {
+                format!("failed to read config file {p} (check the path and spelling)")
+            })?;
+            Config::from_json(&s).with_context(|| format!("invalid config in {p}"))
         }
         None => Ok(Config::default()),
     }
+}
+
+/// Parse a config file and resolve everything path-shaped in it: the sidecar
+/// interpreters (including the `"auto"` sentinel) and the worker script directory.
+///
+/// Every subcommand except `doctor` goes through here, which is the point. Resolution
+/// used to happen only inside the two orchestrators, so `mumdia rescore`,
+/// `mumdia predict-frag` and `mumdia mbr` took the word "auto" literally and tried to
+/// execute a program by that name — while all three shipped example configs, and the
+/// documented standalone-stage workflow, use `"auto"`. Resolving here means one
+/// behaviour for every entry point.
+///
+/// Cost on the native path is nil: `python::resolve` probes only the roles that
+/// `Role::required_by` says this configuration actually uses, and the default
+/// configuration uses none.
+fn load_config(path: &Option<String>) -> Result<Config> {
+    let mut cfg = load_config_raw(path)?;
+    cfg.predict_frag.sidecar_script_dir =
+        python::resolve_script_dir(&cfg.predict_frag.sidecar_script_dir, path.as_deref());
+    // BEST EFFORT, not Require. `Role::required_by` answers "does this configuration use
+    // the role", which is not the same question as "does the subcommand I am about to run
+    // use it": a `mumdia search-seed` with `rescore.classifier = entrapment` would
+    // otherwise fail at config load demanding a mokapot interpreter for a rescorer that
+    // stage never invokes. The two orchestrators call `python::resolve` themselves, and
+    // keep the strict behaviour, which is where early failure actually pays.
+    python::resolve_with(&mut cfg, python::Strictness::BestEffort)?;
+    Ok(cfg)
 }
 
 fn main() -> Result<()> {
@@ -477,8 +914,9 @@ fn main() -> Result<()> {
     // the working directory, so it must outlive the stage that is being profiled.
     #[cfg(feature = "dhat-heap")]
     let _dhat = dhat::Profiler::new_heap();
-    mumdia_io::init_logging();
     let cli = Cli::parse();
+    mumdia_io::init_logging_level(cli.log_filter().as_deref());
+    apply_threads(cli.threads)?;
     match cli.cmd {
         Cmd::Convert {
             mzml,
@@ -491,7 +929,8 @@ fn main() -> Result<()> {
             // Fold the conversion CLI caps into the convert artifacts' provenance
             // key: they change the spectra output but are not part of the config, so
             // two different caps would otherwise produce an identical config_hash
-            // (comment.md A2/C4). The caps are also recorded in the convert report.
+            // (docs/18_findings_and_decisions.md). The caps are also recorded in
+            // the convert report.
             let config_hash = mumdia_io::hash::blake3_str(&format!(
                 "{}\u{1f}max_spectra={max_spectra}\u{1f}top_peaks_ms2={top_peaks_ms2}\u{1f}top_peaks_ms1={top_peaks_ms1}",
                 cfg.canonical_json()
@@ -550,8 +989,8 @@ fn main() -> Result<()> {
         }
         Cmd::SearchSeed {
             ms2,
-            library_precursors,
-            library_fragments,
+            lib_precursors,
+            lib_fragments,
             out,
             config,
         } => {
@@ -559,8 +998,8 @@ fn main() -> Result<()> {
             let ch = mumdia_io::hash::blake3_str(&cfg.canonical_json());
             stages::search_seed::run(stages::search_seed::SearchSeedParams {
                 ms2: &ms2,
-                library_precursors: &library_precursors,
-                library_fragments: &library_fragments,
+                library_precursors: &lib_precursors,
+                library_fragments: &lib_fragments,
                 out: &out,
                 cfg: &cfg.search_seed,
                 bucket_size: cfg.extract.bucket_size,
@@ -569,7 +1008,7 @@ fn main() -> Result<()> {
         }
         Cmd::RtImTrain {
             seed_psms,
-            library_precursors,
+            lib_precursors,
             out_windows,
             out_cal,
             config,
@@ -597,7 +1036,7 @@ fn main() -> Result<()> {
             let ch = mumdia_io::hash::blake3_str(&cfg.canonical_json());
             stages::rt_im_train::run(stages::rt_im_train::RtImTrainParams {
                 seed_psms: &seed_psms,
-                library_precursors: &library_precursors,
+                library_precursors: &lib_precursors,
                 out_windows: &out_windows,
                 out_cal: &out_cal,
                 cfg: &cfg.rt_im_train,
@@ -606,13 +1045,13 @@ fn main() -> Result<()> {
         }
         Cmd::Extract {
             ms2,
-            library_precursors,
-            library_fragments,
+            lib_precursors,
+            lib_fragments,
             run_windows,
             ms1,
             mass_cal,
             out_psms,
-            out_chrom,
+            out_chromatograms,
             restrict_candidates,
             config,
         } => {
@@ -620,22 +1059,22 @@ fn main() -> Result<()> {
             let ch = mumdia_io::hash::blake3_str(&cfg.canonical_json());
             stages::extract::run(stages::extract::ExtractParams {
                 ms2: &ms2,
-                library_precursors: &library_precursors,
-                library_fragments: &library_fragments,
+                library_precursors: &lib_precursors,
+                library_fragments: &lib_fragments,
                 run_windows: &run_windows,
                 ms1: ms1.as_deref(),
                 mass_cal: mass_cal.as_deref(),
                 out_psms: &out_psms,
-                out_chrom: &out_chrom,
+                out_chrom: &out_chromatograms,
                 restrict_candidates: restrict_candidates.as_deref(),
                 cfg: &cfg.extract,
                 config_hash: &ch,
             })?;
         }
         Cmd::Features {
-            psms,
+            psms_extracted,
             chromatograms,
-            seed,
+            seed_psms,
             out,
             out_pin,
             config,
@@ -643,9 +1082,9 @@ fn main() -> Result<()> {
             let cfg = load_config(&config)?;
             let ch = mumdia_io::hash::blake3_str(&cfg.canonical_json());
             stages::features::run(stages::features::FeaturesParams {
-                psms: &psms,
+                psms: &psms_extracted,
                 chromatograms: &chromatograms,
-                seed: seed.as_deref(),
+                seed: seed_psms.as_deref(),
                 out: &out,
                 out_pin: &out_pin,
                 cfg: &cfg.features,
@@ -655,7 +1094,7 @@ fn main() -> Result<()> {
         Cmd::Prescan {
             ms2,
             isolation_windows,
-            library_precursors,
+            lib_precursors,
             run_windows,
             out,
             config,
@@ -665,7 +1104,7 @@ fn main() -> Result<()> {
             stages::prescan::run(stages::prescan::PrescanParams {
                 ms2: &ms2,
                 isolation_windows: &isolation_windows,
-                library_precursors: &library_precursors,
+                library_precursors: &lib_precursors,
                 run_windows: &run_windows,
                 out: &out,
                 cfg: &cfg.prescan,
@@ -687,20 +1126,20 @@ fn main() -> Result<()> {
             })?;
         }
         Cmd::Audit {
-            library_precursors,
-            psms,
+            lib_precursors,
+            psms_extracted,
             competed,
-            scored,
+            psms_scored,
             out,
             q,
             run_id,
             entrapment_substr,
         } => {
             stages::audit::run(stages::audit::AuditParams {
-                library_precursors: &library_precursors,
-                psms: &psms,
+                library_precursors: &lib_precursors,
+                psms: &psms_extracted,
                 competed: &competed,
-                scored: &scored,
+                scored: &psms_scored,
                 out: &out,
                 q_threshold: q,
                 run_id: &run_id,
@@ -740,6 +1179,7 @@ fn main() -> Result<()> {
             }
             stages::run::run(stages::run::RunParams {
                 config: &cfg,
+                config_path: config.as_deref(),
                 fasta: fasta.as_deref(),
                 mzml: &mzml,
                 out_dir: &out_dir,
@@ -772,6 +1212,7 @@ fn main() -> Result<()> {
             };
             stages::run_experiment::run(stages::run_experiment::RunExperimentParams {
                 config: &cfg,
+                config_path: config.as_deref(),
                 fasta: fasta.as_deref(),
                 mzmls: &mzml,
                 run_names,
@@ -822,11 +1263,15 @@ fn main() -> Result<()> {
                 })?;
             stages::quant::run_lfq_combine(&inputs, by_fragment, norm, &out)?;
         }
-        Cmd::Align { seeds, out, config } => {
+        Cmd::Align {
+            seed_psms,
+            out,
+            config,
+        } => {
             let cfg = load_config(&config)?;
             let ch = mumdia_io::hash::blake3_str(&cfg.canonical_json());
             stages::align::run(stages::align::AlignParams {
-                seeds: &seeds,
+                seeds: &seed_psms,
                 out: &out,
                 q_train: cfg.rt_im_train.q_train,
                 grid_n: 100,
@@ -834,10 +1279,10 @@ fn main() -> Result<()> {
             })?;
         }
         Cmd::Mbr {
-            scored,
-            psms,
+            psms_scored,
+            psms_extracted,
             out,
-            out_scored,
+            out_psms_scored,
             frag,
             config,
         } => {
@@ -847,8 +1292,11 @@ fn main() -> Result<()> {
                     "mbr.strategy is `none`; set empirical_library / rt_transfer / full to run MBR"
                 );
             }
-            if psms.len() < 2 {
-                anyhow::bail!("MBR needs >= 2 runs; got {} psms path(s)", psms.len());
+            if psms_extracted.len() < 2 {
+                anyhow::bail!(
+                    "MBR needs >= 2 runs; got {} psms path(s)",
+                    psms_extracted.len()
+                );
             }
             let python = cfg.mbr.python.as_deref().ok_or_else(|| {
                 anyhow::anyhow!(
@@ -862,10 +1310,10 @@ fn main() -> Result<()> {
             mumdia::sidecar::run_mbr(
                 python,
                 &script,
-                &scored,
-                &psms,
+                &psms_scored,
+                &psms_extracted,
                 &out,
-                out_scored.as_deref(),
+                out_psms_scored.as_deref(),
                 &frag,
                 cfg.mbr.q_anchor,
                 cfg.mbr.min_anchor_runs,
@@ -877,18 +1325,35 @@ fn main() -> Result<()> {
         Cmd::Inspect { artifact } => {
             print!("{}", mumdia_io::inspect(&artifact)?);
         }
+        Cmd::PeakCensus { mzml, max_spectra } => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&peak_census(&mzml, max_spectra)?)?
+            );
+        }
         Cmd::Report {
-            scored,
+            psms_scored,
             out_dir,
             peptide_quant,
             protein_quant,
             q,
+            config,
         } => {
+            // Precedence: an explicit --q, then quant.q_threshold from --config, then
+            // the historical 0.01. Reading the config is what stops a standalone report
+            // silently disagreeing with the `run` that produced the same table.
+            let q = match q {
+                Some(v) => v,
+                None => match &config {
+                    Some(_) => load_config(&config)?.quant.q_threshold,
+                    None => 0.01,
+                },
+            };
             std::fs::create_dir_all(&out_dir)?;
             let pep = format!("{out_dir}/peptides.tsv");
             let prot = format!("{out_dir}/proteins.tsv");
             let (n_pep, n_prot) = stages::report::run(stages::report::ReportParams {
-                scored: &scored,
+                scored: &psms_scored,
                 peptide_quant: peptide_quant.as_deref(),
                 protein_quant: protein_quant.as_deref(),
                 out_peptides: &pep,
@@ -899,8 +1364,20 @@ fn main() -> Result<()> {
                 "MuMDIA: {n_pep} peptides, {n_prot} protein groups at q <= {q}\n  {pep}\n  {prot}"
             );
         }
-        Cmd::Doctor { config } => {
-            doctor(&load_config(&config)?)?;
+        Cmd::Doctor { config, json } => {
+            // Deliberately the raw loader: doctor must be able to diagnose a
+            // configuration whose interpreters do not resolve, so it cannot go
+            // through the resolving loader that would bail first.
+            let cfg = load_config_raw(&config)?;
+            let report = doctor_report(&cfg, config.as_deref());
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                print_doctor(&report);
+            }
+            if !report.ok {
+                anyhow::bail!("this configuration cannot run as it stands; see the report above");
+            }
         }
     }
     Ok(())
@@ -908,7 +1385,56 @@ fn main() -> Result<()> {
 
 #[cfg(test)]
 mod cli_tests {
-    use super::{Cli, Cmd};
+    use super::*;
+
+    /// The verbosity flags have to keep working after the subcommand as well as
+    /// before it, which is what `global = true` buys and what a user will type.
+    #[test]
+    fn global_flags_parse_on_either_side_of_the_subcommand() {
+        let a = Cli::parse_from(["mumdia", "--threads", "8", "doctor"]);
+        let b = Cli::parse_from(["mumdia", "doctor", "--threads", "8"]);
+        assert_eq!(a.threads, Some(8));
+        assert_eq!(b.threads, Some(8));
+        assert!(matches!(a.cmd, Cmd::Doctor { .. }));
+    }
+
+    #[test]
+    fn log_filter_maps_the_verbosity_flags() {
+        let f = |args: &[&str]| {
+            let mut v = vec!["mumdia"];
+            v.extend_from_slice(args);
+            v.push("doctor");
+            Cli::parse_from(v).log_filter()
+        };
+        // Nothing given: leave RUST_LOG in charge.
+        assert_eq!(f(&[]), None);
+        assert_eq!(f(&["-v"]), Some("debug".to_string()));
+        assert_eq!(f(&["-vv"]), Some("trace".to_string()));
+        assert_eq!(f(&["-vvv"]), Some("trace".to_string()));
+        assert_eq!(f(&["-q"]), Some("warn".to_string()));
+        // An explicit level wins over the counted flags, and a full RUST_LOG
+        // filter passes through unchanged.
+        assert_eq!(
+            f(&["-vv", "--log-level", "error"]),
+            Some("error".to_string())
+        );
+        assert_eq!(
+            f(&["--log-level", "mumdia=debug,extract=trace"]),
+            Some("mumdia=debug,extract=trace".to_string())
+        );
+        // -q and -v contradict each other, so they are rejected rather than
+        // silently ordered.
+        assert!(Cli::try_parse_from(["mumdia", "-q", "-v", "doctor"]).is_err());
+    }
+
+    #[test]
+    fn threads_must_be_at_least_one() {
+        let err = apply_threads(Some(0)).unwrap_err().to_string();
+        assert!(err.contains("--threads"), "{err}");
+        // `None` is always fine and must not touch the global pool.
+        assert!(apply_threads(None).is_ok());
+    }
+
     use clap::Parser;
 
     #[test]

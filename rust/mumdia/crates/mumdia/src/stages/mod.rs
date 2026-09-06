@@ -1,5 +1,5 @@
 //! Pipeline stages. Each is an independent subcommand reading path-addressable
-//! inputs and writing declared Parquet + a report (PLAN.md Section 3.5).
+//! inputs and writing declared Parquet + a report (docs/03_io_layer.md).
 
 pub mod align;
 pub mod audit;

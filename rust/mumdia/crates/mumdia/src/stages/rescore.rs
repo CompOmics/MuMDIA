@@ -1,7 +1,7 @@
-//! Stage F `mumdia rescore` (PLAN.md Stage F): rescore competed PSMs across the
-//! experiment and compute native target-decoy q-values at PSM and peptide level.
-//! MVP default is the native semi-supervised rescorer; Mokapot / percolator.exe
-//! are optional strategies over the same PIN/feature contract.
+//! Stage F `mumdia rescore` (docs/11_compete_rescore_fdr.md): rescore competed
+//! PSMs across the experiment and compute native target-decoy q-values at PSM and
+//! peptide level. MVP default is the native semi-supervised rescorer; Mokapot /
+//! percolator.exe are optional strategies over the same PIN/feature contract.
 
 use std::collections::HashMap;
 use std::time::Instant;
@@ -50,6 +50,43 @@ pub struct RescoreParams<'a> {
     pub script_dir: &'a str,
     pub cfg: &'a RescoreConfig,
     pub config_hash: &'a str,
+}
+
+/// A byte count in the largest unit that keeps it readable.
+///
+/// The matrix spans six orders of magnitude between the smoke fixture and a 40-run
+/// experiment, so a fixed unit is unhelpful at one end or the other: `0.00 GiB` says
+/// nothing, and `270336.0 MiB` says it badly.
+fn human_bytes(bytes: f64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = KIB * 1024.0;
+    const GIB: f64 = MIB * 1024.0;
+    if bytes >= GIB {
+        format!("{:.2} GiB", bytes / GIB)
+    } else if bytes >= MIB {
+        format!("{:.1} MiB", bytes / MIB)
+    } else {
+        format!("{:.0} KiB", bytes / KIB)
+    }
+}
+
+/// Refuse a rescore whose population cannot support target-decoy FDR.
+///
+/// A one-sided population is not a hard rescore failure in any technical sense:
+/// the classifier would train and q-values would come out. They would simply be
+/// meaningless, because the estimator counts one class against the other. Failing
+/// here is the difference between an error and a plausible-looking result that
+/// nothing downstream can detect. The message names both counts, since which side
+/// is missing points at a different cause: no decoys usually means the library
+/// lost its decoy half, no targets means the labels are inverted.
+fn require_both_labels(n_targets: usize, n_decoys: usize) -> Result<()> {
+    if n_targets == 0 || n_decoys == 0 {
+        anyhow::bail!(
+            "rescore requires both target and decoy PSMs for valid FDR \
+             (targets={n_targets}, decoys={n_decoys})"
+        );
+    }
+    Ok(())
 }
 
 pub fn run(p: RescoreParams) -> Result<u64> {
@@ -201,12 +238,7 @@ pub fn run(p: RescoreParams) -> Result<u64> {
     if n > 0 {
         let n_decoys = is_decoy.iter().filter(|&&v| v).count();
         let n_targets = n - n_decoys;
-        if n_targets == 0 || n_decoys == 0 {
-            anyhow::bail!(
-                "rescore requires both target and decoy PSMs for valid FDR \
-                 (targets={n_targets}, decoys={n_decoys})"
-            );
-        }
+        require_both_labels(n_targets, n_decoys)?;
         for (row, values) in feats.iter_rows().enumerate() {
             if let Some((feature, value)) = values
                 .iter()
@@ -225,7 +257,37 @@ pub fn run(p: RescoreParams) -> Result<u64> {
             }
         }
     }
-    info!(psms = n, "rescore: loaded competed PSMs");
+    // Say how big the feature matrix is, and refuse it if a ceiling is configured.
+    //
+    // `feats` is `Vec<Vec<f64>>`, so eight bytes per value plus a heap allocation and a
+    // 24-byte spine entry per PSM -- twice the width CLAUDE.md documented, because that
+    // figure describes the Python worker's f32 matrix. On an experiment-wide pool this is
+    // the peak-RSS wall (the code's own comment says ~27 GB), `native_tda` runs all folds
+    // in parallel each holding an owned standardised copy of its training slice, and
+    // nothing here estimates available memory. So the failure mode was an OS kill after
+    // however long the run took to reach it, with no number to plan against.
+    let matrix_bytes = (n as f64) * (feat_names.len() as f64) * 8.0 + (n as f64) * 24.0;
+    let matrix_gib = matrix_bytes / (1024.0 * 1024.0 * 1024.0);
+    info!(
+        psms = n,
+        features = feat_names.len(),
+        feature_matrix = %human_bytes(matrix_bytes),
+        folds = p.cfg.folds,
+        "rescore: loaded competed PSMs"
+    );
+    if p.cfg.max_feature_matrix_gib > 0.0 && matrix_gib > p.cfg.max_feature_matrix_gib {
+        anyhow::bail!(
+            "rescore feature matrix would be {} ({n} PSMs x {} features x 8 bytes), over \
+             the configured rescore.max_feature_matrix_gib of {:.2}. The native rescorer \
+             holds roughly (1 + folds) times this at peak. Either raise the ceiling, or \
+             rescore fewer runs per invocation -- `run_psm_q` is computed per source, so \
+             sub-batching costs no per-run FDR, though it does change which PSMs share \
+             the pooled q_value.",
+            human_bytes(matrix_bytes),
+            feat_names.len(),
+            p.cfg.max_feature_matrix_gib
+        );
+    }
 
     // Track the path actually taken so the report reflects reality rather than a
     // hardcoded label, and pick the null the q-values are computed against.
@@ -249,6 +311,7 @@ pub fn run(p: RescoreParams) -> Result<u64> {
                 &protein,
                 &mz,
                 &feats,
+                &base,
             ) {
                 Ok(s) => {
                     info!("rescore: using Mokapot scores");
@@ -278,6 +341,7 @@ pub fn run(p: RescoreParams) -> Result<u64> {
                 &protein,
                 &mz,
                 &feats,
+                &base,
             ) {
                 Ok(s) => {
                     info!("rescore: using PyTorch NN sidecar scores");
@@ -347,9 +411,19 @@ pub fn run(p: RescoreParams) -> Result<u64> {
                             }
                             warn!("rescore: entrapment GBM sidecar failed ({e}); using native linear entrapment fallback");
                             classifier_used = "entrapment_native";
+                            // `is_decoy`, not `is_entrapment`: the negative class for
+                            // TRAINING is the in-silico decoy population, exactly as on
+                            // every other classifier path. Entrapment is the evaluation
+                            // null and must stay held out -- training on it makes the
+                            // leak estimate a measure of the fit rather than of the FDR.
+                            // Passing `is_entrapment` here also inverted the semantics of
+                            // `percolator_lite`'s positive set, which selects on
+                            // `is_decoy == false`: every entrapment row with a low
+                            // internal q was recruited as a POSITIVE training example and
+                            // counted as a target inside the loop's own q estimate.
                             model_identity = "native-percolator-lite-entrapment-v1".to_string();
                             qmode = QMode::Entrapment;
-                            native_scores(&p, &feats, &is_entrapment, &base, &prelim)
+                            native_scores(&p, &feats, &is_decoy, &base, &prelim)
                         }
                     }
                 } else {
@@ -360,7 +434,7 @@ pub fn run(p: RescoreParams) -> Result<u64> {
                     classifier_used = "entrapment_native";
                     model_identity = "native-percolator-lite-entrapment-v1".to_string();
                     qmode = QMode::Entrapment;
-                    native_scores(&p, &feats, &is_entrapment, &base, &prelim)
+                    native_scores(&p, &feats, &is_decoy, &base, &prelim)
                 }
             }
         }
@@ -450,7 +524,8 @@ pub fn run(p: RescoreParams) -> Result<u64> {
     // Peptide-level q: reduce to best PSM per base peptide, q on that set, map
     // back. Protein-group q: same over the protein-accession-set string (the MVP
     // grouping; decoys carry a DECOY_ prefix). Full parsimony/razor is a later
-    // option (PLAN.md Stage G). Group score = best member PSM score.
+    // option (docs/12_quant_lfq_align_mbr_report_audit.md). Group score = best
+    // member PSM score.
     let peptide_q = grouped_q(
         &base,
         &scores,
@@ -482,11 +557,11 @@ pub fn run(p: RescoreParams) -> Result<u64> {
         qmode,
         p.cfg.entrapment_ratio,
     );
-    // Multi-context q-values (PLAN.md Section 8 rescore; comment.md C1/C3). The
-    // pooled per-PSM q is `experiment_psm_q`; `run_psm_q` re-runs TDA within each
-    // source (run) so a per-run quant/report gets a real per-run FDR rather than the
-    // pooled value; `precursor_q` groups on peptidoform+charge. `global_q` is kept
-    // as a byte-identical alias of the pooled q for backward-compat.
+    // Multi-context q-values (docs/11_compete_rescore_fdr.md). The pooled per-PSM q
+    // is `experiment_psm_q`; `run_psm_q` re-runs TDA within each source (run) so a
+    // per-run quant/report gets a real per-run FDR rather than the pooled value;
+    // `precursor_q` groups on peptidoform+charge. `global_q` is kept as a
+    // byte-identical alias of the pooled q for backward-compat.
     let global_q = psm_q.clone();
     let experiment_psm_q = psm_q.clone();
     // Per-run PSM q: TDA within each source separately, scattered back by row index.
@@ -612,9 +687,10 @@ pub fn run(p: RescoreParams) -> Result<u64> {
             // Run identity for experiment-wide rescore (index into --competed);
             // all-zero for a single-run rescore. Lets quant map scores per file.
             Col::U32("source".into(), source),
-            // Multi-context q columns (comment.md C1/C3). run_psm_q = per-run PSM
-            // FDR; experiment_psm_q = pooled PSM FDR (== q_value/global_q_value);
-            // precursor_q = per (peptidoform+charge) FDR.
+            // Multi-context q columns (docs/11_compete_rescore_fdr.md).
+            // run_psm_q = per-run PSM FDR; experiment_psm_q = pooled PSM FDR
+            // (== q_value/global_q_value); precursor_q = per (peptidoform+charge)
+            // FDR.
             Col::F64("run_psm_q".into(), run_psm_q),
             Col::F64("experiment_psm_q".into(), experiment_psm_q),
             Col::F64("precursor_q".into(), precursor_q),
@@ -882,6 +958,21 @@ fn grouped_q<K: std::hash::Hash + Eq + Clone>(
     // make the accepted set anti-conservative.
     let mut best: HashMap<K, (f64, bool, bool, bool, usize)> = HashMap::new();
     for i in 0..n {
+        // In entrapment mode the in-silico decoys are not the null, so they must not
+        // compete for the group. A target and its paired decoy SHARE `base_peptide_id`
+        // by construction (`make_shift_decoys.py`, `make_reverse_decoys.py` and the
+        // native `peptidoforms.rs` all copy it), so a decoy that outscored its target
+        // won the group -- and its tuple is `is_entrapment = false, is_real = false`, so
+        // it counted toward neither the entrapment nor the real population and the group
+        // vanished from the analysis entirely, while the real target was assigned 1.0.
+        // Both `target_peptides_at_1pct` and the entrapment leak metric are computed
+        // from this q, so the FDR-validity instrument was measured on a population that
+        // decoys had partially deleted, and the leak count was under-reported.
+        // Skipped rows keep the default 1.0 below, which is right: a decoy has no
+        // meaningful entrapment-calibrated group q.
+        if matches!(qmode, QMode::Entrapment) && is_decoy[i] {
+            continue;
+        }
         let e = best.entry(keys[i].clone()).or_insert((
             f64::NEG_INFINITY,
             is_decoy[i],
@@ -930,8 +1021,9 @@ fn grouped_q<K: std::hash::Hash + Eq + Clone>(
 /// Run the entrapment GBM sidecar: write a Parquet of features + meta columns,
 /// invoke `entrapment_worker.py`, read back candidate_id + score. Positives are
 /// real targets, negatives are spike-in (entrapment) targets; the worker fits a
-/// gradient-boosted classifier out-of-fold by base peptide (PLAN.md Section 3.2
-/// positional-CLI file contract, as for the MS2PIP/DeepLC/Mokapot sidecars).
+/// gradient-boosted classifier out-of-fold by base peptide (the positional-CLI
+/// file contract in docs/13_sidecars.md, as for the MS2PIP/DeepLC/Mokapot
+/// sidecars).
 #[allow(clippy::too_many_arguments)]
 fn run_entrapment_gbm(
     p: &RescoreParams,
@@ -948,8 +1040,10 @@ fn run_entrapment_gbm(
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("classifier=entrapment GBM requires rescore.python"))?;
     std::fs::create_dir_all(p.work_dir).ok();
-    let inp = format!("{}/entrapment_in.parquet", p.work_dir);
-    let outp = format!("{}/entrapment_out.parquet", p.work_dir);
+    // Per-invocation names; see the note in `sidecar::run_ms2pip`.
+    let pid = std::process::id();
+    let inp = format!("{}/entrapment_in_{pid}.parquet", p.work_dir);
+    let outp = format!("{}/entrapment_out_{pid}.parquet", p.work_dir);
 
     let mut cols = vec![
         // Unique per-row id for score readback: candidate_id repeats across
@@ -1103,8 +1197,9 @@ fn write_features_parquet(
 
 /// Run a PIN-contract Python rescorer sidecar (`mokapot_worker.py` or
 /// `nn_rescore_worker.py`) over a PIN written from the competed set; return scores
-/// aligned to the input candidate order (PLAN.md Section 3.2 file contract). Both
-/// sidecars share this exact contract: PIN in, `candidate_id`+`score` parquet out.
+/// aligned to the input candidate order (the file contract in
+/// docs/13_sidecars.md). Both sidecars share this exact contract: PIN in,
+/// `candidate_id`+`score` parquet out.
 #[allow(clippy::too_many_arguments)]
 fn run_pin_sidecar(
     p: &RescoreParams,
@@ -1116,6 +1211,7 @@ fn run_pin_sidecar(
     protein: &[String],
     mz: &[f64],
     feats: &FeatureMatrix,
+    base: &[u32],
 ) -> Result<Vec<f64>> {
     use std::io::Write as _;
     let python = p.cfg.python.as_deref().ok_or_else(|| {
@@ -1191,6 +1287,23 @@ fn run_pin_sidecar(
         drop(w);
     }
 
+    // Cross-validation fold keys, row-aligned to the PIN.
+    //
+    // The NN worker derived its fold from `md5(strip_pep(Peptide))`, and `strip_pep`
+    // removes bracketed mods and flanking residues but not the `DECOY_` marker, so a
+    // target and its paired decoy landed in DIFFERENT folds -- while `percolator_lite`
+    // keys on `base_peptide_id` and pairs them, and docs/11 claimed the two used "the
+    // same CV-fold scheme". Stripping the prefix would only fix the shift-decoy library:
+    // a reverse decoy's peptidoform is the reversed sequence, so no string derived from
+    // it can reach its target. `base_peptide_id` is the pairing both builders preserve
+    // (`dprec = tprec.copy()`), so pass it explicitly.
+    //
+    // By environment variable rather than argv: the sidecar contract is positional and
+    // shared with `mokapot_worker.py`, and the NN hyperparameters already travel this way.
+    // A worker that does not read it simply keeps its previous behaviour.
+    let foldkeys = format!("{}/rescore_{tag}.foldkeys.parquet", p.work_dir);
+    write_table(&foldkeys, vec![Col::U32("fold_key".into(), base.to_vec())])?;
+
     let script = crate::sidecar::resolve_script(p.script_dir, script_name);
     // Spawn (not `status()`) so the child handle is owned by a guard that kills it if we
     // unwind or are dropped: a killed `mumdia` used to leave the Python worker running,
@@ -1203,8 +1316,9 @@ fn run_pin_sidecar(
         .env("PYTHONUTF8", "1")
         // Pass the configured NN hyperparameters so the worker uses them instead
         // of its own defaults, and so the folds/num_iter/train_fdr recorded in the
-        // report reflect the values actually used (comment.md C4). Ignored by
-        // mokapot_worker.py, which shares this PIN contract.
+        // report reflect the values actually used
+        // (docs/18_findings_and_decisions.md). Ignored by mokapot_worker.py,
+        // which shares this PIN contract.
         .env("MUMDIA_NN_FOLDS", p.cfg.folds.to_string())
         .env("MUMDIA_NN_ITERS", p.cfg.num_iter.to_string())
         .env("MUMDIA_NN_TRAIN_FDR", p.cfg.train_fdr.to_string())
@@ -1232,6 +1346,7 @@ fn run_pin_sidecar(
         .env("MUMDIA_NN_WARM_EPOCHS", p.cfg.train_warm_epochs.to_string())
         .env("MUMDIA_NN_MARGIN_FRAC", p.cfg.train_margin_frac.to_string())
         .env("MUMDIA_NN_SEEDS", p.cfg.seeds.max(1).to_string())
+        .env("MUMDIA_NN_FOLD_KEYS", &foldkeys)
         .spawn()
         .map_err(|e| {
             // A bare `.spawn()?` reported only "No such file or directory (os error 2)" with
@@ -1394,6 +1509,19 @@ b
     }
 
     #[test]
+    fn a_one_sided_population_is_refused_with_both_counts_named() {
+        assert!(require_both_labels(10, 5).is_ok());
+        for (t, d) in [(10usize, 0usize), (0, 10), (0, 0)] {
+            let err = require_both_labels(t, d).unwrap_err().to_string();
+            // Which side is missing points at a different cause, so both counts
+            // have to appear in the message.
+            assert!(err.contains(&format!("targets={t}")), "{err}");
+            assert!(err.contains(&format!("decoys={d}")), "{err}");
+            assert!(err.contains("valid FDR"), "{err}");
+        }
+    }
+
+    #[test]
     fn competed_feature_schema_must_match_id_and_ordered_columns() {
         let expected = FeatureSchema {
             feature_columns: vec!["a".into(), "b".into()],
@@ -1458,5 +1586,59 @@ b
         );
         assert_eq!(q[0], 1.0, "tied target must be the losing sibling");
         assert!(q[1] < 0.05, "tied decoy should own the picked-group q");
+    }
+
+    #[test]
+    fn entrapment_group_competition_excludes_decoys() {
+        // A target and its paired decoy SHARE `base_peptide_id`, which is the grouping
+        // key. Under entrapment q, `incoming_null` is `is_entrapment`, false for both, so
+        // the group winner used to be whichever simply scored higher. When that was the
+        // decoy, its tuple counted toward neither the entrapment nor the real population
+        // -- the group vanished from the analysis -- and the real target was assigned 1.0.
+        // The leak metric and the target count are both computed from this q, so the
+        // FDR-validity instrument was measured on a decoy-thinned population.
+        //
+        // Group 7: a decoy outscoring its real target. Group 8: a real target alone.
+        let keys = vec![7u32, 7u32, 8u32];
+        let scores = vec![1.0, 9.0, 5.0];
+        let is_decoy = vec![false, true, false];
+        let is_entrapment = vec![false, false, false];
+        let is_real = vec![true, false, true];
+
+        let q = grouped_q(
+            &keys,
+            &scores,
+            &is_decoy,
+            &is_entrapment,
+            &is_real,
+            QMode::Entrapment,
+            1.0,
+        );
+        // The real target of group 7 keeps a meaningful q: the decoy did not delete it.
+        assert!(
+            q[0] < 1.0,
+            "the real target must survive the group, got q = {:?}",
+            q
+        );
+        // The decoy itself gets no entrapment-calibrated group q.
+        assert_eq!(q[1], 1.0);
+        assert!(q[2] < 1.0);
+
+        // Decoy mode is unchanged: there the decoy IS the null and must compete, and an
+        // exact tie goes to it.
+        let qd = grouped_q(
+            &keys,
+            &scores,
+            &is_decoy,
+            &is_entrapment,
+            &is_real,
+            QMode::Decoy,
+            1.0,
+        );
+        assert_eq!(
+            qd[0], 1.0,
+            "picked-TDC: the higher-scoring decoy wins group 7"
+        );
+        assert!(qd[1] <= 1.0);
     }
 }

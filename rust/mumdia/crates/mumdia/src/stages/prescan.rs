@@ -222,6 +222,18 @@ fn spectrum_trimers(mz: &[f64], alpha: &Alphabet, tol: f64) -> HashSet<Tri> {
 
 pub fn run(p: PrescanParams) -> Result<u64> {
     let t0 = Instant::now();
+    // `--out` must not be one of the inputs. The library is fully read before the
+    // survivors table is written, so writing over it replaced a complete precursor
+    // library with a two-column list and exited 0.
+    mumdia_io::refuse_output_over_input(
+        p.out,
+        &[
+            ("--lib-precursors", p.library_precursors),
+            ("--run-windows", p.run_windows),
+            ("--ms2", p.ms2),
+            ("--isolation-windows", p.isolation_windows),
+        ],
+    )?;
     let alpha = Alphabet::build(p.cfg)?;
     if alpha.anchor.is_empty() {
         anyhow::bail!(

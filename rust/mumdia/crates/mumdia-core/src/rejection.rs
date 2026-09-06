@@ -1,8 +1,8 @@
 //! Candidate rejection reason codes for the candidate-audit table.
 //!
-//! Sensitivity program (spec `01_workflow_and_gap_analysis.md` §4,
-//! `02_sensitivity_diagnostic_plan.md` §5, backlog P0.3). Each variant names the
-//! pipeline stage at which a candidate precursor is lost. A candidate's audit row
+//! Sensitivity program (docs/20_sensitivity_and_quantification_playbook.md,
+//! backlog P0.3). Each variant names the pipeline stage at which a candidate
+//! precursor is lost. A candidate's audit row
 //! records the EARLIEST such stage, so the aggregate answers "where was each
 //! DIA-NN-only precursor first lost?" without conflating later stages.
 //!

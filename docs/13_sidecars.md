@@ -1,4 +1,4 @@
-# Python sidecars (the 11 scripts) + conda envs
+# Python sidecars (11 scripts + one shared writer) + conda envs
 > Part of the MuMDIA developer documentation (see docs/README.md).
 
 ## Purpose
@@ -94,6 +94,7 @@ For the mapping from each conda environment to the config field that points at i
 | `env/docker-rescore.yml` | Docker env `rescore`: mokapot 0.10.0 + ms2pip 4.0.0.dev9 (py3.11) |
 | `env/docker-deeplc.yml` | Docker env `deeplc`: `deeplc==4.1.1` (PyPI; the engine's floor) + CPU torch (py3.11) |
 | `env/mumdia-rescore.yml` | Minimal portable env for the mokapot logreg rescore path (py3.12) |
+| `env/mumdia-deeplc.yml` | Portable local env for the DeepLC sidecars: DeepLC 4.1.1 + CPU torch (py3.11) |
 
 ## Inputs and outputs
 
@@ -463,6 +464,56 @@ every entry on one axis before extraction, so no explicit reconciliation is done
 | `expected_rt` | `mbr_worker.py:116` | Cross-run predicted RT of a candidate in a run from the other runs' anchors |
 | `frag_mz` / `reverse_keep_cterm` / `stable_seed` / `splitmix` | `make_reverse_decoys.py:58/56/74/65` | Residue-mass b/y m/z; C-term-fixed reversal; process-independent FNV-1a seed; seeded PRNG for scramble |
 
+## Interpreter resolution
+
+Each sidecar role has one config field naming the Python that runs it:
+`rescore.python`, `predict_frag.deeplc_python`, `predict_frag.ms2pip_python`,
+`mbr.python`. Implemented in `rust/mumdia/crates/mumdia/src/python.rs`.
+
+A field may hold an absolute path, which is used as given and never
+second-guessed, or the string `"auto"` (or be absent), which asks the engine to
+find one. Discovery order, from `python.rs`:
+
+| order | source | provenance reported |
+|---|---|---|
+| 1 | `MUMDIA_PYTHON_RESCORE` / `_DEEPLC` / `_MS2PIP` / `_MBR` | the variable name |
+| 2 | `MUMDIA_PYTHON` (all roles) | `MUMDIA_PYTHON` |
+| 3 | `CONDA_PREFIX`: `bin/python`, `python.exe`, `Scripts/python.exe` | `CONDA_PREFIX` |
+| 4 | `VIRTUAL_ENV`, same three layouts | `VIRTUAL_ENV` |
+| 5 | `python3`, then `python`, on `PATH` | `PATH` |
+
+A candidate is accepted only after it imports the role's own module list, so
+discovery cannot pick a Python without torch and defer the failure to the rescore
+stage hours later. The module lists live on `Role::modules` and are the same ones
+`doctor` probes:
+
+| role | modules |
+|---|---|
+| `Rescore`, `classifier = nn_torch` | torch, numpy, pandas, pyarrow |
+| `Rescore`, mokapot or entrapment | mokapot, sklearn, numpy, pandas, pyarrow |
+| `DeepLc` | deeplc, numpy, pandas, pyarrow, torch, psm_utils |
+| `Ms2pip` | ms2pip, numpy, pandas |
+| `Mbr` | numpy, pyarrow |
+
+A role is resolved only when the configuration actually uses it
+(`Role::required_by`): the rescorer classifier, `rt_predictor`/`finetune_deeplc`,
+`predictor`, and `mbr.strategy` respectively. A default native run therefore
+needs no interpreter, probes nothing, and works on a machine with no Python. A
+role that is needed but unresolvable is a hard error in preflight, naming the
+field, the environment variable, and the modules required.
+
+Resolution runs before the config hash is computed, so `manifest.json` records
+the interpreter that actually ran rather than the word `auto`. This makes the hash
+machine-specific for an `auto` config, which is the honest outcome: two runs whose
+rescorer came from different environments are not the same configuration.
+
+`predict_frag.sidecar_script_dir` is resolved the same way
+(`python::resolve_script_dir`): the configured value if it holds the workers, then
+the same path relative to the config file's own directory, then `scripts/` beside
+the executable, which is the release-archive layout. Previously it was interpreted
+against the current working directory alone, so invoking the same config from
+another directory silently changed which scripts ran.
+
 ## Configuration
 
 Config was recently pruned; every field below exists in `mumdia-core/src/config.rs`
@@ -684,17 +735,20 @@ MLP. Set it explicitly for the logreg path.
   change so `mumdia doctor` stays truthful.
 - **Conda envs.** The committed reproducible specs are `env/docker-rescore.yml`
   (env `rescore`: mokapot 0.10.0 + ms2pip 4.0.0.dev9, py3.11) and
-  `env/docker-deeplc.yml` (env `deeplc`: `deeplc==4.1.1` from PyPI, the engine's
-  minimum, + CPU torch, py3.11); the Docker configs point interpreters at
-  `/opt/conda/envs/{rescore,deeplc}/bin/python` (`docker/config.dia.json`,
-  `docker/config.diann-lib.json`). `env/mumdia-rescore.yml` is the minimal
-  portable env for the mokapot logreg path (no torch/DeepLC/MS2PIP). On the
-  developer machine the workers also import from the local `py312_mumdia` env
-  (general env: torch + mokapot + ms2pip + sklearn + pyarrow), `ms2rescore`
-  (mokapot + MS2PIP), and `deeplc_mt` for fine-tune (the a2 build; NOT
-  `deeplc_multitask`/a1, whose predict crashes, nor `py310_deeplc`, whose ms2pip
-  is broken). Anchor only the tool version and let pip resolve its scientific-Python
-  graph, since exact old pins (pandas < 2) have no cp312 wheel.
+  `env/docker-deeplc.yml` (env `deeplc`: DeepLC 4.1.1 + CPU torch, py3.11); the
+  Docker configs point interpreters at `/opt/conda/envs/{rescore,deeplc}/bin/python`
+  (`docker/config.dia.json`, `docker/config.diann-lib.json`). For a native install
+  the portable equivalents are `env/mumdia-rescore.yml` (mokapot logreg path, no
+  torch/DeepLC/MS2PIP) and `env/mumdia-deeplc.yml` (the DeepLC sidecars).
+  **DeepLC 4.1.1 is a floor, not merely the current release**: the 4.0.0a2
+  multitask preview overfits per-run fine-tuning badly enough to invert RT-model
+  rankings (`docs/08_rt_im_train.md` section 4b), so an older DeepLC changes
+  results and not only performance. The engine enforces it: `mumdia doctor` fails
+  below 4.1.1 and `sidecar::require_deeplc_version` refuses to launch a DeepLC worker
+  (one constant, `mumdia_core::constants::MIN_DEEPLC_VERSION`). Anchor the tool version and let pip resolve
+  its scientific-Python graph; do not re-add an exact `pandas < 2` style pin,
+  which has no cp312 wheel. A developer machine may also have older local envs
+  (`deeplc_mt` holds the superseded a2 build); prefer the committed specs.
 - **nn_torch scaling.** For a many-run experiment-wide rescore, force the streaming
   backend with `MUMDIA_NN_STREAM=1` (or rely on the `MUMDIA_NN_STREAM_GB`
   threshold, default 4 GB) so peak RAM is one minibatch, not the whole feature

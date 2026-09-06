@@ -1,0 +1,6 @@
+{
+  "identifier": "default",
+  "description": "Native file and folder pickers for the main window.",
+  "windows": ["main"],
+  "permissions": ["core:default", "dialog:default"]
+}

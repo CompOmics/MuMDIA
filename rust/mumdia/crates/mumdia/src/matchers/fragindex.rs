@@ -1,5 +1,5 @@
 //! `fragindex`: log-space-binned CSR inverted fragment index with an epoch-stamped
-//! dense accumulator (fragindex_spec Sections 2-3). Clean-room reimplementation
+//! dense accumulator (docs/06_predict_frag_index_matchers.md). Clean-room reimplementation
 //! from the spec; no code or constants copied from Sage/MSFragger.
 //!
 //! Posting m/z is stored f32 (adequate for MuMDIA's 20-50 ppm regime: f32 ULP is
@@ -41,12 +41,13 @@ pub struct FragIndex {
 
 impl FragIndex {
     /// Build the CSR index from a loaded library at a fixed tolerance
-    /// (fragindex_spec Section 3.2, two-pass counting sort). Deterministic:
-    /// candidate-order scatter, no parallel sort, no hashing.
+    /// (docs/06_predict_frag_index_matchers.md, two-pass counting sort).
+    /// Deterministic: candidate-order scatter, no parallel sort, no hashing.
     pub fn build(lib: &Library, tol_ppm: f64) -> FragIndex {
         let n_cand = lib.cands.len();
-        // Precondition (fragindex_spec / CLAUDE.md index.rs:73): candidate_id is
-        // dense 0..n_cand so it indexes the accumulator and post_cand directly.
+        // Precondition (docs/06_predict_frag_index_matchers.md, CLAUDE.md
+        // index.rs:73): candidate_id is dense 0..n_cand so it indexes the
+        // accumulator and post_cand directly.
         for (c, cand) in lib.cands.iter().enumerate() {
             assert_eq!(
                 cand.candidate_id as usize, c,
@@ -60,8 +61,19 @@ impl FragIndex {
         // m/z range from the library fragments (guard > 0), spec geometry in f64.
         let mut mz_min = f64::INFINITY;
         let mut mz_max = f64::NEG_INFINITY;
+        // Skip non-finite values rather than letting one of them decide the range. A single
+        // +inf fragment m/z used to make `mz_max` infinite, which tripped the fallback
+        // below and collapsed the range for the WHOLE library to [1.0, 2.0]: `LogBins`
+        // then clamps every real fragment into one bin and the +/-1 probe degenerates into
+        // a linear scan of the entire posting list per peak. No panic and no wrong answer,
+        // just an unbounded hang. Library load rejects non-finite m/z now, so this is the
+        // second line of defence; dropping the offending value is the right shape either
+        // way, because the range is a property of the real fragments.
         for &mz in &lib.frag_mz {
             let mz = mz as f64;
+            if !mz.is_finite() {
+                continue;
+            }
             if mz < mz_min {
                 mz_min = mz;
             }
@@ -69,6 +81,9 @@ impl FragIndex {
                 mz_max = mz;
             }
         }
+        // Reached only when the library has no finite fragment m/z at all (in practice: no
+        // fragments). A placeholder range keeps `LogBins::new` well-defined; `page_search`
+        // early-returns on the resulting empty index.
         if !mz_min.is_finite() || !mz_max.is_finite() {
             mz_min = 1.0;
             mz_max = 2.0;
@@ -268,11 +283,11 @@ pub struct WindowNarrow {
 }
 
 /// Epoch-stamped dense accumulator for the seed's fused `(count, obs_sum)` semiring
-/// (fragindex_spec Section 3.5). `obs_sum` sums the OBSERVED peak intensity per
-/// matched posting (predicted intensity deliberately dropped, reproducing the
-/// seed's existing `_pi` discard); `count` is the per-posting match count. Reused
-/// across all scans of a block; the accumulator is reset lazily via `epoch`, so
-/// only touched candidates are ever written or read.
+/// (docs/06_predict_frag_index_matchers.md). `obs_sum` sums the OBSERVED peak
+/// intensity per matched posting (predicted intensity deliberately dropped,
+/// reproducing the seed's existing `_pi` discard); `count` is the per-posting match
+/// count. Reused across all scans of a block; the accumulator is reset lazily via
+/// `epoch`, so only touched candidates are ever written or read.
 pub struct SeedScratch {
     count: Vec<u32>,
     obs_sum: Vec<f64>,
@@ -364,10 +379,11 @@ impl SeedScratch {
     }
 }
 
-/// Score one scan under both the Count and Dot semirings (fragindex_spec Section
-/// 1.3), returning `(candidate_id, count, dot)` for every touched candidate. Used
-/// by the equivalence gate against [`super::naive`]. Dot = sum over matched
-/// postings of `predicted_intensity * peak_intensity` (both widened to f64).
+/// Score one scan under both the Count and Dot semirings
+/// (docs/06_predict_frag_index_matchers.md), returning `(candidate_id, count, dot)`
+/// for every touched candidate. Used by the equivalence gate against
+/// [`super::naive`]. Dot = sum over matched postings of
+/// `predicted_intensity * peak_intensity` (both widened to f64).
 pub fn score_scan_count_dot(
     idx: &FragIndex,
     peaks: &[(f64, f32)],
@@ -497,7 +513,8 @@ mod tests {
         }
     }
 
-    // fragindex_spec Section 4.2: fragindex == naive at K=C, same predicate.
+    // docs/06_predict_frag_index_matchers.md: fragindex == naive at K=C, same
+    // predicate.
     #[test]
     fn equivalence_gate_vs_naive() {
         let tol = 20.0;

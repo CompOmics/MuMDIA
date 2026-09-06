@@ -1,6 +1,5 @@
-//! Candidate audit `mumdia audit` (sensitivity program, spec
-//! `01_workflow_and_gap_analysis.md` §4, `02_sensitivity_diagnostic_plan.md` §5,
-//! backlog P0.3 / P0.4).
+//! Candidate audit `mumdia audit` (sensitivity program,
+//! docs/20_sensitivity_and_quantification_playbook.md, backlog P0.3 / P0.4).
 //!
 //! Non-destructive, post-hoc observability: reconstruct, for every candidate in
 //! the search space (the library precursors), the pipeline stage flags and the
@@ -14,7 +13,7 @@
 //! "no fragment traces" and "traces but no accepted peak" into a single observable
 //! event (a candidate is in `psms` or it is not); when a future in-extract audit
 //! sidecar `<psms>.audit.parquet` is present, its precise per-candidate reason
-//! refines the extract-stage bucket (see [`load_extract_reasons`]).
+//! refines the extract-stage bucket (see `load_extract_reasons`).
 
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
@@ -242,7 +241,10 @@ mod tests {
     use super::*;
 
     fn tmp(name: &str) -> String {
-        let dir = std::env::temp_dir().join("mumdia_audit_test");
+        // Unique per process: a fixed name races when two `cargo test` runs share a
+        // machine, which is the convention docs/14 states and four other test modules
+        // already follow.
+        let dir = std::env::temp_dir().join(format!("mumdia_audit_test_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir.join(name).to_str().unwrap().to_string()
     }

@@ -57,7 +57,7 @@ DeepLC fine-tune (`run.rs:237-280`).
   into `Vec<Ms2Scan>`. Each `Ms2Scan` carries `scan_index`, `id`, `rt_seconds`,
   an `IsolationWindow { target_mz, lower_mz, upper_mz, im_lower, im_upper }`, and
   `peaks: Vec<Peak { mz: f64, intensity: f32, ion_mobility }>`.
-- **Library** (`--library-precursors` + `--library-fragments`), loaded by
+- **Library** (`--lib-precursors` + `--lib-fragments`), loaded by
   `Library::load` (`index.rs:54`). Provides `cands: Vec<Candidate>`
   (`candidate_id`, `peptidoform`, `charge`, `precursor_mz`, `base_peptide_id`,
   `protein`, `is_decoy`, `predicted_irt: f32`, `frag_start`, `n_frag`), the flat
@@ -296,23 +296,24 @@ deviation threshold are hardcoded in `search_seed.rs` (`:167`, `:192`, `:195`),
 not config fields.
 
 The standalone subcommand `Cmd::SearchSeed` (`main.rs:75-86`, dispatch `:458-476`)
-takes `--ms2`, `--library-precursors`, `--library-fragments`, `--out`, and
+takes `--ms2`, `--lib-precursors`, `--lib-fragments`, `--out`, and
 `--config` (all `String`; `--config` optional). There is no `--bucket-size` flag;
 `bucket_size` is read from the resolved config's `extract.bucket_size`
 (`main.rs:473`).
 
 ## Invariants, determinism, gotchas
 
-- **Determinism** (PLAN.md Section 7): the fragindex parallel path is bit-identical
-  to the *serial fragindex* best-per-candidate (this is a parallel-vs-serial claim
-  about the same backend, not a fragindex-vs-bucketed claim; the two backends use
-  different edge predicates, see the accumulation section). Groups run in `BTreeMap`
-  key order, within a group scans run in RT-ascending order (guaranteed by
-  `load_ms2`'s `sort_by rt_seconds`, `spectra.rs:95`) with a strictly-greater
-  update, and the cross-group merge is a total order (`max score`, tie earliest RT,
-  tie min scan_index; `search_seed.rs:392-409`). `select_peaks` re-sorts the top-N
-  back to index-ascending (`:299`) so the `obs_sum` float reduction is summed in a
-  fixed order. The `HashMap` is only ever reduced through this total order, never
+- **Determinism** (`docs/14_build_test_deploy_gotchas.md`): the fragindex parallel
+  path is bit-identical to the *serial fragindex* best-per-candidate (this is a
+  parallel-vs-serial claim about the same backend, not a fragindex-vs-bucketed
+  claim; the two backends use different edge predicates, see the accumulation
+  section). Groups run in `BTreeMap` key order, within a group scans run in
+  RT-ascending order (guaranteed by `load_ms2`'s `sort_by rt_seconds`,
+  `spectra.rs:95`) with a strictly-greater update, and the cross-group merge is a
+  total order (`max score`, tie earliest RT, tie min scan_index;
+  `search_seed.rs:392-409`). `select_peaks` re-sorts the top-N back to
+  index-ascending (`:299`) so the `obs_sum` float reduction is summed in a fixed
+  order. The `HashMap` is only ever reduced through this total order, never
   iterated for a float sum.
 - **Best-per-candidate, not best-per-spectrum.** One output row per candidate that,
   in at least one scan, cleared `min_matched_peaks` **and** ranked within that

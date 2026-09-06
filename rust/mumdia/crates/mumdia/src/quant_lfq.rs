@@ -1,5 +1,6 @@
-//! MaxLFQ / directLFQ cross-run label-free quantification (PLAN.md Stage G,
-//! beyond-MVP). These are inherently MULTI-RUN methods: they reconstruct a
+//! MaxLFQ / directLFQ cross-run label-free quantification
+//! (docs/12_quant_lfq_align_mbr_report_audit.md, beyond-MVP). These are
+//! inherently MULTI-RUN methods: they reconstruct a
 //! per-sample protein abundance profile from the pairwise median log-ratios of
 //! the features shared between samples (MaxLFQ: peptide-level; directLFQ:
 //! ion/fragment-level), so with a single run there are no cross-sample ratios and
@@ -13,7 +14,7 @@ fn median(v: &mut [f64]) -> f64 {
     if v.is_empty() {
         return 0.0;
     }
-    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    v.sort_by(|a, b| a.total_cmp(b));
     let n = v.len();
     if n % 2 == 1 {
         v[n / 2]

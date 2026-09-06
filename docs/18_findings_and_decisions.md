@@ -28,7 +28,7 @@ iRT has been fine-tuned (the `lib/lib_precursors_ft.parquet` library), the
 Extended feature set, and all reported points are FDR-valid (measured decoy
 fraction near 0.98 to 0.99 percent at the 1 percent threshold). Peptide counts
 are at 1 percent FDR on the `peptide_q_value` column. The extraction threshold is
-`extract.min_frag_corr`; with the default `gate_mode=apex_pearson`, it is the
+`extract.gate_min_score`; with the default `gate_mode=apex_pearson`, it is the
 Pearson correlation between observed and predicted fragment intensities at one
 apex scan. It is temporal co-elution only under `gate_mode=coelution` (or the
 co-elution half of `combined`).
@@ -53,14 +53,37 @@ else. The cost of `nn_torch`: it needs a Python interpreter with PyTorch, and it
 training is only approximately reproducible (see the determinism contract in Part
 B).
 
-The gate optimum inverts by rescorer. `native_tda` shows an inverted-U: the count
-rises to a peak at a tight gate near 0.6, then falls. `nn_torch` is monotonic
-across the tested range, looser-is-better, peaking at the loosest gate tested
-(0.2), and would likely gain further below 0.2. A linear rescorer cannot
+**The gate optimum moved (measured 2026-08-28).** The sweep above was taken on the
+RAW imported library, before the augmented tables, before
+`extract.apex_evidence_rank` became the default, and before the `nn_torch` CV fold
+was keyed on `base_peptide_id`. Re-measured on the same file under the current
+defaults, at an unchanged empirical decoy fraction of 0.0097-0.0098:
+
+| gate | `native_tda` | `nn_torch` |
+|---|---|---|
+| 0.2 | **10,847** | **10,914** |
+| 0.6 | 10,369 | 10,399 |
+
+`native_tda`'s inverted-U has flattened from below: its count rose from 9,503 to
+10,847 and its optimum moved to the loose end. Loose is now better for BOTH
+rescorers -- 0.6 costs 4.4% of peptides for `native_tda` and 4.7% for `nn_torch`,
+and halves what extract accepts (45,338 against 21,979). The shipped default is
+therefore 0.2.
+
+The `native_tda`-`nn_torch` gap has also narrowed sharply, from +8.5% to +0.6%
+(10,847 against 10,914), so "invest in the rescorer before almost anything else"
+no longer follows from these numbers either. Both statements below described the
+configuration they were measured on and no longer describe this one; they are kept
+because the sweep is a real measurement and because the shape of the change is the
+point.
+
+Historical reading, superseded: the gate optimum inverts by rescorer. `native_tda`
+showed an inverted-U peaking near 0.6; `nn_torch` was monotonic across the tested
+range, looser-is-better, peaking at the loosest gate tested (0.2). A linear rescorer cannot
 represent a hard floor on the co-elution feature, so a pre-gate does real work
 for it; a strong nonlinear rescorer absorbs the loose-gate flood and just wants
 recall. The hard gate is a linear-rescorer crutch. The extraction gate is a
-finite floor in `[0, 1]` at `extract.min_frag_corr`, default 0.2
+finite floor in `[0, 1]` at `extract.gate_min_score`, default 0.2
 (`rust/mumdia/crates/mumdia-core/src/config.rs:522`).
 
 ### A2. Mechanism of the gate
@@ -286,7 +309,7 @@ With the database-completeness gap closed, the remaining missed peptides are
 downstream and faint, about 10x lower in abundance than identified peptides.
 Partitioning the misses by the stage that dropped them: extraction presence/apex
 accounts for about 49 percent (dominated by the presence_min_matched and
-minimum-co-elution checks, not the `min_frag_corr` gate), rescoring about 26
+minimum-co-elution checks, not the `gate_min_score` gate), rescoring about 26
 percent, and seed search about 25 percent. The ceiling is therefore not one gate;
 it is split across extraction presence requirements, rescorer discrimination, and
 seed sensitivity, all on low-abundance precursors.
@@ -308,7 +331,7 @@ The `nn_torch` training loop is seed x fold x round x epoch. The knobs:
 `MUMDIA_NN_ITERS` (rounds), `MUMDIA_NN_EPOCHS` is an environment variable only
 (not engine-set, default 25), and `MUMDIA_NN_SEEDS` defaults to 1.
 
-### A11. `compete.group_by = precursor` is a misnomer and deletes modforms
+### A11. `compete.group_by = base_peptide` is a misnomer and deletes modforms
 
 The enum variant is named `Precursor`, but the group key it builds is
 `(base_peptide_id, label_code, 0, peak_rank)`
@@ -478,7 +501,7 @@ Library-input mode is the recipe that wins:
    `rescore.strict = true`). Rationale: finding A1, the rescorer is the dominant
    lever; strict mode prevents a failed sidecar from masquerading as the intended
    model. Verify `params.classifier` in `psms_scored.parquet.report.json`.
-5. Use a loose extraction gate (`extract.min_frag_corr` near 0.2). Rationale:
+5. Use a loose extraction gate (`extract.gate_min_score` near 0.2). Rationale:
    finding A1 and A2, the nonlinear rescorer prefers looser-is-better.
 6. On this AIF file only, set the conversion-time MS2 peak cap to 300 by passing
    `--top-peaks-ms2 300`. Rationale: finding A3, uncapping adds interference on
@@ -506,7 +529,7 @@ ProteoBench precursor matrix, `run_psm_q` for cross-run quantification,
    first-class and well-tested, and ideally deterministic (seed ensembling for
    stability).
 2. **Soft or budgeted extraction gate plus model-visible top-K peaks.** Replace
-   the hard `min_frag_corr` drop with a score-ranked per-window candidate budget
+   the hard `gate_min_score` drop with a score-ranked per-window candidate budget
    and pass the gate score through as a feature (findings A1, A2). Promote the
    retained top-K peaks (`extract.retain_top_peaks`, currently written to a
    sidecar but not scored) into real `candidate_id + peak_rank` rows through

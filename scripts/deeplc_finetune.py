@@ -198,11 +198,30 @@ def main():
                          "this for rt_im_train.library_irt = deeplc, replacing an imported "
                          "library's iRT with predictions that per-run calibration then maps "
                          "onto observed RT")
+    ap.add_argument("--seed", type=int, default=0,
+                    help="seed numpy and torch before fine-tuning, so two runs on the same "
+                         "input draw the same weights. Unseeded, the draw varies enough to "
+                         "change results: on the AIF benchmark the held-out RT window p95 "
+                         "varied 150-211 s across two draws of one arm, worth about 2 percent "
+                         "of peptides, which made single-run comparisons of window sizing or "
+                         "library variants unreadable. Kernel-level nondeterminism remains, "
+                         "so this narrows the variance rather than removing it.")
     args = ap.parse_args()
 
     if args.device == "cuda" and not torch.cuda.is_available():
         raise SystemExit("--device cuda requested but torch.cuda.is_available() is False "
                          "(wrong env? need a +cuXXX torch build)")
+    # Seed before anything touches an RNG: DeepLC's transfer learning shuffles and
+    # initialises, and an unseeded draw is the largest source of run-to-run
+    # variation in the whole pipeline (docs/14_build_test_deploy_gotchas.md).
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+    print(f"seed={args.seed} (numpy, torch"
+          f"{', cuda' if torch.cuda.is_available() else ''}); "
+          "training kernels are not guaranteed bit-for-bit deterministic", flush=True)
+
     # bound torch's own thread pool; only one OpenMP pool spins now (matters on cpu)
     torch.set_num_threads(max(1, args.threads))
     try:

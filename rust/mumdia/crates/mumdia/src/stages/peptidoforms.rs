@@ -1,6 +1,7 @@
 //! Stage A2 `mumdia peptidoforms`: expand stripped peptides into peptidoforms
-//! (PLAN.md Stage A2). Fixed + variable modification enumeration and charge
-//! states, emitted as ProForma strings with UniMod names. Experiment-wide.
+//! (docs/05_digest_peptidoforms.md). Fixed + variable modification enumeration
+//! and charge states, emitted as ProForma strings with UniMod names.
+//! Experiment-wide.
 
 use std::collections::{BTreeMap, HashSet};
 use std::time::Instant;

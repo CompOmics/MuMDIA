@@ -2,8 +2,9 @@
 
 Repository guide for coding agents and maintainers. Read this first, then use
 `docs/README.md` to route to the code-grounded subsystem reference. `plan.md` is
-the long algorithmic design history; when it disagrees with executable code,
-tests and the tracked `docs/` guide describe current behavior.
+the long algorithmic design history, untracked and local-only; when it disagrees
+with executable code, tests and the tracked `docs/` guide describe current
+behavior.
 
 ## Project and scientific objective
 
@@ -31,7 +32,8 @@ policy for tuning and validation.
   - `mumdia-io`: Arrow/Parquet table layer, hashes, JSON, artifact reports.
   - `mumdia`: CLI/library, fragment index, FDR/rescoring, and stages.
 - `scripts/`: seven engine-invoked Python workers plus four imported-library
-  helpers (eleven scripts total), including `augment_library.py`, which adds the
+  helpers (eleven scripts), and `_lib_io.py`, the shared writer the helpers use so
+  they cannot emit a parquet the engine rejects. Includes `augment_library.py`, which adds the
   tryptic FASTA peptides an imported library is missing. Sidecars use positional
   file contracts.
 - `docs/`: tracked developer guide (`01` through `21`); start at
@@ -130,14 +132,14 @@ fine-tuning, Extended features, the loose `apex_pearson` extraction gate, and
 `nn_torch` rescoring:
 
 ```text
-mumdia doctor --config config.local-diann-lib.json
+mumdia doctor --config configs/examples/diann-library.json
 
 mumdia run \
   --lib-precursors lib/lib_precursors.parquet \
   --lib-fragments  lib/lib_fragments.parquet \
   --mzml mzml_files/LFQ_Orbitrap_AIF_Ecoli_01.mzML \
   --out-dir out_aif_nn \
-  --config config.local-diann-lib.json \
+  --config configs/examples/diann-library.json \
   --top-peaks-ms2 300
 ```
 
@@ -145,6 +147,14 @@ Use the original imported precursor library here. Do not pass
 `lib_precursors_ft.parquet` while also enabling fine-tuning. The
 `--top-peaks-ms2 300` in that command reproduces this one benchmark. Do not
 carry it to another acquisition; see the next subsection.
+
+`configs/examples/diann-library.json` sets both interpreters to `"auto"`, so it
+runs unchanged only where an environment with torch and DeepLC is discoverable
+(an activated conda env, or `MUMDIA_PYTHON_RESCORE` / `MUMDIA_PYTHON_DEEPLC`).
+Run `mumdia doctor --config ...` first: it prints the interpreter it resolved and
+the versions, or names exactly what is missing. On a machine with several
+candidate environments, copy the example and write the two paths in, which is
+what the untracked `config.local-*.json` files are for.
 
 The historical result is about 10.3k confident precursor-shaped report rows,
 selected by stripped-peptide q at 1%, versus roughly 9.3-9.5k with linear/native
@@ -173,8 +183,16 @@ Orbitrap DIA run the same cap discarded 78.6% of all MS2 peaks and cost 60% of
 the peptides (25,425 capped versus 63,237 uncapped) at an unchanged 0.99%
 empirical decoy fraction, so the loss is sensitivity, not a loosened threshold.
 The mechanism is peak-group formation rather than scoring: with most peaks gone,
-`presence_min_fragments` cannot be met and real peptides are recorded
-`NO_PEAK_GROUP`.
+`presence_min_fragments` cannot be met and real peptides never assemble a peak
+group.
+
+That reading comes from the cap dose-response, not from the audit ladder's own
+label. `NO_PEAK_GROUP` cannot be used as evidence for it: `audit.rs` reads a
+per-candidate audit table that `extract` does not write (`emit_candidate_audit`
+is unwired), so the reason map is always empty and the `_ => NoPeakGroup`
+catch-all absorbs presence failures, matched-fraction failures AND every
+extraction-gate rejection alike. Treat the label as "did not survive extract",
+and do not decompose it further until the audit table is actually produced.
 
 Rules that follow from this:
 
@@ -195,11 +213,29 @@ is the decision record.
 
 ### Extraction gate and retention time
 
-`extract.min_frag_corr` is named historically. Under the default
+`extract.gate_min_score` is named historically. Under the default
 `gate_mode = apex_pearson`, it thresholds observed-versus-predicted fragment
 intensities at one apex; it is not a chromatographic co-elution correlation.
-The observed optimum was about 0.2 with the NN and tighter with the native
-linear model.
+**The default is 0.2, and loose is now better for both rescorers.** Measured
+2026-08-28 on the AIF file under the current defaults, at an unchanged empirical
+decoy fraction of 0.0097-0.0098:
+
+| gate | `native_tda` | `nn_torch` |
+|---|---|---|
+| 0.2 | 10,847 | 10,914 |
+| 0.6 | 10,369 | 10,399 |
+
+0.6 costs 4.4% of peptides for `native_tda` and 4.7% for `nn_torch`, and halves
+what extract accepts (45,338 against 21,979).
+
+This corrects an earlier reading. The `docs/18` gate sweep, taken on the RAW
+imported library before the augmented tables, before `apex_evidence_rank` became
+the default and before the CV fold was paired, showed `native_tda` peaking at 0.6
+(9,503) and `nn_torch` at the loose end. On that basis the default was briefly
+changed to 0.6 to match the default classifier. `native_tda` has since risen to
+10,847 and its optimum has moved to the loose end, so the sweep no longer
+describes this configuration and the default is back to 0.2. Re-derive the optimum
+rather than inheriting it if you change the library, the apex mode or the folds.
 
 DeepLC 4.1.1 or newer is required wherever DeepLC runs (`predict-frag` in FASTA mode, the
 optional fine-tune): `mumdia doctor` fails on an older one, `sidecar::require_deeplc_version`
@@ -269,11 +305,17 @@ fine-tuning also is not guaranteed deterministic.
   get 1.0. Under an experiment-wide rescore the grouping is experiment-wide, so
   a per-run count on those columns is diluted by roughly 1/n_runs and is
   meaningless. The correct per-file unit there is `run_psm_q`.
-- Pooling more runs does not tighten q. `fdr.rs:38` computes
-  `q = (decoys + 1) / max(1, targets)`, which is scale-invariant under
-  replicating the population. The only pool-size term is the +1 pseudocount,
-  which makes a larger pool marginally looser. Do not attribute per-run count
-  changes to pool size.
+- Pooling more runs does not tighten q. `fdr.rs` computes
+  `q = (decoys + 1) / max(1, targets)`, whose only pool-size term is the `+1`
+  pseudocount, and that makes a larger pool marginally LOOSER, never tighter.
+  Do not attribute per-run count changes to pool size.
+
+  "Scale-invariant" overstates it, though, and the overstatement matters at the
+  top of the list: the floor is exactly `1/T`, so it scales with the pool.
+  Measured on the real kernel, replicating a five-row population once moved q
+  from `[0.5, 0.5, 0.667, 0.667, 1.0]` to `[0.25, 0.25, 0.5, 0.5, 0.833]`. The
+  per-source `run_psm_q` is exactly per-run and genuinely unaffected; the pooled
+  `q_value` -- which is what `run-experiment` gates quant on -- is not.
 - Reported benchmark counts must name their row and q-value unit. `peptides.tsv`
   contains `(peptidoform, charge)` rows but is selected with
   `peptide_q_value`; it is not a precursor-q report.
@@ -292,10 +334,19 @@ fine-tuning also is not guaranteed deterministic.
   the input table each PSM came from (`rescore.rs:65-70,108`), and computes a
   per-source `run_psm_q` alongside the pooled `q_value`
   (`rescore.rs:403-408`). Pooling therefore never costs per-run FDR, and
-  sub-batching a large experiment is statistically free. Batch only to fit RAM.
+  sub-batching is free in `run_psm_q` terms. It is not free in pooled-`q_value`
+  terms, because the `1/T` floor moves with the pool, so a batched run and a
+  single pooled run do not produce identical `q_value` columns. Batch to fit RAM,
+  and compare per-run counts on `run_psm_q`.
 - Pooled rescore scales linearly, measured 0.834 ms/PSM on the streaming
-  backend. The feature matrix is `n_psms x n_features x 4` bytes; size batches
-  from that.
+  backend. Two feature matrices, two widths: the Python worker's is
+  `n_psms x n_features x 4` bytes (f32), while the Rust `feats` that `rescore`
+  builds is `Vec<Vec<f64>>`, so `n_psms x n_features x 8` plus a heap allocation
+  and 24 bytes of spine per PSM. `native_tda` additionally runs all folds in
+  parallel, each holding an owned standardised copy of its training slice, so its
+  peak is roughly `(1 + folds)x` the matrix. The stage logs the figure before it
+  allocates, and `rescore.max_feature_matrix_gib` turns exceeding a ceiling into
+  an error at startup rather than an OS kill hours in.
 
 ### Rescore cost: handoff, feature selection, training-set reduction
 
@@ -348,7 +399,7 @@ sections 10-16:
   and every departure that helps one pool costs another. Do not retune them from a single
   benchmark. The only knob positive on every pool is `MUMDIA_NN_SEEDS=3` (+0.1 to +0.3 pp at
   3x training).
-- The extraction and RT defaults (`min_frag_corr` 0.2, `rt_window_multiplier` 1.5,
+- The extraction and RT defaults (`gate_min_score` 0.2, `rt_window_multiplier` 1.5,
   `apex_count_window` 5) are likewise a measured local optimum on HYE end to end (docs/28
   section 18); `window_holdout_frac` is neutral there with a pre-fine-tuned library.
 - Reference point, 2026-09-05: a complete HYE single run is 17:52 at 16.5 GiB on 32 threads
@@ -399,7 +450,8 @@ Current correctness contract:
   invoking quant with each run's chromatograms. Changing `q_filter` does not
   select a source.
 
-The default competition key `precursor` is a misnomer. `compete.rs:88` keys the
+The default competition key is `base_peptide`, renamed from `precursor`, which it
+was not. `compete.rs:88` keys the
 group on `(base_peptide_id, label_code, 0, peak_rank)`, and `base_peptide_id`
 comes from the stripped sequence (`import_diann_lib.py:137` factorises
 `Stripped.Sequence`). `compete.rs:319-340` keeps only the highest `prelim_score`
@@ -413,6 +465,46 @@ Use Parquet quantities for analysis; TSV values are rounded for presentation.
 Cross-run consensus ions, interference-aware ion selection, minimum clean-ion
 rules, connected-component LFQ diagnostics, and coherent MBR requantification
 remain open high-priority work.
+
+## Defaults promoted on correctness grounds, not on a count
+
+Three defaults changed because the previous value was wrong on its own terms, not
+because a benchmark improved. None was promoted from a sensitivity measurement,
+and each still needs entrapment plus a second acquisition before anyone claims a
+sensitivity result for it.
+
+- `extract.apex_evidence_rank` is now `true`. The legacy signature-intensity
+  apex scores a scan group by the summed observed intensity of only the top-K
+  *predicted* fragments, so when none of those K is observed at any qualifying
+  scan the score is `0.0` everywhere, the strict `>` never replaces the first
+  candidate, and the apex silently becomes the *lowest-RT qualifying scan*: up to
+  a full RT window away, or anywhere in the gradient for a candidate with no
+  window row. The RT prior cannot rescue it, because the combination is
+  multiplicative and a zero annihilates the prior in exactly the case the prior
+  exists for. Evidence rank scores `(n_distinct_fragments + tie) * prior`, which
+  is always positive, so the fallback is unreachable. The wrong apex propagated
+  into `prelim_score`, which decides the pre-FDR competition winner, and into
+  quant's integration centre.
+
+  The quantification question this left open is now measured (`bench/README.md`,
+  HYE 3+3, 2026-08-29): quantification does not distinguish the two settings, every
+  accuracy difference being under 0.013 in median |epsilon| and 0.002 in median CV,
+  which is inside the DeepLC fine-tune draw variance the two arms carry. Extraction
+  does distinguish them, in the promoted default's favour: the legacy apex pushes
+  27.6% MORE candidates through extract (14.29 M against 11.20 M over six runs) and
+  returns 1.0% FEWER peptides from them, costing an hour of pooled rescore. That is
+  the fallback showing up as measured cost. Still one acquisition and no entrapment,
+  so the promotion stays a correctness result rather than a sensitivity one.
+- `extract.gate_min_score` stays `0.2`. It was briefly changed to `0.6`, the
+  documented optimum for the default `native_tda` rescorer, and then measured: 0.6
+  costs 4.4% of peptides for `native_tda` and 4.7% for `nn_torch` at an unchanged
+  decoy fraction, because the gate sweep in `docs/18` was taken on the raw library
+  before the current defaults and its optimum has since moved to the loose end for
+  both rescorers. A default changed from a documentation claim, reverted by
+  measurement.
+- `features.emit_pin` is now `false`. No MuMDIA stage reads the file, because
+  rescore builds its own PIN, and it is a ~5.4 GB text write per run on a real
+  library.
 
 ## Changes that remain benchmark-gated
 

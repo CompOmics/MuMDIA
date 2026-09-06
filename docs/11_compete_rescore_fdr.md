@@ -4,8 +4,8 @@
 
 ## Purpose
 
-This subsystem is the tail of the identification chain (plan.md Stage F). It
-turns the per-PSM feature table produced by the `features` stage into a scored,
+This subsystem is the tail of the identification chain (Stage F). It turns the
+per-PSM feature table produced by the `features` stage into a scored,
 FDR-controlled result set. It has three parts:
 
 1. **compete** (`mumdia compete`): within each competition group, resolve
@@ -184,7 +184,7 @@ could evict its paired decoy, the decoy population would be depleted and the
 target-decoy null would collapse, badly underestimating FDR. This is stated at
 compete.rs:71-78 and re-stated on `CompetitionMode` in config.rs:865-870.
 
-#### `group_by = precursor` does not group by precursor
+#### `group_by = base_peptide` was called `precursor`, which it never was
 
 The default variant is named `Precursor`, but element 0 of its key is
 `base_peptide_id` (compete.rs:88), which is a **stripped-sequence** id in both
@@ -260,7 +260,7 @@ rows are projected into the output columns (compete.rs:151-185), and the schema
 is forwarded. The report records `group_by`, `mode`, `input_rows`, `kept`,
 `removed` (compete.rs:241-255). `removed` is the number to read when checking
 whether a grouping choice is silently discarding evidence: under
-`group_by = precursor` on a modification-rich library it reached 46.6% of the
+`group_by = base_peptide` on a modification-rich library it reached 46.6% of the
 input rows, and under `group_by = peptidoform_charge` on the same input it was 0.
 
 ### rescore: input concat and classifier dispatch
@@ -276,14 +276,26 @@ repeats across runs, so an experiment-wide table would collide on it
 **Pooling costs no per-run FDR, so batch only to fit memory.** Each input table
 keeps its own `source` stamp, and `run_psm_q` re-runs the whole target-decoy
 analysis within each source (rescore.rs:411-437), so a run pooled with others
-still receives a genuine per-run q. Pooling does not tighten the pooled `q_value`
-either, because the estimator is scale-invariant (see
-[fdr: the kernels](#fdr-the-kernels)). What does scale is cost: the dense feature
-matrix is `n_psms * n_features * 4` bytes, and pooled rescoring measured
-0.834 ms/PSM on the streaming backend, i.e. linear in PSM count. Splitting a
-large experiment into several `rescore --competed` batches is therefore
-statistically free; choose the batch size from available RAM, not from a
-statistical argument.
+still receives a genuine per-run q, exactly and by construction.
+
+Pooling does not TIGHTEN the pooled `q_value`: the only pool-size term in
+`(D+1)/T` is the pseudocount, and it makes a larger pool marginally looser. But
+the pooled column is not scale-invariant either, and the earlier wording here
+said it was. The floor is exactly `1/T`, so it moves with the pool: measured on
+the kernel, replicating a five-row population once takes q from
+`[0.5, 0.5, 0.667, 0.667, 1.0]` to `[0.25, 0.25, 0.5, 0.5, 0.833]`. So splitting
+a large experiment into several `rescore --competed` batches is free in
+`run_psm_q` terms and NOT free in `q_value` terms, which matters because
+`run-experiment` gates per-run quant on the pooled column. Batch to fit RAM, and
+compare per-run counts on `run_psm_q`.
+
+What scales with cost: pooled rescoring measured 0.834 ms/PSM on the streaming
+backend, linear in PSM count. Two matrices with two widths -- the Python worker's
+is `n_psms * n_features * 4` bytes (f32), while the Rust `feats` the stage builds
+is `Vec<Vec<f64>>`, so `n_psms * n_features * 8` plus a heap allocation and 24
+bytes of spine per PSM, and `native_tda` holds roughly `(1 + folds)x` that at
+peak. The stage logs the figure before allocating, and
+`rescore.max_feature_matrix_gib` makes exceeding a ceiling an error at startup.
 
 The NnTorch worker picks its backend from the handoff file size against
 `MUMDIA_NN_STREAM_GB` (default 4, `nn_rescore_worker.py:299-300`). A matrix
@@ -355,7 +367,23 @@ reads the PIN through `mokapot.read_pin()` and cannot consume Parquet, so
 
 **`RescorerKind::NnTorch`** (config.rs:107-113): runs `nn_rescore_worker.py`
 through the same `run_pin_sidecar` contract (rescore.rs:187-213). A nonlinear
-PyTorch MLP with the same CV-fold + iterative positive-reselection scheme. The
+PyTorch MLP with the same CV-fold + iterative positive-reselection scheme.
+
+The fold key genuinely is the same one now, and was not before: the worker derived
+its fold from `md5` of the mod-stripped peptidoform, which leaves the `DECOY_`
+marker in place, so a target and its paired decoy hashed into DIFFERENT folds while
+`percolator_lite` keys on `base_peptide_id` and pairs them. Stripping the marker
+would only have fixed a shift-decoy library, because a reverse decoy's peptidoform
+is the reversed sequence and no string derived from it reaches its target. The
+engine therefore writes `base_peptide_id` per PIN row to
+`rescore_<tag>.foldkeys.parquet` and names the file in `MUMDIA_NN_FOLD_KEYS`; the
+worker prefers it and falls back to the hash with a warning. The old behaviour was
+conservative in direction -- the semi-supervised loop uses all decoys as negatives
+but only confident targets as positives, so cross-fold memorisation depressed a
+paired target more often than it inflated a decoy -- so this was a sensitivity and
+reproducibility defect rather than an FDR-validity one.
+
+The
 initial feature/sign and every positive set are selected from that fold's
 training rows only (`nn_rescore_worker.py:556-589`); empty, single-class, or
 zero-positive folds hard-error (`:559-565`, `:602-605`), so held-out labels do not
@@ -425,7 +453,7 @@ derived from one another, they are separately calibrated nulls.
 
 `precursor_q` groups on `(peptidoform, charge)` at this stage, but what reaches
 this stage depends on `compete.group_by`. Under the default
-`group_by = precursor`, compete has already collapsed every charge and
+`group_by = base_peptide`, compete has already collapsed every charge and
 modification variant of a stripped peptide to one row, so the precursor grouping
 sees roughly one form per peptide and `precursor_q` reports a base-peptide
 population. It is a precursor-level unit only under
@@ -461,7 +489,7 @@ least the precursor-level floor. Beyond that floor the ordering is an empirical
 property of the score distribution, not a guarantee, and has not been measured
 here. Reporting both lets a consumer pick the FDR granularity that matches its
 claim (a peptide-level ID list vs a precursor-level one). Under the default
-`compete.group_by = precursor` the two levels see almost the same one-row-per-
+`compete.group_by = base_peptide` the two levels see almost the same one-row-per-
 peptide population, so the distinction only becomes real under
 `compete.group_by = peptidoform_charge`.
 
@@ -487,8 +515,9 @@ rescore.rs:498-506, 551-557).
 1. Sort record indices by descending score (fdr.rs:12-18).
 2. Walk in score order, processing **tied-score blocks together** so every PSM in
    a block gets the same FDR regardless of its arbitrary within-tie order
-   (fdr.rs:27-43). This is a determinism requirement (plan.md Section 7): a
-   target/decoy interleave inside one tie block must not change the q.
+   (fdr.rs:27-43). This is a determinism requirement
+   (`docs/14_build_test_deploy_gotchas.md`): a target/decoy interleave inside one
+   tie block must not change the q.
 3. FDR at rank = `(td + 1) / max(1, tt)` where `td`, `tt` are cumulative decoy and
    target counts at that score (fdr.rs:38). The `+1` is the conservative
    finite-sample pseudocount; the bare `n_decoys/n_targets` is optimistic in the
@@ -572,7 +601,7 @@ one dead field kept in the struct (the `percolator` classifier is unwired).
 
 | field | default | effect |
 |---|---|---|
-| `group_by` | `precursor` | despite the name, groups by stripped peptide: all charge **and** modification variants of one `base_peptide_id` share a group, separately within target and decoy labels; `apex` also buckets by rounded apex RT; `peptidoform_charge` keeps each peptidoform+charge separate and is required for a PTM search |
+| `group_by` | `base_peptide` | despite the name, groups by stripped peptide: all charge **and** modification variants of one `base_peptide_id` share a group, separately within target and decoy labels; `apex` also buckets by rounded apex RT; `peptidoform_charge` keeps each peptidoform+charge separate and is required for a PTM search |
 | `apex_rt_tolerance_s` | `5.0` | RT bucket width (s) for `group_by = apex` (compete.rs:90) |
 | `mode` | `winner_take_all` | within-group resolution (`CompetitionMode`, config.rs:873): `winner_take_all`, `none`, `features_only`, `unique_evidence`, `margin_gated` |
 | `margin` | `0.0` | score margin required to remove a loser under `margin_gated` (compete.rs:379) |
@@ -602,7 +631,7 @@ unless a knob is set.
 
 ## Invariants, determinism, gotchas
 
-- **`group_by = precursor` is peptide-level, not precursor-level** (compete.rs:88).
+- **`group_by = base_peptide` is peptide-level, not precursor-level** (compete.rs:88).
   Its key is `base_peptide_id`, the stripped-sequence id, so `winner_take_all`
   deletes every lower-scoring charge and modification sibling before rescore. On a
   modification-rich imported library that removed 46.6% of extracted candidates,
@@ -644,7 +673,10 @@ unless a knob is set.
   row in the sidecar output is a hard error, not a worst-score fallback: coverage
   must be exact/unique/finite (`align_sidecar_scores`, rescore.rs:1041-1077,
   missing-row bail at rescore.rs:1073-1075).
-- **Pooling runs is statistically free; batch for RAM only.** `source` is stamped
+- **Pooling runs costs no per-run FDR; batch for RAM.** (`run_psm_q` is exactly
+  per-source; the pooled `q_value` floor is `1/T` and does move with pool size, so
+  batched and unbatched runs do not produce identical `q_value` columns.) `source`
+  is stamped
   per input table and `run_psm_q` re-runs TDA within each source
   (rescore.rs:65-70, 108, 411-437), so a pooled rescore still gives every run its
   own FDR, and `(D+1)/T` is scale-invariant apart from the pseudocount

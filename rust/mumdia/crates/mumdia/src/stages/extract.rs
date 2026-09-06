@@ -1,11 +1,11 @@
-//! Stage D `mumdia extract`: targeted 3D extraction (PLAN.md Stage D).
+//! Stage D `mumdia extract`: targeted 3D extraction (docs/09_extract.md).
 //!
 //! Data-driven and peak-major: observed peaks probe the inverted fragment index,
 //! and a candidate hypothesis is materialized only where fragment evidence
 //! exists (a sparse accumulator keyed by `candidate_id`, entries created on first
 //! collision). Work scales with peak-candidate collisions, not library size.
-//! RT is applied as a per-candidate window post-filter (the documented fallback,
-//! PLAN.md Stage D part 2); MVP is 3D so IM is absent.
+//! RT is applied as a per-candidate window post-filter (the documented
+//! fallback); MVP is 3D so IM is absent.
 //!
 //! The cascade: (a) isolation-window candidate range + RT window membership,
 //! (b) cheap matched-fragment presence gate, (c) matched-fragment count + a
@@ -21,7 +21,7 @@ use mumdia_core::schema::artifact;
 use mumdia_io::report::ArtifactReport;
 use mumdia_io::table::{write_table, Col, TableFile, TableWriter};
 use serde_json::json;
-use tracing::info;
+use tracing::{info, warn};
 
 use mumdia_core::constants::{ppm_bounds, ISOTOPE_SPACING};
 
@@ -85,8 +85,8 @@ pub struct ExtractParams<'a> {
     pub library_precursors: &'a str,
     pub library_fragments: &'a str,
     pub run_windows: &'a str,
-    /// Optional MS1 spectra for precursor isotope-envelope features (PLAN.md
-    /// Stage E). When absent, MS1 columns are null.
+    /// Optional MS1 spectra for precursor isotope-envelope features
+    /// (docs/10_features.md). When absent, MS1 columns are null.
     pub ms1: Option<&'a str>,
     /// Optional per-run mass recalibration (search-seed `<seed>.masscal.json`):
     /// systematic fragment ppm offset + learned tolerance.
@@ -423,7 +423,7 @@ fn demix_solve_scan(
         }
         for (j, rs) in ratios.iter_mut().enumerate() {
             if !rs.is_empty() {
-                rs.sort_by(|x, z| x.partial_cmp(z).unwrap_or(std::cmp::Ordering::Equal));
+                rs.sort_by(|x, z| x.total_cmp(z));
                 a_p[j] = rs[rs.len() / 2];
             }
         }
@@ -678,10 +678,7 @@ impl MassOffset {
     #[inline]
     fn factor_at(&self, mz: f64) -> f64 {
         let ppm = if self.grid_mz.len() >= 2 {
-            match self
-                .grid_mz
-                .binary_search_by(|g| g.partial_cmp(&mz).unwrap_or(std::cmp::Ordering::Equal))
-            {
+            match self.grid_mz.binary_search_by(|g| g.total_cmp(&mz)) {
                 Ok(i) => self.grid_ppm[i],
                 Err(0) => self.grid_ppm[0],
                 Err(i) if i >= self.grid_mz.len() => self.grid_ppm[self.grid_mz.len() - 1],
@@ -1250,7 +1247,7 @@ fn extract_twopass_windows(
                     }
                     let mut a_p: BTreeMap<u32, f64> = BTreeMap::new();
                     for (cid, mut v) in uniq {
-                        v.sort_by(|x, z| x.partial_cmp(z).unwrap_or(std::cmp::Ordering::Equal));
+                        v.sort_by(|x, z| x.total_cmp(z));
                         a_p.insert(cid, v[v.len() / 2]);
                     }
                     for (obs, obs_mz, cl) in &prows {
@@ -1469,10 +1466,34 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
     let ncand = lib.n_candidates();
     let mut rt_lo = vec![f64::NEG_INFINITY; ncand];
     let mut rt_hi = vec![f64::INFINITY; ncand];
-    let mut rt_cal = vec![0.0f64; ncand];
+    // NaN, not 0.0, for a candidate with no `run_windows` row. Stage B already uses NaN
+    // as the explicit "calibration unavailable" sentinel (`candidate_window`), and
+    // `calibrated_rt_error` maps a non-finite value to 0.0, i.e. no RT evidence. A 0.0
+    // here is *finite*, so it used to produce `rt_error_abs = apex_rt`, the worst possible
+    // value, for exactly the candidates the other path gives the best value to. That made
+    // the feature a proxy for "was this candidate in the window table", which is not a
+    // property of the spectrum. One sentinel, one meaning.
+    let mut rt_cal = vec![f64::NAN; ncand];
     for i in 0..rw.nrows {
         let c = rw_cid[i] as usize;
         if c < ncand {
+            // The eight RT-window guards downstream are all `rt < rt_lo || rt > rt_hi`,
+            // which is false for NaN, so a NaN bound does not reject the scan, it accepts
+            // *every* scan: the candidate is searched across the whole gradient with no RT
+            // prior and no warning. The legitimate unbounded case is written as explicit
+            // -inf/+inf by `candidate_window`, so a NaN here can only mean a corrupt or
+            // externally-written window table. Reject it while the row can be named.
+            if rw_lo[i].is_nan() || rw_hi[i].is_nan() {
+                anyhow::bail!(
+                    "run_windows row {i} (candidate_id {c}) has a NaN RT bound \
+                     (rt_lo={}, rt_hi={}); an unbounded window must be written as \
+                     -inf/+inf, because a NaN bound silently matches every scan instead \
+                     of being rejected. Re-run rt-im-train to regenerate {}",
+                    rw_lo[i],
+                    rw_hi[i],
+                    p.run_windows
+                );
+            }
             rt_lo[c] = rw_lo[i];
             rt_hi[c] = rw_hi[i];
             rt_cal[c] = rw_cal[i];
@@ -1503,11 +1524,11 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
         let mut w: Vec<(f64, f64, Vec<f64>)> = tmp
             .into_iter()
             .map(|((lb, ub), mut v)| {
-                v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                v.sort_by(|a, b| a.total_cmp(b));
                 (f64::from_bits(lb), f64::from_bits(ub), v)
             })
             .collect();
-        w.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        w.sort_by(|a, b| a.0.total_cmp(&b.0));
         w
     } else {
         Vec::new()
@@ -1540,6 +1561,21 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
                 mz_cal_grid = gmz.len(),
                 "extract: using mass recalibration"
             );
+            // `extract.frag_tol_ppm` is a FALLBACK, not a setting, in any orchestrated
+            // run: search-seed always writes `frag_tol_ppm` into masscal.json --
+            // including in its calibration-failure branch, where it writes
+            // `search_seed.fragment_tol_ppm` -- and both orchestrators always pass
+            // `--mass-cal`. So a config carrying `extract.frag_tol_ppm = 40` extracted at
+            // the learned value with nothing said about it. Say it, because a config key
+            // that is read and then ignored is worse than one that is absent.
+            if (tol - p.cfg.frag_tol_ppm).abs() > 1e-9 {
+                warn!(
+                    configured_frag_tol_ppm = p.cfg.frag_tol_ppm,
+                    learned_frag_tol_ppm = tol,
+                    mass_cal = path,
+                    "extract: extract.frag_tol_ppm is overridden by the learned tolerance                      from mass calibration. It applies only when no --mass-cal is passed;                      to widen the search tolerance, set search_seed.fragment_tol_ppm"
+                );
+            }
             (off, tol, gmz, gpp)
         }
         _ => (0.0, p.cfg.frag_tol_ppm, Vec::new(), Vec::new()),
@@ -1900,7 +1936,7 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
         }
 
         // Group hits into scan groups by RT (dedupe same fragment in a scan by max).
-        hits.sort_by(|a, b| a.rt.partial_cmp(&b.rt).unwrap());
+        hits.sort_by(|a, b| a.rt.total_cmp(&b.rt));
         // scan groups: Vec<(rt, BTreeMap<frag,intensity>)>. A BTreeMap keeps the
         // per-scan fragment order fixed so the f32 apex sum is deterministic.
         let mut groups: Vec<(f64, BTreeMap<u16, f32>)> = Vec::new();
@@ -1938,7 +1974,7 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
                     g.extend_from_slice(&rts[a..b]);
                 }
             }
-            g.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            g.sort_by(|a, b| a.total_cmp(b));
             g.dedup();
             g
         } else {
@@ -2035,11 +2071,7 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
         };
         let sig: Vec<u16> = {
             let mut ord: Vec<usize> = (0..fints0.len()).collect();
-            ord.sort_by(|&a, &b| {
-                fints0[b]
-                    .partial_cmp(&fints0[a])
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
+            ord.sort_by(|&a, &b| fints0[b].total_cmp(&fints0[a]));
             ord.into_iter().take(k_sig).map(|o| o as u16).collect()
         };
         let mut apex_rt = groups[0].0;
@@ -2172,19 +2204,19 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
         let peak_spec = || peak_spectral_score(&groups, &sig, fints0);
         let coel = || coelution_gate_score(&groups, &distinct, &sig, fints0);
 
-        if p.cfg.min_frag_corr > 0.0 {
-            // Acceptance gate. `min_frag_corr` thresholds the ACTIVE gate_mode's
+        if p.cfg.gate_min_score > 0.0 {
+            // Acceptance gate. `gate_min_score` thresholds the ACTIVE gate_mode's
             // spectral-agreement score (plan Section 9): the legacy single-apex-scan
             // Pearson (one chimeric scan can dominate), the peak-integrated spectral
             // Pearson, the apex spectral-entropy similarity, the temporal co-elution
             // score, or Combined (both, more specific). Only the active score computes.
             let rejected = match p.cfg.gate_mode {
-                GateMode::ApexPearson => apex_pearson() < p.cfg.min_frag_corr,
-                GateMode::PeakSpectral => peak_spec() < p.cfg.min_frag_corr,
-                GateMode::SpectralEntropy => apex_entropy() < p.cfg.min_frag_corr,
-                GateMode::Coelution => coel() < p.cfg.min_frag_corr,
+                GateMode::ApexPearson => apex_pearson() < p.cfg.gate_min_score,
+                GateMode::PeakSpectral => peak_spec() < p.cfg.gate_min_score,
+                GateMode::SpectralEntropy => apex_entropy() < p.cfg.gate_min_score,
+                GateMode::Coelution => coel() < p.cfg.gate_min_score,
                 GateMode::Combined => {
-                    peak_spec() < p.cfg.min_frag_corr || coel() < p.cfg.gate_coelution_min
+                    peak_spec() < p.cfg.gate_min_score || coel() < p.cfg.gate_coelution_min
                 }
             };
             if rejected {
@@ -2291,7 +2323,7 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
                 }
                 Some(v) => {
                     let mut s = v.clone();
-                    s.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+                    s.sort_by(|a, b| a.0.total_cmp(&b.0));
                     (
                         s.iter().map(|(r, _)| *r as f32).collect(),
                         s.iter().map(|(_, i)| *i).collect(),
@@ -2845,7 +2877,7 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
                 "frag_ppm_offset": frag_offset,
                 "presence_min_fragments": p.cfg.presence_min_fragments,
                 "presence_min_coelution": p.cfg.presence_min_coelution,
-                "min_frag_corr": p.cfg.min_frag_corr,
+                "gate_min_score": p.cfg.gate_min_score,
                 "gate_mode": p.cfg.gate_mode,
                 "gate_coelution_min": p.cfg.gate_coelution_min,
                 "scan_window": scan_window,

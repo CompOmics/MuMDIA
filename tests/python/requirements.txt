@@ -1,0 +1,29 @@
+# Base requirements for the Python sidecar contract tests (tests/python).
+# These four are enough to run every test that does not need an ML dependency,
+# which includes the whole mbr_worker suite, the DIA-NN library recipe suite and
+# the predictor import-order suite.
+pytest>=7.0
+pyarrow>=8.0
+pandas>=1.4
+numpy>=1.22
+
+# Optional extras. Each unlocks the tests that would otherwise skip; install
+# them into the same interpreter that runs pytest, because the suite invokes
+# every worker with sys.executable.
+#
+#   scikit-learn  -> test_entrapment_worker.py  (the entrapment rescorer; also
+#                    required by mokapot)
+#   mokapot       -> test_mokapot_worker.py     (out-of-fold coverage +
+#                    MUMDIA_RESCORE_MODEL selection)
+#   torch         -> test_nn_rescore_worker.py  (nn_torch coverage across the
+#                    TSV PIN, the parquet handoff and the streaming memmap)
+#   deeplc        -> the fresh-interpreter import-order check for
+#                    deeplc_worker.py and deeplc_finetune.py
+#   psm_utils     -> same check for deeplc_finetune.py
+#   ms2pip        -> the ms2pip_worker.py output-schema test
+#
+# Note on pandas: `DataFrame.to_parquet` chooses the arrow string width itself,
+# and pandas 3 writes `large_string`, which the engine rejects. The library
+# helpers write through `scripts/_lib_io.write_engine_parquet` for that reason,
+# and the string-type assertions in test_import_diann_lib.py and
+# test_decoy_builders.py are what keep it true on any pandas version.

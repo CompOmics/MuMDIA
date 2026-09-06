@@ -1,4 +1,5 @@
 /target
+**/target/
 *.parquet
 !test_data/**/*.parquet
 .mumdia_work/
@@ -20,11 +21,14 @@ sidecar_work/
 *.log
 # ad-hoc analysis notebooks, dev notes, scratch configs (not shipped)
 notebooks/
-MISS_ANALYSIS*.md
-fragindex_*.md
-*_plan.md
-speedup.md
+/MISS_ANALYSIS*.md
+/fragindex_*.md
+/*_plan.md
+/speedup.md
 /cfg_*.json
+/config_*.json
+/config.aif-*.json
+/config.hye-*.json
 /-covr2.gitignore
 # coverage-instrumented source scratch
 *-covr2.rs
@@ -38,14 +42,35 @@ scripts/_probe*.py
 /*.md
 !/README.md
 !/CLAUDE.md
+!/CHANGELOG.md
+!/CONTRIBUTING.md
+!/SECURITY.md
+!/CODE_OF_CONDUCT.md
+!/THIRD_PARTY_LICENSES.md
 # local archive of superseded working docs (not published)
 /_archive/
+# Emitted by ci/smoke.sh for the cross-platform comparison in CI.
+/smoke_output_hashes.txt
+# Local benchmark inputs and scratch outputs (tens of GB; never source). The
+# imported spectral libraries under lib/ are irreplaceable local data, not build
+# output: ignoring them keeps them out of commits without risking deletion.
+/lib/
+/lib_capped/
+/raw_files/
+/val*/
+/mbr_k3/
+/mbr_work/
+/missed_xics*/
+# Vendored third-party source read for comparison only; not ours to redistribute.
+/alphadia/
 
-# Collaborator-specific material stays local: the Strasbourg prenylation work is
-# unpublished, so its configs and deployment notes must never reach the remote.
+# Collaborator-specific configs and deployment notes stay local.
 # (`/*.md` above already keeps root-level notes local; these cover the configs.)
 config.strasbourg*.json
 config.*-local.json
+# Superseded by configs/examples/*.json, which resolve interpreters with "auto".
+# Kept ignored so an existing local copy keeps working without being committed.
+config.local-*.json
 deploy_local/
 
 # stopgate

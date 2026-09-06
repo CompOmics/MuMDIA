@@ -42,14 +42,14 @@ decoys, per-run DeepLC fine-tuning, Extended features, the default
 Run from the repository root, using a fresh output directory:
 
 ```text
-mumdia doctor --config config.local-diann-lib.json
+mumdia doctor --config configs/examples/diann-library.json
 
 mumdia run \
   --lib-precursors lib/lib_precursors.parquet \
   --lib-fragments lib/lib_fragments.parquet \
   --mzml mzml_files/LFQ_Orbitrap_AIF_Ecoli_01.mzML \
   --out-dir out_aif_nn \
-  --config config.local-diann-lib.json \
+  --config configs/examples/diann-library.json \
   --top-peaks-ms2 300
 ```
 
@@ -63,7 +63,7 @@ The effective reference settings are:
 |---|---|
 | `features.set` | `extended` |
 | `extract.gate_mode` | `apex_pearson` |
-| `extract.min_frag_corr` | `0.2` |
+| `extract.gate_min_score` | `0.2` (also the default) |
 | `extract.apex_count_window` | `5` |
 | `extract.apex_rt_prior_s` | `120` seconds |
 | `rt_im_train.finetune_deeplc` | `true` |
@@ -97,7 +97,8 @@ target-decoy sanity check, not an independent empirical-null validation.
 - Record the exact library and decoy provenance. Counts are uninterpretable
   without the search-space definition.
 - Repeat stochastic runs when comparing small gains. NnTorch seeds NumPy/Torch
-  but is not bit-deterministic; DeepLC fine-tuning is unseeded.
+  but is not bit-deterministic; DeepLC fine-tuning is seeded from `rng_seed` and
+  still not bit-for-bit reproducible, because torch's training kernels are not.
 
 ## Acquisition-specific choices
 
@@ -247,7 +248,7 @@ python scripts/augment_library.py \
   --out-precursors lib/lib_precursors_aug.parquet \
   --out-fragments lib/lib_fragments_aug.parquet \
   --mumdia-bin <path to mumdia release binary> \
-  --config config.local-diann-lib.json \
+  --config configs/examples/diann-library.json \
   --work-dir <scratch>
 ```
 
@@ -289,7 +290,7 @@ faint, roughly 10x lower abundance than the shared set. The loss ranks:
 | Seed | about 25% |
 
 The extraction losses are mostly `presence_min_matched` and `min_coelution`, not
-the `min_frag_corr` apex gate. Extraction presence/apex is therefore the largest
+the `gate_min_score` apex gate. Extraction presence/apex is therefore the largest
 remaining lever, then rescore, then seed, all on faint signal.
 
 Before reading a presence/apex loss on any other run as an extraction problem,
@@ -350,12 +351,19 @@ default key as its comparison baseline, and a change of default remains
 benchmark-gated.
 
 Pooling more runs into one rescore does not tighten q. The estimator is
-`q = (n_decoys + 1) / max(1, n_targets)`
-(`rust/mumdia/crates/mumdia/src/fdr.rs:38`), which is scale-invariant under
-replicating the population. The only pool-size-dependent term is the `+1`
-pseudocount, whose relative weight shrinks as the pool grows, so a larger pool is
-if anything marginally looser. Never explain a per-run count difference by the
-number of runs pooled; check the q column and the score distribution instead.
+`q = (n_decoys + 1) / max(1, n_targets)`, whose only pool-size-dependent term is
+the `+1` pseudocount, so a larger pool is if anything marginally looser. Never
+explain a per-run count difference by the number of runs pooled; check the q
+column and the score distribution instead.
+
+It is not scale-INVARIANT, though, which an earlier version of this section
+claimed: the floor is exactly `1/T`, so it moves with the pool. Measured on the
+kernel, replicating a five-row population once takes q from
+`[0.5, 0.5, 0.667, 0.667, 1.0]` to `[0.25, 0.25, 0.5, 0.5, 0.833]`. The
+per-source `run_psm_q` is exactly per-run and genuinely unaffected; the pooled
+`q_value`, which is what `run-experiment` gates per-run quant on, is not. So
+sub-batching a large experiment is free in `run_psm_q` terms and does not
+reproduce the same `q_value` column.
 
 A sensitivity setting may be promoted only when:
 

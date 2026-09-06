@@ -1,5 +1,5 @@
-//! blake3 content hashing (PLAN.md Section 3.3: every artifact records a
-//! content hash; config is hashed to invalidate downstream artifacts).
+//! blake3 content hashing (docs/03_io_layer.md): every artifact records a
+//! content hash; config is hashed to invalidate downstream artifacts.
 
 use anyhow::{Context, Result};
 use std::io::Read;

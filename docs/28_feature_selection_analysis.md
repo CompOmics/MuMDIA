@@ -880,9 +880,9 @@ rescore recipe throughout, HYE B01, one run each (this pool's seed band is 0.9%)
 
 | arm | peptides at 1% | extracted rows | whole-run wall | whole-run peak |
 |---|---|---|---|---|
-| **current** (`min_frag_corr` 0.2, `rt_window_multiplier` 1.5, `apex_count_window` 5) | **59,223** | 2,546,844 | 16:32 | 28.1 GB |
-| `min_frag_corr` 0.1 | 59,245 (+0.04%) | 3,124,230 (+23%) | 19:32 | 24.7 GB |
-| `min_frag_corr` 0.3 | 58,874 (-0.6%) | 2,027,300 | 13:42 | 28.0 GB |
+| **current** (`gate_min_score` 0.2, then named `min_frag_corr`; `rt_window_multiplier` 1.5, `apex_count_window` 5) | **59,223** | 2,546,844 | 16:32 | 28.1 GB |
+| `gate_min_score` 0.1 | 59,245 (+0.04%) | 3,124,230 (+23%) | 19:32 | 24.7 GB |
+| `gate_min_score` 0.3 | 58,874 (-0.6%) | 2,027,300 | 13:42 | 28.0 GB |
 | `rt_window_multiplier` 1.25 | 58,747 (-0.8%) | 2,441,118 | 14:26 | 23.9 GB |
 | `rt_window_multiplier` 2.0 | 58,921 (-0.5%) | 2,695,313 | 20:20 | 34.4 GB |
 | `window_holdout_frac` 0.3 | 59,124 (-0.2%) | 2,603,894 | 18:00 | 30.0 GB |
@@ -890,7 +890,7 @@ rescore recipe throughout, HYE B01, one run each (this pool's seed band is 0.9%)
 | `apex_count_window` 7 | 57,805 (-2.4%) | 2,430,212 | 15:54 | 28.1 GB |
 
 Every single-factor move is neutral or worse. The current defaults are a local optimum on
-this acquisition; the only "gain" (0.04% at `min_frag_corr` 0.1) costs 23% more rows through
+this acquisition; the only "gain" (0.04% at `gate_min_score` 0.1) costs 23% more rows through
 every later stage and three minutes of wall for nothing. Held-out window sizing, which
 docs/08 measured at +1.1% on AIF with a per-run DeepLC fine-tune, is neutral here with a
 pre-fine-tuned library and the LOESS calibration, consistent with the mechanism it addresses

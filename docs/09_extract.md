@@ -162,7 +162,7 @@ sidecar) also gets an `<artifact>.report.json` (`extract.rs:2569`) recording the
 row count, blake3 content hash, stage name, schema name+version, and
 `elapsed_ms`. The `params` object (`extract.rs:2577`) carries `frag_tol_ppm`
 (nominal), `effective_frag_tol_ppm` (post mass-cal), `frag_ppm_offset`,
-`presence_min_fragments`, `presence_min_coelution`, `min_frag_corr`, `gate_mode`,
+`presence_min_fragments`, `presence_min_coelution`, `gate_min_score`, `gate_mode`,
 `gate_coelution_min`, and `scan_window`. The `stats` map (`extract.rs:2562`)
 carries `accepted` (the accepted-candidate count) and `scan_window`.
 `model_identity` is `None` (no model in this stage).
@@ -313,7 +313,7 @@ The cheap-to-expensive acceptance cascade, in order:
    so it can rescue a candidate. `ms1_support` requires a present mono and a +1/mono
    ratio in `[0.1, 1.5]` (`extract.rs:1960`).
 8. **Pearson gate (tier d, optional)** (`extract.rs:2004`): only when
-   `min_frag_corr > 0.0`. It thresholds the score of the **active** `GateMode`
+   `gate_min_score > 0.0`. It thresholds the score of the **active** `GateMode`
    and only the active score is computed (the closures at `extract.rs:1989` are
    lazy). If `ms1_rescue` is set, a gate failure is overridden when the candidate
    has MS1 support and enough matched fragments (`extract.rs:2020`).
@@ -327,11 +327,21 @@ rejected before any gate or score is reached. Measured on a 50-window Orbitrap
 DIA run, `--top-peaks-ms2 300` discarded 78.6% of MS2 peaks; a `mumdia audit`
 ladder restricted to peptides that an external library-free search confirms are
 present in the run showed 49,105 of 78,782 (62.3%) stopping at
-`candidate_generated` with rejection code `NO_PEAK_GROUP` (`rejection.rs:62`),
-that is, never assembling `presence_min_fragments` distinct fragments. Only
-5,380 were lost to FDR and 355 to competition. Replaying those candidates
-against the uncapped artifact recovered 41,948 of the 49,105 (85.4%). When
-`NO_PEAK_GROUP` dominates an audit ladder, check the conversion cap before
+`candidate_generated` with rejection code `NO_PEAK_GROUP` (`rejection.rs:62`).
+Only 5,380 were lost to FDR and 355 to competition. Replaying those candidates
+against the uncapped artifact recovered 41,948 of the 49,105 (85.4%), which is
+what identifies the cap as the cause.
+
+`NO_PEAK_GROUP` does not mean "never assembled `presence_min_fragments` distinct
+fragments", although this document previously said so. `audit.rs` reads a
+per-candidate audit table that `extract` does not write -- `emit_candidate_audit`
+is unwired -- so the reason map is always empty and the `_ => NoPeakGroup`
+catch-all absorbs presence failures, matched-fraction failures and every
+extraction-gate rejection alike. Read it as "did not survive extract". The
+attribution to the peak cap above stands on the replay experiment, not on the
+label.
+
+When `NO_PEAK_GROUP` dominates an audit ladder, check the conversion cap before
 tuning the presence thresholds or gates here; see docs/04_convert.md for the
 peak census and the cap dose-response.
 
@@ -385,7 +395,7 @@ elution peak itself (`extract.rs:520`). `GateMode` scores:
   predicted-intensity-weighted mean Pearson of each matched fragment's XIC to the
   signature-ion reference profile, restricted to the elution peak. Orthogonal to
   intensity agreement (temporal, not shape).
-- `Combined`: requires `peak_spectral >= min_frag_corr` **and** `coelution >=
+- `Combined`: requires `peak_spectral >= gate_min_score` **and** `coelution >=
   gate_coelution_min` (`extract.rs:2016`).
 
 All four diagnostic scores are computed for every accepted candidate only when
@@ -502,14 +512,14 @@ declutter" commit: `extract.scan_window_mode` (and the `ScanWindowMode` enum),
 | `presence_min_matched` | 3 | Tier-b: minimum distinct matched fragments (`extract.rs:1727`) |
 | `presence_min_fragments` | 3 | Acceptance: minimum distinct fragments (`extract.rs:1926`) |
 | `presence_min_coelution` | 2 | Min simultaneously-present fragments to extend a run (`extract.rs:1915`) |
-| `min_frag_corr` | **0.2** | Pearson/gate threshold; 0 disables the gate. Relaxed from a historical 0.5 to recover low-abundance candidates (`config.rs:531`) |
+| `gate_min_score` | **0.2** | Pearson/gate threshold; 0 disables the gate. Measured better than 0.6 for both rescorers under the current defaults; see docs/18. Renamed from `min_frag_corr`, which is not a correlation under any `gate_mode` except by coincidence |
 | `min_matched_fraction` | 0.0 | Acceptance: min matched/predicted fraction (default off) |
 | `apex_top_fragments` | 0 | Signature-ion count for apex; 0 -> default 3 (`extract.rs:1860`). Config marks it superseded by `apex_count_tol`, kept for compat (`config.rs:545`) |
 | `apex_rt_prior_s` | 0.0 | Gaussian RT-prior sigma on apex tiebreak; 0 = off |
 | `apex_count_tol` | 1 | Count slack for qualifying apex scans |
 | `apex_count_window` | 1 | Rolling-sum width for the count profile; 1 = no smoothing. Window 5 cut AIF apex misassignment (median \|dRT\| 131s -> 9s) |
 | `apex_gaussian_sigma_scans` | 0.0 | Opt-in Gaussian apex smoother; 0 = off (`config.rs:572`) |
-| `apex_evidence_rank` | false | Breadth-of-evidence apex vs legacy signature-intensity apex |
+| `apex_evidence_rank` | **true** | Breadth-of-evidence apex. The legacy signature-intensity apex silently falls back to the lowest-RT qualifying scan when none of the top-K predicted fragments is observed |
 | `emit_window_grid` | true | Zero-filled full-window-grid chromatograms |
 | `bucket_size` | 8192 | m/z bucket size (power of two) |
 | `peak_claim` | `None` | Shared-peak apportionment strategy (`PeakClaim`, `config.rs:132`) |
@@ -529,7 +539,7 @@ declutter" commit: `extract.scan_window_mode` (and the `ScanWindowMode` enum),
 | `alt_peak_min_separation_s` | 5.0 | Alternate apex must sit >= 5 s from the rank-0 apex (`config.rs:653`) |
 | `emit_candidate_audit` | false | Candidate-audit sidecar (diagnostic) |
 | `emit_gate_diagnostics` | false | Adds the four `gate_*` diagnostic columns |
-| `gate_mode` | `ApexPearson` | Which score `min_frag_corr` thresholds (`GateMode`, `config.rs:735`) |
+| `gate_mode` | `ApexPearson` | Which score `gate_min_score` thresholds (`GateMode`, `config.rs:735`) |
 | `gate_coelution_min` | 0.5 | Second threshold for `GateMode::Combined` |
 
 Note: `emit_candidate_audit` is a declared knob but the candidate-audit write is
@@ -552,7 +562,7 @@ here for one index.
 | `extract.promote_top_peaks` (`config.rs:645`, default 1) | extra `psms_extracted` rows with `peak_rank >= 1` (`extract.rs:2297`); no new columns | **not schema-neutral in rows**: changes the scored population and therefore FDR; gate pending |
 | `extract.emit_candidate_audit` (`config.rs:658`) | none in `extract.rs` (unused there); in `run` it gates the `audit` stage -> `candidate_audit.parquet` (`run.rs:428`) | diagnostic; no ID effect |
 | `extract.emit_gate_diagnostics` (`config.rs:673`) | 4 F32 cols `gate_apex`, `gate_peak_spectral`, `gate_coelution`, `gate_spectral_entropy` (`extract.rs:2511`) | diagnostic; no ID effect |
-| `extract.apex_evidence_rank` (`config.rs:667`) | none; changes the apex-selection score (`extract.rs:1890`) | diagnostic support (finding A6, docs/18); no end-to-end gain measured |
+| `extract.apex_evidence_rank` (`config.rs:667`) | none; changes the apex-selection score (`extract.rs:1890`) | **now the default**, promoted on correctness grounds rather than a count (docs/25 section 2): the legacy score cannot distinguish "no signature fragment observed anywhere" from "the earliest qualifying scan is the apex" |
 | `extract.apex_gaussian_sigma_scans` (`config.rs:572`) | none; smooths the apex count profile | not measured; gate pending |
 | `search_seed.two_pass_mass_cal` (`config.rs:423`) | none; refits the `<seed>.masscal.json` offset + tolerance | not measured; gate pending |
 | `rt_im_train.adaptive_rt_window` (`config.rs:487`) | none; per-region RT half-window widths in `run_windows` | not measured; gate pending |

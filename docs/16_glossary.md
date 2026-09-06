@@ -118,9 +118,9 @@ Opt-in via `RescorerKind::Entrapment`; the default path relies on target-decoy F
 q-values. This is distinct from the seed search, whose only purpose is calibration
 (see `seed`). See `q-value`.
 
-**gate (`min_frag_corr`) and GateMode**. The extraction acceptance gate: a
+**gate (`gate_min_score`) and GateMode**. The extraction acceptance gate: a
 candidate is rejected when its observed-vs-predicted fragment agreement falls below
-`extract.min_frag_corr` (default 0.2; 0 disables,
+`extract.gate_min_score` (default 0.2; 0 disables,
 `rust/mumdia/crates/mumdia-core/src/config.rs:406`,
 `rust/mumdia/crates/mumdia-core/src/config.rs:522`). `GateMode` selects which
 agreement score is thresholded: `ApexPearson` (single-apex-scan intensity Pearson,
@@ -221,7 +221,7 @@ for `precursor_q` (peptidoform + charge,
 `rust/mumdia/crates/mumdia/src/stages/rescore.rs:388`) and the reporting unit of
 `peptides.tsv`, whose rows are precursors, not stripped sequences
 (`rust/mumdia/crates/mumdia/src/stages/report.rs:93`). Under the default
-`compete.group_by = precursor`, however, competition has already deleted the
+`compete.group_by = base_peptide`, however, competition has already deleted the
 charge and modification siblings by stripped peptide before rescore, so the
 surviving rows are precursor-shaped but effectively one per base peptide, and
 `precursor_q` then counts base peptides rather than precursors. See

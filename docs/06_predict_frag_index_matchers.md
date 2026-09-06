@@ -23,7 +23,7 @@ structures that make fragment matching cheap. It has three parts:
 3. **the matchers** (`matchers/`): given an observed peak m/z, a ppm tolerance,
    and an isolation-window candidate range, return the predicted fragments that
    fall within tolerance. Two backends exist: the default log-bin CSR `fragindex`
-   (`matchers/fragindex.rs`, spec in `fragindex_spec.md`) and the fallback
+   (`matchers/fragindex.rs`, specified in this document) and the fallback
    bucketed `Library::page_search`. A naive band-join (`matchers/naive.rs`) is the
    correctness oracle, not a production path.
 
@@ -41,11 +41,10 @@ DeepLC.
 | `rust/mumdia/crates/mumdia/src/sidecar.rs` | Python sidecar clients (MS2PIP, DeepLC, DeepLC fine-tune, MBR) over the file contract |
 | `rust/mumdia/crates/mumdia/src/index.rs` | `Library` (SoA model + optional bucketed inverted index), `load`/`load_with` preconditions, `page_search`, `candidate_range`, `local_frag_index`, `deconvolve` |
 | `rust/mumdia/crates/mumdia/src/matchers/mod.rs` | matcher module tree; `MatcherKind` selects the backend |
-| `rust/mumdia/crates/mumdia/src/matchers/binning.rs` | `LogBins`: log-space bin geometry (fragindex_spec Section 2.2) |
+| `rust/mumdia/crates/mumdia/src/matchers/binning.rs` | `LogBins`: log-space bin geometry (this document) |
 | `rust/mumdia/crates/mumdia/src/matchers/fragindex.rs` | `FragIndex` CSR index, `WindowNarrow` per-window narrowing cache, `SeedScratch` epoch-stamped accumulator, `probe_peak`/`probe_peak_win`, equivalence-gate scorer |
 | `rust/mumdia/crates/mumdia/src/matchers/naive.rs` | band-join reference for the equivalence gate |
 | `rust/mumdia/crates/mumdia-core/src/constants.rs` | `within_ppm` (min-relative predicate), `ppm_bounds` (query-relative), `PROTON` |
-| `fragindex_spec.md` | language-agnostic algorithm spec the fragindex matcher implements |
 
 ## Inputs and outputs
 
@@ -302,7 +301,7 @@ an isolation window into `[lo, hi)` over `prec_mz` by two `partition_point`s (`m
 win_lo` for `lo`, `m <= win_hi` for `hi`, so `win_hi` is inclusive and `win_lo`
 exclusive).
 
-### The fragindex CSR matcher (`matchers/fragindex.rs`, fragindex_spec Section 2-3)
+### The fragindex CSR matcher (`matchers/fragindex.rs`)
 
 `FragIndex::build` (`fragindex.rs:46`) is a two-pass counting sort into a CSR
 layout keyed by log-space bin. It first derives the m/z range by scanning
@@ -373,8 +372,8 @@ gate assert exact Count equality and near-exact Dot equality.
 **The +/-1 probe exactness.** The correctness of probing only three bins rests on:
 two m/z values within tolerance differ by at most one bin. Proof sketch: within
 tolerance means `|ln(a) - ln(b)| <= w`, one bin width, so the two points span at
-most two adjacent bins (`binning.rs` test `within_tol_pairs_are_at_most_one_bin_apart`,
-`fragindex_spec.md` Section 2.2). One subtlety makes this exact in the
+most two adjacent bins (`binning.rs` test
+`within_tol_pairs_are_at_most_one_bin_apart`). One subtlety makes this exact in the
 implementation: posting m/z is stored f32, so build bins each posting by the
 **same f32-rounded value** the verify uses (`fragindex.rs:85` and
 `fragindex.rs:102`), not the raw f64. Binning by raw f64 while verifying the f32
@@ -500,7 +499,7 @@ Matcher selection (both stages default to `Fragindex`):
   gate disagreement source; build and verify use the same f32-rounded value.
 - **per-posting accumulation.** A candidate with two fragments within tolerance of
   one peak counts twice; a peak within tolerance of two candidate fragments counts
-  twice (fragindex_spec Section 1.4). Do not deduplicate. Tests
+  twice (see the duplicate-fragment note below). Do not deduplicate. Tests
   `two_frags_one_peak_counts_both` (`fragindex.rs:539`) and the count assertion in
   `equivalence_gate_vs_naive` (`fragindex.rs:524-527`) guard this.
 - **epoch, not value, for first touch.** First touch is `stamp[cc] != epoch`, never
@@ -560,11 +559,11 @@ Matcher selection (both stages default to `Fragindex`):
   variant. Any new backend must pass the equivalence gate against `naive.rs` at
   `K = C` under the same `within_ppm` predicate (test pattern in
   `fragindex.rs:499-536`) before its speed is trusted. Before attempting a fragindex
-  optimization, read `fragindex_spec.md` Section 5: cache-blocking, accumulator
-  prefetch, radix partitioning, bin-major inversion, and distinct-m/z dedup were
-  all measured null or negative in the realistic DIA regime. The real levers are
-  top-N reduction (already applied, `top_n_fragments`) and per-window parallelism
-  (already applied in `seed_fragindex_windows`).
+  optimization, note that cache-blocking, accumulator prefetch, radix
+  partitioning, bin-major inversion, and distinct-m/z dedup were all measured null
+  or negative in the realistic DIA regime. The real levers are top-N reduction
+  (already applied, `top_n_fragments`) and per-window parallelism (already applied
+  in `seed_fragindex_windows`).
 - **Change fragment charges or top-N.** `charge2_from_precursor_charge`,
   `charge_by_basic_residues` and `top_n_fragments` are the knobs; all are
   sensitivity/speed tradeoffs. Lowering top-N removes collisions roughly

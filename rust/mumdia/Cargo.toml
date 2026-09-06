@@ -5,9 +5,22 @@ members = ["crates/mumdia-core", "crates/mumdia-io", "crates/mumdia"]
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.85"
+# Tracks rust-toolchain.toml, which is the only Rust version CI builds and tests.
+# A lower floor may well work, but claiming one we do not verify is a guess; lower
+# this together with an MSRV job that proves it.
+rust-version = "1.96"
 license = "Apache-2.0"
 authors = ["CompOmics"]
+description = "MuMDIA: a data-independent-acquisition (DIA) proteomics search engine"
+repository = "https://github.com/CompOmics/MuMDIA"
+homepage = "https://github.com/CompOmics/MuMDIA"
+keywords = ["proteomics", "mass-spectrometry", "dia", "bioinformatics"]
+categories = ["science", "command-line-utilities"]
+# Not published to crates.io: mumdia-core and mumdia-io are internal boundaries of
+# one application, not libraries with independent consumers, and the binary needs
+# the Python sidecars and configs that a crate cannot carry. Distribution is the
+# GitHub release archive and the container image.
+publish = false
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -31,6 +44,9 @@ mimalloc = { version = "0.1", default-features = false }
 
 [profile.release]
 opt-level = 3
+# Release archives shipped unstripped debug symbols, which is most of the binary
+# size for no user benefit; a backtrace still names the functions.
+strip = "symbols"
 # Cross-crate inlining. "thin" keeps build times reasonable while still letting the hot
 # per-fragment/per-candidate loops inline across the io/core crate boundaries.
 lto = "thin"
@@ -41,3 +57,11 @@ codegen-units = 1
 # never uses Arrow IPC, so compile just this crate at a lighter opt-level.
 [profile.release.package.arrow-ipc]
 opt-level = 1
+
+# The workspace has zero `unsafe` today, including in build.rs and not even in a
+# comment. Forbid rather than deny, so a crate cannot opt back in with an
+# `#[allow]`: the property is worth being able to state in SECURITY.md, and
+# stating it is only honest if something enforces it. A tool that parses hostile
+# files for a living gets a lot of its safety argument from this one line.
+[workspace.lints.rust]
+unsafe_code = "forbid"

@@ -1,8 +1,8 @@
-//! Naive band-join reference (fragindex_spec Section 4.1): obviously-correct
-//! ground truth for the equivalence gate. O(C * frags * peaks); slow, not used in
-//! production. For each candidate in the window and each of its fragments, count
-//! every peak within tolerance and accumulate Count and Dot per matched pair (no
-//! de-duplication, fragindex_spec Section 1.4).
+//! Naive band-join reference (docs/06_predict_frag_index_matchers.md):
+//! obviously-correct ground truth for the equivalence gate. O(C * frags * peaks);
+//! slow, not used in production. For each candidate in the window and each of its
+//! fragments, count every peak within tolerance and accumulate Count and Dot per
+//! matched pair (no de-duplication).
 //!
 //! Predicted m/z is rounded to f32 before the predicate, matching `FragIndex`'s
 //! f32 posting storage, so the gate compares the two matchers under an identical

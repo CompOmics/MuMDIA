@@ -1,0 +1,22 @@
+{
+  "features": {
+    "set": "extended"
+  },
+  "extract": {
+    "apex_count_window": 5,
+    "apex_rt_prior_s": 120.0,
+    "gate_min_score": 0.2
+  },
+  "predict_frag": {
+    "predictor": "ms2pip",
+    "rt_predictor": "deeplc",
+    "ms2pip_python": "auto",
+    "deeplc_python": "auto",
+    "sidecar_script_dir": "scripts"
+  },
+  "rescore": {
+    "classifier": "mokapot",
+    "python": "auto",
+    "strict": true
+  }
+}

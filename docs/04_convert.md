@@ -3,12 +3,12 @@
 
 ## Purpose
 
-`convert` is Stage 0 of the pipeline (PLAN.md Stage 0). It is the single point in
-the engine that touches the vendor mass-spectrometry format. It reads one mzML
-run through the `mzdata` crate and writes a normalized, self-describing spectra
-artifact set (four Parquet files) that every downstream stage consumes instead of
-the raw file. Everything after this stage (`search-seed`, `rt-im-train`,
-`extract`, `features`, `quant`) reads spectra only through
+`convert` is Stage 0 of the pipeline. It is the single point in the engine that
+touches the vendor mass-spectrometry format. It reads one mzML run through the
+`mzdata` crate and writes a normalized, self-describing spectra artifact set (four
+Parquet files) that every downstream stage consumes instead of the raw file.
+Everything after this stage (`search-seed`, `rt-im-train`, `extract`, `features`,
+`quant`) reads spectra only through
 `crates/mumdia/src/spectra.rs`, never through `mzdata`. Consequences: the
 vendor-format dependency is isolated here, and any format quirk (profile vs
 centroid, AIF/all-ion windows, missing precursor) must be resolved at this stage
@@ -351,6 +351,24 @@ to 2,286,840 (12.2x) and extract wall clock from 57.9 s to 91.9 s.
 
 ## Invariants, determinism, gotchas
 
+- **Every externally supplied float is checked here, retention time included.**
+  `peaks_of` drops peaks whose m/z or intensity is not finite (and any intensity
+  <= 0), and the spectrum loop drops spectra whose scan start time is not finite.
+  Both report a count, and the retention-time drop names the first offending scan.
+
+  Retention time was the gap, and it was reproduced rather than reasoned about:
+  editing one `scan start time` value in the fixture mzML to `NaN` passed convert
+  with no warning, was written into `spectra_ms2.parquet` as `nan`, and then
+  aborted `mumdia run` inside extract with `called `Option::unwrap()` on a `None`
+  value`, naming neither the file, nor the scan, nor the value. A spectrum with no
+  retention time cannot be placed in a chromatogram, so dropping it loses nothing;
+  leaving it in propagated NaN into every retention-time window. `ci/smoke.sh`
+  step 4b is the regression test, and it also asserts that dropping the scan does
+  not change which peptides are identified.
+
+  The backstop for a file whose retention times are ALL unusable is the existing
+  "yielded no MS2 spectra" bail, which turns an empty result into an error rather
+  than a silent zero-identification run.
 - **Determinism.** The output is a deterministic function of the input file and
   the CLI caps. `scan_index` is assigned in reader order; `window_id` is assigned
   in first-appearance order via a bit-keyed map, not float equality. The

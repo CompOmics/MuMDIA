@@ -16,10 +16,12 @@
 
 use std::time::Instant;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use arrow::array::{Array, BooleanArray, UInt32Array};
 use arrow::compute::filter_record_batch;
 use mumdia_core::config::{Config, FinetuneScope, QuantQColumn};
+use mumdia_core::manifest::Manifest;
+use mumdia_core::schema::artifact;
 use rayon::prelude::*;
 use serde_json::json;
 use tracing::{info, warn};
@@ -28,6 +30,8 @@ use crate::stages::*;
 
 pub struct RunExperimentParams<'a> {
     pub config: &'a Config,
+    /// Path the config was loaded from; see `RunParams::config_path`.
+    pub config_path: Option<&'a str>,
     pub fasta: Option<&'a str>,
     pub mzmls: &'a [String],
     /// Optional per-run labels (default `r0..rN-1`); also the per-run subdir names.
@@ -100,8 +104,14 @@ fn preflight(p: &RunExperimentParams) -> Result<()> {
         if let Some(exe) = path {
             if !std::path::Path::new(exe).exists() {
                 anyhow::bail!(
-                    "{field} points at an interpreter that does not exist: {exe}
-                     (config written for another machine? run `mumdia doctor --config <cfg>`                      to probe every configured sidecar environment before a long batch)"
+                    concat!(
+                        "{} points at an interpreter that does not exist: {}. A config ",
+                        "written for another machine is the usual cause; run ",
+                        "`mumdia doctor --config <cfg>` to probe every configured sidecar ",
+                        "environment before starting a long batch."
+                    ),
+                    field,
+                    exe
                 );
             }
         }
@@ -204,6 +214,7 @@ fn process_run(
             // Keep the fine-tune exclusion aligned with rt-im-train's holdout
             // split (see run.rs); 0.0 (default) changes nothing.
             cfg.rt_im_train.window_holdout_frac,
+            cfg.rng_seed,
         )?;
         produced_ft = Some(lib_p_ft.clone());
         lib_p_ft
@@ -270,6 +281,7 @@ fn split_by_source(scored: &str, out_paths: &[String]) -> Result<()> {
         .iter()
         .map(|out| mumdia_io::table::BatchWriter::new(out, t.schema.clone()))
         .collect::<Result<_>>()?;
+    let mut written = 0usize;
     t.for_each_batch(None, 1 << 14, |b| {
         let src = b
             .column(src_idx)
@@ -279,6 +291,7 @@ fn split_by_source(scored: &str, out_paths: &[String]) -> Result<()> {
         for (i, w) in writers.iter_mut().enumerate() {
             let mask: BooleanArray = (0..src.len()).map(|k| src.value(k) == i as u32).collect();
             let filtered = filter_record_batch(b, &mask)?;
+            written += filtered.num_rows();
             if filtered.num_rows() > 0 {
                 w.write(&filtered)?;
             }
@@ -288,20 +301,84 @@ fn split_by_source(scored: &str, out_paths: &[String]) -> Result<()> {
     for w in writers {
         w.close()?;
     }
+    // The split is a partition, so it must account for every input row. Nothing
+    // enforced that: a `source` value outside `0..out_paths.len()` -- which a
+    // hand-assembled or externally rescored table can carry, and which the MBR
+    // worker could reintroduce -- dropped those PSMs into no output at all. Every
+    // downstream number is then computed from a silently smaller population, with
+    // no error and no warning. A count is the whole check.
+    let total: usize = t.nrows;
+    if written != total {
+        anyhow::bail!(
+            "splitting {scored} by `source` placed {written} of {total} rows into \
+             {} per-run tables; the rest carry a source index outside 0..{}, so they \
+             would be dropped from every per-run quantity",
+            out_paths.len(),
+            out_paths.len()
+        );
+    }
     Ok(())
 }
 
 pub fn run(p: RunExperimentParams) -> Result<()> {
     let t0 = Instant::now();
+    // Same contract as the single-run orchestrator, and it matters more here: an
+    // 83-file batch must not fail on a missing interpreter after the first run has
+    // already been searched.
+    let mut resolved = p.config.clone();
+    resolved.predict_frag.sidecar_script_dir =
+        crate::python::resolve_script_dir(&resolved.predict_frag.sidecar_script_dir, p.config_path);
+    crate::python::resolve(&mut resolved)?;
+    let p = RunExperimentParams {
+        config: &resolved,
+        ..p
+    };
     let cfg = p.config;
     preflight(&p)?;
     let ch = mumdia_io::hash::blake3_str(&cfg.canonical_json());
     std::fs::create_dir_all(p.out_dir).ok();
     let d = |name: &str| format!("{}/{}", p.out_dir, name);
     let n_runs = p.mzmls.len();
+    // Reject a bad --run-names rather than silently substituting r0..rN-1.
+    //
+    // The old `_ =>` arm swallowed any count mismatch with no warning, and accepted
+    // duplicates outright. Duplicates are the dangerous half: two runs then share
+    // `d(&names[i])`, so above one parallel run two `process_run` calls concurrently
+    // write the same spectra_ms2 / seed_psms / psms_extracted / chromatograms into one
+    // directory, and the split and quant paths collide too. The output is an interleaving
+    // of two runs with no error anywhere. Reachable by naming runs after their basenames
+    // when an experiment spans two directories holding same-named files.
     let names: Vec<String> = match p.run_names {
-        Some(ns) if ns.len() == n_runs => ns.to_vec(),
-        _ => (0..n_runs).map(|i| format!("r{i}")).collect(),
+        Some(ns) => {
+            if ns.len() != n_runs {
+                anyhow::bail!(
+                    "--run-names has {} entries but there are {n_runs} runs; pass one name \
+                     per --mzml, in the same order, or omit it to get r0..r{}",
+                    ns.len(),
+                    n_runs - 1
+                );
+            }
+            let mut sorted = ns.to_vec();
+            sorted.sort();
+            sorted.dedup();
+            if sorted.len() != ns.len() {
+                anyhow::bail!(
+                    "--run-names must be unique: each name is a per-run output \
+                     subdirectory, so a repeat makes two runs write the same artifacts \
+                     into one directory and interleave their results with no error"
+                );
+            }
+            if let Some(bad) = ns.iter().find(|n| {
+                n.is_empty() || n.contains('/') || n.contains('\\') || *n == "." || *n == ".."
+            }) {
+                anyhow::bail!(
+                    "--run-names entry {bad:?} is not usable as a directory name; each \
+                     becomes a subdirectory of --out-dir"
+                );
+            }
+            ns.to_vec()
+        }
+        None => (0..n_runs).map(|i| format!("r{i}")).collect(),
     };
 
     // --- shared library (imported or digested once) ---
@@ -514,6 +591,19 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
             crate::sidecar::resolve_script(&cfg.predict_frag.sidecar_script_dir, "mbr_worker.py");
         let transferred = d("mbr_transferred.parquet");
         let scored_mbr = d("scored_mbr.parquet");
+        // Remove any stale copy BEFORE the worker runs, so that the `exists()` check
+        // afterwards is a statement about THIS run. The worker writes this file only when
+        // it accepts at least one transfer, so without the removal a rerun into the same
+        // --out-dir that accepted transfers last time and none this time would silently
+        // feed the previous experiment's scored table to the split and to every per-run
+        // quant. It joins cleanly, because candidate_id and source are stable across
+        // reruns of the same library, so the failure is plausible numbers from the wrong
+        // data, logged as "MBR transfers applied".
+        if std::path::Path::new(&scored_mbr).exists() {
+            std::fs::remove_file(&scored_mbr).with_context(|| {
+                format!("removing a previous run's {scored_mbr} before running MBR")
+            })?;
+        }
         // The competed tables carry candidate_id + apex_rt in `source` order.
         crate::sidecar::run_mbr(
             python,
@@ -532,6 +622,15 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         // The worker writes the augmented scored table only when it accepts at
         // least one transfer; with none, fall back to the un-augmented combined
         // table so quantification still runs.
+        //
+        // `exists()` is only a signal because the stale file was removed before the
+        // worker ran (see above). Without that, it could not tell "this run wrote it"
+        // from "a previous run left it": rerunning the same --out-dir with different
+        // mzMLs or a tighter mbr.q_transfer, and finding no transfers this time, made
+        // the split and every per-run quant consume the OLD scored table. It joins
+        // successfully, because candidate_id and source are stable across reruns of the
+        // same library, so the result was plausible quantities from the wrong data while
+        // the log said "MBR transfers applied".
         if std::path::Path::new(&scored_mbr).exists() {
             info!("run-experiment: MBR transfers applied");
             scored_mbr
@@ -570,22 +669,25 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
     }
     qcfg.q_filter = QuantQColumn::PsmQ;
     let mut peptide_quants: Vec<String> = Vec::with_capacity(n_runs);
+    let mut protein_quants: Vec<String> = Vec::with_capacity(n_runs);
     for i in 0..n_runs {
         let pq = d(&format!("{}/peptide_quant.parquet", names[i]));
+        let gq = d(&format!("{}/protein_group_quant.parquet", names[i]));
         quant::run(quant::QuantParams {
             psms_scored: &split_paths[i],
             chromatograms: &chroms[i],
             out_peptide: &pq,
-            out_protein: &d(&format!("{}/protein_group_quant.parquet", names[i])),
+            out_protein: &gq,
             out_fragment: None,
             out_peak_bounds: None,
             cfg: &qcfg,
             config_hash: &ch,
         })?;
         peptide_quants.push(pq);
+        protein_quants.push(gq);
     }
     let lfq = d("lfq_maxlfq.parquet");
-    quant::run_lfq_combine(
+    let n_lfq = quant::run_lfq_combine(
         &peptide_quants,
         false,
         mumdia_core::config::NormalizeMethod::MedianRatio,
@@ -603,10 +705,187 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         "lfq": lfq,
         "peptide_quants": peptide_quants,
     });
+    // Provenance parity with the single-run manifest: the identity of the code, of
+    // the inputs, and of every artifact this stage produced.
+    //
+    // The per-artifact records were the gap. The experiment manifest listed output
+    // PATHS in its `experiment` block and nothing else, so an experiment result had
+    // no content hash, no row count and no schema version anywhere -- exactly the
+    // three things the single-run manifest exists to provide, and the three things
+    // needed to tell whether two experiment outputs are the same data. Files written
+    // by the per-run chains are not covered here (those chains do not thread a shared
+    // manifest); what is covered is everything `run-experiment` itself writes.
+    let mut prov = Manifest::new(cfg.canonical_json(), ch.clone());
+    for (i, m) in p.mzmls.iter().enumerate() {
+        if let (Ok(bytes), Ok(hash)) = (
+            std::fs::metadata(m).map(|x| x.len()),
+            mumdia_io::hash::blake3_file(m),
+        ) {
+            prov.record_input(&format!("mzml[{i}]"), m, bytes, hash);
+        }
+    }
+    for (role, path) in [
+        ("fasta", p.fasta),
+        ("lib_precursors", p.lib_precursors),
+        ("lib_fragments", p.lib_fragments),
+    ] {
+        let Some(path) = path else { continue };
+        if let (Ok(bytes), Ok(hash)) = (
+            std::fs::metadata(path).map(|x| x.len()),
+            mumdia_io::hash::blake3_file(path),
+        ) {
+            prov.record_input(role, path, bytes, hash);
+        }
+    }
+    // Recorded in a fixed order, and every record hashes its file. `Manifest`
+    // stores them in a BTreeMap, so the serialised order is by logical name and
+    // does not depend on this sequence.
+    let mut artifacts: Vec<(String, (&str, u32), String, &str)> = vec![(
+        "scored_combined".to_string(),
+        artifact::PSMS_SCORED,
+        scored_combined.clone(),
+        "rescore",
+    )];
+    // Only when MBR actually produced a different table; otherwise
+    // `scored_for_quant` IS `scored_combined` and recording it twice would claim two
+    // artifacts where one file exists.
+    if scored_for_quant != scored_combined {
+        artifacts.push((
+            "scored_for_quant".to_string(),
+            artifact::PSMS_SCORED,
+            scored_for_quant.clone(),
+            "mbr",
+        ));
+    }
+    for (i, name) in names.iter().enumerate() {
+        artifacts.push((
+            format!("scored[{name}]"),
+            artifact::PSMS_SCORED,
+            split_paths[i].clone(),
+            "split-by-source",
+        ));
+        artifacts.push((
+            format!("peptide_quant[{name}]"),
+            artifact::PEPTIDE_QUANT,
+            peptide_quants[i].clone(),
+            "quant",
+        ));
+        artifacts.push((
+            format!("protein_group_quant[{name}]"),
+            artifact::PROTEIN_GROUP_QUANT,
+            protein_quants[i].clone(),
+            "quant",
+        ));
+    }
+    for (logical, schema, path, stage) in artifacts {
+        let rows = mumdia_io::table::nrows(&path)
+            .with_context(|| format!("counting rows of {path} for the experiment manifest"))?;
+        prov.record(mumdia_io::record_artifact(
+            &logical, schema, &path, rows, stage, &ch,
+        )?);
+    }
+    prov.record(mumdia_io::record_artifact(
+        artifact::LFQ_MAXLFQ.0,
+        artifact::LFQ_MAXLFQ,
+        &lfq,
+        n_lfq,
+        "quant-lfq",
+        &ch,
+    )?);
+
+    let manifest = serde_json::json!({
+        "mumdia_version": prov.mumdia_version,
+        "git_sha": prov.git_sha,
+        "commit_date": prov.commit_date,
+        "cli_args": prov.cli_args,
+        "inputs": prov.inputs,
+        "artifacts": prov.artifacts,
+        "experiment": manifest,
+    });
     mumdia_io::json::write_json(&d("experiment_manifest.json"), &manifest)?;
     info!(
         elapsed_ms = t0.elapsed().as_millis(),
         n_runs, "run-experiment: complete"
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mumdia_io::table::{write_table, Col, Table};
+
+    fn tmp(name: &str) -> String {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static CTR: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!("mumdia_runexp_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let n = CTR.fetch_add(1, Ordering::Relaxed);
+        dir.join(format!("{n}_{name}"))
+            .to_str()
+            .unwrap()
+            .to_string()
+    }
+
+    fn scored_with_sources(sources: Vec<u32>) -> String {
+        let n = sources.len();
+        let path = tmp("scored.parquet");
+        write_table(
+            &path,
+            vec![
+                Col::U32("source".into(), sources),
+                Col::U32("candidate_id".into(), (0..n as u32).collect()),
+                Col::F64("q_value".into(), vec![0.001; n]),
+            ],
+        )
+        .unwrap();
+        path
+    }
+
+    #[test]
+    fn split_by_source_partitions_every_row() {
+        let scored = scored_with_sources(vec![0, 1, 0, 2, 1, 0]);
+        let outs: Vec<String> = (0..3).map(|i| tmp(&format!("run{i}.parquet"))).collect();
+        split_by_source(&scored, &outs).unwrap();
+        let counts: Vec<usize> = outs.iter().map(|o| Table::read(o).unwrap().nrows).collect();
+        assert_eq!(counts, vec![3, 2, 1]);
+        // Each output must hold only its own run, or a per-run quantity is computed
+        // from another run's PSMs.
+        for (i, o) in outs.iter().enumerate() {
+            let t = Table::read(o).unwrap();
+            let idx = t.schema.index_of("source").unwrap();
+            for b in &t.batches {
+                let src = b
+                    .column(idx)
+                    .as_any()
+                    .downcast_ref::<UInt32Array>()
+                    .unwrap();
+                for k in 0..src.len() {
+                    assert_eq!(src.value(k), i as u32);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_source_index_with_no_output_table_is_an_error_not_a_silent_drop() {
+        // Source 2 with only two runs: the old code wrote two tables holding five of
+        // the six rows and returned Ok, so every per-run quantity and the cross-run
+        // LFQ were computed from a population one row short, with nothing logged.
+        let scored = scored_with_sources(vec![0, 1, 0, 2, 1, 0]);
+        let outs: Vec<String> = (0..2).map(|i| tmp(&format!("run{i}.parquet"))).collect();
+        let err = split_by_source(&scored, &outs).unwrap_err().to_string();
+        assert!(err.contains("5 of 6 rows"), "{err}");
+    }
+
+    #[test]
+    fn a_run_that_identified_nothing_yields_an_empty_table_not_an_error() {
+        // Legitimate and must stay legitimate: run 1 contributed no PSMs. The
+        // downstream quant reads an empty table; it must not read run 0's rows.
+        let scored = scored_with_sources(vec![0, 0]);
+        let outs: Vec<String> = (0..2).map(|i| tmp(&format!("run{i}.parquet"))).collect();
+        split_by_source(&scored, &outs).unwrap();
+        assert_eq!(Table::read(&outs[0]).unwrap().nrows, 2);
+        assert_eq!(Table::read(&outs[1]).unwrap().nrows, 0);
+    }
 }

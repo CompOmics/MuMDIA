@@ -149,7 +149,7 @@ Most of the remaining 38 s is reading the library and RT tables, not computing.
 mumdia prescan \
   --ms2 <spectra_ms2.parquet> \
   --isolation-windows <isolation_windows.parquet> \
-  --library-precursors <lib_precursors.parquet> \
+  --lib-precursors <lib_precursors.parquet> \
   --run-windows <run_windows.parquet> \
   --out prescan_survivors.parquet \
   --config <config.json>

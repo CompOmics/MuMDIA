@@ -8,14 +8,54 @@ the pre-built E. coli test library in `lib/`, two copy-pasteable end-to-end runs
 check. It complements the algorithmic docs (04-12) with the concrete inputs and
 commands that already exist on disk.
 
-The binary referenced below is the prebuilt release binary at
-`C:/Users/robbi/mumdia_build/release/mumdia.exe` (the target directory is
-redirected off the OneDrive tree by `rust/mumdia/.cargo/config.toml`; see
-`docs/14_build_test_deploy_gotchas.md`). Substitute your own path if you rebuild.
+Commands below call `mumdia`, meaning whichever binary you built or unpacked:
+`rust/mumdia/target/release/mumdia` from a source build, `/usr/local/bin/mumdia`
+in the container, or the executable from a release archive. On a machine whose
+Cargo target directory is redirected, which is the case on a synced filesystem
+(`rust/mumdia/.cargo/config.toml`, `docs/14_build_test_deploy_gotchas.md`), the
+binary is under that path instead.
 
 Identification counts quoted here are taken from previously documented runs
 (`CLAUDE.md`, project memory). They are stated as regression targets and were
 not re-verified while writing this document.
+
+## 0. A run that works before you have any data
+
+The fastest way to confirm a build is sound, and the only path here that needs
+nothing but the repository:
+
+```
+ci/smoke.sh
+```
+
+It builds a small synthetic library from `test_data/fixture.fasta`, generates a
+matching mzML, runs the full single-run pipeline over it twice, runs `run-experiment` over two
+copies of it, and asserts 136 things about the result, including that the two
+single runs are byte-identical and that the by-run split of the pooled rescore
+accounts for every row. It needs a
+built `mumdia` binary (found automatically, or set `MUMDIA_BIN`) and a Python with
+pyarrow. No sidecar, no network, no data file.
+
+It runs from a release archive too, not only from a checkout: the archive carries
+`ci/smoke.sh`, its two helper scripts and `test_data/fixture.fasta`, and
+`ci/smoke.sh` finds the `mumdia` binary sitting beside them. `release.yml` runs
+exactly this from a freshly unpacked archive on every target before publishing,
+so the procedure in this section is tested on the artifact you download rather than
+on the tree it was built from.
+
+The fixture is generated rather than shipped, and generated from the engine's own
+library: `ci/make_fixture_mzml.py` reads the precursor and fragment tables
+`mumdia predict-frag` has just produced and plants exactly those m/z values, so it
+cannot disagree with the mass model. What it exercises, and the Rust suite does
+not, is mzML parsing, the library build, the `run` orchestrator and its manifest,
+retention-time calibration on real anchors, and `quant` and `report` writing files.
+
+Measured on it: 99.3% of planted peptides recovered, zero decoys at 1% peptide q,
+LOESS calibration fitted on 110 anchors with a 1.29 s in-sample residual median.
+Those are properties of a 3,820-candidate synthetic library, not a performance
+claim; `bench/README.md` has the real numbers.
+
+This is a functional check. It says the pipeline works, not how well it performs.
 
 ## 1. Local Python sidecar environments
 
@@ -29,14 +69,32 @@ hardcoded in Rust; it comes from the config
 (`predict_frag.ms2pip_python`, `predict_frag.deeplc_python`, `rescore.python`,
 defined at `rust/mumdia/crates/mumdia-core/src/config.rs:263`, `:265`, `:921`).
 
-The environments discovered on this machine under
-`C:/Users/robbi/anaconda3/envs/` are:
+Two environment specifications ship with the repository, and between them they
+cover every sidecar this document uses:
 
-| Env | Interpreter (`python.exe`) | Key packages (verified) | Used for |
-|---|---|---|---|
-| `py312_mumdia` | `C:/Users/robbi/anaconda3/envs/py312_mumdia/python.exe` | torch 2.5.1+cpu, pyarrow 11.0.0 | `nn_torch` rescorer (`nn_rescore_worker.py`); needs an interpreter with torch |
-| `deeplc_411` (venv) | `C:/Users/robbi/deeplc_411/Scripts/python.exe` | DeepLC 4.1.1, torch (CPU), pyarrow | DeepLC iRT prediction (`deeplc_worker.py`) and the optional fine-tune (`deeplc_finetune.py`). The older `deeplc_mt` (4.0.0a2) and `deeplc_410` (4.1.0) interpreters are refused: the engine requires DeepLC >= 4.1.1 |
-| `ms2rescore` (canonical name in `CLAUDE.md`) | not present on this machine | mokapot + MS2PIP | `mokapot` rescorer and MS2PIP intensity prediction |
+| Spec | Creates | Covers |
+|---|---|---|
+| `env/mumdia-rescore.yml` | `mumdia-rescore` (python 3.12) | the mokapot rescore path; no torch, no DeepLC, no MS2PIP |
+| `env/mumdia-deeplc.yml` | `mumdia-deeplc` (python 3.11) | `deeplc_worker.py` and `deeplc_finetune.py`, with DeepLC 4.1.1 and CPU torch. The same interpreter satisfies the `nn_torch` rescorer, which needs torch, numpy, pandas and pyarrow |
+
+```
+conda env create -f env/mumdia-deeplc.yml
+```
+
+DeepLC must be 4.1.1 or newer. The 4.0.0a2 multitask preview overfits per-run
+fine-tuning badly enough to invert retention-time model rankings, so an older
+version changes results and not only speed; `mumdia doctor` fails on one, and the
+engine refuses to launch the DeepLC workers with it. MS2PIP is pinned only in the Docker specification
+(`env/docker-rescore.yml`), because the native fragment predictor is the default
+and MS2PIP is opt-in.
+
+You usually do not have to name the interpreters at all. A field set to `"auto"`,
+which is what `configs/examples/*.json` use, resolves through
+`MUMDIA_PYTHON_<ROLE>`, `MUMDIA_PYTHON`, `CONDA_PREFIX`, `VIRTUAL_ENV`, then
+`python3` and `python` on `PATH`, accepting a candidate only after it imports what
+that role's workers import, so activating the environment is normally enough. Name
+an absolute path when a machine has several candidates and you want to pin one; an
+explicit path is never second-guessed.
 
 Notes:
 
@@ -60,16 +118,16 @@ List what exists and confirm an interpreter's contents:
 
 ```
 conda env list
-C:/Users/robbi/anaconda3/envs/py312_mumdia/python.exe -c "import torch, pyarrow; print(torch.__version__, pyarrow.__version__)"
-C:/Users/robbi/anaconda3/envs/deeplc_mt/python.exe     -c "import deeplc; print(deeplc.__version__)"
+conda run -n mumdia-deeplc python -c "import deeplc, torch; print(deeplc.__version__, torch.__version__)"
 ```
 
-Conda specs for the sidecar environments are under `env/` (the same specs the
-Docker image bakes). `mumdia doctor` probes the interpreters named in a config
-and reports which packages import, so run it after editing paths:
+`mumdia doctor` is the check that matters, because it resolves the interpreters
+exactly as a run does and then reports what it found: the path, which rule
+resolved it, the versions of the packages whose version changes results, and
+whether the worker scripts are where the engine will look.
 
 ```
-C:/Users/robbi/mumdia_build/release/mumdia.exe doctor --config config.local-diann-lib.json
+mumdia doctor --config configs/examples/diann-library.json
 ```
 
 ### Environment to config-field mapping
@@ -187,10 +245,10 @@ written by `search-seed` (`{"frag_ppm_offset": 0.79, "frag_tol_ppm": 19.2,
 
 ## 4. Worked end-to-end runs
 
-Run from the repository root
-(`C:/Users/robbi/OneDrive - UGent/MuMDIA_NG`). Both inputs below exist on disk:
-`fasta/ecoli_22032024.fasta` and
-`mzml_files/LFQ_Orbitrap_AIF_Ecoli_01.mzML` (a 3.4 GB AIF file).
+Run from the repository root. Unlike section 0, these need data you supply:
+`fasta/ecoli_22032024.fasta` and `mzml_files/LFQ_Orbitrap_AIF_Ecoli_01.mzML`, a
+3.4 GB AIF file from ProteomeXchange. Both directories are gitignored, so a fresh
+clone has neither.
 
 ### 4a. Zero-dependency native FASTA run
 
@@ -200,9 +258,9 @@ rolling-window apex counting (window 5), and the RT prior
 throughout.
 
 ```
-C:/Users/robbi/mumdia_build/release/mumdia.exe run \
-  --fasta fasta/ecoli_22032024.fasta \
-  --mzml  mzml_files/LFQ_Orbitrap_AIF_Ecoli_01.mzML \
+mumdia run \
+  --fasta   fasta/ecoli_22032024.fasta \
+  --mzml    mzml_files/LFQ_Orbitrap_AIF_Ecoli_01.mzML \
   --out-dir out_native \
   --profile dia \
   --top-peaks-ms2 300
@@ -210,27 +268,36 @@ C:/Users/robbi/mumdia_build/release/mumdia.exe run \
 
 Expected result (documented, not re-verified here): approximately 1,213 target
 peptides (precursor rows in `out_native/peptides.tsv`) at 1% FDR. This path is
-deterministic across runs and high-precision.
+byte-reproducible: two runs on the same input produce an identical
+`peptides.tsv`, and so do runs on different operating systems, which `ci/smoke.sh`
+and the `smoke-cross-platform` CI job assert.
+
+`--top-peaks-ms2 300` belongs to this one chimeric AIF acquisition and must not be
+carried elsewhere: on a 50-window Orbitrap DIA run the same cap cost 60% of the
+peptides (`docs/04_convert.md`).
 
 ### 4b. Best-workflow library run
 
 Library-input mode plus the local sidecar config. `run` skips
 digest/peptidoforms/predict-frag and consumes the prebuilt library
-(`main.rs:208-215`). The config `config.local-diann-lib.json` (repository root)
-turns on: Extended features, `min_frag_corr = 0.2`, rolling-window apex (5) and
-RT prior (120 s), the per-run DeepLC fine-tune via `deeplc_mt`, the `nn_torch`
-rescorer via `py312_mumdia` with `rescore.strict = true`, an RT-window
-multiplier of 1.5, and `quant.q_filter = run_psm_q`. Use a new output directory:
+(`main.rs:208-215`). The config `configs/examples/diann-library.json` turns on:
+Extended features, `gate_min_score = 0.2`, rolling-window apex (5) and RT prior
+(120 s), the per-run DeepLC fine-tune, the `nn_torch` rescorer with
+`rescore.strict = true`, an RT-window multiplier of 1.5, and
+`quant.q_filter = run_psm_q`. Both interpreters are `"auto"`, so they are
+discovered from `MUMDIA_PYTHON_*`, an activated environment, or `PATH`, and a
+candidate is accepted only if it can import what the worker imports; name an
+absolute path instead if you prefer to pin one. Use a new output directory:
 `run` has no cache/resume and does not clear stale optional files from a reused
 directory.
 
 ```
-C:/Users/robbi/mumdia_build/release/mumdia.exe run \
+mumdia run \
   --lib-precursors lib/lib_precursors.parquet \
   --lib-fragments  lib/lib_fragments.parquet \
   --mzml mzml_files/LFQ_Orbitrap_AIF_Ecoli_01.mzML \
   --out-dir out_lib \
-  --config config.local-diann-lib.json \
+  --config configs/examples/diann-library.json \
   --top-peaks-ms2 300
 ```
 
@@ -274,7 +341,7 @@ failure fatal, and the report is the source of truth.
 
 ### Fast smoke checks
 
-Start with `mumdia doctor --config config.local-diann-lib.json`; it validates
+Start with `mumdia doctor --config configs/examples/diann-library.json`; it validates
 imports without launching a full run.
 
 Do not use `--max-spectra 20000` with the fine-tuning recipe as a sidecar smoke
@@ -299,11 +366,15 @@ Verify the requested sidecars through their logs and
 Treat the Section 4 counts as regression targets on
 `LFQ_Orbitrap_AIF_Ecoli_01.mzML`:
 
+- The fixture smoke test (`ci/smoke.sh`), which needs no external data: 136
+  assertions. Run this first; it fails faster and more specifically than any count
+  below.
 - Native FASTA run (`--profile dia`): approximately 1,213 precursor-shaped
   report rows passing peptide q <= 1%, deterministic (exact match expected).
-- Best-workflow library run (`config.local-diann-lib.json`, strict `nn_torch`,
+- Best-workflow library run (`configs/examples/diann-library.json`, strict `nn_torch`,
   explicit `--top-peaks-ms2 300`): approximately 10,300 rows under the same
-  report definition. Treat this as a band because DeepLC fine-tuning is unseeded
+  report definition. Treat this as a band because DeepLC fine-tuning, although
+  seeded from `rng_seed`, is not bit-for-bit reproducible
   and NnTorch is seeded but not bit-deterministic.
 
 Count the report rows, which are one per `(peptidoform, charge)` but selected by
@@ -316,3 +387,10 @@ wc -l out_lib/peptides.tsv   # subtract 1 for the header
 A native count far below 1,213 or a library count far below 10,300 indicates a
 regression (or, for the library run, a missing or misconfigured sidecar). These
 numbers are documented from prior runs and were not re-verified in this document.
+The fixture smoke test is the part that IS verified on every commit, and it is the
+one to trust when the two disagree about whether the engine works.
+
+Every run records what produced it: `manifest.json` carries the engine version, the
+short commit with a `-dirty` marker when the worktree was dirty, the commit date,
+the full command line, and a blake3 hash of every input. Quote that stamp with any
+number you report.

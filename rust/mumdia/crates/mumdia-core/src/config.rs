@@ -1,33 +1,34 @@
-//! Typed configuration (PLAN.md Section 7, Section 9).
+//! Typed configuration (docs/02_config_and_data_model.md).
 //!
 //! One serde structure with per-stage sections, `#[serde(default)]` on every
 //! field, and `deny_unknown_fields` so misconfiguration fails loudly. Every
-//! choice point is an enum backed by a strategy (Section 9.1); MVP ships only
-//! the strategies MVP needs, with MVP-conservative defaults (Section 10):
-//! fixed tolerances, one documented decoy scheme, the `minimal` feature set.
+//! choice point is an enum backed by a strategy; MVP ships only the strategies
+//! MVP needs, with MVP-conservative defaults: fixed tolerances, one documented
+//! decoy scheme, the `minimal` feature set.
 
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
-// Strategy enums (Section 9)
+// Strategy enums
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DecoyStrategy {
     /// Reverse the sequence keeping the C-terminal residue fixed. Documented,
-    /// clean-room default for MVP (PLAN.md Section 11). No borrowed map.
+    /// clean-room default for MVP (docs/14_build_test_deploy_gotchas.md). No
+    /// borrowed map.
     #[default]
     Reverse,
     /// Deterministic seeded shuffle of the interior residues.
     Scramble,
     /// DIA-NN terminal-residue fragment m/z shift. Deferred: license-checked
-    /// addition (PLAN.md Section 11), not part of MVP.
+    /// addition (docs/14_build_test_deploy_gotchas.md), not part of MVP.
     DiannShift,
     None,
 }
 
-/// Fragment-matcher backend for search-seed and extract (fragindex_spec).
+/// Fragment-matcher backend for search-seed and extract (docs/06_predict_frag_index_matchers.md).
 /// Default `Fragindex` (log-bin CSR matcher): on narrow-window DIA it is ~1.95x
 /// faster in search-seed and ~1.26x in extract with essentially unchanged IDs
 /// (HYE B_01: peptides -0.1%); `Bucketed` is the previous `Library::page_search`
@@ -63,7 +64,7 @@ pub enum CalibrationMethod {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FeatureSet {
-    /// MVP feature set (PLAN.md Section 10).
+    /// MVP feature set (docs/10_features.md).
     #[default]
     Minimal,
     Rich,
@@ -81,7 +82,7 @@ pub enum RtPredictorKind {
     /// the engine runs with zero external runtime dependencies.
     #[default]
     Native,
-    /// DeepLC Python sidecar (PLAN.md Section 0, Section 3.2).
+    /// DeepLC Python sidecar (docs/13_sidecars.md).
     Deeplc,
 }
 
@@ -91,7 +92,7 @@ pub enum FragPredictorKind {
     /// Native heuristic intensity model (no Python). MVP default.
     #[default]
     Native,
-    /// MS2PIP Python sidecar (PLAN.md Section 0, Section 3.2).
+    /// MS2PIP Python sidecar (docs/13_sidecars.md).
     Ms2pip,
 }
 
@@ -102,7 +103,7 @@ pub enum RescorerKind {
     /// default (always available).
     #[default]
     NativeTda,
-    /// Mokapot Python sidecar (PLAN.md Section 0).
+    /// Mokapot Python sidecar (docs/13_sidecars.md).
     Mokapot,
     /// PyTorch semi-supervised MLP sidecar (`nn_rescore_worker.py`): a nonlinear
     /// Percolator/mokapot-style rescorer (CV folds + iterative positive
@@ -405,9 +406,10 @@ pub struct PredictFragConfig {
     pub predictor: FragPredictorKind,
     pub rt_predictor: RtPredictorKind,
     /// Fragment charges rule: charge 1 always; charge 2 added for precursor
-    /// charge >= this threshold (PLAN.md Decision 3). Default 2: DIA-NN uses
-    /// doubly-charged fragments for ~16% of charge-2 precursors' transitions, so
-    /// blocking them (the old default of 3) discarded real signal.
+    /// charge >= this threshold (docs/18_findings_and_decisions.md). Default 2:
+    /// DIA-NN uses doubly-charged fragments for ~16% of charge-2 precursors'
+    /// transitions, so blocking them (the old default of 3) discarded real
+    /// signal.
     pub charge2_from_precursor_charge: i32,
     /// Composition-based fragment charge cap. When true, a b/y fragment is kept
     /// at charge z only if `z <= 1 (its N-terminal amine) + (#R + #H + #K within
@@ -446,7 +448,7 @@ impl Default for PredictFragConfig {
 pub struct SearchSeedConfig {
     pub fdr_seed: f64,
     pub fragment_tol_ppm: f64,
-    /// Max reported PSMs per spectrum (wide-window DIA, PLAN.md Stage S).
+    /// Max reported PSMs per spectrum (wide-window DIA, docs/07_search_seed.md).
     pub report_psms: usize,
     /// Minimum matched fragments for a seed PSM.
     pub min_matched_peaks: usize,
@@ -456,7 +458,8 @@ pub struct SearchSeedConfig {
     /// probing cost without discarding peaks from the downstream extraction
     /// artifact. Default 300; set to 0 to probe every converted peak.
     pub top_n_peaks: usize,
-    /// Fragment-matcher backend (fragindex_spec). Default `Fragindex`.
+    /// Fragment-matcher backend (docs/06_predict_frag_index_matchers.md).
+    /// Default `Fragindex`.
     pub matcher: MatcherKind,
     /// Robust two-pass fragment mass calibration (sensitivity_plan P3.1). After the
     /// first median-offset + tolerance fit, re-fit on only the deviations inside the
@@ -629,12 +632,19 @@ pub struct ExtractConfig {
     pub presence_min_fragments: usize,
     /// minimum simultaneously-present fragments over the consecutive-scan run.
     pub presence_min_coelution: usize,
-    /// tier-(d) spectral-agreement gate: reject a candidate whose apex observed
-    /// fragment intensities correlate with the predicted pattern below this.
+    /// tier-(d) spectral-agreement gate: reject a candidate whose observed fragment
+    /// intensities agree with the predicted pattern below this score.
+    ///
+    /// Renamed from `min_frag_corr`, which was accurate for none of the four
+    /// `gate_mode` values: under the default `apex_pearson` it is an intensity
+    /// correlation at ONE apex scan rather than a chromatographic co-elution
+    /// correlation, and under `spectral_entropy` it is not a correlation at all. The
+    /// old name is not accepted (`deny_unknown_fields`), so an old config fails loudly
+    /// with the offending key named rather than silently reverting to a default.
     /// Applied symmetrically to targets and decoys, but that alone does not prove
     /// null exchangeability in chimeric DIA; validate every threshold with an
     /// independent entrapment. 0 disables.
-    pub min_frag_corr: f64,
+    pub gate_min_score: f64,
     /// tier-(c) minimum fraction of the candidate's predicted fragments that
     /// must be observed. With enough predicted fragments (top_n>=~10) this is a
     /// strong, symmetric discriminator: real peptides match a large fraction,
@@ -719,7 +729,8 @@ pub struct ExtractConfig {
     /// winner-take-all only if the top eluter's profile height is at least this
     /// multiple of the runner-up's; otherwise the peak stays shared.
     pub peak_claim_margin: f64,
-    /// Fragment-matcher backend (fragindex_spec). Default `Fragindex`.
+    /// Fragment-matcher backend (docs/06_predict_frag_index_matchers.md).
+    /// Default `Fragindex`.
     pub matcher: MatcherKind,
     /// Minimum-PSMs-per-peptide evidence filter: reject a candidate whose fragments
     /// co-elute over fewer than this many consecutive scan groups (`coelution_run`).
@@ -767,9 +778,13 @@ pub struct ExtractConfig {
     /// signature-ion intensity only as a sub-integer tiebreak. In wide-window DIA a
     /// single fragment m/z channel is chimeric, so the tallest scan is often a
     /// co-isolated interferent; the scan where the most of the peptide's own
-    /// predicted transitions co-elute is a more reliable apex. `false` (default)
-    /// keeps the legacy signature-intensity apex. The rolling distinct-fragment
-    /// count (`apex_count_window`) still gates which scans qualify in both modes.
+    /// predicted transitions co-elute is a more reliable apex. Default `true`, on
+    /// correctness grounds rather than a count: `false` keeps the legacy
+    /// signature-intensity apex, whose score is 0.0 at every qualifying scan when none
+    /// of the top-K predicted fragments is observed, so the strict `>` never replaces
+    /// the first candidate and the apex silently becomes the LOWEST-RT qualifying scan.
+    /// The rolling distinct-fragment count (`apex_count_window`) still gates which scans
+    /// qualify in both modes.
     pub apex_evidence_rank: bool,
     /// Emit the four gate-diagnostic scores (`gate_apex`, `gate_peak_spectral`,
     /// `gate_coelution`, `gate_spectral_entropy`) as extra `psms.parquet` columns,
@@ -777,12 +792,12 @@ pub struct ExtractConfig {
     /// like `emit_candidate_audit`): when off, neither the columns nor the extra
     /// per-candidate score computation happen, so the default chain is byte-identical.
     pub emit_gate_diagnostics: bool,
-    /// Which spectral-agreement score the `min_frag_corr` gate thresholds
+    /// Which spectral-agreement score the `gate_min_score` gate thresholds
     /// (sensitivity program). The legacy gate uses a single apex-scan intensity
     /// Pearson, which one chimeric scan can dominate. See [`GateMode`].
     pub gate_mode: GateMode,
     /// Second threshold for `GateMode::Combined`: the co-elution score must exceed
-    /// this while the peak-integrated spectral score exceeds `min_frag_corr`.
+    /// this while the peak-integrated spectral score exceeds `gate_min_score`.
     /// Requiring BOTH is more specific (rejects interferents that pass one axis).
     pub gate_coelution_min: f64,
 }
@@ -800,8 +815,26 @@ impl Default for ExtractConfig {
             // validation is required before treating any threshold as FDR-safe.
             // Relaxed from the historical 0.5 to 0.2 to recover low-abundance
             // candidates the hard single-scan Pearson gate was dropping
-            // (comment.md S1); still a hard gate, not the soft/budgeted redesign.
-            min_frag_corr: 0.2,
+            // (docs/18_findings_and_decisions.md); still a hard gate, not the
+            // soft/budgeted redesign.
+            // 0.2. Briefly set to 0.6 on the strength of the gate sweep in docs/18,
+            // where `native_tda` peaked at 0.6 (9,503 peptides) while `nn_torch` peaked
+            // at the loosest gate tested. Since `native_tda` is the default classifier,
+            // 0.6 looked like the matching default.
+            //
+            // Measured, and it is not. Same AIF file, current defaults (augmented
+            // library, `apex_evidence_rank = true`, paired CV folds), 2x2 of gate x
+            // rescorer at an unchanged empirical decoy fraction of 0.0097-0.0098:
+            //
+            //     gate 0.2   native_tda 10,847   nn_torch 10,914
+            //     gate 0.6   native_tda 10,369   nn_torch 10,399
+            //
+            // 0.6 costs 4.4% of peptides for `native_tda` and 4.7% for `nn_torch`, and
+            // halves what extract accepts (45,338 -> 21,979). `native_tda`'s inverted-U
+            // flattened from below -- its count rose from 9,503 to 10,847 and the optimum
+            // moved to the loose end -- so the sweep that motivated 0.6 no longer
+            // describes this configuration, and loose is now better for BOTH rescorers.
+            gate_min_score: 0.2,
             min_matched_fraction: 0.0,
             apex_top_fragments: 0, // superseded by apex_count_tol; kept for compat
             apex_rt_prior_s: 0.0,  // RT prior off by default
@@ -827,15 +860,27 @@ impl Default for ExtractConfig {
             alt_peak_min_area_frac: 0.10, // alternate peak >= 10% of rank-0 area
             alt_peak_min_separation_s: 5.0, // alternate apex >= 5 s from rank-0 apex
             emit_candidate_audit: false, // diagnostic; off in production
-            apex_evidence_rank: false, // legacy signature-intensity apex
+            // On. The legacy signature-intensity apex scores a scan group by the summed
+            // OBSERVED intensity of only the top-K PREDICTED fragments, so when none of
+            // those K is observed at any qualifying scan the score is 0.0 everywhere, the
+            // strict `>` never replaces the first candidate, and the apex silently becomes
+            // the LOWEST-RT qualifying scan -- up to a full RT window away, or anywhere in
+            // the gradient for a candidate with no window row. The RT prior cannot rescue
+            // it, because the combination is multiplicative and a zero annihilates the
+            // prior in exactly the case the prior exists for. Evidence rank scores
+            // `(n_distinct_fragments + tie) * prior`, which is always positive, so the
+            // fallback is unreachable. The wrong apex propagates into `prelim_score`
+            // (which decides the pre-FDR competition winner), `rt_error_abs`,
+            // `log_apex_intensity`, and quant's integration centre.
+            apex_evidence_rank: true,
             emit_gate_diagnostics: false, // diagnostic gate-score columns; off in production
             gate_mode: GateMode::ApexPearson, // legacy single-scan intensity Pearson
-            gate_coelution_min: 0.5, // used only by GateMode::Combined
+            gate_coelution_min: 0.5,      // used only by GateMode::Combined
         }
     }
 }
 
-/// Spectral-agreement score the extraction acceptance gate (`min_frag_corr`)
+/// Spectral-agreement score the extraction acceptance gate (`gate_min_score`)
 /// thresholds. All are computed at the gate from data already in hand.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -858,7 +903,7 @@ pub enum GateMode {
     /// fragment's XIC to the signature reference over the elution peak (temporal
     /// agreement, orthogonal to intensity agreement).
     Coelution,
-    /// Require BOTH: peak-integrated spectral Pearson >= `min_frag_corr` AND the
+    /// Require BOTH: peak-integrated spectral Pearson >= `gate_min_score` AND the
     /// co-elution score >= `gate_coelution_min`. More specific (an interferent
     /// passing one axis is still rejected), for a cleaner FDR pool.
     Combined,
@@ -870,9 +915,9 @@ pub struct FeaturesConfig {
     pub set: FeatureSet,
     /// Write the Percolator-style `.pin` text file requested by `--out-pin`. No MuMDIA
     /// stage consumes it (`rescore` builds its own PIN for the sidecars); it exists for
-    /// external tooling. At 1.5M rows x 387 features it is a ~5.4 GB text write, so set
-    /// this to false to skip it when nothing downstream needs it. Default true, so the
-    /// artifact keeps appearing unless it is explicitly turned off.
+    /// external tooling. At 1.5M rows x 387 features it is a ~5.4 GB text write.
+    /// Default false: nothing in MuMDIA reads it, which makes the write pure cost unless
+    /// an external tool wants the file. Set true to get the artifact back.
     pub emit_pin: bool,
     pub coelution_corr_threshold: f64,
     pub prec_tol_ppm: f64,
@@ -905,7 +950,7 @@ pub struct FeaturesConfig {
     /// (typical real peak width); higher percentiles widen the shared window.
     pub bound_confident_pct: f64,
     /// Emit the MS1 apex-isotope precursor feature `ms1_isotope_height_corr`
-    /// (Pearson of the observed apex isotope heights [i0,i1,i2] against the
+    /// (Pearson of the observed apex isotope heights `[i0,i1,i2]` against the
     /// Poisson-averagine model). Default false (the feature is present in the
     /// battery but returns 0.0, so the vector length is unchanged in effect). It
     /// overlaps the existing `ms1_isotope_cosine_apex`, so it is opt-in and
@@ -916,7 +961,12 @@ impl Default for FeaturesConfig {
     fn default() -> Self {
         Self {
             set: t(),
-            emit_pin: true, // preserve the artifact; set false to skip a ~5.4 GB text write
+            // Off. No MuMDIA stage reads this file: `rescore` builds its own PIN
+            // (features.rs, "the PIN is not consumed by any stage"). It is a ~5.4 GB text
+            // write per run on a real library, so a 40-run experiment wrote hundreds of GB
+            // that nothing read back, by default. Set true when a PIN is wanted for an
+            // external tool.
+            emit_pin: false,
             coelution_corr_threshold: 0.9,
             prec_tol_ppm: 20.0,
             bound_features: true,
@@ -959,7 +1009,7 @@ pub struct CompeteConfig {
 impl Default for CompeteConfig {
     fn default() -> Self {
         Self {
-            group_by: CompeteGroupBy::Precursor,
+            group_by: CompeteGroupBy::BasePeptide,
             apex_rt_tolerance_s: 5.0,
             mode: CompetitionMode::WinnerTakeAll,
             margin: 0.0,
@@ -999,7 +1049,14 @@ pub enum CompetitionMode {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CompeteGroupBy {
-    Precursor,
+    /// One winner per stripped base peptide, per label. Renamed from `precursor`,
+    /// which it is not: `compete.rs` keys the group on `base_peptide_id`, which comes
+    /// from the stripped sequence, so every charge state AND every modification
+    /// variant of one peptide collapses to a single winner before FDR. Use
+    /// `peptidoform_charge` for a genuine precursor unit, and note that it is
+    /// REQUIRED for a PTM search. The old name is not accepted, so an old config
+    /// fails loudly rather than silently changing the competition unit.
+    BasePeptide,
     Apex,
     /// Precursor-level: separate every distinct peptidoform+charge. Recovers
     /// sibling charges the peptide-level `Precursor` grouping collapses; the
@@ -1128,6 +1185,45 @@ pub struct QuantConfig {
     /// peak wings. Off by default (identity on a clean peak). Opt-in and
     /// benchmark-gated: it changes reported quantities.
     pub interference_envelope: bool,
+    /// Which fragments enter the top-N sum. `observed_area` (default, legacy) ranks
+    /// by the integrated area itself, which preferentially selects interfered
+    /// fragments (their areas are inflated) and so varies run to run.
+    /// `predicted` ranks by the library (predicted or empirical) fragment intensity,
+    /// a per-precursor constant, so every run sums the same fragments. Astral HYE
+    /// 2026-08-26: CV 0.163 -> 0.112 on 6/6 ions at top-3. Benchmark-gated.
+    pub fragment_selection: FragmentSelection,
+    /// When > 0, integrate each fragment over the `2k+1` scans centred on the
+    /// identification apex instead of the descent-walk window (`bound_peak`
+    /// window ignored; falls back to it when the apex is unknown). A fixed narrow
+    /// window is far less sensitive to interference in the peak wings than the
+    /// walked bounds. 0 (default) = off.
+    pub fixed_scan_halfwidth: usize,
+    /// Subtract a per-fragment local background before integrating (fixed-scan
+    /// window only). The background is the `baseline_quantile` quantile of the
+    /// intensities in the two flanks (`baseline_flank_scans` samples on each side
+    /// of the integration window); window intensities are clipped at zero after
+    /// subtraction. Targets the additive floor that compresses ratios in the
+    /// low-abundance condition. Off by default; benchmark-gated.
+    pub baseline_subtract: bool,
+    /// Flank length (samples per side) used to estimate the background.
+    pub baseline_flank_scans: usize,
+    /// Quantile of the flank intensities taken as the background level.
+    pub baseline_quantile: f64,
+    /// When > 0, integrate each fragment over the samples within `fixed_window_s`
+    /// seconds of the identification apex (instrument-independent alternative to
+    /// `fixed_scan_halfwidth`, which it overrides). 0 (default) = off.
+    pub fixed_window_s: f64,
+}
+
+/// Fragment ranking for the quant top-N sum. See [`QuantConfig::fragment_selection`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum FragmentSelection {
+    /// Rank fragments by their own integrated area (legacy).
+    #[default]
+    ObservedArea,
+    /// Rank fragments by library intensity (`predicted_intensity` in the chromatogram table).
+    Predicted,
 }
 impl Default for QuantConfig {
     fn default() -> Self {
@@ -1143,12 +1239,18 @@ impl Default for QuantConfig {
             reliable_q: 0.001,
             q_filter: QuantQColumn::PeptideQ,
             interference_envelope: false, // apex-outward interference envelope off by default
+            fragment_selection: FragmentSelection::ObservedArea,
+            fixed_scan_halfwidth: 0,
+            baseline_subtract: false,
+            baseline_flank_scans: 12,
+            baseline_quantile: 0.25,
+            fixed_window_s: 0.0,
         }
     }
 }
 
-/// Match-between-runs strategy (Stage D3, `mbr_plan.md`). Default `None` reproduces
-/// the current chain byte-for-byte.
+/// Match-between-runs strategy (Stage D3, docs/12_quant_lfq_align_mbr_report_audit.md).
+/// Default `None` reproduces the current chain byte-for-byte.
 ///
 /// ONLY `None` VS NOT-`None` IS IMPLEMENTED. The three non-`None` variants are described
 /// below as the intended staging, but no code distinguishes them: every test in the tree is
@@ -1243,7 +1345,28 @@ pub struct RescoreConfig {
     pub train_fdr: f64,
     /// number of semi-supervised iterations for the native rescorer.
     pub num_iter: usize,
+    /// Refuse a rescore whose in-memory feature matrix would exceed this many GiB.
+    /// 0 (default) means no ceiling, which is the previous behaviour.
+    ///
+    /// The matrix is `Vec<Vec<f64>>`: eight bytes per value, plus a heap allocation and a
+    /// 24-byte spine entry per PSM. Nothing in the workspace estimates or checks available
+    /// memory (there is deliberately no `sysinfo` dependency), so an experiment-wide
+    /// rescore over enough runs was simply killed by the OS after however long it took to
+    /// get there. `native_tda` additionally runs all folds in parallel, each holding an
+    /// owned standardised copy of its training slice, so the true peak is roughly
+    /// `(1 + folds) x` this figure.
+    ///
+    /// Setting a ceiling converts that into an error at startup, naming the estimate and
+    /// the two ways out. It is not a batching implementation: sub-batching changes which
+    /// PSMs share a pooled `q_value`, so it is the operator's decision, not a silent one.
+    pub max_feature_matrix_gib: f64,
     pub python: Option<String>,
+    /// Path to an external `percolator` executable.
+    ///
+    /// Parsed and never read: no stage launches percolator, and `RescorerKind` has no
+    /// variant that would. It is the only silently inert config field in the tree, since
+    /// the three MBR ones warn (see `validate`). Kept rather than deleted because the
+    /// external-percolator path is still intended; `validate` now warns when it is set.
     pub percolator_bin: Option<String>,
     /// Protein-accession substring marking spike-in (entrapment) negatives, e.g.
     /// "_HUMAN". Required when `classifier = entrapment`; PSMs whose protein
@@ -1379,6 +1502,7 @@ impl Default for RescoreConfig {
             folds: 3,
             train_fdr: 0.01,
             num_iter: 10,
+            max_feature_matrix_gib: 0.0, // no ceiling; previous behaviour
             python: None,
             percolator_bin: None,
             entrapment_marker: None,
@@ -1579,12 +1703,86 @@ impl Config {
                     .into(),
             ));
         }
-        if !self.extract.min_frag_corr.is_finite()
-            || !(0.0..=1.0).contains(&self.extract.min_frag_corr)
+        if !self.extract.gate_min_score.is_finite()
+            || !(0.0..=1.0).contains(&self.extract.gate_min_score)
         {
             return Err(Invalid(
-                "extract.min_frag_corr must be finite and in [0, 1] (0 disables \
+                "extract.gate_min_score must be finite and in [0, 1] (0 disables \
                 the gate)."
+                    .into(),
+            ));
+        }
+        if !self.quant.fixed_window_s.is_finite() || self.quant.fixed_window_s < 0.0 {
+            return Err(Invalid(
+                "quant.fixed_window_s must be finite and >= 0 (0 disables the fixed \
+                 integration window)."
+                    .into(),
+            ));
+        }
+        if !self.quant.baseline_quantile.is_finite()
+            || !(0.0..=1.0).contains(&self.quant.baseline_quantile)
+        {
+            return Err(Invalid(
+                "quant.baseline_quantile must be finite and in [0, 1].".into(),
+            ));
+        }
+        // The entrapment estimate is
+        // `(ratio * n_entrap + 1) / max(1, n_real)`, so `ratio` scales the entire
+        // numerator. At 0 it collapses to `1/n_real`: with more than 100 real targets
+        // every row passes at 1% FDR with no null contributing at all. Negative values
+        // make q negative, and both `count_targets_at_q` and `passes_quant_filter` accept
+        // a negative q as passing. This is the failure mode of computing the ratio the
+        // wrong way round (N_entrap/N_real, a small number), which silently reports a
+        // near-zero FDR on the tool whose whole job is to validate the FDR.
+        // ── divisors and window widths ──────────────────────────────────────────
+        //
+        // Every field below is either divided by or used as a bin width, so a zero or a
+        // negative value does not degrade the result, it destroys it: a zero divisor
+        // gives an infinite or NaN bucket index that then goes through `as i64`, which in
+        // Rust is a saturating cast, so every row lands in one bucket silently. There is
+        // no error and no warning, just a stage that quietly stops distinguishing
+        // anything.
+        //
+        // `Config::validate` grew field by field around whatever had most recently gone
+        // wrong (`min_frag_corr`, `fixed_window_s`, `baseline_quantile`, `train_fdr`,
+        // `entrapment_ratio`), so the rest of the numeric surface was never covered. This
+        // is the divisor set, audited together.
+        for (name, value) in [
+            // `prescan.rs`: `(rt - lo) / bin` selects the retention-time cell.
+            ("prescan.rt_bin_s", self.prescan.rt_bin_s),
+            // `compete.rs`: `(apex_rt / tolerance).round()` is the apex bucket under
+            // `group_by = apex`.
+            (
+                "compete.apex_rt_tolerance_s",
+                self.compete.apex_rt_tolerance_s,
+            ),
+            // `prescan.rs`: fragment match half-width in Da.
+            ("prescan.tol_da", self.prescan.tol_da),
+            // Fragment/precursor tolerances. Zero admits nothing and overflows the
+            // log-bin count in `binning.rs`; negative completes the run and reports zero
+            // identifications with no error.
+            (
+                "search_seed.fragment_tol_ppm",
+                self.search_seed.fragment_tol_ppm,
+            ),
+            ("extract.frag_tol_ppm", self.extract.frag_tol_ppm),
+            ("extract.prec_tol_ppm", self.extract.prec_tol_ppm),
+        ] {
+            if !value.is_finite() || value <= 0.0 {
+                return Err(Invalid(format!(
+                    "{name} must be finite and > 0 (got {value}); it is used as a divisor \
+                     or a bin width, and a zero or negative value collapses every row \
+                     into one bucket instead of failing"
+                )));
+            }
+        }
+
+        if !self.rescore.entrapment_ratio.is_finite() || self.rescore.entrapment_ratio <= 0.0 {
+            return Err(Invalid(
+                "rescore.entrapment_ratio must be finite and > 0. It is \
+                 N_real_library / N_entrapment_library, so it is >= 1 for the usual \
+                 spike-in proportions; 0 or a negative value makes every PSM pass at any \
+                 q threshold. Check you have not inverted the ratio."
                     .into(),
             ));
         }
@@ -1657,6 +1855,19 @@ impl Config {
                      setting them has no effect on this run"
                 );
             }
+        }
+        // The fourth inert field, and the only one that used to warn about nothing. Under
+        // `deny_unknown_fields` a user reasonably reads an accepted key as an honoured
+        // one, so silence here means a run that looks configured for external percolator
+        // and is not.
+        if self.rescore.percolator_bin.is_some() {
+            tracing::warn!(
+                "rescore.percolator_bin is parsed but no stage launches percolator, so \
+                 setting it has no effect. Use rescore.classifier = mokapot or nn_torch \
+                 for an external classifier."
+            );
+        }
+        {
             // Only `strategy == None` vs `!= None` is ever tested, so the non-None variants
             // are indistinguishable in behaviour.
             if self.mbr.strategy != MbrStrategy::None {
@@ -1667,13 +1878,31 @@ impl Config {
                 );
             }
         }
+        if self.quant.fixed_window_s > 0.0 && self.quant.fixed_scan_halfwidth > 0 {
+            tracing::warn!(
+                fixed_window_s = self.quant.fixed_window_s,
+                fixed_scan_halfwidth = self.quant.fixed_scan_halfwidth,
+                "quant: both fixed-window forms are set; the seconds form wins and \
+                 fixed_scan_halfwidth is ignored"
+            );
+        }
+        if self.quant.baseline_subtract
+            && self.quant.fixed_scan_halfwidth == 0
+            && self.quant.fixed_window_s == 0.0
+        {
+            tracing::warn!(
+                "quant.baseline_subtract applies only to the fixed-window integration, \
+                 which is off (fixed_scan_halfwidth = 0 and fixed_window_s = 0), so no \
+                 baseline is subtracted"
+            );
+        }
         Ok(())
     }
 
     /// Apply a named tuning profile on top of the current config. `dia` is the
     /// validated DIA preset (Extended features + rolling-window apex + RT prior);
     /// the other extraction defaults (emit_window_grid, reverse decoys,
-    /// min_frag_corr) remain conservative baselines. Lets one command reach a
+    /// gate_min_score) remain conservative baselines. Lets one command reach a
     /// respectable result without hand-authoring the full config JSON.
     pub fn apply_profile(&mut self, name: &str) -> Result<(), crate::error::ConfigError> {
         match name {
@@ -1692,7 +1921,7 @@ impl Config {
     }
 
     /// Canonical JSON of the fully-resolved config, for hashing into the
-    /// manifest (PLAN.md Section 9.1).
+    /// manifest (docs/02_config_and_data_model.md).
     pub fn canonical_json(&self) -> String {
         serde_json::to_string(self).expect("config serializes")
     }
@@ -1701,6 +1930,42 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quant_fixed_window_fields_round_trip_and_are_validated() {
+        let c = Config::from_json(
+            r#"{"quant":{"fragment_selection":"predicted","top_n_fragments":12,
+                 "fixed_window_s":5.0,"fixed_scan_halfwidth":3,"baseline_subtract":true,
+                 "baseline_flank_scans":8,"baseline_quantile":0.5}}"#,
+        )
+        .unwrap();
+        assert_eq!(c.quant.fragment_selection, FragmentSelection::Predicted);
+        assert_eq!(c.quant.top_n_fragments, 12);
+        assert_eq!(c.quant.fixed_window_s, 5.0);
+        assert_eq!(c.quant.fixed_scan_halfwidth, 3);
+        assert!(c.quant.baseline_subtract);
+        assert_eq!(c.quant.baseline_flank_scans, 8);
+        assert_eq!(c.quant.baseline_quantile, 0.5);
+
+        // The defaults must reproduce the pre-2026-08 integration exactly: neither fixed
+        // form on, ranking by observed area, no baseline. A config written before these
+        // fields existed therefore quantifies as it did before.
+        let d = QuantConfig::default();
+        assert_eq!(d.fragment_selection, FragmentSelection::ObservedArea);
+        assert_eq!(d.fixed_scan_halfwidth, 0);
+        assert_eq!(d.fixed_window_s, 0.0);
+        assert!(!d.baseline_subtract);
+        assert_eq!(
+            Config::default().quant.fragment_selection,
+            d.fragment_selection
+        );
+
+        assert!(Config::from_json(r#"{"quant":{"fixed_window_s":-1.0}}"#).is_err());
+        assert!(Config::from_json(r#"{"quant":{"baseline_quantile":1.5}}"#).is_err());
+        assert!(Config::from_json(r#"{"quant":{"baseline_quantile":-0.5}}"#).is_err());
+        // Unknown enum variants must fail rather than fall back to the default ranking.
+        assert!(Config::from_json(r#"{"quant":{"fragment_selection":"library"}}"#).is_err());
+    }
 
     #[test]
     fn shipped_configs_parse() {
@@ -1715,7 +1980,9 @@ mod tests {
         // untracked (see .gitignore), so they are checked by `mumdia doctor`, not here.
         let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../..");
         for name in [
-            "config.local-diann-lib.json",
+            "configs/examples/native.json",
+            "configs/examples/fasta-sidecars.json",
+            "configs/examples/diann-library.json",
             "docker/config.dia.json",
             "docker/config.diann-lib.json",
         ] {
@@ -1867,7 +2134,67 @@ mod tests {
         let c = Config::from_json(r#"{"search_seed":{"top_n_peaks":0}}"#).unwrap();
         assert_eq!(c.search_seed.top_n_peaks, 0);
 
-        assert!(Config::from_json(r#"{"extract":{"min_frag_corr":-0.1}}"#).is_err());
-        assert!(Config::from_json(r#"{"extract":{"min_frag_corr":1.1}}"#).is_err());
+        assert!(Config::from_json(r#"{"extract":{"gate_min_score":-0.1}}"#).is_err());
+        assert!(Config::from_json(r#"{"extract":{"gate_min_score":1.1}}"#).is_err());
+    }
+
+    #[test]
+    fn entrapment_ratio_must_be_positive() {
+        // `(ratio * n_entrap + 1) / max(1, n_real)`: at ratio 0 this collapses to
+        // 1/n_real, so above ~100 real targets every row passes at 1% with no null
+        // contributing. A negative ratio makes q negative, which both
+        // `count_targets_at_q` and `passes_quant_filter` accept as passing. That is the
+        // failure mode of inverting the ratio, on the tool whose job is validating FDR.
+        let mut cfg = Config::default();
+        assert!(cfg.validate().is_ok(), "default must be valid");
+
+        for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            cfg.rescore.entrapment_ratio = bad;
+            let err = cfg
+                .validate()
+                .expect_err(&format!("{bad} must be rejected"));
+            assert!(
+                format!("{err}").contains("entrapment_ratio"),
+                "error should name the field: {err}"
+            );
+        }
+        cfg.rescore.entrapment_ratio = 3.5;
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn divisors_must_be_finite_and_positive() {
+        // Each of these is divided by or used as a bin width. A zero divisor produces an
+        // infinite or NaN bucket index, and `as i64` in Rust saturates rather than
+        // trapping, so every row silently lands in one bucket: the stage stops
+        // distinguishing anything and reports no error at all.
+        let mut cfg = Config::default();
+        assert!(cfg.validate().is_ok(), "default must be valid");
+
+        for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            let mut c = Config::default();
+            c.prescan.rt_bin_s = bad;
+            let e = c
+                .validate()
+                .expect_err("prescan.rt_bin_s must reject {bad}");
+            assert!(format!("{e}").contains("prescan.rt_bin_s"), "{e}");
+
+            let mut c = Config::default();
+            c.compete.apex_rt_tolerance_s = bad;
+            let e = c
+                .validate()
+                .expect_err("compete.apex_rt_tolerance_s must reject");
+            assert!(format!("{e}").contains("apex_rt_tolerance_s"), "{e}");
+
+            let mut c = Config::default();
+            c.search_seed.fragment_tol_ppm = bad;
+            let e = c.validate().expect_err("fragment_tol_ppm must reject");
+            assert!(format!("{e}").contains("fragment_tol_ppm"), "{e}");
+        }
+
+        // A legitimate change still passes.
+        cfg.prescan.rt_bin_s = 10.0;
+        cfg.compete.apex_rt_tolerance_s = 2.5;
+        assert!(cfg.validate().is_ok());
     }
 }

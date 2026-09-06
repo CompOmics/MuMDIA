@@ -1,0 +1,35 @@
+# The single environment the desktop application installs, covering every sidecar
+# role at once.
+#
+# Why this instead of the two conda specifications beside this file: rescoring,
+# DeepLC and match-between-runs share one dependency set happily, and that is the
+# whole recommended workflow, so one interpreter serves all three. MS2PIP is the
+# exception, and is dealt with below.
+#
+# Why pip and not conda: reading env/mumdia-deeplc.yml, conda contributes
+# `python=3.11` and `pip`, and everything that matters is already pip. `uv` supplies
+# the interpreter too, as one self-contained binary, so the application can build
+# this with no conda anywhere on the user's machine.
+#
+# Python 3.11 rather than 3.12: mokapot and ms2pip pull `pandas<2`, which has no
+# cp312 wheel, which is exactly why env/docker-rescore.yml pins 3.11 as well.
+#
+# Versions are the ones the project already tests. Keep them in step with
+# env/mumdia-deeplc.yml and env/mumdia-rescore.yml; they are the same pins, merged.
+--extra-index-url https://download.pytorch.org/whl/cpu
+
+# Retention-time prediction and per-run fine-tuning. 4.1.1 is a floor, not a
+# preference: the 4.0.0a2 preview overfits fine-tuning badly enough to invert
+# retention-time model rankings (docs/08_rt_im_train.md).
+deeplc==4.1.1
+torch==2.12.1+cpu
+psm-utils
+
+# Rescoring.
+mokapot==0.10.0
+scikit-learn
+
+# Shared by every worker.
+numpy
+pandas
+pyarrow

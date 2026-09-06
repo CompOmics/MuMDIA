@@ -30,7 +30,7 @@ Usage:
     --out-precursors lib/lib_precursors_aug.parquet \
     --out-fragments  lib/lib_fragments_aug.parquet \
     --mumdia-bin /path/to/mumdia.exe \
-    --config config.local-diann-lib.json \
+    --config configs/examples/diann-library.json \
     --work-dir <scratch> \
     [--match-level base_sequence|peptidoform_charge] \
     [--decoy-strategy shift|reverse]
@@ -43,6 +43,10 @@ import sys
 
 import numpy as np
 import pandas as pd
+# The engine rejects `large_string` parquet columns ("column 'peptidoform' is not
+# utf8"), and `to_parquet` picks the width itself: pandas 3.x chooses the large
+# variant, so this helper silently emitted libraries the engine would not load.
+from _lib_io import write_engine_parquet
 
 STRIP_MODS = re.compile(r"\[[^\]]*\]")
 
@@ -120,7 +124,7 @@ def main():
 
     # predict-frag input schema: id, base_peptide_id, peptidoform, charge, label, protein.
     missing_in = missing[["id", "base_peptide_id", "peptidoform", "charge", "label", "protein"]].copy()
-    missing_in.to_parquet(W("aug_missing_pforms.parquet"), index=False)
+    write_engine_parquet(missing_in, W("aug_missing_pforms.parquet"))
 
     # 4. Predict spectra + iRT for the missing set (native; fine-tune re-predicts RT).
     print("[3/6] predict-frag on missing set", flush=True)
@@ -158,8 +162,8 @@ def main():
     # recompute n_fragments from the emitted fragment rows.
     nfrag = merged_frag.groupby("candidate_id").size()
     merged_prec["n_fragments"] = merged_prec["candidate_id"].map(nfrag).fillna(0).astype(np.int32)
-    merged_prec.to_parquet(W("aug_merged_prec.parquet"), index=False)
-    merged_frag.to_parquet(W("aug_merged_frag.parquet"), index=False)
+    write_engine_parquet(merged_prec, W("aug_merged_prec.parquet"))
+    write_engine_parquet(merged_frag, W("aug_merged_frag.parquet"))
     print(f"      merged target precursors: {len(merged_prec)} (added {len(mprec)})")
 
     # 7. Build paired decoys + densify via the existing decoy builder.

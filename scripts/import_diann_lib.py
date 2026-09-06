@@ -22,6 +22,10 @@ import sys
 
 import numpy as np
 import pandas as pd
+# The engine rejects `large_string` parquet columns ("column 'peptidoform' is not
+# utf8"), and `to_parquet` picks the width itself: pandas 3.x chooses the large
+# variant, so this helper silently emitted libraries the engine would not load.
+from _lib_io import write_engine_parquet
 
 
 # DIA-NN UniMod accession -> MuMDIA ProForma name. Carbamidomethyl/Oxidation are
@@ -172,8 +176,8 @@ def main():
         "cardinality": cardinality,
     }).sort_values("candidate_id").reset_index(drop=True)
 
-    prec.to_parquet(outp, index=False)
-    frag.to_parquet(outf, index=False)
+    write_engine_parquet(prec, outp)
+    write_engine_parquet(frag, outf)
     n_hum = prec.protein.str.contains("_HUMAN").sum()
     n_yea = prec.protein.str.contains("_YEAS").sum()
     n_eco = prec.protein.str.contains("_ECOLI").sum()

@@ -116,7 +116,7 @@ chain. The scored column layout is written by the rescore stage
 | `charge` | I32 | precursor charge |
 | `label` | Str | `target` / `decoy` |
 | `protein` | Str | protein accession |
-| `base_peptide_id` | U32 | interned stripped-peptide id; the peptide-level q grouping and also the default `compete.group_by = precursor` key |
+| `base_peptide_id` | U32 | interned stripped-peptide id; the peptide-level q grouping and also the default `compete.group_by = base_peptide` key |
 | `apex_rt` | F64 | identification apex used by downstream quant |
 | `elution_lo` / `elution_hi` | F64 | identified elution bounds carried through |
 | `score` | F64 | rescorer score |
@@ -154,7 +154,7 @@ Three properties of these columns are easy to misread.
   not change the FDR each run receives, and a per-run count difference must not be
   attributed to pool size.
 - `precursor_q` is a precursor-level unit only when compete was run with
-  `group_by = peptidoform_charge`. Under the default `group_by = precursor` the
+  `group_by = peptidoform_charge`. Under the default `group_by = base_peptide` the
   charge and modification siblings were already collapsed by stripped peptide, so
   the column counts base peptides. See docs/11_compete_rescore_fdr.md.
 
@@ -195,7 +195,7 @@ poor setting is detectable. Defaults always pass.
    `linear` or `loess` (`config.rs:1336-1342`).
 3. `extract.retain_top_peaks == 0` -> `Invalid`: must be `>= 1` (1 = legacy
    single apex) (`config.rs:1343-1349`).
-4. `extract.min_frag_corr` not finite or outside `[0, 1]` -> `Invalid`
+4. `extract.gate_min_score` not finite or outside `[0, 1]` -> `Invalid`
    (`config.rs:1350-1358`). 0 disables the gate. Verified by
    `explicit_uncapped_seed_and_invalid_gate_are_distinguished`
    (`config.rs:1577-1584`).
@@ -279,7 +279,7 @@ difference; a maintainer must not treat them as interchangeable.
   normalized by the query itself.
 - `within_ppm(a, b, tol)` (`constants.rs:92-96`): `lo = min(a,b)`, `hi = max(a,b)`,
   true iff `hi - lo <= tol * 1e-6 * lo`. **Min-relative**, symmetric in argument
-  order. This is the canonical fragment-index predicate (fragindex_spec 2.1):
+  order. This is the canonical fragment-index predicate (`docs/06_predict_frag_index_matchers.md`):
   it is algebraically `hi/lo <= 1 + delta` and `ln(hi) - ln(lo) <= ln(1 + delta)`,
   the last form being what makes log-space binning exact and is proven exact
   against the log-bin +/-1 probe. `within_ppm_three_forms_agree`
@@ -414,10 +414,10 @@ listed with its default and effect. Fields marked **default-off**, **inert**, or
 | `RescorerKind` | config.rs:100-123 | **`native_tda`**, `mokapot`, `nn_torch`, `percolator`, `entrapment` | see RescoreConfig |
 | `PeakClaim` | config.rs:132-182 | **`none`**, `winner_predicted_intensity`, `proportional`, `coelution_winner`, `coelution_proportional`, `coelution_winner_margin`, `coelution_multi_cue`, `coelution_demix`, `coelution_shadow` | shared-peak apportionment; the last three are the fragment-competition framework (see below) |
 | `ClaimCues` (struct, not an enum) | config.rs:192-248 | `mz_close`, `rt_prior`, `ms1_support`, `reassign`, `apportion_em_iters` + their sigmas | composable per-claimant weight cues for `coelution_multi_cue`; every cue defaults off (weight 1.0) |
-| `GateMode` | config.rs:735-758 | **`apex_pearson`**, `peak_spectral`, `spectral_entropy`, `coelution`, `combined` | which spectral score `min_frag_corr` thresholds |
+| `GateMode` | config.rs:735-758 | **`apex_pearson`**, `peak_spectral`, `spectral_entropy`, `coelution`, `combined` | which spectral score `gate_min_score` thresholds |
 | `UnknownModPolicy` | config.rs:353-357 | **`error`**, `skip` | unknown-mod behavior |
 | `CompetitionMode` | config.rs:873-890 | **`winner_take_all`**, `none`, `features_only`, `unique_evidence`, `margin_gated` | within-group resolution |
-| `CompeteGroupBy` | config.rs:894-901 | **`precursor`**, `apex`, `peptidoform_charge` | competition grouping key; `precursor` is a misnomer for stripped-peptide grouping (see below) |
+| `CompeteGroupBy` | config.rs:894-901 | **`base_peptide`**, `apex`, `peptidoform_charge` | competition grouping key; renamed from `precursor`, which named stripped-peptide grouping inaccurately (see below) |
 | `RollupMethod` | config.rs:905-911 | **`top_n_sum`**, `sum` | protein rollup |
 | `PeakWindowMode` | config.rs:916-928 | **`per_candidate`**, `consensus` | quant integration window |
 | `NormalizeMethod` | config.rs:936-949 | `none`, **`median_ratio`**, `median` | cross-run LFQ normalization; `from_token` at 953-960 |
@@ -487,7 +487,7 @@ and lets every candidate keep its intensity minus the interferers' estimated
 contributions, so unlike winner-take-all several real co-eluters can both retain
 signal.
 
-**`GateMode`** (735-758) selects which spectral-agreement score `min_frag_corr`
+**`GateMode`** (735-758) selects which spectral-agreement score `gate_min_score`
 thresholds, all computed at the gate from data in hand. `ApexPearson` (default,
 legacy): Pearson of observed-vs-predicted fragment intensities at the single apex
 scan (one chimeric scan can dominate). `PeakSpectral`: Pearson of the
@@ -499,7 +499,7 @@ single best gate discriminator (AUC 0.826 / matched-pool recall 69.8% vs apex
 Pearson 0.781 / 64.5%). `Coelution`: predicted-intensity-weighted mean co-elution
 correlation of each matched fragment's XIC to the signature reference over the
 peak (temporal agreement, orthogonal to intensity). `Combined`: require BOTH
-peak-integrated Pearson >= `min_frag_corr` AND co-elution >= `gate_coelution_min`.
+peak-integrated Pearson >= `gate_min_score` AND co-elution >= `gate_coelution_min`.
 
 **`CompetitionMode`** (873-890). `WinnerTakeAll` (default, legacy): keep only the
 top `prelim_score` per group. `None`: keep every candidate (FDR handles
@@ -667,7 +667,7 @@ every other section), so both keys are required inside a `ResidueMod` entry.
 | `charge_by_basic_residues` | `false` | when true, keep a b/y fragment at charge z only if `z <= 1+(basic residues within the fragment)` and `z <= precursor charge`; supersedes `charge2_from_precursor_charge` |
 | `top_n_fragments` | 6 | fragments kept per candidate |
 | `ms2pip_model` | `"HCD"` | MS2PIP model name |
-| `ms2pip_python` | `None` | interpreter for MS2PIP sidecar |
+| `ms2pip_python` | `None` | interpreter for MS2PIP sidecar; `"auto"` discovers one (`docs/13_sidecars.md`) |
 | `deeplc_python` | `None` | interpreter for DeepLC sidecar |
 | `sidecar_script_dir` | `"scripts"` | directory holding worker scripts |
 
@@ -739,7 +739,7 @@ selection dominate.
 | `presence_min_matched` | 3 | tier-(b) min matched fragment count |
 | `presence_min_fragments` | 3 | min distinct fragments for acceptance |
 | `presence_min_coelution` | 2 | min simultaneously-present fragments over the run |
-| `min_frag_corr` | 0.2 | tier-(d) spectral-agreement gate (0 disables; must be in [0,1]) |
+| `gate_min_score` | 0.2 | tier-(d) spectral-agreement gate (0 disables; must be in [0,1]). Renamed from `min_frag_corr` |
 | `min_matched_fraction` | 0.0 | tier-(c) min fraction of predicted fragments observed |
 | `apex_top_fragments` | 0 | signature-fragment apex: sums the observed intensity of the top-K predicted fragments per scan; `0` falls back to a default of 3 (`extract.rs:1857-1861`), not all-matched |
 | `apex_rt_prior_s` | 0.0 | Gaussian RT prior sigma on apex (0 = off) |
@@ -764,12 +764,13 @@ selection dominate.
 | `alt_peak_min_area_frac` | 0.10 | min integrated area of a promoted alternate as a fraction of the rank-0 peak; only used when `promote_top_peaks > 1` |
 | `alt_peak_min_separation_s` | 5.0 | min apex-RT separation of a promoted alternate from the rank-0 apex; only used when `promote_top_peaks > 1` |
 | `emit_candidate_audit` | `false` | **default-off**; in `run` gates the separate `audit` stage that writes `candidate_audit.parquet` (`run.rs:428-429`); no stage writes `<psms>.audit.parquet`, although `audit` will read it if present (`audit.rs:52`), so the field's own doc comment overstates what extraction does; no-op for standalone `mumdia extract` (P0.3) |
-| `apex_evidence_rank` | `false` | **default-off** evidence-count apex |
+| `apex_evidence_rank` | `true` | evidence-count apex. On by default: the legacy signature-intensity score is 0.0 at every qualifying scan when none of the top-K predicted fragments is observed, which silently selects the lowest-RT qualifying scan |
 | `emit_gate_diagnostics` | `false` | **default-off** four gate-score columns |
-| `gate_mode` | `apex_pearson` | which spectral score `min_frag_corr` thresholds |
+| `gate_mode` | `apex_pearson` | which spectral score `gate_min_score` thresholds |
 | `gate_coelution_min` | 0.5 | second threshold for `gate_mode = combined` |
 
-The `min_frag_corr` default was relaxed from a historical 0.5 to 0.2
+The gate default was relaxed from a historical 0.5 to 0.2, briefly set to 0.6
+and measured back to 0.2 (docs/18)
 (config.rs:692-697). Every default-off knob is explicitly documented as
 requiring entrapment/target-decoy FDR validation before use.
 
@@ -778,7 +779,7 @@ requiring entrapment/target-decoy FDR validation before use.
 | Field | Default | Effect |
 |---|---|---|
 | `set` | `minimal` | feature set (minimal / rich / extended) |
-| `emit_pin` | `true` | write the Percolator-style `.pin` text file requested by `--out-pin`. No MuMDIA stage consumes it (`rescore` builds its own PIN), and at 1.5M rows by 387 features it is a ~5.4 GB text write, so set it false when nothing external needs it |
+| `emit_pin` | `false` | write the Percolator-style `.pin` text file requested by `--out-pin`. Off by default: no MuMDIA stage consumes it (`rescore` builds its own PIN) and at 1.5M rows by 387 features it is a ~5.4 GB text write, so set it true only when an external tool needs the file |
 | `coelution_corr_threshold` | 0.9 | co-elution correlation cutoff |
 | `prec_tol_ppm` | 20.0 | precursor tolerance for MS1 features |
 | `bound_features` | `true` | restrict trace features to the elution peak |
@@ -792,7 +793,7 @@ requiring entrapment/target-decoy FDR validation before use.
 
 | Field | Default | Effect |
 |---|---|---|
-| `group_by` | `precursor` | competition grouping key; `precursor` groups by stripped peptide (all charge and modification siblings collapse), `peptidoform_charge` is the real precursor-level key and is required for a PTM search |
+| `group_by` | `base_peptide` | competition grouping key; `precursor` groups by stripped peptide (all charge and modification siblings collapse), `peptidoform_charge` is the real precursor-level key and is required for a PTM search |
 | `apex_rt_tolerance_s` | 5.0 | RT bucket for `apex` grouping |
 | `mode` | `winner_take_all` | within-group resolution |
 | `margin` | 0.0 | score margin for `margin_gated` |
@@ -955,8 +956,8 @@ stale.
 - **Add a manifest field.** Extend `Manifest` or `ArtifactRecord`
   (`manifest.rs`); both are plain serde structs. Keep new maps as `BTreeMap` for
   deterministic key order.
-- **`plan.md` is untracked design history, not the contract.** It is excluded by
-  the root-Markdown ignore rule, so it is not the place to record current
-  behavior: where it disagrees with the code, the tests and this tracked `docs/`
+- **Local design notes are not the contract.** The root-Markdown ignore rule
+  keeps them out of the repository, so they are not the place to record current
+  behavior: where they disagree with the code, the tests and this tracked `docs/`
   guide are authoritative. Keep validated numbers consistent across `README`,
-  `COMPARISON.md`, and `CLAUDE.md`.
+  `CLAUDE.md`, and `docs/18_findings_and_decisions.md`.

@@ -1,4 +1,4 @@
-//! Standalone + determinism tests (PLAN.md Section 3.5, Section 7 determinism).
+//! Standalone + determinism tests (docs/14_build_test_deploy_gotchas.md).
 //! Craft a tiny library and MS2 set by hand, then drive the extract -> features
 //! -> compete -> rescore chain directly on files, asserting the planted target
 //! is recovered and the output is reproducible.
@@ -221,7 +221,12 @@ fn features_compete_rescore_run_on_crafted_input() {
     let win = craft_windows();
     let (psms, chrom) = run_extract(&prec, &frag, &ms2, &win, "frc");
 
-    let cfg = Config::default();
+    let mut cfg = Config::default();
+    // `features.emit_pin` is opt-in now: no MuMDIA stage reads the file (rescore builds
+    // its own PIN) and it is a ~5.4 GB text write per run on a real library. This test
+    // asserts the PIN's header format, so it asks for the artifact explicitly rather
+    // than depending on a default whose point is that it costs nothing when unused.
+    cfg.features.emit_pin = true;
     let feats = tmp("features.parquet");
     let pin = tmp("run.pin");
     stages::features::run(stages::features::FeaturesParams {
@@ -373,7 +378,10 @@ fn craft_feature_inputs(n_cand: u32) -> (String, String) {
 #[test]
 fn features_chunking_is_value_preserving() {
     let (psms, chrom) = craft_feature_inputs(23);
-    let cfg = Config::default();
+    // The PIN is opt-in since the parquet handoff became the default; this test compares
+    // both artifacts across chunk sizes, so ask for it.
+    let mut cfg = Config::default();
+    cfg.features.emit_pin = true;
     let run = |tag: &str, chunk_rows: usize| -> (String, String) {
         let feats = tmp(&format!("features_{tag}.parquet"));
         let pin = tmp(&format!("features_{tag}.pin"));

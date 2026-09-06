@@ -4,12 +4,97 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Weekly, for the advisory scan. An earlier commit message claimed a scheduled run
+  # and there was none: `cargo audit` only ran on a push or a PR, so an advisory
+  # published after a merge would not have surfaced until the next unrelated change.
+  # Monday 06:00 UTC.
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
 
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+# Nothing in this workflow needs a token beyond checkout. Without this block every
+# job inherits the repository default, which on many repositories is read/write on
+# all scopes.
+permissions:
+  contents: read
+
 jobs:
+  # The gate CLAUDE.md states, which CI did not previously enforce: formatting and
+  # clippy were a local responsibility, so `main` could carry a tree that failed
+  # them. One Linux runner is enough; neither check is platform-dependent.
+  lint:
+    name: fmt + clippy
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: rust/mumdia
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # rust-toolchain.toml (in rust/mumdia) pins the exact toolchain and requests
+      # the rustfmt and clippy components; rustup installs them on first use.
+      - name: Cache cargo
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/mumdia/target
+          key: ${{ runner.os }}-cargo-lint-${{ hashFiles('rust/mumdia/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-lint-
+
+      - name: Format
+        run: cargo fmt --check
+
+      # --all-targets so tests and benches are linted too: dead code reachable only
+      # from a test module still fails the build under -D warnings.
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      # Rustdoc, warnings as errors. Not previously run anywhere, and it was failing:
+      # four bracketed prose expressions (`[i0,i1,i2]`, `[0,1]`) were parsed as
+      # intra-doc links to items that do not exist, and three public doc comments
+      # linked to private items. Cheap to keep green, and the docs are this project's
+      # contract.
+      - name: Rustdoc
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --workspace --no-deps --locked
+
+  # Dependency advisories. SECURITY.md declares these in scope and invites pin-bump
+  # pull requests, so the project needs a way to see them: without this job, two
+  # CVSS 7.5 advisories sat on the mzML parser (quick-xml, reached through mzdata)
+  # through every green CI run. The schedule matters as much as the PR trigger,
+  # because an advisory published after a merge would otherwise never surface.
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: rust/mumdia
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Cache cargo-audit
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cargo/bin/cargo-audit
+          key: ${{ runner.os }}-cargo-audit-bin
+
+      - name: Install cargo-audit
+        run: command -v cargo-audit || cargo install cargo-audit --locked
+
+      # Vulnerabilities fail the build. Unmaintained-crate warnings do not: `paste`
+      # is a compile-time proc macro whose 1.0.15 is its final release, so there is
+      # nothing to bump to and a hard failure would only train people to ignore
+      # this job. Deny the class that has a fix.
+      - name: Audit
+        run: cargo audit --deny unsound --deny yanked
+
   build-test:
     name: build + test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -21,12 +106,10 @@ jobs:
       run:
         working-directory: rust/mumdia
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      # rust-toolchain.toml (in rust/mumdia) pins the exact toolchain; rustup
-      # installs it automatically on first cargo invocation.
       - name: Cache cargo
-        uses: actions/cache@v4
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -38,5 +121,398 @@ jobs:
       - name: Build (release)
         run: cargo build --release --locked
 
+      # --workspace is explicit: the release binary is only one member, and the
+      # config and IO contracts live in the other two.
       - name: Test
-        run: cargo test --locked
+        run: cargo test --workspace --locked
+
+  # The only end-to-end coverage there is. The Rust suite builds its inputs in
+  # process and starts at `extract`, so mzML parsing, the library build, the `run`
+  # orchestrator, the manifest, RT calibration on real anchors, and quant/report
+  # writing files were all untested. The fixture is generated, not committed: it is
+  # built from `test_data/fixture.fasta` and from the library the engine itself
+  # derives from it, so the planted peaks cannot disagree with the mass model.
+  smoke:
+    name: end-to-end smoke (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Install pyarrow
+        run: python -m pip install --quiet pyarrow
+
+      - name: Cache cargo
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/mumdia/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('rust/mumdia/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Build the binary
+        working-directory: rust/mumdia
+        run: cargo build --release --locked --bin mumdia
+
+      # docs/23 is generated from `--help`, so it can only be checked where a
+      # binary exists. Running it on both matrix legs is also a free
+      # cross-platform check on the help text: the generator normalises the
+      # binary name, so a Windows and a Linux build must produce identical output.
+      - name: CLI reference is current
+        shell: bash
+        run: python ci/gen_cli_reference.py --check
+
+      # bash on the Windows runner too, so one script covers both platforms, and
+      # invoked through `bash` rather than relying on the file mode: the execute bit
+      # is meaningless on the Windows runner, and a checkout that loses it would
+      # otherwise fail here with "Permission denied" rather than with a test result.
+      - name: Smoke test
+        shell: bash
+        run: bash ci/smoke.sh
+
+      - name: Upload output hashes
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: smoke-hashes-${{ matrix.os }}
+          path: smoke_output_hashes.txt
+          if-no-files-found: error
+
+  # The native pipeline is byte-reproducible across operating systems, not only
+  # across runs on one machine: measured 2026-08-27, `peptides.tsv` and
+  # `proteins.tsv` hash identically on Windows and Linux down to the quantity
+  # digits. Nothing enforced that, so a platform-dependent float reduction or a
+  # HashMap-order sum could reintroduce a difference silently.
+  #
+  # The two platforms are compared against each other rather than against a
+  # committed hash. A golden value would have to be updated by every legitimate
+  # change to scoring, which turns an improvement into a chore and the check into a
+  # rubber stamp.
+  # Real sidecar imports, in a real environment.
+  #
+  # Every torch/mokapot/DeepLC test in `tests/python` SKIPS on the runner, so the entire
+  # external-classifier contract that `rescore.strict` exists to protect executed nowhere
+  # on a pull request -- and that is where the worst defect in this project's history
+  # lived, when mokapot returned a targets-only table and the engine reported ~331,000
+  # "identified" peptides against a correct figure near 51,000. The DeepLC import-order
+  # failure (`OSError: [WinError 1114] ... c10.dll`) also only shows up against a real
+  # torch-backed DeepLC, and it has shipped once.
+  #
+  # Runs only when the sidecars, their environments or the image definition change, so
+  # the ~10 minute conda solve is not paid on every documentation PR.
+  sidecar-imports:
+    name: real sidecar imports (${{ matrix.env_name }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      # One job per environment, NOT two `setup-micromamba` steps in one job. The
+      # action registers a `micromamba-shell` wrapper and removes it in its post-job
+      # cleanup, so two invocations in one job leave two cleanups racing for one file
+      # and the second fails with
+      # `ENOENT: ... lstat '.../setup-micromamba/micromamba-shell'` -- after all the
+      # actual work has passed, which is the most misleading way for a job to fail.
+      matrix:
+        include:
+          # The import ORDER is the contract: `deeplc` must come before numpy/pyarrow,
+          # because DeepLC 4.x is torch-backed and the wrong order aborts torch DLL
+          # initialisation on Windows (`OSError: [WinError 1114] ... c10.dll`). Importing
+          # it first here is what proves the worker files still order it that way.
+          - env_name: deeplc
+            env_file: env/docker-deeplc.yml
+            import_check: >-
+              import deeplc, numpy, pandas, pyarrow, torch, psm_utils;
+              print('deeplc', deeplc.__version__, '| torch', torch.__version__)
+          - env_name: rescore
+            env_file: env/docker-rescore.yml
+            import_check: >-
+              import mokapot, ms2pip, numpy, pyarrow;
+              print('mokapot', mokapot.__version__)
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Do the sidecars, envs or Dockerfile change?
+        id: touched
+        env:
+          EVENT: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          # A scheduled or manually dispatched run ALWAYS resolves the environments.
+          # The point of the weekly run is the vulnerability sweep below, and the
+          # advisory database moves on its own; gating it on a diff meant it looked at
+          # `HEAD~1..HEAD` on main, which is almost never a sidecar change, so the
+          # sweep would have skipped nearly every week while appearing to be scheduled.
+          if [ "$EVENT" = "schedule" ] || [ "$EVENT" = "workflow_dispatch" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "$EVENT run: resolving the environments regardless of the diff"
+            exit 0
+          fi
+          base="${{ github.event.pull_request.base.sha || 'HEAD~1' }}"
+          if git diff --name-only "$base" HEAD \
+             | grep -Eq '^(scripts/|env/|tests/python/|Dockerfile$)'; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "no sidecar-relevant change; skipping"
+          fi
+
+      - uses: mamba-org/setup-micromamba@f457c30a868e4760d3a6fcea5f25dc655b8edf39 # v3.2.1
+        if: steps.touched.outputs.run == 'true'
+        with:
+          micromamba-version: latest
+          environment-file: ${{ matrix.env_file }}
+          environment-name: ${{ matrix.env_name }}
+          cache-environment: true
+
+      - name: Import the sidecar dependencies, in the order the workers use
+        if: steps.touched.outputs.run == 'true'
+        shell: micromamba-shell {0}
+        env:
+          IMPORT_CHECK: ${{ matrix.import_check }}
+        run: python -c "$IMPORT_CHECK"
+
+      # The Python dependency surface has no Dependabot coverage: the pins live in the
+      # pip sections of the conda specifications, which Dependabot cannot parse (see
+      # .github/dependabot.yml). This is what covers it instead, and it audits the
+      # RESOLVED environment, so transitive packages no specification names are
+      # included.
+      #
+      # Strict on the weekly schedule and on a manual dispatch; advisory on a pull
+      # request. A new advisory lands independently of any pull request, so a strict
+      # gate here fails changes that did not cause it, which is how teams end up
+      # deleting the scanner. The weekly run is where a new advisory has to be dealt
+      # with, and it fails loudly.
+      - name: Audit the resolved environment for known vulnerabilities
+        if: steps.touched.outputs.run == 'true'
+        shell: micromamba-shell {0}
+        continue-on-error: ${{ github.event_name == 'pull_request' }}
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet pip-audit
+          # NOT --strict, and the reason is specific rather than a shrug. --strict
+          # fails when a package cannot be resolved on PyPI at all, and `torch` is
+          # installed from the PyTorch index as `2.12.1+cpu`, a local version that by
+          # construction does not exist on PyPI. That is not a finding, it is how CPU
+          # torch is distributed, and failing on it would train everyone to ignore
+          # this job. Real advisories still fail the run.
+          #
+          # The gap this leaves is torch itself. Watch
+          # https://github.com/pytorch/pytorch/security/advisories directly; nothing
+          # here can audit a wheel PyPI has never seen.
+          pip-audit --progress-spinner off
+
+      # The exact package set the audit above ran against. The specifications pin the
+      # tools that matter (mokapot, ms2pip, deeplc, torch) and leave the scientific
+      # stack to the resolver, so this is the only record of what a given build
+      # actually installed. Retained per build rather than committed: a lockfile that
+      # nothing installs from drifts from the specification that does.
+      - name: Record the resolved package set
+        if: steps.touched.outputs.run == 'true'
+        shell: micromamba-shell {0}
+        run: |
+          set -euo pipefail
+          mkdir -p resolved
+          python -m pip freeze --all > "resolved/pip-freeze-${{ matrix.env_name }}.txt"
+          micromamba list -n "${{ matrix.env_name }}" \
+            > "resolved/conda-list-${{ matrix.env_name }}.txt" || true
+          wc -l resolved/*
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: steps.touched.outputs.run == 'true'
+        with:
+          name: resolved-env-${{ matrix.env_name }}
+          path: resolved/
+          retention-days: 90
+
+      - name: Worker contract tests, in a real environment
+        if: steps.touched.outputs.run == 'true'
+        shell: micromamba-shell {0}
+        # pytest is installed here rather than added to the runtime env spec: it is a
+        # test-only dependency and has no business in the published image's
+        # environment. The point of running the suite in this env is that the tests
+        # which skip on a bare runner actually EXECUTE -- measured 66 passed / 7 skipped
+        # in `rescore`, against 61 / 12 on the plain runner.
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet pytest
+          python -m pytest tests/python -q -rs
+
+  # The desktop application. A separate Cargo workspace, so nothing above builds it,
+  # and without this job it could break while every other check stayed green.
+  #
+  # It is not independent of the engine either: the settings schema and both
+  # requirement files are compiled into it with `include_str!`, so a change to
+  # `config.rs` that regenerates `configs/config-schema.json` reaches this crate.
+  # That coupling is what makes the job worth its minutes.
+  desktop:
+    name: desktop app
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      # Tauri links WebKitGTK, whose development headers the runner does not carry.
+      - name: Install the build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends             libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+
+      - name: Format
+        working-directory: desktop/src-tauri
+        run: cargo fmt --check
+
+      - name: Clippy
+        working-directory: desktop/src-tauri
+        run: cargo clippy --all-targets -- -D warnings
+
+      # Library tests only. The end-to-end tests skip themselves without an engine
+      # binary, which would make this job look like it covered more than it does; a
+      # real bundle is exercised by the release rehearsal instead.
+      - name: Unit tests
+        working-directory: desktop/src-tauri
+        run: cargo test --lib
+
+      # The frontend has no build step, so this is its whole check.
+      - name: Frontend agrees with the backend
+        run: python ci/check_desktop_ui.py
+
+  smoke-cross-platform:
+    name: cross-platform byte equality
+    runs-on: ubuntu-latest
+    needs: smoke
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: smoke-hashes-*
+          path: hashes
+
+      - name: Compare
+        run: |
+          set -euo pipefail
+          echo "--- collected ---"
+          for f in hashes/*/smoke_output_hashes.txt; do echo "== $f"; cat "$f"; done
+          n=$(ls -d hashes/*/ | wc -l)
+          test "$n" -ge 2 || { echo "need at least two platforms, got $n"; exit 1; }
+          first=""
+          for f in hashes/*/smoke_output_hashes.txt; do
+            if [ -z "$first" ]; then first="$f"; continue; fi
+            diff "$first" "$f" || {
+              echo "outputs differ between platforms; see the hashes above" >&2
+              exit 1
+            }
+          done
+          echo "all platforms produced byte-identical peptides.tsv and proteins.tsv"
+
+  sidecars:
+    name: python sidecars + configs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      # The Python workers are invoked over a positional-file contract and are not
+      # exercised by the Rust suite, so a syntax error in one of them surfaces only
+      # mid-run, hours in. This is the cheap floor, not sidecar validation: real
+      # DeepLC, mokapot, nn_torch and MBR behavior is still untested in CI.
+      - name: Compile sidecars
+        run: python -m compileall -q scripts ci
+
+      # A config is an artifact the engine must accept. `Config` is
+      # deny_unknown_fields, so the Rust test `shipped_configs_parse` is the real
+      # check; this one catches plain JSON syntax errors in any tracked config,
+      # including ones that test does not list.
+      - name: Parse tracked JSON
+        run: |
+          set -euo pipefail
+          for f in $(git ls-files '*.json'); do
+            python -c "import json,sys; json.load(open(sys.argv[1]))" "$f" \
+              || { echo "invalid JSON: $f"; exit 1; }
+            echo "ok $f"
+          done
+
+      # Both YAML checks below need it. It used to be installed inside "Parse env
+      # specs", so adding an earlier YAML step broke with ModuleNotFoundError: the
+      # dependency belongs to the job, not to whichever step reached it first.
+      - name: Install the YAML parser
+        run: python -m pip install --quiet pyyaml
+
+      # A workflow that GitHub refuses to parse fails when it is DISPATCHED, not when
+      # it is pushed: for release.yml that is the moment a release is attempted. And
+      # PyYAML accepts a duplicate mapping key silently, so a local parse check does
+      # not see the one error that actually reached the remote (an orphaned `exe: ""`
+      # left behind by deleting a matrix entry).
+      - name: Check the workflows GitHub has to parse
+        run: python ci/check_workflows.py
+
+      # The conda specs are the only installation instructions for the sidecars;
+      # a malformed one fails the Docker build rather than CI.
+      - name: Parse env specs
+        run: |
+          set -euo pipefail
+          for f in $(git ls-files 'env/*.yml' 'docker/*.yml'); do
+            python -c "import yaml,sys; yaml.safe_load(open(sys.argv[1]))" "$f" \
+              || { echo "invalid YAML: $f"; exit 1; }
+            echo "ok $f"
+          done
+
+      # The workers are invoked over a positional-file contract that nothing else
+      # checks. Tests needing torch, mokapot, deeplc or ms2pip skip here rather
+      # than fail, which is honest but means CI covers the contracts that need only
+      # numpy and pyarrow: the whole mbr_worker suite, including the regression for
+      # the q-column bug that left 34,280 of 34,664 transfers unquantified, the
+      # library-recipe encoding contracts, and the import-order checks.
+      - name: Sidecar contract tests
+        run: |
+          python -m pip install --quiet -r tests/python/requirements.txt
+          python -m pytest tests/python -q -rs
+
+      # docs/24 is generated from config.rs, so a new field or a changed default
+      # must land with its documentation or CI fails. A reference nobody
+      # regenerates is worse than none, because it reads as current.
+      # One parse of config.rs produces two artifacts: the reference document a
+      # person reads, and configs/config-schema.json, which the desktop settings
+      # editor renders its form from. They go stale together, so --check covers both.
+      - name: Config reference and schema are current
+        run: python ci/gen_config_reference.py --check
+
+      # The release binary is statically linked, so it carries 173 third-party crates
+      # whose Apache-2.0 and MIT terms require their notices to ship with it. Generated
+      # from Cargo.lock, so a dependency change that alters the licence inventory has to
+      # land with the regenerated notice file.
+      # Both generators below read the local cargo registry, and this job never
+      # compiles anything, so on a fresh runner the registry is empty. Without this
+      # step the licence generator recovered zero per-crate notices and `--check`
+      # reported the committed file as stale: a difference in the environment, not in
+      # the tree. `cargo fetch` populates `registry/cache` with the .crate tarballs,
+      # which the generator reads directly, so its output is the same here as on a
+      # machine that has built.
+      - name: Fetch the crate sources the generators read
+        run: cargo fetch --locked --manifest-path rust/mumdia/Cargo.toml
+
+      - name: Third-party licences are current
+        run: python ci/gen_third_party_licenses.py --check
+
+      # THIRD_PARTY_LICENSES.md is a notice document for a human reader. The SBOM
+      # answers the machine question: given a published binary, which exact versions
+      # are inside it and how are they connected. That is what a vulnerability
+      # scanner and an institutional software inventory consume, and prose cannot be
+      # queried. Generated from the same lockfile, so both move together.
+      - name: The SBOM is current
+        run: python ci/gen_sbom.py --check
+
+      # Source comments cite the document that specifies each behavior. Several of
+      # those documents are local-only design notes, so a public clone used to hold
+      # ~141 references to files it does not ship.
+      - name: Check documentation references
+        run: python ci/check_doc_refs.py

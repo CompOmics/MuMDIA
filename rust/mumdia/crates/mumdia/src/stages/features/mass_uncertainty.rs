@@ -67,11 +67,7 @@ fn frac_top_pred_observed(pred: &[f64], obs: &[f64], k: usize) -> f64 {
         return 0.0;
     }
     let mut idx: Vec<usize> = (0..n).collect();
-    idx.sort_by(|&a, &b| {
-        pred[b]
-            .partial_cmp(&pred[a])
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    idx.sort_by(|&a, &b| pred[b].total_cmp(&pred[a]));
     let take = k.min(n);
     if take == 0 {
         return 0.0;
@@ -94,10 +90,10 @@ pub fn values(e: &Evidence) -> Vec<f64> {
         (0.0, 0.0, 0.0, 0.0, 0.0)
     } else {
         let mut s = errs.clone();
-        s.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        s.sort_by(|a, b| a.total_cmp(b));
         let med = percentile(&s, 0.5);
         let mut a: Vec<f64> = errs.iter().map(|x| x.abs()).collect();
-        a.sort_by(|x, y| x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal));
+        a.sort_by(|x, y| x.total_cmp(y));
         let abs_med = percentile(&a, 0.5);
         let iqr = percentile(&s, 0.75) - percentile(&s, 0.25);
         let max_abs = a[a.len() - 1];

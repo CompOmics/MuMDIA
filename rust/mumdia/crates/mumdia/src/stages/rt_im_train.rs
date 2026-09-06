@@ -1,7 +1,8 @@
-//! Stage B `mumdia rt-im-train`: per-run RT calibration and windows (PLAN.md
-//! Stage B). Calibrates the run-independent predicted iRT to observed RT from
-//! confident seed PSMs, then sets a per-candidate RT window from the residuals.
-//! MVP is 3D, so IM columns are null. The sidecars are not re-run here.
+//! Stage B `mumdia rt-im-train`: per-run RT calibration and windows
+//! (docs/08_rt_im_train.md). Calibrates the run-independent predicted iRT to
+//! observed RT from confident seed PSMs, then sets a per-candidate RT window from
+//! the residuals. MVP is 3D, so IM columns are null. The sidecars are not re-run
+//! here.
 
 use std::collections::HashMap;
 use std::time::Instant;

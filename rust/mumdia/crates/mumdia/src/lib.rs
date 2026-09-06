@@ -1,6 +1,6 @@
 //! MuMDIA pipeline library: stage implementations and shared machinery.
 //! The `mumdia` binary is a thin CLI over these modules; exposing them as a lib
-//! lets integration tests drive stages directly (PLAN.md Section 3.5).
+//! lets integration tests drive stages directly (docs/01_overview_and_dataflow.md).
 
 pub mod calibrate;
 pub mod fdr;
@@ -9,6 +9,7 @@ pub mod matchers;
 pub mod memlog;
 pub mod peaks;
 pub mod predict;
+pub mod python;
 pub mod quant_lfq;
 pub mod rescoring;
 pub mod sidecar;

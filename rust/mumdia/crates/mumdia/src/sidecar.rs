@@ -1,4 +1,4 @@
-//! Sidecar clients over the file contract (PLAN.md Section 3.2): write an input
+//! Sidecar clients over the file contract (docs/13_sidecars.md): write an input
 //! Parquet, invoke the Python worker as a subprocess, read the output Parquet.
 //! The contract is the files and their schema, so a sidecar can be replaced by a
 //! native implementation without changing callers.
@@ -49,8 +49,15 @@ pub fn run_ms2pip(
     model: &str,
 ) -> Result<FragmentIntensityMap> {
     std::fs::create_dir_all(workdir).ok();
-    let inp = format!("{workdir}/ms2pip_in.parquet");
-    let outp = format!("{workdir}/ms2pip_out.parquet");
+    // Per-invocation names. Fixed ones made two concurrent runs clobber each other, and
+    // silently rather than loudly: the readback key is a row index into each process's own
+    // request, so two runs over tables of the SAME row count -- which is the most likely
+    // reason to run two at once -- swapped each other's results instead of erroring.
+    // `align_sidecar_scores` catches a coverage mismatch, not an equal-length swap. The
+    // PIN/NN path was already PID-qualified for exactly this reason; these three were not.
+    let pid = std::process::id();
+    let inp = format!("{workdir}/ms2pip_in_{pid}.parquet");
+    let outp = format!("{workdir}/ms2pip_out_{pid}.parquet");
     write_table(
         &inp,
         vec![
@@ -77,18 +84,12 @@ pub fn run_ms2pip(
     Ok(map)
 }
 
-/// Installed version of a Python distribution as the interpreter reports it, read from
-/// package metadata so the probe does not import the package (importing DeepLC loads
-/// torch, which takes seconds and on Windows has an import-order hazard of its own).
-/// None when the interpreter cannot be run or the distribution is not installed.
+/// Installed version of a Python distribution as the interpreter reports it
+/// (`crate::python::module_version`, read from package metadata so the probe does not
+/// import the package). None when the interpreter cannot be run or the distribution is
+/// not installed.
 pub fn module_version(python: &str, module: &str) -> Option<String> {
-    let code = format!("import importlib.metadata as m; print(m.version('{module}'))");
-    let out = Command::new(python).args(["-c", &code]).output().ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let v = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    (!v.is_empty()).then_some(v)
+    crate::python::module_version(std::path::Path::new(python), module)
 }
 
 /// Refuse a DeepLC interpreter older than `MIN_DEEPLC_VERSION`. The default
@@ -122,8 +123,10 @@ pub fn run_deeplc(
 ) -> Result<HashMap<u32, f32>> {
     require_deeplc_version(python)?;
     std::fs::create_dir_all(workdir).ok();
-    let inp = format!("{workdir}/deeplc_in.parquet");
-    let outp = format!("{workdir}/deeplc_out.parquet");
+    // Per-invocation names; see the note in the MS2PIP helper above.
+    let pid = std::process::id();
+    let inp = format!("{workdir}/deeplc_in_{pid}.parquet");
+    let outp = format!("{workdir}/deeplc_out_{pid}.parquet");
     write_table(
         &inp,
         vec![
@@ -155,6 +158,7 @@ pub fn run_deeplc_finetune(
     q_train: f64,
     batch: usize,
     window_holdout_frac: f64,
+    rng_seed: u64,
 ) -> Result<()> {
     require_deeplc_version(python)?;
     info!(
@@ -166,6 +170,7 @@ pub fn run_deeplc_finetune(
         q_train,
         batch,
         window_holdout_frac,
+        rng_seed,
         "sidecar: running DeepLC multitask fine-tune"
     );
     let ep = epochs.to_string();
@@ -173,6 +178,13 @@ pub fn run_deeplc_finetune(
     let qt = q_train.to_string();
     let ba = batch.to_string();
     let hf = window_holdout_frac.to_string();
+    // Seed the fine-tune. Unseeded, the draw varies enough to change results: the
+    // held-out RT window p95 moved 150-211 s across two draws of one benchmark arm,
+    // worth about 2 percent of peptides, which made single-run comparisons of
+    // window sizing or library variants unreadable. Kernel-level nondeterminism
+    // remains, so this narrows the variance rather than removing it
+    // (docs/14_build_test_deploy_gotchas.md).
+    let rs = rng_seed.to_string();
     run_worker(
         python,
         script,
@@ -190,6 +202,8 @@ pub fn run_deeplc_finetune(
             &ba,
             "--window-holdout-frac",
             &hf,
+            "--seed",
+            &rs,
         ],
         true,
     )
@@ -302,11 +316,35 @@ fn run_worker(python: &str, script: &str, args: &[&str], utf8: bool) -> Result<(
     if utf8 {
         cmd.env("PYTHONUTF8", "1").env("PYTHONIOENCODING", "utf-8");
     }
+    // Output is INHERITED, not captured, on purpose: the NN rescorer prints
+    // per-iteration progress across hours and a user watching a run needs to see
+    // it live. The cost is that on failure the worker's traceback has already
+    // scrolled past, so the error has to say enough to act on: which interpreter,
+    // which script, and with what arguments. It previously said only
+    // "exited with status", which named neither the environment nor the call.
     let status = cmd
         .status()
         .with_context(|| format!("spawning {python} {script}"))?;
     if !status.success() {
-        bail!("worker {script} exited with {status}");
+        let argv = args
+            .iter()
+            .map(|a| {
+                if a.contains(' ') {
+                    format!("\"{a}\"")
+                } else {
+                    (*a).to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        bail!(
+            "sidecar worker failed: {script} exited with {status}.\n\
+             interpreter: {python}\n\
+             command: {python} {script} {argv}\n\
+             The worker's own output, including any Python traceback, is above this \
+             error. Reproduce it by running that command directly. \
+             `mumdia doctor --config <config>` checks the environment."
+        );
     }
     Ok(())
 }

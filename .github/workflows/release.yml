@@ -4,19 +4,137 @@ name: Release
 #   git tag v0.1.0 && git push origin v0.1.0
 # Then builds a release binary per platform and attaches archives to the
 # GitHub Release for that tag.
+#
+# The archive is a working installation, not just an executable: MuMDIA's ML
+# predictors and rescorers are Python sidecars that the engine launches by path,
+# so a binary on its own cannot fine-tune retention times or rescore with
+# mokapot or the neural network. scripts/, env/ and the example configs ship
+# alongside it, and the checksum file lets a user verify what they downloaded.
 on:
   push:
     tags: ["v*"]
+  # Rehearsal. This workflow had never executed: there is no `v*` tag in the
+  # repository, so the first `v0.1.0` push would have been the first run of every
+  # step in it -- including the packaging, which now stages THIRD_PARTY_LICENSES.md
+  # and prunes two working documents, and the checksum step. A release path that has
+  # never run is not a release path.
+  #
+  # A dispatch run builds, packages, verifies and uploads the archives as a workflow
+  # ARTIFACT, and skips creating a GitHub Release: the upload step below is gated on
+  # a tag ref. So the whole path is exercised without publishing anything.
+  workflow_dispatch:
+    inputs:
+      version_name:
+        description: >-
+          Name to stamp into the archive filenames for this rehearsal
+          (a real tag run uses the tag name).
+        required: false
+        default: dryrun
 
+# Least privilege per job, not one write token for the whole workflow: only the
+# job that publishes needs `contents: write`, and the gate below needs to READ
+# workflow runs, which `contents` does not grant at all.
 permissions:
-  contents: write
+  contents: read
 
 jobs:
+  # A `v*` tag could publish any commit, from any branch, with no CI behind it. The
+  # workflow's own checks were `--version`, `--help` and `doctor`, and a tag push does
+  # not trigger `ci.yml` at all, which only covers pull requests and pushes to `main`.
+  #
+  # This job is the gate. Every build job depends on it, so a tag that fails any check
+  # below publishes nothing. Skipped for a rehearsal, which has no tag to validate.
+  validate-tag:
+    name: validate the tag
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Required for the `ci.yml` run lookup below. Without it the API call
+      # returns 403 and the gate cannot tell a green commit from an untested one.
+      actions: read
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Full history, so reachability from `main` can actually be tested.
+          fetch-depth: 0
+
+      - name: The tag must match the workspace version
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          tag="${REF_NAME#v}"
+          crate=$(grep -m1 '^version' rust/mumdia/Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
+          echo "tag=$tag workspace=$crate"
+          if [ "$tag" != "$crate" ]; then
+            echo "::error::tag v$tag does not match the workspace version $crate."
+            echo "Bump rust/mumdia/Cargo.toml or retag; a release whose archive reports a"
+            echo "different version than its tag is not traceable."
+            exit 1
+          fi
+
+      - name: The tagged commit must be reachable from main
+        run: |
+          set -euo pipefail
+          git fetch -q origin main
+          if ! git merge-base --is-ancestor HEAD origin/main; then
+            echo "::error::the tagged commit is not an ancestor of origin/main."
+            echo "Releases come from main, which is protected and requires CI; tagging a"
+            echo "side branch bypasses both."
+            exit 1
+          fi
+          echo "reachable from main: yes"
+
+      - name: CI must have passed for this exact commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          sha=$(git rev-parse HEAD)
+          # The CI workflow's conclusion for this SHA, not for the branch tip. A tag
+          # push does not run ci.yml, so without this the only evidence a release
+          # rests on is that someone believed it was fine.
+          runs=$(gh api "repos/${{ github.repository }}/actions/workflows/ci.yml/runs?head_sha=$sha&per_page=20" \
+                 --jq '[.workflow_runs[] | select(.conclusion != null) | .conclusion] | join(",")')
+          echo "ci.yml conclusions for $sha: ${runs:-<none>}"
+          case ",$runs," in
+            *",success,"*) echo "CI passed for this commit" ;;
+            *) echo "::error::no successful ci.yml run for $sha."
+               echo "Push the commit to a PR, let CI pass, merge to main, then tag."
+               exit 1 ;;
+          esac
   release:
     name: ${{ matrix.target }}
+    needs: [validate-tag]
+    permissions:
+      # Creating the release and attaching the archives.
+      contents: write
+    # `always()` because `validate-tag` is SKIPPED on a rehearsal (it has no tag to
+    # validate) and a skipped dependency would otherwise skip this job too.
+    #
+    # The condition allows exactly two outcomes, rather than excluding 'failure':
+    # a cancelled gate is not a failed gate, and treating it as permission to build
+    # would let a tag publish with the checks half-run.
+    if: always() && contains(fromJSON('["success", "skipped"]'), needs.validate-tag.result)
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
+      # Three targets, each built on a runner that executes its own binary, so every
+      # archive is verified before it is published.
+      #
+      # `x86_64-apple-darwin` was here and is deliberately gone. It needed the
+      # `macos-13` label, which no longer receives a runner: measured 2026-08-28, that
+      # job sat queued for over two hours in two separate rehearsals while every other
+      # target finished in about three minutes, with no runner ever assigned. A real
+      # tag would have hung until GitHub's 24-hour QUEUE timeout and then failed the
+      # release; one of the cancelled rehearsal jobs was observed reporting exactly
+      # `24h0m0s`. Note that is the queue limit, not the six-hour limit on a job that
+      # is actually running: nothing ever started. The
+      # alternative was cross-compiling it on the arm64 runner, which produces an
+      # archive that cannot be executed there and so cannot be verified; a published
+      # binary nobody has run is what this workflow now exists to prevent. Intel Mac
+      # users build from source or use the container image.
       matrix:
         include:
           - os: ubuntu-latest
@@ -32,7 +150,7 @@ jobs:
       run:
         working-directory: rust/mumdia
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install musl tools (linux)
         if: matrix.target == 'x86_64-unknown-linux-musl'
@@ -44,25 +162,326 @@ jobs:
       - name: Build
         run: cargo build --release --locked --bin mumdia --target ${{ matrix.target }}
 
-      - name: Package
+      # A binary that cannot run the pipeline is not a release. Fail here rather
+      # than shipping an archive whose --version or --help is broken.
+      - name: Smoke-test the binary
         shell: bash
         run: |
-          name="mumdia-${{ github.ref_name }}-${{ matrix.target }}"
+          set -euo pipefail
+          bin="target/${{ matrix.target }}/release/mumdia${{ matrix.exe }}"
+          "$bin" --version
+          "$bin" --help >/dev/null
+          "$bin" doctor >/dev/null
+
+      - name: Package
+        shell: bash
+        # `github.ref_name` reaches the script through the environment, not through
+        # `${{ }}` interpolation into a `run:` line. Git ref names may contain `;`,
+        # backticks, `$`, `&` and `|`, so a crafted tag was a shell injection. Pushing a
+        # tag needs write access, so this is defence in depth rather than an open door,
+        # but the fix costs nothing.
+        env:
+          # On a tag run this is the tag; on a rehearsal it is the supplied name, so
+          # the archive is named `mumdia-dryrun-<target>` and cannot be mistaken for a
+          # real release artifact.
+          REF_NAME: >-
+            ${{ github.event_name == 'workflow_dispatch'
+                && (inputs.version_name || 'dryrun')
+                || github.ref_name }}
+        run: |
+          set -euo pipefail
+          name="mumdia-$REF_NAME-${{ matrix.target }}"
           stage="dist/$name"
+          root=../..
           mkdir -p "$stage"
           cp "target/${{ matrix.target }}/release/mumdia${{ matrix.exe }}" "$stage/"
-          cp ../../README.md ../../LICENSE "$stage/"
+          # Documentation and licence.
+          # THIRD_PARTY_LICENSES.md is not optional: the binary is statically
+          # linked, so it contains 173 third-party crates whose Apache-2.0 and MIT
+          # terms require their notices to travel with it.
+          # sbom.cdx.json travels with the binary for the same reason, one reader
+          # further along: a scanner or a software inventory needs the exact
+          # component versions inside the artifact it has, not inside the
+          # repository it does not have.
+          cp "$root/README.md" "$root/LICENSE" "$root/CHANGELOG.md" \
+             "$root/THIRD_PARTY_LICENSES.md" "$root/sbom.cdx.json" "$stage/"
+          cp -r "$root/docs" "$stage/docs"
+          # The release plan and the pre-release audit are working documents about
+          # getting to this release: they state which gates were failing, what was
+          # blocked, and unpublished benchmark numbers. Useful in the repository,
+          # odd inside the archive of the release they plan.
+          rm -f "$stage/docs/22_release_plan.md" \
+                "$stage/docs/25_release_readiness_review.md"
+          # The Python sidecars the engine invokes, and the environment specs that
+          # make them installable. Without these the binary is native-only.
+          cp -r "$root/scripts" "$stage/scripts"
+          cp -r "$root/env" "$stage/env"
+          # Example configurations, if the tag carries them.
+          if [ -d "$root/configs" ]; then cp -r "$root/configs" "$stage/configs"; fi
+          # The verification procedure the packaged docs/19 tells users to run. It was
+          # documented and not shipped: `ci/` and `test_data/` were excluded, so the
+          # archive's own getting-started guide could not be followed from the archive.
+          # Only the three scripts the smoke test needs; the `gen_*` generators and the
+          # documentation-reference checker are development tooling that needs the
+          # repository and would be meaningless here.
+          mkdir -p "$stage/ci" "$stage/test_data"
+          cp "$root/ci/smoke.sh" "$root/ci/check_smoke.py" \
+             "$root/ci/make_fixture_mzml.py" "$stage/ci/"
+          cp "$root/test_data/fixture.fasta" "$stage/test_data/"
           cd dist
           if [ -n "${{ matrix.exe }}" ]; then
             7z a "$name.zip" "$name" >/dev/null
+            archive="$name.zip"
           else
             tar czf "$name.tar.gz" "$name"
+            archive="$name.tar.gz"
           fi
+          # Portable across the three runners: coreutils on Linux and Git Bash,
+          # BSD shasum on macOS.
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$archive" > "$archive.sha256"
+          else
+            shasum -a 256 "$archive" > "$archive.sha256"
+          fi
+          echo "--- archive contents ---"
+          ls -R "$name" | head -40
+          echo "--- checksum ---"
+          cat "$archive.sha256"
+
+      # Only a real tag creates a GitHub Release. Without this gate a rehearsal would
+      # try to publish a release for a branch ref, which is both wrong and the kind of
+      # thing that is only discovered by doing it.
+      # Test the ARTIFACT, not the tree it came from. The definition of done in
+      # docs/22 asks for exactly this, and it is the only step that can catch a
+      # packaging mistake: a missing script, a config that did not travel, a binary
+      # that runs from a cargo target directory but not from a clean unpack.
+      #
+      # Every matrix target runs on a host that executes its own binary natively, so
+      # this covers all three -- including macOS, which the repository smoke test does
+      # not reach.
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Verify the unpacked archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet pyarrow
+          unpacked="$RUNNER_TEMP/unpacked"
+          rm -rf "$unpacked"; mkdir -p "$unpacked"
+          cd dist
+          # Not `ls *.tar.gz *.zip 2>/dev/null | head -1`: exactly one of those globs
+          # matches, so `ls` exits 2 on the other, and under `pipefail` plus `set -e`
+          # with stderr discarded the step died with no message at all. That is the
+          # failure mode docs/14 already records for `cmd && echo` inside a command
+          # substitution, and it cost one rehearsal.
+          shopt -s nullglob
+          archives=(*.tar.gz *.zip)
+          shopt -u nullglob
+          if [ ${#archives[@]} -eq 0 ]; then
+            echo "::error::the Package step produced no archive in dist/"
+            ls -la
+            exit 1
+          fi
+          archive="${archives[0]}"
+          echo "verifying $archive"
+          case "$archive" in
+            *.tar.gz) tar xzf "$archive" -C "$unpacked" ;;
+            # Python rather than 7z or unzip: the interpreter is already set up above,
+            # and it behaves identically on every runner image. Losing the executable
+            # bit does not matter, because only the Windows archive is a zip.
+            *.zip)    python -c "import sys, zipfile; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])" \
+                        "$archive" "$unpacked" ;;
+            *) echo "::error::unrecognised archive $archive"; exit 1 ;;
+          esac
+          root=$(find "$unpacked" -mindepth 1 -maxdepth 1 -type d | head -1)
+          if [ -z "$root" ]; then
+            echo "::error::the archive did not unpack to a single top-level directory"
+            find "$unpacked" -maxdepth 2
+            exit 1
+          fi
+          cd "$root"
+          echo "--- the archive must be self-sufficient from here ---"
+          ls
+          # MUMDIA_BIN is set explicitly for determinism, but `ci/smoke.sh` also
+          # discovers `./mumdia` in an unpacked archive on its own, which is what a
+          # user following docs/19 relies on.
+          # No work-directory argument: the default (`$TMPDIR/mumdia_smoke`) is what
+          # the ci.yml smoke job already uses on all three platforms. Passing
+          # `$RUNNER_TEMP` would hand a Windows path with backslashes to a bash
+          # script, which is a needless difference between the two invocations.
+          MUMDIA_BIN="$PWD/mumdia${{ matrix.exe }}" bash ci/smoke.sh
 
       - name: Upload to release
-        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/v')
+        # Pinned to a commit, not the mutable `v2` tag. This is the only
+        # third-party action in the tree (the other nine are actions/* and
+        # docker/*), it receives the release token and the built archives, and a
+        # moved tag would run new code with repository write access on every tag
+        # push. Dependabot covers `github-actions`, so the SHA keeps moving on a
+        # reviewed PR instead of silently.
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           files: |
             rust/mumdia/dist/*.tar.gz
             rust/mumdia/dist/*.zip
+            rust/mumdia/dist/*.sha256
           generate_release_notes: true
+
+      # The rehearsal's output, so the archives can actually be inspected rather than
+      # merely reported as built.
+      - name: Upload archives as a workflow artifact (rehearsal only)
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-dryrun-${{ matrix.target }}
+          path: |
+            rust/mumdia/dist/*.tar.gz
+            rust/mumdia/dist/*.zip
+            rust/mumdia/dist/*.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  # The desktop application, built for the two platforms it targets.
+  #
+  # A separate job rather than steps inside `release`: it needs Node-free but
+  # webview-ful build dependencies on Linux, its own cargo workspace, and it must not
+  # slow down or fail the engine archives, which are the primary artifact. macOS is
+  # deliberately absent -- an unsigned bundle is blocked outright by Gatekeeper, so
+  # shipping one would be worse than shipping none.
+  desktop:
+    name: desktop ${{ matrix.target }}
+    needs: [validate-tag]
+    if: always() && contains(fromJSON('["success", "skipped"]'), needs.validate-tag.result)
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # GNU, not musl, and measured rather than assumed. The engine's own
+          # release archives are musl and stay musl; inside an AppImage they do not
+          # survive. `linuxdeploy` runs `patchelf` over every ELF binary it bundles,
+          # and a static-pie musl binary comes out with a `RUNPATH [$ORIGIN]` entry
+          # injected into it and segfaults immediately. Verified by extracting a
+          # built AppImage and running the engine inside it; `uv`, dynamically
+          # linked, survived the same treatment untouched.
+          #
+          # Nothing is lost. musl would buy portability only if the bundle had no
+          # other glibc floor, and the Tauri host links WebKitGTK, so the
+          # application sets that floor whatever the engine is built against.
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            engine_exe: ""
+            bundle_glob: "desktop/target/release/bundle/appimage/*.AppImage"
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            engine_exe: ".exe"
+            bundle_glob: "desktop/target/release/bundle/msi/*.msi"
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      # Tauri needs the platform webview headers at build time on Linux. The
+      # produced AppImage carries what it needs at runtime.
+      - name: Install the Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf \
+            libssl-dev
+
+      # Inside `rust/mumdia`, not at the repository root. That directory pins its
+      # toolchain with `rust-toolchain.toml`, and `rustup target add` adds the target
+      # to whichever toolchain is active where it runs. From the root it added musl
+      # to the DEFAULT toolchain while the build used the pinned one, which then
+      # failed with "can't find crate for `core`" and advice to run the command that
+      # had just succeeded.
+      - name: Add the engine target
+        working-directory: rust/mumdia
+        run: rustup target add ${{ matrix.target }}
+
+      # The application ships the engine it was built alongside. Building both from
+      # one checkout is what makes a version mismatch impossible.
+      - name: Build the engine
+        working-directory: rust/mumdia
+        run: cargo build --release --locked --target ${{ matrix.target }} --bin mumdia
+
+      # Everything the application expects to find beside itself. `binaries/` is
+      # where `engine.rs` and `components.rs` look, and `uv` is what installs the
+      # analysis components without conda.
+      - name: Stage the bundled binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p desktop/src-tauri/binaries
+          cp "rust/mumdia/target/${{ matrix.target }}/release/mumdia${{ matrix.engine_exe }}" \
+             desktop/src-tauri/binaries/
+          # uv publishes static binaries per platform; take the pinned release rather
+          # than whatever `latest` happens to be on the day of a build.
+          UV_VERSION=0.10.6
+          case "${{ runner.os }}" in
+            Linux)   UV_ASSET="uv-x86_64-unknown-linux-gnu.tar.gz" ;;
+            Windows) UV_ASSET="uv-x86_64-pc-windows-msvc.zip" ;;
+          esac
+          curl -fsSL -o uv-asset \
+            "https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/${UV_ASSET}"
+          case "$UV_ASSET" in
+            *.tar.gz) tar xzf uv-asset --strip-components=1 -C desktop/src-tauri/binaries ;;
+            *.zip)    python -c "import sys,zipfile;zipfile.ZipFile('uv-asset').extractall('desktop/src-tauri/binaries')" ;;
+          esac
+          ls -la desktop/src-tauri/binaries
+
+      # The bundler that produces the .msi and .AppImage. Installed rather than
+      # vendored, and pinned, so a bundler change arrives as a reviewed version bump.
+      - name: Install the Tauri bundler
+        run: cargo install tauri-cli --version "^2" --locked
+
+      - name: Build the installer
+        working-directory: desktop
+        run: cargo tauri build
+
+      - name: Collect the installers
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p desktop/dist
+          shopt -s nullglob
+          found=(${{ matrix.bundle_glob }})
+          shopt -u nullglob
+          if [ ${#found[@]} -eq 0 ]; then
+            echo "::error::the bundler produced no installer"
+            find desktop/target/release/bundle -maxdepth 2 -type f || true
+            exit 1
+          fi
+          for f in "${found[@]}"; do
+            cp "$f" desktop/dist/
+          done
+          cd desktop/dist
+          for f in *; do
+            if command -v sha256sum > /dev/null 2>&1; then
+              sha256sum "$f" > "$f.sha256"
+            else
+              shasum -a 256 "$f" > "$f.sha256"
+            fi
+          done
+          ls -la
+
+      - name: Upload to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@da05d552573ad5aba039eaac05058a918a7bf631 # v2.2.2
+        with:
+          files: |
+            desktop/dist/*
+          generate_release_notes: true
+
+      - name: Upload installers as a workflow artifact (rehearsal only)
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: desktop-dryrun-${{ matrix.target }}
+          path: desktop/dist/*
+          if-no-files-found: error
+          retention-days: 7

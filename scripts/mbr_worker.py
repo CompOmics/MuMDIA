@@ -27,6 +27,13 @@ import numpy as np
 import pyarrow.parquet as pq
 import pyarrow as pa
 
+# Both outputs are read back by the engine, so they go through the shared writer
+# rather than a bare `pq.write_table`. Under pandas 3 / pyarrow 25 the string columns
+# come out `large_string` and the engine rejects the file with
+# `column 'peptidoform' is not utf8` -- the exact failure `_lib_io` exists to prevent,
+# and which was fixed in the four library helpers while this worker was missed.
+from _lib_io import write_engine_parquet, write_engine_table
+
 
 def binned_map(x, y, nb=80):
     """Monotone binned-median calibration x -> y."""
@@ -263,31 +270,36 @@ def main():
         "rt_delta": pa.array(target_delta[accept], pa.float64()),
         "transfer_q": pa.array(q[accept], pa.float64()),
     })
-    pq.write_table(out, a.out)
+    write_engine_table(out, a.out)
     print(f"wrote {a.out} ({out.num_rows} accepted transfers)")
 
-    # M5: augmented scored table. Lower the accepted transfers' PSM q_value to their
+    # M5: augmented scored table. Lower the accepted transfers' PSM q-values to their
     # transfer_q on the matching (candidate_id, source) row and flag them, so a
-    # downstream quant/report with quant.q_filter=psm_q includes the transfers.
+    # downstream quant/report includes the transfers. All PSM-level q columns that
+    # quant.q_filter can select are lowered (q_value, run_psm_q, experiment_psm_q);
+    # lowering only q_value left 34,280 of 34,664 transfers unquantified on the HYE
+    # pooled run because quant gated on run_psm_q (2026-08-26).
     if a.out_scored:
         full = pq.read_table(a.scored).to_pandas()
         acc = {(int(c), int(s)): float(qq) for c, s, qq in
                zip(cid[accept], src[accept], q[accept])}
         key = list(zip(full.candidate_id.astype(int), full.source.astype(int)))
-        newq = full.q_value.to_numpy().copy()
         is_tr = np.zeros(len(full), dtype=bool)
+        tq = np.full(len(full), np.inf)
         for i, k in enumerate(key):
             if k in acc:
-                newq[i] = min(newq[i], acc[k])
+                tq[i] = acc[k]
                 is_tr[i] = True
-        full["q_value"] = newq
+        for col in ("q_value", "run_psm_q", "experiment_psm_q"):
+            if col in full.columns:
+                full[col] = np.minimum(full[col].to_numpy(dtype=float), tq)
         full["is_transferred"] = is_tr
-        pq.write_table(pa.Table.from_pandas(full, preserve_index=False), a.out_scored)
+        write_engine_parquet(full, a.out_scored)
         print(f"wrote {a.out_scored} (augmented scored; {int(is_tr.sum())} rows flagged transferred)")
 
 
 def pa_write_empty(path):
-    pq.write_table(pa.table({"candidate_id": pa.array([], pa.uint32())}), path)
+    write_engine_table(pa.table({"candidate_id": pa.array([], pa.uint32())}), path)
 
 
 if __name__ == "__main__":
