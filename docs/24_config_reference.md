@@ -696,7 +696,6 @@ listed with the file it is in.
 | `MUMDIA_LR_C` | sidecar | `"1.0"` | `scripts/mokapot_worker.py:48` |
 | `MUMDIA_LR_MAX_ITER` | sidecar | `"1000"` | `scripts/mokapot_worker.py:49` |
 | `MUMDIA_MOKAPOT_WORKERS` | sidecar | `"3"` | `scripts/mokapot_worker.py:120` |
-| `MUMDIA_MSCONVERT` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/raw.rs:193` |
 | `MUMDIA_NN_ALPHA` | sidecar | `"1e-4"` | `scripts/mokapot_worker.py:90` |
 | `MUMDIA_NN_BATCH` | sidecar | `4096` | `scripts/nn_rescore_worker.py:280` |
 | `MUMDIA_NN_CHUNK` | sidecar | `250000` | `scripts/nn_rescore_worker.py:284` |
@@ -735,16 +734,14 @@ listed with the file it is in.
 | `MUMDIA_PYTHON_MS2PIP` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/python.rs:177` |
 | `MUMDIA_PYTHON_RESCORE` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/python.rs:177` |
 | `MUMDIA_RESCORE_MODEL` | both | `"nn"` | `rust/mumdia/crates/mumdia/src/stages/rescore.rs:320`, `scripts/mokapot_worker.py:181`, `scripts/mokapot_worker.py:37` |
-| `MUMDIA_THERMO_PARSER` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/raw.rs:171` |
 | `MUMDIA_XGB_DEPTH` | sidecar | `"6"` | `scripts/mokapot_worker.py:63` |
 | `MUMDIA_XGB_JOBS` | sidecar | `"0"` | `scripts/mokapot_worker.py:68` |
 | `MUMDIA_XGB_LR` | sidecar | `"0.1"` | `scripts/mokapot_worker.py:64` |
 | `MUMDIA_XGB_TREES` | sidecar | `"200"` | `scripts/mokapot_worker.py:62` |
 | `OMP_NUM_THREADS` | both | `16` | `rust/mumdia/crates/mumdia/src/main.rs:93`, `scripts/nn_rescore_worker.py:316`, `scripts/nn_rescore_worker.py:317` |
-| `PATH` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/raw.rs:293` |
 | `VIRTUAL_ENV` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/python.rs:187` |
 
-54 variables are read: 13 engine-side, 44 sidecar-side, 3 on both sides.
+51 variables are read: 10 engine-side, 44 sidecar-side, 3 on both sides.
 
 ### Variables the code sets
 
@@ -787,15 +784,13 @@ Every field whose struct has an `impl Default` resolved from the source.
 - `peptidoforms.fixed_mods[].name` (`String`)
 - `peptidoforms.fixed_mods[].residue` (`char`)
 
-4 environment read(s) whose name is not a literal:
+2 environment read(s) whose name is not a literal:
 
-- `rust/mumdia/crates/mumdia/src/raw.rs:201: env read of `"ProgramFiles"``
-- `rust/mumdia/crates/mumdia/src/raw.rs:202: env read of `"ProgramFiles(x86)"``
 - `rust/mumdia/crates/mumdia/src/stages/extract.rs:2685: env read via closure of `&mut flushed``
 - `rust/mumdia/crates/mumdia/src/stages/extract.rs:2703: env read via closure of `&mut cand_hits``
 
 ## Coverage
 
-17 structs and 178 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 24 enumerations, 1 named profile(s), 54 environment variables read and 19 set.
+17 structs and 178 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 24 enumerations, 1 named profile(s), 51 environment variables read and 19 set.
 
 20 field(s) carry a gating marker in their doc comment. 47 field(s) carry no doc comment at all, so their description is empty above. 0 default(s) could not be resolved and 2 have none by design.
