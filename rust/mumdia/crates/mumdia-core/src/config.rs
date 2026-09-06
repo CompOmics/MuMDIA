@@ -270,6 +270,68 @@ impl Default for DecoyConfig {
     }
 }
 
+/// Vendor-format conversion, read by every subcommand that takes a spectra path
+/// (`raw.rs`; docs/04_convert.md, "Vendor formats").
+///
+/// The engine itself reads mzML only, deliberately: `mzdata` is pinned to its
+/// pure-Rust `mzml` + `miniz_oxide` features so the build needs no C or .NET
+/// toolchain, and its vendor readers would reintroduce both. A vendor file is
+/// therefore converted to mzML first by an external converter run as a child
+/// process, in the same way the Python sidecars are: ThermoRawFileParser for Thermo
+/// `.raw`, ProteoWizard `msconvert` for everything else and as the Thermo fallback.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ConvertConfig {
+    /// Path to the ThermoRawFileParser executable, or `"auto"` to search.
+    ///
+    /// `"auto"` looks at `MUMDIA_THERMO_PARSER`, then beside the engine binary,
+    /// then on `PATH`. Empty means the same as `"auto"`; a real path is used
+    /// verbatim and its absence is an error rather than a silent fallback, because
+    /// a fallback would convert with a different program than the one asked for and
+    /// vendor conversion is not reproducible across converters.
+    pub thermo_raw_parser: String,
+    /// Path to ProteoWizard `msconvert`, or `"auto"` to search.
+    ///
+    /// Used for every vendor format except Thermo, which prefers
+    /// ThermoRawFileParser: Bruker `.d`, SCIEX `.wiff`, Agilent `.d` and Waters
+    /// `.raw`. It is also the Thermo fallback when no ThermoRawFileParser is found.
+    ///
+    /// `"auto"` searches `MUMDIA_MSCONVERT`, beside the engine binary, the
+    /// version-stamped ProteoWizard directories under Program Files on Windows
+    /// (newest first), then `PATH`.
+    ///
+    /// MuMDIA never ships or downloads ProteoWizard. Its vendor readers bundle the
+    /// instrument vendors' own libraries under the vendors' licence terms, which the
+    /// user accepts when obtaining it, and automating that acceptance is not
+    /// MuMDIA's to do.
+    pub msconvert: String,
+    /// Extra arguments appended to every `msconvert` invocation.
+    ///
+    /// An escape hatch, not a tuning surface. The per-vendor defaults already
+    /// request indexed 64-bit zlib mzML, vendor peak picking where it exists, and
+    /// `--combineIonMobilitySpectra` for Bruker. Use this for something the defaults
+    /// cannot express, such as an `--filter` that trims an acquisition. Arguments
+    /// are passed through verbatim and are not validated.
+    pub msconvert_args: Vec<String>,
+    /// Reuse an mzML that already sits beside the `.raw` and is newer than it.
+    ///
+    /// On by default: conversion is minutes per file and its output is
+    /// deterministic given the same converter, so re-running a search should not
+    /// pay for it twice. Turn it off when the neighbouring mzML may have come from
+    /// a different converter or a different `.raw` of the same name.
+    pub reuse_converted: bool,
+}
+impl Default for ConvertConfig {
+    fn default() -> Self {
+        Self {
+            thermo_raw_parser: "auto".to_string(),
+            msconvert: "auto".to_string(),
+            msconvert_args: Vec::new(),
+            reuse_converted: true,
+        }
+    }
+}
+
 /// Sequence-tag prescan (`mumdia prescan`). Prunes modification-bearing candidates that have no
 /// anchored tag support in a given run, before the per-run library is assembled.
 ///
@@ -1628,6 +1690,7 @@ impl Default for ExperimentConfig {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
+    pub convert: ConvertConfig,
     pub prescan: PrescanConfig,
     pub rng_seed: u64,
     pub digest: DigestConfig,
@@ -1649,6 +1712,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             rng_seed: 0,
+            convert: t(),
             prescan: t(),
             digest: t(),
             peptidoforms: t(),

@@ -102,10 +102,17 @@ fn apply_threads(threads: Option<usize>) -> Result<()> {
 enum Cmd {
     /// Read an mzML run into the normalized spectra artifact set.
     Convert {
+        /// An mzML, or a vendor file (Thermo `.raw`; Bruker/Agilent `.d`, SCIEX
+        /// `.wiff`, Waters `.raw` through msconvert), which is converted to mzML first.
         #[arg(long)]
         mzml: String,
         #[arg(long)]
         out_dir: String,
+        /// Configuration file. Only `convert.*` is read here, and it is read at all
+        /// so that `convert.thermo_raw_parser` can be set for a standalone convert
+        /// rather than only through `MUMDIA_THERMO_PARSER`.
+        #[arg(long)]
+        config: Option<String>,
         /// Limit spectra read (0 = all), for fast iteration.
         #[arg(long, default_value_t = 0)]
         max_spectra: usize,
@@ -402,6 +409,10 @@ enum Cmd {
         /// Stop after this many spectra from the head of the file (0 = all).
         #[arg(long, default_value_t = 0)]
         max_spectra: usize,
+        /// Configuration file, read for `convert.*` so a vendor file can be converted
+        /// the same way `run` converts it.
+        #[arg(long)]
+        config: Option<String>,
     },
     /// Candidate audit: reconstruct per-candidate stage flags + earliest rejection
     /// reason across the artifact chain and write candidate_audit.parquet
@@ -530,6 +541,27 @@ struct DoctorReport {
     ok: bool,
     scripts: ScriptsReport,
     roles: Vec<RoleReport>,
+    /// The Thermo `.raw` converter, if one can be found.
+    ///
+    /// Never a failure: reading mzML needs no converter, and the great majority of
+    /// runs are mzML. It is reported so that someone who intends to search a vendor
+    /// file learns now rather than at the start of a search.
+    thermo: ConverterReport,
+    /// ProteoWizard `msconvert`, which covers every vendor format except Thermo and
+    /// is the Thermo fallback. Also never a failure.
+    msconvert: ConverterReport,
+}
+
+/// Availability of one external converter.
+#[derive(serde::Serialize)]
+struct ConverterReport {
+    /// `ok` when a converter was located, `none` when not.
+    status: String,
+    /// The configured value (`auto` or a path), so the report says what was searched.
+    configured: String,
+    path: Option<String>,
+    /// Why nothing was found, when nothing was.
+    detail: Option<String>,
 }
 
 /// Peaks-per-MS2-spectrum percentiles for one mzML.
@@ -816,7 +848,39 @@ fn doctor_report(cfg: &Config, config_path: Option<&str>) -> DoctorReport {
         roles.push(r);
     }
 
-    DoctorReport { ok, scripts, roles }
+    // The converters are probed but never gate `ok`: an mzML run does not need them,
+    // and failing `doctor` for programs most configurations never call would train
+    // people to ignore this command.
+    let report_of = |r: anyhow::Result<std::path::PathBuf>, configured: &str| match r {
+        Ok(p) => ConverterReport {
+            status: "ok".into(),
+            configured: configured.to_string(),
+            path: Some(p.display().to_string()),
+            detail: None,
+        },
+        Err(e) => ConverterReport {
+            status: "none".into(),
+            configured: configured.to_string(),
+            path: None,
+            detail: Some(e.to_string()),
+        },
+    };
+    let thermo = report_of(
+        mumdia::raw::locate_parser(&cfg.convert.thermo_raw_parser),
+        &cfg.convert.thermo_raw_parser,
+    );
+    let msconvert = report_of(
+        mumdia::raw::locate_msconvert(&cfg.convert.msconvert),
+        &cfg.convert.msconvert,
+    );
+
+    DoctorReport {
+        ok,
+        scripts,
+        roles,
+        thermo,
+        msconvert,
+    }
 }
 
 /// Render the report as the prose a person reads in a terminal.
@@ -835,6 +899,28 @@ fn print_doctor(rep: &DoctorReport) {
              \x20        Point it at the `scripts/` directory that ships beside the binary.",
             rep.scripts.dir
         ),
+    }
+
+    println!("vendor format converters");
+    match rep.thermo.status.as_str() {
+        "ok" => println!(
+            "  [ ok ] Thermo .raw: {} (convert.thermo_raw_parser = {})",
+            rep.thermo.path.as_deref().unwrap_or("?"),
+            rep.thermo.configured
+        ),
+        _ => println!("  [note] Thermo .raw: no ThermoRawFileParser (Apache-2.0) found."),
+    }
+    match rep.msconvert.status.as_str() {
+        "ok" => println!(
+            "  [ ok ] Bruker/SCIEX/Agilent/Waters: {} (convert.msconvert = {})",
+            rep.msconvert.path.as_deref().unwrap_or("?"),
+            rep.msconvert.configured
+        ),
+        _ => println!("  [note] Bruker/SCIEX/Agilent/Waters: no msconvert found."),
+    }
+    if rep.thermo.status != "ok" || rep.msconvert.status != "ok" {
+        println!("         A converter is needed only for that vendor's files, never for");
+        println!("         mzML. See docs/04_convert.md, \"Vendor formats\".");
     }
 
     println!("sidecar interpreters");
@@ -959,11 +1045,12 @@ fn main() -> Result<()> {
         Cmd::Convert {
             mzml,
             out_dir,
+            config,
             max_spectra,
             top_peaks_ms2,
             top_peaks_ms1,
         } => {
-            let cfg = load_config(&None)?;
+            let cfg = load_config(&config)?;
             // Fold the conversion CLI caps into the convert artifacts' provenance
             // key: they change the spectra output but are not part of the config, so
             // two different caps would otherwise produce an identical config_hash
@@ -973,6 +1060,14 @@ fn main() -> Result<()> {
                 "{}\u{1f}max_spectra={max_spectra}\u{1f}top_peaks_ms2={top_peaks_ms2}\u{1f}top_peaks_ms1={top_peaks_ms1}",
                 cfg.canonical_json()
             ));
+            // A vendor file is converted to mzML first; an mzML passes through untouched.
+            // The output directory is the fallback location for the converted file when
+            // the input sits somewhere unwritable.
+            let mzml = mumdia::raw::ensure_mzml(
+                &mzml,
+                &cfg.convert,
+                Some(std::path::Path::new(&out_dir)),
+            )?;
             stages::convert::run(stages::convert::ConvertParams {
                 mzml: &mzml,
                 out_dir: &out_dir,
@@ -1215,6 +1310,14 @@ fn main() -> Result<()> {
             if let Some(pf) = &profile {
                 cfg.apply_profile(pf)?;
             }
+            // Vendor files are converted to mzML before anything else happens, so every
+            // stage below sees mzML; an mzML path passes through untouched.
+            let mzml = mzml
+                .iter()
+                .map(|m| {
+                    mumdia::raw::ensure_mzml(m, &cfg.convert, Some(std::path::Path::new(&out_dir)))
+                })
+                .collect::<Result<Vec<String>>>()?;
             if mzml.len() > 1 {
                 // Files provided together are rescored together. Searching them one by
                 // one would give N unrelated FDR estimates and count a peptide found in
@@ -1267,6 +1370,12 @@ fn main() -> Result<()> {
             if let Some(pf) = &profile {
                 cfg.apply_profile(pf)?;
             }
+            let mzml = mzml
+                .iter()
+                .map(|m| {
+                    mumdia::raw::ensure_mzml(m, &cfg.convert, Some(std::path::Path::new(&out_dir)))
+                })
+                .collect::<Result<Vec<String>>>()?;
             let run_names = if run_names.is_empty() {
                 None
             } else {
@@ -1387,7 +1496,17 @@ fn main() -> Result<()> {
         Cmd::Inspect { artifact } => {
             print!("{}", mumdia_io::inspect(&artifact)?);
         }
-        Cmd::PeakCensus { mzml, max_spectra } => {
+        Cmd::PeakCensus {
+            mzml,
+            max_spectra,
+            config,
+        } => {
+            // The census exists to size `--top-peaks-ms2` for a run, so it has to accept
+            // the same inputs a run does. There is no output directory here, so a vendor
+            // file in an unwritable directory is an error rather than a conversion into
+            // somewhere arbitrary.
+            let cfg = load_config(&config)?;
+            let mzml = mumdia::raw::ensure_mzml(&mzml, &cfg.convert, None)?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&peak_census(&mzml, max_spectra)?)?

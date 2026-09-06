@@ -70,7 +70,7 @@ Library construction/import and mzML conversion are independent branches:
 FASTA -> digest -> peptidoforms -> predict-frag --+
                                                    +-> search-seed
 imported library ---------------------------------+       |
-mzML -> convert ----------------------------------+       v
+mzML or vendor file -> convert -------------------+       v
         (optional: prescan, per-run tag pruning    |
          of modform hypotheses for a PTM search)   |
                                     library iRT re-prediction (DeepLC 4.1.1 base
@@ -100,6 +100,19 @@ Key semantics:
   output was identical with and without a 300-peak conversion cap.
 - `--max-spectra N` reads the head of the mzML. It does not select a
   mid-gradient slice.
+- A vendor path given as `--mzml` is converted to mzML first by
+  `raw::ensure_mzml` (`convert`, `run`, `run-experiment`, `peak-census`): Thermo
+  `.raw` by ThermoRawFileParser, Bruker/Agilent `.d`, SCIEX `.wiff` and Waters
+  `.raw` by ProteoWizard `msconvert`, both located (`convert.thermo_raw_parser`,
+  `convert.msconvert`, `auto` by default) and never shipped. The mzML lands
+  beside the input and is reused when newer than it (`convert.reuse_converted`).
+  `mumdia doctor` reports both converters and never fails for their absence.
+  Only Thermo is exercised end to end; `docs/04_convert.md` "Vendor formats" has
+  the table, the ion-mobility caveat for Bruker, and the extension collisions.
+- An imported library row with an empty `protein` is grouped as `UNASSIGNED` at
+  load, with a warning that counts the rows (DIA-NN writes the iRT-kit standards
+  without a protein); `scripts/import_diann_lib.py` writes the same group at
+  import time. An empty `peptidoform` is still a hard error.
 - The native digest emits N-terminal Met-excised forms by default
   (`digest.n_term_met_excision = true`, matching DIA-NN `--met-excision`).
   Excision keys on protein position 0 with a leading `M`, not any interior `M`.

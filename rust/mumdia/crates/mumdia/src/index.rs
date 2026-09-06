@@ -159,16 +159,41 @@ impl Library {
         // explicitly empty string is a different thing and still reaches here: an empty
         // `peptidoform` cannot be parsed into residues, and an empty `protein` silently
         // joins every such candidate into one protein group.
-        for (col, values) in [("peptidoform", &pform), ("protein", &protein)] {
-            if let Some(row) = values.iter().position(|v| v.trim().is_empty()) {
-                anyhow::bail!(
-                    "library column '{col}' is empty at row {row} in {precursors}; it is \
-                     required, and an empty value would be carried silently into \
-                     peptidoform parsing or protein grouping. DIA-NN leaves the protein \
-                     empty for unmapped peptides such as the iRT-kit standards; \
-                     scripts/import_diann_lib.py writes those as UNASSIGNED, so re-import \
-                     the library or fill the column"
-                );
+        if let Some(row) = pform.iter().position(|v| v.trim().is_empty()) {
+            anyhow::bail!(
+                "library column 'peptidoform' is empty at row {row} in {precursors}; it is \
+                 required, and an empty value cannot be parsed into residues"
+            );
+        }
+        // An empty protein is a fact about the library, not a reason to refuse it: DIA-NN
+        // leaves the protein empty for peptides it did not map to the FASTA, the iRT-kit
+        // standards above all, and every DIA-NN library with the standards in it carries a
+        // few dozen. Left empty, those peptides would silently share one anonymous protein
+        // group; refused, no such library loads. So they are named: the same UNASSIGNED
+        // group scripts/import_diann_lib.py writes at import, said out loud with a count
+        // and examples, so the group is visible in proteins.tsv and in this log.
+        let unassigned: Vec<usize> = protein
+            .iter()
+            .enumerate()
+            .filter(|(_, v)| v.trim().is_empty())
+            .map(|(i, _)| i)
+            .collect();
+        if !unassigned.is_empty() {
+            let examples: Vec<&str> = unassigned
+                .iter()
+                .take(3)
+                .map(|&i| pform[i].as_str())
+                .collect();
+            tracing::warn!(
+                rows = unassigned.len(),
+                examples = ?examples,
+                library = precursors,
+                "library: rows with an empty protein are grouped as UNASSIGNED (typically \
+                 the iRT-kit standards); re-import with scripts/import_diann_lib.py to \
+                 make the group explicit in the file"
+            );
+            for i in unassigned {
+                protein[i] = "UNASSIGNED".to_string();
             }
         }
 
@@ -820,12 +845,14 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    #[test]
-    fn empty_required_string_is_rejected() {
-        // The accessor rejects a NULL now, but an explicitly empty string is a different
-        // thing: an empty `protein` silently joins every such candidate into one group.
-        let dir = unique_dir("empty_protein");
-        std::fs::create_dir_all(&dir).unwrap();
+    /// A two-candidate library whose string columns are the caller's, for the two
+    /// empty-string cases below.
+    fn library_with(
+        dir: &std::path::Path,
+        peptidoforms: [&str; 2],
+        proteins: [&str; 2],
+    ) -> (String, String) {
+        std::fs::create_dir_all(dir).unwrap();
         let p = dir.join("prec.parquet").to_str().unwrap().to_string();
         let f = dir.join("frag.parquet").to_str().unwrap().to_string();
         write_table(
@@ -836,13 +863,16 @@ mod tests {
                 Col::U32("base_peptide_id".into(), vec![0, 1]),
                 Col::Str(
                     "peptidoform".into(),
-                    vec!["PEPTIDEK".into(), "SAMPLER".into()],
+                    vec![peptidoforms[0].into(), peptidoforms[1].into()],
                 ),
                 Col::I32("charge".into(), vec![2, 2]),
                 Col::F64("precursor_mz".into(), vec![400.0, 500.0]),
                 Col::F32("predicted_irt".into(), vec![10.0, 20.0]),
                 Col::Str("label".into(), vec!["target".into(), "decoy".into()]),
-                Col::Str("protein".into(), vec!["P1".into(), "".into()]),
+                Col::Str(
+                    "protein".into(),
+                    vec![proteins[0].into(), proteins[1].into()],
+                ),
                 Col::I32("n_fragments".into(), vec![1, 1]),
             ],
         )
@@ -860,11 +890,35 @@ mod tests {
             ],
         )
         .unwrap();
+        (p, f)
+    }
+
+    #[test]
+    fn an_empty_protein_loads_as_the_unassigned_group() {
+        // DIA-NN leaves the protein empty for peptides it did not map (the iRT-kit
+        // standards), so every real DIA-NN library carries a few dozen such rows. They
+        // load, named rather than anonymous: an empty protein would have silently joined
+        // every such candidate into one group, and refusing the library served nobody.
+        let dir = unique_dir("empty_protein");
+        let (p, f) = library_with(&dir, ["PEPTIDEK", "SAMPLER"], ["P1", ""]);
+        let lib = Library::load(&p, &f, 8).expect("an empty protein is not a load error");
+        assert_eq!(lib.cands[0].protein, "P1");
+        assert_eq!(lib.cands[1].protein, "UNASSIGNED");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_empty_peptidoform_is_rejected() {
+        // Unlike the protein, an empty peptidoform has no meaning at all: it cannot be
+        // parsed into residues, so the accessor's NULL rejection is extended to the
+        // explicitly empty string.
+        let dir = unique_dir("empty_peptidoform");
+        let (p, f) = library_with(&dir, ["PEPTIDEK", ""], ["P1", "P2"]);
         let err = match Library::load(&p, &f, 8) {
-            Ok(_) => panic!("an empty required string must be rejected at load"),
+            Ok(_) => panic!("an empty peptidoform must be rejected at load"),
             Err(e) => e.to_string(),
         };
-        assert!(err.contains("'protein'"), "{err}");
+        assert!(err.contains("'peptidoform'"), "{err}");
         std::fs::remove_dir_all(&dir).ok();
     }
 }

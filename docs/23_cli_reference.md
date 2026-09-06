@@ -128,7 +128,7 @@ first sentence of the description, with the full text in the section below.
 
 | Subcommand | `--config` | Purpose |
 |---|---|---|
-| [`convert`](#convert) | no | Read an mzML run into the normalized spectra artifact set |
+| [`convert`](#convert) | yes | Read an mzML run into the normalized spectra artifact set |
 | [`digest`](#digest) | yes | Fully-tryptic digest + decoy pairing -> peptides.parquet |
 | [`peptidoforms`](#peptidoforms) | yes | Fixed+variable modification and charge enumeration -> peptidoforms.parquet |
 | [`predict-frag`](#predict-frag) | yes | Spectral library: b/y m/z + predicted intensity + iRT -> fragment_library |
@@ -146,17 +146,17 @@ first sentence of the description, with the full text in the section below.
 | [`align`](#align) | yes | Cross-run RT alignment (experiment-level) -> alignment.parquet |
 | [`mbr`](#mbr) | yes | Match-between-runs identification transfer (Stage D3) -> transferred.parquet |
 | [`inspect`](#inspect) | no | Print schema, head sample, and row count for any artifact |
-| [`peak-census`](#peak-census) | no | Peaks per MS2 spectrum for an mzML, as JSON: percentiles plus what each candidate `--top-peaks-ms2` cap would discard |
+| [`peak-census`](#peak-census) | yes | Peaks per MS2 spectrum for an mzML, as JSON: percentiles plus what each candidate `--top-peaks-ms2` cap would discard |
 | [`audit`](#audit) | no | Candidate audit: reconstruct per-candidate stage flags + earliest rejection reason across the artifact chain and write candidate_audit.parquet (sensitivity program, P0.3/P0.4). |
 | [`report`](#report) | yes | Write peptides.tsv + proteins.tsv from a scored PSM table, or the experiment-wide pair for a `run-experiment` output directory |
 | [`doctor`](#doctor) | yes | Check that the configured Python sidecar environments are usable |
 | `help` | n/a | Print this message or the help of the given subcommand(s) |
 
-17 of the 22 documented subcommands accept `--config`:
- `align`, `compete`, `digest`, `doctor`, `extract`, `features`, `mbr`, `peptidoforms`, `predict-frag`, `prescan`, `quant`, `report`, `rescore`, `rt-im-train`, `run`, `run-experiment`, `search-seed`.
+19 of the 22 documented subcommands accept `--config`:
+ `align`, `compete`, `convert`, `digest`, `doctor`, `extract`, `features`, `mbr`, `peak-census`, `peptidoforms`, `predict-frag`, `prescan`, `quant`, `report`, `rescore`, `rt-im-train`, `run`, `run-experiment`, `search-seed`.
 
-5 do not, so every setting they use comes from their own flags:
- `audit`, `convert`, `inspect`, `peak-census`, `quant-lfq`.
+3 do not, so every setting they use comes from their own flags:
+ `audit`, `inspect`, `quant-lfq`.
 
 ## convert
 
@@ -167,8 +167,12 @@ Usage: mumdia convert [OPTIONS] --mzml <MZML> --out-dir <OUT_DIR>
 
 Options:
       --mzml <MZML>
+          An mzML, or a vendor file (Thermo `.raw`; Bruker/Agilent `.d`, SCIEX `.wiff`, Waters `.raw` through msconvert), which is converted to mzML first
 
       --out-dir <OUT_DIR>
+
+      --config <CONFIG>
+          Configuration file. Only `convert.*` is read here, and it is read at all so that `convert.thermo_raw_parser` can be set for a standalone convert rather than only through `MUMDIA_THERMO_PARSER`
 
       --max-spectra <MAX_SPECTRA>
           Limit spectra read (0 = all), for fast iteration
@@ -607,6 +611,9 @@ Options:
           Stop after this many spectra from the head of the file (0 = all)
 
           [default: 0]
+
+      --config <CONFIG>
+          Configuration file, read for `convert.*` so a vendor file can be converted the same way `run` converts it
 ```
 
 Plus the 5 repeated flags removed above: see "Global flags".

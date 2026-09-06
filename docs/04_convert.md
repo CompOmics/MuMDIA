@@ -426,6 +426,133 @@ to 2,286,840 (12.2x) and extract wall clock from 57.9 s to 91.9 s.
   extraction and mass-calibration paths that depend on convert output are
   exercised only in full runs.
 
+## Vendor formats
+
+The engine reads mzML. A vendor file passed to `--mzml` is converted to mzML first
+by an external converter, and every subcommand that takes a spectra path does this:
+`convert`, `run`, `run-experiment` and `peak-census`. `raw.rs` is the whole of it;
+nothing downstream of `convert` knows a vendor file was involved.
+
+| Input | Converter | State |
+|---|---|---|
+| mzML | none | supported |
+| Thermo `.raw` (file) | ThermoRawFileParser, or msconvert | **exercised end to end** |
+| Bruker `.d` (dir) | msconvert | wired, unverified; **ion mobility is discarded** |
+| SCIEX `.wiff` / `.wiff2` | msconvert | wired, unverified |
+| Agilent `.d` (dir) | msconvert | wired, unverified |
+| Waters `.raw` (dir) | msconvert | wired, unverified |
+
+"Wired, unverified" is literal: the dispatch, argument construction, converter
+discovery and reuse rules are unit-tested, and the msconvert code path has been run
+end to end, but only on a Thermo `.raw`. No Bruker, SCIEX, Agilent or Waters file
+has been converted by this code. Treat those four as untested plumbing rather than
+as supported formats.
+
+### Why conversion is a child process and not a linked reader
+
+`mzdata` can read several of these directly, and that was rejected on build grounds
+rather than capability. Those readers need the vendors' own libraries and, for
+Thermo and SCIEX, a .NET runtime, while the workspace pins `mzdata` to
+`default-features = false, features = ["mzml", "miniz_oxide"]` precisely so that
+building MuMDIA needs no C, C++ or .NET toolchain (`CLAUDE.md`, "Build gotchas: do
+not fix these back"). Linking a vendor reader imposes that on every build on every
+platform, including the ones that never see a vendor file.
+
+### Two converters, and the licence difference between them
+
+ThermoRawFileParser is Apache-2.0 and from CompOmics, so the desktop application
+simply installs it. ProteoWizard `msconvert` is located, never installed: its
+vendor readers bundle each instrument maker's own libraries under those makers'
+licence terms, which the user accepts when they obtain ProteoWizard, and automating
+that acceptance is not MuMDIA's to do.
+
+For a Thermo `.raw`, ThermoRawFileParser is preferred and msconvert is the fallback,
+but only when `convert.thermo_raw_parser` is left at `"auto"` and nothing was found.
+An explicitly configured path that does not exist is an error, never a fallback:
+converting with a program the configuration did not name would change the spectra a
+search sees, and vendor conversion is not reproducible across converters or across
+converter versions.
+
+### Bruker and ion mobility
+
+**MuMDIA's pipeline is 3D and discards ion mobility** (README, "No ion mobility").
+For diaPASEF this removes the mobility separation that makes the acquisition
+selective, so a Bruker `.d` will search with substantially more interference and
+fewer identifications than a 4D engine on the same file. The engine warns about this
+on every Bruker input, and the desktop application says it under the file picker.
+
+It is a warning and not a refusal, for a specific reason: the loss is sensitivity,
+not FDR validity. Targets and decoys see the same added interference, so the
+threshold stays calibrated while fewer things pass it. A user with non-PASEF Bruker
+DIA is also well served. But a diaPASEF user who is not told this will read a low
+count as a MuMDIA result rather than as the cost of discarding the dimension their
+acquisition exists to produce.
+
+msconvert is invoked with `--combineIonMobilitySpectra` for Bruker, which is what
+turns a mobility-resolved frame into the 3D spectra this pipeline reads. Without it
+the output is one spectrum per mobility scan, which is both enormous and not what
+any downstream stage expects.
+
+### The two extension collisions
+
+Both are real and both are handled in `raw::detect`:
+
+- **`.raw` is Thermo or Waters.** Thermo's is a single file; Waters' is a directory
+  of `_FUNC*.DAT` files. They route to different converters, and the discriminator
+  is whether the path is a file or a directory, which is what every other tool uses.
+  A path that does not exist is treated as Thermo, so the error names the missing
+  file rather than the format.
+- **`.d` is Bruker or Agilent**, both directories. Bruker's holds `analysis.tdf`
+  (timsTOF) or `analysis.baf`; Agilent's holds `AcqData/`. Both go to msconvert
+  regardless, so this distinction exists only so the ion-mobility warning fires for
+  Bruker and not for Agilent. Unrecognised contents fall to Bruker, which is the
+  commoner `.d` here and the safer warning to emit.
+
+The desktop application needs a folder picker as well as a file picker for exactly
+this reason: three of the five vendor formats are directories.
+
+### Locating the converters
+
+`convert.thermo_raw_parser` and `convert.msconvert` both default to `"auto"`.
+
+`"auto"` searches the role's environment variable (`MUMDIA_THERMO_PARSER`,
+`MUMDIA_MSCONVERT`), then beside the engine binary, then `PATH`. For msconvert on
+Windows the version-stamped ProteoWizard directories under Program Files are also
+searched, newest first. Neither ever searches the working directory, for the reason
+`python::resolve_script_dir` documents at length: an untrusted input directory
+holding a file with the right name would otherwise be executed.
+
+`mumdia doctor` reports both converters, and never fails for their absence: an mzML
+run needs neither, and failing `doctor` for programs most configurations never call
+would train people to ignore the command.
+
+### Where the mzML goes, and when it is reused
+
+Beside the input when that directory is writable, which makes it reusable and
+findable; into the output directory otherwise, with a warning that the next run will
+convert again. `convert.reuse_converted` (default on) uses an mzML that already sits
+beside the input and is **newer** than it. The newer test matters: an mzML older
+than its input is either from a different acquisition of the same name or from
+before the input was re-acquired, and searching it would search the wrong data. An
+unreadable timestamp counts as not reusable.
+
+For a directory input the newest mtime *inside* the directory is used, one level
+deep, because a `.d` directory's own mtime does not necessarily change when a
+contained acquisition file is rewritten.
+
+### Peak picking
+
+ThermoRawFileParser is invoked with `-f 2` (indexed mzML, which is what msconvert
+produces by default and therefore what the engine has always read) and `-m 2` (no
+metadata sidecar). Peak picking is left at its default, which is **on**.
+
+msconvert is invoked with `--mzML --64 --zlib --simAsSpectra`, plus
+`--filter "peakPicking vendor msLevel=1-"` for every vendor except Bruker, whose TDF
+data is already centroided and where msconvert rejects the filter. Vendor
+centroiding is better than the local-maxima fallback in `stages::convert`, which
+then sees centroided input and does nothing. `convert.msconvert_args` appends extra
+arguments verbatim; it is an escape hatch, not a tuning surface.
+
 ## How to extend / modify
 
 - **Add a vendor format** (Thermo `.raw`, Bruker `.d`/TDF): this stage is the only

@@ -11,6 +11,7 @@ pub mod peaks;
 pub mod predict;
 pub mod python;
 pub mod quant_lfq;
+pub mod raw;
 pub mod rescoring;
 pub mod sidecar;
 pub mod solve;

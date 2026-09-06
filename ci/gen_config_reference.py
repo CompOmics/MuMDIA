@@ -750,7 +750,14 @@ RUST_FOR_LIST = re.compile(
 )
 RUST_FN_STR = re.compile(r"fn\s+([a-z_][a-z0-9_]*)\s*\([^)]*\)\s*->\s*&'static str")
 RUST_ENV_CLOSURE = re.compile(r"let\s+mut\s+([a-z_][a-z0-9_]*)\s*=\s*\|\s*([a-z_]+)\s*:")
-ENV_NAME = re.compile(r"^[A-Z][A-Z0-9_]{2,}$")
+# Mixed case and parentheses allowed. Every name reaching `add` came from
+# `resolve`, which accepts only a quoted literal in environment-call position or a
+# known loop/function literal, so this cannot admit unrelated strings. An
+# upper-case-only filter silently DROPPED real reads rather than reporting them:
+# `ProgramFiles` and `ProgramFiles(x86)`, which decide where msconvert is found on
+# Windows, were resolved and then discarded, so the table under-reported what
+# actually changes the engine's behaviour.
+ENV_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9_()]{2,}$")
 
 
 def call_arguments(text: str, open_paren: int) -> list[str] | None:
@@ -941,7 +948,14 @@ def scan_rust_env(
 
         def resolve(arg: str, at_line: int) -> list[str] | None:
             arg = arg.strip()
-            m = re.fullmatch(r'"([A-Z0-9_]+)"', arg)
+            # Mixed case and parentheses are allowed, not just SHOUTING_SNAKE.
+            # Windows variable names are legitimately mixed case and one of the ones
+            # the tree reads is literally `ProgramFiles(x86)`, so an upper-case-only
+            # pattern reported real literal reads as unresolved. Anything appearing
+            # as the first argument of `std::env::var`/`var_os` is an environment
+            # variable name by construction, so widening here cannot admit
+            # unrelated strings.
+            m = re.fullmatch(r'"([A-Za-z0-9_()]+)"', arg)
             if m:
                 return [m.group(1)]
             for var, names, start, end in loop_scopes:

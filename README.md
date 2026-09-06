@@ -7,8 +7,8 @@
 MuMDIA is a data-independent-acquisition (DIA) peptide search engine written in
 Rust, with optional Python sidecars for the machine-learning components (DeepLC
 retention time, MS2PIP fragment intensities, mokapot and a PyTorch rescorer). It
-reads DIA `mzML`, searches against either an in-silico FASTA digest or an
-imported predicted spectral library, and reports peptides and protein groups
+reads DIA `mzML` (and vendor formats, converted on the way in), searches against
+either an in-silico FASTA digest or an imported predicted spectral library, and reports peptides and protein groups
 under target-decoy FDR control together with label-free quantities. This is early
 software. The engine runs end to end and is validated on public DIA data, but the
 Python sidecars are not exercised by continuous integration, and the
@@ -24,7 +24,7 @@ path-addressable inputs:
 FASTA -> digest -> peptidoforms -> predict-frag --+
                                                    +-> search-seed
 imported spectral library ------------------------+       |
-mzML -> convert ----------------------------------+       v
+mzML or vendor format -> convert -----------------+       v
                                                   optional RT fine-tune
                                                            |
                                                            v
@@ -591,9 +591,16 @@ are listed so the documentation cannot imply a capability that is not there.
 
 Hard limits of this release:
 
-- **mzML input only.** No vendor formats.
+- **mzML input, plus vendor formats by external conversion.** The engine reads
+  mzML. A vendor path passed to `--mzml` is converted first: Thermo `.raw` by
+  ThermoRawFileParser (which the desktop application installs), and Bruker `.d`,
+  SCIEX `.wiff`, Agilent `.d` and Waters `.raw` by ProteoWizard `msconvert` (which
+  MuMDIA locates but does not install). `mumdia doctor` reports both converters.
+  Only Thermo is exercised end to end; the other four are wired and unverified
+  (`docs/04_convert.md`, "Vendor formats").
 - **No ion mobility.** The pipeline is 3D; the ion-mobility columns exist in the
-  artifacts and are always null.
+  artifacts and are always null. Bruker diaPASEF input is accepted but loses the
+  mobility separation the acquisition exists to produce.
 - **No wildcard or terminal variable modifications.** Both are rejected at
   peptidoform expansion.
 - **Several files are one experiment by default.** `run` with several `--mzml`, like
