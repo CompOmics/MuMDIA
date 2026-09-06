@@ -436,7 +436,7 @@ nothing downstream of `convert` knows a vendor file was involved.
 | Input | Converter | State |
 |---|---|---|
 | mzML | none | supported |
-| Thermo `.raw` (file) | ThermoRawFileParser, or msconvert | **exercised end to end** |
+| Thermo `.raw` (file) | ThermoRawFileParser, or msconvert | **exercised end to end** (doxy, 2026-09-06: a 3.7 GB Astral `.raw` through `mumdia convert --mzml x.raw`, ThermoRawFileParser 2.0.0 found by `auto`, 6:40 and 4.4 GB for the converter, 3.4 GB mzML renamed into place beside the input, reused by the next run in 1.3 s; `peak-census` on the same `.raw` likewise) |
 | Bruker `.d` (dir) | msconvert | wired, unverified; **ion mobility is discarded** |
 | SCIEX `.wiff` / `.wiff2` | msconvert | wired, unverified |
 | Agilent `.d` (dir) | msconvert | wired, unverified |
@@ -535,6 +535,15 @@ beside the input and is **newer** than it. The newer test matters: an mzML older
 than its input is either from a different acquisition of the same name or from
 before the input was re-acquired, and searching it would search the wrong data. An
 unreadable timestamp counts as not reusable.
+
+The converter writes to `<name>.partial.mzML` and the engine renames it to
+`<name>.mzML` only after a zero exit and a file at that path, so a killed run or a
+converter crash leaves nothing the reuse rule can mistake for a finished conversion;
+a stale `.partial.mzML` is removed at the next attempt. The marker sits in the stem
+because both converters treat the extension as theirs: ThermoRawFileParser appends
+`.mzML` to an output path that lacks it, so the earlier `<name>.mzML.partial` came
+back as `<name>.mzML.partial.mzML` and a 6:48 conversion of a 3.7 GB Astral run was
+discarded as "exited successfully but wrote no file" (doxy, 2026-09-06).
 
 For a directory input the newest mtime *inside* the directory is used, one level
 deep, because a `.d` directory's own mtime does not necessarily change when a
