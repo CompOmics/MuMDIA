@@ -23,7 +23,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{bail, Result};
-use mumdia_core::config::{Config, FragPredictorKind, MbrStrategy, RescorerKind, RtPredictorKind};
+use mumdia_core::config::{
+    Config, FragPredictorKind, LibraryIrt, MbrStrategy, RescorerKind, RtPredictorKind,
+};
 use tracing::{info, warn};
 
 /// The literal a config uses to ask for discovery rather than naming a path.
@@ -143,9 +145,27 @@ impl Role {
             Role::DeepLc => {
                 cfg.predict_frag.rt_predictor == RtPredictorKind::Deeplc
                     || cfg.rt_im_train.finetune_deeplc
+                    || cfg.rt_im_train.library_irt == LibraryIrt::Deeplc
             }
             Role::Ms2pip => cfg.predict_frag.predictor == FragPredictorKind::Ms2pip,
             Role::Mbr => cfg.mbr.strategy != MbrStrategy::None,
+        }
+    }
+
+    /// Whether the configuration would USE the role if an interpreter is available,
+    /// without requiring one. Only DeepLC has this state: under the default
+    /// `rt_im_train.library_irt = auto` a library-input run re-predicts the imported iRT
+    /// with the DeepLC base model when `predict_frag.deeplc_python` resolves and keeps the
+    /// imported values, with a warning, when it does not. Discovery therefore runs for a
+    /// wanted role, and a miss is a note rather than an error. `library_irt = deeplc`
+    /// turns the same role into a required one (`required_by`), and a FASTA-mode run,
+    /// which ignores `library_irt`, simply never launches the worker.
+    pub fn wanted_by(self, cfg: &Config) -> bool {
+        match self {
+            Role::DeepLc => {
+                !self.required_by(cfg) && cfg.rt_im_train.library_irt == LibraryIrt::Auto
+            }
+            _ => false,
         }
     }
 }
@@ -383,7 +403,8 @@ pub fn resolve_with(cfg: &mut Config, strictness: Strictness) -> Result<Vec<Reso
             continue;
         }
 
-        if !required {
+        let wanted = role.wanted_by(cfg);
+        if !required && !wanted {
             // Nothing to probe: the native path is in use. Clear the field so the
             // literal "auto" does not survive into the resolved config, where a later
             // existence check would try to stat a program called "auto".
@@ -409,6 +430,22 @@ pub fn resolve_with(cfg: &mut Config, strictness: Strictness) -> Result<Vec<Reso
                     role,
                     python: Some(path),
                     source,
+                });
+            }
+            None if !required => {
+                // Wanted, not required: the run goes on without it. `run` says what that
+                // means for the retention times when it gets there.
+                role.clear(cfg);
+                info!(
+                    field = role.field(),
+                    "python: no interpreter found for an optional role; a library-input run \
+                     will keep the imported iRT (set {} or name one to re-predict it)",
+                    role.env_var()
+                );
+                out.push(Resolution {
+                    role,
+                    python: None,
+                    source: "not found (optional)",
                 });
             }
             None => {
@@ -441,7 +478,7 @@ pub fn resolve_with(cfg: &mut Config, strictness: Strictness) -> Result<Vec<Reso
     // A configured-but-unused interpreter is a silent no-op today; say so, because
     // it usually means the classifier or predictor is not the one the user thinks.
     for r in &out {
-        if r.source == "configured" && !r.role.required_by(cfg) {
+        if r.source == "configured" && !r.role.required_by(cfg) && !r.role.wanted_by(cfg) {
             warn!(
                 field = r.role.field(),
                 "python: interpreter configured but this run does not use it"
@@ -551,8 +588,20 @@ mod tests {
         cfg.rescore.classifier = RescorerKind::Mokapot;
         assert!(Role::Rescore.modules(&cfg).contains(&"mokapot"));
 
+        // DeepLC is WANTED, not required, by default: `library_irt = auto` uses it for a
+        // library-input run when it resolves and does without it otherwise.
+        assert!(Role::DeepLc.wanted_by(&cfg));
+        cfg.rt_im_train.library_irt = LibraryIrt::Library;
+        assert!(!Role::DeepLc.wanted_by(&cfg) && !Role::DeepLc.required_by(&cfg));
+        cfg.rt_im_train.library_irt = LibraryIrt::Deeplc;
+        assert!(Role::DeepLc.required_by(&cfg) && !Role::DeepLc.wanted_by(&cfg));
+        cfg.rt_im_train.library_irt = LibraryIrt::Auto;
+        for role in [Role::Rescore, Role::Ms2pip, Role::Mbr] {
+            assert!(!role.wanted_by(&cfg), "{:?} has no optional state", role);
+        }
+
         cfg.rt_im_train.finetune_deeplc = true;
-        assert!(Role::DeepLc.required_by(&cfg));
+        assert!(Role::DeepLc.required_by(&cfg) && !Role::DeepLc.wanted_by(&cfg));
         cfg.rt_im_train.finetune_deeplc = false;
         cfg.predict_frag.rt_predictor = RtPredictorKind::Deeplc;
         assert!(Role::DeepLc.required_by(&cfg));
@@ -567,6 +616,10 @@ mod tests {
     #[test]
     fn resolve_leaves_a_native_config_untouched() {
         let mut cfg = Config::default();
+        // The default `library_irt = auto` makes DeepLC an OPTIONAL role that discovery
+        // probes for (next test); the fully native case is the one that keeps the
+        // imported iRT.
+        cfg.rt_im_train.library_irt = LibraryIrt::Library;
         let res = resolve(&mut cfg).unwrap();
         assert_eq!(res.len(), ALL_ROLES.len());
         assert!(res.iter().all(|r| r.source == "not required"));
@@ -660,6 +713,7 @@ mod tests {
         // never uses, and the experiment preflight then stat'ed it. After resolution an
         // unused role must be None: no interpreter was selected, because none is needed.
         let mut cfg = Config::default();
+        cfg.rt_im_train.library_irt = LibraryIrt::Library;
         cfg.mbr.python = Some(AUTO.to_string());
         cfg.rescore.python = Some(AUTO.to_string());
         assert!(
@@ -676,6 +730,27 @@ mod tests {
         assert_eq!(cfg.rescore.python, None);
         assert!(res.iter().all(|r| r.python.is_none()));
         assert!(res.iter().all(|r| r.source == "not required"));
+    }
+
+    #[test]
+    fn resolve_treats_deeplc_as_optional_under_library_irt_auto() {
+        // `library_irt = auto` (the default) WANTS DeepLC without requiring it: discovery
+        // runs, a miss is not an error, and the field never keeps the literal "auto".
+        // Whether a machine has a usable DeepLC is not something a unit test can assume,
+        // so the assertion is on the contract, not on the outcome.
+        let mut cfg = Config::default();
+        cfg.predict_frag.deeplc_python = Some(AUTO.to_string());
+        assert!(Role::DeepLc.wanted_by(&cfg) && !Role::DeepLc.required_by(&cfg));
+        let res = resolve(&mut cfg).expect("an optional role never fails resolution");
+        let r = res.iter().find(|r| r.role == Role::DeepLc).unwrap();
+        assert_ne!(r.source, "not required");
+        assert_eq!(r.python.is_none(), r.source == "not found (optional)");
+        assert_eq!(cfg.predict_frag.deeplc_python, r.python);
+        assert!(cfg
+            .predict_frag
+            .deeplc_python
+            .as_deref()
+            .is_none_or(|p| !p.eq_ignore_ascii_case(AUTO)));
     }
 
     #[test]

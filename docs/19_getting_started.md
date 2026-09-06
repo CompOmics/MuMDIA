@@ -94,7 +94,10 @@ which is what `configs/examples/*.json` use, resolves through
 `python3` and `python` on `PATH`, accepting a candidate only after it imports what
 that role's workers import, so activating the environment is normally enough. Name
 an absolute path when a machine has several candidates and you want to pin one; an
-explicit path is never second-guessed.
+explicit path is never second-guessed. DeepLC is discovered opportunistically under the
+default `rt_im_train.library_irt = auto`: found (and 4.1.1 or newer), a library-input
+run re-predicts the imported iRT with it; not found, the run keeps the imported values
+and says so, and `doctor` shows a `[note]` rather than a failure.
 
 Notes:
 

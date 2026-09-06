@@ -467,6 +467,9 @@ enum Cmd {
 /// One sidecar role, as `doctor` found it.
 #[derive(serde::Serialize)]
 struct RoleReport {
+    /// The configuration uses the role when an interpreter is available, without
+    /// requiring one (DeepLC under `rt_im_train.library_irt = auto`).
+    wanted: bool,
     /// `rescore` | `deeplc` | `ms2pip` | `mbr`
     role: String,
     /// The configuration field that names this interpreter.
@@ -675,6 +678,7 @@ fn doctor_report(cfg: &Config, config_path: Option<&str>) -> DoctorReport {
             Role::Mbr => cfg.mbr.python.clone(),
         };
         let required = role.required_by(&cfg);
+        let wanted = role.wanted_by(&cfg);
         let modules: Vec<String> = role.modules(&cfg).iter().map(|m| m.to_string()).collect();
         let explicit = configured
             .as_deref()
@@ -685,6 +689,7 @@ fn doctor_report(cfg: &Config, config_path: Option<&str>) -> DoctorReport {
             role: format!("{role:?}").to_lowercase(),
             field: role.field().to_string(),
             required,
+            wanted,
             status: "skip".into(),
             python: None,
             provenance: "not required".into(),
@@ -699,7 +704,7 @@ fn doctor_report(cfg: &Config, config_path: Option<&str>) -> DoctorReport {
         // run for every role and then report the interpreter it happened to find as
         // "configured but not needed", which described neither the config nor the
         // outcome.
-        if !required && !explicit {
+        if !required && !wanted && !explicit {
             roles.push(r);
             continue;
         }
@@ -720,7 +725,12 @@ fn doctor_report(cfg: &Config, config_path: Option<&str>) -> DoctorReport {
                 ok = false;
                 r.status = "fail".into();
             }
-            (None, false) => r.status = "skip".into(),
+            (None, false) => {
+                r.status = "skip".into();
+                if wanted {
+                    r.provenance = "not found (optional)".into();
+                }
+            }
             (Some(p), _) => {
                 let interp = std::path::Path::new(p);
                 let module_refs: Vec<&str> = r.modules.iter().map(|s| s.as_str()).collect();
@@ -741,7 +751,7 @@ fn doctor_report(cfg: &Config, config_path: Option<&str>) -> DoctorReport {
                         // (docs/08_rt_im_train.md). The engine refuses to launch a DeepLC
                         // worker below `MIN_DEEPLC_VERSION`, so doctor fails here too
                         // rather than warning about a run that cannot start.
-                        if role == Role::DeepLc && required {
+                        if role == Role::DeepLc && (required || wanted) {
                             let floor = mumdia_core::constants::MIN_DEEPLC_VERSION;
                             let (ma, mi, pa) = floor;
                             match r.versions.get("deeplc") {
@@ -813,6 +823,11 @@ fn print_doctor(rep: &DoctorReport) {
     for r in &rep.roles {
         let label = &r.field;
         match (r.status.as_str(), &r.python) {
+            ("skip", _) if r.wanted => println!(
+                "  [note] {label}: no interpreter found; a library-input run keeps the imported \
+                 iRT.\n\x20        Set {}, or name one, to re-predict it with DeepLC.",
+                r.env_var
+            ),
             ("skip", _) => println!("  [skip] {label}: not needed by this config"),
             ("fail", None) => println!(
                 "  [FAIL] {label}: required by this config, and no usable interpreter was \
@@ -836,7 +851,12 @@ fn print_doctor(rep: &DoctorReport) {
                         format!("\n\x20        {}", notes.join(", "))
                     }
                 );
-                if !r.required {
+                if r.wanted {
+                    println!(
+                        "\x20        (used by a library-input run to re-predict the library iRT; \
+                         rt_im_train.library_irt = auto)"
+                    );
+                } else if !r.required {
                     println!("\x20        (configured but not needed by this config)");
                 }
                 for w in &r.warnings {
