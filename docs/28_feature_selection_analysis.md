@@ -1015,6 +1015,30 @@ the longest at 6:20); under the shipped defaults (every feature) the rescore sta
 instead of 3:31, so about 20:40 at the same 16.5 GiB peak. The six-run pooled rescore with the
 compact preset is 18 minutes at 15.9 GB for 72,344 peptides.
 
+Shipped example configuration end to end (2026-09-06, merged tree, doxy, 32 threads):
+`configs/examples/diann-library.json` with interpreters discovered through
+`MUMDIA_PYTHON_DEEPLC` / `MUMDIA_PYTHON_RESCORE`, the raw imported HYE library (51 empty
+`protein` cells filled, see the import script), HYE B01, everything else default:
+
+| stage | wall | peak tree RSS |
+|---|---|---|
+| convert | 13 s | 0.2 GB |
+| search-seed | 22 s | 6.8 GB |
+| deeplc-repredict (4.91M unique sequences, once per experiment) | 25:19 | 10.8 GB |
+| rt-im-train | 2 s | (w_rt 397 s) |
+| extract | 4:41 | **17.0 GiB** |
+| features | 4:13 | 3.0 GiB |
+| compete (default key, 23% of candidates removed) | 20 s | 3.3 GB |
+| rescore (387 features, training recipe) | 4:39 | 9.4 GB |
+| quant + report | 1:18 | 2.6 GB |
+| **whole run** | **41:08** | **17.9 GB** |
+
+58,974 stripped peptides and 58,294 target PSMs at 1%, 9,082 protein groups at 1%; manifest
+`rt_predictor = deeplc-base-model`, rescore `feature_preset all, train_neg_ratio 3, hybrid,
+warm 5`. Without the one-off re-prediction the run is about 16 minutes. For scale: the same
+file gave 56,556 peptides from the imported iRT and 60,278 from a once-fine-tuned library
+(section 4c of docs/08, seeds 1-3, fast-recipe configuration).
+
 ## 20. Caveats of the original (2026-09-04) analysis
 
 - Two HYE runs on one instrument type. The playbook rule (validate on at least two
