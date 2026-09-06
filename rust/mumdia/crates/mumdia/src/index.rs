@@ -164,7 +164,10 @@ impl Library {
                 anyhow::bail!(
                     "library column '{col}' is empty at row {row} in {precursors}; it is \
                      required, and an empty value would be carried silently into \
-                     peptidoform parsing or protein grouping"
+                     peptidoform parsing or protein grouping. DIA-NN leaves the protein \
+                     empty for unmapped peptides such as the iRT-kit standards; \
+                     scripts/import_diann_lib.py writes those as UNASSIGNED, so re-import \
+                     the library or fill the column"
                 );
             }
         }
