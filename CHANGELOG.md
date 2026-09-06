@@ -4,7 +4,7 @@ All notable changes to MuMDIA are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-`0.1.0` will be the first tagged release of the Rust engine. The superseded
+`0.1.0` is the first tagged release of the Rust engine. The superseded
 Python implementation remains available at the tag `legacy-python-v1`.
 
 Two things are versioned independently of this file and matter when reading old
@@ -14,6 +14,8 @@ results: the per-artifact Parquet schema versions in
 than a number. Both are recorded in every run's `manifest.json`.
 
 ## [Unreleased]
+
+## [0.1.0] - 2026-09-06
 
 ### Pre-release audit (2026-08-28)
 
@@ -65,6 +67,70 @@ sed -i 's/"min_frag_corr"/"gate_min_score"/; s/"group_by": *"precursor"/"group_b
 ```
 
 ### Added
+
+- **Several files pool by default.** `run` given more than one `--mzml` dispatches to
+  `run-experiment`: files provided together are rescored together (one pooled FDR),
+  quantified per run and aligned across runs (MaxLFQ). Searching files separately is
+  the opt-in, one `run` per file.
+- **Experiment-wide report.** `run-experiment` writes `peptides.tsv` and `proteins.tsv`
+  at the experiment root, selected on the experiment-wide `peptide_q_value` and
+  `pg_q_value`, with an `n_runs` column (per-run acceptances on `run_psm_q`) and one
+  `quantity_<run>` and `lfq_<run>` column per run. `mumdia report --experiment-dir`
+  rewrites the pair at another threshold. No per-run TSVs are written, because the
+  grouped q columns go to each group's experiment-wide winner only.
+- **Vendor formats.** A vendor file given as `--mzml` is converted to mzML first
+  (`convert`, `run`, `run-experiment`, `peak-census`): Thermo `.raw` through
+  ThermoRawFileParser (or msconvert), Bruker and Agilent `.d`, SCIEX `.wiff` and
+  Waters `.raw` through ProteoWizard `msconvert`. Converters are located
+  (`convert.thermo_raw_parser`, `convert.msconvert`, both `auto`, or
+  `MUMDIA_THERMO_PARSER` / `MUMDIA_MSCONVERT`), never shipped. The mzML is written
+  beside the input (or into the output directory when that is not writable) through
+  a `<name>.partial.mzML` temporary and reused on later runs when newer than its
+  source (`convert.reuse_converted`). `mumdia doctor` reports both converters and does
+  not fail for their absence. Only Thermo is exercised end to end (a 3.7 GB Astral
+  run, 6:40 through ThermoRawFileParser 2.0.0); the four msconvert formats are wired
+  and unverified, and ion mobility is discarded.
+- **Library retention time from the DeepLC base model.** `rt_im_train.library_irt`
+  (`auto`, `library`, `deeplc`) re-predicts an imported library's iRT with the DeepLC
+  base model once per experiment when a DeepLC interpreter is configured, because the
+  imported DIA-NN iRT is the worst RT source measured: AIF 10,416 peptides against
+  10,015 raw; HYE B01 58,842 against 56,556 raw over three NN seeds. The optional
+  fine-tune (`finetune_deeplc`) remains available and is still +2.4% on HYE.
+- **DeepLC 4.1.1 is a floor.** `mumdia doctor`, the sidecar launch
+  (`sidecar::require_deeplc_version`) and both worker scripts refuse an older DeepLC
+  (`mumdia_core::constants::MIN_DEEPLC_VERSION`), because the default
+  prediction-plus-calibration workflow is only sound on a base model that does not
+  memorise its anchors.
+- **Rescore handoff and training recipe.** `rescore.handoff = parquet` replaces the
+  TSV handoff to the Python worker (rescore peak 29.96 to 8.95 GB, wall 8:35 to 6:33
+  on the HYE competed table, identical identifications; mokapot still receives a PIN).
+  The worker trains on the targets at 1% plus a capped, hybrid-selected decoy sample
+  with warm refits (`train_neg_ratio 3`, `train_neg_select hybrid`,
+  `train_warm_epochs 5`): HYE A01 +1.0%, HYE B01 +2.2%, AIF -0.1%, entrapment +3.3% at
+  an unchanged spike-in FDP, at 9 to 19x less training time. `rescore.features` /
+  `features_file` project the classifier's input columns; `feature_preset = compact`
+  (114 features) is an opt-in memory lever, not a sensitivity one;
+  `max_feature_matrix_gib` turns an oversized matrix into an error at startup;
+  `MUMDIA_NN_SEED` sets the worker's base seed.
+- **Memory footprint.** Streaming Parquet readers, incremental extract output flushed
+  as isolation windows close (`extract.windows_in_flight`, auto, capped at 16), f32
+  bulk arrays and a chunked features stage. HYE B01 single run: 231 GiB and 1:07:30
+  before, 16.5 GiB and 17:52 after (compact preset; about 20:40 with every feature).
+  Six pooled HYE runs rescored in 18 minutes at 15.9 GB against 4:34:42 at 40 GB.
+- **N-terminal methionine excision** in the native digest
+  (`digest.n_term_met_excision`, default on, matching DIA-NN `--met-excision`); old
+  configurations still parse. `scripts/augment_library.py` uses the same digest to add
+  the tryptic peptides an imported library is missing.
+- **Imported libraries with empty protein cells load.** An empty `protein` (DIA-NN
+  writes the iRT-kit standards that way) is grouped as `UNASSIGNED` with a warning
+  that counts the rows; `scripts/import_diann_lib.py` writes the same group. An empty
+  `peptidoform` is still an error.
+- **Desktop application** (`desktop/`, "MuMDIA Console"): a Windows `.msi` and a Linux
+  `.AppImage` built by the release workflow, bundling the engine and `uv`. It creates
+  its own Python environment (no conda), installs ThermoRawFileParser on request,
+  locates msconvert and DIA-NN, and rescores all files provided together by default.
+  Its backend is unit-tested and both bundles were built and inspected; nobody has yet
+  clicked through the interface end to end.
 
 - The release archive verifies itself. It now carries `ci/smoke.sh`, its two helper
   scripts and `test_data/fixture.fasta`, and `release.yml` unpacks every archive it
@@ -191,6 +257,17 @@ All new quantification options default to off, so an existing configuration
 produces bit-identical results.
 
 ### Changed
+
+- **Competition key: `compete.group_by = peptidoform_charge`** (keys
+  `(pform_id, label, charge, peak_rank)`). Sibling charge states and modforms of one
+  peptide are separate precursors that compete only against their own alternative
+  peaks, the unit DIA-NN reports at and the key every benchmark in
+  `docs/28_feature_selection_analysis.md` ran under (entrapment FDP flat at
+  0.48-0.64%). The previous default `base_peptide` (renamed from `precursor`, which it
+  was not) deleted every charge and modification variant of a peptide but the highest
+  `prelim_score` before rescore: 23% of the extracted candidates on HYE B01, 46.6% on a
+  modification-rich library, at an unchanged peptide count. It stays available as an
+  explicit peptide-level population and must not be used for a PTM search.
 
 - CPU PyTorch in the three DeepLC-bearing environment sets (`env/docker-deeplc.yml`,
   `env/mumdia-deeplc.yml`, `env/console-requirements.txt`) moves from `2.12.1+cpu` to
@@ -330,11 +407,16 @@ produces bit-identical results.
   real conda environments on any pull request touching `scripts/`, `env/`,
   `tests/python/` or the Dockerfile, but no CI job runs the sidecar path end to
   end on data.
-- `run` processes a single mzML file. `run-experiment` does not call the report
-  stage, so it writes no `peptides.tsv` or `proteins.tsv`.
+- Under an experiment-wide rescore no per-run TSV report is written; per-run counts
+  come from the split scored tables on `run_psm_q`, and the experiment-wide
+  `peptides.tsv` / `proteins.tsv` are the reports.
 - `mbr.strategy` distinguishes only none from not-none; `rt_window_s`,
   `decoy_transfer` and `requant_all` are accepted but not wired.
 - `extract.retain_top_peaks > 1` writes diagnostic peak alternatives that do not
   reach features or rescoring.
-- No ion mobility support, mzML input only, and no wildcard or terminal variable
-  modifications.
+- No ion mobility support: a Bruker diaPASEF `.d` is converted to 3D spectra and
+  searched with more interference than a 4D engine would see. Vendor formats other
+  than Thermo `.raw` are converted through msconvert but have not been exercised on
+  real files. No wildcard or terminal variable modifications.
+- The desktop application has not been clicked through end to end; its backend is
+  unit-tested and both bundles were built and inspected.
