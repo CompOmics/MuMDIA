@@ -416,9 +416,15 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p desktop/src-tauri/binaries
+          mkdir -p desktop/src-tauri/binaries/scripts
           cp "rust/mumdia/target/${{ matrix.target }}/release/mumdia${{ matrix.engine_exe }}" \
              desktop/src-tauri/binaries/
+          # The Python workers the engine launches by path. `python::resolve_script_dir`
+          # accepts a directory only when it holds a worker file, so the bundle needs the
+          # files and not just the directory: the 0.1.0 installers shipped an empty
+          # `binaries/scripts/` (its README alone) and every sidecar failed at the point
+          # of use. The verification step below fails the build if this ever regresses.
+          cp scripts/*.py desktop/src-tauri/binaries/scripts/
           # uv publishes static binaries per platform; take the pinned release rather
           # than whatever `latest` happens to be on the day of a build.
           UV_VERSION=0.10.6
@@ -468,6 +474,57 @@ jobs:
             fi
           done
           ls -la
+
+      # The bundle is opened and inspected before anything is published, for the same
+      # reason the engine archives are: the file list is the only check that catches a
+      # resource glob satisfied by a README alone, which is exactly how 0.1.0 shipped
+      # without its Python workers. The engine inside is also executed, which is what
+      # caught the patchelf-broken musl build (desktop/README.md, "Packaging").
+      - name: Verify the bundle contents (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $msi = (Get-ChildItem desktop/dist/*.msi | Select-Object -First 1).FullName
+          $img = Join-Path $env:RUNNER_TEMP "msi-image"
+          # An administrative install unpacks the MSI into a directory without installing.
+          $p = Start-Process msiexec.exe -ArgumentList @("/a", "`"$msi`"", "/qn", "TARGETDIR=`"$img`"") -Wait -PassThru
+          if ($p.ExitCode -ne 0) { Write-Error "msiexec /a exited $($p.ExitCode)"; exit 1 }
+          Get-ChildItem -Recurse -File $img | ForEach-Object { $_.FullName.Substring($img.Length + 1) } | Sort-Object
+          $app = Get-ChildItem -Recurse -Directory $img |
+            Where-Object { Test-Path (Join-Path $_.FullName "mumdia-console.exe") } |
+            Select-Object -First 1
+          if (-not $app) { Write-Error "the bundle lacks mumdia-console.exe"; exit 1 }
+          $workers = @("deeplc_worker.py", "deeplc_finetune.py", "nn_rescore_worker.py",
+                       "mokapot_worker.py", "ms2pip_worker.py", "mbr_worker.py",
+                       "import_diann_lib.py", "make_reverse_decoys.py", "_lib_io.py")
+          $required = @("binaries\mumdia.exe", "binaries\uv.exe") +
+                      ($workers | ForEach-Object { "binaries\scripts\$_" })
+          foreach ($r in $required) {
+            if (-not (Test-Path (Join-Path $app.FullName $r))) { Write-Error "the bundle lacks $r"; exit 1 }
+          }
+          & (Join-Path $app.FullName "binaries\mumdia.exe") --version
+          if ($LASTEXITCODE -ne 0) { Write-Error "the bundled engine does not run"; exit 1 }
+
+      - name: Verify the bundle contents (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          app=$(ls desktop/dist/*.AppImage)
+          work=$(mktemp -d)
+          chmod +x "$app"
+          (cd "$work" && "$OLDPWD/$app" --appimage-extract > /dev/null)
+          root="$work/squashfs-root"
+          find "$root/usr" -type f | sed "s|^$root/||" | sort
+          [ -x "$root/usr/bin/mumdia-console" ] || { echo "::error::the bundle lacks mumdia-console"; exit 1; }
+          lib=$(dirname "$(find "$root/usr/lib" -type f -name mumdia -path "*/binaries/*" | head -1)")
+          [ -n "$lib" ] || { echo "::error::the bundle lacks the engine"; exit 1; }
+          [ -f "$lib/uv" ] || { echo "::error::the bundle lacks uv"; exit 1; }
+          for f in deeplc_worker.py deeplc_finetune.py nn_rescore_worker.py mokapot_worker.py \
+                   ms2pip_worker.py mbr_worker.py import_diann_lib.py make_reverse_decoys.py _lib_io.py; do
+            [ -f "$lib/scripts/$f" ] || { echo "::error::the bundle lacks binaries/scripts/$f"; exit 1; }
+          done
+          "$lib/mumdia" --version
 
       - name: Upload to release
         if: startsWith(github.ref, 'refs/tags/v')

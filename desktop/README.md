@@ -377,9 +377,16 @@ rather than a group.
 
 ## Packaging
 
-`cargo tauri build` produces an `.msi` on Windows and an `.AppImage` on Linux. Only
-two files are shipped as Tauri resources, both executables: the engine and `uv`, in
-`binaries/` beside the application.
+`cargo tauri build` produces an `.msi` on Windows and an `.AppImage` on Linux. The
+Tauri resources are the engine and `uv` in `binaries/` beside the application, and
+the Python workers in `binaries/scripts/`, all staged there by `release.yml` from the
+same checkout. The workers are not optional: the engine resolves its relative
+`sidecar_script_dir` against its own directory and accepts that directory only when
+it holds a worker file. The 0.1.0 installers shipped `binaries/scripts/` with its
+README alone, so DeepLC, the neural rescorer, mokapot and the DIA-NN import all
+failed at the point of use; `release.yml` now stages `scripts/*.py` and opens every
+bundle it built (`msiexec /a` on Windows, `--appimage-extract` on Linux) to assert
+the console, the engine, `uv` and the workers are inside and the engine runs.
 
 Everything else the application needs from the repository is compiled in with
 `include_str!`: the settings schema, and the two requirement sets. That is both
@@ -395,7 +402,9 @@ installer:
   fails the build outright with `Access is denied`.
 
 Verified on Windows: a 29 MB installer containing `mumdia-console.exe` with
-`binaries/mumdia.exe` and `binaries/uv.exe` beside it, and no `_up_` directory.
+`binaries/mumdia.exe` and `binaries/uv.exe` beside it, and no `_up_` directory. That
+inspection did not look inside `binaries/scripts/`, which is how the missing workers
+reached 0.1.0; the workflow check above does.
 
 ### The Linux engine is a GNU build, not musl
 
