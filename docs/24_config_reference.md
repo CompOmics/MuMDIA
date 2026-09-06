@@ -690,57 +690,57 @@ listed with the file it is in.
 | Variable | Side | Default in code | Read at |
 |---|---|---|---|
 | `CONDA_PREFIX` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/python.rs:187` |
-| `DEEPLC_FT_THREADS` | sidecar | `"8"` | `scripts/deeplc_finetune-covr2.py:23`, `scripts/deeplc_finetune.py:27` |
-| `MUMDIA_BREW_ITERS` | sidecar | `"20"` | `scripts/mokapot_worker-covr2.py:38`, `scripts/mokapot_worker.py:38` |
-| `MUMDIA_ENTRAPMENT_MODEL` | sidecar | `"gbm"` | `scripts/entrapment_worker-covr2.py:34`, `scripts/entrapment_worker.py:34` |
-| `MUMDIA_LR_C` | sidecar | `"1.0"` | `scripts/mokapot_worker-covr2.py:48`, `scripts/mokapot_worker.py:48` |
-| `MUMDIA_LR_MAX_ITER` | sidecar | `"1000"` | `scripts/mokapot_worker-covr2.py:49`, `scripts/mokapot_worker.py:49` |
-| `MUMDIA_MOKAPOT_WORKERS` | sidecar | `"3"` | `scripts/mokapot_worker-covr2.py:120`, `scripts/mokapot_worker.py:120` |
+| `DEEPLC_FT_THREADS` | sidecar | `"8"` | `scripts/deeplc_finetune.py:27` |
+| `MUMDIA_BREW_ITERS` | sidecar | `"20"` | `scripts/mokapot_worker.py:38` |
+| `MUMDIA_ENTRAPMENT_MODEL` | sidecar | `"gbm"` | `scripts/entrapment_worker.py:34` |
+| `MUMDIA_LR_C` | sidecar | `"1.0"` | `scripts/mokapot_worker.py:48` |
+| `MUMDIA_LR_MAX_ITER` | sidecar | `"1000"` | `scripts/mokapot_worker.py:49` |
+| `MUMDIA_MOKAPOT_WORKERS` | sidecar | `"3"` | `scripts/mokapot_worker.py:120` |
 | `MUMDIA_MSCONVERT` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/raw.rs:193` |
-| `MUMDIA_NN_ALPHA` | sidecar | `"1e-4"` | `scripts/mokapot_worker-covr2.py:90`, `scripts/mokapot_worker.py:90` |
-| `MUMDIA_NN_BATCH` | sidecar | `4096` | `scripts/nn_rescore_worker-covr2.py:268`, `scripts/nn_rescore_worker.py:280` |
-| `MUMDIA_NN_CHUNK` | sidecar | `250000` | `scripts/nn_rescore_worker-covr2.py:271`, `scripts/nn_rescore_worker.py:284` |
-| `MUMDIA_NN_DEVICE` | sidecar | `"auto"` | `scripts/nn_rescore_worker-covr2.py:279`, `scripts/nn_rescore_worker.py:292` |
-| `MUMDIA_NN_DROPOUT` | sidecar | `0.3` | `scripts/nn_rescore_worker-covr2.py:265`, `scripts/nn_rescore_worker.py:277` |
-| `MUMDIA_NN_EARLY_STOP` | sidecar | `1` | `scripts/nn_rescore_worker-covr2.py:272`, `scripts/nn_rescore_worker.py:285` |
-| `MUMDIA_NN_EARLY_STOP_TOL` | sidecar | `0.01` | `scripts/nn_rescore_worker-covr2.py:273`, `scripts/nn_rescore_worker.py:286` |
-| `MUMDIA_NN_EPOCHS` | sidecar | `25` | `scripts/nn_rescore_worker-covr2.py:263`, `scripts/nn_rescore_worker.py:275` |
-| `MUMDIA_NN_FEATURES` | sidecar | `""` | `scripts/nn_rescore_worker-covr2.py:355`, `scripts/nn_rescore_worker.py:368` |
-| `MUMDIA_NN_FOLDS` | sidecar | `3` | `scripts/nn_rescore_worker-covr2.py:257`, `scripts/nn_rescore_worker.py:263` |
-| `MUMDIA_NN_FOLD_KEYS` | sidecar | `""` | `scripts/nn_rescore_worker-covr2.py:394`, `scripts/nn_rescore_worker.py:407` |
-| `MUMDIA_NN_HIDDEN` | sidecar | `"128,64"` in nn_rescore_worker-covr2.py, nn_rescore_worker.py; `"128,64,64,32"` in mokapot_worker-covr2.py, mokapot_worker.py | `scripts/mokapot_worker-covr2.py:83`, `scripts/mokapot_worker.py:83`, `scripts/nn_rescore_worker-covr2.py:264`, +1 more |
-| `MUMDIA_NN_INIT_SAMPLE` | sidecar | `300000` | `scripts/nn_rescore_worker-covr2.py:524`, `scripts/nn_rescore_worker.py:537` |
-| `MUMDIA_NN_INIT_TOPK` | sidecar | `0` | `scripts/nn_rescore_worker-covr2.py:646`, `scripts/nn_rescore_worker.py:659` |
-| `MUMDIA_NN_ITERS` | sidecar | `5` | `scripts/nn_rescore_worker-covr2.py:262`, `scripts/nn_rescore_worker.py:274` |
-| `MUMDIA_NN_LR` | sidecar | `1e-3` | `scripts/nn_rescore_worker-covr2.py:266`, `scripts/nn_rescore_worker.py:278` |
+| `MUMDIA_NN_ALPHA` | sidecar | `"1e-4"` | `scripts/mokapot_worker.py:90` |
+| `MUMDIA_NN_BATCH` | sidecar | `4096` | `scripts/nn_rescore_worker.py:280` |
+| `MUMDIA_NN_CHUNK` | sidecar | `250000` | `scripts/nn_rescore_worker.py:284` |
+| `MUMDIA_NN_DEVICE` | sidecar | `"auto"` | `scripts/nn_rescore_worker.py:292` |
+| `MUMDIA_NN_DROPOUT` | sidecar | `0.3` | `scripts/nn_rescore_worker.py:277` |
+| `MUMDIA_NN_EARLY_STOP` | sidecar | `1` | `scripts/nn_rescore_worker.py:285` |
+| `MUMDIA_NN_EARLY_STOP_TOL` | sidecar | `0.01` | `scripts/nn_rescore_worker.py:286` |
+| `MUMDIA_NN_EPOCHS` | sidecar | `25` | `scripts/nn_rescore_worker.py:275` |
+| `MUMDIA_NN_FEATURES` | sidecar | `""` | `scripts/nn_rescore_worker.py:368` |
+| `MUMDIA_NN_FOLDS` | sidecar | `3` | `scripts/nn_rescore_worker.py:263` |
+| `MUMDIA_NN_FOLD_KEYS` | sidecar | `""` | `scripts/nn_rescore_worker.py:407` |
+| `MUMDIA_NN_HIDDEN` | sidecar | `"128,64"` in nn_rescore_worker.py; `"128,64,64,32"` in mokapot_worker.py | `scripts/mokapot_worker.py:83`, `scripts/nn_rescore_worker.py:276` |
+| `MUMDIA_NN_INIT_SAMPLE` | sidecar | `300000` | `scripts/nn_rescore_worker.py:537` |
+| `MUMDIA_NN_INIT_TOPK` | sidecar | `0` | `scripts/nn_rescore_worker.py:659` |
+| `MUMDIA_NN_ITERS` | sidecar | `5` | `scripts/nn_rescore_worker.py:274` |
+| `MUMDIA_NN_LR` | sidecar | `1e-3` | `scripts/nn_rescore_worker.py:278` |
 | `MUMDIA_NN_MARGIN_FRAC` | sidecar | `0.5` | `scripts/nn_rescore_worker.py:273` |
-| `MUMDIA_NN_MAX_ITER` | sidecar | `"200"` | `scripts/mokapot_worker-covr2.py:91`, `scripts/mokapot_worker.py:91` |
-| `MUMDIA_NN_NEG_RATIO` | sidecar | `0.0` | `scripts/nn_rescore_worker-covr2.py:261`, `scripts/nn_rescore_worker.py:267` |
+| `MUMDIA_NN_MAX_ITER` | sidecar | `"200"` | `scripts/mokapot_worker.py:91` |
+| `MUMDIA_NN_NEG_RATIO` | sidecar | `0.0` | `scripts/nn_rescore_worker.py:267` |
 | `MUMDIA_NN_NEG_SELECT` | sidecar | `"random"` | `scripts/nn_rescore_worker.py:268` |
-| `MUMDIA_NN_PREGATHER_GB` | sidecar | `8` | `scripts/nn_rescore_worker-covr2.py:274`, `scripts/nn_rescore_worker.py:287` |
+| `MUMDIA_NN_PREGATHER_GB` | sidecar | `8` | `scripts/nn_rescore_worker.py:287` |
 | `MUMDIA_NN_SEED` | sidecar | `0` | `scripts/nn_rescore_worker.py:283` |
-| `MUMDIA_NN_SEEDS` | sidecar | `1` | `scripts/nn_rescore_worker-covr2.py:270`, `scripts/nn_rescore_worker.py:282` |
-| `MUMDIA_NN_SOLVER` | sidecar | `"adam"` | `scripts/mokapot_worker-covr2.py:89`, `scripts/mokapot_worker.py:89` |
-| `MUMDIA_NN_STREAM` | sidecar | `"auto"` | `scripts/nn_rescore_worker-covr2.py:316`, `scripts/nn_rescore_worker.py:329` |
-| `MUMDIA_NN_STREAM_GB` | sidecar | `4` | `scripts/nn_rescore_worker-covr2.py:325`, `scripts/nn_rescore_worker.py:338` |
-| `MUMDIA_NN_THREADS` | both | `16` | `rust/mumdia/crates/mumdia/src/main-covr2.rs:87`, `rust/mumdia/crates/mumdia/src/main.rs:93`, `scripts/nn_rescore_worker-covr2.py:300`, +3 more |
-| `MUMDIA_NN_TRAIN_FDR` | sidecar | `0.01` | `scripts/nn_rescore_worker-covr2.py:269`, `scripts/nn_rescore_worker.py:281` |
-| `MUMDIA_NN_TRAIN_SUB` | sidecar | `0.0` | `scripts/nn_rescore_worker-covr2.py:258`, `scripts/nn_rescore_worker.py:264` |
-| `MUMDIA_NN_WARM_EPOCHS` | sidecar | `0` | `scripts/nn_rescore_worker-covr2.py:260`, `scripts/nn_rescore_worker.py:266` |
-| `MUMDIA_NN_WARM_START` | sidecar | `0` | `scripts/nn_rescore_worker-covr2.py:259`, `scripts/nn_rescore_worker.py:265` |
-| `MUMDIA_NN_WD` | sidecar | `1e-4` | `scripts/nn_rescore_worker-covr2.py:267`, `scripts/nn_rescore_worker.py:279` |
+| `MUMDIA_NN_SEEDS` | sidecar | `1` | `scripts/nn_rescore_worker.py:282` |
+| `MUMDIA_NN_SOLVER` | sidecar | `"adam"` | `scripts/mokapot_worker.py:89` |
+| `MUMDIA_NN_STREAM` | sidecar | `"auto"` | `scripts/nn_rescore_worker.py:329` |
+| `MUMDIA_NN_STREAM_GB` | sidecar | `4` | `scripts/nn_rescore_worker.py:338` |
+| `MUMDIA_NN_THREADS` | both | `16` | `rust/mumdia/crates/mumdia/src/main.rs:93`, `scripts/nn_rescore_worker.py:313`, `scripts/nn_rescore_worker.py:314` |
+| `MUMDIA_NN_TRAIN_FDR` | sidecar | `0.01` | `scripts/nn_rescore_worker.py:281` |
+| `MUMDIA_NN_TRAIN_SUB` | sidecar | `0.0` | `scripts/nn_rescore_worker.py:264` |
+| `MUMDIA_NN_WARM_EPOCHS` | sidecar | `0` | `scripts/nn_rescore_worker.py:266` |
+| `MUMDIA_NN_WARM_START` | sidecar | `0` | `scripts/nn_rescore_worker.py:265` |
+| `MUMDIA_NN_WD` | sidecar | `1e-4` | `scripts/nn_rescore_worker.py:279` |
 | `MUMDIA_PYTHON` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/python.rs:178` |
 | `MUMDIA_PYTHON_DEEPLC` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/python.rs:177` |
 | `MUMDIA_PYTHON_MBR` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/python.rs:177` |
 | `MUMDIA_PYTHON_MS2PIP` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/python.rs:177` |
 | `MUMDIA_PYTHON_RESCORE` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/python.rs:177` |
-| `MUMDIA_RESCORE_MODEL` | both | `"nn"` | `rust/mumdia/crates/mumdia/src/stages/rescore-covr2.rs:236`, `rust/mumdia/crates/mumdia/src/stages/rescore.rs:320`, `scripts/mokapot_worker-covr2.py:181`, +3 more |
+| `MUMDIA_RESCORE_MODEL` | both | `"nn"` | `rust/mumdia/crates/mumdia/src/stages/rescore.rs:320`, `scripts/mokapot_worker.py:181`, `scripts/mokapot_worker.py:37` |
 | `MUMDIA_THERMO_PARSER` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/raw.rs:171` |
-| `MUMDIA_XGB_DEPTH` | sidecar | `"6"` | `scripts/mokapot_worker-covr2.py:63`, `scripts/mokapot_worker.py:63` |
-| `MUMDIA_XGB_JOBS` | sidecar | `"0"` | `scripts/mokapot_worker-covr2.py:68`, `scripts/mokapot_worker.py:68` |
-| `MUMDIA_XGB_LR` | sidecar | `"0.1"` | `scripts/mokapot_worker-covr2.py:64`, `scripts/mokapot_worker.py:64` |
-| `MUMDIA_XGB_TREES` | sidecar | `"200"` | `scripts/mokapot_worker-covr2.py:62`, `scripts/mokapot_worker.py:62` |
-| `OMP_NUM_THREADS` | both | `16` | `rust/mumdia/crates/mumdia/src/main-covr2.rs:87`, `rust/mumdia/crates/mumdia/src/main.rs:93`, `scripts/nn_rescore_worker-covr2.py:303`, +3 more |
+| `MUMDIA_XGB_DEPTH` | sidecar | `"6"` | `scripts/mokapot_worker.py:63` |
+| `MUMDIA_XGB_JOBS` | sidecar | `"0"` | `scripts/mokapot_worker.py:68` |
+| `MUMDIA_XGB_LR` | sidecar | `"0.1"` | `scripts/mokapot_worker.py:64` |
+| `MUMDIA_XGB_TREES` | sidecar | `"200"` | `scripts/mokapot_worker.py:62` |
+| `OMP_NUM_THREADS` | both | `16` | `rust/mumdia/crates/mumdia/src/main.rs:93`, `scripts/nn_rescore_worker.py:316`, `scripts/nn_rescore_worker.py:317` |
 | `PATH` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/raw.rs:293` |
 | `VIRTUAL_ENV` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/python.rs:187` |
 
@@ -755,25 +755,25 @@ one exception noted in its own help text: it sets `MUMDIA_NN_THREADS` and
 
 | Variable | Set by | Value | Site |
 |---|---|---|---|
-| `KMP_DUPLICATE_LIB_OK` | sidecar | `"TRUE"` | `scripts/deeplc_finetune-covr2.py:24`, `scripts/deeplc_finetune.py:28` |
-| `MKL_NUM_THREADS` | sidecar | `"1"` | `scripts/deeplc_finetune-covr2.py:27`, `scripts/deeplc_finetune.py:31` |
-| `MUMDIA_NN_FOLDS` | engine | `p.cfg.folds.to_string()` | `rust/mumdia/crates/mumdia/src/stages/rescore-covr2.rs:1126`, `rust/mumdia/crates/mumdia/src/stages/rescore.rs:1322` |
-| `MUMDIA_NN_FOLD_KEYS` | engine | `&foldkeys` | `rust/mumdia/crates/mumdia/src/stages/rescore-covr2.rs:1129`, `rust/mumdia/crates/mumdia/src/stages/rescore.rs:1349` |
-| `MUMDIA_NN_ITERS` | engine | `p.cfg.num_iter.to_string()` | `rust/mumdia/crates/mumdia/src/stages/rescore-covr2.rs:1127`, `rust/mumdia/crates/mumdia/src/stages/rescore.rs:1323` |
+| `KMP_DUPLICATE_LIB_OK` | sidecar | `"TRUE"` | `scripts/deeplc_finetune.py:28` |
+| `MKL_NUM_THREADS` | sidecar | `"1"` | `scripts/deeplc_finetune.py:31` |
+| `MUMDIA_NN_FOLDS` | engine | `p.cfg.folds.to_string()` | `rust/mumdia/crates/mumdia/src/stages/rescore.rs:1322` |
+| `MUMDIA_NN_FOLD_KEYS` | engine | `&foldkeys` | `rust/mumdia/crates/mumdia/src/stages/rescore.rs:1349` |
+| `MUMDIA_NN_ITERS` | engine | `p.cfg.num_iter.to_string()` | `rust/mumdia/crates/mumdia/src/stages/rescore.rs:1323` |
 | `MUMDIA_NN_MARGIN_FRAC` | engine | `p.cfg.train_margin_frac.to_string()` | `rust/mumdia/crates/mumdia/src/stages/rescore.rs:1347` |
 | `MUMDIA_NN_NEG_RATIO` | engine | `p.cfg.train_neg_ratio.to_string()` | `rust/mumdia/crates/mumdia/src/stages/rescore.rs:1328` |
 | `MUMDIA_NN_NEG_SELECT` | engine | `match p.cfg.train_neg_select { mumdia_core::config::NegSelect::Random => "random", mumdia_core::config::NegSelect::Margin => "margin", mumdia_core::config::NegSelect::Hybrid => "hybrid", }` | `rust/mumdia/crates/mumdia/src/stages/rescore.rs:1329` |
 | `MUMDIA_NN_SEEDS` | engine | `p.cfg.seeds.max(1).to_string()` | `rust/mumdia/crates/mumdia/src/stages/rescore.rs:1348` |
-| `MUMDIA_NN_THREADS` | engine | `n.to_string()` | `rust/mumdia/crates/mumdia/src/main-covr2.rs:88`, `rust/mumdia/crates/mumdia/src/main.rs:94` |
-| `MUMDIA_NN_TRAIN_FDR` | engine | `p.cfg.train_fdr.to_string()` | `rust/mumdia/crates/mumdia/src/stages/rescore-covr2.rs:1128`, `rust/mumdia/crates/mumdia/src/stages/rescore.rs:1324` |
+| `MUMDIA_NN_THREADS` | engine | `n.to_string()` | `rust/mumdia/crates/mumdia/src/main.rs:94` |
+| `MUMDIA_NN_TRAIN_FDR` | engine | `p.cfg.train_fdr.to_string()` | `rust/mumdia/crates/mumdia/src/stages/rescore.rs:1324` |
 | `MUMDIA_NN_TRAIN_SUB` | engine | `p.cfg.train_subsample.to_string()` | `rust/mumdia/crates/mumdia/src/stages/rescore.rs:1337` |
 | `MUMDIA_NN_WARM_EPOCHS` | engine | `p.cfg.train_warm_epochs.to_string()` | `rust/mumdia/crates/mumdia/src/stages/rescore.rs:1346` |
 | `MUMDIA_NN_WARM_START` | engine | `if p.cfg.train_warm_epochs > 0 { "1" } else { "0" }` | `rust/mumdia/crates/mumdia/src/stages/rescore.rs:1338` |
-| `NUMEXPR_NUM_THREADS` | sidecar | `"1"` | `scripts/deeplc_finetune-covr2.py:28`, `scripts/deeplc_finetune.py:32` |
-| `OMP_NUM_THREADS` | both | `"1"` in deeplc_finetune-covr2.py, deeplc_finetune.py; `n.to_string()` in main-covr2.rs, main.rs | `rust/mumdia/crates/mumdia/src/main-covr2.rs:88`, `rust/mumdia/crates/mumdia/src/main.rs:94`, `scripts/deeplc_finetune-covr2.py:25` |
-| `OPENBLAS_NUM_THREADS` | sidecar | `"1"` | `scripts/deeplc_finetune-covr2.py:26`, `scripts/deeplc_finetune.py:30` |
-| `PYTHONIOENCODING` | engine | `"utf-8"` | `rust/mumdia/crates/mumdia/src/sidecar-covr2.rs:249`, `rust/mumdia/crates/mumdia/src/sidecar.rs:317` |
-| `PYTHONUTF8` | engine | `"1"` | `rust/mumdia/crates/mumdia/src/sidecar-covr2.rs:249`, `rust/mumdia/crates/mumdia/src/sidecar.rs:317`, `rust/mumdia/crates/mumdia/src/stages/rescore-covr2.rs:1120` |
+| `NUMEXPR_NUM_THREADS` | sidecar | `"1"` | `scripts/deeplc_finetune.py:32` |
+| `OMP_NUM_THREADS` | both | `"1"` in deeplc_finetune.py; `n.to_string()` in main.rs | `rust/mumdia/crates/mumdia/src/main.rs:94`, `scripts/deeplc_finetune.py:29` |
+| `OPENBLAS_NUM_THREADS` | sidecar | `"1"` | `scripts/deeplc_finetune.py:30` |
+| `PYTHONIOENCODING` | engine | `"utf-8"` | `rust/mumdia/crates/mumdia/src/sidecar.rs:317` |
+| `PYTHONUTF8` | engine | `"1"` | `rust/mumdia/crates/mumdia/src/sidecar.rs:317`, `rust/mumdia/crates/mumdia/src/stages/rescore.rs:1078`, `rust/mumdia/crates/mumdia/src/stages/rescore.rs:1316` |
 
 ## Unresolved by the generator
 
