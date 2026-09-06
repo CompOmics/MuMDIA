@@ -438,7 +438,7 @@ nothing downstream of `convert` knows a vendor file was involved.
 | mzML | none | supported |
 | Thermo `.raw` (file) | ThermoRawFileParser, or msconvert | **exercised end to end** (doxy, 2026-09-06: a 3.7 GB Astral `.raw` through `mumdia convert --mzml x.raw`, ThermoRawFileParser 2.0.0 found by `auto`, 6:40 and 4.4 GB for the converter, 3.4 GB mzML renamed into place beside the input, reused by the next run in 1.3 s; `peak-census` on the same `.raw` likewise) |
 | Bruker `.d` (dir) | msconvert | wired, unverified; **ion mobility is discarded** |
-| SCIEX `.wiff` / `.wiff2` | msconvert | wired, unverified |
+| SCIEX `.wiff` / `.wiff2` | msconvert | wired, unverified; a `.wiff` needs its `.wiff.scan` companion beside it, and the engine names that file when msconvert fails without it |
 | Agilent `.d` (dir) | msconvert | wired, unverified |
 | Waters `.raw` (dir) | msconvert | wired, unverified |
 
@@ -446,7 +446,11 @@ nothing downstream of `convert` knows a vendor file was involved.
 discovery and reuse rules are unit-tested, and the msconvert code path has been run
 end to end, but only on a Thermo `.raw`. No Bruker, SCIEX, Agilent or Waters file
 has been converted by this code. Treat those four as untested plumbing rather than
-as supported formats.
+as supported formats. The SCIEX route has been exercised as far as the converter's
+exit: the only `.wiff` files at hand (a PRIDE archive) had no `.wiff.scan` companion,
+msconvert itself refused them (`Could not open data stream. Is a required 'scan'
+file missing?`), and the engine surfaced that failure with the missing file named,
+left no partial mzML behind and reused nothing on the rerun.
 
 ### Why conversion is a child process and not a linked reader
 
