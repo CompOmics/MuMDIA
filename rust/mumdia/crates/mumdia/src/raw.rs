@@ -478,6 +478,20 @@ fn stem_is_ambiguous(dir: &Path, stem: &str, this: &Path) -> bool {
 /// otherwise (a read-only share being the ordinary case). With
 /// `convert.reuse_converted` an mzML already sitting beside the input and newer
 /// than it is used as-is.
+/// The name a conversion writes to before the rename to `out_name`.
+///
+/// The marker sits in the stem and the `.mzML` extension stays last, because both
+/// converters treat the output path's extension as theirs to fix up. ThermoRawFileParser
+/// appends `.mzML` to an output path that does not end in it: given `-b x.mzML.partial` it
+/// wrote `x.mzML.partial.mzML`, the success check found nothing at `x.mzML.partial`, and a
+/// 6:48 conversion of a 3.7 GB Astral run was reported as "exited successfully but wrote no
+/// file" and discarded (doxy, 2026-09-06). msconvert's `--outfile` has the same habit. With
+/// `x.partial.mzML` there is nothing for either to fix up.
+fn partial_name(out_name: &str) -> String {
+    let stem = out_name.strip_suffix(".mzML").unwrap_or(out_name);
+    format!("{stem}.partial.mzML")
+}
+
 pub fn ensure_mzml(
     input: &str,
     cfg: &ConvertConfig,
@@ -596,7 +610,7 @@ msconvert was not usable either: {e}"
     // `reuse_converted` accepted it on every later run: a partial acquisition searched
     // silently, for ever, presenting as unexplained low identification counts with
     // nothing in the interface to reveal it. Neither failure path removed it.
-    let tmp = out_dir.join(format!("{out_name}.partial"));
+    let tmp = out_dir.join(partial_name(&out_name));
     let _ = std::fs::remove_file(&tmp);
 
     let args: Vec<String> = if is_thermo {
@@ -624,7 +638,7 @@ msconvert was not usable either: {e}"
         a.push("-o".into());
         a.push(out_dir.to_string_lossy().into_owned());
         a.push("--outfile".into());
-        a.push(format!("{out_name}.partial"));
+        a.push(partial_name(&out_name));
         a
     };
 
@@ -751,6 +765,19 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    #[test]
+    fn the_partial_name_keeps_the_mzml_extension() {
+        // The regression this guards: `x.mzML.partial` made ThermoRawFileParser write
+        // `x.mzML.partial.mzML`, and the conversion was thrown away as "wrote no file".
+        assert_eq!(partial_name("run.mzML"), "run.partial.mzML");
+        assert_eq!(
+            partial_name("run.1a2b3c4d.mzML"),
+            "run.1a2b3c4d.partial.mzML"
+        );
+        assert!(partial_name("odd").ends_with(".mzML"));
+        assert_ne!(partial_name("run.mzML"), "run.mzML");
     }
 
     #[test]
