@@ -150,7 +150,7 @@ The mechanism is peak-group formation, not scoring. With most peaks removed,
 (`rust/mumdia/crates/mumdia-core/src/config.rs:523`, default at `:690`) cannot be
 satisfied, so real peptides never form a peak group. `mumdia audit` on the capped
 arm, restricted to peptides DIA-NN confirms are present, shows 49,105 of 78,782
-(62.3 percent) stopped at `candidate_generated` with `NO_PEAK_GROUP`, against
+(62.3 percent) stopped at `candidate_generated` with `DID_NOT_SURVIVE_EXTRACTION`, against
 only 5,380 lost to FDR and 355 lost to competition. A counterfactual replay on
 the uncapped artifact recovered 41,948 of those 49,105 (85.4 percent).
 

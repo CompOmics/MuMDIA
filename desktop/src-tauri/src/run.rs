@@ -185,7 +185,8 @@ pub struct Snapshot {
     ///
     /// The interface needs this to label the result counts: an experiment-wide
     /// rescore groups the q columns experiment-wide, so those counts are NOT per
-    /// file, and `run-experiment` writes no report at all.
+    /// file, and the `peptides.tsv` / `proteins.tsv` at the experiment root are the
+    /// experiment-wide report, not a per-run one.
     pub experiment: bool,
     /// Stop was requested. The status stays `running` until the engine has actually
     /// been reaped, and the interface shows "Stopping" meanwhile.
@@ -1361,10 +1362,10 @@ mod multifile_tests {
 
     #[test]
     fn a_pooled_experiment_reports_its_combined_table_and_says_so() {
-        // `run-experiment` writes `scored_combined.parquet` and never calls the report
-        // stage, so reading only `psms_scored.parquet.report.json` left the results
-        // screen blank after every experiment. And the counts it does yield are
-        // experiment-wide: the grouped q columns are grouped across the whole
+        // `run-experiment` writes `scored_combined.parquet` (and an experiment-wide
+        // TSV pair at the root), so reading only `psms_scored.parquet.report.json` left
+        // the results screen blank after every experiment. And the counts it does
+        // yield are experiment-wide: the grouped q columns are grouped across the whole
         // experiment, so a per-file reading of them is diluted by ~1/n_runs.
         let dir = std::env::temp_dir().join("mumdia-results-experiment");
         let _ = std::fs::remove_dir_all(&dir);
@@ -1383,7 +1384,7 @@ mod multifile_tests {
         assert!(r.experiment_wide, "a combined table is experiment-wide");
         assert_eq!(r.peptides_1pct, 7);
         assert_eq!(r.precursors_1pct, 8);
-        // And it writes no report, so neither TSV exists.
+        // This fixture wrote no TSV, so neither is reported present.
         assert!(!r.has_peptides_tsv && !r.has_proteins_tsv);
 
         // A single run's own report wins, and is not labelled experiment-wide.

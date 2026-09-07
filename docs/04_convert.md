@@ -321,10 +321,10 @@ and 80.3% of what a library-free DIA-NN 2.2.0 search reports on the same file.
 The mechanism is downstream: with most peaks gone, candidates cannot assemble
 enough distinct matched fragments to satisfy `extract.presence_min_fragments`
 (`config.rs:523`, default 3 at `config.rs:690`), so they fail peak-group
-formation and are recorded with rejection code `NO_PEAK_GROUP`
+formation and are recorded with rejection code `DID_NOT_SURVIVE_EXTRACTION`
 (`rejection.rs:62`). This was confirmed with `mumdia audit` on the capped arm,
 restricted to the peptides that same DIA-NN search reports as present (78,782
-distinct `Stripped.Sequence` at DIA-NN `Q.Value` <= 0.01): 49,105 of 78,782 (62.3%) stopped at `candidate_generated` with `NO_PEAK_GROUP`, against only
+distinct `Stripped.Sequence` at DIA-NN `Q.Value` <= 0.01): 49,105 of 78,782 (62.3%) stopped at `candidate_generated` with `DID_NOT_SURVIVE_EXTRACTION`, against only
 5,380 lost to FDR and 355 to competition, and a counterfactual replay on the
 uncapped artifact recovered 41,948 (85.4%) of them. The loss is therefore
 extraction-side, not a scoring or competition effect. See docs/09_extract.md for

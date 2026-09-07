@@ -28,12 +28,27 @@ pub fn linear_fit(xs: &[f64], ys: &[f64]) -> (f64, f64) {
 }
 
 /// A LOESS smoother evaluated on a precomputed grid for fast bulk application.
+///
+/// Outside the training range the smoother continues the local fit at the nearest
+/// boundary: the value at the boundary grid point and the slope of the local line
+/// fitted there. It used to switch to the global least-squares line the moment `x`
+/// left the grid, and the two models need not agree at the boundary: on
+/// `y = 200 + 10 x^2` over `x in [0, 9.9]` (span 0.3) the prediction jumped from
+/// 193.4 at `x = 1e-6` to 38.3 at `x = 0`, and from 1173.5 to 1018.4 at the top,
+/// discontinuities of about 155 s in retention-time units that misplaced
+/// gradient-edge peptides relative to a narrow extraction window (docs/29 #10).
 pub struct Loess {
     grid_x: Vec<f64>,
     grid_y: Vec<f64>,
-    // linear fallback for x outside the training range
+    /// The global least-squares line: the fit for fewer than four points, and the
+    /// value a degenerate local window (no spread) falls back to. Not the
+    /// extrapolation model.
     slope: f64,
     intercept: f64,
+    /// Slope of the local line at the first and at the last grid point; extrapolation
+    /// continues these from the boundary values, so `predict` is continuous there.
+    lo_slope: f64,
+    hi_slope: f64,
 }
 
 impl Loess {
@@ -62,6 +77,8 @@ impl Loess {
                 grid_y,
                 slope,
                 intercept,
+                lo_slope: slope,
+                hi_slope: slope,
             };
         }
         let k = ((span * n as f64).ceil() as usize).clamp(3, n);
@@ -69,28 +86,44 @@ impl Loess {
         let gn = grid_n.max(2);
         let mut grid_x = Vec::with_capacity(gn);
         let mut grid_y = Vec::with_capacity(gn);
+        let (mut lo_slope, mut hi_slope) = (slope, slope);
         for g in 0..gn {
             let x = lo + (hi - lo) * g as f64 / (gn - 1) as f64;
+            let (y, b) = local_linear(&sx, &sy, x, k, slope, intercept);
             grid_x.push(x);
-            grid_y.push(local_linear(&sx, &sy, x, k, slope, intercept));
+            grid_y.push(y);
+            if g == 0 {
+                lo_slope = b;
+            }
+            if g == gn - 1 {
+                hi_slope = b;
+            }
         }
         Loess {
             grid_x,
             grid_y,
             slope,
             intercept,
+            lo_slope,
+            hi_slope,
         }
     }
 
-    /// Predict at x by linear interpolation over the grid; linear extrapolation
-    /// outside the training range.
+    /// Predict at x by linear interpolation over the grid. Outside the training range
+    /// the local fit at the nearest boundary is continued (its value there and its
+    /// slope), so the prediction is continuous across the boundary; see the type's
+    /// documentation for what the previous global-line switch did.
     pub fn predict(&self, x: f64) -> f64 {
         let g = &self.grid_x;
-        if x <= g[0] || g.len() < 2 {
+        if g.len() < 2 {
             return self.slope * x + self.intercept;
         }
-        if x >= g[g.len() - 1] {
-            return self.slope * x + self.intercept;
+        if x <= g[0] {
+            return self.grid_y[0] + self.lo_slope * (x - g[0]);
+        }
+        let last = g.len() - 1;
+        if x >= g[last] {
+            return self.grid_y[last] + self.hi_slope * (x - g[last]);
         }
         let j = g.partition_point(|&gx| gx < x);
         let (x0, x1) = (g[j - 1], g[j]);
@@ -103,8 +136,16 @@ impl Loess {
 }
 
 /// Weighted local linear regression at `x0` over the `k` nearest points
-/// (tricubic weights). Falls back to the global line if degenerate.
-fn local_linear(sx: &[f64], sy: &[f64], x0: f64, k: usize, slope: f64, intercept: f64) -> f64 {
+/// (tricubic weights): the fitted value at `x0` and the slope of the local line.
+/// Falls back to the global line (value and slope) if degenerate.
+fn local_linear(
+    sx: &[f64],
+    sy: &[f64],
+    x0: f64,
+    k: usize,
+    slope: f64,
+    intercept: f64,
+) -> (f64, f64) {
     let n = sx.len();
     // find window of k nearest by walking from the insertion point
     let mut lo = sx.partition_point(|&x| x < x0);
@@ -145,11 +186,11 @@ fn local_linear(sx: &[f64], sy: &[f64], x0: f64, k: usize, slope: f64, intercept
     }
     let denom = sw * swxx - swx * swx;
     if sw < 1e-12 || denom.abs() < 1e-12 {
-        return slope * x0 + intercept;
+        return (slope * x0 + intercept, slope);
     }
     let b = (sw * swxy - swx * swy) / denom;
     let a = (swy - b * swx) / sw;
-    a + b * x0
+    (a + b * x0, b)
 }
 
 /// The p-th percentile (0..1) of the values (a copy is sorted).
@@ -182,6 +223,38 @@ mod tests {
         let lo = Loess::fit(&xs, &ys, 0.3, 50);
         // near x=5, y should be ~25
         assert!((lo.predict(5.0) - 25.0).abs() < 2.0, "{}", lo.predict(5.0));
+    }
+
+    #[test]
+    fn loess_is_continuous_at_both_training_boundaries() {
+        // The docs/29 #10 reproduction: a curved map whose global line disagrees with
+        // the local fit at both ends. The old predictor jumped by about 155 at each
+        // boundary; the continued local fit must not.
+        let xs: Vec<f64> = (0..100).map(|i| i as f64 / 10.0).collect();
+        let ys: Vec<f64> = xs.iter().map(|x| 200.0 + 10.0 * x * x).collect();
+        let lo = Loess::fit(&xs, &ys, 0.3, 50);
+        let eps = 1e-6;
+        let (a0, a1) = (lo.predict(0.0), lo.predict(eps));
+        assert!((a0 - a1).abs() < 1e-3, "lower boundary jump: {a0} vs {a1}");
+        let (b0, b1) = (lo.predict(9.9), lo.predict(9.9 - eps));
+        assert!((b0 - b1).abs() < 1e-3, "upper boundary jump: {b0} vs {b1}");
+        // Extrapolation follows the LOCAL slope, not the global line's (99 here): the
+        // curve is nearly flat at the low end and steep (about 200) at the high end.
+        let low_step = lo.predict(0.0) - lo.predict(-1.0);
+        assert!(
+            (0.0..50.0).contains(&low_step),
+            "low-end extrapolation should be nearly flat, got a step of {low_step}"
+        );
+        let high_step = lo.predict(10.9) - lo.predict(9.9);
+        assert!(
+            high_step > 120.0,
+            "high-end extrapolation should follow the steep local slope, got {high_step}"
+        );
+        // Far from the data the extrapolation is a line through the boundary value.
+        assert!(
+            (lo.predict(-2.0) - (lo.predict(0.0) - 2.0 * low_step)).abs() < 1e-9,
+            "extrapolation must be linear in x"
+        );
     }
 
     #[test]

@@ -179,9 +179,10 @@ rt_im_train.rs:136-140).
 
 `predict` is a closure (rt_im_train.rs:142-150): it returns `NaN` when calibration
 is unavailable, otherwise `loess.predict(irt)` when a LOESS model exists, else
-`slope * irt + intercept`. The linear coefficients are therefore both the primary
-map (Linear method) and the extrapolation fallback (LOESS outside its training
-range; see below).
+`slope * irt + intercept`. The linear coefficients are the primary map under the
+Linear method and, under LOESS, only the degenerate fallback (fewer than four anchors,
+or a local window without spread). Outside its training range LOESS continues the
+local fit at the nearest boundary, not the global line (see below).
 
 The math:
 
@@ -191,7 +192,7 @@ The math:
   returns `(0, mean(ys))` (a constant map, calibrate.rs:8-16); a near-zero
   denominator (all `x` equal) returns `(0, Sy/n)` (calibrate.rs:22-24).
 - **`Loess::fit`** (calibrate.rs:42-83) first computes the global linear fit as
-  the extrapolation fallback (calibrate.rs:43), sorts the points by `x`
+  the degenerate fallback (calibrate.rs:43), sorts the points by `x`
   (calibrate.rs:45-48), and if fewer than 4 points are present just fills the grid
   from the linear line (calibrate.rs:50-66). Otherwise the local window size is
   `k = clamp(ceil(span * n), 3, n)` (calibrate.rs:67) and it evaluates a
@@ -513,9 +514,9 @@ cheaper option with equal RT residuals on the one run measured here.
 | `candidate_window` | rt_im_train.rs:65-70 | Builds `(cal, lo, hi)`; returns `(NaN, -inf, +inf)` when calibrated RT or width is absent. |
 | `rt_im_train::run` | rt_im_train.rs:72-354 | The stage: join iRT, select anchors, fit, window, apply, write. |
 | `linear_fit` | calibrate.rs:6-28 | OLS `y = slope*x + intercept` with degenerate-case guards. |
-| `Loess` | calibrate.rs:31-37 | Grid-based local-linear smoother; carries a linear fallback for extrapolation. |
+| `Loess` | calibrate.rs:31-37 | Grid-based local-linear smoother; carries the boundary local slopes for extrapolation and the global line as the degenerate fallback. |
 | `Loess::fit` | calibrate.rs:42-83 | Sorts anchors, builds a `grid_n`-point local-linear grid, `k = clamp(ceil(span*n),3,n)`. |
-| `Loess::predict` | calibrate.rs:87-102 | Grid interpolation inside range, linear extrapolation outside. |
+| `Loess::predict` | calibrate.rs:87-102 | Grid interpolation inside range; outside it, the boundary grid value continued with the boundary local slope, so the map is continuous at both ends. Until docs/29 #10 it switched to the global line there, which on `y = 200 + 10x^2` (span 0.3) jumped from 193.4 to 38.3 at `x = 0` and from 1173.5 to 1018.4 at the top: about 155 s discontinuities for gradient-edge peptides. |
 | `local_linear` | calibrate.rs:107-153 | Tricubic-weighted local least squares at one point. |
 | `percentile` | calibrate.rs:156-164 | Nearest-rank percentile: sorts a copy, `rank = round(p.clamp(0,1)*(len-1))`. Not interpolated. Empty input returns 0.0. |
 | `CalibrationMethod` | config.rs:56-61 | Enum `{ Loess, Linear, None }`; default `Loess`. `None` is rejected at load. |
@@ -618,9 +619,11 @@ though the enum variant still exists.
   and therefore the whole run, non-reproducible. Treat it as an accuracy lever, not
   a deterministic default.
 - **`slope`/`intercept` are emitted in `cal.json` whenever calibration is available,
-  including under LOESS** (rt_im_train.rs:128, 286-287, 313-314). They are the LOESS
-  extrapolation fallback, not dead values; do not assume they were unused when
-  `method == "loess"`. They are serialized as `null` only when calibration is
+  including under LOESS** (rt_im_train.rs:128, 286-287, 313-314). Under LOESS they
+  are the degenerate fallback (fewer than four anchors, or a local window without
+  spread), not the extrapolation model: since docs/29 #10 the map continues the
+  boundary local fit outside the anchor range. Do not read them as the calibration
+  when `method == "loess"`. They are serialized as `null` only when calibration is
   unavailable (`n_train < 2`), since the fit is not computed in that case.
 - **`CalibrationMethod::None` still exists but is rejected** at config load
   (config.rs:1336-1342). The stage would otherwise fall through to the linear path

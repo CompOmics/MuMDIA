@@ -368,6 +368,34 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
     std::fs::create_dir_all(p.out_dir).ok();
     let d = |name: &str| format!("{}/{}", p.out_dir, name);
     let n_runs = p.mzmls.len();
+
+    // Provenance: the identity of the code, of the configuration and of the INPUTS,
+    // hashed now, before anything reads them for compute (docs/29 #15). Hashing at the
+    // end recorded whatever bytes were on disk after a multi-hour experiment, which is
+    // not necessarily what the search read; the single-run orchestrator has always
+    // hashed first, and the two now agree.
+    let mut prov = Manifest::new(cfg.canonical_json(), ch.clone());
+    for (i, m) in p.mzmls.iter().enumerate() {
+        if let (Ok(bytes), Ok(hash)) = (
+            std::fs::metadata(m).map(|x| x.len()),
+            mumdia_io::hash::blake3_file(m),
+        ) {
+            prov.record_input(&format!("mzml[{i}]"), m, bytes, hash);
+        }
+    }
+    for (role, path) in [
+        ("fasta", p.fasta),
+        ("lib_precursors", p.lib_precursors),
+        ("lib_fragments", p.lib_fragments),
+    ] {
+        let Some(path) = path else { continue };
+        if let (Ok(bytes), Ok(hash)) = (
+            std::fs::metadata(path).map(|x| x.len()),
+            mumdia_io::hash::blake3_file(path),
+        ) {
+            prov.record_input(role, path, bytes, hash);
+        }
+    }
     // Reject a bad --run-names rather than silently substituting r0..rN-1.
     //
     // The old `_ =>` arm swallowed any count mismatch with no warning, and accepted
@@ -603,6 +631,20 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         cfg: &cfg.rescore,
         config_hash: &ch,
     })?;
+    // The classifier that actually ran, from the rescore artifact report: the source of
+    // truth, since the configured enum can differ from it under a compatibility path.
+    let rescore_report: mumdia_io::report::ArtifactReport =
+        mumdia_io::json::read_json(&format!("{scored_combined}.report.json"))?;
+    let actual_rescorer = rescore_report
+        .params
+        .get("classifier")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+    let actual_rescorer_model = rescore_report
+        .model_identity
+        .clone()
+        .unwrap_or_else(|| actual_rescorer.clone());
 
     // --- optional rescuable-tier MBR transfer ---
     let scored_for_quant = if cfg.mbr.strategy != mumdia_core::config::MbrStrategy::None {
@@ -741,7 +783,15 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         "runs": names,
         "scored_combined": scored_combined,
         "scored_for_quant": scored_for_quant,
+        "rescorer": actual_rescorer,
         "mbr": format!("{:?}", cfg.mbr.strategy),
+        // Per-run quant gates on the pooled q_value whatever the configuration says
+        // (see the warning above). The configuration hash is of the configuration as
+        // given, so the substitution has to be recorded here or it is recorded nowhere.
+        "quant_q_filter": {
+            "configured": format!("{:?}", cfg.quant.q_filter),
+            "effective": format!("{:?}", qcfg.q_filter),
+        },
         "lfq": lfq,
         "peptide_quants": peptide_quants,
         "report": {
@@ -754,7 +804,8 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         },
     });
     // Provenance parity with the single-run manifest: the identity of the code, of
-    // the inputs, and of every artifact this stage produced.
+    // the inputs (hashed at the start of the run, see above), and of every artifact
+    // this stage produced.
     //
     // The per-artifact records were the gap. The experiment manifest listed output
     // PATHS in its `experiment` block and nothing else, so an experiment result had
@@ -763,28 +814,44 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
     // needed to tell whether two experiment outputs are the same data. Files written
     // by the per-run chains are not covered here (those chains do not thread a shared
     // manifest); what is covered is everything `run-experiment` itself writes.
-    let mut prov = Manifest::new(cfg.canonical_json(), ch.clone());
-    for (i, m) in p.mzmls.iter().enumerate() {
-        if let (Ok(bytes), Ok(hash)) = (
-            std::fs::metadata(m).map(|x| x.len()),
-            mumdia_io::hash::blake3_file(m),
-        ) {
-            prov.record_input(&format!("mzml[{i}]"), m, bytes, hash);
+    //
+    // Model identities reflect the path that produced the downstream artifacts, as
+    // in the single-run manifest (docs/29 #15): which RT source the library carried,
+    // which fragment predictor, and the classifier that actually ran.
+    let library_input = p.lib_precursors.is_some();
+    let rt_identity = if cfg.rt_im_train.finetune_deeplc {
+        if matches!(cfg.experiment.finetune_scope, FinetuneScope::FirstRunOnly) {
+            "deeplc-finetuned-first-run".to_string()
+        } else {
+            "deeplc-finetuned-per-run".to_string()
         }
-    }
-    for (role, path) in [
-        ("fasta", p.fasta),
-        ("lib_precursors", p.lib_precursors),
-        ("lib_fragments", p.lib_fragments),
-    ] {
-        let Some(path) = path else { continue };
-        if let (Ok(bytes), Ok(hash)) = (
-            std::fs::metadata(path).map(|x| x.len()),
-            mumdia_io::hash::blake3_file(path),
-        ) {
-            prov.record_input(role, path, bytes, hash);
-        }
-    }
+    } else if cfg
+        .rt_im_train
+        .repredicts_library_irt(library_input, cfg.predict_frag.deeplc_python.is_some())
+    {
+        "deeplc-base-model".to_string()
+    } else if library_input {
+        "imported-library".to_string()
+    } else {
+        format!("{:?}", cfg.predict_frag.rt_predictor)
+    };
+    let fragment_identity = if library_input {
+        "imported-library".to_string()
+    } else {
+        format!("{:?}", cfg.predict_frag.predictor)
+    };
+    prov.model_identities
+        .insert("rt_predictor".into(), rt_identity);
+    prov.model_identities
+        .insert("fragment_predictor".into(), fragment_identity);
+    prov.model_identities
+        .insert("rescorer".into(), actual_rescorer_model);
+    prov.model_identities.insert(
+        "feature_schema_id".into(),
+        features::feature_schema_id(&features::active_features(cfg.features.set)),
+    );
+    prov.model_identities
+        .insert("mbr".into(), format!("{:?}", cfg.mbr.strategy));
     // Recorded in a fixed order, and every record hashes its file. `Manifest`
     // stores them in a BTreeMap, so the serialised order is by logical name and
     // does not depend on this sequence.
@@ -841,12 +908,18 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         &ch,
     )?);
 
+    // The resolved configuration itself, not only its hash: a hash identifies a
+    // configuration but cannot replay one (docs/29 #15).
     let manifest = serde_json::json!({
         "mumdia_version": prov.mumdia_version,
         "git_sha": prov.git_sha,
         "commit_date": prov.commit_date,
         "cli_args": prov.cli_args,
+        "config_hash": prov.config_hash,
+        "config_json": prov.config_json,
+        "model_identities": prov.model_identities,
         "inputs": prov.inputs,
+        "inputs_hashed_at": "start",
         "artifacts": prov.artifacts,
         "experiment": manifest,
     });

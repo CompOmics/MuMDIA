@@ -71,6 +71,28 @@ pub fn run(p: ReportParams) -> Result<(u64, u64)> {
     };
     let accepted =
         |i: usize, q: &[f64]| label[i] == "target" && (is_transferred[i] || q[i] <= p.q_threshold);
+    // The acceptance basis is exported with every row (`is_transferred`, `transfer_q`),
+    // because the rule above is otherwise invisible in the TSV: a transferred row keeps
+    // its grouped q, usually 1.0, and a tighter threshold does not revoke a transfer that
+    // already passed `mbr.q_transfer` (docs/29 #19). A transfer is a peptide-level
+    // acceptance and not protein-group confidence; a group admitted through one carries
+    // the flag so a reader can tell.
+    let transfer_q: Vec<f64> = match t.f64("transfer_q") {
+        Ok(v) => v,
+        Err(_) => vec![f64::NAN; n],
+    };
+    let transfer_cells = |i: usize| -> String {
+        if is_transferred[i] {
+            let q = if transfer_q[i].is_nan() {
+                String::new()
+            } else {
+                format!("{:.6}", transfer_q[i])
+            };
+            format!("\ttrue\t{q}")
+        } else {
+            "\tfalse\t".to_string()
+        }
+    };
 
     let pep_quant: HashMap<(String, i32), f64> = match p.peptide_quant {
         Some(path) => {
@@ -111,7 +133,8 @@ pub fn run(p: ReportParams) -> Result<(u64, u64)> {
     // sequence; the header and the returned count reflect that.
     writeln!(
         w,
-        "precursor\tstripped_sequence\tcharge\tprotein\tq_value\tscore\tquantity"
+        "precursor\tstripped_sequence\tcharge\tprotein\tq_value\tscore\tquantity\t\
+         is_transferred\ttransfer_q"
     )?;
     let mut npep = 0u64;
     for &i in &order {
@@ -126,14 +149,15 @@ pub fn run(p: ReportParams) -> Result<(u64, u64)> {
         let qv = pep_quant.get(&key).copied().unwrap_or(f64::NAN);
         writeln!(
             w,
-            "{}\t{}\t{}\t{}\t{:.6}\t{:.4}\t{}",
+            "{}\t{}\t{}\t{}\t{:.6}\t{:.4}\t{}{}",
             pform[i],
             strip(&pform[i]),
             charge[i],
             protein[i],
             pep_q[i],
             score[i],
-            qcell(qv)
+            qcell(qv),
+            transfer_cells(i)
         )?;
         npep += 1;
     }
@@ -147,7 +171,10 @@ pub fn run(p: ReportParams) -> Result<(u64, u64)> {
     let mut pseen: HashSet<String> = HashSet::new();
     let prot_target = mumdia_io::table::AtomicPath::new(p.out_proteins)?;
     let mut w2 = std::io::BufWriter::new(std::fs::File::create(prot_target.tmp())?);
-    writeln!(w2, "protein_group\tq_value\tquantity")?;
+    writeln!(
+        w2,
+        "protein_group\tq_value\tquantity\tis_transferred\ttransfer_q"
+    )?;
     let mut nprot = 0u64;
     for &i in &porder {
         if !accepted(i, &pg_q) || pg[i].is_empty() {
@@ -157,7 +184,14 @@ pub fn run(p: ReportParams) -> Result<(u64, u64)> {
             continue;
         }
         let qv = prot_quant.get(&pg[i]).copied().unwrap_or(f64::NAN);
-        writeln!(w2, "{}\t{:.6}\t{}", pg[i], pg_q[i], qcell(qv))?;
+        writeln!(
+            w2,
+            "{}\t{:.6}\t{}{}",
+            pg[i],
+            pg_q[i],
+            qcell(qv),
+            transfer_cells(i)
+        )?;
         nprot += 1;
     }
     w2.flush()?;
@@ -229,6 +263,28 @@ pub fn run_experiment(p: ExperimentReportParams) -> Result<(u64, u64)> {
     };
     let accepted =
         |i: usize, q: &[f64]| label[i] == "target" && (is_transferred[i] || q[i] <= p.q_threshold);
+    // The acceptance basis is exported with every row (`is_transferred`, `transfer_q`),
+    // because the rule above is otherwise invisible in the TSV: a transferred row keeps
+    // its grouped q, usually 1.0, and a tighter threshold does not revoke a transfer that
+    // already passed `mbr.q_transfer` (docs/29 #19). A transfer is a peptide-level
+    // acceptance and not protein-group confidence; a group admitted through one carries
+    // the flag so a reader can tell.
+    let transfer_q: Vec<f64> = match t.f64("transfer_q") {
+        Ok(v) => v,
+        Err(_) => vec![f64::NAN; n],
+    };
+    let transfer_cells = |i: usize| -> String {
+        if is_transferred[i] {
+            let q = if transfer_q[i].is_nan() {
+                String::new()
+            } else {
+                format!("{:.6}", transfer_q[i])
+            };
+            format!("\ttrue\t{q}")
+        } else {
+            "\tfalse\t".to_string()
+        }
+    };
 
     // Runs in which each precursor / protein group was identified on its own per-run FDR.
     let mut pep_runs: HashMap<(String, i32), Vec<bool>> = HashMap::new();
@@ -305,6 +361,7 @@ pub fn run_experiment(p: ExperimentReportParams) -> Result<(u64, u64)> {
             write!(w, "\tquantity_{name}")?;
         }
     }
+    write!(w, "\tis_transferred\ttransfer_q")?;
     writeln!(w)?;
     let mut npep = 0u64;
     for &i in &order {
@@ -330,6 +387,7 @@ pub fn run_experiment(p: ExperimentReportParams) -> Result<(u64, u64)> {
         for m in &pep_quant {
             write!(w, "\t{}", qcell(m.get(&key).copied().unwrap_or(f64::NAN)))?;
         }
+        write!(w, "{}", transfer_cells(i))?;
         writeln!(w)?;
         npep += 1;
     }
@@ -349,6 +407,7 @@ pub fn run_experiment(p: ExperimentReportParams) -> Result<(u64, u64)> {
             write!(w2, "\tlfq_{name}")?;
         }
     }
+    write!(w2, "\tis_transferred\ttransfer_q")?;
     writeln!(w2)?;
     let mut nprot = 0u64;
     for &i in &porder {
@@ -371,6 +430,7 @@ pub fn run_experiment(p: ExperimentReportParams) -> Result<(u64, u64)> {
                 write!(w2, "\t{}", qcell(*x))?;
             }
         }
+        write!(w2, "{}", transfer_cells(i))?;
         writeln!(w2)?;
         nprot += 1;
     }
@@ -510,7 +570,7 @@ mod tests {
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(
             lines[0],
-            "precursor\tstripped_sequence\tcharge\tprotein\tq_value\tscore\tn_runs\tquantity_a\tquantity_b"
+            "precursor\tstripped_sequence\tcharge\tprotein\tq_value\tscore\tn_runs\tquantity_a\tquantity_b\tis_transferred\ttransfer_q"
         );
         assert_eq!(lines.len(), 3, "header plus two precursors:\n{text}");
         assert!(
@@ -531,7 +591,10 @@ mod tests {
 
         let prot = std::fs::read_to_string(&proteins).unwrap();
         let plines: Vec<&str> = prot.lines().collect();
-        assert_eq!(plines[0], "protein_group\tq_value\tn_runs\tlfq_a\tlfq_b");
+        assert_eq!(
+            plines[0],
+            "protein_group\tq_value\tn_runs\tlfq_a\tlfq_b\tis_transferred\ttransfer_q"
+        );
         assert_eq!(
             plines.len(),
             2,
@@ -642,11 +705,13 @@ mod tests {
             "stripped sequence missing:\n{text}"
         );
         // Quantity is empty when no quant table was supplied, not zero: absence of
-        // a measurement is not a measurement of zero.
+        // a measurement is not a measurement of zero. Nothing here is a transfer.
         let data_line = text.lines().nth(1).unwrap();
-        assert!(
-            data_line.ends_with('\t'),
-            "expected an empty quantity cell: {data_line:?}"
+        let cells: Vec<&str> = data_line.split('\t').collect();
+        assert_eq!(
+            (cells[6], cells[7], cells[8]),
+            ("", "false", ""),
+            "expected an empty quantity cell and no transfer: {data_line:?}"
         );
 
         let prot = std::fs::read_to_string(&proteins).unwrap();
@@ -654,6 +719,121 @@ mod tests {
         assert!(!prot.contains("DECOY_PG1"));
         // An empty protein_group must not become a row.
         assert_eq!(prot.lines().count(), 2, "header plus one group:\n{prot}");
+    }
+
+    /// The same table after `mumdia mbr`: the above-threshold target is an accepted
+    /// transfer (`is_transferred`, with the transfer q the worker accepted it at).
+    fn scored_table_with_transfer() -> String {
+        let path = tmp("scored_mbr.parquet");
+        write_table(
+            &path,
+            vec![
+                Col::Str(
+                    "peptidoform".into(),
+                    vec![
+                        "PEPTIDEK".into(),
+                        "M[Oxidation]EGVDGHK".into(),
+                        "DECOY_KEDITPEP".into(),
+                        "LATEPEPTIDEK".into(),
+                    ],
+                ),
+                Col::I32("charge".into(), vec![2, 3, 2, 2]),
+                Col::Str(
+                    "protein".into(),
+                    vec!["P1".into(), "P2".into(), "DECOY_P1".into(), "P1".into()],
+                ),
+                Col::Str(
+                    "label".into(),
+                    vec![
+                        "target".into(),
+                        "target".into(),
+                        "decoy".into(),
+                        "target".into(),
+                    ],
+                ),
+                Col::F64("peptide_q_value".into(), vec![0.001, 0.005, 0.0001, 0.5]),
+                Col::Str(
+                    "protein_group".into(),
+                    vec!["PG1".into(), "PG2".into(), "DECOY_PG1".into(), "".into()],
+                ),
+                Col::F64("pg_q_value".into(), vec![0.002, 0.9, 0.0001, 1.0]),
+                Col::F64("score".into(), vec![3.5, 2.5, 9.9, 0.1]),
+                Col::Bool("is_transferred".into(), vec![false, false, false, true]),
+                Col::F64(
+                    "transfer_q".into(),
+                    vec![f64::NAN, f64::NAN, f64::NAN, 0.004],
+                ),
+            ],
+        )
+        .unwrap();
+        path
+    }
+
+    #[test]
+    fn report_exports_the_transfer_basis_and_a_tighter_threshold_does_not_revoke_it() {
+        // docs/29 #19: the acceptance rule admits any target flagged `is_transferred`
+        // whatever its grouped q, and the TSV has to show that basis rather than a
+        // `q_value` of 0.5 next to a 1% threshold with no explanation.
+        let scored = scored_table_with_transfer();
+        let out = tmp("report_mbr");
+        std::fs::create_dir_all(&out).unwrap();
+        let peptides = format!("{out}/peptides.tsv");
+        let proteins = format!("{out}/proteins.tsv");
+        let report = |q: f64| {
+            run(ReportParams {
+                scored: &scored,
+                peptide_quant: None,
+                protein_quant: None,
+                out_peptides: &peptides,
+                out_proteins: &proteins,
+                q_threshold: q,
+            })
+            .unwrap()
+        };
+
+        let (n_pep, _) = report(0.01);
+        assert_eq!(n_pep, 3, "two confident targets plus the transfer");
+        let text = std::fs::read_to_string(&peptides).unwrap();
+        let header = text.lines().next().unwrap();
+        assert!(
+            header.ends_with("\tquantity\tis_transferred\ttransfer_q"),
+            "{header}"
+        );
+        let late = text
+            .lines()
+            .find(|l| l.starts_with("LATEPEPTIDEK"))
+            .expect("the transfer is reported");
+        let cells: Vec<&str> = late.split('\t').collect();
+        // The grouped q is preserved as it is (0.5), and the basis is next to it.
+        assert_eq!(
+            (cells[4], cells[7], cells[8]),
+            ("0.500000", "true", "0.004000")
+        );
+        let first = text.lines().nth(1).unwrap();
+        let c: Vec<&str> = first.split('\t').collect();
+        assert_eq!(
+            (c[7], c[8]),
+            ("false", ""),
+            "a scored row is not a transfer: {first}"
+        );
+
+        // Protein rows carry the same two columns; PG1 was admitted on its own q.
+        let prot = std::fs::read_to_string(&proteins).unwrap();
+        let plines: Vec<&str> = prot.lines().collect();
+        assert_eq!(
+            plines[0],
+            "protein_group\tq_value\tquantity\tis_transferred\ttransfer_q"
+        );
+        let pg: Vec<&str> = plines[1].split('\t').collect();
+        assert_eq!((pg[0], pg[3], pg[4]), ("PG1", "false", ""));
+
+        // Tighter threshold: the 0.005 target drops, the transfer stays. This is the
+        // rule the columns exist to make visible, not a new one.
+        let (n_pep, _) = report(0.001);
+        assert_eq!(n_pep, 2);
+        let text = std::fs::read_to_string(&peptides).unwrap();
+        assert!(text.contains("LATEPEPTIDEK\t"), "{text}");
+        assert!(!text.contains("M[Oxidation]EGVDGHK"), "{text}");
     }
 
     #[test]
@@ -715,7 +895,8 @@ mod tests {
         let mut quantified = 0;
         let mut empty = 0;
         for line in text.lines().skip(1) {
-            let cell = line.rsplit('\t').next().unwrap();
+            // The quantity column, by position: the transfer columns follow it.
+            let cell = line.split('\t').nth(6).unwrap();
             if cell.is_empty() {
                 empty += 1;
             } else {

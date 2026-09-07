@@ -32,12 +32,29 @@ than a number. Both are recorded in every run's `manifest.json`.
   in the top 5,000; fragment charges 79% / 21%), `HCD2021` with charge-2 fragments
   only from precursor charge 3 14,412, the DIA-NN library 21,856.
 
+- `peptides.tsv` and `proteins.tsv` (single-run and experiment-wide) carry
+  `is_transferred` and `transfer_q`, the acceptance basis of a match-between-runs row:
+  a transferred row keeps its grouped q next to the transfer q it was accepted at, a
+  tighter report threshold does not revoke a transfer that passed `mbr.q_transfer`, and a
+  protein group admitted through a transferred row carries the flag. The MBR worker's
+  augmented scored table gains `transfer_q` for it (docs/29 #19).
+- `experiment_manifest.json` records the resolved `config_json` next to its hash, the
+  `model_identities` that produced the artifacts (RT source, fragment predictor, the
+  classifier that actually ran, feature schema, MBR strategy), the configured and
+  effective `quant.q_filter`, and input hashes taken at the start of the run rather than
+  at its end (docs/29 #15).
 - Dependabot covers the desktop application's Cargo dependencies (`/desktop`), and CI
   audits `desktop/Cargo.lock` with `cargo audit` next to the engine's lockfile, with one
   documented ignore (RUSTSEC-2024-0429: glib 0.18 through Tauri 2's gtk 0.18).
 
 ### Changed
 
+- The candidate-audit rejection code `NO_PEAK_GROUP` is `DID_NOT_SURVIVE_EXTRACTION`
+  (`RejectionReason::DidNotSurviveExtraction`). The audit assigns it to every candidate
+  with no extracted row, and `extract` does not write the per-candidate table that would
+  separate presence, matched-fraction and gate failures, so the old name claimed a cause
+  the audit cannot see (docs/29 #16). The audit table has no versioned schema; the
+  metrics JSON gains `q_unit`.
 - MS2PIP 4.2.0 in every shipped environment (`env/docker-rescore.yml`,
   `env/console-ms2pip-requirements.txt`), and `env/mumdia-deeplc.yml` now carries
   `ms2pip==4.2.0` too, so one host environment serves DeepLC, MS2PIP and the `nn_torch`
@@ -154,6 +171,20 @@ than a number. Both are recorded in every run's `manifest.json`.
     cancellation flag was written and never read. The waiter is now the only writer: it
     reads the intent after reaping the engine and publishes `cancelled`, `done` when the
     engine had already finished, or `failed`; until then the run shows "Stopping" (#14).
+- Code review D, calibration, provenance, reporting (`docs/29`, findings 10, 15, 16, 19):
+  - LOESS retention-time calibration switched to the global least-squares line the
+    moment a query left the anchor range, while the grid just inside used the local fit,
+    and the two need not agree: on `y = 200 + 10x^2` (span 0.3) the prediction jumped
+    from 193.4 at `x = 1e-6` to 38.3 at `x = 0`, and from 1173.5 to 1018.4 at the top,
+    about 155 s discontinuities that misplaced gradient-edge peptides relative to their
+    extraction window. The map now continues the boundary local fit (its value and
+    slope) outside the range, and is continuous at both ends; the global line remains
+    only the degenerate fallback (#10).
+  - The candidate audit's `passed_precursor_fdr` gate and `FAILED_PRECURSOR_FDR` reason
+    read the PSM `q_value`; they read `precursor_q`, the unit the label names, with the
+    PSM q as a recorded fallback on tables without it. A pooled scored table (several
+    `source` values) is refused, because the audit keys on `candidate_id` and would
+    attribute the last run's fate to every run (#16).
 - Desktop: the digest fields on the Search screen (missed cleavages, peptide length,
   charge range, carbamidomethyl, oxidation) now reach the engine on the built-in
   library path. They were read only by the DIA-NN library build, so with the built-in

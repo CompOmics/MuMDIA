@@ -337,6 +337,10 @@ def main():
             if col in full.columns:
                 full[col] = np.minimum(full[col].to_numpy(dtype=float), tq)
         full["is_transferred"] = is_tr
+        # The q the transfer was accepted at, on the transferred rows only, so the
+        # report can print the acceptance basis next to the untouched grouped q
+        # (docs/29 #19). NaN on every other row: no transfer, no transfer q.
+        full["transfer_q"] = np.where(is_tr, tq, np.nan)
         write_engine_parquet(full, a.out_scored)
         print(f"wrote {a.out_scored} (augmented scored; {int(is_tr.sum())} rows flagged transferred)")
 

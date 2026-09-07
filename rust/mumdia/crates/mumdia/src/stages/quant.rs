@@ -2198,7 +2198,7 @@ mod tests {
 /// ran on the engine's own output: a pooled table quantified against one run's
 /// chromatograms produced one identical row per run without a word (docs/29 #1). A
 /// present column that is neither u32 nor i32 is an error now, not a shrug.
-fn pooled_source_count(ps: &TableFile, path: &str) -> Result<Option<usize>> {
+pub(crate) fn pooled_source_count(ps: &TableFile, path: &str) -> Result<Option<usize>> {
     if !ps.has_column("source") {
         return Ok(None);
     }
@@ -2213,8 +2213,8 @@ fn pooled_source_count(ps: &TableFile, path: &str) -> Result<Option<usize>> {
                 .collect::<std::collections::BTreeSet<_>>()
                 .len(),
             Err(_) => anyhow::bail!(
-                "quant: column `source` in {path} is present but neither u32 (what rescore \
-                 writes) nor i32: {u32_err:#}"
+                "column `source` in {path} is present but neither u32 (what rescore writes) \
+                 nor i32: {u32_err:#}"
             ),
         },
     };

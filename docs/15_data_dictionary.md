@@ -817,11 +817,19 @@ Each `ArtifactRecord`:
 
 Not Parquet, but these are the files most users actually read, so they are
 documented here rather than left to the source. Written by `report`
-(`stages/report.rs`), which has two call sites: inside `run` (`run.rs:484`) and
-the `mumdia report` handler (`main.rs:798`). `run-experiment` never calls it, so
-an experiment output tree contains neither TSV at any level; take per-run counts
-from the per-run split `scored.parquet` tables on `run_psm_q`, or invoke
-`mumdia report` yourself.
+(`stages/report.rs`): `report::run` inside `run` and the `mumdia report` handler,
+and `report::run_experiment` inside `run-experiment` (also `mumdia report
+--experiment-dir`), which writes one experiment-wide pair at the experiment root
+with an `n_runs` column and one quantity column per run and no per-run TSVs; take
+per-run counts from the per-run split `scored.parquet` tables on `run_psm_q`.
+
+**Acceptance rule, both writers.** A row is written when it is a target and either
+its grouped q is at or under the threshold or it is flagged `is_transferred` by
+`mumdia mbr`. The two columns `is_transferred` and `transfer_q` export that basis
+(docs/29 #19): a transferred row keeps its grouped q, which is usually 1.0, and a
+tighter `--q` does not revoke a transfer that already passed `mbr.q_transfer`. A
+transfer is a peptide-level acceptance, not protein-group confidence; a protein group
+admitted through a transferred row carries the flag so the reader can tell.
 
 Values are formatted for reading, not for analysis: `q_value` is printed to six
 decimals, `score` to four, and `quantity` to one
@@ -843,6 +851,8 @@ the best q (`report.rs:90,105-108`). Targets only, filtered on
 | `q_value` | `peptide_q_value` | **base-peptide** q, six decimals |
 | `score` | `score` | rescorer score, four decimals |
 | `quantity` | `peptide_quant.parquet` joined on `(peptidoform, charge)` | empty when the precursor was not quantifiable or no `--peptide-quant` was passed (`report.rs:39-45,61-72`) |
+| `is_transferred` | `is_transferred` (`mumdia mbr`), `false` without it | `true` when the row was admitted as a match-between-runs transfer rather than on its q |
+| `transfer_q` | `transfer_q` (`mumdia mbr`) | the transfer q the row was accepted at, six decimals; empty on every other row |
 
 The row unit and the filter column deliberately disagree, and this is the single
 most common misreading of MuMDIA output: rows are precursors
@@ -861,6 +871,8 @@ with a non-empty group, filtered on `pg_q_value <= --q` (`report.rs:137`).
 | `protein_group` | `protein_group` | accession set as grouped by rescore |
 | `q_value` | `pg_q_value` | protein-group q, six decimals |
 | `quantity` | `protein_group_quant.parquet` joined on `protein_group` | empty when not quantifiable or no `--protein-quant` was passed |
+| `is_transferred` | `is_transferred` of the admitting row | `true` when the group entered through a transferred peptide row; a transfer is not protein-group confidence |
+| `transfer_q` | `transfer_q` of the admitting row | empty unless `is_transferred` |
 
 Both grouped q columns (`peptide_q_value`, `pg_q_value`) are written only to each
 group's single winning row, so under an experiment-wide rescore the grouping is

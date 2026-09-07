@@ -27,7 +27,7 @@ is the source of truth if it has moved.
 | Two runs of the same command give slightly different identification counts | A nondeterministic opt-in path is on: DeepLC fine-tune (no seed) or the PyTorch NN rescorer (approximately reproducible) | Accept the trade for the ID gain, or leave those paths off; set `MUMDIA_NN_SEEDS > 1` to average out NN variance |
 | Peptidoforms silently get iRT 0.0 | DeepLC returned no iRT for some peptidoforms; they are anchored at 0.0 with a warning | Check the DeepLC env and the `n_irt_missing` warning; unmatched peptidoforms are a known foot-gun |
 | Peptide count is a fraction of expectation while the empirical decoy fraction still sits at the target | `--top-peaks-ms2` truncated the MS2 peaks at convert time and baked the truncation into the spectra artifact (`convert.rs:76-79`) | Reconvert uncapped or with a much larger cap; the right cap is acquisition-specific, not a universal preset |
-| `mumdia audit` attributes most missed peptides to `NO_PEAK_GROUP` at `candidate_generated` | The same peak truncation leaves too few surviving fragments to satisfy `extract.presence_min_fragments` (`extract.rs:1926-1931`) | Raise or remove `--top-peaks-ms2` and reconvert; do not lower `presence_min_fragments` to compensate |
+| `mumdia audit` attributes most missed peptides to `DID_NOT_SURVIVE_EXTRACTION` at `candidate_generated` | The same peak truncation leaves too few surviving fragments to satisfy `extract.presence_min_fragments` (`extract.rs:1926-1931`) | Raise or remove `--top-peaks-ms2` and reconvert; do not lower `presence_min_fragments` to compensate |
 | Every modified form of a peptide is missing from the output; `precursor_q` reports exactly 1.000 precursors per peptide | `compete.group_by = base_peptide` keys the stripped sequence, not the precursor (`compete.rs:88`), and deletes all but the top-scoring sibling before rescore (`compete.rs:319-340`) | Set `compete.group_by = peptidoform_charge` (`compete.rs:93-98`); required for any PTM search |
 | `cal.json` reports a small `rt_residual_abs_median_s` but RT windows still miss peptides | The residual is measured on the same anchors the calibration was fitted to (`rt_im_train.rs:137`, `rt_im_train.rs:177-185`), so it is in-sample | Treat it as a fit diagnostic; size external RT tolerances from an out-of-sample comparison |
 | RT windows in a PTM search behave as if the modification were absent | The imported library gave every modform of a stripped peptide the same `predicted_irt` | Check per-stripped-peptide variance of `predicted_irt` in the library; re-predict iRT per peptidoform |
@@ -222,7 +222,7 @@ The mechanism is peak-group formation, not scoring. With most peaks gone,
 `extract.presence_min_fragments` (default 3) cannot be met and the candidate
 returns no peak group (`extract.rs:1926-1931`). `mumdia audit` on the capped arm,
 restricted to peptides the reference search confirms are present, put
-49,105 of 78,782 (62.3%) at `candidate_generated` with `NO_PEAK_GROUP`; only
+49,105 of 78,782 (62.3%) at `candidate_generated` with `DID_NOT_SURVIVE_EXTRACTION`; only
 5,380 were lost to FDR and 355 to competition. A counterfactual replay against
 the uncapped artifact recovered 41,948 of those 49,105 (85.4%). Do not lower
 `presence_min_fragments` to compensate: that trades a real fragment requirement

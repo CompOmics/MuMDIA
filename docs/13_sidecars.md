@@ -155,8 +155,9 @@ code.
 - OUT `<out>.parquet`: one row per accepted transfer with
   `candidate_id, source, peptidoform, charge, protein_group, label, expected_rt,
   observed_rt, rt_delta, transfer_q` (`mbr_worker.py:254-265`). Optional
-  `--out-scored` writes the scored table with accepted transfers' `q_value`
-  lowered to `transfer_q` and an `is_transferred` flag added. Optional
+  `--out-scored` writes the scored table with accepted transfers' PSM q columns
+  lowered to `transfer_q`, an `is_transferred` flag and a `transfer_q` column (NaN
+  on non-transferred rows) added. Optional
   `--emit-transfer-targets` writes per-run `run_windows`-format tables
   (`candidate_id, rt_pred_cal, rt_lo, rt_hi, im_*`) plus a permuted-RT decoy file
   for the re-extraction tier (`mbr_worker.py:142-151`).

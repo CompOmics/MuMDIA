@@ -131,7 +131,7 @@ real peptides never form a peak group. On a 50-window Orbitrap DIA run, a cap of
 300 discarded 78.6% of all MS2 peaks and truncated 85.5% of spectra, and
 `mumdia audit` restricted to peptides DIA-NN 2.2.0 confirms are present showed
 49,105 of 78,782 (62.3%) stopped at `candidate_generated` with
-`NO_PEAK_GROUP`, versus 5,380 lost to FDR and 355 lost to competition. Peptides.tsv rows at `peptide_q_value` <= 0.01
+`DID_NOT_SURVIVE_EXTRACTION`, versus 5,380 lost to FDR and 355 lost to competition. Peptides.tsv rows at `peptide_q_value` <= 0.01
 fell from 63,237 uncapped to 25,425 at cap 300 with the decoy fraction at 0.99%
 in both arms, so this is lost sensitivity and not a changed threshold. The
 canonical treatment of the flag, including the full peak census and the cap
@@ -295,7 +295,7 @@ remaining lever, then rescore, then seed, all on faint signal.
 
 Before reading a presence/apex loss on any other run as an extraction problem,
 check the conversion cap. A cap that truncates most spectra produces exactly the
-same signature (`NO_PEAK_GROUP` at `candidate_generated`) while the cause is the
+same signature (`DID_NOT_SURVIVE_EXTRACTION` at `candidate_generated`) while the cause is the
 converted artifact, not the extraction thresholds. On the 50-window run above,
 62.3% of the confirmed-present peptides were lost this way at a cap of 300.
 

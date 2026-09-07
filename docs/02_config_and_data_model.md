@@ -385,7 +385,7 @@ the smaller `stage_order` and `Reported` never overrides a real rejection;
 | 6 | `RtPruned` / `RT_PRUNED` | candidate generation (B) |
 | 7 | `CandidateCapReached` / `CANDIDATE_CAP_REACHED` | candidate generation (B) |
 | 8 | `NoFragmentTraces` / `NO_FRAGMENT_TRACES` | extraction (C, D) |
-| 9 | `NoPeakGroup` / `NO_PEAK_GROUP` | extraction (C, D) |
+| 9 | `DidNotSurviveExtraction` / `DID_NOT_SURVIVE_EXTRACTION` (was `NoPeakGroup` / `NO_PEAK_GROUP` before docs/29 #16) | extraction (C, D) |
 | 10 | `PeakNotSelected` / `PEAK_NOT_SELECTED` | peak/peptide ranking (E) |
 | 11 | `OutcompetedByTarget` / `OUTCOMPETED_BY_TARGET` | competition (G) |
 | 12 | `OutcompetedByDecoy` / `OUTCOMPETED_BY_DECOY` | competition (G) |

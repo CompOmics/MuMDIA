@@ -334,6 +334,18 @@ def test_m5_sets_is_transferred_on_exactly_the_accepted_rows(mbr_dataset, mbr_re
     got = np.asarray(after["is_transferred"], dtype=bool)
     assert np.array_equal(got, expect)
 
+    # The acceptance basis travels with the flag: `transfer_q` is the accepted q on
+    # exactly the flagged rows and NaN everywhere else (docs/29 #19).
+    tq = np.asarray(after["transfer_q"], dtype=float)
+    assert np.array_equal(np.isfinite(tq), expect)
+    tr = read_columns(mbr_result["transferred"])
+    accepted_q = {k: q for k, q in zip(
+        zip((int(c) for c in tr["candidate_id"]), (int(s) for s in tr["source"])),
+        (float(q) for q in tr["transfer_q"]))}
+    for k, flagged, q in zip(key, expect, tq):
+        if flagged:
+            assert q == accepted_q[k]
+
 
 def test_m5_touches_only_the_matching_candidate_id_and_source(mbr_dataset, mbr_result):
     """Only the `(candidate_id, source)` row of an accepted transfer may change.
