@@ -15,8 +15,20 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-09-07
+
 ### Fixed
 
+- The 0.1.0 desktop installers (`.msi`, `.AppImage`) shipped without the Python
+  workers: `binaries/scripts/` held its README alone, because the release workflow
+  staged the engine and `uv` but never copied `scripts/*.py`, and the Tauri resource
+  glob was satisfied by the README. The engine accepts a script directory only when it
+  holds a worker file, so the installed application had no sidecars and DeepLC, the
+  neural rescorer, mokapot and the DIA-NN import failed at the point of use. The
+  workflow now stages the workers and, before uploading, unpacks every bundle it built
+  (`msiexec /a`, `--appimage-extract`) to assert the console, the engine, `uv` and each
+  worker are inside and the bundled engine runs. Found by unpacking the published
+  installers; the Setup page installs the Python environment, not these files.
 - A SCIEX `.wiff` without its `.wiff.scan` companion fails in msconvert with
   `Could not open data stream. Is a required 'scan' file missing?`, which names no
   file. The engine now appends the missing companion's path to that error. Measured on

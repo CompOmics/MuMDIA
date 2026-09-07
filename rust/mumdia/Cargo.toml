@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/mumdia-core", "crates/mumdia-io", "crates/mumdia"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 # Tracks rust-toolchain.toml, which is the only Rust version CI builds and tests.
 # A lower floor may well work, but claiming one we do not verify is a guess; lower
