@@ -185,7 +185,11 @@ than a number. Both are recorded in every run's `manifest.json`.
     groups in both arms. 208,130 of 10.88 M candidates (1.9%) received a different window,
     194,698 of them with iRT above the anchor range, which the global line had placed
     past the end of the 9,000 s run; the local fit places them at 8,578 to 9,100 s, and
-    extract accepted 454 more rows from them.
+    extract accepted 454 more rows from them. A second pair on the DeepLC 4.1.1
+    re-predicted precursor table (`w_rt` 414 s against 691 s): 48,533 stripped peptides in
+    both arms, PSM-q 1% targets 53,124 against 53,127 at the same decoy fraction, 6,519
+    protein groups in both, 0.2% of candidates with a different window. Neutral on both RT
+    sources, which is what a boundary correction should be.
   - The candidate audit's `passed_precursor_fdr` gate and `FAILED_PRECURSOR_FDR` reason
     read the PSM `q_value`; they read `precursor_q`, the unit the label names, with the
     PSM q as a recorded fallback on tables without it. A pooled scored table (several
