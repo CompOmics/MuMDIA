@@ -756,7 +756,7 @@ fn reject_null(name: &str, row: usize) -> anyhow::Error {
     )
 }
 
-/// The same contract as [`reject_null`], for a reader that walks Arrow batches itself.
+/// The same contract as `reject_null`, for a reader that walks Arrow batches itself.
 ///
 /// The streaming library loader reads fragment columns straight from record batches, and
 /// `values()` on an Arrow array is the physical buffer: it ignores the validity bitmap,
