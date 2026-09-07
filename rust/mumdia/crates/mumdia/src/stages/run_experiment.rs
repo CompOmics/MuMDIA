@@ -320,6 +320,35 @@ fn split_by_source(scored: &str, out_paths: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// Reject run names that would share a per-run output directory.
+///
+/// Compared without regard to case on every platform, not only where the filesystem
+/// is known to fold case: `RunA` and `runa` are two directories on ext4 and one
+/// directory on NTFS, APFS and most network shares, and an experiment's output may be
+/// written to any of them. Sequential runs overwrite each other's artifacts there and
+/// parallel ones interleave, with no error from either (docs/29 #5). Refusing the pair
+/// everywhere costs nothing anyone would want.
+fn check_run_names_distinct(ns: &[String]) -> Result<()> {
+    let mut seen: std::collections::BTreeMap<String, &str> = std::collections::BTreeMap::new();
+    for n in ns {
+        if let Some(prev) = seen.insert(n.to_lowercase(), n.as_str()) {
+            if prev == n {
+                anyhow::bail!(
+                    "--run-names must be unique: {n:?} is given twice; each name is a per-run \
+                     output subdirectory, so a repeat makes two runs write the same artifacts \
+                     into one directory and interleave their results with no error"
+                );
+            }
+            anyhow::bail!(
+                "--run-names {prev:?} and {n:?} differ only in case; on a case-insensitive \
+                 filesystem (Windows, macOS, most network shares) they are one per-run output \
+                 directory, so the names must be distinct without regard to case"
+            );
+        }
+    }
+    Ok(())
+}
+
 pub fn run(p: RunExperimentParams) -> Result<()> {
     let t0 = Instant::now();
     // Same contract as the single-run orchestrator, and it matters more here: an
@@ -358,16 +387,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
                     n_runs - 1
                 );
             }
-            let mut sorted = ns.to_vec();
-            sorted.sort();
-            sorted.dedup();
-            if sorted.len() != ns.len() {
-                anyhow::bail!(
-                    "--run-names must be unique: each name is a per-run output \
-                     subdirectory, so a repeat makes two runs write the same artifacts \
-                     into one directory and interleave their results with no error"
-                );
-            }
+            check_run_names_distinct(ns)?;
             if let Some(bad) = ns.iter().find(|n| {
                 n.is_empty() || n.contains('/') || n.contains('\\') || *n == "." || *n == ".."
             }) {
@@ -845,6 +865,30 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
 mod tests {
     use super::*;
     use mumdia_io::table::{write_table, Col, Table};
+
+    fn names(xs: &[&str]) -> Vec<String> {
+        xs.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn run_names_that_differ_only_in_case_are_rejected() {
+        // One directory on Windows, macOS and most network shares (docs/29 #5): the
+        // check refuses it everywhere rather than probing the destination filesystem.
+        let e = check_run_names_distinct(&names(&["RunA", "runa"]))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("differ only in case"), "{e}");
+        assert!(e.contains("RunA") && e.contains("runa"), "{e}");
+    }
+
+    #[test]
+    fn repeated_run_names_are_rejected_and_distinct_ones_pass() {
+        let e = check_run_names_distinct(&names(&["a", "b", "a"]))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("given twice"), "{e}");
+        check_run_names_distinct(&names(&["a", "b", "c_1"])).unwrap();
+    }
 
     fn tmp(name: &str) -> String {
         use std::sync::atomic::{AtomicU64, Ordering};

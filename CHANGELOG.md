@@ -32,6 +32,10 @@ than a number. Both are recorded in every run's `manifest.json`.
   in the top 5,000; fragment charges 79% / 21%), `HCD2021` with charge-2 fragments
   only from precursor charge 3 14,412, the DIA-NN library 21,856.
 
+- Dependabot covers the desktop application's Cargo dependencies (`/desktop`), and CI
+  audits `desktop/Cargo.lock` with `cargo audit` next to the engine's lockfile, with one
+  documented ignore (RUSTSEC-2024-0429: glib 0.18 through Tauri 2's gtk 0.18).
+
 ### Changed
 
 - MS2PIP 4.2.0 in every shipped environment (`env/docker-rescore.yml`,
@@ -127,6 +131,29 @@ than a number. Both are recorded in every run's `manifest.json`.
     fold assignment, splitting pairs; it hashes the base sequence, and every benchmark
     row records the code revision, fold rule, feature count, seed and training recipe
     (#20).
+- Code review C, desktop and output ownership (`docs/29`, findings 5, 13, 14):
+  - A repeated Start in the desktop application could launch a second engine into the
+    same results folder: the start flow had several awaits and no in-progress guard, and
+    the backend launched every request. A Start is now refused while one is in progress
+    or while the run the interface follows is still running, and the backend reserves a
+    run's results folder (by canonical path) before spawning the engine and releases it
+    when the run's end is published, so a request for an active folder is refused with
+    the owning run named (#5).
+  - `run-experiment --run-names` compared names case-sensitively, so `RunA` and `runa`
+    passed and addressed one directory on Windows, macOS and most network shares. Names
+    that differ only in case are rejected on every platform (#5).
+  - Desktop preflight asked the engine about converters without the request's
+    configuration, so a converter named in `convert.thermo_raw_parser` or
+    `convert.msconvert` was reported missing and the search refused, and it required
+    ThermoRawFileParser for Thermo `.raw` even when msconvert, the engine's own fallback
+    for a parser left at `auto`, was present. The probe now carries the configuration and
+    the verdict follows the engine's rule: only msconvert present runs, with a note; an
+    explicitly configured parser that is missing blocks, as it errors in the engine (#13).
+  - A cancelled desktop run could be published as failed. `cancel` and the process
+    waiter both wrote the terminal status and whichever ran second won, while the
+    cancellation flag was written and never read. The waiter is now the only writer: it
+    reads the intent after reaping the engine and publishes `cancelled`, `done` when the
+    engine had already finished, or `failed`; until then the run shows "Stopping" (#14).
 - Desktop: the digest fields on the Search screen (missed cleavages, peptide length,
   charge range, carbamidomethyl, oxidation) now reach the engine on the built-in
   library path. They were read only by the DIA-NN library build, so with the built-in

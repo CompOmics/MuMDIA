@@ -236,45 +236,37 @@ fn preflight(
         ));
     }
 
-    // A Thermo .raw with no converter fails inside the engine, after the run has
-    // been launched and the interface has switched to the progress screen. Caught
-    // here it is a sentence on the screen the user is already looking at.
-    // Every selected file, not just the first. A mixed selection where only one file
-    // needs a converter would otherwise pass preflight and fail mid-experiment, after
-    // the other runs had already been searched.
-    // Both answers come from the engine's own search (`doctor --json`), not from this
-    // application's install directory. Asking the narrow question blocked a user whose
-    // ThermoRawFileParser was on PATH, or named in the configuration, for a file the
-    // engine converts without complaint -- and the GUI was the only path that refused.
-    let thermo_missing = thermo::engine_thermo_parser().is_none();
-    let msconvert_missing = thermo::msconvert_available().is_none();
-    let mut needs_thermo: Vec<&str> = Vec::new();
-    let mut needs_msconvert: Vec<&str> = Vec::new();
-    for m in &req.mzml {
-        match thermo::needs(m) {
-            thermo::Needs::ThermoParser if thermo_missing => needs_thermo.push(m),
-            thermo::Needs::Msconvert if msconvert_missing => needs_msconvert.push(m),
-            _ => {}
+    // A vendor file with no converter fails inside the engine, after the run has been
+    // launched and the interface has switched to the progress screen. Caught here it is
+    // a sentence on the screen the user is already looking at, for every selected file,
+    // so a mixed selection cannot fail mid-experiment after the other runs were
+    // searched. The answer comes from the engine's own search (`doctor --json`) FOR
+    // THIS REQUEST'S CONFIGURATION, and the rule that turns it into a blocker or a note
+    // is the engine's (`thermo::converter_verdict`).
+    let mut warnings: Vec<String> = Vec::new();
+    match thermo::converters(req.config.as_deref()) {
+        Some(conv) => {
+            let (b, notes) = thermo::converter_verdict(&req.mzml, &conv);
+            blockers.extend(b);
+            warnings.extend(notes);
         }
-    }
-    if !needs_thermo.is_empty() {
-        blockers.push(format!(
-            "{} selected file(s) are Thermo .raw and the converter is not installed. 
-Install it on the Setup screen, or convert them to mzML yourself. 
-First: {}",
-            needs_thermo.len(),
-            needs_thermo[0]
-        ));
-    }
-    if !needs_msconvert.is_empty() {
-        blockers.push(format!(
-            "{} selected file(s) need ProteoWizard msconvert, which was not found. 
-MuMDIA does not install it; see the Setup screen. 
-First: {} ({})",
-            needs_msconvert.len(),
-            needs_msconvert[0],
-            thermo::label(needs_msconvert[0])
-        ));
+        // The engine resolved a moment ago, so this is not "no engine". Refusing on it
+        // would block a search over a probe failure; the engine reports its own
+        // conversion errors, so let it be the judge and say the check did not run.
+        None => {
+            if req
+                .mzml
+                .iter()
+                .any(|m| thermo::needs(m) != thermo::Needs::Nothing)
+            {
+                warnings.push(
+                    "Could not ask the engine which vendor converters it would use; the \
+                     selected vendor files will be converted when the search starts, or \
+                     fail there."
+                        .into(),
+                );
+            }
+        }
     }
 
     // Room on disk. The engine cannot resume, so filling the volume at hour three
@@ -299,7 +291,6 @@ First: {} ({})",
     // roomy one passed preflight and then filled the acquisition drive mid-conversion,
     // and the engine cannot resume.
     let conversion = pf::conversion_space(&req.mzml);
-    let mut warnings: Vec<String> = Vec::new();
     for w in conversion {
         warnings.push(w);
     }

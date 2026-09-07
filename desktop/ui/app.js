@@ -58,6 +58,10 @@ const state = {
   lastStatus: null,
   outDir: "",
   componentsReady: false,
+  // The engine was found at startup. Start is only ever enabled when it was.
+  engineOk: false,
+  // A Start is in progress: library build, derived configuration, preflight, launch.
+  starting: false,
   setupTimer: null,
   schema: null,
   overrides: {},
@@ -128,6 +132,7 @@ async function init() {
     const info = await invoke("engine_info");
     $("engine-line").textContent = `${info.version}\n${info.path}`;
     $("engine-line").title = `${info.version} — found via ${info.source}\n${info.path}`;
+    state.engineOk = true;
   } catch (e) {
     $("engine-line").textContent = "engine not found";
     banner($("engine-error"), String(e));
@@ -1319,13 +1324,52 @@ function renderBatchSummary() {
   }
 }
 
+// Start is asynchronous with several awaits before the run exists (library build,
+// derived configuration, preflight), and a second click during any of them launched a
+// second engine into the same results folder while the interface kept only the latest
+// run id (docs/29 #5). This guard sits before the first await and is the first line of
+// defence; the backend's reservation of active results folders is the second.
 async function start() {
+  if (state.starting) return;
+  state.starting = true;
+  $("start").disabled = true;
+  try {
+    await startSearch();
+  } finally {
+    state.starting = false;
+    $("start").disabled = !state.engineOk;
+  }
+}
+
+// The run the interface follows, when it has not reached a terminal state.
+async function activeRun() {
+  if (!state.runId) return null;
+  try {
+    const s = await invoke("run_state", { id: state.runId });
+    return s && (s.status === "running" || s.status === "starting") ? s : null;
+  } catch {
+    return null;
+  }
+}
+
+async function startSearch() {
   banner($("start-error"), "");
   const p = state.picks;
   const threads = parseInt($("threads").value, 10);
 
   if (p.mzml.length === 0) {
     banner($("start-error"), "Add at least one spectra file.");
+    return;
+  }
+
+  // The interface follows one run. Starting another while it is in progress would
+  // leave the first running with nothing showing it and nothing able to stop it.
+  const active = await activeRun();
+  if (active) {
+    banner(
+      $("start-error"),
+      `A search is still running in ${active.out_dir}. Stop it, or wait for it to finish, before starting another.`
+    );
     return;
   }
 
@@ -1577,6 +1621,11 @@ function render(s) {
     cancelled: "Search stopped",
   };
   $("prog-title").textContent = titles[s.status] || s.status;
+  // Stop was pressed but the engine has not been reaped yet: the status stays
+  // `running` until the waiter publishes the outcome, and the title says so.
+  if (s.cancel_requested && (s.status === "running" || s.status === "starting")) {
+    $("prog-title").textContent = "Stopping";
+  }
 
   const done = expected.filter(([k]) => seen.has(k)).length;
   const parts = [];
