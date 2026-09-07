@@ -17,7 +17,7 @@
     "sidecar_script_dir": "scripts"
   },
   "rescore": {
-    "classifier": "mokapot",
+    "classifier": "nn_torch",
     "python": "auto",
     "strict": true
   }

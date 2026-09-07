@@ -222,9 +222,13 @@ per-run DeepLC fine-tuning, Extended features, the loose `apex_pearson`
 extraction gate, and `nn_torch` rescoring. Building the two library tables is
 described under [Two library sources](#two-library-sources).
 
-`configs/examples/fasta-sidecars.json` is the middle option: digest a FASTA,
-predict fragment intensities with MS2PIP and retention time with DeepLC, rescore
-with mokapot.
+`configs/examples/fasta-sidecars.json` is the FASTA option: digest a FASTA,
+predict fragment intensities with MS2PIP (`HCDch2`, 12 fragments) and retention
+time with DeepLC, rescore with `nn_torch`. All three sidecars live in the one
+environment `env/mumdia-deeplc.yml` builds, so with it activated the config runs
+with its interpreters at `auto`. Measured on both HYE acquisitions in
+[`docs/28_feature_selection_analysis.md`](docs/28_feature_selection_analysis.md)
+section 22.
 
 ### Other useful invocations
 
