@@ -5,10 +5,12 @@ Usage:
 
 Input parquet columns:  id (uint32), peptidoform (ProForma string), charge (int)
 Output parquet columns: id (uint32), ion_type (str 'b'/'y'), ordinal (int),
-                        intensity (float, linear)
+                        frag_charge (int, 1 or 2), intensity (float, linear)
 
-Run with an env that has ms2pip + pyarrow. MS2PIP predicts singly-charged b/y
-intensities in log2 space; converted to linear here (2**x - 0.001, clipped at 0).
+Run with an env that has ms2pip + pyarrow. MS2PIP predicts b/y intensities in log2
+space; converted to linear here (2**x - 0.001, clipped at 0). The `*ch2` models
+(HCDch2, CIDch2) also predict the doubly charged series, which MS2PIP keys `b2`/`y2`;
+those rows carry `frag_charge` 2. Every other model emits charge 1 only.
 
 `processes` is the size of the MS2PIP worker pool. The engine passes its own thread
 count; without the argument the historical cap of min(8, cpu_count) applies. On the
@@ -27,26 +29,30 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 ION_CODES = ("b", "y")
+# MS2PIP result key -> (ion code, fragment charge), in output order.
+SERIES = (("b", 0, 1), ("y", 1, 1), ("b2", 0, 2), ("y2", 1, 2))
 
 
 def fragment_rows(results):
-    """Flatten MS2PIP results into four aligned arrays: id, ion code, ordinal, intensity.
+    """Flatten MS2PIP results into five aligned arrays: id, ion code, ordinal, fragment
+    charge, intensity.
 
     `results` yields objects with `.psm.spectrum_id` (the row id as text) and
-    `.predicted_intensity`, a dict ion -> log2-intensity array, possibly None. Rows come
-    out in the order the per-fragment loop produced them: per result, ions b then y,
-    ordinals ascending and 1-based; intensities are 2**x - 0.001 clipped at 0, computed
-    in float64 and stored as float32. A result with no predictions contributes no rows,
-    and the engine then falls back to its native intensities for that candidate.
+    `.predicted_intensity`, a dict series -> log2-intensity array, possibly None. Rows
+    come out in the order the per-fragment loop produced them: per result, series b, y,
+    then b2, y2 when the model emits them; ordinals ascending and 1-based; intensities
+    are 2**x - 0.001 clipped at 0, computed in float64 and stored as float32. A result
+    with no predictions contributes no rows, and the engine then falls back to its
+    native intensities for that candidate.
     """
-    ids, ions, ords, ints = [], [], [], []
+    ids, ions, ords, chgs, ints = [], [], [], [], []
     for r in results:
         pred = r.predicted_intensity
         if not pred:
             continue
         rid = int(r.psm.spectrum_id)
-        for code, ion in enumerate(ION_CODES):
-            arr = pred.get(ion)
+        for key, code, charge in SERIES:
+            arr = pred.get(key)
             if arr is None:
                 continue
             arr = np.asarray(arr, dtype=np.float64)
@@ -57,11 +63,13 @@ def fragment_rows(results):
             ids.append(np.full(n, rid, dtype=np.uint32))
             ions.append(np.full(n, code, dtype=np.int8))
             ords.append(np.arange(1, n + 1, dtype=np.int32))
+            chgs.append(np.full(n, charge, dtype=np.int32))
             ints.append(lin.astype(np.float32))
     if not ids:
         return (
             np.empty(0, dtype=np.uint32),
             np.empty(0, dtype=np.int8),
+            np.empty(0, dtype=np.int32),
             np.empty(0, dtype=np.int32),
             np.empty(0, dtype=np.float32),
         )
@@ -69,12 +77,13 @@ def fragment_rows(results):
         np.concatenate(ids),
         np.concatenate(ions),
         np.concatenate(ords),
+        np.concatenate(chgs),
         np.concatenate(ints),
     )
 
 
-def to_table(ids, ions, ords, ints):
-    """The four arrays as the arrow table the engine reads: plain utf8 `ion_type`, not a
+def to_table(ids, ions, ords, chgs, ints):
+    """The five arrays as the arrow table the engine reads: plain utf8 `ion_type`, not a
     dictionary column, because `TableFile::str` accepts utf8 only."""
     ion_type = pa.DictionaryArray.from_arrays(
         pa.array(ions, pa.int8()), pa.array(list(ION_CODES), pa.string())
@@ -84,6 +93,7 @@ def to_table(ids, ions, ords, ints):
             "id": pa.array(ids, pa.uint32()),
             "ion_type": ion_type,
             "ordinal": pa.array(ords, pa.int32()),
+            "frag_charge": pa.array(chgs, pa.int32()),
             "intensity": pa.array(ints, pa.float32()),
         }
     )
@@ -130,7 +140,7 @@ def main():
 
     if not parts:
         parts = [fragment_rows([])]
-    cols = [np.concatenate([p[k] for p in parts]) for k in range(4)]
+    cols = [np.concatenate([p[k] for p in parts]) for k in range(5)]
     pq.write_table(to_table(*cols), out_path)
     print(f"ms2pip_worker: {len(ids)} peptidoforms -> {n_rows} fragment rows")
 

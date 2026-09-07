@@ -481,6 +481,15 @@ pub struct PredictFragConfig {
     /// because it changes the scored transition set.
     pub charge_by_basic_residues: bool,
     pub top_n_fragments: usize,
+    /// MS2PIP model name, as `ms2pip.predict_batch` takes it (`HCD`, `HCD2021`,
+    /// `HCDch2`, `CID`, `CIDch2`, `TTOF5600`, `timsTOF2024`, ...). Single-charge models
+    /// predict the b/y series at charge 1; charge-2 fragments then take the native
+    /// heuristic, normalised per charge group. The `*ch2` models also predict the
+    /// doubly charged series, and every fragment then carries a model intensity on one
+    /// scale. Prefer `HCDch2` for an Orbitrap library whose fragments include charge 2
+    /// (`charge2_from_precursor_charge` <= 2): with `HCD2021` the heuristic charge-2
+    /// values, each group normalised to 1.0, filled 78.6% of the top-6 slots on the HYE
+    /// FASTA library and the seed search could not separate targets from decoys.
     pub ms2pip_model: String,
     /// Python executable for the MS2PIP sidecar (env with ms2pip + pyarrow).
     pub ms2pip_python: Option<String>,

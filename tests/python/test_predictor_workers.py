@@ -203,10 +203,11 @@ def test_ms2pip_worker_flattens_predictions_like_the_per_fragment_loop():
         Res("11", None),
         Res("13", {"b": np.array([]), "y": None}),
     ]
-    ids, ions, ords, ints = module.fragment_rows(results)
+    ids, ions, ords, chgs, ints = module.fragment_rows(results)
     assert ids.tolist() == [7, 7, 7, 9]
     assert ions.tolist() == [0, 0, 1, 1]
     assert ords.tolist() == [1, 2, 1, 1]
+    assert chgs.tolist() == [1, 1, 1, 1]
     expected = np.clip(
         np.power(2.0, np.array([-1.0, 0.0, -20.0, 2.0])) - 0.001, 0.0, None
     ).astype(np.float32)
@@ -214,11 +215,21 @@ def test_ms2pip_worker_flattens_predictions_like_the_per_fragment_loop():
     assert np.array_equal(ints, expected)
     assert ints[2] == 0.0, "2**-20 - 0.001 is negative and must clip to 0"
 
-    tbl = module.to_table(ids, ions, ords, ints)
+    tbl = module.to_table(ids, ions, ords, chgs, ints)
     assert tbl.schema.field("ion_type").type == pa.string()
     assert tbl.column("ion_type").to_pylist() == ["b", "b", "y", "y"]
     assert tbl.schema.field("id").type == pa.uint32()
+    assert tbl.schema.field("frag_charge").type == pa.int32()
     assert tbl.schema.field("intensity").type == pa.float32()
+
+    # A *ch2 model: the b2/y2 series follow b and y, carrying charge 2.
+    ch2 = [Res("3", {"b": np.array([0.0]), "y": np.array([1.0]),
+                     "b2": np.array([-2.0]), "y2": np.array([-1.0, -3.0])})]
+    ids, ions, ords, chgs, ints = module.fragment_rows(ch2)
+    assert ids.tolist() == [3, 3, 3, 3, 3]
+    assert ions.tolist() == [0, 1, 0, 1, 1]
+    assert ords.tolist() == [1, 1, 1, 1, 2]
+    assert chgs.tolist() == [1, 1, 2, 2, 2]
 
     empty = module.fragment_rows([])
     assert all(a.size == 0 for a in empty)

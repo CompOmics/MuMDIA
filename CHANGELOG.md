@@ -15,6 +15,20 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ## [Unreleased]
 
+### Added
+
+- MS2PIP charge-2 fragment predictions reach the library. The worker emits a
+  `frag_charge` column from the `b2`/`y2` series that the `*ch2` models (`HCDch2`,
+  `CIDch2`) predict, and `predict-frag` keys its lookup on `(ion, ordinal, charge)`.
+  When the model emitted charge-2 series, every fragment carries a model intensity on
+  one scale; single-charge models keep the previous behaviour (native heuristic for
+  charge-2 fragments, each charge group normalised to its own peak), so existing
+  `HCD2021` libraries are unchanged. Why: on the HYE FASTA library built with `HCD2021`,
+  78.6% of the top-6 fragments were charge-2 heuristics and the seed search separated
+  targets from decoys no better than chance (41.6% decoys among the top 1,000 seed
+  scores, against 0% with the DIA-NN library on the same spectra), so retention-time
+  calibration found no anchors and the run proceeded with an unbounded RT window.
+
 ### Changed
 
 - The MS2PIP worker uses the engine's thread count for its process pool (passed as a

@@ -103,7 +103,7 @@ code.
 
 **ms2pip_worker** (`sidecar.rs:42` `run_ms2pip`)
 - IN `ms2pip_in.parquet`: `id` u32, `peptidoform` str (ProForma), `charge` i32.
-- OUT `ms2pip_out.parquet`: `id` u32, `ion_type` str (`"b"`/`"y"`), `ordinal` i32
+- OUT `ms2pip_out.parquet`: `id` u32, `ion_type` str (`"b"`/`"y"`), `ordinal` i32, `frag_charge` i32 (1, or 2 for the `b2`/`y2` series of the `*ch2` models; an output without the column is read as charge 1)
   (1-based), `intensity` f32 (linear). Rust folds this into
   `HashMap<u32, HashMap<(u8 ion_byte, u16 ordinal), f32>>` (`sidecar.rs:70-76`).
 
