@@ -15,18 +15,6 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ## [Unreleased]
 
-### Changed
-
-- MS2PIP 4.2.0 in every shipped environment (`env/docker-rescore.yml`,
-  `env/console-ms2pip-requirements.txt`), and `env/mumdia-deeplc.yml` now carries
-  `ms2pip==4.2.0` too, so one host environment serves DeepLC, MS2PIP and the `nn_torch`
-  rescorer and `configs/examples/fasta-sidecars.json` runs from the shipped
-  specifications with its interpreters at `auto`. Before this no host specification
-  provided MS2PIP at all. 4.0.0 needed `sqlalchemy<2` and could not share an
-  environment with DeepLC; 4.2.0 is the version behind the FASTA-mode measurements in
-  `docs/28` section 22. The image's smoke test imports `ms2pip` in the rescore
-  environment.
-
 ### Added
 
 - MS2PIP charge-2 fragment predictions reach the library. The worker emits a
@@ -46,6 +34,15 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ### Changed
 
+- MS2PIP 4.2.0 in every shipped environment (`env/docker-rescore.yml`,
+  `env/console-ms2pip-requirements.txt`), and `env/mumdia-deeplc.yml` now carries
+  `ms2pip==4.2.0` too, so one host environment serves DeepLC, MS2PIP and the `nn_torch`
+  rescorer and `configs/examples/fasta-sidecars.json` runs from the shipped
+  specifications with its interpreters at `auto`. Before this no host specification
+  provided MS2PIP at all. 4.0.0 needed `sqlalchemy<2` and could not share an
+  environment with DeepLC; 4.2.0 is the version behind the FASTA-mode measurements in
+  `docs/28` section 22. The image's smoke test imports `ms2pip` in the rescore
+  environment.
 - `predict_frag.ms2pip_model` defaults to `HCDch2` (was `HCD`), for the reason above.
   `configs/examples/fasta-sidecars.json` and the image's `config.dia.json` set
   `top_n_fragments: 12` explicitly, the count the DIA-NN library ships and the one the
@@ -65,6 +62,22 @@ than a number. Both are recorded in every run's `manifest.json`.
   2-3, one oxidation), the old worker ran on six to eight cores of the 32 requested and
   held 13 GB of Python objects before writing. Predictions are unchanged: the same
   rows in the same order, the same float64 arithmetic stored as float32.
+
+### Fixed
+
+- Desktop: the digest fields on the Search screen (missed cleavages, peptide length,
+  charge range, carbamidomethyl, oxidation) now reach the engine on the built-in
+  library path. They were read only by the DIA-NN library build, so with the built-in
+  predictors the engine digested with the preset's values; the block also showed the
+  two modification checkboxes twice under the same ids. The run's configuration is now
+  the selected preset with the fields merged on top (`derive_config`), validated by
+  the engine before the search starts.
+- Desktop: the settings editor starts from the preset selected on the Search screen
+  instead of from the engine defaults, so "Save and use" writes the preset plus the
+  edits rather than silently dropping the preset's predictor, rescorer and interpreter
+  choices. Engine fields the schema marks `not yet wired` (the match-between-runs
+  tiers) are labelled as such and cannot be edited; list-valued settings display and
+  accept JSON.
 
 ## [0.1.1] - 2026-09-07
 

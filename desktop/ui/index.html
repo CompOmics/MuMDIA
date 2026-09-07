@@ -230,6 +230,42 @@
         </div>
 
         <div class="rule"></div>
+        <div class="card-title">Digest</div>
+        <div class="grid2">
+          <div class="row">
+            <label for="d-missed">Missed cleavages</label>
+            <input type="number" id="d-missed" value="1" min="0" max="5" />
+          </div>
+          <div class="row">
+            <label for="d-minlen">Peptide length</label>
+            <input type="number" id="d-minlen" value="7" min="4" max="60" />
+            <span class="dash">to</span>
+            <input type="number" id="d-maxlen" value="30" min="4" max="60" />
+          </div>
+          <div class="row">
+            <label for="d-minz">Charge</label>
+            <input type="number" id="d-minz" value="2" min="1" max="10" />
+            <span class="dash">to</span>
+            <input type="number" id="d-maxz" value="3" min="1" max="10" />
+          </div>
+        </div>
+        <label class="check">
+          <input type="checkbox" id="d-cam" checked />
+          Carbamidomethyl on cysteine (fixed)
+        </label>
+        <label class="check">
+          <input type="checkbox" id="d-ox" checked />
+          Oxidation of methionine (variable)
+        </label>
+        <p class="hint">
+          These decide the search space whichever way the library is built. With the
+          built-in predictors they are written into the run's configuration on top of
+          the preset; with DIA-NN they are part of the library's identity, so changing
+          one builds and caches a different library. MuMDIA imports only these two
+          modifications from a DIA-NN library; precursors carrying others are dropped.
+        </p>
+
+        <div class="rule"></div>
         <div class="card-title">How to build the library from it</div>
         <label class="check">
           <input type="radio" name="libsrc" id="libsrc-diann" value="diann" />
@@ -240,57 +276,20 @@
           </span>
         </label>
         <div id="libsrc-params" hidden>
-      <div class="grid2">
-        <div class="row">
-          <label for="d-missed">Missed cleavages</label>
-          <input type="number" id="d-missed" value="1" min="0" max="5" />
-        </div>
-        <div class="row">
-          <label for="d-threads">Threads</label>
-          <input type="number" id="d-threads" value="8" min="1" max="256" />
-        </div>
-        <div class="row">
-          <label for="d-minlen">Peptide length</label>
-          <input type="number" id="d-minlen" value="7" min="4" max="60" />
-          <span class="dash">to</span>
-          <input type="number" id="d-maxlen" value="30" min="4" max="60" />
-        </div>
-        <div class="row">
-          <label for="d-minz">Charge</label>
-          <input type="number" id="d-minz" value="2" min="1" max="10" />
-          <span class="dash">to</span>
-          <input type="number" id="d-maxz" value="4" min="1" max="10" />
-        </div>
-      </div>
-
-      <label class="check">
-        <input type="checkbox" id="d-cam" checked />
-        Carbamidomethyl on cysteine (fixed)
-      </label>
-      <label class="check">
-        <input type="checkbox" id="d-ox" checked />
-        Oxidation of methionine (variable)
-      </label>
-          <label class="check">
-            <input type="checkbox" id="d-cam" checked />
-            Carbamidomethyl on cysteine (fixed)
-          </label>
-          <label class="check">
-            <input type="checkbox" id="d-ox" checked />
-            Oxidation of methionine (variable)
-          </label>
-          <p class="hint">
-            These decide the search space and are part of the library's identity: change
-            one and a different library is built and cached. MuMDIA imports only these
-            two modifications; precursors carrying others are dropped on conversion.
-          </p>
+          <div class="grid2">
+            <div class="row">
+              <label for="d-threads">DIA-NN threads</label>
+              <input type="number" id="d-threads" value="8" min="1" max="256" />
+            </div>
+          </div>
         </div>
 
         <label class="check">
           <input type="radio" name="libsrc" id="libsrc-builtin" value="builtin" checked />
           <span>
-            <b>Built-in predictors</b> — the engine digests the FASTA itself. No DIA-NN
-            needed, and considerably less sensitive.
+            <b>Built-in predictors</b> — the engine digests the FASTA itself and predicts with
+            MS2PIP and DeepLC when the preset asks for them (the fasta-sidecars preset
+            does), native predictors otherwise. No DIA-NN needed.
           </span>
         </label>
       </div>
@@ -357,6 +356,7 @@
         <h1>All settings</h1>
         <p class="sub" id="settings-sub">
           Every engine parameter, with its default and the explanation from the source.
+          Values start from the preset selected on the Search screen.
         </p>
       </div>
       <button class="btn" id="save-settings">Save and use</button>

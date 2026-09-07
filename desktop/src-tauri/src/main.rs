@@ -365,6 +365,28 @@ fn save_settings(
     Ok(path)
 }
 
+/// The run configuration for the built-in library path: the chosen preset (or the
+/// engine defaults when none) with the Search screen's digest fields merged on top,
+/// validated by the engine like a saved settings file.
+#[tauri::command]
+fn derive_config(
+    base: Option<String>,
+    overrides: std::collections::BTreeMap<String, serde_json::Value>,
+) -> Result<String, String> {
+    let path = settings::derive("search-derived", base.as_deref(), overrides)?;
+    settings::validate(&path)?;
+    Ok(path)
+}
+
+/// The override set a preset file amounts to, so the settings editor can start from
+/// the preset selected on the Search screen instead of from the engine defaults.
+#[tauri::command]
+fn config_overrides(
+    path: String,
+) -> Result<std::collections::BTreeMap<String, serde_json::Value>, String> {
+    settings::overrides_of(&path)
+}
+
 /// Start a search. Returns the run id used by every subsequent call.
 #[tauri::command]
 fn start_run(state: tauri::State<'_, AppState>, req: run::Request) -> Result<String, String> {
@@ -580,6 +602,8 @@ fn main() {
             components_install,
             config_schema,
             save_settings,
+            derive_config,
+            config_overrides,
             peak_census,
             history,
             preflight,

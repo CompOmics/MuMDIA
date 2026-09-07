@@ -184,14 +184,24 @@ download would understate the disk cost threefold.
 
 ### Building the library from the search screen
 
-The digest parameters live on the Search screen, beside the control that consumes
-them. They used to sit on Setup in a separate "Predict a library" card while the
-radio that used them was here, so invisible state on a screen the user need never
-have opened decided the search space, the cache key, and whether the "already built"
-note was true; the `if (!el) return dflt` guards made every mismatch silent. That
-card is gone and this is the only way to build a library, which also removed the
-branch that silently overwrote a manually chosen library pair on every visit to
-Setup.
+The digest parameters live on the Search screen, beside the controls that consume
+them, and they apply to both ways of building the library. They used to sit on Setup
+in a separate "Predict a library" card while the radio that used them was here, so
+invisible state on a screen the user need never have opened decided the search space,
+the cache key, and whether the "already built" note was true; the `if (!el) return
+dflt` guards made every mismatch silent. That card is gone and this is the only way to
+build a library, which also removed the branch that silently overwrote a manually
+chosen library pair on every visit to Setup.
+
+A second version of the same mistake lived on until 2026-09-07: the fields sat inside
+the DIA-NN block and were read only by the DIA-NN library build, so with the built-in
+predictors the engine digested with the preset's values and a missed-cleavage count
+typed on the screen reached nothing (the block also carried the two modification
+checkboxes twice, with the same ids; only the first pair was read). Now the fields sit
+above the two radios, and for the built-in path `start()` asks `derive_config` for a
+run configuration that is the selected preset with the fields merged on top
+(`settings::derive`), validated by the engine like any saved settings file. `start_run`
+still receives an ordinary `--config` path and stays the one tested entry point.
 
 FASTA mode offers two ways to get a library: the engine's built-in predictors, or
 DIA-NN predicting one first. The second is the sensitive path -- the ~1,213 against
@@ -352,6 +362,16 @@ Saving writes only the difference from the defaults. `Config` is
 `deny_unknown_fields` with serde defaults, so that is a valid configuration, and it
 means a later release that improves a default still reaches someone who saved
 settings today. Every save is validated by the engine before it is offered for use.
+
+The editor starts from the preset selected on the Search screen, not from the engine
+defaults: `config_overrides` flattens the preset file into the same dotted paths the
+form uses (`settings::flatten`, the inverse of `nest`), so the saved file is the
+preset plus the edits. Until 2026-09-07 it started from the defaults, and saving with
+a preset selected silently dropped the preset's predictor, rescorer and interpreter
+choices. Selecting another preset re-seeds the form and says so. Fields the engine
+accepts but does not act on yet (the schema marks them `not yet wired`: the
+match-between-runs tiers) are shown with that label and cannot be edited; a value
+typed there would have been saved, validated and then ignored by the run.
 
 ## Testing
 
