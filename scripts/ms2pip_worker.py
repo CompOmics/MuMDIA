@@ -105,9 +105,11 @@ def main():
     charges = tbl.column("charge").to_pylist()
 
     # Rows per predict_batch call. Each call starts one worker pool, so the chunk grows
-    # with the pool: 20k rows per process keeps the pool start-up a small part of the
-    # work at any process count, and 100k is the historical floor.
-    chunk = max(100_000, 20_000 * procs)
+    # with the pool (5k rows per process, 100k floor) to keep pool start-up a small part
+    # of the work. It does not grow further because MS2PIP holds a chunk's results,
+    # with their parsed peptidoforms, in the main process until the chunk is flattened:
+    # 640k-row chunks peaked at 56 GB on the 9.8M-peptidoform HYE library.
+    chunk = max(100_000, 5_000 * procs)
     parts = []
     n_rows = 0
     for start in range(0, len(ids), chunk):
