@@ -54,7 +54,8 @@ fn a_fasta_search_runs_to_completion_and_reports_itself() {
     let _ = std::fs::remove_dir_all(&out);
 
     let req = mumdia_console::run::Request {
-        mzml,
+        mzml: vec![mzml],
+        experiment: false,
         out_dir: out.display().to_string(),
         fasta: Some(fasta),
         lib_precursors: None,
@@ -123,7 +124,8 @@ fn stopping_a_run_kills_it_and_leaves_no_temp_files() {
     let _ = std::fs::remove_dir_all(&out);
 
     let req = mumdia_console::run::Request {
-        mzml,
+        mzml: vec![mzml],
+        experiment: false,
         out_dir: out.display().to_string(),
         fasta: Some(fasta),
         lib_precursors: None,

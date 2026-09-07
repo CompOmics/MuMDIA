@@ -183,6 +183,15 @@ select { min-width: 220px; }
            animation: slide 1.4s ease-in-out infinite; }
 @keyframes slide { 0% { margin-left: -40%; } 100% { margin-left: 100%; } }
 @media (prefers-reduced-motion: reduce) { .bar > i { animation: none; width: 100%; } }
+/* The determinate variant. The shared `.bar` slides because most of what it covers
+   has no known length; a download does, so this one stops moving on its own and
+   takes its width from the reported percentage. */
+.bar.pct > i { animation: none; margin-left: 0; transition: width .25s linear; }
+@media (prefers-reduced-motion: reduce) { .bar.pct > i { transition: none; } }
+
+/* A divider inside a card, separating the "you have it" case from the "you do
+   not" case without starting a second card. */
+.rule { height: 1px; background: var(--rule); margin: 16px 0 4px; }
 
 /* ── settings editor ──────────────────────────────────────────────────── */
 input[type="search"] {
@@ -218,5 +227,58 @@ input[type="search"] {
   background: var(--sunk); border: 1px solid var(--rule);
   border-radius: 4px; padding: 1px 6px;
 }
+
+/* -- spectral libraries / DIA-NN ----------------------------------------- */
+/* A second heading inside a screen, for the part of Setup that is about
+   libraries rather than the Python components. */
+.section-h { font-size: 19px; font-weight: 650; margin: 34px 0 4px; letter-spacing: -.01em; }
+
+/* The licence notice. Warm rather than red: it is a condition to read, not an
+   error, and colouring it as a failure would teach people to dismiss it. */
+.notice {
+  background: var(--warn-soft); border: 1px solid var(--warn);
+  border-radius: var(--radius); padding: 12px 14px; margin-top: 12px;
+}
+.notice-title {
+  font-size: 11px; font-weight: 700; text-transform: uppercase;
+  letter-spacing: .06em; color: var(--warn); margin-bottom: 6px;
+}
+.notice-body { font-size: 12.5px; line-height: 1.6; margin: 0 0 10px; white-space: pre-line; }
+
+.check {
+  display: flex; align-items: flex-start; gap: 8px;
+  font-size: 12.5px; color: var(--ink-soft); line-height: 1.5;
+  margin-top: 8px; cursor: pointer;
+}
+.check input { margin: 3px 0 0; flex: none; accent-color: var(--accent); }
+
+.grid2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 0 20px; }
+.grid2 .row label { width: 108px; }
+.dash { font-size: 12.5px; color: var(--ink-faint); }
+
+/* A log pane nested inside a card, which must not repeat the card's own frame. */
+.sub-card { margin-top: 12px; background: var(--sunk); }
+
+/* -- selected spectra files ---------------------------------------------- */
+.filelist { list-style: none; margin: 10px 0 0; padding: 0; display: flex; flex-direction: column; gap: 4px; }
+.filelist li {
+  display: flex; align-items: center; gap: 10px;
+  background: var(--sunk); border: 1px solid var(--rule); border-radius: 5px;
+  padding: 5px 8px 5px 10px; font-size: 12.5px;
+}
+/* The name is what a user recognises; the path is why they can tell two apart.
+   Both are shown, the path dimmed and truncated from the left so the tail -- the
+   part that differs between plateA and plateB -- stays visible. */
+.filelist .fname { font-weight: 600; flex: none; }
+.filelist .fpath {
+  color: var(--ink-faint); font-size: 11.5px; direction: rtl; text-align: left;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; min-width: 0;
+}
+.filelist .fdrop {
+  appearance: none; border: 0; background: transparent; cursor: pointer;
+  color: var(--ink-faint); font-size: 15px; line-height: 1; padding: 2px 4px; flex: none;
+}
+.filelist .fdrop:hover { color: var(--danger); }
+.filelist .fbad { color: var(--danger); font-size: 11.5px; flex: none; }
 
 @media (prefers-reduced-motion: reduce) { * { transition: none !important; animation: none !important; } }

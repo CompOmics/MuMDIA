@@ -10,8 +10,16 @@ use mumdia_core::config::Config;
 /// Per-thread-arena allocator. The extraction accumulation allocates heavily inside
 /// rayon workers and measured only ~1.07x parallel scaling under the Windows system
 /// allocator's shared heap lock. Swapping the allocator changes no results.
+#[cfg(not(feature = "dhat-heap"))]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+/// Heap-profiling build (`--features dhat-heap`): dhat has to own the global allocator,
+/// so mimalloc steps aside. Results are unchanged; speed is not, which is why this is a
+/// build-time opt-in and not a flag.
+#[cfg(feature = "dhat-heap")]
+#[global_allocator]
+static GLOBAL: dhat::Alloc = dhat::Alloc;
 
 #[derive(Parser)]
 #[command(
@@ -94,10 +102,17 @@ fn apply_threads(threads: Option<usize>) -> Result<()> {
 enum Cmd {
     /// Read an mzML run into the normalized spectra artifact set.
     Convert {
+        /// An mzML, or a vendor file (Thermo `.raw`; Bruker/Agilent `.d`, SCIEX
+        /// `.wiff`, Waters `.raw` through msconvert), which is converted to mzML first.
         #[arg(long)]
         mzml: String,
         #[arg(long)]
         out_dir: String,
+        /// Configuration file. Only `convert.*` is read here, and it is read at all
+        /// so that `convert.thermo_raw_parser` can be set for a standalone convert
+        /// rather than only through `MUMDIA_THERMO_PARSER`.
+        #[arg(long)]
+        config: Option<String>,
         /// Limit spectra read (0 = all), for fast iteration.
         #[arg(long, default_value_t = 0)]
         max_spectra: usize,
@@ -286,14 +301,19 @@ enum Cmd {
         #[arg(long)]
         out: String,
     },
-    /// Orchestrate the full MVP pipeline on one run and write a manifest.
+    /// Orchestrate the full pipeline on one run and write a manifest. Given several
+    /// --mzml, the files are searched as ONE pooled experiment (`run-experiment`:
+    /// one combined rescore, per-run quant, cross-run LFQ), which is the default
+    /// treatment of a multi-file input; use `run-experiment` directly for run names.
     Run {
         /// FASTA to digest into the library. Omit when supplying a prebuilt
         /// library via --lib-precursors + --lib-fragments (library-input mode).
         #[arg(long)]
         fasta: Option<String>,
-        #[arg(long)]
-        mzml: String,
+        /// Spectra file. Repeat the flag for several files; they are then rescored
+        /// together as one experiment rather than searched separately.
+        #[arg(long, required = true)]
+        mzml: Vec<String>,
         #[arg(long)]
         out_dir: String,
         /// Library-input mode: consume a prebuilt precursor library (e.g. an
@@ -389,6 +409,10 @@ enum Cmd {
         /// Stop after this many spectra from the head of the file (0 = all).
         #[arg(long, default_value_t = 0)]
         max_spectra: usize,
+        /// Configuration file, read for `convert.*` so a vendor file can be converted
+        /// the same way `run` converts it.
+        #[arg(long)]
+        config: Option<String>,
     },
     /// Candidate audit: reconstruct per-candidate stage flags + earliest rejection
     /// reason across the artifact chain and write candidate_audit.parquet
@@ -419,15 +443,28 @@ enum Cmd {
         #[arg(long, default_value = "")]
         entrapment_substr: String,
     },
-    /// Write peptides.tsv + proteins.tsv from a scored PSM table.
+    /// Write peptides.tsv + proteins.tsv from a scored PSM table, or the
+    /// experiment-wide pair for a `run-experiment` output directory.
     Report {
+        /// A single run's scored table. Either this or --experiment-dir.
+        #[arg(
+            long,
+            conflicts_with = "experiment_dir",
+            required_unless_present = "experiment_dir"
+        )]
+        psms_scored: Option<String>,
+        /// A `run-experiment` output directory: rewrite its experiment-wide
+        /// peptides.tsv and proteins.tsv (one quantity column per run) from the
+        /// pooled scored table, per-run quantities and cross-run LFQ named in its
+        /// experiment_manifest.json, at another --q if wanted.
         #[arg(long)]
-        psms_scored: String,
-        #[arg(long)]
-        out_dir: String,
-        #[arg(long)]
+        experiment_dir: Option<String>,
+        /// Where the two TSVs go. Defaults to --experiment-dir in experiment mode.
+        #[arg(long, required_unless_present = "experiment_dir")]
+        out_dir: Option<String>,
+        #[arg(long, conflicts_with = "experiment_dir")]
         peptide_quant: Option<String>,
-        #[arg(long)]
+        #[arg(long, conflicts_with = "experiment_dir")]
         protein_quant: Option<String>,
         /// Reported q threshold. Defaults to `quant.q_threshold` from `--config`
         /// when that is given, otherwise 0.01. An explicit value always wins.
@@ -459,6 +496,9 @@ enum Cmd {
 /// One sidecar role, as `doctor` found it.
 #[derive(serde::Serialize)]
 struct RoleReport {
+    /// The configuration uses the role when an interpreter is available, without
+    /// requiring one (DeepLC under `rt_im_train.library_irt = auto`).
+    wanted: bool,
     /// `rescore` | `deeplc` | `ms2pip` | `mbr`
     role: String,
     /// The configuration field that names this interpreter.
@@ -501,6 +541,27 @@ struct DoctorReport {
     ok: bool,
     scripts: ScriptsReport,
     roles: Vec<RoleReport>,
+    /// The Thermo `.raw` converter, if one can be found.
+    ///
+    /// Never a failure: reading mzML needs no converter, and the great majority of
+    /// runs are mzML. It is reported so that someone who intends to search a vendor
+    /// file learns now rather than at the start of a search.
+    thermo: ConverterReport,
+    /// ProteoWizard `msconvert`, which covers every vendor format except Thermo and
+    /// is the Thermo fallback. Also never a failure.
+    msconvert: ConverterReport,
+}
+
+/// Availability of one external converter.
+#[derive(serde::Serialize)]
+struct ConverterReport {
+    /// `ok` when a converter was located, `none` when not.
+    status: String,
+    /// The configured value (`auto` or a path), so the report says what was searched.
+    configured: String,
+    path: Option<String>,
+    /// Why nothing was found, when nothing was.
+    detail: Option<String>,
 }
 
 /// Peaks-per-MS2-spectrum percentiles for one mzML.
@@ -667,6 +728,7 @@ fn doctor_report(cfg: &Config, config_path: Option<&str>) -> DoctorReport {
             Role::Mbr => cfg.mbr.python.clone(),
         };
         let required = role.required_by(&cfg);
+        let wanted = role.wanted_by(&cfg);
         let modules: Vec<String> = role.modules(&cfg).iter().map(|m| m.to_string()).collect();
         let explicit = configured
             .as_deref()
@@ -677,6 +739,7 @@ fn doctor_report(cfg: &Config, config_path: Option<&str>) -> DoctorReport {
             role: format!("{role:?}").to_lowercase(),
             field: role.field().to_string(),
             required,
+            wanted,
             status: "skip".into(),
             python: None,
             provenance: "not required".into(),
@@ -691,7 +754,7 @@ fn doctor_report(cfg: &Config, config_path: Option<&str>) -> DoctorReport {
         // run for every role and then report the interpreter it happened to find as
         // "configured but not needed", which described neither the config nor the
         // outcome.
-        if !required && !explicit {
+        if !required && !wanted && !explicit {
             roles.push(r);
             continue;
         }
@@ -712,7 +775,12 @@ fn doctor_report(cfg: &Config, config_path: Option<&str>) -> DoctorReport {
                 ok = false;
                 r.status = "fail".into();
             }
-            (None, false) => r.status = "skip".into(),
+            (None, false) => {
+                r.status = "skip".into();
+                if wanted {
+                    r.provenance = "not found (optional)".into();
+                }
+            }
             (Some(p), _) => {
                 let interp = std::path::Path::new(p);
                 let module_refs: Vec<&str> = r.modules.iter().map(|s| s.as_str()).collect();
@@ -726,16 +794,35 @@ fn doctor_report(cfg: &Config, config_path: Option<&str>) -> DoctorReport {
                             }
                         }
                         r.status = if required { "ok" } else { "note" }.into();
-                        // DeepLC below 4.1.1 changes results rather than only
-                        // performance: the 4.0.0a2 multitask preview overfits per-run
-                        // fine-tuning badly enough to invert RT-model rankings
-                        // (docs/08_rt_im_train.md).
-                        if role == Role::DeepLc && required {
-                            if let Some(v) = r.versions.get("deeplc") {
-                                if version_below(v, &[4, 1, 1]) {
+                        // DeepLC below the floor changes results rather than only
+                        // performance: the default RT workflow calibrates base-model
+                        // predictions, and the 4.0.0a2 multitask preview memorised its
+                        // anchors badly enough to invert RT-model rankings
+                        // (docs/08_rt_im_train.md). The engine refuses to launch a DeepLC
+                        // worker below `MIN_DEEPLC_VERSION`, so doctor fails here too
+                        // rather than warning about a run that cannot start.
+                        if role == Role::DeepLc && (required || wanted) {
+                            let floor = mumdia_core::constants::MIN_DEEPLC_VERSION;
+                            let (ma, mi, pa) = floor;
+                            match r.versions.get("deeplc") {
+                                Some(v)
+                                    if mumdia_core::constants::parse_version3(v)
+                                        .is_some_and(|t| t >= floor) => {}
+                                Some(v) => {
+                                    ok = false;
+                                    r.status = "fail".into();
                                     r.warnings.push(format!(
-                                        "DeepLC {v} is older than the supported floor 4.1.1; \
-                                         results, not just speed, differ"
+                                        "DeepLC {v} is older than the required {ma}.{mi}.{pa}; \
+                                         the engine refuses to launch the DeepLC workers with it \
+                                         (pip install 'deeplc>={ma}.{mi}.{pa}')"
+                                    ));
+                                }
+                                None => {
+                                    ok = false;
+                                    r.status = "fail".into();
+                                    r.warnings.push(format!(
+                                        "cannot determine the deeplc version; {ma}.{mi}.{pa} or \
+                                         newer is required"
                                     ));
                                 }
                             }
@@ -761,7 +848,39 @@ fn doctor_report(cfg: &Config, config_path: Option<&str>) -> DoctorReport {
         roles.push(r);
     }
 
-    DoctorReport { ok, scripts, roles }
+    // The converters are probed but never gate `ok`: an mzML run does not need them,
+    // and failing `doctor` for programs most configurations never call would train
+    // people to ignore this command.
+    let report_of = |r: anyhow::Result<std::path::PathBuf>, configured: &str| match r {
+        Ok(p) => ConverterReport {
+            status: "ok".into(),
+            configured: configured.to_string(),
+            path: Some(p.display().to_string()),
+            detail: None,
+        },
+        Err(e) => ConverterReport {
+            status: "none".into(),
+            configured: configured.to_string(),
+            path: None,
+            detail: Some(e.to_string()),
+        },
+    };
+    let thermo = report_of(
+        mumdia::raw::locate_parser(&cfg.convert.thermo_raw_parser),
+        &cfg.convert.thermo_raw_parser,
+    );
+    let msconvert = report_of(
+        mumdia::raw::locate_msconvert(&cfg.convert.msconvert),
+        &cfg.convert.msconvert,
+    );
+
+    DoctorReport {
+        ok,
+        scripts,
+        roles,
+        thermo,
+        msconvert,
+    }
 }
 
 /// Render the report as the prose a person reads in a terminal.
@@ -782,10 +901,37 @@ fn print_doctor(rep: &DoctorReport) {
         ),
     }
 
+    println!("vendor format converters");
+    match rep.thermo.status.as_str() {
+        "ok" => println!(
+            "  [ ok ] Thermo .raw: {} (convert.thermo_raw_parser = {})",
+            rep.thermo.path.as_deref().unwrap_or("?"),
+            rep.thermo.configured
+        ),
+        _ => println!("  [note] Thermo .raw: no ThermoRawFileParser (Apache-2.0) found."),
+    }
+    match rep.msconvert.status.as_str() {
+        "ok" => println!(
+            "  [ ok ] Bruker/SCIEX/Agilent/Waters: {} (convert.msconvert = {})",
+            rep.msconvert.path.as_deref().unwrap_or("?"),
+            rep.msconvert.configured
+        ),
+        _ => println!("  [note] Bruker/SCIEX/Agilent/Waters: no msconvert found."),
+    }
+    if rep.thermo.status != "ok" || rep.msconvert.status != "ok" {
+        println!("         A converter is needed only for that vendor's files, never for");
+        println!("         mzML. See docs/04_convert.md, \"Vendor formats\".");
+    }
+
     println!("sidecar interpreters");
     for r in &rep.roles {
         let label = &r.field;
         match (r.status.as_str(), &r.python) {
+            ("skip", _) if r.wanted => println!(
+                "  [note] {label}: no interpreter found; a library-input run keeps the imported \
+                 iRT.\n\x20        Set {}, or name one, to re-predict it with DeepLC.",
+                r.env_var
+            ),
             ("skip", _) => println!("  [skip] {label}: not needed by this config"),
             ("fail", None) => println!(
                 "  [FAIL] {label}: required by this config, and no usable interpreter was \
@@ -809,7 +955,12 @@ fn print_doctor(rep: &DoctorReport) {
                         format!("\n\x20        {}", notes.join(", "))
                     }
                 );
-                if !r.required {
+                if r.wanted {
+                    println!(
+                        "\x20        (used by a library-input run to re-predict the library iRT; \
+                         rt_im_train.library_irt = auto)"
+                    );
+                } else if !r.required {
                     println!("\x20        (configured but not needed by this config)");
                 }
                 for w in &r.warnings {
@@ -836,29 +987,6 @@ fn print_doctor(rep: &DoctorReport) {
     if rep.ok {
         println!("mumdia doctor: configuration is runnable");
     }
-}
-
-/// True when the dotted version `v` is below `floor`. Unparseable components
-/// compare as 0, so a pre-release such as `4.0.0a2` reads as 4.0.0 and stays below
-/// a 4.1.1 floor, which is the direction that matters here.
-fn version_below(v: &str, floor: &[u32]) -> bool {
-    let parts: Vec<u32> = v
-        .split(['.', '-', '+'])
-        .map(|p| {
-            p.chars()
-                .take_while(char::is_ascii_digit)
-                .collect::<String>()
-                .parse()
-                .unwrap_or(0)
-        })
-        .collect();
-    for (i, want) in floor.iter().enumerate() {
-        let got = parts.get(i).copied().unwrap_or(0);
-        if got != *want {
-            return got < *want;
-        }
-    }
-    false
 }
 
 /// Parse a config file without touching the sidecar interpreter fields.
@@ -906,6 +1034,10 @@ fn load_config(path: &Option<String>) -> Result<Config> {
 }
 
 fn main() -> Result<()> {
+    // Held for the whole process: dropping the guard is what writes dhat-heap.json into
+    // the working directory, so it must outlive the stage that is being profiled.
+    #[cfg(feature = "dhat-heap")]
+    let _dhat = dhat::Profiler::new_heap();
     let cli = Cli::parse();
     mumdia_io::init_logging_level(cli.log_filter().as_deref());
     apply_threads(cli.threads)?;
@@ -913,11 +1045,12 @@ fn main() -> Result<()> {
         Cmd::Convert {
             mzml,
             out_dir,
+            config,
             max_spectra,
             top_peaks_ms2,
             top_peaks_ms1,
         } => {
-            let cfg = load_config(&None)?;
+            let cfg = load_config(&config)?;
             // Fold the conversion CLI caps into the convert artifacts' provenance
             // key: they change the spectra output but are not part of the config, so
             // two different caps would otherwise produce an identical config_hash
@@ -927,6 +1060,14 @@ fn main() -> Result<()> {
                 "{}\u{1f}max_spectra={max_spectra}\u{1f}top_peaks_ms2={top_peaks_ms2}\u{1f}top_peaks_ms1={top_peaks_ms1}",
                 cfg.canonical_json()
             ));
+            // A vendor file is converted to mzML first; an mzML passes through untouched.
+            // The output directory is the fallback location for the converted file when
+            // the input sits somewhere unwritable.
+            let mzml = mumdia::raw::ensure_mzml(
+                &mzml,
+                &cfg.convert,
+                Some(std::path::Path::new(&out_dir)),
+            )?;
             stages::convert::run(stages::convert::ConvertParams {
                 mzml: &mzml,
                 out_dir: &out_dir,
@@ -1169,17 +1310,49 @@ fn main() -> Result<()> {
             if let Some(pf) = &profile {
                 cfg.apply_profile(pf)?;
             }
-            stages::run::run(stages::run::RunParams {
-                config: &cfg,
-                config_path: config.as_deref(),
-                fasta: fasta.as_deref(),
-                mzml: &mzml,
-                out_dir: &out_dir,
-                lib_precursors: lib_precursors.as_deref(),
-                lib_fragments: lib_fragments.as_deref(),
-                max_spectra,
-                top_peaks_ms2,
-            })?;
+            // Vendor files are converted to mzML before anything else happens, so every
+            // stage below sees mzML; an mzML path passes through untouched.
+            let mzml = mzml
+                .iter()
+                .map(|m| {
+                    mumdia::raw::ensure_mzml(m, &cfg.convert, Some(std::path::Path::new(&out_dir)))
+                })
+                .collect::<Result<Vec<String>>>()?;
+            if mzml.len() > 1 {
+                // Files provided together are rescored together. Searching them one by
+                // one would give N unrelated FDR estimates and count a peptide found in
+                // three files three times; pooling is the default and the separate
+                // searches are the opt-in (`run` once per file).
+                tracing::info!(
+                    runs = mzml.len(),
+                    "run: several --mzml given; searching them as one pooled experiment \
+                     (run-experiment: combined rescore, per-run quant, cross-run LFQ)"
+                );
+                stages::run_experiment::run(stages::run_experiment::RunExperimentParams {
+                    config: &cfg,
+                    config_path: config.as_deref(),
+                    fasta: fasta.as_deref(),
+                    mzmls: &mzml,
+                    run_names: None,
+                    out_dir: &out_dir,
+                    lib_precursors: lib_precursors.as_deref(),
+                    lib_fragments: lib_fragments.as_deref(),
+                    max_spectra,
+                    top_peaks_ms2,
+                })?;
+            } else {
+                stages::run::run(stages::run::RunParams {
+                    config: &cfg,
+                    config_path: config.as_deref(),
+                    fasta: fasta.as_deref(),
+                    mzml: &mzml[0],
+                    out_dir: &out_dir,
+                    lib_precursors: lib_precursors.as_deref(),
+                    lib_fragments: lib_fragments.as_deref(),
+                    max_spectra,
+                    top_peaks_ms2,
+                })?;
+            }
         }
         Cmd::RunExperiment {
             fasta,
@@ -1197,6 +1370,12 @@ fn main() -> Result<()> {
             if let Some(pf) = &profile {
                 cfg.apply_profile(pf)?;
             }
+            let mzml = mzml
+                .iter()
+                .map(|m| {
+                    mumdia::raw::ensure_mzml(m, &cfg.convert, Some(std::path::Path::new(&out_dir)))
+                })
+                .collect::<Result<Vec<String>>>()?;
             let run_names = if run_names.is_empty() {
                 None
             } else {
@@ -1317,7 +1496,17 @@ fn main() -> Result<()> {
         Cmd::Inspect { artifact } => {
             print!("{}", mumdia_io::inspect(&artifact)?);
         }
-        Cmd::PeakCensus { mzml, max_spectra } => {
+        Cmd::PeakCensus {
+            mzml,
+            max_spectra,
+            config,
+        } => {
+            // The census exists to size `--top-peaks-ms2` for a run, so it has to accept
+            // the same inputs a run does. There is no output directory here, so a vendor
+            // file in an unwritable directory is an error rather than a conversion into
+            // somewhere arbitrary.
+            let cfg = load_config(&config)?;
+            let mzml = mumdia::raw::ensure_mzml(&mzml, &cfg.convert, None)?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&peak_census(&mzml, max_spectra)?)?
@@ -1325,6 +1514,7 @@ fn main() -> Result<()> {
         }
         Cmd::Report {
             psms_scored,
+            experiment_dir,
             out_dir,
             peptide_quant,
             protein_quant,
@@ -1341,20 +1531,74 @@ fn main() -> Result<()> {
                     None => 0.01,
                 },
             };
-            std::fs::create_dir_all(&out_dir)?;
-            let pep = format!("{out_dir}/peptides.tsv");
-            let prot = format!("{out_dir}/proteins.tsv");
-            let (n_pep, n_prot) = stages::report::run(stages::report::ReportParams {
-                scored: &psms_scored,
-                peptide_quant: peptide_quant.as_deref(),
-                protein_quant: protein_quant.as_deref(),
-                out_peptides: &pep,
-                out_proteins: &prot,
-                q_threshold: q,
-            })?;
-            println!(
-                "MuMDIA: {n_pep} peptides, {n_prot} protein groups at q <= {q}\n  {pep}\n  {prot}"
-            );
+            if let Some(exp) = experiment_dir {
+                // Everything the report needs is named in the experiment manifest, so the
+                // user points at the directory rather than at four files.
+                let manifest_path = format!("{exp}/experiment_manifest.json");
+                let text = std::fs::read_to_string(&manifest_path)
+                    .map_err(|e| anyhow::anyhow!("reading {manifest_path}: {e}"))?;
+                let m: serde_json::Value = serde_json::from_str(&text)
+                    .map_err(|e| anyhow::anyhow!("parsing {manifest_path}: {e}"))?;
+                let e = m
+                    .get("experiment")
+                    .ok_or_else(|| anyhow::anyhow!("{manifest_path} has no `experiment` block"))?;
+                let strs = |key: &str| -> Result<Vec<String>> {
+                    e.get(key)
+                        .and_then(|v| v.as_array())
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|x| x.as_str().map(String::from))
+                                .collect()
+                        })
+                        .ok_or_else(|| anyhow::anyhow!("{manifest_path}: experiment.{key} missing"))
+                };
+                let runs = strs("runs")?;
+                let peptide_quants = strs("peptide_quants")?;
+                let scored = e
+                    .get("scored_for_quant")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("{manifest_path}: experiment.scored_for_quant missing")
+                    })?
+                    .to_string();
+                let lfq = e.get("lfq").and_then(|v| v.as_str()).map(String::from);
+                let out = out_dir.unwrap_or_else(|| exp.clone());
+                std::fs::create_dir_all(&out)?;
+                let pep = format!("{out}/peptides.tsv");
+                let prot = format!("{out}/proteins.tsv");
+                let (n_pep, n_prot) =
+                    stages::report::run_experiment(stages::report::ExperimentReportParams {
+                        scored: &scored,
+                        run_names: &runs,
+                        peptide_quants: &peptide_quants,
+                        protein_lfq: lfq.as_deref(),
+                        out_peptides: &pep,
+                        out_proteins: &prot,
+                        q_threshold: q,
+                    })?;
+                println!(
+                    "MuMDIA: {n_pep} precursors, {n_prot} protein groups at experiment-wide \
+                     q <= {q} over {} runs\n  {pep}\n  {prot}",
+                    runs.len()
+                );
+            } else {
+                let psms_scored = psms_scored.expect("clap: required unless --experiment-dir");
+                let out_dir = out_dir.expect("clap: required unless --experiment-dir");
+                std::fs::create_dir_all(&out_dir)?;
+                let pep = format!("{out_dir}/peptides.tsv");
+                let prot = format!("{out_dir}/proteins.tsv");
+                let (n_pep, n_prot) = stages::report::run(stages::report::ReportParams {
+                    scored: &psms_scored,
+                    peptide_quant: peptide_quant.as_deref(),
+                    protein_quant: protein_quant.as_deref(),
+                    out_peptides: &pep,
+                    out_proteins: &prot,
+                    q_threshold: q,
+                })?;
+                println!(
+                    "MuMDIA: {n_pep} peptides, {n_prot} protein groups at q <= {q}\n  {pep}\n  {prot}"
+                );
+            }
         }
         Cmd::Doctor { config, json } => {
             // Deliberately the raw loader: doctor must be able to diagnose a

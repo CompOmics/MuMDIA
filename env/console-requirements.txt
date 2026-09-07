@@ -22,8 +22,11 @@
 # preference: the 4.0.0a2 preview overfits fine-tuning badly enough to invert
 # retention-time model rankings (docs/08_rt_im_train.md).
 deeplc==4.1.1
-torch==2.12.1+cpu
+torch==2.14.0+cpu
 psm-utils
+# >= 83 closes PYSEC-2026-3447 (CVE-2026-59890). torch 2.12.1 declared setuptools<82
+# and pulled the affected 81.0.0 into every environment; 2.14.0 does not.
+setuptools>=83
 
 # Rescoring.
 mokapot==0.10.0
