@@ -425,10 +425,13 @@ def main() -> int:
              "run-experiment writes the experiment-wide peptides.tsv and proteins.tsv")
         if rep_pep.is_file():
             hdr = rep_pep.read_text(encoding="utf-8").splitlines()[0].split("\t")
+            # The two trailing columns are the acceptance basis of a match-between-runs
+            # row (docs/29 #19); without MBR they read `false` and empty.
             c.ok(hdr == ["precursor", "stripped_sequence", "charge", "protein", "q_value",
-                         "score", "n_runs", "quantity_a", "quantity_b"],
-                 "experiment peptides.tsv has the experiment-wide columns and one quantity "
-                 "column per run", "\t".join(hdr))
+                         "score", "n_runs", "quantity_a", "quantity_b", "is_transferred",
+                         "transfer_q"],
+                 "experiment peptides.tsv has the experiment-wide columns, one quantity "
+                 "column per run and the transfer basis", "\t".join(hdr))
         # Rows are asserted on the standalone rewrite at q 0.05 (smoke.sh): the pooled
         # peptide-level q of this fixture cannot reach 1 percent, so the root pair is
         # legitimately header-only at the default threshold.
@@ -444,8 +447,10 @@ def main() -> int:
                  "identical inputs: every precursor is quantified in both runs")
         if rep_prot.is_file():
             hdr = rep_prot.read_text(encoding="utf-8").splitlines()[0].split("\t")
-            c.ok(hdr == ["protein_group", "q_value", "n_runs", "lfq_a", "lfq_b"],
-                 "experiment proteins.tsv has one LFQ column per run", "\t".join(hdr))
+            c.ok(hdr == ["protein_group", "q_value", "n_runs", "lfq_a", "lfq_b",
+                         "is_transferred", "transfer_q"],
+                 "experiment proteins.tsv has one LFQ column per run and the transfer "
+                 "basis", "\t".join(hdr))
         for r in ("a", "b"):
             c.ok(not (exp / r / "peptides.tsv").exists(),
                  f"no per-run peptides.tsv under {r}: the grouped q is experiment-wide")
