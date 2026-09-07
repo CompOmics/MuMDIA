@@ -1065,3 +1065,122 @@ file gave 56,556 peptides from the imported iRT and 60,278 from a once-fine-tune
 - Nothing here is a statement about the Minimal or Rich sets as *classifiers*: they lose
   7.5% and 22% because they omit information the Extended families carry, not because the
   Extended set is 387 wide. The finding is that ~120 of the 387 carry that information.
+
+## 22. FASTA mode with MS2PIP 4.2.0 on the HYE sets (2026-09-07)
+
+Question asked: how does the FASTA path (digest, MS2PIP fragment intensities, DeepLC
+retention time) do on the two HYE acquisitions, and how fast is it against DIA-NN
+library-free. Machine: doxy, 128 cores, 755 GB; engine `59b922a` (PR #61 tree on
+0.1.1); sidecar environment `ms2pip 4.2.0` (latest), `deeplc 4.1.1`, `torch
+2.14.0+cpu`, `numpy 2.4.6`, one environment for all three roles. FASTA
+`ProteoBenchFASTA_MixedSpecies_HYE.fasta`; digest one missed cleavage, length 7-30
+(DIA-NN's library-free defaults), charges 2-3, carbamidomethyl fixed, one oxidation:
+1,870,197 target peptides with paired decoys, 9,817,356 peptidoforms. `nn_torch`
+rescoring under the shipped training recipe, `compete.group_by = peptidoform_charge`.
+
+### 22.1 The FASTA path did not work before this PR
+
+The first attempt, with the engine defaults of the time (`ms2pip_model = HCD`,
+`top_n_fragments = 6`, `charge2_from_precursor_charge = 2`), built the library in
+90 minutes and then found **0 confident seed PSMs at 1%** on every run. MS2PIP's
+single-charge models predict the singly charged b/y series only; the engine filled
+charge-2 fragments with its native heuristic and max-normalised each charge group to
+its own peak, so the heuristics tied at 1.0 and took 78.6% of the kept fragment
+slots. `rt-im-train` reported `insufficient_anchors_unbounded`, extract probed all
+9.8M candidates over whole gradients at 100 GB, and the run was killed. Precursor
+and fragment m/z of that library agree with the DIA-NN library to 0.1 ppm on 3.66M
+shared `(peptidoform, charge)` keys, so this was intensity ranking, not mass.
+
+Seed search on `LFQ_Orbitrap_AIF_Condition_A_Sample_Alpha_01` (`search_seed`
+defaults; `confident` = target PSMs at seed FDR 1%):
+
+| library | fragments | confident | decoys among top 1,000 / 5,000 / 20,000 seed scores | fragment charge 1 / 2 | build, 32 threads |
+|---|---|---|---|---|---|
+| DIA-NN imported (reference) | 12 | 21,856 | 0 / 0 / 0.5% | | |
+| `HCD2021`, top 6, charge-2 from charge 2 (old default path) | 6 | **0** | 41.6% / 44.5% / 46.5% | 21% / 79% | 90 min (old worker) |
+| `HCD2021`, top 12, charge-2 from charge 3 | 12 | 14,412 | 0 / 0 / 4.4% | 57% / 43% | 58:28, 38 GB |
+| `HCDch2`, top 12, charge-2 from charge 2 | 12 | **19,308** | 0 / 0 / 1.1% | 79% / 21% | 53:42, 60 GB |
+
+`HCDch2` predicts the doubly charged series (`b2`/`y2`); the worker returns it as
+`frag_charge` 2 and `predict_frag::ms2pip_values` puts every fragment on the
+model's scale. It is the default since this PR; the two FASTA-plus-sidecar
+configurations set `top_n_fragments: 12`. Lowering `search_seed.min_matched_peaks`
+to 3 or 2 on the old library changed nothing (still 0 confident), which is what
+pointed at fragment quality rather than fragment count.
+
+### 22.2 Both acquisitions, six runs pooled, on the `HCDch2` library
+
+`run` with six `--mzml` (one pooled rescore, per-run quant, MaxLFQ), the prebuilt
+library passed as an imported library with `rt_im_train.library_irt = library`,
+`experiment.parallel_runs = 3`, 32 threads per run.
+
+| | AIF HYE (`LFQ_Orbitrap_AIF_Condition_{A,B}_Sample_Alpha_0{1,2,3}`) | Astral HYE (`LFQ_Astral_DIA_15min_50ng_Condition_{A,B}_REP{1,2,3}`) |
+|---|---|---|
+| search wall (library excluded) | 45:25 at 38 GB | 33:31 at 33 GB |
+| of which pooled rescore | 25:07 over 11,888,482 PSMs | 23:01 over 7,863,738 PSMs |
+| per-run seed, extract, features, quant | 25 s, ~3 min, ~3 min, 45 s | 20 s, ~1.5 min, ~1.3 min, 16 s |
+| confident seeds per run | 18.1k-18.9k | 12.6k-13.9k |
+| `w_rt` (LOESS) | 208-238 s | 53-55 s |
+| extracted candidates per run | 1.87M-2.08M | 1.30M-1.33M |
+| target PSMs at pooled 1% | 369,440 | 396,164 |
+| **experiment-wide `peptides.tsv` rows (peptide_q_value <= 0.01)** | **69,091** | **85,644** |
+| protein groups at 1% | 9,637 | 10,570 |
+| MaxLFQ proteins | 12,652 | 14,206 |
+| artifacts on disk | 100 GB | 61 GB |
+
+Per run, stripped peptides at `run_psm_q <= 0.01` (one row per precursor in the
+scored table, so PSMs equal precursors here):
+
+| run | AIF stripped peptides | AIF precursors | run | Astral stripped peptides | Astral precursors |
+|---|---|---|---|---|---|
+| A_01 | 56,354 | 65,862 | A_REP1 | 61,105 | 65,648 |
+| A_02 | 57,312 | 67,945 | A_REP2 | 61,264 | 65,826 |
+| A_03 | 53,790 | 62,333 | A_REP3 | 61,232 | 65,871 |
+| B_01 | 52,569 | 57,810 | B_REP1 | 61,614 | 66,826 |
+| B_02 | 53,662 | 60,576 | B_REP2 | 61,042 | 66,217 |
+| B_03 | 49,918 | 54,940 | B_REP3 | 60,802 | 65,914 |
+| union | 76,892 | | union | 96,465 | |
+
+### 22.3 Against the imported library and against DIA-NN
+
+- AIF: the imported DIA-NN library pooled over the same six runs gives 72,344
+  peptides (section 19), so the FASTA library reaches 95.5% of it. DIA-NN 2.2.0
+  library-free with `--reanalyse` reports 65.6k-72.5k stripped peptides per run at
+  run + global 1%; the FASTA path is at roughly 80% of that per run.
+- Astral: DIA-NN reports about 108-110k precursors per run at 1%, and a single
+  MuMDIA run on the imported library reached 88k (83%); the FASTA path's 65.6k-66.8k
+  precursors per run is about 60% of DIA-NN and 75% of the imported-library
+  MuMDIA run. The `HCDch2` model was trained on Orbitrap HCD spectra; Astral is
+  where a library predicted for the instrument would matter most.
+- Both experiments ran with the shipped `compete.group_by = peptidoform_charge`, so
+  `peptides.tsv` rows are precursors selected on the experiment-wide
+  `peptide_q_value`, exactly as in section 21.
+
+### 22.4 Speed against DIA-NN library-free
+
+DIA-NN 2.2.0 library-free with `--reanalyse`, 32 threads, in-silico library
+included: 61 min for the six AIF runs, 67 min for the six Astral runs (memory of
+the 2026-08-25/26 benchmark runs).
+
+| | MuMDIA FASTA path | DIA-NN |
+|---|---|---|
+| library prediction, once per FASTA | 53:42 (DeepLC 19 min for 4.9M sequences, MS2PIP 35 min for 9.8M peptidoforms at 32 processes) | included |
+| six AIF runs | 45:25 (three runs concurrent at 32 threads each, i.e. up to 96 cores for the per-run stages; the 25-min pooled rescore uses 32) | 61 min total |
+| six Astral runs | 33:31 | 67 min total |
+| total, AIF | 1 h 39 | 61 min |
+| total, Astral | 1 h 27 | 67 min |
+
+Sequentialised at 32 threads the per-run stages would add about 15 min to each
+search, so the search alone is in DIA-NN's range and the library prediction is the
+whole gap. Two things in this PR moved the library from 90 to 54 minutes: the
+worker's process pool follows the engine's thread count (it was capped at eight),
+and the output is assembled with numpy instead of ~300M Python list appends.
+MS2PIP's own scaling is the remaining limit: per 100k peptidoforms, PSM
+construction 3.5 s (single-threaded), prediction 37.4 s at 8 processes and 16.5 s at
+32, flattening 1.7 s. DeepLC's 19 minutes are for the base-model prediction only
+(no fine-tune). A library is cached per FASTA, so a second search of either set
+costs the search alone.
+
+Not done here: entrapment on the FASTA library, and a native-predictor
+(`predictor = native`) re-measurement under the same 12-fragment setting, which is
+why `top_n_fragments` stays 6 as the engine default.

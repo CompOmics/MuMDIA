@@ -39,6 +39,12 @@ than a number. Both are recorded in every run's `manifest.json`.
   `top_n_fragments: 12` explicitly, the count the DIA-NN library ships and the one the
   measurement used; the engine default stays 6, because the native predictor was not
   re-measured.
+- FASTA mode measured end to end on both HYE acquisitions with that library
+  (`docs/28_feature_selection_analysis.md` section 22): six pooled AIF runs 69,091
+  experiment-wide peptides at 1% in 45 min of search (imported DIA-NN library: 72,344),
+  six pooled Astral runs 85,644 in 34 min; library prediction 54 min once per FASTA
+  (DeepLC 19, MS2PIP 35 at 32 processes). DIA-NN 2.2.0 library-free on the same files:
+  61 and 67 min including its library.
 
 - The MS2PIP worker uses the engine's thread count for its process pool (passed as a
   fourth argument by `run_ms2pip`) instead of capping itself at eight processes, and
