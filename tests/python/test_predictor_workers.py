@@ -273,13 +273,14 @@ def test_deeplc_worker_imports_in_a_fresh_interpreter(script):
 
 
 def test_ms2pip_worker_writes_the_documented_output_schema(tmp_path):
-    """`id`, `ion_type`, `ordinal` (1-based), `intensity` (linear).
+    """`id`, `ion_type`, `ordinal` (1-based), `frag_charge`, `intensity` (linear).
 
-    The Rust side folds this into `HashMap<u32, HashMap<(ion, ordinal), f32>>`
-    and looks up charge-1 fragments only (`predict_frag.rs:356-363`). A 0-based
-    ordinal shifts every predicted intensity by one residue, and log2 intensities
-    left unconverted would be compared against max-normalised native values on
-    an entirely different scale.
+    The Rust side folds this into `HashMap<u32, HashMap<(ion, ordinal, charge), f32>>`
+    (`sidecar::run_ms2pip`). A 0-based ordinal shifts every predicted intensity by one
+    residue, and log2 intensities left unconverted would be compared against
+    max-normalised native values on an entirely different scale. A single-charge model
+    emits charge 1 throughout; a `*ch2` model adds the doubly charged series as charge 2,
+    which is what lets `predict-frag` put every fragment on the model's scale.
     """
     importorskip_any("ms2pip", "the MS2PIP sidecar needs a usable ms2pip")
     importorskip_any("psm_utils", "the MS2PIP sidecar needs a usable psm_utils")
@@ -301,10 +302,20 @@ def test_ms2pip_worker_writes_the_documented_output_schema(tmp_path):
     )
     run_worker_ok("ms2pip_worker.py", inp, out, "HCD")
     cols = read_columns(out)
-    assert set(cols) == {"id", "ion_type", "ordinal", "intensity"}
+    assert set(cols) == {"id", "ion_type", "ordinal", "frag_charge", "intensity"}
     assert set(int(x) for x in cols["id"]) <= {0, 1}
     assert set(cols["ion_type"]) <= {"b", "y"}
     assert int(min(int(o) for o in cols["ordinal"])) == 1, "ordinals must be 1-based"
+    assert set(int(z) for z in cols["frag_charge"]) == {1}, "HCD predicts charge 1 only"
     intensity = np.asarray(cols["intensity"], dtype=float)
     assert np.isfinite(intensity).all()
     assert (intensity >= 0.0).all(), "log2 intensities were not converted to linear"
+
+    # The doubly charged series of a *ch2 model arrive as charge 2, same columns.
+    out2 = tmp_path / "ms2pip_out_ch2.parquet"
+    run_worker_ok("ms2pip_worker.py", inp, out2, "HCDch2")
+    cols2 = read_columns(out2)
+    assert set(cols2) == set(cols)
+    assert set(int(z) for z in cols2["frag_charge"]) == {1, 2}
+    n1 = sum(1 for z in cols2["frag_charge"] if int(z) == 1)
+    assert n1 == len(cols["frag_charge"]), "the charge-1 series must be as long as before"
