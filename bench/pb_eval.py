@@ -41,7 +41,7 @@ def main() -> int:
     a = ap.parse_args()
 
     user_input = {
-        "software_version": "0.1.0", "search_engine": "MuMDIA", "search_engine_version": "0.1.0",
+        "software_version": "0.1.1", "search_engine": "MuMDIA", "search_engine_version": "0.1.1",
         "ident_fdr_psm": 0.01, "ident_fdr_peptide": 0.01, "ident_fdr_protein": 0.01,
         "enable_match_between_runs": True, "precursor_mass_tolerance": "20 ppm",
         "fragment_mass_tolerance": "20 ppm", "enzyme": "Trypsin", "allowed_miscleavages": 1,
