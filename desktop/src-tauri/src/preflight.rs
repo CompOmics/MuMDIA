@@ -76,7 +76,134 @@ fn free_bytes(path: &Path) -> Option<u64> {
 
 /// Is there room for this search's output?
 pub fn disk(mzml: &str, out_dir: &str) -> Disk {
-    let input = std::fs::metadata(mzml).map(|m| m.len()).unwrap_or(0);
+    disk_multi(std::slice::from_ref(&mzml.to_string()), out_dir)
+}
+
+/// Bytes an input occupies, whether it is a file or an acquisition directory.
+///
+/// Recursive with a small depth cap, not one level. One level was wrong and the
+/// codebase already knew it: an Agilent `.d` keeps its data under `AcqData/`, and
+/// `thermo::label` identifies Agilent precisely by that subdirectory, so a one-level
+/// sum measured an Agilent acquisition as 0 bytes and every space check on it was
+/// trivially satisfied. The cap keeps a mistaken argument from walking a whole volume.
+fn input_size(p: &str) -> u64 {
+    fn dir_size(dir: &Path, depth: u32) -> u64 {
+        if depth == 0 {
+            return 0;
+        }
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return 0;
+        };
+        entries
+            .flatten()
+            .map(|e| {
+                let path = e.path();
+                match e.metadata() {
+                    Ok(m) if m.is_file() => m.len(),
+                    Ok(m) if m.is_dir() => dir_size(&path, depth - 1),
+                    _ => 0,
+                }
+            })
+            .fold(0, u64::saturating_add)
+    }
+    match std::fs::metadata(p) {
+        Ok(m) if m.is_file() => m.len(),
+        Ok(m) if m.is_dir() => dir_size(Path::new(p), 4),
+        _ => 0,
+    }
+}
+
+/// Can this directory be written to? Answered by trying, because a permission bit is
+/// not the whole story on a network share.
+fn is_writable(dir: &Path) -> bool {
+    let probe = dir.join(".mumdia-preflight-probe");
+    match std::fs::write(&probe, b"") {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&probe);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// Free bytes on the volume holding `dir`, walking up to the nearest existing
+/// ancestor because the directory may not exist yet.
+fn free_space(dir: &Path) -> Option<u64> {
+    let mut probe = dir.to_path_buf();
+    while !probe.exists() {
+        match probe.parent() {
+            Some(p) if p != probe => probe = p.to_path_buf(),
+            _ => break,
+        }
+    }
+    free_bytes(&probe)
+}
+
+/// Room for the CONVERTED mzML, on the volume it is actually written to.
+///
+/// `raw::ensure_mzml` puts it beside the input when that directory is writable, and
+/// only falls back to the output directory otherwise. So a vendor input has a second
+/// space requirement on a volume `disk` never looks at. Returns one warning per input
+/// that does not obviously fit; an unreadable volume returns nothing rather than a
+/// false alarm.
+///
+/// The multiplier is deliberately modest: an mzML is typically two to four times its
+/// vendor file (the AIF `.raw` measured 887 MB against 664 MB from
+/// ThermoRawFileParser and 1.10 GB from msconvert), so 4 is the pessimistic end of
+/// what was actually observed rather than a guess.
+pub fn conversion_space(inputs: &[String]) -> Vec<String> {
+    const MZML_SIZE_MULTIPLE: u64 = 4;
+    let mut out = Vec::new();
+    for input in inputs {
+        let p = Path::new(input);
+        let ext = p
+            .extension()
+            .map(|e| e.to_string_lossy().to_ascii_lowercase())
+            .unwrap_or_default();
+        // mzML needs no conversion, so no extra space.
+        if !matches!(ext.as_str(), "raw" | "d" | "wiff" | "wiff2") {
+            continue;
+        }
+        let Some(dir) = p.parent() else { continue };
+        // Only the beside-the-input case: if that directory is not writable the
+        // engine uses the output directory, which `disk` already covers.
+        if !is_writable(dir) {
+            continue;
+        }
+        let need = input_size(input).saturating_mul(MZML_SIZE_MULTIPLE);
+        let Some(free) = free_space(dir) else {
+            continue;
+        };
+        if need > free {
+            let gb = |b: u64| format!("{:.1} GB", b as f64 / 1e9);
+            out.push(format!(
+                "Converting {} to mzML needs roughly {} beside it, on a drive with {} \
+                 free. The conversion writes next to the input, not into the results \
+                 folder.",
+                p.file_name().unwrap_or_default().to_string_lossy(),
+                gb(need),
+                gb(free)
+            ));
+        }
+    }
+    out
+}
+
+/// The same estimate for several inputs, whose intermediates coexist.
+///
+/// A pooled experiment writes every run's artifacts under one output directory and
+/// keeps them, so the input size that matters is the sum. Sizing from one file would
+/// understate an eight-run experiment roughly eightfold, and the engine cannot
+/// resume: running out of space at hour three loses all of it.
+///
+/// A directory input (Bruker/Agilent `.d`, Waters `.raw`) has no meaningful length of
+/// its own, so its contents are summed one level deep, which is where the acquisition
+/// files sit.
+pub fn disk_multi(inputs: &[String], out_dir: &str) -> Disk {
+    let input: u64 = inputs
+        .iter()
+        .map(|p| input_size(p))
+        .fold(0, u64::saturating_add);
     let estimate = input.saturating_mul(OUTPUT_SIZE_MULTIPLE);
 
     // The output directory may not exist yet, so ask about the nearest ancestor that
@@ -115,7 +242,10 @@ pub fn disk(mzml: &str, out_dir: &str) -> Disk {
 /// has the file, so it can answer the question instead of asking a user to guess.
 pub fn peak_census(mzml: &str) -> Result<serde_json::Value, String> {
     let (exe, _) = crate::engine::resolve()?;
-    let out = crate::engine::command(&exe)
+    let mut cmd = crate::engine::command(&exe);
+    // Every engine invocation gets the same environment; see `components::stamp_env`.
+    crate::components::stamp_env(&mut cmd);
+    let out = cmd
         .args(["peak-census", "--mzml", mzml, "--max-spectra", "2000"])
         .output()
         .map_err(|e| format!("could not run the engine: {e}"))?;

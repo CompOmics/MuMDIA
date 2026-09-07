@@ -49,14 +49,14 @@ Commands:
   rescore         Rescore + native target-decoy q-values -> psms_scored.parquet
   quant           Quantify identified peptides + roll up to protein groups
   quant-lfq       Combine per-run quant tables into a protein-by-run matrix (cross-run LFQ)
-  run             Orchestrate the full MVP pipeline on one run and write a manifest
+  run             Orchestrate the full pipeline on one run and write a manifest. Given several --mzml, the files are searched as ONE pooled experiment (`run-experiment`: one combined rescore, per-run quant, cross-run LFQ), which is the default treatment of a multi-file input; use `run-experiment` directly for run names
   run-experiment  Experiment-wide orchestrator: run the per-file search chain over N runs, then one combined rescore, optional rescuable MBR transfer, per-run quant, and cross-run LFQ. Pass --mzml once per run (>= 2)
   align           Cross-run RT alignment (experiment-level) -> alignment.parquet
   mbr             Match-between-runs identification transfer (Stage D3) -> transferred.parquet
   inspect         Print schema, head sample, and row count for any artifact
   peak-census     Peaks per MS2 spectrum for an mzML, as JSON: percentiles plus what each candidate `--top-peaks-ms2` cap would discard
   audit           Candidate audit: reconstruct per-candidate stage flags + earliest rejection reason across the artifact chain and write candidate_audit.parquet (sensitivity program, P0.3/P0.4). Non-destructive; reruns no compute
-  report          Write peptides.tsv + proteins.tsv from a scored PSM table
+  report          Write peptides.tsv + proteins.tsv from a scored PSM table, or the experiment-wide pair for a `run-experiment` output directory
   doctor          Check that the configured Python sidecar environments are usable
   help            Print this message or the help of the given subcommand(s)
 
@@ -128,7 +128,7 @@ first sentence of the description, with the full text in the section below.
 
 | Subcommand | `--config` | Purpose |
 |---|---|---|
-| [`convert`](#convert) | no | Read an mzML run into the normalized spectra artifact set |
+| [`convert`](#convert) | yes | Read an mzML run into the normalized spectra artifact set |
 | [`digest`](#digest) | yes | Fully-tryptic digest + decoy pairing -> peptides.parquet |
 | [`peptidoforms`](#peptidoforms) | yes | Fixed+variable modification and charge enumeration -> peptidoforms.parquet |
 | [`predict-frag`](#predict-frag) | yes | Spectral library: b/y m/z + predicted intensity + iRT -> fragment_library |
@@ -141,22 +141,22 @@ first sentence of the description, with the full text in the section below.
 | [`rescore`](#rescore) | yes | Rescore + native target-decoy q-values -> psms_scored.parquet |
 | [`quant`](#quant) | yes | Quantify identified peptides + roll up to protein groups |
 | [`quant-lfq`](#quant-lfq) | no | Combine per-run quant tables into a protein-by-run matrix (cross-run LFQ) |
-| [`run`](#run) | yes | Orchestrate the full MVP pipeline on one run and write a manifest |
+| [`run`](#run) | yes | Orchestrate the full pipeline on one run and write a manifest. |
 | [`run-experiment`](#run-experiment) | yes | Experiment-wide orchestrator: run the per-file search chain over N runs, then one combined rescore, optional rescuable MBR transfer, per-run quant, and cross-run LFQ. |
 | [`align`](#align) | yes | Cross-run RT alignment (experiment-level) -> alignment.parquet |
 | [`mbr`](#mbr) | yes | Match-between-runs identification transfer (Stage D3) -> transferred.parquet |
 | [`inspect`](#inspect) | no | Print schema, head sample, and row count for any artifact |
-| [`peak-census`](#peak-census) | no | Peaks per MS2 spectrum for an mzML, as JSON: percentiles plus what each candidate `--top-peaks-ms2` cap would discard |
+| [`peak-census`](#peak-census) | yes | Peaks per MS2 spectrum for an mzML, as JSON: percentiles plus what each candidate `--top-peaks-ms2` cap would discard |
 | [`audit`](#audit) | no | Candidate audit: reconstruct per-candidate stage flags + earliest rejection reason across the artifact chain and write candidate_audit.parquet (sensitivity program, P0.3/P0.4). |
-| [`report`](#report) | yes | Write peptides.tsv + proteins.tsv from a scored PSM table |
+| [`report`](#report) | yes | Write peptides.tsv + proteins.tsv from a scored PSM table, or the experiment-wide pair for a `run-experiment` output directory |
 | [`doctor`](#doctor) | yes | Check that the configured Python sidecar environments are usable |
 | `help` | n/a | Print this message or the help of the given subcommand(s) |
 
-17 of the 22 documented subcommands accept `--config`:
- `align`, `compete`, `digest`, `doctor`, `extract`, `features`, `mbr`, `peptidoforms`, `predict-frag`, `prescan`, `quant`, `report`, `rescore`, `rt-im-train`, `run`, `run-experiment`, `search-seed`.
+19 of the 22 documented subcommands accept `--config`:
+ `align`, `compete`, `convert`, `digest`, `doctor`, `extract`, `features`, `mbr`, `peak-census`, `peptidoforms`, `predict-frag`, `prescan`, `quant`, `report`, `rescore`, `rt-im-train`, `run`, `run-experiment`, `search-seed`.
 
-5 do not, so every setting they use comes from their own flags:
- `audit`, `convert`, `inspect`, `peak-census`, `quant-lfq`.
+3 do not, so every setting they use comes from their own flags:
+ `audit`, `inspect`, `quant-lfq`.
 
 ## convert
 
@@ -167,8 +167,12 @@ Usage: mumdia convert [OPTIONS] --mzml <MZML> --out-dir <OUT_DIR>
 
 Options:
       --mzml <MZML>
+          An mzML, or a vendor file (Thermo `.raw`; Bruker/Agilent `.d`, SCIEX `.wiff`, Waters `.raw` through msconvert), which is converted to mzML first
 
       --out-dir <OUT_DIR>
+
+      --config <CONFIG>
+          Configuration file. Only `convert.*` is read here, and it is read at all so that `convert.thermo_raw_parser` can be set for a standalone convert rather than only through `MUMDIA_THERMO_PARSER`
 
       --max-spectra <MAX_SPECTRA>
           Limit spectra read (0 = all), for fast iteration
@@ -463,7 +467,7 @@ Plus the 5 repeated flags removed above: see "Global flags".
 ## run
 
 ```text
-Orchestrate the full MVP pipeline on one run and write a manifest
+Orchestrate the full pipeline on one run and write a manifest. Given several --mzml, the files are searched as ONE pooled experiment (`run-experiment`: one combined rescore, per-run quant, cross-run LFQ), which is the default treatment of a multi-file input; use `run-experiment` directly for run names
 
 Usage: mumdia run [OPTIONS] --mzml <MZML> --out-dir <OUT_DIR>
 
@@ -472,6 +476,7 @@ Options:
           FASTA to digest into the library. Omit when supplying a prebuilt library via --lib-precursors + --lib-fragments (library-input mode)
 
       --mzml <MZML>
+          Spectra file. Repeat the flag for several files; they are then rescored together as one experiment rather than searched separately
 
       --out-dir <OUT_DIR>
 
@@ -606,6 +611,9 @@ Options:
           Stop after this many spectra from the head of the file (0 = all)
 
           [default: 0]
+
+      --config <CONFIG>
+          Configuration file, read for `convert.*` so a vendor file can be converted the same way `run` converts it
 ```
 
 Plus the 5 repeated flags removed above: see "Global flags".
@@ -654,14 +662,19 @@ Plus the 5 repeated flags removed above: see "Global flags".
 ## report
 
 ```text
-Write peptides.tsv + proteins.tsv from a scored PSM table
+Write peptides.tsv + proteins.tsv from a scored PSM table, or the experiment-wide pair for a `run-experiment` output directory
 
-Usage: mumdia report [OPTIONS] --psms-scored <PSMS_SCORED> --out-dir <OUT_DIR>
+Usage: mumdia report [OPTIONS]
 
 Options:
       --psms-scored <PSMS_SCORED>
+          A single run's scored table. Either this or --experiment-dir
+
+      --experiment-dir <EXPERIMENT_DIR>
+          A `run-experiment` output directory: rewrite its experiment-wide peptides.tsv and proteins.tsv (one quantity column per run) from the pooled scored table, per-run quantities and cross-run LFQ named in its experiment_manifest.json, at another --q if wanted
 
       --out-dir <OUT_DIR>
+          Where the two TSVs go. Defaults to --experiment-dir in experiment mode
 
       --peptide-quant <PEPTIDE_QUANT>
 

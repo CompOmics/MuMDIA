@@ -35,7 +35,10 @@ dependencies:
   - pip
   - pip:
       - --extra-index-url https://download.pytorch.org/whl/cpu
-      - torch==2.12.1+cpu
+      - torch==2.14.0+cpu
+      # >= 83 closes PYSEC-2026-3447; torch 2.12.1 capped setuptools below 82 and
+      # would have forced the affected version back in.
+      - setuptools>=83
       - deeplc==4.1.1
       - psm-utils
       - pyarrow

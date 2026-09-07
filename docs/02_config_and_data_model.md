@@ -153,10 +153,10 @@ Three properties of these columns are easy to misread.
   statistically stronger. Batch a large experiment to fit memory; the split does
   not change the FDR each run receives, and a per-run count difference must not be
   attributed to pool size.
-- `precursor_q` is a precursor-level unit only when compete was run with
-  `group_by = peptidoform_charge`. Under the default `group_by = base_peptide` the
-  charge and modification siblings were already collapsed by stripped peptide, so
-  the column counts base peptides. See docs/11_compete_rescore_fdr.md.
+- `precursor_q` is a precursor-level unit under the default
+  `group_by = peptidoform_charge`. Under `group_by = base_peptide` the charge and
+  modification siblings were already collapsed by stripped peptide, so the column
+  then counts base peptides. See docs/11_compete_rescore_fdr.md.
 
 ## How it works
 
@@ -417,7 +417,7 @@ listed with its default and effect. Fields marked **default-off**, **inert**, or
 | `GateMode` | config.rs:735-758 | **`apex_pearson`**, `peak_spectral`, `spectral_entropy`, `coelution`, `combined` | which spectral score `gate_min_score` thresholds |
 | `UnknownModPolicy` | config.rs:353-357 | **`error`**, `skip` | unknown-mod behavior |
 | `CompetitionMode` | config.rs:873-890 | **`winner_take_all`**, `none`, `features_only`, `unique_evidence`, `margin_gated` | within-group resolution |
-| `CompeteGroupBy` | config.rs:894-901 | **`base_peptide`**, `apex`, `peptidoform_charge` | competition grouping key; renamed from `precursor`, which named stripped-peptide grouping inaccurately (see below) |
+| `CompeteGroupBy` | config.rs:894-901 | `base_peptide`, `apex`, **`peptidoform_charge`** | competition grouping key; `peptidoform_charge` (precursor-level) is the default since 2026-09-06, `base_peptide` was renamed from `precursor`, which named stripped-peptide grouping inaccurately (see below) |
 | `RollupMethod` | config.rs:905-911 | **`top_n_sum`**, `sum` | protein rollup |
 | `PeakWindowMode` | config.rs:916-928 | **`per_candidate`**, `consensus` | quant integration window |
 | `NormalizeMethod` | config.rs:936-949 | `none`, **`median_ratio`**, `median` | cross-run LFQ normalization; `from_token` at 953-960 |
@@ -708,7 +708,8 @@ docs/04_convert.md before setting the destructive one.
 | `min_seed_for_calibration` | 50 | min anchors before calibrating |
 | `loess_span` | 0.3 | LOESS local-fit fraction |
 | `fallback_rt_window_s` | 120.0 | fixed window when calibration cannot fit |
-| `finetune_deeplc` | `false` | **default-off** DeepLC multitask fine-tune (nondeterministic; needs `deeplc_python`) |
+| `finetune_deeplc` | `false` | **default-off** DeepLC fine-tune (nondeterministic; needs `deeplc_python`); the default RT path is prediction plus per-run LOESS calibration |
+| `library_irt` | `auto` | library-input mode only: `auto` re-predicts the imported iRT with the DeepLC base model when `deeplc_python` is set (else keeps it, with a warning), `deeplc` requires the interpreter, `library` keeps the imported values. Ignored under `finetune_deeplc`. `run-experiment` predicts once per experiment (docs/08 section 4c) |
 | `finetune_epochs` | 25 | fine-tune epoch cap (early stopping usually halts earlier) |
 | `finetune_patience` | 10 | early-stopping patience |
 | `finetune_batch` | 0 | 0 = auto-scale batch to seed size |
@@ -792,7 +793,7 @@ requiring entrapment/target-decoy FDR validation before use.
 
 | Field | Default | Effect |
 |---|---|---|
-| `group_by` | `base_peptide` | competition grouping key; `precursor` groups by stripped peptide (all charge and modification siblings collapse), `peptidoform_charge` is the real precursor-level key and is required for a PTM search |
+| `group_by` | `peptidoform_charge` | competition grouping key: the default keeps every peptidoform + charge as its own precursor group; `base_peptide` groups by stripped peptide (all charge and modification siblings collapse) and must not be used for a PTM search |
 | `apex_rt_tolerance_s` | 5.0 | RT bucket for `apex` grouping |
 | `mode` | `winner_take_all` | within-group resolution |
 | `margin` | 0.0 | score margin for `margin_gated` |
@@ -830,7 +831,15 @@ requiring entrapment/target-decoy FDR validation before use.
 | `entrapment_contaminant_markers` | `[]` | substrings that keep a spike-in hit as a real target |
 | `entrapment_ratio` | 1.0 | N_real_lib / N_entrap_lib scaling |
 | `strict` | `true` | fail on a rescorer sidecar failure or unsupported classifier; set false only for explicit compatibility fallback |
-| `handoff` | `tsv` | how the feature matrix reaches a sidecar rescorer (`Handoff`); `parquet` is dramatically faster on large pools but applies to `nn_torch` only |
+| `handoff` | `parquet` | how the feature matrix reaches a sidecar rescorer (`Handoff`); mokapot/entrapment fall back to TSV automatically (docs/28 section 11) |
+| `features` / `features_file` | `None` | explicit feature projection by name (inline list or one-name-per-line file); strict: a missing name is an error |
+| `feature_preset` | `all` | named list used when no explicit list is set: `all` every column, `compact` the embedded 114-feature list of docs/28 section 12 (3.4x smaller rescore matrix; the option for pooled rescoring on small machines, -1.2% on the held-out HYE B01 pool). Preset names the table lacks are skipped with a log line |
+| `train_neg_ratio` | 3.0 | cap on decoys per positive in each training fold (0 = every decoy) |
+| `train_neg_select` | `hybrid` | which decoys survive the cap: `random`, `margin` (highest-scoring), `hybrid` (`train_margin_frac` from the margin, rest random) |
+| `train_margin_frac` | 0.5 | margin share under `hybrid` |
+| `train_subsample` | 0.0 | random fraction of training rows kept after the cap (0 = all) |
+| `train_warm_epochs` | 5 | epochs per self-training iteration when reusing the previous iteration's weights (0 = cold refit, 25 epochs, every iteration) |
+| `seeds` | 1 | independent self-training passes rank-averaged out of fold; 3 is the sensitivity recipe of docs/28 section 15 |
 
 ### `MbrConfig` (config.rs:1084-1129), partly inert
 

@@ -102,7 +102,9 @@ pub fn record_artifact(
 /// Human-readable schema + head sample + row count for any Parquet artifact
 /// (`mumdia inspect`, docs/03_io_layer.md).
 pub fn inspect(path: &str) -> Result<String> {
-    let t = table::Table::read(path)?;
+    // Footer only, then a single 10-row batch for the head sample: `inspect` on a
+    // multi-GB chromatogram or fragment table must not decode the whole file.
+    let t = table::TableFile::open(path)?;
     let mut s = String::new();
     s.push_str(&format!("artifact: {path}\n"));
     s.push_str(&format!("rows: {}\n", t.nrows));
@@ -115,10 +117,8 @@ pub fn inspect(path: &str) -> Result<String> {
             if f.is_nullable() { " (nullable)" } else { "" }
         ));
     }
-    if let Some(first) = t.batches.first() {
-        let head_rows = first.num_rows().min(10);
-        let head = first.slice(0, head_rows);
-        if let Ok(p) = arrow::util::pretty::pretty_format_batches(&[head]) {
+    if let Some(first) = t.batches(None, 10)?.next().transpose()? {
+        if let Ok(p) = arrow::util::pretty::pretty_format_batches(&[first]) {
             s.push_str("head:\n");
             s.push_str(&p.to_string());
             s.push('\n');

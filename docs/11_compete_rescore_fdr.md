@@ -186,7 +186,7 @@ compete.rs:71-78 and re-stated on `CompetitionMode` in config.rs:865-870.
 
 #### `group_by = base_peptide` was called `precursor`, which it never was
 
-The default variant is named `Precursor`, but element 0 of its key is
+`base_peptide` was the default until 2026-09-06 and was named `Precursor`, but element 0 of its key is
 `base_peptide_id` (compete.rs:88), which is a **stripped-sequence** id in both
 library paths: `pd.factorize(Stripped.Sequence)` on the imported path
 (import_diann_lib.py:137), and the target peptide row id (shared by a decoy and
@@ -212,9 +212,14 @@ Two consequences follow.
 In that single comparison the peptide count was unchanged, so the precursor-level
 key cost nothing at the peptide level while recovering the sibling forms. Treat
 `peptidoform_charge` as **required** for a PTM-oriented search, where the deleted
-sibling is the analyte of interest. It stays benchmark-gated as a global default
-because it changes the population the rescorer trains on and the population FDR is
-estimated over, and that has not been validated across datasets.
+sibling is the analyte of interest. It became the default on 2026-09-06: the change
+of training and FDR population it implies was validated the way CLAUDE.md asks, on
+the entrapment pool (spike-in FDP 0.48-0.64%, flat) and on the HYE and AIF
+benchmarks of docs/28, all of which ran under it; on HYE B01 the shipped example
+configuration gave 58,974 peptides under `base_peptide` and 58,813 under
+`peptidoform_charge` on the same table (one seed each, inside the pool's seed band),
+with 23% of the extracted candidates removed under the former and none under the
+latter.
 
 `PeptidoformCharge` (config.rs:894-900) is the precursor-level grouping DIA-NN and
 Spectronaut report at: sibling charges **and** sibling modforms of one peptide are

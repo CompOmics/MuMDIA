@@ -6,17 +6,31 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
-use anyhow::Result;
-use mumdia_core::config::{RescoreConfig, RescorerKind};
+use anyhow::{anyhow, Context as _, Result};
+use arrow::array::{Array, Float64Array};
+use mumdia_core::config::{FeaturePreset, RescoreConfig, RescorerKind};
 use mumdia_core::schema::artifact;
 use mumdia_io::report::ArtifactReport;
-use mumdia_io::table::{write_table, Col, Table};
+use mumdia_io::table::{write_table, Col, TableFile};
 use serde_json::json;
 use tracing::{info, warn};
 
 use crate::fdr::{entrapment_q, target_decoy_q};
-use crate::rescoring::{percolator_lite, RescoreInput};
+use crate::rescoring::{percolator_lite, FeatureMatrix, RescoreInput};
 use crate::stages::features::FeatureSchema;
+
+/// Rows per decoded batch while streaming the ~390 feature columns of a competed table
+/// (~16k rows x 387 f64 is about 50 MB per batch).
+const FEATURE_BATCH_ROWS: usize = 1 << 14;
+
+/// Payload bytes of the per-PSM metadata columns that stay resident beside the feature
+/// matrix for the whole stage (the strings dominate: one heap allocation per PSM each).
+fn meta_bytes(cid: &[u32], label: &[String], pform: &[String], protein: &[String]) -> usize {
+    let strs = |v: &[String]| -> usize {
+        std::mem::size_of_val(v) + v.iter().map(|s| s.len()).sum::<usize>()
+    };
+    std::mem::size_of_val(cid) + strs(label) + strs(pform) + strs(protein)
+}
 
 /// Which empirical null the q-values are computed against.
 #[derive(Clone, Copy, PartialEq)]
@@ -94,7 +108,6 @@ pub fn run(p: RescoreParams) -> Result<u64> {
         Vec::new(),
         Vec::new(),
     );
-    let mut feats: Vec<Vec<f64>> = Vec::new();
     let mut mz: Vec<f64> = Vec::new();
     let mut apex_rt: Vec<f64> = Vec::new();
     let mut elution_lo: Vec<f64> = Vec::new();
@@ -111,11 +124,30 @@ pub fn run(p: RescoreParams) -> Result<u64> {
     // subsequent companion must match exactly: silently concatenating differing
     // feature order/sets would train and score on semantically misaligned columns.
     let expected_schema = FeatureSchema::read(&p.competed[0])?;
-    let feat_names = expected_schema.feature_columns.clone();
+    // The classifier's input columns. Without `rescore.features`/`features_file` this is
+    // every feature the competed table carries; with them it is a projection of that list,
+    // in schema order, and the matrix, the sidecar handoff and the training all shrink
+    // with it. The list actually used is recorded in the artifact report below, which is
+    // the source of truth for what the classifier saw.
+    let feat_names = resolve_feature_subset(p.cfg, &expected_schema.feature_columns)?;
+    if feat_names.len() != expected_schema.feature_columns.len() {
+        info!(
+            selected = feat_names.len(),
+            available = expected_schema.feature_columns.len(),
+            "rescore: feature subset active"
+        );
+    }
+    // Total rows across the inputs, from the parquet footers, so the flat matrix is
+    // allocated once at its final size.
+    let mut total_rows = 0usize;
+    for path in p.competed.iter() {
+        total_rows += TableFile::open(path)?.nrows;
+    }
+    let mut matrix = FeatureMatrix::with_capacity(total_rows, feat_names.len());
     for (src, path) in p.competed.iter().enumerate() {
         let actual_schema = FeatureSchema::read(path)?;
         validate_feature_schema(&expected_schema, &actual_schema, path)?;
-        let t = Table::read(path)?;
+        let t = TableFile::open(path)?;
         let c = t.u32("candidate_id")?;
         let l = t.str("label")?;
         let b = t.u32("base_peptide_id")?;
@@ -128,7 +160,49 @@ pub fn run(p: RescoreParams) -> Result<u64> {
         let elo = t.f64("elution_lo")?;
         let ehi = t.f64("elution_hi")?;
         let pkr = t.i32("peak_rank").unwrap_or_else(|_| vec![0; t.nrows]);
-        let fcols: Vec<Vec<f64>> = feat_names.iter().map(|n| t.f64(n)).collect::<Result<_>>()?;
+        // Feature values: ONE streaming pass over just the feature columns, appending each
+        // row's values contiguously into the flat matrix. The previous path materialised all
+        // ~390 columns as owned `Vec`s first (`fcols`) and then built a `Vec` per PSM from
+        // them, so the whole matrix existed twice, plus the Arrow batches of the full table.
+        // Values, and the null policy (a null f64 reads as NaN), are unchanged.
+        {
+            let names: Vec<&str> = feat_names.iter().map(String::as_str).collect();
+            let reader = t.batches(Some(&names), FEATURE_BATCH_ROWS)?;
+            let sch = reader.schema();
+            let order: Vec<usize> = feat_names
+                .iter()
+                .map(|n| {
+                    sch.index_of(n)
+                        .map_err(|_| anyhow!("competed table {path} has no feature column '{n}'"))
+                })
+                .collect::<Result<_>>()?;
+            for b in reader {
+                let b = b?;
+                let cols: Vec<&Float64Array> = order
+                    .iter()
+                    .map(|&i| {
+                        b.column(i)
+                            .as_any()
+                            .downcast_ref::<Float64Array>()
+                            .ok_or_else(|| {
+                                anyhow!("feature column '{}' is not f64", sch.field(i).name())
+                            })
+                    })
+                    .collect::<Result<_>>()?;
+                let any_null = cols.iter().any(|c| c.null_count() > 0);
+                for k in 0..b.num_rows() {
+                    if any_null {
+                        for c in &cols {
+                            matrix.push(if c.is_null(k) { f64::NAN } else { c.value(k) });
+                        }
+                    } else {
+                        for c in &cols {
+                            matrix.push(c.value(k));
+                        }
+                    }
+                }
+            }
+        }
         for i in 0..t.nrows {
             cid.push(c[i]);
             peak_rank.push(pkr[i]);
@@ -143,9 +217,19 @@ pub fn run(p: RescoreParams) -> Result<u64> {
             elution_lo.push(elo[i]);
             elution_hi.push(ehi[i]);
             source.push(src as u32);
-            feats.push((0..feat_names.len()).map(|k| fcols[k][i]).collect());
         }
     }
+    let feats = matrix.finish()?;
+    crate::memlog::report(
+        "rescore feature matrix",
+        &[
+            ("feats", feats.bytes()),
+            (
+                "metadata_columns",
+                meta_bytes(&cid, &label, &pform, &protein),
+            ),
+        ],
+    );
     crate::fdr::validate_labels(&label)?;
     let is_decoy: Vec<bool> = label.iter().map(|l| l == "decoy").collect();
     let (mut is_entrapment, mut is_real_target) = classify_entrapment(p.cfg, &protein, &is_decoy);
@@ -155,7 +239,7 @@ pub fn run(p: RescoreParams) -> Result<u64> {
         let n_decoys = is_decoy.iter().filter(|&&v| v).count();
         let n_targets = n - n_decoys;
         require_both_labels(n_targets, n_decoys)?;
-        for (row, values) in feats.iter().enumerate() {
+        for (row, values) in feats.iter_rows().enumerate() {
             if let Some((feature, value)) = values
                 .iter()
                 .enumerate()
@@ -646,6 +730,25 @@ pub fn run(p: RescoreParams) -> Result<u64> {
             "num_iter": p.cfg.num_iter,
             "train_fdr": p.cfg.train_fdr,
             "feature_schema_id": expected_schema.schema_id,
+            "train_neg_ratio": p.cfg.train_neg_ratio,
+            "train_neg_select": format!("{:?}", p.cfg.train_neg_select).to_lowercase(),
+            "train_subsample": p.cfg.train_subsample,
+            "train_warm_epochs": p.cfg.train_warm_epochs,
+            "train_margin_frac": p.cfg.train_margin_frac,
+            "seeds": p.cfg.seeds.max(1),
+            "n_features_used": feat_names.len(),
+            "n_features_available": expected_schema.feature_columns.len(),
+            "feature_preset": if p.cfg.features.is_some() || p.cfg.features_file.is_some() {
+                "explicit".to_string()
+            } else {
+                format!("{:?}", p.cfg.feature_preset).to_lowercase()
+            },
+            "feature_selection_id": crate::stages::features::feature_schema_id(&feat_names),
+            "features_used": if feat_names.len() == expected_schema.feature_columns.len() {
+                serde_json::Value::Null
+            } else {
+                json!(feat_names)
+            },
             "competed_inputs": p.competed,
             "config_hash": p.config_hash,
         }),
@@ -669,6 +772,100 @@ pub fn run(p: RescoreParams) -> Result<u64> {
 /// ordered feature columns. Both checks are intentional: the ID catches a
 /// declared contract mismatch, while the explicit column comparison protects
 /// against a malformed or manually edited companion.
+/// The classifier's feature columns: every column of the schema, or the projection named
+/// by `rescore.features` / `rescore.features_file`.
+///
+/// The result keeps SCHEMA order, not the order the caller listed, so a selection can
+/// never silently reorder the matrix (the sidecar contract is positional). A name that is
+/// not in the schema is an error rather than a silent drop: a typo in a 100-name list
+/// would otherwise train a different model than the one asked for.
+/// The `compact` preset, one name per line; see `FeaturePreset::Compact`.
+const COMPACT_FEATURES: &str = include_str!("feature_presets/compact.txt");
+
+/// One feature name per line, blank lines and `#` comments ignored.
+fn parse_feature_list(text: &str) -> Vec<String> {
+    text.lines()
+        .map(|l| l.split('#').next().unwrap_or("").trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect()
+}
+
+fn preset_names(preset: FeaturePreset) -> Option<Vec<String>> {
+    match preset {
+        FeaturePreset::All => None,
+        FeaturePreset::Compact => Some(parse_feature_list(COMPACT_FEATURES)),
+    }
+}
+
+fn resolve_feature_subset(cfg: &RescoreConfig, available: &[String]) -> Result<Vec<String>> {
+    let wanted: Vec<String> = match (&cfg.features, &cfg.features_file) {
+        (Some(_), Some(_)) => anyhow::bail!(
+            "rescore.features and rescore.features_file are mutually exclusive; set one"
+        ),
+        (None, None) => {
+            let Some(names) = preset_names(cfg.feature_preset) else {
+                return Ok(available.to_vec());
+            };
+            // A preset is a default, not a contract with one feature set: names the
+            // table lacks (a smaller `features.set`) are skipped, visibly.
+            let have: std::collections::HashSet<&str> =
+                available.iter().map(String::as_str).collect();
+            let keep: std::collections::HashSet<&str> = names
+                .iter()
+                .map(String::as_str)
+                .filter(|n| have.contains(n))
+                .collect();
+            if keep.is_empty() {
+                anyhow::bail!(
+                    "rescore.feature_preset {:?} shares no column with the competed table's \
+                     feature schema",
+                    cfg.feature_preset
+                );
+            }
+            if keep.len() < names.len() {
+                info!(
+                    preset = ?cfg.feature_preset,
+                    skipped = names.len() - keep.len(),
+                    kept = keep.len(),
+                    "rescore: preset names absent from this feature set are skipped"
+                );
+            }
+            return Ok(available
+                .iter()
+                .filter(|a| keep.contains(a.as_str()))
+                .cloned()
+                .collect());
+        }
+        (Some(list), None) => list.clone(),
+        (None, Some(path)) => parse_feature_list(
+            &std::fs::read_to_string(path)
+                .with_context(|| format!("reading rescore.features_file {path}"))?,
+        ),
+    };
+    if wanted.is_empty() {
+        anyhow::bail!("rescore feature selection resolved to an empty list");
+    }
+    let have: std::collections::HashSet<&str> = available.iter().map(String::as_str).collect();
+    let missing: Vec<&String> = wanted
+        .iter()
+        .filter(|w| !have.contains(w.as_str()))
+        .collect();
+    if !missing.is_empty() {
+        anyhow::bail!(
+            "rescore feature selection names {} column(s) absent from the competed table's \
+             feature schema, first few: {:?}",
+            missing.len(),
+            missing.iter().take(5).collect::<Vec<_>>()
+        );
+    }
+    let keep: std::collections::HashSet<&str> = wanted.iter().map(String::as_str).collect();
+    Ok(available
+        .iter()
+        .filter(|a| keep.contains(a.as_str()))
+        .cloned()
+        .collect())
+}
+
 fn validate_feature_schema(
     expected: &FeatureSchema,
     actual: &FeatureSchema,
@@ -691,7 +888,7 @@ fn validate_feature_schema(
 /// Native semi-supervised rescorer scores.
 fn native_scores(
     p: &RescoreParams,
-    feats: &[Vec<f64>],
+    feats: &FeatureMatrix,
     is_decoy: &[bool],
     fold_key: &[u32],
     prelim: &[f64],
@@ -835,7 +1032,7 @@ fn run_entrapment_gbm(
     base: &[u32],
     is_entrapment: &[bool],
     is_decoy: &[bool],
-    feats: &[Vec<f64>],
+    feats: &FeatureMatrix,
 ) -> Result<Vec<f64>> {
     let python = p
         .cfg
@@ -867,7 +1064,7 @@ fn run_entrapment_gbm(
     for (fi, name) in feat_names.iter().enumerate() {
         cols.push(Col::F64(
             name.clone(),
-            (0..cid.len()).map(|i| feats[i][fi]).collect(),
+            (0..cid.len()).map(|i| feats.row(i)[fi] as f64).collect(),
         ));
     }
     write_table(&inp, cols)?;
@@ -884,7 +1081,7 @@ fn run_entrapment_gbm(
         anyhow::bail!("entrapment worker exited with {status}");
     }
 
-    let t = Table::read(&outp)?;
+    let t = TableFile::open(&outp)?;
     let orid = t.u32("row_id")?;
     let osc = t.f64("score")?;
     align_sidecar_scores(&orid, &osc, cid.len(), "entrapment_worker")
@@ -922,8 +1119,8 @@ impl Drop for ChildGuard {
 /// matches what is actually used, halves the file, and does not silently increase precision
 /// relative to the validated TSV reference.
 ///
-/// Batched because `feats` is already resident (Vec<Vec<f64>>, ~27 GB on an experiment-wide
-/// pool); materialising 387 full columns as well would add ~12.8 GB for nothing.
+/// Batched because `feats` is already resident (one flat row-major matrix, 8 bytes per
+/// value); materialising 387 full columns as well would add ~12.8 GB for nothing.
 fn write_features_parquet(
     path: &str,
     feat_names: &[String],
@@ -931,7 +1128,7 @@ fn write_features_parquet(
     pform: &[String],
     protein: &[String],
     mz: &[f64],
-    feats: &[Vec<f64>],
+    feats: &FeatureMatrix,
 ) -> Result<u64> {
     use arrow::array::{ArrayRef, Float32Array, Float64Array, Int32Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
@@ -981,9 +1178,8 @@ fn write_features_parquet(
         arrays.push(Arc::new(Float64Array::from(mzv)));
         // Transpose this row block into one column per feature. `feats` is row-major, so a
         // column read strides it; doing that per batch keeps the working set to one block.
-        let block = &feats[start..end];
         for fi in 0..nf {
-            let col: Vec<f32> = block.iter().map(|row| row[fi] as f32).collect();
+            let col: Vec<f32> = (start..end).map(|i| feats.row(i)[fi]).collect();
             arrays.push(Arc::new(Float32Array::from(col)));
         }
         let _ = k;
@@ -1014,7 +1210,7 @@ fn run_pin_sidecar(
     pform: &[String],
     protein: &[String],
     mz: &[f64],
-    feats: &[Vec<f64>],
+    feats: &FeatureMatrix,
     base: &[u32],
 ) -> Result<Vec<f64>> {
     use std::io::Write as _;
@@ -1080,10 +1276,10 @@ fn run_pin_sidecar(
         for i in 0..cid.len() {
             let lab = if label[i] == "decoy" { -1 } else { 1 };
             write!(w, "psm_{}\t{}\t{}\t{:.5}\t{:.5}\t", i, lab, i, mz[i], mz[i])?;
-            #[allow(clippy::needless_range_loop)]
-            // parallel index into feats[i] bounded by feat_names
-            for fi in 0..feat_names.len() {
-                write!(w, "{:.6}\t", feats[i][fi])?;
+            // one flat matrix row, already in `feat_names` order
+            let row = feats.row(i);
+            for v in row.iter().take(feat_names.len()) {
+                write!(w, "{:.6}\t", v)?;
             }
             writeln!(w, "-.{}.-\t{}", pform[i], protein[i])?;
         }
@@ -1126,6 +1322,30 @@ fn run_pin_sidecar(
         .env("MUMDIA_NN_FOLDS", p.cfg.folds.to_string())
         .env("MUMDIA_NN_ITERS", p.cfg.num_iter.to_string())
         .env("MUMDIA_NN_TRAIN_FDR", p.cfg.train_fdr.to_string())
+        // Training-set reduction. Passed unconditionally so the report and the worker
+        // agree on what ran; the defaults (0 / random) are the worker's own, so an
+        // unconfigured run behaves exactly as before.
+        .env("MUMDIA_NN_NEG_RATIO", p.cfg.train_neg_ratio.to_string())
+        .env(
+            "MUMDIA_NN_NEG_SELECT",
+            match p.cfg.train_neg_select {
+                mumdia_core::config::NegSelect::Random => "random",
+                mumdia_core::config::NegSelect::Margin => "margin",
+                mumdia_core::config::NegSelect::Hybrid => "hybrid",
+            },
+        )
+        .env("MUMDIA_NN_TRAIN_SUB", p.cfg.train_subsample.to_string())
+        .env(
+            "MUMDIA_NN_WARM_START",
+            if p.cfg.train_warm_epochs > 0 {
+                "1"
+            } else {
+                "0"
+            },
+        )
+        .env("MUMDIA_NN_WARM_EPOCHS", p.cfg.train_warm_epochs.to_string())
+        .env("MUMDIA_NN_MARGIN_FRAC", p.cfg.train_margin_frac.to_string())
+        .env("MUMDIA_NN_SEEDS", p.cfg.seeds.max(1).to_string())
         .env("MUMDIA_NN_FOLD_KEYS", &foldkeys)
         .spawn()
         .map_err(|e| {
@@ -1144,7 +1364,7 @@ fn run_pin_sidecar(
     // flat row index. Exact, unique, finite coverage is part of the classifier
     // contract: silently assigning a worst score to missing rows changes the
     // trained population and can invalidate sensitivity/FDR comparisons.
-    let t = Table::read(&outp)?;
+    let t = TableFile::open(&outp)?;
     let orow = t.u32("candidate_id")?;
     let osc = t.f64("score")?;
     align_sidecar_scores(&orow, &osc, cid.len(), script_name)
@@ -1194,6 +1414,99 @@ fn align_sidecar_scores(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn cfg_with(features: Option<Vec<&str>>, file: Option<&str>) -> RescoreConfig {
+        RescoreConfig {
+            features: features.map(|v| v.into_iter().map(String::from).collect()),
+            features_file: file.map(String::from),
+            feature_preset: FeaturePreset::All,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn compact_preset_is_114_unique_names_and_intersects_the_schema() {
+        let names = preset_names(FeaturePreset::Compact).unwrap();
+        assert_eq!(names.len(), 114);
+        let uniq: std::collections::HashSet<&String> = names.iter().collect();
+        assert_eq!(
+            uniq.len(),
+            114,
+            "duplicate name in the embedded compact list"
+        );
+        let cfg = RescoreConfig {
+            feature_preset: FeaturePreset::Compact,
+            ..cfg_with(None, None)
+        };
+        // Schema order is kept and names the table lacks are skipped, not fatal.
+        let avail: Vec<String> = ["zz", "rt_error_abs", "coelution_run", "yy"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(
+            resolve_feature_subset(&cfg, &avail).unwrap(),
+            vec!["rt_error_abs".to_string(), "coelution_run".to_string()]
+        );
+        let none: Vec<String> = vec!["zz".to_string()];
+        let e = resolve_feature_subset(&cfg, &none).unwrap_err();
+        assert!(e.to_string().contains("shares no column"), "{e}");
+        // An explicit list wins over the preset.
+        let explicit = RescoreConfig {
+            feature_preset: FeaturePreset::Compact,
+            ..cfg_with(Some(vec!["zz"]), None)
+        };
+        assert_eq!(
+            resolve_feature_subset(&explicit, &avail).unwrap(),
+            vec!["zz".to_string()]
+        );
+    }
+
+    #[test]
+    fn feature_subset_projects_in_schema_order_and_defaults_to_all() {
+        let avail: Vec<String> = ["a", "b", "c", "d"].iter().map(|s| s.to_string()).collect();
+        // No selection: every column, untouched.
+        assert_eq!(
+            resolve_feature_subset(&cfg_with(None, None), &avail).unwrap(),
+            avail
+        );
+        // A selection is a projection: schema order wins over the order asked for, and
+        // duplicates collapse, because the sidecar contract is positional.
+        let got =
+            resolve_feature_subset(&cfg_with(Some(vec!["d", "a", "d"]), None), &avail).unwrap();
+        assert_eq!(got, vec!["a".to_string(), "d".to_string()]);
+    }
+
+    #[test]
+    fn feature_subset_rejects_unknown_names_and_bad_configuration() {
+        let avail: Vec<String> = ["a", "b"].iter().map(|s| s.to_string()).collect();
+        let e = resolve_feature_subset(&cfg_with(Some(vec!["a", "zz"]), None), &avail).unwrap_err();
+        assert!(format!("{e}").contains("zz"), "{e}");
+        let e = resolve_feature_subset(&cfg_with(Some(vec![]), None), &avail).unwrap_err();
+        assert!(format!("{e}").contains("empty"), "{e}");
+        let e =
+            resolve_feature_subset(&cfg_with(Some(vec!["a"]), Some("f.txt")), &avail).unwrap_err();
+        assert!(format!("{e}").contains("mutually exclusive"), "{e}");
+    }
+
+    #[test]
+    fn feature_subset_reads_a_list_file_ignoring_blanks_and_comments() {
+        let dir = std::env::temp_dir().join("mumdia_fs_subset_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("feats_{}.txt", std::process::id()));
+        std::fs::write(
+            &path,
+            "# picked by docs/28
+
+b
+  c  # trailing note
+",
+        )
+        .unwrap();
+        let avail: Vec<String> = ["a", "b", "c"].iter().map(|s| s.to_string()).collect();
+        let got =
+            resolve_feature_subset(&cfg_with(None, Some(path.to_str().unwrap())), &avail).unwrap();
+        assert_eq!(got, vec!["b".to_string(), "c".to_string()]);
+    }
 
     #[test]
     fn a_one_sided_population_is_refused_with_both_counts_named() {
