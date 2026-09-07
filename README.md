@@ -535,43 +535,6 @@ loosened threshold. Both `convert` and `run` default `--top-peaks-ms2` to `0`
 [`docs/04_convert.md`](docs/04_convert.md), section "Choosing
 `--top-peaks-ms2`", is the full treatment.
 
-### Quantification
-
-Measured on the ProteoBench Astral HYE set at commit `83ba81d`. Setting
-`quant.fixed_scan_halfwidth` and `quant.fixed_window_s` together, which integrate
-a fixed window centred on the identification apex instead of the descent-walk
-bounds, moved median absolute epsilon from 0.273 to 0.195 and CV from 0.175 to
-0.107. Both options default to off, so an existing configuration produces
-bit-identical results. Promotion to a default is gated on entrapment, which has
-not been run.
-
-The full recorded ProteoBench comparisons live in
-[`bench/README.md`](bench/README.md), together with the scoring scripts. **Row
-unit: ions at `min_obs = 3`, that is quantified in at least three of the six
-runs.** DIA-NN 2.2.0 was run library-free with `--reanalyse` on the same files.
-
-| set | tool | features | median abs eps (global) | CV median |
-|---|---|---|---|---|
-| Astral `LFQ_Astral_DIA_15min_50ng` | MuMDIA | 100,528 | 0.176 | 0.105 |
-| Astral `LFQ_Astral_DIA_15min_50ng` | DIA-NN 2.2.0 | 115,045 | 0.203 | 0.141 |
-| AIF HYE `LFQ_Orbitrap_AIF_Condition_{A,B}` | MuMDIA | 70,689 | 0.154 | 0.314 |
-| AIF HYE `LFQ_Orbitrap_AIF_Condition_{A,B}` | DIA-NN 2.2.0 | 89,800 | 0.234 | 0.182 |
-
-Read those with one caveat that matters: the MuMDIA figures were produced by the
-second-pass workflow described in
-[`docs/22_release_plan.md`](docs/22_release_plan.md) WP7, which is prototype shell
-code on the benchmark machine and is **not in the engine**. This release does not
-reproduce them on its own. Accuracy is competitive or better, completeness trails
-DIA-NN by 13% on Astral and 21% on AIF, and per-ion precision is comparable on
-Astral but about 1.7 times worse on AIF, where the all-ion isolation window leaves
-interference the current fragment selection does not remove.
-
-Per-stage wall clock and artifact sizes for a reference run are in
-[`bench/README.md`](bench/README.md): one 1.94 GB AIF file takes about 85 minutes
-and writes 13.1 GB of artifacts, of which rescoring is 80% of the time. Peak
-memory is still not measured, and neither is the six-file experiment profile
-([`docs/22_release_plan.md`](docs/22_release_plan.md), WP5).
-
 ## Status of experimental features
 
 These exist in the code and are measured, but are not enabled by default. They
