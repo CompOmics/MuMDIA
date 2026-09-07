@@ -66,8 +66,13 @@ pub fn run_ms2pip(
             Col::I32("charge".into(), charges.to_vec()),
         ],
     )?;
-    info!(n = ids.len(), model, "sidecar: running MS2PIP");
-    run_worker(python, script, &[&inp, &outp, model], false).context("MS2PIP worker failed")?;
+    // The worker sizes its MS2PIP process pool from this. Left to itself it capped the
+    // pool at min(8, cpu_count), which on the 9.8M-peptidoform HYE library left 24 of
+    // the 32 requested cores idle for the whole prediction.
+    let processes = rayon::current_num_threads().max(1).to_string();
+    info!(n = ids.len(), model, processes = %processes, "sidecar: running MS2PIP");
+    run_worker(python, script, &[&inp, &outp, model, &processes], false)
+        .context("MS2PIP worker failed")?;
 
     let t = TableFile::open(&outp)?;
     let oid = t.u32("id")?;

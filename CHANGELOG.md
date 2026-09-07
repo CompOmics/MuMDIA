@@ -15,6 +15,16 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ## [Unreleased]
 
+### Changed
+
+- The MS2PIP worker uses the engine's thread count for its process pool (passed as a
+  fourth argument by `run_ms2pip`) instead of capping itself at eight processes, and
+  assembles its output from numpy arrays per chunk instead of four per-fragment Python
+  lists. Measured on the 9.8M-peptidoform HYE library (one missed cleavage, 7-30, charges
+  2-3, one oxidation), the old worker ran on six to eight cores of the 32 requested and
+  held 13 GB of Python objects before writing. Predictions are unchanged: the same
+  rows in the same order, the same float64 arithmetic stored as float32.
+
 ## [0.1.1] - 2026-09-07
 
 ### Fixed

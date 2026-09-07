@@ -165,6 +165,66 @@ def test_ms2pip_worker_module_imports_without_ms2pip_installed():
     assert callable(module.main)
 
 
+def _load_ms2pip_worker():
+    spec = importlib.util.spec_from_file_location(
+        "mumdia_ms2pip_worker_rows", SCRIPTS / "ms2pip_worker.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_ms2pip_worker_flattens_predictions_like_the_per_fragment_loop():
+    """`fragment_rows` must reproduce the loop it replaced, row for row.
+
+    Per result: ions b then y, ordinals 1-based and ascending, the id repeated per
+    fragment, `2**x - 0.001` clipped at 0 in float64 and stored as float32; a missing
+    ion contributes nothing and a result without predictions is skipped rather than
+    crashing the worker. `to_table` must emit `ion_type` as plain utf8, which is the
+    only string encoding the engine reads.
+    """
+    import numpy as np
+    import pyarrow as pa
+
+    module = _load_ms2pip_worker()
+
+    class Psm:
+        def __init__(self, sid):
+            self.spectrum_id = sid
+
+    class Res:
+        def __init__(self, sid, pred):
+            self.psm = Psm(sid)
+            self.predicted_intensity = pred
+
+    results = [
+        Res("7", {"b": np.array([-1.0, 0.0]), "y": np.array([-20.0])}),
+        Res("9", {"b": None, "y": np.array([2.0])}),
+        Res("11", None),
+        Res("13", {"b": np.array([]), "y": None}),
+    ]
+    ids, ions, ords, ints = module.fragment_rows(results)
+    assert ids.tolist() == [7, 7, 7, 9]
+    assert ions.tolist() == [0, 0, 1, 1]
+    assert ords.tolist() == [1, 2, 1, 1]
+    expected = np.clip(
+        np.power(2.0, np.array([-1.0, 0.0, -20.0, 2.0])) - 0.001, 0.0, None
+    ).astype(np.float32)
+    assert ints.dtype == np.float32
+    assert np.array_equal(ints, expected)
+    assert ints[2] == 0.0, "2**-20 - 0.001 is negative and must clip to 0"
+
+    tbl = module.to_table(ids, ions, ords, ints)
+    assert tbl.schema.field("ion_type").type == pa.string()
+    assert tbl.column("ion_type").to_pylist() == ["b", "b", "y", "y"]
+    assert tbl.schema.field("id").type == pa.uint32()
+    assert tbl.schema.field("intensity").type == pa.float32()
+
+    empty = module.fragment_rows([])
+    assert all(a.size == 0 for a in empty)
+    assert module.to_table(*empty).num_rows == 0
+
+
 @pytest.mark.parametrize("script", DEEPLC_WORKERS)
 def test_deeplc_worker_imports_in_a_fresh_interpreter(script):
     """With DeepLC present, a fresh-interpreter module import must succeed.

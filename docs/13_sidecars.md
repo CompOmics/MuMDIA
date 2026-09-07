@@ -59,7 +59,7 @@ the column it keys the readback on.
 
 | worker | positional args in | output file | key column |
 |---|---|---|---|
-| ms2pip_worker | `<in.parquet> <out.parquet> <model>` (`sidecar.rs:63`) | `ms2pip_out.parquet` | `id` |
+| ms2pip_worker | `<in.parquet> <out.parquet> <model> <processes>` (`sidecar.rs`, `run_ms2pip`; `processes` is the engine's thread count) | `ms2pip_out.parquet` | `id` |
 | deeplc_worker | `<in.parquet> <out.parquet>` (`sidecar.rs:99`) | `deeplc_out.parquet` | `id` |
 | deeplc_finetune | `<lib_in> <seed> <lib_out> --epochs --patience --q-train --batch --window-holdout-frac` (`sidecar.rs`) | `<lib_out>` (= `fragment_library_precursors_ft.parquet`) | `peptidoform` (new table with replaced `predicted_irt`; input unchanged) |
 | mokapot_worker / nn_rescore_worker | `<rescore.pin> <out.parquet>` + env `MUMDIA_NN_FOLDS/ITERS/TRAIN_FDR` (`rescore.rs:781-792`) | `rescore_sidecar_out.parquet` | `candidate_id` (echoes the flat row index) |
@@ -210,12 +210,16 @@ before they compete (`predict_frag.rs:365-384`). Two native-fallback edge cases:
 predictions")`, `predict_frag.rs:342-344`), while a single candidate that MS2PIP
 returned nothing for (missing/empty per-id entry) falls back wholesale to the
 native intensities for that candidate (`predict_frag.rs:387-389`). The
-worker builds `psm_utils.PSMList` in 100k-row chunks, calls
-`ms2pip.predict_batch(model, processes=min(8, cpu_count))`, and converts MS2PIP's
-log2 intensities to linear via `2**x - 0.001` clipped at 0
-(`ms2pip_worker.py:52-53`). Ordinals are emitted 1-based
-(`ms2pip_worker.py:57`). The `__main__` guard makes the Windows `spawn` start
-method safe for multiprocessing.
+worker builds `psm_utils.PSMList` in chunks of `max(100k, 20k x processes)` rows,
+calls `ms2pip.predict_batch(model, processes=N)` with `N` the engine's thread count
+passed as the fourth argument (the old cap `min(8, cpu_count)` applies only when the
+argument is absent), and converts MS2PIP's log2 intensities to linear via
+`2**x - 0.001` clipped at 0, in float64, stored as float32
+(`ms2pip_worker.py`, `fragment_rows`). Ordinals are emitted 1-based; rows come out
+per result, ions b then y. The output is assembled from numpy arrays per chunk, not
+from per-fragment Python list appends, which at 9.8M peptidoforms were about 300M
+appends and 13 GB of Python objects. The `__main__` guard makes the Windows `spawn`
+start method safe for multiprocessing.
 
 **DeepLC predict** (`predict_frag.rs:274-312`, worker `deeplc_worker.py`).
 Selected by `predict_frag.rt_predictor = "deeplc"`. `assign_rt` deduplicates by
