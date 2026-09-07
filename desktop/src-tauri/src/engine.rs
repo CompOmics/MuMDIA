@@ -41,6 +41,43 @@ pub const EXE: &str = if cfg!(windows) {
     "mumdia"
 };
 
+/// The directory holding the Python sidecar workers.
+///
+/// The engine resolves its own `sidecar_script_dir` relative to the engine binary
+/// (`python::resolve_script_dir`), so a bundle must place `scripts/` beside the
+/// staged engine in `binaries/`. This finds the same directory for the callers
+/// that invoke a worker directly rather than through the engine, and it is the
+/// check that catches a bundle built without them.
+///
+/// A worker file is required, not just the directory: an empty `scripts/` would
+/// otherwise resolve and fail later, at the point of use.
+pub fn scripts_dir() -> Option<PathBuf> {
+    let has_workers =
+        |d: &Path| d.join("import_diann_lib.py").is_file() || d.join("deeplc_worker.py").is_file();
+
+    if let Some(p) = std::env::var_os("MUMDIA_SCRIPTS") {
+        let p = PathBuf::from(p);
+        if has_workers(&p) {
+            return Some(p);
+        }
+    }
+    let mut roots: Vec<PathBuf> = Vec::new();
+    if let Some(res) = resource_dir() {
+        roots.push(res.join("binaries").join("scripts"));
+        roots.push(res.join("scripts"));
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            roots.push(dir.join("scripts"));
+            roots.push(dir.join("binaries").join("scripts"));
+            // Same development fallback as the engine lookup: a `cargo run` binary
+            // sits three levels below the repository root.
+            roots.push(dir.join("../../../scripts"));
+        }
+    }
+    roots.into_iter().find(|d| has_workers(d))
+}
+
 /// What the application knows about the engine it will run.
 #[derive(Serialize, Clone, Debug)]
 pub struct Info {

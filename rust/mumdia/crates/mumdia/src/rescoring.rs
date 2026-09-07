@@ -11,13 +11,89 @@ use rayon::prelude::*;
 /// Column mean/std over a SUBSET of rows (guarded; std < 1e-9 -> 1.0). Fitting the
 /// scaler on the training fold only avoids leaking test-fold statistics into the
 /// standardization.
-fn fit_standardizer(x: &[Vec<f64>], idx: &[usize]) -> (Vec<f64>, Vec<f64>) {
-    let d = x.first().map(|r| r.len()).unwrap_or(0);
+/// Row-major feature matrix: ONE flat allocation of `rows * n_features` values, instead of
+/// a `Vec<f64>` per PSM.
+///
+/// The per-row form cost a 24-byte `Vec` header plus allocator overhead and a separate heap
+/// block for every PSM, and building it required the whole table column-major first, so a
+/// second full copy of the matrix was alive during the load. Rows are contiguous here, which
+/// is also the access pattern of every consumer ([`FeatureMatrix::row`], the standardizer,
+/// the sidecar writers).
+pub struct FeatureMatrix {
+    /// Feature values, stored f32 (4 B) and widened to f64 at every arithmetic use.
+    /// A feature is a measurement, not an accumulator: f32 carries 7 significant digits,
+    /// while the reductions that consume it (standardizer means/variances, the logistic
+    /// gradient, the score) stay in f64 below. Halves the matrix, which is the single
+    /// largest allocation of an experiment-wide rescore (33.6 GiB at 11.6M PSMs x 387
+    /// features in f64; 16.8 GiB here).
+    values: Vec<f32>,
+    n_features: usize,
+}
+
+impl FeatureMatrix {
+    /// Empty matrix of `n_features` columns, preallocated for `rows` rows.
+    pub fn with_capacity(rows: usize, n_features: usize) -> FeatureMatrix {
+        FeatureMatrix {
+            values: Vec::with_capacity(rows.saturating_mul(n_features)),
+            n_features,
+        }
+    }
+
+    /// Append one value. Callers push exactly `n_features` values per row, in column order.
+    /// The f64 the reader decoded is narrowed here, once.
+    #[inline]
+    pub fn push(&mut self, v: f64) {
+        self.values.push(v as f32);
+    }
+
+    /// Fail loudly rather than silently mis-striding if a caller pushed a partial row.
+    pub fn finish(self) -> anyhow::Result<FeatureMatrix> {
+        if self.n_features > 0 && !self.values.len().is_multiple_of(self.n_features) {
+            anyhow::bail!(
+                "feature matrix has {} values, not a multiple of {} features",
+                self.values.len(),
+                self.n_features
+            );
+        }
+        Ok(self)
+    }
+
+    /// Payload bytes of the value buffer, for the memory accounting.
+    pub fn bytes(&self) -> usize {
+        std::mem::size_of_val(self.values.as_slice())
+    }
+
+    pub fn n_features(&self) -> usize {
+        self.n_features
+    }
+
+    pub fn rows(&self) -> usize {
+        self.values.len().checked_div(self.n_features).unwrap_or(0)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.rows() == 0
+    }
+
+    /// Row `i` as a contiguous slice of `n_features` values.
+    #[inline]
+    pub fn row(&self, i: usize) -> &[f32] {
+        let a = i * self.n_features;
+        &self.values[a..a + self.n_features]
+    }
+
+    pub fn iter_rows(&self) -> impl Iterator<Item = &[f32]> {
+        self.values.chunks_exact(self.n_features.max(1))
+    }
+}
+
+fn fit_standardizer(x: &FeatureMatrix, idx: &[usize]) -> (Vec<f64>, Vec<f64>) {
+    let d = x.n_features();
     let n = idx.len().max(1) as f64;
     let mut mean = vec![0.0; d];
     for &i in idx {
-        for j in 0..d {
-            mean[j] += x[i][j];
+        for (m, v) in mean.iter_mut().zip(x.row(i)) {
+            *m += *v as f64;
         }
     }
     for m in &mut mean {
@@ -25,9 +101,9 @@ fn fit_standardizer(x: &[Vec<f64>], idx: &[usize]) -> (Vec<f64>, Vec<f64>) {
     }
     let mut std = vec![0.0; d];
     for &i in idx {
-        for j in 0..d {
-            let dd = x[i][j] - mean[j];
-            std[j] += dd * dd;
+        for ((s, v), m) in std.iter_mut().zip(x.row(i)).zip(&mean) {
+            let dd = *v as f64 - *m;
+            *s += dd * dd;
         }
     }
     for s in &mut std {
@@ -39,15 +115,18 @@ fn fit_standardizer(x: &[Vec<f64>], idx: &[usize]) -> (Vec<f64>, Vec<f64>) {
     (mean, std)
 }
 
+/// Standardise one row. The subtraction and division are f64; the result is kept f32
+/// because `xtr` below holds one standardised copy of the training slice per fold, and
+/// those copies are as large as the matrix itself.
 #[inline]
-fn std_row(row: &[f64], mean: &[f64], std: &[f64]) -> Vec<f64> {
+fn std_row(row: &[f32], mean: &[f64], std: &[f64]) -> Vec<f32> {
     (0..row.len())
-        .map(|j| (row[j] - mean[j]) / std[j])
+        .map(|j| ((row[j] as f64 - mean[j]) / std[j]) as f32)
         .collect()
 }
 
 /// Logistic regression by full-batch gradient descent with L2. Weight[0] = bias.
-fn logreg_fit(rows: &[&[f64]], y: &[f64], l2: f64, epochs: usize, lr: f64) -> Vec<f64> {
+fn logreg_fit(rows: &[&[f32]], y: &[f64], l2: f64, epochs: usize, lr: f64) -> Vec<f64> {
     let d = rows.first().map(|r| r.len()).unwrap_or(0);
     let mut w = vec![0.0f64; d + 1];
     if rows.is_empty() {
@@ -59,13 +138,13 @@ fn logreg_fit(rows: &[&[f64]], y: &[f64], l2: f64, epochs: usize, lr: f64) -> Ve
         for (r, &yi) in rows.iter().zip(y) {
             let mut z = w[0];
             for j in 0..d {
-                z += w[j + 1] * r[j];
+                z += w[j + 1] * r[j] as f64;
             }
             let p = 1.0 / (1.0 + (-z).exp());
             let err = p - yi;
             grad[0] += err;
             for j in 0..d {
-                grad[j + 1] += err * r[j];
+                grad[j + 1] += err * r[j] as f64;
             }
         }
         w[0] -= lr * grad[0] / n;
@@ -76,16 +155,16 @@ fn logreg_fit(rows: &[&[f64]], y: &[f64], l2: f64, epochs: usize, lr: f64) -> Ve
     w
 }
 
-fn score_row(w: &[f64], r: &[f64]) -> f64 {
+fn score_row(w: &[f64], r: &[f32]) -> f64 {
     let mut z = w[0];
     for j in 0..r.len() {
-        z += w[j + 1] * r[j];
+        z += w[j + 1] * r[j] as f64;
     }
     z
 }
 
 pub struct RescoreInput<'a> {
-    pub features: &'a [Vec<f64>],
+    pub features: &'a FeatureMatrix,
     pub is_decoy: &'a [bool],
     /// Cross-validation fold key. Use base_peptide_id so every charge/mod variant
     /// of a peptide lands in the same fold (no peptide leaks train<->test).
@@ -98,7 +177,7 @@ pub struct RescoreInput<'a> {
 
 /// Run the semi-supervised rescorer, returning a discriminant score per PSM.
 pub fn percolator_lite(inp: RescoreInput) -> Vec<f64> {
-    let n = inp.features.len();
+    let n = inp.features.rows();
     if n == 0 {
         return Vec::new();
     }
@@ -121,12 +200,12 @@ pub fn percolator_lite(inp: RescoreInput) -> Vec<f64> {
             }
             let (mean, std) = fit_standardizer(inp.features, &train_idx);
             // standardized train matrix (owned, so we can take &[f64] slices)
-            let xtr: Vec<Vec<f64>> = train_idx
+            let xtr: Vec<Vec<f32>> = train_idx
                 .iter()
-                .map(|&i| std_row(&inp.features[i], &mean, &std))
+                .map(|&i| std_row(inp.features.row(i), &mean, &std))
                 .collect();
             let mut train_scores: Vec<f64> = train_idx.iter().map(|&i| inp.init_score[i]).collect();
-            let mut w = vec![0.0; inp.features[0].len() + 1];
+            let mut w = vec![0.0; inp.features.n_features() + 1];
             let mut sd: Vec<(f64, bool)> = Vec::with_capacity(train_idx.len());
             for _ in 0..inp.num_iter.max(1) {
                 sd.clear();
@@ -138,7 +217,7 @@ pub fn percolator_lite(inp: RescoreInput) -> Vec<f64> {
                 );
                 let q = target_decoy_q(&sd);
                 // positive set: confident targets; negatives: all decoys
-                let mut rows: Vec<&[f64]> = Vec::new();
+                let mut rows: Vec<&[f32]> = Vec::new();
                 let mut ys: Vec<f64> = Vec::new();
                 let mut n_pos = 0;
                 for (k, &i) in train_idx.iter().enumerate() {
@@ -177,7 +256,7 @@ pub fn percolator_lite(inp: RescoreInput) -> Vec<f64> {
             // score the held-out test fold with this fold's scaler + weights
             test_idx
                 .iter()
-                .map(|&i| (i, score_row(&w, &std_row(&inp.features[i], &mean, &std))))
+                .map(|&i| (i, score_row(&w, &std_row(inp.features.row(i), &mean, &std))))
                 .collect()
         })
         .collect();
@@ -198,7 +277,7 @@ mod tests {
     #[test]
     fn separates_targets_from_decoys() {
         // targets have high feature[0], decoys low, plus noise
-        let mut features = Vec::new();
+        let mut features = FeatureMatrix::with_capacity(200, 2);
         let mut is_decoy = Vec::new();
         let mut cid = Vec::new();
         let mut init = Vec::new();
@@ -206,11 +285,13 @@ mod tests {
             let decoy = i % 2 == 0;
             let base = if decoy { 0.0 } else { 3.0 };
             let noise = ((i * 7 % 5) as f64) * 0.1;
-            features.push(vec![base + noise, noise]);
+            features.push(base + noise);
+            features.push(noise);
             is_decoy.push(decoy);
             cid.push(i as u32);
             init.push(base + noise); // init score already discriminates
         }
+        let features = features.finish().unwrap();
         let s = percolator_lite(RescoreInput {
             features: &features,
             is_decoy: &is_decoy,

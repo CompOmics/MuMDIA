@@ -227,6 +227,34 @@ def test_protein_names_keep_their_species_flags(imported):
     assert any(p.endswith("_ECOLI") for p in proteins)
 
 
+def test_an_empty_protein_is_written_as_unassigned(diann_lib, tmp_path):
+    """DIA-NN leaves `Protein.Names` empty for peptides it did not map, the iRT-kit
+    standards above all. The engine refuses a library with an empty required string
+    (`index.rs load()`), so the importer must name that group rather than pass the
+    empty cell through; otherwise every DIA-NN library with the standards in it fails
+    to load."""
+    src = pq.read_table(diann_lib)
+    modseq = src.column("Modified.Sequence").to_pylist()
+    charge = src.column("Precursor.Charge").to_pylist()
+    prot = src.column("Protein.Names").to_pylist()
+    blanked = [
+        "" if (m == "PEPTIDEK" and z == 3) else p for m, z, p in zip(modseq, charge, prot)
+    ]
+    assert blanked != prot, "the fixture must contain the precursor being blanked"
+    i = src.schema.get_field_index("Protein.Names")
+    lib = tmp_path / "diann_lib_blank.parquet"
+    pq.write_table(src.set_column(i, "Protein.Names", pa.array(blanked, pa.string())), str(lib),
+                   compression="snappy")
+    prec = tmp_path / "lib_precursors.parquet"
+    frag = tmp_path / "lib_fragments.parquet"
+    run_worker_ok("import_diann_lib.py", lib, prec, frag)
+    cols = read_columns(prec)
+    by_key = {(p, z): pr for p, z, pr in zip(cols["peptidoform"], cols["charge"], cols["protein"])}
+    assert by_key[("PEPTIDEK", 3)] == "UNASSIGNED"
+    assert by_key[("PEPTIDEK", 2)] == "ALBU_HUMAN", "only the blanked precursor changes"
+    assert all(pr.strip() for pr in cols["protein"]), "no empty protein reaches the engine"
+
+
 def test_output_parquet_uses_only_a_codec_the_engine_can_decode(imported):
     """Snappy (or uncompressed), or the engine cannot open the library at all.
 

@@ -27,7 +27,7 @@ pub fn score_scan_count_dot(
         let mut dot = 0.0f64;
         for k in 0..cand.n_frag {
             let gi = cand.frag_start + k;
-            let fmz = lib.frag_mz[gi] as f32 as f64; // match FragIndex f32 storage
+            let fmz = lib.frag_mz[gi] as f64; // library stores f32, as FragIndex matches on
             let fint = lib.frag_int[gi];
             for &(pmz, pint) in peaks {
                 if within_ppm(fmz, pmz, tol_ppm) {

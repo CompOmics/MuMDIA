@@ -287,20 +287,22 @@ jobs:
       # included.
       #
       # Strict on the weekly schedule and on a manual dispatch; advisory on a pull
-      # request. A new advisory lands independently of any pull request, so a strict
-      # gate here fails changes that did not cause it, which is how teams end up
-      # deleting the scanner. The weekly run is where a new advisory has to be dealt
-      # with, and it fails loudly.
+      # request and on a push to main. A new advisory lands independently of any
+      # change, so a strict gate here fails changes that did not cause it, which is
+      # how teams end up deleting the scanner. It also blocked a release: the merge
+      # of #54 went red on main for a setuptools advisory (2026-09-06), and the
+      # release gate requires a successful ci.yml run for the tagged commit. The
+      # weekly run is where a new advisory has to be dealt with, and it fails loudly.
       - name: Audit the resolved environment for known vulnerabilities
         if: steps.touched.outputs.run == 'true'
         shell: micromamba-shell {0}
-        continue-on-error: ${{ github.event_name == 'pull_request' }}
+        continue-on-error: ${{ github.event_name != 'schedule' && github.event_name != 'workflow_dispatch' }}
         run: |
           set -euo pipefail
           python -m pip install --quiet pip-audit
           # NOT --strict, and the reason is specific rather than a shrug. --strict
           # fails when a package cannot be resolved on PyPI at all, and `torch` is
-          # installed from the PyTorch index as `2.12.1+cpu`, a local version that by
+          # installed from the PyTorch index as `2.14.0+cpu`, a local version that by
           # construction does not exist on PyPI. That is not a finding, it is how CPU
           # torch is distributed, and failing on it would train everyone to ignore
           # this job. Real advisories still fail the run.

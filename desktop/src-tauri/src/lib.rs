@@ -5,7 +5,9 @@
 //! and the run registry, and nothing else.
 
 pub mod components;
+pub mod diann;
 pub mod engine;
 pub mod preflight;
 pub mod run;
 pub mod settings;
+pub mod thermo;
