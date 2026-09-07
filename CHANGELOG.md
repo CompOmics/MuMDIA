@@ -28,8 +28,17 @@ than a number. Both are recorded in every run's `manifest.json`.
   targets from decoys no better than chance (41.6% decoys among the top 1,000 seed
   scores, against 0% with the DIA-NN library on the same spectra), so retention-time
   calibration found no anchors and the run proceeded with an unbounded RT window.
+  Measured on that run with 12 fragments: `HCDch2` 19,308 confident seeds (0% decoys
+  in the top 5,000; fragment charges 79% / 21%), `HCD2021` with charge-2 fragments
+  only from precursor charge 3 14,412, the DIA-NN library 21,856.
 
 ### Changed
+
+- `predict_frag.ms2pip_model` defaults to `HCDch2` (was `HCD`), for the reason above.
+  `configs/examples/fasta-sidecars.json` and the image's `config.dia.json` set
+  `top_n_fragments: 12` explicitly, the count the DIA-NN library ships and the one the
+  measurement used; the engine default stays 6, because the native predictor was not
+  re-measured.
 
 - The MS2PIP worker uses the engine's thread count for its process pool (passed as a
   fourth argument by `run_ms2pip`) instead of capping itself at eight processes, and

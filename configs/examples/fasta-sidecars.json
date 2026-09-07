@@ -10,6 +10,8 @@
   "predict_frag": {
     "predictor": "ms2pip",
     "rt_predictor": "deeplc",
+    "ms2pip_model": "HCDch2",
+    "top_n_fragments": 12,
     "ms2pip_python": "auto",
     "deeplc_python": "auto",
     "sidecar_script_dir": "scripts"

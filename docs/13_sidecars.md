@@ -529,7 +529,7 @@ configured.
 |---|---|---|
 | `predict_frag.predictor` | `native` | `ms2pip` engages `ms2pip_worker.py` (requires `ms2pip_python`) |
 | `predict_frag.rt_predictor` | `native` | `deeplc` engages `deeplc_worker.py` (requires `deeplc_python`) |
-| `predict_frag.ms2pip_model` | `"HCD"` | 3rd positional arg to `ms2pip_worker.py` |
+| `predict_frag.ms2pip_model` | `"HCDch2"` | 3rd positional arg to `ms2pip_worker.py`; `*ch2` models emit the `b2`/`y2` series as `frag_charge` 2 |
 | `predict_frag.ms2pip_python` | `None` | interpreter for MS2PIP (env with ms2pip+pyarrow) |
 | `predict_frag.deeplc_python` | `None` | interpreter for DeepLC predict AND fine-tune |
 | `predict_frag.sidecar_script_dir` | `"scripts"` | dir passed to `resolve_script` for all workers |

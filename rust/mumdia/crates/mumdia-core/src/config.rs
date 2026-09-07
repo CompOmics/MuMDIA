@@ -486,10 +486,12 @@ pub struct PredictFragConfig {
     /// predict the b/y series at charge 1; charge-2 fragments then take the native
     /// heuristic, normalised per charge group. The `*ch2` models also predict the
     /// doubly charged series, and every fragment then carries a model intensity on one
-    /// scale. Prefer `HCDch2` for an Orbitrap library whose fragments include charge 2
-    /// (`charge2_from_precursor_charge` <= 2): with `HCD2021` the heuristic charge-2
-    /// values, each group normalised to 1.0, filled 78.6% of the top-6 slots on the HYE
-    /// FASTA library and the seed search could not separate targets from decoys.
+    /// scale. Default `HCDch2` since 2026-09-07, on correctness grounds: with `HCD2021`
+    /// (6 fragments, charge-2 fragments from precursor charge 2) the heuristic charge-2
+    /// values, each group normalised to 1.0, filled 78.6% of the fragment slots on the
+    /// HYE FASTA library and the seed search found 0 confident PSMs at 1% on a real run
+    /// (41.6% decoys among the top 1,000 seed scores). `HCDch2` with 12 fragments gave
+    /// 19,308 confident seeds on the same run against 21,856 with the DIA-NN library.
     pub ms2pip_model: String,
     /// Python executable for the MS2PIP sidecar (env with ms2pip + pyarrow).
     pub ms2pip_python: Option<String>,
@@ -506,7 +508,7 @@ impl Default for PredictFragConfig {
             charge2_from_precursor_charge: 2,
             charge_by_basic_residues: false,
             top_n_fragments: 6,
-            ms2pip_model: "HCD".to_string(),
+            ms2pip_model: "HCDch2".to_string(),
             ms2pip_python: None,
             deeplc_python: None,
             sidecar_script_dir: "scripts".to_string(),
