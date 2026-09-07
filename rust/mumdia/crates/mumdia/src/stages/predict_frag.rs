@@ -129,9 +129,33 @@ pub fn run(p: PredictFragParams) -> Result<(u64, u64)> {
         "predict-frag: parsed"
     );
 
-    let rt_model_id = assign_rt(&p, &mut raws)?;
-    let frag_model_id = assign_intensities(&p, &mut raws)?;
+    let (rt_model_id, rt_missing) = assign_rt(&p, &mut raws)?;
+    let (frag_model_id, frag_missing) = assign_intensities(&p, &mut raws)?;
     let model_identity = format!("{rt_model_id}; {frag_model_id}");
+
+    // Coverage. A candidate a predictor returned nothing for is dropped, together with
+    // every candidate sharing its pair key (base peptide, charge, modification set), so
+    // a target and its paired decoy leave the library together and the exchangeability
+    // the FDR rests on is kept. Substituting a value was the previous behaviour, iRT 0.0
+    // for DeepLC and the native heuristic for MS2PIP, and it produced a plausible, finite
+    // library whose rows came from an unrecorded mixture of predictors (docs/29 #17).
+    let (n_dropped_rows, n_dropped_pairs) = drop_unpredicted(&mut raws, &rt_missing, &frag_missing);
+    if n_dropped_rows > 0 {
+        tracing::warn!(
+            candidates_dropped = n_dropped_rows,
+            pairs_dropped = n_dropped_pairs,
+            without_irt = rt_missing.len(),
+            without_intensities = frag_missing.len(),
+            "predict-frag: candidates without a prediction were dropped with their pairs \
+             instead of receiving a substitute value; the counts are in the library report"
+        );
+    }
+    if raws.is_empty() && (n_dropped_rows > 0 || n_parse_err > 0) {
+        bail!(
+            "predict-frag: no candidate received a prediction ({n_dropped_rows} dropped for \
+             missing predictions); the predictor sidecar produced nothing usable"
+        );
+    }
 
     // Finite guard at the prediction sidecar boundary. A NaN/Inf predicted iRT or
     // fragment intensity from a misbehaving MS2PIP/DeepLC run would silently
@@ -271,6 +295,14 @@ pub fn run(p: PredictFragParams) -> Result<(u64, u64)> {
     stats.insert("candidates".to_string(), json!(n_prec));
     stats.insert("fragments".to_string(), json!(n_frag));
     stats.insert("parse_errors".to_string(), json!(n_parse_err));
+    stats.insert(
+        "candidates_dropped_unpredicted".to_string(),
+        json!(n_dropped_rows),
+    );
+    stats.insert(
+        "pairs_dropped_unpredicted".to_string(),
+        json!(n_dropped_pairs),
+    );
     for (path, schema) in [
         (p.out_precursors, artifact::FRAGMENT_LIBRARY_PRECURSORS),
         (p.out_fragments, artifact::FRAGMENT_LIBRARY_FRAGMENTS),
@@ -305,8 +337,9 @@ pub fn run(p: PredictFragParams) -> Result<(u64, u64)> {
     Ok((n_prec, n_frag))
 }
 
-/// Assign predicted iRT to every candidate. Returns the model id.
-fn assign_rt(p: &PredictFragParams, raws: &mut [Raw]) -> Result<String> {
+/// Assign predicted iRT to every candidate. Returns the model id and the indices of the
+/// candidates the predictor returned nothing for; the caller drops those.
+fn assign_rt(p: &PredictFragParams, raws: &mut [Raw]) -> Result<(String, Vec<usize>)> {
     match p.cfg.rt_predictor {
         RtPredictorKind::Native => {
             let m = NativeRt;
@@ -314,7 +347,7 @@ fn assign_rt(p: &PredictFragParams, raws: &mut [Raw]) -> Result<String> {
             raws.par_iter_mut().for_each(|r| {
                 r.irt = m.predict_irt(&r.parsed);
             });
-            Ok(m.identity())
+            Ok((m.identity(), Vec::new()))
         }
         RtPredictorKind::Deeplc => {
             let python = p.cfg.deeplc_python.as_deref().ok_or_else(|| {
@@ -334,30 +367,22 @@ fn assign_rt(p: &PredictFragParams, raws: &mut [Raw]) -> Result<String> {
                 }
             }
             let out = sidecar::run_deeplc(python, &script, p.work_dir, &ids, &peps)?;
-            let mut n_irt_missing = 0u64;
-            for r in raws.iter_mut() {
+            let mut missing = Vec::new();
+            for (i, r) in raws.iter_mut().enumerate() {
                 let uid = uniq[&r.peptidoform];
                 match out.get(&uid) {
                     Some(&v) => r.irt = v,
-                    None => {
-                        r.irt = 0.0;
-                        n_irt_missing += 1;
-                    }
+                    None => missing.push(i),
                 }
             }
-            if n_irt_missing > 0 {
-                tracing::warn!(
-                    n_irt_missing,
-                    "predict-frag: DeepLC returned no iRT for some peptidoforms; anchored at iRT 0.0"
-                );
-            }
-            Ok("deeplc-4.0-mt".to_string())
+            Ok(("deeplc-4.0-mt".to_string(), missing))
         }
     }
 }
 
-/// Assign a predicted intensity to every fragment. Returns the model id.
-fn assign_intensities(p: &PredictFragParams, raws: &mut [Raw]) -> Result<String> {
+/// Assign a predicted intensity to every fragment. Returns the model id and the indices
+/// of the candidates the predictor returned nothing for; the caller drops those.
+fn assign_intensities(p: &PredictFragParams, raws: &mut [Raw]) -> Result<(String, Vec<usize>)> {
     match p.cfg.predictor {
         FragPredictorKind::Native => {
             let m = NativeFrag;
@@ -367,7 +392,7 @@ fn assign_intensities(p: &PredictFragParams, raws: &mut [Raw]) -> Result<String>
             raws.par_iter_mut().for_each(|r| {
                 r.frag_int = m.predict_intensities(&r.parsed, &r.frags);
             });
-            Ok(m.identity())
+            Ok((m.identity(), Vec::new()))
         }
         FragPredictorKind::Ms2pip => {
             let python = p.cfg.ms2pip_python.as_deref().ok_or_else(|| {
@@ -398,32 +423,117 @@ fn assign_intensities(p: &PredictFragParams, raws: &mut [Raw]) -> Result<String>
             // self-contained, so this is bit-identical to the serial loop. The MS2PIP sidecar
             // call already happened above -- what is parallelized here is the per-row native
             // prediction and normalization, which is real CPU work, not sidecar wait.
-            raws.par_iter_mut().enumerate().for_each(|(i, r)| {
-                let per = map.get(&(i as u32));
-                match per {
-                    Some(per) if !per.is_empty() => {
-                        let keys: Vec<(u8, u16, u8)> = r
-                            .frags
-                            .iter()
-                            .map(|fr| {
-                                (
-                                    fr.ion_type.symbol() as u8,
-                                    fr.ordinal as u16,
-                                    fr.charge.clamp(1, 255) as u8,
-                                )
-                            })
-                            .collect();
-                        let nat = native.predict_intensities(&r.parsed, &r.frags);
-                        r.frag_int = ms2pip_values(&keys, per, &nat);
+            //
+            // A candidate MS2PIP returned nothing for is reported to the caller, which
+            // drops it with its pair; it used to receive the native heuristic silently,
+            // under a library-wide MS2PIP model identity (docs/29 #17).
+            let covered: Vec<bool> = raws
+                .par_iter_mut()
+                .enumerate()
+                .map(|(i, r)| {
+                    let per = map.get(&(i as u32));
+                    match per {
+                        Some(per) if !per.is_empty() => {
+                            let keys: Vec<(u8, u16, u8)> = r
+                                .frags
+                                .iter()
+                                .map(|fr| {
+                                    (
+                                        fr.ion_type.symbol() as u8,
+                                        fr.ordinal as u16,
+                                        fr.charge.clamp(1, 255) as u8,
+                                    )
+                                })
+                                .collect();
+                            let nat = native.predict_intensities(&r.parsed, &r.frags);
+                            r.frag_int = ms2pip_values(&keys, per, &nat);
+                            true
+                        }
+                        _ => {
+                            r.frag_int = vec![0.0; r.frags.len()];
+                            false
+                        }
                     }
-                    _ => {
-                        r.frag_int = native.predict_intensities(&r.parsed, &r.frags);
-                    }
-                }
-            });
-            Ok(format!("ms2pip-{}", p.cfg.ms2pip_model))
+                })
+                .collect();
+            let missing: Vec<usize> = covered
+                .iter()
+                .enumerate()
+                .filter(|(_, &c)| !c)
+                .map(|(i, _)| i)
+                .collect();
+            Ok((format!("ms2pip-{}", p.cfg.ms2pip_model), missing))
         }
     }
+}
+
+/// The modification content of a ProForma peptidoform, order-free: every bracketed
+/// token, sorted and joined. Two peptidoforms with the same base peptide, charge and
+/// signature are the same precursor on the target and decoy side.
+fn mod_signature(peptidoform: &str) -> String {
+    let mut mods: Vec<&str> = Vec::new();
+    let mut rest = peptidoform;
+    while let Some(open) = rest.find('[') {
+        match rest[open..].find(']') {
+            Some(close) => {
+                mods.push(&rest[open + 1..open + close]);
+                rest = &rest[open + close + 1..];
+            }
+            None => break,
+        }
+    }
+    mods.sort_unstable();
+    mods.join(",")
+}
+
+/// The key under which a target and its paired decoy are one precursor.
+fn pair_key(base_peptide_id: u32, charge: i32, peptidoform: &str) -> (u32, i32, String) {
+    (base_peptide_id, charge, mod_signature(peptidoform))
+}
+
+/// Which rows to drop so that every row sharing a pair key with an unpredicted row goes
+/// with it. `keys[i]` is the pair key of row `i`; `missing` lists unpredicted rows.
+fn rows_to_drop(keys: &[(u32, i32, String)], missing: &[usize]) -> Vec<bool> {
+    let doomed: std::collections::HashSet<&(u32, i32, String)> =
+        missing.iter().map(|&i| &keys[i]).collect();
+    keys.iter().map(|k| doomed.contains(k)).collect()
+}
+
+/// Drop every candidate without a prediction together with its pair. Returns the
+/// number of rows and of distinct pair keys removed.
+fn drop_unpredicted(
+    raws: &mut Vec<Raw>,
+    rt_missing: &[usize],
+    frag_missing: &[usize],
+) -> (u64, u64) {
+    if rt_missing.is_empty() && frag_missing.is_empty() {
+        return (0, 0);
+    }
+    let keys: Vec<(u32, i32, String)> = raws
+        .iter()
+        .map(|r| pair_key(r.base_peptide_id, r.charge, &r.peptidoform))
+        .collect();
+    let mut missing: Vec<usize> = rt_missing
+        .iter()
+        .chain(frag_missing.iter())
+        .copied()
+        .collect();
+    missing.sort_unstable();
+    missing.dedup();
+    let drop = rows_to_drop(&keys, &missing);
+    let n_pairs = missing
+        .iter()
+        .map(|&i| &keys[i])
+        .collect::<std::collections::HashSet<_>>()
+        .len() as u64;
+    let before = raws.len();
+    let mut i = 0usize;
+    raws.retain(|_| {
+        let keep = !drop[i];
+        i += 1;
+        keep
+    });
+    ((before - raws.len()) as u64, n_pairs)
 }
 
 /// One candidate's fragment intensities from its MS2PIP predictions.
@@ -538,8 +648,36 @@ fn fragment_cardinality(cid: &[u32], mz: &[f64]) -> Vec<i32> {
 
 #[cfg(test)]
 mod cardinality_tests {
-    use super::{fragment_cardinality, ms2pip_values};
+    use super::{fragment_cardinality, mod_signature, ms2pip_values, pair_key, rows_to_drop};
     use std::collections::HashMap;
+
+    #[test]
+    fn unpredicted_candidates_are_dropped_with_their_pairs() {
+        // Pair key = (base peptide, charge, modification set): the target PEPTIDEK/2 and
+        // its reversed decoy share base 7 and charge 2 with no modifications; the oxidised
+        // form is a different precursor and stays.
+        assert_eq!(mod_signature("PEPTM[Oxidation]IDEK"), "Oxidation");
+        assert_eq!(
+            mod_signature("C[Carbamidomethyl]M[Oxidation]C[Carbamidomethyl]K"),
+            "Carbamidomethyl,Carbamidomethyl,Oxidation"
+        );
+        assert_eq!(mod_signature("[Acetyl]-PEPTIDEK"), "Acetyl");
+        assert_eq!(mod_signature("PEPTIDEK"), "");
+        let keys = vec![
+            pair_key(7, 2, "PEPTIDEK"),
+            pair_key(7, 2, "KEDITPEP"),
+            pair_key(7, 2, "PEPTM[Oxidation]IDEK"),
+            pair_key(7, 3, "PEPTIDEK"),
+            pair_key(8, 2, "SAMPLER"),
+        ];
+        // Only the target PEPTIDEK/2 lacked a prediction: it and its decoy go, the
+        // oxidised form, the charge-3 form and the other peptide stay.
+        assert_eq!(
+            rows_to_drop(&keys, &[0]),
+            vec![true, true, false, false, false]
+        );
+        assert_eq!(rows_to_drop(&keys, &[]), vec![false; 5]);
+    }
 
     #[test]
     fn ms2pip_values_keep_the_two_group_regime_for_single_charge_models() {

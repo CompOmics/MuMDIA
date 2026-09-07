@@ -57,6 +57,24 @@ pub struct RescoreParams<'a> {
 /// The matrix spans six orders of magnitude between the smoke fixture and a 40-run
 /// experiment, so a fixed unit is unhelpful at one end or the other: `0.00 GiB` says
 /// nothing, and `270336.0 MiB` says it badly.
+/// Bytes of the flat f32 feature matrix for `rows` PSMs and `features` columns, or
+/// `None` when the product overflows.
+fn feature_matrix_bytes(rows: usize, features: usize) -> Option<u64> {
+    (rows as u64)
+        .checked_mul(features as u64)?
+        .checked_mul(std::mem::size_of::<f32>() as u64)
+}
+
+/// `Some(ceiling)` when a configured `rescore.max_feature_matrix_gib` (0 = off) is
+/// exceeded by `matrix_bytes`.
+fn matrix_ceiling_exceeded(matrix_bytes: u64, max_gib: f64) -> Option<f64> {
+    if max_gib <= 0.0 {
+        return None;
+    }
+    let gib = matrix_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+    (gib > max_gib).then_some(max_gib)
+}
+
 fn human_bytes(bytes: f64) -> String {
     const KIB: f64 = 1024.0;
     const MIB: f64 = KIB * 1024.0;
@@ -142,6 +160,38 @@ pub fn run(p: RescoreParams) -> Result<u64> {
     let mut total_rows = 0usize;
     for path in p.competed.iter() {
         total_rows += TableFile::open(path)?.nrows;
+    }
+    // The matrix is one contiguous f32 buffer (`rescoring::FeatureMatrix`), so its size
+    // follows from the parquet footers and the selected feature count before a byte is
+    // allocated. The ceiling used to be applied after the matrix had been filled, against
+    // an estimate of the old `Vec<Vec<f64>>` layout (8 bytes per value plus a 24-byte
+    // spine per PSM), so it could neither prevent the allocation it described nor
+    // describe the one that happened (docs/29 #11). It is a limit on the matrix alone.
+    let matrix_bytes = feature_matrix_bytes(total_rows, feat_names.len()).ok_or_else(|| {
+        anyhow::anyhow!(
+            "rescore feature matrix size overflows: {total_rows} PSMs x {} features",
+            feat_names.len()
+        )
+    })?;
+    info!(
+        psms = total_rows,
+        features = feat_names.len(),
+        feature_matrix = %human_bytes(matrix_bytes as f64),
+        folds = p.cfg.folds,
+        "rescore: feature matrix size before allocation"
+    );
+    if let Some(ceiling) = matrix_ceiling_exceeded(matrix_bytes, p.cfg.max_feature_matrix_gib) {
+        anyhow::bail!(
+            "rescore feature matrix would be {} ({total_rows} PSMs x {} features x 4 bytes, \
+             f32), over the configured rescore.max_feature_matrix_gib of {ceiling:.2}. This \
+             is the matrix alone: per-PSM metadata, the per-fold standardised training \
+             copies of native_tda (roughly (1 + folds) times this at peak) and the Python \
+             worker's own copy come on top. Either raise the ceiling, or rescore fewer runs \
+             per invocation -- `run_psm_q` is computed per source, so sub-batching costs no \
+             per-run FDR, though it does change which PSMs share the pooled q_value.",
+            human_bytes(matrix_bytes as f64),
+            feat_names.len(),
+        );
     }
     let mut matrix = FeatureMatrix::with_capacity(total_rows, feat_names.len());
     for (src, path) in p.competed.iter().enumerate() {
@@ -257,37 +307,12 @@ pub fn run(p: RescoreParams) -> Result<u64> {
             }
         }
     }
-    // Say how big the feature matrix is, and refuse it if a ceiling is configured.
-    //
-    // `feats` is `Vec<Vec<f64>>`, so eight bytes per value plus a heap allocation and a
-    // 24-byte spine entry per PSM -- twice the width CLAUDE.md documented, because that
-    // figure describes the Python worker's f32 matrix. On an experiment-wide pool this is
-    // the peak-RSS wall (the code's own comment says ~27 GB), `native_tda` runs all folds
-    // in parallel each holding an owned standardised copy of its training slice, and
-    // nothing here estimates available memory. So the failure mode was an OS kill after
-    // however long the run took to reach it, with no number to plan against.
-    let matrix_bytes = (n as f64) * (feat_names.len() as f64) * 8.0 + (n as f64) * 24.0;
-    let matrix_gib = matrix_bytes / (1024.0 * 1024.0 * 1024.0);
     info!(
         psms = n,
         features = feat_names.len(),
-        feature_matrix = %human_bytes(matrix_bytes),
         folds = p.cfg.folds,
         "rescore: loaded competed PSMs"
     );
-    if p.cfg.max_feature_matrix_gib > 0.0 && matrix_gib > p.cfg.max_feature_matrix_gib {
-        anyhow::bail!(
-            "rescore feature matrix would be {} ({n} PSMs x {} features x 8 bytes), over \
-             the configured rescore.max_feature_matrix_gib of {:.2}. The native rescorer \
-             holds roughly (1 + folds) times this at peak. Either raise the ceiling, or \
-             rescore fewer runs per invocation -- `run_psm_q` is computed per source, so \
-             sub-batching costs no per-run FDR, though it does change which PSMs share \
-             the pooled q_value.",
-            human_bytes(matrix_bytes),
-            feat_names.len(),
-            p.cfg.max_feature_matrix_gib
-        );
-    }
 
     // Track the path actually taken so the report reflects reality rather than a
     // hardcoded label, and pick the null the q-values are computed against.
@@ -1640,5 +1665,24 @@ b
             "picked-TDC: the higher-scoring decoy wins group 7"
         );
         assert!(qd[1] <= 1.0);
+    }
+}
+
+#[cfg(test)]
+mod matrix_ceiling_tests {
+    use super::*;
+
+    #[test]
+    fn the_ceiling_is_judged_on_the_f32_matrix_before_allocation() {
+        // 1,000,000 PSMs x 387 features: 1.548 GB as f32. The old estimate
+        // (8 bytes + a 24-byte spine per PSM) was 3.12 GB, so a 2 GiB ceiling used to
+        // refuse a matrix that fits with room to spare.
+        let bytes = feature_matrix_bytes(1_000_000, 387).unwrap();
+        assert_eq!(bytes, 1_548_000_000);
+        assert_eq!(matrix_ceiling_exceeded(bytes, 2.0), None);
+        assert_eq!(matrix_ceiling_exceeded(bytes, 1.0), Some(1.0));
+        // 0 disables the ceiling; an overflowing product is refused rather than wrapped.
+        assert_eq!(matrix_ceiling_exceeded(bytes, 0.0), None);
+        assert_eq!(feature_matrix_bytes(usize::MAX, 2), None);
     }
 }

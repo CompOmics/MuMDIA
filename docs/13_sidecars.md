@@ -207,10 +207,12 @@ MS2PIP charge-1 (TIC-fraction, ~0.02-0.3) and the native charge-2 fallback
 top-N would bury MS2PIP, so each charge group is max-normalized to its own peak
 before they compete (`predict_frag.rs:365-384`). Two native-fallback edge cases:
 `run_ms2pip` returning an empty map is a hard error (`bail!("MS2PIP returned no
-predictions")`, `predict_frag.rs:342-344`), while a single candidate that MS2PIP
-returned nothing for (missing/empty per-id entry) falls back wholesale to the
-native intensities for that candidate (`predict_frag.rs:387-389`). The
-worker builds `psm_utils.PSMList` in chunks of `max(100k, 20k x processes)` rows,
+predictions")`), while a single candidate that MS2PIP returned nothing for
+(missing/empty per-id entry) is dropped from the library together with its pair
+(`drop_unpredicted`; docs/29 #17) instead of falling back to the native intensities
+under an MS2PIP model identity. `run_ms2pip` rejects an id it did not request and a
+fragment reported twice. The worker builds `psm_utils.PSMList` in chunks of
+`max(100k, 5k x processes)` rows,
 calls `ms2pip.predict_batch(model, processes=N)` with `N` the engine's thread count
 passed as the fourth argument (the old cap `min(8, cpu_count)` applies only when the
 argument is absent), and converts MS2PIP's log2 intensities to linear via
@@ -224,9 +226,11 @@ start method safe for multiprocessing.
 **DeepLC predict** (`predict_frag.rs:274-312`, worker `deeplc_worker.py`).
 Selected by `predict_frag.rt_predictor = "deeplc"`. `assign_rt` deduplicates by
 peptidoform (RT is charge-independent, `predict_frag.rs:281-290`), calls
-`run_deeplc`, and writes `r.irt`. Peptidoforms with no returned iRT are anchored
-at `0.0` with a warning (`predict_frag.rs:293-308`; this is the "unmatched
-peptidoforms silently get iRT 0.0" foot-gun noted in CLAUDE.md). The worker calls
+`run_deeplc`, and writes `r.irt`. Peptidoforms with no returned iRT are dropped
+from the library with their pairs and counted in the library report (they used to
+be anchored at `0.0` with a warning, the "unmatched peptidoforms silently get iRT
+0.0" foot-gun; docs/29 #17). `run_deeplc` rejects an id it did not request and a
+duplicate id. The worker calls
 `deeplc.predict` in 200k chunks and, when the multitask model returns an
 ensemble matrix `(N, n_models)`, averages across models (`deeplc_worker.py:44-47`).
 Predictions are uncalibrated; rt-im-train's per-run LOESS/linear maps them onto

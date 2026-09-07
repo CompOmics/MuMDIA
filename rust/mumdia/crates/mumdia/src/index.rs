@@ -17,7 +17,7 @@
 use anyhow::Result;
 use arrow::array::{Array, Float32Array, Float64Array, StringArray, UInt32Array};
 use mumdia_core::constants::{ppm_bounds, PROTON};
-use mumdia_io::table::TableFile;
+use mumdia_io::table::{require_no_nulls, TableFile};
 use rayon::prelude::*;
 
 /// Fragment rows per decoded batch while streaming the fragment table (a few MB).
@@ -244,6 +244,10 @@ impl Library {
                     .as_any()
                     .downcast_ref::<UInt32Array>()
                     .ok_or_else(|| anyhow::anyhow!("fragment column 'candidate_id' is not u32"))?;
+                // `values()` is the physical buffer and ignores the validity bitmap: a NULL
+                // candidate_id would read as 0 and attach the fragment to candidate 0
+                // (docs/29 #2).
+                require_no_nulls(a, "candidate_id", fragments, row)?;
                 for &candidate_id in a.values().iter() {
                     let c = candidate_id as usize;
                     if c >= ncand {
@@ -286,6 +290,7 @@ impl Library {
                 ix("predicted_intensity")?,
                 ix("name")?,
             );
+            let mut row_base = 0usize;
             for b in reader {
                 let b = b?;
                 let a_cid = b
@@ -305,6 +310,19 @@ impl Library {
                     .ok_or_else(|| {
                         anyhow::anyhow!("fragment column 'predicted_intensity' is not f32")
                     })?;
+                let a_name = b
+                    .column(i_name)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .ok_or_else(|| anyhow::anyhow!("fragment column 'name' is not utf8"))?;
+                // Every required column, before any value is read: the finiteness checks
+                // above ran on physical buffers, where a NULL is a perfectly finite 0.0, and
+                // the fill below used to turn NULLs into NaN and "" instead of refusing
+                // them (docs/29 #2).
+                require_no_nulls(a_cid, "candidate_id", fragments, row_base)?;
+                require_no_nulls(a_mz, "mz", fragments, row_base)?;
+                require_no_nulls(a_int, "predicted_intensity", fragments, row_base)?;
+                require_no_nulls(a_name, "name", fragments, row_base)?;
                 // Same contract as the precursor columns above, applied batch by batch. A
                 // non-finite fragment m/z is worse than a wrong value: `FragIndex::build`
                 // collapses its whole m/z range when the observed min or max is not finite,
@@ -331,11 +349,6 @@ impl Library {
                         a_cid.value(k)
                     );
                 }
-                let a_name = b
-                    .column(i_name)
-                    .as_any()
-                    .downcast_ref::<StringArray>()
-                    .ok_or_else(|| anyhow::anyhow!("fragment column 'name' is not utf8"))?;
                 for k in 0..b.num_rows() {
                     let c = a_cid.value(k) as usize;
                     if c >= ncand {
@@ -345,23 +358,10 @@ impl Library {
                     }
                     let pos = cursor[c] as usize;
                     cursor[c] += 1;
-                    // Null policy matches the typed getters (null f64/f32 -> NaN, null utf8
-                    // -> ""); the artifact has no nulls, this only keeps the contract exact.
-                    frag_mz[pos] = if a_mz.is_null(k) {
-                        f32::NAN
-                    } else {
-                        a_mz.value(k) as f32
-                    };
-                    frag_int[pos] = if a_int.is_null(k) {
-                        f32::NAN
-                    } else {
-                        a_int.value(k)
-                    };
-                    let name = if a_name.is_null(k) {
-                        ""
-                    } else {
-                        a_name.value(k)
-                    };
+                    // NULLs were rejected above, so the physical values are the values.
+                    frag_mz[pos] = a_mz.value(k) as f32;
+                    frag_int[pos] = a_int.value(k);
+                    let name = a_name.value(k);
                     let id = match name_lookup.get(name) {
                         Some(&id) => id,
                         None => {
@@ -379,6 +379,7 @@ impl Library {
                     };
                     frag_name_id[pos] = id;
                 }
+                row_base += b.num_rows();
             }
         }
         drop(name_lookup);
@@ -920,5 +921,113 @@ mod tests {
         };
         assert!(err.contains("'peptidoform'"), "{err}");
         std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod null_fixture_tests {
+    use super::*;
+    use arrow::array::{Float32Array, Float64Array, Int32Array, StringArray, UInt32Array};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use mumdia_io::table::{write_batches, write_table, Col};
+    use std::sync::Arc;
+
+    fn precursors(dir: &std::path::Path) -> String {
+        let p = dir.join("prec.parquet").to_str().unwrap().to_string();
+        write_table(
+            &p,
+            vec![
+                Col::U32("candidate_id".into(), vec![0, 1]),
+                Col::U32("peptidoform_id".into(), vec![0, 1]),
+                Col::U32("base_peptide_id".into(), vec![0, 1]),
+                Col::Str(
+                    "peptidoform".into(),
+                    vec!["PEPTIDEK".into(), "SAMPLER".into()],
+                ),
+                Col::I32("charge".into(), vec![2, 2]),
+                Col::F64("precursor_mz".into(), vec![400.0, 500.0]),
+                Col::F32("predicted_irt".into(), vec![10.0, 20.0]),
+                Col::Str("label".into(), vec!["target".into(), "decoy".into()]),
+                Col::Str("protein".into(), vec!["P1".into(), "P2".into()]),
+                Col::I32("n_fragments".into(), vec![1, 1]),
+            ],
+        )
+        .unwrap();
+        p
+    }
+
+    /// A two-row fragment table with one NULL in `null_in`.
+    fn fragments_with_null(dir: &std::path::Path, null_in: &str) -> String {
+        let f = dir
+            .join(format!("frag_{null_in}.parquet"))
+            .to_str()
+            .unwrap()
+            .to_string();
+        let cid = UInt32Array::from(if null_in == "candidate_id" {
+            vec![Some(0u32), None]
+        } else {
+            vec![Some(0u32), Some(1)]
+        });
+        let mz = Float64Array::from(if null_in == "mz" {
+            vec![Some(200.1), None]
+        } else {
+            vec![Some(200.1), Some(250.5)]
+        });
+        let inten = Float32Array::from(if null_in == "predicted_intensity" {
+            vec![None, Some(0.9f32)]
+        } else {
+            vec![Some(1.0f32), Some(0.9)]
+        });
+        let name = StringArray::from(if null_in == "name" {
+            vec![Some("b2"), None]
+        } else {
+            vec![Some("b2"), Some("y3")]
+        });
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("candidate_id", DataType::UInt32, true),
+            Field::new("mz", DataType::Float64, true),
+            Field::new("predicted_intensity", DataType::Float32, true),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("ion_type", DataType::Utf8, false),
+            Field::new("ordinal", DataType::Int32, false),
+            Field::new("frag_charge", DataType::Int32, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(cid),
+                Arc::new(mz),
+                Arc::new(inten),
+                Arc::new(name),
+                Arc::new(StringArray::from(vec!["b", "y"])),
+                Arc::new(Int32Array::from(vec![2, 3])),
+                Arc::new(Int32Array::from(vec![1, 1])),
+            ],
+        )
+        .unwrap();
+        write_batches(&f, schema, &[batch]).unwrap();
+        f
+    }
+
+    #[test]
+    fn a_null_in_any_required_fragment_column_is_refused_by_name() {
+        // Before docs/29 #2 a NULL m/z or intensity loaded as NaN (the finiteness check
+        // looked at physical buffers) and a NULL candidate_id attached the fragment to
+        // candidate 0.
+        let dir = std::env::temp_dir().join(format!("mumdia_index_nulls_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = precursors(&dir);
+        for col in ["candidate_id", "mz", "predicted_intensity", "name"] {
+            let f = fragments_with_null(&dir, col);
+            let err = match Library::load(&p, &f, 8) {
+                Ok(_) => panic!("a NULL {col} must not load"),
+                Err(e) => format!("{e:#}"),
+            };
+            assert!(err.contains(&format!("'{col}'")), "{col}: {err}");
+            assert!(err.contains("NULL"), "{col}: {err}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

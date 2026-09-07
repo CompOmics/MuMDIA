@@ -1978,6 +1978,149 @@ impl Config {
                  baseline is subtracted"
             );
         }
+        // ── numeric domains (docs/29 #18) ───────────────────────────────────────
+        //
+        // A value outside its domain used to be accepted and then either excluded every
+        // discovery (`quant.q_threshold = -0.1`), was clamped into a different analysis
+        // (`rt_im_train.rt_window_multiplier = -1.0` became a one-second window), or fed a
+        // training recipe a fraction above one. Each field's domain is stated here once;
+        // 0 keeps its documented "off" or "no cap" meaning where a field has one.
+        for (name, value) in [
+            ("quant.q_threshold", self.quant.q_threshold),
+            ("rescore.train_margin_frac", self.rescore.train_margin_frac),
+            ("mbr.q_transfer", self.mbr.q_transfer),
+        ] {
+            if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+                return Err(Invalid(format!(
+                    "{name} must be finite and in [0, 1] (got {value})"
+                )));
+            }
+        }
+        for (name, value) in [
+            ("search_seed.fdr_seed", self.search_seed.fdr_seed),
+            ("rt_im_train.q_train", self.rt_im_train.q_train),
+            ("rt_im_train.p_rt", self.rt_im_train.p_rt),
+            ("rt_im_train.loess_span", self.rt_im_train.loess_span),
+        ] {
+            if !value.is_finite() || value <= 0.0 || value > 1.0 {
+                return Err(Invalid(format!(
+                    "{name} must be finite and in (0, 1] (got {value})"
+                )));
+            }
+        }
+        if !self.rt_im_train.window_holdout_frac.is_finite()
+            || !(0.0..1.0).contains(&self.rt_im_train.window_holdout_frac)
+        {
+            return Err(Invalid(format!(
+                "rt_im_train.window_holdout_frac must be finite and in [0, 1) (got {}); 0 \
+                 sizes the window in-sample",
+                self.rt_im_train.window_holdout_frac
+            )));
+        }
+        for (name, value) in [
+            (
+                "rt_im_train.rt_window_multiplier",
+                self.rt_im_train.rt_window_multiplier,
+            ),
+            (
+                "rt_im_train.fallback_rt_window_s",
+                self.rt_im_train.fallback_rt_window_s,
+            ),
+        ] {
+            if !value.is_finite() || value <= 0.0 {
+                return Err(Invalid(format!(
+                    "{name} must be finite and > 0 (got {value}); a non-positive value was \
+                     previously clamped into a one-second window instead of being rejected"
+                )));
+            }
+        }
+        for (name, value) in [
+            ("extract.apex_rt_prior_s", self.extract.apex_rt_prior_s),
+            (
+                "rt_im_train.rt_window_min_s",
+                self.rt_im_train.rt_window_min_s,
+            ),
+            (
+                "extract.apex_gaussian_sigma_scans",
+                self.extract.apex_gaussian_sigma_scans,
+            ),
+            (
+                "rescore.max_feature_matrix_gib",
+                self.rescore.max_feature_matrix_gib,
+            ),
+            ("rescore.train_neg_ratio", self.rescore.train_neg_ratio),
+            ("rescore.train_subsample", self.rescore.train_subsample),
+        ] {
+            if !value.is_finite() || value < 0.0 {
+                return Err(Invalid(format!(
+                    "{name} must be finite and >= 0 (got {value}); 0 keeps its documented \
+                     meaning (off, or no cap)"
+                )));
+            }
+        }
+        if self.digest.min_len == 0 || self.digest.min_len > self.digest.max_len {
+            return Err(Invalid(format!(
+                "digest.min_len must be >= 1 and <= digest.max_len (got {} and {})",
+                self.digest.min_len, self.digest.max_len
+            )));
+        }
+        if self.peptidoforms.charge_min < 1
+            || self.peptidoforms.charge_min > self.peptidoforms.charge_max
+        {
+            return Err(Invalid(format!(
+                "peptidoforms.charge_min must be >= 1 and <= peptidoforms.charge_max (got {} \
+                 and {})",
+                self.peptidoforms.charge_min, self.peptidoforms.charge_max
+            )));
+        }
+        for (name, value) in [
+            (
+                "predict_frag.top_n_fragments",
+                self.predict_frag.top_n_fragments,
+            ),
+            (
+                "search_seed.min_matched_peaks",
+                self.search_seed.min_matched_peaks,
+            ),
+            ("search_seed.report_psms", self.search_seed.report_psms),
+            ("extract.apex_count_window", self.extract.apex_count_window),
+            (
+                "extract.presence_min_fragments",
+                self.extract.presence_min_fragments,
+            ),
+            ("experiment.parallel_runs", self.experiment.parallel_runs),
+            ("rescore.seeds", self.rescore.seeds),
+        ] {
+            if value == 0 {
+                return Err(Invalid(format!("{name} must be >= 1")));
+            }
+        }
+        if self.predict_frag.charge2_from_precursor_charge < 1 {
+            return Err(Invalid(
+                "predict_frag.charge2_from_precursor_charge must be >= 1".into(),
+            ));
+        }
+        if self.rt_im_train.min_seed_for_calibration < 2 {
+            return Err(Invalid(
+                "rt_im_train.min_seed_for_calibration must be >= 2; a calibration needs at \
+                 least two anchors"
+                    .into(),
+            ));
+        }
+        if self.rt_im_train.finetune_deeplc
+            && (self.rt_im_train.finetune_epochs == 0 || self.rt_im_train.finetune_batch == 0)
+        {
+            return Err(Invalid(
+                "rt_im_train.finetune_epochs and finetune_batch must be >= 1 when \
+                 finetune_deeplc is on"
+                    .into(),
+            ));
+        }
+        if self.rt_im_train.adaptive_rt_window && self.rt_im_train.adaptive_rt_bins == 0 {
+            return Err(Invalid(
+                "rt_im_train.adaptive_rt_bins must be >= 1 when adaptive_rt_window is on".into(),
+            ));
+        }
         Ok(())
     }
 
@@ -2209,6 +2352,42 @@ mod tests {
         assert!(Config::from_json(r#"{"rescore":{"classifier":"nn_torch"}}"#).is_err());
         assert!(Config::from_json(r#"{"rescore":{"classifier":"percolator"}}"#).is_err());
         assert!(Config::from_json(r#"{"rescore":{"classifier":"entrapment"}}"#).is_err());
+    }
+
+    #[test]
+    fn numeric_domains_are_validated_at_load() {
+        // The three values docs/29 #18 reproduced as accepted: a negative q threshold
+        // excluded every discovery, a negative multiplier was clamped into a one-second
+        // window, and a fraction above one fed the training recipe out of its domain.
+        for bad in [
+            r#"{"quant":{"q_threshold":-0.1}}"#,
+            r#"{"rt_im_train":{"rt_window_multiplier":-1.0}}"#,
+            r#"{"rescore":{"train_margin_frac":2.0}}"#,
+            r#"{"digest":{"min_len":10,"max_len":5}}"#,
+            r#"{"digest":{"min_len":0}}"#,
+            r#"{"peptidoforms":{"charge_min":3,"charge_max":2}}"#,
+            r#"{"rt_im_train":{"window_holdout_frac":1.0}}"#,
+            r#"{"rt_im_train":{"p_rt":0.0}}"#,
+            r#"{"search_seed":{"min_matched_peaks":0}}"#,
+            r#"{"experiment":{"parallel_runs":0}}"#,
+            r#"{"rescore":{"train_neg_ratio":-1.0}}"#,
+            r#"{"predict_frag":{"top_n_fragments":0}}"#,
+        ] {
+            assert!(Config::from_json(bad).is_err(), "{bad} must be rejected");
+        }
+        // Documented zero semantics survive: no negative cap, in-sample window sizing,
+        // an uncapped subsample, a row-cap subsample above one.
+        for ok in [
+            r#"{"rescore":{"train_neg_ratio":0}}"#,
+            r#"{"rt_im_train":{"window_holdout_frac":0.0}}"#,
+            r#"{"rescore":{"train_subsample":0.0}}"#,
+            r#"{"rescore":{"train_subsample":2000}}"#,
+            r#"{"rescore":{"max_feature_matrix_gib":0}}"#,
+            r#"{"extract":{"apex_rt_prior_s":0.0}}"#,
+        ] {
+            assert!(Config::from_json(ok).is_ok(), "{ok} must be accepted");
+        }
+        assert!(Config::default().validate().is_ok());
     }
 
     #[test]

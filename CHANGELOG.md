@@ -65,6 +65,45 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ### Fixed
 
+- Code review A, data integrity (`docs/29_code_review_2026-09-07.md`, findings 1, 2, 4,
+  9, 11, 17, 18, 21):
+  - quant's refusal of a pooled scored table read `source` as i32 while rescore writes
+    it as u32, treated the type error as "no such column", and so never ran on the
+    engine's own output; a pooled table quantified against one run's chromatograms
+    produced one identical row per run. The column is now read in its declared type and
+    a present column of another type is an error (#1).
+  - The streamed library loader checked fragment `mz` and `predicted_intensity` for
+    finiteness on the physical Arrow buffers, which ignore the validity bitmap, and then
+    turned NULL cells into NaN, NULL names into `""` and a NULL `candidate_id` into
+    candidate 0. Every required fragment column now rejects NULLs before its values are
+    read, through the same contract the typed getters enforce, with a fixture per
+    column (#2).
+  - `AtomicPath` removed the destination before renaming, so a failed publication had
+    already destroyed the previous artifact and readers saw a window with no file; two
+    writers for one destination in one process shared a temporary name. The rename
+    replaces in place on every platform, the temporary name carries a counter, and the
+    failure case is tested (#4).
+  - N-terminal methionine excision was skipped whenever the Met-retained peptide fell
+    outside the length window, so an N-terminal peptide of `max_len + 1` residues yielded
+    nothing although its excised form was in range. Both forms are judged on their own
+    length (#9).
+  - `rescore.max_feature_matrix_gib` was checked after the matrix had been filled,
+    against an estimate of the old `Vec<Vec<f64>>` layout, so it could neither prevent the
+    allocation nor describe it; it is now checked from the parquet footers and the
+    selected feature count before allocation, on the flat f32 layout, with checked
+    arithmetic (#11).
+  - A candidate DeepLC or MS2PIP returned nothing for received a substitute (iRT 0.0, or
+    the native intensities under an MS2PIP model identity). It is now dropped together
+    with its paired decoy or target, the counts are in the library report and a warning,
+    and a worker id that was not requested or appears twice is an error (#17).
+  - Numeric configuration domains are validated at load: thresholds and fractions within
+    their unit interval, positive multipliers and widths, ordered `min_len <= max_len` and
+    `charge_min <= charge_max`, counts at least one, with documented zero meanings kept
+    (#18). `quant.q_threshold = -0.1`, `rt_im_train.rt_window_multiplier = -1.0` and
+    `rescore.train_margin_frac = 2.0` were accepted before.
+  - `ci/gen_config_reference.py` and `ci/check_workflows.py` scan the files git tracks
+    rather than everything on disk, so scratch copies beside the sources no longer enter
+    the generated reference or the workflow check (#21).
 - Desktop: the digest fields on the Search screen (missed cleavages, peptide length,
   charge range, carbamidomethyl, oxidation) now reach the engine on the built-in
   library path. They were read only by the DIA-NN library build, so with the built-in

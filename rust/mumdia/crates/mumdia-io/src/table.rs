@@ -342,10 +342,19 @@ impl TableWriter {
 ///   directory of unopenable artifacts is still worse than a directory of intact ones;
 /// - nothing distinguished "this run wrote it" from "a previous run left it".
 ///
-/// Writing to `<path>.tmp-<pid>` and renaming on success addresses all three: the
+/// Writing to `<path>.tmp-<pid>-<n>` and renaming on success addresses all three: the
 /// rename is atomic on both POSIX and Windows for a same-directory target, so a reader
 /// sees either the old artifact or the new one, never a partial one. A killed run
-/// leaves at most a recognisable `.tmp-<pid>` file, which is inert.
+/// leaves at most a recognisable `.tmp-<pid>-<n>` file, which is inert.
+///
+/// Two guarantees this makes, and one it does not (docs/29 #4): the destination is never
+/// removed before the rename, so a failed publication leaves the previous artifact in
+/// place; and `n` is a process-wide counter, so two writers for one destination in one
+/// process cannot share a temporary file. It does not promise that the rename succeeds
+/// while another Windows process holds the destination open without delete sharing;
+/// then the rename fails and the old file stays, which is the first guarantee at work.
+static TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 pub struct AtomicPath {
     tmp: std::path::PathBuf,
     final_path: std::path::PathBuf,
@@ -361,7 +370,8 @@ impl AtomicPath {
                     .with_context(|| format!("creating output directory {}", parent.display()))?;
             }
         }
-        let tmp = std::path::PathBuf::from(format!("{path}.tmp-{}", std::process::id()));
+        let n = TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = std::path::PathBuf::from(format!("{path}.tmp-{}-{n}", std::process::id()));
         Ok(AtomicPath {
             tmp,
             final_path,
@@ -375,14 +385,12 @@ impl AtomicPath {
 
     /// Move the completed temp file onto the final path.
     pub fn publish(mut self) -> Result<()> {
-        // Windows `rename` fails when the destination exists, unlike POSIX. Removing
-        // first opens a window in which neither file is at the final path; that is
-        // strictly better than the previous behaviour, where the window lasted for the
-        // whole write.
-        if self.final_path.exists() {
-            std::fs::remove_file(&self.final_path)
-                .with_context(|| format!("replacing {}", self.final_path.display()))?;
-        }
+        // `std::fs::rename` replaces an existing destination FILE on POSIX and, through
+        // `MoveFileExW(MOVEFILE_REPLACE_EXISTING)`, on Windows, so the destination is not
+        // removed first. Removing it first meant a rename that then failed had already
+        // destroyed the previous result, and gave every reader a window with no file at
+        // the final path at all (docs/29 #4). Now a failed rename is an error with the
+        // previous artifact still where it was.
         std::fs::rename(&self.tmp, &self.final_path).with_context(|| {
             format!(
                 "publishing {} -> {}",
@@ -746,6 +754,27 @@ fn reject_null(name: &str, row: usize) -> anyhow::Error {
          accessors; a NULL here would otherwise be substituted with 0 or an empty string. \
          Fix or drop the row"
     )
+}
+
+/// The same contract as [`reject_null`], for a reader that walks Arrow batches itself.
+///
+/// The streaming library loader reads fragment columns straight from record batches, and
+/// `values()` on an Arrow array is the physical buffer: it ignores the validity bitmap,
+/// so a NULL reads as 0 or 0.0 and a finiteness check over it proves nothing. Call this
+/// on every required column of a batch before touching its values (docs/29 #2).
+/// `row_offset` is the absolute row of the batch's first element, so the message names
+/// the row a person can find in the file.
+pub fn require_no_nulls(
+    array: &dyn arrow::array::Array,
+    name: &str,
+    path: &str,
+    row_offset: usize,
+) -> Result<()> {
+    if array.null_count() == 0 {
+        return Ok(());
+    }
+    let row = (0..array.len()).find(|&i| array.is_null(i)).unwrap_or(0);
+    Err(reject_null(name, row_offset + row).context(format!("in {path}")))
 }
 
 fn push_i64(out: &mut Vec<i64>, col: &ArrayRef, name: &str) -> Result<()> {
@@ -1521,5 +1550,84 @@ mod streaming_tests {
         assert_eq!(w.close().unwrap(), 2);
         assert!(TableWriter::new(&tmp("never.parquet")).close().is_err());
         std::fs::remove_file(&p).ok();
+    }
+}
+
+#[cfg(test)]
+mod atomic_path_tests {
+    use super::*;
+
+    fn dir(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("mumdia_atomic_{}_{}", name, std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn two_writers_for_one_destination_get_different_temporary_files() {
+        let d = dir("two_writers");
+        let final_path = d.join("out.parquet").to_str().unwrap().to_string();
+        let a = AtomicPath::new(&final_path).unwrap();
+        let b = AtomicPath::new(&final_path).unwrap();
+        assert_ne!(
+            a.tmp(),
+            b.tmp(),
+            "the suffix must not be the process id alone"
+        );
+        drop(a);
+        drop(b);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_failed_publication_leaves_the_previous_result_in_place() {
+        // The destination is a non-empty directory, which a file cannot be renamed onto
+        // on any platform, so publication fails. Before the fix the destination was
+        // removed first and the failure left nothing behind.
+        let d = dir("failed_publish");
+        let final_path = d.join("out.parquet");
+        std::fs::create_dir_all(&final_path).unwrap();
+        std::fs::write(final_path.join("previous"), b"previous result").unwrap();
+        let ap = AtomicPath::new(final_path.to_str().unwrap()).unwrap();
+        std::fs::write(ap.tmp(), b"new result").unwrap();
+        assert!(
+            ap.publish().is_err(),
+            "renaming a file onto a directory must fail"
+        );
+        assert!(
+            final_path.join("previous").is_file(),
+            "the previous result must survive a failed publication"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_successful_publication_replaces_the_previous_file() {
+        let d = dir("replace");
+        let final_path = d.join("out.parquet");
+        let fp = final_path.to_str().unwrap().to_string();
+        let first = AtomicPath::new(&fp).unwrap();
+        std::fs::write(first.tmp(), b"v1").unwrap();
+        first.publish().unwrap();
+        let second = AtomicPath::new(&fp).unwrap();
+        std::fs::write(second.tmp(), b"v2").unwrap();
+        second.publish().unwrap();
+        assert_eq!(std::fs::read(&final_path).unwrap(), b"v2");
+        assert!(
+            std::fs::read_dir(&d).unwrap().count() == 1,
+            "no temporary file may remain after publication"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn require_no_nulls_names_the_column_and_the_absolute_row() {
+        let a = arrow::array::Float64Array::from(vec![Some(1.0), None, Some(3.0)]);
+        let err = require_no_nulls(&a, "mz", "lib.parquet", 1000).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("'mz'") && msg.contains("row 1001"), "{msg}");
+        let ok = arrow::array::Float64Array::from(vec![Some(1.0), Some(2.0)]);
+        assert!(require_no_nulls(&ok, "mz", "lib.parquet", 0).is_ok());
     }
 }

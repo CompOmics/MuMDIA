@@ -88,13 +88,34 @@ pub fn run_ms2pip(
     } else {
         None
     };
+    // Returned ids must be requested ones and each (ion, ordinal, charge) may appear once
+    // per id; coverage of the requested set is the caller's decision (docs/29 #17).
+    let requested: std::collections::HashSet<u32> = ids.iter().copied().collect();
     let mut map: FragmentIntensityMap = HashMap::new();
     for i in 0..t.nrows {
+        if !requested.contains(&oid[i]) {
+            bail!(
+                "MS2PIP worker returned id {}, which was not among the {} peptidoforms \
+                 requested",
+                oid[i],
+                ids.len()
+            );
+        }
         let ib = ion[i].as_bytes().first().copied().unwrap_or(b'?');
         let z = fch.as_ref().map(|c| c[i].clamp(1, 255) as u8).unwrap_or(1);
-        map.entry(oid[i])
+        if map
+            .entry(oid[i])
             .or_default()
-            .insert((ib, ord[i] as u16, z), inten[i]);
+            .insert((ib, ord[i] as u16, z), inten[i])
+            .is_some()
+        {
+            bail!(
+                "MS2PIP worker returned fragment {}{} charge {z} of id {} more than once",
+                ion[i],
+                ord[i],
+                oid[i]
+            );
+        }
     }
     Ok(map)
 }
@@ -155,7 +176,25 @@ pub fn run_deeplc(
     let t = TableFile::open(&outp)?;
     let oid = t.u32("id")?;
     let rt = t.f32("predicted_rt")?;
-    Ok(oid.into_iter().zip(rt).collect())
+    // Returned ids must be a subset of the requested ones, each at most once. A repeated
+    // id used to overwrite silently and an unrequested one was kept; coverage (ids with
+    // no prediction) is the caller's to decide, and it drops those candidates rather
+    // than substituting a value (docs/29 #17).
+    let requested: std::collections::HashSet<u32> = ids.iter().copied().collect();
+    let mut map: HashMap<u32, f32> = HashMap::with_capacity(oid.len());
+    for (id, value) in oid.into_iter().zip(rt) {
+        if !requested.contains(&id) {
+            bail!(
+                "DeepLC worker returned id {id}, which was not among the {} peptidoforms \
+                 requested",
+                ids.len()
+            );
+        }
+        if map.insert(id, value).is_some() {
+            bail!("DeepLC worker returned id {id} more than once");
+        }
+    }
+    Ok(map)
 }
 
 /// DeepLC multitask fine-tune: adapt the RT model to this run's confident seed
