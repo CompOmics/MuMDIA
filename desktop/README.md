@@ -98,19 +98,22 @@ narrow on purpose -- "this configuration requires no sidecar at all", asked of
 `native_tda` would be wrong: on an imported library it measured 10,847 against
 `nn_torch`'s 10,914.
 
-### Two environments, not one
+### Two environments, not one (historical)
 
-MS2PIP cannot share an environment with DeepLC at the versions this project tests:
+MS2PIP could not share an environment with DeepLC at the versions this project
+tested until 2026-09-07:
 
     deeplc==4.1.1  -> psm-utils>=1.5 -> sqlalchemy>=2
     ms2pip==4.0.0  ->                   sqlalchemy>=1.3,<2
 
-`uv` reports the pair as unsatisfiable. `ms2pip>=4.1` does resolve alongside DeepLC,
-but MS2PIP's version changes predicted fragment intensities, and
-`env/docker-rescore.yml` pins 4.0.0 deliberately as "a separate, testable upgrade".
-So the primary environment covers rescoring, DeepLC and match-between-runs, which is
-the whole recommended workflow, and MS2PIP gets its own, installed on request and
-needed only for FASTA-mode library building with predicted intensities.
+`uv` reported the pair as unsatisfiable, so the primary environment covers
+rescoring, DeepLC and match-between-runs, and MS2PIP got its own, installed on
+request and needed only for FASTA-mode library building with predicted
+intensities. The shipped MS2PIP is now 4.2.0, which resolves next to DeepLC (the
+host specification `env/mumdia-deeplc.yml` holds all three), and the FASTA path
+was measured with it (`docs/28`, section 22). The application still installs it as
+the separate optional component; folding it into the primary environment and
+removing the second `Env` is a follow-up, not a requirement.
 
 ## DIA-NN
 

@@ -15,6 +15,18 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ## [Unreleased]
 
+### Changed
+
+- MS2PIP 4.2.0 in every shipped environment (`env/docker-rescore.yml`,
+  `env/console-ms2pip-requirements.txt`), and `env/mumdia-deeplc.yml` now carries
+  `ms2pip==4.2.0` too, so one host environment serves DeepLC, MS2PIP and the `nn_torch`
+  rescorer and `configs/examples/fasta-sidecars.json` runs from the shipped
+  specifications with its interpreters at `auto`. Before this no host specification
+  provided MS2PIP at all. 4.0.0 needed `sqlalchemy<2` and could not share an
+  environment with DeepLC; 4.2.0 is the version behind the FASTA-mode measurements in
+  `docs/28` section 22. The image's smoke test imports `ms2pip` in the rescore
+  environment.
+
 ### Added
 
 - MS2PIP charge-2 fragment predictions reach the library. The worker emits a
