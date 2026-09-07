@@ -424,8 +424,15 @@ The worker (`scripts/mbr_worker.py`) implements two tiers:
 The M5 augmented scored output (`--out-scored`, `mbr_worker.py:272`) requires the
 scored table to have a `source` column and matches transfers on `(candidate_id,
 source)`, taking `min(q_value, transfer_q)` and setting `is_transferred`. The worker
-prints a validation summary (accepted counts per run, empirical decoy fraction, and the
-RT window `delta_star` at `q_transfer`, `mbr_worker.py:245`).
+prints a validation summary: accepted counts per run, how many permuted-RT null draws
+fall inside the accepted RT window, and the window `delta_star` at `q_transfer`. It
+no longer prints a "decoy fraction" among accepted transfers: every transfer candidate
+is a confident target of another run, so that fraction was structurally zero and said
+nothing about calibration (docs/29 #6). The transfer q uses the engine's `+1`
+pseudocount, `(null <= delta + 1) / (targets <= delta)`, so a pool no permuted residual
+undercuts no longer gets q = 0 (docs/29 #7), and the RT residual is measured on the
+peak rescore selected (`selected_peak_rank`) when a competed table carries several
+peaks per candidate (docs/29 #8).
 
 ### report (`report.rs:49`, `run`)
 

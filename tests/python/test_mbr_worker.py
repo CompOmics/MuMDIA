@@ -29,6 +29,7 @@ Dataset layout (built once per session):
 from __future__ import annotations
 
 import numpy as np
+import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
@@ -565,3 +566,115 @@ def test_missing_psms_path_fails_loudly(mbr_dataset, tmp_path):
     )
     assert rc != 0
     assert "does_not_exist" in err or "No such file" in err or "FileNotFound" in err
+
+
+# ---------------------------------------------------------------------------
+# small pools and the selected peak (docs/29 #7, #8)
+# ---------------------------------------------------------------------------
+
+
+def _small_dataset(d, n_cand, run0_apex, run0_extra=None, selected_peak_rank=None):
+    """`n_cand` candidates confident in runs 1 and 2, extracted sub-threshold in run 0.
+
+    `run0_apex(cid)` gives run 0's observed apex; `run0_extra` appends rows to run 0's
+    table (candidate_id, apex_rt, peak_rank, prelim_score) to model a second retained
+    peak; `selected_peak_rank` maps candidate_id -> rescore's chosen rank for source 0.
+    """
+    ids = list(range(n_cand))
+    rows = {k: [] for k in ("candidate_id", "source", "label", "q_value",
+                            "peptidoform", "charge", "protein_group")}
+    sel = []
+    for cid in ids:
+        for src in range(3):
+            rows["candidate_id"].append(cid)
+            rows["source"].append(src)
+            rows["label"].append("target")
+            rows["q_value"].append(0.5 if src == 0 else 0.001)
+            rows["peptidoform"].append("PEP{}K".format(cid))
+            rows["charge"].append(2)
+            rows["protein_group"].append("PG{}".format(cid % 3))
+            sel.append(selected_peak_rank.get(cid, 0) if (selected_peak_rank and src == 0) else 0)
+    extra_int = {"selected_peak_rank": sel} if selected_peak_rank is not None else None
+    scored = write_scored_table(d / "scored.parquet", rows, extra_int=extra_int)
+    base = lambda cid: 200.0 + 5.0 * cid
+    run0_ids = list(ids)
+    run0_rt = [run0_apex(c) for c in ids]
+    extra = None
+    if run0_extra:
+        extra = {"peak_rank": [0] * len(ids), "prelim_score": [10.0] * len(ids)}
+        for cid, rt, rank, score in run0_extra:
+            run0_ids.append(cid)
+            run0_rt.append(rt)
+            extra["peak_rank"].append(rank)
+            extra["prelim_score"].append(score)
+    psms = [
+        write_psms_table(d / "psms_0.parquet", run0_ids, run0_rt, extra_cols=extra),
+        write_psms_table(d / "psms_1.parquet", ids, [base(c) + 0.02 for c in ids]),
+        write_psms_table(d / "psms_2.parquet", ids, [base(c) - 0.02 for c in ids]),
+    ]
+    return {"scored": scored, "psms_csv": ",".join(str(p) for p in psms)}
+
+
+def _derangement_seed(n):
+    """A seed whose first `permutation(n)` has no fixed point, so no permuted
+    residual coincides with a real one and the null count is exactly zero."""
+    for seed in range(1, 10_000):
+        perm = np.random.default_rng(seed).permutation(n)
+        if not np.any(perm == np.arange(n)):
+            return seed
+    raise AssertionError("no derangement seed found")
+
+
+def test_a_tiny_concordant_pool_is_not_accepted_at_one_percent(tmp_path):
+    """Three candidates, every observed apex within 0.01 s of its prediction and no
+    permuted residual as small: the ratio (null <= delta) / targets is exactly 0 for
+    all of them, and the worker used to accept all three at 1% (docs/29 #7). With the
+    engine's +1 pseudocount the best q a three-candidate pool can reach is 1/3.
+    """
+    d = tmp_path / "tiny"
+    d.mkdir()
+    ds = _small_dataset(d, 3, lambda cid: 200.0 + 5.0 * cid + 0.01)
+    seed = _derangement_seed(3)
+    strict = d / "strict.parquet"
+    run_worker_ok("mbr_worker.py", ds["scored"], ds["psms_csv"], strict,
+                  "--q-anchor", 0.01, "--min-anchor-runs", 2, "--q-transfer", 0.01, "--seed", seed)
+    assert pq.read_table(strict).num_rows == 0, "1/3 is not <= 0.01"
+
+    loose = d / "loose.parquet"
+    run_worker_ok("mbr_worker.py", ds["scored"], ds["psms_csv"], loose,
+                  "--q-anchor", 0.01, "--min-anchor-runs", 2, "--q-transfer", 0.5, "--seed", seed)
+    t = read_columns(loose)
+    assert len(t["candidate_id"]) == 3
+    assert all(abs(float(q) - 1.0 / 3.0) < 1e-9 for q in t["transfer_q"]), t["transfer_q"]
+
+
+def test_the_transfer_is_measured_on_the_rescore_selected_peak(tmp_path):
+    """Candidate 0 has two retained peaks in run 0: rank 1 at the concordant RT and,
+    listed last, rank 0 five hundred seconds away. Rescore selected rank 1. The worker
+    used to keep the last row per candidate (docs/29 #8), measured the transfer on the
+    wrong peak and rejected it; it must use the selected peak and accept.
+    """
+    d = tmp_path / "selected"
+    d.mkdir()
+    n = 40
+    concordant = lambda cid: 200.0 + 5.0 * cid + 0.01
+    ds = _small_dataset(
+        d, n, concordant,
+        run0_extra=[(0, concordant(0) + 500.0, 0, 99.0)],
+        selected_peak_rank={0: 1},
+    )
+    # The concordant row of candidate 0 is rank 1 (the base rows carry rank 0), so
+    # rewrite run 0's peak_rank for that first row.
+    p0 = d / "psms_0.parquet"
+    tbl = pq.read_table(p0).to_pandas()
+    tbl.loc[(tbl.candidate_id == 0) & (tbl.apex_rt < 400.0), "peak_rank"] = 1
+    pq.write_table(pa.Table.from_pandas(tbl, preserve_index=False), str(p0), compression="snappy")
+
+    out = d / "transferred.parquet"
+    run_worker_ok("mbr_worker.py", ds["scored"], ds["psms_csv"], out,
+                  "--q-anchor", 0.01, "--min-anchor-runs", 2, "--q-transfer", 0.05,
+                  "--seed", _derangement_seed(n))
+    t = read_columns(out)
+    accepted = {int(c): float(rt) for c, rt in zip(t["candidate_id"], t["observed_rt"])}
+    assert 0 in accepted, "the selected concordant peak must carry the transfer"
+    assert abs(accepted[0] - concordant(0)) < 1e-6, accepted[0]

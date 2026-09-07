@@ -433,13 +433,14 @@ def write_features_parquet(path, psms):
 # ---------------------------------------------------------------------------
 
 
-def write_scored_table(path, rows, extra_q=None):
+def write_scored_table(path, rows, extra_q=None, extra_int=None):
     """Write an experiment-wide scored_combined table for `mbr_worker.py`.
 
     `rows` holds equal-length sequences for the columns MBR reads
     (`mbr_worker.py:81-82`): candidate_id, source, label, q_value, peptidoform,
     charge, protein_group. `extra_q` adds further PSM-level q columns
-    (`run_psm_q`, `experiment_psm_q`) that the M5 augmentation must also lower.
+    (`run_psm_q`, `experiment_psm_q`) that the M5 augmentation must also lower;
+    `extra_int` adds int32 columns such as `selected_peak_rank`.
     """
     cols = {
         "candidate_id": pa.array(
@@ -454,26 +455,29 @@ def write_scored_table(path, rows, extra_q=None):
     }
     for name, values in (extra_q or {}).items():
         cols[name] = pa.array(np.asarray(values, dtype=np.float64), pa.float64())
+    for name, values in (extra_int or {}).items():
+        cols[name] = pa.array(np.asarray(values, dtype=np.int32), pa.int32())
     pq.write_table(pa.table(cols), str(path), compression="snappy")
     return path
 
 
-def write_psms_table(path, candidate_ids, apex_rts):
-    """Write a per-run psms.parquet: the two columns MBR reads (`mbr_worker.py:96`)."""
-    pq.write_table(
-        pa.table(
-            {
-                "candidate_id": pa.array(
-                    np.asarray(candidate_ids, dtype=np.uint32), pa.uint32()
-                ),
-                "apex_rt": pa.array(
-                    np.asarray(apex_rts, dtype=np.float64), pa.float64()
-                ),
-            }
-        ),
-        str(path),
-        compression="snappy",
-    )
+def write_psms_table(path, candidate_ids, apex_rts, extra_cols=None):
+    """Write a per-run psms.parquet: the columns MBR reads (`mbr_worker.py`).
+
+    `extra_cols` adds the optional top-K columns (`peak_rank` int32, `prelim_score`
+    float64) a competed table carries when `extract.retain_top_peaks` is above 1.
+    """
+    cols = {
+        "candidate_id": pa.array(np.asarray(candidate_ids, dtype=np.uint32), pa.uint32()),
+        "apex_rt": pa.array(np.asarray(apex_rts, dtype=np.float64), pa.float64()),
+    }
+    for name, values in (extra_cols or {}).items():
+        arr = np.asarray(values)
+        if np.issubdtype(arr.dtype, np.integer):
+            cols[name] = pa.array(arr.astype(np.int32), pa.int32())
+        else:
+            cols[name] = pa.array(arr.astype(np.float64), pa.float64())
+    pq.write_table(pa.table(cols), str(path), compression="snappy")
     return path
 
 

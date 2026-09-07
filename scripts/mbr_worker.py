@@ -20,7 +20,10 @@ Contract:
 Output <out_transferred>.parquet: one row per ACCEPTED transfer
   (candidate_id, source, peptidoform, charge, protein_group, label, expected_rt,
    observed_rt, rt_delta, transfer_q).
-Also prints a validation summary (accepted counts per run, empirical decoy fraction).
+Also prints a validation summary: accepted counts per run and how many permuted-RT
+null draws fall inside the accepted RT window. Transfer candidates are confident
+targets of other runs by construction, so a decoy-label count among them is
+structurally zero and is not printed as validation (docs/29 #6).
 """
 import argparse
 import numpy as np
@@ -48,6 +51,34 @@ def binned_map(x, y, nb=80):
             cy.append(np.median(ys[lo:hi]))
     cx, cy = np.array(cx), np.array(cy)
     return lambda q: np.interp(q, cx, cy)
+
+
+def selected_apex_map(psms_path, source, selected):
+    """candidate_id -> apex_rt for one run, one peak per candidate.
+
+    A competed table carries several peaks per candidate when `extract.retain_top_peaks`
+    is above 1. Rescore chose one of them and wrote its rank as `selected_peak_rank`; the
+    transfer's RT residual is measured on that peak, because that is the apex the scored
+    row carries and quant integrates (docs/29 #8). For a candidate rescore did not select
+    a peak for, the highest `prelim_score` peak stands in; a table without `peak_rank`
+    has one row per candidate and its value is taken as is.
+    """
+    names = set(pq.read_schema(psms_path).names)
+    cols = ["candidate_id", "apex_rt"] + [c for c in ("peak_rank", "prelim_score") if c in names]
+    d = pq.read_table(psms_path, columns=cols).to_pandas()
+    if "peak_rank" not in d.columns or not d.candidate_id.duplicated().any():
+        return dict(zip(d.candidate_id.astype(int), d.apex_rt.astype(float)))
+    want = np.array([selected.get((source, int(c)), -1) for c in d.candidate_id], dtype=np.int64)
+    match = d[(want >= 0) & (d.peak_rank.to_numpy() == want)]
+    out = dict(zip(match.candidate_id.astype(int), match.apex_rt.astype(float)))
+    rest = d[~d.candidate_id.isin(list(out))]
+    if len(rest):
+        if "prelim_score" in rest.columns:
+            best = rest.loc[rest.groupby("candidate_id")["prelim_score"].idxmax()]
+        else:
+            best = rest.drop_duplicates("candidate_id", keep="last")
+        out.update(dict(zip(best.candidate_id.astype(int), best.apex_rt.astype(float))))
+    return out
 
 
 def main():
@@ -85,8 +116,14 @@ def main():
 
     psms_paths = a.psms_csv.split(",")
     n_runs = len(psms_paths)
-    sc = pq.read_table(a.scored, columns=["candidate_id", "source", "label", "q_value",
-                                          "peptidoform", "charge", "protein_group"]).to_pandas()
+    sc_cols = ["candidate_id", "source", "label", "q_value", "peptidoform", "charge", "protein_group"]
+    has_selected = "selected_peak_rank" in set(pq.read_schema(a.scored).names)
+    sc = pq.read_table(a.scored, columns=sc_cols + (["selected_peak_rank"] if has_selected else [])).to_pandas()
+    # rescore's chosen peak per (source, candidate), for the per-run apex lookup below.
+    selected = {}
+    if has_selected:
+        selected = {(int(s_), int(c)): int(r) for c, s_, r in
+                    zip(sc.candidate_id, sc.source, sc.selected_peak_rank)}
     # meta per candidate_id (peptidoform/charge/protein_group/label) from any row
     meta = sc.drop_duplicates("candidate_id").set_index("candidate_id")[
         ["peptidoform", "charge", "protein_group", "label"]]
@@ -97,11 +134,11 @@ def main():
     conf_t = {i: set(sc[(sc.source == i) & (sc.label == "target") & (sc.q_value <= a.q_anchor)].candidate_id)
               for i in range(n_runs)}
 
-    # per-run apex RT (all extracted candidates) + confident-target apex (for maps)
+    # per-run apex RT (all extracted candidates, the rescore-selected peak where a
+    # candidate has several) + confident-target apex (for maps)
     rt_all, rt_anchor = {}, {}
     for i, p in enumerate(psms_paths):
-        d = pq.read_table(p, columns=["candidate_id", "apex_rt"]).to_pandas()
-        m = dict(zip(d.candidate_id, d.apex_rt))
+        m = selected_apex_map(p, i, selected)
         rt_all[i] = m
         rt_anchor[i] = {c: m[c] for c in conf_t[i] if c in m}
 
@@ -195,13 +232,16 @@ def main():
         print("MBR: no transfer candidates"); pa_write_empty(a.out); return
 
     # transfer q via target/decoy competition on rt_delta (smaller = better). At a
-    # threshold delta, FDR = (#decoy <= delta) / (#target <= delta). q = running min.
+    # threshold delta, FDR = (#null <= delta + 1) / (#target <= delta), the same +1
+    # pseudocount as the engine's `fdr.rs`: without it a pool no permuted residual
+    # undercuts gets q exactly 0 however small it is, and a three-candidate pool was
+    # accepted whole at 1% (docs/29 #7). q = running min.
     order = np.argsort(target_delta)
     dt = np.sort(target_delta)
     dd = np.sort(decoy_delta)
-    dec_cum = np.searchsorted(dd, dt, side="right")          # decoys within each delta
+    dec_cum = np.searchsorted(dd, dt, side="right")          # null draws within each delta
     tgt_cum = np.arange(1, len(dt) + 1)
-    fdr = dec_cum / tgt_cum
+    fdr = (dec_cum + 1) / tgt_cum
     q_sorted = np.minimum.accumulate(fdr[::-1])[::-1]         # monotone q from the tail
     q = np.empty_like(q_sorted); q[order] = q_sorted          # map back to row order
 
@@ -248,11 +288,14 @@ def main():
               f"{int((q <= a.q_transfer).sum())} FDR-passing transfers")
 
     n_acc = int(accept.sum())
-    acc_dec = int(((lab == "decoy") & accept).sum())
-    print(f"MBR transfer: candidates={len(cid)} accepted@q<={a.q_transfer}={n_acc} "
-          f"(target={n_acc-acc_dec}, decoy={acc_dec}, empirical decoy-frac="
-          f"{acc_dec/max(1,n_acc)*100:.2f}%)")
     delta_star = dt[q_sorted <= a.q_transfer].max() if (q_sorted <= a.q_transfer).any() else 0.0
+    # The validation statistic is the permuted-RT null, not the decoy label: every
+    # transfer candidate is a confident target somewhere else, so decoys cannot enter
+    # this population and a "decoy fraction" over it was structurally zero (docs/29 #6).
+    null_within = int(np.searchsorted(dd, delta_star, side="right")) if n_acc else 0
+    print(f"MBR transfer: candidates={len(cid)} accepted@q<={a.q_transfer}={n_acc}; "
+          f"permuted-RT null: {len(dd)} draws, {null_within} within the accepted window "
+          f"(transfer q = (null + 1) / targets, running minimum)")
     print(f"  RT window at q<={a.q_transfer}: {delta_star:.1f}s")
     for i in range(n_runs):
         m = accept & (src == i) & (lab == "target")

@@ -13,6 +13,7 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+import subprocess
 import time
 
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
@@ -27,6 +28,38 @@ NON_FEATURE = {"SpecId", "Label", "ScanNr", "ExpMass", "CalcMass", "Peptide", "P
 # train_fdr 0.01) are passed to the worker as MUMDIA_NN_FOLDS / ITERS / TRAIN_FDR
 # (rescore.rs), overriding the worker's own docstring default of 5 iterations. The measured
 # HYE run trained 10 iterations per fold and never hit the churn stop.
+def recipe_metadata(cfg, n_features_used, seed):
+    """What a benchmark row was produced with, recorded beside it (docs/29 #20).
+
+    A study evaluates a re-implementation of the worker, so the reader needs the code
+    revision, the fold rule, the feature count, the seed and the training settings to
+    compare it with what production later ran. Remaining differences from the worker
+    (its explicit base-peptide fold keys, its standardisation backend) are stated, not
+    hidden behind "faithful".
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    try:
+        sha = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"], cwd=here, capture_output=True, text=True, check=True
+        ).stdout.strip()
+    except (OSError, subprocess.CalledProcessError):
+        sha = "unknown"
+    c = {**WORKER_DEFAULTS, **(cfg or {})}
+    training = {k: (list(c[k]) if isinstance(c[k], tuple) else c[k]) for k in (
+        "iters", "epochs", "hidden", "dropout", "lr", "wd", "batch", "train_fdr",
+        "neg_ratio", "neg_select", "margin_frac", "train_sub")}
+    return {
+        "code_sha": sha,
+        "folds": c["folds"],
+        "fold_key": "md5(base sequence, DECOY_ prefix stripped) % folds",
+        "fold_key_differs_from_worker": "the worker folds on explicit base_peptide_id pairs when the PIN carries them",
+        "n_features_used": int(n_features_used),
+        "seed": int(seed),
+        "preprocessing": "in-memory backend: median/IQR standardisation; worker's streaming backend uses mean/std",
+        "training": training,
+    }
+
+
 WORKER_DEFAULTS = dict(
     folds=3,
     iters=10,
@@ -92,8 +125,11 @@ def load_pin(
     y = (tb.column("Label").to_numpy() == 1).astype(np.float32)
     cids = np.array([int(x.rsplit("_", 1)[-1]) for x in tb.column("SpecId").to_pylist()], np.int64)
     peps = [strip_pep(p) for p in tb.column("Peptide").to_pylist()]
-    pep_hash = np.array([int(hashlib.md5(p.encode()).hexdigest(), 16) for p in peps], dtype=object)
     base_seq = np.array([p[6:] if p.startswith("DECOY_") else p for p in peps], dtype=object)
+    # The fold key hashes the base sequence, so a target and its paired decoy share a
+    # fold as they do in the worker's explicit pairing. Until 2026-09-07 the hash was
+    # taken before the `DECOY_` prefix came off, and the pair could split (docs/29 #20).
+    pep_hash = np.array([int(hashlib.md5(p.encode()).hexdigest(), 16) for p in base_seq], dtype=object)
     tb_prot = tb.column("Proteins").to_pylist() if entrapment else None
     del tb
     n, nf = len(y), len(feat_cols)

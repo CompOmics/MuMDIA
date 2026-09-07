@@ -331,9 +331,9 @@ rescorer or `native_tda` (`rescore.rs:217-276`). `classify_entrapment`
 marker, does not contain `entrapment_exclude`, and matches none of
 `entrapment_contaminant_markers`. The worker trains real-target (positive) vs
 spike-in (negative), decoys excluded from training (`entrapment_worker.py:80-83`),
-out-of-fold with `GroupKFold` grouped by `base_peptide_id`
-(`entrapment_worker.py:93-101`); a final model fit on all non-decoy PSMs scores
-decoys and any single-class-fold gaps (`:103-108`). Model is `gbm`
+out-of-fold with `GroupKFold` grouped by `base_peptide_id`; a training fold with a
+single class is an error, never a gap filled with in-sample scores (docs/29 #3), and
+a final model fit on all non-decoy PSMs scores the decoys only. Model is `gbm`
 (`HistGradientBoostingClassifier`, `early_stopping=False` so `random_state=0` is
 reproducible) or `nn` (StandardScaler + MLP pipeline) via
 `MUMDIA_ENTRAPMENT_MODEL` (`entrapment_worker.py:28-60`). The rationale: spike-in

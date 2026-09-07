@@ -78,7 +78,8 @@ def main():
         for sd in seeds:
             t0 = time.time()
             row, r = fs_lib.bench_subset(name, d, cols, cfg={**cfg, "seed_base": sd})
-            row.update(dataset=args.tag, seed=sd, rows=int(len(d["y"])), when=time.strftime("%Y-%m-%d %H:%M:%S"))
+            row.update(dataset=args.tag, seed=sd, rows=int(len(d["y"])), when=time.strftime("%Y-%m-%d %H:%M:%S"),
+                       recipe=json.dumps(fs_lib.recipe_metadata({**cfg, "seed_base": sd}, len(cols), sd), sort_keys=True))
             pd.DataFrame([row]).to_csv(out_csv, mode="a", header=not os.path.exists(out_csv), index=False)
             if args.save_oof and name == args.save_oof:
                 np.save(os.path.join(args.out_dir, f"{args.tag}_oof_{name}_seed{sd}.npy"), r["score"].astype(np.float32))

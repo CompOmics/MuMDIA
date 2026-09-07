@@ -94,8 +94,13 @@ labels, masses and peptides in the same order.
 
 The objective is measured with `bench/feature_selection/fs_lib.py::run_rescoring`, a
 re-implementation of `scripts/nn_rescore_worker.py` under the configuration the engine
-ships: md5(stripped peptide) folds (3), per-fold init-feature scan over both signs,
+ships: md5(base sequence, `DECOY_` prefix stripped) folds (3), per-fold init-feature scan over both signs,
 Percolator-style self-training on targets at 1% vs all decoys for `num_iter = 10`
+(fold rule since 2026-09-07; the studies in this document hashed the peptide with its
+`DECOY_` prefix, so a target and its paired decoy could fall in different folds, unlike
+the worker's explicit base-peptide pairing; docs/29 #20. Each benchmark row now carries a
+`recipe` column with the code revision, fold rule, feature count, seed and training
+settings it was produced with.) Then
 iterations (the `RescoreConfig` default, passed as `MUMDIA_NN_ITERS`; the worker's own
 docstring default of 5 is never what the engine runs), a fresh MLP 128-64 with dropout 0.3
 per iteration, churn early stop at 1% (never triggered here, as in the real run), mean/std

@@ -104,6 +104,29 @@ than a number. Both are recorded in every run's `manifest.json`.
   - `ci/gen_config_reference.py` and `ci/check_workflows.py` scan the files git tracks
     rather than everything on disk, so scratch copies beside the sources no longer enter
     the generated reference or the workflow check (#21).
+- Code review B, workers (`docs/29`, findings 3, 6, 7, 8, 12, 20):
+  - The entrapment worker skipped a training fold whose training side held one class
+    and then scored that fold's held-out rows with the final model, trained on those
+    very rows, so in-sample scores entered the entrapment FDR. A single-class training
+    fold is now an error that names the condition; the final model scores the decoys
+    only (#3).
+  - The MBR worker printed an "empirical decoy fraction" over accepted transfers, a
+    population that cannot contain a decoy, and computed the transfer q as
+    `null / targets`, which is exactly 0 for any pool no permuted residual undercuts, so
+    a three-candidate pool was accepted whole at 1%. The q uses the engine's `+1`
+    pseudocount and the summary names the permuted-null draws inside the accepted window
+    instead (#6, #7).
+  - With `extract.retain_top_peaks` above 1 the MBR worker measured the transfer on the
+    last competed peak of a candidate, not the one rescore selected and quant integrates;
+    it now joins `selected_peak_rank` and falls back to the highest `prelim_score` peak
+    (#8).
+  - `augment_library.py` gave every added precursor a fresh `base_peptide_id`, so an
+    added charge state or modform of an existing peptide left its peptide's competition
+    group and fold; added forms of existing sequences keep the imported id (#12).
+  - `bench/feature_selection/fs_lib.py` hashed the peptide with its `DECOY_` prefix for
+    fold assignment, splitting pairs; it hashes the base sequence, and every benchmark
+    row records the code revision, fold rule, feature count, seed and training recipe
+    (#20).
 - Desktop: the digest fields on the Search screen (missed cleavages, peptide length,
   charge range, carbamidomethyl, oxidation) now reach the engine on the built-in
   library path. They were read only by the DIA-NN library build, so with the built-in
