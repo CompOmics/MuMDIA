@@ -1430,6 +1430,14 @@ fn extract_twopass_windows(
 
 pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
     let t0 = Instant::now();
+    // Neither output may be one of the inputs (docs/31 F6).
+    let inputs = [
+        ("--ms2", p.ms2),
+        ("--lib-precursors", p.library_precursors),
+        ("--lib-fragments", p.library_fragments),
+    ];
+    mumdia_io::refuse_output_over_input(p.out_psms, &inputs)?;
+    mumdia_io::refuse_output_over_input(p.out_chrom, &inputs)?;
     // Skip the bucketed page_search index when the fragindex backend is selected (the
     // default): it is never read on that path and costs a full sort plus several full
     // copies of every library fragment.

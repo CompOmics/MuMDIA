@@ -275,6 +275,22 @@ impl Run {
         matches!(self.snapshot().status.as_str(), "running" | "starting")
     }
 
+    /// Forget the process id, under the lock a stop takes before it kills.
+    ///
+    /// Called the instant `wait` returns, before anything else. The pid is free for the
+    /// operating system to reuse from that moment, and a stop landing later would
+    /// otherwise pass it to `kill_tree`, which on Windows terminates whatever now owns it
+    /// and its whole tree (docs/31 F8). Retiring it inside `publish_exit` was too late:
+    /// that function scans the output directory and reads the result reports first, so
+    /// the window was as long as that disk work. It is now a few instructions, and a stop
+    /// that reaches the lock inside it still finds the pid this run really owns, because
+    /// the reap has only just returned.
+    fn retire_pid(&self) {
+        if let Ok(mut p) = self.pid.lock() {
+            *p = None;
+        }
+    }
+
     /// Apply `f` only while the run is still active; returns whether it was.
     fn set_if_active<F: FnOnce(&mut Snapshot)>(&self, f: F) -> bool {
         if let Ok(mut s) = self.snapshot.lock() {
@@ -298,12 +314,11 @@ impl Run {
     /// engine finished before the kill landed and its outputs are complete, and
     /// calling them cancelled would hide a finished result.
     fn publish_exit(&self, outcome: std::io::Result<std::process::ExitStatus>, out_dir: &Path) {
-        // Retire the pid first. This waits for a stop that is still killing (it holds the
-        // same lock), so nothing below overlaps a kill, and a later stop finds nothing to
-        // signal (docs/30 R3).
-        if let Ok(mut p) = self.pid.lock() {
-            *p = None;
-        }
+        // Idempotent: the waiter retires the pid the moment `wait` returns (docs/31 F8),
+        // and this call is what makes `publish_exit` safe to reach from a test or any
+        // other path. Taking the lock here also waits for a stop that is still killing,
+        // so nothing below overlaps a kill.
+        self.retire_pid();
         let cancelled = self.cancelled.load(Ordering::SeqCst);
         if cancelled {
             // The only sweep: after the reap, before the release, inside this run's
@@ -748,6 +763,8 @@ pub fn start(id: String, req: Request) -> Result<Arc<Run>, String> {
         let out_dir = PathBuf::from(&req.out_dir);
         std::thread::spawn(move || {
             let outcome = child.wait();
+            // Before anything else: the pid is reusable from here (docs/31 F8).
+            run.retire_pid();
             run.publish_exit(outcome, &out_dir);
         });
     }
@@ -985,6 +1002,22 @@ mod tests {
         run.cancelled.store(true, Ordering::SeqCst);
         run.publish_exit(Err(std::io::Error::other("gone")), &dir);
         assert_eq!(run.snapshot().status, "cancelled");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_stop_after_the_reap_has_no_pid_to_kill() {
+        // docs/31 F8: the pid is reusable the moment `wait` returns, so the waiter retires
+        // it there rather than after reading the output directory. A stop arriving in
+        // between must find nothing, not a recycled pid.
+        let (run, dir) = running("reaped");
+        *run.pid.lock().unwrap() = Some(4242);
+        run.retire_pid();
+        assert_eq!(*run.pid.lock().unwrap(), None);
+        // The run is still active, so cancel proceeds and simply has nothing to signal.
+        run.cancel();
+        assert!(run.snapshot().cancel_requested);
+        assert_eq!(*run.pid.lock().unwrap(), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

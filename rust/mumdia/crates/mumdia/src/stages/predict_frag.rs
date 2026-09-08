@@ -139,15 +139,44 @@ pub fn run(p: PredictFragParams) -> Result<(u64, u64)> {
     // the FDR rests on is kept. Substituting a value was the previous behaviour, iRT 0.0
     // for DeepLC and the native heuristic for MS2PIP, and it produced a plausible, finite
     // library whose rows came from an unrecorded mixture of predictors (docs/29 #17).
+    let n_before_drop = raws.len() as u64;
     let (n_dropped_rows, n_dropped_pairs) = drop_unpredicted(&mut raws, &rt_missing, &frag_missing);
+    // The rows the predictors actually missed, and the rows that went with them for
+    // sharing a pair key. Reported separately because the second number is the cost of
+    // the position-free key (see `rows_to_drop`) and the first is the sidecar's own miss
+    // rate; one warning conflating them hid a worker returning nothing for a large batch.
+    let n_direct = {
+        let mut d: Vec<usize> = rt_missing
+            .iter()
+            .chain(frag_missing.iter())
+            .copied()
+            .collect();
+        d.sort_unstable();
+        d.dedup();
+        d.len() as u64
+    };
+    let n_collateral = n_dropped_rows.saturating_sub(n_direct);
     if n_dropped_rows > 0 {
         tracing::warn!(
             candidates_dropped = n_dropped_rows,
+            unpredicted = n_direct,
+            dropped_with_their_pair = n_collateral,
             pairs_dropped = n_dropped_pairs,
             without_irt = rt_missing.len(),
             without_intensities = frag_missing.len(),
             "predict-frag: candidates without a prediction were dropped with their pairs \
              instead of receiving a substitute value; the counts are in the library report"
+        );
+    }
+    if let Some(frac) = dropped_fraction_exceeded(n_dropped_rows, n_before_drop) {
+        bail!(
+            "predict-frag: {n_dropped_rows} of {n_before_drop} candidates ({:.2}%) have no \
+             prediction ({n_direct} the predictor missed, {n_collateral} dropped with their \
+             pair) and would silently leave the library. That is a failing sidecar rather \
+             than a few unsupported peptidoforms; the ceiling is {:.0}%. Check the worker's \
+             output above, then rerun.",
+            frac * 100.0,
+            MAX_DROPPED_FRACTION * 100.0
         );
     }
     if raws.is_empty() && (n_dropped_rows > 0 || n_parse_err > 0) {
@@ -295,6 +324,10 @@ pub fn run(p: PredictFragParams) -> Result<(u64, u64)> {
     stats.insert("candidates".to_string(), json!(n_prec));
     stats.insert("fragments".to_string(), json!(n_frag));
     stats.insert("parse_errors".to_string(), json!(n_parse_err));
+    stats.insert(
+        "candidates_dropped_with_their_pair".to_string(),
+        json!(n_collateral),
+    );
     stats.insert(
         "candidates_dropped_unpredicted".to_string(),
         json!(n_dropped_rows),
@@ -496,8 +529,34 @@ fn pair_key(base_peptide_id: u32, charge: i32, peptidoform: &str) -> (u32, i32, 
     (base_peptide_id, charge, mod_signature(peptidoform))
 }
 
+/// The largest fraction of the library that may be dropped for want of a prediction
+/// before the build is treated as a failed sidecar rather than a few unsupported
+/// peptidoforms.
+///
+/// The only previous guard fired when the library was emptied entirely, so a worker that
+/// returned nothing for 5% of a 9.8M-peptidoform batch removed those rows, plus every
+/// positional isomer sharing their signature, behind one warning (docs/31 F10).
+const MAX_DROPPED_FRACTION: f64 = 0.02;
+
+/// The dropped fraction when it exceeds [`MAX_DROPPED_FRACTION`], else `None`.
+fn dropped_fraction_exceeded(dropped: u64, total: u64) -> Option<f64> {
+    if total == 0 || dropped == 0 {
+        return None;
+    }
+    let frac = dropped as f64 / total as f64;
+    (frac > MAX_DROPPED_FRACTION).then_some(frac)
+}
+
 /// Which rows to drop so that every row sharing a pair key with an unpredicted row goes
 /// with it. `keys[i]` is the pair key of row `i`; `missing` lists unpredicted rows.
+///
+/// The key is deliberately position-free, and that over-deletes: `M[Oxidation]PEPTIDEMK`
+/// and `MPEPTIDEM[Oxidation]K` share a base peptide, a charge and a modification
+/// multiset, so a miss on either removes both. Making the key position-aware would be
+/// worse, not better: a reverse decoy carries its modifications at mirrored positions, so
+/// a positional key would stop matching a target to its decoy and a target could be
+/// dropped while its decoy stayed, which is an FDR defect rather than a sensitivity one.
+/// The collateral is counted separately and bounded by [`MAX_DROPPED_FRACTION`] instead.
 fn rows_to_drop(keys: &[(u32, i32, String)], missing: &[usize]) -> Vec<bool> {
     let doomed: std::collections::HashSet<&(u32, i32, String)> =
         missing.iter().map(|&i| &keys[i]).collect();
@@ -653,7 +712,10 @@ fn fragment_cardinality(cid: &[u32], mz: &[f64]) -> Vec<i32> {
 
 #[cfg(test)]
 mod cardinality_tests {
-    use super::{fragment_cardinality, mod_signature, ms2pip_values, pair_key, rows_to_drop};
+    use super::{
+        dropped_fraction_exceeded, fragment_cardinality, mod_signature, ms2pip_values, pair_key,
+        rows_to_drop, MAX_DROPPED_FRACTION,
+    };
     use std::collections::HashMap;
 
     #[test]
@@ -700,6 +762,42 @@ mod cardinality_tests {
         let keys2 = [(b'b', 2, 1), (b'b', 5, 1)];
         let v2 = ms2pip_values(&keys2, &per, &[0.9, 0.9]);
         assert_eq!(v2, vec![1.0, 0.0]);
+    }
+
+    #[test]
+    fn a_large_unpredicted_fraction_is_a_failure_not_a_warning() {
+        // docs/31 F10: the only previous guard fired when the library was emptied, so a
+        // worker returning nothing for a large batch removed those rows plus every
+        // positional isomer sharing their signature behind one warning.
+        assert_eq!(dropped_fraction_exceeded(0, 1000), None);
+        assert_eq!(dropped_fraction_exceeded(0, 0), None);
+        assert_eq!(
+            dropped_fraction_exceeded(5, 1000),
+            None,
+            "a few misses are fine"
+        );
+        let frac = dropped_fraction_exceeded(500_000, 9_800_000).expect("5% must be refused");
+        assert!(frac > MAX_DROPPED_FRACTION);
+        // The boundary itself is accepted; only exceeding it is refused.
+        assert_eq!(dropped_fraction_exceeded(20, 1000), None);
+        assert!(dropped_fraction_exceeded(21, 1000).is_some());
+    }
+
+    #[test]
+    fn a_positional_isomer_still_shares_its_pair_key_by_design() {
+        // Deliberate over-deletion, documented on `rows_to_drop`: a positional key would
+        // stop matching a reverse decoy to its target, which is an FDR defect. The test
+        // pins the trade so a future change has to argue with it.
+        let a = pair_key(7, 2, "M[Oxidation]PEPTIDEMK");
+        let b = pair_key(7, 2, "MPEPTIDEM[Oxidation]K");
+        assert_eq!(a, b);
+        let keys = vec![a.clone(), b, pair_key(7, 3, "M[Oxidation]PEPTIDEMK")];
+        let drop = rows_to_drop(&keys, &[0]);
+        assert_eq!(
+            drop,
+            vec![true, true, false],
+            "the other charge is a different precursor"
+        );
     }
 
     #[test]

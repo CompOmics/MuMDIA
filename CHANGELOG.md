@@ -177,6 +177,59 @@ than a number. Both are recorded in every run's `manifest.json`.
     cancellation flag was written and never read. The waiter is now the only writer: it
     reads the intent after reaping the engine and publishes `cancelled`, `done` when the
     engine had already finished, or `failed`; until then the run shows "Stopping" (#14).
+- Code review F, whole-repository review (`docs/31_code_review_2026-09-08_full.md`,
+  F1 to F10):
+  - `prescan` read the infinite-bounds sentinel that `rt-im-train` writes for "calibration
+    unavailable, search the whole gradient" as "cannot be screened" and dropped the
+    candidate, so a run with no confident seeds discarded the entire library and exited 0
+    with a zero-row survivors table. An unbounded window now screens over the whole
+    gradient, a candidate with no window row is treated the same, both are counted, and
+    screening every candidate away is an error (F1).
+  - A present-but-wrong-typed `is_transferred` was swallowed as "no transfers", silently
+    removing every match-between-runs identification from `peptides.tsv` and
+    `proteins.tsv` while the parquet still carried them. Present columns are read in their
+    declared type and a mismatch is an error; only an absent column falls back (F2).
+  - `sidecar::resolve_script` tried the working directory before the directory beside the
+    binary, the ordering `python::resolve_script_dir` was hardened against, so a `scripts/`
+    directory inside an untrusted dataset could have its worker executed. An absolute
+    directory is taken as given, then the executable's directory, then `<exe>/scripts`, and
+    the working directory last (F3).
+  - `Loess::predict` indexed before the start of its grid for a non-finite query, so one
+    library row with a null `predicted_irt` could abort or misread memory at rt-im-train.
+    It returns NaN, and rt-im-train treats a non-finite library iRT as "no calibrated RT"
+    and counts those rows (F4).
+  - The rescorer's in-memory TSV backend standardised with median/IQR while the parquet and
+    streaming backends used mean/std, so the same pool scored differently depending on
+    `rescore.handoff` and on the 4 GB streaming threshold. All three use mean/std, which
+    leaves the shipped parquet default and every published benchmark unchanged. The
+    `MUMDIA_NN_FOLD_KEYS` companion is length-checked instead of being sliced short, which
+    used to leave the tail rows unscored at a fabricated mid-rank score, and the estimate
+    that picks the backend counts feature columns by name (F5).
+  - `refuse_output_over_input` was wired into two of eighteen stages, so
+    `compete --features f.parquet --out f.parquet` replaced the widest artifact of the run
+    with the competed subset at exit 0. It now guards every output of `search-seed`,
+    `rt-im-train`, `extract`, `features`, `compete`, `rescore`, `quant` and `audit` (F6).
+  - The LOESS boundary extrapolation slope introduced in the previous package was the
+    pointwise local slope at the sparsest, most one-sided point of the fit: unbounded, free
+    to be negative, and multiplying an unbounded distance. It is the secant of the fitted
+    curve over its end decile, clamped non-negative and to at most four times the global
+    slope, and the test uses noisy anchors rather than a noiseless quadratic (F7).
+  - A desktop stop arriving between the reap and the end of `publish_exit` could pass a
+    recycled process id to the tree kill. The waiter retires the id the instant `wait`
+    returns, before it reads the output directory (F8).
+  - The conversion lock added in the previous package spun without pause on an undeletable
+    stale lock, mistook clock skew and a peer's partial file for evidence about its own
+    holder, could be held by two processes at once, and left every interrupted conversion's
+    partial mzML behind for ever. Take-overs are bounded and paced, the holder is
+    identified by a token it reads back, a future modification time counts as fresh, the
+    partial-file probe matches this destination only, and abandoned partials are swept
+    under the lock (F9).
+  - Dropping an unpredicted candidate with everything sharing its pair key also removed
+    positional isomers that predicted correctly, bounded only by the library being emptied.
+    The direct misses and the collateral are counted separately and exceeding 2% of the
+    library is an error naming the sidecar. The key stays position-free deliberately: a
+    positional key would stop matching a reverse decoy to its target, trading a sensitivity
+    defect for an FDR one (F10).
 - Code review E, follow-up (`docs/30_code_review_2026-09-08.md`, R1 to R9):
   - Enabling DeepLC fine-tuning with its own defaults was rejected at load, because the
     documented automatic batch size is `finetune_batch = 0` and the new validation demanded

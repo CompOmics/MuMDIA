@@ -539,6 +539,10 @@ fn unique_tag() -> String {
 /// into the same destination. Dropping the guard releases the lock.
 struct ConvertLock {
     path: PathBuf,
+    /// Written into the lock file and verified after creation, so a lock this process
+    /// took cannot be one another process took a moment earlier, and `Drop` cannot
+    /// delete a lock that is no longer ours.
+    token: String,
 }
 
 impl ConvertLock {
@@ -553,9 +557,22 @@ impl ConvertLock {
 
     /// Take the lock for `out`, waiting for a holder to finish first. `Ok(None)` means the
     /// holder finished and left a usable conversion at `out`, which the caller reuses.
+    ///
+    /// Three things this has to survive, all of which the first version did not
+    /// (docs/31 F9). A stale lock that cannot be deleted is bounded rather than retried
+    /// forever with no pause. Two waiters that both judge one lock stale cannot both come
+    /// away holding it, because each writes a token and reads it back, and only the
+    /// process whose token survives owns the lock. And waiting itself has a deadline, so
+    /// a lock nothing will ever release fails the run with a message instead of hanging.
     fn acquire(out: &Path, src: &Path, reuse: bool) -> Result<Option<ConvertLock>> {
+        const RETRY: std::time::Duration = std::time::Duration::from_secs(2);
+        const MAX_TAKEOVERS: u32 = 8;
+        const MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(12 * 3600);
         let path = Self::path_for(out);
+        let token = format!("{}:{}", std::process::id(), unique_tag());
+        let waiting_since = std::time::Instant::now();
         let mut announced = false;
+        let mut takeovers = 0u32;
         loop {
             match std::fs::OpenOptions::new()
                 .write(true)
@@ -564,17 +581,47 @@ impl ConvertLock {
             {
                 Ok(mut f) => {
                     use std::io::Write;
-                    let _ = writeln!(f, "{}", std::process::id());
-                    return Ok(Some(ConvertLock { path }));
+                    f.write_all(token.as_bytes())
+                        .and_then(|()| f.sync_all())
+                        .with_context(|| {
+                            format!("writing the conversion lock {}", path.display())
+                        })?;
+                    drop(f);
+                    // Read it back. If another waiter removed this file and created its
+                    // own between the two calls, the token no longer matches and the lock
+                    // is theirs; wait and try again rather than converting alongside them.
+                    let held = std::fs::read_to_string(&path)
+                        .map(|t| t.trim() == token)
+                        .unwrap_or(false);
+                    if held {
+                        return Ok(Some(ConvertLock { path, token }));
+                    }
+                    std::thread::sleep(RETRY);
+                    continue;
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    if lock_is_stale(&path) {
+                    if lock_is_stale(&path, out) {
+                        takeovers += 1;
+                        if takeovers > MAX_TAKEOVERS {
+                            bail!(
+                                "the conversion lock {} looks abandoned but cannot be \
+                                 removed after {MAX_TAKEOVERS} attempts. Delete it by hand \
+                                 once nothing is converting {}, then rerun.",
+                                path.display(),
+                                out.display()
+                            );
+                        }
                         warn!(
                             lock = %path.display(),
+                            attempt = takeovers,
                             "convert: removing a stale conversion lock; its holder stopped \
                              writing"
                         );
+                        // A failed removal used to `continue` straight back into
+                        // `create_new` with no pause, pinning a core and writing one
+                        // warning per iteration for as long as the run lasted.
                         let _ = std::fs::remove_file(&path);
+                        std::thread::sleep(RETRY);
                         continue;
                     }
                     if !announced {
@@ -585,7 +632,16 @@ impl ConvertLock {
                         );
                         announced = true;
                     }
-                    std::thread::sleep(std::time::Duration::from_secs(2));
+                    if waiting_since.elapsed() > MAX_WAIT {
+                        bail!(
+                            "waited {} hours for the conversion lock {} and it is still \
+                             held and still fresh. Check for another MuMDIA converting {}.",
+                            MAX_WAIT.as_secs() / 3600,
+                            path.display(),
+                            out.display()
+                        );
+                    }
+                    std::thread::sleep(RETRY);
                     if !path.exists() && reuse && out.is_file() && is_newer_than(out, src) {
                         return Ok(None);
                     }
@@ -602,35 +658,104 @@ impl ConvertLock {
 
 impl Drop for ConvertLock {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        // Only if it is still ours: a lock taken over after this one was judged stale
+        // belongs to the taker, and removing it would leave two converters writing one
+        // destination, which is the situation the lock exists to prevent.
+        let ours = std::fs::read_to_string(&self.path)
+            .map(|t| t.trim() == self.token)
+            .unwrap_or(false);
+        if ours {
+            let _ = std::fs::remove_file(&self.path);
+        }
     }
 }
 
-/// A lock whose holder has stopped: neither the lock nor any partial conversion file
-/// beside it has been written for `STALE_AFTER`. Converters write their output
-/// continuously, so a live conversion keeps a `.partial-` file fresh; a crashed or killed
-/// holder leaves both untouched.
-fn lock_is_stale(lock: &Path) -> bool {
-    const STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(15 * 60);
-    let fresh = |p: &Path| {
-        std::fs::metadata(p)
-            .and_then(|m| m.modified())
-            .ok()
-            .and_then(|t| t.elapsed().ok())
-            .is_some_and(|age| age < STALE_AFTER)
-    };
-    if fresh(lock) {
+/// How long a lock and its partial output may go untouched before the holder counts as
+/// gone.
+const STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
+/// Was `p` written within [`STALE_AFTER`]?
+///
+/// A modification time in the future counts as fresh. It is an unreadable clock, not
+/// evidence that nobody is writing: `SystemTime::elapsed` returns `Err` for a future
+/// timestamp, and treating that as "not fresh" made ordinary clock skew on a network
+/// share declare a live lock stale one second after it was taken (docs/31 F9).
+fn written_recently(p: &Path) -> bool {
+    match std::fs::metadata(p).and_then(|m| m.modified()) {
+        Ok(t) => match t.elapsed() {
+            Ok(age) => age < STALE_AFTER,
+            Err(_) => true,
+        },
+        Err(_) => false,
+    }
+}
+
+/// The `<stem>.partial-` prefix of the temporary files belonging to one destination.
+fn partial_prefix(out: &Path) -> String {
+    let name = out.file_name().unwrap_or_default().to_string_lossy();
+    let stem = name.strip_suffix(".mzML").unwrap_or(&name);
+    format!("{stem}.partial-")
+}
+
+/// A lock whose holder has stopped: neither the lock nor a partial conversion file OF
+/// THIS DESTINATION has been written for [`STALE_AFTER`]. Converters write continuously,
+/// so a live conversion keeps its partial file fresh; a crashed or killed holder leaves
+/// both untouched.
+///
+/// Matching this destination's prefix rather than any `.partial-` name is what makes the
+/// probe mean anything with several conversions in one directory: it used to accept any
+/// partial file, so one live conversion kept a dead peer's lock fresh indefinitely, and
+/// with `experiment.parallel_runs > 1` that is the normal case (docs/31 F9).
+fn lock_is_stale(lock: &Path, out: &Path) -> bool {
+    if written_recently(lock) {
         return false;
     }
     let dir = lock.parent().unwrap_or(Path::new("."));
+    let prefix = partial_prefix(out);
     if let Ok(rd) = std::fs::read_dir(dir) {
         for e in rd.flatten() {
-            if e.file_name().to_string_lossy().contains(".partial-") && fresh(&e.path()) {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if name.starts_with(&prefix) && written_recently(&e.path()) {
                 return false;
             }
         }
     }
     true
+}
+
+/// Remove this destination's abandoned partial conversions.
+///
+/// Called with the lock held, so anything matching that is older than [`STALE_AFTER`]
+/// belongs to a conversion that died. Giving every attempt a unique temporary name fixed
+/// one bug and created this one: the pre-conversion `remove_file` then named a file that
+/// cannot exist yet, so a killed conversion left its multi-gigabyte partial mzML beside
+/// the input for ever and nothing anywhere deleted it (docs/31 F9).
+fn sweep_stale_partials(out_dir: &Path, out: &Path) {
+    let prefix = partial_prefix(out);
+    let Ok(rd) = std::fs::read_dir(out_dir) else {
+        return;
+    };
+    for e in rd.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if !name.starts_with(&prefix) || !name.ends_with(".mzML") {
+            continue;
+        }
+        let path = e.path();
+        if written_recently(&path) {
+            continue;
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => warn!(
+                partial = %path.display(),
+                "convert: removed an abandoned partial conversion"
+            ),
+            Err(e) => warn!(
+                partial = %path.display(),
+                error = %e,
+                "convert: could not remove an abandoned partial conversion"
+            ),
+        }
+    }
 }
 
 pub fn ensure_mzml(
@@ -762,9 +887,11 @@ msconvert was not usable either: {e}"
     // `reuse_converted` accepted it on every later run: a partial acquisition searched
     // silently, for ever, presenting as unexplained low identification counts with
     // nothing in the interface to reveal it. Neither failure path removed it.
+    // Under the lock, so every abandoned partial of THIS destination is dead by
+    // definition. The unique name below cannot collide with a live one.
+    sweep_stale_partials(&out_dir, &out);
     let tmp_name = partial_name(&out_name, &unique_tag());
     let tmp = out_dir.join(&tmp_name);
-    let _ = std::fs::remove_file(&tmp);
 
     let args: Vec<String> = if is_thermo {
         // `-f 2` is indexed mzML, which is what msconvert produces by default and so
@@ -989,27 +1116,121 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
+    /// Backdate a file's modification time by `secs`.
+    fn age(path: &Path, secs: u64) {
+        let t = std::time::SystemTime::now() - std::time::Duration::from_secs(secs);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(t)
+            .unwrap();
+    }
+
     #[test]
     fn a_stale_lock_is_broken_and_a_fresh_one_is_honoured() {
         let d = tmp("stale");
+        let out = d.join("run.mzML");
         let lock = d.join("run.mzML.converting");
         std::fs::write(&lock, b"1").unwrap();
-        assert!(!lock_is_stale(&lock), "a lock written a moment ago is live");
-        // Age the lock past the staleness window; nothing partial is being written.
-        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(20 * 60);
-        std::fs::OpenOptions::new()
-            .write(true)
-            .open(&lock)
-            .unwrap()
-            .set_modified(old)
-            .unwrap();
         assert!(
-            lock_is_stale(&lock),
+            !lock_is_stale(&lock, &out),
+            "a lock written a moment ago is live"
+        );
+        age(&lock, 20 * 60);
+        assert!(
+            lock_is_stale(&lock, &out),
             "an old lock with no live partial file is stale"
         );
-        // A partial file still being written keeps even an old lock alive.
+        // A partial file of THIS destination, still being written, keeps an old lock alive.
         std::fs::write(d.join("run.partial-99-0.mzML"), b"...").unwrap();
-        assert!(!lock_is_stale(&lock));
+        assert!(!lock_is_stale(&lock, &out));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn another_destinations_partial_does_not_keep_this_lock_alive() {
+        // docs/31 F9: the probe accepted any `.partial-` name, so one live conversion in a
+        // shared directory kept a dead peer's lock fresh for ever. With
+        // `experiment.parallel_runs > 1` that is the ordinary case.
+        let d = tmp("peer");
+        let out = d.join("dead.mzML");
+        let lock = d.join("dead.mzML.converting");
+        std::fs::write(&lock, b"1").unwrap();
+        age(&lock, 20 * 60);
+        std::fs::write(d.join("alive.partial-1-0.mzML"), b"...").unwrap();
+        assert!(
+            lock_is_stale(&lock, &out),
+            "a peer's live partial file must not vouch for this destination"
+        );
+        std::fs::write(d.join("dead.partial-1-0.mzML"), b"...").unwrap();
+        assert!(!lock_is_stale(&lock, &out), "its own partial file does");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_future_modification_time_reads_as_fresh_not_stale() {
+        // Clock skew on a network share, not evidence that nobody is writing.
+        let d = tmp("skew");
+        let f = d.join("run.mzML.converting");
+        std::fs::write(&f, b"1").unwrap();
+        let future = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&f)
+            .unwrap()
+            .set_modified(future)
+            .unwrap();
+        assert!(written_recently(&f));
+        assert!(!lock_is_stale(&f, &d.join("run.mzML")));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn abandoned_partials_are_swept_and_live_ones_are_not() {
+        let d = tmp("sweep");
+        let out = d.join("run.mzML");
+        let dead = d.join("run.partial-1-0.mzML");
+        let live = d.join("run.partial-2-0.mzML");
+        let peer = d.join("other.partial-3-0.mzML");
+        let real = d.join("run.mzML");
+        for f in [&dead, &live, &peer, &real] {
+            std::fs::write(f, b"x").unwrap();
+        }
+        age(&dead, 20 * 60);
+        age(&peer, 20 * 60);
+        sweep_stale_partials(&d, &out);
+        assert!(
+            !dead.is_file(),
+            "an abandoned partial of this destination goes"
+        );
+        assert!(live.is_file(), "a partial still being written stays");
+        assert!(
+            peer.is_file(),
+            "another destination's partial is not ours to remove"
+        );
+        assert!(real.is_file(), "the converted mzML itself is untouched");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_lock_is_only_removed_by_the_holder_that_still_owns_it() {
+        // docs/31 F9: two waiters that both judged a lock stale each removed it and each
+        // created their own, so the second unlinked the first's and both believed they
+        // held it; the first's Drop then removed the second's.
+        let d = tmp("token");
+        let out = d.join("run.mzML");
+        std::fs::write(d.join("run.raw"), b"raw").unwrap();
+        let first = ConvertLock::acquire(&out, &d.join("run.raw"), true)
+            .unwrap()
+            .expect("first holder");
+        // Simulate a take-over: another process replaces the lock with its own token.
+        std::fs::write(ConvertLock::path_for(&out), b"9999:other").unwrap();
+        drop(first);
+        assert!(
+            ConvertLock::path_for(&out).is_file(),
+            "dropping a lock we no longer own must not remove the new holder's"
+        );
         let _ = std::fs::remove_dir_all(&d);
     }
 

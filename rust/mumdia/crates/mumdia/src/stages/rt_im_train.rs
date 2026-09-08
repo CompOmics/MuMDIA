@@ -99,6 +99,23 @@ fn candidate_window(calibrated_rt: Option<f64>, width: Option<f64>) -> (f64, f64
 
 pub fn run(p: RtImTrainParams) -> Result<u64> {
     let t0 = Instant::now();
+    // `--out` must not be one of this stage's own inputs: every input is read
+    // before the output is published, so writing over one replaces it and exits 0
+    // (docs/31 F6). The shared guard existed and was wired into two stages.
+    mumdia_io::refuse_output_over_input(
+        p.out_windows,
+        &[
+            ("--seed-psms", p.seed_psms),
+            ("--lib-precursors", p.library_precursors),
+        ],
+    )?;
+    mumdia_io::refuse_output_over_input(
+        p.out_cal,
+        &[
+            ("--seed-psms", p.seed_psms),
+            ("--lib-precursors", p.library_precursors),
+        ],
+    )?;
 
     let holdout_frac = p.cfg.window_holdout_frac;
     if !(0.0..=0.9).contains(&holdout_frac) {
@@ -357,8 +374,17 @@ pub fn run(p: RtImTrainParams) -> Result<u64> {
         Vec::with_capacity(n),
         Vec::with_capacity(n),
     );
+    let mut n_nonfinite_irt = 0u64;
     for i in 0..n {
-        let calibrated_rt = calibration_available.then(|| predict(irt[i] as f64));
+        // A row whose library iRT is not finite has no calibrated RT, which is the
+        // documented "search the whole gradient" sentinel rather than an arithmetic
+        // accident. The parquet reader maps a null f32 to NaN, so one failed prediction
+        // in an imported library reaches here (docs/31 F4).
+        let usable_irt = (irt[i] as f64).is_finite();
+        if !usable_irt {
+            n_nonfinite_irt += 1;
+        }
+        let calibrated_rt = (calibration_available && usable_irt).then(|| predict(irt[i] as f64));
         let width = calibrated_rt.map(|cal| match &adaptive {
             Some((rt_min, span, widths)) => {
                 let nb = widths.len();
@@ -457,6 +483,10 @@ pub fn run(p: RtImTrainParams) -> Result<u64> {
     stats.insert("n_train".to_string(), json!(n_train));
     stats.insert("w_rt".to_string(), json!(w_rt));
     stats.insert("calibration_status".to_string(), json!(status));
+    stats.insert(
+        "candidates_without_finite_irt".to_string(),
+        json!(n_nonfinite_irt),
+    );
     ArtifactReport {
         logical_name: artifact::RUN_WINDOWS.0.to_string(),
         schema_name: artifact::RUN_WINDOWS.0.to_string(),
@@ -471,10 +501,18 @@ pub fn run(p: RtImTrainParams) -> Result<u64> {
     }
     .write_for(p.out_windows)?;
 
+    if n_nonfinite_irt > 0 {
+        tracing::warn!(
+            candidates = n_nonfinite_irt,
+            of = rows,
+            "rt-im-train: these candidates have no finite library iRT, so they get the              unbounded RT window rather than a calibrated one; a null predicted_irt reads              as NaN (docs/31 F4)"
+        );
+    }
     info!(
         rows,
         w_rt = ?w_rt,
         status,
+        without_finite_irt = n_nonfinite_irt,
         elapsed_ms = elapsed,
         "rt-im-train: done"
     );

@@ -44,6 +44,17 @@ struct Best {
 
 pub fn run(p: SearchSeedParams) -> Result<u64> {
     let t0 = Instant::now();
+    // `--out` must not be one of this stage's own inputs: every input is read
+    // before the output is published, so writing over one replaces it and exits 0
+    // (docs/31 F6). The shared guard existed and was wired into two stages.
+    mumdia_io::refuse_output_over_input(
+        p.out,
+        &[
+            ("--ms2", p.ms2),
+            ("--lib-precursors", p.library_precursors),
+            ("--lib-fragments", p.library_fragments),
+        ],
+    )?;
     // See extract: the bucketed index is dead weight on the fragindex path.
     let build_bucketed = !matches!(p.cfg.matcher, MatcherKind::Fragindex);
     let lib = Library::load_with(

@@ -429,7 +429,7 @@ m/z (`Library::local_frag_index`, `index.rs:325`).
 | `RtPredictor` / `FragmentPredictor` | `predict.rs:13` / `predict.rs:19` | predictor traits (predict + `identity`); implemented only by the native structs |
 | `NativeRt` | `predict.rs:25` | additive retention-coefficient model + `sqrt(len)` + `0.01*mod` term, `identity` `native-rt-v1` |
 | `NativeFrag` | `predict.rs:73` | heuristic b/y intensity model (y=1.0, b=0.75, mid-seq positional, charge-2 x0.5), max-normalized, `identity` `native-frag-v1` |
-| `resolve_script` | `sidecar.rs:20` | locate a worker script (CWD, exe dir/dir, exe dir/scripts, else CWD-relative) |
+| `resolve_script` | `sidecar.rs:20` | locate a worker script (an absolute directory as given, else exe dir/dir, exe dir/scripts, and the working directory LAST; docs/31 F3) |
 | `run_ms2pip` | `sidecar.rs:42` | MS2PIP client; in `id`/`peptidoform`/`charge`, out `id`/`ion_type`/`ordinal`/`intensity`; returns `cid -> (ion_byte, ordinal) -> intensity` |
 | `run_deeplc` | `sidecar.rs:81` | DeepLC client; in `id`/`peptidoform`, out `id`/`predicted_rt`; returns `id -> predicted_rt` |
 | `run_deeplc_finetune` | `sidecar.rs:111` | DeepLC multitask fine-tune; `deeplc_finetune.py <lib_in> <seed> <lib_out>` + epoch/patience/q-train/batch flags (called by `run`, not predict-frag) |

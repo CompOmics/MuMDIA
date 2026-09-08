@@ -454,6 +454,17 @@ fn rollup_protein_bases(
 
 pub fn run(p: QuantParams) -> Result<(u64, u64)> {
     let t0 = Instant::now();
+    // No output may be one of the inputs (docs/31 F6).
+    let inputs = [
+        ("--psms-scored", p.psms_scored),
+        ("--chromatograms", p.chromatograms),
+    ];
+    for out in [Some(p.out_peptide), Some(p.out_protein), p.out_fragment]
+        .into_iter()
+        .flatten()
+    {
+        mumdia_io::refuse_output_over_input(out, &inputs)?;
+    }
 
     // Identified target PSMs below the peptide q threshold.
     let ps = TableFile::open(p.psms_scored)?;
