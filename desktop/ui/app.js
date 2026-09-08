@@ -218,10 +218,61 @@ async function loadSettings() {
     banner($("settings-error"), String(e));
     return;
   }
+  await seedOverridesFromPreset();
   $("settings-search").addEventListener("input", renderSettings);
   $("only-changed").addEventListener("change", renderSettings);
   $("save-settings").addEventListener("click", saveSettings);
+  // A preset chosen on the Search screen is the new starting point here. Edits made
+  // before the switch are dropped, and the banner says so.
+  $("preset").addEventListener("change", async () => {
+    const had = Object.keys(state.overrides).length;
+    await seedOverridesFromPreset();
+    if (had) banner($("settings-saved"), "Settings reset to the newly selected preset.");
+    renderSettings();
+  });
   renderSettings();
+}
+
+// Start from the preset selected on the Search screen, not from the engine defaults.
+//
+// A saved settings file used to hold only what was edited on this screen, relative
+// to the engine defaults, so saving with a preset selected silently dropped the
+// preset's own choices: predictor, rescorer, interpreters. Seeding the overrides with
+// the preset's content makes the saved file the preset plus the edits.
+async function seedOverridesFromPreset() {
+  state.overrides = {};
+  const path = $("preset").value;
+  if (!path) return;
+  try {
+    const flat = await invoke("config_overrides", { path });
+    for (const [k, v] of Object.entries(flat)) {
+      const f = state.schema.fields.find((x) => x.path === k);
+      if (!f || sameAsDefault(f, v)) continue;
+      state.overrides[k] = v;
+    }
+  } catch (e) {
+    banner($("settings-error"), `Could not read the selected preset: ${e}`);
+  }
+}
+
+/// Whether `value` is the engine default for `f`. List-valued settings carry their
+/// default as JSON text in the schema, so both sides are compared as parsed JSON.
+function sameAsDefault(f, value) {
+  let dflt = f.default;
+  if (typeof dflt === "string" && f.kind === "other") {
+    try {
+      dflt = JSON.parse(dflt);
+    } catch {
+      /* a plain text default stays text */
+    }
+  }
+  return JSON.stringify(value) === JSON.stringify(dflt);
+}
+
+/// A value as the text input shows it: lists and objects as JSON, scalars as they are.
+function displayValue(v) {
+  if (v === null || v === undefined) return "";
+  return typeof v === "object" ? JSON.stringify(v) : v;
 }
 
 /// The value currently shown for a setting: an override if one was typed, else the
@@ -268,14 +319,21 @@ function renderSettings() {
             .join("") +
           `</select>`;
       } else {
-        control = `<input type="text" data-path="${esc(f.path)}" value="${esc(v ?? "")}">`;
+        control = `<input type="text" data-path="${esc(f.path)}" value="${esc(displayValue(v))}">`;
       }
+      // A field the engine accepts but does not act on yet is shown as exactly that,
+      // and cannot be edited: a value typed there would be saved, validated and then
+      // ignored by the run, which is the one outcome worse than not offering it.
       // A gated parameter is one the project documents as not to be changed from a
       // single benchmark count. Saying so where the decision is made is the whole
       // reason the schema carries the marker.
-      const gate = f.gates.length
-        ? `<span class="pill warn" title="${esc(f.gates.join(", "))}">gated</span>`
-        : "";
+      const unwired = f.gates.some((g) => g.includes("wired"));
+      if (unwired) control = control.replace(/^<(select|input)/, "<$1 disabled");
+      const gate = unwired
+        ? `<span class="pill warn" title="${esc(f.gates.join(", "))}">not wired yet</span>`
+        : f.gates.length
+          ? `<span class="pill warn" title="${esc(f.gates.join(", "))}">gated</span>`
+          : "";
       const badge = changed ? `<span class="pill info">changed</span>` : "";
       parts.push(
         `<div class="setting${changed ? " changed" : ""}">` +
@@ -299,9 +357,12 @@ function renderSettings() {
   }
 
   const n = Object.keys(state.overrides).length;
+  const presetName = $("preset").selectedOptions[0]?.textContent || "Engine defaults";
   $("settings-sub").textContent =
-    `${state.schema.fields.length} settings. ` +
-    (n ? `${n} changed from the defaults; only those are saved.` : "None changed.");
+    `${state.schema.fields.length} settings, starting from "${presetName}". ` +
+    (n
+      ? `${n} differ from the engine defaults (the preset's own values included); those are what is saved.`
+      : "None differ from the engine defaults.");
 }
 
 /// Record a change, or drop it when the value returns to the default.
@@ -322,9 +383,17 @@ function onSettingChanged(el) {
       return;
     }
     value = n;
+  } else if (f.kind === "other" && /^\s*[\[{]/.test(raw)) {
+    // A list or object typed as JSON (the modification lists, for instance).
+    try {
+      value = JSON.parse(raw);
+    } catch {
+      banner($("settings-error"), `${path} must be valid JSON.`);
+      return;
+    }
   }
   banner($("settings-error"), "");
-  if (JSON.stringify(value) === JSON.stringify(f.default)) delete state.overrides[path];
+  if (sameAsDefault(f, value)) delete state.overrides[path];
   else state.overrides[path] = value;
   renderSettings();
 }
@@ -351,7 +420,7 @@ async function saveSettings() {
     sel.value = path;
     banner(
       $("settings-saved"),
-      `Saved and accepted by the engine. The next search will use these settings.`
+      `Saved and accepted by the engine: the selected preset plus your edits. The next search uses this file.`
     );
   } catch (e) {
     banner($("settings-error"), String(e));
@@ -1003,6 +1072,28 @@ function libraryParams(fasta) {
   };
 }
 
+// The same digest fields as engine configuration paths, for the built-in library path.
+//
+// Before this the fields were read only when DIA-NN built the library; with the
+// built-in predictors the engine digested with whatever the preset said, and a
+// missed-cleavage count typed on this screen reached nothing. The values go on top of
+// the chosen preset through `derive_config`, so the preset's predictor and rescorer
+// choices survive. Modification lists are the whole list: an unticked box means none.
+function digestOverrides() {
+  const d = libraryParams("");
+  return {
+    "digest.missed_cleavages": d.missed_cleavages,
+    "digest.min_len": d.min_pep_len,
+    "digest.max_len": d.max_pep_len,
+    "peptidoforms.charge_min": d.min_charge,
+    "peptidoforms.charge_max": d.max_charge,
+    "peptidoforms.fixed_mods": d.carbamidomethyl
+      ? [{ residue: "C", name: "Carbamidomethyl" }]
+      : [],
+    "peptidoforms.variable_mods": d.oxidation ? [{ residue: "M", name: "Oxidation" }] : [],
+  };
+}
+
 // Say, on the search screen, whether choosing DIA-NN means waiting.
 async function refreshLibSrcNote() {
   const note = $("libsrc-diann-note");
@@ -1114,7 +1205,7 @@ async function ensureLibrary(fasta) {
 // two at once would compete for the same cores and memory while making the progress
 // display meaningless. The engine's own `experiment.parallel_runs` exists for the
 // pooled case where it can be reasoned about.
-async function runBatch(p, built, threads) {
+async function runBatch(p, built, threads, config) {
   const files = p.mzml.slice();
   state.batch = { total: files.length, done: 0, failed: 0, results: [] };
 
@@ -1134,7 +1225,7 @@ async function runBatch(p, built, threads) {
       fasta: state.mode === "fasta" && !built ? p.fasta || null : null,
       lib_precursors: built ? built[0] : state.mode === "library" ? p.lib_precursors || null : null,
       lib_fragments: built ? built[1] : state.mode === "library" ? p.lib_fragments || null : null,
-      config: $("preset").value || null,
+      config,
       threads: Number.isFinite(threads) && threads > 0 ? threads : null,
     };
 
@@ -1252,12 +1343,26 @@ async function start() {
     if (!built) return;
   }
 
+  // Built-in predictors: the digest fields on this screen become part of the run's
+  // configuration, on top of the chosen preset. Derived once for the whole selection
+  // and validated by the engine before anything starts.
+  let config = $("preset").value || null;
+  if (state.mode === "fasta" && !built) {
+    try {
+      config = await invoke("derive_config", { base: config, overrides: digestOverrides() });
+    } catch (e) {
+      banner($("start-error"), String(e));
+      screen("input");
+      return;
+    }
+  }
+
   // Several files searched separately are N independent runs. Queued in the frontend
   // so `start_run` stays the single tested path and each run is an ordinary one; the
   // cost is that closing the window ends the queue, which the per-file output folders
   // make recoverable.
   if (p.mzml.length > 1 && currentRunMode() === "separate") {
-    return runBatch(p, built, threads);
+    return runBatch(p, built, threads, config);
   }
 
   const req = {
@@ -1271,7 +1376,7 @@ async function start() {
     fasta: state.mode === "fasta" && !built ? p.fasta || null : null,
     lib_precursors: built ? built[0] : state.mode === "library" ? p.lib_precursors || null : null,
     lib_fragments: built ? built[1] : state.mode === "library" ? p.lib_fragments || null : null,
-    config: $("preset").value || null,
+    config,
     threads: Number.isFinite(threads) && threads > 0 ? threads : null,
   };
 

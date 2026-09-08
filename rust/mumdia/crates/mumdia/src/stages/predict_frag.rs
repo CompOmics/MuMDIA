@@ -402,42 +402,19 @@ fn assign_intensities(p: &PredictFragParams, raws: &mut [Raw]) -> Result<String>
                 let per = map.get(&(i as u32));
                 match per {
                     Some(per) if !per.is_empty() => {
-                        // native as fallback for fragment charges MS2PIP does not emit (charge 2)
-                        let nat = native.predict_intensities(&r.parsed, &r.frags);
-                        let mut vals: Vec<f32> = r
+                        let keys: Vec<(u8, u16, u8)> = r
                             .frags
                             .iter()
-                            .enumerate()
-                            .map(|(k, fr)| {
-                                if fr.charge == 1 {
-                                    let ion = fr.ion_type.symbol() as u8;
-                                    *per.get(&(ion, fr.ordinal as u16)).unwrap_or(&0.0)
-                                } else {
-                                    nat[k]
-                                }
+                            .map(|fr| {
+                                (
+                                    fr.ion_type.symbol() as u8,
+                                    fr.ordinal as u16,
+                                    fr.charge.clamp(1, 255) as u8,
+                                )
                             })
                             .collect();
-                        // MS2PIP (charge-1, TIC-fraction, ~0.02-0.3) and the native
-                        // charge-2 fallback (max-normalized, ~0.19-0.5) live on
-                        // different scales; ranking them together in top-N buries
-                        // MS2PIP. Max-normalize each charge group to its own peak so
-                        // the two compete fairly.
-                        let gmax = |want2: bool| {
-                            r.frags
-                                .iter()
-                                .zip(&vals)
-                                .filter(|(fr, _)| (fr.charge >= 2) == want2)
-                                .map(|(_, v)| *v)
-                                .fold(0.0f32, f32::max)
-                        };
-                        let (m1, m2) = (gmax(false), gmax(true));
-                        for (k, fr) in r.frags.iter().enumerate() {
-                            let m = if fr.charge >= 2 { m2 } else { m1 };
-                            if m > 0.0 {
-                                vals[k] /= m;
-                            }
-                        }
-                        r.frag_int = vals;
+                        let nat = native.predict_intensities(&r.parsed, &r.frags);
+                        r.frag_int = ms2pip_values(&keys, per, &nat);
                     }
                     _ => {
                         r.frag_int = native.predict_intensities(&r.parsed, &r.frags);
@@ -447,6 +424,69 @@ fn assign_intensities(p: &PredictFragParams, raws: &mut [Raw]) -> Result<String>
             Ok(format!("ms2pip-{}", p.cfg.ms2pip_model))
         }
     }
+}
+
+/// One candidate's fragment intensities from its MS2PIP predictions.
+///
+/// `keys` are the candidate's fragments as `(ion byte, ordinal, charge)`, `per` the
+/// worker's predictions for it, `native` the heuristic intensities for the same
+/// fragments. Two regimes, decided by what the model emitted:
+///
+/// - **Charge-1 series only** (HCD2021 and the other single-charge models): charge-1
+///   fragments take the prediction (0.0 when the ordinal is missing), charge-2 fragments
+///   take the native heuristic, and each charge group is max-normalised to its own peak,
+///   because MS2PIP's TIC fractions (~0.02-0.3) and the heuristic (~0.19-0.5) live on
+///   different scales and ranking them together buries the predictions. This is the
+///   historical behaviour, unchanged.
+/// - **Charge-2 series present** (`HCDch2`, `CIDch2`): every fragment takes the
+///   prediction for its own charge, a missing entry is 0.0 for either charge, and the
+///   whole candidate is normalised to one peak, since all values share the model's scale.
+///   Measured on the HYE FASTA library with the first regime, 78.6% of the top-6
+///   fragments were charge-2 heuristics (each group's peak normalised to 1.0, so the
+///   heuristics crowded out the predictions) and the seed search separated targets from
+///   decoys no better than chance (41.6% decoys in the top 1,000 by score against 0% with
+///   the DIA-NN library on the same spectra).
+fn ms2pip_values(
+    keys: &[(u8, u16, u8)],
+    per: &HashMap<(u8, u16, u8), f32>,
+    native: &[f32],
+) -> Vec<f32> {
+    let model_has_charge2 = per.keys().any(|k| k.2 >= 2);
+    let mut vals: Vec<f32> = keys
+        .iter()
+        .enumerate()
+        .map(|(k, key)| {
+            if key.2 == 1 || model_has_charge2 {
+                *per.get(key).unwrap_or(&0.0)
+            } else {
+                native[k]
+            }
+        })
+        .collect();
+    if model_has_charge2 {
+        let m = vals.iter().copied().fold(0.0f32, f32::max);
+        if m > 0.0 {
+            for v in &mut vals {
+                *v /= m;
+            }
+        }
+    } else {
+        let gmax = |want2: bool| {
+            keys.iter()
+                .zip(&vals)
+                .filter(|(key, _)| (key.2 >= 2) == want2)
+                .map(|(_, v)| *v)
+                .fold(0.0f32, f32::max)
+        };
+        let (m1, m2) = (gmax(false), gmax(true));
+        for (k, key) in keys.iter().enumerate() {
+            let m = if key.2 >= 2 { m2 } else { m1 };
+            if m > 0.0 {
+                vals[k] /= m;
+            }
+        }
+    }
+    vals
 }
 
 /// Count distinct precursors (candidate_ids) whose fragments fall in each 0.01 Da
@@ -498,7 +538,39 @@ fn fragment_cardinality(cid: &[u32], mz: &[f64]) -> Vec<i32> {
 
 #[cfg(test)]
 mod cardinality_tests {
-    use super::fragment_cardinality;
+    use super::{fragment_cardinality, ms2pip_values};
+    use std::collections::HashMap;
+
+    #[test]
+    fn ms2pip_values_keep_the_two_group_regime_for_single_charge_models() {
+        // b2(1), y3(1), y3(2), y4(2): the model emitted charge 1 only.
+        let keys = [(b'b', 2, 1), (b'y', 3, 1), (b'y', 3, 2), (b'y', 4, 2)];
+        let mut per = HashMap::new();
+        per.insert((b'b', 2, 1), 0.05f32);
+        per.insert((b'y', 3, 1), 0.20f32);
+        let native = [0.9f32, 0.9, 0.5, 0.25];
+        let v = ms2pip_values(&keys, &per, &native);
+        // Charge-1 from the model, normalised to its own peak; charge-2 from the
+        // heuristic, normalised to its own peak.
+        assert_eq!(v, vec![0.25, 1.0, 1.0, 0.5]);
+        // A charge-1 ordinal the model did not emit is 0.0, not the heuristic.
+        let keys2 = [(b'b', 2, 1), (b'b', 5, 1)];
+        let v2 = ms2pip_values(&keys2, &per, &[0.9, 0.9]);
+        assert_eq!(v2, vec![1.0, 0.0]);
+    }
+
+    #[test]
+    fn ms2pip_values_use_one_scale_when_the_model_emitted_charge_2() {
+        let keys = [(b'b', 2, 1), (b'y', 3, 1), (b'y', 3, 2), (b'y', 4, 2)];
+        let mut per = HashMap::new();
+        per.insert((b'b', 2, 1), 0.05f32);
+        per.insert((b'y', 3, 1), 0.20f32);
+        per.insert((b'y', 3, 2), 0.10f32);
+        // y4(2) is absent from the predictions: 0.0, never the heuristic.
+        let native = [0.9f32, 0.9, 0.9, 0.9];
+        let v = ms2pip_values(&keys, &per, &native);
+        assert_eq!(v, vec![0.25, 1.0, 0.5, 0.0]);
+    }
 
     #[test]
     fn counts_distinct_precursors_per_mz_bin() {

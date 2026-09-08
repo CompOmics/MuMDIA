@@ -86,7 +86,7 @@ jobs:
           docker run --rm --entrypoint /opt/conda/envs/deeplc/bin/python mumdia:ci \
             -c "import deeplc, numpy, pyarrow, torch, psm_utils; print('deeplc', deeplc.__version__, '| torch', torch.__version__)"
           docker run --rm --entrypoint /opt/conda/envs/rescore/bin/python mumdia:ci \
-            -c "import mokapot, sklearn, numpy, pandas, pyarrow; print('mokapot', mokapot.__version__)"
+            -c "import mokapot, ms2pip, sklearn, numpy, pandas, pyarrow; print('mokapot', mokapot.__version__, '| ms2pip', ms2pip.__version__)"
 
           echo "--- a bind-mounted output directory must be writable as the host user ---"
           # This is the documented invocation. If it breaks, the image is unusable

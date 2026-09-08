@@ -15,6 +15,70 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ## [Unreleased]
 
+### Added
+
+- MS2PIP charge-2 fragment predictions reach the library. The worker emits a
+  `frag_charge` column from the `b2`/`y2` series that the `*ch2` models (`HCDch2`,
+  `CIDch2`) predict, and `predict-frag` keys its lookup on `(ion, ordinal, charge)`.
+  When the model emitted charge-2 series, every fragment carries a model intensity on
+  one scale; single-charge models keep the previous behaviour (native heuristic for
+  charge-2 fragments, each charge group normalised to its own peak), so existing
+  `HCD2021` libraries are unchanged. Why: on the HYE FASTA library built with `HCD2021`,
+  78.6% of the top-6 fragments were charge-2 heuristics and the seed search separated
+  targets from decoys no better than chance (41.6% decoys among the top 1,000 seed
+  scores, against 0% with the DIA-NN library on the same spectra), so retention-time
+  calibration found no anchors and the run proceeded with an unbounded RT window.
+  Measured on that run with 12 fragments: `HCDch2` 19,308 confident seeds (0% decoys
+  in the top 5,000; fragment charges 79% / 21%), `HCD2021` with charge-2 fragments
+  only from precursor charge 3 14,412, the DIA-NN library 21,856.
+
+### Changed
+
+- MS2PIP 4.2.0 in every shipped environment (`env/docker-rescore.yml`,
+  `env/console-ms2pip-requirements.txt`), and `env/mumdia-deeplc.yml` now carries
+  `ms2pip==4.2.0` too, so one host environment serves DeepLC, MS2PIP and the `nn_torch`
+  rescorer and `configs/examples/fasta-sidecars.json` runs from the shipped
+  specifications with its interpreters at `auto`. Before this no host specification
+  provided MS2PIP at all. 4.0.0 needed `sqlalchemy<2` and could not share an
+  environment with DeepLC; 4.2.0 is the version behind the FASTA-mode measurements in
+  `docs/28` section 22. The image's smoke test imports `ms2pip` in the rescore
+  environment.
+- `predict_frag.ms2pip_model` defaults to `HCDch2` (was `HCD`), for the reason above.
+  `configs/examples/fasta-sidecars.json` and the image's `config.dia.json` set
+  `top_n_fragments: 12` explicitly, the count the DIA-NN library ships and the one the
+  measurement used; the engine default stays 6, because the native predictor was not
+  re-measured.
+- FASTA mode measured end to end on both HYE acquisitions with that library
+  (`docs/28_feature_selection_analysis.md` section 22): six pooled AIF runs 69,091
+  experiment-wide peptides at 1% in 45 min of search (imported DIA-NN library: 72,344),
+  six pooled Astral runs 85,644 in 34 min; library prediction 54 min once per FASTA
+  (DeepLC 19, MS2PIP 35 at 32 processes). DIA-NN 2.2.0 library-free on the same files:
+  61 and 67 min including its library.
+
+- The MS2PIP worker uses the engine's thread count for its process pool (passed as a
+  fourth argument by `run_ms2pip`) instead of capping itself at eight processes, and
+  assembles its output from numpy arrays per chunk instead of four per-fragment Python
+  lists. Measured on the 9.8M-peptidoform HYE library (one missed cleavage, 7-30, charges
+  2-3, one oxidation), the old worker ran on six to eight cores of the 32 requested and
+  held 13 GB of Python objects before writing. Predictions are unchanged: the same
+  rows in the same order, the same float64 arithmetic stored as float32.
+
+### Fixed
+
+- Desktop: the digest fields on the Search screen (missed cleavages, peptide length,
+  charge range, carbamidomethyl, oxidation) now reach the engine on the built-in
+  library path. They were read only by the DIA-NN library build, so with the built-in
+  predictors the engine digested with the preset's values; the block also showed the
+  two modification checkboxes twice under the same ids. The run's configuration is now
+  the selected preset with the fields merged on top (`derive_config`), validated by
+  the engine before the search starts.
+- Desktop: the settings editor starts from the preset selected on the Search screen
+  instead of from the engine defaults, so "Save and use" writes the preset plus the
+  edits rather than silently dropping the preset's predictor, rescorer and interpreter
+  choices. Engine fields the schema marks `not yet wired` (the match-between-runs
+  tiers) are labelled as such and cannot be edited; list-valued settings display and
+  accept JSON.
+
 ## [0.1.1] - 2026-09-07
 
 ### Fixed

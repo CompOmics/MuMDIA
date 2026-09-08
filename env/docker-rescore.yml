@@ -5,8 +5,7 @@
 # build). Built into the image as /opt/conda/envs/rescore; the baked
 # docker/config.dia.json points rescore.python and predict_frag.ms2pip_python at
 # its interpreter.
-# python 3.11: mokapot/ms2pip pull pandas<2, which has no cp312 wheel (would
-# force a fragile source build); 3.11 has prebuilt wheels for the whole graph.
+# python 3.11 matches the deeplc env; ms2pip 4.2.0 requires >= 3.11.
 name: rescore
 channels:
   - conda-forge
@@ -23,9 +22,9 @@ dependencies:
       - pyarrow
       - scikit-learn
       - mokapot==0.10.0
-      # 4.0.0 final, not the 4.0.0.dev9 pre-release this used to pin. A .dev build in
-      # a published image is a supportability problem: it can be yanked and carries no
-      # stability promise. This is the released version of exactly what was pinned, so
-      # it is the smallest correct change; 4.1.x and 4.2.0 exist and are a separate,
-      # testable upgrade.
-      - ms2pip==4.0.0
+      # 4.2.0 is the version the FASTA-mode measurements were made with (docs/28
+      # section 22: HYE, HCDch2, 69,091 and 85,644 experiment-wide peptides at 1%).
+      # 4.0.0 was pinned before; it needed sqlalchemy<2 and so could not share an
+      # environment with DeepLC. Resolved here with mokapot 0.10.0: numpy 1.26.4,
+      # pandas 2.3.3, sqlalchemy 2.0.52, psm-utils 1.5.5, xgboost 2.1.4.
+      - ms2pip==4.2.0

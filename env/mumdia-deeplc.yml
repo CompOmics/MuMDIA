@@ -1,11 +1,18 @@
-# Portable local environment for the DeepLC sidecars: retention-time prediction
-# (scripts/deeplc_worker.py) and per-run fine-tuning (scripts/deeplc_finetune.py).
-# The Docker image builds the same tool version from env/docker-deeplc.yml; this
-# spec is the equivalent for a native install.
+# Portable local environment for the prediction and neural-rescoring sidecars:
+# DeepLC retention time (scripts/deeplc_worker.py, scripts/deeplc_finetune.py),
+# MS2PIP fragment intensities (scripts/ms2pip_worker.py) and the nn_torch rescorer
+# (scripts/nn_rescore_worker.py, which needs torch, numpy and pyarrow). One
+# environment covers all three since MS2PIP 4.2.0, which resolves next to DeepLC
+# 4.1.1 (4.0.0 needed sqlalchemy<2 and could not). The Docker image builds the same
+# tool versions from env/docker-deeplc.yml and env/docker-rescore.yml; this spec is
+# the equivalent for a native install.
 #
 #   conda env create -f env/mumdia-deeplc.yml
-#   # then point the config at this env's interpreter:
-#   #   "predict_frag": { "deeplc_python": ".../envs/mumdia-deeplc/bin/python" }
+#   # then point the config at this env's interpreter, or leave the three
+#   # interpreter fields at "auto" with the env activated:
+#   #   "predict_frag": { "deeplc_python": ".../envs/mumdia-deeplc/bin/python",
+#   #                     "ms2pip_python": ".../envs/mumdia-deeplc/bin/python" }
+#   #   "rescore":      { "python":        ".../envs/mumdia-deeplc/bin/python" }
 #   #   (on Windows: ...\\envs\\mumdia-deeplc\\python.exe)
 #   mumdia doctor --config <your config>
 #
@@ -40,5 +47,7 @@ dependencies:
       # would have forced the affected version back in.
       - setuptools>=83
       - deeplc==4.1.1
+      # The version behind the FASTA-mode measurements in docs/28 section 22 (HCDch2).
+      - ms2pip==4.2.0
       - psm-utils
       - pyarrow

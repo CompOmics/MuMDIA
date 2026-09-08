@@ -156,14 +156,20 @@ Outside Docker, create the environment for the sidecars you intend to use:
 # mokapot rescoring only (no torch, no DeepLC, no MS2PIP)
 conda env create -f env/mumdia-rescore.yml
 
-# DeepLC retention-time prediction and per-run fine-tuning, plus CPU PyTorch
+# DeepLC retention time, MS2PIP fragment intensities and the nn_torch rescorer,
+# plus CPU PyTorch: one environment for the whole FASTA-mode and imported-library
+# workflow
 conda env create -f env/mumdia-deeplc.yml
 ```
 
-`env/mumdia-deeplc.yml` pins `deeplc==4.1.1` and `torch==2.14.0+cpu`. DeepLC
-4.1.1 is a floor rather than merely the current release: the 4.0.0a2 multitask
-preview overfits per-run fine-tuning badly enough to invert retention-time model
-rankings, so an older version changes results and not only speed.
+`env/mumdia-deeplc.yml` pins `deeplc==4.1.1`, `ms2pip==4.2.0` and
+`torch==2.14.0+cpu`. DeepLC 4.1.1 is a floor rather than merely the current
+release: the 4.0.0a2 multitask preview overfits per-run fine-tuning badly enough to
+invert retention-time model rankings, so an older version changes results and not
+only speed. MS2PIP 4.2.0 is the version the FASTA-mode measurements were made with
+(`docs/28_feature_selection_analysis.md`, section 22), and the first that resolves
+next to DeepLC in one environment. With that environment activated,
+`configs/examples/fasta-sidecars.json` runs unchanged (its interpreters are `auto`).
 
 Then, before any long run:
 
@@ -216,9 +222,13 @@ per-run DeepLC fine-tuning, Extended features, the loose `apex_pearson`
 extraction gate, and `nn_torch` rescoring. Building the two library tables is
 described under [Two library sources](#two-library-sources).
 
-`configs/examples/fasta-sidecars.json` is the middle option: digest a FASTA,
-predict fragment intensities with MS2PIP and retention time with DeepLC, rescore
-with mokapot.
+`configs/examples/fasta-sidecars.json` is the FASTA option: digest a FASTA,
+predict fragment intensities with MS2PIP (`HCDch2`, 12 fragments) and retention
+time with DeepLC, rescore with `nn_torch`. All three sidecars live in the one
+environment `env/mumdia-deeplc.yml` builds, so with it activated the config runs
+with its interpreters at `auto`. Measured on both HYE acquisitions in
+[`docs/28_feature_selection_analysis.md`](docs/28_feature_selection_analysis.md)
+section 22.
 
 ### Other useful invocations
 

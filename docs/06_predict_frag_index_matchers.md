@@ -161,19 +161,24 @@ hardcoded string `"deeplc-4.0-mt"` (`predict_frag.rs:353`), not a trait
 **intensity assignment** (`assign_intensities`, `predict_frag.rs:359`). Native
 path calls `NativeFrag::predict_intensities`. MS2PIP path runs the sidecar over
 all candidates; an empty whole-map result is a hard error (`bail`,
-`predict_frag.rs:389-391`). Per candidate, MS2PIP supplies charge-1 b/y
-intensities keyed by `(ion_byte, ordinal)`; charge-2 fragments (which MS2PIP does
-not emit) fall back to the native model (`predict_frag.rs:405-418`). MS2PIP
-values (TIC-fraction scale, roughly 0.02-0.3) and the native charge-2 fallback
-(max-normalized, roughly 0.19-0.5) live on different scales, so each charge group
-is max-normalized to its own peak before they compete for top-N slots
-(`predict_frag.rs:419-438`); otherwise the larger-scale group would always win the
-truncation. There are two distinct MS2PIP-miss fallbacks: a candidate MS2PIP
-returns nothing for (absent from the map, or an empty per-candidate map) falls
-back wholesale to native (`predict_frag.rs:441-443`), whereas a single charge-1
-fragment whose `(ion_byte, ordinal)` key MS2PIP omits gets intensity `0.0`, not
-the native value (`unwrap_or(&0.0)`, `predict_frag.rs:413`); a fragment at
-`0.0` can then be dropped by top-N. MS2PIP requires `ms2pip_python` and errors
+`predict_frag.rs`). Per candidate, `ms2pip_values` looks each fragment up by
+`(ion_byte, ordinal, charge)` and decides the regime from what the model emitted.
+With a `*ch2` model (`HCDch2`, the default since 2026-09-07; `CIDch2`) the worker
+returns the doubly charged series as `frag_charge` 2, every fragment takes the
+prediction for its own charge, a missing key is `0.0`, and the candidate is
+normalised to one peak. With a single-charge model (`HCD2021`, `HCD2019`, ...)
+charge-2 fragments fall back to the native model, and because MS2PIP's TIC
+fractions (roughly 0.02-0.3) and the fallback (roughly 0.19-0.5) live on different
+scales, each charge group is max-normalised to its own peak before they compete
+for top-N slots. That second regime is where the FASTA path failed on a whole
+proteome: on the HYE library (9.8M peptidoforms, 6 fragments, charge-2 from
+precursor charge 2) 78.6% of the kept fragments were charge-2 heuristics tied at
+1.0, and the seed search found 0 confident PSMs at 1% on a real run, 41.6% decoys
+among the top 1,000 seed scores. `HCDch2` with 12 fragments gave 19,308 confident
+seeds on the same run (DIA-NN library: 21,856; `HCD2021`, 12 fragments, charge-2
+only from charge 3: 14,412). A candidate MS2PIP returns nothing for (absent from
+the map, or an empty per-candidate map) falls back wholesale to native in either
+regime; a fragment at `0.0` can then be dropped by top-N. MS2PIP requires `ms2pip_python` and errors
 otherwise (`predict_frag.rs:371-374`); its model id is `format!("ms2pip-{model}")`
 (`predict_frag.rs:446`).
 
@@ -454,8 +459,8 @@ so the struct holds exactly these fields and unknown keys are rejected):
 | `rt_predictor` | `Native` (`RtPredictorKind`) | native additive model vs `Deeplc` sidecar for iRT |
 | `charge2_from_precursor_charge` | `2` | precursor charge at/above which charge-2 fragments are added (was 3; lowered to keep the ~16% of charge-2 precursors' doubly-charged transitions) |
 | `charge_by_basic_residues` | `false` | composition cap: keep a fragment at charge z only if `z <= 1 + (#R+#H+#K in that fragment)` and `z <= precursor charge`. Supersedes `charge2_from_precursor_charge`. Benchmark-gated, it changes the scored transition set. Pairs with `peptidoforms.charge_by_basic_residues` (`config.rs:318`) |
-| `top_n_fragments` | `6` | fragments kept per candidate after intensity ranking (top-6 is standard DIA) |
-| `ms2pip_model` | `"HCD"` | MS2PIP model name passed as argv |
+| `top_n_fragments` | `6` | fragments kept per candidate after intensity ranking; the FASTA + sidecar configurations set 12, the count the DIA-NN library ships and the one the HCDch2 measurement used |
+| `ms2pip_model` | `"HCDch2"` | MS2PIP model name passed as argv; `*ch2` models predict the doubly charged series too |
 | `ms2pip_python` | `None` | interpreter for the MS2PIP sidecar; required when `predictor=ms2pip`, else the stage errors |
 | `deeplc_python` | `None` | interpreter for the DeepLC sidecar; required when `rt_predictor=deeplc`, else the stage errors |
 | `sidecar_script_dir` | `"scripts"` | directory searched by `resolve_script` for the worker scripts |

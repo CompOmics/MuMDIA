@@ -165,6 +165,77 @@ def test_ms2pip_worker_module_imports_without_ms2pip_installed():
     assert callable(module.main)
 
 
+def _load_ms2pip_worker():
+    spec = importlib.util.spec_from_file_location(
+        "mumdia_ms2pip_worker_rows", SCRIPTS / "ms2pip_worker.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_ms2pip_worker_flattens_predictions_like_the_per_fragment_loop():
+    """`fragment_rows` must reproduce the loop it replaced, row for row.
+
+    Per result: ions b then y, ordinals 1-based and ascending, the id repeated per
+    fragment, `2**x - 0.001` clipped at 0 in float64 and stored as float32; a missing
+    ion contributes nothing and a result without predictions is skipped rather than
+    crashing the worker. `to_table` must emit `ion_type` as plain utf8, which is the
+    only string encoding the engine reads.
+    """
+    import numpy as np
+    import pyarrow as pa
+
+    module = _load_ms2pip_worker()
+
+    class Psm:
+        def __init__(self, sid):
+            self.spectrum_id = sid
+
+    class Res:
+        def __init__(self, sid, pred):
+            self.psm = Psm(sid)
+            self.predicted_intensity = pred
+
+    results = [
+        Res("7", {"b": np.array([-1.0, 0.0]), "y": np.array([-20.0])}),
+        Res("9", {"b": None, "y": np.array([2.0])}),
+        Res("11", None),
+        Res("13", {"b": np.array([]), "y": None}),
+    ]
+    ids, ions, ords, chgs, ints = module.fragment_rows(results)
+    assert ids.tolist() == [7, 7, 7, 9]
+    assert ions.tolist() == [0, 0, 1, 1]
+    assert ords.tolist() == [1, 2, 1, 1]
+    assert chgs.tolist() == [1, 1, 1, 1]
+    expected = np.clip(
+        np.power(2.0, np.array([-1.0, 0.0, -20.0, 2.0])) - 0.001, 0.0, None
+    ).astype(np.float32)
+    assert ints.dtype == np.float32
+    assert np.array_equal(ints, expected)
+    assert ints[2] == 0.0, "2**-20 - 0.001 is negative and must clip to 0"
+
+    tbl = module.to_table(ids, ions, ords, chgs, ints)
+    assert tbl.schema.field("ion_type").type == pa.string()
+    assert tbl.column("ion_type").to_pylist() == ["b", "b", "y", "y"]
+    assert tbl.schema.field("id").type == pa.uint32()
+    assert tbl.schema.field("frag_charge").type == pa.int32()
+    assert tbl.schema.field("intensity").type == pa.float32()
+
+    # A *ch2 model: the b2/y2 series follow b and y, carrying charge 2.
+    ch2 = [Res("3", {"b": np.array([0.0]), "y": np.array([1.0]),
+                     "b2": np.array([-2.0]), "y2": np.array([-1.0, -3.0])})]
+    ids, ions, ords, chgs, ints = module.fragment_rows(ch2)
+    assert ids.tolist() == [3, 3, 3, 3, 3]
+    assert ions.tolist() == [0, 1, 0, 1, 1]
+    assert ords.tolist() == [1, 1, 1, 1, 2]
+    assert chgs.tolist() == [1, 1, 2, 2, 2]
+
+    empty = module.fragment_rows([])
+    assert all(a.size == 0 for a in empty)
+    assert module.to_table(*empty).num_rows == 0
+
+
 @pytest.mark.parametrize("script", DEEPLC_WORKERS)
 def test_deeplc_worker_imports_in_a_fresh_interpreter(script):
     """With DeepLC present, a fresh-interpreter module import must succeed.
@@ -202,13 +273,14 @@ def test_deeplc_worker_imports_in_a_fresh_interpreter(script):
 
 
 def test_ms2pip_worker_writes_the_documented_output_schema(tmp_path):
-    """`id`, `ion_type`, `ordinal` (1-based), `intensity` (linear).
+    """`id`, `ion_type`, `ordinal` (1-based), `frag_charge`, `intensity` (linear).
 
-    The Rust side folds this into `HashMap<u32, HashMap<(ion, ordinal), f32>>`
-    and looks up charge-1 fragments only (`predict_frag.rs:356-363`). A 0-based
-    ordinal shifts every predicted intensity by one residue, and log2 intensities
-    left unconverted would be compared against max-normalised native values on
-    an entirely different scale.
+    The Rust side folds this into `HashMap<u32, HashMap<(ion, ordinal, charge), f32>>`
+    (`sidecar::run_ms2pip`). A 0-based ordinal shifts every predicted intensity by one
+    residue, and log2 intensities left unconverted would be compared against
+    max-normalised native values on an entirely different scale. A single-charge model
+    emits charge 1 throughout; a `*ch2` model adds the doubly charged series as charge 2,
+    which is what lets `predict-frag` put every fragment on the model's scale.
     """
     importorskip_any("ms2pip", "the MS2PIP sidecar needs a usable ms2pip")
     importorskip_any("psm_utils", "the MS2PIP sidecar needs a usable psm_utils")
@@ -230,10 +302,20 @@ def test_ms2pip_worker_writes_the_documented_output_schema(tmp_path):
     )
     run_worker_ok("ms2pip_worker.py", inp, out, "HCD")
     cols = read_columns(out)
-    assert set(cols) == {"id", "ion_type", "ordinal", "intensity"}
+    assert set(cols) == {"id", "ion_type", "ordinal", "frag_charge", "intensity"}
     assert set(int(x) for x in cols["id"]) <= {0, 1}
     assert set(cols["ion_type"]) <= {"b", "y"}
     assert int(min(int(o) for o in cols["ordinal"])) == 1, "ordinals must be 1-based"
+    assert set(int(z) for z in cols["frag_charge"]) == {1}, "HCD predicts charge 1 only"
     intensity = np.asarray(cols["intensity"], dtype=float)
     assert np.isfinite(intensity).all()
     assert (intensity >= 0.0).all(), "log2 intensities were not converted to linear"
+
+    # The doubly charged series of a *ch2 model arrive as charge 2, same columns.
+    out2 = tmp_path / "ms2pip_out_ch2.parquet"
+    run_worker_ok("ms2pip_worker.py", inp, out2, "HCDch2")
+    cols2 = read_columns(out2)
+    assert set(cols2) == set(cols)
+    assert set(int(z) for z in cols2["frag_charge"]) == {1, 2}
+    n1 = sum(1 for z in cols2["frag_charge"] if int(z) == 1)
+    assert n1 == len(cols["frag_charge"]), "the charge-1 series must be as long as before"

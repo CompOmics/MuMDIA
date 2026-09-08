@@ -493,7 +493,7 @@ remain open high-priority work.
 
 ## Defaults promoted on correctness grounds, not on a count
 
-Three defaults changed because the previous value was wrong on its own terms, not
+Four defaults changed because the previous value was wrong on its own terms, not
 because a benchmark improved. None was promoted from a sensitivity measurement,
 and each still needs entrapment plus a second acquisition before anyone claims a
 sensitivity result for it.
@@ -530,6 +530,25 @@ sensitivity result for it.
 - `features.emit_pin` is now `false`. No MuMDIA stage reads the file, because
   rescore builds its own PIN, and it is a ~5.4 GB text write per run on a real
   library.
+- `predict_frag.ms2pip_model` is now `HCDch2` (2026-09-07). MS2PIP's single-charge
+  models predict the singly charged b/y series only; the engine filled charge-2
+  fragments with its native heuristic and max-normalised each charge group to its
+  own peak, so the heuristics tied at 1.0 and crowded the predictions out of the
+  top-N. On the HYE FASTA library (9.8M peptidoforms, one missed cleavage, 7-30,
+  charges 2-3) built that way, 78.6% of the kept fragments were heuristics and the
+  seed search found 0 confident PSMs at 1% on a real run (41.6% decoys among the
+  top 1,000 seed scores; the DIA-NN library on the same spectra: 21,856 confident,
+  0%), so `rt-im-train` had no anchors and the run continued with an unbounded RT
+  window. `HCDch2` predicts the doubly charged series too; the worker returns it as
+  `frag_charge` 2, `predict_frag::ms2pip_values` puts every fragment on the model's
+  scale, and the same library gave 19,308 confident seeds (`HCD2021` with 12
+  fragments and charge-2 only from charge 3: 14,412). The FASTA + sidecar example
+  configurations set `top_n_fragments: 12`, the count the DIA-NN library ships;
+  the engine default stays 6 because the native predictor was not re-measured.
+  Precursor and fragment m/z of the FASTA library agree with the DIA-NN library to
+  0.1 ppm on 3.66M shared keys, so this was intensity ranking, not mass. Library
+  build for those 9.8M peptidoforms: DeepLC 19 min, MS2PIP 4.2.0 35-39 min at 32
+  processes (docs/13).
 
 ## Changes that remain benchmark-gated
 

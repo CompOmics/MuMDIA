@@ -10,7 +10,10 @@ use anyhow::{bail, Context, Result};
 use mumdia_io::table::{write_table, Col, TableFile};
 use tracing::info;
 
-type FragmentIntensityMap = HashMap<u32, HashMap<(u8, u16), f32>>;
+/// Per candidate row: `(ion byte, ordinal, fragment charge)` -> linear predicted intensity.
+/// The charge is 1 for every series a single-charge MS2PIP model emits and 2 for the
+/// `b2`/`y2` series of the `*ch2` models.
+pub type FragmentIntensityMap = HashMap<u32, HashMap<(u8, u16, u8), f32>>;
 
 /// Resolve a sidecar worker script path so a deployed binary finds its workers
 /// regardless of the working directory: try the configured dir relative to the
@@ -66,20 +69,32 @@ pub fn run_ms2pip(
             Col::I32("charge".into(), charges.to_vec()),
         ],
     )?;
-    info!(n = ids.len(), model, "sidecar: running MS2PIP");
-    run_worker(python, script, &[&inp, &outp, model], false).context("MS2PIP worker failed")?;
+    // The worker sizes its MS2PIP process pool from this. Left to itself it capped the
+    // pool at min(8, cpu_count), which on the 9.8M-peptidoform HYE library left 24 of
+    // the 32 requested cores idle for the whole prediction.
+    let processes = rayon::current_num_threads().max(1).to_string();
+    info!(n = ids.len(), model, processes = %processes, "sidecar: running MS2PIP");
+    run_worker(python, script, &[&inp, &outp, model, &processes], false)
+        .context("MS2PIP worker failed")?;
 
     let t = TableFile::open(&outp)?;
     let oid = t.u32("id")?;
     let ion = t.str("ion_type")?;
     let ord = t.i32("ordinal")?;
     let inten = t.f32("intensity")?;
-    let mut map: HashMap<u32, HashMap<(u8, u16), f32>> = HashMap::new();
+    // Older workers wrote no `frag_charge`: every row was a singly charged fragment.
+    let fch = if t.has_column("frag_charge") {
+        Some(t.i32("frag_charge")?)
+    } else {
+        None
+    };
+    let mut map: FragmentIntensityMap = HashMap::new();
     for i in 0..t.nrows {
         let ib = ion[i].as_bytes().first().copied().unwrap_or(b'?');
+        let z = fch.as_ref().map(|c| c[i].clamp(1, 255) as u8).unwrap_or(1);
         map.entry(oid[i])
             .or_default()
-            .insert((ib, ord[i] as u16), inten[i]);
+            .insert((ib, ord[i] as u16, z), inten[i]);
     }
     Ok(map)
 }
