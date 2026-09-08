@@ -349,6 +349,43 @@ fn check_run_names_distinct(ns: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// Why `name` cannot be a per-run directory name on every platform, or `None`.
+///
+/// Syntactic, not probed: Windows's rules are applied everywhere, because an experiment's
+/// output may be written to any filesystem and a name that is one directory on NTFS must
+/// not be two on ext4. `a` and `a.` passed the old check (empty, separators, `.`, `..`) and
+/// were one directory on Windows: the second run overwrote the first and the experiment
+/// exited 0 with both split tables holding `source = 1` (docs/30 R2).
+fn portable_dir_name_problem(name: &str) -> Option<&'static str> {
+    const RESERVED: [&str; 22] = [
+        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+        "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    ];
+    if name.is_empty() {
+        return Some("it is empty");
+    }
+    if name == "." || name == ".." {
+        return Some("`.` and `..` are not names");
+    }
+    if name.contains('/') || name.contains('\\') {
+        return Some("it contains a path separator");
+    }
+    if name
+        .chars()
+        .any(|c| matches!(c, '<' | '>' | ':' | '"' | '|' | '?' | '*') || (c as u32) < 0x20)
+    {
+        return Some("it contains a character Windows forbids in a file name (<>:\"|?* or a control character)");
+    }
+    if name.ends_with('.') || name.ends_with(' ') {
+        return Some("it ends with a dot or a space, which Windows strips, so it names the same directory as the trimmed form");
+    }
+    let stem = name.split('.').next().unwrap_or(name).to_ascii_uppercase();
+    if RESERVED.contains(&stem.as_str()) {
+        return Some("it is a Windows reserved device name (CON, PRN, AUX, NUL, COM1-9, LPT1-9), with or without an extension");
+    }
+    None
+}
+
 pub fn run(p: RunExperimentParams) -> Result<()> {
     let t0 = Instant::now();
     // Same contract as the single-run orchestrator, and it matters more here: an
@@ -416,12 +453,13 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
                 );
             }
             check_run_names_distinct(ns)?;
-            if let Some(bad) = ns.iter().find(|n| {
-                n.is_empty() || n.contains('/') || n.contains('\\') || *n == "." || *n == ".."
-            }) {
+            if let Some((bad, why)) = ns
+                .iter()
+                .find_map(|n| portable_dir_name_problem(n).map(|why| (n, why)))
+            {
                 anyhow::bail!(
-                    "--run-names entry {bad:?} is not usable as a directory name; each \
-                     becomes a subdirectory of --out-dir"
+                    "--run-names entry {bad:?} is not usable as a directory name: {why}; each \
+                     name becomes a subdirectory of --out-dir"
                 );
             }
             ns.to_vec()
@@ -819,17 +857,18 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
     // in the single-run manifest (docs/29 #15): which RT source the library carried,
     // which fragment predictor, and the classifier that actually ran.
     let library_input = p.lib_precursors.is_some();
+    let deeplc_py = cfg.predict_frag.deeplc_python.as_deref();
     let rt_identity = if cfg.rt_im_train.finetune_deeplc {
         if matches!(cfg.experiment.finetune_scope, FinetuneScope::FirstRunOnly) {
-            "deeplc-finetuned-first-run".to_string()
+            crate::sidecar::deeplc_identity(deeplc_py, "finetuned-first-run")
         } else {
-            "deeplc-finetuned-per-run".to_string()
+            crate::sidecar::deeplc_identity(deeplc_py, "finetuned-per-run")
         }
     } else if cfg
         .rt_im_train
-        .repredicts_library_irt(library_input, cfg.predict_frag.deeplc_python.is_some())
+        .repredicts_library_irt(library_input, deeplc_py.is_some())
     {
-        "deeplc-base-model".to_string()
+        crate::sidecar::deeplc_identity(deeplc_py, "base")
     } else if library_input {
         "imported-library".to_string()
     } else {
@@ -952,6 +991,35 @@ mod tests {
             .to_string();
         assert!(e.contains("differ only in case"), "{e}");
         assert!(e.contains("RunA") && e.contains("runa"), "{e}");
+    }
+
+    #[test]
+    fn run_names_that_alias_on_windows_are_rejected_everywhere() {
+        // docs/30 R2: `a` and `a.` are one directory on Windows and the experiment ran
+        // to completion with one run overwriting the other. The syntactic rules apply on
+        // every platform so the output is portable.
+        for (bad, why) in [
+            ("a.", "dot or a space"),
+            ("a ", "dot or a space"),
+            ("NUL", "reserved"),
+            ("com1.log", "reserved"),
+            ("run:1", "forbids"),
+            ("run?", "forbids"),
+            ("a/b", "separator"),
+            ("", "empty"),
+            ("..", "not names"),
+        ] {
+            let why_got = portable_dir_name_problem(bad)
+                .unwrap_or_else(|| panic!("{bad:?} must be rejected"));
+            assert!(why_got.contains(why), "{bad:?}: {why_got}");
+        }
+        for ok in ["r0", "run.1", "A-b_c", "B_01", "sample 3", "com10", "conx"] {
+            assert_eq!(
+                portable_dir_name_problem(ok),
+                None,
+                "{ok:?} must be accepted"
+            );
+        }
     }
 
     #[test]

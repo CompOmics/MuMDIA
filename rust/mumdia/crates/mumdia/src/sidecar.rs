@@ -8,7 +8,7 @@ use std::process::Command;
 
 use anyhow::{bail, Context, Result};
 use mumdia_io::table::{write_table, Col, TableFile};
-use tracing::info;
+use tracing::{info, warn};
 
 /// Per candidate row: `(ion byte, ordinal, fragment charge)` -> linear predicted intensity.
 /// The charge is 1 for every series a single-charge MS2PIP model emits and 2 for the
@@ -149,6 +149,40 @@ pub fn require_deeplc_version(python: &str) -> Result<String> {
     }
 }
 
+/// `deeplc-<version>-<suffix>` when the interpreter answers, `deeplc-<suffix>` when there
+/// is none to ask: the manifest's RT identity should say which DeepLC release produced the
+/// library, not only the recipe (docs/30, model identity).
+pub fn deeplc_identity(python: Option<&str>, suffix: &str) -> String {
+    match python.and_then(|py| module_version(py, "deeplc")) {
+        Some(v) => format!("deeplc-{v}-{suffix}"),
+        None => format!("deeplc-{suffix}"),
+    }
+}
+
+/// Read the `<lib_out>.summary.json` the fine-tune worker writes beside a rewritten
+/// library and warn when rows kept their imported iRT, so a mixed RT source is visible
+/// in the log rather than only in the file (docs/30 R6).
+fn warn_on_retained_imported(lib_out: &str) {
+    let path = format!("{lib_out}.summary.json");
+    let Ok(v) = mumdia_io::json::read_json::<serde_json::Value>(&path) else {
+        return;
+    };
+    let n = |k: &str| v.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
+    let retained = n("retained_imported");
+    if retained > 0 {
+        warn!(
+            rows = n("rows"),
+            repredicted = n("repredicted"),
+            retained_imported = retained,
+            retained_non_standard = n("retained_non_standard"),
+            retained_no_prediction = n("retained_no_prediction"),
+            summary = %path,
+            "sidecar: the rewritten library keeps the imported iRT on some rows, so its RT \
+             source is mixed; see the summary for the counts"
+        );
+    }
+}
+
 /// DeepLC: predict retention time per peptidoform. Returns `id -> predicted_rt`.
 pub fn run_deeplc(
     python: &str,
@@ -261,7 +295,9 @@ pub fn run_deeplc_finetune(
         ],
         true,
     )
-    .context("DeepLC fine-tune failed")
+    .context("DeepLC fine-tune failed")?;
+    warn_on_retained_imported(lib_out);
+    Ok(())
 }
 
 /// DeepLC base-model re-prediction of an imported library's `predicted_irt`: the
@@ -298,7 +334,9 @@ pub fn run_deeplc_repredict(
         ],
         true,
     )
-    .context("DeepLC library re-prediction failed")
+    .context("DeepLC library re-prediction failed")?;
+    warn_on_retained_imported(lib_out);
+    Ok(())
 }
 
 /// MBR transfer (Stage D3): match-between-runs identification transfer over the

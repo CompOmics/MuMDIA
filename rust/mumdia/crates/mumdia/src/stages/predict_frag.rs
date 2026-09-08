@@ -375,7 +375,10 @@ fn assign_rt(p: &PredictFragParams, raws: &mut [Raw]) -> Result<(String, Vec<usi
                     None => missing.push(i),
                 }
             }
-            Ok(("deeplc-4.0-mt".to_string(), missing))
+            // The installed DeepLC version, not a family label: two libraries predicted by
+            // different DeepLC releases are different libraries (docs/30, model identity).
+            let version = sidecar::require_deeplc_version(python)?;
+            Ok((format!("deeplc-{version}-base"), missing))
         }
     }
 }
@@ -462,7 +465,9 @@ fn assign_intensities(p: &PredictFragParams, raws: &mut [Raw]) -> Result<(String
                 .filter(|(_, &c)| !c)
                 .map(|(i, _)| i)
                 .collect();
-            Ok((format!("ms2pip-{}", p.cfg.ms2pip_model), missing))
+            let version =
+                sidecar::module_version(python, "ms2pip").unwrap_or_else(|| "unknown".into());
+            Ok((format!("ms2pip-{version}-{}", p.cfg.ms2pip_model), missing))
         }
     }
 }

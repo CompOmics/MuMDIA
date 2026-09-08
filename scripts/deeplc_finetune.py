@@ -32,6 +32,8 @@ os.environ["MKL_NUM_THREADS"] = "1"
 os.environ["NUMEXPR_NUM_THREADS"] = "1"
 
 import argparse
+import json
+import math
 import re
 import time
 import deeplc                                    # import before numpy (OpenMP load order)
@@ -271,6 +273,13 @@ def main():
         t0 = time.time()
         batch = uniq[s:s + chunk]
         p = agg(deeplc.predict(batch) if ft_model is None else deeplc.predict(batch, model=ft_model))
+        # A structurally short or long answer is a broken predictor, not a set of
+        # unsupported peptidoforms: zipping it silently paired predictions with the wrong
+        # peptidoforms and left the tail on its imported value (docs/30 R6).
+        if len(p) != len(batch):
+            raise SystemExit(
+                f"DeepLC returned {len(p)} predictions for {len(batch)} peptidoforms in one "
+                f"batch; refusing to rewrite the library from a malformed response")
         for pf, v in zip(batch, p):
             preds[pf] = float(v)
         done = min(s + chunk, len(uniq))
@@ -281,14 +290,61 @@ def main():
               f"({rate:.0f} peptidoforms/s, ETA {eta / 60:.1f} min)", flush=True)
     print(f"prediction phase: {time.time() - t_pred0:.1f}s total", flush=True)
 
-    # `base_pf` is recomputed here rather than cached from the pass above on purpose:
-    # caching it would retain one extra string per library row (hundreds of MB at
-    # library scale) to avoid a `startswith` and a slice.
-    new = np.array([preds.get(base_pf(pf), orig[i]) for i, pf in enumerate(pform)], dtype=np.float32)
+    new, summary = rewrite_irt(pform, orig, preds)
     idx = lib.schema.get_field_index("predicted_irt")
     lib = lib.set_column(idx, "predicted_irt", pa.array(new, pa.float32()))
     pq.write_table(lib, args.lib_out)
+    summary["model"] = which
+    summary["lib_in"] = args.lib_in
+    summary["lib_out"] = args.lib_out
+    with open(args.lib_out + ".summary.json", "w", encoding="utf-8") as fh:
+        json.dump(summary, fh, indent=2)
     print(f"wrote library with re-predicted iRT ({which}): {args.lib_out}")
+    print(f"  rows={summary['rows']} repredicted={summary['repredicted']} "
+          f"retained_imported={summary['retained_imported']} "
+          f"(non-standard residues {summary['retained_non_standard']}, "
+          f"no finite prediction {summary['retained_no_prediction']})")
+    if summary["retained_imported"]:
+        print(f"WARNING: {summary['retained_imported']} of {summary['rows']} rows "
+              f"({100.0 * summary['retained_imported'] / max(1, summary['rows']):.2f}%) keep "
+              f"their imported iRT, which is on the imported model's scale, not {which}'s; "
+              f"the counts are in {args.lib_out}.summary.json", flush=True)
+
+
+def rewrite_irt(pform, orig, preds):
+    """The new `predicted_irt` column and a count of where each value came from.
+
+    A peptidoform with a finite prediction for its DECOY_-stripped sequence takes it. A
+    peptidoform without one keeps its imported value: rows with non-standard residues are
+    never sent to DeepLC (`is_std`), and a prediction that came back non-finite is an
+    unsupported input rather than a number. Both are counted so the mixture of RT sources
+    in the written library is explicit instead of silent (docs/30 R6). `base_pf` is
+    recomputed here rather than cached from the pass above on purpose: caching it would
+    retain one extra string per library row (hundreds of MB at library scale).
+    """
+    n = len(pform)
+    new = np.empty(n, dtype=np.float32)
+    repredicted = 0
+    no_prediction = 0
+    non_standard = 0
+    for i, pf in enumerate(pform):
+        v = preds.get(base_pf(pf))
+        if v is None:
+            new[i] = orig[i]
+            non_standard += 1
+        elif not math.isfinite(v):
+            new[i] = orig[i]
+            no_prediction += 1
+        else:
+            new[i] = v
+            repredicted += 1
+    return new, {
+        "rows": n,
+        "repredicted": repredicted,
+        "retained_imported": non_standard + no_prediction,
+        "retained_non_standard": non_standard,
+        "retained_no_prediction": no_prediction,
+    }
 
 
 if __name__ == "__main__":

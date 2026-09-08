@@ -110,8 +110,10 @@ and one `psms.parquet` per run in `source` order. Produces `<out>.parquet`, one 
 per accepted transfer (`mbr_worker.py:254`): `candidate_id`, `source`, `peptidoform`,
 `charge`, `protein_group`, `label`, `expected_rt`, `observed_rt`, `rt_delta`,
 `transfer_q` (10 columns). When there are no transfer candidates at all the worker
-short-circuits and writes a placeholder table with a single empty `candidate_id`
-column (`pa_write_empty`, `mbr_worker.py:289`), so `<out>.parquet` always exists.
+short-circuits and writes the same ten columns with zero rows (`write_empty_transfers`),
+and, when `--out-scored` was asked for, the scored table unchanged with `is_transferred`
+false and `transfer_q` NaN on every row (`write_unflagged_scored`), so a downstream stage
+never meets a missing file or a one-column placeholder (docs/30).
 Optionally writes an augmented scored table (`--out-scored`) that lowers each accepted
 transfer's PSM q columns to `min(q, transfer_q)` on the matching `(candidate_id,
 source)` row and adds an `is_transferred` bool plus a `transfer_q` column (the accepted
@@ -535,7 +537,7 @@ FDR/reporting).
 | `run_mbr` | sidecar.rs:162 | build argv and spawn `mbr_worker.py` |
 | `binned_map` | mbr_worker.py:31 | monotone binned-median RT calibration |
 | `expected_rt` | mbr_worker.py:116 | cross-run predicted RT for a candidate in a run |
-| `pa_write_empty` | mbr_worker.py:289 | placeholder output when there are no transfer candidates |
+| `write_empty_transfers` / `write_unflagged_scored` | mbr_worker.py | full-schema outputs when there are no transfer candidates |
 | `ReportParams` / `report::run` | report.rs:13 / 49 | TSV writer |
 | `strip` | report.rs:24 | stripped sequence from a peptidoform |
 | `qcell` | report.rs:39 | quantity cell formatting (1 decimal; empty on NaN) |
@@ -648,10 +650,14 @@ but do not affect the wired `mumdia mbr` path.
   `traces_extracted` are all set from the same `traces` flag (`audit.rs:170`) because
   the artifacts only record presence in `psms`; the (not-yet-written) in-extract sidecar
   would be the only way to split "no traces" from "traces but no accepted peak".
-- **audit `reported` vs `REPORTED`.** The `reported` bool column is set from
-  `passed_prec` alone (`audit.rs:176`), while the `REPORTED` rejection reason additionally
-  requires the peptide gate. A candidate can therefore have `reported=true` yet
-  `rejection_reason=FAILED_PEPTIDE_FDR`. Treat `rejection_reason` as authoritative.
+- **audit `reported` and `REPORTED` agree.** The `reported` bool is `rejection_reason ==
+  REPORTED`: a target that passed the precursor and the peptide gate. A decoy that passes
+  both is `REMOVED_DURING_REPORTING`, because the report never writes a decoy. The two
+  gate columns (`passed_precursor_fdr`, `passed_peptide_fdr`) remain the diagnostics.
+  Until docs/30 R7 the flag repeated the precursor gate alone, so a row could read
+  `reported=true` next to `FAILED_PEPTIDE_FDR`, and a decoy could be `REPORTED`. A present
+  `precursor_q` column of the wrong type is an error; only an absent column falls back to
+  the PSM `q_value` (recorded as `q_unit`).
 - **audit reason coverage.** In the current chain `audit.rs` can only ever emit
   `DID_NOT_SURVIVE_EXTRACTION`, `OUTCOMPETED_BY_TARGET`/`OUTCOMPETED_BY_DECOY`, `FAILED_PRECURSOR_FDR`,
   `FAILED_PEPTIDE_FDR`, and `REPORTED`. The five refined extract codes

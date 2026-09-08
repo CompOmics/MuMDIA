@@ -49,6 +49,12 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ### Changed
 
+- Model identities carry the installed predictor versions: `deeplc-4.1.1-base`,
+  `deeplc-4.1.1-finetuned`, `ms2pip-4.2.0-HCDch2` in the library report and the manifests,
+  in place of the family labels `deeplc-4.0-mt` and `ms2pip-<model>` (docs/30).
+- With nothing to transfer, the MBR worker writes a transfer table with its ten columns and
+  zero rows, and the requested augmented scored table with every row unflagged, instead of
+  a one-column placeholder and no scored table (docs/30).
 - The candidate-audit rejection code `NO_PEAK_GROUP` is `DID_NOT_SURVIVE_EXTRACTION`
   (`RejectionReason::DidNotSurviveExtraction`). The audit assigns it to every candidate
   with no extracted row, and `extract` does not write the per-candidate table that would
@@ -171,6 +177,41 @@ than a number. Both are recorded in every run's `manifest.json`.
     cancellation flag was written and never read. The waiter is now the only writer: it
     reads the intent after reaping the engine and publishes `cancelled`, `done` when the
     engine had already finished, or `failed`; until then the run shows "Stopping" (#14).
+- Code review E, follow-up (`docs/30_code_review_2026-09-08.md`, R1 to R9):
+  - Enabling DeepLC fine-tuning with its own defaults was rejected at load, because the
+    documented automatic batch size is `finetune_batch = 0` and the new validation demanded
+    a positive batch. Only the epoch count has a lower bound now (R1; a regression from
+    review A).
+  - `run-experiment --run-names` accepted `a` and `a.`, one directory on Windows, and the
+    second run overwrote the first with exit 0. Names ending in a dot or a space, containing
+    `<>:"|?*` or a control character, or naming a Windows reserved device are rejected on
+    every platform before anything is written (R2).
+  - A desktop stop could sweep temporary files that belonged to the next run in the same
+    folder: cancellation swept after the reservation had been released, and a stop on a
+    finished run swept as well. Cancellation is now intent and kill only and inert once the
+    run is terminal; the sweep happens in the waiter, after the reap and before the release,
+    and a stop still killing finishes before the folder changes hands (R3).
+  - Two searches converting the same vendor file concurrently shared one temporary output
+    and one could publish the other's bytes. Each conversion writes a unique partial file
+    under a lock beside the destination; a concurrent converter waits and reuses the
+    result (R4).
+  - Domain checks for the numeric settings review A left unchecked: `mbr.q_anchor`,
+    `min_anchor_runs`, `extract.min_matched_fraction`, `features.bound_peak_fraction`,
+    `quant.reliable_q` and the remaining fractions, correlations, tolerances and counts (R5).
+  - The DeepLC fine-tune and re-prediction worker zipped predictions with peptidoforms
+    without checking the count and silently kept the imported iRT for anything missing. A
+    count mismatch is an error; rows that keep their imported value are counted in
+    `<lib_out>.summary.json` and the engine warns when there are any (R6).
+  - The audit's `reported` flag repeated the precursor gate, so it could read `true` next to
+    `FAILED_PEPTIDE_FDR`, and a decoy could be `REPORTED`; the flag now follows the reason,
+    a decoy past both gates is `REMOVED_DURING_REPORTING`, and a present `precursor_q` of the
+    wrong type is an error rather than a fallback (R7).
+  - The desktop results-folder reservation compared exact folders only, so a search into a
+    child of an active experiment's folder was allowed; ancestors and descendants are
+    refused, siblings are not (R8).
+  - The Windows debug binary overflowed its 1 MiB main-thread stack on `--version`; the CLI
+    runs on a thread with a 256 MiB reservation and an integration test runs the built
+    binary (R9).
 - Code review D, calibration, provenance, reporting (`docs/29`, findings 10, 15, 16, 19):
   - LOESS retention-time calibration switched to the global least-squares line the
     moment a query left the anchor range, while the grid just inside used the local fit,

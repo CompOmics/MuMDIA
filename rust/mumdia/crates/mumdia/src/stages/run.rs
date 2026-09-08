@@ -615,13 +615,14 @@ pub fn run(p: RunParams) -> Result<()> {
     // Model identities reflect the path that produced the downstream artifacts,
     // including imported libraries and per-run RT fine-tuning.
     let library_input = p.lib_precursors.is_some();
+    let deeplc_py = cfg.predict_frag.deeplc_python.as_deref();
     let rt_identity = if cfg.rt_im_train.finetune_deeplc {
-        "deeplc-finetuned".to_string()
+        crate::sidecar::deeplc_identity(deeplc_py, "finetuned")
     } else if cfg
         .rt_im_train
-        .repredicts_library_irt(library_input, cfg.predict_frag.deeplc_python.is_some())
+        .repredicts_library_irt(library_input, deeplc_py.is_some())
     {
-        "deeplc-base-model".to_string()
+        crate::sidecar::deeplc_identity(deeplc_py, "base")
     } else if library_input {
         "imported-library".to_string()
     } else {

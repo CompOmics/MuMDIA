@@ -540,7 +540,13 @@ than its input is either from a different acquisition of the same name or from
 before the input was re-acquired, and searching it would search the wrong data. An
 unreadable timestamp counts as not reusable.
 
-The converter writes to `<name>.partial.mzML` and the engine renames it to
+The converter writes to `<name>.partial-<pid>-<n>.mzML`, a name unique to this
+conversion, under a `<name>.mzML.converting` lock beside the destination; a second
+process converting the same input waits for the lock and reuses the finished mzML
+instead of converting into the same destination (docs/30 R4: two concurrent
+conversions used to share one partial file, and one of them published the other's
+bytes). A lock whose holder stopped writing for fifteen minutes is broken. The engine
+then renames the partial file to
 `<name>.mzML` only after a zero exit and a file at that path, so a killed run or a
 converter crash leaves nothing the reuse rule can mistake for a finished conversion;
 a stale `.partial.mzML` is removed at the next attempt. The marker sits in the stem

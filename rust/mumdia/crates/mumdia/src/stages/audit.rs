@@ -106,16 +106,21 @@ pub fn run(p: AuditParams) -> Result<u64> {
     // the PSM `q_value` (docs/29 #16), a different unit: a PSM can pass at 1% while
     // its precursor group does not, and the other way round. Older scored tables have
     // no `precursor_q`; there the PSM q is used and the metrics say so.
-    let (scored_q, q_unit) = match scored_t.f64("precursor_q") {
-        Ok(v) => (v, "precursor_q"),
-        Err(_) => {
-            tracing::warn!(
-                scored = p.scored,
-                "audit: no `precursor_q` column; the precursor gate falls back to the PSM \
-                 q_value, which is not the same unit"
-            );
-            (scored_t.f64("q_value")?, "q_value")
-        }
+    let (scored_q, q_unit) = if scored_t.has_column("precursor_q") {
+        // Present means present: a column of the wrong type is an error, not a reason to
+        // read another unit in its place (docs/30 R7, the absent-versus-malformed rule
+        // quant applies to `source`).
+        let v = scored_t
+            .f64("precursor_q")
+            .with_context(|| format!("audit: reading precursor_q from {}", p.scored))?;
+        (v, "precursor_q")
+    } else {
+        tracing::warn!(
+            scored = p.scored,
+            "audit: no `precursor_q` column; the precursor gate falls back to the PSM \
+             q_value, which is not the same unit"
+        );
+        (scored_t.f64("q_value")?, "q_value")
     };
     // peptide-level q is optional (only present in some scored schemas).
     let scored_pep_q = scored_t.f64("peptide_q_value").ok();
@@ -186,6 +191,9 @@ pub fn run(p: AuditParams) -> Result<u64> {
             RejectionReason::FailedPrecursorFdr
         } else if !passed_pep {
             RejectionReason::FailedPeptideFdr
+        } else if is_decoy {
+            // Passed every gate, and the report never writes a decoy (docs/30 R7).
+            RejectionReason::RemovedDuringReporting
         } else {
             RejectionReason::Reported
         };
@@ -205,7 +213,11 @@ pub fn run(p: AuditParams) -> Result<u64> {
         f_td_winner.push(in_scored);
         f_prec_fdr.push(passed_prec);
         f_pep_fdr.push(passed_pep && passed_prec);
-        f_reported.push(passed_prec);
+        // One definition of "reported": the rejection reason. The flag used to repeat
+        // the precursor gate alone, so a row could read `reported = true` next to
+        // `FAILED_PEPTIDE_FDR`, and a decoy could be reported (docs/30 R7). The gate
+        // diagnostics keep their own columns above.
+        f_reported.push(reason == RejectionReason::Reported);
         reason_c.push(reason.code().to_string());
     }
 
@@ -417,6 +429,91 @@ mod tests {
         let m: serde_json::Value =
             mumdia_io::json::read_json(&format!("{out}.metrics.json")).unwrap();
         assert_eq!(m["q_unit"], "precursor_q");
+    }
+
+    #[test]
+    fn the_reported_flag_follows_the_reason_and_the_report_rules() {
+        // docs/30 R7: a target passing the precursor gate but not the peptide gate, a
+        // target passing both, and a decoy passing both. Only the second is reported,
+        // the flag says so, and the metrics count the same row.
+        let lib = tmp("lib_rep.parquet");
+        let psms = tmp("psms_rep.parquet");
+        let comp = tmp("comp_rep.parquet");
+        let scored = tmp("scored_rep.parquet");
+        let out = tmp("audit_rep.parquet");
+        write_lib(&lib, &[1, 2, 3], &["target", "target", "decoy"]);
+        write_cid_only(&psms, &[1, 2, 3]);
+        write_cid_only(&comp, &[1, 2, 3]);
+        write_table(
+            &scored,
+            vec![
+                Col::U32("candidate_id".into(), vec![1, 2, 3]),
+                Col::F64("q_value".into(), vec![0.001, 0.001, 0.001]),
+                Col::F64("precursor_q".into(), vec![0.001, 0.001, 0.001]),
+                Col::F64("peptide_q_value".into(), vec![0.5, 0.001, 0.001]),
+            ],
+        )
+        .unwrap();
+        run(AuditParams {
+            library_precursors: &lib,
+            psms: &psms,
+            competed: &comp,
+            scored: &scored,
+            out: &out,
+            q_threshold: 0.01,
+            run_id: "t",
+            entrapment_substr: "",
+        })
+        .unwrap();
+        let a = TableFile::open(&out).unwrap();
+        let cid = a.u32("precursor_id").unwrap();
+        let reason = a.str("rejection_reason").unwrap();
+        let reported = a.bool("reported").unwrap();
+        let by: std::collections::HashMap<u32, (String, bool)> = cid
+            .iter()
+            .cloned()
+            .zip(reason.into_iter().zip(reported))
+            .collect();
+        assert_eq!(by[&1], ("FAILED_PEPTIDE_FDR".to_string(), false));
+        assert_eq!(by[&2], ("REPORTED".to_string(), true));
+        assert_eq!(by[&3], ("REMOVED_DURING_REPORTING".to_string(), false));
+        let m: serde_json::Value =
+            mumdia_io::json::read_json(&format!("{out}.metrics.json")).unwrap();
+        assert_eq!(m["reported"], 1);
+    }
+
+    #[test]
+    fn a_present_but_malformed_precursor_q_column_is_an_error_not_a_fallback() {
+        let lib = tmp("lib_bad.parquet");
+        let psms = tmp("psms_bad.parquet");
+        let comp = tmp("comp_bad.parquet");
+        let scored = tmp("scored_bad.parquet");
+        let out = tmp("audit_bad.parquet");
+        write_lib(&lib, &[1], &["target"]);
+        write_cid_only(&psms, &[1]);
+        write_cid_only(&comp, &[1]);
+        write_table(
+            &scored,
+            vec![
+                Col::U32("candidate_id".into(), vec![1]),
+                Col::F64("q_value".into(), vec![0.001]),
+                Col::I32("precursor_q".into(), vec![0]),
+            ],
+        )
+        .unwrap();
+        let e = run(AuditParams {
+            library_precursors: &lib,
+            psms: &psms,
+            competed: &comp,
+            scored: &scored,
+            out: &out,
+            q_threshold: 0.01,
+            run_id: "t",
+            entrapment_substr: "",
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("precursor_q"), "{e}");
     }
 
     #[test]

@@ -525,13 +525,15 @@ def test_binned_map_removes_a_systematic_inter_run_rt_offset(
         )
 
 
-def test_no_transfer_candidates_writes_an_empty_table_and_no_scored_table(tmp_path):
-    """With nothing to transfer the worker exits 0, and `--out-scored` is skipped.
+def test_no_transfer_candidates_writes_the_full_schema_and_an_unflagged_scored_table(tmp_path):
+    """With nothing to transfer the worker exits 0 and keeps its output contract.
 
-    `mbr_worker.py:187-188` returns before the M5 block, so a caller that
-    passed `--out-scored` gets no file. A downstream quant pointed at that path
-    fails on a missing input rather than on a nonzero MBR exit, so the true
-    cause is not in the MBR log; pinning the behaviour keeps that documented.
+    It used to return before the M5 block: a caller that passed `--out-scored` got no
+    file, and the transfer table had a single `candidate_id` column. Downstream stages
+    then failed on a missing input or an unexpected schema instead of reading an empty
+    result (docs/30). Now the transfer table carries all ten columns with zero rows, and
+    the augmented scored table is the input with `is_transferred` false and `transfer_q`
+    NaN on every row.
     """
     ids = list(range(20))
     cols = {k: [] for k in ("candidate_id", "source", "label", "q_value",
@@ -558,8 +560,19 @@ def test_no_transfer_candidates_writes_an_empty_table_and_no_scored_table(tmp_pa
         "--out-scored", scored_out,
     )
     assert "no transfer candidates" in stdout
-    assert pq.read_table(str(out)).num_rows == 0
-    assert not scored_out.exists()
+    transfers = pq.read_table(str(out))
+    assert transfers.num_rows == 0
+    assert transfers.column_names == [
+        "candidate_id", "source", "peptidoform", "charge", "protein_group", "label",
+        "expected_rt", "observed_rt", "rt_delta", "transfer_q",
+    ]
+    assert scored_out.exists(), "--out-scored is honoured even with nothing to transfer"
+    after = read_columns(scored_out)
+    assert len(after["candidate_id"]) == len(cols["candidate_id"])
+    assert not np.asarray(after["is_transferred"], dtype=bool).any()
+    assert np.isnan(np.asarray(after["transfer_q"], dtype=float)).all()
+    for col in ("q_value", "peptidoform"):
+        assert list(after[col]) == list(cols[col]), "{} must be unchanged".format(col)
 
 
 def test_missing_psms_path_fails_loudly(mbr_dataset, tmp_path):

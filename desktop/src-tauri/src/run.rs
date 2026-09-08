@@ -79,16 +79,36 @@ fn ownership_key(dir: &Path) -> String {
 pub fn reserve_out_dir(dir: &Path, id: &str) -> Result<String, String> {
     let key = ownership_key(dir);
     let mut active = ACTIVE_OUT_DIRS.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(owner) = active.get(&key) {
+    // Equal keys, and also one folder inside the other (docs/30 R8): an experiment writes
+    // into its per-run subfolders and cleanup walks its whole folder, so a search into a
+    // child of an active experiment, or an experiment over the parent of an active search,
+    // is an overlapping writer. Component-wise, so `out` and `out2` stay independent.
+    if let Some((held, owner)) = active
+        .iter()
+        .find(|(held, _)| **held == key || paths_nest(held, &key))
+    {
+        let relation = if *held == key {
+            "is in use".to_string()
+        } else if Path::new(&key).starts_with(Path::new(held)) {
+            format!("is inside the results folder {held}, which is in use")
+        } else {
+            format!("contains the results folder {held}, which is in use")
+        };
         return Err(format!(
-            "the results folder {} is in use by a search that is still running ({owner}). \
+            "the results folder {} {relation} by a search that is still running ({owner}). \
              Wait for it to finish or stop it, or choose another folder: two searches \
-             writing one folder overwrite each other's results.",
+             writing one folder tree overwrite each other's results.",
             dir.display()
         ));
     }
     active.insert(key.clone(), id.to_string());
     Ok(key)
+}
+
+/// True when one path is an ancestor of the other, by path components.
+fn paths_nest(a: &str, b: &str) -> bool {
+    let (pa, pb) = (Path::new(a), Path::new(b));
+    pa.starts_with(pb) || pb.starts_with(pa)
 }
 
 /// Give a reserved results folder back.
@@ -231,16 +251,39 @@ impl Run {
     /// publish `failed`, with the last log line as the "error", and this method then
     /// declined to replace a terminal status (docs/29 #14).
     pub fn cancel(&self) {
+        // Inert once terminal: there is no process to kill, and the folder may already
+        // belong to a later run (docs/30 R3). Cleanup is not done here at all any more:
+        // it belongs to `publish_exit`, which runs after the reap and before the
+        // reservation is released, so it can only ever touch this run's own files.
+        if !self.is_active() {
+            return;
+        }
         self.cancelled.store(true, Ordering::SeqCst);
         self.set(|s| s.cancel_requested = true);
-        let pid = self.pid.lock().ok().and_then(|p| *p);
-        if let Some(pid) = pid {
+        // The pid lock is held across the kill, and `publish_exit` retires the pid under
+        // the same lock before it sweeps and releases. A stop still in flight when the
+        // engine is reaped therefore finishes before the folder changes hands, and a stop
+        // that arrives after the reap finds no pid.
+        let guard = self.pid.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(pid) = *guard {
             kill_tree(pid);
         }
-        // A first sweep once the kill has returned. `publish_exit` sweeps again after
-        // the process is reaped, the only moment nothing can still be writing.
-        let out_dir = self.snapshot().out_dir;
-        sweep_temp_files(Path::new(&out_dir));
+        drop(guard);
+    }
+
+    fn is_active(&self) -> bool {
+        matches!(self.snapshot().status.as_str(), "running" | "starting")
+    }
+
+    /// Apply `f` only while the run is still active; returns whether it was.
+    fn set_if_active<F: FnOnce(&mut Snapshot)>(&self, f: F) -> bool {
+        if let Ok(mut s) = self.snapshot.lock() {
+            if matches!(s.status.as_str(), "running" | "starting") {
+                f(&mut s);
+                return true;
+            }
+        }
+        false
     }
 
     /// Publish the terminal state of the run from how its process ended.
@@ -255,8 +298,16 @@ impl Run {
     /// engine finished before the kill landed and its outputs are complete, and
     /// calling them cancelled would hide a finished result.
     fn publish_exit(&self, outcome: std::io::Result<std::process::ExitStatus>, out_dir: &Path) {
+        // Retire the pid first. This waits for a stop that is still killing (it holds the
+        // same lock), so nothing below overlaps a kill, and a later stop finds nothing to
+        // signal (docs/30 R3).
+        if let Ok(mut p) = self.pid.lock() {
+            *p = None;
+        }
         let cancelled = self.cancelled.load(Ordering::SeqCst);
         if cancelled {
+            // The only sweep: after the reap, before the release, inside this run's
+            // ownership of the folder.
             sweep_temp_files(out_dir);
         }
         let stages = scan_stages(out_dir);
@@ -671,15 +722,15 @@ pub fn start(id: String, req: Request) -> Result<Arc<Run>, String> {
             let started = Instant::now();
             loop {
                 let stages = scan_stages(&out_dir);
-                let running = {
-                    let s = run.snapshot();
-                    s.status == "running" || s.status == "starting"
-                };
-                run.set(|s| {
+                // Written only while the run is still active, under the snapshot lock:
+                // once `publish_exit` has published, a scan that was in flight must not
+                // replace the finished snapshot's stages with whatever the folder holds
+                // now, which may already be a later run's contents (docs/30).
+                let still_active = run.set_if_active(|s| {
                     s.stages = stages;
                     s.elapsed_ms = started.elapsed().as_millis() as u64;
                 });
-                if !running {
+                if !still_active {
                     // The final scan belongs to the waiter, not here: it has to happen
                     // BEFORE the status becomes terminal, or a caller that polls until
                     // the run is finished can read a snapshot whose stages and results
@@ -903,7 +954,8 @@ mod tests {
         let s = run.snapshot();
         assert_eq!(s.status, "failed");
         assert_eq!(s.error.as_deref(), Some("Error: no such file"));
-        assert!(s.cancel_requested);
+        // A stop that arrives after the end is inert and records nothing (docs/30 R3).
+        assert!(!s.cancel_requested);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -946,6 +998,84 @@ mod tests {
         assert_eq!(s.status, "running");
         assert!(s.cancel_requested);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_late_stop_after_the_run_ended_leaves_the_folder_alone() {
+        // docs/30 R3: A finished and released its folder; B took it and is writing. A
+        // stop delivered to A must neither sweep B's temporary file nor change A's state.
+        let (run, dir) = running("late_stop");
+        let key = reserve_out_dir(&dir, "run-A").unwrap();
+        *run.reservation.lock().unwrap() = Some(key);
+        run.publish_exit(Ok(exit_status(1)), &dir);
+        assert_eq!(run.snapshot().status, "failed");
+        let key_b = reserve_out_dir(&dir, "run-B").expect("A released its folder");
+        let b_file = dir.join("new.parquet.tmp-999-1");
+        std::fs::write(&b_file, b"B's partial write").unwrap();
+        run.cancel();
+        assert!(
+            b_file.is_file(),
+            "a late stop must not sweep another run's files"
+        );
+        let s = run.snapshot();
+        assert_eq!(s.status, "failed");
+        assert!(!s.cancel_requested, "a terminal run records no stop");
+        release_out_dir(&key_b);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_stop_still_in_flight_finishes_before_the_folder_is_released() {
+        // docs/30 R3, the concurrent route: the engine is reaped while the stop thread is
+        // still inside the kill. Publication must wait for the kill to finish, so the
+        // reservation cannot be released, and taken by a new run, while the stop is
+        // still active in that folder. The kill is simulated by holding the pid lock.
+        let (run, dir) = running("inflight_stop");
+        let key = reserve_out_dir(&dir, "run-A").unwrap();
+        *run.reservation.lock().unwrap() = Some(key);
+        run.cancelled.store(true, Ordering::SeqCst);
+        let killing = run.pid.lock().unwrap();
+        let (r2, d2) = (Arc::clone(&run), dir.clone());
+        let waiter = std::thread::spawn(move || r2.publish_exit(Ok(exit_status(1)), &d2));
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            reserve_out_dir(&dir, "run-B").is_err(),
+            "the folder must stay reserved while the stop is in flight"
+        );
+        assert_eq!(
+            run.snapshot().status,
+            "running",
+            "nothing is published mid-kill"
+        );
+        drop(killing);
+        waiter.join().unwrap();
+        assert_eq!(run.snapshot().status, "cancelled");
+        let k = reserve_out_dir(&dir, "run-B").expect("released once the stop completed");
+        release_out_dir(&k);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn overlapping_result_folders_are_refused_in_both_orders_but_siblings_are_not() {
+        // docs/30 R8: an experiment owns its per-run subfolders and its cleanup walks the
+        // whole tree, so a parent and a child are one writer.
+        let parent = scratch("nest");
+        let child = parent.join("run1");
+        let sibling = std::env::temp_dir().join(format!("mumdia_run_{}_nest2", std::process::id()));
+        std::fs::create_dir_all(&child).unwrap();
+        std::fs::create_dir_all(&sibling).unwrap();
+        let k = reserve_out_dir(&parent, "run-1").unwrap();
+        let e = reserve_out_dir(&child, "run-2").unwrap_err();
+        assert!(e.contains("is inside") && e.contains("run-1"), "{e}");
+        let ks = reserve_out_dir(&sibling, "run-3").expect("a sibling is independent");
+        release_out_dir(&k);
+        release_out_dir(&ks);
+        let kc = reserve_out_dir(&child, "run-2").unwrap();
+        let e = reserve_out_dir(&parent, "run-1").unwrap_err();
+        assert!(e.contains("contains") && e.contains("run-2"), "{e}");
+        release_out_dir(&kc);
+        let _ = std::fs::remove_dir_all(&parent);
+        let _ = std::fs::remove_dir_all(&sibling);
     }
 
     #[test]

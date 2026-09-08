@@ -156,9 +156,10 @@ paired decoy leave together; the counts land in the library report as
 used to be anchored at `irt = 0.0` with a warning, which collapsed the RT window onto
 the gradient origin for those candidates (docs/29 #17). `run_deeplc` also rejects a
 returned id that was not requested or that appears twice. The DeepLC branch requires `deeplc_python`
-and errors otherwise (`predict_frag.rs:318-321`); its returned model id is the
-hardcoded string `"deeplc-4.0-mt"` (`predict_frag.rs:353`), not a trait
-`identity()` (the sidecar path has no `RtPredictor` impl to query).
+and errors otherwise (`predict_frag.rs:318-321`); its returned model id is
+`deeplc-<installed version>-base`, the version read from the interpreter, not a trait
+`identity()` (the sidecar path has no `RtPredictor` impl to query). It was the literal
+`"deeplc-4.0-mt"` until docs/30, which named a family, not the release that predicted.
 
 **intensity assignment** (`assign_intensities`, `predict_frag.rs:359`). Native
 path calls `NativeFrag::predict_intensities`. MS2PIP path runs the sidecar over
@@ -422,8 +423,8 @@ m/z (`Library::local_frag_index`, `index.rs:325`).
 | `PredictFragParams` | `predict_frag.rs:24` | Stage C entry args: in/out paths, `cfg`, `work_dir`, `config_hash` |
 | `predict_frag::run` | `predict_frag.rs:50` | Stage C entry: parse, fragment, assign intensity/iRT, top-N, sort, write; returns `(n_prec, n_frag)` |
 | `Raw` | `predict_frag.rs:34` | one candidate pre-assignment; caches the `ParsedPeptidoform` so RT/intensity reuse the parse |
-| `assign_rt` | `predict_frag.rs:308` | native or DeepLC iRT; emits the DeepLC-miss warning; DeepLC id `"deeplc-4.0-mt"` |
-| `assign_intensities` | `predict_frag.rs:359` | native or MS2PIP intensity with per-charge-group normalization + native charge-2 fallback; MS2PIP id `"ms2pip-{model}"` |
+| `assign_rt` | `predict_frag.rs:308` | native or DeepLC iRT; emits the DeepLC-miss warning; DeepLC id `deeplc-<version>-base` |
+| `assign_intensities` | `predict_frag.rs:359` | native or MS2PIP intensity with per-charge-group normalization + native charge-2 fallback; MS2PIP id `ms2pip-<version>-{model}` |
 | `fragment_cardinality` | `predict_frag.rs:457` | distinct precursors per 0.01 Da fragment-m/z bin, per fragment row; diagnostic column, no consumer yet |
 | `RtPredictor` / `FragmentPredictor` | `predict.rs:13` / `predict.rs:19` | predictor traits (predict + `identity`); implemented only by the native structs |
 | `NativeRt` | `predict.rs:25` | additive retention-coefficient model + `sqrt(len)` + `0.01*mod` term, `identity` `native-rt-v1` |

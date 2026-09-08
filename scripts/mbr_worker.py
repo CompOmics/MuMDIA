@@ -229,7 +229,14 @@ def main():
     target_delta = np.array(rows["rt_delta"])
     decoy_delta = np.array(decoy_delta)
     if len(target_delta) == 0:
-        print("MBR: no transfer candidates"); pa_write_empty(a.out); return
+        # The same output contract as a run with transfers: a full-schema empty transfer
+        # table, and the requested augmented scored table with every row unflagged, so a
+        # downstream stage never sees a missing file or a one-column placeholder (docs/30).
+        print("MBR: no transfer candidates")
+        write_empty_transfers(a.out)
+        if a.out_scored:
+            write_unflagged_scored(a.scored, a.out_scored)
+        return
 
     # transfer q via target/decoy competition on rt_delta (smaller = better). At a
     # threshold delta, FDR = (#null <= delta + 1) / (#target <= delta), the same +1
@@ -345,8 +352,30 @@ def main():
         print(f"wrote {a.out_scored} (augmented scored; {int(is_tr.sum())} rows flagged transferred)")
 
 
-def pa_write_empty(path):
-    write_engine_table(pa.table({"candidate_id": pa.array([], pa.uint32())}), path)
+def write_empty_transfers(path):
+    """A zero-row transfer table with the same ten columns a run with transfers writes."""
+    write_engine_table(pa.table({
+        "candidate_id": pa.array([], pa.uint32()),
+        "source": pa.array([], pa.uint32()),
+        "peptidoform": pa.array([], pa.string()),
+        "charge": pa.array([], pa.int32()),
+        "protein_group": pa.array([], pa.string()),
+        "label": pa.array([], pa.string()),
+        "expected_rt": pa.array([], pa.float64()),
+        "observed_rt": pa.array([], pa.float64()),
+        "rt_delta": pa.array([], pa.float64()),
+        "transfer_q": pa.array([], pa.float64()),
+    }), path)
+
+
+def write_unflagged_scored(scored_in, scored_out):
+    """The scored table unchanged, with `is_transferred` false and `transfer_q` NaN on
+    every row: the augmented schema with no transfer in it."""
+    full = pq.read_table(scored_in).to_pandas()
+    full["is_transferred"] = np.zeros(len(full), dtype=bool)
+    full["transfer_q"] = np.full(len(full), np.nan)
+    write_engine_parquet(full, scored_out)
+    print(f"wrote {scored_out} (augmented scored; 0 rows flagged transferred)")
 
 
 if __name__ == "__main__":

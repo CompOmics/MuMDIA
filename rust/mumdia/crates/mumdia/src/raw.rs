@@ -511,9 +511,126 @@ fn sciex_scan_hint(src: &Path) -> Option<String> {
 /// 6:48 conversion of a 3.7 GB Astral run was reported as "exited successfully but wrote no
 /// file" and discarded (doxy, 2026-09-06). msconvert's `--outfile` has the same habit. With
 /// `x.partial.mzML` there is nothing for either to fix up.
-fn partial_name(out_name: &str) -> String {
+fn partial_name(out_name: &str, tag: &str) -> String {
     let stem = out_name.strip_suffix(".mzML").unwrap_or(out_name);
-    format!("{stem}.partial.mzML")
+    format!("{stem}.partial-{tag}.mzML")
+}
+
+/// A tag no other conversion in any process shares: process id plus a per-process
+/// counter. Two searches converting one acquisition at the same time used to share
+/// `<stem>.partial.mzML` (docs/30 R4).
+fn unique_tag() -> String {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    format!(
+        "{}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    )
+}
+
+/// A claim on a conversion destination, held from before the temporary file is written
+/// until the result has been renamed into place or the attempt has failed.
+///
+/// Two searches converting the same input concurrently wrote one temporary file:
+/// converter B replaced A's partial output, A renamed B's bytes into place and reported
+/// success, and B failed because its output had been renamed away (docs/30 R4). The
+/// temporary name is unique now, and this lock beside the destination makes a second
+/// converter wait for the first and reuse what it produced rather than convert again
+/// into the same destination. Dropping the guard releases the lock.
+struct ConvertLock {
+    path: PathBuf,
+}
+
+impl ConvertLock {
+    fn path_for(out: &Path) -> PathBuf {
+        let mut name = out
+            .file_name()
+            .map(|n| n.to_os_string())
+            .unwrap_or_default();
+        name.push(".converting");
+        out.with_file_name(name)
+    }
+
+    /// Take the lock for `out`, waiting for a holder to finish first. `Ok(None)` means the
+    /// holder finished and left a usable conversion at `out`, which the caller reuses.
+    fn acquire(out: &Path, src: &Path, reuse: bool) -> Result<Option<ConvertLock>> {
+        let path = Self::path_for(out);
+        let mut announced = false;
+        loop {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(mut f) => {
+                    use std::io::Write;
+                    let _ = writeln!(f, "{}", std::process::id());
+                    return Ok(Some(ConvertLock { path }));
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if lock_is_stale(&path) {
+                        warn!(
+                            lock = %path.display(),
+                            "convert: removing a stale conversion lock; its holder stopped \
+                             writing"
+                        );
+                        let _ = std::fs::remove_file(&path);
+                        continue;
+                    }
+                    if !announced {
+                        info!(
+                            mzml = %out.display(),
+                            "convert: another process is converting this input; waiting for \
+                             it rather than converting into the same destination"
+                        );
+                        announced = true;
+                    }
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+                    if !path.exists() && reuse && out.is_file() && is_newer_than(out, src) {
+                        return Ok(None);
+                    }
+                }
+                Err(e) => {
+                    return Err(e).with_context(|| {
+                        format!("creating the conversion lock {}", path.display())
+                    })
+                }
+            }
+        }
+    }
+}
+
+impl Drop for ConvertLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// A lock whose holder has stopped: neither the lock nor any partial conversion file
+/// beside it has been written for `STALE_AFTER`. Converters write their output
+/// continuously, so a live conversion keeps a `.partial-` file fresh; a crashed or killed
+/// holder leaves both untouched.
+fn lock_is_stale(lock: &Path) -> bool {
+    const STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+    let fresh = |p: &Path| {
+        std::fs::metadata(p)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age < STALE_AFTER)
+    };
+    if fresh(lock) {
+        return false;
+    }
+    let dir = lock.parent().unwrap_or(Path::new("."));
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for e in rd.flatten() {
+            if e.file_name().to_string_lossy().contains(".partial-") && fresh(&e.path()) {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 pub fn ensure_mzml(
@@ -627,6 +744,17 @@ msconvert was not usable either: {e}"
         format!("{stem}.{}.mzML", path_discriminator(src))
     };
     let out = out_dir.join(&out_name);
+    // One converter per destination at a time; a concurrent one waits and reuses.
+    let _lock = match ConvertLock::acquire(&out, src, cfg.reuse_converted)? {
+        Some(lock) => lock,
+        None => {
+            info!(
+                mzml = %out.display(),
+                "convert: reusing the mzML a concurrent conversion of this input just wrote"
+            );
+            return Ok(out.to_string_lossy().into_owned());
+        }
+    };
     // Convert to a temporary name and rename only on success.
     //
     // Writing straight to `out` meant a killed run, a power loss or a converter crash
@@ -634,7 +762,8 @@ msconvert was not usable either: {e}"
     // `reuse_converted` accepted it on every later run: a partial acquisition searched
     // silently, for ever, presenting as unexplained low identification counts with
     // nothing in the interface to reveal it. Neither failure path removed it.
-    let tmp = out_dir.join(partial_name(&out_name));
+    let tmp_name = partial_name(&out_name, &unique_tag());
+    let tmp = out_dir.join(&tmp_name);
     let _ = std::fs::remove_file(&tmp);
 
     let args: Vec<String> = if is_thermo {
@@ -662,7 +791,7 @@ msconvert was not usable either: {e}"
         a.push("-o".into());
         a.push(out_dir.to_string_lossy().into_owned());
         a.push("--outfile".into());
-        a.push(partial_name(&out_name));
+        a.push(tmp_name.clone());
         a
     };
 
@@ -822,13 +951,66 @@ mod tests {
     fn the_partial_name_keeps_the_mzml_extension() {
         // The regression this guards: `x.mzML.partial` made ThermoRawFileParser write
         // `x.mzML.partial.mzML`, and the conversion was thrown away as "wrote no file".
-        assert_eq!(partial_name("run.mzML"), "run.partial.mzML");
+        assert_eq!(partial_name("run.mzML", "7-0"), "run.partial-7-0.mzML");
         assert_eq!(
-            partial_name("run.1a2b3c4d.mzML"),
-            "run.1a2b3c4d.partial.mzML"
+            partial_name("run.1a2b3c4d.mzML", "7-1"),
+            "run.1a2b3c4d.partial-7-1.mzML"
         );
-        assert!(partial_name("odd").ends_with(".mzML"));
-        assert_ne!(partial_name("run.mzML"), "run.mzML");
+        assert!(partial_name("odd", "1-1").ends_with(".mzML"));
+        assert_ne!(partial_name("run.mzML", "1-1"), "run.mzML");
+        // Two conversions in one process never share a temporary file (docs/30 R4).
+        assert_ne!(unique_tag(), unique_tag());
+    }
+
+    #[test]
+    fn a_conversion_lock_is_exclusive_and_released_on_drop() {
+        let d = tmp("lock");
+        let out = d.join("run.mzML");
+        let src = d.join("run.raw");
+        std::fs::write(&src, b"raw").unwrap();
+        let first = ConvertLock::acquire(&out, &src, true)
+            .unwrap()
+            .expect("first holder");
+        assert!(ConvertLock::path_for(&out).is_file());
+        // A second claim cannot be taken while the first is held; the probe below asks
+        // the primitive directly rather than waiting through `acquire`.
+        let taken = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(ConvertLock::path_for(&out));
+        assert!(taken.is_err(), "the lock must be exclusive");
+        drop(first);
+        assert!(
+            !ConvertLock::path_for(&out).exists(),
+            "dropping releases the lock"
+        );
+        let second = ConvertLock::acquire(&out, &src, true).unwrap();
+        assert!(second.is_some(), "free again once released");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_stale_lock_is_broken_and_a_fresh_one_is_honoured() {
+        let d = tmp("stale");
+        let lock = d.join("run.mzML.converting");
+        std::fs::write(&lock, b"1").unwrap();
+        assert!(!lock_is_stale(&lock), "a lock written a moment ago is live");
+        // Age the lock past the staleness window; nothing partial is being written.
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(20 * 60);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&lock)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        assert!(
+            lock_is_stale(&lock),
+            "an old lock with no live partial file is stale"
+        );
+        // A partial file still being written keeps even an old lock alive.
+        std::fs::write(d.join("run.partial-99-0.mzML"), b"...").unwrap();
+        assert!(!lock_is_stale(&lock));
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

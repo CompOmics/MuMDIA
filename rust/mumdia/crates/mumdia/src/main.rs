@@ -1034,6 +1034,26 @@ fn load_config(path: &Option<String>) -> Result<Config> {
 }
 
 fn main() -> Result<()> {
+    // The dispatch in `real_main` is one large function whose arms keep their locals in
+    // a single frame, and without optimisation that frame exceeds the 1 MiB main-thread
+    // stack Windows reserves: the debug binary overflowed on `--version` before printing
+    // anything (docs/30 R9). The CLI therefore runs on a thread with a generous
+    // reservation; pages are committed only as they are touched, so release builds pay
+    // nothing for it. `tests/cli_version.rs` runs the built binary to keep this true.
+    const MAIN_STACK_BYTES: usize = 256 << 20;
+    let handle = std::thread::Builder::new()
+        .name("mumdia-main".into())
+        .stack_size(MAIN_STACK_BYTES)
+        .spawn(real_main)
+        .context("spawning the main thread")?;
+    match handle.join() {
+        Ok(result) => result,
+        // The panic hook has already printed the message and location.
+        Err(_) => anyhow::bail!("mumdia stopped on an internal error (see the panic above)"),
+    }
+}
+
+fn real_main() -> Result<()> {
     // Held for the whole process: dropping the guard is what writes dhat-heap.json into
     // the working directory, so it must outlive the stage that is being profiled.
     #[cfg(feature = "dhat-heap")]
