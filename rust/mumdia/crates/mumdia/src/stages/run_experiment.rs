@@ -320,6 +320,72 @@ fn split_by_source(scored: &str, out_paths: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// Reject run names that would share a per-run output directory.
+///
+/// Compared without regard to case on every platform, not only where the filesystem
+/// is known to fold case: `RunA` and `runa` are two directories on ext4 and one
+/// directory on NTFS, APFS and most network shares, and an experiment's output may be
+/// written to any of them. Sequential runs overwrite each other's artifacts there and
+/// parallel ones interleave, with no error from either (docs/29 #5). Refusing the pair
+/// everywhere costs nothing anyone would want.
+fn check_run_names_distinct(ns: &[String]) -> Result<()> {
+    let mut seen: std::collections::BTreeMap<String, &str> = std::collections::BTreeMap::new();
+    for n in ns {
+        if let Some(prev) = seen.insert(n.to_lowercase(), n.as_str()) {
+            if prev == n {
+                anyhow::bail!(
+                    "--run-names must be unique: {n:?} is given twice; each name is a per-run \
+                     output subdirectory, so a repeat makes two runs write the same artifacts \
+                     into one directory and interleave their results with no error"
+                );
+            }
+            anyhow::bail!(
+                "--run-names {prev:?} and {n:?} differ only in case; on a case-insensitive \
+                 filesystem (Windows, macOS, most network shares) they are one per-run output \
+                 directory, so the names must be distinct without regard to case"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Why `name` cannot be a per-run directory name on every platform, or `None`.
+///
+/// Syntactic, not probed: Windows's rules are applied everywhere, because an experiment's
+/// output may be written to any filesystem and a name that is one directory on NTFS must
+/// not be two on ext4. `a` and `a.` passed the old check (empty, separators, `.`, `..`) and
+/// were one directory on Windows: the second run overwrote the first and the experiment
+/// exited 0 with both split tables holding `source = 1` (docs/30 R2).
+fn portable_dir_name_problem(name: &str) -> Option<&'static str> {
+    const RESERVED: [&str; 22] = [
+        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+        "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    ];
+    if name.is_empty() {
+        return Some("it is empty");
+    }
+    if name == "." || name == ".." {
+        return Some("`.` and `..` are not names");
+    }
+    if name.contains('/') || name.contains('\\') {
+        return Some("it contains a path separator");
+    }
+    if name
+        .chars()
+        .any(|c| matches!(c, '<' | '>' | ':' | '"' | '|' | '?' | '*') || (c as u32) < 0x20)
+    {
+        return Some("it contains a character Windows forbids in a file name (<>:\"|?* or a control character)");
+    }
+    if name.ends_with('.') || name.ends_with(' ') {
+        return Some("it ends with a dot or a space, which Windows strips, so it names the same directory as the trimmed form");
+    }
+    let stem = name.split('.').next().unwrap_or(name).to_ascii_uppercase();
+    if RESERVED.contains(&stem.as_str()) {
+        return Some("it is a Windows reserved device name (CON, PRN, AUX, NUL, COM1-9, LPT1-9), with or without an extension");
+    }
+    None
+}
+
 pub fn run(p: RunExperimentParams) -> Result<()> {
     let t0 = Instant::now();
     // Same contract as the single-run orchestrator, and it matters more here: an
@@ -339,6 +405,34 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
     std::fs::create_dir_all(p.out_dir).ok();
     let d = |name: &str| format!("{}/{}", p.out_dir, name);
     let n_runs = p.mzmls.len();
+
+    // Provenance: the identity of the code, of the configuration and of the INPUTS,
+    // hashed now, before anything reads them for compute (docs/29 #15). Hashing at the
+    // end recorded whatever bytes were on disk after a multi-hour experiment, which is
+    // not necessarily what the search read; the single-run orchestrator has always
+    // hashed first, and the two now agree.
+    let mut prov = Manifest::new(cfg.canonical_json(), ch.clone());
+    for (i, m) in p.mzmls.iter().enumerate() {
+        if let (Ok(bytes), Ok(hash)) = (
+            std::fs::metadata(m).map(|x| x.len()),
+            mumdia_io::hash::blake3_file(m),
+        ) {
+            prov.record_input(&format!("mzml[{i}]"), m, bytes, hash);
+        }
+    }
+    for (role, path) in [
+        ("fasta", p.fasta),
+        ("lib_precursors", p.lib_precursors),
+        ("lib_fragments", p.lib_fragments),
+    ] {
+        let Some(path) = path else { continue };
+        if let (Ok(bytes), Ok(hash)) = (
+            std::fs::metadata(path).map(|x| x.len()),
+            mumdia_io::hash::blake3_file(path),
+        ) {
+            prov.record_input(role, path, bytes, hash);
+        }
+    }
     // Reject a bad --run-names rather than silently substituting r0..rN-1.
     //
     // The old `_ =>` arm swallowed any count mismatch with no warning, and accepted
@@ -358,22 +452,14 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
                     n_runs - 1
                 );
             }
-            let mut sorted = ns.to_vec();
-            sorted.sort();
-            sorted.dedup();
-            if sorted.len() != ns.len() {
+            check_run_names_distinct(ns)?;
+            if let Some((bad, why)) = ns
+                .iter()
+                .find_map(|n| portable_dir_name_problem(n).map(|why| (n, why)))
+            {
                 anyhow::bail!(
-                    "--run-names must be unique: each name is a per-run output \
-                     subdirectory, so a repeat makes two runs write the same artifacts \
-                     into one directory and interleave their results with no error"
-                );
-            }
-            if let Some(bad) = ns.iter().find(|n| {
-                n.is_empty() || n.contains('/') || n.contains('\\') || *n == "." || *n == ".."
-            }) {
-                anyhow::bail!(
-                    "--run-names entry {bad:?} is not usable as a directory name; each \
-                     becomes a subdirectory of --out-dir"
+                    "--run-names entry {bad:?} is not usable as a directory name: {why}; each \
+                     name becomes a subdirectory of --out-dir"
                 );
             }
             ns.to_vec()
@@ -583,6 +669,20 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         cfg: &cfg.rescore,
         config_hash: &ch,
     })?;
+    // The classifier that actually ran, from the rescore artifact report: the source of
+    // truth, since the configured enum can differ from it under a compatibility path.
+    let rescore_report: mumdia_io::report::ArtifactReport =
+        mumdia_io::json::read_json(&format!("{scored_combined}.report.json"))?;
+    let actual_rescorer = rescore_report
+        .params
+        .get("classifier")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+    let actual_rescorer_model = rescore_report
+        .model_identity
+        .clone()
+        .unwrap_or_else(|| actual_rescorer.clone());
 
     // --- optional rescuable-tier MBR transfer ---
     let scored_for_quant = if cfg.mbr.strategy != mumdia_core::config::MbrStrategy::None {
@@ -721,7 +821,15 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         "runs": names,
         "scored_combined": scored_combined,
         "scored_for_quant": scored_for_quant,
+        "rescorer": actual_rescorer,
         "mbr": format!("{:?}", cfg.mbr.strategy),
+        // Per-run quant gates on the pooled q_value whatever the configuration says
+        // (see the warning above). The configuration hash is of the configuration as
+        // given, so the substitution has to be recorded here or it is recorded nowhere.
+        "quant_q_filter": {
+            "configured": format!("{:?}", cfg.quant.q_filter),
+            "effective": format!("{:?}", qcfg.q_filter),
+        },
         "lfq": lfq,
         "peptide_quants": peptide_quants,
         "report": {
@@ -734,7 +842,8 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         },
     });
     // Provenance parity with the single-run manifest: the identity of the code, of
-    // the inputs, and of every artifact this stage produced.
+    // the inputs (hashed at the start of the run, see above), and of every artifact
+    // this stage produced.
     //
     // The per-artifact records were the gap. The experiment manifest listed output
     // PATHS in its `experiment` block and nothing else, so an experiment result had
@@ -743,28 +852,45 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
     // needed to tell whether two experiment outputs are the same data. Files written
     // by the per-run chains are not covered here (those chains do not thread a shared
     // manifest); what is covered is everything `run-experiment` itself writes.
-    let mut prov = Manifest::new(cfg.canonical_json(), ch.clone());
-    for (i, m) in p.mzmls.iter().enumerate() {
-        if let (Ok(bytes), Ok(hash)) = (
-            std::fs::metadata(m).map(|x| x.len()),
-            mumdia_io::hash::blake3_file(m),
-        ) {
-            prov.record_input(&format!("mzml[{i}]"), m, bytes, hash);
+    //
+    // Model identities reflect the path that produced the downstream artifacts, as
+    // in the single-run manifest (docs/29 #15): which RT source the library carried,
+    // which fragment predictor, and the classifier that actually ran.
+    let library_input = p.lib_precursors.is_some();
+    let deeplc_py = cfg.predict_frag.deeplc_python.as_deref();
+    let rt_identity = if cfg.rt_im_train.finetune_deeplc {
+        if matches!(cfg.experiment.finetune_scope, FinetuneScope::FirstRunOnly) {
+            crate::sidecar::deeplc_identity(deeplc_py, "finetuned-first-run")
+        } else {
+            crate::sidecar::deeplc_identity(deeplc_py, "finetuned-per-run")
         }
-    }
-    for (role, path) in [
-        ("fasta", p.fasta),
-        ("lib_precursors", p.lib_precursors),
-        ("lib_fragments", p.lib_fragments),
-    ] {
-        let Some(path) = path else { continue };
-        if let (Ok(bytes), Ok(hash)) = (
-            std::fs::metadata(path).map(|x| x.len()),
-            mumdia_io::hash::blake3_file(path),
-        ) {
-            prov.record_input(role, path, bytes, hash);
-        }
-    }
+    } else if cfg
+        .rt_im_train
+        .repredicts_library_irt(library_input, deeplc_py.is_some())
+    {
+        crate::sidecar::deeplc_identity(deeplc_py, "base")
+    } else if library_input {
+        "imported-library".to_string()
+    } else {
+        format!("{:?}", cfg.predict_frag.rt_predictor)
+    };
+    let fragment_identity = if library_input {
+        "imported-library".to_string()
+    } else {
+        format!("{:?}", cfg.predict_frag.predictor)
+    };
+    prov.model_identities
+        .insert("rt_predictor".into(), rt_identity);
+    prov.model_identities
+        .insert("fragment_predictor".into(), fragment_identity);
+    prov.model_identities
+        .insert("rescorer".into(), actual_rescorer_model);
+    prov.model_identities.insert(
+        "feature_schema_id".into(),
+        features::feature_schema_id(&features::active_features(cfg.features.set)),
+    );
+    prov.model_identities
+        .insert("mbr".into(), format!("{:?}", cfg.mbr.strategy));
     // Recorded in a fixed order, and every record hashes its file. `Manifest`
     // stores them in a BTreeMap, so the serialised order is by logical name and
     // does not depend on this sequence.
@@ -821,12 +947,18 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         &ch,
     )?);
 
+    // The resolved configuration itself, not only its hash: a hash identifies a
+    // configuration but cannot replay one (docs/29 #15).
     let manifest = serde_json::json!({
         "mumdia_version": prov.mumdia_version,
         "git_sha": prov.git_sha,
         "commit_date": prov.commit_date,
         "cli_args": prov.cli_args,
+        "config_hash": prov.config_hash,
+        "config_json": prov.config_json,
+        "model_identities": prov.model_identities,
         "inputs": prov.inputs,
+        "inputs_hashed_at": "start",
         "artifacts": prov.artifacts,
         "experiment": manifest,
     });
@@ -845,6 +977,59 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
 mod tests {
     use super::*;
     use mumdia_io::table::{write_table, Col, Table};
+
+    fn names(xs: &[&str]) -> Vec<String> {
+        xs.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn run_names_that_differ_only_in_case_are_rejected() {
+        // One directory on Windows, macOS and most network shares (docs/29 #5): the
+        // check refuses it everywhere rather than probing the destination filesystem.
+        let e = check_run_names_distinct(&names(&["RunA", "runa"]))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("differ only in case"), "{e}");
+        assert!(e.contains("RunA") && e.contains("runa"), "{e}");
+    }
+
+    #[test]
+    fn run_names_that_alias_on_windows_are_rejected_everywhere() {
+        // docs/30 R2: `a` and `a.` are one directory on Windows and the experiment ran
+        // to completion with one run overwriting the other. The syntactic rules apply on
+        // every platform so the output is portable.
+        for (bad, why) in [
+            ("a.", "dot or a space"),
+            ("a ", "dot or a space"),
+            ("NUL", "reserved"),
+            ("com1.log", "reserved"),
+            ("run:1", "forbids"),
+            ("run?", "forbids"),
+            ("a/b", "separator"),
+            ("", "empty"),
+            ("..", "not names"),
+        ] {
+            let why_got = portable_dir_name_problem(bad)
+                .unwrap_or_else(|| panic!("{bad:?} must be rejected"));
+            assert!(why_got.contains(why), "{bad:?}: {why_got}");
+        }
+        for ok in ["r0", "run.1", "A-b_c", "B_01", "sample 3", "com10", "conx"] {
+            assert_eq!(
+                portable_dir_name_problem(ok),
+                None,
+                "{ok:?} must be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn repeated_run_names_are_rejected_and_distinct_ones_pass() {
+        let e = check_run_names_distinct(&names(&["a", "b", "a"]))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("given twice"), "{e}");
+        check_run_names_distinct(&names(&["a", "b", "c_1"])).unwrap();
+    }
 
     fn tmp(name: &str) -> String {
         use std::sync::atomic::{AtomicU64, Ordering};

@@ -63,6 +63,22 @@ next run would start in a dirty folder.
 
 Closing the window cancels every running search, for the same reason.
 
+The terminal state is published in one place. `cancel` records the intent and kills
+the tree; the thread that reaps the engine reads that intent and publishes `cancelled`,
+`done` (the engine finished before the kill landed, so its outputs are complete) or
+`failed`. Until then the status stays `running` with `cancel_requested` set and the
+interface shows "Stopping". Two writers used to race here, and a stopped run could be
+shown as failed with the last log line as its error (docs/29 #14).
+
+## Output ownership
+
+Two engines writing one results folder interleave their artifacts with no error from
+either. A run reserves its results folder before the engine is spawned, by canonical
+path so that spellings and, on Windows, case name one folder, and releases it when its
+end is published; a second Start into an active folder is refused with the owning run
+named. The frontend also refuses to start while a Start is in progress or while the run
+it follows is still running, because it can show and stop only one (docs/29 #5).
+
 ## How progress works
 
 No log parsing. Every engine stage writes `<artifact>.report.json` beside its output,
@@ -321,7 +337,12 @@ Two things worth knowing:
   they get it during the run rather than before it.
 - **Preflight blocks a vendor format whose converter is missing**, naming which
   converter, rather than letting the engine fail after the interface has switched to
-  the progress screen.
+  the progress screen. The converters are asked of the engine with the request's own
+  configuration (`doctor --json --config`), so one named in `convert.thermo_raw_parser`
+  or `convert.msconvert` counts, and the rule is the engine's: a Thermo `.raw` with the
+  parser at `auto` and only msconvert present runs, with a note; a parser the
+  configuration names and that is missing blocks, as it errors in the engine
+  (docs/29 #13).
 - **Bruker gets an ion-mobility warning** on the Setup screen and under the picker.
   MuMDIA's pipeline is 3D, so diaPASEF loses the separation that makes it selective.
   Saying so is the difference between a user reading a low count as a MuMDIA result

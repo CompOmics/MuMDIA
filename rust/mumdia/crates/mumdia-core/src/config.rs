@@ -1978,6 +1978,301 @@ impl Config {
                  baseline is subtracted"
             );
         }
+        // ── numeric domains (docs/29 #18) ───────────────────────────────────────
+        //
+        // A value outside its domain used to be accepted and then either excluded every
+        // discovery (`quant.q_threshold = -0.1`), was clamped into a different analysis
+        // (`rt_im_train.rt_window_multiplier = -1.0` became a one-second window), or fed a
+        // training recipe a fraction above one. Each field's domain is stated here once;
+        // 0 keeps its documented "off" or "no cap" meaning where a field has one.
+        for (name, value) in [
+            ("quant.q_threshold", self.quant.q_threshold),
+            ("rescore.train_margin_frac", self.rescore.train_margin_frac),
+            ("mbr.q_transfer", self.mbr.q_transfer),
+        ] {
+            if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+                return Err(Invalid(format!(
+                    "{name} must be finite and in [0, 1] (got {value})"
+                )));
+            }
+        }
+        for (name, value) in [
+            ("search_seed.fdr_seed", self.search_seed.fdr_seed),
+            ("rt_im_train.q_train", self.rt_im_train.q_train),
+            ("rt_im_train.p_rt", self.rt_im_train.p_rt),
+            ("rt_im_train.loess_span", self.rt_im_train.loess_span),
+        ] {
+            if !value.is_finite() || value <= 0.0 || value > 1.0 {
+                return Err(Invalid(format!(
+                    "{name} must be finite and in (0, 1] (got {value})"
+                )));
+            }
+        }
+        if !self.rt_im_train.window_holdout_frac.is_finite()
+            || !(0.0..1.0).contains(&self.rt_im_train.window_holdout_frac)
+        {
+            return Err(Invalid(format!(
+                "rt_im_train.window_holdout_frac must be finite and in [0, 1) (got {}); 0 \
+                 sizes the window in-sample",
+                self.rt_im_train.window_holdout_frac
+            )));
+        }
+        for (name, value) in [
+            (
+                "rt_im_train.rt_window_multiplier",
+                self.rt_im_train.rt_window_multiplier,
+            ),
+            (
+                "rt_im_train.fallback_rt_window_s",
+                self.rt_im_train.fallback_rt_window_s,
+            ),
+        ] {
+            if !value.is_finite() || value <= 0.0 {
+                return Err(Invalid(format!(
+                    "{name} must be finite and > 0 (got {value}); a non-positive value was \
+                     previously clamped into a one-second window instead of being rejected"
+                )));
+            }
+        }
+        for (name, value) in [
+            ("extract.apex_rt_prior_s", self.extract.apex_rt_prior_s),
+            (
+                "rt_im_train.rt_window_min_s",
+                self.rt_im_train.rt_window_min_s,
+            ),
+            (
+                "extract.apex_gaussian_sigma_scans",
+                self.extract.apex_gaussian_sigma_scans,
+            ),
+            (
+                "rescore.max_feature_matrix_gib",
+                self.rescore.max_feature_matrix_gib,
+            ),
+            ("rescore.train_neg_ratio", self.rescore.train_neg_ratio),
+            ("rescore.train_subsample", self.rescore.train_subsample),
+        ] {
+            if !value.is_finite() || value < 0.0 {
+                return Err(Invalid(format!(
+                    "{name} must be finite and >= 0 (got {value}); 0 keeps its documented \
+                     meaning (off, or no cap)"
+                )));
+            }
+        }
+        if self.digest.min_len == 0 || self.digest.min_len > self.digest.max_len {
+            return Err(Invalid(format!(
+                "digest.min_len must be >= 1 and <= digest.max_len (got {} and {})",
+                self.digest.min_len, self.digest.max_len
+            )));
+        }
+        if self.peptidoforms.charge_min < 1
+            || self.peptidoforms.charge_min > self.peptidoforms.charge_max
+        {
+            return Err(Invalid(format!(
+                "peptidoforms.charge_min must be >= 1 and <= peptidoforms.charge_max (got {} \
+                 and {})",
+                self.peptidoforms.charge_min, self.peptidoforms.charge_max
+            )));
+        }
+        for (name, value) in [
+            (
+                "predict_frag.top_n_fragments",
+                self.predict_frag.top_n_fragments,
+            ),
+            (
+                "search_seed.min_matched_peaks",
+                self.search_seed.min_matched_peaks,
+            ),
+            ("search_seed.report_psms", self.search_seed.report_psms),
+            ("extract.apex_count_window", self.extract.apex_count_window),
+            (
+                "extract.presence_min_fragments",
+                self.extract.presence_min_fragments,
+            ),
+            ("experiment.parallel_runs", self.experiment.parallel_runs),
+            ("rescore.seeds", self.rescore.seeds),
+        ] {
+            if value == 0 {
+                return Err(Invalid(format!("{name} must be >= 1")));
+            }
+        }
+        if self.predict_frag.charge2_from_precursor_charge < 1 {
+            return Err(Invalid(
+                "predict_frag.charge2_from_precursor_charge must be >= 1".into(),
+            ));
+        }
+        if self.rt_im_train.min_seed_for_calibration < 2 {
+            return Err(Invalid(
+                "rt_im_train.min_seed_for_calibration must be >= 2; a calibration needs at \
+                 least two anchors"
+                    .into(),
+            ));
+        }
+        // `finetune_batch = 0` is the documented automatic batch size (see the field), so
+        // only the epoch count has a lower bound. Rejecting the zero batch made simply
+        // enabling the fine-tune invalid with its own defaults (docs/30 R1).
+        if self.rt_im_train.finetune_deeplc && self.rt_im_train.finetune_epochs == 0 {
+            return Err(Invalid(
+                "rt_im_train.finetune_epochs must be >= 1 when finetune_deeplc is on".into(),
+            ));
+        }
+
+        // The remaining active numeric fields, by their documented domains (docs/30 R5):
+        // fractions and q-values inside their unit interval, correlations and percentiles
+        // inside theirs, tolerances and widths positive, counts at least one where zero
+        // has no documented meaning. Every default sits inside its domain, which the
+        // `Config::default().validate()` assertion in the tests keeps true.
+        for (name, value) in [
+            (
+                "extract.min_matched_fraction",
+                self.extract.min_matched_fraction,
+            ),
+            (
+                "extract.alt_peak_min_area_frac",
+                self.extract.alt_peak_min_area_frac,
+            ),
+            (
+                "extract.gate_coelution_min",
+                self.extract.gate_coelution_min,
+            ),
+            ("quant.baseline_quantile", self.quant.baseline_quantile),
+            ("mbr.consensus_corr_min", self.mbr.consensus_corr_min),
+        ] {
+            if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+                return Err(Invalid(format!(
+                    "{name} must be finite and in [0, 1] (got {value})"
+                )));
+            }
+        }
+        for (name, value) in [
+            ("mbr.q_anchor", self.mbr.q_anchor),
+            ("quant.reliable_q", self.quant.reliable_q),
+            ("quant.peak_fraction", self.quant.peak_fraction),
+            (
+                "features.bound_peak_fraction",
+                self.features.bound_peak_fraction,
+            ),
+            ("rescore.train_fdr", self.rescore.train_fdr),
+        ] {
+            if !value.is_finite() || value <= 0.0 || value > 1.0 {
+                return Err(Invalid(format!(
+                    "{name} must be finite and in (0, 1] (got {value})"
+                )));
+            }
+        }
+        if !self.features.coelution_corr_threshold.is_finite()
+            || !(-1.0..=1.0).contains(&self.features.coelution_corr_threshold)
+        {
+            return Err(Invalid(format!(
+                "features.coelution_corr_threshold is a correlation and must be in [-1, 1] \
+                 (got {})",
+                self.features.coelution_corr_threshold
+            )));
+        }
+        if !self.features.bound_confident_pct.is_finite()
+            || !(0.0..=100.0).contains(&self.features.bound_confident_pct)
+        {
+            return Err(Invalid(format!(
+                "features.bound_confident_pct is a percentile and must be in [0, 100] (got {})",
+                self.features.bound_confident_pct
+            )));
+        }
+        for (name, value) in [
+            (
+                "search_seed.fragment_tol_ppm",
+                self.search_seed.fragment_tol_ppm,
+            ),
+            ("extract.frag_tol_ppm", self.extract.frag_tol_ppm),
+            ("extract.prec_tol_ppm", self.extract.prec_tol_ppm),
+            ("features.prec_tol_ppm", self.features.prec_tol_ppm),
+            ("prescan.tol_da", self.prescan.tol_da),
+            ("prescan.rt_bin_s", self.prescan.rt_bin_s),
+            (
+                "extract.claim_cues.mz_close_sigma_ppm",
+                self.extract.claim_cues.mz_close_sigma_ppm,
+            ),
+            (
+                "extract.claim_cues.rt_prior_tau_s",
+                self.extract.claim_cues.rt_prior_tau_s,
+            ),
+            ("extract.peak_claim_margin", self.extract.peak_claim_margin),
+            ("mbr.rt_window_s", self.mbr.rt_window_s),
+            ("rescore.entrapment_ratio", self.rescore.entrapment_ratio),
+        ] {
+            if !value.is_finite() || value <= 0.0 {
+                return Err(Invalid(format!(
+                    "{name} must be finite and > 0 (got {value})"
+                )));
+            }
+        }
+        for (name, value) in [
+            ("prescan.rt_slack_s", self.prescan.rt_slack_s),
+            ("extract.demix_lambda", self.extract.demix_lambda),
+            (
+                "extract.alt_peak_min_separation_s",
+                self.extract.alt_peak_min_separation_s,
+            ),
+            (
+                "compete.apex_rt_tolerance_s",
+                self.compete.apex_rt_tolerance_s,
+            ),
+            ("compete.margin", self.compete.margin),
+            ("quant.fixed_window_s", self.quant.fixed_window_s),
+        ] {
+            if !value.is_finite() || value < 0.0 {
+                return Err(Invalid(format!(
+                    "{name} must be finite and >= 0 (got {value}); 0 keeps its documented \
+                     meaning"
+                )));
+            }
+        }
+        for (name, value) in [
+            ("mbr.min_anchor_runs", self.mbr.min_anchor_runs),
+            ("rescore.num_iter", self.rescore.num_iter),
+            ("quant.top_n_fragments", self.quant.top_n_fragments),
+            ("quant.top_n_peptides", self.quant.top_n_peptides),
+            (
+                "quant.baseline_flank_scans",
+                self.quant.baseline_flank_scans,
+            ),
+            (
+                "extract.demix_max_candidates",
+                self.extract.demix_max_candidates,
+            ),
+            ("extract.demix_scan_stride", self.extract.demix_scan_stride),
+            ("extract.retain_top_peaks", self.extract.retain_top_peaks),
+            ("extract.promote_top_peaks", self.extract.promote_top_peaks),
+            (
+                "rt_im_train.adaptive_rt_bins",
+                self.rt_im_train.adaptive_rt_bins,
+            ),
+        ] {
+            if value == 0 {
+                return Err(Invalid(format!("{name} must be >= 1")));
+            }
+        }
+        if self.rescore.folds < 2 {
+            return Err(Invalid(format!(
+                "rescore.folds must be >= 2 for cross-validated scores (got {})",
+                self.rescore.folds
+            )));
+        }
+        if self.extract.promote_top_peaks > self.extract.retain_top_peaks {
+            return Err(Invalid(format!(
+                "extract.promote_top_peaks ({}) must be <= extract.retain_top_peaks ({})",
+                self.extract.promote_top_peaks, self.extract.retain_top_peaks
+            )));
+        }
+        if !self.extract.bucket_size.is_power_of_two() {
+            return Err(Invalid(format!(
+                "extract.bucket_size must be a power of two (got {})",
+                self.extract.bucket_size
+            )));
+        }
+        if self.rt_im_train.adaptive_rt_window && self.rt_im_train.adaptive_rt_bins == 0 {
+            return Err(Invalid(
+                "rt_im_train.adaptive_rt_bins must be >= 1 when adaptive_rt_window is on".into(),
+            ));
+        }
         Ok(())
     }
 
@@ -2209,6 +2504,92 @@ mod tests {
         assert!(Config::from_json(r#"{"rescore":{"classifier":"nn_torch"}}"#).is_err());
         assert!(Config::from_json(r#"{"rescore":{"classifier":"percolator"}}"#).is_err());
         assert!(Config::from_json(r#"{"rescore":{"classifier":"entrapment"}}"#).is_err());
+    }
+
+    #[test]
+    fn numeric_domains_are_validated_at_load() {
+        // The three values docs/29 #18 reproduced as accepted: a negative q threshold
+        // excluded every discovery, a negative multiplier was clamped into a one-second
+        // window, and a fraction above one fed the training recipe out of its domain.
+        for bad in [
+            r#"{"quant":{"q_threshold":-0.1}}"#,
+            r#"{"rt_im_train":{"rt_window_multiplier":-1.0}}"#,
+            r#"{"rescore":{"train_margin_frac":2.0}}"#,
+            r#"{"digest":{"min_len":10,"max_len":5}}"#,
+            r#"{"digest":{"min_len":0}}"#,
+            r#"{"peptidoforms":{"charge_min":3,"charge_max":2}}"#,
+            r#"{"rt_im_train":{"window_holdout_frac":1.0}}"#,
+            r#"{"rt_im_train":{"p_rt":0.0}}"#,
+            r#"{"search_seed":{"min_matched_peaks":0}}"#,
+            r#"{"experiment":{"parallel_runs":0}}"#,
+            r#"{"rescore":{"train_neg_ratio":-1.0}}"#,
+            r#"{"predict_frag":{"top_n_fragments":0}}"#,
+            // docs/30 R5: the five values the follow-up review found still accepted.
+            r#"{"mbr":{"q_anchor":-0.1}}"#,
+            r#"{"mbr":{"q_anchor":2.0,"min_anchor_runs":0}}"#,
+            r#"{"mbr":{"min_anchor_runs":0}}"#,
+            r#"{"extract":{"min_matched_fraction":2.0}}"#,
+            r#"{"features":{"bound_peak_fraction":-1.0}}"#,
+            r#"{"quant":{"reliable_q":2.0}}"#,
+            r#"{"features":{"coelution_corr_threshold":1.5}}"#,
+            r#"{"features":{"bound_confident_pct":101}}"#,
+            r#"{"extract":{"frag_tol_ppm":0.0}}"#,
+            r#"{"extract":{"bucket_size":1000}}"#,
+            r#"{"extract":{"retain_top_peaks":1,"promote_top_peaks":3}}"#,
+            r#"{"rescore":{"folds":1}}"#,
+            r#"{"quant":{"top_n_peptides":0}}"#,
+            r#"{"rescore":{"train_fdr":0.0}}"#,
+        ] {
+            assert!(Config::from_json(bad).is_err(), "{bad} must be rejected");
+        }
+        // Documented zero semantics survive: no negative cap, in-sample window sizing,
+        // an uncapped subsample, a row-cap subsample above one. And the boundaries of
+        // every new domain are accepted, not only their violations rejected.
+        for ok in [
+            r#"{"rescore":{"train_neg_ratio":0}}"#,
+            r#"{"rt_im_train":{"window_holdout_frac":0.0}}"#,
+            r#"{"rescore":{"train_subsample":0.0}}"#,
+            r#"{"rescore":{"train_subsample":2000}}"#,
+            r#"{"rescore":{"max_feature_matrix_gib":0}}"#,
+            r#"{"extract":{"apex_rt_prior_s":0.0}}"#,
+            r#"{"mbr":{"q_anchor":1.0}}"#,
+            r#"{"mbr":{"q_anchor":0.001,"min_anchor_runs":1}}"#,
+            r#"{"extract":{"min_matched_fraction":0.0}}"#,
+            r#"{"extract":{"min_matched_fraction":1.0}}"#,
+            r#"{"features":{"bound_peak_fraction":1.0}}"#,
+            r#"{"quant":{"reliable_q":0.001}}"#,
+            r#"{"features":{"coelution_corr_threshold":-1.0}}"#,
+            r#"{"features":{"bound_confident_pct":100}}"#,
+            r#"{"mbr":{"consensus_corr_min":0.0}}"#,
+            r#"{"compete":{"margin":0.0}}"#,
+            r#"{"quant":{"fixed_window_s":0.0}}"#,
+            r#"{"extract":{"bucket_size":4096}}"#,
+            r#"{"extract":{"retain_top_peaks":3,"promote_top_peaks":3}}"#,
+            r#"{"rescore":{"folds":2}}"#,
+        ] {
+            assert!(Config::from_json(ok).is_ok(), "{ok} must be accepted");
+        }
+        assert!(Config::default().validate().is_ok());
+    }
+
+    #[test]
+    fn enabling_the_fine_tune_keeps_the_automatic_batch() {
+        // docs/30 R1: turning the fine-tune on with its own defaults was rejected because
+        // the documented automatic batch size is 0. Omitted, explicit zero and a positive
+        // override are all valid; a zero epoch count is not.
+        for ok in [
+            r#"{"rt_im_train":{"finetune_deeplc":true}}"#,
+            r#"{"rt_im_train":{"finetune_deeplc":true,"finetune_batch":0}}"#,
+            r#"{"rt_im_train":{"finetune_deeplc":true,"finetune_batch":256}}"#,
+        ] {
+            let c = Config::from_json(ok).unwrap_or_else(|e| panic!("{ok} must be accepted: {e}"));
+            assert!(c.rt_im_train.finetune_deeplc);
+        }
+        let e =
+            Config::from_json(r#"{"rt_im_train":{"finetune_deeplc":true,"finetune_epochs":0}}"#)
+                .unwrap_err()
+                .to_string();
+        assert!(e.contains("finetune_epochs"), "{e}");
     }
 
     #[test]

@@ -38,6 +38,85 @@ const POLL: Duration = Duration::from_millis(700);
 /// Log lines kept in memory. The pane shows the tail; the full log is on disk.
 const LOG_TAIL: usize = 4000;
 
+/// The results folders of the runs in flight, by canonical path, each with the id of
+/// the run that owns it.
+///
+/// Two engines writing one artifact set interleave their output with no error from
+/// either (docs/29 #5): a repeated Start launched a second engine into the same folder
+/// and the interface kept only the latest run id. A folder is reserved here before the
+/// engine is spawned and released when the run's end is published, so while a run is
+/// active nothing else can be started into its folder.
+static ACTIVE_OUT_DIRS: Mutex<BTreeMap<String, String>> = Mutex::new(BTreeMap::new());
+
+/// The identity of a results folder for ownership purposes.
+///
+/// The canonical path folds the ways one directory can be spelled: relative against
+/// absolute, `.` and `..` segments, symbolic links and, on Windows, case (`Out` and
+/// `out` canonicalise to the on-disk spelling). The directory has to exist for that,
+/// which is why `start` creates it first. When it cannot be canonicalised the path is
+/// used as given, made absolute, so a reservation is still taken.
+fn ownership_key(dir: &Path) -> String {
+    let p = std::fs::canonicalize(dir).unwrap_or_else(|_| {
+        if dir.is_absolute() {
+            dir.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .map(|c| c.join(dir))
+                .unwrap_or_else(|_| dir.to_path_buf())
+        }
+    });
+    let s = p.to_string_lossy().into_owned();
+    if cfg!(windows) {
+        s.to_lowercase()
+    } else {
+        s
+    }
+}
+
+/// Reserve `dir` for run `id`, or say which run already owns it.
+///
+/// Returns the key to release with. Held by the `Run`, released by `publish_exit`.
+pub fn reserve_out_dir(dir: &Path, id: &str) -> Result<String, String> {
+    let key = ownership_key(dir);
+    let mut active = ACTIVE_OUT_DIRS.lock().unwrap_or_else(|e| e.into_inner());
+    // Equal keys, and also one folder inside the other (docs/30 R8): an experiment writes
+    // into its per-run subfolders and cleanup walks its whole folder, so a search into a
+    // child of an active experiment, or an experiment over the parent of an active search,
+    // is an overlapping writer. Component-wise, so `out` and `out2` stay independent.
+    if let Some((held, owner)) = active
+        .iter()
+        .find(|(held, _)| **held == key || paths_nest(held, &key))
+    {
+        let relation = if *held == key {
+            "is in use".to_string()
+        } else if Path::new(&key).starts_with(Path::new(held)) {
+            format!("is inside the results folder {held}, which is in use")
+        } else {
+            format!("contains the results folder {held}, which is in use")
+        };
+        return Err(format!(
+            "the results folder {} {relation} by a search that is still running ({owner}). \
+             Wait for it to finish or stop it, or choose another folder: two searches \
+             writing one folder tree overwrite each other's results.",
+            dir.display()
+        ));
+    }
+    active.insert(key.clone(), id.to_string());
+    Ok(key)
+}
+
+/// True when one path is an ancestor of the other, by path components.
+fn paths_nest(a: &str, b: &str) -> bool {
+    let (pa, pb) = (Path::new(a), Path::new(b));
+    pa.starts_with(pb) || pb.starts_with(pa)
+}
+
+/// Give a reserved results folder back.
+pub fn release_out_dir(key: &str) {
+    let mut active = ACTIVE_OUT_DIRS.lock().unwrap_or_else(|e| e.into_inner());
+    active.remove(key);
+}
+
 /// What the interface asks for when it starts a search.
 #[derive(Deserialize, Debug, Clone)]
 pub struct Request {
@@ -126,8 +205,12 @@ pub struct Snapshot {
     ///
     /// The interface needs this to label the result counts: an experiment-wide
     /// rescore groups the q columns experiment-wide, so those counts are NOT per
-    /// file, and `run-experiment` writes no report at all.
+    /// file, and the `peptides.tsv` / `proteins.tsv` at the experiment root are the
+    /// experiment-wide report, not a per-run one.
     pub experiment: bool,
+    /// Stop was requested. The status stays `running` until the engine has actually
+    /// been reaped, and the interface shows "Stopping" meanwhile.
+    pub cancel_requested: bool,
 }
 
 pub struct Run {
@@ -136,6 +219,8 @@ pub struct Run {
     /// it is spawned into a new group.
     pid: Mutex<Option<u32>>,
     cancelled: AtomicBool,
+    /// The results-folder reservation, until `publish_exit` releases it.
+    reservation: Mutex<Option<String>>,
 }
 
 impl Run {
@@ -152,26 +237,160 @@ impl Run {
             .unwrap_or_else(|e| e.into_inner().clone())
     }
 
-    /// Stop the run: kill the process tree, then remove the rubble.
+    /// Stop the run: record the intent, kill the process tree, then remove the rubble.
     ///
-    /// Both halves matter. The engine spawns Python workers, so killing only the
-    /// engine would orphan a process that may hold tens of gigabytes. And a hard
-    /// kill skips destructors, so the atomic-write layer never removes its
+    /// Both halves of the kill matter. The engine spawns Python workers, so killing
+    /// only the engine would orphan a process that may hold tens of gigabytes. And a
+    /// hard kill skips destructors, so the atomic-write layer never removes its
     /// `.tmp-<pid>` files; without a sweep the next run starts in a dirty directory.
+    ///
+    /// What this does NOT do is write the terminal status. That is `publish_exit`'s,
+    /// once the process has been reaped, and it reads the intent recorded here. The
+    /// flag used to be written and never read while the status was written from here
+    /// as well, racing the waiter: it could wake from the dying process first and
+    /// publish `failed`, with the last log line as the "error", and this method then
+    /// declined to replace a terminal status (docs/29 #14).
     pub fn cancel(&self) {
+        // Inert once terminal: there is no process to kill, and the folder may already
+        // belong to a later run (docs/30 R3). Cleanup is not done here at all any more:
+        // it belongs to `publish_exit`, which runs after the reap and before the
+        // reservation is released, so it can only ever touch this run's own files.
+        if !self.is_active() {
+            return;
+        }
         self.cancelled.store(true, Ordering::SeqCst);
-        let pid = self.pid.lock().ok().and_then(|p| *p);
-        if let Some(pid) = pid {
+        self.set(|s| s.cancel_requested = true);
+        // The pid lock is held across the kill, and `publish_exit` retires the pid under
+        // the same lock before it sweeps and releases. A stop still in flight when the
+        // engine is reaped therefore finishes before the folder changes hands, and a stop
+        // that arrives after the reap finds no pid.
+        let guard = self.pid.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(pid) = *guard {
             kill_tree(pid);
         }
-        let out_dir = self.snapshot().out_dir;
-        sweep_temp_files(Path::new(&out_dir));
-        self.set(|s| {
-            if s.status == "running" || s.status == "starting" {
-                s.status = "cancelled".into();
+        drop(guard);
+    }
+
+    fn is_active(&self) -> bool {
+        matches!(self.snapshot().status.as_str(), "running" | "starting")
+    }
+
+    /// Forget the process id, under the lock a stop takes before it kills.
+    ///
+    /// Called the instant `wait` returns, before anything else. The pid is free for the
+    /// operating system to reuse from that moment, and a stop landing later would
+    /// otherwise pass it to `kill_tree`, which on Windows terminates whatever now owns it
+    /// and its whole tree (docs/31 F8). Retiring it inside `publish_exit` was too late:
+    /// that function scans the output directory and reads the result reports first, so
+    /// the window was as long as that disk work. It is now a few instructions, and a stop
+    /// that reaches the lock inside it still finds the pid this run really owns, because
+    /// the reap has only just returned.
+    fn retire_pid(&self) {
+        if let Ok(mut p) = self.pid.lock() {
+            *p = None;
+        }
+    }
+
+    /// Apply `f` only while the run is still active; returns whether it was.
+    fn set_if_active<F: FnOnce(&mut Snapshot)>(&self, f: F) -> bool {
+        if let Ok(mut s) = self.snapshot.lock() {
+            if matches!(s.status.as_str(), "running" | "starting") {
+                f(&mut s);
+                return true;
             }
+        }
+        false
+    }
+
+    /// Publish the terminal state of the run from how its process ended.
+    ///
+    /// The one place a run becomes terminal, so the outcome does not depend on which
+    /// thread ran first. Everything a finished run displays, its stages and results,
+    /// is read from disk BEFORE the status stops being `running`; the other way round
+    /// leaves a window in which the run says it is finished but has no stages, which an
+    /// interface polling for completion reliably catches.
+    ///
+    /// A process that exited successfully is `done` even under a cancel request: the
+    /// engine finished before the kill landed and its outputs are complete, and
+    /// calling them cancelled would hide a finished result.
+    fn publish_exit(&self, outcome: std::io::Result<std::process::ExitStatus>, out_dir: &Path) {
+        // Idempotent: the waiter retires the pid the moment `wait` returns (docs/31 F8),
+        // and this call is what makes `publish_exit` safe to reach from a test or any
+        // other path. Taking the lock here also waits for a stop that is still killing,
+        // so nothing below overlaps a kill.
+        self.retire_pid();
+        let cancelled = self.cancelled.load(Ordering::SeqCst);
+        if cancelled {
+            // The only sweep: after the reap, before the release, inside this run's
+            // ownership of the folder.
+            sweep_temp_files(out_dir);
+        }
+        let stages = scan_stages(out_dir);
+        let results = read_results(out_dir);
+        let status = terminal_status(cancelled, &outcome);
+        // Released before the status is published, so a caller that sees the run end
+        // can start another into the same folder without being refused.
+        self.release_reservation();
+        self.set(|s| {
+            s.stages = stages;
+            s.results = results;
+            s.exit_code = outcome.as_ref().ok().and_then(|st| st.code());
+            s.error = match (&outcome, status) {
+                (_, "done" | "cancelled") => None,
+                // The last stderr line is almost always the anyhow error chain, which
+                // is the sentence worth showing.
+                (Ok(_), _) => s.log.iter().rev().find(|l| !l.trim().is_empty()).cloned(),
+                (Err(e), _) => Some(format!("could not wait for the engine: {e}")),
+            };
+            s.status = status.into();
         });
     }
+
+    fn release_reservation(&self) {
+        let key = self.reservation.lock().ok().and_then(|mut r| r.take());
+        if let Some(key) = key {
+            release_out_dir(&key);
+        }
+    }
+}
+
+/// The status a finished process publishes. Pure, so the interleavings of a Stop with
+/// the engine's own exit can be pinned down in tests.
+fn terminal_status(
+    cancelled: bool,
+    outcome: &std::io::Result<std::process::ExitStatus>,
+) -> &'static str {
+    match outcome {
+        Ok(s) if s.success() => "done",
+        _ if cancelled => "cancelled",
+        _ => "failed",
+    }
+}
+
+/// A run handle in its initial state. Shared by `start` and by the tests, which drive
+/// `publish_exit` and `cancel` directly to pin down their interleavings.
+fn new_run(id: &str, req: &Request, command: String, reservation: Option<String>) -> Arc<Run> {
+    Arc::new(Run {
+        snapshot: Mutex::new(Snapshot {
+            id: id.to_string(),
+            status: "starting".into(),
+            exit_code: None,
+            error: None,
+            stages: Vec::new(),
+            log: Vec::new(),
+            out_dir: req.out_dir.clone(),
+            command,
+            started_unix_ms: now_ms(),
+            elapsed_ms: 0,
+            results: None,
+            library_mode: req.lib_precursors.is_some(),
+            experiment: req.experiment,
+            cancel_requested: false,
+        }),
+        pid: Mutex::new(None),
+        cancelled: AtomicBool::new(false),
+        reservation: Mutex::new(reservation),
+    })
 }
 
 /// Kill a process and everything it spawned.
@@ -433,6 +652,9 @@ pub fn start(id: String, req: Request) -> Result<Arc<Run>, String> {
 
     std::fs::create_dir_all(&req.out_dir)
         .map_err(|e| format!("cannot create the results folder {}: {e}", req.out_dir))?;
+    // Taken before the engine exists, so a second request for this folder is refused
+    // while this one is still being spawned, not only once it runs.
+    let reservation = reserve_out_dir(Path::new(&req.out_dir), &id)?;
 
     let display = format!(
         "{} {}",
@@ -440,27 +662,7 @@ pub fn start(id: String, req: Request) -> Result<Arc<Run>, String> {
         args.iter().map(|a| quote(a)).collect::<Vec<_>>().join(" ")
     );
 
-    let library_mode = req.lib_precursors.is_some();
-    let experiment = req.experiment;
-    let run = Arc::new(Run {
-        snapshot: Mutex::new(Snapshot {
-            id: id.clone(),
-            status: "starting".into(),
-            exit_code: None,
-            error: None,
-            stages: Vec::new(),
-            log: Vec::new(),
-            out_dir: req.out_dir.clone(),
-            command: display,
-            started_unix_ms: now_ms(),
-            elapsed_ms: 0,
-            results: None,
-            library_mode,
-            experiment,
-        }),
-        pid: Mutex::new(None),
-        cancelled: AtomicBool::new(false),
-    });
+    let run = new_run(&id, &req, display, Some(reservation));
 
     let mut cmd = engine::command(&exe);
     // Without this the managed Python environment and the managed .raw converter
@@ -479,9 +681,13 @@ pub fn start(id: String, req: Request) -> Result<Arc<Run>, String> {
         cmd.process_group(0);
     }
 
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| format!("could not start {}: {e}", exe.display()))?;
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            run.release_reservation();
+            return Err(format!("could not start {}: {e}", exe.display()));
+        }
+    };
 
     let pid = child.id();
     if let Ok(mut p) = run.pid.lock() {
@@ -531,15 +737,15 @@ pub fn start(id: String, req: Request) -> Result<Arc<Run>, String> {
             let started = Instant::now();
             loop {
                 let stages = scan_stages(&out_dir);
-                let running = {
-                    let s = run.snapshot();
-                    s.status == "running" || s.status == "starting"
-                };
-                run.set(|s| {
+                // Written only while the run is still active, under the snapshot lock:
+                // once `publish_exit` has published, a scan that was in flight must not
+                // replace the finished snapshot's stages with whatever the folder holds
+                // now, which may already be a later run's contents (docs/30).
+                let still_active = run.set_if_active(|s| {
                     s.stages = stages;
                     s.elapsed_ms = started.elapsed().as_millis() as u64;
                 });
-                if !running {
+                if !still_active {
                     // The final scan belongs to the waiter, not here: it has to happen
                     // BEFORE the status becomes terminal, or a caller that polls until
                     // the run is finished can read a snapshot whose stages and results
@@ -551,43 +757,15 @@ pub fn start(id: String, req: Request) -> Result<Arc<Run>, String> {
         });
     }
 
-    // Reap the child, then publish the terminal state in one step.
-    //
-    // The order matters. Everything a finished run displays -- its stages and its
-    // results -- is read from disk here, BEFORE the status stops being `running`.
-    // Doing it the other way round leaves a window in which the run says it is
-    // finished but has no stages, which an interface polling for completion will
-    // reliably catch: the results screen renders empty and then fills in.
+    // Reap the child, then publish the terminal state in one step (`publish_exit`).
     {
         let run = Arc::clone(&run);
         let out_dir = PathBuf::from(&req.out_dir);
         std::thread::spawn(move || {
             let outcome = child.wait();
-            let stages = scan_stages(&out_dir);
-            let results = read_results(&out_dir);
-            match outcome {
-                Ok(status) => run.set(|s| {
-                    s.stages = stages;
-                    s.results = results;
-                    s.exit_code = status.code();
-                    if s.status == "cancelled" {
-                        return;
-                    }
-                    if status.success() {
-                        s.status = "done".into();
-                    } else {
-                        s.status = "failed".into();
-                        // The last stderr line is almost always the anyhow error
-                        // chain, which is the sentence worth showing.
-                        s.error = s.log.iter().rev().find(|l| !l.trim().is_empty()).cloned();
-                    }
-                }),
-                Err(e) => run.set(|s| {
-                    s.stages = stages;
-                    s.status = "failed".into();
-                    s.error = Some(format!("could not wait for the engine: {e}"));
-                }),
-            }
+            // Before anything else: the pid is reusable from here (docs/31 F8).
+            run.retire_pid();
+            run.publish_exit(outcome, &out_dir);
         });
     }
 
@@ -736,6 +914,251 @@ mod tests {
             config: None,
             threads: None,
         }
+    }
+
+    fn exit_status(code: i32) -> std::process::ExitStatus {
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            std::process::ExitStatus::from_raw(code << 8)
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::ExitStatusExt;
+            std::process::ExitStatus::from_raw(code as u32)
+        }
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("mumdia_run_{}_{name}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A run in the `running` state with no process behind it, so `publish_exit` and
+    /// `cancel` can be interleaved by hand.
+    fn running(name: &str) -> (Arc<Run>, PathBuf) {
+        let dir = scratch(name);
+        let mut r = req();
+        r.out_dir = dir.display().to_string();
+        let run = new_run(&format!("run-{name}"), &r, "mumdia run ...".into(), None);
+        run.set(|s| s.status = "running".into());
+        (run, dir)
+    }
+
+    #[test]
+    fn a_stop_that_lands_before_the_waiter_wakes_is_published_as_cancelled() {
+        // The interleaving of docs/29 #14: Stop was pressed and the kill issued, and
+        // the waiter wakes from the dying process before `cancel` could have written
+        // anything. The waiter used to publish `failed` here, with the last log line
+        // as the error, and `cancel` then left that terminal status alone.
+        let (run, dir) = running("cancel_first");
+        run.set(|s| s.log.push("thread 'main' panicked".into()));
+        run.cancelled.store(true, Ordering::SeqCst);
+        run.publish_exit(Ok(exit_status(1)), &dir);
+        let s = run.snapshot();
+        assert_eq!(s.status, "cancelled");
+        assert_eq!(s.error, None, "a stopped run has no error to show");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_run_that_failed_on_its_own_stays_failed_when_stop_arrives_late() {
+        let (run, dir) = running("failed_first");
+        run.set(|s| s.log.push("Error: no such file".into()));
+        run.publish_exit(Ok(exit_status(1)), &dir);
+        run.cancel();
+        let s = run.snapshot();
+        assert_eq!(s.status, "failed");
+        assert_eq!(s.error.as_deref(), Some("Error: no such file"));
+        // A stop that arrives after the end is inert and records nothing (docs/30 R3).
+        assert!(!s.cancel_requested);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_run_that_finished_before_the_kill_landed_is_done() {
+        let (run, dir) = running("done_under_cancel");
+        run.cancelled.store(true, Ordering::SeqCst);
+        run.publish_exit(Ok(exit_status(0)), &dir);
+        assert_eq!(run.snapshot().status, "done");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_wait_error_is_failed_unless_a_stop_was_requested() {
+        let (run, dir) = running("wait_error");
+        run.publish_exit(Err(std::io::Error::other("gone")), &dir);
+        let s = run.snapshot();
+        assert_eq!(s.status, "failed");
+        assert!(
+            s.error.as_deref().unwrap_or("").contains("could not wait"),
+            "{:?}",
+            s.error
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let (run, dir) = running("wait_error_cancelled");
+        run.cancelled.store(true, Ordering::SeqCst);
+        run.publish_exit(Err(std::io::Error::other("gone")), &dir);
+        assert_eq!(run.snapshot().status, "cancelled");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_stop_after_the_reap_has_no_pid_to_kill() {
+        // docs/31 F8: the pid is reusable the moment `wait` returns, so the waiter retires
+        // it there rather than after reading the output directory. A stop arriving in
+        // between must find nothing, not a recycled pid.
+        let (run, dir) = running("reaped");
+        *run.pid.lock().unwrap() = Some(4242);
+        run.retire_pid();
+        assert_eq!(*run.pid.lock().unwrap(), None);
+        // The run is still active, so cancel proceeds and simply has nothing to signal.
+        run.cancel();
+        assert!(run.snapshot().cancel_requested);
+        assert_eq!(*run.pid.lock().unwrap(), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cancel_records_the_intent_without_publishing_a_terminal_status() {
+        // Until the engine is reaped the run is still running, whatever the button
+        // says; `cancel_requested` is what the interface shows "Stopping" from.
+        let (run, dir) = running("intent_only");
+        run.cancel();
+        let s = run.snapshot();
+        assert_eq!(s.status, "running");
+        assert!(s.cancel_requested);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_late_stop_after_the_run_ended_leaves_the_folder_alone() {
+        // docs/30 R3: A finished and released its folder; B took it and is writing. A
+        // stop delivered to A must neither sweep B's temporary file nor change A's state.
+        let (run, dir) = running("late_stop");
+        let key = reserve_out_dir(&dir, "run-A").unwrap();
+        *run.reservation.lock().unwrap() = Some(key);
+        run.publish_exit(Ok(exit_status(1)), &dir);
+        assert_eq!(run.snapshot().status, "failed");
+        let key_b = reserve_out_dir(&dir, "run-B").expect("A released its folder");
+        let b_file = dir.join("new.parquet.tmp-999-1");
+        std::fs::write(&b_file, b"B's partial write").unwrap();
+        run.cancel();
+        assert!(
+            b_file.is_file(),
+            "a late stop must not sweep another run's files"
+        );
+        let s = run.snapshot();
+        assert_eq!(s.status, "failed");
+        assert!(!s.cancel_requested, "a terminal run records no stop");
+        release_out_dir(&key_b);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_stop_still_in_flight_finishes_before_the_folder_is_released() {
+        // docs/30 R3, the concurrent route: the engine is reaped while the stop thread is
+        // still inside the kill. Publication must wait for the kill to finish, so the
+        // reservation cannot be released, and taken by a new run, while the stop is
+        // still active in that folder. The kill is simulated by holding the pid lock.
+        let (run, dir) = running("inflight_stop");
+        let key = reserve_out_dir(&dir, "run-A").unwrap();
+        *run.reservation.lock().unwrap() = Some(key);
+        run.cancelled.store(true, Ordering::SeqCst);
+        let killing = run.pid.lock().unwrap();
+        let (r2, d2) = (Arc::clone(&run), dir.clone());
+        let waiter = std::thread::spawn(move || r2.publish_exit(Ok(exit_status(1)), &d2));
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            reserve_out_dir(&dir, "run-B").is_err(),
+            "the folder must stay reserved while the stop is in flight"
+        );
+        assert_eq!(
+            run.snapshot().status,
+            "running",
+            "nothing is published mid-kill"
+        );
+        drop(killing);
+        waiter.join().unwrap();
+        assert_eq!(run.snapshot().status, "cancelled");
+        let k = reserve_out_dir(&dir, "run-B").expect("released once the stop completed");
+        release_out_dir(&k);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn overlapping_result_folders_are_refused_in_both_orders_but_siblings_are_not() {
+        // docs/30 R8: an experiment owns its per-run subfolders and its cleanup walks the
+        // whole tree, so a parent and a child are one writer.
+        let parent = scratch("nest");
+        let child = parent.join("run1");
+        let sibling = std::env::temp_dir().join(format!("mumdia_run_{}_nest2", std::process::id()));
+        std::fs::create_dir_all(&child).unwrap();
+        std::fs::create_dir_all(&sibling).unwrap();
+        let k = reserve_out_dir(&parent, "run-1").unwrap();
+        let e = reserve_out_dir(&child, "run-2").unwrap_err();
+        assert!(e.contains("is inside") && e.contains("run-1"), "{e}");
+        let ks = reserve_out_dir(&sibling, "run-3").expect("a sibling is independent");
+        release_out_dir(&k);
+        release_out_dir(&ks);
+        let kc = reserve_out_dir(&child, "run-2").unwrap();
+        let e = reserve_out_dir(&parent, "run-1").unwrap_err();
+        assert!(e.contains("contains") && e.contains("run-2"), "{e}");
+        release_out_dir(&kc);
+        let _ = std::fs::remove_dir_all(&parent);
+        let _ = std::fs::remove_dir_all(&sibling);
+    }
+
+    #[test]
+    fn a_results_folder_owned_by_an_active_run_is_refused_to_a_second() {
+        let dir = scratch("owned");
+        let key = reserve_out_dir(&dir, "run-1").unwrap();
+        let e = reserve_out_dir(&dir, "run-2").unwrap_err();
+        assert!(e.contains("run-1") && e.contains("still running"), "{e}");
+        // Another spelling of the same folder is the same folder.
+        let e2 = reserve_out_dir(&dir.join("."), "run-3").unwrap_err();
+        assert!(e2.contains("run-1"), "{e2}");
+        release_out_dir(&key);
+        let key2 = reserve_out_dir(&dir, "run-2").expect("free again once released");
+        release_out_dir(&key2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_case_alias_of_an_active_folder_is_refused_where_the_filesystem_folds_case() {
+        // `..._Case` and `..._case` are one directory on NTFS and APFS and two on ext4.
+        // The rule follows the filesystem, which is what the canonical path reports:
+        // the same directory is refused, a different one is free.
+        let dir = scratch("Case");
+        let alias = std::env::temp_dir().join(format!("mumdia_run_{}_case", std::process::id()));
+        let key = reserve_out_dir(&dir, "run-1").unwrap();
+        let same = std::fs::canonicalize(&alias).ok() == std::fs::canonicalize(&dir).ok();
+        let second = reserve_out_dir(&alias, "run-2");
+        if same {
+            let e = second.unwrap_err();
+            assert!(e.contains("run-1"), "{e}");
+        } else {
+            release_out_dir(&second.expect("a different directory is free"));
+        }
+        release_out_dir(&key);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn publishing_the_end_of_a_run_releases_its_folder() {
+        let dir = scratch("release");
+        let key = reserve_out_dir(&dir, "run-9").unwrap();
+        let mut r = req();
+        r.out_dir = dir.display().to_string();
+        let run = new_run("run-9", &r, String::new(), Some(key));
+        run.set(|s| s.status = "running".into());
+        assert!(reserve_out_dir(&dir, "run-10").is_err());
+        run.publish_exit(Ok(exit_status(0)), &dir);
+        let k = reserve_out_dir(&dir, "run-10").expect("released when the run ended");
+        release_out_dir(&k);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1102,10 +1525,10 @@ mod multifile_tests {
 
     #[test]
     fn a_pooled_experiment_reports_its_combined_table_and_says_so() {
-        // `run-experiment` writes `scored_combined.parquet` and never calls the report
-        // stage, so reading only `psms_scored.parquet.report.json` left the results
-        // screen blank after every experiment. And the counts it does yield are
-        // experiment-wide: the grouped q columns are grouped across the whole
+        // `run-experiment` writes `scored_combined.parquet` (and an experiment-wide
+        // TSV pair at the root), so reading only `psms_scored.parquet.report.json` left
+        // the results screen blank after every experiment. And the counts it does
+        // yield are experiment-wide: the grouped q columns are grouped across the whole
         // experiment, so a per-file reading of them is diluted by ~1/n_runs.
         let dir = std::env::temp_dir().join("mumdia-results-experiment");
         let _ = std::fs::remove_dir_all(&dir);
@@ -1124,7 +1547,7 @@ mod multifile_tests {
         assert!(r.experiment_wide, "a combined table is experiment-wide");
         assert_eq!(r.peptides_1pct, 7);
         assert_eq!(r.precursors_1pct, 8);
-        // And it writes no report, so neither TSV exists.
+        // This fixture wrote no TSV, so neither is reported present.
         assert!(!r.has_peptides_tsv && !r.has_proteins_tsv);
 
         // A single run's own report wins, and is not labelled experiment-wide.

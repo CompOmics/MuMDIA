@@ -1217,6 +1217,15 @@ fn confident_global_bounds(
 }
 
 pub fn run(p: FeaturesParams) -> Result<u64> {
+    // Neither output may be one of the inputs (docs/31 F6).
+    let mut inputs = vec![("--psms", p.psms), ("--chromatograms", p.chromatograms)];
+    if let Some(seed) = p.seed {
+        inputs.push(("--seed-psms", seed));
+    }
+    mumdia_io::refuse_output_over_input(p.out, &inputs)?;
+    if !p.out_pin.is_empty() {
+        mumdia_io::refuse_output_over_input(p.out_pin, &inputs)?;
+    }
     run_with_chunk_rows(p, CHUNK_CHROM_ROWS)
 }
 

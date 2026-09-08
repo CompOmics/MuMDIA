@@ -11,6 +11,11 @@ GroupKFold grouped by base peptide, so no peptide leaks between train and test
 and the entrapment negatives are scored by a model that never saw them. Decoy
 rows are scored by a final model fit on all non-decoy PSMs.
 
+A training fold that holds a single class is an error, not a gap to fill: the
+previous behaviour skipped such a fold and then scored its held-out rows with the
+final model, which had been trained on those very rows, so the confidence estimate
+downstream rested on in-sample scores (docs/29 #3).
+
 Input columns: candidate_id, base_peptide_id, is_entrapment (0/1), is_decoy
 (0/1), and one column per feature. Output columns: candidate_id, score. Run with
 an env that has scikit-learn + pyarrow (py312_mumdia).
@@ -91,21 +96,37 @@ def main():
 
     scores = np.full(len(t), np.nan, dtype=np.float64)
     gkf = GroupKFold(n_splits=k)
-    for tr, te in gkf.split(Xt, yt, gt):
-        # A fold whose training side is single-class cannot fit; leave NaN, the
-        # final full model fills it below.
-        if len(np.unique(yt[tr])) < 2:
-            continue
+    for fold_no, (tr, te) in enumerate(gkf.split(Xt, yt, gt)):
+        classes = np.unique(yt[tr])
+        if len(classes) < 2:
+            raise SystemExit(
+                f"entrapment_worker: training fold {fold_no + 1} of {k} holds a single "
+                f"class ({'real targets' if classes[0] == 1 else 'entrapment'} only). Every "
+                "training fold needs both real-target and entrapment PSMs: use more base "
+                "peptides, fewer folds, or a larger spike-in library. Scoring the held-out "
+                "rows with a model trained on them would inflate the entrapment FDR, so the "
+                "worker refuses instead of filling the gap."
+            )
         m = _new_model()
         m.fit(Xt[tr], yt[tr])
         scores[idx[te]] = m.predict_proba(Xt[te])[:, 1]
 
-    # Final model on all non-decoy PSMs: scores decoys and any out-of-fold gaps.
+    # Every non-decoy row now carries an out-of-fold score; anything else is a fold
+    # construction bug, not a data condition.
+    gap = np.isnan(scores) & train
+    if gap.any():
+        raise SystemExit(
+            f"entrapment_worker: {int(gap.sum())} non-decoy rows received no out-of-fold "
+            "score; GroupKFold did not cover the training set"
+        )
+
+    # Final model on all non-decoy PSMs scores the decoys, which took no part in
+    # training and have no fold.
     mf = _new_model()
     mf.fit(Xt, yt)
-    gap = np.isnan(scores)
-    if gap.any():
-        scores[gap] = mf.predict_proba(X[gap])[:, 1]
+    dec_idx = np.where(is_dec)[0]
+    if len(dec_idx):
+        scores[dec_idx] = mf.predict_proba(X[dec_idx])[:, 1]
 
     out = pa.table({
         "row_id": pa.array(rid.astype("uint32")),

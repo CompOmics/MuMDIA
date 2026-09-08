@@ -454,6 +454,17 @@ fn rollup_protein_bases(
 
 pub fn run(p: QuantParams) -> Result<(u64, u64)> {
     let t0 = Instant::now();
+    // No output may be one of the inputs (docs/31 F6).
+    let inputs = [
+        ("--psms-scored", p.psms_scored),
+        ("--chromatograms", p.chromatograms),
+    ];
+    for out in [Some(p.out_peptide), Some(p.out_protein), p.out_fragment]
+        .into_iter()
+        .flatten()
+    {
+        mumdia_io::refuse_output_over_input(out, &inputs)?;
+    }
 
     // Identified target PSMs below the peptide q threshold.
     let ps = TableFile::open(p.psms_scored)?;
@@ -519,11 +530,7 @@ pub fn run(p: QuantParams) -> Result<(u64, u64)> {
     // `run-experiment` splits by `source` before calling quant, and the docs say to do
     // the same by hand, but nothing enforced it -- and the pooled table is precisely what
     // the recorded multi-run recipe produces. Refuse instead, naming the fix.
-    if let Ok(source) = ps.i32("source") {
-        let n_sources = source
-            .iter()
-            .collect::<std::collections::BTreeSet<_>>()
-            .len();
+    if let Some(n_sources) = pooled_source_count(&ps, p.psms_scored)? {
         if n_sources > 1 {
             anyhow::bail!(
                 "quant: {} names a pooled scored table covering {n_sources} runs \
@@ -2191,5 +2198,93 @@ mod tests {
         assert_eq!(used, 1);
         // The 0.9-intensity fragment wins, not the NaN one.
         assert_eq!(q, Some(20.0));
+    }
+}
+
+/// Distinct values of the scored table's `source` column, or `None` when the column is
+/// absent (a single-run table from before pooled rescoring stamped it).
+///
+/// `rescore` writes `source` as u32. The previous guard read it as i32 and treated the
+/// resulting type error like an absent column, so the pooled-table refusal above never
+/// ran on the engine's own output: a pooled table quantified against one run's
+/// chromatograms produced one identical row per run without a word (docs/29 #1). A
+/// present column that is neither u32 nor i32 is an error now, not a shrug.
+pub(crate) fn pooled_source_count(ps: &TableFile, path: &str) -> Result<Option<usize>> {
+    if !ps.has_column("source") {
+        return Ok(None);
+    }
+    let distinct = match ps.u32("source") {
+        Ok(v) => v
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        Err(u32_err) => match ps.i32("source") {
+            Ok(v) => v
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            Err(_) => anyhow::bail!(
+                "column `source` in {path} is present but neither u32 (what rescore writes) \
+                 nor i32: {u32_err:#}"
+            ),
+        },
+    };
+    Ok(Some(distinct))
+}
+
+#[cfg(test)]
+mod source_guard_tests {
+    use super::*;
+
+    fn table(name: &str, cols: Vec<Col>) -> String {
+        let dir = std::env::temp_dir().join(format!("mumdia_quant_source_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir
+            .join(format!("{name}.parquet"))
+            .to_str()
+            .unwrap()
+            .to_string();
+        write_table(&p, cols).unwrap();
+        p
+    }
+
+    #[test]
+    fn the_pooled_guard_reads_the_u32_source_rescore_writes() {
+        // The exact type rescore emits (`Col::U32("source", ...)`, rescore.rs): two runs.
+        let p = table(
+            "u32",
+            vec![
+                Col::U32("candidate_id".into(), vec![0, 0]),
+                Col::U32("source".into(), vec![0, 1]),
+            ],
+        );
+        let t = TableFile::open(&p).unwrap();
+        assert_eq!(pooled_source_count(&t, &p).unwrap(), Some(2));
+
+        // The signed spelling still counts, an absent column is None, and a present
+        // column of the wrong type is an error rather than "absent".
+        let p = table(
+            "i32",
+            vec![
+                Col::U32("candidate_id".into(), vec![0, 0]),
+                Col::I32("source".into(), vec![3, 3]),
+            ],
+        );
+        let t = TableFile::open(&p).unwrap();
+        assert_eq!(pooled_source_count(&t, &p).unwrap(), Some(1));
+
+        let p = table("none", vec![Col::U32("candidate_id".into(), vec![0, 1])]);
+        let t = TableFile::open(&p).unwrap();
+        assert_eq!(pooled_source_count(&t, &p).unwrap(), None);
+
+        let p = table(
+            "f64",
+            vec![
+                Col::U32("candidate_id".into(), vec![0, 1]),
+                Col::F64("source".into(), vec![0.0, 1.0]),
+            ],
+        );
+        let t = TableFile::open(&p).unwrap();
+        assert!(pooled_source_count(&t, &p).is_err());
     }
 }

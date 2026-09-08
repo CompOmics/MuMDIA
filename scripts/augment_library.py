@@ -57,6 +57,30 @@ def stripped(peptidoform: str) -> str:
     return STRIP_MODS.sub("", s)
 
 
+def assign_base_ids(imported_base_by_seq, added_seqs, next_id):
+    """`base_peptide_id` for each added target, by stripped sequence.
+
+    A sequence the imported library already carries keeps that sequence's id, so an
+    added charge state or modform stays in its peptide's competition group and CV fold
+    (`--match-level peptidoform_charge` adds exactly those). A sequence new to the
+    library gets a fresh id above the imported range, one per sequence, so its own forms
+    share it. Offsetting every added id, the previous rule, split one stripped peptide
+    across two base ids whenever it already existed (docs/29 #12). The shift-decoy
+    helper copies `base_peptide_id` onto each decoy, so pairs stay paired.
+    """
+    fresh = {}
+    out = []
+    for seq in added_seqs:
+        if seq in imported_base_by_seq:
+            out.append(int(imported_base_by_seq[seq]))
+            continue
+        if seq not in fresh:
+            fresh[seq] = next_id
+            next_id += 1
+        out.append(fresh[seq])
+    return out
+
+
 def run_stage(mumdia_bin, subcmd, args, config):
     cmd = [mumdia_bin, subcmd] + args
     if config:
@@ -136,13 +160,24 @@ def main():
     mprec = pd.read_parquet(W("aug_missing_prec.parquet"))
     mfrag = pd.read_parquet(W("aug_missing_frag.parquet"))
 
-    # 5. Make ids disjoint from the imported library; keep sibling/base linkage.
+    # 5. Make ids disjoint from the imported library where they must be (peptidoform
+    #    and candidate ids), and keep base-peptide linkage where it exists: an added
+    #    form of a sequence the library already has reuses that sequence's base id.
     print("[4/6] merge imported targets + missing targets", flush=True)
     pfid_off = int(imp_t.peptidoform_id.max()) + 1
-    base_off = int(imp_t.base_peptide_id.max()) + 1
     cid_off = int(imp_t.candidate_id.max()) + 1
     mprec["peptidoform_id"] = mprec["peptidoform_id"].astype(np.int64) + pfid_off
-    mprec["base_peptide_id"] = mprec["base_peptide_id"].astype(np.int64) + base_off
+    imported_base_by_seq = {}
+    for seq, bid in zip(imp_t.peptidoform.map(stripped), imp_t.base_peptide_id.astype(np.int64)):
+        imported_base_by_seq.setdefault(seq, int(bid))
+    mprec["base_peptide_id"] = np.asarray(
+        assign_base_ids(imported_base_by_seq, list(mprec.peptidoform.map(stripped)),
+                        int(imp_t.base_peptide_id.max()) + 1),
+        dtype=np.int64,
+    )
+    n_reused = int(mprec.peptidoform.map(stripped).isin(imported_base_by_seq).sum())
+    print(f"      base ids: {n_reused} added forms keep an imported sequence's id, "
+          f"{len(mprec) - n_reused} rows belong to new sequences", flush=True)
     # candidate_id only needs to be unique before make_shift_decoys re-densifies.
     mprec["candidate_id"] = mprec["candidate_id"].astype(np.int64) + cid_off
     mfrag["candidate_id"] = mfrag["candidate_id"].astype(np.int64) + cid_off

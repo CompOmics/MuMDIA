@@ -179,3 +179,39 @@ def test_single_class_input_fails_instead_of_scoring(sklearn_available, tmp_path
     assert rc != 0
     assert "entrapment" in err.lower()
     assert not out.exists()
+
+
+def test_a_single_class_training_fold_is_an_error_not_an_in_sample_fill(sklearn_available, tmp_path):
+    """Two groups, one all real and one all entrapment: every training fold is
+    single-class. The worker used to skip such folds and score their held-out rows
+    with the final model trained on those very rows (docs/29 #3). It must refuse,
+    naming the condition, rather than hand in-sample scores to the FDR estimate.
+    """
+    n_real, n_ent, n_dec = 40, 40, 10
+    n_rows = n_real + n_ent + n_dec
+    rng = np.random.default_rng(1)
+    feats = rng.normal(0.0, 1.0, size=(n_rows, N_FEATURES))
+    feats[:n_real, 0] += 3.0
+    is_entrapment = np.zeros(n_rows, dtype=np.int32)
+    is_entrapment[n_real:n_real + n_ent] = 1
+    is_decoy = np.zeros(n_rows, dtype=np.int32)
+    is_decoy[n_real + n_ent:] = 1
+    # group 0 = every real target, group 1 = every entrapment PSM, group 2 = decoys.
+    groups = np.concatenate([np.zeros(n_real), np.ones(n_ent), np.full(n_dec, 2)]).astype(np.uint32)
+    cols = {
+        "row_id": pa.array(np.arange(n_rows, dtype=np.uint32), pa.uint32()),
+        "candidate_id": pa.array(np.arange(n_rows, dtype=np.uint32), pa.uint32()),
+        "base_peptide_id": pa.array(groups, pa.uint32()),
+        "is_entrapment": pa.array(is_entrapment, pa.int32()),
+        "is_decoy": pa.array(is_decoy, pa.int32()),
+    }
+    for j in range(N_FEATURES):
+        cols["feat_{}".format(j)] = pa.array(feats[:, j], pa.float64())
+    inp = tmp_path / "entrapment_in.parquet"
+    pq.write_table(pa.table(cols), str(inp), compression="snappy")
+    out = tmp_path / "entrapment_out.parquet"
+
+    rc, _, err = run_worker("entrapment_worker.py", inp, out, 2)
+    assert rc != 0, "a single-class training fold must fail the worker"
+    assert "single" in err and "class" in err, err
+    assert not out.exists(), "no output may be written for a refused run"

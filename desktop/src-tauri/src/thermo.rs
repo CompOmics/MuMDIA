@@ -131,31 +131,153 @@ pub fn is_raw(path: &str) -> bool {
 /// directories under Program Files, then `PATH`, and a second implementation here
 /// would drift from that.
 pub fn msconvert_available() -> Option<String> {
-    converter_path("msconvert")
+    converters(None).and_then(|c| c.msconvert.path)
 }
 
-/// The Thermo converter the ENGINE would use, which is not the same question as
-/// whether this application installed one.
+/// One converter as the engine reports it for a configuration: what was configured,
+/// what was found, and when nothing was, why.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Converter {
+    /// `convert.thermo_raw_parser` or `convert.msconvert` as the engine read it:
+    /// `auto`, or a path.
+    pub configured: String,
+    pub path: Option<String>,
+    pub detail: Option<String>,
+}
+
+impl Converter {
+    /// True when the configuration names a converter rather than leaving the search
+    /// to the engine. The engine treats a wrong explicit path as an error and never as
+    /// a reason to use a different converter (`raw::ensure_mzml`), because vendor
+    /// conversion is not reproducible across converters; preflight says the same.
+    pub fn explicit(&self) -> bool {
+        !self.configured.is_empty() && self.configured != "auto"
+    }
+}
+
+/// Both converters, as the engine resolves them for one configuration.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Converters {
+    pub thermo: Converter,
+    pub msconvert: Converter,
+}
+
+/// Ask the engine which converters a request with this configuration would use.
 ///
-/// `Installer::refresh` only ever looks in `data_dir()/ThermoRawFileParser/`, while
-/// the engine's `raw::locate_parser` also accepts an explicit
-/// `convert.thermo_raw_parser`, `MUMDIA_THERMO_PARSER`, a binary beside the engine or
-/// one on `PATH`. Preflight asked the narrow question and hard-blocked users whose
-/// converter the engine would have found perfectly well -- and the GUI was the only
-/// path that refused. `doctor --json` already reports both converters from the
-/// engine's own search; nothing was reading the `thermo` half of it.
-pub fn engine_thermo_parser() -> Option<String> {
-    converter_path("thermo")
-}
-
-/// One `doctor --json` probe, shared by both converter questions.
-fn converter_path(key: &str) -> Option<String> {
+/// `doctor --json --config <file>`: the engine resolves `convert.thermo_raw_parser`
+/// and `convert.msconvert` from that file, its environment (`MUMDIA_THERMO_PARSER`,
+/// `MUMDIA_MSCONVERT`), its own directory and `PATH`, so a converter is found here
+/// exactly when the run would find it. The probe used to run without the configuration
+/// (docs/29 #13): it answered for the defaults, so a converter the configuration named
+/// at an off-`PATH` location was reported missing and the search refused, while the
+/// engine would have converted without complaint. `None` when the engine could not be
+/// asked at all, which is a different situation from "asked, and nothing found".
+pub fn converters(config: Option<&str>) -> Option<Converters> {
     let (exe, _) = crate::engine::resolve().ok()?;
     let mut cmd = crate::engine::command(&exe);
     crate::components::stamp_env(&mut cmd);
-    let out = cmd.arg("doctor").arg("--json").output().ok()?;
+    // `doctor` exits non-zero when the configuration's interpreters do not resolve,
+    // but it prints the report first, and the converter half is what is wanted here.
+    let out = cmd.args(doctor_args(config)).output().ok()?;
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
-    v.get(key)?.get("path")?.as_str().map(|s| s.to_string())
+    Some(Converters {
+        thermo: converter_of(v.get("thermo")),
+        msconvert: converter_of(v.get("msconvert")),
+    })
+}
+
+/// The `doctor` invocation for a configuration, or for the defaults without one.
+fn doctor_args(config: Option<&str>) -> Vec<String> {
+    let mut args = vec!["doctor".to_string(), "--json".to_string()];
+    if let Some(c) = config {
+        args.push("--config".to_string());
+        args.push(c.to_string());
+    }
+    args
+}
+
+/// One converter entry of the `doctor --json` report; an absent entry is "nothing".
+fn converter_of(v: Option<&serde_json::Value>) -> Converter {
+    let field = |k: &str| {
+        v.and_then(|c| c.get(k))
+            .and_then(|s| s.as_str())
+            .map(|s| s.to_string())
+    };
+    Converter {
+        configured: field("configured").unwrap_or_default(),
+        path: field("path"),
+        detail: field("detail"),
+    }
+}
+
+/// What preflight says about the converters the selected files need: hard blockers,
+/// and notes worth reading before an hour is spent.
+///
+/// The rule is the engine's own (`raw::ensure_mzml`), restated rather than imported
+/// because this application spawns the engine and does not link it:
+///
+/// - a Thermo `.raw` goes to ThermoRawFileParser when one is found;
+/// - when `convert.thermo_raw_parser` is `auto` and none is found, msconvert converts
+///   it instead, with a note, because that is what the engine will do;
+/// - a parser the configuration names explicitly and that is not found is an error
+///   and never a fallback, matching the engine;
+/// - every other vendor format needs msconvert.
+///
+/// Preflight used to require the Thermo parser specifically, so a machine with only
+/// msconvert was refused a search the engine would have run (docs/29 #13).
+pub fn converter_verdict(files: &[String], conv: &Converters) -> (Vec<String>, Vec<String>) {
+    let mut blockers = Vec::new();
+    let mut notes = Vec::new();
+    let thermo: Vec<&str> = files
+        .iter()
+        .filter(|m| needs(m) == Needs::ThermoParser)
+        .map(|s| s.as_str())
+        .collect();
+    let other: Vec<&str> = files
+        .iter()
+        .filter(|m| needs(m) == Needs::Msconvert)
+        .map(|s| s.as_str())
+        .collect();
+
+    if let (Some(first), None) = (thermo.first(), &conv.thermo.path) {
+        let n = thermo.len();
+        if conv.thermo.explicit() {
+            let detail = conv
+                .thermo
+                .detail
+                .as_deref()
+                .map(|d| format!(": {d}"))
+                .unwrap_or_default();
+            blockers.push(format!(
+                "{n} selected file(s) are Thermo .raw and the converter named in the \
+                 configuration was not found (convert.thermo_raw_parser = {}){detail}.\n\
+                 Fix that path, or set it to \"auto\" to let MuMDIA search for a converter.\n\
+                 First: {first}",
+                conv.thermo.configured
+            ));
+        } else if let Some(ms) = conv.msconvert.path.as_deref() {
+            notes.push(format!(
+                "{n} Thermo .raw file(s) will be converted with ProteoWizard msconvert ({ms}) \
+                 because ThermoRawFileParser was not found.\nInstall it on the Setup screen to \
+                 use the licence-free converter instead.\nFirst: {first}"
+            ));
+        } else {
+            blockers.push(format!(
+                "{n} selected file(s) are Thermo .raw and no converter is installed.\n\
+                 Install ThermoRawFileParser on the Setup screen, install ProteoWizard \
+                 msconvert, or convert them to mzML yourself.\nFirst: {first}"
+            ));
+        }
+    }
+    if let (Some(first), None) = (other.first(), &conv.msconvert.path) {
+        blockers.push(format!(
+            "{} selected file(s) need ProteoWizard msconvert, which was not found.\n\
+             MuMDIA does not install it; see the Setup screen.\nFirst: {first} ({})",
+            other.len(),
+            label(first)
+        ));
+    }
+    (blockers, notes)
 }
 
 /// State of the converter: installed or not, and the last install's progress.
@@ -496,6 +618,131 @@ fn unzip(archive: &std::path::Path, target: &PathBuf) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn conv(thermo: (&str, Option<&str>), msconvert: Option<&str>) -> Converters {
+        Converters {
+            thermo: Converter {
+                configured: thermo.0.into(),
+                path: thermo.1.map(String::from),
+                detail: thermo
+                    .1
+                    .is_none()
+                    .then(|| "no ThermoRawFileParser found".to_string()),
+            },
+            msconvert: Converter {
+                configured: "auto".into(),
+                path: msconvert.map(String::from),
+                detail: None,
+            },
+        }
+    }
+
+    fn files(xs: &[&str]) -> Vec<String> {
+        xs.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn a_thermo_file_with_only_msconvert_is_allowed_with_a_note() {
+        // The engine's fallback for a parser left at `auto` (docs/29 #13): preflight
+        // used to demand the parser and block this.
+        let (blockers, notes) = converter_verdict(
+            &files(&["a.raw"]),
+            &conv(("auto", None), Some("C:/pwiz/msconvert.exe")),
+        );
+        assert!(blockers.is_empty(), "{blockers:?}");
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].contains("msconvert"), "{}", notes[0]);
+    }
+
+    #[test]
+    fn an_explicit_parser_that_is_missing_blocks_even_with_msconvert_present() {
+        // The engine's rule: a configured path that is wrong is an error, not a reason
+        // to convert with a program the configuration did not name.
+        let (blockers, notes) = converter_verdict(
+            &files(&["a.raw"]),
+            &conv(
+                ("D:/tools/ThermoRawFileParser.exe", None),
+                Some("msconvert"),
+            ),
+        );
+        assert_eq!(blockers.len(), 1, "{blockers:?}");
+        assert!(
+            blockers[0].contains("D:/tools/ThermoRawFileParser.exe"),
+            "{}",
+            blockers[0]
+        );
+        assert!(
+            blockers[0].contains("no ThermoRawFileParser found"),
+            "{}",
+            blockers[0]
+        );
+        assert!(notes.is_empty(), "{notes:?}");
+    }
+
+    #[test]
+    fn converters_the_configuration_names_off_path_are_enough() {
+        // The probe carries the request's configuration, so a converter found only
+        // through it arrives with a path, and nothing is blocked.
+        let mut c = conv(
+            (
+                "D:/tools/ThermoRawFileParser.exe",
+                Some("D:/tools/ThermoRawFileParser.exe"),
+            ),
+            Some("E:/pwiz/msconvert.exe"),
+        );
+        c.msconvert.configured = "E:/pwiz/msconvert.exe".into();
+        assert!(c.thermo.explicit() && c.msconvert.explicit());
+        let (blockers, notes) = converter_verdict(&files(&["a.raw", "b.d"]), &c);
+        assert!(
+            blockers.is_empty() && notes.is_empty(),
+            "{blockers:?} {notes:?}"
+        );
+    }
+
+    #[test]
+    fn nothing_installed_blocks_thermo_and_bruker_and_leaves_mzml_alone() {
+        let (blockers, _) = converter_verdict(
+            &files(&["a.raw", "b.d", "c.raw"]),
+            &conv(("auto", None), None),
+        );
+        assert_eq!(blockers.len(), 2, "{blockers:?}");
+        assert!(
+            blockers[0].starts_with("2 selected file(s) are Thermo"),
+            "{}",
+            blockers[0]
+        );
+        assert!(blockers[0].contains("msconvert"), "{}", blockers[0]);
+        assert!(blockers[1].contains("msconvert"), "{}", blockers[1]);
+        let (b, n) = converter_verdict(&files(&["x.mzML"]), &conv(("auto", None), None));
+        assert!(b.is_empty() && n.is_empty());
+    }
+
+    #[test]
+    fn the_probe_carries_the_requests_configuration() {
+        assert_eq!(doctor_args(None), vec!["doctor", "--json"]);
+        assert_eq!(
+            doctor_args(Some("C:/cfg/run.json")),
+            vec!["doctor", "--json", "--config", "C:/cfg/run.json"]
+        );
+    }
+
+    #[test]
+    fn the_report_is_read_as_the_engine_writes_it() {
+        let v = serde_json::json!({
+            "thermo": {"status": "none", "configured": "auto", "path": null,
+                       "detail": "no ThermoRawFileParser found"},
+            "msconvert": {"status": "ok", "configured": "auto",
+                          "path": "/opt/pwiz/msconvert", "detail": null}
+        });
+        let t = converter_of(v.get("thermo"));
+        assert_eq!(t.configured, "auto");
+        assert!(!t.explicit());
+        assert_eq!(t.path, None);
+        assert_eq!(t.detail.as_deref(), Some("no ThermoRawFileParser found"));
+        let m = converter_of(v.get("msconvert"));
+        assert_eq!(m.path.as_deref(), Some("/opt/pwiz/msconvert"));
+        assert_eq!(converter_of(None), Converter::default());
+    }
 
     #[test]
     fn the_download_is_pinned_to_the_publishers_own_release() {

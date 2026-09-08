@@ -137,8 +137,12 @@ Key semantics:
   eliminate a target against its decoy. Peptide-level q estimation subsequently
   performs picked target-decoy competition through the shared
   `base_peptide_id`; keep that pairing intact.
-- `retain_top_peaks > 1` currently writes diagnostic peak alternatives only.
-  Those alternatives do not yet become feature/rescore rows.
+- `extract.retain_top_peaks > 1` (default 1) writes the alternative peaks as
+  additional `psms_extracted` rows with `peak_rank >= 1` (plus a diagnostic
+  `.peaks.parquet`), `features` carries `peak_rank`, `compete` keys on it, and
+  `rescore` keeps one row per candidate and records `selected_peak_rank`. The
+  plumbing exists; what the default still lacks is entrapment validation on two
+  acquisitions.
 
 ## Validated sensitivity workflow
 
@@ -203,9 +207,9 @@ The mechanism is peak-group formation rather than scoring: with most peaks gone,
 group.
 
 That reading comes from the cap dose-response, not from the audit ladder's own
-label. `NO_PEAK_GROUP` cannot be used as evidence for it: `audit.rs` reads a
+label. `DID_NOT_SURVIVE_EXTRACTION` cannot be used as evidence for it: `audit.rs` reads a
 per-candidate audit table that `extract` does not write (`emit_candidate_audit`
-is unwired), so the reason map is always empty and the `_ => NoPeakGroup`
+is unwired), so the reason map is always empty and the `_ => DidNotSurviveExtraction`
 catch-all absorbs presence failures, matched-fraction failures AND every
 extraction-gate rejection alike. Treat the label as "did not survive extract",
 and do not decompose it further until the audit table is actually produced.
@@ -361,14 +365,15 @@ fine-tuning also is not guaranteed deterministic.
   single pooled run do not produce identical `q_value` columns. Batch to fit RAM,
   and compare per-run counts on `run_psm_q`.
 - Pooled rescore scales linearly, measured 0.834 ms/PSM on the streaming
-  backend. Two feature matrices, two widths: the Python worker's is
-  `n_psms x n_features x 4` bytes (f32), while the Rust `feats` that `rescore`
-  builds is `Vec<Vec<f64>>`, so `n_psms x n_features x 8` plus a heap allocation
-  and 24 bytes of spine per PSM. `native_tda` additionally runs all folds in
+  backend. Two feature matrices, one width: the Python worker's is
+  `n_psms x n_features x 4` bytes (f32), and the Rust `FeatureMatrix` that
+  `rescore` builds (`rescoring.rs`) is flat f32 as well, so the same
+  `n_psms x n_features x 4`. `native_tda` additionally runs all folds in
   parallel, each holding an owned standardised copy of its training slice, so its
-  peak is roughly `(1 + folds)x` the matrix. The stage logs the figure before it
-  allocates, and `rescore.max_feature_matrix_gib` turns exceeding a ceiling into
-  an error at startup rather than an OS kill hours in.
+  peak is roughly `(1 + folds)x` the matrix. `rescore.max_feature_matrix_gib` is
+  checked against that layout, from the parquet footers and the selected feature
+  count, before the allocation (docs/29 #11), so exceeding the ceiling is an error
+  at startup rather than an OS kill hours in.
 
 ### Rescore cost: handoff, feature selection, training-set reduction
 
@@ -554,7 +559,8 @@ sensitivity result for it.
 
 Do not enable these by default from a single AIF count:
 
-- model-visible top-K peaks (currently diagnostic sidecar only);
+- model-visible top-K peaks (`extract.retain_top_peaks > 1`; implemented through
+  features, compete and rescore, default 1);
 - adaptive RT windows;
 - held-out RT window sizing (`rt_im_train.window_holdout_frac`). Implemented and
   measured on the AIF benchmark: +1.1% peptides with DeepLC 4.1.0 at unchanged
@@ -581,8 +587,9 @@ and FDR population: the entrapment pool, HYE and AIF of docs/28 all ran under it
 The selected apex was historically correct/strongest only about 48-52% of the
 time while the correct peak appeared in the top five about 86-88%. Promoting
 top-K alternatives through features/rescore is therefore the best plausible
-sensitivity project, but it needs a `candidate_id + peak_rank` contract and
-entrapment validation before default activation.
+sensitivity project. The `candidate_id + peak_rank` contract exists (`peak_rank`
+on every extracted row, `selected_peak_rank` on the scored row, and the MBR worker
+joins it); what default activation still needs is the entrapment validation.
 
 ## Coding conventions
 

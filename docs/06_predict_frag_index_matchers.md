@@ -149,14 +149,17 @@ struct so intensity/iRT assignment reuses it instead of re-parsing
 `NativeRt::predict_irt` per candidate. DeepLC path deduplicates by peptidoform
 string (RT is charge-independent, `predict_frag.rs:324-334`), runs the sidecar
 once over the unique set, then maps results back. Peptidoforms DeepLC returns no
-prediction for are anchored at `irt = 0.0` and counted; if any are missing a
-`tracing::warn!` fires (`predict_frag.rs:347-352`). This is the DeepLC-miss iRT
-warning: it makes the silent "unmatched peptidoform gets iRT 0.0" failure visible,
-because an iRT-0 anchor collapses the RT window onto the gradient origin and
-misplaces the candidate at extraction. The DeepLC branch requires `deeplc_python`
-and errors otherwise (`predict_frag.rs:318-321`); its returned model id is the
-hardcoded string `"deeplc-4.0-mt"` (`predict_frag.rs:353`), not a trait
-`identity()` (the sidecar path has no `RtPredictor` impl to query).
+prediction for are reported to `run`, which drops them together with every candidate
+sharing their pair key (base peptide, charge, modification set), so a target and its
+paired decoy leave together; the counts land in the library report as
+`candidates_dropped_unpredicted` and `pairs_dropped_unpredicted` and in a warning. They
+used to be anchored at `irt = 0.0` with a warning, which collapsed the RT window onto
+the gradient origin for those candidates (docs/29 #17). `run_deeplc` also rejects a
+returned id that was not requested or that appears twice. The DeepLC branch requires `deeplc_python`
+and errors otherwise (`predict_frag.rs:318-321`); its returned model id is
+`deeplc-<installed version>-base`, the version read from the interpreter, not a trait
+`identity()` (the sidecar path has no `RtPredictor` impl to query). It was the literal
+`"deeplc-4.0-mt"` until docs/30, which named a family, not the release that predicted.
 
 **intensity assignment** (`assign_intensities`, `predict_frag.rs:359`). Native
 path calls `NativeFrag::predict_intensities`. MS2PIP path runs the sidecar over
@@ -177,8 +180,9 @@ precursor charge 2) 78.6% of the kept fragments were charge-2 heuristics tied at
 among the top 1,000 seed scores. `HCDch2` with 12 fragments gave 19,308 confident
 seeds on the same run (DIA-NN library: 21,856; `HCD2021`, 12 fragments, charge-2
 only from charge 3: 14,412). A candidate MS2PIP returns nothing for (absent from
-the map, or an empty per-candidate map) falls back wholesale to native in either
-regime; a fragment at `0.0` can then be dropped by top-N. MS2PIP requires `ms2pip_python` and errors
+the map, or an empty per-candidate map) is dropped with its pair, exactly like a
+DeepLC miss, rather than receiving the native heuristic under an MS2PIP model identity
+(docs/29 #17); a fragment at `0.0` can still be dropped by top-N. MS2PIP requires `ms2pip_python` and errors
 otherwise (`predict_frag.rs:371-374`); its model id is `format!("ms2pip-{model}")`
 (`predict_frag.rs:446`).
 
@@ -419,13 +423,13 @@ m/z (`Library::local_frag_index`, `index.rs:325`).
 | `PredictFragParams` | `predict_frag.rs:24` | Stage C entry args: in/out paths, `cfg`, `work_dir`, `config_hash` |
 | `predict_frag::run` | `predict_frag.rs:50` | Stage C entry: parse, fragment, assign intensity/iRT, top-N, sort, write; returns `(n_prec, n_frag)` |
 | `Raw` | `predict_frag.rs:34` | one candidate pre-assignment; caches the `ParsedPeptidoform` so RT/intensity reuse the parse |
-| `assign_rt` | `predict_frag.rs:308` | native or DeepLC iRT; emits the DeepLC-miss warning; DeepLC id `"deeplc-4.0-mt"` |
-| `assign_intensities` | `predict_frag.rs:359` | native or MS2PIP intensity with per-charge-group normalization + native charge-2 fallback; MS2PIP id `"ms2pip-{model}"` |
+| `assign_rt` | `predict_frag.rs:308` | native or DeepLC iRT; emits the DeepLC-miss warning; DeepLC id `deeplc-<version>-base` |
+| `assign_intensities` | `predict_frag.rs:359` | native or MS2PIP intensity with per-charge-group normalization + native charge-2 fallback; MS2PIP id `ms2pip-<version>-{model}` |
 | `fragment_cardinality` | `predict_frag.rs:457` | distinct precursors per 0.01 Da fragment-m/z bin, per fragment row; diagnostic column, no consumer yet |
 | `RtPredictor` / `FragmentPredictor` | `predict.rs:13` / `predict.rs:19` | predictor traits (predict + `identity`); implemented only by the native structs |
 | `NativeRt` | `predict.rs:25` | additive retention-coefficient model + `sqrt(len)` + `0.01*mod` term, `identity` `native-rt-v1` |
 | `NativeFrag` | `predict.rs:73` | heuristic b/y intensity model (y=1.0, b=0.75, mid-seq positional, charge-2 x0.5), max-normalized, `identity` `native-frag-v1` |
-| `resolve_script` | `sidecar.rs:20` | locate a worker script (CWD, exe dir/dir, exe dir/scripts, else CWD-relative) |
+| `resolve_script` | `sidecar.rs:20` | locate a worker script (an absolute directory as given, else exe dir/dir, exe dir/scripts, and the working directory LAST; docs/31 F3) |
 | `run_ms2pip` | `sidecar.rs:42` | MS2PIP client; in `id`/`peptidoform`/`charge`, out `id`/`ion_type`/`ordinal`/`intensity`; returns `cid -> (ion_byte, ordinal) -> intensity` |
 | `run_deeplc` | `sidecar.rs:81` | DeepLC client; in `id`/`peptidoform`, out `id`/`predicted_rt`; returns `id -> predicted_rt` |
 | `run_deeplc_finetune` | `sidecar.rs:111` | DeepLC multitask fine-tune; `deeplc_finetune.py <lib_in> <seed> <lib_out>` + epoch/patience/q-train/batch flags (called by `run`, not predict-frag) |
@@ -520,10 +524,11 @@ Matcher selection (both stages default to `Fragindex`):
   sums `obs_sum` in the caller's fixed peak order and `touched()` is in
   first-touch order, so callers sort before any float reduction
   (`fragindex.rs:346-350`).
-- **DeepLC nondeterminism and the iRT-0 anchor.** The DeepLC sidecar and fine-tune
-  are not seeded, so iRT values vary run to run. Any peptidoform DeepLC does not
-  return lands at iRT 0.0; the warning at `predict_frag.rs:347-352` reports the
-  count so a large miss is visible rather than silent.
+- **DeepLC nondeterminism and unpredicted peptidoforms.** The DeepLC sidecar and
+  fine-tune are not seeded, so iRT values vary run to run. Any peptidoform DeepLC
+  does not return is dropped from the library together with its pair (it used to be
+  anchored at iRT 0.0); the library report's `candidates_dropped_unpredicted` counts
+  them so a large miss is visible rather than silent.
 - **An imported library can carry one iRT per stripped peptide.** The importer
   copies `predicted_irt` verbatim from the source library's RT column
   (`import_diann_lib.py:148`) and library load accepts it unchecked

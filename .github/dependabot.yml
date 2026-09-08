@@ -30,6 +30,22 @@ updates:
           - minor
           - patch
 
+  # The desktop application is a separate Cargo workspace with its own lockfile
+  # (desktop/Cargo.lock), which the entry above does not read (docs/29, work
+  # package C). Tauri and its toolkit crates are updated within their major version.
+  - package-ecosystem: cargo
+    directory: /desktop
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 3
+    groups:
+      desktop-minor-and-patch:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
+
   # Base images, so the digest pins in the Dockerfile stay current instead of
   # freezing the image on a base that stops receiving security updates. Pinning
   # without an update path is how a reproducible image becomes an unpatched one.

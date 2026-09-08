@@ -27,6 +27,7 @@ Usage:
 
 from __future__ import annotations
 
+import subprocess
 import sys
 from pathlib import Path
 
@@ -61,8 +62,33 @@ StrictLoader.add_constructor(
 )
 
 
+def workflow_files() -> list[Path]:
+    """The tracked workflow files; the directory glob only where git cannot answer.
+
+    An untracked scratch copy beside the real workflows was checked as if it shipped
+    (docs/29 #21); the tracked set is what CI runs.
+    """
+    try:
+        out = subprocess.run(
+            ["git", "ls-files", "-z", "--", str(WORKFLOWS)],
+            cwd=WORKFLOWS.parents[1],
+            capture_output=True,
+            check=True,
+        ).stdout
+        files = sorted(
+            WORKFLOWS.parents[1] / rel
+            for rel in out.decode("utf-8").split("\0")
+            if rel.endswith((".yml", ".yaml"))
+        )
+        if files:
+            return files
+    except (OSError, subprocess.CalledProcessError):
+        pass
+    return sorted(WORKFLOWS.glob("*.yml")) + sorted(WORKFLOWS.glob("*.yaml"))
+
+
 def main() -> int:
-    files = sorted(WORKFLOWS.glob("*.yml")) + sorted(WORKFLOWS.glob("*.yaml"))
+    files = workflow_files()
     if not files:
         print(f"no workflows found under {WORKFLOWS}", file=sys.stderr)
         return 1

@@ -321,10 +321,10 @@ and 80.3% of what a library-free DIA-NN 2.2.0 search reports on the same file.
 The mechanism is downstream: with most peaks gone, candidates cannot assemble
 enough distinct matched fragments to satisfy `extract.presence_min_fragments`
 (`config.rs:523`, default 3 at `config.rs:690`), so they fail peak-group
-formation and are recorded with rejection code `NO_PEAK_GROUP`
+formation and are recorded with rejection code `DID_NOT_SURVIVE_EXTRACTION`
 (`rejection.rs:62`). This was confirmed with `mumdia audit` on the capped arm,
 restricted to the peptides that same DIA-NN search reports as present (78,782
-distinct `Stripped.Sequence` at DIA-NN `Q.Value` <= 0.01): 49,105 of 78,782 (62.3%) stopped at `candidate_generated` with `NO_PEAK_GROUP`, against only
+distinct `Stripped.Sequence` at DIA-NN `Q.Value` <= 0.01): 49,105 of 78,782 (62.3%) stopped at `candidate_generated` with `DID_NOT_SURVIVE_EXTRACTION`, against only
 5,380 lost to FDR and 355 to competition, and a counterfactual replay on the
 uncapped artifact recovered 41,948 (85.4%) of them. The loss is therefore
 extraction-side, not a scoring or competition effect. See docs/09_extract.md for
@@ -540,7 +540,13 @@ than its input is either from a different acquisition of the same name or from
 before the input was re-acquired, and searching it would search the wrong data. An
 unreadable timestamp counts as not reusable.
 
-The converter writes to `<name>.partial.mzML` and the engine renames it to
+The converter writes to `<name>.partial-<pid>-<n>.mzML`, a name unique to this
+conversion, under a `<name>.mzML.converting` lock beside the destination; a second
+process converting the same input waits for the lock and reuses the finished mzML
+instead of converting into the same destination (docs/30 R4: two concurrent
+conversions used to share one partial file, and one of them published the other's
+bytes). A lock whose holder stopped writing for fifteen minutes is broken. The engine
+then renames the partial file to
 `<name>.mzML` only after a zero exit and a file at that path, so a killed run or a
 converter crash leaves nothing the reuse rule can mistake for a finished conversion;
 a stale `.partial.mzML` is removed at the next attempt. The marker sits in the stem

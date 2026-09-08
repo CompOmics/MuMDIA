@@ -157,6 +157,9 @@ def main():
                 rows=int(len(d["y"])),
                 n_features_used=len(cols) if cols else len(d["feat_cols"]),
                 cfg=json.dumps(over, sort_keys=True),
+                recipe=json.dumps(fs_lib.recipe_metadata({**over, "seed_base": sd},
+                                                         len(cols) if cols else len(d["feat_cols"]), sd),
+                                  sort_keys=True),
                 when=time.strftime("%Y-%m-%d %H:%M:%S"),
             )
             pd.DataFrame([row]).to_csv(out_csv, mode="a", header=not os.path.exists(out_csv), index=False)

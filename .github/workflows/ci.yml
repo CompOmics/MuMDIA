@@ -95,6 +95,17 @@ jobs:
       - name: Audit
         run: cargo audit --deny unsound --deny yanked
 
+      # The desktop application has its own lockfile, which the step above does not
+      # read (docs/29, work package C). One advisory is ignored deliberately:
+      # RUSTSEC-2024-0429, an unsound iterator in glib 0.18's `VariantStrIter`. Tauri
+      # 2's Linux toolkit is gtk 0.18, which pins glib 0.18; the fix is glib 0.20; and
+      # the application never touches a GVariant. Drop the ignore when Tauri moves to
+      # gtk4 / glib 0.20.
+      - name: Audit the desktop lockfile
+        run: >-
+          cargo audit --file ../../desktop/Cargo.lock --deny unsound --deny yanked
+          --ignore RUSTSEC-2024-0429
+
   build-test:
     name: build + test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}

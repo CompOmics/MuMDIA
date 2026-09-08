@@ -7,8 +7,15 @@
 //! DIA-NN-only precursor first lost?" without conflating later stages.
 //!
 //! The serialized spelling is SCREAMING_SNAKE_CASE and matches the reason strings
-//! in the specification exactly (e.g. `NO_PEAK_GROUP`). Use [`RejectionReason::code`]
-//! for the stable string written to Parquet/JSON (no serde round-trip cost).
+//! in the specification exactly (e.g. `NO_FRAGMENT_TRACES`). Use
+//! [`RejectionReason::code`] for the stable string written to Parquet/JSON (no serde
+//! round-trip cost).
+//!
+//! `DID_NOT_SURVIVE_EXTRACTION` was `NO_PEAK_GROUP` until docs/29 #16. The audit
+//! assigns it to every candidate that has traces in no extracted row, and `extract`
+//! does not write the per-candidate table that would separate presence failures,
+//! matched-fraction failures and gate rejections, so the old name claimed a cause the
+//! audit cannot see. The name now says what is known.
 
 use serde::{Deserialize, Serialize};
 
@@ -29,7 +36,9 @@ pub enum RejectionReason {
     CandidateCapReached,
     // --- extraction + peak formation (Stages C, D) ---
     NoFragmentTraces,
-    NoPeakGroup,
+    /// Extracted no accepted row, for any extraction-side reason; see the module
+    /// documentation for why this is not called a peak-group failure.
+    DidNotSurviveExtraction,
     // --- peak / peptide ranking (Stage E) ---
     PeakNotSelected,
     // --- competition (Stage G) ---
@@ -59,7 +68,7 @@ impl RejectionReason {
             RtPruned => "RT_PRUNED",
             CandidateCapReached => "CANDIDATE_CAP_REACHED",
             NoFragmentTraces => "NO_FRAGMENT_TRACES",
-            NoPeakGroup => "NO_PEAK_GROUP",
+            DidNotSurviveExtraction => "DID_NOT_SURVIVE_EXTRACTION",
             PeakNotSelected => "PEAK_NOT_SELECTED",
             OutcompetedByTarget => "OUTCOMPETED_BY_TARGET",
             OutcompetedByDecoy => "OUTCOMPETED_BY_DECOY",
@@ -85,7 +94,7 @@ impl RejectionReason {
             RtPruned => 6,
             CandidateCapReached => 7,
             NoFragmentTraces => 8,
-            NoPeakGroup => 9,
+            DidNotSurviveExtraction => 9,
             PeakNotSelected => 10,
             OutcompetedByTarget => 11,
             OutcompetedByDecoy => 12,
@@ -119,7 +128,7 @@ mod tests {
 
     #[test]
     fn codes_match_spec_strings() {
-        assert_eq!(NoPeakGroup.code(), "NO_PEAK_GROUP");
+        assert_eq!(DidNotSurviveExtraction.code(), "DID_NOT_SURVIVE_EXTRACTION");
         assert_eq!(PeakNotSelected.code(), "PEAK_NOT_SELECTED");
         assert_eq!(OutcompetedByDecoy.code(), "OUTCOMPETED_BY_DECOY");
         assert_eq!(Reported.code(), "REPORTED");
@@ -136,8 +145,14 @@ mod tests {
     #[test]
     fn earliest_keeps_smaller_stage() {
         // an extraction loss precedes an FDR loss
-        assert_eq!(NoPeakGroup.earliest(FailedPrecursorFdr), NoPeakGroup);
-        assert_eq!(FailedPrecursorFdr.earliest(NoPeakGroup), NoPeakGroup);
+        assert_eq!(
+            DidNotSurviveExtraction.earliest(FailedPrecursorFdr),
+            DidNotSurviveExtraction
+        );
+        assert_eq!(
+            FailedPrecursorFdr.earliest(DidNotSurviveExtraction),
+            DidNotSurviveExtraction
+        );
         // Reported never wins against a real rejection
         assert_eq!(Reported.earliest(NoFragmentTraces), NoFragmentTraces);
         assert_eq!(NoFragmentTraces.earliest(Reported), NoFragmentTraces);
@@ -145,7 +160,7 @@ mod tests {
 
     #[test]
     fn is_rejection_flags_only_losses() {
-        assert!(NoPeakGroup.is_rejection());
+        assert!(DidNotSurviveExtraction.is_rejection());
         assert!(!Reported.is_rejection());
     }
 
@@ -153,8 +168,8 @@ mod tests {
     fn stage_order_is_monotone_ladder() {
         // ladder ordering across the major stages
         assert!(PeptideNotGenerated.stage_order() < NoFragmentTraces.stage_order());
-        assert!(NoFragmentTraces.stage_order() < NoPeakGroup.stage_order());
-        assert!(NoPeakGroup.stage_order() < PeakNotSelected.stage_order());
+        assert!(NoFragmentTraces.stage_order() < DidNotSurviveExtraction.stage_order());
+        assert!(DidNotSurviveExtraction.stage_order() < PeakNotSelected.stage_order());
         assert!(PeakNotSelected.stage_order() < OutcompetedByTarget.stage_order());
         assert!(OutcompetedByTarget.stage_order() < FailedPrecursorFdr.stage_order());
         assert!(FailedPrecursorFdr.stage_order() < RemovedDuringReporting.stage_order());

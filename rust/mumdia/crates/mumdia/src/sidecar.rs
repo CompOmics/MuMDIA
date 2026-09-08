@@ -8,7 +8,7 @@ use std::process::Command;
 
 use anyhow::{bail, Context, Result};
 use mumdia_io::table::{write_table, Col, TableFile};
-use tracing::info;
+use tracing::{info, warn};
 
 /// Per candidate row: `(ion byte, ordinal, fragment charge)` -> linear predicted intensity.
 /// The charge is 1 for every series a single-charge MS2PIP model emits and 2 for the
@@ -17,27 +17,43 @@ pub type FragmentIntensityMap = HashMap<u32, HashMap<(u8, u16, u8), f32>>;
 
 /// Resolve a sidecar worker script path so a deployed binary finds its workers
 /// regardless of the working directory: try the configured dir relative to the
-/// CWD, then relative to the binary's own directory, then `<exe_dir>/scripts`.
-/// Falls back to the CWD-relative path (so the eventual error names it) if none
-/// of those exist.
+/// the binary's own directory, then `<exe_dir>/scripts`, and the current working
+/// directory LAST. Falls back to the directory-relative path (so the eventual error
+/// names it) if none of those exist.
+///
+/// The working directory used to be tried first. `python::resolve_script_dir` was
+/// reordered away from exactly that and documents why at length: the shipped default is
+/// the relative `"scripts"`, which both sidecar example configs carry, so unpacking a
+/// dataset archive, `cd`-ing into it and running with an example config executed any
+/// worker the archive happened to contain. That resolver only claims a directory holding
+/// `mbr_worker.py` or `deeplc_worker.py`, so a directory with any of the other ten
+/// workers reached this function still relative, and this function ran it (docs/31 F3).
+/// An absolute directory is taken as given: naming one is how a user is unambiguous.
 pub fn resolve_script(dir: &str, worker: &str) -> String {
-    let cwd_rel = format!("{dir}/{worker}");
-    if std::path::Path::new(&cwd_rel).exists() {
-        return cwd_rel;
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|e| e.parent().map(|p| p.to_path_buf()));
+    resolve_script_in(dir, worker, exe_dir.as_deref())
+}
+
+/// [`resolve_script`] with the executable's directory supplied, so the ordering can be
+/// tested without a second binary.
+fn resolve_script_in(dir: &str, worker: &str, exe_dir: Option<&std::path::Path>) -> String {
+    let dir_rel = format!("{dir}/{worker}");
+    if std::path::Path::new(dir).is_absolute() {
+        return dir_rel;
     }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(base) = exe.parent() {
-            for cand in [
-                base.join(dir).join(worker),
-                base.join("scripts").join(worker),
-            ] {
-                if cand.exists() {
-                    return cand.to_string_lossy().into_owned();
-                }
+    if let Some(base) = exe_dir {
+        for cand in [
+            base.join(dir).join(worker),
+            base.join("scripts").join(worker),
+        ] {
+            if cand.exists() {
+                return cand.to_string_lossy().into_owned();
             }
         }
     }
-    cwd_rel
+    dir_rel
 }
 
 /// MS2PIP: predict singly-charged b/y intensities per (peptidoform, charge).
@@ -88,13 +104,34 @@ pub fn run_ms2pip(
     } else {
         None
     };
+    // Returned ids must be requested ones and each (ion, ordinal, charge) may appear once
+    // per id; coverage of the requested set is the caller's decision (docs/29 #17).
+    let requested: std::collections::HashSet<u32> = ids.iter().copied().collect();
     let mut map: FragmentIntensityMap = HashMap::new();
     for i in 0..t.nrows {
+        if !requested.contains(&oid[i]) {
+            bail!(
+                "MS2PIP worker returned id {}, which was not among the {} peptidoforms \
+                 requested",
+                oid[i],
+                ids.len()
+            );
+        }
         let ib = ion[i].as_bytes().first().copied().unwrap_or(b'?');
         let z = fch.as_ref().map(|c| c[i].clamp(1, 255) as u8).unwrap_or(1);
-        map.entry(oid[i])
+        if map
+            .entry(oid[i])
             .or_default()
-            .insert((ib, ord[i] as u16, z), inten[i]);
+            .insert((ib, ord[i] as u16, z), inten[i])
+            .is_some()
+        {
+            bail!(
+                "MS2PIP worker returned fragment {}{} charge {z} of id {} more than once",
+                ion[i],
+                ord[i],
+                oid[i]
+            );
+        }
     }
     Ok(map)
 }
@@ -128,6 +165,40 @@ pub fn require_deeplc_version(python: &str) -> Result<String> {
     }
 }
 
+/// `deeplc-<version>-<suffix>` when the interpreter answers, `deeplc-<suffix>` when there
+/// is none to ask: the manifest's RT identity should say which DeepLC release produced the
+/// library, not only the recipe (docs/30, model identity).
+pub fn deeplc_identity(python: Option<&str>, suffix: &str) -> String {
+    match python.and_then(|py| module_version(py, "deeplc")) {
+        Some(v) => format!("deeplc-{v}-{suffix}"),
+        None => format!("deeplc-{suffix}"),
+    }
+}
+
+/// Read the `<lib_out>.summary.json` the fine-tune worker writes beside a rewritten
+/// library and warn when rows kept their imported iRT, so a mixed RT source is visible
+/// in the log rather than only in the file (docs/30 R6).
+fn warn_on_retained_imported(lib_out: &str) {
+    let path = format!("{lib_out}.summary.json");
+    let Ok(v) = mumdia_io::json::read_json::<serde_json::Value>(&path) else {
+        return;
+    };
+    let n = |k: &str| v.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
+    let retained = n("retained_imported");
+    if retained > 0 {
+        warn!(
+            rows = n("rows"),
+            repredicted = n("repredicted"),
+            retained_imported = retained,
+            retained_non_standard = n("retained_non_standard"),
+            retained_no_prediction = n("retained_no_prediction"),
+            summary = %path,
+            "sidecar: the rewritten library keeps the imported iRT on some rows, so its RT \
+             source is mixed; see the summary for the counts"
+        );
+    }
+}
+
 /// DeepLC: predict retention time per peptidoform. Returns `id -> predicted_rt`.
 pub fn run_deeplc(
     python: &str,
@@ -155,7 +226,25 @@ pub fn run_deeplc(
     let t = TableFile::open(&outp)?;
     let oid = t.u32("id")?;
     let rt = t.f32("predicted_rt")?;
-    Ok(oid.into_iter().zip(rt).collect())
+    // Returned ids must be a subset of the requested ones, each at most once. A repeated
+    // id used to overwrite silently and an unrequested one was kept; coverage (ids with
+    // no prediction) is the caller's to decide, and it drops those candidates rather
+    // than substituting a value (docs/29 #17).
+    let requested: std::collections::HashSet<u32> = ids.iter().copied().collect();
+    let mut map: HashMap<u32, f32> = HashMap::with_capacity(oid.len());
+    for (id, value) in oid.into_iter().zip(rt) {
+        if !requested.contains(&id) {
+            bail!(
+                "DeepLC worker returned id {id}, which was not among the {} peptidoforms \
+                 requested",
+                ids.len()
+            );
+        }
+        if map.insert(id, value).is_some() {
+            bail!("DeepLC worker returned id {id} more than once");
+        }
+    }
+    Ok(map)
 }
 
 /// DeepLC multitask fine-tune: adapt the RT model to this run's confident seed
@@ -222,7 +311,9 @@ pub fn run_deeplc_finetune(
         ],
         true,
     )
-    .context("DeepLC fine-tune failed")
+    .context("DeepLC fine-tune failed")?;
+    warn_on_retained_imported(lib_out);
+    Ok(())
 }
 
 /// DeepLC base-model re-prediction of an imported library's `predicted_irt`: the
@@ -259,7 +350,9 @@ pub fn run_deeplc_repredict(
         ],
         true,
     )
-    .context("DeepLC library re-prediction failed")
+    .context("DeepLC library re-prediction failed")?;
+    warn_on_retained_imported(lib_out);
+    Ok(())
 }
 
 /// MBR transfer (Stage D3): match-between-runs identification transfer over the
@@ -362,4 +455,68 @@ fn run_worker(python: &str, script: &str, args: &[&str], utf8: bool) -> Result<(
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod resolve_tests {
+    use super::resolve_script_in;
+    use std::path::Path;
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("mumdia_resolve_{}_{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn the_shipped_directory_beside_the_binary_wins_over_the_working_directory() {
+        // docs/31 F3. Both locations hold a worker of the same name; the one that ships
+        // with the binary must win, because the working directory can be an untrusted
+        // dataset the user merely unpacked and `cd`-ed into.
+        let exe = scratch("exe");
+        std::fs::create_dir_all(exe.join("scripts")).unwrap();
+        std::fs::write(exe.join("scripts").join("ms2pip_worker.py"), b"# shipped").unwrap();
+        let got = resolve_script_in("scripts", "ms2pip_worker.py", Some(&exe));
+        assert_eq!(
+            got,
+            exe.join("scripts")
+                .join("ms2pip_worker.py")
+                .to_string_lossy()
+        );
+        assert_ne!(got, "scripts/ms2pip_worker.py");
+        let _ = std::fs::remove_dir_all(&exe);
+    }
+
+    #[test]
+    fn an_absolute_directory_is_taken_as_given() {
+        let abs = if cfg!(windows) {
+            "C:/opt/mumdia/scripts"
+        } else {
+            "/opt/mumdia/scripts"
+        };
+        let exe = scratch("abs");
+        std::fs::create_dir_all(exe.join("scripts")).unwrap();
+        std::fs::write(exe.join("scripts").join("mbr_worker.py"), b"# shipped").unwrap();
+        assert_eq!(
+            resolve_script_in(abs, "mbr_worker.py", Some(&exe)),
+            format!("{abs}/mbr_worker.py"),
+            "naming a directory outright is how a user is unambiguous"
+        );
+        let _ = std::fs::remove_dir_all(&exe);
+    }
+
+    #[test]
+    fn nothing_beside_the_binary_falls_back_to_the_relative_path_for_the_error() {
+        let exe = scratch("empty");
+        assert_eq!(
+            resolve_script_in("scripts", "deeplc_worker.py", Some(&exe)),
+            "scripts/deeplc_worker.py"
+        );
+        assert_eq!(
+            resolve_script_in("scripts", "deeplc_worker.py", None::<&Path>),
+            "scripts/deeplc_worker.py"
+        );
+        let _ = std::fs::remove_dir_all(&exe);
+    }
 }

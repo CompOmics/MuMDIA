@@ -18,10 +18,12 @@ positives, all decoys negatives -> train the MLP from scratch -> rescore} for
 
 MEMORY (multi-run / large PINs): two feature backends behind one accessor.
     - in-memory (default for PINs <= MUMDIA_NN_STREAM_GB, 4 GB): the full standardised
-      feature matrix is held in RAM (median/IQR standardisation).
+      feature matrix is held in RAM. Mean/std standardisation, the same as the streaming
+      backend: one transform for every backend and every handoff, so a score does not
+      depend on which one ran (docs/31 F5).
     - streaming memmap (large PINs, or MUMDIA_NN_STREAM=1): the PIN is read ONCE in
-      chunks into a disk-backed float32 memmap (mean/std standardisation accumulated
-      in the same pass); training and scoring then draw MINIBATCHES indexed into the
+      chunks into a disk-backed float32 memmap (the same mean/std, accumulated in the
+      same pass); training and scoring then draw MINIBATCHES indexed into the
       memmap, so peak RAM is one batch + per-row metadata, NOT the whole matrix.
       This is what makes combining many runs into one rescoring tractable: the full
       PIN never lives in RAM at once.
@@ -165,7 +167,21 @@ def folds_for(peptides, fold_keys, folds, off=0):
     serve the chunked streaming backend as well as the two whole-table ones.
     """
     if fold_keys is not None:
-        return (fold_keys[off:off + len(peptides)] % folds).astype(np.int16)
+        want = len(peptides)
+        got = fold_keys[off:off + want]
+        # Numpy slicing past the end returns a SHORT array rather than raising, and a
+        # short `fold` puts the tail rows in no fold at all: `np.where(fold == f)` cannot
+        # index them, they are never scored, and they keep the zero initialiser, which the
+        # final rank-normalisation turns into a plausible tied mid-rank score. The Rust
+        # caller's completeness contract is satisfied by that, so `rescore.strict` does not
+        # catch it either (docs/31 F5).
+        if len(got) != want:
+            raise SystemExit(
+                "MUMDIA_NN_FOLD_KEYS has %d rows but the PIN needs at least %d "
+                "(rows %d..%d); the companion table does not belong to this PIN, and "
+                "folding on a truncated one would leave the tail unscored."
+                % (len(fold_keys), off + want, off, off + want))
+        return (got % folds).astype(np.int16)
     return np.array([peptide_fold(x, folds) for x in peptides], np.int16)
 
 
@@ -333,7 +349,10 @@ def main():
         # times smaller than the equivalent text, so the raw file size would understate the
         # memory a full read actually needs.
         _md = pq.read_metadata(pin_path)
-        _nf_guess = max(1, _md.num_columns - 3)      # minus SpecId / Label / Peptide
+        # Count the feature columns by name. Subtracting a hardcoded 3 undercounted the
+        # non-feature columns, of which NON_FEATURE lists 7, so the estimate that picks the
+        # backend was biased upward and could stream a matrix that fits (docs/31 F5).
+        _nf_guess = max(1, sum(1 for c in pq.read_schema(pin_path).names if c not in NON_FEATURE))
         filesize = int(_md.num_rows) * _nf_guess * 4
     stream_gb = env_f("MUMDIA_NN_STREAM_GB", 4)
     stream = stream_env in ("1", "on", "true") or (
@@ -475,10 +494,18 @@ def main():
                 pin[feat_cols].to_numpy(np.float32), nan=0.0, posinf=0.0, neginf=0.0
             )
             del pin
-            med = np.median(X, axis=0)
-            iqr = np.subtract(*np.percentile(X, [75, 25], axis=0))
-            iqr[iqr == 0] = 1.0
-            Xs = np.clip((X - med) / iqr, -8, 8).astype(np.float32)
+            # Mean/std, the same transform as the parquet and streaming backends.
+            #
+            # This path used median/IQR while the other two used mean/std, so the same PSM
+            # pool produced different scores depending on `rescore.handoff` and on which
+            # side of MUMDIA_NN_STREAM_GB the matrix fell: a 3.99 GB PIN was standardised
+            # one way and a 4.01 GB PIN the other, with nothing in the log to say which
+            # (docs/31 F5). Converging on mean/std leaves the shipped default (parquet)
+            # and every published benchmark unchanged, and only moves this legacy path.
+            mean = X.mean(axis=0, dtype=np.float64).astype(np.float32)
+            std = X.std(axis=0, dtype=np.float64).astype(np.float32)
+            std[std == 0] = 1.0
+            Xs = np.clip((X - mean) / std, -8, 8).astype(np.float32)
             del X
             n = len(y)
             get = lambda idx: Xs[idx]

@@ -32,8 +32,35 @@ than a number. Both are recorded in every run's `manifest.json`.
   in the top 5,000; fragment charges 79% / 21%), `HCD2021` with charge-2 fragments
   only from precursor charge 3 14,412, the DIA-NN library 21,856.
 
+- `peptides.tsv` and `proteins.tsv` (single-run and experiment-wide) carry
+  `is_transferred` and `transfer_q`, the acceptance basis of a match-between-runs row:
+  a transferred row keeps its grouped q next to the transfer q it was accepted at, a
+  tighter report threshold does not revoke a transfer that passed `mbr.q_transfer`, and a
+  protein group admitted through a transferred row carries the flag. The MBR worker's
+  augmented scored table gains `transfer_q` for it (docs/29 #19).
+- `experiment_manifest.json` records the resolved `config_json` next to its hash, the
+  `model_identities` that produced the artifacts (RT source, fragment predictor, the
+  classifier that actually ran, feature schema, MBR strategy), the configured and
+  effective `quant.q_filter`, and input hashes taken at the start of the run rather than
+  at its end (docs/29 #15).
+- Dependabot covers the desktop application's Cargo dependencies (`/desktop`), and CI
+  audits `desktop/Cargo.lock` with `cargo audit` next to the engine's lockfile, with one
+  documented ignore (RUSTSEC-2024-0429: glib 0.18 through Tauri 2's gtk 0.18).
+
 ### Changed
 
+- Model identities carry the installed predictor versions: `deeplc-4.1.1-base`,
+  `deeplc-4.1.1-finetuned`, `ms2pip-4.2.0-HCDch2` in the library report and the manifests,
+  in place of the family labels `deeplc-4.0-mt` and `ms2pip-<model>` (docs/30).
+- With nothing to transfer, the MBR worker writes a transfer table with its ten columns and
+  zero rows, and the requested augmented scored table with every row unflagged, instead of
+  a one-column placeholder and no scored table (docs/30).
+- The candidate-audit rejection code `NO_PEAK_GROUP` is `DID_NOT_SURVIVE_EXTRACTION`
+  (`RejectionReason::DidNotSurviveExtraction`). The audit assigns it to every candidate
+  with no extracted row, and `extract` does not write the per-candidate table that would
+  separate presence, matched-fraction and gate failures, so the old name claimed a cause
+  the audit cannot see (docs/29 #16). The audit table has no versioned schema; the
+  metrics JSON gains `q_unit`.
 - MS2PIP 4.2.0 in every shipped environment (`env/docker-rescore.yml`,
   `env/console-ms2pip-requirements.txt`), and `env/mumdia-deeplc.yml` now carries
   `ms2pip==4.2.0` too, so one host environment serves DeepLC, MS2PIP and the `nn_torch`
@@ -65,6 +92,207 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ### Fixed
 
+- Code review A, data integrity (`docs/29_code_review_2026-09-07.md`, findings 1, 2, 4,
+  9, 11, 17, 18, 21):
+  - quant's refusal of a pooled scored table read `source` as i32 while rescore writes
+    it as u32, treated the type error as "no such column", and so never ran on the
+    engine's own output; a pooled table quantified against one run's chromatograms
+    produced one identical row per run. The column is now read in its declared type and
+    a present column of another type is an error (#1).
+  - The streamed library loader checked fragment `mz` and `predicted_intensity` for
+    finiteness on the physical Arrow buffers, which ignore the validity bitmap, and then
+    turned NULL cells into NaN, NULL names into `""` and a NULL `candidate_id` into
+    candidate 0. Every required fragment column now rejects NULLs before its values are
+    read, through the same contract the typed getters enforce, with a fixture per
+    column (#2).
+  - `AtomicPath` removed the destination before renaming, so a failed publication had
+    already destroyed the previous artifact and readers saw a window with no file; two
+    writers for one destination in one process shared a temporary name. The rename
+    replaces in place on every platform, the temporary name carries a counter, and the
+    failure case is tested (#4).
+  - N-terminal methionine excision was skipped whenever the Met-retained peptide fell
+    outside the length window, so an N-terminal peptide of `max_len + 1` residues yielded
+    nothing although its excised form was in range. Both forms are judged on their own
+    length (#9).
+  - `rescore.max_feature_matrix_gib` was checked after the matrix had been filled,
+    against an estimate of the old `Vec<Vec<f64>>` layout, so it could neither prevent the
+    allocation nor describe it; it is now checked from the parquet footers and the
+    selected feature count before allocation, on the flat f32 layout, with checked
+    arithmetic (#11).
+  - A candidate DeepLC or MS2PIP returned nothing for received a substitute (iRT 0.0, or
+    the native intensities under an MS2PIP model identity). It is now dropped together
+    with its paired decoy or target, the counts are in the library report and a warning,
+    and a worker id that was not requested or appears twice is an error (#17).
+  - Numeric configuration domains are validated at load: thresholds and fractions within
+    their unit interval, positive multipliers and widths, ordered `min_len <= max_len` and
+    `charge_min <= charge_max`, counts at least one, with documented zero meanings kept
+    (#18). `quant.q_threshold = -0.1`, `rt_im_train.rt_window_multiplier = -1.0` and
+    `rescore.train_margin_frac = 2.0` were accepted before.
+  - `ci/gen_config_reference.py` and `ci/check_workflows.py` scan the files git tracks
+    rather than everything on disk, so scratch copies beside the sources no longer enter
+    the generated reference or the workflow check (#21).
+- Code review B, workers (`docs/29`, findings 3, 6, 7, 8, 12, 20):
+  - The entrapment worker skipped a training fold whose training side held one class
+    and then scored that fold's held-out rows with the final model, trained on those
+    very rows, so in-sample scores entered the entrapment FDR. A single-class training
+    fold is now an error that names the condition; the final model scores the decoys
+    only (#3).
+  - The MBR worker printed an "empirical decoy fraction" over accepted transfers, a
+    population that cannot contain a decoy, and computed the transfer q as
+    `null / targets`, which is exactly 0 for any pool no permuted residual undercuts, so
+    a three-candidate pool was accepted whole at 1%. The q uses the engine's `+1`
+    pseudocount and the summary names the permuted-null draws inside the accepted window
+    instead (#6, #7).
+  - With `extract.retain_top_peaks` above 1 the MBR worker measured the transfer on the
+    last competed peak of a candidate, not the one rescore selected and quant integrates;
+    it now joins `selected_peak_rank` and falls back to the highest `prelim_score` peak
+    (#8).
+  - `augment_library.py` gave every added precursor a fresh `base_peptide_id`, so an
+    added charge state or modform of an existing peptide left its peptide's competition
+    group and fold; added forms of existing sequences keep the imported id (#12).
+  - `bench/feature_selection/fs_lib.py` hashed the peptide with its `DECOY_` prefix for
+    fold assignment, splitting pairs; it hashes the base sequence, and every benchmark
+    row records the code revision, fold rule, feature count, seed and training recipe
+    (#20).
+- Code review C, desktop and output ownership (`docs/29`, findings 5, 13, 14):
+  - A repeated Start in the desktop application could launch a second engine into the
+    same results folder: the start flow had several awaits and no in-progress guard, and
+    the backend launched every request. A Start is now refused while one is in progress
+    or while the run the interface follows is still running, and the backend reserves a
+    run's results folder (by canonical path) before spawning the engine and releases it
+    when the run's end is published, so a request for an active folder is refused with
+    the owning run named (#5).
+  - `run-experiment --run-names` compared names case-sensitively, so `RunA` and `runa`
+    passed and addressed one directory on Windows, macOS and most network shares. Names
+    that differ only in case are rejected on every platform (#5).
+  - Desktop preflight asked the engine about converters without the request's
+    configuration, so a converter named in `convert.thermo_raw_parser` or
+    `convert.msconvert` was reported missing and the search refused, and it required
+    ThermoRawFileParser for Thermo `.raw` even when msconvert, the engine's own fallback
+    for a parser left at `auto`, was present. The probe now carries the configuration and
+    the verdict follows the engine's rule: only msconvert present runs, with a note; an
+    explicitly configured parser that is missing blocks, as it errors in the engine (#13).
+  - A cancelled desktop run could be published as failed. `cancel` and the process
+    waiter both wrote the terminal status and whichever ran second won, while the
+    cancellation flag was written and never read. The waiter is now the only writer: it
+    reads the intent after reaping the engine and publishes `cancelled`, `done` when the
+    engine had already finished, or `failed`; until then the run shows "Stopping" (#14).
+- Code review F, whole-repository review (`docs/31_code_review_2026-09-08_full.md`,
+  F1 to F10):
+  - `prescan` read the infinite-bounds sentinel that `rt-im-train` writes for "calibration
+    unavailable, search the whole gradient" as "cannot be screened" and dropped the
+    candidate, so a run with no confident seeds discarded the entire library and exited 0
+    with a zero-row survivors table. An unbounded window now screens over the whole
+    gradient, a candidate with no window row is treated the same, both are counted, and
+    screening every candidate away is an error (F1).
+  - A present-but-wrong-typed `is_transferred` was swallowed as "no transfers", silently
+    removing every match-between-runs identification from `peptides.tsv` and
+    `proteins.tsv` while the parquet still carried them. Present columns are read in their
+    declared type and a mismatch is an error; only an absent column falls back (F2).
+  - `sidecar::resolve_script` tried the working directory before the directory beside the
+    binary, the ordering `python::resolve_script_dir` was hardened against, so a `scripts/`
+    directory inside an untrusted dataset could have its worker executed. An absolute
+    directory is taken as given, then the executable's directory, then `<exe>/scripts`, and
+    the working directory last (F3).
+  - `Loess::predict` indexed before the start of its grid for a non-finite query, so one
+    library row with a null `predicted_irt` could abort or misread memory at rt-im-train.
+    It returns NaN, and rt-im-train treats a non-finite library iRT as "no calibrated RT"
+    and counts those rows (F4).
+  - The rescorer's in-memory TSV backend standardised with median/IQR while the parquet and
+    streaming backends used mean/std, so the same pool scored differently depending on
+    `rescore.handoff` and on the 4 GB streaming threshold. All three use mean/std, which
+    leaves the shipped parquet default and every published benchmark unchanged. The
+    `MUMDIA_NN_FOLD_KEYS` companion is length-checked instead of being sliced short, which
+    used to leave the tail rows unscored at a fabricated mid-rank score, and the estimate
+    that picks the backend counts feature columns by name (F5).
+  - `refuse_output_over_input` was wired into two of eighteen stages, so
+    `compete --features f.parquet --out f.parquet` replaced the widest artifact of the run
+    with the competed subset at exit 0. It now guards every output of `search-seed`,
+    `rt-im-train`, `extract`, `features`, `compete`, `rescore`, `quant` and `audit` (F6).
+  - The LOESS boundary extrapolation slope introduced in the previous package was the
+    pointwise local slope at the sparsest, most one-sided point of the fit: unbounded, free
+    to be negative, and multiplying an unbounded distance. It is the secant of the fitted
+    curve over its end decile, clamped non-negative and to at most four times the global
+    slope, and the test uses noisy anchors rather than a noiseless quadratic (F7).
+    Measured on HYE B01 against the previous behaviour, same library and settings: 48,533
+    stripped peptides at 1%, 53,127 PSM-q 1% targets, 6,519 protein groups and 1,961,800
+    extracted rows in both arms, identical to the row. The two extrapolations agree
+    wherever the anchors are dense and differ only outside the anchor range.
+  - A desktop stop arriving between the reap and the end of `publish_exit` could pass a
+    recycled process id to the tree kill. The waiter retires the id the instant `wait`
+    returns, before it reads the output directory (F8).
+  - The conversion lock added in the previous package spun without pause on an undeletable
+    stale lock, mistook clock skew and a peer's partial file for evidence about its own
+    holder, could be held by two processes at once, and left every interrupted conversion's
+    partial mzML behind for ever. Take-overs are bounded and paced, the holder is
+    identified by a token it reads back, a future modification time counts as fresh, the
+    partial-file probe matches this destination only, and abandoned partials are swept
+    under the lock (F9).
+  - Dropping an unpredicted candidate with everything sharing its pair key also removed
+    positional isomers that predicted correctly, bounded only by the library being emptied.
+    The direct misses and the collateral are counted separately and exceeding 2% of the
+    library is an error naming the sidecar. The key stays position-free deliberately: a
+    positional key would stop matching a reverse decoy to its target, trading a sensitivity
+    defect for an FDR one (F10).
+- Code review E, follow-up (`docs/30_code_review_2026-09-08.md`, R1 to R9):
+  - Enabling DeepLC fine-tuning with its own defaults was rejected at load, because the
+    documented automatic batch size is `finetune_batch = 0` and the new validation demanded
+    a positive batch. Only the epoch count has a lower bound now (R1; a regression from
+    review A).
+  - `run-experiment --run-names` accepted `a` and `a.`, one directory on Windows, and the
+    second run overwrote the first with exit 0. Names ending in a dot or a space, containing
+    `<>:"|?*` or a control character, or naming a Windows reserved device are rejected on
+    every platform before anything is written (R2).
+  - A desktop stop could sweep temporary files that belonged to the next run in the same
+    folder: cancellation swept after the reservation had been released, and a stop on a
+    finished run swept as well. Cancellation is now intent and kill only and inert once the
+    run is terminal; the sweep happens in the waiter, after the reap and before the release,
+    and a stop still killing finishes before the folder changes hands (R3).
+  - Two searches converting the same vendor file concurrently shared one temporary output
+    and one could publish the other's bytes. Each conversion writes a unique partial file
+    under a lock beside the destination; a concurrent converter waits and reuses the
+    result (R4).
+  - Domain checks for the numeric settings review A left unchecked: `mbr.q_anchor`,
+    `min_anchor_runs`, `extract.min_matched_fraction`, `features.bound_peak_fraction`,
+    `quant.reliable_q` and the remaining fractions, correlations, tolerances and counts (R5).
+  - The DeepLC fine-tune and re-prediction worker zipped predictions with peptidoforms
+    without checking the count and silently kept the imported iRT for anything missing. A
+    count mismatch is an error; rows that keep their imported value are counted in
+    `<lib_out>.summary.json` and the engine warns when there are any (R6).
+  - The audit's `reported` flag repeated the precursor gate, so it could read `true` next to
+    `FAILED_PEPTIDE_FDR`, and a decoy could be `REPORTED`; the flag now follows the reason,
+    a decoy past both gates is `REMOVED_DURING_REPORTING`, and a present `precursor_q` of the
+    wrong type is an error rather than a fallback (R7).
+  - The desktop results-folder reservation compared exact folders only, so a search into a
+    child of an active experiment's folder was allowed; ancestors and descendants are
+    refused, siblings are not (R8).
+  - The Windows debug binary overflowed its 1 MiB main-thread stack on `--version`; the CLI
+    runs on a thread with a 256 MiB reservation and an integration test runs the built
+    binary (R9).
+- Code review D, calibration, provenance, reporting (`docs/29`, findings 10, 15, 16, 19):
+  - LOESS retention-time calibration switched to the global least-squares line the
+    moment a query left the anchor range, while the grid just inside used the local fit,
+    and the two need not agree: on `y = 200 + 10x^2` (span 0.3) the prediction jumped
+    from 193.4 at `x = 1e-6` to 38.3 at `x = 0`, and from 1173.5 to 1018.4 at the top,
+    about 155 s discontinuities that misplaced gradient-edge peptides relative to their
+    extraction window. The map now continues the boundary local fit (its value and
+    slope) outside the range, and is continuous at both ends; the global line remains
+    only the degenerate fallback (#10). Measured on HYE B01 with the imported DIA-NN iRT
+    as the RT source and `native_tda`: 45,946 stripped peptides at `peptide_q_value` 1%
+    before, 45,957 after, at an unchanged 1.0% PSM-level decoy fraction and 6,410 protein
+    groups in both arms. 208,130 of 10.88 M candidates (1.9%) received a different window,
+    194,698 of them with iRT above the anchor range, which the global line had placed
+    past the end of the 9,000 s run; the local fit places them at 8,578 to 9,100 s, and
+    extract accepted 454 more rows from them. A second pair on the DeepLC 4.1.1
+    re-predicted precursor table (`w_rt` 414 s against 691 s): 48,533 stripped peptides in
+    both arms, PSM-q 1% targets 53,124 against 53,127 at the same decoy fraction, 6,519
+    protein groups in both, 0.2% of candidates with a different window. Neutral on both RT
+    sources, which is what a boundary correction should be.
+  - The candidate audit's `passed_precursor_fdr` gate and `FAILED_PRECURSOR_FDR` reason
+    read the PSM `q_value`; they read `precursor_q`, the unit the label names, with the
+    PSM q as a recorded fallback on tables without it. A pooled scored table (several
+    `source` values) is refused, because the audit keys on `candidate_id` and would
+    attribute the last run's fate to every run (#16).
 - Desktop: the digest fields on the Search screen (missed cleavages, peptide length,
   charge range, carbamidomethyl, oxidation) now reach the engine on the built-in
   library path. They were read only by the DIA-NN library build, so with the built-in

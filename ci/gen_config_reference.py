@@ -40,6 +40,7 @@ import ast
 import difflib
 import json
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -723,6 +724,35 @@ def reachable_enums(
 # ---------------------------------------------------------------------------
 
 
+def tracked_files(root: Path, suffix: str, fallback, recursive: bool = True) -> list[Path]:
+    """Files under `root` with `suffix` that git tracks; `fallback()` when git cannot say.
+
+    `git ls-files` is asked for `root` and the answer is filtered, so the input set of
+    this generator is the tracked source and nothing a developer left beside it.
+    """
+    try:
+        out = subprocess.run(
+            ["git", "ls-files", "-z", "--", str(root)],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            check=True,
+        ).stdout
+    except (OSError, subprocess.CalledProcessError):
+        return fallback()
+    files = []
+    for rel in out.decode("utf-8").split("\0"):
+        if not rel or not rel.endswith(suffix):
+            continue
+        path = REPO_ROOT / rel
+        if not recursive and path.parent != root:
+            continue
+        if path.is_file():
+            files.append(path)
+    if not files:
+        return fallback()
+    return sorted(files)
+
+
 def parse_profiles(text: str) -> dict[str, list[tuple[str, str]]]:
     """Extract `--profile NAME` overrides from `Config::apply_profile`."""
     m = re.search(r"pub fn apply_profile\(.*?\n    \}\n", text, re.S)
@@ -1120,10 +1150,23 @@ def build_document() -> tuple[str, dict[str, object]]:
         if not (REPO_ROOT / target).is_file():
             sys.exit(f"error: ITEM_STRUCT_DOC['{name}'] points at missing {target}")
 
-    rust_files = sorted(
-        p for p in CRATES_DIR.rglob("*.rs") if "target" not in p.parts
+    # Tracked sources only. A filesystem glob also picked up untracked scratch copies
+    # (`*-covr2.rs`, `*-covr2.py`) that sit beside the real files on a developer's
+    # machine, and their environment-variable reads then entered this document and
+    # failed `--check` in a workspace that was fine as far as git was concerned
+    # (docs/29 #21). Outside a git checkout, the release archive for instance, the
+    # glob is the only option and the archive holds tracked files only.
+    rust_files = tracked_files(
+        CRATES_DIR,
+        ".rs",
+        lambda: sorted(p for p in CRATES_DIR.rglob("*.rs") if "target" not in p.parts),
     )
-    py_files = sorted(SCRIPTS_DIR.glob("*.py"))
+    py_files = tracked_files(
+        SCRIPTS_DIR,
+        ".py",
+        lambda: sorted(SCRIPTS_DIR.glob("*.py")),
+        recursive=False,
+    )
     rust_reads, rust_sets, env_unresolved = scan_rust_env(rust_files)
     py_reads, py_sets = scan_python_env(py_files)
 

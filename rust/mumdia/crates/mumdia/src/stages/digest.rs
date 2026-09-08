@@ -83,26 +83,29 @@ fn digest_protein(seq: &[u8], cfg: &DigestConfig) -> Vec<(usize, usize, String)>
                 break;
             }
             let (start, end) = (sites[i], sites[j]);
-            let len = end - start;
-            if len < cfg.min_len || len > cfg.max_len {
-                continue;
-            }
             let sub = &seq[start..end];
-            if !sub.iter().all(|&c| is_standard_residue(c)) {
-                continue;
+            let len = end - start;
+            // The ordinary form and the Met-excised form are judged independently. The
+            // ordinary form used to be rejected with `continue`, which also skipped the
+            // excision below, so an N-terminal peptide of `max_len + 1` residues produced
+            // nothing although its excised form was in range (docs/29 #9).
+            if len >= cfg.min_len
+                && len <= cfg.max_len
+                && sub.iter().all(|&c| is_standard_residue(c))
+            {
+                out.push((start, end, String::from_utf8_lossy(sub).to_string()));
             }
-            out.push((start, end, String::from_utf8_lossy(sub).to_string()));
 
             // N-terminal methionine excision: for a peptide anchored at the
             // protein N-terminus whose first residue is the initiator Met, also
             // emit the Met-removed form (start shifted to 1). The excised peptide
-            // is re-checked against the length bounds and standard-residue rule.
-            // This mirrors DIA-NN's `--met-excision`; without it the search
+            // is checked against the length bounds and standard-residue rule on its
+            // own. This mirrors DIA-NN's `--met-excision`; without it the search
             // database cannot contain these (biologically dominant) peptides.
             if cfg.n_term_met_excision && start == 0 && seq.first() == Some(&b'M') {
                 let ex = &seq[1..end];
                 let ex_len = ex.len();
-                if ex_len >= cfg.min_len
+                if ex_len >= cfg.min_len.max(1)
                     && ex_len <= cfg.max_len
                     && ex.iter().all(|&c| is_standard_residue(c))
                 {
@@ -434,6 +437,36 @@ mod tests {
             .collect();
         assert!(peps.contains(&"MDER".to_string()), "{peps:?}");
         assert!(!peps.contains(&"DER".to_string()), "{peps:?}");
+    }
+
+    #[test]
+    fn met_excision_applies_when_only_the_excised_form_is_in_range() {
+        // MPEPTIDK is eight residues; with a length window of exactly seven the
+        // Met-retained form is too long and the excised PEPTIDK is the only valid
+        // peptide. The length rejection used to `continue` past the excision (docs/29
+        // #9), so the digest returned nothing.
+        let peps = |min_len: usize, max_len: usize| -> Vec<String> {
+            let cfg = DigestConfig {
+                missed_cleavages: 0,
+                min_len,
+                max_len,
+                n_term_met_excision: true,
+                ..Default::default()
+            };
+            digest_protein(b"MPEPTIDK", &cfg)
+                .into_iter()
+                .map(|(_, _, p)| p)
+                .collect()
+        };
+        assert_eq!(peps(7, 7), vec!["PEPTIDK".to_string()]);
+        // With room for both, both appear, Met-retained first.
+        assert_eq!(
+            peps(7, 8),
+            vec!["MPEPTIDK".to_string(), "PEPTIDK".to_string()]
+        );
+        // The excised form is judged on its own length too: at min_len 8 only the
+        // ordinary form is in range.
+        assert_eq!(peps(8, 8), vec!["MPEPTIDK".to_string()]);
     }
 
     #[test]

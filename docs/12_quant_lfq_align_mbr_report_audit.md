@@ -110,12 +110,15 @@ and one `psms.parquet` per run in `source` order. Produces `<out>.parquet`, one 
 per accepted transfer (`mbr_worker.py:254`): `candidate_id`, `source`, `peptidoform`,
 `charge`, `protein_group`, `label`, `expected_rt`, `observed_rt`, `rt_delta`,
 `transfer_q` (10 columns). When there are no transfer candidates at all the worker
-short-circuits and writes a placeholder table with a single empty `candidate_id`
-column (`pa_write_empty`, `mbr_worker.py:289`), so `<out>.parquet` always exists.
-Optionally writes an augmented scored table (`--out-psms-scored`) that lowers each accepted
-transfer's `q_value` to `min(q_value, transfer_q)` on the matching `(candidate_id,
-source)` row and adds an `is_transferred` bool (`mbr_worker.py:272`); this requires the
-scored table to carry a `source` column. All MBR outputs are written by Python and
+short-circuits and writes the same ten columns with zero rows (`write_empty_transfers`),
+and, when `--out-scored` was asked for, the scored table unchanged with `is_transferred`
+false and `transfer_q` NaN on every row (`write_unflagged_scored`), so a downstream stage
+never meets a missing file or a one-column placeholder (docs/30).
+Optionally writes an augmented scored table (`--out-scored`) that lowers each accepted
+transfer's PSM q columns to `min(q, transfer_q)` on the matching `(candidate_id,
+source)` row and adds an `is_transferred` bool plus a `transfer_q` column (the accepted
+q on transferred rows, NaN elsewhere; `mbr_worker.py`); this requires the scored table
+to carry a `source` column. All MBR outputs are written by Python and
 have no `report.json`.
 
 The unreachable re-extraction tier (`--emit-transfer-targets <dir>`) instead writes
@@ -130,8 +133,14 @@ Consumes `psms_scored.parquet` and optionally the two quant tables. The CLI take
 (`main.rs:796-797`); `run` passes the run out-dir and
 `q_threshold = quant.q_threshold` (`run.rs:484-491`). `peptides.tsv` header
 (`report.rs:95`): `precursor`, `stripped_sequence`, `charge`, `protein`,
-`q_value`, `score`, `quantity`. `proteins.tsv` header (`report.rs:134`):
-`protein_group`, `q_value`, `quantity`. No Parquet or `report.json` is written;
+`q_value`, `score`, `quantity`, `is_transferred`, `transfer_q`. `proteins.tsv` header
+(`report.rs:134`): `protein_group`, `q_value`, `quantity`, `is_transferred`,
+`transfer_q`. The last two export the acceptance basis: a row is written when it is a
+target and either its grouped q passes the threshold or it is an accepted
+match-between-runs transfer, and a transferred row keeps its grouped q (usually 1.0)
+next to the transfer q it was accepted at. A tighter threshold does not revoke a
+transfer; a transfer is not protein-group confidence (docs/29 #19). No Parquet or
+`report.json` is written;
 `report::run` returns `(n_precursors, n_protein_groups)`, and the `mumdia report`
 handler prints a one-line summary (`main.rs:806`).
 
@@ -423,9 +432,17 @@ The worker (`scripts/mbr_worker.py`) implements two tiers:
 
 The M5 augmented scored output (`--out-scored`, `mbr_worker.py:272`) requires the
 scored table to have a `source` column and matches transfers on `(candidate_id,
-source)`, taking `min(q_value, transfer_q)` and setting `is_transferred`. The worker
-prints a validation summary (accepted counts per run, empirical decoy fraction, and the
-RT window `delta_star` at `q_transfer`, `mbr_worker.py:245`).
+source)`, taking `min(q, transfer_q)` on the PSM q columns and setting `is_transferred`
+and `transfer_q`. The worker
+prints a validation summary: accepted counts per run, how many permuted-RT null draws
+fall inside the accepted RT window, and the window `delta_star` at `q_transfer`. It
+no longer prints a "decoy fraction" among accepted transfers: every transfer candidate
+is a confident target of another run, so that fraction was structurally zero and said
+nothing about calibration (docs/29 #6). The transfer q uses the engine's `+1`
+pseudocount, `(null <= delta + 1) / (targets <= delta)`, so a pool no permuted residual
+undercuts no longer gets q = 0 (docs/29 #7), and the RT residual is measured on the
+peak rescore selected (`selected_peak_rank`) when a competed table carries several
+peaks per candidate (docs/29 #8).
 
 ### report (`report.rs:49`, `run`)
 
@@ -456,16 +473,20 @@ presentation value rounded to one decimal.
 
 The search space is every library precursor (`candidate_id`, `peptidoform`, `charge`,
 `label`, `protein`). Survivor sets are built as `HashSet<u32>` of `candidate_id` from
-`psms` (extracted), `competed`, and `scored`; scored also yields `q_by_cid` and
-optional `pepq_by_cid` (peptide-level q, only present in some scored schemas,
-`audit.rs:90`). `load_extract_reasons` (`audit.rs:51`) tries to read a
+`psms` (extracted), `competed`, and `scored`; scored also yields `q_by_cid`, read from
+`precursor_q` (the unit the `passed_precursor_fdr` label names; the PSM `q_value` only
+on an older table without that column, recorded as `q_unit` in the metrics JSON;
+docs/29 #16) and optional `pepq_by_cid` (peptide-level q, only present in some scored
+schemas). A scored table with more than one `source` is refused: the audit keys on
+`candidate_id`, so a pooled table would attribute one run's fate to every run; audit
+the per-run split tables. `load_extract_reasons` (`audit.rs:51`) tries to read a
 `<psms>.audit.parquet` sidecar to refine the extract-stage bucket, but nothing in the
 current chain writes that file (see the gotchas), so the map is empty and every
-extract-stage loss buckets to `NO_PEAK_GROUP`. For each candidate the earliest
+extract-stage loss buckets to `DID_NOT_SURVIVE_EXTRACTION`. For each candidate the earliest
 rejection reason is assigned along the ladder (`audit.rs:136`):
 - not in `extracted` -> refined from the sidecar
   (`NO_FRAGMENT_TRACES`/`NO_VALID_FRAGMENTS`/`PEAK_NOT_SELECTED`/`RT_PRUNED`/
-  `WRONG_ISOLATION_WINDOW`, `audit.rs:139`) or the generic `NO_PEAK_GROUP` when no
+  `WRONG_ISOLATION_WINDOW`, `audit.rs:139`) or the generic `DID_NOT_SURVIVE_EXTRACTION` when no
   sidecar (the only outcome today);
 - extracted but not in `competed` -> `OUTCOMPETED_BY_DECOY` (decoy) or
   `OUTCOMPETED_BY_TARGET` (target);
@@ -516,7 +537,7 @@ FDR/reporting).
 | `run_mbr` | sidecar.rs:162 | build argv and spawn `mbr_worker.py` |
 | `binned_map` | mbr_worker.py:31 | monotone binned-median RT calibration |
 | `expected_rt` | mbr_worker.py:116 | cross-run predicted RT for a candidate in a run |
-| `pa_write_empty` | mbr_worker.py:289 | placeholder output when there are no transfer candidates |
+| `write_empty_transfers` / `write_unflagged_scored` | mbr_worker.py | full-schema outputs when there are no transfer candidates |
 | `ReportParams` / `report::run` | report.rs:13 / 49 | TSV writer |
 | `strip` | report.rs:24 | stripped sequence from a peptidoform |
 | `qcell` | report.rs:39 | quantity cell formatting (1 decimal; empty on NaN) |
@@ -629,19 +650,23 @@ but do not affect the wired `mumdia mbr` path.
   `traces_extracted` are all set from the same `traces` flag (`audit.rs:170`) because
   the artifacts only record presence in `psms`; the (not-yet-written) in-extract sidecar
   would be the only way to split "no traces" from "traces but no accepted peak".
-- **audit `reported` vs `REPORTED`.** The `reported` bool column is set from
-  `passed_prec` alone (`audit.rs:176`), while the `REPORTED` rejection reason additionally
-  requires the peptide gate. A candidate can therefore have `reported=true` yet
-  `rejection_reason=FAILED_PEPTIDE_FDR`. Treat `rejection_reason` as authoritative.
+- **audit `reported` and `REPORTED` agree.** The `reported` bool is `rejection_reason ==
+  REPORTED`: a target that passed the precursor and the peptide gate. A decoy that passes
+  both is `REMOVED_DURING_REPORTING`, because the report never writes a decoy. The two
+  gate columns (`passed_precursor_fdr`, `passed_peptide_fdr`) remain the diagnostics.
+  Until docs/30 R7 the flag repeated the precursor gate alone, so a row could read
+  `reported=true` next to `FAILED_PEPTIDE_FDR`, and a decoy could be `REPORTED`. A present
+  `precursor_q` column of the wrong type is an error; only an absent column falls back to
+  the PSM `q_value` (recorded as `q_unit`).
 - **audit reason coverage.** In the current chain `audit.rs` can only ever emit
-  `NO_PEAK_GROUP`, `OUTCOMPETED_BY_TARGET`/`OUTCOMPETED_BY_DECOY`, `FAILED_PRECURSOR_FDR`,
+  `DID_NOT_SURVIVE_EXTRACTION`, `OUTCOMPETED_BY_TARGET`/`OUTCOMPETED_BY_DECOY`, `FAILED_PRECURSOR_FDR`,
   `FAILED_PEPTIDE_FDR`, and `REPORTED`. The five refined extract codes
   (`NO_FRAGMENT_TRACES`, `NO_VALID_FRAGMENTS`, `PEAK_NOT_SELECTED`, `RT_PRUNED`,
   `WRONG_ISOLATION_WINDOW`) are matched by `load_extract_reasons` (`audit.rs:139`) but
   need the absent sidecar to fire. The six remaining enum variants
   (`PEPTIDE_NOT_GENERATED`, `MODIFICATION_NOT_ALLOWED`, `CHARGE_OUT_OF_RANGE`,
   `PRECURSOR_MZ_OUT_OF_RANGE`, `CANDIDATE_CAP_REACHED`, `REMOVED_DURING_REPORTING`) have
-  no producer at all: even a sidecar string of that name falls to the `_ => NoPeakGroup`
+  no producer at all: even a sidecar string of that name falls to the `_ => DidNotSurviveExtraction`
   arm (`audit.rs:145`).
 - **report.json coverage is partial.** `quant` writes reports for
   `peptide_quant`, `protein_quant`, and emitted `fragment_quant`; the peak-bounds

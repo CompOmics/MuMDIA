@@ -155,8 +155,10 @@ code.
 - OUT `<out>.parquet`: one row per accepted transfer with
   `candidate_id, source, peptidoform, charge, protein_group, label, expected_rt,
   observed_rt, rt_delta, transfer_q` (`mbr_worker.py:254-265`). Optional
-  `--out-scored` writes the scored table with accepted transfers' `q_value`
-  lowered to `transfer_q` and an `is_transferred` flag added. Optional
+  `--out-scored` writes the scored table with accepted transfers' PSM q columns
+  lowered to `transfer_q`, an `is_transferred` flag and a `transfer_q` column (NaN
+  on non-transferred rows) added; with no transfer candidates the transfer table has
+  its ten columns and zero rows and the augmented table is the input, unflagged. Optional
   `--emit-transfer-targets` writes per-run `run_windows`-format tables
   (`candidate_id, rt_pred_cal, rt_lo, rt_hi, im_*`) plus a permuted-RT decoy file
   for the re-extraction tier (`mbr_worker.py:142-151`).
@@ -207,10 +209,12 @@ MS2PIP charge-1 (TIC-fraction, ~0.02-0.3) and the native charge-2 fallback
 top-N would bury MS2PIP, so each charge group is max-normalized to its own peak
 before they compete (`predict_frag.rs:365-384`). Two native-fallback edge cases:
 `run_ms2pip` returning an empty map is a hard error (`bail!("MS2PIP returned no
-predictions")`, `predict_frag.rs:342-344`), while a single candidate that MS2PIP
-returned nothing for (missing/empty per-id entry) falls back wholesale to the
-native intensities for that candidate (`predict_frag.rs:387-389`). The
-worker builds `psm_utils.PSMList` in chunks of `max(100k, 20k x processes)` rows,
+predictions")`), while a single candidate that MS2PIP returned nothing for
+(missing/empty per-id entry) is dropped from the library together with its pair
+(`drop_unpredicted`; docs/29 #17) instead of falling back to the native intensities
+under an MS2PIP model identity. `run_ms2pip` rejects an id it did not request and a
+fragment reported twice. The worker builds `psm_utils.PSMList` in chunks of
+`max(100k, 5k x processes)` rows,
 calls `ms2pip.predict_batch(model, processes=N)` with `N` the engine's thread count
 passed as the fourth argument (the old cap `min(8, cpu_count)` applies only when the
 argument is absent), and converts MS2PIP's log2 intensities to linear via
@@ -224,9 +228,11 @@ start method safe for multiprocessing.
 **DeepLC predict** (`predict_frag.rs:274-312`, worker `deeplc_worker.py`).
 Selected by `predict_frag.rt_predictor = "deeplc"`. `assign_rt` deduplicates by
 peptidoform (RT is charge-independent, `predict_frag.rs:281-290`), calls
-`run_deeplc`, and writes `r.irt`. Peptidoforms with no returned iRT are anchored
-at `0.0` with a warning (`predict_frag.rs:293-308`; this is the "unmatched
-peptidoforms silently get iRT 0.0" foot-gun noted in CLAUDE.md). The worker calls
+`run_deeplc`, and writes `r.irt`. Peptidoforms with no returned iRT are dropped
+from the library with their pairs and counted in the library report (they used to
+be anchored at `0.0` with a warning, the "unmatched peptidoforms silently get iRT
+0.0" foot-gun; docs/29 #17). `run_deeplc` rejects an id it did not request and a
+duplicate id. The worker calls
 `deeplc.predict` in 200k chunks and, when the multitask model returns an
 ensemble matrix `(N, n_models)`, averages across models (`deeplc_worker.py:44-47`).
 Predictions are uncalibrated; rt-im-train's per-run LOESS/linear maps them onto
@@ -327,9 +333,9 @@ rescorer or `native_tda` (`rescore.rs:217-276`). `classify_entrapment`
 marker, does not contain `entrapment_exclude`, and matches none of
 `entrapment_contaminant_markers`. The worker trains real-target (positive) vs
 spike-in (negative), decoys excluded from training (`entrapment_worker.py:80-83`),
-out-of-fold with `GroupKFold` grouped by `base_peptide_id`
-(`entrapment_worker.py:93-101`); a final model fit on all non-decoy PSMs scores
-decoys and any single-class-fold gaps (`:103-108`). Model is `gbm`
+out-of-fold with `GroupKFold` grouped by `base_peptide_id`; a training fold with a
+single class is an error, never a gap filled with in-sample scores (docs/29 #3), and
+a final model fit on all non-decoy PSMs scores the decoys only. Model is `gbm`
 (`HistGradientBoostingClassifier`, `early_stopping=False` so `random_state=0` is
 reproducible) or `nn` (StandardScaler + MLP pipeline) via
 `MUMDIA_ENTRAPMENT_MODEL` (`entrapment_worker.py:28-60`). The rationale: spike-in
