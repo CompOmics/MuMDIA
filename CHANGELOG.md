@@ -7,6 +7,14 @@ All notable changes to MuMDIA are recorded here. The format follows
 `0.1.0` is the first tagged release of the Rust engine. The superseded
 Python implementation remains available at the tag `legacy-python-v1`.
 
+`0.2.0` is a minor rather than a patch release: it changes behaviour a user can
+see. The default MS2PIP model is `HCDch2`, configurations with out-of-range
+numeric values are refused at load instead of running, both TSV reports gain two
+columns, the candidate-audit rejection code `NO_PEAK_GROUP` is
+`DID_NOT_SURVIVE_EXTRACTION`, a candidate no predictor covered is dropped rather
+than given a substitute value, and a stage refuses to write its output over one of
+its own inputs.
+
 Two things are versioned independently of this file and matter when reading old
 results: the per-artifact Parquet schema versions in
 `rust/mumdia/crates/mumdia-core/src/schema.rs`, and the feature-set identity
@@ -14,6 +22,14 @@ results: the per-artifact Parquet schema versions in
 than a number. Both are recorded in every run's `manifest.json`.
 
 ## [Unreleased]
+
+## [0.2.0] - 2026-09-08
+
+Three code reviews and their fixes (`docs/29_code_review_2026-09-07.md`,
+`docs/30_code_review_2026-09-08.md`, `docs/31_code_review_2026-09-08_full.md`),
+the MS2PIP charge-2 library path, and the desktop settings work. Validated on the
+six-file HYE benchmark end to end: 80,803 experiment-wide stripped peptides at 1%
+at a 1.00% decoy fraction.
 
 ### Added
 
@@ -177,6 +193,15 @@ than a number. Both are recorded in every run's `manifest.json`.
     cancellation flag was written and never read. The waiter is now the only writer: it
     reads the intent after reaping the engine and publishes `cancelled`, `done` when the
     engine had already finished, or `failed`; until then the run shows "Stopping" (#14).
+- The committed CycloneDX SBOM, which ships in every release archive, referenced
+  `pkg:cargo/mumdia-core` and `pkg:cargo/mumdia-io` in its dependency graph while
+  excluding them from its component list, so it failed validation and `--check`
+  regenerated the same broken document. Only the application crate is excluded now,
+  because `metadata.component` describes it (`docs/31` F11).
+- The desktop DIA-NN cache-key test used a fixed temporary directory and deleted it on
+  entry, so two `cargo test` runs on one machine raced and one lost its fixture
+  mid-test. It is unique per process, like every other temporary fixture in the
+  workspace (`docs/14`).
 - Code review F, whole-repository review (`docs/31_code_review_2026-09-08_full.md`,
   F1 to F10):
   - `prescan` read the infinite-bounds sentinel that `rt-im-train` writes for "calibration
