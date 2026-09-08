@@ -133,6 +133,30 @@ instead, and a test pins the trade so a future change has to argue with it.
 and the staleness rules cover the reproduced failure. Two different conversion recipes
 aimed at one destination name remain a documented limitation of writing beside the input.
 
+### F7 merge check
+
+HYE B01 on doxy, the same arm as the docs/29 #10 pair 2: the DeepLC 4.1.1 re-predicted
+precursor table, `rt_im_train.library_irt = library` so no DeepLC draw, `native_tda`, 32
+threads, one binary changed. The comparison arm is the package-D head, whose pointwise
+boundary slope this replaces.
+
+| | package D (pointwise slope) | package F (clamped end-decile secant) |
+|---|---|---|
+| stripped peptides at `peptide_q_value` 1% | 48,533 | 48,533 |
+| PSM-q 1% targets | 53,127 | 53,127 |
+| PSM-q 1% decoy fraction | 0.010 | 0.010 |
+| protein groups at `pg_q_value` 1% | 6,519 | 6,519 |
+| extract accepted rows | 1,961,800 | 1,961,800 |
+| `w_rt`, in-sample residual median | 414 s, 78.3 s | 414 s, 78.3 s |
+| wall (32 threads) | 25:46 | 24:38 |
+
+Identical on every count, which is the expected result and the reason the change is safe:
+both extrapolations are continuous at the boundary and agree closely wherever the anchors
+are dense, and they differ only for queries outside the anchor range, where this benchmark
+has almost nothing. The guard exists for the case the counts cannot show, a sparse or noisy
+boundary window producing a negative or several-times-global slope, which the unit test
+covers directly on noisy anchors.
+
 ## F11: the second tier, not in package F
 
 Recorded for a later pass, in rough order of value:

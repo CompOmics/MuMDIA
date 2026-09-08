@@ -214,6 +214,10 @@ than a number. Both are recorded in every run's `manifest.json`.
     to be negative, and multiplying an unbounded distance. It is the secant of the fitted
     curve over its end decile, clamped non-negative and to at most four times the global
     slope, and the test uses noisy anchors rather than a noiseless quadratic (F7).
+    Measured on HYE B01 against the previous behaviour, same library and settings: 48,533
+    stripped peptides at 1%, 53,127 PSM-q 1% targets, 6,519 protein groups and 1,961,800
+    extracted rows in both arms, identical to the row. The two extrapolations agree
+    wherever the anchors are dense and differ only outside the anchor range.
   - A desktop stop arriving between the reap and the end of `publish_exit` could pass a
     recycled process id to the tree kill. The waiter retires the id the instant `wait`
     returns, before it reads the output directory (F8).
