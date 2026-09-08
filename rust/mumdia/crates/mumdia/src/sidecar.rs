@@ -17,27 +17,43 @@ pub type FragmentIntensityMap = HashMap<u32, HashMap<(u8, u16, u8), f32>>;
 
 /// Resolve a sidecar worker script path so a deployed binary finds its workers
 /// regardless of the working directory: try the configured dir relative to the
-/// CWD, then relative to the binary's own directory, then `<exe_dir>/scripts`.
-/// Falls back to the CWD-relative path (so the eventual error names it) if none
-/// of those exist.
+/// the binary's own directory, then `<exe_dir>/scripts`, and the current working
+/// directory LAST. Falls back to the directory-relative path (so the eventual error
+/// names it) if none of those exist.
+///
+/// The working directory used to be tried first. `python::resolve_script_dir` was
+/// reordered away from exactly that and documents why at length: the shipped default is
+/// the relative `"scripts"`, which both sidecar example configs carry, so unpacking a
+/// dataset archive, `cd`-ing into it and running with an example config executed any
+/// worker the archive happened to contain. That resolver only claims a directory holding
+/// `mbr_worker.py` or `deeplc_worker.py`, so a directory with any of the other ten
+/// workers reached this function still relative, and this function ran it (docs/31 F3).
+/// An absolute directory is taken as given: naming one is how a user is unambiguous.
 pub fn resolve_script(dir: &str, worker: &str) -> String {
-    let cwd_rel = format!("{dir}/{worker}");
-    if std::path::Path::new(&cwd_rel).exists() {
-        return cwd_rel;
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|e| e.parent().map(|p| p.to_path_buf()));
+    resolve_script_in(dir, worker, exe_dir.as_deref())
+}
+
+/// [`resolve_script`] with the executable's directory supplied, so the ordering can be
+/// tested without a second binary.
+fn resolve_script_in(dir: &str, worker: &str, exe_dir: Option<&std::path::Path>) -> String {
+    let dir_rel = format!("{dir}/{worker}");
+    if std::path::Path::new(dir).is_absolute() {
+        return dir_rel;
     }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(base) = exe.parent() {
-            for cand in [
-                base.join(dir).join(worker),
-                base.join("scripts").join(worker),
-            ] {
-                if cand.exists() {
-                    return cand.to_string_lossy().into_owned();
-                }
+    if let Some(base) = exe_dir {
+        for cand in [
+            base.join(dir).join(worker),
+            base.join("scripts").join(worker),
+        ] {
+            if cand.exists() {
+                return cand.to_string_lossy().into_owned();
             }
         }
     }
-    cwd_rel
+    dir_rel
 }
 
 /// MS2PIP: predict singly-charged b/y intensities per (peptidoform, charge).
@@ -439,4 +455,68 @@ fn run_worker(python: &str, script: &str, args: &[&str], utf8: bool) -> Result<(
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod resolve_tests {
+    use super::resolve_script_in;
+    use std::path::Path;
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("mumdia_resolve_{}_{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn the_shipped_directory_beside_the_binary_wins_over_the_working_directory() {
+        // docs/31 F3. Both locations hold a worker of the same name; the one that ships
+        // with the binary must win, because the working directory can be an untrusted
+        // dataset the user merely unpacked and `cd`-ed into.
+        let exe = scratch("exe");
+        std::fs::create_dir_all(exe.join("scripts")).unwrap();
+        std::fs::write(exe.join("scripts").join("ms2pip_worker.py"), b"# shipped").unwrap();
+        let got = resolve_script_in("scripts", "ms2pip_worker.py", Some(&exe));
+        assert_eq!(
+            got,
+            exe.join("scripts")
+                .join("ms2pip_worker.py")
+                .to_string_lossy()
+        );
+        assert_ne!(got, "scripts/ms2pip_worker.py");
+        let _ = std::fs::remove_dir_all(&exe);
+    }
+
+    #[test]
+    fn an_absolute_directory_is_taken_as_given() {
+        let abs = if cfg!(windows) {
+            "C:/opt/mumdia/scripts"
+        } else {
+            "/opt/mumdia/scripts"
+        };
+        let exe = scratch("abs");
+        std::fs::create_dir_all(exe.join("scripts")).unwrap();
+        std::fs::write(exe.join("scripts").join("mbr_worker.py"), b"# shipped").unwrap();
+        assert_eq!(
+            resolve_script_in(abs, "mbr_worker.py", Some(&exe)),
+            format!("{abs}/mbr_worker.py"),
+            "naming a directory outright is how a user is unambiguous"
+        );
+        let _ = std::fs::remove_dir_all(&exe);
+    }
+
+    #[test]
+    fn nothing_beside_the_binary_falls_back_to_the_relative_path_for_the_error() {
+        let exe = scratch("empty");
+        assert_eq!(
+            resolve_script_in("scripts", "deeplc_worker.py", Some(&exe)),
+            "scripts/deeplc_worker.py"
+        );
+        assert_eq!(
+            resolve_script_in("scripts", "deeplc_worker.py", None::<&Path>),
+            "scripts/deeplc_worker.py"
+        );
+        let _ = std::fs::remove_dir_all(&exe);
+    }
 }

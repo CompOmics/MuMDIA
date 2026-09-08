@@ -112,6 +112,14 @@ pub fn run(p: RescoreParams) -> Result<u64> {
     if p.competed.is_empty() {
         anyhow::bail!("rescore requires at least one competed input");
     }
+    // `--out` must not be one of the competed tables: they are read before the scored
+    // table is published, so writing over one replaces it and exits 0 (docs/31 F6).
+    let competed_inputs: Vec<(&str, &str)> = p
+        .competed
+        .iter()
+        .map(|c| ("--competed", c.as_str()))
+        .collect();
+    mumdia_io::refuse_output_over_input(p.out, &competed_inputs)?;
     if p.cfg.folds < 2 {
         anyhow::bail!("rescore.folds must be >= 2 for out-of-fold scoring");
     }

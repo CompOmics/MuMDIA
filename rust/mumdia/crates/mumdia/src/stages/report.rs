@@ -10,7 +10,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use mumdia_io::table::TableFile;
 
 pub struct ReportParams<'a> {
@@ -47,6 +47,41 @@ fn qcell(q: f64) -> String {
     }
 }
 
+/// The match-between-runs acceptance basis of every row: the flag and the q it was
+/// accepted at, or all-false and all-NaN when the table has never been through
+/// `mumdia mbr`.
+///
+/// Absent means absent; present means readable. A present column of the wrong type used
+/// to be swallowed by an `Err(_) => vec![false; n]` arm, so a boolean written as a
+/// nullable dtype or as int8 (which `mbr_worker.py` writes through pandas) silently
+/// removed EVERY transfer from both TSVs at exit 0, indistinguishable from an MBR run
+/// that transferred nothing while the parquet still showed them (docs/31 F2). This is the
+/// absent-versus-malformed rule `quant` and `audit` already follow.
+fn transfer_columns(t: &TableFile, n: usize) -> Result<(Vec<bool>, Vec<f64>)> {
+    let flag = if t.has_column("is_transferred") {
+        t.bool("is_transferred").with_context(|| {
+            "report: `is_transferred` is present but not a boolean column; it is written by \
+             `mumdia mbr` and decides which rows are reported"
+        })?
+    } else {
+        vec![false; n]
+    };
+    let q = if t.has_column("transfer_q") {
+        t.f64("transfer_q")
+            .with_context(|| "report: `transfer_q` is present but not a float column")?
+    } else {
+        vec![f64::NAN; n]
+    };
+    if flag.len() != n || q.len() != n {
+        anyhow::bail!(
+            "report: the transfer columns have {} and {} rows against {n} scored rows",
+            flag.len(),
+            q.len()
+        );
+    }
+    Ok((flag, q))
+}
+
 /// Write peptides.tsv + proteins.tsv from a scored PSM table. Returns
 /// (n_peptides, n_protein_groups) at the FDR threshold.
 pub fn run(p: ReportParams) -> Result<(u64, u64)> {
@@ -65,10 +100,7 @@ pub fn run(p: ReportParams) -> Result<(u64, u64)> {
     // this stage filters on, so without this a `mumdia mbr` followed by `mumdia report`
     // showed no transfers at all. Same contract as `quant`: a transfer has already
     // passed `mbr.q_transfer`, and a decoy is still never reported.
-    let is_transferred: Vec<bool> = match t.bool("is_transferred") {
-        Ok(v) => v,
-        Err(_) => vec![false; n],
-    };
+    let (is_transferred, transfer_q) = transfer_columns(&t, n)?;
     let accepted =
         |i: usize, q: &[f64]| label[i] == "target" && (is_transferred[i] || q[i] <= p.q_threshold);
     // The acceptance basis is exported with every row (`is_transferred`, `transfer_q`),
@@ -77,10 +109,6 @@ pub fn run(p: ReportParams) -> Result<(u64, u64)> {
     // already passed `mbr.q_transfer` (docs/29 #19). A transfer is a peptide-level
     // acceptance and not protein-group confidence; a group admitted through one carries
     // the flag so a reader can tell.
-    let transfer_q: Vec<f64> = match t.f64("transfer_q") {
-        Ok(v) => v,
-        Err(_) => vec![f64::NAN; n],
-    };
     let transfer_cells = |i: usize| -> String {
         if is_transferred[i] {
             let q = if transfer_q[i].is_nan() {
@@ -257,10 +285,7 @@ pub fn run_experiment(p: ExperimentReportParams) -> Result<(u64, u64)> {
     let source = t.u32("source")?;
     let run_q = t.f64("run_psm_q")?;
     let n = t.nrows;
-    let is_transferred: Vec<bool> = match t.bool("is_transferred") {
-        Ok(v) => v,
-        Err(_) => vec![false; n],
-    };
+    let (is_transferred, transfer_q) = transfer_columns(&t, n)?;
     let accepted =
         |i: usize, q: &[f64]| label[i] == "target" && (is_transferred[i] || q[i] <= p.q_threshold);
     // The acceptance basis is exported with every row (`is_transferred`, `transfer_q`),
@@ -269,10 +294,6 @@ pub fn run_experiment(p: ExperimentReportParams) -> Result<(u64, u64)> {
     // already passed `mbr.q_transfer` (docs/29 #19). A transfer is a peptide-level
     // acceptance and not protein-group confidence; a group admitted through one carries
     // the flag so a reader can tell.
-    let transfer_q: Vec<f64> = match t.f64("transfer_q") {
-        Ok(v) => v,
-        Err(_) => vec![f64::NAN; n],
-    };
     let transfer_cells = |i: usize| -> String {
         if is_transferred[i] {
             let q = if transfer_q[i].is_nan() {
@@ -767,6 +788,69 @@ mod tests {
         )
         .unwrap();
         path
+    }
+
+    #[test]
+    fn a_malformed_transfer_column_is_an_error_not_a_silent_loss_of_every_transfer() {
+        // docs/31 F2: `mbr_worker.py` writes `is_transferred` through pandas, so a
+        // nullable dtype or int8 0/1 reaches this stage. The old `Err(_) => vec![false; n]`
+        // arm turned that into "no transfers", removing every match-between-runs
+        // identification from both TSVs at exit 0 while the parquet still showed them.
+        let path = tmp("scored_int_flag.parquet");
+        write_table(
+            &path,
+            vec![
+                Col::Str("peptidoform".into(), vec!["PEPTIDEK".into()]),
+                Col::I32("charge".into(), vec![2]),
+                Col::Str("protein".into(), vec!["P1".into()]),
+                Col::Str("label".into(), vec!["target".into()]),
+                Col::F64("peptide_q_value".into(), vec![0.5]),
+                Col::Str("protein_group".into(), vec!["PG1".into()]),
+                Col::F64("pg_q_value".into(), vec![0.5]),
+                Col::F64("score".into(), vec![1.0]),
+                // The flag as an integer, which is what a pandas round-trip can produce.
+                Col::I32("is_transferred".into(), vec![1]),
+                Col::F64("transfer_q".into(), vec![0.004]),
+            ],
+        )
+        .unwrap();
+        let out = tmp("report_badflag");
+        std::fs::create_dir_all(&out).unwrap();
+        let e = run(ReportParams {
+            scored: &path,
+            peptide_quant: None,
+            protein_quant: None,
+            out_peptides: &format!("{out}/peptides.tsv"),
+            out_proteins: &format!("{out}/proteins.tsv"),
+            q_threshold: 0.01,
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("is_transferred"), "{e}");
+    }
+
+    #[test]
+    fn a_table_that_never_saw_mbr_reports_no_transfers_without_complaint() {
+        // The absent case stays absent: `mumdia report` on a plain scored table must not
+        // start demanding columns only `mumdia mbr` writes.
+        let scored = scored_table();
+        let out = tmp("report_nombr");
+        std::fs::create_dir_all(&out).unwrap();
+        let (n_pep, _) = run(ReportParams {
+            scored: &scored,
+            peptide_quant: None,
+            protein_quant: None,
+            out_peptides: &format!("{out}/peptides.tsv"),
+            out_proteins: &format!("{out}/proteins.tsv"),
+            q_threshold: 0.01,
+        })
+        .unwrap();
+        assert_eq!(n_pep, 2);
+        let text = std::fs::read_to_string(format!("{out}/peptides.tsv")).unwrap();
+        for line in text.lines().skip(1) {
+            let c: Vec<&str> = line.split('\t').collect();
+            assert_eq!((c[7], c[8]), ("false", ""));
+        }
     }
 
     #[test]

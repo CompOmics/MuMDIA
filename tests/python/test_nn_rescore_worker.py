@@ -237,6 +237,32 @@ def test_explicit_fold_keys_pair_a_target_with_its_decoy():
     assert hashed[0] != hashed[1]
 
 
+def test_a_short_fold_key_file_is_refused_rather_than_leaving_rows_unfolded():
+    """A fold-key companion shorter than the PIN must stop the run.
+
+    Numpy slicing past the end returns a SHORT array instead of raising, and a short
+    `fold` puts the tail rows in no fold at all: `np.where(fold == f)` cannot reach
+    them, they are never scored, and they keep the zero initialiser, which the final
+    rank-normalisation turns into a plausible tied mid-rank score. The Rust caller's
+    completeness contract is satisfied by that, so `rescore.strict` does not catch it
+    either (docs/31 F5).
+    """
+    w = _import_worker()
+    np = pytest.importorskip("numpy")
+
+    keys = np.arange(6, dtype=np.uint32)
+    peptides = [f"p{i}" for i in range(10)]
+    with pytest.raises(SystemExit) as exc:
+        w.folds_for(peptides, keys, 3)
+    assert "MUMDIA_NN_FOLD_KEYS" in str(exc.value)
+    # A companion that covers the rows is unaffected, at an offset too.
+    full = np.arange(10, dtype=np.uint32)
+    assert len(w.folds_for(peptides, full, 3)) == 10
+    assert len(w.folds_for(peptides[7:], full, 3, off=7)) == 3
+    with pytest.raises(SystemExit):
+        w.folds_for(peptides[7:], keys, 3, off=7)
+
+
 def test_fold_keys_respect_the_streaming_row_offset():
     """The chunked backend passes a flat row offset; the keys must be sliced by it.
 

@@ -32,6 +32,10 @@ pub struct CompeteParams<'a> {
 
 pub fn run(p: CompeteParams) -> Result<u64> {
     let t0 = Instant::now();
+    // `--out` must not be one of this stage's own inputs: every input is read
+    // before the output is published, so writing over one replaces it and exits 0
+    // (docs/31 F6). The shared guard existed and was wired into two stages.
+    mumdia_io::refuse_output_over_input(p.out, &[("--features", p.features)])?;
     // Footer-only open. The key columns below stream one at a time and the feature columns
     // (hundreds of them) are never materialised: the previous path read the whole features
     // table into Arrow and then copied every column into an owned Vec, so compete held two
@@ -538,6 +542,44 @@ fn resolve_competition(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn writing_the_output_over_the_input_is_refused() {
+        // docs/31 F6: the features table is opened footer-only and streamed, so the read
+        // completes before `AtomicPath::publish` renames over it. Nothing errored: the
+        // widest artifact of the run, hundreds of columns and gigabytes on a real library,
+        // was replaced by the competed subset at exit 0, recoverable only by re-running
+        // extract and features.
+        let dir = std::env::temp_dir().join(format!("mumdia_compete_guard_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let features = dir.join("features.parquet");
+        mumdia_io::table::write_table(
+            features.to_str().unwrap(),
+            vec![mumdia_io::table::Col::U32(
+                "candidate_id".into(),
+                vec![1, 2],
+            )],
+        )
+        .unwrap();
+        let cfg = mumdia_core::config::CompeteConfig::default();
+        let e = run(CompeteParams {
+            features: features.to_str().unwrap(),
+            out: features.to_str().unwrap(),
+            cfg: &cfg,
+            config_hash: "h",
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("its own input"), "{e}");
+        assert!(
+            mumdia_io::table::TableFile::open(features.to_str().unwrap())
+                .unwrap()
+                .nrows
+                == 2,
+            "the input must still be there"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn one_group(members: Vec<usize>) -> HashMap<(u32, u8, i64, i32), Vec<usize>> {
         let mut g = HashMap::new();

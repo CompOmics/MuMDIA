@@ -208,8 +208,10 @@ The math:
   contribute. If the weighted system is degenerate, meaning `sw < 1e-12` (all
   weights vanished) or `sw*swxx - swx^2` near zero (calibrate.rs:146-149), it
   falls back to the global line.
-- **`Loess::predict`** (calibrate.rs:87-102) uses the linear fallback for `x` at or
-  outside the grid ends, and also when the grid has fewer than 2 nodes
+- **`Loess::predict`** (calibrate.rs:87-102) returns NaN for a non-finite `x` (a null
+  library iRT reads as NaN, and interpolating it used to index before the start of the
+  grid; docs/31 F4), extrapolates from the nearer grid end for `x` outside the range,
+  uses the linear fallback when the grid has fewer than 2 nodes
   (calibrate.rs:89-94), and otherwise linearly interpolates between the two
   bracketing grid nodes found by `partition_point` (calibrate.rs:95-101). When the
   two bracketing nodes are within `1e-12` in `x` it returns the lower node's `y`
@@ -514,9 +516,14 @@ cheaper option with equal RT residuals on the one run measured here.
 | `candidate_window` | rt_im_train.rs:65-70 | Builds `(cal, lo, hi)`; returns `(NaN, -inf, +inf)` when calibrated RT or width is absent. |
 | `rt_im_train::run` | rt_im_train.rs:72-354 | The stage: join iRT, select anchors, fit, window, apply, write. |
 | `linear_fit` | calibrate.rs:6-28 | OLS `y = slope*x + intercept` with degenerate-case guards. |
-| `Loess` | calibrate.rs:31-37 | Grid-based local-linear smoother; carries the boundary local slopes for extrapolation and the global line as the degenerate fallback. |
+| `Loess` | calibrate.rs:31-37 | Grid-based local-linear smoother; carries the two boundary extrapolation slopes and the global line as the degenerate fallback. |
 | `Loess::fit` | calibrate.rs:42-83 | Sorts anchors, builds a `grid_n`-point local-linear grid, `k = clamp(ceil(span*n),3,n)`. |
-| `Loess::predict` | calibrate.rs:87-102 | Grid interpolation inside range; outside it, the boundary grid value continued with the boundary local slope, so the map is continuous at both ends. Until docs/29 #10 it switched to the global line there, which on `y = 200 + 10x^2` (span 0.3) jumped from 193.4 to 38.3 at `x = 0` and from 1173.5 to 1018.4 at the top: about 155 s discontinuities for gradient-edge peptides. Measured on HYE B01 with the imported iRT and `native_tda`: 45,946 stripped peptides at 1% before, 45,957 after, decoy fraction unchanged; 1.9% of candidates got a different window, almost all with iRT above the anchor range, which the global line had placed past the end of the run. With the DeepLC 4.1.1 re-predicted precursors (`w_rt` 414 s): 48,533 in both arms, 0.2% of windows moved. |
+| `Loess::predict` | calibrate.rs:87-102 | NaN for a non-finite query (docs/31 F4). Grid interpolation inside range; outside it, the boundary grid value continued with the boundary extrapolation slope, so the map is continuous at both ends. Until docs/29 #10 it switched to the global line there, which on `y = 200 + 10x^2` (span 0.3) jumped from 193.4 to 38.3 at `x = 0` and from 1173.5 to 1018.4 at the top: about 155 s discontinuities for gradient-edge peptides. The extrapolation slope is the
+secant of the fitted curve over its end decile, clamped non-negative and to at most four
+times the global slope: the pointwise local slope it first used comes from the sparsest,
+most one-sided window in the fit, and on noisy anchors it was free to be negative (which
+inverts the iRT-to-RT map) or several times the global slope, multiplying a distance that
+is unbounded by construction (docs/31 F7). Measured on HYE B01 with the imported iRT and `native_tda`: 45,946 stripped peptides at 1% before, 45,957 after, decoy fraction unchanged; 1.9% of candidates got a different window, almost all with iRT above the anchor range, which the global line had placed past the end of the run. With the DeepLC 4.1.1 re-predicted precursors (`w_rt` 414 s): 48,533 in both arms, 0.2% of windows moved. |
 | `local_linear` | calibrate.rs:107-153 | Tricubic-weighted local least squares at one point. |
 | `percentile` | calibrate.rs:156-164 | Nearest-rank percentile: sorts a copy, `rank = round(p.clamp(0,1)*(len-1))`. Not interpolated. Empty input returns 0.0. |
 | `CalibrationMethod` | config.rs:56-61 | Enum `{ Loess, Linear, None }`; default `Loess`. `None` is rejected at load. |
@@ -621,9 +628,9 @@ though the enum variant still exists.
 - **`slope`/`intercept` are emitted in `cal.json` whenever calibration is available,
   including under LOESS** (rt_im_train.rs:128, 286-287, 313-314). Under LOESS they
   are the degenerate fallback (fewer than four anchors, or a local window without
-  spread), not the extrapolation model: since docs/29 #10 the map continues the
-  boundary local fit outside the anchor range. Do not read them as the calibration
-  when `method == "loess"`. They are serialized as `null` only when calibration is
+  spread), not the extrapolation model: since docs/29 #10 the map continues the fitted
+  curve outside the anchor range. Do not read them as the calibration when
+  `method == "loess"`. They are serialized as `null` only when calibration is
   unavailable (`n_train < 2`), since the fit is not computed in that case.
 - **`CalibrationMethod::None` still exists but is rejected** at config load
   (config.rs:1336-1342). The stage would otherwise fall through to the linear path

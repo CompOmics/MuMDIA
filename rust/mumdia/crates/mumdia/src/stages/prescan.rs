@@ -32,7 +32,7 @@ use mumdia_io::report::ArtifactReport;
 use mumdia_io::table::{write_table, Col, TableFile};
 use rayon::prelude::*;
 use serde_json::json;
-use tracing::info;
+use tracing::{info, warn};
 
 pub struct PrescanParams<'a> {
     /// `spectra_ms2` for this run.
@@ -290,6 +290,12 @@ pub fn run(p: PrescanParams) -> Result<u64> {
     for (k, v) in per_spectrum {
         obs.entry(k).or_default().extend(v);
     }
+    // The full observed RT-bin range, for candidates whose RT window is unbounded (see
+    // the screening loop). Empty when no spectrum produced a tag, in which case nothing
+    // can survive on any path.
+    let (bin_min, bin_max) = obs.keys().fold((i64::MAX, i64::MIN), |(lo, hi), &(_, b)| {
+        (lo.min(b), hi.max(b))
+    });
     info!(
         cells = obs.len(),
         spectra = ms2.nrows,
@@ -330,6 +336,8 @@ pub fn run(p: PrescanParams) -> Result<u64> {
 
     let slack = p.cfg.rt_slack_s;
     let t1 = Instant::now();
+    // Candidates screened over the whole gradient because their RT window is unbounded.
+    let unbounded = std::sync::atomic::AtomicU64::new(0);
     // Screening is independent per candidate, which is what makes this worth doing in Rust: the
     // equivalent Python loop was single-threaded and ~40% of the per-file wall clock.
     let mut surv: Vec<(u32, &str)> = (0..lib.nrows)
@@ -345,12 +353,26 @@ pub fn run(p: PrescanParams) -> Result<u64> {
                 return None;
             }
             let c = cid[i] as usize;
-            let (lo, hi) = (*lo_by.get(c)?, *hi_by.get(c)?);
-            if !lo.is_finite() || !hi.is_finite() {
-                return None;
-            }
-            let b0 = ((lo - slack) / bin).floor() as i64;
-            let b1 = ((hi + slack) / bin).floor() as i64;
+            // An unbounded RT window is "search the whole gradient", not "cannot be
+            // screened". `rt_im_train::candidate_window` writes (NaN, -inf, +inf) whenever
+            // calibration is unavailable and documents the infinite bounds as recall-safe;
+            // this guard used to read them as a screening failure and drop the candidate,
+            // so a run with no confident seeds -- the documented FASTA/MS2PIP failure --
+            // discarded the ENTIRE library and exited 0 (docs/31 F1). A candidate with no
+            // run_windows row at all is the same case: unknown RT, not absent evidence.
+            let (lo, hi) = match (lo_by.get(c), hi_by.get(c)) {
+                (Some(&l), Some(&h)) => (l, h),
+                _ => (f64::NEG_INFINITY, f64::INFINITY),
+            };
+            let (b0, b1) = if lo.is_finite() && hi.is_finite() {
+                (
+                    ((lo - slack) / bin).floor() as i64,
+                    ((hi + slack) / bin).floor() as i64,
+                )
+            } else {
+                unbounded.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                (bin_min, bin_max)
+            };
             let m = pmz[i];
             for w in 0..win.nrows {
                 if !(w_lo[w] <= m && m < w_hi[w]) {
@@ -378,15 +400,39 @@ pub fn run(p: PrescanParams) -> Result<u64> {
     } else {
         f64::NAN
     };
+    let n_unbounded = unbounded.load(std::sync::atomic::Ordering::Relaxed);
     info!(
         screened = lib.nrows,
         survivors = surv.len(),
         targets = n_t,
         decoys = n_d,
         target_decoy_ratio = ratio,
+        rt_unbounded = n_unbounded,
         elapsed_ms = t1.elapsed().as_millis() as u64,
         "prescan: screened candidates"
     );
+    if n_unbounded > 0 {
+        warn!(
+            candidates = n_unbounded,
+            of = lib.nrows,
+            "prescan: these candidates have no bounded RT window (no calibration, or no \
+             run_windows row) and were screened over the whole gradient, which is the \
+             recall-safe reading of the sentinel but a weaker screen"
+        );
+    }
+    // Screening everything away is not a result. Before docs/31 F1 this was the silent
+    // outcome of an uncalibrated run: every candidate dropped, a zero-row survivors table,
+    // exit 0. The single-label bail below cannot see it, because it is gated on a
+    // survivor count.
+    if lib.nrows > 0 && surv.is_empty() {
+        anyhow::bail!(
+            "prescan screened {} candidates and none survived; a search would have no \
+             candidates at all. Check that the observed tag index is not empty (spectra, \
+             prescan.tol_da, prescan.top_peaks) and that prescan.anchor_mods matches the \
+             modifications in this library",
+            lib.nrows
+        );
+    }
     // A one-sided survival means the screen has become label-dependent and the modification's
     // null is gone. Fail loudly rather than emit a library whose modified q-values cannot be
     // estimated.

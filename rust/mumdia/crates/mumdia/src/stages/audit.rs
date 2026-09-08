@@ -64,6 +64,18 @@ fn load_extract_reasons(psms_path: &str) -> HashMap<u32, String> {
 
 pub fn run(p: AuditParams) -> Result<u64> {
     let t0 = Instant::now();
+    // `--out` must not be one of this stage's own inputs: every input is read
+    // before the output is published, so writing over one replaces it and exits 0
+    // (docs/31 F6). The shared guard existed and was wired into two stages.
+    mumdia_io::refuse_output_over_input(
+        p.out,
+        &[
+            ("--lib-precursors", p.library_precursors),
+            ("--psms", p.psms),
+            ("--competed", p.competed),
+            ("--psms-scored", p.scored),
+        ],
+    )?;
 
     // Search space = all library precursors.
     let lib = TableFile::open(p.library_precursors)
