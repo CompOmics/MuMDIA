@@ -381,7 +381,7 @@ jobs:
             bundle_glob: "desktop/target/release/bundle/msi/*.msi"
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # Tauri needs the platform webview headers at build time on Linux. The
       # produced AppImage carries what it needs at runtime.
@@ -528,7 +528,7 @@ jobs:
 
       - name: Upload to release
         if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@da05d552573ad5aba039eaac05058a918a7bf631 # v2.2.2
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           files: |
             desktop/dist/*
@@ -536,7 +536,7 @@ jobs:
 
       - name: Upload installers as a workflow artifact (rehearsal only)
         if: github.event_name == 'workflow_dispatch'
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: desktop-dryrun-${{ matrix.target }}
           path: desktop/dist/*
