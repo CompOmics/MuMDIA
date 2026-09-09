@@ -7,6 +7,10 @@ All notable changes to MuMDIA are recorded here. The format follows
 `0.1.0` is the first tagged release of the Rust engine. The superseded
 Python implementation remains available at the tag `legacy-python-v1`.
 
+`0.3.0` raises the DeepLC floor to 4.4.0, so every environment must be rebuilt
+before upgrading. It also adds multi-head retention-time calibration, off by
+default.
+
 `0.2.0` is a minor rather than a patch release: it changes behaviour a user can
 see. The default MS2PIP model is `HCDch2`, configurations with out-of-range
 numeric values are refused at load instead of running, both TSV reports gain two
@@ -22,6 +26,20 @@ results: the per-artifact Parquet schema versions in
 than a number. Both are recorded in every run's `manifest.json`.
 
 ## [Unreleased]
+
+### Fixed
+
+- Nine desktop test fixtures used a fixed temporary directory and deleted it on entry, so
+  two `cargo test` runs on one machine raced and one lost its files mid-test. They are
+  unique per process, like every other temporary fixture in the workspace (`docs/14`). Hit
+  twice while preparing releases; two concurrent runs now both pass.
+
+## [0.3.0] - 2026-09-09
+
+Multi-head retention-time calibration and the DeepLC 4.4.0 floor it needs, plus
+the sha2 0.11 bump. `rt_im_train.multihead_calibration` is off by default;
+turning it on measured +4.8% stripped peptides on the HYE AIF benchmark and
++14.3% on HYE Astral, at an unchanged empirical decoy fraction.
 
 ### Added
 
