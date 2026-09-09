@@ -35,4 +35,4 @@ sha2 = "0.10"
 # Unpacking the ThermoRawFileParser release, which is a zip. Pure Rust, and
 # `deflate` only: shelling out would mean `unzip` on Linux and `tar`/PowerShell on
 # Windows, neither of which is guaranteed present.
-zip = { version = "2", default-features = false, features = ["deflate"] }
+zip = { version = "8", default-features = false, features = ["deflate"] }
