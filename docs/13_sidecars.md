@@ -92,9 +92,9 @@ For the mapping from each conda environment to the config field that points at i
 | `rust/mumdia/crates/mumdia/src/stages/rescore.rs` | Call sites for mokapot/nn_torch (PIN) + entrapment (Parquet) sidecars |
 | `rust/mumdia/crates/mumdia/src/main.rs` | Call site for MBR (`Cmd::Mbr`) + `doctor` env probe |
 | `env/docker-rescore.yml` | Docker env `rescore`: mokapot 0.10.0 + ms2pip 4.0.0.dev9 (py3.11) |
-| `env/docker-deeplc.yml` | Docker env `deeplc`: `deeplc==4.1.1` (PyPI; the engine's floor) + CPU torch (py3.11) |
+| `env/docker-deeplc.yml` | Docker env `deeplc`: `deeplc==4.4.0` (PyPI; the engine's floor) + CPU torch (py3.11) |
 | `env/mumdia-rescore.yml` | Minimal portable env for the mokapot logreg rescore path (py3.12) |
-| `env/mumdia-deeplc.yml` | Portable local env for the DeepLC sidecars: DeepLC 4.1.1 + CPU torch (py3.11) |
+| `env/mumdia-deeplc.yml` | Portable local env for the DeepLC sidecars: DeepLC 4.4.0 + CPU torch (py3.11) |
 
 ## Inputs and outputs
 
@@ -745,16 +745,16 @@ MLP. Set it explicitly for the logreg path.
   change so `mumdia doctor` stays truthful.
 - **Conda envs.** The committed reproducible specs are `env/docker-rescore.yml`
   (env `rescore`: mokapot 0.10.0 + ms2pip 4.0.0.dev9, py3.11) and
-  `env/docker-deeplc.yml` (env `deeplc`: DeepLC 4.1.1 + CPU torch, py3.11); the
+  `env/docker-deeplc.yml` (env `deeplc`: DeepLC 4.4.0 + CPU torch, py3.11); the
   Docker configs point interpreters at `/opt/conda/envs/{rescore,deeplc}/bin/python`
   (`docker/config.dia.json`, `docker/config.diann-lib.json`). For a native install
   the portable equivalents are `env/mumdia-rescore.yml` (mokapot logreg path, no
   torch/DeepLC/MS2PIP) and `env/mumdia-deeplc.yml` (the DeepLC sidecars).
-  **DeepLC 4.1.1 is a floor, not merely the current release**: the 4.0.0a2
+  **DeepLC 4.4.0 is a floor, not merely the current release**: the 4.0.0a2
   multitask preview overfits per-run fine-tuning badly enough to invert RT-model
   rankings (`docs/08_rt_im_train.md` section 4b), so an older DeepLC changes
   results and not only performance. The engine enforces it: `mumdia doctor` fails
-  below 4.1.1 and `sidecar::require_deeplc_version` refuses to launch a DeepLC worker
+  below 4.4.0 and `sidecar::require_deeplc_version` refuses to launch a DeepLC worker
   (one constant, `mumdia_core::constants::MIN_DEEPLC_VERSION`). Anchor the tool version and let pip resolve
   its scientific-Python graph; do not re-add an exact `pandas < 2` style pin,
   which has no cp312 wheel. A developer machine may also have older local envs

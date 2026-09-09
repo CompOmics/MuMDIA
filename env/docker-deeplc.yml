@@ -1,14 +1,14 @@
-# Conda env "deeplc" for the MuMDIA Docker image: DeepLC 4.1.1 from PyPI plus a
+# Conda env "deeplc" for the MuMDIA Docker image: DeepLC 4.4.0 from PyPI plus a
 # CPU-only PyTorch. Both are pinned; DeepLC pulls its own scientific-Python
 # dependencies (numpy, pandas, scikit-learn, psm-utils) at compatible versions,
 # and its model weights ship inside the package, so nothing is downloaded at run
 # time. Built into the image as /opt/conda/envs/deeplc; the baked
 # docker/config.dia.json points predict_frag.deeplc_python at its interpreter.
 #
-# 4.1.1 is a floor, not merely the current version: the 4.0.0a2 multitask preview
+# 4.4.0 is a floor, not merely the current version: the 4.0.0a2 multitask preview
 # overfits per-run fine-tuning badly enough to invert RT-model rankings
 # (docs/08_rt_im_train.md section 4b), so an older DeepLC changes results rather
-# than only performance. DeepLC 4.1.1 requires Python >= 3.11 and torch >= 2.6.
+# than only performance. DeepLC 4.4.0 requires Python >= 3.11 and torch >= 2.6.
 name: deeplc
 channels:
   - conda-forge
@@ -27,4 +27,4 @@ dependencies:
       - torch==2.14.0+cpu
       - setuptools>=83
       - pyarrow
-      - deeplc==4.1.1
+      - deeplc==4.4.0

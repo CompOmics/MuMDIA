@@ -67,7 +67,7 @@ def _check_deeplc_version():
         parts.append(0)
     if tuple(parts) < _MIN_DEEPLC:
         sys.exit(
-            "deeplc %s is older than the required %d.%d.%d (pip install 'deeplc>=4.1.1')"
+            "deeplc %s is older than the required %d.%d.%d (pip install 'deeplc>=4.4.0')"
             % (raw, *_MIN_DEEPLC)
         )
 
@@ -102,8 +102,12 @@ def agg(a):
     return a.mean(axis=1) if a.ndim == 2 else a
 
 
-def build_finetuned_model(args):
-    """Transfer-learn on the confident seed PSMs named by args.seed_path."""
+def build_reference(args):
+    """The run's confident seed PSMs as a `PSMList`: peptidoform plus observed RT.
+
+    Shared by the fine-tune and the multi-head calibration, so both adapt to exactly the
+    same peptides and both honour the held-out window rule.
+    """
     # reference: confident target seed PSMs (peptidoform + observed RT, seconds)
     seed = pq.read_table(args.seed_path).to_pydict()
     # Held-out window sizing: the same rule as rt_im_train.rs::is_holdout, on the same
@@ -132,8 +136,40 @@ def build_finetuned_model(args):
         ref_items = ref_items[: args.max_ref]
     ref_psms = PSMList(psm_list=[PSM(peptidoform=pf, retention_time=rt, spectrum_id=str(k))
                                  for k, (pf, rt) in enumerate(ref_items)])
-    print(f"fine-tune reference: {len(ref_psms)} confident seed peptides", flush=True)
+    print(f"reference: {len(ref_psms)} confident seed peptides", flush=True)
+    return ref_psms
 
+
+def fit_multihead(args, ref_psms):
+    """Fit a multi-head ridge calibration of the base model against this run.
+
+    `deeplc.predict` returns ONE of the model's 6,543 LC-setup heads, the one named by
+    `DEFAULT_TASK_NAME`, on that setup's own gradient. Calibrating it with a smooth
+    increasing curve, which is what the engine's LOESS does, can stretch and bend the axis
+    but cannot reorder two peptides, and different chromatography reorders peptides. So the
+    ordering of one arbitrary setup survives into the result no matter how good the curve
+    is. `MultiHeadRidgeCalibration` ranks every head against this run's own anchors,
+    spline-calibrates the best ones and ridge-combines them, so the ordering is assembled
+    from the setups that actually resemble the run. It never fits more head weights than
+    half the reference, so a small anchor set degrades to fewer heads rather than
+    overfitting.
+    """
+    from deeplc.calibration import MultiHeadRidgeCalibration
+
+    cal = MultiHeadRidgeCalibration(n_heads=args.multihead)
+    print(f"multi-head calibration: fitting up to {args.multihead} heads against "
+          f"{len(ref_psms)} anchors", flush=True)
+    t0 = time.time()
+    cal = deeplc.calibrate(psm_list_reference=ref_psms, calibration=cal)
+    idx = getattr(cal, "_head_idx", None)
+    n_fitted = 0 if idx is None else len(idx)
+    print(f"multi-head calibration: {n_fitted} heads combined, best head "
+          f"{getattr(cal, 'selected_model_head', '?')}, {time.time() - t0:.1f}s", flush=True)
+    return cal
+
+
+def build_finetuned_model(args, ref_psms):
+    """Transfer-learn on the confident seed PSMs."""
     # Batch size: 0 -> auto-scale so each epoch runs ~30+ gradient steps. A fixed 512
     # underfits small references (e.g. ~4k E.coli seed = ~8 steps/epoch, never
     # converges); clamp to [16, 512].
@@ -194,6 +230,13 @@ def main():
                     help="cap number of unique peptidoforms predicted (0 = all)")
     ap.add_argument("--skip-predict", action="store_true",
                     help="fine-tune only, skip the full-library prediction (crash-path smoke test)")
+    ap.add_argument("--multihead", type=int, default=0, metavar="N",
+                    help="instead of fine-tuning, calibrate the base model against the run's "
+                         "confident seed PSMs with MultiHeadRidgeCalibration over its N "
+                         "best-correlating LC-setup heads (DeepLC >= 4.4.0). 0 (default) is "
+                         "off. The engine's LOESS cannot reorder peptides, so a single head "
+                         "fixes the gradient but keeps that setup's elution order; this "
+                         "assembles the order from the setups that resemble the run.")
     ap.add_argument("--no-finetune", action="store_true",
                     help="skip the transfer learning and predict every peptidoform with the "
                          "DeepLC base model; seed_psms is ignored (pass '-'). The engine uses "
@@ -239,11 +282,22 @@ def main():
     pform = lib.column("peptidoform").to_pylist()
     orig = np.asarray(lib.column("predicted_irt"), dtype=np.float32)
 
-    if args.no_finetune:
+    if args.multihead and args.no_finetune:
+        raise SystemExit("--multihead and --no-finetune are alternatives: the first "
+                         "calibrates the base model against this run, the second predicts "
+                         "from it uncalibrated")
+    if args.multihead < 0:
+        raise SystemExit(f"--multihead must be >= 0, got {args.multihead}")
+
+    calibration = None
+    if args.multihead:
+        calibration = fit_multihead(args, build_reference(args))
+        ft_model = None
+    elif args.no_finetune:
         ft_model = None
         print("no-finetune: predicting with the DeepLC base model (seed ignored)", flush=True)
     else:
-        ft_model = build_finetuned_model(args)
+        ft_model = build_finetuned_model(args, build_reference(args))
 
     if args.skip_predict:
         print("skip-predict set; fine-tune smoke test complete (crash path exercised)", flush=True)
@@ -263,16 +317,33 @@ def main():
     pt = args.predict_threads if args.predict_threads > 0 else args.threads
     if pt != torch.get_num_threads():
         torch.set_num_threads(max(1, pt))
-    which = "the DeepLC base model" if ft_model is None else "the fine-tuned model"
+    which = (
+        f"the base model calibrated over {args.multihead} heads"
+        if calibration is not None
+        else "the DeepLC base model"
+        if ft_model is None
+        else "the fine-tuned model"
+    )
     print(f"predicting {len(uniq)} unique standard peptidoforms with {which} "
           f"(torch threads={torch.get_num_threads()})", flush=True)
+    # Only needed to satisfy `predict_and_calibrate`, which parses a reference before it
+    # notices the calibration is already fitted.
+    ref_for_transform = ref_psms_for_transform(calibration, args)
     preds = {}
     chunk = 100_000
     t_pred0 = time.time()
     for s in range(0, len(uniq), chunk):
         t0 = time.time()
         batch = uniq[s:s + chunk]
-        p = agg(deeplc.predict(batch) if ft_model is None else deeplc.predict(batch, model=ft_model))
+        if calibration is not None:
+            # The calibration is already fitted, so this only predicts and transforms: it
+            # pulls the head columns the ridge reads rather than materialising all 6,543,
+            # which at library scale would be terabytes. The reference is passed again
+            # because the signature requires one; the fitting step is skipped.
+            p = agg(deeplc.predict_and_calibrate(
+                batch, psm_list_reference=ref_for_transform, calibration=calibration))
+        else:
+            p = agg(deeplc.predict(batch) if ft_model is None else deeplc.predict(batch, model=ft_model))
         # A structurally short or long answer is a broken predictor, not a set of
         # unsupported peptidoforms: zipping it silently paired predictions with the wrong
         # peptidoforms and left the tail on its imported value (docs/30 R6).
@@ -309,6 +380,13 @@ def main():
               f"({100.0 * summary['retained_imported'] / max(1, summary['rows']):.2f}%) keep "
               f"their imported iRT, which is on the imported model's scale, not {which}'s; "
               f"the counts are in {args.lib_out}.summary.json", flush=True)
+
+
+def ref_psms_for_transform(calibration, args):
+    """A one-row reference for the transform-only calls, or None when not calibrating."""
+    if calibration is None:
+        return None
+    return PSMList(psm_list=[PSM(peptidoform="PEPTIDEK", retention_time=0.0, spectrum_id="0")])
 
 
 def rewrite_irt(pform, orig, preds):

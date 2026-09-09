@@ -552,7 +552,7 @@ fn download(installer: &Arc<Installer>, a: &Asset, dest: &std::path::Path) -> Re
     std::io::Write::flush(&mut file).map_err(|e| e.to_string())?;
     drop(file);
 
-    let got = format!("{:x}", hasher.finalize());
+    let got = crate::components::hex(hasher.finalize());
     if got != a.sha256 {
         let _ = std::fs::remove_file(dest);
         return Err(format!(

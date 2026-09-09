@@ -39,7 +39,7 @@ image are at fixed locations.
 
 The environments themselves are specified under `env/`:
 `env/mumdia-rescore.yml` for the mokapot path and `env/mumdia-deeplc.yml` for the
-DeepLC workers. DeepLC must be 4.1.1 or newer: the 4.0.0a2 preview overfits
+DeepLC workers. DeepLC must be 4.4.0 or newer: the 4.0.0a2 preview overfits
 per-run fine-tuning badly enough to invert retention-time model rankings, so an
 older version changes results and not only speed. `doctor` warns when it finds
 one.

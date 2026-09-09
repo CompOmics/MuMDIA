@@ -411,7 +411,7 @@ things in order.
    line states the provenance (configured, which environment variable, the
    activated environment, or `PATH`).
 3. The versions of the packages whose version changes results (`deeplc`, `torch`,
-   `mokapot`, `ms2pip`, `numpy`), and a warning when DeepLC is below the 4.1.1
+   `mokapot`, `ms2pip`, `numpy`), and a warning when DeepLC is below the 4.4.0
    floor (`main.rs:566`, `version_below` at `main.rs:611`, which reads a
    pre-release such as `4.0.0a2` as 4.0.0 so it stays below the floor).
 4. A verdict. `doctor` exits non-zero if any required role is unusable
@@ -460,13 +460,13 @@ to be writable at run time, because everything MuMDIA writes lands under
 
 The two conda envs both pin `python=3.11` on purpose: mokapot and MS2PIP pull
 `pandas<2`, which has no cp312 wheel and would force a fragile source build
-(`docker-rescore.yml:8-9`), and DeepLC 4.1.1 itself requires Python >= 3.11
+(`docker-rescore.yml:8-9`), and DeepLC 4.4.0 itself requires Python >= 3.11
 (`docker-deeplc.yml:11`). The `rescore` env anchors only the two tools
 (`mokapot==0.10.0`, `ms2pip==4.2.0`) plus `numpy<2`/`pyarrow`/`scikit-learn`,
 leaving their scientific-Python graph to pip (`docker-rescore.yml:16-21`). The
 `deeplc` env installs `torch==2.14.0+cpu` from the PyTorch CPU index-url plus
-`deeplc==4.1.1` and `pyarrow` (`docker-deeplc.yml:18-22`); it no longer caps
-`numpy<2`, which 4.1.1 does not require, and the multitask model weight ships
+`deeplc==4.4.0` and `pyarrow` (`docker-deeplc.yml:18-22`); it no longer caps
+`numpy<2`, which 4.4.0 does not require, and the multitask model weight ships
 inside the DeepLC package, so nothing is downloaded at run time.
 
 **CI workflow.** `ci.yml` triggers on push to `main` and on every pull request
@@ -741,9 +741,9 @@ do not reintroduce removed knobs. The fields relevant here:
   Python. `configs/README.md` documents the resolution order for users.
 - The pip pins in the two in-image envs are exact and reproducibility-load-bearing:
   `rescore` = `mokapot==0.10.0` + `ms2pip==4.2.0` + `numpy<2` (rest via pip,
-  `docker-rescore.yml:16-21`); `deeplc` = `torch==2.14.0+cpu` + `deeplc==4.1.1`
+  `docker-rescore.yml:16-21`); `deeplc` = `torch==2.14.0+cpu` + `deeplc==4.4.0`
   from PyPI + `pyarrow` (`docker-deeplc.yml:18-22`), with no `numpy<2` cap, which
-  4.1.1 does not require. The two host envs differ:
+  4.4.0 does not require. The two host envs differ:
   `env/mumdia-deeplc.yml` mirrors the image's DeepLC pins and adds `psm-utils`
   explicitly because `deeplc_finetune.py` imports it directly, while
   `env/mumdia-rescore.yml` is a deliberately different, minimal pin set

@@ -162,8 +162,8 @@ conda env create -f env/mumdia-rescore.yml
 conda env create -f env/mumdia-deeplc.yml
 ```
 
-`env/mumdia-deeplc.yml` pins `deeplc==4.1.1`, `ms2pip==4.2.0` and
-`torch==2.14.0+cpu`. DeepLC 4.1.1 is a floor rather than merely the current
+`env/mumdia-deeplc.yml` pins `deeplc==4.4.0`, `ms2pip==4.2.0` and
+`torch==2.14.0+cpu`. DeepLC 4.4.0 is a floor rather than merely the current
 release: the 4.0.0a2 multitask preview overfits per-run fine-tuning badly enough to
 invert retention-time model rankings, so an older version changes results and not
 only speed. MS2PIP 4.2.0 is the version the FASTA-mode measurements were made with
@@ -294,7 +294,7 @@ fragment prediction, and uses the imported library's fragment intensities. For
 retention time the default (`rt_im_train.library_irt = auto`) re-predicts the
 imported iRT once with the DeepLC base model when a DeepLC interpreter is
 configured, then calibrates it per run; without an interpreter the imported values
-are kept and a warning says so. DeepLC 4.1.1 or newer is required (`mumdia doctor`
+are kept and a warning says so. DeepLC 4.4.0 or newer is required (`mumdia doctor`
 and the workers refuse older versions). Measured at 1%: AIF 10,416 peptides against
 10,015 from the imported iRT and 10,181 from a per-run fine-tune; HYE B01 (NN seeds
 1-3) 58,842 against 56,556, and 60,278 with a library fine-tuned once. The optional

@@ -700,7 +700,7 @@ fn download_verified(installer: &Arc<Installer>, a: &Asset, dest: &Path) -> Resu
     std::io::Write::flush(&mut file).map_err(|e| e.to_string())?;
     drop(file);
 
-    let got = format!("{:x}", hasher.finalize());
+    let got = crate::components::hex(hasher.finalize());
     if got != a.sha256 {
         // The file is removed rather than left for someone to run by hand.
         let _ = std::fs::remove_file(dest);
@@ -943,7 +943,7 @@ pub fn library_cache_dir(req: &BuildRequest, diann_version: &str) -> Result<Path
         )
         .as_bytes(),
     );
-    let key = format!("{:x}", h.finalize());
+    let key = crate::components::hex(h.finalize());
     Ok(crate::components::data_dir()
         .join("libraries")
         .join(&key[..16]))
@@ -1757,7 +1757,7 @@ mod tests {
     fn a_download_that_matches_its_digest_is_kept() {
         use sha2::{Digest, Sha256};
         let body = b"the quick brown fox jumps over the lazy dog".to_vec();
-        let digest = format!("{:x}", Sha256::digest(&body));
+        let digest = crate::components::hex(Sha256::digest(&body));
         let url: &'static str = Box::leak(serve_once(body.clone()).into_boxed_str());
         let sha: &'static str = Box::leak(digest.into_boxed_str());
 

@@ -79,5 +79,10 @@ deploy_local/
 .stopgate/loop.jsonl
 .stopgate/bench.json
 .stopgate/tmp/
+# The rest of the harness's local state. Enumerated like the lines above rather than
+# ignoring `.stopgate/` wholesale, so a file the harness starts tracking on purpose is a
+# deliberate addition. `handoff.md` was swept into a commit by a `git add -A` before this.
+.stopgate/handoff.md
+.stopgate/state/
 .claude/settings.local.json
 .stopgate.toml

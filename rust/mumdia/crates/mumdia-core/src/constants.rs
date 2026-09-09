@@ -15,7 +15,12 @@ pub const PROTON: f64 = 1.007_276_466_812;
 /// held-out 195 s residuals, docs/08 section 4b) and would silently degrade every window
 /// under that default. Enforced by interpreter discovery, `doctor`, and the two DeepLC
 /// worker scripts.
-pub const MIN_DEEPLC_VERSION: (u32, u32, u32) = (4, 1, 1);
+///
+/// Raised from 4.1.1 to 4.4.0 for `rt_im_train.multihead_calibration`, which needs
+/// `deeplc.calibration.MultiHeadRidgeCalibration` and the lazy head source
+/// `predict_and_calibrate` uses to avoid materialising all 6,543 head columns. 4.1.1 has
+/// neither: its `calibrate` picks a single best-correlating head.
+pub const MIN_DEEPLC_VERSION: (u32, u32, u32) = (4, 4, 0);
 
 /// Parse a PEP 440-ish version string's leading numeric components. Pre-release suffixes
 /// ("4.0.0a2") are dropped, so "4.1.1rc1" compares as 4.1.1; anything unparsable is None.
@@ -208,7 +213,9 @@ mod version_tests {
         assert_eq!(parse_version3("4.1.1rc1"), Some((4, 1, 1)));
         assert_eq!(parse_version3("dev"), None);
         assert!(parse_version3("4.0.0a2").unwrap() < MIN_DEEPLC_VERSION);
-        assert!(parse_version3("4.1.1").unwrap() >= MIN_DEEPLC_VERSION);
-        assert!(parse_version3("4.2.0").unwrap() >= MIN_DEEPLC_VERSION);
+        assert!(parse_version3("4.1.1").unwrap() < MIN_DEEPLC_VERSION);
+        assert!(parse_version3("4.3.0").unwrap() < MIN_DEEPLC_VERSION);
+        assert!(parse_version3("4.4.0").unwrap() >= MIN_DEEPLC_VERSION);
+        assert!(parse_version3("4.5.0").unwrap() >= MIN_DEEPLC_VERSION);
     }
 }
