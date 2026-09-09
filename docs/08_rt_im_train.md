@@ -419,6 +419,50 @@ CLAUDE.md sets. The option is off by default and needs entrapment plus a second
 acquisition before that changes. What it does establish is that the ordering loss is real,
 large and not repairable by any improvement to the curve.
 
+#### Both acquisitions, four pooled experiments (2026-09-09)
+
+One binary, four six-file `run-experiment` runs, configurations differing only in
+`rt_im_train.multihead_calibration`, so the RT source is the only variable. Imported
+DIA-NN library, strict `nn_torch`, no match-between-runs, 24 threads each.
+
+| | AIF baseline | AIF multi-head | Astral baseline | Astral multi-head |
+|---|---|---|---|---|
+| stripped peptides at `peptide_q_value` 1% | 80,842 | **84,725** (+4.8%) | 102,942 | **117,652** (+14.3%) |
+| precursors at 1% | 100,753 | 105,603 (+4.8%) | 113,961 | 131,646 (+15.5%) |
+| protein groups at `pg_q_value` 1% | 10,707 | 10,963 (+2.4%) | 11,458 | 12,276 (+7.1%) |
+| empirical decoy fraction at pooled q 1% | 0.0100 | 0.0100 | 0.0100 | 0.0100 |
+| PSMs entering the pooled rescore | 11,897,730 | 11,271,816 | 7,167,118 | 3,510,539 |
+| in-sample RT residual, median | 67-78 s | 19-26 s | 15.8-16.0 s | 2.0-2.2 s |
+| `w_rt` | 349-399 s | 171-273 s | 84 s | 17-21 s |
+| wall clock | 110 min | 152 min | 63 min | 107 min |
+
+The decoy fraction is identical in all four arms, so none of the gain is a loosened
+threshold. The mechanism shows up in the PSM count: on Astral the window narrows from 84 s
+to about 20 s, half as many candidates reach rescore, and more of them are real. Fewer
+candidates and more identifications at one FDR is interference removed, not traded.
+
+The gain is three times larger on Astral than on AIF, which is what the mechanism predicts:
+a 15-minute gradient sits further from the default head's setup than a 150-minute one, so
+there is more ordering error to remove. Head selection agrees: every AIF run picked head
+1229, while the Astral runs picked 2503, 1176 and others. None picked the default 938.
+
+For scale, DIA-NN 2.2.0 library-free with `--reanalyse` on the same six Astral files gives
+126,457 union precursors at run and global 1%. The baseline reaches 81% of that and
+multi-head 93%, though the two counts are not the same unit (ours is experiment-wide,
+DIA-NN's is a union of per-run identifications).
+
+**Cost.** The calibration re-predicts the library once per run rather than once per
+experiment, because it is fitted against each run's own anchors: 1.4x wall clock on AIF and
+1.7x on Astral. The fine-tune has the same shape, which is what `experiment.finetune_scope`
+exists to amortise, and multi-head cannot share by construction. Since every AIF run chose
+the same head, a shared-selection variant is worth measuring before that cost is made
+default.
+
+**What is still missing for a default.** Entrapment. CLAUDE.md requires an empirical null
+as well as two acquisitions, and an unchanged decoy fraction is not the same test: it says
+the target-decoy ratio held, not that the FDR estimate is honest under a known-false
+population. The option therefore stays off by default until an entrapment arm runs.
+
 ### 5. Optional adaptive per-region window (default off)
 
 When `adaptive_rt_window` is set (and `n_train >= min_anchors`, which guarantees the
