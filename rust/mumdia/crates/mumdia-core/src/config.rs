@@ -670,7 +670,10 @@ impl RtImTrainConfig {
     /// DeepLC interpreter (the orchestrator warns in that case). `deeplc` without an
     /// interpreter is a preflight error, so it resolves to true here.
     pub fn repredicts_library_irt(&self, library_input: bool, has_deeplc: bool) -> bool {
-        if !library_input || self.finetune_deeplc {
+        // Multi-head calibration re-predicts the library itself, from the same base model
+        // and against this run's anchors, so a base-model re-prediction before it is 27
+        // minutes of work whose only output it overwrites.
+        if !library_input || self.finetune_deeplc || self.multihead_calibration > 0 {
             return false;
         }
         match self.library_irt {
@@ -2620,6 +2623,18 @@ mod tests {
             assert!(Config::from_json(ok).is_ok(), "{ok} must be accepted");
         }
         assert_eq!(Config::default().rt_im_train.multihead_calibration, 0);
+    }
+
+    #[test]
+    fn multihead_calibration_suppresses_the_base_model_re_prediction() {
+        // It re-predicts the library itself, from the same base model, against this run's
+        // anchors. Re-predicting first would be 27 minutes producing a column it
+        // overwrites, exactly as under the fine-tune.
+        let c = Config::from_json(r#"{"rt_im_train":{"multihead_calibration":80}}"#).unwrap();
+        assert!(!c.rt_im_train.repredicts_library_irt(true, true));
+        // Without it, an imported library under `auto` with DeepLC still re-predicts.
+        let d = Config::default();
+        assert!(d.rt_im_train.repredicts_library_irt(true, true));
     }
 
     #[test]

@@ -77,6 +77,11 @@ fn preflight(p: &RunExperimentParams) -> Result<()> {
     if cfg.rt_im_train.finetune_deeplc && cfg.predict_frag.deeplc_python.is_none() {
         anyhow::bail!("rt_im_train.finetune_deeplc requires predict_frag.deeplc_python");
     }
+    if cfg.rt_im_train.multihead_calibration > 0 && cfg.predict_frag.deeplc_python.is_none() {
+        anyhow::bail!(
+            "rt_im_train.multihead_calibration requires predict_frag.deeplc_python (DeepLC              >= 4.4.0): it calibrates the base model against each run's confident seed PSMs"
+        );
+    }
     if p.lib_precursors.is_some()
         && matches!(
             cfg.rt_im_train.library_irt,
@@ -188,7 +193,33 @@ fn process_run(
     // drift is then absorbed by `rt_im_train`'s per-run calibration below, which is fitted
     // separately for every run regardless.
     let mut produced_ft: Option<String> = None;
-    let lib_p = if let Some(ft) = shared_ft {
+    let lib_p = if cfg.rt_im_train.multihead_calibration > 0 {
+        // Per run, always, and never shared: the whole point is that it is fitted against
+        // THIS run's chromatography. `shared_ft` cannot be set here, because sharing is
+        // gated on `finetune_deeplc`, which validation forbids alongside this.
+        let python = cfg
+            .predict_frag
+            .deeplc_python
+            .as_deref()
+            .expect("preflight guarantees deeplc_python when multihead_calibration is set");
+        let script = crate::sidecar::resolve_script(
+            &cfg.predict_frag.sidecar_script_dir,
+            "deeplc_finetune.py",
+        );
+        let lib_p_mh = d("fragment_library_precursors_multihead.parquet");
+        crate::sidecar::run_deeplc_multihead(
+            python,
+            &script,
+            lib_p_base,
+            &seed,
+            &lib_p_mh,
+            cfg.rt_im_train.multihead_calibration,
+            cfg.rt_im_train.q_train,
+            cfg.rt_im_train.window_holdout_frac,
+            rayon::current_num_threads(),
+        )?;
+        lib_p_mh
+    } else if let Some(ft) = shared_ft {
         ft.to_string()
     } else if cfg.rt_im_train.finetune_deeplc {
         let python = cfg
@@ -858,7 +889,12 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
     // which fragment predictor, and the classifier that actually ran.
     let library_input = p.lib_precursors.is_some();
     let deeplc_py = cfg.predict_frag.deeplc_python.as_deref();
-    let rt_identity = if cfg.rt_im_train.finetune_deeplc {
+    let rt_identity = if cfg.rt_im_train.multihead_calibration > 0 {
+        crate::sidecar::deeplc_identity(
+            deeplc_py,
+            &format!("multihead-{}", cfg.rt_im_train.multihead_calibration),
+        )
+    } else if cfg.rt_im_train.finetune_deeplc {
         if matches!(cfg.experiment.finetune_scope, FinetuneScope::FirstRunOnly) {
             crate::sidecar::deeplc_identity(deeplc_py, "finetuned-first-run")
         } else {

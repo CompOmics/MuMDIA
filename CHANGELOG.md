@@ -42,7 +42,15 @@ than a number. Both are recorded in every run's `manifest.json`.
   fitted on the scoring half itself, also scores 79.5 s, so on that run the LOESS is
   already doing everything a monotone map can and the whole gap is ordering rather than
   fit quality (`docs/08_rt_im_train.md` section 4d). The best head there is 1229, not the
-  default 938.
+  default 938. Measured end to end on both HYE acquisitions, four pooled six-file
+  experiments from one binary differing only in this field: AIF 80,842 to 84,725 stripped
+  peptides at 1% (+4.8%), Astral 102,942 to 117,652 (+14.3%), protein groups +2.4% and
+  +7.1%, at an empirical decoy fraction of 0.0100 in all four arms. On Astral the window
+  narrows from 84 s to about 20 s and half as many candidates reach the rescore, so the
+  gain is interference removed rather than a loosened threshold. It costs 1.4x to 1.7x
+  wall clock, because the calibration re-predicts the library per run rather than once per
+  experiment. Still off by default: entrapment has not been run, and CLAUDE.md requires an
+  empirical null as well as two acquisitions.
 
 ### Changed
 
