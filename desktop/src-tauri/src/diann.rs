@@ -1942,7 +1942,11 @@ mod tests {
 
     #[test]
     fn the_library_cache_key_covers_what_changes_the_library_and_nothing_else() {
-        let dir = std::env::temp_dir().join("mumdia-diann-cachekey");
+        // Unique per process, like every other temp fixture in the workspace: this one
+        // used a fixed name AND deleted the directory on entry, so two `cargo test` runs
+        // on one machine raced and one of them lost its fasta mid-test (docs/14).
+        let dir =
+            std::env::temp_dir().join(format!("mumdia-diann-cachekey-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let fa = dir.join("a.fasta");
