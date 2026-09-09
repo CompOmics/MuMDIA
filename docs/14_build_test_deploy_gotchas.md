@@ -106,7 +106,7 @@ mzML, FASTA, and library Parquets remain user data and must be mounted.
 
 **Build configuration.** The workspace declares three members
 (`Cargo.toml:3`) sharing one `[workspace.package]` (`Cargo.toml:5-23`): version
-`0.1.1`, `edition = "2021"`, `rust-version = "1.96"`, license `Apache-2.0`, plus
+`0.2.0`, `edition = "2021"`, `rust-version = "1.96"`, license `Apache-2.0`, plus
 the crates.io metadata (description, repository, homepage, keywords, categories)
 and `publish = false`. The declared MSRV deliberately tracks
 `rust-toolchain.toml` (channel `1.96.1`), which is the only Rust version CI

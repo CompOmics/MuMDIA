@@ -49,6 +49,15 @@ OUT = ROOT / "sbom.cdx.json"
 # rather than third-party dependencies of it.
 OURS = {"mumdia", "mumdia-core", "mumdia-io"}
 
+# The one that IS the application, described by `metadata.component` rather than listed
+# among the components. The other two are libraries this binary is composed of, and they
+# have to appear as components: the dependency graph references them, and a `dependsOn`
+# naming a `bom-ref` no component declares makes the document fail CycloneDX validation.
+# Excluding all three left exactly those two references dangling in the SBOM that ships in
+# every release archive, and `--check` regenerated the same broken document
+# (docs/31_code_review_2026-09-08_full.md, F11).
+APPLICATION = "mumdia"
+
 
 def cargo_metadata() -> dict:
     """Full metadata, WITH dependencies, so `resolve` carries the graph.
@@ -113,7 +122,7 @@ def render(meta: dict) -> str:
     )
 
     components = sorted(
-        (component(p) for p in meta["packages"] if p["name"] not in OURS),
+        (component(p) for p in meta["packages"] if p["name"] != APPLICATION),
         key=lambda c: (c["name"].lower(), c["version"]),
     )
 
