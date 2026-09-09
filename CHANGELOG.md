@@ -23,8 +23,35 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ## [Unreleased]
 
+### Added
+
+- `rt_im_train.multihead_calibration` (default 0, off): calibrate the DeepLC base model
+  against this run's confident seed PSMs across its N best-correlating LC-setup heads,
+  instead of fine-tuning. `deeplc.predict` returns one of the model's 6,543 heads, the
+  setup its `DEFAULT_TASK_NAME` names, on that setup's gradient; the per-run LOESS then
+  maps that column onto observed retention time, and a smooth increasing curve can stretch
+  and bend the axis but cannot reorder two peptides, so that one setup's elution order
+  survives into the calibrated result. Different chromatography reorders peptides.
+  `MultiHeadRidgeCalibration` ranks every head against the run's own anchors,
+  spline-calibrates the best ones and ridge-combines them, and never fits more head
+  weights than half the reference. It occupies the fine-tune's slot in the chain, needs
+  the same anchors, and validation refuses both at once. Off by default: no entrapment or
+  second-acquisition measurement exists for it in this repository yet. Measured on HYE
+  B01's own anchors, split in half: the default head with the best possible monotone map
+  scores 79.5 s median error, the multi-head combination 28.6 s. The monotone oracle,
+  fitted on the scoring half itself, also scores 79.5 s, so on that run the LOESS is
+  already doing everything a monotone map can and the whole gap is ordering rather than
+  fit quality (`docs/08_rt_im_train.md` section 4d). The best head there is 1229, not the
+  default 938.
+
 ### Changed
 
+- The DeepLC floor is 4.4.0, raised from 4.1.1, for
+  `deeplc.calibration.MultiHeadRidgeCalibration` and the lazy head source that
+  `predict_and_calibrate` uses to avoid materialising all 6,543 head columns. 4.1.1 has
+  neither: its `calibrate` picks a single best-correlating head. `mumdia doctor`, the
+  interpreter discovery, `sidecar::require_deeplc_version` and both worker scripts enforce
+  it from the one constant, and every shipped environment pins `deeplc==4.4.0`.
 - The desktop application builds against `sha2` 0.11. Its `finalize()` returns
   `hybrid_array::Array` rather than the old `GenericArray`, which does not implement
   `LowerHex`, so the four `format!("{:x}", ..)` sites move to a `components::hex`

@@ -149,7 +149,7 @@ config when the machine has several candidate environments.
 **Symptom.** `doctor` is green but a DeepLC run's retention-time windows look
 wrong.
 
-**Cause and fix.** Check the DeepLC version `doctor` prints. Below 4.1.1 it warns,
+**Cause and fix.** Check the DeepLC version `doctor` prints. Below 4.4.0 it warns,
 because the 4.0.0a2 multitask preview overfits per-run fine-tuning badly enough to
 invert RT-model rankings (see the retention-time section below). That is a
 different result, not a slower one.

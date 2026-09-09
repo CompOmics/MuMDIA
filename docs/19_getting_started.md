@@ -81,7 +81,7 @@ cover every sidecar this document uses:
 conda env create -f env/mumdia-deeplc.yml
 ```
 
-DeepLC must be 4.1.1 or newer. The 4.0.0a2 multitask preview overfits per-run
+DeepLC must be 4.4.0 or newer. The 4.0.0a2 multitask preview overfits per-run
 fine-tuning badly enough to invert retention-time model rankings, so an older
 version changes results and not only speed; `mumdia doctor` fails on one, and the
 engine refuses to launch the DeepLC workers with it. MS2PIP is pinned only in the Docker specification
@@ -95,7 +95,7 @@ which is what `configs/examples/*.json` use, resolves through
 that role's workers import, so activating the environment is normally enough. Name
 an absolute path when a machine has several candidates and you want to pin one; an
 explicit path is never second-guessed. DeepLC is discovered opportunistically under the
-default `rt_im_train.library_irt = auto`: found (and 4.1.1 or newer), a library-input
+default `rt_im_train.library_irt = auto`: found (and 4.4.0 or newer), a library-input
 run re-predicts the imported iRT with it; not found, the run keeps the imported values
 and says so, and `doctor` shows a `[note]` rather than a failure.
 

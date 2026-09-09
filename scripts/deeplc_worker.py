@@ -54,7 +54,7 @@ def _check_deeplc_version():
         parts.append(0)
     if tuple(parts) < _MIN_DEEPLC:
         sys.exit(
-            "deeplc %s is older than the required %d.%d.%d (pip install 'deeplc>=4.1.1')"
+            "deeplc %s is older than the required %d.%d.%d (pip install 'deeplc>=4.4.0')"
             % (raw, *_MIN_DEEPLC)
         )
 

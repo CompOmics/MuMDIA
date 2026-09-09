@@ -316,6 +316,61 @@ pub fn run_deeplc_finetune(
     Ok(())
 }
 
+/// Multi-head calibration of the library's `predicted_irt` against this run's anchors.
+///
+/// The fine-tune worker in its third mode: same positional contract, same reference
+/// (the confident seed PSMs), but instead of transfer-learning it fits
+/// `MultiHeadRidgeCalibration` over the base model's best-correlating LC-setup heads and
+/// writes the calibrated retention times into the library. See
+/// `RtImTrainConfig::multihead_calibration` for why one head plus a monotone curve is not
+/// the same thing. Positional contract:
+/// `deeplc_finetune.py <lib_in> <seed> <lib_out> --multihead <n_heads>`.
+#[allow(clippy::too_many_arguments)]
+pub fn run_deeplc_multihead(
+    python: &str,
+    script: &str,
+    lib_in: &str,
+    seed: &str,
+    lib_out: &str,
+    n_heads: usize,
+    q_train: f64,
+    window_holdout_frac: f64,
+    threads: usize,
+) -> Result<()> {
+    require_deeplc_version(python)?;
+    info!(
+        lib_in,
+        seed, lib_out, n_heads, q_train, "sidecar: calibrating DeepLC over multiple heads"
+    );
+    let nh = n_heads.to_string();
+    let qt = q_train.to_string();
+    let hf = window_holdout_frac.to_string();
+    let th = threads.max(1).to_string();
+    run_worker(
+        python,
+        script,
+        &[
+            lib_in,
+            seed,
+            lib_out,
+            "--multihead",
+            &nh,
+            "--q-train",
+            &qt,
+            "--window-holdout-frac",
+            &hf,
+            "--threads",
+            &th,
+            "--predict-threads",
+            &th,
+        ],
+        true,
+    )
+    .context("DeepLC multi-head calibration failed")?;
+    warn_on_retained_imported(lib_out);
+    Ok(())
+}
+
 /// DeepLC base-model re-prediction of an imported library's `predicted_irt`: the
 /// fine-tune worker with `--no-finetune`, so the table rewrite (targets predicted on their
 /// peptidoform, decoys on the DECOY_-stripped sequence, rows with non-standard residues

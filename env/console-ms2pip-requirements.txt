@@ -1,7 +1,7 @@
 # Optional MS2PIP environment for the desktop application.
 #
 # Separate from env/console-requirements.txt for historical reasons: ms2pip==4.0.0
-# needed sqlalchemy<2 while deeplc==4.1.1 needs sqlalchemy>=2. Since 4.2.0 the pair
+# needed sqlalchemy<2 while deeplc==4.4.0 needs sqlalchemy>=2. Since 4.2.0 the pair
 # resolves in one environment (env/mumdia-deeplc.yml is exactly that), so this file
 # exists only because the application still installs MS2PIP as a separate optional
 # component; folding it into the primary environment is a desktop follow-up.

@@ -38,7 +38,7 @@ written null; there is no IM calibration or IM window.
 | `rust/mumdia/crates/mumdia/src/calibrate.rs` | Calibration math: `linear_fit`, the `Loess` local-linear smoother, and `percentile`. Shared, no external deps. |
 | `rust/mumdia/crates/mumdia/src/stages/run.rs` | Orchestrator. Runs the optional DeepLC fine-tune between `search-seed` and this stage, then calls `rt_im_train::run` (see `run.rs:265-314`). |
 | `rust/mumdia/crates/mumdia/src/sidecar.rs` | `run_deeplc_finetune` (sidecar.rs:110-155): the file-contract client that invokes the fine-tune worker. |
-| `scripts/deeplc_finetune.py` | The fine-tune worker: transfer-learns DeepLC (4.1.1 or newer; older versions are refused) on the seed and writes a new library parquet with replaced `predicted_irt`. |
+| `scripts/deeplc_finetune.py` | The fine-tune worker: transfer-learns DeepLC (4.4.0 or newer; older versions are refused) on the seed and writes a new library parquet with replaced `predicted_irt`. |
 | `rust/mumdia/crates/mumdia-core/src/config.rs` | `RtImTrainConfig` (config.rs:447-512), `CalibrationMethod` enum (config.rs:56-61), and the load-time validation that rejects `calibration_method=none` (config.rs:1336-1342). |
 | `rust/mumdia/crates/mumdia-core/src/schema.rs` | `artifact::RUN_WINDOWS = ("run_windows", 1)` (schema.rs:16). |
 
@@ -376,6 +376,48 @@ of them kept the imported iRT while the targets moved to DeepLC's scale, and the
 57,501 under an invalid, non-exchangeable decoy population. The engine path predicts every
 stripped sequence and does not have this failure mode; the AIF library's decoys are shift
 decoys (99.96% paired), so its arm was unaffected.
+
+
+### 4d. The head the LOESS is given: `multihead_calibration` (2026-09-09)
+
+`deeplc.predict` returns ONE of the base model's 6,543 LC-setup heads, the one its
+`DEFAULT_TASK_NAME` names (`PXD005573_mcp`, index 938), on that setup's own gradient. The
+per-run LOESS then maps that column onto observed retention time. A smooth increasing
+curve can stretch, compress and bend the axis, so it repairs gradient length, dead time
+and curvature, but it cannot reorder two peptides: whatever elution order that one setup
+produces survives into the calibrated result. Different chromatography reorders peptides,
+which is precisely what a multitask model exists to represent.
+
+Measured on HYE B01's own confident seed anchors, 18,930 of them, split in half at random
+(fit on one half, scored on the other), median absolute error against observed RT:
+
+| path | median abs. error |
+|---|---|
+| default head, monotone fit on the training half (what the engine gets) | 79.5 s |
+| default head, monotone fit on the TEST half (the oracle: the floor for ANY monotone map) | 79.5 s |
+| `MultiHeadRidgeCalibration`, 80 heads | 28.6 s |
+
+The oracle equals the honest fit to the decimal, so on this run the LOESS is already doing
+everything a monotone map can do and **the entire 50.9 s gap is ordering**, none of it fit
+quality. That is the argument for the feature in one line: `calibrate.rs` is not the weak
+part, its input is. The best-correlating head for this run is 1229, not the default 938.
+
+The Spearman correlations look like nothing and are not: 0.9876 for the default head
+against 0.9896 for the combination. Near a correlation of one the residual is what remains
+after almost everything is explained, so a small move there is most of a 2.8x change in
+error. Reading those two numbers as "the head already orders correctly" is the mistake that
+makes the single-head design look sound.
+
+Fitting cost is negligible (2.5 s for 80 heads over 9,465 anchors) and prediction runs at
+the usual rate, because `predict_and_calibrate` pulls only the head columns the ridge reads
+rather than materialising all 6,543. `MultiHeadRidgeCalibration` never fits more head
+weights than half the reference, so a small anchor set degrades to fewer heads instead of
+overfitting.
+
+One run and one acquisition, so this is not yet a sensitivity result by the standard
+CLAUDE.md sets. The option is off by default and needs entrapment plus a second
+acquisition before that changes. What it does establish is that the ordering loss is real,
+large and not repairable by any improvement to the curve.
 
 ### 5. Optional adaptive per-region window (default off)
 

@@ -24,7 +24,7 @@
 //!
 //! Rescoring, DeepLC and match-between-runs share one interpreter happily, and that
 //! is the whole recommended workflow. MS2PIP cannot join them: at the versions this
-//! project tests, `deeplc==4.1.1` needs `sqlalchemy>=2` through `psm-utils` and
+//! project tests, `deeplc==4.4.0` needs `sqlalchemy>=2` through `psm-utils` and
 //! `ms2pip==4.0.0` needs `sqlalchemy<2`, which `uv` reports as unsatisfiable.
 //!
 //! This was checked rather than assumed, and the assumption was wrong. `ms2pip>=4.1`
@@ -725,7 +725,7 @@ mod tests {
     fn ms2pip_is_deliberately_not_in_the_primary_environment() {
         assert!(
             !REQUIRED_MODULES.contains(&"ms2pip"),
-            "ms2pip==4.0.0 needs sqlalchemy<2 and deeplc==4.1.1 needs sqlalchemy>=2;              they cannot share an environment"
+            "ms2pip==4.0.0 needs sqlalchemy<2 and deeplc==4.4.0 needs sqlalchemy>=2;              they cannot share an environment"
         );
         assert!(MS2PIP_MODULES.contains(&"ms2pip"));
     }

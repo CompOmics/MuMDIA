@@ -582,6 +582,25 @@ pub struct RtImTrainConfig {
     /// main use is library-input mode, where the base iRT comes from the imported
     /// library rather than a DeepLC prediction.
     pub finetune_deeplc: bool,
+    /// Calibrate the DeepLC base model against this run's confident seed PSMs across this
+    /// many of its best-correlating LC-setup heads, instead of fine-tuning. 0 (default) is
+    /// off. Needs DeepLC >= 4.4.0 and a `predict_frag.deeplc_python`.
+    ///
+    /// `deeplc.predict` returns ONE of the model's 6,543 heads, the setup named by its
+    /// `DEFAULT_TASK_NAME`, on that setup's gradient. The per-run LOESS then maps that
+    /// column onto observed RT, and a smooth increasing curve can stretch and bend the
+    /// axis but cannot reorder two peptides: whatever elution order that one setup
+    /// produces survives into the calibrated result. Different chromatography reorders
+    /// peptides, which is what the multitask model exists to represent, so the ordering is
+    /// the part the curve cannot repair. `MultiHeadRidgeCalibration` ranks every head
+    /// against this run's anchors, spline-calibrates the best ones and ridge-combines
+    /// them. It never fits more head weights than half the reference, so a small anchor
+    /// set degrades to fewer heads rather than overfitting.
+    ///
+    /// 80 is DeepLC's own default. Mutually exclusive with `finetune_deeplc`: both adapt
+    /// the same step against the same anchors. Benchmark-gated, so off by default: no
+    /// entrapment or second-acquisition measurement exists for it in this repository yet.
+    pub multihead_calibration: usize,
     /// DeepLC fine-tune training epochs (passed to `deeplc_finetune.py --epochs`).
     /// Early stopping with `finetune_patience` usually halts before this cap, so it
     /// is an upper bound rather than a fixed count. Only used when `finetune_deeplc`.
@@ -672,6 +691,7 @@ impl Default for RtImTrainConfig {
             loess_span: 0.3,
             fallback_rt_window_s: 120.0,
             finetune_deeplc: false,
+            multihead_calibration: 0,
             finetune_epochs: 25,   // deeplc_finetune.py default
             finetune_patience: 10, // deeplc_finetune.py default
             finetune_batch: 0,     // 0 = auto-scale to seed size
@@ -2107,6 +2127,15 @@ impl Config {
                     .into(),
             ));
         }
+        if self.rt_im_train.multihead_calibration > 0 && self.rt_im_train.finetune_deeplc {
+            return Err(Invalid(
+                "rt_im_train.multihead_calibration and rt_im_train.finetune_deeplc are \
+                 alternatives: both adapt the retention-time model to the same run against \
+                 the same confident seed PSMs, at the same point in the chain. Choose one."
+                    .into(),
+            ));
+        }
+
         // `finetune_batch = 0` is the documented automatic batch size (see the field), so
         // only the epoch count has a lower bound. Rejecting the zero batch made simply
         // enabling the fine-tune invalid with its own defaults (docs/30 R1).
@@ -2570,6 +2599,27 @@ mod tests {
             assert!(Config::from_json(ok).is_ok(), "{ok} must be accepted");
         }
         assert!(Config::default().validate().is_ok());
+    }
+
+    #[test]
+    fn multihead_calibration_and_the_fine_tune_are_alternatives() {
+        // Both adapt the same step against the same anchors, so asking for both is a
+        // configuration error rather than a silent precedence rule.
+        let e = Config::from_json(
+            r#"{"rt_im_train":{"finetune_deeplc":true,"multihead_calibration":80}}"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("alternatives"), "{e}");
+        // Either alone is fine, and 0 is off.
+        for ok in [
+            r#"{"rt_im_train":{"multihead_calibration":80}}"#,
+            r#"{"rt_im_train":{"multihead_calibration":1}}"#,
+            r#"{"rt_im_train":{"multihead_calibration":0,"finetune_deeplc":true}}"#,
+        ] {
+            assert!(Config::from_json(ok).is_ok(), "{ok} must be accepted");
+        }
+        assert_eq!(Config::default().rt_im_train.multihead_calibration, 0);
     }
 
     #[test]

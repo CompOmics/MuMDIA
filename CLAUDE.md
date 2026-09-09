@@ -257,12 +257,25 @@ changed to 0.6 to match the default classifier. `native_tda` has since risen to
 describes this configuration and the default is back to 0.2. Re-derive the optimum
 rather than inheriting it if you change the library, the apex mode or the folds.
 
-DeepLC 4.1.1 or newer is required wherever DeepLC runs (`predict-frag` in FASTA mode, the
+DeepLC 4.4.0 or newer is required wherever DeepLC runs (`predict-frag` in FASTA mode, the
 optional fine-tune): `mumdia doctor` fails on an older one, `sidecar::require_deeplc_version`
 refuses to launch either worker, and both worker scripts repeat the check
 (`mumdia_core::constants::MIN_DEEPLC_VERSION` is the single Rust constant). The default retention-time workflow is
 prediction plus per-run LOESS calibration with `finetune_deeplc = false`, and that default
 is only sound on a base model that does not memorise its anchors (4.0.0a2 did).
+
+`rt_im_train.multihead_calibration` (default 0, off) is the fourth RT lever and the
+reason the floor is 4.4.0. `deeplc.predict` returns ONE of the base model's 6,543
+LC-setup heads, the one its `DEFAULT_TASK_NAME` names, on that setup's own gradient. The
+per-run LOESS then maps that column onto observed RT, and a smooth increasing curve can
+stretch and bend the axis but cannot reorder two peptides, so that setup's elution order
+survives into the result. Different chromatography reorders peptides, which is what the
+multitask model exists to represent. Set to N and the worker fits
+`MultiHeadRidgeCalibration` over the N best-correlating heads against this run's confident
+seed PSMs instead of fine-tuning, so the ordering is assembled from the setups that
+resemble the run. It occupies the fine-tune's slot and validation refuses both at once.
+Benchmark-gated and off by default: no entrapment or second-acquisition measurement exists
+for it here yet.
 
 Three RT rules, each measured in `docs/08_rt_im_train.md` and restated from the
 failure side in `docs/17_troubleshooting.md`:

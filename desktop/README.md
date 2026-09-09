@@ -119,7 +119,7 @@ narrow on purpose -- "this configuration requires no sidecar at all", asked of
 MS2PIP could not share an environment with DeepLC at the versions this project
 tested until 2026-09-07:
 
-    deeplc==4.1.1  -> psm-utils>=1.5 -> sqlalchemy>=2
+    deeplc==4.4.0  -> psm-utils>=1.5 -> sqlalchemy>=2
     ms2pip==4.0.0  ->                   sqlalchemy>=1.3,<2
 
 `uv` reported the pair as unsatisfiable, so the primary environment covers
