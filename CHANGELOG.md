@@ -23,6 +23,15 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ## [Unreleased]
 
+### Changed
+
+- The desktop application builds against `sha2` 0.11. Its `finalize()` returns
+  `hybrid_array::Array` rather than the old `GenericArray`, which does not implement
+  `LowerHex`, so the four `format!("{:x}", ..)` sites move to a `components::hex`
+  helper. The strings are unchanged, and a test pins them against the canonical
+  SHA-256 vectors, because they are compared with published checksums and used as
+  cache directory names.
+
 ## [0.2.0] - 2026-09-08
 
 Three code reviews and their fixes (`docs/29_code_review_2026-09-07.md`,

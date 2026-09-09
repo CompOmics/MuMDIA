@@ -130,6 +130,22 @@ impl Env {
 /// Packages whose version is worth reporting, because it changes results.
 const REPORT_VERSIONS: &[&str] = &["deeplc", "torch", "mokapot", "ms2pip", "numpy"];
 
+/// Lowercase hex of a digest.
+///
+/// `sha2` 0.11 returns `hybrid_array::Array` from `finalize()` rather than the old
+/// `GenericArray`, and that type does not implement `LowerHex`, so the `format!("{:x}",
+/// ..)` this replaced stopped compiling. Writing the bytes out keeps the string
+/// identical, which matters: these digests are compared against published checksums and
+/// used as cache directory names, so a changed spelling would reject good downloads and
+/// miss every existing cache entry.
+pub fn hex(bytes: impl AsRef<[u8]>) -> String {
+    use std::fmt::Write as _;
+    bytes.as_ref().iter().fold(String::new(), |mut s, b| {
+        let _ = write!(s, "{b:02x}");
+        s
+    })
+}
+
 /// Per-user application data, where the managed environment is created.
 ///
 /// Not beside the executable: on Windows that is under Program Files, which a
@@ -571,6 +587,28 @@ pub fn install(installer: Arc<Installer>, env: Env) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hex_matches_the_lowerhex_spelling_it_replaced() {
+        // These strings are compared against published SHA-256 checksums and used as
+        // cache directory names, so the spelling is a compatibility surface, not a
+        // detail: a changed one would reject good downloads and miss every existing
+        // cache entry. `sha2` 0.11 stopped implementing `LowerHex` on its digest type,
+        // which is why the formatting moved here.
+        use sha2::{Digest, Sha256};
+        assert_eq!(
+            hex(Sha256::digest(b"")),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "the empty-input SHA-256, as every other tool prints it"
+        );
+        assert_eq!(
+            hex(Sha256::digest(b"abc")),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        // Zero-padded, lowercase, no separators, and an empty input is an empty string.
+        assert_eq!(hex([0x00u8, 0x0f, 0xff]), "000fff");
+        assert_eq!(hex([]), "");
+    }
 
     #[test]
     fn both_requirement_sets_are_compiled_in_and_look_right() {
