@@ -789,7 +789,10 @@ mod tests {
         // The collision. A Waters `.raw` directory sent to ThermoRawFileParser fails
         // with something unhelpful, and the interface would have offered the wrong
         // Install button.
-        let d = std::env::temp_dir().join("mumdia-thermo-waters");
+        // Unique per process, like every other temp fixture in the workspace: a fixed name
+        // plus the delete-on-entry below races a second `cargo test` on one machine
+        // (docs/14). Hit twice during the 0.2.0 and 0.3.0 releases.
+        let d = std::env::temp_dir().join(format!("mumdia-thermo-waters-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(d.join("waters.raw")).unwrap();
         let p = d.join("waters.raw");
@@ -802,7 +805,7 @@ mod tests {
 
     #[test]
     fn a_d_directory_is_labelled_by_its_contents() {
-        let d = std::env::temp_dir().join("mumdia-thermo-dlabel");
+        let d = std::env::temp_dir().join(format!("mumdia-thermo-dlabel-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         let tims = d.join("tims.d");
         std::fs::create_dir_all(&tims).unwrap();
@@ -825,7 +828,8 @@ mod tests {
     fn a_zip_entry_that_escapes_the_target_is_refused() {
         // A zip is untrusted input even from a trusted publisher. Without the
         // `enclosed_name` check this entry would be written outside the target.
-        let dir = std::env::temp_dir().join("mumdia-thermo-traversal");
+        let dir =
+            std::env::temp_dir().join(format!("mumdia-thermo-traversal-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let archive = dir.join("evil.zip");
@@ -858,7 +862,7 @@ mod tests {
 
     #[test]
     fn a_normal_zip_round_trips_with_its_directory_structure() {
-        let dir = std::env::temp_dir().join("mumdia-thermo-unzip");
+        let dir = std::env::temp_dir().join(format!("mumdia-thermo-unzip-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let archive = dir.join("ok.zip");

@@ -1607,7 +1607,11 @@ mod tests {
 
     #[test]
     fn the_predicted_parquet_is_found_by_name_or_by_search() {
-        let dir = std::env::temp_dir().join("mumdia-diann-test-lib");
+        // Unique per process, like every other temp fixture in the workspace: a fixed name
+        // plus the delete-on-entry below races a second `cargo test` on one machine
+        // (docs/14). Hit twice during the 0.2.0 and 0.3.0 releases.
+        let dir =
+            std::env::temp_dir().join(format!("mumdia-diann-test-lib-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
@@ -1900,7 +1904,7 @@ mod tests {
         // `.speclib`; only an empirical one is Parquet. Without recognising the
         // `.speclib`, a successful prediction was reported as "DIA-NN finished but
         // wrote no Parquet library" and the user was left with a file nothing reads.
-        let dir = std::env::temp_dir().join("mumdia-diann-speclib");
+        let dir = std::env::temp_dir().join(format!("mumdia-diann-speclib-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
@@ -2011,7 +2015,8 @@ mod tests {
         // search, and the engine then either rejected the library or accepted a
         // partial decoy population -- with no eviction and no way to force a rebuild.
         // The marker is written last, after both tables are complete.
-        let dir = std::env::temp_dir().join("mumdia-diann-halfcache");
+        let dir =
+            std::env::temp_dir().join(format!("mumdia-diann-halfcache-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
@@ -2104,7 +2109,7 @@ mod tests {
         // `pop()` returned `lib_precursors_targets.parquet` and MuMDIA's own schema
         // table was imported as the DIA-NN library, reporting success on a library
         // that did not match the FASTA.
-        let dir = std::env::temp_dir().join("mumdia-diann-anchor");
+        let dir = std::env::temp_dir().join(format!("mumdia-diann-anchor-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 

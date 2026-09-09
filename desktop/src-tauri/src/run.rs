@@ -1530,7 +1530,11 @@ mod multifile_tests {
         // the results screen blank after every experiment. And the counts it does
         // yield are experiment-wide: the grouped q columns are grouped across the whole
         // experiment, so a per-file reading of them is diluted by ~1/n_runs.
-        let dir = std::env::temp_dir().join("mumdia-results-experiment");
+        // Unique per process, like every other temp fixture in the workspace: a fixed name
+        // plus the delete-on-entry below races a second `cargo test` on one machine
+        // (docs/14). Hit twice during the 0.2.0 and 0.3.0 releases.
+        let dir =
+            std::env::temp_dir().join(format!("mumdia-results-experiment-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
