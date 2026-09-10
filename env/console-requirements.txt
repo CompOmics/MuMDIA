@@ -16,6 +16,11 @@
 #
 # Versions are the ones the project already tests. Keep them in step with
 # env/mumdia-deeplc.yml and env/mumdia-rescore.yml; they are the same pins, merged.
+# uv gives an `--extra-index-url` priority OVER PyPI, and this index also carries an
+# old vendored `setuptools`. The installer therefore passes
+# `--index-strategy unsafe-best-match`, without which the `setuptools>=83` below is
+# unsatisfiable and the desktop environment cannot be created at all. Keep the two
+# together; `ci/check_console_envs.py` checks that they stay together.
 --extra-index-url https://download.pytorch.org/whl/cpu
 
 # Retention-time prediction and per-run fine-tuning. 4.4.0 is a floor, not a

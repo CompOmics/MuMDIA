@@ -27,12 +27,28 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-09-10
+
+Fixes a v0.3.0 desktop installer that could not create its Python environment at all.
+
 ### Fixed
 
-- Nine desktop test fixtures used a fixed temporary directory and deleted it on entry, so
-  two `cargo test` runs on one machine raced and one lost its files mid-test. They are
-  unique per process, like every other temporary fixture in the workspace (`docs/14`). Hit
-  twice while preparing releases; two concurrent runs now both pass.
+- The desktop application's "installing the analysis packages" step failed on every
+  machine with `Because only setuptools<=78.1.0 is available and you require
+  setuptools>=83, we can conclude that your requirements are unsatisfiable`.
+  `env/console-requirements.txt` adds the PyTorch CPU index for `torch==2.14.0+cpu`, uv
+  gives an `--extra-index-url` priority over PyPI, and that index also carries an old
+  vendored `setuptools`, so under uv's default `first-index` strategy the resolver never
+  reached PyPI's setuptools 84 and the `setuptools>=83` pin that closes PYSEC-2026-3447
+  made the environment unresolvable. The installer passes
+  `--index-strategy unsafe-best-match`, which is what uv's own PyTorch documentation
+  prescribes and which both first-party indexes already justify; the environment resolves
+  to setuptools 84.0.0 from PyPI and torch 2.14.0+cpu from the PyTorch index. Verified by
+  building the environment end to end, not only by resolving it.
+- `ci/check_console_envs.py` resolves both `env/console-*.txt` files with uv and asserts
+  the installer still passes that flag. Nothing in CI read those files before, which is
+  how a broken installer shipped: the conda specifications beside them are exercised by
+  the sidecar-import jobs, but the desktop application installs neither of those.
 
 ## [0.3.0] - 2026-09-09
 
@@ -84,6 +100,13 @@ turning it on measured +4.8% stripped peptides on the HYE AIF benchmark and
   helper. The strings are unchanged, and a test pins them against the canonical
   SHA-256 vectors, because they are compared with published checksums and used as
   cache directory names.
+
+### Fixed
+
+- Nine desktop test fixtures used a fixed temporary directory and deleted it on entry, so
+  two `cargo test` runs on one machine raced and one lost its files mid-test. They are
+  unique per process, like every other temporary fixture in the workspace (`docs/14`). Hit
+  twice while preparing releases; two concurrent runs now both pass.
 
 ## [0.2.0] - 2026-09-08
 
