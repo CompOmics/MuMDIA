@@ -493,6 +493,33 @@ pub fn install(installer: Arc<Installer>, env: Env) -> Result<(), String> {
                 vec![
                     "pip".into(),
                     "install".into(),
+                    // Consider every index for every package, rather than stopping at
+                    // the first index that happens to carry the name.
+                    //
+                    // `env/console-requirements.txt` adds the PyTorch CPU index for
+                    // `torch==2.14.0+cpu`, and uv gives an `--extra-index-url` PRIORITY
+                    // over PyPI. That index also carries an old vendored `setuptools`
+                    // (<= 78.1.0), so under uv's default `first-index` strategy the
+                    // resolver found `setuptools` there, never looked at PyPI, and the
+                    // `setuptools>=83` line that closes PYSEC-2026-3447 made the whole
+                    // environment unsatisfiable:
+                    //
+                    //   Because only setuptools<=78.1.0 is available and you require
+                    //   setuptools>=83, we can conclude that your requirements are
+                    //   unsatisfiable.
+                    //
+                    // That is the install failing on a first run, which is the only run
+                    // most users get. `unsafe-best-match` is what uv's own PyTorch
+                    // documentation prescribes here; the name is about dependency
+                    // confusion between a trusted and an untrusted index, and both of
+                    // these are first-party ones this application already downloads
+                    // from. Resolved this way: setuptools 84.0.0 from PyPI, torch
+                    // 2.14.0+cpu from the PyTorch index.
+                    //
+                    // `ci/check_console_envs.py` resolves both requirement files with
+                    // this same flag, and asserts this argument is still here.
+                    "--index-strategy".into(),
+                    "unsafe-best-match".into(),
                     "--python".into(),
                     venv.display().to_string(),
                     "-r".into(),
