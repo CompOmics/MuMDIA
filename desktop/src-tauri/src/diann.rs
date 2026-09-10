@@ -68,8 +68,14 @@ results. Record the version you used.";
 
 /// Where a located DIA-NN, and the acknowledgement, are remembered.
 fn state_file() -> PathBuf {
-    crate::components::data_dir().join("diann.json")
+    crate::components::data_dir().join(STATE_FILE_NAME)
 }
+
+/// Names under the data directory, shared with `components::inventory` so that the
+/// removal offered on the Setup screen cannot drift out of step with what is written.
+pub const STATE_FILE_NAME: &str = "diann.json";
+pub const MANAGED_DIR_NAME: &str = "diann-1.8.1";
+pub const LIBRARY_CACHE_NAME: &str = "libraries";
 
 #[derive(Serialize, Deserialize, Default, Clone, Debug)]
 struct Saved {
@@ -597,6 +603,17 @@ pub struct Installer {
 }
 
 impl Installer {
+    /// Drop a finished install's outcome, after the files it produced were removed.
+    ///
+    /// The state is deliberately sticky so a caller polling for `done` cannot miss it;
+    /// without this, a DIA-NN removed from the Setup screen would go on reporting
+    /// itself installed until the application restarted.
+    pub fn forget(&self) {
+        if let Ok(mut s) = self.state.lock() {
+            *s = InstallState::default();
+        }
+    }
+
     pub fn snapshot(&self) -> InstallState {
         self.state
             .lock()
@@ -635,7 +652,7 @@ impl Installer {
 
 /// Where a managed 1.8.1 is extracted. Per-user, so no administrator rights.
 fn managed_dir() -> PathBuf {
-    crate::components::data_dir().join("diann-1.8.1")
+    crate::components::data_dir().join(MANAGED_DIR_NAME)
 }
 
 /// Whether this platform can be offered the download at all, and what it costs.
@@ -945,7 +962,7 @@ pub fn library_cache_dir(req: &BuildRequest, diann_version: &str) -> Result<Path
     );
     let key = crate::components::hex(h.finalize());
     Ok(crate::components::data_dir()
-        .join("libraries")
+        .join(LIBRARY_CACHE_NAME)
         .join(&key[..16]))
 }
 
@@ -1062,6 +1079,17 @@ pub struct Builder {
 }
 
 impl Builder {
+    /// Forget a finished build, after the library cache it wrote was removed.
+    ///
+    /// `BuildState` carries the paths of the two tables the build produced, and the
+    /// search screen offers to reuse them. Removing the cache without clearing this
+    /// would offer a library that is no longer on disk.
+    pub fn forget(&self) {
+        if let Ok(mut s) = self.state.lock() {
+            *s = BuildState::default();
+        }
+    }
+
     /// Stop the running build. Safe to call when nothing is running.
     pub fn cancel(&self) {
         self.cancelled

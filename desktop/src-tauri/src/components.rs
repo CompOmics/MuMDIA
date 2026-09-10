@@ -228,8 +228,11 @@ pub fn stamp_env(cmd: &mut std::process::Command) {
 
 /// Where a managed ThermoRawFileParser is unpacked.
 pub fn thermo_dir() -> PathBuf {
-    data_dir().join("ThermoRawFileParser")
+    data_dir().join(THERMO_DIR_NAME)
 }
+
+/// Shared with [`inventory`], which offers to remove this directory.
+pub const THERMO_DIR_NAME: &str = "ThermoRawFileParser";
 
 /// The managed ThermoRawFileParser, but only when it actually executes.
 ///
@@ -401,6 +404,28 @@ impl Installer {
             Env::Primary => &self.primary,
             Env::Ms2pip => &self.ms2pip,
         }
+    }
+
+    /// Forget a finished installation's outcome, after its files were removed.
+    ///
+    /// `refresh` preserves a terminal `done` or `failed` on purpose (see below), so
+    /// without this a removed environment would keep reporting itself installed until
+    /// the application restarted.
+    pub fn forget(&self, env: Env) {
+        if let Ok(mut s) = self.slot(env).lock() {
+            *s = status_of(env);
+        }
+    }
+
+    /// Whether an installation is running, without probing the interpreter.
+    ///
+    /// `refresh` spawns Python to ask what it can import, which is far too expensive
+    /// for a guard that runs before every removal.
+    pub fn busy(&self, env: Env) -> bool {
+        self.slot(env)
+            .lock()
+            .map(|s| s.install_status == "installing")
+            .unwrap_or(false)
     }
 
     /// Refresh one environment from disk. Cheap enough to call whenever the screen
@@ -611,9 +636,340 @@ pub fn install(installer: Arc<Installer>, env: Env) -> Result<(), String> {
     Ok(())
 }
 
+// -- removing managed data ---------------------------------------------------
+//
+// # Why the application has to offer this
+//
+// Everything above is created at runtime under [`data_dir`] by the running
+// application: two Python environments, the Thermo converter, an optionally
+// downloaded DIA-NN, the predicted-library cache and the saved settings. The MSI
+// removes exactly what it placed under Program Files, so an uninstall leaves all of
+// it behind. Measured on one development machine: 8.9 GB, with nothing in the
+// interface that could remove it.
+//
+// That the installer leaves it is not itself the bug. An upgrade reinstalls over the
+// same data directory and reuses a several-hundred-megabyte download and a library
+// cache that costs hours to rebuild, and an MSI "uninstall" also runs during some
+// upgrade paths, so deleting either as a side effect of a version change would be
+// worse than leaving files behind. The removal therefore lives here, where it is
+// explicit, itemised with its size, and undone by reinstalling the component.
+
+/// One removable piece of managed data.
+#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+pub struct Removable {
+    /// Stable key the interface passes back to [`remove`].
+    pub id: String,
+    pub label: String,
+    /// What is lost, and what getting it back costs.
+    pub detail: String,
+    /// Absolute paths this item covers. Every one of them exists.
+    pub paths: Vec<String>,
+    pub bytes: u64,
+    /// Removing this discards work measured in hours rather than minutes, so the
+    /// interface warns rather than merely confirming.
+    pub costly: bool,
+}
+
+/// Bytes under `p`: the file itself, or everything below a directory.
+///
+/// Links count as nothing and are never followed. A link into the user's own data
+/// would otherwise inflate the figure shown on the confirmation, and worse, imply
+/// that removing a component frees space it does not own.
+fn size_on_disk(p: &Path) -> u64 {
+    let Ok(md) = std::fs::symlink_metadata(p) else {
+        return 0;
+    };
+    if md.file_type().is_symlink() {
+        0
+    } else if md.is_dir() {
+        std::fs::read_dir(p)
+            .map(|rd| rd.flatten().map(|e| size_on_disk(&e.path())).sum())
+            .unwrap_or(0)
+    } else {
+        md.len()
+    }
+}
+
+/// What this application has created under `root`, as removable items.
+///
+/// Only paths it writes itself are listed, each through the constant the module that
+/// owns it exports, so a renamed directory cannot quietly become unremovable. An item
+/// with nothing on disk is omitted: the interface shows what exists rather than a
+/// catalogue of what could.
+fn inventory(root: &Path) -> Vec<Removable> {
+    let items: Vec<(&str, &str, &str, bool, Vec<PathBuf>)> = vec![
+        (
+            "primary",
+            "Required components",
+            "The managed Python environment for retention-time modelling and rescoring. \
+             Reinstalling it downloads a few hundred megabytes again.",
+            false,
+            vec![
+                root.join(Env::Primary.dir_name()),
+                root.join(Env::Primary.requirements_name()),
+            ],
+        ),
+        (
+            "ms2pip",
+            "MS2PIP environment",
+            "The optional second Python environment, needed only to build a library from \
+             a FASTA with predicted fragment intensities.",
+            false,
+            vec![
+                root.join(Env::Ms2pip.dir_name()),
+                root.join(Env::Ms2pip.requirements_name()),
+            ],
+        ),
+        (
+            "thermo",
+            "Thermo .raw converter",
+            "ThermoRawFileParser, downloaded to convert Thermo .raw files to mzML. mzML \
+             files it already produced are not affected.",
+            false,
+            vec![root.join(THERMO_DIR_NAME)],
+        ),
+        (
+            "diann",
+            "DIA-NN 1.8.1",
+            "The copy of DIA-NN downloaded through this application. A DIA-NN you \
+             installed yourself lives elsewhere and is not touched.",
+            false,
+            vec![root.join(crate::diann::MANAGED_DIR_NAME)],
+        ),
+        (
+            "libraries",
+            "Predicted spectral libraries",
+            "Libraries DIA-NN predicted from your FASTA files, kept so that the same \
+             library is not predicted twice. Rebuilding one means running the prediction \
+             again, which takes hours on a whole proteome.",
+            true,
+            vec![root.join(crate::diann::LIBRARY_CACHE_NAME)],
+        ),
+        (
+            "settings",
+            "Saved settings",
+            "Configurations saved from the Settings screen, and the path of the DIA-NN you \
+             located. A few kilobytes; searches and their results are untouched.",
+            false,
+            vec![
+                root.join(crate::settings::CONFIG_DIR_NAME),
+                root.join(crate::diann::STATE_FILE_NAME),
+            ],
+        ),
+    ];
+
+    items
+        .into_iter()
+        .filter_map(|(id, label, detail, costly, paths)| {
+            // `symlink_metadata` rather than `exists`, so a broken link is still
+            // reported and can still be removed.
+            let paths: Vec<PathBuf> = paths
+                .into_iter()
+                .filter(|p| std::fs::symlink_metadata(p).is_ok())
+                .collect();
+            if paths.is_empty() {
+                return None;
+            }
+            Some(Removable {
+                id: id.into(),
+                label: label.into(),
+                detail: detail.into(),
+                bytes: paths.iter().map(|p| size_on_disk(p)).sum(),
+                paths: paths.iter().map(|p| p.display().to_string()).collect(),
+                costly,
+            })
+        })
+        .collect()
+}
+
+/// Delete one inventory item under `root`, returning the bytes freed.
+fn remove_in(root: &Path, id: &str) -> Result<u64, String> {
+    let item = inventory(root)
+        .into_iter()
+        .find(|r| r.id == id)
+        .ok_or_else(|| format!("`{id}` is not a removable component, or is not installed"))?;
+
+    // A recursive delete driven by a string from the interface, so containment is
+    // checked before anything is touched -- and checked on the real PARENT directory,
+    // because canonicalising the item itself would follow a link and resolve to the
+    // target this then deletes.
+    let real_root = root
+        .canonicalize()
+        .map_err(|e| format!("cannot resolve {}: {e}", root.display()))?;
+    let mut freed = 0u64;
+    for path in &item.paths {
+        let p = PathBuf::from(path);
+        let parent = p
+            .parent()
+            .ok_or_else(|| format!("{path} has no parent directory"))?
+            .canonicalize()
+            .map_err(|e| format!("cannot resolve the parent of {path}: {e}"))?;
+        if !parent.starts_with(&real_root) {
+            return Err(format!(
+                "refusing to remove {path}: it resolves outside {}",
+                root.display()
+            ));
+        }
+        let md =
+            std::fs::symlink_metadata(&p).map_err(|e| format!("cannot inspect {path}: {e}"))?;
+        if md.file_type().is_symlink() {
+            return Err(format!(
+                "refusing to remove {path}: it is a link, and this application creates none \
+                 here, so what it points at is not this application's to delete"
+            ));
+        }
+        freed += size_on_disk(&p);
+        let done = if md.is_dir() {
+            std::fs::remove_dir_all(&p)
+        } else {
+            std::fs::remove_file(&p)
+        };
+        done.map_err(|e| {
+            format!(
+                "could not remove {path}: {e}. Close whatever is holding it open -- on \
+                 Windows a running Python or an open file manager window will -- and try \
+                 again."
+            )
+        })?;
+    }
+    Ok(freed)
+}
+
+/// What this application has created under [`data_dir`], as removable items.
+pub fn removable() -> Vec<Removable> {
+    inventory(&data_dir())
+}
+
+/// Delete one removable item, returning the bytes freed.
+///
+/// Callers must first establish that nothing is using the files: an installation
+/// writing into an environment, or a search reading from one.
+pub fn remove(id: &str) -> Result<u64, String> {
+    remove_in(&data_dir(), id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A scratch data directory of this process's own, so two concurrent `cargo test`
+    /// runs cannot delete each other's files.
+    fn scratch(name: &str) -> PathBuf {
+        let d =
+            std::env::temp_dir().join(format!("mumdia-inventory-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn file(p: &Path, bytes: usize) {
+        if let Some(parent) = p.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(p, vec![b'x'; bytes]).unwrap();
+    }
+
+    #[test]
+    fn the_inventory_lists_only_what_is_on_disk() {
+        let d = scratch("listing");
+        assert!(
+            inventory(&d).is_empty(),
+            "an empty data directory has nothing to remove"
+        );
+
+        file(&d.join("python").join("pyvenv.cfg"), 10);
+        file(&d.join("console-requirements.txt"), 5);
+        file(
+            &d.join(crate::diann::LIBRARY_CACHE_NAME)
+                .join("abc")
+                .join("lib_precursors.parquet"),
+            100,
+        );
+
+        let inv = inventory(&d);
+        let ids: Vec<&str> = inv.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["primary", "libraries"],
+            "in a fixed order, only what exists"
+        );
+
+        let primary = &inv[0];
+        assert_eq!(
+            primary.bytes, 15,
+            "the environment and its requirements file"
+        );
+        assert_eq!(primary.paths.len(), 2);
+        assert!(!primary.costly);
+        // The library cache is the one item whose loss is measured in hours.
+        assert_eq!(inv[1].bytes, 100);
+        assert!(
+            inv[1].costly,
+            "rebuilding a predicted library is a prediction, not a download"
+        );
+
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn removing_an_item_deletes_exactly_its_own_paths() {
+        let d = scratch("removal");
+        file(&d.join("python").join("lib").join("torch.so"), 2048);
+        file(&d.join("console-requirements.txt"), 12);
+        file(
+            &d.join(crate::settings::CONFIG_DIR_NAME).join("my.json"),
+            30,
+        );
+
+        let freed = remove_in(&d, "primary").unwrap();
+        assert_eq!(freed, 2060, "everything the item covers, and nothing else");
+        assert!(!d.join("python").exists());
+        assert!(!d.join("console-requirements.txt").exists());
+        // A neighbouring item is untouched, and is still offered.
+        assert!(d
+            .join(crate::settings::CONFIG_DIR_NAME)
+            .join("my.json")
+            .is_file());
+        assert_eq!(
+            inventory(&d)
+                .iter()
+                .map(|r| r.id.clone())
+                .collect::<Vec<_>>(),
+            vec!["settings".to_string()]
+        );
+
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn an_unknown_or_absent_item_is_refused_rather_than_guessed() {
+        let d = scratch("unknown");
+        // A recursive delete taking a string from the interface: anything that is not
+        // one of the known ids must fail before the disk is touched.
+        for id in ["", "..", "python", "primary", "../../Users"] {
+            let e = remove_in(&d, id).unwrap_err();
+            assert!(e.contains("not a removable component"), "{id}: {e}");
+        }
+        // `primary` is refused above only because nothing is installed. Once it is, the
+        // same id works: the guard is presence, not a name filter.
+        file(&d.join("python").join("pyvenv.cfg"), 1);
+        assert!(remove_in(&d, "primary").is_ok());
+
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_size_is_zero_rather_than_an_error_when_there_is_nothing_there() {
+        let d = scratch("sizes");
+        file(&d.join("outside.bin"), 4096);
+        assert_eq!(size_on_disk(&d.join("outside.bin")), 4096);
+        assert_eq!(
+            size_on_disk(&d.join("missing")),
+            0,
+            "an absent path contributes nothing, and does not fail the listing"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
 
     #[test]
     fn hex_matches_the_lowerhex_spelling_it_replaced() {

@@ -305,6 +305,24 @@ pub struct Installer {
 }
 
 impl Installer {
+    /// Drop a finished install's outcome, after the converter it unpacked was removed.
+    ///
+    /// `refresh` preserves a terminal `done` or `failed` on purpose, so without this a
+    /// removed converter would keep reporting itself installed.
+    pub fn forget(&self) {
+        if let Ok(mut s) = self.state.lock() {
+            *s = Status::default();
+        }
+    }
+
+    /// Whether an installation is running, without touching the disk.
+    pub fn busy(&self) -> bool {
+        self.state
+            .lock()
+            .map(|s| s.install_status == "installing")
+            .unwrap_or(false)
+    }
+
     /// Probe the disk, preserving any terminal state from an install.
     ///
     /// Same reasoning as `components::Installer::refresh`: a fresh probe carries

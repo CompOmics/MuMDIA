@@ -57,6 +57,9 @@ const state = {
   timer: null,
   lastStatus: null,
   outDir: "",
+  // Where the application keeps its downloaded and generated files, for the button
+  // that opens it. Reported by the backend rather than guessed here.
+  managedDir: "",
   componentsReady: false,
   // The engine was found at startup. Start is only ever enabled when it was.
   engineOk: false,
@@ -103,6 +106,13 @@ function baseName(p) {
 function show(el, on) {
   if (on) el.removeAttribute("hidden");
   else el.setAttribute("hidden", "");
+}
+
+function node(tag, cls, text) {
+  const n = document.createElement(tag);
+  if (cls) n.className = cls;
+  if (text !== undefined) n.textContent = text;
+  return n;
 }
 
 function banner(el, message) {
@@ -156,7 +166,12 @@ async function init() {
     b.addEventListener("click", () => {
       if (b.disabled) return;
       screen(b.dataset.screen);
-      if (b.dataset.screen === "setup") { refreshComponents(); refreshDiann(); refreshThermo(); }
+      if (b.dataset.screen === "setup") {
+        refreshComponents();
+        refreshDiann();
+        refreshThermo();
+        refreshManaged();
+      }
       if (b.dataset.screen === "settings") loadSettings();
       if (b.dataset.screen === "history") loadHistory();
     });
@@ -195,6 +210,11 @@ async function init() {
     }
     refreshDiann();
   });
+  $("managed-reveal").addEventListener("click", () =>
+    invoke("reveal", { path: state.managedDir }).catch((e) =>
+      banner($("managed-error"), String(e))
+    )
+  );
   refreshComponents();
   refreshDiann();
   refreshThermo();
@@ -520,6 +540,9 @@ async function refreshComponents() {
   } else if (!busy && state.setupTimer) {
     clearInterval(state.setupTimer);
     state.setupTimer = null;
+    // An installation just finished, so the managed-data sizes are stale. Once, on
+    // the transition: walking a Python environment is too slow for the poll itself.
+    refreshManaged();
   }
 }
 
@@ -532,6 +555,116 @@ async function installComponents(env) {
     return;
   }
   refreshComponents();
+}
+
+// -- managed data ------------------------------------------------------------
+// Everything the application downloads or builds lives under one per-user folder,
+// and the installer does not remove it: an MSI uninstalls what it installed, and all
+// of this is written at runtime. Several gigabytes left behind with no visible way to
+// remove them is the reason this card exists.
+//
+// Nothing is deleted on a single click. The confirmation names the exact paths,
+// because "Required components" is a label and `C:\Users\...\MuMDIA\python` is what
+// actually disappears, and the spectral library cache in particular can be hours of
+// prediction rather than a download.
+const SIZE_UNITS = ["B", "KB", "MB", "GB", "TB"];
+
+function bytesLabel(n) {
+  let v = Number(n) || 0;
+  let i = 0;
+  while (v >= 1024 && i < SIZE_UNITS.length - 1) {
+    v /= 1024;
+    i += 1;
+  }
+  return `${i === 0 ? v : v.toFixed(v < 10 ? 1 : 0)} ${SIZE_UNITS[i]}`;
+}
+
+function managedRow(item) {
+  const row = node("div", "dataitem");
+  row.append(
+    node("div", "dname", item.label),
+    node("div", "dsize", bytesLabel(item.bytes)),
+    node("div", "dhelp", item.detail)
+  );
+
+  const act = node("div", "dact");
+  const remove = node("button", "btn quiet", "Remove");
+  act.appendChild(remove);
+  row.appendChild(act);
+
+  const ask = node("div", "dconfirm");
+  ask.hidden = true;
+  ask.append(
+    node("p", "dpaths", item.paths.join("\n")),
+    node(
+      "p",
+      "dwarn",
+      item.costly
+        ? "This is not downloaded again. Getting it back means running the prediction " +
+            "once more, which takes hours on a whole proteome."
+        : "This is deleted permanently. Reinstall it from this screen when you need it."
+    )
+  );
+  const buttons = node("div", "dact");
+  const yes = node("button", "btn", "Delete permanently");
+  const no = node("button", "btn quiet", "Cancel");
+  buttons.append(yes, no);
+  ask.appendChild(buttons);
+  row.appendChild(ask);
+
+  remove.addEventListener("click", () => {
+    ask.hidden = false;
+    remove.disabled = true;
+  });
+  no.addEventListener("click", () => {
+    ask.hidden = true;
+    remove.disabled = false;
+  });
+  yes.addEventListener("click", async () => {
+    yes.disabled = true;
+    no.disabled = true;
+    yes.textContent = "Removing\u2026";
+    banner($("managed-error"), "");
+    banner($("managed-freed"), "");
+    try {
+      const r = await invoke("components_remove", { id: item.id });
+      renderManaged(r);
+      banner($("managed-freed"), `Removed ${item.label}. ${bytesLabel(r.freed_bytes)} freed.`);
+      // The other Setup cards read the same folder, so they are now stale.
+      refreshComponents();
+      refreshThermo();
+      refreshDiann();
+    } catch (e) {
+      banner($("managed-error"), String(e));
+      yes.disabled = false;
+      no.disabled = false;
+      yes.textContent = "Delete permanently";
+    }
+  });
+  return row;
+}
+
+function renderManaged(m) {
+  state.managedDir = m.dir;
+  $("managed-where").textContent = m.dir;
+  const items = m.items || [];
+  $("managed-total").textContent = items.length
+    ? bytesLabel(items.reduce((a, x) => a + x.bytes, 0))
+    : "empty";
+  show($("managed-empty"), items.length === 0);
+  const host = $("managed-items");
+  host.textContent = "";
+  for (const it of items) host.appendChild(managedRow(it));
+}
+
+// Sizing the folder walks every file in it, so this runs when the screen is opened
+// and after a removal -- never on the installation poll, which ticks every 900 ms.
+async function refreshManaged() {
+  try {
+    renderManaged(await invoke("components_removable"));
+  } catch (e) {
+    banner($("managed-error"), String(e));
+  }
 }
 
 // -- DIA-NN --------------------------------------------------------------
