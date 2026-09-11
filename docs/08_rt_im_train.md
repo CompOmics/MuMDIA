@@ -450,6 +450,52 @@ For scale, DIA-NN 2.2.0 library-free with `--reanalyse` on the same six Astral f
 multi-head 93%, though the two counts are not the same unit (ours is experiment-wide,
 DIA-NN's is a union of per-run identifications).
 
+#### The entrapment arm (2026-09-11)
+
+The empirical null CLAUDE.md requires before a sensitivity default moves. The E. coli AIF
+file (`LFQ_Orbitrap_AIF_Ecoli_01`) searched against an E. coli + 1:1 human entrapment
+library: the human peptides cannot be in the vial, so any that pass at 1% are false by
+construction. One binary, two runs, configurations differing only in
+`rt_im_train.multihead_calibration`.
+
+| | baseline | multi-head |
+|---|---|---|
+| real peptides at 1% | 7,879 | **8,216** (+4.28%) |
+| spike-in peptides accepted | 138 | 144 |
+| **empirical FDP** | **0.995%** | **0.995%** |
+| target PSMs at 1% | 8,832 | 9,166 |
+| wall clock | 10:19 | 10:55 |
+
+FDP is `(ratio * entrapment + 1) / real` with `entrapment_ratio = 0.560632`, the engine's
+own estimator (`fdr.rs::entrapment_q`), and it is identical to three decimal places. The
+gain is therefore real discoveries, not a loosened threshold: 4.28% more peptides at the
+same measured false-discovery proportion.
+
+This measurement is about five times more sensitive than the entrapment arms in
+`docs/28_feature_selection_analysis.md`, which rest on 22-30 accepted spike-in peptides
+and cannot resolve FDP differences below roughly 0.1 percentage points. With 138 and 144
+it resolves considerably finer, and still sees no difference.
+
+Two things to read carefully rather than over-read:
+
+- decoys accepted at the entrapment threshold moved 91 to 113 (1.03% to 1.23% of targets).
+  Under `classifier = entrapment` the q column is the entrapment FDP, not target-decoy, so
+  this is a side diagnostic and not the threshold in use. It is worth watching if the
+  number grows, but the spike-in FDP is the empirical null and it did not move.
+- the 1.06x wall clock here is NOT the cost of the default. This is a single run against a
+  library whose baseline arm already pays a DeepLC re-prediction of its own, so multi-head
+  displaces work rather than adding it. The 1.4x to 1.7x figures above, from six-run
+  pooled experiments, are the ones to plan around.
+
+**Library.** The archived entrapment library could not be used: its report reads
+`native-rt-v1; native-frag-v1`, and a run against it returns 333 confident seeds and 6,401
+candidates surviving extract, which is the degenerate regime the `HCDch2` finding in
+`docs/13_sidecars.md` describes and in which nothing can be measured. It was rebuilt over
+the same 5,828,348 peptidoforms with MS2PIP 4.2.0 `HCDch2` and DeepLC 4.4.0
+(`deeplc-4.4.0-base; ms2pip-4.2.0-HCDch2`, 69,564,520 fragments), which is what the two
+arms above ran against. If this benchmark is repeated, check the library's
+`model_identity` first.
+
 **Default since 2026-09-11.** Leaving `multihead_calibration` unset now means 80 heads
 wherever the run's retention times come from DeepLC and an interpreter is available. The
 default is deliberately scoped rather than unconditional: a native, Python-free run is a

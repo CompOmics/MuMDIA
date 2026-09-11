@@ -286,7 +286,9 @@ asking for both explicitly is still refused.
 
 Measured (`docs/08_rt_im_train.md` section 4d), two acquisitions, six pooled runs each, at
 an unchanged empirical decoy fraction of 0.0100 in all four arms: AIF 80,842 -> 84,725
-peptides (+4.8%), Astral 102,942 -> 117,652 (+14.3%), protein groups +2.4% and +7.1%.
+peptides (+4.8%), Astral 102,942 -> 117,652 (+14.3%), protein groups +2.4% and +7.1%. The
+entrapment arm closes the other half of the gate: +4.28% real peptides at an empirical FDP
+of 0.995% against the baseline's 0.995%, on 138 and 144 accepted spike-ins.
 Fewer candidates reach rescore and more of them are real, which is interference removed
 rather than a threshold traded. It costs 1.4x to 1.7x wall clock, because the calibration
 is fitted against each run's own anchors and cannot be shared across an experiment; that

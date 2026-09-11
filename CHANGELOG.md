@@ -35,7 +35,9 @@ than a number. Both are recorded in every run's `manifest.json`.
   two acquisitions, six pooled runs each, at an unchanged empirical decoy fraction of
   0.0100 in all four arms: AIF 80,842 -> 84,725 peptides (+4.8%), Astral 102,942 ->
   117,652 (+14.3%), protein groups +2.4% and +7.1%, precursors +4.8% and +15.5%. Fewer
-  candidates reach rescore and more of them are real.
+  candidates reach rescore and more of them are real. An entrapment arm supplies the
+  empirical null: +4.28% real peptides at an FDP of 0.995% against the baseline's 0.995%,
+  identical to three decimal places on 138 and 144 accepted spike-in peptides.
 
   It costs **1.4x to 1.7x wall clock**, because the calibration is fitted against each
   run's own anchors and so cannot be shared across an experiment. Set
