@@ -264,8 +264,8 @@ refuses to launch either worker, and both worker scripts repeat the check
 prediction plus per-run LOESS calibration with `finetune_deeplc = false`, and that default
 is only sound on a base model that does not memorise its anchors (4.0.0a2 did).
 
-`rt_im_train.multihead_calibration` (default 0, off) is the fourth RT lever and the
-reason the floor is 4.4.0. `deeplc.predict` returns ONE of the base model's 6,543
+`rt_im_train.multihead_calibration` (default: automatic) is the fourth RT lever, the
+reason the floor is 4.4.0, and since 2026-09-11 the default. `deeplc.predict` returns ONE of the base model's 6,543
 LC-setup heads, the one its `DEFAULT_TASK_NAME` names, on that setup's own gradient. The
 per-run LOESS then maps that column onto observed RT, and a smooth increasing curve can
 stretch and bend the axis but cannot reorder two peptides, so that setup's elution order
@@ -273,9 +273,25 @@ survives into the result. Different chromatography reorders peptides, which is w
 multitask model exists to represent. Set to N and the worker fits
 `MultiHeadRidgeCalibration` over the N best-correlating heads against this run's confident
 seed PSMs instead of fine-tuning, so the ordering is assembled from the setups that
-resemble the run. It occupies the fine-tune's slot and validation refuses both at once.
-Benchmark-gated and off by default: no entrapment or second-acquisition measurement exists
-for it here yet.
+resemble the run.
+
+Left unset it is AUTOMATIC, and the scope matters: 80 heads when a DeepLC interpreter is
+available and the run's retention times are DeepLC's already (imported library under
+`library_irt = auto`/`deeplc`, or FASTA with `rt_predictor = deeplc`), and nothing
+otherwise. It never turns a native, Python-free run into a startup error, and it never
+replaces a native retention time because an unrelated interpreter happened to be
+discoverable. `0` disables it; any other number is an explicit request and then a hard
+requirement. `finetune_deeplc` keeps its own slot rather than colliding with the default;
+asking for both explicitly is still refused.
+
+Measured (`docs/08_rt_im_train.md` section 4d), two acquisitions, six pooled runs each, at
+an unchanged empirical decoy fraction of 0.0100 in all four arms: AIF 80,842 -> 84,725
+peptides (+4.8%), Astral 102,942 -> 117,652 (+14.3%), protein groups +2.4% and +7.1%.
+Fewer candidates reach rescore and more of them are real, which is interference removed
+rather than a threshold traded. It costs 1.4x to 1.7x wall clock, because the calibration
+is fitted against each run's own anchors and cannot be shared across an experiment; that
+is the price of the default and the reason a shared-head-selection variant is worth
+measuring.
 
 Three RT rules, each measured in `docs/08_rt_im_train.md` and restated from the
 failure side in `docs/17_troubleshooting.md`:
@@ -624,9 +640,12 @@ joins it); what default activation still needs is the entrapment validation.
 The Docker image contains:
 
 - `/opt/mumdia/config.dia.json`: FASTA + MS2PIP/DeepLC + strict mokapot;
-- `/opt/mumdia/config.diann-lib.json`: imported library + per-run LOESS calibration of
-  the library's retention times (no fine-tune; `rt_im_train.finetune_deeplc` is available
-  for a once-per-library fine-tune) + strict `nn_torch`.
+- `/opt/mumdia/config.diann-lib.json`: imported library + multi-head calibration of the
+  library's retention times against each run, then the per-run LOESS (no fine-tune;
+  `rt_im_train.finetune_deeplc` is available for a once-per-library fine-tune instead) +
+  strict `nn_torch`. The multi-head step is the default rather than something this config
+  sets, and it needs the image's DeepLC interpreter; without one the run still works and
+  says in the log that it is not calibrating.
 
 The Dockerfile copies both configs. MuMDIA consumes but does not ship or invoke a
 DIA-NN binary; users create imported libraries under their own DIA-NN license.

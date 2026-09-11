@@ -402,12 +402,19 @@ function onSettingChanged(el) {
   let value = raw;
   if (f.kind === "bool") value = raw === "true";
   else if (f.kind === "integer" || f.kind === "float") {
-    const n = Number(raw);
-    if (raw.trim() === "" || Number.isNaN(n)) {
-      banner($("settings-error"), `${path} must be a number.`);
-      return;
+    // An OPTIONAL number left blank means "unset", which is a real value for these
+    // (`rt_im_train.multihead_calibration` unset is what turns the automatic default
+    // on). A required one left blank is still an error.
+    if (raw.trim() === "" && f.optional) {
+      value = null;
+    } else {
+      const n = Number(raw);
+      if (raw.trim() === "" || Number.isNaN(n)) {
+        banner($("settings-error"), `${path} must be a number.`);
+        return;
+      }
+      value = n;
     }
-    value = n;
   } else if (f.kind === "other" && /^\s*[\[{]/.test(raw)) {
     // A list or object typed as JSON (the modification lists, for instance).
     try {

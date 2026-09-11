@@ -67,11 +67,26 @@ fn preflight(p: &RunParams, cfg: &Config) -> Result<()> {
     // The interpreter fields were filled in by `python::resolve` before this point,
     // so a field still empty here means the role is unused or discovery failed.
     // The messages name the field and the alternative, which is what a user acts on.
-    if cfg.rt_im_train.multihead_calibration > 0 && cfg.predict_frag.deeplc_python.is_none() {
+    // An EXPLICIT head count is a hard requirement; the automatic default is not, or a
+    // native Python-free run -- a supported configuration -- would fail at startup.
+    if cfg.rt_im_train.multihead_calibration.is_some_and(|n| n > 0)
+        && cfg.predict_frag.deeplc_python.is_none()
+    {
         anyhow::bail!(
             "rt_im_train.multihead_calibration requires predict_frag.deeplc_python (a Python \
              interpreter with DeepLC >= 4.4.0, or \"auto\" to discover one); it calibrates \
              the DeepLC base model against this run's confident seed PSMs"
+        );
+    }
+    if cfg.rt_im_train.multihead_calibration.is_none()
+        && !cfg.rt_im_train.finetune_deeplc
+        && cfg.predict_frag.deeplc_python.is_none()
+    {
+        warn!(
+            "no DeepLC interpreter resolved, so retention-time multi-head calibration is \
+             not running. It is the default and is worth 4.8% of peptides on AIF and 14.3% \
+             on Astral; set predict_frag.deeplc_python (\"auto\" discovers one). The \
+             manifest records the retention-time model that actually ran."
         );
     }
     if cfg.rt_im_train.finetune_deeplc && cfg.predict_frag.deeplc_python.is_none() {
@@ -325,7 +340,12 @@ pub fn run(p: RunParams) -> Result<()> {
     // calibration. The seed is iRT-independent, so it was computed above on the
     // base library and is reused here. rt-im-train and extract then read the
     // fine-tuned library.
-    let lib_p = if cfg.rt_im_train.multihead_calibration > 0 {
+    let has_deeplc = cfg.predict_frag.deeplc_python.is_some();
+    let mh_heads = cfg.rt_im_train.multihead_heads(
+        has_deeplc,
+        cfg.deeplc_rt_source(p.lib_precursors.is_some(), has_deeplc),
+    );
+    let lib_p = if mh_heads > 0 {
         // Multi-head calibration occupies the fine-tune's slot: it needs this run's
         // confident seed PSMs, which exist only now, and it rewrites the same library the
         // fine-tune would. Validation refuses both at once.
@@ -333,7 +353,7 @@ pub fn run(p: RunParams) -> Result<()> {
             .predict_frag
             .deeplc_python
             .as_deref()
-            .expect("preflight guarantees deeplc_python when multihead_calibration is set");
+            .expect("mh_heads is 0 unless an interpreter resolved");
         let script = crate::sidecar::resolve_script(
             &cfg.predict_frag.sidecar_script_dir,
             "deeplc_finetune.py",
@@ -346,7 +366,7 @@ pub fn run(p: RunParams) -> Result<()> {
             &lib_p,
             &seed,
             &lib_p_mh,
-            cfg.rt_im_train.multihead_calibration,
+            mh_heads,
             cfg.rt_im_train.q_train,
             cfg.rt_im_train.window_holdout_frac,
             rayon::current_num_threads(),
@@ -659,11 +679,8 @@ pub fn run(p: RunParams) -> Result<()> {
     // including imported libraries and per-run RT fine-tuning.
     let library_input = p.lib_precursors.is_some();
     let deeplc_py = cfg.predict_frag.deeplc_python.as_deref();
-    let rt_identity = if cfg.rt_im_train.multihead_calibration > 0 {
-        crate::sidecar::deeplc_identity(
-            deeplc_py,
-            &format!("multihead-{}", cfg.rt_im_train.multihead_calibration),
-        )
+    let rt_identity = if mh_heads > 0 {
+        crate::sidecar::deeplc_identity(deeplc_py, &format!("multihead-{mh_heads}"))
     } else if cfg.rt_im_train.finetune_deeplc {
         crate::sidecar::deeplc_identity(deeplc_py, "finetuned")
     } else if cfg

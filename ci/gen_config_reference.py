@@ -1617,6 +1617,18 @@ def build_schema() -> dict:
 
     def field_entry(path: str, field: Field) -> dict:
         base = base_type(field.rtype)
+        # `Option<usize>` is an integer the form should offer as one, not an opaque
+        # "other" it renders as free text. The desktop settings screen keys its input
+        # conversion on `kind`, so an optional number typed there used to reach the
+        # engine as the STRING "0" and be rejected -- which is how the off-switch for an
+        # optional setting became unreachable from the interface. `Option<String>` is
+        # left alone: it is already rendered as text and means the same thing either way.
+        if base.startswith("Option<") and base.endswith(">"):
+            inner = base[len("Option<"): -1].strip()
+            if inner in ("f32", "f64") or inner in (
+                "u8", "u16", "u32", "u64", "usize", "i8", "i16", "i32", "i64"
+            ):
+                base = inner
         # `default_rendered` is populated by the Markdown row builder, which the
         # schema does not run. Render it here with the same function, so the value
         # the form shows and the value the table shows are produced by one code

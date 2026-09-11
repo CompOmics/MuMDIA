@@ -414,10 +414,9 @@ rather than materialising all 6,543. `MultiHeadRidgeCalibration` never fits more
 weights than half the reference, so a small anchor set degrades to fewer heads instead of
 overfitting.
 
-One run and one acquisition, so this is not yet a sensitivity result by the standard
-CLAUDE.md sets. The option is off by default and needs entrapment plus a second
-acquisition before that changes. What it does establish is that the ordering loss is real,
-large and not repairable by any improvement to the curve.
+One run and one acquisition, so this section alone was not yet a sensitivity result by the
+standard CLAUDE.md sets. What it does establish is that the ordering loss is real, large
+and not repairable by any improvement to the curve. The second acquisition is below.
 
 #### Both acquisitions, four pooled experiments (2026-09-09)
 
@@ -451,9 +450,20 @@ For scale, DIA-NN 2.2.0 library-free with `--reanalyse` on the same six Astral f
 multi-head 93%, though the two counts are not the same unit (ours is experiment-wide,
 DIA-NN's is a union of per-run identifications).
 
+**Default since 2026-09-11.** Leaving `multihead_calibration` unset now means 80 heads
+wherever the run's retention times come from DeepLC and an interpreter is available. The
+default is deliberately scoped rather than unconditional: a native, Python-free run is a
+supported configuration and must not become a startup error, and a configuration that
+asked for `rt_predictor = native` must not have its RT source changed because an unrelated
+interpreter was discoverable. `0` turns it off; an explicit count is a hard requirement.
+`config.rs::multihead_heads` is the single place that resolves this, so the two
+orchestrators and the `library_irt` predicate cannot disagree about whether it ran, and
+`model_identities.rt_predictor` records what actually happened (`multihead-80` against
+`deeplc-4.4.0-base`).
+
 **Cost.** The calibration re-predicts the library once per run rather than once per
 experiment, because it is fitted against each run's own anchors: 1.4x wall clock on AIF and
-1.7x on Astral. The fine-tune has the same shape, which is what `experiment.finetune_scope`
+1.7x on Astral. That is the price of the default. The fine-tune has the same shape, which is what `experiment.finetune_scope`
 exists to amortise, and multi-head cannot share by construction. Since every AIF run chose
 the same head, a shared-selection variant is worth measuring before that cost is made
 default.

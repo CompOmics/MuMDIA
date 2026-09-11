@@ -563,6 +563,14 @@ impl Default for SearchSeedConfig {
     }
 }
 
+/// Heads `rt_im_train.multihead_calibration` uses when it is left to decide.
+///
+/// DeepLC's own default for `MultiHeadRidgeCalibration`, and the value both measured
+/// acquisitions ran at. It never fits more head weights than half the reference, so a
+/// small anchor set degrades to fewer heads rather than overfitting, which is why one
+/// number serves runs with very different numbers of confident seed PSMs.
+pub const DEFAULT_MULTIHEAD_HEADS: usize = 80;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RtImTrainConfig {
@@ -583,8 +591,19 @@ pub struct RtImTrainConfig {
     /// library rather than a DeepLC prediction.
     pub finetune_deeplc: bool,
     /// Calibrate the DeepLC base model against this run's confident seed PSMs across this
-    /// many of its best-correlating LC-setup heads, instead of fine-tuning. 0 (default) is
-    /// off. Needs DeepLC >= 4.4.0 and a `predict_frag.deeplc_python`.
+    /// many of its best-correlating LC-setup heads, instead of fine-tuning.
+    ///
+    /// `null` (the default) is AUTOMATIC: [`DEFAULT_MULTIHEAD_HEADS`] heads when a DeepLC
+    /// interpreter is available and `finetune_deeplc` is off, and nothing otherwise. `0`
+    /// turns it off explicitly; any other number asks for exactly that many heads and is
+    /// then a hard requirement, so a run without a `predict_frag.deeplc_python` fails
+    /// rather than quietly doing without.
+    ///
+    /// Automatic rather than a plain number because a default that a native, Python-free
+    /// run cannot satisfy would turn "no interpreter" from a supported configuration into
+    /// a startup error, and because `finetune_deeplc` occupies the same slot: a
+    /// configuration that asks for the fine-tune keeps it instead of being refused for a
+    /// conflict it never wrote.
     ///
     /// `deeplc.predict` returns ONE of the model's 6,543 heads, the setup named by its
     /// `DEFAULT_TASK_NAME`, on that setup's gradient. The per-run LOESS then maps that
@@ -597,10 +616,13 @@ pub struct RtImTrainConfig {
     /// them. It never fits more head weights than half the reference, so a small anchor
     /// set degrades to fewer heads rather than overfitting.
     ///
-    /// 80 is DeepLC's own default. Mutually exclusive with `finetune_deeplc`: both adapt
-    /// the same step against the same anchors. Benchmark-gated, so off by default: no
-    /// entrapment or second-acquisition measurement exists for it in this repository yet.
-    pub multihead_calibration: usize,
+    /// Measured on two acquisitions, six pooled runs each, at an unchanged empirical decoy
+    /// fraction of 0.0100 in every arm (`docs/08_rt_im_train.md` section 4d): AIF +4.8%
+    /// peptides, Astral +14.3%, protein groups +2.4% and +7.1%. The mechanism is ordering,
+    /// not thresholds -- fewer candidates reach rescore and more of them are real -- and
+    /// the cost is 1.4x to 1.7x wall clock, because the calibration is fitted against each
+    /// run's own anchors and so cannot be shared across an experiment.
+    pub multihead_calibration: Option<usize>,
     /// DeepLC fine-tune training epochs (passed to `deeplc_finetune.py --epochs`).
     /// Early stopping with `finetune_patience` usually halts before this cap, so it
     /// is an upper bound rather than a fixed count. Only used when `finetune_deeplc`.
@@ -664,23 +686,57 @@ pub enum LibraryIrt {
 }
 
 impl RtImTrainConfig {
+    /// How many LC-setup heads this run should calibrate over: 0 when it should not.
+    ///
+    /// The single place that turns the configured value into a decision, so the two
+    /// orchestrators and the `library_irt` predicate below cannot disagree about whether
+    /// multi-head is running. `has_deeplc` is whether an interpreter actually resolved,
+    /// which is only known after discovery.
+    ///
+    /// `finetune_deeplc` wins its own slot rather than colliding with the default: both
+    /// adapt the same step against the same anchors, and a configuration that asked for
+    /// the fine-tune asked for it on purpose. Asking for BOTH explicitly is still refused
+    /// by validation.
+    /// `deeplc_rt_source` is [`Config::deeplc_rt_source`]: whether this run's library
+    /// retention times come from DeepLC at all. The AUTOMATIC default is scoped to that,
+    /// because multi-head calibration replaces the library's iRT with DeepLC predictions
+    /// fitted to this run, and doing that to a configuration that asked for the NATIVE
+    /// retention-time model would change its RT source for no reason other than an
+    /// unrelated interpreter being discoverable. An EXPLICIT count ignores the scope:
+    /// asking for it is asking for it.
+    pub fn multihead_heads(&self, has_deeplc: bool, deeplc_rt_source: bool) -> usize {
+        if self.finetune_deeplc || !has_deeplc {
+            return 0;
+        }
+        match self.multihead_calibration {
+            Some(n) => n,
+            None if deeplc_rt_source => DEFAULT_MULTIHEAD_HEADS,
+            None => 0,
+        }
+    }
+
     /// Whether an imported library's `predicted_irt` is re-predicted with the DeepLC base
     /// model before RT calibration. False in FASTA mode, under a fine-tune (which
     /// re-predicts by itself), under `library_irt = library`, and under `auto` without a
     /// DeepLC interpreter (the orchestrator warns in that case). `deeplc` without an
     /// interpreter is a preflight error, so it resolves to true here.
     pub fn repredicts_library_irt(&self, library_input: bool, has_deeplc: bool) -> bool {
-        // Multi-head calibration re-predicts the library itself, from the same base model
-        // and against this run's anchors, so a base-model re-prediction before it is 27
-        // minutes of work whose only output it overwrites.
-        if !library_input || self.finetune_deeplc || self.multihead_calibration > 0 {
+        if !library_input || self.finetune_deeplc {
             return false;
         }
-        match self.library_irt {
+        let would_be_deeplc = match self.library_irt {
             LibraryIrt::Library => false,
             LibraryIrt::Deeplc => true,
             LibraryIrt::Auto => has_deeplc,
+        };
+        // Multi-head calibration re-predicts the library itself, from the same base model
+        // and against this run's anchors, so a base-model re-prediction before it is 27
+        // minutes of work whose only output it overwrites. The scope is passed in as
+        // `would_be_deeplc` rather than recomputed, which is what keeps this non-circular.
+        if would_be_deeplc && self.multihead_heads(has_deeplc, true) > 0 {
+            return false;
         }
+        would_be_deeplc
     }
 }
 impl Default for RtImTrainConfig {
@@ -694,7 +750,7 @@ impl Default for RtImTrainConfig {
             loess_span: 0.3,
             fallback_rt_window_s: 120.0,
             finetune_deeplc: false,
-            multihead_calibration: 0,
+            multihead_calibration: None,
             finetune_epochs: 25,   // deeplc_finetune.py default
             finetune_patience: 10, // deeplc_finetune.py default
             finetune_batch: 0,     // 0 = auto-scale to seed size
@@ -1772,6 +1828,24 @@ impl Default for Config {
 }
 
 impl Config {
+    /// Whether this run's library retention times come from DeepLC.
+    ///
+    /// Imported library: whatever `library_irt` resolves to. FASTA: whether the library
+    /// was predicted with DeepLC in the first place. This is the scope of the automatic
+    /// multi-head default, which improves a DeepLC retention time and has no business
+    /// replacing a native one.
+    pub fn deeplc_rt_source(&self, library_input: bool, has_deeplc: bool) -> bool {
+        if library_input {
+            match self.rt_im_train.library_irt {
+                LibraryIrt::Library => false,
+                LibraryIrt::Deeplc => true,
+                LibraryIrt::Auto => has_deeplc,
+            }
+        } else {
+            self.predict_frag.rt_predictor == RtPredictorKind::Deeplc
+        }
+    }
+
     /// Parse from a JSON string, rejecting unknown keys, then validate.
     pub fn from_json(s: &str) -> Result<Self, crate::error::ConfigError> {
         let c: Config =
@@ -2130,11 +2204,18 @@ impl Config {
                     .into(),
             ));
         }
-        if self.rt_im_train.multihead_calibration > 0 && self.rt_im_train.finetune_deeplc {
+        if self
+            .rt_im_train
+            .multihead_calibration
+            .is_some_and(|n| n > 0)
+            && self.rt_im_train.finetune_deeplc
+        {
             return Err(Invalid(
                 "rt_im_train.multihead_calibration and rt_im_train.finetune_deeplc are \
                  alternatives: both adapt the retention-time model to the same run against \
-                 the same confident seed PSMs, at the same point in the chain. Choose one."
+                 the same confident seed PSMs, at the same point in the chain. Choose one. \
+                 (Leaving multihead_calibration unset keeps the fine-tune; only asking for \
+                 both explicitly is a conflict.)"
                     .into(),
             ));
         }
@@ -2432,6 +2513,11 @@ mod tests {
     fn library_irt_resolves_per_mode_and_interpreter() {
         let mut rt = RtImTrainConfig::default();
         assert_eq!(rt.library_irt, LibraryIrt::Auto);
+        // Under the shipped defaults the separate base-model pass does NOT run, because
+        // multi-head calibration re-predicts the library itself against this run's
+        // anchors. Turning multi-head off restores it; that is the case below.
+        assert!(!rt.repredicts_library_irt(true, true));
+        rt.multihead_calibration = Some(0);
         assert!(rt.repredicts_library_irt(true, true));
         assert!(
             !rt.repredicts_library_irt(true, false),
@@ -2447,6 +2533,7 @@ mod tests {
             "the fine-tune re-predicts by itself"
         );
         rt.finetune_deeplc = false;
+        rt.multihead_calibration = Some(0);
         rt.library_irt = LibraryIrt::Library;
         assert!(!rt.repredicts_library_irt(true, true));
         rt.library_irt = LibraryIrt::Deeplc;
@@ -2605,6 +2692,92 @@ mod tests {
     }
 
     #[test]
+    fn multihead_is_on_by_default_but_never_at_the_cost_of_a_runnable_configuration() {
+        let d = Config::default();
+        assert_eq!(
+            d.rt_im_train.multihead_calibration, None,
+            "unset means automatic"
+        );
+        assert_eq!(
+            d.rt_im_train.multihead_heads(true, true),
+            DEFAULT_MULTIHEAD_HEADS,
+            "with an interpreter the default calibrates"
+        );
+        // The whole reason the field is an Option: a native, Python-free run is a
+        // supported configuration, and a default it cannot satisfy would turn that into a
+        // startup error.
+        assert_eq!(
+            d.rt_im_train.multihead_heads(false, true),
+            0,
+            "without an interpreter the default does nothing rather than failing"
+        );
+
+        // An explicit 0 is off even where it could run.
+        let off = Config::from_json(r#"{"rt_im_train":{"multihead_calibration":0}}"#).unwrap();
+        assert_eq!(off.rt_im_train.multihead_heads(true, true), 0);
+
+        // An explicit count is honoured.
+        let n = Config::from_json(r#"{"rt_im_train":{"multihead_calibration":40}}"#).unwrap();
+        assert_eq!(n.rt_im_train.multihead_heads(true, true), 40);
+
+        // A configuration that asked for the fine-tune keeps it, rather than being
+        // refused for a conflict with a default it never wrote.
+        let ft = Config::from_json(r#"{"rt_im_train":{"finetune_deeplc":true}}"#).unwrap();
+        assert_eq!(
+            ft.rt_im_train.multihead_heads(true, true),
+            0,
+            "the fine-tune wins its slot"
+        );
+        assert!(
+            !ft.rt_im_train.repredicts_library_irt(true, true),
+            "and still re-predicts by itself"
+        );
+
+        // With multi-head running, the separate base-model re-prediction is skipped: it
+        // would be 27 minutes of work whose only output multi-head overwrites.
+        assert!(!d.rt_im_train.repredicts_library_irt(true, true));
+        assert!(
+            !d.rt_im_train.repredicts_library_irt(true, false),
+            "no interpreter, nothing to re-predict with"
+        );
+        assert!(
+            off.rt_im_train.repredicts_library_irt(true, true),
+            "off restores it"
+        );
+
+        // Scope: the automatic default only improves a retention time DeepLC already
+        // produced. A configuration that asked for the native model keeps it, rather than
+        // having its RT source changed because an unrelated interpreter is present.
+        assert_eq!(
+            d.rt_im_train.multihead_heads(true, false),
+            0,
+            "a native retention-time source is left alone by the default"
+        );
+        assert_eq!(
+            n.rt_im_train.multihead_heads(true, false),
+            40,
+            "an explicit count is honoured whatever the retention-time source is"
+        );
+        assert!(
+            !d.deeplc_rt_source(false, true),
+            "FASTA with the native predictor"
+        );
+        let dl = Config::from_json(r#"{"predict_frag":{"rt_predictor":"deeplc"}}"#).unwrap();
+        assert!(
+            dl.deeplc_rt_source(false, true),
+            "FASTA with the DeepLC predictor"
+        );
+        assert!(
+            d.deeplc_rt_source(true, true),
+            "imported library, library_irt auto"
+        );
+        assert!(
+            !d.deeplc_rt_source(true, false),
+            "imported library, no interpreter"
+        );
+    }
+
+    #[test]
     fn multihead_calibration_and_the_fine_tune_are_alternatives() {
         // Both adapt the same step against the same anchors, so asking for both is a
         // configuration error rather than a silent precedence rule.
@@ -2614,15 +2787,16 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(e.contains("alternatives"), "{e}");
-        // Either alone is fine, and 0 is off.
+        // Either alone is fine, 0 is off, and -- the case the default created -- asking
+        // for the fine-tune WITHOUT naming a head count is not a conflict.
         for ok in [
             r#"{"rt_im_train":{"multihead_calibration":80}}"#,
             r#"{"rt_im_train":{"multihead_calibration":1}}"#,
             r#"{"rt_im_train":{"multihead_calibration":0,"finetune_deeplc":true}}"#,
+            r#"{"rt_im_train":{"finetune_deeplc":true}}"#,
         ] {
             assert!(Config::from_json(ok).is_ok(), "{ok} must be accepted");
         }
-        assert_eq!(Config::default().rt_im_train.multihead_calibration, 0);
     }
 
     #[test]
@@ -2632,9 +2806,16 @@ mod tests {
         // overwrites, exactly as under the fine-tune.
         let c = Config::from_json(r#"{"rt_im_train":{"multihead_calibration":80}}"#).unwrap();
         assert!(!c.rt_im_train.repredicts_library_irt(true, true));
-        // Without it, an imported library under `auto` with DeepLC still re-predicts.
+        // Since multi-head became the default, so does the shipped configuration: the
+        // base-model pass survives only where multi-head is off or cannot run.
         let d = Config::default();
-        assert!(d.rt_im_train.repredicts_library_irt(true, true));
+        assert!(!d.rt_im_train.repredicts_library_irt(true, true));
+        let off = Config::from_json(r#"{"rt_im_train":{"multihead_calibration":0}}"#).unwrap();
+        assert!(off.rt_im_train.repredicts_library_irt(true, true));
+        assert!(
+            !d.rt_im_train.repredicts_library_irt(true, false),
+            "no interpreter: neither multi-head nor the re-prediction can run"
+        );
     }
 
     #[test]
