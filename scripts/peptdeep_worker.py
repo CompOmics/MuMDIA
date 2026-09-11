@@ -209,6 +209,14 @@ def main():
     procs = int(sys.argv[6]) if len(sys.argv) > 6 else min(8, cpu)
     procs = max(1, min(procs, cpu))
 
+    # Before anything heavy is imported: a mistyped device is a mistyped device, and
+    # reporting it as a missing module would send the reader after the wrong problem.
+    want = os.environ.get("MUMDIA_PEPTDEEP_DEVICE", "auto").strip().lower()
+    if want not in ("auto", "cuda", "cpu"):
+        raise SystemExit(
+            f"MUMDIA_PEPTDEEP_DEVICE must be auto, cuda or cpu (got {want!r})"
+        )
+
     import pandas as pd
     import torch
     from alphabase.constants.modification import MOD_DF
@@ -225,11 +233,6 @@ def main():
             f"knows: {', '.join(sorted(set(vocab)))}"
         )
 
-    want = os.environ.get("MUMDIA_PEPTDEEP_DEVICE", "auto").strip().lower()
-    if want not in ("auto", "cuda", "cpu"):
-        raise SystemExit(
-            f"MUMDIA_PEPTDEEP_DEVICE must be auto, cuda or cpu (got {want!r})"
-        )
     if want == "cuda" and not torch.cuda.is_available():
         raise SystemExit(
             "MUMDIA_PEPTDEEP_DEVICE=cuda but torch reports no CUDA device; this torch "

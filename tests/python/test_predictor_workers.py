@@ -540,13 +540,16 @@ def test_peptdeep_worker_refuses_an_unknown_instrument(tmp_path):
 
 def test_peptdeep_worker_rejects_a_bad_device_request(tmp_path):
     """`MUMDIA_PEPTDEEP_DEVICE` follows `MUMDIA_NN_DEVICE`: auto|cuda|cpu, and `cuda`
-    on a CPU-only torch errors rather than quietly measuring the wrong device."""
+    on a CPU-only torch errors rather than quietly measuring the wrong device.
+
+    No dependency is needed to reach this, deliberately: the name is checked before
+    the worker imports torch, peptdeep or alphabase, so a mistyped variable reports
+    itself instead of surfacing as a missing module from a stack it never needed.
+    """
     import pyarrow as pa
     import pyarrow.parquet as pq
 
     from conftest import run_worker
-
-    importorskip_any("torch")
 
     inp = tmp_path / "peptdeep_in.parquet"
     pq.write_table(
