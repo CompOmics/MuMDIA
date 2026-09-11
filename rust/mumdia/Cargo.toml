@@ -36,7 +36,7 @@ arrow = { version = "59", features = ["prettyprint"] }
 # Pure-Rust build: drop C zlib-ng (needs cmake); SNAPPY codec is pure Rust.
 parquet = { version = "59", default-features = false, features = ["arrow", "snap"] }
 # Pure-Rust zlib backend (miniz_oxide) instead of zlib-ng-compat (needs cmake).
-mzdata = { version = "0.65", default-features = false, features = ["mzml", "miniz_oxide"] }
+mzdata = { version = "0.66", default-features = false, features = ["mzml", "miniz_oxide"] }
 # Per-thread-arena allocator. The extraction accumulation is allocation-heavy and only
 # scaled ~1.07x across cores under the Windows system allocator's shared heap lock;
 # mimalloc is pure Rust (no cmake) and removes that serialisation. No behaviour change.
