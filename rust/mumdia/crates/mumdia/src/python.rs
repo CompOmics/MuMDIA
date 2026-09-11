@@ -42,6 +42,8 @@ pub enum Role {
     DeepLc,
     /// `predict_frag.ms2pip_python`: `ms2pip_worker.py`.
     Ms2pip,
+    /// `predict_frag.peptdeep_python`: `peptdeep_worker.py`.
+    Peptdeep,
     /// `mbr.python`: `mbr_worker.py`.
     Mbr,
 }
@@ -52,6 +54,7 @@ impl Role {
             Role::Rescore => "rescore.python",
             Role::DeepLc => "predict_frag.deeplc_python",
             Role::Ms2pip => "predict_frag.ms2pip_python",
+            Role::Peptdeep => "predict_frag.peptdeep_python",
             Role::Mbr => "mbr.python",
         }
     }
@@ -62,6 +65,7 @@ impl Role {
             Role::Rescore => "MUMDIA_PYTHON_RESCORE",
             Role::DeepLc => "MUMDIA_PYTHON_DEEPLC",
             Role::Ms2pip => "MUMDIA_PYTHON_MS2PIP",
+            Role::Peptdeep => "MUMDIA_PYTHON_PEPTDEEP",
             Role::Mbr => "MUMDIA_PYTHON_MBR",
         }
     }
@@ -82,6 +86,17 @@ impl Role {
             // deeplc itself.
             Role::DeepLc => &["deeplc", "numpy", "pandas", "pyarrow", "torch", "psm_utils"],
             Role::Ms2pip => &["ms2pip", "numpy", "pandas"],
+            // `peptdeep_worker.py` imports torch directly to decide the device, and
+            // alphabase to check a modification name against the installed vocabulary,
+            // so both are probed rather than assumed from peptdeep's dependency tree.
+            Role::Peptdeep => &[
+                "peptdeep",
+                "alphabase",
+                "torch",
+                "numpy",
+                "pandas",
+                "pyarrow",
+            ],
             Role::Mbr => &["numpy", "pyarrow"],
         }
     }
@@ -96,6 +111,7 @@ impl Role {
             ],
             Role::DeepLc => &["deeplc_worker.py", "deeplc_finetune.py"],
             Role::Ms2pip => &["ms2pip_worker.py"],
+            Role::Peptdeep => &["peptdeep_worker.py"],
             Role::Mbr => &["mbr_worker.py"],
         }
     }
@@ -105,6 +121,7 @@ impl Role {
             Role::Rescore => cfg.rescore.python.as_deref(),
             Role::DeepLc => cfg.predict_frag.deeplc_python.as_deref(),
             Role::Ms2pip => cfg.predict_frag.ms2pip_python.as_deref(),
+            Role::Peptdeep => cfg.predict_frag.peptdeep_python.as_deref(),
             Role::Mbr => cfg.mbr.python.as_deref(),
         }
     }
@@ -114,6 +131,7 @@ impl Role {
             Role::Rescore => cfg.rescore.python = Some(value),
             Role::DeepLc => cfg.predict_frag.deeplc_python = Some(value),
             Role::Ms2pip => cfg.predict_frag.ms2pip_python = Some(value),
+            Role::Peptdeep => cfg.predict_frag.peptdeep_python = Some(value),
             Role::Mbr => cfg.mbr.python = Some(value),
         }
     }
@@ -129,6 +147,7 @@ impl Role {
             Role::Rescore => cfg.rescore.python = None,
             Role::DeepLc => cfg.predict_frag.deeplc_python = None,
             Role::Ms2pip => cfg.predict_frag.ms2pip_python = None,
+            Role::Peptdeep => cfg.predict_frag.peptdeep_python = None,
             Role::Mbr => cfg.mbr.python = None,
         }
     }
@@ -151,6 +170,7 @@ impl Role {
                     || cfg.rt_im_train.multihead_calibration.is_some_and(|n| n > 0)
             }
             Role::Ms2pip => cfg.predict_frag.predictor == FragPredictorKind::Ms2pip,
+            Role::Peptdeep => cfg.predict_frag.predictor == FragPredictorKind::Peptdeep,
             Role::Mbr => cfg.mbr.strategy != MbrStrategy::None,
         }
     }
@@ -179,7 +199,13 @@ impl Role {
     }
 }
 
-pub const ALL_ROLES: [Role; 4] = [Role::Rescore, Role::DeepLc, Role::Ms2pip, Role::Mbr];
+pub const ALL_ROLES: [Role; 5] = [
+    Role::Rescore,
+    Role::DeepLc,
+    Role::Ms2pip,
+    Role::Peptdeep,
+    Role::Mbr,
+];
 
 /// How a role's interpreter was determined, for logging and for `doctor`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -617,6 +643,13 @@ mod tests {
 
         cfg.predict_frag.predictor = FragPredictorKind::Ms2pip;
         assert!(Role::Ms2pip.required_by(&cfg));
+        assert!(
+            !Role::Peptdeep.required_by(&cfg),
+            "one fragment predictor is chosen, so the other role stays unrequired"
+        );
+        cfg.predict_frag.predictor = FragPredictorKind::Peptdeep;
+        assert!(Role::Peptdeep.required_by(&cfg));
+        assert!(!Role::Ms2pip.required_by(&cfg));
         // An explicit head count makes DeepLC required. The automatic default does not:
         // it is scoped to a run whose retention times are DeepLC's already, so a native
         // run neither requires nor wants an interpreter and still starts without Python.

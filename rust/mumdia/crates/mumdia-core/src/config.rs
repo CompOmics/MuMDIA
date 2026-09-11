@@ -94,6 +94,18 @@ pub enum FragPredictorKind {
     Native,
     /// MS2PIP Python sidecar (docs/13_sidecars.md).
     Ms2pip,
+    /// AlphaPeptDeep Python sidecar (`peptdeep_worker.py`, docs/13_sidecars.md).
+    ///
+    /// A transformer intensity model conditioned on collision energy and instrument,
+    /// which MS2PIP is not. It supplies intensities for the same `(ion_type, ordinal,
+    /// charge)` triples the engine already enumerates, so it changes the numbers on the
+    /// fragments rather than which fragments exist: the engine generates b and y only
+    /// (`mumdia_core::mass::IonType`), and AlphaPeptDeep's a/c/x/z and neutral-loss
+    /// series have nowhere to go until that changes.
+    ///
+    /// Benchmark-gated. It is opt-in until there is entrapment plus a second
+    /// acquisition, and a seed-PSM count alone does not promote it.
+    Peptdeep,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -495,6 +507,30 @@ pub struct PredictFragConfig {
     pub ms2pip_model: String,
     /// Python executable for the MS2PIP sidecar (env with ms2pip + pyarrow).
     pub ms2pip_python: Option<String>,
+    /// AlphaPeptDeep MS2 model, as `peptdeep.pretrained_models.ModelManager` names it:
+    /// `generic`, `phospho`, `digly` or `HLA`. Default `generic`. The specialised models
+    /// are trained on their own enrichment chemistry and are not a better `generic`.
+    pub peptdeep_model: String,
+    /// Normalised collision energy the AlphaPeptDeep MS2 model is conditioned on.
+    ///
+    /// There is no neutral value. The model was trained across a range of energies and
+    /// predicts a different spectrum at each, so this is an instrument setting that has
+    /// to match the data, not a tuning knob: b/y ratios move with it. Default 30.0,
+    /// AlphaPeptDeep's own. Read the value the acquisition used; where the vendor
+    /// reports a stepped or absolute energy, convert it before writing it here.
+    pub peptdeep_nce: f64,
+    /// Instrument the AlphaPeptDeep MS2 model is conditioned on, as its own vocabulary
+    /// spells it (`Lumos`, `QE`, `QEHFX`, `Exploris`, `Fusion`, `Eclipse`, `timsTOF`,
+    /// `SciexTOF`, ...). Unknown names fall back to the model's default instrument
+    /// inside AlphaPeptDeep rather than failing, so the worker checks the name against
+    /// the installed vocabulary and refuses one it does not recognise.
+    pub peptdeep_instrument: String,
+    /// Python executable for the AlphaPeptDeep sidecar (env with peptdeep + pyarrow).
+    ///
+    /// Its own environment rather than a shared one, for the same reason MS2PIP has one:
+    /// AlphaPeptDeep pins the alphabase/alpharaw stack alongside torch, and a resolver
+    /// conflict with DeepLC would otherwise take out the retention-time model too.
+    pub peptdeep_python: Option<String>,
     /// Python executable for the DeepLC sidecar (env with deeplc + pyarrow).
     pub deeplc_python: Option<String>,
     /// Directory holding the sidecar worker scripts.
@@ -510,6 +546,10 @@ impl Default for PredictFragConfig {
             top_n_fragments: 6,
             ms2pip_model: "HCDch2".to_string(),
             ms2pip_python: None,
+            peptdeep_model: "generic".to_string(),
+            peptdeep_nce: 30.0,
+            peptdeep_instrument: "Lumos".to_string(),
+            peptdeep_python: None,
             deeplc_python: None,
             sidecar_script_dir: "scripts".to_string(),
         }
@@ -2161,6 +2201,30 @@ impl Config {
                 self.digest.min_len, self.digest.max_len
             )));
         }
+        // A collision energy outside this range is a unit mistake -- an absolute energy
+        // in eV, or a fraction -- rather than an unusual setting, and the model would
+        // silently predict from it.
+        if !(self.predict_frag.peptdeep_nce.is_finite()
+            && self.predict_frag.peptdeep_nce > 0.0
+            && self.predict_frag.peptdeep_nce <= 100.0)
+        {
+            return Err(Invalid(format!(
+                "predict_frag.peptdeep_nce must be a normalised collision energy in \
+                 (0, 100]; got {}. A value outside that range is usually an absolute \
+                 energy in eV rather than an NCE.",
+                self.predict_frag.peptdeep_nce
+            )));
+        }
+        if self.predict_frag.peptdeep_model.trim().is_empty()
+            || self.predict_frag.peptdeep_instrument.trim().is_empty()
+        {
+            return Err(Invalid(
+                "predict_frag.peptdeep_model and predict_frag.peptdeep_instrument must \
+                 not be empty; the worker checks both against the installed \
+                 AlphaPeptDeep's own vocabulary"
+                    .into(),
+            ));
+        }
         if self.peptidoforms.charge_min < 1
             || self.peptidoforms.charge_min > self.peptidoforms.charge_max
         {
@@ -2507,6 +2571,28 @@ mod tests {
         assert_eq!(c.rescore.train_neg_ratio, 0.0);
         assert_eq!(c.rescore.train_neg_select, NegSelect::Random);
         assert_eq!(c.rescore.train_warm_epochs, 0);
+    }
+
+    #[test]
+    fn a_collision_energy_outside_the_nce_range_is_refused() {
+        // The commonest way to get this wrong is to copy the absolute energy out of the
+        // method file, which the model would accept and predict nonsense from.
+        for bad in ["0.0", "-5.0", "120.0"] {
+            let e = Config::from_json(&format!(r#"{{"predict_frag":{{"peptdeep_nce":{bad}}}}}"#))
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains("peptdeep_nce"), "{bad}: {e}");
+        }
+        for ok in ["1.0", "27.5", "100.0"] {
+            let c = format!(r#"{{"predict_frag":{{"peptdeep_nce":{ok}}}}}"#);
+            assert!(Config::from_json(&c).is_ok(), "{ok} must be accepted");
+        }
+        let e = Config::from_json(r#"{"predict_frag":{"peptdeep_instrument":"  "}}"#)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("peptdeep_instrument"), "{e}");
+        assert_eq!(Config::default().predict_frag.peptdeep_nce, 30.0);
+        assert_eq!(Config::default().predict_frag.peptdeep_model, "generic");
     }
 
     #[test]

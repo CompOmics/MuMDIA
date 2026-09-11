@@ -499,7 +499,7 @@ struct RoleReport {
     /// The configuration uses the role when an interpreter is available, without
     /// requiring one (DeepLC under `rt_im_train.library_irt = auto`).
     wanted: bool,
-    /// `rescore` | `deeplc` | `ms2pip` | `mbr`
+    /// `rescore` | `deeplc` | `ms2pip` | `peptdeep` | `mbr`
     role: String,
     /// The configuration field that names this interpreter.
     field: String,
@@ -725,6 +725,7 @@ fn doctor_report(cfg: &Config, config_path: Option<&str>) -> DoctorReport {
             Role::Rescore => cfg.rescore.python.clone(),
             Role::DeepLc => cfg.predict_frag.deeplc_python.clone(),
             Role::Ms2pip => cfg.predict_frag.ms2pip_python.clone(),
+            Role::Peptdeep => cfg.predict_frag.peptdeep_python.clone(),
             Role::Mbr => cfg.mbr.python.clone(),
         };
         let required = role.required_by(&cfg);
@@ -786,7 +787,9 @@ fn doctor_report(cfg: &Config, config_path: Option<&str>) -> DoctorReport {
                 let module_refs: Vec<&str> = r.modules.iter().map(|s| s.as_str()).collect();
                 match python::missing_modules(interp, &module_refs) {
                     Ok(missing) if missing.is_empty() => {
-                        for m in ["deeplc", "torch", "mokapot", "ms2pip", "numpy"] {
+                        // Every package whose VERSION changes results, so `doctor`
+                        // prints it rather than only asserting it imports.
+                        for m in ["deeplc", "torch", "mokapot", "ms2pip", "peptdeep", "numpy"] {
                             if module_refs.contains(&m) {
                                 if let Some(v) = python::module_version(interp, m) {
                                     r.versions.insert(m.to_string(), v);

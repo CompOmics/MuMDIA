@@ -1,0 +1,26 @@
+{
+  "features": {
+    "set": "extended"
+  },
+  "extract": {
+    "apex_count_window": 5,
+    "apex_rt_prior_s": 120.0,
+    "gate_min_score": 0.2
+  },
+  "predict_frag": {
+    "predictor": "peptdeep",
+    "rt_predictor": "deeplc",
+    "peptdeep_model": "generic",
+    "peptdeep_nce": 30.0,
+    "peptdeep_instrument": "Lumos",
+    "top_n_fragments": 12,
+    "peptdeep_python": "auto",
+    "deeplc_python": "auto",
+    "sidecar_script_dir": "scripts"
+  },
+  "rescore": {
+    "classifier": "nn_torch",
+    "python": "auto",
+    "strict": true
+  }
+}

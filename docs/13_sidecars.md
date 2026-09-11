@@ -1,4 +1,4 @@
-# Python sidecars (11 scripts + one shared writer) + conda envs
+# Python sidecars (12 scripts + one shared writer) + conda envs
 > Part of the MuMDIA developer documentation (see docs/README.md).
 
 ## Purpose
@@ -19,8 +19,9 @@ only the rescore sidecars fall back to a native rescorer, and only when
 strict gate, so a crashed MS2PIP, DeepLC, or DeepLC fine-tune aborts the whole
 run. The matrix in **Failure behavior** below is authoritative.
 
-The 11 scripts split into four groups: **predictors** (`ms2pip_worker`,
-`deeplc_worker`, `deeplc_finetune`) feed the run-independent library;
+The 12 scripts split into four groups: **predictors** (`ms2pip_worker`,
+`peptdeep_worker`, `deeplc_worker`, `deeplc_finetune`) feed the run-independent
+library;
 **rescorers** (`mokapot_worker`, `nn_rescore_worker`, `entrapment_worker`) score
 the competed PSMs in Stage F; **MBR** (`mbr_worker`) transfers identifications
 across runs (Stage D3); and the **DIA-NN recipe** (`import_diann_lib`,
@@ -76,6 +77,7 @@ For the mapping from each conda environment to the config field that points at i
 | path | role |
 |---|---|
 | `scripts/ms2pip_worker.py` | Predictor: MS2PIP b/y fragment intensities per peptidoform+charge |
+| `scripts/peptdeep_worker.py` | Predictor: AlphaPeptDeep b/y fragment intensities per peptidoform+charge, conditioned on collision energy and instrument |
 | `scripts/deeplc_worker.py` | Predictor: DeepLC iRT per peptidoform (uncalibrated) |
 | `scripts/deeplc_finetune.py` | Predictor: transfer-learn DeepLC on this run's seed and rewrite the library iRT; with `--no-finetune` (seed `-`) rewrite it with base-model predictions instead (`rt_im_train.library_irt`) |
 | `scripts/mokapot_worker.py` | Rescorer: mokapot brew over a PIN (model env-switchable: nn/logreg/xgb/percolator) |
@@ -86,7 +88,7 @@ For the mapping from each conda environment to the config field that points at i
 | `scripts/make_reverse_decoys.py` | Recipe: reverse-sequence decoys with no-target-overlap invariant |
 | `scripts/make_shift_decoys.py` | Recipe: fragment-shift (CH2) decoys, DIA-NN-style terminal shift |
 | `scripts/augment_library.py` | Recipe: augment an imported library with its missing tryptic FASTA peptides, then hand off to a decoy builder |
-| `rust/mumdia/crates/mumdia/src/sidecar.rs` | Rust clients: `resolve_script`, `run_ms2pip`, `run_deeplc`, `run_deeplc_finetune`, `run_mbr`, `run_worker` |
+| `rust/mumdia/crates/mumdia/src/sidecar.rs` | Rust clients: `resolve_script`, `run_ms2pip`, `run_peptdeep`, `run_deeplc`, `run_deeplc_finetune`, `run_mbr`, `run_worker`, and the shared `fragment_request` / `read_fragment_intensities` the two intensity predictors both use |
 | `rust/mumdia/crates/mumdia/src/stages/predict_frag.rs` | Call sites for MS2PIP + DeepLC (Stage C) |
 | `rust/mumdia/crates/mumdia/src/stages/run.rs` | Call site for DeepLC fine-tune (between search-seed and rt-im-train) |
 | `rust/mumdia/crates/mumdia/src/stages/rescore.rs` | Call sites for mokapot/nn_torch (PIN) + entrapment (Parquet) sidecars |
@@ -95,6 +97,7 @@ For the mapping from each conda environment to the config field that points at i
 | `env/docker-deeplc.yml` | Docker env `deeplc`: `deeplc==4.4.0` (PyPI; the engine's floor) + CPU torch (py3.11) |
 | `env/mumdia-rescore.yml` | Minimal portable env for the mokapot logreg rescore path (py3.12) |
 | `env/mumdia-deeplc.yml` | Portable local env for the DeepLC sidecars: DeepLC 4.4.0 + CPU torch (py3.11) |
+| `env/mumdia-peptdeep.yml` | Portable local env for the AlphaPeptDeep sidecar: peptdeep 1.5.1 (py3.11), separate because it pins the alphabase stack |
 
 ## Inputs and outputs
 
@@ -106,6 +109,18 @@ code.
 - OUT `ms2pip_out.parquet`: `id` u32, `ion_type` str (`"b"`/`"y"`), `ordinal` i32, `frag_charge` i32 (1, or 2 for the `b2`/`y2` series of the `*ch2` models; an output without the column is read as charge 1)
   (1-based), `intensity` f32 (linear). Rust folds this into
   `HashMap<u32, HashMap<(u8 ion_byte, u16 ordinal), f32>>` (`sidecar.rs:70-76`).
+
+**peptdeep_worker** (`sidecar.rs` `run_peptdeep`)
+- IN `peptdeep_in.parquet`: `id` u32, `peptidoform` str (ProForma), `charge` i32.
+  Byte-for-byte the same request `ms2pip_worker` reads; both are written by
+  `fragment_request`.
+- OUT `peptdeep_out.parquet`: the same five columns `ms2pip_worker` writes, read back
+  by the same `read_fragment_intensities`. The two intensity predictors are therefore
+  interchangeable at this boundary, which is the point: the engine enumerates its own
+  fragments and asks only for an intensity per `(ion_type, ordinal, frag_charge)`.
+- ARGV `<in> <out> <model> <nce> <instrument> <processes>`; the device comes from
+  `MUMDIA_PEPTDEEP_DEVICE` (auto|cuda|cpu), matching `MUMDIA_NN_DEVICE` in the
+  rescorer rather than inventing a second convention.
 
 **deeplc_worker** (`sidecar.rs:81` `run_deeplc`)
 - IN `deeplc_in.parquet`: `id` u32, `peptidoform` str.
@@ -224,6 +239,50 @@ per result, ions b then y. The output is assembled from numpy arrays per chunk, 
 from per-fragment Python list appends, which at 9.8M peptidoforms were about 300M
 appends and 13 GB of Python objects. The `__main__` guard makes the Windows `spawn`
 start method safe for multiprocessing.
+
+**AlphaPeptDeep** (`predict_frag.rs`, worker `peptdeep_worker.py`). Selected by
+`predict_frag.predictor = "peptdeep"`. The call site is the MS2PIP arm with a
+different worker behind it, down to reusing `ms2pip_values` for the lookup and
+normalisation, and the empty-map and per-candidate-miss behaviour is identical
+(`bail!` on an empty map, `drop_unpredicted` for a candidate the model did not
+cover).
+
+Three things are specific to it:
+
+- **Both fragment charges are always predicted.** `FRAG_TYPES` in the worker is fixed
+  at `b_z1, b_z2, y_z1, y_z2` and zero intensities are written out rather than
+  dropped. The engine decides a model predicts the doubly charged series by finding
+  ANY charge-2 key in that candidate's map; a precursor whose charge-2 predictions
+  happened to be all zero would otherwise be scored as though the model were
+  charge-1-only, fall back to native heuristic values there and max-normalise the two
+  charge groups separately. That is the `HCD2021` failure mode, which measured 0
+  confident PSMs at 1% on a real run. Measured on a 40-protein E. coli library,
+  AlphaPeptDeep keeps 59,942 charge-2 fragments in the top 12 against the native
+  heuristic's 9,892.
+- **Collision energy and instrument change the prediction**, and are recorded in the
+  artifact's `model_identity` for that reason:
+  `peptdeep-1.5.1-generic-nce30-Lumos`. Two libraries built at different NCE are not
+  the same library. The worker refuses an instrument outside the installed
+  AlphaPeptDeep's own `instrument_group` vocabulary, because AlphaPeptDeep maps an
+  unknown one onto its default silently.
+- **ProForma is translated in the worker.** MuMDIA writes modifications as UniMod
+  names (`PEC[Carbamidomethyl]TIDE`), which is also alphabase's `Name@Residue`
+  convention, so `parse_peptidoform` maps them mechanically with 1-based sites, 0 for
+  the N terminus and -1 for the C terminus. A bare mass delta (`[+79.96633]`) is
+  refused rather than matched by mass, because the nearest UniMod entry is not
+  necessarily the right one; those candidates are left unpredicted and the engine
+  drops them with their pairs, failing above 2%.
+
+Ordinals follow AlphaPeptDeep's fragment dataframe: within a precursor's
+`[frag_start_idx, frag_stop_idx)` slice, row `i` holds b(i+1) and y(nAA-1-i). Verified
+against its own `fragment_mz_df` (for a 9-mer, row 0 is b1 = 72.0444 and y8; row 7 is
+b8 and y1 = 147.1128). Output is streamed through a `ParquetWriter` in 200k-precursor
+chunks rather than concatenated at the end.
+
+What it does not do: retention time or ion mobility (AlphaPeptDeep can; MuMDIA's RT is
+DeepLC and its calibration is built around that), and a/c/x/z or neutral-loss ions
+(`mumdia_core::mass::IonType` is `B | Y`, so the engine never generates those
+fragments and an intensity for one has nowhere to go).
 
 **DeepLC predict** (`predict_frag.rs:274-312`, worker `deeplc_worker.py`).
 Selected by `predict_frag.rt_predictor = "deeplc"`. `assign_rt` deduplicates by

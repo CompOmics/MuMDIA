@@ -67,24 +67,7 @@ pub fn run_ms2pip(
     charges: &[i32],
     model: &str,
 ) -> Result<FragmentIntensityMap> {
-    std::fs::create_dir_all(workdir).ok();
-    // Per-invocation names. Fixed ones made two concurrent runs clobber each other, and
-    // silently rather than loudly: the readback key is a row index into each process's own
-    // request, so two runs over tables of the SAME row count -- which is the most likely
-    // reason to run two at once -- swapped each other's results instead of erroring.
-    // `align_sidecar_scores` catches a coverage mismatch, not an equal-length swap. The
-    // PIN/NN path was already PID-qualified for exactly this reason; these three were not.
-    let pid = std::process::id();
-    let inp = format!("{workdir}/ms2pip_in_{pid}.parquet");
-    let outp = format!("{workdir}/ms2pip_out_{pid}.parquet");
-    write_table(
-        &inp,
-        vec![
-            Col::U32("id".into(), ids.to_vec()),
-            Col::Str("peptidoform".into(), peptidoforms.to_vec()),
-            Col::I32("charge".into(), charges.to_vec()),
-        ],
-    )?;
+    let (inp, outp) = fragment_request(workdir, "ms2pip", ids, peptidoforms, charges)?;
     // The worker sizes its MS2PIP process pool from this. Left to itself it capped the
     // pool at min(8, cpu_count), which on the 9.8M-peptidoform HYE library left 24 of
     // the 32 requested cores idle for the whole prediction.
@@ -93,7 +76,50 @@ pub fn run_ms2pip(
     run_worker(python, script, &[&inp, &outp, model, &processes], false)
         .context("MS2PIP worker failed")?;
 
-    let t = TableFile::open(&outp)?;
+    read_fragment_intensities(&outp, ids, "MS2PIP")
+}
+
+/// Write the three-column request both fragment-intensity workers read, and name the
+/// output file. Returns `(input, output)`.
+///
+/// Per-invocation names. Fixed ones made two concurrent runs clobber each other, and
+/// silently rather than loudly: the readback key is a row index into each process's own
+/// request, so two runs over tables of the SAME row count -- which is the most likely
+/// reason to run two at once -- swapped each other's results instead of erroring.
+/// `align_sidecar_scores` catches a coverage mismatch, not an equal-length swap. The
+/// PIN/NN path was already PID-qualified for exactly this reason; these were not.
+fn fragment_request(
+    workdir: &str,
+    tag: &str,
+    ids: &[u32],
+    peptidoforms: &[String],
+    charges: &[i32],
+) -> Result<(String, String)> {
+    std::fs::create_dir_all(workdir).ok();
+    let pid = std::process::id();
+    let inp = format!("{workdir}/{tag}_in_{pid}.parquet");
+    let outp = format!("{workdir}/{tag}_out_{pid}.parquet");
+    write_table(
+        &inp,
+        vec![
+            Col::U32("id".into(), ids.to_vec()),
+            Col::Str("peptidoform".into(), peptidoforms.to_vec()),
+            Col::I32("charge".into(), charges.to_vec()),
+        ],
+    )?;
+    Ok((inp, outp))
+}
+
+/// Read the five-column fragment-intensity table both workers write.
+///
+/// Shared rather than copied, so a predictor added later cannot arrive with its own
+/// slightly different idea of the contract. `who` names the worker in the errors.
+fn read_fragment_intensities(
+    out_path: &str,
+    ids: &[u32],
+    who: &str,
+) -> Result<FragmentIntensityMap> {
+    let t = TableFile::open(out_path)?;
     let oid = t.u32("id")?;
     let ion = t.str("ion_type")?;
     let ord = t.i32("ordinal")?;
@@ -111,7 +137,7 @@ pub fn run_ms2pip(
     for i in 0..t.nrows {
         if !requested.contains(&oid[i]) {
             bail!(
-                "MS2PIP worker returned id {}, which was not among the {} peptidoforms \
+                "{who} worker returned id {}, which was not among the {} peptidoforms \
                  requested",
                 oid[i],
                 ids.len()
@@ -126,7 +152,7 @@ pub fn run_ms2pip(
             .is_some()
         {
             bail!(
-                "MS2PIP worker returned fragment {}{} charge {z} of id {} more than once",
+                "{who} worker returned fragment {}{} charge {z} of id {} more than once",
                 ion[i],
                 ord[i],
                 oid[i]
@@ -134,6 +160,48 @@ pub fn run_ms2pip(
         }
     }
     Ok(map)
+}
+
+/// AlphaPeptDeep fragment intensities: the same contract as [`run_ms2pip`], a different
+/// model behind it.
+///
+/// Positional contract: `peptdeep_worker.py <in> <out> <model> <nce> <instrument>
+/// <processes>`. The device is chosen by `MUMDIA_PEPTDEEP_DEVICE` (auto|cuda|cpu) in the
+/// worker, matching `MUMDIA_NN_DEVICE` in the rescorer rather than adding a second
+/// convention; the worker prints the device it actually got, because on a whole-proteome
+/// library the difference is an order of magnitude and a CPU-only torch looks the same
+/// from outside.
+#[allow(clippy::too_many_arguments)]
+pub fn run_peptdeep(
+    python: &str,
+    script: &str,
+    workdir: &str,
+    ids: &[u32],
+    peptidoforms: &[String],
+    charges: &[i32],
+    model: &str,
+    nce: f64,
+    instrument: &str,
+) -> Result<FragmentIntensityMap> {
+    let (inp, outp) = fragment_request(workdir, "peptdeep", ids, peptidoforms, charges)?;
+    let nce_s = nce.to_string();
+    let processes = rayon::current_num_threads().max(1).to_string();
+    info!(
+        n = ids.len(),
+        model,
+        nce,
+        instrument,
+        processes = %processes,
+        "sidecar: running AlphaPeptDeep"
+    );
+    run_worker(
+        python,
+        script,
+        &[&inp, &outp, model, &nce_s, instrument, &processes],
+        false,
+    )
+    .context("AlphaPeptDeep worker failed")?;
+    read_fragment_intensities(&outp, ids, "AlphaPeptDeep")
 }
 
 /// Installed version of a Python distribution as the interpreter reports it

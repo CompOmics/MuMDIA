@@ -61,6 +61,24 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ### Added
 
+- `predict_frag.predictor = "peptdeep"`: AlphaPeptDeep fragment intensities, a third
+  option beside `native` and `ms2pip`. With `rt_predictor = "deeplc"` this is a
+  library built end to end from a FASTA with open predictors and no DIA-NN anywhere,
+  which also means nothing re-predicts or replaces its retention times later:
+  `rt_im_train.library_irt` applies to imported libraries only, and a library you
+  built already is the DeepLC prediction. The per-run LOESS calibration,
+  `finetune_deeplc` and `multihead_calibration` all still apply.
+
+  New settings: `peptdeep_python`, `peptdeep_model` (default `generic`),
+  `peptdeep_nce` (default 30.0) and `peptdeep_instrument` (default `Lumos`).
+  Collision energy and instrument change the predicted spectrum, so both are part of
+  the artifact's `model_identity` (`peptdeep-1.5.1-generic-nce30-Lumos`): two
+  libraries built at different NCE are not the same library. The device comes from
+  `MUMDIA_PEPTDEEP_DEVICE` (auto|cuda|cpu), as the rescorer takes `MUMDIA_NN_DEVICE`.
+
+  Opt-in and benchmark-gated. No entrapment or second-acquisition measurement exists
+  for it yet, and a seed-PSM count alone does not promote a default.
+
 - The desktop Setup screen has a **Managed data** card. Everything the application
   downloads or builds is written at runtime under `%LOCALAPPDATA%\MuMDIA` (or
   `~/.local/share/MuMDIA`), and an installer removes only what it placed under the
