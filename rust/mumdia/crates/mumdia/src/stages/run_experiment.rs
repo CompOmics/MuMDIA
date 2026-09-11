@@ -77,9 +77,24 @@ fn preflight(p: &RunExperimentParams) -> Result<()> {
     if cfg.rt_im_train.finetune_deeplc && cfg.predict_frag.deeplc_python.is_none() {
         anyhow::bail!("rt_im_train.finetune_deeplc requires predict_frag.deeplc_python");
     }
-    if cfg.rt_im_train.multihead_calibration > 0 && cfg.predict_frag.deeplc_python.is_none() {
+    // Explicit count: hard requirement. Automatic default: degrade with a warning, so a
+    // native Python-free experiment stays runnable (`run.rs` says the same).
+    if cfg.rt_im_train.multihead_calibration.is_some_and(|n| n > 0)
+        && cfg.predict_frag.deeplc_python.is_none()
+    {
         anyhow::bail!(
-            "rt_im_train.multihead_calibration requires predict_frag.deeplc_python (DeepLC              >= 4.4.0): it calibrates the base model against each run's confident seed PSMs"
+            "rt_im_train.multihead_calibration requires predict_frag.deeplc_python (DeepLC \
+             >= 4.4.0): it calibrates the base model against each run's confident seed PSMs"
+        );
+    }
+    if cfg.rt_im_train.multihead_calibration.is_none()
+        && !cfg.rt_im_train.finetune_deeplc
+        && cfg.predict_frag.deeplc_python.is_none()
+    {
+        warn!(
+            "no DeepLC interpreter resolved, so retention-time multi-head calibration is \
+             not running; it is the default and was worth 4.8% of peptides on AIF and \
+             14.3% on Astral. Set predict_frag.deeplc_python (\"auto\" discovers one)."
         );
     }
     if p.lib_precursors.is_some()
@@ -150,6 +165,9 @@ fn process_run(
     ch: &str,
     lib_p_base: &str,
     lib_f: &str,
+    // Whether the experiment was given a library rather than a FASTA. Only the caller
+    // knows, and the multi-head default is scoped on it.
+    library_input: bool,
     mzml: &str,
     out: &str,
     top_peaks_ms2: usize,
@@ -193,7 +211,11 @@ fn process_run(
     // drift is then absorbed by `rt_im_train`'s per-run calibration below, which is fitted
     // separately for every run regardless.
     let mut produced_ft: Option<String> = None;
-    let lib_p = if cfg.rt_im_train.multihead_calibration > 0 {
+    let has_deeplc = cfg.predict_frag.deeplc_python.is_some();
+    let mh_heads = cfg
+        .rt_im_train
+        .multihead_heads(has_deeplc, cfg.deeplc_rt_source(library_input, has_deeplc));
+    let lib_p = if mh_heads > 0 {
         // Per run, always, and never shared: the whole point is that it is fitted against
         // THIS run's chromatography. `shared_ft` cannot be set here, because sharing is
         // gated on `finetune_deeplc`, which validation forbids alongside this.
@@ -201,7 +223,7 @@ fn process_run(
             .predict_frag
             .deeplc_python
             .as_deref()
-            .expect("preflight guarantees deeplc_python when multihead_calibration is set");
+            .expect("mh_heads is 0 unless an interpreter resolved");
         let script = crate::sidecar::resolve_script(
             &cfg.predict_frag.sidecar_script_dir,
             "deeplc_finetune.py",
@@ -213,7 +235,7 @@ fn process_run(
             lib_p_base,
             &seed,
             &lib_p_mh,
-            cfg.rt_im_train.multihead_calibration,
+            mh_heads,
             cfg.rt_im_train.q_train,
             cfg.rt_im_train.window_holdout_frac,
             rayon::current_num_threads(),
@@ -618,6 +640,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
             &ch,
             &lib_p_base,
             &lib_f,
+            p.lib_precursors.is_some(),
             &p.mzmls[0],
             &d(&names[0]),
             p.top_peaks_ms2,
@@ -650,6 +673,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
                 &ch,
                 &lib_p_base,
                 &lib_f,
+                p.lib_precursors.is_some(),
                 &p.mzmls[i],
                 &d(&names[i]),
                 p.top_peaks_ms2,
@@ -675,6 +699,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
                         &ch,
                         &lib_p_base,
                         &lib_f,
+                        p.lib_precursors.is_some(),
                         &p.mzmls[i],
                         &d(&names[i]),
                         p.top_peaks_ms2,
@@ -889,11 +914,14 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
     // which fragment predictor, and the classifier that actually ran.
     let library_input = p.lib_precursors.is_some();
     let deeplc_py = cfg.predict_frag.deeplc_python.as_deref();
-    let rt_identity = if cfg.rt_im_train.multihead_calibration > 0 {
-        crate::sidecar::deeplc_identity(
-            deeplc_py,
-            &format!("multihead-{}", cfg.rt_im_train.multihead_calibration),
-        )
+    // Resolved the same way the stage itself resolved it, so the manifest records what
+    // ran rather than what was configured.
+    let mh_heads = cfg.rt_im_train.multihead_heads(
+        deeplc_py.is_some(),
+        cfg.deeplc_rt_source(library_input, deeplc_py.is_some()),
+    );
+    let rt_identity = if mh_heads > 0 {
+        crate::sidecar::deeplc_identity(deeplc_py, &format!("multihead-{mh_heads}"))
     } else if cfg.rt_im_train.finetune_deeplc {
         if matches!(cfg.experiment.finetune_scope, FinetuneScope::FirstRunOnly) {
             crate::sidecar::deeplc_identity(deeplc_py, "finetuned-first-run")

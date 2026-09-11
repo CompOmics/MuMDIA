@@ -165,6 +165,9 @@ impl Role {
                 cfg.predict_frag.rt_predictor == RtPredictorKind::Deeplc
                     || cfg.rt_im_train.finetune_deeplc
                     || cfg.rt_im_train.library_irt == LibraryIrt::Deeplc
+                    // An EXPLICIT head count. The automatic default is `wanted_by`
+                    // instead, so a run with no interpreter degrades rather than failing.
+                    || cfg.rt_im_train.multihead_calibration.is_some_and(|n| n > 0)
             }
             Role::Ms2pip => cfg.predict_frag.predictor == FragPredictorKind::Ms2pip,
             Role::Peptdeep => cfg.predict_frag.predictor == FragPredictorKind::Peptdeep,
@@ -183,6 +186,12 @@ impl Role {
     pub fn wanted_by(self, cfg: &Config) -> bool {
         match self {
             Role::DeepLc => {
+                // The automatic multi-head default needs no clause of its own. Its
+                // scope IS a DeepLC retention-time source: in imported-library mode that
+                // is `library_irt == Auto`, which already wants an interpreter, and in
+                // FASTA mode it is `rt_predictor == Deeplc`, which already requires one.
+                // An earlier version added a clause here and made a fully native
+                // configuration want DeepLC, which three tests caught.
                 !self.required_by(cfg) && cfg.rt_im_train.library_irt == LibraryIrt::Auto
             }
             _ => false,
@@ -641,6 +650,25 @@ mod tests {
         cfg.predict_frag.predictor = FragPredictorKind::Peptdeep;
         assert!(Role::Peptdeep.required_by(&cfg));
         assert!(!Role::Ms2pip.required_by(&cfg));
+        // An explicit head count makes DeepLC required. The automatic default does not:
+        // it is scoped to a run whose retention times are DeepLC's already, so a native
+        // run neither requires nor wants an interpreter and still starts without Python.
+        cfg.predict_frag.rt_predictor = RtPredictorKind::Native;
+        cfg.rt_im_train.library_irt = LibraryIrt::Library;
+        cfg.rt_im_train.multihead_calibration = Some(80);
+        assert!(
+            Role::DeepLc.required_by(&cfg),
+            "an explicit count requires it"
+        );
+        cfg.rt_im_train.multihead_calibration = None;
+        assert!(
+            !Role::DeepLc.required_by(&cfg) && !Role::DeepLc.wanted_by(&cfg),
+            "the default asks nothing of a native configuration"
+        );
+        // Under the default `library_irt = auto` it is wanted but not required, which is
+        // the state the automatic multi-head default rides on.
+        cfg.rt_im_train.library_irt = LibraryIrt::Auto;
+        assert!(!Role::DeepLc.required_by(&cfg) && Role::DeepLc.wanted_by(&cfg));
 
         cfg.mbr.strategy = MbrStrategy::RtTransfer;
         assert!(Role::Mbr.required_by(&cfg));

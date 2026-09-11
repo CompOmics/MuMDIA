@@ -27,6 +27,38 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ## [Unreleased]
 
+### Changed
+
+- **`rt_im_train.multihead_calibration` is now the default.** Left unset it calibrates the
+  DeepLC base model over 80 of its best-correlating LC-setup heads against each run's own
+  confident seed PSMs, in place of the single head `deeplc.predict` returns. Measured on
+  two acquisitions, six pooled runs each, at an unchanged empirical decoy fraction of
+  0.0100 in all four arms: AIF 80,842 -> 84,725 peptides (+4.8%), Astral 102,942 ->
+  117,652 (+14.3%), protein groups +2.4% and +7.1%, precursors +4.8% and +15.5%. Fewer
+  candidates reach rescore and more of them are real. An entrapment arm supplies the
+  empirical null: +4.28% real peptides at an FDP of 0.995% against the baseline's 0.995%,
+  identical to three decimal places on 138 and 144 accepted spike-in peptides.
+
+  It costs **1.4x to 1.7x wall clock**, because the calibration is fitted against each
+  run's own anchors and so cannot be shared across an experiment. Set
+  `multihead_calibration: 0` to restore the previous behaviour exactly.
+
+  The default is scoped rather than unconditional, and the field is now nullable to
+  express that. It applies only where an interpreter is available AND the run's retention
+  times are DeepLC's already: an imported library under `library_irt = auto` or `deeplc`,
+  or FASTA with `rt_predictor = deeplc`. A native, Python-free run is unaffected and still
+  starts; a configuration asking for the native retention-time model keeps it. An explicit
+  count is a hard requirement, so `multihead_calibration: 80` without an interpreter
+  still fails rather than doing without. `finetune_deeplc` keeps its own slot instead of
+  colliding with the default, so a configuration that enables the fine-tune is no longer
+  refused for a conflict it never wrote; asking for both explicitly is still an error.
+
+  Two consequences worth knowing: the separate `library_irt` base-model re-prediction no
+  longer runs under the defaults, because multi-head re-predicts the library itself (about
+  27 minutes saved on a 10.9M-row library, whose only output it would overwrite); and
+  `model_identities.rt_predictor` now reads `multihead-80` rather than
+  `deeplc-4.4.0-base`, which is how to tell which one a given run used.
+
 ### Added
 
 - `predict_frag.predictor = "peptdeep"`: AlphaPeptDeep fragment intensities, a third
