@@ -114,6 +114,47 @@ narrow on purpose -- "this configuration requires no sidecar at all", asked of
 `native_tda` would be wrong: on an imported library it measured 10,847 against
 `nn_torch`'s 10,914.
 
+### Uninstalling does not remove them
+
+An MSI removes exactly what it placed under Program Files. Everything the
+application downloads or builds is written at runtime under the data directory, so
+an uninstall leaves all of it behind: two Python environments, ThermoRawFileParser,
+an optionally downloaded DIA-NN, the predicted-library cache and the saved settings.
+Measured on one development machine, 8.9 GB of it, with nothing in the interface
+that could remove it.
+
+That the installer leaves it is not itself the bug, and the fix is deliberately not
+a WiX uninstall custom action:
+
+- an upgrade reinstalls over the same data directory and reuses a
+  several-hundred-megabyte download and a library cache that costs hours to rebuild;
+- an MSI "uninstall" also runs during some upgrade paths, so a silent delete there
+  would destroy a predicted library as a side effect of a version change.
+
+The Setup screen therefore has a **Managed data** card. `components::inventory`
+lists what exists, item by item, with the bytes each occupies; each row names the
+exact paths and takes two clicks to remove. The items are `primary`, `ms2pip`,
+`thermo`, `diann`, `libraries` and `settings`, and each directory name comes from a
+constant exported by the module that writes there, so a rename cannot leave
+something behind that nothing offers to remove.
+
+Two properties matter and are tested. `remove_in` resolves the real parent directory
+and refuses anything outside the data directory, and refuses a symbolic link
+outright, because this is a recursive delete driven by a string from the frontend.
+`components_remove` refuses entirely while a search, an installation or a library
+build is running, since those hold the very files it would delete.
+
+By hand, the same thing:
+
+```powershell
+Remove-Item -Recurse -Force "$env:LOCALAPPDATA\MuMDIA"           # everything
+Remove-Item -Recurse -Force "$env:LOCALAPPDATA\MuMDIA\python"    # just the environment
+```
+
+```bash
+rm -rf ~/.local/share/MuMDIA
+```
+
 ### Two environments, not one (historical)
 
 MS2PIP could not share an environment with DeepLC at the versions this project

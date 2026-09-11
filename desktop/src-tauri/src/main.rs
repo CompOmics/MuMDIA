@@ -196,6 +196,83 @@ fn components_install(
     )
 }
 
+/// What is running that would make removing managed data unsafe, if anything.
+///
+/// Every answer names something the user can see and wait for, because that is what
+/// the message asks them to do. A poisoned lock counts as busy: refusing a delete is
+/// the safe reading of "the state cannot be established".
+fn managed_work_in_progress(state: &AppState) -> Option<String> {
+    let searching = state
+        .runs
+        .lock()
+        .map(|r| r.values().any(|run| run.is_active()))
+        .unwrap_or(true);
+    if searching {
+        return Some("a search is running".into());
+    }
+    if state.installer.busy(components::Env::Primary) {
+        return Some("the required components are being installed".into());
+    }
+    if state.installer.busy(components::Env::Ms2pip) {
+        return Some("MS2PIP is being installed".into());
+    }
+    if state.thermo.busy() {
+        return Some("the Thermo converter is being installed".into());
+    }
+    if state.diann_installer.snapshot().status == "running" {
+        return Some("DIA-NN is being downloaded".into());
+    }
+    if state.diann.snapshot().status == "running" {
+        return Some("a spectral library is being built".into());
+    }
+    None
+}
+
+/// What the application has created under its data directory, and how big each is.
+///
+/// Nothing else can tell the user this. The installer removes what it placed under the
+/// program folder; every item here is written at runtime and survives an uninstall.
+#[tauri::command]
+fn components_removable() -> serde_json::Value {
+    serde_json::json!({
+        "dir": components::data_dir().display().to_string(),
+        "items": components::removable(),
+    })
+}
+
+/// Delete one managed component's data, and return the bytes freed with the new list.
+///
+/// Destructive, so it refuses while anything might be reading those files: a search
+/// holds the Python environment open, an installation is writing into it, and a
+/// library build is writing the cache.
+#[tauri::command]
+fn components_remove(
+    state: tauri::State<'_, AppState>,
+    id: String,
+) -> Result<serde_json::Value, String> {
+    if let Some(busy) = managed_work_in_progress(&state) {
+        return Err(format!(
+            "{busy}. Wait for it to finish, or stop it, before removing anything."
+        ));
+    }
+    let freed = components::remove(&id)?;
+    // The install trackers keep a terminal `done` on purpose, so without this a removed
+    // component would go on reporting itself installed until the application restarted.
+    match id.as_str() {
+        "primary" => state.installer.forget(components::Env::Primary),
+        "ms2pip" => state.installer.forget(components::Env::Ms2pip),
+        "thermo" => state.thermo.forget(),
+        "diann" => state.diann_installer.forget(),
+        "libraries" => state.diann.forget(),
+        _ => {}
+    }
+    Ok(serde_json::json!({
+        "freed_bytes": freed,
+        "dir": components::data_dir().display().to_string(),
+        "items": components::removable(),
+    }))
+}
+
 /// Everything that must be true before a search can start.
 ///
 /// Checked here rather than at the moment of starting, so the interface can explain
@@ -591,6 +668,8 @@ fn main() {
             engine_info,
             components_status,
             components_install,
+            components_removable,
+            components_remove,
             config_schema,
             save_settings,
             derive_config,

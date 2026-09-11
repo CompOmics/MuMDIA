@@ -102,8 +102,11 @@ pub fn nest(flat: &BTreeMap<String, serde_json::Value>) -> serde_json::Value {
 /// settings can be reused across searches, and so a results folder stays a results
 /// folder.
 pub fn config_dir() -> PathBuf {
-    crate::components::data_dir().join("configs")
+    crate::components::data_dir().join(CONFIG_DIR_NAME)
 }
+
+/// Shared with `components::inventory`, which offers to remove this directory.
+pub const CONFIG_DIR_NAME: &str = "configs";
 
 /// The inverse of [`nest`]: a configuration object as `{"extract.gate_min_score": 0.3}`.
 ///

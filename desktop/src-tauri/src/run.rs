@@ -271,7 +271,7 @@ impl Run {
         drop(guard);
     }
 
-    fn is_active(&self) -> bool {
+    pub fn is_active(&self) -> bool {
         matches!(self.snapshot().status.as_str(), "running" | "starting")
     }
 

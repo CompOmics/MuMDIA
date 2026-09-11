@@ -27,6 +27,21 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ## [Unreleased]
 
+### Added
+
+- The desktop Setup screen has a **Managed data** card. Everything the application
+  downloads or builds is written at runtime under `%LOCALAPPDATA%\MuMDIA` (or
+  `~/.local/share/MuMDIA`), and an installer removes only what it placed under the
+  program folder, so an uninstall left all of it behind: 8.9 GB on one development
+  machine, with nothing in the interface that could remove it. The card lists each
+  item with its size and removes it in two clicks, naming the exact paths first.
+  Removal is refused while a search, an installation or a library build is running.
+
+  Deliberately not done as an uninstaller action: an upgrade reuses the same data
+  directory, and an MSI uninstall also runs during some upgrade paths, so a silent
+  delete would throw away a spectral library that costs hours to predict as a side
+  effect of a version change.
+
 ## [0.3.1] - 2026-09-10
 
 Fixes a v0.3.0 desktop installer that could not create its Python environment at all.

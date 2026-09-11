@@ -162,6 +162,32 @@
       </div>
     </div>
 
+    <h1 class="section-h">Managed data</h1>
+    <p class="sub">
+      Everything MuMDIA downloads or builds lives in one folder under your user
+      account. Uninstalling MuMDIA does not remove it: the installer only removes
+      what it put in the program folder, and this is written while the application
+      runs. Remove what you no longer need here.
+    </p>
+
+    <div class="card" id="managed-card">
+      <div class="card-head">
+        <div>
+          <div class="card-title">
+            On this machine <span class="pill mute" id="managed-total">checking…</span>
+          </div>
+          <div class="card-sub" id="managed-where"></div>
+        </div>
+        <button class="btn quiet" id="managed-reveal">Open folder</button>
+      </div>
+      <div id="managed-freed" class="banner ok" hidden></div>
+      <div id="managed-error" class="banner bad" hidden></div>
+      <div id="managed-items"></div>
+      <p class="hint" id="managed-empty" hidden>
+        Nothing has been downloaded or built yet, so there is nothing to remove.
+      </p>
+    </div>
+
   </section>
 
   <!-- ─────────────────────────────── Search ─────────────────────────────── -->
