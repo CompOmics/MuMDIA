@@ -1,5 +1,5 @@
 """Import-order and structural contract tests for the predictor sidecars:
-`deeplc_worker.py`, `deeplc_finetune.py`, `ms2pip_worker.py`.
+`deeplc_worker.py`, `deeplc_finetune.py`, `ms2pip_worker.py`, `peptdeep_worker.py`.
 
 The static assertions here need no ML dependency and always run. They exist
 because the failure they guard keeps recurring and is invisible in review: in
@@ -319,3 +319,252 @@ def test_ms2pip_worker_writes_the_documented_output_schema(tmp_path):
     assert set(int(z) for z in cols2["frag_charge"]) == {1, 2}
     n1 = sum(1 for z in cols2["frag_charge"] if int(z) == 1)
     assert n1 == len(cols["frag_charge"]), "the charge-1 series must be as long as before"
+
+
+# ---------------------------------------------------------------- peptdeep_worker
+
+def _load_peptdeep_worker():
+    spec = importlib.util.spec_from_file_location(
+        "mumdia_peptdeep_worker", SCRIPTS / "peptdeep_worker.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_peptdeep_worker_module_imports_without_peptdeep_installed():
+    """Same deferred-import contract as the MS2PIP worker, for the same reason."""
+    module = _load_peptdeep_worker()
+    assert callable(module.main)
+    text = _source("peptdeep_worker.py")
+    for line in text.splitlines():
+        assert not line.startswith("import peptdeep"), "peptdeep hoisted to module scope"
+        assert not line.startswith("from peptdeep"), "peptdeep hoisted to module scope"
+        assert not line.startswith("from alphabase"), "alphabase hoisted to module scope"
+
+
+def test_peptdeep_worker_translates_proforma_to_alphabase():
+    """`parse_peptidoform` must map MuMDIA's ProForma onto alphabase's convention.
+
+    MuMDIA writes UniMod NAMES in brackets and alphabase spells a modification
+    `Name@Residue` with 1-based sites, 0 for the N terminus and -1 for the C terminus,
+    so the mapping is mechanical. Getting a site off by one would put the modification
+    on the wrong residue and predict a plausible-looking wrong spectrum, which no
+    later stage could detect.
+    """
+    module = _load_peptdeep_worker()
+    p = module.parse_peptidoform
+
+    assert p("PEPTIDEK") == ("PEPTIDEK", "", "")
+    assert p("PEC[Carbamidomethyl]TIDE") == (
+        "PECTIDE",
+        "Carbamidomethyl@C",
+        "3",
+    ), "1-based site on the residue the bracket follows"
+    assert p("[Acetyl]-PEPK") == ("PEPK", "Acetyl@Any_N-term", "0")
+    assert p("PEPK-[Amidated]") == ("PEPK", "Amidated@Any_C-term", "-1")
+    # Several modifications keep their order and their own sites.
+    assert p("M[Oxidation]PEC[Carbamidomethyl]K") == (
+        "MPECK",
+        "Oxidation@M;Carbamidomethyl@C",
+        "1;4",
+    )
+
+
+def test_peptdeep_worker_refuses_a_mass_delta_rather_than_guessing():
+    """A bare delta names no modification, and the nearest UniMod is not necessarily
+    the right one, so it is left unpredicted instead of silently substituted.
+
+    The engine drops a candidate no predictor covered together with its target/decoy
+    pair and fails the run above 2%, so refusing here is reported, not lost.
+    """
+    module = _load_peptdeep_worker()
+    for bad in ["PEPT[+79.96633]IDEK", "PEC[57.021464]TIDE", "PEPT[-18.0106]IDEK"]:
+        assert module.parse_peptidoform(bad) is None, bad
+    # An unparseable string is refused rather than raising.
+    assert module.parse_peptidoform("") is None
+    assert module.parse_peptidoform("PEPT[Oxidation") is None
+
+
+def test_peptdeep_worker_always_asks_for_both_fragment_charges():
+    """`FRAG_TYPES` must keep the doubly charged series.
+
+    The engine decides a model predicted charge 2 by finding ANY charge-2 key for that
+    candidate; without one it fills those fragments from the native heuristic and
+    max-normalises the two charge groups separately. That is the measured `HCD2021`
+    failure: 78.6% of kept fragments heuristic and 0 confident PSMs at 1% on a real
+    run. This is a contract of the worker, not a setting.
+    """
+    module = _load_peptdeep_worker()
+    assert module.FRAG_TYPES == ["b_z1", "b_z2", "y_z1", "y_z2"]
+    assert {c for c, _, _ in module.SERIES} == set(module.FRAG_TYPES)
+    assert {z for _, _, z in module.SERIES} == {1, 2}
+    assert {i for _, i, _ in module.SERIES} == {0, 1}
+
+
+def test_peptdeep_worker_maps_fragment_rows_to_ordinals():
+    """Row `i` of a precursor's slice is b(i+1) and y(nAA-1-i).
+
+    Verified against AlphaPeptDeep's own `fragment_mz_df` for a 9-mer: row 0 carries
+    b1 (72.0444) and y8, row 7 carries b8 and y1 (147.1128). An inverted y ordinal
+    would pair every predicted intensity with the wrong fragment m/z, which the
+    engine cannot notice: both series exist and both are plausible.
+    """
+    import pandas as pd
+
+    import pyarrow as pa
+
+    module = _load_peptdeep_worker()
+    n_aa = 5
+    width = n_aa - 1
+    precursor_df = pd.DataFrame(
+        {
+            "mumdia_id": [7],
+            "nAA": [n_aa],
+            "frag_start_idx": [0],
+            "frag_stop_idx": [width],
+        }
+    )
+    intensity_df = pd.DataFrame(
+        {
+            "b_z1": [0.1, 0.2, 0.3, 0.4],
+            "b_z2": [0.0, 0.0, 0.0, 0.0],
+            "y_z1": [0.5, 0.6, 0.7, 0.8],
+            "y_z2": [0.9, 0.0, 0.0, 0.0],
+        }
+    )
+    ids, ions, ords, chgs, ints = module.fragment_rows(precursor_df, intensity_df)
+    assert set(ids.tolist()) == {7}
+    table = {}
+    for ion, ordinal, charge, value in zip(ions, ords, chgs, ints):
+        table[("by"[ion], int(ordinal), int(charge))] = round(float(value), 4)
+
+    assert table[("b", 1, 1)] == 0.1 and table[("b", 4, 1)] == 0.4
+    # y counts from the other end: row 0 is y(n-1) = y4, row 3 is y1.
+    assert table[("y", 4, 1)] == 0.5 and table[("y", 1, 1)] == 0.8
+    assert table[("y", 4, 2)] == 0.9
+    # Zeros are kept: dropping a precursor's whole charge-2 series would make the
+    # engine treat the model as charge-1-only.
+    assert table[("b", 1, 2)] == 0.0
+    assert len(table) == 4 * width
+
+    arrow = module.to_table((ids, ions, ords, chgs, ints))
+    assert arrow.schema.field("ion_type").type == pa.string(), "utf8, not dictionary"
+    assert arrow.column_names == [
+        "id",
+        "ion_type",
+        "ordinal",
+        "frag_charge",
+        "intensity",
+    ], "the same five columns the MS2PIP worker writes"
+
+
+def test_peptdeep_worker_end_to_end(tmp_path):
+    """The real worker over the real model, when peptdeep is installed.
+
+    Skipped without it. What this adds over the unit tests is the contract the engine
+    actually reads: five columns, snappy, ids only from the request, both fragment
+    charges present, intensities finite and in [0, 1].
+    """
+    import numpy as np
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from conftest import read_columns, run_worker_ok
+
+    importorskip_any("peptdeep")
+
+    inp = tmp_path / "peptdeep_in.parquet"
+    out = tmp_path / "peptdeep_out.parquet"
+    pq.write_table(
+        pa.table(
+            {
+                "id": pa.array([0, 1], pa.uint32()),
+                "peptidoform": pa.array(
+                    ["ACDEFGHIK", "PEC[Carbamidomethyl]TIDEK"], pa.string()
+                ),
+                "charge": pa.array([2, 3], pa.int32()),
+            }
+        ),
+        inp,
+        compression="snappy",
+    )
+    run_worker_ok("peptdeep_worker.py", inp, out, "generic", "30", "Lumos", "2")
+
+    cols = read_columns(out)
+    assert set(cols) == {"id", "ion_type", "ordinal", "frag_charge", "intensity"}
+    assert set(int(x) for x in cols["id"]) <= {0, 1}
+    assert set(cols["ion_type"]) <= {"b", "y"}
+    assert min(int(o) for o in cols["ordinal"]) == 1, "ordinals must be 1-based"
+    assert set(int(z) for z in cols["frag_charge"]) == {1, 2}, "both charges, always"
+    intensity = np.asarray(cols["intensity"], dtype=float)
+    assert np.isfinite(intensity).all()
+    assert ((intensity >= 0.0) & (intensity <= 1.0)).all()
+    assert intensity.max() > 0.0, "an all-zero library is not a prediction"
+
+
+def test_peptdeep_worker_refuses_an_unknown_instrument(tmp_path):
+    """AlphaPeptDeep maps an unknown instrument onto its default silently, which would
+    predict a different spectrum than the configuration asked for and say nothing."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from conftest import run_worker
+
+    importorskip_any("peptdeep")
+
+    inp = tmp_path / "peptdeep_in.parquet"
+    pq.write_table(
+        pa.table(
+            {
+                "id": pa.array([0], pa.uint32()),
+                "peptidoform": pa.array(["PEPTIDEK"], pa.string()),
+                "charge": pa.array([2], pa.int32()),
+            }
+        ),
+        inp,
+        compression="snappy",
+    )
+    rc, _, err = run_worker(
+        "peptdeep_worker.py",
+        inp,
+        tmp_path / "out.parquet",
+        "generic",
+        "30",
+        "NoSuchInstrument",
+        "1",
+    )
+    assert rc != 0
+    assert "unknown instrument" in err.lower()
+
+
+def test_peptdeep_worker_rejects_a_bad_device_request(tmp_path):
+    """`MUMDIA_PEPTDEEP_DEVICE` follows `MUMDIA_NN_DEVICE`: auto|cuda|cpu, and `cuda`
+    on a CPU-only torch errors rather than quietly measuring the wrong device."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from conftest import run_worker
+
+    importorskip_any("torch")
+
+    inp = tmp_path / "peptdeep_in.parquet"
+    pq.write_table(
+        pa.table(
+            {
+                "id": pa.array([0], pa.uint32()),
+                "peptidoform": pa.array(["PEPTIDEK"], pa.string()),
+                "charge": pa.array([2], pa.int32()),
+            }
+        ),
+        inp,
+        compression="snappy",
+    )
+    rc, _, err = run_worker(
+        "peptdeep_worker.py",
+        inp,
+        tmp_path / "out.parquet",
+        env={"MUMDIA_PEPTDEEP_DEVICE": "tpu"},
+    )
+    assert rc != 0
+    assert "must be auto, cuda or cpu" in err

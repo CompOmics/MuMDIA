@@ -31,8 +31,8 @@ policy for tuning and validation.
   - `mumdia-core`: typed config, schemas, manifest, masses/constants.
   - `mumdia-io`: Arrow/Parquet table layer, hashes, JSON, artifact reports.
   - `mumdia`: CLI/library, fragment index, FDR/rescoring, and stages.
-- `scripts/`: seven engine-invoked Python workers plus four imported-library
-  helpers (eleven scripts), and `_lib_io.py`, the shared writer the helpers use so
+- `scripts/`: eight engine-invoked Python workers plus four imported-library
+  helpers (twelve scripts), and `_lib_io.py`, the shared writer the helpers use so
   they cannot emit a parquet the engine rejects. Includes `augment_library.py`, which adds the
   tryptic FASTA peptides an imported library is missing. Sidecars use positional
   file contracts.
