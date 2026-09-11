@@ -502,6 +502,80 @@ fn assign_intensities(p: &PredictFragParams, raws: &mut [Raw]) -> Result<(String
                 sidecar::module_version(python, "ms2pip").unwrap_or_else(|| "unknown".into());
             Ok((format!("ms2pip-{version}-{}", p.cfg.ms2pip_model), missing))
         }
+        FragPredictorKind::Peptdeep => {
+            let python = p.cfg.peptdeep_python.as_deref().ok_or_else(|| {
+                anyhow::anyhow!("predictor=peptdeep requires predict_frag.peptdeep_python")
+            })?;
+            let script =
+                crate::sidecar::resolve_script(&p.cfg.sidecar_script_dir, "peptdeep_worker.py");
+            let ids: Vec<u32> = (0..raws.len() as u32).collect();
+            let peps: Vec<String> = raws.iter().map(|r| r.peptidoform.clone()).collect();
+            let charges: Vec<i32> = raws.iter().map(|r| r.charge).collect();
+            let map = sidecar::run_peptdeep(
+                python,
+                &script,
+                p.work_dir,
+                &ids,
+                &peps,
+                &charges,
+                &p.cfg.peptdeep_model,
+                p.cfg.peptdeep_nce,
+                &p.cfg.peptdeep_instrument,
+            )?;
+            if map.is_empty() {
+                bail!("AlphaPeptDeep returned no predictions");
+            }
+            // Same assembly as the MS2PIP arm, and deliberately the same `ms2pip_values`:
+            // the worker always emits both fragment charges, so `model_has_charge2` holds
+            // and every fragment is on one scale. The native heuristic is passed for the
+            // same reason it is there -- it is what a charge-1-only model would fall back
+            // to -- and is unreachable while that stays true.
+            let native = NativeFrag;
+            let covered: Vec<bool> = raws
+                .par_iter_mut()
+                .enumerate()
+                .map(|(i, r)| match map.get(&(i as u32)) {
+                    Some(per) if !per.is_empty() => {
+                        let keys: Vec<(u8, u16, u8)> = r
+                            .frags
+                            .iter()
+                            .map(|fr| {
+                                (
+                                    fr.ion_type.symbol() as u8,
+                                    fr.ordinal as u16,
+                                    fr.charge.clamp(1, 255) as u8,
+                                )
+                            })
+                            .collect();
+                        let nat = native.predict_intensities(&r.parsed, &r.frags);
+                        r.frag_int = ms2pip_values(&keys, per, &nat);
+                        true
+                    }
+                    _ => {
+                        r.frag_int = vec![0.0; r.frags.len()];
+                        false
+                    }
+                })
+                .collect();
+            let missing: Vec<usize> = covered
+                .iter()
+                .enumerate()
+                .filter(|(_, &c)| !c)
+                .map(|(i, _)| i)
+                .collect();
+            let version =
+                sidecar::module_version(python, "peptdeep").unwrap_or_else(|| "unknown".into());
+            // The identity carries what changes the numbers: the model, the collision
+            // energy and the instrument. Two libraries built at different NCE are not
+            // the same library, and the manifest has to be able to say so.
+            Ok((
+                format!(
+                    "peptdeep-{version}-{}-nce{}-{}",
+                    p.cfg.peptdeep_model, p.cfg.peptdeep_nce, p.cfg.peptdeep_instrument
+                ),
+                missing,
+            ))
+        }
     }
 }
 

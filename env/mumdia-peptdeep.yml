@@ -1,0 +1,46 @@
+# Portable local environment for the AlphaPeptDeep fragment-intensity sidecar
+# (scripts/peptdeep_worker.py).
+#
+#   conda env create -f env/mumdia-peptdeep.yml
+#   # then point the config at this env's interpreter:
+#   #   "predict_frag": { "predictor": "peptdeep",
+#   #                     "peptdeep_python": ".../envs/mumdia-peptdeep/bin/python" }
+#   #   (on Windows: ...\\envs\\mumdia-peptdeep\\python.exe)
+#   mumdia doctor --config <your config>
+#
+# Its own environment rather than joining env/mumdia-deeplc.yml, for the same reason
+# MS2PIP once needed one: peptdeep pins the alphabase/alpharaw stack alongside torch
+# and transformers, and a resolver conflict here would otherwise take the
+# retention-time model down with it. The two are independent processes, so nothing is
+# lost by separating them.
+#
+# The first run downloads AlphaPeptDeep's pretrained models (~100 MB) into
+# `~/peptdeep/pretrained_models`. That is a network fetch at prediction time, not at
+# install time, so a machine that builds libraries offline needs the cache warmed
+# first.
+#
+# CPU torch is the default here, as elsewhere, so the environment installs on a
+# machine without CUDA. Unlike DeepLC fine-tuning, this one IS the bottleneck: it is a
+# transformer evaluated over every peptidoform in the library, so a CUDA build is
+# worth it for a whole proteome. Drop the `--extra-index-url` line and the `+cpu`
+# suffix, or install a cu12x wheel, and set MUMDIA_PEPTDEEP_DEVICE=auto (the default)
+# to use the GPU; `=cuda` errors rather than silently running on the CPU.
+#
+# No version floor is enforced in the engine, unlike DeepLC's. 1.5.1 is what the
+# worker was written and measured against; the fragment dataframe layout it reads
+# (`frag_start_idx`/`frag_stop_idx` slices, `b_z1`/`b_z2`/`y_z1`/`y_z2` columns) is
+# stable across 1.x, and the worker checks the instrument vocabulary against whatever
+# version is installed rather than assuming one.
+name: mumdia-peptdeep
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - pip:
+      - --extra-index-url https://download.pytorch.org/whl/cpu
+      - torch==2.14.0+cpu
+      # >= 83 closes PYSEC-2026-3447, as in env/mumdia-deeplc.yml.
+      - setuptools>=83
+      - peptdeep==1.5.1
+      - pyarrow
