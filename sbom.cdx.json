@@ -634,11 +634,11 @@
     },
     {
       "type": "library",
-      "bom-ref": "pkg:cargo/block-buffer@0.10.4",
+      "bom-ref": "pkg:cargo/block-buffer@0.12.1",
       "name": "block-buffer",
-      "version": "0.10.4",
-      "purl": "pkg:cargo/block-buffer@0.10.4",
-      "description": "Buffer type for block processing of data",
+      "version": "0.12.1",
+      "purl": "pkg:cargo/block-buffer@0.12.1",
+      "description": "Buffer types for block processing of data",
       "licenses": [
         {
           "expression": "MIT OR Apache-2.0"
@@ -881,6 +881,29 @@
     },
     {
       "type": "library",
+      "bom-ref": "pkg:cargo/const-oid@0.10.2",
+      "name": "const-oid",
+      "version": "0.10.2",
+      "purl": "pkg:cargo/const-oid@0.10.2",
+      "description": "Const-friendly implementation of the ISO/IEC Object Identifier (OID) standard as defined in ITU X.660, with support for BER/DER encoding/decoding as well as heapless no_std (i.e. embedded) support",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 OR MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/RustCrypto/formats"
+        },
+        {
+          "type": "website",
+          "url": "https://github.com/RustCrypto/formats/tree/master/const-oid"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "bom-ref": "pkg:cargo/const-random@0.1.18",
       "name": "const-random",
       "version": "0.1.18",
@@ -952,25 +975,6 @@
         {
           "type": "vcs",
           "url": "https://github.com/servo/core-foundation-rs"
-        }
-      ]
-    },
-    {
-      "type": "library",
-      "bom-ref": "pkg:cargo/cpufeatures@0.2.17",
-      "name": "cpufeatures",
-      "version": "0.2.17",
-      "purl": "pkg:cargo/cpufeatures@0.2.17",
-      "description": "Lightweight runtime CPU feature detection for aarch64, loongarch64, and x86/x86_64 targets, with no_std support and support for mobile targets including Android and iOS",
-      "licenses": [
-        {
-          "expression": "MIT OR Apache-2.0"
-        }
-      ],
-      "externalReferences": [
-        {
-          "type": "vcs",
-          "url": "https://github.com/RustCrypto/utils"
         }
       ]
     },
@@ -1102,11 +1106,11 @@
     },
     {
       "type": "library",
-      "bom-ref": "pkg:cargo/crypto-common@0.1.7",
+      "bom-ref": "pkg:cargo/crypto-common@0.2.2",
       "name": "crypto-common",
-      "version": "0.1.7",
-      "purl": "pkg:cargo/crypto-common@0.1.7",
-      "description": "Common cryptographic traits",
+      "version": "0.2.2",
+      "purl": "pkg:cargo/crypto-common@0.2.2",
+      "description": "Common traits used by cryptographic algorithms",
       "licenses": [
         {
           "expression": "MIT OR Apache-2.0"
@@ -1159,10 +1163,10 @@
     },
     {
       "type": "library",
-      "bom-ref": "pkg:cargo/digest@0.10.7",
+      "bom-ref": "pkg:cargo/digest@0.11.3",
       "name": "digest",
-      "version": "0.10.7",
-      "purl": "pkg:cargo/digest@0.10.7",
+      "version": "0.11.3",
+      "purl": "pkg:cargo/digest@0.11.3",
       "description": "Traits for cryptographic hash functions and message authentication codes",
       "licenses": [
         {
@@ -1369,25 +1373,6 @@
     },
     {
       "type": "library",
-      "bom-ref": "pkg:cargo/generic-array@0.14.7",
-      "name": "generic-array",
-      "version": "0.14.7",
-      "purl": "pkg:cargo/generic-array@0.14.7",
-      "description": "Generic types implementing functionality of arrays",
-      "licenses": [
-        {
-          "expression": "MIT"
-        }
-      ],
-      "externalReferences": [
-        {
-          "type": "vcs",
-          "url": "https://github.com/fizyk20/generic-array.git"
-        }
-      ]
-    },
-    {
-      "type": "library",
       "bom-ref": "pkg:cargo/getrandom@0.2.17",
       "name": "getrandom",
       "version": "0.2.17",
@@ -1478,6 +1463,44 @@
         {
           "type": "vcs",
           "url": "https://github.com/withoutboats/heck"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/hex@0.4.3",
+      "name": "hex",
+      "version": "0.4.3",
+      "purl": "pkg:cargo/hex@0.4.3",
+      "description": "Encoding and decoding data into/from hexadecimal representation.",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/KokaKiwi/rust-hex"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/hybrid-array@0.4.15",
+      "name": "hybrid-array",
+      "version": "0.4.15",
+      "purl": "pkg:cargo/hybrid-array@0.4.15",
+      "description": "Hybrid typenum-based and const generic array types designed to provide the flexibility of typenum-based expressions while also allowing interoperability and a transition path to const generics",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/RustCrypto/hybrid-array"
         }
       ]
     },
@@ -1943,10 +1966,86 @@
     },
     {
       "type": "library",
-      "bom-ref": "pkg:cargo/mzdata@0.65.5",
+      "bom-ref": "pkg:cargo/mzdata@0.66.6",
       "name": "mzdata",
-      "version": "0.65.5",
-      "purl": "pkg:cargo/mzdata@0.65.5",
+      "version": "0.66.6",
+      "purl": "pkg:cargo/mzdata@0.66.6",
+      "description": "A library to read mass spectrometry data formats and a data model for mass spectra",
+      "licenses": [
+        {
+          "expression": "Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/mobiusklein/mzdata"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/mzdata-bindata@0.66.6",
+      "name": "mzdata-bindata",
+      "version": "0.66.6",
+      "purl": "pkg:cargo/mzdata-bindata@0.66.6",
+      "description": "A library to read mass spectrometry data formats and a data model for mass spectra",
+      "licenses": [
+        {
+          "expression": "Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/mobiusklein/mzdata"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/mzdata-meta@0.66.6",
+      "name": "mzdata-meta",
+      "version": "0.66.6",
+      "purl": "pkg:cargo/mzdata-meta@0.66.6",
+      "description": "A library to read mass spectrometry data formats and a data model for mass spectra",
+      "licenses": [
+        {
+          "expression": "Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/mobiusklein/mzdata"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/mzdata-param@0.66.6",
+      "name": "mzdata-param",
+      "version": "0.66.6",
+      "purl": "pkg:cargo/mzdata-param@0.66.6",
+      "description": "A library to read mass spectrometry data formats and a data model for mass spectra",
+      "licenses": [
+        {
+          "expression": "Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/mobiusklein/mzdata"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/mzdata-spectrum@0.66.6",
+      "name": "mzdata-spectrum",
+      "version": "0.66.6",
+      "purl": "pkg:cargo/mzdata-spectrum@0.66.6",
       "description": "A library to read mass spectrometry data formats and a data model for mass spectra",
       "licenses": [
         {
@@ -2556,10 +2655,10 @@
     },
     {
       "type": "library",
-      "bom-ref": "pkg:cargo/sha1@0.10.6",
+      "bom-ref": "pkg:cargo/sha1@0.11.0",
       "name": "sha1",
-      "version": "0.10.6",
-      "purl": "pkg:cargo/sha1@0.10.6",
+      "version": "0.11.0",
+      "purl": "pkg:cargo/sha1@0.11.0",
       "description": "SHA-1 hash function",
       "licenses": [
         {
@@ -3735,9 +3834,9 @@
       ]
     },
     {
-      "ref": "pkg:cargo/block-buffer@0.10.4",
+      "ref": "pkg:cargo/block-buffer@0.12.1",
       "dependsOn": [
-        "pkg:cargo/generic-array@0.14.7"
+        "pkg:cargo/hybrid-array@0.4.15"
       ]
     },
     {
@@ -3814,6 +3913,10 @@
       ]
     },
     {
+      "ref": "pkg:cargo/const-oid@0.10.2",
+      "dependsOn": []
+    },
+    {
       "ref": "pkg:cargo/const-random-macro@0.1.16",
       "dependsOn": [
         "pkg:cargo/getrandom@0.2.17",
@@ -3834,12 +3937,6 @@
     {
       "ref": "pkg:cargo/core-foundation-sys@0.8.7",
       "dependsOn": []
-    },
-    {
-      "ref": "pkg:cargo/cpufeatures@0.2.17",
-      "dependsOn": [
-        "pkg:cargo/libc@0.2.186"
-      ]
     },
     {
       "ref": "pkg:cargo/cpufeatures@0.3.0",
@@ -3875,10 +3972,9 @@
       "dependsOn": []
     },
     {
-      "ref": "pkg:cargo/crypto-common@0.1.7",
+      "ref": "pkg:cargo/crypto-common@0.2.2",
       "dependsOn": [
-        "pkg:cargo/generic-array@0.14.7",
-        "pkg:cargo/typenum@1.20.1"
+        "pkg:cargo/hybrid-array@0.4.15"
       ]
     },
     {
@@ -3897,10 +3993,11 @@
       ]
     },
     {
-      "ref": "pkg:cargo/digest@0.10.7",
+      "ref": "pkg:cargo/digest@0.11.3",
       "dependsOn": [
-        "pkg:cargo/block-buffer@0.10.4",
-        "pkg:cargo/crypto-common@0.1.7"
+        "pkg:cargo/block-buffer@0.12.1",
+        "pkg:cargo/const-oid@0.10.2",
+        "pkg:cargo/crypto-common@0.2.2"
       ]
     },
     {
@@ -3953,13 +4050,6 @@
       ]
     },
     {
-      "ref": "pkg:cargo/generic-array@0.14.7",
-      "dependsOn": [
-        "pkg:cargo/typenum@1.20.1",
-        "pkg:cargo/version_check@0.9.5"
-      ]
-    },
-    {
       "ref": "pkg:cargo/getrandom@0.2.17",
       "dependsOn": [
         "pkg:cargo/cfg-if@1.0.4",
@@ -3992,6 +4082,16 @@
     {
       "ref": "pkg:cargo/heck@0.5.0",
       "dependsOn": []
+    },
+    {
+      "ref": "pkg:cargo/hex@0.4.3",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:cargo/hybrid-array@0.4.15",
+      "dependsOn": [
+        "pkg:cargo/typenum@1.20.1"
+      ]
     },
     {
       "ref": "pkg:cargo/iana-time-zone-haiku@0.1.2",
@@ -4159,7 +4259,7 @@
         "pkg:cargo/mimalloc@0.1.52",
         "pkg:cargo/mumdia-core@0.3.1",
         "pkg:cargo/mumdia-io@0.3.1",
-        "pkg:cargo/mzdata@0.65.5",
+        "pkg:cargo/mzdata@0.66.6",
         "pkg:cargo/parquet@59.0.0",
         "pkg:cargo/rayon@1.12.0",
         "pkg:cargo/serde@1.0.228",
@@ -4170,7 +4270,53 @@
       ]
     },
     {
-      "ref": "pkg:cargo/mzdata@0.65.5",
+      "ref": "pkg:cargo/mzdata-bindata@0.66.6",
+      "dependsOn": [
+        "pkg:cargo/base64-simd@0.8.0",
+        "pkg:cargo/bytemuck@1.25.0",
+        "pkg:cargo/flate2@1.1.9",
+        "pkg:cargo/log@0.4.33",
+        "pkg:cargo/mzdata-param@0.66.6",
+        "pkg:cargo/mzpeaks@1.0.9",
+        "pkg:cargo/num-traits@0.2.19",
+        "pkg:cargo/thiserror@2.0.18"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/mzdata-meta@0.66.6",
+      "dependsOn": [
+        "pkg:cargo/bitflags@2.13.0",
+        "pkg:cargo/chrono@0.4.45",
+        "pkg:cargo/log@0.4.33",
+        "pkg:cargo/mzdata-bindata@0.66.6",
+        "pkg:cargo/mzdata-param@0.66.6",
+        "pkg:cargo/num-traits@0.2.19",
+        "pkg:cargo/regex@1.12.4",
+        "pkg:cargo/thiserror@2.0.18"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/mzdata-param@0.66.6",
+      "dependsOn": [
+        "pkg:cargo/log@0.4.33",
+        "pkg:cargo/thiserror@2.0.18"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/mzdata-spectrum@0.66.6",
+      "dependsOn": [
+        "pkg:cargo/identity-hash@0.1.0",
+        "pkg:cargo/log@0.4.33",
+        "pkg:cargo/mzdata-bindata@0.66.6",
+        "pkg:cargo/mzdata-meta@0.66.6",
+        "pkg:cargo/mzdata-param@0.66.6",
+        "pkg:cargo/mzpeaks@1.0.9",
+        "pkg:cargo/num-traits@0.2.19",
+        "pkg:cargo/thiserror@2.0.18"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/mzdata@0.66.6",
       "dependsOn": [
         "pkg:cargo/base64-simd@0.8.0",
         "pkg:cargo/bitflags@2.13.0",
@@ -4178,15 +4324,20 @@
         "pkg:cargo/chrono@0.4.45",
         "pkg:cargo/encoding_rs@0.8.35",
         "pkg:cargo/flate2@1.1.9",
+        "pkg:cargo/hex@0.4.3",
         "pkg:cargo/identity-hash@0.1.0",
         "pkg:cargo/indexmap@2.14.0",
         "pkg:cargo/log@0.4.33",
         "pkg:cargo/memchr@2.8.2",
+        "pkg:cargo/mzdata-bindata@0.66.6",
+        "pkg:cargo/mzdata-meta@0.66.6",
+        "pkg:cargo/mzdata-param@0.66.6",
+        "pkg:cargo/mzdata-spectrum@0.66.6",
         "pkg:cargo/mzpeaks@1.0.9",
         "pkg:cargo/num-traits@0.2.19",
         "pkg:cargo/quick-xml@0.41.0",
         "pkg:cargo/regex@1.12.4",
-        "pkg:cargo/sha1@0.10.6",
+        "pkg:cargo/sha1@0.11.0",
         "pkg:cargo/thiserror@2.0.18"
       ]
     },
@@ -4384,11 +4535,11 @@
       ]
     },
     {
-      "ref": "pkg:cargo/sha1@0.10.6",
+      "ref": "pkg:cargo/sha1@0.11.0",
       "dependsOn": [
         "pkg:cargo/cfg-if@1.0.4",
-        "pkg:cargo/cpufeatures@0.2.17",
-        "pkg:cargo/digest@0.10.7"
+        "pkg:cargo/cpufeatures@0.3.0",
+        "pkg:cargo/digest@0.11.3"
       ]
     },
     {
