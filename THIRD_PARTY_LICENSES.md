@@ -9,7 +9,7 @@ accompanies it in every release archive and in the container image.
 
 ## Obligations
 
-172 third-party crates. Every one declares an SPDX expression; none is
+177 third-party crates. Every one declares an SPDX expression; none is
 unspecified.
 
 The following copyleft identifiers appear, in each case as one arm of a
@@ -24,8 +24,8 @@ Licence identifiers by crate count:
 
 | SPDX identifier | crates |
 |---|---|
-| `MIT` | 150 |
-| `Apache-2.0` | 140 |
+| `MIT` | 151 |
+| `Apache-2.0` | 146 |
 | `Apache-2.0 WITH LLVM-exception` | 4 |
 | `Unlicense` | 4 |
 | `CC0-1.0` | 3 |
@@ -73,7 +73,7 @@ Licence identifiers by crate count:
 | `base64-simd` | 0.8.0 | MIT | - | [https://github.com/Nugine/simd](https://github.com/Nugine/simd) |
 | `bitflags` | 2.13.0 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/bitflags/bitflags](https://github.com/bitflags/bitflags) |
 | `blake3` | 1.8.7 | CC0-1.0 OR Apache-2.0 OR Apache-2.0 WITH LLVM-exception | `Apache-2.0` | [https://github.com/BLAKE3-team/BLAKE3](https://github.com/BLAKE3-team/BLAKE3) |
-| `block-buffer` | 0.10.4 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/RustCrypto/utils](https://github.com/RustCrypto/utils) |
+| `block-buffer` | 0.12.1 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/RustCrypto/utils](https://github.com/RustCrypto/utils) |
 | `bumpalo` | 3.20.3 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/fitzgen/bumpalo](https://github.com/fitzgen/bumpalo) |
 | `bytemuck` | 1.25.0 | Zlib OR Apache-2.0 OR MIT | `Apache-2.0` | [https://github.com/Lokathor/bytemuck](https://github.com/Lokathor/bytemuck) |
 | `bytes` | 1.12.0 | MIT | - | [https://github.com/tokio-rs/bytes](https://github.com/tokio-rs/bytes) |
@@ -86,21 +86,21 @@ Licence identifiers by crate count:
 | `clap_lex` | 1.1.0 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/clap-rs/clap](https://github.com/clap-rs/clap) |
 | `colorchoice` | 1.0.5 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/rust-cli/anstyle.git](https://github.com/rust-cli/anstyle.git) |
 | `comfy-table` | 7.2.2 | MIT | - | [https://github.com/nukesor/comfy-table](https://github.com/nukesor/comfy-table) |
+| `const-oid` | 0.10.2 | Apache-2.0 OR MIT | `Apache-2.0` | [https://github.com/RustCrypto/formats](https://github.com/RustCrypto/formats) |
 | `const-random` | 0.1.18 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/tkaitchuck/constrandom](https://github.com/tkaitchuck/constrandom) |
 | `const-random-macro` | 0.1.16 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/tkaitchuck/constrandom](https://github.com/tkaitchuck/constrandom) |
 | `constant_time_eq` | 0.4.2 | CC0-1.0 OR MIT-0 OR Apache-2.0 | `Apache-2.0` | [https://github.com/cesarb/constant_time_eq](https://github.com/cesarb/constant_time_eq) |
 | `core-foundation-sys` | 0.8.7 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/servo/core-foundation-rs](https://github.com/servo/core-foundation-rs) |
-| `cpufeatures` | 0.2.17 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/RustCrypto/utils](https://github.com/RustCrypto/utils) |
 | `cpufeatures` | 0.3.0 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/RustCrypto/utils](https://github.com/RustCrypto/utils) |
 | `crc32fast` | 1.5.0 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/srijs/rust-crc32fast](https://github.com/srijs/rust-crc32fast) |
 | `crossbeam-deque` | 0.8.6 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/crossbeam-rs/crossbeam](https://github.com/crossbeam-rs/crossbeam) |
 | `crossbeam-epoch` | 0.9.20 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/crossbeam-rs/crossbeam](https://github.com/crossbeam-rs/crossbeam) |
 | `crossbeam-utils` | 0.8.21 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/crossbeam-rs/crossbeam](https://github.com/crossbeam-rs/crossbeam) |
 | `crunchy` | 0.2.4 | MIT | - | [https://github.com/eira-fransham/crunchy](https://github.com/eira-fransham/crunchy) |
-| `crypto-common` | 0.1.7 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/RustCrypto/traits](https://github.com/RustCrypto/traits) |
+| `crypto-common` | 0.2.2 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/RustCrypto/traits](https://github.com/RustCrypto/traits) |
 | `csv` | 1.4.0 | Unlicense/MIT | `MIT` | [https://github.com/BurntSushi/rust-csv](https://github.com/BurntSushi/rust-csv) |
 | `csv-core` | 0.1.13 | Unlicense/MIT | `MIT` | [https://github.com/BurntSushi/rust-csv](https://github.com/BurntSushi/rust-csv) |
-| `digest` | 0.10.7 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/RustCrypto/traits](https://github.com/RustCrypto/traits) |
+| `digest` | 0.11.3 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/RustCrypto/traits](https://github.com/RustCrypto/traits) |
 | `either` | 1.16.0 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/rayon-rs/either](https://github.com/rayon-rs/either) |
 | `encoding_rs` | 0.8.35 | (Apache-2.0 OR MIT) AND BSD-3-Clause | `Apache-2.0` | [https://github.com/hsivonen/encoding_rs](https://github.com/hsivonen/encoding_rs) |
 | `equivalent` | 1.0.2 | Apache-2.0 OR MIT | `Apache-2.0` | [https://github.com/indexmap-rs/equivalent](https://github.com/indexmap-rs/equivalent) |
@@ -110,12 +110,13 @@ Licence identifiers by crate count:
 | `futures-core` | 0.3.32 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/rust-lang/futures-rs](https://github.com/rust-lang/futures-rs) |
 | `futures-task` | 0.3.32 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/rust-lang/futures-rs](https://github.com/rust-lang/futures-rs) |
 | `futures-util` | 0.3.32 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/rust-lang/futures-rs](https://github.com/rust-lang/futures-rs) |
-| `generic-array` | 0.14.7 | MIT | - | [https://github.com/fizyk20/generic-array.git](https://github.com/fizyk20/generic-array.git) |
 | `getrandom` | 0.2.17 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/rust-random/getrandom](https://github.com/rust-random/getrandom) |
 | `getrandom` | 0.3.4 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/rust-random/getrandom](https://github.com/rust-random/getrandom) |
 | `half` | 2.7.1 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/VoidStarKat/half-rs](https://github.com/VoidStarKat/half-rs) |
 | `hashbrown` | 0.17.1 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/rust-lang/hashbrown](https://github.com/rust-lang/hashbrown) |
 | `heck` | 0.5.0 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/withoutboats/heck](https://github.com/withoutboats/heck) |
+| `hex` | 0.4.3 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/KokaKiwi/rust-hex](https://github.com/KokaKiwi/rust-hex) |
+| `hybrid-array` | 0.4.15 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/RustCrypto/hybrid-array](https://github.com/RustCrypto/hybrid-array) |
 | `iana-time-zone` | 0.1.65 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/strawlab/iana-time-zone](https://github.com/strawlab/iana-time-zone) |
 | `iana-time-zone-haiku` | 0.1.2 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/strawlab/iana-time-zone](https://github.com/strawlab/iana-time-zone) |
 | `identity-hash` | 0.1.0 | Apache-2.0 OR MIT | `Apache-2.0` | [https://github.com/offsetting/identity-hash](https://github.com/offsetting/identity-hash) |
@@ -138,7 +139,11 @@ Licence identifiers by crate count:
 | `memchr` | 2.8.2 | Unlicense OR MIT | `MIT` | [https://github.com/BurntSushi/memchr](https://github.com/BurntSushi/memchr) |
 | `mimalloc` | 0.1.52 | MIT | - | [https://github.com/purpleprotocol/mimalloc_rust](https://github.com/purpleprotocol/mimalloc_rust) |
 | `miniz_oxide` | 0.8.9 | MIT OR Zlib OR Apache-2.0 | `Apache-2.0` | [https://github.com/Frommi/miniz_oxide/tree/master/miniz_oxide](https://github.com/Frommi/miniz_oxide/tree/master/miniz_oxide) |
-| `mzdata` | 0.65.5 | Apache-2.0 | - | [https://github.com/mobiusklein/mzdata](https://github.com/mobiusklein/mzdata) |
+| `mzdata` | 0.66.6 | Apache-2.0 | - | [https://github.com/mobiusklein/mzdata](https://github.com/mobiusklein/mzdata) |
+| `mzdata-bindata` | 0.66.6 | Apache-2.0 | - | [https://github.com/mobiusklein/mzdata](https://github.com/mobiusklein/mzdata) |
+| `mzdata-meta` | 0.66.6 | Apache-2.0 | - | [https://github.com/mobiusklein/mzdata](https://github.com/mobiusklein/mzdata) |
+| `mzdata-param` | 0.66.6 | Apache-2.0 | - | [https://github.com/mobiusklein/mzdata](https://github.com/mobiusklein/mzdata) |
+| `mzdata-spectrum` | 0.66.6 | Apache-2.0 | - | [https://github.com/mobiusklein/mzdata](https://github.com/mobiusklein/mzdata) |
 | `mzpeaks` | 1.0.9 | Apache-2.0 | - | [https://github.com/mobiusklein/mzpeaks](https://github.com/mobiusklein/mzpeaks) |
 | `nu-ansi-term` | 0.50.3 | MIT | - | [https://github.com/nushell/nu-ansi-term](https://github.com/nushell/nu-ansi-term) |
 | `num-bigint` | 0.5.1 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/rust-num/num-bigint](https://github.com/rust-num/num-bigint) |
@@ -168,7 +173,7 @@ Licence identifiers by crate count:
 | `serde_core` | 1.0.228 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/serde-rs/serde](https://github.com/serde-rs/serde) |
 | `serde_derive` | 1.0.228 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/serde-rs/serde](https://github.com/serde-rs/serde) |
 | `serde_json` | 1.0.151 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/serde-rs/json](https://github.com/serde-rs/json) |
-| `sha1` | 0.10.6 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/RustCrypto/hashes](https://github.com/RustCrypto/hashes) |
+| `sha1` | 0.11.0 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/RustCrypto/hashes](https://github.com/RustCrypto/hashes) |
 | `sharded-slab` | 0.1.7 | MIT | - | [https://github.com/hawkw/sharded-slab](https://github.com/hawkw/sharded-slab) |
 | `shlex` | 2.0.1 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/comex/rust-shlex](https://github.com/comex/rust-shlex) |
 | `simd-adler32` | 0.3.9 | MIT | - | [https://github.com/mcountryman/simd-adler32](https://github.com/mcountryman/simd-adler32) |
@@ -325,7 +330,7 @@ licence text alone does not discharge the obligation: MIT requires the copyright
 notice in all copies, BSD requires it retained, and Apache-2.0 section 4(d)
 requires the contents of a NOTICE file to be propagated.
 
-Notices recovered for 125 of 172 crates (the remainder ship no copyright line in a licence file; see their repositories, linked above).
+Notices recovered for 126 of 177 crates (the remainder ship no copyright line in a licence file; see their repositories, linked above).
 
 **adler2 2.0.1**
 
@@ -392,9 +397,9 @@ Notices recovered for 125 of 172 crates (the remainder ship no copyright line in
 
 - Copyright 2019 Jack O'Connor and Samuel Neves
 
-**block-buffer 0.10.4**
+**block-buffer 0.12.1**
 
-- Copyright (c) 2018-2019 The RustCrypto Project Developers
+- Copyright (c) 2018-2025 The RustCrypto Project Developers
 
 **bumpalo 3.20.3**
 
@@ -444,6 +449,10 @@ Notices recovered for 125 of 172 crates (the remainder ship no copyright line in
 
 - Copyright (c) 2019 Arne Beer
 
+**const-oid 0.10.2**
+
+- Copyright (c) 2020-2026 The RustCrypto Project Developers
+
 **const-random 0.1.18**
 
 - Copyright (c) 2016 Amanieu d'Antras
@@ -455,10 +464,6 @@ Notices recovered for 125 of 172 crates (the remainder ship no copyright line in
 **core-foundation-sys 0.8.7**
 
 - Copyright (c) 2012-2013 Mozilla Foundation
-
-**cpufeatures 0.2.17**
-
-- Copyright (c) 2020-2025 The RustCrypto Project Developers
 
 **cpufeatures 0.3.0**
 
@@ -484,9 +489,9 @@ Notices recovered for 125 of 172 crates (the remainder ship no copyright line in
 
 - Copyright 2017-2023 Eira Fransham.
 
-**crypto-common 0.1.7**
+**crypto-common 0.2.2**
 
-- Copyright (c) 2021 RustCrypto Developers
+- Copyright (c) 2021-2026 RustCrypto Developers
 
 **csv 1.4.0**
 
@@ -496,8 +501,9 @@ Notices recovered for 125 of 172 crates (the remainder ship no copyright line in
 
 - Copyright (c) 2015 Andrew Gallant
 
-**digest 0.10.7**
+**digest 0.11.3**
 
+- Copyright (c) 2017-2025 RustCrypto Developers
 - Copyright (c) 2017 Artyom Pavlov
 
 **either 1.16.0**
@@ -535,10 +541,6 @@ Notices recovered for 125 of 172 crates (the remainder ship no copyright line in
 - Copyright (c) 2016 Alex Crichton
 - Copyright (c) 2017 The Tokio Authors
 
-**generic-array 0.14.7**
-
-- Copyright (c) 2015 Bartłomiej Kamiński
-
 **getrandom 0.2.17**
 
 - Copyright (c) 2018-2024 The rust-random Project Developers
@@ -556,6 +558,15 @@ Notices recovered for 125 of 172 crates (the remainder ship no copyright line in
 **heck 0.5.0**
 
 - Copyright (c) 2015 The Rust Project Developers
+
+**hex 0.4.3**
+
+- Copyright (c) 2013-2014 The Rust Project Developers.
+- Copyright (c) 2015-2020 The rust-hex Developers
+
+**hybrid-array 0.4.15**
+
+- Copyright (c) 2022-2026 The RustCrypto Project Developers
 
 **iana-time-zone 0.1.65**
 
@@ -724,11 +735,12 @@ Notices recovered for 125 of 172 crates (the remainder ship no copyright line in
 
 - Copyright (c) 2016 The Rust Project Developers
 
-**sha1 0.10.6**
+**sha1 0.11.0**
 
-- Copyright (c) 2006-2009 Graydon Hoare
-- Copyright (c) 2009-2013 Mozilla Foundation
+- Copyright (c) 2016-2026 The RustCrypto Project Developers
 - Copyright (c) 2016 Artyom Pavlov
+- Copyright (c) 2009-2013 Mozilla Foundation
+- Copyright (c) 2006-2009 Graydon Hoare
 
 **sharded-slab 0.1.7**
 
