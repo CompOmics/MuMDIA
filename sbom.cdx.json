@@ -197,10 +197,10 @@
     },
     {
       "type": "library",
-      "bom-ref": "pkg:cargo/anyhow@1.0.103",
+      "bom-ref": "pkg:cargo/anyhow@1.0.104",
       "name": "anyhow",
-      "version": "1.0.103",
-      "purl": "pkg:cargo/anyhow@1.0.103",
+      "version": "1.0.104",
+      "purl": "pkg:cargo/anyhow@1.0.104",
       "description": "Flexible concrete Error type built on std::error::Error",
       "licenses": [
         {
@@ -211,25 +211,6 @@
         {
           "type": "vcs",
           "url": "https://github.com/dtolnay/anyhow"
-        }
-      ]
-    },
-    {
-      "type": "library",
-      "bom-ref": "pkg:cargo/arrayref@0.3.9",
-      "name": "arrayref",
-      "version": "0.3.9",
-      "purl": "pkg:cargo/arrayref@0.3.9",
-      "description": "Macros to take array references of slices",
-      "licenses": [
-        {
-          "expression": "BSD-2-Clause"
-        }
-      ],
-      "externalReferences": [
-        {
-          "type": "vcs",
-          "url": "https://github.com/droundy/arrayref"
         }
       ]
     },
@@ -254,10 +235,10 @@
     },
     {
       "type": "library",
-      "bom-ref": "pkg:cargo/arrow@59.0.0",
+      "bom-ref": "pkg:cargo/arrow@59.3.0",
       "name": "arrow",
-      "version": "59.0.0",
-      "purl": "pkg:cargo/arrow@59.0.0",
+      "version": "59.3.0",
+      "purl": "pkg:cargo/arrow@59.3.0",
       "description": "Rust implementation of Apache Arrow",
       "licenses": [
         {
@@ -273,10 +254,10 @@
     },
     {
       "type": "library",
-      "bom-ref": "pkg:cargo/arrow-arith@59.0.0",
+      "bom-ref": "pkg:cargo/arrow-arith@59.3.0",
       "name": "arrow-arith",
-      "version": "59.0.0",
-      "purl": "pkg:cargo/arrow-arith@59.0.0",
+      "version": "59.3.0",
+      "purl": "pkg:cargo/arrow-arith@59.3.0",
       "description": "Arrow arithmetic kernels",
       "licenses": [
         {
@@ -292,10 +273,10 @@
     },
     {
       "type": "library",
-      "bom-ref": "pkg:cargo/arrow-array@59.0.0",
+      "bom-ref": "pkg:cargo/arrow-array@59.3.0",
       "name": "arrow-array",
-      "version": "59.0.0",
-      "purl": "pkg:cargo/arrow-array@59.0.0",
+      "version": "59.3.0",
+      "purl": "pkg:cargo/arrow-array@59.3.0",
       "description": "Array abstractions for Apache Arrow",
       "licenses": [
         {
@@ -311,10 +292,10 @@
     },
     {
       "type": "library",
-      "bom-ref": "pkg:cargo/arrow-buffer@59.0.0",
+      "bom-ref": "pkg:cargo/arrow-buffer@59.3.0",
       "name": "arrow-buffer",
-      "version": "59.0.0",
-      "purl": "pkg:cargo/arrow-buffer@59.0.0",
+      "version": "59.3.0",
+      "purl": "pkg:cargo/arrow-buffer@59.3.0",
       "description": "Buffer abstractions for Apache Arrow",
       "licenses": [
         {
@@ -330,10 +311,10 @@
     },
     {
       "type": "library",
-      "bom-ref": "pkg:cargo/arrow-cast@59.0.0",
+      "bom-ref": "pkg:cargo/arrow-cast@59.3.0",
       "name": "arrow-cast",
-      "version": "59.0.0",
-      "purl": "pkg:cargo/arrow-cast@59.0.0",
+      "version": "59.3.0",
+      "purl": "pkg:cargo/arrow-cast@59.3.0",
       "description": "Cast kernel and utilities for Apache Arrow",
       "licenses": [
         {
@@ -349,10 +330,10 @@
     },
     {
       "type": "library",
-      "bom-ref": "pkg:cargo/arrow-csv@59.0.0",
+      "bom-ref": "pkg:cargo/arrow-csv@59.3.0",
       "name": "arrow-csv",
-      "version": "59.0.0",
-      "purl": "pkg:cargo/arrow-csv@59.0.0",
+      "version": "59.3.0",
+      "purl": "pkg:cargo/arrow-csv@59.3.0",
       "description": "Support for parsing CSV format to and from the Arrow format",
       "licenses": [
         {
@@ -368,10 +349,10 @@
     },
     {
       "type": "library",
-      "bom-ref": "pkg:cargo/arrow-data@59.0.0",
+      "bom-ref": "pkg:cargo/arrow-data@59.3.0",
       "name": "arrow-data",
-      "version": "59.0.0",
-      "purl": "pkg:cargo/arrow-data@59.0.0",
+      "version": "59.3.0",
+      "purl": "pkg:cargo/arrow-data@59.3.0",
       "description": "Array data abstractions for Apache Arrow",
       "licenses": [
         {
@@ -387,10 +368,10 @@
     },
     {
       "type": "library",
-      "bom-ref": "pkg:cargo/arrow-ipc@59.0.0",
+      "bom-ref": "pkg:cargo/arrow-ipc@59.3.0",
       "name": "arrow-ipc",
-      "version": "59.0.0",
-      "purl": "pkg:cargo/arrow-ipc@59.0.0",
+      "version": "59.3.0",
+      "purl": "pkg:cargo/arrow-ipc@59.3.0",
       "description": "Support for the Arrow IPC format",
       "licenses": [
         {
@@ -406,10 +387,10 @@
     },
     {
       "type": "library",
-      "bom-ref": "pkg:cargo/arrow-json@59.0.0",
+      "bom-ref": "pkg:cargo/arrow-json@59.3.0",
       "name": "arrow-json",
-      "version": "59.0.0",
-      "purl": "pkg:cargo/arrow-json@59.0.0",
+      "version": "59.3.0",
+      "purl": "pkg:cargo/arrow-json@59.3.0",
       "description": "Support for parsing JSON format to and from the Arrow format",
       "licenses": [
         {
@@ -425,10 +406,10 @@
     },
     {
       "type": "library",
-      "bom-ref": "pkg:cargo/arrow-ord@59.0.0",
+      "bom-ref": "pkg:cargo/arrow-ord@59.3.0",
       "name": "arrow-ord",
-      "version": "59.0.0",
-      "purl": "pkg:cargo/arrow-ord@59.0.0",
+      "version": "59.3.0",
+      "purl": "pkg:cargo/arrow-ord@59.3.0",
       "description": "Ordering kernels for arrow arrays",
       "licenses": [
         {
@@ -444,10 +425,10 @@
     },
     {
       "type": "library",
-      "bom-ref": "pkg:cargo/arrow-row@59.0.0",
+      "bom-ref": "pkg:cargo/arrow-row@59.3.0",
       "name": "arrow-row",
-      "version": "59.0.0",
-      "purl": "pkg:cargo/arrow-row@59.0.0",
+      "version": "59.3.0",
+      "purl": "pkg:cargo/arrow-row@59.3.0",
       "description": "Arrow row format",
       "licenses": [
         {
@@ -463,10 +444,10 @@
     },
     {
       "type": "library",
-      "bom-ref": "pkg:cargo/arrow-schema@59.0.0",
+      "bom-ref": "pkg:cargo/arrow-schema@59.3.0",
       "name": "arrow-schema",
-      "version": "59.0.0",
-      "purl": "pkg:cargo/arrow-schema@59.0.0",
+      "version": "59.3.0",
+      "purl": "pkg:cargo/arrow-schema@59.3.0",
       "description": "Defines the logical types for arrow arrays",
       "licenses": [
         {
@@ -482,10 +463,10 @@
     },
     {
       "type": "library",
-      "bom-ref": "pkg:cargo/arrow-select@59.0.0",
+      "bom-ref": "pkg:cargo/arrow-select@59.3.0",
       "name": "arrow-select",
-      "version": "59.0.0",
-      "purl": "pkg:cargo/arrow-select@59.0.0",
+      "version": "59.3.0",
+      "purl": "pkg:cargo/arrow-select@59.3.0",
       "description": "Selection kernels for arrow arrays",
       "licenses": [
         {
@@ -501,10 +482,10 @@
     },
     {
       "type": "library",
-      "bom-ref": "pkg:cargo/arrow-string@59.0.0",
+      "bom-ref": "pkg:cargo/arrow-string@59.3.0",
       "name": "arrow-string",
-      "version": "59.0.0",
-      "purl": "pkg:cargo/arrow-string@59.0.0",
+      "version": "59.3.0",
+      "purl": "pkg:cargo/arrow-string@59.3.0",
       "description": "String kernels for arrow arrays",
       "licenses": [
         {
@@ -558,10 +539,10 @@
     },
     {
       "type": "library",
-      "bom-ref": "pkg:cargo/base64@0.22.1",
+      "bom-ref": "pkg:cargo/base64@0.23.1",
       "name": "base64",
-      "version": "0.22.1",
-      "purl": "pkg:cargo/base64@0.22.1",
+      "version": "0.23.1",
+      "purl": "pkg:cargo/base64@0.23.1",
       "description": "encodes and decodes base64 as bytes or utf8",
       "licenses": [
         {
@@ -615,10 +596,10 @@
     },
     {
       "type": "library",
-      "bom-ref": "pkg:cargo/blake3@1.8.5",
+      "bom-ref": "pkg:cargo/blake3@1.8.7",
       "name": "blake3",
-      "version": "1.8.5",
-      "purl": "pkg:cargo/blake3@1.8.5",
+      "version": "1.8.7",
+      "purl": "pkg:cargo/blake3@1.8.7",
       "description": "the BLAKE3 hash function",
       "licenses": [
         {
@@ -767,10 +748,10 @@
     },
     {
       "type": "library",
-      "bom-ref": "pkg:cargo/clap@4.6.1",
+      "bom-ref": "pkg:cargo/clap@4.6.6",
       "name": "clap",
-      "version": "4.6.1",
-      "purl": "pkg:cargo/clap@4.6.1",
+      "version": "4.6.6",
+      "purl": "pkg:cargo/clap@4.6.6",
       "description": "A simple to use, efficient, and full-featured Command Line Argument Parser",
       "licenses": [
         {
@@ -786,10 +767,10 @@
     },
     {
       "type": "library",
-      "bom-ref": "pkg:cargo/clap_builder@4.6.0",
+      "bom-ref": "pkg:cargo/clap_builder@4.6.6",
       "name": "clap_builder",
-      "version": "4.6.0",
-      "purl": "pkg:cargo/clap_builder@4.6.0",
+      "version": "4.6.6",
+      "purl": "pkg:cargo/clap_builder@4.6.6",
       "description": "A simple to use, efficient, and full-featured Command Line Argument Parser",
       "licenses": [
         {
@@ -805,10 +786,10 @@
     },
     {
       "type": "library",
-      "bom-ref": "pkg:cargo/clap_derive@4.6.1",
+      "bom-ref": "pkg:cargo/clap_derive@4.6.4",
       "name": "clap_derive",
-      "version": "4.6.1",
-      "purl": "pkg:cargo/clap_derive@4.6.1",
+      "version": "4.6.4",
+      "purl": "pkg:cargo/clap_derive@4.6.4",
       "description": "Parse command line argument by defining a struct, derive crate.",
       "licenses": [
         {
@@ -2099,10 +2080,10 @@
     },
     {
       "type": "library",
-      "bom-ref": "pkg:cargo/num-bigint@0.4.6",
+      "bom-ref": "pkg:cargo/num-bigint@0.5.1",
       "name": "num-bigint",
-      "version": "0.4.6",
-      "purl": "pkg:cargo/num-bigint@0.4.6",
+      "version": "0.5.1",
+      "purl": "pkg:cargo/num-bigint@0.5.1",
       "description": "Big integer implementation for Rust",
       "licenses": [
         {
@@ -2232,10 +2213,10 @@
     },
     {
       "type": "library",
-      "bom-ref": "pkg:cargo/parquet@59.0.0",
+      "bom-ref": "pkg:cargo/parquet@59.3.0",
       "name": "parquet",
-      "version": "59.0.0",
-      "purl": "pkg:cargo/parquet@59.0.0",
+      "version": "59.3.0",
+      "purl": "pkg:cargo/parquet@59.3.0",
       "description": "Apache Parquet implementation in Rust",
       "licenses": [
         {
@@ -2246,25 +2227,6 @@
         {
           "type": "vcs",
           "url": "https://github.com/apache/arrow-rs"
-        }
-      ]
-    },
-    {
-      "type": "library",
-      "bom-ref": "pkg:cargo/paste@1.0.15",
-      "name": "paste",
-      "version": "1.0.15",
-      "purl": "pkg:cargo/paste@1.0.15",
-      "description": "Macros for all your token pasting needs",
-      "licenses": [
-        {
-          "expression": "MIT OR Apache-2.0"
-        }
-      ],
-      "externalReferences": [
-        {
-          "type": "vcs",
-          "url": "https://github.com/dtolnay/paste"
         }
       ]
     },
@@ -2636,10 +2598,10 @@
     },
     {
       "type": "library",
-      "bom-ref": "pkg:cargo/serde_json@1.0.150",
+      "bom-ref": "pkg:cargo/serde_json@1.0.151",
       "name": "serde_json",
-      "version": "1.0.150",
-      "purl": "pkg:cargo/serde_json@1.0.150",
+      "version": "1.0.151",
+      "purl": "pkg:cargo/serde_json@1.0.151",
       "description": "A JSON serialization file format",
       "licenses": [
         {
@@ -2845,10 +2807,29 @@
     },
     {
       "type": "library",
-      "bom-ref": "pkg:cargo/thiserror@2.0.18",
+      "bom-ref": "pkg:cargo/syn@3.0.5",
+      "name": "syn",
+      "version": "3.0.5",
+      "purl": "pkg:cargo/syn@3.0.5",
+      "description": "Parser for Rust source code",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/dtolnay/syn"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/thiserror@2.0.20",
       "name": "thiserror",
-      "version": "2.0.18",
-      "purl": "pkg:cargo/thiserror@2.0.18",
+      "version": "2.0.20",
+      "purl": "pkg:cargo/thiserror@2.0.20",
       "description": "derive(Error)",
       "licenses": [
         {
@@ -2864,10 +2845,10 @@
     },
     {
       "type": "library",
-      "bom-ref": "pkg:cargo/thiserror-impl@2.0.18",
+      "bom-ref": "pkg:cargo/thiserror-impl@2.0.20",
       "name": "thiserror-impl",
-      "version": "2.0.18",
-      "purl": "pkg:cargo/thiserror-impl@2.0.18",
+      "version": "2.0.20",
+      "purl": "pkg:cargo/thiserror-impl@2.0.20",
       "description": "Implementation detail of the `thiserror` crate",
       "licenses": [
         {
@@ -3610,11 +3591,7 @@
       "dependsOn": []
     },
     {
-      "ref": "pkg:cargo/anyhow@1.0.103",
-      "dependsOn": []
-    },
-    {
-      "ref": "pkg:cargo/arrayref@0.3.9",
+      "ref": "pkg:cargo/anyhow@1.0.104",
       "dependsOn": []
     },
     {
@@ -3622,23 +3599,23 @@
       "dependsOn": []
     },
     {
-      "ref": "pkg:cargo/arrow-arith@59.0.0",
+      "ref": "pkg:cargo/arrow-arith@59.3.0",
       "dependsOn": [
-        "pkg:cargo/arrow-array@59.0.0",
-        "pkg:cargo/arrow-buffer@59.0.0",
-        "pkg:cargo/arrow-data@59.0.0",
-        "pkg:cargo/arrow-schema@59.0.0",
+        "pkg:cargo/arrow-array@59.3.0",
+        "pkg:cargo/arrow-buffer@59.3.0",
+        "pkg:cargo/arrow-data@59.3.0",
+        "pkg:cargo/arrow-schema@59.3.0",
         "pkg:cargo/chrono@0.4.45",
         "pkg:cargo/num-traits@0.2.19"
       ]
     },
     {
-      "ref": "pkg:cargo/arrow-array@59.0.0",
+      "ref": "pkg:cargo/arrow-array@59.3.0",
       "dependsOn": [
         "pkg:cargo/ahash@0.8.12",
-        "pkg:cargo/arrow-buffer@59.0.0",
-        "pkg:cargo/arrow-data@59.0.0",
-        "pkg:cargo/arrow-schema@59.0.0",
+        "pkg:cargo/arrow-buffer@59.3.0",
+        "pkg:cargo/arrow-data@59.3.0",
+        "pkg:cargo/arrow-schema@59.3.0",
         "pkg:cargo/chrono@0.4.45",
         "pkg:cargo/half@2.7.1",
         "pkg:cargo/hashbrown@0.17.1",
@@ -3648,25 +3625,25 @@
       ]
     },
     {
-      "ref": "pkg:cargo/arrow-buffer@59.0.0",
+      "ref": "pkg:cargo/arrow-buffer@59.3.0",
       "dependsOn": [
         "pkg:cargo/bytes@1.12.0",
         "pkg:cargo/half@2.7.1",
-        "pkg:cargo/num-bigint@0.4.6",
+        "pkg:cargo/num-bigint@0.5.1",
         "pkg:cargo/num-traits@0.2.19"
       ]
     },
     {
-      "ref": "pkg:cargo/arrow-cast@59.0.0",
+      "ref": "pkg:cargo/arrow-cast@59.3.0",
       "dependsOn": [
-        "pkg:cargo/arrow-array@59.0.0",
-        "pkg:cargo/arrow-buffer@59.0.0",
-        "pkg:cargo/arrow-data@59.0.0",
-        "pkg:cargo/arrow-ord@59.0.0",
-        "pkg:cargo/arrow-schema@59.0.0",
-        "pkg:cargo/arrow-select@59.0.0",
+        "pkg:cargo/arrow-array@59.3.0",
+        "pkg:cargo/arrow-buffer@59.3.0",
+        "pkg:cargo/arrow-data@59.3.0",
+        "pkg:cargo/arrow-ord@59.3.0",
+        "pkg:cargo/arrow-schema@59.3.0",
+        "pkg:cargo/arrow-select@59.3.0",
         "pkg:cargo/atoi@2.0.0",
-        "pkg:cargo/base64@0.22.1",
+        "pkg:cargo/base64@0.23.1",
         "pkg:cargo/chrono@0.4.45",
         "pkg:cargo/comfy-table@7.2.2",
         "pkg:cargo/half@2.7.1",
@@ -3676,11 +3653,11 @@
       ]
     },
     {
-      "ref": "pkg:cargo/arrow-csv@59.0.0",
+      "ref": "pkg:cargo/arrow-csv@59.3.0",
       "dependsOn": [
-        "pkg:cargo/arrow-array@59.0.0",
-        "pkg:cargo/arrow-cast@59.0.0",
-        "pkg:cargo/arrow-schema@59.0.0",
+        "pkg:cargo/arrow-array@59.3.0",
+        "pkg:cargo/arrow-cast@59.3.0",
+        "pkg:cargo/arrow-schema@59.3.0",
         "pkg:cargo/chrono@0.4.45",
         "pkg:cargo/csv-core@0.1.13",
         "pkg:cargo/csv@1.4.0",
@@ -3688,35 +3665,35 @@
       ]
     },
     {
-      "ref": "pkg:cargo/arrow-data@59.0.0",
+      "ref": "pkg:cargo/arrow-data@59.3.0",
       "dependsOn": [
-        "pkg:cargo/arrow-buffer@59.0.0",
-        "pkg:cargo/arrow-schema@59.0.0",
+        "pkg:cargo/arrow-buffer@59.3.0",
+        "pkg:cargo/arrow-schema@59.3.0",
         "pkg:cargo/half@2.7.1",
         "pkg:cargo/num-integer@0.1.46",
         "pkg:cargo/num-traits@0.2.19"
       ]
     },
     {
-      "ref": "pkg:cargo/arrow-ipc@59.0.0",
+      "ref": "pkg:cargo/arrow-ipc@59.3.0",
       "dependsOn": [
-        "pkg:cargo/arrow-array@59.0.0",
-        "pkg:cargo/arrow-buffer@59.0.0",
-        "pkg:cargo/arrow-data@59.0.0",
-        "pkg:cargo/arrow-schema@59.0.0",
-        "pkg:cargo/arrow-select@59.0.0",
+        "pkg:cargo/arrow-array@59.3.0",
+        "pkg:cargo/arrow-buffer@59.3.0",
+        "pkg:cargo/arrow-data@59.3.0",
+        "pkg:cargo/arrow-schema@59.3.0",
+        "pkg:cargo/arrow-select@59.3.0",
         "pkg:cargo/flatbuffers@25.12.19"
       ]
     },
     {
-      "ref": "pkg:cargo/arrow-json@59.0.0",
+      "ref": "pkg:cargo/arrow-json@59.3.0",
       "dependsOn": [
-        "pkg:cargo/arrow-array@59.0.0",
-        "pkg:cargo/arrow-buffer@59.0.0",
-        "pkg:cargo/arrow-cast@59.0.0",
-        "pkg:cargo/arrow-ord@59.0.0",
-        "pkg:cargo/arrow-schema@59.0.0",
-        "pkg:cargo/arrow-select@59.0.0",
+        "pkg:cargo/arrow-array@59.3.0",
+        "pkg:cargo/arrow-buffer@59.3.0",
+        "pkg:cargo/arrow-cast@59.3.0",
+        "pkg:cargo/arrow-ord@59.3.0",
+        "pkg:cargo/arrow-schema@59.3.0",
+        "pkg:cargo/arrow-select@59.3.0",
         "pkg:cargo/chrono@0.4.45",
         "pkg:cargo/half@2.7.1",
         "pkg:cargo/indexmap@2.14.0",
@@ -3726,53 +3703,53 @@
         "pkg:cargo/num-traits@0.2.19",
         "pkg:cargo/ryu@1.0.23",
         "pkg:cargo/serde_core@1.0.228",
-        "pkg:cargo/serde_json@1.0.150",
+        "pkg:cargo/serde_json@1.0.151",
         "pkg:cargo/simdutf8@0.1.5"
       ]
     },
     {
-      "ref": "pkg:cargo/arrow-ord@59.0.0",
+      "ref": "pkg:cargo/arrow-ord@59.3.0",
       "dependsOn": [
-        "pkg:cargo/arrow-array@59.0.0",
-        "pkg:cargo/arrow-buffer@59.0.0",
-        "pkg:cargo/arrow-data@59.0.0",
-        "pkg:cargo/arrow-schema@59.0.0",
-        "pkg:cargo/arrow-select@59.0.0"
+        "pkg:cargo/arrow-array@59.3.0",
+        "pkg:cargo/arrow-buffer@59.3.0",
+        "pkg:cargo/arrow-data@59.3.0",
+        "pkg:cargo/arrow-schema@59.3.0",
+        "pkg:cargo/arrow-select@59.3.0"
       ]
     },
     {
-      "ref": "pkg:cargo/arrow-row@59.0.0",
+      "ref": "pkg:cargo/arrow-row@59.3.0",
       "dependsOn": [
-        "pkg:cargo/arrow-array@59.0.0",
-        "pkg:cargo/arrow-buffer@59.0.0",
-        "pkg:cargo/arrow-data@59.0.0",
-        "pkg:cargo/arrow-schema@59.0.0",
+        "pkg:cargo/arrow-array@59.3.0",
+        "pkg:cargo/arrow-buffer@59.3.0",
+        "pkg:cargo/arrow-data@59.3.0",
+        "pkg:cargo/arrow-schema@59.3.0",
         "pkg:cargo/half@2.7.1"
       ]
     },
     {
-      "ref": "pkg:cargo/arrow-schema@59.0.0",
+      "ref": "pkg:cargo/arrow-schema@59.3.0",
       "dependsOn": []
     },
     {
-      "ref": "pkg:cargo/arrow-select@59.0.0",
+      "ref": "pkg:cargo/arrow-select@59.3.0",
       "dependsOn": [
         "pkg:cargo/ahash@0.8.12",
-        "pkg:cargo/arrow-array@59.0.0",
-        "pkg:cargo/arrow-buffer@59.0.0",
-        "pkg:cargo/arrow-data@59.0.0",
-        "pkg:cargo/arrow-schema@59.0.0",
+        "pkg:cargo/arrow-array@59.3.0",
+        "pkg:cargo/arrow-buffer@59.3.0",
+        "pkg:cargo/arrow-data@59.3.0",
+        "pkg:cargo/arrow-schema@59.3.0",
         "pkg:cargo/num-traits@0.2.19"
       ]
     },
     {
-      "ref": "pkg:cargo/arrow-string@59.0.0",
+      "ref": "pkg:cargo/arrow-string@59.3.0",
       "dependsOn": [
-        "pkg:cargo/arrow-array@59.0.0",
-        "pkg:cargo/arrow-buffer@59.0.0",
-        "pkg:cargo/arrow-data@59.0.0",
-        "pkg:cargo/arrow-schema@59.0.0",
-        "pkg:cargo/arrow-select@59.0.0",
+        "pkg:cargo/arrow-array@59.3.0",
+        "pkg:cargo/arrow-buffer@59.3.0",
+        "pkg:cargo/arrow-data@59.3.0",
+        "pkg:cargo/arrow-schema@59.3.0",
+        "pkg:cargo/arrow-select@59.3.0",
         "pkg:cargo/memchr@2.8.2",
         "pkg:cargo/num-traits@0.2.19",
         "pkg:cargo/regex-syntax@0.8.11",
@@ -3780,21 +3757,21 @@
       ]
     },
     {
-      "ref": "pkg:cargo/arrow@59.0.0",
+      "ref": "pkg:cargo/arrow@59.3.0",
       "dependsOn": [
-        "pkg:cargo/arrow-arith@59.0.0",
-        "pkg:cargo/arrow-array@59.0.0",
-        "pkg:cargo/arrow-buffer@59.0.0",
-        "pkg:cargo/arrow-cast@59.0.0",
-        "pkg:cargo/arrow-csv@59.0.0",
-        "pkg:cargo/arrow-data@59.0.0",
-        "pkg:cargo/arrow-ipc@59.0.0",
-        "pkg:cargo/arrow-json@59.0.0",
-        "pkg:cargo/arrow-ord@59.0.0",
-        "pkg:cargo/arrow-row@59.0.0",
-        "pkg:cargo/arrow-schema@59.0.0",
-        "pkg:cargo/arrow-select@59.0.0",
-        "pkg:cargo/arrow-string@59.0.0"
+        "pkg:cargo/arrow-arith@59.3.0",
+        "pkg:cargo/arrow-array@59.3.0",
+        "pkg:cargo/arrow-buffer@59.3.0",
+        "pkg:cargo/arrow-cast@59.3.0",
+        "pkg:cargo/arrow-csv@59.3.0",
+        "pkg:cargo/arrow-data@59.3.0",
+        "pkg:cargo/arrow-ipc@59.3.0",
+        "pkg:cargo/arrow-json@59.3.0",
+        "pkg:cargo/arrow-ord@59.3.0",
+        "pkg:cargo/arrow-row@59.3.0",
+        "pkg:cargo/arrow-schema@59.3.0",
+        "pkg:cargo/arrow-select@59.3.0",
+        "pkg:cargo/arrow-string@59.3.0"
       ]
     },
     {
@@ -3815,7 +3792,7 @@
       ]
     },
     {
-      "ref": "pkg:cargo/base64@0.22.1",
+      "ref": "pkg:cargo/base64@0.23.1",
       "dependsOn": []
     },
     {
@@ -3823,9 +3800,8 @@
       "dependsOn": []
     },
     {
-      "ref": "pkg:cargo/blake3@1.8.5",
+      "ref": "pkg:cargo/blake3@1.8.7",
       "dependsOn": [
-        "pkg:cargo/arrayref@0.3.9",
         "pkg:cargo/arrayvec@0.7.7",
         "pkg:cargo/cc@1.2.65",
         "pkg:cargo/cfg-if@1.0.4",
@@ -3873,14 +3849,14 @@
       ]
     },
     {
-      "ref": "pkg:cargo/clap@4.6.1",
+      "ref": "pkg:cargo/clap@4.6.6",
       "dependsOn": [
-        "pkg:cargo/clap_builder@4.6.0",
-        "pkg:cargo/clap_derive@4.6.1"
+        "pkg:cargo/clap_builder@4.6.6",
+        "pkg:cargo/clap_derive@4.6.4"
       ]
     },
     {
-      "ref": "pkg:cargo/clap_builder@4.6.0",
+      "ref": "pkg:cargo/clap_builder@4.6.6",
       "dependsOn": [
         "pkg:cargo/anstream@1.0.0",
         "pkg:cargo/anstyle@1.0.14",
@@ -3889,12 +3865,12 @@
       ]
     },
     {
-      "ref": "pkg:cargo/clap_derive@4.6.1",
+      "ref": "pkg:cargo/clap_derive@4.6.4",
       "dependsOn": [
         "pkg:cargo/heck@0.5.0",
         "pkg:cargo/proc-macro2@1.0.106",
         "pkg:cargo/quote@1.0.46",
-        "pkg:cargo/syn@2.0.118"
+        "pkg:cargo/syn@3.0.5"
       ]
     },
     {
@@ -4229,22 +4205,22 @@
       "ref": "pkg:cargo/mumdia-core@0.3.1",
       "dependsOn": [
         "pkg:cargo/serde@1.0.228",
-        "pkg:cargo/serde_json@1.0.150",
-        "pkg:cargo/thiserror@2.0.18",
+        "pkg:cargo/serde_json@1.0.151",
+        "pkg:cargo/thiserror@2.0.20",
         "pkg:cargo/tracing@0.1.44"
       ]
     },
     {
       "ref": "pkg:cargo/mumdia-io@0.3.1",
       "dependsOn": [
-        "pkg:cargo/anyhow@1.0.103",
-        "pkg:cargo/arrow@59.0.0",
-        "pkg:cargo/blake3@1.8.5",
+        "pkg:cargo/anyhow@1.0.104",
+        "pkg:cargo/arrow@59.3.0",
+        "pkg:cargo/blake3@1.8.7",
         "pkg:cargo/mumdia-core@0.3.1",
-        "pkg:cargo/parquet@59.0.0",
+        "pkg:cargo/parquet@59.3.0",
         "pkg:cargo/serde@1.0.228",
-        "pkg:cargo/serde_json@1.0.150",
-        "pkg:cargo/thiserror@2.0.18",
+        "pkg:cargo/serde_json@1.0.151",
+        "pkg:cargo/thiserror@2.0.20",
         "pkg:cargo/tracing-subscriber@0.3.23",
         "pkg:cargo/tracing@0.1.44"
       ]
@@ -4252,19 +4228,19 @@
     {
       "ref": "pkg:cargo/mumdia@0.3.1",
       "dependsOn": [
-        "pkg:cargo/anyhow@1.0.103",
-        "pkg:cargo/arrow@59.0.0",
-        "pkg:cargo/blake3@1.8.5",
-        "pkg:cargo/clap@4.6.1",
+        "pkg:cargo/anyhow@1.0.104",
+        "pkg:cargo/arrow@59.3.0",
+        "pkg:cargo/blake3@1.8.7",
+        "pkg:cargo/clap@4.6.6",
         "pkg:cargo/mimalloc@0.1.52",
         "pkg:cargo/mumdia-core@0.3.1",
         "pkg:cargo/mumdia-io@0.3.1",
         "pkg:cargo/mzdata@0.66.6",
-        "pkg:cargo/parquet@59.0.0",
+        "pkg:cargo/parquet@59.3.0",
         "pkg:cargo/rayon@1.12.0",
         "pkg:cargo/serde@1.0.228",
-        "pkg:cargo/serde_json@1.0.150",
-        "pkg:cargo/thiserror@2.0.18",
+        "pkg:cargo/serde_json@1.0.151",
+        "pkg:cargo/thiserror@2.0.20",
         "pkg:cargo/tracing-subscriber@0.3.23",
         "pkg:cargo/tracing@0.1.44"
       ]
@@ -4279,7 +4255,7 @@
         "pkg:cargo/mzdata-param@0.66.6",
         "pkg:cargo/mzpeaks@1.0.9",
         "pkg:cargo/num-traits@0.2.19",
-        "pkg:cargo/thiserror@2.0.18"
+        "pkg:cargo/thiserror@2.0.20"
       ]
     },
     {
@@ -4292,14 +4268,14 @@
         "pkg:cargo/mzdata-param@0.66.6",
         "pkg:cargo/num-traits@0.2.19",
         "pkg:cargo/regex@1.12.4",
-        "pkg:cargo/thiserror@2.0.18"
+        "pkg:cargo/thiserror@2.0.20"
       ]
     },
     {
       "ref": "pkg:cargo/mzdata-param@0.66.6",
       "dependsOn": [
         "pkg:cargo/log@0.4.33",
-        "pkg:cargo/thiserror@2.0.18"
+        "pkg:cargo/thiserror@2.0.20"
       ]
     },
     {
@@ -4312,7 +4288,7 @@
         "pkg:cargo/mzdata-param@0.66.6",
         "pkg:cargo/mzpeaks@1.0.9",
         "pkg:cargo/num-traits@0.2.19",
-        "pkg:cargo/thiserror@2.0.18"
+        "pkg:cargo/thiserror@2.0.20"
       ]
     },
     {
@@ -4338,7 +4314,7 @@
         "pkg:cargo/quick-xml@0.41.0",
         "pkg:cargo/regex@1.12.4",
         "pkg:cargo/sha1@0.11.0",
-        "pkg:cargo/thiserror@2.0.18"
+        "pkg:cargo/thiserror@2.0.20"
       ]
     },
     {
@@ -4354,7 +4330,7 @@
       ]
     },
     {
-      "ref": "pkg:cargo/num-bigint@0.4.6",
+      "ref": "pkg:cargo/num-bigint@0.5.1",
       "dependsOn": [
         "pkg:cargo/num-integer@0.1.46",
         "pkg:cargo/num-traits@0.2.19"
@@ -4392,32 +4368,27 @@
       "dependsOn": []
     },
     {
-      "ref": "pkg:cargo/parquet@59.0.0",
+      "ref": "pkg:cargo/parquet@59.3.0",
       "dependsOn": [
         "pkg:cargo/ahash@0.8.12",
-        "pkg:cargo/arrow-array@59.0.0",
-        "pkg:cargo/arrow-buffer@59.0.0",
-        "pkg:cargo/arrow-data@59.0.0",
-        "pkg:cargo/arrow-ipc@59.0.0",
-        "pkg:cargo/arrow-schema@59.0.0",
-        "pkg:cargo/arrow-select@59.0.0",
-        "pkg:cargo/base64@0.22.1",
+        "pkg:cargo/arrow-array@59.3.0",
+        "pkg:cargo/arrow-buffer@59.3.0",
+        "pkg:cargo/arrow-data@59.3.0",
+        "pkg:cargo/arrow-ipc@59.3.0",
+        "pkg:cargo/arrow-schema@59.3.0",
+        "pkg:cargo/arrow-select@59.3.0",
+        "pkg:cargo/base64@0.23.1",
         "pkg:cargo/bytes@1.12.0",
         "pkg:cargo/chrono@0.4.45",
         "pkg:cargo/half@2.7.1",
         "pkg:cargo/hashbrown@0.17.1",
-        "pkg:cargo/num-bigint@0.4.6",
+        "pkg:cargo/num-bigint@0.5.1",
         "pkg:cargo/num-integer@0.1.46",
         "pkg:cargo/num-traits@0.2.19",
-        "pkg:cargo/paste@1.0.15",
         "pkg:cargo/seq-macro@0.3.6",
         "pkg:cargo/snap@1.1.1",
         "pkg:cargo/twox-hash@2.1.2"
       ]
-    },
-    {
-      "ref": "pkg:cargo/paste@1.0.15",
-      "dependsOn": []
     },
     {
       "ref": "pkg:cargo/pin-project-lite@0.2.17",
@@ -4525,7 +4496,7 @@
       ]
     },
     {
-      "ref": "pkg:cargo/serde_json@1.0.150",
+      "ref": "pkg:cargo/serde_json@1.0.151",
       "dependsOn": [
         "pkg:cargo/itoa@1.0.18",
         "pkg:cargo/memchr@2.8.2",
@@ -4585,17 +4556,25 @@
       ]
     },
     {
-      "ref": "pkg:cargo/thiserror-impl@2.0.18",
+      "ref": "pkg:cargo/syn@3.0.5",
       "dependsOn": [
         "pkg:cargo/proc-macro2@1.0.106",
         "pkg:cargo/quote@1.0.46",
-        "pkg:cargo/syn@2.0.118"
+        "pkg:cargo/unicode-ident@1.0.24"
       ]
     },
     {
-      "ref": "pkg:cargo/thiserror@2.0.18",
+      "ref": "pkg:cargo/thiserror-impl@2.0.20",
       "dependsOn": [
-        "pkg:cargo/thiserror-impl@2.0.18"
+        "pkg:cargo/proc-macro2@1.0.106",
+        "pkg:cargo/quote@1.0.46",
+        "pkg:cargo/syn@3.0.5"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/thiserror@2.0.20",
+      "dependsOn": [
+        "pkg:cargo/thiserror-impl@2.0.20"
       ]
     },
     {

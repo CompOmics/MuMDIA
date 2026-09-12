@@ -9,7 +9,7 @@ accompanies it in every release archive and in the container image.
 
 ## Obligations
 
-178 third-party crates. Every one declares an SPDX expression; none is
+177 third-party crates. Every one declares an SPDX expression; none is
 unspecified.
 
 The following copyleft identifiers appear, in each case as one arm of a
@@ -28,8 +28,8 @@ Licence identifiers by crate count:
 | `Apache-2.0` | 146 |
 | `Apache-2.0 WITH LLVM-exception` | 4 |
 | `Unlicense` | 4 |
-| `BSD-2-Clause` | 3 |
 | `CC0-1.0` | 3 |
+| `BSD-2-Clause` | 2 |
 | `BSD-3-Clause` | 2 |
 | `Zlib` | 2 |
 | `0BSD` | 1 |
@@ -51,29 +51,28 @@ Licence identifiers by crate count:
 | `anstyle-parse` | 1.0.0 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/rust-cli/anstyle.git](https://github.com/rust-cli/anstyle.git) |
 | `anstyle-query` | 1.1.5 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/rust-cli/anstyle.git](https://github.com/rust-cli/anstyle.git) |
 | `anstyle-wincon` | 3.0.11 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/rust-cli/anstyle.git](https://github.com/rust-cli/anstyle.git) |
-| `anyhow` | 1.0.103 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/dtolnay/anyhow](https://github.com/dtolnay/anyhow) |
-| `arrayref` | 0.3.9 | BSD-2-Clause | - | [https://github.com/droundy/arrayref](https://github.com/droundy/arrayref) |
+| `anyhow` | 1.0.104 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/dtolnay/anyhow](https://github.com/dtolnay/anyhow) |
 | `arrayvec` | 0.7.7 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/bluss/arrayvec](https://github.com/bluss/arrayvec) |
-| `arrow` | 59.0.0 | Apache-2.0 | - | [https://github.com/apache/arrow-rs](https://github.com/apache/arrow-rs) |
-| `arrow-arith` | 59.0.0 | Apache-2.0 | - | [https://github.com/apache/arrow-rs](https://github.com/apache/arrow-rs) |
-| `arrow-array` | 59.0.0 | Apache-2.0 AND MIT | - | [https://github.com/apache/arrow-rs](https://github.com/apache/arrow-rs) |
-| `arrow-buffer` | 59.0.0 | Apache-2.0 | - | [https://github.com/apache/arrow-rs](https://github.com/apache/arrow-rs) |
-| `arrow-cast` | 59.0.0 | Apache-2.0 | - | [https://github.com/apache/arrow-rs](https://github.com/apache/arrow-rs) |
-| `arrow-csv` | 59.0.0 | Apache-2.0 | - | [https://github.com/apache/arrow-rs](https://github.com/apache/arrow-rs) |
-| `arrow-data` | 59.0.0 | Apache-2.0 | - | [https://github.com/apache/arrow-rs](https://github.com/apache/arrow-rs) |
-| `arrow-ipc` | 59.0.0 | Apache-2.0 | - | [https://github.com/apache/arrow-rs](https://github.com/apache/arrow-rs) |
-| `arrow-json` | 59.0.0 | Apache-2.0 | - | [https://github.com/apache/arrow-rs](https://github.com/apache/arrow-rs) |
-| `arrow-ord` | 59.0.0 | Apache-2.0 | - | [https://github.com/apache/arrow-rs](https://github.com/apache/arrow-rs) |
-| `arrow-row` | 59.0.0 | Apache-2.0 | - | [https://github.com/apache/arrow-rs](https://github.com/apache/arrow-rs) |
-| `arrow-schema` | 59.0.0 | Apache-2.0 | - | [https://github.com/apache/arrow-rs](https://github.com/apache/arrow-rs) |
-| `arrow-select` | 59.0.0 | Apache-2.0 | - | [https://github.com/apache/arrow-rs](https://github.com/apache/arrow-rs) |
-| `arrow-string` | 59.0.0 | Apache-2.0 | - | [https://github.com/apache/arrow-rs](https://github.com/apache/arrow-rs) |
+| `arrow` | 59.3.0 | Apache-2.0 | - | [https://github.com/apache/arrow-rs](https://github.com/apache/arrow-rs) |
+| `arrow-arith` | 59.3.0 | Apache-2.0 | - | [https://github.com/apache/arrow-rs](https://github.com/apache/arrow-rs) |
+| `arrow-array` | 59.3.0 | Apache-2.0 AND MIT | - | [https://github.com/apache/arrow-rs](https://github.com/apache/arrow-rs) |
+| `arrow-buffer` | 59.3.0 | Apache-2.0 | - | [https://github.com/apache/arrow-rs](https://github.com/apache/arrow-rs) |
+| `arrow-cast` | 59.3.0 | Apache-2.0 | - | [https://github.com/apache/arrow-rs](https://github.com/apache/arrow-rs) |
+| `arrow-csv` | 59.3.0 | Apache-2.0 | - | [https://github.com/apache/arrow-rs](https://github.com/apache/arrow-rs) |
+| `arrow-data` | 59.3.0 | Apache-2.0 | - | [https://github.com/apache/arrow-rs](https://github.com/apache/arrow-rs) |
+| `arrow-ipc` | 59.3.0 | Apache-2.0 | - | [https://github.com/apache/arrow-rs](https://github.com/apache/arrow-rs) |
+| `arrow-json` | 59.3.0 | Apache-2.0 | - | [https://github.com/apache/arrow-rs](https://github.com/apache/arrow-rs) |
+| `arrow-ord` | 59.3.0 | Apache-2.0 | - | [https://github.com/apache/arrow-rs](https://github.com/apache/arrow-rs) |
+| `arrow-row` | 59.3.0 | Apache-2.0 | - | [https://github.com/apache/arrow-rs](https://github.com/apache/arrow-rs) |
+| `arrow-schema` | 59.3.0 | Apache-2.0 | - | [https://github.com/apache/arrow-rs](https://github.com/apache/arrow-rs) |
+| `arrow-select` | 59.3.0 | Apache-2.0 | - | [https://github.com/apache/arrow-rs](https://github.com/apache/arrow-rs) |
+| `arrow-string` | 59.3.0 | Apache-2.0 | - | [https://github.com/apache/arrow-rs](https://github.com/apache/arrow-rs) |
 | `atoi` | 2.0.0 | MIT | - | [https://github.com/pacman82/atoi-rs](https://github.com/pacman82/atoi-rs) |
 | `autocfg` | 1.5.1 | Apache-2.0 OR MIT | `Apache-2.0` | [https://github.com/cuviper/autocfg](https://github.com/cuviper/autocfg) |
-| `base64` | 0.22.1 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/marshallpierce/rust-base64](https://github.com/marshallpierce/rust-base64) |
+| `base64` | 0.23.1 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/marshallpierce/rust-base64](https://github.com/marshallpierce/rust-base64) |
 | `base64-simd` | 0.8.0 | MIT | - | [https://github.com/Nugine/simd](https://github.com/Nugine/simd) |
 | `bitflags` | 2.13.0 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/bitflags/bitflags](https://github.com/bitflags/bitflags) |
-| `blake3` | 1.8.5 | CC0-1.0 OR Apache-2.0 OR Apache-2.0 WITH LLVM-exception | `Apache-2.0` | [https://github.com/BLAKE3-team/BLAKE3](https://github.com/BLAKE3-team/BLAKE3) |
+| `blake3` | 1.8.7 | CC0-1.0 OR Apache-2.0 OR Apache-2.0 WITH LLVM-exception | `Apache-2.0` | [https://github.com/BLAKE3-team/BLAKE3](https://github.com/BLAKE3-team/BLAKE3) |
 | `block-buffer` | 0.12.1 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/RustCrypto/utils](https://github.com/RustCrypto/utils) |
 | `bumpalo` | 3.20.3 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/fitzgen/bumpalo](https://github.com/fitzgen/bumpalo) |
 | `bytemuck` | 1.25.0 | Zlib OR Apache-2.0 OR MIT | `Apache-2.0` | [https://github.com/Lokathor/bytemuck](https://github.com/Lokathor/bytemuck) |
@@ -81,9 +80,9 @@ Licence identifiers by crate count:
 | `cc` | 1.2.65 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/rust-lang/cc-rs](https://github.com/rust-lang/cc-rs) |
 | `cfg-if` | 1.0.4 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/rust-lang/cfg-if](https://github.com/rust-lang/cfg-if) |
 | `chrono` | 0.4.45 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/chronotope/chrono](https://github.com/chronotope/chrono) |
-| `clap` | 4.6.1 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/clap-rs/clap](https://github.com/clap-rs/clap) |
-| `clap_builder` | 4.6.0 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/clap-rs/clap](https://github.com/clap-rs/clap) |
-| `clap_derive` | 4.6.1 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/clap-rs/clap](https://github.com/clap-rs/clap) |
+| `clap` | 4.6.6 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/clap-rs/clap](https://github.com/clap-rs/clap) |
+| `clap_builder` | 4.6.6 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/clap-rs/clap](https://github.com/clap-rs/clap) |
+| `clap_derive` | 4.6.4 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/clap-rs/clap](https://github.com/clap-rs/clap) |
 | `clap_lex` | 1.1.0 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/clap-rs/clap](https://github.com/clap-rs/clap) |
 | `colorchoice` | 1.0.5 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/rust-cli/anstyle.git](https://github.com/rust-cli/anstyle.git) |
 | `comfy-table` | 7.2.2 | MIT | - | [https://github.com/nukesor/comfy-table](https://github.com/nukesor/comfy-table) |
@@ -147,15 +146,14 @@ Licence identifiers by crate count:
 | `mzdata-spectrum` | 0.66.6 | Apache-2.0 | - | [https://github.com/mobiusklein/mzdata](https://github.com/mobiusklein/mzdata) |
 | `mzpeaks` | 1.0.9 | Apache-2.0 | - | [https://github.com/mobiusklein/mzpeaks](https://github.com/mobiusklein/mzpeaks) |
 | `nu-ansi-term` | 0.50.3 | MIT | - | [https://github.com/nushell/nu-ansi-term](https://github.com/nushell/nu-ansi-term) |
-| `num-bigint` | 0.4.6 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/rust-num/num-bigint](https://github.com/rust-num/num-bigint) |
+| `num-bigint` | 0.5.1 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/rust-num/num-bigint](https://github.com/rust-num/num-bigint) |
 | `num-complex` | 0.4.6 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/rust-num/num-complex](https://github.com/rust-num/num-complex) |
 | `num-integer` | 0.1.46 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/rust-num/num-integer](https://github.com/rust-num/num-integer) |
 | `num-traits` | 0.2.19 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/rust-num/num-traits](https://github.com/rust-num/num-traits) |
 | `once_cell` | 1.21.4 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/matklad/once_cell](https://github.com/matklad/once_cell) |
 | `once_cell_polyfill` | 1.70.2 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/polyfill-rs/once_cell_polyfill](https://github.com/polyfill-rs/once_cell_polyfill) |
 | `outref` | 0.5.2 | MIT | - | [https://github.com/Nugine/outref](https://github.com/Nugine/outref) |
-| `parquet` | 59.0.0 | Apache-2.0 | - | [https://github.com/apache/arrow-rs](https://github.com/apache/arrow-rs) |
-| `paste` | 1.0.15 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/dtolnay/paste](https://github.com/dtolnay/paste) |
+| `parquet` | 59.3.0 | Apache-2.0 | - | [https://github.com/apache/arrow-rs](https://github.com/apache/arrow-rs) |
 | `pin-project-lite` | 0.2.17 | Apache-2.0 OR MIT | `Apache-2.0` | [https://github.com/taiki-e/pin-project-lite](https://github.com/taiki-e/pin-project-lite) |
 | `proc-macro2` | 1.0.106 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/dtolnay/proc-macro2](https://github.com/dtolnay/proc-macro2) |
 | `quick-xml` | 0.41.0 | MIT | - | [https://github.com/tafia/quick-xml](https://github.com/tafia/quick-xml) |
@@ -174,7 +172,7 @@ Licence identifiers by crate count:
 | `serde` | 1.0.228 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/serde-rs/serde](https://github.com/serde-rs/serde) |
 | `serde_core` | 1.0.228 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/serde-rs/serde](https://github.com/serde-rs/serde) |
 | `serde_derive` | 1.0.228 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/serde-rs/serde](https://github.com/serde-rs/serde) |
-| `serde_json` | 1.0.150 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/serde-rs/json](https://github.com/serde-rs/json) |
+| `serde_json` | 1.0.151 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/serde-rs/json](https://github.com/serde-rs/json) |
 | `sha1` | 0.11.0 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/RustCrypto/hashes](https://github.com/RustCrypto/hashes) |
 | `sharded-slab` | 0.1.7 | MIT | - | [https://github.com/hawkw/sharded-slab](https://github.com/hawkw/sharded-slab) |
 | `shlex` | 2.0.1 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/comex/rust-shlex](https://github.com/comex/rust-shlex) |
@@ -185,8 +183,9 @@ Licence identifiers by crate count:
 | `snap` | 1.1.1 | BSD-3-Clause | - | [https://github.com/BurntSushi/rust-snappy](https://github.com/BurntSushi/rust-snappy) |
 | `strsim` | 0.11.1 | MIT | - | [https://github.com/rapidfuzz/strsim-rs](https://github.com/rapidfuzz/strsim-rs) |
 | `syn` | 2.0.118 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/dtolnay/syn](https://github.com/dtolnay/syn) |
-| `thiserror` | 2.0.18 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/dtolnay/thiserror](https://github.com/dtolnay/thiserror) |
-| `thiserror-impl` | 2.0.18 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/dtolnay/thiserror](https://github.com/dtolnay/thiserror) |
+| `syn` | 3.0.5 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/dtolnay/syn](https://github.com/dtolnay/syn) |
+| `thiserror` | 2.0.20 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/dtolnay/thiserror](https://github.com/dtolnay/thiserror) |
+| `thiserror-impl` | 2.0.20 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/dtolnay/thiserror](https://github.com/dtolnay/thiserror) |
 | `thread_local` | 1.1.9 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/Amanieu/thread_local-rs](https://github.com/Amanieu/thread_local-rs) |
 | `tiny-keccak` | 2.0.2 | CC0-1.0 | - | - |
 | `tracing` | 0.1.44 | MIT | - | [https://github.com/tokio-rs/tracing](https://github.com/tokio-rs/tracing) |
@@ -331,7 +330,7 @@ licence text alone does not discharge the obligation: MIT requires the copyright
 notice in all copies, BSD requires it retained, and Apache-2.0 section 4(d)
 requires the contents of a NOTICE file to be propagated.
 
-Notices recovered for 127 of 178 crates (the remainder ship no copyright line in a licence file; see their repositories, linked above).
+Notices recovered for 126 of 177 crates (the remainder ship no copyright line in a licence file; see their repositories, linked above).
 
 **adler2 2.0.1**
 
@@ -370,15 +369,11 @@ Notices recovered for 127 of 178 crates (the remainder ship no copyright line in
 
 - Copyright (c) Individual contributors
 
-**arrayref 0.3.9**
-
-- Copyright (c) 2015 David Roundy <roundyd@physics.oregonstate.edu>
-
 **arrayvec 0.7.7**
 
 - Copyright (c) Ulrik Sverdrup "bluss" 2015-2023
 
-**arrow-array 59.0.0**
+**arrow-array 59.3.0**
 
 - Copyright (c) 2020-2022 Oliver Margetts
 
@@ -390,15 +385,15 @@ Notices recovered for 127 of 178 crates (the remainder ship no copyright line in
 
 - Copyright (c) 2018 Josh Stone
 
-**base64 0.22.1**
+**base64 0.23.1**
 
-- Copyright (c) 2015 Alice Maz
+- Copyright (c) 2025 Alice Maz, Marshall Pierce
 
 **bitflags 2.13.0**
 
 - Copyright (c) 2014 The Rust Project Developers
 
-**blake3 1.8.5**
+**blake3 1.8.7**
 
 - Copyright 2019 Jack O'Connor and Samuel Neves
 
@@ -430,15 +425,15 @@ Notices recovered for 127 of 178 crates (the remainder ship no copyright line in
 
 - Copyright (c) 2014, Kang Seonghoon.
 
-**clap 4.6.1**
+**clap 4.6.6**
 
 - Copyright (c) Individual contributors
 
-**clap_builder 4.6.0**
+**clap_builder 4.6.6**
 
 - Copyright (c) Individual contributors
 
-**clap_derive 4.6.1**
+**clap_derive 4.6.4**
 
 - Copyright (c) Individual contributors
 
@@ -682,7 +677,7 @@ Notices recovered for 127 of 178 crates (the remainder ship no copyright line in
 - Copyright (c) 2014 Benjamin Sago
 - Copyright (c) 2021-2022 The Nushell Project Developers
 
-**num-bigint 0.4.6**
+**num-bigint 0.5.1**
 
 - Copyright (c) 2014 The Rust Project Developers
 
@@ -889,9 +884,9 @@ Notices recovered for 127 of 178 crates (the remainder ship no copyright line in
 
 Apache-2.0 section 4(d) requires these to travel with the distribution.
 
-#### arrow 59.0.0, and 14 more
+#### arrow 59.3.0, and 14 more
 
-Shared by: `arrow 59.0.0`, `arrow-arith 59.0.0`, `arrow-array 59.0.0`, `arrow-buffer 59.0.0`, `arrow-cast 59.0.0`, `arrow-csv 59.0.0`, `arrow-data 59.0.0`, `arrow-ipc 59.0.0`, `arrow-json 59.0.0`, `arrow-ord 59.0.0`, `arrow-row 59.0.0`, `arrow-schema 59.0.0`, `arrow-select 59.0.0`, `arrow-string 59.0.0`, `parquet 59.0.0`.
+Shared by: `arrow 59.3.0`, `arrow-arith 59.3.0`, `arrow-array 59.3.0`, `arrow-buffer 59.3.0`, `arrow-cast 59.3.0`, `arrow-csv 59.3.0`, `arrow-data 59.3.0`, `arrow-ipc 59.3.0`, `arrow-json 59.3.0`, `arrow-ord 59.3.0`, `arrow-row 59.3.0`, `arrow-schema 59.3.0`, `arrow-select 59.3.0`, `arrow-string 59.3.0`, `parquet 59.3.0`.
 
 ```text
 Apache Arrow
