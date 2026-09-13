@@ -27,6 +27,22 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ## [Unreleased]
 
+### Fixed
+
+- The desktop application's run log, the terminal and any redirected log file were
+  almost entirely blank lines whenever retention times were predicted. DeepLC's
+  progress writer emits a bare carriage return per update, which renders as nothing
+  when stdout is not a terminal, and the engine inherits a worker's stdout rather than
+  capturing it (deliberately, so long-running progress reaches the user live). Measured:
+  5,697 blank lines from one 2.9M-peptide prediction, and 98-99% of two real run logs.
+  Both DeepLC workers now filter their own stdout, dropping only what is empty once
+  carriage returns and whitespace are stripped; everything DeepLC actually says still
+  comes through, in order, and stderr is untouched. `MUMDIA_DEEPLC_RAW_OUTPUT=1`
+  restores the unfiltered output for debugging.
+
+  This affected every run that predicts retention times, which since multi-head
+  calibration became the default is every run with a DeepLC interpreter.
+
 ### Changed
 
 - **`rt_im_train.multihead_calibration` is now the default.** Left unset it calibrates the
