@@ -424,7 +424,7 @@ listed with its default and effect. Fields marked **default-off**, **inert**, or
 | `QuantQColumn` | config.rs:971-988 | **`peptide_q`**, `precursor_q`, `psm_q`, `run_psm_q` | which q column quant filters on |
 | `MbrStrategy` | config.rs:1058-1068 | **`none`**, `empirical_library`, `rt_transfer`, `full` | only `none` vs not-`none` is distinguished in code; the three non-`none` variants behave identically and `validate()` warns |
 | `DecoyTransfer` | config.rs:1077-1082 | **`permuted_rt`**, `reverse_sequence`, `both` | MBR false-transfer null; **not read by any stage** (`validate()` warns if changed) |
-| `FinetuneScope` | config.rs:1197-1225 | **`first_run_only`**, `per_run` | `run-experiment` only: how many DeepLC fine-tunes an experiment pays for |
+| `RtLibraryScope` | config.rs | **`first_run_only`**, `per_run` | `run-experiment` only: how many DeepLC fine-tunes an experiment pays for |
 | `Handoff` | config.rs:1230-1244 | **`tsv`**, `parquet` | how the feature matrix crosses into a sidecar rescorer; `parquet` is nn_torch only (mokapot falls back to `tsv` with a warning) |
 
 #### Variant semantics (behaviorally-rich enums)
@@ -583,7 +583,7 @@ complete-case features, robust to a minority of changing features (does not flat
 a spike-in design's real fold changes); `Median` aligns each run's median intensity
 (simpler, less robust to composition shifts); `None` uses raw areas.
 
-**`FinetuneScope`** (1194-1225), consulted only by `run-experiment` and only when
+**`RtLibraryScope`**, consulted only by `run-experiment` and only when
 `rt_im_train.finetune_deeplc` is set. `FirstRunOnly` (default) fine-tunes DeepLC
 once on the first run's confident seeds and reuses that library everywhere; each
 run still fits its own RT calibration on top. Reuse is not free: on a 6-run
@@ -859,8 +859,10 @@ sequential behavior. Runs are independent so raising it scales nearly linearly i
 wall time, but each concurrent run holds its own extraction working set, so the
 practical ceiling is memory rather than cores. Results are unaffected: chunks are
 processed in index order and completion order never reaches the output.
-`finetune_scope` (default `first_run_only`) is consulted only when
-`rt_im_train.finetune_deeplc` is set; see `FinetuneScope` above.
+`rt_library_scope` (default `first_run_only`, and still accepted under its old name
+`finetune_scope`) is consulted whenever the library's retention times are adapted to a
+run: `rt_im_train.finetune_deeplc` or `rt_im_train.multihead_calibration`. See
+`RtLibraryScope` above.
 
 ### Top-level `Config` (config.rs:1274-1311)
 

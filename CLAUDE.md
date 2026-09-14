@@ -291,9 +291,10 @@ entrapment arm closes the other half of the gate: +4.28% real peptides at an emp
 of 0.995% against the baseline's 0.995%, on 138 and 144 accepted spike-ins.
 Fewer candidates reach rescore and more of them are real, which is interference removed
 rather than a threshold traded. It costs 1.4x to 1.7x wall clock, because the calibration
-is fitted against each run's own anchors and cannot be shared across an experiment; that
-is the price of the default and the reason a shared-head-selection variant is worth
-measuring.
+is fitted against each run's own anchors. Since 2026-09-14 `experiment.rt_library_scope`
+(default `first_run_only`, formerly `finetune_scope`) amortises it exactly as it already
+amortised the fine-tune: the first run adapts the library, the rest reuse it and fit their
+own LOESS on top. Use `per_run` where the runs do not share an elution order.
 
 Three RT rules, each measured in `docs/08_rt_im_train.md` and restated from the
 failure side in `docs/17_troubleshooting.md`:

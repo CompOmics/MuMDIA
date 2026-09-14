@@ -29,6 +29,24 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ### Changed
 
+- **`experiment.finetune_scope` is now `experiment.rt_library_scope`, and it governs
+  multi-head calibration as well as the DeepLC fine-tune.** The old name still parses.
+
+  Multi-head re-predicted the whole library once per run, unconditionally. On a six-file
+  Astral experiment that is six 362 MB re-predictions of the same 9.4M-row library, and
+  it is where the measured 1.4x-1.7x wall clock goes. The reasoning was that the
+  calibration is fitted against THIS run's chromatography -- true, and equally true of
+  the fine-tune, which has been shareable all along. What a shared library fixes is
+  elution ORDER, which replicate injections on one LC method share; each run still fits
+  its own LOESS on top, and that per-run fit is what absorbs drift.
+
+  Under the default `first_run_only` the first run adapts the library and the rest reuse
+  it. Set `per_run` for a batch that genuinely reorders -- different gradients or
+  columns, a method change part-way -- or a long batch where drift accumulates; the
+  fine-tune's measured cost of sharing (+47% median RT residual across five reusing runs,
+  monotonic in acquisition order) is the guide until the multi-head equivalent is
+  measured.
+
 - **`rt_im_train.multihead_calibration` is now the default.** Left unset it calibrates the
   DeepLC base model over 80 of its best-correlating LC-setup heads against each run's own
   confident seed PSMs, in place of the single head `deeplc.predict` returns. Measured on

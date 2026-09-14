@@ -507,9 +507,21 @@ orchestrators and the `library_irt` predicate cannot disagree about whether it r
 `model_identities.rt_predictor` records what actually happened (`multihead-80` against
 `deeplc-4.4.0-base`).
 
-**Cost.** The calibration re-predicts the library once per run rather than once per
-experiment, because it is fitted against each run's own anchors: 1.4x wall clock on AIF and
-1.7x on Astral. That is the price of the default. The fine-tune has the same shape, which is what `experiment.finetune_scope`
+**Cost, and how to amortise it.** The calibration re-predicts the whole library against a
+run's own anchors, which on a 9.4M-row library is the most expensive step in the
+experiment: 1.4x wall clock on AIF and 1.7x on Astral when every run pays it.
+
+Since 2026-09-14 it does not have to. `experiment.rt_library_scope` (default
+`first_run_only`, formerly `finetune_scope`) governs multi-head exactly as it already
+governed the fine-tune: the first run adapts the library, the rest reuse it and fit their
+own LOESS on top. What a shared library fixes is elution ORDER, which replicate injections
+on one method share; a batch that genuinely reorders -- different gradients or columns, a
+method change part-way -- wants `per_run`, and so does a long batch where drift
+accumulates. The fine-tune's measured cost of sharing is the guide until the multi-head
+equivalent is measured: +47% median RT residual across five reusing runs, monotonic in
+acquisition order.
+
+The fine-tune has the same shape, which is what `experiment.finetune_scope`
 exists to amortise, and multi-head cannot share by construction. Since every AIF run chose
 the same head, a shared-selection variant is worth measuring before that cost is made
 default.

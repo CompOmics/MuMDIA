@@ -1736,10 +1736,14 @@ impl Default for RescoreConfig {
 /// How many DeepLC fine-tunes an experiment pays for.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum FinetuneScope {
-    /// Fine-tune DeepLC once, on the FIRST run's confident seeds, and reuse that library
-    /// for every run. Each run still fits its OWN retention-time calibration (LOESS by
-    /// default) on top of it.
+pub enum RtLibraryScope {
+    /// Adapt the library's retention times once, on the FIRST run's confident seeds, and
+    /// reuse that library for every run. Each run still fits its OWN retention-time
+    /// calibration (LOESS by default) on top of it.
+    ///
+    /// "Adapt" is whichever of the two mechanisms is active: the DeepLC fine-tune, or
+    /// multi-head calibration. They occupy the same slot, cost the same kind of time --
+    /// one full re-prediction of the library per run -- and are amortised the same way.
     ///
     /// MEASURED COST (6-run ProteoBench HYE AIF set, 2026-07-28). Reuse is NOT free: the
     /// run that owned the fine-tune reached a median |RT residual| of 15.2 s, while the
@@ -1810,16 +1814,34 @@ pub struct ExperimentConfig {
     /// large-memory machine. Results are unaffected: chunks are processed in index
     /// order and completion order never reaches the output.
     pub parallel_runs: usize,
-    /// Whether the DeepLC fine-tune runs once for the experiment or once per run.
-    /// Only consulted when `rt_im_train.finetune_deeplc` is set.
-    pub finetune_scope: FinetuneScope,
+    /// How often the library's retention times are adapted to a run: once on the first
+    /// run and reused (`first_run_only`, the default) or separately for every run
+    /// (`per_run`).
+    ///
+    /// Governs whichever adaptation is active -- `rt_im_train.finetune_deeplc` or
+    /// `rt_im_train.multihead_calibration` -- because they are the same shape of work:
+    /// one full re-prediction of the library against that run's confident seed PSMs,
+    /// which on a 9.4M-row library is the most expensive step in the experiment. Each
+    /// run then fits its own LOESS on top of whichever library it was given, and that
+    /// per-run fit is what absorbs chromatographic drift.
+    ///
+    /// Accepts the old name `finetune_scope`, which is what it was called when only the
+    /// fine-tune could be shared.
+    ///
+    /// `first_run_only` assumes the runs share an elution ORDER, which replicate
+    /// injections on one LC method do. A per-run LOESS can stretch and bend the axis but
+    /// cannot reorder two peptides, so a batch that genuinely reorders -- different
+    /// gradients, different columns, a method change part-way -- wants `per_run`, and so
+    /// does a long batch where drift accumulates (see the measured cost above).
+    #[serde(alias = "finetune_scope")]
+    pub rt_library_scope: RtLibraryScope,
 }
 
 impl Default for ExperimentConfig {
     fn default() -> Self {
         Self {
             parallel_runs: 1,
-            finetune_scope: FinetuneScope::FirstRunOnly,
+            rt_library_scope: RtLibraryScope::FirstRunOnly,
         }
     }
 }
@@ -2634,22 +2656,46 @@ mod tests {
     }
 
     #[test]
-    fn experiment_finetune_scope_defaults_to_first_run_only() {
+    fn the_rt_library_scope_governs_multi_head_as_well_as_the_fine_tune() {
+        // Both adaptations are the same shape of work -- one full re-prediction of the
+        // library per run -- so one knob amortises both. Multi-head was per-run
+        // unconditionally until 2026-09-14, which on a six-file Astral experiment meant
+        // six 362 MB re-predictions of the same 9.4M-row library.
+        let d = Config::default();
+        assert_eq!(
+            d.experiment.rt_library_scope,
+            RtLibraryScope::FirstRunOnly,
+            "sharing is the default, as it already was for the fine-tune"
+        );
+        // The old spelling keeps working; it is what the field was called when only the
+        // fine-tune could be shared.
+        let old = Config::from_json(r#"{"experiment":{"finetune_scope":"per_run"}}"#).unwrap();
+        assert_eq!(old.experiment.rt_library_scope, RtLibraryScope::PerRun);
+        let new = Config::from_json(r#"{"experiment":{"rt_library_scope":"per_run"}}"#).unwrap();
+        assert_eq!(new.experiment.rt_library_scope, RtLibraryScope::PerRun);
+        // And the two spellings mean the same thing.
+        assert_eq!(
+            old.experiment.rt_library_scope,
+            new.experiment.rt_library_scope
+        );
+    }
+    #[test]
+    fn experiment_rt_library_scope_defaults_to_first_run_only() {
         // The expensive default must be the cheap one: paying a DeepLC fine-tune per run
         // is hours-to-days on a large experiment, and each run calibrates itself anyway.
         assert_eq!(
-            Config::default().experiment.finetune_scope,
-            FinetuneScope::FirstRunOnly
+            Config::default().experiment.rt_library_scope,
+            RtLibraryScope::FirstRunOnly
         );
         let c = Config::from_json("{}").expect("empty config parses");
-        assert_eq!(c.experiment.finetune_scope, FinetuneScope::FirstRunOnly);
+        assert_eq!(c.experiment.rt_library_scope, RtLibraryScope::FirstRunOnly);
         let c = Config::from_json(r#"{"experiment":{"finetune_scope":"per_run"}}"#)
             .expect("per_run parses");
-        assert_eq!(c.experiment.finetune_scope, FinetuneScope::PerRun);
+        assert_eq!(c.experiment.rt_library_scope, RtLibraryScope::PerRun);
         // Old configs that predate the section keep working.
         let c = Config::from_json(r#"{"experiment":{"parallel_runs":3}}"#).expect("parses");
         assert_eq!(c.experiment.parallel_runs, 3);
-        assert_eq!(c.experiment.finetune_scope, FinetuneScope::FirstRunOnly);
+        assert_eq!(c.experiment.rt_library_scope, RtLibraryScope::FirstRunOnly);
     }
 
     #[test]
