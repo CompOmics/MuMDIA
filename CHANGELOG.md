@@ -7,6 +7,16 @@ All notable changes to MuMDIA are recorded here. The format follows
 `0.1.0` is the first tagged release of the Rust engine. The superseded
 Python implementation remains available at the tag `legacy-python-v1`.
 
+`0.4.0` is a minor rather than a patch release: it changes results. Multi-head
+retention-time calibration is on by default, which on a six-file Astral experiment
+moved precursors from 113,961 to 131,646 and cost 1.4x to 1.7x wall clock; the
+library it produces is then adapted once per experiment rather than once per run,
+which gives about 1% of that back in exchange for removing N-1 full re-predictions.
+A run repeated across the upgrade will not reproduce its old counts or its old
+runtime. `predict_frag.predictor = "peptdeep"` is a new fragment-intensity
+predictor, and `experiment.finetune_scope` is now `experiment.rt_library_scope`
+(the old name still parses).
+
 `0.3.0` raises the DeepLC floor to 4.4.0, so every environment must be rebuilt
 before upgrading. It also adds multi-head retention-time calibration, off by
 default.
@@ -26,6 +36,8 @@ results: the per-artifact Parquet schema versions in
 than a number. Both are recorded in every run's `manifest.json`.
 
 ## [Unreleased]
+
+## [0.4.0] - 2026-09-14
 
 ### Fixed
 
