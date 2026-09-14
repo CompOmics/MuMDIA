@@ -155,6 +155,25 @@ pub struct Stage {
     pub artifacts: usize,
 }
 
+/// One file's stage progress inside a multi-file experiment.
+///
+/// `run-experiment` gives each input file its own output subdirectory (`r0`, `r1`, ...,
+/// or the `--run-names` the caller chose) and runs the per-file chain -- convert through
+/// compete -- in each, then does one pooled rescore/quant/report at the experiment root.
+///
+/// Without this the progress display could only aggregate by stage NAME across the whole
+/// tree, which made the ladder stop moving after the first file: once file 1 had reached
+/// the last stage, file 2's `convert` could not pull the "furthest stage seen" backwards,
+/// so five of six files ran with the display frozen on the first file's finish. The rows
+/// and elapsed figures were a sum across files as well, so they belonged to no file in
+/// particular.
+#[derive(Serialize, Clone, Debug, Default)]
+pub struct RunProgress {
+    /// The output subdirectory's name, which is what the engine logs as the run name.
+    pub name: String,
+    pub stages: Vec<Stage>,
+}
+
 /// Everything the results panel shows, taken from the scored table's own report.
 ///
 /// Read from disk rather than recomputed: `psms_scored.parquet.report.json` records
@@ -192,6 +211,11 @@ pub struct Snapshot {
     pub exit_code: Option<i32>,
     pub error: Option<String>,
     pub stages: Vec<Stage>,
+    /// Per-file progress, empty for a single run. See [`RunProgress`].
+    pub runs: Vec<RunProgress>,
+    /// Stages recorded at the experiment root rather than inside a run: the pooled
+    /// rescore, quant and report that follow every per-file chain.
+    pub root_stages: Vec<Stage>,
     pub log: Vec<String>,
     pub out_dir: String,
     /// The exact command line, so it can be shown, copied and reproduced.
@@ -326,6 +350,8 @@ impl Run {
             sweep_temp_files(out_dir);
         }
         let stages = scan_stages(out_dir);
+        let runs = scan_runs(out_dir);
+        let root_stages = scan_root_stages(out_dir);
         let results = read_results(out_dir);
         let status = terminal_status(cancelled, &outcome);
         // Released before the status is published, so a caller that sees the run end
@@ -333,6 +359,8 @@ impl Run {
         self.release_reservation();
         self.set(|s| {
             s.stages = stages;
+            s.runs = runs;
+            s.root_stages = root_stages;
             s.results = results;
             s.exit_code = outcome.as_ref().ok().and_then(|st| st.code());
             s.error = match (&outcome, status) {
@@ -377,6 +405,8 @@ fn new_run(id: &str, req: &Request, command: String, reservation: Option<String>
             exit_code: None,
             error: None,
             stages: Vec::new(),
+            runs: Vec::new(),
+            root_stages: Vec::new(),
             log: Vec::new(),
             out_dir: req.out_dir.clone(),
             command,
@@ -737,12 +767,16 @@ pub fn start(id: String, req: Request) -> Result<Arc<Run>, String> {
             let started = Instant::now();
             loop {
                 let stages = scan_stages(&out_dir);
+                let runs = scan_runs(&out_dir);
+                let root_stages = scan_root_stages(&out_dir);
                 // Written only while the run is still active, under the snapshot lock:
                 // once `publish_exit` has published, a scan that was in flight must not
                 // replace the finished snapshot's stages with whatever the folder holds
                 // now, which may already be a later run's contents (docs/30).
                 let still_active = run.set_if_active(|s| {
                     s.stages = stages;
+                    s.runs = runs;
+                    s.root_stages = root_stages;
                     s.elapsed_ms = started.elapsed().as_millis() as u64;
                 });
                 if !still_active {
@@ -826,32 +860,93 @@ pub fn history_entry(dir: &Path) -> Option<HistoryEntry> {
 }
 
 /// Fold every `*.report.json` under `dir` into one row per producing stage.
+/// Per-file progress for an experiment, or an empty list for a single run.
+///
+/// A subdirectory counts as a run when it holds at least one artifact report. Ordering
+/// is the engine's own: `r0`, `r1`, ... sort numerically rather than lexically, so `r10`
+/// does not land between `r1` and `r2`; any other name sorts by itself.
+fn scan_runs(dir: &Path) -> Vec<RunProgress> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut runs: Vec<RunProgress> = Vec::new();
+    for e in entries.flatten() {
+        let path = e.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let stages = scan_stages(&path);
+        if stages.is_empty() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        runs.push(RunProgress {
+            name: name.to_string(),
+            stages,
+        });
+    }
+    runs.sort_by(|a, b| run_order(&a.name).cmp(&run_order(&b.name)));
+    runs
+}
+
+/// Sort key for a run directory: the numeric suffix of `r<N>` first, then the name.
+fn run_order(name: &str) -> (u64, String) {
+    let n = name
+        .strip_prefix('r')
+        .and_then(|rest| rest.parse::<u64>().ok())
+        .unwrap_or(u64::MAX);
+    (n, name.to_string())
+}
+
+/// Stages whose reports sit directly in `dir`, not inside a run subdirectory.
+fn scan_root_stages(dir: &Path) -> Vec<Stage> {
+    let mut by_stage: BTreeMap<String, Stage> = BTreeMap::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    for e in entries.flatten() {
+        let f = e.path();
+        if !f.is_file() {
+            continue;
+        }
+        accumulate_stage(&f, &mut by_stage);
+    }
+    by_stage.into_values().collect()
+}
+
+/// Fold one `*.report.json` into `by_stage`, ignoring anything unreadable.
+fn accumulate_stage(f: &Path, by_stage: &mut BTreeMap<String, Stage>) {
+    if !f
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.ends_with(".report.json"))
+    {
+        return;
+    }
+    let Ok(text) = std::fs::read_to_string(f) else {
+        return;
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return;
+    };
+    let Some(stage) = v.get("stage").and_then(|s| s.as_str()) else {
+        return;
+    };
+    let e = by_stage.entry(stage.to_string()).or_insert_with(|| Stage {
+        name: stage.to_string(),
+        ..Default::default()
+    });
+    e.rows += v.get("rows").and_then(|r| r.as_u64()).unwrap_or(0);
+    e.elapsed_ms += v.get("elapsed_ms").and_then(|r| r.as_u64()).unwrap_or(0);
+    e.artifacts += 1;
+}
+
 fn scan_stages(dir: &Path) -> Vec<Stage> {
     let mut by_stage: BTreeMap<String, Stage> = BTreeMap::new();
     for f in walk(dir) {
-        if !f
-            .file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|n| n.ends_with(".report.json"))
-        {
-            continue;
-        }
-        let Ok(text) = std::fs::read_to_string(&f) else {
-            continue;
-        };
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
-            continue;
-        };
-        let Some(stage) = v.get("stage").and_then(|s| s.as_str()) else {
-            continue;
-        };
-        let e = by_stage.entry(stage.to_string()).or_insert_with(|| Stage {
-            name: stage.to_string(),
-            ..Default::default()
-        });
-        e.rows += v.get("rows").and_then(|r| r.as_u64()).unwrap_or(0);
-        e.elapsed_ms += v.get("elapsed_ms").and_then(|r| r.as_u64()).unwrap_or(0);
-        e.artifacts += 1;
+        accumulate_stage(&f, &mut by_stage);
     }
     by_stage.into_values().collect()
 }
@@ -1381,6 +1476,57 @@ mod tests {
         }
     }
 
+    #[test]
+    fn an_experiment_reports_progress_per_file_not_summed_across_them() {
+        // The bug this covers: stages were aggregated by NAME over the whole output
+        // tree, so once the first file finished the ladder could not move back to show
+        // the second file converting, and the row counts were a sum belonging to no file
+        // in particular. `r10` must also sort after `r2`, not between `r1` and `r2`.
+        let dir = scratch("experiment_progress");
+        let report = |rel: &str, stage: &str, rows: u64| {
+            let p = dir.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(
+                &p,
+                format!(r#"{{"stage":"{stage}","rows":{rows},"elapsed_ms":10}}"#),
+            )
+            .unwrap();
+        };
+        // Two finished files, a third mid-convert, a tenth, and the pooled tail at root.
+        report("r0/a.parquet.report.json", "compete", 100);
+        report("r1/a.parquet.report.json", "compete", 200);
+        report("r2/a.parquet.report.json", "convert", 7);
+        report("r10/a.parquet.report.json", "convert", 9);
+        report("scored.parquet.report.json", "rescore", 500);
+
+        let runs = scan_runs(&dir);
+        assert_eq!(
+            runs.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+            vec!["r0", "r1", "r2", "r10"],
+            "r10 sorts after r2, by its numeric suffix rather than lexically"
+        );
+        // Each file's counts are its own, not a sum over the experiment.
+        assert_eq!(runs[0].stages[0].rows, 100);
+        assert_eq!(runs[1].stages[0].rows, 200);
+        assert_eq!(runs[3].stages[0].name, "convert");
+        assert_eq!(runs[3].stages[0].rows, 9);
+
+        // The pooled tail belongs to the root, not to any file.
+        let root = scan_root_stages(&dir);
+        assert_eq!(root.len(), 1);
+        assert_eq!(root[0].name, "rescore");
+        assert!(
+            !root.iter().any(|st| st.name == "convert"),
+            "a file's stages must not leak into the root view"
+        );
+
+        // The deep aggregate still exists, and still sums, for a single run.
+        let all = scan_stages(&dir);
+        let convert = all.iter().find(|st| st.name == "convert").unwrap();
+        assert_eq!(convert.rows, 16, "7 + 9 across the two converting files");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     #[test]
     fn the_temp_sweep_removes_only_temp_files() {
         let dir = std::env::temp_dir().join(format!("mumdia_sweep_{}", std::process::id()));

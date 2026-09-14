@@ -1709,7 +1709,23 @@ async function loadHistory() {
 
 // ── rendering ───────────────────────────────────────────────────────────────
 function render(s) {
-  const seen = new Map(s.stages.map((x) => [x.name, x]));
+  // In a pooled experiment the engine runs the per-file chain -- convert through
+  // compete -- once per input file, in that file's own subdirectory, and then does a
+  // single rescore/quant/report at the experiment root. Aggregating by stage NAME
+  // across the whole tree, which is all this had before, meant the ladder stopped
+  // moving after the first file: once file 1 had reached the end, file 2's `convert`
+  // could not pull "the furthest stage seen" backwards, so the remaining files ran
+  // with the display frozen. The counts were a sum across files as well, so they
+  // described no file in particular.
+  //
+  // So track the file that is actually running: the last one with any stage. Its
+  // per-file stages plus the root's pooled ones are the ladder; the subtitle says
+  // which file of how many.
+  const active = (s.runs || []).length ? s.runs[s.runs.length - 1] : null;
+  const perFile = active
+    ? [...(active.stages || []), ...(s.root_stages || [])]
+    : s.stages;
+  const seen = new Map(perFile.map((x) => [x.name, x]));
   const expected = STAGES_FASTA.filter(
     ([key]) => !(s.library_mode && SKIP_IN_LIBRARY_MODE.has(key))
   );
@@ -1769,6 +1785,12 @@ function render(s) {
 
   const done = expected.filter(([k]) => seen.has(k)).length;
   const parts = [];
+  // `s.runs` only has entries once a file has written something, so during the very
+  // first file it reads "file 1 of n" rather than "0".
+  if (active && (s.runs || []).length && s.status === "running") {
+    const total = state.picks.mzml.length || s.runs.length;
+    parts.push(`file ${Math.min(s.runs.length, total)} of ${total}`);
+  }
   if (s.status === "running") parts.push(`stage ${Math.min(done + 1, expected.length)} of ${expected.length}`);
   if (s.elapsed_ms) parts.push(fmtDuration(s.elapsed_ms));
   if (s.status === "cancelled") parts.push("partial results were discarded");
