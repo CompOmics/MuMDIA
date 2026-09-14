@@ -27,6 +27,18 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ## [Unreleased]
 
+### Fixed
+
+- The desktop progress ladder stopped moving after the first file of a multi-file
+  experiment. Stages were aggregated by NAME across the whole output tree, so once file
+  1 had reached the last stage, file 2's `convert` could not pull "the furthest stage
+  seen" backwards, and the remaining files ran with the display frozen on the first
+  file's finish. The row and time figures were a sum across files as well, describing no
+  file in particular: on a six-file Astral experiment `extract` read 87.8M rows from 12
+  artifacts. The run snapshot now carries per-file progress (`runs`) and the pooled tail
+  (`root_stages`) separately, and the display follows the file that is actually running
+  and says "file k of n".
+
 ### Changed
 
 - **`rt_im_train.multihead_calibration` is now the default.** Left unset it calibrates the
