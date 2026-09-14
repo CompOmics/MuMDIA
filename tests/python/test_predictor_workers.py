@@ -571,3 +571,60 @@ def test_peptdeep_worker_rejects_a_bad_device_request(tmp_path):
     )
     assert rc != 0
     assert "must be auto, cuda or cpu" in err
+
+
+# ---------------------------------------------------- DeepLC progress-line filtering
+
+@pytest.mark.parametrize("script", ["deeplc_worker.py", "deeplc_finetune.py"])
+def test_deeplc_workers_filter_the_blank_progress_lines(script):
+    """Both DeepLC workers must route their prediction through the stdout filter.
+
+    DeepLC's progress writer emits a bare `\r\n` per update when stdout is not a
+    terminal. The engine INHERITS a worker's stdout rather than capturing it
+    (`sidecar.rs::run_worker`), so those lines reach the terminal, any redirected log
+    file, and the desktop application's run log. Measured before the filter: 5,697 blank
+    lines from one 2.9M-peptide prediction, and 98-99% of two real run logs.
+
+    A static check because the behaviour is only visible with DeepLC installed and a
+    large enough prediction; what it guards is that the wrapper does not get dropped in
+    a refactor.
+    """
+    text = _source(script)
+    assert "class _DropBlankProgress" in text, "the filter itself is gone"
+    assert "quiet_deeplc_progress" in text, "the context manager is gone"
+    assert text.count("with quiet_deeplc_progress():") >= 1, "nothing is wrapped in it"
+    # The escape hatch has to stay too: it is the only way to see raw worker output.
+    assert "MUMDIA_DEEPLC_RAW_OUTPUT" in text
+
+
+def test_deeplc_progress_filter_keeps_content_and_drops_blanks():
+    """The filter drops only what says nothing, and keeps order.
+
+    Exercised on `deeplc_finetune.py`, whose module body does not need DeepLC beyond the
+    version probe; the class is plain stdlib.
+    """
+    import io as _io
+
+    importorskip_any("deeplc")
+    module = _load_finetune_worker()
+
+    sink = _io.StringIO()
+    proxy = module._DropBlankProgress(sink)
+    proxy.write("\r")                       # a bare progress update
+    proxy.write("\r\n")                     # and another
+    proxy.write("real message\n")
+    proxy.write("   \r\n")                  # whitespace only
+    proxy.write("second\n")
+    proxy.write("trailing without newline")
+    proxy.close()
+
+    assert sink.getvalue() == "real message\nsecond\ntrailing without newline"
+
+
+def _load_finetune_worker():
+    spec = importlib.util.spec_from_file_location(
+        "mumdia_deeplc_finetune_filter", SCRIPTS / "deeplc_finetune.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
