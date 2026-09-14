@@ -887,7 +887,7 @@ fn scan_runs(dir: &Path) -> Vec<RunProgress> {
             stages,
         });
     }
-    runs.sort_by(|a, b| run_order(&a.name).cmp(&run_order(&b.name)));
+    runs.sort_by_key(|r| run_order(&r.name));
     runs
 }
 
