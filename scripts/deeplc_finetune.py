@@ -32,6 +32,8 @@ os.environ["MKL_NUM_THREADS"] = "1"
 os.environ["NUMEXPR_NUM_THREADS"] = "1"
 
 import argparse
+import contextlib
+import io
 import json
 import math
 import re
@@ -86,6 +88,72 @@ strip_mods = lambda s: re.sub(r"\[[^\]]*\]", "", s)
 # (un-fine-tuned) iRT, landing on a different scale than the fine-tuned targets.
 base_pf = lambda s: s[6:] if s.startswith("DECOY_") else s
 
+
+
+class _DropBlankProgress(io.TextIOBase):
+    """`sys.stdout` with DeepLC's empty progress writes removed.
+
+    DeepLC's prediction loop writes a carriage-return progress indicator that renders as
+    nothing when stdout is not a terminal, so every update arrives as a bare `\r\n`.
+    Measured on a real library build: 5,697 blank lines from a 2.9M-peptide prediction,
+    99% of the entire log. The engine INHERITS a worker's stdout rather than capturing it
+    (`sidecar.rs::run_worker`, deliberately, so long-running progress reaches the user
+    live), so those lines land in the terminal, in any redirected log file, and in the
+    desktop application's run log, where they push the real messages out of view.
+
+    Only segments that are empty once carriage returns and whitespace are stripped get
+    dropped. Anything DeepLC actually says still comes through, in order, and stderr --
+    where a traceback goes -- is not touched at all. Set `MUMDIA_DEEPLC_RAW_OUTPUT=1` to
+    disable the filter when debugging the worker itself.
+
+    `\r` counts as a terminator as well as `\n`: a progress writer that never emits a
+    newline would otherwise accumulate in the buffer for the whole run.
+    """
+
+    def __init__(self, inner):
+        self._inner = inner
+        self._buf = ""
+
+    def write(self, s):
+        self._buf += s
+        while True:
+            i = min(
+                (p for p in (self._buf.find("\n"), self._buf.find("\r")) if p >= 0),
+                default=-1,
+            )
+            if i < 0:
+                break
+            line, self._buf = self._buf[:i], self._buf[i + 1 :]
+            if line.strip():
+                self._inner.write(line + "\n")
+                self._inner.flush()
+        return len(s)
+
+    def flush(self):
+        self._inner.flush()
+
+    def close(self):
+        # Whatever is left had no terminator; emit it if it says anything.
+        if self._buf.strip():
+            self._inner.write(self._buf)
+        self._buf = ""
+        self._inner.flush()
+
+
+@contextlib.contextmanager
+def quiet_deeplc_progress():
+    """Install the filter for the duration of a block, unless disabled by env."""
+    if os.environ.get("MUMDIA_DEEPLC_RAW_OUTPUT", "").strip() not in ("", "0"):
+        yield
+        return
+    original = sys.stdout
+    proxy = _DropBlankProgress(original)
+    sys.stdout = proxy
+    try:
+        yield
+    finally:
+        proxy.close()
+        sys.stdout = original
 
 def is_std(pf):
     # Same predicate as `all(c in STD for c in strip_mods(base_pf(pf)))`, but the regex
@@ -160,7 +228,8 @@ def fit_multihead(args, ref_psms):
     print(f"multi-head calibration: fitting up to {args.multihead} heads against "
           f"{len(ref_psms)} anchors", flush=True)
     t0 = time.time()
-    cal = deeplc.calibrate(psm_list_reference=ref_psms, calibration=cal)
+    with quiet_deeplc_progress():
+        cal = deeplc.calibrate(psm_list_reference=ref_psms, calibration=cal)
     idx = getattr(cal, "_head_idx", None)
     n_fitted = 0 if idx is None else len(idx)
     print(f"multi-head calibration: {n_fitted} heads combined, best head "
@@ -332,33 +401,38 @@ def main():
     preds = {}
     chunk = 100_000
     t_pred0 = time.time()
-    for s in range(0, len(uniq), chunk):
-        t0 = time.time()
-        batch = uniq[s:s + chunk]
-        if calibration is not None:
-            # The calibration is already fitted, so this only predicts and transforms: it
-            # pulls the head columns the ridge reads rather than materialising all 6,543,
-            # which at library scale would be terabytes. The reference is passed again
-            # because the signature requires one; the fitting step is skipped.
-            p = agg(deeplc.predict_and_calibrate(
-                batch, psm_list_reference=ref_for_transform, calibration=calibration))
-        else:
-            p = agg(deeplc.predict(batch) if ft_model is None else deeplc.predict(batch, model=ft_model))
-        # A structurally short or long answer is a broken predictor, not a set of
-        # unsupported peptidoforms: zipping it silently paired predictions with the wrong
-        # peptidoforms and left the tail on its imported value (docs/30 R6).
-        if len(p) != len(batch):
-            raise SystemExit(
-                f"DeepLC returned {len(p)} predictions for {len(batch)} peptidoforms in one "
-                f"batch; refusing to rewrite the library from a malformed response")
-        for pf, v in zip(batch, p):
-            preds[pf] = float(v)
-        done = min(s + chunk, len(uniq))
-        dt = time.time() - t0
-        rate = len(batch) / dt if dt > 0 else float("inf")
-        eta = (len(uniq) - done) / rate if rate > 0 else float("nan")
-        print(f"  {done}/{len(uniq)}  {dt:.1f}s for this chunk "
-              f"({rate:.0f} peptidoforms/s, ETA {eta / 60:.1f} min)", flush=True)
+    # DeepLC's progress writer emits one blank line per update when stdout is not a
+    # terminal, and the engine inherits this worker's stdout, so a real run was 98%
+    # blank lines. The per-chunk progress printed inside the loop is not blank and
+    # still comes through.
+    with quiet_deeplc_progress():
+        for s in range(0, len(uniq), chunk):
+            t0 = time.time()
+            batch = uniq[s:s + chunk]
+            if calibration is not None:
+                # The calibration is already fitted, so this only predicts and transforms: it
+                # pulls the head columns the ridge reads rather than materialising all 6,543,
+                # which at library scale would be terabytes. The reference is passed again
+                # because the signature requires one; the fitting step is skipped.
+                p = agg(deeplc.predict_and_calibrate(
+                    batch, psm_list_reference=ref_for_transform, calibration=calibration))
+            else:
+                p = agg(deeplc.predict(batch) if ft_model is None else deeplc.predict(batch, model=ft_model))
+            # A structurally short or long answer is a broken predictor, not a set of
+            # unsupported peptidoforms: zipping it silently paired predictions with the wrong
+            # peptidoforms and left the tail on its imported value (docs/30 R6).
+            if len(p) != len(batch):
+                raise SystemExit(
+                    f"DeepLC returned {len(p)} predictions for {len(batch)} peptidoforms in one "
+                    f"batch; refusing to rewrite the library from a malformed response")
+            for pf, v in zip(batch, p):
+                preds[pf] = float(v)
+            done = min(s + chunk, len(uniq))
+            dt = time.time() - t0
+            rate = len(batch) / dt if dt > 0 else float("inf")
+            eta = (len(uniq) - done) / rate if rate > 0 else float("nan")
+            print(f"  {done}/{len(uniq)}  {dt:.1f}s for this chunk "
+                  f"({rate:.0f} peptidoforms/s, ETA {eta / 60:.1f} min)", flush=True)
     print(f"prediction phase: {time.time() - t_pred0:.1f}s total", flush=True)
 
     new, summary = rewrite_irt(pform, orig, preds)
