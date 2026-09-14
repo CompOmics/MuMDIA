@@ -19,7 +19,7 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use arrow::array::{Array, BooleanArray, UInt32Array};
 use arrow::compute::filter_record_batch;
-use mumdia_core::config::{Config, FinetuneScope, QuantQColumn};
+use mumdia_core::config::{Config, QuantQColumn, RtLibraryScope};
 use mumdia_core::manifest::Manifest;
 use mumdia_core::schema::artifact;
 use rayon::prelude::*;
@@ -172,7 +172,7 @@ fn process_run(
     out: &str,
     top_peaks_ms2: usize,
     max_spectra: usize,
-    shared_ft: Option<&str>,
+    shared_rt_lib: Option<&str>,
 ) -> Result<(String, String, Option<String>)> {
     let d = |name: &str| format!("{out}/{name}");
     std::fs::create_dir_all(out).ok();
@@ -205,20 +205,23 @@ fn process_run(
         bucket_size: cfg.extract.bucket_size,
         config_hash: ch,
     })?;
-    // DeepLC fine-tune. Under `FinetuneScope::FirstRunOnly` the caller hands every run
+    // DeepLC fine-tune. Under `RtLibraryScope::FirstRunOnly` the caller hands every run
     // after the first the library the first run produced, so the fine-tune -- the most
     // expensive step in the whole experiment -- is paid once. Run-to-run chromatographic
     // drift is then absorbed by `rt_im_train`'s per-run calibration below, which is fitted
     // separately for every run regardless.
-    let mut produced_ft: Option<String> = None;
+    let mut produced_rt_lib: Option<String> = None;
     let has_deeplc = cfg.predict_frag.deeplc_python.is_some();
     let mh_heads = cfg
         .rt_im_train
         .multihead_heads(has_deeplc, cfg.deeplc_rt_source(library_input, has_deeplc));
-    let lib_p = if mh_heads > 0 {
-        // Per run, always, and never shared: the whole point is that it is fitted against
-        // THIS run's chromatography. `shared_ft` cannot be set here, because sharing is
-        // gated on `finetune_deeplc`, which validation forbids alongside this.
+    let lib_p = if let Some(shared) = shared_rt_lib {
+        // A previous run already adapted the library and `experiment.rt_library_scope`
+        // says to reuse it. Which mechanism produced it does not matter here: the
+        // fine-tune and multi-head both hand back a precursor table with rewritten
+        // retention times, and this run fits its own LOESS on top either way.
+        shared.to_string()
+    } else if mh_heads > 0 {
         let python = cfg
             .predict_frag
             .deeplc_python
@@ -240,9 +243,8 @@ fn process_run(
             cfg.rt_im_train.window_holdout_frac,
             rayon::current_num_threads(),
         )?;
+        produced_rt_lib = Some(lib_p_mh.clone());
         lib_p_mh
-    } else if let Some(ft) = shared_ft {
-        ft.to_string()
     } else if cfg.rt_im_train.finetune_deeplc {
         let python = cfg
             .predict_frag
@@ -269,7 +271,7 @@ fn process_run(
             cfg.rt_im_train.window_holdout_frac,
             cfg.rng_seed,
         )?;
-        produced_ft = Some(lib_p_ft.clone());
+        produced_rt_lib = Some(lib_p_ft.clone());
         lib_p_ft
     } else {
         lib_p_base.to_string()
@@ -315,7 +317,7 @@ fn process_run(
         cfg: &cfg.compete,
         config_hash: ch,
     })?;
-    Ok((competed, chrom, produced_ft))
+    Ok((competed, chrom, produced_rt_lib))
 }
 
 /// Split an experiment-wide scored table into per-run tables by the `source`
@@ -618,14 +620,35 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
     let mut competed: Vec<String> = Vec::with_capacity(n_runs);
     let mut chroms: Vec<String> = Vec::with_capacity(n_runs);
 
-    // Under `FinetuneScope::FirstRunOnly` (the default) the first run is processed alone so
-    // its DeepLC fine-tune can be handed to all the others. That fine-tune is the most
-    // expensive step in a large experiment -- tens of minutes per run -- so paying it N
-    // times instead of once is the difference between hours and days on an 80-run batch.
-    // Every run still fits its OWN retention-time calibration (LOESS by default) against
-    // that shared library, and that per-run fit is what absorbs chromatographic drift.
-    let share_ft = cfg.rt_im_train.finetune_deeplc
-        && matches!(cfg.experiment.finetune_scope, FinetuneScope::FirstRunOnly)
+    // Under `RtLibraryScope::FirstRunOnly` (the default) the first run is processed alone
+    // so the library it adapted can be handed to all the others. That adaptation -- the
+    // DeepLC fine-tune, or multi-head calibration -- is the most expensive step in a large
+    // experiment: one full re-prediction of the library per run, tens of minutes on a
+    // 9.4M-row library, so paying it N times instead of once is the difference between
+    // hours and days on a large batch. Every run still fits its OWN retention-time
+    // calibration (LOESS by default) against that shared library, and that per-run fit is
+    // what absorbs chromatographic drift.
+    //
+    // Multi-head was per-run unconditionally until 2026-09-14, on the reasoning that it is
+    // fitted against THIS run's chromatography. That is true, and it is also true of the
+    // fine-tune, which has been shareable all along: what a shared library fixes is elution
+    // ORDER, which replicate injections on one method share. A batch that genuinely
+    // reorders wants `per_run`.
+    // Resolved exactly as `process_run` resolves it, so the decision to process the first
+    // run alone matches what that run will actually do.
+    let has_deeplc_for_scope = cfg.predict_frag.deeplc_python.is_some();
+    let deeplc_rt_source_for_scope =
+        cfg.deeplc_rt_source(p.lib_precursors.is_some(), has_deeplc_for_scope);
+    let adapts_rt_library = cfg.rt_im_train.finetune_deeplc
+        || cfg
+            .rt_im_train
+            .multihead_heads(has_deeplc_for_scope, deeplc_rt_source_for_scope)
+            > 0;
+    let share_ft = adapts_rt_library
+        && matches!(
+            cfg.experiment.rt_library_scope,
+            RtLibraryScope::FirstRunOnly
+        )
         && n_runs > 1;
     let mut shared_ft: Option<String> = None;
     let mut first: usize = 0;
@@ -633,7 +656,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         info!(
             run = %names[0],
             n = n_runs,
-            "run-experiment: fine-tuning DeepLC on the first run only; the remaining runs              reuse that library and fit their own RT calibration on it              (experiment.finetune_scope = per_run to fine-tune every run instead)"
+            "run-experiment: adapting the library's retention times on the first run only;              the remaining runs reuse that library and fit their own RT calibration on it              (experiment.rt_library_scope = per_run to adapt for every run instead)"
         );
         let (comp, chrom, ft) = process_run(
             cfg,
@@ -651,7 +674,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         chroms.push(chrom);
         match ft {
             Some(path) => {
-                info!(library = %path, "run-experiment: reusing this fine-tuned library for the remaining runs");
+                info!(library = %path, "run-experiment: reusing this adapted library for the remaining runs");
                 shared_ft = Some(path);
             }
             // Defensive: `share_ft` implies the first run fine-tunes, so this should not
@@ -923,7 +946,10 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
     let rt_identity = if mh_heads > 0 {
         crate::sidecar::deeplc_identity(deeplc_py, &format!("multihead-{mh_heads}"))
     } else if cfg.rt_im_train.finetune_deeplc {
-        if matches!(cfg.experiment.finetune_scope, FinetuneScope::FirstRunOnly) {
+        if matches!(
+            cfg.experiment.rt_library_scope,
+            RtLibraryScope::FirstRunOnly
+        ) {
             crate::sidecar::deeplc_identity(deeplc_py, "finetuned-first-run")
         } else {
             crate::sidecar::deeplc_identity(deeplc_py, "finetuned-per-run")

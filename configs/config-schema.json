@@ -32,7 +32,7 @@
       "default_text": "0",
       "help": "",
       "gates": [],
-      "source_line": 1832
+      "source_line": 1854
     },
     {
       "path": "convert.thermo_raw_parser",
@@ -2384,20 +2384,20 @@
       "default_text": "1",
       "help": "How many per-run search chains to execute concurrently. 1 (default) is strictly sequential, i.e. the historical behaviour. Runs are independent, so raising this scales nearly linearly in wall time, but EACH concurrent run holds its own extraction working set (tens of GB on a large library), so the practical ceiling is memory, not cores. Raise it deliberately after checking peak RSS for a single run; 2-4 is a reasonable start on a large-memory machine. Results are unaffected: chunks are processed in index order and completion order never reaches the output.",
       "gates": [],
-      "source_line": 1812
+      "source_line": 1816
     },
     {
-      "path": "experiment.finetune_scope",
-      "name": "finetune_scope",
+      "path": "experiment.rt_library_scope",
+      "name": "rt_library_scope",
       "section": "experiment",
-      "rust_type": "FinetuneScope",
+      "rust_type": "RtLibraryScope",
       "kind": "enum",
       "optional": false,
       "default": "first_run_only",
       "default_text": "`first_run_only`",
-      "help": "Whether the DeepLC fine-tune runs once for the experiment or once per run. Only consulted when `rt_im_train.finetune_deeplc` is set.",
+      "help": "How often the library's retention times are adapted to a run: once on the first run and reused (`first_run_only`, the default) or separately for every run (`per_run`). Governs whichever adaptation is active -- `rt_im_train.finetune_deeplc` or `rt_im_train.multihead_calibration` -- because they are the same shape of work: one full re-prediction of the library against that run's confident seed PSMs, which on a 9.4M-row library is the most expensive step in the experiment. Each run then fits its own LOESS on top of whichever library it was given, and that per-run fit is what absorbs chromatographic drift. Accepts the old name `finetune_scope`, which is what it was called when only the fine-tune could be shared. `first_run_only` assumes the runs share an elution ORDER, which replicate injections on one LC method do. A per-run LOESS can stretch and bend the axis but cannot reorder two peptides, so a batch that genuinely reorders -- different gradients, different columns, a method change part-way -- wants `per_run`, and so does a long batch where drift accumulates (see the measured cost above).",
       "gates": [],
-      "source_line": 1815,
+      "source_line": 1837,
       "choices": [
         "first_run_only",
         "per_run"

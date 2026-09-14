@@ -72,7 +72,7 @@ undocumented on purpose; those fields are counted under "Coverage".
 
 ## (top level)
 
-`Config` (rust/mumdia/crates/mumdia-core/src/config.rs:1829). stage document: [docs/02_config_and_data_model.md](02_config_and_data_model.md).
+`Config` (rust/mumdia/crates/mumdia-core/src/config.rs:1851). stage document: [docs/02_config_and_data_model.md](02_config_and_data_model.md).
 
 | Field | Type | Default | Gated | Description |
 |---|---|---|---|---|
@@ -374,14 +374,14 @@ Composable per-claimant weight cues for `PeakClaim::CoelutionMultiCue` (the modu
 
 ## experiment
 
-`ExperimentConfig` (rust/mumdia/crates/mumdia-core/src/config.rs:1802). stage document: [docs/01_overview_and_dataflow.md](01_overview_and_dataflow.md).
+`ExperimentConfig` (rust/mumdia/crates/mumdia-core/src/config.rs:1806). stage document: [docs/01_overview_and_dataflow.md](01_overview_and_dataflow.md).
 
 Options for the experiment-wide orchestrator (`mumdia run-experiment`).
 
 | Field | Type | Default | Gated | Description |
 |---|---|---|---|---|
 | `parallel_runs` | `usize` | `1` |  | How many per-run search chains to execute concurrently. 1 (default) is strictly sequential, i.e. the historical behaviour. Runs are independent, so raising this scales nearly linearly in wall time, but EACH concurrent run holds its own extraction working set (tens of GB on a large library), so the practical ceiling is memory, not cores. Raise it deliberately after checking peak RSS for a single run; 2-4 is a reasonable start on a large-memory machine. Results are unaffected: chunks are processed in index order and completion order never reaches the output. |
-| `finetune_scope` | `FinetuneScope` | `first_run_only` |  | Whether the DeepLC fine-tune runs once for the experiment or once per run. Only consulted when `rt_im_train.finetune_deeplc` is set. |
+| `rt_library_scope` | `RtLibraryScope` | `first_run_only` |  | How often the library's retention times are adapted to a run: once on the first run and reused (`first_run_only`, the default) or separately for every run (`per_run`). Governs whichever adaptation is active -- `rt_im_train.finetune_deeplc` or `rt_im_train.multihead_calibration` -- because they are the same shape of work: one full re-prediction of the library against that run's confident seed PSMs, which on a 9.4M-row library is the most expensive step in the experiment. Each run then fits its own LOESS on top of whichever library it was given, and that per-run fit is what absorbs chromatographic drift. Accepts the old name `finetune_scope`, which is what it was called when only the fine-tune could be shared. `first_run_only` assumes the runs share an elution ORDER, which replicate injections on one LC method do. A per-run LOESS can stretch and bend the axis but cannot reorder two peptides, so a batch that genuinely reorders -- different gradients, different columns, a method change part-way -- wants `per_run`, and so does a long batch where drift accumulates (see the measured cost above). |
 
 ## peptidoforms.fixed_mods[] / peptidoforms.variable_mods[]
 
@@ -500,17 +500,6 @@ Named feature list for `RescoreConfig::feature_preset`.
 | `rich` |  |  |
 | `extended` |  | Minimal + Rich + the extended battery (DIA-NN / OpenSWATH / AlphaDIA / MS2Rescore / OktoberFest analogs + novel families) from the per-family modules in `stages/features/`. Superset, opt-in; the classifier picks the signal it can use (esp. under the nonlinear `Entrapment` rescorer). |
 
-### `FinetuneScope`
-
-(rust/mumdia/crates/mumdia-core/src/config.rs:1739)
-
-How many DeepLC fine-tunes an experiment pays for.
-
-| Value | Default | Description |
-|---|---|---|
-| `first_run_only` | yes | Fine-tune DeepLC once, on the FIRST run's confident seeds, and reuse that library for every run. Each run still fits its OWN retention-time calibration (LOESS by default) on top of it. MEASURED COST (6-run ProteoBench HYE AIF set, 2026-07-28). Reuse is NOT free: the run that owned the fine-tune reached a median \|RT residual\| of 15.2 s, while the five reusing runs reached 20.3, 20.5, 20.9, 24.9 and 25.4 s -- +7.2 s, +47% on average -- and their calibrated RT windows widened from 145 s to 179-227 s. The degradation is MONOTONIC in acquisition order, i.e. real chromatographic drift that a single fine-tune cannot track; per-run LOESS corrects the slope (0.96-0.99) but not the scatter. Wider windows also cost compute downstream: extract roughly doubled (126 s -> 203-242 s) and features up to tripled (116 s -> 215-388 s), which claws back part of the saving. It is still the default because the fine-tune dominates a large experiment: one 36.5 min fine-tune instead of N. On an 80-run batch that is ~48 h saved against ~6.5 h of extra extract/features. But on a long batch the drift keeps growing, so prefer `PerRun` when the extra hours are affordable, and treat periodic re-fine-tuning (not yet implemented) as the better answer for very large batches. |
-| `per_run` |  | Fine-tune separately for every run. Adapts the model weights to each run's own chromatography instead of only calibrating a shared model, which measurably tightens retention time: see the numbers on `FirstRunOnly`. Costs one full DeepLC fine-tune per run (36.5 min on the HYE library: 5.7 min training plus 30.8 min predicting 4.9M peptidoforms). |
-
 ### `FragPredictorKind`
 
 (rust/mumdia/crates/mumdia-core/src/config.rs:91)
@@ -548,7 +537,7 @@ Spectral-agreement score the extraction acceptance gate (`gate_min_score`) thres
 
 ### `Handoff`
 
-(rust/mumdia/crates/mumdia-core/src/config.rs:1772)
+(rust/mumdia/crates/mumdia-core/src/config.rs:1776)
 
 How the feature matrix crosses the Rust -> Python boundary for a sidecar rescorer.
 
@@ -667,6 +656,17 @@ Which q-value column quant filters candidates on. Peptide- or precursor-level q 
 |---|---|---|
 | `top_n_sum` | yes | Sum of the top-N most abundant peptides (single-run default). |
 | `sum` |  | Sum of all group peptides. |
+
+### `RtLibraryScope`
+
+(rust/mumdia/crates/mumdia-core/src/config.rs:1739)
+
+How many DeepLC fine-tunes an experiment pays for.
+
+| Value | Default | Description |
+|---|---|---|
+| `first_run_only` | yes | Adapt the library's retention times once, on the FIRST run's confident seeds, and reuse that library for every run. Each run still fits its OWN retention-time calibration (LOESS by default) on top of it. "Adapt" is whichever of the two mechanisms is active: the DeepLC fine-tune, or multi-head calibration. They occupy the same slot, cost the same kind of time -- one full re-prediction of the library per run -- and are amortised the same way. MEASURED COST (6-run ProteoBench HYE AIF set, 2026-07-28). Reuse is NOT free: the run that owned the fine-tune reached a median \|RT residual\| of 15.2 s, while the five reusing runs reached 20.3, 20.5, 20.9, 24.9 and 25.4 s -- +7.2 s, +47% on average -- and their calibrated RT windows widened from 145 s to 179-227 s. The degradation is MONOTONIC in acquisition order, i.e. real chromatographic drift that a single fine-tune cannot track; per-run LOESS corrects the slope (0.96-0.99) but not the scatter. Wider windows also cost compute downstream: extract roughly doubled (126 s -> 203-242 s) and features up to tripled (116 s -> 215-388 s), which claws back part of the saving. It is still the default because the fine-tune dominates a large experiment: one 36.5 min fine-tune instead of N. On an 80-run batch that is ~48 h saved against ~6.5 h of extra extract/features. But on a long batch the drift keeps growing, so prefer `PerRun` when the extra hours are affordable, and treat periodic re-fine-tuning (not yet implemented) as the better answer for very large batches. |
+| `per_run` |  | Fine-tune separately for every run. Adapts the model weights to each run's own chromatography instead of only calibrating a shared model, which measurably tightens retention time: see the numbers on `FirstRunOnly`. Costs one full DeepLC fine-tune per run (36.5 min on the HYE library: 5.7 min training plus 30.8 min predicting 4.9M peptidoforms). |
 
 ### `RtPredictorKind`
 
