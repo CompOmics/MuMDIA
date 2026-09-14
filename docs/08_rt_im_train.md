@@ -507,6 +507,38 @@ orchestrators and the `library_irt` predicate cannot disagree about whether it r
 `model_identities.rt_predictor` records what actually happened (`multihead-80` against
 `deeplc-4.4.0-base`).
 
+#### Sharing the adapted library across an experiment (2026-09-14)
+
+`experiment.rt_library_scope` governs multi-head as well as the fine-tune since
+2026-09-14. Measured on the six-file Astral experiment, one binary, configurations
+differing only in that field:
+
+| | per run | first run only |
+|---|---|---|
+| precursors at 1% | 128,006 | 126,762 (**-0.97%**) |
+| stripped peptides at 1% | 115,924 | 114,704 (**-1.05%**) |
+| protein groups at 1% | 12,201 | 12,287 (+0.70%) |
+| target PSMs at pooled 1% | 536,462 | 531,107 (-1.00%) |
+| empirical decoy fraction | 0.0100 | 0.0100 |
+| `w_rt`, the run that owns the fit | 22.1 s | 22.1 s |
+| `w_rt`, the five reusing runs | 20.8-23.2 s | **34.9-37.9 s** |
+| per-file chain, the reusing runs | full re-prediction each | **1.9-3.4 min** |
+
+Read it as a deliberate trade rather than a free win. Sharing costs about 1% of
+precursors and peptides and gives back 55% of the window narrowing multi-head's gain came
+from: the five reusing runs go from a mean `w_rt` of 22.0 s to 34.1 s. What it buys is
+the re-prediction itself -- five full passes over a 9.4M-row library removed, the reusing
+files finishing their chain in minutes instead of the better part of an hour.
+
+The empirical decoy fraction is 0.0100 in both arms, so the 1% is lost identifications
+rather than a moved threshold. Protein groups go the other way by 0.7%, which is within
+the noise this comparison can resolve on a single pair of runs.
+
+`first_run_only` stays the default on that basis, and it is the same default the
+fine-tune has always had on a considerably worse trade (+47% median RT residual across
+the reusing runs). Set `per_run` when the last percent matters more than the hours, when
+the runs do not share an elution order, or on a long batch where drift accumulates.
+
 **Cost, and how to amortise it.** The calibration re-predicts the whole library against a
 run's own anchors, which on a 9.4M-row library is the most expensive step in the
 experiment: 1.4x wall clock on AIF and 1.7x on Astral when every run pays it.

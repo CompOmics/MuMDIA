@@ -43,9 +43,17 @@ than a number. Both are recorded in every run's `manifest.json`.
   Under the default `first_run_only` the first run adapts the library and the rest reuse
   it. Set `per_run` for a batch that genuinely reorders -- different gradients or
   columns, a method change part-way -- or a long batch where drift accumulates; the
-  fine-tune's measured cost of sharing (+47% median RT residual across five reusing runs,
-  monotonic in acquisition order) is the guide until the multi-head equivalent is
-  measured.
+  Measured on the six-file Astral experiment: sharing costs 0.97% of precursors and
+  1.05% of peptides (128,006 -> 126,762 and 115,924 -> 114,704), gains 0.70% of protein
+  groups, and leaves the empirical decoy fraction at 0.0100, so the 1% is lost
+  identifications rather than a moved threshold. It gives back 55% of the window
+  narrowing multi-head's gain came from -- the five reusing runs go from a mean `w_rt`
+  of 22.0 s to 34.1 s -- and in exchange removes five full re-predictions of a 9.4M-row
+  library, finishing those files' chains in 1.9-3.4 minutes each.
+
+  `first_run_only` stays the default on that trade. Set `per_run` when the last percent
+  matters more than the hours, when the runs do not share an elution order, or on a long
+  batch where drift accumulates.
 
 - **`rt_im_train.multihead_calibration` is now the default.** Left unset it calibrates the
   DeepLC base model over 80 of its best-correlating LC-setup heads against each run's own
