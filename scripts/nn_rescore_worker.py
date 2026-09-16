@@ -18,7 +18,9 @@ positives, all decoys negatives -> train the MLP from scratch -> rescore} for
 
 MEMORY (multi-run / large PINs): two feature backends behind one accessor.
     - in-memory (default for PINs <= MUMDIA_NN_STREAM_GB, 4 GB): the full standardised
-      feature matrix is held in RAM. Mean/std standardisation, the same as the streaming
+      feature matrix is held in RAM, and not much else: one n x features float32 block plus
+      one fold's gathered training rows. The load is streamed row group by row group and
+      its transients are returned to the OS before training starts. Mean/std standardisation, the same as the streaming
       backend: one transform for every backend and every handoff, so a score does not
       depend on which one ran (docs/31 F5).
     - streaming memmap (large PINs, or MUMDIA_NN_STREAM=1): the PIN is read ONCE in
@@ -109,7 +111,22 @@ Env knobs (all optional):
                                      one. Forcing gives a device-only comparison within one
                                      environment; cuda errors out rather than silently
                                      falling back to CPU on a CPU-only torch build.
-    MUMDIA_NN_THREADS     = 16       torch CPU threads (0 = leave torch's default)
+    MUMDIA_NN_THREADS     = 16       torch CPU threads asked for (0 = leave torch's default);
+                                     the engine passes its --threads here
+    MUMDIA_NN_FLUSH_DENORMAL = 1     flush subnormal float32 to zero in torch (FTZ/DAZ). Intel
+                                     cores handle subnormals through microcode assists at
+                                     ~100x the cost per affected FMA; the trained network
+                                     carries them, and the desktop rescore ran 6x slower than
+                                     the fleet's on the same pool because of it. 0 = leave the
+                                     FPU default.
+    MUMDIA_NN_DEBUG_DENORMALS = 0    1 = after every training round, count subnormal cells in
+                                     the model's parameters, buffers and one chunk's
+                                     activations, and print them (diagnostic only)
+    MUMDIA_NN_THREAD_CAP  = auto     ceiling on those threads. auto = the performance-core
+                                     count on a hybrid (P+E core) CPU, else 16. 0 = no cap.
+                                     Measured: the MLP is flat from 16 to 64 threads on two
+                                     EPYC generations, and on an i9-13900KS (8P+16E) 30
+                                     threads took 6x longer than 8 on a 3.1M-row pool.
     MUMDIA_NN_PREGATHER_GB= 8        pre-gather the fold's training rows when they fit in
                                      this many GB (one gather per iteration instead of a
                                      fancy-index copy per minibatch)
@@ -132,6 +149,7 @@ import time
 import numpy as np
 import pandas as pd
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
 NON_FEATURE = {"SpecId", "Label", "ScanNr", "ExpMass", "CalcMass", "Peptide", "Proteins"}
@@ -189,6 +207,142 @@ def folds_for(peptides, fold_keys, folds, off=0):
                 % (len(fold_keys), off + want, off, off + want))
         return (got % folds).astype(np.int16)
     return np.array([peptide_fold(x, folds) for x in peptides], np.int16)
+
+
+# Beyond this many torch threads the rescorer's MLP does not get faster on any CPU measured
+# (EPYC 7H12: 16 = 32 threads, 64 slower; EPYC 9354: 8 = 32), so more only costs the rest of
+# the machine. It is a ceiling on what the engine's --threads asks for, not a target.
+_THREAD_CAP = 16
+
+
+def performance_cores():
+    """Performance-core count on a hybrid CPU, or None when the CPU is uniform or unknown.
+
+    Windows only: `GetLogicalProcessorInformationEx(RelationProcessorCore)` reports an
+    EfficiencyClass per physical core, and the highest class is the performance tier. On
+    an i9-13900KS that is 8 (with 16 efficiency cores). Every OpenMP-parallel op waits for
+    its slowest thread, so a thread pinned to an efficiency core, or sharing a performance
+    core's second hyperthread, sets the pace for all of them: measured on that CPU, one
+    rescore of a 522k-row pool took 152 s at 4 threads and 200 s at 30, and the same ratio
+    grew with pool size (docs/28). Linux desktops with hybrid CPUs are not detected here;
+    MUMDIA_NN_THREAD_CAP sets the ceiling explicitly there.
+    """
+    if sys.platform != "win32":
+        return None
+    try:
+        import ctypes
+        import struct
+        from ctypes import wintypes
+
+        k32 = ctypes.windll.kernel32
+        relation_processor_core = 0
+        size = wintypes.DWORD(0)
+        k32.GetLogicalProcessorInformationEx(relation_processor_core, None, ctypes.byref(size))
+        buf = ctypes.create_string_buffer(size.value)
+        if not k32.GetLogicalProcessorInformationEx(
+            relation_processor_core, buf, ctypes.byref(size)
+        ):
+            return None
+        raw = buf.raw
+        classes = []
+        off = 0
+        # SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX: Relationship (u32), Size (u32), then a
+        # PROCESSOR_RELATIONSHIP whose second byte is EfficiencyClass. One record per core.
+        while off + 10 <= size.value:
+            relationship, record_size = struct.unpack_from("<II", raw, off)
+            if record_size < 10:
+                return None
+            if relationship == relation_processor_core:
+                classes.append(raw[off + 9])
+            off += record_size
+        if len(set(classes)) < 2:
+            return None
+        top = max(classes)
+        return sum(1 for c in classes if c == top)
+    except Exception:  # noqa: BLE001 - detection is best effort; None keeps the flat cap
+        return None
+
+
+def torch_thread_cap():
+    """`(cap, why)` for the torch CPU thread count; 0 means uncapped."""
+    raw = os.environ.get("MUMDIA_NN_THREAD_CAP", "auto").strip().lower()
+    if raw not in ("", "auto"):
+        try:
+            return max(0, int(float(raw))), "MUMDIA_NN_THREAD_CAP"
+        except ValueError:
+            pass
+    p_cores = performance_cores()
+    if p_cores:
+        return p_cores, f"{p_cores} performance cores on a hybrid CPU"
+    return _THREAD_CAP, "flat beyond this on every CPU measured"
+
+
+def _denormal_census(model, xb):
+    """Subnormal float32 cells in the model's parameters, buffers and one chunk's activations.
+
+    Diagnostic for the flush-to-zero switch above: subnormals in any of the three are what
+    make every Linear on an Intel core pay the microcode assist.
+    """
+    import torch  # imported here: the module imports torch inside main(), after the device check
+
+    tiny = 1.1754944e-38
+
+    def count(t):
+        a = t.detach().abs().float()
+        return int(((a > 0) & (a < tiny)).sum())
+
+    params = sum(count(p) for p in model.parameters())
+    bufs = sum(count(b) for b in model.buffers())
+    acts = 0
+    with torch.no_grad():
+        h = xb
+        for layer in model.net:
+            h = layer(h)
+            acts += count(h)
+    return params, bufs, acts
+
+
+def _accumulate_moments(blk, s1, s2, rows=32768):
+    """Add a float32 block's per-column sum and sum of squares to `s1`/`s2`, in float64.
+
+    In sub-blocks: `(blk.astype(np.float64) ** 2)` on a 250k-row chunk is two 0.77 GB
+    temporaries per chunk, and that transient -- not the matrix -- set the worker's
+    high-water mark during the load.
+    """
+    for a in range(0, len(blk), rows):
+        sub = blk[a:a + rows].astype(np.float64)
+        s1 += sub.sum(axis=0)
+        np.square(sub, out=sub)
+        s2 += sub.sum(axis=0)
+
+
+def _row_ids(spec_ids):
+    """`<prefix>_<flat row>` -> int64 flat rows, without a Python string per row."""
+    tail = pc.replace_substring_regex(spec_ids, pattern="^.*_", replacement="")
+    return pc.cast(tail, pa.int64()).to_numpy()
+
+
+def _release_allocator_slack():
+    """Return freed memory to the OS after a bulk load.
+
+    Arrow's pool and glibc both keep freed pages mapped by default, so RSS after the load
+    stays at the load's transient peak rather than at what is still referenced. Every call
+    here is best effort and platform-dependent.
+    """
+    import gc
+
+    gc.collect()
+    try:
+        pa.default_memory_pool().release_unused()
+    except Exception:  # noqa: BLE001 - older pyarrow without the call
+        pass
+    if sys.platform.startswith("linux"):
+        try:
+            import ctypes
+
+            ctypes.CDLL("libc.so.6").malloc_trim(0)
+        except Exception:  # noqa: BLE001 - not glibc
+            pass
 
 
 PHASE = {}
@@ -422,13 +576,36 @@ def main():
             src = "OMP_NUM_THREADS"
         else:
             want, src = 16, "default"
-        if want > 0:
-            torch.set_num_threads(max(1, min(want, os.cpu_count() or want)))
+        # The engine's --threads sizes its own rayon pool for the whole machine; for the
+        # MLP it is an upper bound, not a target. See `performance_cores`.
+        cap, cap_why = torch_thread_cap()
+        use = want if (want <= 0 or cap <= 0) else min(want, cap)
+        if use > 0:
+            torch.set_num_threads(max(1, min(use, os.cpu_count() or use)))
         print(
-            "nn_rescore_worker: torch cpu threads=%d (from %s; %d cores visible)"
-            % (torch.get_num_threads(), src, os.cpu_count() or -1),
+            "nn_rescore_worker: torch cpu threads=%d (asked %d from %s; cap %d: %s; "
+            "%d cores visible)"
+            % (torch.get_num_threads(), want, src, cap, cap_why, os.cpu_count() or -1),
             flush=True,
         )
+    # Subnormal float32 values are handled by microcode assists on Intel cores, at roughly
+    # a hundred times the cost of a normal FMA. Measured on an i9-13900KS: one 16384 x 387
+    # Linear takes 4.2 ms with normal inputs, 475 ms with subnormal ones, 150 ms with
+    # subnormal weights, and 3.5 ms again with flush-to-zero; an EPYC 9354 pays nothing
+    # either way (12.1 against 11.4 ms). The trained network accumulates subnormals as
+    # training proceeds, which is why the same six-run pool took 118 minutes on that
+    # desktop and 19 on the fleet while single-threaded epoch speed was identical, and why
+    # the desktop's iterations got slower as the run went on. Values below 1.2e-38
+    # contribute nothing to a score, so flushing them changes no identification.
+    FLUSH_DENORMAL = env_i("MUMDIA_NN_FLUSH_DENORMAL", 1) != 0
+    if FLUSH_DENORMAL:
+        _ftz = torch.set_flush_denormal(True)
+        print(
+            "nn_rescore_worker: flush subnormal floats to zero: %s"
+            % ("on" if _ftz else "unsupported on this CPU"),
+            flush=True,
+        )
+    DEBUG_DENORMALS = env_i("MUMDIA_NN_DEBUG_DENORMALS", 0) != 0
 
     stream_env = os.environ.get("MUMDIA_NN_STREAM", "auto").lower()
     filesize = os.path.getsize(pin_path)
@@ -553,37 +730,64 @@ def main():
         # ---- in-memory backend (median/IQR standardisation) ----
         if IS_PQ:
             # ---- Parquet in-memory: one float32 matrix, standardised in place ----
-            # Metadata columns first; they are small.
-            _tb = pq.read_table(pin_path, columns=["SpecId", "Label", "Peptide"])
+            # Metadata columns first; they are small as long as they stay Arrow. The
+            # previous `to_pylist()` round trips made a Python string per row out of SpecId
+            # and Peptide (~0.7 GB on a 3M-row pool) that then sat in the allocator's
+            # high-water mark for the whole run. Peptide is only needed when there is no
+            # fold-key table to fold on.
+            _cols = ["SpecId", "Label"] + ([] if fold_keys is not None else ["Peptide"])
+            _tb = pq.read_table(pin_path, columns=_cols)
             y = (_tb.column("Label").to_numpy() == 1).astype(np.float32)
-            _spec = _tb.column("SpecId").to_pylist()
-            cids = np.array([int(x.rsplit("_", 1)[-1]) for x in _spec], np.int64)
-            fold = _folds(_tb.column("Peptide").to_pylist())
-            del _tb, _spec
             n = len(y)
+            cids = _row_ids(_tb.column("SpecId"))
+            if fold_keys is not None:
+                fold = _folds(range(n))
+            else:
+                fold = _folds(_tb.column("Peptide").to_pylist())
+            del _tb
             Xs = np.empty((n, nf), np.float32)
             s1 = np.zeros(nf, np.float64)
             s2 = np.zeros(nf, np.float64)
             _pf = pq.ParquetFile(pin_path)
             off = 0
-            for _b in _pf.iter_batches(batch_size=CHUNK, columns=feat_cols):
-                k = _b.num_rows
-                blk = np.empty((k, nf), np.float32)
-                for j in range(nf):
-                    blk[:, j] = _b.column(j).to_numpy(zero_copy_only=False)
-                np.nan_to_num(blk, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
-                Xs[off:off + k] = blk
-                s1 += blk.sum(axis=0, dtype=np.float64)
-                s2 += (blk.astype(np.float64) ** 2).sum(axis=0)
-                off += k
-                del blk
+            _tbl = _b = None
+            # One row group at a time. `iter_batches` reads ahead and decodes groups in
+            # parallel, and its buffered batches grew into a second copy of the matrix:
+            # measured, the worker climbed to 11.2 GB while filling a 4.85 GB `Xs`, then
+            # fell to 6.3 GB the moment the loop ended. Reading a group, slicing it into
+            # CHUNK-row blocks and dropping it bounds the transient to one group, which the
+            # engine writes at 131,072 rows (200 MB at 387 features); a file with parquet's
+            # default 1,048,576-row groups still loads, at 1.6 GB per group.
+            for _rg in range(_pf.num_row_groups):
+                _tbl = _pf.read_row_group(_rg, columns=feat_cols)
+                for _s0 in range(0, _tbl.num_rows, CHUNK):
+                    _b = _tbl.slice(_s0, CHUNK)
+                    k = _b.num_rows
+                    blk = np.empty((k, nf), np.float32)
+                    for j in range(nf):
+                        blk[:, j] = _b.column(j).to_numpy(zero_copy_only=False)
+                    np.nan_to_num(blk, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+                    Xs[off:off + k] = blk
+                    _accumulate_moments(blk, s1, s2)
+                    off += k
+                    del blk
+                del _tbl, _b
+                _tbl = _b = None
+            del _pf, _tbl, _b
             if off != n:
                 raise RuntimeError(f"parquet row mismatch: metadata {n}, features {off}")
+            # The decoded Arrow buffers are garbage now; hand them back before training
+            # starts, or they stay in RSS for the whole run.
+            _release_allocator_slack()
             mean = (s1 / n).astype(np.float32)
             std = np.sqrt(np.maximum(s2 / n - (s1 / n) ** 2, 1e-12)).astype(np.float32)
             std[std == 0] = 1.0
+            # In place on each chunk: `(Xs[i:j] - mean) / std` made two chunk-sized copies.
             for i in range(0, n, CHUNK):
-                Xs[i:i + CHUNK] = np.clip((Xs[i:i + CHUNK] - mean) / std, -8, 8)
+                view = Xs[i:i + CHUNK]
+                np.subtract(view, mean, out=view)
+                np.divide(view, std, out=view)
+                np.clip(view, -8, 8, out=view)
             get = lambda idx: Xs[idx]
             get_col = lambda idx, j: np.asarray(Xs[idx, j])
         else:
@@ -649,8 +853,7 @@ def main():
             k = len(chunk)
             xf = np.nan_to_num(chunk[feat_cols].to_numpy(np.float32), nan=0.0, posinf=0.0, neginf=0.0)
             mm[off:off + k] = xf
-            s1 += xf.sum(axis=0, dtype=np.float64)
-            s2 += (xf.astype(np.float64) ** 2).sum(axis=0)
+            _accumulate_moments(xf, s1, s2)
             y[off:off + k] = (chunk["Label"].to_numpy() == 1).astype(np.float32)
             cids[off:off + k] = [int(s.rsplit("_", 1)[-1]) for s in chunk["SpecId"].astype(str)]
             fold[off:off + k] = _folds(chunk["Peptide"].tolist(), off)
@@ -917,6 +1120,14 @@ def main():
                     ep = WARM_EPOCHS
                 model, optim = train_model(sel, pw, seed, warm=warm_in, epochs=ep)
                 _t = _tick("3_train", _t)
+                if DEBUG_DENORMALS:
+                    model.eval()
+                    _xb = torch.from_numpy(get(tr_idx[:BATCH * 4])).to(DEVICE)
+                    print(
+                        "  seed %d fold %d: subnormals params=%d buffers=%d activations=%d"
+                        % ((seed, f) + _denormal_census(model, _xb)),
+                        flush=True,
+                    )
                 score_tr = score_idx(model, tr_idx)
                 _t = _tick("4_score_pool_per_iter", _t)
                 used_iters += 1

@@ -417,6 +417,57 @@ sections 10-16:
   took the rescore peak from 29.96 to 8.95 GB and the wall from 8:35 to 6:33 at identical
   identifications. mokapot and entrapment sidecars still receive the tab-separated PIN
   (`mokapot.read_pin` cannot read parquet), automatically and with a warning.
+- The rescore process tree is about half as tall since 2026-09-16, at identical
+  identifications. Under `rescore.strict` (the production setting) with a sidecar classifier
+  the engine releases its own `FeatureMatrix` as soon as the handoff parquet is written,
+  because strict has no native fallback that could still read it; the handoff is written in
+  131,072-row groups; and the worker loads it one row group at a time, since pyarrow's
+  `iter_batches` reads ahead and its buffered batches were a second copy of the matrix (the
+  worker climbed to 11.2 GB while filling a 4.85 GB matrix, then fell to 6.3). Measured on
+  the fleet (EPYC 9354, 32 threads, process-tree peaks): the six-run Astral pool
+  (3,133,636 x 387) 17.9 GB -> 9.3 GB in 19.4 against 19.4 min, HYE B01
+  (1,838,344 x 387) 12.0 GB -> 5.05 GB in 5.2 against 5.0 min, 63,270 peptides in both HYE
+  arms. The disk-backed memmap remains the last resort it was made in #88.
+- The worker caps its torch CPU threads at 16, or at the performance-core count on a
+  hybrid CPU (Windows, `GetLogicalProcessorInformationEx`; `MUMDIA_NN_THREAD_CAP` overrides,
+  `0` = none), and treats the engine's `--threads` as an upper bound rather than a target.
+  Measured: the MLP is flat from 16 to 64 threads on an EPYC 7H12 (one Astral run: 253 s at
+  16, 254 at 32, 281 at 64) and from 8 on an EPYC 9354, while on an i9-13900KS (8 P + 16 E
+  cores) every OpenMP-parallel op waits for its slowest thread: one run 200 s at 30 threads
+  against 152 s at 4, and the six-run Astral pool 118 min at 30 threads against
+  74 min at 8 on the same machine. A desktop rescore that is many times slower
+  than a server's on the same pool is this, not the pool.
+- The worker flushes subnormal float32 to zero (`torch.set_flush_denormal`,
+  `MUMDIA_NN_FLUSH_DENORMAL`, default on) since 2026-09-16. Intel cores handle subnormals
+  through microcode assists: measured on the i9-13900KS, one 16384 x 387 `Linear` takes
+  4.2 ms with normal inputs, 475 ms with subnormal inputs, 150 ms with subnormal weights and
+  3.5 ms again with flush-to-zero, while an EPYC 9354 pays nothing (12.1 against 11.4 ms).
+  The competed features carry none (0 subnormal cells in the 3.1M x 387 table, raw or
+  standardised); they are the first-layer weights of the constant features. A constant
+  column standardises to exactly 0, so its 128 weights receive no data gradient, only the
+  L2 term, and Adam walks them under 1.2e-38: the census reads 1 subnormal parameter after
+  the cold round and about 1,180 (10 features x 128 units) after the first warm-started
+  rounds, with 0 subnormal buffers or activations. Every FMA on those 10 columns then took
+  the assist, which is why the desktop's iterations slowed as the run went on and why
+  py-spy found 97% of the worker's samples inside `Linear.forward`. A
+  value below 1.2e-38 contributes nothing to a score; `MUMDIA_NN_DEBUG_DENORMALS=1` prints a
+  per-round census of parameters, buffers and activations. Desktop A/B on a two-run pool at 8
+  threads: flush off 7.64 min, flush on 5.07 min, 96,137 peptides in both. This, not the
+  thread count alone, is why the same pool took 118 min on the desktop and 19 on the fleet.
+- Training is 85% of the rescore wall (fleet baseline: worker 1,106 s of a 19.4 min stage,
+  944 s of it `train`; engine load 11 s, handoff write 26 s, post-processing 5 s), so the
+  only cheaper recipes are ones that train less. Measured 2026-09-16 with seeds on two pools
+  (Astral six-run pool, HYE B01): `folds: 2` is -45% wall (10.6 against 19.4 min) at -0.06%
+  peptides on Astral (3 seeds, 116,236 against 116,309) but -1.1% on HYE B01 (62,297 against
+  63,004), the smaller pool with the smaller training folds; `train_subsample: 0.5` -33% wall
+  at -0.3% / -0.9%; `MUMDIA_NN_EARLY_STOP_TOL=0.03` -17% wall at -1.9%; `MUMDIA_NN_BATCH=16384`
+  with `MUMDIA_NN_LR=2e-3` -10% to -24% wall at +0.07% on Astral and -0.6% on HYE B01 (3 seeds
+  each; the notebook's 2.3x was measured on a GPU, where per-step overhead dominates);
+  `MUMDIA_NN_INIT_TOPK=20000` -6% wall at -0.16%, within seed spread. None is a default;
+  `folds: 2` is the fast option for a large pool. `folds: 1` (in-sample scoring) is refuted
+  by entrapment on the AIF spike-in library: +2.8% real peptides at an empirical FDP of 1.42%
+  against 1.00% for folds 3, with the decoy fraction unchanged at 0.98%, so the decoys do not
+  see the overfit and the count is not a gain.
 - `rescore.features` / `features_file` project the classifier's input columns. 43 of the 387
   Extended features are dead by construction (10 constant under the default configuration, 20
   bit-identical, 13 affine duplicates), and about 114 chosen multivariately reproduce all 387

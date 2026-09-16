@@ -372,7 +372,8 @@ production default. The authoritative actual path is recorded in
   `:358-413`) or a disk-backed float32 **memmap** streamed in `MUMDIA_NN_CHUNK`
   chunks with mean/std accumulated in one pass (`:415-463`), selected at
   `nn_rescore_worker.py:290-302` by comparing an estimated decoded size against
-  `MUMDIA_NN_STREAM_GB` (default 4 GB). For a tab-separated PIN the compared
+  `MUMDIA_NN_STREAM_GB` (auto: twice the free physical memory, never below 4 GB;
+  #88). For a tab-separated PIN the compared
   quantity is the on-disk file size; for a Parquet feature table
   (`rescore.handoff = parquet`, accepted by this worker only, `rescore.rs:943-959`)
   it is `num_rows * (num_columns - 3) * 4`, the decoded float32 feature matrix,
@@ -696,7 +697,31 @@ MLP. Set it explicitly for the logreg path.
 - **The nn_torch backend threshold is a cliff, not a preference.** A feature
   matrix marginally over `MUMDIA_NN_STREAM_GB` takes the disk-backed memmap path,
   which is much slower than in-memory; a 4.31 GB matrix against the 4.00 GB
-  default was observed doing so. The worker prints the size, the threshold, and
+  default was observed doing so, and a 4.52 GB matrix cost 166 minutes against 20
+  before the threshold was sized from free memory (#88).
+- **The in-memory backend holds one matrix and little else** (2026-09-16). The
+  engine writes the handoff parquet in 131,072-row groups and releases its own
+  `FeatureMatrix` before the worker starts (under `rescore.strict`, which has no
+  native fallback), and the worker reads one row group at a time; pyarrow's
+  `iter_batches` reads ahead and had buffered a second copy of the matrix. Six-run
+  Astral pool: process tree 17.9 GB before, under 10 after; HYE B01 12.0 -> 5.05 GB,
+  identical identifications (`docs/27` section 0.1).
+- **Torch CPU threads are capped** at 16, or at the performance-core count on a
+  hybrid CPU (Windows `GetLogicalProcessorInformationEx`); the engine's `--threads`
+  arrives as `MUMDIA_NN_THREADS` and is an upper bound. The MLP is flat past 16
+  threads on two EPYC generations, and on an i9-13900KS (8P + 16E) 30 threads made
+  the pooled Astral rescore 118 minutes against 74 at 8, before the subnormal fix below. The
+  worker prints `torch cpu threads=N (asked A from ...; cap C: why)` at startup;
+  `MUMDIA_NN_THREAD_CAP` overrides the cap, `0` removes it.
+- **Subnormal floats are flushed to zero** (`MUMDIA_NN_FLUSH_DENORMAL`, default 1;
+  2026-09-16). On Intel cores a subnormal operand turns a 4 ms `Linear` into a
+  475 ms one (measured, i9-13900KS; an EPYC 9354 is unaffected), and the trained
+  network accumulates them in the first-layer weights of the constant features
+  (standardised to exactly 0, so Adam's L2 term is their only gradient: census
+  1 -> ~1,180 subnormal parameters over the first rounds, 0 in buffers or
+  activations) while the input features carry none. `MUMDIA_NN_DEBUG_DENORMALS=1` prints a census after every
+  training round. Desktop A/B on a two-run pool at 8 threads: 7.64 min with the
+  FPU default, 5.07 min with flush-to-zero, identical peptides (96,137). The worker prints the size, the threshold, and
   the chosen backend before it starts (`nn_rescore_worker.py:306-311`), so check
   that line rather than inferring the backend from the wall clock. Raise
   `MUMDIA_NN_STREAM_GB` when the RAM is available, or force the choice with
