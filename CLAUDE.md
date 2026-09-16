@@ -465,8 +465,11 @@ sections 10-16:
   seed's peptide count by up to ~0.4% on the Astral pool and ~1% on HYE B01: seed 0 gave
   116,405 at 32 threads, 116,192 at 8 threads, 116,025 with the 11 constant columns dropped
   (a mathematically identical model) and 115,937 with flush-to-zero, while the means over
-  three seeds sit within 0.1% of each other (flushed: -0.24 / -0.04 / +0.03%). Same seed on
-  the same hardware reproduces exactly. Judge a change on the mean over seeds on two pools,
+  three seeds sit within 0.1% of each other (flushed: -0.24 / -0.04 / +0.03%). Paired on the
+  same host with the constant columns dropped, flush-to-zero is bit-identical on HYE B01 for
+  three seeds and -0.04% on Astral seed 1. Same seed on the same CPU model reproduces
+  exactly; a different CPU generation does not (EPYC 7H12 against 9354), so pair A/B arms on
+  one host. Judge a change on the mean over seeds on two pools,
   which is what CLAUDE.md already asks, and treat a 0.3% single-seed delta as nothing.
 - Training is 85% of the rescore wall (fleet baseline: worker 1,106 s of a 19.4 min stage,
   944 s of it `train`; engine load 11 s, handoff write 26 s, post-processing 5 s), so the
