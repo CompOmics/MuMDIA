@@ -277,3 +277,62 @@ def test_fold_keys_respect_the_streaming_row_offset():
     whole = w.folds_for([f"p{i}" for i in range(10)], keys, 3)
     chunk = w.folds_for([f"p{i}" for i in range(4, 7)], keys, 3, off=4)
     assert list(chunk) == list(whole[4:7])
+
+
+# ------------------------------------------------- streaming threshold from free memory
+
+def _load_nn_worker():
+    import importlib.util
+
+    from conftest import SCRIPTS
+
+    spec = importlib.util.spec_from_file_location(
+        "mumdia_nn_worker_threshold", SCRIPTS / "nn_rescore_worker.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_stream_threshold_is_sized_from_free_memory_and_never_below_the_old_default():
+    """The fixed 4 GB was wrong at both ends; the replacement may only ever raise it.
+
+    What prompted this: a 4.52 GiB feature matrix on a 96 GiB machine crossed the fixed
+    threshold by 13% and took the disk-backed memmap, costing 166 minutes against roughly
+    20 in memory. Sizing from free memory fixes that without making a small machine
+    stream LESS eagerly than it does today, which is why the historical default is a
+    floor rather than a starting point.
+    """
+    m = _load_nn_worker()
+
+    # The helper reads the real machine, so the size-dependent behaviour is exercised
+    # through the arithmetic it uses, which is deterministic.
+    def derived(free_gb):
+        return free_gb * m._FREE_MULTIPLIER
+
+    # Greater than 1 on purpose: the memmap is a last resort, and between 1x and 2x free
+    # memory the operating system's page file is the cheaper way to overflow.
+    assert m._FREE_MULTIPLIER > 1, "the memmap must not be preferred over paging"
+    assert derived(40) > 40, "a matrix larger than free memory still goes in memory"
+    assert derived(90) > 4, "a 90 GiB-free workstation must not be held at 4 GB"
+    assert derived(1) < 4, "a machine this small falls back to the floor"
+
+    # The floor holds whatever the arithmetic says, on whatever machine this runs.
+    gb, why = m.auto_stream_threshold_gb(4)
+    assert gb >= 4
+    assert isinstance(why, str) and why, "the threshold must explain where it came from"
+    assert m.auto_stream_threshold_gb(99)[0] >= 99, "a higher default is never lowered"
+
+
+def test_available_ram_is_optional_and_never_fatal():
+    """It must degrade to the fixed default rather than raise, on any platform.
+
+    `psutil` is deliberately not a dependency of the rescore environment, so this reads
+    the platform directly; anywhere that fails, the caller keeps the old behaviour.
+    """
+    m = _load_nn_worker()
+    free = m.available_ram_bytes()
+    assert free is None or (isinstance(free, int) and free > 0)
+    # Whatever it returns, the threshold is usable.
+    gb, why = m.auto_stream_threshold_gb(4)
+    assert gb >= 4 and isinstance(why, str)

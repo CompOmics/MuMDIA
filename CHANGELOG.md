@@ -37,6 +37,19 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ## [Unreleased]
 
+### Fixed
+
+- The `nn_torch` rescorer fell to its disk-backed memmap far too eagerly.
+  `MUMDIA_NN_STREAM_GB` was a fixed 4 GB, so a 4.52 GiB feature matrix on a 96 GiB
+  machine crossed it by 13% and took a path measured at about 9x slower: **166 minutes
+  against roughly 20**. Unset, the threshold is now twice free physical memory, never
+  below the historical 4 GB, so the memmap is a last resort rather than a safety margin
+  and a matrix that merely overflows RAM is paged by the operating system instead --
+  much cheaper for this access pattern. Setting `MUMDIA_NN_STREAM_GB` still overrides it
+  exactly as before, which is what a machine with no page file wants.
+
+  The worker already logged which backend it chose; it now also says where the threshold
+  came from, and warns explicitly when the slow path is taken for want of memory.
 ### Security
 
 - `rustls` 0.23.43 -> 0.23.45 in the desktop application, closing RUSTSEC-2026-0285
