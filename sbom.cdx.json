@@ -5,16 +5,16 @@
   "metadata": {
     "component": {
       "type": "application",
-      "bom-ref": "pkg:cargo/mumdia@0.3.1",
+      "bom-ref": "pkg:cargo/mumdia@0.4.0",
       "name": "mumdia",
-      "version": "0.3.1",
+      "version": "0.4.0",
       "description": "Clean-room Rust DIA proteomics search engine",
       "licenses": [
         {
           "expression": "Apache-2.0"
         }
       ],
-      "purl": "pkg:cargo/mumdia@0.3.1"
+      "purl": "pkg:cargo/mumdia@0.4.0"
     },
     "tools": [
       {
@@ -1909,10 +1909,10 @@
     },
     {
       "type": "library",
-      "bom-ref": "pkg:cargo/mumdia-core@0.3.1",
+      "bom-ref": "pkg:cargo/mumdia-core@0.4.0",
       "name": "mumdia-core",
-      "version": "0.3.1",
-      "purl": "pkg:cargo/mumdia-core@0.3.1",
+      "version": "0.4.0",
+      "purl": "pkg:cargo/mumdia-core@0.4.0",
       "description": "Typed configuration, mass model, artifact schemas, and run manifest for MuMDIA",
       "licenses": [
         {
@@ -1928,10 +1928,10 @@
     },
     {
       "type": "library",
-      "bom-ref": "pkg:cargo/mumdia-io@0.3.1",
+      "bom-ref": "pkg:cargo/mumdia-io@0.4.0",
       "name": "mumdia-io",
-      "version": "0.3.1",
-      "purl": "pkg:cargo/mumdia-io@0.3.1",
+      "version": "0.4.0",
+      "purl": "pkg:cargo/mumdia-io@0.4.0",
       "description": "Parquet/JSON artifact layer, content hashing, and logging for MuMDIA",
       "licenses": [
         {
@@ -4202,7 +4202,7 @@
       ]
     },
     {
-      "ref": "pkg:cargo/mumdia-core@0.3.1",
+      "ref": "pkg:cargo/mumdia-core@0.4.0",
       "dependsOn": [
         "pkg:cargo/serde@1.0.228",
         "pkg:cargo/serde_json@1.0.151",
@@ -4211,12 +4211,12 @@
       ]
     },
     {
-      "ref": "pkg:cargo/mumdia-io@0.3.1",
+      "ref": "pkg:cargo/mumdia-io@0.4.0",
       "dependsOn": [
         "pkg:cargo/anyhow@1.0.104",
         "pkg:cargo/arrow@59.3.0",
         "pkg:cargo/blake3@1.8.7",
-        "pkg:cargo/mumdia-core@0.3.1",
+        "pkg:cargo/mumdia-core@0.4.0",
         "pkg:cargo/parquet@59.3.0",
         "pkg:cargo/serde@1.0.228",
         "pkg:cargo/serde_json@1.0.151",
@@ -4226,15 +4226,15 @@
       ]
     },
     {
-      "ref": "pkg:cargo/mumdia@0.3.1",
+      "ref": "pkg:cargo/mumdia@0.4.0",
       "dependsOn": [
         "pkg:cargo/anyhow@1.0.104",
         "pkg:cargo/arrow@59.3.0",
         "pkg:cargo/blake3@1.8.7",
         "pkg:cargo/clap@4.6.6",
         "pkg:cargo/mimalloc@0.1.52",
-        "pkg:cargo/mumdia-core@0.3.1",
-        "pkg:cargo/mumdia-io@0.3.1",
+        "pkg:cargo/mumdia-core@0.4.0",
+        "pkg:cargo/mumdia-io@0.4.0",
         "pkg:cargo/mzdata@0.66.6",
         "pkg:cargo/parquet@59.3.0",
         "pkg:cargo/rayon@1.12.0",
