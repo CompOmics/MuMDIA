@@ -1628,12 +1628,17 @@ pub struct RescoreConfig {
     /// pooled rescoring on small machines (docs/28 section 21), not the default.
     pub feature_preset: FeaturePreset,
     /// Cap the decoys the sidecar TRAINS on at this multiple of the targets it selected
-    /// that iteration; 0 (the default) trains on every decoy, which is about 19:1 on a
-    /// DIA pool and is where the rescore spends its time.
+    /// that iteration; 0 trains on every decoy, which is about 19:1 on a DIA pool and is
+    /// where the rescore spends its time.
     ///
     /// This thins gradient steps only. Selection, scoring, target-decoy competition and
     /// q-values still run over the full pool, so the cap cannot loosen the q threshold;
-    /// what it can move is the learned boundary, hence a knob and not a default.
+    /// what it can move is the learned boundary. Default 2 since 2026-09-16, measured
+    /// against the previous 3 with three seeds on two pools and on the entrapment pool:
+    /// Astral six-run pool 116,711 against 116,309 peptides (+0.35%), HYE B01 63,096
+    /// against 63,004 (+0.15%), AIF spike-in library +0.56% real peptides at an empirical
+    /// FDP of 1.025% against 1.044%, at 16% less rescore wall. `1` with `margin` selection
+    /// is still the recipe that loses 10% on the entrapment pool (docs/28).
     pub train_neg_ratio: f64,
     /// Which decoys survive [`RescoreConfig::train_neg_ratio`]. See [`NegSelect`].
     pub train_neg_select: NegSelect,
@@ -1719,7 +1724,9 @@ impl Default for RescoreConfig {
             // `train_neg_select = random`, `train_warm_epochs = 0` restore the previous
             // behaviour exactly. The compact feature preset stays opt-in (see its field).
             feature_preset: FeaturePreset::All,
-            train_neg_ratio: 3.0,
+            // 3 -> 2 on 2026-09-16: +0.35% / +0.15% / +0.56% on Astral, HYE B01 and the
+            // entrapment pool (FDP 1.025% against 1.044%), -16% wall; see the field.
+            train_neg_ratio: 2.0,
             train_neg_select: NegSelect::Hybrid,
             train_subsample: 0.0,
             train_warm_epochs: 5,
@@ -2575,7 +2582,7 @@ mod tests {
     fn rescore_defaults_are_the_training_recipe_and_json_omission_keeps_them() {
         let d = RescoreConfig::default();
         assert_eq!(d.feature_preset, FeaturePreset::All);
-        assert_eq!(d.train_neg_ratio, 3.0);
+        assert_eq!(d.train_neg_ratio, 2.0);
         assert_eq!(d.train_neg_select, NegSelect::Hybrid);
         assert_eq!(d.train_warm_epochs, 5);
         // A config that does not mention them gets the same values (no field-level

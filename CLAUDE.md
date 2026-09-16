@@ -500,7 +500,8 @@ sections 10-16:
   default; `folds: 2` is the fast option for a large pool. The one lever that gained on every
   pool is `train_neg_ratio: 2` (default 3): Astral +0.35% (116,711 against 116,309, 3 seeds),
   HYE B01 +0.15% (63,096 against 63,004, 3 seeds), entrapment +0.56% real peptides at an FDP
-  of 1.025% against 1.044%, at -16% wall; it is proposed as the default in its own PR. `folds: 1` (in-sample scoring) is refuted
+  of 1.025% against 1.044%, at -16% wall; it is the default since 2026-09-16 (this is the
+  measurement the promotion rests on). `folds: 1` (in-sample scoring) is refuted
   by entrapment on the AIF spike-in library: +2.8% real peptides at an empirical FDP of 1.42%
   against 1.00% for folds 3, with the decoy fraction unchanged at 0.98%, so the decoys do not
   see the overfit and the count is not a gain.
@@ -517,8 +518,9 @@ sections 10-16:
   not: `train_neg_ratio: 5` never binds on a balanced pool and is 2.2x on an imbalanced one.
 - Feature selection buys memory, not time: MLP training time per row is flat in the feature
   count from 387 down to 25. Training-set reduction buys time.
-- The training recipe (`train_neg_ratio: 3, train_neg_select: hybrid, train_warm_epochs: 5`)
-  is the shipped default since 2026-09-05: measured with seeds against the previous defaults
+- The training recipe (`train_neg_ratio: 2` since 2026-09-16, previously 3; `train_neg_select:
+  hybrid, train_warm_epochs: 5`) is the shipped default since 2026-09-05: measured with seeds
+  against the previous defaults
   (every decoy, cold refits) on four pools, HYE A01 +1.0%, HYE B01 +2.2%, AIF -0.1%,
   entrapment +3.3% with the spike-in FDP unchanged, at 9-19x less training time (docs/28
   section 21; B01's baseline training took 50 minutes per seed against 2.6). `train_neg_ratio:
