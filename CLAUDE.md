@@ -456,6 +456,18 @@ sections 10-16:
   per-round census of parameters, buffers and activations. Desktop A/B on a two-run pool at 8
   threads: flush off 7.64 min, flush on 5.07 min, 96,137 peptides in both. This, not the
   thread count alone, is why the same pool took 118 min on the desktop and 19 on the fleet.
+  The worker also drops the constant columns before training (`MUMDIA_NN_DROP_CONSTANT`,
+  from the parquet footer's per-column min/max, 11 of 387 on the Astral pool), which removes
+  that subnormal source but not the others: dead hidden units and their BatchNorm variances
+  decay the same way (census on the six-run pool: up to ~6,400 parameters, 11 buffers,
+  ~3,000 activations in a round), and the desktop still took 61.8 min without flushing.
+- Single-seed counts are not a measurement. Any change to the arithmetic reshuffles one
+  seed's peptide count by up to ~0.4% on the Astral pool and ~1% on HYE B01: seed 0 gave
+  116,405 at 32 threads, 116,192 at 8 threads, 116,025 with the 11 constant columns dropped
+  (a mathematically identical model) and 115,937 with flush-to-zero, while the means over
+  three seeds sit within 0.1% of each other (flushed: -0.24 / -0.04 / +0.03%). Same seed on
+  the same hardware reproduces exactly. Judge a change on the mean over seeds on two pools,
+  which is what CLAUDE.md already asks, and treat a 0.3% single-seed delta as nothing.
 - Training is 85% of the rescore wall (fleet baseline: worker 1,106 s of a 19.4 min stage,
   944 s of it `train`; engine load 11 s, handoff write 26 s, post-processing 5 s), so the
   only cheaper recipes are ones that train less. Measured 2026-09-16 with seeds on two pools
@@ -465,8 +477,15 @@ sections 10-16:
   at -0.3% / -0.9%; `MUMDIA_NN_EARLY_STOP_TOL=0.03` -17% wall at -1.9%; `MUMDIA_NN_BATCH=16384`
   with `MUMDIA_NN_LR=2e-3` -10% to -24% wall at +0.07% on Astral and -0.6% on HYE B01 (3 seeds
   each; the notebook's 2.3x was measured on a GPU, where per-step overhead dominates);
-  `MUMDIA_NN_INIT_TOPK=20000` -6% wall at -0.16%, within seed spread. None is a default;
-  `folds: 2` is the fast option for a large pool. `folds: 1` (in-sample scoring) is refuted
+  `MUMDIA_NN_INIT_TOPK=20000` -6% wall at -0.16% / identical, within seed spread; the three
+  combined (`folds 2` + batch 16384 + init_topk) -55% wall at -0.34% on Astral and -2.0% on
+  HYE B01 (3 seeds); progressive subsampling (30% of the training rows for the first seven
+  rounds, all of them for the last three; experiment knob, not shipped) -47% wall at -0.14%
+  on Astral and -0.85% on HYE B01 (3 seeds); `folds: 5` +0.09% at 2.0x the wall. None is a
+  default; `folds: 2` is the fast option for a large pool. The one lever that gained on every
+  pool is `train_neg_ratio: 2` (default 3): Astral +0.35% (116,711 against 116,309, 3 seeds),
+  HYE B01 +0.15% (63,096 against 63,004, 3 seeds), entrapment +0.56% real peptides at an FDP
+  of 1.025% against 1.044%, at -16% wall; it is proposed as the default in its own PR. `folds: 1` (in-sample scoring) is refuted
   by entrapment on the AIF spike-in library: +2.8% real peptides at an empirical FDP of 1.42%
   against 1.00% for folds 3, with the decoy fraction unchanged at 0.98%, so the decoys do not
   see the overfit and the count is not a gain.
@@ -514,6 +533,14 @@ sections 10-16:
 - The extraction and RT defaults (`gate_min_score` 0.2, `rt_window_multiplier` 1.5,
   `apex_count_window` 5) are likewise a measured local optimum on HYE end to end (docs/28
   section 18); `window_holdout_frac` is neutral there with a pre-fine-tuned library.
+- Reference point, 2026-09-16: the six Astral files end to end (`mumdia run` with six
+  `--mzml`, imported HYE library, multi-head calibration on the first run and reuse, pooled
+  `nn_torch` rescore) take 52.5 min at a 13.25 GB process-tree peak on an EPYC 9354 with 32
+  threads: per file convert 1.9-2.5 min, extract 1.6-2.0, features 0.5-0.8, search-seed 0.4,
+  compete 0.2, quant 0.3 (about 5 min per file, 30 of the 52), then the pooled rescore 21.9
+  min. 113,160 peptides, 126,224 precursors, 12,132 protein groups at 1%. The rescore is 42%
+  of the whole and the per-file chain the rest, so after this PR the next lever is convert +
+  extract (`extract.windows_in_flight`, the mzML read), not the classifier.
 - Reference point, 2026-09-05: a complete HYE single run is 17:52 at 16.5 GiB on 32 threads
   (extract 16.5 GiB is the tallest stage, `extract.windows_in_flight: 8` takes it to 12.3),
   and the six-run pooled rescore is 18 minutes at 15.9 GB for 72,344 peptides.

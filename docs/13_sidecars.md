@@ -713,6 +713,12 @@ MLP. Set it explicitly for the logreg path.
   the pooled Astral rescore 118 minutes against 74 at 8, before the subnormal fix below. The
   worker prints `torch cpu threads=N (asked A from ...; cap C: why)` at startup;
   `MUMDIA_NN_THREAD_CAP` overrides the cap, `0` removes it.
+- **Constant feature columns are dropped before training** (`MUMDIA_NN_DROP_CONSTANT`,
+  default 1; 2026-09-16), identified from the parquet footer's per-column min/max
+  without a read (11 of the 387 Extended features on the Astral pool, `has_ms1` and
+  ten all-zero deconvolution/peak-sharing fractions). A constant column standardises
+  to exactly 0 and contributes nothing to any prediction; its first-layer weights are
+  the main subnormal source (below), so dropping it is free.
 - **Subnormal floats are flushed to zero** (`MUMDIA_NN_FLUSH_DENORMAL`, default 1;
   2026-09-16). On Intel cores a subnormal operand turns a 4 ms `Linear` into a
   475 ms one (measured, i9-13900KS; an EPYC 9354 is unaffected), and the trained

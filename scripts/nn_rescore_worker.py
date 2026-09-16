@@ -113,12 +113,23 @@ Env knobs (all optional):
                                      falling back to CPU on a CPU-only torch build.
     MUMDIA_NN_THREADS     = 16       torch CPU threads asked for (0 = leave torch's default);
                                      the engine passes its --threads here
-    MUMDIA_NN_FLUSH_DENORMAL = 1     flush subnormal float32 to zero in torch (FTZ/DAZ). Intel
-                                     cores handle subnormals through microcode assists at
-                                     ~100x the cost per affected FMA; the trained network
-                                     carries them, and the desktop rescore ran 6x slower than
-                                     the fleet's on the same pool because of it. 0 = leave the
-                                     FPU default.
+    MUMDIA_NN_DROP_CONSTANT = 1      drop feature columns that are constant over the pool
+                                     (from the parquet footer's per-column statistics, so no
+                                     read). A constant column standardises to exactly 0 and
+                                     contributes nothing to any prediction, but its first-layer
+                                     weights see only Adam's L2 term and decay below 1.2e-38;
+                                     on Intel cores every FMA on a subnormal operand then takes
+                                     a ~100x microcode assist, which made a desktop rescore 6x
+                                     slower than the same pool on an EPYC. 0 = keep them.
+    MUMDIA_NN_FLUSH_DENORMAL = 1     flush subnormal float32 to zero in torch (FTZ/DAZ). The
+                                     constant columns are not the only subnormal source: dead
+                                     hidden units and their BatchNorm buffers decay too (census
+                                     on the six-run pool: up to ~6,400 parameters, 11 buffers,
+                                     ~3,000 activations per round), and without this the desktop
+                                     rescore took 61.8 min against 11.4 with it. Any change to
+                                     the arithmetic reshuffles a single seed's count by up to
+                                     ~0.4% (thread count, column set, this flag alike); means
+                                     over seeds are flat. 0 = leave the FPU default.
     MUMDIA_NN_DEBUG_DENORMALS = 0    1 = after every training round, count subnormal cells in
                                      the model's parameters, buffers and one chunk's
                                      activations, and print them (diagnostic only)
@@ -275,6 +286,35 @@ def torch_thread_cap():
     if p_cores:
         return p_cores, f"{p_cores} performance cores on a hybrid CPU"
     return _THREAD_CAP, "flat beyond this on every CPU measured"
+
+
+def constant_columns(pin_path, cols):
+    """Feature columns whose parquet footer statistics show a single value in every row group.
+
+    No data is read: the writer records min/max per column chunk, and a column with
+    min == max across all groups is constant over the pool. Columns without statistics are
+    kept, so a file from a writer that omits them behaves as before.
+    """
+    pf = pq.ParquetFile(pin_path)
+    md = pf.metadata
+    position = {name: j for j, name in enumerate(pf.schema_arrow.names)}
+    out = []
+    for c in cols:
+        j = position.get(c)
+        if j is None:
+            continue
+        lo = hi = None
+        complete = True
+        for rg in range(md.num_row_groups):
+            st = md.row_group(rg).column(j).statistics
+            if st is None or not st.has_min_max:
+                complete = False
+                break
+            lo = st.min if lo is None else min(lo, st.min)
+            hi = st.max if hi is None else max(hi, st.max)
+        if complete and lo is not None and lo == hi:
+            out.append(c)
+    return out
 
 
 def _denormal_census(model, xb):
@@ -592,11 +632,18 @@ def main():
     # a hundred times the cost of a normal FMA. Measured on an i9-13900KS: one 16384 x 387
     # Linear takes 4.2 ms with normal inputs, 475 ms with subnormal ones, 150 ms with
     # subnormal weights, and 3.5 ms again with flush-to-zero; an EPYC 9354 pays nothing
-    # either way (12.1 against 11.4 ms). The trained network accumulates subnormals as
-    # training proceeds, which is why the same six-run pool took 118 minutes on that
-    # desktop and 19 on the fleet while single-threaded epoch speed was identical, and why
-    # the desktop's iterations got slower as the run went on. Values below 1.2e-38
-    # contribute nothing to a score, so flushing them changes no identification.
+    # either way (12.1 against 11.4 ms). The subnormals are the first-layer weights of the
+    # constant feature columns (see `constant_columns`), which is why the same six-run pool
+    # took 118 minutes on that desktop and 19 on the fleet while single-threaded epoch
+    # speed was identical. Dropping those columns (`constant_columns`) removes that source
+    # but not the others: dead hidden units and their BatchNorm running variances decay the
+    # same way (census on the six-run pool: up to ~6,400 parameters, 11 buffers, ~3,000
+    # activations in a round), and without flushing the desktop still took 61.8 min against
+    # 11.4 with it. Flushing perturbs the arithmetic below 1.2e-38, and any such perturbation
+    # reshuffles a single seed's count by up to ~0.4% -- changing the thread count or the
+    # column set does the same (116,405 -> 116,192 at 8 threads, -> 116,025 with the constant
+    # columns dropped, -> 115,937 flushed, all seed 0) -- while the mean over seeds is flat
+    # (Astral, flushed, three seeds: -0.24 / -0.04 / +0.03%).
     FLUSH_DENORMAL = env_i("MUMDIA_NN_FLUSH_DENORMAL", 1) != 0
     if FLUSH_DENORMAL:
         _ftz = torch.set_flush_denormal(True)
@@ -687,6 +734,23 @@ def main():
             % (len(feat_cols), len(_all_feats)),
             flush=True,
         )
+    # Constant columns never train. Standardised to exactly 0 they contribute nothing to any
+    # prediction, but their first-layer weights receive only Adam's L2 term and decay below
+    # 1.2e-38 within a few thousand steps (measured census: about 10 columns x 128 units on
+    # the six-run Astral pool). Every FMA on a subnormal operand then takes a microcode
+    # assist on Intel cores, ~100x a normal one, which made a desktop rescore 6x slower than
+    # the same pool on an EPYC. Dropping them here removes the source without touching the
+    # arithmetic of anything else; the parquet footer identifies them, so nothing is read.
+    if IS_PQ and env_i("MUMDIA_NN_DROP_CONSTANT", 1) != 0:
+        _const = constant_columns(pin_path, feat_cols)
+        if _const and len(_const) < len(feat_cols):
+            _drop = set(_const)
+            feat_cols = [c for c in feat_cols if c not in _drop]
+            print(
+                "nn_rescore_worker: dropped %d constant feature column(s): %s%s"
+                % (len(_const), ", ".join(_const[:6]), ", ..." if len(_const) > 6 else ""),
+                flush=True,
+            )
     nf = len(feat_cols)
     if nf == 0:
         raise ValueError("PIN contains no rescoring feature columns")
