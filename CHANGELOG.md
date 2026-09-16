@@ -37,6 +37,23 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ## [Unreleased]
 
+### Changed
+
+- **`rescore.feature_preset` now defaults to `compact`**, the embedded 114-feature list,
+  rather than `all`. The rescore matrix is 3.4x smaller (full-scale HYE 5.49 GB against
+  13.5 GB).
+
+  This costs identifications and the numbers are worth knowing before upgrading: -1.2%
+  peptides on the held-out HYE B01 pool under the default training (+0.2% / -0.1% /
+  +1.5% on A01 / AIF / entrapment), and **-2.1% on a FASTA-built entrapment library**,
+  because the 114 features were selected on a DIA-NN-library search and do not transfer
+  for free. Set `feature_preset: all` to score on every feature as before.
+
+  It does not make rescoring faster: MLP training time per row is flat in the feature
+  count from 387 down to 25. If a rescore is slow because its feature matrix crossed
+  `MUMDIA_NN_STREAM_GB` and fell to the disk-backed memmap, the fix is the threshold,
+  which is now sized from free memory.
+
 ## [0.4.0] - 2026-09-14
 
 ### Fixed

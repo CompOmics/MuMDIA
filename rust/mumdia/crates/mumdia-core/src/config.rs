@@ -1622,10 +1622,22 @@ pub struct RescoreConfig {
     /// spike-in FDP unchanged) at 3.4x less rescore memory. Preset names the table lacks
     /// are skipped with a log line rather than an error, so a preset tolerates a smaller
     /// `features.set`; the intersection must not be empty. Explicit lists stay strict.
-    /// Default `all`: the projection is a memory lever (3.4x smaller rescore matrix), not a
-    /// sensitivity one, and it cost 1.2% on the held-out HYE B01 pool under the default
-    /// training (+0.2% / -0.1% / +1.5% on A01 / AIF / entrapment), so it is the option for
-    /// pooled rescoring on small machines (docs/28 section 21), not the default.
+    ///
+    /// Default `compact` since 2026-09-16. It is a memory lever rather than a sensitivity
+    /// one: the rescore matrix is 3.4x smaller (full-scale HYE 5.49 GB against 13.5 GB),
+    /// while MLP training time per row is flat in the feature count from 387 down to 25,
+    /// so it buys space and not time.
+    ///
+    /// It COSTS identifications, and the numbers are the reason to know what you are
+    /// choosing: -1.2% peptides on the held-out HYE B01 pool under the default training
+    /// (+0.2% / -0.1% / +1.5% on A01 / AIF / entrapment), and -2.1% on a FASTA-built
+    /// entrapment library. B01 is the pool the list was never fitted on, and the FASTA
+    /// figure is the one to weigh if you do not search a DIA-NN library: the 114 features
+    /// were selected on a DIA-NN-library search and do not transfer for free.
+    ///
+    /// Set `all` to score on every feature. Do that when identifications matter more than
+    /// memory, when the library is not a DIA-NN import, or whenever the list is
+    /// re-derived for another library type (docs/28 section 12).
     pub feature_preset: FeaturePreset,
     /// Cap the decoys the sidecar TRAINS on at this multiple of the targets it selected
     /// that iteration; 0 (the default) trains on every decoy, which is about 19:1 on a
@@ -1671,9 +1683,16 @@ fn default_seeds() -> usize {
 #[serde(rename_all = "snake_case")]
 pub enum FeaturePreset {
     /// Every feature column of the competed table.
-    #[default]
     All,
     /// The 114-feature list of docs/28 section 12, embedded in the engine.
+    ///
+    /// The default since 2026-09-16, by explicit maintainer decision rather than a
+    /// measurement: it is 3.4x less memory for the rescore matrix, at a measured cost of
+    /// -1.2% peptides on the held-out HYE B01 pool and -2.1% on a FASTA-built entrapment
+    /// library, the latter because the list was selected on a DIA-NN-library search. See
+    /// `RescoreConfig::feature_preset` for the full set of numbers and for when to set
+    /// `all` back.
+    #[default]
     Compact,
 }
 
@@ -1718,7 +1737,7 @@ impl Default for RescoreConfig {
             // spike-in FDP unchanged, at 9-19x less training time. `train_neg_ratio = 0`,
             // `train_neg_select = random`, `train_warm_epochs = 0` restore the previous
             // behaviour exactly. The compact feature preset stays opt-in (see its field).
-            feature_preset: FeaturePreset::All,
+            feature_preset: FeaturePreset::Compact,
             train_neg_ratio: 3.0,
             train_neg_select: NegSelect::Hybrid,
             train_subsample: 0.0,
@@ -2574,22 +2593,27 @@ mod tests {
     #[test]
     fn rescore_defaults_are_the_training_recipe_and_json_omission_keeps_them() {
         let d = RescoreConfig::default();
-        assert_eq!(d.feature_preset, FeaturePreset::All);
+        // Compact since 2026-09-16: 3.4x less memory, at -1.2% peptides on the held-out
+        // HYE B01 pool and -2.1% on a FASTA-built entrapment library. `all` scores on
+        // every feature and is what to set when identifications matter more.
+        assert_eq!(d.feature_preset, FeaturePreset::Compact);
         assert_eq!(d.train_neg_ratio, 3.0);
         assert_eq!(d.train_neg_select, NegSelect::Hybrid);
         assert_eq!(d.train_warm_epochs, 5);
         // A config that does not mention them gets the same values (no field-level
         // serde default shadowing the struct default), and each can be switched off.
         let c = Config::from_json(r#"{"rescore":{"classifier":"native_tda"}}"#).expect("parses");
-        assert_eq!(c.rescore.feature_preset, FeaturePreset::All);
+        assert_eq!(c.rescore.feature_preset, FeaturePreset::Compact);
         assert_eq!(c.rescore.train_neg_ratio, 3.0);
         assert_eq!(c.rescore.train_neg_select, NegSelect::Hybrid);
         assert_eq!(c.rescore.train_warm_epochs, 5);
+        // `all` is now the one that has to be asked for, which is the direction that
+        // matters: a configuration wanting every feature must be able to say so.
         let c = Config::from_json(
-            r#"{"rescore":{"feature_preset":"compact","train_neg_ratio":0.0,"train_neg_select":"random","train_warm_epochs":0}}"#,
+            r#"{"rescore":{"feature_preset":"all","train_neg_ratio":0.0,"train_neg_select":"random","train_warm_epochs":0}}"#,
         )
         .expect("parses");
-        assert_eq!(c.rescore.feature_preset, FeaturePreset::Compact);
+        assert_eq!(c.rescore.feature_preset, FeaturePreset::All);
         assert_eq!(c.rescore.train_neg_ratio, 0.0);
         assert_eq!(c.rescore.train_neg_select, NegSelect::Random);
         assert_eq!(c.rescore.train_warm_epochs, 0);

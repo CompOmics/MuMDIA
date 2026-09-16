@@ -833,7 +833,7 @@ requiring entrapment/target-decoy FDR validation before use.
 | `strict` | `true` | fail on a rescorer sidecar failure or unsupported classifier; set false only for explicit compatibility fallback |
 | `handoff` | `parquet` | how the feature matrix reaches a sidecar rescorer (`Handoff`); mokapot/entrapment fall back to TSV automatically (docs/28 section 11) |
 | `features` / `features_file` | `None` | explicit feature projection by name (inline list or one-name-per-line file); strict: a missing name is an error |
-| `feature_preset` | `all` | named list used when no explicit list is set: `all` every column, `compact` the embedded 114-feature list of docs/28 section 12 (3.4x smaller rescore matrix; the option for pooled rescoring on small machines, -1.2% on the held-out HYE B01 pool). Preset names the table lacks are skipped with a log line |
+| `feature_preset` | `compact` | named list used when no explicit list is set: `all` every column, `compact` the embedded 114-feature list of docs/28 section 12 (3.4x smaller rescore matrix; the option for pooled rescoring on small machines, -1.2% on the held-out HYE B01 pool). Preset names the table lacks are skipped with a log line |
 | `train_neg_ratio` | 3.0 | cap on decoys per positive in each training fold (0 = every decoy) |
 | `train_neg_select` | `hybrid` | which decoys survive the cap: `random`, `margin` (highest-scoring), `hybrid` (`train_margin_frac` from the margin, rest random) |
 | `train_margin_frac` | 0.5 | margin share under `hybrid` |

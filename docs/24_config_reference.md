@@ -72,7 +72,7 @@ undocumented on purpose; those fields are counted under "Coverage".
 
 ## (top level)
 
-`Config` (rust/mumdia/crates/mumdia-core/src/config.rs:1851). stage document: [docs/02_config_and_data_model.md](02_config_and_data_model.md).
+`Config` (rust/mumdia/crates/mumdia-core/src/config.rs:1870). stage document: [docs/02_config_and_data_model.md](02_config_and_data_model.md).
 
 | Field | Type | Default | Gated | Description |
 |---|---|---|---|---|
@@ -324,7 +324,7 @@ Composable per-claimant weight cues for `PeakClaim::CoelutionMultiCue` (the modu
 | `handoff` | `Handoff` | `parquet` |  | How the feature matrix reaches a sidecar rescorer. See `Handoff`. Defaults to `parquet`, which applies to nn_torch only; mokapot and entrapment sidecars always receive the tab-separated PIN. |
 | `features` | `Option<Vec<String>>` | `null` |  | Restrict the classifier's input to these feature columns, by name. Absent (the default) falls through to `feature_preset`. The restriction is a projection, not a reordering: the columns keep the order of the feature schema, only those named are read out of the competed table, and the matrix, the sidecar handoff and the training all shrink with the list. Feature selection is a memory and I/O lever, not a speed one (docs/28 section 7), and any list must clear the sensitivity gate before it becomes a default. Mutually exclusive with `RescoreConfig::features_file`. Every name must exist in the competed table's schema; a missing one is an error, never a silent drop. |
 | `features_file` | `Option<String>` | `null` |  | The same restriction, read from a file with one feature name per line (blank lines and `#` comments ignored), which is how a 100+ name list stays readable. |
-| `feature_preset` | `FeaturePreset` | `all` |  | Named feature list used when neither `features` nor `features_file` is set. `all` is every feature the competed table carries. `compact` is the 114-name list of docs/28 section 12 (`bench/feature_selection/fs_union75_dedup.txt`, embedded in the binary), which with the hard-negative training recipe reproduced the full Extended set within seed noise on three pools (HYE A01 +1.2%, AIF -0.2%, entrapment +4.9%, spike-in FDP unchanged) at 3.4x less rescore memory. Preset names the table lacks are skipped with a log line rather than an error, so a preset tolerates a smaller `features.set`; the intersection must not be empty. Explicit lists stay strict. Default `all`: the projection is a memory lever (3.4x smaller rescore matrix), not a sensitivity one, and it cost 1.2% on the held-out HYE B01 pool under the default training (+0.2% / -0.1% / +1.5% on A01 / AIF / entrapment), so it is the option for pooled rescoring on small machines (docs/28 section 21), not the default. |
+| `feature_preset` | `FeaturePreset` | `compact` |  | Named feature list used when neither `features` nor `features_file` is set. `all` is every feature the competed table carries. `compact` is the 114-name list of docs/28 section 12 (`bench/feature_selection/fs_union75_dedup.txt`, embedded in the binary), which with the hard-negative training recipe reproduced the full Extended set within seed noise on three pools (HYE A01 +1.2%, AIF -0.2%, entrapment +4.9%, spike-in FDP unchanged) at 3.4x less rescore memory. Preset names the table lacks are skipped with a log line rather than an error, so a preset tolerates a smaller `features.set`; the intersection must not be empty. Explicit lists stay strict. Default `compact` since 2026-09-16. It is a memory lever rather than a sensitivity one: the rescore matrix is 3.4x smaller (full-scale HYE 5.49 GB against 13.5 GB), while MLP training time per row is flat in the feature count from 387 down to 25, so it buys space and not time. It COSTS identifications, and the numbers are the reason to know what you are choosing: -1.2% peptides on the held-out HYE B01 pool under the default training (+0.2% / -0.1% / +1.5% on A01 / AIF / entrapment), and -2.1% on a FASTA-built entrapment library. B01 is the pool the list was never fitted on, and the FASTA figure is the one to weigh if you do not search a DIA-NN library: the 114 features were selected on a DIA-NN-library search and do not transfer for free. Set `all` to score on every feature. Do that when identifications matter more than memory, when the library is not a DIA-NN import, or whenever the list is re-derived for another library type (docs/28 section 12). |
 | `train_neg_ratio` | `f64` | `3.0` |  | Cap the decoys the sidecar TRAINS on at this multiple of the targets it selected that iteration; 0 (the default) trains on every decoy, which is about 19:1 on a DIA pool and is where the rescore spends its time. This thins gradient steps only. Selection, scoring, target-decoy competition and q-values still run over the full pool, so the cap cannot loosen the q threshold; what it can move is the learned boundary, hence a knob and not a default. |
 | `train_neg_select` | `NegSelect` | `hybrid` |  | Which decoys survive `RescoreConfig::train_neg_ratio`. See `NegSelect`. |
 | `train_subsample` | `f64` | `0.0` |  | Stratified thinning of whatever survived the cap: a fraction in (0, 1], or a row cap when > 1. Positives and negatives are thinned by the same factor, so the class balance is unchanged. 0 (the default) keeps every row. |
@@ -374,7 +374,7 @@ Composable per-claimant weight cues for `PeakClaim::CoelutionMultiCue` (the modu
 
 ## experiment
 
-`ExperimentConfig` (rust/mumdia/crates/mumdia-core/src/config.rs:1806). stage document: [docs/01_overview_and_dataflow.md](01_overview_and_dataflow.md).
+`ExperimentConfig` (rust/mumdia/crates/mumdia-core/src/config.rs:1825). stage document: [docs/01_overview_and_dataflow.md](01_overview_and_dataflow.md).
 
 Options for the experiment-wide orchestrator (`mumdia run-experiment`).
 
@@ -481,14 +481,14 @@ Decoy-transfer null for the MBR false-transfer FDR (M4). `ReverseSequence` trans
 
 ### `FeaturePreset`
 
-(rust/mumdia/crates/mumdia-core/src/config.rs:1672)
+(rust/mumdia/crates/mumdia-core/src/config.rs:1684)
 
 Named feature list for `RescoreConfig::feature_preset`.
 
 | Value | Default | Description |
 |---|---|---|
-| `all` | yes | Every feature column of the competed table. |
-| `compact` |  | The 114-feature list of docs/28 section 12, embedded in the engine. |
+| `all` |  | Every feature column of the competed table. |
+| `compact` | yes | The 114-feature list of docs/28 section 12, embedded in the engine. The default since 2026-09-16, by explicit maintainer decision rather than a measurement: it is 3.4x less memory for the rescore matrix, at a measured cost of -1.2% peptides on the held-out HYE B01 pool and -2.1% on a FASTA-built entrapment library, the latter because the list was selected on a DIA-NN-library search. See `RescoreConfig::feature_preset` for the full set of numbers and for when to set `all` back. |
 
 ### `FeatureSet`
 
@@ -537,7 +537,7 @@ Spectral-agreement score the extraction acceptance gate (`gate_min_score`) thres
 
 ### `Handoff`
 
-(rust/mumdia/crates/mumdia-core/src/config.rs:1776)
+(rust/mumdia/crates/mumdia-core/src/config.rs:1795)
 
 How the feature matrix crosses the Rust -> Python boundary for a sidecar rescorer.
 
@@ -584,7 +584,7 @@ Match-between-runs strategy (Stage D3, docs/12_quant_lfq_align_mbr_report_audit.
 
 ### `NegSelect`
 
-(rust/mumdia/crates/mumdia-core/src/config.rs:1683)
+(rust/mumdia/crates/mumdia-core/src/config.rs:1702)
 
 Which decoys survive the training-set negative cap.
 
@@ -659,7 +659,7 @@ Which q-value column quant filters candidates on. Peptide- or precursor-level q 
 
 ### `RtLibraryScope`
 
-(rust/mumdia/crates/mumdia-core/src/config.rs:1739)
+(rust/mumdia/crates/mumdia-core/src/config.rs:1758)
 
 How many DeepLC fine-tunes an experiment pays for.
 

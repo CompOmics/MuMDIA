@@ -32,7 +32,7 @@
       "default_text": "0",
       "help": "",
       "gates": [],
-      "source_line": 1854
+      "source_line": 1873
     },
     {
       "path": "convert.thermo_raw_parser",
@@ -1900,11 +1900,11 @@
       "rust_type": "FeaturePreset",
       "kind": "enum",
       "optional": false,
-      "default": "all",
-      "default_text": "`all`",
-      "help": "Named feature list used when neither `features` nor `features_file` is set. `all` is every feature the competed table carries. `compact` is the 114-name list of docs/28 section 12 (`bench/feature_selection/fs_union75_dedup.txt`, embedded in the binary), which with the hard-negative training recipe reproduced the full Extended set within seed noise on three pools (HYE A01 +1.2%, AIF -0.2%, entrapment +4.9%, spike-in FDP unchanged) at 3.4x less rescore memory. Preset names the table lacks are skipped with a log line rather than an error, so a preset tolerates a smaller `features.set`; the intersection must not be empty. Explicit lists stay strict. Default `all`: the projection is a memory lever (3.4x smaller rescore matrix), not a sensitivity one, and it cost 1.2% on the held-out HYE B01 pool under the default training (+0.2% / -0.1% / +1.5% on A01 / AIF / entrapment), so it is the option for pooled rescoring on small machines (docs/28 section 21), not the default.",
+      "default": "compact",
+      "default_text": "`compact`",
+      "help": "Named feature list used when neither `features` nor `features_file` is set. `all` is every feature the competed table carries. `compact` is the 114-name list of docs/28 section 12 (`bench/feature_selection/fs_union75_dedup.txt`, embedded in the binary), which with the hard-negative training recipe reproduced the full Extended set within seed noise on three pools (HYE A01 +1.2%, AIF -0.2%, entrapment +4.9%, spike-in FDP unchanged) at 3.4x less rescore memory. Preset names the table lacks are skipped with a log line rather than an error, so a preset tolerates a smaller `features.set`; the intersection must not be empty. Explicit lists stay strict. Default `compact` since 2026-09-16. It is a memory lever rather than a sensitivity one: the rescore matrix is 3.4x smaller (full-scale HYE 5.49 GB against 13.5 GB), while MLP training time per row is flat in the feature count from 387 down to 25, so it buys space and not time. It COSTS identifications, and the numbers are the reason to know what you are choosing: -1.2% peptides on the held-out HYE B01 pool under the default training (+0.2% / -0.1% / +1.5% on A01 / AIF / entrapment), and -2.1% on a FASTA-built entrapment library. B01 is the pool the list was never fitted on, and the FASTA figure is the one to weigh if you do not search a DIA-NN library: the 114 features were selected on a DIA-NN-library search and do not transfer for free. Set `all` to score on every feature. Do that when identifications matter more than memory, when the library is not a DIA-NN import, or whenever the list is re-derived for another library type (docs/28 section 12).",
       "gates": [],
-      "source_line": 1629,
+      "source_line": 1641,
       "choices": [
         "all",
         "compact"
@@ -1921,7 +1921,7 @@
       "default_text": "3.0",
       "help": "Cap the decoys the sidecar TRAINS on at this multiple of the targets it selected that iteration; 0 (the default) trains on every decoy, which is about 19:1 on a DIA pool and is where the rescore spends its time. This thins gradient steps only. Selection, scoring, target-decoy competition and q-values still run over the full pool, so the cap cannot loosen the q threshold; what it can move is the learned boundary, hence a knob and not a default.",
       "gates": [],
-      "source_line": 1637
+      "source_line": 1649
     },
     {
       "path": "rescore.train_neg_select",
@@ -1934,7 +1934,7 @@
       "default_text": "`hybrid`",
       "help": "Which decoys survive `RescoreConfig::train_neg_ratio`. See `NegSelect`.",
       "gates": [],
-      "source_line": 1639,
+      "source_line": 1651,
       "choices": [
         "random",
         "margin",
@@ -1952,7 +1952,7 @@
       "default_text": "0.0",
       "help": "Stratified thinning of whatever survived the cap: a fraction in (0, 1], or a row cap when > 1. Positives and negatives are thinned by the same factor, so the class balance is unchanged. 0 (the default) keeps every row.",
       "gates": [],
-      "source_line": 1644
+      "source_line": 1656
     },
     {
       "path": "rescore.train_warm_epochs",
@@ -1965,7 +1965,7 @@
       "default_text": "5",
       "help": "Reuse the previous iteration's weights and optimiser state, running this many epochs from the second self-training iteration on instead of a full fresh fit. 0 (the default) refits from scratch every iteration, which is 25 epochs x 10 iterations x 3 folds of the whole training set.",
       "gates": [],
-      "source_line": 1649
+      "source_line": 1661
     },
     {
       "path": "rescore.train_margin_frac",
@@ -1978,7 +1978,7 @@
       "default_text": "0.5",
       "help": "Under `train_neg_select = hybrid`, the share of the negative budget taken from the margin (highest-scoring decoys); the rest is sampled at random. Default 0.5.",
       "gates": [],
-      "source_line": 1653
+      "source_line": 1665
     },
     {
       "path": "rescore.seeds",
@@ -1991,7 +1991,7 @@
       "default_text": "1",
       "help": "Independent self-training passes whose out-of-fold scores are rank-averaged. 1 (the default) is a single pass. 3 was the one knob positive on every pool of the seeded sweep (docs/28 section 17), at three times the training cost.",
       "gates": [],
-      "source_line": 1658
+      "source_line": 1670
     },
     {
       "path": "quant.q_threshold",
@@ -2384,7 +2384,7 @@
       "default_text": "1",
       "help": "How many per-run search chains to execute concurrently. 1 (default) is strictly sequential, i.e. the historical behaviour. Runs are independent, so raising this scales nearly linearly in wall time, but EACH concurrent run holds its own extraction working set (tens of GB on a large library), so the practical ceiling is memory, not cores. Raise it deliberately after checking peak RSS for a single run; 2-4 is a reasonable start on a large-memory machine. Results are unaffected: chunks are processed in index order and completion order never reaches the output.",
       "gates": [],
-      "source_line": 1816
+      "source_line": 1835
     },
     {
       "path": "experiment.rt_library_scope",
@@ -2397,7 +2397,7 @@
       "default_text": "`first_run_only`",
       "help": "How often the library's retention times are adapted to a run: once on the first run and reused (`first_run_only`, the default) or separately for every run (`per_run`). Governs whichever adaptation is active -- `rt_im_train.finetune_deeplc` or `rt_im_train.multihead_calibration` -- because they are the same shape of work: one full re-prediction of the library against that run's confident seed PSMs, which on a 9.4M-row library is the most expensive step in the experiment. Each run then fits its own LOESS on top of whichever library it was given, and that per-run fit is what absorbs chromatographic drift. Accepts the old name `finetune_scope`, which is what it was called when only the fine-tune could be shared. `first_run_only` assumes the runs share an elution ORDER, which replicate injections on one LC method do. A per-run LOESS can stretch and bend the axis but cannot reorder two peptides, so a batch that genuinely reorders -- different gradients, different columns, a method change part-way -- wants `per_run`, and so does a long batch where drift accumulates (see the measured cost above).",
       "gates": [],
-      "source_line": 1837,
+      "source_line": 1856,
       "choices": [
         "first_run_only",
         "per_run"

@@ -436,13 +436,23 @@ sections 10-16:
   entrapment +3.3% with the spike-in FDP unchanged, at 9-19x less training time (docs/28
   section 21; B01's baseline training took 50 minutes per seed against 2.6). `train_neg_ratio:
   0, train_neg_select: random, train_warm_epochs: 0` restore the previous behaviour exactly.
-- `rescore.feature_preset = compact` (the embedded 114-feature list) stays opt-in. It is a
-  memory lever, not a sensitivity one: the rescore matrix shrinks 3.4x (full-scale HYE
-  rescore 5.49 GB / 3:19 against 13.5 GB / 6:20 with every feature, process-tree peaks; both
-  sit under extract's 16.5 GiB), but under the
-  default training it measured +0.2% / -1.2% / -0.1% / +1.5% on A01 / B01 / AIF / entrapment,
-  and B01 is the pool the list was never fitted on. Use it for pooled rescoring on machines
-  where the matrix would not fit (six HYE runs: 15.9 GB with it), not by default.
+- `rescore.feature_preset = compact` (the embedded 114-feature list) is the DEFAULT since
+  2026-09-16, by maintainer decision rather than a measurement. It is a memory lever, not a
+  sensitivity one: the rescore matrix shrinks 3.4x (full-scale HYE rescore 5.49 GB / 3:19
+  against 13.5 GB / 6:20 with every feature, process-tree peaks; both sit under extract's
+  16.5 GiB), while MLP training time per row is flat in the feature count from 387 down to
+  25, so it buys space and not time.
+
+  It COSTS identifications: under the default training +0.2% / -1.2% / -0.1% / +1.5% on A01
+  / B01 / AIF / entrapment, and -2.1% on a FASTA-built entrapment library. B01 is the pool
+  the list was never fitted on, and the FASTA figure is the one that matters if the library
+  is not a DIA-NN import, because the 114 features were selected on a DIA-NN-library search
+  and do not transfer for free. Set `feature_preset: all` when identifications matter more
+  than memory, and re-derive the list per library type rather than inheriting it.
+
+  Note what this default does NOT fix. The slow-rescore case it was reached for was a
+  feature matrix crossing `MUMDIA_NN_STREAM_GB` and falling to the disk-backed memmap; that
+  is fixed by sizing the threshold from free memory, not by shrinking the matrix.
 - The "sensitivity" recipe adds `folds: 5, train_margin_frac: 0.75, seeds: 3`: +0.4 / +0.4 /
   +0.6 pp over the fast recipe on HYE A01 / AIF / entrapment with the FDP unchanged, for 5.3x
   the rescore wall through the engine (18:38 against 3:31 on HYE B01, +0.2% peptides there);
