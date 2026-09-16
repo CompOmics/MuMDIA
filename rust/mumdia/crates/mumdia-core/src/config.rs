@@ -2589,7 +2589,7 @@ mod tests {
         // serde default shadowing the struct default), and each can be switched off.
         let c = Config::from_json(r#"{"rescore":{"classifier":"native_tda"}}"#).expect("parses");
         assert_eq!(c.rescore.feature_preset, FeaturePreset::All);
-        assert_eq!(c.rescore.train_neg_ratio, 3.0);
+        assert_eq!(c.rescore.train_neg_ratio, 2.0);
         assert_eq!(c.rescore.train_neg_select, NegSelect::Hybrid);
         assert_eq!(c.rescore.train_warm_epochs, 5);
         let c = Config::from_json(
