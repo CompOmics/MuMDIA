@@ -50,6 +50,13 @@ than a number. Both are recorded in every run's `manifest.json`.
 
   The worker already logged which backend it chose; it now also says where the threshold
   came from, and warns explicitly when the slow path is taken for want of memory.
+### Security
+
+- `rustls` 0.23.43 -> 0.23.45 in the desktop application, closing RUSTSEC-2026-0285
+  (TLS 1.3 handshake messages incorrectly accepted across encryption level boundaries,
+  medium, 5.3). It reaches the application through `ureq`, which is what downloads
+  DIA-NN 1.8.1 and ThermoRawFileParser, so it is on a path that fetches executables.
+  Lock-only; no manifest constraint changed.
 
 ## [0.4.0] - 2026-09-14
 
