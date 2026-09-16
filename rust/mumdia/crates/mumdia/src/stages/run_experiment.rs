@@ -589,6 +589,8 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         )?;
         out
     } else {
+        // Same two reasons as in `run`: no interpreter (warn) or the multi-head calibration
+        // taking over the re-prediction on the first run (a plan, logged as such).
         if p.lib_precursors.is_some()
             && !cfg.rt_im_train.finetune_deeplc
             && matches!(
@@ -596,11 +598,18 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
                 mumdia_core::config::LibraryIrt::Auto
             )
         {
-            warn!(
-                "run-experiment: keeping the imported library iRT because no \
-                 predict_frag.deeplc_python is configured; configure one to re-predict with \
-                 DeepLC, or set rt_im_train.library_irt = library to silence this"
-            );
+            if cfg.predict_frag.deeplc_python.is_none() {
+                warn!(
+                    "run-experiment: keeping the imported library iRT because no \
+                     predict_frag.deeplc_python is configured; configure one to re-predict with \
+                     DeepLC, or set rt_im_train.library_irt = library to silence this"
+                );
+            } else {
+                info!(
+                    "run-experiment: the multi-head calibration re-predicts the library iRT on \
+                     the first run; skipping the base-model re-prediction it would overwrite"
+                );
+            }
         }
         lib_p_base
     };
