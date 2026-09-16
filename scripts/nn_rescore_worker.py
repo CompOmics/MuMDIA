@@ -50,7 +50,13 @@ Env knobs (all optional):
     MUMDIA_NN_SEEDS       = 1        seed models to ensemble (average OOF)
     MUMDIA_NN_SEED        = 0        base seed; ensemble member s uses SEED + s (seeded repeats)
     MUMDIA_NN_STREAM      = auto     auto|1|0  force the streaming memmap backend
-    MUMDIA_NN_STREAM_GB   = 4        auto-stream when the PIN exceeds this many GB
+    MUMDIA_NN_STREAM_GB   = auto     auto-stream when the decoded feature matrix exceeds
+                                     this many GB. Unset, it is TWICE free physical
+                                     memory, never below the historical 4 GB: the memmap
+                                     measured ~9x slower than RAM (166 min against ~20 on
+                                     a 4.52 GB matrix), so it is a last resort and the
+                                     page file absorbs a matrix that merely overflows.
+                                     Set it explicitly on a machine with no page file.
     MUMDIA_NN_CHUNK       = 250000   PIN rows per read chunk (streaming backend)
     MUMDIA_NN_INIT_SAMPLE = 300000   rows used to pick the init feature (streaming)
     MUMDIA_NN_INIT_TOPK   = 0        > 0 sorts only a top-k window per feature in the init
@@ -270,6 +276,88 @@ def n_targets_at_many(X, is_target, fdr, topk=0):
     return best_j, best_sign, best_n
 
 
+
+# How much larger than free physical memory a feature matrix may be before the
+# disk-backed memmap is used at all.
+#
+# Deliberately greater than 1: the memmap is a LAST RESORT, not a safety margin. Its
+# indexed minibatch reads measured about 9x slower than holding the matrix in RAM -- 166
+# minutes against roughly 20 on a 4.52 GiB matrix -- whereas a matrix that merely
+# overflows physical memory is paged by the operating system, which for the largely
+# sequential access this training does is far cheaper than the explicit memmap path.
+# Above this ratio the paging itself would thrash and the memmap wins again.
+#
+# The consequence is deliberate and worth stating: between 1x and 2x free memory the
+# rescore relies on the page file. A machine with no page file, or a small fixed one,
+# will hit the allocator instead -- set MUMDIA_NN_STREAM_GB explicitly there.
+_FREE_MULTIPLIER = 2.0
+
+
+def available_ram_bytes():
+    """Physical memory currently available, or None when it cannot be determined.
+
+    No new dependency: `psutil` is not in the rescore environment and adding it to reach
+    one number is not worth the resolver risk. Windows goes through
+    `GlobalMemoryStatusEx`, Linux reads `MemAvailable` (which accounts for reclaimable
+    cache, unlike MemFree), and anything else returns None so the caller keeps the fixed
+    default rather than guessing.
+    """
+    try:
+        if sys.platform == "win32":
+            import ctypes
+
+            class _MemStatus(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", ctypes.c_ulong),
+                    ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", ctypes.c_ulonglong),
+                    ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong),
+                    ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong),
+                    ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+                ]
+
+            m = _MemStatus()
+            m.dwLength = ctypes.sizeof(_MemStatus)
+            if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m)):
+                return None
+            return int(m.ullAvailPhys)
+        with open("/proc/meminfo", encoding="utf-8") as fh:
+            for line in fh:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except Exception:  # noqa: BLE001 - any failure means "cannot tell", never fatal
+        return None
+    return None
+
+
+def auto_stream_threshold_gb(default_gb):
+    """How large a feature matrix may be before the disk-backed backend is used.
+
+    The fixed 4 GB this replaces cost 166 minutes on the machine that prompted the
+    change: 96 GiB total, 42 free, and a 4.52 GiB matrix that crossed the threshold by
+    13% and took the memmap path instead of the roughly 20 minutes it needed in RAM.
+
+    The memmap is treated as a last resort rather than a safety margin, so the threshold
+    is `_FREE_MULTIPLIER` times free memory -- above it, not under it. Between 1x and 2x
+    the operating system pages, which for this access pattern is much cheaper than the
+    memmap; beyond that the paging thrashes and the memmap is the better of two bad
+    options. Never returns less than `default_gb`, so a machine too small to benefit
+    keeps exactly today's behaviour.
+
+    Returns `(threshold_gb, why)` so the caller can say where the number came from.
+    """
+    free = available_ram_bytes()
+    if not free:
+        return default_gb, "default (available memory could not be determined)"
+    free_gb = free / 1024 ** 3
+    derived = free_gb * _FREE_MULTIPLIER
+    if derived <= default_gb:
+        return default_gb, f"default ({free_gb:.1f} GiB free is not enough to raise it)"
+    return derived, f"{_FREE_MULTIPLIER:g}x the {free_gb:.1f} GiB free"
+
 def main():
     pin_path, out_path = sys.argv[1], sys.argv[2]
 
@@ -354,7 +442,12 @@ def main():
         # backend was biased upward and could stream a matrix that fits (docs/31 F5).
         _nf_guess = max(1, sum(1 for c in pq.read_schema(pin_path).names if c not in NON_FEATURE))
         filesize = int(_md.num_rows) * _nf_guess * 4
-    stream_gb = env_f("MUMDIA_NN_STREAM_GB", 4)
+    # An explicit MUMDIA_NN_STREAM_GB wins; otherwise size it from free memory, because
+    # a fixed 4 GB is both too small on a workstation and too large on a laptop.
+    if os.environ.get("MUMDIA_NN_STREAM_GB"):
+        stream_gb, stream_why = env_f("MUMDIA_NN_STREAM_GB", 4), "MUMDIA_NN_STREAM_GB"
+    else:
+        stream_gb, stream_why = auto_stream_threshold_gb(4)
     stream = stream_env in ("1", "on", "true") or (
         stream_env == "auto" and filesize > stream_gb * 1024 ** 3
     )
@@ -362,11 +455,22 @@ def main():
     # ~1M PSMs silently switched to the disk-backed memmap and started requiring a
     # writable path -- an invisible change of behaviour when it went wrong.
     print(
-        f"nn_rescore_worker: PIN {filesize / 1024 ** 3:.2f} GB, threshold {stream_gb:.2f} GB, "
-        f"MUMDIA_NN_STREAM={stream_env} -> backend={'stream(memmap)' if stream else 'in-memory'}"
+        f"nn_rescore_worker: PIN {filesize / 1024 ** 3:.2f} GB, threshold {stream_gb:.2f} GB "
+        f"({stream_why}), MUMDIA_NN_STREAM={stream_env} -> "
+        f"backend={'stream(memmap)' if stream else 'in-memory'}"
         f", format={'parquet' if pin_path.lower().endswith(('.parquet', '.pq')) else 'tsv'}",
         flush=True,
     )
+
+    if stream and stream_env == "auto":
+        print(
+            f"nn_rescore_worker: the {filesize / 1024 ** 3:.2f} GB feature matrix exceeds the "
+            f"{stream_gb:.2f} GB threshold, so scoring runs from a disk-backed memmap. That is "
+            "correct but MUCH slower than holding it in RAM. Raise MUMDIA_NN_STREAM_GB if the "
+            "machine has the memory, or set rescore.feature_preset = compact to shrink the "
+            "matrix.",
+            flush=True,
+        )
 
     _t = time.time()
     # Parquet or the legacy tab-separated PIN, decided by extension.
