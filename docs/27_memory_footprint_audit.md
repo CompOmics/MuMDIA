@@ -165,7 +165,9 @@ Three changes, all in `rescore.rs`, `table.rs` and `nn_rescore_worker.py`:
 What remains is the matrix itself plus one fold's gathered training rows (1.1 GB on the
 Astral pool), and the engine at ~1 GB while it waits. The whole six-file Astral experiment
 (`mumdia run` with six `--mzml`) measured 52.5 min at a 13.25 GB process-tree peak on the
-same class of host, the peak set during the per-file chain, not the rescore. `rescore.feature_preset = compact`
+same class of host. That peak is the multi-head DeepLC calibration of the first run (13.0-13.2 GB
+for its whole 11.7 min), not extract and not the rescore; after it the per-run chain runs at
+1-10 GB and the pooled rescore at 9.3. `rescore.feature_preset = compact`
 still shrinks the matrix 3.4x on top of this, at its measured -3.4% peptides on the Astral
 pool; the two compose.
 

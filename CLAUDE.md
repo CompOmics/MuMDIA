@@ -541,9 +541,12 @@ sections 10-16:
   `nn_torch` rescore) take 52.5 min at a 13.25 GB process-tree peak on an EPYC 9354 with 32
   threads: per file convert 1.9-2.5 min, extract 1.6-2.0, features 0.5-0.8, search-seed 0.4,
   compete 0.2, quant 0.3 (about 5 min per file, 30 of the 52), then the pooled rescore 21.9
-  min. 113,160 peptides, 126,224 precursors, 12,132 protein groups at 1%. The rescore is 42%
-  of the whole and the per-file chain the rest, so after this PR the next lever is convert +
-  extract (`extract.windows_in_flight`, the mzML read), not the classifier.
+  min, and the multi-head calibration of the first run 11.7 min, which is also where the 13.2 GB
+  peak sits (`extract.windows_in_flight: 8` left the peak at 13.5 GB: it is not extract's on this
+  data). 113,160 peptides, 126,224 precursors, 12,132 protein groups at 1%. The rescore is 42%
+  of the whole, the multi-head calibration 22% and the per-file chains the rest, so after this PR
+  the next levers are the calibration's library re-prediction and convert + extract, not the
+  classifier.
 - Reference point, 2026-09-05: a complete HYE single run is 17:52 at 16.5 GiB on 32 threads
   (extract 16.5 GiB is the tallest stage, `extract.windows_in_flight: 8` takes it to 12.3),
   and the six-run pooled rescore is 18 minutes at 15.9 GB for 72,344 peptides.
