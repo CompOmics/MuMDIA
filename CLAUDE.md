@@ -435,8 +435,10 @@ sections 10-16:
   16, 254 at 32, 281 at 64) and from 8 on an EPYC 9354, while on an i9-13900KS (8 P + 16 E
   cores) every OpenMP-parallel op waits for its slowest thread: one run 200 s at 30 threads
   against 152 s at 4, and the six-run Astral pool 118 min at 30 threads against
-  74 min at 8 on the same machine. A desktop rescore that is many times slower
-  than a server's on the same pool is this, not the pool.
+  74 min at 8 on the same machine, and 11.4 min with the thread cap, flush-to-zero and the
+  memory diet together (116,258 peptides, inside the seed spread; 4.6 min on its RTX 4090).
+  A desktop rescore that is many times slower than a server's on the same pool is this, not
+  the pool.
 - The worker flushes subnormal float32 to zero (`torch.set_flush_denormal`,
   `MUMDIA_NN_FLUSH_DENORMAL`, default on) since 2026-09-16. Intel cores handle subnormals
   through microcode assists: measured on the i9-13900KS, one 16384 x 387 `Linear` takes
