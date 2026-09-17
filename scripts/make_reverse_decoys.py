@@ -18,14 +18,22 @@ The m/z calculator is validated against the library's own target fragment m/z
 before writing (aborts if the residue-mass model is inconsistent).
 
 Usage: python make_reverse_decoys.py <in_prec> <in_frag> <out_prec> <out_frag>
+
+The precursor table is held in memory (one row per target); the fragment table is
+streamed one parquet row group at a time and the decoy fragment m/z are computed
+from per-decoy cumulative residue masses with array lookups, so a library of
+hundreds of millions of fragment rows is a matter of minutes and a few GB rather
+than a per-fragment Python loop over a table that must fit in RAM.
 """
 import sys, re
 import numpy as np
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 # The engine rejects `large_string` parquet columns ("column 'peptidoform' is not
 # utf8"), and `to_parquet` picks the width itself: pandas 3.x chooses the large
 # variant, so this helper silently emitted libraries the engine would not load.
-from _lib_io import write_engine_parquet
+from _lib_io import narrow_table, write_engine_parquet
 
 RES = {
     'G':57.021463735,'A':71.037113805,'S':87.032028435,'P':97.052763875,'V':99.068413945,
@@ -142,12 +150,40 @@ def scramble(toks, gen):
         inter[i], inter[j] = inter[j], inter[i]
     return inter + toks[-1:]
 
+def _cumulative_masses(toks_list, width):
+    """Per peptide, the cumulative residue+modification mass after k residues, k = 0..L,
+    zero-padded to `width` + 1 columns, plus each peptide's length. Feeds the
+    vectorised b/y calculator: a b_k ion sums the first k residues, a y_k ion the last k."""
+    n = len(toks_list)
+    cum = np.zeros((n, width + 1), dtype=np.float64)
+    length = np.zeros(n, dtype=np.int64)
+    for i, toks in enumerate(toks_list):
+        L = len(toks)
+        length[i] = L
+        acc = 0.0
+        for k, tok in enumerate(toks):
+            acc += tmass(tok)
+            cum[i, k + 1] = acc
+    return cum, length
+
+
+def _fragment_mz(cum, length, rows, ion_is_b, ordinal, z):
+    """Vectorised `frag_mz`: `rows` indexes peptides in `cum`, the rest are per-fragment
+    arrays. Same arithmetic as the scalar version, including the ordinal clamp."""
+    k = np.minimum(ordinal, length[rows])
+    total = cum[rows, length[rows]]
+    b = cum[rows, k]
+    y = total - cum[rows, length[rows] - k] + WATER
+    s = np.where(ion_is_b, b, y)
+    return (s + z * PROTON) / z
+
+
 def main():
-    inp,inf,outp,outf = sys.argv[1:5]
-    prec = pd.read_parquet(inp); frag = pd.read_parquet(inf)
-    tprec = prec[prec.label=='target'].copy().reset_index(drop=True)
-    tids = set(tprec.candidate_id); tfrag = frag[frag.candidate_id.isin(tids)].copy()
-    tgt_toks = {cid: parse(pf) for cid,pf in zip(tprec.candidate_id, tprec.peptidoform)}
+    inp, inf, outp, outf = sys.argv[1:5]
+    prec = pd.read_parquet(inp)
+    tprec = prec[prec.label == 'target'].copy().reset_index(drop=True)
+    tids = tprec.candidate_id.to_numpy().astype(np.int64)
+    tgt_toks = {cid: parse(pf) for cid, pf in zip(tprec.candidate_id, tprec.peptidoform)}
     target_stripped = {stripped(t) for t in tgt_toks.values()}
 
     # Name the modifications this script cannot model, before anything is written.
@@ -166,83 +202,146 @@ def main():
               "library whose modifications are written as numeric deltas.", flush=True)
 
     # --- validate m/z calculator against library target fragments ---
-    fg = {cid:g for cid,g in tfrag.groupby('candidate_id')}
-    err=[]
-    for r in tprec.head(500).itertuples():
-        t=tgt_toks[r.candidate_id]; g=fg.get(r.candidate_id)
-        if g is None or not valid(t): continue
+    # Up to 500 target precursors from the first row group of the fragment table.
+    pf = pq.ParquetFile(inf)
+    sample = pf.read_row_group(0).to_pandas()
+    sample = sample[sample.candidate_id.isin(set(tids.tolist()))]
+    first500 = set(sample.candidate_id.drop_duplicates().head(500).tolist())
+    sample = sample[sample.candidate_id.isin(first500)]
+    err = []
+    for cid, g in sample.groupby('candidate_id', sort=True):
+        t = tgt_toks.get(int(cid))
+        if t is None or not valid(t):
+            continue
         for x in g.itertuples():
-            err.append(1e6*abs(frag_mz(t,x.ion_type,int(x.ordinal),int(x.frag_charge))-x.mz)/x.mz)
-    err=np.array(err); p99=np.percentile(err,99)
-    print(f"calculator vs library: median {np.median(err):.2f} ppm, 99th {p99:.2f} ppm, max {err.max():.2f} ppm",flush=True)
-    if p99>5.0: sys.exit(f"ABORT: m/z calculator inconsistent (99th {p99:.1f} ppm > 5)")
+            err.append(1e6 * abs(frag_mz(t, x.ion_type, int(x.ordinal), int(x.frag_charge)) - x.mz) / x.mz)
+    err = np.array(err)
+    if len(err) == 0:
+        sys.exit("ABORT: no target fragments found to validate the m/z calculator against")
+    p99 = np.percentile(err, 99)
+    print(f"calculator vs library: median {np.median(err):.2f} ppm, 99th {p99:.2f} ppm, max {err.max():.2f} ppm", flush=True)
+    if p99 > 5.0:
+        sys.exit(f"ABORT: m/z calculator inconsistent (99th {p99:.1f} ppm > 5)")
 
     # --- reversed decoys with no-overlap invariant ---
-    rev={}; palin=0; scr=0; drop=0; invalid=0
+    rev = {}; palin = 0; scr = 0; drop = 0; invalid = 0
     # Different target base sequences must not collapse onto the same decoy
     # sequence. Repeated charge/modification rows of one base sequence may reuse
     # that sequence, which preserves the precursor-level library structure.
-    decoy_owner={}
+    decoy_owner = {}
     for cid in sorted(tgt_toks):
-        t=tgt_toks[cid]
-        if not valid(t): rev[cid]=None; invalid+=1; continue
-        source=stripped(t)
-        gen=splitmix(stable_seed(source) ^ 0xD1CE)
-        cand=reverse_keep_cterm(t); tries=0
+        t = tgt_toks[cid]
+        if not valid(t):
+            rev[cid] = None; invalid += 1; continue
+        source = stripped(t)
+        gen = splitmix(stable_seed(source) ^ 0xD1CE)
+        cand = reverse_keep_cterm(t); tries = 0
         def conflicts(sequence):
-            owner=decoy_owner.get(sequence)
+            owner = decoy_owner.get(sequence)
             return sequence in target_stripped or (owner is not None and owner != source)
-        while conflicts(stripped(cand)) and tries<MAX_TRIES:
-            if tries==0: palin+=1
-            cand=scramble(t,gen); tries+=1
-        if conflicts(stripped(cand)): rev[cid]=None; drop+=1
+        while conflicts(stripped(cand)) and tries < MAX_TRIES:
+            if tries == 0: palin += 1
+            cand = scramble(t, gen); tries += 1
+        if conflicts(stripped(cand)):
+            rev[cid] = None; drop += 1
         else:
-            if tries>0: scr+=1
-            rev[cid]=cand
+            if tries > 0: scr += 1
+            rev[cid] = cand
             decoy_owner.setdefault(stripped(cand), source)
-    print(f"reverse: target-collisions={palin} resolved-by-scramble={scr} dropped={drop} skipped-nonstd={invalid}",flush=True)
+    print(f"reverse: target-collisions={palin} resolved-by-scramble={scr} dropped={drop} skipped-nonstd={invalid}", flush=True)
 
-    off=int(tprec.candidate_id.max())+1
-    keep=[cid for cid in tprec.candidate_id if rev[cid] is not None]
-    keepset=set(keep)
+    off = int(tprec.candidate_id.max()) + 1
+    keep = [cid for cid in tprec.candidate_id if rev[cid] is not None]
+    keepset = set(keep)
     # Keep target and decoy populations paired. Retaining a target whose decoy
     # could not be generated biases the null, even when the unresolved set is
     # small, so remove its target precursor and fragments too.
-    tprec_out=tprec[tprec.candidate_id.isin(keepset)].copy()
-    tfrag_out=tfrag[tfrag.candidate_id.isin(keepset)].copy()
-    dprec=tprec_out.copy()
-    dprec['candidate_id']=dprec['candidate_id']+off
-    dprec['label']='decoy'
-    dprec['protein']='DECOY_'+dprec['protein'].astype(str)
-    dprec['peptidoform']=dprec['candidate_id'].map(lambda nc: 'DECOY_'+to_pform(rev[nc-off]))
+    tprec_out = tprec[tprec.candidate_id.isin(keepset)].copy()
+    dprec = tprec_out.copy()
+    dprec['candidate_id'] = dprec['candidate_id'] + off
+    dprec['label'] = 'decoy'
+    dprec['protein'] = 'DECOY_' + dprec['protein'].astype(str)
+    dprec['peptidoform'] = dprec['candidate_id'].map(lambda nc: 'DECOY_' + to_pform(rev[nc - off]))
 
-    df=tfrag_out.copy()
-    df['candidate_id']=df['candidate_id']+off
-    mz=np.empty(len(df))
-    ci=(df['candidate_id']-off).to_numpy(); ion=df['ion_type'].to_numpy(); ordn=df['ordinal'].to_numpy(); ch=df['frag_charge'].to_numpy()
-    for i in range(len(df)):
-        t=rev[ci[i]]; mz[i]=frag_mz(t,ion[i],int(ordn[i]),int(ch[i]))
-    df['mz']=mz
+    allp = pd.concat([tprec_out, dprec], ignore_index=True).sort_values('precursor_mz', kind='mergesort').reset_index(drop=True)
+    # old candidate_id -> new, as an array: the ids are 0..2*off, so a lookup table
+    # replaces the dict and lets every fragment batch be remapped in one indexing op.
+    o2n = np.full(2 * off + 1, -1, dtype=np.int64)
+    o2n[allp['candidate_id'].to_numpy().astype(np.int64)] = np.arange(len(allp), dtype=np.int64)
+    allp['candidate_id'] = np.arange(len(allp), dtype=np.uint32)
+    for c, dt in [('peptidoform_id', 'uint32'), ('base_peptide_id', 'uint32'), ('charge', 'int32'), ('predicted_irt', 'float32'), ('n_fragments', 'int32')]:
+        if c in allp.columns: allp[c] = allp[c].astype(dt)
 
-    allp=pd.concat([tprec_out,dprec],ignore_index=True).sort_values('precursor_mz',kind='mergesort').reset_index(drop=True)
-    o2n={o:n for n,o in enumerate(allp['candidate_id'].tolist())}
-    allp['candidate_id']=np.arange(len(allp),dtype=np.uint32)
-    allf=pd.concat([tfrag_out,df],ignore_index=True)
-    allf['candidate_id']=allf['candidate_id'].map(o2n).astype(np.uint32)
-    allf=allf.sort_values('candidate_id',kind='mergesort').reset_index(drop=True)
-    for c,dt in [('peptidoform_id','uint32'),('base_peptide_id','uint32'),('charge','int32'),('predicted_irt','float32'),('n_fragments','int32')]:
-        if c in allp.columns: allp[c]=allp[c].astype(dt)
-    allf['predicted_intensity']=allf['predicted_intensity'].astype('float32'); allf['ordinal']=allf['ordinal'].astype('int32'); allf['frag_charge']=allf['frag_charge'].astype('int32')
+    # Per-decoy cumulative masses, indexed by the TARGET's old candidate_id.
+    kept_mask = np.zeros(off, dtype=bool)
+    kept_mask[np.array(keep, dtype=np.int64)] = True
+    rev_toks = [rev[cid] for cid in keep]
+    width = max((len(t) for t in rev_toks), default=0)
+    cum, length = _cumulative_masses(rev_toks, width)
+    row_of = np.full(off, -1, dtype=np.int64)
+    row_of[np.array(keep, dtype=np.int64)] = np.arange(len(keep), dtype=np.int64)
 
-    dstr={stripped(parse(s)) for s in allp[allp.label=='decoy'].peptidoform}
-    ov=dstr & target_stripped
-    print(f"FINAL overlap decoy-vs-target stripped = {len(ov)} (must be 0)",flush=True)
-    assert len(ov)==0, f"overlap invariant violated: {len(ov)}"
-    paired={stripped(tgt_toks[cid]): stripped(rev[cid]) for cid in keep}
+    dstr = {stripped(parse(s)) for s in allp[allp.label == 'decoy'].peptidoform}
+    ov = dstr & target_stripped
+    print(f"FINAL overlap decoy-vs-target stripped = {len(ov)} (must be 0)", flush=True)
+    assert len(ov) == 0, f"overlap invariant violated: {len(ov)}"
+    paired = {stripped(tgt_toks[cid]): stripped(rev[cid]) for cid in keep}
     assert len(set(paired.values())) == len(paired), "distinct targets share a decoy sequence"
 
-    write_engine_parquet(allp, outp); write_engine_parquet(allf, outf)
-    print(f"targets_in={len(tprec)} targets_out={len(tprec_out)} decoys={len(dprec)} total_prec={len(allp)} total_frag={len(allf)}",flush=True)
+    write_engine_parquet(allp, outp)
 
-if __name__=='__main__':
+    # --- fragments: one row group in, target rows plus their decoy twins out ---
+    frag_schema = pa.schema([
+        pa.field("candidate_id", pa.uint32(), False),
+        pa.field("mz", pa.float64(), False),
+        pa.field("predicted_intensity", pa.float32(), False),
+        pa.field("name", pa.string(), False),
+        pa.field("ion_type", pa.string(), False),
+        pa.field("ordinal", pa.int32(), False),
+        pa.field("frag_charge", pa.int32(), False),
+        pa.field("cardinality", pa.int32(), False),
+    ])
+    n_out = 0
+    writer = pq.ParquetWriter(str(outf), frag_schema, compression="snappy")
+    try:
+        for rg in range(pf.num_row_groups):
+            g = pf.read_row_group(rg).to_pandas()
+            old = g['candidate_id'].to_numpy().astype(np.int64)
+            sel = (old < off) & kept_mask[np.minimum(old, off - 1)]
+            g = g[sel]
+            if not len(g):
+                continue
+            old = g['candidate_id'].to_numpy().astype(np.int64)
+            rows = row_of[old]
+            ion_is_b = (g['ion_type'].astype(str).to_numpy() == 'b')
+            ordinal = g['ordinal'].to_numpy().astype(np.int64)
+            z = g['frag_charge'].to_numpy().astype(np.float64)
+            dmz = _fragment_mz(cum, length, rows, ion_is_b, ordinal, z)
+            tgt_new = o2n[old]
+            dec_new = o2n[old + off]
+            assert (tgt_new >= 0).all() and (dec_new >= 0).all()
+            cid = np.concatenate([tgt_new, dec_new]).astype(np.uint32)
+            mz = np.concatenate([g['mz'].to_numpy(dtype=np.float64), dmz])
+            def twice(col, dtype):
+                v = g[col].to_numpy()
+                return np.concatenate([v, v]).astype(dtype)
+            table = pa.table({
+                "candidate_id": pa.array(cid, pa.uint32()),
+                "mz": pa.array(mz, pa.float64()),
+                "predicted_intensity": pa.array(twice('predicted_intensity', np.float32), pa.float32()),
+                "name": pa.array(twice('name', object).astype(str), pa.string()),
+                "ion_type": pa.array(twice('ion_type', object).astype(str), pa.string()),
+                "ordinal": pa.array(twice('ordinal', np.int32), pa.int32()),
+                "frag_charge": pa.array(twice('frag_charge', np.int32), pa.int32()),
+                "cardinality": pa.array(twice('cardinality', np.int32), pa.int32()),
+            }, schema=frag_schema)
+            writer.write_table(narrow_table(table))
+            n_out += table.num_rows
+    finally:
+        writer.close()
+
+    print(f"targets_in={len(tprec)} targets_out={len(tprec_out)} decoys={len(dprec)} total_prec={len(allp)} total_frag={n_out}", flush=True)
+
+
+if __name__ == '__main__':
     main()

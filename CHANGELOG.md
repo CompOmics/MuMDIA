@@ -41,7 +41,23 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ## [Unreleased]
 
-## [0.4.0] - 2026-09-17
+### Performance
+
+- **`scripts/import_diann_lib.py` streams the DIA-NN library** instead of reading the
+  whole fragment-level parquet into pandas. Two passes over the row groups: the first
+  collects the precursor table, the fragment counts and the fragment m/z cardinality, the
+  second writes the fragment table one row group at a time. Output contract unchanged
+  (same candidate ids, same columns, same types; the 11 contract tests pass), fragments are
+  no longer globally sorted by `candidate_id`, which the engine never required. Measured on
+  a 29.5M-precursor, 354M-row immunopeptidomics library: 19:54 at a 15.0 GB peak against
+  21:18 at 202.6 GB before, output identical column for column (cardinality included); the 142.7M-precursor, 1.69-billion-row 8-12-mer library of the
+  same set could not be imported at all before (about a terabyte in pandas).
+- **`scripts/make_reverse_decoys.py` streams the fragment table** and computes the decoy
+  fragment m/z from per-decoy cumulative residue masses with array lookups instead of a
+  Python loop over every fragment row. Same decoys (same reversal, same seeded scramble, same
+  collision rules, same mass model; the 18 decoy-builder tests pass). Measured on the same 29.5M-precursor library: 18:20 at a 59.6 GB peak against 59:00 at 321.4 GB before, identical decoy statistics (26,438 collisions, 22,242 resolved by scramble, 4,196 pairs dropped, 58,996,242 precursors, 707,582,432 fragment rows).
+
+
 
 ### Added
 

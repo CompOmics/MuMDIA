@@ -11,6 +11,13 @@ Precursors carrying any other UniMod are dropped (their names are unmapped).
 Usage: python import_diann_lib.py <diann_lib.parquet> <out_precursors.parquet> <out_fragments.parquet>
               [--charge-by-basic-residues]
 
+The library is read one parquet row group at a time, twice: a first pass collects the
+precursor table (one row per peptidoform/charge), the fragment counts and the fragment
+m/z cardinality, a second pass writes the fragment table batch by batch. Peak memory is
+the precursor table plus one row group, not the whole fragment table: a DIA-NN
+immunopeptidomics library of 142.7M precursors and 1.69 billion fragment rows (18.7 GB)
+imports in tens of GB, where reading it whole into pandas needed about a terabyte.
+
 --charge-by-basic-residues restricts the imported search space to charges a
 peptide can physically carry: a precursor is kept only at charge
 <= 1 (N-terminus) + (#R + #H + #K), and a b/y fragment only at charge
@@ -22,10 +29,12 @@ import sys
 
 import numpy as np
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 # The engine rejects `large_string` parquet columns ("column 'peptidoform' is not
 # utf8"), and `to_parquet` picks the width itself: pandas 3.x chooses the large
 # variant, so this helper silently emitted libraries the engine would not load.
-from _lib_io import write_engine_parquet
+from _lib_io import narrow_table, write_engine_parquet
 
 
 # DIA-NN UniMod accession -> MuMDIA ProForma name. Carbamidomethyl/Oxidation are
@@ -79,17 +88,22 @@ def _fragment_basic_sites(seq_s, typ_s, k_s):
     return out
 
 
-def main():
-    args = sys.argv[1:]
-    charge_by_basic = "--charge-by-basic-residues" in args
-    args = [a for a in args if not a.startswith("--")]
-    inp, outp, outf = args[0:3]
-    df = pd.read_parquet(inp)
+# Columns read from the DIA-NN table. The optional ones are used when present.
+_META_COLS = ["Modified.Sequence", "Stripped.Sequence", "Precursor.Charge", "Precursor.Mz", "RT"]
+_FRAG_COLS = ["Product.Mz", "Relative.Intensity", "Fragment.Type", "Fragment.Series.Number",
+              "Fragment.Charge"]
+_OPTIONAL_COLS = ["Decoy", "Fragment.Loss.Type", "Protein.Names", "Protein.Ids"]
+# 0.01 Da bins for the fragment cardinality; wide enough for any fragment m/z.
+_MZ_BIN_MAX = 1_000_000
 
+
+def _filter_rows(df, charge_by_basic):
+    """The importer's row filter on one batch: targets, b/y no-loss fragments, mapped
+    modifications only, and the optional composition-based charge cap. Returns the
+    filtered frame and the (precursor, fragment) counts the charge cap removed."""
     # Targets only (the re-exported speclib carries DIA-NN's own decoys).
     if "Decoy" in df.columns:
         df = df[df["Decoy"].astype(int) == 0]
-
     # b/y no-loss fragments only.
     lt = "Fragment.Loss.Type"
     if lt in df.columns:
@@ -99,10 +113,10 @@ def main():
     _kept_alt = "|".join(f"{i}\\)" for i in _KEPT_UNIMOD_IDS)
     df = df[~df["Modified.Sequence"].astype(str).str.contains(
         rf"\(UniMod:(?!{_kept_alt})", regex=True)]
-
+    dropped = (0, 0)
     # Composition-based charge restriction (opt-in). Done before candidate_id
     # assignment so dropped rows never receive an id and n_fragments stays exact.
-    if charge_by_basic:
+    if charge_by_basic and len(df):
         n0_prec = df.drop_duplicates(["Modified.Sequence", "Precursor.Charge"]).shape[0]
         n0_frag = len(df)
         seq = df["Stripped.Sequence"].astype(str)
@@ -116,43 +130,105 @@ def main():
         frag_basic = _fragment_basic_sites(seq, typ, k)
         df = df[df["Fragment.Charge"].astype(int) <= 1 + frag_basic]
         n1_prec = df.drop_duplicates(["Modified.Sequence", "Precursor.Charge"]).shape[0]
+        dropped = (n0_prec - n1_prec, n0_frag - len(df))
+    return df, dropped
+
+
+def _keys(df):
+    """The precursor key the whole import is joined on: ProForma peptidoform / charge."""
+    return df["Modified.Sequence"].map(to_proforma) + "/" + df["Precursor.Charge"].astype(str)
+
+
+def _mz_bins(mz):
+    return np.clip((np.asarray(mz, dtype=np.float64) * 100.0).round().astype(np.int64), 0, _MZ_BIN_MAX - 1)
+
+
+def main():
+    args = sys.argv[1:]
+    charge_by_basic = "--charge-by-basic-residues" in args
+    args = [a for a in args if not a.startswith("--")]
+    inp, outp, outf = args[0:3]
+
+    pf = pq.ParquetFile(inp)
+    present = set(pf.schema_arrow.names)
+    missing = [c for c in _META_COLS + _FRAG_COLS if c not in present]
+    if missing:
+        raise SystemExit(f"{inp}: not a DIA-NN fragment-level library, missing columns {missing}")
+    optional = [c for c in _OPTIONAL_COLS if c in present]
+    prot_col = "Protein.Names" if "Protein.Names" in present else "Protein.Ids"
+    read_cols = _META_COLS + _FRAG_COLS + optional
+
+    # ---- pass 1: precursor table, fragment counts, fragment m/z cardinality ----
+    # A precursor's fragments are contiguous in a DIA-NN table, so each row group
+    # contributes a handful of precursors that are new and at most one that continues
+    # from the previous group; the frames are concatenated in file order and deduplicated
+    # keeping the first occurrence, which is exactly what a whole-table
+    # `drop_duplicates` would have kept.
+    prec_parts, count_parts = [], []
+    card = np.zeros(_MZ_BIN_MAX, dtype=np.int64)
+    dropped_prec = dropped_frag = 0
+    n_frag_total = 0
+    for rg in range(pf.num_row_groups):
+        df = pf.read_row_group(rg, columns=read_cols).to_pandas()
+        df, (dp, dfr) = _filter_rows(df, charge_by_basic)
+        dropped_prec += dp
+        dropped_frag += dfr
+        if not len(df):
+            continue
+        n_frag_total += len(df)
+        key = _keys(df)
+        counts = key.value_counts(sort=False)
+        count_parts.append(counts)
+        first = ~key.duplicated()
+        part = pd.DataFrame({
+            "key": key[first].to_numpy(),
+            "peptidoform": df.loc[first, "Modified.Sequence"].map(to_proforma).to_numpy(),
+            "Stripped.Sequence": df.loc[first, "Stripped.Sequence"].astype(str).to_numpy(),
+            "Precursor.Charge": df.loc[first, "Precursor.Charge"].astype(np.int32).to_numpy(),
+            "Precursor.Mz": df.loc[first, "Precursor.Mz"].astype(np.float64).to_numpy(),
+            "RT": df.loc[first, "RT"].astype(np.float32).to_numpy(),
+            "protein_str": df.loc[first, prot_col].astype(str).to_numpy() if prot_col in df.columns
+            else np.full(int(first.sum()), "", dtype=object),
+        })
+        prec_parts.append(part)
+        # Fragment cardinality: how many distinct library precursors share each fragment
+        # m/z (0.01 Da bin). A high value marks a non-unique, interference-prone ion; a
+        # low value a clean, quantification-friendly one. Computed here at import time so
+        # downstream selection reads a deterministic column. One count per (precursor,
+        # bin) pair: deduplicated inside the batch, which is exact except for a precursor
+        # split across two row groups with a fragment in the same bin on both sides.
+        pairs = pd.DataFrame({"k": key.to_numpy(), "b": _mz_bins(df["Product.Mz"])}).drop_duplicates()
+        np.add.at(card, pairs["b"].to_numpy(), 1)
+    if charge_by_basic:
         print(
-            f"charge-by-basic-residues: precursors {n0_prec} -> {n1_prec} "
-            f"(dropped {n0_prec - n1_prec}), fragment rows {n0_frag} -> {len(df)} "
-            f"(dropped {n0_frag - len(df)})"
+            f"charge-by-basic-residues: dropped {dropped_prec} precursor(s) and "
+            f"{dropped_frag} fragment row(s)"
         )
+    if not prec_parts:
+        raise SystemExit(f"{inp}: no target b/y fragment rows survived the filters")
 
-    df["peptidoform"] = df["Modified.Sequence"].map(to_proforma)
-    df["key"] = df["peptidoform"] + "/" + df["Precursor.Charge"].astype(str)
+    keys = pd.concat(prec_parts, ignore_index=True)
+    keys = keys[~keys["key"].duplicated()].reset_index(drop=True)
+    nfrag = pd.concat(count_parts).groupby(level=0).sum()
 
-    # Species-flagged protein string: prefer entry names (carry _HUMAN/_YEAST/_ECOLI),
-    # fall back to accessions. Keep the ";"-joined multi-protein string intact so the
-    # metric can drop multi-species precursors.
-    prot_col = "Protein.Names" if "Protein.Names" in df.columns else "Protein.Ids"
-    df["protein_str"] = df[prot_col].astype(str)
     # DIA-NN leaves the protein empty for peptides it did not map to the FASTA, the
     # Biognosys iRT-kit standards above all (LGGNEQVTR, GTFIIDPGGVIR, ...). The engine
     # refuses a library with an empty required string, because an empty protein would
     # silently merge every such peptide into one anonymous protein group. Name that
     # group explicitly instead, so the peptides stay searchable and visibly unassigned.
-    unassigned = df["protein_str"].str.strip().isin(["", "nan", "None", "<NA>"])
+    unassigned = keys["protein_str"].str.strip().isin(["", "nan", "None", "<NA>"])
     if unassigned.any():
-        n_prec_unassigned = df.loc[unassigned, "key"].nunique()
-        df.loc[unassigned, "protein_str"] = "UNASSIGNED"
-        print(f"protein: {n_prec_unassigned} precursors had no protein in {prot_col}; "
+        keys.loc[unassigned, "protein_str"] = "UNASSIGNED"
+        print(f"protein: {int(unassigned.sum())} precursors had no protein in {prot_col}; "
               f"written as UNASSIGNED (typically the iRT-kit standards)")
 
     # Sort precursors by m/z before assigning candidate_id, so the emitted library
     # is monotonic in precursor_mz (the fragment index's candidate_range assumes
     # this). The decoy builder re-sorts too, but this makes a direct target-only
     # import index-valid on its own. mergesort = stable for reproducibility.
-    keys = df.drop_duplicates("key").sort_values("Precursor.Mz", kind="mergesort").reset_index(drop=True)
+    keys = keys.sort_values("Precursor.Mz", kind="mergesort").reset_index(drop=True)
     keys["candidate_id"] = np.arange(len(keys), dtype=np.uint32)
-    key2cand = dict(zip(keys["key"], keys["candidate_id"]))
     keys["base_peptide_id"] = pd.factorize(keys["Stripped.Sequence"])[0].astype(np.uint32)
-    df["candidate_id"] = df["key"].map(key2cand).astype(np.uint32)
-
-    nfrag = df.groupby("candidate_id").size()
     prec = pd.DataFrame({
         "candidate_id": keys["candidate_id"],
         "peptidoform_id": keys["candidate_id"].astype(np.uint32),
@@ -163,37 +239,63 @@ def main():
         "predicted_irt": keys["RT"].astype(np.float32),
         "label": "target",
         "protein": keys["protein_str"],
-        "n_fragments": keys["candidate_id"].map(nfrag).fillna(0).astype(np.int32),
+        "n_fragments": keys["key"].map(nfrag).fillna(0).astype(np.int32),
     })
-
-    name = df["Fragment.Type"].astype(str) + df["Fragment.Series.Number"].astype(str)
-    fc = df["Fragment.Charge"].astype(np.int32)
-    name = np.where(fc > 1, name + "^" + fc.astype(str), name)
-    # Fragment cardinality: how many distinct library precursors share each
-    # fragment m/z (0.01 Da bin). A high value marks a non-unique, interference
-    # prone ion; a low value marks a clean, quantification-friendly ion. Computed
-    # once here at import time so downstream interference-aware feature/quant
-    # selection reads a deterministic column instead of a runtime heuristic.
-    mz_bin = (df["Product.Mz"] * 100.0).round().astype("int64")
-    cardinality = df.groupby(mz_bin)["candidate_id"].transform("nunique").astype(np.int32)
-    frag = pd.DataFrame({
-        "candidate_id": df["candidate_id"],
-        "mz": df["Product.Mz"].astype(np.float64),
-        "predicted_intensity": df["Relative.Intensity"].astype(np.float32),
-        "name": name,
-        "ion_type": df["Fragment.Type"].astype(str).str.lower(),
-        "ordinal": df["Fragment.Series.Number"].astype(np.int32),
-        "frag_charge": fc,
-        "cardinality": cardinality,
-    }).sort_values("candidate_id").reset_index(drop=True)
-
     write_engine_parquet(prec, outp)
-    write_engine_parquet(frag, outf)
+    key_index = pd.Index(keys["key"])
+    del prec_parts, count_parts, nfrag
+
+    # ---- pass 2: the fragment table, one row group in, one row group out ----
+    frag_schema = pa.schema([
+        pa.field("candidate_id", pa.uint32(), False),
+        pa.field("mz", pa.float64(), False),
+        pa.field("predicted_intensity", pa.float32(), False),
+        pa.field("name", pa.string(), False),
+        pa.field("ion_type", pa.string(), False),
+        pa.field("ordinal", pa.int32(), False),
+        pa.field("frag_charge", pa.int32(), False),
+        pa.field("cardinality", pa.int32(), False),
+    ])
+    n_written = 0
+    writer = pq.ParquetWriter(str(outf), frag_schema, compression="snappy")
+    try:
+        for rg in range(pf.num_row_groups):
+            df = pf.read_row_group(rg, columns=read_cols).to_pandas()
+            df, _ = _filter_rows(df, charge_by_basic)
+            if not len(df):
+                continue
+            cand = key_index.get_indexer(_keys(df))
+            if (cand < 0).any():
+                raise RuntimeError("pass 2 met a precursor key that pass 1 did not record")
+            typ = df["Fragment.Type"].astype(str).str.lower()
+            ordinal = df["Fragment.Series.Number"].astype(np.int32)
+            fc = df["Fragment.Charge"].astype(np.int32)
+            name = df["Fragment.Type"].astype(str) + ordinal.astype(str)
+            name = np.where(fc > 1, name + "^" + fc.astype(str), name)
+            bins = _mz_bins(df["Product.Mz"])
+            table = pa.table({
+                "candidate_id": pa.array(cand.astype(np.uint32), pa.uint32()),
+                "mz": pa.array(df["Product.Mz"].astype(np.float64).to_numpy(), pa.float64()),
+                "predicted_intensity": pa.array(
+                    df["Relative.Intensity"].astype(np.float32).to_numpy(), pa.float32()),
+                "name": pa.array(name.astype(str), pa.string()),
+                "ion_type": pa.array(typ.to_numpy(), pa.string()),
+                "ordinal": pa.array(ordinal.to_numpy(), pa.int32()),
+                "frag_charge": pa.array(fc.to_numpy(), pa.int32()),
+                "cardinality": pa.array(card[bins].astype(np.int32), pa.int32()),
+            }, schema=frag_schema)
+            writer.write_table(narrow_table(table))
+            n_written += table.num_rows
+    finally:
+        writer.close()
+    if n_written != n_frag_total:
+        raise RuntimeError(f"fragment rows: pass 1 counted {n_frag_total}, pass 2 wrote {n_written}")
+
     n_hum = prec.protein.str.contains("_HUMAN").sum()
     n_yea = prec.protein.str.contains("_YEAS").sum()
     n_eco = prec.protein.str.contains("_ECOLI").sum()
     print(f"target precursors {len(prec)} (human {n_hum}, yeast {n_yea}, ecoli {n_eco}), "
-          f"fragments {len(frag)} -> {outp}, {outf}")
+          f"fragments {n_written} -> {outp}, {outf}")
 
 
 if __name__ == "__main__":
