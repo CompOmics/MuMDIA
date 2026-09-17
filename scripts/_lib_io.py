@@ -43,6 +43,20 @@ def narrow_type(ty: pa.DataType) -> pa.DataType:
     return ty
 
 
+def _rebased(col: pa.ChunkedArray) -> pa.ChunkedArray:
+    """`col` with every chunk copied so its offsets start at zero.
+
+    A chunk that is a slice of a larger array keeps the parent's offset buffer, and the
+    `large_string -> string` cast rejects the slice when the parent's offsets past the
+    slice's end exceed 2 GiB ("input array too large"), however small the slice itself is.
+    That is how `to_engine_table` failed on the 8-12-mer library: the decoy builder's m/z
+    sort left one 2.86 GB `large_string` array, and every 4M-row slice past the 2 GiB mark
+    of it was refused. `concat_arrays` of a single chunk materialises it with its own
+    offsets, after which the cast sees only the slice's bytes.
+    """
+    return pa.chunked_array([pa.concat_arrays([c]) for c in col.chunks], type=col.type)
+
+
 def narrow_table(table: pa.Table) -> pa.Table:
     """An arrow Table cast to the 32-bit-offset encoding the engine accepts.
 
@@ -54,7 +68,16 @@ def narrow_table(table: pa.Table) -> pa.Table:
     schema = pa.schema(
         [pa.field(f.name, narrow_type(f.type), f.nullable) for f in table.schema]
     )
-    return table.cast(schema) if schema != table.schema else table
+    if schema == table.schema:
+        return table
+    cols = []
+    for i, field in enumerate(table.schema):
+        col = table.column(i)
+        narrowing = field.type != schema.field(i).type
+        if narrowing and (pa.types.is_large_string(field.type) or pa.types.is_large_binary(field.type)):
+            col = _rebased(col)
+        cols.append(col)
+    return pa.Table.from_arrays(cols, schema=table.schema).cast(schema)
 
 
 # Rows converted per slice when a DataFrame becomes an arrow Table. A `string` array holds
