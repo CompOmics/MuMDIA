@@ -712,6 +712,14 @@ the decision record):
 
 Opt-in, each for a stated reason:
 
+> **The compact list is bound to `nn_torch`.** Every measurement in this section used it.
+> Promoting `feature_preset: compact` to the shipped default was tried on 2026-09-16 and
+> reverted: under `native_tda` the same 114 names returned ZERO identifications on the
+> smoke fixture -- 0 of 152 planted peptides, empty quant tables -- where the identical
+> binary with `feature_preset: all` passed. Selection transfers neither across library
+> types (-2.1% on a FASTA-built entrapment library) nor across classifiers, and the
+> classifier case is not a percentage, it is a collapse.
+
 **Compact features** (`"feature_preset": "compact"`, the embedded 114-name list of section 12;
 `features_file` still accepts any list). A memory lever: the rescore matrix is 3.4x smaller
 (full-scale HYE rescore 5.49 GB / 3:19 against 13.5 GB / 6:20 with every feature; six pooled

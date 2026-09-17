@@ -530,6 +530,14 @@ sections 10-16:
   default training it measured +0.2% / -1.2% / -0.1% / +1.5% on A01 / B01 / AIF / entrapment,
   and B01 is the pool the list was never fitted on. Use it for pooled rescoring on machines
   where the matrix would not fit (six HYE runs: 15.9 GB with it), not by default.
+
+  It is CLASSIFIER-specific as well as library-specific, which is the stronger reason it
+  cannot be a default. Every number above was measured with `nn_torch`. Under
+  `native_tda` -- the shipped default classifier -- the same list produced ZERO
+  identifications on the smoke fixture: 0 of 152 planted peptides, 0 peptides at 1%, and
+  empty quant tables, against SMOKE_OK from the same binary with `feature_preset: all`
+  (measured 2026-09-16 while trying to promote it to the default). Pair it with the
+  classifier it was selected for, and re-derive the list for any other combination.
 - The "sensitivity" recipe adds `folds: 5, train_margin_frac: 0.75, seeds: 3`: +0.4 / +0.4 /
   +0.6 pp over the fast recipe on HYE A01 / AIF / entrapment with the FDP unchanged, for 5.3x
   the rescore wall through the engine (18:38 against 3:31 on HYE B01, +0.2% peptides there);
