@@ -121,6 +121,14 @@ Env knobs (all optional):
                                      on Intel cores every FMA on a subnormal operand then takes
                                      a ~100x microcode assist, which made a desktop rescore 6x
                                      slower than the same pool on an EPYC. 0 = keep them.
+    MUMDIA_NN_CLAMP_TINY  = 1e-20    once per epoch, set every parameter and buffer with
+                                     |value| below this to exactly 0. Removes the subnormal
+                                     source itself: Adam + L2 shrinks parameters that get no
+                                     data gradient (dead units, their BatchNorm scale/shift and
+                                     running variances) geometrically until they cross 1.2e-38;
+                                     a value below 1e-20 contributes nothing to a float32 sum, a
+                                     weight of exactly 0 stays 0, and 0 x anything is 0. Works on
+                                     every CPU without touching the FPU. 0 = off.
     MUMDIA_NN_FLUSH_DENORMAL = 1     flush subnormal float32 to zero in torch (FTZ/DAZ). The
                                      constant columns are not the only subnormal source: dead
                                      hidden units and their BatchNorm buffers decay too (census
@@ -317,7 +325,42 @@ def constant_columns(pin_path, cols):
     return out
 
 
-def _denormal_census(model, xb):
+def _optimizer_tensors(opt):
+    """Adam's moment tensors: they decay geometrically for a zero-gradient parameter too."""
+    if opt is None:
+        return []
+    out = []
+    for state in opt.state.values():
+        for v in state.values():
+            if hasattr(v, "is_floating_point") and v.is_floating_point() and v.dim() > 0:
+                out.append(v)
+    return out
+
+
+def _clamp_tiny(model, threshold, opt=None):
+    """Set every parameter, floating buffer and optimizer moment with |value| < threshold to 0.
+
+    Adam with L2 decay shrinks a parameter that receives no data gradient by a roughly
+    constant factor per step (the L2 term is normalised by a second moment that decays much
+    more slowly), so dead units' weights, their BatchNorm scale and shift and the running
+    variances head for the subnormal range within a few thousand steps. Adam's own moment
+    tensors follow: for a zero-gradient parameter the first moment decays as 0.9^k and the
+    second as 0.999^k, and every optimizer step then touches them elementwise. Below 1e-20 a value
+    adds nothing to any float32 sum that matters here, a weight of exactly 0 stays 0 under
+    Adam, and 0 times anything is 0, so after this no subnormal can arise in a weight, a
+    buffer or an activation. Once per epoch over ~60k values: free.
+    """
+    if threshold <= 0:
+        return
+    import torch  # imported here: the module imports torch inside main(), after the device check
+
+    with torch.no_grad():
+        for t in list(model.parameters()) + list(model.buffers()) + _optimizer_tensors(opt):
+            if t.is_floating_point():
+                t.masked_fill_(t.abs() < threshold, 0.0)
+
+
+def _denormal_census(model, xb, opt=None):
     """Subnormal float32 cells in the model's parameters, buffers and one chunk's activations.
 
     Diagnostic for the flush-to-zero switch above: subnormals in any of the three are what
@@ -339,7 +382,8 @@ def _denormal_census(model, xb):
         for layer in model.net:
             h = layer(h)
             acts += count(h)
-    return params, bufs, acts
+    moments = sum(count(t) for t in _optimizer_tensors(opt))
+    return params, bufs, acts, moments
 
 
 def _accumulate_moments(blk, s1, s2, rows=32768):
@@ -583,6 +627,7 @@ def main():
     EARLY_STOP = env_i("MUMDIA_NN_EARLY_STOP", 1) != 0
     EARLY_STOP_TOL = env_f("MUMDIA_NN_EARLY_STOP_TOL", 0.01)
     PREGATHER_GB = env_f("MUMDIA_NN_PREGATHER_GB", 8)
+    CLAMP_TINY = env_f("MUMDIA_NN_CLAMP_TINY", 1e-20)
     # auto (default) uses the GPU when torch can see one; cuda/cpu force it. Forcing is
     # what makes a device-only comparison possible: same environment, same package
     # versions, same data, only the device differs (CUDA_VISIBLE_DEVICES="" does NOT
@@ -1006,6 +1051,7 @@ def main():
                     opt.zero_grad()
                     lossf(m(Xb), yb).backward()
                     opt.step()
+            _clamp_tiny(m, CLAMP_TINY, opt)
         return m, opt
 
     @torch.no_grad()
@@ -1188,8 +1234,8 @@ def main():
                     model.eval()
                     _xb = torch.from_numpy(get(tr_idx[:BATCH * 4])).to(DEVICE)
                     print(
-                        "  seed %d fold %d: subnormals params=%d buffers=%d activations=%d"
-                        % ((seed, f) + _denormal_census(model, _xb)),
+                        "  seed %d fold %d: subnormals params=%d buffers=%d activations=%d "
+                        "adam_moments=%d" % ((seed, f) + _denormal_census(model, _xb, optim)),
                         flush=True,
                     )
                 score_tr = score_idx(model, tr_idx)

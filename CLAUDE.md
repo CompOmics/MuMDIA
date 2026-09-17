@@ -461,12 +461,27 @@ sections 10-16:
   that subnormal source but not the others: dead hidden units and their BatchNorm variances
   decay the same way (census on the six-run pool: up to ~6,400 parameters, 11 buffers,
   ~3,000 activations in a round), and the desktop still took 61.8 min without flushing.
+  Since 2026-09-17 the worker removes that source as well: once per epoch every parameter,
+  floating buffer and Adam moment with |value| < 1e-20 is set to exactly 0
+  (`MUMDIA_NN_CLAMP_TINY`). A value that small adds nothing to any float32 sum here, a weight
+  of exactly 0 stays 0 under Adam, and 0 times anything is 0, so no subnormal can form in a
+  weight, a buffer, an activation or the optimizer state on any CPU, flush-to-zero or not.
+  The moments matter: for a zero-gradient parameter Adam's first moment decays as 0.9^k and
+  its second as 0.999^k, and every step touches them elementwise; with parameters and
+  buffers clamped but the moments not, the six-run desktop pool still took 18.8 min with
+  flush off (train 939 s), with the moments clamped 11.9 min (train 527 s, the flushed run's
+  513), census 0 everywhere, 116,873 peptides. Two-run pool: 4.31 min against 7.64 without
+  the clamp. Flush-to-zero stays on as the second layer; clamping training logits was tried
+  and changed nothing (no row saturates).
 - Single-seed counts are not a measurement. Any change to the arithmetic reshuffles one
   seed's peptide count by up to ~0.4% on the Astral pool and ~1% on HYE B01: seed 0 gave
   116,405 at 32 threads, 116,192 at 8 threads, 116,025 with the 11 constant columns dropped
   (a mathematically identical model) and 115,937 with flush-to-zero, while the means over
-  three seeds sit within 0.1% of each other (flushed: -0.24 / -0.04 / +0.03%). Same seed on
-  the same hardware reproduces exactly. Judge a change on the mean over seeds on two pools,
+  three seeds sit within 0.1% of each other (flushed: -0.24 / -0.04 / +0.03%). Paired on the
+  same host with the constant columns dropped, flush-to-zero is bit-identical on HYE B01 for
+  three seeds and -0.04% on Astral seed 1. Same seed on the same CPU model reproduces
+  exactly; a different CPU generation does not (EPYC 7H12 against 9354), so pair A/B arms on
+  one host. Judge a change on the mean over seeds on two pools,
   which is what CLAUDE.md already asks, and treat a 0.3% single-seed delta as nothing.
 - Training is 85% of the rescore wall (fleet baseline: worker 1,106 s of a 19.4 min stage,
   944 s of it `train`; engine load 11 s, handoff write 26 s, post-processing 5 s), so the
@@ -517,6 +532,14 @@ sections 10-16:
   default training it measured +0.2% / -1.2% / -0.1% / +1.5% on A01 / B01 / AIF / entrapment,
   and B01 is the pool the list was never fitted on. Use it for pooled rescoring on machines
   where the matrix would not fit (six HYE runs: 15.9 GB with it), not by default.
+
+  It is CLASSIFIER-specific as well as library-specific, which is the stronger reason it
+  cannot be a default. Every number above was measured with `nn_torch`. Under
+  `native_tda` -- the shipped default classifier -- the same list produced ZERO
+  identifications on the smoke fixture: 0 of 152 planted peptides, 0 peptides at 1%, and
+  empty quant tables, against SMOKE_OK from the same binary with `feature_preset: all`
+  (measured 2026-09-16 while trying to promote it to the default). Pair it with the
+  classifier it was selected for, and re-derive the list for any other combination.
 - The "sensitivity" recipe adds `folds: 5, train_margin_frac: 0.75, seeds: 3`: +0.4 / +0.4 /
   +0.6 pp over the fast recipe on HYE A01 / AIF / entrapment with the FDP unchanged, for 5.3x
   the rescore wall through the engine (18:38 against 3:31 on HYE B01, +0.2% peptides there);
@@ -540,9 +563,12 @@ sections 10-16:
   `nn_torch` rescore) take 52.5 min at a 13.25 GB process-tree peak on an EPYC 9354 with 32
   threads: per file convert 1.9-2.5 min, extract 1.6-2.0, features 0.5-0.8, search-seed 0.4,
   compete 0.2, quant 0.3 (about 5 min per file, 30 of the 52), then the pooled rescore 21.9
-  min. 113,160 peptides, 126,224 precursors, 12,132 protein groups at 1%. The rescore is 42%
-  of the whole and the per-file chain the rest, so after this PR the next lever is convert +
-  extract (`extract.windows_in_flight`, the mzML read), not the classifier.
+  min, and the multi-head calibration of the first run 11.7 min, which is also where the 13.2 GB
+  peak sits (`extract.windows_in_flight: 8` left the peak at 13.5 GB: it is not extract's on this
+  data). 113,160 peptides, 126,224 precursors, 12,132 protein groups at 1%. The rescore is 42%
+  of the whole, the multi-head calibration 22% and the per-file chains the rest, so after this PR
+  the next levers are the calibration's library re-prediction and convert + extract, not the
+  classifier.
 - Reference point, 2026-09-05: a complete HYE single run is 17:52 at 16.5 GiB on 32 threads
   (extract 16.5 GiB is the tallest stage, `extract.windows_in_flight: 8` takes it to 12.3),
   and the six-run pooled rescore is 18 minutes at 15.9 GB for 72,344 peptides.
