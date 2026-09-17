@@ -460,17 +460,29 @@ pub fn run(p: RunParams) -> Result<()> {
         )?);
         lib_p_dl
     } else {
+        // Two reasons land here, and the log has to name the right one: without a DeepLC
+        // interpreter the imported iRT is kept as is (worth a warning); with one, the
+        // multi-head calibration re-predicts the library itself against this run's anchors
+        // and a base-model re-prediction first would only be overwritten
+        // (`repredicts_library_irt`), which is a plan, not a shortfall.
         if p.lib_precursors.is_some()
             && matches!(
                 cfg.rt_im_train.library_irt,
                 mumdia_core::config::LibraryIrt::Auto
             )
         {
-            tracing::warn!(
-                "run: keeping the imported library iRT because no predict_frag.deeplc_python \
-                 is configured; configure one to re-predict with DeepLC, or set \
-                 rt_im_train.library_irt = library to silence this"
-            );
+            if cfg.predict_frag.deeplc_python.is_none() {
+                tracing::warn!(
+                    "run: keeping the imported library iRT because no predict_frag.deeplc_python \
+                     is configured; configure one to re-predict with DeepLC, or set \
+                     rt_im_train.library_irt = library to silence this"
+                );
+            } else {
+                tracing::info!(
+                    "run: the multi-head calibration re-predicts the library iRT against this \
+                     run's anchors; skipping the base-model re-prediction it would overwrite"
+                );
+            }
         }
         lib_p
     };
