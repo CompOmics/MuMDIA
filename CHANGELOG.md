@@ -15,7 +15,11 @@ which gives about 1% of that back in exchange for removing N-1 full re-predictio
 A run repeated across the upgrade will not reproduce its old counts or its old
 runtime. `predict_frag.predictor = "peptdeep"` is a new fragment-intensity
 predictor, and `experiment.finetune_scope` is now `experiment.rt_library_scope`
-(the old name still parses).
+(the old name still parses). The pooled `nn_torch` rescore also changed shape:
+about half the memory, and on Intel desktops about a tenth of the time (a six-run
+Astral pool went from 118 to 11 minutes on an i9-13900KS), because the trained
+network no longer accumulates subnormal floats; and `rescore.train_neg_ratio`
+defaults to 2 instead of 3, which raised identifications on every pool measured.
 
 `0.3.0` raises the DeepLC floor to 4.4.0, so every environment must be rebuilt
 before upgrading. It also adds multi-head retention-time calibration, off by
@@ -37,56 +41,56 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ## [Unreleased]
 
-### Fixed
+## [0.4.0] - 2026-09-17
 
-- The `nn_torch` rescorer fell to its disk-backed memmap far too eagerly.
-  `MUMDIA_NN_STREAM_GB` was a fixed 4 GB, so a 4.52 GiB feature matrix on a 96 GiB
-  machine crossed it by 13% and took a path measured at about 9x slower: **166 minutes
-  against roughly 20**. Unset, the threshold is now twice free physical memory, never
-  below the historical 4 GB, so the memmap is a last resort rather than a safety margin
-  and a matrix that merely overflows RAM is paged by the operating system instead --
-  much cheaper for this access pattern. Setting `MUMDIA_NN_STREAM_GB` still overrides it
-  exactly as before, which is what a machine with no page file wants.
+### Added
 
-  The worker already logged which backend it chose; it now also says where the threshold
-  came from, and warns explicitly when the slow path is taken for want of memory.
-### Security
+- `predict_frag.predictor = "peptdeep"`: AlphaPeptDeep fragment intensities, a third
+  option beside `native` and `ms2pip`. With `rt_predictor = "deeplc"` this is a
+  library built end to end from a FASTA with open predictors and no DIA-NN anywhere,
+  which also means nothing re-predicts or replaces its retention times later:
+  `rt_im_train.library_irt` applies to imported libraries only, and a library you
+  built already is the DeepLC prediction. The per-run LOESS calibration,
+  `finetune_deeplc` and `multihead_calibration` all still apply.
 
-- `rustls` 0.23.43 -> 0.23.45 in the desktop application, closing RUSTSEC-2026-0285
-  (TLS 1.3 handshake messages incorrectly accepted across encryption level boundaries,
-  medium, 5.3). It reaches the application through `ureq`, which is what downloads
-  DIA-NN 1.8.1 and ThermoRawFileParser, so it is on a path that fetches executables.
-  Lock-only; no manifest constraint changed.
+  New settings: `peptdeep_python`, `peptdeep_model` (default `generic`),
+  `peptdeep_nce` (default 30.0) and `peptdeep_instrument` (default `Lumos`).
+  Collision energy and instrument change the predicted spectrum, so both are part of
+  the artifact's `model_identity` (`peptdeep-1.5.1-generic-nce30-Lumos`): two
+  libraries built at different NCE are not the same library. The device comes from
+  `MUMDIA_PEPTDEEP_DEVICE` (auto|cuda|cpu), as the rescorer takes `MUMDIA_NN_DEVICE`.
 
-## [0.4.0] - 2026-09-14
+  Opt-in and benchmark-gated. No entrapment or second-acquisition measurement exists
+  for it yet, and a seed-PSM count alone does not promote a default.
 
-### Fixed
+- The desktop Setup screen has a **Managed data** card. Everything the application
+  downloads or builds is written at runtime under `%LOCALAPPDATA%\MuMDIA` (or
+  `~/.local/share/MuMDIA`), and an installer removes only what it placed under the
+  program folder, so an uninstall left all of it behind: 8.9 GB on one development
+  machine, with nothing in the interface that could remove it. The card lists each
+  item with its size and removes it in two clicks, naming the exact paths first.
+  Removal is refused while a search, an installation or a library build is running.
 
-- The desktop progress ladder stopped moving after the first file of a multi-file
-  experiment. Stages were aggregated by NAME across the whole output tree, so once file
-  1 had reached the last stage, file 2's `convert` could not pull "the furthest stage
-  seen" backwards, and the remaining files ran with the display frozen on the first
-  file's finish. The row and time figures were a sum across files as well, describing no
-  file in particular: on a six-file Astral experiment `extract` read 87.8M rows from 12
-  artifacts. The run snapshot now carries per-file progress (`runs`) and the pooled tail
-  (`root_stages`) separately, and the display follows the file that is actually running
-  and says "file k of n".
-- The desktop application's run log, the terminal and any redirected log file were
-  almost entirely blank lines whenever retention times were predicted. DeepLC's
-  progress writer emits a bare carriage return per update, which renders as nothing
-  when stdout is not a terminal, and the engine inherits a worker's stdout rather than
-  capturing it (deliberately, so long-running progress reaches the user live). Measured:
-  5,697 blank lines from one 2.9M-peptide prediction, and 98-99% of two real run logs.
-  Both DeepLC workers now filter their own stdout, dropping only what is empty once
-  carriage returns and whitespace are stripped; everything DeepLC actually says still
-  comes through, in order, and stderr is untouched. `MUMDIA_DEEPLC_RAW_OUTPUT=1`
-  restores the unfiltered output for debugging.
-
-  This affected every run that predicts retention times, which since multi-head
-  calibration became the default is every run with a DeepLC interpreter.
+  Deliberately not done as an uninstaller action: an upgrade reuses the same data
+  directory, and an MSI uninstall also runs during some upgrade paths, so a silent
+  delete would throw away a spectral library that costs hours to predict as a side
+  effect of a version change.
 
 ### Changed
 
+- **`rescore.train_neg_ratio` defaults to 2 instead of 3.** Measured with three seeds per
+  pool against 3: Astral six-run pool 116,711 against 116,309 peptides (+0.35%), HYE B01
+  63,096 against 63,004 (+0.15%), AIF entrapment library +0.56% real peptides at an
+  empirical FDP of 1.025% against 1.044% with the decoy fraction unchanged, at 16% less
+  rescore wall. 1.5 and 1 were measured too: 1 buys its count with a looser null (FDP
+  1.099%). A config that sets the ratio explicitly is unaffected.
+- Measured and recorded rather than changed (CLAUDE.md "Rescore cost"): `folds: 2` is
+  -45% rescore wall at -0.06% peptides on the large pool but -1.1% on HYE B01;
+  `train_subsample: 0.5` -33% at -0.3% / -0.9%; batch 16384 -20% at +0.07% / -0.6%;
+  `folds: 5` +0.09% at twice the wall; `folds: 1` (in-sample scoring) is refuted by
+  entrapment, +2.8% real peptides at an FDP of 1.42% against 1.00%. A single seed's count
+  moves by up to 0.4% under any change of arithmetic (thread count, CPU generation, column
+  set), so these are means over seeds on two pools.
 - **`experiment.finetune_scope` is now `experiment.rt_library_scope`, and it governs
   multi-head calibration as well as the DeepLC fine-tune.** The old name still parses.
 
@@ -143,38 +147,84 @@ than a number. Both are recorded in every run's `manifest.json`.
   `model_identities.rt_predictor` now reads `multihead-80` rather than
   `deeplc-4.4.0-base`, which is how to tell which one a given run used.
 
-### Added
+### Performance
 
-- `predict_frag.predictor = "peptdeep"`: AlphaPeptDeep fragment intensities, a third
-  option beside `native` and `ms2pip`. With `rt_predictor = "deeplc"` this is a
-  library built end to end from a FASTA with open predictors and no DIA-NN anywhere,
-  which also means nothing re-predicts or replaces its retention times later:
-  `rt_im_train.library_irt` applies to imported libraries only, and a library you
-  built already is the DeepLC prediction. The per-run LOESS calibration,
-  `finetune_deeplc` and `multihead_calibration` all still apply.
+- **The pooled `nn_torch` rescore holds about half the memory it did.** Under
+  `rescore.strict` with a sidecar classifier the engine releases its own feature matrix
+  as soon as the handoff table is written (strict has no native fallback that could still
+  read it); the handoff parquet is written in 131,072-row groups; and the worker reads it
+  one row group at a time, because pyarrow's read-ahead had buffered a second copy of the
+  matrix. Six-run Astral pool (3,133,636 PSMs x 387 features): process-tree peak 17.9 ->
+  9.3 GB; HYE B01 (1,838,344 PSMs): 12.0 -> 5.05 GB; identical identifications and
+  unchanged wall on the fleet. The disk-backed memmap stays the last resort.
+- **Intel desktops rescore at fleet speed.** The same six-run pool took 118 minutes on an
+  i9-13900KS against 19 on an EPYC 9354, with identical single-threaded epoch speed. Two
+  causes, both removed. The worker ran one OpenMP thread per logical CPU, and on a hybrid
+  (P + E core) CPU every parallel op waits for its slowest thread; torch threads are now
+  capped at the performance-core count on Windows or 16 elsewhere, the engine's
+  `--threads` being an upper bound (`MUMDIA_NN_THREAD_CAP`). And the trained network
+  accumulated subnormal float32 values, which Intel cores handle through microcode assists
+  at about a hundred times the cost of a normal multiply-add: Adam with L2 decay shrinks
+  every parameter that receives no data gradient geometrically until it crosses 1.2e-38
+  (the constant features' weights, dead units, their BatchNorm buffers, and Adam's own
+  moments). The worker now drops constant feature columns from the parquet footer's
+  statistics (`MUMDIA_NN_DROP_CONSTANT`), zeroes every parameter, buffer and optimizer
+  moment below 1e-20 once per epoch (`MUMDIA_NN_CLAMP_TINY`), and flushes subnormals to
+  zero as a second layer (`MUMDIA_NN_FLUSH_DENORMAL`). Desktop, six-run pool: 118 -> 74
+  minutes from the thread cap alone, 11.4 with everything, 11.9 with flush-to-zero off and
+  the clamps alone; 4.6 minutes on an RTX 4090 with `MUMDIA_NN_DEVICE=cuda`. Paired on one
+  host, the clamps and the flush move a single seed's count by less than the seed-to-seed
+  spread and are bit-identical on HYE B01. `MUMDIA_NN_DEBUG_DENORMALS=1` prints a per-round
+  census.
 
-  New settings: `peptdeep_python`, `peptdeep_model` (default `generic`),
-  `peptdeep_nce` (default 30.0) and `peptdeep_instrument` (default `Lumos`).
-  Collision energy and instrument change the predicted spectrum, so both are part of
-  the artifact's `model_identity` (`peptdeep-1.5.1-generic-nce30-Lumos`): two
-  libraries built at different NCE are not the same library. The device comes from
-  `MUMDIA_PEPTDEEP_DEVICE` (auto|cuda|cpu), as the rescorer takes `MUMDIA_NN_DEVICE`.
+### Fixed
 
-  Opt-in and benchmark-gated. No entrapment or second-acquisition measurement exists
-  for it yet, and a seed-PSM count alone does not promote a default.
+- Under multi-head calibration both orchestrators warned that no
+  `predict_frag.deeplc_python` was configured when the base-model re-prediction of the
+  library iRT was skipped; the real reason was that the calibration re-predicts the library
+  itself on the first run. The warning is now reserved for a missing interpreter and the
+  multi-head case is logged as what it is.
+- The `nn_torch` rescorer fell to its disk-backed memmap far too eagerly.
+  `MUMDIA_NN_STREAM_GB` was a fixed 4 GB, so a 4.52 GiB feature matrix on a 96 GiB
+  machine crossed it by 13% and took a path measured at about 9x slower: **166 minutes
+  against roughly 20**. Unset, the threshold is now twice free physical memory, never
+  below the historical 4 GB, so the memmap is a last resort rather than a safety margin
+  and a matrix that merely overflows RAM is paged by the operating system instead --
+  much cheaper for this access pattern. Setting `MUMDIA_NN_STREAM_GB` still overrides it
+  exactly as before, which is what a machine with no page file wants.
 
-- The desktop Setup screen has a **Managed data** card. Everything the application
-  downloads or builds is written at runtime under `%LOCALAPPDATA%\MuMDIA` (or
-  `~/.local/share/MuMDIA`), and an installer removes only what it placed under the
-  program folder, so an uninstall left all of it behind: 8.9 GB on one development
-  machine, with nothing in the interface that could remove it. The card lists each
-  item with its size and removes it in two clicks, naming the exact paths first.
-  Removal is refused while a search, an installation or a library build is running.
+  The worker already logged which backend it chose; it now also says where the threshold
+  came from, and warns explicitly when the slow path is taken for want of memory.
+- The desktop progress ladder stopped moving after the first file of a multi-file
+  experiment. Stages were aggregated by NAME across the whole output tree, so once file
+  1 had reached the last stage, file 2's `convert` could not pull "the furthest stage
+  seen" backwards, and the remaining files ran with the display frozen on the first
+  file's finish. The row and time figures were a sum across files as well, describing no
+  file in particular: on a six-file Astral experiment `extract` read 87.8M rows from 12
+  artifacts. The run snapshot now carries per-file progress (`runs`) and the pooled tail
+  (`root_stages`) separately, and the display follows the file that is actually running
+  and says "file k of n".
+- The desktop application's run log, the terminal and any redirected log file were
+  almost entirely blank lines whenever retention times were predicted. DeepLC's
+  progress writer emits a bare carriage return per update, which renders as nothing
+  when stdout is not a terminal, and the engine inherits a worker's stdout rather than
+  capturing it (deliberately, so long-running progress reaches the user live). Measured:
+  5,697 blank lines from one 2.9M-peptide prediction, and 98-99% of two real run logs.
+  Both DeepLC workers now filter their own stdout, dropping only what is empty once
+  carriage returns and whitespace are stripped; everything DeepLC actually says still
+  comes through, in order, and stderr is untouched. `MUMDIA_DEEPLC_RAW_OUTPUT=1`
+  restores the unfiltered output for debugging.
 
-  Deliberately not done as an uninstaller action: an upgrade reuses the same data
-  directory, and an MSI uninstall also runs during some upgrade paths, so a silent
-  delete would throw away a spectral library that costs hours to predict as a side
-  effect of a version change.
+  This affected every run that predicts retention times, which since multi-head
+  calibration became the default is every run with a DeepLC interpreter.
+
+### Security
+
+- `rustls` 0.23.43 -> 0.23.45 in the desktop application, closing RUSTSEC-2026-0285
+  (TLS 1.3 handshake messages incorrectly accepted across encryption level boundaries,
+  medium, 5.3). It reaches the application through `ureq`, which is what downloads
+  DIA-NN 1.8.1 and ThermoRawFileParser, so it is on a path that fetches executables.
+  Lock-only; no manifest constraint changed.
 
 ## [0.3.1] - 2026-09-10
 
