@@ -41,6 +41,24 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`scripts/_lib_io.py` writes precursor tables of any size.** `Table.from_pandas` converts
+  a column as one arrow array, and a `string` array holds at most 2 GiB of characters, so on
+  a 285M-row precursor table (the 8-12-mer immunopeptidomics library with reverse decoys;
+  `peptidoform` alone is 4.5 GB) pandas 3 / pyarrow 25 produced a `large_string` array that
+  the engine-encoding cast refused (`Failed casting from large_string to string: input array
+  too large`), and `make_reverse_decoys.py` failed at its final write after 70 minutes. The
+  frame is now converted in 4M-row slices into a chunked table; parquet writes the chunks as
+  row groups, which is how the engine reads them.
+- **`scripts/import_diann_lib.py` fragment m/z cardinality is bit-identical to the
+  whole-table importer.** The streaming importer binned `Product.Mz` in float64 where the
+  original rounded the float32 column, and it counted a bin twice when one precursor's
+  fragments straddled a parquet row-group boundary. Bins are computed in float32 and the last
+  precursor's bins are carried into the next row group; measured identical `cardinality` on
+  the 29.5M-precursor 9-mer library.
+
+
 ### Performance
 
 - **`scripts/import_diann_lib.py` streams the DIA-NN library** instead of reading the

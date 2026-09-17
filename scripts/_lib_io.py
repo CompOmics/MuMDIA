@@ -57,9 +57,32 @@ def narrow_table(table: pa.Table) -> pa.Table:
     return table.cast(schema) if schema != table.schema else table
 
 
+# Rows converted per slice when a DataFrame becomes an arrow Table. A `string` array holds
+# at most 2 GiB of character data (32-bit offsets), and `Table.from_pandas` converts a column
+# as ONE array, so past that size pandas 3 / pyarrow 25 produce a `large_string` array that
+# `narrow_table` cannot cast back ("Failed casting from large_string to string: input array
+# too large"). Measured on the 285M-row 8-12-mer immunopeptidomics precursor table: the
+# `peptidoform` column alone is 4.5 GB, and the reverse-decoy builder failed at the final
+# write after 70 minutes. Converting in slices keeps every array under the limit; the
+# resulting table is chunked, which parquet writes as row groups and the engine reads
+# row group by row group.
+SLICE_ROWS = 4_000_000
+
+
 def to_engine_table(df) -> pa.Table:
-    """A pandas DataFrame as an arrow Table the engine will accept."""
-    return narrow_table(pa.Table.from_pandas(df, preserve_index=False))
+    """A pandas DataFrame as an arrow Table the engine will accept, of any row count."""
+    n = len(df)
+    if n <= SLICE_ROWS:
+        return narrow_table(pa.Table.from_pandas(df, preserve_index=False))
+    parts = []
+    for start in range(0, n, SLICE_ROWS):
+        part = narrow_table(pa.Table.from_pandas(df.iloc[start:start + SLICE_ROWS], preserve_index=False))
+        # A slice whose object column happens to be all-null converts to type `null`; cast
+        # it to the first slice's schema so the concatenation is one type per column.
+        if parts and part.schema != parts[0].schema:
+            part = part.cast(parts[0].schema)
+        parts.append(part)
+    return pa.concat_tables(parts)
 
 
 def write_engine_parquet(df, path) -> None:
