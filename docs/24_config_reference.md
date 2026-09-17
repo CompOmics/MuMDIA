@@ -720,41 +720,42 @@ listed with the file it is in.
 | `MUMDIA_MOKAPOT_WORKERS` | sidecar | `"3"` | `scripts/mokapot_worker.py:120` |
 | `MUMDIA_MSCONVERT` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/raw.rs:193` |
 | `MUMDIA_NN_ALPHA` | sidecar | `"1e-4"` | `scripts/mokapot_worker.py:90` |
-| `MUMDIA_NN_BATCH` | sidecar | `4096` | `scripts/nn_rescore_worker.py:578` |
-| `MUMDIA_NN_CHUNK` | sidecar | `250000` | `scripts/nn_rescore_worker.py:582` |
-| `MUMDIA_NN_DEBUG_DENORMALS` | sidecar | `0` | `scripts/nn_rescore_worker.py:655` |
-| `MUMDIA_NN_DEVICE` | sidecar | `"auto"` | `scripts/nn_rescore_worker.py:590` |
-| `MUMDIA_NN_DROPOUT` | sidecar | `0.3` | `scripts/nn_rescore_worker.py:575` |
-| `MUMDIA_NN_DROP_CONSTANT` | sidecar | `1` | `scripts/nn_rescore_worker.py:744` |
-| `MUMDIA_NN_EARLY_STOP` | sidecar | `1` | `scripts/nn_rescore_worker.py:583` |
-| `MUMDIA_NN_EARLY_STOP_TOL` | sidecar | `0.01` | `scripts/nn_rescore_worker.py:584` |
-| `MUMDIA_NN_EPOCHS` | sidecar | `25` | `scripts/nn_rescore_worker.py:573` |
-| `MUMDIA_NN_FEATURES` | sidecar | `""` | `scripts/nn_rescore_worker.py:715` |
-| `MUMDIA_NN_FLUSH_DENORMAL` | sidecar | `1` | `scripts/nn_rescore_worker.py:647` |
-| `MUMDIA_NN_FOLDS` | sidecar | `3` | `scripts/nn_rescore_worker.py:561` |
-| `MUMDIA_NN_FOLD_KEYS` | sidecar | `""` | `scripts/nn_rescore_worker.py:771` |
-| `MUMDIA_NN_HIDDEN` | sidecar | `"128,64"` in nn_rescore_worker.py; `"128,64,64,32"` in mokapot_worker.py | `scripts/mokapot_worker.py:83`, `scripts/nn_rescore_worker.py:574` |
-| `MUMDIA_NN_INIT_SAMPLE` | sidecar | `300000` | `scripts/nn_rescore_worker.py:935` |
-| `MUMDIA_NN_INIT_TOPK` | sidecar | `0` | `scripts/nn_rescore_worker.py:1057` |
-| `MUMDIA_NN_ITERS` | sidecar | `5` | `scripts/nn_rescore_worker.py:572` |
-| `MUMDIA_NN_LR` | sidecar | `1e-3` | `scripts/nn_rescore_worker.py:576` |
-| `MUMDIA_NN_MARGIN_FRAC` | sidecar | `0.5` | `scripts/nn_rescore_worker.py:571` |
+| `MUMDIA_NN_BATCH` | sidecar | `4096` | `scripts/nn_rescore_worker.py:607` |
+| `MUMDIA_NN_CHUNK` | sidecar | `250000` | `scripts/nn_rescore_worker.py:611` |
+| `MUMDIA_NN_CLAMP_TINY` | sidecar | `1e-20` | `scripts/nn_rescore_worker.py:615` |
+| `MUMDIA_NN_DEBUG_DENORMALS` | sidecar | `0` | `scripts/nn_rescore_worker.py:685` |
+| `MUMDIA_NN_DEVICE` | sidecar | `"auto"` | `scripts/nn_rescore_worker.py:620` |
+| `MUMDIA_NN_DROPOUT` | sidecar | `0.3` | `scripts/nn_rescore_worker.py:604` |
+| `MUMDIA_NN_DROP_CONSTANT` | sidecar | `1` | `scripts/nn_rescore_worker.py:774` |
+| `MUMDIA_NN_EARLY_STOP` | sidecar | `1` | `scripts/nn_rescore_worker.py:612` |
+| `MUMDIA_NN_EARLY_STOP_TOL` | sidecar | `0.01` | `scripts/nn_rescore_worker.py:613` |
+| `MUMDIA_NN_EPOCHS` | sidecar | `25` | `scripts/nn_rescore_worker.py:602` |
+| `MUMDIA_NN_FEATURES` | sidecar | `""` | `scripts/nn_rescore_worker.py:745` |
+| `MUMDIA_NN_FLUSH_DENORMAL` | sidecar | `1` | `scripts/nn_rescore_worker.py:677` |
+| `MUMDIA_NN_FOLDS` | sidecar | `3` | `scripts/nn_rescore_worker.py:590` |
+| `MUMDIA_NN_FOLD_KEYS` | sidecar | `""` | `scripts/nn_rescore_worker.py:801` |
+| `MUMDIA_NN_HIDDEN` | sidecar | `"128,64"` in nn_rescore_worker.py; `"128,64,64,32"` in mokapot_worker.py | `scripts/mokapot_worker.py:83`, `scripts/nn_rescore_worker.py:603` |
+| `MUMDIA_NN_INIT_SAMPLE` | sidecar | `300000` | `scripts/nn_rescore_worker.py:965` |
+| `MUMDIA_NN_INIT_TOPK` | sidecar | `0` | `scripts/nn_rescore_worker.py:1088` |
+| `MUMDIA_NN_ITERS` | sidecar | `5` | `scripts/nn_rescore_worker.py:601` |
+| `MUMDIA_NN_LR` | sidecar | `1e-3` | `scripts/nn_rescore_worker.py:605` |
+| `MUMDIA_NN_MARGIN_FRAC` | sidecar | `0.5` | `scripts/nn_rescore_worker.py:600` |
 | `MUMDIA_NN_MAX_ITER` | sidecar | `"200"` | `scripts/mokapot_worker.py:91` |
-| `MUMDIA_NN_NEG_RATIO` | sidecar | `0.0` | `scripts/nn_rescore_worker.py:565` |
-| `MUMDIA_NN_NEG_SELECT` | sidecar | `"random"` | `scripts/nn_rescore_worker.py:566` |
-| `MUMDIA_NN_PREGATHER_GB` | sidecar | `8` | `scripts/nn_rescore_worker.py:585` |
-| `MUMDIA_NN_SEED` | sidecar | `0` | `scripts/nn_rescore_worker.py:581` |
-| `MUMDIA_NN_SEEDS` | sidecar | `1` | `scripts/nn_rescore_worker.py:580` |
+| `MUMDIA_NN_NEG_RATIO` | sidecar | `0.0` | `scripts/nn_rescore_worker.py:594` |
+| `MUMDIA_NN_NEG_SELECT` | sidecar | `"random"` | `scripts/nn_rescore_worker.py:595` |
+| `MUMDIA_NN_PREGATHER_GB` | sidecar | `8` | `scripts/nn_rescore_worker.py:614` |
+| `MUMDIA_NN_SEED` | sidecar | `0` | `scripts/nn_rescore_worker.py:610` |
+| `MUMDIA_NN_SEEDS` | sidecar | `1` | `scripts/nn_rescore_worker.py:609` |
 | `MUMDIA_NN_SOLVER` | sidecar | `"adam"` | `scripts/mokapot_worker.py:89` |
-| `MUMDIA_NN_STREAM` | sidecar | `"auto"` | `scripts/nn_rescore_worker.py:657` |
-| `MUMDIA_NN_STREAM_GB` | sidecar | `4` | `scripts/nn_rescore_worker.py:671`, `scripts/nn_rescore_worker.py:672` |
-| `MUMDIA_NN_THREADS` | both | `16` | `rust/mumdia/crates/mumdia/src/main.rs:93`, `scripts/nn_rescore_worker.py:611`, `scripts/nn_rescore_worker.py:612` |
-| `MUMDIA_NN_THREAD_CAP` | sidecar | `"auto"` | `scripts/nn_rescore_worker.py:279` |
-| `MUMDIA_NN_TRAIN_FDR` | sidecar | `0.01` | `scripts/nn_rescore_worker.py:579` |
-| `MUMDIA_NN_TRAIN_SUB` | sidecar | `0.0` | `scripts/nn_rescore_worker.py:562` |
-| `MUMDIA_NN_WARM_EPOCHS` | sidecar | `0` | `scripts/nn_rescore_worker.py:564` |
-| `MUMDIA_NN_WARM_START` | sidecar | `0` | `scripts/nn_rescore_worker.py:563` |
-| `MUMDIA_NN_WD` | sidecar | `1e-4` | `scripts/nn_rescore_worker.py:577` |
+| `MUMDIA_NN_STREAM` | sidecar | `"auto"` | `scripts/nn_rescore_worker.py:687` |
+| `MUMDIA_NN_STREAM_GB` | sidecar | `4` | `scripts/nn_rescore_worker.py:701`, `scripts/nn_rescore_worker.py:702` |
+| `MUMDIA_NN_THREADS` | both | `16` | `rust/mumdia/crates/mumdia/src/main.rs:93`, `scripts/nn_rescore_worker.py:641`, `scripts/nn_rescore_worker.py:642` |
+| `MUMDIA_NN_THREAD_CAP` | sidecar | `"auto"` | `scripts/nn_rescore_worker.py:287` |
+| `MUMDIA_NN_TRAIN_FDR` | sidecar | `0.01` | `scripts/nn_rescore_worker.py:608` |
+| `MUMDIA_NN_TRAIN_SUB` | sidecar | `0.0` | `scripts/nn_rescore_worker.py:591` |
+| `MUMDIA_NN_WARM_EPOCHS` | sidecar | `0` | `scripts/nn_rescore_worker.py:593` |
+| `MUMDIA_NN_WARM_START` | sidecar | `0` | `scripts/nn_rescore_worker.py:592` |
+| `MUMDIA_NN_WD` | sidecar | `1e-4` | `scripts/nn_rescore_worker.py:606` |
 | `MUMDIA_PEPTDEEP_DEVICE` | sidecar | `"auto"` | `scripts/peptdeep_worker.py:214` |
 | `MUMDIA_PYTHON` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/python.rs:233` |
 | `MUMDIA_PYTHON_DEEPLC` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/python.rs:232` |
@@ -768,13 +769,13 @@ listed with the file it is in.
 | `MUMDIA_XGB_JOBS` | sidecar | `"0"` | `scripts/mokapot_worker.py:68` |
 | `MUMDIA_XGB_LR` | sidecar | `"0.1"` | `scripts/mokapot_worker.py:64` |
 | `MUMDIA_XGB_TREES` | sidecar | `"200"` | `scripts/mokapot_worker.py:62` |
-| `OMP_NUM_THREADS` | both | `16` | `rust/mumdia/crates/mumdia/src/main.rs:93`, `scripts/nn_rescore_worker.py:614`, `scripts/nn_rescore_worker.py:615` |
+| `OMP_NUM_THREADS` | both | `16` | `rust/mumdia/crates/mumdia/src/main.rs:93`, `scripts/nn_rescore_worker.py:644`, `scripts/nn_rescore_worker.py:645` |
 | `PATH` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/raw.rs:293` |
 | `ProgramFiles` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/raw.rs:201` |
 | `ProgramFiles(x86)` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/raw.rs:202` |
 | `VIRTUAL_ENV` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/python.rs:242` |
 
-63 variables are read: 16 engine-side, 50 sidecar-side, 3 on both sides.
+64 variables are read: 16 engine-side, 51 sidecar-side, 3 on both sides.
 
 ### Variables the code sets
 
@@ -824,6 +825,6 @@ Every field whose struct has an `impl Default` resolved from the source.
 
 ## Coverage
 
-18 structs and 188 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 24 enumerations, 1 named profile(s), 63 environment variables read and 19 set.
+18 structs and 188 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 24 enumerations, 1 named profile(s), 64 environment variables read and 19 set.
 
 20 field(s) carry a gating marker in their doc comment. 47 field(s) carry no doc comment at all, so their description is empty above. 0 default(s) could not be resolved and 2 have none by design.
