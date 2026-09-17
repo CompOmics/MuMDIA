@@ -461,13 +461,18 @@ sections 10-16:
   that subnormal source but not the others: dead hidden units and their BatchNorm variances
   decay the same way (census on the six-run pool: up to ~6,400 parameters, 11 buffers,
   ~3,000 activations in a round), and the desktop still took 61.8 min without flushing.
-  Since 2026-09-17 the worker removes that source as well: once per epoch every parameter
-  and floating buffer with |value| < 1e-20 is set to exactly 0 (`MUMDIA_NN_CLAMP_TINY`). A
-  value that small adds nothing to any float32 sum here, a weight of exactly 0 stays 0 under
-  Adam, and 0 times anything is 0, so no subnormal can form in a weight, a buffer or an
-  activation on any CPU, flush-to-zero or not. Measured on the desktop two-run pool with
-  flush-to-zero off: census 0 in every round, 4.31 min against 7.64 without it and 5.07 with flush-to-zero alone, 96,220 peptides against 96,137. Flush-to-zero stays on as the
-  second layer.
+  Since 2026-09-17 the worker removes that source as well: once per epoch every parameter,
+  floating buffer and Adam moment with |value| < 1e-20 is set to exactly 0
+  (`MUMDIA_NN_CLAMP_TINY`). A value that small adds nothing to any float32 sum here, a weight
+  of exactly 0 stays 0 under Adam, and 0 times anything is 0, so no subnormal can form in a
+  weight, a buffer, an activation or the optimizer state on any CPU, flush-to-zero or not.
+  The moments matter: for a zero-gradient parameter Adam's first moment decays as 0.9^k and
+  its second as 0.999^k, and every step touches them elementwise; with parameters and
+  buffers clamped but the moments not, the six-run desktop pool still took 18.8 min with
+  flush off (train 939 s), with the moments clamped 11.9 min (train 527 s, the flushed run's
+  513), census 0 everywhere, 116,873 peptides. Two-run pool: 4.31 min against 7.64 without
+  the clamp. Flush-to-zero stays on as the second layer; clamping training logits was tried
+  and changed nothing (no row saturates).
 - Single-seed counts are not a measurement. Any change to the arithmetic reshuffles one
   seed's peptide count by up to ~0.4% on the Astral pool and ~1% on HYE B01: seed 0 gave
   116,405 at 32 threads, 116,192 at 8 threads, 116,025 with the 11 constant columns dropped

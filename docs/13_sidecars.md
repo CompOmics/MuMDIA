@@ -719,13 +719,15 @@ MLP. Set it explicitly for the logreg path.
   ten all-zero deconvolution/peak-sharing fractions). A constant column standardises
   to exactly 0 and contributes nothing to any prediction; its first-layer weights are
   the main subnormal source (below), so dropping it is free.
-- **Tiny parameters are clamped to zero once per epoch** (`MUMDIA_NN_CLAMP_TINY`,
-  default 1e-20; 2026-09-17). Adam with L2 decay shrinks any parameter that receives
-  no data gradient geometrically until it crosses 1.2e-38: dead hidden units'
-  weights, their BatchNorm scale and shift and the running variances. Setting them to
+- **Tiny parameters, buffers and Adam moments are clamped to zero once per epoch**
+  (`MUMDIA_NN_CLAMP_TINY`, default 1e-20; 2026-09-17). Adam with L2 decay shrinks any
+  parameter that receives no data gradient geometrically until it crosses 1.2e-38:
+  dead hidden units' weights, their BatchNorm scale and shift, the running variances,
+  and Adam's own first and second moments (0.9^k and 0.999^k). Setting them to
   exactly 0 below 1e-20 changes no prediction and leaves nothing that can become
-  subnormal, on any CPU. Desktop two-run pool, flush-to-zero off: census 0 in every
-  round, 4.31 min against 7.64 without it and 5.07 with flush-to-zero alone, 96,220 peptides against 96,137.
+  subnormal, on any CPU. Desktop six-run pool with flush-to-zero off: 11.9 min and a
+  census of 0 everywhere (18.8 min with the moments left unclamped, 61.8 with no
+  clamp at all); two-run pool 4.31 min against 7.64.
 - **Subnormal floats are flushed to zero** (`MUMDIA_NN_FLUSH_DENORMAL`, default 1;
   2026-09-16). On Intel cores a subnormal operand turns a 4 ms `Linear` into a
   475 ms one (measured, i9-13900KS; an EPYC 9354 is unaffected), and the trained
