@@ -431,14 +431,33 @@ pub struct BatchWriter {
 
 impl BatchWriter {
     pub fn new(path: &str, schema: Arc<Schema>) -> Result<BatchWriter> {
+        Self::open(path, schema, None)
+    }
+
+    /// Like [`BatchWriter::new`], with row groups capped at `rows` rows.
+    ///
+    /// A reader that iterates the file in batches decodes one row group at a time, so on
+    /// a wide table the row-group size IS the reader's working set: at 387 f32 columns
+    /// the parquet default of 1,048,576 rows is 1.6 GB decoded per group, regardless of
+    /// how small the batches it asks for are. Batches larger than `rows` are split.
+    pub fn with_row_group_rows(
+        path: &str,
+        schema: Arc<Schema>,
+        rows: usize,
+    ) -> Result<BatchWriter> {
+        Self::open(path, schema, Some(rows))
+    }
+
+    fn open(path: &str, schema: Arc<Schema>, row_group_rows: Option<usize>) -> Result<BatchWriter> {
         let target = AtomicPath::new(path)?;
         let file = std::fs::File::create(target.tmp())
             .with_context(|| format!("creating {}", target.tmp().display()))?;
-        let props = WriterProperties::builder()
-            .set_compression(Compression::SNAPPY)
-            .build();
         Ok(BatchWriter {
-            writer: Some(ArrowWriter::try_new(file, schema, Some(props))?),
+            writer: Some(ArrowWriter::try_new(
+                file,
+                schema,
+                Some(snappy_props(row_group_rows)),
+            )?),
             rows: 0,
             target: Some(target),
         })
@@ -1307,6 +1326,46 @@ mod projection_tests {
         assert!(proj.f32("skip_me").is_err());
         assert!(full.f32("skip_me").is_ok());
         std::fs::remove_file(p).ok();
+    }
+}
+
+#[cfg(test)]
+mod batch_writer_tests {
+    use super::*;
+    use arrow::array::{ArrayRef, Float32Array, Int32Array};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use parquet::file::reader::{FileReader, SerializedFileReader};
+
+    #[test]
+    fn row_group_cap_splits_large_batches() {
+        let dir =
+            std::env::temp_dir().join(format!("mumdia_batch_writer_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("capped.parquet").to_string_lossy().to_string();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("i", DataType::Int32, false),
+            Field::new("x", DataType::Float32, false),
+        ]));
+        let n = 10_000usize;
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from((0..n as i32).collect::<Vec<_>>())) as ArrayRef,
+                Arc::new(Float32Array::from(vec![1.5f32; n])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        // One 10,000-row batch, groups capped at 3,000 rows: 3,000 + 3,000 + 3,000 + 1,000.
+        let mut w = BatchWriter::with_row_group_rows(&path, schema, 3_000).unwrap();
+        w.write(&batch).unwrap();
+        assert_eq!(w.close().unwrap(), n as u64);
+        let reader = SerializedFileReader::new(std::fs::File::open(&path).unwrap()).unwrap();
+        let meta = reader.metadata();
+        assert_eq!(meta.num_row_groups(), 4);
+        assert_eq!(meta.row_group(0).num_rows(), 3_000);
+        assert_eq!(meta.row_group(3).num_rows(), 1_000);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

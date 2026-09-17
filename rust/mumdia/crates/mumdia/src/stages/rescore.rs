@@ -321,6 +321,10 @@ pub fn run(p: RescoreParams) -> Result<u64> {
         folds = p.cfg.folds,
         "rescore: loaded competed PSMs"
     );
+    // From here on the matrix is optional. A sidecar run under `rescore.strict` releases it
+    // as soon as the worker has its own copy on disk (`run_pin_sidecar`), because no native
+    // fallback can follow; every native path reads it through `kept_matrix`.
+    let mut feats_slot = Some(feats);
 
     // Track the path actually taken so the report reflects reality rather than a
     // hardcoded label, and pick the null the q-values are computed against.
@@ -343,7 +347,7 @@ pub fn run(p: RescoreParams) -> Result<u64> {
                 &pform,
                 &protein,
                 &mz,
-                &feats,
+                &mut feats_slot,
                 &base,
             ) {
                 Ok(s) => {
@@ -361,7 +365,7 @@ pub fn run(p: RescoreParams) -> Result<u64> {
                         );
                     }
                     warn!("rescore: Mokapot failed ({e}); falling back to native_tda");
-                    native_scores(&p, &feats, &is_decoy, &base, &prelim)
+                    native_scores(&p, kept_matrix(&feats_slot), &is_decoy, &base, &prelim)
                 }
             },
             RescorerKind::NnTorch => match run_pin_sidecar(
@@ -373,7 +377,7 @@ pub fn run(p: RescoreParams) -> Result<u64> {
                 &pform,
                 &protein,
                 &mz,
-                &feats,
+                &mut feats_slot,
                 &base,
             ) {
                 Ok(s) => {
@@ -389,7 +393,7 @@ pub fn run(p: RescoreParams) -> Result<u64> {
                         );
                     }
                     warn!("rescore: NnTorch failed ({e}); falling back to native_tda");
-                    native_scores(&p, &feats, &is_decoy, &base, &prelim)
+                    native_scores(&p, kept_matrix(&feats_slot), &is_decoy, &base, &prelim)
                 }
             },
             RescorerKind::Percolator => {
@@ -397,9 +401,11 @@ pub fn run(p: RescoreParams) -> Result<u64> {
                     anyhow::bail!("rescore: classifier=percolator but percolator.exe is not wired, and rescore.strict=true");
                 }
                 warn!("rescore: percolator.exe path not wired; using native_tda");
-                native_scores(&p, &feats, &is_decoy, &base, &prelim)
+                native_scores(&p, kept_matrix(&feats_slot), &is_decoy, &base, &prelim)
             }
-            RescorerKind::NativeTda => native_scores(&p, &feats, &is_decoy, &base, &prelim),
+            RescorerKind::NativeTda => {
+                native_scores(&p, kept_matrix(&feats_slot), &is_decoy, &base, &prelim)
+            }
             RescorerKind::Entrapment => {
                 let n_ent = is_entrapment.iter().filter(|&&b| b).count();
                 if p.cfg.entrapment_marker.is_none() || n_ent == 0 {
@@ -417,7 +423,7 @@ pub fn run(p: RescoreParams) -> Result<u64> {
                          (set rescore.entrapment_marker to the spike-in accession \
                          substring); falling back to native_tda"
                     );
-                    native_scores(&p, &feats, &is_decoy, &base, &prelim)
+                    native_scores(&p, kept_matrix(&feats_slot), &is_decoy, &base, &prelim)
                 } else if p.cfg.python.is_some() {
                     match run_entrapment_gbm(
                         &p,
@@ -426,7 +432,7 @@ pub fn run(p: RescoreParams) -> Result<u64> {
                         &base,
                         &is_entrapment,
                         &is_decoy,
-                        &feats,
+                        kept_matrix(&feats_slot),
                     ) {
                         Ok(s) => {
                             info!(
@@ -456,7 +462,7 @@ pub fn run(p: RescoreParams) -> Result<u64> {
                             // counted as a target inside the loop's own q estimate.
                             model_identity = "native-percolator-lite-entrapment-v1".to_string();
                             qmode = QMode::Entrapment;
-                            native_scores(&p, &feats, &is_decoy, &base, &prelim)
+                            native_scores(&p, kept_matrix(&feats_slot), &is_decoy, &base, &prelim)
                         }
                     }
                 } else {
@@ -467,7 +473,7 @@ pub fn run(p: RescoreParams) -> Result<u64> {
                     classifier_used = "entrapment_native";
                     model_identity = "native-percolator-lite-entrapment-v1".to_string();
                     qmode = QMode::Entrapment;
-                    native_scores(&p, &feats, &is_decoy, &base, &prelim)
+                    native_scores(&p, kept_matrix(&feats_slot), &is_decoy, &base, &prelim)
                 }
             }
         }
@@ -1154,6 +1160,14 @@ impl Drop for ChildGuard {
 ///
 /// Batched because `feats` is already resident (one flat row-major matrix, 8 bytes per
 /// value); materialising 387 full columns as well would add ~12.8 GB for nothing.
+/// The feature matrix, which is released only under `rescore.strict` and only after a
+/// PIN sidecar has its own copy; strict has no native fallback, so no reader is left.
+fn kept_matrix(slot: &Option<FeatureMatrix>) -> &FeatureMatrix {
+    slot.as_ref().expect(
+        "the feature matrix is released only under rescore.strict, after the sidecar handoff",
+    )
+}
+
 fn write_features_parquet(
     path: &str,
     feat_names: &[String],
@@ -1185,9 +1199,14 @@ fn write_features_parquet(
     let n = label.len();
     let nf = feat_names.len();
     // ~250k rows x 387 f32 is about 390 MB per batch, which keeps the encoder's working set
-    // modest while still giving parquet large row groups.
+    // modest. Row groups are capped well below that: the worker reads this file back with
+    // `ParquetFile.iter_batches`, which decodes a whole row group before it slices batches
+    // out of it, so at parquet's default 1,048,576-row groups the load transient was 1.6 GB
+    // of Arrow buffers per group on top of the matrix. 131,072 rows x 387 f32 is 200 MB.
     const BATCH: usize = 250_000;
-    let mut w = mumdia_io::table::BatchWriter::new(path, schema.clone())?;
+    const ROW_GROUP_ROWS: usize = 131_072;
+    let mut w =
+        mumdia_io::table::BatchWriter::with_row_group_rows(path, schema.clone(), ROW_GROUP_ROWS)?;
     let mut start = 0usize;
     while start < n {
         let end = (start + BATCH).min(n);
@@ -1243,12 +1262,15 @@ fn run_pin_sidecar(
     pform: &[String],
     protein: &[String],
     mz: &[f64],
-    feats: &FeatureMatrix,
+    feats: &mut Option<FeatureMatrix>,
     base: &[u32],
 ) -> Result<Vec<f64>> {
     use std::io::Write as _;
     let python = p.cfg.python.as_deref().ok_or_else(|| {
         anyhow::anyhow!("classifier sidecar {script_name} requires rescore.python")
+    })?;
+    let matrix = feats.as_ref().ok_or_else(|| {
+        anyhow::anyhow!("rescore: the feature matrix was released before the {script_name} handoff")
     })?;
     std::fs::create_dir_all(p.work_dir).ok();
     // Per-invocation sidecar filenames. Fixed names (`rescore.pin`,
@@ -1288,7 +1310,7 @@ fn run_pin_sidecar(
     // un-reserved String: at ~1M rows x 387 features that is a >5 GB allocation (plus
     // realloc churn) held entirely in RAM before the first byte reaches disk.
     if use_pq {
-        let rows = write_features_parquet(&pin, feat_names, label, pform, protein, mz, feats)?;
+        let rows = write_features_parquet(&pin, feat_names, label, pform, protein, mz, matrix)?;
         tracing::info!(
             path = %pin,
             rows,
@@ -1310,7 +1332,7 @@ fn run_pin_sidecar(
             let lab = if label[i] == "decoy" { -1 } else { 1 };
             write!(w, "psm_{}\t{}\t{}\t{:.5}\t{:.5}\t", i, lab, i, mz[i], mz[i])?;
             // one flat matrix row, already in `feat_names` order
-            let row = feats.row(i);
+            let row = matrix.row(i);
             for v in row.iter().take(feat_names.len()) {
                 write!(w, "{:.6}\t", v)?;
             }
@@ -1336,6 +1358,20 @@ fn run_pin_sidecar(
     // A worker that does not read it simply keeps its previous behaviour.
     let foldkeys = format!("{}/rescore_{tag}.foldkeys.parquet", p.work_dir);
     write_table(&foldkeys, vec![Col::U32("fold_key".into(), base.to_vec())])?;
+
+    // Everything the worker reads is on disk now. Under `strict` a sidecar failure is an
+    // error rather than a fall back to native_tda, so nothing downstream reads the engine's
+    // copy of the matrix again: release it before the child starts instead of holding it
+    // idle beside the worker's own for the whole training run. Measured on the six-run
+    // Astral pool (3.13M x 387): the engine sat at 5.3 GB of a 17.9 GB process-tree peak.
+    if p.cfg.strict {
+        let bytes = matrix.bytes();
+        *feats = None;
+        tracing::info!(
+            released = %human_bytes(bytes as f64),
+            "rescore: released the engine's feature matrix for the sidecar run"
+        );
+    }
 
     let script = crate::sidecar::resolve_script(p.script_dir, script_name);
     // Spawn (not `status()`) so the child handle is owned by a guard that kills it if we

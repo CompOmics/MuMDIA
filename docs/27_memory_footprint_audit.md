@@ -131,6 +131,46 @@ This table used the compact feature preset; under the shipped defaults (every fe
 same training recipe) the rescore stage measured 6:20 at 13.5 GB instead of 3:31 at 5.57 GB,
 so a default run is about 20:40 at the same 16.5 GiB peak (docs/28 section 21).
 
+### 0.1 Rescore process tree, measured 2026-09-16
+
+Six-run Astral pool (3,133,636 competed rows x 387 features), `mumdia rescore --competed`
+with `nn_torch`, 32 threads, sampled once a second across the process tree on the poweredge
+fleet (EPYC 9354, 755 GB). Before this change the tree peaked at 17.9 GB: the engine held
+its 4.52 GiB `FeatureMatrix` (5.3 GB RSS with the metadata columns) idle for the whole
+training run, and the Python worker sat at 12.5 GB over a 4.85 GB matrix. The worker's
+excess was set during the load: pyarrow's `ParquetFile.iter_batches` reads ahead and decodes
+row groups in parallel, and its buffered batches grew into a second copy of the matrix
+(RSS climbed to 11.2 GB while `Xs` filled, then fell to 6.3 GB the moment the loop ended);
+the per-chunk `astype(np.float64) ** 2` for the column moments added two 0.77 GB
+temporaries per 250k-row chunk; and the `to_pylist()` round trips over SpecId and Peptide
+left ~0.7 GB of Python strings in the allocator's high-water mark.
+
+Three changes, all in `rescore.rs`, `table.rs` and `nn_rescore_worker.py`:
+
+- under `rescore.strict` with a sidecar classifier the engine drops its matrix once the
+  handoff parquet and fold-key table are written (strict has no native fallback left to read
+  it; `kept_matrix` guards the native paths);
+- the handoff parquet is written in 131,072-row groups (`BatchWriter::with_row_group_rows`),
+  200 MB decoded at 387 features instead of parquet's default 1,048,576 rows (1.6 GB);
+- the worker reads one row group at a time, slices it into `MUMDIA_NN_CHUNK` blocks,
+  accumulates the moments in 32k-row float64 sub-blocks, parses the SpecId suffix in Arrow,
+  standardises in place, and returns the load's transients to the OS
+  (`pa.default_memory_pool().release_unused()`, `malloc_trim` on glibc) before training.
+
+| pool | before | after | peptides |
+|------|--------|-------|----------|
+| Astral, six runs pooled | 17.9 GB, 19.4 min | 9.3 GB, 19.4 min | 116,405 both (seed 0) |
+| HYE B01, one run | 12.0 GB, 5.0 min | 5.05 GB, 5.2 min | 63,270 both |
+
+What remains is the matrix itself plus one fold's gathered training rows (1.1 GB on the
+Astral pool), and the engine at ~1 GB while it waits. The whole six-file Astral experiment
+(`mumdia run` with six `--mzml`) measured 52.5 min at a 13.25 GB process-tree peak on the
+same class of host. That peak is the multi-head DeepLC calibration of the first run (13.0-13.2 GB
+for its whole 11.7 min), not extract and not the rescore; after it the per-run chain runs at
+1-10 GB and the pooled rescore at 9.3. `rescore.feature_preset = compact`
+still shrinks the matrix 3.4x on top of this, at its measured -3.4% peptides on the Astral
+pool; the two compose.
+
 ## 1. Static memory model per stage
 
 All sizes are resident-set estimates derived from the code. Symbols: `P` = MS2
