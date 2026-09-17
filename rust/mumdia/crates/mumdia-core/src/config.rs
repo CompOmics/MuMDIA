@@ -373,6 +373,15 @@ pub struct PrescanConfig {
     /// Residue:UniModName entries the screen anchors ON. Only trimers covering one of these
     /// positions count as evidence, so backbone signal cannot keep a modified hypothesis alive.
     pub anchor_mods: Vec<String>,
+    /// Screen EVERY candidate on every trimer of its sequence, modified or not, instead of only
+    /// the modification-bearing candidates on their anchored trimers. This turns the prescan
+    /// from a modform pruner into a per-run library pruner for a search space that is large
+    /// on its own, such as a predicted immunopeptidomics library of 10^8 precursors, where a
+    /// run supports only a small fraction of the enumeration. The screen stays label-blind
+    /// (both orientations of every trimer; a reverse decoy's tag set is its target's), so it
+    /// remains a compute reduction and never a discriminator. `anchor_mods` may be empty when
+    /// this is set. Default off: the anchored screen is the measured one.
+    pub anchor_all: bool,
 }
 impl Default for PrescanConfig {
     fn default() -> Self {
@@ -383,6 +392,7 @@ impl Default for PrescanConfig {
             top_peaks: 150,
             mods: vec!["C:Carbamidomethyl".to_string(), "M:Oxidation".to_string()],
             anchor_mods: Vec::new(),
+            anchor_all: false,
         }
     }
 }

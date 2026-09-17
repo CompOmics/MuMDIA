@@ -54,6 +54,9 @@ pub struct PrescanParams<'a> {
 /// Masses come from the shared model, never a local copy: `residue_mass` for the backbone and
 /// `unimod_mass` for the modification delta. A modified residue's tag mass is residue + delta.
 struct Alphabet {
+    /// Every position anchors (`prescan.anchor_all`): the screen prunes any candidate, not only
+    /// modification-bearing ones.
+    anchor_all: bool,
     masses: Vec<f64>,
     /// (residue, mod name) -> alphabet index, for the modified entries.
     modded: HashMap<(u8, String), usize>,
@@ -106,6 +109,7 @@ impl Alphabet {
             }
         }
         Ok(Alphabet {
+            anchor_all: cfg.anchor_all,
             masses,
             modded,
             plain,
@@ -146,7 +150,7 @@ impl Alphabet {
         let mut tris = HashSet::new();
         let l = idx.len();
         for p in 0..l {
-            if !self.anchor.contains(&idx[p]) {
+            if !self.anchor_all && !self.anchor.contains(&idx[p]) {
                 continue;
             }
             for a in p.saturating_sub(2)..=p {
@@ -235,11 +239,15 @@ pub fn run(p: PrescanParams) -> Result<u64> {
         ],
     )?;
     let alpha = Alphabet::build(p.cfg)?;
-    if alpha.anchor.is_empty() {
+    if alpha.anchor.is_empty() && !alpha.anchor_all {
         anyhow::bail!(
             "prescan.anchor_mods is empty, so no candidate can ever be anchored and every \
-             modified candidate would be discarded; list the modifications to screen for"
+             modified candidate would be discarded; list the modifications to screen for, \
+             or set prescan.anchor_all to screen every candidate on every trimer"
         );
+    }
+    if alpha.anchor_all {
+        info!("prescan: anchor_all is set; every candidate is screened on every trimer of its sequence");
     }
 
     // ---- observed tag index, parallel over spectra ----
@@ -521,6 +529,27 @@ mod tests {
         let a = Alphabet::build(&cfg()).unwrap();
         assert!(a.tokenise("PEC[Phospho]K").is_none());
         assert!(a.tokenise("PEC[Carbamidomethyl]K").is_some());
+    }
+
+    #[test]
+    fn anchor_all_screens_unmodified_candidates_on_every_trimer() {
+        let mut c = cfg();
+        c.anchor_mods.clear();
+        c.anchor_all = true;
+        let a = Alphabet::build(&c).unwrap();
+        let idx = a.tokenise("AAGKAA").unwrap();
+        let tris = a.anchored_tris(&idx);
+        // Six residues give four trimers, each in both orientations (AAG/GAA are one pair, AGK/KGA,
+        // GKA/AKG, KAA/AAK): 8 entries, 7 distinct because AAG reversed is GAA which also occurs.
+        assert!(!tris.is_empty());
+        for &(x, y, z) in &tris {
+            assert!(tris.contains(&(z, y, x)));
+        }
+        // Without the switch the same sequence has nothing to anchor on.
+        let plain = Alphabet::build(&cfg()).unwrap();
+        assert!(plain
+            .anchored_tris(&plain.tokenise("AAGKAA").unwrap())
+            .is_empty());
     }
 
     #[test]
