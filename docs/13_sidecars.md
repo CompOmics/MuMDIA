@@ -636,7 +636,11 @@ cores); `MUMDIA_MOKAPOT_WORKERS` (3, thread-based CV-fold parallelism).
 `MUMDIA_NN_DROPOUT` (0.3), `MUMDIA_NN_LR` (1e-3), `MUMDIA_NN_WD` (1e-4),
 `MUMDIA_NN_BATCH` (4096), `MUMDIA_NN_SEEDS` (1), `MUMDIA_NN_SEED` (0, base seed; ensemble member s uses SEED + s, so seeded repeats of one configuration set it to 1, 2, ...), `MUMDIA_NN_STREAM` (auto),
 `MUMDIA_NN_STREAM_GB` (4), `MUMDIA_NN_CHUNK` (250000), `MUMDIA_NN_INIT_SAMPLE`
-(300000) plus the three the Rust caller injects: `MUMDIA_NN_FOLDS` (worker default
+(300000; when no feature reaches the training FDR on that sample the init scan is
+repeated on 4x the rows up to the whole fold), `MUMDIA_NN_INIT_FDR_MAX` (0.05; ceiling
+of the first-iteration bootstrap ladder 0.02/0.05/0.1 used only when the init feature
+selects no positive at the training FDR over the whole fold, 0 = hard error as before)
+plus the three the Rust caller injects: `MUMDIA_NN_FOLDS` (worker default
 3), `MUMDIA_NN_ITERS` (worker default 5, but `run_pin_sidecar` overrides it with
 `rescore.num_iter` = 10), `MUMDIA_NN_TRAIN_FDR` (0.01). These worker defaults
 apply only when the sidecar is run standalone. `entrapment_worker.py`:
