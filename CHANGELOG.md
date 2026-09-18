@@ -41,6 +41,20 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`extract --restrict-candidates` now runs on the streaming path.** A candidate allowlist
+  routed extract to the serial path, whose whole-run hit accumulator ignores
+  `extract.windows_in_flight`, so a prescan-restricted extract had the memory profile of
+  the pre-streaming engine: measured on an immunopeptidomics library, 35M allowed
+  candidates took 2:08 h at a 325 GB peak, and 83M candidates aborted with
+  `memory allocation of 12288 bytes failed` at 471 GB on a host with a 1 TB commit limit.
+  The allowlist is now applied inside the streaming probe at the point the serial path
+  applies it, before the peak claim, so a listed candidate collects the same hits and an
+  unlisted one neither collects hits nor competes for a shared peak; the serial path is
+  unchanged and still serves the two-pass peak-claim strategies.
+
+
 ### Performance
 
 - **`scripts/import_diann_lib.py` streams the DIA-NN library** instead of reading the
