@@ -140,7 +140,12 @@ def _keys(df):
 
 
 def _mz_bins(mz):
-    return np.clip((np.asarray(mz, dtype=np.float64) * 100.0).round().astype(np.int64), 0, _MZ_BIN_MAX - 1)
+    """0.01 Da bin of each fragment m/z, computed in float32 as the DIA-NN column is stored:
+    the previous implementation multiplied the float32 pandas column by 100.0 and rounded in
+    float32, and a bin that rounds differently in float64 would change `cardinality` for the
+    same library, which is a feature downstream."""
+    b = np.round(np.asarray(mz, dtype=np.float32) * np.float32(100.0)).astype(np.int64)
+    return np.clip(b, 0, _MZ_BIN_MAX - 1)
 
 
 def main():
@@ -168,6 +173,10 @@ def main():
     card = np.zeros(_MZ_BIN_MAX, dtype=np.int64)
     dropped_prec = dropped_frag = 0
     n_frag_total = 0
+    # The last precursor of a row group can continue into the next one; its (bin) set is
+    # carried over so a bin seen on both sides of the boundary is counted once, exactly as a
+    # whole-table `nunique` would count it.
+    carry_key, carry_bins = None, set()
     for rg in range(pf.num_row_groups):
         df = pf.read_row_group(rg, columns=read_cols).to_pandas()
         df, (dp, dfr) = _filter_rows(df, charge_by_basic)
@@ -198,7 +207,16 @@ def main():
         # bin) pair: deduplicated inside the batch, which is exact except for a precursor
         # split across two row groups with a fragment in the same bin on both sides.
         pairs = pd.DataFrame({"k": key.to_numpy(), "b": _mz_bins(df["Product.Mz"])}).drop_duplicates()
+        if carry_key is not None:
+            seen_before = (pairs["k"] == carry_key) & pairs["b"].isin(carry_bins)
+            pairs = pairs[~seen_before]
         np.add.at(card, pairs["b"].to_numpy(), 1)
+        last = key.iloc[-1]
+        last_bins = set(pairs.loc[pairs["k"] == last, "b"].tolist())
+        if last == carry_key:
+            carry_bins |= last_bins
+        else:
+            carry_key, carry_bins = last, last_bins
     if charge_by_basic:
         print(
             f"charge-by-basic-residues: dropped {dropped_prec} precursor(s) and "

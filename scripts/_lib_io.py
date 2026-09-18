@@ -43,6 +43,20 @@ def narrow_type(ty: pa.DataType) -> pa.DataType:
     return ty
 
 
+def _rebased(col: pa.ChunkedArray) -> pa.ChunkedArray:
+    """`col` with every chunk copied so its offsets start at zero.
+
+    A chunk that is a slice of a larger array keeps the parent's offset buffer, and the
+    `large_string -> string` cast rejects the slice when the parent's offsets past the
+    slice's end exceed 2 GiB ("input array too large"), however small the slice itself is.
+    That is how `to_engine_table` failed on the 8-12-mer library: the decoy builder's m/z
+    sort left one 2.86 GB `large_string` array, and every 4M-row slice past the 2 GiB mark
+    of it was refused. `concat_arrays` of a single chunk materialises it with its own
+    offsets, after which the cast sees only the slice's bytes.
+    """
+    return pa.chunked_array([pa.concat_arrays([c]) for c in col.chunks], type=col.type)
+
+
 def narrow_table(table: pa.Table) -> pa.Table:
     """An arrow Table cast to the 32-bit-offset encoding the engine accepts.
 
@@ -54,12 +68,44 @@ def narrow_table(table: pa.Table) -> pa.Table:
     schema = pa.schema(
         [pa.field(f.name, narrow_type(f.type), f.nullable) for f in table.schema]
     )
-    return table.cast(schema) if schema != table.schema else table
+    if schema == table.schema:
+        return table
+    cols = []
+    for i, field in enumerate(table.schema):
+        col = table.column(i)
+        narrowing = field.type != schema.field(i).type
+        if narrowing and (pa.types.is_large_string(field.type) or pa.types.is_large_binary(field.type)):
+            col = _rebased(col)
+        cols.append(col)
+    return pa.Table.from_arrays(cols, schema=table.schema).cast(schema)
+
+
+# Rows converted per slice when a DataFrame becomes an arrow Table. A `string` array holds
+# at most 2 GiB of character data (32-bit offsets), and `Table.from_pandas` converts a column
+# as ONE array, so past that size pandas 3 / pyarrow 25 produce a `large_string` array that
+# `narrow_table` cannot cast back ("Failed casting from large_string to string: input array
+# too large"). Measured on the 285M-row 8-12-mer immunopeptidomics precursor table: the
+# `peptidoform` column alone is 4.5 GB, and the reverse-decoy builder failed at the final
+# write after 70 minutes. Converting in slices keeps every array under the limit; the
+# resulting table is chunked, which parquet writes as row groups and the engine reads
+# row group by row group.
+SLICE_ROWS = 4_000_000
 
 
 def to_engine_table(df) -> pa.Table:
-    """A pandas DataFrame as an arrow Table the engine will accept."""
-    return narrow_table(pa.Table.from_pandas(df, preserve_index=False))
+    """A pandas DataFrame as an arrow Table the engine will accept, of any row count."""
+    n = len(df)
+    if n <= SLICE_ROWS:
+        return narrow_table(pa.Table.from_pandas(df, preserve_index=False))
+    parts = []
+    for start in range(0, n, SLICE_ROWS):
+        part = narrow_table(pa.Table.from_pandas(df.iloc[start:start + SLICE_ROWS], preserve_index=False))
+        # A slice whose object column happens to be all-null converts to type `null`; cast
+        # it to the first slice's schema so the concatenation is one type per column.
+        if parts and part.schema != parts[0].schema:
+            part = part.cast(parts[0].schema)
+        parts.append(part)
+    return pa.concat_tables(parts)
 
 
 def write_engine_parquet(df, path) -> None:
