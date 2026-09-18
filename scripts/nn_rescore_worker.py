@@ -60,7 +60,21 @@ Env knobs (all optional):
                                      page file absorbs a matrix that merely overflows.
                                      Set it explicitly on a machine with no page file.
     MUMDIA_NN_CHUNK       = 250000   PIN rows per read chunk (streaming backend)
-    MUMDIA_NN_INIT_SAMPLE = 300000   rows used to pick the init feature (streaming)
+    MUMDIA_NN_INIT_SAMPLE = 300000   rows used to pick the init feature. When no feature
+                                     reaches the training FDR on that sample the scan is
+                                     repeated on 4x the rows, up to the whole fold: on an
+                                     8.07M-row immunopeptidomics pool 300k rows (3.7%)
+                                     held too few true PSMs for any of 347 features to
+                                     pass 1%, the scan returned an arbitrary feature with
+                                     0 and the fold aborted, while the same features gave
+                                     150-217 at 1% on a 2M pool of the same run.
+    MUMDIA_NN_INIT_FDR_MAX = 0.05    first-iteration bootstrap only: when the init feature
+                                     selects no positive at the training FDR over the
+                                     whole fold, the threshold is loosened in steps
+                                     (0.02, 0.05, 0.1) up to this ceiling for that one
+                                     selection; every later iteration re-selects at the
+                                     training FDR on the model's own scores. 0 disables
+                                     the ladder and restores the hard error.
     MUMDIA_NN_INIT_TOPK   = 0        > 0 sorts only a top-k window per feature in the init
                                      scan instead of the whole sample (7.2x on that phase).
                                      NOT exact: tie ordering at the window edge shifted 30 of
@@ -621,6 +635,7 @@ def main():
     WD = env_f("MUMDIA_NN_WD", 1e-4)
     BATCH = env_i("MUMDIA_NN_BATCH", 4096)
     TRAIN_FDR = env_f("MUMDIA_NN_TRAIN_FDR", 0.01)
+    INIT_FDR_MAX = env_f("MUMDIA_NN_INIT_FDR_MAX", 0.05)
     N_SEEDS = env_i("MUMDIA_NN_SEEDS", 1)
     BASE_SEED = env_i("MUMDIA_NN_SEED", 0)
     CHUNK = env_i("MUMDIA_NN_CHUNK", 250000)
@@ -1085,23 +1100,34 @@ def main():
             # the nominal OOF scores optimistic. For very large folds, sample
             # evenly across the deterministic training order rather than taking
             # only the file head.
-            sample_n = min(len(tr_idx), init_sample_limit)
-            if sample_n == len(tr_idx):
-                init_idx = tr_idx
-            else:
-                positions = np.linspace(0, len(tr_idx) - 1, sample_n, dtype=np.int64)
-                init_idx = tr_idx[positions]
-            Xsamp, ysamp = get(init_idx), y[init_idx]
-            # One column at a time, both signs from the SAME column read. This is the
-            # same 2*nf q-value evaluations as before (argsort dominates and is kept
-            # per sign so tie-ordering is unchanged), but it stops re-slicing the
-            # sample matrix twice per feature.
             _t = time.time()
-            # Vectorised over feature blocks; see n_targets_at_many. Same counts, same
-            # tie-breaking, ~387x fewer Python-level argsort calls.
-            best_j, best_sign, best_n = n_targets_at_many(
-                Xsamp, ysamp, TRAIN_FDR, topk=env_i("MUMDIA_NN_INIT_TOPK", 0)
-            )
+            sample_n = min(len(tr_idx), init_sample_limit)
+            while True:
+                if sample_n >= len(tr_idx):
+                    sample_n, init_idx = len(tr_idx), tr_idx
+                else:
+                    positions = np.linspace(0, len(tr_idx) - 1, sample_n, dtype=np.int64)
+                    init_idx = tr_idx[positions]
+                Xsamp, ysamp = get(init_idx), y[init_idx]
+                # One column at a time, both signs from the SAME column read, vectorised
+                # over feature blocks (see n_targets_at_many): same counts and tie-breaking
+                # as the per-feature scan, ~387x fewer Python-level argsort calls.
+                best_j, best_sign, best_n = n_targets_at_many(
+                    Xsamp, ysamp, TRAIN_FDR, topk=env_i("MUMDIA_NN_INIT_TOPK", 0)
+                )
+                if best_n > 0 or sample_n >= len(tr_idx):
+                    break
+                # Nothing passes on this sample. That is a property of the sample size
+                # relative to the pool's true fraction, not of the features: a pool that
+                # is overwhelmingly false (35M candidates screened, 8M PSMs accepted, a
+                # few thousand true) puts too few true rows into a fixed 300k sample for
+                # any column to accumulate 100 targets before its first decoy. Rescan on
+                # 4x the rows rather than rank the fold by an arbitrary column.
+                next_n = min(len(tr_idx), sample_n * 4)
+                print(f"  seed {seed} fold {f}: no feature reaches {TRAIN_FDR:.0%} on a "
+                      f"{sample_n}-row init sample; rescanning on {next_n} rows", flush=True)
+                del Xsamp, ysamp
+                sample_n = next_n
             score_tr = (best_sign * get_col(tr_idx, best_j)).astype(np.float32)
             _t = _tick("2_init_feature_scan", _t)
             print(f"  seed {seed} fold {f}: init={feat_cols[best_j]} "
@@ -1114,6 +1140,22 @@ def main():
             for _ in range(ITERS):
                 q = tda_q(score_tr, ytr)
                 pos = (q <= TRAIN_FDR) & (ytr == 1)
+                if model is None and not np.any(pos) and INIT_FDR_MAX > 0:
+                    # Bootstrap only. The init feature ranks the whole fold here, and on a
+                    # pool that is overwhelmingly false no single column may reach the
+                    # training FDR although the model trained on a looser first selection
+                    # will. Loosen this one selection in steps up to INIT_FDR_MAX; the next
+                    # iteration re-selects at TRAIN_FDR on the model's scores as always.
+                    for fdr in (0.02, 0.05, 0.1):
+                        if fdr > INIT_FDR_MAX + 1e-12:
+                            break
+                        pos = (q <= fdr) & (ytr == 1)
+                        if np.any(pos):
+                            print(f"  seed {seed} fold {f}: init feature has no target at "
+                                  f"{TRAIN_FDR:.0%}; bootstrap positives selected at {fdr:.0%} "
+                                  f"({int(pos.sum())} rows), later iterations use {TRAIN_FDR:.0%}",
+                                  flush=True)
+                            break
                 neg = ytr == 0
                 if not np.any(pos):
                     raise RuntimeError(

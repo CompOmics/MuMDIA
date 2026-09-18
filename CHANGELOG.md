@@ -43,6 +43,19 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ### Fixed
 
+- **`nn_torch` rescoring no longer aborts on a pool that is overwhelmingly false.** The
+  worker picks its initial ranking feature on a 300k-row sample of the training fold and
+  then requires at least one target at the training FDR. On an 8.07M-PSM immunopeptidomics
+  pool (34.9M candidates screened, a few thousand true) a 300k sample was 3.7% of the rows
+  and held too few true PSMs for any of 347 features to reach 1%, so the scan returned an
+  arbitrary feature with 0 targets and every fold aborted with `selected no positive
+  targets at training FDR 0.01`, while the same features gave 150-217 targets at 1% on a
+  2M-PSM pool of the same run. Two changes: when no feature passes on the sample the scan
+  is repeated on 4x the rows up to the whole fold, and when the chosen feature still
+  selects no positive over the whole fold the first (and only the first) selection is
+  loosened in steps to `MUMDIA_NN_INIT_FDR_MAX` (default 0.05; 0 restores the hard error).
+  Later iterations re-select at the training FDR on the model's own scores as before, so a
+  pool where the init already works is unchanged.
 - **`scripts/_lib_io.py` writes precursor tables of any size.** `Table.from_pandas` converts
   a column as one arrow array, and a `string` array holds at most 2 GiB of characters, so on
   a 285M-row precursor table (the 8-12-mer immunopeptidomics library with reverse decoys;
