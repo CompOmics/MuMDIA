@@ -821,8 +821,8 @@ Every field whose struct has an `impl Default` resolved from the source.
 
 2 environment read(s) whose name is not a literal:
 
-- `rust/mumdia/crates/mumdia/src/stages/extract.rs:2693: env read via closure of `&mut flushed``
-- `rust/mumdia/crates/mumdia/src/stages/extract.rs:2711: env read via closure of `&mut cand_hits``
+- `rust/mumdia/crates/mumdia/src/stages/extract.rs:2705: env read via closure of `&mut flushed``
+- `rust/mumdia/crates/mumdia/src/stages/extract.rs:2723: env read via closure of `&mut cand_hits``
 
 ## Coverage
 
