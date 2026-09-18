@@ -41,6 +41,18 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ## [Unreleased]
 
+### Added
+
+- **Helpers for very large predicted libraries** and `docs/32_large_libraries.md`, from the
+  immunopeptidomics case study (59M and 203M precursors on one Astral run):
+  `scripts/mz_range_survivors.py` (candidates inside the run's isolation range),
+  `scripts/assemble_survivors.py` (survivors -> renumbered library, target/decoy pair kept
+  together on `peptidoform_id`), `scripts/shard_parquet.py` (row-group-aligned split and
+  concatenate) and `scripts/mh_shard_predict.py` (deduplicated, sharded multi-head DeepLC
+  calibration: 125.9M unique sequences in 42 minutes over 12 CPU shards instead of 6 hours in
+  one process). Measured yields and costs are in the document.
+
+
 ### Fixed
 
 - **`nn_torch` rescoring no longer aborts on a pool that is overwhelmingly false.** The
