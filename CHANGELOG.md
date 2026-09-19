@@ -50,7 +50,9 @@ than a number. Both are recorded in every run's `manifest.json`.
   together on `peptidoform_id`), `scripts/shard_parquet.py` (row-group-aligned split and
   concatenate) and `scripts/mh_shard_predict.py` (deduplicated, sharded multi-head DeepLC
   calibration: 125.9M unique sequences in 42 minutes over 12 CPU shards instead of 6 hours in
-  one process). Measured yields and costs are in the document.
+  one process). Measured yields and costs are in the document, including the seven-file
+  orchestrated first pass and the second pass from the union of first-pass identifications
+  (17,829 peptides pooled at 1%, 94-100% of DIA-NN's empirical-library second pass per file).
 
 
 ### Fixed

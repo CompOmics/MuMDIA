@@ -34,7 +34,21 @@ with several `--mzml`, which pays the calibration once.
    peptides (seed retention 67% at 25 peaks, 96% at 60, 100% from 300). On the 8-12-mers the
    60-peak screen kept 41% of candidates and cost 19% of the peptides for 40% less wall.
 8. **Extract on the streaming path** with `extract.windows_in_flight` 2-8, then features,
-   compete and `nn_torch` rescore.
+   compete and `nn_torch` rescore. Use `mumdia run` rather than stage-by-stage chains: it
+   passes the MS1 scans and the seed's mass calibration to extract (see below).
+9. **Second pass** from the union of first-pass identifications across the runs
+   (`assemble_survivors.py` on the identified candidate ids), per-run multi-head
+   calibration, pooled rescore.
+
+## Two omissions in the hand-built chains
+
+The arm table below was produced by stage-by-stage shell chains that called `extract` with
+`--ms2` only. `mumdia run` also passes `--ms1` (the converted MS1 scans; 6,404 here) and
+`--mass-cal <seed>.masscal.json` (the seed had learned an 11.6 ppm fragment tolerance; the
+chains ran at the 20 ppm default). Rerun through the orchestrator, the same 9-mer search went
+from 4,371 to 5,656 peptides and from 3 h 40 min to 1 h 09 min (a third fewer noise
+candidates into rescore, and the streaming extract), and the 8-12-mer search from 7,961 to
+10,213 peptides. Treat the arm numbers as lower bounds and use the orchestrated numbers.
 
 ## What it yields
 
@@ -49,6 +63,40 @@ with several `--mzml`, which pays the calibration once.
 PSM-level decoy fraction 0.91-0.98% in every arm. The 7,961 split 830 / 4,280 / 1,716 / 923 /
 212 over lengths 8-12 and recover 861 of the 910 confident seed peptides; 4,042 of the 9-mers
 are shared with the 9-mer-only search, which loses 329 to the larger space and gains 238.
+
+## Orchestrated runs, seven files
+
+First pass: one `mumdia run` per file against the full calibrated 8-12-mer library (203M
+candidates), MS1 and mass calibration on, `windows_in_flight` 2-4, 96-128 threads, one host
+per file. Second pass: the union of the first-pass target precursors at run-level
+`q_value <= 0.01` (21,342) with their paired decoys, assembled by `assemble_survivors.py`
+into a 42,684-precursor library; one `mumdia run` per file on it with per-run multi-head
+calibration (`rt_im_train.multihead_calibration = 80`, about 80 s per file, RT windows
+62-73 s), then one pooled `rescore` over the seven competed tables. This is the analogue of
+DIA-NN's empirical-library workflow, whose second pass on these files searched a
+23,186-precursor library.
+
+| file | first pass, peptides | first pass, wall | pass 2, peptides | pass 2, precursors | DIA-NN pass 2, precursors |
+|---|---|---|---|---|---|
+| AT10234AUH | 10,213 | 6:36 h | 15,182 | 15,983 | 16,427 |
+| AT10237AUH | 10,745 | 9:25 h (shared host) | 15,396 | 16,293 | 17,131 |
+| AT10240AUH | 9,739 | 3:49 h | 14,664 | 15,379 | 16,290 |
+| AT10253AUH | 9,781 | 3:55 h | 14,880 | 15,680 | 16,420 |
+| AT10256AUH | 15,372 | 8:04 h | 16,888 | 18,422 | 18,420 |
+| AT10265RJB | 12,984 | 12:08 h (shared host) | 16,423 | 17,738 | 18,039 |
+| AT10273AUH | 10,342 | 4:10 h | 14,741 | 15,528 | 13,379 (DIA-NN's AT10673AUH) |
+
+Pooled over the seven runs, pass 2 reports 17,829 peptides, 19,745 precursors and 7,208
+protein groups at 1% (116,854 PSMs). DIA-NN's library carries 559 cysteinylated precursors
+per file (`--var-mod UniMod:312`) that the imported library lacks. The second-pass FDR of
+both tools is decoy-based on a library that is almost entirely real; neither has an
+entrapment check here.
+
+Stage trace of DIA-NN's 16,427 AT10234AUH precursors through the orchestrated first pass:
+59.7% identified as the same precursor, 2.4% at another charge, 23.7% extracted but rescored
+above q 0.01 (1,379 of them at q <= 0.05), 11.5% not extracted with the RT inside our window,
+2.5% outside it, 0.1% not in the search space. The missing tail is low abundance: median
+DIA-NN intensity 0.28M against 1.5M for what is identified.
 
 ## What it costs (8-12-mers, uncapped, 128 threads)
 
