@@ -52,7 +52,10 @@ than a number. Both are recorded in every run's `manifest.json`.
   calibration: 125.9M unique sequences in 42 minutes over 12 CPU shards instead of 6 hours in
   one process). Measured yields and costs are in the document, including the seven-file
   orchestrated first pass and the second pass from the union of first-pass identifications
-  (17,829 peptides pooled at 1%, 94-100% of DIA-NN's empirical-library second pass per file).
+  (17,829 peptides pooled at 1%, 94-100% of DIA-NN's empirical-library second pass per file)
+  and a measurement of what the sequence-tag screen can and cannot prune on DIA
+  immunopeptidomics data, including the negative result for predicted-intensity-weighted
+  tags.
 
 
 ### Fixed

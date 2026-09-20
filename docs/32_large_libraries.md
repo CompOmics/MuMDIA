@@ -64,6 +64,46 @@ PSM-level decoy fraction 0.91-0.98% in every arm. The 7,961 split 830 / 4,280 / 
 212 over lengths 8-12 and recover 861 of the 910 confident seed peptides; 4,042 of the 9-mers
 are shared with the 9-mer-only search, which loses 329 to the larger space and gains 238.
 
+## Why the tag screen does not discriminate here, and why intensity does not fix it
+
+Measured 2026-09-20 on `AT10234AUH`: 3,000 of DIA-NN's identifications placed at their own
+retention time and isolation window against 3,000 random library targets at random retention
+times, scored with the same tag model the stage uses (residue-mass delta chains in the uncapped
+peaks, pooled per window and 25 s bin, both orientations).
+
+Occupancy is the reason. One 25 s cell already holds a median of 715 of the 6,859 possible
+trimers (10%) and 366 of the 130,321 4-mers (0.3%), and a candidate is screened against every
+cell its RT span covers, so a 620 s half-span pools about 50 cells and every trimer is present
+somewhere in it.
+
+| RT half-span | k | candidate tags | tags required | true retention | false survival |
+|---|---|---|---|---|---|
+| 620 s | 3 | all | 1 | 1.000 | 1.000 |
+| 620 s | 4 | all | 1 | 1.000 | 0.996 |
+| 316 s | 4 | all | 1 | 0.999 | 0.960 |
+| 100 s | 3 | all | 1 | 1.000 | 0.988 |
+| 100 s | 4 | all | 1 | 0.991 | 0.881 |
+| 100 s | 4 | all | 2 | 0.976 | 0.812 |
+| 100 s | 3 | ladder >= 5% of base peak | 1 | 0.902 | 0.858 |
+| 100 s | 3 | ladder >= 20% | 1 | 0.468 | 0.468 |
+| 100 s | 4 | ladder >= 5% | 2 | 0.401 | 0.264 |
+| 100 s | 4 | ladder >= 20% | 2 | 0.094 | 0.069 |
+
+Restricting a candidate's tags to those whose b/y ladder the library predicts intense does not
+help: every threshold removes true and false candidates at nearly the same rate, and the best
+true-to-false ratio anywhere in the grid is 1.5 at 40% retention. The mechanism is visible
+directly: for the identified peptides, the observed rate of a ladder's tag is 99-100% in every
+predicted-intensity bin *including ladders whose ions the library does not predict at all*. A
+tag hit in a chimeric DIA spectrum (median 588 peaks per MS2 here) is peak-density coincidence
+rather than evidence of that peptide's fragments, so weighting the candidate side by predicted
+intensity only removes lottery tickets, symmetrically.
+
+The one usable setting is 4-mers on a narrow RT window with no intensity rule, which prunes 12%
+of candidates at 99.1% retention, and the cost of getting a narrow window is the multi-head
+calibration that already pays for itself. The tag screen stays what `docs/21` built it for: a
+modform pruner for PTM searches, where the anchored trimers carry the modification mass and the
+hypotheses being separated differ by that mass rather than by sequence.
+
 ## Orchestrated runs, seven files
 
 First pass: one `mumdia run` per file against the full calibrated 8-12-mer library (203M
