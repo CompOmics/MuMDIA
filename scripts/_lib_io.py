@@ -120,3 +120,90 @@ def write_engine_parquet(df, path) -> None:
 def write_engine_table(table, path) -> None:
     """As `write_engine_parquet`, for a caller that already holds an arrow Table."""
     pq.write_table(narrow_table(table), str(path), compression="snappy")
+
+
+def sort_fragments_by_candidate(path, buckets: int = 64, tmp_dir=None) -> int:
+    """Rewrite the fragment table at `path` ordered by `candidate_id`, in place, streaming.
+
+    The engine reads one candidate-id range of a fragment table through its parquet
+    row-group statistics (`Library::load_range_with`), which needs the rows sorted by
+    `candidate_id` at row-group granularity. The writers cannot produce that order directly:
+    the importer streams fragments in the input's order, and a decoy builder appends decoy
+    fragments after the targets while the precursor order interleaves the two. So every
+    writer finishes with this pass. Two streaming passes: rows are partitioned into
+    `buckets` temporary files by candidate-id range, then each bucket is sorted in memory
+    (stable, so a candidate's fragments keep their stored order) and appended to the output.
+    Resident set is one bucket; the temporary files are one extra copy on disk.
+
+    Returns the row count. An already-sorted table is rewritten all the same; the cost is one
+    read and one write of the table.
+    """
+    import os
+    import shutil
+    import tempfile
+
+    import numpy as np
+    import pyarrow.compute as pc
+
+    pf = pq.ParquetFile(str(path))
+    n_rows = pf.metadata.num_rows
+    if n_rows == 0:
+        pf.close()
+        return 0
+    # Candidate-id range from the footer statistics when present, else from a scan.
+    hi = 0
+    have_stats = True
+    for i in range(pf.num_row_groups):
+        st = pf.metadata.row_group(i).column(pf.schema_arrow.get_field_index("candidate_id")).statistics
+        if st is None or st.max is None:
+            have_stats = False
+            break
+        hi = max(hi, int(st.max))
+    if not have_stats:
+        for i in range(pf.num_row_groups):
+            hi = max(hi, int(pc.max(pf.read_row_group(i, columns=["candidate_id"]).column(0)).as_py()))
+    buckets = max(1, min(int(buckets), hi + 1))
+    width = (hi + buckets) // buckets  # ids per bucket, so that bucket = id // width
+    work = tempfile.mkdtemp(prefix="sort_fragments_", dir=tmp_dir or os.path.dirname(os.path.abspath(str(path))) or None)
+    try:
+        writers = [None] * buckets
+        schema = None
+        for i in range(pf.num_row_groups):
+            t = pf.read_row_group(i)
+            if schema is None:
+                schema = t.schema
+            b = pc.divide(t.column("candidate_id").cast(pa.int64()), width).to_numpy()
+            for k in np.unique(b):
+                part = t.filter(pa.array(b == k))
+                if writers[k] is None:
+                    writers[k] = pq.ParquetWriter(os.path.join(work, f"bucket_{k:04d}.parquet"), schema, compression="snappy")
+                writers[k].write_table(part)
+        for w in writers:
+            if w is not None:
+                w.close()
+        # The input must be closed before it is replaced: Windows refuses to rename over an
+        # open file.
+        pf.close()
+        out = str(path) + ".sorted.tmp"
+        writer = pq.ParquetWriter(out, schema, compression="snappy")
+        written = 0
+        try:
+            for k in range(buckets):
+                bp = os.path.join(work, f"bucket_{k:04d}.parquet")
+                if not os.path.exists(bp):
+                    continue
+                t = pq.read_table(bp)
+                idx = pc.sort_indices(t, sort_keys=[("candidate_id", "ascending")])  # stable
+                t = t.take(idx)
+                writer.write_table(t)
+                written += t.num_rows
+                os.remove(bp)
+        finally:
+            writer.close()
+        if written != n_rows:
+            os.remove(out)
+            raise RuntimeError(f"sort_fragments_by_candidate: wrote {written} of {n_rows} rows")
+        os.replace(out, str(path))
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    return n_rows

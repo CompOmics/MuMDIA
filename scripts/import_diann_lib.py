@@ -34,7 +34,7 @@ import pyarrow.parquet as pq
 # The engine rejects `large_string` parquet columns ("column 'peptidoform' is not
 # utf8"), and `to_parquet` picks the width itself: pandas 3.x chooses the large
 # variant, so this helper silently emitted libraries the engine would not load.
-from _lib_io import narrow_table, write_engine_parquet
+from _lib_io import narrow_table, sort_fragments_by_candidate, write_engine_parquet
 
 
 # DIA-NN UniMod accession -> MuMDIA ProForma name. Carbamidomethyl/Oxidation are
@@ -306,6 +306,9 @@ def main():
             n_written += table.num_rows
     finally:
         writer.close()
+    # The engine reads one candidate-id range of this table by row-group statistics, which
+    # needs the rows in candidate order; the input order above is DIA-NN's.
+    sort_fragments_by_candidate(outf)
     if n_written != n_frag_total:
         raise RuntimeError(f"fragment rows: pass 1 counted {n_frag_total}, pass 2 wrote {n_written}")
 

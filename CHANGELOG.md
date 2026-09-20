@@ -41,6 +41,20 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ## [Unreleased]
 
+### Changed
+
+- **Library writers emit fragment tables sorted by `candidate_id`.** `import_diann_lib.py`,
+  `make_reverse_decoys.py` and `make_shift_decoys.py` finish with a streaming bucket sort
+  (`_lib_io.sort_fragments_by_candidate`: partition by candidate-id range into temporary
+  files, sort each bucket in memory, append), so the parquet row-group statistics of
+  `candidate_id` are monotonic and the engine's range load can read one candidate range of
+  the table without scanning it (`Library::load_range_with`, the isolation-window-group
+  search). Stable, so each candidate's fragments keep their stored order; the engine never
+  depended on the previous order. `scripts/sort_fragments.py` applies the same rewrite to a
+  table written before this change; the engine still loads an unsorted table through a
+  filtered scan, with a warning.
+
+
 ### Fixed
 
 - **`nn_torch` rescoring no longer aborts on a pool that is overwhelmingly false.** The

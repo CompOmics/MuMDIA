@@ -88,6 +88,7 @@ For the mapping from each conda environment to the config field that points at i
 | `scripts/make_reverse_decoys.py` | Recipe: reverse-sequence decoys with no-target-overlap invariant |
 | `scripts/make_shift_decoys.py` | Recipe: fragment-shift (CH2) decoys, DIA-NN-style terminal shift |
 | `scripts/augment_library.py` | Recipe: augment an imported library with its missing tryptic FASTA peptides, then hand off to a decoy builder |
+| `scripts/sort_fragments.py` | Recipe: rewrite a fragment table in `candidate_id` order (streaming bucket sort, in place); the writers above do this themselves since the range load, this is for tables written before |
 | `rust/mumdia/crates/mumdia/src/sidecar.rs` | Rust clients: `resolve_script`, `run_ms2pip`, `run_peptdeep`, `run_deeplc`, `run_deeplc_finetune`, `run_mbr`, `run_worker`, and the shared `fragment_request` / `read_fragment_intensities` the two intensity predictors both use |
 | `rust/mumdia/crates/mumdia/src/stages/predict_frag.rs` | Call sites for MS2PIP + DeepLC (Stage C) |
 | `rust/mumdia/crates/mumdia/src/stages/run.rs` | Call site for DeepLC fine-tune (between search-seed and rt-im-train) |

@@ -70,6 +70,9 @@ def main():
     allf["frag_charge"] = allf["frag_charge"].astype(np.int32)
 
     write_engine_parquet(allp, outp)
+    # Candidate order: the engine reads one candidate-id range of the table by row-group
+    # statistics. Stable, so each candidate's fragments keep their stored order.
+    allf = allf.sort_values("candidate_id", kind="stable").reset_index(drop=True)
     write_engine_parquet(allf, outf)
     print(f"targets={len(tprec)} decoys={len(dprec)} total_prec={len(allp)} total_frag={len(allf)}")
 
