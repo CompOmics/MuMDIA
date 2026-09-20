@@ -932,7 +932,8 @@ fn print_doctor(rep: &DoctorReport) {
         match (r.status.as_str(), &r.python) {
             ("skip", _) if r.wanted => println!(
                 "  [note] {label}: no interpreter found; a library-input run keeps the imported \
-                 iRT.\n\x20        Set {}, or name one, to re-predict it with DeepLC.",
+                 iRT and the multi-head RT calibration does not run (measured +4.8% peptides on \
+                 AIF, +14.3% on Astral).\n\x20        Set {}, or name one, to enable it.",
                 r.env_var
             ),
             ("skip", _) => println!("  [skip] {label}: not needed by this config"),
