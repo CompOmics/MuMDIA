@@ -1153,6 +1153,7 @@ fn real_main() -> Result<()> {
             let cfg = load_config(&config)?;
             let ch = mumdia_io::hash::blake3_str(&cfg.canonical_json());
             stages::search_seed::run(stages::search_seed::SearchSeedParams {
+                fragment_offset: None,
                 ms2: &ms2,
                 library_precursors: &lib_precursors,
                 library_fragments: &lib_fragments,
@@ -1191,6 +1192,7 @@ fn real_main() -> Result<()> {
             }
             let ch = mumdia_io::hash::blake3_str(&cfg.canonical_json());
             stages::rt_im_train::run(stages::rt_im_train::RtImTrainParams {
+                anchor_irt_from_seed: false,
                 seed_psms: &seed_psms,
                 library_precursors: &lib_precursors,
                 out_windows: &out_windows,
@@ -1214,6 +1216,7 @@ fn real_main() -> Result<()> {
             let cfg = load_config(&config)?;
             let ch = mumdia_io::hash::blake3_str(&cfg.canonical_json());
             stages::extract::run(stages::extract::ExtractParams {
+                fragment_offset: None,
                 ms2: &ms2,
                 library_precursors: &lib_precursors,
                 library_fragments: &lib_fragments,

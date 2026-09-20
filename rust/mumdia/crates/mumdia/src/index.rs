@@ -123,7 +123,7 @@ impl Library {
         bucket_size: usize,
         build_bucketed: bool,
     ) -> Result<Library> {
-        Self::load_impl(precursors, fragments, bucket_size, build_bucketed, None)
+        Self::load_impl(precursors, fragments, bucket_size, build_bucketed, None, 0)
     }
 
     /// Load only the precursors whose `precursor_mz` lies in `[mz_lo, mz_hi]`, with their
@@ -164,6 +164,31 @@ impl Library {
             bucket_size,
             build_bucketed,
             Some((first_row, n_rows)),
+            first_row,
+        )
+    }
+
+    /// Load a band that was written out as a precursor table of its own (local ids `0..n`,
+    /// see `groups::write_band_slice`) together with its fragments from the library-wide
+    /// fragment table, whose rows for this band carry the ids from `fragment_offset` to
+    /// `fragment_offset + n`. This is what every stage of an isolation-window group loads:
+    /// the band file is what the DeepLC sidecars rewrite, and the fragment table is shared
+    /// and read by id range (selectively when it is sorted by candidate, else through a
+    /// filtered scan).
+    pub fn load_with_fragment_offset(
+        precursors: &str,
+        fragments: &str,
+        fragment_offset: u32,
+        bucket_size: usize,
+        build_bucketed: bool,
+    ) -> Result<Library> {
+        Self::load_impl(
+            precursors,
+            fragments,
+            bucket_size,
+            build_bucketed,
+            None,
+            fragment_offset as usize,
         )
     }
 
@@ -172,7 +197,7 @@ impl Library {
     /// skipped from their statistics; the ones that can are decoded (one column) and the
     /// exact bounds found by partition point. Without statistics the whole column is decoded,
     /// which is 8 bytes per precursor and still no library.
-    fn precursor_row_span(precursors: &str, mz_lo: f64, mz_hi: f64) -> Result<(usize, usize)> {
+    pub fn precursor_row_span(precursors: &str, mz_lo: f64, mz_hi: f64) -> Result<(usize, usize)> {
         let pt = TableFile::open(precursors)?;
         let stats = pt.row_group_stats("precursor_mz")?;
         // Candidate row groups: those whose [min, max] overlaps the range. With statistics
@@ -246,12 +271,18 @@ impl Library {
         }
     }
 
+    /// `span`: the precursor rows to read (`None` = the whole file) and, with it, the file
+    /// row of local id 0 that the ids in the file are checked against. `frag_offset`: the
+    /// library-wide id of local candidate 0 in the fragment table. They coincide for a range
+    /// load of one library file; a band written to its own file has ids `0..n` (span `None`)
+    /// while its fragments still carry library-wide ids.
     fn load_impl(
         precursors: &str,
         fragments: &str,
         bucket_size: usize,
         build_bucketed: bool,
         span: Option<(usize, usize)>,
+        frag_offset: usize,
     ) -> Result<Library> {
         let offset = span.map(|(first, _)| first).unwrap_or(0);
         let pt = match span {
@@ -369,9 +400,11 @@ impl Library {
         // no `frag_order` permutation and no `Vec<String>` with one heap allocation per
         // fragment. The resident peak is the final arrays plus one batch, which is what lets
         // a modification-expanded library load on a 32 GB machine.
-        let partial = span.is_some();
+        // A partial load (a range of one file, or a band file against the shared fragment
+        // table) sees fragments of other candidates and skips them.
+        let partial = span.is_some() || frag_offset != 0;
         let ft = if partial {
-            Self::open_fragments_for(fragments, offset, ncand)?
+            Self::open_fragments_for(fragments, frag_offset, ncand)?
         } else {
             TableFile::open(fragments)?
         };
@@ -402,7 +435,7 @@ impl Library {
                     // boundary row groups (or the whole table when it is unsorted); they
                     // belong to precursors this library does not hold and are skipped. A
                     // full load has no such rows, so an id past the end is a broken file.
-                    if c < offset || c >= offset + ncand {
+                    if c < frag_offset || c >= frag_offset + ncand {
                         if partial {
                             continue;
                         }
@@ -411,7 +444,7 @@ impl Library {
                             row - 1
                         );
                     }
-                    frag_offsets[c - offset + 1] += 1;
+                    frag_offsets[c - frag_offset + 1] += 1;
                 }
             }
         }
@@ -508,7 +541,7 @@ impl Library {
                 }
                 for k in 0..b.num_rows() {
                     let c = a_cid.value(k) as usize;
-                    if c < offset || c >= offset + ncand {
+                    if c < frag_offset || c >= frag_offset + ncand {
                         if partial {
                             continue;
                         }
@@ -516,7 +549,7 @@ impl Library {
                             "fragment table changed between passes: candidate_id {c} >= {ncand}"
                         );
                     }
-                    let c = c - offset;
+                    let c = c - frag_offset;
                     let pos = cursor[c] as usize;
                     cursor[c] += 1;
                     // NULLs were rejected above, so the physical values are the values.
@@ -666,8 +699,10 @@ impl Library {
             bucket_min,
             bucket_size: bs,
             prec_mz,
-            global_offset: u32::try_from(offset)
-                .map_err(|_| anyhow::anyhow!("precursor row offset {offset} does not fit u32"))?,
+            // Where local id 0 sits in the library: the precursor span's first row, or the
+            // fragment offset of a band file (its precursor rows are already local).
+            global_offset: u32::try_from(if span.is_some() { offset } else { frag_offset })
+                .map_err(|_| anyhow::anyhow!("candidate offset does not fit u32"))?,
         })
     }
 
@@ -889,6 +924,37 @@ mod tests {
         assert_eq!((lo.n_candidates(), lo.global_offset), (2, 0));
         assert_eq!((hi.n_candidates(), hi.global_offset), (4, 2));
         assert!(Library::load_range_with(&p, &f, 700.0, 800.0, 8, false).is_err());
+    }
+
+    #[test]
+    fn band_slice_file_loads_with_the_fragment_offset_and_matches_the_range_load() {
+        let dir = std::env::temp_dir().join(format!("mumdia_index_band_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (p, f) = build_six_lib(&dir, "band", &[0, 1, 2, 3, 4, 5]);
+        let full = Library::load_with(&p, &f, 8, false).unwrap();
+        // The band of rows 1..4 written as its own table, ids 0..3.
+        let band = dir.join("band_prec.parquet").to_str().unwrap().to_string();
+        let n = crate::groups::write_band_slice(&p, 1, 3, &band).unwrap();
+        assert_eq!(n, 3);
+        let ids = mumdia_io::table::TableFile::open(&band)
+            .unwrap()
+            .u32("candidate_id")
+            .unwrap();
+        assert_eq!(ids, vec![0, 1, 2]);
+        let lib = Library::load_with_fragment_offset(&band, &f, 1, 8, false).unwrap();
+        assert_eq!(lib.n_candidates(), 3);
+        assert_eq!(lib.global_offset, 1);
+        for c in 0..3 {
+            assert_eq!(lib.cands[c].candidate_id, c as u32);
+            assert_eq!(lib.cands[c].peptidoform, full.cands[c + 1].peptidoform);
+            assert_eq!(frag_slice(&lib, c), frag_slice(&full, c + 1));
+        }
+        // Same content as loading the band by m/z from the whole file.
+        let by_mz = Library::load_range_with(&p, &f, 440.0, 530.0, 8, false).unwrap();
+        for c in 0..3 {
+            assert_eq!(frag_slice(&lib, c), frag_slice(&by_mz, c));
+            assert_eq!(lib.cands[c].precursor_mz, by_mz.cands[c].precursor_mz);
+        }
     }
 
     #[test]

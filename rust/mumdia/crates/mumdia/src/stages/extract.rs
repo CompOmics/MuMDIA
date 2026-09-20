@@ -101,6 +101,12 @@ pub struct ExtractParams<'a> {
     pub restrict_candidates: Option<&'a str>,
     pub cfg: &'a ExtractConfig,
     pub config_hash: &'a str,
+    /// The precursor table is one isolation-window group's band with local ids `0..n`, and
+    /// its fragments sit in the library-wide fragment table at ids `offset..offset + n`.
+    /// `run_windows` and the outputs are then in band-local ids; the spectra of every window
+    /// are still read, and scans of other windows find no candidate. `None` is the ordinary
+    /// whole-library extract.
+    pub fragment_offset: Option<u32>,
 }
 
 /// One observed hit: scan RT, candidate-local fragment index, observed intensity
@@ -1442,12 +1448,21 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
     // default): it is never read on that path and costs a full sort plus several full
     // copies of every library fragment.
     let build_bucketed = !matches!(p.cfg.matcher, MatcherKind::Fragindex);
-    let lib = Library::load_with(
-        p.library_precursors,
-        p.library_fragments,
-        p.cfg.bucket_size,
-        build_bucketed,
-    )?;
+    let lib = match p.fragment_offset {
+        None => Library::load_with(
+            p.library_precursors,
+            p.library_fragments,
+            p.cfg.bucket_size,
+            build_bucketed,
+        )?,
+        Some(offset) => Library::load_with_fragment_offset(
+            p.library_precursors,
+            p.library_fragments,
+            offset,
+            p.cfg.bucket_size,
+            build_bucketed,
+        )?,
+    };
 
     // Optional candidate allowlist (gate-first-then-compete): restrict extraction to
     // the accepted survivors of a prior gate-on run so the two-pass peak-claim profile
