@@ -64,6 +64,17 @@ pub fn run(g: GroupRun) -> Result<Pooled> {
     let t0 = Instant::now();
     let cfg = g.cfg;
     let ch = g.config_hash;
+    // The multi-head ridge and the base-model re-prediction are deterministic in the
+    // anchors, so fitting them per band on the pooled anchors gives every band the same
+    // model. A fine-tune is not: trained per band it would give each band a different
+    // model, and cost the training once per band. Until the fine-tune can be trained once
+    // and applied per band, a grouped run refuses it; fine-tune the library once beforehand
+    // (docs/08, once-per-library) and search that table instead.
+    if cfg.rt_im_train.finetune_deeplc {
+        bail!(
+            "rt_im_train.finetune_deeplc is not supported with groups.window_groups > 1: the              fine-tune would be trained separately in every group (non-deterministic, and the              training cost once per group). Fine-tune the library once beforehand and search              the fine-tuned table, or leave the default multi-head calibration on"
+        );
+    }
     let d = |name: &str| format!("{}/{}", g.out_dir, name);
     let gd = |i: usize, name: &str| format!("{}/groups/g{i:02}/{name}", g.out_dir);
 

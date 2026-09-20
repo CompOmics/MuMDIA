@@ -63,7 +63,8 @@ than a number. Both are recorded in every run's `manifest.json`.
   every smoke assertion passing and the grouped run byte-identical on repetition.
   `docs/33_window_groups.md` has the layout, the semantics of the two calibration modes,
   and what a band cannot see. Groups run one after another in one process; child-process
-  parallelism and `run-experiment` support are the next steps.
+  parallelism and `run-experiment` support are the next steps. A grouped run refuses
+  `rt_im_train.finetune_deeplc`, which would train a different model per group.
 - **`Library::load_range_with` loads one precursor m/z band of a library.** The precursor
   table is m/z-sorted with row-aligned ids, so a band is a row span: it is found from the
   parquet row-group statistics plus one decode of `precursor_mz` over the boundary groups,

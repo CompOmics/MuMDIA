@@ -124,6 +124,14 @@ new value from its band's table into `seed_psms_calibrated.parquet`, which is wh
 `rt-im-train` reads. The RT fit is then identical across bands (same anchors, same model),
 and only the windows differ, because the precursors do.
 
+Refitting per band is sound because the multi-head ridge and the base-model re-prediction
+are deterministic in their anchors: the same pooled anchors give the same head selection,
+the same ridge and the same predictions, so every band carries one model, at the cost of
+one anchor pass per band (seconds). The optional DeepLC fine-tune is not deterministic and
+would be trained once per band, so a grouped run refuses `rt_im_train.finetune_deeplc`;
+fine-tune the library once beforehand (`docs/08_rt_im_train.md`, once per library) and
+search that table.
+
 `per_group` is kept for the comparison the design asked for, not as a recommendation: it is
 one pooling pass cheaper and every group is independent, but each group fits on a fraction
 of the anchors, and the fit quality sets the RT window that the extract of every group then
