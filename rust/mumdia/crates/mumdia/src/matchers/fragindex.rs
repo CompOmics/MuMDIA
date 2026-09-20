@@ -453,6 +453,7 @@ mod tests {
             bucket_min: Vec::new(),
             bucket_size: 1,
             prec_mz,
+            global_offset: 0,
         }
     }
 
