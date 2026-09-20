@@ -1119,8 +1119,8 @@ impl TableFile {
         let file = std::fs::File::open(path).with_context(|| format!("opening {path}"))?;
         let builder = ParquetRecordBatchReaderBuilder::try_new(file)
             .with_context(|| format!("reading parquet footer {path}"))?;
-        let md = builder.metadata();
-        let total = md.file_metadata().num_rows().max(0) as usize;
+        let meta = builder.metadata();
+        let total = meta.file_metadata().num_rows().max(0) as usize;
         if first_row.saturating_add(n_rows) > total {
             anyhow::bail!(
                 "row span {first_row}..{} lies outside {path}, which has {total} rows",
@@ -1131,8 +1131,8 @@ impl TableFile {
         let mut skip_before = 0usize;
         let mut covered = 0usize;
         let mut start = 0usize;
-        for i in 0..md.num_row_groups() {
-            let rows = md.row_group(i).num_rows().max(0) as usize;
+        for i in 0..meta.num_row_groups() {
+            let rows = meta.row_group(i).num_rows().max(0) as usize;
             let end = start + rows;
             if n_rows > 0 && end > first_row && start < first_row + n_rows {
                 if row_groups.is_empty() {
@@ -1166,10 +1166,10 @@ impl TableFile {
             std::fs::File::open(&self.path).with_context(|| format!("opening {}", self.path))?;
         let builder = ParquetRecordBatchReaderBuilder::try_new(file)
             .with_context(|| format!("reading parquet footer {}", self.path))?;
-        let md = builder.metadata();
-        let mut out = Vec::with_capacity(md.num_row_groups());
-        for i in 0..md.num_row_groups() {
-            let rg = md.row_group(i);
+        let meta = builder.metadata();
+        let mut out = Vec::with_capacity(meta.num_row_groups());
+        for i in 0..meta.num_row_groups() {
+            let rg = meta.row_group(i);
             let col = (0..rg.num_columns())
                 .map(|j| rg.column(j))
                 .find(|c| c.column_descr().name() == name)
