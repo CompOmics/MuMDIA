@@ -33,7 +33,7 @@
       "default_text": "0",
       "help": "",
       "gates": [],
-      "source_line": 1921
+      "source_line": 1929
     },
     {
       "path": "convert.thermo_raw_parser",
@@ -2446,6 +2446,19 @@
         "global",
         "per_group"
       ]
+    },
+    {
+      "path": "groups.parallel",
+      "name": "parallel",
+      "section": "groups",
+      "rust_type": "usize",
+      "kind": "integer",
+      "optional": false,
+      "default": 1,
+      "default_text": "1",
+      "help": "Bands searched at the same time inside one run. `1` (the default) is one band at a time, which is what bounds the memory: each band in flight holds its own extraction working set, so the peak is this many bands' worth. Raise it to fill a large machine, after checking one band's peak RSS: on a 203M-precursor library at 63 bands the largest band took 39 GB and the median far less. Results do not depend on it; bands are independent and their artifacts are pooled in band order either way.",
+      "gates": [],
+      "source_line": 1912
     }
   ],
   "list_sections": [

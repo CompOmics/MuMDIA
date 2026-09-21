@@ -1903,12 +1903,20 @@ pub struct GroupsConfig {
     pub window_groups: usize,
     /// Anchors for the RT calibration of each group; see [`GroupCalibration`].
     pub calibration: GroupCalibration,
+    /// Bands searched at the same time inside one run. `1` (the default) is one band at a
+    /// time, which is what bounds the memory: each band in flight holds its own extraction
+    /// working set, so the peak is this many bands' worth. Raise it to fill a large
+    /// machine, after checking one band's peak RSS: on a 203M-precursor library at 63
+    /// bands the largest band took 39 GB and the median far less. Results do not depend on
+    /// it; bands are independent and their artifacts are pooled in band order either way.
+    pub parallel: usize,
 }
 impl Default for GroupsConfig {
     fn default() -> Self {
         Self {
             window_groups: 1,
             calibration: GroupCalibration::Global,
+            parallel: 1,
         }
     }
 }
@@ -2344,6 +2352,7 @@ impl Config {
             ("experiment.parallel_runs", self.experiment.parallel_runs),
             ("rescore.seeds", self.rescore.seeds),
             ("groups.window_groups", self.groups.window_groups),
+            ("groups.parallel", self.groups.parallel),
         ] {
             if value == 0 {
                 return Err(Invalid(format!("{name} must be >= 1")));

@@ -21,6 +21,7 @@ use mumdia_core::schema::artifact;
 use mumdia_io::record_artifact;
 use mumdia_io::report::ArtifactReport;
 use mumdia_io::table::TableFile;
+use rayon::prelude::*;
 use serde_json::json;
 use tracing::info;
 
@@ -151,50 +152,72 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
         seed_view: String,
     }
     let mut bands: Vec<Band> = Vec::new();
-    for b in &plan.bands {
-        let (first, n) = Library::precursor_row_span(g.lib_precursors, b.mz_lo, b.mz_hi)?;
-        if n == 0 {
-            info!(
-                group = b.index,
-                "groups: band selects no precursor; skipped"
-            );
-            continue;
-        }
-        std::fs::create_dir_all(gd(b.index, ""))?;
-        let prec = gd(b.index, "lib_precursors.parquet");
-        info!(stage = %"band-slice", group = b.index, rows = n, "run: stage start");
-        groups::write_band_slice(g.lib_precursors, first, n, &prec)?;
-        let seed = gd(b.index, "seed_psms.parquet");
-        info!(stage = %"search-seed", group = b.index, "run: stage start");
-        let rows = search_seed::run(search_seed::SearchSeedParams {
-            ms2: &g.converted.ms2,
-            library_precursors: &prec,
-            library_fragments: g.lib_fragments,
-            out: &seed,
-            cfg: &cfg.search_seed,
-            bucket_size: cfg.extract.bucket_size,
-            config_hash: ch,
-            fragment_offset: Some(first as u32),
-        })?;
-        record_opt(
-            g.man.as_deref_mut(),
-            record_artifact(
+    let par = cfg.groups.parallel.max(1);
+    // Bands are independent, so `groups.parallel` of them are sliced and seeded at once.
+    // Chunked rather than a free-running pool: the chunk bounds how many extraction working
+    // sets are resident, which is the whole point of banding. Results do not depend on it,
+    // and the records below are merged in band order.
+    let slice_one =
+        |b: &groups::Band| -> Result<Option<(Band, Vec<mumdia_core::manifest::ArtifactRecord>)>> {
+            let (first, n) = Library::precursor_row_span(g.lib_precursors, b.mz_lo, b.mz_hi)?;
+            if n == 0 {
+                info!(
+                    group = b.index,
+                    "groups: band selects no precursor; skipped"
+                );
+                return Ok(None);
+            }
+            std::fs::create_dir_all(gd(b.index, ""))?;
+            let prec = gd(b.index, "lib_precursors.parquet");
+            info!(stage = %"band-slice", group = b.index, rows = n, "run: stage start");
+            groups::write_band_slice(g.lib_precursors, first, n, &prec)?;
+            let seed = gd(b.index, "seed_psms.parquet");
+            info!(stage = %"search-seed", group = b.index, "run: stage start");
+            let rows = search_seed::run(search_seed::SearchSeedParams {
+                ms2: &g.converted.ms2,
+                library_precursors: &prec,
+                library_fragments: g.lib_fragments,
+                out: &seed,
+                cfg: &cfg.search_seed,
+                bucket_size: cfg.extract.bucket_size,
+                config_hash: ch,
+                fragment_offset: Some(first as u32),
+            })?;
+            let rec = vec![record_artifact(
                 &format!("{}[g{:02}]", artifact::SEED_PSMS.0, b.index),
                 artifact::SEED_PSMS,
                 &seed,
                 rows,
                 "search-seed",
                 ch,
-            )?,
-        );
-        bands.push(Band {
-            index: b.index,
-            offset: first as u32,
-            n,
-            prec,
-            seed,
-            seed_view: gd(b.index, "seed_psms_pooled.parquet"),
-        });
+            )?];
+            Ok(Some((
+                Band {
+                    index: b.index,
+                    offset: first as u32,
+                    n,
+                    prec,
+                    seed,
+                    seed_view: gd(b.index, "seed_psms_pooled.parquet"),
+                },
+                rec,
+            )))
+        };
+    for chunk in plan.bands.chunks(par) {
+        let done: Vec<Option<(Band, Vec<mumdia_core::manifest::ArtifactRecord>)>> = if par == 1 {
+            chunk.iter().map(slice_one).collect::<Result<Vec<_>>>()?
+        } else {
+            chunk
+                .par_iter()
+                .map(slice_one)
+                .collect::<Result<Vec<_>>>()?
+        };
+        for (band, recs) in done.into_iter().flatten() {
+            for r in recs {
+                record_opt(g.man.as_deref_mut(), r);
+            }
+            bands.push(band);
+        }
     }
     if bands.is_empty() {
         bail!("groups: no band selects any precursor of the library");
@@ -359,10 +382,17 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
     // --- windows, extract, features, compete per band
     let mut arts: Vec<pool::BandArtifacts> = Vec::new();
     let mut cals: Vec<(usize, String)> = Vec::new();
-    for b in &bands {
+    // `groups.parallel` bands at a time. Each band in flight holds its own extraction
+    // working set, so this chunk is what the stage's memory scales with; the artifacts are
+    // pooled in band order regardless of which band finishes first.
+    let band_one = |b: &Band| -> Result<(
+        pool::BandArtifacts,
+        (usize, String),
+        Vec<mumdia_core::manifest::ArtifactRecord>,
+    )> {
+        let mut recs: Vec<mumdia_core::manifest::ArtifactRecord> = Vec::new();
         let windows = gd(b.index, "run_windows.parquet");
         let cal = gd(b.index, "cal.json");
-        cals.push((b.index, cal.clone()));
         let (seed_for_windows, from_seed) = match (&anchors_for_windows, global) {
             (Some(refreshed), _) => (refreshed.clone(), true),
             (None, true) => (pooled_seed.clone(), true),
@@ -378,17 +408,14 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
             config_hash: ch,
             anchor_irt_from_seed: from_seed,
         })?;
-        record_opt(
-            g.man.as_deref_mut(),
-            record_artifact(
-                &format!("{}[g{:02}]", artifact::RUN_WINDOWS.0, b.index),
-                artifact::RUN_WINDOWS,
-                &windows,
-                rows,
-                "rt-im-train",
-                ch,
-            )?,
-        );
+        recs.push(record_artifact(
+            &format!("{}[g{:02}]", artifact::RUN_WINDOWS.0, b.index),
+            artifact::RUN_WINDOWS,
+            &windows,
+            rows,
+            "rt-im-train",
+            ch,
+        )?);
         let mass_cal = if global {
             format!("{pooled_seed}.masscal.json")
         } else {
@@ -411,28 +438,22 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
             config_hash: ch,
             fragment_offset: Some(b.offset),
         })?;
-        record_opt(
-            g.man.as_deref_mut(),
-            record_artifact(
-                &format!("{}[g{:02}]", artifact::PSMS_EXTRACTED.0, b.index),
-                artifact::PSMS_EXTRACTED,
-                &psms,
-                npsm,
-                "extract",
-                ch,
-            )?,
-        );
-        record_opt(
-            g.man.as_deref_mut(),
-            record_artifact(
-                &format!("{}[g{:02}]", artifact::CHROMATOGRAMS.0, b.index),
-                artifact::CHROMATOGRAMS,
-                &chrom,
-                nchr,
-                "extract",
-                ch,
-            )?,
-        );
+        recs.push(record_artifact(
+            &format!("{}[g{:02}]", artifact::PSMS_EXTRACTED.0, b.index),
+            artifact::PSMS_EXTRACTED,
+            &psms,
+            npsm,
+            "extract",
+            ch,
+        )?);
+        recs.push(record_artifact(
+            &format!("{}[g{:02}]", artifact::CHROMATOGRAMS.0, b.index),
+            artifact::CHROMATOGRAMS,
+            &chrom,
+            nchr,
+            "extract",
+            ch,
+        )?);
         let feats = gd(b.index, "features.parquet");
         let pin = gd(b.index, "run.pin");
         info!(stage = %"features", group = b.index, "run: stage start");
@@ -447,17 +468,14 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
             cfg: &cfg.features,
             config_hash: ch,
         })?;
-        record_opt(
-            g.man.as_deref_mut(),
-            record_artifact(
-                &format!("{}[g{:02}]", artifact::FEATURES.0, b.index),
-                artifact::FEATURES,
-                &feats,
-                nf,
-                "features",
-                ch,
-            )?,
-        );
+        recs.push(record_artifact(
+            &format!("{}[g{:02}]", artifact::FEATURES.0, b.index),
+            artifact::FEATURES,
+            &feats,
+            nf,
+            "features",
+            ch,
+        )?);
         let competed = gd(b.index, "psms_competed.parquet");
         info!(stage = %"compete", group = b.index, "run: stage start");
         let nc = compete::run(compete::CompeteParams {
@@ -466,24 +484,43 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
             cfg: &cfg.compete,
             config_hash: ch,
         })?;
-        record_opt(
-            g.man.as_deref_mut(),
-            record_artifact(
-                &format!("{}[g{:02}]", artifact::PSMS_COMPETED.0, b.index),
-                artifact::PSMS_COMPETED,
-                &competed,
-                nc,
-                "compete",
-                ch,
-            )?,
-        );
-        arts.push(pool::BandArtifacts {
-            offset: b.offset,
-            psms,
-            chromatograms: chrom,
-            features: feats,
-            competed,
-        });
+        recs.push(record_artifact(
+            &format!("{}[g{:02}]", artifact::PSMS_COMPETED.0, b.index),
+            artifact::PSMS_COMPETED,
+            &competed,
+            nc,
+            "compete",
+            ch,
+        )?);
+        Ok((
+            pool::BandArtifacts {
+                offset: b.offset,
+                psms,
+                chromatograms: chrom,
+                features: feats,
+                competed,
+            },
+            (b.index, gd(b.index, "cal.json")),
+            recs,
+        ))
+    };
+    for chunk in bands.chunks(par) {
+        let done: Vec<(
+            pool::BandArtifacts,
+            (usize, String),
+            Vec<mumdia_core::manifest::ArtifactRecord>,
+        )> = if par == 1 {
+            chunk.iter().map(band_one).collect::<Result<Vec<_>>>()?
+        } else {
+            chunk.par_iter().map(band_one).collect::<Result<Vec<_>>>()?
+        };
+        for (art, cal, recs) in done {
+            for r in recs {
+                record_opt(g.man.as_deref_mut(), r);
+            }
+            cals.push(cal);
+            arts.push(art);
+        }
     }
 
     // The run-level cal.json, as an ungrouped run writes it.

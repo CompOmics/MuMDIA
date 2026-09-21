@@ -68,12 +68,12 @@ undocumented on purpose; those fields are counted under "Coverage".
 | [`quant`](#quant) | `QuantConfig` | 17 | [docs/12_quant_lfq_align_mbr_report_audit.md](12_quant_lfq_align_mbr_report_audit.md) |
 | [`mbr`](#mbr) | `MbrConfig` | 9 | [docs/12_quant_lfq_align_mbr_report_audit.md](12_quant_lfq_align_mbr_report_audit.md) |
 | [`experiment`](#experiment) | `ExperimentConfig` | 2 | [docs/01_overview_and_dataflow.md](01_overview_and_dataflow.md) |
-| [`groups`](#groups) | `GroupsConfig` | 2 |  |
+| [`groups`](#groups) | `GroupsConfig` | 3 |  |
 | [`peptidoforms.fixed_mods[] / peptidoforms.variable_mods[]`](#peptidoformsfixed_mods--peptidoformsvariable_mods) | `ResidueMod` | 2 | [docs/05_digest_peptidoforms.md](05_digest_peptidoforms.md) |
 
 ## (top level)
 
-`Config` (rust/mumdia/crates/mumdia-core/src/config.rs:1918). stage document: [docs/02_config_and_data_model.md](02_config_and_data_model.md).
+`Config` (rust/mumdia/crates/mumdia-core/src/config.rs:1926). stage document: [docs/02_config_and_data_model.md](02_config_and_data_model.md).
 
 | Field | Type | Default | Gated | Description |
 |---|---|---|---|---|
@@ -396,6 +396,7 @@ Searching a run one isolation-window group at a time. A group of isolation windo
 |---|---|---|---|---|
 | `window_groups` | `usize` | `1` |  | Number of window groups. `1` (the default) is the ordinary single-library search. Groups are contiguous bands of isolation windows balanced by the number of library precursors they select, read from the precursor table's row-group statistics. |
 | `calibration` | `GroupCalibration` | `global` |  | Anchors for the RT calibration of each group; see `GroupCalibration`. |
+| `parallel` | `usize` | `1` |  | Bands searched at the same time inside one run. `1` (the default) is one band at a time, which is what bounds the memory: each band in flight holds its own extraction working set, so the peak is this many bands' worth. Raise it to fill a large machine, after checking one band's peak RSS: on a 203M-precursor library at 63 bands the largest band took 39 GB and the median far less. Results do not depend on it; bands are independent and their artifacts are pooled in band order either way. |
 
 ## peptidoforms.fixed_mods[] / peptidoforms.variable_mods[]
 
@@ -852,6 +853,6 @@ Every field whose struct has an `impl Default` resolved from the source.
 
 ## Coverage
 
-19 structs and 192 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 25 enumerations, 1 named profile(s), 66 environment variables read and 19 set.
+19 structs and 193 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 25 enumerations, 1 named profile(s), 66 environment variables read and 19 set.
 
 20 field(s) carry a gating marker in their doc comment. 48 field(s) carry no doc comment at all, so their description is empty above. 0 default(s) could not be resolved and 2 have none by design.
