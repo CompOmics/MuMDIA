@@ -745,6 +745,7 @@ fn accumulate_groups(
     rt_hi: &[f64],
     mass_off: &MassOffset,
     cfg: &ExtractConfig,
+    restrict: Option<&std::collections::HashSet<u32>>,
     acc: &mut HashMap<u32, Vec<Hit>>,
 ) {
     // Partials are merged into `acc` in window order as they complete, not collected first
@@ -777,6 +778,14 @@ fn accumulate_groups(
                         let c = cid as usize;
                         if rt < rt_lo[c] || rt > rt_hi[c] {
                             return;
+                        }
+                        // The allowlist is applied here, before the claim, exactly where the
+                        // serial path applies it: a candidate outside the list neither
+                        // collects hits nor competes for a shared peak.
+                        if let Some(s) = restrict {
+                            if !s.contains(&cid) {
+                                return;
+                            }
                         }
                         claimants.push((cid, frag, pint));
                     });
@@ -1633,12 +1642,14 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
     let claim_margin = p.cfg.peak_claim_margin as f32;
 
     if !two_pass {
-        if let (Some(idx), true) = (fidx.as_ref(), restrict.is_none()) {
+        if let Some(idx) = fidx.as_ref() {
             // Parallel across isolation-window groups (bit-identical to serial: the
-            // cascade rt-sorts each candidate's hits before summing). Only when there
-            // is no candidate allowlist; a `restrict` list routes to the serial path
-            // below, which applies the allowlist filter and honors every peak_claim
-            // strategy (Winner/Proportional/None).
+            // cascade rt-sorts each candidate's hits before summing), with or without a
+            // candidate allowlist: the allowlist is applied inside the probe, before the
+            // peak claim, as on the serial path. Until 2026-09-18 an allowlist routed to
+            // the serial path below, whose whole-run accumulator ignores
+            // `windows_in_flight`; on a 35M-candidate immunopeptidomics library that was
+            // a 325 GB, 2-hour extract, and on 83M candidates it aborted at 471 GB.
             // Streamed: the driver below probes the windows in batches and writes each
             // candidate out as soon as no later window can add a hit to it, so the whole
             // run's hits are never resident. Measured at 1.6 billion hits (35.9 GiB of
@@ -2682,6 +2693,7 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
                     &rt_hi,
                     &mass_off,
                     p.cfg,
+                    restrict.as_ref(),
                     &mut acc_stream,
                 );
                 gi = upto;
