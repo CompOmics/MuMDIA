@@ -203,6 +203,29 @@ enum Cmd {
         #[arg(long)]
         config: Option<String>,
     },
+    /// Subset a library to a set of candidates (a first pass's survivors, or prescan's),
+    /// renumbered to the contiguous 0..n the fragment index requires.
+    SubLibrary {
+        #[arg(long)]
+        lib_precursors: String,
+        #[arg(long)]
+        lib_fragments: String,
+        /// Parquet with a `candidate_id` column: the candidates to keep. Order and
+        /// duplicates do not matter.
+        #[arg(long)]
+        survivors: String,
+        #[arg(long)]
+        out_precursors: String,
+        #[arg(long)]
+        out_fragments: String,
+        /// Keep exactly the listed candidates instead of unioning the decision over
+        /// `peptidoform_id`. A target and its decoy share that id, so the default keeps
+        /// pairs together and this breaks pairing unless the list is already pair-complete.
+        #[arg(long, default_value_t = false)]
+        no_pair_link: bool,
+        #[arg(long)]
+        config: Option<String>,
+    },
     /// Targeted 3D extraction (peak-major cascade) -> psms_extracted, chromatograms.
     Extract {
         #[arg(long)]
@@ -1199,6 +1222,34 @@ fn real_main() -> Result<()> {
                 cfg: &cfg.rt_im_train,
                 config_hash: &ch,
             })?;
+        }
+        Cmd::SubLibrary {
+            lib_precursors,
+            lib_fragments,
+            survivors,
+            out_precursors,
+            out_fragments,
+            no_pair_link,
+            config,
+        } => {
+            let _ = load_config(&config)?;
+            let st = stages::sub_library::run(stages::sub_library::SubLibraryParams {
+                precursors: &lib_precursors,
+                fragments: &lib_fragments,
+                survivors: &survivors,
+                out_precursors: &out_precursors,
+                out_fragments: &out_fragments,
+                pair_linked: !no_pair_link,
+            })?;
+            println!(
+                "sub-library: {} precursors ({} targets, {} decoys) and {} fragment rows from                  {} survivors of {}",
+                st.precursors,
+                st.targets,
+                st.decoys,
+                st.fragments,
+                st.survivors,
+                st.library_precursors
+            );
         }
         Cmd::Extract {
             ms2,

@@ -41,6 +41,22 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ## [Unreleased]
 
+### Added
+
+- **`mumdia sub-library` subsets a library to a set of candidates.** A second pass searches
+  the survivors of a first pass (or of `prescan`) as a library of their own, which means
+  keeping those precursors, renumbering them to the contiguous `0..n` the fragment index
+  requires, and remapping their fragment rows. `scripts/assemble_survivors.py` did that by
+  holding the whole precursor table plus a Python string per label: 44 GB and several
+  minutes per call on the 142.7M-precursor 8-12-mer immunopeptidomics library. The engine
+  streams both tables one batch at a time and keeps two `u32` per library precursor, about
+  1.6 GB on that library. The keep decision is unioned over `peptidoform_id`
+  (`--no-pair-link` opts out), so a target and its decoy are kept or dropped together and
+  exchangeability is what it was in the full library, which is the semantics the script had.
+  Not to be confused with an m/z band of a library, which is a row range the engine reads
+  directly with no fragment table of its own. The script stays for existing recipes, with a
+  note pointing at the command.
+
 ### Changed
 
 - **Library writers emit fragment tables sorted by `candidate_id`.** `import_diann_lib.py`,
