@@ -88,6 +88,7 @@ For the mapping from each conda environment to the config field that points at i
 | `scripts/make_reverse_decoys.py` | Recipe: reverse-sequence decoys with no-target-overlap invariant |
 | `scripts/make_shift_decoys.py` | Recipe: fragment-shift (CH2) decoys, DIA-NN-style terminal shift |
 | `scripts/augment_library.py` | Recipe: augment an imported library with its missing tryptic FASTA peptides, then hand off to a decoy builder |
+| `scripts/sort_fragments.py` | Recipe: rewrite a fragment table in `candidate_id` order (streaming bucket sort, in place); the writers above do this themselves since the range load, this is for tables written before |
 | `scripts/mz_range_survivors.py` | Recipe: candidate ids inside the run's isolation range, as a prescan-style survivors table (docs/32) |
 | `scripts/assemble_survivors.py` | Recipe: survivors table -> renumbered library, target/decoy pair kept together on `peptidoform_id`, fragments streamed (docs/21, docs/32) |
 | `scripts/shard_parquet.py` | Recipe: row-group-aligned parquet split / concatenate |
