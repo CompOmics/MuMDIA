@@ -790,6 +790,7 @@ listed with the file it is in.
 | `MUMDIA_PYTHON_PEPTDEEP` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/python.rs:232` |
 | `MUMDIA_PYTHON_RESCORE` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/python.rs:232` |
 | `MUMDIA_RESCORE_MODEL` | both | `"nn"` | `rust/mumdia/crates/mumdia/src/stages/rescore.rs:357`, `scripts/mokapot_worker.py:181`, `scripts/mokapot_worker.py:37` |
+| `MUMDIA_SCRIPTS` | sidecar | `os.path.dirname(os.path.abspath(__file__` | `scripts/mh_shard_predict.py:23` |
 | `MUMDIA_THERMO_PARSER` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/raw.rs:171` |
 | `MUMDIA_XGB_DEPTH` | sidecar | `"6"` | `scripts/mokapot_worker.py:63` |
 | `MUMDIA_XGB_JOBS` | sidecar | `"0"` | `scripts/mokapot_worker.py:68` |
@@ -801,7 +802,7 @@ listed with the file it is in.
 | `ProgramFiles(x86)` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/raw.rs:202` |
 | `VIRTUAL_ENV` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/python.rs:242` |
 
-65 variables are read: 16 engine-side, 52 sidecar-side, 3 on both sides.
+66 variables are read: 16 engine-side, 53 sidecar-side, 3 on both sides.
 
 ### Variables the code sets
 

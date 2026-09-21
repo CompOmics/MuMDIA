@@ -33,7 +33,7 @@ import pyarrow.parquet as pq
 # The engine rejects `large_string` parquet columns ("column 'peptidoform' is not
 # utf8"), and `to_parquet` picks the width itself: pandas 3.x chooses the large
 # variant, so this helper silently emitted libraries the engine would not load.
-from _lib_io import narrow_table, write_engine_parquet
+from _lib_io import narrow_table, sort_fragments_by_candidate, write_engine_parquet
 
 RES = {
     'G':57.021463735,'A':71.037113805,'S':87.032028435,'P':97.052763875,'V':99.068413945,
@@ -339,6 +339,9 @@ def main():
             n_out += table.num_rows
     finally:
         writer.close()
+    # Targets were streamed first and decoys after, while the precursor order interleaves
+    # them; restore candidate order so the engine can read one id range of the table.
+    sort_fragments_by_candidate(outf)
 
     print(f"targets_in={len(tprec)} targets_out={len(tprec_out)} decoys={len(dprec)} total_prec={len(allp)} total_frag={n_out}", flush=True)
 
