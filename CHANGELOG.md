@@ -84,7 +84,12 @@ than a number. Both are recorded in every run's `manifest.json`.
   `docs/33_window_groups.md` has the layout, the semantics of the two calibration modes,
   and what a band cannot see. Groups run one after another in one process; child-process
   parallelism and `run-experiment` support are the next steps. A grouped run refuses
-  `rt_im_train.finetune_deeplc`, which would train a different model per group.
+  `rt_im_train.finetune_deeplc`, which would train a different model per group. A sweep of
+  the group count on the same file (48, 64, 96 and 192 asked for, one per host) accepted
+  22,850,003 PSMs in every arm, the monolithic count exactly; it also showed that a band
+  cannot be smaller than one isolation window (114 here, so 192 became 94 bands), that the
+  largest band falls only from 44 to 23 GB as bands shrink, because each pays a fixed cost,
+  and that CPU roughly doubles past about 64 bands.
 - **`Library::load_range_with` loads one precursor m/z band of a library.** The precursor
   table is m/z-sorted with row-aligned ids, so a band is a row span: it is found from the
   parquet row-group statistics plus one decode of `precursor_mz` over the boundary groups,

@@ -265,6 +265,43 @@ next measurement), together with streaming extract's accepted rows to disk durin
 The pooled rescore (40.6 GB here for 22.85M PSMs) is the stage grouping does not bound; the
 compact feature preset is its lever.
 
+### How many groups, and what it costs
+
+Measured 2026-09-21 on four idle 128-core hosts, one group count each, the same file and
+the same run-wide calibration, six threads per band and no per-band fragment table
+(`extract --fragment-offset` against the shared sorted table). Bands are precursor-balanced.
+
+| asked for | bands | precursors per band | largest band | extract CPU | cores per band | modelled wall |
+|---|---|---|---|---|---|---|
+| 48 | 48 | 4.24M | 44.3 GB | 25,901 s | 2.7 | 13.2 min |
+| 64 | 63 | 3.23M | 39.0 GB | 20,821 s | 2.7 | 8.1 min |
+| 96 | 81 | 2.51M | 31.2 GB | 42,174 s | 2.3 | 14.9 min |
+| 192 | 94 | 2.16M | 23.0 GB | 39,624 s | 2.1 | 14.9 min |
+
+All four arms accepted **22,850,003 PSMs, the monolithic run's count exactly**, so the
+number of bands changes neither what is searched nor what is extracted. The wall is
+modelled as the summed band time over the number of bands run at once (12, 16, 21, 21),
+because the arms were interrupted and resumed; the CPU totals are measured.
+
+Three things this says:
+
+- **A band cannot be smaller than one isolation window.** The run has 114 windows, so 96
+  groups became 81 bands and 192 became 94. Beyond one window per band, the only way to
+  divide further is to split a window's candidates by m/z, which extract already does
+  across threads (`accumulate_groups`) but not across processes.
+- **Memory falls sublinearly.** Halving the precursors per band from 4.2M to 2.2M takes the
+  largest band from 44 to 23 GB, not to 22, because each band pays a fixed cost: the run's
+  spectra (1 GB here), the band's fragment index, and the accumulator, which is sized by the
+  windows in flight rather than by the band.
+- **Cost rises past 64 bands.** The 81- and 94-band arms spent about twice the CPU of the
+  63-band arm. Each extra band repeats the fixed load, and the per-band single-threaded
+  load phase becomes a larger share, visible as cores per band falling from 2.7 to 2.1.
+  Those two arms also ran 21 bands at once against 12 and 16, so part of the penalty is
+  host contention rather than band size.
+
+On this data the useful range is therefore 48 to 64 bands: about 40 GB per band, which is
+what a 100 GB desktop can run two of at a time, or one with room to spare.
+
 ## 9. What is not there yet
 
 - Groups run one after another in one process. Running them as child processes in parallel
