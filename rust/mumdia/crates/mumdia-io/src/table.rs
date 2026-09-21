@@ -15,10 +15,11 @@ use arrow::array::{
 };
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use parquet::arrow::arrow_reader::{ParquetRecordBatchReaderBuilder, RowSelection, RowSelector};
 use parquet::arrow::ArrowWriter;
-use parquet::basic::Compression;
+use parquet::basic::{Compression, LogicalType};
 use parquet::file::properties::WriterProperties;
+use parquet::file::statistics::Statistics;
 
 /// One named, typed column for writing.
 pub enum Col {
@@ -1052,8 +1053,42 @@ pub struct TableFile {
     path: String,
     /// Arrow schema of the file, from the parquet footer.
     pub schema: Arc<Schema>,
-    /// Row count from the parquet footer.
+    /// Row count from the parquet footer, or the span's row count for a partial open.
     pub nrows: usize,
+    /// `Some` when the table was opened on a row span ([`TableFile::open_rows`]): the row
+    /// groups that cover the span and the selection that trims them to it. Every getter and
+    /// batch reader applies it, so a partial table behaves as a smaller file.
+    selection: Option<RowSpan>,
+}
+
+/// A contiguous row span of a parquet file: the row groups that cover it, in file order,
+/// and how many rows to skip at the front of the first and the back of the last.
+#[derive(Clone, Debug)]
+struct RowSpan {
+    row_groups: Vec<usize>,
+    skip_before: usize,
+    take: usize,
+    skip_after: usize,
+}
+
+/// Per-row-group facts a caller can plan a partial read from without decoding anything:
+/// the row count and the writer's min/max statistics of one numeric column, as f64.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RowGroupStats {
+    pub rows: usize,
+    /// `None` when the writer recorded no statistics for the column.
+    pub min: Option<f64>,
+    pub max: Option<f64>,
+}
+
+impl RowGroupStats {
+    /// Whether every group carries statistics and the groups are in non-decreasing order
+    /// of the column, i.e. the file is sorted by it at row-group granularity. That is the
+    /// precondition for reading a value range as a contiguous run of row groups.
+    pub fn sorted_by_column(stats: &[RowGroupStats]) -> bool {
+        stats.iter().all(|s| s.min.is_some() && s.max.is_some())
+            && stats.windows(2).all(|w| w[0].max <= w[1].min)
+    }
 }
 
 impl TableFile {
@@ -1068,7 +1103,116 @@ impl TableFile {
             path: path.to_string(),
             schema,
             nrows,
+            selection: None,
         })
+    }
+
+    /// Open only the rows `[first_row, first_row + n_rows)` of `path`. The row groups that
+    /// cover the span are the only ones ever decoded and a row selection trims the first
+    /// and last of them, so a getter costs the span's rows plus at most one row group of
+    /// decoding at each end. `nrows` is `n_rows`; the span must lie inside the file.
+    ///
+    /// This is what lets a stage load one slice of a sorted table: a library's precursors
+    /// are ordered by m/z with row-aligned ids, so an isolation-window group is a row span,
+    /// and the group's search never holds the rest of the library.
+    pub fn open_rows(path: &str, first_row: usize, n_rows: usize) -> Result<TableFile> {
+        let file = std::fs::File::open(path).with_context(|| format!("opening {path}"))?;
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+            .with_context(|| format!("reading parquet footer {path}"))?;
+        let meta = builder.metadata();
+        let total = meta.file_metadata().num_rows().max(0) as usize;
+        if first_row.saturating_add(n_rows) > total {
+            anyhow::bail!(
+                "row span {first_row}..{} lies outside {path}, which has {total} rows",
+                first_row + n_rows
+            );
+        }
+        let mut row_groups = Vec::new();
+        let mut skip_before = 0usize;
+        let mut covered = 0usize;
+        let mut start = 0usize;
+        for i in 0..meta.num_row_groups() {
+            let rows = meta.row_group(i).num_rows().max(0) as usize;
+            let end = start + rows;
+            if n_rows > 0 && end > first_row && start < first_row + n_rows {
+                if row_groups.is_empty() {
+                    skip_before = first_row - start;
+                }
+                row_groups.push(i);
+                covered += rows;
+            }
+            start = end;
+        }
+        let skip_after = covered.saturating_sub(skip_before + n_rows);
+        Ok(TableFile {
+            path: path.to_string(),
+            schema: builder.schema().clone(),
+            nrows: n_rows,
+            selection: Some(RowSpan {
+                row_groups,
+                skip_before,
+                take: n_rows,
+                skip_after,
+            }),
+        })
+    }
+
+    /// Row count and min/max statistics of a numeric column per row group, in file order,
+    /// from the footer alone. Integer and floating columns are reported as f64; unsigned
+    /// integers are read back through their logical type so a value above `i32::MAX` is not
+    /// returned as its two's-complement image.
+    pub fn row_group_stats(&self, name: &str) -> Result<Vec<RowGroupStats>> {
+        let file =
+            std::fs::File::open(&self.path).with_context(|| format!("opening {}", self.path))?;
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+            .with_context(|| format!("reading parquet footer {}", self.path))?;
+        let meta = builder.metadata();
+        let mut out = Vec::with_capacity(meta.num_row_groups());
+        for i in 0..meta.num_row_groups() {
+            let rg = meta.row_group(i);
+            let col = (0..rg.num_columns())
+                .map(|j| rg.column(j))
+                .find(|c| c.column_descr().name() == name)
+                .ok_or_else(|| missing_column(name, &self.path, &self.column_names()))?;
+            let unsigned = matches!(
+                col.column_descr().logical_type_ref(),
+                Some(LogicalType::Integer(t)) if !t.is_signed
+            );
+            let (min, max) = match col.statistics() {
+                Some(Statistics::Double(s)) => (s.min_opt().copied(), s.max_opt().copied()),
+                Some(Statistics::Float(s)) => (
+                    s.min_opt().map(|v| f64::from(*v)),
+                    s.max_opt().map(|v| f64::from(*v)),
+                ),
+                Some(Statistics::Int32(s)) => {
+                    let conv = |v: &i32| {
+                        if unsigned {
+                            f64::from(*v as u32)
+                        } else {
+                            f64::from(*v)
+                        }
+                    };
+                    (s.min_opt().map(conv), s.max_opt().map(conv))
+                }
+                Some(Statistics::Int64(s)) => {
+                    let conv = |v: &i64| {
+                        if unsigned {
+                            *v as u64 as f64
+                        } else {
+                            *v as f64
+                        }
+                    };
+                    (s.min_opt().map(conv), s.max_opt().map(conv))
+                }
+                _ => (None, None),
+            };
+            out.push(RowGroupStats {
+                rows: rg.num_rows().max(0) as usize,
+                min,
+                max,
+            });
+        }
+        Ok(out)
     }
 
     pub fn path(&self) -> &str {
@@ -1104,6 +1248,21 @@ impl TableFile {
         let mut builder = ParquetRecordBatchReaderBuilder::try_new(file)
             .with_context(|| format!("reading parquet {}", self.path))?
             .with_batch_size(batch_size.max(1));
+        if let Some(span) = &self.selection {
+            // The selection counts rows of the SELECTED row groups only, front to back, so
+            // it is skip / take / skip over exactly the groups named here.
+            let mut sel = Vec::with_capacity(3);
+            if span.skip_before > 0 {
+                sel.push(RowSelector::skip(span.skip_before));
+            }
+            sel.push(RowSelector::select(span.take));
+            if span.skip_after > 0 {
+                sel.push(RowSelector::skip(span.skip_after));
+            }
+            builder = builder
+                .with_row_groups(span.row_groups.clone())
+                .with_row_selection(RowSelection::from(sel));
+        }
         if let Some(want) = columns {
             let mask = {
                 let parquet_schema = builder.parquet_schema();
@@ -1242,6 +1401,56 @@ impl TableFile {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn open_rows_reads_exactly_the_span_and_stats_describe_the_groups() {
+        let dir = std::env::temp_dir().join(format!("mumdia_table_rows_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("ten.parquet").to_str().unwrap().to_string();
+        // Ten rows in row groups of three: 3, 3, 3, 1.
+        let mut w = TableWriter::new(&p).with_row_group_rows(3);
+        w.write_cols(vec![
+            Col::U32("id".into(), (0..10).collect()),
+            Col::F64("v".into(), (0..10).map(|i| i as f64 * 1.5).collect()),
+        ])
+        .unwrap();
+        w.close().unwrap();
+
+        let stats = TableFile::open(&p).unwrap().row_group_stats("v").unwrap();
+        assert_eq!(
+            stats.iter().map(|s| s.rows).collect::<Vec<_>>(),
+            vec![3, 3, 3, 1]
+        );
+        assert_eq!((stats[1].min, stats[1].max), (Some(4.5), Some(7.5)));
+        assert_eq!((stats[3].min, stats[3].max), (Some(13.5), Some(13.5)));
+        assert!(RowGroupStats::sorted_by_column(&stats));
+        let ids = TableFile::open(&p).unwrap().row_group_stats("id").unwrap();
+        assert_eq!((ids[2].min, ids[2].max), (Some(6.0), Some(8.0)));
+
+        // Rows 4..9 start inside the second group and end inside the third.
+        let part = TableFile::open_rows(&p, 4, 5).unwrap();
+        assert_eq!(part.nrows, 5);
+        assert_eq!(part.u32("id").unwrap(), vec![4, 5, 6, 7, 8]);
+        assert_eq!(part.f64("v").unwrap(), vec![6.0, 7.5, 9.0, 10.5, 12.0]);
+        let mut seen = 0;
+        part.for_each_batch(Some(&["id"]), 2, |b| {
+            seen += b.num_rows();
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(seen, 5);
+        // A span that is exactly one whole group, an empty span, and one past the end.
+        assert_eq!(
+            TableFile::open_rows(&p, 3, 3).unwrap().u32("id").unwrap(),
+            vec![3, 4, 5]
+        );
+        assert!(TableFile::open_rows(&p, 0, 0)
+            .unwrap()
+            .u32("id")
+            .unwrap()
+            .is_empty());
+        assert!(TableFile::open_rows(&p, 8, 5).is_err());
+    }
 
     #[test]
     fn roundtrip_mixed_columns() {

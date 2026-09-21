@@ -41,6 +41,19 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ## [Unreleased]
 
+### Added
+
+- **`Library::load_range_with` loads one precursor m/z band of a library.** The precursor
+  table is m/z-sorted with row-aligned ids, so a band is a row span: it is found from the
+  parquet row-group statistics plus one decode of `precursor_mz` over the boundary groups,
+  and `TableFile::open_rows` then reads only the row groups that cover it, trimmed by a row
+  selection. Fragments come the same way when their table is sorted by `candidate_id` at
+  row-group granularity; an unsorted table still loads through a filtered scan, with a
+  warning. The slice carries local ids `0..n` and `Library::global_offset`, the file row of
+  local id 0. This is the load an isolation-window-group search needs: a group of windows
+  can only select precursors in its band, so a run searched group by group never holds the
+  rest of the library. `TableFile::row_group_stats` exposes the footer statistics for
+  planning such reads.
 ### Changed
 
 - **`mumdia doctor` and the interpreter resolver say what a missing DeepLC costs.** The
