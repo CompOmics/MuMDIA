@@ -61,6 +61,14 @@ than a number. Both are recorded in every run's `manifest.json`.
   recorded as `name[gNN]`, under `groups/gNN/`). Measured on the CI fixture with three and
   five groups against the ungrouped run: 151 against 150 stripped peptides, 149 shared,
   every smoke assertion passing and the grouped run byte-identical on repetition.
+  At real scale (AT10234AUH against the 142.7M-precursor 8-12-mer immunopeptidomics
+  library, eight groups, measured with a zero-code harness) the grouped extraction with the
+  run-wide calibration reproduced the monolithic extraction row for row (22,850,003
+  candidates, identical apex retention times) at 22-96 GB per group against 173 GB, and the
+  pooled rescore gave the same 11,271 precursors at 1% (10,346 peptides against 10,213,
+  within seed spread) in 107 min against 329 min for the same stages. Per-group calibration
+  failed on the same file: three of seven groups had no confident seed on their own q scale
+  and ran unbounded, one aborting at 664 GB.
   `docs/33_window_groups.md` has the layout, the semantics of the two calibration modes,
   and what a band cannot see. Groups run one after another in one process; child-process
   parallelism and `run-experiment` support are the next steps. A grouped run refuses

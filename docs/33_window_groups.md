@@ -203,17 +203,67 @@ configuration, `native_tda`), 2026-09-20, same binary:
 | `window_groups: 8`, global | 5 (three merged: empty bands) | 151 | 168 of 168 |
 | `window_groups: 3`, per_group | 3 | 147 | RT checks fail: no band has a confident anchor (`1/T`) |
 
+The fixture cannot measure memory or time; the real-scale measurement below does.
+
 Ungrouped and three-group global share 149 stripped peptides; the two that differ are
 sibling-modform ties on synthetic spectra, and the grouped run's extract tolerance was the
 configured 20 ppm rather than the ungrouped run's learned 5 ppm, for the same `1/T` reason
 (no band reached a confident seed, so no band calibrated). A repeated grouped run is
 byte-identical in every artifact.
 
-The real-scale measurement is the one that decides the default group count and the
-calibration mode: the immunopeptidomics file AT10234AUH against the 8-12-mer library,
-eight groups, per-group and global arms, against the monolithic run (10,213 peptides,
-6 h 36 min, 335 GB). It is running as this page is written and will be recorded here with
-the memory and time per group.
+### Real scale: AT10234AUH against the 8-12-mer library (2026-09-20/21)
+
+Measured with a zero-code harness on basilisk (EPYC 7H12, 2 TB) before this PR existed:
+`scripts`-level slicing of the library into 8 groups of 14-15 windows in m/z order (equal
+window counts, NOT precursor-balanced: 0 / 22.6M / 43.9M / 44.6M / 27.9M / 24.9M / 22.8M /
+16.8M precursors; the empty low-m/z group skipped), one `mumdia run` per group at 32 threads,
+4 groups at a time, then one pooled `rescore --competed` over the groups' competed tables.
+Reference: the monolithic calibrated run of the same file (`run812_ms1`, 128 threads):
+22,850,003 accepted PSMs, 11,271 precursors and 10,213 peptides at 1%, 6 h 24 min, 173 GB
+engine RSS.
+
+**Global calibration** (each group extracted with the monolithic run's RT windows, mass
+calibration and MS1, which is what `groups.calibration = global` does in the engine):
+
+| group | precursors | extract wall (32 thr) | extract RSS | accepted |
+|---|---|---|---|---|
+| g01 | 22.6M | 19.6 min | 68 GB | 2,600,526 |
+| g02 | 43.9M | 41.1 min | 94 GB | 5,845,126 |
+| g03 | 44.6M | 42.6 min | 96 GB | 5,517,121 |
+| g04 | 27.9M | 35.6 min | 80 GB | 4,647,444 |
+| g05 | 24.9M | 24.5 min | 63 GB | 3,195,039 |
+| g06 | 22.8M | 9.8 min | 42 GB | 913,969 |
+| g07 | 16.8M | 3.0 min | 22 GB | 130,778 |
+
+The seven extractions reproduce the monolithic one row for row: the same 22,850,003
+candidates in the same order with identical apex retention times (checked over the union of
+the group tables with ids mapped back). The pooled rescore over the seven competed tables
+(31.7 min at 40.6 GB) gave 11,271 precursors at 1%, the monolithic count exactly, and
+10,346 peptides at 1% against 10,213 (+1.3%; 9,627 shared, 586 only monolithic, 719 only
+grouped): the same PSMs and features in a different row order, so the classifier's folds and
+initial ranking differ within the seed spread. Wall clock for extract + features + compete +
+rescore: 107 min for the grouped arm (4 x 32 threads) against 329 min for the monolithic
+stages (128 threads); extract CPU summed over the groups 11.7 CPU-hours. The partition adds
+no measurable cost, and the independent 32-thread processes scale where the one 128-thread
+extract did not.
+
+**Per-group calibration** (each group seeded and calibrated on its own): three of seven
+groups (g01, g02, g07) had no confident seed on their own q scale, the `1/T` floor at real
+scale, and ran with an unbounded RT window at the configured 20 ppm instead of the learned
+9.5 ppm. g01 accepted 6,831,580 PSMs from 11% of the library and took 9.6 h at 560 GB, g07
+2:43 h at 159 GB for the smallest band, and g02 aborted after 6 h at 664 GB with
+`memory allocation ... failed` at the host's commit limit. The four calibrated groups had
+`w_rt` between 130 and 404 s (monolithic 286 s) and ran in 26-76 min at 36-79 GB. The pooled
+rescore over the six surviving groups gave 8,845 peptides at 1%, with g02's band missing
+entirely. This settles the default: `global`.
+
+What the numbers say about the group count: memory per group follows the accepted rows
+of the band (about 16-17 GB per million accepted PSMs here, plus a fixed part), not the
+precursor count, so precursor-balanced bands and more of them are the lever for a 100 GB
+desktop (8 equal-window groups peaked at 96 GB; a 12-group precursor-balanced plan is the
+next measurement), together with streaming extract's accepted rows to disk during the band.
+The pooled rescore (40.6 GB here for 22.85M PSMs) is the stage grouping does not bound; the
+compact feature preset is its lever.
 
 ## 9. What is not there yet
 
