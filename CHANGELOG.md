@@ -41,6 +41,18 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ## [Unreleased]
 
+### Changed
+
+- **Library writers emit fragment tables sorted by `candidate_id`.** `import_diann_lib.py`,
+  `make_reverse_decoys.py` and `make_shift_decoys.py` finish with a streaming bucket sort
+  (`_lib_io.sort_fragments_by_candidate`: partition by candidate-id range into temporary
+  files, sort each bucket in memory, append), so the parquet row-group statistics of
+  `candidate_id` are monotonic and the engine's range load can read one candidate range of
+  the table without scanning it (`Library::load_range_with`, the isolation-window-group
+  search). Stable, so each candidate's fragments keep their stored order; the engine never
+  depended on the previous order. `scripts/sort_fragments.py` applies the same rewrite to a
+  table written before this change; the engine still loads an unsorted table through a
+  filtered scan, with a warning.
 ### Added
 
 - **`groups.window_groups` searches a run one isolation-window group at a time.** The
@@ -84,10 +96,44 @@ than a number. Both are recorded in every run's `manifest.json`.
   can only select precursors in its band, so a run searched group by group never holds the
   rest of the library. `TableFile::row_group_stats` exposes the footer statistics for
   planning such reads.
+### Changed
+
+- **`mumdia doctor` and the interpreter resolver say what a missing DeepLC costs.** The
+  multi-head retention-time calibration is the default whenever a DeepLC interpreter is
+  configured or discovered (`predict_frag.deeplc_python` absent or `"auto"`: `MUMDIA_PYTHON_DEEPLC`,
+  `CONDA_PREFIX`, `VIRTUAL_ENV`, then `python3`/`python` on `PATH`), and a machine without one
+  runs on the imported iRT. The note printed in that case now names the calibration and its
+  measured value (+4.8% peptides on AIF, +14.3% on Astral) instead of only "keeps the imported
+  iRT", so the loss is visible where the decision is made.
+### Added
+
+- **Helpers for very large predicted libraries** and `docs/32_large_libraries.md`, from the
+  immunopeptidomics case study (59M and 203M precursors on one Astral run):
+  `scripts/mz_range_survivors.py` (candidates inside the run's isolation range),
+  `scripts/assemble_survivors.py` (survivors -> renumbered library, target/decoy pair kept
+  together on `peptidoform_id`), `scripts/shard_parquet.py` (row-group-aligned split and
+  concatenate) and `scripts/mh_shard_predict.py` (deduplicated, sharded multi-head DeepLC
+  calibration: 125.9M unique sequences in 42 minutes over 12 CPU shards instead of 6 hours in
+  one process). Measured yields and costs are in the document, including the seven-file
+  orchestrated first pass and the second pass from the union of first-pass identifications
+  (17,829 peptides pooled at 1%, 94-100% of DIA-NN's empirical-library second pass per file)
+  and a measurement of what the sequence-tag screen can and cannot prune on DIA
+  immunopeptidomics data, including the negative result for predicted-intensity-weighted
+  tags.
 
 
 ### Fixed
 
+- **`extract --restrict-candidates` now runs on the streaming path.** A candidate allowlist
+  routed extract to the serial path, whose whole-run hit accumulator ignores
+  `extract.windows_in_flight`, so a prescan-restricted extract had the memory profile of
+  the pre-streaming engine: measured on an immunopeptidomics library, 35M allowed
+  candidates took 2:08 h at a 325 GB peak, and 83M candidates aborted with
+  `memory allocation of 12288 bytes failed` at 471 GB on a host with a 1 TB commit limit.
+  The allowlist is now applied inside the streaming probe at the point the serial path
+  applies it, before the peak claim, so a listed candidate collects the same hits and an
+  unlisted one neither collects hits nor competes for a shared peak; the serial path is
+  unchanged and still serves the two-pass peak-claim strategies.
 - **`nn_torch` rescoring no longer aborts on a pool that is overwhelmingly false.** The
   worker picks its initial ranking feature on a 300k-row sample of the training fold and
   then requires at least one target at the training FDR. On an 8.07M-PSM immunopeptidomics
