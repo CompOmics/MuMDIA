@@ -105,6 +105,7 @@ pub struct ExtractParams<'a> {
 
 /// One observed hit: scan RT, candidate-local fragment index, observed intensity
 /// and observed m/z (for mass-accuracy features).
+#[cfg_attr(test, derive(Debug, PartialEq))]
 struct Hit {
     rt: f64,
     frag: u16,
@@ -755,14 +756,25 @@ fn accumulate_groups(
     // earlier window, so the merge order, and with it every candidate's hit sequence, is
     // exactly the serial one.
     let (tx, rx) = std::sync::mpsc::channel::<(usize, Vec<(u32, Vec<Hit>)>)>();
-    let probe = |gi: usize, g: &WinGroup| -> Vec<(u32, Vec<Hit>)> {
-        let _ = gi;
-        {
-            let ids = &g.scans;
-            let (lo, hi) = (g.lo_cid, g.hi_cid);
+    // A batch of `step` windows on `t` threads leaves `t - step` threads idle whenever the
+    // batch is smaller than the pool, which is what a `windows_in_flight` set low for memory
+    // does: measured at 4 in flight on 24 threads, 3.2-3.7 cores busy for the whole stage.
+    // So each window is also split across its CANDIDATE range. A candidate belongs to
+    // exactly one sub-range, so the sub-results are disjoint: they hold the window's hits
+    // once between them (no duplication of the accumulator, which is the stage's memory),
+    // they concatenate instead of merging per candidate, and each candidate's hits are still
+    // appended in ascending scan order, so every float reduction downstream is unchanged.
+    // Splitting the candidate axis rather than the scan axis is also where the work is: a
+    // peak's cost is dominated by walking its posting list, which the narrowed sub-range
+    // divides, while the peak loop itself is repeated per task.
+    let threads = rayon::current_num_threads().max(1);
+    let tasks_per_window = (threads * 2).div_ceil(groups.len().max(1)).max(1);
+    let probe = |_gi: usize, g: &WinGroup| -> Vec<(u32, Vec<Hit>)> {
+        let ids = &g.scans;
+        let probe_range = |lo: u32, hi: u32| -> Vec<(u32, Vec<Hit>)> {
             let mut local: HashMap<u32, Vec<Hit>> = HashMap::new();
             let mut claimants: Vec<(u32, u16, f32)> = Vec::new();
-            // `(lo, hi)` is fixed for this whole isolation window and every scan of it
+            // `(lo, hi)` is fixed for this whole sub-range and every scan of the window
             // reprobes the same bins, so cache each bin's narrowed posting range once
             // instead of binary-searching it per peak.
             let mut nw = idx.window_narrow(lo, hi);
@@ -840,7 +852,31 @@ fn accumulate_groups(
                 }
             }
             local.into_iter().collect()
+        };
+        let n_cand = (g.hi_cid - g.lo_cid) as usize;
+        let tasks = tasks_per_window
+            .min(n_cand.div_ceil(MIN_CANDIDATES_PER_TASK))
+            .max(1);
+        if tasks <= 1 {
+            return probe_range(g.lo_cid, g.hi_cid);
         }
+        let span = n_cand.div_ceil(tasks) as u32;
+        let ranges: Vec<(u32, u32)> = (0..tasks as u32)
+            .map(|i| {
+                (
+                    g.lo_cid + i * span,
+                    (g.lo_cid + (i + 1) * span).min(g.hi_cid),
+                )
+            })
+            .filter(|&(lo, hi)| hi > lo)
+            .collect();
+        ranges
+            .par_iter()
+            .map(|&(lo, hi)| probe_range(lo, hi))
+            .collect::<Vec<_>>()
+            .into_iter()
+            .flatten()
+            .collect()
     };
     let n = groups.len();
     // `move`: the receiver is Send but not Sync, so it has to be owned by the scope closure
@@ -886,12 +922,16 @@ fn accumulate_groups(
 /// Isolation windows probed before the driver flushes the candidates that are now final.
 /// Memory scales with this: the accumulator holds the hits of the windows in flight, so a
 /// batch of `n` windows of width `w` stepping `s` keeps about `n * s + w` Th of the
-/// precursor axis open. The batch is also the unit of accumulation parallelism, but that
-/// phase is a small part of the stage and is not compute-bound, so the default is capped at
-/// 16 rather than following the thread count. Measured on the HYE benchmark at 32 threads
-/// (docs/27 section 3.10): 32 in flight 24.65 GiB / 5:00, 16 in flight 16.57 GiB / 5:04,
-/// 8 in flight 12.31 GiB / 5:26, identical output throughout.
+/// precursor axis open. It is no longer the unit of parallelism: each window is probed in
+/// parallel over sub-ranges of its candidates (`accumulate_groups`), so a small batch keeps
+/// every thread busy without holding more of the precursor axis open. Measured on the HYE benchmark at 32 threads before that change (docs/27 section
+/// 3.10): 32 in flight 24.65 GiB / 5:00, 16 in flight 16.57 GiB / 5:04, 8 in flight
+/// 12.31 GiB / 5:26, identical output throughout.
 const DEFAULT_MAX_WINDOWS_IN_FLIGHT: usize = 16;
+
+/// Fewest candidates a probing task takes: below this the per-task narrowed bin cache (one
+/// entry per fragment bin) costs more than the posting-list work it divides.
+const MIN_CANDIDATES_PER_TASK: usize = 4096;
 
 fn groups_in_flight(cfg: &ExtractConfig) -> usize {
     cfg.windows_in_flight
@@ -3024,5 +3064,174 @@ mod coelution_tests {
             s > 0.99,
             "peak integration should recover the off-apex fragment, got {s}"
         );
+    }
+}
+
+#[cfg(test)]
+mod accumulate_tests {
+    use super::*;
+    use crate::index::{Candidate, Library};
+    use mumdia_core::types::{IsolationWindow, Ms2Scan, Peak};
+
+    /// `n` candidates in one isolation window, each with two fragments, m/z ascending.
+    fn lib(n: usize) -> Library {
+        let mut frag_mz = Vec::with_capacity(2 * n);
+        let mut frag_int = Vec::with_capacity(2 * n);
+        let mut frag_name_id = Vec::with_capacity(2 * n);
+        let mut cands = Vec::with_capacity(n);
+        let mut prec_mz = Vec::with_capacity(n);
+        for i in 0..n {
+            let start = frag_mz.len();
+            // Fragments are shared across candidates on purpose (300.0 + i % 97 * 1.37),
+            // so a peak has many claimants and the sub-ranges all see work.
+            for k in 0..2 {
+                frag_mz.push((300.0 + ((i + 13 * k) % 97) as f64 * 1.37) as f32);
+                frag_int.push(0.5 + 0.1 * k as f32);
+                frag_name_id.push(k as u16);
+            }
+            let pmz = 400.0 + i as f64 * 1e-3;
+            cands.push(Candidate {
+                candidate_id: i as u32,
+                peptidoform_id: i as u32,
+                base_peptide_id: i as u32,
+                peptidoform: String::new(),
+                charge: 2,
+                precursor_mz: pmz,
+                predicted_irt: 0.0,
+                is_decoy: false,
+                protein: String::new(),
+                frag_start: start,
+                n_frag: 2,
+            });
+            prec_mz.push(pmz);
+        }
+        Library {
+            cands,
+            frag_mz,
+            frag_int,
+            frag_name_id,
+            frag_name_dict: vec!["b".to_string(), "y".to_string()],
+            idx_mz: Vec::new(),
+            idx_cid: Vec::new(),
+            idx_int: Vec::new(),
+            bucket_min: Vec::new(),
+            bucket_size: 1,
+            prec_mz,
+            global_offset: 0,
+        }
+    }
+
+    fn scans(n_scans: usize, window: IsolationWindow, base: usize) -> Vec<Ms2Scan> {
+        (0..n_scans)
+            .map(|si| Ms2Scan {
+                scan_index: (base + si) as u32,
+                id: format!("s{}", base + si),
+                rt_seconds: 100.0 + (base + si) as f64,
+                window,
+                peaks: (0..97)
+                    .map(|k| Peak {
+                        mz: 300.0 + k as f64 * 1.37,
+                        intensity: 10.0 + (si + k) as f32,
+                        ion_mobility: None,
+                    })
+                    .collect(),
+            })
+            .collect()
+    }
+
+    /// The candidate-range split inside a window is a partition, so the accumulator it
+    /// produces must not depend on how many sub-ranges ran: same candidates, same hits, and
+    /// the same order within each candidate, which is what keeps every downstream float
+    /// reduction identical.
+    ///
+    /// The number of sub-ranges per window is `2 * threads / windows`, capped by the band's
+    /// candidate count, so four windows on a two-thread pool probe each window whole (the
+    /// pre-change behaviour) and on a sixteen-thread pool split each into three. Note the
+    /// pool must have at least two threads here: `accumulate_groups` spawns its producer
+    /// into the pool and consumes on the calling thread, and under `install` that calling
+    /// thread is one of the pool's own. The engine calls it from the main thread, which is
+    /// never a pool worker (`build_global`), so a one-thread engine is unaffected.
+    #[test]
+    fn candidate_range_split_reproduces_the_unsplit_accumulation() {
+        let per_window = 3 * MIN_CANDIDATES_PER_TASK;
+        let n = 4 * per_window;
+        let lib = lib(n);
+        let idx = FragIndex::build(&lib, 20.0);
+        let windows: Vec<IsolationWindow> = (0..4)
+            .map(|w| {
+                let lo = 400.0 + (w * per_window) as f64 * 1e-3;
+                IsolationWindow {
+                    target_mz: lo,
+                    lower_mz: lo - 1e-9,
+                    upper_mz: lo + (per_window - 1) as f64 * 1e-3 + 1e-9,
+                    im_lower: None,
+                    im_upper: None,
+                }
+            })
+            .collect();
+        let mut sc: Vec<Ms2Scan> = Vec::new();
+        for w in &windows {
+            sc.extend(scans(3, *w, sc.len()));
+        }
+        let groups: Vec<WinGroup> = windows
+            .iter()
+            .enumerate()
+            .map(|(wi, w)| {
+                let (lo, hi) = idx.candidate_range(w.lower_mz, w.upper_mz);
+                assert_eq!(
+                    (hi - lo) as usize,
+                    per_window,
+                    "window {wi} must select its own candidates only"
+                );
+                WinGroup {
+                    lo_cid: lo,
+                    hi_cid: hi,
+                    scans: (wi * 3..wi * 3 + 3).collect(),
+                }
+            })
+            .collect();
+        let rt_lo = vec![0.0; n];
+        let rt_hi = vec![1e9; n];
+        let mass_off = MassOffset {
+            scalar_ppm: 0.0,
+            grid_mz: Vec::new(),
+            grid_ppm: Vec::new(),
+        };
+        let cfg = ExtractConfig::default();
+        let run = |threads: usize| -> HashMap<u32, Vec<Hit>> {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .expect("thread pool");
+            let mut acc: HashMap<u32, Vec<Hit>> = HashMap::new();
+            pool.install(|| {
+                accumulate_groups(
+                    &idx, &groups, &sc, &rt_lo, &rt_hi, &mass_off, &cfg, None, &mut acc,
+                )
+            });
+            acc
+        };
+        // Two threads: 2 * 2 / 4 windows = one sub-range per window, the unsplit path.
+        let unsplit = run(2);
+        assert!(!unsplit.is_empty(), "the fixture must produce hits");
+        assert!(
+            unsplit.values().any(|v| v.len() > 1),
+            "candidates must collect several hits, or hit order proves nothing"
+        );
+        for threads in [8, 16] {
+            let split = run(threads);
+            assert_eq!(
+                split.len(),
+                unsplit.len(),
+                "{threads} threads: candidate count"
+            );
+            for (cid, hits) in &unsplit {
+                assert_eq!(
+                    split.get(cid),
+                    Some(hits),
+                    "{threads} threads: candidate {cid} hits differ"
+                );
+            }
+        }
     }
 }
