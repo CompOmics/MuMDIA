@@ -24,6 +24,12 @@ pub struct RtImTrainParams<'a> {
     pub out_cal: &'a str,
     pub cfg: &'a RtImTrainConfig,
     pub config_hash: &'a str,
+    /// Take each anchor's predicted iRT from the seed table's own `predicted_irt` column
+    /// instead of joining the library by `candidate_id`. For a pooled seed of a grouped
+    /// run: its ids are library-wide while the band's table is local, and the pooling step
+    /// has refreshed the column from the re-predicted band libraries, so the seed is the
+    /// source of truth there. Off, anchors outside the library are dropped silently.
+    pub anchor_irt_from_seed: bool,
 }
 
 const INSUFFICIENT_ANCHORS_STATUS: &str = "insufficient_anchors_unbounded";
@@ -151,6 +157,11 @@ pub fn run(p: RtImTrainParams) -> Result<u64> {
     let s_score = seed.f64("score")?;
     let s_rt = seed.f64("observed_rt")?;
     let s_label = seed.str("label")?;
+    let s_irt: Option<Vec<f32>> = if p.anchor_irt_from_seed {
+        Some(seed.f32("predicted_irt")?)
+    } else {
+        None
+    };
 
     let mut best_per_pep: HashMap<u32, (f64, f64, f64)> = HashMap::new(); // base -> (score, irt, rt)
     for i in 0..seed.nrows {
@@ -166,10 +177,19 @@ pub fn run(p: RtImTrainParams) -> Result<u64> {
         if s_label[i] != "target" {
             continue;
         }
-        let irt = match irt_by_cid.get(&s_cid[i]) {
-            Some(v) if v.is_finite() => *v,
-            None => continue,
-            Some(_) => continue,
+        let irt = match &s_irt {
+            Some(col) => {
+                let v = col[i] as f64;
+                if !v.is_finite() {
+                    continue;
+                }
+                v
+            }
+            None => match irt_by_cid.get(&s_cid[i]) {
+                Some(v) if v.is_finite() => *v,
+                None => continue,
+                Some(_) => continue,
+            },
         };
         let e = best_per_pep
             .entry(s_base[i])

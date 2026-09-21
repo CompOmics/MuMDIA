@@ -32,6 +32,11 @@ pub struct SearchSeedParams<'a> {
     pub cfg: &'a SearchSeedConfig,
     pub bucket_size: usize,
     pub config_hash: &'a str,
+    /// The precursor table is one isolation-window group's band, written with local ids
+    /// `0..n` (`groups.window_groups`), and its fragments sit in the library-wide fragment
+    /// table at ids `offset..offset + n`. The seed table is then in band-local ids. `None`
+    /// is the ordinary whole-library search.
+    pub fragment_offset: Option<u32>,
 }
 
 #[derive(Clone)]
@@ -57,12 +62,21 @@ pub fn run(p: SearchSeedParams) -> Result<u64> {
     )?;
     // See extract: the bucketed index is dead weight on the fragindex path.
     let build_bucketed = !matches!(p.cfg.matcher, MatcherKind::Fragindex);
-    let lib = Library::load_with(
-        p.library_precursors,
-        p.library_fragments,
-        p.bucket_size,
-        build_bucketed,
-    )?;
+    let lib = match p.fragment_offset {
+        None => Library::load_with(
+            p.library_precursors,
+            p.library_fragments,
+            p.bucket_size,
+            build_bucketed,
+        )?,
+        Some(offset) => Library::load_with_fragment_offset(
+            p.library_precursors,
+            p.library_fragments,
+            offset,
+            p.bucket_size,
+            build_bucketed,
+        )?,
+    };
     let scans = load_ms2(p.ms2)?;
     info!(
         candidates = lib.n_candidates(),

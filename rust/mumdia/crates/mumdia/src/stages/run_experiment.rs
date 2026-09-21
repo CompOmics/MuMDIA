@@ -77,6 +77,14 @@ fn preflight(p: &RunExperimentParams) -> Result<()> {
     if cfg.rt_im_train.finetune_deeplc && cfg.predict_frag.deeplc_python.is_none() {
         anyhow::bail!("rt_im_train.finetune_deeplc requires predict_frag.deeplc_python");
     }
+    // The grouped search lives in the single-run orchestrator for now; refusing here beats
+    // reading the key and searching every run against the whole library anyway.
+    if cfg.groups.window_groups > 1 {
+        anyhow::bail!(
+            "groups.window_groups = {} is not supported by run-experiment yet: run each file              with `mumdia run --mzml <one file>` (which searches it group by group) and pool              the competed tables with `mumdia rescore --competed a b c`",
+            cfg.groups.window_groups
+        );
+    }
     // Explicit count: hard requirement. Automatic default: degrade with a warning, so a
     // native Python-free experiment stays runnable (`run.rs` says the same).
     if cfg.rt_im_train.multihead_calibration.is_some_and(|n| n > 0)
@@ -197,6 +205,7 @@ fn process_run(
     })?;
     let seed = d("seed_psms.parquet");
     search_seed::run(search_seed::SearchSeedParams {
+        fragment_offset: None,
         ms2: &co.ms2,
         library_precursors: lib_p_base,
         library_fragments: lib_f,
@@ -278,6 +287,7 @@ fn process_run(
     };
     let windows = d("run_windows.parquet");
     rt_im_train::run(rt_im_train::RtImTrainParams {
+        anchor_irt_from_seed: false,
         seed_psms: &seed,
         library_precursors: &lib_p,
         out_windows: &windows,
@@ -288,6 +298,7 @@ fn process_run(
     let psms = d("psms_extracted.parquet");
     let chrom = d("chromatograms.parquet");
     extract::run(extract::ExtractParams {
+        fragment_offset: None,
         ms2: &co.ms2,
         library_precursors: &lib_p,
         library_fragments: lib_f,

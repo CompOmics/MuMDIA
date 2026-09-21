@@ -4,6 +4,7 @@
 
 pub mod calibrate;
 pub mod fdr;
+pub mod groups;
 pub mod index;
 pub mod matchers;
 pub mod memlog;
