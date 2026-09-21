@@ -642,7 +642,7 @@ const CHROM_BATCH_ROWS: usize = 1 << 12;
 /// Interned fragment names. A chromatogram table has tens of millions of rows but only
 /// a few dozen distinct names (`y1`..`y30`, `b1`.., `ms1_mono`..), so rows carry a name
 /// id and each string is stored once.
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct NameTab {
     ids: HashMap<String, u32>,
     names: Vec<String>,
@@ -1422,223 +1422,260 @@ pub fn run_with_chunk_rows(p: FeaturesParams, chunk_rows: usize) -> Result<u64> 
         );
         None
     };
-    let mut stream = ChromStream::open(&ch, p.chromatograms)?;
-    let mut names = NameTab::default();
     // Accounting for the audit (docs/27): the largest chunk in flight against the run
     // total streamed is exactly the quantity chunking changes.
     let (mut max_frag_bytes, mut max_ms1_bytes, mut max_matrix_bytes) = (0usize, 0usize, 0usize);
     let (mut tot_frag_bytes, mut tot_ms1_bytes) = (0usize, 0usize);
     let (mut n_cand, mut n_frag_rows, mut n_ms1_rows) = (0usize, 0usize, 0usize);
 
-    for chunk in &chunks {
-        let store = stream.read_chunk(chunk.chrom_rows, &mut names)?;
-        let (lo, hi) = (chunk.psm_lo, chunk.psm_hi);
-        let rows_in_chunk = hi - lo;
-        let (fb, mb) = store.payload_bytes();
-        max_frag_bytes = max_frag_bytes.max(fb);
-        max_ms1_bytes = max_ms1_bytes.max(mb);
-        tot_frag_bytes += fb;
-        tot_ms1_bytes += mb;
-        n_cand += store.cids.len();
-        n_frag_rows += store.frag.nrows();
-        n_ms1_rows += store.ms1.nrows();
+    // The chunk decode is single-threaded parquet work and it ran in series with the
+    // feature computation, which is what left a 24-thread features process at 1.6-2.8 cores
+    // (measured on the 8-12-mer immunopeptidomics run: 3.7 of a 4-minute stage were the
+    // load). The loader now runs on its own thread, one chunk ahead of the computation, so
+    // decode and compute overlap; at most two chunks are resident. Each chunk travels with a
+    // snapshot of the fragment-name table as it stood when the chunk was read, which is
+    // exactly what the serial code saw at that point.
+    let chunk_rows: Vec<usize> = chunks.iter().map(|c| c.chrom_rows).collect();
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Result<(ChromChunk, NameTab)>>(1);
+    let ch_ref = &ch;
+    let chrom_path = p.chromatograms;
+    std::thread::scope(|sc| -> Result<()> {
+        sc.spawn(move || {
+            let mut stream = match ChromStream::open(ch_ref, chrom_path) {
+                Ok(s) => s,
+                Err(e) => {
+                    let _ = tx.send(Err(e));
+                    return;
+                }
+            };
+            let mut names = NameTab::default();
+            for want in chunk_rows {
+                let r = stream
+                    .read_chunk(want, &mut names)
+                    .map(|store| (store, names.clone()));
+                let failed = r.is_err();
+                if tx.send(r).is_err() || failed {
+                    return;
+                }
+            }
+        });
+        for chunk in &chunks {
+            let (store, names) = rx.recv().map_err(|_| {
+                anyhow!(
+                    "features: the chromatogram loader stopped before chunk {}..{}",
+                    chunk.psm_lo,
+                    chunk.psm_hi
+                )
+            })??;
+            let (lo, hi) = (chunk.psm_lo, chunk.psm_hi);
+            let rows_in_chunk = hi - lo;
+            let (fb, mb) = store.payload_bytes();
+            max_frag_bytes = max_frag_bytes.max(fb);
+            max_ms1_bytes = max_ms1_bytes.max(mb);
+            tot_frag_bytes += fb;
+            tot_ms1_bytes += mb;
+            n_cand += store.cids.len();
+            n_frag_rows += store.frag.nrows();
+            n_ms1_rows += store.ms1.nrows();
 
-        let per: Vec<PerPsm> = (lo..hi)
-            .into_par_iter()
-            .map(|i| {
-                let ci = store.index.get(&cid[i]).copied();
-                let rows = ci
-                    .map(|c| store.rows(&store.frag, c, &names))
-                    .unwrap_or_default();
-                let ff = if rows.is_empty() {
-                    FragFeatures::default()
-                } else {
-                    fragment_features(
-                        &rows,
-                        apex_rt[i],
-                        p.cfg.coelution_corr_threshold,
-                        p.cfg.bound_features,
-                        p.cfg.bound_peak_fraction,
-                        p.cfg.bound_peak_grace,
-                        global_bounds,
-                    )
-                };
-                let ext = if extended {
-                    if rows.is_empty() {
-                        vec![0.0; ext_names.len()]
+            let per: Vec<PerPsm> = (lo..hi)
+                .into_par_iter()
+                .map(|i| {
+                    let ci = store.index.get(&cid[i]).copied();
+                    let rows = ci
+                        .map(|c| store.rows(&store.frag, c, &names))
+                        .unwrap_or_default();
+                    let ff = if rows.is_empty() {
+                        FragFeatures::default()
                     } else {
-                        let ms1_rows = ci
-                            .map(|c| store.rows(&store.ms1, c, &names))
-                            .unwrap_or_default();
-                        let mut ev = build_evidence(
+                        fragment_features(
                             &rows,
-                            &ms1_rows,
                             apex_rt[i],
+                            p.cfg.coelution_corr_threshold,
+                            p.cfg.bound_features,
                             p.cfg.bound_peak_fraction,
                             p.cfg.bound_peak_grace,
                             global_bounds,
-                        );
-                        ev.rt_pred_cal = rt_cal[i];
-                        ev.rt_err = calibrated_rt_error(apex_rt[i], rt_cal[i]);
-                        ev.gradient = gradient;
-                        ev.precursor_mz = mz[i];
-                        ev.charge = charge[i];
-                        ev.seq_len = peptide_length(&pform[i]);
-                        ev.n_matched = n_matched[i];
-                        ev.n_predicted = n_pred[i];
-                        ev.seed_score = *seed_score_map.get(&cid[i]).unwrap_or(&0.0);
-                        ev.seed_identified = *seed_id_map.get(&cid[i]).unwrap_or(&0.0);
-                        ev.apex_intensity = apex_int[i] as f64;
-                        ev.ms1_mono = ms1_mono[i];
-                        ev.ms1_iso1 = ms1_i1[i];
-                        ev.ms1_iso2 = ms1_i2[i];
-                        ev.ms1_isom1 = ms1_m1[i];
-                        ev.ms1_precursor_features = p.cfg.ms1_precursor_features;
-                        ev.deconv_explained = deconv_expl[i] as f64;
-                        ev.deconv_active = deconv_act[i] as f64;
-                        ev.deconv_share = deconv_shr[i] as f64;
-                        ev.deconv_max_collin = deconv_col[i] as f64;
-                        ev.deconv_shadow = deconv_sha[i] as f64;
-                        extended_values(&ev)
+                        )
+                    };
+                    let ext = if extended {
+                        if rows.is_empty() {
+                            vec![0.0; ext_names.len()]
+                        } else {
+                            let ms1_rows = ci
+                                .map(|c| store.rows(&store.ms1, c, &names))
+                                .unwrap_or_default();
+                            let mut ev = build_evidence(
+                                &rows,
+                                &ms1_rows,
+                                apex_rt[i],
+                                p.cfg.bound_peak_fraction,
+                                p.cfg.bound_peak_grace,
+                                global_bounds,
+                            );
+                            ev.rt_pred_cal = rt_cal[i];
+                            ev.rt_err = calibrated_rt_error(apex_rt[i], rt_cal[i]);
+                            ev.gradient = gradient;
+                            ev.precursor_mz = mz[i];
+                            ev.charge = charge[i];
+                            ev.seq_len = peptide_length(&pform[i]);
+                            ev.n_matched = n_matched[i];
+                            ev.n_predicted = n_pred[i];
+                            ev.seed_score = *seed_score_map.get(&cid[i]).unwrap_or(&0.0);
+                            ev.seed_identified = *seed_id_map.get(&cid[i]).unwrap_or(&0.0);
+                            ev.apex_intensity = apex_int[i] as f64;
+                            ev.ms1_mono = ms1_mono[i];
+                            ev.ms1_iso1 = ms1_i1[i];
+                            ev.ms1_iso2 = ms1_i2[i];
+                            ev.ms1_isom1 = ms1_m1[i];
+                            ev.ms1_precursor_features = p.cfg.ms1_precursor_features;
+                            ev.deconv_explained = deconv_expl[i] as f64;
+                            ev.deconv_active = deconv_act[i] as f64;
+                            ev.deconv_share = deconv_shr[i] as f64;
+                            ev.deconv_max_collin = deconv_col[i] as f64;
+                            ev.deconv_shadow = deconv_sha[i] as f64;
+                            extended_values(&ev)
+                        }
+                    } else {
+                        Vec::new()
+                    };
+                    PerPsm { ff, ext }
+                })
+                .collect();
+
+            let mut m = ValueMatrix::new(&cols_active, rows_in_chunk);
+            let mut prelim = vec![0.0f64; rows_in_chunk];
+            let mut elu_lo = vec![0.0f64; rows_in_chunk];
+            let mut elu_hi = vec![0.0f64; rows_in_chunk];
+            for (r, i) in (lo..hi).enumerate() {
+                let ff = &per[r].ff;
+                elu_lo[r] = ff.elution_lo;
+                elu_hi[r] = ff.elution_hi;
+                let rt_err = calibrated_rt_error(apex_rt[i], rt_cal[i]);
+                // MS1 isotope features.
+                let neutral = mz[i] * charge[i] as f64 - charge[i] as f64 * PROTON;
+                let (iso_corr, isom1_ratio, log_mono, has_ms1) =
+                    isotope_features(ms1_m1[i], ms1_mono[i], ms1_i1[i], ms1_i2[i], neutral);
+
+                m.set("rt_error_abs", r, rt_err);
+                m.set("rt_error_rel", r, rt_err / gradient);
+                m.set("n_matched_fragments", r, n_matched[i] as f64);
+                m.set("coelution_run", r, corun[i] as f64);
+                m.set("log_apex_intensity", r, (1.0 + apex_int[i] as f64).ln());
+                m.set("frag_corr", r, ff.frag_corr);
+                m.set("frag_cosine", r, ff.frag_cosine);
+                m.set("spectral_angle", r, ff.spectral_angle);
+                m.set("coelution_mean", r, ff.coelution_mean);
+                m.set("coelution_best", r, ff.coelution_best);
+                m.set("n_coelution_above", r, ff.n_coelution_above);
+                m.set("charge", r, charge[i] as f64);
+                m.set("peptide_length", r, peptide_length(&pform[i]) as f64);
+                m.set(
+                    "n_proteins",
+                    r,
+                    (protein[i].matches(';').count() + 1) as f64,
+                );
+                m.set("library_norm_manhattan", r, ff.norm_manhattan);
+                m.set("library_rmsd", r, ff.rmsd);
+                m.set("xcorr_coelution", r, ff.xcorr_coelution);
+                m.set("xcorr_shape", r, ff.xcorr_shape);
+                m.set("sum_b_intensity", r, ff.sum_b);
+                m.set("sum_y_intensity", r, ff.sum_y);
+                m.set("diff_by_intensity", r, ff.sum_b - ff.sum_y);
+                m.set("n_b_ions", r, ff.n_b);
+                m.set("n_y_ions", r, ff.n_y);
+                m.set("weighted_mass_error", r, ff.weighted_mass_error);
+                m.set("mean_mass_error", r, ff.mean_mass_error);
+                m.set("isotope_corr", r, iso_corr);
+                m.set("ms1_isom1_ratio", r, isom1_ratio);
+                m.set("log_mono_ms1", r, log_mono);
+                m.set("has_ms1", r, has_ms1);
+                m.set("log_sn", r, ff.log_sn);
+                m.set("n_observations", r, ff.n_observations);
+                m.set("base_width_rt", r, ff.base_width_rt);
+                m.set(
+                    "seed_score",
+                    r,
+                    *seed_score_map.get(&cid[i]).unwrap_or(&0.0),
+                );
+                m.set(
+                    "seed_identified",
+                    r,
+                    *seed_id_map.get(&cid[i]).unwrap_or(&0.0),
+                );
+                m.set(
+                    "matched_fraction",
+                    r,
+                    n_matched[i] as f64 / (n_pred[i].max(1) as f64),
+                );
+                m.set("profile_cos", r, ff.profile_cos);
+                m.set("ref_corr", r, ff.ref_corr);
+                m.set("best_ref_corr", r, ff.best_ref_corr);
+                m.set("low_frag_coel", r, ff.low_frag_coel);
+                m.set("evidence", r, ff.evidence);
+                m.set("contrast_min", r, ff.contrast_min);
+                m.set("resid_corr", r, ff.resid_corr);
+                m.set("coel_clean", r, ff.coel_clean);
+                m.set("shadow_frac", r, ff.shadow_frac);
+                m.set("peak_contested_frac", r, contested[i]);
+                m.set("peak_contested_count_frac", r, contested_count[i]);
+                m.set("peak_apportioned_frac", r, apportioned[i]);
+
+                // Extended battery (opt-in). Built once per PSM above and fanned out to the
+                // family modules; pushed here under the fixed registry-order names.
+                if extended {
+                    for (k, v) in ext_names.iter().zip(&per[r].ext) {
+                        m.set(k, r, *v);
                     }
-                } else {
-                    Vec::new()
-                };
-                PerPsm { ff, ext }
-            })
-            .collect();
-
-        let mut m = ValueMatrix::new(&cols_active, rows_in_chunk);
-        let mut prelim = vec![0.0f64; rows_in_chunk];
-        let mut elu_lo = vec![0.0f64; rows_in_chunk];
-        let mut elu_hi = vec![0.0f64; rows_in_chunk];
-        for (r, i) in (lo..hi).enumerate() {
-            let ff = &per[r].ff;
-            elu_lo[r] = ff.elution_lo;
-            elu_hi[r] = ff.elution_hi;
-            let rt_err = calibrated_rt_error(apex_rt[i], rt_cal[i]);
-            // MS1 isotope features.
-            let neutral = mz[i] * charge[i] as f64 - charge[i] as f64 * PROTON;
-            let (iso_corr, isom1_ratio, log_mono, has_ms1) =
-                isotope_features(ms1_m1[i], ms1_mono[i], ms1_i1[i], ms1_i2[i], neutral);
-
-            m.set("rt_error_abs", r, rt_err);
-            m.set("rt_error_rel", r, rt_err / gradient);
-            m.set("n_matched_fragments", r, n_matched[i] as f64);
-            m.set("coelution_run", r, corun[i] as f64);
-            m.set("log_apex_intensity", r, (1.0 + apex_int[i] as f64).ln());
-            m.set("frag_corr", r, ff.frag_corr);
-            m.set("frag_cosine", r, ff.frag_cosine);
-            m.set("spectral_angle", r, ff.spectral_angle);
-            m.set("coelution_mean", r, ff.coelution_mean);
-            m.set("coelution_best", r, ff.coelution_best);
-            m.set("n_coelution_above", r, ff.n_coelution_above);
-            m.set("charge", r, charge[i] as f64);
-            m.set("peptide_length", r, peptide_length(&pform[i]) as f64);
-            m.set(
-                "n_proteins",
-                r,
-                (protein[i].matches(';').count() + 1) as f64,
-            );
-            m.set("library_norm_manhattan", r, ff.norm_manhattan);
-            m.set("library_rmsd", r, ff.rmsd);
-            m.set("xcorr_coelution", r, ff.xcorr_coelution);
-            m.set("xcorr_shape", r, ff.xcorr_shape);
-            m.set("sum_b_intensity", r, ff.sum_b);
-            m.set("sum_y_intensity", r, ff.sum_y);
-            m.set("diff_by_intensity", r, ff.sum_b - ff.sum_y);
-            m.set("n_b_ions", r, ff.n_b);
-            m.set("n_y_ions", r, ff.n_y);
-            m.set("weighted_mass_error", r, ff.weighted_mass_error);
-            m.set("mean_mass_error", r, ff.mean_mass_error);
-            m.set("isotope_corr", r, iso_corr);
-            m.set("ms1_isom1_ratio", r, isom1_ratio);
-            m.set("log_mono_ms1", r, log_mono);
-            m.set("has_ms1", r, has_ms1);
-            m.set("log_sn", r, ff.log_sn);
-            m.set("n_observations", r, ff.n_observations);
-            m.set("base_width_rt", r, ff.base_width_rt);
-            m.set(
-                "seed_score",
-                r,
-                *seed_score_map.get(&cid[i]).unwrap_or(&0.0),
-            );
-            m.set(
-                "seed_identified",
-                r,
-                *seed_id_map.get(&cid[i]).unwrap_or(&0.0),
-            );
-            m.set(
-                "matched_fraction",
-                r,
-                n_matched[i] as f64 / (n_pred[i].max(1) as f64),
-            );
-            m.set("profile_cos", r, ff.profile_cos);
-            m.set("ref_corr", r, ff.ref_corr);
-            m.set("best_ref_corr", r, ff.best_ref_corr);
-            m.set("low_frag_coel", r, ff.low_frag_coel);
-            m.set("evidence", r, ff.evidence);
-            m.set("contrast_min", r, ff.contrast_min);
-            m.set("resid_corr", r, ff.resid_corr);
-            m.set("coel_clean", r, ff.coel_clean);
-            m.set("shadow_frac", r, ff.shadow_frac);
-            m.set("peak_contested_frac", r, contested[i]);
-            m.set("peak_contested_count_frac", r, contested_count[i]);
-            m.set("peak_apportioned_frac", r, apportioned[i]);
-
-            // Extended battery (opt-in). Built once per PSM above and fanned out to the
-            // family modules; pushed here under the fixed registry-order names.
-            if extended {
-                for (k, v) in ext_names.iter().zip(&per[r].ext) {
-                    m.set(k, r, *v);
                 }
+
+                // Cross-charge corroboration features (whole-run reductions, indexed by row).
+                m.set("n_charge_states", r, f_n_charge[i]);
+                m.set("charge_multi_flag", r, f_charge_multi[i]);
+                m.set("cross_charge_intensity_log", r, f_cross_charge_int[i]);
+
+                prelim[r] = n_matched[i] as f64 * (0.5 + ff.frag_corr.max(0.0))
+                    + ff.coelution_mean.max(0.0)
+                    + (1.0 + apex_int[i] as f64).ln() * 0.1
+                    - rt_err / gradient;
+            }
+            drop(per);
+            max_matrix_bytes = max_matrix_bytes.max(m.payload_bytes());
+
+            // PIN first: it reads the same values the columns below move into Arrow.
+            if let Some(w) = pin.as_mut() {
+                w.write_chunk(
+                    cols_active.len(),
+                    &m,
+                    &cid[lo..hi],
+                    &label[lo..hi],
+                    &pform[lo..hi],
+                    &protein[lo..hi],
+                    &mz[lo..hi],
+                )?;
             }
 
-            // Cross-charge corroboration features (whole-run reductions, indexed by row).
-            m.set("n_charge_states", r, f_n_charge[i]);
-            m.set("charge_multi_flag", r, f_charge_multi[i]);
-            m.set("cross_charge_intensity_log", r, f_cross_charge_int[i]);
-
-            prelim[r] = n_matched[i] as f64 * (0.5 + ff.frag_corr.max(0.0))
-                + ff.coelution_mean.max(0.0)
-                + (1.0 + apex_int[i] as f64).ln() * 0.1
-                - rt_err / gradient;
+            let mut cols: Vec<Col> = vec![
+                Col::U32("candidate_id".into(), cid[lo..hi].to_vec()),
+                Col::I32("peak_rank".into(), peak_rank[lo..hi].to_vec()),
+                Col::Str("label".into(), label[lo..hi].to_vec()),
+                Col::U32("base_peptide_id".into(), base[lo..hi].to_vec()),
+                Col::Str("peptidoform".into(), pform[lo..hi].to_vec()),
+                Col::Str("protein".into(), protein[lo..hi].to_vec()),
+                Col::F64("apex_rt".into(), apex_rt[lo..hi].to_vec()),
+                Col::F64("elution_lo".into(), elu_lo),
+                Col::F64("elution_hi".into(), elu_hi),
+                Col::F64("precursor_mz".into(), mz[lo..hi].to_vec()),
+                Col::F64("prelim_score".into(), prelim),
+            ];
+            for (c, name) in cols_active.iter().enumerate() {
+                cols.push(Col::F64(name.clone(), m.column(c).to_vec()));
+            }
+            drop(m);
+            writer.write_cols(cols)?;
         }
-        drop(per);
-        max_matrix_bytes = max_matrix_bytes.max(m.payload_bytes());
-
-        // PIN first: it reads the same values the columns below move into Arrow.
-        if let Some(w) = pin.as_mut() {
-            w.write_chunk(
-                cols_active.len(),
-                &m,
-                &cid[lo..hi],
-                &label[lo..hi],
-                &pform[lo..hi],
-                &protein[lo..hi],
-                &mz[lo..hi],
-            )?;
-        }
-
-        let mut cols: Vec<Col> = vec![
-            Col::U32("candidate_id".into(), cid[lo..hi].to_vec()),
-            Col::I32("peak_rank".into(), peak_rank[lo..hi].to_vec()),
-            Col::Str("label".into(), label[lo..hi].to_vec()),
-            Col::U32("base_peptide_id".into(), base[lo..hi].to_vec()),
-            Col::Str("peptidoform".into(), pform[lo..hi].to_vec()),
-            Col::Str("protein".into(), protein[lo..hi].to_vec()),
-            Col::F64("apex_rt".into(), apex_rt[lo..hi].to_vec()),
-            Col::F64("elution_lo".into(), elu_lo),
-            Col::F64("elution_hi".into(), elu_hi),
-            Col::F64("precursor_mz".into(), mz[lo..hi].to_vec()),
-            Col::F64("prelim_score".into(), prelim),
-        ];
-        for (c, name) in cols_active.iter().enumerate() {
-            cols.push(Col::F64(name.clone(), m.column(c).to_vec()));
-        }
-        drop(m);
-        writer.write_cols(cols)?;
-    }
+        Ok(())
+    })?;
     if let Some(w) = pin {
         w.finish()?;
     }
