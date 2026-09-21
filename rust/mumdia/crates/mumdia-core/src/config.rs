@@ -819,10 +819,16 @@ pub struct ExtractConfig {
     /// Isolation windows probed per batch before the candidates no later window can touch
     /// are scored and written. `None` (the default) uses the rayon thread count capped at
     /// 16. The hit accumulator holds the windows in flight, so this sets the stage's peak
-    /// almost linearly, while the accumulation phase it parallelises is a small part of the
-    /// wall clock: on the HYE benchmark at 32 threads, 32 in flight is 24.65 GiB / 5:00, 16
-    /// is 16.57 GiB / 5:04 and 8 is 12.31 GiB / 5:26, with identical output (docs/27 section
-    /// 3.10). Set 8 or 4 on a memory-bound machine. Not a sensitivity knob.
+    /// almost linearly: on the HYE benchmark at 32 threads, 32 in flight is 24.65 GiB, 16 is
+    /// 16.57 GiB and 8 is 12.31 GiB, with identical output (docs/27 section 3.10). It is a
+    /// memory knob only: each window is probed in parallel over sub-ranges of its
+    /// candidates, so a small batch still uses every thread. Set 8 or 4 on a memory-bound
+    /// machine. Not a sensitivity knob. It does move the chromatogram table's parquet row
+    /// group boundaries, which follow the flush batches, so two runs at different settings
+    /// produce files that differ byte for byte while holding the same rows in the same
+    /// order with the same values (measured on one band: 29,028,466 rows, 10.4 billion
+    /// trace elements, every per-column sum equal). Compare values, not bytes, across
+    /// settings.
     #[serde(default)]
     pub windows_in_flight: Option<usize>,
     pub fixed_scan_window: usize,
