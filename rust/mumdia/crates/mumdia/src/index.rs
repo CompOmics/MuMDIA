@@ -123,7 +123,14 @@ impl Library {
         bucket_size: usize,
         build_bucketed: bool,
     ) -> Result<Library> {
-        Self::load_impl(precursors, fragments, bucket_size, build_bucketed, None, 0)
+        Self::load_impl(
+            precursors,
+            fragments,
+            bucket_size,
+            build_bucketed,
+            None,
+            None,
+        )
     }
 
     /// Load only the precursors whose `precursor_mz` lies in `[mz_lo, mz_hi]`, with their
@@ -164,7 +171,7 @@ impl Library {
             bucket_size,
             build_bucketed,
             Some((first_row, n_rows)),
-            first_row,
+            Some(first_row),
         )
     }
 
@@ -188,7 +195,7 @@ impl Library {
             bucket_size,
             build_bucketed,
             None,
-            fragment_offset as usize,
+            Some(fragment_offset as usize),
         )
     }
 
@@ -273,17 +280,22 @@ impl Library {
 
     /// `span`: the precursor rows to read (`None` = the whole file) and, with it, the file
     /// row of local id 0 that the ids in the file are checked against. `frag_offset`: the
-    /// library-wide id of local candidate 0 in the fragment table. They coincide for a range
-    /// load of one library file; a band written to its own file has ids `0..n` (span `None`)
-    /// while its fragments still carry library-wide ids.
+    /// library-wide id of local candidate 0 in the fragment table, `None` when the precursor
+    /// table is the whole library. They coincide for a range load of one library file; a band
+    /// written to its own file has ids `0..n` (span `None`) while its fragments still carry
+    /// library-wide ids. `Some(0)` is a band that happens to start at library row 0 and is
+    /// still a band: the fragment table then holds other candidates' rows to skip, which is
+    /// exactly what a plain `0` could not express.
     fn load_impl(
         precursors: &str,
         fragments: &str,
         bucket_size: usize,
         build_bucketed: bool,
         span: Option<(usize, usize)>,
-        frag_offset: usize,
+        frag_offset: Option<usize>,
     ) -> Result<Library> {
+        let partial = span.is_some() || frag_offset.is_some();
+        let frag_offset = frag_offset.unwrap_or(0);
         let offset = span.map(|(first, _)| first).unwrap_or(0);
         let pt = match span {
             None => TableFile::open(precursors)?,
@@ -402,7 +414,6 @@ impl Library {
         // a modification-expanded library load on a 32 GB machine.
         // A partial load (a range of one file, or a band file against the shared fragment
         // table) sees fragments of other candidates and skips them.
-        let partial = span.is_some() || frag_offset != 0;
         let ft = if partial {
             Self::open_fragments_for(fragments, frag_offset, ncand)?
         } else {
@@ -954,6 +965,27 @@ mod tests {
         for c in 0..3 {
             assert_eq!(frag_slice(&lib, c), frag_slice(&by_mz, c));
             assert_eq!(lib.cands[c].precursor_mz, by_mz.cands[c].precursor_mz);
+        }
+    }
+
+    /// The FIRST band starts at library row 0, and it is still a band: the shared fragment
+    /// table holds every other candidate's rows, which the load must skip. Inferring
+    /// "this is a band" from a non-zero offset made this case read the whole table and fail
+    /// on the first foreign id, which is what every group-0 of a real run hit.
+    #[test]
+    fn the_band_at_library_row_zero_is_still_a_band() {
+        let dir = std::env::temp_dir().join(format!("mumdia_index_band0_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (p, f) = build_six_lib(&dir, "band0", &[0, 1, 2, 3, 4, 5]);
+        let full = Library::load_with(&p, &f, 8, false).unwrap();
+        let band = dir.join("band0_prec.parquet").to_str().unwrap().to_string();
+        assert_eq!(crate::groups::write_band_slice(&p, 0, 2, &band).unwrap(), 2);
+        let lib = Library::load_with_fragment_offset(&band, &f, 0, 8, false).unwrap();
+        assert_eq!(lib.n_candidates(), 2);
+        assert_eq!(lib.global_offset, 0);
+        for c in 0..2 {
+            assert_eq!(lib.cands[c].peptidoform, full.cands[c].peptidoform);
+            assert_eq!(frag_slice(&lib, c), frag_slice(&full, c));
         }
     }
 
