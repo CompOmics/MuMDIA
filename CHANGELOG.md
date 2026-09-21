@@ -55,6 +55,41 @@ than a number. Both are recorded in every run's `manifest.json`.
   filtered scan, with a warning.
 ### Added
 
+- **`groups.window_groups` searches a run one isolation-window group at a time.** The
+  run's windows are cut, in ascending m/z, into contiguous groups whose library bands hold
+  about the same number of precursors (planned from the precursor table's row-group
+  statistics, no table read). Each group's band is written as a precursor table of its own
+  and searched as a library of its own: seed, RT calibration windows, extract, features and
+  compete see one band's precursors, fragments (by id range from the shared fragment table)
+  and accepted rows, so the search's memory is one band's worth rather than the library's.
+  A `seed-pool` stage then puts the bands' seeds on one q scale with library-wide ids and
+  combines their mass calibrations by calibrant count; under `groups.calibration = global`
+  (the default) every band's RT model and windows are fitted on the pooled anchors, under
+  `per_group` on its own. A `pool` stage rewrites the band tables with library-wide ids,
+  keeps one row per candidate where overlapping windows searched it twice (the higher
+  `prelim_score`), and writes the standard `psms_extracted`, `chromatograms`, `features`
+  and `psms_competed`, so rescore, quant and report run unchanged and the manifest, the
+  run-level `cal.json` and the per-artifact reports keep their shape (band artifacts are
+  recorded as `name[gNN]`, under `groups/gNN/`). Measured on the CI fixture with three and
+  five groups against the ungrouped run: 151 against 150 stripped peptides, 149 shared,
+  every smoke assertion passing and the grouped run byte-identical on repetition.
+  At real scale (AT10234AUH against the 142.7M-precursor 8-12-mer immunopeptidomics
+  library, eight groups, measured with a zero-code harness) the grouped extraction with the
+  run-wide calibration reproduced the monolithic extraction row for row (22,850,003
+  candidates, identical apex retention times) at 22-96 GB per group against 173 GB, and the
+  pooled rescore gave the same 11,271 precursors at 1% (10,346 peptides against 10,213,
+  within seed spread) in 107 min against 329 min for the same stages. Per-group calibration
+  failed on the same file: three of seven groups had no confident seed on their own q scale
+  and ran unbounded, one aborting at 664 GB.
+  `docs/33_window_groups.md` has the layout, the semantics of the two calibration modes,
+  and what a band cannot see. Groups run one after another in one process; child-process
+  parallelism and `run-experiment` support are the next steps. A grouped run refuses
+  `rt_im_train.finetune_deeplc`, which would train a different model per group. A sweep of
+  the group count on the same file (48, 64, 96 and 192 asked for, one per host) accepted
+  22,850,003 PSMs in every arm, the monolithic count exactly; it also showed that a band
+  cannot be smaller than one isolation window (114 here, so 192 became 94 bands), that the
+  largest band falls only from 44 to 23 GB as bands shrink, because each pays a fixed cost,
+  and that CPU roughly doubles past about 64 bands.
 - **`Library::load_range_with` loads one precursor m/z band of a library.** The precursor
   table is m/z-sorted with row-aligned ids, so a band is a row span: it is found from the
   parquet row-group statistics plus one decode of `precursor_mz` over the boundary groups,

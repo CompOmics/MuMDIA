@@ -1869,6 +1869,50 @@ impl Default for ExperimentConfig {
     }
 }
 
+/// Which anchors the retention-time calibration of a window group is fitted on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum GroupCalibration {
+    /// The confident seed PSMs of every group, pooled (q re-estimated on the union), so
+    /// each group's LOESS and multi-head fit see the whole run's anchors. The default: a
+    /// group holds a fraction of the anchors, and the fit quality is what sets the RT
+    /// window that the extract of every group then pays for.
+    #[default]
+    Global,
+    /// Each group calibrates on its own seeds only. Cheaper by one pooling pass and fully
+    /// independent per group; kept for the comparison, not as a recommendation.
+    PerGroup,
+}
+
+/// Searching a run one isolation-window group at a time.
+///
+/// A group of isolation windows can only select precursors whose m/z lies in the group's
+/// band, so its seed, calibration, extract, features and compete need only that band of the
+/// library (`Library::load_with_fragment_offset`): the library, the hit accumulator and the
+/// accepted rows are all one band's worth instead of the whole run's, which is what bounds
+/// the memory of a search against a library of 10^8 precursors. Only rescore, quant and
+/// report see everything, after the group artifacts are pooled with library-wide ids. The
+/// groups run one after another in this process; `docs/33_window_groups.md` has the layout
+/// and the measurements.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct GroupsConfig {
+    /// Number of window groups. `1` (the default) is the ordinary single-library search.
+    /// Groups are contiguous bands of isolation windows balanced by the number of library
+    /// precursors they select, read from the precursor table's row-group statistics.
+    pub window_groups: usize,
+    /// Anchors for the RT calibration of each group; see [`GroupCalibration`].
+    pub calibration: GroupCalibration,
+}
+impl Default for GroupsConfig {
+    fn default() -> Self {
+        Self {
+            window_groups: 1,
+            calibration: GroupCalibration::Global,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -1889,6 +1933,8 @@ pub struct Config {
     pub mbr: MbrConfig,
     #[serde(default)]
     pub experiment: ExperimentConfig,
+    #[serde(default)]
+    pub groups: GroupsConfig,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -1908,6 +1954,7 @@ impl Default for Config {
             quant: t(),
             mbr: t(),
             experiment: t(),
+            groups: t(),
         }
     }
 }
@@ -2296,6 +2343,7 @@ impl Config {
             ),
             ("experiment.parallel_runs", self.experiment.parallel_runs),
             ("rescore.seeds", self.rescore.seeds),
+            ("groups.window_groups", self.groups.window_groups),
         ] {
             if value == 0 {
                 return Err(Invalid(format!("{name} must be >= 1")));
