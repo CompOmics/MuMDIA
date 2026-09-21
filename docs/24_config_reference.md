@@ -766,6 +766,7 @@ listed with the file it is in.
 | `MUMDIA_PYTHON_PEPTDEEP` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/python.rs:232` |
 | `MUMDIA_PYTHON_RESCORE` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/python.rs:232` |
 | `MUMDIA_RESCORE_MODEL` | both | `"nn"` | `rust/mumdia/crates/mumdia/src/stages/rescore.rs:357`, `scripts/mokapot_worker.py:181`, `scripts/mokapot_worker.py:37` |
+| `MUMDIA_SCRIPTS` | sidecar | `os.path.dirname(os.path.abspath(__file__` | `scripts/mh_shard_predict.py:23` |
 | `MUMDIA_THERMO_PARSER` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/raw.rs:171` |
 | `MUMDIA_XGB_DEPTH` | sidecar | `"6"` | `scripts/mokapot_worker.py:63` |
 | `MUMDIA_XGB_JOBS` | sidecar | `"0"` | `scripts/mokapot_worker.py:68` |
@@ -777,7 +778,7 @@ listed with the file it is in.
 | `ProgramFiles(x86)` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/raw.rs:202` |
 | `VIRTUAL_ENV` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/python.rs:242` |
 
-65 variables are read: 16 engine-side, 52 sidecar-side, 3 on both sides.
+66 variables are read: 16 engine-side, 53 sidecar-side, 3 on both sides.
 
 ### Variables the code sets
 
@@ -822,11 +823,11 @@ Every field whose struct has an `impl Default` resolved from the source.
 
 2 environment read(s) whose name is not a literal:
 
-- `rust/mumdia/crates/mumdia/src/stages/extract.rs:2693: env read via closure of `&mut flushed``
-- `rust/mumdia/crates/mumdia/src/stages/extract.rs:2711: env read via closure of `&mut cand_hits``
+- `rust/mumdia/crates/mumdia/src/stages/extract.rs:2705: env read via closure of `&mut flushed``
+- `rust/mumdia/crates/mumdia/src/stages/extract.rs:2723: env read via closure of `&mut cand_hits``
 
 ## Coverage
 
-18 structs and 189 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 24 enumerations, 1 named profile(s), 65 environment variables read and 19 set.
+18 structs and 189 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 24 enumerations, 1 named profile(s), 66 environment variables read and 19 set.
 
 20 field(s) carry a gating marker in their doc comment. 47 field(s) carry no doc comment at all, so their description is empty above. 0 default(s) could not be resolved and 2 have none by design.
