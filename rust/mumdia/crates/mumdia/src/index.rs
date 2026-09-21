@@ -64,6 +64,11 @@ pub struct Library {
     pub bucket_size: usize,
     /// precursor m/z indexed by candidate_id (ascending).
     pub prec_mz: Vec<f64>,
+    /// Row of the precursor table that local `candidate_id` 0 corresponds to: 0 for a full
+    /// load, the first selected row for [`Library::load_range_with`]. Every id the library
+    /// hands out and every artifact a stage writes from it is local; a pooling step that
+    /// combines groups adds this back to obtain the library-wide id.
+    pub global_offset: u32,
 }
 
 /// Reject a non-finite value in a numeric library column, naming the row, the column
@@ -118,7 +123,141 @@ impl Library {
         bucket_size: usize,
         build_bucketed: bool,
     ) -> Result<Library> {
+        Self::load_impl(precursors, fragments, bucket_size, build_bucketed, None)
+    }
+
+    /// Load only the precursors whose `precursor_mz` lies in `[mz_lo, mz_hi]`, with their
+    /// fragments, as a library of its own: local `candidate_id`s `0..n`, and
+    /// [`Library::global_offset`] recording where the slice starts in the file.
+    ///
+    /// The precursor table is m/z-sorted with row-aligned ids (both are load-time
+    /// invariants), so the range is one row span, found from the row-group statistics and
+    /// one decode of `precursor_mz` over the boundary groups; the rest of the table is never
+    /// read. Fragments are read the same way when their table is sorted by `candidate_id`
+    /// at row-group granularity (what the library writers produce); an older, unsorted table
+    /// still loads correctly through a filtered full scan, with a warning naming the cost.
+    ///
+    /// This is the per-isolation-window-group search: a group of windows can only select
+    /// precursors in its m/z band, so a run searched group by group holds one band's library
+    /// at a time. An empty range is an error, since no stage can run on it.
+    pub fn load_range_with(
+        precursors: &str,
+        fragments: &str,
+        mz_lo: f64,
+        mz_hi: f64,
+        bucket_size: usize,
+        build_bucketed: bool,
+    ) -> Result<Library> {
+        if !(mz_lo.is_finite() && mz_hi.is_finite()) || mz_lo > mz_hi {
+            anyhow::bail!("precursor m/z range [{mz_lo}, {mz_hi}] is empty or not finite");
+        }
+        let (first_row, n_rows) = Self::precursor_row_span(precursors, mz_lo, mz_hi)?;
+        if n_rows == 0 {
+            anyhow::bail!(
+                "no precursor of {precursors} has precursor_mz in [{mz_lo}, {mz_hi}]; the \
+                 isolation-window group selects nothing from this library"
+            );
+        }
+        Self::load_impl(
+            precursors,
+            fragments,
+            bucket_size,
+            build_bucketed,
+            Some((first_row, n_rows)),
+        )
+    }
+
+    /// The row span `[first_row, first_row + n)` of the m/z-sorted precursor table whose
+    /// `precursor_mz` lies in `[mz_lo, mz_hi]`. Row groups that cannot contain the range are
+    /// skipped from their statistics; the ones that can are decoded (one column) and the
+    /// exact bounds found by partition point. Without statistics the whole column is decoded,
+    /// which is 8 bytes per precursor and still no library.
+    fn precursor_row_span(precursors: &str, mz_lo: f64, mz_hi: f64) -> Result<(usize, usize)> {
         let pt = TableFile::open(precursors)?;
+        let stats = pt.row_group_stats("precursor_mz")?;
+        // Candidate row groups: those whose [min, max] overlaps the range. With statistics
+        // this is a contiguous run for a sorted table; without, every group.
+        let mut start = 0usize;
+        let mut span_start = None;
+        let mut span_end = 0usize;
+        for s in &stats {
+            let overlaps = match (s.min, s.max) {
+                (Some(min), Some(max)) => max >= mz_lo && min <= mz_hi,
+                _ => true,
+            };
+            if overlaps {
+                if span_start.is_none() {
+                    span_start = Some(start);
+                }
+                span_end = start + s.rows;
+            }
+            start += s.rows;
+        }
+        let Some(span_start) = span_start else {
+            return Ok((0, 0));
+        };
+        let scan = TableFile::open_rows(precursors, span_start, span_end - span_start)?;
+        let mz = scan.f64("precursor_mz")?;
+        if mz.windows(2).any(|w| w[1] < w[0]) {
+            anyhow::bail!(
+                "library precursors in {precursors} are not ascending by precursor_mz; a \
+                 range load needs the sorted order the decoy builders produce"
+            );
+        }
+        let lo = mz.partition_point(|&v| v < mz_lo);
+        let hi = mz.partition_point(|&v| v <= mz_hi);
+        Ok((span_start + lo, hi.saturating_sub(lo)))
+    }
+
+    /// Open the fragment table for the local candidates `[offset, offset + ncand)` of the
+    /// precursor table. Sorted by `candidate_id` at row-group granularity, only the groups
+    /// that can hold those ids are decoded; otherwise the whole table is, filtered by id.
+    fn open_fragments_for(fragments: &str, offset: usize, ncand: usize) -> Result<TableFile> {
+        let ft = TableFile::open(fragments)?;
+        let stats = ft.row_group_stats("candidate_id")?;
+        if !mumdia_io::table::RowGroupStats::sorted_by_column(&stats) {
+            tracing::warn!(
+                fragments,
+                "library: the fragment table is not sorted by candidate_id at row-group \
+                 granularity, so a range load scans it whole and keeps the rows in range; \
+                 rewrite it with scripts/sort_fragments.py to make group loads selective"
+            );
+            return Ok(ft);
+        }
+        let (lo, hi) = (offset as f64, (offset + ncand) as f64 - 1.0);
+        let mut start = 0usize;
+        let mut span_start = None;
+        let mut span_end = 0usize;
+        for s in &stats {
+            let (Some(min), Some(max)) = (s.min, s.max) else {
+                unreachable!("sorted_by_column requires statistics")
+            };
+            if max >= lo && min <= hi {
+                if span_start.is_none() {
+                    span_start = Some(start);
+                }
+                span_end = start + s.rows;
+            }
+            start += s.rows;
+        }
+        match span_start {
+            Some(s) => TableFile::open_rows(fragments, s, span_end - s),
+            None => TableFile::open_rows(fragments, 0, 0),
+        }
+    }
+
+    fn load_impl(
+        precursors: &str,
+        fragments: &str,
+        bucket_size: usize,
+        build_bucketed: bool,
+        span: Option<(usize, usize)>,
+    ) -> Result<Library> {
+        let offset = span.map(|(first, _)| first).unwrap_or(0);
+        let pt = match span {
+            None => TableFile::open(precursors)?,
+            Some((first, n)) => TableFile::open_rows(precursors, first, n)?,
+        };
         let cid = pt.u32("candidate_id")?;
         let pfid = pt.u32("peptidoform_id")?;
         let baseid = pt.u32("base_peptide_id")?;
@@ -203,12 +342,15 @@ impl Library {
         // (the library + decoy builders guarantee this). An external library that
         // violates it would misgroup fragments or panic on the index below, so
         // check explicitly and fail with a clear error instead.
+        // For a range load the same invariant holds against the file row: local id c is
+        // file row c + offset, so the slice's ids must be exactly offset..offset + ncand.
         for (c, &candidate_id) in cid.iter().enumerate().take(ncand) {
-            if candidate_id as usize != c {
+            if candidate_id as usize != c + offset {
                 anyhow::bail!(
-                    "library precursor row {c} has candidate_id {} but candidate_id must \
-                     be the contiguous range 0..{ncand} in row order; reindex the library \
+                    "library precursor row {} has candidate_id {} but candidate_id must \
+                     be the contiguous range 0..n in row order; reindex the library \
                      (e.g. via the decoy-builder scripts)",
+                    c + offset,
                     candidate_id
                 );
             }
@@ -227,11 +369,16 @@ impl Library {
         // no `frag_order` permutation and no `Vec<String>` with one heap allocation per
         // fragment. The resident peak is the final arrays plus one batch, which is what lets
         // a modification-expanded library load on a 32 GB machine.
-        let ft = TableFile::open(fragments)?;
-        let n_frag_rows = ft.nrows;
-        if n_frag_rows > u32::MAX as usize {
+        let partial = span.is_some();
+        let ft = if partial {
+            Self::open_fragments_for(fragments, offset, ncand)?
+        } else {
+            TableFile::open(fragments)?
+        };
+        if ft.nrows > u32::MAX as usize {
             anyhow::bail!(
-                "fragment library has {n_frag_rows} rows; per-candidate fragment offsets are u32"
+                "fragment library has {} rows; per-candidate fragment offsets are u32",
+                ft.nrows
             );
         }
         let mut frag_offsets: Vec<u32> = vec![0; ncand + 1];
@@ -250,19 +397,29 @@ impl Library {
                 require_no_nulls(a, "candidate_id", fragments, row)?;
                 for &candidate_id in a.values().iter() {
                     let c = candidate_id as usize;
-                    if c >= ncand {
+                    row += 1;
+                    // A range load sees the fragments of neighbouring candidates in the
+                    // boundary row groups (or the whole table when it is unsorted); they
+                    // belong to precursors this library does not hold and are skipped. A
+                    // full load has no such rows, so an id past the end is a broken file.
+                    if c < offset || c >= offset + ncand {
+                        if partial {
+                            continue;
+                        }
                         anyhow::bail!(
-                            "fragment row {row} references candidate_id {c} >= precursor count {ncand}"
+                            "fragment row {} references candidate_id {c} >= precursor count {ncand}",
+                            row - 1
                         );
                     }
-                    frag_offsets[c + 1] += 1;
-                    row += 1;
+                    frag_offsets[c - offset + 1] += 1;
                 }
             }
         }
         for c in 0..ncand {
             frag_offsets[c + 1] += frag_offsets[c];
         }
+        // Rows in range, which for a range load is fewer than the rows decoded.
+        let n_frag_rows = frag_offsets[ncand] as usize;
 
         let mut frag_mz: Vec<f32> = vec![0.0; n_frag_rows];
         let mut frag_int: Vec<f32> = vec![0.0; n_frag_rows];
@@ -351,11 +508,15 @@ impl Library {
                 }
                 for k in 0..b.num_rows() {
                     let c = a_cid.value(k) as usize;
-                    if c >= ncand {
+                    if c < offset || c >= offset + ncand {
+                        if partial {
+                            continue;
+                        }
                         anyhow::bail!(
                             "fragment table changed between passes: candidate_id {c} >= {ncand}"
                         );
                     }
+                    let c = c - offset;
                     let pos = cursor[c] as usize;
                     cursor[c] += 1;
                     // NULLs were rejected above, so the physical values are the values.
@@ -390,7 +551,8 @@ impl Library {
             let start = frag_offsets[c] as usize;
             let n = frag_offsets[c + 1] as usize - start;
             cands.push(Candidate {
-                candidate_id: cid[c],
+                // Local id: file row minus the slice's offset (verified equal above).
+                candidate_id: c as u32,
                 peptidoform_id: pfid[c],
                 base_peptide_id: baseid[c],
                 // Move the strings out of the column Vecs instead of cloning them.
@@ -504,6 +666,8 @@ impl Library {
             bucket_min,
             bucket_size: bs,
             prec_mz,
+            global_offset: u32::try_from(offset)
+                .map_err(|_| anyhow::anyhow!("precursor row offset {offset} does not fit u32"))?,
         })
     }
 
@@ -611,7 +775,135 @@ pub fn deconvolve(peak_mz: f64, z: i32) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mumdia_io::table::{write_table, Col};
+    use mumdia_io::table::{write_table, Col, TableWriter};
+
+    /// Six candidates at m/z 400, 450, 500, 520, 600, 650 with two fragments each, written
+    /// in row groups of two rows so a range crosses row-group boundaries on both tables.
+    /// `frag_order` is the candidate order of the fragment table: `[0, 1, 2, 3, 4, 5]` is
+    /// sorted by candidate_id (the writers' contract); anything else exercises the scan
+    /// fallback of a range load.
+    fn build_six_lib(dir: &std::path::Path, tag: &str, frag_order: &[usize]) -> (String, String) {
+        let p = dir
+            .join(format!("prec_{tag}.parquet"))
+            .to_str()
+            .unwrap()
+            .to_string();
+        let f = dir
+            .join(format!("frag_{tag}.parquet"))
+            .to_str()
+            .unwrap()
+            .to_string();
+        let mz = [400.0, 450.0, 500.0, 520.0, 600.0, 650.0];
+        let mut w = TableWriter::new(&p).with_row_group_rows(2);
+        w.write_cols(vec![
+            Col::U32("candidate_id".into(), (0..6).collect()),
+            Col::U32("peptidoform_id".into(), (10..16).collect()),
+            Col::U32("base_peptide_id".into(), (20..26).collect()),
+            Col::Str(
+                "peptidoform".into(),
+                (0..6).map(|i| format!("PEPTIDE{i}K")).collect(),
+            ),
+            Col::I32("charge".into(), vec![2; 6]),
+            Col::F64("precursor_mz".into(), mz.to_vec()),
+            Col::F32(
+                "predicted_irt".into(),
+                (0..6).map(|i| i as f32 * 10.0).collect(),
+            ),
+            Col::Str(
+                "label".into(),
+                (0..6)
+                    .map(|i| if i % 2 == 0 { "target" } else { "decoy" }.to_string())
+                    .collect(),
+            ),
+            Col::Str("protein".into(), (0..6).map(|i| format!("P{i}")).collect()),
+        ])
+        .unwrap();
+        w.close().unwrap();
+        let mut cid = Vec::new();
+        let mut fmz = Vec::new();
+        let mut fint = Vec::new();
+        let mut name = Vec::new();
+        for &c in frag_order {
+            for (k, off) in [100.0, 200.0].iter().enumerate() {
+                cid.push(c as u32);
+                fmz.push(off + 10.0 * c as f64);
+                fint.push(1.0 - 0.1 * k as f32);
+                name.push(if k == 0 {
+                    "b2".to_string()
+                } else {
+                    "y3".to_string()
+                });
+            }
+        }
+        let mut w = TableWriter::new(&f).with_row_group_rows(2);
+        w.write_cols(vec![
+            Col::U32("candidate_id".into(), cid),
+            Col::F64("mz".into(), fmz),
+            Col::F32("predicted_intensity".into(), fint),
+            Col::Str("name".into(), name),
+        ])
+        .unwrap();
+        w.close().unwrap();
+        (p, f)
+    }
+
+    fn frag_slice(lib: &Library, c: usize) -> (Vec<f32>, Vec<f32>, Vec<String>) {
+        let cand = &lib.cands[c];
+        let r = cand.frag_start..cand.frag_start + cand.n_frag;
+        (
+            lib.frag_mz[r.clone()].to_vec(),
+            lib.frag_int[r.clone()].to_vec(),
+            lib.frag_name_id[r]
+                .iter()
+                .map(|&id| lib.frag_name_dict[id as usize].clone())
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn range_load_is_the_slice_of_the_full_load() {
+        let dir = std::env::temp_dir().join(format!("mumdia_index_range_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (p, f) = build_six_lib(&dir, "sorted", &[0, 1, 2, 3, 4, 5]);
+        let full = Library::load_with(&p, &f, 8, false).unwrap();
+        assert_eq!(full.global_offset, 0);
+        // [440, 530] covers 450, 500, 520: file rows 1..4, crossing two row groups.
+        let part = Library::load_range_with(&p, &f, 440.0, 530.0, 8, false).unwrap();
+        assert_eq!(part.n_candidates(), 3);
+        assert_eq!(part.global_offset, 1);
+        for c in 0..3 {
+            let (a, b) = (&part.cands[c], &full.cands[c + 1]);
+            assert_eq!(a.candidate_id, c as u32);
+            assert_eq!(a.peptidoform, b.peptidoform);
+            assert_eq!(a.peptidoform_id, b.peptidoform_id);
+            assert_eq!(a.base_peptide_id, b.base_peptide_id);
+            assert_eq!(a.precursor_mz, b.precursor_mz);
+            assert_eq!(a.is_decoy, b.is_decoy);
+            assert_eq!(frag_slice(&part, c), frag_slice(&full, c + 1));
+        }
+        assert_eq!(part.frag_mz.len(), 6);
+        assert_eq!(part.candidate_range(499.0, 501.0), (1, 2));
+        // The two halves of the library cover it exactly once.
+        let lo = Library::load_range_with(&p, &f, 0.0, 470.0, 8, false).unwrap();
+        let hi = Library::load_range_with(&p, &f, 470.0, 1000.0, 8, false).unwrap();
+        assert_eq!((lo.n_candidates(), lo.global_offset), (2, 0));
+        assert_eq!((hi.n_candidates(), hi.global_offset), (4, 2));
+        assert!(Library::load_range_with(&p, &f, 700.0, 800.0, 8, false).is_err());
+    }
+
+    #[test]
+    fn range_load_of_an_unsorted_fragment_table_scans_and_still_matches() {
+        let dir =
+            std::env::temp_dir().join(format!("mumdia_index_unsorted_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (p, f) = build_six_lib(&dir, "shuffled", &[3, 0, 5, 1, 4, 2]);
+        let full = Library::load_with(&p, &f, 8, false).unwrap();
+        let part = Library::load_range_with(&p, &f, 440.0, 530.0, 8, false).unwrap();
+        assert_eq!(part.n_candidates(), 3);
+        for c in 0..3 {
+            assert_eq!(frag_slice(&part, c), frag_slice(&full, c + 1));
+        }
+    }
 
     fn build_tiny_lib(dir: &std::path::Path) -> (String, String) {
         let p = dir.join("prec.parquet").to_str().unwrap().to_string();

@@ -53,10 +53,57 @@ than a number. Both are recorded in every run's `manifest.json`.
   depended on the previous order. `scripts/sort_fragments.py` applies the same rewrite to a
   table written before this change; the engine still loads an unsorted table through a
   filtered scan, with a warning.
+### Added
+
+- **`Library::load_range_with` loads one precursor m/z band of a library.** The precursor
+  table is m/z-sorted with row-aligned ids, so a band is a row span: it is found from the
+  parquet row-group statistics plus one decode of `precursor_mz` over the boundary groups,
+  and `TableFile::open_rows` then reads only the row groups that cover it, trimmed by a row
+  selection. Fragments come the same way when their table is sorted by `candidate_id` at
+  row-group granularity; an unsorted table still loads through a filtered scan, with a
+  warning. The slice carries local ids `0..n` and `Library::global_offset`, the file row of
+  local id 0. This is the load an isolation-window-group search needs: a group of windows
+  can only select precursors in its band, so a run searched group by group never holds the
+  rest of the library. `TableFile::row_group_stats` exposes the footer statistics for
+  planning such reads.
+### Changed
+
+- **`mumdia doctor` and the interpreter resolver say what a missing DeepLC costs.** The
+  multi-head retention-time calibration is the default whenever a DeepLC interpreter is
+  configured or discovered (`predict_frag.deeplc_python` absent or `"auto"`: `MUMDIA_PYTHON_DEEPLC`,
+  `CONDA_PREFIX`, `VIRTUAL_ENV`, then `python3`/`python` on `PATH`), and a machine without one
+  runs on the imported iRT. The note printed in that case now names the calibration and its
+  measured value (+4.8% peptides on AIF, +14.3% on Astral) instead of only "keeps the imported
+  iRT", so the loss is visible where the decision is made.
+### Added
+
+- **Helpers for very large predicted libraries** and `docs/32_large_libraries.md`, from the
+  immunopeptidomics case study (59M and 203M precursors on one Astral run):
+  `scripts/mz_range_survivors.py` (candidates inside the run's isolation range),
+  `scripts/assemble_survivors.py` (survivors -> renumbered library, target/decoy pair kept
+  together on `peptidoform_id`), `scripts/shard_parquet.py` (row-group-aligned split and
+  concatenate) and `scripts/mh_shard_predict.py` (deduplicated, sharded multi-head DeepLC
+  calibration: 125.9M unique sequences in 42 minutes over 12 CPU shards instead of 6 hours in
+  one process). Measured yields and costs are in the document, including the seven-file
+  orchestrated first pass and the second pass from the union of first-pass identifications
+  (17,829 peptides pooled at 1%, 94-100% of DIA-NN's empirical-library second pass per file)
+  and a measurement of what the sequence-tag screen can and cannot prune on DIA
+  immunopeptidomics data, including the negative result for predicted-intensity-weighted
+  tags.
 
 
 ### Fixed
 
+- **`extract --restrict-candidates` now runs on the streaming path.** A candidate allowlist
+  routed extract to the serial path, whose whole-run hit accumulator ignores
+  `extract.windows_in_flight`, so a prescan-restricted extract had the memory profile of
+  the pre-streaming engine: measured on an immunopeptidomics library, 35M allowed
+  candidates took 2:08 h at a 325 GB peak, and 83M candidates aborted with
+  `memory allocation of 12288 bytes failed` at 471 GB on a host with a 1 TB commit limit.
+  The allowlist is now applied inside the streaming probe at the point the serial path
+  applies it, before the peak claim, so a listed candidate collects the same hits and an
+  unlisted one neither collects hits nor competes for a shared peak; the serial path is
+  unchanged and still serves the two-pass peak-claim strategies.
 - **`nn_torch` rescoring no longer aborts on a pool that is overwhelmingly false.** The
   worker picks its initial ranking feature on a 300k-row sample of the training fold and
   then requires at least one target at the training FDR. On an 8.07M-PSM immunopeptidomics
