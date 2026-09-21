@@ -41,6 +41,15 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ## [Unreleased]
 
+### Changed
+
+- **`mumdia doctor` and the interpreter resolver say what a missing DeepLC costs.** The
+  multi-head retention-time calibration is the default whenever a DeepLC interpreter is
+  configured or discovered (`predict_frag.deeplc_python` absent or `"auto"`: `MUMDIA_PYTHON_DEEPLC`,
+  `CONDA_PREFIX`, `VIRTUAL_ENV`, then `python3`/`python` on `PATH`), and a machine without one
+  runs on the imported iRT. The note printed in that case now names the calibration and its
+  measured value (+4.8% peptides on AIF, +14.3% on Astral) instead of only "keeps the imported
+  iRT", so the loss is visible where the decision is made.
 ### Added
 
 - **Helpers for very large predicted libraries** and `docs/32_large_libraries.md`, from the
