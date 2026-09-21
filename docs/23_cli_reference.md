@@ -347,6 +347,9 @@ Options:
       --restrict-candidates <RESTRICT_CANDIDATES>
           Optional candidate allowlist (a prior run's psms.parquet): restrict extraction to these candidate_ids. For "gate first, then compete" - re-extract with a peak_claim strategy over only the gate-accepted survivors, keeping the two-pass profile map small
 
+      --fragment-offset <FRAGMENT_OFFSET>
+          The library row that `--lib-precursors` row 0 came from, when that table is one isolation-window band of a larger library (`groups.window_groups` writes such bands, with ids rebased to `0..n`). The band's fragments are then read from the shared `--lib-fragments` table by that id range, selectively when the table is sorted by `candidate_id`, so a band needs no fragment table of its own
+
       --config <CONFIG>
 ```
 

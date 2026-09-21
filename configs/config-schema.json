@@ -18,7 +18,8 @@
     "rescore",
     "quant",
     "mbr",
-    "experiment"
+    "experiment",
+    "groups"
   ],
   "fields": [
     {
@@ -32,7 +33,7 @@
       "default_text": "0",
       "help": "",
       "gates": [],
-      "source_line": 1877
+      "source_line": 1921
     },
     {
       "path": "convert.thermo_raw_parser",
@@ -2414,6 +2415,36 @@
       "choices": [
         "first_run_only",
         "per_run"
+      ]
+    },
+    {
+      "path": "groups.window_groups",
+      "name": "window_groups",
+      "section": "groups",
+      "rust_type": "usize",
+      "kind": "integer",
+      "optional": false,
+      "default": 1,
+      "default_text": "1",
+      "help": "Number of window groups. `1` (the default) is the ordinary single-library search. Groups are contiguous bands of isolation windows balanced by the number of library precursors they select, read from the precursor table's row-group statistics.",
+      "gates": [],
+      "source_line": 1903
+    },
+    {
+      "path": "groups.calibration",
+      "name": "calibration",
+      "section": "groups",
+      "rust_type": "GroupCalibration",
+      "kind": "enum",
+      "optional": false,
+      "default": "global",
+      "default_text": "`global`",
+      "help": "Anchors for the RT calibration of each group; see `GroupCalibration`.",
+      "gates": [],
+      "source_line": 1905,
+      "choices": [
+        "global",
+        "per_group"
       ]
     }
   ],
