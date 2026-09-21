@@ -77,14 +77,6 @@ fn preflight(p: &RunExperimentParams) -> Result<()> {
     if cfg.rt_im_train.finetune_deeplc && cfg.predict_frag.deeplc_python.is_none() {
         anyhow::bail!("rt_im_train.finetune_deeplc requires predict_frag.deeplc_python");
     }
-    // The grouped search lives in the single-run orchestrator for now; refusing here beats
-    // reading the key and searching every run against the whole library anyway.
-    if cfg.groups.window_groups > 1 {
-        anyhow::bail!(
-            "groups.window_groups = {} is not supported by run-experiment yet: run each file              with `mumdia run --mzml <one file>` (which searches it group by group) and pool              the competed tables with `mumdia rescore --competed a b c`",
-            cfg.groups.window_groups
-        );
-    }
     // Explicit count: hard requirement. Automatic default: degrade with a warning, so a
     // native Python-free experiment stays runnable (`run.rs` says the same).
     if cfg.rt_im_train.multihead_calibration.is_some_and(|n| n > 0)
@@ -203,6 +195,35 @@ fn process_run(
         top_peaks_ms1: 0,
         config_hash: &convert_hash,
     })?;
+    let has_deeplc = cfg.predict_frag.deeplc_python.is_some();
+    let mh_heads = cfg
+        .rt_im_train
+        .multihead_heads(has_deeplc, cfg.deeplc_rt_source(library_input, has_deeplc));
+    // Grouped: seed, calibration, extract, features and compete happen one isolation-window
+    // group at a time, and the pooled competed table and chromatograms come back under the
+    // names the pooled stages below read, exactly as in the single-run orchestrator. The
+    // third return value is then this run's `groups/` directory rather than an adapted
+    // library, which is what `experiment.rt_library_scope = first_run_only` hands to the
+    // runs that follow (`shared_rt_lib` here).
+    if cfg.groups.window_groups > 1 {
+        let pooled = crate::stages::run_groups::run(crate::stages::run_groups::GroupRun {
+            cfg,
+            config_hash: ch,
+            converted: &co,
+            lib_precursors: lib_p_base,
+            lib_fragments: lib_f,
+            out_dir: out,
+            man: None,
+            shared_bands: shared_rt_lib,
+            mh_heads,
+            library_input,
+        })?;
+        return Ok((
+            pooled.competed,
+            pooled.chromatograms,
+            Some(format!("{out}/groups")),
+        ));
+    }
     let seed = d("seed_psms.parquet");
     search_seed::run(search_seed::SearchSeedParams {
         fragment_offset: None,
@@ -220,10 +241,6 @@ fn process_run(
     // drift is then absorbed by `rt_im_train`'s per-run calibration below, which is fitted
     // separately for every run regardless.
     let mut produced_rt_lib: Option<String> = None;
-    let has_deeplc = cfg.predict_frag.deeplc_python.is_some();
-    let mh_heads = cfg
-        .rt_im_train
-        .multihead_heads(has_deeplc, cfg.deeplc_rt_source(library_input, has_deeplc));
     let lib_p = if let Some(shared) = shared_rt_lib {
         // A previous run already adapted the library and `experiment.rt_library_scope`
         // says to reuse it. Which mechanism produced it does not matter here: the
@@ -664,6 +681,8 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
             .rt_im_train
             .multihead_heads(has_deeplc_for_scope, deeplc_rt_source_for_scope)
             > 0;
+    // A grouped run adapts its bands rather than one library table, and shares them the
+    // same way: the first run's `groups/` directory is what the rest reuse.
     let share_ft = adapts_rt_library
         && matches!(
             cfg.experiment.rt_library_scope,

@@ -36,7 +36,14 @@ pub struct GroupRun<'a> {
     pub lib_precursors: &'a str,
     pub lib_fragments: &'a str,
     pub out_dir: &'a str,
-    pub man: &'a mut Manifest,
+    /// Where to record the band and pooled artifacts. `None` under `run-experiment`,
+    /// which keeps one experiment-level manifest instead of one per run.
+    pub man: Option<&'a mut Manifest>,
+    /// A previous run's `groups/` directory, whose per-band precursor tables already carry
+    /// adapted retention times (`experiment.rt_library_scope = first_run_only`). Set, no
+    /// band re-predicts: each takes that run's table for its band and fits its own per-run
+    /// LOESS on top, which is what the ungrouped path does with a shared library.
+    pub shared_bands: Option<&'a str>,
     /// Multi-head calibration heads resolved by the caller (0 = off).
     pub mh_heads: usize,
     pub library_input: bool,
@@ -60,7 +67,25 @@ fn windows_of(path: &str) -> Result<Vec<(f64, f64)>> {
     Ok(lo.into_iter().zip(hi).collect())
 }
 
-pub fn run(g: GroupRun) -> Result<Pooled> {
+/// The file name a band's adapted precursor table takes, so a later run can find it.
+fn band_lib_name(rt_model: &str) -> &'static str {
+    if rt_model.starts_with("multihead") {
+        "lib_precursors_multihead.parquet"
+    } else if rt_model == "finetuned" {
+        "lib_precursors_ft.parquet"
+    } else {
+        "lib_precursors_deeplc.parquet"
+    }
+}
+
+/// Record an artifact when this run keeps a manifest of its own.
+fn record_opt(man: Option<&mut Manifest>, rec: mumdia_core::manifest::ArtifactRecord) {
+    if let Some(m) = man {
+        m.record(rec);
+    }
+}
+
+pub fn run(mut g: GroupRun) -> Result<Pooled> {
     let t0 = Instant::now();
     let cfg = g.cfg;
     let ch = g.config_hash;
@@ -151,14 +176,17 @@ pub fn run(g: GroupRun) -> Result<Pooled> {
             config_hash: ch,
             fragment_offset: Some(first as u32),
         })?;
-        g.man.record(record_artifact(
-            &format!("{}[g{:02}]", artifact::SEED_PSMS.0, b.index),
-            artifact::SEED_PSMS,
-            &seed,
-            rows,
-            "search-seed",
-            ch,
-        )?);
+        record_opt(
+            g.man.as_deref_mut(),
+            record_artifact(
+                &format!("{}[g{:02}]", artifact::SEED_PSMS.0, b.index),
+                artifact::SEED_PSMS,
+                &seed,
+                rows,
+                "search-seed",
+                ch,
+            )?,
+        );
         bands.push(Band {
             index: b.index,
             offset: first as u32,
@@ -193,14 +221,17 @@ pub fn run(g: GroupRun) -> Result<Pooled> {
         masscals: &masscals,
         out: &pooled_seed,
     })?;
-    g.man.record(record_artifact(
-        artifact::SEED_PSMS.0,
-        artifact::SEED_PSMS,
-        &pooled_seed,
-        n,
-        "seed-pool",
-        ch,
-    )?);
+    record_opt(
+        g.man.as_deref_mut(),
+        record_artifact(
+            artifact::SEED_PSMS.0,
+            artifact::SEED_PSMS,
+            &pooled_seed,
+            n,
+            "seed-pool",
+            ch,
+        )?,
+    );
     let global = cfg.groups.calibration == GroupCalibration::Global;
 
     // --- RT model per band, against the pooled or the band's own anchors
@@ -221,7 +252,30 @@ pub fn run(g: GroupRun) -> Result<Pooled> {
         "library".to_string()
     };
     let mut repredicted: Vec<(String, u32)> = Vec::new();
-    for b in &mut bands {
+    if let Some(shared) = g.shared_bands {
+        // Take a previous run's adapted bands wholesale: same ids, same row order, which is
+        // what `fragment_offset` and the per-band seed views key on. Only the retention
+        // times inside differ from the raw library, and this run still fits its own LOESS.
+        let name = band_lib_name(&rt_model);
+        for b in &mut bands {
+            let from = format!("{shared}/g{:02}/{name}", b.index);
+            if !std::path::Path::new(&from).exists() {
+                bail!(
+                    "groups: {from} is missing, so the shared bands do not match this run: \
+                     reusing them needs the same group plan and the same retention-time model"
+                );
+            }
+            repredicted.push((from.clone(), b.offset));
+            b.prec = from;
+        }
+        info!(
+            groups = bands.len(),
+            model = %rt_model,
+            source = %shared,
+            "groups: reusing a previous run's adapted bands"
+        );
+    }
+    for b in bands.iter_mut().filter(|_| g.shared_bands.is_none()) {
         let anchors = if global { &pooled_seed } else { &b.seed };
         let out = if g.mh_heads > 0 {
             let out = gd(b.index, "lib_precursors_multihead.parquet");
@@ -271,18 +325,21 @@ pub fn run(g: GroupRun) -> Result<Pooled> {
         };
         if let Some(out) = out {
             let rows = mumdia_io::table::nrows(&out)?;
-            g.man.record(record_artifact(
-                &format!(
-                    "{}[g{:02}]",
-                    artifact::FRAGMENT_LIBRARY_PRECURSORS.0,
-                    b.index
-                ),
-                artifact::FRAGMENT_LIBRARY_PRECURSORS,
-                &out,
-                rows,
-                &rt_model,
-                ch,
-            )?);
+            record_opt(
+                g.man.as_deref_mut(),
+                record_artifact(
+                    &format!(
+                        "{}[g{:02}]",
+                        artifact::FRAGMENT_LIBRARY_PRECURSORS.0,
+                        b.index
+                    ),
+                    artifact::FRAGMENT_LIBRARY_PRECURSORS,
+                    &out,
+                    rows,
+                    &rt_model,
+                    ch,
+                )?,
+            );
             repredicted.push((out.clone(), b.offset));
             b.prec = out;
         }
@@ -321,14 +378,17 @@ pub fn run(g: GroupRun) -> Result<Pooled> {
             config_hash: ch,
             anchor_irt_from_seed: from_seed,
         })?;
-        g.man.record(record_artifact(
-            &format!("{}[g{:02}]", artifact::RUN_WINDOWS.0, b.index),
-            artifact::RUN_WINDOWS,
-            &windows,
-            rows,
-            "rt-im-train",
-            ch,
-        )?);
+        record_opt(
+            g.man.as_deref_mut(),
+            record_artifact(
+                &format!("{}[g{:02}]", artifact::RUN_WINDOWS.0, b.index),
+                artifact::RUN_WINDOWS,
+                &windows,
+                rows,
+                "rt-im-train",
+                ch,
+            )?,
+        );
         let mass_cal = if global {
             format!("{pooled_seed}.masscal.json")
         } else {
@@ -351,22 +411,28 @@ pub fn run(g: GroupRun) -> Result<Pooled> {
             config_hash: ch,
             fragment_offset: Some(b.offset),
         })?;
-        g.man.record(record_artifact(
-            &format!("{}[g{:02}]", artifact::PSMS_EXTRACTED.0, b.index),
-            artifact::PSMS_EXTRACTED,
-            &psms,
-            npsm,
-            "extract",
-            ch,
-        )?);
-        g.man.record(record_artifact(
-            &format!("{}[g{:02}]", artifact::CHROMATOGRAMS.0, b.index),
-            artifact::CHROMATOGRAMS,
-            &chrom,
-            nchr,
-            "extract",
-            ch,
-        )?);
+        record_opt(
+            g.man.as_deref_mut(),
+            record_artifact(
+                &format!("{}[g{:02}]", artifact::PSMS_EXTRACTED.0, b.index),
+                artifact::PSMS_EXTRACTED,
+                &psms,
+                npsm,
+                "extract",
+                ch,
+            )?,
+        );
+        record_opt(
+            g.man.as_deref_mut(),
+            record_artifact(
+                &format!("{}[g{:02}]", artifact::CHROMATOGRAMS.0, b.index),
+                artifact::CHROMATOGRAMS,
+                &chrom,
+                nchr,
+                "extract",
+                ch,
+            )?,
+        );
         let feats = gd(b.index, "features.parquet");
         let pin = gd(b.index, "run.pin");
         info!(stage = %"features", group = b.index, "run: stage start");
@@ -381,14 +447,17 @@ pub fn run(g: GroupRun) -> Result<Pooled> {
             cfg: &cfg.features,
             config_hash: ch,
         })?;
-        g.man.record(record_artifact(
-            &format!("{}[g{:02}]", artifact::FEATURES.0, b.index),
-            artifact::FEATURES,
-            &feats,
-            nf,
-            "features",
-            ch,
-        )?);
+        record_opt(
+            g.man.as_deref_mut(),
+            record_artifact(
+                &format!("{}[g{:02}]", artifact::FEATURES.0, b.index),
+                artifact::FEATURES,
+                &feats,
+                nf,
+                "features",
+                ch,
+            )?,
+        );
         let competed = gd(b.index, "psms_competed.parquet");
         info!(stage = %"compete", group = b.index, "run: stage start");
         let nc = compete::run(compete::CompeteParams {
@@ -397,14 +466,17 @@ pub fn run(g: GroupRun) -> Result<Pooled> {
             cfg: &cfg.compete,
             config_hash: ch,
         })?;
-        g.man.record(record_artifact(
-            &format!("{}[g{:02}]", artifact::PSMS_COMPETED.0, b.index),
-            artifact::PSMS_COMPETED,
-            &competed,
-            nc,
-            "compete",
-            ch,
-        )?);
+        record_opt(
+            g.man.as_deref_mut(),
+            record_artifact(
+                &format!("{}[g{:02}]", artifact::PSMS_COMPETED.0, b.index),
+                artifact::PSMS_COMPETED,
+                &competed,
+                nc,
+                "compete",
+                ch,
+            )?,
+        );
         arts.push(pool::BandArtifacts {
             offset: b.offset,
             psms,
@@ -461,8 +533,10 @@ pub fn run(g: GroupRun) -> Result<Pooled> {
             stats.competed,
         ),
     ] {
-        g.man
-            .record(record_artifact(name, schema, path, rows, "pool", ch)?);
+        record_opt(
+            g.man.as_deref_mut(),
+            record_artifact(name, schema, path, rows, "pool", ch)?,
+        );
         ArtifactReport {
             logical_name: name.to_string(),
             schema_name: name.to_string(),
