@@ -18,7 +18,8 @@
     "rescore",
     "quant",
     "mbr",
-    "experiment"
+    "experiment",
+    "groups"
   ],
   "fields": [
     {
@@ -32,7 +33,7 @@
       "default_text": "0",
       "help": "",
       "gates": [],
-      "source_line": 1871
+      "source_line": 1921
     },
     {
       "path": "convert.thermo_raw_parser",
@@ -895,9 +896,9 @@
       "optional": true,
       "default": "null",
       "default_text": "null",
-      "help": "Isolation windows probed per batch before the candidates no later window can touch are scored and written. `None` (the default) uses the rayon thread count capped at 16. The hit accumulator holds the windows in flight, so this sets the stage's peak almost linearly, while the accumulation phase it parallelises is a small part of the wall clock: on the HYE benchmark at 32 threads, 32 in flight is 24.65 GiB / 5:00, 16 is 16.57 GiB / 5:04 and 8 is 12.31 GiB / 5:26, with identical output (docs/27 section 3.10). Set 8 or 4 on a memory-bound machine. Not a sensitivity knob.",
+      "help": "Isolation windows probed per batch before the candidates no later window can touch are scored and written. `None` (the default) uses the rayon thread count capped at 16. The hit accumulator holds the windows in flight, so this sets the stage's peak almost linearly: on the HYE benchmark at 32 threads, 32 in flight is 24.65 GiB, 16 is 16.57 GiB and 8 is 12.31 GiB, with identical output (docs/27 section 3.10). It is a memory knob only: each window is probed in parallel over sub-ranges of its candidates, so a small batch still uses every thread. Set 8 or 4 on a memory-bound machine. Not a sensitivity knob. It does move the chromatogram table's parquet row group boundaries, which follow the flush batches, so two runs at different settings produce files that differ byte for byte while holding the same rows in the same order with the same values (measured on one band: 29,028,466 rows, 10.4 billion trace elements, every per-column sum equal). Compare values, not bytes, across settings.",
       "gates": [],
-      "source_line": 827
+      "source_line": 833
     },
     {
       "path": "extract.fixed_scan_window",
@@ -910,7 +911,7 @@
       "default_text": "3",
       "help": "",
       "gates": [],
-      "source_line": 828
+      "source_line": 834
     },
     {
       "path": "extract.frag_tol_ppm",
@@ -923,7 +924,7 @@
       "default_text": "20.0",
       "help": "",
       "gates": [],
-      "source_line": 829
+      "source_line": 835
     },
     {
       "path": "extract.prec_tol_ppm",
@@ -936,7 +937,7 @@
       "default_text": "20.0",
       "help": "",
       "gates": [],
-      "source_line": 830
+      "source_line": 836
     },
     {
       "path": "extract.presence_min_matched",
@@ -949,7 +950,7 @@
       "default_text": "3",
       "help": "tier-(b) minimum matched fragment count.",
       "gates": [],
-      "source_line": 832
+      "source_line": 838
     },
     {
       "path": "extract.presence_min_fragments",
@@ -962,7 +963,7 @@
       "default_text": "3",
       "help": "minimum distinct fragments for acceptance.",
       "gates": [],
-      "source_line": 834
+      "source_line": 840
     },
     {
       "path": "extract.presence_min_coelution",
@@ -975,7 +976,7 @@
       "default_text": "2",
       "help": "minimum simultaneously-present fragments over the consecutive-scan run.",
       "gates": [],
-      "source_line": 836
+      "source_line": 842
     },
     {
       "path": "extract.gate_min_score",
@@ -988,7 +989,7 @@
       "default_text": "0.2",
       "help": "tier-(d) spectral-agreement gate: reject a candidate whose observed fragment intensities agree with the predicted pattern below this score. Renamed from `min_frag_corr`, which was accurate for none of the four `gate_mode` values: under the default `apex_pearson` it is an intensity correlation at ONE apex scan rather than a chromatographic co-elution correlation, and under `spectral_entropy` it is not a correlation at all. The old name is not accepted (`deny_unknown_fields`), so an old config fails loudly with the offending key named rather than silently reverting to a default. Applied symmetrically to targets and decoys, but that alone does not prove null exchangeability in chimeric DIA; validate every threshold with an independent entrapment. 0 disables.",
       "gates": [],
-      "source_line": 849
+      "source_line": 855
     },
     {
       "path": "extract.min_matched_fraction",
@@ -1001,7 +1002,7 @@
       "default_text": "0.0",
       "help": "tier-(c) minimum fraction of the candidate's predicted fragments that must be observed. With enough predicted fragments (top_n>=~10) this is a strong, symmetric discriminator: real peptides match a large fraction, chimeric false matches and decoys match a small fraction alike, so the target-decoy null stays valid.",
       "gates": [],
-      "source_line": 855
+      "source_line": 861
     },
     {
       "path": "extract.apex_top_fragments",
@@ -1014,7 +1015,7 @@
       "default_text": "0",
       "help": "Shape-aware apex selection: choose the apex scan group by the summed observed intensity of only the top-K predicted (signature) fragments, rather than all matched fragments. In chimeric DIA a bright co-eluting interferent contributing to arbitrary channels wins a max-over-all-fragments apex; restricting to the peptide's strongest predicted ions locks onto its true elution instead. 0 selects the implementation default of the top 3 predicted fragments.",
       "gates": [],
-      "source_line": 863
+      "source_line": 869
     },
     {
       "path": "extract.apex_rt_prior_s",
@@ -1027,7 +1028,7 @@
       "default_text": "0.0",
       "help": "Optional Gaussian RT prior on apex selection: weight each scan group by exp(-0.5*((rt - rt_cal)/sigma)^2) with sigma = this value in seconds, so a distant interferent inside a wide RT window cannot define the apex. 0 = off.",
       "gates": [],
-      "source_line": 867
+      "source_line": 873
     },
     {
       "path": "extract.apex_count_tol",
@@ -1040,7 +1041,7 @@
       "default_text": "1",
       "help": "Fragment-count apex: pick the scan with the most distinct matched fragments, allowing scans within `apex_count_tol` of that maximum (so a slightly-lower- count but much more intense scan can still win), then the max summed-top-3 intensity among them. Supersedes the summed-intensity apex when set.",
       "gates": [],
-      "source_line": 872
+      "source_line": 878
     },
     {
       "path": "extract.apex_count_window",
@@ -1053,7 +1054,7 @@
       "default_text": "1",
       "help": "Rolling-window width (in scan groups, centered, odd) for the distinct- fragment count that drives apex selection. Low-intensity fragments flicker in and out scan-to-scan; a single-scan count then spikes at noise scans and misplaces the apex. This sums the per-scan distinct-fragment count over a centered window so the apex lands in the region of *sustained* fragment presence, not an isolated flicker. A sum (not a mean) is used deliberately: edge truncation makes interior positions accumulate more, center-weighting the apex toward the RT-window centre (~= predicted RT) as a mild RT-prior; measured to beat a mean by ~+300 IDs on AIF. 1 = no smoothing (per-scan).",
       "gates": [],
-      "source_line": 882
+      "source_line": 888
     },
     {
       "path": "extract.apex_gaussian_sigma_scans",
@@ -1068,7 +1069,7 @@
       "gates": [
         "benchmark-gated"
       ],
-      "source_line": 890
+      "source_line": 896
     },
     {
       "path": "extract.emit_window_grid",
@@ -1081,7 +1082,7 @@
       "default_text": "true",
       "help": "Emit per-fragment chromatograms on the FULL isolation-window scan grid with 0.0 where a fragment is absent (aggregating scans of the same isolation window), so the elution profile drops to zero between peaks and the features-stage boundary calling is not misled by interpolated gaps.",
       "gates": [],
-      "source_line": 895
+      "source_line": 901
     },
     {
       "path": "extract.bucket_size",
@@ -1094,7 +1095,7 @@
       "default_text": "8192",
       "help": "m/z bucket size (power of two).",
       "gates": [],
-      "source_line": 897
+      "source_line": 903
     },
     {
       "path": "extract.peak_claim",
@@ -1107,7 +1108,7 @@
       "default_text": "`none`",
       "help": "How a shared observed peak's intensity is apportioned among co-isolated, co-eluting candidates that all match it (see `PeakClaim`).",
       "gates": [],
-      "source_line": 900,
+      "source_line": 906,
       "choices": [
         "none",
         "winner_predicted_intensity",
@@ -1131,7 +1132,7 @@
       "default_text": "false",
       "help": "Spectrum-centric NNLS demixing (D2, fragment-competition report). When true, at each accepted candidate's apex scan, assemble the co-isolated candidate x fragment design matrix, solve non-negative least squares (deterministic ridge-regularized), and emit non-destructive demix features (deconv_explained_frac, deconv_active, deconv_share) so the rescorer sees each candidate's interference-corrected abundance. Default false; changes no extracted intensity.",
       "gates": [],
-      "source_line": 910
+      "source_line": 916
     },
     {
       "path": "extract.demix_lambda",
@@ -1144,7 +1145,7 @@
       "default_text": "1.0",
       "help": "Ridge for the demix NNLS passive solve (keeps it PD/deterministic under the ~98% wide-window column collinearity). Default 1.0.",
       "gates": [],
-      "source_line": 913
+      "source_line": 919
     },
     {
       "path": "extract.demix_max_candidates",
@@ -1157,7 +1158,7 @@
       "default_text": "64",
       "help": "Cap on the number of co-isolated candidates (design-matrix columns) in a single demix solve, to bound compute on crowded windows. Default 64.",
       "gates": [],
-      "source_line": 916
+      "source_line": 922
     },
     {
       "path": "extract.demix_scan_stride",
@@ -1170,7 +1171,7 @@
       "default_text": "1",
       "help": "Scan stride for the DESTRUCTIVE `CoelutionDemix` redistribution: solve the per-scan NNLS every Nth scan and reuse the resulting candidate abundances to apportion the intervening scans (a re-solve is forced whenever a new candidate enters the co-isolated set, so accuracy is preserved where the population changes). This is the practicality lever - a full per-scan solve over the ~465k scans of a wide-window run is impractical. 1 (default) solves at every scan. Only affects `CoelutionDemix`; the non-destructive demix FEATURES are unaffected.",
       "gates": [],
-      "source_line": 924
+      "source_line": 930
     },
     {
       "path": "extract.emit_contested_features",
@@ -1183,7 +1184,7 @@
       "default_text": "false",
       "help": "Emit a non-destructive `contested_frac` per PSM: the fraction of a candidate's matched intensity that a co-eluting competitor claims more strongly (by the two-pass elution-profile arbitration). Does not alter the extracted intensities; feeds a rescorer feature. Forces the two-pass path.",
       "gates": [],
-      "source_line": 929
+      "source_line": 935
     },
     {
       "path": "extract.peak_claim_margin",
@@ -1196,7 +1197,7 @@
       "default_text": "2.0",
       "help": "Dominance factor for `CoelutionWinnerMargin`: a shared peak is claimed winner-take-all only if the top eluter's profile height is at least this multiple of the runner-up's; otherwise the peak stays shared.",
       "gates": [],
-      "source_line": 933
+      "source_line": 939
     },
     {
       "path": "extract.matcher",
@@ -1209,7 +1210,7 @@
       "default_text": "`fragindex`",
       "help": "Fragment-matcher backend (docs/06_predict_frag_index_matchers.md). Default `Fragindex`.",
       "gates": [],
-      "source_line": 936,
+      "source_line": 942,
       "choices": [
         "bucketed",
         "fragindex"
@@ -1226,7 +1227,7 @@
       "default_text": "0",
       "help": "Minimum-PSMs-per-peptide evidence filter: reject a candidate whose fragments co-elute over fewer than this many consecutive scan groups (`coelution_run`). A single/double-scan spike is a transient (likely-interferent) match; a real peptide persists across its elution. 0 disables (the `scan_window` floor still applies). This is the DIA analog of a \"seen in >= N PSMs\" requirement.",
       "gates": [],
-      "source_line": 942
+      "source_line": 948
     },
     {
       "path": "extract.ms1_rescue",
@@ -1239,7 +1240,7 @@
       "default_text": "false",
       "help": "Rescue a candidate that fails the single-scan fragment-Pearson gate when it has adequate matched fragments AND MS1 isotope-pattern support (mono + a plausible +1/mono ratio). Off by default: it relaxes acceptance, so enable it only with target-decoy/entrapment FDR validation. MS1 evidence is now computed before the gate so this can take effect.",
       "gates": [],
-      "source_line": 948
+      "source_line": 954
     },
     {
       "path": "extract.retain_top_peaks",
@@ -1255,7 +1256,7 @@
         "diagnostic",
         "not currently"
       ],
-      "source_line": 954
+      "source_line": 960
     },
     {
       "path": "extract.promote_top_peaks",
@@ -1270,7 +1271,7 @@
       "gates": [
         "gated"
       ],
-      "source_line": 964
+      "source_line": 970
     },
     {
       "path": "extract.alt_peak_min_area_frac",
@@ -1283,7 +1284,7 @@
       "default_text": "0.10",
       "help": "Minimum integrated area of a promoted alternate peak (rank >= 1) as a fraction of the rank-0 peak's area. Suppresses noise-level alternates. Only used when `promote_top_peaks > 1`.",
       "gates": [],
-      "source_line": 968
+      "source_line": 974
     },
     {
       "path": "extract.alt_peak_min_separation_s",
@@ -1296,7 +1297,7 @@
       "default_text": "5.0",
       "help": "Minimum apex-RT separation (seconds) between a promoted alternate peak and the rank-0 apex, so a near-duplicate of the selected peak is not re-emitted. Only used when `promote_top_peaks > 1`.",
       "gates": [],
-      "source_line": 972
+      "source_line": 978
     },
     {
       "path": "extract.emit_candidate_audit",
@@ -1311,7 +1312,7 @@
       "gates": [
         "diagnostic"
       ],
-      "source_line": 977
+      "source_line": 983
     },
     {
       "path": "extract.apex_evidence_rank",
@@ -1324,7 +1325,7 @@
       "default_text": "true",
       "help": "Evidence-count apex selection: choose the apex scan by the NUMBER of distinct co-eluting predicted fragments present (breadth of evidence), using observed signature-ion intensity only as a sub-integer tiebreak. In wide-window DIA a single fragment m/z channel is chimeric, so the tallest scan is often a co-isolated interferent; the scan where the most of the peptide's own predicted transitions co-elute is a more reliable apex. Default `true`, on correctness grounds rather than a count: `false` keeps the legacy signature-intensity apex, whose score is 0.0 at every qualifying scan when none of the top-K predicted fragments is observed, so the strict `>` never replaces the first candidate and the apex silently becomes the LOWEST-RT qualifying scan. The rolling distinct-fragment count (`apex_count_window`) still gates which scans qualify in both modes.",
       "gates": [],
-      "source_line": 990
+      "source_line": 996
     },
     {
       "path": "extract.emit_gate_diagnostics",
@@ -1339,7 +1340,7 @@
       "gates": [
         "diagnostic"
       ],
-      "source_line": 996
+      "source_line": 1002
     },
     {
       "path": "extract.gate_mode",
@@ -1352,7 +1353,7 @@
       "default_text": "`apex_pearson`",
       "help": "Which spectral-agreement score the `gate_min_score` gate thresholds (sensitivity program). The legacy gate uses a single apex-scan intensity Pearson, which one chimeric scan can dominate. See `GateMode`.",
       "gates": [],
-      "source_line": 1000,
+      "source_line": 1006,
       "choices": [
         "apex_pearson",
         "peak_spectral",
@@ -1372,7 +1373,7 @@
       "default_text": "0.5",
       "help": "Second threshold for `GateMode::Combined`: the co-elution score must exceed this while the peak-integrated spectral score exceeds `gate_min_score`. Requiring BOTH is more specific (rejects interferents that pass one axis).",
       "gates": [],
-      "source_line": 1004
+      "source_line": 1010
     },
     {
       "path": "extract.claim_cues.mz_close",
@@ -1478,7 +1479,7 @@
       "default_text": "`minimal`",
       "help": "",
       "gates": [],
-      "source_line": 1117,
+      "source_line": 1123,
       "choices": [
         "minimal",
         "rich",
@@ -1496,7 +1497,7 @@
       "default_text": "false",
       "help": "Write the Percolator-style `.pin` text file requested by `--out-pin`. No MuMDIA stage consumes it (`rescore` builds its own PIN for the sidecars); it exists for external tooling. At 1.5M rows x 387 features it is a ~5.4 GB text write. Default false: nothing in MuMDIA reads it, which makes the write pure cost unless an external tool wants the file. Set true to get the artifact back.",
       "gates": [],
-      "source_line": 1123
+      "source_line": 1129
     },
     {
       "path": "features.coelution_corr_threshold",
@@ -1509,7 +1510,7 @@
       "default_text": "0.9",
       "help": "",
       "gates": [],
-      "source_line": 1124
+      "source_line": 1130
     },
     {
       "path": "features.prec_tol_ppm",
@@ -1522,7 +1523,7 @@
       "default_text": "20.0",
       "help": "",
       "gates": [],
-      "source_line": 1125
+      "source_line": 1131
     },
     {
       "path": "features.bound_features",
@@ -1535,7 +1536,7 @@
       "default_text": "true",
       "help": "Restrict trace-based features (co-elution, profile, xcorr, interference, base width) to the elution peak around the apex rather than the whole extracted RT window, so they are not diluted over large RT stretches.",
       "gates": [],
-      "source_line": 1129
+      "source_line": 1135
     },
     {
       "path": "features.bound_peak_fraction",
@@ -1550,7 +1551,7 @@
       "gates": [
         "diagnostic"
       ],
-      "source_line": 1133
+      "source_line": 1139
     },
     {
       "path": "features.bound_peak_grace",
@@ -1563,7 +1564,7 @@
       "default_text": "0",
       "help": "Grace when walking the elution-peak boundary: number of consecutive sub-threshold scans to BRIDGE before stopping. 0 (default) stops at the first scan below `bound_peak_fraction` (brittle on jagged/gappy profiles); 1 bridges a single-scan dip (DIA sampling gap / noise), giving steadier boundaries.",
       "gates": [],
-      "source_line": 1138
+      "source_line": 1144
     },
     {
       "path": "features.bound_from_confident",
@@ -1576,7 +1577,7 @@
       "default_text": "true",
       "help": "Elution-peak boundary source. When true (default) a single set of left/right half-widths (seconds) is learned once from the confident seed PSMs (`spectrum_q <= 0.01`, target-only, the same set that anchors RT calibration / DeepLC fine-tune) and applied to EVERY candidate around its own apex. This removes per-candidate boundary manipulation so a decoy is scored over a real- peptide-width window centred on its apex. When false, each candidate detects its own peak boundary from its top-3-predicted-fragment profile (per-candidate, but noisy/manipulable for chimeric decoys; the legacy behaviour). If the seed yields < 20 confident anchors the stage logs a warning and falls back to per-candidate detection for that run.",
       "gates": [],
-      "source_line": 1149
+      "source_line": 1155
     },
     {
       "path": "features.bound_confident_pct",
@@ -1589,7 +1590,7 @@
       "default_text": "50.0",
       "help": "Percentile (0-100) of the confident-set half-widths taken as the global left/ right elution half-width when `bound_from_confident` is true. 50 = median (typical real peak width); higher percentiles widen the shared window.",
       "gates": [],
-      "source_line": 1153
+      "source_line": 1159
     },
     {
       "path": "features.ms1_precursor_features",
@@ -1604,7 +1605,7 @@
       "gates": [
         "benchmark-gated"
       ],
-      "source_line": 1160
+      "source_line": 1166
     },
     {
       "path": "compete.group_by",
@@ -1617,7 +1618,7 @@
       "default_text": "`peptidoform_charge`",
       "help": "Competition grouping: `precursor` collapses charge/modification siblings separately within each target/decoy label; targets and decoys therefore do not compete directly. `apex` also groups by rounded apex RT; `peptidoform_charge` keeps each peptidoform+charge as its own group (precursor-level, as DIA-NN/Spectronaut report), so sibling charges of one peptide are not collapsed.",
       "gates": [],
-      "source_line": 1193,
+      "source_line": 1199,
       "choices": [
         "base_peptide",
         "apex",
@@ -1635,7 +1636,7 @@
       "default_text": "5.0",
       "help": "",
       "gates": [],
-      "source_line": 1194
+      "source_line": 1200
     },
     {
       "path": "compete.mode",
@@ -1648,7 +1649,7 @@
       "default_text": "`winner_take_all`",
       "help": "How within-group competition resolves (sensitivity program, spec 04 §6 / P2.4). `winner_take_all` = legacy (keep only the top `prelim_score` per group). The other modes preserve more candidate evidence for the rescorer/ FDR to arbitrate. Default `winner_take_all` (unchanged behaviour).",
       "gates": [],
-      "source_line": 1199,
+      "source_line": 1205,
       "choices": [
         "winner_take_all",
         "none",
@@ -1670,7 +1671,7 @@
       "gates": [
         "gated"
       ],
-      "source_line": 1202
+      "source_line": 1208
     },
     {
       "path": "compete.unique_evidence_min_fragments",
@@ -1683,7 +1684,7 @@
       "default_text": "2",
       "help": "Minimum distinct unique-fragment count a loser must have to survive under `unique_evidence` (needs the `unique_fragment_count` feature; falls back to winner-take-all when the column is absent).",
       "gates": [],
-      "source_line": 1206
+      "source_line": 1212
     },
     {
       "path": "compete.emit_competition_audit",
@@ -1698,7 +1699,7 @@
       "gates": [
         "diagnostic"
       ],
-      "source_line": 1209
+      "source_line": 1215
     },
     {
       "path": "rescore.classifier",
@@ -1711,7 +1712,7 @@
       "default_text": "`native_tda`",
       "help": "",
       "gates": [],
-      "source_line": 1552,
+      "source_line": 1558,
       "choices": [
         "native_tda",
         "mokapot",
@@ -1731,7 +1732,7 @@
       "default_text": "3",
       "help": "",
       "gates": [],
-      "source_line": 1553
+      "source_line": 1559
     },
     {
       "path": "rescore.train_fdr",
@@ -1744,7 +1745,7 @@
       "default_text": "0.01",
       "help": "",
       "gates": [],
-      "source_line": 1554
+      "source_line": 1560
     },
     {
       "path": "rescore.num_iter",
@@ -1757,7 +1758,7 @@
       "default_text": "10",
       "help": "number of semi-supervised iterations for the native rescorer.",
       "gates": [],
-      "source_line": 1556
+      "source_line": 1562
     },
     {
       "path": "rescore.max_feature_matrix_gib",
@@ -1770,7 +1771,7 @@
       "default_text": "0.0",
       "help": "Refuse a rescore whose in-memory feature matrix would exceed this many GiB. 0 (default) means no ceiling, which is the previous behaviour. The matrix is `Vec<Vec<f64>>`: eight bytes per value, plus a heap allocation and a 24-byte spine entry per PSM. Nothing in the workspace estimates or checks available memory (there is deliberately no `sysinfo` dependency), so an experiment-wide rescore over enough runs was simply killed by the OS after however long it took to get there. `native_tda` additionally runs all folds in parallel, each holding an owned standardised copy of its training slice, so the true peak is roughly `(1 + folds) x` this figure. Setting a ceiling converts that into an error at startup, naming the estimate and the two ways out. It is not a batching implementation: sub-batching changes which PSMs share a pooled `q_value`, so it is the operator's decision, not a silent one.",
       "gates": [],
-      "source_line": 1571
+      "source_line": 1577
     },
     {
       "path": "rescore.python",
@@ -1783,7 +1784,7 @@
       "default_text": "null",
       "help": "",
       "gates": [],
-      "source_line": 1572
+      "source_line": 1578
     },
     {
       "path": "rescore.percolator_bin",
@@ -1796,7 +1797,7 @@
       "default_text": "null",
       "help": "Path to an external `percolator` executable. Parsed and never read: no stage launches percolator, and `RescorerKind` has no variant that would. It is the only silently inert config field in the tree, since the three MBR ones warn (see `validate`). Kept rather than deleted because the external-percolator path is still intended; `validate` now warns when it is set.",
       "gates": [],
-      "source_line": 1579
+      "source_line": 1585
     },
     {
       "path": "rescore.entrapment_marker",
@@ -1809,7 +1810,7 @@
       "default_text": "null",
       "help": "Protein-accession substring marking spike-in (entrapment) negatives, e.g. \"_HUMAN\". Required when `classifier = entrapment`; PSMs whose protein contains it are the empirical false population.",
       "gates": [],
-      "source_line": 1583
+      "source_line": 1589
     },
     {
       "path": "rescore.entrapment_exclude",
@@ -1822,7 +1823,7 @@
       "default_text": "null",
       "help": "If a protein also contains this substring it is NOT counted as entrapment (the sample's own species, e.g. \"_ECOLI\"): shared peptides then count as real targets. `None` = the marker alone decides.",
       "gates": [],
-      "source_line": 1587
+      "source_line": 1593
     },
     {
       "path": "rescore.entrapment_contaminant_markers",
@@ -1835,7 +1836,7 @@
       "default_text": "[]",
       "help": "Protein substrings marking genuine contaminants inside the spike-in proteome (e.g. \"KRT\", \"ALBU\", keratin/albumin entry-name tokens). A PSM matching `entrapment_marker` but also one of these is treated as a REAL target, not an entrapment negative: such peptides are truly present (handling contaminants) so using them as negatives mislabels real signal and inflates the estimated FDR. Empty = every spike-in hit is a negative.",
       "gates": [],
-      "source_line": 1594
+      "source_line": 1600
     },
     {
       "path": "rescore.entrapment_ratio",
@@ -1848,7 +1849,7 @@
       "default_text": "1.0",
       "help": "N_real_lib / N_entrap_lib. Scales the entrapment FDR estimate so it is unbiased when the spike-in library differs in size from the real one.",
       "gates": [],
-      "source_line": 1597
+      "source_line": 1603
     },
     {
       "path": "rescore.strict",
@@ -1861,7 +1862,7 @@
       "default_text": "true",
       "help": "When true, any sidecar/classifier failure or misconfiguration (Mokapot or entrapment sidecar error, unwired percolator, entrapment mode with no entrapment PSMs) is a hard error instead of a silent fall back to the native rescorer. Default true so a named scientific workflow cannot silently execute a different model; set false only for explicit legacy compatibility.",
       "gates": [],
-      "source_line": 1604
+      "source_line": 1610
     },
     {
       "path": "rescore.handoff",
@@ -1874,7 +1875,7 @@
       "default_text": "`parquet`",
       "help": "How the feature matrix reaches a sidecar rescorer. See `Handoff`. Defaults to `parquet`, which applies to nn_torch only; mokapot and entrapment sidecars always receive the tab-separated PIN.",
       "gates": [],
-      "source_line": 1609,
+      "source_line": 1615,
       "choices": [
         "tsv",
         "parquet"
@@ -1891,7 +1892,7 @@
       "default_text": "null",
       "help": "Restrict the classifier's input to these feature columns, by name. Absent (the default) falls through to `feature_preset`. The restriction is a projection, not a reordering: the columns keep the order of the feature schema, only those named are read out of the competed table, and the matrix, the sidecar handoff and the training all shrink with the list. Feature selection is a memory and I/O lever, not a speed one (docs/28 section 7), and any list must clear the sensitivity gate before it becomes a default. Mutually exclusive with `RescoreConfig::features_file`. Every name must exist in the competed table's schema; a missing one is an error, never a silent drop.",
       "gates": [],
-      "source_line": 1622
+      "source_line": 1628
     },
     {
       "path": "rescore.features_file",
@@ -1904,7 +1905,7 @@
       "default_text": "null",
       "help": "The same restriction, read from a file with one feature name per line (blank lines and `#` comments ignored), which is how a 100+ name list stays readable.",
       "gates": [],
-      "source_line": 1626
+      "source_line": 1632
     },
     {
       "path": "rescore.feature_preset",
@@ -1917,7 +1918,7 @@
       "default_text": "`all`",
       "help": "Named feature list used when neither `features` nor `features_file` is set. `all` is every feature the competed table carries. `compact` is the 114-name list of docs/28 section 12 (`bench/feature_selection/fs_union75_dedup.txt`, embedded in the binary), which with the hard-negative training recipe reproduced the full Extended set within seed noise on three pools (HYE A01 +1.2%, AIF -0.2%, entrapment +4.9%, spike-in FDP unchanged) at 3.4x less rescore memory. Preset names the table lacks are skipped with a log line rather than an error, so a preset tolerates a smaller `features.set`; the intersection must not be empty. Explicit lists stay strict. Default `all`: the projection is a memory lever (3.4x smaller rescore matrix), not a sensitivity one, and it cost 1.2% on the held-out HYE B01 pool under the default training (+0.2% / -0.1% / +1.5% on A01 / AIF / entrapment), so it is the option for pooled rescoring on small machines (docs/28 section 21), not the default.",
       "gates": [],
-      "source_line": 1639,
+      "source_line": 1645,
       "choices": [
         "all",
         "compact"
@@ -1934,7 +1935,7 @@
       "default_text": "2.0",
       "help": "Cap the decoys the sidecar TRAINS on at this multiple of the targets it selected that iteration; 0 trains on every decoy, which is about 19:1 on a DIA pool and is where the rescore spends its time. This thins gradient steps only. Selection, scoring, target-decoy competition and q-values still run over the full pool, so the cap cannot loosen the q threshold; what it can move is the learned boundary. Default 2 since 2026-09-16, measured against the previous 3 with three seeds on two pools and on the entrapment pool: Astral six-run pool 116,711 against 116,309 peptides (+0.35%), HYE B01 63,096 against 63,004 (+0.15%), AIF spike-in library +0.56% real peptides at an empirical FDP of 1.025% against 1.044%, at 16% less rescore wall. `1` with `margin` selection is still the recipe that loses 10% on the entrapment pool (docs/28).",
       "gates": [],
-      "source_line": 1652
+      "source_line": 1658
     },
     {
       "path": "rescore.train_neg_select",
@@ -1947,7 +1948,7 @@
       "default_text": "`hybrid`",
       "help": "Which decoys survive `RescoreConfig::train_neg_ratio`. See `NegSelect`.",
       "gates": [],
-      "source_line": 1654,
+      "source_line": 1660,
       "choices": [
         "random",
         "margin",
@@ -1965,7 +1966,7 @@
       "default_text": "0.0",
       "help": "Stratified thinning of whatever survived the cap: a fraction in (0, 1], or a row cap when > 1. Positives and negatives are thinned by the same factor, so the class balance is unchanged. 0 (the default) keeps every row.",
       "gates": [],
-      "source_line": 1659
+      "source_line": 1665
     },
     {
       "path": "rescore.train_warm_epochs",
@@ -1978,7 +1979,7 @@
       "default_text": "5",
       "help": "Reuse the previous iteration's weights and optimiser state, running this many epochs from the second self-training iteration on instead of a full fresh fit. 0 (the default) refits from scratch every iteration, which is 25 epochs x 10 iterations x 3 folds of the whole training set.",
       "gates": [],
-      "source_line": 1664
+      "source_line": 1670
     },
     {
       "path": "rescore.train_margin_frac",
@@ -1991,7 +1992,7 @@
       "default_text": "0.5",
       "help": "Under `train_neg_select = hybrid`, the share of the negative budget taken from the margin (highest-scoring decoys); the rest is sampled at random. Default 0.5.",
       "gates": [],
-      "source_line": 1668
+      "source_line": 1674
     },
     {
       "path": "rescore.seeds",
@@ -2004,7 +2005,7 @@
       "default_text": "1",
       "help": "Independent self-training passes whose out-of-fold scores are rank-averaged. 1 (the default) is a single pass. 3 was the one knob positive on every pool of the seeded sweep (docs/28 section 17), at three times the training cost.",
       "gates": [],
-      "source_line": 1673
+      "source_line": 1679
     },
     {
       "path": "quant.q_threshold",
@@ -2017,7 +2018,7 @@
       "default_text": "0.01",
       "help": "Peptide-level q-value cutoff for inclusion.",
       "gates": [],
-      "source_line": 1367
+      "source_line": 1373
     },
     {
       "path": "quant.top_n_fragments",
@@ -2030,7 +2031,7 @@
       "default_text": "3",
       "help": "Number of top fragments summed per peptidoform.",
       "gates": [],
-      "source_line": 1369
+      "source_line": 1375
     },
     {
       "path": "quant.top_n_peptides",
@@ -2043,7 +2044,7 @@
       "default_text": "3",
       "help": "Number of top peptides summed per protein group (TopNSum).",
       "gates": [],
-      "source_line": 1371
+      "source_line": 1377
     },
     {
       "path": "quant.rollup",
@@ -2056,7 +2057,7 @@
       "default_text": "`top_n_sum`",
       "help": "",
       "gates": [],
-      "source_line": 1372,
+      "source_line": 1378,
       "choices": [
         "top_n_sum",
         "sum"
@@ -2073,7 +2074,7 @@
       "default_text": "true",
       "help": "Integrate each fragment only over the detected elution-peak window rather than the whole chromatogram. The window is found from the summed XIC apex.",
       "gates": [],
-      "source_line": 1375
+      "source_line": 1381
     },
     {
       "path": "quant.peak_fraction",
@@ -2086,7 +2087,7 @@
       "default_text": "1.0 / 6.0 (0.166667)",
       "help": "Descent threshold for the peak-window walk: stop where the summed XIC drops below `peak_fraction` * apex height (1/6 expanded from the 1/3 feature bound).",
       "gates": [],
-      "source_line": 1378
+      "source_line": 1384
     },
     {
       "path": "quant.peak_grace",
@@ -2099,7 +2100,7 @@
       "default_text": "1",
       "help": "Zig-zag grace: bridge up to this many consecutive sub-threshold scans during the peak-window walk; the boundary triggers on `peak_grace + 1` consecutive sub-threshold scans (1 = stop on 2 consecutive misses).",
       "gates": [],
-      "source_line": 1382
+      "source_line": 1388
     },
     {
       "path": "quant.peak_window_mode",
@@ -2112,7 +2113,7 @@
       "default_text": "`per_candidate`",
       "help": "Per-candidate window vs a consensus width derived from confident peptides.",
       "gates": [],
-      "source_line": 1384,
+      "source_line": 1390,
       "choices": [
         "per_candidate",
         "consensus"
@@ -2129,7 +2130,7 @@
       "default_text": "0.001",
       "help": "Peptide q-value cutoff defining the \"confident\" set that calibrates the consensus half-widths (Consensus mode only). Tighter than `q_threshold`.",
       "gates": [],
-      "source_line": 1387
+      "source_line": 1393
     },
     {
       "path": "quant.q_filter",
@@ -2142,7 +2143,7 @@
       "default_text": "`peptide_q`",
       "help": "Which q-value column to filter candidates on (`peptide_q` default; `precursor_q` is single-run only; use `run_psm_q` for per-run slices of an experiment-wide rescore). See `QuantQColumn`.",
       "gates": [],
-      "source_line": 1391,
+      "source_line": 1397,
       "choices": [
         "peptide_q",
         "precursor_q",
@@ -2163,7 +2164,7 @@
       "gates": [
         "benchmark-gated"
       ],
-      "source_line": 1396
+      "source_line": 1402
     },
     {
       "path": "quant.fragment_selection",
@@ -2178,7 +2179,7 @@
       "gates": [
         "benchmark-gated"
       ],
-      "source_line": 1403,
+      "source_line": 1409,
       "choices": [
         "observed_area",
         "predicted"
@@ -2195,7 +2196,7 @@
       "default_text": "0",
       "help": "When > 0, integrate each fragment over the `2k+1` scans centred on the identification apex instead of the descent-walk window (`bound_peak` window ignored; falls back to it when the apex is unknown). A fixed narrow window is far less sensitive to interference in the peak wings than the walked bounds. 0 (default) = off.",
       "gates": [],
-      "source_line": 1409
+      "source_line": 1415
     },
     {
       "path": "quant.baseline_subtract",
@@ -2210,7 +2211,7 @@
       "gates": [
         "benchmark-gated"
       ],
-      "source_line": 1416
+      "source_line": 1422
     },
     {
       "path": "quant.baseline_flank_scans",
@@ -2223,7 +2224,7 @@
       "default_text": "12",
       "help": "Flank length (samples per side) used to estimate the background.",
       "gates": [],
-      "source_line": 1418
+      "source_line": 1424
     },
     {
       "path": "quant.baseline_quantile",
@@ -2236,7 +2237,7 @@
       "default_text": "0.25",
       "help": "Quantile of the flank intensities taken as the background level.",
       "gates": [],
-      "source_line": 1420
+      "source_line": 1426
     },
     {
       "path": "quant.fixed_window_s",
@@ -2249,7 +2250,7 @@
       "default_text": "0.0",
       "help": "When > 0, integrate each fragment over the samples within `fixed_window_s` seconds of the identification apex (instrument-independent alternative to `fixed_scan_halfwidth`, which it overrides). 0 (default) = off.",
       "gates": [],
-      "source_line": 1424
+      "source_line": 1430
     },
     {
       "path": "mbr.strategy",
@@ -2262,7 +2263,7 @@
       "default_text": "`none`",
       "help": "",
       "gates": [],
-      "source_line": 1505,
+      "source_line": 1511,
       "choices": [
         "none",
         "empirical_library",
@@ -2281,7 +2282,7 @@
       "default_text": "0.01",
       "help": "q-value for a precursor to become a cross-run anchor (validated at 0.01).",
       "gates": [],
-      "source_line": 1507
+      "source_line": 1513
     },
     {
       "path": "mbr.min_anchor_runs",
@@ -2294,7 +2295,7 @@
       "default_text": "2",
       "help": "Minimum number of OTHER runs a precursor must be confident in to transfer.",
       "gates": [],
-      "source_line": 1509
+      "source_line": 1515
     },
     {
       "path": "mbr.q_transfer",
@@ -2307,7 +2308,7 @@
       "default_text": "0.01",
       "help": "Accept threshold for a transferred identification's transfer q-value.",
       "gates": [],
-      "source_line": 1511
+      "source_line": 1517
     },
     {
       "path": "mbr.rt_window_s",
@@ -2323,7 +2324,7 @@
         "benchmark-gated",
         "not yet wired"
       ],
-      "source_line": 1518
+      "source_line": 1524
     },
     {
       "path": "mbr.decoy_transfer",
@@ -2338,7 +2339,7 @@
       "gates": [
         "not yet wired"
       ],
-      "source_line": 1521,
+      "source_line": 1527,
       "choices": [
         "permuted_rt",
         "reverse_sequence",
@@ -2356,7 +2357,7 @@
       "default_text": "0.0",
       "help": "Minimum correlation of the observed fragment pattern to the empirical consensus for a transfer to be accepted (interference guard; 0 disables).",
       "gates": [],
-      "source_line": 1524
+      "source_line": 1530
     },
     {
       "path": "mbr.requant_all",
@@ -2371,7 +2372,7 @@
       "gates": [
         "not yet wired"
       ],
-      "source_line": 1528
+      "source_line": 1534
     },
     {
       "path": "mbr.python",
@@ -2384,7 +2385,7 @@
       "default_text": "null",
       "help": "Python interpreter for the `mbr_worker.py` sidecar (pandas/pyarrow/numpy; e.g. the `py312_mumdia` env). Required when `strategy != None`.",
       "gates": [],
-      "source_line": 1531
+      "source_line": 1537
     },
     {
       "path": "experiment.parallel_runs",
@@ -2397,7 +2398,7 @@
       "default_text": "1",
       "help": "How many per-run search chains to execute concurrently. 1 (default) is strictly sequential, i.e. the historical behaviour. Runs are independent, so raising this scales nearly linearly in wall time, but EACH concurrent run holds its own extraction working set (tens of GB on a large library), so the practical ceiling is memory, not cores. Raise it deliberately after checking peak RSS for a single run; 2-4 is a reasonable start on a large-memory machine. Results are unaffected: chunks are processed in index order and completion order never reaches the output.",
       "gates": [],
-      "source_line": 1833
+      "source_line": 1839
     },
     {
       "path": "experiment.rt_library_scope",
@@ -2410,10 +2411,40 @@
       "default_text": "`first_run_only`",
       "help": "How often the library's retention times are adapted to a run: once on the first run and reused (`first_run_only`, the default) or separately for every run (`per_run`). Governs whichever adaptation is active -- `rt_im_train.finetune_deeplc` or `rt_im_train.multihead_calibration` -- because they are the same shape of work: one full re-prediction of the library against that run's confident seed PSMs, which on a 9.4M-row library is the most expensive step in the experiment. Each run then fits its own LOESS on top of whichever library it was given, and that per-run fit is what absorbs chromatographic drift. Accepts the old name `finetune_scope`, which is what it was called when only the fine-tune could be shared. `first_run_only` assumes the runs share an elution ORDER, which replicate injections on one LC method do. A per-run LOESS can stretch and bend the axis but cannot reorder two peptides, so a batch that genuinely reorders -- different gradients, different columns, a method change part-way -- wants `per_run`, and so does a long batch where drift accumulates (see the measured cost above).",
       "gates": [],
-      "source_line": 1854,
+      "source_line": 1860,
       "choices": [
         "first_run_only",
         "per_run"
+      ]
+    },
+    {
+      "path": "groups.window_groups",
+      "name": "window_groups",
+      "section": "groups",
+      "rust_type": "usize",
+      "kind": "integer",
+      "optional": false,
+      "default": 1,
+      "default_text": "1",
+      "help": "Number of window groups. `1` (the default) is the ordinary single-library search. Groups are contiguous bands of isolation windows balanced by the number of library precursors they select, read from the precursor table's row-group statistics.",
+      "gates": [],
+      "source_line": 1903
+    },
+    {
+      "path": "groups.calibration",
+      "name": "calibration",
+      "section": "groups",
+      "rust_type": "GroupCalibration",
+      "kind": "enum",
+      "optional": false,
+      "default": "global",
+      "default_text": "`global`",
+      "help": "Anchors for the RT calibration of each group; see `GroupCalibration`.",
+      "gates": [],
+      "source_line": 1905,
+      "choices": [
+        "global",
+        "per_group"
       ]
     }
   ],

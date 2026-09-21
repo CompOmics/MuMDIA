@@ -819,10 +819,16 @@ pub struct ExtractConfig {
     /// Isolation windows probed per batch before the candidates no later window can touch
     /// are scored and written. `None` (the default) uses the rayon thread count capped at
     /// 16. The hit accumulator holds the windows in flight, so this sets the stage's peak
-    /// almost linearly, while the accumulation phase it parallelises is a small part of the
-    /// wall clock: on the HYE benchmark at 32 threads, 32 in flight is 24.65 GiB / 5:00, 16
-    /// is 16.57 GiB / 5:04 and 8 is 12.31 GiB / 5:26, with identical output (docs/27 section
-    /// 3.10). Set 8 or 4 on a memory-bound machine. Not a sensitivity knob.
+    /// almost linearly: on the HYE benchmark at 32 threads, 32 in flight is 24.65 GiB, 16 is
+    /// 16.57 GiB and 8 is 12.31 GiB, with identical output (docs/27 section 3.10). It is a
+    /// memory knob only: each window is probed in parallel over sub-ranges of its
+    /// candidates, so a small batch still uses every thread. Set 8 or 4 on a memory-bound
+    /// machine. Not a sensitivity knob. It does move the chromatogram table's parquet row
+    /// group boundaries, which follow the flush batches, so two runs at different settings
+    /// produce files that differ byte for byte while holding the same rows in the same
+    /// order with the same values (measured on one band: 29,028,466 rows, 10.4 billion
+    /// trace elements, every per-column sum equal). Compare values, not bytes, across
+    /// settings.
     #[serde(default)]
     pub windows_in_flight: Option<usize>,
     pub fixed_scan_window: usize,
@@ -1863,6 +1869,50 @@ impl Default for ExperimentConfig {
     }
 }
 
+/// Which anchors the retention-time calibration of a window group is fitted on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum GroupCalibration {
+    /// The confident seed PSMs of every group, pooled (q re-estimated on the union), so
+    /// each group's LOESS and multi-head fit see the whole run's anchors. The default: a
+    /// group holds a fraction of the anchors, and the fit quality is what sets the RT
+    /// window that the extract of every group then pays for.
+    #[default]
+    Global,
+    /// Each group calibrates on its own seeds only. Cheaper by one pooling pass and fully
+    /// independent per group; kept for the comparison, not as a recommendation.
+    PerGroup,
+}
+
+/// Searching a run one isolation-window group at a time.
+///
+/// A group of isolation windows can only select precursors whose m/z lies in the group's
+/// band, so its seed, calibration, extract, features and compete need only that band of the
+/// library (`Library::load_with_fragment_offset`): the library, the hit accumulator and the
+/// accepted rows are all one band's worth instead of the whole run's, which is what bounds
+/// the memory of a search against a library of 10^8 precursors. Only rescore, quant and
+/// report see everything, after the group artifacts are pooled with library-wide ids. The
+/// groups run one after another in this process; `docs/33_window_groups.md` has the layout
+/// and the measurements.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct GroupsConfig {
+    /// Number of window groups. `1` (the default) is the ordinary single-library search.
+    /// Groups are contiguous bands of isolation windows balanced by the number of library
+    /// precursors they select, read from the precursor table's row-group statistics.
+    pub window_groups: usize,
+    /// Anchors for the RT calibration of each group; see [`GroupCalibration`].
+    pub calibration: GroupCalibration,
+}
+impl Default for GroupsConfig {
+    fn default() -> Self {
+        Self {
+            window_groups: 1,
+            calibration: GroupCalibration::Global,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -1883,6 +1933,8 @@ pub struct Config {
     pub mbr: MbrConfig,
     #[serde(default)]
     pub experiment: ExperimentConfig,
+    #[serde(default)]
+    pub groups: GroupsConfig,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -1902,6 +1954,7 @@ impl Default for Config {
             quant: t(),
             mbr: t(),
             experiment: t(),
+            groups: t(),
         }
     }
 }
@@ -2290,6 +2343,7 @@ impl Config {
             ),
             ("experiment.parallel_runs", self.experiment.parallel_runs),
             ("rescore.seeds", self.rescore.seeds),
+            ("groups.window_groups", self.groups.window_groups),
         ] {
             if value == 0 {
                 return Err(Invalid(format!("{name} must be >= 1")));

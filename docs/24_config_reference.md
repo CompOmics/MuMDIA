@@ -51,7 +51,7 @@ undocumented on purpose; those fields are counted under "Coverage".
 
 | Section | Struct | Fields | Stage document |
 |---|---|---|---|
-| [(top level)](#top-level) | `Config` | 15 | [docs/02_config_and_data_model.md](02_config_and_data_model.md) |
+| [(top level)](#top-level) | `Config` | 16 | [docs/02_config_and_data_model.md](02_config_and_data_model.md) |
 | [`convert`](#convert) | `ConvertConfig` | 4 |  |
 | [`prescan`](#prescan) | `PrescanConfig` | 7 | [docs/21_prescan.md](21_prescan.md) |
 | [`digest`](#digest) | `DigestConfig` | 6 | [docs/05_digest_peptidoforms.md](05_digest_peptidoforms.md) |
@@ -68,11 +68,12 @@ undocumented on purpose; those fields are counted under "Coverage".
 | [`quant`](#quant) | `QuantConfig` | 17 | [docs/12_quant_lfq_align_mbr_report_audit.md](12_quant_lfq_align_mbr_report_audit.md) |
 | [`mbr`](#mbr) | `MbrConfig` | 9 | [docs/12_quant_lfq_align_mbr_report_audit.md](12_quant_lfq_align_mbr_report_audit.md) |
 | [`experiment`](#experiment) | `ExperimentConfig` | 2 | [docs/01_overview_and_dataflow.md](01_overview_and_dataflow.md) |
+| [`groups`](#groups) | `GroupsConfig` | 2 |  |
 | [`peptidoforms.fixed_mods[] / peptidoforms.variable_mods[]`](#peptidoformsfixed_mods--peptidoformsvariable_mods) | `ResidueMod` | 2 | [docs/05_digest_peptidoforms.md](05_digest_peptidoforms.md) |
 
 ## (top level)
 
-`Config` (rust/mumdia/crates/mumdia-core/src/config.rs:1868). stage document: [docs/02_config_and_data_model.md](02_config_and_data_model.md).
+`Config` (rust/mumdia/crates/mumdia-core/src/config.rs:1918). stage document: [docs/02_config_and_data_model.md](02_config_and_data_model.md).
 
 | Field | Type | Default | Gated | Description |
 |---|---|---|---|---|
@@ -91,6 +92,7 @@ undocumented on purpose; those fields are counted under "Coverage".
 | `quant` | `QuantConfig` | the `QuantConfig` section's own defaults |  |  |
 | `mbr` | `MbrConfig` | the `MbrConfig` section's own defaults |  |  |
 | `experiment` | `ExperimentConfig` | the `ExperimentConfig` section's own defaults |  |  |
+| `groups` | `GroupsConfig` | the `GroupsConfig` section's own defaults |  |  |
 
 ## convert
 
@@ -221,7 +223,7 @@ Sequence-tag prescan (`mumdia prescan`). Prunes modification-bearing candidates 
 
 | Field | Type | Default | Gated | Description |
 |---|---|---|---|---|
-| `windows_in_flight` | `Option<usize>` | `null` |  | Isolation windows probed per batch before the candidates no later window can touch are scored and written. `None` (the default) uses the rayon thread count capped at 16. The hit accumulator holds the windows in flight, so this sets the stage's peak almost linearly, while the accumulation phase it parallelises is a small part of the wall clock: on the HYE benchmark at 32 threads, 32 in flight is 24.65 GiB / 5:00, 16 is 16.57 GiB / 5:04 and 8 is 12.31 GiB / 5:26, with identical output (docs/27 section 3.10). Set 8 or 4 on a memory-bound machine. Not a sensitivity knob. |
+| `windows_in_flight` | `Option<usize>` | `null` |  | Isolation windows probed per batch before the candidates no later window can touch are scored and written. `None` (the default) uses the rayon thread count capped at 16. The hit accumulator holds the windows in flight, so this sets the stage's peak almost linearly: on the HYE benchmark at 32 threads, 32 in flight is 24.65 GiB, 16 is 16.57 GiB and 8 is 12.31 GiB, with identical output (docs/27 section 3.10). It is a memory knob only: each window is probed in parallel over sub-ranges of its candidates, so a small batch still uses every thread. Set 8 or 4 on a memory-bound machine. Not a sensitivity knob. It does move the chromatogram table's parquet row group boundaries, which follow the flush batches, so two runs at different settings produce files that differ byte for byte while holding the same rows in the same order with the same values (measured on one band: 29,028,466 rows, 10.4 billion trace elements, every per-column sum equal). Compare values, not bytes, across settings. |
 | `fixed_scan_window` | `usize` | `3` |  |  |
 | `frag_tol_ppm` | `f64` | `20.0` |  |  |
 | `prec_tol_ppm` | `f64` | `20.0` |  |  |
@@ -276,7 +278,7 @@ Composable per-claimant weight cues for `PeakClaim::CoelutionMultiCue` (the modu
 
 ## features
 
-`FeaturesConfig` (rust/mumdia/crates/mumdia-core/src/config.rs:1116). stage document: [docs/10_features.md](10_features.md).
+`FeaturesConfig` (rust/mumdia/crates/mumdia-core/src/config.rs:1122). stage document: [docs/10_features.md](10_features.md).
 
 | Field | Type | Default | Gated | Description |
 |---|---|---|---|---|
@@ -293,7 +295,7 @@ Composable per-claimant weight cues for `PeakClaim::CoelutionMultiCue` (the modu
 
 ## compete
 
-`CompeteConfig` (rust/mumdia/crates/mumdia-core/src/config.rs:1186). stage document: [docs/11_compete_rescore_fdr.md](11_compete_rescore_fdr.md).
+`CompeteConfig` (rust/mumdia/crates/mumdia-core/src/config.rs:1192). stage document: [docs/11_compete_rescore_fdr.md](11_compete_rescore_fdr.md).
 
 | Field | Type | Default | Gated | Description |
 |---|---|---|---|---|
@@ -306,7 +308,7 @@ Composable per-claimant weight cues for `PeakClaim::CoelutionMultiCue` (the modu
 
 ## rescore
 
-`RescoreConfig` (rust/mumdia/crates/mumdia-core/src/config.rs:1551). stage document: [docs/11_compete_rescore_fdr.md](11_compete_rescore_fdr.md).
+`RescoreConfig` (rust/mumdia/crates/mumdia-core/src/config.rs:1557). stage document: [docs/11_compete_rescore_fdr.md](11_compete_rescore_fdr.md).
 
 | Field | Type | Default | Gated | Description |
 |---|---|---|---|---|
@@ -335,7 +337,7 @@ Composable per-claimant weight cues for `PeakClaim::CoelutionMultiCue` (the modu
 
 ## quant
 
-`QuantConfig` (rust/mumdia/crates/mumdia-core/src/config.rs:1365). stage document: [docs/12_quant_lfq_align_mbr_report_audit.md](12_quant_lfq_align_mbr_report_audit.md).
+`QuantConfig` (rust/mumdia/crates/mumdia-core/src/config.rs:1371). stage document: [docs/12_quant_lfq_align_mbr_report_audit.md](12_quant_lfq_align_mbr_report_audit.md).
 
 | Field | Type | Default | Gated | Description |
 |---|---|---|---|---|
@@ -359,7 +361,7 @@ Composable per-claimant weight cues for `PeakClaim::CoelutionMultiCue` (the modu
 
 ## mbr
 
-`MbrConfig` (rust/mumdia/crates/mumdia-core/src/config.rs:1504). stage document: [docs/12_quant_lfq_align_mbr_report_audit.md](12_quant_lfq_align_mbr_report_audit.md).
+`MbrConfig` (rust/mumdia/crates/mumdia-core/src/config.rs:1510). stage document: [docs/12_quant_lfq_align_mbr_report_audit.md](12_quant_lfq_align_mbr_report_audit.md).
 
 | Field | Type | Default | Gated | Description |
 |---|---|---|---|---|
@@ -375,7 +377,7 @@ Composable per-claimant weight cues for `PeakClaim::CoelutionMultiCue` (the modu
 
 ## experiment
 
-`ExperimentConfig` (rust/mumdia/crates/mumdia-core/src/config.rs:1823). stage document: [docs/01_overview_and_dataflow.md](01_overview_and_dataflow.md).
+`ExperimentConfig` (rust/mumdia/crates/mumdia-core/src/config.rs:1829). stage document: [docs/01_overview_and_dataflow.md](01_overview_and_dataflow.md).
 
 Options for the experiment-wide orchestrator (`mumdia run-experiment`).
 
@@ -383,6 +385,17 @@ Options for the experiment-wide orchestrator (`mumdia run-experiment`).
 |---|---|---|---|---|
 | `parallel_runs` | `usize` | `1` |  | How many per-run search chains to execute concurrently. 1 (default) is strictly sequential, i.e. the historical behaviour. Runs are independent, so raising this scales nearly linearly in wall time, but EACH concurrent run holds its own extraction working set (tens of GB on a large library), so the practical ceiling is memory, not cores. Raise it deliberately after checking peak RSS for a single run; 2-4 is a reasonable start on a large-memory machine. Results are unaffected: chunks are processed in index order and completion order never reaches the output. |
 | `rt_library_scope` | `RtLibraryScope` | `first_run_only` |  | How often the library's retention times are adapted to a run: once on the first run and reused (`first_run_only`, the default) or separately for every run (`per_run`). Governs whichever adaptation is active -- `rt_im_train.finetune_deeplc` or `rt_im_train.multihead_calibration` -- because they are the same shape of work: one full re-prediction of the library against that run's confident seed PSMs, which on a 9.4M-row library is the most expensive step in the experiment. Each run then fits its own LOESS on top of whichever library it was given, and that per-run fit is what absorbs chromatographic drift. Accepts the old name `finetune_scope`, which is what it was called when only the fine-tune could be shared. `first_run_only` assumes the runs share an elution ORDER, which replicate injections on one LC method do. A per-run LOESS can stretch and bend the axis but cannot reorder two peptides, so a batch that genuinely reorders -- different gradients, different columns, a method change part-way -- wants `per_run`, and so does a long batch where drift accumulates (see the measured cost above). |
+
+## groups
+
+`GroupsConfig` (rust/mumdia/crates/mumdia-core/src/config.rs:1899).
+
+Searching a run one isolation-window group at a time. A group of isolation windows can only select precursors whose m/z lies in the group's band, so its seed, calibration, extract, features and compete need only that band of the library (`Library::load_with_fragment_offset`): the library, the hit accumulator and the accepted rows are all one band's worth instead of the whole run's, which is what bounds the memory of a search against a library of 10^8 precursors. Only rescore, quant and report see everything, after the group artifacts are pooled with library-wide ids. The groups run one after another in this process; `docs/33_window_groups.md` has the layout and the measurements.
+
+| Field | Type | Default | Gated | Description |
+|---|---|---|---|---|
+| `window_groups` | `usize` | `1` |  | Number of window groups. `1` (the default) is the ordinary single-library search. Groups are contiguous bands of isolation windows balanced by the number of library precursors they select, read from the precursor table's row-group statistics. |
+| `calibration` | `GroupCalibration` | `global` |  | Anchors for the RT calibration of each group; see `GroupCalibration`. |
 
 ## peptidoforms.fixed_mods[] / peptidoforms.variable_mods[]
 
@@ -426,7 +439,7 @@ config file must use. The default variant is marked. Sorted by type name.
 
 ### `CompeteGroupBy`
 
-(rust/mumdia/crates/mumdia-core/src/config.rs:1253)
+(rust/mumdia/crates/mumdia-core/src/config.rs:1259)
 
 | Value | Default | Description |
 |---|---|---|
@@ -436,7 +449,7 @@ config file must use. The default variant is marked. Sorted by type name.
 
 ### `CompetitionMode`
 
-(rust/mumdia/crates/mumdia-core/src/config.rs:1232)
+(rust/mumdia/crates/mumdia-core/src/config.rs:1238)
 
 Within-group competition resolution (spec 04 §6). Only `WinnerTakeAll` removes candidates unconditionally; the others preserve candidates the rescorer can still discriminate, which is the sensitivity program's central principle ("preserve candidate evidence until the workflow can make a calibrated decision"). Target/decoy labels remain part of the competition key in every mode, so a target never competes against its own decoy (the null is preserved).
 
@@ -461,7 +474,7 @@ Within-group competition resolution (spec 04 §6). Only `WinnerTakeAll` removes 
 
 ### `DecoyTransfer`
 
-(rust/mumdia/crates/mumdia-core/src/config.rs:1495)
+(rust/mumdia/crates/mumdia-core/src/config.rs:1501)
 
 Decoy-transfer null for the MBR false-transfer FDR (M4). `ReverseSequence` transfers reverse/scramble decoys at the same expected RT; `PermutedRt` transfers real precursors to a decoupled (wrong) expected RT; `Both` combines them. The prototype's shuffled-RT null gave a ~0.6% in-window false rate vs 66.6% true (113x separation), so the transfer q-value is well-calibrated.
 
@@ -482,7 +495,7 @@ Decoy-transfer null for the MBR false-transfer FDR (M4). `ReverseSequence` trans
 
 ### `FeaturePreset`
 
-(rust/mumdia/crates/mumdia-core/src/config.rs:1687)
+(rust/mumdia/crates/mumdia-core/src/config.rs:1693)
 
 Named feature list for `RescoreConfig::feature_preset`.
 
@@ -513,7 +526,7 @@ Named feature list for `RescoreConfig::feature_preset`.
 
 ### `FragmentSelection`
 
-(rust/mumdia/crates/mumdia-core/src/config.rs:1430)
+(rust/mumdia/crates/mumdia-core/src/config.rs:1436)
 
 Fragment ranking for the quant top-N sum. See `QuantConfig::fragment_selection`.
 
@@ -524,7 +537,7 @@ Fragment ranking for the quant top-N sum. See `QuantConfig::fragment_selection`.
 
 ### `GateMode`
 
-(rust/mumdia/crates/mumdia-core/src/config.rs:1089)
+(rust/mumdia/crates/mumdia-core/src/config.rs:1095)
 
 Spectral-agreement score the extraction acceptance gate (`gate_min_score`) thresholds. All are computed at the gate from data already in hand.
 
@@ -536,9 +549,20 @@ Spectral-agreement score the extraction acceptance gate (`gate_min_score`) thres
 | `coelution` |  | Predicted-intensity-weighted mean CO-ELUTION correlation of each matched fragment's XIC to the signature reference over the elution peak (temporal agreement, orthogonal to intensity agreement). |
 | `combined` |  | Require BOTH: peak-integrated spectral Pearson >= `gate_min_score` AND the co-elution score >= `gate_coelution_min`. More specific (an interferent passing one axis is still rejected), for a cleaner FDR pool. |
 
+### `GroupCalibration`
+
+(rust/mumdia/crates/mumdia-core/src/config.rs:1875)
+
+Which anchors the retention-time calibration of a window group is fitted on.
+
+| Value | Default | Description |
+|---|---|---|
+| `global` | yes | The confident seed PSMs of every group, pooled (q re-estimated on the union), so each group's LOESS and multi-head fit see the whole run's anchors. The default: a group holds a fraction of the anchors, and the fit quality is what sets the RT window that the extract of every group then pays for. |
+| `per_group` |  | Each group calibrates on its own seeds only. Cheaper by one pooling pass and fully independent per group; kept for the comparison, not as a recommendation. |
+
 ### `Handoff`
 
-(rust/mumdia/crates/mumdia-core/src/config.rs:1793)
+(rust/mumdia/crates/mumdia-core/src/config.rs:1799)
 
 How the feature matrix crosses the Rust -> Python boundary for a sidecar rescorer.
 
@@ -572,7 +596,7 @@ Fragment-matcher backend for search-seed and extract (docs/06_predict_frag_index
 
 ### `MbrStrategy`
 
-(rust/mumdia/crates/mumdia-core/src/config.rs:1476)
+(rust/mumdia/crates/mumdia-core/src/config.rs:1482)
 
 Match-between-runs strategy (Stage D3, docs/12_quant_lfq_align_mbr_report_audit.md). Default `None` reproduces the current chain byte-for-byte. ONLY `None` VS NOT-`None` IS IMPLEMENTED. The three non-`None` variants are described below as the intended staging, but no code distinguishes them: every test in the tree is `strategy != None`, so selecting `RtTransfer` or `Full` today behaves exactly like `EmpiricalLibrary`. They are kept as the recorded design ladder rather than deleted because the MBR tier is planned and benchmark-gated (CLAUDE.md); `validate()` warns when a non-`None` variant is selected so a config cannot quietly expect more than it gets. Intended staging: `EmpiricalLibrary` builds the consensus anchor library only; `RtTransfer` adds cross-run expected-RT transfer extraction; `Full` adds requantification. All require >= 2 runs and a decoy-transfer FDR (see the plan).
 
@@ -585,7 +609,7 @@ Match-between-runs strategy (Stage D3, docs/12_quant_lfq_align_mbr_report_audit.
 
 ### `NegSelect`
 
-(rust/mumdia/crates/mumdia-core/src/config.rs:1698)
+(rust/mumdia/crates/mumdia-core/src/config.rs:1704)
 
 Which decoys survive the training-set negative cap.
 
@@ -615,7 +639,7 @@ Fragment-peak apportionment when one observed MS2 peak matches the fragments of 
 
 ### `PeakWindowMode`
 
-(rust/mumdia/crates/mumdia-core/src/config.rs:1289)
+(rust/mumdia/crates/mumdia-core/src/config.rs:1295)
 
 How the elution-peak integration window is chosen per candidate in quant.
 
@@ -626,7 +650,7 @@ How the elution-peak integration window is chosen per candidate in quant.
 
 ### `QuantQColumn`
 
-(rust/mumdia/crates/mumdia-core/src/config.rs:1344)
+(rust/mumdia/crates/mumdia-core/src/config.rs:1350)
 
 Which q-value column quant filters candidates on. Peptide- or precursor-level q is appropriate for a single-run rescore. Under experiment-wide rescoring, those grouped q-values are pooled and carried only on the best PSM across all runs, so filtering per-run slices on them creates disjoint quant sets. `RunPsmQ` is the run-local FDR gate for that cross-run workflow; `PsmQ` keeps the pooled per-PSM gate available when that is explicitly intended.
 
@@ -651,7 +675,7 @@ Which q-value column quant filters candidates on. Peptide- or precursor-level q 
 
 ### `RollupMethod`
 
-(rust/mumdia/crates/mumdia-core/src/config.rs:1278)
+(rust/mumdia/crates/mumdia-core/src/config.rs:1284)
 
 | Value | Default | Description |
 |---|---|---|
@@ -660,7 +684,7 @@ Which q-value column quant filters candidates on. Peptide- or precursor-level q 
 
 ### `RtLibraryScope`
 
-(rust/mumdia/crates/mumdia-core/src/config.rs:1756)
+(rust/mumdia/crates/mumdia-core/src/config.rs:1762)
 
 How many DeepLC fine-tunes an experiment pays for.
 
@@ -823,11 +847,11 @@ Every field whose struct has an `impl Default` resolved from the source.
 
 2 environment read(s) whose name is not a literal:
 
-- `rust/mumdia/crates/mumdia/src/stages/extract.rs:2705: env read via closure of `&mut flushed``
-- `rust/mumdia/crates/mumdia/src/stages/extract.rs:2723: env read via closure of `&mut cand_hits``
+- `rust/mumdia/crates/mumdia/src/stages/extract.rs:2760: env read via closure of `&mut flushed``
+- `rust/mumdia/crates/mumdia/src/stages/extract.rs:2778: env read via closure of `&mut cand_hits``
 
 ## Coverage
 
-18 structs and 189 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 24 enumerations, 1 named profile(s), 66 environment variables read and 19 set.
+19 structs and 192 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 25 enumerations, 1 named profile(s), 66 environment variables read and 19 set.
 
-20 field(s) carry a gating marker in their doc comment. 47 field(s) carry no doc comment at all, so their description is empty above. 0 default(s) could not be resolved and 2 have none by design.
+20 field(s) carry a gating marker in their doc comment. 48 field(s) carry no doc comment at all, so their description is empty above. 0 default(s) could not be resolved and 2 have none by design.

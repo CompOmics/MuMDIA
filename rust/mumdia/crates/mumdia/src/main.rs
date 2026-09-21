@@ -252,6 +252,13 @@ enum Cmd {
         /// survivors, keeping the two-pass profile map small.
         #[arg(long)]
         restrict_candidates: Option<String>,
+        /// The library row that `--lib-precursors` row 0 came from, when that table is one
+        /// isolation-window band of a larger library (`groups.window_groups` writes such
+        /// bands, with ids rebased to `0..n`). The band's fragments are then read from the
+        /// shared `--lib-fragments` table by that id range, selectively when the table is
+        /// sorted by `candidate_id`, so a band needs no fragment table of its own.
+        #[arg(long)]
+        fragment_offset: Option<u32>,
         #[arg(long)]
         config: Option<String>,
     },
@@ -1177,6 +1184,7 @@ fn real_main() -> Result<()> {
             let cfg = load_config(&config)?;
             let ch = mumdia_io::hash::blake3_str(&cfg.canonical_json());
             stages::search_seed::run(stages::search_seed::SearchSeedParams {
+                fragment_offset: None,
                 ms2: &ms2,
                 library_precursors: &lib_precursors,
                 library_fragments: &lib_fragments,
@@ -1215,6 +1223,7 @@ fn real_main() -> Result<()> {
             }
             let ch = mumdia_io::hash::blake3_str(&cfg.canonical_json());
             stages::rt_im_train::run(stages::rt_im_train::RtImTrainParams {
+                anchor_irt_from_seed: false,
                 seed_psms: &seed_psms,
                 library_precursors: &lib_precursors,
                 out_windows: &out_windows,
@@ -1261,11 +1270,13 @@ fn real_main() -> Result<()> {
             out_psms,
             out_chromatograms,
             restrict_candidates,
+            fragment_offset,
             config,
         } => {
             let cfg = load_config(&config)?;
             let ch = mumdia_io::hash::blake3_str(&cfg.canonical_json());
             stages::extract::run(stages::extract::ExtractParams {
+                fragment_offset,
                 ms2: &ms2,
                 library_precursors: &lib_precursors,
                 library_fragments: &lib_fragments,
