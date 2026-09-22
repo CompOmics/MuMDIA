@@ -255,6 +255,24 @@ enum Cmd {
         #[arg(long)]
         config: Option<String>,
     },
+    /// Pool a grouped run's band artifacts into the run-level tables.
+    ///
+    /// `run` does this itself at the end of a grouped search (`groups.window_groups`).
+    /// Standalone it is for the case where the search finished and the run did not: the
+    /// band directories hold everything, and pooling them is a byte copy of their parquet
+    /// row groups, so a killed run costs a pool rather than a re-search.
+    Pool {
+        /// The run's `groups/` directory, holding the `gNN/` band directories.
+        #[arg(long)]
+        groups_dir: String,
+        /// Where the pooled tables go. Default: the parent of `--groups-dir`, which is
+        /// where a run writes them.
+        #[arg(long)]
+        out_dir: Option<String>,
+        /// Also pool `psms_extracted`, which only the candidate audit reads.
+        #[arg(long)]
+        psms: bool,
+    },
     /// Keep the best candidate per competition group -> psms_competed.parquet.
     Compete {
         #[arg(long)]
@@ -1293,6 +1311,72 @@ fn real_main() -> Result<()> {
                 cfg: &cfg.compete,
                 config_hash: &ch,
             })?;
+        }
+        Cmd::Pool {
+            groups_dir,
+            out_dir,
+            psms,
+        } => {
+            let out_dir = out_dir.unwrap_or_else(|| {
+                std::path::Path::new(&groups_dir)
+                    .parent()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_else(|| ".".to_string())
+            });
+            // Band directories in band order: the pooled row order is the bands' order,
+            // and `gNN` sorts lexically into it.
+            let mut dirs: Vec<std::path::PathBuf> = std::fs::read_dir(&groups_dir)
+                .with_context(|| format!("reading {groups_dir}"))?
+                .filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| {
+                    p.is_dir()
+                        && p.file_name()
+                            .and_then(|n| n.to_str())
+                            .is_some_and(|n| n.starts_with('g'))
+                })
+                .collect();
+            dirs.sort();
+            let bands: Vec<stages::pool::BandArtifacts> = dirs
+                .iter()
+                .map(|d| {
+                    let f = |n: &str| d.join(n).to_string_lossy().to_string();
+                    stages::pool::BandArtifacts {
+                        psms: f("psms_extracted.parquet"),
+                        chromatograms: f("chromatograms.parquet"),
+                        competed: f("psms_competed.parquet"),
+                    }
+                })
+                .filter(|b| std::path::Path::new(&b.competed).exists())
+                .collect();
+            if bands.is_empty() {
+                anyhow::bail!(
+                    "no band directory under {groups_dir} holds a psms_competed.parquet"
+                );
+            }
+            let out = |n: &str| format!("{out_dir}/{n}");
+            let (op, oc, ok) = (
+                out("psms_extracted.parquet"),
+                out("chromatograms.parquet"),
+                out("psms_competed.parquet"),
+            );
+            let stats = stages::pool::run(stages::pool::PoolParams {
+                bands: &bands,
+                out_psms: psms.then_some(op.as_str()),
+                out_chromatograms: &oc,
+                out_competed: &ok,
+            })?;
+            println!(
+                "pooled {} bands: {} competed rows, {} chromatogram rows, {} overlap                  duplicates removed{}",
+                bands.len(),
+                stats.competed,
+                stats.chromatograms,
+                stats.duplicates,
+                if psms {
+                    format!(", {} extracted rows", stats.psms)
+                } else {
+                    String::new()
+                }
+            );
         }
         Cmd::Audit {
             lib_precursors,
