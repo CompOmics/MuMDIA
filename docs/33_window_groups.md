@@ -405,6 +405,22 @@ calibration file it was handed, accepted 12,414 candidates at 11.400 ppm and 8,7
 A control arm, unbanded on the same adapted library, reproduced the unbanded arm's 113,860
 peptides exactly, which rules out the seeding difference between the arms.
 
+Fitting the calibration once on the bands' pooled deviations settles it. The banded arm
+repeated on that build reproduces the unbanded calibration to eight significant figures and
+selects the same calibrants:
+
+| | unbanded | banded, per-band scalars | banded, pooled deviations |
+|---|---|---|---|
+| offset | -1.8486016959 | -1.8834 | -1.8486016989 |
+| tolerance | 8.452381550 | 11.400 | 8.452381790 |
+| calibrant deviations | 181,196 | 200,257 | 181,196 |
+| residual MAD | 0.90689065 | 1.035 | 0.90689063 |
+
+The residual difference is the sidecar storing deviations as f32. Downstream, the banded run
+then extracts the SAME candidate set as the unbanded one, to the row: 4,986,153 accepted and
+74,115,941 chromatogram rows in both. So banding is identification-neutral on this data once
+the calibration is fitted once, and what it costs is the fixed per-band work above.
+
 ### `groups.parallel` and the thread count
 
 A band in flight occupies one rayon worker, which then blocks on its own extraction's
