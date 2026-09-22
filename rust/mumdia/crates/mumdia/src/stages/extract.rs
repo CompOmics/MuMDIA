@@ -344,6 +344,41 @@ impl HitRun {
     }
 }
 
+/// Receive one probing result, executing pending pool work while waiting instead of
+/// parking.
+///
+/// The consumer runs on the thread that called `accumulate_groups`, and under
+/// `groups.parallel` that thread is itself a rayon worker: a plain blocking `recv` parks
+/// one worker per band in flight, so 24 bands parked 24 of 32 threads and the pool ran on
+/// what was left. `yield_now` executes one queued task instead, which is usually one of
+/// this batch's own probes. When the pool has nothing queued it returns `Idle` (or `None`
+/// off a worker thread), and a short blocking wait then avoids a spin.
+///
+/// Scheduling only: the results are still consumed in arrival order and reordered by
+/// sub-range, so nothing about the output depends on this.
+fn recv_participating<T>(rx: &std::sync::mpsc::Receiver<T>) -> T {
+    use std::sync::mpsc::{RecvTimeoutError, TryRecvError};
+    loop {
+        match rx.try_recv() {
+            Ok(v) => return v,
+            Err(TryRecvError::Disconnected) => {
+                panic!("every probing task sends exactly one store")
+            }
+            Err(TryRecvError::Empty) => {}
+        }
+        if let Some(rayon::Yield::Executed) = rayon::yield_now() {
+            continue;
+        }
+        match rx.recv_timeout(std::time::Duration::from_millis(1)) {
+            Ok(v) => return v,
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => {
+                panic!("every probing task sends exactly one store")
+            }
+        }
+    }
+}
+
 /// Gather up to `max_cands` candidates below `bound` out of `runs`, ascending by candidate
 /// id, appending each candidate's hits run by run. Runs are held in window order, so a
 /// candidate seen in several windows keeps exactly the hit sequence the serial path
@@ -459,6 +494,49 @@ struct Contested {
     n_won: u32,
     n_lost: u32,
     apportioned: f64,
+}
+
+/// The `--restrict-candidates` allowlist, as a bitset over the dense candidate id range.
+///
+/// The allowlist used to be a `HashSet<u32>` probed once per VERIFIED POSTING, inside the
+/// probe callback: a hash and a bucket load for every fragment match of every peak of
+/// every scan. Candidate ids are dense `0..ncand` (`index.rs`), so one bit per candidate
+/// answers the same question with a shift and a load, and it is one allocation of
+/// `ncand / 8` bytes instead of a hash table of the allowlist -- smaller as soon as the
+/// allowlist holds more than about a sixty-fourth of the library, which is the case the
+/// allowlist exists for (a prior gate-on pass over a 35M-83M candidate library).
+struct CandMask {
+    bits: Vec<u64>,
+    n: usize,
+}
+
+impl CandMask {
+    fn new(n: usize) -> CandMask {
+        CandMask {
+            bits: vec![0; n.div_ceil(64)],
+            n,
+        }
+    }
+
+    fn insert(&mut self, c: u32) {
+        let i = c as usize;
+        if i < self.n {
+            self.bits[i >> 6] |= 1u64 << (i & 63);
+        }
+    }
+
+    /// Ids outside `0..n` are absent. The probe only ever asks about ids it produced, so
+    /// they are in range by construction; an out-of-range id in the allowlist file could
+    /// not have matched the hash set either, because no probe would ask for it.
+    #[inline]
+    fn contains(&self, c: u32) -> bool {
+        let i = c as usize;
+        i < self.n && self.bits[i >> 6] & (1u64 << (i & 63)) != 0
+    }
+
+    fn len(&self) -> usize {
+        self.bits.iter().map(|w| w.count_ones() as usize).sum()
+    }
 }
 
 /// Ordinals a [`FragSet`] holds in its inline bitmask; above this it spills to a sorted
@@ -1119,7 +1197,7 @@ fn accumulate_groups(
     rt_hi: &[f64],
     mass_off: &MassOffset,
     cfg: &ExtractConfig,
-    restrict: Option<&std::collections::HashSet<u32>>,
+    restrict: Option<&CandMask>,
     // First candidate a window of a LATER batch can still add hits to; nothing at or above
     // it may be flushed here.
     bound: u32,
@@ -1209,7 +1287,7 @@ fn accumulate_groups(
                         // serial path applies it: a candidate outside the list neither
                         // collects hits nor competes for a shared peak.
                         if let Some(s) = restrict {
-                            if !s.contains(&cid) {
+                            if !s.contains(cid) {
                                 return;
                             }
                         }
@@ -1301,7 +1379,7 @@ fn accumulate_groups(
             let mut next_k = 0usize;
             let mut stopped = false;
             for _ in 0..n {
-                let (k, gi, store) = rx.recv().expect("every task sends exactly one store");
+                let (k, gi, store) = recv_participating(&rx);
                 arrived[k] += 1;
                 pending.insert((k, gi), store);
                 while next_k < n_sub && arrived[next_k] == expected[next_k] {
@@ -1381,7 +1459,7 @@ fn extract_twopass_windows(
     mass_off: &MassOffset,
     frag_tol: f64,
     cfg: &ExtractConfig,
-    restrict: Option<&std::collections::HashSet<u32>>,
+    restrict: Option<&CandMask>,
     reassign: bool,
     claim_margin: f32,
 ) -> (HashMap<u32, Vec<Hit>>, HashMap<u32, Contested>) {
@@ -1436,7 +1514,7 @@ fn extract_twopass_windows(
                                 return;
                             }
                             if let Some(s) = restrict {
-                                if !s.contains(&cid) {
+                                if !s.contains(cid) {
                                     return;
                                 }
                             }
@@ -1490,7 +1568,7 @@ fn extract_twopass_windows(
                                     return;
                                 }
                                 if let Some(s) = restrict {
-                                    if !s.contains(&cid) {
+                                    if !s.contains(cid) {
                                         return;
                                     }
                                 }
@@ -1561,7 +1639,7 @@ fn extract_twopass_windows(
                                     return;
                                 }
                                 if let Some(s) = restrict {
-                                    if !s.contains(&cid) {
+                                    if !s.contains(cid) {
                                         return;
                                     }
                                 }
@@ -1672,7 +1750,7 @@ fn extract_twopass_windows(
                                     return;
                                 }
                                 if let Some(s) = restrict {
-                                    if !s.contains(&cid) {
+                                    if !s.contains(cid) {
                                         return;
                                     }
                                 }
@@ -1744,7 +1822,7 @@ fn extract_twopass_windows(
                                 return;
                             }
                             if let Some(s) = restrict {
-                                if !s.contains(&cid) {
+                                if !s.contains(cid) {
                                     return;
                                 }
                             }
@@ -1915,10 +1993,13 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
     // Optional candidate allowlist (gate-first-then-compete): restrict extraction to
     // the accepted survivors of a prior gate-on run so the two-pass peak-claim profile
     // map stays small.
-    let restrict: Option<std::collections::HashSet<u32>> = match p.restrict_candidates {
+    let restrict: Option<CandMask> = match p.restrict_candidates {
         Some(path) => {
             let t = TableFile::open(path)?;
-            let s: std::collections::HashSet<u32> = t.u32("candidate_id")?.into_iter().collect();
+            let mut s = CandMask::new(lib.n_candidates());
+            for c in t.u32("candidate_id")? {
+                s.insert(c);
+            }
             info!(
                 restrict_candidates = s.len(),
                 "extract: restricting to candidate allowlist"
@@ -2144,7 +2225,7 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
                                 return;
                             }
                             if let Some(s) = &restrict {
-                                if !s.contains(&cid) {
+                                if !s.contains(cid) {
                                     return;
                                 }
                             }
@@ -3458,6 +3539,54 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
         "extract: done"
     );
     Ok((n_psms, n_chrom))
+}
+
+#[cfg(test)]
+mod cand_mask_tests {
+    use super::CandMask;
+
+    /// The allowlist bitset must answer exactly what the `HashSet<u32>` answered for every
+    /// id the probe can produce, which is every id in `0..ncand`.
+    #[test]
+    fn answers_the_same_as_the_hash_set() {
+        let n = 1000usize;
+        let ids: Vec<u32> = vec![0, 1, 63, 64, 65, 127, 128, 500, 999, 500];
+        let reference: std::collections::HashSet<u32> = ids.iter().copied().collect();
+        let mut mask = CandMask::new(n);
+        for &c in &ids {
+            mask.insert(c);
+        }
+        assert_eq!(
+            mask.len(),
+            reference.len(),
+            "duplicates must not be counted"
+        );
+        for c in 0..n as u32 {
+            assert_eq!(mask.contains(c), reference.contains(&c), "id {c}");
+        }
+    }
+
+    /// An id past the library's candidate count cannot be asked about by the probe, so it
+    /// must not panic and must not be stored.
+    #[test]
+    fn ids_outside_the_library_are_absent() {
+        let mut mask = CandMask::new(64);
+        mask.insert(5);
+        mask.insert(64);
+        mask.insert(u32::MAX);
+        assert_eq!(mask.len(), 1);
+        assert!(mask.contains(5));
+        assert!(!mask.contains(64) && !mask.contains(u32::MAX));
+    }
+
+    /// An empty library gives an empty mask rather than an out-of-bounds write.
+    #[test]
+    fn an_empty_library_gives_an_empty_mask() {
+        let mut mask = CandMask::new(0);
+        mask.insert(0);
+        assert_eq!(mask.len(), 0);
+        assert!(!mask.contains(0));
+    }
 }
 
 #[cfg(test)]
