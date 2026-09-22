@@ -5,7 +5,7 @@
 //! selection. Deterministic (weights start at zero, no RNG). Port features, not
 //! classifiers; the model is intentionally simple and swappable.
 
-use crate::fdr::target_decoy_q;
+use crate::fdr::target_decoy_q_split;
 use rayon::prelude::*;
 
 /// Column mean/std over a SUBSET of rows (guarded; std < 1e-9 -> 1.0). Fitting the
@@ -117,12 +117,12 @@ impl FeatureMatrix {
     }
 }
 
-fn fit_standardizer(x: &FeatureMatrix, idx: &[usize]) -> (Vec<f64>, Vec<f64>) {
+fn fit_standardizer(x: &FeatureMatrix, idx: &[u32]) -> (Vec<f64>, Vec<f64>) {
     let d = x.n_features();
     let n = idx.len().max(1) as f64;
     let mut mean = vec![0.0; d];
     for &i in idx {
-        for (m, v) in mean.iter_mut().zip(x.row(i)) {
+        for (m, v) in mean.iter_mut().zip(x.row(i as usize)) {
             *m += *v as f64;
         }
     }
@@ -131,7 +131,7 @@ fn fit_standardizer(x: &FeatureMatrix, idx: &[usize]) -> (Vec<f64>, Vec<f64>) {
     }
     let mut std = vec![0.0; d];
     for &i in idx {
-        for ((s, v), m) in std.iter_mut().zip(x.row(i)).zip(&mean) {
+        for ((s, v), m) in std.iter_mut().zip(x.row(i as usize)).zip(&mean) {
             let dd = *v as f64 - *m;
             *s += dd * dd;
         }
@@ -315,102 +315,133 @@ pub fn percolator_lite(inp: RescoreInput) -> Vec<f64> {
     if n == 0 {
         return Vec::new();
     }
+    // Every per-PSM bookkeeping vector below is u32-indexed; `fdr.rs` already asserts the
+    // same bound for the q kernels this calls into.
+    assert!(
+        n <= u32::MAX as usize,
+        "percolator_lite: {n} rows exceeds the u32 row index"
+    );
     let folds = inp.folds.max(1);
+    let d = inp.features.n_features();
 
     // Fold assignment by fold_key (base peptide): all charge/mod variants of a
-    // peptide share a fold, so none leaks between train and test.
-    let fold_of: Vec<usize> = inp.fold_key.iter().map(|c| (*c as usize) % folds).collect();
-
-    // Folds are independent: each fits its own scaler + weights on its training
-    // rows and scores only its own (disjoint) test set. Standardization is fit on
-    // the TRAIN fold only (no test leakage), which is why each fold owns its scaler.
-    let per_fold: Vec<Vec<(usize, f64)>> = (0..folds)
-        .into_par_iter()
-        .map(|test_fold| {
-            let train_idx: Vec<usize> = (0..n).filter(|&i| fold_of[i] != test_fold).collect();
-            let test_idx: Vec<usize> = (0..n).filter(|&i| fold_of[i] == test_fold).collect();
-            if train_idx.is_empty() || test_idx.is_empty() {
-                return Vec::new();
-            }
-            let (mean, std) = fit_standardizer(inp.features, &train_idx);
-            // Standardized train matrix: ONE flat allocation of `train_rows * d`, row-major,
-            // sliced with `chunks_exact(d)` below. It used to be a `Vec<Vec<f32>>`, which is
-            // one heap block per training row -- the exact layout the comment on
-            // `FeatureMatrix` records was removed from the matrix itself, surviving one
-            // level down and multiplied by `folds`, since every fold is live at once inside
-            // this parallel map. At experiment scale (11.6M PSMs, 3 folds) that is ~23M
-            // live blocks here; now it is 3. Same values, same order, so the fit is
-            // bit-identical.
-            let d = inp.features.n_features();
-            let mut xtr: Vec<f32> = vec![0.0; train_idx.len().saturating_mul(d)];
-            xtr.par_chunks_mut(d.max(1))
-                .zip(train_idx.par_iter())
-                .for_each(|(out, &i)| std_row_into(inp.features.row(i), &mean, &std, out));
-            let xrow = |k: usize| -> &[f32] { &xtr[k * d..(k + 1) * d] };
-            let mut train_scores: Vec<f64> = train_idx.iter().map(|&i| inp.init_score[i]).collect();
-            let mut w = vec![0.0; inp.features.n_features() + 1];
-            let mut sd: Vec<(f64, bool)> = Vec::with_capacity(train_idx.len());
-            for _ in 0..inp.num_iter.max(1) {
-                sd.clear();
-                sd.extend(
-                    train_idx
-                        .iter()
-                        .enumerate()
-                        .map(|(k, &i)| (train_scores[k], inp.is_decoy[i])),
-                );
-                let q = target_decoy_q(&sd);
-                // positive set: confident targets; negatives: all decoys
-                let mut rows: Vec<&[f32]> = Vec::new();
-                let mut ys: Vec<f64> = Vec::new();
-                let mut n_pos = 0;
-                for (k, &i) in train_idx.iter().enumerate() {
-                    if inp.is_decoy[i] {
-                        rows.push(xrow(k));
-                        ys.push(0.0);
-                    } else if q[k] <= inp.train_fdr {
-                        rows.push(xrow(k));
-                        ys.push(1.0);
-                        n_pos += 1;
-                    }
-                }
-                // fallback: if too few confident targets, take the top-scoring half
-                if n_pos < 10 {
-                    let mut order: Vec<usize> = (0..train_idx.len()).collect();
-                    order.sort_by(|&a, &b| train_scores[b].total_cmp(&train_scores[a]));
-                    let take = (train_idx.len() / 2).max(1);
-                    rows.clear();
-                    ys.clear();
-                    for (rank, &k) in order.iter().enumerate() {
-                        let i = train_idx[k];
-                        if inp.is_decoy[i] {
-                            rows.push(xrow(k));
-                            ys.push(0.0);
-                        } else if rank < take {
-                            rows.push(xrow(k));
-                            ys.push(1.0);
-                        }
-                    }
-                }
-                w = logreg_fit(&rows, &ys, 1e-3, 200, 0.5);
-                // One independent score per training row; the parallel map is an indexed
-                // rayon collect, so the output order and every value are unchanged.
-                train_scores = (0..train_idx.len())
-                    .into_par_iter()
-                    .map(|k| score_row(&w, xrow(k)))
-                    .collect();
-            }
-            // score the held-out test fold with this fold's scaler + weights
-            test_idx
-                .par_iter()
-                .map(|&i| (i, score_std_row(&w, inp.features.row(i), &mean, &std)))
-                .collect()
-        })
+    // peptide share a fold, so none leaks between train and test. The value is always
+    // below `folds` and never above the u32 key it came from, so u32 stores it exactly and
+    // the vector is 4 bytes per PSM rather than 8.
+    let fold_of: Vec<u32> = inp
+        .fold_key
+        .iter()
+        .map(|c| ((*c as usize) % folds) as u32)
         .collect();
 
+    // Folds are independent: each fits its own scaler + weights on its training rows and
+    // scores only its own (disjoint) test set. Standardization is fit on the TRAIN fold
+    // only (no test leakage), which is why each fold owns its scaler.
+    //
+    // They run ONE AT A TIME. A parallel map over folds used to be the only source of
+    // threads in this rescorer, and the price was that every fold's standardised training
+    // copy was live at once: with the default 3 folds the peak was the matrix plus three
+    // 2/3-sized copies of it, roughly (1 + folds) x the matrix (4.85 + 3 x 3.23 = 14.6 GB
+    // on a six-run Astral pool of 3,133,636 PSMs x 387 features; 53.8 GB at 11.6M PSMs).
+    // Sequentially it is the matrix plus one copy: 8.1 GB and 29.9 GB, a saving of 6.5 and
+    // 23.9 GB. `train_idx`/`test_idx`, `mean`/`std`, `train_scores` and the `rows` pointer
+    // vector become single-copy at the same time. What makes this affordable is that
+    // `logreg_fit` and the per-row maps below are parallel in their own right, so one fold
+    // already saturates the machine; before that change this would have been 3x the wall.
+    // What it does cost is the serial remainder (the tied-block walk in `target_decoy_q`,
+    // the positive-set build, the bias fold), which no longer overlaps across folds: a few
+    // seconds per fold against a fit measured in minutes.
     let mut final_score = inp.init_score.to_vec();
-    for fold_scores in per_fold {
-        for (i, s) in fold_scores {
-            final_score[i] = s;
+    for test_fold in 0..folds {
+        let mut train_idx: Vec<u32> = Vec::new();
+        let mut test_idx: Vec<u32> = Vec::new();
+        for (i, f) in fold_of.iter().enumerate() {
+            if *f as usize == test_fold {
+                test_idx.push(i as u32);
+            } else {
+                train_idx.push(i as u32);
+            }
+        }
+        if train_idx.is_empty() || test_idx.is_empty() {
+            continue;
+        }
+        let (mean, std) = fit_standardizer(inp.features, &train_idx);
+        // Standardized train matrix: ONE flat allocation of `train_rows * d`, row-major.
+        // It used to be a `Vec<Vec<f32>>`, which is one heap block per training row -- the
+        // exact layout the comment on `FeatureMatrix` records was removed from the matrix
+        // itself, surviving one level down. At experiment scale (11.6M PSMs) that was
+        // ~7.7M live blocks per fold; now it is one. Same values, same order, so the fit
+        // is bit-identical.
+        let mut xtr: Vec<f32> = vec![0.0; train_idx.len().saturating_mul(d)];
+        xtr.par_chunks_mut(d.max(1))
+            .zip(train_idx.par_iter())
+            .for_each(|(out, &i)| std_row_into(inp.features.row(i as usize), &mean, &std, out));
+        let xrow = |k: usize| -> &[f32] { &xtr[k * d..(k + 1) * d] };
+        let mut train_scores: Vec<f64> = train_idx
+            .iter()
+            .map(|&i| inp.init_score[i as usize])
+            .collect();
+        // The training fold's labels, gathered once. The q kernel used to be handed a
+        // freshly zipped `Vec<(f64, bool)>` of the scores and these labels on every
+        // iteration: a 16-byte-per-row buffer, allocated outside the loop and so resident
+        // for the whole fit, whose only job was to pair two columns the fold already has.
+        let train_decoy: Vec<bool> = train_idx
+            .iter()
+            .map(|&i| inp.is_decoy[i as usize])
+            .collect();
+        let mut w = vec![0.0; d + 1];
+        for _ in 0..inp.num_iter.max(1) {
+            let q = target_decoy_q_split(&train_scores, &train_decoy);
+            // positive set: confident targets; negatives: all decoys
+            let mut rows: Vec<&[f32]> = Vec::new();
+            let mut ys: Vec<f64> = Vec::new();
+            let mut n_pos = 0;
+            for (k, &decoy) in train_decoy.iter().enumerate() {
+                if decoy {
+                    rows.push(xrow(k));
+                    ys.push(0.0);
+                } else if q[k] <= inp.train_fdr {
+                    rows.push(xrow(k));
+                    ys.push(1.0);
+                    n_pos += 1;
+                }
+            }
+            // fallback: if too few confident targets, take the top-scoring half
+            if n_pos < 10 {
+                let mut order: Vec<u32> = (0..train_idx.len() as u32).collect();
+                order.sort_by(|&a, &b| {
+                    train_scores[b as usize].total_cmp(&train_scores[a as usize])
+                });
+                let take = (train_idx.len() / 2).max(1);
+                rows.clear();
+                ys.clear();
+                for (rank, &k) in order.iter().enumerate() {
+                    if train_decoy[k as usize] {
+                        rows.push(xrow(k as usize));
+                        ys.push(0.0);
+                    } else if rank < take {
+                        rows.push(xrow(k as usize));
+                        ys.push(1.0);
+                    }
+                }
+            }
+            w = logreg_fit(&rows, &ys, 1e-3, 200, 0.5);
+            // One independent score per training row; the parallel map is an indexed
+            // rayon collect, so the output order and every value are unchanged.
+            train_scores = (0..train_idx.len())
+                .into_par_iter()
+                .map(|k| score_row(&w, xrow(k)))
+                .collect();
+        }
+        // score the held-out test fold with this fold's scaler + weights
+        let scored: Vec<f64> = test_idx
+            .par_iter()
+            .map(|&i| score_std_row(&w, inp.features.row(i as usize), &mean, &std))
+            .collect();
+        // A scatter onto this fold's own (disjoint) test rows, so doing it here rather
+        // than after every fold has finished cannot move a value.
+        for (&i, s) in test_idx.iter().zip(scored) {
+            final_score[i as usize] = s;
         }
     }
     final_score
@@ -419,6 +450,37 @@ pub fn percolator_lite(inp: RescoreInput) -> Vec<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fdr::target_decoy_q;
+
+    /// The previous standardiser, transcribed: `usize` row indices, which is what the
+    /// per-fold bookkeeping used before it was narrowed to `u32`.
+    fn fit_standardizer_reference(x: &FeatureMatrix, idx: &[usize]) -> (Vec<f64>, Vec<f64>) {
+        let d = x.n_features();
+        let n = idx.len().max(1) as f64;
+        let mut mean = vec![0.0; d];
+        for &i in idx {
+            for (m, v) in mean.iter_mut().zip(x.row(i)) {
+                *m += *v as f64;
+            }
+        }
+        for m in &mut mean {
+            *m /= n;
+        }
+        let mut std = vec![0.0; d];
+        for &i in idx {
+            for ((s, v), m) in std.iter_mut().zip(x.row(i)).zip(&mean) {
+                let dd = *v as f64 - *m;
+                *s += dd * dd;
+            }
+        }
+        for s in &mut std {
+            *s = (*s / n).sqrt();
+            if *s < 1e-9 {
+                *s = 1.0;
+            }
+        }
+        (mean, std)
+    }
 
     /// The previous per-row standardiser: one `Vec<f32>` (one heap block) per row.
     fn std_row_ref(row: &[f32], mean: &[f64], std: &[f64]) -> Vec<f32> {
@@ -515,7 +577,7 @@ mod tests {
                 if train_idx.is_empty() || test_idx.is_empty() {
                     return Vec::new();
                 }
-                let (mean, std) = fit_standardizer(inp.features, &train_idx);
+                let (mean, std) = fit_standardizer_reference(inp.features, &train_idx);
                 let xtr: Vec<Vec<f32>> = train_idx
                     .iter()
                     .map(|&i| std_row_ref(inp.features.row(i), &mean, &std))
