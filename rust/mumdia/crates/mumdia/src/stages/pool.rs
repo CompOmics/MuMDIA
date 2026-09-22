@@ -13,6 +13,11 @@
 //! Streaming: one batch is resident at a time per table, and the writer's row groups are
 //! capped, so the pooling costs one read and one write of the group artifacts and no more
 //! memory than any single stage.
+//!
+//! `psms_extracted` is pooled only when something reads it (the candidate audit). The
+//! extracted rows are already on disk per band; copying them into a run-level table that no
+//! stage opens was a full read and a full write of the run's widest non-chromatogram
+//! artifact.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -37,7 +42,11 @@ pub struct BandArtifacts {
 
 pub struct PoolParams<'a> {
     pub bands: &'a [BandArtifacts],
-    pub out_psms: &'a str,
+    /// Where to pool the extracted rows, or `None` to leave them per band. Nothing in the
+    /// pipeline reads this table -- features ran per band, and rescore reads the competed
+    /// one -- so the caller passes `None` unless the candidate audit is on, which is the
+    /// one consumer. The per-band tables are written either way.
+    pub out_psms: Option<&'a str>,
     pub out_chromatograms: &'a str,
     pub out_competed: &'a str,
 }
@@ -175,7 +184,10 @@ pub fn run(p: PoolParams) -> Result<PoolStats> {
             .collect::<Vec<_>>()
     };
     let stats = PoolStats {
-        psms: pool_table(with(|b| &b.psms).into_iter(), p.out_psms)?,
+        psms: match p.out_psms {
+            Some(out) => pool_table(with(|b| &b.psms).into_iter(), out)?,
+            None => 0,
+        },
         chromatograms: pool_table(with(|b| &b.chromatograms).into_iter(), p.out_chromatograms)?,
         competed: pool_table(with(|b| &b.competed).into_iter(), p.out_competed)?,
         duplicates,
@@ -183,6 +195,7 @@ pub fn run(p: PoolParams) -> Result<PoolStats> {
     info!(
         groups = p.bands.len(),
         psms = stats.psms,
+        psms_pooled = p.out_psms.is_some(),
         chromatograms = stats.chromatograms,
         competed = stats.competed,
         duplicates,
@@ -254,7 +267,7 @@ mod tests {
         let (op, oc, ok) = (out("psms"), out("chrom"), out("comp"));
         let stats = run(PoolParams {
             bands: &[b0, b1],
-            out_psms: &op,
+            out_psms: Some(op.as_str()),
             out_chromatograms: &oc,
             out_competed: &ok,
         })
@@ -271,6 +284,44 @@ mod tests {
                 (x[3] - 3.0).abs() < 1e-9 && (x[4] - 4.003).abs() < 1e-9,
                 "{path}: {x:?}"
             );
+        }
+    }
+
+    #[test]
+    fn without_a_psms_path_the_other_tables_are_pooled_unchanged() {
+        let dir = std::env::temp_dir().join(format!("mumdia_pool_nopsms_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let b0 = band(
+            &dir,
+            "n0",
+            0.0,
+            &[0, 1, 2, 3, 4],
+            &[9.0, 9.0, 9.0, 7.0, 2.0],
+        );
+        let b1 = band(&dir, "n1", 0.003, &[3, 4, 5, 6], &[5.0, 6.0, 9.0, 9.0]);
+        let out = |n: &str| {
+            dir.join(format!("nopsms_{n}.parquet"))
+                .to_str()
+                .unwrap()
+                .to_string()
+        };
+        let (op, oc, ok) = (out("psms"), out("chrom"), out("comp"));
+        let stats = run(PoolParams {
+            bands: &[b0, b1],
+            out_psms: None,
+            out_chromatograms: &oc,
+            out_competed: &ok,
+        })
+        .unwrap();
+        // The skipped table is not written, and the pooled tables that are read downstream
+        // are exactly what they are when it is.
+        assert_eq!(stats.psms, 0);
+        assert!(!std::path::Path::new(&op).exists());
+        assert_eq!(stats.competed, 7);
+        assert_eq!(stats.duplicates, 2);
+        for path in [&oc, &ok] {
+            let t = TableFile::open(path).unwrap();
+            assert_eq!(t.u32("candidate_id").unwrap(), vec![0, 1, 2, 3, 4, 5, 6]);
         }
     }
 }

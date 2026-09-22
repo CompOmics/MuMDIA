@@ -86,17 +86,42 @@ pub fn record_artifact(
     stage: &str,
     config_hash: &str,
 ) -> Result<ArtifactRecord> {
-    Ok(ArtifactRecord {
+    let content_hash = hash::blake3_file(path)?;
+    Ok(record_artifact_with_hash(
+        logical_name,
+        schema,
+        path,
+        rows,
+        stage,
+        config_hash,
+        content_hash,
+    ))
+}
+
+/// The same record from a hash the caller already has. A stage that writes both a manifest
+/// record and an [`report::ArtifactReport`] for one file would otherwise read it twice, and
+/// on a grouped run those files are tens of GB each.
+#[allow(clippy::too_many_arguments)]
+pub fn record_artifact_with_hash(
+    logical_name: &str,
+    schema: (&str, u32),
+    path: &str,
+    rows: u64,
+    stage: &str,
+    config_hash: &str,
+    content_hash: String,
+) -> ArtifactRecord {
+    ArtifactRecord {
         logical_name: logical_name.to_string(),
         path: path.to_string(),
         format: "parquet".to_string(),
         schema_name: schema.0.to_string(),
         schema_version: schema.1,
         rows,
-        content_hash: hash::blake3_file(path)?,
+        content_hash,
         producing_stage: stage.to_string(),
         config_hash: config_hash.to_string(),
-    })
+    }
 }
 
 /// Human-readable schema + head sample + row count for any Parquet artifact

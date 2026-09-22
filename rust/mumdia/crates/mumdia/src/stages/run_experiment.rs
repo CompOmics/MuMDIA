@@ -361,9 +361,15 @@ fn split_by_source(scored: &str, out_paths: &[String]) -> Result<()> {
         .schema
         .index_of("source")
         .map_err(|_| anyhow::anyhow!("scored table has no `source` column for split"))?;
+    // Row groups capped as the rescore handoff caps them. The scored table is ~390 float
+    // columns wide, so parquet's default 1,048,576-row group is about 3 GB decoded, and
+    // every reader of these per-run tables (quant, report) then pays that in one allocation.
+    // Only the row-group boundaries change; the rows, their order and their values do not.
     let mut writers: Vec<mumdia_io::table::BatchWriter> = out_paths
         .iter()
-        .map(|out| mumdia_io::table::BatchWriter::new(out, t.schema.clone()))
+        .map(|out| {
+            mumdia_io::table::BatchWriter::with_row_group_rows(out, t.schema.clone(), 1 << 17)
+        })
         .collect::<Result<_>>()?;
     let mut written = 0usize;
     t.for_each_batch(None, 1 << 14, |b| {

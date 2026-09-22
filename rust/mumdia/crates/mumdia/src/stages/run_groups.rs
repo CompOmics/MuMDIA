@@ -166,9 +166,35 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
                 return Ok(None);
             }
             std::fs::create_dir_all(gd(b.index, ""))?;
-            let prec = gd(b.index, "lib_precursors.parquet");
-            info!(stage = %"band-slice", group = b.index, rows = n, "run: stage start");
-            groups::write_band_slice(g.lib_precursors, first, n, &prec)?;
+            let mut prec = gd(b.index, "lib_precursors.parquet");
+            // A band's slice is a deterministic function of the library and the row span,
+            // and a shared-band run searches the same library under the same plan, so the
+            // first run's slice is the same bytes. Take it rather than write the whole
+            // precursor table again: only the seed reads it, and the adapted table replaces
+            // it for everything downstream.
+            let shared_slice = g
+                .shared_bands
+                .map(|s| format!("{s}/g{:02}/lib_precursors.parquet", b.index))
+                .filter(|p| {
+                    std::path::Path::new(p).exists()
+                        && mumdia_io::table::nrows(p).is_ok_and(|r| r == n as u64)
+                });
+            match shared_slice {
+                Some(p) => {
+                    info!(
+                        stage = %"band-slice",
+                        group = b.index,
+                        rows = n,
+                        reused = %p,
+                        "run: stage skipped"
+                    );
+                    prec = p;
+                }
+                None => {
+                    info!(stage = %"band-slice", group = b.index, rows = n, "run: stage start");
+                    groups::write_band_slice(g.lib_precursors, first, n, &prec)?;
+                }
+            }
             let seed = gd(b.index, "seed_psms.parquet");
             info!(stage = %"search-seed", group = b.index, "run: stage start");
             let rows = search_seed::run(search_seed::SearchSeedParams {
@@ -534,37 +560,61 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
         competed: d("psms_competed.parquet"),
         rt_model,
     };
+    // The pooled extracted table has exactly one reader, the candidate audit, and that is
+    // off by default. Pooling it anyway read and rewrote every band's extracted rows for a
+    // file nothing opens; the per-band tables stay where they are either way.
+    let pool_psms = cfg.extract.emit_candidate_audit;
+    if !pool_psms {
+        info!(
+            groups = arts.len(),
+            "groups: psms_extracted stays per band (extract.emit_candidate_audit is off, and              nothing else reads the pooled table)"
+        );
+    }
     info!(stage = %"pool", groups = arts.len(), "run: stage start");
     let stats = pool::run(pool::PoolParams {
         bands: &arts,
-        out_psms: &out.psms,
+        out_psms: pool_psms.then_some(out.psms.as_str()),
         out_chromatograms: &out.chromatograms,
         out_competed: &out.competed,
     })
     .context("pooling the window groups")?;
-    for (name, schema, path, rows) in [
-        (
+    let pooled_artifacts = pool_psms
+        .then_some((
             artifact::PSMS_EXTRACTED.0,
             artifact::PSMS_EXTRACTED,
             &out.psms,
             stats.psms,
-        ),
-        (
-            artifact::CHROMATOGRAMS.0,
-            artifact::CHROMATOGRAMS,
-            &out.chromatograms,
-            stats.chromatograms,
-        ),
-        (
-            artifact::PSMS_COMPETED.0,
-            artifact::PSMS_COMPETED,
-            &out.competed,
-            stats.competed,
-        ),
-    ] {
+        ))
+        .into_iter()
+        .chain([
+            (
+                artifact::CHROMATOGRAMS.0,
+                artifact::CHROMATOGRAMS,
+                &out.chromatograms,
+                stats.chromatograms,
+            ),
+            (
+                artifact::PSMS_COMPETED.0,
+                artifact::PSMS_COMPETED,
+                &out.competed,
+                stats.competed,
+            ),
+        ]);
+    for (name, schema, path, rows) in pooled_artifacts {
+        // One hash for both the manifest record and the report beside the file: these are
+        // the run's largest artifacts, and hashing reads all of it.
+        let content_hash = mumdia_io::hash::blake3_file(path)?;
         record_opt(
             g.man.as_deref_mut(),
-            record_artifact(name, schema, path, rows, "pool", ch)?,
+            mumdia_io::record_artifact_with_hash(
+                name,
+                schema,
+                path,
+                rows,
+                "pool",
+                ch,
+                content_hash.clone(),
+            ),
         );
         ArtifactReport {
             logical_name: name.to_string(),
@@ -572,7 +622,7 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
             schema_version: schema.1,
             stage: "pool".to_string(),
             rows,
-            content_hash: mumdia_io::hash::blake3_file(path)?,
+            content_hash,
             params: json!({
                 "window_groups": arts.len(),
                 "calibration": if global { "global" } else { "per_group" },
