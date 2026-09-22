@@ -327,8 +327,8 @@ per-bin occupancy with the `+1` counting-sort offset (`fragindex.rs:83-86`); a
 prefix sum turns counts into CSR start offsets (`fragindex.rs:88-90`); pass 2
 scatters postings in candidate-id order (`fragindex.rs:98-110`) so `post_cand` is
 ascending within every bin. Postings are Structure-of-Arrays
-(`post_cand`/`post_mz`/`post_int`/`post_frag`) so the verify hot loop streams only
-`post_mz`.
+(`post_cand`/`post_mz`/`post_int`/`post_frag`) so the verify hot loop decides on
+`post_mz` alone and wants the other three only where a posting verifies.
 
 `FragIndex` keeps its own copy of `prec_mz` and exposes `n_cand()`
 (`fragindex.rs:125`), `tol_ppm()` (`fragindex.rs:129`), and a `candidate_range`
@@ -351,8 +351,31 @@ each bin's `[cand_lo, cand_hi)` posting sub-range built by `window_narrow`
 and every scan of that window revisits the same bins, so the two binary searches
 per bin happen once per `(window, bin)` instead of once per peak. Semantics and
 callback order are identical, which the test
-`probe_peak_win_matches_probe_peak_callback_for_callback` (`fragindex.rs:442`)
+`probe_peak_win_matches_probe_peak_callback_for_callback` (`fragindex.rs:497`)
 asserts posting-for-posting.
+
+`probe_peak_win_binned` (`fragindex.rs:220`) is the same probe again with the bin
+handed in rather than computed, and `bin_of` (`fragindex.rs:193`) is what computes
+it; `probe_peak_win` is now just `probe_peak_win_binned` with `bin_of` applied, so
+the three cannot drift. The bin is a `ln()`, and a caller that walks the same peaks
+more than once pays it every time: extract splits one isolation window into several
+candidate sub-range tasks and each task re-walks every scan of the window, so it
+computes the window's bins once and shares them (`extract.rs`, `peak_bins`). `bin`
+is clamped into range, so a stale one cannot index out of bounds, but it will probe
+the wrong bins; the caller that buffers is the one that must assert the pairing, and
+extract debug-asserts it per peak. The equality is pinned by
+`bin_of_is_the_bin_the_probe_uses` and by the third comparison inside
+`probe_peak_win_matches_probe_peak_callback_for_callback`;
+`a_bin_past_the_top_is_clamped_not_a_panic` pins the clamp.
+
+`emit_range` slices the four posting arrays once and zips them rather than indexing
+each per posting, and returns early on an empty range, which is what a narrow
+candidate window mostly produces. The `within_ppm` call is deliberately left alone:
+precomputing m/z bounds from `peak_mz` once would round differently from the
+per-pair `hi - lo <= tol * 1e-6 * lo`, and the tolerance edge decides real matches.
+`emit_range_pairs_every_posting_with_its_own_columns` (`fragindex.rs:634`) pins that
+every within-tolerance posting is emitted exactly once carrying its own candidate,
+intensity and ordinal, over a run long enough for a mis-aligned slice to show.
 
 `SeedScratch` (`fragindex.rs:275`) is the epoch-stamped dense accumulator:
 `stamp[cc]` records the last epoch a candidate was touched; `epoch` is incremented
@@ -446,7 +469,8 @@ m/z (`Library::local_frag_index`, `index.rs:325`).
 | `LogBins` / `LogBins::bin` | `binning.rs:11` / `binning.rs:49` | log-space bin geometry and mapping |
 | `FragIndex::build` | `fragindex.rs:46` | two-pass counting-sort CSR build at a fixed tolerance; derives m/z range from the library |
 | `FragIndex::probe_peak` | `fragindex.rs:152` | +/-1 bin probe + `within_ppm` verify, candidate-window narrowed; callback `(cid, mz, int, frag)` |
-| `FragIndex::probe_peak_win` / `window_narrow` / `WindowNarrow` | `fragindex.rs:176` / `:236` / `:263` | same probe with the per-window bin-narrowing cache amortized |
+| `FragIndex::probe_peak_win` / `window_narrow` / `WindowNarrow` | `fragindex.rs:202` / `:301` / `:328` | same probe with the per-window bin-narrowing cache amortized |
+| `FragIndex::probe_peak_win_binned` / `bin_of` | `fragindex.rs:220` / `:193` | same probe again with the bin precomputed by the caller, for a caller that walks the same peaks repeatedly; `bin_of` is the bin it expects |
 | `FragIndex::candidate_range` / `n_cand` / `tol_ppm` | `fragindex.rs:137` / `:125` / `:129` | index-side isolation-window narrowing + accessors |
 | `SeedScratch` | `fragindex.rs:275` | epoch-stamped, window-relative dense `(count, obs_sum)` accumulator; `touched`/`count`/`obs_sum` getters |
 | `score_scan_count_dot` (fragindex / naive) | `fragindex.rs:370` / `naive.rs:16` | equivalence-gate scorers, `dot = predicted*observed`, under an identical predicate |

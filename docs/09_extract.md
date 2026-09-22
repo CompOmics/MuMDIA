@@ -185,6 +185,23 @@ the seed fitted one, an m/z-dependent grid that is linearly interpolated and
 clamped at the ends (`extract.rs:632`), so the correction is not necessarily
 constant across the m/z range.
 
+`q_mz` is then binned, which is a `ln()`, and both halves of that setup used to be
+recomputed by every sub-range task of a window over every peak of every scan of it
+(up to twice the thread count, about eight times per window in a grouped band
+search). `accumulate_groups` now computes the BIN once per window into a flat `u32`
+buffer with one offset per scan (`peak_bins`) wherever the window is actually split
+into more than one task, and a task-local per-scan scratch otherwise, so the peak
+loop always reads a bin from a slice rather than computing one. The query m/z
+itself is still recomputed per task: it is one f64 division, 0.72 ns/peak against
+the bin's 4.99, and buffering it measured the same as the bin alone for three times
+the memory. Costs 4 bytes per peak of the windows in flight; worth -28 to -31%
+(narrow candidate window) to -5% (wide) of the probe loop, measured in
+`rust/mumdia/crates/mumdia/tests/bench_fragindex.rs`. The buffered bin is the same
+value the probe would have computed, and extract debug-asserts that per peak;
+`candidate_range_split_reproduces_the_unsplit_accumulation` runs the fixture at two
+and at eight/sixteen threads, which is the unsplit (scratch) and the split (buffer)
+path, and compares the accumulation hit for hit.
+
 Two matcher backends dispatch through `Prober::probe` (`extract.rs:57`):
 - `MatcherKind::Fragindex` (default): builds a `FragIndex` once at the learned
   tolerance (`extract.rs:1431`). `FragIndex::probe_peak` (`fragindex.rs:152`)

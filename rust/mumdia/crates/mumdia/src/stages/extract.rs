@@ -1252,6 +1252,7 @@ fn accumulate_groups(
     // windows must report before sub-range `k` is final.
     let mut tasks: Vec<(usize, usize, u32, u32)> = Vec::new();
     let mut expected: Vec<usize> = vec![0; n_sub];
+    let mut per_window: Vec<usize> = vec![0; groups.len()];
     for (k, exp) in expected.iter_mut().enumerate() {
         let (s, e) = sub_bounds(k);
         for (gi, g) in groups.iter().enumerate() {
@@ -1259,22 +1260,52 @@ fn accumulate_groups(
             if hi > lo {
                 tasks.push((k, gi, lo, hi));
                 *exp += 1;
+                per_window[gi] += 1;
             }
         }
     }
-    // Note on `peak.mz / mass_off.factor_at(peak.mz)` below: it is recomputed once per
-    // task for every peak of the window, so the tasks of one window repeat it. Hoisting
-    // it into a per-window buffer was tried and reverted: it is 8 bytes per peak of every
-    // window in flight, which measured +200 MB of peak RSS on the AIF fixture (and would
-    // be a third of a gigabyte with the whole run in one batch, which is the shape a
-    // grouped band search has), for no measurable time -- the extract compute phase was
-    // 2.12-2.16 s with and without it over five runs. The other half of that hoist, the
-    // `ln()` bin computation inside `probe_peak_win`, needs a `FragIndex` entry point
-    // taking a precomputed bin and cannot be done from this file at all.
+    // Fragment bin per peak, computed ONCE per window instead of once per sub-range task.
+    // The bin is a `ln()` (`LogBins::bin`), and `probe_peak_win` recomputed it for every
+    // peak of every scan of the window in EVERY task of that window -- up to 2x threads of
+    // them, and about 8 of them per window in a grouped band search, where one band is one
+    // batch of 1-3 windows. Flat u32 with one offset per scan, so it is two allocations per
+    // window rather than one per scan, and built only where the window is actually split;
+    // an unsplit window has nothing to amortise and the task fills a per-scan scratch.
+    //
+    // 4 bytes per peak of the windows in flight: a sixteenth of the run under the default
+    // `windows_in_flight`, a band's 1-3 windows under `groups.parallel`. The OTHER half of
+    // the hoist, `peak.mz / mass_off.factor_at(peak.mz)`, is deliberately NOT buffered and
+    // is still recomputed per task. It was tried on its own and reverted (8 B/peak, +200 MB
+    // of peak RSS on the AIF fixture and 317 MB with the whole run in one batch, for no
+    // measurable time), and buffering it BESIDE the bin measures the same as the bin alone:
+    // on `tests/bench_fragindex.rs`, five rounds, buffering both was -25 to -27 / -9 to
+    // -14 / -2 to -7% and the bin alone -20 to -29 / -9 to -17 / -4 to -6% (narrow /
+    // medium / wide candidate window), which is one spread, for three times the buffer.
+    // The bin is the half that pays: the division is 0.72 ns/peak, the `ln()` 4.99.
+    let peak_bins: Vec<Option<(Vec<u32>, Vec<usize>)>> = groups
+        .iter()
+        .enumerate()
+        .map(|(gi, g)| {
+            (per_window[gi] > 1).then(|| {
+                let mut b: Vec<u32> =
+                    Vec::with_capacity(g.scans.iter().map(|&si| scans[si].peaks.len()).sum());
+                let mut off: Vec<usize> = Vec::with_capacity(g.scans.len() + 1);
+                off.push(0);
+                for &si in &g.scans {
+                    for peak in &scans[si].peaks {
+                        b.push(idx.bin_of(peak.mz / mass_off.factor_at(peak.mz)));
+                    }
+                    off.push(b.len());
+                }
+                (b, off)
+            })
+        })
+        .collect();
     let (tx, rx) = std::sync::mpsc::channel::<(usize, usize, HitStore)>();
     {
         let probe_range = |gi: usize, lo: u32, hi: u32| -> HitStore {
             let ids = &groups[gi].scans;
+            let win_bins = peak_bins[gi].as_ref();
             // Flat `(cid, hit)` pairs in probe order, grouped by candidate at the end of
             // the task with a stable counting sort. The task-local `HashMap<u32,
             // Vec<Hit>>` this replaces was one of the two populations of medium heap
@@ -1286,15 +1317,45 @@ fn accumulate_groups(
             // reprobes the same bins, so cache each bin's narrowed posting range once
             // instead of binary-searching it per peak.
             let mut nw = idx.window_narrow(lo, hi);
-            for &si in ids {
+            // Filled per scan when this window has no shared buffer. A few KB, reused.
+            let mut bin_scratch: Vec<u32> = Vec::new();
+            for (k, &si) in ids.iter().enumerate() {
                 let scan = &scans[si];
                 let rt = scan.rt_seconds;
-                for peak in &scan.peaks {
+                // A `&[u32]` either way, so the peak loop has no per-peak branch on
+                // whether the buffer exists. That is not tidiness: an `Option` tested per
+                // peak measured +4 to +7% on the wide arm even when it always took the
+                // same side, which is more than the `ln()` it was there to save.
+                //
+                // Filling the scratch is a win by itself, with no buffer and the same
+                // `ln()` count: -15 to -27 / -4 to -11 / -3 to +1% (narrow / medium / wide
+                // candidate window, five rounds of `tests/bench_fragindex.rs`), because a
+                // separate pass takes the `ln()` off the dependency chain that the
+                // bin-cache load and then the posting loads hang from. The shared buffer
+                // adds the amortisation on top: -28 to -31 / -8 to -17 / -5 to -7%.
+                let scan_bins: &[u32] = match win_bins {
+                    Some((b, off)) => &b[off[k]..off[k + 1]],
+                    None => {
+                        bin_scratch.clear();
+                        bin_scratch.extend(
+                            scan.peaks
+                                .iter()
+                                .map(|p| idx.bin_of(p.mz / mass_off.factor_at(p.mz))),
+                        );
+                        &bin_scratch
+                    }
+                };
+                debug_assert_eq!(scan.peaks.len(), scan_bins.len());
+                for (peak, &bin) in scan.peaks.iter().zip(scan_bins) {
                     let inten = peak.intensity;
+                    // Same value the probe would have computed: `bin_of` is a pure
+                    // function of `q_mz`, and `q_mz` is recomputed here from the same
+                    // peak and the same offset as the buffer used.
                     let q_mz = peak.mz / mass_off.factor_at(peak.mz);
+                    debug_assert_eq!(bin, idx.bin_of(q_mz), "buffered bin disagrees");
                     let obs_mz = peak.mz;
                     claimants.clear();
-                    idx.probe_peak_win(&mut nw, q_mz, |cid, _pmz, pint, frag| {
+                    idx.probe_peak_win_binned(&mut nw, q_mz, bin, |cid, _pmz, pint, frag| {
                         let c = cid as usize;
                         if rt < rt_lo[c] || rt > rt_hi[c] {
                             return;
