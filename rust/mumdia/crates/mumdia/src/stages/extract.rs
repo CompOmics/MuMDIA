@@ -1021,10 +1021,32 @@ fn window_groups(idx: &FragIndex, scans: &[Ms2Scan]) -> Vec<WinGroup> {
         .collect()
 }
 
-/// Probe one batch of isolation windows, in parallel across windows, and merge the hits
-/// in window order. Merging in window order (not thread completion order) is what keeps
-/// each candidate's hit sequence, and therefore every float reduction downstream, the
-/// same as the serial path.
+/// Probe one batch of isolation windows and flush what each candidate sub-range finalises,
+/// in ascending candidate order.
+///
+/// Two axes are cut. Across WINDOWS, because each scan belongs to exactly one of them. And
+/// across a shared, GLOBAL grid of candidate sub-ranges, because a batch of `step` windows
+/// on `t` threads leaves `t - step` threads idle whenever the batch is smaller than the
+/// pool (measured at 4 in flight on 24 threads: 3.2-3.7 cores busy for the whole stage),
+/// and because a candidate is final once every window of the batch has passed it, which is
+/// a statement about a boundary all the windows share. Per-window sub-ranges would
+/// parallelise just as well and could not be flushed.
+///
+/// That matters most exactly where the stage hurts. `window_groups` drops the windows that
+/// select no candidate of the band, so a band of a 63-band grouped plan overlaps only 1-3
+/// windows, the whole band is one batch, the flush bound is `u32::MAX` and nothing was ever
+/// flushed early: the accumulator held the entire band. Cutting on the candidate axis makes
+/// the flush unit a sub-range of it instead, at no extra probing, because the sub-ranges
+/// are the tasks that already existed.
+///
+/// Order is the contract. A candidate is flushed only once every window that can reach it
+/// has reported, its hits are gathered run by run in window order, and sub-ranges are
+/// flushed in ascending index, so the per-candidate hit sequence and the ascending PSM row
+/// order are exactly what the serial path produced. Chromatogram parquet row-group
+/// boundaries can move, because the flush is now cut on sub-ranges rather than on the
+/// batch; no row and no value moves with them.
+///
+/// Returns true when `flush` asked to stop (the chromatogram writer went away).
 #[allow(clippy::too_many_arguments)]
 fn accumulate_groups(
     idx: &FragIndex,
@@ -1035,55 +1057,86 @@ fn accumulate_groups(
     mass_off: &MassOffset,
     cfg: &ExtractConfig,
     restrict: Option<&std::collections::HashSet<u32>>,
+    // First candidate a window of a LATER batch can still add hits to; nothing at or above
+    // it may be flushed here.
+    bound: u32,
     acc: &mut HitAcc,
-) {
-    // Partials are appended to `acc` in window order as they complete, not collected first
-    // and merged after. The channel hands each finished partial to this thread; the
-    // reorder buffer holds the ones that finished ahead of an earlier window, so the run
-    // order, and with it every candidate's hit sequence, is exactly the serial one. No
-    // per-candidate merge happens here any more: a window's partial is a CSR store per
-    // sub-range task, and the concatenation is resolved lazily by `gather_chunk` at flush.
-    let (tx, rx) = std::sync::mpsc::channel::<(usize, Vec<HitStore>)>();
-    // A batch of `step` windows on `t` threads leaves `t - step` threads idle whenever the
-    // batch is smaller than the pool, which is what a `windows_in_flight` set low for memory
-    // does: measured at 4 in flight on 24 threads, 3.2-3.7 cores busy for the whole stage.
-    // So each window is also split across its CANDIDATE range. A candidate belongs to
-    // exactly one sub-range, so the sub-results are disjoint: they hold the window's hits
-    // once between them (no duplication of the accumulator, which is the stage's memory),
-    // they concatenate instead of merging per candidate, and each candidate's hits are still
-    // appended in ascending scan order, so every float reduction downstream is unchanged.
-    // Splitting the candidate axis rather than the scan axis is also where the work is: a
-    // peak's cost is dominated by walking its posting list, which the narrowed sub-range
-    // divides, while the peak loop itself is repeated per task.
+    chunk: &mut HitStore,
+    flush: &mut (dyn FnMut(&mut HitStore) -> bool + Send),
+) -> bool {
+    if groups.is_empty() {
+        return false;
+    }
     let threads = rayon::current_num_threads().max(1);
-    let tasks_per_window = (threads * 2).div_ceil(groups.len().max(1)).max(1);
-    let probe = |g: &WinGroup| -> Vec<HitStore> {
-        let ids = &g.scans;
-        let n_cand = (g.hi_cid - g.lo_cid) as usize;
-        let tasks = tasks_per_window
-            .min(n_cand.div_ceil(MIN_CANDIDATES_PER_TASK))
-            .max(1);
-        // Offset-corrected query m/z per peak, computed ONCE for the window instead of
-        // once per sub-range task. `MassOffset::factor_at` is a binary search into the
-        // m/z-dependent calibration grid when a masscal grid is present and a division
-        // either way, and both were repeated `tasks` times -- up to 2x threads -- for
-        // every peak of every scan of the window. Flat with one offset per scan, so it is
-        // two allocations rather than one per scan, and built only when the window is
-        // actually split (unsplit, there is nothing to share it with).
-        let qmz: Option<(Vec<f64>, Vec<usize>)> = (tasks > 1).then(|| {
-            let mut q: Vec<f64> =
-                Vec::with_capacity(ids.iter().map(|&si| scans[si].peaks.len()).sum());
-            let mut off: Vec<usize> = Vec::with_capacity(ids.len() + 1);
-            off.push(0);
-            for &si in ids {
-                for peak in &scans[si].peaks {
-                    q.push(peak.mz / mass_off.factor_at(peak.mz));
-                }
-                off.push(q.len());
+    let tasks_per_window = (threads * 2).div_ceil(groups.len()).max(1);
+    // The sub-range WIDTH is taken from the mean window span divided by
+    // `tasks_per_window`, not from the global span divided by a task count, so each window
+    // still splits into about `tasks_per_window` pieces and the batch still runs about
+    // 2x threads of them -- the same parallelism as before, on a shared grid.
+    let g_lo = groups.iter().map(|g| g.lo_cid).min().expect("non-empty");
+    let g_hi = groups.iter().map(|g| g.hi_cid).max().expect("non-empty");
+    let mean_span = groups
+        .iter()
+        .map(|g| (g.hi_cid - g.lo_cid) as usize)
+        .sum::<usize>()
+        / groups.len();
+    let width = mean_span
+        .div_ceil(tasks_per_window)
+        .max(MIN_CANDIDATES_PER_TASK)
+        .min(u32::MAX as usize) as u64;
+    let n_sub = ((g_hi - g_lo) as u64).div_ceil(width).max(1) as usize;
+    let sub_bounds = |k: usize| -> (u32, u32) {
+        let hi = g_hi as u64;
+        let s = (g_lo as u64 + k as u64 * width).min(hi);
+        ((s) as u32, (s + width).min(hi) as u32)
+    };
+    // One task per (sub-range, window) pair that actually intersects, k-major so the pool
+    // starts on the sub-ranges that will be flushed first. `expected[k]` is how many
+    // windows must report before sub-range `k` is final.
+    let mut tasks: Vec<(usize, usize, u32, u32)> = Vec::new();
+    let mut expected: Vec<usize> = vec![0; n_sub];
+    let mut per_window: Vec<usize> = vec![0; groups.len()];
+    for (k, exp) in expected.iter_mut().enumerate() {
+        let (s, e) = sub_bounds(k);
+        for (gi, g) in groups.iter().enumerate() {
+            let (lo, hi) = (g.lo_cid.max(s), g.hi_cid.min(e));
+            if hi > lo {
+                tasks.push((k, gi, lo, hi));
+                *exp += 1;
+                per_window[gi] += 1;
             }
-            (q, off)
-        });
-        let probe_range = |lo: u32, hi: u32| -> HitStore {
+        }
+    }
+    // Offset-corrected query m/z per peak, computed ONCE per window instead of once per
+    // sub-range task. `MassOffset::factor_at` is a binary search into the m/z-dependent
+    // calibration grid when a masscal grid is present, and a division either way, and both
+    // were repeated once per task -- up to 2x threads -- for every peak of every scan of
+    // the window. Flat with one offset per scan, so it is two allocations per window rather
+    // than one per scan, and built only where the window is actually split.
+    let qmz: Vec<Option<(Vec<f64>, Vec<usize>)>> = groups
+        .iter()
+        .enumerate()
+        .map(|(gi, g)| {
+            (per_window[gi] > 1).then(|| {
+                let mut q: Vec<f64> =
+                    Vec::with_capacity(g.scans.iter().map(|&si| scans[si].peaks.len()).sum());
+                let mut off: Vec<usize> = Vec::with_capacity(g.scans.len() + 1);
+                off.push(0);
+                for &si in &g.scans {
+                    for peak in &scans[si].peaks {
+                        q.push(peak.mz / mass_off.factor_at(peak.mz));
+                    }
+                    off.push(q.len());
+                }
+                (q, off)
+            })
+        })
+        .collect();
+    let (tx, rx) = std::sync::mpsc::channel::<(usize, usize, HitStore)>();
+    {
+        let probe_range = |gi: usize, lo: u32, hi: u32| -> HitStore {
+            let ids = &groups[gi].scans;
+            let qmz = &qmz[gi];
             // Flat `(cid, hit)` pairs in probe order, grouped by candidate at the end of
             // the task with a stable counting sort. The task-local `HashMap<u32,
             // Vec<Hit>>` this replaces was one of the two populations of medium heap
@@ -1183,70 +1236,73 @@ fn accumulate_groups(
                 hits: flat_hit,
             }
         };
-        if tasks <= 1 {
-            return vec![probe_range(g.lo_cid, g.hi_cid)];
-        }
-        let span = n_cand.div_ceil(tasks) as u32;
-        let ranges: Vec<(u32, u32)> = (0..tasks as u32)
-            .map(|i| {
-                (
-                    g.lo_cid + i * span,
-                    (g.lo_cid + (i + 1) * span).min(g.hi_cid),
-                )
-            })
-            .filter(|&(lo, hi)| hi > lo)
-            .collect();
-        // Ascending, disjoint candidate spans, so the stores concatenate into one
-        // ascending run without a per-candidate merge.
-        ranges
-            .par_iter()
-            .map(|&(lo, hi)| probe_range(lo, hi))
-            .collect()
-    };
-    let n = groups.len();
-    // `move`: the receiver is Send but not Sync, so it has to be owned by the scope closure
-    // (the consumer) rather than borrowed into it.
-    rayon::scope(move |sc| {
-        // The workers run under rayon; this thread is the single consumer. `spawn` so the
-        // scope does not block the consumer loop below until every window has finished.
-        sc.spawn(move |_| {
-            groups
-                .par_iter()
-                .enumerate()
-                .for_each_with(tx, |tx, (gi, g)| {
-                    let part = probe(g);
-                    // A closed receiver only happens if the consumer panicked; nothing to do.
-                    let _ = tx.send((gi, part));
+        let n = tasks.len();
+        // `move`: the receiver is Send but not Sync, so it has to be owned by the scope
+        // closure (the consumer) rather than borrowed into it.
+        rayon::scope(move |sc| {
+            // The workers run under rayon; this thread is the single consumer. `spawn` so
+            // the scope does not block the consumer loop below until every task is done.
+            sc.spawn(move |_| {
+                tasks.par_iter().for_each_with(tx, |tx, &(k, gi, lo, hi)| {
+                    // A closed receiver only happens if the consumer panicked.
+                    let _ = tx.send((k, gi, probe_range(gi, lo, hi)));
                 });
-        });
-        let mut next = 0usize;
-        let mut pending: std::collections::BTreeMap<usize, Vec<HitStore>> =
-            std::collections::BTreeMap::new();
-        for _ in 0..n {
-            let (gi, part) = rx.recv().expect("every window sends exactly one partial");
-            if gi == next {
-                acc.runs.push(HitRun::new(part));
-                next += 1;
-                while let Some(p) = pending.remove(&next) {
-                    acc.runs.push(HitRun::new(p));
-                    next += 1;
+            });
+            // Stores wait here, keyed by `(sub-range, window)`, until their whole
+            // sub-range has reported. `next_k` is the lowest sub-range not yet flushed, so
+            // the map's first keys are always that sub-range's.
+            let mut pending: std::collections::BTreeMap<(usize, usize), HitStore> =
+                std::collections::BTreeMap::new();
+            let mut arrived: Vec<usize> = vec![0; n_sub];
+            let mut next_k = 0usize;
+            let mut stopped = false;
+            for _ in 0..n {
+                let (k, gi, store) = rx.recv().expect("every task sends exactly one store");
+                arrived[k] += 1;
+                pending.insert((k, gi), store);
+                while next_k < n_sub && arrived[next_k] == expected[next_k] {
+                    let mut runs = std::mem::take(&mut acc.runs);
+                    for _ in 0..expected[next_k] {
+                        let key = *pending.keys().next().expect("the sub-range is complete");
+                        debug_assert_eq!(key.0, next_k);
+                        let store = pending.remove(&key).expect("key came from the map");
+                        // One run per window, appended in window order, after whatever
+                        // earlier windows already left in the accumulator.
+                        runs.push(HitRun::new(vec![store]));
+                    }
+                    // Everything this sub-range owns is final, except what a later batch
+                    // can still reach.
+                    let sub_bound = sub_bounds(next_k).1.min(bound);
+                    while !stopped {
+                        gather_chunk(&mut runs, sub_bound, CAND_CHUNK, chunk);
+                        if chunk.is_empty() {
+                            break;
+                        }
+                        if !flush(chunk) {
+                            stopped = true;
+                        }
+                    }
+                    acc.runs = runs;
+                    acc.compact();
+                    next_k += 1;
                 }
-            } else {
-                pending.insert(gi, part);
             }
-        }
-        debug_assert!(pending.is_empty() && next == n);
-    });
+            debug_assert!(pending.is_empty() && next_k == n_sub);
+            stopped
+        })
+    }
 }
 
 /// Isolation windows probed before the driver flushes the candidates that are now final.
-/// Memory scales with this: the accumulator holds the hits of the windows in flight, so a
-/// batch of `n` windows of width `w` stepping `s` keeps about `n * s + w` Th of the
-/// precursor axis open. It is no longer the unit of parallelism: each window is probed in
-/// parallel over sub-ranges of its candidates (`accumulate_groups`), so a small batch keeps
-/// every thread busy without holding more of the precursor axis open. Measured on the HYE benchmark at 32 threads before that change (docs/27 section
-/// 3.10): 32 in flight 24.65 GiB / 5:00, 16 in flight 16.57 GiB / 5:04, 8 in flight
-/// 12.31 GiB / 5:26, identical output throughout.
+/// It is neither the unit of parallelism nor, since the sub-range flush, the unit of
+/// memory: each window is probed in parallel over a shared grid of candidate sub-ranges,
+/// and `accumulate_groups` flushes a sub-range as soon as every window of the batch has
+/// passed it, so the accumulator holds a sub-range of the batch rather than the batch.
+/// The batch still bounds how much of the precursor axis is open at once, because a
+/// candidate is not final until the last window that can reach it has run. Measured on the
+/// HYE benchmark at 32 threads before either change (docs/27 section 3.10): 32 in flight
+/// 24.65 GiB / 5:00, 16 in flight 16.57 GiB / 5:04, 8 in flight 12.31 GiB / 5:26,
+/// identical output throughout.
 const DEFAULT_MAX_WINDOWS_IN_FLIGHT: usize = 16;
 
 /// Fewest candidates a probing task takes: below this the per-task narrowed bin cache (one
@@ -3035,11 +3091,23 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
         let mut chunk = HitStore::default();
         let mut open_hits_max = 0usize;
         if let Some(groups) = stream_groups.as_ref() {
+            // Counting the flushed candidates here rather than inside `emit_batch` keeps
+            // the eager path below able to borrow `emit_batch` on its own.
+            let mut flush = |c: &mut HitStore| -> bool {
+                n_materialized += c.len() as u64;
+                emit_batch(c)
+            };
             let step = groups_in_flight(p.cfg);
             let mut gi = 0usize;
             while gi < groups.len() {
                 let upto = (gi + step).min(groups.len());
-                accumulate_groups(
+                // Everything below the next batch's first candidate is final: windows are
+                // processed in ascending m/z and precursors are sorted by m/z, so no later
+                // window can add a hit below `bound`. Within the batch, `accumulate_groups`
+                // flushes each candidate sub-range as soon as every window has passed it,
+                // so the accumulator holds a sub-range of the band rather than the band.
+                let bound = groups.get(upto).map(|g| g.lo_cid).unwrap_or(u32::MAX);
+                let mut stopped = accumulate_groups(
                     fidx.as_ref()
                         .expect("streamed path implies a fragment index"),
                     &groups[gi..upto],
@@ -3049,24 +3117,23 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
                     &mass_off,
                     p.cfg,
                     restrict.as_ref(),
+                    bound,
                     &mut acc_stream,
+                    &mut chunk,
+                    &mut flush,
                 );
                 gi = upto;
                 open_hits_max = open_hits_max.max(acc_stream.n_hits());
-                // Everything below the next window's first candidate is final: windows are
-                // processed in ascending m/z and precursors are sorted by m/z, so no later
-                // window can add a hit below `bound`.
-                let bound = groups.get(gi).map(|g| g.lo_cid).unwrap_or(u32::MAX);
-                let mut stopped = false;
-                loop {
+                // Candidates past the batch's own sub-range grid (a window of this batch
+                // can reach past the last window's range when the windows differ in width)
+                // are final too, and the sub-range loop cannot have reached them.
+                while !stopped {
                     gather_chunk(&mut acc_stream.runs, bound, CAND_CHUNK, &mut chunk);
                     if chunk.is_empty() {
                         break;
                     }
-                    n_materialized += chunk.len() as u64;
-                    if !emit_batch(&mut chunk) {
+                    if !flush(&mut chunk) {
                         stopped = true;
-                        break;
                     }
                 }
                 acc_stream.compact();
@@ -3542,28 +3609,42 @@ mod accumulate_tests {
             grid_ppm: Vec::new(),
         };
         let cfg = ExtractConfig::default();
-        let run = |threads: usize| -> HitAcc {
+        // `bound = 0` flushes nothing, so the whole batch stays in the accumulator and the
+        // comparison is over the accumulation itself. `flush_all` below runs the same
+        // fixture with the flush live.
+        let run = |threads: usize, bound: u32| -> (HitAcc, Vec<(u32, Vec<Hit>)>) {
             let pool = rayon::ThreadPoolBuilder::new()
                 .num_threads(threads)
                 .build()
                 .expect("thread pool");
             let mut acc = HitAcc::default();
+            let mut chunk = HitStore::default();
+            let mut flushed: Vec<(u32, Vec<Hit>)> = Vec::new();
             pool.install(|| {
+                let mut sink = |c: &mut HitStore| -> bool {
+                    for (cid, hits) in c.slices_mut() {
+                        flushed.push((cid, hits.to_vec()));
+                    }
+                    true
+                };
                 accumulate_groups(
-                    &idx, &groups, &sc, &rt_lo, &rt_hi, &mass_off, &cfg, None, &mut acc,
-                )
+                    &idx, &groups, &sc, &rt_lo, &rt_hi, &mass_off, &cfg, None, bound, &mut acc,
+                    &mut chunk, &mut sink,
+                );
             });
-            acc
+            (acc, flushed)
         };
         // Two threads: 2 * 2 / 4 windows = one sub-range per window, the unsplit path.
-        let unsplit = materialize(run(2));
+        let (acc, empty) = run(2, 0);
+        assert!(empty.is_empty(), "bound 0 must flush nothing");
+        let unsplit = materialize(acc);
         assert!(!unsplit.is_empty(), "the fixture must produce hits");
         assert!(
             unsplit.values().any(|v| v.len() > 1),
             "candidates must collect several hits, or hit order proves nothing"
         );
         for threads in [8, 16] {
-            let split = materialize(run(threads));
+            let split = materialize(run(threads, 0).0);
             assert_eq!(
                 split.len(),
                 unsplit.len(),
@@ -3574,6 +3655,29 @@ mod accumulate_tests {
                     split.get(cid),
                     Some(hits),
                     "{threads} threads: candidate {cid} hits differ"
+                );
+            }
+        }
+        // Flushing per candidate sub-range instead of per batch must deliver exactly the
+        // same candidates, ascending, with the same hits in the same order: the sub-range
+        // grid is where a candidate becomes final, not where its evidence changes.
+        for threads in [2, 8, 16] {
+            let (acc, flushed) = run(threads, u32::MAX);
+            assert_eq!(acc.n_hits(), 0, "{threads} threads: nothing may stay open");
+            assert!(
+                flushed.windows(2).all(|w| w[0].0 < w[1].0),
+                "{threads} threads: flushed candidates must be strictly ascending"
+            );
+            assert_eq!(
+                flushed.len(),
+                unsplit.len(),
+                "{threads} threads: flushed candidate count"
+            );
+            for (cid, hits) in &flushed {
+                assert_eq!(
+                    unsplit.get(cid),
+                    Some(hits),
+                    "{threads} threads: flushed candidate {cid} hits differ"
                 );
             }
         }
