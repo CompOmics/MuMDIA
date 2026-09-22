@@ -219,7 +219,12 @@ pub fn run(p: RescoreParams) -> Result<u64> {
             feat_names.len(),
         );
     }
-    let mut matrix = FeatureMatrix::with_capacity(total_rows, feat_names.len());
+    // Pass 1: the per-PSM metadata columns of every input. Reading them in their own pass,
+    // separately from the ~390 feature columns, is what lets the feature pass below be
+    // skipped entirely, and it preserves the order of the checks: the labels and the
+    // target/decoy population are validated before anything reads a feature value, as they
+    // were when both were read together. The cost is one extra parquet footer read per
+    // input.
     for (src, path) in p.competed.iter().enumerate() {
         let actual_schema = FeatureSchema::read(path)?;
         validate_feature_schema(&expected_schema, &actual_schema, path)?;
@@ -236,49 +241,6 @@ pub fn run(p: RescoreParams) -> Result<u64> {
         let elo = t.f64("elution_lo")?;
         let ehi = t.f64("elution_hi")?;
         let pkr = t.i32("peak_rank").unwrap_or_else(|_| vec![0; t.nrows]);
-        // Feature values: ONE streaming pass over just the feature columns, appending each
-        // row's values contiguously into the flat matrix. The previous path materialised all
-        // ~390 columns as owned `Vec`s first (`fcols`) and then built a `Vec` per PSM from
-        // them, so the whole matrix existed twice, plus the Arrow batches of the full table.
-        // Values, and the null policy (a null f64 reads as NaN), are unchanged.
-        {
-            let names: Vec<&str> = feat_names.iter().map(String::as_str).collect();
-            let reader = t.batches(Some(&names), FEATURE_BATCH_ROWS)?;
-            let sch = reader.schema();
-            let order: Vec<usize> = feat_names
-                .iter()
-                .map(|n| {
-                    sch.index_of(n)
-                        .map_err(|_| anyhow!("competed table {path} has no feature column '{n}'"))
-                })
-                .collect::<Result<_>>()?;
-            for b in reader {
-                let b = b?;
-                let cols: Vec<&Float64Array> = order
-                    .iter()
-                    .map(|&i| {
-                        b.column(i)
-                            .as_any()
-                            .downcast_ref::<Float64Array>()
-                            .ok_or_else(|| {
-                                anyhow!("feature column '{}' is not f64", sch.field(i).name())
-                            })
-                    })
-                    .collect::<Result<_>>()?;
-                let any_null = cols.iter().any(|c| c.null_count() > 0);
-                for k in 0..b.num_rows() {
-                    if any_null {
-                        for c in &cols {
-                            matrix.push(if c.is_null(k) { f64::NAN } else { c.value(k) });
-                        }
-                    } else {
-                        for c in &cols {
-                            matrix.push(c.value(k));
-                        }
-                    }
-                }
-            }
-        }
         // Take the reader's columns rather than copying them row by row into a second set.
         // The row loop this replaces cloned every metadata STRING -- label, peptidoform,
         // protein -- into a fresh allocation while the source vector stayed alive until the
@@ -304,61 +266,105 @@ pub fn run(p: RescoreParams) -> Result<u64> {
         merge_col(&mut elution_hi, ehi, total_rows);
         merge_col(&mut source, vec![src as u32; t.nrows], total_rows);
     }
-    let feats = matrix.finish()?;
+    crate::fdr::validate_labels(&label)?;
+    let is_decoy: Vec<bool> = label.iter().map(|l| l == "decoy").collect();
+    let (mut is_entrapment, mut is_real_target) = classify_entrapment(p.cfg, &protein, &is_decoy);
+    let mut is_decoy = is_decoy;
+    let mut n = cid.len();
+    // First row with a non-finite prelim_score/precursor_mz, if any. Found here but NOT
+    // reported here: the serial validation this replaces checked a row's features before
+    // its scalars and stopped at the first offending ROW, so the two answers are combined
+    // once the feature scan has run (`bail_non_finite`).
+    let mut bad_scalar = None;
+    if n > 0 {
+        let n_decoys = is_decoy.iter().filter(|&&v| v).count();
+        let n_targets = n - n_decoys;
+        require_both_labels(n_targets, n_decoys)?;
+        bad_scalar = (0..n)
+            .into_par_iter()
+            .find_first(|&row| !prelim[row].is_finite() || !mz[row].is_finite());
+    }
+
+    // Pass 2: the feature values, either into the engine's own matrix or straight through
+    // to the sidecar's handoff file.
+    //
+    // Under `rescore.strict` with a PIN sidecar, nothing in this process ever reads that
+    // matrix. The handoff file is written FROM it and it is released immediately after
+    // (that release is itself measured: docs/28), and strict turns a sidecar failure into
+    // an error rather than a fall back to `native_tda`, so the native path that would read
+    // it is unreachable. It was still materialised in full first -- one allocation of
+    // `rows x features x 4` bytes, ~250 GB at experiment scale -- purely so that it could
+    // be copied to disk. Streaming the competed feature columns straight into the handoff
+    // removes it: what stays resident is one staging block of `HANDOFF_BATCH_ROWS` rows
+    // (about 390 MB at 387 features), and the non-finite validation moves into the same
+    // pass, inline with the narrowing, while the row is still in cache.
+    let sidecar_script = match p.cfg.classifier {
+        RescorerKind::Mokapot => Some("mokapot_worker.py"),
+        RescorerKind::NnTorch => Some("nn_rescore_worker.py"),
+        _ => None,
+    };
+    // `python.is_some()` belongs in this condition: without an interpreter the sidecar
+    // fails before it reads anything, and a streamed handoff would be work thrown away.
+    let stream_to_handoff =
+        n > 0 && p.cfg.strict && p.cfg.python.is_some() && sidecar_script.is_some();
+    let mut feats_slot: Option<FeatureMatrix> = None;
+    let mut prewritten: Option<SidecarPaths> = None;
+    if stream_to_handoff {
+        let paths = sidecar_paths(&p, sidecar_script.expect("checked in the condition"));
+        let mut w = HandoffWriter::new(&paths, &feat_names, &label, &pform, &protein, &mz)?;
+        let mut bad_feature = None;
+        for_each_feature_row(p.competed, &feat_names, |row, values| {
+            if bad_feature.is_none() {
+                if let Some(col) = values.iter().position(|v| !v.is_finite()) {
+                    bad_feature = Some((row, col, values[col]));
+                }
+            }
+            w.push_row(row, values)
+        })?;
+        let rows = w.finish()?;
+        // The metadata and the feature values now come from two separate passes over the
+        // same files. Nothing should be able to make them disagree, and if anything does,
+        // the handoff is row-misaligned with every metadata column: refuse rather than
+        // train on it.
+        if rows as usize != n {
+            anyhow::bail!(
+                "rescore: the streamed handoff wrote {rows} rows but the competed metadata \
+                 has {n}; the two passes disagree about the input"
+            );
+        }
+        info!(
+            path = %paths.handoff,
+            rows,
+            features = feat_names.len(),
+            "rescore: streamed the competed features into the sidecar handoff \
+             (no engine-side feature matrix)"
+        );
+        bail_non_finite(bad_feature, bad_scalar, &feat_names)?;
+        prewritten = Some(paths);
+    } else {
+        let feats = load_feature_matrix(p.competed, &feat_names, total_rows)?;
+        let bad_feature = feats
+            .find_non_finite()
+            .map(|(row, col)| (row, col, feats.row(row)[col]));
+        bail_non_finite(bad_feature, bad_scalar, &feat_names)?;
+        feats_slot = Some(feats);
+    }
     crate::memlog::report(
         "rescore feature matrix",
         &[
-            ("feats", feats.bytes()),
+            ("feats", feats_slot.as_ref().map_or(0, |f| f.bytes())),
             (
                 "metadata_columns",
                 meta_bytes(&cid, &label, &pform, &protein),
             ),
         ],
     );
-    crate::fdr::validate_labels(&label)?;
-    let is_decoy: Vec<bool> = label.iter().map(|l| l == "decoy").collect();
-    let (mut is_entrapment, mut is_real_target) = classify_entrapment(p.cfg, &protein, &is_decoy);
-    let mut is_decoy = is_decoy;
-    let mut n = cid.len();
-    if n > 0 {
-        let n_decoys = is_decoy.iter().filter(|&&v| v).count();
-        let n_targets = n - n_decoys;
-        require_both_labels(n_targets, n_decoys)?;
-        // The validation this replaces was one serial pass of `n_rows x n_features`
-        // `is_finite` checks -- hundreds of gigabytes on one thread at experiment scale --
-        // for a predicate with no carried state. Both scans are parallel now and both are
-        // order-preserving (`find_first`), and the two answers are combined so the row
-        // reported is still the FIRST offending row, features before scalars within a row,
-        // exactly as the interleaved serial loop reported it.
-        let bad_feature = feats.find_non_finite();
-        let bad_scalar = (0..n)
-            .into_par_iter()
-            .find_first(|&row| !prelim[row].is_finite() || !mz[row].is_finite());
-        if let Some((row, feature)) = bad_feature {
-            if bad_scalar.is_none_or(|scalar_row| row <= scalar_row) {
-                anyhow::bail!(
-                    "rescore input contains non-finite feature '{}' at flat row {row}: {}",
-                    feat_names[feature],
-                    feats.row(row)[feature]
-                );
-            }
-        }
-        if let Some(row) = bad_scalar {
-            anyhow::bail!(
-                "rescore input contains non-finite prelim_score/precursor_mz at flat row {row}"
-            );
-        }
-    }
     info!(
         psms = n,
         features = feat_names.len(),
         folds = p.cfg.folds,
         "rescore: loaded competed PSMs"
     );
-    // From here on the matrix is optional. A sidecar run under `rescore.strict` releases it
-    // as soon as the worker has its own copy on disk (`run_pin_sidecar`), because no native
-    // fallback can follow; every native path reads it through `kept_matrix`.
-    let mut feats_slot = Some(feats);
 
     // Track the path actually taken so the report reflects reality rather than a
     // hardcoded label, and pick the null the q-values are computed against.
@@ -383,6 +389,7 @@ pub fn run(p: RescoreParams) -> Result<u64> {
                 &mz,
                 &mut feats_slot,
                 &base,
+                prewritten.take(),
             ) {
                 Ok(s) => {
                     info!("rescore: using Mokapot scores");
@@ -413,6 +420,7 @@ pub fn run(p: RescoreParams) -> Result<u64> {
                 &mz,
                 &mut feats_slot,
                 &base,
+                prewritten.take(),
             ) {
                 Ok(s) => {
                     info!("rescore: using PyTorch NN sidecar scores");
@@ -1288,60 +1296,192 @@ impl Drop for ChildGuard {
 ///
 /// Batched because `feats` is already resident (one flat row-major matrix, 8 bytes per
 /// value); materialising 387 full columns as well would add ~12.8 GB for nothing.
-/// The feature matrix, which is released only under `rescore.strict` and only after a
-/// PIN sidecar has its own copy; strict has no native fallback, so no reader is left.
+/// The feature matrix, for the paths that read it.
+///
+/// It is absent in exactly two situations, both of them `rescore.strict` with a PIN
+/// sidecar: it was streamed past (never built) or released once the worker had its own copy
+/// on disk. Strict has no native fallback, so neither situation leaves a reader; every
+/// caller of this function is on a non-strict or native path, where the matrix was built.
 fn kept_matrix(slot: &Option<FeatureMatrix>) -> &FeatureMatrix {
     slot.as_ref().expect(
-        "the feature matrix is released only under rescore.strict, after the sidecar handoff",
+        "the feature matrix is absent only under rescore.strict with a sidecar classifier, \
+         which has no native fallback",
     )
 }
 
-fn write_features_parquet(
-    path: &str,
-    feat_names: &[String],
-    label: &[String],
-    pform: &[String],
-    protein: &[String],
-    mz: &[f64],
-    feats: &FeatureMatrix,
-) -> Result<u64> {
-    use arrow::array::{ArrayRef, Float32Array, Float64Array, Int32Array, StringArray};
-    use arrow::datatypes::{DataType, Field, Schema};
-    use arrow::record_batch::RecordBatch;
-    use std::sync::Arc;
+/// ~250k rows x 387 f32 is about 390 MB per batch, which keeps the encoder's working set
+/// modest.
+const HANDOFF_BATCH_ROWS: usize = 250_000;
+/// Row groups are capped well below the batch: the worker reads this file back with
+/// `ParquetFile.iter_batches`, which decodes a whole row group before it slices batches out
+/// of it, so at parquet's default 1,048,576-row groups the load transient was 1.6 GB of
+/// Arrow buffers per group on top of the matrix. 131,072 rows x 387 f32 is 200 MB.
+const HANDOFF_ROW_GROUP_ROWS: usize = 131_072;
 
-    let mut fields: Vec<Field> = vec![
-        Field::new("SpecId", DataType::Utf8, false),
-        Field::new("Label", DataType::Int32, false),
-        Field::new("ScanNr", DataType::Int32, false),
-        Field::new("ExpMass", DataType::Float64, false),
-        Field::new("CalcMass", DataType::Float64, false),
-    ];
-    for n in feat_names {
-        fields.push(Field::new(n, DataType::Float32, false));
+/// The parquet encoding's state. Boxed in `HandoffSink` because the arrow writer it owns
+/// dwarfs a `BufWriter`.
+struct ParquetHandoff {
+    schema: std::sync::Arc<arrow::datatypes::Schema>,
+    writer: mumdia_io::table::BatchWriter,
+    /// Row-major staging buffer for the current block, transposed to columns on flush.
+    stage: Vec<f32>,
+    block_start: usize,
+}
+
+enum HandoffSink {
+    Parquet(Box<ParquetHandoff>),
+    Pin(std::io::BufWriter<std::fs::File>),
+}
+
+/// The sidecar handoff file, written one row at a time.
+///
+/// Same logical contract in both encodings - `SpecId`, `Label`, `ScanNr`, `ExpMass`,
+/// `CalcMass`, the feature columns, `Peptide`, `Proteins` - so the worker reads either
+/// format from the same column names. Parquet applies to `nn_torch` only; `mokapot_worker`
+/// goes through `mokapot.read_pin()`, which requires the tab-separated form.
+///
+/// Features are `f32` in the parquet: the TSV writes `{:.6}` and the worker casts to
+/// float32 anyway, so f32 matches what is actually used, halves the file, and does not
+/// silently increase precision relative to the validated TSV reference.
+///
+/// Row-at-a-time, rather than a function over a resident matrix, because the source is
+/// either that matrix or the competed parquet itself (`for_each_feature_row`) and neither
+/// caller should hold a second copy. The parquet blocks are the same
+/// `HANDOFF_BATCH_ROWS`-row blocks written before, with the same values in the same order,
+/// so the file is unchanged.
+struct HandoffWriter<'a> {
+    sink: HandoffSink,
+    /// Rows per parquet batch. `HANDOFF_BATCH_ROWS` outside tests.
+    block_rows: usize,
+    /// Rows accepted so far, so `finish` reports what was written rather than what the
+    /// caller's metadata columns happen to be long.
+    rows: u64,
+    feat_names: &'a [String],
+    label: &'a [String],
+    pform: &'a [String],
+    protein: &'a [String],
+    mz: &'a [f64],
+}
+
+impl<'a> HandoffWriter<'a> {
+    fn new(
+        paths: &SidecarPaths,
+        feat_names: &'a [String],
+        label: &'a [String],
+        pform: &'a [String],
+        protein: &'a [String],
+        mz: &'a [f64],
+    ) -> Result<HandoffWriter<'a>> {
+        use arrow::datatypes::{DataType, Field, Schema};
+        use std::io::Write as _;
+        use std::sync::Arc;
+
+        let sink = if paths.use_pq {
+            let mut fields: Vec<Field> = vec![
+                Field::new("SpecId", DataType::Utf8, false),
+                Field::new("Label", DataType::Int32, false),
+                Field::new("ScanNr", DataType::Int32, false),
+                Field::new("ExpMass", DataType::Float64, false),
+                Field::new("CalcMass", DataType::Float64, false),
+            ];
+            for n in feat_names {
+                fields.push(Field::new(n, DataType::Float32, false));
+            }
+            fields.push(Field::new("Peptide", DataType::Utf8, false));
+            fields.push(Field::new("Proteins", DataType::Utf8, false));
+            let schema = Arc::new(Schema::new(fields));
+            let writer = mumdia_io::table::BatchWriter::with_row_group_rows(
+                &paths.handoff,
+                schema.clone(),
+                HANDOFF_ROW_GROUP_ROWS,
+            )?;
+            HandoffSink::Parquet(Box::new(ParquetHandoff {
+                schema,
+                writer,
+                stage: Vec::with_capacity(HANDOFF_BATCH_ROWS.saturating_mul(feat_names.len())),
+                block_start: 0,
+            }))
+        } else {
+            // Streamed through a BufWriter. It was previously accumulated in ONE
+            // un-reserved String: at ~1M rows x 387 features that is a >5 GB allocation
+            // (plus realloc churn) held entirely in RAM before the first byte reaches disk.
+            let mut w =
+                std::io::BufWriter::with_capacity(1 << 20, std::fs::File::create(&paths.handoff)?);
+            w.write_all(b"SpecId\tLabel\tScanNr\tExpMass\tCalcMass\t")?;
+            w.write_all(feat_names.join("\t").as_bytes())?;
+            w.write_all(b"\tPeptide\tProteins\n")?;
+            HandoffSink::Pin(w)
+        };
+        Ok(HandoffWriter {
+            sink,
+            block_rows: HANDOFF_BATCH_ROWS,
+            rows: 0,
+            feat_names,
+            label,
+            pform,
+            protein,
+            mz,
+        })
     }
-    fields.push(Field::new("Peptide", DataType::Utf8, false));
-    fields.push(Field::new("Proteins", DataType::Utf8, false));
-    let schema = Arc::new(Schema::new(fields));
 
-    let n = label.len();
-    let nf = feat_names.len();
-    // ~250k rows x 387 f32 is about 390 MB per batch, which keeps the encoder's working set
-    // modest. Row groups are capped well below that: the worker reads this file back with
-    // `ParquetFile.iter_batches`, which decodes a whole row group before it slices batches
-    // out of it, so at parquet's default 1,048,576-row groups the load transient was 1.6 GB
-    // of Arrow buffers per group on top of the matrix. 131,072 rows x 387 f32 is 200 MB.
-    const BATCH: usize = 250_000;
-    const ROW_GROUP_ROWS: usize = 131_072;
-    let mut w =
-        mumdia_io::table::BatchWriter::with_row_group_rows(path, schema.clone(), ROW_GROUP_ROWS)?;
-    let mut start = 0usize;
-    while start < n {
-        let end = (start + BATCH).min(n);
-        let k = end - start;
+    /// Shrink the parquet batch so a test can exercise several blocks. Production always
+    /// uses `HANDOFF_BATCH_ROWS`.
+    #[cfg(test)]
+    fn with_block_rows(mut self, rows: usize) -> Self {
+        self.block_rows = rows.max(1);
+        self
+    }
+
+    /// Append flat row `i`. Callers push rows in ascending order from 0.
+    ///
+    /// SpecId / ScanNr key on the row index, NOT candidate_id: candidate_id is the library
+    /// index and repeats across runs, so an experiment-wide table would collide.
+    fn push_row(&mut self, i: usize, values: &[f32]) -> Result<()> {
+        use std::io::Write as _;
+        let nf = self.feat_names.len();
+        self.rows += 1;
+        match &mut self.sink {
+            HandoffSink::Parquet(pq) => {
+                pq.stage.extend_from_slice(&values[..nf]);
+                if pq.stage.len() >= self.block_rows.saturating_mul(nf.max(1)) {
+                    self.flush_block()?;
+                }
+                Ok(())
+            }
+            HandoffSink::Pin(w) => {
+                let lab = if self.label[i] == "decoy" { -1 } else { 1 };
+                write!(
+                    w,
+                    "psm_{}\t{}\t{}\t{:.5}\t{:.5}\t",
+                    i, lab, i, self.mz[i], self.mz[i]
+                )?;
+                for v in values.iter().take(nf) {
+                    write!(w, "{:.6}\t", v)?;
+                }
+                writeln!(w, "-.{}.-\t{}", self.pform[i], self.protein[i])?;
+                Ok(())
+            }
+        }
+    }
+
+    /// Transpose the staged rows into one column per field and write them as one batch.
+    fn flush_block(&mut self) -> Result<()> {
+        use arrow::array::{ArrayRef, Float32Array, Int32Array, StringArray};
+        use arrow::record_batch::RecordBatch;
+        use std::sync::Arc;
+
+        let nf = self.feat_names.len();
+        let (label, pform, protein, mz) = (self.label, self.pform, self.protein, self.mz);
+        let HandoffSink::Parquet(pq) = &mut self.sink else {
+            return Ok(());
+        };
+        if pq.stage.is_empty() {
+            return Ok(());
+        }
+        let start = pq.block_start;
+        let k = pq.stage.len() / nf.max(1);
+        let end = start + k;
         let mut arrays: Vec<ArrayRef> = Vec::with_capacity(nf + 7);
-        // SpecId / ScanNr key on the row index, NOT candidate_id: candidate_id is the library
-        // index and repeats across runs, so an experiment-wide table would collide.
         arrays.push(Arc::new(StringArray::from(
             (start..end).map(|i| format!("psm_{i}")).collect::<Vec<_>>(),
         )));
@@ -1356,57 +1496,156 @@ fn write_features_parquet(
         let mzv: Vec<f64> = mz[start..end].to_vec();
         arrays.push(Arc::new(Float64Array::from(mzv.clone())));
         arrays.push(Arc::new(Float64Array::from(mzv)));
-        // Transpose this row block into one column per feature. `feats` is row-major, so a
-        // column read strides it; doing that per batch keeps the working set to one block.
         for fi in 0..nf {
-            let col: Vec<f32> = (start..end).map(|i| feats.row(i)[fi]).collect();
+            let col: Vec<f32> = (0..k).map(|r| pq.stage[r * nf + fi]).collect();
             arrays.push(Arc::new(Float32Array::from(col)));
         }
-        let _ = k;
         arrays.push(Arc::new(StringArray::from(
             (start..end)
                 .map(|i| format!("-.{}.-", pform[i]))
                 .collect::<Vec<_>>(),
         )));
         arrays.push(Arc::new(StringArray::from(protein[start..end].to_vec())));
-        w.write(&RecordBatch::try_new(schema.clone(), arrays)?)?;
-        start = end;
+        pq.writer
+            .write(&RecordBatch::try_new(pq.schema.clone(), arrays)?)?;
+        pq.stage.clear();
+        pq.block_start = end;
+        Ok(())
     }
-    w.close()
+
+    /// Finish the file and return the rows written.
+    fn finish(mut self) -> Result<u64> {
+        use std::io::Write as _;
+        self.flush_block()?;
+        match self.sink {
+            HandoffSink::Parquet(pq) => pq.writer.close(),
+            HandoffSink::Pin(mut w) => {
+                w.flush()?;
+                Ok(self.rows)
+            }
+        }
+    }
 }
 
-/// Run a PIN-contract Python rescorer sidecar (`mokapot_worker.py` or
-/// `nn_rescore_worker.py`) over a PIN written from the competed set; return scores
-/// aligned to the input candidate order (the file contract in
-/// docs/13_sidecars.md). Both sidecars share this exact contract: PIN in,
-/// `candidate_id`+`score` parquet out.
-#[allow(clippy::too_many_arguments)]
-fn run_pin_sidecar(
-    p: &RescoreParams,
-    script_name: &str,
+/// Stream the selected feature columns of every competed input, one row at a time, in flat
+/// row order, narrowed to f32 exactly as `FeatureMatrix::push` narrows them.
+///
+/// One pass over just the feature columns. The null policy is unchanged: a null f64 reads
+/// as NaN, which the validation then rejects.
+fn for_each_feature_row(
+    competed: &[String],
     feat_names: &[String],
-    cid: &[u32],
-    label: &[String],
-    pform: &[String],
-    protein: &[String],
-    mz: &[f64],
-    feats: &mut Option<FeatureMatrix>,
-    base: &[u32],
-) -> Result<Vec<f64>> {
-    use std::io::Write as _;
-    let python = p.cfg.python.as_deref().ok_or_else(|| {
-        anyhow::anyhow!("classifier sidecar {script_name} requires rescore.python")
+    mut f: impl FnMut(usize, &[f32]) -> Result<()>,
+) -> Result<()> {
+    let names: Vec<&str> = feat_names.iter().map(String::as_str).collect();
+    let mut row: Vec<f32> = vec![0.0; feat_names.len()];
+    let mut flat = 0usize;
+    for path in competed {
+        let t = TableFile::open(path)?;
+        let reader = t.batches(Some(&names), FEATURE_BATCH_ROWS)?;
+        let sch = reader.schema();
+        let order: Vec<usize> = feat_names
+            .iter()
+            .map(|n| {
+                sch.index_of(n)
+                    .map_err(|_| anyhow!("competed table {path} has no feature column '{n}'"))
+            })
+            .collect::<Result<_>>()?;
+        for b in reader {
+            let b = b?;
+            let cols: Vec<&Float64Array> = order
+                .iter()
+                .map(|&i| {
+                    b.column(i)
+                        .as_any()
+                        .downcast_ref::<Float64Array>()
+                        .ok_or_else(|| {
+                            anyhow!("feature column '{}' is not f64", sch.field(i).name())
+                        })
+                })
+                .collect::<Result<_>>()?;
+            let any_null = cols.iter().any(|c| c.null_count() > 0);
+            for k in 0..b.num_rows() {
+                if any_null {
+                    for (slot, c) in row.iter_mut().zip(&cols) {
+                        // `f64::NAN as f32`, not `f32::NAN`: the same expression the
+                        // matrix path narrowed through, so a null cell keeps its bits.
+                        *slot = if c.is_null(k) {
+                            f64::NAN as f32
+                        } else {
+                            c.value(k) as f32
+                        };
+                    }
+                } else {
+                    for (slot, c) in row.iter_mut().zip(&cols) {
+                        *slot = c.value(k) as f32;
+                    }
+                }
+                f(flat, &row)?;
+                flat += 1;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The engine's own copy of the feature values: one contiguous f32 buffer.
+fn load_feature_matrix(
+    competed: &[String],
+    feat_names: &[String],
+    total_rows: usize,
+) -> Result<FeatureMatrix> {
+    let mut m = FeatureMatrix::with_capacity(total_rows, feat_names.len());
+    for_each_feature_row(competed, feat_names, |_, values| {
+        m.push_row(values);
+        Ok(())
     })?;
-    let matrix = feats.as_ref().ok_or_else(|| {
-        anyhow::anyhow!("rescore: the feature matrix was released before the {script_name} handoff")
-    })?;
+    m.finish()
+}
+
+/// Report the first non-finite input value, whichever kind of column it is in.
+///
+/// The validation these two answers come from used to be one serial row loop that checked a
+/// row's features before its scalars and stopped at the first offending ROW. Both scans run
+/// separately now (one of them inside the handoff stream), so the choice between them is
+/// made here, on the row index, to keep the message identical.
+fn bail_non_finite(
+    bad_feature: Option<(usize, usize, f32)>,
+    bad_scalar: Option<usize>,
+    feat_names: &[String],
+) -> Result<()> {
+    if let Some((row, feature, value)) = bad_feature {
+        if bad_scalar.is_none_or(|scalar_row| row <= scalar_row) {
+            anyhow::bail!(
+                "rescore input contains non-finite feature '{}' at flat row {row}: {value}",
+                feat_names[feature]
+            );
+        }
+    }
+    if let Some(row) = bad_scalar {
+        anyhow::bail!(
+            "rescore input contains non-finite prelim_score/precursor_mz at flat row {row}"
+        );
+    }
+    Ok(())
+}
+
+/// The per-invocation sidecar file paths, and which handoff encoding they name.
+struct SidecarPaths {
+    /// The feature handoff: a parquet for `nn_torch`, the tab-separated PIN otherwise.
+    handoff: String,
+    out: String,
+    foldkeys: String,
+    use_pq: bool,
+}
+
+/// Per-invocation sidecar filenames. Fixed names (`rescore.pin`,
+/// `rescore_sidecar_out.parquet`) made two concurrent rescores clobber each other and let a
+/// killed run's orphaned Python worker hold `*.feat.mm` open forever, so every later
+/// rescore failed with `OSError: [Errno 22]` on a path it did not own. Keying on the output
+/// artifact plus the PID makes collisions impossible.
+fn sidecar_paths(p: &RescoreParams, script_name: &str) -> SidecarPaths {
     std::fs::create_dir_all(p.work_dir).ok();
-    // Per-invocation sidecar filenames. Fixed names (`rescore.pin`,
-    // `rescore_sidecar_out.parquet`) made two concurrent rescores clobber each other and
-    // let a killed run's orphaned Python worker hold `*.feat.mm` open forever, so every
-    // later rescore failed with `OSError: [Errno 22]` on a path it did not own. Keying on
-    // the output artifact plus the PID makes collisions impossible, and the guard below
-    // reaps the child so a killed parent cannot orphan it.
     let tag = format!(
         "{}_{}",
         std::path::Path::new(p.out)
@@ -1427,48 +1666,77 @@ fn run_pin_sidecar(
              a PIN through mokapot.read_pin); writing the tab-separated PIN instead"
         );
     }
-    let pin = if use_pq {
+    let handoff = if use_pq {
         format!("{}/rescore_{tag}.features.parquet", p.work_dir)
     } else {
         format!("{}/rescore_{tag}.pin", p.work_dir)
     };
-    let outp = format!("{}/rescore_{tag}_out.parquet", p.work_dir);
-
-    // Stream the PIN through a BufWriter. It was previously accumulated in ONE
-    // un-reserved String: at ~1M rows x 387 features that is a >5 GB allocation (plus
-    // realloc churn) held entirely in RAM before the first byte reaches disk.
-    if use_pq {
-        let rows = write_features_parquet(&pin, feat_names, label, pform, protein, mz, matrix)?;
-        tracing::info!(
-            path = %pin,
-            rows,
-            features = feat_names.len(),
-            "rescore: wrote the sidecar feature table as parquet"
-        );
-    } else {
-        let mut w = std::io::BufWriter::with_capacity(1 << 20, std::fs::File::create(&pin)?);
-        w.write_all(b"SpecId\tLabel\tScanNr\tExpMass\tCalcMass\t")?;
-        w.write_all(feat_names.join("\t").as_bytes())?;
-        w.write_all(b"\tPeptide\tProteins\n")?;
-        // Key the PIN on the unique row index i (SpecId=psm_i, ScanNr=i), NOT
-        // candidate_id: candidate_id is the library index and repeats across runs, so
-        // an experiment-wide (multi-file) PIN would collide on ScanNr and mokapot's
-        // per-spectrum competition would collapse the runs. The row index is unique
-        // across the whole concatenation. Single-run behaviour is unchanged (the
-        // mapping is bijective and mokapot does not use SpecId/ScanNr as features).
-        for i in 0..cid.len() {
-            let lab = if label[i] == "decoy" { -1 } else { 1 };
-            write!(w, "psm_{}\t{}\t{}\t{:.5}\t{:.5}\t", i, lab, i, mz[i], mz[i])?;
-            // one flat matrix row, already in `feat_names` order
-            let row = matrix.row(i);
-            for v in row.iter().take(feat_names.len()) {
-                write!(w, "{:.6}\t", v)?;
-            }
-            writeln!(w, "-.{}.-\t{}", pform[i], protein[i])?;
-        }
-        w.flush()?;
-        drop(w);
+    SidecarPaths {
+        handoff,
+        out: format!("{}/rescore_{tag}_out.parquet", p.work_dir),
+        foldkeys: format!("{}/rescore_{tag}.foldkeys.parquet", p.work_dir),
+        use_pq,
     }
+}
+
+/// Run a PIN-contract Python rescorer sidecar (`mokapot_worker.py` or
+/// `nn_rescore_worker.py`) over a PIN written from the competed set; return scores
+/// aligned to the input candidate order (the file contract in
+/// docs/13_sidecars.md). Both sidecars share this exact contract: PIN in,
+/// `candidate_id`+`score` parquet out.
+///
+/// `prewritten` is `Some` when the handoff was already streamed straight from the competed
+/// parquet, which is what happens under `rescore.strict` (see `run`); then there is no
+/// engine-side matrix and `feats` is `None`. Otherwise the handoff is written here, from
+/// the matrix, and released afterwards if strict allows it.
+#[allow(clippy::too_many_arguments)]
+fn run_pin_sidecar(
+    p: &RescoreParams,
+    script_name: &str,
+    feat_names: &[String],
+    cid: &[u32],
+    label: &[String],
+    pform: &[String],
+    protein: &[String],
+    mz: &[f64],
+    feats: &mut Option<FeatureMatrix>,
+    base: &[u32],
+    prewritten: Option<SidecarPaths>,
+) -> Result<Vec<f64>> {
+    let python = p.cfg.python.as_deref().ok_or_else(|| {
+        anyhow::anyhow!("classifier sidecar {script_name} requires rescore.python")
+    })?;
+    let paths = match prewritten {
+        Some(paths) => paths,
+        None => {
+            let paths = sidecar_paths(p, script_name);
+            let matrix = feats.as_ref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "rescore: the feature matrix was released before the {script_name} handoff"
+                )
+            })?;
+            // Key the handoff on the unique row index i (SpecId=psm_i, ScanNr=i), NOT
+            // candidate_id: candidate_id is the library index and repeats across runs, so
+            // an experiment-wide (multi-file) PIN would collide on ScanNr and mokapot's
+            // per-spectrum competition would collapse the runs. The row index is unique
+            // across the whole concatenation. Single-run behaviour is unchanged (the
+            // mapping is bijective and mokapot does not use SpecId/ScanNr as features).
+            let mut w = HandoffWriter::new(&paths, feat_names, label, pform, protein, mz)?;
+            for i in 0..cid.len() {
+                w.push_row(i, matrix.row(i))?;
+            }
+            let rows = w.finish()?;
+            tracing::info!(
+                path = %paths.handoff,
+                rows,
+                features = feat_names.len(),
+                parquet = paths.use_pq,
+                "rescore: wrote the sidecar feature table"
+            );
+            paths
+        }
+    };
+    let (pin, outp) = (&paths.handoff, &paths.out);
 
     // Cross-validation fold keys, row-aligned to the PIN.
     //
@@ -1484,21 +1752,24 @@ fn run_pin_sidecar(
     // By environment variable rather than argv: the sidecar contract is positional and
     // shared with `mokapot_worker.py`, and the NN hyperparameters already travel this way.
     // A worker that does not read it simply keeps its previous behaviour.
-    let foldkeys = format!("{}/rescore_{tag}.foldkeys.parquet", p.work_dir);
-    write_table(&foldkeys, vec![Col::U32("fold_key".into(), base.to_vec())])?;
+    let foldkeys = &paths.foldkeys;
+    write_table(foldkeys, vec![Col::U32("fold_key".into(), base.to_vec())])?;
 
     // Everything the worker reads is on disk now. Under `strict` a sidecar failure is an
     // error rather than a fall back to native_tda, so nothing downstream reads the engine's
     // copy of the matrix again: release it before the child starts instead of holding it
     // idle beside the worker's own for the whole training run. Measured on the six-run
     // Astral pool (3.13M x 387): the engine sat at 5.3 GB of a 17.9 GB process-tree peak.
+    // Under strict the matrix is usually never built at all (the handoff was streamed),
+    // and then there is nothing to release.
     if p.cfg.strict {
-        let bytes = matrix.bytes();
-        *feats = None;
-        tracing::info!(
-            released = %human_bytes(bytes as f64),
-            "rescore: released the engine's feature matrix for the sidecar run"
-        );
+        if let Some(bytes) = feats.as_ref().map(|m| m.bytes()) {
+            *feats = None;
+            tracing::info!(
+                released = %human_bytes(bytes as f64),
+                "rescore: released the engine's feature matrix for the sidecar run"
+            );
+        }
     }
 
     let script = crate::sidecar::resolve_script(p.script_dir, script_name);
@@ -1508,8 +1779,8 @@ fn run_pin_sidecar(
     // stale lock with no hint about which PID held it.
     let child = std::process::Command::new(python)
         .arg(&script)
-        .arg(&pin)
-        .arg(&outp)
+        .arg(pin)
+        .arg(outp)
         .env("PYTHONUTF8", "1")
         // Pass the configured NN hyperparameters so the worker uses them instead
         // of its own defaults, and so the folds/num_iter/train_fdr recorded in the
@@ -1543,7 +1814,7 @@ fn run_pin_sidecar(
         .env("MUMDIA_NN_WARM_EPOCHS", p.cfg.train_warm_epochs.to_string())
         .env("MUMDIA_NN_MARGIN_FRAC", p.cfg.train_margin_frac.to_string())
         .env("MUMDIA_NN_SEEDS", p.cfg.seeds.max(1).to_string())
-        .env("MUMDIA_NN_FOLD_KEYS", &foldkeys)
+        .env("MUMDIA_NN_FOLD_KEYS", foldkeys)
         .spawn()
         .map_err(|e| {
             // A bare `.spawn()?` reported only "No such file or directory (os error 2)" with
@@ -1561,7 +1832,7 @@ fn run_pin_sidecar(
     // flat row index. Exact, unique, finite coverage is part of the classifier
     // contract: silently assigning a worst score to missing rows changes the
     // trained population and can invalidate sensitivity/FDR comparisons.
-    let t = TableFile::open(&outp)?;
+    let t = TableFile::open(outp)?;
     let orow = t.u32("candidate_id")?;
     let osc = t.f64("score")?;
     align_sidecar_scores(&orow, &osc, cid.len(), script_name)
@@ -1733,6 +2004,260 @@ b
         merge_col(&mut dst, Vec::new(), 2);
         merge_col(&mut dst, vec![7, 8], 2);
         assert_eq!(dst, vec![7, 8]);
+    }
+
+    /// A competed-shaped parquet: the named feature columns as nullable f64, values keyed
+    /// on the row so the concatenation order is checkable, and (when `nulls`) one null per
+    /// five rows, which the reader must present as NaN.
+    fn crafted_competed(path: &str, rows: usize, tag: f64, feat_names: &[String], nulls: bool) {
+        let cols: Vec<Col> = feat_names
+            .iter()
+            .enumerate()
+            .map(|(j, name)| {
+                let v: Vec<Option<f64>> = (0..rows)
+                    .map(|i| {
+                        if nulls && j == 1 && i % 5 == 0 {
+                            None
+                        } else {
+                            Some(tag + i as f64 + j as f64 * 0.125)
+                        }
+                    })
+                    .collect();
+                Col::OptF64(name.clone(), v)
+            })
+            .collect();
+        write_table(path, cols).unwrap();
+    }
+
+    fn scratch(name: &str) -> String {
+        let dir = std::env::temp_dir().join("mumdia_rescore_stream_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join(format!("{}_{name}", std::process::id()))
+            .to_str()
+            .unwrap()
+            .to_string()
+    }
+
+    #[test]
+    fn streamed_feature_rows_are_the_matrix_rows() {
+        // The streamed handoff never builds a `FeatureMatrix`, so the equality that has to
+        // hold is between what `for_each_feature_row` yields and what the matrix would have
+        // held: same values, same flat order across several inputs, same null policy.
+        let names: Vec<String> = ["f0", "f1", "f2"].iter().map(|s| s.to_string()).collect();
+        let a = scratch("cmp_a.parquet");
+        let b = scratch("cmp_b.parquet");
+        crafted_competed(&a, 7, 100.0, &names, false);
+        crafted_competed(&b, 5, 900.0, &names, true);
+        let competed = vec![a, b];
+
+        let m = load_feature_matrix(&competed, &names, 12).unwrap();
+        assert_eq!(m.rows(), 12);
+        let mut seen: Vec<(usize, Vec<f32>)> = Vec::new();
+        for_each_feature_row(&competed, &names, |i, v| {
+            seen.push((i, v.to_vec()));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(seen.len(), 12);
+        for (i, values) in &seen {
+            assert_eq!(*i, seen[*i].0, "flat row index must be dense and ascending");
+            assert_eq!(
+                values.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                m.row(*i).iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "row {i}"
+            );
+        }
+        // Row 7 is the first row of the second input, and its f1 is the null: NaN in both
+        // paths, and the validation that runs inside the stream finds the same row the
+        // matrix scan does.
+        assert!(seen[7].1[1].is_nan());
+        assert_eq!(m.find_non_finite(), Some((7, 1)));
+    }
+
+    #[test]
+    fn the_streamed_handoff_is_byte_identical_to_the_handoff_from_the_matrix() {
+        // The claim of the streaming change: the sidecar receives exactly the file it
+        // received when the engine materialised the whole feature matrix first. Both
+        // encodings, several inputs, and a batch small enough to force several parquet
+        // blocks with a block boundary inside the second input.
+        let names: Vec<String> = ["f0", "f1", "f2"].iter().map(|s| s.to_string()).collect();
+        let a = scratch("hs_a.parquet");
+        let b = scratch("hs_b.parquet");
+        crafted_competed(&a, 7, 100.0, &names, false);
+        crafted_competed(&b, 5, 900.0, &names, true);
+        let competed = vec![a, b];
+        let n = 12;
+        let label: Vec<String> = (0..n)
+            .map(|i| if i % 3 == 0 { "decoy" } else { "target" }.to_string())
+            .collect();
+        let pform: Vec<String> = (0..n).map(|i| format!("PEPTIDEK/{i}")).collect();
+        let protein: Vec<String> = (0..n).map(|i| format!("sp|P{i:05}|X")).collect();
+        let mz: Vec<f64> = (0..n).map(|i| 400.0 + i as f64 * 1.5).collect();
+        let m = load_feature_matrix(&competed, &names, n).unwrap();
+
+        for use_pq in [true, false] {
+            let from_matrix = SidecarPaths {
+                handoff: scratch(if use_pq { "m.parquet" } else { "m.pin" }),
+                out: String::new(),
+                foldkeys: String::new(),
+                use_pq,
+            };
+            let from_stream = SidecarPaths {
+                handoff: scratch(if use_pq { "s.parquet" } else { "s.pin" }),
+                out: String::new(),
+                foldkeys: String::new(),
+                use_pq,
+            };
+            let mut w = HandoffWriter::new(&from_matrix, &names, &label, &pform, &protein, &mz)
+                .unwrap()
+                .with_block_rows(5);
+            for i in 0..n {
+                w.push_row(i, m.row(i)).unwrap();
+            }
+            assert_eq!(w.finish().unwrap(), n as u64);
+
+            let mut w = HandoffWriter::new(&from_stream, &names, &label, &pform, &protein, &mz)
+                .unwrap()
+                .with_block_rows(5);
+            for_each_feature_row(&competed, &names, |i, v| w.push_row(i, v)).unwrap();
+            assert_eq!(w.finish().unwrap(), n as u64);
+
+            assert_eq!(
+                std::fs::read(&from_matrix.handoff).unwrap(),
+                std::fs::read(&from_stream.handoff).unwrap(),
+                "handoff differs (parquet = {use_pq})"
+            );
+        }
+        // And the PIN really is the PIN contract: header, then one row per PSM.
+        let pin = scratch("m.pin");
+        let text = std::fs::read_to_string(&pin).unwrap();
+        assert!(text.starts_with(
+            "SpecId\tLabel\tScanNr\tExpMass\tCalcMass\tf0\tf1\tf2\tPeptide\tProteins\n"
+        ));
+        assert_eq!(text.lines().count(), n + 1);
+        assert!(text.lines().nth(1).unwrap().starts_with("psm_0\t-1\t0\t"));
+    }
+
+    /// A minimal competed table: the metadata columns `rescore::run` reads plus two
+    /// feature columns. No `.schema.json` companion, so the feature list is reconstructed
+    /// from the parquet's own columns (`NON_FEATURE_COLUMNS`).
+    fn crafted_competed_table(path: &str, rows: usize) {
+        let cols = vec![
+            Col::U32("candidate_id".into(), (0..rows as u32).collect()),
+            Col::Str(
+                "label".into(),
+                (0..rows)
+                    .map(|i| if i % 2 == 0 { "target" } else { "decoy" }.to_string())
+                    .collect(),
+            ),
+            Col::U32(
+                "base_peptide_id".into(),
+                (0..rows as u32).map(|i| i / 2).collect(),
+            ),
+            Col::Str(
+                "peptidoform".into(),
+                (0..rows).map(|i| format!("PEPTIDEK{i}")).collect(),
+            ),
+            Col::Str(
+                "protein".into(),
+                (0..rows).map(|i| format!("sp|P{i:04}|X")).collect(),
+            ),
+            Col::F64("charge".into(), (0..rows).map(|_| 2.0).collect()),
+            Col::F64(
+                "prelim_score".into(),
+                (0..rows)
+                    .map(|i| if i % 2 == 0 { 9.0 } else { 1.0 } + i as f64 * 0.01)
+                    .collect(),
+            ),
+            Col::F64(
+                "precursor_mz".into(),
+                (0..rows).map(|i| 400.0 + i as f64).collect(),
+            ),
+            Col::F64(
+                "apex_rt".into(),
+                (0..rows).map(|i| 10.0 + i as f64).collect(),
+            ),
+            Col::F64(
+                "elution_lo".into(),
+                (0..rows).map(|i| 9.0 + i as f64).collect(),
+            ),
+            Col::F64(
+                "elution_hi".into(),
+                (0..rows).map(|i| 11.0 + i as f64).collect(),
+            ),
+            Col::I32("peak_rank".into(), vec![0; rows]),
+            Col::F64(
+                "feat_a".into(),
+                (0..rows)
+                    .map(|i| if i % 2 == 0 { 3.0 } else { 0.5 })
+                    .collect(),
+            ),
+            Col::F64(
+                "feat_b".into(),
+                (0..rows).map(|i| (i % 7) as f64 * 0.25).collect(),
+            ),
+        ];
+        write_table(path, cols).unwrap();
+    }
+
+    #[test]
+    fn strict_sidecar_streams_the_handoff_without_building_a_matrix() {
+        // End-to-end through `run`: under strict with a PIN sidecar the features go from
+        // the competed parquet straight into the handoff, and no `FeatureMatrix` is
+        // allocated. Driven with an interpreter that cannot be spawned, so the run fails at
+        // the child rather than needing a Python environment -- but only AFTER the handoff
+        // has been written from the streamed features, which is what is asserted.
+        let competed = scratch("run_competed.parquet");
+        crafted_competed_table(&competed, 24);
+        let work = scratch("run_work");
+        let out = scratch("run_scored.parquet");
+        let cfg = RescoreConfig {
+            classifier: RescorerKind::NnTorch,
+            strict: true,
+            python: Some("mumdia-no-such-interpreter-for-this-test".to_string()),
+            ..Default::default()
+        };
+        let err = run(RescoreParams {
+            competed: &[competed],
+            out: &out,
+            work_dir: &work,
+            script_dir: "scripts",
+            cfg: &cfg,
+            config_hash: "test",
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("NnTorch sidecar failed") && err.contains("strict"),
+            "{err}"
+        );
+        // The handoff is a parquet (the default `handoff`), named per invocation, and holds
+        // every row exactly once in flat order with the PIN column contract.
+        let tag = format!(
+            "{}_{}",
+            std::path::Path::new(&out)
+                .file_stem()
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            std::process::id()
+        );
+        let handoff = format!("{work}/rescore_{tag}.features.parquet");
+        let t = mumdia_io::table::Table::read(&handoff).unwrap();
+        assert_eq!(t.nrows, 24);
+        assert_eq!(t.i32("ScanNr").unwrap(), (0..24).collect::<Vec<i32>>());
+        assert_eq!(
+            t.i32("Label").unwrap(),
+            (0..24)
+                .map(|i| if i % 2 == 0 { 1 } else { -1 })
+                .collect::<Vec<i32>>()
+        );
+        assert_eq!(
+            t.f32("feat_a").unwrap(),
+            (0..24)
+                .map(|i| if i % 2 == 0 { 3.0f32 } else { 0.5 })
+                .collect::<Vec<f32>>()
+        );
     }
 
     #[test]
