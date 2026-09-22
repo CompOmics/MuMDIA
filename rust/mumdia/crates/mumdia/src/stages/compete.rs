@@ -460,6 +460,23 @@ fn copy_kept_rows(
             };
             let mut arrays: Vec<ArrayRef> = Vec::with_capacity(src_idx.len());
             for (si, f) in src_idx.iter().zip(out_schema.fields()) {
+                // A column the schema declares non-nullable must not carry nulls. The
+                // typed getters (`TableFile::u32`) refuse them, and reading fewer columns
+                // means fewer of them pass through a getter: `candidate_id` is now read
+                // only for the audit and `base_peptide_id` only for the groupings that key
+                // on it, so without this the pass-through would copy a null into the
+                // competed table and the failure would surface somewhere downstream, or
+                // not at all. `null_count` is a counter on the array, not a scan.
+                if let Some(i) = si {
+                    let col = b.column(*i);
+                    if !f.is_nullable() && col.null_count() > 0 {
+                        return Err(anyhow!(
+                            "column '{}' has {} null values in rows {row0}..{row1} of the                              features table, and the competed schema declares it                              non-nullable",
+                            f.name(),
+                            col.null_count()
+                        ));
+                    }
+                }
                 arrays.push(match (si, &idx) {
                     (Some(i), None) => densify(b.column(*i).clone(), f)?,
                     (Some(i), Some(ix)) => densify(take(b.column(*i).as_ref(), ix, None)?, f)?,
