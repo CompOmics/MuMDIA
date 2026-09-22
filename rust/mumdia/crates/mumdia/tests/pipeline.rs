@@ -812,6 +812,7 @@ fn search_seed_from_a_shared_scan_buffer_is_byte_identical_and_read_only() {
         let rows = stages::search_seed::run(stages::search_seed::SearchSeedParams {
             fragment_offset: None,
             ms2_scans: shared,
+            emit_calibrants: false,
             ms2: &ms2,
             library_precursors: &prec,
             library_fragments: &frag,
@@ -856,6 +857,7 @@ fn search_seed_from_a_shared_scan_buffer_is_byte_identical_and_read_only() {
     stages::search_seed::run(stages::search_seed::SearchSeedParams {
         fragment_offset: None,
         ms2_scans: None,
+        emit_calibrants: false,
         ms2: &ms2,
         library_precursors: &prec,
         library_fragments: &frag,

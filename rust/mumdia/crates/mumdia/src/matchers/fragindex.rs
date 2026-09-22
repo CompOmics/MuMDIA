@@ -18,9 +18,10 @@ use crate::matchers::binning::LogBins;
 use mumdia_core::constants::within_ppm;
 
 /// The CSR inverted fragment index. Structure-of-arrays so the verify hot loop
-/// streams only `post_mz`; `post_cand`/`post_int`/`post_frag` are read on a
-/// verified hit. Built once per tolerance (seed at `fragment_tol_ppm`, extract at
-/// the learned masscal tolerance).
+/// decides on `post_mz` alone and `post_cand`/`post_int`/`post_frag` are wanted only
+/// where a posting verifies (their loads sit under the predicate's branch, so the
+/// compiler is free to sink them there). Built once per tolerance (seed at
+/// `fragment_tol_ppm`, extract at the learned masscal tolerance).
 pub struct FragIndex {
     bins: LogBins,
     /// CSR row offsets, length `n_bins + 1`.
@@ -184,6 +185,20 @@ impl FragIndex {
         }
     }
 
+    /// The fragment bin a query m/z probes, as [`FragIndex::probe_peak_win`] would
+    /// compute it. Exposed so a caller can compute the bin in a pass of its own and
+    /// hand it to [`FragIndex::probe_peak_win_binned`]; the computation is a `ln()`,
+    /// and taking it off the probe's dependency chain is worth 7-17% of the probe
+    /// depending on the shape, even when the count of `ln()` calls is unchanged (see
+    /// extract's per-scan setup scratch). It is NOT here to be cached across calls:
+    /// buffering bins per window so
+    /// several tasks can share one fill was tried and reverted, because the fill is
+    /// serial and the work it removes was parallel.
+    #[inline]
+    pub fn bin_of(&self, mz: f64) -> u32 {
+        self.bins.bin(mz) as u32
+    }
+
     /// Probe one peak using a per-window narrowing cache. Identical semantics and
     /// identical callback order to [`FragIndex::probe_peak`] for the `(cand_lo,
     /// cand_hi)` the cache was built with; the only difference is that the two
@@ -193,12 +208,32 @@ impl FragIndex {
         &self,
         nw: &mut WindowNarrow,
         peak_mz: f64,
+        f: F,
+    ) {
+        self.probe_peak_win_binned(nw, peak_mz, self.bin_of(peak_mz), f);
+    }
+
+    /// [`FragIndex::probe_peak_win`] with the bin already computed.
+    ///
+    /// `bin` must be `self.bin_of(peak_mz)`. It is clamped into range, so a wrong
+    /// value cannot index out of bounds, but it WILL probe the wrong bins and drop
+    /// matches, silently. That is why the only caller computes `peak_mz` and `bin`
+    /// from one expression into one scratch entry and reads both back from it
+    /// (`extract.rs`, `setup`): the pairing is structural there, not asserted, so
+    /// there is no second evaluation that could drift. A caller that stores the two
+    /// apart must assert it itself.
+    #[inline]
+    pub fn probe_peak_win_binned<F: FnMut(u32, f64, f32, u16)>(
+        &self,
+        nw: &mut WindowNarrow,
+        peak_mz: f64,
+        bin: u32,
         mut f: F,
     ) {
         if nw.cand_hi <= nw.cand_lo {
             return;
         }
-        let b = self.bins.bin(peak_mz);
+        let b = (bin as usize).min(self.bins.n_bins - 1);
         let lo_bin = b.saturating_sub(1);
         let hi_bin = (b + 1).min(self.bins.n_bins - 1);
         for nb in lo_bin..=hi_bin {
@@ -232,6 +267,28 @@ impl FragIndex {
 
     /// Verify each posting in `[a, z)` against the exact f64 tolerance predicate and
     /// emit the survivors.
+    ///
+    /// The four parallel arrays are sliced once and zipped, so the loop pays four
+    /// range checks for the whole range instead of four per posting; the early return
+    /// keeps the empty range, which is what a narrow candidate window mostly produces,
+    /// from paying for the four slicings at all.
+    ///
+    /// Worth -5.7 to -9.3% OF THIS LOOP, at 1, 8, 64 and 512 postings in the range,
+    /// measured against the indexed loop it replaced in the same binary and over the
+    /// same index (`bench_emit_range` below; 1.28 against 1.37 ns/posting at 512, both
+    /// cache-hot). That is not -5.7 to -9.3% of the probe. At the harness's widest arm
+    /// (65 emitted postings per peak, 798 ns/peak) the whole verify loop is about 11%
+    /// of the probe, so the ceiling here is about -0.8% of a probe and less on a narrow
+    /// candidate window; the earlier "-4 to -6% of the probe" in this comment came from
+    /// an unreproducible pair of binaries and was wrong. It is kept because it is
+    /// measurably faster, never slower, and costs no memory -- not because it moves the
+    /// stage. The end-to-end AIF extract A/B below cannot resolve it.
+    ///
+    /// The PREDICATE is untouched. Hoisting it to precomputed m/z bounds would be the
+    /// obvious next step and is not equivalent: `within_ppm` compares
+    /// `hi - lo <= tol * 1e-6 * lo` in f64 per pair, and a bound computed once from
+    /// `peak_mz` rounds differently from that at the tolerance edge. The edge decides
+    /// real matches, so the loop keeps calling the canonical predicate.
     #[inline]
     fn emit_range<F: FnMut(u32, f64, f32, u16)>(
         &self,
@@ -240,10 +297,17 @@ impl FragIndex {
         peak_mz: f64,
         f: &mut F,
     ) {
-        for p in a..z {
-            let pmz = self.post_mz[p] as f64;
+        if z <= a {
+            return;
+        }
+        let mzs = &self.post_mz[a..z];
+        let cands = &self.post_cand[a..z];
+        let ints = &self.post_int[a..z];
+        let frags = &self.post_frag[a..z];
+        for (((&mz, &cid), &pint), &pfrag) in mzs.iter().zip(cands).zip(ints).zip(frags) {
+            let pmz = mz as f64;
             if within_ppm(pmz, peak_mz, self.tol_ppm) {
-                f(self.post_cand[p], pmz, self.post_int[p], self.post_frag[p]);
+                f(cid, pmz, pint, pfrag);
             }
         }
     }
@@ -509,8 +573,276 @@ mod tests {
                         a, b,
                         "cached probe diverged at q={q} window=({win_lo},{win_hi})"
                     );
+                    // The precomputed-bin entry point must be the same drop-in: same
+                    // postings, same order, same bits, whenever `bin` came from `bin_of`.
+                    let mut c: Vec<(u32, u64, u32, u16)> = Vec::new();
+                    idx.probe_peak_win_binned(&mut nw, q, idx.bin_of(q), |c_, m, it, fr| {
+                        c.push((c_, m.to_bits(), it.to_bits(), fr))
+                    });
+                    assert_eq!(
+                        a, c,
+                        "binned probe diverged at q={q} window=({win_lo},{win_hi})"
+                    );
                 }
             }
+        }
+    }
+
+    /// `bin_of` is the bin the probe would have computed, for every m/z including the
+    /// ones the geometry clamps (at or below `mz_min`, above `mz_max`, zero, negative).
+    ///
+    /// A modest test, and it was once described here as the one the whole contract
+    /// rests on, which it is not: `bin_of` is `self.bins.bin(mz) as u32`, so this can
+    /// only fail on a `u32` truncation, which needs more than 2^32 bins (there are
+    /// about 115k at 20 ppm over 200-2000). What it does pin is that the cast is the
+    /// only thing between the two and that the clamped edges agree. The equality that
+    /// matters -- that the bin handed to `probe_peak_win_binned` belongs to the m/z
+    /// handed with it -- is structural at the only call site: extract computes both in
+    /// one expression into one scratch entry and reads both out of it.
+    #[test]
+    fn bin_of_is_the_bin_the_probe_uses() {
+        let tol = 20.0;
+        let lib = lib_from(&[
+            (vec![(300.0, 1.0), (900.0, 1.0)], 400.0),
+            (vec![(1800.0, 1.0)], 500.0),
+        ]);
+        let idx = FragIndex::build(&lib, tol);
+        // A peak the probe finds nothing for still has to agree, because extract buffers
+        // the bin for every peak of the scan, hit or not.
+        let mut mz = 1.0f64;
+        while mz < 5000.0 {
+            assert_eq!(
+                idx.bin_of(mz) as usize,
+                idx.bins.bin(mz),
+                "bin_of disagrees with the probe's own binning at {mz}"
+            );
+            mz *= 1.013;
+        }
+        for &q in &[0.0f64, -1.0, f64::MIN_POSITIVE, 1e12] {
+            assert_eq!(idx.bin_of(q) as usize, idx.bins.bin(q), "edge m/z {q}");
+        }
+    }
+
+    /// A bin past the top of the geometry is clamped rather than indexing out of
+    /// bounds. `bin_of` can never produce one, so this pins the defensive clamp that
+    /// keeps the public entry point total for a caller that hands over a stale bin.
+    #[test]
+    fn a_bin_past_the_top_is_clamped_not_a_panic() {
+        let tol = 20.0;
+        // The indexed range has to be wide, or the clamped top bin is still the peak's.
+        let lib = lib_from(&[(vec![(700.0, 1.0)], 400.0), (vec![(1800.0, 1.0)], 500.0)]);
+        let idx = FragIndex::build(&lib, tol);
+        let mut nw = idx.window_narrow(0, 2);
+        let mut n = 0usize;
+        idx.probe_peak_win_binned(&mut nw, 700.0, u32::MAX, |_, _, _, _| n += 1);
+        // Wrong bin, so the match is missed -- but nothing panics, and the correct bin
+        // still finds it.
+        assert_eq!(
+            n, 0,
+            "a bogus bin probes the top of the index, not the peak"
+        );
+        let mut nw = idx.window_narrow(0, 2);
+        let mut m = 0usize;
+        idx.probe_peak_win_binned(&mut nw, 700.0, idx.bin_of(700.0), |_, _, _, _| m += 1);
+        assert_eq!(m, 1);
+    }
+
+    /// `emit_range` walks four parallel arrays. Whatever way it is written, every
+    /// posting within tolerance must be emitted exactly once and carry ITS OWN
+    /// candidate, intensity and fragment ordinal: a mis-sliced or mis-zipped array
+    /// would pair a posting's m/z with a neighbour's candidate, which no small fixture
+    /// and no count-only assertion would notice. The fixture puts hundreds of postings
+    /// in the probed bins so the verify loop actually runs long.
+    #[test]
+    fn emit_range_pairs_every_posting_with_its_own_columns() {
+        let tol = 20.0;
+        let n_cand = 400usize;
+        let n_frag = 4usize;
+        // All fragments within a few ppm of 600, so they crowd into a handful of bins;
+        // intensity and ordinal identify the posting uniquely.
+        let mut cands: Vec<(Vec<(f64, f32)>, f64)> = Vec::new();
+        for i in 0..n_cand {
+            let frags: Vec<(f64, f32)> = (0..n_frag)
+                .map(|k| {
+                    let ppm = (i * n_frag + k) as f64 * 0.11 - 40.0; // -40..+136 ppm
+                    (600.0 * (1.0 + ppm * 1e-6), (i * n_frag + k) as f32)
+                })
+                .collect();
+            cands.push((frags, 400.0 + i as f64 * 1e-3));
+        }
+        let lib = lib_from(&cands);
+        let idx = FragIndex::build(&lib, tol);
+        let (lo, hi) = idx.candidate_range(400.0, 400.0 + (n_cand as f64 - 1.0) * 1e-3);
+        assert_eq!((lo, hi), (0, n_cand as u32));
+
+        let q = 600.0f64;
+        let mut got: Vec<(u32, u64, u32, u16)> = Vec::new();
+        idx.probe_peak(q, lo, hi, |c, m, it, fr| {
+            got.push((c, m.to_bits(), it.to_bits(), fr))
+        });
+        // Reference: the same predicate, over the library itself.
+        let mut want: Vec<(u32, u64, u32, u16)> = Vec::new();
+        for (c, cand) in lib.cands.iter().enumerate() {
+            for k in 0..cand.n_frag {
+                let gi = cand.frag_start + k;
+                let pmz = lib.frag_mz[gi] as f64;
+                if within_ppm(pmz, q, tol) {
+                    want.push((
+                        c as u32,
+                        pmz.to_bits(),
+                        lib.frag_int[gi].to_bits(),
+                        k as u16,
+                    ));
+                }
+            }
+        }
+        assert!(
+            want.len() > 100,
+            "the fixture must put a long run of postings in the probed bins, got {}",
+            want.len()
+        );
+        let mut a = got.clone();
+        let mut b = want.clone();
+        a.sort_unstable();
+        b.sort_unstable();
+        let mut once = a.clone();
+        once.dedup();
+        assert_eq!(once.len(), got.len(), "no posting may be emitted twice");
+        assert_eq!(a, b, "emitted postings, or their columns, differ");
+        // And the intensity really identifies the posting: cand*n_frag + frag.
+        for &(cid, _, int_bits, frag) in &got {
+            assert_eq!(
+                f32::from_bits(int_bits),
+                (cid as usize * n_frag + frag as usize) as f32,
+                "posting columns are out of step for cand {cid} frag {frag}"
+            );
+        }
+        // The cached and binned entry points see the same thing.
+        let mut nw = idx.window_narrow(lo, hi);
+        let mut cached: Vec<(u32, u64, u32, u16)> = Vec::new();
+        idx.probe_peak_win_binned(&mut nw, q, idx.bin_of(q), |c, m, it, fr| {
+            cached.push((c, m.to_bits(), it.to_bits(), fr))
+        });
+        assert_eq!(got, cached);
+    }
+
+    /// The indexed verify loop `emit_range` replaced, kept verbatim so the two can be
+    /// timed against each other in the same binary. `tests/bench_fragindex.rs` cannot
+    /// do it: `emit_range` is private and every arm of that harness calls the same one,
+    /// so no arm varies it.
+    fn emit_range_indexed<F: FnMut(u32, f64, f32, u16)>(
+        idx: &FragIndex,
+        a: usize,
+        z: usize,
+        peak_mz: f64,
+        f: &mut F,
+    ) {
+        for p in a..z {
+            let pmz = idx.post_mz[p] as f64;
+            if within_ppm(pmz, peak_mz, idx.tol_ppm) {
+                f(idx.post_cand[p], pmz, idx.post_int[p], idx.post_frag[p]);
+            }
+        }
+    }
+
+    /// Microbenchmark: `emit_range`'s slice-and-zip against the indexed loop above, at
+    /// several range lengths, over the SAME index and the same peak m/z sequence, with
+    /// the checksum asserted equal. `#[ignore]`d.
+    ///
+    ///   cargo test --release -p mumdia bench_emit_range -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn bench_emit_range() {
+        let tol = 20.0;
+        println!("emit_range: sliced-and-zipped (shipped) vs the indexed loop it replaced");
+        // Fix the geometry with two anchor fragments present in every fixture, so the
+        // bin around 600 is the same bin whatever else the library holds.
+        let anchors = vec![(200.0f64, 1.0f32), (1500.0, 1.0)];
+        let probe_lib = lib_from(&[(
+            {
+                let mut v = anchors.clone();
+                v.push((600.0, 1.0));
+                v
+            },
+            900.0,
+        )]);
+        let geom = FragIndex::build(&probe_lib, tol);
+        let b0 = geom.bins.bin(600.0);
+        // Every m/z within 9 ppm of 600 (so every posting verifies at 20 ppm) that the
+        // geometry puts in that one bin, as the index will see it after the f32 store.
+        let in_bin: Vec<f64> = (-45..=45)
+            .map(|k| ((600.0 * (1.0 + k as f64 * 0.2e-6)) as f32) as f64)
+            .filter(|&mz| geom.bins.bin(mz) == b0)
+            .collect();
+        assert!(in_bin.len() >= 8, "the bin holds too few distinct m/z");
+        for &n_post in &[1usize, 8, 64, 512] {
+            // `n_post` postings inside that one bin, each on its own candidate, plus the
+            // anchors so the index is not degenerate. m/z repeat once the bin runs out
+            // of distinct values, which is what a crowded bin looks like anyway.
+            let mut cands: Vec<(Vec<(f64, f32)>, f64)> = (0..n_post)
+                .map(|i| {
+                    (
+                        vec![(in_bin[i % in_bin.len()], i as f32)],
+                        400.0 + i as f64 * 1e-3,
+                    )
+                })
+                .collect();
+            cands.push((anchors.clone(), 900.0));
+            let lib = lib_from(&cands);
+            let idx = FragIndex::build(&lib, tol);
+            let b = idx.bins.bin(600.0);
+            let (a, z) = (idx.bin_start[b] as usize, idx.bin_start[b + 1] as usize);
+            assert_eq!(z - a, n_post, "fixture did not put the run in one bin");
+            let iters = 4_000_000 / (n_post + 2);
+            let mut best = (f64::INFINITY, f64::INFINITY);
+            let (mut hs, mut hi_) = (0u64, 0u64);
+            for r in 0..14 {
+                // rotate, so warm-cache position cannot favour one side
+                for s in [r % 2, 1 - r % 2] {
+                    let mut acc = 0u64;
+                    let t = std::time::Instant::now();
+                    for it in 0..iters {
+                        // perturbation far below tolerance, so no posting changes side
+                        let q = 600.0 * (1.0 + (it % 4) as f64 * 1e-12);
+                        if s == 0 {
+                            idx.emit_range(a, z, q, &mut |c, m, i, f| {
+                                acc = acc
+                                    .wrapping_add(c as u64)
+                                    .wrapping_add(m.to_bits())
+                                    .wrapping_add(i.to_bits() as u64)
+                                    .wrapping_add(f as u64);
+                            });
+                        } else {
+                            emit_range_indexed(&idx, a, z, q, &mut |c, m, i, f| {
+                                acc = acc
+                                    .wrapping_add(c as u64)
+                                    .wrapping_add(m.to_bits())
+                                    .wrapping_add(i.to_bits() as u64)
+                                    .wrapping_add(f as u64);
+                            });
+                        }
+                    }
+                    let el = t.elapsed().as_secs_f64() * 1e9 / (iters as f64);
+                    std::hint::black_box(acc);
+                    if s == 0 {
+                        best.0 = best.0.min(el);
+                        hs = acc;
+                    } else {
+                        best.1 = best.1.min(el);
+                        hi_ = acc;
+                    }
+                }
+            }
+            assert_eq!(hs, hi_, "the two verify loops emit different postings");
+            println!(
+                "  range {n_post:4} postings: sliced {:8.1} ns/range, indexed {:8.1} ns/range  \
+                 delta {:+6.1}%  ({:.2} vs {:.2} ns/posting)",
+                best.0,
+                best.1,
+                100.0 * (best.0 - best.1) / best.1,
+                best.0 / n_post as f64,
+                best.1 / n_post as f64
+            );
         }
     }
 
