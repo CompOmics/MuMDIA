@@ -122,18 +122,33 @@ impl ChromStore {
 
     /// Store `rt` as an axis id, reusing an axis already stored for the open candidate
     /// when the values are identical (the common case: one grid per candidate).
-    fn axis_for(&mut self, cid: u32, rt: &[f32]) -> u32 {
+    fn axis_for(&mut self, cid: u32, rt: &[f32]) -> Result<u32> {
         if self.open_cid != Some(cid) {
             self.open_cid = Some(cid);
             self.open_axis_lo = self.axis_off.len() - 1;
         }
         if rt.is_empty() {
-            return NO_AXIS;
+            return Ok(NO_AXIS);
         }
         for a in self.open_axis_lo..self.axis_off.len() - 1 {
             let (lo, hi) = (self.axis_off[a], self.axis_off[a + 1]);
-            if hi - lo == rt.len() && self.axis_vals[lo..hi] == *rt {
-                return a as u32;
+            // BITWISE, not `==`. Interning makes every consumer read `store.rt(row)`
+            // instead of the row's own values, so it may only substitute an axis that is
+            // identical to the last bit. `-0.0 == 0.0` holds under f32's `PartialEq`
+            // while [`peak_window`]'s merge keys the union on `to_bits`, so an `==` match
+            // would fold two union points into one and move the profile, the apex, the
+            // walked window and the quantity. Extract's grid is positive mzML scan times,
+            // but `mumdia quant --chromatograms` takes a table written by anything, which
+            // is the same reason the rt/intensity length check below exists.
+            // (A NaN-carrying axis now dedups against an identical one, which `==` never
+            // did; the values stored are the same bits either way.)
+            if hi - lo == rt.len()
+                && self.axis_vals[lo..hi]
+                    .iter()
+                    .zip(rt)
+                    .all(|(a, b)| a.to_bits() == b.to_bits())
+            {
+                return Ok(a as u32);
             }
         }
         let nondecreasing = rt_is_sorted(rt);
@@ -142,11 +157,34 @@ impl ChromStore {
             .push(nondecreasing && rt.windows(2).all(|w| w[0] < w[1]));
         self.axis_vals.extend_from_slice(rt);
         self.axis_off.push(self.axis_vals.len());
-        (self.axis_off.len() - 2) as u32
+        let id = (self.axis_off.len() - 2) as u32;
+        // [`NO_AXIS`] means "this row has no RT axis": [`ChromStore::axis`] hands back an
+        // empty slice for it, [`peak_window`]'s uniformity scan skips the row and
+        // [`fixed_window_indices`] returns `None`, so a real axis minted under that id
+        // would integrate to 0 without a word. One comparison per DISTINCT axis, at the
+        // point the id is minted, is cheaper than the argument that the count cannot get
+        // there -- and `--out-peak-bounds` is exactly the path that holds the whole table.
+        if id == NO_AXIS {
+            anyhow::bail!(
+                "chromatogram table has more than {NO_AXIS} distinct retention-time axes; \
+                 the axis id would collide with the empty-trace marker"
+            );
+        }
+        Ok(id)
     }
 
-    fn push(&mut self, cid: u32, name: &str, pred: f32, rt: &[f32], inten: &[f32]) {
-        let axis_id = self.axis_for(cid, rt);
+    fn push(&mut self, cid: u32, name: &str, pred: f32, rt: &[f32], inten: &[f32]) -> Result<()> {
+        // The shared-axis profile in [`peak_window`] is sized from the AXIS and indexed by
+        // the INTENSITY position, and `fixed_window_indices` slices the intensities with
+        // indices taken from the RT trace. `run` refuses a mismatched row while it can
+        // still name the candidate and the file; this catches a fixture or a future loader
+        // that does not.
+        debug_assert_eq!(
+            rt.len(),
+            inten.len(),
+            "chromatogram row for candidate_id {cid} has mismatched rt/intensity lengths"
+        );
+        let axis_id = self.axis_for(cid, rt)?;
         let name_id = self.names.intern(name);
         self.cid.push(cid);
         self.name_id.push(name_id);
@@ -154,6 +192,7 @@ impl ChromStore {
         self.axis_id.push(axis_id);
         self.int_vals.extend_from_slice(inten);
         self.int_off.push(self.int_vals.len());
+        Ok(())
     }
 
     fn axis(&self, id: u32) -> &[f32] {
@@ -305,8 +344,20 @@ fn nearest_index(rt: &[f32], target: f64, sorted: bool) -> usize {
         }
         return k;
     }
-    // First sample at or after `target`. A non-finite target makes every predicate false
-    // and lands on 0, which is where the scan's untouched `k` sits too.
+    // The binary search below needs a FINITE target, and the earlier claim that any
+    // non-finite one "makes every predicate false and lands on 0" is wrong for `+inf`:
+    // `r < inf` holds at every sample, so `partition_point` returns `rt.len()` and the
+    // last index comes back, where the scan returns 0 (its `d` is `inf` everywhere and
+    // `inf < inf` is false, so `k` is never assigned). NaN and `-inf` do land on 0 by
+    // themselves; the precondition that actually holds is "finite", so it is stated once
+    // here instead of argued per case. Retention times reach this stage finite (convert
+    // drops a spectrum whose scan start time is not, `convert.rs`), and both call sites
+    // filter the apex hint on `is_finite`, so this is the guard for the third caller.
+    // Returning 0 is what the scan returns for every non-finite target.
+    if !target.is_finite() {
+        return 0;
+    }
+    // First sample at or after `target`.
     let j = rt.partition_point(|&r| (r as f64) < target);
     // Backing up over an equal-valued run keeps the FIRST of several identical samples,
     // which is the one the scan's strict `<` kept.
@@ -688,10 +739,18 @@ fn peak_window(
         let apex = axis.first().map_or(f64::NAN, |&r| r as f64);
         return (f64::NEG_INFINITY, f64::INFINITY, apex);
     }
-    // Both constructions leave the axis ascending: the shared one is checked strictly
-    // increasing when it is stored, and the merged one is deduped and ordered by bit
-    // pattern, which is value order as long as no negative or NaN RT is present.
-    let axis_sorted = shared.is_some() || axis.last().is_some_and(|&r| r >= 0.0);
+    // [`nearest_index`] may binary-search only an ascending axis. The shared one was
+    // checked strictly increasing when it was stored ([`ChromStore::axis_strict`]). The
+    // merged one is ordered by BIT PATTERN, which is value order only while no RT is
+    // negative or NaN -- and the previous test, "the last sample is `>= 0.0`", passes for
+    // `-0.0`, whose bits sort after every positive f32. An axis ending in `-0.0` was
+    // therefore declared sorted while descending at its last step, and the search and the
+    // scan then disagreed on `ai`, which is the apex index that sizes the integration
+    // window. Check the order itself instead: one pass over an axis the sort above already
+    // paid O(n log n) for, and it needs no argument about the bit layout. Strict `<` is
+    // right because the merge already deduped by bits, so the only way two neighbours can
+    // compare equal is `0.0` against `-0.0`.
+    let axis_sorted = shared.is_some() || axis.windows(2).all(|w| w[0] < w[1]);
     let ai = if let Some(hint) = apex_hint.filter(|v| v.is_finite()) {
         // The identified apex need not exactly equal a chromatogram sample (for
         // example after serialization/calibration), so anchor to the nearest RT.
@@ -1108,7 +1167,7 @@ pub fn run(p: QuantParams) -> Result<(u64, u64)> {
                     Some(a) => a.value(k),
                     None => 0.0,
                 };
-                store.push(c, nm, pred, rt, it);
+                store.push(c, nm, pred, rt, it)?;
             }
         }
     }
@@ -1886,19 +1945,26 @@ mod tests {
     fn store_of(rt: &[Vec<f32>], inten: &[Vec<f32>]) -> ChromStore {
         let mut s = ChromStore::new();
         for (i, (r, it)) in rt.iter().zip(inten).enumerate() {
-            s.push(0, &format!("y{i}"), 0.0, r, it);
+            s.push(0, &format!("y{i}"), 0.0, r, it).unwrap();
         }
         s
     }
 
-    /// The same rows under a DISTINCT candidate id each, so no two rows can share an axis
-    /// id and [`peak_window`] must merge the samples instead of reading one shared axis.
-    /// The row indices are passed to `peak_window` explicitly, so the candidate ids only
-    /// steer the store's axis dedup.
+    /// The same rows, forced through [`peak_window`]'s MERGED union construction.
+    ///
+    /// Distinct candidate ids alone do not force it. They stop the axis dedup, so each row
+    /// gets its own axis id, but the uniformity scan then finds exactly ONE axis id
+    /// whenever `rows.len() == 1` and takes the shared-axis fast path anyway -- which made
+    /// every single-row `peak_window_both` case compare the shared path against itself.
+    /// Clearing `axis_strict` withdraws the fast path's permission without touching a
+    /// stored value, so the merge runs over exactly the same samples for any row count.
     fn store_of_unshared(rt: &[Vec<f32>], inten: &[Vec<f32>]) -> ChromStore {
         let mut s = ChromStore::new();
         for (i, (r, it)) in rt.iter().zip(inten).enumerate() {
-            s.push(i as u32, &format!("y{i}"), 0.0, r, it);
+            s.push(i as u32, &format!("y{i}"), 0.0, r, it).unwrap();
+        }
+        for strict in s.axis_strict.iter_mut() {
+            *strict = false;
         }
         s
     }
@@ -1907,6 +1973,9 @@ mod tests {
     /// The shared-axis path is an accumulation into one profile array; the merged path is
     /// the sort over every sample that replaced the two BTreeMaps. Every `peak_window`
     /// test below goes through this, so each is also an equality test between the paths.
+    ///
+    /// The routing is asserted rather than assumed: see [`store_of_unshared`] for why
+    /// distinct candidate ids were not enough on their own.
     fn peak_window_both(
         rows: &[usize],
         rt: &[Vec<f32>],
@@ -1915,8 +1984,13 @@ mod tests {
         grace: usize,
         hint: Option<f64>,
     ) -> (f64, f64, f64) {
+        let merged_store = store_of_unshared(rt, inten);
+        assert!(
+            merged_store.axis_strict.iter().all(|&s| !s),
+            "the merged fixture must refuse `peak_window`'s shared-axis fast path"
+        );
         let shared = peak_window(rows, &store_of(rt, inten), frac, grace, hint);
-        let merged = peak_window(rows, &store_of_unshared(rt, inten), frac, grace, hint);
+        let merged = peak_window(rows, &merged_store, frac, grace, hint);
         let bits = |w: (f64, f64, f64)| (w.0.to_bits(), w.1.to_bits(), w.2.to_bits());
         assert_eq!(
             bits(shared),
@@ -2744,15 +2818,141 @@ mod tests {
     }
 
     #[test]
+    fn nearest_index_returns_the_scans_answer_for_a_non_finite_target() {
+        // The comment that used to stand in for a guard claimed any non-finite target
+        // "makes every predicate false and lands on 0". That holds for NaN and for -inf
+        // and is FALSE for +inf: `r < inf` is true at every sample, so `partition_point`
+        // returned `rt.len()` and the search handed back the LAST index where the scan
+        // hands back 0 (its `d` is `inf` everywhere and `inf < inf` never fires, so `k` is
+        // never assigned). Both call sites filter the apex hint on `is_finite` today, so
+        // no artifact moved; the precondition is now enforced rather than asserted.
+        let traces: [&[f32]; 5] = [
+            &[],
+            &[5.0],
+            &[1.0, 2.0],
+            &[0.0, 1.0, 2.0, 3.0, 4.0],
+            &[2.0, 2.0, 2.0],
+        ];
+        for rt in traces {
+            for t in [f64::INFINITY, f64::NEG_INFINITY, f64::NAN] {
+                assert_eq!(
+                    nearest_index(rt, t, true),
+                    nearest_index(rt, t, false),
+                    "rt={rt:?} target={t}"
+                );
+                assert_eq!(
+                    nearest_index(rt, t, true),
+                    0,
+                    "the scan leaves `k` at 0 for every non-finite target: rt={rt:?} target={t}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_axis_differing_only_in_the_sign_of_a_zero_is_a_distinct_axis() {
+        // Interning made every consumer read `store.rt(row)` instead of the row's own
+        // values, and `-0.0 == 0.0` under f32's `PartialEq`, so a slice comparison handed
+        // the second row the FIRST row's axis. `peak_window`'s merge keys the union on
+        // `to_bits`, where `-0.0` and `0.0` are two points, so the substitution folded the
+        // union: profile [4.0, 6.0] over axis [0.0, 1.0] instead of [1.0, 6.0, 3.0] over
+        // [0.0, 1.0, -0.0]. Extract writes positive mzML scan times, but
+        // `mumdia quant --chromatograms` takes a table written by anything.
+        let mut s = ChromStore::new();
+        s.push(0, "y1", 0.0, &[0.0, 1.0], &[1.0, 2.0]).unwrap();
+        s.push(0, "y2", 0.0, &[-0.0, 1.0], &[3.0, 4.0]).unwrap();
+        assert_ne!(s.axis_id[0], s.axis_id[1]);
+        assert_eq!(
+            s.rt(1)[0].to_bits(),
+            (-0.0f32).to_bits(),
+            "the row must read back the bits the table carried"
+        );
+        // An axis that really is identical still interns to one copy, which is what the
+        // store exists for.
+        s.push(0, "y3", 0.0, &[0.0, 1.0], &[5.0, 6.0]).unwrap();
+        assert_eq!(s.axis_id[0], s.axis_id[2]);
+
+        // And the fold moved the apex, not just the profile: with the `-0.0` sample the
+        // brightest, the substitution summed it onto the `+0.0` point and put the apex on
+        // the wrong sample.
+        let mut moved = ChromStore::new();
+        moved.push(0, "y1", 0.0, &[0.0, 1.0], &[1.0, 2.0]).unwrap();
+        moved.push(0, "y2", 0.0, &[-0.0, 1.0], &[9.0, 0.0]).unwrap();
+        let (_, _, apex) = peak_window(&[0, 1], &moved, 0.5, 0, None);
+        assert_eq!(
+            apex.to_bits(),
+            (-0.0f64).to_bits(),
+            "apex must land on the -0.0 sample (interning gave +0.0), got {apex}"
+        );
+    }
+
+    #[test]
+    fn a_merged_axis_ending_in_negative_zero_is_not_binary_searched() {
+        // The merged union is ordered by BIT PATTERN, and `-0.0`'s bits sort after every
+        // positive f32, so an axis that ends in `-0.0` descends at its last step. The old
+        // guard asked only whether the last sample was `>= 0.0`, which `-0.0` satisfies,
+        // so the axis was declared sorted and `nearest_index` binary-searched a descending
+        // trace. `ai` is the apex index that anchors `peak_bounds` and the returned
+        // window, so the disagreement is a different quantity.
+        let rt = [vec![1.0f32, 2.0], vec![-0.0f32, 3.0]];
+        let inten = [vec![1.0f32, 1.0], vec![1.0f32, 1.0]];
+        let store = store_of(&rt, &inten);
+        // Union axis, in bit order: [1.0, 2.0, 3.0, -0.0].
+        assert_ne!(store.axis_id[0], store.axis_id[1]);
+
+        // Below every sample the scan picks `-0.0` at index 3; the binary search returned
+        // index 0 because `partition_point` found nothing smaller than the target.
+        let (_, _, apex_low) = peak_window(&[0, 1], &store, 0.5, 0, Some(-1.0));
+        assert_eq!(
+            apex_low.to_bits(),
+            (-0.0f64).to_bits(),
+            "expected the -0.0 sample, got {apex_low}"
+        );
+        // Above every sample the scan picks 3.0 at index 2; the binary search ran off the
+        // end and returned index 3, which is the `-0.0`.
+        let (_, _, apex_high) = peak_window(&[0, 1], &store, 0.5, 0, Some(100.0));
+        assert_eq!(apex_high, 3.0, "expected the 3.0 sample, got {apex_high}");
+    }
+
+    #[test]
+    fn the_merged_fixture_refuses_the_shared_axis_fast_path_even_for_one_row() {
+        // `peak_window` takes the shared-axis fast path whenever the rows resolve to ONE
+        // axis id that is marked strictly increasing, and a single-row call always does,
+        // whatever candidate id the row was pushed under. Distinct candidate ids therefore
+        // did NOT make the merged fixture merge, and the three single-row
+        // `peak_window_both` cases were comparing the shared path against itself.
+        let rt = [vec![0.0f32, 1.0, 2.0]];
+        let inten = [vec![1.0f32, 5.0, 1.0]];
+        let plain = store_of(&rt, &inten);
+        assert!(
+            plain.axis_strict[plain.axis_id[0] as usize],
+            "the fixture's axis is strictly increasing, so the fast path is available"
+        );
+        let merged = store_of_unshared(&rt, &inten);
+        assert!(
+            merged.axis_strict.iter().all(|&s| !s),
+            "clearing `axis_strict` is what actually withdraws the fast path"
+        );
+        // Which is the equality `peak_window_both` claims to be testing.
+        let bits = |w: (f64, f64, f64)| (w.0.to_bits(), w.1.to_bits(), w.2.to_bits());
+        assert_eq!(
+            bits(peak_window(&[0], &plain, 0.5, 0, None)),
+            bits(peak_window(&[0], &merged, 0.5, 0, None))
+        );
+    }
+
+    #[test]
     fn the_chromatogram_store_returns_the_rows_it_was_given() {
         let grid: Vec<f32> = (0..5).map(|k| k as f32).collect();
         let offset: Vec<f32> = (0..5).map(|k| k as f32 + 0.5).collect();
         let mut s = ChromStore::new();
-        s.push(7, "y1", 0.25, &grid, &[1.0, 2.0, 3.0, 2.0, 1.0]);
-        s.push(7, "y2", 0.75, &grid, &[0.0, 1.0, 2.0, 1.0, 0.0]);
-        s.push(7, "b3", 0.5, &offset, &[9.0; 5]);
-        s.push(7, "b4", 0.1, &[], &[]);
-        s.push(8, "y1", 0.6, &grid, &[4.0; 5]);
+        s.push(7, "y1", 0.25, &grid, &[1.0, 2.0, 3.0, 2.0, 1.0])
+            .unwrap();
+        s.push(7, "y2", 0.75, &grid, &[0.0, 1.0, 2.0, 1.0, 0.0])
+            .unwrap();
+        s.push(7, "b3", 0.5, &offset, &[9.0; 5]).unwrap();
+        s.push(7, "b4", 0.1, &[], &[]).unwrap();
+        s.push(8, "y1", 0.6, &grid, &[4.0; 5]).unwrap();
         assert_eq!(s.nrows(), 5);
         assert_eq!(s.rt(0), grid.as_slice());
         assert_eq!(s.inten(1), &[0.0, 1.0, 2.0, 1.0, 0.0]);
@@ -2777,7 +2977,9 @@ mod tests {
     #[test]
     fn an_unsorted_or_duplicated_axis_refuses_the_fast_paths() {
         let mut descending = ChromStore::new();
-        descending.push(1, "y1", 0.0, &[3.0, 1.0, 2.0], &[1.0, 2.0, 3.0]);
+        descending
+            .push(1, "y1", 0.0, &[3.0, 1.0, 2.0], &[1.0, 2.0, 3.0])
+            .unwrap();
         assert!(
             !descending.rt_sorted,
             "a descending step must send every nearest-sample search back to the scan"
@@ -2785,7 +2987,9 @@ mod tests {
         assert!(!descending.axis_strict[0]);
 
         let mut duplicated = ChromStore::new();
-        duplicated.push(1, "y1", 0.0, &[1.0, 1.0, 2.0], &[1.0, 2.0, 3.0]);
+        duplicated
+            .push(1, "y1", 0.0, &[1.0, 1.0, 2.0], &[1.0, 2.0, 3.0])
+            .unwrap();
         assert!(
             duplicated.rt_sorted,
             "non-decreasing is all the nearest-sample search needs"
@@ -2797,7 +3001,9 @@ mod tests {
         );
 
         let mut negative = ChromStore::new();
-        negative.push(1, "y1", 0.0, &[-1.0, 2.0], &[1.0, 2.0]);
+        negative
+            .push(1, "y1", 0.0, &[-1.0, 2.0], &[1.0, 2.0])
+            .unwrap();
         assert!(
             !negative.rt_sorted,
             "bit order is value order only above zero"
@@ -2842,7 +3048,8 @@ mod tests {
         ] {
             let mut s = ChromStore::new();
             for (r, &c) in cids.iter().enumerate() {
-                s.push(c, &format!("y{r}"), r as f32, &[r as f32], &[1.0]);
+                s.push(c, &format!("y{r}"), r as f32, &[r as f32], &[1.0])
+                    .unwrap();
             }
             let index = CandIndex::build(&s);
             let mut want: BTreeMap<u32, Vec<usize>> = BTreeMap::new();
