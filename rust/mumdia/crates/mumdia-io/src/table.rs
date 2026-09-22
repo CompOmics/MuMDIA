@@ -21,6 +21,24 @@ use parquet::basic::{Compression, LogicalType};
 use parquet::file::properties::WriterProperties;
 use parquet::file::statistics::Statistics;
 
+/// The codec every artifact is written with. Snappy by default, which is what released
+/// artifacts use and what the sidecars' pyarrow reads without configuration;
+/// `MUMDIA_PARQUET_COMPRESSION=zstd` writes zstd instead, which is much smaller on the
+/// float-heavy chromatogram and feature tables and therefore that much less to write on a
+/// run whose wall clock is disk-bound. Both are read transparently, whatever wrote them.
+/// It changes every artifact's bytes, so two runs compared by content hash must agree on it.
+fn codec() -> Compression {
+    match std::env::var("MUMDIA_PARQUET_COMPRESSION")
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "zstd" => Compression::ZSTD(Default::default()),
+        "uncompressed" | "none" => Compression::UNCOMPRESSED,
+        _ => Compression::SNAPPY,
+    }
+}
+
 /// One named, typed column for writing.
 pub enum Col {
     I64(String, Vec<i64>),
@@ -203,7 +221,7 @@ fn cols_to_batch(path: &str, cols: Vec<Col>) -> Result<(Arc<Schema>, RecordBatch
 }
 
 fn snappy_props(row_group_rows: Option<usize>) -> WriterProperties {
-    let mut b = WriterProperties::builder().set_compression(Compression::SNAPPY);
+    let mut b = WriterProperties::builder().set_compression(codec());
     if let Some(n) = row_group_rows {
         b = b.set_max_row_group_row_count(Some(n.max(1)));
     }
@@ -490,9 +508,7 @@ pub fn write_batches(path: &str, schema: Arc<Schema>, batches: &[RecordBatch]) -
     let target = AtomicPath::new(path)?;
     let file = std::fs::File::create(target.tmp())
         .with_context(|| format!("creating {}", target.tmp().display()))?;
-    let props = WriterProperties::builder()
-        .set_compression(Compression::SNAPPY)
-        .build();
+    let props = WriterProperties::builder().set_compression(codec()).build();
     let mut writer = ArrowWriter::try_new(file, schema, Some(props))?;
     let mut n = 0u64;
     for b in batches {

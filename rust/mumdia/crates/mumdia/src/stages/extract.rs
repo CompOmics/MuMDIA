@@ -142,7 +142,14 @@ struct ChromChunk {
 }
 
 impl ChromChunk {
-    fn cols(self) -> Vec<Col> {
+    /// `offset` is the library row of this band's local id 0 (`Library::global_offset`),
+    /// so the table carries library-wide ids even when the stage searched one band.
+    fn cols(mut self, offset: u32) -> Vec<Col> {
+        if offset != 0 {
+            for c in &mut self.cid {
+                *c += offset;
+            }
+        }
         vec![
             Col::U32("candidate_id".into(), self.cid),
             Col::Str("frag_name".into(), self.name),
@@ -2630,6 +2637,9 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
     let (mut pk_apex, mut pk_start, mut pk_end): (Vec<f64>, Vec<f64>, Vec<f64>) =
         (Vec::new(), Vec::new(), Vec::new());
     let (mut pk_ev, mut pk_area): (Vec<f64>, Vec<f64>) = (Vec::new(), Vec::new());
+    // The chromatogram writer runs on its own thread and cannot borrow the library, so the
+    // band's offset travels with the chunks.
+    let chrom_offset = lib.global_offset;
     let n_chrom = std::thread::scope(|sc| -> Result<u64> {
         let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<Col>>(2);
         let writer = sc.spawn(move || -> Result<u64> {
@@ -2722,7 +2732,7 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
                 chrom_bytes_max_chunk = chrom_bytes_max_chunk.max(chunk_bytes);
                 // Hand the chunk's chromatogram rows to the writer thread. A send error means
                 // the writer failed; its error surfaces at the join below.
-                if tx.send(ch.cols()).is_err() {
+                if tx.send(ch.cols(chrom_offset)).is_err() {
                     return false;
                 }
             }
@@ -2778,7 +2788,7 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
             emit_batch(&mut cand_hits);
         }
         // A final empty chunk fixes the schema when no candidate was accepted at all.
-        let _ = tx.send(ChromChunk::default().cols());
+        let _ = tx.send(ChromChunk::default().cols(0));
         drop(tx);
         let n = writer
             .join()
@@ -2865,7 +2875,10 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
     }
 
     let mut psms_cols = vec![
-        Col::U32("candidate_id".into(), cid_c),
+        Col::U32(
+            "candidate_id".into(),
+            cid_c.iter().map(|c| c + lib.global_offset).collect(),
+        ),
         Col::I32("peak_rank".into(), peakrank_c),
         Col::F64("apex_rt".into(), apexrt_c),
         Col::OptF64("apex_im".into(), apexim_c),
@@ -2919,7 +2932,10 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
         let n_peaks = write_table(
             &pk_path,
             vec![
-                Col::U32("candidate_id".into(), pk_cid),
+                Col::U32(
+                    "candidate_id".into(),
+                    pk_cid.iter().map(|c| c + lib.global_offset).collect(),
+                ),
                 Col::I32("peak_rank".into(), pk_rank),
                 Col::F64("apex_rt".into(), pk_apex),
                 Col::F64("start_rt".into(), pk_start),
