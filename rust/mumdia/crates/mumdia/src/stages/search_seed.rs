@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use mumdia_core::config::{MatcherKind, SearchSeedConfig};
 use mumdia_core::schema::artifact;
 use mumdia_io::report::ArtifactReport;
@@ -59,6 +59,22 @@ pub struct SearchSeedParams<'a> {
     /// An EMPTY slice does not mean "this run has no MS2". It means the caller has
     /// nothing to lend, and the stage decodes `ms2` itself.
     pub ms2_scans: Option<&'a [Ms2Scan]>,
+    /// Also write `<out>.masscal.parquet`: the ppm deviation of every matched fragment of
+    /// every calibrant PSM, keyed by LIBRARY-WIDE candidate id (see
+    /// [`crate::masscal::Calibrants`]).
+    ///
+    /// Only a grouped run asks for it. A band's own fit is over its own ~2,000 deviations
+    /// and its own `spectrum_q`, and combining the bands' fitted scalars is a wider
+    /// tolerance than the estimator applied to the union (35% wider, measured; see
+    /// [`crate::masscal`]), so `seed-pool` refits over the sidecars instead. Because the
+    /// pooled q is not this band's q in either direction, the sidecar carries the band's
+    /// best-scoring targets ([`crate::masscal::CALIBRANT_OFFER_PSMS`]) as well as the ones
+    /// this band's own q accepts, and `seed-pool` decides. The band's own
+    /// `masscal.json` is unaffected: it is still fitted on its confident targets alone.
+    ///
+    /// An ungrouped run already fits on every deviation it has, writes no sidecar, and
+    /// selects exactly the rows it always did.
+    pub emit_calibrants: bool,
 }
 
 #[derive(Clone)]
@@ -243,13 +259,34 @@ pub fn run(p: SearchSeedParams) -> Result<u64> {
     }
     let mut devs: Vec<f64> = Vec::new();
     // Fragment m/z paired to each ppm deviation, for the optional m/z-dependent
-    // (LOESS) mass calibration. Only populated/used when `mass_cal_loess` is set.
+    // (LOESS) mass calibration. Used only when `mass_cal_loess` is set.
     let mut dev_mz: Vec<f64> = Vec::new();
+    // The same deviations keyed by library-wide candidate id and scan, written beside the
+    // masscal for a grouped run to pool. Stays empty otherwise.
+    let gid_base = p.fragment_offset.unwrap_or(0);
+    let mut calibrants = crate::masscal::Calibrants::default();
+    let offer_floor = if p.emit_calibrants {
+        calibrant_offer_floor(&score_c, &is_dec)
+    } else {
+        // No sidecar, so nothing is offered and the loop below selects exactly what it
+        // always did: this band's confident targets.
+        f64::INFINITY
+    };
     for (i, (cid, b)) in rows.iter().enumerate() {
-        if is_dec[i] || q[i] > p.cfg.fdr_seed {
+        if is_dec[i] {
+            continue;
+        }
+        // This band's own calibrants, which are what its own `masscal.json` is fitted from.
+        let confident = q[i] <= p.cfg.fdr_seed;
+        // Offered to the pool on top of them, and never to this band's own fit.
+        let offered = score_c[i] >= offer_floor;
+        if !confident && !offered {
             continue;
         }
         if let Some(scan) = scan_by_index.get(&b.scan_index) {
+            let gid = cid.checked_add(gid_base).with_context(|| {
+                format!("search-seed: candidate id {cid} overflows the band offset {gid_base}")
+            })?;
             // m/z only: the predicted intensity and the fragment name are not part of the
             // mass calibration, and on the fragindex path they no longer exist.
             let mzs = lib.cand_frag_mz(*cid);
@@ -277,101 +314,41 @@ pub fn run(p: SearchSeedParams) -> Result<u64> {
                     j += 1;
                 }
                 if let Some(pp) = bestppm {
-                    devs.push(pp);
-                    dev_mz.push(fmz);
+                    if confident {
+                        devs.push(pp);
+                        dev_mz.push(fmz);
+                    }
+                    if p.emit_calibrants {
+                        calibrants.candidate_id.push(gid);
+                        calibrants.scan_index.push(b.scan_index);
+                        // f32 is the library's own storage width for a fragment m/z, and a
+                        // ppm deviation is a few parts in 1e7 at f32 -- far below the
+                        // resolution any percentile of these points has.
+                        calibrants.frag_mz.push(fmz as f32);
+                        calibrants.ppm.push(pp as f32);
+                    }
                 }
             }
         }
     }
-    // Median offset + 95th-percentile-of-centered tolerance. `fit` is reused by the
-    // optional robust second pass on the outlier-trimmed calibrants.
-    let fit = |d: &[f64]| -> (f64, f64) {
-        let mut sorted = d.to_vec();
-        sorted.sort_by(|a, b| a.total_cmp(b));
-        let offset = sorted[sorted.len() / 2];
-        let centered: Vec<f64> = d.iter().map(|x| (x - offset).abs()).collect();
-        let tol = (crate::calibrate::percentile(&centered, 0.95) * 1.5).max(5.0);
-        (offset, tol)
-    };
-    let (frag_ppm_offset, frag_tol_learned, cal_passes) = if devs.len() >= 20 {
-        let (o1, t1) = fit(&devs);
-        if p.cfg.two_pass_mass_cal {
-            // Second pass: keep only deviations inside the first-pass window, so
-            // random-match outliers cannot bias the offset, then re-fit.
-            let inl: Vec<f64> = devs
-                .iter()
-                .cloned()
-                .filter(|d| (d - o1).abs() <= t1)
-                .collect();
-            if inl.len() >= 20 {
-                let (o2, t2) = fit(&inl);
-                (o2, t2, 2)
-            } else {
-                (o1, t1, 1)
-            }
-        } else {
-            (o1, t1, 1)
-        }
-    } else {
-        (0.0, p.cfg.fragment_tol_ppm, 0)
-    };
-    // Calibration-quality residual stats for the mass dimension: the median and
-    // MAD of the calibrant deviations AFTER the offset correction. A residual
-    // median far from zero means the single offset did not fully de-bias the mass
-    // axis (a case for an m/z-dependent calibration); the MAD is the achieved
-    // precision. Purely diagnostic; consumed by the per-run calibration-quality
-    // report, never by extraction.
-    let (ppm_residual_median, ppm_residual_mad) = if devs.is_empty() {
-        (0.0, 0.0)
-    } else {
-        let centered: Vec<f64> = devs.iter().map(|d| d - frag_ppm_offset).collect();
-        let med = crate::calibrate::percentile(&centered, 0.5);
-        let absdev: Vec<f64> = centered.iter().map(|c| (c - med).abs()).collect();
-        (med, crate::calibrate::percentile(&absdev, 0.5))
-    };
-    // Optional m/z-dependent (LOESS) mass calibration grid: fit the calibrant
-    // ppm deviation versus fragment m/z and sample it on a fixed 25-Th grid that
-    // extract interpolates per peak. Empty unless `mass_cal_loess` is set and
-    // enough calibrants exist; extract then falls back to the scalar offset.
-    // Deterministic: pairs are sorted by m/z before the fit.
-    let (mz_cal_grid_mz, mz_cal_grid_ppm): (Vec<f64>, Vec<f64>) = if p.cfg.mass_cal_loess
-        && dev_mz.len() >= 50
-    {
-        let mut pairs: Vec<(f64, f64)> = dev_mz.iter().cloned().zip(devs.iter().cloned()).collect();
-        pairs.sort_by(|a, b| a.0.total_cmp(&b.0));
-        let xs: Vec<f64> = pairs.iter().map(|(m, _)| *m).collect();
-        let ys: Vec<f64> = pairs.iter().map(|(_, pp)| *pp).collect();
-        let loess = crate::calibrate::Loess::fit(&xs, &ys, 0.3, 200);
-        let lo = xs.first().copied().unwrap_or(150.0);
-        let hi = xs.last().copied().unwrap_or(2000.0);
-        let step = 25.0;
-        let n = (((hi - lo) / step).floor() as usize).max(1);
-        let gm: Vec<f64> = (0..=n).map(|k| lo + k as f64 * step).collect();
-        let gp: Vec<f64> = gm.iter().map(|&m| loess.predict(m)).collect();
-        (gm, gp)
-    } else {
-        (Vec::new(), Vec::new())
-    };
-    mumdia_io::json::write_json(
-        &format!("{}.masscal.json", p.out),
-        &json!({
-            "frag_ppm_offset": frag_ppm_offset,
-            "frag_tol_ppm": frag_tol_learned,
-            // The learned tolerance is the local mass-uncertainty estimate.
-            "frag_ppm_sigma": frag_tol_learned,
-            "n_dev": devs.len(),
-            "cal_passes": cal_passes,
-            // Calibration-quality diagnostics (post-correction residuals).
-            "ppm_residual_median": ppm_residual_median,
-            "ppm_residual_mad": ppm_residual_mad,
-            // Optional m/z-dependent correction grid (empty = scalar offset only).
-            "mz_cal_grid_mz": mz_cal_grid_mz,
-            "mz_cal_grid_ppm": mz_cal_grid_ppm,
-        }),
-    )?;
+    // Median offset + 95th-percentile-of-centered tolerance, with the optional robust
+    // second pass and the optional m/z-dependent grid. The estimator lives in
+    // `crate::masscal` because `seed-pool` fits the very same one over the pooled
+    // deviations of a grouped run.
+    let cal = crate::masscal::MassCal::fit_from(&devs, &dev_mz, p.cfg);
+    mumdia_io::json::write_json(&crate::masscal::json_path(p.out), &cal.to_json())?;
+    if p.emit_calibrants {
+        let n_cal = crate::masscal::write_calibrants(p.out, &calibrants)?;
+        info!(
+            calibrant_deviations = n_cal,
+            "search-seed: wrote the calibrant deviations for the pooled mass calibration"
+        );
+    }
     info!(
-        frag_ppm_offset,
-        frag_tol_learned, cal_passes, "search-seed: mass recalibration"
+        frag_ppm_offset = cal.frag_ppm_offset,
+        frag_tol_learned = cal.frag_tol_ppm,
+        cal_passes = cal.cal_passes,
+        "search-seed: mass recalibration"
     );
 
     let n = write_table(
@@ -428,6 +405,26 @@ pub fn run(p: SearchSeedParams) -> Result<u64> {
         "search-seed: done"
     );
     Ok(n)
+}
+
+/// Score of the [`crate::masscal::CALIBRANT_OFFER_PSMS`]-th best TARGET PSM: every target at
+/// or above it is offered to the pooled mass calibration whatever this band's own q says.
+///
+/// `-inf` when the band has fewer targets than that, so it offers all of them. The pooled
+/// selection inside one band is a score-ranked prefix of the band's targets, so a prefix is
+/// the shape of superset that makes `seed-pool`'s pooled-q selection exact.
+fn calibrant_offer_floor(scores: &[f64], is_decoy: &[bool]) -> f64 {
+    let mut targets: Vec<f64> = scores
+        .iter()
+        .zip(is_decoy)
+        .filter(|(_, d)| !**d)
+        .map(|(s, _)| *s)
+        .collect();
+    targets.sort_by(|a, b| b.total_cmp(a));
+    targets
+        .get(crate::masscal::CALIBRANT_OFFER_PSMS - 1)
+        .copied()
+        .unwrap_or(f64::NEG_INFINITY)
 }
 
 /// Peak indices to probe for a scan: the `top_n` most intense (index-ascending
@@ -835,6 +832,35 @@ mod survey_tests {
             (500.0, 510.0),
             (0.0, 2000.0)
         ]));
+    }
+
+    #[test]
+    fn a_band_offers_a_score_prefix_of_its_targets_to_the_pooled_mass_calibration() {
+        use super::calibrant_offer_floor;
+        use crate::masscal::CALIBRANT_OFFER_PSMS;
+        // Fewer targets than the cap: every target is offered, whatever the band's own q
+        // makes of them. This is the CI fixture's case, where each band's q rejects all of
+        // its targets and a q-selected sidecar would be empty in every band.
+        let scores = [9.0, 8.0, 7.0, 6.0];
+        let decoys = [false, true, false, false];
+        assert_eq!(
+            calibrant_offer_floor(&scores, &decoys),
+            f64::NEG_INFINITY,
+            "3 targets, so all three are at or above the floor"
+        );
+        assert_eq!(calibrant_offer_floor(&[], &[]), f64::NEG_INFINITY);
+        // More targets than the cap: the floor is the cap-th best TARGET score, and the
+        // decoys interleaved among them do not consume a slot.
+        let n = 2 * (CALIBRANT_OFFER_PSMS + 500);
+        let scores: Vec<f64> = (0..n).map(|i| (n - i) as f64).collect();
+        let decoys: Vec<bool> = (0..n).map(|i| i % 2 == 1).collect();
+        let floor = calibrant_offer_floor(&scores, &decoys);
+        let offered = scores
+            .iter()
+            .zip(&decoys)
+            .filter(|(s, d)| !**d && **s >= floor)
+            .count();
+        assert_eq!(offered, CALIBRANT_OFFER_PSMS);
     }
 
     #[test]

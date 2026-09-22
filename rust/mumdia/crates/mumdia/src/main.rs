@@ -1205,6 +1205,7 @@ fn real_main() -> Result<()> {
                 fragment_offset: None,
                 // Standalone: this invocation decodes the run itself.
                 ms2_scans: None,
+                emit_calibrants: false,
                 ms2: &ms2,
                 library_precursors: &lib_precursors,
                 library_fragments: &lib_fragments,

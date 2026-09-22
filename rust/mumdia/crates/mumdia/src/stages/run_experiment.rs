@@ -229,6 +229,7 @@ fn process_run(
         fragment_offset: None,
         // One reader at a time, as in the ungrouped `run`.
         ms2_scans: None,
+        emit_calibrants: false,
         ms2: &co.ms2,
         library_precursors: lib_p_base,
         library_fragments: lib_f,

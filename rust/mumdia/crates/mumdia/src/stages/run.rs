@@ -358,6 +358,7 @@ pub fn run(p: RunParams) -> Result<()> {
                 // it. Sharing here would hold ~1 GB across the retention-time model,
                 // which in a single run is where the tallest sidecar sits.
                 ms2_scans: None,
+                emit_calibrants: false,
                 ms2: &co.ms2,
                 library_precursors: &lib_p,
                 library_fragments: &lib_f,
