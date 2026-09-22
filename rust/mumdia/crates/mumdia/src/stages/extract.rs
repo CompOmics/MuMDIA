@@ -461,6 +461,69 @@ struct Contested {
     apportioned: f64,
 }
 
+/// Ordinals a [`FragSet`] holds in its inline bitmask; above this it spills to a sorted
+/// vector. A candidate carries a few dozen predicted fragments (6 by default, 12 in the
+/// shipped DIA-NN library), so the spill is unreachable in practice and costs nothing when
+/// it is not used (an empty `Vec` does not allocate).
+const FRAG_SET_BITS: usize = 512;
+
+/// A set of a candidate's local fragment ordinals.
+///
+/// This replaces `hits.iter().map(|h| h.frag).collect::<Vec<u16>>()` followed by a sort and
+/// a dedup, which allocated one `u16` per HIT and sorted it: a candidate with no
+/// `run_windows` row collects 10^4-10^5 hits, so that was a 20-200 KB allocation and an
+/// `n log n` sort to recover at most a few dozen distinct values.
+#[derive(Default)]
+struct FragSet {
+    bits: [u64; FRAG_SET_BITS / 64],
+    spill: Vec<u16>,
+}
+
+impl FragSet {
+    #[inline]
+    fn insert(&mut self, f: u16) {
+        let i = f as usize;
+        if i < FRAG_SET_BITS {
+            self.bits[i >> 6] |= 1u64 << (i & 63);
+        } else if let Err(p) = self.spill.binary_search(&f) {
+            self.spill.insert(p, f);
+        }
+    }
+
+    #[inline]
+    fn contains(&self, f: u16) -> bool {
+        let i = f as usize;
+        if i < FRAG_SET_BITS {
+            self.bits[i >> 6] & (1u64 << (i & 63)) != 0
+        } else {
+            self.spill.binary_search(&f).is_ok()
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.bits
+            .iter()
+            .map(|w| w.count_ones() as usize)
+            .sum::<usize>()
+            + self.spill.len()
+    }
+
+    /// The ordinals, ascending: exactly what the sorted, deduplicated vector held.
+    fn to_vec(&self) -> Vec<u16> {
+        let mut v = Vec::with_capacity(self.len());
+        for (w, &word) in self.bits.iter().enumerate() {
+            let mut word = word;
+            while word != 0 {
+                let b = word.trailing_zeros() as usize;
+                v.push((w * 64 + b) as u16);
+                word &= word - 1;
+            }
+        }
+        v.extend_from_slice(&self.spill);
+        v
+    }
+}
+
 /// Index of the value in ascending `rts` nearest to `t` (binary search).
 fn nearest_index(rts: &[f64], t: f64) -> usize {
     if rts.is_empty() {
@@ -1960,6 +2023,15 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
     } else {
         Vec::new()
     };
+    // Widest isolation window, so the per-candidate scan over `windows` (sorted by lower
+    // m/z) can binary-search the span that can possibly cover a precursor instead of
+    // walking all of them: a window covering `pm` has `lower_mz <= pm` and
+    // `lower_mz >= upper_mz - max_width >= pm - max_width`.
+    let window_max_width =
+        windows
+            .iter()
+            .map(|w| w.1 - w.0)
+            .fold(0.0f64, |a, b| if b > a { b } else { a });
 
     // Per-run mass recalibration (optional). Reads the scalar offset + learned
     // tolerance, plus an optional m/z-dependent correction grid (mass_cal_loess).
@@ -2353,11 +2425,14 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
     };
 
     let per_candidate = |cid: u32, hits: &mut [Hit]| -> Vec<CandOut> {
-        // distinct matched fragments (tier b)
-        let mut distinct: Vec<u16> = hits.iter().map(|h| h.frag).collect();
-        distinct.sort_unstable();
-        distinct.dedup();
-        if distinct.len() < p.cfg.presence_min_matched.max(1) {
+        // distinct matched fragments (tier b), as a bitmask over the candidate's local
+        // fragment ordinals rather than a sorted, deduplicated `u16` per hit.
+        let mut distinct = FragSet::default();
+        for h in hits.iter() {
+            distinct.insert(h.frag);
+        }
+        let n_distinct = distinct.len();
+        if n_distinct < p.cfg.presence_min_matched.max(1) {
             return Vec::new();
         }
 
@@ -2392,31 +2467,49 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
         let grid: Vec<f64> = if !windows.is_empty() {
             let pm = lib.cands[cid as usize].precursor_mz;
             let (lo, hi) = (rt_lo[cid as usize], rt_hi[cid as usize]);
+            // `windows` is sorted by lower m/z, so a covering window has
+            // `lower_mz <= pm` AND, since its width is at most `window_max_width`,
+            // `lower_mz >= pm - window_max_width`. Binary-search that span instead of
+            // scanning all ~150 windows per candidate; the membership test inside the
+            // span is unchanged, so the same windows contribute in the same order.
+            let s = windows.partition_point(|w| w.0 < pm - window_max_width);
+            let e = windows.partition_point(|w| w.0 <= pm);
             let mut g: Vec<f64> = Vec::new();
-            for (wl, wu, rts) in &windows {
+            let mut covering = 0usize;
+            for (wl, wu, rts) in &windows[s..e] {
                 if *wl <= pm && pm <= *wu {
                     let a = rts.partition_point(|&r| r < lo);
                     let b = rts.partition_point(|&r| r <= hi);
                     g.extend_from_slice(&rts[a..b]);
+                    covering += 1;
                 }
             }
-            g.sort_by(|a, b| a.total_cmp(b));
+            // One covering window contributes one already-ascending slice of its own
+            // sorted scan RTs, which is the overwhelmingly common case; only an overlap
+            // of two windows needs the merge sorting.
+            if covering > 1 {
+                g.sort_by(|a, b| a.total_cmp(b));
+            }
             g.dedup();
             g
         } else {
             Vec::new()
         };
         if !grid.is_empty() {
-            let g2i: HashMap<u64, usize> = grid
-                .iter()
-                .enumerate()
-                .map(|(j, r)| (r.to_bits(), j))
-                .collect();
             let mut aligned: Vec<(f64, BTreeMap<u16, f32>)> =
                 grid.iter().map(|&r| (r, BTreeMap::new())).collect();
+            // Both sides are ascending (`grid` is sorted and deduplicated; the scan groups
+            // were built from rt-sorted hits), so this is a merge rather than a per-
+            // candidate `HashMap` of the grid. The match is still on the exact bit
+            // pattern, so a group whose RT is not a grid RT is dropped exactly as before.
+            let mut j = 0usize;
             for (rt, map) in std::mem::take(&mut groups) {
-                if let Some(&j) = g2i.get(&rt.to_bits()) {
+                while j < grid.len() && grid[j] < rt {
+                    j += 1;
+                }
+                if j < grid.len() && grid[j].to_bits() == rt.to_bits() {
                     aligned[j].1 = map;
+                    j += 1;
                 }
             }
             groups = aligned;
@@ -2551,8 +2644,8 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
 
         // Acceptance (tier c): presence, consecutive-scan run, and matched
         // fraction of the predicted fragments (symmetric discriminator).
-        let matched_fraction = distinct.len() as f64 / (fmzs0.len().max(1) as f64);
-        if distinct.len() < p.cfg.presence_min_fragments.max(1)
+        let matched_fraction = n_distinct as f64 / (fmzs0.len().max(1) as f64);
+        if n_distinct < p.cfg.presence_min_fragments.max(1)
             || best_run < scan_window
             || best_run < p.cfg.min_coelution_run
             || matched_fraction < p.cfg.min_matched_fraction
@@ -2628,7 +2721,9 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
             None => 1.0,
         };
         let peak_spec = || peak_spectral_score(&groups, &sig, fints0);
-        let coel = || coelution_gate_score(&groups, &distinct, &sig, fints0);
+        // `to_vec` only where the co-elution score is actually asked for (a non-default
+        // gate mode, or the diagnostics), so the default chain never materialises it.
+        let coel = || coelution_gate_score(&groups, &distinct.to_vec(), &sig, fints0);
 
         if p.cfg.gate_min_score > 0.0 {
             // Acceptance gate. `gate_min_score` thresholds the ACTIVE gate_mode's
@@ -2648,7 +2743,7 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
             if rejected {
                 let rescued = p.cfg.ms1_rescue
                     && ms1_support
-                    && distinct.len() >= p.cfg.presence_min_fragments.max(1);
+                    && n_distinct >= p.cfg.presence_min_fragments.max(1);
                 if !rescued {
                     return Vec::new();
                 }
@@ -2699,12 +2794,19 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
             }
         };
 
-        // Per-fragment intensity-weighted observed m/z (for mass accuracy).
-        let mut wsum: HashMap<u16, (f64, f64)> = HashMap::new(); // frag -> (sum w*mz, sum w)
+        let (fmzs, fints, fnames) = lib.cand_frags(cid);
+
+        // Per-fragment intensity-weighted observed m/z (for mass accuracy). Indexed by
+        // the candidate-local ordinal rather than hashed: a fragment ordinal is
+        // `0..n_frag` by construction, so the map was a hash table over a dense range.
+        // An untouched entry keeps `sum_w == 0`, which takes the same theoretical-m/z
+        // fallback the absent map entry took.
+        let mut wsum: Vec<(f64, f64)> = vec![(0.0, 0.0); fmzs.len()]; // (sum w*mz, sum w)
         for h in hits.iter() {
-            let e = wsum.entry(h.frag).or_insert((0.0, 0.0));
-            e.0 += h.obs_mz * h.inten as f64;
-            e.1 += h.inten as f64;
+            if let Some(e) = wsum.get_mut(h.frag as usize) {
+                e.0 += h.obs_mz * h.inten as f64;
+                e.1 += h.inten as f64;
+            }
         }
 
         let mut chrom_rows: Vec<ChromOutputRow> = Vec::new();
@@ -2713,14 +2815,21 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
         // on the full isolation-window scan grid (all scans of the covering window(s)
         // within the RT window), with 0.0 where the fragment is absent, so the elution
         // profile drops to zero between peaks (correct boundary calling downstream).
-        let (fmzs, fints, fnames) = lib.cand_frags(cid);
-        let mut per_frag: HashMap<u16, Vec<(f64, f32)>> = HashMap::new();
-        for (rt, map) in &groups {
-            for (&frag, &inten) in map {
-                per_frag.entry(frag).or_default().push((*rt, inten));
+        //
+        // The traces are read straight off the scan groups. In grid mode `groups` IS the
+        // grid (it was rebuilt on it above, one entry per grid RT in the same order), so a
+        // fragment's grid-sampled trace is its value in each group, and the RT axis is the
+        // grid itself and the same for every fragment and for the MS1 XICs below: one
+        // conversion instead of one per fragment. That replaces a `HashMap<u16,
+        // Vec<(f64, f32)>>` over the whole candidate plus a `HashMap<u64, f32>` per
+        // fragment, and produces the same values in the same order.
+        let mut observed = FragSet::default();
+        for (_, m) in &groups {
+            for &f in m.keys() {
+                observed.insert(f);
             }
         }
-        // (the acquisition-scan `grid` was computed above, before apex/co-elution)
+        let grid_rt: Vec<f32> = grid.iter().map(|&r| r as f32).collect();
         // Emit a row for EVERY predicted transition so the feature families see the
         // full predicted set (a missing strong ion is penalized). An OBSERVED
         // fragment carries its grid-sampled (or sorted) trace; a NEVER-OBSERVED one
@@ -2733,29 +2842,31 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
         // only fragments with obs_apex > 0.
         for fi in 0..fmzs.len() {
             let frag = fi as u16;
-            let obs_mz = wsum
-                .get(&frag)
-                .map(|(sm, sw)| if *sw > 0.0 { sm / sw } else { fmzs[fi] as f64 })
-                .unwrap_or(fmzs[fi] as f64);
-            let (rts, ints): (Vec<f32>, Vec<f32>) = match per_frag.get(&frag) {
-                Some(v) if !grid.is_empty() => {
-                    let m: HashMap<u64, f32> = v.iter().map(|(r, i)| (r.to_bits(), *i)).collect();
-                    (
-                        grid.iter().map(|r| *r as f32).collect(),
-                        grid.iter()
-                            .map(|r| *m.get(&r.to_bits()).unwrap_or(&0.0))
-                            .collect(),
-                    )
+            let (sm, sw) = wsum[fi];
+            let obs_mz = if sw > 0.0 { sm / sw } else { fmzs[fi] as f64 };
+            let (rts, ints): (Vec<f32>, Vec<f32>) = if !observed.contains(frag) {
+                (Vec::new(), Vec::new()) // absent predicted transition
+            } else if !grid.is_empty() {
+                (
+                    grid_rt.clone(),
+                    groups
+                        .iter()
+                        .map(|(_, m)| *m.get(&frag).unwrap_or(&0.0))
+                        .collect(),
+                )
+            } else {
+                // Sparse mode: the groups are already ascending in RT, so the trace is
+                // the fragment's entries read in group order -- what the per-fragment
+                // vector held before its (already-sorted) stable sort.
+                let mut rts: Vec<f32> = Vec::new();
+                let mut ints: Vec<f32> = Vec::new();
+                for (rt, m) in &groups {
+                    if let Some(&i) = m.get(&frag) {
+                        rts.push(*rt as f32);
+                        ints.push(i);
+                    }
                 }
-                Some(v) => {
-                    let mut s = v.clone();
-                    s.sort_by(|a, b| a.0.total_cmp(&b.0));
-                    (
-                        s.iter().map(|(r, _)| *r as f32).collect(),
-                        s.iter().map(|(_, i)| *i).collect(),
-                    )
-                }
-                None => (Vec::new(), Vec::new()), // absent predicted transition
+                (rts, ints)
             };
             chrom_rows.push((
                 cid,
@@ -2778,7 +2889,6 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
         if !ms1_scans.is_empty() && !grid.is_empty() {
             let sp = ISOTOPE_SPACING / c.charge as f64;
             let tol = p.cfg.prec_tol_ppm;
-            let grid_rt: Vec<f32> = grid.iter().map(|&r| r as f32).collect();
             for (nm, dmz) in [("ms1_mono", 0.0), ("ms1_iso1", sp), ("ms1_iso2", 2.0 * sp)] {
                 let mz = c.precursor_mz + dmz;
                 let ints: Vec<f32> = grid
@@ -2832,7 +2942,7 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
             peak_rank: 0, // selected apex; ranks >= 1 added when promote_top_peaks > 1
             apex_rt,
             apex_int: apex_sum,
-            n_match: distinct.len() as i32,
+            n_match: n_distinct as i32,
             corun: best_run as i32,
             npred: fmzs0.len() as i32,
             calrt: rt_cal[cid as usize],
@@ -3367,6 +3477,99 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
         "extract: done"
     );
     Ok((n_psms, n_chrom))
+}
+
+#[cfg(test)]
+mod frag_set_tests {
+    use super::{FragSet, FRAG_SET_BITS};
+
+    /// The bitmask replaces "collect every hit's ordinal, sort, dedup", so it has to
+    /// produce that vector, and its length, for any input.
+    #[test]
+    fn reproduces_sort_and_dedup() {
+        for &case in &[
+            &[][..],
+            &[0][..],
+            &[7, 7, 7][..],
+            &[5, 1, 9, 1, 63, 64, 0, 9][..],
+            &[511, 510, 0, 1, 64, 65, 128, FRAG_SET_BITS as u16 - 1][..],
+        ] {
+            let mut set = FragSet::default();
+            for &f in case {
+                set.insert(f);
+            }
+            let mut reference: Vec<u16> = case.to_vec();
+            reference.sort_unstable();
+            reference.dedup();
+            assert_eq!(set.len(), reference.len(), "{case:?}");
+            assert_eq!(set.to_vec(), reference, "{case:?}");
+            for f in 0..600u16 {
+                assert_eq!(set.contains(f), reference.contains(&f), "{case:?} frag {f}");
+            }
+        }
+    }
+
+    /// Ordinals past the inline mask spill to a sorted vector rather than panicking, and
+    /// the two halves still read back as one ascending set.
+    #[test]
+    fn ordinals_past_the_mask_spill_in_order() {
+        let case: Vec<u16> = vec![900, 3, 512, 900, 1200, 511, 512];
+        let mut set = FragSet::default();
+        for &f in &case {
+            set.insert(f);
+        }
+        let mut reference = case.clone();
+        reference.sort_unstable();
+        reference.dedup();
+        assert_eq!(set.to_vec(), reference);
+        assert_eq!(set.len(), reference.len());
+        assert!(set.contains(1200) && set.contains(3) && !set.contains(4));
+    }
+}
+
+#[cfg(test)]
+mod covering_window_tests {
+    /// The per-candidate grid used to scan every isolation window. The binary-searched
+    /// span must select exactly the windows the scan did, for uneven widths and for
+    /// precursors falling in a gap, or a candidate silently loses part of its scan grid.
+    #[test]
+    fn the_searched_span_holds_every_covering_window() {
+        // Deliberately uneven: overlapping wide and narrow windows, plus a gap.
+        let mut windows: Vec<(f64, f64)> = vec![
+            (400.0, 404.0),
+            (402.0, 426.0),
+            (404.0, 408.0),
+            (408.0, 412.0),
+            (412.0, 413.0),
+            (420.0, 430.0),
+            (430.0, 470.0),
+            (460.0, 461.0),
+        ];
+        windows.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let max_width = windows
+            .iter()
+            .map(|w| w.1 - w.0)
+            .fold(0.0f64, |a, b| if b > a { b } else { a });
+        let mut pms: Vec<f64> = Vec::new();
+        for i in 0..2000 {
+            pms.push(395.0 + i as f64 * 0.05);
+        }
+        for &w in &windows {
+            pms.push(w.0);
+            pms.push(w.1);
+        }
+        for pm in pms {
+            let full: Vec<usize> = (0..windows.len())
+                .filter(|&i| windows[i].0 <= pm && pm <= windows[i].1)
+                .collect();
+            let s = windows.partition_point(|w| w.0 < pm - max_width);
+            let e = windows.partition_point(|w| w.0 <= pm);
+            let span: Vec<usize> = (s..e)
+                .filter(|&i| windows[i].0 <= pm && pm <= windows[i].1)
+                .collect();
+            assert_eq!(span, full, "pm {pm}");
+        }
+    }
 }
 
 #[cfg(test)]
