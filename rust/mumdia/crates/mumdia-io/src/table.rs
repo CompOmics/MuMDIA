@@ -19,20 +19,35 @@ use parquet::arrow::arrow_reader::{
     ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder, RowSelection,
     RowSelector,
 };
-use parquet::arrow::ArrowWriter;
-use parquet::basic::{Compression, LogicalType};
+use parquet::arrow::{ArrowSchemaConverter, ArrowWriter};
+use parquet::basic::{Compression, LogicalType, Type as PhysicalType};
 use parquet::column::writer::ColumnCloseResult;
 use parquet::file::metadata::{PageIndexPolicy, ParquetMetaData, ParquetMetaDataReader};
 use parquet::file::properties::WriterProperties;
 use parquet::file::statistics::Statistics;
 use parquet::file::writer::SerializedFileWriter;
+use parquet::schema::types::ColumnPath;
 
 /// The codec every artifact is written with. Snappy by default, which is what released
 /// artifacts use and what the sidecars' pyarrow reads without configuration;
-/// `MUMDIA_PARQUET_COMPRESSION=zstd` writes zstd instead, which is much smaller on the
-/// float-heavy chromatogram and feature tables and therefore that much less to write on a
-/// run whose wall clock is disk-bound. Both are read transparently, whatever wrote them.
-/// It changes every artifact's bytes, so two runs compared by content hash must agree on it.
+/// `MUMDIA_PARQUET_COMPRESSION=zstd` writes zstd instead. Both are read transparently,
+/// whatever wrote them. It changes every artifact's bytes, so two runs compared by content
+/// hash must agree on it.
+///
+/// zstd is a DISK-FOOTPRINT lever. This docstring used to call it a wall-clock lever
+/// ("that much less to write on a run whose wall clock is disk-bound"), which the
+/// measurement does not support: the write is not where it helps.
+///
+/// Measured through `bench_rewrite_a_real_artifact` on `out_aif02/chromatograms.parquet`
+/// (1,028,155 rows), parquet-rs 59.3 at `ZstdLevel::default()` = 1, which is what this
+/// function selects, both arms with the float dictionaries off (see [`writer_props`]):
+/// snappy 171.6 MB / write 6.7-7.0 s / read 3.9-4.3 s, zstd 70.4 MB (-59%) / write 6.7 s /
+/// read 4.3 s. So it more than halves the largest artifact for no encode cost, and the
+/// decode difference did not come out of the run-to-run noise on this host (repeats of the
+/// IDENTICAL arm spread 10%). Set it where the disk is the constraint -- a network share,
+/// OneDrive, a spinning disk, or a run that is out of space; the immuno run's 136 GB of
+/// band artifacts would become roughly 60 GB -- and re-measure the decode there before
+/// assuming it is free on slower storage than this.
 fn codec() -> Compression {
     match std::env::var("MUMDIA_PARQUET_COMPRESSION")
         .unwrap_or_default()
@@ -237,10 +252,83 @@ fn cols_to_batch(path: &str, cols: Vec<Col>) -> Result<(Arc<Schema>, RecordBatch
     Ok((schema, batch))
 }
 
-fn snappy_props(row_group_rows: Option<usize>) -> WriterProperties {
+/// The parquet leaves of `schema` whose physical type is FLOAT or DOUBLE, as the writer
+/// will name them. Derived with the same converter the [`ArrowWriter`] uses, so a list
+/// column's leaf path (`trace.list.item`) is the writer's own spelling rather than a guess.
+/// A schema the converter rejects yields no paths; the writer reports that failure itself.
+fn float_leaf_paths(schema: &Schema) -> Vec<ColumnPath> {
+    let Ok(desc) = ArrowSchemaConverter::new()
+        .with_coerce_types(false)
+        .convert(schema)
+    else {
+        return Vec::new();
+    };
+    desc.columns()
+        .iter()
+        .filter(|c| {
+            matches!(
+                c.physical_type(),
+                PhysicalType::FLOAT | PhysicalType::DOUBLE
+            )
+        })
+        .map(|c| c.path().clone())
+        .collect()
+}
+
+/// Writer properties for one artifact: the codec, an optional row-group cap, and
+/// dictionary encoding turned OFF for the f32/f64 leaves.
+///
+/// parquet-rs enables dictionary encoding for every column by default and only falls back
+/// to PLAIN once the dictionary reaches `dictionary_page_size_limit` (1 MB, i.e. 131,072
+/// distinct f64 or 262,144 distinct f32). Every row-group cap in this engine
+/// (`FEATURE_ROW_GROUP_ROWS` 65,536, `COMPETED_ROW_GROUP_ROWS` and
+/// `HANDOFF_ROW_GROUP_ROWS` 131,072) is at or below that, so a near-unique float column
+/// could never trigger the fallback: it was written fully RLE_DICTIONARY, paying a
+/// dictionary page that holds essentially every value plus a bit-packed index on top of
+/// it. The chromatogram list leaves are NOT the exception one might expect: they carry a
+/// dictionary page too (`rt.list.item` and `intensity.list.item` on a shipped
+/// chromatograms.parquet both report RLE_DICTIONARY and a dictionary page offset), and
+/// they are the largest column chunks in the pipeline.
+///
+/// Measured by rewriting the shipped artifacts through `bench_rewrite_a_real_artifact`,
+/// float dictionaries off against parquet-rs's default, snappy both sides:
+///
+/// | artifact | rows x columns | dict on | dict off |
+/// |---|---|---|---|
+/// | `features.parquet` | 69,464 x 398 | 172.6 MB, write 1.6 s | 149.9 MB (-13.2%), write 0.54 s (-66%) |
+/// | `psms_competed.parquet` | 63,157 x 398 | 157.1 MB, write 1.26 s | 136.4 MB (-13.2%), write 0.43 s (-66%) |
+/// | `chromatograms.parquet` | 1,028,155 x 7 | 216.8 MB, write 6.5-7.5 s | 171.6 MB (-20.9%), write 6.7-7.0 s |
+///
+/// That is a constant 327 bytes per row on the ~390-column tables (2,485 -> 2,158), so
+/// about 1.0 GB off the six-run HYE competed table and 0.5 GB off a 3.84 GB rescore
+/// handoff, and about a fifth of every chromatogram table. The read side did not come out
+/// of the noise on this host and is not claimed: repeats of the identical arm spread 10-20%.
+///
+/// It is sized for those artifacts and is NOT a universal win: a float table small enough
+/// or repetitive enough that its dictionary stays small still compresses better with one.
+/// The smoke fixture is the case -- its 284-row x 398-column `features.parquet` grows 2.4%,
+/// 440 to 450 KB -- and it does not matter, because the tables that shape describes are
+/// kilobytes. Over the whole smoke run the 92 parquet artifacts are 0.9% smaller.
+///
+/// Only FLOAT and DOUBLE, and that narrowing is measured rather than assumed
+/// (`bench_dictionary_on_the_non_float_column_shapes`, 1,000,000 rows each, snappy,
+/// dictionary on -> off): unique i32 4.57 -> 4.00 MB, run-length i32 2.32 -> 1.17 MB,
+/// three-valued u32 0.02 -> 0.19 MB (+1,168%), two-valued utf8 0.01 -> 0.45 MB (+4,763%).
+/// Turning it off for every non-string leaf would therefore multiply the small-enum integer
+/// columns (`charge`, `peak_rank`, `frag_charge`, `label_code`, `source`) by about twelve
+/// for no gain, which is the wrong trade even though the run-length ids would have gained:
+/// one rule cannot serve both shapes, and the floats are where the bytes are. Booleans never
+/// use a dictionary in parquet-rs at all, so they are unaffected either way.
+///
+/// This changes the bytes of every artifact with a float column, exactly as the
+/// `MUMDIA_PARQUET_COMPRESSION` knob does; the decoded f32/f64 values are identical.
+fn writer_props(schema: &Schema, row_group_rows: Option<usize>) -> WriterProperties {
     let mut b = WriterProperties::builder().set_compression(codec());
     if let Some(n) = row_group_rows {
         b = b.set_max_row_group_row_count(Some(n.max(1)));
+    }
+    for leaf in float_leaf_paths(schema) {
+        b = b.set_column_dictionary_enabled(leaf, false);
     }
     b.build()
 }
@@ -515,7 +603,7 @@ impl TableWriter {
                 self.writer = Some(ArrowWriter::try_new(
                     file,
                     schema.clone(),
-                    Some(snappy_props(self.row_group_rows)),
+                    Some(writer_props(&schema, self.row_group_rows)),
                 )?);
                 self.schema = Some(schema);
             }
@@ -686,12 +774,9 @@ impl BatchWriter {
         let target = AtomicPath::new(path)?;
         let file = std::fs::File::create(target.tmp())
             .with_context(|| format!("creating {}", target.tmp().display()))?;
+        let props = writer_props(&schema, row_group_rows);
         Ok(BatchWriter {
-            writer: Some(ArrowWriter::try_new(
-                file,
-                schema,
-                Some(snappy_props(row_group_rows)),
-            )?),
+            writer: Some(ArrowWriter::try_new(file, schema, Some(props))?),
             rows: 0,
             target: Some(target),
         })
@@ -723,7 +808,10 @@ pub fn write_batches(path: &str, schema: Arc<Schema>, batches: &[RecordBatch]) -
     let target = AtomicPath::new(path)?;
     let file = std::fs::File::create(target.tmp())
         .with_context(|| format!("creating {}", target.tmp().display()))?;
-    let props = WriterProperties::builder().set_compression(codec()).build();
+    // The same properties [`TableWriter`] uses, minus the row-group cap: this path and the
+    // chunked one must produce the same file, which
+    // `write_table_matches_one_batch_byte_for_byte_on_scalars` asserts.
+    let props = writer_props(&schema, None);
     let mut writer = ArrowWriter::try_new(file, schema, Some(props))?;
     let mut n = 0u64;
     for b in batches {
@@ -1087,11 +1175,19 @@ fn push_u32(out: &mut Vec<u32>, col: &ArrayRef, name: &str) -> Result<()> {
 
 fn push_bool(out: &mut Vec<bool>, col: &ArrayRef, name: &str) -> Result<()> {
     let a: &BooleanArray = downcast(col, name, "bool")?;
-    for k in 0..a.len() {
-        if a.is_null(k) {
-            return Err(reject_null(name, out.len()));
+    // Same `null_count() == 0` fast path as the numeric decoders: on a required column the
+    // per-row `is_null` is a validity-bitmap load and a branch for a bit that is always the
+    // same. Values and null policy are unchanged.
+    if a.null_count() == 0 {
+        out.reserve(a.len());
+        out.extend(a.values().iter());
+    } else {
+        for k in 0..a.len() {
+            if a.is_null(k) {
+                return Err(reject_null(name, out.len()));
+            }
+            out.push(a.value(k));
         }
-        out.push(a.value(k));
     }
     Ok(())
 }
@@ -1136,67 +1232,48 @@ fn push_str_flat(
 /// Same null policy: a NULL in a required column is an error, not `false`.
 fn push_str_eq(out: &mut Vec<bool>, col: &ArrayRef, name: &str, value: &str) -> Result<()> {
     let a: &StringArray = downcast(col, name, "utf8")?;
-    for k in 0..a.len() {
-        if a.is_null(k) {
-            return Err(reject_null(name, out.len()));
+    out.reserve(a.len());
+    if a.null_count() == 0 {
+        for k in 0..a.len() {
+            out.push(a.value(k) == value);
         }
-        out.push(a.value(k) == value);
+    } else {
+        for k in 0..a.len() {
+            if a.is_null(k) {
+                return Err(reject_null(name, out.len()));
+            }
+            out.push(a.value(k) == value);
+        }
     }
     Ok(())
 }
 
 fn push_opt_f64(out: &mut Vec<Option<f64>>, col: &ArrayRef, name: &str) -> Result<()> {
     let a: &Float64Array = downcast(col, name, "f64")?;
-    for k in 0..a.len() {
-        out.push(if a.is_null(k) { None } else { Some(a.value(k)) });
+    if a.null_count() == 0 {
+        out.extend(a.values().iter().copied().map(Some));
+    } else {
+        for k in 0..a.len() {
+            out.push(if a.is_null(k) { None } else { Some(a.value(k)) });
+        }
     }
     Ok(())
 }
 
-/// Visit each row of an f32 list column (`List` or `LargeList`); `None` for a null row.
-/// The inner array is the row's own f32 slice.
-fn for_each_list_f32(
-    col: &ArrayRef,
-    name: &str,
-    mut f: impl FnMut(Option<&Float32Array>) -> Result<()>,
-) -> Result<()> {
-    fn inner<'a>(v: &'a ArrayRef, name: &str) -> Result<&'a Float32Array> {
-        v.as_any()
-            .downcast_ref::<Float32Array>()
-            .ok_or_else(|| anyhow!("list '{name}' inner is not f32"))
-    }
-    if let Some(a) = col.as_any().downcast_ref::<LargeListArray>() {
-        for k in 0..a.len() {
-            if a.is_null(k) {
-                f(None)?;
-            } else {
-                let v = a.value(k);
-                f(Some(inner(&v, name)?))?;
-            }
-        }
-    } else if let Some(a) = col.as_any().downcast_ref::<ListArray>() {
-        for k in 0..a.len() {
-            if a.is_null(k) {
-                f(None)?;
-            } else {
-                let v = a.value(k);
-                f(Some(inner(&v, name)?))?;
-            }
-        }
-    } else {
-        return Err(anyhow!("column '{name}' is not a list"));
+/// Visit each row of an f32 list column (`List` or `LargeList`) as its own f32 slice;
+/// an empty slice for a null row (the rows this layer writes are never null, and the
+/// readers that use this treat a null row as empty).
+fn for_each_list_f32(col: &ArrayRef, name: &str, mut f: impl FnMut(&[f32])) -> Result<()> {
+    let list = ListF32::of(col, name)?;
+    for k in 0..list.len() {
+        f(list.row_slice(k, name)?);
     }
     Ok(())
 }
 
 fn push_list_f32(out: &mut Vec<Vec<f32>>, col: &ArrayRef, name: &str) -> Result<()> {
-    for_each_list_f32(col, name, |row| {
-        out.push(match row {
-            Some(a) => a.values().to_vec(),
-            None => Vec::new(),
-        });
-        Ok(())
-    })
+    out.reserve(col.len());
+    for_each_list_f32(col, name, |row| out.push(row.to_vec()))
 }
 
 /// Flat layout: one values buffer plus `offsets` (row `r` is `values[offsets[r]..offsets[r+1]]`).
@@ -1210,42 +1287,100 @@ fn push_list_f32_flat(
     if offsets.is_empty() {
         offsets.push(0);
     }
+    offsets.reserve(col.len());
     for_each_list_f32(col, name, |row| {
-        if let Some(a) = row {
-            values.extend_from_slice(a.values());
-        }
+        values.extend_from_slice(row);
         offsets.push(values.len());
-        Ok(())
     })
 }
 
+/// The 32- or 64-bit offset buffer of a list column, already sliced to the array's own
+/// window by Arrow, so `bounds[k]..bounds[k + 1]` indexes the child's logical values.
+enum ListOffsets<'a> {
+    Small(&'a [i32]),
+    Large(&'a [i64]),
+}
+
 /// Borrowed view of an f32 list column (`List` or `LargeList`) for per-row access while
-/// iterating a batch: [`ListF32::row`] is row `k` as an owned `Vec<f32>` (empty for null).
-pub enum ListF32<'a> {
-    Small(&'a ListArray),
-    Large(&'a LargeListArray),
+/// iterating a batch. [`ListF32::row_slice`] is row `k` as a borrowed `&[f32]`,
+/// [`ListF32::append_row`] copies it into a caller-owned flat buffer, and
+/// [`ListF32::row`] is the owned `Vec<f32>`. A null row is empty in all three.
+///
+/// The offsets, the child's values and the validity bitmap are resolved ONCE, in
+/// [`ListF32::of`], because they are the same for every row of the batch. Reaching a row
+/// through `ListArray::value(k)` instead returns an owned `ArrayRef`, which is an
+/// `Arc::new(PrimitiveArray)` heap allocation plus an atomic refcount bump on the shared
+/// values buffer, per row, thrown away immediately after the copy.
+///
+/// Measured (`bench_list_view_against_the_per_row_arrayref`, 200,000 rows of 40 values,
+/// both arms copying into the same pre-reserved buffer): 7.1-7.4 ms against 14.3-14.8 ms,
+/// so 2.0x and 36-37 ns per row. Two list columns (`rt`, `intensity`) are read twice per
+/// run, by features and then by quant, which is 108 M rows on the HYE benchmark's 27 M
+/// chromatogram rows (about 4 s) and 2.15 billion on the immuno run's 537 M (about 78 s),
+/// plus the same number of contended refcount operations. It is also exactly the
+/// one-heap-block-per-item pattern the per-process mapping-limit investigation named.
+pub struct ListF32<'a> {
+    offsets: ListOffsets<'a>,
+    values: &'a [f32],
+    nulls: Option<&'a arrow::buffer::NullBuffer>,
+    len: usize,
 }
 
 impl<'a> ListF32<'a> {
     pub fn of(col: &'a ArrayRef, name: &str) -> Result<ListF32<'a>> {
+        fn child<'b>(v: &'b ArrayRef, name: &str) -> Result<&'b [f32]> {
+            // The physical values buffer, as the per-row path already read it: the inner
+            // validity bitmap is ignored here exactly as it was before.
+            Ok(v.as_any()
+                .downcast_ref::<Float32Array>()
+                .ok_or_else(|| anyhow!("list '{name}' inner is not f32"))?
+                .values())
+        }
         if let Some(a) = col.as_any().downcast_ref::<LargeListArray>() {
-            Ok(ListF32::Large(a))
+            Ok(ListF32 {
+                offsets: ListOffsets::Large(a.value_offsets()),
+                values: child(a.values(), name)?,
+                nulls: a.nulls(),
+                len: a.len(),
+            })
         } else if let Some(a) = col.as_any().downcast_ref::<ListArray>() {
-            Ok(ListF32::Small(a))
+            Ok(ListF32 {
+                offsets: ListOffsets::Small(a.value_offsets()),
+                values: child(a.values(), name)?,
+                nulls: a.nulls(),
+                len: a.len(),
+            })
         } else {
             Err(anyhow!("column '{name}' is not a list"))
         }
     }
 
     pub fn len(&self) -> usize {
-        match self {
-            ListF32::Small(a) => a.len(),
-            ListF32::Large(a) => a.len(),
-        }
+        self.len
     }
 
     pub fn is_empty(&self) -> bool {
-        self.len() == 0
+        self.len == 0
+    }
+
+    /// Row `k` as a borrowed slice of the batch's own values buffer; empty for a null row.
+    ///
+    /// The offsets come from the file, so they are checked rather than trusted: a corrupt
+    /// pair names the column and the row instead of panicking on the slice.
+    pub fn row_slice(&self, k: usize, name: &str) -> Result<&'a [f32]> {
+        if self.nulls.is_some_and(|n| n.is_null(k)) {
+            return Ok(&[]);
+        }
+        let (lo, hi) = match &self.offsets {
+            ListOffsets::Small(o) => (o[k] as usize, o[k + 1] as usize),
+            ListOffsets::Large(o) => (o[k] as usize, o[k + 1] as usize),
+        };
+        self.values.get(lo..hi).ok_or_else(|| {
+            anyhow!(
+                "list '{name}' row {k} spans {lo}..{hi} of a {} value buffer",
+                self.values.len()
+            )
+        })
     }
 
     /// Append row `k` to `out` and return the number of values appended (0 for a null
@@ -1253,38 +1388,14 @@ impl<'a> ListF32<'a> {
     /// of millions of short traces costs one allocation instead of one per row, which
     /// [`ListF32::row`] cannot avoid.
     pub fn append_row(&self, k: usize, out: &mut Vec<f32>, name: &str) -> Result<usize> {
-        let v: Option<ArrayRef> = match self {
-            ListF32::Small(a) => (!a.is_null(k)).then(|| a.value(k)),
-            ListF32::Large(a) => (!a.is_null(k)).then(|| a.value(k)),
-        };
-        match v {
-            None => Ok(0),
-            Some(v) => {
-                let a = v
-                    .as_any()
-                    .downcast_ref::<Float32Array>()
-                    .ok_or_else(|| anyhow!("list '{name}' inner is not f32"))?;
-                out.extend_from_slice(a.values());
-                Ok(a.len())
-            }
-        }
+        let row = self.row_slice(k, name)?;
+        out.extend_from_slice(row);
+        Ok(row.len())
     }
 
     /// Row `k` as an owned `Vec<f32>`; a null row is empty.
     pub fn row(&self, k: usize, name: &str) -> Result<Vec<f32>> {
-        let v: Option<ArrayRef> = match self {
-            ListF32::Small(a) => (!a.is_null(k)).then(|| a.value(k)),
-            ListF32::Large(a) => (!a.is_null(k)).then(|| a.value(k)),
-        };
-        match v {
-            None => Ok(Vec::new()),
-            Some(v) => Ok(v
-                .as_any()
-                .downcast_ref::<Float32Array>()
-                .ok_or_else(|| anyhow!("list '{name}' inner is not f32"))?
-                .values()
-                .to_vec()),
-        }
+        Ok(self.row_slice(k, name)?.to_vec())
     }
 }
 
@@ -2754,5 +2865,571 @@ mod atomic_path_tests {
         assert!(msg.contains("'mz'") && msg.contains("row 1001"), "{msg}");
         let ok = arrow::array::Float64Array::from(vec![Some(1.0), Some(2.0)]);
         assert!(require_no_nulls(&ok, "mz", "lib.parquet", 0).is_ok());
+    }
+}
+
+/// The float columns are written without a dictionary and everything else keeps one, the
+/// per-row decoders agree on both sides of their null fast path, and [`ListF32`] returns
+/// exactly what the per-row `ArrayRef` path returned.
+#[cfg(test)]
+mod encoding_tests {
+    use super::*;
+    use parquet::basic::Encoding;
+
+    fn tmp(name: &str) -> String {
+        let dir = std::env::temp_dir().join(format!("mumdia_table_enc_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join(name).to_str().unwrap().to_string()
+    }
+
+    /// The encodings parquet recorded for one leaf of row group 0, by its dotted path.
+    fn encodings(path: &str, leaf: &str) -> Vec<Encoding> {
+        let file = std::fs::File::open(path).unwrap();
+        let b = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
+        let rg = b.metadata().row_group(0);
+        let c = (0..rg.num_columns())
+            .map(|i| rg.column(i))
+            .find(|c| c.column_descr().path().string() == leaf)
+            .unwrap_or_else(|| panic!("no leaf '{leaf}' in {path}"));
+        c.encodings().collect()
+    }
+
+    fn mixed(n: usize) -> Vec<Col> {
+        vec![
+            // Near-unique floats: the case the dictionary can never pay for.
+            Col::F64("mz".into(), (0..n).map(|i| i as f64 * 1.000_007).collect()),
+            Col::F32("irt".into(), (0..n).map(|i| i as f32 * 0.5).collect()),
+            Col::OptF64("cal".into(), (0..n).map(|i| Some(i as f64)).collect()),
+            // Run-length ints and a two-valued string: the cases it pays for handsomely.
+            Col::I32(
+                "candidate_id".into(),
+                (0..n).map(|i| (i / 6) as i32).collect(),
+            ),
+            Col::U32(
+                "charge".into(),
+                (0..n).map(|i| (i % 3) as u32 + 1).collect(),
+            ),
+            Col::Str(
+                "label".into(),
+                (0..n)
+                    .map(|i| if i % 2 == 0 { "target" } else { "decoy" }.to_string())
+                    .collect(),
+            ),
+            Col::ListF32(
+                "trace".into(),
+                (0..n).map(|i| vec![i as f32, i as f32 + 0.5]).collect(),
+            ),
+            Col::LargeListF32("big".into(), (0..n).map(|i| vec![i as f32 * 3.0]).collect()),
+        ]
+    }
+
+    #[test]
+    fn float_leaves_lose_their_dictionary_and_nothing_else_does() {
+        let p = tmp("encodings.parquet");
+        write_table(&p, mixed(4_096)).unwrap();
+        let dict = |leaf: &str| encodings(&p, leaf).contains(&Encoding::RLE_DICTIONARY);
+        // f32/f64, scalar, nullable and inside a List or a LargeList.
+        for leaf in ["mz", "irt", "cal", "trace.list.item", "big.list.item"] {
+            assert!(!dict(leaf), "{leaf} should not be dictionary encoded");
+        }
+        // Everything else keeps the dictionary that makes it nearly free. `candidate_id`
+        // is the fragment library's run of repeated values and `label` is two-valued over
+        // 203M rows; PLAIN would be a large regression on both.
+        for leaf in ["candidate_id", "charge", "label"] {
+            assert!(dict(leaf), "{leaf} should still be dictionary encoded");
+        }
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// The point of the setting: the same values, fewer bytes, and every reader still
+    /// decodes them. The margin here is smaller than the 13% the 390-column artifacts
+    /// show, because this fixture is 8 columns wide; the direction is what this pins.
+    #[test]
+    fn dropping_the_float_dictionary_keeps_the_values_and_shrinks_the_file() {
+        let n = 65_536;
+        let p = tmp("nodict.parquet");
+        let q = tmp("withdict.parquet");
+        write_table(&p, mixed(n)).unwrap();
+        // The pre-change properties: parquet-rs's dictionary default for every column.
+        let (schema, batch) = cols_to_batch(&q, mixed(n)).unwrap();
+        let props = WriterProperties::builder().set_compression(codec()).build();
+        let f = std::fs::File::create(&q).unwrap();
+        let mut w = ArrowWriter::try_new(f, schema, Some(props)).unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+
+        let a = Table::read(&p).unwrap();
+        let b = Table::read(&q).unwrap();
+        assert_eq!(a.f64("mz").unwrap(), b.f64("mz").unwrap());
+        assert_eq!(a.f32("irt").unwrap(), b.f32("irt").unwrap());
+        assert_eq!(a.opt_f64("cal").unwrap(), b.opt_f64("cal").unwrap());
+        assert_eq!(a.list_f32("trace").unwrap(), b.list_f32("trace").unwrap());
+        assert_eq!(
+            a.i32("candidate_id").unwrap(),
+            b.i32("candidate_id").unwrap()
+        );
+        assert_eq!(a.str("label").unwrap(), b.str("label").unwrap());
+
+        let (sa, sb) = (
+            std::fs::metadata(&p).unwrap().len(),
+            std::fs::metadata(&q).unwrap().len(),
+        );
+        assert!(
+            sa < sb,
+            "float dictionaries off should be smaller: {sa} vs {sb}"
+        );
+        std::fs::remove_file(&p).ok();
+        std::fs::remove_file(&q).ok();
+    }
+
+    /// Pins the OLD behaviour of the three decoders that gained a `null_count() == 0` fast
+    /// path: identical values with no nulls, and the identical error, naming the same row,
+    /// with one.
+    #[test]
+    fn the_decoder_fast_paths_agree_with_the_per_row_loops() {
+        let flags: ArrayRef = Arc::new(BooleanArray::from(vec![true, false, true, true]));
+        let mut out = Vec::new();
+        push_bool(&mut out, &flags, "flag").unwrap();
+        assert_eq!(out, vec![true, false, true, true]);
+        let with_null: ArrayRef = Arc::new(BooleanArray::from(vec![Some(true), None, Some(false)]));
+        let mut out = Vec::new();
+        let e = push_bool(&mut out, &with_null, "flag")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("'flag'") && e.contains("row 1"), "{e}");
+
+        let names: ArrayRef = Arc::new(StringArray::from(vec!["target", "decoy", "target"]));
+        let mut out = Vec::new();
+        push_str_eq(&mut out, &names, "label", "target").unwrap();
+        assert_eq!(out, vec![true, false, true]);
+        let with_null: ArrayRef =
+            Arc::new(StringArray::from(vec![Some("target"), Some("decoy"), None]));
+        let mut out = Vec::new();
+        let e = push_str_eq(&mut out, &with_null, "label", "target")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("'label'") && e.contains("row 2"), "{e}");
+
+        let cal: ArrayRef = Arc::new(Float64Array::from(vec![1.5, -0.0, f64::NAN]));
+        let mut out = Vec::new();
+        push_opt_f64(&mut out, &cal, "cal").unwrap();
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0], Some(1.5));
+        // -0.0 and NaN survive the fast path bit for bit.
+        assert_eq!(out[1].unwrap().to_bits(), (-0.0f64).to_bits());
+        assert!(out[2].unwrap().is_nan());
+        let cal: ArrayRef = Arc::new(Float64Array::from(vec![Some(1.0), None, Some(3.0)]));
+        let mut out = Vec::new();
+        push_opt_f64(&mut out, &cal, "cal").unwrap();
+        assert_eq!(out, vec![Some(1.0), None, Some(3.0)]);
+    }
+
+    fn list_with_a_null() -> ListArray {
+        let mut b = ListBuilder::new(Float32Builder::new());
+        b.values().append_slice(&[1.0, 2.0, 3.0]);
+        b.append(true);
+        b.append(false); // a null row
+        b.values().append_slice(&[]);
+        b.append(true); // an empty row
+        b.values().append_slice(&[9.5, -0.0, f32::NAN]);
+        b.append(true);
+        b.finish()
+    }
+
+    /// Pins the OLD per-row path: whatever `ListArray::value(k)` yielded, including for a
+    /// null row, an empty row and a SLICED array whose offsets no longer start at 0, is
+    /// what the resolved-once view must yield.
+    #[test]
+    fn the_list_view_matches_the_per_row_arrayref_path() {
+        fn old_row(a: &ListArray, k: usize) -> Vec<f32> {
+            if a.is_null(k) {
+                return Vec::new();
+            }
+            a.value(k)
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .unwrap()
+                .values()
+                .to_vec()
+        }
+        let bits = |x: &[f32]| x.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+        for (label, arr) in [
+            ("whole", list_with_a_null()),
+            ("sliced", list_with_a_null().slice(1, 3)),
+        ] {
+            let col: ArrayRef = Arc::new(arr.clone());
+            let v = ListF32::of(&col, "trace").unwrap();
+            assert_eq!(v.len(), arr.len(), "{label}");
+            let mut flat = Vec::new();
+            for k in 0..arr.len() {
+                let old = old_row(&arr, k);
+                assert_eq!(
+                    bits(v.row_slice(k, "trace").unwrap()),
+                    bits(&old),
+                    "{label} {k}"
+                );
+                assert_eq!(bits(&v.row(k, "trace").unwrap()), bits(&old), "{label} {k}");
+                let n = v.append_row(k, &mut flat, "trace").unwrap();
+                assert_eq!(n, old.len(), "{label} {k}");
+            }
+            let total: usize = (0..arr.len()).map(|k| old_row(&arr, k).len()).sum();
+            assert_eq!(flat.len(), total, "{label}");
+        }
+    }
+
+    /// The same for `LargeList` (64-bit offsets), which is what the chromatogram columns
+    /// actually are on a real run.
+    #[test]
+    fn the_list_view_handles_large_list_offsets() {
+        let mut b = LargeListBuilder::new(Float32Builder::new());
+        b.values().append_slice(&[4.0, 5.0]);
+        b.append(true);
+        b.append(false);
+        b.values().append_slice(&[6.0]);
+        b.append(true);
+        let arr = b.finish();
+        let col: ArrayRef = Arc::new(arr);
+        let v = ListF32::of(&col, "trace").unwrap();
+        assert_eq!(v.row(0, "trace").unwrap(), vec![4.0, 5.0]);
+        assert_eq!(v.row(1, "trace").unwrap(), Vec::<f32>::new());
+        assert_eq!(v.row(2, "trace").unwrap(), vec![6.0]);
+    }
+
+    /// A non-f32 list is still refused, only now at [`ListF32::of`] rather than at the
+    /// first row.
+    #[test]
+    fn a_non_f32_list_is_refused() {
+        let mut b = ListBuilder::new(arrow::array::Float64Builder::new());
+        b.values().append_slice(&[1.0]);
+        b.append(true);
+        let col: ArrayRef = Arc::new(b.finish());
+        let e = ListF32::of(&col, "trace").err().unwrap().to_string();
+        assert!(e.contains("'trace'") && e.contains("not f32"), "{e}");
+        let col: ArrayRef = Arc::new(Float32Array::from(vec![1.0f32]));
+        let e = ListF32::of(&col, "trace").err().unwrap().to_string();
+        assert!(e.contains("is not a list"), "{e}");
+    }
+}
+
+/// Microbenchmarks for the writer properties and the list view. Ignored by default; run
+/// them with
+///
+/// ```text
+/// cargo test -p mumdia-io --release -- --ignored --nocapture bench_
+/// ```
+///
+/// Both arms of every A/B build their inputs the same way OUTSIDE the timer and the timer
+/// covers only the operation being compared.
+#[cfg(test)]
+mod writer_bench {
+    use super::*;
+    use std::time::Instant;
+
+    fn tmp(name: &str) -> String {
+        let dir = std::env::temp_dir().join(format!("mumdia_table_bench_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join(name).to_str().unwrap().to_string()
+    }
+
+    /// A cheap LCG, so the floats are near-unique and not compressible by accident.
+    fn noise(seed: u64, n: usize) -> Vec<f64> {
+        let mut s = seed | 1;
+        (0..n)
+            .map(|_| {
+                s = s
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((s >> 11) as f64) / ((1u64 << 53) as f64) * 1e4
+            })
+            .collect()
+    }
+
+    fn write_with(path: &str, cols: Vec<Col>, dictionaries: bool) -> (u64, f64) {
+        let (schema, batch) = cols_to_batch(path, cols).unwrap();
+        let props = if dictionaries {
+            // parquet-rs's default: a dictionary on every column.
+            WriterProperties::builder().set_compression(codec()).build()
+        } else {
+            writer_props(&schema, None)
+        };
+        let t = Instant::now();
+        let f = std::fs::File::create(path).unwrap();
+        let mut w = ArrowWriter::try_new(f, schema, Some(props)).unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+        let secs = t.elapsed().as_secs_f64();
+        (std::fs::metadata(path).unwrap().len(), secs)
+    }
+
+    fn read_secs(path: &str) -> f64 {
+        let t = Instant::now();
+        let table = Table::read(path).unwrap();
+        std::hint::black_box(table.nrows);
+        t.elapsed().as_secs_f64()
+    }
+
+    /// The shape of `features.parquet` / `psms_competed.parquet`: a few id columns and
+    /// several hundred near-unique f64. This is the table the change is for.
+    #[test]
+    #[ignore = "benchmark"]
+    fn bench_float_dictionary_on_a_wide_float_table() {
+        let (rows, wide) = (65_536usize, 200usize);
+        let cols = |_: ()| -> Vec<Col> {
+            let mut c = vec![
+                Col::U32("candidate_id".into(), (0..rows as u32).collect()),
+                Col::Str(
+                    "label".into(),
+                    (0..rows)
+                        .map(|i| if i % 2 == 0 { "target" } else { "decoy" }.to_string())
+                        .collect(),
+                ),
+            ];
+            for j in 0..wide {
+                c.push(Col::F64(format!("f{j}"), noise(j as u64 + 7, rows)));
+            }
+            c
+        };
+        let on = tmp("wide_dict_on.parquet");
+        let off = tmp("wide_dict_off.parquet");
+        let (s_on, w_on) = write_with(&on, cols(()), true);
+        let (s_off, w_off) = write_with(&off, cols(()), false);
+        // Warm the page cache for both before timing either read.
+        read_secs(&on);
+        read_secs(&off);
+        let (r_on, r_off) = (read_secs(&on), read_secs(&off));
+        println!(
+            "wide f64 {rows} x {wide}: dict on {:.1} MB / write {w_on:.2} s / read {r_on:.2} s; \
+             off {:.1} MB ({:+.1}%) / write {w_off:.2} s ({:+.0}%) / read {r_off:.2} s ({:+.0}%); \
+             {:.0} against {:.0} bytes per row",
+            s_on as f64 / 1e6,
+            s_off as f64 / 1e6,
+            100.0 * (s_off as f64 / s_on as f64 - 1.0),
+            100.0 * (w_off / w_on - 1.0),
+            100.0 * (r_off / r_on - 1.0),
+            s_on as f64 / rows as f64,
+            s_off as f64 / rows as f64,
+        );
+        std::fs::remove_file(&on).ok();
+        std::fs::remove_file(&off).ok();
+    }
+
+    /// The same A/B on a REAL artifact, because a synthetic float column is pure noise and
+    /// therefore the most favourable case a dictionary can be given. Point it at one:
+    ///
+    /// ```text
+    /// MUMDIA_BENCH_PARQUET=out_aif02/features.parquet \
+    ///   cargo test -p mumdia-io --release -- --ignored --nocapture bench_rewrite
+    /// ```
+    ///
+    /// Both arms rewrite the SAME decoded batches, so the read and the decode are outside
+    /// the timer and only the encode is compared.
+    #[test]
+    #[ignore = "benchmark; needs MUMDIA_BENCH_PARQUET"]
+    fn bench_rewrite_a_real_artifact() {
+        let Ok(src) = std::env::var("MUMDIA_BENCH_PARQUET") else {
+            println!("set MUMDIA_BENCH_PARQUET to a real artifact to run this");
+            return;
+        };
+        let table = Table::read(&src).unwrap();
+        let floats = table
+            .schema
+            .fields()
+            .iter()
+            .filter(|f| {
+                matches!(f.data_type(), DataType::Float32 | DataType::Float64)
+                    || matches!(f.data_type(), DataType::List(i) | DataType::LargeList(i)
+                    if matches!(i.data_type(), DataType::Float32 | DataType::Float64))
+            })
+            .count();
+        let rewrite = |path: &str, dictionaries: bool| -> (u64, f64) {
+            let props = if dictionaries {
+                WriterProperties::builder().set_compression(codec()).build()
+            } else {
+                writer_props(&table.schema, None)
+            };
+            let t = Instant::now();
+            let f = std::fs::File::create(path).unwrap();
+            let mut w = ArrowWriter::try_new(f, table.schema.clone(), Some(props)).unwrap();
+            for b in &table.batches {
+                w.write(b).unwrap();
+            }
+            w.close().unwrap();
+            let secs = t.elapsed().as_secs_f64();
+            (std::fs::metadata(path).unwrap().len(), secs)
+        };
+        let on = tmp("real_dict_on.parquet");
+        let off = tmp("real_dict_off.parquet");
+        let (s_on, w_on) = rewrite(&on, true);
+        let (s_off, w_off) = rewrite(&off, false);
+        read_secs(&on);
+        read_secs(&off);
+        let (r_on, r_off) = (read_secs(&on), read_secs(&off));
+        println!(
+            "{src}: {} rows x {} columns ({floats} float); on disk {:.1} MB. \
+             Rewritten dict on {:.1} MB / write {w_on:.2} s / read {r_on:.2} s; \
+             off {:.1} MB ({:+.1}%) / write {w_off:.2} s ({:+.0}%) / read {r_off:.2} s ({:+.0}%); \
+             {:.0} against {:.0} bytes per row",
+            table.nrows,
+            table.schema.fields().len(),
+            std::fs::metadata(&src).unwrap().len() as f64 / 1e6,
+            s_on as f64 / 1e6,
+            s_off as f64 / 1e6,
+            100.0 * (s_off as f64 / s_on as f64 - 1.0),
+            100.0 * (w_off / w_on - 1.0),
+            100.0 * (r_off / r_on - 1.0),
+            s_on as f64 / table.nrows.max(1) as f64,
+            s_off as f64 / table.nrows.max(1) as f64,
+        );
+        std::fs::remove_file(&on).ok();
+        std::fs::remove_file(&off).ok();
+    }
+
+    /// Why [`writer_props`] disables the dictionary on FLOAT leaves and leaves the integer
+    /// and string ones alone. Each integer shape the engine actually writes, on its own,
+    /// with the dictionary on and then off; the dictionary has to lose on ALL of them
+    /// before the rule could be widened to every non-string leaf.
+    ///
+    /// Measured here (1,000,000 rows, snappy, one row group, dictionary on -> off): unique
+    /// i32 4.57 -> 4.00 MB (-12%), run-length i32 at 6 rows per id 2.32 -> 1.17 MB (-50%),
+    /// three-valued u32 0.02 -> 0.19 MB (+1,168%), two-valued utf8 0.01 -> 0.45 MB
+    /// (+4,763%). The wider rule would gain on the id columns and lose an order of
+    /// magnitude on the small enums, so it is not one rule: the floats keep the change and
+    /// everything else keeps its dictionary.
+    #[test]
+    #[ignore = "benchmark"]
+    fn bench_dictionary_on_the_non_float_column_shapes() {
+        let rows = 1_000_000usize;
+        type Shape<'a> = (&'a str, Box<dyn Fn() -> Col>);
+        let shapes: Vec<Shape> = vec![
+            (
+                "unique i32",
+                Box::new(move || Col::I32("id".into(), (0..rows as i32).collect())),
+            ),
+            (
+                "run-length i32 (6 rows per id)",
+                Box::new(move || {
+                    Col::I32(
+                        "candidate_id".into(),
+                        (0..rows).map(|i| (i / 6) as i32).collect(),
+                    )
+                }),
+            ),
+            (
+                "three-valued u32",
+                Box::new(move || {
+                    Col::U32(
+                        "charge".into(),
+                        (0..rows).map(|i| (i % 3) as u32 + 1).collect(),
+                    )
+                }),
+            ),
+            (
+                "two-valued utf8",
+                Box::new(move || {
+                    Col::Str(
+                        "label".into(),
+                        (0..rows)
+                            .map(|i| if i % 2 == 0 { "target" } else { "decoy" }.to_string())
+                            .collect(),
+                    )
+                }),
+            ),
+        ];
+        for (what, make) in shapes {
+            let on = tmp("shape_dict_on.parquet");
+            let off = tmp("shape_dict_off.parquet");
+            let (s_on, w_on) = write_with(&on, vec![make()], true);
+            // Disabling the dictionary on a non-float leaf is NOT what `writer_props`
+            // does; build the properties by hand to measure the rule that was rejected.
+            let (schema, batch) = cols_to_batch(&off, vec![make()]).unwrap();
+            let mut b = WriterProperties::builder().set_compression(codec());
+            for c in ArrowSchemaConverter::new()
+                .convert(&schema)
+                .unwrap()
+                .columns()
+            {
+                b = b.set_column_dictionary_enabled(c.path().clone(), false);
+            }
+            let t = Instant::now();
+            let f = std::fs::File::create(&off).unwrap();
+            let mut w = ArrowWriter::try_new(f, schema, Some(b.build())).unwrap();
+            w.write(&batch).unwrap();
+            w.close().unwrap();
+            let w_off = t.elapsed().as_secs_f64();
+            let s_off = std::fs::metadata(&off).unwrap().len();
+            println!(
+                "{what} {rows} rows: dict on {:.2} MB / {w_on:.2} s; off {:.2} MB ({:+.0}%) \
+                 / {w_off:.2} s",
+                s_on as f64 / 1e6,
+                s_off as f64 / 1e6,
+                100.0 * (s_off as f64 / s_on as f64 - 1.0),
+            );
+            std::fs::remove_file(&on).ok();
+            std::fs::remove_file(&off).ok();
+        }
+    }
+
+    /// The chromatogram read path: `ListF32` resolved once against the per-row
+    /// `ArrayRef`. Both arms walk the same decoded batches and copy the same values into
+    /// the same pre-reserved buffer; only the way the row's bounds are reached differs.
+    #[test]
+    #[ignore = "benchmark"]
+    fn bench_list_view_against_the_per_row_arrayref() {
+        let (rows, per_row) = (200_000usize, 40usize);
+        let p = tmp("traces.parquet");
+        write_table(
+            &p,
+            vec![
+                Col::U32("id".into(), (0..rows as u32).collect()),
+                Col::LargeListF32(
+                    "rt".into(),
+                    (0..rows)
+                        .map(|i| (0..per_row).map(|k| (i + k) as f32).collect())
+                        .collect(),
+                ),
+            ],
+        )
+        .unwrap();
+        let table = Table::read(&p).unwrap();
+        let total = rows * per_row;
+
+        let mut out = Vec::with_capacity(total);
+        let t = Instant::now();
+        for b in &table.batches {
+            let col = b.column(b.schema().index_of("rt").unwrap()).clone();
+            let v = ListF32::of(&col, "rt").unwrap();
+            for k in 0..v.len() {
+                v.append_row(k, &mut out, "rt").unwrap();
+            }
+        }
+        let new = t.elapsed().as_secs_f64();
+        assert_eq!(out.len(), total);
+
+        // The previous implementation, verbatim: one owned `ArrayRef` per row.
+        let mut old_out = Vec::with_capacity(total);
+        let t = Instant::now();
+        for b in &table.batches {
+            let col = b.column(b.schema().index_of("rt").unwrap()).clone();
+            let a = col.as_any().downcast_ref::<LargeListArray>().unwrap();
+            for k in 0..a.len() {
+                if a.is_null(k) {
+                    continue;
+                }
+                let v = a.value(k);
+                let f = v.as_any().downcast_ref::<Float32Array>().unwrap();
+                old_out.extend_from_slice(f.values());
+            }
+        }
+        let old = t.elapsed().as_secs_f64();
+        assert_eq!(old_out, out);
+        println!(
+            "list rows {rows} x {per_row}: resolved once {:.1} ms, ArrayRef per row {:.1} ms \
+             ({:.2}x), {:.1} ns per row saved",
+            new * 1e3,
+            old * 1e3,
+            old / new,
+            (old - new) * 1e9 / rows as f64,
+        );
+        std::fs::remove_file(&p).ok();
     }
 }
