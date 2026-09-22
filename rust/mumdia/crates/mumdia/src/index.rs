@@ -23,6 +23,10 @@ use rayon::prelude::*;
 /// Fragment rows per decoded batch while streaming the fragment table (a few MB).
 const FRAG_BATCH_ROWS: usize = 1 << 16;
 
+/// Precursor rows per decoded batch for the two columns that are validated in a streaming
+/// pass and never kept (`label`, `candidate_id`).
+const PREC_BATCH_ROWS: usize = 1 << 16;
+
 #[derive(Clone, Debug)]
 pub struct Candidate {
     pub candidate_id: u32,
@@ -100,6 +104,80 @@ fn require_finite_f32(v: &[f32], column: &str, path: &str) -> Result<()> {
              \"matches everything\" downstream rather than an error. Fix or drop the row",
             v[row]
         );
+    }
+    Ok(())
+}
+
+/// Read the `label` column as one boolean per row, streaming, without materialising a
+/// `String` per row.
+///
+/// The column is two-valued and its only consumer is [`Candidate::is_decoy`], so reading it
+/// as a `Vec<String>` cost one heap block per precursor -- 203M blocks and about 6.5 GB on
+/// the full library -- to produce one bit each. The validity rule is unchanged and stays in
+/// one place: an unexpected value is handed to [`crate::fdr::validate_labels`], which is
+/// also the only value ever turned into a `String`.
+fn read_is_decoy(pt: &TableFile, path: &str) -> Result<Vec<bool>> {
+    let mut out: Vec<bool> = Vec::with_capacity(pt.nrows);
+    for b in pt.batches(Some(&["label"]), PREC_BATCH_ROWS)? {
+        let b = b?;
+        let a = b
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| anyhow::anyhow!("column 'label' is not utf8"))?;
+        // `value()` ignores the validity bitmap, so a NULL would read as "" and become a
+        // target. Same contract as the fragment columns below.
+        require_no_nulls(a, "label", path, out.len())?;
+        for k in 0..a.len() {
+            match a.value(k) {
+                "decoy" => out.push(true),
+                "target" => out.push(false),
+                other => {
+                    // `validate_labels` refuses anything but target/decoy, so this arm
+                    // returns. Written as an explicit error rather than a fall-through:
+                    // if that rule ever widens, not pushing here would leave the column
+                    // shorter than the table and every later row would read its
+                    // neighbour's label.
+                    crate::fdr::validate_labels(&[other.to_string()])?;
+                    anyhow::bail!(
+                        "library precursor row {} of {path} has label '{other}', which is                          neither 'target' nor 'decoy'",
+                        out.len()
+                    );
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Check, streaming, that `candidate_id` is the contiguous row-aligned range
+/// `offset..offset + ncand`.
+///
+/// The ids are a precondition, never data: `index.rs` uses the row position everywhere and
+/// the column exists only to be verified. Holding it cost 4 bytes per precursor (812 MB on
+/// the full library) for the whole of the fragment load and index build.
+fn check_candidate_ids(pt: &TableFile, path: &str, offset: usize, ncand: usize) -> Result<()> {
+    let mut row = 0usize;
+    for b in pt.batches(Some(&["candidate_id"]), PREC_BATCH_ROWS)? {
+        let b = b?;
+        let a = b
+            .column(0)
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .ok_or_else(|| anyhow::anyhow!("column 'candidate_id' is not u32"))?;
+        require_no_nulls(a, "candidate_id", path, row)?;
+        for &candidate_id in a.values().iter().take(ncand.saturating_sub(row)) {
+            if candidate_id as usize != row + offset {
+                anyhow::bail!(
+                    "library precursor row {} has candidate_id {} but candidate_id must \
+                     be the contiguous range 0..n in row order; reindex the library \
+                     (e.g. via the decoy-builder scripts)",
+                    row + offset,
+                    candidate_id
+                );
+            }
+            row += 1;
+        }
     }
     Ok(())
 }
@@ -301,16 +379,16 @@ impl Library {
             None => TableFile::open(precursors)?,
             Some((first, n)) => TableFile::open_rows(precursors, first, n)?,
         };
-        let cid = pt.u32("candidate_id")?;
         let pfid = pt.u32("peptidoform_id")?;
         let baseid = pt.u32("base_peptide_id")?;
         let mut pform = pt.str("peptidoform")?;
         let charge = pt.i32("charge")?;
         let pmz = pt.f64("precursor_mz")?;
         let irt = pt.f32("predicted_irt")?;
-        let label = pt.str("label")?;
         let mut protein = pt.str("protein")?;
-        crate::fdr::validate_labels(&label)?;
+        // `label` is validated and reduced to a bit in one streaming pass rather than being
+        // held as a `Vec<String>`; `candidate_id` is checked the same way further down.
+        let is_decoy = read_is_decoy(&pt, precursors)?;
         // A Parquet NULL decodes to NaN (mumdia-io `Table::f64`/`f32`), and NaN is
         // accepted rather than rejected by every downstream guard that should catch it:
         // the ascending-m/z check below is `<`, the extract RT-window guards are
@@ -380,24 +458,14 @@ impl Library {
         }
 
         let ncand = pt.nrows;
-        drop(pt);
         // Precondition: candidate_id is the contiguous, row-aligned range 0..ncand
         // (the library + decoy builders guarantee this). An external library that
         // violates it would misgroup fragments or panic on the index below, so
         // check explicitly and fail with a clear error instead.
         // For a range load the same invariant holds against the file row: local id c is
         // file row c + offset, so the slice's ids must be exactly offset..offset + ncand.
-        for (c, &candidate_id) in cid.iter().enumerate().take(ncand) {
-            if candidate_id as usize != c + offset {
-                anyhow::bail!(
-                    "library precursor row {} has candidate_id {} but candidate_id must \
-                     be the contiguous range 0..n in row order; reindex the library \
-                     (e.g. via the decoy-builder scripts)",
-                    c + offset,
-                    candidate_id
-                );
-            }
-        }
+        check_candidate_ids(&pt, precursors, offset, ncand)?;
+        drop(pt);
 
         // Fragment table: two streaming passes over the four columns the library needs (the
         // artifact also carries `ion_type`, `ordinal`, `frag_charge` and `cardinality`, which
@@ -589,8 +657,12 @@ impl Library {
         }
         drop(name_lookup);
 
+        // `prec_mz` IS the decoded `precursor_mz` column: row c is candidate c, in the same
+        // order, so the second array was a copy of the first. Move it instead of pushing a
+        // duplicate, which removes 8 bytes per candidate (1.6 GB on the full library) and
+        // one large heap block from the load's peak.
+        let prec_mz = pmz;
         let mut cands = Vec::with_capacity(ncand);
-        let mut prec_mz = Vec::with_capacity(ncand);
         for c in 0..ncand {
             let start = frag_offsets[c] as usize;
             let n = frag_offsets[c + 1] as usize - start;
@@ -602,14 +674,13 @@ impl Library {
                 // Move the strings out of the column Vecs instead of cloning them.
                 peptidoform: std::mem::take(&mut pform[c]),
                 charge: charge[c],
-                precursor_mz: pmz[c],
+                precursor_mz: prec_mz[c],
                 predicted_irt: irt[c],
-                is_decoy: label[c] == "decoy",
+                is_decoy: is_decoy[c],
                 protein: std::mem::take(&mut protein[c]),
                 frag_start: start,
                 n_frag: n,
             });
-            prec_mz.push(pmz[c]);
         }
         drop(frag_offsets);
 
@@ -733,6 +804,11 @@ impl Library {
     /// Per-candidate fragment m/z, predicted intensity, and INTERNED name ids (resolve
     /// with [`Library::frag_name_str`]).
     pub fn cand_frags(&self, cid: u32) -> (&[f32], &[f32], &[u16]) {
+        assert!(
+            !self.fragment_payload_released(),
+            "the library's fragment payload was released (Library::release_fragment_payload); \
+             only cand_frag_mz is available after that"
+        );
         let c = &self.cands[cid as usize];
         let s = c.frag_start;
         let e = s + c.n_frag;
@@ -741,6 +817,38 @@ impl Library {
             &self.frag_int[s..e],
             &self.frag_name_id[s..e],
         )
+    }
+
+    /// Per-candidate fragment m/z alone. The only fragment column that survives
+    /// [`Library::release_fragment_payload`], so this is what a stage that has already built
+    /// its index must use.
+    pub fn cand_frag_mz(&self, cid: u32) -> &[f32] {
+        let c = &self.cands[cid as usize];
+        &self.frag_mz[c.frag_start..c.frag_start + c.n_frag]
+    }
+
+    /// Free the fragment columns that only an index build reads: `frag_int`,
+    /// `frag_name_id` and the name dictionary. `frag_mz` is kept, because the seed's mass
+    /// recalibration still matches every library fragment against the scan.
+    ///
+    /// Predicted intensity and fragment name are copied into the index (or, for the
+    /// bucketed arrays, into `idx_int`) at build time and never read from the library
+    /// afterwards by a stage that has an index, so holding them is 6 bytes per fragment of
+    /// dead weight for the whole search -- about 7 GB on a 1.2G-fragment library, and two
+    /// of the large mappings the process is rationed on. Call it only after the index the
+    /// stage will actually probe exists; [`Library::cand_frags`] panics afterwards rather
+    /// than returning a short or stale slice.
+    pub fn release_fragment_payload(&mut self) {
+        self.frag_int = Vec::new();
+        self.frag_name_id = Vec::new();
+        self.frag_name_dict = Vec::new();
+    }
+
+    /// Whether [`Library::release_fragment_payload`] has run. Derived rather than stored:
+    /// the three fragment arrays are parallel, so a `frag_int` shorter than `frag_mz` can
+    /// only mean the payload was dropped.
+    pub fn fragment_payload_released(&self) -> bool {
+        self.frag_int.len() != self.frag_mz.len()
     }
 
     /// Local fragment index (0..n_frag) of the candidate whose stored m/z is
@@ -822,6 +930,85 @@ pub fn deconvolve(peak_mz: f64, z: i32) -> f64 {
 mod tests {
     use super::*;
     use mumdia_io::table::{write_table, Col, TableWriter};
+
+    /// The label and candidate_id passes read in 65,536-row batches, and their row
+    /// accounting across a batch boundary -- the absolute row in an error, and the
+    /// `ncand` cap on the last batch -- is the only genuinely new logic in them. Nothing
+    /// covered it: every other fixture in this file is six rows.
+    #[test]
+    fn labels_and_ids_are_read_across_a_batch_boundary() {
+        let dir = std::env::temp_dir().join(format!("mumdia_idx_batch_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let n = PREC_BATCH_ROWS + 5;
+        let path = |t: &str| dir.join(t).to_str().unwrap().to_string();
+
+        let good = path("good.parquet");
+        write_table(
+            &good,
+            vec![
+                Col::U32("candidate_id".into(), (0..n as u32).collect()),
+                Col::Str(
+                    "label".into(),
+                    (0..n)
+                        .map(|i| if i % 2 == 0 { "target" } else { "decoy" }.to_string())
+                        .collect(),
+                ),
+            ],
+        )
+        .unwrap();
+        let t = TableFile::open(&good).unwrap();
+        let decoy = read_is_decoy(&t, &good).unwrap();
+        assert_eq!(decoy.len(), n, "one value per row across both batches");
+        assert!(!decoy[0] && decoy[1]);
+        // The rows either side of the boundary, and the last row of the short batch.
+        assert_eq!(decoy[PREC_BATCH_ROWS - 1], (PREC_BATCH_ROWS - 1) % 2 == 1);
+        assert_eq!(decoy[PREC_BATCH_ROWS], PREC_BATCH_ROWS % 2 == 1);
+        assert_eq!(decoy[n - 1], (n - 1) % 2 == 1);
+        check_candidate_ids(&t, &good, 0, n).unwrap();
+        // A band: the ids start at an offset and only `ncand` of them are checked.
+        check_candidate_ids(&t, &good, 0, PREC_BATCH_ROWS).unwrap();
+
+        // A wrong id in the SECOND batch must be named by its absolute row.
+        let bad = path("bad_id.parquet");
+        let mut ids: Vec<u32> = (0..n as u32).collect();
+        ids[PREC_BATCH_ROWS + 2] = 7;
+        write_table(
+            &bad,
+            vec![
+                Col::U32("candidate_id".into(), ids),
+                Col::Str("label".into(), vec!["target".to_string(); n]),
+            ],
+        )
+        .unwrap();
+        let t = TableFile::open(&bad).unwrap();
+        let err = check_candidate_ids(&t, &bad, 0, n).unwrap_err().to_string();
+        assert!(
+            err.contains(&format!("row {}", PREC_BATCH_ROWS + 2)) && err.contains("candidate_id 7"),
+            "{err}"
+        );
+
+        // A NULL label in the second batch, likewise.
+        let nulls = path("null_label.parquet");
+        let mut labels: Vec<Option<String>> = vec![Some("target".to_string()); n];
+        labels[PREC_BATCH_ROWS + 1] = None;
+        write_table(
+            &nulls,
+            vec![
+                Col::U32("candidate_id".into(), (0..n as u32).collect()),
+                Col::OptStr("label".into(), labels),
+            ],
+        )
+        .unwrap();
+        let t = TableFile::open(&nulls).unwrap();
+        // The row is in the error's source and the path in its context, so the whole
+        // chain has to be formatted (`{:#}`), as mumdia-io's own test of this does.
+        let err = format!("{:#}", read_is_decoy(&t, &nulls).unwrap_err());
+        assert!(
+            err.contains(&(PREC_BATCH_ROWS + 1).to_string()),
+            "the null must be named by its absolute row: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// Six candidates at m/z 400, 450, 500, 520, 600, 650 with two fragments each, written
     /// in row groups of two rows so a range crosses row-group boundaries on both tables.
@@ -1282,6 +1469,187 @@ mod tests {
         )
         .unwrap();
         (p, f)
+    }
+
+    /// A two-candidate library whose `candidate_id` and `label` columns are the caller's,
+    /// for the two streaming-validated columns below.
+    fn library_ids_labels(
+        dir: &std::path::Path,
+        ids: [u32; 2],
+        labels: [&str; 2],
+    ) -> (String, String) {
+        std::fs::create_dir_all(dir).unwrap();
+        let p = dir.join("prec.parquet").to_str().unwrap().to_string();
+        let f = dir.join("frag.parquet").to_str().unwrap().to_string();
+        write_table(
+            &p,
+            vec![
+                Col::U32("candidate_id".into(), ids.to_vec()),
+                Col::U32("peptidoform_id".into(), vec![0, 1]),
+                Col::U32("base_peptide_id".into(), vec![0, 1]),
+                Col::Str(
+                    "peptidoform".into(),
+                    vec!["PEPTIDEK".into(), "SAMPLER".into()],
+                ),
+                Col::I32("charge".into(), vec![2, 2]),
+                Col::F64("precursor_mz".into(), vec![400.0, 500.0]),
+                Col::F32("predicted_irt".into(), vec![10.0, 20.0]),
+                Col::Str(
+                    "label".into(),
+                    vec![labels[0].to_string(), labels[1].to_string()],
+                ),
+                Col::Str("protein".into(), vec!["P1".into(), "P2".into()]),
+            ],
+        )
+        .unwrap();
+        write_table(
+            &f,
+            vec![
+                Col::U32("candidate_id".into(), vec![0, 1]),
+                Col::F64("mz".into(), vec![200.1, 250.5]),
+                Col::F32("predicted_intensity".into(), vec![1.0, 0.9]),
+                Col::Str("name".into(), vec!["b2".into(), "y3".into()]),
+            ],
+        )
+        .unwrap();
+        (p, f)
+    }
+
+    /// The `label` column is read as a boolean per row instead of a `String` per row (203M
+    /// heap blocks and ~6.5 GB on the full library, to set one bit each). The bit must be
+    /// exactly what `label[c] == "decoy"` produced, and an unexpected value must still be
+    /// refused by `fdr::validate_labels`'s rule and message.
+    #[test]
+    fn the_label_column_becomes_the_boolean_it_always_meant() {
+        let dir = unique_dir("label_bool");
+        let (p, f) = library_ids_labels(&dir, [0, 1], ["target", "decoy"]);
+        let lib = Library::load_with(&p, &f, 8, false).unwrap();
+        assert_eq!(
+            lib.cands.iter().map(|c| c.is_decoy).collect::<Vec<_>>(),
+            vec![false, true]
+        );
+        // Reversed, so a constant-false or index-shifted read cannot pass both cases.
+        let (p2, f2) = library_ids_labels(&unique_dir("label_bool2"), [0, 1], ["decoy", "target"]);
+        let lib2 = Library::load_with(&p2, &f2, 8, false).unwrap();
+        assert_eq!(
+            lib2.cands.iter().map(|c| c.is_decoy).collect::<Vec<_>>(),
+            vec![true, false]
+        );
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(unique_dir("label_bool2")).ok();
+    }
+
+    #[test]
+    fn an_unknown_label_is_still_refused_by_name() {
+        let dir = unique_dir("label_bad");
+        let (p, f) = library_ids_labels(&dir, [0, 1], ["target", "REVERSE"]);
+        let err = match Library::load_with(&p, &f, 8, false) {
+            Ok(_) => panic!("an unknown label must be rejected at load"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("unknown PSM label"), "{err}");
+        assert!(err.contains("REVERSE"), "{err}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `candidate_id` is verified in a streaming pass and never held (4 B per precursor,
+    /// 812 MB on the full library, live for the whole fragment load). The check itself is
+    /// unchanged: row-aligned or refused, naming the row.
+    #[test]
+    fn a_non_contiguous_candidate_id_is_rejected_with_the_row() {
+        let dir = unique_dir("cid_gap");
+        let (p, f) = library_ids_labels(&dir, [0, 2], ["target", "decoy"]);
+        let err = match Library::load_with(&p, &f, 8, false) {
+            Ok(_) => panic!("a non-contiguous candidate_id must be rejected at load"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("contiguous range"), "{err}");
+        assert!(
+            err.contains("row 1"),
+            "should name the offending row: {err}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A range load checks the ids against the FILE row, not the local one, and the
+    /// streaming check must keep that: local id c is file row c + offset.
+    #[test]
+    fn the_streamed_id_check_uses_the_file_row_for_a_range_load() {
+        let dir = std::env::temp_dir().join(format!("mumdia_index_cidspan_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (p, f) = build_six_lib(&dir, "cidspan", &[0, 1, 2, 3, 4, 5]);
+        // Rows 1..4 carry file ids 1, 2, 3; the load accepts them against offset 1.
+        let part = Library::load_range_with(&p, &f, 440.0, 530.0, 8, false).unwrap();
+        assert_eq!(part.n_candidates(), 3);
+        assert_eq!(
+            part.cands
+                .iter()
+                .map(|c| c.candidate_id)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+    }
+
+    /// `prec_mz` is now the moved `precursor_mz` column rather than a second copy of it.
+    /// It must still be exactly the per-candidate value, since `candidate_range` and the
+    /// fragment index both index it by candidate id.
+    #[test]
+    fn prec_mz_is_the_per_candidate_precursor_mz() {
+        let dir = std::env::temp_dir().join(format!("mumdia_index_precmz_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (p, f) = build_six_lib(&dir, "precmz", &[0, 1, 2, 3, 4, 5]);
+        let lib = Library::load_with(&p, &f, 8, false).unwrap();
+        assert_eq!(lib.prec_mz.len(), lib.n_candidates());
+        for c in 0..lib.n_candidates() {
+            assert_eq!(lib.prec_mz[c], lib.cands[c].precursor_mz);
+        }
+        assert_eq!(lib.prec_mz, vec![400.0, 450.0, 500.0, 520.0, 600.0, 650.0]);
+        // The same holds for a band, whose `prec_mz` is the band's slice of the column.
+        let part = Library::load_range_with(&p, &f, 440.0, 530.0, 8, false).unwrap();
+        assert_eq!(part.prec_mz, vec![450.0, 500.0, 520.0]);
+        for c in 0..part.n_candidates() {
+            assert_eq!(part.prec_mz[c], part.cands[c].precursor_mz);
+        }
+    }
+
+    /// Releasing the fragment payload frees `frag_int`/`frag_name_id` and keeps `frag_mz`
+    /// byte for byte, because the seed's mass recalibration still walks every library
+    /// fragment m/z after its index exists.
+    #[test]
+    fn releasing_the_fragment_payload_keeps_every_fragment_mz() {
+        let dir = std::env::temp_dir().join(format!("mumdia_index_release_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (p, f) = build_six_lib(&dir, "release", &[0, 1, 2, 3, 4, 5]);
+        let mut lib = Library::load_with(&p, &f, 8, false).unwrap();
+        assert!(!lib.fragment_payload_released());
+        let before: Vec<Vec<f32>> = (0..lib.n_candidates())
+            .map(|c| lib.cand_frag_mz(c as u32).to_vec())
+            .collect();
+        // Before the release the two accessors agree, which is what makes the swap safe.
+        for c in 0..lib.n_candidates() {
+            assert_eq!(lib.cand_frags(c as u32).0, lib.cand_frag_mz(c as u32));
+        }
+        lib.release_fragment_payload();
+        assert!(lib.fragment_payload_released());
+        assert!(lib.frag_int.is_empty() && lib.frag_name_id.is_empty());
+        let after: Vec<Vec<f32>> = (0..lib.n_candidates())
+            .map(|c| lib.cand_frag_mz(c as u32).to_vec())
+            .collect();
+        assert_eq!(before, after);
+    }
+
+    /// The released payload must fail loudly rather than hand back a short or stale slice:
+    /// `cand_frags` is what extract reads predicted intensities through.
+    #[test]
+    #[should_panic(expected = "fragment payload was released")]
+    fn cand_frags_after_a_release_panics_instead_of_lying() {
+        let dir =
+            std::env::temp_dir().join(format!("mumdia_index_relpanic_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (p, f) = build_six_lib(&dir, "relpanic", &[0, 1, 2, 3, 4, 5]);
+        let mut lib = Library::load_with(&p, &f, 8, false).unwrap();
+        lib.release_fragment_payload();
+        let _ = lib.cand_frags(0);
     }
 
     #[test]

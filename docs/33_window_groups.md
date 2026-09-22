@@ -84,10 +84,18 @@ The stages then run unchanged on that table, as if it were the library:
   precursor file, which is why the band is a file rather than an in-memory slice.
 - `rt-im-train` writes the band's `run_windows.parquet` and `cal.json`.
 - `extract`, `features` and `compete` write the band's `psms_extracted`, `chromatograms`,
-  `features` and `psms_competed` with local ids.
+  `features` and `psms_competed`. The id columns are library-wide on the way out
+  (local id plus `Library::global_offset`), so a band's table means the same thing as the
+  run's and pooling is a concatenation.
 
 Nothing outside the band is resident during any of these. The converted spectra are read by
 each stage as they always are.
+
+Under `experiment.rt_library_scope = first_run_only` the runs after the first reuse the first
+run's adapted bands, and then they reuse its band slices too: a slice is a deterministic
+function of the library and the row span, so rewriting it would produce the same bytes. Only
+the seed reads it, and the adapted table replaces it everywhere else. On a 203M-precursor
+library that is the whole precursor table not written, per run after the first.
 
 ## 4. The seed pool and the two calibration modes
 
@@ -140,14 +148,49 @@ pays for. On the CI fixture it cannot fit at all (no band has a confident anchor
 
 ## 5. The artifact pool
 
-`pool` (`stages/pool.rs`) rewrites the four band tables with library-wide ids and appends
-them, batch by batch, into the standard `psms_extracted.parquet`, `chromatograms.parquet`,
-`features.parquet` and `psms_competed.parquet`. Where two bands hold the same candidate
-(window overlap across a cut), the competed row with the higher `prelim_score` wins and the
-loser's rows are dropped from all four tables, so the pooled tables hold each candidate
-once and rescore's competition is unchanged. One batch is resident at a time, and the writer's
-row groups are capped, so the pool costs one read and one write of the group artifacts and
-no more memory than any single stage. The feature and competed schema companions
+`pool` (`stages/pool.rs`) appends the band tables, batch by batch, into the standard
+`chromatograms.parquet` and `psms_competed.parquet`. The bands already wrote library-wide
+ids, so this is a concatenation rather than a rewrite. Where two bands hold the same
+candidate (window overlap across a cut), the competed row with the higher `prelim_score`
+wins and the loser's rows are dropped from every pooled table, so the pooled tables hold
+each candidate once and rescore's competition is unchanged. One batch is resident at a time,
+and the writer's row groups are capped, so the pool costs one read and one write of the
+group artifacts and no more memory than any single stage.
+
+Two of the four tables an ungrouped run writes are not pooled, because nothing reads them:
+
+- `features.parquet`: the competed table carries the feature columns, and no stage opens a
+  run-level feature table. On a real run it was 55 GB of writes per run.
+- `psms_extracted.parquet`: its one consumer is the candidate audit, which is off by
+  default (`extract.emit_candidate_audit`). With the audit on it is pooled as before; with
+  it off the band tables stay where they are and the run says so in the log. This is the
+  run's second-widest artifact, so pooling it cost a full read and a full write for a file
+  nothing opened.
+
+Each pooled table is hashed once, for the manifest record and the report beside it
+together. At experiment scale those tables are tens of GB, and hashing reads all of it.
+
+The pooling itself is a byte copy. A band's rows are already in the order the pooled table
+wants and already encoded, so `pool` splices each band's parquet row groups into the output
+without decoding them (`mumdia_io::table::SpliceWriter`, the column-chunk append the parquet
+writer exposes for concatenation). Only the row groups that hold a candidate the overlap
+dedup drops are decoded, filtered and re-encoded, and window overlap puts those at the two
+ends of a band. Measured on the production seven-file experiment, both arms on the same
+63 bands of one run (537,047,953 chromatogram rows and 35,844,209 competed rows, 136 GB):
+
+| pooling | wall | peak RSS |
+|---|---|---|
+| decode and re-encode | 3.5 MB/s, 42.7 GB in 2 h 50 min (killed) | 4.3 GB |
+| splice the row groups | 3 min 12 s for all 136 GB | 2.6 GB |
+
+The disk reads 221 MB/s (`dd`, direct), so the old path was two orders of magnitude off the
+hardware and single-threaded: 110% CPU throughout. The spliced output holds the same rows in
+the same order with the same values; its row groups are the bands' own, so it is not
+byte-identical to a re-encoded pool.
+
+`mumdia pool --groups-dir <run>/groups` runs the same stage standalone, which is how those
+numbers were taken, and is what to reach for when a grouped search finished but the run did
+not: the band directories hold everything, and pooling them is a copy. The feature and competed schema companions
 (`<table>.schema.json`, the classifier's column list) are copied from the first band; every
 band wrote the same one. Each pooled table gets a `.report.json` whose stage is `pool` and
 whose stats record the number of groups and the overlap duplicates removed.
@@ -172,7 +215,8 @@ out/
   seed_psms.parquet                  pooled seed, library-wide ids (+ .masscal.json)
   seed_psms_calibrated.parquet       pooled seed with refreshed iRT (global, after re-prediction)
   cal.json                           run-level RT calibration record (section 7)
-  {psms_extracted,chromatograms,features,psms_competed}.parquet  pooled (+ .report.json)
+  {chromatograms,psms_competed}.parquet  pooled (+ .report.json)
+  psms_extracted.parquet             pooled only under extract.emit_candidate_audit
   psms_scored.parquet, quant, peptides.tsv, proteins.tsv, manifest.json  as always
 ```
 
@@ -319,6 +363,16 @@ Three things this says:
 
 On this data the useful range is therefore 48 to 64 bands: about 40 GB per band, which is
 what a 100 GB desktop can run two of at a time, or one with room to spare.
+
+### `groups.parallel` and the thread count
+
+A band in flight occupies one rayon worker, which then blocks on its own extraction's
+accumulation channel while the probing tasks run on the other workers. So `groups.parallel`
+must stay below `--threads`: with as many bands as threads every worker parks and the run
+makes no progress at all (reproduced on the fixture at `parallel = 2, --threads 2`: the
+process sat at 0.1 s of CPU indefinitely, with no error and no output). The orchestrator
+clamps the value to `threads - 1` and warns. The production runs are far from the bound (8
+bands on 128 threads), which is why this was not visible before.
 
 ## 9. What is not there yet
 

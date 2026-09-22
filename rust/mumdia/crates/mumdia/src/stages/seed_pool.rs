@@ -32,10 +32,6 @@ pub struct BandSeed {
     pub offset: u32,
     /// Rows of the band; the band's candidates are `offset..offset + rows`.
     pub rows: u32,
-    /// Where to write the band's view of the pooled seed: its own rows with band-local
-    /// ids and the pooled `spectrum_q`, for the band's stages that key on the seed by
-    /// candidate id (features' corroboration and elution boundary).
-    pub view: String,
 }
 
 pub struct SeedPoolParams<'a> {
@@ -169,25 +165,7 @@ pub fn run(p: SeedPoolParams) -> Result<u64> {
     let pairs: Vec<(f64, bool)> = rows.iter().map(|r| (r.score, r.label == "decoy")).collect();
     let q = target_decoy_q(&pairs);
     let n_out = rows.len();
-    let n = write_rows(p.out, &rows, q.clone())?;
-    // Each band's rows again, with local ids and the pooled q.
-    for band in p.seeds {
-        let (view_rows, view_q): (Vec<Row>, Vec<f64>) = rows
-            .iter()
-            .zip(&q)
-            .filter(|(r, _)| r.cid >= band.offset && r.cid - band.offset < band.rows)
-            .map(|(r, q)| {
-                (
-                    Row {
-                        cid: r.cid - band.offset,
-                        ..r.clone()
-                    },
-                    *q,
-                )
-            })
-            .unzip();
-        write_rows(&band.view, &view_rows, view_q)?;
-    }
+    let n = write_rows(p.out, &rows, q)?;
 
     // Mass calibration: the bands' scalar offsets and learned tolerances combined by
     // calibrant count. The optional m/z grids are not combined (they would need the
@@ -357,25 +335,17 @@ mod tests {
             .unwrap();
         }
         let out = dir.join("pooled.parquet").to_str().unwrap().to_string();
-        let view = |tag: &str| {
-            dir.join(format!("{tag}_view.parquet"))
-                .to_str()
-                .unwrap()
-                .to_string()
-        };
         let n = run(SeedPoolParams {
             seeds: &[
                 BandSeed {
                     path: a.clone(),
                     offset: 0,
                     rows: 4,
-                    view: view("a"),
                 },
                 BandSeed {
                     path: b.clone(),
                     offset: 3,
                     rows: 3,
-                    view: view("b"),
                 },
             ],
             masscals: &[format!("{a}.masscal.json"), format!("{b}.masscal.json")],
@@ -407,16 +377,6 @@ mod tests {
         );
         assert!((cal["frag_tol_ppm"].as_f64().unwrap() - 9.0).abs() < 1e-9);
         assert_eq!(cal["n_dev"].as_u64().unwrap(), 40);
-
-        // Band views: the band's own rows, local ids, the pooled q (band b's local 0 is
-        // the shared candidate, which the pool holds with band a's score).
-        let va = TableFile::open(&view("a")).unwrap();
-        assert_eq!(va.u32("candidate_id").unwrap(), vec![0, 1, 2, 3]);
-        assert_eq!(va.f64("spectrum_q").unwrap(), q[0..4].to_vec());
-        let vb = TableFile::open(&view("b")).unwrap();
-        assert_eq!(vb.u32("candidate_id").unwrap(), vec![0, 1, 2]);
-        assert_eq!(vb.f64("spectrum_q").unwrap(), q[3..6].to_vec());
-        assert_eq!(vb.f64("score").unwrap()[0], 15.0);
 
         // Refresh: band b's re-predicted table says local 1 (global 4) now has iRT 50.
         let lib_b = dir.join("lib_b.parquet").to_str().unwrap().to_string();
@@ -453,13 +413,11 @@ mod tests {
         )
         .unwrap();
         let out = dir.join("pooled.parquet").to_str().unwrap().to_string();
-        let view = dir.join("a_view.parquet").to_str().unwrap().to_string();
         run(SeedPoolParams {
             seeds: &[BandSeed {
                 path: a.clone(),
                 offset: 0,
                 rows: 2,
-                view,
             }],
             masscals: &[format!("{a}.masscal.json")],
             out: &out,

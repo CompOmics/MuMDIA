@@ -85,20 +85,34 @@ pub fn values(e: &Evidence) -> Vec<f64> {
     // present (both-positive), and over scans where any signal is present.
     let mut both = Vec::new();
     let mut summpos = Vec::new();
+    // The summed-positive gather does not depend on the pair, so it is done ONCE per
+    // fragment rather than twice per pair: it was three of the five Vecs this loop
+    // allocated per pair, which is O(k^2) allocations per PSM for an O(k) quantity.
+    let sm_gathered: Vec<Vec<f64>> = if sm.len() >= 2 {
+        e.traces
+            .iter()
+            .map(|tr| sm.iter().map(|&t| tr[t]).collect())
+            .collect()
+    } else {
+        Vec::new()
+    };
+    // The both-positive index set IS pair-dependent, so only its buffers are reused.
+    let mut idx: Vec<usize> = Vec::with_capacity(np);
+    let mut xa: Vec<f64> = Vec::with_capacity(np);
+    let mut xb: Vec<f64> = Vec::with_capacity(np);
     for a in 0..e.traces.len() {
         for b in (a + 1)..e.traces.len() {
-            let idx: Vec<usize> = (0..np)
-                .filter(|&t| e.traces[a][t] > 0.0 && e.traces[b][t] > 0.0)
-                .collect();
+            idx.clear();
+            idx.extend((0..np).filter(|&t| e.traces[a][t] > 0.0 && e.traces[b][t] > 0.0));
             if idx.len() >= 2 {
-                let xa: Vec<f64> = idx.iter().map(|&t| e.traces[a][t]).collect();
-                let xb: Vec<f64> = idx.iter().map(|&t| e.traces[b][t]).collect();
+                xa.clear();
+                xa.extend(idx.iter().map(|&t| e.traces[a][t]));
+                xb.clear();
+                xb.extend(idx.iter().map(|&t| e.traces[b][t]));
                 both.push(pearson(&xa, &xb));
             }
             if sm.len() >= 2 {
-                let xa: Vec<f64> = sm.iter().map(|&t| e.traces[a][t]).collect();
-                let xb: Vec<f64> = sm.iter().map(|&t| e.traces[b][t]).collect();
-                summpos.push(pearson(&xa, &xb));
+                summpos.push(pearson(&sm_gathered[a], &sm_gathered[b]));
             }
         }
     }

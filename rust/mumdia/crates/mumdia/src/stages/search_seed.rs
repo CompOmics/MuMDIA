@@ -62,7 +62,7 @@ pub fn run(p: SearchSeedParams) -> Result<u64> {
     )?;
     // See extract: the bucketed index is dead weight on the fragindex path.
     let build_bucketed = !matches!(p.cfg.matcher, MatcherKind::Fragindex);
-    let lib = match p.fragment_offset {
+    let mut lib = match p.fragment_offset {
         None => Library::load_with(
             p.library_precursors,
             p.library_fragments,
@@ -87,6 +87,15 @@ pub fn run(p: SearchSeedParams) -> Result<u64> {
     // fragindex backend, built once at the seed's fragment tolerance when selected.
     let fidx = matches!(p.cfg.matcher, MatcherKind::Fragindex)
         .then(|| FragIndex::build(&lib, p.cfg.fragment_tol_ppm));
+    if fidx.is_some() {
+        // The index owns its own copy of every posting, and the seed reads neither the
+        // predicted intensity nor the fragment name from either side: the hyperscore is
+        // count + observed intensity, and the mass recalibration below needs only
+        // `frag_mz`. So the library's `frag_int` and `frag_name_id` are dead from here on
+        // -- 6 bytes per library fragment, held for the whole search. The bucketed path
+        // keeps them, because `page_search` serves `idx_int` out of arrays built from them.
+        lib.release_fragment_payload();
+    }
 
     // Best-per-candidate PSM. The fragindex path parallelizes across isolation-window
     // groups (each scan belongs to exactly one window, so groups are independent) and
@@ -148,17 +157,23 @@ pub fn run(p: SearchSeedParams) -> Result<u64> {
         .collect();
     let q = target_decoy_q(&sd);
 
-    let (mut cid_c, mut pform_c, mut charge_c, mut mz_c) =
-        (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-    let (mut base_c, mut prot_c, mut label_c) = (Vec::new(), Vec::new(), Vec::new());
-    let (mut score_c, mut q_c, mut rt_c, mut matched_c, mut scan_c, mut irt_c) = (
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-    );
+    // One allocation per column instead of a growth sequence per column: the row count is
+    // known, and these are the tables that make the seed's peak.
+    let n_rows = rows.len();
+    let mut cid_c = Vec::with_capacity(n_rows);
+    let mut pform_c = Vec::with_capacity(n_rows);
+    let mut charge_c = Vec::with_capacity(n_rows);
+    let mut mz_c = Vec::with_capacity(n_rows);
+    let mut base_c = Vec::with_capacity(n_rows);
+    let mut prot_c = Vec::with_capacity(n_rows);
+    // The label is the boolean, not a string that a later pass has to parse back into one.
+    let mut is_dec: Vec<bool> = Vec::with_capacity(n_rows);
+    let mut score_c = Vec::with_capacity(n_rows);
+    let mut q_c = Vec::with_capacity(n_rows);
+    let mut rt_c = Vec::with_capacity(n_rows);
+    let mut matched_c = Vec::with_capacity(n_rows);
+    let mut scan_c = Vec::with_capacity(n_rows);
+    let mut irt_c = Vec::with_capacity(n_rows);
     for (i, (cid, b)) in rows.iter().enumerate() {
         let c = &lib.cands[*cid as usize];
         cid_c.push(*cid);
@@ -167,7 +182,7 @@ pub fn run(p: SearchSeedParams) -> Result<u64> {
         mz_c.push(c.precursor_mz);
         base_c.push(c.base_peptide_id);
         prot_c.push(c.protein.clone());
-        label_c.push(if c.is_decoy { "decoy" } else { "target" }.to_string());
+        is_dec.push(c.is_decoy);
         score_c.push(b.score);
         q_c.push(q[i]);
         rt_c.push(b.rt);
@@ -176,7 +191,6 @@ pub fn run(p: SearchSeedParams) -> Result<u64> {
         irt_c.push(c.predicted_irt);
     }
 
-    let is_dec: Vec<bool> = label_c.iter().map(|l| l == "decoy").collect();
     let n_at_1pct = count_targets_at_q(&q_c, &is_dec, p.cfg.fdr_seed);
 
     // Per-run fragment mass recalibration + learned tolerance
@@ -197,7 +211,9 @@ pub fn run(p: SearchSeedParams) -> Result<u64> {
             continue;
         }
         if let Some(scan) = scan_by_index.get(&b.scan_index) {
-            let (mzs, _, _) = lib.cand_frags(*cid);
+            // m/z only: the predicted intensity and the fragment name are not part of the
+            // mass calibration, and on the fragindex path they no longer exist.
+            let mzs = lib.cand_frag_mz(*cid);
             // The calibrant collection window has to be at least as wide as the search
             // tolerance, or the deviation percentile that SETS the learned tolerance is
             // truncated by the collection window itself. A literal 50 ppm silently did
@@ -328,7 +344,11 @@ pub fn run(p: SearchSeedParams) -> Result<u64> {
             Col::F64("precursor_mz".into(), mz_c),
             Col::U32("base_peptide_id".into(), base_c),
             Col::Str("protein".into(), prot_c),
-            Col::Str("label".into(), label_c),
+            // Materialised here and nowhere else: the artifact's column is text, but the
+            // engine never needed the strings for anything but the write itself. (A `Col`
+            // variant over a two-valued dictionary would remove these too; that is a
+            // mumdia-io change.)
+            Col::Str("label".into(), label_column(&is_dec)),
             Col::F64("score".into(), score_c),
             Col::F64("spectrum_q".into(), q_c),
             Col::F64("observed_rt".into(), rt_c),
@@ -391,6 +411,114 @@ fn select_peaks(scan: &Ms2Scan, top_n: usize) -> Vec<usize> {
     }
 }
 
+/// The seed artifact's `label` column, built from the boolean the library already carries.
+///
+/// It used to be the other way round: the column was assembled as `Vec<String>` while the
+/// rows were walked and the `is_decoy` vector was then rebuilt by comparing each of those
+/// strings to `"decoy"`, which is a full extra pass over the rows to recover a bit that
+/// `Candidate::is_decoy` had all along.
+fn label_column(is_decoy: &[bool]) -> Vec<String> {
+    is_decoy
+        .iter()
+        .map(|&d| if d { "decoy" } else { "target" }.to_string())
+        .collect()
+}
+
+/// The `(lower_mz, upper_mz)` `convert` writes for an MS2 scan whose reported isolation
+/// window is zero-width or whose precursor is missing (`convert.rs`, "AIF / all-ion"). It is
+/// a property of the SCAN, so it reads the same on every band of a grouped search.
+const FULL_RANGE_WINDOW: (f64, f64) = (0.0, 1.0e6);
+
+/// True when the run mixes the full-range isolation window with narrow ones, which is the
+/// signature of a scan that lost its isolation window: [`FULL_RANGE_WINDOW`] is what
+/// `convert` substitutes. Every window full-range is a legitimate all-ion acquisition and
+/// none is an ordinary run, so only the mixture is worth a warning.
+///
+/// This test, unlike the candidate-width ratio below, reads the same under a grouped search.
+/// A full-range window resolves to the WHOLE loaded band, and so does the band's own
+/// isolation window, so on a band the two widths are equal and no ratio can separate them.
+fn has_stray_full_range_window(windows: &[(f64, f64)]) -> bool {
+    let n = windows.iter().filter(|&&w| w == FULL_RANGE_WINDOW).count();
+    n > 0 && n < windows.len()
+}
+
+/// What the per-worker scratch sizing and the width warning read off the window groups.
+struct WindowSurvey {
+    /// Median candidate-window width over the SERVED groups; 1 when none is served.
+    median: usize,
+    /// Widest served candidate window, or `None` when no group is served.
+    widest: Option<usize>,
+    /// Groups this search serves, of `total`.
+    served: usize,
+    total: usize,
+}
+
+/// Candidate-window widths over the window groups THIS search actually serves, from each
+/// group's `(lo, hi)` candidate range.
+///
+/// The MEDIAN is the sizing statistic, not the widest and certainly not the library. The
+/// scratch is indexed window-relative and grows on demand, so an underestimate costs a
+/// reallocation while an overestimate costs 16 B x width per rayon worker up front.
+///
+/// The max is the wrong statistic because one window can be the whole library:
+/// [`FULL_RANGE_WINDOW`] resolves to every candidate. So a single malformed or all-ion scan
+/// in an otherwise 50-window run sized every worker's scratch to the library -- 877 MB per
+/// worker on the profiled 54.8M-candidate library, about 28 GB of commit charge on 32 cores,
+/// for arrays a worker inside one narrow window never touches.
+///
+/// Groups that select nothing (`hi <= lo`) are EXCLUDED from the widths, which is the same
+/// test the worker uses to skip a group, and counted instead: `served` against `total`.
+/// Under an isolation-window-group search the library is one m/z band while the run's
+/// windows are all of them, so with 63 bands 62 of every 63 groups select nothing and
+/// contributed a width of 1. The median was then 1 on every band and `widest > 8 * median`
+/// fired on every band, printing a warning about a zero-width or missing isolation window
+/// once per band for a run that has no such scan.
+///
+/// `served`/`total` is what keeps the correction from becoming a memory regression: see
+/// [`initial_scratch_width`].
+///
+/// Widths are collected in group order and then sorted, so the value is deterministic.
+fn window_survey(ranges: &[(u32, u32)]) -> WindowSurvey {
+    let mut widths: Vec<usize> = ranges
+        .iter()
+        .filter(|(lo, hi)| hi > lo)
+        .map(|(lo, hi)| hi.saturating_sub(*lo) as usize + 1)
+        .collect();
+    widths.sort_unstable();
+    let median = widths.get(widths.len() / 2).copied().unwrap_or(1).max(1);
+    WindowSurvey {
+        median,
+        widest: widths.last().copied(),
+        served: widths.len(),
+        total: ranges.len(),
+    }
+}
+
+/// Width each rayon leaf's [`SeedScratch`] is allocated with before it knows which groups it
+/// drew.
+///
+/// `map_init` runs its initialiser once per LEAF, not once per thread, and it runs before
+/// the leaf sees a group, so a leaf that draws only unserved groups pays the allocation and
+/// then returns empty. Where every group is served -- an ungrouped search -- the eager size
+/// is what the leaf's first `accumulate` would have grown it to anyway, so sizing it up
+/// front costs nothing and saves the reallocation. Where most groups are NOT served it is
+/// pure waste, and that is exactly the banded search this survey was corrected for: the
+/// library is one m/z band while the scans are all of them, so 62 of 63 groups are unserved
+/// and eager sizing would commit 16 B x band width on every leaf (about 14 MB per worker on
+/// the profiled 54.8M-candidate library over 63 bands, roughly 445 MB across 32 workers)
+/// for arrays nearly all of them never touch.
+///
+/// So: the served median when a majority of groups is served, one slot otherwise. The leaf
+/// that does draw work still reaches the same size through `SeedScratch::ensure`, in one
+/// amortised reallocation.
+fn initial_scratch_width(survey: &WindowSurvey) -> usize {
+    if survey.served * 2 > survey.total {
+        survey.median
+    } else {
+        1
+    }
+}
+
 /// fragindex seed over isolation-window groups, in parallel. Each scan belongs to
 /// exactly one isolation window, so grouping scans by window gives independent
 /// parallel units (the candidate axis overlaps between adjacent windows, handled by
@@ -417,54 +545,62 @@ fn seed_fragindex_windows(
             .push(si);
     }
     let group_vec: Vec<Vec<usize>> = groups.into_values().collect();
-    // Size each worker's scratch to the MEDIAN candidate window, not the widest one and
-    // certainly not the whole library. The scratch is indexed window-relative, and it
-    // grows on demand, so an underestimate costs a few reallocations while an
-    // overestimate costs 16 B x width per rayon worker up front.
-    //
-    // The max is the wrong statistic because one window can be the whole library:
-    // `convert.rs` maps BOTH a zero-width reported isolation window and a missing
-    // precursor to the full range (0, 1e6), which `candidate_range` resolves to every
-    // candidate. So a single malformed or all-ion scan in an otherwise 50-window run
-    // sized every worker's scratch to the library -- 877 MB per worker on the profiled
-    // 54.8M-candidate library, about 28 GB of commit charge on 32 cores, for arrays a
-    // worker inside one narrow window never touches. The only mitigation was `--threads`,
-    // which the user had to know to reach for.
-    //
-    // The median is robust to that outlier and needs no configuration. Widths are
-    // collected in group order, so the value is deterministic.
-    let mut widths: Vec<usize> = group_vec
+    let group_windows: Vec<(f64, f64)> = group_vec
         .iter()
         .filter_map(|ids| ids.first())
         .map(|&si| {
             let w = &scans[si].window;
-            let (lo, hi) = idx.candidate_range(w.lower_mz, w.upper_mz);
-            hi.saturating_sub(lo) as usize + 1
+            (w.lower_mz, w.upper_mz)
         })
         .collect();
-    widths.sort_unstable();
-    let median_window_width = widths.get(widths.len() / 2).copied().unwrap_or(1).max(1);
-    // Say so when the two disagree by a lot: a window spanning most of the library is
-    // either a genuine all-ion acquisition or a malformed scan, and both are worth
-    // knowing about before wondering why extraction is slow.
-    if let Some(&widest) = widths.last() {
-        if widest > 8 * median_window_width {
+    let ranges: Vec<(u32, u32)> = group_windows
+        .iter()
+        .map(|&(lo, hi)| idx.candidate_range(lo, hi))
+        .collect();
+    let survey = window_survey(&ranges);
+    // Two diagnostics, in order of how much each actually establishes.
+    //
+    // 1. A scan that lost its isolation window is recognisable from the WINDOW: convert
+    //    substitutes the full m/z range, so a run mixing full-range groups with narrow ones
+    //    contains such a scan whatever library happens to be loaded. This is the test that
+    //    survives a grouped search, where the ratio below cannot fire at all -- a
+    //    full-range window resolves to the whole loaded band, and so does the band's own
+    //    isolation window, so on a band the two widths are equal.
+    // 2. Otherwise, a window covering far more candidates than the median is still worth a
+    //    word even when the window itself is well formed (an unusually wide quadrupole
+    //    setting, or a library whose m/z range sits inside one window), before anyone
+    //    wonders why extraction is slow. Under a grouped search this second test sees only
+    //    the in-band groups, so it reports on this band, which is all it can honestly say.
+    if has_stray_full_range_window(&group_windows) {
+        warn!(
+            full_range_windows = group_windows
+                .iter()
+                .filter(|&&w| w == FULL_RANGE_WINDOW)
+                .count(),
+            window_groups = group_windows.len(),
+            "search-seed: some isolation windows are the full m/z range that convert \
+             writes for a scan with a zero-width or missing isolation window, while others \
+             are narrow. An all-ion acquisition makes EVERY window full-range; a mixture \
+             means those scans lost their isolation window"
+        );
+    } else if let Some(widest) = survey.widest {
+        if widest > 8 * survey.median {
             warn!(
-                median_window_candidates = median_window_width,
+                median_window_candidates = survey.median,
                 widest_window_candidates = widest,
                 library_candidates = idx.n_cand(),
                 "search-seed: one isolation window covers far more candidates than the \
-                 median. An all-ion acquisition does this legitimately; otherwise check \
-                 for a scan with a zero-width or missing isolation window, which convert \
-                 maps to the full m/z range"
+                 median of the window groups this search serves. An all-ion acquisition \
+                 does this legitimately"
             );
         }
     }
 
+    let scratch_width = initial_scratch_width(&survey);
     let partials: Vec<Vec<(u32, Best)>> = group_vec
         .par_iter()
         .map_init(
-            || SeedScratch::new(median_window_width),
+            || SeedScratch::new(scratch_width),
             |scratch, ids| {
                 if ids.is_empty() {
                     return Vec::new();
@@ -483,7 +619,10 @@ fn seed_fragindex_windows(
                         .map(|&pi| (scan.peaks[pi].mz, scan.peaks[pi].intensity))
                         .collect();
                     scratch.accumulate(idx, &peaks, lo, hi);
-                    let touched: Vec<u32> = scratch.touched().to_vec();
+                    // Borrowed, not copied: `touched` can be as long as the candidate
+                    // window, so the copy was one allocation of up to a window's width per
+                    // scan. Same slice, same order, so the scored list is unchanged.
+                    let touched = scratch.touched();
                     let mut scored: Vec<(u32, f64, u32)> = touched
                         .iter()
                         .filter(|&&cid| scratch.count(cid) as usize >= cfg.min_matched_peaks)
@@ -542,6 +681,134 @@ fn seed_fragindex_windows(
 /// Sage-style hyperscore: ln(matched!) + ln(1 + summed matched intensity).
 fn hyperscore(matched: u32, sum_obs: f64) -> f64 {
     ln_factorial(matched) + (1.0 + sum_obs).ln()
+}
+
+#[cfg(test)]
+mod survey_tests {
+    use super::{
+        has_stray_full_range_window, initial_scratch_width, label_column, window_survey,
+        FULL_RANGE_WINDOW,
+    };
+
+    fn window_width_stats(ranges: &[(u32, u32)]) -> (usize, Option<usize>) {
+        let s = window_survey(ranges);
+        (s.median, s.widest)
+    }
+
+    #[test]
+    fn window_width_stats_ignores_the_groups_this_band_does_not_serve() {
+        // A grouped search loads ONE m/z band of the library and sees the run's whole
+        // window list, so every group outside the band resolves to an empty candidate
+        // range. With 63 bands that is 62 empty groups against one real one; counting the
+        // empty groups as width 1 put the median at 1 (scratch sized to a single slot,
+        // resized on first use) and made `widest > 8 * median` true on every band, so the
+        // zero-width-isolation-window warning fired 63 times per run for a run with no such
+        // scan.
+        let mut ranges = vec![(0u32, 0u32); 62];
+        ranges.push((1000, 6000));
+        let (median, widest) = window_width_stats(&ranges);
+        assert_eq!((median, widest), (5001, Some(5001)));
+        // ... which is what the guard needs in order not to fire.
+        assert!(widest.unwrap() <= 8 * median);
+    }
+
+    #[test]
+    fn window_width_stats_is_the_median_of_the_served_groups_and_still_flags_an_outlier() {
+        // Widths 11, 11, 11, and one group covering the library: the median is still 11 and
+        // the outlier is still reported. Order-independent, and the empty groups mixed in
+        // change neither answer.
+        let ranges = [(0, 10), (100, 110), (0, 0), (50, 60), (0, 5_000_000)];
+        let (median, widest) = window_width_stats(&ranges);
+        assert_eq!((median, widest), (11, Some(5_000_001)));
+        assert!(widest.unwrap() > 8 * median);
+        // No group selects anything: nothing to size from, nothing to warn about.
+        assert_eq!(window_width_stats(&[(7, 7), (0, 0)]), (1, None));
+        assert_eq!(window_width_stats(&[]), (1, None));
+    }
+
+    #[test]
+    fn a_band_that_serves_one_group_of_many_is_not_sized_from_the_band_width() {
+        // `map_init` runs its initialiser once per rayon LEAF and before the leaf knows
+        // which groups it drew, so sizing the scratch from the served median would commit
+        // 16 B x band width on every leaf while only the leaf holding the one in-band group
+        // ever touches it. The correction to the median must not turn into that.
+        let mut banded = vec![(0u32, 0u32); 62];
+        banded.push((1000, 871_000));
+        let survey = window_survey(&banded);
+        assert_eq!((survey.served, survey.total), (1, 63));
+        assert_eq!(
+            survey.median, 870_001,
+            "the warning still reads the band width"
+        );
+        assert_eq!(
+            initial_scratch_width(&survey),
+            1,
+            "62 of 63 leaves would allocate a band they never probe"
+        );
+
+        // An ungrouped search serves every group, and there the eager size is what the
+        // leaf's first `accumulate` would have grown it to anyway.
+        let plain = window_survey(&[(0, 10), (100, 110), (50, 60)]);
+        assert_eq!((plain.served, plain.total), (3, 3));
+        assert_eq!(initial_scratch_width(&plain), 11);
+        // One dead window among live ones does not tip the majority.
+        let mostly = window_survey(&[(0, 10), (100, 110), (7, 7), (50, 60)]);
+        assert_eq!(initial_scratch_width(&mostly), 11);
+        // Nothing served at all: one slot, and `SeedScratch::ensure` never runs.
+        assert_eq!(initial_scratch_width(&window_survey(&[])), 1);
+    }
+
+    #[test]
+    fn a_stray_full_range_window_is_flagged_from_the_window_and_not_from_the_width() {
+        // convert maps a zero-width or missing isolation window to the full m/z range, so
+        // the malformed scan is visible in the window itself. The candidate-width ratio
+        // that used to carry this warning cannot see it under a grouped search: the
+        // full-range window resolves to the WHOLE loaded band, and so does the band's own
+        // isolation window, so the two served widths are equal and `widest > 8 * median`
+        // is false. The band below is 5,001 candidates wide and serves exactly those two
+        // groups.
+        let banded_ranges = [(1000u32, 6000u32), (1000, 6000)];
+        let banded = window_survey(&banded_ranges);
+        assert_eq!(banded.widest, Some(5001));
+        assert!(
+            banded.widest.unwrap() <= 8 * banded.median,
+            "the width ratio is silent on a band, which is the false negative"
+        );
+        // The window test is not, and it does not consult the library at all.
+        let mut banded_windows = vec![(500.0f64, 510.0f64); 62];
+        banded_windows.push(FULL_RANGE_WINDOW);
+        assert!(has_stray_full_range_window(&banded_windows));
+
+        // A genuine all-ion acquisition is every window full-range: legitimate, silent.
+        assert!(!has_stray_full_range_window(&[
+            FULL_RANGE_WINDOW,
+            FULL_RANGE_WINDOW
+        ]));
+        // An ordinary run has none.
+        assert!(!has_stray_full_range_window(&[
+            (500.0, 510.0),
+            (510.0, 520.0)
+        ]));
+        assert!(!has_stray_full_range_window(&[]));
+        // A wide-but-not-full window is not this warning's business; the width ratio keeps
+        // it.
+        assert!(!has_stray_full_range_window(&[
+            (500.0, 510.0),
+            (0.0, 2000.0)
+        ]));
+    }
+
+    #[test]
+    fn label_column_is_the_boolean_the_old_code_parsed_back_out_of_it() {
+        // The artifact text is unchanged, and the boolean the stage uses is now its source
+        // rather than its product: `is_decoy` -> column -> `l == "decoy"` is the identity.
+        let is_dec = [false, true, true, false];
+        let col = label_column(&is_dec);
+        assert_eq!(col, vec!["target", "decoy", "decoy", "target"]);
+        let round_trip: Vec<bool> = col.iter().map(|l| l == "decoy").collect();
+        assert_eq!(round_trip, is_dec);
+        assert!(label_column(&[]).is_empty());
+    }
 }
 
 #[cfg(test)]

@@ -334,7 +334,8 @@ pub fn run(p: RunParams) -> Result<()> {
                 lib_precursors: &lib_p,
                 lib_fragments: &lib_f,
                 out_dir: p.out_dir,
-                man: &mut man,
+                man: Some(&mut man),
+                shared_bands: None,
                 mh_heads,
                 library_input: p.lib_precursors.is_some(),
             })?;
@@ -542,6 +543,7 @@ pub fn run(p: RunParams) -> Result<()> {
             info!(stage = %"extract", "run: stage start");
             let (npsm, nchr) = extract::run(extract::ExtractParams {
                 fragment_offset: None,
+                sibling_bands: 1,
                 ms2: &co.ms2,
                 library_precursors: &lib_p,
                 library_fragments: &lib_f,

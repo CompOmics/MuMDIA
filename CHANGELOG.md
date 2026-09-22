@@ -59,6 +59,45 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ### Changed
 
+- **The engine holds far fewer heap blocks, because that, not memory, is what a banded
+  search runs out of.** A grouped search of a 203M-precursor library died at about 290 GB
+  resident with 1.7 TB free, reporting a failed 3 KB allocation. Sampled on the live
+  process at 180 GB it held 129,393 memory mappings of the kernel's 1,048,576 per-process
+  limit, 92,030 of them 64-256 KB and 36,368 of them 256 KB-1 MB: one heap block per item,
+  which mimalloc maps individually. Six subsystems now use flat buffers where they used a
+  block per row: the library's `label` column is read as one bit per row rather than one
+  `String` (203M blocks), compete groups PSMs through one sorted vector rather than a
+  `Vec` per competition group, features holds one buffer rather than a `Vec<f64>` per PSM
+  and dense ids rather than a `HashSet` per peptidoform, quant reads chromatograms into
+  flat buffers with an axis store rather than three blocks per row, and rescoring's
+  per-fold training matrix is one buffer rather than one per training row. Rescore also
+  stops materialising the engine's own feature matrix when a sidecar classifier will read
+  the handoff parquet instead, which at experiment scale is about 250 GB that need not
+  exist. Artifacts are unchanged except where noted below.
+- **Pooling a grouped run's bands is a byte copy.** The rows are already in the pooled
+  table's order and already encoded, so `pool` splices the bands' parquet column chunks
+  into the output and decodes only the row groups whose `candidate_id` statistics say they
+  hold a candidate the overlap dedup drops. Measured on one run of the production
+  experiment, 63 bands and 136 GB: 3 minutes 12 seconds at 2.6 GB resident, against
+  3.5 MB/s at 110% CPU before, which had reached 42.7 GB in 2 hours 50 minutes when it was
+  stopped, on a disk that reads 221 MB/s. The pooled tables hold the same rows in the same
+  order with the same values; their row groups are the bands' own, so their content hashes
+  differ from a re-encoded pool's.
+- **A grouped run no longer pools `psms_extracted`.** Its only reader is the candidate
+  audit, so it is pooled when `extract.emit_candidate_audit` is set and left per band
+  otherwise. The band tables are written either way.
+- **`groups.parallel` is clamped to one less than the thread count.** A band in flight
+  parks a rayon worker on its extraction's accumulation channel, so as many bands as
+  threads leaves no worker to feed them and the run deadlocks with no error and no output
+  (reproduced on the fixture at `parallel = 2, --threads 2`). A larger value now warns and
+  uses `threads - 1`.
+- **`psms_extracted.parquet` and `run_windows.parquet` change content hash.** `write_table`
+  now encodes in 65,536-row chunks instead of building one Arrow copy of the whole table,
+  and on a column that is entirely NULL -- `apex_im` and the three ion-mobility columns
+  always are -- the definition levels are run-encoded, which moves the writer's internal
+  mini-batch size and so the page framing. Measured at 196,615 rows: 16 bytes, with every
+  row, value and row-group boundary unchanged.
+
 - **Library writers emit fragment tables sorted by `candidate_id`.** `import_diann_lib.py`,
   `make_reverse_decoys.py` and `make_shift_decoys.py` finish with a streaming bucket sort
   (`_lib_io.sort_fragments_by_candidate`: partition by candidate-id range into temporary
@@ -71,6 +110,9 @@ than a number. Both are recorded in every run's `manifest.json`.
   filtered scan, with a warning.
 ### Added
 
+- **`mumdia pool` pools a grouped run's band artifacts from the command line.** `run` does
+  this itself at the end of a grouped search; standalone it is for the case where the
+  search finished and the run did not, which now costs a pool rather than a re-search.
 - **`groups.window_groups` searches a run one isolation-window group at a time.** The
   run's windows are cut, in ascending m/z, into contiguous groups whose library bands hold
   about the same number of precursors (planned from the precursor table's row-group

@@ -180,29 +180,29 @@ pub fn load_ms1(path: &str) -> Result<Vec<Ms1Scan>> {
         let mza = list_col(b, "mz")?;
         let ina = list_col(b, "intensity")?;
         for k in 0..mza.len() {
-            let mz: Vec<f32> = if mza.is_null(k) {
-                Vec::new()
-            } else {
-                let mv = mza.value(k);
-                inner_f32(&mv, "mz")?.values().to_vec()
-            };
-            let intensity: Vec<f32> = if ina.is_null(k) {
-                Vec::new()
-            } else {
-                let iv = ina.value(k);
-                inner_f32(&iv, "intensity")?.values().to_vec()
-            };
             // Truncate to the shorter list, as `load_ms2` does at :68. The two list
             // columns are decoded independently and either can be null, so a spectra
             // artifact whose m/z and intensity lists disagree in length would otherwise
             // be carried into `sum_near` and the MS1 isotope features, where the loop
             // bound comes from one array and the body indexes the other.
-            let n = mz.len().min(intensity.len());
+            //
+            // The length is taken from the decoded arrays before either is copied: each
+            // list was previously copied whole and then copied again truncated, which on a
+            // run with MS1 scans of tens of thousands of peaks is two allocations per scan
+            // per column that are freed immediately.
+            let mv = (!mza.is_null(k)).then(|| mza.value(k));
+            let iv = (!ina.is_null(k)).then(|| ina.value(k));
+            let mf = mv.as_ref().map(|v| inner_f32(v, "mz")).transpose()?;
+            let iff = iv.as_ref().map(|v| inner_f32(v, "intensity")).transpose()?;
+            let n = match (&mf, &iff) {
+                (Some(m), Some(x)) => m.len().min(x.len()),
+                _ => 0,
+            };
             out.push(Ms1Scan {
                 scan_index: scan_index[i],
                 rt_seconds: rt[i],
-                mz: mz[..n].to_vec(),
-                intensity: intensity[..n].to_vec(),
+                mz: mf.map(|m| m.values()[..n].to_vec()).unwrap_or_default(),
+                intensity: iff.map(|x| x.values()[..n].to_vec()).unwrap_or_default(),
             });
             i += 1;
         }
@@ -226,4 +226,38 @@ pub fn load_ms1(path: &str) -> Result<Vec<Ms1Scan>> {
         ],
     );
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mumdia_io::table::{write_table, Col};
+
+    /// The MS1 loader truncates a scan to the shorter of its two peak lists and keeps the
+    /// scans in retention-time order. Both are contracts the isotope features depend on:
+    /// they take the loop bound from one array and index the other.
+    #[test]
+    fn ms1_scans_are_rt_sorted_and_truncated_to_the_shorter_list() {
+        let dir = std::env::temp_dir().join(format!("mumdia_ms1_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ms1.parquet").to_str().unwrap().to_string();
+        write_table(
+            &path,
+            vec![
+                Col::U32("scan_index".into(), vec![7, 3]),
+                Col::F64("rt_seconds".into(), vec![20.0, 10.0]),
+                // The second scan carries one more intensity than it has m/z values.
+                Col::ListF32("mz".into(), vec![vec![100.0, 200.0], vec![300.0]]),
+                Col::ListF32("intensity".into(), vec![vec![1.0, 2.0], vec![3.0, 4.0]]),
+            ],
+        )
+        .unwrap();
+        let scans = load_ms1(&path).unwrap();
+        assert_eq!(scans.len(), 2);
+        assert_eq!(scans[0].scan_index, 3, "sorted by retention time");
+        assert_eq!(scans[0].mz, vec![300.0]);
+        assert_eq!(scans[0].intensity, vec![3.0], "truncated to the m/z count");
+        assert_eq!(scans[1].mz, vec![100.0, 200.0]);
+        assert_eq!(scans[1].intensity, vec![1.0, 2.0]);
+    }
 }

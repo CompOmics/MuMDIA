@@ -13,36 +13,40 @@
 //! Streaming: one batch is resident at a time per table, and the writer's row groups are
 //! capped, so the pooling costs one read and one write of the group artifacts and no more
 //! memory than any single stage.
+//!
+//! `psms_extracted` is pooled only when something reads it (the candidate audit). The
+//! extracted rows are already on disk per band; copying them into a run-level table that no
+//! stage opens was a full read and a full write of the run's widest non-chromatogram
+//! artifact.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 use std::time::Instant;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, bail, Result};
 use arrow::array::{Array, BooleanArray, UInt32Array};
 use arrow::compute::filter_record_batch;
-use arrow::record_batch::RecordBatch;
-use mumdia_io::table::{BatchWriter, TableFile};
+use mumdia_io::table::{BatchWriter, SpliceWriter, TableFile};
 use tracing::info;
 
 const BATCH_ROWS: usize = 1 << 16;
 const ROW_GROUP_ROWS: usize = 1 << 17;
 
-/// One group's artifacts and where its band starts in the library.
+/// One group's artifacts. The ids inside are already library-wide.
 #[derive(Clone, Debug)]
 pub struct BandArtifacts {
-    pub offset: u32,
     pub psms: String,
     pub chromatograms: String,
-    pub features: String,
     pub competed: String,
 }
 
 pub struct PoolParams<'a> {
     pub bands: &'a [BandArtifacts],
-    pub out_psms: &'a str,
+    /// Where to pool the extracted rows, or `None` to leave them per band. Nothing in the
+    /// pipeline reads this table -- features ran per band, and rescore reads the competed
+    /// one -- so the caller passes `None` unless the candidate audit is on, which is the
+    /// one consumer. The per-band tables are written either way.
+    pub out_psms: Option<&'a str>,
     pub out_chromatograms: &'a str,
-    pub out_features: &'a str,
     pub out_competed: &'a str,
 }
 
@@ -51,7 +55,6 @@ pub struct PoolParams<'a> {
 pub struct PoolStats {
     pub psms: u64,
     pub chromatograms: u64,
-    pub features: u64,
     pub competed: u64,
     /// Candidates that appeared in two bands and were kept from one.
     pub duplicates: u64,
@@ -81,10 +84,7 @@ fn overlap_losers(bands: &[BandArtifacts]) -> Result<(Vec<HashSet<u32>>, u64)> {
                 *e = *s;
             }
         }
-        for (local, s) in per_band {
-            let global = local
-                .checked_add(band.offset)
-                .ok_or_else(|| anyhow!("candidate id overflow pooling {}", band.competed))?;
+        for (global, s) in per_band {
             match best.get(&global) {
                 None => {
                     best.insert(global, (b, s));
@@ -92,10 +92,10 @@ fn overlap_losers(bands: &[BandArtifacts]) -> Result<(Vec<HashSet<u32>>, u64)> {
                 Some(&(prev_b, prev_s)) => {
                     duplicates += 1;
                     if s > prev_s {
-                        losers[prev_b].insert(global - bands[prev_b].offset);
+                        losers[prev_b].insert(global);
                         best.insert(global, (b, s));
                     } else {
-                        losers[b].insert(local);
+                        losers[b].insert(global);
                     }
                 }
             }
@@ -104,75 +104,116 @@ fn overlap_losers(bands: &[BandArtifacts]) -> Result<(Vec<HashSet<u32>>, u64)> {
     Ok((losers, duplicates))
 }
 
-/// Append every band's table into `out`, ids offset, losers dropped. Returns the row count.
-fn pool_table(paths: impl Iterator<Item = (String, u32, HashSet<u32>)>, out: &str) -> Result<u64> {
-    let mut writer: Option<BatchWriter> = None;
-    let mut schema: Option<Arc<arrow::datatypes::Schema>> = None;
+/// Append every band's table into `out`, losers dropped. Returns the row count.
+///
+/// The bands already wrote library-wide ids (`Library::global_offset` is added on the way
+/// out of extract), so pooling is a concatenation and almost every row group can be spliced
+/// into the output as bytes, without being decoded. That matters at scale: decoding and
+/// re-encoding one run's 68 GB of chromatograms ran at 3.5 MB/s on one core, five hours,
+/// against a disk that does 221 MB/s. Only the row groups that actually hold a dropped
+/// candidate are decoded, filtered and re-encoded, and window overlap puts those at the two
+/// ends of a band.
+fn pool_table(paths: impl Iterator<Item = (String, HashSet<u32>)>, out: &str) -> Result<u64> {
+    let paths: Vec<(String, HashSet<u32>)> = paths.collect();
+    let Some((template, _)) = paths.first() else {
+        bail!("pool: no group tables to pool into {out}");
+    };
+    let mut w = SpliceWriter::create(out, template)?;
     let mut rows = 0u64;
-    for (path, offset, drop) in paths {
-        let t = TableFile::open(&path)?;
-        let reader = t.batches(None, BATCH_ROWS)?;
-        let this_schema = reader.schema();
-        match &schema {
-            None => {
-                schema = Some(this_schema.clone());
-                writer = Some(BatchWriter::with_row_group_rows(
-                    out,
-                    this_schema.clone(),
-                    ROW_GROUP_ROWS,
-                )?);
-            }
-            Some(first) => {
-                if first.fields() != this_schema.fields() {
-                    bail!(
-                        "{path} has a different schema from the first pooled table; the group \
-                         artifacts must come from the same configuration"
-                    );
+    for (path, drop) in &paths {
+        if drop.is_empty() {
+            rows += w.append_row_groups(path, |_| true)?;
+            continue;
+        }
+        // Which row groups can hold a dropped id, from the statistics on candidate_id.
+        let t = TableFile::open(path)?;
+        let stats = t.row_group_stats("candidate_id")?;
+        let spans = SpliceWriter::row_group_spans(path)?;
+        if stats.len() != spans.len() {
+            bail!(
+                "{path}: {} row groups but {} statistics",
+                spans.len(),
+                stats.len()
+            );
+        }
+        let mut sorted: Vec<u32> = drop.iter().copied().collect();
+        sorted.sort_unstable();
+        let dirty: Vec<bool> = stats
+            .iter()
+            .map(|s| match (s.min, s.max) {
+                (Some(lo), Some(hi)) => {
+                    let at = sorted.partition_point(|&d| f64::from(d) < lo);
+                    at < sorted.len() && f64::from(sorted[at]) <= hi
                 }
+                // No statistics: assume it holds one and take the slow path.
+                _ => true,
+            })
+            .collect();
+        // File order is the pooled row order, so clean runs and dirty groups are appended as
+        // they come, not clean ones first.
+        let mut i = 0usize;
+        while i < spans.len() {
+            if dirty[i] {
+                rows += rewrite_row_group(&mut w, path, spans[i], drop)?;
+                i += 1;
+                continue;
             }
-        }
-        let cid_ix = this_schema
-            .index_of("candidate_id")
-            .map_err(|_| anyhow!("{path} has no candidate_id column"))?;
-        let w = writer.as_mut().expect("opened above");
-        for b in reader {
-            let b = b?;
-            let cid = b
-                .column(cid_ix)
-                .as_any()
-                .downcast_ref::<UInt32Array>()
-                .ok_or_else(|| anyhow!("{path}: candidate_id is not u32"))?;
-            if cid.null_count() > 0 {
-                bail!("{path}: candidate_id has nulls");
+            let start = i;
+            while i < spans.len() && !dirty[i] {
+                i += 1;
             }
-            let mut global = Vec::with_capacity(cid.len());
-            for &c in cid.values().iter() {
-                global.push(
-                    c.checked_add(offset)
-                        .ok_or_else(|| anyhow!("candidate id overflow pooling {path}"))?,
-                );
-            }
-            let mut cols = b.columns().to_vec();
-            cols[cid_ix] = Arc::new(UInt32Array::from(global));
-            let mut batch = RecordBatch::try_new(this_schema.clone(), cols)
-                .with_context(|| format!("rebuilding a batch of {path}"))?;
-            if !drop.is_empty() {
-                let keep: Vec<bool> = cid.values().iter().map(|c| !drop.contains(c)).collect();
-                batch = filter_record_batch(&batch, &BooleanArray::from(keep))?;
-            }
-            if batch.num_rows() > 0 {
-                w.write(&batch)?;
-                rows += batch.num_rows() as u64;
-            }
+            rows += w.append_row_groups(path, |k| k >= start && k < i)?;
         }
     }
-    match writer {
-        Some(w) => {
-            w.close()?;
-            Ok(rows)
-        }
-        None => bail!("pool: no group tables to pool into {out}"),
+    let spliced = w.close()?;
+    if spliced != rows {
+        bail!("pool: counted {rows} rows into {out} but the file holds {spliced}");
     }
+    Ok(rows)
+}
+
+/// Decode one row group, drop the losers, and splice the result back in. Used only for the
+/// row groups whose candidate range holds a dropped id.
+fn rewrite_row_group(
+    w: &mut SpliceWriter,
+    path: &str,
+    span: (usize, usize),
+    drop: &HashSet<u32>,
+) -> Result<u64> {
+    let (first_row, n_rows) = span;
+    let t = TableFile::open_rows(path, first_row, n_rows)?;
+    let reader = t.batches(None, BATCH_ROWS)?;
+    let schema = reader.schema();
+    let cid_ix = schema
+        .index_of("candidate_id")
+        .map_err(|_| anyhow!("{path} has no candidate_id column"))?;
+    let tmp = format!("{path}.pool-rg{first_row}.parquet");
+    let mut bw = BatchWriter::with_row_group_rows(&tmp, schema.clone(), ROW_GROUP_ROWS)?;
+    let mut kept = 0u64;
+    for b in reader {
+        let b = b?;
+        let cid = b
+            .column(cid_ix)
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .ok_or_else(|| anyhow!("{path}: candidate_id is not u32"))?;
+        if cid.null_count() > 0 {
+            bail!("{path}: candidate_id has nulls");
+        }
+        let keep: Vec<bool> = cid.values().iter().map(|c| !drop.contains(c)).collect();
+        let batch = filter_record_batch(&b, &BooleanArray::from(keep))?;
+        if batch.num_rows() > 0 {
+            bw.write(&batch)?;
+            kept += batch.num_rows() as u64;
+        }
+    }
+    bw.close()?;
+    let spliced = w.append_row_groups(&tmp, |_| true)?;
+    std::fs::remove_file(&tmp).ok();
+    if spliced != kept {
+        bail!("{path}: rewrote {kept} rows but spliced {spliced}");
+    }
+    Ok(kept)
 }
 
 pub fn run(p: PoolParams) -> Result<PoolStats> {
@@ -185,21 +226,23 @@ pub fn run(p: PoolParams) -> Result<PoolStats> {
         p.bands
             .iter()
             .zip(losers.iter())
-            .map(move |(b, l)| (pick(b).clone(), b.offset, l.clone()))
+            .map(move |(b, l)| (pick(b).clone(), l.clone()))
             .collect::<Vec<_>>()
     };
     let stats = PoolStats {
-        psms: pool_table(with(|b| &b.psms).into_iter(), p.out_psms)?,
+        psms: match p.out_psms {
+            Some(out) => pool_table(with(|b| &b.psms).into_iter(), out)?,
+            None => 0,
+        },
         chromatograms: pool_table(with(|b| &b.chromatograms).into_iter(), p.out_chromatograms)?,
-        features: pool_table(with(|b| &b.features).into_iter(), p.out_features)?,
         competed: pool_table(with(|b| &b.competed).into_iter(), p.out_competed)?,
         duplicates,
     };
     info!(
         groups = p.bands.len(),
         psms = stats.psms,
+        psms_pooled = p.out_psms.is_some(),
         chromatograms = stats.chromatograms,
-        features = stats.features,
         competed = stats.competed,
         duplicates,
         elapsed_ms = t0.elapsed().as_millis() as u64,
@@ -216,7 +259,7 @@ mod tests {
     fn band(
         dir: &std::path::Path,
         tag: &str,
-        offset: u32,
+        marker: f64,
         cids: &[u32],
         scores: &[f64],
     ) -> BandArtifacts {
@@ -230,8 +273,15 @@ mod tests {
                 Col::U32("candidate_id".into(), cids.to_vec()),
                 Col::F64(
                     "x".into(),
+                    cids.iter().map(|c| *c as f64 + marker).collect(),
+                ),
+                // A LargeList column, as the chromatogram table has: the distinction from
+                // `List` lives only in the file's Arrow metadata, which a spliced output has
+                // to carry over from the tables it was spliced from.
+                Col::LargeListF32(
+                    "trace".into(),
                     cids.iter()
-                        .map(|c| *c as f64 + offset as f64 * 0.001)
+                        .map(|c| vec![*c as f32, *c as f32 + 0.5])
                         .collect(),
                 ),
             ];
@@ -242,10 +292,8 @@ mod tests {
             p
         };
         BandArtifacts {
-            offset,
             psms: mk("psms", false),
             chromatograms: mk("chrom", false),
-            features: mk("feat", false),
             competed: mk("comp", true),
         }
     }
@@ -254,37 +302,174 @@ mod tests {
     fn pooled_tables_carry_global_ids_and_one_row_per_overlap_candidate() {
         let dir = std::env::temp_dir().join(format!("mumdia_pool_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        // Band 0: global 0..4; band 1: offset 3, local 0..3 = global 3..6. Globals 3 and 4
-        // are in both; band 0 wins 3 (higher score), band 1 wins 4.
-        let b0 = band(&dir, "b0", 0, &[0, 1, 2, 3, 4], &[9.0, 9.0, 9.0, 7.0, 2.0]);
-        let b1 = band(&dir, "b1", 3, &[0, 1, 2, 3], &[5.0, 6.0, 9.0, 9.0]);
+        // The bands already carry library-wide ids: band 0 holds 0..4, band 1 holds 3..6,
+        // so 3 and 4 are in both. Band 0 wins 3 (higher score), band 1 wins 4. The `x`
+        // marker says which band a row came from.
+        let b0 = band(
+            &dir,
+            "b0",
+            0.0,
+            &[0, 1, 2, 3, 4],
+            &[9.0, 9.0, 9.0, 7.0, 2.0],
+        );
+        let b1 = band(&dir, "b1", 0.003, &[3, 4, 5, 6], &[5.0, 6.0, 9.0, 9.0]);
         let out = |n: &str| {
             dir.join(format!("out_{n}.parquet"))
                 .to_str()
                 .unwrap()
                 .to_string()
         };
-        let (op, oc, of, ok) = (out("psms"), out("chrom"), out("feat"), out("comp"));
+        let (op, oc, ok) = (out("psms"), out("chrom"), out("comp"));
         let stats = run(PoolParams {
             bands: &[b0, b1],
-            out_psms: &op,
+            out_psms: Some(op.as_str()),
             out_chromatograms: &oc,
-            out_features: &of,
             out_competed: &ok,
         })
         .unwrap();
         assert_eq!(stats.duplicates, 2);
         assert_eq!(stats.competed, 7);
-        for path in [&op, &oc, &of, &ok] {
+        for path in [&op, &oc, &ok] {
             let t = TableFile::open(path).unwrap();
             let cid = t.u32("candidate_id").unwrap();
             assert_eq!(cid, vec![0, 1, 2, 3, 4, 5, 6], "{path}");
-            let x = t.f64("x").unwrap();
-            // Global 3 came from band 0 (x = 3.000), global 4 from band 1 (x = 1.003).
             assert!(
-                (x[3] - 3.0).abs() < 1e-9 && (x[4] - 1.003).abs() < 1e-9,
+                matches!(
+                    t.schema.field_with_name("trace").unwrap().data_type(),
+                    arrow::datatypes::DataType::LargeList(_)
+                ),
+                "{path}: the spliced table lost the LargeList type"
+            );
+            let x = t.f64("x").unwrap();
+            // Id 3 came from band 0 (x = 3.000), id 4 from band 1 (x = 4.003).
+            assert!(
+                (x[3] - 3.0).abs() < 1e-9 && (x[4] - 4.003).abs() < 1e-9,
                 "{path}: {x:?}"
             );
+        }
+    }
+
+    /// A band whose losers sit in one row group: the groups around it are spliced as bytes
+    /// and that one is decoded, filtered and re-encoded. The pooled table must still be the
+    /// bands' rows, in band order, in row order, with the losers gone -- the splice must not
+    /// reorder anything, and the mixed path must not drop or duplicate a group.
+    #[test]
+    fn a_band_of_many_row_groups_keeps_its_order_when_only_one_holds_a_loser() {
+        use mumdia_io::table::BatchWriter;
+        let dir = std::env::temp_dir().join(format!("mumdia_pool_rg_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // 500 rows in row groups of 50, so 10 groups; the losers are ids 220..230, which is
+        // group 4 alone.
+        let mk = |tag: &str, ids: std::ops::Range<u32>, score: f64| -> String {
+            let p = dir
+                .join(format!("{tag}.parquet"))
+                .to_str()
+                .unwrap()
+                .to_string();
+            let cids: Vec<u32> = ids.collect();
+            let n = cids.len();
+            let schema = std::sync::Arc::new(arrow::datatypes::Schema::new(vec![
+                arrow::datatypes::Field::new(
+                    "candidate_id",
+                    arrow::datatypes::DataType::UInt32,
+                    false,
+                ),
+                arrow::datatypes::Field::new(
+                    "prelim_score",
+                    arrow::datatypes::DataType::Float64,
+                    false,
+                ),
+            ]));
+            let mut w = BatchWriter::with_row_group_rows(&p, schema.clone(), 50).unwrap();
+            for chunk in cids.chunks(25) {
+                let batch = arrow::record_batch::RecordBatch::try_new(
+                    schema.clone(),
+                    vec![
+                        std::sync::Arc::new(UInt32Array::from(chunk.to_vec())),
+                        std::sync::Arc::new(arrow::array::Float64Array::from(vec![
+                            score;
+                            chunk.len()
+                        ])),
+                    ],
+                )
+                .unwrap();
+                w.write(&batch).unwrap();
+            }
+            w.close().unwrap();
+            assert_eq!(TableFile::open(&p).unwrap().nrows, n);
+            p
+        };
+        // Band 0 holds 0..500 and band 1 holds 220..230 with a higher score, so band 0
+        // loses exactly those ten, which live in one of its ten row groups.
+        let b0 = BandArtifacts {
+            psms: mk("rg_b0_psms", 0..500, 1.0),
+            chromatograms: mk("rg_b0_chrom", 0..500, 1.0),
+            competed: mk("rg_b0_comp", 0..500, 1.0),
+        };
+        let b1 = BandArtifacts {
+            psms: mk("rg_b1_psms", 220..230, 9.0),
+            chromatograms: mk("rg_b1_chrom", 220..230, 9.0),
+            competed: mk("rg_b1_comp", 220..230, 9.0),
+        };
+        let out = |n: &str| {
+            dir.join(format!("rg_out_{n}.parquet"))
+                .to_str()
+                .unwrap()
+                .to_string()
+        };
+        let (op, oc, ok) = (out("psms"), out("chrom"), out("comp"));
+        let stats = run(PoolParams {
+            bands: &[b0, b1],
+            out_psms: Some(op.as_str()),
+            out_chromatograms: &oc,
+            out_competed: &ok,
+        })
+        .unwrap();
+        assert_eq!(stats.duplicates, 10);
+        assert_eq!(stats.competed, 500);
+        let mut expect: Vec<u32> = (0..500).filter(|c| !(220..230).contains(c)).collect();
+        expect.extend(220..230);
+        for path in [&op, &oc, &ok] {
+            let t = TableFile::open(path).unwrap();
+            assert_eq!(t.u32("candidate_id").unwrap(), expect, "{path}");
+        }
+    }
+
+    #[test]
+    fn without_a_psms_path_the_other_tables_are_pooled_unchanged() {
+        let dir = std::env::temp_dir().join(format!("mumdia_pool_nopsms_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let b0 = band(
+            &dir,
+            "n0",
+            0.0,
+            &[0, 1, 2, 3, 4],
+            &[9.0, 9.0, 9.0, 7.0, 2.0],
+        );
+        let b1 = band(&dir, "n1", 0.003, &[3, 4, 5, 6], &[5.0, 6.0, 9.0, 9.0]);
+        let out = |n: &str| {
+            dir.join(format!("nopsms_{n}.parquet"))
+                .to_str()
+                .unwrap()
+                .to_string()
+        };
+        let (op, oc, ok) = (out("psms"), out("chrom"), out("comp"));
+        let stats = run(PoolParams {
+            bands: &[b0, b1],
+            out_psms: None,
+            out_chromatograms: &oc,
+            out_competed: &ok,
+        })
+        .unwrap();
+        // The skipped table is not written, and the pooled tables that are read downstream
+        // are exactly what they are when it is.
+        assert_eq!(stats.psms, 0);
+        assert!(!std::path::Path::new(&op).exists());
+        assert_eq!(stats.competed, 7);
+        assert_eq!(stats.duplicates, 2);
+        for path in [&oc, &ok] {
+            let t = TableFile::open(path).unwrap();
+            assert_eq!(t.u32("candidate_id").unwrap(), vec![0, 1, 2, 3, 4, 5, 6]);
         }
     }
 }

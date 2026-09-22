@@ -34,7 +34,7 @@ rayon = "1"
 clap = { version = "4", features = ["derive"] }
 arrow = { version = "59", features = ["prettyprint"] }
 # Pure-Rust build: drop C zlib-ng (needs cmake); SNAPPY codec is pure Rust.
-parquet = { version = "59", default-features = false, features = ["arrow", "snap"] }
+parquet = { version = "59", default-features = false, features = ["arrow", "snap", "zstd"] }
 # Pure-Rust zlib backend (miniz_oxide) instead of zlib-ng-compat (needs cmake).
 mzdata = { version = "0.66", default-features = false, features = ["mzml", "miniz_oxide"] }
 # Per-thread-arena allocator. The extraction accumulation is allocation-heavy and only

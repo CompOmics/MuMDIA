@@ -357,29 +357,30 @@ pub fn values(e: &Evidence) -> Vec<f64> {
     let m = matched.len();
     let (mut explained_variance_ratio, mut second_component_fraction) = (0.0, 0.0);
     if m >= 1 {
-        // Gram matrix G = X X^T over matched fragment peak traces (m x m).
-        let mut g = vec![vec![0.0f64; m]; m];
+        // Gram matrix G = X X^T over matched fragment peak traces (m x m), row-major in
+        // one buffer: `g[i * m + j]`. One allocation instead of m.
+        let mut g = vec![0.0f64; m * m];
         for i in 0..m {
             for j in i..m {
                 let d = dot(&e.traces[matched[i]], &e.traces[matched[j]]);
-                g[i][j] = d;
-                g[j][i] = d;
+                g[i * m + j] = d;
+                g[j * m + i] = d;
             }
         }
         let mut trace = 0.0;
-        for (i, row) in g.iter().enumerate().take(m) {
-            trace += row[i];
+        for i in 0..m {
+            trace += g[i * m + i];
         }
         if trace > 0.0 {
-            let (lam1, v1) = power_top(&g);
+            let (lam1, v1) = power_top(&g, m);
             explained_variance_ratio = (lam1 / trace).clamp(0.0, 1.0);
             // Deflate and extract the second eigenvalue.
             for i in 0..m {
                 for j in 0..m {
-                    g[i][j] -= lam1 * v1[i] * v1[j];
+                    g[i * m + j] -= lam1 * v1[i] * v1[j];
                 }
             }
-            let (lam2, _) = power_top(&g);
+            let (lam2, _) = power_top(&g, m);
             second_component_fraction = (lam2.max(0.0) / trace).clamp(0.0, 1.0);
         }
     }
@@ -544,20 +545,22 @@ fn mean_loo(e: &Evidence, set: &[usize], tp: usize) -> f64 {
     }
 }
 
-/// Top eigenvalue and (normalized) eigenvector of a symmetric matrix via power
-/// iteration. Returns (0.0, zeros) for an empty or degenerate matrix.
-fn power_top(g: &[Vec<f64>]) -> (f64, Vec<f64>) {
-    let m = g.len();
+/// Top eigenvalue and (normalized) eigenvector of a symmetric `m x m` matrix stored
+/// row-major in one buffer, via power iteration. Returns (0.0, zeros) for an empty or
+/// degenerate matrix.
+fn power_top(g: &[f64], m: usize) -> (f64, Vec<f64>) {
     if m == 0 {
         return (0.0, Vec::new());
     }
     let mut v = vec![1.0 / (m as f64).sqrt(); m];
+    // Two buffers reused across the 100 iterations; `nv` used to be a fresh allocation
+    // on every one of them.
+    let mut nv = vec![0.0f64; m];
     for _ in 0..100 {
-        let mut nv = vec![0.0f64; m];
         for i in 0..m {
             let mut s = 0.0;
             for j in 0..m {
-                s += g[i][j] * v[j];
+                s += g[i * m + j] * v[j];
             }
             nv[i] = s;
         }
@@ -568,14 +571,14 @@ fn power_top(g: &[Vec<f64>]) -> (f64, Vec<f64>) {
         for x in nv.iter_mut() {
             *x /= norm;
         }
-        v = nv;
+        std::mem::swap(&mut v, &mut nv);
     }
     // Rayleigh quotient: v is unit-norm, so lambda = v^T G v.
     let mut gv = vec![0.0f64; m];
     for i in 0..m {
         let mut s = 0.0;
         for j in 0..m {
-            s += g[i][j] * v[j];
+            s += g[i * m + j] * v[j];
         }
         gv[i] = s;
     }

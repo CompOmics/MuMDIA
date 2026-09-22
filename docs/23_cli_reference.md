@@ -46,6 +46,7 @@ Commands:
   sub-library     Subset a library to a set of candidates (a first pass's survivors, or prescan's), renumbered to the contiguous 0..n the fragment index requires
   extract         Targeted 3D extraction (peak-major cascade) -> psms_extracted, chromatograms
   features        Compute the minimal feature set -> features.parquet + PIN
+  pool            Pool a grouped run's band artifacts into the run-level tables
   compete         Keep the best candidate per competition group -> psms_competed.parquet
   rescore         Rescore + native target-decoy q-values -> psms_scored.parquet
   quant           Quantify identified peptides + roll up to protein groups
@@ -139,6 +140,7 @@ first sentence of the description, with the full text in the section below.
 | [`sub-library`](#sub-library) | yes | Subset a library to a set of candidates (a first pass's survivors, or prescan's), renumbered to the contiguous 0..n the fragment index requires |
 | [`extract`](#extract) | yes | Targeted 3D extraction (peak-major cascade) -> psms_extracted, chromatograms |
 | [`features`](#features) | yes | Compute the minimal feature set -> features.parquet + PIN |
+| [`pool`](#pool) | no | Pool a grouped run's band artifacts into the run-level tables |
 | [`compete`](#compete) | yes | Keep the best candidate per competition group -> psms_competed.parquet |
 | [`rescore`](#rescore) | yes | Rescore + native target-decoy q-values -> psms_scored.parquet |
 | [`quant`](#quant) | yes | Quantify identified peptides + roll up to protein groups |
@@ -157,8 +159,8 @@ first sentence of the description, with the full text in the section below.
 20 of the 23 documented subcommands accept `--config`:
  `align`, `compete`, `convert`, `digest`, `doctor`, `extract`, `features`, `mbr`, `peak-census`, `peptidoforms`, `predict-frag`, `prescan`, `quant`, `report`, `rescore`, `rt-im-train`, `run`, `run-experiment`, `search-seed`, `sub-library`.
 
-3 do not, so every setting they use comes from their own flags:
- `audit`, `inspect`, `quant-lfq`.
+4 do not, so every setting they use comes from their own flags:
+ `audit`, `inspect`, `pool`, `quant-lfq`.
 
 ## convert
 
@@ -404,6 +406,28 @@ Options:
       --out-pin <OUT_PIN>
 
       --config <CONFIG>
+```
+
+Plus the 5 repeated flags removed above: see "Global flags".
+
+## pool
+
+```text
+Pool a grouped run's band artifacts into the run-level tables.
+
+`run` does this itself at the end of a grouped search (`groups.window_groups`). Standalone it is for the case where the search finished and the run did not: the band directories hold everything, and pooling them is a byte copy of their parquet row groups, so a killed run costs a pool rather than a re-search.
+
+Usage: mumdia pool [OPTIONS] --groups-dir <GROUPS_DIR>
+
+Options:
+      --groups-dir <GROUPS_DIR>
+          The run's `groups/` directory, holding the `gNN/` band directories
+
+      --out-dir <OUT_DIR>
+          Where the pooled tables go. Default: the parent of `--groups-dir`, which is where a run writes them
+
+      --psms
+          Also pool `psms_extracted`, which only the candidate audit reads
 ```
 
 Plus the 5 repeated flags removed above: see "Global flags".
