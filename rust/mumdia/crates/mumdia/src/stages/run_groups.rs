@@ -8,8 +8,11 @@
 //! and competed, in a directory `groups/gNN/` under the run. Between the seeds and the RT
 //! model the seeds are pooled (`groups.calibration = global`), so every group's calibration
 //! is fitted on the whole run's anchors; `per_group` calibrates each group on its own.
-//! Groups run one after the other in this process (`groups.parallel` is reserved), so the
-//! resident set is one band's library, one band's hits and one band's accepted rows.
+//! `groups.parallel` bands run at a time in this process, so the resident set is that many
+//! bands' libraries, hits and accepted rows -- plus ONE copy of the run's spectra, which
+//! this module decodes once and lends to every band's seed and extract. Before that each
+//! band decoded them itself, twice: 63 bands were 126 decodes of a ~1 GB MS2 artifact and
+//! as many resident copies as there were bands in flight.
 
 use std::collections::BTreeMap;
 use std::time::Instant;
@@ -28,6 +31,8 @@ use tracing::info;
 use super::{compete, convert, extract, features, pool, rt_im_train, search_seed, seed_pool};
 use crate::groups;
 use crate::index::Library;
+use crate::spectra::{load_ms1, load_ms2, Ms1Scan};
+use mumdia_core::types::Ms2Scan;
 
 pub struct GroupRun<'a> {
     pub cfg: &'a Config,
@@ -141,6 +146,19 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
         }),
     )?;
 
+    // --- the run's spectra, decoded once for every band
+    // Each band searches the whole run and differs only in its slice of the library, so
+    // the scans are the same bytes for all of them. Both stages read them and neither
+    // writes: `load_ms2` has already RT-sorted, and the mass calibration is applied to
+    // the library m/z at probe time rather than by rewriting observed peaks.
+    info!(stage = %"load-ms2", "run: stage start");
+    let ms2_scans: Vec<Ms2Scan> = load_ms2(&g.converted.ms2)?;
+    info!(
+        scans = ms2_scans.len(),
+        bands = plan.bands.len(),
+        "groups: spectra decoded once and shared"
+    );
+
     // --- band files and seeds
     struct Band {
         index: usize,
@@ -227,6 +245,7 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
                 bucket_size: cfg.extract.bucket_size,
                 config_hash: ch,
                 fragment_offset: Some(first as u32),
+                ms2_scans: Some(&ms2_scans),
             })?;
             let rec = vec![record_artifact(
                 &format!("{}[g{:02}]", artifact::SEED_PSMS.0, b.index),
@@ -425,6 +444,13 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
     // --- windows, extract, features, compete per band
     let mut arts: Vec<pool::BandArtifacts> = Vec::new();
     let mut cals: Vec<(usize, String)> = Vec::new();
+    // MS1 is read by extract and not by the seed, so it is decoded here rather than beside
+    // the MS2 above: the retention-time phase between the two is where the DeepLC sidecar
+    // processes sit, and this keeps the MS1 buffer out of that peak. `extract` itself
+    // loaded it from the same path, so the failure on a missing or unreadable artifact is
+    // the same one, raised a moment earlier.
+    info!(stage = %"load-ms1", "run: stage start");
+    let ms1_scans: Vec<Ms1Scan> = load_ms1(&g.converted.ms1)?;
     // `groups.parallel` bands at a time. Each band in flight holds its own extraction
     // working set, so this chunk is what the stage's memory scales with; the artifacts are
     // pooled in band order regardless of which band finishes first.
@@ -481,6 +507,10 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
             config_hash: ch,
             fragment_offset: Some(b.offset),
             sibling_bands: par,
+            scans: Some(extract::SharedScans {
+                ms2: &ms2_scans,
+                ms1: &ms1_scans,
+            }),
         })?;
         recs.push(record_artifact(
             &format!("{}[g{:02}]", artifact::PSMS_EXTRACTED.0, b.index),

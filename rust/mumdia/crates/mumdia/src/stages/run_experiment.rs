@@ -227,6 +227,8 @@ fn process_run(
     let seed = d("seed_psms.parquet");
     search_seed::run(search_seed::SearchSeedParams {
         fragment_offset: None,
+        // One reader at a time, as in the ungrouped `run`.
+        ms2_scans: None,
         ms2: &co.ms2,
         library_precursors: lib_p_base,
         library_fragments: lib_f,
@@ -317,6 +319,7 @@ fn process_run(
     extract::run(extract::ExtractParams {
         fragment_offset: None,
         sibling_bands: 1,
+        scans: None,
         ms2: &co.ms2,
         library_precursors: &lib_p,
         library_fragments: lib_f,

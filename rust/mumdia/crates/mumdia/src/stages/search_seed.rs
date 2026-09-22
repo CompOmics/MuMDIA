@@ -37,6 +37,17 @@ pub struct SearchSeedParams<'a> {
     /// table at ids `offset..offset + n`. The seed table is then in band-local ids. `None`
     /// is the ordinary whole-library search.
     pub fragment_offset: Option<u32>,
+    /// This run's MS2 scans, already decoded. A grouped search
+    /// (`groups.window_groups > 1`) decodes the run once in `run_groups` and lends the
+    /// same buffer to every band, because every band re-reads the whole run and only the
+    /// library differs. `None` loads them from `ms2`, which is what a standalone
+    /// `mumdia search-seed` and an ungrouped `run` do.
+    ///
+    /// Borrowed, never owned, and the stage only reads them: `load_ms2` has already
+    /// sorted by retention time, and the mass recalibration this stage fits is written to
+    /// `<out>.masscal.json` rather than applied to the peaks. So no band can leave a
+    /// trace in the scans the next band sees.
+    pub ms2_scans: Option<&'a [Ms2Scan]>,
 }
 
 #[derive(Clone)]
@@ -77,7 +88,16 @@ pub fn run(p: SearchSeedParams) -> Result<u64> {
             build_bucketed,
         )?,
     };
-    let scans = load_ms2(p.ms2)?;
+    // Decoded here unless the caller lent its own copy (see `ms2_scans`). The owned
+    // buffer is declared first so it outlives the borrow.
+    let owned_scans: Vec<Ms2Scan>;
+    let scans: &[Ms2Scan] = match p.ms2_scans {
+        Some(s) => s,
+        None => {
+            owned_scans = load_ms2(p.ms2)?;
+            &owned_scans
+        }
+    };
     info!(
         candidates = lib.n_candidates(),
         scans = scans.len(),
@@ -102,10 +122,10 @@ pub fn run(p: SearchSeedParams) -> Result<u64> {
     // is bit-identical to the serial path via a deterministic per-candidate merge; the
     // bucketed path stays serial.
     let best: HashMap<u32, Best> = if let Some(idx) = fidx.as_ref() {
-        seed_fragindex_windows(idx, &scans, p.cfg)
+        seed_fragindex_windows(idx, scans, p.cfg)
     } else {
         let mut best: HashMap<u32, Best> = HashMap::new();
-        for scan in &scans {
+        for scan in scans {
             let (lo, hi) = lib.candidate_range(scan.window.lower_mz, scan.window.upper_mz);
             if hi <= lo {
                 continue;
@@ -199,7 +219,7 @@ pub fn run(p: SearchSeedParams) -> Result<u64> {
     // percentile of the centered deviations sets the tolerance. Written to
     // <seed>.masscal.json and consumed by extract.
     let mut scan_by_index: HashMap<u32, &mumdia_core::types::Ms2Scan> = HashMap::new();
-    for s in &scans {
+    for s in scans {
         scan_by_index.insert(s.scan_index, s);
     }
     let mut devs: Vec<f64> = Vec::new();

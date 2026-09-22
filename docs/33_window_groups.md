@@ -88,14 +88,60 @@ The stages then run unchanged on that table, as if it were the library:
   (local id plus `Library::global_offset`), so a band's table means the same thing as the
   run's and pooling is a concatenation.
 
-Nothing outside the band is resident during any of these. The converted spectra are read by
-each stage as they always are.
+Nothing outside the band is resident during any of these, except the run's spectra, which
+are decoded once for all the bands (next section).
 
 Under `experiment.rt_library_scope = first_run_only` the runs after the first reuse the first
 run's adapted bands, and then they reuse its band slices too: a slice is a deterministic
 function of the library and the row span, so rewriting it would produce the same bytes. Only
 the seed reads it, and the adapted table replaces it everywhere else. On a 203M-precursor
 library that is the whole precursor table not written, per run after the first.
+
+### The run's spectra, decoded once
+
+Every band searches the whole run and differs only in its slice of the library, so the
+scans are the same bytes for all of them. `run_groups` therefore decodes them once and
+lends the buffers to every band: MS2 before the seeding phase
+(`search_seed::SearchSeedParams::ms2_scans`), MS1 before the extraction phase
+(`extract::ExtractParams::scans`, which carries both). `None` there means "open the file
+yourself", which is what a standalone `mumdia search-seed` or `mumdia extract` and an
+ungrouped `run` still do.
+
+Both stages only read the scans. `load_ms2` and `load_ms1` sort by retention time before
+returning, and the per-run mass recalibration is applied to the library m/z at probe time
+(`MassOffset`, `Prober::probe`) rather than by rewriting observed peaks; the destructive
+peak-claim strategies rewrite the band's own `Hit` intensities, not the spectra. The
+integration tests assert this from the outside: the same extract and the same seed, once
+from the path and twice from one lent buffer, write byte-identical artifacts, and the lent
+buffer still equals a freshly decoded one afterwards.
+
+What it removes, for `m` bands with `p` of them in flight:
+
+| | decodes per run | resident copies at the peak |
+|---|---|---|
+| before | `2m` MS2, `m` MS1 | `p` MS2 while seeding, `p` (MS2 + MS1) while extracting |
+| after | 1 MS2, 1 MS1 | 1 MS2 + 1 MS1 |
+
+Measured on the fixture at `window_groups: 3, parallel: 2`: 6 MS2 decodes and 3 MS1
+decodes become 1 and 1, and the run's artifacts are byte-identical to the previous
+binary's (67 of 67 files; the five JSON sidecars that differ do so only in the recorded
+output directory, the binary path and `elapsed_ms`).
+
+At production scale one run's MS2 is about 1 GB decoded (301,127 scans on the immuno data,
+293,271 on the Astral data), and 63 bands were 126 decodes of it. The saving at the
+extraction peak scales with `groups.parallel` and the added cost does not: at `parallel: 8`
+the extraction phase holds 1 GB instead of 8, at `parallel: 48` (a 100-band run on a
+smaller library) 1 GB instead of 48, and in both cases the one new cost is the same single
+MS2 buffer held across the retention-time phase, where before nothing held one. That phase
+is where the DeepLC sidecar processes sit, which is why the MS1 buffer is decoded after it
+rather than beside the MS2.
+
+It also removes allocations, which is the failure the banding is up against: the engine
+dies at the kernel's per-process mapping limit (1,048,576; the live grouped run peaked at
+556,573 mappings and 244 GB). A decoded MS2 scan is two heap blocks, its `Vec<Peak>` and
+its id `String`, so one copy of a 301,127-scan run is about 602,000 blocks and eight
+concurrent copies about 4.8 million. How many of those become distinct mappings depends on
+the allocator's size classes and is not measured here; the block count is exact.
 
 ## 4. The seed pool and the two calibration modes
 

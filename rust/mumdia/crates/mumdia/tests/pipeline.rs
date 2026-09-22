@@ -3,8 +3,10 @@
 //! -> compete -> rescore chain directly on files, asserting the planted target
 //! is recovered and the output is reproducible.
 
+use mumdia::spectra::Ms1Scan;
 use mumdia::stages;
 use mumdia_core::config::Config;
+use mumdia_core::types::Ms2Scan;
 use mumdia_io::table::{write_table, Col, Table};
 
 fn tmp(name: &str) -> String {
@@ -171,6 +173,7 @@ fn run_extract(prec: &str, frag: &str, ms2: &str, win: &str, tag: &str) -> (Stri
     stages::extract::run(stages::extract::ExtractParams {
         fragment_offset: None,
         sibling_bands: 1,
+        scans: None,
         ms2,
         library_precursors: prec,
         library_fragments: frag,
@@ -428,4 +431,203 @@ fn features_chunking_is_value_preserving() {
             assert_eq!(xb, yb, "column '{name}' differs between chunk sizes");
         }
     }
+}
+
+/// A tiny MS1 artifact: two scans bracketing the MS2 retention times, carrying the
+/// precursor m/z and its first isotope so the MS1 features have something to read.
+fn craft_ms1() -> String {
+    let path = tmp("ms1.parquet");
+    write_table(
+        &path,
+        vec![
+            Col::U32("scan_index".into(), vec![100, 101]),
+            Col::F64("rt_seconds".into(), vec![105.0, 125.0]),
+            Col::ListF32(
+                "mz".into(),
+                vec![
+                    vec![499.0, 500.0, 500.5, 501.0],
+                    vec![499.0, 500.0, 500.5, 501.0],
+                ],
+            ),
+            Col::ListF32(
+                "intensity".into(),
+                vec![
+                    vec![10.0, 900.0, 400.0, 120.0],
+                    vec![12.0, 1100.0, 480.0, 140.0],
+                ],
+            ),
+        ],
+    )
+    .unwrap();
+    path
+}
+
+/// Field-by-field equality of two scan lists, including every peak. Used to assert that a
+/// stage handed a borrowed buffer leaves it exactly as it found it, which is the premise
+/// of sharing one decode across the bands of a grouped search: `load_ms2` sorts by
+/// retention time and the mass calibration is applied to the library m/z at probe time, so
+/// nothing writes to the scans.
+fn assert_scans_identical(after: &[Ms2Scan], fresh: &[Ms2Scan]) {
+    assert_eq!(after.len(), fresh.len(), "scan count changed");
+    for (a, b) in after.iter().zip(fresh) {
+        assert_eq!(a.scan_index, b.scan_index);
+        assert_eq!(a.id, b.id);
+        assert_eq!(a.rt_seconds.to_bits(), b.rt_seconds.to_bits());
+        assert_eq!(a.window, b.window);
+        assert_eq!(a.peaks, b.peaks, "peaks of scan {} changed", a.scan_index);
+    }
+}
+
+fn assert_ms1_identical(after: &[Ms1Scan], fresh: &[Ms1Scan]) {
+    assert_eq!(after.len(), fresh.len(), "MS1 scan count changed");
+    for (a, b) in after.iter().zip(fresh) {
+        assert_eq!(a.scan_index, b.scan_index);
+        assert_eq!(a.rt_seconds.to_bits(), b.rt_seconds.to_bits());
+        assert_eq!(a.mz, b.mz);
+        assert_eq!(a.intensity, b.intensity);
+    }
+}
+
+/// Extract must write the same bytes whether it decodes the spectra itself from `--ms2`
+/// and `--ms1` or is handed an already-decoded buffer, and two stages sharing one buffer
+/// must not see each other.
+///
+/// This pins the OLD behaviour: the arm with `scans: None` is exactly what every caller
+/// did before the buffer could be lent, and the shared arms have to match it byte for
+/// byte. It also pins the read-only premise the sharing rests on, by asserting the lent
+/// buffer still equals a freshly decoded one after two extracts have run over it.
+#[test]
+fn extract_from_a_shared_scan_buffer_is_byte_identical_and_read_only() {
+    let (prec, frag) = craft_library();
+    let ms2 = craft_ms2();
+    let ms1 = craft_ms1();
+    let win = craft_windows();
+    let cfg = Config::default();
+
+    let run_one = |shared: Option<stages::extract::SharedScans>, tag: &str| -> (String, String) {
+        let psms = tmp(&format!("psms_{tag}.parquet"));
+        let chrom = tmp(&format!("chrom_{tag}.parquet"));
+        stages::extract::run(stages::extract::ExtractParams {
+            fragment_offset: None,
+            sibling_bands: 1,
+            scans: shared,
+            ms2: &ms2,
+            library_precursors: &prec,
+            library_fragments: &frag,
+            run_windows: &win,
+            ms1: Some(&ms1),
+            mass_cal: None,
+            out_psms: &psms,
+            out_chrom: &chrom,
+            restrict_candidates: None,
+            cfg: &cfg.extract,
+            config_hash: "test",
+        })
+        .unwrap();
+        (psms, chrom)
+    };
+
+    // The old path: extract opens the files itself.
+    let (psms_own, chrom_own) = run_one(None, "own");
+
+    // One decode, lent to two extracts in a row, as a grouped run lends it to its bands.
+    let ms2_scans = mumdia::spectra::load_ms2(&ms2).unwrap();
+    let ms1_scans = mumdia::spectra::load_ms1(&ms1).unwrap();
+    let shared = stages::extract::SharedScans {
+        ms2: &ms2_scans,
+        ms1: &ms1_scans,
+    };
+    let (psms_a, chrom_a) = run_one(Some(shared), "shared_a");
+    let (psms_b, chrom_b) = run_one(Some(shared), "shared_b");
+
+    let h = |p: &str| mumdia_io::hash::blake3_file(p).unwrap();
+    assert_eq!(
+        h(&psms_own),
+        h(&psms_a),
+        "a lent scan buffer changed psms_extracted"
+    );
+    assert_eq!(h(&psms_a), h(&psms_b), "the second band saw a used buffer");
+    assert_eq!(
+        h(&chrom_own),
+        h(&chrom_a),
+        "a lent scan buffer changed the chromatograms"
+    );
+    assert_eq!(h(&chrom_a), h(&chrom_b));
+
+    assert_scans_identical(&ms2_scans, &mumdia::spectra::load_ms2(&ms2).unwrap());
+    assert_ms1_identical(&ms1_scans, &mumdia::spectra::load_ms1(&ms1).unwrap());
+
+    // Guard: the MS1 fixture has to reach the output, or the shared-MS1 half of this test
+    // would pass over a buffer nothing reads. Same extract without the MS1 artifact.
+    let psms_no_ms1 = tmp("psms_no_ms1.parquet");
+    let chrom_no_ms1 = tmp("chrom_no_ms1.parquet");
+    stages::extract::run(stages::extract::ExtractParams {
+        fragment_offset: None,
+        sibling_bands: 1,
+        scans: None,
+        ms2: &ms2,
+        library_precursors: &prec,
+        library_fragments: &frag,
+        run_windows: &win,
+        ms1: None,
+        mass_cal: None,
+        out_psms: &psms_no_ms1,
+        out_chrom: &chrom_no_ms1,
+        restrict_candidates: None,
+        cfg: &cfg.extract,
+        config_hash: "test",
+    })
+    .unwrap();
+    assert_ne!(
+        h(&psms_own),
+        h(&psms_no_ms1),
+        "the MS1 fixture does not reach psms_extracted, so sharing it is untested here"
+    );
+}
+
+/// The same contract for the seed search, whose artifacts are the PSM table and the mass
+/// calibration beside it. `<out>.report.json` is excluded on purpose: it records the
+/// stage's wall clock.
+#[test]
+fn search_seed_from_a_shared_scan_buffer_is_byte_identical_and_read_only() {
+    let (prec, frag) = craft_library();
+    let ms2 = craft_ms2_with_decoy(true);
+    let cfg = Config::default();
+
+    let run_one = |shared: Option<&[Ms2Scan]>, tag: &str| -> String {
+        let out = tmp(&format!("seed_{tag}.parquet"));
+        stages::search_seed::run(stages::search_seed::SearchSeedParams {
+            fragment_offset: None,
+            ms2_scans: shared,
+            ms2: &ms2,
+            library_precursors: &prec,
+            library_fragments: &frag,
+            out: &out,
+            cfg: &cfg.search_seed,
+            bucket_size: cfg.extract.bucket_size,
+            config_hash: "test",
+        })
+        .unwrap();
+        out
+    };
+
+    let own = run_one(None, "own");
+    let scans = mumdia::spectra::load_ms2(&ms2).unwrap();
+    let a = run_one(Some(&scans), "shared_a");
+    let b = run_one(Some(&scans), "shared_b");
+
+    let h = |p: &str| mumdia_io::hash::blake3_file(p).unwrap();
+    assert_eq!(h(&own), h(&a), "a lent scan buffer changed seed_psms");
+    assert_eq!(h(&a), h(&b), "the second band saw a used buffer");
+    assert_eq!(
+        std::fs::read(format!("{own}.masscal.json")).unwrap(),
+        std::fs::read(format!("{a}.masscal.json")).unwrap(),
+        "a lent scan buffer changed the mass calibration"
+    );
+    assert_eq!(
+        std::fs::read(format!("{a}.masscal.json")).unwrap(),
+        std::fs::read(format!("{b}.masscal.json")).unwrap()
+    );
+
+    assert_scans_identical(&scans, &mumdia::spectra::load_ms2(&ms2).unwrap());
 }

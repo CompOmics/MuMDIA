@@ -111,6 +111,33 @@ pub struct ExtractParams<'a> {
     /// (`groups.parallel`). The probing fan-out is this band's share of the thread pool,
     /// not the whole pool, because every band in flight computes it independently.
     pub sibling_bands: usize,
+    /// This run's MS2 and MS1 scans, already decoded. A grouped search
+    /// (`groups.window_groups > 1`) decodes the run once in `run_groups` and lends the
+    /// same buffers to every band, because every band re-reads the whole run and only the
+    /// library differs. `None` loads them from `ms2` / `ms1`, which is what a standalone
+    /// `mumdia extract` and an ungrouped `run` do.
+    ///
+    /// Borrowed, never owned, and the stage only reads them: the loaders have already
+    /// sorted by retention time, and the per-run mass recalibration is applied to the
+    /// library m/z at probe time (`MassOffset`, `Prober::probe`) rather than by rewriting
+    /// observed peaks. The destructive peak-claim strategies rewrite this band's own
+    /// `Hit` intensities, never `scans`. So no band can leave a trace in the scans the
+    /// next band sees.
+    ///
+    /// The two are one field because extract needs both or neither: a caller that shares
+    /// the MS2 buffer but lets extract re-decode the MS1 would keep the saving it came
+    /// for and lose half the mappings again.
+    pub scans: Option<SharedScans<'a>>,
+}
+
+/// One run's decoded spectra, lent to a stage instead of being re-decoded by it.
+///
+/// `ms1` is empty when the run has no MS1 artifact, which is the same thing
+/// `ExtractParams::ms1 = None` means.
+#[derive(Clone, Copy)]
+pub struct SharedScans<'a> {
+    pub ms2: &'a [Ms2Scan],
+    pub ms1: &'a [Ms1Scan],
 }
 
 /// One observed hit: scan RT, candidate-local fragment index, observed intensity
@@ -2068,10 +2095,20 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
         }
     }
 
-    let scans = load_ms2(p.ms2)?;
-    let ms1_scans: Vec<Ms1Scan> = match p.ms1 {
-        Some(path) => load_ms1(path)?,
-        None => Vec::new(),
+    // Decoded here unless the caller lent its own copies (see `ExtractParams::scans`).
+    // The owned buffers are declared first so they outlive the borrows.
+    let owned_ms2: Vec<Ms2Scan>;
+    let owned_ms1: Vec<Ms1Scan>;
+    let (scans, ms1_scans): (&[Ms2Scan], &[Ms1Scan]) = match p.scans {
+        Some(shared) => (shared.ms2, shared.ms1),
+        None => {
+            owned_ms2 = load_ms2(p.ms2)?;
+            owned_ms1 = match p.ms1 {
+                Some(path) => load_ms1(path)?,
+                None => Vec::new(),
+            };
+            (&owned_ms2, &owned_ms1)
+        }
     };
     let ms1_rts: Vec<f64> = ms1_scans.iter().map(|s| s.rt_seconds).collect();
     info!(
@@ -2084,7 +2121,7 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
     // Isolation-window -> sorted scan RTs, for zero-filled chromatogram grids.
     let windows: Vec<(f64, f64, Vec<f64>)> = if p.cfg.emit_window_grid {
         let mut tmp: HashMap<(u64, u64), Vec<f64>> = HashMap::new();
-        for s in &scans {
+        for s in scans {
             tmp.entry((s.window.lower_mz.to_bits(), s.window.upper_mz.to_bits()))
                 .or_default()
                 .push(s.rt_seconds);
@@ -2214,14 +2251,14 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
             // candidate out as soon as no later window can add a hit to it, so the whole
             // run's hits are never resident. Measured at 1.6 billion hits (35.9 GiB of
             // payload) on the HYE benchmark, which was 60% of extract's 61.3 GiB peak.
-            stream_groups = Some(window_groups(idx, &scans));
+            stream_groups = Some(window_groups(idx, scans));
         } else {
             let pr = Prober {
                 fidx: fidx.as_ref(),
                 lib: &lib,
                 frag_tol,
             };
-            for scan in &scans {
+            for scan in scans {
                 let (lo, hi) = lib.candidate_range(scan.window.lower_mz, scan.window.upper_mz);
                 if hi <= lo {
                     continue;
@@ -2322,11 +2359,11 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
         let (a, c) = extract_twopass_windows(
             fidx.as_ref(),
             &lib,
-            &scans,
+            scans,
             &rt_lo,
             &rt_hi,
             &rt_cal,
-            &ms1_scans,
+            ms1_scans,
             &ms1_rts,
             &mass_off,
             frag_tol,
@@ -2979,7 +3016,7 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
                     .iter()
                     .map(|&r| {
                         let j = nearest_index(&ms1_rts, r);
-                        sum_near(&ms1_scans[j].mz, &ms1_scans[j].intensity, mz, tol) as f32
+                        sum_near(&ms1_scans[j].mz, &ms1_scans[j].intensity, mz, tol)
                     })
                     .collect();
                 chrom_rows.push((cid, nm.to_string(), mz, mz, 0.0, grid_rt.clone(), ints));
@@ -3309,7 +3346,7 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
                         .expect("streamed path implies a fragment index"),
                     p.sibling_bands,
                     &groups[gi..upto],
-                    &scans,
+                    scans,
                     &rt_lo,
                     &rt_hi,
                     &mass_off,
@@ -3407,7 +3444,7 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
             if peakrank_c[i] != 0 {
                 continue;
             }
-            if let Some(si) = demix_apex_scan(&scans, &rt_scan, apexrt_c[i], mz_c[i]) {
+            if let Some(si) = demix_apex_scan(scans, &rt_scan, apexrt_c[i], mz_c[i]) {
                 by_scan.entry(si).or_default().push(cid_c[i]);
             }
         }
