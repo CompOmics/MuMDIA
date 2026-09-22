@@ -15,9 +15,13 @@ use arrow::array::{
 };
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use parquet::arrow::arrow_reader::{ParquetRecordBatchReaderBuilder, RowSelection, RowSelector};
+use parquet::arrow::arrow_reader::{
+    ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder, RowSelection,
+    RowSelector,
+};
 use parquet::arrow::ArrowWriter;
 use parquet::basic::{Compression, LogicalType};
+use parquet::file::metadata::ParquetMetaData;
 use parquet::file::properties::WriterProperties;
 use parquet::file::statistics::Statistics;
 
@@ -181,17 +185,20 @@ impl Col {
     }
 }
 
-/// Validate a set of typed columns and turn them into one Arrow schema + record batch.
-/// Shared by [`write_table`] (one batch = the whole table) and [`TableWriter`] (one batch
-/// per chunk), so both write paths declare a column identically.
-fn cols_to_batch(path: &str, cols: Vec<Col>) -> Result<(Arc<Schema>, RecordBatch)> {
+/// Validate a set of typed columns: at least one column, unique names, equal lengths.
+/// Returns the row count.
+///
+/// Split out of [`cols_to_batch`] so [`write_table`] can check the WHOLE column set once,
+/// before it starts consuming the columns chunk by chunk, and still report exactly the
+/// errors it always reported.
+fn validate_cols(path: &str, cols: &[Col]) -> Result<usize> {
     if cols.is_empty() {
         return Err(anyhow!("write_table: no columns for {path}"));
     }
     // Reject duplicate column names: Arrow allows them but readers resolve a
     // name to the first match, silently hiding the second column.
     let mut names = std::collections::HashSet::new();
-    for c in &cols {
+    for c in cols {
         if !names.insert(c.name()) {
             return Err(anyhow!(
                 "write_table: duplicate column '{}' for {path}",
@@ -200,7 +207,7 @@ fn cols_to_batch(path: &str, cols: Vec<Col>) -> Result<(Arc<Schema>, RecordBatch
         }
     }
     let nrows = cols[0].len();
-    for c in &cols {
+    for c in cols {
         if c.len() != nrows {
             return Err(anyhow!(
                 "write_table: column '{}' has {} rows, expected {}",
@@ -210,6 +217,14 @@ fn cols_to_batch(path: &str, cols: Vec<Col>) -> Result<(Arc<Schema>, RecordBatch
             ));
         }
     }
+    Ok(nrows)
+}
+
+/// Validate a set of typed columns and turn them into one Arrow schema + record batch.
+/// Shared by [`write_table`] (one batch per chunk) and [`TableWriter`] (one batch per
+/// caller chunk), so both write paths declare a column identically.
+fn cols_to_batch(path: &str, cols: Vec<Col>) -> Result<(Arc<Schema>, RecordBatch)> {
+    validate_cols(path, &cols)?;
     let fields: Vec<Field> = cols.iter().map(|c| c.field()).collect();
     let schema = Arc::new(Schema::new(fields));
     // Consume the columns so each Vec is moved into its Arrow array rather than
@@ -228,19 +243,87 @@ fn snappy_props(row_group_rows: Option<usize>) -> WriterProperties {
     b.build()
 }
 
+/// Rows per internal chunk in [`write_table`].
+///
+/// A multiple of the parquet writer's 1,024-value write batch, so the encoder sees the
+/// same sequence of mini-batches it would see from one big batch, and a divisor of the
+/// writer's default 1,048,576-row row group, so the row-group boundaries are where they
+/// were. 65,536 rows is ~0.5 MB for an f64 column and ~1.5 MB for a string column.
+const WRITE_TABLE_CHUNK_ROWS: usize = 1 << 16;
+
+/// One column of [`write_table`] mid-flight: the source `Vec` turned into an iterator so
+/// each chunk MOVES its rows out of it. A `String` or an inner `Vec<f32>` is handed to the
+/// chunk and freed with the chunk's Arrow arrays, rather than every column being copied
+/// into Arrow in full while the source is still resident.
+macro_rules! col_chunks {
+    ($($v:ident => $t:ty),+ $(,)?) => {
+        enum ColChunks { $($v(String, std::vec::IntoIter<$t>)),+ }
+
+        impl ColChunks {
+            fn of(c: Col) -> ColChunks {
+                match c { $(Col::$v(n, v) => ColChunks::$v(n, v.into_iter())),+ }
+            }
+
+            /// The next `k` rows as a `Col` of the same variant and name. Fewer than `k`
+            /// only when the column is exhausted, which `write_table` never asks for.
+            fn take(&mut self, k: usize) -> Col {
+                match self {
+                    $(ColChunks::$v(n, it) => Col::$v(n.clone(), it.by_ref().take(k).collect())),+
+                }
+            }
+        }
+    };
+}
+
+col_chunks!(
+    I64 => i64,
+    I32 => i32,
+    U32 => u32,
+    F64 => f64,
+    F32 => f32,
+    Bool => bool,
+    Str => String,
+    OptF64 => Option<f64>,
+    OptF32 => Option<f32>,
+    OptI32 => Option<i32>,
+    OptStr => Option<String>,
+    ListF32 => Vec<f32>,
+    ListF64 => Vec<f64>,
+    LargeListF32 => Vec<f32>,
+);
+
 /// Write columns to a Parquet file. Returns the row count. All columns must
 /// share the same length.
+///
+/// The columns are validated as a set, then encoded in [`WRITE_TABLE_CHUNK_ROWS`] chunks
+/// through [`TableWriter`]. Building ONE record batch for the whole table first, as this
+/// used to, meant a second full Arrow copy of every column existed beside the source
+/// vectors: on a wide artifact that is a second copy of the whole table, and each column
+/// is one very large heap block, which on a grouped run is what the per-process mapping
+/// limit counts. Chunking holds one chunk's Arrow arrays instead.
+///
+/// Rows are written in order and row groups still fall where the parquet writer's default
+/// 1,048,576-row maximum puts them (the writer accumulates across chunks; the chunk size
+/// divides it), so the file is the same file:
+/// `write_table_matches_one_batch_byte_for_byte_on_scalars` asserts exactly that, and
+/// `..._row_for_row_on_lists` asserts the rows where the encoder's page boundaries are its
+/// own business.
 pub fn write_table(path: &str, cols: Vec<Col>) -> Result<u64> {
-    let (schema, batch) = cols_to_batch(path, cols)?;
-    let nrows = batch.num_rows();
-    let target = AtomicPath::new(path)?;
-    let file = std::fs::File::create(target.tmp())
-        .with_context(|| format!("creating {}", target.tmp().display()))?;
-    let mut writer = ArrowWriter::try_new(file, schema, Some(snappy_props(None)))?;
-    writer.write(&batch)?;
-    writer.close()?;
-    target.publish()?;
-    Ok(nrows as u64)
+    let nrows = validate_cols(path, &cols)?;
+    let mut chunks: Vec<ColChunks> = cols.into_iter().map(ColChunks::of).collect();
+    let mut w = TableWriter::new(path);
+    let mut written = 0usize;
+    loop {
+        let k = (nrows - written).min(WRITE_TABLE_CHUNK_ROWS);
+        // A zero-row table still writes its one empty chunk, which fixes the schema, so
+        // an empty artifact keeps its columns.
+        w.write_cols(chunks.iter_mut().map(|c| c.take(k)).collect())?;
+        written += k;
+        if written >= nrows {
+            break;
+        }
+    }
+    w.close()
 }
 
 /// Incremental typed writer: the chunked counterpart of [`write_table`]. Feed `Vec<Col>`
@@ -697,6 +780,18 @@ impl Table {
         Ok(out)
     }
 
+    /// A string column as `column == value`, row by row: exactly
+    /// `self.str(name)?.iter().map(|s| s == value).collect()`, without building the
+    /// `String`s. See [`TableFile::str_eq`] for what that costs on a two-valued column.
+    pub fn str_eq(&self, name: &str, value: &str) -> Result<Vec<bool>> {
+        let i = self.idx(name)?;
+        let mut out = Vec::with_capacity(self.nrows);
+        for b in &self.batches {
+            push_str_eq(&mut out, b.column(i), name, value)?;
+        }
+        Ok(out)
+    }
+
     pub fn opt_f64(&self, name: &str) -> Result<Vec<Option<f64>>> {
         let i = self.idx(name)?;
         let mut out = Vec::with_capacity(self.nrows);
@@ -876,6 +971,44 @@ fn push_str(out: &mut Vec<String>, col: &ArrayRef, name: &str) -> Result<()> {
             return Err(reject_null(name, out.len()));
         }
         out.push(a.value(k).to_string());
+    }
+    Ok(())
+}
+
+/// Flat layout: one `String` of concatenated values plus `offsets` (row `r` is
+/// `data[offsets[r]..offsets[r + 1]]`). One allocation instead of one per row. Same null
+/// policy as `push_str`: a NULL in a required column is an error.
+fn push_str_flat(
+    offsets: &mut Vec<usize>,
+    data: &mut String,
+    col: &ArrayRef,
+    name: &str,
+) -> Result<()> {
+    let a: &StringArray = downcast(col, name, "utf8")?;
+    if offsets.is_empty() {
+        offsets.push(0);
+    }
+    for k in 0..a.len() {
+        if a.is_null(k) {
+            // `offsets` holds one entry per row pushed plus the leading 0, so this is the
+            // same absolute row `push_str` would name.
+            return Err(reject_null(name, offsets.len() - 1));
+        }
+        data.push_str(a.value(k));
+        offsets.push(data.len());
+    }
+    Ok(())
+}
+
+/// The equality test of `push_str`'s output against `value`, without the `String` per row.
+/// Same null policy: a NULL in a required column is an error, not `false`.
+fn push_str_eq(out: &mut Vec<bool>, col: &ArrayRef, name: &str, value: &str) -> Result<()> {
+    let a: &StringArray = downcast(col, name, "utf8")?;
+    for k in 0..a.len() {
+        if a.is_null(k) {
+            return Err(reject_null(name, out.len()));
+        }
+        out.push(a.value(k) == value);
     }
     Ok(())
 }
@@ -1071,6 +1204,19 @@ pub struct TableFile {
     pub schema: Arc<Schema>,
     /// Row count from the parquet footer, or the span's row count for a partial open.
     pub nrows: usize,
+    /// The parsed parquet footer, held for the life of the handle.
+    ///
+    /// Every reader this handle builds reuses it instead of re-reading and re-parsing the
+    /// footer from disk, which is what [`ParquetRecordBatchReaderBuilder::try_new`] does
+    /// each time it is called. The footer is not small on the library tables -- a
+    /// 1.7-billion-row fragment table has ~13,000 row groups, and one
+    /// `ColumnChunkMetaData` with statistics per column per group -- and it was being
+    /// parsed once per open, once per `row_group_stats` and once per typed getter, so
+    /// reading nine columns of one band cost ten parses. Measured on a 13,000-row-group,
+    /// six-column, 1.3-million-row file: 26.6 ms per parse against 118 ms for the whole f64
+    /// column, so every getter was paying about a fifth of its own cost again for a footer
+    /// it already had. Cloning it into a span ([`TableFile::span`]) is an `Arc` clone.
+    meta: ArrowReaderMetadata,
     /// `Some` when the table was opened on a row span ([`TableFile::open_rows`]): the row
     /// groups that cover the span and the selection that trims them to it. Every getter and
     /// batch reader applies it, so a partial table behaves as a smaller file.
@@ -1108,17 +1254,20 @@ impl RowGroupStats {
 }
 
 impl TableFile {
-    /// Open `path` and read its footer. No column data is decoded.
+    /// Open `path` and read its footer. No column data is decoded. The parsed footer is
+    /// kept on the handle, so every getter, batch reader and [`TableFile::span`] taken
+    /// from it reads the file without parsing the footer again.
     pub fn open(path: &str) -> Result<TableFile> {
         let file = std::fs::File::open(path).with_context(|| format!("opening {path}"))?;
-        let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+        let meta = ArrowReaderMetadata::load(&file, ArrowReaderOptions::default())
             .with_context(|| format!("reading parquet footer {path}"))?;
-        let nrows = builder.metadata().file_metadata().num_rows().max(0) as usize;
-        let schema = builder.schema().clone();
+        let nrows = meta.metadata().file_metadata().num_rows().max(0) as usize;
+        let schema = meta.schema().clone();
         Ok(TableFile {
             path: path.to_string(),
             schema,
             nrows,
+            meta,
             selection: None,
         })
     }
@@ -1132,10 +1281,26 @@ impl TableFile {
     /// are ordered by m/z with row-aligned ids, so an isolation-window group is a row span,
     /// and the group's search never holds the rest of the library.
     pub fn open_rows(path: &str, first_row: usize, n_rows: usize) -> Result<TableFile> {
-        let file = std::fs::File::open(path).with_context(|| format!("opening {path}"))?;
-        let builder = ParquetRecordBatchReaderBuilder::try_new(file)
-            .with_context(|| format!("reading parquet footer {path}"))?;
-        let meta = builder.metadata();
+        TableFile::open(path)?.span(first_row, n_rows)
+    }
+
+    /// The row span `[first_row, first_row + n_rows)` of an ALREADY-OPEN handle, reusing
+    /// the footer this handle has already parsed. [`TableFile::open_rows`] is this plus the
+    /// open, and is the right call for a single span; this is the right call for a grouped
+    /// search, which cuts one library into many bands and would otherwise re-read and
+    /// re-parse a ~13,000-row-group footer for each band of each stage.
+    ///
+    /// Spans do not nest: take every span from the whole-file handle.
+    pub fn span(&self, first_row: usize, n_rows: usize) -> Result<TableFile> {
+        if self.selection.is_some() {
+            anyhow::bail!(
+                "TableFile::span: {} is already a row span; take spans from the whole-file \
+                 handle so their rows are file rows",
+                self.path
+            );
+        }
+        let path = &self.path;
+        let meta: &ParquetMetaData = self.meta.metadata();
         let total = meta.file_metadata().num_rows().max(0) as usize;
         if first_row.saturating_add(n_rows) > total {
             anyhow::bail!(
@@ -1161,9 +1326,10 @@ impl TableFile {
         }
         let skip_after = covered.saturating_sub(skip_before + n_rows);
         Ok(TableFile {
-            path: path.to_string(),
-            schema: builder.schema().clone(),
+            path: self.path.clone(),
+            schema: self.schema.clone(),
             nrows: n_rows,
+            meta: self.meta.clone(),
             selection: Some(RowSpan {
                 row_groups,
                 skip_before,
@@ -1174,15 +1340,15 @@ impl TableFile {
     }
 
     /// Row count and min/max statistics of a numeric column per row group, in file order,
-    /// from the footer alone. Integer and floating columns are reported as f64; unsigned
-    /// integers are read back through their logical type so a value above `i32::MAX` is not
-    /// returned as its two's-complement image.
+    /// from the footer this handle already holds -- no file access at all. Integer and
+    /// floating columns are reported as f64; unsigned integers are read back through their
+    /// logical type so a value above `i32::MAX` is not returned as its two's-complement
+    /// image.
+    ///
+    /// On a span handle these are the statistics of the WHOLE file, as they always were:
+    /// the caller plans a span from them.
     pub fn row_group_stats(&self, name: &str) -> Result<Vec<RowGroupStats>> {
-        let file =
-            std::fs::File::open(&self.path).with_context(|| format!("opening {}", self.path))?;
-        let builder = ParquetRecordBatchReaderBuilder::try_new(file)
-            .with_context(|| format!("reading parquet footer {}", self.path))?;
-        let meta = builder.metadata();
+        let meta: &ParquetMetaData = self.meta.metadata();
         let mut out = Vec::with_capacity(meta.num_row_groups());
         for i in 0..meta.num_row_groups() {
             let rg = meta.row_group(i);
@@ -1261,9 +1427,11 @@ impl TableFile {
     pub fn batches(&self, columns: Option<&[&str]>, batch_size: usize) -> Result<BatchReader> {
         let file =
             std::fs::File::open(&self.path).with_context(|| format!("opening {}", self.path))?;
-        let mut builder = ParquetRecordBatchReaderBuilder::try_new(file)
-            .with_context(|| format!("reading parquet {}", self.path))?
-            .with_batch_size(batch_size.max(1));
+        // The footer this handle parsed at `open`, not a fresh parse: a typed getter is one
+        // call to this, and a stage reads a dozen columns.
+        let mut builder =
+            ParquetRecordBatchReaderBuilder::new_with_metadata(file, self.meta.clone())
+                .with_batch_size(batch_size.max(1));
         if let Some(span) = &self.selection {
             // The selection counts rows of the SELECTED row groups only, front to back, so
             // it is skip / take / skip over exactly the groups named here.
@@ -1380,6 +1548,24 @@ impl TableFile {
         Ok(out)
     }
 
+    /// A string column as `column == value`, row by row: exactly
+    /// `self.str(name)?.iter().map(|s| s == value).collect()`, without building the
+    /// `String`s.
+    ///
+    /// For the two-valued columns -- `label` is "target" or "decoy" on every row of a
+    /// 203-million-row precursor table -- `str` returns one `String` per row: a 24-byte
+    /// spine plus its own heap block, so about 4.9 GB of spine and 203 million live
+    /// allocations to carry one bit per row. This returns the bit: one byte per row and one
+    /// allocation. The null policy is `str`'s, so a NULL is still refused rather than
+    /// quietly reading as `false`.
+    pub fn str_eq(&self, name: &str, value: &str) -> Result<Vec<bool>> {
+        let mut out = Vec::with_capacity(self.nrows);
+        for b in self.column(name, SCALAR_BATCH_ROWS)? {
+            push_str_eq(&mut out, b?.column(0), name, value)?;
+        }
+        Ok(out)
+    }
+
     pub fn opt_f64(&self, name: &str) -> Result<Vec<Option<f64>>> {
         let mut out = Vec::with_capacity(self.nrows);
         for b in self.column(name, SCALAR_BATCH_ROWS)? {
@@ -1395,6 +1581,27 @@ impl TableFile {
             push_list_f32(&mut out, b?.column(0), name)?;
         }
         Ok(out)
+    }
+
+    /// Read a string column into one buffer plus `nrows + 1` byte offsets (row `r` is
+    /// `data[offsets[r]..offsets[r + 1]]`, always a char boundary because whole values are
+    /// concatenated): one allocation for the column instead of one `String` per row.
+    ///
+    /// The counterpart of [`TableFile::list_f32_flat`] for the high-cardinality string
+    /// columns, where an equality test will not do. `peptidoform` and `protein` on a
+    /// 203-million-row precursor library are 203 million live allocations and 4.9 GB of
+    /// `String` spine through [`TableFile::str`] before a byte of text; here they are one
+    /// `Vec` and one `String`. Same null policy as `str`.
+    pub fn str_flat(&self, name: &str) -> Result<(Vec<usize>, String)> {
+        let mut offsets = Vec::with_capacity(self.nrows + 1);
+        let mut data = String::new();
+        for b in self.column(name, SCALAR_BATCH_ROWS)? {
+            push_str_flat(&mut offsets, &mut data, b?.column(0), name)?;
+        }
+        if offsets.is_empty() {
+            offsets.push(0);
+        }
+        Ok((offsets, data))
     }
 
     /// Read an f32 list column into one flat values buffer plus `nrows + 1` offsets
@@ -1551,6 +1758,186 @@ mod projection_tests {
         assert!(proj.f32("skip_me").is_err());
         assert!(full.f32("skip_me").is_ok());
         std::fs::remove_file(p).ok();
+    }
+}
+
+#[cfg(test)]
+mod write_chunking_tests {
+    use super::*;
+
+    fn tmp(name: &str) -> String {
+        let dir = std::env::temp_dir().join(format!("mumdia_table_chunk_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join(name).to_str().unwrap().to_string()
+    }
+
+    /// Scalars and a string column: one value per row per column, so the parquet encoder
+    /// sees the same 1,024-value mini-batches whether the rows arrive in one batch or in
+    /// chunks that are multiples of 1,024.
+    fn scalar_cols(n: usize) -> Vec<Col> {
+        vec![
+            Col::U32("id".into(), (0..n as u32).collect()),
+            Col::F64("mz".into(), (0..n).map(|i| i as f64 * 1.5 - 3.0).collect()),
+            Col::F32("irt".into(), (0..n).map(|i| (i % 977) as f32).collect()),
+            Col::Bool("flag".into(), (0..n).map(|i| i % 3 == 0).collect()),
+            Col::Str(
+                "label".into(),
+                (0..n)
+                    .map(|i| if i % 2 == 0 { "target" } else { "decoy" }.to_string())
+                    .collect(),
+            ),
+            Col::OptF64(
+                "cal".into(),
+                (0..n)
+                    .map(|i| (i % 5 != 2).then_some(i as f64 * 0.25))
+                    .collect(),
+            ),
+        ]
+    }
+
+    fn list_cols(n: usize) -> Vec<Col> {
+        vec![
+            Col::U32("id".into(), (0..n as u32).collect()),
+            Col::ListF32(
+                "trace".into(),
+                (0..n)
+                    .map(|i| (0..(i % 7)).map(|k| k as f32 + i as f32).collect())
+                    .collect(),
+            ),
+            Col::LargeListF32(
+                "rt".into(),
+                (0..n)
+                    .map(|i| (0..(i % 5)).map(|k| k as f32 * 0.5).collect())
+                    .collect(),
+            ),
+        ]
+    }
+
+    /// The pre-change write path, verbatim: validate, build ONE record batch for the whole
+    /// table, write it with the same Snappy properties.
+    fn write_one_batch(path: &str, cols: Vec<Col>) {
+        let (schema, batch) = cols_to_batch(path, cols).unwrap();
+        write_batches(path, schema, &[batch]).unwrap();
+    }
+
+    /// `write_table` now encodes in 65,536-row chunks. On scalar columns that must produce
+    /// the same FILE, not merely the same values: the chunk size divides the writer's
+    /// 1,048,576-row row group, so the row groups fall where they fell, and it is a
+    /// multiple of the 1,024-value write batch, so the pages do too.
+    #[test]
+    fn write_table_matches_one_batch_byte_for_byte_on_scalars() {
+        let n = 3 * WRITE_TABLE_CHUNK_ROWS + 7; // several chunks and a short last one
+        let chunked = tmp("scalars_chunked.parquet");
+        let once = tmp("scalars_once.parquet");
+        assert_eq!(write_table(&chunked, scalar_cols(n)).unwrap(), n as u64);
+        write_one_batch(&once, scalar_cols(n));
+        assert_eq!(
+            std::fs::read(&chunked).unwrap(),
+            std::fs::read(&once).unwrap(),
+            "chunked write_table must produce the same parquet file as the single-batch write"
+        );
+        // And the row groups are the writer's default, not one per chunk.
+        let meta = TableFile::open(&chunked).unwrap();
+        assert_eq!(
+            meta.row_group_stats("id").unwrap().len(),
+            1,
+            "{n} rows is one 1,048,576-row row group, chunked or not"
+        );
+        assert_eq!(meta.nrows, n);
+        std::fs::remove_file(&chunked).ok();
+        std::fs::remove_file(&once).ok();
+    }
+
+    /// List columns hold a variable number of leaf values per row, so a row-chunk boundary
+    /// need not fall on a 1,024-level mini-batch boundary and the data pages could in
+    /// principle be cut elsewhere. The contract there is the rows: same order, same values,
+    /// same row groups. (Measured on parquet 59.3.0 the files came out byte-identical here
+    /// too, at 0-6 and at 0-136 values per row, but that is the encoder's business, not a
+    /// promise this layer makes.)
+    #[test]
+    fn write_table_matches_one_batch_row_for_row_on_lists() {
+        let n = WRITE_TABLE_CHUNK_ROWS + 1_234;
+        let chunked = tmp("lists_chunked.parquet");
+        let once = tmp("lists_once.parquet");
+        write_table(&chunked, list_cols(n)).unwrap();
+        write_one_batch(&once, list_cols(n));
+        let (a, b) = (Table::read(&chunked).unwrap(), Table::read(&once).unwrap());
+        assert_eq!(a.schema, b.schema);
+        assert_eq!(a.nrows, n);
+        assert_eq!(a.u32("id").unwrap(), b.u32("id").unwrap());
+        assert_eq!(a.list_f32("trace").unwrap(), b.list_f32("trace").unwrap());
+        assert_eq!(a.list_f32("rt").unwrap(), b.list_f32("rt").unwrap());
+        assert_eq!(
+            TableFile::open(&chunked)
+                .unwrap()
+                .row_group_stats("id")
+                .unwrap()
+                .len(),
+            TableFile::open(&once)
+                .unwrap()
+                .row_group_stats("id")
+                .unwrap()
+                .len()
+        );
+        std::fs::remove_file(&chunked).ok();
+        std::fs::remove_file(&once).ok();
+    }
+
+    /// A table shorter than one chunk, and an empty one: both must still be the file the
+    /// single-batch path wrote, including the schema of a zero-row artifact.
+    #[test]
+    fn write_table_matches_one_batch_when_short_or_empty() {
+        for n in [0usize, 1, 1_000] {
+            let chunked = tmp(&format!("short_chunked_{n}.parquet"));
+            let once = tmp(&format!("short_once_{n}.parquet"));
+            assert_eq!(write_table(&chunked, scalar_cols(n)).unwrap(), n as u64);
+            write_one_batch(&once, scalar_cols(n));
+            assert_eq!(
+                std::fs::read(&chunked).unwrap(),
+                std::fs::read(&once).unwrap(),
+                "{n} rows"
+            );
+            let t = Table::read(&chunked).unwrap();
+            assert_eq!(t.nrows, n);
+            assert_eq!(
+                t.column_names().len(),
+                6,
+                "a zero-row table keeps its columns"
+            );
+            std::fs::remove_file(&chunked).ok();
+            std::fs::remove_file(&once).ok();
+        }
+    }
+
+    /// The validation is of the whole column set, before any chunk is encoded: a length
+    /// mismatch past the first chunk must still be refused, with the same message, and
+    /// must not leave a partial file behind.
+    #[test]
+    fn write_table_validates_the_whole_column_set_before_writing() {
+        let p = tmp("rejected.parquet");
+        let n = WRITE_TABLE_CHUNK_ROWS + 10;
+        let mut cols = scalar_cols(n);
+        cols.push(Col::I32("short".into(), vec![1, 2, 3]));
+        let err = write_table(&p, cols).unwrap_err().to_string();
+        assert!(err.contains("'short'") && err.contains("expected"), "{err}");
+        assert!(
+            !std::path::Path::new(&p).exists(),
+            "a refused write must not publish a file"
+        );
+        let dup = write_table(
+            &p,
+            vec![
+                Col::U32("id".into(), vec![1]),
+                Col::U32("id".into(), vec![2]),
+            ],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(dup.contains("duplicate column 'id'"), "{dup}");
+        assert!(write_table(&p, vec![])
+            .unwrap_err()
+            .to_string()
+            .contains("no columns"));
     }
 }
 
@@ -1834,6 +2221,227 @@ mod streaming_tests {
         assert_eq!(w.close().unwrap(), 2);
         assert!(TableWriter::new(&tmp("never.parquet")).close().is_err());
         std::fs::remove_file(&p).ok();
+    }
+
+    /// A span taken from an open handle must be the table `open_rows` opens, column for
+    /// column, and must be the matching slice of the whole table. That equality is what
+    /// lets a grouped search take every band from one handle and parse the footer once
+    /// instead of once per band per stage.
+    #[test]
+    fn span_of_an_open_handle_matches_open_rows() {
+        let p = tmp("spans.parquet");
+        let n = 10_000;
+        let mut w = TableWriter::new(&p).with_row_group_rows(1_000);
+        w.write_cols(mixed_cols(n)).unwrap();
+        w.close().unwrap();
+
+        let whole = TableFile::open(&p).unwrap();
+        let all_id = whole.u32("id").unwrap();
+        let all_name = whole.str("name").unwrap();
+        let all_trace = whole.list_f32("trace").unwrap();
+        // Empty, whole-file, inside one row group, across several, and the last row.
+        for (first, len) in [(0, 0), (0, n), (999, 1), (1_500, 3_000), (n - 1, 1)] {
+            let a = whole.span(first, len).unwrap();
+            let b = TableFile::open_rows(&p, first, len).unwrap();
+            assert_eq!(a.nrows, len);
+            assert_eq!(b.nrows, len);
+            assert_eq!(a.u32("id").unwrap(), b.u32("id").unwrap(), "{first}+{len}");
+            assert_eq!(a.f64("mz").unwrap(), b.f64("mz").unwrap());
+            assert_eq!(a.str("name").unwrap(), b.str("name").unwrap());
+            assert_eq!(a.list_f32("trace").unwrap(), b.list_f32("trace").unwrap());
+            // ... and the same rows as the whole table's slice.
+            assert_eq!(a.u32("id").unwrap(), all_id[first..first + len]);
+            assert_eq!(a.str("name").unwrap(), all_name[first..first + len]);
+            assert_eq!(a.list_f32("trace").unwrap(), all_trace[first..first + len]);
+        }
+        // Out of range is refused with the same message as open_rows.
+        let msg = |r: Result<TableFile>| r.err().expect("must be refused").to_string();
+        assert_eq!(
+            msg(whole.span(n - 1, 2)),
+            msg(TableFile::open_rows(&p, n - 1, 2))
+        );
+        // Spans do not nest: a span's rows would otherwise mean two different things.
+        let part = whole.span(10, 20).unwrap();
+        let err = msg(part.span(0, 1));
+        assert!(err.contains("already a row span"), "{err}");
+        // Statistics are the whole file's on either handle, which is how a caller plans
+        // a span from them.
+        assert_eq!(
+            part.row_group_stats("id").unwrap(),
+            whole.row_group_stats("id").unwrap()
+        );
+        assert_eq!(whole.row_group_stats("id").unwrap().len(), 10);
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// The handle carries its parsed footer across getters, spans and batch readers. If
+    /// anything in that plumbing went wrong it would show up as a wrong row count or a
+    /// wrong column, so read every getter twice from one handle and once through a span.
+    #[test]
+    fn one_handle_serves_repeated_reads() {
+        let p = tmp("reuse.parquet");
+        let n = 3_000;
+        write_table(&p, mixed_cols(n)).unwrap();
+        let f = TableFile::open(&p).unwrap();
+        for _ in 0..3 {
+            assert_eq!(f.u32("id").unwrap().len(), n);
+            assert_eq!(f.f64("mz").unwrap().len(), n);
+            assert_eq!(f.str("name").unwrap().len(), n);
+            assert_eq!(f.list_f32("trace").unwrap().len(), n);
+            let mut seen = 0;
+            f.for_each_batch(Some(&["id", "mz"]), 512, |b| {
+                seen += b.num_rows();
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(seen, n);
+        }
+        assert_eq!(f.span(100, 50).unwrap().u32("id").unwrap()[0], 100);
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// `str_eq` must be `str` plus a comparison, error for error: it is offered as a
+    /// drop-in for a caller that only asks whether a two-valued column equals a value.
+    #[test]
+    fn str_eq_is_the_string_comparison_without_the_strings() {
+        let p = tmp("labels.parquet");
+        let n: usize = 5_000;
+        write_table(
+            &p,
+            vec![
+                Col::U32("id".into(), (0..n as u32).collect()),
+                Col::Str(
+                    "label".into(),
+                    (0..n)
+                        .map(|i| {
+                            match i % 3 {
+                                0 => "target",
+                                1 => "decoy",
+                                _ => "target_x",
+                            }
+                            .to_string()
+                        })
+                        .collect(),
+                ),
+                Col::OptStr(
+                    "note".into(),
+                    (0..n)
+                        .map(|i| (i % 7 != 4).then(|| format!("n{i}")))
+                        .collect(),
+                ),
+            ],
+        )
+        .unwrap();
+        let t = Table::read(&p).unwrap();
+        let f = TableFile::open(&p).unwrap();
+        let want: Vec<bool> = t
+            .str("label")
+            .unwrap()
+            .iter()
+            .map(|s| s == "target")
+            .collect();
+        assert_eq!(want.iter().filter(|b| **b).count(), n.div_ceil(3));
+        assert_eq!(t.str_eq("label", "target").unwrap(), want);
+        assert_eq!(f.str_eq("label", "target").unwrap(), want);
+        // A prefix is not a match, and a value the column does not hold matches nothing.
+        assert!(f.str_eq("label", "targe").unwrap().iter().all(|b| !b));
+        assert!(f.str_eq("label", "TARGET").unwrap().iter().all(|b| !b));
+        // A span reads its own rows only: rows 10..16, where 10 % 3 == 1 is the decoy.
+        assert_eq!(
+            f.span(10, 6).unwrap().str_eq("label", "decoy").unwrap(),
+            vec![true, false, false, true, false, false]
+        );
+        // A NULL is refused exactly as `str` refuses it, and so are a missing column and
+        // the wrong type -- same wording on both read paths.
+        for (a, b) in [
+            (f.str_eq("note", "n0"), f.str("note")),
+            (f.str_eq("nope", "x"), f.str("nope")),
+            (f.str_eq("id", "x"), f.str("id")),
+        ] {
+            assert_eq!(
+                a.unwrap_err().to_string(),
+                b.unwrap_err().to_string(),
+                "str_eq must fail exactly as str does"
+            );
+        }
+        assert_eq!(
+            t.str_eq("note", "n0").unwrap_err().to_string(),
+            f.str_eq("note", "n0").unwrap_err().to_string()
+        );
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// `str_flat` must rebuild exactly what `str` returns, row for row, including empty
+    /// values and multi-byte ones, and refuse a NULL the same way.
+    #[test]
+    fn str_flat_rebuilds_the_string_column() {
+        let p = tmp("flat_str.parquet");
+        let n = 10_000; // several SCALAR_BATCH_ROWS-independent batches of rows
+        write_table(&p, mixed_cols(n)).unwrap();
+        let f = TableFile::open(&p).unwrap();
+        let rows = f.str("name").unwrap();
+        let (off, data) = f.str_flat("name").unwrap();
+        assert_eq!(off.len(), n + 1);
+        assert_eq!(off[0], 0);
+        assert_eq!(*off.last().unwrap(), data.len());
+        for (r, want) in rows.iter().enumerate() {
+            assert_eq!(&data[off[r]..off[r + 1]], want, "row {r}");
+        }
+        // A span reads its own rows only, and a NULL is refused as `str` refuses it.
+        let part = f.span(3, 4).unwrap();
+        let (o, d) = part.str_flat("name").unwrap();
+        assert_eq!(o.len(), 5);
+        assert_eq!(&d[o[0]..o[1]], &rows[3]);
+        assert_eq!(
+            f.str_flat("note").unwrap_err().to_string(),
+            f.str("note").unwrap_err().to_string()
+        );
+        assert_eq!(
+            f.str_flat("id").unwrap_err().to_string(),
+            f.str("id").unwrap_err().to_string()
+        );
+        // Multi-byte values: the offsets are byte offsets, and every one of them must land
+        // on a char boundary or the slicing panics.
+        let u = tmp("flat_unicode.parquet");
+        write_table(
+            &u,
+            vec![Col::Str(
+                "s".into(),
+                vec![
+                    String::new(),
+                    "\u{03bc}\u{00b2}".into(),
+                    "plain".into(),
+                    "\u{1f9ea}\u{00e9}".into(),
+                ],
+            )],
+        )
+        .unwrap();
+        let tu = TableFile::open(&u).unwrap();
+        let want = tu.str("s").unwrap();
+        let (o, d) = tu.str_flat("s").unwrap();
+        for (r, w) in want.iter().enumerate() {
+            assert_eq!(&d[o[r]..o[r + 1]], w, "row {r}");
+        }
+        // An empty table still returns the leading offset.
+        let e = tmp("flat_empty.parquet");
+        write_table(&e, vec![Col::Str("s".into(), vec![])]).unwrap();
+        let (o, d) = TableFile::open(&e).unwrap().str_flat("s").unwrap();
+        assert_eq!((o, d.as_str()), (vec![0], ""));
+        std::fs::remove_file(&p).ok();
+        std::fs::remove_file(&u).ok();
+        std::fs::remove_file(&e).ok();
+    }
+
+    /// A grouped search hands band handles to worker threads. Holding the parsed footer on
+    /// the handle must not have taken that away.
+    #[test]
+    fn table_handles_stay_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<TableFile>();
+        assert_send_sync::<Table>();
+        // A reader is moved to the thread that drains it, not shared.
+        fn assert_send<T: Send>() {}
+        assert_send::<BatchReader>();
     }
 }
 
