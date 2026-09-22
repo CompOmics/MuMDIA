@@ -353,6 +353,7 @@ pub fn run(p: RunParams) -> Result<()> {
             info!(stage = %"search-seed", "run: stage start");
             let n = search_seed::run(search_seed::SearchSeedParams {
                 fragment_offset: None,
+                emit_calibrants: false,
                 ms2: &co.ms2,
                 library_precursors: &lib_p,
                 library_fragments: &lib_f,

@@ -1203,6 +1203,7 @@ fn real_main() -> Result<()> {
             let ch = mumdia_io::hash::blake3_str(&cfg.canonical_json());
             stages::search_seed::run(stages::search_seed::SearchSeedParams {
                 fragment_offset: None,
+                emit_calibrants: false,
                 ms2: &ms2,
                 library_precursors: &lib_precursors,
                 library_fragments: &lib_fragments,

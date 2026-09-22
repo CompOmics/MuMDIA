@@ -227,6 +227,7 @@ fn process_run(
     let seed = d("seed_psms.parquet");
     search_seed::run(search_seed::SearchSeedParams {
         fragment_offset: None,
+        emit_calibrants: false,
         ms2: &co.ms2,
         library_precursors: lib_p_base,
         library_fragments: lib_f,

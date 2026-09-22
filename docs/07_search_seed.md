@@ -94,7 +94,7 @@ a candidate that always ranks below `report_psms` gets no row even if it cleared
 | `matched_peaks` | i32 | matched-fragment count at the best scan |
 | `scan_index` | u32 | `scan_index` of the best-scoring scan |
 
-**`<out>.masscal.json`** (written at `search_seed.rs:217-227`):
+**`<out>.masscal.json`** (fitted and serialised by `masscal::MassCal`, `masscal.rs`):
 
 | key | type | meaning |
 |---|---|---|
@@ -232,7 +232,16 @@ two-element average), then sets `tol = max(5.0, 1.5 * P95(|dev - offset|))` usin
   `>= 20` survive, re-fit to `(o2, t2, 2)`; otherwise keep the single-pass result.
   The second pass rejects random-match outliers so they cannot bias the median.
 
-The result is written to `<out>.masscal.json` (`:217-227`).
+The estimator is `masscal::MassCal::fit_from` and the JSON body its `to_json`, both in
+`masscal.rs`, because a grouped search fits the very same estimator a second time: each
+band's seed would otherwise learn a tolerance from its own ~2,000 deviations and
+`seed-pool` would average the bands' scalars, which measured 35% wider and cost 3.4% of the
+peptides (`docs/33_window_groups.md` section 4a). Under `groups.window_groups > 1` the stage
+is additionally asked (`SearchSeedParams::emit_calibrants`) to write
+`<out>.masscal.parquet`: `candidate_id` (library-wide), `scan_index`, `frag_mz`, `ppm`, one
+row per deviation, plus the band's best-scoring targets down to
+`masscal::CALIBRANT_OFFER_PSMS` so the pooled q rather than the band's own q chooses the
+calibrants. An ungrouped run writes no sidecar and is byte-identical.
 
 **7. Write** `seed_psms.parquet` (`write_table`, `:233`) and the `ArtifactReport`
 (`:256-274`), then log `psms`, `confident`, `elapsed_ms`.
@@ -380,8 +389,8 @@ takes `--ms2`, `--lib-precursors`, `--lib-fragments`, `--out`, and
   branch in the `if let Some(idx) = fidx` dispatch (`search_seed.rs:63-108`); mirror
   the deterministic merge if the new path is parallel.
 - **Charge-2 / m/z-binned tolerance.** The current fit produces one global offset
-  and tolerance. To make them charge- or m/z-dependent, partition `devs` before the
-  `fit` closure and emit per-bin entries in `masscal.json`, then teach `extract` to
+  and tolerance. To make them charge- or m/z-dependent, partition `devs` before
+  `masscal::fit` and emit per-bin entries in `masscal.json`, then teach `extract` to
   pick the matching bin.
 - **Change the score.** `hyperscore` (`search_seed.rs:413`) is a free function; keep
   it monotone in matched-fragment count and observed intensity so the target-decoy q
