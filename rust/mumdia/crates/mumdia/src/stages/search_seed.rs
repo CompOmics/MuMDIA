@@ -43,10 +43,21 @@ pub struct SearchSeedParams<'a> {
     /// library differs. `None` loads them from `ms2`, which is what a standalone
     /// `mumdia search-seed` and an ungrouped `run` do.
     ///
-    /// Borrowed, never owned, and the stage only reads them: `load_ms2` has already
-    /// sorted by retention time, and the mass recalibration this stage fits is written to
+    /// Borrowed, never owned, and the stage only reads them: it takes a shared slice that
+    /// it cannot write through, `load_ms2` has already sorted by retention time so it
+    /// does not re-sort, `select_peaks` returns peak INDICES rather than truncating
+    /// `scan.peaks`, and the mass recalibration this stage fits is written to
     /// `<out>.masscal.json` rather than applied to the peaks. So no band can leave a
     /// trace in the scans the next band sees.
+    ///
+    /// `select_peaks` is the one to watch. Truncating `scan.peaks` in place is the obvious
+    /// way to stop rebuilding an index vector per scan per band, and it would hand the
+    /// following band -- and extract, which shares the same buffer -- capped spectra. A
+    /// 300-peak cap costs 60% of the peptides on a 50-window Orbitrap DIA run
+    /// (docs/04_convert.md).
+    ///
+    /// An EMPTY slice does not mean "this run has no MS2". It means the caller has
+    /// nothing to lend, and the stage decodes `ms2` itself.
     pub ms2_scans: Option<&'a [Ms2Scan]>,
 }
 
@@ -89,12 +100,20 @@ pub fn run(p: SearchSeedParams) -> Result<u64> {
         )?,
     };
     // Decoded here unless the caller lent its own copy (see `ms2_scans`). The owned
-    // buffer is declared first so it outlives the borrow.
+    // buffer is declared first so it outlives the borrow. An empty lent slice is not
+    // believed over the path: it means the caller had nothing to lend.
     let owned_scans: Vec<Ms2Scan>;
     let scans: &[Ms2Scan] = match p.ms2_scans {
-        Some(s) => s,
-        None => {
+        Some(s) if !s.is_empty() => s,
+        _ => {
             owned_scans = load_ms2(p.ms2)?;
+            if p.ms2_scans.is_some() && !owned_scans.is_empty() {
+                warn!(
+                    ms2 = p.ms2,
+                    scans = owned_scans.len(),
+                    "search-seed: the caller lent an empty MS2 buffer for a run that has                      scans; decoding the artifact instead of searching nothing"
+                );
+            }
             &owned_scans
         }
     };

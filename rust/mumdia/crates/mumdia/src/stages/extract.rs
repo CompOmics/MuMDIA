@@ -117,12 +117,20 @@ pub struct ExtractParams<'a> {
     /// library differs. `None` loads them from `ms2` / `ms1`, which is what a standalone
     /// `mumdia extract` and an ungrouped `run` do.
     ///
-    /// Borrowed, never owned, and the stage only reads them: the loaders have already
-    /// sorted by retention time, and the per-run mass recalibration is applied to the
-    /// library m/z at probe time (`MassOffset`, `Prober::probe`) rather than by rewriting
-    /// observed peaks. The destructive peak-claim strategies rewrite this band's own
+    /// Borrowed, never owned, and the stage only reads them. What makes that safe is not
+    /// that nothing here corrects the observed m/z -- the per-peak mass recalibration
+    /// corrects exactly that, `peak.mz / mass_off.factor_at(peak.mz)`, and each band
+    /// applies its own factor under `groups.calibration = per_group`. It is safe because
+    /// the corrected value is computed into a LOCAL (`q_mz`) at every one of those call
+    /// sites and never written back, the scans arrive as a shared slice that no stage can
+    /// write through, and the loaders have already sorted by retention time so no stage
+    /// re-sorts. The destructive peak-claim strategies likewise rewrite this band's own
     /// `Hit` intensities, never `scans`. So no band can leave a trace in the scans the
     /// next band sees.
+    ///
+    /// If you ever hoist `q_mz` out of the per-peak loop, hoist it into a side buffer.
+    /// Writing it back into the scans was harmless when each band decoded its own copy
+    /// and silently corrupts every later band now. See the note above the probe loop.
     ///
     /// The two are one field because extract needs both or neither: a caller that shares
     /// the MS2 buffer but lets extract re-decode the MS1 would keep the saving it came
@@ -132,8 +140,12 @@ pub struct ExtractParams<'a> {
 
 /// One run's decoded spectra, lent to a stage instead of being re-decoded by it.
 ///
-/// `ms1` is empty when the run has no MS1 artifact, which is the same thing
-/// `ExtractParams::ms1 = None` means.
+/// An EMPTY slice here never means "this run has no such spectra". It means the caller
+/// has nothing to lend, and the stage decodes the corresponding path itself. Saying "no
+/// MS1" is `ExtractParams::ms1 = None`, as it always was. The two are not interchangeable:
+/// an empty `ms1` believed over a named `ms1` path would drop every MS1 feature and every
+/// `ms1_mono` / `ms1_iso1` / `ms1_iso2` chromatogram row, and write a plausible table
+/// while doing it.
 #[derive(Clone, Copy)]
 pub struct SharedScans<'a> {
     pub ms2: &'a [Ms2Scan],
@@ -1298,6 +1310,14 @@ fn accumulate_groups(
     // 2.12-2.16 s with and without it over five runs. The other half of that hoist, the
     // `ln()` bin computation inside `probe_peak_win`, needs a `FragIndex` entry point
     // taking a precomputed bin and cannot be done from this file at all.
+    //
+    // The memory-cheap version of that hoist -- writing the corrected value back into
+    // `scan.peaks` instead of into a side buffer -- is now FORBIDDEN, not merely
+    // unmeasured. Under `groups.window_groups > 1` the scans are one buffer lent to every
+    // band (`ExtractParams::scans`), and under `groups.calibration = per_group` each band
+    // applies its own `MassOffset` to it, so band g00's factor would be baked into the
+    // peaks band g01 reads. The borrow checker stops it today, because `scans` arrives as
+    // a shared slice; do not reach for `&mut` to get around that.
     let (tx, rx) = std::sync::mpsc::channel::<(usize, usize, HitStore)>();
     {
         let probe_range = |gi: usize, lo: u32, hi: u32| -> HitStore {
@@ -2097,10 +2117,46 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
 
     // Decoded here unless the caller lent its own copies (see `ExtractParams::scans`).
     // The owned buffers are declared first so they outlive the borrows.
+    //
+    // An empty lent slice is never believed over a named path. A caller that lends
+    // `SharedScans { ms2, ms1: &[] }` while still passing `ms1: Some(path)` would
+    // otherwise lose every MS1 feature and every MS1 chromatogram row with no error and
+    // no warning, because both are guarded on `!ms1_scans.is_empty()` and simply write
+    // nothing. Decoding the named artifact instead costs nothing when the run really has
+    // no MS1 rows (the decode is then empty too) and makes the silent version impossible.
     let owned_ms2: Vec<Ms2Scan>;
     let owned_ms1: Vec<Ms1Scan>;
     let (scans, ms1_scans): (&[Ms2Scan], &[Ms1Scan]) = match p.scans {
-        Some(shared) => (shared.ms2, shared.ms1),
+        Some(shared) => {
+            let ms2: &[Ms2Scan] = if shared.ms2.is_empty() {
+                owned_ms2 = load_ms2(p.ms2)?;
+                if !owned_ms2.is_empty() {
+                    warn!(
+                        ms2 = p.ms2,
+                        scans = owned_ms2.len(),
+                        "extract: the caller lent an empty MS2 buffer for a run that has                          scans; decoding the artifact instead of searching nothing"
+                    );
+                }
+                &owned_ms2
+            } else {
+                shared.ms2
+            };
+            let ms1: &[Ms1Scan] = match p.ms1 {
+                Some(path) if shared.ms1.is_empty() => {
+                    owned_ms1 = load_ms1(path)?;
+                    if !owned_ms1.is_empty() {
+                        warn!(
+                            ms1 = path,
+                            scans = owned_ms1.len(),
+                            "extract: the caller lent an empty MS1 buffer while naming an MS1                              artifact; decoding it instead of dropping every MS1 feature"
+                        );
+                    }
+                    &owned_ms1
+                }
+                _ => shared.ms1,
+            };
+            (ms2, ms1)
+        }
         None => {
             owned_ms2 = load_ms2(p.ms2)?;
             owned_ms1 = match p.ms1 {
@@ -3016,6 +3072,13 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
                     .iter()
                     .map(|&r| {
                         let j = nearest_index(&ms1_rts, r);
+                        // No `as f32`: `sum_near` returns f32 and the target is `Vec<f32>`,
+                        // so the cast was an identity. It was tolerated while `ms1_scans`
+                        // was a `Vec<Ms1Scan>` and `clippy::unnecessary_cast` fires on it
+                        // now that it is a `&[Ms1Scan]` -- verified in both directions on
+                        // this tree with clippy 1.96.0, silent before and an error after,
+                        // though which of the lint's heuristics distinguishes `Vec`
+                        // indexing from slice indexing was not established.
                         sum_near(&ms1_scans[j].mz, &ms1_scans[j].intensity, mz, tol)
                     })
                     .collect();
