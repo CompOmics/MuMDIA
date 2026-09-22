@@ -283,6 +283,24 @@ number of bands changes neither what is searched nor what is extracted. The wall
 modelled as the summed band time over the number of bands run at once (12, 16, 21, 21),
 because the arms were interrupted and resumed; the CPU totals are measured.
 
+Pooling each arm's competed tables and rescoring (28 to 29 minutes at 40.6-40.8 GB in
+every arm, since the pool is the same 22.85M PSMs whatever the banding):
+
+| arm | peptides at 1% | precursors | protein groups |
+|---|---|---|---|
+| monolithic | 10,213 | 11,271 | 4,777 |
+| 8 bands (the earlier arm) | 10,346 | 11,271 | 4,761 |
+| 48 bands | 10,559 | 11,579 | 4,899 |
+| 63 bands | 10,608 | 11,594 | 4,863 |
+| 81 bands | 10,382 | 11,404 | 4,841 |
+| 94 bands | 10,631 | 11,643 | 4,893 |
+
+The five grouped arms span 10,346 to 10,631 peptides with no trend in the band count, which
+is the classifier reshuffling on a differently ordered input: the PSMs and features are
+identical, only the row order into rescore differs, and CLAUDE.md puts that at up to about
+1% on a pool of this size. Read this as "grouping costs no identifications", not as a gain
+over the monolithic run; a gain would need seeds, which none of these arms used.
+
 Three things this says:
 
 - **A band cannot be smaller than one isolation window.** The run has 114 windows, so 96
