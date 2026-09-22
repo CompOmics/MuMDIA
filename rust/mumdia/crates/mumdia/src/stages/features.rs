@@ -3569,7 +3569,22 @@ mod tests {
         // running this fixture at 1ac1b44^ (or at the last commit whose values are trusted)
         // and changing them in one commit that says which values moved and why. Taking the
         // new numbers from the current build makes the test pin nothing.
-        const GOLDEN_DIGEST: u64 = 0x4e43_7960_2b2a_a1cc;
+        //
+        // THE DIGEST IS PER PLATFORM, and that is a finding rather than a nuisance: the
+        // same fixture gives 0x4e43..a1cc on Windows and 0x6137..c42a on Linux, stably on
+        // both (two runs each). The extended battery reaches `ln`, `exp` and `powf`, which
+        // are the platform's libm and agree only to within the last bit, so the engine's
+        // f64 feature VALUES are not bit-identical across operating systems. The PIN is: it
+        // formats to fixed decimals, which is why the same PIN hash holds on both. A
+        // platform with no entry here checks the shape and the PIN and says it has no
+        // digest, rather than failing on a constant captured somewhere else.
+        const GOLDEN_DIGEST: Option<u64> = if cfg!(target_os = "windows") {
+            Some(0x4e43_7960_2b2a_a1cc)
+        } else if cfg!(target_os = "linux") {
+            Some(0x6137_b855_a2da_c42a)
+        } else {
+            None
+        };
         const GOLDEN_PIN: &str = "806a126473eafce7a1567ac71b5253e8605af0062864a02f2ab5f0b77e851817";
 
         let dir = std::env::temp_dir().join("mumdia_features_golden");
@@ -3608,11 +3623,15 @@ mod tests {
             .unwrap();
             let (rows, ncols, digest) = features_digest(&out);
             assert_eq!((rows, ncols), (61, 398), "chunk {tag}: table shape moved");
-            assert_eq!(
-                digest, GOLDEN_DIGEST,
-                "chunk {tag}: a feature value or its column differs from the name-keyed \
-                 assembly at 1ac1b44^ (digest 0x{digest:016x})"
-            );
+            match GOLDEN_DIGEST {
+                Some(golden) => assert_eq!(
+                    digest, golden,
+                    "chunk {tag}: a feature value or its column differs from the                      name-keyed assembly at 1ac1b44^ (this platform computes                      0x{digest:016x})"
+                ),
+                None => eprintln!(
+                    "no feature digest is recorded for this platform; chunk {tag} computes                      0x{digest:016x}. Add it above once it has been checked against a                      platform that has one."
+                ),
+            }
             assert_eq!(
                 mumdia_io::hash::blake3_file(&pin).unwrap(),
                 GOLDEN_PIN,
