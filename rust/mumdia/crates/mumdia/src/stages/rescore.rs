@@ -1350,11 +1350,52 @@ fn classify_entrapment(
     (ent, real)
 }
 
+/// A group's winning row: its score, the three label bits it carries into the q kernel,
+/// and the flat row index the q is written back to.
+type GroupBest = (f64, bool, bool, bool, usize);
+
+/// Group ids as a dense `0..span` range, so the reduction below can index an array
+/// instead of hashing.
+///
+/// `protein_id` and `precursor_id` arrive dense already (both were interned in `run`
+/// immediately before the call). `base_peptide_id` is dense over the LIBRARY, not over
+/// the competed rows: at 203M precursors an array indexed by it would be gigabytes for a
+/// few million rows. So index directly when the span is within a small factor of the row
+/// count, and otherwise intern, which costs one hash per row but bounds the array by the
+/// number of groups. The interning is a permutation of the group labels, and the
+/// reduction's result does not depend on which integer names a group, so the two arms
+/// agree row for row (`grouped_q_is_the_same_on_a_dense_and_a_sparse_key_space`).
+fn dense_group_ids(keys: &[u32]) -> (std::borrow::Cow<'_, [u32]>, usize) {
+    let Some(&max) = keys.iter().max() else {
+        return (std::borrow::Cow::Borrowed(keys), 0);
+    };
+    let span = max as usize + 1;
+    if span <= keys.len().saturating_mul(4).max(1024) {
+        return (std::borrow::Cow::Borrowed(keys), span);
+    }
+    let mut interner: HashMap<u32, u32> = HashMap::with_capacity(keys.len().min(span));
+    let ids: Vec<u32> = keys
+        .iter()
+        .map(|&k| {
+            let next = interner.len() as u32;
+            *interner.entry(k).or_insert(next)
+        })
+        .collect();
+    let span = interner.len();
+    (std::borrow::Cow::Owned(ids), span)
+}
+
 /// Reduce PSMs to the best score per group key, compute group q-values against
 /// the selected null, and map back to a per-PSM vector. Mirrors the PSM-level
 /// logic for peptide- and protein-group-level q.
-fn grouped_q<K: std::hash::Hash + Eq + Clone>(
-    keys: &[K],
+///
+/// The reduction indexes a `Vec<Option<GroupBest>>` rather than hashing, because two of
+/// the three calls have a group count close to the row count and were building the
+/// largest hash table in the stage to reproduce their own input: measured on
+/// out_hye/psms_competed.parquet, 746,772 distinct `base_peptide_id` and 879,018 distinct
+/// (peptidoform, charge) over 879,027 rows, against 69,958 distinct proteins.
+fn grouped_q(
+    keys: &[u32],
     scores: &[f64],
     is_decoy: &[bool],
     is_entrapment: &[bool],
@@ -1363,10 +1404,11 @@ fn grouped_q<K: std::hash::Hash + Eq + Clone>(
     ratio: f64,
 ) -> Vec<f64> {
     let n = scores.len();
+    let (ids, span) = dense_group_ids(keys);
     // Keep the winning row index with each picked group. Exact target/null score
     // ties go to the active null (decoy or entrapment) so input row order cannot
     // make the accepted set anti-conservative.
-    let mut best: HashMap<K, (f64, bool, bool, bool, usize)> = HashMap::new();
+    let mut best: Vec<Option<GroupBest>> = vec![None; span];
     for i in 0..n {
         // In entrapment mode the in-silico decoys are not the null, so they must not
         // compete for the group. A target and its paired decoy SHARE `base_peptide_id`
@@ -1383,7 +1425,11 @@ fn grouped_q<K: std::hash::Hash + Eq + Clone>(
         if matches!(qmode, QMode::Entrapment) && is_decoy[i] {
             continue;
         }
-        let e = best.entry(keys[i].clone()).or_insert((
+        // `get_or_insert` is `HashMap::entry(..).or_insert(..)`: the placeholder score is
+        // NEG_INFINITY, so the comparison below promotes the first row of a group unless
+        // its own score is NEG_INFINITY or NaN, in which case the tuple already holds
+        // that row's flags and index and is left alone. Same arithmetic, same outcome.
+        let e = best[ids[i] as usize].get_or_insert((
             f64::NEG_INFINITY,
             is_decoy[i],
             is_entrapment[i],
@@ -1402,28 +1448,33 @@ fn grouped_q<K: std::hash::Hash + Eq + Clone>(
             *e = (scores[i], is_decoy[i], is_entrapment[i], is_real[i], i);
         }
     }
-    let ks: Vec<K> = best.keys().cloned().collect();
+    // The picked groups, in ascending key order. The hash version read them out of
+    // `HashMap::keys()` and then probed the map four more times per group; this walk is
+    // one pass, and it also removes a dependency on `HashMap` iteration order, which the
+    // project bans even where it is harmless (it was harmless: a group's q depends only
+    // on the multiset of (score, is_null), because every member of a tied block is
+    // assigned the same qmin and the totals are order-free).
+    let picked: Vec<GroupBest> = best.into_iter().flatten().collect();
     let qv = match qmode {
         QMode::Decoy => {
-            let sd: Vec<(f64, bool)> = ks.iter().map(|k| (best[k].0, best[k].1)).collect();
+            let sd: Vec<(f64, bool)> = picked.iter().map(|g| (g.0, g.1)).collect();
             target_decoy_q(&sd)
         }
         QMode::Entrapment => {
-            let sc: Vec<f64> = ks.iter().map(|k| best[k].0).collect();
-            let e: Vec<bool> = ks.iter().map(|k| best[k].2).collect();
-            let r: Vec<bool> = ks.iter().map(|k| best[k].3).collect();
+            let sc: Vec<f64> = picked.iter().map(|g| g.0).collect();
+            let e: Vec<bool> = picked.iter().map(|g| g.2).collect();
+            let r: Vec<bool> = picked.iter().map(|g| g.3).collect();
             entrapment_q(&sc, &e, &r, ratio)
         }
     };
-    let qmap: HashMap<K, f64> = ks.into_iter().zip(qv).collect();
     // Assign the group q ONLY to the picked winning row of each group. A
     // losing sibling (a lower-scoring charge/mod variant, which may itself be a
     // false target) must not inherit the winner's low q; it gets 1.0. The
     // report/counts dedup by key on the winner, so peptide/PG counts are
     // unchanged, but per-PSM peptide_q/pg_q no longer propagate to losers.
     let mut out = vec![1.0f64; n];
-    for (key, (_, _, _, _, row)) in best {
-        out[row] = qmap[&key];
+    for (g, q) in picked.iter().zip(qv) {
+        out[g.4] = q;
     }
     out
 }
@@ -3049,6 +3100,175 @@ b
         );
         assert_eq!(q[0], 1.0, "tied target must be the losing sibling");
         assert!(q[1] < 0.05, "tied decoy should own the picked-group q");
+    }
+
+    /// `grouped_q` exactly as it was before the dense rewrite: a `HashMap` keyed on the
+    /// group id, read back out through `best.keys()` and a second `HashMap` of q-values.
+    /// The tests below pin the rewrite against THIS, not against its own shape.
+    fn grouped_q_hashed(
+        keys: &[u32],
+        scores: &[f64],
+        is_decoy: &[bool],
+        is_entrapment: &[bool],
+        is_real: &[bool],
+        qmode: QMode,
+        ratio: f64,
+    ) -> Vec<f64> {
+        let n = scores.len();
+        let mut best: HashMap<u32, (f64, bool, bool, bool, usize)> = HashMap::new();
+        for i in 0..n {
+            if matches!(qmode, QMode::Entrapment) && is_decoy[i] {
+                continue;
+            }
+            let e = best.entry(keys[i]).or_insert((
+                f64::NEG_INFINITY,
+                is_decoy[i],
+                is_entrapment[i],
+                is_real[i],
+                i,
+            ));
+            let incoming_null = match qmode {
+                QMode::Decoy => is_decoy[i],
+                QMode::Entrapment => is_entrapment[i],
+            };
+            let current_null = match qmode {
+                QMode::Decoy => e.1,
+                QMode::Entrapment => e.2,
+            };
+            if scores[i] > e.0 || (scores[i] == e.0 && incoming_null && !current_null) {
+                *e = (scores[i], is_decoy[i], is_entrapment[i], is_real[i], i);
+            }
+        }
+        let ks: Vec<u32> = best.keys().cloned().collect();
+        let qv = match qmode {
+            QMode::Decoy => {
+                let sd: Vec<(f64, bool)> = ks.iter().map(|k| (best[k].0, best[k].1)).collect();
+                target_decoy_q(&sd)
+            }
+            QMode::Entrapment => {
+                let sc: Vec<f64> = ks.iter().map(|k| best[k].0).collect();
+                let e: Vec<bool> = ks.iter().map(|k| best[k].2).collect();
+                let r: Vec<bool> = ks.iter().map(|k| best[k].3).collect();
+                entrapment_q(&sc, &e, &r, ratio)
+            }
+        };
+        let qmap: HashMap<u32, f64> = ks.into_iter().zip(qv).collect();
+        let mut out = vec![1.0f64; n];
+        for (key, (_, _, _, _, row)) in best {
+            out[row] = qmap[&key];
+        }
+        out
+    }
+
+    /// A deterministic generator: populations with exact score ties (which is what the
+    /// tie-break arm exists for), both labels, entrapment rows, and the two degenerate
+    /// scores the `or_insert` placeholder interacts with.
+    struct GroupedQPopulation {
+        keys: Vec<u32>,
+        scores: Vec<f64>,
+        is_decoy: Vec<bool>,
+        is_entrapment: Vec<bool>,
+        is_real: Vec<bool>,
+    }
+
+    fn grouped_q_population(n: usize, group_stride: u32, seed: u64) -> GroupedQPopulation {
+        let mut x = seed | 1;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let mut keys = Vec::with_capacity(n);
+        let mut scores = Vec::with_capacity(n);
+        let mut is_decoy = Vec::with_capacity(n);
+        let mut is_entrapment = Vec::with_capacity(n);
+        let mut is_real = Vec::with_capacity(n);
+        for _ in 0..n {
+            let r = next();
+            // Few groups relative to rows, so most groups really compete.
+            keys.push((r % (n as u64 / 3 + 1)) as u32 * group_stride);
+            // A coarse score grid forces exact ties.
+            scores.push(match r % 41 {
+                0 => f64::NEG_INFINITY,
+                1 => f64::NAN,
+                k => (k % 7) as f64,
+            });
+            let d = r % 5 == 0;
+            let e = !d && r % 11 == 0;
+            is_decoy.push(d);
+            is_entrapment.push(e);
+            is_real.push(!d && !e);
+        }
+        GroupedQPopulation {
+            keys,
+            scores,
+            is_decoy,
+            is_entrapment,
+            is_real,
+        }
+    }
+
+    #[test]
+    fn the_dense_group_reduction_reproduces_the_hashed_one() {
+        // The output-equality claim of the dense rewrite, against the previous
+        // implementation rather than against the new shape, in both q modes and on both
+        // arms of the density gate: `group_stride` 1 indexes the keys directly, 100_000
+        // blows the span past the gate and takes the interning fallback.
+        assert_eq!(
+            std::mem::size_of::<Option<GroupBest>>(),
+            24,
+            "the dense array's per-group cost is the memory claim: a niche in one of the \
+             bools must absorb the Option discriminant"
+        );
+        for stride in [1u32, 100_000] {
+            for seed in [1u64, 2, 3, 4] {
+                let p = grouped_q_population(600, stride, seed);
+                let (keys, scores) = (&p.keys, &p.scores);
+                let (d, e, r) = (&p.is_decoy, &p.is_entrapment, &p.is_real);
+                for qmode in [QMode::Decoy, QMode::Entrapment] {
+                    let want = grouped_q_hashed(keys, scores, d, e, r, qmode, 1.5);
+                    let got = grouped_q(keys, scores, d, e, r, qmode, 1.5);
+                    assert_eq!(
+                        want.iter().map(|q| q.to_bits()).collect::<Vec<_>>(),
+                        got.iter().map(|q| q.to_bits()).collect::<Vec<_>>(),
+                        "stride {stride} seed {seed}"
+                    );
+                }
+            }
+        }
+        // Empty input, and a population whose every row is skipped in entrapment mode.
+        assert!(grouped_q(&[], &[], &[], &[], &[], QMode::Decoy, 1.0).is_empty());
+        assert_eq!(
+            grouped_q(
+                &[3, 3],
+                &[1.0, 2.0],
+                &[true, true],
+                &[false, false],
+                &[false, false],
+                QMode::Entrapment,
+                1.0
+            ),
+            vec![1.0, 1.0]
+        );
+    }
+
+    #[test]
+    fn a_sparse_key_space_does_not_allocate_by_its_span() {
+        // The guard the dense path needs: `base_peptide_id` is dense over the LIBRARY, so
+        // a competed table of a few rows can carry ids in the hundreds of millions, and an
+        // array indexed by them would be gigabytes. The gate must send that to the
+        // interning arm, and the interning arm must number the groups 0..k.
+        let sparse: Vec<u32> = vec![900_000_000, 12, 900_000_000, 4_000_000];
+        let (ids, span) = dense_group_ids(&sparse);
+        assert_eq!(span, 3, "one slot per distinct group, not per id value");
+        assert_eq!(ids.as_ref(), &[0u32, 1, 0, 2]);
+
+        // Dense enough to index directly: the ids are the keys themselves.
+        let dense: Vec<u32> = (0..64u32).collect();
+        let (ids, span) = dense_group_ids(&dense);
+        assert_eq!(span, 64);
+        assert_eq!(ids.as_ref(), dense.as_slice());
     }
 
     #[test]
