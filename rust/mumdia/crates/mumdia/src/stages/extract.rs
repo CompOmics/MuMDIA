@@ -1158,7 +1158,6 @@ fn accumulate_groups(
     // windows must report before sub-range `k` is final.
     let mut tasks: Vec<(usize, usize, u32, u32)> = Vec::new();
     let mut expected: Vec<usize> = vec![0; n_sub];
-    let mut per_window: Vec<usize> = vec![0; groups.len()];
     for (k, exp) in expected.iter_mut().enumerate() {
         let (s, e) = sub_bounds(k);
         for (gi, g) in groups.iter().enumerate() {
@@ -1166,40 +1165,22 @@ fn accumulate_groups(
             if hi > lo {
                 tasks.push((k, gi, lo, hi));
                 *exp += 1;
-                per_window[gi] += 1;
             }
         }
     }
-    // Offset-corrected query m/z per peak, computed ONCE per window instead of once per
-    // sub-range task. `MassOffset::factor_at` is a binary search into the m/z-dependent
-    // calibration grid when a masscal grid is present, and a division either way, and both
-    // were repeated once per task -- up to 2x threads -- for every peak of every scan of
-    // the window. Flat with one offset per scan, so it is two allocations per window rather
-    // than one per scan, and built only where the window is actually split.
-    let qmz: Vec<Option<(Vec<f64>, Vec<usize>)>> = groups
-        .iter()
-        .enumerate()
-        .map(|(gi, g)| {
-            (per_window[gi] > 1).then(|| {
-                let mut q: Vec<f64> =
-                    Vec::with_capacity(g.scans.iter().map(|&si| scans[si].peaks.len()).sum());
-                let mut off: Vec<usize> = Vec::with_capacity(g.scans.len() + 1);
-                off.push(0);
-                for &si in &g.scans {
-                    for peak in &scans[si].peaks {
-                        q.push(peak.mz / mass_off.factor_at(peak.mz));
-                    }
-                    off.push(q.len());
-                }
-                (q, off)
-            })
-        })
-        .collect();
+    // Note on `peak.mz / mass_off.factor_at(peak.mz)` below: it is recomputed once per
+    // task for every peak of the window, so the tasks of one window repeat it. Hoisting
+    // it into a per-window buffer was tried and reverted: it is 8 bytes per peak of every
+    // window in flight, which measured +200 MB of peak RSS on the AIF fixture (and would
+    // be a third of a gigabyte with the whole run in one batch, which is the shape a
+    // grouped band search has), for no measurable time -- the extract compute phase was
+    // 2.12-2.16 s with and without it over five runs. The other half of that hoist, the
+    // `ln()` bin computation inside `probe_peak_win`, needs a `FragIndex` entry point
+    // taking a precomputed bin and cannot be done from this file at all.
     let (tx, rx) = std::sync::mpsc::channel::<(usize, usize, HitStore)>();
     {
         let probe_range = |gi: usize, lo: u32, hi: u32| -> HitStore {
             let ids = &groups[gi].scans;
-            let qmz = &qmz[gi];
             // Flat `(cid, hit)` pairs in probe order, grouped by candidate at the end of
             // the task with a stable counting sort. The task-local `HashMap<u32,
             // Vec<Hit>>` this replaces was one of the two populations of medium heap
@@ -1211,16 +1192,12 @@ fn accumulate_groups(
             // reprobes the same bins, so cache each bin's narrowed posting range once
             // instead of binary-searching it per peak.
             let mut nw = idx.window_narrow(lo, hi);
-            for (k, &si) in ids.iter().enumerate() {
+            for &si in ids {
                 let scan = &scans[si];
                 let rt = scan.rt_seconds;
-                let qs: Option<&[f64]> = qmz.as_ref().map(|(q, off)| &q[off[k]..off[k + 1]]);
-                for (pk, peak) in scan.peaks.iter().enumerate() {
+                for peak in &scan.peaks {
                     let inten = peak.intensity;
-                    let q_mz = match qs {
-                        Some(s) => s[pk],
-                        None => peak.mz / mass_off.factor_at(peak.mz),
-                    };
+                    let q_mz = peak.mz / mass_off.factor_at(peak.mz);
                     let obs_mz = peak.mz;
                     claimants.clear();
                     idx.probe_peak_win(&mut nw, q_mz, |cid, _pmz, pint, frag| {
@@ -1293,6 +1270,10 @@ fn accumulate_groups(
             }
             let (cids, offs) = group_hits_by_candidate(lo, hi, &mut flat_cid, &mut flat_hit);
             drop(flat_cid);
+            // Not shrunk: the buffer's doubling slack is the same slack the per-candidate
+            // vectors carried, and `shrink_to_fit` here measured 2,520-2,560 MB of peak
+            // RSS against 2,456-2,505 MB without it on the AIF fixture, i.e. its copy
+            // costs more than the slack it returns.
             HitStore {
                 cids,
                 offs,
