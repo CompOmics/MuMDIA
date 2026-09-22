@@ -25,12 +25,92 @@ use crate::stages::features::FeatureSchema;
 const FEATURE_BATCH_ROWS: usize = 1 << 14;
 
 /// Payload bytes of the per-PSM metadata columns that stay resident beside the feature
-/// matrix for the whole stage (the strings dominate: one heap allocation per PSM each).
-fn meta_bytes(cid: &[u32], label: &[String], pform: &[String], protein: &[String]) -> usize {
-    let strs = |v: &[String]| -> usize {
-        std::mem::size_of_val(v) + v.iter().map(|s| s.len()).sum::<usize>()
-    };
-    std::mem::size_of_val(cid) + strs(label) + strs(pform) + strs(protein)
+/// matrix for the whole stage.
+fn meta_bytes(cid: &[u32], is_decoy: &[bool], pform: &FlatStr, protein: &FlatStr) -> usize {
+    std::mem::size_of_val(cid) + std::mem::size_of_val(is_decoy) + pform.bytes() + protein.bytes()
+}
+
+/// A string column held as one text buffer plus one byte offset per row, rather than one
+/// `String` per row.
+///
+/// [`TableFile::str`] is `out.push(a.value(k).to_string())`: a 24-byte spine AND its own
+/// heap block for every row, for the whole stage, including the 16-22 minutes the sidecar
+/// spends training. Measured on `out_hye/psms_competed.parquet` (879,027 rows), mean byte
+/// lengths are 21.66 for `peptidoform` and 13.84 for `protein`, which under mimalloc's
+/// 8-byte-granular bins is 48 and 40 bytes resident per row. Flat is 8 bytes of offset
+/// plus the text itself -- 29.7 and 21.8 bytes per row here -- in two allocations for the
+/// whole column instead of one per row.
+///
+/// The allocation COUNT is the load-bearing half. The engine dies at the kernel's
+/// per-process mapping limit (1,048,576) rather than on memory, and the three string
+/// columns through `str` are three live blocks per PSM: 2.6 million at the measured single
+/// run, 9.4 million at the six-run Astral pool.
+#[derive(Default)]
+struct FlatStr {
+    /// `rows + 1` byte offsets into `data`; row `r` is `data[offsets[r]..offsets[r + 1]]`.
+    /// Always a char boundary, because whole values are concatenated. Empty only before
+    /// the first input has been merged in.
+    offsets: Vec<usize>,
+    data: String,
+}
+
+impl FlatStr {
+    fn len(&self) -> usize {
+        self.offsets.len().saturating_sub(1)
+    }
+
+    fn get(&self, i: usize) -> &str {
+        &self.data[self.offsets[i]..self.offsets[i + 1]]
+    }
+
+    /// Rows in order. `ExactSizeIterator`, which is what `StringArray::from_iter_values`
+    /// needs to size its offset buffer in one allocation.
+    fn iter(&self) -> impl ExactSizeIterator<Item = &str> {
+        (0..self.len()).map(|i| self.get(i))
+    }
+
+    /// Resident payload: the offsets plus the text.
+    fn bytes(&self) -> usize {
+        std::mem::size_of_val(self.offsets.as_slice()) + self.data.len()
+    }
+
+    /// Append one competed input's column, the flat counterpart of [`merge_col`].
+    ///
+    /// The first input is MOVED in and the offsets are then reserved to the total row
+    /// count from the parquet footers; every later input has its offsets rebased onto the
+    /// end of this buffer and its text appended. This is the part of the flat layout that
+    /// is easiest to get subtly wrong, so `flat_columns_concatenate_like_merge_col` pins
+    /// it against `merge_col` over the same inputs.
+    fn merge(&mut self, (offsets, data): (Vec<usize>, String), total_rows: usize) {
+        if self.offsets.is_empty() {
+            self.offsets = offsets;
+            self.data = data;
+            if self.offsets.len() < total_rows + 1 {
+                self.offsets.reserve(total_rows + 1 - self.offsets.len());
+            }
+            return;
+        }
+        let base = self.data.len();
+        self.data.push_str(&data);
+        // `offsets[0]` is this input's leading 0 and is already covered by the previous
+        // input's last offset.
+        self.offsets.extend(offsets[1..].iter().map(|o| base + o));
+    }
+
+    /// The named rows, in the given order: the flat counterpart of the `keep_rows!`
+    /// gather in the top-K collapse.
+    fn gather(&self, keep: &[usize]) -> FlatStr {
+        let mut out = FlatStr {
+            offsets: Vec::with_capacity(keep.len() + 1),
+            data: String::new(),
+        };
+        out.offsets.push(0);
+        for &i in keep {
+            out.data.push_str(self.get(i));
+            out.offsets.push(out.data.len());
+        }
+        out
+    }
 }
 
 /// Which empirical null the q-values are computed against.
@@ -162,15 +242,25 @@ pub fn run(p: RescoreParams) -> Result<u64> {
     }
 
     // Concatenate competed inputs.
-    let (mut cid, mut label, mut base, mut pform, mut protein, mut charge, mut prelim) = (
+    //
+    // The three string columns are NOT `Vec<String>`. `label` is two-valued and every read
+    // of it in this stage is `== "decoy"`, so it is reduced to one bit per row as it is
+    // read; `peptidoform` and `protein` are flat (see `FlatStr`). Measured on the competed
+    // table this takes the resident metadata from 120 bytes and 3 live heap blocks per PSM
+    // to about 51 bytes and 4 blocks for the whole stage.
+    let (mut cid, mut is_decoy, mut base, mut charge, mut prelim) = (
         Vec::new(),
-        Vec::<String>::new(),
+        Vec::<bool>::new(),
         Vec::new(),
-        Vec::<String>::new(),
-        Vec::<String>::new(),
         Vec::new(),
         Vec::new(),
     );
+    let mut pform = FlatStr::default();
+    let mut protein = FlatStr::default();
+    // The first label that is neither "target" nor "decoy", with its VALUE, so the message
+    // `fdr::validate_labels` produced can be reproduced verbatim at the point it was
+    // produced (below) rather than replaced by a bool that cannot name what it saw.
+    let mut bad_label: Option<String> = None;
     let mut mz: Vec<f64> = Vec::new();
     let mut apex_rt: Vec<f64> = Vec::new();
     let mut elution_lo: Vec<f64> = Vec::new();
@@ -268,10 +358,30 @@ pub fn run(p: RescoreParams) -> Result<u64> {
         validate_feature_schema(&expected_schema, &actual_schema, path)?;
         let t = TableFile::open(path)?;
         let c = t.u32("candidate_id")?;
-        let l = t.str("label")?;
+        // Read flat and reduced to one bit here. The full label text of an input is alive
+        // only for the length of this reduction (5.55 bytes per row, measured), and the
+        // scan is in flat row order across inputs, so `bad_label` holds the same first
+        // offending value the serial `validate_labels` below would have found.
+        let l = {
+            let (off, data) = t.str_flat("label")?;
+            let mut d = Vec::with_capacity(t.nrows);
+            for r in 0..off.len().saturating_sub(1) {
+                match &data[off[r]..off[r + 1]] {
+                    "decoy" => d.push(true),
+                    "target" => d.push(false),
+                    other => {
+                        d.push(false);
+                        if bad_label.is_none() {
+                            bad_label = Some(other.to_string());
+                        }
+                    }
+                }
+            }
+            d
+        };
         let b = t.u32("base_peptide_id")?;
-        let pf = t.str("peptidoform")?;
-        let pr = t.str("protein")?;
+        let pf = t.str_flat("peptidoform")?;
+        let pr = t.str_flat("protein")?;
         let z = t.f64("charge")?; // carried as an f64 feature
         let pl = t.f64("prelim_score")?;
         let pm = t.f64("precursor_mz")?;
@@ -288,10 +398,10 @@ pub fn run(p: RescoreParams) -> Result<u64> {
         // which copies `String` headers but never the heap blocks they own.
         merge_col(&mut cid, c, total_rows);
         merge_col(&mut peak_rank, pkr, total_rows);
-        merge_col(&mut label, l, total_rows);
+        merge_col(&mut is_decoy, l, total_rows);
         merge_col(&mut base, b, total_rows);
-        merge_col(&mut pform, pf, total_rows);
-        merge_col(&mut protein, pr, total_rows);
+        pform.merge(pf, total_rows);
+        protein.merge(pr, total_rows);
         merge_col(
             &mut charge,
             z.into_iter().map(|v| v as i32).collect(),
@@ -316,7 +426,7 @@ pub fn run(p: RescoreParams) -> Result<u64> {
     for (name, len) in [
         ("candidate_id", cid.len()),
         ("peak_rank", peak_rank.len()),
-        ("label", label.len()),
+        ("label", is_decoy.len()),
         ("base_peptide_id", base.len()),
         ("peptidoform", pform.len()),
         ("protein", protein.len()),
@@ -330,10 +440,14 @@ pub fn run(p: RescoreParams) -> Result<u64> {
     ] {
         refuse_row_disagreement(&format!("the competed column '{name}'"), len, total_rows)?;
     }
-    crate::fdr::validate_labels(&label)?;
-    let is_decoy: Vec<bool> = label.iter().map(|l| l == "decoy").collect();
+    // What `fdr::validate_labels(&label)` reported, from the scan that ran during the read
+    // above. Same rule, same message, same position in the sequence of checks: an unknown
+    // or malformed label must not silently count as a target, because the target-decoy
+    // null depends on exact labelling (docs/18_findings_and_decisions.md).
+    if let Some(l) = bad_label {
+        anyhow::bail!("unknown PSM label {l:?}; expected \"target\" or \"decoy\"");
+    }
     let (mut is_entrapment, mut is_real_target) = classify_entrapment(p.cfg, &protein, &is_decoy);
-    let mut is_decoy = is_decoy;
     let mut n = cid.len();
     // First row with a non-finite prelim_score/precursor_mz, if any. Found here but NOT
     // reported here: the serial validation this replaces checked a row's features before
@@ -386,7 +500,7 @@ pub fn run(p: RescoreParams) -> Result<u64> {
         // known here and `bail_non_finite` still makes the same choice between the two on
         // the row index.
         let streamed = {
-            let mut w = HandoffWriter::new(&paths, &feat_names, &label, &pform, &protein, &mz)?;
+            let mut w = HandoffWriter::new(&paths, &feat_names, &is_decoy, &pform, &protein, &mz)?;
             let scan = for_each_feature_row(p.competed, &feat_names, |row, values| {
                 if let Some(col) = values.iter().position(|v| !v.is_finite()) {
                     bail_non_finite(Some((row, col, values[col])), bad_scalar, &feat_names)?;
@@ -445,7 +559,7 @@ pub fn run(p: RescoreParams) -> Result<u64> {
             ("feats", feats_slot.as_ref().map_or(0, |f| f.bytes())),
             (
                 "metadata_columns",
-                meta_bytes(&cid, &label, &pform, &protein),
+                meta_bytes(&cid, &is_decoy, &pform, &protein),
             ),
         ],
     );
@@ -473,7 +587,7 @@ pub fn run(p: RescoreParams) -> Result<u64> {
                 "mokapot_worker.py",
                 &feat_names,
                 &cid,
-                &label,
+                &is_decoy,
                 &pform,
                 &protein,
                 &mz,
@@ -504,7 +618,7 @@ pub fn run(p: RescoreParams) -> Result<u64> {
                 "nn_rescore_worker.py",
                 &feat_names,
                 &cid,
-                &label,
+                &is_decoy,
                 &pform,
                 &protein,
                 &mz,
@@ -651,12 +765,13 @@ pub fn run(p: RescoreParams) -> Result<u64> {
                     { let tmp: Vec<_> = keep.iter().map(|&i| $v[i].clone()).collect(); $v = tmp; }
                 )+};
             }
+            // The flat string columns gather their own text rather than cloning one
+            // `String` per kept row.
+            pform = pform.gather(&keep);
+            protein = protein.gather(&keep);
             keep_rows!(
                 cid,
-                label,
                 base,
-                pform,
-                protein,
                 charge,
                 prelim,
                 apex_rt,
@@ -713,9 +828,9 @@ pub fn run(p: RescoreParams) -> Result<u64> {
     let protein_id: Vec<u32> = {
         let mut interner: HashMap<&str, u32> = HashMap::new();
         let mut ids = Vec::with_capacity(protein.len());
-        for s in &protein {
+        for s in protein.iter() {
             let next = interner.len() as u32;
-            ids.push(*interner.entry(s.as_str()).or_insert(next));
+            ids.push(*interner.entry(s).or_insert(next));
         }
         ids
     };
@@ -772,7 +887,7 @@ pub fn run(p: RescoreParams) -> Result<u64> {
         let mut ids = Vec::with_capacity(pform.len());
         for (pf, &z) in pform.iter().zip(charge.iter()) {
             let next = interner.len() as u32;
-            ids.push(*interner.entry((pf.as_str(), z)).or_insert(next));
+            ids.push(*interner.entry((pf, z)).or_insert(next));
         }
         ids
     };
@@ -841,7 +956,7 @@ pub fn run(p: RescoreParams) -> Result<u64> {
             cid,
             pform,
             charge,
-            label,
+            is_decoy,
             protein,
             base,
             apex_rt,
@@ -930,10 +1045,13 @@ pub fn run(p: RescoreParams) -> Result<u64> {
 /// The `psms_scored` columns, in schema order.
 struct ScoredColumns {
     cid: Vec<u32>,
-    pform: Vec<String>,
+    pform: FlatStr,
     charge: Vec<i32>,
-    label: Vec<String>,
-    protein: Vec<String>,
+    /// `label`, as the bit every read of it in this stage takes. `validate_labels` (the
+    /// check reproduced in `run`) guarantees the column is exactly {"target", "decoy"},
+    /// so writing `if decoy {"decoy"} else {"target"}` reproduces the input bytes.
+    is_decoy: Vec<bool>,
+    protein: FlatStr,
     base: Vec<u32>,
     apex_rt: Vec<f64>,
     elution_lo: Vec<f64>,
@@ -973,14 +1091,12 @@ struct ScoredColumns {
 /// the identical SNAPPY writer on the identical `AtomicPath` temp-then-rename. The
 /// duplicate columns are encoded independently, exactly as they were when they were
 /// separate vectors.
-fn write_scored_table(path: &str, c: ScoredColumns) -> Result<u64> {
-    use arrow::array::{ArrayRef, Int32Array, StringArray, UInt32Array};
+fn scored_schema() -> std::sync::Arc<arrow::datatypes::Schema> {
     use arrow::datatypes::{DataType, Field, Schema};
-    use arrow::record_batch::RecordBatch;
     use std::sync::Arc;
 
     let f = |name: &str, t: DataType| Field::new(name, t, false);
-    let schema = Arc::new(Schema::new(vec![
+    Arc::new(Schema::new(vec![
         f("candidate_id", DataType::UInt32),
         f("peptidoform", DataType::Utf8),
         f("charge", DataType::Int32),
@@ -1009,14 +1125,33 @@ fn write_scored_table(path: &str, c: ScoredColumns) -> Result<u64> {
         // Which chromatographic peak the rescorer selected for this candidate (#7).
         // 0 = the up-front apex; > 0 = a promoted alternate peak won.
         f("selected_peak_rank", DataType::Int32),
-    ]));
-    let protein: ArrayRef = Arc::new(StringArray::from(c.protein));
+    ]))
+}
+
+fn write_scored_table(path: &str, c: ScoredColumns) -> Result<u64> {
+    use arrow::array::{ArrayRef, Int32Array, StringArray, UInt32Array};
+    use arrow::record_batch::RecordBatch;
+    use std::sync::Arc;
+
+    let schema = scored_schema();
+    // `StringArray::from(Vec<String>)` IS `StringArray::from_iter_values` in arrow 59
+    // (`string_array.rs`), so building the same values from the flat columns and from the
+    // label bits produces the identical offsets+values buffers, and therefore the
+    // identical parquet. `the_flat_metadata_columns_write_the_same_scored_parquet` pins
+    // that against the previous `Vec<String>` construction.
+    let protein: ArrayRef = Arc::new(StringArray::from_iter_values(c.protein.iter()));
     let q: ArrayRef = Arc::new(Float64Array::from(c.psm_q));
     let arrays: Vec<ArrayRef> = vec![
         Arc::new(UInt32Array::from(c.cid)),
-        Arc::new(StringArray::from(c.pform)),
+        Arc::new(StringArray::from_iter_values(c.pform.iter())),
         Arc::new(Int32Array::from(c.charge)),
-        Arc::new(StringArray::from(c.label)),
+        Arc::new(StringArray::from_iter_values(c.is_decoy.iter().map(|&d| {
+            if d {
+                "decoy"
+            } else {
+                "target"
+            }
+        }))),
         protein.clone(),
         Arc::new(UInt32Array::from(c.base)),
         Arc::new(Float64Array::from(c.apex_rt)),
@@ -1187,7 +1322,7 @@ fn native_scores(
 /// `(is_entrapment, is_real_target)`.
 fn classify_entrapment(
     cfg: &RescoreConfig,
-    protein: &[String],
+    protein: &FlatStr,
     is_decoy: &[bool],
 ) -> (Vec<bool>, Vec<bool>) {
     let marker = cfg.entrapment_marker.as_deref();
@@ -1200,11 +1335,12 @@ fn classify_entrapment(
         if is_decoy[i] {
             continue;
         }
+        let acc = protein.get(i);
         let is_ent = match marker {
             Some(m) => {
-                protein[i].contains(m)
-                    && exclude.is_none_or(|e| !protein[i].contains(e))
-                    && !contaminants.iter().any(|c| protein[i].contains(c.as_str()))
+                acc.contains(m)
+                    && exclude.is_none_or(|e| !acc.contains(e))
+                    && !contaminants.iter().any(|c| acc.contains(c.as_str()))
             }
             None => false,
         };
@@ -1456,9 +1592,10 @@ struct HandoffWriter<'a> {
     /// caller's metadata columns happen to be long.
     rows: u64,
     feat_names: &'a [String],
-    label: &'a [String],
-    pform: &'a [String],
-    protein: &'a [String],
+    /// `label`, reduced to the bit the PIN's `Label` column and the parquet's need.
+    is_decoy: &'a [bool],
+    pform: &'a FlatStr,
+    protein: &'a FlatStr,
     mz: &'a [f64],
 }
 
@@ -1466,9 +1603,9 @@ impl<'a> HandoffWriter<'a> {
     fn new(
         paths: &SidecarPaths,
         feat_names: &'a [String],
-        label: &'a [String],
-        pform: &'a [String],
-        protein: &'a [String],
+        is_decoy: &'a [bool],
+        pform: &'a FlatStr,
+        protein: &'a FlatStr,
         mz: &'a [f64],
     ) -> Result<HandoffWriter<'a>> {
         use arrow::datatypes::{DataType, Field, Schema};
@@ -1516,7 +1653,7 @@ impl<'a> HandoffWriter<'a> {
             block_rows: HANDOFF_BATCH_ROWS,
             rows: 0,
             feat_names,
-            label,
+            is_decoy,
             pform,
             protein,
             mz,
@@ -1548,7 +1685,7 @@ impl<'a> HandoffWriter<'a> {
                 Ok(())
             }
             HandoffSink::Pin(w) => {
-                let lab = if self.label[i] == "decoy" { -1 } else { 1 };
+                let lab = if self.is_decoy[i] { -1 } else { 1 };
                 write!(
                     w,
                     "psm_{}\t{}\t{}\t{:.5}\t{:.5}\t",
@@ -1557,7 +1694,7 @@ impl<'a> HandoffWriter<'a> {
                 for v in values.iter().take(nf) {
                     write!(w, "{:.6}\t", v)?;
                 }
-                writeln!(w, "-.{}.-\t{}", self.pform[i], self.protein[i])?;
+                writeln!(w, "-.{}.-\t{}", self.pform.get(i), self.protein.get(i))?;
                 Ok(())
             }
         }
@@ -1570,7 +1707,7 @@ impl<'a> HandoffWriter<'a> {
         use std::sync::Arc;
 
         let nf = self.feat_names.len();
-        let (label, pform, protein, mz) = (self.label, self.pform, self.protein, self.mz);
+        let (is_decoy, pform, protein, mz) = (self.is_decoy, self.pform, self.protein, self.mz);
         let HandoffSink::Parquet(pq) = &mut self.sink else {
             return Ok(());
         };
@@ -1586,7 +1723,7 @@ impl<'a> HandoffWriter<'a> {
         )));
         arrays.push(Arc::new(Int32Array::from(
             (start..end)
-                .map(|i| if label[i] == "decoy" { -1 } else { 1 })
+                .map(|i| if is_decoy[i] { -1 } else { 1 })
                 .collect::<Vec<_>>(),
         )));
         arrays.push(Arc::new(Int32Array::from(
@@ -1601,10 +1738,13 @@ impl<'a> HandoffWriter<'a> {
         }
         arrays.push(Arc::new(StringArray::from(
             (start..end)
-                .map(|i| format!("-.{}.-", pform[i]))
+                .map(|i| format!("-.{}.-", pform.get(i)))
                 .collect::<Vec<_>>(),
         )));
-        arrays.push(Arc::new(StringArray::from(protein[start..end].to_vec())));
+        // `StringArray::from(Vec<String>)` is `from_iter_values`, so the same bytes.
+        arrays.push(Arc::new(StringArray::from_iter_values(
+            (start..end).map(|i| protein.get(i)),
+        )));
         pq.writer
             .write(&RecordBatch::try_new(pq.schema.clone(), arrays)?)?;
         pq.stage.clear();
@@ -1794,9 +1934,9 @@ fn run_pin_sidecar(
     script_name: &str,
     feat_names: &[String],
     cid: &[u32],
-    label: &[String],
-    pform: &[String],
-    protein: &[String],
+    is_decoy: &[bool],
+    pform: &FlatStr,
+    protein: &FlatStr,
     mz: &[f64],
     feats: &mut Option<FeatureMatrix>,
     base: &[u32],
@@ -1820,7 +1960,7 @@ fn run_pin_sidecar(
             // per-spectrum competition would collapse the runs. The row index is unique
             // across the whole concatenation. Single-run behaviour is unchanged (the
             // mapping is bijective and mokapot does not use SpecId/ScanNr as features).
-            let mut w = HandoffWriter::new(&paths, feat_names, label, pform, protein, mz)?;
+            let mut w = HandoffWriter::new(&paths, feat_names, is_decoy, pform, protein, mz)?;
             for i in 0..cid.len() {
                 w.push_row(i, matrix.row(i))?;
             }
@@ -2128,6 +2268,162 @@ b
         write_table(path, cols).unwrap();
     }
 
+    /// One input's worth of `TableFile::str_flat` output, for the tests that feed
+    /// `FlatStr` directly.
+    fn flat_parts<S: AsRef<str>>(v: &[S]) -> (Vec<usize>, String) {
+        let mut offsets = vec![0usize];
+        let mut data = String::new();
+        for s in v {
+            data.push_str(s.as_ref());
+            offsets.push(data.len());
+        }
+        (offsets, data)
+    }
+
+    fn flat<S: AsRef<str>>(v: &[S]) -> FlatStr {
+        let mut f = FlatStr::default();
+        f.merge(flat_parts(v), v.len());
+        f
+    }
+
+    #[test]
+    fn flat_columns_concatenate_and_gather_like_a_vec_of_strings() {
+        // `FlatStr::merge` is the flat counterpart of `merge_col` and is the part of the
+        // layout easiest to get subtly wrong: the second input's offsets have to be
+        // rebased onto the end of the first input's text. Pinned against what the
+        // `Vec<String>` columns did, over the same inputs, including the empty-first-input
+        // case `merge_col_moves_the_first_input_and_appends_the_rest` covers.
+        let a: Vec<String> = vec!["PEPTIDEK".into(), "".into(), "MKK[+42]R".into()];
+        let b: Vec<String> = vec!["ELVIS".into(), "LIVES".into()];
+        let total = a.len() + b.len();
+
+        let mut want: Vec<String> = Vec::new();
+        merge_col(&mut want, a.clone(), total);
+        merge_col(&mut want, b.clone(), total);
+
+        let mut got = FlatStr::default();
+        got.merge(flat_parts(&a), total);
+        got.merge(flat_parts(&b), total);
+        assert_eq!(got.len(), want.len());
+        assert_eq!(got.iter().collect::<Vec<_>>(), want, "concatenated rows");
+        assert_eq!(got.iter().len(), want.len(), "the iterator is exact-sized");
+
+        // An empty first input must not lose the rows of the second, and must not leave
+        // the offsets without their leading zero.
+        let mut empty_first = FlatStr::default();
+        empty_first.merge(flat_parts::<String>(&[]), 2);
+        empty_first.merge(flat_parts(&b), 2);
+        assert_eq!(empty_first.iter().collect::<Vec<_>>(), b);
+
+        // `gather` is the top-K collapse's `keep_rows!`, which cloned one `String` per
+        // kept row.
+        let keep = vec![4usize, 2, 0];
+        let gathered = got.gather(&keep);
+        let cloned: Vec<String> = keep.iter().map(|&i| want[i].clone()).collect();
+        assert_eq!(gathered.iter().collect::<Vec<_>>(), cloned);
+        assert_eq!(gathered.len(), 3);
+    }
+
+    #[test]
+    fn the_flat_metadata_columns_write_the_same_scored_parquet() {
+        // The output-equality claim of the flat/bit metadata columns: `psms_scored` must
+        // be byte-for-byte the file the `Vec<String>` columns produced. Both arms are
+        // written by `write_scored_table` itself, one from the flat columns and one from
+        // a `ScoredColumns` whose string arrays are rebuilt the old way, so what is
+        // compared is the array construction and nothing else.
+        //
+        // `label` is the part that could not be reproduced from a bool if the input were
+        // not exactly {"target", "decoy"}; the check that guarantees it is pinned
+        // separately by `an_unknown_label_is_still_refused_by_its_value`.
+        let n = 300usize;
+        let dir = std::env::temp_dir().join("mumdia_scored_flat_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let pid = std::process::id();
+        let pform: Vec<String> = (0..n).map(|i| format!("PEPTIDEK[+16]{i}")).collect();
+        let protein: Vec<String> = (0..n)
+            .map(|i| format!("sp|P{:05}|PROT_HUMAN;sp|Q{:05}|ALT_HUMAN", i % 37, i % 11))
+            .collect();
+        let is_decoy: Vec<bool> = (0..n).map(|i| i % 3 == 0).collect();
+
+        let columns = |pform: FlatStr, protein: FlatStr| ScoredColumns {
+            cid: (0..n as u32).collect(),
+            pform,
+            charge: (0..n).map(|i| 2 + (i % 3) as i32).collect(),
+            is_decoy: is_decoy.clone(),
+            protein,
+            base: (0..n as u32).map(|i| i / 2).collect(),
+            apex_rt: (0..n).map(|i| i as f64 * 0.5).collect(),
+            elution_lo: (0..n).map(|i| i as f64 * 0.5 - 1.0).collect(),
+            elution_hi: (0..n).map(|i| i as f64 * 0.5 + 1.0).collect(),
+            scores: (0..n).map(|i| (i % 29) as f64 / 29.0).collect(),
+            psm_q: (0..n).map(|i| (i % 97) as f64 / 97.0).collect(),
+            peptide_q: (0..n).map(|i| (i % 53) as f64 / 53.0).collect(),
+            pg_q: (0..n).map(|i| (i % 41) as f64 / 41.0).collect(),
+            prelim: (0..n).map(|i| i as f64).collect(),
+            source: vec![0; n],
+            run_psm_q: (0..n).map(|i| (i % 89) as f64 / 89.0).collect(),
+            precursor_q: (0..n).map(|i| (i % 61) as f64 / 61.0).collect(),
+            peak_rank: vec![0; n],
+        };
+
+        let from_flat = dir.join(format!("flat_{pid}.parquet"));
+        let rows = write_scored_table(
+            from_flat.to_str().unwrap(),
+            columns(flat(&pform), flat(&protein)),
+        )
+        .unwrap();
+        assert_eq!(rows, n as u64);
+
+        // The previous construction: `StringArray::from(Vec<String>)` over the same
+        // values, including the label text the bit stands for.
+        let label: Vec<String> = is_decoy
+            .iter()
+            .map(|&d| if d { "decoy" } else { "target" }.to_string())
+            .collect();
+        let from_vecs = dir.join(format!("vecs_{pid}.parquet"));
+        {
+            use arrow::array::{ArrayRef, Int32Array, StringArray, UInt32Array};
+            use std::sync::Arc;
+            let c = columns(flat(&pform), flat(&protein));
+            let schema = scored_schema();
+            let protein_a: ArrayRef = Arc::new(StringArray::from(protein.clone()));
+            let q: ArrayRef = Arc::new(Float64Array::from(c.psm_q));
+            let arrays: Vec<ArrayRef> = vec![
+                Arc::new(UInt32Array::from(c.cid)),
+                Arc::new(StringArray::from(pform.clone())),
+                Arc::new(Int32Array::from(c.charge)),
+                Arc::new(StringArray::from(label)),
+                protein_a.clone(),
+                Arc::new(UInt32Array::from(c.base)),
+                Arc::new(Float64Array::from(c.apex_rt)),
+                Arc::new(Float64Array::from(c.elution_lo)),
+                Arc::new(Float64Array::from(c.elution_hi)),
+                Arc::new(Float64Array::from(c.scores)),
+                q.clone(),
+                Arc::new(Float64Array::from(c.peptide_q)),
+                protein_a,
+                Arc::new(Float64Array::from(c.pg_q)),
+                q.clone(),
+                Arc::new(Float64Array::from(c.prelim)),
+                Arc::new(UInt32Array::from(c.source)),
+                Arc::new(Float64Array::from(c.run_psm_q)),
+                q,
+                Arc::new(Float64Array::from(c.precursor_q)),
+                Arc::new(Int32Array::from(c.peak_rank)),
+            ];
+            let batch = arrow::record_batch::RecordBatch::try_new(schema.clone(), arrays).unwrap();
+            let mut w =
+                mumdia_io::table::BatchWriter::new(from_vecs.to_str().unwrap(), schema).unwrap();
+            w.write(&batch).unwrap();
+            w.close().unwrap();
+        }
+        assert_eq!(
+            std::fs::read(&from_flat).unwrap(),
+            std::fs::read(&from_vecs).unwrap(),
+            "the flat metadata columns must write the identical psms_scored"
+        );
+    }
+
     fn scratch(name: &str) -> String {
         let dir = std::env::temp_dir().join("mumdia_rescore_stream_test");
         std::fs::create_dir_all(&dir).unwrap();
@@ -2186,11 +2482,9 @@ b
         crafted_competed(&b, 5, 900.0, &names, true);
         let competed = vec![a, b];
         let n = 12;
-        let label: Vec<String> = (0..n)
-            .map(|i| if i % 3 == 0 { "decoy" } else { "target" }.to_string())
-            .collect();
-        let pform: Vec<String> = (0..n).map(|i| format!("PEPTIDEK/{i}")).collect();
-        let protein: Vec<String> = (0..n).map(|i| format!("sp|P{i:05}|X")).collect();
+        let is_decoy: Vec<bool> = (0..n).map(|i| i % 3 == 0).collect();
+        let pform = flat(&(0..n).map(|i| format!("PEPTIDEK/{i}")).collect::<Vec<_>>());
+        let protein = flat(&(0..n).map(|i| format!("sp|P{i:05}|X")).collect::<Vec<_>>());
         let mz: Vec<f64> = (0..n).map(|i| 400.0 + i as f64 * 1.5).collect();
         let m = load_feature_matrix(&competed, &names, n).unwrap();
 
@@ -2207,7 +2501,7 @@ b
                 foldkeys: String::new(),
                 use_pq,
             };
-            let mut w = HandoffWriter::new(&from_matrix, &names, &label, &pform, &protein, &mz)
+            let mut w = HandoffWriter::new(&from_matrix, &names, &is_decoy, &pform, &protein, &mz)
                 .unwrap()
                 .with_block_rows(5);
             for i in 0..n {
@@ -2215,7 +2509,7 @@ b
             }
             assert_eq!(w.finish().unwrap(), n as u64);
 
-            let mut w = HandoffWriter::new(&from_stream, &names, &label, &pform, &protein, &mz)
+            let mut w = HandoffWriter::new(&from_stream, &names, &is_decoy, &pform, &protein, &mz)
                 .unwrap()
                 .with_block_rows(5);
             for_each_feature_row(&competed, &names, |i, v| w.push_row(i, v)).unwrap();
@@ -2244,6 +2538,12 @@ b
         crafted_competed_table_planting(path, rows, None, None);
     }
 
+    /// The same table with one row's `label` replaced by a value that is neither
+    /// "target" nor "decoy".
+    fn crafted_competed_table_mislabelled(path: &str, rows: usize, row: usize, label: &str) {
+        crafted_competed_table_inner(path, rows, None, None, Some((row, label)));
+    }
+
     /// The same table with a NaN planted in the `feat_b` feature column and/or in the
     /// `precursor_mz` metadata column, which is what a malformed competed input looks like
     /// to the two validations (a null f64 cell reads back as NaN, so a null is the same
@@ -2254,12 +2554,25 @@ b
         nan_feature_row: Option<usize>,
         nan_mz_row: Option<usize>,
     ) {
+        crafted_competed_table_inner(path, rows, nan_feature_row, nan_mz_row, None);
+    }
+
+    fn crafted_competed_table_inner(
+        path: &str,
+        rows: usize,
+        nan_feature_row: Option<usize>,
+        nan_mz_row: Option<usize>,
+        bad_label: Option<(usize, &str)>,
+    ) {
         let cols = vec![
             Col::U32("candidate_id".into(), (0..rows as u32).collect()),
             Col::Str(
                 "label".into(),
                 (0..rows)
-                    .map(|i| if i % 2 == 0 { "target" } else { "decoy" }.to_string())
+                    .map(|i| match bad_label {
+                        Some((row, l)) if row == i => l.to_string(),
+                        _ => if i % 2 == 0 { "target" } else { "decoy" }.to_string(),
+                    })
                     .collect(),
             ),
             Col::U32(
@@ -2518,6 +2831,31 @@ b
                 .to_string();
             assert!(err.contains(expect), "{err} should contain {expect}");
         }
+    }
+
+    #[test]
+    fn an_unknown_label_is_still_refused_by_its_value() {
+        // `label` is no longer carried as a `Vec<String>`, so the check that used to be
+        // `fdr::validate_labels(&label)` now runs on the flat text during the read. The
+        // behaviour it has to keep is the OLD one, in both halves: an unknown value is a
+        // hard error, and the message names the value it saw -- a bool could not. It also
+        // has to fail at the same point, before a byte of handoff is written.
+        let competed = scratch("badlabel_competed.parquet");
+        crafted_competed_table_mislabelled(&competed, 24, 7, "TARGET");
+        let (err, handoff, work) = run_streamed(&competed, "badlabel");
+        assert!(
+            err.contains(r#"unknown PSM label "TARGET""#)
+                && err.contains(r#"expected "target" or "decoy""#),
+            "{err}"
+        );
+        assert!(!std::path::Path::new(&handoff).exists(), "{handoff}");
+        no_handoff_rubble(&work);
+
+        // An empty label is refused the same way, and is not silently a target.
+        let competed = scratch("emptylabel_competed.parquet");
+        crafted_competed_table_mislabelled(&competed, 24, 0, "");
+        let (err, _, _) = run_streamed(&competed, "emptylabel");
+        assert!(err.contains(r#"unknown PSM label """#), "{err}");
     }
 
     #[test]
