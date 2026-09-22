@@ -20,4 +20,5 @@ pub mod run;
 pub mod run_experiment;
 pub mod run_groups;
 pub mod search_seed;
+pub mod seed_pool;
 pub mod sub_library;
