@@ -122,8 +122,6 @@ pub fn run(g: GroupRun) -> Result<Pooled> {
         n: usize,
         prec: String,
         seed: String,
-        /// The band's rows of the pooled seed (local ids, pooled q).
-        seed_view: String,
     }
     let mut bands: Vec<Band> = Vec::new();
     for b in &plan.bands {
@@ -165,7 +163,6 @@ pub fn run(g: GroupRun) -> Result<Pooled> {
             n,
             prec,
             seed,
-            seed_view: gd(b.index, "seed_psms_pooled.parquet"),
         });
     }
     if bands.is_empty() {
@@ -180,7 +177,6 @@ pub fn run(g: GroupRun) -> Result<Pooled> {
             path: b.seed.clone(),
             offset: b.offset,
             rows: b.n as u32,
-            view: b.seed_view.clone(),
         })
         .collect();
     let masscals: Vec<String> = bands
@@ -373,9 +369,11 @@ pub fn run(g: GroupRun) -> Result<Pooled> {
         let nf = features::run(features::FeaturesParams {
             psms: &psms,
             chromatograms: &chrom,
-            // Corroboration and the confident elution boundary key on the seed by local
-            // id; under global calibration "confident" means the pooled q.
-            seed: Some(if global { &b.seed_view } else { &b.seed }),
+            // Corroboration and the confident elution boundary key on the seed by
+            // candidate id, and the band's tables carry library-wide ids, so the pooled
+            // seed is the one that matches. Its q is the pooled one either way, which is
+            // what "confident" has to mean once the bands are scored together.
+            seed: Some(&pooled_seed),
             out: &feats,
             out_pin: &pin,
             cfg: &cfg.features,
@@ -406,10 +404,8 @@ pub fn run(g: GroupRun) -> Result<Pooled> {
             ch,
         )?);
         arts.push(pool::BandArtifacts {
-            offset: b.offset,
             psms,
             chromatograms: chrom,
-            features: feats,
             competed,
         });
     }
@@ -422,7 +418,9 @@ pub fn run(g: GroupRun) -> Result<Pooled> {
         seed: pooled_seed,
         psms: d("psms_extracted.parquet"),
         chromatograms: d("chromatograms.parquet"),
-        features: d("features.parquet"),
+        // Not pooled: nothing reads a run-level features table (compete's output carries
+        // the feature columns), and on a real run it is 55 GB of writes per run.
+        features: String::new(),
         competed: d("psms_competed.parquet"),
         rt_model,
     };
@@ -431,7 +429,6 @@ pub fn run(g: GroupRun) -> Result<Pooled> {
         bands: &arts,
         out_psms: &out.psms,
         out_chromatograms: &out.chromatograms,
-        out_features: &out.features,
         out_competed: &out.competed,
     })
     .context("pooling the window groups")?;
@@ -447,12 +444,6 @@ pub fn run(g: GroupRun) -> Result<Pooled> {
             artifact::CHROMATOGRAMS,
             &out.chromatograms,
             stats.chromatograms,
-        ),
-        (
-            artifact::FEATURES.0,
-            artifact::FEATURES,
-            &out.features,
-            stats.features,
         ),
         (
             artifact::PSMS_COMPETED.0,
@@ -486,15 +477,12 @@ pub fn run(g: GroupRun) -> Result<Pooled> {
         }
         .write_for(path)?;
     }
-    // The feature and competed schema companions (`<table>.schema.json`) describe the
-    // classifier's columns; every band wrote the same one, so the first band's is the pool's.
-    for (band, pooled) in [
-        (&arts[0].features, &out.features),
-        (&arts[0].competed, &out.competed),
-    ] {
-        let src = format!("{band}.schema.json");
+    // The competed table's schema companion (`<table>.schema.json`) names the classifier's
+    // columns; every band wrote the same one, so the first band's is the pool's.
+    {
+        let src = format!("{}.schema.json", arts[0].competed);
         if std::path::Path::new(&src).exists() {
-            std::fs::copy(&src, format!("{pooled}.schema.json"))
+            std::fs::copy(&src, format!("{}.schema.json", out.competed))
                 .with_context(|| format!("copying {src} beside the pooled table"))?;
         }
     }

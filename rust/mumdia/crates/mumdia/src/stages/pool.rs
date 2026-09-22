@@ -18,23 +18,20 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, bail, Result};
 use arrow::array::{Array, BooleanArray, UInt32Array};
 use arrow::compute::filter_record_batch;
-use arrow::record_batch::RecordBatch;
 use mumdia_io::table::{BatchWriter, TableFile};
 use tracing::info;
 
 const BATCH_ROWS: usize = 1 << 16;
 const ROW_GROUP_ROWS: usize = 1 << 17;
 
-/// One group's artifacts and where its band starts in the library.
+/// One group's artifacts. The ids inside are already library-wide.
 #[derive(Clone, Debug)]
 pub struct BandArtifacts {
-    pub offset: u32,
     pub psms: String,
     pub chromatograms: String,
-    pub features: String,
     pub competed: String,
 }
 
@@ -42,7 +39,6 @@ pub struct PoolParams<'a> {
     pub bands: &'a [BandArtifacts],
     pub out_psms: &'a str,
     pub out_chromatograms: &'a str,
-    pub out_features: &'a str,
     pub out_competed: &'a str,
 }
 
@@ -51,7 +47,6 @@ pub struct PoolParams<'a> {
 pub struct PoolStats {
     pub psms: u64,
     pub chromatograms: u64,
-    pub features: u64,
     pub competed: u64,
     /// Candidates that appeared in two bands and were kept from one.
     pub duplicates: u64,
@@ -81,10 +76,7 @@ fn overlap_losers(bands: &[BandArtifacts]) -> Result<(Vec<HashSet<u32>>, u64)> {
                 *e = *s;
             }
         }
-        for (local, s) in per_band {
-            let global = local
-                .checked_add(band.offset)
-                .ok_or_else(|| anyhow!("candidate id overflow pooling {}", band.competed))?;
+        for (global, s) in per_band {
             match best.get(&global) {
                 None => {
                     best.insert(global, (b, s));
@@ -92,10 +84,10 @@ fn overlap_losers(bands: &[BandArtifacts]) -> Result<(Vec<HashSet<u32>>, u64)> {
                 Some(&(prev_b, prev_s)) => {
                     duplicates += 1;
                     if s > prev_s {
-                        losers[prev_b].insert(global - bands[prev_b].offset);
+                        losers[prev_b].insert(global);
                         best.insert(global, (b, s));
                     } else {
-                        losers[b].insert(local);
+                        losers[b].insert(global);
                     }
                 }
             }
@@ -105,11 +97,11 @@ fn overlap_losers(bands: &[BandArtifacts]) -> Result<(Vec<HashSet<u32>>, u64)> {
 }
 
 /// Append every band's table into `out`, ids offset, losers dropped. Returns the row count.
-fn pool_table(paths: impl Iterator<Item = (String, u32, HashSet<u32>)>, out: &str) -> Result<u64> {
+fn pool_table(paths: impl Iterator<Item = (String, HashSet<u32>)>, out: &str) -> Result<u64> {
     let mut writer: Option<BatchWriter> = None;
     let mut schema: Option<Arc<arrow::datatypes::Schema>> = None;
     let mut rows = 0u64;
-    for (path, offset, drop) in paths {
+    for (path, drop) in paths {
         let t = TableFile::open(&path)?;
         let reader = t.batches(None, BATCH_ROWS)?;
         let this_schema = reader.schema();
@@ -137,29 +129,23 @@ fn pool_table(paths: impl Iterator<Item = (String, u32, HashSet<u32>)>, out: &st
         let w = writer.as_mut().expect("opened above");
         for b in reader {
             let b = b?;
-            let cid = b
-                .column(cid_ix)
-                .as_any()
-                .downcast_ref::<UInt32Array>()
-                .ok_or_else(|| anyhow!("{path}: candidate_id is not u32"))?;
-            if cid.null_count() > 0 {
-                bail!("{path}: candidate_id has nulls");
-            }
-            let mut global = Vec::with_capacity(cid.len());
-            for &c in cid.values().iter() {
-                global.push(
-                    c.checked_add(offset)
-                        .ok_or_else(|| anyhow!("candidate id overflow pooling {path}"))?,
-                );
-            }
-            let mut cols = b.columns().to_vec();
-            cols[cid_ix] = Arc::new(UInt32Array::from(global));
-            let mut batch = RecordBatch::try_new(this_schema.clone(), cols)
-                .with_context(|| format!("rebuilding a batch of {path}"))?;
-            if !drop.is_empty() {
-                let keep: Vec<bool> = cid.values().iter().map(|c| !drop.contains(c)).collect();
-                batch = filter_record_batch(&batch, &BooleanArray::from(keep))?;
-            }
+            let keep: Option<Vec<bool>> = {
+                let cid = b
+                    .column(cid_ix)
+                    .as_any()
+                    .downcast_ref::<UInt32Array>()
+                    .ok_or_else(|| anyhow!("{path}: candidate_id is not u32"))?;
+                if cid.null_count() > 0 {
+                    bail!("{path}: candidate_id has nulls");
+                }
+                (!drop.is_empty()).then(|| cid.values().iter().map(|c| !drop.contains(c)).collect())
+            };
+            // The band stages already wrote library-wide ids (`Library::global_offset` is
+            // added on the way out of extract), so pooling appends rather than rewrites.
+            let batch = match keep {
+                Some(k) => filter_record_batch(&b, &BooleanArray::from(k))?,
+                None => b,
+            };
             if batch.num_rows() > 0 {
                 w.write(&batch)?;
                 rows += batch.num_rows() as u64;
@@ -185,13 +171,12 @@ pub fn run(p: PoolParams) -> Result<PoolStats> {
         p.bands
             .iter()
             .zip(losers.iter())
-            .map(move |(b, l)| (pick(b).clone(), b.offset, l.clone()))
+            .map(move |(b, l)| (pick(b).clone(), l.clone()))
             .collect::<Vec<_>>()
     };
     let stats = PoolStats {
         psms: pool_table(with(|b| &b.psms).into_iter(), p.out_psms)?,
         chromatograms: pool_table(with(|b| &b.chromatograms).into_iter(), p.out_chromatograms)?,
-        features: pool_table(with(|b| &b.features).into_iter(), p.out_features)?,
         competed: pool_table(with(|b| &b.competed).into_iter(), p.out_competed)?,
         duplicates,
     };
@@ -199,7 +184,6 @@ pub fn run(p: PoolParams) -> Result<PoolStats> {
         groups = p.bands.len(),
         psms = stats.psms,
         chromatograms = stats.chromatograms,
-        features = stats.features,
         competed = stats.competed,
         duplicates,
         elapsed_ms = t0.elapsed().as_millis() as u64,
@@ -216,7 +200,7 @@ mod tests {
     fn band(
         dir: &std::path::Path,
         tag: &str,
-        offset: u32,
+        marker: f64,
         cids: &[u32],
         scores: &[f64],
     ) -> BandArtifacts {
@@ -230,9 +214,7 @@ mod tests {
                 Col::U32("candidate_id".into(), cids.to_vec()),
                 Col::F64(
                     "x".into(),
-                    cids.iter()
-                        .map(|c| *c as f64 + offset as f64 * 0.001)
-                        .collect(),
+                    cids.iter().map(|c| *c as f64 + marker).collect(),
                 ),
             ];
             if extra {
@@ -242,10 +224,8 @@ mod tests {
             p
         };
         BandArtifacts {
-            offset,
             psms: mk("psms", false),
             chromatograms: mk("chrom", false),
-            features: mk("feat", false),
             competed: mk("comp", true),
         }
     }
@@ -254,35 +234,41 @@ mod tests {
     fn pooled_tables_carry_global_ids_and_one_row_per_overlap_candidate() {
         let dir = std::env::temp_dir().join(format!("mumdia_pool_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        // Band 0: global 0..4; band 1: offset 3, local 0..3 = global 3..6. Globals 3 and 4
-        // are in both; band 0 wins 3 (higher score), band 1 wins 4.
-        let b0 = band(&dir, "b0", 0, &[0, 1, 2, 3, 4], &[9.0, 9.0, 9.0, 7.0, 2.0]);
-        let b1 = band(&dir, "b1", 3, &[0, 1, 2, 3], &[5.0, 6.0, 9.0, 9.0]);
+        // The bands already carry library-wide ids: band 0 holds 0..4, band 1 holds 3..6,
+        // so 3 and 4 are in both. Band 0 wins 3 (higher score), band 1 wins 4. The `x`
+        // marker says which band a row came from.
+        let b0 = band(
+            &dir,
+            "b0",
+            0.0,
+            &[0, 1, 2, 3, 4],
+            &[9.0, 9.0, 9.0, 7.0, 2.0],
+        );
+        let b1 = band(&dir, "b1", 0.003, &[3, 4, 5, 6], &[5.0, 6.0, 9.0, 9.0]);
         let out = |n: &str| {
             dir.join(format!("out_{n}.parquet"))
                 .to_str()
                 .unwrap()
                 .to_string()
         };
-        let (op, oc, of, ok) = (out("psms"), out("chrom"), out("feat"), out("comp"));
+        let (op, oc, ok) = (out("psms"), out("chrom"), out("comp"));
         let stats = run(PoolParams {
             bands: &[b0, b1],
             out_psms: &op,
             out_chromatograms: &oc,
-            out_features: &of,
             out_competed: &ok,
         })
         .unwrap();
         assert_eq!(stats.duplicates, 2);
         assert_eq!(stats.competed, 7);
-        for path in [&op, &oc, &of, &ok] {
+        for path in [&op, &oc, &ok] {
             let t = TableFile::open(path).unwrap();
             let cid = t.u32("candidate_id").unwrap();
             assert_eq!(cid, vec![0, 1, 2, 3, 4, 5, 6], "{path}");
             let x = t.f64("x").unwrap();
-            // Global 3 came from band 0 (x = 3.000), global 4 from band 1 (x = 1.003).
+            // Id 3 came from band 0 (x = 3.000), id 4 from band 1 (x = 4.003).
             assert!(
-                (x[3] - 3.0).abs() < 1e-9 && (x[4] - 1.003).abs() < 1e-9,
+                (x[3] - 3.0).abs() < 1e-9 && (x[4] - 4.003).abs() < 1e-9,
                 "{path}: {x:?}"
             );
         }
