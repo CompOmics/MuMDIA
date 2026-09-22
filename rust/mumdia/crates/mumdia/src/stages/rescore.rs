@@ -106,6 +106,25 @@ fn merge_col<T>(dst: &mut Vec<T>, mut src: Vec<T>, total_rows: usize) {
     dst.append(&mut src);
 }
 
+/// Refuse a read of the competed inputs whose row count disagrees with the row count every
+/// other read of them produced.
+///
+/// The metadata columns, the streamed handoff and the feature matrix are now three separate
+/// passes over the same files, where they used to be one loop that could not disagree with
+/// itself. Any disagreement row-misaligns the features against `label`, `source` and every
+/// other metadata column, and nothing downstream can detect that, so every pass is measured
+/// against the row count the parquet footers declared.
+fn refuse_row_disagreement(what: &str, got: usize, expected: usize) -> Result<()> {
+    if got != expected {
+        anyhow::bail!(
+            "rescore: {what} has {got} rows where {expected} were expected; the reads of the \
+             competed inputs disagree about the input, and a disagreement row-misaligns the \
+             feature rows against every metadata column"
+        );
+    }
+    Ok(())
+}
+
 /// Refuse a rescore whose population cannot support target-decoy FDR.
 ///
 /// A one-sided population is not a hard rescore failure in any technical sense:
@@ -174,6 +193,25 @@ pub fn run(p: RescoreParams) -> Result<u64> {
     // with it. The list actually used is recorded in the artifact report below, which is
     // the source of truth for what the classifier saw.
     let feat_names = resolve_feature_subset(p.cfg, &expected_schema.feature_columns)?;
+    // An empty feature set is refused HERE rather than carried into the passes below.
+    //
+    // `resolve_feature_subset` already refuses an explicitly empty selection, and
+    // `FeatureSchema::read` already refuses to reconstruct an empty list from the parquet,
+    // so the one way left in is a `.schema.json` companion whose `feature_columns` is `[]`.
+    // What that used to do was an accident of the validation loop's shape, not a decision:
+    // it ran `for (row, values) in feats.iter_rows().enumerate()`, `iter_rows` is
+    // `chunks_exact(n_features.max(1))`, and with no feature columns the matrix buffer is
+    // empty, so the loop never ran a single iteration -- which silently skipped the
+    // prelim_score/precursor_mz finiteness check for EVERY row as well, and then trained a
+    // classifier on zero inputs. Neither is worth preserving; say so instead.
+    if feat_names.is_empty() {
+        anyhow::bail!(
+            "rescore: the feature schema of {} declares no feature columns, so the \
+             classifier would have no input. Check the `.schema.json` companion next to \
+             the competed table.",
+            p.competed[0]
+        );
+    }
     if feat_names.len() != expected_schema.feature_columns.len() {
         info!(
             selected = feat_names.len(),
@@ -266,6 +304,32 @@ pub fn run(p: RescoreParams) -> Result<u64> {
         merge_col(&mut elution_hi, ehi, total_rows);
         merge_col(&mut source, vec![src as u32; t.nrows], total_rows);
     }
+    // The row loop this pass replaces was `for i in 0..t.nrows { cid.push(c[i]); ... }`,
+    // which could not produce columns of different lengths: it indexed every column at the
+    // footer's row count and panicked if one was short. `merge_col` appends whatever the
+    // reader returned, and `source` is still built from `t.nrows`, so a reader column that
+    // disagreed with the footer would row-misalign `source` -- the column quant splits the
+    // scored table on -- against `cid`, `label` and the feature rows, with nothing
+    // downstream able to detect it (`n` is taken as `cid.len()` below). `TableFile`
+    // concatenates all batches and so returns exactly `nrows` today; this keeps the
+    // invariant checked at the point that relies on it rather than assumed.
+    for (name, len) in [
+        ("candidate_id", cid.len()),
+        ("peak_rank", peak_rank.len()),
+        ("label", label.len()),
+        ("base_peptide_id", base.len()),
+        ("peptidoform", pform.len()),
+        ("protein", protein.len()),
+        ("charge", charge.len()),
+        ("prelim_score", prelim.len()),
+        ("precursor_mz", mz.len()),
+        ("apex_rt", apex_rt.len()),
+        ("elution_lo", elution_lo.len()),
+        ("elution_hi", elution_hi.len()),
+        ("source", source.len()),
+    ] {
+        refuse_row_disagreement(&format!("the competed column '{name}'"), len, total_rows)?;
+    }
     crate::fdr::validate_labels(&label)?;
     let is_decoy: Vec<bool> = label.iter().map(|l| l == "decoy").collect();
     let (mut is_entrapment, mut is_real_target) = classify_entrapment(p.cfg, &protein, &is_decoy);
@@ -296,8 +360,10 @@ pub fn run(p: RescoreParams) -> Result<u64> {
     // `rows x features x 4` bytes, ~250 GB at experiment scale -- purely so that it could
     // be copied to disk. Streaming the competed feature columns straight into the handoff
     // removes it: what stays resident is one staging block of `HANDOFF_BATCH_ROWS` rows
-    // (about 390 MB at 387 features), and the non-finite validation moves into the same
-    // pass, inline with the narrowing, while the row is still in cache.
+    // (387 MB of staged f32 at 387 features, plus what `flush_block` transposes out of it
+    // while a block is encoded, so call the transient roughly twice that), and the
+    // non-finite validation moves into the same pass, inline with the narrowing, while the
+    // row is still in cache.
     let sidecar_script = match p.cfg.classifier {
         RescorerKind::Mokapot => Some("mokapot_worker.py"),
         RescorerKind::NnTorch => Some("nn_rescore_worker.py"),
@@ -311,27 +377,49 @@ pub fn run(p: RescoreParams) -> Result<u64> {
     let mut prewritten: Option<SidecarPaths> = None;
     if stream_to_handoff {
         let paths = sidecar_paths(&p, sidecar_script.expect("checked in the condition"));
-        let mut w = HandoffWriter::new(&paths, &feat_names, &label, &pform, &protein, &mz)?;
-        let mut bad_feature = None;
-        for_each_feature_row(p.competed, &feat_names, |row, values| {
-            if bad_feature.is_none() {
+        // The validation aborts the stream on the first offending row rather than after the
+        // file is complete. A malformed competed table used to cost nothing: the serial
+        // scan ran before `run_pin_sidecar` was ever entered and nothing had been written.
+        // Deferring it until after `finish()` made the same failure cost a full handoff
+        // write, which at experiment scale is hundreds of GB of IO for a run that was
+        // always going to abort. The message is unchanged, because `bad_scalar` is already
+        // known here and `bail_non_finite` still makes the same choice between the two on
+        // the row index.
+        let streamed = {
+            let mut w = HandoffWriter::new(&paths, &feat_names, &label, &pform, &protein, &mz)?;
+            let scan = for_each_feature_row(p.competed, &feat_names, |row, values| {
                 if let Some(col) = values.iter().position(|v| !v.is_finite()) {
-                    bad_feature = Some((row, col, values[col]));
+                    bail_non_finite(Some((row, col, values[col])), bad_scalar, &feat_names)?;
                 }
+                // Past the offending scalar row with no earlier bad feature, the choice
+                // `bail_non_finite` would make is already decided (a later feature row
+                // loses the tie-break), so there is nothing left to learn from the rest of
+                // the file.
+                if bad_scalar.is_some_and(|scalar_row| row >= scalar_row) {
+                    bail_non_finite(None, bad_scalar, &feat_names)?;
+                }
+                w.push_row(row, values)
+            });
+            // `finish` consumes the writer, and the `Err` arm drops it, so the file is
+            // closed either way before the cleanup below.
+            scan.and_then(|()| w.finish())
+        };
+        let rows = match streamed {
+            Ok(rows) => rows,
+            Err(e) => {
+                // A parquet handoff is written through `AtomicPath` and never appears at
+                // its final name, but the PIN encoding writes the final path directly, so
+                // an aborted stream would leave a truncated PIN for the next reader to
+                // find. Take the rubble with us.
+                let _ = std::fs::remove_file(&paths.handoff);
+                return Err(e);
             }
-            w.push_row(row, values)
-        })?;
-        let rows = w.finish()?;
-        // The metadata and the feature values now come from two separate passes over the
-        // same files. Nothing should be able to make them disagree, and if anything does,
-        // the handoff is row-misaligned with every metadata column: refuse rather than
-        // train on it.
-        if rows as usize != n {
-            anyhow::bail!(
-                "rescore: the streamed handoff wrote {rows} rows but the competed metadata \
-                 has {n}; the two passes disagree about the input"
-            );
-        }
+        };
+        // The metadata and the feature values come from two separate passes over the same
+        // files. Nothing should be able to make them disagree, and if anything does, the
+        // handoff is row-misaligned with every metadata column: refuse rather than train
+        // on it.
+        refuse_row_disagreement("the streamed handoff", rows as usize, n)?;
         info!(
             path = %paths.handoff,
             rows,
@@ -339,10 +427,12 @@ pub fn run(p: RescoreParams) -> Result<u64> {
             "rescore: streamed the competed features into the sidecar handoff \
              (no engine-side feature matrix)"
         );
-        bail_non_finite(bad_feature, bad_scalar, &feat_names)?;
         prewritten = Some(paths);
     } else {
         let feats = load_feature_matrix(p.competed, &feat_names, total_rows)?;
+        // Same guard as the streamed path's: the feature pass and the metadata pass are
+        // separate reads of the same files and only this comparison ties them together.
+        refuse_row_disagreement("the feature matrix", feats.rows(), n)?;
         let bad_feature = feats
             .find_non_finite()
             .map(|(row, col)| (row, col, feats.row(row)[col]));
@@ -864,10 +954,19 @@ struct ScoredColumns {
 /// Three of the 21 columns are duplicates by construction: `protein_group` is `protein`,
 /// and `global_q_value` and `experiment_psm_q` are both the pooled `q_value` (the comments
 /// at their definitions say so). Through `write_table` each duplicate had to arrive as its
-/// own `Vec`, so the stage carried a second full copy of the protein strings -- one heap
-/// block per PSM -- and two more copies of the pooled q column, all three alive at the
-/// same moment as the originals. An `ArrayRef` is refcounted, so passing the same array in
-/// several slots of the batch writes the same bytes from one buffer.
+/// own `Vec` -- `protein.clone()` and two `psm_q.clone()`s at the call site -- so the stage
+/// carried a second full copy of the protein strings, one heap block per PSM, and two more
+/// copies of the pooled q column, all three alive at the same moment as the originals. An
+/// `ArrayRef` is refcounted, so passing the same array in several slots of the batch writes
+/// the same bytes from one buffer.
+///
+/// What this does NOT claim is a strict reduction in peak: `write_table` encodes in
+/// `WRITE_TABLE_CHUNK_ROWS` chunks and moves each chunk's rows out of the source vectors,
+/// so its own Arrow copy is one chunk wide, while one batch means the `StringArray`
+/// conversion re-packs each of `peptidoform`, `label` and `protein` into one contiguous
+/// offsets+values buffer at once. The three clones go away; a full-width Arrow copy of each
+/// string column arrives. Which side is larger depends on the string widths of the run, so
+/// the honest claim is the one the test below pins: the file is identical.
 ///
 /// The parquet is byte-identical to the previous `write_table` call: the same schema
 /// (names, types, all non-nullable, same order), one record batch, and `BatchWriter` opens
@@ -2142,6 +2241,19 @@ b
     /// feature columns. No `.schema.json` companion, so the feature list is reconstructed
     /// from the parquet's own columns (`NON_FEATURE_COLUMNS`).
     fn crafted_competed_table(path: &str, rows: usize) {
+        crafted_competed_table_planting(path, rows, None, None);
+    }
+
+    /// The same table with a NaN planted in the `feat_b` feature column and/or in the
+    /// `precursor_mz` metadata column, which is what a malformed competed input looks like
+    /// to the two validations (a null f64 cell reads back as NaN, so a null is the same
+    /// case).
+    fn crafted_competed_table_planting(
+        path: &str,
+        rows: usize,
+        nan_feature_row: Option<usize>,
+        nan_mz_row: Option<usize>,
+    ) {
         let cols = vec![
             Col::U32("candidate_id".into(), (0..rows as u32).collect()),
             Col::Str(
@@ -2171,7 +2283,15 @@ b
             ),
             Col::F64(
                 "precursor_mz".into(),
-                (0..rows).map(|i| 400.0 + i as f64).collect(),
+                (0..rows)
+                    .map(|i| {
+                        if nan_mz_row == Some(i) {
+                            f64::NAN
+                        } else {
+                            400.0 + i as f64
+                        }
+                    })
+                    .collect(),
             ),
             Col::F64(
                 "apex_rt".into(),
@@ -2194,7 +2314,15 @@ b
             ),
             Col::F64(
                 "feat_b".into(),
-                (0..rows).map(|i| (i % 7) as f64 * 0.25).collect(),
+                (0..rows)
+                    .map(|i| {
+                        if nan_feature_row == Some(i) {
+                            f64::NAN
+                        } else {
+                            (i % 7) as f64 * 0.25
+                        }
+                    })
+                    .collect(),
             ),
         ];
         write_table(path, cols).unwrap();
@@ -2260,6 +2388,175 @@ b
         );
     }
 
+    /// Drive `run` down the streamed-handoff path (strict + a sidecar classifier + an
+    /// interpreter that cannot be spawned) and return the error, the handoff path the
+    /// invocation used, and its work directory.
+    fn run_streamed(competed: &str, name: &str) -> (String, String, String) {
+        let work = scratch(&format!("{name}_work"));
+        let out = scratch(&format!("{name}_scored.parquet"));
+        let cfg = RescoreConfig {
+            classifier: RescorerKind::NnTorch,
+            strict: true,
+            python: Some("mumdia-no-such-interpreter-for-this-test".to_string()),
+            ..Default::default()
+        };
+        let err = run(RescoreParams {
+            competed: &[competed.to_string()],
+            out: &out,
+            work_dir: &work,
+            script_dir: "scripts",
+            cfg: &cfg,
+            config_hash: "test",
+        })
+        .unwrap_err()
+        .to_string();
+        let tag = format!(
+            "{}_{}",
+            std::path::Path::new(&out)
+                .file_stem()
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            std::process::id()
+        );
+        (err, format!("{work}/rescore_{tag}.features.parquet"), work)
+    }
+
+    /// Nothing that looks like a handoff (published or half-written) is left in `work`.
+    fn no_handoff_rubble(work: &str) {
+        let left: Vec<String> = std::fs::read_dir(work)
+            .map(|d| {
+                d.filter_map(|e| e.ok())
+                    .map(|e| e.file_name().to_string_lossy().to_string())
+                    .filter(|n| n.contains(".features.parquet") || n.ends_with(".pin"))
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(left.is_empty(), "handoff rubble left behind: {left:?}");
+    }
+
+    #[test]
+    fn a_non_finite_feature_aborts_the_stream_instead_of_writing_the_whole_handoff() {
+        // Before the features were streamed, the non-finite scan ran over the resident
+        // matrix and bailed before `run_pin_sidecar` was ever entered, so a malformed
+        // competed table cost nothing. Streaming moved the scan into the write and then
+        // reported it after `finish()`: the full handoff -- hundreds of GB at experiment
+        // scale -- was written and published for a run that was always going to abort.
+        // The row and column named must not change, and the file must not be there.
+        let competed = scratch("nanfeat_competed.parquet");
+        crafted_competed_table_planting(&competed, 24, Some(3), None);
+        let (err, handoff, work) = run_streamed(&competed, "nanfeat");
+        assert_eq!(
+            err, "rescore input contains non-finite feature 'feat_b' at flat row 3: NaN",
+            "the message must name the same row and column the serial scan named"
+        );
+        assert!(
+            !std::path::Path::new(&handoff).exists(),
+            "the handoff must not survive a stream that aborted: {handoff}"
+        );
+        no_handoff_rubble(&work);
+    }
+
+    #[test]
+    fn a_non_finite_precursor_mz_aborts_the_stream_at_its_row() {
+        // The scalar scan runs before the stream, so its row is already known; the stream
+        // still has to reach that row before the message is decided (an earlier bad feature
+        // would win), and must stop there rather than write the remaining rows.
+        let competed = scratch("nanmz_competed.parquet");
+        crafted_competed_table_planting(&competed, 24, None, Some(2));
+        let (err, handoff, work) = run_streamed(&competed, "nanmz");
+        assert_eq!(
+            err,
+            "rescore input contains non-finite prelim_score/precursor_mz at flat row 2"
+        );
+        assert!(!std::path::Path::new(&handoff).exists(), "{handoff}");
+        no_handoff_rubble(&work);
+    }
+
+    #[test]
+    fn the_first_offending_row_still_decides_the_message_when_both_kinds_are_present() {
+        // The serial loop this replaces checked a row's features before its scalars and
+        // stopped at the first offending ROW. Aborting the stream early must not change
+        // which of the two answers is reported.
+        let a = scratch("both_scalar_first.parquet");
+        crafted_competed_table_planting(&a, 24, Some(5), Some(2));
+        let (err, _, _) = run_streamed(&a, "both_scalar_first");
+        assert_eq!(
+            err, "rescore input contains non-finite prelim_score/precursor_mz at flat row 2",
+            "the scalar row is earlier, so it is the one reported"
+        );
+
+        let b = scratch("both_feature_first.parquet");
+        crafted_competed_table_planting(&b, 24, Some(1), Some(4));
+        let (err, _, _) = run_streamed(&b, "both_feature_first");
+        assert_eq!(
+            err, "rescore input contains non-finite feature 'feat_b' at flat row 1: NaN",
+            "the feature row is earlier, so it is the one reported"
+        );
+    }
+
+    #[test]
+    fn the_earlier_row_wins_and_a_tie_goes_to_the_feature() {
+        // The tie-break `bail_non_finite` applies, pinned directly: within one row the old
+        // serial loop tested the features first, so an equal row index reports the feature.
+        let names: Vec<String> = ["f0", "f1"].iter().map(|s| s.to_string()).collect();
+        assert!(bail_non_finite(None, None, &names).is_ok());
+        let feature_at = |row: usize| Some((row, 1, f32::NAN));
+        for (feature, scalar, expect) in [
+            (feature_at(3), None, "feature 'f1' at flat row 3"),
+            (None, Some(3), "prelim_score/precursor_mz at flat row 3"),
+            (feature_at(3), Some(7), "feature 'f1' at flat row 3"),
+            (
+                feature_at(7),
+                Some(3),
+                "prelim_score/precursor_mz at flat row 3",
+            ),
+            (feature_at(3), Some(3), "feature 'f1' at flat row 3"),
+        ] {
+            let err = bail_non_finite(feature, scalar, &names)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(expect), "{err} should contain {expect}");
+        }
+    }
+
+    #[test]
+    fn a_feature_schema_with_no_feature_columns_is_refused() {
+        // Reachable only through a hand-written companion: an explicitly empty
+        // `rescore.features` list is already refused, and `FeatureSchema::read` refuses to
+        // reconstruct an empty list from the parquet. What the old validation did with it
+        // was an accident of `chunks_exact(n_features.max(1))` over an empty buffer: the
+        // loop ran zero times, which ALSO skipped the prelim_score/precursor_mz check for
+        // every row, and the run went on to train on no features at all.
+        let competed = scratch("nofeat_competed.parquet");
+        crafted_competed_table(&competed, 8);
+        std::fs::write(
+            format!("{competed}.schema.json"),
+            r#"{"feature_columns":[],"schema_id":"empty-for-this-test"}"#,
+        )
+        .unwrap();
+        let (err, _, work) = run_streamed(&competed, "nofeat");
+        std::fs::remove_file(format!("{competed}.schema.json")).ok();
+        assert!(
+            err.contains("declares no feature columns"),
+            "an empty feature set must be refused by name: {err}"
+        );
+        no_handoff_rubble(&work);
+    }
+
+    #[test]
+    fn a_pass_that_disagrees_about_the_row_count_is_refused_with_both_counts() {
+        assert!(refuse_row_disagreement("the streamed handoff", 10, 10).is_ok());
+        let err = refuse_row_disagreement("the feature matrix", 9, 10)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("the feature matrix has 9 rows where 10 were expected"),
+            "{err}"
+        );
+        assert!(err.contains("row-misaligns"), "{err}");
+    }
+
     #[test]
     fn a_shared_column_array_writes_the_same_parquet_as_two_copies() {
         use arrow::array::{ArrayRef, Int32Array, StringArray};
@@ -2271,16 +2568,29 @@ b
         // to the three aliases of the pooled q. This asserts the file that produces is
         // byte-for-byte the file `write_table` produced from separate, equal vectors --
         // the output-equality claim of that change, on the mechanism it rests on.
+        //
+        // The row count is what makes the comparison capable of failing. `write_table`
+        // encodes in 65,536-row chunks and `write_scored_table` writes one batch, so below
+        // 65,536 rows both write exactly one chunk and no arrangement of the data could
+        // tell them apart -- the test asserted the new shape at a size where the two
+        // writers cannot diverge. Chunking is not free of that risk in general: mumdia-io's
+        // `an_entirely_null_column_keeps_its_rows_but_not_its_page_framing` shows a column
+        // type whose page framing DOES move at a chunk boundary. 3 chunks and a short last
+        // one is the shape that can catch it here, on the scored table's own duplicate-array
+        // arrangement and with a string column in it. The writer's 1,048,576-row row-group
+        // seam is the other place the two could part; mumdia-io pins that one directly, at
+        // 1,048,583 rows, in `the_row_groups_fall_in_the_same_places_past_the_row_group_maximum`.
+        let n = 3 * (1usize << 16) + 7;
         let dir = std::env::temp_dir().join("mumdia_scored_share_test");
         std::fs::create_dir_all(&dir).unwrap();
         let pid = std::process::id();
         let a = dir.join(format!("copies_{pid}.parquet"));
         let b = dir.join(format!("shared_{pid}.parquet"));
-        let prot: Vec<String> = (0..2000)
+        let prot: Vec<String> = (0..n)
             .map(|i| format!("sp|P{:05}|PROT_HUMAN", i % 700))
             .collect();
-        let q: Vec<f64> = (0..2000).map(|i| (i % 97) as f64 / 97.0).collect();
-        let rank: Vec<i32> = (0..2000).map(|i| i % 3).collect();
+        let q: Vec<f64> = (0..n).map(|i| (i % 97) as f64 / 97.0).collect();
+        let rank: Vec<i32> = (0..n).map(|i| (i % 3) as i32).collect();
         write_table(
             a.to_str().unwrap(),
             vec![
@@ -2315,7 +2625,7 @@ b
         .unwrap();
         let mut w = mumdia_io::table::BatchWriter::new(b.to_str().unwrap(), schema).unwrap();
         w.write(&batch).unwrap();
-        assert_eq!(w.close().unwrap(), 2000);
+        assert_eq!(w.close().unwrap(), n as u64);
         assert_eq!(
             std::fs::read(&a).unwrap(),
             std::fs::read(&b).unwrap(),
