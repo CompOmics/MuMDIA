@@ -543,6 +543,7 @@ pub fn run(p: RunParams) -> Result<()> {
             info!(stage = %"extract", "run: stage start");
             let (npsm, nchr) = extract::run(extract::ExtractParams {
                 fragment_offset: None,
+                sibling_bands: 1,
                 ms2: &co.ms2,
                 library_precursors: &lib_p,
                 library_fragments: &lib_f,

@@ -433,6 +433,7 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
             cfg: &cfg.extract,
             config_hash: ch,
             fragment_offset: Some(b.offset),
+            sibling_bands: par,
         })?;
         recs.push(record_artifact(
             &format!("{}[g{:02}]", artifact::PSMS_EXTRACTED.0, b.index),

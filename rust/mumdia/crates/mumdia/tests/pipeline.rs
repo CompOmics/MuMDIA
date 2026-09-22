@@ -170,6 +170,7 @@ fn run_extract(prec: &str, frag: &str, ms2: &str, win: &str, tag: &str) -> (Stri
     let chrom = tmp(&format!("chrom_{tag}.parquet"));
     stages::extract::run(stages::extract::ExtractParams {
         fragment_offset: None,
+        sibling_bands: 1,
         ms2,
         library_precursors: prec,
         library_fragments: frag,

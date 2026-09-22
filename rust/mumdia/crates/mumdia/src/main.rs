@@ -1226,6 +1226,7 @@ fn real_main() -> Result<()> {
             let ch = mumdia_io::hash::blake3_str(&cfg.canonical_json());
             stages::extract::run(stages::extract::ExtractParams {
                 fragment_offset,
+                sibling_bands: 1,
                 ms2: &ms2,
                 library_precursors: &lib_precursors,
                 library_fragments: &lib_fragments,

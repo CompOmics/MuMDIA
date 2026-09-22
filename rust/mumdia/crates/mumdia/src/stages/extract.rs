@@ -107,6 +107,10 @@ pub struct ExtractParams<'a> {
     /// are still read, and scans of other windows find no candidate. `None` is the ordinary
     /// whole-library extract.
     pub fragment_offset: Option<u32>,
+    /// How many bands of the same run are being searched beside this one
+    /// (`groups.parallel`). The probing fan-out is this band's share of the thread pool,
+    /// not the whole pool, because every band in flight computes it independently.
+    pub sibling_bands: usize,
 }
 
 /// One observed hit: scan RT, candidate-local fragment index, observed intensity
@@ -753,6 +757,7 @@ fn window_groups(idx: &FragIndex, scans: &[Ms2Scan]) -> Vec<WinGroup> {
 #[allow(clippy::too_many_arguments)]
 fn accumulate_groups(
     idx: &FragIndex,
+    sibling_bands: usize,
     groups: &[WinGroup],
     scans: &[Ms2Scan],
     rt_lo: &[f64],
@@ -780,7 +785,11 @@ fn accumulate_groups(
     // Splitting the candidate axis rather than the scan axis is also where the work is: a
     // peak's cost is dominated by walking its posting list, which the narrowed sub-range
     // divides, while the peak loop itself is repeated per task.
-    let threads = rayon::current_num_threads().max(1);
+    // `current_num_threads()` is the whole pool, and under `groups.parallel` every band in
+    // flight computes this independently: 24 bands each fanning out to twice the pool gave
+    // thousands of live narrowed-bin caches (1-2 MB each) allocated in lockstep. Divide by
+    // the bands beside this one so the fan-out describes this band's share.
+    let threads = (rayon::current_num_threads() / sibling_bands.max(1)).max(1);
     let tasks_per_window = (threads * 2).div_ceil(groups.len().max(1)).max(1);
     let probe = |_gi: usize, g: &WinGroup| -> Vec<(u32, Vec<Hit>)> {
         let ids = &g.scans;
@@ -2017,7 +2026,13 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
         }
 
         // Group hits into scan groups by RT (dedupe same fragment in a scan by max).
-        hits.sort_by(|a, b| a.rt.total_cmp(&b.rt));
+        // Probing walks a window's scans in ascending index, so the hits of a candidate are
+        // already rt-ascending in the ordinary case; the sort then allocates scratch as large
+        // as the vector itself for nothing. Equal-rt hits collapse to `max` per (rt, frag)
+        // below either way, so skipping a sort that would not move anything is exact.
+        if !hits.windows(2).all(|w| w[0].rt <= w[1].rt) {
+            hits.sort_by(|a, b| a.rt.total_cmp(&b.rt));
+        }
         // scan groups: Vec<(rt, BTreeMap<frag,intensity>)>. A BTreeMap keeps the
         // per-scan fragment order fixed so the f32 apex sum is deterministic.
         let mut groups: Vec<(f64, BTreeMap<u16, f32>)> = Vec::new();
@@ -2752,6 +2767,7 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
                 accumulate_groups(
                     fidx.as_ref()
                         .expect("streamed path implies a fragment index"),
+                    p.sibling_bands,
                     &groups[gi..upto],
                     &scans,
                     &rt_lo,
@@ -3237,7 +3253,7 @@ mod accumulate_tests {
             let mut acc: HashMap<u32, Vec<Hit>> = HashMap::new();
             pool.install(|| {
                 accumulate_groups(
-                    &idx, &groups, &sc, &rt_lo, &rt_hi, &mass_off, &cfg, None, &mut acc,
+                    &idx, 1, &groups, &sc, &rt_lo, &rt_hi, &mass_off, &cfg, None, &mut acc,
                 )
             });
             acc

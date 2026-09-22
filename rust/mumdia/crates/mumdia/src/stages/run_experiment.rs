@@ -316,6 +316,7 @@ fn process_run(
     let chrom = d("chromatograms.parquet");
     extract::run(extract::ExtractParams {
         fragment_offset: None,
+        sibling_bands: 1,
         ms2: &co.ms2,
         library_precursors: &lib_p,
         library_fragments: lib_f,
