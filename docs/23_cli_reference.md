@@ -43,6 +43,7 @@ Commands:
   prescan         Sequence-tag prescan: keep only modification-bearing candidates whose anchored trimers are observed in this run -> prescan_survivors.parquet. Label-blind by construction, so it prunes search space without touching target-decoy exchangeability
   search-seed     Native broad DIA seed search over the fragment index -> seed_psms.parquet
   rt-im-train     Per-run RT calibration + windows -> run_windows.parquet, cal.json
+  sub-library     Subset a library to a set of candidates (a first pass's survivors, or prescan's), renumbered to the contiguous 0..n the fragment index requires
   extract         Targeted 3D extraction (peak-major cascade) -> psms_extracted, chromatograms
   features        Compute the minimal feature set -> features.parquet + PIN
   compete         Keep the best candidate per competition group -> psms_competed.parquet
@@ -135,6 +136,7 @@ first sentence of the description, with the full text in the section below.
 | [`prescan`](#prescan) | yes | Sequence-tag prescan: keep only modification-bearing candidates whose anchored trimers are observed in this run -> prescan_survivors.parquet. |
 | [`search-seed`](#search-seed) | yes | Native broad DIA seed search over the fragment index -> seed_psms.parquet |
 | [`rt-im-train`](#rt-im-train) | yes | Per-run RT calibration + windows -> run_windows.parquet, cal.json |
+| [`sub-library`](#sub-library) | yes | Subset a library to a set of candidates (a first pass's survivors, or prescan's), renumbered to the contiguous 0..n the fragment index requires |
 | [`extract`](#extract) | yes | Targeted 3D extraction (peak-major cascade) -> psms_extracted, chromatograms |
 | [`features`](#features) | yes | Compute the minimal feature set -> features.parquet + PIN |
 | [`compete`](#compete) | yes | Keep the best candidate per competition group -> psms_competed.parquet |
@@ -152,8 +154,8 @@ first sentence of the description, with the full text in the section below.
 | [`doctor`](#doctor) | yes | Check that the configured Python sidecar environments are usable |
 | `help` | n/a | Print this message or the help of the given subcommand(s) |
 
-19 of the 22 documented subcommands accept `--config`:
- `align`, `compete`, `convert`, `digest`, `doctor`, `extract`, `features`, `mbr`, `peak-census`, `peptidoforms`, `predict-frag`, `prescan`, `quant`, `report`, `rescore`, `rt-im-train`, `run`, `run-experiment`, `search-seed`.
+20 of the 23 documented subcommands accept `--config`:
+ `align`, `compete`, `convert`, `digest`, `doctor`, `extract`, `features`, `mbr`, `peak-census`, `peptidoforms`, `predict-frag`, `prescan`, `quant`, `report`, `rescore`, `rt-im-train`, `run`, `run-experiment`, `search-seed`, `sub-library`.
 
 3 do not, so every setting they use comes from their own flags:
  `audit`, `inspect`, `quant-lfq`.
@@ -312,6 +314,33 @@ Options:
       --out-windows <OUT_WINDOWS>
 
       --out-cal <OUT_CAL>
+
+      --config <CONFIG>
+```
+
+Plus the 5 repeated flags removed above: see "Global flags".
+
+## sub-library
+
+```text
+Subset a library to a set of candidates (a first pass's survivors, or prescan's), renumbered to the contiguous 0..n the fragment index requires
+
+Usage: mumdia sub-library [OPTIONS] --lib-precursors <LIB_PRECURSORS> --lib-fragments <LIB_FRAGMENTS> --survivors <SURVIVORS> --out-precursors <OUT_PRECURSORS> --out-fragments <OUT_FRAGMENTS>
+
+Options:
+      --lib-precursors <LIB_PRECURSORS>
+
+      --lib-fragments <LIB_FRAGMENTS>
+
+      --survivors <SURVIVORS>
+          Parquet with a `candidate_id` column: the candidates to keep. Order and duplicates do not matter
+
+      --out-precursors <OUT_PRECURSORS>
+
+      --out-fragments <OUT_FRAGMENTS>
+
+      --no-pair-link
+          Keep exactly the listed candidates instead of unioning the decision over `peptidoform_id`. A target and its decoy share that id, so the default keeps pairs together and this breaks pairing unless the list is already pair-complete
 
       --config <CONFIG>
 ```
