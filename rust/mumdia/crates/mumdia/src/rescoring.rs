@@ -348,9 +348,24 @@ pub fn percolator_lite(inp: RescoreInput) -> Vec<f64> {
     // vector become single-copy at the same time. What makes this affordable is that
     // `logreg_fit` and the per-row maps below are parallel in their own right, so one fold
     // already saturates the machine; before that change this would have been 3x the wall.
-    // What it does cost is the serial remainder (the tied-block walk in `target_decoy_q`,
-    // the positive-set build, the bias fold), which no longer overlaps across folds: a few
-    // seconds per fold against a fit measured in minutes.
+    //
+    // The wall-clock trade is NOT unconditional and the memory saving is: this arrangement
+    // is faster only where the per-fold speedup beats `folds`, because the old one got
+    // exactly `folds`-way parallelism for free. Measured by `percolator_lite_fold_cost`
+    // below on an i9-13900KS (32 rayon threads, dual-channel DDR5, 387 features, training
+    // slices of 206-310 MB so nothing is cache-resident): 1.51x at the default 3 folds,
+    // 0.91x at 5. On the same fixture shrunk to 30,000 PSMs the numbers are 5.00x / 0.97x /
+    // 0.24x at 2 / 3 / 5 folds, and that cliff is an artifact of the training slice
+    // crossing this chip's 36 MB L3 (23 / 31 / 37 MB), not of the fold count -- it is the
+    // reason the honest fixture is the large one. A machine with more memory channels
+    // should sit well above these ratios, since the fitter is bandwidth-bound here (see
+    // `logreg_fit`). At `folds: 5`, the opt-in "sensitivity" recipe, expect wall parity at
+    // best on a desktop and take the 1.8x smaller peak as the reason.
+    //
+    // What this also costs is the serial remainder (the tied-block walk in
+    // `target_decoy_q`, the positive-set build, the bias fold, `fit_standardizer`), which
+    // no longer overlaps across folds: a few seconds per fold against a fit measured in
+    // minutes.
     let mut final_score = inp.init_score.to_vec();
     for test_fold in 0..folds {
         let mut train_idx: Vec<u32> = Vec::new();
@@ -845,6 +860,61 @@ mod tests {
             "logreg_fit {rows} rows x {d} features x {epochs} epochs, {} rayon threads:              serial {serial:?}, two-phase {two_phase:?} ({:.2}x)",
             rayon::current_num_threads(),
             serial.as_secs_f64() / two_phase.as_secs_f64()
+        );
+    }
+
+    /// Microbenchmark of the two commits TOGETHER, which is the only way to judge either:
+    /// the old arm gets its threads from the parallel map over folds and fits each fold
+    /// serially, the new one fits one fold at a time with a parallel fitter. Whether that
+    /// is a win on wall clock depends entirely on whether the per-fold speedup beats
+    /// `folds`; the memory saving (the matrix plus ONE standardised training copy instead
+    /// of `folds` of them) does not depend on it. Both arms are handed the same
+    /// `FeatureMatrix` and each allocates its own standardised copies, index vectors and
+    /// per-epoch working set inside the timer. `MUMDIA_BENCH_ROWS`, `_D`, `_FOLDS` and
+    /// `_ITERS` scale it. Run with
+    /// `cargo test -p mumdia --release -- --ignored --nocapture percolator_lite_fold_cost`.
+    #[test]
+    #[ignore = "microbenchmark; meaningful only in release"]
+    fn percolator_lite_fold_cost() {
+        let env = |k: &str, dflt: usize| {
+            std::env::var(k)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(dflt)
+        };
+        let (n, d, folds, num_iter) = (
+            env("MUMDIA_BENCH_ROWS", 30_000),
+            env("MUMDIA_BENCH_D", 387),
+            env("MUMDIA_BENCH_FOLDS", 3),
+            env("MUMDIA_BENCH_ITERS", 2),
+        );
+        let (features, is_decoy, key, init) = crafted_population(n, d);
+        let mk = || RescoreInput {
+            features: &features,
+            is_decoy: &is_decoy,
+            fold_key: &key,
+            init_score: &init,
+            folds,
+            num_iter,
+            train_fdr: 0.05,
+        };
+        let t0 = std::time::Instant::now();
+        let want = percolator_lite_reference(mk());
+        let parallel_folds = t0.elapsed();
+        let t1 = std::time::Instant::now();
+        let got = percolator_lite(mk());
+        let sequential_folds = t1.elapsed();
+        assert_eq!(
+            got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            want.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            "the benchmark arms must agree bit for bit"
+        );
+        println!(
+            "percolator_lite {n} PSMs x {d} features, {folds} folds x {num_iter} iters, \
+             {} rayon threads: parallel folds + serial fit {parallel_folds:?}, \
+             sequential folds + parallel fit {sequential_folds:?} ({:.2}x)",
+            rayon::current_num_threads(),
+            parallel_folds.as_secs_f64() / sequential_folds.as_secs_f64()
         );
     }
 
