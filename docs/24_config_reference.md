@@ -847,10 +847,11 @@ Every field whose struct has an `impl Default` resolved from the source.
 - `peptidoforms.fixed_mods[].name` (`String`)
 - `peptidoforms.fixed_mods[].residue` (`char`)
 
-2 environment read(s) whose name is not a literal:
+3 environment read(s) whose name is not a literal:
 
-- `rust/mumdia/crates/mumdia/src/stages/extract.rs:2786: env read via closure of `&mut flushed``
-- `rust/mumdia/crates/mumdia/src/stages/extract.rs:2804: env read via closure of `&mut cand_hits``
+- `rust/mumdia/crates/mumdia/src/stages/extract.rs:1419: env read via closure of `chunk``
+- `rust/mumdia/crates/mumdia/src/stages/extract.rs:3333: env read via closure of `&mut chunk``
+- `rust/mumdia/crates/mumdia/src/stages/extract.rs:3369: env read via closure of `&mut chunk``
 
 ## Coverage
 
