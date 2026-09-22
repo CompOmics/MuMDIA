@@ -1597,6 +1597,20 @@ fn kept_matrix(slot: &Option<FeatureMatrix>) -> &FeatureMatrix {
 
 /// ~250k rows x 387 f32 is about 390 MB per batch, which keeps the encoder's working set
 /// modest.
+///
+/// It is also the fastest of the sizes measured, which is not what the staging layout
+/// suggests. `flush_block` stages rows row-major and then gathers 387 columns back out at
+/// a 1,548-byte stride, so every element read costs a 64-byte line: making the block
+/// L2-resident really does make THAT loop 6-8x cheaper (`handoff_block_size_end_to_end`,
+/// transpose in isolation, 262,144 rows x 387: 2.6-3.4 s/Mrow at 250,000 against 0.42 at
+/// 4,096). The parquet encoder's per-batch cost at 387 columns grows faster than the
+/// transpose shrinks, so end to end the same change is a LOSS: 5.3-5.5 s/Mrow at 250,000
+/// against 9.2-9.6 at 4,096 and 12.2-13.4 at 1,024, with 131,072 / 65,536 / 16,384 all in
+/// the 8.5-10.3 band (min of three per arm, three whole runs). The 387 MB this stages is
+/// transient and is not at the measured peak: under `rescore.strict` with `nn_torch`
+/// there is no feature matrix at handoff time and the engine sits near 1.4 GB, while the
+/// 9.3 GB process-tree peak happens later, inside the worker. Re-measure with the ignored
+/// benchmark before moving it.
 const HANDOFF_BATCH_ROWS: usize = 250_000;
 /// Row groups are capped well below the batch: the worker reads this file back with
 /// `ParquetFile.iter_batches`, which decodes a whole row group before it slices batches out
@@ -1713,9 +1727,16 @@ impl<'a> HandoffWriter<'a> {
 
     /// Shrink the parquet batch so a test can exercise several blocks. Production always
     /// uses `HANDOFF_BATCH_ROWS`.
+    ///
+    /// The staging buffer is re-reserved to match, so a benchmark arm at `rows` pays
+    /// exactly what a build with `HANDOFF_BATCH_ROWS = rows` would pay, allocation
+    /// included. The stage is always empty here (this is a builder), so nothing is lost.
     #[cfg(test)]
     fn with_block_rows(mut self, rows: usize) -> Self {
         self.block_rows = rows.max(1);
+        if let HandoffSink::Parquet(pq) = &mut self.sink {
+            pq.stage = Vec::with_capacity(self.block_rows * self.feat_names.len().max(1));
+        }
         self
     }
 
@@ -2580,6 +2601,119 @@ b
         ));
         assert_eq!(text.lines().count(), n + 1);
         assert!(text.lines().nth(1).unwrap().starts_with("psm_0\t-1\t0\t"));
+    }
+
+    /// What the handoff block size costs, end to end, at the real column count.
+    ///
+    /// Ignored: it stages and encodes several hundred MB. Run with
+    /// `cargo test -p mumdia --release handoff_block_size -- --ignored --nocapture`.
+    ///
+    /// Both arms pay for everything they use: each builds its own `HandoffWriter`
+    /// (including the staging reservation, which `with_block_rows` re-sizes to match the
+    /// arm), pushes every row, transposes, builds every `RecordBatch` and encodes to a
+    /// real file. Nothing is hoisted out of the timer, which is the point: the transpose
+    /// is only part of the handoff write, so a per-transpose speedup is not a per-stage
+    /// speedup, and the second section below shows exactly how much of the first is
+    /// transpose.
+    #[test]
+    #[ignore]
+    fn handoff_block_size_end_to_end() {
+        let nf = 387usize;
+        let rows = 262_144usize;
+        let names: Vec<String> = (0..nf).map(|j| format!("f{j}")).collect();
+        let is_decoy: Vec<bool> = (0..rows).map(|i| i % 3 == 0).collect();
+        let pform = flat(
+            &(0..rows)
+                .map(|i| format!("PEPTIDEK[+16]{}", i % 100_000))
+                .collect::<Vec<_>>(),
+        );
+        let protein = flat(
+            &(0..rows)
+                .map(|i| format!("sp|P{:05}|PROT_HUMAN", i % 70_000))
+                .collect::<Vec<_>>(),
+        );
+        let mz: Vec<f64> = (0..rows)
+            .map(|i| 400.0 + (i % 9973) as f64 * 0.11)
+            .collect();
+        // 256 distinct rows, cycled: the values differ row to row, so snappy has real work
+        // to do and the encode arm is not a degenerate one. Built once, outside every
+        // timer, and read identically by every arm.
+        let pool: Vec<Vec<f32>> = (0..256usize)
+            .map(|k| {
+                (0..nf)
+                    .map(|j| {
+                        let x = (k * 2_654_435_761 + j * 40_503) as u32;
+                        (x as f32 / u32::MAX as f32) * 1000.0 - 500.0
+                    })
+                    .collect()
+            })
+            .collect();
+
+        for block in [250_000usize, 131_072, 65_536, 16_384, 4_096, 1_024] {
+            let path = scratch(&format!("hbench_{block}.parquet"));
+            let mut best = f64::INFINITY;
+            let mut bytes = 0u64;
+            // Min of three: this is a disk-touching benchmark on a shared machine, and one
+            // arm being unlucky is otherwise indistinguishable from an effect.
+            for _ in 0..3 {
+                let paths = SidecarPaths {
+                    handoff: path.clone(),
+                    out: String::new(),
+                    foldkeys: String::new(),
+                    use_pq: true,
+                };
+                let t0 = std::time::Instant::now();
+                let mut w = HandoffWriter::new(&paths, &names, &is_decoy, &pform, &protein, &mz)
+                    .unwrap()
+                    .with_block_rows(block);
+                for i in 0..rows {
+                    w.push_row(i, &pool[i % pool.len()]).unwrap();
+                }
+                assert_eq!(w.finish().unwrap(), rows as u64);
+                best = best.min(t0.elapsed().as_secs_f64() * 1000.0);
+                bytes = std::fs::metadata(&path).unwrap().len();
+            }
+            println!(
+                "block {block:>7}: {best:8.1} ms  ({:.2} s/Mrow)  staged {:>6.1} MB  file {:.1} MB",
+                best / 1000.0 * 1e6 / rows as f64,
+                (block.min(rows) * nf * 4) as f64 / 1e6,
+                bytes as f64 / 1e6
+            );
+            let _ = std::fs::remove_file(&path);
+        }
+
+        // The transpose ALONE, to locate the part the block size actually moves: stage a
+        // block row-major, then gather each of the 387 columns out of it at a 1,548-byte
+        // stride. Each arm allocates its own staging buffer and its own column vectors
+        // inside its own timer, so neither is handed a buffer the other paid for.
+        println!("-- transpose only (no encode) --");
+        for block in [250_000usize, 131_072, 16_384, 4_096, 1_024] {
+            let mut best = f64::INFINITY;
+            for _ in 0..3 {
+                let t0 = std::time::Instant::now();
+                let mut stage: Vec<f32> = Vec::with_capacity(block * nf);
+                let mut acc = 0.0f32;
+                let mut done = 0usize;
+                while done < rows {
+                    let k = block.min(rows - done);
+                    for i in 0..k {
+                        stage.extend_from_slice(&pool[(done + i) % pool.len()]);
+                    }
+                    for fi in 0..nf {
+                        let col: Vec<f32> = (0..k).map(|r| stage[r * nf + fi]).collect();
+                        acc += col[0];
+                    }
+                    stage.clear();
+                    done += k;
+                }
+                std::hint::black_box(acc);
+                best = best.min(t0.elapsed().as_secs_f64() * 1000.0);
+            }
+            println!(
+                "block {block:>7}: {best:8.1} ms  ({:.2} s/Mrow)",
+                best / 1000.0 * 1e6 / rows as f64
+            );
+        }
     }
 
     /// A minimal competed table: the metadata columns `rescore::run` reads plus two
