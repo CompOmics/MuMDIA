@@ -1,5 +1,14 @@
 """Assemble a per-run library from `mumdia prescan` survivors.
 
+DEPRECATED: `mumdia sub-library` does the same thing in the engine, streaming both tables
+instead of holding the precursor table and every label string in memory (44 GB on the
+142.7M-precursor 8-12-mer library, against about 1.6 GB). Prefer:
+
+    mumdia sub-library --lib-precursors P --lib-fragments F --survivors S         --out-precursors OP --out-fragments OF
+
+This script stays for recipes that already call it and is unchanged otherwise.
+
+
 Usage: python assemble_survivors.py <lib_precursors> <lib_fragments> <prescan_survivors>
                                     <out_precursors> <out_fragments>
 
