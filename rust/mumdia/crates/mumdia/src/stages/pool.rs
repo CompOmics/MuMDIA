@@ -280,7 +280,9 @@ mod tests {
                 // to carry over from the tables it was spliced from.
                 Col::LargeListF32(
                     "trace".into(),
-                    cids.iter().map(|c| vec![*c as f32, *c as f32 + 0.5]).collect(),
+                    cids.iter()
+                        .map(|c| vec![*c as f32, *c as f32 + 0.5])
+                        .collect(),
                 ),
             ];
             if extra {
@@ -367,8 +369,16 @@ mod tests {
             let cids: Vec<u32> = ids.collect();
             let n = cids.len();
             let schema = std::sync::Arc::new(arrow::datatypes::Schema::new(vec![
-                arrow::datatypes::Field::new("candidate_id", arrow::datatypes::DataType::UInt32, false),
-                arrow::datatypes::Field::new("prelim_score", arrow::datatypes::DataType::Float64, false),
+                arrow::datatypes::Field::new(
+                    "candidate_id",
+                    arrow::datatypes::DataType::UInt32,
+                    false,
+                ),
+                arrow::datatypes::Field::new(
+                    "prelim_score",
+                    arrow::datatypes::DataType::Float64,
+                    false,
+                ),
             ]));
             let mut w = BatchWriter::with_row_group_rows(&p, schema.clone(), 50).unwrap();
             for chunk in cids.chunks(25) {
@@ -376,9 +386,10 @@ mod tests {
                     schema.clone(),
                     vec![
                         std::sync::Arc::new(UInt32Array::from(chunk.to_vec())),
-                        std::sync::Arc::new(arrow::array::Float64Array::from(
-                            vec![score; chunk.len()],
-                        )),
+                        std::sync::Arc::new(arrow::array::Float64Array::from(vec![
+                            score;
+                            chunk.len()
+                        ])),
                     ],
                 )
                 .unwrap();

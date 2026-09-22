@@ -2058,11 +2058,20 @@ mod write_chunking_tests {
         let (chunked, once) = (p("big_chunked.parquet"), p("big_once.parquet"));
         write_table(&chunked, cols(n)).unwrap();
         write_one_batch(&once, cols(n));
-        let a = TableFile::open(&chunked).unwrap().row_group_stats("id").unwrap();
-        let b = TableFile::open(&once).unwrap().row_group_stats("id").unwrap();
+        let a = TableFile::open(&chunked)
+            .unwrap()
+            .row_group_stats("id")
+            .unwrap();
+        let b = TableFile::open(&once)
+            .unwrap()
+            .row_group_stats("id")
+            .unwrap();
         let rows_a: Vec<usize> = a.iter().map(|g| g.rows).collect();
         let rows_b: Vec<usize> = b.iter().map(|g| g.rows).collect();
-        assert_eq!(rows_a, rows_b, "row groups moved: {rows_a:?} against {rows_b:?}");
+        assert_eq!(
+            rows_a, rows_b,
+            "row groups moved: {rows_a:?} against {rows_b:?}"
+        );
         assert_eq!(rows_a, vec![1_048_576, 7]);
         assert_eq!(
             std::fs::read(&chunked).unwrap(),

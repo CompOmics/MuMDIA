@@ -1349,9 +1349,7 @@ fn real_main() -> Result<()> {
                 .filter(|b| std::path::Path::new(&b.competed).exists())
                 .collect();
             if bands.is_empty() {
-                anyhow::bail!(
-                    "no band directory under {groups_dir} holds a psms_competed.parquet"
-                );
+                anyhow::bail!("no band directory under {groups_dir} holds a psms_competed.parquet");
             }
             let out = |n: &str| format!("{out_dir}/{n}");
             let (op, oc, ok) = (
