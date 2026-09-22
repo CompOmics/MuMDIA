@@ -36,6 +36,301 @@ pub struct QuantParams<'a> {
     pub config_hash: &'a str,
 }
 
+/// Interned fragment names. A chromatogram table has tens of millions of rows and only a
+/// few dozen distinct fragment names (`y1`..`y30`, `b1`..), so a row carries a name id and
+/// each string is stored once instead of the `String` per row this stage used to keep.
+#[derive(Default)]
+struct NameTab {
+    ids: HashMap<String, u32>,
+    names: Vec<String>,
+}
+
+impl NameTab {
+    fn intern(&mut self, s: &str) -> u32 {
+        if let Some(&i) = self.ids.get(s) {
+            return i;
+        }
+        let i = self.names.len() as u32;
+        self.names.push(s.to_string());
+        self.ids.insert(s.to_string(), i);
+        i
+    }
+
+    fn get(&self, id: u32) -> &str {
+        &self.names[id as usize]
+    }
+}
+
+/// Marker for a row with no RT axis at all: extract emits an empty trace, not a
+/// zero-filled one, for a predicted fragment that was never observed.
+const NO_AXIS: u32 = u32::MAX;
+
+/// The fragment chromatogram rows quant keeps, in table order, in flat buffers.
+///
+/// This is the same treatment `features` gives the same table ([`super::features`]'s
+/// `ChromChunk`): one heap block per array instead of a `Vec<f32>` for the RT axis, a
+/// `Vec<f32>` for the intensities and a `String` for the fragment name PER ROW. The
+/// motivation is the number of live heap blocks rather than the bytes: a grouped search
+/// died at ~290 GB resident with 1.7 TB free because the process had hit the kernel's
+/// per-process memory-mapping limit (1,048,576) with one mapping per medium block, and
+/// `--out-peak-bounds` bypasses the accepted-candidate filter and holds the whole table
+/// this way. The RT axis is additionally shared between the rows of one candidate that
+/// sample the same grid, which is every row of a candidate under extract's window-grid
+/// mode, so the axis is stored once per candidate instead of once per fragment.
+#[derive(Default)]
+struct ChromStore {
+    names: NameTab,
+    /// Candidate id per row, in table order.
+    cid: Vec<u32>,
+    name_id: Vec<u32>,
+    pred: Vec<f32>,
+    /// Index into `axis_off`, or [`NO_AXIS`] for an empty trace.
+    axis_id: Vec<u32>,
+    /// Axis `a` is `axis_vals[axis_off[a]..axis_off[a + 1]]`.
+    axis_off: Vec<usize>,
+    axis_vals: Vec<f32>,
+    /// Axis `a` is strictly increasing and non-negative, so it carries no duplicate RT
+    /// and no NaN. [`peak_window`] needs that before it may treat the axis as the union
+    /// axis directly instead of merging the samples.
+    axis_strict: Vec<bool>,
+    /// Row `r`'s intensities are `int_vals[int_off[r]..int_off[r + 1]]`.
+    int_off: Vec<usize>,
+    int_vals: Vec<f32>,
+    /// First axis of the candidate being filled, so dedup only compares within it.
+    open_axis_lo: usize,
+    open_cid: Option<u32>,
+    /// Every stored axis is non-decreasing, non-negative and NaN-free, so the nearest
+    /// sample to an apex may be found by binary search rather than by scanning the whole
+    /// trace. False makes every search fall back to the scan, which is what this stage
+    /// always did.
+    rt_sorted: bool,
+}
+
+impl ChromStore {
+    fn new() -> ChromStore {
+        ChromStore {
+            axis_off: vec![0],
+            int_off: vec![0],
+            rt_sorted: true,
+            ..Default::default()
+        }
+    }
+
+    fn nrows(&self) -> usize {
+        self.cid.len()
+    }
+
+    /// Store `rt` as an axis id, reusing an axis already stored for the open candidate
+    /// when the values are identical (the common case: one grid per candidate).
+    fn axis_for(&mut self, cid: u32, rt: &[f32]) -> u32 {
+        if self.open_cid != Some(cid) {
+            self.open_cid = Some(cid);
+            self.open_axis_lo = self.axis_off.len() - 1;
+        }
+        if rt.is_empty() {
+            return NO_AXIS;
+        }
+        for a in self.open_axis_lo..self.axis_off.len() - 1 {
+            let (lo, hi) = (self.axis_off[a], self.axis_off[a + 1]);
+            if hi - lo == rt.len() && self.axis_vals[lo..hi] == *rt {
+                return a as u32;
+            }
+        }
+        let nondecreasing = rt_is_sorted(rt);
+        self.rt_sorted &= nondecreasing;
+        self.axis_strict
+            .push(nondecreasing && rt.windows(2).all(|w| w[0] < w[1]));
+        self.axis_vals.extend_from_slice(rt);
+        self.axis_off.push(self.axis_vals.len());
+        (self.axis_off.len() - 2) as u32
+    }
+
+    fn push(&mut self, cid: u32, name: &str, pred: f32, rt: &[f32], inten: &[f32]) {
+        let axis_id = self.axis_for(cid, rt);
+        let name_id = self.names.intern(name);
+        self.cid.push(cid);
+        self.name_id.push(name_id);
+        self.pred.push(pred);
+        self.axis_id.push(axis_id);
+        self.int_vals.extend_from_slice(inten);
+        self.int_off.push(self.int_vals.len());
+    }
+
+    fn axis(&self, id: u32) -> &[f32] {
+        if id == NO_AXIS {
+            return &[];
+        }
+        let a = id as usize;
+        &self.axis_vals[self.axis_off[a]..self.axis_off[a + 1]]
+    }
+
+    fn rt(&self, row: usize) -> &[f32] {
+        self.axis(self.axis_id[row])
+    }
+
+    fn inten(&self, row: usize) -> &[f32] {
+        &self.int_vals[self.int_off[row]..self.int_off[row + 1]]
+    }
+
+    fn name(&self, row: usize) -> &str {
+        self.names.get(self.name_id[row])
+    }
+
+    /// Payload bytes by part, for [`crate::memlog::report`].
+    fn mem_parts(&self) -> Vec<(&'static str, usize)> {
+        use crate::memlog::bytes_of;
+        vec![
+            ("intensities", bytes_of(&self.int_vals)),
+            ("rt_axes", bytes_of(&self.axis_vals)),
+            (
+                "row_index",
+                bytes_of(&self.cid)
+                    + bytes_of(&self.name_id)
+                    + bytes_of(&self.pred)
+                    + bytes_of(&self.axis_id)
+                    + bytes_of(&self.int_off),
+            ),
+            (
+                "axis_index",
+                bytes_of(&self.axis_off) + bytes_of(&self.axis_strict),
+            ),
+        ]
+    }
+}
+
+/// The fragment chromatogram rows grouped by candidate: candidate `ci` owns the rows
+/// `rows[cand_off[ci]..cand_off[ci + 1]]` of [`ChromStore`], ascending by candidate id and
+/// in table order within a candidate. That is exactly the iteration the
+/// `BTreeMap<u32, Vec<usize>>` this replaces produced, without a map node and a `Vec` per
+/// candidate; the per-candidate results below (windows, areas) are flat arrays indexed by
+/// the same `ci`.
+struct CandIndex {
+    /// Distinct candidate ids, ascending.
+    cids: Vec<u32>,
+    cand_off: Vec<usize>,
+    rows: Vec<usize>,
+    /// `pred[slot]` for the row at `rows[slot]`, so the fragment-selection ranking reads
+    /// one contiguous slice per candidate instead of gathering pairs.
+    slot_pred: Vec<f32>,
+}
+
+impl CandIndex {
+    fn build(store: &ChromStore) -> CandIndex {
+        // The table is written grouped by candidate, so a one-entry run cache resolves
+        // almost every row; an ungrouped table falls back to the binary search and is
+        // grouped just the same.
+        let mut distinct: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        let mut last: Option<u32> = None;
+        for &c in &store.cid {
+            if last != Some(c) {
+                distinct.insert(c);
+                last = Some(c);
+            }
+        }
+        let mut cids: Vec<u32> = distinct.into_iter().collect();
+        cids.sort_unstable();
+        let mut cand_off = vec![0usize; cids.len() + 1];
+        let mut cache: Option<(u32, usize)> = None;
+        let lookup = |c: u32, cache: &mut Option<(u32, usize)>| -> usize {
+            if let Some((lc, li)) = *cache {
+                if lc == c {
+                    return li;
+                }
+            }
+            let i = cids
+                .binary_search(&c)
+                .expect("candidate id was collected above");
+            *cache = Some((c, i));
+            i
+        };
+        for &c in &store.cid {
+            cand_off[lookup(c, &mut cache) + 1] += 1;
+        }
+        for k in 1..=cids.len() {
+            cand_off[k] += cand_off[k - 1];
+        }
+        let mut cursor = cand_off[..cids.len()].to_vec();
+        let mut rows = vec![0usize; store.nrows()];
+        let mut slot_pred = vec![0.0f32; store.nrows()];
+        cache = None;
+        for (row, &c) in store.cid.iter().enumerate() {
+            let ci = lookup(c, &mut cache);
+            rows[cursor[ci]] = row;
+            slot_pred[cursor[ci]] = store.pred[row];
+            cursor[ci] += 1;
+        }
+        CandIndex {
+            cids,
+            cand_off,
+            rows,
+            slot_pred,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.cids.len()
+    }
+
+    fn slots(&self, ci: usize) -> std::ops::Range<usize> {
+        self.cand_off[ci]..self.cand_off[ci + 1]
+    }
+
+    fn rows_of(&self, ci: usize) -> &[usize] {
+        &self.rows[self.slots(ci)]
+    }
+
+    fn find(&self, cid: u32) -> Option<usize> {
+        self.cids.binary_search(&cid).ok()
+    }
+}
+
+/// Index of the sample nearest to `target`, reproducing the first-minimum tie-break of a
+/// forward linear scan (`d < best`). `sorted` asserts the trace is non-decreasing and
+/// NaN-free ([`ChromStore::rt_sorted`], or the union axis built by [`peak_window`]), and
+/// only then is the answer found by binary search; otherwise the scan runs as before.
+///
+/// The scan was the dominant per-fragment cost of a fixed-window integration: it is
+/// `O(trace)` where the integration itself is `O(window)`, and on a window-grid
+/// chromatogram the trace is a few thousand samples against a window of ten.
+fn nearest_index(rt: &[f32], target: f64, sorted: bool) -> usize {
+    if !sorted {
+        let mut k = 0usize;
+        let mut best = f64::INFINITY;
+        for (i, &r) in rt.iter().enumerate() {
+            let d = (r as f64 - target).abs();
+            if d < best {
+                best = d;
+                k = i;
+            }
+        }
+        return k;
+    }
+    // First sample at or after `target`. A non-finite target makes every predicate false
+    // and lands on 0, which is where the scan's untouched `k` sits too.
+    let j = rt.partition_point(|&r| (r as f64) < target);
+    // Backing up over an equal-valued run keeps the FIRST of several identical samples,
+    // which is the one the scan's strict `<` kept.
+    let back = |mut m: usize| {
+        while m > 0 && rt[m - 1] == rt[m] {
+            m -= 1;
+        }
+        m
+    };
+    if j == 0 {
+        return 0;
+    }
+    if j >= rt.len() {
+        return back(rt.len() - 1);
+    }
+    // Sorted, so the distance is V-shaped and the minimum is at `j - 1` or `j`; an exact
+    // tie is the equidistant case, where the scan kept the earlier index.
+    if (target - rt[j - 1] as f64).abs() <= (rt[j] as f64 - target).abs() {
+        back(j - 1)
+    } else {
+        j
+    }
+}
+
 /// Trapezoidal integral of an intensity trace over RT (seconds). A single point
 /// yields its raw intensity.
 fn trapezoid(rt: &[f32], inten: &[f32]) -> f64 {
@@ -128,20 +423,27 @@ fn flank_baseline(inten: &[f32], lo: usize, hi: usize, flank: usize, quantile: f
 /// otherwise takes `half` scans on each side. `None` for an empty trace.
 ///
 /// Shared by the integration below and by the applied-window contract in [`run`],
-/// so the bounds reported for a quantity are the bounds it was integrated over.
-fn fixed_window_indices(rt: &[f32], apex: f64, half: usize, half_s: f64) -> Option<(usize, usize)> {
+/// so the bounds reported for a quantity are the bounds it was integrated over. [`run`]
+/// computes this ONCE per fragment row and uses it for both, where it used to compute the
+/// same indices a second time to report the bounds.
+///
+/// `sorted` says the trace is non-decreasing and NaN-free (see [`nearest_index`]).
+fn fixed_window_indices(
+    rt: &[f32],
+    apex: f64,
+    half: usize,
+    half_s: f64,
+    sorted: bool,
+) -> Option<(usize, usize)> {
     if rt.is_empty() {
         return None;
     }
-    let mut k = 0usize;
-    let mut best = f64::INFINITY;
-    for (i, &r) in rt.iter().enumerate() {
-        let d = (r as f64 - apex).abs();
-        if d < best {
-            best = d;
-            k = i;
-        }
-    }
+    let k = nearest_index(rt, apex, sorted);
+    // The scan this replaced left `best` at infinity when every distance was NaN (a
+    // non-finite apex, which makes the guard below reject the window); reproduce that
+    // rather than letting a NaN slip past the comparison as false.
+    let d = (rt[k] as f64 - apex).abs();
+    let best = if d.is_nan() { f64::INFINITY } else { d };
     let (mut lo, mut hi) = if half_s > 0.0 {
         // Distance guard: the nearest sample must itself lie inside the window. Without
         // it the nearest sample was always included however far away it was, so a weak
@@ -181,9 +483,21 @@ fn fixed_window_indices(rt: &[f32], apex: f64, half: usize, half_s: f64) -> Opti
     Some((lo, hi))
 }
 
+/// True when `rt` is non-decreasing, non-negative and NaN-free, the property
+/// [`nearest_index`] needs before it may binary-search. [`run`] takes it once per store
+/// ([`ChromStore::rt_sorted`]) rather than per call.
+fn rt_is_sorted(rt: &[f32]) -> bool {
+    rt.is_empty() || (rt[0] >= 0.0 && rt.windows(2).all(|w| w[0] <= w[1]))
+}
+
 /// Fixed-window integration over the samples chosen by [`fixed_window_indices`],
 /// with optional apex-outward envelope and optional flank-baseline subtraction
 /// (`baseline = Some((flank, quantile))`). Empty trace integrates to 0.
+///
+/// Test-facing composition of [`fixed_window_indices`] and [`trapezoid_fixed_at`]; [`run`]
+/// calls the two separately so the window indices are computed once and serve both the
+/// area and the reported bounds.
+#[cfg(test)]
 fn trapezoid_fixed_opts(
     rt: &[f32],
     inten: &[f32],
@@ -193,9 +507,23 @@ fn trapezoid_fixed_opts(
     envelope: bool,
     baseline: Option<(usize, f64)>,
 ) -> f64 {
-    let Some((lo, hi)) = fixed_window_indices(rt, apex, half, half_s) else {
+    let Some((lo, hi)) = fixed_window_indices(rt, apex, half, half_s, rt_is_sorted(rt)) else {
         return 0.0;
     };
+    trapezoid_fixed_at(rt, inten, lo, hi, envelope, baseline)
+}
+
+/// Fixed-window integration over the sample range `[lo, hi)` already chosen by
+/// [`fixed_window_indices`], with optional apex-outward envelope and optional
+/// flank-baseline subtraction (`baseline = Some((flank, quantile))`).
+fn trapezoid_fixed_at(
+    rt: &[f32],
+    inten: &[f32],
+    lo: usize,
+    hi: usize,
+    envelope: bool,
+    baseline: Option<(usize, f64)>,
+) -> f64 {
     let mut w: Vec<f32> = inten[lo..hi].to_vec();
     if let Some((flank, quantile)) = baseline {
         let b = flank_baseline(inten, lo, hi, flank, quantile);
@@ -212,23 +540,26 @@ fn trapezoid_fixed_opts(
 /// Top-N sum with the fragment ranking chosen by `selection`. `observed_area`
 /// delegates to [`summarize_fragment_areas`] (legacy, byte-identical); `predicted`
 /// ranks the positive finite areas by library intensity and sums the top N.
+///
+/// The areas and their library intensities arrive as two parallel slices of one
+/// candidate's fragment rows rather than a `Vec<(f64, f32)>`, because [`run`] holds them
+/// as flat per-candidate slices of one buffer each. `None` is a candidate with no
+/// chromatogram row at all.
 fn select_fragment_areas(
-    areas: Option<&[(f64, f32)]>,
+    areas: Option<(&[f64], &[f32])>,
     top_n: usize,
     selection: FragmentSelection,
 ) -> (Option<f64>, usize, &'static str) {
     match selection {
-        FragmentSelection::ObservedArea => {
-            let plain: Option<Vec<f64>> = areas.map(|a| a.iter().map(|x| x.0).collect());
-            summarize_fragment_areas(plain.as_deref(), top_n)
-        }
+        FragmentSelection::ObservedArea => summarize_fragment_areas(areas.map(|a| a.0), top_n),
         FragmentSelection::Predicted => {
-            let Some(areas) = areas else {
+            let Some((areas, preds)) = areas else {
                 return (None, 0, "no_fragment_traces");
             };
             let mut positive: Vec<(f64, f32)> = areas
                 .iter()
                 .copied()
+                .zip(preds.iter().copied())
                 // The ranking key must be finite too. `total_cmp` orders NaN ABOVE every
                 // real value, so in the descending sort below a NaN predicted intensity
                 // reached the front and was preferentially selected into the top N. The
@@ -256,7 +587,7 @@ fn select_fragment_areas(
 
 /// Elution-peak RT window `[lo, hi]` for one candidate, from the summed XIC across
 /// all its fragment chromatograms. Fragments are aligned on the union of their RT
-/// samples via a BTreeMap keyed by the f32 RT bit pattern: for the non-negative
+/// samples ordered by the f32 RT bit pattern: for the non-negative
 /// RTs here the bit order matches the value order, so both the union axis and the
 /// f64 summation order are fixed (determinism,
 /// docs/14_build_test_deploy_gotchas.md). When a finite identification apex is
@@ -266,54 +597,105 @@ fn select_fragment_areas(
 /// artifacts and missing/non-finite hints retain the legacy co-elution apex
 /// detector. Returns an unbounded window when there are fewer than two distinct
 /// RT samples (nothing to bound).
+///
+/// The union used to be built by inserting every sample into TWO `BTreeMap`s keyed
+/// identically, one tree walk per sample each. It is now either a direct accumulation
+/// (every row of the candidate shares one strictly increasing axis, which is what
+/// extract's window grid writes, so the union IS that axis) or one stable sort of the
+/// samples by RT bits. Both reduce each RT's f64 sum in the same order the tree did --
+/// row order, then sample order -- so the profile, the apex and the bounds are
+/// bit-identical.
 fn peak_window(
     rows: &[usize],
-    ch_rt: &[Vec<f32>],
-    ch_int: &[Vec<f32>],
+    store: &ChromStore,
     frac: f64,
     grace: usize,
     apex_hint: Option<f64>,
 ) -> (f64, f64, f64) {
-    let mut prof_map: BTreeMap<u32, f64> = BTreeMap::new();
-    // Per-scan count of co-eluting (nonzero) fragments, aligned to prof_map keys.
-    let mut cnt_map: BTreeMap<u32, u32> = BTreeMap::new();
+    // Does every non-empty row of this candidate sample the same strictly increasing
+    // axis? An empty trace contributes no sample and so cannot widen the union.
+    let mut shared: Option<u32> = None;
+    let mut uniform = true;
     for &i in rows {
-        let rts = &ch_rt[i];
-        let ins = &ch_int[i];
-        for k in 0..rts.len() {
-            *prof_map.entry(rts[k].to_bits()).or_insert(0.0) += ins[k] as f64;
-            if ins[k] > 0.0 {
-                *cnt_map.entry(rts[k].to_bits()).or_insert(0) += 1;
+        let a = store.axis_id[i];
+        if a == NO_AXIS {
+            continue;
+        }
+        match shared {
+            None => shared = Some(a),
+            Some(s) if s == a => {}
+            _ => {
+                uniform = false;
+                break;
             }
         }
     }
-    if prof_map.len() < 2 {
+    let shared = shared.filter(|&a| uniform && store.axis_strict[a as usize]);
+
+    let mut owned_axis: Vec<f32> = Vec::new();
+    let (prof, cnt) = if let Some(a) = shared {
+        let n = store.axis(a).len();
+        let mut prof = vec![0.0f64; n];
+        let mut cnt = vec![0u32; n];
+        for &i in rows {
+            for (k, &v) in store.inten(i).iter().enumerate() {
+                prof[k] += v as f64;
+                if v > 0.0 {
+                    cnt[k] += 1;
+                }
+            }
+        }
+        (prof, cnt)
+    } else {
+        let total: usize = rows.iter().map(|&i| store.inten(i).len()).sum();
+        let mut samples: Vec<(u32, f32)> = Vec::with_capacity(total);
+        for &i in rows {
+            let rts = store.rt(i);
+            let ins = store.inten(i);
+            for k in 0..rts.len() {
+                samples.push((rts[k].to_bits(), ins[k]));
+            }
+        }
+        // Stable, so within one RT the contributions keep their (row, sample) order --
+        // the order the map accumulated them in.
+        samples.sort_by_key(|s| s.0);
+        let mut prof: Vec<f64> = Vec::new();
+        let mut cnt: Vec<u32> = Vec::new();
+        let mut k = 0usize;
+        while k < samples.len() {
+            let bits = samples[k].0;
+            let mut sum = 0.0f64;
+            let mut c = 0u32;
+            while k < samples.len() && samples[k].0 == bits {
+                sum += samples[k].1 as f64;
+                if samples[k].1 > 0.0 {
+                    c += 1;
+                }
+                k += 1;
+            }
+            owned_axis.push(f32::from_bits(bits));
+            prof.push(sum);
+            cnt.push(c);
+        }
+        (prof, cnt)
+    };
+    let axis: &[f32] = match shared {
+        Some(a) => store.axis(a),
+        None => &owned_axis,
+    };
+    if axis.len() < 2 {
         // Nothing to bound; apex is the lone RT if present, else NaN.
-        let apex = prof_map
-            .keys()
-            .next()
-            .map_or(f64::NAN, |b| f32::from_bits(*b) as f64);
+        let apex = axis.first().map_or(f64::NAN, |&r| r as f64);
         return (f64::NEG_INFINITY, f64::INFINITY, apex);
     }
-    let axis: Vec<f64> = prof_map.keys().map(|b| f32::from_bits(*b) as f64).collect();
-    let prof: Vec<f64> = prof_map.values().cloned().collect();
-    let cnt: Vec<u32> = prof_map
-        .keys()
-        .map(|b| *cnt_map.get(b).unwrap_or(&0))
-        .collect();
+    // Both constructions leave the axis ascending: the shared one is checked strictly
+    // increasing when it is stored, and the merged one is deduped and ordered by bit
+    // pattern, which is value order as long as no negative or NaN RT is present.
+    let axis_sorted = shared.is_some() || axis.last().is_some_and(|&r| r >= 0.0);
     let ai = if let Some(hint) = apex_hint.filter(|v| v.is_finite()) {
         // The identified apex need not exactly equal a chromatogram sample (for
         // example after serialization/calibration), so anchor to the nearest RT.
-        let mut nearest = 0usize;
-        let mut distance = f64::INFINITY;
-        for (i, &rt) in axis.iter().enumerate() {
-            let d = (rt - hint).abs();
-            if d < distance {
-                nearest = i;
-                distance = d;
-            }
-        }
-        nearest
+        nearest_index(axis, hint, axis_sorted)
     } else {
         // Legacy robust apex: among scans whose co-eluting-fragment count is
         // within 1 of the maximum ("-1 for robustness"), take the one with the
@@ -356,7 +738,7 @@ fn peak_window(
         }
         lo = lo.saturating_sub(1);
     }
-    (axis[lo], axis[hi], axis[ai])
+    (axis[lo] as f64, axis[hi] as f64, axis[ai] as f64)
 }
 
 fn finite_option(value: f64) -> Option<f64> {
@@ -419,7 +801,17 @@ fn add_protein_base_quantity(
     base_peptide_id: u32,
     quantity: Option<f64>,
 ) {
-    let bases = groups.entry(protein_group.to_string()).or_default();
+    // `entry` needs an owned key, so this allocated a `String` for every scored row even
+    // though the group almost always exists already. Look it up first and allocate only
+    // for a group that is new. The group is still created for an unquantifiable row: a
+    // protein whose every peptide is unquantifiable is REPORTED, with status
+    // `no_quantifiable_peptide`, not omitted.
+    if !groups.contains_key(protein_group) {
+        groups.insert(protein_group.to_string(), BTreeMap::new());
+    }
+    let bases = groups
+        .get_mut(protein_group)
+        .expect("the group was just inserted");
     if let Some(quantity) = quantity.filter(|v| v.is_finite() && *v > 0.0) {
         bases
             .entry(base_peptide_id)
@@ -606,14 +998,15 @@ pub fn run(p: QuantParams) -> Result<(u64, u64)> {
         );
     }
     let ch = TableFile::open(p.chromatograms)?;
-    let mut ch_cid: Vec<u32> = Vec::new();
-    let mut ch_name: Vec<String> = Vec::new();
-    let mut ch_rt: Vec<Vec<f32>> = Vec::new();
-    let mut ch_int: Vec<Vec<f32>> = Vec::new();
-    // Zero, not NaN, for the absent column: the value is only a ranking key, and
-    // `total_cmp` orders NaN above every real intensity, which would silently invert the
-    // `predicted` ranking rather than fail.
-    let mut ch_pred: Vec<f32> = Vec::new();
+    // Flat, grouped-by-candidate store (see [`ChromStore`]). The MS1 isotope XIC
+    // pseudo-traces (frag_name "ms1_*") are precursor channels, not fragment ions, and
+    // neither the peak-window detection nor the top-N sum ever reads one, so they are not
+    // stored at all rather than loaded and skipped later.
+    //
+    // Zero, not NaN, for an absent `predicted_intensity`: the value is only a ranking key,
+    // and `total_cmp` orders NaN above every real intensity, which would silently invert
+    // the `predicted` ranking rather than fail.
+    let mut store = ChromStore::new();
     {
         let cols: Vec<&str> = if has_pred {
             vec![
@@ -643,6 +1036,11 @@ pub fn run(p: QuantParams) -> Result<(u64, u64)> {
         } else {
             None
         };
+        // Trace values are appended into scratch buffers and then copied into the store,
+        // because the RT axis is deduplicated against the candidate's earlier rows before
+        // it is stored.
+        let mut rt_buf: Vec<f32> = Vec::new();
+        let mut int_buf: Vec<f32> = Vec::new();
         for b in reader {
             let b = b?;
             let a_cid = b
@@ -671,8 +1069,16 @@ pub fn run(p: QuantParams) -> Result<(u64, u64)> {
                 if !keep_all && !wanted.contains(&c) {
                     continue;
                 }
-                let rt = a_rt.row(k, "rt")?;
-                let it = a_int.row(k, "intensity")?;
+                let nm = if a_name.is_null(k) {
+                    ""
+                } else {
+                    a_name.value(k)
+                };
+                rt_buf.clear();
+                int_buf.clear();
+                a_rt.append_row(k, &mut rt_buf, "rt")?;
+                a_int.append_row(k, &mut int_buf, "intensity")?;
+                let (rt, it) = (&rt_buf, &int_buf);
                 // `rt` and `intensity` are two independent list columns, and every
                 // integration below slices `intensity` with indices computed from the LENGTH
                 // OF `rt`. Extract writes them from paired vectors so they always match, but
@@ -691,69 +1097,74 @@ pub fn run(p: QuantParams) -> Result<(u64, u64)> {
                         p.chromatograms
                     );
                 }
-                ch_cid.push(c);
-                ch_name.push(if a_name.is_null(k) {
-                    String::new()
-                } else {
-                    a_name.value(k).to_string()
-                });
-                ch_rt.push(rt);
-                ch_int.push(it);
-                ch_pred.push(match a_pred {
+                // The MS1 isotope XIC pseudo-traces are precursor channels, not fragment
+                // ions, and no phase below reads one, so they are dropped rather than
+                // stored and skipped later. Dropped AFTER the length check, which is a
+                // guard on the table rather than on what this stage happens to consume.
+                if nm.starts_with("ms1_") {
+                    continue;
+                }
+                let pred = match a_pred {
                     Some(a) => a.value(k),
                     None => 0.0,
-                });
+                };
+                store.push(c, nm, pred, rt, it);
             }
         }
     }
     drop(wanted);
-    // Group the b/y fragment chromatogram rows by candidate. The MS1 isotope XIC
-    // pseudo-traces (frag_name "ms1_*") are precursor channels, not fragment ions,
-    // and are excluded from both the peak-window detection and the top-N sum. The
-    // BTreeMap keeps candidate iteration order deterministic.
-    let mut cand_rows: BTreeMap<u32, Vec<usize>> = BTreeMap::new();
-    for i in 0..ch_cid.len() {
-        if ch_name[i].starts_with("ms1_") {
-            continue;
-        }
-        cand_rows.entry(ch_cid[i]).or_default().push(i);
+    let store = store;
+    // Group the fragment chromatogram rows by candidate, ascending by candidate id and in
+    // table order within a candidate: the order the `BTreeMap<u32, Vec<usize>>` this
+    // replaces iterated in, so every per-candidate reduction below runs over the same rows
+    // in the same order.
+    let index = CandIndex::build(&store);
+    {
+        let mut parts = store.mem_parts();
+        parts.push((
+            "cand_index",
+            crate::memlog::bytes_of(&index.rows)
+                + crate::memlog::bytes_of(&index.slot_pred)
+                + crate::memlog::bytes_of(&index.cids)
+                + crate::memlog::bytes_of(&index.cand_off),
+        ));
+        crate::memlog::report("quant chromatogram store", &parts);
     }
-    let mut areas: HashMap<u32, Vec<(f64, f32)>> = HashMap::new();
-    // Store the fragment name by reference (borrowed from `ch_name`, which outlives
-    // this map) to avoid a per-row String clone; it is materialized once at export.
-    let mut frag_areas: HashMap<u32, Vec<(&str, f64)>> = HashMap::new();
+    info!(
+        chromatogram_rows = store.nrows(),
+        candidates = index.len(),
+        "quant: chromatograms loaded"
+    );
     // Optional peak-window diagnostic: (candidate_id, lo_rt, hi_rt) for finite windows.
     let emit_bounds = p.out_peak_bounds.is_some() && p.cfg.bound_peak;
     let (mut pb_cid, mut pb_lo, mut pb_hi) = (Vec::new(), Vec::new(), Vec::new());
 
     // Phase 1: per-candidate summed-XIC window (lo_rt, hi_rt, apex_rt), anchored at
     // the identification apex when available and otherwise using the legacy robust
-    // co-elution detector. Kept keyed by candidate for the consensus estimate.
-    let mut win: BTreeMap<u32, (f64, f64, f64)> = BTreeMap::new();
-    if p.cfg.bound_peak {
-        // Each candidate's window depends only on its own chromatogram rows, so this is
-        // embarrassingly parallel. Results are collected into a Vec and only then folded
-        // into the BTreeMap, so the map is built from a deterministically ordered sequence
-        // and every float inside `peak_window` is still reduced per candidate in the same
-        // order as before -- bit-identical, not merely equivalent.
-        let computed: Vec<(u32, (f64, f64, f64))> = cand_rows
-            .par_iter()
-            .map(|(&c, rows)| {
-                (
-                    c,
-                    peak_window(
-                        rows,
-                        &ch_rt,
-                        &ch_int,
-                        p.cfg.peak_fraction,
-                        p.cfg.peak_grace,
-                        apex_by_cid.get(&c).copied(),
-                    ),
+    // co-elution detector. Indexed by candidate position in `index` for the consensus
+    // estimate and for phase 2, which is the same ascending-candidate_id order the
+    // `BTreeMap<u32, _>` this replaces iterated in, without its node per candidate.
+    //
+    // Each candidate's window depends only on its own chromatogram rows, so this is
+    // embarrassingly parallel; a range is an indexed parallel iterator, so the collected
+    // Vec is in candidate order and every float inside `peak_window` is still reduced per
+    // candidate in the same order as before.
+    let win: Vec<(f64, f64, f64)> = if p.cfg.bound_peak {
+        (0..index.len())
+            .into_par_iter()
+            .map(|ci| {
+                peak_window(
+                    index.rows_of(ci),
+                    &store,
+                    p.cfg.peak_fraction,
+                    p.cfg.peak_grace,
+                    apex_by_cid.get(&index.cids[ci]).copied(),
                 )
             })
-            .collect();
-        win.extend(computed);
-    }
+            .collect()
+    } else {
+        Vec::new()
+    };
 
     // Consensus mode: peak width is a near-constant instrument/gradient property, so
     // take the median left/right half-width over CONFIDENT peptides (q <= reliable_q)
@@ -773,11 +1184,13 @@ pub fn run(p: QuantParams) -> Result<(u64, u64)> {
                 }
             }
             let (mut left, mut right) = (Vec::new(), Vec::new());
-            for (c, &(lo, hi, apex)) in &win {
+            for (ci, &(lo, hi, apex)) in win.iter().enumerate() {
                 if lo.is_finite()
                     && hi.is_finite()
                     && apex.is_finite()
-                    && q_by_cid.get(c).is_some_and(|&q| q <= p.cfg.reliable_q)
+                    && q_by_cid
+                        .get(&index.cids[ci])
+                        .is_some_and(|&q| q <= p.cfg.reliable_q)
                 {
                     left.push(apex - lo);
                     right.push(hi - apex);
@@ -806,18 +1219,38 @@ pub fn run(p: QuantParams) -> Result<(u64, u64)> {
 
     // Phase 2: integrate each fragment over the chosen window and retain the
     // actually applied apex/bounds for the peptide-quant contract.
-    let mut applied_win: BTreeMap<u32, (f64, f64, f64)> = BTreeMap::new();
-    // `(candidate_id, (lo_rt, hi_rt, integration_apex), one area per chromatogram row)`.
-    type Integrated = (u32, (f64, f64, f64), Vec<f64>);
+    //
     // Integrate each candidate's fragment traces. Parallel across candidates for the same
     // reason the peak-window phase above is: a candidate reads only its own chromatogram
     // rows and every float reduction happens inside one candidate's `trapezoid*` call.
-    // Rayon's indexed `collect` keeps candidate order, and `cand_rows` is a `BTreeMap`, so
-    // the maps below are filled in exactly the order the serial loop filled them.
-    let integrated: Vec<Integrated> = cand_rows
-        .par_iter()
-        .map(|(&c, rows)| {
-            let want_fixed = p.cfg.fixed_scan_halfwidth > 0 || p.cfg.fixed_window_s > 0.0;
+    // The areas go into ONE flat buffer laid out exactly like `index.rows`, so candidate
+    // `ci`'s areas are `area_by_slot[index.slots(ci)]` and nothing is allocated per
+    // candidate. Rayon writes into disjoint sub-slices of it, carved once below, which is
+    // also why the positional pairing the serial fold used to assert is gone: each
+    // candidate writes the slice that is its own by construction.
+    let want_fixed = p.cfg.fixed_scan_halfwidth > 0 || p.cfg.fixed_window_s > 0.0;
+    let baseline = if p.cfg.baseline_subtract {
+        Some((p.cfg.baseline_flank_scans, p.cfg.baseline_quantile))
+    } else {
+        None
+    };
+    let mut area_by_slot: Vec<f64> = vec![0.0; index.rows.len()];
+    let mut slices: Vec<&mut [f64]> = Vec::with_capacity(index.len());
+    {
+        let mut rest: &mut [f64] = &mut area_by_slot;
+        for ci in 0..index.len() {
+            let n = index.cand_off[ci + 1] - index.cand_off[ci];
+            let (head, tail) = rest.split_at_mut(n);
+            slices.push(head);
+            rest = tail;
+        }
+    }
+    let applied_win: Vec<(f64, f64, f64)> = slices
+        .par_iter_mut()
+        .enumerate()
+        .map(|(ci, out)| {
+            let c = index.cids[ci];
+            let rows = index.rows_of(ci);
             let (lo_rt, hi_rt, integration_apex) = if !p.cfg.bound_peak {
                 // A fixed window needs only an apex to centre on, not the descent walk,
                 // so take the identification apex directly. Previously this branch
@@ -839,7 +1272,7 @@ pub fn run(p: QuantParams) -> Result<(u64, u64)> {
                 };
                 (f64::NEG_INFINITY, f64::INFINITY, apex)
             } else {
-                let (lo, hi, apex) = win[&c];
+                let (lo, hi, apex) = win[ci];
                 match consensus {
                     Some((ml, mr)) if apex.is_finite() => (apex - ml, apex + mr, apex),
                     _ => (lo, hi, apex),
@@ -848,87 +1281,63 @@ pub fn run(p: QuantParams) -> Result<(u64, u64)> {
             // A fixed window replaces the walked bounds entirely; it needs a finite apex
             // to centre on, so an unknown apex falls back to the configured window.
             let fixed = want_fixed && integration_apex.is_finite();
-            let a: Vec<f64> = rows
-                .iter()
-                .map(|&i| {
-                    if fixed {
-                        trapezoid_fixed_opts(
-                            &ch_rt[i],
-                            &ch_int[i],
-                            integration_apex,
-                            p.cfg.fixed_scan_halfwidth,
-                            p.cfg.fixed_window_s,
-                            p.cfg.interference_envelope,
-                            if p.cfg.baseline_subtract {
-                                Some((p.cfg.baseline_flank_scans, p.cfg.baseline_quantile))
-                            } else {
-                                None
-                            },
-                        )
-                    } else if p.cfg.bound_peak {
-                        trapezoid_window(
-                            &ch_rt[i],
-                            &ch_int[i],
-                            lo_rt,
-                            hi_rt,
-                            p.cfg.interference_envelope,
-                        )
-                    } else {
-                        trapezoid(&ch_rt[i], &ch_int[i])
-                    }
-                })
-                .collect();
             // Applied-window contract: under a fixed window the walked bounds are NOT the
             // integration range, so report the RT extent actually covered (union over this
             // candidate's traces, whose sample grids may differ). Otherwise
             // `integration_lo_rt`/`integration_hi_rt` and the peak-bounds diagnostic would
-            // describe a window that produced no part of `quantity`.
-            let (lo_rt, hi_rt) = if fixed {
-                let mut flo = f64::INFINITY;
-                let mut fhi = f64::NEG_INFINITY;
-                for &i in rows.iter() {
-                    if let Some((lo, hi)) = fixed_window_indices(
-                        &ch_rt[i],
+            // describe a window that produced no part of `quantity`. The window indices are
+            // computed ONCE per row and serve both the area and this union; the union used
+            // to recompute the identical indices in a second pass over the same rows.
+            let mut flo = f64::INFINITY;
+            let mut fhi = f64::NEG_INFINITY;
+            for (slot, &i) in rows.iter().enumerate() {
+                let rt = store.rt(i);
+                let it = store.inten(i);
+                out[slot] = if fixed {
+                    match fixed_window_indices(
+                        rt,
                         integration_apex,
                         p.cfg.fixed_scan_halfwidth,
                         p.cfg.fixed_window_s,
+                        store.rt_sorted,
                     ) {
-                        flo = flo.min(ch_rt[i][lo] as f64);
-                        fhi = fhi.max(ch_rt[i][hi - 1] as f64);
+                        Some((lo, hi)) => {
+                            flo = flo.min(rt[lo] as f64);
+                            fhi = fhi.max(rt[hi - 1] as f64);
+                            trapezoid_fixed_at(
+                                rt,
+                                it,
+                                lo,
+                                hi,
+                                p.cfg.interference_envelope,
+                                baseline,
+                            )
+                        }
+                        None => 0.0,
                     }
-                }
-                if flo.is_finite() && fhi.is_finite() {
-                    (flo, fhi)
+                } else if p.cfg.bound_peak {
+                    trapezoid_window(rt, it, lo_rt, hi_rt, p.cfg.interference_envelope)
                 } else {
-                    (lo_rt, hi_rt)
-                }
+                    trapezoid(rt, it)
+                };
+            }
+            let (lo_rt, hi_rt) = if fixed && flo.is_finite() && fhi.is_finite() {
+                (flo, fhi)
             } else {
                 (lo_rt, hi_rt)
             };
-            (c, (lo_rt, hi_rt, integration_apex), a)
+            (lo_rt, hi_rt, integration_apex)
         })
         .collect();
-    for ((c, w, computed), (key, rows)) in integrated.into_iter().zip(cand_rows.iter()) {
-        // The pairing is positional. It holds because both sides derive from the same
-        // `BTreeMap` and rayon's `collect` into a `Vec` preserves order, but the comment
-        // that justified it named the wrong reason (`BTreeMap::par_iter()` is not an
-        // `IndexedParallelIterator`; the order survives incidentally). If it ever
-        // diverged, one candidate's areas would attach to another's fragment rows with no
-        // error at all, so assert the invariant instead of arguing it.
-        debug_assert_eq!(c, *key, "quant: integrated order diverged from cand_rows");
-        let (lo_rt, hi_rt, _) = w;
-        applied_win.insert(c, w);
-        if emit_bounds && lo_rt.is_finite() && hi_rt.is_finite() {
-            pb_cid.push(c);
-            pb_lo.push(lo_rt);
-            pb_hi.push(hi_rt);
-        }
-        for (&i, a) in rows.iter().zip(computed) {
-            areas.entry(c).or_default().push((a, ch_pred[i]));
-            frag_areas
-                .entry(c)
-                .or_default()
-                .push((ch_name[i].as_str(), a));
+    drop(slices);
+    let area_by_slot = area_by_slot;
+    if emit_bounds {
+        for (ci, &(lo_rt, hi_rt, _)) in applied_win.iter().enumerate() {
+            if lo_rt.is_finite() && hi_rt.is_finite() {
+                pb_cid.push(index.cids[ci]);
+                pb_lo.push(lo_rt);
+                pb_hi.push(hi_rt);
+            }
         }
     }
 
@@ -974,20 +1383,37 @@ pub fn run(p: QuantParams) -> Result<(u64, u64)> {
     );
     let mut per_group: ProteinBaseQuant = BTreeMap::new();
     let mut n_quantified_peptides = 0u64;
+    // The top-N selection depends on the candidate alone, so it is computed once per
+    // candidate rather than once per scored row: it collects and SORTS the candidate's
+    // areas, and every extra row mapping to the same candidate repeated that.
+    let mut selected: HashMap<usize, usize> = HashMap::new();
+    let mut selections: Vec<(Option<f64>, usize, &'static str)> = Vec::new();
     for i in 0..ps.nrows {
         if !passes_quant_filter(&label[i], pep_q[i], p.cfg.q_threshold, is_transferred[i]) {
             continue;
         }
-        let (quantity, used, status) = select_fragment_areas(
-            areas.get(&cid[i]).map(Vec::as_slice),
-            p.cfg.top_n_fragments,
-            p.cfg.fragment_selection,
-        );
+        let ci = index.find(cid[i]);
+        let (quantity, used, status) = match ci {
+            None => select_fragment_areas(None, p.cfg.top_n_fragments, p.cfg.fragment_selection),
+            Some(ci) => {
+                let slot = *selected.entry(ci).or_insert_with(|| {
+                    let r = index.slots(ci);
+                    selections.push(select_fragment_areas(
+                        Some((&area_by_slot[r.clone()], &index.slot_pred[r])),
+                        p.cfg.top_n_fragments,
+                        p.cfg.fragment_selection,
+                    ));
+                    selections.len() - 1
+                });
+                selections[slot]
+            }
+        };
         if quantity.is_some() {
             n_quantified_peptides += 1;
         }
-        let (integration_lo, integration_hi, integration_apex) = match applied_win.get(&cid[i]) {
-            Some(&(lo, hi, apex)) => (finite_option(lo), finite_option(hi), finite_option(apex)),
+        let (integration_lo, integration_hi, integration_apex) = match ci.map(|ci| applied_win[ci])
+        {
+            Some((lo, hi, apex)) => (finite_option(lo), finite_option(hi), finite_option(apex)),
             None => (None, None, None),
         };
         q_cid.push(cid[i]);
@@ -1061,17 +1487,21 @@ pub fn run(p: QuantParams) -> Result<(u64, u64)> {
             if !passes_quant_filter(&label[i], pep_q[i], p.cfg.q_threshold, is_transferred[i]) {
                 continue;
             }
-            if let Some(fa) = frag_areas.get(&cid[i]) {
-                for (nm, a) in fa {
-                    if !a.is_finite() || *a <= 0.0 {
+            // The fragment name comes from the interned table by row rather than from a
+            // per-candidate `Vec<(&str, f64)>` built alongside the areas; the rows are the
+            // same rows in the same order.
+            if let Some(ci) = index.find(cid[i]) {
+                for slot in index.slots(ci) {
+                    let a = area_by_slot[slot];
+                    if !a.is_finite() || a <= 0.0 {
                         continue;
                     }
                     f_cid.push(cid[i]);
                     f_pf.push(pform[i].clone());
                     f_z.push(charge[i]);
                     f_pg.push(pg[i].clone());
-                    f_name.push(nm.to_string());
-                    f_area.push(*a);
+                    f_name.push(store.name(index.rows[slot]).to_string());
+                    f_area.push(a);
                 }
             }
         }
@@ -1213,9 +1643,15 @@ pub fn run_lfq_combine(
                 Some(fnm) => format!("{}|{}|{}", pform[i], z[i], fnm[i]),
                 None => format!("{}|{}", pform[i], z[i]),
             };
+            // Same reason as `add_protein_base_quantity`: `entry` would clone the protein
+            // group name on every row, and a run's quant table repeats each group many
+            // times over.
+            if !data.contains_key(&pgc[i]) {
+                data.insert(pgc[i].clone(), BTreeMap::new());
+            }
             let slot = &mut data
-                .entry(pgc[i].clone())
-                .or_default()
+                .get_mut(&pgc[i])
+                .expect("the group was just inserted")
                 .entry(key)
                 .or_insert_with(|| vec![None; n])[ri];
             *slot = Some(slot.map_or(quantity, |previous| previous.max(quantity)));
@@ -1237,8 +1673,13 @@ pub fn run_lfq_combine(
         }
     }
     let (mut c_pg, mut c_run, mut c_q, mut c_nf) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    // The rollup levels below read the SAME feature vectors, so each level borrows them
+    // from `data` rather than cloning them: with the protein level and the two sibling
+    // levels this held three or four copies of every feature vector at once.
+    let mut mat: Vec<&Vec<Option<f64>>> = Vec::new();
     for (pgname, feats) in &data {
-        let mat: Vec<Vec<Option<f64>>> = feats.values().cloned().collect();
+        mat.clear();
+        mat.extend(feats.values());
         let prof = crate::quant_lfq::lfq_profile(&mat, n);
         for (r, &v) in prof.iter().enumerate() {
             c_pg.push(pgname.clone());
@@ -1263,25 +1704,24 @@ pub fn run_lfq_combine(
     // base sequence. Both roll their member features up with the same LFQ engine.
     // Purely additive analysis granularity; strictly post-FDR, no identification
     // or FDR change.
-    let mut prec: BTreeMap<(String, i32), Vec<Vec<Option<f64>>>> = BTreeMap::new();
-    let mut pep: BTreeMap<String, Vec<Vec<Option<f64>>>> = BTreeMap::new();
+    let mut prec: BTreeMap<(String, i32), Vec<&Vec<Option<f64>>>> = BTreeMap::new();
+    let mut pep: BTreeMap<String, Vec<&Vec<Option<f64>>>> = BTreeMap::new();
     for feats in data.values() {
         for (key, vec) in feats {
             // key = "peptidoform|charge" (maxlfq) or "peptidoform|charge|fragment"
             // (directlfq); peptidoform strings never contain '|'.
             let mut it = key.splitn(3, '|');
-            let pform = it.next().unwrap_or("").to_string();
+            let pform = it.next().unwrap_or("");
             let charge: i32 = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-            prec.entry((pform.clone(), charge))
+            prec.entry((pform.to_string(), charge))
                 .or_default()
-                .push(vec.clone());
-            pep.entry(base_sequence(&pform))
-                .or_default()
-                .push(vec.clone());
+                .push(vec);
+            pep.entry(base_sequence(pform)).or_default().push(vec);
         }
     }
-    // (group key, charge, feature-by-run matrix) for one sibling-matrix level.
-    type LevelGroup = (String, i32, Vec<Vec<Option<f64>>>);
+    // (group key, charge, feature-by-run matrix) for one sibling-matrix level. The matrix
+    // borrows its rows from `data`.
+    type LevelGroup<'a> = (String, i32, Vec<&'a Vec<Option<f64>>>);
     let write_level = |path: String, groups: Vec<LevelGroup>| -> Result<()> {
         let (mut g_key, mut g_z, mut g_run, mut g_q, mut g_nf) =
             (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
@@ -1441,6 +1881,77 @@ mod tests {
     use super::*;
     use mumdia_io::table::Table;
 
+    /// A store built from plain per-row traces, all rows belonging to one candidate, so
+    /// the axes deduplicate exactly as extract's window grid makes them.
+    fn store_of(rt: &[Vec<f32>], inten: &[Vec<f32>]) -> ChromStore {
+        let mut s = ChromStore::new();
+        for (i, (r, it)) in rt.iter().zip(inten).enumerate() {
+            s.push(0, &format!("y{i}"), 0.0, r, it);
+        }
+        s
+    }
+
+    /// The same rows under a DISTINCT candidate id each, so no two rows can share an axis
+    /// id and [`peak_window`] must merge the samples instead of reading one shared axis.
+    /// The row indices are passed to `peak_window` explicitly, so the candidate ids only
+    /// steer the store's axis dedup.
+    fn store_of_unshared(rt: &[Vec<f32>], inten: &[Vec<f32>]) -> ChromStore {
+        let mut s = ChromStore::new();
+        for (i, (r, it)) in rt.iter().zip(inten).enumerate() {
+            s.push(i as u32, &format!("y{i}"), 0.0, r, it);
+        }
+        s
+    }
+
+    /// [`peak_window`] through BOTH union constructions, asserting they are bit-identical.
+    /// The shared-axis path is an accumulation into one profile array; the merged path is
+    /// the sort over every sample that replaced the two BTreeMaps. Every `peak_window`
+    /// test below goes through this, so each is also an equality test between the paths.
+    fn peak_window_both(
+        rows: &[usize],
+        rt: &[Vec<f32>],
+        inten: &[Vec<f32>],
+        frac: f64,
+        grace: usize,
+        hint: Option<f64>,
+    ) -> (f64, f64, f64) {
+        let shared = peak_window(rows, &store_of(rt, inten), frac, grace, hint);
+        let merged = peak_window(rows, &store_of_unshared(rt, inten), frac, grace, hint);
+        let bits = |w: (f64, f64, f64)| (w.0.to_bits(), w.1.to_bits(), w.2.to_bits());
+        assert_eq!(
+            bits(shared),
+            bits(merged),
+            "shared-axis and merged-sample unions disagree: {shared:?} vs {merged:?}"
+        );
+        shared
+    }
+
+    /// [`fixed_window_indices`] through both nearest-sample searches, asserting they
+    /// agree: `false` forces the linear first-minimum scan the binary search replaced.
+    fn fixed_window_indices_both(
+        rt: &[f32],
+        apex: f64,
+        half: usize,
+        half_s: f64,
+    ) -> Option<(usize, usize)> {
+        let scanned = fixed_window_indices(rt, apex, half, half_s, false);
+        let searched = fixed_window_indices(rt, apex, half, half_s, rt_is_sorted(rt));
+        assert_eq!(
+            scanned, searched,
+            "scan and binary search disagree on {rt:?} at apex {apex}"
+        );
+        scanned
+    }
+
+    /// One candidate's fragment areas as the two parallel slices `select_fragment_areas`
+    /// reads (it used to take a `Vec<(f64, f32)>`).
+    fn split_areas(pairs: &[(f64, f32)]) -> (Vec<f64>, Vec<f32>) {
+        (
+            pairs.iter().map(|p| p.0).collect(),
+            pairs.iter().map(|p| p.1).collect(),
+        )
+    }
+
     fn quant_test_path(name: &str) -> String {
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -1519,7 +2030,7 @@ mod tests {
         ];
         let ch_rt = vec![grid.clone(), grid.clone()];
         let ch_int = vec![real, interf];
-        let (lo, hi, _) = peak_window(&[0, 1], &ch_rt, &ch_int, 1.0 / 6.0, 1, None);
+        let (lo, hi, _) = peak_window_both(&[0, 1], &ch_rt, &ch_int, 1.0 / 6.0, 1, None);
         // Apex rt=6 (sum=10); 1/6 threshold ~1.67. Left: idx4(2)>=thr, idx3/idx2=0
         // -> 2 consecutive misses stop at rt=4. Right: symmetric stop at rt=8.
         assert_eq!(lo, 4.0);
@@ -1537,8 +2048,8 @@ mod tests {
         let prof = vec![0.0f32, 0.0, 1.0, 5.0, 10.0, 5.0, 1.0, 5.0, 0.0];
         let ch_rt = vec![grid.clone()];
         let ch_int = vec![prof];
-        let (_, hi1, _) = peak_window(&[0], &ch_rt, &ch_int, 1.0 / 3.0, 1, None);
-        let (_, hi0, _) = peak_window(&[0], &ch_rt, &ch_int, 1.0 / 3.0, 0, None);
+        let (_, hi1, _) = peak_window_both(&[0], &ch_rt, &ch_int, 1.0 / 3.0, 1, None);
+        let (_, hi0, _) = peak_window_both(&[0], &ch_rt, &ch_int, 1.0 / 3.0, 0, None);
         // grace=1 bridges the idx6 dip (1.0 < 3.33) and includes idx7 (5.0) -> rt 7.
         assert_eq!(hi1, 7.0);
         // grace=0 stops at the first sub-threshold scan -> last above-threshold rt 5.
@@ -1625,7 +2136,7 @@ mod tests {
             real.clone(),
             interf,
         ];
-        let (_, _, apex) = peak_window(&[0, 1, 2, 3, 4], &ch_rt, &ch_int, 1.0 / 6.0, 1, None);
+        let (_, _, apex) = peak_window_both(&[0, 1, 2, 3, 4], &ch_rt, &ch_int, 1.0 / 6.0, 1, None);
         assert_eq!(
             apex, 5.0,
             "apex must be the 4-fragment co-elution scan, not the lone interferent spike"
@@ -1642,16 +2153,16 @@ mod tests {
         let ch_rt = vec![grid.clone(), grid.clone(), grid.clone()];
         let ch_int = vec![trace.clone(), trace.clone(), trace];
 
-        let (_, _, legacy_apex) = peak_window(&[0, 1, 2], &ch_rt, &ch_int, 1.0 / 6.0, 1, None);
+        let (_, _, legacy_apex) = peak_window_both(&[0, 1, 2], &ch_rt, &ch_int, 1.0 / 6.0, 1, None);
         assert_eq!(legacy_apex, 1.0);
 
         let (lo, hi, anchored_apex) =
-            peak_window(&[0, 1, 2], &ch_rt, &ch_int, 1.0 / 6.0, 1, Some(5.1));
+            peak_window_both(&[0, 1, 2], &ch_rt, &ch_int, 1.0 / 6.0, 1, Some(5.1));
         assert_eq!(anchored_apex, 5.0);
         assert!(lo > 1.0 && hi >= 5.0, "anchored window was [{lo}, {hi}]");
 
         let (_, _, nonfinite_fallback) =
-            peak_window(&[0, 1, 2], &ch_rt, &ch_int, 1.0 / 6.0, 1, Some(f64::NAN));
+            peak_window_both(&[0, 1, 2], &ch_rt, &ch_int, 1.0 / 6.0, 1, Some(f64::NAN));
         assert_eq!(nonfinite_fallback, legacy_apex);
     }
 
@@ -1828,7 +2339,7 @@ mod tests {
         let spike = vec![0.0f32, 0.0, 10.0, 0.0, 0.0];
         let ch_rt = vec![grid.clone()];
         let ch_int = vec![spike];
-        let (lo, hi, apex) = peak_window(&[0], &ch_rt, &ch_int, 1.0 / 6.0, 1, None);
+        let (lo, hi, apex) = peak_window_both(&[0], &ch_rt, &ch_int, 1.0 / 6.0, 1, None);
         assert_eq!(apex, 4.0, "apex should be the summed-XIC max rt");
         assert!(hi > lo, "window must have nonzero width: lo={lo} hi={hi}");
         let a = trapezoid_window(&ch_rt[0], &ch_int[0], lo, hi, false);
@@ -1860,7 +2371,7 @@ mod tests {
             trapezoid_fixed_opts(&rt, &it, 5.0, 0, 0.0, false, None),
             7.5
         );
-        assert_eq!(fixed_window_indices(&rt, 5.0, 0, 0.0), Some((5, 7)));
+        assert_eq!(fixed_window_indices_both(&rt, 5.0, 0, 0.0), Some((5, 7)));
         // A window wider than the trace integrates the whole trace (area 20).
         assert!((trapezoid_fixed_opts(&rt, &it, 5.0, 0, 100.0, false, None) - 20.0).abs() < 1e-9);
         // An apex off the sampled range still integrates around the nearest sample.
@@ -1873,9 +2384,9 @@ mod tests {
             trapezoid_fixed_opts(&[], &[], 5.0, 3, 0.0, false, None),
             0.0
         );
-        assert_eq!(fixed_window_indices(&[], 5.0, 3, 0.0), None);
-        assert_eq!(fixed_window_indices(&rt, 5.0, 1, 0.0), Some((4, 7)));
-        assert_eq!(fixed_window_indices(&rt, 5.0, 0, 1.0), Some((4, 7)));
+        assert_eq!(fixed_window_indices_both(&[], 5.0, 3, 0.0), None);
+        assert_eq!(fixed_window_indices_both(&rt, 5.0, 1, 0.0), Some((4, 7)));
+        assert_eq!(fixed_window_indices_both(&rt, 5.0, 0, 1.0), Some((4, 7)));
 
         // Distance guard on the seconds form: an apex far outside the sampled range has
         // NO sample inside +/- half_s, so the window is empty and the area is 0. Before
@@ -1883,15 +2394,18 @@ mod tests {
         // fragment sampled 45 s from the apex contributed its off-peak intensity as this
         // candidate's area -- while `trapezoid_window`, given the same RT bounds,
         // correctly returns 0.
-        assert_eq!(fixed_window_indices(&rt, -50.0, 0, 5.0), None);
+        assert_eq!(fixed_window_indices_both(&rt, -50.0, 0, 5.0), None);
         assert_eq!(
             trapezoid_fixed_opts(&rt, &it, -50.0, 0, 5.0, false, None),
             0.0
         );
         // Just inside the guard, the sample is kept (and widened to two).
-        assert_eq!(fixed_window_indices(&rt, -4.0, 0, 5.0), Some((0, 2)));
+        assert_eq!(fixed_window_indices_both(&rt, -4.0, 0, 5.0), Some((0, 2)));
         // A single-sample trace cannot be widened, and must not panic.
-        assert_eq!(fixed_window_indices(&rt[0..1], 0.0, 0, 1.0), Some((0, 1)));
+        assert_eq!(
+            fixed_window_indices_both(&rt[0..1], 0.0, 0, 1.0),
+            Some((0, 1))
+        );
     }
 
     #[test]
@@ -1918,22 +2432,25 @@ mod tests {
     fn select_fragment_areas_ranks_by_predicted_intensity() {
         // Fragment 0 has the largest observed area but the smallest library intensity:
         // the interference case `fragment_selection = predicted` exists to avoid.
-        let areas = [(100.0f64, 0.1f32), (40.0, 1.0), (30.0, 0.8)];
+        let pairs = [(100.0f64, 0.1f32), (40.0, 1.0), (30.0, 0.8)];
+        let (a, pr) = split_areas(&pairs);
+        let areas = Some((a.as_slice(), pr.as_slice()));
         assert_eq!(
-            select_fragment_areas(Some(&areas), 2, FragmentSelection::ObservedArea),
+            select_fragment_areas(areas, 2, FragmentSelection::ObservedArea),
             (Some(140.0), 2, "quantified")
         );
         assert_eq!(
-            select_fragment_areas(Some(&areas), 2, FragmentSelection::Predicted),
+            select_fragment_areas(areas, 2, FragmentSelection::Predicted),
             (Some(70.0), 2, "quantified")
         );
         // `observed_area` must stay byte-identical to the legacy summariser.
-        let plain: Vec<f64> = areas.iter().map(|a| a.0).collect();
         assert_eq!(
-            select_fragment_areas(Some(&areas), 2, FragmentSelection::ObservedArea),
-            summarize_fragment_areas(Some(&plain), 2)
+            select_fragment_areas(areas, 2, FragmentSelection::ObservedArea),
+            summarize_fragment_areas(Some(&a), 2)
         );
         // Both rankings report the same statuses on the degenerate inputs.
+        let (zero_a, zero_p) = split_areas(&[(0.0, 1.0)]);
+        let (nan_a, nan_p) = split_areas(&[(f64::NAN, 1.0), (10.0, 0.5)]);
         for sel in [
             FragmentSelection::ObservedArea,
             FragmentSelection::Predicted,
@@ -1943,16 +2460,16 @@ mod tests {
                 (None, 0, "no_fragment_traces")
             );
             assert_eq!(
-                select_fragment_areas(Some(&[(0.0, 1.0)]), 3, sel),
+                select_fragment_areas(Some((&zero_a, &zero_p)), 3, sel),
                 (None, 0, "no_positive_fragment_area")
             );
             assert_eq!(
-                select_fragment_areas(Some(&areas), 0, sel),
+                select_fragment_areas(areas, 0, sel),
                 (None, 0, "no_fragments_selected")
             );
             // Non-finite areas are dropped, not summed into a NaN quantity.
             assert_eq!(
-                select_fragment_areas(Some(&[(f64::NAN, 1.0), (10.0, 0.5)]), 3, sel),
+                select_fragment_areas(Some((&nan_a, &nan_p)), 3, sel),
                 (Some(10.0), 1, "quantified")
             );
         }
@@ -2191,13 +2708,275 @@ mod tests {
         // `total_cmp` orders NaN above every real value, so in the descending sort a NaN
         // predicted intensity reached the front of the ranking and was preferentially
         // summed into the top N.
-        let areas: [(f64, f32); 3] = [(10.0, f32::NAN), (20.0, 0.9), (30.0, 0.8)];
+        let pairs: [(f64, f32); 3] = [(10.0, f32::NAN), (20.0, 0.9), (30.0, 0.8)];
+        let (a, pr) = split_areas(&pairs);
         let (q, used, status) =
-            select_fragment_areas(Some(&areas), 1, FragmentSelection::Predicted);
+            select_fragment_areas(Some((&a, &pr)), 1, FragmentSelection::Predicted);
         assert_eq!(status, "quantified");
         assert_eq!(used, 1);
         // The 0.9-intensity fragment wins, not the NaN one.
         assert_eq!(q, Some(20.0));
+    }
+
+    #[test]
+    fn nearest_index_binary_search_matches_the_scan() {
+        // The search replaces a forward linear scan whose strict `<` kept the FIRST
+        // minimum, so ties, runs of identical RTs and targets off either end all have to
+        // land on the same index.
+        let traces: [&[f32]; 7] = [
+            &[],
+            &[5.0],
+            &[1.0, 1.0, 5.0],
+            &[1.0, 3.0, 3.0, 10.0],
+            &[0.0, 1.0, 2.0, 3.0, 4.0],
+            &[2.0, 2.0, 2.0],
+            &[0.0, 0.0, 1.0, 1.0, 1.0, 9.0],
+        ];
+        for rt in traces {
+            for &t in &[-10.0f64, 0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 4.5, 9.0, 100.0] {
+                assert_eq!(
+                    nearest_index(rt, t, false),
+                    nearest_index(rt, t, true),
+                    "rt={rt:?} target={t}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_chromatogram_store_returns_the_rows_it_was_given() {
+        let grid: Vec<f32> = (0..5).map(|k| k as f32).collect();
+        let offset: Vec<f32> = (0..5).map(|k| k as f32 + 0.5).collect();
+        let mut s = ChromStore::new();
+        s.push(7, "y1", 0.25, &grid, &[1.0, 2.0, 3.0, 2.0, 1.0]);
+        s.push(7, "y2", 0.75, &grid, &[0.0, 1.0, 2.0, 1.0, 0.0]);
+        s.push(7, "b3", 0.5, &offset, &[9.0; 5]);
+        s.push(7, "b4", 0.1, &[], &[]);
+        s.push(8, "y1", 0.6, &grid, &[4.0; 5]);
+        assert_eq!(s.nrows(), 5);
+        assert_eq!(s.rt(0), grid.as_slice());
+        assert_eq!(s.inten(1), &[0.0, 1.0, 2.0, 1.0, 0.0]);
+        assert_eq!(s.name(2), "b3");
+        assert_eq!(s.pred[4], 0.6);
+        assert_eq!(s.rt(3), &[] as &[f32]);
+        assert_eq!(s.inten(3), &[] as &[f32]);
+        // One stored axis per distinct grid within a candidate, and the interned name
+        // table holds one string per distinct name.
+        assert_eq!(s.axis_id[0], s.axis_id[1]);
+        assert_ne!(s.axis_id[0], s.axis_id[2]);
+        assert_eq!(s.axis_id[3], NO_AXIS);
+        assert_eq!(s.names.names.len(), 4);
+        // A new candidate starts a new axis even for identical values: that costs a copy,
+        // never a value.
+        assert_ne!(s.axis_id[0], s.axis_id[4]);
+        assert_eq!(s.rt(4), grid.as_slice());
+        assert!(s.rt_sorted);
+        assert!(s.axis_strict[s.axis_id[0] as usize]);
+    }
+
+    #[test]
+    fn an_unsorted_or_duplicated_axis_refuses_the_fast_paths() {
+        let mut descending = ChromStore::new();
+        descending.push(1, "y1", 0.0, &[3.0, 1.0, 2.0], &[1.0, 2.0, 3.0]);
+        assert!(
+            !descending.rt_sorted,
+            "a descending step must send every nearest-sample search back to the scan"
+        );
+        assert!(!descending.axis_strict[0]);
+
+        let mut duplicated = ChromStore::new();
+        duplicated.push(1, "y1", 0.0, &[1.0, 1.0, 2.0], &[1.0, 2.0, 3.0]);
+        assert!(
+            duplicated.rt_sorted,
+            "non-decreasing is all the nearest-sample search needs"
+        );
+        assert!(
+            !duplicated.axis_strict[0],
+            "a repeated RT must merge into one profile point, so the axis cannot be \
+             used as the union axis"
+        );
+
+        let mut negative = ChromStore::new();
+        negative.push(1, "y1", 0.0, &[-1.0, 2.0], &[1.0, 2.0]);
+        assert!(
+            !negative.rt_sorted,
+            "bit order is value order only above zero"
+        );
+    }
+
+    #[test]
+    fn a_repeated_rt_sample_merges_into_one_profile_point() {
+        // The union used to be a BTreeMap keyed on the RT bit pattern, so two samples at
+        // the same RT became ONE profile point carrying their sum. Expressed as two rows
+        // the same two samples must give exactly the same window.
+        let duplicated = peak_window(
+            &[0],
+            &store_of(
+                &[vec![0.0f32, 1.0, 1.0, 2.0, 3.0]],
+                &[vec![0.0f32, 4.0, 6.0, 0.0, 0.0]],
+            ),
+            1.0 / 6.0,
+            1,
+            None,
+        );
+        let split = peak_window(
+            &[0, 1],
+            &store_of(
+                &[vec![0.0f32, 1.0, 2.0, 3.0], vec![1.0f32]],
+                &[vec![0.0f32, 4.0, 0.0, 0.0], vec![6.0f32]],
+            ),
+            1.0 / 6.0,
+            1,
+            None,
+        );
+        assert_eq!(duplicated, split);
+        assert_eq!(duplicated.2, 1.0, "the merged point is the apex");
+    }
+
+    #[test]
+    fn the_candidate_index_groups_exactly_as_the_map_it_replaces() {
+        for cids in [
+            vec![3u32, 3, 3, 1, 1, 9], // grouped by candidate, as extract writes it
+            vec![3u32, 1, 3, 9, 1, 3], // interleaved: the run cache cannot shortcut this
+            vec![5u32],
+        ] {
+            let mut s = ChromStore::new();
+            for (r, &c) in cids.iter().enumerate() {
+                s.push(c, &format!("y{r}"), r as f32, &[r as f32], &[1.0]);
+            }
+            let index = CandIndex::build(&s);
+            let mut want: BTreeMap<u32, Vec<usize>> = BTreeMap::new();
+            for (r, &c) in cids.iter().enumerate() {
+                want.entry(c).or_default().push(r);
+            }
+            let got: BTreeMap<u32, Vec<usize>> = (0..index.len())
+                .map(|ci| (index.cids[ci], index.rows_of(ci).to_vec()))
+                .collect();
+            assert_eq!(got, want, "grouping of {cids:?}");
+            for ci in 0..index.len() {
+                assert_eq!(index.find(index.cids[ci]), Some(ci));
+                for slot in index.slots(ci) {
+                    assert_eq!(index.slot_pred[slot], s.pred[index.rows[slot]]);
+                }
+            }
+            assert_eq!(index.find(u32::MAX), None);
+        }
+    }
+
+    #[test]
+    fn several_scored_rows_of_one_candidate_agree_and_ms1_traces_stay_out() {
+        // The top-N selection is memoised per candidate, so two scored rows on candidate 1
+        // must carry exactly what the per-row computation produced. The `ms1_*` traces are
+        // precursor channels, not fragment ions: here they are ten times brighter than any
+        // fragment, so including one would move both the window and the sum. Candidate 3
+        // has no scored row at all and reaches only the peak-bounds diagnostic, which is
+        // the export that keeps every candidate's chromatogram rows.
+        let scored = quant_test_path("memo_scored.parquet");
+        let chrom = quant_test_path("memo_chrom.parquet");
+        let peptide = quant_test_path("memo_peptide.parquet");
+        let protein = quant_test_path("memo_protein.parquet");
+        let fragment = quant_test_path("memo_fragment.parquet");
+        let bounds = quant_test_path("memo_bounds.parquet");
+
+        write_table(
+            &scored,
+            vec![
+                Col::U32("candidate_id".into(), vec![1, 1, 2]),
+                Col::U32("base_peptide_id".into(), vec![10, 11, 12]),
+                Col::Str(
+                    "peptidoform".into(),
+                    vec!["PEPA".into(), "PEPB".into(), "PEPC".into()],
+                ),
+                Col::I32("charge".into(), vec![2, 3, 2]),
+                Col::Str("label".into(), vec!["target".into(); 3]),
+                Col::Str(
+                    "protein_group".into(),
+                    vec!["PG".into(), "PG".into(), "PG2".into()],
+                ),
+                Col::F64("peptide_q_value".into(), vec![0.0; 3]),
+                Col::F64("apex_rt".into(), vec![5.0; 3]),
+            ],
+        )
+        .unwrap();
+
+        let grid: Vec<f32> = (0..10).map(|rt| rt as f32).collect();
+        let c1a = vec![0.0f32, 50.0, 0.0, 0.0, 5.0, 10.0, 5.0, 0.0, 0.0, 0.0];
+        let c1b = vec![0.0f32, 25.0, 0.0, 0.0, 2.5, 5.0, 2.5, 0.0, 0.0, 0.0];
+        let c2 = vec![0.0f32, 0.0, 0.0, 0.0, 10.0, 20.0, 10.0, 0.0, 0.0, 0.0];
+        let ms1 = vec![100.0f32; 10];
+        write_table(
+            &chrom,
+            vec![
+                Col::U32("candidate_id".into(), vec![1, 1, 1, 2, 3]),
+                Col::Str(
+                    "frag_name".into(),
+                    vec![
+                        "b2".into(),
+                        "ms1_mono".into(),
+                        "y3".into(),
+                        "b4".into(),
+                        "y5".into(),
+                    ],
+                ),
+                Col::ListF32(
+                    "rt".into(),
+                    vec![
+                        grid.clone(),
+                        grid.clone(),
+                        grid.clone(),
+                        grid.clone(),
+                        grid.clone(),
+                    ],
+                ),
+                Col::ListF32("intensity".into(), vec![c1a, ms1, c1b, c2.clone(), c2]),
+            ],
+        )
+        .unwrap();
+
+        let cfg = QuantConfig::default();
+        let rows = run(QuantParams {
+            psms_scored: &scored,
+            chromatograms: &chrom,
+            out_peptide: &peptide,
+            out_protein: &protein,
+            out_fragment: Some(&fragment),
+            out_peak_bounds: Some(&bounds),
+            cfg: &cfg,
+            config_hash: "test",
+        })
+        .unwrap();
+        assert_eq!(rows, (3, 2));
+
+        let pq = Table::read(&peptide).unwrap();
+        let quantities = pq.opt_f64("quantity").unwrap();
+        // b2 + y3 over the walked window [4, 6]: (5+10)/2 + (10+5)/2 = 15, and half that.
+        assert_eq!(quantities[0], Some(22.5));
+        assert_eq!(
+            quantities[0], quantities[1],
+            "the two rows of candidate 1 must quantify identically"
+        );
+        assert_eq!(quantities[2], Some(30.0));
+        assert_eq!(pq.i32("n_fragments_used").unwrap(), vec![2, 2, 1]);
+        assert_eq!(
+            pq.opt_f64("integration_lo_rt").unwrap(),
+            vec![Some(4.0); 3],
+            "the ms1 channel must not widen the window"
+        );
+
+        let fq = Table::read(&fragment).unwrap();
+        let names = fq.str("fragment_name").unwrap();
+        assert_eq!(names.len(), 5, "two fragments x two rows, plus candidate 2");
+        assert!(
+            !names.iter().any(|n| n.starts_with("ms1_")),
+            "ms1 pseudo-traces are not fragment quantities: {names:?}"
+        );
+
+        let bq = Table::read(&bounds).unwrap();
+        assert_eq!(
+            bq.u32("candidate_id").unwrap(),
+            vec![1, 2, 3],
+            "the diagnostic keeps candidates no scored row selected"
+        );
     }
 }
 
