@@ -33,7 +33,7 @@
       "default_text": "0",
       "help": "",
       "gates": [],
-      "source_line": 1929
+      "source_line": 1934
     },
     {
       "path": "convert.thermo_raw_parser",
@@ -2456,9 +2456,9 @@
       "optional": false,
       "default": 1,
       "default_text": "1",
-      "help": "Bands searched at the same time inside one run. `1` (the default) is one band at a time, which is what bounds the memory: each band in flight holds its own extraction working set, so the peak is this many bands' worth. Raise it to fill a large machine, after checking one band's peak RSS: on a 203M-precursor library at 63 bands the largest band took 39 GB and the median far less. Results do not depend on it; bands are independent and their artifacts are pooled in band order either way.",
+      "help": "Bands searched at the same time inside one run. `1` (the default) is one band at a time, which is what bounds the memory: each band in flight holds its own extraction working set, so the peak is this many bands' worth. Raise it to fill a large machine, after checking one band's peak RSS: on a 203M-precursor library at 63 bands the largest band took 39 GB and the median far less. Results do not depend on it; bands are independent and their artifacts are pooled in band order either way. It must stay below the thread count: a band in flight parks one worker on its accumulation channel, so as many bands as there are threads leaves nothing to do the probing and the run deadlocks. A larger value is clamped to `threads - 1` with a warning rather than hanging.",
       "gates": [],
-      "source_line": 1912
+      "source_line": 1917
     }
   ],
   "list_sections": [
