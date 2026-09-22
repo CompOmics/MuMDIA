@@ -16,8 +16,11 @@
 //! 60% kept, so it is not the key.
 //!
 //! Streaming: both tables are read one batch at a time and written the same way. What is
-//! resident is one batch of each plus two `u32` per library precursor (the pair key and the
-//! old-to-new map), which is why a 203M-precursor library subsets in about 1.6 GB.
+//! resident is one batch of each, two `u32` per library precursor (the pair key and the
+//! old-to-new map), one `bool` per precursor, and under `--pair-link` one more `bool` per
+//! peptidoform id up to the largest one the library carries. That is why a 203M-precursor
+//! library subsets in about 1.6 GB: the fixed cost is the three per-precursor vectors, not
+//! the tables.
 
 use std::time::Instant;
 
