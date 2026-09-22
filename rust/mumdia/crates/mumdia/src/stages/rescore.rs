@@ -12,6 +12,7 @@ use mumdia_core::config::{FeaturePreset, RescoreConfig, RescorerKind};
 use mumdia_core::schema::artifact;
 use mumdia_io::report::ArtifactReport;
 use mumdia_io::table::{write_table, Col, TableFile};
+use rayon::prelude::*;
 use serde_json::json;
 use tracing::{info, warn};
 
@@ -86,6 +87,23 @@ fn human_bytes(bytes: f64) -> String {
     } else {
         format!("{:.0} KiB", bytes / KIB)
     }
+}
+
+/// Append one competed input's column to the concatenated column.
+///
+/// The first input is MOVED in, not copied, and the destination is then reserved to the
+/// total row count known from the parquet footers, so a multi-input concatenation
+/// reallocates once and every later input appends into spare capacity. For the common
+/// single-input rescore nothing is copied at all.
+fn merge_col<T>(dst: &mut Vec<T>, mut src: Vec<T>, total_rows: usize) {
+    if dst.is_empty() {
+        *dst = src;
+        if dst.len() < total_rows {
+            dst.reserve(total_rows - dst.len());
+        }
+        return;
+    }
+    dst.append(&mut src);
 }
 
 /// Refuse a rescore whose population cannot support target-decoy FDR.
@@ -261,21 +279,30 @@ pub fn run(p: RescoreParams) -> Result<u64> {
                 }
             }
         }
-        for i in 0..t.nrows {
-            cid.push(c[i]);
-            peak_rank.push(pkr[i]);
-            label.push(l[i].clone());
-            base.push(b[i]);
-            pform.push(pf[i].clone());
-            protein.push(pr[i].clone());
-            charge.push(z[i] as i32);
-            prelim.push(pl[i]);
-            mz.push(pm[i]);
-            apex_rt.push(ar[i]);
-            elution_lo.push(elo[i]);
-            elution_hi.push(ehi[i]);
-            source.push(src as u32);
-        }
+        // Take the reader's columns rather than copying them row by row into a second set.
+        // The row loop this replaces cloned every metadata STRING -- label, peptidoform,
+        // protein -- into a fresh allocation while the source vector stayed alive until the
+        // end of the iteration, so at peak both copies existed: twice the string bytes and,
+        // more importantly, twice the live allocation count, three per PSM. `merge_col`
+        // moves the whole vector for the first (usually only) input and appends the rest,
+        // which copies `String` headers but never the heap blocks they own.
+        merge_col(&mut cid, c, total_rows);
+        merge_col(&mut peak_rank, pkr, total_rows);
+        merge_col(&mut label, l, total_rows);
+        merge_col(&mut base, b, total_rows);
+        merge_col(&mut pform, pf, total_rows);
+        merge_col(&mut protein, pr, total_rows);
+        merge_col(
+            &mut charge,
+            z.into_iter().map(|v| v as i32).collect(),
+            total_rows,
+        );
+        merge_col(&mut prelim, pl, total_rows);
+        merge_col(&mut mz, pm, total_rows);
+        merge_col(&mut apex_rt, ar, total_rows);
+        merge_col(&mut elution_lo, elo, total_rows);
+        merge_col(&mut elution_hi, ehi, total_rows);
+        merge_col(&mut source, vec![src as u32; t.nrows], total_rows);
     }
     let feats = matrix.finish()?;
     crate::memlog::report(
@@ -297,22 +324,29 @@ pub fn run(p: RescoreParams) -> Result<u64> {
         let n_decoys = is_decoy.iter().filter(|&&v| v).count();
         let n_targets = n - n_decoys;
         require_both_labels(n_targets, n_decoys)?;
-        for (row, values) in feats.iter_rows().enumerate() {
-            if let Some((feature, value)) = values
-                .iter()
-                .enumerate()
-                .find(|(_, value)| !value.is_finite())
-            {
+        // The validation this replaces was one serial pass of `n_rows x n_features`
+        // `is_finite` checks -- hundreds of gigabytes on one thread at experiment scale --
+        // for a predicate with no carried state. Both scans are parallel now and both are
+        // order-preserving (`find_first`), and the two answers are combined so the row
+        // reported is still the FIRST offending row, features before scalars within a row,
+        // exactly as the interleaved serial loop reported it.
+        let bad_feature = feats.find_non_finite();
+        let bad_scalar = (0..n)
+            .into_par_iter()
+            .find_first(|&row| !prelim[row].is_finite() || !mz[row].is_finite());
+        if let Some((row, feature)) = bad_feature {
+            if bad_scalar.is_none_or(|scalar_row| row <= scalar_row) {
                 anyhow::bail!(
-                    "rescore input contains non-finite feature '{}' at flat row {row}: {value}",
-                    feat_names[feature]
+                    "rescore input contains non-finite feature '{}' at flat row {row}: {}",
+                    feat_names[feature],
+                    feats.row(row)[feature]
                 );
             }
-            if !prelim[row].is_finite() || !mz[row].is_finite() {
-                anyhow::bail!(
-                    "rescore input contains non-finite prelim_score/precursor_mz at flat row {row}"
-                );
-            }
+        }
+        if let Some(row) = bad_scalar {
+            anyhow::bail!(
+                "rescore input contains non-finite prelim_score/precursor_mz at flat row {row}"
+            );
         }
     }
     info!(
@@ -599,10 +633,10 @@ pub fn run(p: RescoreParams) -> Result<u64> {
     // Multi-context q-values (docs/11_compete_rescore_fdr.md). The pooled per-PSM q
     // is `experiment_psm_q`; `run_psm_q` re-runs TDA within each source (run) so a
     // per-run quant/report gets a real per-run FDR rather than the pooled value;
-    // `precursor_q` groups on peptidoform+charge. `global_q` is kept as a
-    // byte-identical alias of the pooled q for backward-compat.
-    let global_q = psm_q.clone();
-    let experiment_psm_q = psm_q.clone();
+    // `precursor_q` groups on peptidoform+charge. `global_q_value` and
+    // `experiment_psm_q` are kept as byte-identical aliases of the pooled q for
+    // backward-compat, and are written from the SAME Arrow array below rather than from
+    // two more copies of the column (see `write_scored_table`).
     // Per-run PSM q: TDA within each source separately, scattered back by row index.
     // Single-run (source all-zero) => equals `q_value`. Sorted (BTree) source
     // iteration keeps it deterministic; no floats are summed.
@@ -703,40 +737,28 @@ pub fn run(p: RescoreParams) -> Result<u64> {
         seen.len()
     };
 
-    let rows = write_table(
+    let rows = write_scored_table(
         p.out,
-        vec![
-            Col::U32("candidate_id".into(), cid),
-            Col::Str("peptidoform".into(), pform),
-            Col::I32("charge".into(), charge),
-            Col::Str("label".into(), label),
-            // `protein` feeds two columns; clone once here and move the original below.
-            Col::Str("protein".into(), protein.clone()),
-            Col::U32("base_peptide_id".into(), base),
-            Col::F64("apex_rt".into(), apex_rt),
-            Col::F64("elution_lo".into(), elution_lo),
-            Col::F64("elution_hi".into(), elution_hi),
-            Col::F64("score".into(), scores),
-            Col::F64("q_value".into(), psm_q),
-            Col::F64("peptide_q_value".into(), peptide_q),
-            Col::Str("protein_group".into(), protein),
-            Col::F64("pg_q_value".into(), pg_q),
-            Col::F64("global_q_value".into(), global_q),
-            Col::F64("prelim_score".into(), prelim),
-            // Run identity for experiment-wide rescore (index into --competed);
-            // all-zero for a single-run rescore. Lets quant map scores per file.
-            Col::U32("source".into(), source),
-            // Multi-context q columns (docs/11_compete_rescore_fdr.md).
-            // run_psm_q = per-run PSM FDR; experiment_psm_q = pooled PSM FDR
-            // (== q_value/global_q_value); precursor_q = per (peptidoform+charge)
-            // FDR.
-            Col::F64("run_psm_q".into(), run_psm_q),
-            Col::F64("experiment_psm_q".into(), experiment_psm_q),
-            Col::F64("precursor_q".into(), precursor_q),
-            // Which chromatographic peak the rescorer selected for this candidate
-            // (#7). 0 = the up-front apex; > 0 = a promoted alternate peak won.
-            Col::I32("selected_peak_rank".into(), peak_rank),
-        ],
+        ScoredColumns {
+            cid,
+            pform,
+            charge,
+            label,
+            protein,
+            base,
+            apex_rt,
+            elution_lo,
+            elution_hi,
+            scores,
+            psm_q,
+            peptide_q,
+            pg_q,
+            prelim,
+            source,
+            run_psm_q,
+            precursor_q,
+            peak_rank,
+        },
     )?;
 
     let elapsed = t0.elapsed().as_millis();
@@ -805,6 +827,112 @@ pub fn run(p: RescoreParams) -> Result<u64> {
         "rescore: done"
     );
     Ok(rows)
+}
+
+/// The `psms_scored` columns, in schema order.
+struct ScoredColumns {
+    cid: Vec<u32>,
+    pform: Vec<String>,
+    charge: Vec<i32>,
+    label: Vec<String>,
+    protein: Vec<String>,
+    base: Vec<u32>,
+    apex_rt: Vec<f64>,
+    elution_lo: Vec<f64>,
+    elution_hi: Vec<f64>,
+    scores: Vec<f64>,
+    psm_q: Vec<f64>,
+    peptide_q: Vec<f64>,
+    pg_q: Vec<f64>,
+    prelim: Vec<f64>,
+    source: Vec<u32>,
+    run_psm_q: Vec<f64>,
+    precursor_q: Vec<f64>,
+    peak_rank: Vec<i32>,
+}
+
+/// Write `psms_scored`, sharing the Arrow array behind every column that repeats.
+///
+/// Three of the 21 columns are duplicates by construction: `protein_group` is `protein`,
+/// and `global_q_value` and `experiment_psm_q` are both the pooled `q_value` (the comments
+/// at their definitions say so). Through `write_table` each duplicate had to arrive as its
+/// own `Vec`, so the stage carried a second full copy of the protein strings -- one heap
+/// block per PSM -- and two more copies of the pooled q column, all three alive at the
+/// same moment as the originals. An `ArrayRef` is refcounted, so passing the same array in
+/// several slots of the batch writes the same bytes from one buffer.
+///
+/// The parquet is byte-identical to the previous `write_table` call: the same schema
+/// (names, types, all non-nullable, same order), one record batch, and `BatchWriter` opens
+/// the identical SNAPPY writer on the identical `AtomicPath` temp-then-rename. The
+/// duplicate columns are encoded independently, exactly as they were when they were
+/// separate vectors.
+fn write_scored_table(path: &str, c: ScoredColumns) -> Result<u64> {
+    use arrow::array::{ArrayRef, Int32Array, StringArray, UInt32Array};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use std::sync::Arc;
+
+    let f = |name: &str, t: DataType| Field::new(name, t, false);
+    let schema = Arc::new(Schema::new(vec![
+        f("candidate_id", DataType::UInt32),
+        f("peptidoform", DataType::Utf8),
+        f("charge", DataType::Int32),
+        f("label", DataType::Utf8),
+        f("protein", DataType::Utf8),
+        f("base_peptide_id", DataType::UInt32),
+        f("apex_rt", DataType::Float64),
+        f("elution_lo", DataType::Float64),
+        f("elution_hi", DataType::Float64),
+        f("score", DataType::Float64),
+        f("q_value", DataType::Float64),
+        f("peptide_q_value", DataType::Float64),
+        f("protein_group", DataType::Utf8),
+        f("pg_q_value", DataType::Float64),
+        f("global_q_value", DataType::Float64),
+        f("prelim_score", DataType::Float64),
+        // Run identity for experiment-wide rescore (index into --competed); all-zero for
+        // a single-run rescore. Lets quant map scores per file.
+        f("source", DataType::UInt32),
+        // Multi-context q columns (docs/11_compete_rescore_fdr.md). run_psm_q = per-run
+        // PSM FDR; experiment_psm_q = pooled PSM FDR (== q_value/global_q_value);
+        // precursor_q = per (peptidoform+charge) FDR.
+        f("run_psm_q", DataType::Float64),
+        f("experiment_psm_q", DataType::Float64),
+        f("precursor_q", DataType::Float64),
+        // Which chromatographic peak the rescorer selected for this candidate (#7).
+        // 0 = the up-front apex; > 0 = a promoted alternate peak won.
+        f("selected_peak_rank", DataType::Int32),
+    ]));
+    let protein: ArrayRef = Arc::new(StringArray::from(c.protein));
+    let q: ArrayRef = Arc::new(Float64Array::from(c.psm_q));
+    let arrays: Vec<ArrayRef> = vec![
+        Arc::new(UInt32Array::from(c.cid)),
+        Arc::new(StringArray::from(c.pform)),
+        Arc::new(Int32Array::from(c.charge)),
+        Arc::new(StringArray::from(c.label)),
+        protein.clone(),
+        Arc::new(UInt32Array::from(c.base)),
+        Arc::new(Float64Array::from(c.apex_rt)),
+        Arc::new(Float64Array::from(c.elution_lo)),
+        Arc::new(Float64Array::from(c.elution_hi)),
+        Arc::new(Float64Array::from(c.scores)),
+        q.clone(),
+        Arc::new(Float64Array::from(c.peptide_q)),
+        protein,
+        Arc::new(Float64Array::from(c.pg_q)),
+        q.clone(),
+        Arc::new(Float64Array::from(c.prelim)),
+        Arc::new(UInt32Array::from(c.source)),
+        Arc::new(Float64Array::from(c.run_psm_q)),
+        q,
+        Arc::new(Float64Array::from(c.precursor_q)),
+        Arc::new(Int32Array::from(c.peak_rank)),
+    ];
+    let batch = RecordBatch::try_new(schema.clone(), arrays)
+        .with_context(|| format!("building the scored record batch for {path}"))?;
+    let mut w = mumdia_io::table::BatchWriter::new(path, schema)?;
+    w.write(&batch)?;
+    w.close()
 }
 
 /// Reject a concatenation whose feature companions differ in either identity or
@@ -1575,6 +1703,99 @@ b
         let got =
             resolve_feature_subset(&cfg_with(None, Some(path.to_str().unwrap())), &avail).unwrap();
         assert_eq!(got, vec!["b".to_string(), "c".to_string()]);
+    }
+
+    #[test]
+    fn merge_col_moves_the_first_input_and_appends_the_rest() {
+        // One input: the destination IS the reader's vector, not a copy of it. Checked on
+        // the pointer, because "moved rather than copied" is the whole claim.
+        let src = vec![String::from("a"), String::from("b")];
+        let ptr = src.as_ptr();
+        let mut dst: Vec<String> = Vec::new();
+        merge_col(&mut dst, src, 2);
+        assert_eq!(dst.as_ptr(), ptr);
+        assert_eq!(dst, vec!["a".to_string(), "b".to_string()]);
+        // Several inputs: the concatenation is in input order, and the reserve from the
+        // footer row count means the appends do not realloc.
+        let mut dst: Vec<u32> = Vec::new();
+        merge_col(&mut dst, vec![1, 2], 5);
+        let after_first = dst.as_ptr();
+        merge_col(&mut dst, vec![3], 5);
+        merge_col(&mut dst, vec![4, 5], 5);
+        assert_eq!(dst, vec![1, 2, 3, 4, 5]);
+        assert_eq!(
+            dst.as_ptr(),
+            after_first,
+            "the reserve should have sufficed"
+        );
+        // An empty first input must not lose the rows of the second.
+        let mut dst: Vec<u32> = Vec::new();
+        merge_col(&mut dst, Vec::new(), 2);
+        merge_col(&mut dst, vec![7, 8], 2);
+        assert_eq!(dst, vec![7, 8]);
+    }
+
+    #[test]
+    fn a_shared_column_array_writes_the_same_parquet_as_two_copies() {
+        use arrow::array::{ArrayRef, Int32Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+        use std::sync::Arc;
+
+        // `write_scored_table` hands the same Arrow array to `protein`/`protein_group` and
+        // to the three aliases of the pooled q. This asserts the file that produces is
+        // byte-for-byte the file `write_table` produced from separate, equal vectors --
+        // the output-equality claim of that change, on the mechanism it rests on.
+        let dir = std::env::temp_dir().join("mumdia_scored_share_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let pid = std::process::id();
+        let a = dir.join(format!("copies_{pid}.parquet"));
+        let b = dir.join(format!("shared_{pid}.parquet"));
+        let prot: Vec<String> = (0..2000)
+            .map(|i| format!("sp|P{:05}|PROT_HUMAN", i % 700))
+            .collect();
+        let q: Vec<f64> = (0..2000).map(|i| (i % 97) as f64 / 97.0).collect();
+        let rank: Vec<i32> = (0..2000).map(|i| i % 3).collect();
+        write_table(
+            a.to_str().unwrap(),
+            vec![
+                Col::Str("protein".into(), prot.clone()),
+                Col::F64("q_value".into(), q.clone()),
+                Col::Str("protein_group".into(), prot.clone()),
+                Col::F64("global_q_value".into(), q.clone()),
+                Col::I32("selected_peak_rank".into(), rank.clone()),
+            ],
+        )
+        .unwrap();
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("protein", DataType::Utf8, false),
+            Field::new("q_value", DataType::Float64, false),
+            Field::new("protein_group", DataType::Utf8, false),
+            Field::new("global_q_value", DataType::Float64, false),
+            Field::new("selected_peak_rank", DataType::Int32, false),
+        ]));
+        let protein: ArrayRef = Arc::new(StringArray::from(prot));
+        let qq: ArrayRef = Arc::new(Float64Array::from(q));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                protein.clone(),
+                qq.clone(),
+                protein,
+                qq,
+                Arc::new(Int32Array::from(rank)),
+            ],
+        )
+        .unwrap();
+        let mut w = mumdia_io::table::BatchWriter::new(b.to_str().unwrap(), schema).unwrap();
+        w.write(&batch).unwrap();
+        assert_eq!(w.close().unwrap(), 2000);
+        assert_eq!(
+            std::fs::read(&a).unwrap(),
+            std::fs::read(&b).unwrap(),
+            "sharing one array across duplicate columns must not change the parquet"
+        );
     }
 
     #[test]
