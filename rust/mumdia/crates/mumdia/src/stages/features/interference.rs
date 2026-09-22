@@ -69,18 +69,14 @@ pub fn values(e: &Evidence) -> Vec<f64> {
         }
     }
 
-    // Reference profile over the full extraction window (pred-weighted sum).
-    let mut rfull = vec![0.0f64; tf];
-    for f in 0..k {
-        if f < e.traces_full.len() {
-            let x = &e.traces_full[f];
-            let w = e.pred[f];
-            let n = x.len().min(tf);
-            for t in 0..n {
-                rfull[t] += w * x[t];
-            }
-        }
-    }
+    // Reference profile over the full extraction window (pred-weighted sum), built once
+    // in `build_evidence` rather than here and again in `coelution`; the inline loop this
+    // replaces is reproduced term for term by `super::weighted_reference_full`.
+    let rfull: &[f64] = &e.ref_profile_full;
+    // `full_apex` below is a position on `axis_full` and indexes this profile, which the
+    // inline build made `tf` long by construction. Kept as an assertion now that the
+    // build lives elsewhere.
+    debug_assert_eq!(rfull.len(), tf, "ref_profile_full must span axis_full");
 
     // Matched fragment set (observed apex intensity present, trace available).
     let matched: Vec<usize> = (0..k)
@@ -265,7 +261,7 @@ pub fn values(e: &Evidence) -> Vec<f64> {
     for &f in &matched {
         sp_corr += corr_ref[f];
         let full_corr = if f < e.traces_full.len() {
-            pearson(&e.traces_full[f], &rfull)
+            pearson(&e.traces_full[f], rfull)
         } else {
             0.0
         };
@@ -402,7 +398,7 @@ pub fn values(e: &Evidence) -> Vec<f64> {
     };
     let max_peak = r.iter().cloned().fold(0.0f64, f64::max);
     let (lo, hi) = if rfull.len() >= 2 {
-        super::peak_bounds(&rfull, full_apex, 0.5, 0)
+        super::peak_bounds(rfull, full_apex, 0.5, 0)
     } else {
         (0, 0)
     };

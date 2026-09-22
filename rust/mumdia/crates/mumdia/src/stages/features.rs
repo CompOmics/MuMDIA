@@ -501,6 +501,16 @@ pub struct Evidence {
     pub apex_idx: usize,
     /// Predicted-intensity-weighted reference elution profile over `axis`.
     pub ref_profile: Vec<f64>,
+    /// The same profile over `axis_full`, and therefore `axis_full.len()` long: both
+    /// readers index it with a position on that axis. Built once here instead of once in
+    /// `coelution` and again in `interference`. Those two builds were bit-identical --
+    /// both weight by the raw `pred[f]`, both accumulate fragment-outer and time-inner
+    /// over `traces_full` -- so this is [`weighted_reference_full`] called once.
+    /// `chromatographic` is NOT folded in: it clamps the weights at zero and falls back
+    /// to an unweighted sum when they are all zero, which differs whenever a predicted
+    /// intensity is negative (`index.rs` rejects only non-finite ones), so it keeps its
+    /// own build.
+    pub ref_profile_full: Vec<f64>,
     // --- scalars (filled by the caller after build) ---
     pub apex_rt: f64,
     pub rt_pred_cal: f64,
@@ -544,6 +554,27 @@ fn parse_ion(name: &str) -> (bool, u32, u32) {
         None => (rest, 1),
     };
     (is_b, ord_str.parse::<u32>().unwrap_or(0), chg)
+}
+
+/// Predicted-intensity-weighted reference profile over the FULL extraction window, with
+/// the raw (unclamped) weights.
+///
+/// [`Evidence::ref_profile_full`] is this; the function exists so the one build is
+/// written once and the equality of the two it replaced can be read off it. It reproduces
+/// `interference`'s inline loop exactly (`for f in 0..k` under an `f < traces_full.len()`
+/// guard, `n = x.len().min(t)`), and `coelution`'s `weighted_reference` whenever
+/// `traces_full.len() == pred.len()` -- which `build_evidence` guarantees, since both are
+/// built per row of the same `rows`, and which coelution's `has_full` guard requires
+/// anyway. Fragment-outer, time-inner, so the f64 accumulation order is the old one.
+fn weighted_reference_full(traces_full: &[Vec<f64>], pred: &[f64], t: usize) -> Vec<f64> {
+    let mut r = vec![0.0f64; t];
+    for (f, x) in traces_full.iter().enumerate().take(pred.len()) {
+        let w = pred[f];
+        for (dst, v) in r.iter_mut().zip(x.iter()) {
+            *dst += w * v;
+        }
+    }
+    r
 }
 
 /// Build the trace-derived fields of [`Evidence`] from a PSM's chromatogram
@@ -645,6 +676,7 @@ fn build_evidence(
             ref_profile[k] += w * tr[k];
         }
     }
+    let ref_profile_full = weighted_reference_full(&traces_full, &pred, axis_full_f.len());
 
     // MS1 isotope XICs [mono, +1, +2] sampled on the same grid as the fragments,
     // mapped onto axis_full then sliced to the elution peak. Present only when the
@@ -687,6 +719,7 @@ fn build_evidence(
         mass_err_ppm,
         apex_idx,
         ref_profile,
+        ref_profile_full,
         apex_rt,
         rt_pred_cal: 0.0,
         rt_err: 0.0,
@@ -729,6 +762,24 @@ pub struct FeaturesParams<'a> {
 /// traces of a 2 h gradient a chunk of 2^20 rows is about 1 GiB of trace payload; the
 /// whole-run store this replaced held 62.7 GiB at 31.1M rows on the HYE benchmark.
 const CHUNK_CHROM_ROWS: usize = 1 << 20;
+
+/// PSM rows resident at once in the same pass. A chunk closes on whichever limit binds
+/// first, because the two quantities are only loosely related and the value buffers are
+/// sized in PSM rows, not chromatogram rows.
+///
+/// The chunk was closed on chromatogram rows alone, while `ValueMatrix`, `ext_vals`,
+/// `frag_feats`, `prelim`, `elu_lo` and `elu_hi` are all `rows_in_chunk = psm_hi - psm_lo`
+/// long. The ratio between the two is data-dependent and unbounded: docs/27 measured
+/// 2,603,894 PSM rows in 38 chunks, so 68,523 PSM rows per chunk at 15.3 chromatogram rows
+/// each, and 387 x 68,523 x 8 = 212 MB of value matrix (the 0.21 GiB the stage reported).
+/// At the engine default `top_n_fragments = 6` plus three MS1 rows the ratio is 9 and the
+/// same constant gives 116,508 PSM rows per chunk; with `retain_top_peaks = 5`, which
+/// multiplies PSM rows but not chromatogram rows (several PSM rows share one candidate's
+/// traces), it gives 582,542 and about 5.2 GB in flight -- matrix, `ext_vals` and the
+/// previous chunk still owned by the writer thread. 2^16 bounds that at ~203 MB per
+/// matrix whatever the shape, and matches `FEATURE_ROW_GROUP_ROWS`, the row group the
+/// writer buffers anyway.
+const CHUNK_PSM_ROWS: usize = 1 << 16;
 
 /// Rows per parquet row group of the features table: the encoder buffers
 /// `rows x n_features x 8` bytes, so 2^16 rows of the 387-feature Extended set is
@@ -921,6 +972,46 @@ impl ChromChunk {
     }
 }
 
+/// Row `k` of an f32 list column as a slice BORROWED from the decoded batch.
+///
+/// [`ListF32::append_row`] copies the row into a caller buffer, and to reach the values it
+/// calls `ListArray::value(k)`, which is `values.slice(start, len)`: one `Arc<dyn Array>`
+/// heap allocation plus refcount traffic on the child buffer, per row per column. The
+/// loader then copied the row a SECOND time, out of the scratch buffer and into the chunk.
+/// At the HYE benchmark shape (38.8M chromatogram rows, ~220-point traces, two list
+/// columns) that was 77.6M allocations and ~68 GB memcpy'd per pass on the single loader
+/// thread, for values [`ChromChunk::push_row`] copies into the chunk anyway. Borrowing
+/// leaves exactly one copy: the one the chunk keeps.
+///
+/// Byte-identical to `append_row`: `value_offsets()` is already adjusted for a SLICED list
+/// (which matters, because the loader slices a batch that straddles a chunk boundary) and
+/// `PrimitiveArray::values()` for the child's own offset, so `child[o[k]..o[k + 1]]` is
+/// exactly what `value(k).values()` returns. A null row yields an empty slice, which is
+/// what `append_row` left in the cleared scratch buffer.
+fn list_row<'a>(l: &ListF32<'a>, k: usize, name: &str) -> Result<&'a [f32]> {
+    let (child, lo, hi) = match *l {
+        ListF32::Small(a) => {
+            if a.is_null(k) {
+                return Ok(&[]);
+            }
+            let o = a.value_offsets();
+            (a.values(), o[k] as usize, o[k + 1] as usize)
+        }
+        ListF32::Large(a) => {
+            if a.is_null(k) {
+                return Ok(&[]);
+            }
+            let o = a.value_offsets();
+            (a.values(), o[k] as usize, o[k + 1] as usize)
+        }
+    };
+    let v = child
+        .as_any()
+        .downcast_ref::<Float32Array>()
+        .ok_or_else(|| anyhow!("list '{name}' inner is not f32"))?;
+    Ok(&v.values()[lo..hi])
+}
+
 /// Sequential reader over the chromatogram table that hands out one [`ChromChunk`] of a
 /// requested row count at a time. One decoded batch is resident beyond the chunk; a batch
 /// straddling a chunk boundary is sliced and its remainder kept for the next chunk.
@@ -1031,11 +1122,12 @@ impl ChromStream {
                 .ok_or_else(|| anyhow!("chromatograms column 'predicted_intensity' is not f32"))?;
             let rt = ListF32::of(col("rt")?, "rt")?;
             let inten = ListF32::of(col("intensity")?, "intensity")?;
-            // Trace values are appended into scratch buffers and then copied into the
-            // chunk, because the axis is deduplicated against the candidate's earlier
-            // rows before it is stored.
-            let mut rt_buf: Vec<f32> = Vec::new();
-            let mut int_buf: Vec<f32> = Vec::new();
+            // Trace values are read as slices of the decoded batch and copied ONCE, by
+            // `push_row` (the axis is deduplicated against the candidate's earlier rows
+            // before it is stored, and the intensities are appended to the flat buffer).
+            // They used to go through a per-row scratch buffer, which was a second full
+            // copy of the payload plus an `Arc` allocation per row per column; see
+            // [`list_row`].
             for k in 0..n {
                 let c = cid.value(k);
                 if keep.is_some_and(|s| !s.contains(&c)) {
@@ -1048,10 +1140,8 @@ impl ChromStream {
                     chunk.open_candidate(c);
                     open = Some(c);
                 }
-                rt_buf.clear();
-                int_buf.clear();
-                rt.append_row(k, &mut rt_buf, "rt")?;
-                inten.append_row(k, &mut int_buf, "intensity")?;
+                let rt_row = list_row(&rt, k, "rt")?;
+                let int_row = list_row(&inten, k, "intensity")?;
                 let nm = name.value(k);
                 let id = names.intern(nm);
                 chunk.push_row(
@@ -1060,8 +1150,8 @@ impl ChromStream {
                     fmz.value(k),
                     obsmz.map(|a| a.value(k)).unwrap_or_else(|| fmz.value(k)),
                     pint.value(k),
-                    &rt_buf,
-                    &int_buf,
+                    rt_row,
+                    int_row,
                 );
             }
             taken += n;
@@ -1088,11 +1178,18 @@ struct Chunk {
 /// (`extract.rs`, the per-candidate emission loop). The chunked pass depends on that, so
 /// it is verified here rather than assumed: a violation is a hard error naming the
 /// artifact, not a silently mis-joined feature table.
+///
+/// A chunk closes when EITHER limit is reached: `chunk_rows` bounds the traces resident
+/// (what the loader holds) and `max_psm_rows` bounds the value buffers (what the compute
+/// and the writer hold). See [`CHUNK_PSM_ROWS`] for why one limit is not enough. Both are
+/// closed at the end of the current candidate's PSM rows, so neither ever cuts a
+/// candidate.
 fn plan_chunks(
     psm_cid: &[u32],
     ch_cid: &[u32],
     chrom_path: &str,
     chunk_rows: usize,
+    max_psm_rows: usize,
 ) -> Result<Vec<Chunk>> {
     // Run-length groups of both tables, with a contiguity check on each.
     let groups = |v: &[u32], what: &str| -> Result<Vec<(u32, usize, usize)>> {
@@ -1130,7 +1227,7 @@ fn plan_chunks(
             ci += 1;
         }
         let last = gi + 1 == pg.len();
-        if acc >= chunk_rows || last {
+        if acc >= chunk_rows || plo + plen - lo >= max_psm_rows || last {
             chunks.push(Chunk {
                 psm_lo: lo,
                 psm_hi: plo + plen,
@@ -1495,36 +1592,164 @@ fn confident_row_spans(
     Some(spans)
 }
 
-/// Global elution half-widths from the confident set, computed in one streaming pass that
-/// holds a single candidate's rows at a time. Returns None when fewer than 20 confident
-/// anchors have a resolvable peak (the caller then keeps per-candidate detection).
+/// Concurrent decoders in the confident-bounds pass. Each holds one decoded batch plus
+/// the parquet reader's row group, so this is a memory bound as much as a thread bound:
+/// the pass is pure decode and would otherwise scale to every core, at one ~65,536-row
+/// row group of traces each (~115 MB at the HYE shape). Eight keeps the pass under about
+/// a gigabyte, well below the chunk loop's peak, and already takes the measured 2:10 of
+/// docs/27 section 3.4 to roughly a sixth of it.
+const BOUNDS_DECODERS: usize = 8;
+
+/// The `(first_row, n_rows)` sub-chunks the confident-bounds pass reads, on the ABSOLUTE
+/// `chunk_rows` grid rather than one restarted per span.
 ///
-/// `spans` are the row spans to read, from [`confident_row_spans`]. The whole table used
-/// to be decoded here -- up to 88 GB of traces to learn two scalars from a few thousand
-/// candidates -- with every row of a non-confident candidate decoded and thrown away.
-/// Chunk boundaries inside a span stay on the same ABSOLUTE row grid the whole-table pass
-/// used, so a candidate that straddles one is split exactly where it was split before and
-/// the half-width samples, and therefore the percentiles, are unchanged.
-fn confident_global_bounds(
+/// The grid matters for equality, not for cost: a confident candidate straddling a
+/// boundary is bounded from each part separately, so the half-width samples depend on
+/// where the boundaries fall. Keeping them on the absolute grid is what makes the pruned
+/// pass, the whole-table pass and the parallel pass produce the same multiset.
+fn confident_subchunks(spans: &[(usize, usize)], chunk_rows: usize) -> Vec<(usize, usize)> {
+    let mut out: Vec<(usize, usize)> = Vec::new();
+    for &(first, n_rows) in spans {
+        let (mut abs, end) = (first, first + n_rows);
+        while abs < end {
+            let want = (chunk_rows - abs % chunk_rows).min(end - abs);
+            out.push((abs, want));
+            abs += want;
+        }
+    }
+    out
+}
+
+/// Half-width samples from one sub-chunk, appended to `lefts` / `rights`.
+///
+/// `ch.span` rather than `TableFile::open_rows`: the caller already holds an open handle
+/// with the footer parsed, and `span` is an `Arc` clone of it. `open_rows` is `open` plus
+/// `span`, so it re-opened the file and re-parsed the whole footer once per span -- and
+/// the pruning's whole point is to produce MANY spans, so the cost grew with the saving.
+#[allow(clippy::too_many_arguments)]
+fn subchunk_half_widths(
+    ch: &TableFile,
+    first: usize,
+    n_rows: usize,
+    keep: &std::collections::HashSet<u32>,
+    confident_rows: &HashMap<u32, Vec<usize>>,
+    apex_rt: &[f64],
+    cfg: &FeaturesConfig,
+    names: &mut NameTab,
+    lefts: &mut Vec<f64>,
+    rights: &mut Vec<f64>,
+) -> Result<()> {
+    let span = ch.span(first, n_rows)?;
+    let mut stream = ChromStream::open(&span)?;
+    // Chunk reading already groups rows by candidate, so this reuses it and keeps only
+    // the confident candidates' rows long enough to bound their peak.
+    let chunk = stream.read_chunk_filtered(n_rows, names, Some(keep))?;
+    for (ci, &c) in chunk.cids.iter().enumerate() {
+        let Some(psm_rows) = confident_rows.get(&c) else {
+            continue;
+        };
+        let rows = chunk.rows(&chunk.frag, ci, names);
+        if rows.is_empty() {
+            continue;
+        }
+        for &i in psm_rows {
+            if let Some((lo, hi)) = elution_peak_rt_bounds(
+                &rows,
+                apex_rt[i],
+                cfg.bound_peak_fraction,
+                cfg.bound_peak_grace,
+            ) {
+                let l = apex_rt[i] - lo as f64;
+                let r = hi as f64 - apex_rt[i];
+                if l >= 0.0 && r >= 0.0 {
+                    lefts.push(l);
+                    rights.push(r);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Every confident candidate's half-width samples, in table order.
+///
+/// This pass is a full decode of the chromatogram table (~68 GB of traces at the HYE
+/// benchmark shape) to learn TWO scalars from the ~0.84% of rows that belong to a
+/// confident candidate, and it ran on one thread: docs/27 section 3.4 measured the
+/// features stage at 7:15 with it against 5:05 without, so 30% of the stage. Row-group
+/// pruning does not help on a production-shaped table (`confident_row_spans` explains
+/// why, and `row_group_pruning_saves_nothing_on_a_production_shaped_table` pins it), so
+/// the decode is split across [`BOUNDS_DECODERS`] threads instead. Each group of
+/// sub-chunks is decoded in order by one thread with its own [`NameTab`], and the parts
+/// are concatenated in order, so this produces the same samples in the same ORDER the
+/// serial loop produced -- not merely the same multiset that `percentile` would need.
+fn confident_half_widths(
     ch: &TableFile,
     spans: &[(usize, usize)],
     confident_rows: &HashMap<u32, Vec<usize>>,
     apex_rt: &[f64],
     cfg: &FeaturesConfig,
     chunk_rows: usize,
-) -> Result<Option<(f64, f64)>> {
+) -> Result<(Vec<f64>, Vec<f64>)> {
+    let keep: std::collections::HashSet<u32> = confident_rows.keys().copied().collect();
+    let subs = confident_subchunks(spans, chunk_rows);
+    // `par_chunks` rather than a per-sub-chunk `par_iter`: the group count IS the decoder
+    // count, so no more than `BOUNDS_DECODERS` row groups are ever resident, whatever the
+    // pool size. The groups are equal-sized runs of equal-sized reads, so the imbalance is
+    // at most one sub-chunk.
+    let per = subs
+        .len()
+        .div_ceil(rayon::current_num_threads().clamp(1, BOUNDS_DECODERS))
+        .max(1);
+    let parts: Vec<(Vec<f64>, Vec<f64>)> = subs
+        .par_chunks(per)
+        .map(|group| {
+            let mut names = NameTab::default();
+            let (mut lefts, mut rights) = (Vec::new(), Vec::new());
+            for &(first, n_rows) in group {
+                subchunk_half_widths(
+                    ch,
+                    first,
+                    n_rows,
+                    &keep,
+                    confident_rows,
+                    apex_rt,
+                    cfg,
+                    &mut names,
+                    &mut lefts,
+                    &mut rights,
+                )?;
+            }
+            Ok((lefts, rights))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut lefts: Vec<f64> = Vec::new();
+    let mut rights: Vec<f64> = Vec::new();
+    for (l, r) in parts {
+        lefts.extend_from_slice(&l);
+        rights.extend_from_slice(&r);
+    }
+    Ok((lefts, rights))
+}
+
+/// The pass exactly as it ran before it was parallelised: one stream per span, chunks
+/// read from it in sequence, one [`NameTab`] for the whole pass. Kept as the reference
+/// `parallel_confident_bounds_match_the_serial_pass_sample_for_sample` compares against,
+/// so the equality claim is pinned against the OLD code rather than against a second
+/// description of the new one.
+#[cfg(test)]
+fn confident_half_widths_serial(
+    ch: &TableFile,
+    spans: &[(usize, usize)],
+    confident_rows: &HashMap<u32, Vec<usize>>,
+    apex_rt: &[f64],
+    cfg: &FeaturesConfig,
+    chunk_rows: usize,
+) -> Result<(Vec<f64>, Vec<f64>)> {
     let mut lefts: Vec<f64> = Vec::new();
     let mut rights: Vec<f64> = Vec::new();
     let mut names = NameTab::default();
     let keep: std::collections::HashSet<u32> = confident_rows.keys().copied().collect();
-    // Chunk reading already groups rows by candidate, so this reuses it and keeps only
-    // the confident candidates' rows long enough to bound their peak.
-    //
-    // `ch.span` rather than `TableFile::open_rows`: the caller already holds an open
-    // handle with the footer parsed, and `span` is an `Arc` clone of it. `open_rows` is
-    // `open` plus `span`, so it re-opened the file and re-parsed the whole footer once per
-    // span -- and the pruning's whole point is to produce MANY spans, so the cost grew
-    // with the saving.
     for &(first, n_rows) in spans {
         let span = ch.span(first, n_rows)?;
         let mut stream = ChromStream::open(&span)?;
@@ -1559,6 +1784,29 @@ fn confident_global_bounds(
             }
         }
     }
+    Ok((lefts, rights))
+}
+
+/// Global elution half-widths from the confident set, computed in one streaming pass that
+/// holds a single candidate's rows at a time. Returns None when fewer than 20 confident
+/// anchors have a resolvable peak (the caller then keeps per-candidate detection).
+///
+/// `spans` are the row spans to read, from [`confident_row_spans`]. The whole table used
+/// to be decoded here -- up to 88 GB of traces to learn two scalars from a few thousand
+/// candidates -- with every row of a non-confident candidate decoded and thrown away.
+/// Chunk boundaries inside a span stay on the same ABSOLUTE row grid the whole-table pass
+/// used, so a candidate that straddles one is split exactly where it was split before and
+/// the half-width samples, and therefore the percentiles, are unchanged.
+fn confident_global_bounds(
+    ch: &TableFile,
+    spans: &[(usize, usize)],
+    confident_rows: &HashMap<u32, Vec<usize>>,
+    apex_rt: &[f64],
+    cfg: &FeaturesConfig,
+    chunk_rows: usize,
+) -> Result<Option<(f64, f64)>> {
+    let (lefts, rights) =
+        confident_half_widths(ch, spans, confident_rows, apex_rt, cfg, chunk_rows)?;
     if lefts.len() >= 20 {
         let q = (cfg.bound_confident_pct / 100.0).clamp(0.0, 1.0);
         let (l, r) = (percentile(&lefts, q), percentile(&rights, q));
@@ -1593,6 +1841,16 @@ pub fn run(p: FeaturesParams) -> Result<u64> {
     run_with_chunk_rows(p, CHUNK_CHROM_ROWS)
 }
 
+/// [`run_with_chunk_rows`] with the PSM-row bound exposed as well; see [`CHUNK_PSM_ROWS`].
+/// Both limits only move chunk boundaries, which move no value.
+pub fn run_with_chunk_limits(
+    p: FeaturesParams,
+    chunk_rows: usize,
+    max_psm_rows: usize,
+) -> Result<u64> {
+    run_chunked(p, chunk_rows, max_psm_rows, PinFinish::Normal)
+}
+
 /// How the PIN is closed. `Fail` exists only under `cfg(test)` and injects a failure at
 /// the flush, which is the one step of the stage that can fail after every chunk has been
 /// computed but before the features table is published. It is a parameter rather than a
@@ -1622,10 +1880,15 @@ impl PinFinish {
 /// feature values, the row order and the PIN bytes do not, which is what the
 /// `features_chunking_is_value_preserving` test asserts by hashing both artifacts.
 pub fn run_with_chunk_rows(p: FeaturesParams, chunk_rows: usize) -> Result<u64> {
-    run_chunked(p, chunk_rows, PinFinish::Normal)
+    run_chunked(p, chunk_rows, CHUNK_PSM_ROWS, PinFinish::Normal)
 }
 
-fn run_chunked(p: FeaturesParams, chunk_rows: usize, pin_finish: PinFinish) -> Result<u64> {
+fn run_chunked(
+    p: FeaturesParams,
+    chunk_rows: usize,
+    max_psm_rows: usize,
+    pin_finish: PinFinish,
+) -> Result<u64> {
     let t0 = Instant::now();
     let ps = TableFile::open(p.psms)?;
     let cid = ps.u32("candidate_id")?;
@@ -1695,7 +1958,13 @@ fn run_chunked(p: FeaturesParams, chunk_rows: usize, pin_finish: PinFinish) -> R
     let ch = TableFile::open(p.chromatograms)?;
     let ch_cid = ch.u32("candidate_id")?;
     let chrom_rows_total = ch_cid.len();
-    let chunks = plan_chunks(&cid, &ch_cid, p.chromatograms, chunk_rows.max(1))?;
+    let chunks = plan_chunks(
+        &cid,
+        &ch_cid,
+        p.chromatograms,
+        chunk_rows.max(1),
+        max_psm_rows.max(1),
+    )?;
     drop(ch_cid);
 
     // Seed corroboration maps (candidate_id -> seed score / identified flag) plus the
@@ -2816,7 +3085,7 @@ mod tests {
         let psm = [1, 1, 1, 2, 3];
         let chrom = [1, 1, 1, 1, 3, 3];
         // One row per chunk requested: the planner must still keep a candidate whole.
-        let cs = plan_chunks(&psm, &chrom, "c.parquet", 1).unwrap();
+        let cs = plan_chunks(&psm, &chrom, "c.parquet", 1, usize::MAX).unwrap();
         assert_eq!(
             cs.len(),
             2,
@@ -2828,18 +3097,50 @@ mod tests {
         assert_eq!(cs[0].psm_lo, 0);
         assert_eq!(cs.last().unwrap().psm_hi, psm.len());
         // A chunk larger than the table is one chunk over everything.
-        let one = plan_chunks(&psm, &chrom, "c.parquet", 1 << 20).unwrap();
+        let one = plan_chunks(&psm, &chrom, "c.parquet", 1 << 20, usize::MAX).unwrap();
         assert_eq!(one.len(), 1);
         assert_eq!((one[0].psm_lo, one[0].psm_hi, one[0].chrom_rows), (0, 5, 6));
     }
 
     #[test]
+    fn plan_chunks_bounds_psm_rows_as_well_as_chromatogram_rows() {
+        // Four top-K PSM rows per candidate, one chromatogram row each: the ratio the
+        // chromatogram limit cannot see. With only `chunk_rows` the whole run is one
+        // chunk, and the value buffers (sized in PSM rows) grow with `retain_top_peaks`
+        // without any constant bounding them.
+        let psm: Vec<u32> = (0..6u32).flat_map(|c| [c; 4]).collect();
+        let chrom: Vec<u32> = (0..6u32).collect();
+        let unbounded = plan_chunks(&psm, &chrom, "c.parquet", 1 << 20, usize::MAX).unwrap();
+        assert_eq!(unbounded.len(), 1);
+        assert_eq!(unbounded[0].psm_hi - unbounded[0].psm_lo, 24);
+
+        // The PSM limit closes the chunk instead, at the end of the candidate that
+        // reached it -- never inside one, so the chunk can exceed the limit by at most
+        // the last candidate's PSM rows.
+        let cs = plan_chunks(&psm, &chrom, "c.parquet", 1 << 20, 6).unwrap();
+        assert_eq!(cs.len(), 3);
+        for c in &cs {
+            assert_eq!(c.psm_hi - c.psm_lo, 8, "two whole candidates per chunk");
+            assert_eq!(c.chrom_rows, 2);
+        }
+        // Every PSM row lands in exactly one chunk, in order, whichever limit binds.
+        assert_eq!(cs[0].psm_lo, 0);
+        assert!(cs.windows(2).all(|w| w[0].psm_hi == w[1].psm_lo));
+        assert_eq!(cs.last().unwrap().psm_hi, psm.len());
+        // A limit below one candidate's PSM rows gives one candidate per chunk, not a
+        // split candidate.
+        let cs = plan_chunks(&psm, &chrom, "c.parquet", 1 << 20, 1).unwrap();
+        assert_eq!(cs.len(), 6);
+        assert!(cs.iter().all(|c| c.psm_hi - c.psm_lo == 4));
+    }
+
+    #[test]
     fn plan_chunks_rejects_artifacts_it_cannot_join() {
         // A chromatogram candidate the PSM table does not have.
-        let e = plan_chunks(&[1, 2], &[1, 9], "c.parquet", 1 << 20).unwrap_err();
+        let e = plan_chunks(&[1, 2], &[1, 9], "c.parquet", 1 << 20, usize::MAX).unwrap_err();
         assert!(format!("{e}").contains("candidate 9"), "{e}");
         // A candidate whose rows are not contiguous.
-        let e = plan_chunks(&[1, 2, 1], &[1], "c.parquet", 1 << 20).unwrap_err();
+        let e = plan_chunks(&[1, 2, 1], &[1], "c.parquet", 1 << 20, usize::MAX).unwrap_err();
         assert!(format!("{e}").contains("more than one run"), "{e}");
     }
 
@@ -3315,6 +3616,342 @@ mod tests {
     }
 
     #[test]
+    fn parallel_confident_bounds_match_the_serial_pass_sample_for_sample() {
+        // The parallel pass must not be judged on the two percentiles alone: a percentile
+        // survives a reordering, and would survive a sample being read twice as long as
+        // its rank landed elsewhere. This compares the SAMPLES, bit for bit and in order,
+        // against the pass as it ran before it was parallelised.
+        let dir = std::env::temp_dir().join("mumdia_features_bounds_par");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("chrom_par.parquet").to_string_lossy().to_string();
+        let (confident, apex_rt) = craft_chrom_for_bounds(&path);
+        let ch = TableFile::open(&path).unwrap();
+        let cfg = FeaturesConfig::default();
+
+        let mut sorted: Vec<u32> = confident.keys().copied().collect();
+        sorted.sort_unstable();
+        let rg = ch.row_group_stats("candidate_id").unwrap();
+        let spans = confident_row_spans(&rg, &sorted).expect("the writer records statistics");
+        assert!(spans.len() > 1, "a single span would not exercise the grid");
+
+        let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<u64>>();
+        // Chunk sizes below and above the 12-row group size, and one that swallows the
+        // whole table (a single sub-chunk, so the parallel driver degenerates to one
+        // decoder and must still agree).
+        for chunk in [7usize, 16, 64, 100, 1 << 20] {
+            for sp in [spans.clone(), vec![(0, ch.nrows)]] {
+                let (pl, pr) =
+                    confident_half_widths(&ch, &sp, &confident, &apex_rt, &cfg, chunk).unwrap();
+                let (sl, sr) =
+                    confident_half_widths_serial(&ch, &sp, &confident, &apex_rt, &cfg, chunk)
+                        .unwrap();
+                assert!(
+                    !sl.is_empty(),
+                    "chunk {chunk}: the fixture must yield anchors"
+                );
+                assert_eq!(
+                    bits(&pl),
+                    bits(&sl),
+                    "chunk {chunk}: left half-widths differ"
+                );
+                assert_eq!(
+                    bits(&pr),
+                    bits(&sr),
+                    "chunk {chunk}: right half-widths differ"
+                );
+            }
+        }
+
+        // The sub-chunk grid is the thing that makes the above hold, so pin it directly:
+        // boundaries sit on absolute multiples of `chunk_rows`, never restarted per span.
+        let subs = confident_subchunks(&[(5, 20), (40, 9)], 8);
+        assert_eq!(
+            subs,
+            vec![(5, 3), (8, 8), (16, 8), (24, 1), (40, 8), (48, 1)]
+        );
+        assert_eq!(confident_subchunks(&[], 8), vec![]);
+    }
+
+    /// A production-SHAPED chromatogram table: ~220-point traces (a 2 h gradient at the
+    /// HYE benchmark's cycle time), 20 fragment rows per candidate, one shared grid per
+    /// candidate. `n_cand` candidates, every tenth confident. Returns the confident row
+    /// map and the apex RTs. Used only by the ignored benchmark below, which is why it is
+    /// allowed to write ~100 MB.
+    fn craft_big_chrom(path: &str, n_cand: u32) -> (HashMap<u32, Vec<usize>>, Vec<f64>) {
+        const POINTS: usize = 220;
+        const FRAGS: u32 = 20;
+        let (mut cid, mut name): (Vec<u32>, Vec<String>) = (Vec::new(), Vec::new());
+        let (mut fmz, mut pint): (Vec<f64>, Vec<f32>) = (Vec::new(), Vec::new());
+        let (mut rt, mut inten): (Vec<Vec<f32>>, Vec<Vec<f32>>) = (Vec::new(), Vec::new());
+        let mut apex_rt: Vec<f64> = Vec::new();
+        let mut confident: HashMap<u32, Vec<usize>> = HashMap::new();
+        for c in 0..n_cand {
+            let apex = 300.0 + (c % 4000) as f64 * 0.7;
+            apex_rt.push(apex);
+            if c % 10 == 0 {
+                confident.insert(c, vec![c as usize]);
+            }
+            let grid: Vec<f32> = (0..POINTS)
+                .map(|k| (apex - 55.0 + k as f64 * 0.5) as f32)
+                .collect();
+            for f in 0..FRAGS {
+                cid.push(c);
+                name.push(format!("y{}", f + 1));
+                fmz.push(200.0 + f as f64 * 30.0);
+                pint.push(1.0 / (f + 1) as f32);
+                rt.push(grid.clone());
+                inten.push(
+                    (0..POINTS)
+                        .map(|k| {
+                            let x = k as f32 - 110.0;
+                            (1000.0 - f as f32 * 20.0) / (1.0 + 0.05 * x * x)
+                        })
+                        .collect(),
+                );
+            }
+        }
+        // Row groups that DIVIDE the benchmark's sub-chunk size, as extract's 65,536-row
+        // groups divide the production 2^20-row sub-chunk. Misaligned groups would make
+        // every decoder decompress pages belonging to another's span and measure that
+        // instead of the parallelism.
+        let mut w = TableWriter::new(path).with_row_group_rows(2_048);
+        w.write_cols(vec![
+            Col::U32("candidate_id".into(), cid),
+            Col::Str("frag_name".into(), name),
+            Col::F64("frag_mz".into(), fmz),
+            Col::F32("predicted_intensity".into(), pint),
+            Col::ListF32("rt".into(), rt),
+            Col::ListF32("intensity".into(), inten),
+        ])
+        .unwrap();
+        w.close().unwrap();
+        (confident, apex_rt)
+    }
+
+    #[test]
+    #[ignore = "benchmark: writes ~100 MB and decodes it four times"]
+    fn bench_confident_bounds_serial_against_parallel() {
+        // Both arms decode the WHOLE table from the same file with the same sub-chunk
+        // grid and the same filter; the only difference is how many threads do it. The
+        // serial arm is the code as it shipped (`confident_half_widths_serial`), not a
+        // re-description of it, and its samples are compared with the parallel arm's, so
+        // a faster arm that read less would fail rather than win.
+        let dir = std::env::temp_dir().join("mumdia_features_bench");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("chrom_big.parquet").to_string_lossy().to_string();
+        let t = Instant::now();
+        let (confident, apex_rt) = craft_big_chrom(&path, 3_000);
+        let write = t.elapsed();
+        let ch = TableFile::open(&path).unwrap();
+        let cfg = FeaturesConfig::default();
+        let spans = vec![(0usize, ch.nrows)];
+        // 15 sub-chunks over 60,000 rows, which is the ratio the production constant
+        // gives on a real table (2^20 rows per sub-chunk over ~38.8M rows = 38).
+        let chunk = 4_096usize;
+        assert_eq!(confident_subchunks(&spans, chunk).len(), 15);
+
+        // One untimed pass of each arm, so neither pays the page cache's first read.
+        let warm_s =
+            confident_half_widths_serial(&ch, &spans, &confident, &apex_rt, &cfg, chunk).unwrap();
+        let warm_p = confident_half_widths(&ch, &spans, &confident, &apex_rt, &cfg, chunk).unwrap();
+        assert_eq!(warm_s.0.len(), warm_p.0.len());
+
+        let t = Instant::now();
+        let (sl, sr) =
+            confident_half_widths_serial(&ch, &spans, &confident, &apex_rt, &cfg, chunk).unwrap();
+        let serial = t.elapsed();
+        let t = Instant::now();
+        let (pl, pr) =
+            confident_half_widths(&ch, &spans, &confident, &apex_rt, &cfg, chunk).unwrap();
+        let parallel = t.elapsed();
+
+        assert_eq!(sl, pl);
+        assert_eq!(sr, pr);
+        println!(
+            "confident-bounds pass over {} rows ({} anchors), {} threads capped at {}: \
+             serial {:?}, parallel {:?}, speedup {:.2}x (fixture write {:?})",
+            ch.nrows,
+            sl.len(),
+            rayon::current_num_threads(),
+            BOUNDS_DECODERS,
+            serial,
+            parallel,
+            serial.as_secs_f64() / parallel.as_secs_f64().max(1e-9),
+            write
+        );
+    }
+
+    #[test]
+    #[ignore = "benchmark: decodes one batch of production-shaped traces many times"]
+    fn bench_list_row_against_append_row() {
+        // Both arms do the SAME final work -- copy the row into the flat buffer a chunk
+        // keeps -- so the only difference is the scratch buffer and the `Arc` that
+        // `append_row` needs to reach the values. Arm A allocates its scratch once,
+        // outside the timed loop but inside the arm, which is the best case for the old
+        // path rather than a straw man.
+        let dir = std::env::temp_dir().join("mumdia_features_bench");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("chrom_rows.parquet").to_string_lossy().to_string();
+        craft_big_chrom(&path, 200); // 4,000 rows of 220 points
+        let ch = TableFile::open(&path).unwrap();
+        let mut reader = ch.batches(Some(&["rt", "intensity"]), 1 << 12).unwrap();
+        let b = reader.next().unwrap().unwrap();
+        let n = b.num_rows();
+        let rt = ListF32::of(b.column(0), "rt").unwrap();
+        let reps = 400;
+
+        let mut sink: Vec<f32> = Vec::with_capacity(n * 220);
+        let t = Instant::now();
+        let mut scratch: Vec<f32> = Vec::new();
+        for _ in 0..reps {
+            sink.clear();
+            for k in 0..n {
+                scratch.clear();
+                rt.append_row(k, &mut scratch, "rt").unwrap();
+                sink.extend_from_slice(&scratch);
+            }
+        }
+        let old = t.elapsed();
+        let checksum_old = sink.len();
+
+        let t = Instant::now();
+        for _ in 0..reps {
+            sink.clear();
+            for k in 0..n {
+                sink.extend_from_slice(list_row(&rt, k, "rt").unwrap());
+            }
+        }
+        let new = t.elapsed();
+        assert_eq!(checksum_old, sink.len());
+        println!(
+            "{} rows x {} reps: append_row + scratch {:?}, list_row {:?}, {:.2}x",
+            n,
+            reps,
+            old,
+            new,
+            old.as_secs_f64() / new.as_secs_f64().max(1e-9)
+        );
+    }
+
+    #[test]
+    fn the_cached_full_window_reference_is_the_profile_both_families_built() {
+        // Pins the OLD builds: the bodies below are `coelution::weighted_reference` and
+        // `interference`'s inline `rfull` as they stood before either read the cached
+        // field. One negative predicted intensity, because that is exactly where the
+        // third build (`chromatographic::weighted_profile`, which clamps at zero) parts
+        // company and why it is not folded in.
+        let axis: Vec<f32> = (0..7).map(|k| 100.0 + k as f32).collect();
+        let traces: Vec<Vec<f32>> = vec![
+            vec![1.0, 3.0, 9.0, 20.0, 8.0, 2.0, 0.5],
+            vec![0.5, 2.0, 7.0, 15.0, 6.0, 1.0, 0.25],
+            vec![0.0, 1.0, 2.0, 4.0, 2.0, 0.5, 0.0],
+        ];
+        let preds = [0.8f32, -0.3, 0.5];
+        let rows: Vec<ChromRow> = (0..3)
+            .map(|i| ChromRow {
+                frag_name: ["y3", "y4", "b2"][i],
+                frag_mz: 300.0 + i as f64,
+                frag_obs_mz: 300.0 + i as f64,
+                pred_int: preds[i],
+                rt: &axis,
+                inten: &traces[i],
+            })
+            .collect();
+        let al = align_traces(&rows);
+        let e = build_evidence(&rows, al, &[], 103.0, 0.5, 1, None);
+
+        // Old coelution build.
+        let mut old_coelution = vec![0.0f64; e.axis_full.len()];
+        for (i, tr) in e.traces_full.iter().enumerate() {
+            let w = e.pred.get(i).cloned().unwrap_or(0.0);
+            let n = old_coelution.len().min(tr.len());
+            for (j, slot) in old_coelution.iter_mut().enumerate().take(n) {
+                *slot += w * tr[j];
+            }
+        }
+        // Old interference build.
+        let tf = e.axis_full.len();
+        let mut old_interference = vec![0.0f64; tf];
+        for f in 0..e.pred.len() {
+            if f < e.traces_full.len() {
+                let x = &e.traces_full[f];
+                let w = e.pred[f];
+                for t in 0..x.len().min(tf) {
+                    old_interference[t] += w * x[t];
+                }
+            }
+        }
+        let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<u64>>();
+        assert_eq!(bits(&e.ref_profile_full), bits(&old_coelution));
+        assert_eq!(bits(&e.ref_profile_full), bits(&old_interference));
+        assert_eq!(e.ref_profile_full.len(), e.axis_full.len());
+        // The negative weight is really in play, so the equality above is not the trivial
+        // one, and the clamped third build really does differ.
+        assert!(e.pred.iter().any(|&w| w < 0.0));
+        let clamped: Vec<f64> = (0..tf)
+            .map(|t| {
+                e.traces_full
+                    .iter()
+                    .enumerate()
+                    .map(|(f, x)| e.pred[f].max(0.0) * x[t])
+                    .sum()
+            })
+            .collect();
+        assert_ne!(
+            bits(&e.ref_profile_full),
+            bits(&clamped),
+            "a clamped profile must not be substitutable for the raw-weighted one"
+        );
+    }
+
+    #[test]
+    fn list_row_borrows_exactly_what_append_row_copied() {
+        use arrow::array::{Float32Builder, ListBuilder};
+        // Rows of several lengths, an empty row and a NULL row: `append_row` leaves the
+        // cleared scratch buffer empty for a null, and `list_row` must return an empty
+        // slice for the same rows.
+        let mut b = ListBuilder::new(Float32Builder::new());
+        for k in 0..12usize {
+            match k % 4 {
+                0 => b.append(false), // null row
+                1 => b.append(true),  // empty row
+                _ => {
+                    for j in 0..(k % 5 + 1) {
+                        b.values().append_value(k as f32 * 10.0 + j as f32);
+                    }
+                    b.append(true);
+                }
+            }
+        }
+        let arr: ArrayRef = std::sync::Arc::new(b.finish());
+        // Whole array, and the slices the loader takes at a chunk boundary: `value_offsets`
+        // is adjusted for a sliced list, and this is where a hand-rolled offset would be
+        // wrong.
+        for (off, len) in [(0usize, 12usize), (3, 5), (7, 5), (11, 1)] {
+            let sliced = arr.slice(off, len);
+            let l = ListF32::of(&sliced, "trace").unwrap();
+            for k in 0..len {
+                let mut want: Vec<f32> = vec![7.0; 3]; // non-empty: append_row appends
+                want.clear();
+                l.append_row(k, &mut want, "trace").unwrap();
+                assert_eq!(
+                    list_row(&l, k, "trace").unwrap(),
+                    want.as_slice(),
+                    "slice {off}..{} row {k}",
+                    off + len
+                );
+            }
+        }
+        // A non-f32 list is still an error rather than a silent reinterpretation.
+        let mut ib = ListBuilder::new(arrow::array::Int32Builder::new());
+        ib.values().append_value(1);
+        ib.append(true);
+        let iarr: ArrayRef = std::sync::Arc::new(ib.finish());
+        let il = ListF32::of(&iarr, "trace").unwrap();
+        assert!(list_row(&il, 0, "trace").is_err());
+    }
+
+    #[test]
     fn row_group_pruning_saves_nothing_on_a_production_shaped_table() {
         // The doc comment on `confident_row_spans` claims the pruning is worth close to
         // nothing on real data. This measures that claim instead of asserting it, from the
@@ -3650,7 +4287,7 @@ mod tests {
         let dir = std::env::temp_dir().join("mumdia_features_extended");
         std::fs::create_dir_all(&dir).unwrap();
         let (psms, chrom) = craft_extended_inputs(&dir, 61);
-        let run = |tag: &str, chunk_rows: usize| -> String {
+        let run = |tag: &str, chunk_rows: usize, max_psm_rows: usize| -> String {
             let out = dir
                 .join(format!("features_{tag}.parquet"))
                 .to_string_lossy()
@@ -3670,7 +4307,7 @@ mod tests {
                 ..Default::default()
             };
             cfg.ms1_precursor_features = true;
-            run_with_chunk_rows(
+            run_with_chunk_limits(
                 FeaturesParams {
                     psms: &psms,
                     chromatograms: &chrom,
@@ -3681,16 +4318,22 @@ mod tests {
                     config_hash: "test",
                 },
                 chunk_rows,
+                max_psm_rows,
             )
             .unwrap();
             out
         };
-        let one = run("one", 1 << 20);
-        let many = run("many", 1);
+        let one = run("one", 1 << 20, usize::MAX);
+        let many = run("many", 1, usize::MAX);
+        // And chunks closed by the PSM-row limit rather than the chromatogram one: a
+        // different set of boundaries again, over the same candidates.
+        let psm_capped = run("psmcap", 1 << 20, 3);
 
         let a = mumdia_io::table::Table::read(&one).unwrap();
         let b = mumdia_io::table::Table::read(&many).unwrap();
+        let c = mumdia_io::table::Table::read(&psm_capped).unwrap();
         assert_eq!(a.nrows, 61);
+        assert_eq!(a.nrows, c.nrows);
         assert_eq!(a.nrows, b.nrows);
         assert_eq!(a.column_names(), b.column_names());
         assert_eq!(
@@ -3701,10 +4344,18 @@ mod tests {
         // Every f64 column bit for bit, so a feature that differs in the last ulp fails.
         let mut checked = 0usize;
         for name in a.column_names() {
-            if let (Ok(x), Ok(y)) = (a.f64(&name), b.f64(&name)) {
-                let xb: Vec<u64> = x.iter().map(|v| v.to_bits()).collect();
-                let yb: Vec<u64> = y.iter().map(|v| v.to_bits()).collect();
-                assert_eq!(xb, yb, "column '{name}' differs between chunk sizes");
+            if let (Ok(x), Ok(y), Ok(z)) = (a.f64(&name), b.f64(&name), c.f64(&name)) {
+                let bits = |v: &[f64]| v.iter().map(|q| q.to_bits()).collect::<Vec<u64>>();
+                assert_eq!(
+                    bits(&x),
+                    bits(&y),
+                    "column '{name}' differs between chunk sizes"
+                );
+                assert_eq!(
+                    bits(&x),
+                    bits(&z),
+                    "column '{name}' differs under the PSM cap"
+                );
                 checked += 1;
             }
         }
@@ -3854,10 +4505,11 @@ mod tests {
             config_hash: "test",
         };
 
-        run_chunked(params(), 4, PinFinish::Normal).expect("the good run must succeed");
+        run_chunked(params(), 4, CHUNK_PSM_ROWS, PinFinish::Normal)
+            .expect("the good run must succeed");
         let good = mumdia_io::hash::blake3_file(&out).unwrap();
 
-        let err = run_chunked(params(), 4, PinFinish::Fail)
+        let err = run_chunked(params(), 4, CHUNK_PSM_ROWS, PinFinish::Fail)
             .expect_err("a PIN that cannot be flushed must fail the stage");
         assert!(
             err.to_string().contains("PIN"),
