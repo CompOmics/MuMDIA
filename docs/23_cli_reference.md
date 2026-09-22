@@ -156,7 +156,7 @@ first sentence of the description, with the full text in the section below.
 | [`doctor`](#doctor) | yes | Check that the configured Python sidecar environments are usable |
 | `help` | n/a | Print this message or the help of the given subcommand(s) |
 
-20 of the 23 documented subcommands accept `--config`:
+20 of the 24 documented subcommands accept `--config`:
  `align`, `compete`, `convert`, `digest`, `doctor`, `extract`, `features`, `mbr`, `peak-census`, `peptidoforms`, `predict-frag`, `prescan`, `quant`, `report`, `rescore`, `rt-im-train`, `run`, `run-experiment`, `search-seed`, `sub-library`.
 
 4 do not, so every setting they use comes from their own flags:
