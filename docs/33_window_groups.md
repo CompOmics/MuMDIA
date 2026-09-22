@@ -175,11 +175,22 @@ wants and already encoded, so `pool` splices each band's parquet row groups into
 without decoding them (`mumdia_io::table::SpliceWriter`, the column-chunk append the parquet
 writer exposes for concatenation). Only the row groups that hold a candidate the overlap
 dedup drops are decoded, filtered and re-encoded, and window overlap puts those at the two
-ends of a band. Measured on the production run before the change: decoding and re-encoding
-ran at 3.5 MB/s on one core, so one run's 68 GB of chromatograms would have taken about five
-hours, on a disk that reads at 221 MB/s. The spliced output holds the same rows in the same
-order with the same values; its row groups are the bands' own, so it is not byte-identical to
-a re-encoded pool. The feature and competed schema companions
+ends of a band. Measured on the production seven-file experiment, both arms on the same
+63 bands of one run (537,047,953 chromatogram rows and 35,844,209 competed rows, 136 GB):
+
+| pooling | wall | peak RSS |
+|---|---|---|
+| decode and re-encode | 3.5 MB/s, 42.7 GB in 2 h 50 min (killed) | 4.3 GB |
+| splice the row groups | 3 min 12 s for all 136 GB | 2.6 GB |
+
+The disk reads 221 MB/s (`dd`, direct), so the old path was two orders of magnitude off the
+hardware and single-threaded: 110% CPU throughout. The spliced output holds the same rows in
+the same order with the same values; its row groups are the bands' own, so it is not
+byte-identical to a re-encoded pool.
+
+`mumdia pool --groups-dir <run>/groups` runs the same stage standalone, which is how those
+numbers were taken, and is what to reach for when a grouped search finished but the run did
+not: the band directories hold everything, and pooling them is a copy. The feature and competed schema companions
 (`<table>.schema.json`, the classifier's column list) are copied from the first band; every
 band wrote the same one. Each pooled table gets a `.report.json` whose stage is `pool` and
 whose stats record the number of groups and the overlap duplicates removed.
