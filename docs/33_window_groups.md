@@ -168,7 +168,18 @@ Two of the four tables an ungrouped run writes are not pooled, because nothing r
   nothing opened.
 
 Each pooled table is hashed once, for the manifest record and the report beside it
-together. At experiment scale those tables are tens of GB, and hashing reads all of it. The feature and competed schema companions
+together. At experiment scale those tables are tens of GB, and hashing reads all of it.
+
+The pooling itself is a byte copy. A band's rows are already in the order the pooled table
+wants and already encoded, so `pool` splices each band's parquet row groups into the output
+without decoding them (`mumdia_io::table::SpliceWriter`, the column-chunk append the parquet
+writer exposes for concatenation). Only the row groups that hold a candidate the overlap
+dedup drops are decoded, filtered and re-encoded, and window overlap puts those at the two
+ends of a band. Measured on the production run before the change: decoding and re-encoding
+ran at 3.5 MB/s on one core, so one run's 68 GB of chromatograms would have taken about five
+hours, on a disk that reads at 221 MB/s. The spliced output holds the same rows in the same
+order with the same values; its row groups are the bands' own, so it is not byte-identical to
+a re-encoded pool. The feature and competed schema companions
 (`<table>.schema.json`, the classifier's column list) are copied from the first band; every
 band wrote the same one. Each pooled table gets a `.report.json` whose stage is `pool` and
 whose stats record the number of groups and the overlap duplicates removed.
@@ -341,6 +352,16 @@ Three things this says:
 
 On this data the useful range is therefore 48 to 64 bands: about 40 GB per band, which is
 what a 100 GB desktop can run two of at a time, or one with room to spare.
+
+### `groups.parallel` and the thread count
+
+A band in flight occupies one rayon worker, which then blocks on its own extraction's
+accumulation channel while the probing tasks run on the other workers. So `groups.parallel`
+must stay below `--threads`: with as many bands as threads every worker parks and the run
+makes no progress at all (reproduced on the fixture at `parallel = 2, --threads 2`: the
+process sat at 0.1 s of CPU indefinitely, with no error and no output). The orchestrator
+clamps the value to `threads - 1` and warns. The production runs are far from the bound (8
+bands on 128 threads), which is why this was not visible before.
 
 ## 9. What is not there yet
 

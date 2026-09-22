@@ -150,7 +150,28 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
         seed: String,
     }
     let mut bands: Vec<Band> = Vec::new();
-    let par = cfg.groups.parallel.max(1);
+    // Bands in flight are driven from the rayon pool, and each one's extraction blocks its
+    // own thread on the accumulation channel while the probing tasks run on the others. A
+    // band in flight therefore occupies a worker that cannot do the work it is waiting for,
+    // and `groups.parallel >= threads` deadlocks: every worker parks and no task is left to
+    // feed them. Reproduced on the fixture with `parallel = 2, --threads 2` (the process sat
+    // at 0.1 s of CPU indefinitely). Leave at least one worker free.
+    let threads = rayon::current_num_threads();
+    let par = {
+        let want = cfg.groups.parallel.max(1);
+        let most = threads.saturating_sub(1).max(1);
+        if want > most {
+            tracing::warn!(
+                requested = want,
+                used = most,
+                threads,
+                "groups.parallel is at least the thread count, which would deadlock: every                  band in flight parks a worker on its accumulation channel. Using one fewer                  band than there are threads; raise --threads to run more at once"
+            );
+            most
+        } else {
+            want
+        }
+    };
     // Bands are independent, so `groups.parallel` of them are sliced and seeded at once.
     // Chunked rather than a free-running pool: the chunk bounds how many extraction working
     // sets are resident, which is the whole point of banding. Results do not depend on it,

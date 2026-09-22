@@ -21,9 +21,11 @@ use parquet::arrow::arrow_reader::{
 };
 use parquet::arrow::ArrowWriter;
 use parquet::basic::{Compression, LogicalType};
-use parquet::file::metadata::ParquetMetaData;
+use parquet::column::writer::ColumnCloseResult;
+use parquet::file::metadata::{PageIndexPolicy, ParquetMetaData, ParquetMetaDataReader};
 use parquet::file::properties::WriterProperties;
 use parquet::file::statistics::Statistics;
+use parquet::file::writer::SerializedFileWriter;
 
 /// The codec every artifact is written with. Snappy by default, which is what released
 /// artifacts use and what the sidecars' pyarrow reads without configuration;
@@ -241,6 +243,136 @@ fn snappy_props(row_group_rows: Option<usize>) -> WriterProperties {
         b = b.set_max_row_group_row_count(Some(n.max(1)));
     }
     b.build()
+}
+
+/// A parquet file assembled from the row groups of other parquet files, copied as bytes.
+///
+/// Pooling a grouped run's band artifacts is a concatenation: the rows are already in the
+/// order the pooled table wants, already encoded and already compressed. Decoding and
+/// re-encoding them is what the pool used to do, and on the chromatogram tables it ran at
+/// 3.5 MB/s on one core against a disk that does 221 MB/s -- five hours for one run's 68 GB
+/// (measured on the production seven-file experiment). Splicing the column chunks byte for
+/// byte costs a copy, so the pool becomes disk-bound.
+///
+/// The output carries the template's parquet schema and its Arrow metadata, so a spliced
+/// table reads back as the same types as the tables it came from -- including the
+/// `LargeList` columns, whose distinction from `List` lives only in that metadata. Every
+/// source must have that same schema; splicing is a byte copy and cannot convert anything.
+///
+/// The values and the row order are exactly those of the sources. The row-group boundaries
+/// are the sources' own, so a spliced file is not byte-identical to a re-encoded one.
+pub struct SpliceWriter {
+    writer: Option<SerializedFileWriter<std::fs::File>>,
+    /// The Arrow schema the sources must share, for the caller's own checks.
+    pub schema: Arc<Schema>,
+    rows: u64,
+    target: Option<AtomicPath>,
+}
+
+/// The parsed footer of a file to splice from, with its page index when it has one.
+fn splice_meta(path: &str) -> Result<(std::fs::File, ParquetMetaData)> {
+    let file = std::fs::File::open(path).with_context(|| format!("opening {path}"))?;
+    let meta = ParquetMetaDataReader::new()
+        .with_page_index_policy(PageIndexPolicy::Optional)
+        .parse_and_finish(&file)
+        .with_context(|| format!("reading the parquet footer of {path}"))?;
+    Ok((file, meta))
+}
+
+impl SpliceWriter {
+    /// Create `out`, taking the schema and the Arrow metadata from `template`, which is
+    /// normally the first file whose row groups will be spliced in.
+    pub fn create(out: &str, template: &str) -> Result<SpliceWriter> {
+        let (_, meta) = splice_meta(template)?;
+        let fm = meta.file_metadata();
+        let props = WriterProperties::builder()
+            .set_key_value_metadata(fm.key_value_metadata().cloned())
+            .build();
+        let schema =
+            parquet::arrow::parquet_to_arrow_schema(fm.schema_descr(), fm.key_value_metadata())
+                .with_context(|| format!("reading the arrow schema of {template}"))?;
+        let target = AtomicPath::new(out)?;
+        let file = std::fs::File::create(target.tmp())
+            .with_context(|| format!("creating {}", target.tmp().display()))?;
+        let writer =
+            SerializedFileWriter::new(file, fm.schema_descr().root_schema_ptr(), Arc::new(props))
+                .with_context(|| format!("opening {out} for splicing"))?;
+        Ok(SpliceWriter {
+            writer: Some(writer),
+            schema: Arc::new(schema),
+            rows: 0,
+            target: Some(target),
+        })
+    }
+
+    /// Splice row groups of `src`: those whose index `keep` accepts, or all of them when
+    /// `keep` accepts everything. Returns the rows appended.
+    pub fn append_row_groups(&mut self, src: &str, keep: impl Fn(usize) -> bool) -> Result<u64> {
+        let (file, meta) = splice_meta(src)?;
+        let w = self.writer.as_mut().expect("writer closed");
+        if meta.file_metadata().schema_descr() != w.schema_descr() {
+            return Err(anyhow!(
+                "{src} has a different parquet schema from the table being spliced into;                  the band artifacts must come from the same configuration"
+            ));
+        }
+        let column_indexes = meta.column_index();
+        let offset_indexes = meta.offset_index();
+        let mut rows = 0u64;
+        for (i, rg) in meta.row_groups().iter().enumerate() {
+            if !keep(i) {
+                continue;
+            }
+            let rg_column = column_indexes.and_then(|ci| ci.get(i));
+            let rg_offset = offset_indexes.and_then(|oi| oi.get(i));
+            let mut out = w.next_row_group()?;
+            for (j, col) in rg.columns().iter().enumerate() {
+                out.append_column(
+                    &file,
+                    ColumnCloseResult {
+                        bytes_written: col.compressed_size() as u64,
+                        rows_written: rg.num_rows() as u64,
+                        metadata: col.clone(),
+                        // The engine writes no bloom filters; the page index is carried
+                        // through when the source has one.
+                        bloom_filter: None,
+                        column_index: rg_column.and_then(|r| r.get(j)).cloned(),
+                        offset_index: rg_offset.and_then(|r| r.get(j)).cloned(),
+                    },
+                )?;
+            }
+            out.close()?;
+            rows += rg.num_rows() as u64;
+        }
+        self.rows += rows;
+        Ok(rows)
+    }
+
+    /// The row groups of `src`, as (first row, row count) in file order.
+    pub fn row_group_spans(src: &str) -> Result<Vec<(usize, usize)>> {
+        let (_, meta) = splice_meta(src)?;
+        let mut out = Vec::with_capacity(meta.num_row_groups());
+        let mut start = 0usize;
+        for rg in meta.row_groups() {
+            let n = rg.num_rows() as usize;
+            out.push((start, n));
+            start += n;
+        }
+        Ok(out)
+    }
+
+    pub fn rows(&self) -> u64 {
+        self.rows
+    }
+
+    pub fn close(mut self) -> Result<u64> {
+        if let Some(w) = self.writer.take() {
+            w.close().context("closing the spliced parquet file")?;
+        }
+        if let Some(t) = self.target.take() {
+            t.publish()?;
+        }
+        Ok(self.rows)
+    }
 }
 
 /// Rows per internal chunk in [`write_table`].

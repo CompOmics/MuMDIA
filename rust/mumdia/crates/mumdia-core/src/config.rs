@@ -1909,6 +1909,11 @@ pub struct GroupsConfig {
     /// machine, after checking one band's peak RSS: on a 203M-precursor library at 63
     /// bands the largest band took 39 GB and the median far less. Results do not depend on
     /// it; bands are independent and their artifacts are pooled in band order either way.
+    ///
+    /// It must stay below the thread count: a band in flight parks one worker on its
+    /// accumulation channel, so as many bands as there are threads leaves nothing to do the
+    /// probing and the run deadlocks. A larger value is clamped to `threads - 1` with a
+    /// warning rather than hanging.
     pub parallel: usize,
 }
 impl Default for GroupsConfig {
