@@ -1980,6 +1980,98 @@ mod write_chunking_tests {
         std::fs::remove_file(&once).ok();
     }
 
+    /// An entirely NULL optional column, which is what every real run writes: `apex_im` on
+    /// `psms_extracted` and the three ion-mobility columns on `run_windows` have exactly one
+    /// push site each and it pushes `None`.
+    ///
+    /// Here the chunked write is NOT byte-identical to the single-batch write, and this test
+    /// pins that rather than hiding it. An all-null column's definition levels are RLE-run
+    /// encoded, which changes the size the writer takes its internal mini-batches in, so a
+    /// row-chunk boundary no longer coincides with a mini-batch boundary and one page header
+    /// lands elsewhere: measured on parquet 59.3.0, 2,287,903 bytes against 2,287,919 at
+    /// 196,615 rows, a 16-byte difference in page framing. The ROWS are identical, which is
+    /// the contract this layer makes. The consequence to know about is that
+    /// `psms_extracted.parquet` and `run_windows.parquet` have different content hashes from
+    /// the ones a pre-chunking build wrote, exactly as the row-group caps elsewhere do.
+    #[test]
+    fn an_entirely_null_column_keeps_its_rows_but_not_its_page_framing() {
+        let n = 3 * WRITE_TABLE_CHUNK_ROWS + 7;
+        let cols = |n: usize| -> Vec<Col> {
+            vec![
+                Col::U32("id".into(), (0..n as u32).collect()),
+                Col::F64("mz".into(), (0..n).map(|i| i as f64 * 1.5 - 3.0).collect()),
+                Col::OptF64("apex_im".into(), vec![None; n]),
+                Col::OptF32("im_lower".into(), vec![None; n]),
+                Col::OptI32("im_bin".into(), vec![None; n]),
+                Col::OptStr("note".into(), vec![None; n]),
+            ]
+        };
+        // Its own directory: another test in this module wipes the shared one with
+        // `remove_dir_all` while these run in parallel threads.
+        let dir = std::env::temp_dir().join(format!("mumdia_allnull_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = |n: &str| dir.join(n).to_str().unwrap().to_string();
+        let chunked = p("allnull_chunked.parquet");
+        let once = p("allnull_once.parquet");
+        assert_eq!(write_table(&chunked, cols(n)).unwrap(), n as u64);
+        write_one_batch(&once, cols(n));
+        let (a, b) = (Table::read(&chunked).unwrap(), Table::read(&once).unwrap());
+        assert_eq!(a.schema, b.schema);
+        assert_eq!(a.nrows, n);
+        assert_eq!(a.u32("id").unwrap(), b.u32("id").unwrap());
+        assert_eq!(a.f64("mz").unwrap(), b.f64("mz").unwrap());
+        assert_eq!(a.opt_f64("apex_im").unwrap(), b.opt_f64("apex_im").unwrap());
+        assert!(
+            a.opt_f64("apex_im").unwrap().iter().all(|v| v.is_none()),
+            "the fixture's point is that the column is entirely null"
+        );
+        let (ta, tb) = (
+            TableFile::open(&chunked).unwrap(),
+            TableFile::open(&once).unwrap(),
+        );
+        assert_eq!(
+            ta.row_group_stats("id").unwrap().len(),
+            tb.row_group_stats("id").unwrap().len(),
+            "the row groups fall in the same places whichever way the table was written"
+        );
+        std::fs::remove_file(&chunked).ok();
+        std::fs::remove_file(&once).ok();
+    }
+
+    /// Past the writer's 1,048,576-row row-group maximum the chunked write must still put
+    /// the group boundaries where the single-batch write puts them: the 65,536-row chunk
+    /// divides that maximum, so a row group closes on the same row either way. Nothing
+    /// tested that before -- the other chunking tests are all under one row group -- and it
+    /// is the property the whole chunk-size choice rests on.
+    #[test]
+    fn the_row_groups_fall_in_the_same_places_past_the_row_group_maximum() {
+        let n = 1_048_576 + 7;
+        let dir = std::env::temp_dir().join(format!("mumdia_bigrg_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = |x: &str| dir.join(x).to_str().unwrap().to_string();
+        let cols = |n: usize| -> Vec<Col> {
+            vec![
+                Col::U32("id".into(), (0..n as u32).collect()),
+                Col::F64("mz".into(), (0..n).map(|i| i as f64 * 0.5).collect()),
+            ]
+        };
+        let (chunked, once) = (p("big_chunked.parquet"), p("big_once.parquet"));
+        write_table(&chunked, cols(n)).unwrap();
+        write_one_batch(&once, cols(n));
+        let a = TableFile::open(&chunked).unwrap().row_group_stats("id").unwrap();
+        let b = TableFile::open(&once).unwrap().row_group_stats("id").unwrap();
+        let rows_a: Vec<usize> = a.iter().map(|g| g.rows).collect();
+        let rows_b: Vec<usize> = b.iter().map(|g| g.rows).collect();
+        assert_eq!(rows_a, rows_b, "row groups moved: {rows_a:?} against {rows_b:?}");
+        assert_eq!(rows_a, vec![1_048_576, 7]);
+        assert_eq!(
+            std::fs::read(&chunked).unwrap(),
+            std::fs::read(&once).unwrap(),
+            "and the file is still byte-identical across a row-group boundary"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// List columns hold a variable number of leaf values per row, so a row-chunk boundary
     /// need not fall on a 1,024-level mini-batch boundary and the data pages could in
     /// principle be cut elsewhere. The contract there is the rows: same order, same values,
