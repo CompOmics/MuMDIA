@@ -140,7 +140,8 @@ pub fn values(e: &Evidence) -> Vec<f64> {
     let f_gain = mean_all(&rc) - f_mean_full;
 
     // --- pairwise Pearson (symmetric matrix) + cross-correlation over pairs ---
-    let mut corr = vec![vec![0.0f64; k]; k];
+    // Row-major flat k x k, one allocation instead of k. `corr[a * k + b]`.
+    let mut corr = vec![0.0f64; k * k];
     let mut pair_p: Vec<f64> = Vec::new();
     let mut pair_w: Vec<f64> = Vec::new(); // l_a * l_b weights aligned with pair_p
     let mut xvals: Vec<f64> = Vec::new();
@@ -153,11 +154,11 @@ pub fn values(e: &Evidence) -> Vec<f64> {
     let mut chg_cnt = 0.0f64;
     if has_traces {
         for a in 0..k {
-            corr[a][a] = 1.0;
+            corr[a * k + a] = 1.0;
             for b in (a + 1)..k {
                 let p = pearson(&traces[a], &traces[b]);
-                corr[a][b] = p;
-                corr[b][a] = p;
+                corr[a * k + b] = p;
+                corr[b * k + a] = p;
                 pair_p.push(p);
                 pair_w.push(e.pred[a] * e.pred[b]);
                 let (lag, xv) = best_xcorr(&traces[a], &traces[b], MAXLAG);
@@ -207,8 +208,8 @@ pub fn values(e: &Evidence) -> Vec<f64> {
     let half = k / 2;
     let hi_idx: Vec<usize> = order.iter().take(half).cloned().collect();
     let lo_idx: Vec<usize> = order.iter().skip(k - half).cloned().collect();
-    let f_hi = subset_pair_mean(&corr, &hi_idx);
-    let f_lo = subset_pair_mean(&corr, &lo_idx);
+    let f_hi = subset_pair_mean(&corr, k, &hi_idx);
+    let f_lo = subset_pair_mean(&corr, k, &lo_idx);
     let f_contrast = f_hi - f_lo;
 
     // 19. coelution_corr_entropy: histogram of pairwise pearson in [-1,1]
@@ -538,9 +539,10 @@ fn weighted_mean_topk(rc: &[f64], pred: &[f64], k: usize) -> f64 {
     }
 }
 
-/// Mean pairwise Pearson (from a precomputed symmetric matrix) over a subset of
-/// fragment indices. Returns 0.0 when fewer than two indices are given.
-fn subset_pair_mean(corr: &[Vec<f64>], idx: &[usize]) -> f64 {
+/// Mean pairwise Pearson over a subset of fragment indices, read from a precomputed
+/// symmetric `k x k` matrix stored row-major in one buffer. Returns 0.0 when fewer than
+/// two indices are given.
+fn subset_pair_mean(corr: &[f64], k: usize, idx: &[usize]) -> f64 {
     let m = idx.len();
     if m < 2 {
         return 0.0;
@@ -550,8 +552,8 @@ fn subset_pair_mean(corr: &[Vec<f64>], idx: &[usize]) -> f64 {
     for a in 0..m {
         for b in (a + 1)..m {
             let (ia, ib) = (idx[a], idx[b]);
-            if ia < corr.len() && ib < corr.len() {
-                s += corr[ia][ib];
+            if ia < k && ib < k {
+                s += corr[ia * k + ib];
                 n += 1.0;
             }
         }
