@@ -9,7 +9,7 @@ accompanies it in every release archive and in the container image.
 
 ## Obligations
 
-177 third-party crates. Every one declares an SPDX expression; none is
+184 third-party crates. Every one declares an SPDX expression; none is
 unspecified.
 
 The following copyleft identifiers appear, in each case as one arm of a
@@ -24,17 +24,17 @@ Licence identifiers by crate count:
 
 | SPDX identifier | crates |
 |---|---|
-| `MIT` | 151 |
-| `Apache-2.0` | 146 |
+| `MIT` | 158 |
+| `Apache-2.0` | 152 |
 | `Apache-2.0 WITH LLVM-exception` | 4 |
 | `Unlicense` | 4 |
 | `CC0-1.0` | 3 |
 | `BSD-2-Clause` | 2 |
 | `BSD-3-Clause` | 2 |
+| `LGPL-2.1-or-later` | 2 |
 | `Zlib` | 2 |
 | `0BSD` | 1 |
 | `BSL-1.0` | 1 |
-| `LGPL-2.1-or-later` | 1 |
 | `MIT-0` | 1 |
 | `Unicode-3.0` | 1 |
 
@@ -112,6 +112,7 @@ Licence identifiers by crate count:
 | `futures-util` | 0.3.32 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/rust-lang/futures-rs](https://github.com/rust-lang/futures-rs) |
 | `getrandom` | 0.2.17 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/rust-random/getrandom](https://github.com/rust-random/getrandom) |
 | `getrandom` | 0.3.4 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/rust-random/getrandom](https://github.com/rust-random/getrandom) |
+| `getrandom` | 0.4.3 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/rust-random/getrandom](https://github.com/rust-random/getrandom) |
 | `half` | 2.7.1 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/VoidStarKat/half-rs](https://github.com/VoidStarKat/half-rs) |
 | `hashbrown` | 0.17.1 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/rust-lang/hashbrown](https://github.com/rust-lang/hashbrown) |
 | `heck` | 0.5.0 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/withoutboats/heck](https://github.com/withoutboats/heck) |
@@ -123,6 +124,7 @@ Licence identifiers by crate count:
 | `indexmap` | 2.14.0 | Apache-2.0 OR MIT | `Apache-2.0` | [https://github.com/indexmap-rs/indexmap](https://github.com/indexmap-rs/indexmap) |
 | `is_terminal_polyfill` | 1.70.2 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/polyfill-rs/is_terminal_polyfill](https://github.com/polyfill-rs/is_terminal_polyfill) |
 | `itoa` | 1.0.18 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/dtolnay/itoa](https://github.com/dtolnay/itoa) |
+| `jobserver` | 0.1.35 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/rust-lang/jobserver-rs](https://github.com/rust-lang/jobserver-rs) |
 | `js-sys` | 0.3.103 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/wasm-bindgen/wasm-bindgen/tree/master/crates/js-sys](https://github.com/wasm-bindgen/wasm-bindgen/tree/master/crates/js-sys) |
 | `lazy_static` | 1.5.0 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/rust-lang-nursery/lazy-static.rs](https://github.com/rust-lang-nursery/lazy-static.rs) |
 | `lexical-core` | 1.0.6 | MIT/Apache-2.0 | `Apache-2.0` | [https://github.com/Alexhuszagh/rust-lexical](https://github.com/Alexhuszagh/rust-lexical) |
@@ -155,10 +157,12 @@ Licence identifiers by crate count:
 | `outref` | 0.5.2 | MIT | - | [https://github.com/Nugine/outref](https://github.com/Nugine/outref) |
 | `parquet` | 59.3.0 | Apache-2.0 | - | [https://github.com/apache/arrow-rs](https://github.com/apache/arrow-rs) |
 | `pin-project-lite` | 0.2.17 | Apache-2.0 OR MIT | `Apache-2.0` | [https://github.com/taiki-e/pin-project-lite](https://github.com/taiki-e/pin-project-lite) |
+| `pkg-config` | 0.3.34 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/rust-lang/pkg-config-rs](https://github.com/rust-lang/pkg-config-rs) |
 | `proc-macro2` | 1.0.106 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/dtolnay/proc-macro2](https://github.com/dtolnay/proc-macro2) |
 | `quick-xml` | 0.41.0 | MIT | - | [https://github.com/tafia/quick-xml](https://github.com/tafia/quick-xml) |
 | `quote` | 1.0.46 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/dtolnay/quote](https://github.com/dtolnay/quote) |
 | `r-efi` | 5.3.0 | MIT OR Apache-2.0 OR LGPL-2.1-or-later | `Apache-2.0` | [https://github.com/r-efi/r-efi](https://github.com/r-efi/r-efi) |
+| `r-efi` | 6.0.0 | MIT OR Apache-2.0 OR LGPL-2.1-or-later | `Apache-2.0` | [https://github.com/r-efi/r-efi](https://github.com/r-efi/r-efi) |
 | `rayon` | 1.12.0 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/rayon-rs/rayon](https://github.com/rayon-rs/rayon) |
 | `rayon-core` | 1.13.0 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/rayon-rs/rayon](https://github.com/rayon-rs/rayon) |
 | `regex` | 1.12.4 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/rust-lang/regex](https://github.com/rust-lang/regex) |
@@ -219,6 +223,9 @@ Licence identifiers by crate count:
 | `zerocopy` | 0.8.52 | BSD-2-Clause OR Apache-2.0 OR MIT | `Apache-2.0` | [https://github.com/google/zerocopy](https://github.com/google/zerocopy) |
 | `zerocopy-derive` | 0.8.52 | BSD-2-Clause OR Apache-2.0 OR MIT | `Apache-2.0` | [https://github.com/google/zerocopy](https://github.com/google/zerocopy) |
 | `zmij` | 1.0.21 | MIT | - | [https://github.com/dtolnay/zmij](https://github.com/dtolnay/zmij) |
+| `zstd` | 0.13.3 | MIT | - | [https://github.com/gyscos/zstd-rs](https://github.com/gyscos/zstd-rs) |
+| `zstd-safe` | 7.2.4 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/gyscos/zstd-rs](https://github.com/gyscos/zstd-rs) |
+| `zstd-sys` | 2.0.16+zstd.1.5.7 | MIT/Apache-2.0 | `Apache-2.0` | [https://github.com/gyscos/zstd-rs](https://github.com/gyscos/zstd-rs) |
 
 ## Licence texts
 
@@ -330,7 +337,7 @@ licence text alone does not discharge the obligation: MIT requires the copyright
 notice in all copies, BSD requires it retained, and Apache-2.0 section 4(d)
 requires the contents of a NOTICE file to be propagated.
 
-Notices recovered for 126 of 177 crates (the remainder ship no copyright line in a licence file; see their repositories, linked above).
+Notices recovered for 133 of 184 crates (the remainder ship no copyright line in a licence file; see their repositories, linked above).
 
 **adler2 2.0.1**
 
@@ -551,6 +558,11 @@ Notices recovered for 126 of 177 crates (the remainder ship no copyright line in
 - Copyright (c) 2018-2025 The rust-random Project Developers
 - Copyright (c) 2014 The Rust Project Developers
 
+**getrandom 0.4.3**
+
+- Copyright (c) 2018-2026 The rust-random Project Developers
+- Copyright (c) 2014 The Rust Project Developers
+
 **hashbrown 0.17.1**
 
 - Copyright (c) 2016 Amanieu d'Antras
@@ -590,6 +602,10 @@ Notices recovered for 126 of 177 crates (the remainder ship no copyright line in
 **is_terminal_polyfill 1.70.2**
 
 - Copyright (c) Individual contributors
+
+**jobserver 0.1.35**
+
+- Copyright (c) 2014 Alex Crichton
 
 **js-sys 0.3.103**
 
@@ -701,11 +717,21 @@ Notices recovered for 126 of 177 crates (the remainder ship no copyright line in
 
 - Copyright (c) 2022 Nugine
 
+**pkg-config 0.3.34**
+
+- Copyright (c) 2014 Alex Crichton
+
 **quick-xml 0.41.0**
 
 - Copyright (c) 2016 Johann Tuffe
 
 **r-efi 5.3.0**
+
+- Copyright (C) 2017-2023 Red Hat, Inc.
+- Copyright (C) 2019-2023 Microsoft Corporation
+- Copyright (C) 2022-2023 David Rheinsberg
+
+**r-efi 6.0.0**
 
 - Copyright (C) 2017-2023 Red Hat, Inc.
 - Copyright (C) 2019-2023 Microsoft Corporation
@@ -879,6 +905,19 @@ Notices recovered for 126 of 177 crates (the remainder ship no copyright line in
 
 - Copyright 2023 The Fuchsia Authors
 - Copyright 2019 The Fuchsia Authors.
+
+**zstd 0.13.3**
+
+- Copyright (c) 2016 Alexandre Bury
+
+**zstd-safe 7.2.4**
+
+- Copyright (c) 2016 Alexandre Bury
+
+**zstd-sys 2.0.16+zstd.1.5.7**
+
+- Copyright (c) 2016-present, Facebook, Inc. All rights reserved.
+- Copyright (c) 2016 Alexandre Bury
 
 ### NOTICE files, verbatim
 

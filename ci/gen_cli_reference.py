@@ -48,6 +48,7 @@ import difflib
 import os
 import re
 import shutil
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -88,6 +89,31 @@ ABBREVIATIONS = ("e.g", "i.e", "vs", "etc", "cf", "Fig", "no", "approx")
 # ---------------------------------------------------------------------------
 
 
+def cargo_target_binaries() -> list[Path]:
+    """`release/mumdia` under the target directory cargo reports, if cargo answers.
+
+    Run from inside the workspace, not with `--manifest-path`: cargo discovers
+    `.cargo/config.toml` by walking up from the CURRENT directory, so from the repository
+    root it reports the in-tree `target/` and misses the redirect this exists to follow.
+    """
+    ws = REPO_ROOT / "rust" / "mumdia"
+    if not shutil.which("cargo") or not ws.is_dir():
+        return []
+    try:
+        out = subprocess.run(
+            ["cargo", "metadata", "--format-version", "1", "--no-deps"],
+            cwd=ws,
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=True,
+        ).stdout
+        target = Path(json.loads(out)["target_directory"])
+    except (subprocess.SubprocessError, OSError, ValueError, KeyError):
+        return []
+    return [target / "release" / "mumdia", target / "release" / "mumdia.exe"]
+
+
 def find_binary(explicit: str | None) -> Path:
     """Resolve the binary to interrogate, or exit with the search order shown."""
     if explicit:
@@ -101,10 +127,16 @@ def find_binary(explicit: str | None) -> Path:
         if not p.is_file():
             sys.exit(f"error: $MUMDIA_BIN={from_env} is not a file")
         return p
-    for rel in BIN_CANDIDATES:
-        p = Path(rel)
+    # The target directory cargo actually reports comes before the in-tree path. A
+    # redirected `build.target-dir` -- which `.cargo/config.toml.example` documents, to keep
+    # build output out of a synced folder -- leaves `rust/mumdia/target/` holding whatever
+    # was built before the redirect, and this generator then documents a months-old CLI.
+    # That is not hypothetical: it shipped a reference missing a whole subcommand, and CI
+    # caught it only because CI has no such stale directory. `ci/smoke.sh` avoids the same
+    # trap the same way.
+    for p in (cargo_target_binaries() + [Path(rel) for rel in BIN_CANDIDATES if rel]):
         if not p.is_absolute():
-            p = REPO_ROOT / rel
+            p = REPO_ROOT / p
         if p.is_file():
             return p
     on_path = shutil.which(PROG)

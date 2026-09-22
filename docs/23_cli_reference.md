@@ -45,6 +45,7 @@ Commands:
   rt-im-train     Per-run RT calibration + windows -> run_windows.parquet, cal.json
   extract         Targeted 3D extraction (peak-major cascade) -> psms_extracted, chromatograms
   features        Compute the minimal feature set -> features.parquet + PIN
+  pool            Pool a grouped run's band artifacts into the run-level tables
   compete         Keep the best candidate per competition group -> psms_competed.parquet
   rescore         Rescore + native target-decoy q-values -> psms_scored.parquet
   quant           Quantify identified peptides + roll up to protein groups
@@ -137,6 +138,7 @@ first sentence of the description, with the full text in the section below.
 | [`rt-im-train`](#rt-im-train) | yes | Per-run RT calibration + windows -> run_windows.parquet, cal.json |
 | [`extract`](#extract) | yes | Targeted 3D extraction (peak-major cascade) -> psms_extracted, chromatograms |
 | [`features`](#features) | yes | Compute the minimal feature set -> features.parquet + PIN |
+| [`pool`](#pool) | no | Pool a grouped run's band artifacts into the run-level tables |
 | [`compete`](#compete) | yes | Keep the best candidate per competition group -> psms_competed.parquet |
 | [`rescore`](#rescore) | yes | Rescore + native target-decoy q-values -> psms_scored.parquet |
 | [`quant`](#quant) | yes | Quantify identified peptides + roll up to protein groups |
@@ -152,11 +154,11 @@ first sentence of the description, with the full text in the section below.
 | [`doctor`](#doctor) | yes | Check that the configured Python sidecar environments are usable |
 | `help` | n/a | Print this message or the help of the given subcommand(s) |
 
-19 of the 22 documented subcommands accept `--config`:
+19 of the 23 documented subcommands accept `--config`:
  `align`, `compete`, `convert`, `digest`, `doctor`, `extract`, `features`, `mbr`, `peak-census`, `peptidoforms`, `predict-frag`, `prescan`, `quant`, `report`, `rescore`, `rt-im-train`, `run`, `run-experiment`, `search-seed`.
 
-3 do not, so every setting they use comes from their own flags:
- `audit`, `inspect`, `quant-lfq`.
+4 do not, so every setting they use comes from their own flags:
+ `audit`, `inspect`, `pool`, `quant-lfq`.
 
 ## convert
 
@@ -347,6 +349,9 @@ Options:
       --restrict-candidates <RESTRICT_CANDIDATES>
           Optional candidate allowlist (a prior run's psms.parquet): restrict extraction to these candidate_ids. For "gate first, then compete" - re-extract with a peak_claim strategy over only the gate-accepted survivors, keeping the two-pass profile map small
 
+      --fragment-offset <FRAGMENT_OFFSET>
+          The library row that `--lib-precursors` row 0 came from, when that table is one isolation-window band of a larger library (`groups.window_groups` writes such bands, with ids rebased to `0..n`). The band's fragments are then read from the shared `--lib-fragments` table by that id range, selectively when the table is sorted by `candidate_id`, so a band needs no fragment table of its own
+
       --config <CONFIG>
 ```
 
@@ -372,6 +377,28 @@ Options:
       --out-pin <OUT_PIN>
 
       --config <CONFIG>
+```
+
+Plus the 5 repeated flags removed above: see "Global flags".
+
+## pool
+
+```text
+Pool a grouped run's band artifacts into the run-level tables.
+
+`run` does this itself at the end of a grouped search (`groups.window_groups`). Standalone it is for the case where the search finished and the run did not: the band directories hold everything, and pooling them is a byte copy of their parquet row groups, so a killed run costs a pool rather than a re-search.
+
+Usage: mumdia pool [OPTIONS] --groups-dir <GROUPS_DIR>
+
+Options:
+      --groups-dir <GROUPS_DIR>
+          The run's `groups/` directory, holding the `gNN/` band directories
+
+      --out-dir <OUT_DIR>
+          Where the pooled tables go. Default: the parent of `--groups-dir`, which is where a run writes them
+
+      --psms
+          Also pool `psms_extracted`, which only the candidate audit reads
 ```
 
 Plus the 5 repeated flags removed above: see "Global flags".

@@ -427,7 +427,7 @@ col_chunks!(
 /// Write columns to a Parquet file. Returns the row count. All columns must
 /// share the same length.
 ///
-/// The columns are validated as a set, then encoded in [`WRITE_TABLE_CHUNK_ROWS`] chunks
+/// The columns are validated as a set, then encoded in `WRITE_TABLE_CHUNK_ROWS` chunks
 /// through [`TableWriter`]. Building ONE record batch for the whole table first, as this
 /// used to, meant a second full Arrow copy of every column existed beside the source
 /// vectors: on a wide artifact that is a second copy of the whole table, and each column
