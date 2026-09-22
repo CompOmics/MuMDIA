@@ -82,7 +82,13 @@ fn solve_fixed(l: &[Vec<f64>], c: &[f64]) -> Vec<f64> {
 /// feature-sharing graph is fit by least squares to the pairwise median log
 /// ratios, then anchored so the component preserves its measured total intensity;
 /// isolated samples fall back to their column sum.
-pub fn lfq_profile(mat: &[Vec<Option<f64>>], n_samples: usize) -> Vec<f64> {
+///
+/// The rows are taken as anything that borrows as `[Option<f64>]`, so a caller that
+/// already owns the per-feature vectors (the cross-run combine, which rolls the same
+/// features up at protein, precursor and peptide level) passes references rather than
+/// three clones of every feature vector. Read-only: the arithmetic and the iteration
+/// order over rows are unchanged.
+pub fn lfq_profile<R: AsRef<[Option<f64>]>>(mat: &[R], n_samples: usize) -> Vec<f64> {
     let mut out = vec![0.0f64; n_samples];
     if n_samples == 0 {
         return out;
@@ -90,6 +96,7 @@ pub fn lfq_profile(mat: &[Vec<Option<f64>>], n_samples: usize) -> Vec<f64> {
     let mut colsum = vec![0.0f64; n_samples];
     let mut colcount = vec![0usize; n_samples];
     for row in mat {
+        let row = row.as_ref();
         for s in 0..n_samples {
             if let Some(v) = row.get(s).copied().flatten() {
                 if v > 0.0 {
@@ -109,6 +116,7 @@ pub fn lfq_profile(mat: &[Vec<Option<f64>>], n_samples: usize) -> Vec<f64> {
         for b in (a + 1)..n_samples {
             let mut d = Vec::new();
             for row in mat {
+                let row = row.as_ref();
                 if let (Some(va), Some(vb)) =
                     (row.get(a).copied().flatten(), row.get(b).copied().flatten())
                 {
@@ -189,14 +197,14 @@ pub fn lfq_profile(mat: &[Vec<Option<f64>>], n_samples: usize) -> Vec<f64> {
 }
 
 /// MaxLFQ (Cox et al. 2014): peptide-level cross-sample profile.
-pub fn maxlfq(peptides_by_sample: &[Vec<Option<f64>>], n_samples: usize) -> Vec<f64> {
+pub fn maxlfq<R: AsRef<[Option<f64>]>>(peptides_by_sample: &[R], n_samples: usize) -> Vec<f64> {
     lfq_profile(peptides_by_sample, n_samples)
 }
 
 /// directLFQ (Ammar et al. 2023) core: the same ratio-alignment applied at the
 /// ion/fragment level rather than the peptide level (the caller passes an
 /// ion-by-sample matrix).
-pub fn directlfq(ions_by_sample: &[Vec<Option<f64>>], n_samples: usize) -> Vec<f64> {
+pub fn directlfq<R: AsRef<[Option<f64>]>>(ions_by_sample: &[R], n_samples: usize) -> Vec<f64> {
     lfq_profile(ions_by_sample, n_samples)
 }
 
@@ -262,6 +270,23 @@ mod tests {
             got,
             measured
         );
+    }
+
+    #[test]
+    fn borrowed_rows_give_the_same_profile_as_owned_rows() {
+        // The cross-run combine passes `&Vec<Option<f64>>` rows so the same feature
+        // vector is not cloned once per rollup level. The profile must be bit-identical
+        // to the owned form it replaced.
+        let owned = vec![
+            vec![Some(10.0), Some(20.0), None],
+            vec![None, Some(10.0), Some(20.0)],
+            vec![Some(3.0), None, Some(12.0)],
+            vec![Some(5.0), Some(10.0), Some(20.0)],
+        ];
+        let borrowed: Vec<&Vec<Option<f64>>> = owned.iter().collect();
+        assert_eq!(lfq_profile(&owned, 3), lfq_profile(&borrowed, 3));
+        let slices: Vec<&[Option<f64>]> = owned.iter().map(|v| v.as_slice()).collect();
+        assert_eq!(lfq_profile(&owned, 3), lfq_profile(&slices, 3));
     }
 
     #[test]
