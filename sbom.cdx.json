@@ -1392,6 +1392,25 @@
     },
     {
       "type": "library",
+      "bom-ref": "pkg:cargo/getrandom@0.4.3",
+      "name": "getrandom",
+      "version": "0.4.3",
+      "purl": "pkg:cargo/getrandom@0.4.3",
+      "description": "A small cross-platform library for retrieving random data from system source",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rust-random/getrandom"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "bom-ref": "pkg:cargo/half@2.7.1",
       "name": "half",
       "version": "2.7.1",
@@ -1596,6 +1615,25 @@
         {
           "type": "vcs",
           "url": "https://github.com/dtolnay/itoa"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/jobserver@0.1.35",
+      "name": "jobserver",
+      "version": "0.1.35",
+      "purl": "pkg:cargo/jobserver@0.1.35",
+      "description": "An implementation of the GNU Make jobserver for Rust.",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rust-lang/jobserver-rs"
         }
       ]
     },
@@ -2251,6 +2289,25 @@
     },
     {
       "type": "library",
+      "bom-ref": "pkg:cargo/pkg-config@0.3.34",
+      "name": "pkg-config",
+      "version": "0.3.34",
+      "purl": "pkg:cargo/pkg-config@0.3.34",
+      "description": "A library to run the pkg-config system tool at build time in order to be used in Cargo build scripts.",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rust-lang/pkg-config-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "bom-ref": "pkg:cargo/proc-macro2@1.0.106",
       "name": "proc-macro2",
       "version": "1.0.106",
@@ -2312,6 +2369,29 @@
       "name": "r-efi",
       "version": "5.3.0",
       "purl": "pkg:cargo/r-efi@5.3.0",
+      "description": "UEFI Reference Specification Protocol Constants and Definitions",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0 OR LGPL-2.1-or-later"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/r-efi/r-efi"
+        },
+        {
+          "type": "website",
+          "url": "https://github.com/r-efi/r-efi/wiki"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/r-efi@6.0.0",
+      "name": "r-efi",
+      "version": "6.0.0",
+      "purl": "pkg:cargo/r-efi@6.0.0",
       "description": "UEFI Reference Specification Protocol Constants and Definitions",
       "licenses": [
         {
@@ -3524,6 +3604,63 @@
           "url": "https://github.com/dtolnay/zmij"
         }
       ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/zstd@0.13.3",
+      "name": "zstd",
+      "version": "0.13.3",
+      "purl": "pkg:cargo/zstd@0.13.3",
+      "description": "Binding for the zstd compression library.",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/gyscos/zstd-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/zstd-safe@7.2.4",
+      "name": "zstd-safe",
+      "version": "7.2.4",
+      "purl": "pkg:cargo/zstd-safe@7.2.4",
+      "description": "Safe low-level bindings for the zstd compression library.",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/gyscos/zstd-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/zstd-sys@2.0.16+zstd.1.5.7",
+      "name": "zstd-sys",
+      "version": "2.0.16+zstd.1.5.7",
+      "purl": "pkg:cargo/zstd-sys@2.0.16+zstd.1.5.7",
+      "description": "Low-level bindings for the zstd compression library.",
+      "licenses": [
+        {
+          "expression": "MIT/Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/gyscos/zstd-rs"
+        }
+      ]
     }
   ],
   "dependencies": [
@@ -3831,6 +3968,8 @@
       "ref": "pkg:cargo/cc@1.2.65",
       "dependsOn": [
         "pkg:cargo/find-msvc-tools@0.1.9",
+        "pkg:cargo/jobserver@0.1.35",
+        "pkg:cargo/libc@0.2.186",
         "pkg:cargo/shlex@2.0.1"
       ]
     },
@@ -4043,6 +4182,14 @@
       ]
     },
     {
+      "ref": "pkg:cargo/getrandom@0.4.3",
+      "dependsOn": [
+        "pkg:cargo/cfg-if@1.0.4",
+        "pkg:cargo/libc@0.2.186",
+        "pkg:cargo/r-efi@6.0.0"
+      ]
+    },
+    {
       "ref": "pkg:cargo/half@2.7.1",
       "dependsOn": [
         "pkg:cargo/cfg-if@1.0.4",
@@ -4107,6 +4254,13 @@
     {
       "ref": "pkg:cargo/itoa@1.0.18",
       "dependsOn": []
+    },
+    {
+      "ref": "pkg:cargo/jobserver@0.1.35",
+      "dependsOn": [
+        "pkg:cargo/getrandom@0.4.3",
+        "pkg:cargo/libc@0.2.186"
+      ]
     },
     {
       "ref": "pkg:cargo/js-sys@0.3.103",
@@ -4387,11 +4541,16 @@
         "pkg:cargo/num-traits@0.2.19",
         "pkg:cargo/seq-macro@0.3.6",
         "pkg:cargo/snap@1.1.1",
-        "pkg:cargo/twox-hash@2.1.2"
+        "pkg:cargo/twox-hash@2.1.2",
+        "pkg:cargo/zstd@0.13.3"
       ]
     },
     {
       "ref": "pkg:cargo/pin-project-lite@0.2.17",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:cargo/pkg-config@0.3.34",
       "dependsOn": []
     },
     {
@@ -4415,6 +4574,10 @@
     },
     {
       "ref": "pkg:cargo/r-efi@5.3.0",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:cargo/r-efi@6.0.0",
       "dependsOn": []
     },
     {
@@ -4783,6 +4946,25 @@
     {
       "ref": "pkg:cargo/zmij@1.0.21",
       "dependsOn": []
+    },
+    {
+      "ref": "pkg:cargo/zstd-safe@7.2.4",
+      "dependsOn": [
+        "pkg:cargo/zstd-sys@2.0.16+zstd.1.5.7"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/zstd-sys@2.0.16+zstd.1.5.7",
+      "dependsOn": [
+        "pkg:cargo/cc@1.2.65",
+        "pkg:cargo/pkg-config@0.3.34"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/zstd@0.13.3",
+      "dependsOn": [
+        "pkg:cargo/zstd-safe@7.2.4"
+      ]
     }
   ]
 }
