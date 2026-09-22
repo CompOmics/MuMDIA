@@ -2,6 +2,8 @@
 //! estimator `q = (n_decoys + 1) / max(1, n_targets)`, monotonized, with tied
 //! scores collapsed to a single block q. Shared by search-seed and rescore.
 
+use rayon::prelude::*;
+
 /// Rank key for the q-value kernels: finite scores pass through, non-finite ones
 /// (NaN, +/-inf) become the worst possible key.
 ///
@@ -27,45 +29,82 @@ fn rank_key(x: f64) -> f64 {
 
 /// Compute per-record q-values from (score, is_decoy). Higher score is better.
 /// Returns q aligned to the input order.
+///
+/// Layout, not statistics: the walk below is the same tied-block estimator it has always
+/// been, but it ranks ONE sortable record per row -- `(key, row, is_decoy)`, 16 bytes --
+/// instead of sorting an index permutation with a comparator that dereferences a separate
+/// key column. The old comparator paid two random loads per comparison (`key[a]`,
+/// `key[b]`) and the tied-block walk paid two more per row (`key[order[end]]`,
+/// `scores[order[end]].1`); here the sort compares the key in hand and the walk is a
+/// sequential scan. It also allocates two vectors rather than four (`key`, `order`,
+/// `fdr_at`, `q`): the `fdr_at` column is gone because the monotonization now runs in the
+/// same backward pass that computes each block's FDR, from the per-block counts and the
+/// totals, so 32 bytes per row becomes 24. At the experiment scale this kernel runs at
+/// (pooled PSM q over ~11.6M rows, plus `folds x num_iter` calls inside
+/// `rescoring::percolator_lite`) that is the difference between a random-access sort and
+/// a cache-resident one.
+///
+/// Output is unchanged, including tie behaviour. The previous stable `sort_by` over an
+/// ascending index vector ordered ties by row index; sorting `(key desc, row asc)` is the
+/// same permutation, and no two records compare equal, so the unstable parallel sort is
+/// deterministic.
 pub fn target_decoy_q(scores: &[(f64, bool)]) -> Vec<f64> {
     let n = scores.len();
     if n == 0 {
         return Vec::new();
     }
-    let key: Vec<f64> = scores.iter().map(|&(s, _)| rank_key(s)).collect();
-    let mut order: Vec<usize> = (0..n).collect();
-    order.sort_by(|&a, &b| key[b].total_cmp(&key[a]));
-    let (mut td, mut tt) = (0usize, 0usize);
-    let mut fdr_at = vec![1.0f64; n];
+    // A u32 row index halves the sort record. 2^32 PSMs is not a scale this engine can
+    // reach (the feature matrix alone would be 6.6 TB), but an assert is still better
+    // than a silent truncation that would scatter q onto the wrong rows.
+    assert!(
+        n <= u32::MAX as usize,
+        "target_decoy_q: {n} rows exceeds the u32 row index"
+    );
+    let mut ranked: Vec<(f64, u32, bool)> = scores
+        .iter()
+        .enumerate()
+        .map(|(i, &(s, d))| (rank_key(s), i as u32, d))
+        .collect();
+    ranked.par_sort_unstable_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    let total_d = scores.iter().filter(|&&(_, d)| d).count();
+    let total_t = n - total_d;
     // Walk in score order, processing tied-score blocks together so every PSM in
     // a block gets the same FDR (its within-tie order is arbitrary and must not
     // change the q). Numerator uses `n_decoys + 1` (the standard conservative
     // target-decoy estimate); the bare `n_decoys / n_targets` is optimistic in
     // the low-count regime.
-    let mut rank = 0usize;
-    while rank < n {
-        let s = key[order[rank]];
-        let mut end = rank;
-        while end < n && key[order[end]] == s {
-            if scores[order[end]].1 {
-                td += 1;
-            } else {
-                tt += 1;
-            }
-            end += 1;
-        }
-        let f = (td as f64 + 1.0) / (tt.max(1) as f64);
-        for value in fdr_at.iter_mut().take(end).skip(rank) {
-            *value = f;
-        }
-        rank = end;
-    }
-    // Monotonize from worst-scoring to best so q is non-increasing with score.
+    //
+    // Walked from the WORST-scoring end so the monotonization (q non-increasing with
+    // score) happens in the same pass: the counts at or above a block are the totals
+    // minus what is strictly below it, which is exactly what the forward walk
+    // accumulated, and `qmin` over the blocks already visited is exactly what the
+    // separate backward pass over `fdr_at` used to compute.
     let mut q = vec![1.0f64; n];
+    let (mut below_d, mut below_t) = (0usize, 0usize);
     let mut qmin = 1.0f64;
-    for rank in (0..n).rev() {
-        qmin = qmin.min(fdr_at[rank]);
-        q[order[rank]] = qmin;
+    let mut end = n;
+    while end > 0 {
+        let s = ranked[end - 1].0;
+        let mut start = end;
+        let (mut block_d, mut block_t) = (0usize, 0usize);
+        while start > 0 && ranked[start - 1].0 == s {
+            start -= 1;
+            if ranked[start].2 {
+                block_d += 1;
+            } else {
+                block_t += 1;
+            }
+        }
+        let td = total_d - below_d;
+        let tt = total_t - below_t;
+        let f = (td as f64 + 1.0) / (tt.max(1) as f64);
+        qmin = qmin.min(f);
+        for r in &ranked[start..end] {
+            q[r.1 as usize] = qmin;
+        }
+        below_d += block_d;
+        below_t += block_t;
+        end = start;
     }
     q
 }
@@ -163,6 +202,91 @@ pub fn ln_factorial(n: u32) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The previous `target_decoy_q`, transcribed unchanged: an index permutation sorted
+    /// with an indirect comparator, a forward tied-block walk into `fdr_at`, and a
+    /// separate backward monotonization. Kept as the reference the rewritten kernel is
+    /// checked against, because the claim being made is equality of output, not merely
+    /// that the new code is self-consistent.
+    fn target_decoy_q_reference(scores: &[(f64, bool)]) -> Vec<f64> {
+        let n = scores.len();
+        if n == 0 {
+            return Vec::new();
+        }
+        let key: Vec<f64> = scores.iter().map(|&(s, _)| rank_key(s)).collect();
+        let mut order: Vec<usize> = (0..n).collect();
+        order.sort_by(|&a, &b| key[b].total_cmp(&key[a]));
+        let (mut td, mut tt) = (0usize, 0usize);
+        let mut fdr_at = vec![1.0f64; n];
+        let mut rank = 0usize;
+        while rank < n {
+            let s = key[order[rank]];
+            let mut end = rank;
+            while end < n && key[order[end]] == s {
+                if scores[order[end]].1 {
+                    td += 1;
+                } else {
+                    tt += 1;
+                }
+                end += 1;
+            }
+            let f = (td as f64 + 1.0) / (tt.max(1) as f64);
+            for value in fdr_at.iter_mut().take(end).skip(rank) {
+                *value = f;
+            }
+            rank = end;
+        }
+        let mut q = vec![1.0f64; n];
+        let mut qmin = 1.0f64;
+        for rank in (0..n).rev() {
+            qmin = qmin.min(fdr_at[rank]);
+            q[order[rank]] = qmin;
+        }
+        q
+    }
+
+    #[test]
+    fn q_is_bit_identical_to_the_previous_kernel() {
+        // A deterministic pseudo-random population with every case the rewrite touches:
+        // heavy score ties (the tied-block walk), signed zeros (`total_cmp` separates
+        // them, `==` groups them), non-finite scores (mapped to the worst key), decoys
+        // above and below targets, and single-class stretches.
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for n in [1usize, 2, 3, 7, 64, 513, 4096] {
+            let mut scores: Vec<(f64, bool)> = Vec::with_capacity(n);
+            for _ in 0..n {
+                let r = next();
+                // Coarse quantisation so ties are common rather than incidental.
+                let s = match r % 11 {
+                    0 => 0.0,
+                    1 => -0.0,
+                    2 => f64::NAN,
+                    3 => f64::INFINITY,
+                    4 => f64::NEG_INFINITY,
+                    _ => ((r >> 8) % 37) as f64 * 0.25 - 4.0,
+                };
+                scores.push((s, r % 3 == 0));
+            }
+            let got = target_decoy_q(&scores);
+            let want = target_decoy_q_reference(&scores);
+            assert_eq!(
+                got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                want.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "n = {n}"
+            );
+        }
+        // All-target and all-decoy populations, where the `max(1, .)` guard bites.
+        for flag in [false, true] {
+            let scores: Vec<(f64, bool)> = (0..32).map(|i| ((i % 4) as f64, flag)).collect();
+            assert_eq!(target_decoy_q(&scores), target_decoy_q_reference(&scores));
+        }
+    }
 
     #[test]
     fn perfect_separation_q_is_conservative_plus_one() {

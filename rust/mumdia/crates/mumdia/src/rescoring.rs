@@ -46,6 +46,36 @@ impl FeatureMatrix {
         self.values.push(v as f32);
     }
 
+    /// Append a whole row that a caller has already narrowed to f32.
+    #[inline]
+    pub fn push_row(&mut self, row: &[f32]) {
+        self.values.extend_from_slice(row);
+    }
+
+    /// `(row, feature)` of the first non-finite value in flat row order, or `None`.
+    ///
+    /// Parallel because the serial form was `n_rows * n_features` `is_finite` checks on one
+    /// thread over a matrix that is hundreds of gigabytes at experiment scale, for a
+    /// predicate that is embarrassingly parallel. `find_first` is order-preserving: it
+    /// returns the earliest matching row regardless of which worker found it, so the error
+    /// a malformed table produces is the same row and the same message as before.
+    pub fn find_non_finite(&self) -> Option<(usize, usize)> {
+        if self.n_features == 0 {
+            return None;
+        }
+        self.values
+            .par_chunks_exact(self.n_features)
+            .enumerate()
+            .find_first(|(_, row)| row.iter().any(|v| !v.is_finite()))
+            .map(|(row, values)| {
+                let col = values
+                    .iter()
+                    .position(|v| !v.is_finite())
+                    .expect("the row matched the predicate");
+                (row, col)
+            })
+    }
+
     /// Fail loudly rather than silently mis-striding if a caller pushed a partial row.
     pub fn finish(self) -> anyhow::Result<FeatureMatrix> {
         if self.n_features > 0 && !self.values.len().is_multiple_of(self.n_features) {
@@ -115,14 +145,27 @@ fn fit_standardizer(x: &FeatureMatrix, idx: &[usize]) -> (Vec<f64>, Vec<f64>) {
     (mean, std)
 }
 
-/// Standardise one row. The subtraction and division are f64; the result is kept f32
-/// because `xtr` below holds one standardised copy of the training slice per fold, and
-/// those copies are as large as the matrix itself.
+/// Standardise one row into `out`. The subtraction and division are f64; the result is
+/// kept f32 because `xtr` below holds one standardised copy of the training slice per
+/// fold, and those copies are as large as the matrix itself.
 #[inline]
-fn std_row(row: &[f32], mean: &[f64], std: &[f64]) -> Vec<f32> {
-    (0..row.len())
-        .map(|j| ((row[j] as f64 - mean[j]) / std[j]) as f32)
-        .collect()
+fn std_row_into(row: &[f32], mean: &[f64], std: &[f64], out: &mut Vec<f32>) {
+    out.extend((0..row.len()).map(|j| ((row[j] as f64 - mean[j]) / std[j]) as f32));
+}
+
+/// Score a row through the standardizer without materialising it.
+///
+/// The f32 narrowing is kept: `score_row(w, &std_row(..))` scored the standardised value
+/// AFTER it had been rounded to f32, so computing the product from the f64 quotient
+/// instead would change the last bits of every test-fold score.
+#[inline]
+fn score_std_row(w: &[f64], row: &[f32], mean: &[f64], std: &[f64]) -> f64 {
+    let mut z = w[0];
+    for j in 0..row.len() {
+        let v = ((row[j] as f64 - mean[j]) / std[j]) as f32;
+        z += w[j + 1] * v as f64;
+    }
+    z
 }
 
 /// Logistic regression by full-batch gradient descent with L2. Weight[0] = bias.
@@ -199,11 +242,20 @@ pub fn percolator_lite(inp: RescoreInput) -> Vec<f64> {
                 return Vec::new();
             }
             let (mean, std) = fit_standardizer(inp.features, &train_idx);
-            // standardized train matrix (owned, so we can take &[f64] slices)
-            let xtr: Vec<Vec<f32>> = train_idx
-                .iter()
-                .map(|&i| std_row(inp.features.row(i), &mean, &std))
-                .collect();
+            // Standardized train matrix: ONE flat allocation of `train_rows * d`, row-major,
+            // sliced with `chunks_exact(d)` below. It used to be a `Vec<Vec<f32>>`, which is
+            // one heap block per training row -- the exact layout the comment on
+            // `FeatureMatrix` records was removed from the matrix itself, surviving one
+            // level down and multiplied by `folds`, since every fold is live at once inside
+            // this parallel map. At experiment scale (11.6M PSMs, 3 folds) that is ~23M
+            // live blocks here; now it is 3. Same values, same order, so the fit is
+            // bit-identical.
+            let d = inp.features.n_features();
+            let mut xtr: Vec<f32> = Vec::with_capacity(train_idx.len().saturating_mul(d));
+            for &i in &train_idx {
+                std_row_into(inp.features.row(i), &mean, &std, &mut xtr);
+            }
+            let xrow = |k: usize| -> &[f32] { &xtr[k * d..(k + 1) * d] };
             let mut train_scores: Vec<f64> = train_idx.iter().map(|&i| inp.init_score[i]).collect();
             let mut w = vec![0.0; inp.features.n_features() + 1];
             let mut sd: Vec<(f64, bool)> = Vec::with_capacity(train_idx.len());
@@ -222,10 +274,10 @@ pub fn percolator_lite(inp: RescoreInput) -> Vec<f64> {
                 let mut n_pos = 0;
                 for (k, &i) in train_idx.iter().enumerate() {
                     if inp.is_decoy[i] {
-                        rows.push(&xtr[k]);
+                        rows.push(xrow(k));
                         ys.push(0.0);
                     } else if q[k] <= inp.train_fdr {
-                        rows.push(&xtr[k]);
+                        rows.push(xrow(k));
                         ys.push(1.0);
                         n_pos += 1;
                     }
@@ -240,23 +292,23 @@ pub fn percolator_lite(inp: RescoreInput) -> Vec<f64> {
                     for (rank, &k) in order.iter().enumerate() {
                         let i = train_idx[k];
                         if inp.is_decoy[i] {
-                            rows.push(&xtr[k]);
+                            rows.push(xrow(k));
                             ys.push(0.0);
                         } else if rank < take {
-                            rows.push(&xtr[k]);
+                            rows.push(xrow(k));
                             ys.push(1.0);
                         }
                     }
                 }
                 w = logreg_fit(&rows, &ys, 1e-3, 200, 0.5);
                 train_scores = (0..train_idx.len())
-                    .map(|k| score_row(&w, &xtr[k]))
+                    .map(|k| score_row(&w, xrow(k)))
                     .collect();
             }
             // score the held-out test fold with this fold's scaler + weights
             test_idx
                 .iter()
-                .map(|&i| (i, score_row(&w, &std_row(inp.features.row(i), &mean, &std))))
+                .map(|&i| (i, score_std_row(&w, inp.features.row(i), &mean, &std)))
                 .collect()
         })
         .collect();
@@ -273,6 +325,216 @@ pub fn percolator_lite(inp: RescoreInput) -> Vec<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The previous per-row standardiser: one `Vec<f32>` (one heap block) per row.
+    fn std_row_ref(row: &[f32], mean: &[f64], std: &[f64]) -> Vec<f32> {
+        (0..row.len())
+            .map(|j| ((row[j] as f64 - mean[j]) / std[j]) as f32)
+            .collect()
+    }
+
+    /// `percolator_lite` as it was before the flattening, transcribed: `xtr` as a
+    /// `Vec<Vec<f32>>`, and the test fold scored through a materialised `std_row`. The
+    /// claim the rewrite makes is bit-equality of the scores, so the old layout is kept
+    /// here as the thing to compare against rather than asserting properties of the new
+    /// one.
+    fn percolator_lite_reference(inp: RescoreInput) -> Vec<f64> {
+        let n = inp.features.rows();
+        if n == 0 {
+            return Vec::new();
+        }
+        let folds = inp.folds.max(1);
+        let fold_of: Vec<usize> = inp.fold_key.iter().map(|c| (*c as usize) % folds).collect();
+        let per_fold: Vec<Vec<(usize, f64)>> = (0..folds)
+            .into_par_iter()
+            .map(|test_fold| {
+                let train_idx: Vec<usize> = (0..n).filter(|&i| fold_of[i] != test_fold).collect();
+                let test_idx: Vec<usize> = (0..n).filter(|&i| fold_of[i] == test_fold).collect();
+                if train_idx.is_empty() || test_idx.is_empty() {
+                    return Vec::new();
+                }
+                let (mean, std) = fit_standardizer(inp.features, &train_idx);
+                let xtr: Vec<Vec<f32>> = train_idx
+                    .iter()
+                    .map(|&i| std_row_ref(inp.features.row(i), &mean, &std))
+                    .collect();
+                let mut train_scores: Vec<f64> =
+                    train_idx.iter().map(|&i| inp.init_score[i]).collect();
+                let mut w = vec![0.0; inp.features.n_features() + 1];
+                let mut sd: Vec<(f64, bool)> = Vec::with_capacity(train_idx.len());
+                for _ in 0..inp.num_iter.max(1) {
+                    sd.clear();
+                    sd.extend(
+                        train_idx
+                            .iter()
+                            .enumerate()
+                            .map(|(k, &i)| (train_scores[k], inp.is_decoy[i])),
+                    );
+                    let q = target_decoy_q(&sd);
+                    let mut rows: Vec<&[f32]> = Vec::new();
+                    let mut ys: Vec<f64> = Vec::new();
+                    let mut n_pos = 0;
+                    for (k, &i) in train_idx.iter().enumerate() {
+                        if inp.is_decoy[i] {
+                            rows.push(&xtr[k]);
+                            ys.push(0.0);
+                        } else if q[k] <= inp.train_fdr {
+                            rows.push(&xtr[k]);
+                            ys.push(1.0);
+                            n_pos += 1;
+                        }
+                    }
+                    if n_pos < 10 {
+                        let mut order: Vec<usize> = (0..train_idx.len()).collect();
+                        order.sort_by(|&a, &b| train_scores[b].total_cmp(&train_scores[a]));
+                        let take = (train_idx.len() / 2).max(1);
+                        rows.clear();
+                        ys.clear();
+                        for (rank, &k) in order.iter().enumerate() {
+                            let i = train_idx[k];
+                            if inp.is_decoy[i] {
+                                rows.push(&xtr[k]);
+                                ys.push(0.0);
+                            } else if rank < take {
+                                rows.push(&xtr[k]);
+                                ys.push(1.0);
+                            }
+                        }
+                    }
+                    w = logreg_fit(&rows, &ys, 1e-3, 200, 0.5);
+                    train_scores = (0..train_idx.len())
+                        .map(|k| score_row(&w, &xtr[k]))
+                        .collect();
+                }
+                test_idx
+                    .iter()
+                    .map(|&i| {
+                        (
+                            i,
+                            score_row(&w, &std_row_ref(inp.features.row(i), &mean, &std)),
+                        )
+                    })
+                    .collect()
+            })
+            .collect();
+        let mut final_score = inp.init_score.to_vec();
+        for fold_scores in per_fold {
+            for (i, s) in fold_scores {
+                final_score[i] = s;
+            }
+        }
+        final_score
+    }
+
+    /// A synthetic population wide enough that the flattening matters and mixed enough
+    /// that both the confident-target branch and the top-half fallback are exercised.
+    fn crafted_population(n: usize, d: usize) -> (FeatureMatrix, Vec<bool>, Vec<u32>, Vec<f64>) {
+        let mut features = FeatureMatrix::with_capacity(n, d);
+        let (mut is_decoy, mut key, mut init) = (Vec::new(), Vec::new(), Vec::new());
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        for i in 0..n {
+            let decoy = i % 3 == 0;
+            for j in 0..d {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                let noise = (state >> 40) as f64 / 16_777_216.0;
+                // Column 0 separates; the rest are noise of varying scale, including one
+                // constant column (std guard) and one with a large offset.
+                let v = match j {
+                    0 => (if decoy { 0.0 } else { 2.5 }) + noise,
+                    1 => 7.0,
+                    2 => 1e6 * noise,
+                    _ => noise - 0.5,
+                };
+                features.push(v);
+            }
+            is_decoy.push(decoy);
+            key.push((i / 2) as u32);
+            init.push(if decoy { -0.5 } else { 0.5 } + (i % 7) as f64 * 0.01);
+        }
+        (features.finish().unwrap(), is_decoy, key, init)
+    }
+
+    #[test]
+    fn flat_training_matrix_scores_bit_identically_to_the_per_row_layout() {
+        let (features, is_decoy, key, init) = crafted_population(600, 9);
+        let mk = || RescoreInput {
+            features: &features,
+            is_decoy: &is_decoy,
+            fold_key: &key,
+            init_score: &init,
+            folds: 3,
+            num_iter: 4,
+            train_fdr: 0.05,
+        };
+        let got = percolator_lite(mk());
+        let want = percolator_lite_reference(mk());
+        assert_eq!(
+            got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            want.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+        );
+        // And the fallback branch (too few confident targets to train on) as well.
+        let (features, is_decoy, key, init) = crafted_population(40, 5);
+        let mk = || RescoreInput {
+            features: &features,
+            is_decoy: &is_decoy,
+            fold_key: &key,
+            init_score: &init,
+            folds: 2,
+            num_iter: 3,
+            train_fdr: 1e-9,
+        };
+        assert_eq!(
+            percolator_lite(mk())
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>(),
+            percolator_lite_reference(mk())
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn non_finite_scan_reports_the_first_row_in_flat_order() {
+        let mut m = FeatureMatrix::with_capacity(4, 3);
+        for v in [
+            1.0,
+            2.0,
+            3.0, // row 0: clean
+            4.0,
+            5.0,
+            6.0, // row 1: clean
+            7.0,
+            f64::NAN,
+            f64::INFINITY, // row 2: feature 1 first
+            f64::NEG_INFINITY,
+            0.0,
+            0.0, // row 3: also bad, must not win
+        ] {
+            m.push(v);
+        }
+        let m = m.finish().unwrap();
+        assert_eq!(m.find_non_finite(), Some((2, 1)));
+        // Same answer as the serial scan it replaces, on a clean matrix too.
+        let serial = m
+            .iter_rows()
+            .enumerate()
+            .find_map(|(r, row)| row.iter().position(|v| !v.is_finite()).map(|c| (r, c)));
+        assert_eq!(m.find_non_finite(), serial);
+        let mut clean = FeatureMatrix::with_capacity(2, 2);
+        for v in [1.0, 2.0, 3.0, 4.0] {
+            clean.push(v);
+        }
+        assert_eq!(clean.finish().unwrap().find_non_finite(), None);
+        // An f64 that overflows f32 is non-finite once narrowed, and must be caught: the
+        // scan reads the stored f32, not the value the reader decoded.
+        let mut overflow = FeatureMatrix::with_capacity(1, 1);
+        overflow.push(1e300);
+        assert_eq!(overflow.finish().unwrap().find_non_finite(), Some((0, 0)));
+    }
 
     #[test]
     fn separates_targets_from_decoys() {
