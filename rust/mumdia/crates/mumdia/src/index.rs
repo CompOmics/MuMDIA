@@ -132,7 +132,18 @@ fn read_is_decoy(pt: &TableFile, path: &str) -> Result<Vec<bool>> {
             match a.value(k) {
                 "decoy" => out.push(true),
                 "target" => out.push(false),
-                other => crate::fdr::validate_labels(&[other.to_string()])?,
+                other => {
+                    // `validate_labels` refuses anything but target/decoy, so this arm
+                    // returns. Written as an explicit error rather than a fall-through:
+                    // if that rule ever widens, not pushing here would leave the column
+                    // shorter than the table and every later row would read its
+                    // neighbour's label.
+                    crate::fdr::validate_labels(&[other.to_string()])?;
+                    anyhow::bail!(
+                        "library precursor row {} of {path} has label '{other}', which is                          neither 'target' nor 'decoy'",
+                        out.len()
+                    );
+                }
             }
         }
     }
@@ -919,6 +930,85 @@ pub fn deconvolve(peak_mz: f64, z: i32) -> f64 {
 mod tests {
     use super::*;
     use mumdia_io::table::{write_table, Col, TableWriter};
+
+    /// The label and candidate_id passes read in 65,536-row batches, and their row
+    /// accounting across a batch boundary -- the absolute row in an error, and the
+    /// `ncand` cap on the last batch -- is the only genuinely new logic in them. Nothing
+    /// covered it: every other fixture in this file is six rows.
+    #[test]
+    fn labels_and_ids_are_read_across_a_batch_boundary() {
+        let dir = std::env::temp_dir().join(format!("mumdia_idx_batch_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let n = PREC_BATCH_ROWS + 5;
+        let path = |t: &str| dir.join(t).to_str().unwrap().to_string();
+
+        let good = path("good.parquet");
+        write_table(
+            &good,
+            vec![
+                Col::U32("candidate_id".into(), (0..n as u32).collect()),
+                Col::Str(
+                    "label".into(),
+                    (0..n)
+                        .map(|i| if i % 2 == 0 { "target" } else { "decoy" }.to_string())
+                        .collect(),
+                ),
+            ],
+        )
+        .unwrap();
+        let t = TableFile::open(&good).unwrap();
+        let decoy = read_is_decoy(&t, &good).unwrap();
+        assert_eq!(decoy.len(), n, "one value per row across both batches");
+        assert!(!decoy[0] && decoy[1]);
+        // The rows either side of the boundary, and the last row of the short batch.
+        assert_eq!(decoy[PREC_BATCH_ROWS - 1], (PREC_BATCH_ROWS - 1) % 2 == 1);
+        assert_eq!(decoy[PREC_BATCH_ROWS], PREC_BATCH_ROWS % 2 == 1);
+        assert_eq!(decoy[n - 1], (n - 1) % 2 == 1);
+        check_candidate_ids(&t, &good, 0, n).unwrap();
+        // A band: the ids start at an offset and only `ncand` of them are checked.
+        check_candidate_ids(&t, &good, 0, PREC_BATCH_ROWS).unwrap();
+
+        // A wrong id in the SECOND batch must be named by its absolute row.
+        let bad = path("bad_id.parquet");
+        let mut ids: Vec<u32> = (0..n as u32).collect();
+        ids[PREC_BATCH_ROWS + 2] = 7;
+        write_table(
+            &bad,
+            vec![
+                Col::U32("candidate_id".into(), ids),
+                Col::Str("label".into(), vec!["target".to_string(); n]),
+            ],
+        )
+        .unwrap();
+        let t = TableFile::open(&bad).unwrap();
+        let err = check_candidate_ids(&t, &bad, 0, n).unwrap_err().to_string();
+        assert!(
+            err.contains(&format!("row {}", PREC_BATCH_ROWS + 2)) && err.contains("candidate_id 7"),
+            "{err}"
+        );
+
+        // A NULL label in the second batch, likewise.
+        let nulls = path("null_label.parquet");
+        let mut labels: Vec<Option<String>> = vec![Some("target".to_string()); n];
+        labels[PREC_BATCH_ROWS + 1] = None;
+        write_table(
+            &nulls,
+            vec![
+                Col::U32("candidate_id".into(), (0..n as u32).collect()),
+                Col::OptStr("label".into(), labels),
+            ],
+        )
+        .unwrap();
+        let t = TableFile::open(&nulls).unwrap();
+        // The row is in the error's source and the path in its context, so the whole
+        // chain has to be formatted (`{:#}`), as mumdia-io's own test of this does.
+        let err = format!("{:#}", read_is_decoy(&t, &nulls).unwrap_err());
+        assert!(
+            err.contains(&(PREC_BATCH_ROWS + 1).to_string()),
+            "the null must be named by its absolute row: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// Six candidates at m/z 400, 450, 500, 520, 600, 650 with two fragments each, written
     /// in row groups of two rows so a range crosses row-group boundaries on both tables.
