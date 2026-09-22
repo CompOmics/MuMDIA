@@ -114,24 +114,41 @@ pub fn plan(windows: &[(f64, f64)], stats: &[RowGroupStats], n: usize) -> Result
     let n = n.min(windows.len()).max(1);
     let target = per_window.iter().sum::<f64>() / n as f64;
 
-    // Greedy cut: close a group once it holds at least the target and enough windows remain
-    // for the groups still to make.
-    let mut groups: Vec<Vec<usize>> = Vec::new();
-    let mut cur: Vec<usize> = Vec::new();
-    let mut acc = 0.0;
-    for (i, w) in per_window.iter().enumerate() {
-        cur.push(i);
-        acc += w;
-        let remaining_windows = windows.len() - i - 1;
-        let remaining_groups = n - groups.len() - 1;
-        if groups.len() + 1 < n && acc >= target && remaining_windows >= remaining_groups {
-            groups.push(std::mem::take(&mut cur));
-            acc = 0.0;
+    // Cut where the running total crosses each k/n share of the whole. A greedy "close the
+    // group once it reaches the target" walk looks equivalent and is not: it closes a group
+    // on the window that first reaches the target, so every group overshoots a little, the
+    // overshoot compounds, and the windows left at the end are swallowed by the last group.
+    // Measured on the 8-12-mer library, whose first 14 windows select nothing because the
+    // library starts at m/z 326: 63 groups asked for came back as 36, one of them holding
+    // 28 windows and 37.9M precursors against a 3.2M target. Crossing points cannot
+    // compound, because each is taken against the running total rather than a reset
+    // accumulator.
+    let cum: Vec<f64> = per_window
+        .iter()
+        .scan(0.0, |acc, w| {
+            *acc += w;
+            Some(*acc)
+        })
+        .collect();
+    let mut cuts: Vec<usize> = vec![0];
+    for k in 1..n {
+        let want = target * k as f64;
+        // First window whose running total reaches this share, and never a cut that would
+        // leave fewer windows than groups still to place.
+        let at = cum.partition_point(|&c| c < want) + 1;
+        let at = at
+            .min(windows.len() - (n - k))
+            .max(*cuts.last().expect("seeded with 0") + 1);
+        if at > *cuts.last().expect("seeded with 0") && at < windows.len() {
+            cuts.push(at);
         }
     }
-    if !cur.is_empty() {
-        groups.push(cur);
-    }
+    cuts.push(windows.len());
+    let groups: Vec<Vec<usize>> = cuts
+        .windows(2)
+        .filter(|c| c[1] > c[0])
+        .map(|c| (c[0]..c[1]).collect())
+        .collect();
 
     // Bands from the groups, then merge any band that selects nothing into a neighbour.
     let mut bands: Vec<Band> = groups
@@ -432,6 +449,42 @@ mod tests {
             max: None,
         }];
         assert!(plan(&windows, &no_stats, 2).is_err());
+    }
+
+    /// The cut must not compound: a leading run of windows that select nothing, and then
+    /// windows of equal weight, has to come back as the number of bands asked for, evenly
+    /// filled. The greedy walk this replaced returned 36 bands for 63 here, one of them
+    /// holding a third of the library.
+    #[test]
+    fn empty_leading_windows_do_not_swallow_the_plan() {
+        // 14 windows below the library's first precursor, then 100 windows over it.
+        let mut windows: Vec<(f64, f64)> = (0..14)
+            .map(|i| (100.0 + i as f64, 101.0 + i as f64))
+            .collect();
+        windows.extend((0..100).map(|i| (400.0 + i as f64, 401.0 + i as f64)));
+        let stats: Vec<RowGroupStats> = (0..100)
+            .map(|i| RowGroupStats {
+                rows: 1_000_000,
+                min: Some(400.0 + i as f64),
+                max: Some(401.0 + i as f64),
+            })
+            .collect();
+        let p = plan(&windows, &stats, 25).expect("plans");
+        assert_eq!(p.bands.len(), 25, "every band asked for");
+        let est: Vec<f64> = p.bands.iter().map(|b| b.est_precursors).collect();
+        let (lo, hi) = (
+            est.iter().cloned().fold(f64::MAX, f64::min),
+            est.iter().cloned().fold(0.0, f64::max),
+        );
+        assert!(
+            hi <= 3.0 * lo.max(1.0),
+            "bands within 3x of each other, got {lo} to {hi}"
+        );
+        assert_eq!(
+            p.bands.iter().map(|b| b.windows.len()).sum::<usize>(),
+            windows.len(),
+            "every window placed exactly once"
+        );
     }
 
     #[test]
