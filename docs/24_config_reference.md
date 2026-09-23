@@ -739,6 +739,7 @@ listed with the file it is in.
 | `CONDA_PREFIX` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/python.rs:242` |
 | `DEEPLC_FT_THREADS` | sidecar | `"8"` | `scripts/deeplc_finetune.py:27` |
 | `MUMDIA_BREW_ITERS` | sidecar | `"20"` | `scripts/mokapot_worker.py:38` |
+| `MUMDIA_CONVERT_THREADS` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/stages/convert.rs:491` |
 | `MUMDIA_DEEPLC_RAW_OUTPUT` | sidecar | `""` | `scripts/deeplc_finetune.py:146`, `scripts/deeplc_worker.py:124` |
 | `MUMDIA_ENTRAPMENT_MODEL` | sidecar | `"gbm"` | `scripts/entrapment_worker.py:39` |
 | `MUMDIA_LR_C` | sidecar | `"1.0"` | `scripts/mokapot_worker.py:48` |
@@ -804,7 +805,7 @@ listed with the file it is in.
 | `ProgramFiles(x86)` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/raw.rs:202` |
 | `VIRTUAL_ENV` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/python.rs:242` |
 
-67 variables are read: 17 engine-side, 53 sidecar-side, 3 on both sides.
+68 variables are read: 18 engine-side, 53 sidecar-side, 3 on both sides.
 
 ### Variables the code sets
 
@@ -849,12 +850,12 @@ Every field whose struct has an `impl Default` resolved from the source.
 
 3 environment read(s) whose name is not a literal:
 
-- `rust/mumdia/crates/mumdia/src/stages/extract.rs:1419: env read via closure of `chunk``
-- `rust/mumdia/crates/mumdia/src/stages/extract.rs:3333: env read via closure of `&mut chunk``
-- `rust/mumdia/crates/mumdia/src/stages/extract.rs:3369: env read via closure of `&mut chunk``
+- `rust/mumdia/crates/mumdia/src/stages/extract.rs:1520: env read via closure of `chunk``
+- `rust/mumdia/crates/mumdia/src/stages/extract.rs:3489: env read via closure of `&mut chunk``
+- `rust/mumdia/crates/mumdia/src/stages/extract.rs:3525: env read via closure of `&mut chunk``
 
 ## Coverage
 
-19 structs and 193 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 25 enumerations, 1 named profile(s), 67 environment variables read and 19 set.
+19 structs and 193 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 25 enumerations, 1 named profile(s), 68 environment variables read and 19 set.
 
 20 field(s) carry a gating marker in their doc comment. 48 field(s) carry no doc comment at all, so their description is empty above. 0 default(s) could not be resolved and 2 have none by design.

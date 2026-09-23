@@ -185,9 +185,90 @@ the seed fitted one, an m/z-dependent grid that is linearly interpolated and
 clamped at the ends (`extract.rs:632`), so the correction is not necessarily
 constant across the m/z range.
 
+#### The per-peak setup: a per-scan scratch, and the per-window buffer that was not
+
+`q_mz` is then binned, which is a `ln()`. `accumulate_groups` fills a task-local
+`Vec<(f64, u32)>` with one scan's `(q_mz, bin)` and then probes from it, rather than
+computing both inside the probe per peak. The scratch is a few KB, refilled per scan
+and reused, and it makes exactly the same number of `ln()` calls the probe made. It
+still pays, because a separate pass takes the `ln()` off the dependency chain that
+the bin-cache load and then the posting loads hang from. Measured on
+`rust/mumdia/crates/mumdia/tests/bench_fragindex.rs`, which is `#[ignore]`d and has
+to be asked for:
+
+- `bench_wall`, extract's own task shape over rayon, 32 threads, min of 9, two
+  passes: -11.7 / -6.4% on the default shape (16 windows in flight, 4 tasks each),
+  -15.1 / -17.9% with smaller windows (1-2 tasks each), -17.4 / -18.6% with one wide
+  all-ion window in the batch.
+- `bench_probe`, one thread, m/z-sorted peaks: -9.1 / -12.7 / -6.7% for a narrow /
+  medium / wide candidate window.
+
+The scratch carries `q_mz` and not just the bin, so `factor_at` still runs once per
+peak. That matters under `search_seed.mass_cal_loess`, where the offset is a ~74
+point grid and `factor_at` is a binary search plus an interpolation: 8.3 ns/peak
+against 0.725 for the scalar default. A bin-only scratch, which recomputes `q_mz` in
+the peak loop, turned that arm from -1.7% into +5.6%.
+
+**A shared per-window buffer was tried twice and reverted twice.** The m/z half went
+first (8 B/peak, +200 MB of peak RSS on the AIF fixture, 317 MB with the whole run in
+one batch, no measurable time). The `ln()` bin half was then hoisted into a flat
+`u32` buffer per window, shared by that window's sub-range tasks, and reverted in
+turn: the buffer has to be filled before `rayon::scope` starts, so it turns per-task
+work that was SPREAD ACROSS THE POOL into serial work on the calling thread, and the
+default shape has nowhere near enough tasks per window to pay that back.
+`tasks_per_window` is `(2 * threads).div_ceil(groups.len())`, which is 4 at 32
+threads and the default 16 windows in flight, so the fill costs one pass per peak to
+save three thirty-seconds of one; break-even needs `tasks_per_window >= threads`,
+i.e. a batch of one or two windows. Measured, same harness:
+
+The two numbers in each cell are two independent passes of min-of-9, on a machine
+that was quieter for the first; read the direction and the sign, which are the same
+in both, rather than the third digit.
+
+| `bench_wall`, min of 9, 32 threads | in probe | per-scan scratch | shared buffer, serial fill | shared buffer, filled on the pool |
+|---|---|---|---|---|
+| default: 16 windows, 4 tasks each | 51.3 / 62.8 ms | -11.7 / -6.4% | **+8.5 / +22.1%** | -16.6 / -8.5% |
+| 16 windows, 1-2 tasks each | 19.9 / 43.9 ms | -15.1 / -17.9% | **+38.9 / +30.0%** | -10.3 / -15.3% |
+| one wide window, 49 tasks | 167.9 / 189.3 ms | -17.4 / -18.6% | -23.7 / -19.0% | -26.2 / -22.1% |
+
+Filling it on the pool instead removes the regression, and it is still not worth it:
+against the plain scratch it is -5.6 / -2.3% on the default shape and -10.7 / -4.3%
+on the all-ion shape, and it LOSES 5.7 / 3.2% on the second row, for 4 bytes per peak
+of every window in flight. The in-flight fraction is `windows_in_flight / n_windows`
+-- 16 of 152 on the AIF benchmark, about 17 MB there, but the whole run's peaks on an
+acquisition with 16 windows or fewer, and one copy per band under `groups.parallel`,
+in extract, the tallest stage in the pipeline.
+
+End to end, `mumdia extract` on the real AIF run (152 windows, 1.69M candidates,
+465,806 MS2 scans, 32 threads, i9-13900KS, three binaries interleaved over 24 / 21 /
+24 reps), timing the accumulation phase between the `loaded; probing peaks` and
+`candidates with evidence` log lines so the 310 MB spectra read is not in the number:
+
+| | min | mean of 3 fastest | mean of 5 fastest | median |
+|---|---|---|---|---|
+| in probe (before either change) | 3,274 ms | 3,360 ms | 3,419 ms | 4,233 ms |
+| shared buffer, serial fill | **+14.0%** | **+13.2%** | **+14.0%** | **+9.3%** |
+| per-scan scratch (shipped) | -0.3% | -1.9% | -2.3% | -4.5% |
+
+The machine is noisy (reps spread 2.5x, and it is a hybrid CPU), so read the sign and
+the ordering, not the third digit. The buffer's regression is the same size the model
+predicts: one serial pass over the in-flight peaks, 39.6M x 5.4 ns = 430 ms, against a
+3.3 s accumulation phase. The scratch's gain is smaller end to end than the -6 to -18%
+`bench_wall` measures on the probe loop, because the accumulation phase also runs the
+RT filter, the claim arbitration, the hit store and the counting sort, none of which
+this touches.
+
+All 69 runs wrote a byte-identical `psms_extracted.parquet` and
+`chromatograms.parquet` (41,677 accepted in every one), and peak RSS did not separate
+the arms (2,266-2,499 MB across all three).
+`candidate_range_split_reproduces_the_unsplit_accumulation` runs the fixture at two,
+eight and sixteen threads and compares the accumulation hit for hit, and `ci/smoke.sh`
+wrote 127 byte-identical artifacts against a binary built from the parent commit (the
+five that differ are logs and a work-directory path inside `planted.json`).
+
 Two matcher backends dispatch through `Prober::probe` (`extract.rs:57`):
 - `MatcherKind::Fragindex` (default): builds a `FragIndex` once at the learned
-  tolerance (`extract.rs:1431`). `FragIndex::probe_peak` (`fragindex.rs:152`)
+  tolerance (`extract.rs:1431`). `FragIndex::probe_peak` (`fragindex.rs:169`)
   probes bins `bin-1 ..= bin+1`, verifies each posting with the exact f64 ppm
   predicate, and carries the **true generating fragment ordinal** in `post_frag`.
 - Bucketed fallback (`MatcherKind::Bucketed`): `Library::page_search`
@@ -198,7 +279,7 @@ Two matcher backends dispatch through `Prober::probe` (`extract.rs:57`):
   pay for it (`extract.rs:1302`).
 
 `Library::candidate_range` / `FragIndex::candidate_range` (`index.rs:341`,
-`fragindex.rs:137`) give the half-open candidate-id range `[lo, hi)` whose
+`fragindex.rs:154`) give the half-open candidate-id range `[lo, hi)` whose
 precursor m/z falls in an isolation window, exploiting that the library is sorted
 by precursor m/z. This is what makes a per-window probe cheap.
 
@@ -495,7 +576,8 @@ the training/FDR population and needs entrapment validation, not a count check.
 | `Library::candidate_range` | `index.rs:341` | Candidate-id range for an isolation window |
 | `Library::cand_frags` | `index.rs:312` | Fragment m/z, predicted intensity, and interned name-id slices |
 | `Library::page_search` | `index.rs:350` | Bucketed-backend fragment probe |
-| `FragIndex::probe_peak` | `fragindex.rs:152` | Verified postings for one observed peak in a candidate range |
+| `FragIndex::probe_peak` | `fragindex.rs:169` | Verified postings for one observed peak in a candidate range |
+| `FragIndex::probe_peak_win_binned` / `bin_of` | `fragindex.rs:225` / `:197` | The same probe with the bin handed in, which is how the per-scan setup scratch probes |
 
 ## Configuration
 

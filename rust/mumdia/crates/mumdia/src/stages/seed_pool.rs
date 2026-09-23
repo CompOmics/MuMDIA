@@ -5,8 +5,8 @@
 //! `spectrum_q`, estimated on that band's PSMs alone. The retention-time calibration wants
 //! the whole run's anchors on one q scale, so the pooled table carries library-wide ids
 //! (local id plus the band's first row), a `spectrum_q` re-estimated over the union with the
-//! same target-decoy kernel the seed uses, and one mass calibration combined from the bands'
-//! by their calibrant counts. Rows stay one best PSM per candidate, as the seed writes them:
+//! same target-decoy kernel the seed uses, and one mass calibration fitted over the bands'
+//! calibrants. Rows stay one best PSM per candidate, as the seed writes them:
 //! bands are disjoint in candidates except where windows overlap across a cut, and there the
 //! higher score wins.
 //!
@@ -14,16 +14,27 @@
 //! (multi-head calibration per band), [`refresh_irt`] copies each anchor's current iRT from
 //! its band's table into the pooled seed, so `rt-im-train` can take anchors' iRT from the
 //! seed (`anchor_irt_from_seed`) while looking at one band's library at a time.
+//!
+//! The mass calibration is pooled the same way and for the same reason: the bands write
+//! their calibrant ppm deviations beside their masscal, and this stage fits
+//! [`crate::masscal::MassCal`] ONCE over the union, keeping the deviations whose PSM passes
+//! the POOLED q. Combining the bands' fitted scalars instead came out 35% wider on the
+//! six-file HYE Astral benchmark and cost 3.4% of the peptides; [`crate::masscal`] has the
+//! numbers and the mechanism. A band directory written before the sidecar existed still
+//! pools, by the scalar combination, with a warning.
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
+use mumdia_core::config::SearchSeedConfig;
 use mumdia_io::table::{write_table, Col, TableFile};
 use serde_json::json;
 use tracing::{info, warn};
 
 use crate::fdr::target_decoy_q;
+use crate::masscal::MassCal;
 
 /// One group's seed table and the library band it searched.
 pub struct BandSeed {
@@ -38,6 +49,14 @@ pub struct SeedPoolParams<'a> {
     pub seeds: &'a [BandSeed],
     /// The groups' `<seed>.masscal.json`, same order as `seeds`.
     pub masscals: &'a [String],
+    /// The groups' `<seed>.masscal.parquet` calibrant deviations, same order as `seeds`.
+    /// A path that does not exist is a band seeded before the sidecar existed; the pool
+    /// then falls back to combining the bands' scalars.
+    pub calibrants: &'a [String],
+    /// The seed configuration the bands searched under. The pooled mass calibration is
+    /// the same estimator under the same `fdr_seed`, `fragment_tol_ppm`,
+    /// `two_pass_mass_cal` and `mass_cal_loess` that a single-library search would use.
+    pub cfg: &'a SearchSeedConfig,
     /// Output seed table; `<out>.masscal.json` is written beside it.
     pub out: &'a str,
 }
@@ -144,6 +163,13 @@ pub fn run(p: SeedPoolParams) -> Result<u64> {
             p.masscals.len()
         );
     }
+    if p.calibrants.len() != p.seeds.len() {
+        bail!(
+            "seed-pool: {} seed tables but {} calibrant sidecar paths",
+            p.seeds.len(),
+            p.calibrants.len()
+        );
+    }
     // One row per library-wide candidate: where two bands share a candidate (window
     // overlap across a cut) the higher score stays, so the pooled q sees each once.
     let mut best: HashMap<u32, Row> = HashMap::new();
@@ -164,12 +190,111 @@ pub fn run(p: SeedPoolParams) -> Result<u64> {
     crate::fdr::validate_labels(&rows.iter().map(|r| r.label.clone()).collect::<Vec<_>>())?;
     let pairs: Vec<(f64, bool)> = rows.iter().map(|r| (r.score, r.label == "decoy")).collect();
     let q = target_decoy_q(&pairs);
+    // The pooled calibrant selector: for every target candidate the POOLED q accepts at
+    // the seed threshold, the scan its winning PSM was matched on. A band's own q accepts
+    // a different, looser set -- that is half of why the banded tolerance came out wide --
+    // and the scan pins the union to one PSM per candidate where two bands overlap, which
+    // is the one-best-PSM-per-candidate population an ungrouped seed fits on.
+    let accepted: HashMap<u32, u32> = rows
+        .iter()
+        .zip(&q)
+        .filter(|(r, qq)| **qq <= p.cfg.fdr_seed && r.label != "decoy")
+        .map(|(r, _)| (r.cid, r.scan))
+        .collect();
     let n_out = rows.len();
     let n = write_rows(p.out, &rows, q)?;
 
-    // Mass calibration: the bands' scalar offsets and learned tolerances combined by
-    // calibrant count. The optional m/z grids are not combined (they would need the
-    // deviations, which the seed does not keep); extract then applies the scalar offset.
+    // One fit over the run's deviations when the bands wrote them; otherwise the old
+    // combination of their scalars.
+    let (cal, source) = match pooled_masscal(&p, &accepted)? {
+        Some(cal) => (cal, "pooled_deviations"),
+        None => (combine_band_scalars(&p)?, "band_scalars"),
+    };
+    let mut body = cal.to_json();
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert("pooled_from_groups".into(), json!(p.seeds.len()));
+        obj.insert("masscal_source".into(), json!(source));
+    }
+    mumdia_io::json::write_json(&crate::masscal::json_path(p.out), &body)?;
+    info!(
+        groups = p.seeds.len(),
+        rows_in = n_in,
+        rows_out = n_out,
+        frag_ppm_offset = cal.frag_ppm_offset,
+        frag_tol_ppm = cal.frag_tol_ppm,
+        n_dev = cal.n_dev,
+        masscal_source = source,
+        elapsed_ms = t0.elapsed().as_millis() as u64,
+        "seed-pool: done"
+    );
+    Ok(n)
+}
+
+/// Fit the mass calibration once over the bands' calibrant deviations, keeping the ones
+/// whose PSM the POOLED q accepts (`accepted`: candidate -> winning scan).
+///
+/// `Ok(None)` when a band has no sidecar, which is a band directory seeded before the
+/// sidecar existed: the caller then combines the bands' scalars as it always did.
+fn pooled_masscal(p: &SeedPoolParams, accepted: &HashMap<u32, u32>) -> Result<Option<MassCal>> {
+    let missing = p
+        .calibrants
+        .iter()
+        .filter(|c| !Path::new(c.as_str()).exists())
+        .count();
+    if missing > 0 {
+        warn!(
+            missing,
+            groups = p.calibrants.len(),
+            "seed-pool: a group has no calibrant deviation sidecar, which is a band                  directory seeded before the pooled mass calibration existed. Combining the                  bands' fitted scalars instead, which is measurably WIDER than one fit over the                  pooled deviations (11.40 against 8.45 ppm on the six-file HYE Astral                  benchmark). Re-run search-seed on the bands to get the pooled fit"
+        );
+        if p.cfg.mass_cal_loess {
+            warn!(
+                "seed-pool: search_seed.mass_cal_loess is set but cannot be honoured from                      the bands' scalars -- an m/z-dependent grid needs the deviations. extract                      will apply the scalar offset only"
+            );
+        }
+        return Ok(None);
+    }
+    // Bands in order, rows in file order: the fit sorts internally, so the result does not
+    // depend on this, but the LOESS grid's tie order does.
+    let mut devs: Vec<f64> = Vec::new();
+    let mut dev_mz: Vec<f64> = Vec::new();
+    let mut n_band = 0usize;
+    for path in p.calibrants {
+        let c = crate::masscal::read_calibrants(path)?;
+        n_band += c.len();
+        for i in 0..c.len() {
+            if accepted.get(&c.candidate_id[i]) == Some(&c.scan_index[i]) {
+                devs.push(c.ppm[i] as f64);
+                dev_mz.push(c.frag_mz[i] as f64);
+            }
+        }
+    }
+    let cal = MassCal::fit_from(&devs, &dev_mz, p.cfg);
+    if cal.cal_passes == 0 {
+        warn!(
+            calibrants = devs.len(),
+            frag_tol_ppm = cal.frag_tol_ppm,
+            "seed-pool: too few pooled calibrants to fit a fragment tolerance; extract runs                  at the configured tolerance with no offset"
+        );
+    }
+    info!(
+        band_deviations = n_band,
+        pooled_deviations = devs.len(),
+        frag_ppm_offset = cal.frag_ppm_offset,
+        frag_tol_ppm = cal.frag_tol_ppm,
+        cal_passes = cal.cal_passes,
+        "seed-pool: fragment mass calibration fitted once over the pooled deviations"
+    );
+    Ok(Some(cal))
+}
+
+/// The pre-sidecar combination: the bands' scalar offsets and learned tolerances weighted
+/// by calibrant count. Kept so a band directory written by an older build still pools.
+///
+/// It is not the estimator: a mean of per-band p95s is not the p95 of the union, and the
+/// bands selected their calibrants on their own q. The m/z grids are not combined either,
+/// because they would need the deviations.
+fn combine_band_scalars(p: &SeedPoolParams) -> Result<MassCal> {
     let mut w_sum = 0.0;
     let (mut off, mut tol, mut med, mut mad) = (0.0, 0.0, 0.0, 0.0);
     let (mut n_dev, mut passes) = (0u64, 0u64);
@@ -202,31 +327,16 @@ pub fn run(p: SeedPoolParams) -> Result<u64> {
         );
         (0.0, uncalibrated_tol, 0.0, 0.0)
     };
-    mumdia_io::json::write_json(
-        &format!("{}.masscal.json", p.out),
-        &json!({
-            "frag_ppm_offset": off,
-            "frag_tol_ppm": tol,
-            "frag_ppm_sigma": tol,
-            "n_dev": n_dev,
-            "cal_passes": passes,
-            "ppm_residual_median": med,
-            "ppm_residual_mad": mad,
-            "mz_cal_grid_mz": Vec::<f64>::new(),
-            "mz_cal_grid_ppm": Vec::<f64>::new(),
-            "pooled_from_groups": p.seeds.len(),
-        }),
-    )?;
-    info!(
-        groups = p.seeds.len(),
-        rows_in = n_in,
-        rows_out = n_out,
-        frag_ppm_offset = off,
-        frag_tol_ppm = tol,
-        elapsed_ms = t0.elapsed().as_millis() as u64,
-        "seed-pool: done"
-    );
-    Ok(n)
+    Ok(MassCal {
+        frag_ppm_offset: off,
+        frag_tol_ppm: tol,
+        n_dev,
+        cal_passes: passes,
+        ppm_residual_median: med,
+        ppm_residual_mad: mad,
+        mz_cal_grid_mz: Vec::new(),
+        mz_cal_grid_ppm: Vec::new(),
+    })
 }
 
 /// Rewrite `seed_in` to `seed_out` with each row's `predicted_irt` taken from the band
@@ -271,6 +381,13 @@ pub fn refresh_irt(seed_in: &str, seed_out: &str, bands: &[(String, u32)]) -> Re
 mod tests {
     use super::*;
 
+    fn seed_cfg(fdr_seed: f64) -> SearchSeedConfig {
+        SearchSeedConfig {
+            fdr_seed,
+            ..Default::default()
+        }
+    }
+
     fn write_seed(path: &str, cids: &[u32], scores: &[f64], labels: &[&str], irt: &[f32]) {
         let n = cids.len();
         write_table(
@@ -304,6 +421,8 @@ mod tests {
     }
 
     #[test]
+    // No band writes a calibrant sidecar here, which is the pre-sidecar band directory:
+    // the pool must still combine the bands' scalars and say so.
     fn pooled_seed_has_global_ids_one_q_scale_and_a_combined_calibration() {
         let dir = std::env::temp_dir().join(format!("mumdia_seed_pool_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -349,6 +468,11 @@ mod tests {
                 },
             ],
             masscals: &[format!("{a}.masscal.json"), format!("{b}.masscal.json")],
+            calibrants: &[
+                crate::masscal::calibrants_path(&a),
+                crate::masscal::calibrants_path(&b),
+            ],
+            cfg: &seed_cfg(0.01),
             out: &out,
         })
         .unwrap();
@@ -377,6 +501,7 @@ mod tests {
         );
         assert!((cal["frag_tol_ppm"].as_f64().unwrap() - 9.0).abs() < 1e-9);
         assert_eq!(cal["n_dev"].as_u64().unwrap(), 40);
+        assert_eq!(cal["masscal_source"], "band_scalars");
 
         // Refresh: band b's re-predicted table says local 1 (global 4) now has iRT 50.
         let lib_b = dir.join("lib_b.parquet").to_str().unwrap().to_string();
@@ -420,6 +545,8 @@ mod tests {
                 rows: 2,
             }],
             masscals: &[format!("{a}.masscal.json")],
+            calibrants: &[crate::masscal::calibrants_path(&a)],
+            cfg: &seed_cfg(0.01),
             out: &out,
         })
         .unwrap();
@@ -428,5 +555,292 @@ mod tests {
         assert_eq!(cal["frag_tol_ppm"].as_f64().unwrap(), 20.0);
         assert_eq!(cal["frag_ppm_sigma"].as_f64().unwrap(), 20.0);
         assert_eq!(cal["n_dev"].as_u64().unwrap(), 0);
+    }
+
+    /// Three bands with their calibrant sidecars, built so the two q scales disagree.
+    ///
+    /// Each band holds 100 candidates on its own score range (band A the highest, band C
+    /// the lowest) and bands A and B carry two decoys at their bottom. On the POOLED
+    /// scale that puts band A's 98 targets at q = 1/98, band B's at 3/196 and band C's at
+    /// 5/296; on each band's OWN scale every target sits at 1/98 or 1/100. So a threshold
+    /// of 0.012 accepts every band's calibrants under the band q and only band A's under
+    /// the pooled q, while 0.017 accepts all three under both.
+    struct Fixture {
+        seeds: Vec<BandSeed>,
+        masscals: Vec<String>,
+        calibrants: Vec<String>,
+        /// Per band, in sidecar row order, the deviations and fragment m/z it carries,
+        /// already rounded through `f32` as the sidecar stores them.
+        devs: Vec<Vec<f64>>,
+        mz: Vec<Vec<f64>>,
+        out: String,
+    }
+
+    fn three_bands(tag: &str) -> Fixture {
+        let dir =
+            std::env::temp_dir().join(format!("mumdia_seed_pool_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut f = Fixture {
+            seeds: Vec::new(),
+            masscals: Vec::new(),
+            calibrants: Vec::new(),
+            devs: Vec::new(),
+            mz: Vec::new(),
+            out: dir.join("pooled.parquet").to_str().unwrap().to_string(),
+        };
+        // (rows, decoys at the bottom, top score, deviation centre, deviation step): the
+        // three deviation populations differ, so a fit over one band is not a fit over
+        // the union and the assertions below can tell them apart.
+        let spec = [
+            (100usize, 2usize, 1000.0f64, -2.0f64, 1.0f64),
+            (100, 2, 900.0, -2.0, 2.0),
+            (100, 0, 800.0, 8.0, 3.0),
+        ];
+        for (bi, &(n, n_dec, top, centre, step)) in spec.iter().enumerate() {
+            let offset = (bi * 100) as u32;
+            let path = dir
+                .join(format!("g{bi}.parquet"))
+                .to_str()
+                .unwrap()
+                .to_string();
+            let cids: Vec<u32> = (0..n as u32).collect();
+            let scores: Vec<f64> = (0..n).map(|i| top - i as f64).collect();
+            let labels: Vec<&str> = (0..n)
+                .map(|i| if i >= n - n_dec { "decoy" } else { "target" })
+                .collect();
+            let irt: Vec<f32> = (0..n).map(|i| i as f32).collect();
+            write_seed(&path, &cids, &scores, &labels, &irt);
+            // Two calibrant deviations per TARGET row, which is what this band's own q
+            // accepts, keyed by library-wide id and by the row's scan.
+            let mut c = crate::masscal::Calibrants::default();
+            let (mut d, mut m) = (Vec::new(), Vec::new());
+            for i in 0..n - n_dec {
+                for k in 0..2usize {
+                    let ppm = (centre + ((((i * 2 + k) % 11) as f64) - 5.0) * step) as f32;
+                    let fmz = (300.0 + (((i + k) % 11) as f64) * 50.0) as f32;
+                    c.candidate_id.push(offset + i as u32);
+                    c.scan_index.push(i as u32);
+                    c.frag_mz.push(fmz);
+                    c.ppm.push(ppm);
+                    d.push(ppm as f64);
+                    m.push(fmz as f64);
+                }
+            }
+            crate::masscal::write_calibrants(&path, &c).unwrap();
+            // The band's own scalar fit, so the fallback path has something to combine
+            // and the pooled path can be shown not to be it.
+            let band = MassCal::fit_from(&d, &m, &seed_cfg(0.012));
+            mumdia_io::json::write_json(&crate::masscal::json_path(&path), &band.to_json())
+                .unwrap();
+            f.masscals.push(crate::masscal::json_path(&path));
+            f.calibrants.push(crate::masscal::calibrants_path(&path));
+            f.seeds.push(BandSeed {
+                path,
+                offset,
+                rows: n as u32,
+            });
+            f.devs.push(d);
+            f.mz.push(m);
+        }
+        f
+    }
+
+    #[test]
+    fn the_pooled_tolerance_is_the_estimator_applied_to_the_concatenated_deviations() {
+        // The fix in one assertion: three bands' deviations are fitted ONCE, and the
+        // result is what `search-seed`'s own estimator gives on the concatenation. A band
+        // does not get to contribute its p95, only its points.
+        let f = three_bands("concat");
+        let cfg = seed_cfg(0.017);
+        run(SeedPoolParams {
+            seeds: &f.seeds,
+            masscals: &f.masscals,
+            calibrants: &f.calibrants,
+            cfg: &cfg,
+            out: &f.out,
+        })
+        .unwrap();
+        let got: serde_json::Value =
+            mumdia_io::json::read_json(&crate::masscal::json_path(&f.out)).unwrap();
+        let all_devs: Vec<f64> = f.devs.iter().flatten().cloned().collect();
+        let all_mz: Vec<f64> = f.mz.iter().flatten().cloned().collect();
+        let want = MassCal::fit_from(&all_devs, &all_mz, &cfg);
+        assert_eq!(got["masscal_source"], "pooled_deviations");
+        assert_eq!(got["n_dev"].as_u64().unwrap(), all_devs.len() as u64);
+        assert_eq!(got["frag_tol_ppm"].as_f64().unwrap(), want.frag_tol_ppm);
+        assert_eq!(got["frag_ppm_sigma"].as_f64().unwrap(), want.frag_tol_ppm);
+        assert_eq!(
+            got["frag_ppm_offset"].as_f64().unwrap(),
+            want.frag_ppm_offset
+        );
+        assert_eq!(
+            got["ppm_residual_mad"].as_f64().unwrap(),
+            want.ppm_residual_mad
+        );
+        assert_eq!(got["cal_passes"].as_u64().unwrap(), 1);
+        assert_eq!(got["pooled_from_groups"].as_u64().unwrap(), 3);
+        // And it is not the calibrant-weighted mean of the bands' own tolerances, which
+        // is what the stage used to write.
+        let (mut w, mut wt) = (0.0f64, 0.0f64);
+        for (d, m) in f.devs.iter().zip(&f.mz) {
+            let band = MassCal::fit_from(d, m, &cfg);
+            w += d.len() as f64;
+            wt += d.len() as f64 * band.frag_tol_ppm;
+        }
+        let averaged = wt / w;
+        assert!(
+            (averaged - want.frag_tol_ppm).abs() > 1e-6,
+            "the scalar combination ({averaged}) is a different number from the pooled fit \
+             ({}), which is the defect",
+            want.frag_tol_ppm
+        );
+
+        // The optional m/z-dependent grid is fitted from the pooled deviations too, so it
+        // keeps working on this path rather than being silently dropped.
+        let mut loess = seed_cfg(0.017);
+        loess.mass_cal_loess = true;
+        run(SeedPoolParams {
+            seeds: &f.seeds,
+            masscals: &f.masscals,
+            calibrants: &f.calibrants,
+            cfg: &loess,
+            out: &f.out,
+        })
+        .unwrap();
+        let grid: serde_json::Value =
+            mumdia_io::json::read_json(&crate::masscal::json_path(&f.out)).unwrap();
+        let gm = grid["mz_cal_grid_mz"].as_array().unwrap();
+        assert!(gm.len() >= 2, "the pooled path fits the LOESS grid");
+        assert_eq!(gm.len(), grid["mz_cal_grid_ppm"].as_array().unwrap().len());
+        // And the robust second pass, which also needs the deviations.
+        let mut two = seed_cfg(0.017);
+        two.two_pass_mass_cal = true;
+        run(SeedPoolParams {
+            seeds: &f.seeds,
+            masscals: &f.masscals,
+            calibrants: &f.calibrants,
+            cfg: &two,
+            out: &f.out,
+        })
+        .unwrap();
+        let second: serde_json::Value =
+            mumdia_io::json::read_json(&crate::masscal::json_path(&f.out)).unwrap();
+        assert_eq!(second["cal_passes"].as_u64().unwrap(), 2);
+        assert_eq!(
+            second["frag_tol_ppm"].as_f64().unwrap(),
+            MassCal::fit_from(&all_devs, &all_mz, &two).frag_tol_ppm
+        );
+    }
+
+    #[test]
+    fn the_pooled_q_and_not_the_band_q_selects_the_calibrants() {
+        let f = three_bands("poolq");
+        let cfg = seed_cfg(0.012);
+        // Every band's OWN q accepts every one of its targets at this threshold, so the
+        // sidecars carry all three bands' deviations.
+        for s in &f.seeds {
+            let t = TableFile::open(&s.path).unwrap();
+            let sc = t.f64("score").unwrap();
+            let lb = t.str("label").unwrap();
+            let pairs: Vec<(f64, bool)> = sc
+                .iter()
+                .zip(&lb)
+                .map(|(x, l)| (*x, l == "decoy"))
+                .collect();
+            let bq = target_decoy_q(&pairs);
+            let worst = bq
+                .iter()
+                .zip(&lb)
+                .filter(|(_, l)| *l == "target")
+                .fold(0.0f64, |a, (q, _)| a.max(*q));
+            assert!(
+                worst <= cfg.fdr_seed,
+                "band {} puts its worst target at {worst}, which its own q accepts",
+                s.offset
+            );
+        }
+        run(SeedPoolParams {
+            seeds: &f.seeds,
+            masscals: &f.masscals,
+            calibrants: &f.calibrants,
+            cfg: &cfg,
+            out: &f.out,
+        })
+        .unwrap();
+        // The pooled q does not: only band A's targets clear 0.012 on the union.
+        let pooled = TableFile::open(&f.out).unwrap();
+        let pq = pooled.f64("spectrum_q").unwrap();
+        let plab = pooled.str("label").unwrap();
+        let accepted: Vec<u32> = pooled
+            .u32("candidate_id")
+            .unwrap()
+            .into_iter()
+            .zip(pq.iter().zip(&plab))
+            .filter(|(_, (q, l))| **q <= cfg.fdr_seed && *l == "target")
+            .map(|(c, _)| c)
+            .collect();
+        assert_eq!(accepted.len(), 98, "band A's targets and nothing else");
+        assert!(accepted.iter().all(|&c| c < 100));
+
+        let got: serde_json::Value =
+            mumdia_io::json::read_json(&crate::masscal::json_path(&f.out)).unwrap();
+        let want = MassCal::fit_from(&f.devs[0], &f.mz[0], &cfg);
+        assert_eq!(got["masscal_source"], "pooled_deviations");
+        assert_eq!(
+            got["n_dev"].as_u64().unwrap(),
+            f.devs[0].len() as u64,
+            "only the calibrants of the PSMs the pooled q accepts"
+        );
+        assert_eq!(got["frag_tol_ppm"].as_f64().unwrap(), want.frag_tol_ppm);
+        assert_eq!(
+            got["frag_ppm_offset"].as_f64().unwrap(),
+            want.frag_ppm_offset
+        );
+        // Selecting on each band's own q instead would have taken every sidecar row and
+        // fitted a different, wider tolerance.
+        let all_devs: Vec<f64> = f.devs.iter().flatten().cloned().collect();
+        let all_mz: Vec<f64> = f.mz.iter().flatten().cloned().collect();
+        let band_q_selection = MassCal::fit_from(&all_devs, &all_mz, &cfg);
+        assert!(
+            band_q_selection.frag_tol_ppm > want.frag_tol_ppm,
+            "the band-q selection is the wider fit: {} against {}",
+            band_q_selection.frag_tol_ppm,
+            want.frag_tol_ppm
+        );
+    }
+
+    #[test]
+    fn a_band_without_a_sidecar_still_pools_on_the_scalars() {
+        // An older band directory has no calibrant sidecar. That must not fail the run:
+        // the scalars combine as they always did, and the log says so.
+        let f = three_bands("legacy");
+        std::fs::remove_file(&f.calibrants[1]).unwrap();
+        let cfg = seed_cfg(0.017);
+        run(SeedPoolParams {
+            seeds: &f.seeds,
+            masscals: &f.masscals,
+            calibrants: &f.calibrants,
+            cfg: &cfg,
+            out: &f.out,
+        })
+        .unwrap();
+        let got: serde_json::Value =
+            mumdia_io::json::read_json(&crate::masscal::json_path(&f.out)).unwrap();
+        assert_eq!(got["masscal_source"], "band_scalars");
+        let expected = combine_band_scalars(&SeedPoolParams {
+            seeds: &f.seeds,
+            masscals: &f.masscals,
+            calibrants: &f.calibrants,
+            cfg: &cfg,
+            out: &f.out,
+        })
+        .unwrap();
+        assert_eq!(
+            got["frag_tol_ppm"].as_f64().unwrap(),
+            expected.frag_tol_ppm,
+            "the calibrant-weighted mean of the bands' own tolerances"
+        );
+        assert_eq!(got["n_dev"].as_u64().unwrap(), expected.n_dev);
     }
 }

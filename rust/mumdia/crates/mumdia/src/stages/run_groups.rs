@@ -8,8 +8,13 @@
 //! and competed, in a directory `groups/gNN/` under the run. Between the seeds and the RT
 //! model the seeds are pooled (`groups.calibration = global`), so every group's calibration
 //! is fitted on the whole run's anchors; `per_group` calibrates each group on its own.
-//! Groups run one after the other in this process (`groups.parallel` is reserved), so the
-//! resident set is one band's library, one band's hits and one band's accepted rows.
+//! `groups.parallel` bands run at a time in this process, so the resident set is that many
+//! bands' libraries, hits and accepted rows -- plus ONE copy of the run's spectra, which
+//! this module decodes once per PHASE and lends to every band's seed and extract. Before
+//! that each band decoded them itself, twice: 63 bands were 126 decodes of a ~1 GB MS2
+//! artifact and as many resident copies as there were bands in flight. Once per phase and
+//! not once per run, because nothing between the two phases reads the spectra and the
+//! DeepLC sidecars sit there: see `scan_fingerprint` and the two decode sites.
 
 use std::collections::BTreeMap;
 use std::time::Instant;
@@ -28,6 +33,8 @@ use tracing::info;
 use super::{compete, convert, extract, features, pool, rt_im_train, search_seed, seed_pool};
 use crate::groups;
 use crate::index::Library;
+use crate::spectra::{load_ms1, load_ms2, Ms1Scan};
+use mumdia_core::types::Ms2Scan;
 
 pub struct GroupRun<'a> {
     pub cfg: &'a Config,
@@ -84,6 +91,55 @@ fn record_opt(man: Option<&mut Manifest>, rec: mumdia_core::manifest::ArtifactRe
     if let Some(m) = man {
         m.record(rec);
     }
+}
+
+/// Content fingerprint of the scans lent to the bands. FNV-1a over every field the
+/// stages read, so any change to any peak changes it.
+///
+/// Sharing one buffer across bands rests on "no band writes to it", and most of that is
+/// discharged by the type system rather than by this: the stages take `&[Ms2Scan]` and
+/// `&[Ms1Scan]`, so a band that wanted to write would have to change the signature to
+/// `&mut`, which does not compile. What the borrow checker does NOT cover is a write
+/// through interior mutability or `unsafe`, and it says nothing at all about the second
+/// decode of the same artifact returning something different from the first, which this
+/// module now relies on. Both are checked here, in debug builds only: the assertions
+/// below are `debug_assert!`, and in a release build this function returns a constant
+/// that the optimiser deletes along with its call sites.
+#[cfg(debug_assertions)]
+fn scan_fingerprint(ms2: &[Ms2Scan], ms1: &[Ms1Scan]) -> u64 {
+    #[inline]
+    fn mix(h: u64, x: u64) -> u64 {
+        (h ^ x).wrapping_mul(0x0000_0100_0000_01b3)
+    }
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    h = mix(h, ms2.len() as u64);
+    for s in ms2 {
+        h = mix(h, s.scan_index as u64);
+        h = mix(h, s.rt_seconds.to_bits());
+        h = mix(h, s.window.lower_mz.to_bits());
+        h = mix(h, s.window.upper_mz.to_bits());
+        h = mix(h, s.peaks.len() as u64);
+        for p in &s.peaks {
+            h = mix(h, p.mz.to_bits() as u64);
+            h = mix(h, p.intensity.to_bits() as u64);
+        }
+    }
+    h = mix(h, ms1.len() as u64);
+    for s in ms1 {
+        h = mix(h, s.scan_index as u64);
+        h = mix(h, s.rt_seconds.to_bits());
+        h = mix(h, s.mz.len() as u64);
+        for (m, i) in s.mz.iter().zip(&s.intensity) {
+            h = mix(h, m.to_bits() as u64);
+            h = mix(h, i.to_bits() as u64);
+        }
+    }
+    h
+}
+
+#[cfg(not(debug_assertions))]
+fn scan_fingerprint(_ms2: &[Ms2Scan], _ms1: &[Ms1Scan]) -> u64 {
+    0
 }
 
 pub fn run(mut g: GroupRun) -> Result<Pooled> {
@@ -172,11 +228,33 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
             want
         }
     };
-    // Bands are independent, so `groups.parallel` of them are sliced and seeded at once.
-    // Chunked rather than a free-running pool: the chunk bounds how many extraction working
-    // sets are resident, which is the whole point of banding. Results do not depend on it,
-    // and the records below are merged in band order.
-    let slice_one =
+    // --- the run's MS2, decoded once for the whole seeding phase
+    //
+    // Each band searches the whole run and differs only in its slice of the library, so
+    // the scans are the same bytes for all of them, and one decode serves the lot. The
+    // block is what bounds the buffer's LIFETIME: it is dropped at the end of the seeding
+    // phase rather than held to the end of the run. Nothing between here and extract
+    // reads the spectra, and what sits in between is the per-band retention-time phase,
+    // where a DeepLC sidecar process runs once per band, sequentially -- 63 of them on
+    // the 63-band run. Holding ~1 GB of decoded MS2 across that is exactly the resident
+    // set the banding exists to bound, so the extraction phase below decodes it a second
+    // time instead. Two decodes per run against the 2m this replaces (m = bands), and
+    // `run.rs` refuses to share for the same reason in the ungrouped single-run case.
+    let ms2_fingerprint = {
+        info!(stage = %"load-ms2", "run: stage start");
+        let ms2_scans: Vec<Ms2Scan> = load_ms2(&g.converted.ms2)?;
+        info!(
+            scans = ms2_scans.len(),
+            bands = plan.bands.len(),
+            "groups: MS2 decoded once for the seeding phase and shared"
+        );
+        let fp = scan_fingerprint(&ms2_scans, &[]);
+
+        // Bands are independent, so `groups.parallel` of them are sliced and seeded at once.
+        // Chunked rather than a free-running pool: the chunk bounds how many extraction working
+        // sets are resident, which is the whole point of banding. Results do not depend on it,
+        // and the records below are merged in band order.
+        let slice_one =
         |b: &groups::Band| -> Result<Option<(Band, Vec<mumdia_core::manifest::ArtifactRecord>)>> {
             let (first, n) = Library::precursor_row_span(g.lib_precursors, b.mz_lo, b.mz_hi)?;
             if n == 0 {
@@ -227,6 +305,11 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
                 bucket_size: cfg.extract.bucket_size,
                 config_hash: ch,
                 fragment_offset: Some(first as u32),
+                ms2_scans: Some(&ms2_scans),
+                // The band writes its calibrant deviations so `seed-pool` can fit the
+                // mass calibration once over the whole run rather than average the
+                // bands' fitted scalars (see `crate::masscal`).
+                emit_calibrants: true,
             })?;
             let rec = vec![record_artifact(
                 &format!("{}[g{:02}]", artifact::SEED_PSMS.0, b.index),
@@ -247,22 +330,30 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
                 rec,
             )))
         };
-    for chunk in plan.bands.chunks(par) {
-        let done: Vec<Option<(Band, Vec<mumdia_core::manifest::ArtifactRecord>)>> = if par == 1 {
-            chunk.iter().map(slice_one).collect::<Result<Vec<_>>>()?
-        } else {
-            chunk
-                .par_iter()
-                .map(slice_one)
-                .collect::<Result<Vec<_>>>()?
-        };
-        for (band, recs) in done.into_iter().flatten() {
-            for r in recs {
-                record_opt(g.man.as_deref_mut(), r);
+        for chunk in plan.bands.chunks(par) {
+            let done: Vec<Option<(Band, Vec<mumdia_core::manifest::ArtifactRecord>)>> = if par == 1
+            {
+                chunk.iter().map(slice_one).collect::<Result<Vec<_>>>()?
+            } else {
+                chunk
+                    .par_iter()
+                    .map(slice_one)
+                    .collect::<Result<Vec<_>>>()?
+            };
+            for (band, recs) in done.into_iter().flatten() {
+                for r in recs {
+                    record_opt(g.man.as_deref_mut(), r);
+                }
+                bands.push(band);
             }
-            bands.push(band);
         }
-    }
+        debug_assert_eq!(
+            fp,
+            scan_fingerprint(&ms2_scans, &[]),
+            "a band's seed search modified the shared MS2 buffer"
+        );
+        fp
+    };
     if bands.is_empty() {
         bail!("groups: no band selects any precursor of the library");
     }
@@ -279,12 +370,20 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
         .collect();
     let masscals: Vec<String> = bands
         .iter()
-        .map(|b| format!("{}.masscal.json", b.seed))
+        .map(|b| crate::masscal::json_path(&b.seed))
+        .collect();
+    // The bands' calibrant deviations, so the fragment tolerance is fitted once over the
+    // whole run rather than averaged from the bands' own p95s on their own q.
+    let calibrants: Vec<String> = bands
+        .iter()
+        .map(|b| crate::masscal::calibrants_path(&b.seed))
         .collect();
     info!(stage = %"seed-pool", "run: stage start");
     let n = seed_pool::run(seed_pool::SeedPoolParams {
         seeds: &seeds,
         masscals: &masscals,
+        calibrants: &calibrants,
+        cfg: &cfg.search_seed,
         out: &pooled_seed,
     })?;
     record_opt(
@@ -425,147 +524,189 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
     // --- windows, extract, features, compete per band
     let mut arts: Vec<pool::BandArtifacts> = Vec::new();
     let mut cals: Vec<(usize, String)> = Vec::new();
-    // `groups.parallel` bands at a time. Each band in flight holds its own extraction
-    // working set, so this chunk is what the stage's memory scales with; the artifacts are
-    // pooled in band order regardless of which band finishes first.
-    let band_one = |b: &Band| -> Result<(
-        pool::BandArtifacts,
-        (usize, String),
-        Vec<mumdia_core::manifest::ArtifactRecord>,
-    )> {
-        let mut recs: Vec<mumdia_core::manifest::ArtifactRecord> = Vec::new();
-        let windows = gd(b.index, "run_windows.parquet");
-        let cal = gd(b.index, "cal.json");
-        let (seed_for_windows, from_seed) = match (&anchors_for_windows, global) {
-            (Some(refreshed), _) => (refreshed.clone(), true),
-            (None, true) => (pooled_seed.clone(), true),
-            (None, false) => (b.seed.clone(), false),
-        };
-        info!(stage = %"rt-im-train", group = b.index, "run: stage start");
-        let rows = rt_im_train::run(rt_im_train::RtImTrainParams {
-            seed_psms: &seed_for_windows,
-            library_precursors: &b.prec,
-            out_windows: &windows,
-            out_cal: &cal,
-            cfg: &cfg.rt_im_train,
-            config_hash: ch,
-            anchor_irt_from_seed: from_seed,
-        })?;
-        recs.push(record_artifact(
-            &format!("{}[g{:02}]", artifact::RUN_WINDOWS.0, b.index),
-            artifact::RUN_WINDOWS,
-            &windows,
-            rows,
-            "rt-im-train",
-            ch,
-        )?);
-        let mass_cal = if global {
-            format!("{pooled_seed}.masscal.json")
-        } else {
-            format!("{}.masscal.json", b.seed)
-        };
-        let psms = gd(b.index, "psms_extracted.parquet");
-        let chrom = gd(b.index, "chromatograms.parquet");
-        info!(stage = %"extract", group = b.index, candidates = b.n, "run: stage start");
-        let (npsm, nchr) = extract::run(extract::ExtractParams {
-            ms2: &g.converted.ms2,
-            library_precursors: &b.prec,
-            library_fragments: g.lib_fragments,
-            run_windows: &windows,
-            ms1: Some(&g.converted.ms1),
-            mass_cal: Some(&mass_cal),
-            out_psms: &psms,
-            out_chrom: &chrom,
-            restrict_candidates: None,
-            cfg: &cfg.extract,
-            config_hash: ch,
-            fragment_offset: Some(b.offset),
-            sibling_bands: par,
-        })?;
-        recs.push(record_artifact(
-            &format!("{}[g{:02}]", artifact::PSMS_EXTRACTED.0, b.index),
-            artifact::PSMS_EXTRACTED,
-            &psms,
-            npsm,
-            "extract",
-            ch,
-        )?);
-        recs.push(record_artifact(
-            &format!("{}[g{:02}]", artifact::CHROMATOGRAMS.0, b.index),
-            artifact::CHROMATOGRAMS,
-            &chrom,
-            nchr,
-            "extract",
-            ch,
-        )?);
-        let feats = gd(b.index, "features.parquet");
-        let pin = gd(b.index, "run.pin");
-        info!(stage = %"features", group = b.index, "run: stage start");
-        let nf = features::run(features::FeaturesParams {
-            psms: &psms,
-            chromatograms: &chrom,
-            // Corroboration and the confident elution boundary key on the seed by
-            // candidate id, and the band's tables carry library-wide ids, so the pooled
-            // seed is the one that matches. Its q is the pooled one either way, which is
-            // what "confident" has to mean once the bands are scored together.
-            seed: Some(&pooled_seed),
-            out: &feats,
-            out_pin: &pin,
-            cfg: &cfg.features,
-            config_hash: ch,
-        })?;
-        recs.push(record_artifact(
-            &format!("{}[g{:02}]", artifact::FEATURES.0, b.index),
-            artifact::FEATURES,
-            &feats,
-            nf,
-            "features",
-            ch,
-        )?);
-        let competed = gd(b.index, "psms_competed.parquet");
-        info!(stage = %"compete", group = b.index, "run: stage start");
-        let nc = compete::run(compete::CompeteParams {
-            features: &feats,
-            out: &competed,
-            cfg: &cfg.compete,
-            config_hash: ch,
-        })?;
-        recs.push(record_artifact(
-            &format!("{}[g{:02}]", artifact::PSMS_COMPETED.0, b.index),
-            artifact::PSMS_COMPETED,
-            &competed,
-            nc,
-            "compete",
-            ch,
-        )?);
-        Ok((
-            pool::BandArtifacts {
-                psms,
-                chromatograms: chrom,
-                competed,
-            },
-            (b.index, gd(b.index, "cal.json")),
-            recs,
-        ))
-    };
-    for chunk in bands.chunks(par) {
-        let done: Vec<(
+    // --- the run's spectra, decoded once for the whole extraction phase
+    //
+    // Both are decoded here, after the retention-time phase and its per-band DeepLC
+    // sidecars, and both are dropped at the end of this block, before the pooling that
+    // reads and rewrites the run's largest artifacts. Neither is resident anywhere else.
+    // The MS2 is a second decode of the artifact the seeding phase already read; see the
+    // note there for why that is cheaper than holding it. `extract` itself loaded both
+    // from these paths, so the failure on a missing or unreadable artifact is the same
+    // one, raised a moment earlier.
+    {
+        info!(stage = %"load-ms2", "run: stage start");
+        let ms2_scans: Vec<Ms2Scan> = load_ms2(&g.converted.ms2)?;
+        info!(stage = %"load-ms1", "run: stage start");
+        let ms1_scans: Vec<Ms1Scan> = load_ms1(&g.converted.ms1)?;
+        // The seeded and the extracted band tables are joined by candidate id and scored on
+        // one q scale, so the two phases have to have searched the same spectra. They are the
+        // same file read twice by a deterministic loader, which is why this is a
+        // debug_assert and not a run-time check.
+        debug_assert_eq!(
+            ms2_fingerprint,
+            scan_fingerprint(&ms2_scans, &[]),
+            "the extraction phase decoded a different MS2 than the seeding phase"
+        );
+        let extract_fingerprint = scan_fingerprint(&ms2_scans, &ms1_scans);
+        info!(
+            ms2 = ms2_scans.len(),
+            ms1 = ms1_scans.len(),
+            bands = bands.len(),
+            "groups: spectra decoded once for the extraction phase and shared"
+        );
+        // `groups.parallel` bands at a time. Each band in flight holds its own extraction
+        // working set, so this chunk is what the stage's memory scales with; the artifacts are
+        // pooled in band order regardless of which band finishes first.
+        let band_one = |b: &Band| -> Result<(
             pool::BandArtifacts,
             (usize, String),
             Vec<mumdia_core::manifest::ArtifactRecord>,
-        )> = if par == 1 {
-            chunk.iter().map(band_one).collect::<Result<Vec<_>>>()?
-        } else {
-            chunk.par_iter().map(band_one).collect::<Result<Vec<_>>>()?
+        )> {
+            let mut recs: Vec<mumdia_core::manifest::ArtifactRecord> = Vec::new();
+            let windows = gd(b.index, "run_windows.parquet");
+            let cal = gd(b.index, "cal.json");
+            let (seed_for_windows, from_seed) = match (&anchors_for_windows, global) {
+                (Some(refreshed), _) => (refreshed.clone(), true),
+                (None, true) => (pooled_seed.clone(), true),
+                (None, false) => (b.seed.clone(), false),
+            };
+            info!(stage = %"rt-im-train", group = b.index, "run: stage start");
+            let rows = rt_im_train::run(rt_im_train::RtImTrainParams {
+                seed_psms: &seed_for_windows,
+                library_precursors: &b.prec,
+                out_windows: &windows,
+                out_cal: &cal,
+                cfg: &cfg.rt_im_train,
+                config_hash: ch,
+                anchor_irt_from_seed: from_seed,
+            })?;
+            recs.push(record_artifact(
+                &format!("{}[g{:02}]", artifact::RUN_WINDOWS.0, b.index),
+                artifact::RUN_WINDOWS,
+                &windows,
+                rows,
+                "rt-im-train",
+                ch,
+            )?);
+            let mass_cal = if global {
+                format!("{pooled_seed}.masscal.json")
+            } else {
+                format!("{}.masscal.json", b.seed)
+            };
+            let psms = gd(b.index, "psms_extracted.parquet");
+            let chrom = gd(b.index, "chromatograms.parquet");
+            info!(stage = %"extract", group = b.index, candidates = b.n, "run: stage start");
+            let (npsm, nchr) = extract::run(extract::ExtractParams {
+                ms2: &g.converted.ms2,
+                library_precursors: &b.prec,
+                library_fragments: g.lib_fragments,
+                run_windows: &windows,
+                ms1: Some(&g.converted.ms1),
+                mass_cal: Some(&mass_cal),
+                out_psms: &psms,
+                out_chrom: &chrom,
+                restrict_candidates: None,
+                cfg: &cfg.extract,
+                config_hash: ch,
+                fragment_offset: Some(b.offset),
+                sibling_bands: par,
+                scans: Some(extract::SharedScans {
+                    ms2: &ms2_scans,
+                    ms1: &ms1_scans,
+                }),
+            })?;
+            recs.push(record_artifact(
+                &format!("{}[g{:02}]", artifact::PSMS_EXTRACTED.0, b.index),
+                artifact::PSMS_EXTRACTED,
+                &psms,
+                npsm,
+                "extract",
+                ch,
+            )?);
+            recs.push(record_artifact(
+                &format!("{}[g{:02}]", artifact::CHROMATOGRAMS.0, b.index),
+                artifact::CHROMATOGRAMS,
+                &chrom,
+                nchr,
+                "extract",
+                ch,
+            )?);
+            let feats = gd(b.index, "features.parquet");
+            let pin = gd(b.index, "run.pin");
+            info!(stage = %"features", group = b.index, "run: stage start");
+            let nf = features::run(features::FeaturesParams {
+                psms: &psms,
+                chromatograms: &chrom,
+                // Corroboration and the confident elution boundary key on the seed by
+                // candidate id, and the band's tables carry library-wide ids, so the pooled
+                // seed is the one that matches. Its q is the pooled one either way, which is
+                // what "confident" has to mean once the bands are scored together.
+                seed: Some(&pooled_seed),
+                out: &feats,
+                out_pin: &pin,
+                cfg: &cfg.features,
+                config_hash: ch,
+            })?;
+            recs.push(record_artifact(
+                &format!("{}[g{:02}]", artifact::FEATURES.0, b.index),
+                artifact::FEATURES,
+                &feats,
+                nf,
+                "features",
+                ch,
+            )?);
+            let competed = gd(b.index, "psms_competed.parquet");
+            info!(stage = %"compete", group = b.index, "run: stage start");
+            let nc = compete::run(compete::CompeteParams {
+                features: &feats,
+                out: &competed,
+                cfg: &cfg.compete,
+                config_hash: ch,
+            })?;
+            recs.push(record_artifact(
+                &format!("{}[g{:02}]", artifact::PSMS_COMPETED.0, b.index),
+                artifact::PSMS_COMPETED,
+                &competed,
+                nc,
+                "compete",
+                ch,
+            )?);
+            Ok((
+                pool::BandArtifacts {
+                    psms,
+                    chromatograms: chrom,
+                    competed,
+                },
+                (b.index, gd(b.index, "cal.json")),
+                recs,
+            ))
         };
-        for (art, cal, recs) in done {
-            for r in recs {
-                record_opt(g.man.as_deref_mut(), r);
+        for chunk in bands.chunks(par) {
+            let done: Vec<(
+                pool::BandArtifacts,
+                (usize, String),
+                Vec<mumdia_core::manifest::ArtifactRecord>,
+            )> = if par == 1 {
+                chunk.iter().map(band_one).collect::<Result<Vec<_>>>()?
+            } else {
+                chunk.par_iter().map(band_one).collect::<Result<Vec<_>>>()?
+            };
+            for (art, cal, recs) in done {
+                for r in recs {
+                    record_opt(g.man.as_deref_mut(), r);
+                }
+                cals.push(cal);
+                arts.push(art);
             }
-            cals.push(cal);
-            arts.push(art);
         }
+        debug_assert_eq!(
+            extract_fingerprint,
+            scan_fingerprint(&ms2_scans, &ms1_scans),
+            "a band's extract modified the shared scan buffers"
+        );
     }
+    // Both buffers are dropped here, at the end of the block above, so neither is
+    // resident across `pool::run` below.
 
     // The run-level cal.json, as an ungrouped run writes it.
     groups::summarise_cal(&cals, global, &d("cal.json"))?;

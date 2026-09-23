@@ -9,7 +9,7 @@ accompanies it in every release archive and in the container image.
 
 ## Obligations
 
-184 third-party crates. Every one declares an SPDX expression; none is
+185 third-party crates. Every one declares an SPDX expression; none is
 unspecified.
 
 The following copyleft identifiers appear, in each case as one arm of a
@@ -29,10 +29,10 @@ Licence identifiers by crate count:
 | `Apache-2.0 WITH LLVM-exception` | 4 |
 | `Unlicense` | 4 |
 | `CC0-1.0` | 3 |
+| `Zlib` | 3 |
 | `BSD-2-Clause` | 2 |
 | `BSD-3-Clause` | 2 |
 | `LGPL-2.1-or-later` | 2 |
-| `Zlib` | 2 |
 | `0BSD` | 1 |
 | `BSL-1.0` | 1 |
 | `MIT-0` | 1 |
@@ -222,6 +222,7 @@ Licence identifiers by crate count:
 | `wit-bindgen` | 0.57.1 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | `Apache-2.0` | [https://github.com/bytecodealliance/wit-bindgen](https://github.com/bytecodealliance/wit-bindgen) |
 | `zerocopy` | 0.8.52 | BSD-2-Clause OR Apache-2.0 OR MIT | `Apache-2.0` | [https://github.com/google/zerocopy](https://github.com/google/zerocopy) |
 | `zerocopy-derive` | 0.8.52 | BSD-2-Clause OR Apache-2.0 OR MIT | `Apache-2.0` | [https://github.com/google/zerocopy](https://github.com/google/zerocopy) |
+| `zlib-rs` | 0.6.8 | Zlib | - | [https://github.com/trifectatechfoundation/zlib-rs](https://github.com/trifectatechfoundation/zlib-rs) |
 | `zmij` | 1.0.21 | MIT | - | [https://github.com/dtolnay/zmij](https://github.com/dtolnay/zmij) |
 | `zstd` | 0.13.3 | MIT | - | [https://github.com/gyscos/zstd-rs](https://github.com/gyscos/zstd-rs) |
 | `zstd-safe` | 7.2.4 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/gyscos/zstd-rs](https://github.com/gyscos/zstd-rs) |
@@ -337,7 +338,7 @@ licence text alone does not discharge the obligation: MIT requires the copyright
 notice in all copies, BSD requires it retained, and Apache-2.0 section 4(d)
 requires the contents of a NOTICE file to be propagated.
 
-Notices recovered for 133 of 184 crates (the remainder ship no copyright line in a licence file; see their repositories, linked above).
+Notices recovered for 133 of 185 crates (the remainder ship no copyright line in a licence file; see their repositories, linked above).
 
 **adler2 2.0.1**
 
