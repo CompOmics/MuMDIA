@@ -170,7 +170,9 @@ pub fn run(p: SearchSeedParams) -> Result<u64> {
             for &pidx in &peak_idx {
                 let peak = &scan.peaks[pidx];
                 let inten = peak.intensity as f64;
-                lib.page_search(peak.mz, p.cfg.fragment_tol_ppm, lo, hi, |cid, _mz, _pi| {
+                // Observed m/z is stored f32; widen once, the value is unchanged.
+                let obs_mz = peak.mz as f64;
+                lib.page_search(obs_mz, p.cfg.fragment_tol_ppm, lo, hi, |cid, _mz, _pi| {
                     let e = acc.entry(cid).or_insert((0, 0.0));
                     e.0 += 1;
                     e.1 += inten;
@@ -302,14 +304,18 @@ pub fn run(p: SearchSeedParams) -> Result<u64> {
                 // library m/z is stored f32; widen once, the value is unchanged
                 let fmz = fmz as f64;
                 let (lo, hi) = mumdia_core::constants::ppm_bounds(fmz, collect_ppm);
-                let s = scan.peaks.partition_point(|pk| pk.mz < lo);
+                // Observed m/z is stored f32 too, and widening is exact, so the
+                // partition point, the walk bound and the ppm deviation are all computed
+                // on the same doubles a widened-at-load peak carried.
+                let s = scan.peaks.partition_point(|pk| (pk.mz as f64) < lo);
                 let (mut bestd, mut bestppm) = (f64::MAX, None);
                 let mut j = s;
-                while j < scan.peaks.len() && scan.peaks[j].mz <= hi {
-                    let d = (scan.peaks[j].mz - fmz).abs();
+                while j < scan.peaks.len() && (scan.peaks[j].mz as f64) <= hi {
+                    let pmz = scan.peaks[j].mz as f64;
+                    let d = (pmz - fmz).abs();
                     if d < bestd {
                         bestd = d;
-                        bestppm = Some(mumdia_core::constants::ppm_diff(scan.peaks[j].mz, fmz));
+                        bestppm = Some(mumdia_core::constants::ppm_diff(pmz, fmz));
                     }
                     j += 1;
                 }
@@ -652,7 +658,7 @@ fn seed_fragindex_windows(
                     let peak_idx = select_peaks(scan, cfg.top_n_peaks);
                     let peaks: Vec<(f64, f32)> = peak_idx
                         .iter()
-                        .map(|&pi| (scan.peaks[pi].mz, scan.peaks[pi].intensity))
+                        .map(|&pi| (scan.peaks[pi].mz as f64, scan.peaks[pi].intensity))
                         .collect();
                     scratch.accumulate(idx, &peaks, lo, hi);
                     // Borrowed, not copied: `touched` can be as long as the candidate
@@ -884,7 +890,6 @@ mod peak_selection_tests {
     fn scan(n: usize) -> Ms2Scan {
         Ms2Scan {
             scan_index: 0,
-            id: "scan=0".into(),
             rt_seconds: 0.0,
             window: IsolationWindow {
                 target_mz: 0.0,
@@ -895,9 +900,8 @@ mod peak_selection_tests {
             },
             peaks: (0..n)
                 .map(|i| Peak {
-                    mz: 100.0 + i as f64,
+                    mz: 100.0 + i as f32,
                     intensity: i as f32,
-                    ion_mobility: None,
                 })
                 .collect(),
         }

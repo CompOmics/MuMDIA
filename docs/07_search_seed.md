@@ -54,9 +54,11 @@ DeepLC fine-tune (`run.rs:237-280`).
 ### Consumed
 
 - **MS2 spectra** (`--ms2`, a `convert` output Parquet), loaded by `load_ms2`
-  into `Vec<Ms2Scan>`. Each `Ms2Scan` carries `scan_index`, `id`, `rt_seconds`,
+  into `Vec<Ms2Scan>`. Each `Ms2Scan` carries `scan_index`, `rt_seconds`,
   an `IsolationWindow { target_mz, lower_mz, upper_mz, im_lower, im_upper }`, and
-  `peaks: Vec<Peak { mz: f64, intensity: f32, ion_mobility }>`.
+  `peaks: Vec<Peak { mz: f32, intensity: f32 }>`. The peak m/z is the artifact's
+  own f32 width; this stage widens it with `as f64` at each comparison, which is
+  exact, exactly as it already did for the library's f32 fragment m/z.
 - **Library** (`--lib-precursors` + `--lib-fragments`), loaded by
   `Library::load` (`index.rs:54`). Provides `cands: Vec<Candidate>`
   (`candidate_id`, `peptidoform`, `charge`, `precursor_mz`, `base_peptide_id`,
@@ -125,7 +127,7 @@ formatted threshold, e.g. `targets_at_q0.01`), `model_identity =
 Entry point: `search_seed::run(SearchSeedParams)` (`search_seed.rs:45-283`).
 
 **1. Load** the library (`Library::load`, `index.rs:54`) and MS2 scans
-(`load_ms2`, `spectra.rs:20`), then log candidate and scan counts
+(`load_ms2`, `spectra.rs:101`), then log candidate and scan counts
 (`search_seed.rs:47-53`). `load_ms2` sorts the returned `Vec<Ms2Scan>` by
 `rt_seconds` ascending (`spectra.rs:95`); this RT ordering is what makes the
 within-group strictly-greater update deterministic (earliest-RT wins a tie). It
@@ -279,7 +281,7 @@ tolerance (falling back to the config value if the file is absent,
 | `ln_factorial` | `fdr.rs:137` | `ln(n!)` via summed logs |
 | `ppm_diff` / `ppm_bounds` | `constants.rs:66` / `:78` | signed ppm (theoretical-relative) and ppm window bounds (query-relative) |
 | `within_ppm` | `constants.rs:92` | min-relative tolerance predicate used by the fragindex match (differs at the edge from the two above) |
-| `load_ms2` | `spectra.rs:20` | reads `spectra_ms2.parquet` into `Vec<Ms2Scan>`, RT-sorted |
+| `load_ms2` | `spectra.rs:101` | reads `spectra_ms2.parquet` into `Vec<Ms2Scan>`, RT-sorted |
 | `percentile` | `calibrate.rs:156` | nearest-rank percentile (used for the tolerance) |
 
 ## Configuration

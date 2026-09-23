@@ -15,11 +15,14 @@ centroid, AIF/all-ion windows, missing precursor) must be resolved at this stage
 because later stages assume the normalized shape.
 
 The MVP is mzML-only and 3D. Ion-mobility columns are therefore absent from the
-artifacts. convert writes no IM columns at all; the in-memory `Peak`/
-`IsolationWindow` types carry `Option` IM fields (`Peak.ion_mobility` at
-`crates/mumdia-core/src/types.rs:12`; `IsolationWindow.im_lower`/`im_upper` at
-`:21`/`:22`), and the read side (`spectra.rs`) fills them with `None`
-(`spectra.rs:74`, `:87-88`).
+artifacts. convert writes no IM columns at all, and the in-memory
+`IsolationWindow` carries `Option` IM bounds that the read side fills with `None`
+(`crates/mumdia-core/src/types.rs:40-41`, `spectra.rs:150-151`).
+
+`Peak` carries no IM field. It used to: a per-peak `Option<f32>` written `None` at
+three sites and read at none, costing 8 of the struct's 24 bytes because an `f32`
+has no niche. A 4D run wants a per-scan `Vec<f32>` parallel to `peaks`, the same
+shape `Ms1Scan` already uses for its own arrays, added when 4D is supported.
 
 ## Files
 
@@ -230,8 +233,8 @@ read side: `spectra::load_ms2` / `load_ms1` sort by `rt_seconds` after loading
 | `artifact::SPECTRA_MS1/_MS2/ISOLATION_WINDOWS/MS2_TO_MS1` | `schema.rs:7-10` | Frozen `(name, version)` schema identifiers, all v1. |
 | `Col` / `write_table` | `table.rs:23` / `table.rs:166` | Typed columns and the SNAPPY Parquet writer; rejects duplicate names (`table.rs:172-180`) and unequal column lengths (`table.rs:181-191`). |
 | `ArtifactReport` | `report.rs:11` | The report struct written next to each artifact. |
-| `load_ms2` / `load_ms1` | `spectra.rs:20` / `spectra.rs:100` | Read-back into `Ms2Scan` / `Ms1Scan`, RT-sorted, m/z widened to f64; per-scan peak count is `mf.len().min(iff.len())` (`spectra.rs:68`), tolerant of an m/z vs intensity length mismatch. |
-| `Ms1Scan` / `Ms2Scan` | `spectra.rs:12` / `types.rs:55` | Read-back structs. `Ms1Scan` (scan_index, rt_seconds, mz, intensity) is defined in `spectra.rs`, not `types.rs`; `Ms2Scan` (adds `id`, `window`, `peaks`) is in `types.rs`. |
+| `load_ms2` / `load_ms1` | `spectra.rs:101` / `spectra.rs:175` | Read-back into `Ms2Scan` / `Ms1Scan`, RT-sorted; m/z is kept at the artifact's f32 width in both and widened by the consumers at the comparison. Per-scan peak count is `mf.len().min(iff.len())` (`spectra.rs:133`), tolerant of an m/z vs intensity length mismatch. Neither loader reads the `id` column. |
+| `Ms1Scan` / `Ms2Scan` | `spectra.rs:23` / `types.rs:78` | Read-back structs. `Ms1Scan` (scan_index, rt_seconds, mz, intensity) is defined in `spectra.rs`, not `types.rs`; `Ms2Scan` (adds `window`, `peaks`) is in `types.rs`. |
 
 ## Configuration
 
@@ -581,9 +584,13 @@ arguments verbatim; it is an escape hatch, not a tuning surface.
   point.
 - **Ion mobility / 4D (diaPASEF).** The artifact schemas here are 3D. Adding IM
   means new nullable columns on `spectra_ms2` (and the isolation-window IM bounds
-  already modeled as `Option` in `types.rs:21`), plus populating `Peak.ion_mobility`
-  on the read side. Bump the affected schema versions in `schema.rs` when columns
-  change, since the version guards downstream model/schema matching.
+  already modeled as `Option` in `types.rs:40`), plus a per-scan IM array on the
+  read side: give `Ms2Scan` a `Vec<f32>` parallel to `peaks`, as `Ms1Scan` already
+  does for its own arrays. Do not put it back on `Peak`: one `Option<f32>` per MS2
+  point is 8 bytes on the engine's largest resident array, 1.28 GiB on a HYE Astral
+  run, and the previous version of that field was written `None` and never read.
+  Bump the affected schema versions in `schema.rs` when columns change, since the
+  version guards downstream model/schema matching.
 - **Change centroiding.** Edit `centroid` (`convert.rs:19`). If the choice should
   be user-selectable, add a config field and strategy enum in `mumdia-core`
   (per the project convention that every algorithmic choice is a typed config

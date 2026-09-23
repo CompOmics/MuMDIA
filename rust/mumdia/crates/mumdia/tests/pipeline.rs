@@ -520,7 +520,6 @@ fn assert_scans_identical(after: &[Ms2Scan], fresh: &[Ms2Scan]) {
     assert_eq!(after.len(), fresh.len(), "scan count changed");
     for (a, b) in after.iter().zip(fresh) {
         assert_eq!(a.scan_index, b.scan_index);
-        assert_eq!(a.id, b.id);
         assert_eq!(a.rt_seconds.to_bits(), b.rt_seconds.to_bits());
         assert_eq!(a.window, b.window);
         assert_eq!(a.peaks, b.peaks, "peaks of scan {} changed", a.scan_index);

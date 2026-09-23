@@ -136,7 +136,10 @@ hand the following band, and extract, capped spectra; a 300-peak cap costs 60% o
 peptides on a 50-window Orbitrap DIA run (`docs/04_convert.md`). The borrow checker refuses
 both today, because the scans arrive as `&[Ms2Scan]`; `run_groups::scan_fingerprint` covers
 what it does not (interior mutability, `unsafe`, and the second decode differing from the
-first) with a `debug_assert` that costs nothing in a release build.
+first) with a `debug_assert` that costs nothing in a release build. The fingerprint mixes
+every field the stages read, so it followed `Ms2Scan` when the `id` was deleted and when
+`Peak.mz` was narrowed to `f32`; it is an internal digest compared between two decodes of
+one artifact, never a stored value, so its numeric value is free to change.
 
 What it removes, for `m` bands with `p` of them in flight:
 
@@ -156,15 +159,19 @@ byte-identical to the pre-change binary's under both `calibration: global` and
 `calibration: per_group`, which is the mode in which the bands apply different mass offsets
 to the one shared buffer.
 
-At production scale one run's MS2 is about 1 GB decoded (301,127 scans on the immuno data,
-293,271 on the Astral data), and 63 bands were 126 decodes of it.
+At production scale one run's MS2 was about 1 GB decoded (301,127 scans on the immuno data,
+293,271 on the Astral data), and 63 bands were 126 decodes of it. Since `Peak` was narrowed
+to two `f32` and `Ms2Scan.id` deleted it is about a third of that: measured on
+`LFQ_Orbitrap_AIF_Ecoli_01` (465,806 scans, 41,293,465 MS2 points, the engine's own
+`mem: ms2 scans` report), 0.968 GiB before and 0.342 GiB after.
 
 It also removes allocations, which is the failure the banding is up against: the engine
 dies at the kernel's per-process mapping limit (1,048,576; the live grouped run peaked at
-556,573 mappings and 244 GB). A decoded MS2 scan is two heap blocks, its `Vec<Peak>` and
-its id `String`, so one copy of a 301,127-scan run is about 602,000 blocks and eight
-concurrent copies about 4.8 million. How many of those become distinct mappings depends on
-the allocator's size classes and is not measured here; the block count is exact.
+556,573 mappings and 244 GB). A decoded MS2 scan used to be two heap blocks, its
+`Vec<Peak>` and its id `String`, so one copy of a 301,127-scan run was about 602,000 blocks
+and eight concurrent copies about 4.8 million. Deleting the id halves that to one block per
+scan. How many of those become distinct mappings depends on the allocator's size classes
+and is not measured here; the block count is exact.
 
 `ci/smoke.sh` runs a grouped arm (`window_groups: 3, parallel: 2, calibration: per_group`)
 so that this path, and `run_groups` generally, has regression cover: without it every

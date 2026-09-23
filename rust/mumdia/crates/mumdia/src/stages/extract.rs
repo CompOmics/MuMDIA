@@ -815,7 +815,10 @@ fn demix_solve_scan(
     let mut rows: Vec<(f64, Vec<(u32, f32)>)> = Vec::new();
     let mut claimants: Vec<(u32, u16, f32)> = Vec::new();
     for peak in &scan.peaks {
-        let q_mz = peak.mz / mass_off.factor_at(peak.mz);
+        // Peaks are stored at the artifact's f32 width; widen once per peak. Exact, so
+        // `mz` is the value the peak used to carry in an f64 field.
+        let mz = peak.mz as f64;
+        let q_mz = mz / mass_off.factor_at(mz);
         claimants.clear();
         {
             let mut push = |c: u32, frag: u16, pi: f32| {
@@ -1384,12 +1387,13 @@ fn accumulate_groups(
                 let rt = scan.rt_seconds;
                 setup.clear();
                 setup.extend(scan.peaks.iter().map(|p| {
-                    let q = p.mz / mass_off.factor_at(p.mz);
+                    let mz = p.mz as f64;
+                    let q = mz / mass_off.factor_at(mz);
                     (q, idx.bin_of(q))
                 }));
                 for (peak, &(q_mz, bin)) in scan.peaks.iter().zip(&setup) {
                     let inten = peak.intensity;
-                    let obs_mz = peak.mz;
+                    let obs_mz = peak.mz as f64;
                     claimants.clear();
                     idx.probe_peak_win_binned(&mut nw, q_mz, bin, |cid, _pmz, pint, frag| {
                         let c = cid as usize;
@@ -1617,8 +1621,8 @@ fn extract_twopass_windows(
                 let rt = scan.rt_seconds;
                 for peak in &scan.peaks {
                     let inten = peak.intensity;
-                    let q_mz = peak.mz / mass_off.factor_at(peak.mz);
-                    let obs_mz = peak.mz;
+                    let obs_mz = peak.mz as f64;
+                    let q_mz = obs_mz / mass_off.factor_at(obs_mz);
                     claimants.clear();
                     {
                         let mut push = |cid: u32, frag: u16, pi: f32| {
@@ -1671,8 +1675,8 @@ fn extract_twopass_windows(
                     let rtb = rt.to_bits();
                     for peak in &scan.peaks {
                         let inten = peak.intensity;
-                        let q_mz = peak.mz / mass_off.factor_at(peak.mz);
-                        let obs_mz = peak.mz;
+                        let obs_mz = peak.mz as f64;
+                        let q_mz = obs_mz / mass_off.factor_at(obs_mz);
                         claimants.clear();
                         {
                             let mut push = |cid: u32, frag: u16, pi: f32| {
@@ -1743,7 +1747,8 @@ fn extract_twopass_windows(
                         std::collections::BTreeSet::new();
                     let mut prows: Vec<DemixRow> = Vec::new();
                     for peak in &scan.peaks {
-                        let q_mz = peak.mz / mass_off.factor_at(peak.mz);
+                        let obs_mz = peak.mz as f64;
+                        let q_mz = obs_mz / mass_off.factor_at(obs_mz);
                         claimants.clear();
                         {
                             let mut push = |cid: u32, frag: u16, pi: f32| {
@@ -1766,7 +1771,7 @@ fn extract_twopass_windows(
                         for &(cid, _, _) in &claimants {
                             cand.insert(cid);
                         }
-                        prows.push((peak.intensity, peak.mz, claimants.clone()));
+                        prows.push((peak.intensity, obs_mz, claimants.clone()));
                     }
                     if prows.is_empty() {
                         continue;
@@ -1854,7 +1859,8 @@ fn extract_twopass_windows(
                     // both keep signal at a shared peak.
                     let mut prows: Vec<DemixRow> = Vec::new();
                     for peak in &scan.peaks {
-                        let q_mz = peak.mz / mass_off.factor_at(peak.mz);
+                        let obs_mz = peak.mz as f64;
+                        let q_mz = obs_mz / mass_off.factor_at(obs_mz);
                         claimants.clear();
                         {
                             let mut push = |cid: u32, frag: u16, pi: f32| {
@@ -1874,7 +1880,7 @@ fn extract_twopass_windows(
                         if claimants.is_empty() {
                             continue;
                         }
-                        prows.push((peak.intensity, peak.mz, claimants.clone()));
+                        prows.push((peak.intensity, obs_mz, claimants.clone()));
                     }
                     if prows.is_empty() {
                         continue;
@@ -1925,8 +1931,8 @@ fn extract_twopass_windows(
                 }
                 for peak in &scan.peaks {
                     let inten = peak.intensity;
-                    let q_mz = peak.mz / mass_off.factor_at(peak.mz);
-                    let obs_mz = peak.mz;
+                    let obs_mz = peak.mz as f64;
+                    let q_mz = obs_mz / mass_off.factor_at(obs_mz);
                     claimants.clear();
                     {
                         let mut push = |cid: u32, frag: u16, pi: f32| {
@@ -2372,7 +2378,8 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
                 let rt = scan.rt_seconds;
                 for peak in &scan.peaks {
                     let inten = peak.intensity;
-                    let q_mz = peak.mz / mass_off.factor_at(peak.mz);
+                    let obs_mz = peak.mz as f64;
+                    let q_mz = obs_mz / mass_off.factor_at(obs_mz);
                     // Collect every co-isolated, in-RT-window candidate matching this
                     // peak, then apportion per the claim strategy. In wide DIA one peak
                     // matches many candidates (~98% of fragments collide).
@@ -2395,7 +2402,6 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
                     if claimants.is_empty() {
                         continue;
                     }
-                    let obs_mz = peak.mz;
                     match p.cfg.peak_claim {
                         PeakClaim::WinnerPredictedIntensity => {
                             let mut best = 0usize;
@@ -4031,14 +4037,12 @@ mod accumulate_tests {
         (0..n_scans)
             .map(|si| Ms2Scan {
                 scan_index: (base + si) as u32,
-                id: format!("s{}", base + si),
                 rt_seconds: 100.0 + (base + si) as f64,
                 window,
                 peaks: (0..97)
                     .map(|k| Peak {
-                        mz: 300.0 + k as f64 * 1.37,
+                        mz: 300.0 + k as f32 * 1.37,
                         intensity: 10.0 + (si + k) as f32,
-                        ion_mobility: None,
                     })
                     .collect(),
             })

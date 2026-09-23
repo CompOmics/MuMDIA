@@ -49,6 +49,14 @@ Per-buffer payload from `mumdia::memlog` on the instrumented build (`1d1ed7f`), 
 | features `fmap` value matrix | 7.51 |
 | rescore feature matrix | 4.05 (features 3.75 + metadata 0.30) |
 
+The "MS2 scans" row predates the `Peak` narrowing. `Peak` was 24 bytes there
+(`mz` f64 widened at load, `intensity` f32, and a dead `ion_mobility: Option<f32>`
+costing a full word); it is now two `f32`, and `Ms2Scan` lost its unread `id`
+`String`, so the same buffer is about a third of that figure. Measured with the
+engine's own `mem: ms2 scans` report on `LFQ_Orbitrap_AIF_Ecoli_01` (465,806 scans,
+41,293,465 MS2 points): 0.968 GiB before, 0.342 GiB after. The `8P` in the model
+below is now what the code does; it was `24P` when the table above was taken.
+
 The incremental writer removed extract's whole-run trace residency as intended, and the
 peak moved to features, which re-materialised the traces the writer had just streamed out.
 The gap between the 70.2 GiB of named payload and the 86.6 GiB sampled peak is Arrow
@@ -209,8 +217,8 @@ any PTM search and for the augmented HYE libraries.
 
 ### 1.3 search-seed (`stages/search_seed.rs:55`)
 
-`load_ms2` materialises every MS2 scan (`spectra.rs:20`, f32 m/z and intensity,
-one heap allocation per array per scan) plus the library. Hits accumulate per
+`load_ms2` materialises every MS2 scan (`spectra.rs:101`, f32 m/z and intensity,
+one heap allocation per scan) plus the library. Hits accumulate per
 scan and are reduced to the seed table. Resident: library steady state plus `8P`
 plus hit buffers. Library-dominated.
 
