@@ -400,9 +400,10 @@ fine-tuning also is not guaranteed deterministic.
   backend. Two feature matrices, one width: the Python worker's is
   `n_psms x n_features x 4` bytes (f32), and the Rust `FeatureMatrix` that
   `rescore` builds (`rescoring.rs`) is flat f32 as well, so the same
-  `n_psms x n_features x 4`. `native_tda` additionally runs all folds in
-  parallel, each holding an owned standardised copy of its training slice, so its
-  peak is roughly `(1 + folds)x` the matrix. `rescore.max_feature_matrix_gib` is
+  `n_psms x n_features x 4`. `native_tda` fits its folds one at a time and holds
+  one standardised copy of the training slice, so its peak is
+  `1 + (folds - 1) / folds` times the matrix: 1.67x at the default 3 folds, 1.80x
+  at 5, and never above 2x. `rescore.max_feature_matrix_gib` is
   checked against that layout, from the parquet footers and the selected feature
   count, before the allocation (docs/29 #11), so exceeding the ceiling is an error
   at startup rather than an OS kill hours in.
