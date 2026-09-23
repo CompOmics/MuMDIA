@@ -31,6 +31,8 @@ clap.workspace = true
 arrow.workspace = true
 parquet.workspace = true
 mzdata.workspace = true
+# Feature selection only, never imported: see the comment on the workspace dependency.
+mzdata-bindata.workspace = true
 mimalloc.workspace = true
 # Heap profiler, off by default. `--features dhat-heap` swaps the global allocator for
 # dhat's and writes dhat-heap.json (per-call-site bytes and the peak), which is the only

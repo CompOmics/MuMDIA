@@ -3588,6 +3588,25 @@
     },
     {
       "type": "library",
+      "bom-ref": "pkg:cargo/zlib-rs@0.6.8",
+      "name": "zlib-rs",
+      "version": "0.6.8",
+      "purl": "pkg:cargo/zlib-rs@0.6.8",
+      "description": "A memory-safe zlib implementation written in rust",
+      "licenses": [
+        {
+          "expression": "Zlib"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/trifectatechfoundation/zlib-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "bom-ref": "pkg:cargo/zmij@1.0.21",
       "name": "zmij",
       "version": "1.0.21",
@@ -4144,7 +4163,8 @@
       "ref": "pkg:cargo/flate2@1.1.9",
       "dependsOn": [
         "pkg:cargo/crc32fast@1.5.0",
-        "pkg:cargo/miniz_oxide@0.8.9"
+        "pkg:cargo/miniz_oxide@0.8.9",
+        "pkg:cargo/zlib-rs@0.6.8"
       ]
     },
     {
@@ -4389,6 +4409,7 @@
         "pkg:cargo/mimalloc@0.1.52",
         "pkg:cargo/mumdia-core@0.4.0",
         "pkg:cargo/mumdia-io@0.4.0",
+        "pkg:cargo/mzdata-bindata@0.66.6",
         "pkg:cargo/mzdata@0.66.6",
         "pkg:cargo/parquet@59.3.0",
         "pkg:cargo/rayon@1.12.0",
@@ -4942,6 +4963,10 @@
       "dependsOn": [
         "pkg:cargo/zerocopy-derive@0.8.52"
       ]
+    },
+    {
+      "ref": "pkg:cargo/zlib-rs@0.6.8",
+      "dependsOn": []
     },
     {
       "ref": "pkg:cargo/zmij@1.0.21",
