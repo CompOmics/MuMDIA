@@ -118,13 +118,9 @@ fn scan_fingerprint(ms2: &[Ms2Scan], ms1: &[Ms1Scan]) -> u64 {
         h = mix(h, s.rt_seconds.to_bits());
         h = mix(h, s.window.lower_mz.to_bits());
         h = mix(h, s.window.upper_mz.to_bits());
-        h = mix(h, s.id.len() as u64);
-        for b in s.id.as_bytes() {
-            h = mix(h, *b as u64);
-        }
         h = mix(h, s.peaks.len() as u64);
         for p in &s.peaks {
-            h = mix(h, p.mz.to_bits());
+            h = mix(h, p.mz.to_bits() as u64);
             h = mix(h, p.intensity.to_bits() as u64);
         }
     }
@@ -310,6 +306,10 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
                 config_hash: ch,
                 fragment_offset: Some(first as u32),
                 ms2_scans: Some(&ms2_scans),
+                // The band writes its calibrant deviations so `seed-pool` can fit the
+                // mass calibration once over the whole run rather than average the
+                // bands' fitted scalars (see `crate::masscal`).
+                emit_calibrants: true,
             })?;
             let rec = vec![record_artifact(
                 &format!("{}[g{:02}]", artifact::SEED_PSMS.0, b.index),
@@ -370,12 +370,20 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
         .collect();
     let masscals: Vec<String> = bands
         .iter()
-        .map(|b| format!("{}.masscal.json", b.seed))
+        .map(|b| crate::masscal::json_path(&b.seed))
+        .collect();
+    // The bands' calibrant deviations, so the fragment tolerance is fitted once over the
+    // whole run rather than averaged from the bands' own p95s on their own q.
+    let calibrants: Vec<String> = bands
+        .iter()
+        .map(|b| crate::masscal::calibrants_path(&b.seed))
         .collect();
     info!(stage = %"seed-pool", "run: stage start");
     let n = seed_pool::run(seed_pool::SeedPoolParams {
         seeds: &seeds,
         masscals: &masscals,
+        calibrants: &calibrants,
+        cfg: &cfg.search_seed,
         out: &pooled_seed,
     })?;
     record_opt(

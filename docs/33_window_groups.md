@@ -136,7 +136,10 @@ hand the following band, and extract, capped spectra; a 300-peak cap costs 60% o
 peptides on a 50-window Orbitrap DIA run (`docs/04_convert.md`). The borrow checker refuses
 both today, because the scans arrive as `&[Ms2Scan]`; `run_groups::scan_fingerprint` covers
 what it does not (interior mutability, `unsafe`, and the second decode differing from the
-first) with a `debug_assert` that costs nothing in a release build.
+first) with a `debug_assert` that costs nothing in a release build. The fingerprint mixes
+every field the stages read, so it followed `Ms2Scan` when the `id` was deleted and when
+`Peak.mz` was narrowed to `f32`; it is an internal digest compared between two decodes of
+one artifact, never a stored value, so its numeric value is free to change.
 
 What it removes, for `m` bands with `p` of them in flight:
 
@@ -156,15 +159,19 @@ byte-identical to the pre-change binary's under both `calibration: global` and
 `calibration: per_group`, which is the mode in which the bands apply different mass offsets
 to the one shared buffer.
 
-At production scale one run's MS2 is about 1 GB decoded (301,127 scans on the immuno data,
-293,271 on the Astral data), and 63 bands were 126 decodes of it.
+At production scale one run's MS2 was about 1 GB decoded (301,127 scans on the immuno data,
+293,271 on the Astral data), and 63 bands were 126 decodes of it. Since `Peak` was narrowed
+to two `f32` and `Ms2Scan.id` deleted it is about a third of that: measured on
+`LFQ_Orbitrap_AIF_Ecoli_01` (465,806 scans, 41,293,465 MS2 points, the engine's own
+`mem: ms2 scans` report), 0.968 GiB before and 0.342 GiB after.
 
 It also removes allocations, which is the failure the banding is up against: the engine
 dies at the kernel's per-process mapping limit (1,048,576; the live grouped run peaked at
-556,573 mappings and 244 GB). A decoded MS2 scan is two heap blocks, its `Vec<Peak>` and
-its id `String`, so one copy of a 301,127-scan run is about 602,000 blocks and eight
-concurrent copies about 4.8 million. How many of those become distinct mappings depends on
-the allocator's size classes and is not measured here; the block count is exact.
+556,573 mappings and 244 GB). A decoded MS2 scan used to be two heap blocks, its
+`Vec<Peak>` and its id `String`, so one copy of a 301,127-scan run was about 602,000 blocks
+and eight concurrent copies about 4.8 million. Deleting the id halves that to one block per
+scan. How many of those become distinct mappings depends on the allocator's size classes
+and is not measured here; the block count is exact.
 
 `ci/smoke.sh` runs a grouped arm (`window_groups: 3, parallel: 2, calibration: per_group`)
 so that this path, and `run_groups` generally, has regression cover: without it every
@@ -181,14 +188,75 @@ ids are local.
 `seed-pool` (`stages/seed_pool.rs`) reads every band's seed, maps the ids to library-wide
 ones, keeps the higher-scoring row where two bands searched the same candidate, re-estimates
 `spectrum_q` over the union with the seed's own target-decoy kernel (`fdr::target_decoy_q`),
-and writes the run-level `seed_psms.parquet`. Beside it goes `seed_psms.parquet.masscal.json`:
-the bands' scalar ppm offsets and learned tolerances combined by calibrant count (`n_dev`).
-The optional m/z-dependent grids are not combined, because they need the per-fragment
-deviations the seed does not keep; extract then applies the scalar offset. A band with no
-calibrants wrote the configured tolerance in place of a learned one (search-seed's failure
-branch), and when no band calibrated the pool keeps that tolerance rather than averaging
-nothing into a zero, with a warning. It also writes each band's view of the pooled seed,
-`groups/gNN/seed_psms_pooled.parquet`: the band's own rows, local ids, pooled q.
+and writes the run-level `seed_psms.parquet`. Beside it goes
+`seed_psms.parquet.masscal.json`, the run's fragment mass calibration, fitted once over the
+bands' calibrant deviations (next subsection). It also writes each band's view of the
+pooled seed, `groups/gNN/seed_psms_pooled.parquet`: the band's own rows, local ids,
+pooled q.
+
+### 4a. The mass calibration is fitted once, not averaged
+
+The tolerance `search-seed` learns is `1.5 * p95(|dev - median|)` over the ppm deviations of
+the matched fragments of its confident target PSMs (`docs/07_search_seed.md`). Combining the
+bands' fitted SCALARS is not that estimator, and it is systematically wider. Measured on the
+six-file HYE Astral benchmark, the same library and the same retention-time model, 100 bands
+against none:
+
+| | unbanded | 100 bands, scalars combined |
+|---|---|---|
+| `frag_ppm_offset` | -1.8486 | -1.8834 |
+| `frag_ppm_sigma` | 8.452 | 11.400 |
+| `n_dev` | 181,196 | 200,257 |
+| `ppm_residual_mad` | 0.907 | 1.035 |
+| candidates accepted by extract | 4,986,153 | 6,609,984 |
+| peptides at 1% | 113,860 | 110,006 |
+| precursors at 1% | 126,436 | 121,966 |
+
+The offsets agree and the tolerance is 35% wider, extract then accepts 33% more candidates
+and the run returns 3.4% fewer peptides. Causal rather than correlated: one band extracted
+twice, identical in every input but the calibration file it was handed, accepted 12,414
+candidates at 11.40 ppm and 8,791 at 8.45; and an unbanded control on the same adapted
+library returned the unbanded arm's 113,860 peptides exactly.
+
+Two things compound. A p95 estimated on one band's ~2,000 deviations has a heavier tail than
+the p95 of the union, and a mean of those p95s does not recover it. And each band selects
+its calibrants on its OWN `spectrum_q`, which is not the pooled one: on that benchmark it is
+looser (106,088 band-confident PSMs against 97,584 pooled).
+
+So the bands write their deviations and the pool fits them, exactly as the retention-time
+calibration already uses the pooled anchors under `groups.calibration = global`:
+
+- `search-seed`, asked for it (`SearchSeedParams::emit_calibrants`, set only by the grouped
+  path), writes `<seed>.masscal.parquet` beside the masscal: `candidate_id` (LIBRARY-WIDE,
+  the band's local id plus its fragment offset), `scan_index`, `frag_mz` and `ppm`, one row
+  per matched fragment. 16 B per deviation, a few MB for a whole run.
+- `seed-pool` reads them, keeps the deviations whose PSM the POOLED q accepts at
+  `search_seed.fdr_seed` (and whose scan is the one the pool kept, so an overlap candidate
+  contributes one PSM's fragments as an ungrouped seed would), and fits
+  `masscal::MassCal::fit_from` -- the same function `search-seed` calls -- once.
+  `two_pass_mass_cal` and the `mass_cal_loess` grid work on this path, because both read the
+  deviations rather than a scalar.
+- The band's own `<seed>.masscal.json` is unchanged: still fitted on that band's confident
+  targets alone, and still what `groups.calibration = per_group` extracts with.
+
+The band's q is not the pooled q in either direction, so the sidecar carries more than the
+band's own selection: the band's best-scoring targets down to
+`masscal::CALIBRANT_OFFER_PSMS` (2,000) are offered whatever its own q says, and the pooled
+q decides. That matters where the band q is STRICTER, which is the `1/T` case above: on the
+CI fixture at three bands, every band's own q rejects every one of its targets, so a
+strictly q-selected sidecar would be empty in all three. With the offer, the three bands
+contribute 437, 401 and 230 deviations, the pool selects all 1,068 of them and fits
+`frag_tol_ppm` 5.0 at offset 0.0 -- the same calibration, to the digit, that the ungrouped
+search of the same spectra produces. Before this the same run calibrated nothing and
+extracted at the configured 20 ppm.
+
+`masscal.json` gains `masscal_source`, which reads `pooled_deviations` or `band_scalars`. A
+band directory seeded before the sidecar existed has none, and the pool then combines the
+scalars as it always did, naming the missing groups in a warning; if `mass_cal_loess` is set
+it warns separately that the grid cannot be recovered from scalars. A band with no
+calibrants wrote the configured tolerance in place of a learned one, and when the pooled fit
+has fewer than `masscal::MIN_CALIBRANTS` deviations the pool keeps that tolerance rather
+than fitting a percentile of a handful of points, with a warning.
 
 `groups.calibration` decides which anchors each band's calibration sees:
 

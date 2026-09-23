@@ -815,7 +815,10 @@ fn demix_solve_scan(
     let mut rows: Vec<(f64, Vec<(u32, f32)>)> = Vec::new();
     let mut claimants: Vec<(u32, u16, f32)> = Vec::new();
     for peak in &scan.peaks {
-        let q_mz = peak.mz / mass_off.factor_at(peak.mz);
+        // Peaks are stored at the artifact's f32 width; widen once per peak. Exact, so
+        // `mz` is the value the peak used to carry in an f64 field.
+        let mz = peak.mz as f64;
+        let q_mz = mz / mass_off.factor_at(mz);
         claimants.clear();
         {
             let mut push = |c: u32, frag: u16, pi: f32| {
@@ -1301,15 +1304,40 @@ fn accumulate_groups(
             }
         }
     }
-    // Note on `peak.mz / mass_off.factor_at(peak.mz)` below: it is recomputed once per
-    // task for every peak of the window, so the tasks of one window repeat it. Hoisting
-    // it into a per-window buffer was tried and reverted: it is 8 bytes per peak of every
-    // window in flight, which measured +200 MB of peak RSS on the AIF fixture (and would
-    // be a third of a gigabyte with the whole run in one batch, which is the shape a
-    // grouped band search has), for no measurable time -- the extract compute phase was
-    // 2.12-2.16 s with and without it over five runs. The other half of that hoist, the
-    // `ln()` bin computation inside `probe_peak_win`, needs a `FragIndex` entry point
-    // taking a precomputed bin and cannot be done from this file at all.
+    // Note on the per-peak setup `(peak.mz / mass_off.factor_at(peak.mz), bin_of(q_mz))`:
+    // the tasks of one window each recompute it for every peak of the window, so a window
+    // split into `t` tasks computes it `t` times. Hoisting it into a PER-WINDOW buffer,
+    // shared by those tasks, has now been tried twice and reverted twice.
+    //
+    // The m/z half was reverted first: 8 B/peak, +200 MB of peak RSS on the AIF fixture
+    // (317 MB with the whole run in one batch), no measurable time.
+    //
+    // The `ln()` bin half was reverted in the same place for a different reason. The
+    // buffer has to be filled before the pool starts, so it converts per-task work that
+    // was SPREAD ACROSS THE POOL into serial work on one thread, and the default shape
+    // does not have enough tasks per window to pay that back: `tasks_per_window` is
+    // `(2 * threads).div_ceil(groups.len())`, which is 4 at 32 threads and the default
+    // 16 windows in flight, so the fill costs one pass per peak to save three thirty-
+    // seconds of one; break-even needs `tasks_per_window >= threads`, i.e. a batch of one
+    // or two windows. Measured on `tests/bench_fragindex.rs` `bench_wall`, which runs this
+    // task shape over rayon (32 threads, min of 9, two independent passes): against the
+    // in-probe baseline the serial fill is +8.5 / +22.1% on the default shape and
+    // +38.9 / +30.0% with smaller windows (1-2 tasks each), where the scratch below is
+    // -11.7 / -6.4% and -15.1 / -17.9%. Only a batch of one wide window pays the fill
+    // back (-23.7 / -19.0%, against the scratch's -17.4 / -18.6%). A fill spread over the
+    // POOL removes the regression and is still not worth it: against the scratch it is
+    // -5.6 / -2.3% on the default shape and +5.7 / +3.2% -- a loss -- on the second, for
+    // 4 B/peak of every window in flight, about half of what got the m/z hoist reverted,
+    // in extract, the tallest stage.
+    //
+    // End to end, `mumdia extract` on the AIF run (152 windows, 1.69M candidates,
+    // 465,806 scans, 32 threads, three binaries interleaved over ~24 reps each, timing
+    // the accumulation phase alone): against the in-probe baseline's 3,274 ms min /
+    // 3,360 mean-of-3-fastest / 4,233 median, the serial-fill buffer is +14.0 / +13.2 /
+    // +9.3% and the scratch below -0.3 / -1.9 / -4.5%. The regression is the size the
+    // model predicts: one serial pass over the in-flight peaks, 39.6M x 5.4 ns = 430 ms
+    // of a 3.3 s phase. Byte-identical artifacts in all 69 runs. See docs/09_extract.md.
+
     //
     // The memory-cheap version of that hoist -- writing the corrected value back into
     // `scan.peaks` instead of into a side buffer -- is now FORBIDDEN, not merely
@@ -1333,15 +1361,41 @@ fn accumulate_groups(
             // reprobes the same bins, so cache each bin's narrowed posting range once
             // instead of binary-searching it per peak.
             let mut nw = idx.window_narrow(lo, hi);
+            // One scan's `(q_mz, bin)`, refilled per scan and reused. A few KB at 300-2000
+            // peaks a scan, task-local, so it is not the per-window buffer above: nothing
+            // is shared, nothing is filled before the pool starts, and no thread waits.
+            //
+            // It still pays, with exactly the same number of `ln()` calls the probe made
+            // per peak, because a separate pass takes the `ln()` off the dependency chain
+            // that the bin-cache load and then the posting loads hang from. Measured over
+            // rayon at this task shape (`tests/bench_fragindex.rs` `bench_wall`, 32
+            // threads, min of 9, two independent passes): -11.7 / -6.4% on the default
+            // shape, -15.1 / -17.9% with smaller windows, -17.4 / -18.6% with one wide
+            // window in the batch. Single thread, sorted production-shaped peaks
+            // (`bench_probe`): -9.1 / -12.7 / -6.7% for a narrow / medium / wide
+            // candidate window.
+            //
+            // It carries `q_mz` and not just the bin so `factor_at` still runs ONCE per
+            // peak. That is free here and is not free for the caller: under
+            // `search_seed.mass_cal_loess` the offset is a ~74-point grid and `factor_at`
+            // is a binary search plus an interpolation, measured 8.3 ns/peak against
+            // 0.725 for the scalar default, and a bin-only scratch (which recomputes
+            // `q_mz` in the peak loop) turned that arm from -1.7% into +5.6%.
+            let mut setup: Vec<(f64, u32)> = Vec::new();
             for &si in ids {
                 let scan = &scans[si];
                 let rt = scan.rt_seconds;
-                for peak in &scan.peaks {
+                setup.clear();
+                setup.extend(scan.peaks.iter().map(|p| {
+                    let mz = p.mz as f64;
+                    let q = mz / mass_off.factor_at(mz);
+                    (q, idx.bin_of(q))
+                }));
+                for (peak, &(q_mz, bin)) in scan.peaks.iter().zip(&setup) {
                     let inten = peak.intensity;
-                    let q_mz = peak.mz / mass_off.factor_at(peak.mz);
-                    let obs_mz = peak.mz;
+                    let obs_mz = peak.mz as f64;
                     claimants.clear();
-                    idx.probe_peak_win(&mut nw, q_mz, |cid, _pmz, pint, frag| {
+                    idx.probe_peak_win_binned(&mut nw, q_mz, bin, |cid, _pmz, pint, frag| {
                         let c = cid as usize;
                         if rt < rt_lo[c] || rt > rt_hi[c] {
                             return;
@@ -1567,8 +1621,8 @@ fn extract_twopass_windows(
                 let rt = scan.rt_seconds;
                 for peak in &scan.peaks {
                     let inten = peak.intensity;
-                    let q_mz = peak.mz / mass_off.factor_at(peak.mz);
-                    let obs_mz = peak.mz;
+                    let obs_mz = peak.mz as f64;
+                    let q_mz = obs_mz / mass_off.factor_at(obs_mz);
                     claimants.clear();
                     {
                         let mut push = |cid: u32, frag: u16, pi: f32| {
@@ -1621,8 +1675,8 @@ fn extract_twopass_windows(
                     let rtb = rt.to_bits();
                     for peak in &scan.peaks {
                         let inten = peak.intensity;
-                        let q_mz = peak.mz / mass_off.factor_at(peak.mz);
-                        let obs_mz = peak.mz;
+                        let obs_mz = peak.mz as f64;
+                        let q_mz = obs_mz / mass_off.factor_at(obs_mz);
                         claimants.clear();
                         {
                             let mut push = |cid: u32, frag: u16, pi: f32| {
@@ -1693,7 +1747,8 @@ fn extract_twopass_windows(
                         std::collections::BTreeSet::new();
                     let mut prows: Vec<DemixRow> = Vec::new();
                     for peak in &scan.peaks {
-                        let q_mz = peak.mz / mass_off.factor_at(peak.mz);
+                        let obs_mz = peak.mz as f64;
+                        let q_mz = obs_mz / mass_off.factor_at(obs_mz);
                         claimants.clear();
                         {
                             let mut push = |cid: u32, frag: u16, pi: f32| {
@@ -1716,7 +1771,7 @@ fn extract_twopass_windows(
                         for &(cid, _, _) in &claimants {
                             cand.insert(cid);
                         }
-                        prows.push((peak.intensity, peak.mz, claimants.clone()));
+                        prows.push((peak.intensity, obs_mz, claimants.clone()));
                     }
                     if prows.is_empty() {
                         continue;
@@ -1804,7 +1859,8 @@ fn extract_twopass_windows(
                     // both keep signal at a shared peak.
                     let mut prows: Vec<DemixRow> = Vec::new();
                     for peak in &scan.peaks {
-                        let q_mz = peak.mz / mass_off.factor_at(peak.mz);
+                        let obs_mz = peak.mz as f64;
+                        let q_mz = obs_mz / mass_off.factor_at(obs_mz);
                         claimants.clear();
                         {
                             let mut push = |cid: u32, frag: u16, pi: f32| {
@@ -1824,7 +1880,7 @@ fn extract_twopass_windows(
                         if claimants.is_empty() {
                             continue;
                         }
-                        prows.push((peak.intensity, peak.mz, claimants.clone()));
+                        prows.push((peak.intensity, obs_mz, claimants.clone()));
                     }
                     if prows.is_empty() {
                         continue;
@@ -1875,8 +1931,8 @@ fn extract_twopass_windows(
                 }
                 for peak in &scan.peaks {
                     let inten = peak.intensity;
-                    let q_mz = peak.mz / mass_off.factor_at(peak.mz);
-                    let obs_mz = peak.mz;
+                    let obs_mz = peak.mz as f64;
+                    let q_mz = obs_mz / mass_off.factor_at(obs_mz);
                     claimants.clear();
                     {
                         let mut push = |cid: u32, frag: u16, pi: f32| {
@@ -2322,7 +2378,8 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
                 let rt = scan.rt_seconds;
                 for peak in &scan.peaks {
                     let inten = peak.intensity;
-                    let q_mz = peak.mz / mass_off.factor_at(peak.mz);
+                    let obs_mz = peak.mz as f64;
+                    let q_mz = obs_mz / mass_off.factor_at(obs_mz);
                     // Collect every co-isolated, in-RT-window candidate matching this
                     // peak, then apportion per the claim strategy. In wide DIA one peak
                     // matches many candidates (~98% of fragments collide).
@@ -2345,7 +2402,6 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
                     if claimants.is_empty() {
                         continue;
                     }
-                    let obs_mz = peak.mz;
                     match p.cfg.peak_claim {
                         PeakClaim::WinnerPredictedIntensity => {
                             let mut best = 0usize;
@@ -3981,14 +4037,12 @@ mod accumulate_tests {
         (0..n_scans)
             .map(|si| Ms2Scan {
                 scan_index: (base + si) as u32,
-                id: format!("s{}", base + si),
                 rt_seconds: 100.0 + (base + si) as f64,
                 window,
                 peaks: (0..97)
                     .map(|k| Peak {
-                        mz: 300.0 + k as f64 * 1.37,
+                        mz: 300.0 + k as f32 * 1.37,
                         intensity: 10.0 + (si + k) as f32,
-                        ion_mobility: None,
                     })
                     .collect(),
             })

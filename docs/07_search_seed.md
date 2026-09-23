@@ -54,9 +54,11 @@ DeepLC fine-tune (`run.rs:237-280`).
 ### Consumed
 
 - **MS2 spectra** (`--ms2`, a `convert` output Parquet), loaded by `load_ms2`
-  into `Vec<Ms2Scan>`. Each `Ms2Scan` carries `scan_index`, `id`, `rt_seconds`,
+  into `Vec<Ms2Scan>`. Each `Ms2Scan` carries `scan_index`, `rt_seconds`,
   an `IsolationWindow { target_mz, lower_mz, upper_mz, im_lower, im_upper }`, and
-  `peaks: Vec<Peak { mz: f64, intensity: f32, ion_mobility }>`.
+  `peaks: Vec<Peak { mz: f32, intensity: f32 }>`. The peak m/z is the artifact's
+  own f32 width; this stage widens it with `as f64` at each comparison, which is
+  exact, exactly as it already did for the library's f32 fragment m/z.
 - **Library** (`--lib-precursors` + `--lib-fragments`), loaded by
   `Library::load` (`index.rs:54`). Provides `cands: Vec<Candidate>`
   (`candidate_id`, `peptidoform`, `charge`, `precursor_mz`, `base_peptide_id`,
@@ -94,7 +96,7 @@ a candidate that always ranks below `report_psms` gets no row even if it cleared
 | `matched_peaks` | i32 | matched-fragment count at the best scan |
 | `scan_index` | u32 | `scan_index` of the best-scoring scan |
 
-**`<out>.masscal.json`** (written at `search_seed.rs:217-227`):
+**`<out>.masscal.json`** (fitted and serialised by `masscal::MassCal`, `masscal.rs`):
 
 | key | type | meaning |
 |---|---|---|
@@ -125,7 +127,7 @@ formatted threshold, e.g. `targets_at_q0.01`), `model_identity =
 Entry point: `search_seed::run(SearchSeedParams)` (`search_seed.rs:45-283`).
 
 **1. Load** the library (`Library::load`, `index.rs:54`) and MS2 scans
-(`load_ms2`, `spectra.rs:20`), then log candidate and scan counts
+(`load_ms2`, `spectra.rs:101`), then log candidate and scan counts
 (`search_seed.rs:47-53`). `load_ms2` sorts the returned `Vec<Ms2Scan>` by
 `rt_seconds` ascending (`spectra.rs:95`); this RT ordering is what makes the
 within-group strictly-greater update deterministic (earliest-RT wins a tie). It
@@ -232,7 +234,16 @@ two-element average), then sets `tol = max(5.0, 1.5 * P95(|dev - offset|))` usin
   `>= 20` survive, re-fit to `(o2, t2, 2)`; otherwise keep the single-pass result.
   The second pass rejects random-match outliers so they cannot bias the median.
 
-The result is written to `<out>.masscal.json` (`:217-227`).
+The estimator is `masscal::MassCal::fit_from` and the JSON body its `to_json`, both in
+`masscal.rs`, because a grouped search fits the very same estimator a second time: each
+band's seed would otherwise learn a tolerance from its own ~2,000 deviations and
+`seed-pool` would average the bands' scalars, which measured 35% wider and cost 3.4% of the
+peptides (`docs/33_window_groups.md` section 4a). Under `groups.window_groups > 1` the stage
+is additionally asked (`SearchSeedParams::emit_calibrants`) to write
+`<out>.masscal.parquet`: `candidate_id` (library-wide), `scan_index`, `frag_mz`, `ppm`, one
+row per deviation, plus the band's best-scoring targets down to
+`masscal::CALIBRANT_OFFER_PSMS` so the pooled q rather than the band's own q chooses the
+calibrants. An ungrouped run writes no sidecar and is byte-identical.
 
 **7. Write** `seed_psms.parquet` (`write_table`, `:233`) and the `ArtifactReport`
 (`:256-274`), then log `psms`, `confident`, `elapsed_ms`.
@@ -270,7 +281,7 @@ tolerance (falling back to the config value if the file is absent,
 | `ln_factorial` | `fdr.rs:137` | `ln(n!)` via summed logs |
 | `ppm_diff` / `ppm_bounds` | `constants.rs:66` / `:78` | signed ppm (theoretical-relative) and ppm window bounds (query-relative) |
 | `within_ppm` | `constants.rs:92` | min-relative tolerance predicate used by the fragindex match (differs at the edge from the two above) |
-| `load_ms2` | `spectra.rs:20` | reads `spectra_ms2.parquet` into `Vec<Ms2Scan>`, RT-sorted |
+| `load_ms2` | `spectra.rs:101` | reads `spectra_ms2.parquet` into `Vec<Ms2Scan>`, RT-sorted |
 | `percentile` | `calibrate.rs:156` | nearest-rank percentile (used for the tolerance) |
 
 ## Configuration
@@ -380,8 +391,8 @@ takes `--ms2`, `--lib-precursors`, `--lib-fragments`, `--out`, and
   branch in the `if let Some(idx) = fidx` dispatch (`search_seed.rs:63-108`); mirror
   the deterministic merge if the new path is parallel.
 - **Charge-2 / m/z-binned tolerance.** The current fit produces one global offset
-  and tolerance. To make them charge- or m/z-dependent, partition `devs` before the
-  `fit` closure and emit per-bin entries in `masscal.json`, then teach `extract` to
+  and tolerance. To make them charge- or m/z-dependent, partition `devs` before
+  `masscal::fit` and emit per-bin entries in `masscal.json`, then teach `extract` to
   pick the matching bin.
 - **Change the score.** `hyperscore` (`search_seed.rs:413`) is a free function; keep
   it monotone in matched-fragment count and observed intensity so the target-decoy q

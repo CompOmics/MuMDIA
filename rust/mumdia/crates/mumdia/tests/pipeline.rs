@@ -520,7 +520,6 @@ fn assert_scans_identical(after: &[Ms2Scan], fresh: &[Ms2Scan]) {
     assert_eq!(after.len(), fresh.len(), "scan count changed");
     for (a, b) in after.iter().zip(fresh) {
         assert_eq!(a.scan_index, b.scan_index);
-        assert_eq!(a.id, b.id);
         assert_eq!(a.rt_seconds.to_bits(), b.rt_seconds.to_bits());
         assert_eq!(a.window, b.window);
         assert_eq!(a.peaks, b.peaks, "peaks of scan {} changed", a.scan_index);
@@ -812,6 +811,7 @@ fn search_seed_from_a_shared_scan_buffer_is_byte_identical_and_read_only() {
         let rows = stages::search_seed::run(stages::search_seed::SearchSeedParams {
             fragment_offset: None,
             ms2_scans: shared,
+            emit_calibrants: false,
             ms2: &ms2,
             library_precursors: &prec,
             library_fragments: &frag,
@@ -856,6 +856,7 @@ fn search_seed_from_a_shared_scan_buffer_is_byte_identical_and_read_only() {
     stages::search_seed::run(stages::search_seed::SearchSeedParams {
         fragment_offset: None,
         ms2_scans: None,
+        emit_calibrants: false,
         ms2: &ms2,
         library_precursors: &prec,
         library_fragments: &frag,
