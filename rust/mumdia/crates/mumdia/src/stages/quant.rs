@@ -122,14 +122,18 @@ impl CidSet {
         }
     }
 
+    /// `ids` need not be sorted or distinct: a repeated id sets the same bit twice.
     fn from_ids(ids: &[u32]) -> CidSet {
         let (Some(&base), Some(&top)) = (ids.iter().min(), ids.iter().max()) else {
             return CidSet::empty();
         };
-        let span = (top - base) as usize + 1;
-        if span.div_ceil(64) * 8 > CID_BITSET_MAX_BYTES {
+        // In u64: `top - base` reaches `u32::MAX`, and `+ 1` on a 32-bit `usize` would wrap
+        // to a zero-length allocation that the fill below then indexes out of.
+        let span = u64::from(top - base) + 1;
+        if span.div_ceil(64) * 8 > CID_BITSET_MAX_BYTES as u64 {
             return CidSet::Hashed(ids.iter().copied().collect());
         }
+        let span = span as usize;
         let mut bits = vec![0u64; span.div_ceil(64)];
         for &c in ids {
             let k = (c - base) as usize;
@@ -221,6 +225,33 @@ impl ChromStore {
         self.cid.len()
     }
 
+    /// The first axis of the OPEN candidate whose values are identical to `rt`, in
+    /// ascending id order. [`ChromStore::axis_for`] interns a row's trace through this, and
+    /// [`ChromStore::append`] re-runs it across a row-group seam so a split table dedups
+    /// exactly as one pass would have.
+    ///
+    /// BITWISE, not `==`. Interning makes every consumer read `store.rt(row)` instead of
+    /// the row's own values, so it may only substitute an axis that is identical to the
+    /// last bit. `-0.0 == 0.0` holds under f32's `PartialEq` while [`peak_window`]'s merge
+    /// keys the union on `to_bits`, so an `==` match would fold two union points into one
+    /// and move the profile, the apex, the walked window and the quantity. Extract's grid
+    /// is positive mzML scan times, but `mumdia quant --chromatograms` takes a table
+    /// written by anything, which is the same reason the rt/intensity length check in
+    /// [`load_chrom_span`] exists. (A NaN-carrying axis dedups against an identical one,
+    /// which `==` never did; the values stored are the same bits either way.)
+    fn open_axis_matching(&self, rt: &[f32]) -> Option<u32> {
+        (self.open_axis_lo..self.axis_off.len() - 1)
+            .find(|&a| {
+                let (lo, hi) = (self.axis_off[a], self.axis_off[a + 1]);
+                hi - lo == rt.len()
+                    && self.axis_vals[lo..hi]
+                        .iter()
+                        .zip(rt)
+                        .all(|(x, y)| x.to_bits() == y.to_bits())
+            })
+            .map(|a| a as u32)
+    }
+
     /// Store `rt` as an axis id, reusing an axis already stored for the open candidate
     /// when the values are identical (the common case: one grid per candidate).
     fn axis_for(&mut self, cid: u32, rt: &[f32]) -> Result<u32> {
@@ -231,26 +262,8 @@ impl ChromStore {
         if rt.is_empty() {
             return Ok(NO_AXIS);
         }
-        for a in self.open_axis_lo..self.axis_off.len() - 1 {
-            let (lo, hi) = (self.axis_off[a], self.axis_off[a + 1]);
-            // BITWISE, not `==`. Interning makes every consumer read `store.rt(row)`
-            // instead of the row's own values, so it may only substitute an axis that is
-            // identical to the last bit. `-0.0 == 0.0` holds under f32's `PartialEq`
-            // while [`peak_window`]'s merge keys the union on `to_bits`, so an `==` match
-            // would fold two union points into one and move the profile, the apex, the
-            // walked window and the quantity. Extract's grid is positive mzML scan times,
-            // but `mumdia quant --chromatograms` takes a table written by anything, which
-            // is the same reason the rt/intensity length check below exists.
-            // (A NaN-carrying axis now dedups against an identical one, which `==` never
-            // did; the values stored are the same bits either way.)
-            if hi - lo == rt.len()
-                && self.axis_vals[lo..hi]
-                    .iter()
-                    .zip(rt)
-                    .all(|(a, b)| a.to_bits() == b.to_bits())
-            {
-                return Ok(a as u32);
-            }
+        if let Some(a) = self.open_axis_matching(rt) {
+            return Ok(a);
         }
         let nondecreasing = rt_is_sorted(rt);
         self.rt_sorted &= nondecreasing;
@@ -296,46 +309,97 @@ impl ChromStore {
         Ok(())
     }
 
-    /// Append `other`'s rows after this store's, as one pass over the table in this order
-    /// would have produced them. This is what lets the chromatogram table be read row
-    /// group by row group in parallel ([`load_chromatograms`]): row groups are disjoint,
-    /// contiguous row spans, so concatenating their stores in file order reproduces table
-    /// order exactly.
+    /// Append `other`'s rows after this store's, producing exactly the store one pass over
+    /// the table in this order would have produced -- axis ids included. This is what lets
+    /// the chromatogram table be read row group by row group in parallel
+    /// ([`load_chromatograms`]): row groups are disjoint, contiguous row spans, so
+    /// concatenating their stores in file order reproduces table order exactly.
     ///
-    /// Every per-row value survives unchanged -- `store.rt(row)`, `inten(row)`, `name(row)`
-    /// and `pred[row]` are identical to the single-pass store. What does NOT survive is
-    /// axis IDENTITY across the seam: a candidate whose rows straddle a row-group boundary
-    /// dedups within each part only, because [`ChromStore::axis_for`] resets its open
-    /// candidate per part, so it mints two ids holding the same values. [`peak_window`]'s
-    /// uniformity scan then sees two ids and takes the merged-sample union instead of the
-    /// shared-axis accumulation. Those two paths are bit-identical (asserted for every
-    /// `peak_window` case by the `peak_window_both` harness below), so the quantities do
-    /// not move; only the axis count and the fast-path hit rate do, for the handful of
-    /// candidates on a boundary (about 218 of 959,426 on the six-run HYE benchmark).
+    /// The one thing concatenation can get wrong is axis IDENTITY across the seam.
+    /// [`ChromStore::axis_for`] dedups a trace only against the axes of the candidate it
+    /// currently has open, and `other` was built with nothing open, so a candidate whose
+    /// rows straddle the boundary would mint a second axis holding the same values. That is
+    /// not an internal detail: [`peak_window`] takes the shared-axis accumulation for one
+    /// axis id and the merged-sample union for two, and those paths do NOT agree for every
+    /// axis this table may carry. An axis `[-0.0, 1.0, 2.0, 3.0]` is marked strict
+    /// ([`rt_is_sorted`] accepts `-0.0`, which compares `>= 0.0`), so the shared path walks
+    /// it in value order, while the merge keys the union on `to_bits`, where `-0.0`'s bits
+    /// sort after every positive f32: the merged path walks `[1.0, 2.0, 3.0, -0.0]` with
+    /// the profile permuted, `axis_sorted` false, and reaches a different apex, window and
+    /// quantity. Extract writes positive mzML scan times, but `mumdia quant
+    /// --chromatograms` takes a table written by anything, and a parquet row-group layout
+    /// is the writer's choice, so the seam must not be able to decide this.
+    ///
+    /// So the leading rows of `other` that continue this store's open candidate are deduped
+    /// against the open window here, by the same [`ChromStore::open_axis_matching`] search
+    /// in the same ascending-id order, and the open candidate is carried across the seam
+    /// rather than closed. Every field then matches the single pass bit for bit, which is
+    /// what `the_row_group_plan_builds_the_single_passes_store_exactly` asserts over a
+    /// fixture split at every row.
     fn append(&mut self, other: ChromStore) -> Result<()> {
-        let axis_base = (self.axis_off.len() - 1) as u64;
-        let n_axes = (other.axis_off.len() - 1) as u64;
+        if other.nrows() == 0 {
+            // A span that kept no row is a span the single pass walked straight past: it
+            // must not close the open candidate, or the next span's rows would stop
+            // deduping against it. No rows also means no axes, which only `push` mints.
+            debug_assert_eq!(other.axis_off.len(), 1);
+            self.rt_sorted &= other.rt_sorted;
+            return Ok(());
+        }
+        let axis_count = self.axis_off.len() - 1;
+        let n_axes = other.axis_off.len() - 1;
         // The same ceiling [`ChromStore::axis_for`] enforces at mint time, re-checked here
         // because concatenation is the other way the count can reach the empty-trace
-        // marker: ids run `0..n`, so `n` axes need `n - 1 < NO_AXIS`.
-        if axis_base + n_axes > NO_AXIS as u64 {
+        // marker: ids run `0..n`, so `n` axes need `n - 1 < NO_AXIS`. Taken before the
+        // dedup below, which can only lower the count.
+        if axis_count as u64 + n_axes as u64 > NO_AXIS as u64 {
             anyhow::bail!(
                 "chromatogram table has more than {NO_AXIS} distinct retention-time axes; \
                  the axis id would collide with the empty-trace marker"
             );
         }
-        let axis_base = axis_base as u32;
+        // The leading rows of `other` that continue this store's open candidate. Axes are
+        // minted in row order, so the axes those rows own are exactly `other`'s ids
+        // `0..prefix_axes`, and no later row of `other` can reuse one of this store's axes:
+        // a candidate change resets the dedup window in the single pass too.
+        let (mut prefix_rows, mut prefix_axes) = (0usize, 0usize);
+        if let Some(open) = self.open_cid {
+            while prefix_rows < other.nrows() && other.cid[prefix_rows] == open {
+                let a = other.axis_id[prefix_rows];
+                if a != NO_AXIS {
+                    prefix_axes = prefix_axes.max(a as usize + 1);
+                }
+                prefix_rows += 1;
+            }
+        }
+        // `other`'s axis ids, in this store's numbering. A prefix axis that the open window
+        // already holds maps onto it and is not copied; everything else is minted in
+        // `other`'s order, which is the order the single pass mints it in.
+        let mut minted_prefix = 0usize;
+        let mut map: Vec<u32> = Vec::with_capacity(n_axes);
+        for a in 0..n_axes {
+            let vals = &other.axis_vals[other.axis_off[a]..other.axis_off[a + 1]];
+            let reuse = if a < prefix_axes {
+                self.open_axis_matching(vals)
+            } else {
+                None
+            };
+            match reuse {
+                Some(existing) => map.push(existing),
+                None => {
+                    map.push((self.axis_off.len() - 1) as u32);
+                    self.axis_vals.extend_from_slice(vals);
+                    self.axis_off.push(self.axis_vals.len());
+                    self.axis_strict.push(other.axis_strict[a]);
+                    minted_prefix += usize::from(a < prefix_axes);
+                }
+            }
+        }
         let name_map: Vec<u32> = other
             .names
             .names
             .iter()
             .map(|n| self.names.intern(n))
             .collect();
-        let val_base = self.axis_vals.len();
-        self.axis_off
-            .extend(other.axis_off[1..].iter().map(|o| val_base + o));
-        self.axis_vals.extend_from_slice(&other.axis_vals);
-        self.axis_strict.extend_from_slice(&other.axis_strict);
         let int_base = self.int_vals.len();
         self.int_off
             .extend(other.int_off[1..].iter().map(|o| int_base + o));
@@ -348,14 +412,21 @@ impl ChromStore {
             if id == NO_AXIS {
                 NO_AXIS
             } else {
-                id + axis_base
+                map[id as usize]
             }
         }));
+        // A deduped axis was already counted by whichever store holds the copy, and an
+        // identical trace answers [`rt_is_sorted`] identically, so the conjunction stands.
         self.rt_sorted &= other.rt_sorted;
-        // A push after an append must not dedup against an axis minted before the seam:
-        // the appended part's own dedup already closed over its candidates.
-        self.open_cid = None;
-        self.open_axis_lo = self.axis_off.len() - 1;
+        if prefix_rows < other.nrows() {
+            // `other`'s last candidate opened its window at or after the end of the prefix,
+            // so its start maps by the offset the prefix's dedup left behind. When the
+            // whole span continued the open candidate instead, the window it deduped
+            // against is still the right one and both fields stay as they are.
+            debug_assert!(other.open_axis_lo >= prefix_axes);
+            self.open_cid = other.open_cid;
+            self.open_axis_lo = axis_count + minted_prefix + (other.open_axis_lo - prefix_axes);
+        }
         Ok(())
     }
 
@@ -1072,20 +1143,62 @@ fn rollup_protein_bases(
 }
 
 /// Rows of the chromatogram table allowed to be in flight at once across the parallel
-/// row-group readers. This is what bounds the transient arrow buffers.
+/// row-group readers, a cap on decoder work rather than on memory.
 ///
 /// A row group is decoded into arrow arrays IN FULL before this stage's accepted-candidate
 /// filter looks at a single row, so N readers hold N row groups of `rt` and `intensity`
 /// whatever fraction of them is kept, and the per-span stores of one chunk wait alongside
-/// them until they are merged. At the 55.5 list values per row measured on the six-run HYE
-/// artifact -- 444 bytes of f32 per row -- this budget is about 235 MB of arrow buffers,
-/// and at most that again in per-span stores on the `--out-peak-bounds` path, which keeps
-/// every row. On the default path the stores hold the accepted 5.6% and are negligible.
+/// them until they are merged.
+///
+/// A ROW COUNT DOES NOT BOUND BYTES. The row carries two list columns whose length is the
+/// number of scans of the covering isolation window inside the candidate's RT window: 55.5
+/// values, 444 bytes of f32, on the six-run HYE artifact, and tens of times that on a run
+/// whose `w_rt` is wide or unbounded. 1 << 19 rows is 235 MB at the first and 8 GB at the
+/// second, so the byte budget below is what actually bounds the buffers and this is only
+/// the ceiling on how many groups may be decoded at once.
 ///
 /// It is also why a table written before extract's `CHROM_ROW_GROUP_ROWS = 1 << 16`
 /// (2026-09-04), whose row groups hold 1,048,576 rows, reads with a single reader: 32 of
-/// those would be 14.9 GB, which trades a few seconds for a memory regression.
+/// those would be 14.9 GB, which trades a few seconds for a memory regression. One reader
+/// is the floor in every case, and one reader is still one whole row group -- as the single
+/// pass it falls back to also is.
 const CHROM_ROWS_IN_FLIGHT: usize = 1 << 19;
+
+/// Decoded arrow bytes the parallel readers may hold at once, estimated per row from the
+/// file's own compressed size, which tracks the trace length as [`CHROM_ROWS_IN_FLIGHT`]
+/// cannot. 256 MB is what 1 << 19 rows of the six-run HYE artifact came to, so the shipped
+/// shape (65,536-row groups, 444 B per row) still plans the same eight readers; a run with
+/// 30x longer traces falls to one reader instead of asking for 8 GB of buffers.
+///
+/// This budget is SPENT, not saved: the single reader it replaces held one 65,536-row group,
+/// about 29 MB, so the parallel read costs about 204 MB of transient buffers on the HYE
+/// shape, against the 60-105 MB of `String` spine the flat scored-column reads gave back.
+/// The direction of quant's peak is therefore up, by roughly 100-145 MB on a stage that
+/// already holds a ~355 MB store, in exchange for the 3-4x load measured by
+/// `chromatogram_read_arms`. The per-span stores waiting to be merged are a third term:
+/// negligible on the default path, where they hold the accepted few percent, and a second
+/// copy of the chunk's rows under `--out-peak-bounds`, which keeps every row.
+const CHROM_BYTES_IN_FLIGHT: u64 = 256 << 20;
+
+/// Assumed decompression factor of the chromatogram parquet, for sizing readers off the
+/// file's compressed size. Measured 4.5x on the six-run HYE artifact (802 MB of snappy to
+/// 3.62 GB of f32); 6 is used so the estimate errs towards fewer readers.
+const CHROM_DECOMPRESSION_FACTOR: u64 = 6;
+
+/// Readers the byte budget allows for row groups of `widest` rows, from the file's
+/// compressed bytes per row. `usize::MAX` when the size cannot be taken, which leaves
+/// [`CHROM_ROWS_IN_FLIGHT`] in charge rather than refusing to plan.
+fn chrom_byte_readers(path: &str, nrows: usize, widest: usize) -> usize {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return usize::MAX;
+    };
+    if nrows == 0 {
+        return usize::MAX;
+    }
+    let per_row = (meta.len() / nrows as u64).max(1) * CHROM_DECOMPRESSION_FACTOR;
+    let per_group = per_row.saturating_mul(widest as u64).max(1);
+    (CHROM_BYTES_IN_FLIGHT / per_group).max(1) as usize
+}
 
 /// Read the chromatogram table into one [`ChromStore`], row group by row group.
 ///
@@ -1105,13 +1218,17 @@ const CHROM_ROWS_IN_FLIGHT: usize = 1 << 19;
 ///
 /// It falls back to a single pass when the footer offers no usable layout, when there is
 /// one row group, and when the groups are large enough that neither parallelism nor
-/// pruning would apply -- in which case the per-span copy would be pure loss.
+/// pruning would apply -- in which case the per-span copy would be pure loss. Which of the
+/// two runs is therefore a function of `threads` and of the writer's row-group size, and
+/// neither may reach the output: [`ChromStore::append`] rebuilds the single pass's store
+/// exactly, axis ids included, which is what makes that safe.
 fn load_chromatograms(
     ch: &TableFile,
     has_pred: bool,
     keep_all: bool,
     wanted: &CidSet,
     path: &str,
+    threads: usize,
 ) -> Result<ChromStore> {
     let cols: Vec<&str> = if has_pred {
         vec![
@@ -1124,7 +1241,7 @@ fn load_chromatograms(
     } else {
         vec!["candidate_id", "frag_name", "rt", "intensity"]
     };
-    let Some((spans, readers)) = chrom_spans(ch, keep_all, wanted) else {
+    let Some((spans, readers)) = chrom_spans(ch, keep_all, wanted, threads, path) else {
         return load_chrom_span(ch, &cols, has_pred, keep_all, wanted, path);
     };
     let mut store = ChromStore::new();
@@ -1146,26 +1263,46 @@ fn load_chromatograms(
 }
 
 /// Plan the chromatogram read as row-group spans, with the number to read concurrently, or
-/// `None` to read the file in one pass.
-fn chrom_spans(ch: &TableFile, keep_all: bool, wanted: &CidSet) -> Option<(Vec<TableFile>, usize)> {
+/// `None` to read the file in one pass. `threads` is the caller's rayon pool width; it is
+/// a parameter rather than a `rayon::current_num_threads()` call inside so the plan can be
+/// asserted on any host.
+///
+/// Pruning trusts the writer's `candidate_id` statistics, which by the parquet
+/// specification describe the group's NON-NULL values. A null `candidate_id` is outside
+/// this table's contract -- extract writes the column from a `Vec<u32>`, which has no null
+/// -- and the single pass does not read it as a candidate either: it takes
+/// `a_cid.value(k)`, the raw slot behind the validity bitmap, whose content the decoder
+/// does not define. Closing that last gap needs a null count from `row_group_stats`, which
+/// is `mumdia-io`'s to add.
+fn chrom_spans(
+    ch: &TableFile,
+    keep_all: bool,
+    wanted: &CidSet,
+    threads: usize,
+    path: &str,
+) -> Option<(Vec<TableFile>, usize)> {
     // Footer only: no column data is touched here.
     let stats = ch.row_group_stats("candidate_id").ok()?;
     if stats.len() < 2 {
         return None;
     }
     let widest = stats.iter().map(|s| s.rows).max().unwrap_or(0).max(1);
-    let readers = (CHROM_ROWS_IN_FLIGHT / widest).clamp(1, rayon::current_num_threads());
+    let readers = (CHROM_ROWS_IN_FLIGHT / widest)
+        .min(chrom_byte_readers(path, ch.nrows, widest))
+        .clamp(1, threads.max(1));
     // `keep_all` (`--out-peak-bounds`) wants every candidate, so nothing may be skipped.
     let accepted = if keep_all { None } else { wanted.range() };
     let mut spans = Vec::with_capacity(stats.len());
     let mut pruned = 0usize;
     let mut first = 0usize;
+    let mut probe: Option<(usize, usize)> = None;
     for s in &stats {
         let start = first;
         first += s.rows;
         if s.rows == 0 {
             continue;
         }
+        probe = probe.or(Some((start, s.rows)));
         // A group outside the accepted id range holds no row this stage would store. Note
         // that the per-row rt/intensity length guard already runs only on kept rows (the
         // filter `continue`s before it), so skipping such a group withdraws no check.
@@ -1181,11 +1318,15 @@ fn chrom_spans(ch: &TableFile, keep_all: bool, wanted: &CidSet) -> Option<(Vec<T
     if readers < 2 && pruned == 0 {
         return None;
     }
-    // Every group skipped means nothing is accepted at all. Read the file anyway rather
-    // than skip it silently: the single pass still validates the projection and the row
-    // shape, which is what an empty accepted set would otherwise stop doing.
+    // Every group skipped means the file holds nothing this stage would keep. Read ONE
+    // group rather than the whole file: what a full read still does here is check the
+    // projection and the column types, which one group checks just as well, while the
+    // per-row rt/intensity guard runs only on KEPT rows and so was never going to fire.
+    // The store is empty either way, and reading 802 MB to produce an empty store is the
+    // case pruning exists for.
     if spans.is_empty() {
-        return None;
+        let (start, rows) = probe?;
+        spans.push(ch.span(start, rows).ok()?);
     }
     Some((spans, readers))
 }
@@ -1435,6 +1576,14 @@ pub fn run(p: QuantParams) -> Result<(u64, u64)> {
     // `label == "target"` is read only under consensus mode (the anchor set here and the
     // median half-widths below), so the second pass over the column is taken only there.
     // Empty otherwise, and indexed only behind `consensus_mode`.
+    //
+    // It IS a second decode of the column, which a single `Vec<String>` would not have
+    // been. `label` holds two distinct values over the whole table, so it is dictionary
+    // encoded and this costs one more pass over the smallest column in the artifact, for
+    // `nrows` bools -- 879 KB on the six-run HYE table, against the ~21 MB of `String`
+    // spine plus payload that one `str` read would have held for the whole stage. Three
+    // spellings cannot be folded into one bit, and neither bit may be derived from the
+    // other: a label that is neither spelling is a target to the filter and not an anchor.
     let is_target: Vec<bool> = if consensus_mode {
         ps.str_eq("label", "target")?
     } else {
@@ -1444,6 +1593,10 @@ pub fn run(p: QuantParams) -> Result<(u64, u64)> {
     let wanted: CidSet = if keep_all {
         CidSet::empty()
     } else {
+        // Accepted ids, with duplicates: the scored table carries one row per candidate, so
+        // this is the accepted row count (53,863 on the six-run HYE table, 215 KB) and a
+        // repeat would only set the same bit twice. `CidSet::from_ids` walks it three times
+        // -- min, max, fill -- which is three passes over that, not over the table.
         let mut ids: Vec<u32> = Vec::new();
         for i in 0..ps.nrows {
             if passes_quant_filter(is_decoy[i], pep_q[i], p.cfg.q_threshold, is_transferred[i])
@@ -1473,7 +1626,14 @@ pub fn run(p: QuantParams) -> Result<(u64, u64)> {
     let ch = TableFile::open(p.chromatograms)?;
     // Flat, grouped-by-candidate store (see [`ChromStore`]), read row group by row group
     // in parallel (see [`load_chromatograms`]).
-    let store = load_chromatograms(&ch, has_pred, keep_all, &wanted, p.chromatograms)?;
+    let store = load_chromatograms(
+        &ch,
+        has_pred,
+        keep_all,
+        &wanted,
+        p.chromatograms,
+        rayon::current_num_threads(),
+    )?;
     drop(wanted);
     // Group the fragment chromatogram rows by candidate, ascending by candidate id and in
     // table order within a candidate: the order the `BTreeMap<u32, Vec<usize>>` this
@@ -3494,9 +3654,7 @@ mod tests {
     }
     // ---- chromatogram load: accepted-candidate bitset, row-group spans ----
 
-    /// Every row of a store as the values its consumers read, so two stores built by
-    /// different read plans can be compared without comparing axis IDS, which are the one
-    /// thing [`ChromStore::append`] is allowed to change.
+    /// Every row of a store as the values its consumers read:
     /// `(candidate_id, fragment name, predicted intensity, rt trace, intensity trace)`,
     /// floats as bit patterns so the comparison is exact.
     type StoredRow = (u32, String, u32, Vec<u32>, Vec<u32>);
@@ -3513,6 +3671,43 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    /// Every field of a store, the axis TABLE and the axis IDS included, so a store built
+    /// by the row-group plan can be held to BEING the single pass's store instead of merely
+    /// agreeing with it row by row. The ids are the part that matters: [`peak_window`]
+    /// routes on how many distinct axis ids a candidate's rows carry, and the shared-axis
+    /// and merged-sample unions do not agree for every axis the table may hold (an axis
+    /// beginning with `-0.0` is the counterexample [`ChromStore::append`] documents).
+    #[derive(Debug, PartialEq)]
+    struct StoreSnapshot {
+        rows: Vec<StoredRow>,
+        axis_id: Vec<u32>,
+        axis_off: Vec<usize>,
+        axis_vals: Vec<u32>,
+        axis_strict: Vec<bool>,
+        int_off: Vec<usize>,
+        names: Vec<String>,
+        name_id: Vec<u32>,
+        rt_sorted: bool,
+        open_cid: Option<u32>,
+        open_axis_lo: usize,
+    }
+
+    fn snapshot(s: &ChromStore) -> StoreSnapshot {
+        StoreSnapshot {
+            rows: store_rows(s),
+            axis_id: s.axis_id.clone(),
+            axis_off: s.axis_off.clone(),
+            axis_vals: s.axis_vals.iter().map(|v| v.to_bits()).collect(),
+            axis_strict: s.axis_strict.clone(),
+            int_off: s.int_off.clone(),
+            names: s.names.names.clone(),
+            name_id: s.name_id.clone(),
+            rt_sorted: s.rt_sorted,
+            open_cid: s.open_cid,
+            open_axis_lo: s.open_axis_lo,
+        }
     }
 
     /// A chromatogram table of `n_cand` candidates x `per_cand` fragments on a shared
@@ -3675,86 +3870,156 @@ mod tests {
                 .unwrap();
             first += s.rows;
         }
-        assert_eq!(store_rows(&by_span), store_rows(&one_pass));
-        assert_eq!(by_span.rt_sorted, one_pass.rt_sorted);
+        assert_eq!(snapshot(&by_span), snapshot(&one_pass));
         // And the planner's own result, whichever path it chose on this machine.
-        let planned = load_chromatograms(&ch, true, false, &wanted, &path).unwrap();
-        assert_eq!(store_rows(&planned), store_rows(&one_pass));
+        let planned = load_chromatograms(&ch, true, false, &wanted, &path, 4).unwrap();
+        assert_eq!(snapshot(&planned), snapshot(&one_pass));
 
-        // The one thing that does move: a candidate whose rows straddle a seam dedups
-        // within each span only, so it holds more than one axis id. That is what routes
-        // `peak_window` to the merged union, and is asserted here so the equality test
-        // below is known to be exercising it.
-        let ids: std::collections::HashSet<u32> = (0..by_span.nrows())
-            .filter(|&r| by_span.cid[r] == 1)
-            .map(|r| by_span.axis_id[r])
-            .collect();
-        assert!(
-            ids.len() > 1,
-            "candidate 1 must straddle a row-group seam in this fixture"
-        );
+        // The comparison only proves something if a candidate really does straddle a seam,
+        // which is the case `append` has to reconstruct. Candidate 1 owns file rows 3..6
+        // and the groups hold 4 rows, so row 3 is in the first group and rows 4 and 5 in
+        // the second.
         assert_eq!(
-            (0..one_pass.nrows())
-                .filter(|&r| one_pass.cid[r] == 1)
-                .map(|r| one_pass.axis_id[r])
+            stats[0].rows, 4,
+            "the fixture's row groups must hold 4 rows"
+        );
+        let rows_of_1: Vec<usize> = (0..one_pass.nrows())
+            .filter(|&r| one_pass.cid[r] == 1)
+            .collect();
+        assert_eq!(rows_of_1.len(), 3);
+        // One axis id for it in BOTH stores: `append` deduped its second part against the
+        // window the first part left open, exactly as the single pass would have.
+        assert_eq!(
+            rows_of_1
+                .iter()
+                .map(|&r| by_span.axis_id[r])
                 .collect::<std::collections::HashSet<u32>>()
                 .len(),
             1,
-            "and it must NOT in the single pass, or the comparison proves nothing"
+            "the seam must not mint a second axis for a straddling candidate"
         );
     }
 
     #[test]
-    fn splitting_a_candidates_axis_across_a_seam_does_not_move_its_peak_window() {
-        // The equality claim of the row-group read: `append` mints a second axis id for a
-        // straddling candidate, `peak_window`'s uniformity scan then takes the merged
-        // union instead of the shared-axis accumulation, and the two agree to the bit.
-        let grid: Vec<f32> = (0..9).map(|k| k as f32).collect();
+    fn a_seam_inside_an_axis_beginning_with_negative_zero_does_not_move_the_window() {
+        // Why `append` has to dedup across the seam rather than leave two identical axes.
+        // `rt_is_sorted` accepts a leading `-0.0` (it compares `>= 0.0`) and the axis is
+        // strictly increasing after it, so ONE axis id takes `peak_window`'s shared path
+        // and walks the profile in value order. TWO ids take the merged union, which keys
+        // on `to_bits`, where `-0.0` sorts after every positive f32: the axis becomes
+        // `[1.0, 2.0, 3.0, -0.0]`, `axis_sorted` flips to false and the profile is
+        // permuted. Same rows, same file, different quantity -- decided by nothing but the
+        // writer's row-group size. Extract writes positive scan times; `mumdia quant
+        // --chromatograms` takes a table written by anything.
+        let grid = [-0.0f32, 1.0, 2.0, 3.0];
         let traces = [
-            vec![0.0f32, 1.0, 3.0, 9.0, 20.0, 9.0, 3.0, 1.0, 0.0],
-            vec![0.0f32, 0.5, 2.0, 7.0, 15.0, 8.0, 2.0, 0.5, 0.0],
-            vec![0.0f32, 0.0, 1.0, 4.0, 11.0, 5.0, 1.0, 0.0, 0.0],
+            vec![9.0f32, 1.0, 0.0, 0.0],
+            vec![7.0f32, 2.0, 0.0, 0.0],
+            vec![5.0f32, 0.0, 1.0, 0.0],
         ];
         let mut whole = ChromStore::new();
         for (f, t) in traces.iter().enumerate() {
             whole.push(7, &format!("y{f}"), 0.0, &grid, t).unwrap();
         }
-        let mut split = ChromStore::new();
-        let mut head = ChromStore::new();
-        head.push(7, "y0", 0.0, &grid, &traces[0]).unwrap();
-        let mut tail = ChromStore::new();
-        for (f, t) in traces.iter().enumerate().skip(1) {
-            tail.push(7, &format!("y{f}"), 0.0, &grid, t).unwrap();
-        }
-        split.append(head).unwrap();
-        split.append(tail).unwrap();
-
-        let rows = [0usize, 1, 2];
-        assert_eq!(
-            whole
-                .axis_id
-                .iter()
-                .collect::<std::collections::HashSet<_>>()
-                .len(),
-            1,
-            "one pass shares one axis"
+        assert!(
+            whole.axis_strict[0],
+            "a leading -0.0 is accepted as strictly increasing, which is the trap"
         );
-        assert_eq!(
-            split
-                .axis_id
-                .iter()
-                .collect::<std::collections::HashSet<_>>()
-                .len(),
-            2,
-            "the seam mints a second axis holding the same values"
-        );
-        assert_eq!(store_rows(&split), store_rows(&whole));
-        for hint in [None, Some(4.0), Some(3.7), Some(f64::NAN)] {
-            let a = peak_window(&rows, &whole, 1.0 / 6.0, 1, hint);
-            let b = peak_window(&rows, &split, 1.0 / 6.0, 1, hint);
+        // The same rows, cut at every position a row-group boundary could fall at.
+        for cut in 1..traces.len() {
+            let mut split = ChromStore::new();
+            for (lo, hi) in [(0, cut), (cut, traces.len())] {
+                let mut part = ChromStore::new();
+                for (f, t) in traces.iter().enumerate().take(hi).skip(lo) {
+                    part.push(7, &format!("y{f}"), 0.0, &grid, t).unwrap();
+                }
+                split.append(part).unwrap();
+            }
+            assert_eq!(snapshot(&split), snapshot(&whole), "cut at {cut}");
+            let rows = [0usize, 1, 2];
             let bits = |w: (f64, f64, f64)| (w.0.to_bits(), w.1.to_bits(), w.2.to_bits());
-            assert_eq!(bits(a), bits(b), "hint {hint:?}: {a:?} vs {b:?}");
+            for hint in [None, Some(0.0), Some(-1.0), Some(2.5), Some(f64::NAN)] {
+                assert_eq!(
+                    bits(peak_window(&rows, &whole, 0.5, 0, hint)),
+                    bits(peak_window(&rows, &split, 0.5, 0, hint)),
+                    "cut at {cut}, hint {hint:?}"
+                );
+            }
         }
+    }
+
+    #[test]
+    fn the_row_group_plan_builds_the_single_passes_store_exactly() {
+        // Concatenation has to reproduce the single pass FIELD BY FIELD, not just row by
+        // row, because `peak_window` routes on the axis ids. Cut the same rows at every
+        // position, including cuts inside a candidate, cuts on a candidate boundary and
+        // three-way cuts that leave a whole candidate alone in the middle part.
+        let grid = [0.0f32, 1.0, 2.0];
+        let offset = [0.5f32, 1.5, 2.5];
+        // (candidate, name, rt) -- candidate 2 appears twice, once either side of 3, and
+        // candidate 4's trace is empty (NO_AXIS), which is the other thing `append` remaps.
+        let rows: Vec<(u32, &str, &[f32])> = vec![
+            (1, "y1", &grid),
+            (1, "y2", &grid),
+            (1, "b3", &offset),
+            (1, "b4", &grid),
+            (2, "y1", &offset),
+            (3, "y1", &grid),
+            (2, "y1", &offset),
+            (4, "y1", &[]),
+            (4, "y2", &grid),
+        ];
+        let build = |cuts: &[usize]| -> ChromStore {
+            let mut out = ChromStore::new();
+            let mut lo = 0usize;
+            for &hi in cuts.iter().chain(std::iter::once(&rows.len())) {
+                let mut part = ChromStore::new();
+                for &(c, n, rt) in &rows[lo..hi] {
+                    let inten: Vec<f32> = rt.iter().map(|v| v + 1.0).collect();
+                    part.push(c, n, c as f32, rt, &inten).unwrap();
+                }
+                out.append(part).unwrap();
+                lo = hi;
+            }
+            out
+        };
+        let whole = build(&[]);
+        for cut in 1..rows.len() {
+            assert_eq!(snapshot(&build(&[cut])), snapshot(&whole), "cut at {cut}");
+        }
+        for a in 1..rows.len() {
+            for b in a + 1..rows.len() {
+                assert_eq!(
+                    snapshot(&build(&[a, b])),
+                    snapshot(&whole),
+                    "cuts at {a} and {b}"
+                );
+            }
+        }
+        // A span that kept no row -- every row filtered out, or an empty row group -- must
+        // not close the open candidate either.
+        let mut with_empty = ChromStore::new();
+        let mut head = ChromStore::new();
+        for &(c, n, rt) in &rows[..2] {
+            let inten: Vec<f32> = rt.iter().map(|v| v + 1.0).collect();
+            head.push(c, n, c as f32, rt, &inten).unwrap();
+        }
+        with_empty.append(head).unwrap();
+        with_empty.append(ChromStore::new()).unwrap();
+        let mut tail = ChromStore::new();
+        for &(c, n, rt) in &rows[2..] {
+            let inten: Vec<f32> = rt.iter().map(|v| v + 1.0).collect();
+            tail.push(c, n, c as f32, rt, &inten).unwrap();
+        }
+        with_empty.append(tail).unwrap();
+        assert_eq!(snapshot(&with_empty), snapshot(&whole));
+        // And a `push` after an append continues the open candidate's window.
+        let mut pushed = build(&[4]);
+        let mut direct = build(&[]);
+        for s in [&mut pushed, &mut direct] {
+            s.push(4, "y3", 4.0, &grid, &[1.0, 2.0, 3.0]).unwrap();
+        }
+        assert_eq!(snapshot(&pushed), snapshot(&direct));
     }
 
     #[test]
@@ -3767,27 +4032,69 @@ mod tests {
         assert_eq!(stats.len(), 4);
 
         let wanted = CidSet::from_ids(&[0]);
-        let (spans, _) = chrom_spans(&ch, false, &wanted).expect("pruning must plan spans");
+        let (spans, _) =
+            chrom_spans(&ch, false, &wanted, 4, &path).expect("pruning must plan spans");
         assert_eq!(spans.len(), 1, "only the first group can hold candidate 0");
 
         // Pruning is a read plan, not a filter: the store is what the full read would
         // have produced.
-        let pruned = load_chromatograms(&ch, true, false, &wanted, &path).unwrap();
+        let pruned = load_chromatograms(&ch, true, false, &wanted, &path, 4).unwrap();
         let full = load_chrom_span(&ch, &CHROM_COLS, true, false, &wanted, &path).unwrap();
-        assert_eq!(store_rows(&pruned), store_rows(&full));
+        assert_eq!(snapshot(&pruned), snapshot(&full));
         assert_eq!(pruned.nrows(), 2);
 
         // `keep_all` (`--out-peak-bounds`) wants every candidate, so nothing is skipped.
-        let (all_spans, _) =
-            chrom_spans(&ch, true, &wanted).expect("a multi-group file always plans spans");
+        // The thread count is passed in rather than read from the rayon pool, so this says
+        // the same thing on a 64-core host and on a 1-vCPU runner.
+        let (all_spans, _) = chrom_spans(&ch, true, &wanted, 4, &path)
+            .expect("a multi-group file plans spans for 4 threads");
         assert_eq!(all_spans.len(), 4);
+        // One thread and nothing pruned is the single pass plus a copy per span, so the
+        // plan declines rather than paying for it.
+        assert!(chrom_spans(&ch, true, &wanted, 1, &path).is_none());
+
+        // An accepted set disjoint from the file prunes every group. That must not turn
+        // into a full read of an 802 MB table to produce an empty store: one group is read,
+        // which is what validates the projection and the column types, and the per-row
+        // rt/intensity guard runs only on kept rows, so it was never going to fire here.
+        let none = CidSet::from_ids(&[10_000]);
+        let (probe, _) = chrom_spans(&ch, false, &none, 4, &path)
+            .expect("an empty accepted set still validates the table");
+        assert_eq!(
+            probe.len(),
+            1,
+            "one group, not four, and not the whole file"
+        );
+        assert_eq!(probe[0].nrows, 4);
+        let empty = load_chromatograms(&ch, true, false, &none, &path, 4).unwrap();
+        assert_eq!(
+            snapshot(&empty),
+            snapshot(&load_chrom_span(&ch, &CHROM_COLS, true, false, &none, &path).unwrap())
+        );
+        assert_eq!(empty.nrows(), 0);
+        // And the projection is still checked: a multi-group table missing `rt` fails even
+        // though every one of its groups is pruned.
+        let bad = quant_test_path("prune_noshape.parquet");
+        let mut w = mumdia_io::table::TableWriter::new(&bad).with_row_group_rows(4);
+        w.write_cols(vec![
+            Col::U32("candidate_id".into(), (0..8u32).collect::<Vec<u32>>()),
+            Col::Str("frag_name".into(), vec!["y1".to_string(); 8]),
+        ])
+        .unwrap();
+        w.close().unwrap();
+        let bt = TableFile::open(&bad).unwrap();
+        assert_eq!(bt.row_group_stats("candidate_id").unwrap().len(), 2);
+        assert!(load_chromatograms(&bt, false, false, &none, &bad, 4).is_err());
     }
 
     #[test]
     fn a_candidate_split_across_row_groups_quantifies_identically() {
         // The same scored table against two chromatogram artifacts that differ only in
         // parquet row-group size, one of which puts every fragment of a candidate in its
-        // own row group.
+        // own row group. The artifacts carry 8 candidates and the scored table accepts 6,
+        // so the split artifact's last groups are PRUNED: the row-group plan is then taken
+        // whatever the rayon pool width is, and this says the same thing on a 1-vCPU runner
+        // as on a 64-core host. The comparison is of the written FILES, byte for byte.
         let scored = quant_test_path("split_scored.parquet");
         write_table(
             &scored,
@@ -3807,7 +4114,7 @@ mod tests {
         )
         .unwrap();
 
-        let quantify = |chrom: &str, tag: &str| -> (Vec<Option<f64>>, Vec<String>, Vec<f64>) {
+        let quantify = |chrom: &str, tag: &str| -> Vec<Vec<u8>> {
             let peptide = quant_test_path(&format!("{tag}_peptide.parquet"));
             let protein = quant_test_path(&format!("{tag}_protein.parquet"));
             let fragment = quant_test_path(&format!("{tag}_fragment.parquet"));
@@ -3823,61 +4130,105 @@ mod tests {
                 config_hash: "test",
             })
             .unwrap();
+            // The quantities as well, so a failure says which column moved rather than
+            // only that two files differ.
             let pq = Table::read(&peptide).unwrap();
-            let fq = Table::read(&fragment).unwrap();
-            (
-                pq.opt_f64("quantity").unwrap(),
-                pq.str("quant_status").unwrap(),
-                fq.f64("quantity").unwrap(),
-            )
+            assert_eq!(pq.opt_f64("quantity").unwrap().len(), 6);
+            [&peptide, &protein, &fragment]
+                .iter()
+                .map(|p| std::fs::read(p).unwrap())
+                .collect()
         };
 
-        let one_group = chrom_fixture("one_group.parquet", 6, 4, 1_000);
-        let per_row = chrom_fixture("per_row.parquet", 6, 4, 1);
+        let one_group = chrom_fixture("one_group.parquet", 8, 4, 1_000);
+        let per_row = chrom_fixture("per_row.parquet", 8, 4, 1);
         assert_eq!(
             TableFile::open(&per_row)
                 .unwrap()
                 .row_group_stats("candidate_id")
                 .unwrap()
                 .len(),
-            24,
+            32,
             "every row its own group, so every candidate straddles three seams"
+        );
+        assert_eq!(
+            TableFile::open(&one_group)
+                .unwrap()
+                .row_group_stats("candidate_id")
+                .unwrap()
+                .len(),
+            1,
+            "and the reference artifact is the single pass"
         );
         assert_eq!(quantify(&one_group, "whole"), quantify(&per_row, "split"));
     }
 
-    /// Single pass against the row-group plan on a table big enough to time.
+    /// Single pass against the row-group plan, IN THE SHIPPED REGIME.
     ///
-    /// Both arms read the same file from disk and build their own store, so neither is
-    /// handed a buffer the other pays for. Run with
+    /// The row-group size is the benchmark's main parameter and the earlier fixture had it
+    /// wrong: 8,192-row groups plan `524288/8192 = 64` readers, clamped to the pool, so
+    /// every span landed in ONE `spans.chunks(readers)` chunk with no merge barrier at all.
+    /// Extract writes 65,536-row groups (`CHROM_ROW_GROUP_ROWS`), which plan 8 readers and
+    /// therefore one serial `append` barrier per 8 groups. This fixture uses the shipped
+    /// size and enough groups for several chunks.
+    ///
+    /// Both arms read the same file and build their own store, and the arms run twice in
+    /// each order, because the first read warms the page cache for whichever runs second.
+    /// A second pair keeps only 5.6% of the rows, the fraction a real run keeps, since the
+    /// accepted-candidate filter decides how much of each decoded group is copied into the
+    /// span store. Run with
     /// `cargo test -p mumdia --release -- --ignored --nocapture chromatogram_read_arms`.
-    /// Measured 120,000 rows of 8-point traces in 15 row groups, 32 threads: one pass
-    /// 35.1-35.4 ms, row-group plan 12.8-15.9 ms over three runs. That is this fixture
-    /// with every candidate accepted and the file in page cache; a real artifact is 800 MB
-    /// of snappy and keeps 5.6% of its rows, so take the ratio, not the milliseconds.
+    ///
+    /// Still 8-point traces on a page-cached file, against 55.5 values per row and 802 MB
+    /// of snappy on the artifact: take the ratio, not the milliseconds.
     #[test]
     #[ignore = "microbenchmark"]
     fn chromatogram_read_arms() {
-        let path = chrom_fixture("bench.parquet", 20_000, 6, 1 << 13);
+        // 16 groups of 65,536 rows: 2 chunks at the 8 readers this plans.
+        let path = chrom_fixture("bench.parquet", 262_144, 4, 1 << 16);
         let ch = TableFile::open(&path).unwrap();
-        let wanted = CidSet::from_ids(&(0..20_000u32).collect::<Vec<u32>>());
+        let threads = rayon::current_num_threads();
         let groups = ch.row_group_stats("candidate_id").unwrap().len();
+        let all = CidSet::from_ids(&(0..262_144u32).collect::<Vec<u32>>());
+        // Every 18th candidate, which is the 5.6% a real run keeps.
+        let some = CidSet::from_ids(&(0..262_144u32).step_by(18).collect::<Vec<u32>>());
 
-        let t = Instant::now();
-        let serial = load_chrom_span(&ch, &CHROM_COLS, true, false, &wanted, &path).unwrap();
-        let serial_ms = t.elapsed().as_secs_f64() * 1e3;
-
-        let t = Instant::now();
-        let planned = load_chromatograms(&ch, true, false, &wanted, &path).unwrap();
-        let planned_ms = t.elapsed().as_secs_f64() * 1e3;
-
-        assert_eq!(store_rows(&planned), store_rows(&serial));
-        println!(
-            "rows {} groups {groups} threads {} | one pass {serial_ms:.1} ms | row-group plan \
-             {planned_ms:.1} ms",
-            serial.nrows(),
-            rayon::current_num_threads(),
-        );
+        for (label, wanted) in [("all rows", &all), ("5.6% of rows", &some)] {
+            let mut serial_ms = Vec::new();
+            let mut planned_ms = Vec::new();
+            let mut rows = 0usize;
+            for round in 0..2 {
+                // Swapped, so neither arm is always the one that finds the file cold.
+                let mut run_serial = || {
+                    let t = Instant::now();
+                    let s = load_chrom_span(&ch, &CHROM_COLS, true, false, wanted, &path).unwrap();
+                    serial_ms.push(t.elapsed().as_secs_f64() * 1e3);
+                    s
+                };
+                let mut run_planned = || {
+                    let t = Instant::now();
+                    let s = load_chromatograms(&ch, true, false, wanted, &path, threads).unwrap();
+                    planned_ms.push(t.elapsed().as_secs_f64() * 1e3);
+                    s
+                };
+                let (a, b) = if round == 0 {
+                    let a = run_serial();
+                    let b = run_planned();
+                    (a, b)
+                } else {
+                    let b = run_planned();
+                    let a = run_serial();
+                    (a, b)
+                };
+                assert_eq!(snapshot(&a), snapshot(&b));
+                rows = a.nrows();
+            }
+            println!(
+                "{label}: stored {rows} of {} rows, {groups} groups of 65536, {threads} threads \
+                 | one pass {serial_ms:?} ms | row-group plan {planned_ms:?} ms",
+                ch.nrows,
+            );
+        }
     }
 
     /// The accepted-candidate probe, at the shape it runs at on the six-run HYE artifact:
