@@ -168,7 +168,7 @@ discards the mobility dimension.
 Produce centroided mzML using the vendor peak-picking filter:
 
 ```
-msconvert sample.raw --mzML --64 --zlib --filter "peakPicking vendor msLevel=1-"
+msconvert sample.raw --mzML --mz64 --inten32 --zlib --filter "peakPicking vendor msLevel=1-"
 ```
 
 - `peakPicking vendor msLevel=1-` applies the instrument vendor's centroiding to

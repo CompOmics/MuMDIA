@@ -35,8 +35,27 @@ clap = { version = "4", features = ["derive"] }
 arrow = { version = "59", features = ["prettyprint"] }
 # Pure-Rust build: drop C zlib-ng (needs cmake); SNAPPY codec is pure Rust.
 parquet = { version = "59", default-features = false, features = ["arrow", "snap", "zstd"] }
-# Pure-Rust zlib backend (miniz_oxide) instead of zlib-ng-compat (needs cmake).
+# Pure-Rust zlib backend instead of zlib-ng-compat (needs cmake). `miniz_oxide` stays
+# so this line still selects a pure-Rust codec on its own.
 mzdata = { version = "0.66", default-features = false, features = ["mzml", "miniz_oxide"] }
+# NOT unused, and not to be deleted as such. mzdata-bindata is already in the graph as a
+# transitive dependency of mzdata; naming it here only turns on `zlib-rs`, which through
+# feature unification gives flate2 `any_zlib` and so selects the zlib-rs inflater instead
+# of miniz_oxide. Every mzML binary array is zlib-deflated and mzdata inflates it on the
+# decode thread, so this is the hottest codec in `convert`: measured on
+# LFQ_Orbitrap_AIF_Ecoli_02.mzML (1.54 GB, 236,042 spectra, 32 cores, warm, medians of
+# 3-4 runs per arm), convert went from 4,143 to 3,319 ms with two decode threads (-20%)
+# and from 2,079 to 1,859 ms with four (-11%), and is within noise at 32 threads
+# (1,513 against 1,479 ms) because the stage is then at its serial floor.
+# Byte-identical output: DEFLATE is exactly specified by RFC 1951 and no float arithmetic
+# is involved (the artifact hashes are unchanged on that file).
+#
+# Do NOT instead add `zlib-rs` to mzdata's own feature list: mzdata's `zlib-rs` feature
+# also enables `mzdata-spectrum/zlib`, which resolves to `flate2/zlib` -> `any_c_zlib` ->
+# libz-sys, and flate2 ranks the C backend ABOVE zlib-rs, so that spelling quietly
+# reintroduces a C build and selects the opposite codec. Verified with `cargo tree`: this
+# spelling adds zlib-rs 0.6.8 and no libz-sys.
+mzdata-bindata = { version = "0.66", default-features = false, features = ["zlib-rs"] }
 # Per-thread-arena allocator. The extraction accumulation is allocation-heavy and only
 # scaled ~1.07x across cores under the Windows system allocator's shared heap lock;
 # mimalloc is pure Rust (no cmake) and removes that serialisation. No behaviour change.

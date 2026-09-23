@@ -217,6 +217,83 @@ Note the artifacts are written in acquisition order. RT-sorting is deferred to t
 read side: `spectra::load_ms2` / `load_ms1` sort by `rt_seconds` after loading
 (`spectra.rs:95`, `spectra.rs:158`).
 
+### The two decode paths
+
+Steps 2 to 7 above describe the FOLD, which is still one thread in file order. The
+mzML PARSE that feeds it runs on several threads when the file's own offset index
+makes that safe.
+
+`decode_one` computes everything one spectrum contributes from that spectrum alone:
+retention time, MS level, peaks, isolation window, precursor. `Fold::absorb` owns
+everything that depends on what came before: `scan_index`, `last_ms1_index`, the
+window-id map, the two drop counters, the first offending scan id, and the parquet
+row order. Both decode paths call the same `decode_one` and the same
+`Fold::absorb`, in index order, so they cannot diverge.
+
+`drive_sequential` is what the stage always did: iterate `MZReader`, fold each
+spectrum as it arrives.
+
+`drive_parallel` takes the byte offset of every spectrum from the offset index that
+`MZReader::open_path` has ALREADY built or read (`new_indexed`; the cost is sunk
+either way and was previously discarded), cuts the file into chunks of about 1 MiB
+each, and gives worker `w` chunks `w, w + workers, ...`. Each worker opens its own
+reader with a 256 KiB buffer (mzdata's own default is 10,000 bytes), seeks to its
+chunk's first offset and decodes forwards. One bounded queue per worker, consumed
+strictly in chunk order, so the fold needs no reorder buffer and the in-flight
+memory is bounded by `workers x 3` chunks rather than by the file.
+
+It is taken only when all of these hold; otherwise the run is sequential, silently
+and with no loss beyond speed:
+
+- more than one decode thread (`MUMDIA_CONVERT_THREADS` overrides; `0` or `1`
+  forces sequential, and concurrent conversions under `experiment.parallel_runs`
+  share the rayon pool rather than each taking all of it);
+- the input is mzML (not, say, a future mzMLb);
+- `<spectrumList count=...>` is present and the offset index is initialised and
+  exactly that long;
+- a two-spectrum probe of the last and middle spectra seeks to the index's offset
+  and finds a spectrum that calls itself that index. This catches a stale index, a
+  short file, and a file whose `<spectrum>` elements omit the `index` attribute the
+  schema requires (mzdata then reports `0` for all of them, and a seek-driven
+  decode would mislabel every scan).
+
+A parse error part-way through the file behaves as it always did: a worker whose
+`read_next` gives up reports the index, the fold stops at the FIRST such index and
+discards everything after it, so `read` is still the length of the contiguous
+prefix and the completeness check still refuses a truncated file.
+
+**Equality.** Byte-identical artifacts, asserted rather than argued. Every float in
+`decode_one` is confined to one spectrum, so no reduction is reordered, and the fold
+is unchanged. Three unit tests diff all four parquet files and their content hashes
+between the two paths (uncapped, under `--max-spectra`, and with a wrong `index`
+attribute), and it was checked on two real 1.5 GB runs
+(`LFQ_Orbitrap_AIF_Ecoli_02/_03.mzML`): all four artifacts identical, and
+`ci/smoke.sh` produces the same `peptides.tsv` and `proteins.tsv` hashes either way.
+
+**Measured** on `LFQ_Orbitrap_AIF_Ecoli_02.mzML` (1.544 GB, 236,042 spectra, 32
+cores, warm page cache, medians of 3-4 runs per arm, the stage's own `elapsed_ms`):
+
+| decode threads | ms |
+|---|---|
+| sequential (the old path) | 14,490 |
+| 1 worker | 9,900 |
+| 2 | 3,319 |
+| 4 | 1,859 |
+| 8 | 1,414 |
+| 32 | 1,479 |
+
+About 10x end to end. `LFQ_Orbitrap_AIF_Ecoli_03.mzML`: 12,701 -> 1,544 ms. Note
+that no IO was removed: the same bytes are read from the same file. What moved is
+CPU and read syscalls. The 1-worker arm isolates the 256 KiB buffer and the chunked
+reads from the fan-out, and it is about a third of the total on its own; the rest is
+the parse spread over cores. The curve is flat past 8 because what remains is the
+serial tail -- the index read, the parquet encode and write, and the blake3 of the
+four artifacts -- which is roughly 1.4 s on this file.
+
+Peak process working set is unchanged: 9.8 MB sequential against 9.4 MB at 8 and at
+32 workers. Chunks are sized in FILE bytes, not in spectra, so a peak-dense
+acquisition does not inflate them.
+
 ## Key types and functions
 
 | Name | file:line | What it does |
@@ -565,12 +642,21 @@ ThermoRawFileParser is invoked with `-f 2` (indexed mzML, which is what msconver
 produces by default and therefore what the engine has always read) and `-m 2` (no
 metadata sidecar). Peak picking is left at its default, which is **on**.
 
-msconvert is invoked with `--mzML --64 --zlib --simAsSpectra`, plus
+msconvert is invoked with `--mzML --mz64 --inten32 --zlib --simAsSpectra`, plus
 `--filter "peakPicking vendor msLevel=1-"` for every vendor except Bruker, whose TDF
 data is already centroided and where msconvert rejects the filter. Vendor
 centroiding is better than the local-maxima fallback in `stages::convert`, which
 then sees centroided input and does nothing. `convert.msconvert_args` appends extra
 arguments verbatim; it is an escape hatch, not a tuning surface.
+
+The two width flags replaced a single `--64` (msconvert's own default, and it set
+both arrays). `stages::convert` stores intensity as f32 whatever it reads, so a
+64-bit intensity array was inflated at double width, base64'd, deflated, inflated
+again by mzdata and then halved on the first read; `--inten32` asks msconvert to do
+that one rounding at write time instead. Both regimes round once, to nearest, from
+the same source value, so the spectra artifacts and their content hashes are
+unchanged. m/z keeps 64 bits: convert reads that at full width. The saving is on
+the vendor path only, which is why it carries no benchmark number here.
 
 ## How to extend / modify
 
