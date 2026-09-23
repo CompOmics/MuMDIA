@@ -353,6 +353,11 @@ pub fn run(p: RunParams) -> Result<()> {
             info!(stage = %"search-seed", "run: stage start");
             let n = search_seed::run(search_seed::SearchSeedParams {
                 fragment_offset: None,
+                // Ungrouped: the seed and the extract below are the only readers of the
+                // spectra and they run minutes apart, so each decodes its own and drops
+                // it. Sharing here would hold ~1 GB across the retention-time model,
+                // which in a single run is where the tallest sidecar sits.
+                ms2_scans: None,
                 ms2: &co.ms2,
                 library_precursors: &lib_p,
                 library_fragments: &lib_f,
@@ -544,6 +549,7 @@ pub fn run(p: RunParams) -> Result<()> {
             let (npsm, nchr) = extract::run(extract::ExtractParams {
                 fragment_offset: None,
                 sibling_bands: 1,
+                scans: None,
                 ms2: &co.ms2,
                 library_precursors: &lib_p,
                 library_fragments: &lib_f,
