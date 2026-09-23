@@ -1011,29 +1011,6 @@ impl ChromChunk {
 /// `PrimitiveArray::values()` for the child's own offset, so `child[o[k]..o[k + 1]]` is
 /// exactly what `value(k).values()` returns. A null row yields an empty slice, which is
 /// what `append_row` left in the cleared scratch buffer.
-fn list_row<'a>(l: &ListF32<'a>, k: usize, name: &str) -> Result<&'a [f32]> {
-    let (child, lo, hi) = match *l {
-        ListF32::Small(a) => {
-            if a.is_null(k) {
-                return Ok(&[]);
-            }
-            let o = a.value_offsets();
-            (a.values(), o[k] as usize, o[k + 1] as usize)
-        }
-        ListF32::Large(a) => {
-            if a.is_null(k) {
-                return Ok(&[]);
-            }
-            let o = a.value_offsets();
-            (a.values(), o[k] as usize, o[k + 1] as usize)
-        }
-    };
-    let v = child
-        .as_any()
-        .downcast_ref::<Float32Array>()
-        .ok_or_else(|| anyhow!("list '{name}' inner is not f32"))?;
-    Ok(&v.values()[lo..hi])
-}
 
 /// Sequential reader over the chromatogram table that hands out one [`ChromChunk`] of a
 /// requested row count at a time. One decoded batch is resident beyond the chunk; a batch
@@ -1163,8 +1140,8 @@ impl ChromStream {
                     chunk.open_candidate(c);
                     open = Some(c);
                 }
-                let rt_row = list_row(&rt, k, "rt")?;
-                let int_row = list_row(&inten, k, "intensity")?;
+                let rt_row = rt.row_slice(k, "rt")?;
+                let int_row = inten.row_slice(k, "intensity")?;
                 let nm = name.value(k);
                 let id = names.intern(nm);
                 chunk.push_row(
@@ -3982,7 +3959,7 @@ mod tests {
         for _ in 0..reps {
             sink.clear();
             for k in 0..n {
-                sink.extend_from_slice(list_row(&rt, k, "rt").unwrap());
+                sink.extend_from_slice(rt.row_slice(k, "rt").unwrap());
             }
         }
         let new = t.elapsed();
@@ -4217,10 +4194,11 @@ mod tests {
         }
         let small: ArrayRef = std::sync::Arc::new(b.finish());
         let large: ArrayRef = std::sync::Arc::new(lb.finish());
-        assert!(matches!(
-            ListF32::of(&large, "trace").unwrap(),
-            ListF32::Large(_)
-        ));
+        // A LargeList is accepted and read through the same path as a List. The offset
+        // width is resolved inside `ListF32::of`, so there is no variant left to match on;
+        // what matters is that the wide form reads back, which the loop below checks value
+        // by value against `append_row`.
+        assert_eq!(ListF32::of(&large, "trace").unwrap().len(), 12);
         // Whole array, and the slices the loader takes at a chunk boundary: `value_offsets`
         // is adjusted for a sliced list, and this is where a hand-rolled offset would be
         // wrong.
@@ -4233,7 +4211,7 @@ mod tests {
                     want.clear();
                     l.append_row(k, &mut want, "trace").unwrap();
                     assert_eq!(
-                        list_row(&l, k, "trace").unwrap(),
+                        l.row_slice(k, "trace").unwrap(),
                         want.as_slice(),
                         "slice {off}..{} row {k}",
                         off + len
@@ -4242,17 +4220,19 @@ mod tests {
             }
         }
         // A non-f32 list is still an error rather than a silent reinterpretation, at both
-        // offset widths.
+        // offset widths. The error now surfaces when the column is OPENED rather than when
+        // a row is read: `ListF32::of` resolves the child once instead of downcasting per
+        // row, so a wrong inner type is refused before any row is handed out.
         let mut ib = ListBuilder::new(arrow::array::Int32Builder::new());
         ib.values().append_value(1);
         ib.append(true);
         let iarr: ArrayRef = std::sync::Arc::new(ib.finish());
-        assert!(list_row(&ListF32::of(&iarr, "trace").unwrap(), 0, "trace").is_err());
+        assert!(ListF32::of(&iarr, "trace").is_err());
         let mut ilb = LargeListBuilder::new(arrow::array::Int32Builder::new());
         ilb.values().append_value(1);
         ilb.append(true);
         let ilarr: ArrayRef = std::sync::Arc::new(ilb.finish());
-        assert!(list_row(&ListF32::of(&ilarr, "trace").unwrap(), 0, "trace").is_err());
+        assert!(ListF32::of(&ilarr, "trace").is_err());
     }
 
     #[test]
