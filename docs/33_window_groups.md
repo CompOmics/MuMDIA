@@ -418,8 +418,20 @@ selects the same calibrants:
 
 The residual difference is the sidecar storing deviations as f32. Downstream, the banded run
 then extracts the SAME candidate set as the unbanded one, to the row: 4,986,153 accepted and
-74,115,941 chromatogram rows in both. So banding is identification-neutral on this data once
-the calibration is fitted once, and what it costs is the fixed per-band work above.
+74,115,941 chromatogram rows in both, and 4,986,153 scored rows against the unbanded run's
+4,986,153.
+
+| at 1% | unbanded | 100 bands, per-band scalars | 100 bands, pooled deviations |
+|---|---|---|---|
+| precursors | 126,436 | 121,966 | 125,983 |
+| peptides | 113,860 | 110,006 | 113,789 |
+| protein groups | 12,166 | 12,029 | 12,221 |
+
+That is 98% of the lost peptides recovered, and what remains is inside the single-seed
+spread this pool shows (about 0.4%, docs/28): the protein groups come back slightly above
+the unbanded arm, which is the same noise in the other direction. Banding is
+identification-neutral on this data once the calibration is fitted once, and what it costs
+is the fixed per-band work above.
 
 ### `groups.parallel` and the thread count
 
