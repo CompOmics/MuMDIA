@@ -62,6 +62,15 @@ pub fn target_decoy_q(scores: &[(f64, bool)]) -> Vec<f64> {
 /// so it stayed resident for the entire fit. `entrapment_q` below already takes its
 /// columns separately, so this makes the two kernels consistent rather than adding a
 /// convention.
+///
+/// Five call sites are still on the pair form, and the largest of them is the pooled PSM q
+/// over the whole scored table (`stages/rescore.rs:685`, `:753`, `:1273`,
+/// `stages/search_seed.rs:158`, `stages/seed_pool.rs:166`), where the staging buffer is
+/// 186 MB at 11.6M rows -- bigger than the one this form was introduced to remove. They
+/// should move too; they are outside the file set of the change that added this, which is
+/// why they have not. Note that this is a saving left on the table, NOT a divergence
+/// hazard: both entry points are one-line wrappers over `target_decoy_q_core` below and
+/// there is no second copy of the estimator to drift.
 pub fn target_decoy_q_split(scores: &[f64], is_decoy: &[bool]) -> Vec<f64> {
     assert_eq!(
         scores.len(),

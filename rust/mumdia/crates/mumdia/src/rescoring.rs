@@ -176,11 +176,26 @@ fn score_std_row(w: &[f64], row: &[f32], mean: &[f64], std: &[f64]) -> f64 {
     z
 }
 
-/// Columns per gradient band: 16 f32 = 64 B = exactly one cache line, so a band's pass
-/// over the training slice uses every byte it fetches. Narrower bands would give more
-/// parallel tasks but split a cache line across threads, so the same line would be
-/// fetched once per band that touches it; wider bands read more than one line per row and
-/// leave fewer tasks. At the shipped feature count (387) this is 25 bands.
+/// Columns per gradient band: 16 f32 = 64 B, the size of one cache line. That BOUNDS the
+/// over-fetch of phase 2b at 2x; it does not remove it, and the earlier claim here that "a
+/// band uses every byte it fetches" holds only where the row stride is a multiple of 64,
+/// which at the shipped feature count it is not. The stride is 387 * 4 = 1548 B and
+/// 1548 mod 64 = 12, so successive row starts walk the residues of gcd(1548, 64) = 4 and
+/// land on a line boundary once every 16 rows; the other 15 straddle two lines. Expected
+/// lines per band-row is 1/16 + 15/16 * 2 = 1.94, so a band moves about 1.94x its payload.
+///
+/// What the width actually trades is that over-fetch, roughly 1 + 16 / GRAD_BAND, against
+/// the task count, ceil(d / GRAD_BAND). At d = 387: 8 gives 49 tasks at ~3x over-fetch, 16
+/// gives 25 at ~2x, 32 gives 13 at ~1.5x, 64 gives 7 at ~1.25x -- and 25 tasks is already
+/// fewer than this machine's 32 threads, so neither end of that trade is free.
+///
+/// Swept rather than argued (`logreg_fit_epoch_cost` below, 300,000 x 387 x 5 epochs, best
+/// of 3 interleaved repeats, i9-13900KS, 32 rayon threads; the serial control arm read
+/// 0.500-0.517 s in all four builds, so the four are comparable): two-phase 0.144 s at
+/// GRAD_BAND 8, 0.101 s at 16, 0.123 s at 32, 0.160 s at 64. 16 is the measured optimum, so
+/// the constant stands even though the reasoning that first justified it did not. The band
+/// width cannot change any result: each column is a left-fold over rows in ascending order
+/// whatever band it lands in.
 const GRAD_BAND: usize = 16;
 
 /// Logistic regression by full-batch gradient descent with L2. Weight[0] = bias.
@@ -207,38 +222,62 @@ const GRAD_BAND: usize = 16;
 /// walks the rows in the same ascending order and adds the same terms to the same
 /// accumulator in the same sequence. No sum is reordered anywhere in either phase.
 ///
-/// The cost is one extra streaming pass over the training slice per epoch (phase 1 reads
-/// it to produce `err`, phase 2 reads it again to fold), which is why the band width is a
-/// cache line: the second pass then moves exactly its payload rather than 16x it.
+/// The cost is more than the "one extra streaming pass over the training slice" an earlier
+/// version of this comment claimed. Phase 1 reads the slice to produce `err` and phase 2b
+/// reads it again to fold, which is the two passes; but phase 2b also re-reads the whole
+/// `rows` pointer vector and the whole `errs` column ONCE PER BAND, so both are read
+/// `ceil(d / GRAD_BAND)` = 25 times per epoch at the shipped feature count. At a real
+/// 2.09M-row fold (the six-run Astral pool at 3 folds) that is 25 x 33.4 MB of fat
+/// pointers plus 25 x 16.7 MB of residuals, 1.25 GB, on top of two 3.23 GB matrix passes:
+/// 7.7 GB per epoch against the serial form's 3.28 GB, so 2.4x the DRAM traffic and not
+/// the 2x this comment used to say. It is still a win because the serial form cannot use
+/// more than one core of that bandwidth, but it is the reason the measured speedup is well
+/// under the core count and falls as the slice grows.
+///
+/// Two ways out, neither taken here: fusing the two phases over L3-sized row blocks halves
+/// the matrix traffic (legal, since a per-column fold over consecutive row blocks adds the
+/// same terms in the same order), and indexing a flat training matrix instead of taking
+/// `&[&[f32]]` would remove the pointer vector entirely -- `percolator_lite` already has
+/// `xtr` flat and builds the pointers only to express the positive-set subset.
 ///
 /// Measured by `logreg_fit_epoch_cost` below on an i9-13900KS (8 P + 16 E cores,
-/// dual-channel DDR5), release, 32 rayon threads, 387 features: 2.7-4.3x at 60,000 rows,
-/// 3.2x at 300,000 rows (serial 104 ms/epoch, two-phase 32 ms/epoch), 4.4x at 16,000 rows
-/// and 5.3x at 4,000. The gain FALLS as the slice grows because the two passes are then
-/// DRAM streams: at 300,000 rows the two-phase epoch moves 2 x 464 MB in 32 ms, which is
-/// ~29 GB/s and about all this desktop's two memory channels have. That is the honest
-/// bound on the claim. Extrapolating the serial arm does corroborate the size of the
-/// problem (104 ms/epoch at 300,000 x 387 scales to ~415 ms at a real ~1.2M-row fold, so
-/// ~14 min for the 2,000 epochs of one fold), but a many-channel server should land far
-/// above 3.2x and this fixture cannot show that. Halving the DRAM traffic by fusing the
-/// two phases over L3-sized row blocks -- legal, since a per-column fold over consecutive
-/// row blocks adds the same terms in the same order -- is the obvious next step and is
-/// not done here.
+/// dual-channel DDR5), release, 32 rayon threads, 387 features, best of 3 interleaved
+/// repeats: 6.1x at 4,000 rows, 8.5x at 16,000, 5.1x at 60,000, 5.1x at 300,000 (serial
+/// 103 ms/epoch, two-phase 20 ms/epoch) and 4.9x at 1,000,000. An earlier single-shot run
+/// of this fixture recorded 5.3x / 4.4x / 2.7-4.3x / 3.2x at the first four sizes; the
+/// serial arm reproduces to 1% (104 against 103 ms/epoch), so it was the two-phase arm
+/// that was mistimed, which is why every arm is now repeated and interleaved. The
+/// 1,000,000-row point is the least trustworthy of the five (spread 1.8x across repeats
+/// against 1.02-1.10x at the smaller sizes).
+///
+/// The gain does fall as the slice grows, and the ceiling is bandwidth: at 300,000 rows the
+/// two-phase epoch moves 2 x 464 MB of matrix plus 25 x 7.2 MB of pointers and residuals in
+/// 20 ms, 55 GB/s, and at 1,000,000 rows 3.70 GB in 69 ms, 53 GB/s -- the same ceiling
+/// twice, which is about all this desktop's two channels have. Extrapolating the serial arm
+/// corroborates the size of the problem: 103 ms/epoch at 300,000 x 387 scales to ~415 ms at
+/// a real ~1.2M-row fold, so ~14 min for the 2,000 epochs of one fold. A many-channel
+/// server should land above these ratios and this fixture cannot show that.
 fn logreg_fit(rows: &[&[f32]], y: &[f64], l2: f64, epochs: usize, lr: f64) -> Vec<f64> {
     let d = rows.first().map(|r| r.len()).unwrap_or(0);
     let mut w = vec![0.0f64; d + 1];
     if rows.is_empty() {
         return w;
     }
-    // `n` is the row count, as before; the `zip` below stopped at the shorter of the two
-    // sequences, so the rows actually visited are the first `m`. Callers push `rows` and
-    // `y` in lockstep, but keeping the truncation explicit means the two forms agree even
-    // where they disagree with the caller.
+    // The one-pass form `zip`ped `rows` with `y` and so silently stopped at the shorter of
+    // the two, while still dividing the gradient by `rows.len()`: a short `y` produced a
+    // fitted model rather than an error. Every caller pushes the two in lockstep, so the
+    // condition is a caller bug and not a shape to support; assert it rather than
+    // entrenching the truncation. (Checked after the empty-`rows` early return above, which
+    // both forms take before they look at `y` at all.)
+    assert_eq!(
+        rows.len(),
+        y.len(),
+        "logreg_fit: {} rows against {} labels",
+        rows.len(),
+        y.len()
+    );
     let n = rows.len() as f64;
-    let m = rows.len().min(y.len());
-    let rows = &rows[..m];
-    let y = &y[..m];
-    let mut errs = vec![0.0f64; m];
+    let mut errs = vec![0.0f64; rows.len()];
     let mut grad = vec![0.0f64; d];
     for _ in 0..epochs {
         // Phase 1: per-row residual, parallel over rows.
@@ -321,6 +360,33 @@ pub fn percolator_lite(inp: RescoreInput) -> Vec<f64> {
         n <= u32::MAX as usize,
         "percolator_lite: {n} rows exceeds the u32 row index"
     );
+    // The four per-PSM columns must all be `n` long. This used to be enforced by accident:
+    // the fold loop was `(0..n).filter(|&i| fold_of[i] != test_fold)`, which panicked on a
+    // short `fold_key`. Driving the loop off `fold_of` instead would have turned that into
+    // something worse than a crash -- the trailing PSMs would be assigned to no fold, never
+    // scored, and silently returned at their unrescored `init_score`, from where they enter
+    // the q population as if they had been rescored. `is_decoy` and `init_score` are checked
+    // for the same reason: both are indexed by matrix row below, and `final_score` is sized
+    // from `init_score`. No caller is short today (`native_scores` builds all four from the
+    // same table), but a sub-batched caller easily could be.
+    assert_eq!(
+        inp.fold_key.len(),
+        n,
+        "percolator_lite: {} fold keys against {n} matrix rows",
+        inp.fold_key.len()
+    );
+    assert_eq!(
+        inp.is_decoy.len(),
+        n,
+        "percolator_lite: {} decoy labels against {n} matrix rows",
+        inp.is_decoy.len()
+    );
+    assert_eq!(
+        inp.init_score.len(),
+        n,
+        "percolator_lite: {} initial scores against {n} matrix rows",
+        inp.init_score.len()
+    );
     let folds = inp.folds.max(1);
     let d = inp.features.n_features();
 
@@ -340,27 +406,57 @@ pub fn percolator_lite(inp: RescoreInput) -> Vec<f64> {
     //
     // They run ONE AT A TIME. A parallel map over folds used to be the only source of
     // threads in this rescorer, and the price was that every fold's standardised training
-    // copy was live at once: with the default 3 folds the peak was the matrix plus three
-    // 2/3-sized copies of it, roughly (1 + folds) x the matrix (4.85 + 3 x 3.23 = 14.6 GB
-    // on a six-run Astral pool of 3,133,636 PSMs x 387 features; 53.8 GB at 11.6M PSMs).
-    // Sequentially it is the matrix plus one copy: 8.1 GB and 29.9 GB, a saving of 6.5 and
-    // 23.9 GB. `train_idx`/`test_idx`, `mean`/`std`, `train_scores` and the `rows` pointer
-    // vector become single-copy at the same time. What makes this affordable is that
-    // `logreg_fit` and the per-row maps below are parallel in their own right, so one fold
-    // already saturates the machine; before that change this would have been 3x the wall.
+    // copy was live at once. A training copy is `(folds - 1) / folds` of the matrix, so
+    // `folds` of them is `folds - 1` matrices and the old peak was the matrix plus that:
+    // `folds` x the matrix exactly, not the "(1 + folds) x" several places still say. With
+    // the default 3 folds, 4.85 + 3 x 3.23 = 14.55 GB on a six-run Astral pool of 3,133,636
+    // PSMs x 387 features (3.00x), and 53.8 GB at 11.6M PSMs.
     //
-    // The wall-clock trade is NOT unconditional and the memory saving is: this arrangement
-    // is faster only where the per-fold speedup beats `folds`, because the old one got
-    // exactly `folds`-way parallelism for free. Measured by `percolator_lite_fold_cost`
-    // below on an i9-13900KS (32 rayon threads, dual-channel DDR5, 387 features, training
-    // slices of 206-310 MB so nothing is cache-resident): 1.51x at the default 3 folds,
-    // 0.91x at 5. On the same fixture shrunk to 30,000 PSMs the numbers are 5.00x / 0.97x /
-    // 0.24x at 2 / 3 / 5 folds, and that cliff is an artifact of the training slice
-    // crossing this chip's 36 MB L3 (23 / 31 / 37 MB), not of the fold count -- it is the
-    // reason the honest fixture is the large one. A machine with more memory channels
-    // should sit well above these ratios, since the fitter is bandwidth-bound here (see
-    // `logreg_fit`). At `folds: 5`, the opt-in "sensitivity" recipe, expect wall parity at
-    // best on a desktop and take the 1.8x smaller peak as the reason.
+    // Sequentially it is the matrix plus ONE copy, `1 + (folds - 1) / folds` x the matrix:
+    // 1.50x at 2 folds, 1.67x at 3, 1.80x at 5, approaching 2x and never above it. That is
+    // 8.08 GB and 29.9 GB on the two pools above, a saving of 6.47 and 23.9 GB, and the
+    // point is that the peak no longer grows with `folds` at all. Independently verified at
+    // 300,000 x 387: folds=3 1,385 -> 767 MB, folds=5 2,308 -> 829 MB.
+    // `train_idx`/`test_idx`, `mean`/`std`, `train_scores` and the `rows` pointer vector
+    // become single-copy at the same time. What makes this affordable is that `logreg_fit`
+    // and the per-row maps below are parallel in their own right, so one fold already
+    // saturates the machine; before that change this would have been 3x the wall.
+    //
+    // The wall-clock trade is conditional in principle and the memory saving is not: this
+    // arrangement is faster only where the per-fold speedup beats `folds`, because the old
+    // one got exactly `folds`-way parallelism for free. In practice, on this fixture, it
+    // wins everywhere measured. `percolator_lite_fold_cost` below, against a transcription
+    // of the PARENT commit's production code, i9-13900KS, 32 rayon threads, 387 features,
+    // 200,000 PSMs (training slices 206-310 MB, nothing cache-resident), best of 3
+    // interleaved repeats:
+    //
+    //     folds   num_iter 2   num_iter 10 (the shipped `rescore.num_iter`)
+    //     3       1.91x        2.03x
+    //     5       1.31x        1.30x
+    //
+    // and on the same fixture at 30,000 PSMs, num_iter 10: 6.16x / 3.82x / 2.17x at 2 / 3 /
+    // 5 folds (at num_iter 2: 5.82x / 3.46x / 1.89x). The implied per-fold speedup is
+    // consistent across the two fold counts -- 107.4 s of parent against 3 x 17.6 s here at
+    // 3 folds, 135.8 against 5 x 20.9 at 5, so about 6.1x and 6.5x -- and it beats both.
+    //
+    // Three earlier numbers are WITHDRAWN. "1.51x at 3 folds, 0.91x at 5" and "0.24x at 5
+    // folds" on the 30,000-PSM fixture were single shots against a reference arm that was
+    // NOT the parent: it reintroduced a `Vec<Vec<f32>>` the parent had already removed. That
+    // arm is measurable here (`MUMDIA_BENCH_BASELINE=per_row`) and it is 1.03x the parent's
+    // wall at 3 folds but 1.56x at 5 (211.6 s against 135.8), so it inflated exactly the
+    // configuration where the change is weakest. It also perturbs the arm it is compared
+    // against: at 5 folds it keeps ~800,000 live heap blocks, and the interleaved sequential
+    // arm then varied 124-212 s against 104-105 s when the baseline is the parent. And
+    // `MUMDIA_BENCH_ITERS` defaulted to 2 against a shipped `num_iter` of 10. The
+    // L3-thrashing story told to explain the 0.24x was explaining a noise artifact:
+    // repeated and interleaved, that exact configuration reads 1.89x. `num_iter` does move
+    // the answer in the predicted direction, because the per-fold serial remainder is paid
+    // once per fold whatever `num_iter` is and so costs relatively more when the fit is
+    // short, but by 6% at 3 folds and by nothing at 5 -- not by a change of sign.
+    //
+    // This remains a microbenchmark of one kernel on one desktop: nothing here measures
+    // `mumdia rescore` on a real competed table. A machine with more memory channels should
+    // sit above these ratios, since the fitter is bandwidth-bound (see `logreg_fit`).
     //
     // What this also costs is the serial remainder (the tied-block walk in
     // `target_decoy_q`, the positive-set build, the bias fold, `fit_standardizer`), which
@@ -572,12 +668,15 @@ mod tests {
         (x, y)
     }
 
-    /// `percolator_lite` as it was before the flattening, transcribed: `xtr` as a
-    /// `Vec<Vec<f32>>`, and the test fold scored through a materialised `std_row`. The
-    /// claim the rewrite makes is bit-equality of the scores, so the old layout is kept
-    /// here as the thing to compare against rather than asserting properties of the new
-    /// one.
-    fn percolator_lite_reference(inp: RescoreInput) -> Vec<f64> {
+    /// `percolator_lite` two layouts back, before the training slice was flattened:
+    /// `xtr` as a `Vec<Vec<f32>>`, and the test fold scored through a materialised
+    /// `std_row`. Kept as the OLDEST form the current scores are still pinned against, so
+    /// the equality claim reaches back past the parent as well.
+    ///
+    /// This is NOT the arm to time against. It is one heap block per training row, which
+    /// the parent had already removed; see `percolator_lite_parent` for the baseline the
+    /// benchmark uses.
+    fn percolator_lite_per_row_reference(inp: RescoreInput) -> Vec<f64> {
         let n = inp.features.rows();
         if n == 0 {
             return Vec::new();
@@ -665,6 +764,111 @@ mod tests {
         final_score
     }
 
+    /// The parent's `std_row_into`: appends into a `Vec<f32>` rather than writing into a
+    /// caller-provided slice, which is what made its `xtr` fill serial.
+    fn std_row_into_parent(row: &[f32], mean: &[f64], std: &[f64], out: &mut Vec<f32>) {
+        out.extend((0..row.len()).map(|j| ((row[j] as f64 - mean[j]) / std[j]) as f32));
+    }
+
+    /// The PARENT commit's production `percolator_lite`, transcribed line for line: the
+    /// parallel map over folds, `usize` bookkeeping, a FLAT `xtr` filled serially by
+    /// `std_row_into_parent`, the `Vec<(f64, bool)>` staging buffer allocated outside the
+    /// `num_iter` loop and refilled inside it, the serial one-pass `logreg_fit_reference`,
+    /// a serial `train_scores` rebuild, and the test fold scored by the allocation-free
+    /// `score_std_row`.
+    ///
+    /// This is the baseline `percolator_lite_fold_cost` times, and getting it right is the
+    /// whole point of the function. An earlier version of that benchmark timed the per-row
+    /// reference above instead, which reintroduces a `Vec<Vec<f32>>` the parent had already
+    /// removed. Measured at 200,000 x 387 x 10 iters, that arm costs 1.03x the parent's wall
+    /// at 3 folds and 1.56x at 5, so it flattered the new arrangement most in the
+    /// configuration where the new arrangement is weakest. Nothing here may be
+    /// "modernised": if a line looks avoidable, that is the measurement it exists to make.
+    fn percolator_lite_parent(inp: RescoreInput) -> Vec<f64> {
+        let n = inp.features.rows();
+        if n == 0 {
+            return Vec::new();
+        }
+        let folds = inp.folds.max(1);
+        let fold_of: Vec<usize> = inp.fold_key.iter().map(|c| (*c as usize) % folds).collect();
+        let per_fold: Vec<Vec<(usize, f64)>> = (0..folds)
+            .into_par_iter()
+            .map(|test_fold| {
+                let train_idx: Vec<usize> = (0..n).filter(|&i| fold_of[i] != test_fold).collect();
+                let test_idx: Vec<usize> = (0..n).filter(|&i| fold_of[i] == test_fold).collect();
+                if train_idx.is_empty() || test_idx.is_empty() {
+                    return Vec::new();
+                }
+                let (mean, std) = fit_standardizer_reference(inp.features, &train_idx);
+                let d = inp.features.n_features();
+                let mut xtr: Vec<f32> = Vec::with_capacity(train_idx.len().saturating_mul(d));
+                for &i in &train_idx {
+                    std_row_into_parent(inp.features.row(i), &mean, &std, &mut xtr);
+                }
+                let xrow = |k: usize| -> &[f32] { &xtr[k * d..(k + 1) * d] };
+                let mut train_scores: Vec<f64> =
+                    train_idx.iter().map(|&i| inp.init_score[i]).collect();
+                let mut w = vec![0.0; inp.features.n_features() + 1];
+                let mut sd: Vec<(f64, bool)> = Vec::with_capacity(train_idx.len());
+                for _ in 0..inp.num_iter.max(1) {
+                    sd.clear();
+                    sd.extend(
+                        train_idx
+                            .iter()
+                            .enumerate()
+                            .map(|(k, &i)| (train_scores[k], inp.is_decoy[i])),
+                    );
+                    let q = target_decoy_q(&sd);
+                    let mut rows: Vec<&[f32]> = Vec::new();
+                    let mut ys: Vec<f64> = Vec::new();
+                    let mut n_pos = 0;
+                    for (k, &i) in train_idx.iter().enumerate() {
+                        if inp.is_decoy[i] {
+                            rows.push(xrow(k));
+                            ys.push(0.0);
+                        } else if q[k] <= inp.train_fdr {
+                            rows.push(xrow(k));
+                            ys.push(1.0);
+                            n_pos += 1;
+                        }
+                    }
+                    if n_pos < 10 {
+                        let mut order: Vec<usize> = (0..train_idx.len()).collect();
+                        order.sort_by(|&a, &b| train_scores[b].total_cmp(&train_scores[a]));
+                        let take = (train_idx.len() / 2).max(1);
+                        rows.clear();
+                        ys.clear();
+                        for (rank, &k) in order.iter().enumerate() {
+                            let i = train_idx[k];
+                            if inp.is_decoy[i] {
+                                rows.push(xrow(k));
+                                ys.push(0.0);
+                            } else if rank < take {
+                                rows.push(xrow(k));
+                                ys.push(1.0);
+                            }
+                        }
+                    }
+                    w = logreg_fit_reference(&rows, &ys, 1e-3, 200, 0.5);
+                    train_scores = (0..train_idx.len())
+                        .map(|k| score_row(&w, xrow(k)))
+                        .collect();
+                }
+                test_idx
+                    .iter()
+                    .map(|&i| (i, score_std_row(&w, inp.features.row(i), &mean, &std)))
+                    .collect()
+            })
+            .collect();
+        let mut final_score = inp.init_score.to_vec();
+        for fold_scores in per_fold {
+            for (i, s) in fold_scores {
+                final_score[i] = s;
+            }
+        }
+        final_score
+    }
+
     /// A synthetic population wide enough that the flattening matters and mixed enough
     /// that both the confident-target branch and the top-half fallback are exercised.
     fn crafted_population(n: usize, d: usize) -> (FeatureMatrix, Vec<bool>, Vec<u32>, Vec<f64>) {
@@ -696,7 +900,11 @@ mod tests {
     }
 
     #[test]
-    fn flat_training_matrix_scores_bit_identically_to_the_per_row_layout() {
+    fn sequential_folds_score_bit_identically_to_both_older_layouts() {
+        // Against the PARENT (the code actually replaced) and against the per-row layout
+        // two steps back, because each pins a different claim: the parent pins this
+        // series, the per-row one pins that the flattening before it still holds.
+        let bits = |v: Vec<f64>| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
         let (features, is_decoy, key, init) = crafted_population(600, 9);
         let mk = || RescoreInput {
             features: &features,
@@ -707,11 +915,16 @@ mod tests {
             num_iter: 4,
             train_fdr: 0.05,
         };
-        let got = percolator_lite(mk());
-        let want = percolator_lite_reference(mk());
+        let got = bits(percolator_lite(mk()));
         assert_eq!(
-            got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-            want.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+            got,
+            bits(percolator_lite_parent(mk())),
+            "against the parent"
+        );
+        assert_eq!(
+            got,
+            bits(percolator_lite_per_row_reference(mk())),
+            "against the per-row layout"
         );
         // And the fallback branch (too few confident targets to train on) as well.
         let (features, is_decoy, key, init) = crafted_population(40, 5);
@@ -724,16 +937,50 @@ mod tests {
             num_iter: 3,
             train_fdr: 1e-9,
         };
+        let got = bits(percolator_lite(mk()));
         assert_eq!(
-            percolator_lite(mk())
-                .iter()
-                .map(|v| v.to_bits())
-                .collect::<Vec<_>>(),
-            percolator_lite_reference(mk())
-                .iter()
-                .map(|v| v.to_bits())
-                .collect::<Vec<_>>()
+            got,
+            bits(percolator_lite_parent(mk())),
+            "against the parent"
         );
+        assert_eq!(
+            got,
+            bits(percolator_lite_per_row_reference(mk())),
+            "against the per-row layout"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "percolator_lite: 40 fold keys against 60 matrix rows")]
+    fn a_short_fold_key_is_rejected_rather_than_silently_leaving_psms_unrescored() {
+        // The parent panicked here (`(0..n).filter(|&i| fold_of[i] != test_fold)`). Driving
+        // the fold loop off `fold_of` instead would return the trailing 20 PSMs at their
+        // unrescored `init_score`, and nothing downstream can tell those from real scores.
+        let (features, is_decoy, key, init) = crafted_population(60, 4);
+        percolator_lite(RescoreInput {
+            features: &features,
+            is_decoy: &is_decoy,
+            fold_key: &key[..40],
+            init_score: &init,
+            folds: 3,
+            num_iter: 1,
+            train_fdr: 0.05,
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "percolator_lite: 40 initial scores against 60 matrix rows")]
+    fn a_short_init_score_is_rejected() {
+        let (features, is_decoy, key, init) = crafted_population(60, 4);
+        percolator_lite(RescoreInput {
+            features: &features,
+            is_decoy: &is_decoy,
+            fold_key: &key,
+            init_score: &init[..40],
+            folds: 3,
+            num_iter: 1,
+            train_fdr: 0.05,
+        });
     }
 
     #[test]
@@ -793,8 +1040,8 @@ mod tests {
             }
         }
         // Degenerate shapes the caller can still produce: no rows at all (an empty
-        // positive set), a `y` shorter than `rows` (the `zip` truncation the one-pass form
-        // had), and zero epochs.
+        // positive set, which both forms return from before they look at `y`), and zero
+        // epochs.
         let (x, y) = training_slice(8, 4);
         let r: Vec<&[f32]> = x.chunks_exact(4).collect();
         let empty: [&[f32]; 0] = [];
@@ -802,24 +1049,26 @@ mod tests {
             logreg_fit(&empty, &y, 1e-3, 3, 0.5),
             logreg_fit_reference(&empty, &y, 1e-3, 3, 0.5)
         );
-        assert_eq!(
-            logreg_fit(&r, &y[..3], 1e-3, 5, 0.5)
-                .iter()
-                .map(|v| v.to_bits())
-                .collect::<Vec<_>>(),
-            logreg_fit_reference(&r, &y[..3], 1e-3, 5, 0.5)
-                .iter()
-                .map(|v| v.to_bits())
-                .collect::<Vec<_>>()
-        );
         assert_eq!(logreg_fit(&r, &y, 1e-3, 0, 0.5), vec![0.0f64; 5]);
+    }
+
+    #[test]
+    #[should_panic(expected = "logreg_fit: 8 rows against 3 labels")]
+    fn mismatched_rows_and_labels_are_rejected_rather_than_truncated() {
+        // The one-pass form `zip`ped and so fitted on the first 3 rows while dividing the
+        // gradient by 8. Callers push the two in lockstep; a mismatch is a caller bug.
+        let (x, y) = training_slice(8, 4);
+        let r: Vec<&[f32]> = x.chunks_exact(4).collect();
+        logreg_fit(&r, &y[..3], 1e-3, 5, 0.5);
     }
 
     /// Microbenchmark, not an assertion about any machine: the one-pass serial fit against
     /// the two-phase one on a slice shaped like a training fold (387 features), small
     /// enough to run in a test. Both arms are handed the same prebuilt row pointers and
     /// each allocates its own per-epoch working set inside the timer, so neither is
-    /// credited with work the other pays for. Run with
+    /// credited with work the other pays for. Repeated `MUMDIA_BENCH_REPS` times with the
+    /// arms interleaved and the order alternating, summarised on the minimum with the
+    /// spread printed, for the same reason as `percolator_lite_fold_cost` below. Run with
     /// `cargo test -p mumdia --release -- --ignored --nocapture logreg_fit_epoch_cost`.
     #[test]
     #[ignore = "microbenchmark; meaningful only in release"]
@@ -833,10 +1082,11 @@ mod tests {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(dflt)
         };
-        let (d, rows, epochs) = (
+        let (d, rows, epochs, reps) = (
             env("MUMDIA_BENCH_D", 387),
             env("MUMDIA_BENCH_ROWS", 60_000),
             env("MUMDIA_BENCH_EPOCHS", 5),
+            env("MUMDIA_BENCH_REPS", 3).max(1),
         );
         let (x, y) = training_slice(rows, d);
         let r: Vec<&[f32]> = x.chunks_exact(d).collect();
@@ -845,21 +1095,47 @@ mod tests {
             logreg_fit_reference(&r, &y, 1e-3, 1, 0.5),
             logreg_fit(&r, &y, 1e-3, 1, 0.5)
         );
-        let t0 = std::time::Instant::now();
-        let a = logreg_fit_reference(&r, &y, 1e-3, epochs, 0.5);
-        let serial = t0.elapsed();
-        let t1 = std::time::Instant::now();
-        let b = logreg_fit(&r, &y, 1e-3, epochs, 0.5);
-        let two_phase = t1.elapsed();
-        assert_eq!(
-            a.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-            b.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-            "the benchmark arms must agree bit for bit"
-        );
+        let bits = |v: Vec<f64>| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        let time = |f: &dyn Fn() -> Vec<f64>| {
+            let t = std::time::Instant::now();
+            let v = f();
+            (t.elapsed().as_secs_f64(), bits(v))
+        };
+        let old = || logreg_fit_reference(&r, &y, 1e-3, epochs, 0.5);
+        let new = || logreg_fit(&r, &y, 1e-3, epochs, 0.5);
+        let (mut olds, mut news) = (Vec::new(), Vec::new());
+        for rep in 0..reps {
+            let (a, b) = if rep % 2 == 0 {
+                let a = time(&old);
+                let b = time(&new);
+                (a, b)
+            } else {
+                let b = time(&new);
+                let a = time(&old);
+                (a, b)
+            };
+            assert_eq!(a.1, b.1, "the benchmark arms must agree bit for bit");
+            println!(
+                "  rep {rep}: serial {:.3} s, two-phase {:.3} s ({:.2}x)",
+                a.0,
+                b.0,
+                a.0 / b.0
+            );
+            olds.push(a.0);
+            news.push(b.0);
+        }
+        let lo = |v: &[f64]| v.iter().copied().fold(f64::INFINITY, f64::min);
+        let hi = |v: &[f64]| v.iter().copied().fold(f64::NEG_INFINITY, f64::max);
         println!(
-            "logreg_fit {rows} rows x {d} features x {epochs} epochs, {} rayon threads:              serial {serial:?}, two-phase {two_phase:?} ({:.2}x)",
+            "logreg_fit {rows} rows x {d} features x {epochs} epochs, {} rayon threads, \
+             {reps} reps: serial {:.3} s (spread {:.2}x), two-phase {:.3} s \
+             (spread {:.2}x), best-of ratio {:.2}x",
             rayon::current_num_threads(),
-            serial.as_secs_f64() / two_phase.as_secs_f64()
+            lo(&olds),
+            hi(&olds) / lo(&olds),
+            lo(&news),
+            hi(&news) / lo(&news),
+            lo(&olds) / lo(&news)
         );
     }
 
@@ -870,9 +1146,32 @@ mod tests {
     /// `folds`; the memory saving (the matrix plus ONE standardised training copy instead
     /// of `folds` of them) does not depend on it. Both arms are handed the same
     /// `FeatureMatrix` and each allocates its own standardised copies, index vectors and
-    /// per-epoch working set inside the timer. `MUMDIA_BENCH_ROWS`, `_D`, `_FOLDS` and
-    /// `_ITERS` scale it. Run with
+    /// per-epoch working set inside the timer.
+    ///
+    /// Three things about the harness, each of which was wrong in the first version of it
+    /// and each of which changed the answer:
+    ///
+    /// - the baseline is `percolator_lite_parent`, the parent commit's production code. It
+    ///   was `percolator_lite_per_row_reference`, which reintroduces a `Vec<Vec<f32>>` the
+    ///   parent had already removed and is 1.4-1.7x slower than what is actually being
+    ///   replaced;
+    /// - `MUMDIA_BENCH_ITERS` defaults to the SHIPPED `rescore.num_iter` of 10, not to 2.
+    ///   The per-fold serial remainder is paid once per fold whatever `num_iter` is, so
+    ///   serialising folds hurts most when `num_iter` is small, and the sign of the answer
+    ///   changes between 2 and 10;
+    /// - every arm is repeated `MUMDIA_BENCH_REPS` times with the two arms interleaved and
+    ///   the order alternating, and the summary is the MINIMUM over repeats with the full
+    ///   spread printed. On this hybrid desktop two consecutive identical runs have
+    ///   differed by 2.2x and arm order alone moved one arm by 1.7x; a single shot of each
+    ///   arm is not a measurement.
+    ///
+    /// `MUMDIA_BENCH_ROWS`, `_D`, `_FOLDS`, `_ITERS` and `_REPS` scale it. Run with
     /// `cargo test -p mumdia --release -- --ignored --nocapture percolator_lite_fold_cost`.
+    ///
+    /// What it does NOT measure: the `rescore` stage. This is the fitter over a synthetic
+    /// population, with none of the parquet load, the feature build, the handoff or the
+    /// grouped q that surround it in a real run, so no share-of-stage-runtime claim can be
+    /// made from it.
     #[test]
     #[ignore = "microbenchmark; meaningful only in release"]
     fn percolator_lite_fold_cost() {
@@ -882,11 +1181,12 @@ mod tests {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(dflt)
         };
-        let (n, d, folds, num_iter) = (
+        let (n, d, folds, num_iter, reps) = (
             env("MUMDIA_BENCH_ROWS", 30_000),
             env("MUMDIA_BENCH_D", 387),
             env("MUMDIA_BENCH_FOLDS", 3),
-            env("MUMDIA_BENCH_ITERS", 2),
+            env("MUMDIA_BENCH_ITERS", 10),
+            env("MUMDIA_BENCH_REPS", 3).max(1),
         );
         let (features, is_decoy, key, init) = crafted_population(n, d);
         let mk = || RescoreInput {
@@ -898,23 +1198,66 @@ mod tests {
             num_iter,
             train_fdr: 0.05,
         };
-        let t0 = std::time::Instant::now();
-        let want = percolator_lite_reference(mk());
-        let parallel_folds = t0.elapsed();
-        let t1 = std::time::Instant::now();
-        let got = percolator_lite(mk());
-        let sequential_folds = t1.elapsed();
-        assert_eq!(
-            got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-            want.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-            "the benchmark arms must agree bit for bit"
-        );
+        let bits = |v: Vec<f64>| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        let time = |f: &dyn Fn() -> Vec<f64>| {
+            let t = std::time::Instant::now();
+            let v = f();
+            (t.elapsed().as_secs_f64(), bits(v))
+        };
+        // `MUMDIA_BENCH_BASELINE=per_row` times the OLD, WRONG baseline instead. It is here
+        // only so the gap between the two baselines can be measured rather than asserted;
+        // `parent` is the default and is the code this change actually replaced.
+        let per_row = std::env::var("MUMDIA_BENCH_BASELINE").as_deref() == Ok("per_row");
+        let base_name = if per_row { "per_row" } else { "parent" };
+        let old = || {
+            if per_row {
+                percolator_lite_per_row_reference(mk())
+            } else {
+                percolator_lite_parent(mk())
+            }
+        };
+        let new = || percolator_lite(mk());
+        let (mut olds, mut news) = (Vec::new(), Vec::new());
+        for rep in 0..reps {
+            // Alternate which arm goes first, so a first-mover advantage (page faults,
+            // turbo residency, the allocator's state) cannot accrue to one arm.
+            let (a, b) = if rep % 2 == 0 {
+                let a = time(&old);
+                let b = time(&new);
+                (a, b)
+            } else {
+                let b = time(&new);
+                let a = time(&old);
+                (a, b)
+            };
+            assert_eq!(a.1, b.1, "the benchmark arms must agree bit for bit");
+            println!(
+                "  rep {rep} ({}): {base_name} {:.3} s, sequential {:.3} s ({:.2}x)",
+                if rep % 2 == 0 {
+                    "baseline first"
+                } else {
+                    "new first"
+                },
+                a.0,
+                b.0,
+                a.0 / b.0
+            );
+            olds.push(a.0);
+            news.push(b.0);
+        }
+        let lo = |v: &[f64]| v.iter().copied().fold(f64::INFINITY, f64::min);
+        let hi = |v: &[f64]| v.iter().copied().fold(f64::NEG_INFINITY, f64::max);
         println!(
             "percolator_lite {n} PSMs x {d} features, {folds} folds x {num_iter} iters, \
-             {} rayon threads: parallel folds + serial fit {parallel_folds:?}, \
-             sequential folds + parallel fit {sequential_folds:?} ({:.2}x)",
+             {} rayon threads, {reps} reps: parallel folds + serial fit [{base_name}] \
+             {:.3} s (spread {:.2}x), sequential folds + parallel fit {:.3} s \
+             (spread {:.2}x), best-of ratio {:.2}x",
             rayon::current_num_threads(),
-            parallel_folds.as_secs_f64() / sequential_folds.as_secs_f64()
+            lo(&olds),
+            hi(&olds) / lo(&olds),
+            lo(&news),
+            hi(&news) / lo(&news),
+            lo(&olds) / lo(&news)
         );
     }
 
