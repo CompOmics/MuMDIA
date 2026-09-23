@@ -15,6 +15,8 @@
 //! Note: the JSON feature `coelution_weighted_mean` is an exact alias of
 //! `pairwise_coelution_weighted` (identical computation) and is emitted once
 //! here under the `pairwise_coelution_weighted` name only.
+use std::borrow::Cow;
+
 use super::{best_xcorr, Evidence};
 use crate::stats::pearson;
 
@@ -127,7 +129,23 @@ pub fn values(e: &Evidence) -> Vec<f64> {
     // now builds it once (see `super::weighted_reference_full`). It is read only under
     // `has_full`, which requires `traces_full.len() == pred.len()` -- the condition that
     // made the two builds identical.
-    let r_full: &[f64] = if has_full { &e.ref_profile_full } else { &[] };
+    //
+    // The length is checked rather than assumed, for the reason `interference` gives:
+    // `Evidence` is `pub` with `pub` fields, and a short profile would quietly shorten
+    // every `pearson` below instead of failing. On `build_evidence`, the one constructor,
+    // the check is a comparison and the rebuild never runs.
+    let r_full_owned: Cow<[f64]> = if !has_full {
+        Cow::Borrowed(&[][..])
+    } else if e.ref_profile_full.len() == e.axis_full.len() {
+        Cow::Borrowed(&e.ref_profile_full)
+    } else {
+        Cow::Owned(super::weighted_reference_full(
+            &e.traces_full,
+            &e.pred,
+            e.axis_full.len(),
+        ))
+    };
+    let r_full: &[f64] = &r_full_owned;
     let rc_full: Vec<f64> = if has_full {
         (0..k).map(|i| pearson(&tf[i], r_full)).collect()
     } else {

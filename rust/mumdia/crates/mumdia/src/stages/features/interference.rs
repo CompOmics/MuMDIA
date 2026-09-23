@@ -11,6 +11,8 @@
 //! degenerate cases (K = 0 fragments, T < 2 time points, empty windows) return
 //! 0.0. Correlation/cosine are delegated to `crate::stats`; profile helpers to
 //! the parent `features` module.
+use std::borrow::Cow;
+
 use super::Evidence;
 use crate::stats::{cosine, pearson};
 
@@ -72,11 +74,21 @@ pub fn values(e: &Evidence) -> Vec<f64> {
     // Reference profile over the full extraction window (pred-weighted sum), built once
     // in `build_evidence` rather than here and again in `coelution`; the inline loop this
     // replaces is reproduced term for term by `super::weighted_reference_full`.
-    let rfull: &[f64] = &e.ref_profile_full;
+    //
     // `full_apex` below is a position on `axis_full` and indexes this profile, which the
-    // inline build made `tf` long by construction. Kept as an assertion now that the
-    // build lives elsewhere.
-    debug_assert_eq!(rfull.len(), tf, "ref_profile_full must span axis_full");
+    // inline build made `tf` long by construction. A `debug_assert` would not hold that
+    // in a release build: `Evidence` is `pub` with `pub` fields, `build_evidence` is only
+    // today's sole constructor, and a shorter profile degrades SILENTLY here --
+    // `sum_full_profile` becomes 0, the `rfull.len() >= 2` and `>= 3` guards below skip
+    // `peak_bounds` and the second-peak scan, and `pearson` correlates over the shorter
+    // overlap. So the length is checked and the profile rebuilt rather than trusted; on
+    // the one constructor the check is a comparison and the rebuild never runs.
+    let rfull_owned: Cow<[f64]> = if e.ref_profile_full.len() == tf {
+        Cow::Borrowed(&e.ref_profile_full)
+    } else {
+        Cow::Owned(super::weighted_reference_full(&e.traces_full, &e.pred, tf))
+    };
+    let rfull: &[f64] = &rfull_owned;
 
     // Matched fragment set (observed apex intensity present, trace available).
     let matched: Vec<usize> = (0..k)
