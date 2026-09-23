@@ -332,6 +332,23 @@ pub struct ConvertConfig {
     /// pay for it twice. Turn it off when the neighbouring mzML may have come from
     /// a different converter or a different `.raw` of the same name.
     pub reuse_converted: bool,
+    /// How a timsTOF `.d` (one holding `analysis.tdf`) is read.
+    ///
+    /// `native` reads frames directly (timsrust) and keeps ion mobility: one MS2
+    /// spectrum per (frame, diaPASEF window slot), with a per-peak 1/K0 after m/z x
+    /// mobility centroiding (docs/TIMS_ROADMAP.md, P1). `msconvert` is the previous
+    /// route, which collapses mobility; it stays as a fallback. Non-TIMS Bruker
+    /// (`analysis.baf`) always goes to msconvert.
+    pub bruker_reader: BrukerReader,
+    /// Native TDF centroiding: m/z merge tolerance in ppm between neighbouring TOF
+    /// points (single linkage).
+    pub tdf_mz_ppm: f64,
+    /// Native TDF centroiding: a gap of more than this many TIMS scans without signal
+    /// splits one m/z trace into separate peaks.
+    pub tdf_im_gap_scans: u32,
+    /// Native TDF noise floor: a centroid built from fewer raw TOF x scan points than
+    /// this is dropped.
+    pub tdf_min_points: u32,
 }
 impl Default for ConvertConfig {
     fn default() -> Self {
@@ -340,8 +357,23 @@ impl Default for ConvertConfig {
             msconvert: "auto".to_string(),
             msconvert_args: Vec::new(),
             reuse_converted: true,
+            bruker_reader: BrukerReader::Native,
+            // Provisional values from a peak census on one diaPASEF run
+            // (docs/TIMS_ROADMAP.md, P1), not an optimum.
+            tdf_mz_ppm: 10.0,
+            tdf_im_gap_scans: 5,
+            tdf_min_points: 2,
         }
     }
+}
+
+/// Reader for timsTOF `.d` input (`convert.bruker_reader`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum BrukerReader {
+    #[default]
+    Native,
+    Msconvert,
 }
 
 /// Sequence-tag prescan (`mumdia prescan`). Prunes modification-bearing candidates that have no

@@ -13,9 +13,13 @@
 
 /// (logical name, schema version) for every MVP artifact.
 pub mod artifact {
-    pub const SPECTRA_MS1: (&str, u32) = ("spectra_ms1", 1);
-    pub const SPECTRA_MS2: (&str, u32) = ("spectra_ms2", 1);
-    pub const ISOLATION_WINDOWS: (&str, u32) = ("isolation_windows", 1);
+    // v2: ion mobility. `spectra_ms2` gains `window_im_lower/upper` and
+    // `isolation_windows` gains `im_lower/upper` (nullable 1/K0, null for 3D input);
+    // `spectra_ms1/ms2` gain a per-peak `im` list only when the source has mobility.
+    // v1 artifacts still load: readers treat an absent column as "no mobility".
+    pub const SPECTRA_MS1: (&str, u32) = ("spectra_ms1", 2);
+    pub const SPECTRA_MS2: (&str, u32) = ("spectra_ms2", 2);
+    pub const ISOLATION_WINDOWS: (&str, u32) = ("isolation_windows", 2);
     pub const MS2_TO_MS1: (&str, u32) = ("ms2_to_ms1", 1);
     pub const PEPTIDES: (&str, u32) = ("peptides", 1);
     pub const PEPTIDOFORMS: (&str, u32) = ("peptidoforms", 1);

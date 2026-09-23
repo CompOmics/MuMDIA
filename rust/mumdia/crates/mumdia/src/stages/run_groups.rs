@@ -118,7 +118,12 @@ fn scan_fingerprint(ms2: &[Ms2Scan], ms1: &[Ms1Scan]) -> u64 {
         h = mix(h, s.rt_seconds.to_bits());
         h = mix(h, s.window.lower_mz.to_bits());
         h = mix(h, s.window.upper_mz.to_bits());
+        h = mix(h, s.window.key().2 as u64);
+        h = mix(h, s.window.key().3 as u64);
         h = mix(h, s.peaks.len() as u64);
+        for v in &s.im {
+            h = mix(h, v.to_bits() as u64);
+        }
         for p in &s.peaks {
             h = mix(h, p.mz.to_bits() as u64);
             h = mix(h, p.intensity.to_bits() as u64);

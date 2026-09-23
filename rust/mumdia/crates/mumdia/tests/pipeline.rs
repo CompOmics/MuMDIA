@@ -523,6 +523,7 @@ fn assert_scans_identical(after: &[Ms2Scan], fresh: &[Ms2Scan]) {
         assert_eq!(a.rt_seconds.to_bits(), b.rt_seconds.to_bits());
         assert_eq!(a.window, b.window);
         assert_eq!(a.peaks, b.peaks, "peaks of scan {} changed", a.scan_index);
+        assert_eq!(a.im, b.im, "ion mobility of scan {} changed", a.scan_index);
     }
 }
 

@@ -194,6 +194,7 @@ fn process_run(
         top_peaks_ms2,
         top_peaks_ms1: 0,
         config_hash: &convert_hash,
+        tdf: convert::TdfParams::from_config(&cfg.convert),
     })?;
     let has_deeplc = cfg.predict_frag.deeplc_python.is_some();
     let mh_heads = cfg

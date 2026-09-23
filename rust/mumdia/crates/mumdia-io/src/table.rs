@@ -1917,6 +1917,16 @@ impl TableFile {
         Ok(out)
     }
 
+    pub fn opt_f32(&self, name: &str) -> Result<Vec<Option<f32>>> {
+        let mut out = Vec::with_capacity(self.nrows);
+        for b in self.column(name, SCALAR_BATCH_ROWS)? {
+            let col = b?;
+            let a: &Float32Array = downcast(col.column(0), name, "f32")?;
+            out.extend((0..a.len()).map(|k| (!a.is_null(k)).then(|| a.value(k))));
+        }
+        Ok(out)
+    }
+
     /// Read an f32 list column (`List` or `LargeList`) as one `Vec` per row.
     pub fn list_f32(&self, name: &str) -> Result<Vec<Vec<f32>>> {
         let mut out = Vec::with_capacity(self.nrows);

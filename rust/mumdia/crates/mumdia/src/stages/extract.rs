@@ -29,7 +29,7 @@ use crate::index::Library;
 use crate::matchers::fragindex::{FragIndex, WindowNarrow};
 use crate::spectra::{load_ms1, load_ms2, Ms1Scan};
 use mumdia_core::config::MatcherKind;
-use mumdia_core::types::Ms2Scan;
+use mumdia_core::types::{Ms2Scan, WindowKey};
 use rayon::prelude::*;
 
 /// The matcher backend plus the values that never change across a probe: which
@@ -1191,15 +1191,9 @@ struct WinGroup {
 /// Group the run's scans by isolation window, ascending.
 fn window_groups(idx: &FragIndex, scans: &[Ms2Scan]) -> Vec<WinGroup> {
     use std::collections::BTreeMap;
-    let mut groups: BTreeMap<(u64, u64), Vec<usize>> = BTreeMap::new();
+    let mut groups: BTreeMap<WindowKey, Vec<usize>> = BTreeMap::new();
     for (si, scan) in scans.iter().enumerate() {
-        groups
-            .entry((
-                scan.window.lower_mz.to_bits(),
-                scan.window.upper_mz.to_bits(),
-            ))
-            .or_default()
-            .push(si);
+        groups.entry(scan.window.key()).or_default().push(si);
     }
     groups
         .into_values()
@@ -1581,15 +1575,9 @@ fn extract_twopass_windows(
     claim_margin: f32,
 ) -> (HashMap<u32, Vec<Hit>>, HashMap<u32, Contested>) {
     use std::collections::BTreeMap;
-    let mut groups: BTreeMap<(u64, u64), Vec<usize>> = BTreeMap::new();
+    let mut groups: BTreeMap<WindowKey, Vec<usize>> = BTreeMap::new();
     for (si, scan) in scans.iter().enumerate() {
-        groups
-            .entry((
-                scan.window.lower_mz.to_bits(),
-                scan.window.upper_mz.to_bits(),
-            ))
-            .or_default()
-            .push(si);
+        groups.entry(scan.window.key()).or_default().push(si);
     }
     let group_vec: Vec<Vec<usize>> = groups.into_values().collect();
     let pr = Prober {
@@ -2232,15 +2220,15 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
 
     // Isolation-window -> sorted scan RTs, for zero-filled chromatogram grids.
     let windows: Vec<(f64, f64, Vec<f64>)> = if p.cfg.emit_window_grid {
-        let mut tmp: HashMap<(u64, u64), Vec<f64>> = HashMap::new();
+        // Ordered, so windows sharing a lower bound (diaPASEF slots) keep a fixed order
+        // through the stable sort below.
+        let mut tmp: std::collections::BTreeMap<WindowKey, Vec<f64>> = Default::default();
         for s in scans {
-            tmp.entry((s.window.lower_mz.to_bits(), s.window.upper_mz.to_bits()))
-                .or_default()
-                .push(s.rt_seconds);
+            tmp.entry(s.window.key()).or_default().push(s.rt_seconds);
         }
         let mut w: Vec<(f64, f64, Vec<f64>)> = tmp
             .into_iter()
-            .map(|((lb, ub), mut v)| {
+            .map(|((lb, ub, _, _), mut v)| {
                 v.sort_by(|a, b| a.total_cmp(b));
                 (f64::from_bits(lb), f64::from_bits(ub), v)
             })
@@ -4045,6 +4033,8 @@ mod accumulate_tests {
                         intensity: 10.0 + (si + k) as f32,
                     })
                     .collect(),
+
+                im: Vec::new(),
             })
             .collect()
     }

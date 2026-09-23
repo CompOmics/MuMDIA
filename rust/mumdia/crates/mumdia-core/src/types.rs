@@ -1,6 +1,7 @@
 //! Core data-model types (docs/02_config_and_data_model.md). Ion mobility is `Option` /
-//! nullable on the per-SCAN types, so the same model serves 3D and 4D runs; MVP is 3D so
-//! IM is always `None`. It is deliberately absent from [`Peak`]: see that type.
+//! nullable on the per-SCAN types, so the same model serves 3D and 4D runs. It is
+//! deliberately absent from [`Peak`]: a 4D scan carries it in `Ms2Scan::im`, parallel to
+//! `peaks` (see [`Peak`]).
 
 use serde::{Deserialize, Serialize};
 
@@ -46,7 +47,26 @@ impl IsolationWindow {
     pub fn covers(&self, mz: f64) -> bool {
         mz >= self.lower_mz && mz <= self.upper_mz
     }
+
+    /// Exact identity of a window for grouping scans: the bits of its (m/z, 1/K0)
+    /// bounds. diaPASEF slots can share an m/z range and differ only in mobility. The
+    /// m/z bounds come first, so an ordered map over keys stays ascending in m/z (all
+    /// bounds are non-negative, whose IEEE bits order like the values); an absent IM
+    /// bound sorts last.
+    #[inline]
+    pub fn key(&self) -> WindowKey {
+        let im = |v: Option<f32>| v.map_or(u32::MAX, f32::to_bits);
+        (
+            self.lower_mz.to_bits(),
+            self.upper_mz.to_bits(),
+            im(self.im_lower),
+            im(self.im_upper),
+        )
+    }
 }
+
+/// See [`IsolationWindow::key`].
+pub type WindowKey = (u64, u64, u32, u32);
 
 /// Whether a record is a target or a decoy, and which strategy made it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -81,6 +101,8 @@ pub struct Ms2Scan {
     pub window: IsolationWindow,
     /// m/z sorted peaks.
     pub peaks: Vec<Peak>,
+    /// Per-peak 1/K0 (V s cm^-2), parallel to `peaks`. Empty for a 3D run.
+    pub im: Vec<f32>,
 }
 
 #[cfg(test)]

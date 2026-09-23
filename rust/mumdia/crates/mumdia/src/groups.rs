@@ -92,6 +92,9 @@ pub fn plan(windows: &[(f64, f64)], stats: &[RowGroupStats], n: usize) -> Result
     }
     let mut windows: Vec<(f64, f64)> = windows.to_vec();
     windows.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.total_cmp(&b.1)));
+    // diaPASEF slots can repeat an m/z range at another mobility; bands are cut in m/z,
+    // so one m/z range counts once.
+    windows.dedup_by(|a, b| a.0.to_bits() == b.0.to_bits() && a.1.to_bits() == b.1.to_bits());
     if windows
         .iter()
         .any(|w| !(w.0.is_finite() && w.1.is_finite()) || w.1 < w.0)

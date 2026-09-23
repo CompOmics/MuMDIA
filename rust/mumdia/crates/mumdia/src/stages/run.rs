@@ -289,6 +289,7 @@ pub fn run(p: RunParams) -> Result<()> {
         top_peaks_ms2: p.top_peaks_ms2,
         top_peaks_ms1: 0,
         config_hash: &convert_hash,
+        tdf: convert::TdfParams::from_config(&cfg.convert),
     })?;
     for (name, schema, path) in [
         ("spectra_ms1", artifact::SPECTRA_MS1, &co.ms1),

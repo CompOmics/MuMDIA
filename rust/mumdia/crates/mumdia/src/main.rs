@@ -623,15 +623,28 @@ struct ConverterReport {
 ///
 /// Reads peaks and counts them; it does not centroid, so a profile-mode file reports
 /// raw sample counts and says so.
-fn peak_census(mzml: &str, max_spectra: usize) -> Result<serde_json::Value> {
+fn peak_census(
+    mzml: &str,
+    max_spectra: usize,
+    tdf: &stages::convert::TdfParams,
+) -> Result<serde_json::Value> {
     use mzdata::prelude::*;
-
-    // The same reader  uses, so this sees exactly the spectra a run would.
-    let reader = mzdata::MZReader::open_path(mzml).with_context(|| format!("opening {mzml}"))?;
 
     let mut counts: Vec<usize> = Vec::new();
     let mut profile = 0usize;
     let mut ms1 = 0usize;
+    // A timsTOF `.d` is counted after native centroiding, which is what `convert`
+    // writes; `max_spectra` then counts frames.
+    let tims = mumdia::raw::is_tims_tdf(mzml);
+    if tims {
+        (counts, ms1) = stages::convert::tdf_peak_counts(mzml, max_spectra, tdf)?;
+    }
+    // The same reader `convert` uses, so this sees exactly the spectra a run would.
+    let reader: Box<dyn Iterator<Item = mzdata::spectrum::MultiLayerSpectrum>> = if tims {
+        Box::new(std::iter::empty())
+    } else {
+        Box::new(mzdata::MZReader::open_path(mzml).with_context(|| format!("opening {mzml}"))?)
+    };
     for (i, spec) in reader.enumerate() {
         if max_spectra > 0 && i >= max_spectra {
             break;
@@ -1147,6 +1160,7 @@ fn real_main() -> Result<()> {
                 top_peaks_ms2,
                 top_peaks_ms1,
                 config_hash: &config_hash,
+                tdf: stages::convert::TdfParams::from_config(&cfg.convert),
             })?;
         }
         Cmd::Digest { fasta, out, config } => {
@@ -1683,7 +1697,11 @@ fn real_main() -> Result<()> {
             let mzml = mumdia::raw::ensure_mzml(&mzml, &cfg.convert, None)?;
             println!(
                 "{}",
-                serde_json::to_string_pretty(&peak_census(&mzml, max_spectra)?)?
+                serde_json::to_string_pretty(&peak_census(
+                    &mzml,
+                    max_spectra,
+                    &stages::convert::TdfParams::from_config(&cfg.convert),
+                )?)?
             );
         }
         Cmd::Report {

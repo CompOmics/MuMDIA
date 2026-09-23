@@ -34,9 +34,9 @@ import pyarrow.parquet as pq
 # without a deliberate decision means an on-disk format changed silently, which is
 # the thing artifact versioning exists to prevent.
 EXPECTED_SCHEMA_VERSIONS = {
-    "spectra_ms1": 1,
-    "spectra_ms2": 1,
-    "isolation_windows": 1,
+    "spectra_ms1": 2,
+    "spectra_ms2": 2,
+    "isolation_windows": 2,
     "ms2_to_ms1": 1,
     "peptides": 1,
     "peptidoforms": 1,

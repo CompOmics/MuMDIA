@@ -105,6 +105,23 @@ pub fn load_ms2(path: &str) -> Result<Vec<Ms2Scan>> {
     let wlo = t.f64("window_lower")?;
     let whi = t.f64("window_upper")?;
     let wtarget = t.f64("window_target")?;
+    // Ion mobility (schema v2). Absent in a v1 artifact and null for a 3D source, which
+    // both read as "no mobility".
+    let opt_im = |name: &str| -> Result<Vec<Option<f32>>> {
+        if t.has_column(name) {
+            t.opt_f32(name)
+        } else {
+            Ok(vec![None; t.nrows])
+        }
+    };
+    let wim_lo = opt_im("window_im_lower")?;
+    let wim_hi = opt_im("window_im_upper")?;
+    let has_im = t.has_column("im");
+    let peak_cols: &[&str] = if has_im {
+        &["mz", "intensity", "im"]
+    } else {
+        &["mz", "intensity"]
+    };
     // The "id" column is NOT read. It stays in the artifact, where an external consumer can
     // find the mzML native id of any scan by `scan_index`, but decoding it here built one
     // String per scan (~72 B of header plus payload each, ~17 MB and 233 k allocations on
@@ -119,9 +136,14 @@ pub fn load_ms2(path: &str) -> Result<Vec<Ms2Scan>> {
     // so it stays aligned.
     let mut out = Vec::with_capacity(t.nrows);
     let mut i = 0usize;
-    t.for_each_batch(Some(&["mz", "intensity"]), SCAN_BATCH_ROWS, |b| {
+    t.for_each_batch(Some(peak_cols), SCAN_BATCH_ROWS, |b| {
         let mza = list_col(b, "mz")?;
         let ina = list_col(b, "intensity")?;
+        let ima = if has_im {
+            Some(list_col(b, "im")?)
+        } else {
+            None
+        };
         for k in 0..mza.len() {
             let peaks: Vec<Peak> = if mza.is_null(k) || ina.is_null(k) {
                 Vec::new()
@@ -140,6 +162,22 @@ pub fn load_ms2(path: &str) -> Result<Vec<Ms2Scan>> {
                 }
                 peaks
             };
+            let im = match &ima {
+                Some(a) if !a.is_null(k) => {
+                    let v = a.value(k);
+                    let f = inner_f32(&v, "im")?;
+                    if f.len() < peaks.len() {
+                        return Err(anyhow!(
+                            "scan {}: 'im' has {} values for {} peaks",
+                            scan_index[i],
+                            f.len(),
+                            peaks.len()
+                        ));
+                    }
+                    f.values()[..peaks.len()].to_vec()
+                }
+                _ => Vec::new(),
+            };
             out.push(Ms2Scan {
                 scan_index: scan_index[i],
                 rt_seconds: rt[i],
@@ -147,10 +185,11 @@ pub fn load_ms2(path: &str) -> Result<Vec<Ms2Scan>> {
                     target_mz: wtarget[i],
                     lower_mz: wlo[i],
                     upper_mz: whi[i],
-                    im_lower: None,
-                    im_upper: None,
+                    im_lower: wim_lo[i],
+                    im_upper: wim_hi[i],
                 },
                 peaks,
+                im,
             });
             i += 1;
         }
@@ -165,6 +204,12 @@ pub fn load_ms2(path: &str) -> Result<Vec<Ms2Scan>> {
         "ms2 scans",
         &[
             ("peaks", peak_bytes),
+            (
+                "peak_im",
+                out.iter()
+                    .map(|s| std::mem::size_of_val(s.im.as_slice()))
+                    .sum(),
+            ),
             ("scan_spine", std::mem::size_of_val(out.as_slice())),
         ],
     );

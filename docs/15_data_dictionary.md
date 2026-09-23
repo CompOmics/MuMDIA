@@ -49,6 +49,7 @@ their own sections at the end.
 | `rt_seconds` | Float64 | no | s | scan start time, converted from mzdata minutes |
 | `mz` | List\<Float32\> | yes | m/z | centroided, m/z-sorted peak m/z values |
 | `intensity` | List\<Float32\> | yes | counts | peak intensities aligned to `mz` |
+| `im` | LargeList\<Float32\> | yes | V s cm^-2 | per-peak 1/K0 aligned to `mz`; column present only for a mobility source (native timsTOF reader, schema v2) |
 
 ### spectra_ms2 (`convert.rs:198-213`)
 
@@ -57,14 +58,17 @@ their own sections at the end.
 | `scan_index` | UInt32 | no | - | monotonic scan index (shared axis with MS1) |
 | `id` | Utf8 | no | - | vendor spectrum id string |
 | `rt_seconds` | Float64 | no | s | scan start time |
-| `window_id` | UInt32 | no | - | dense id of the distinct isolation window (`(lower,upper)` bits), matches `isolation_windows.window_id` |
+| `window_id` | UInt32 | no | - | dense id of the distinct isolation window (bits of `(lower, upper, im_lower, im_upper)`), matches `isolation_windows.window_id` |
 | `window_target` | Float64 | no | m/z | isolation-window target m/z (0.0 for AIF/all-ion) |
 | `window_lower` | Float64 | no | m/z | isolation-window lower bound (0.0 for AIF full-range fallback) |
 | `window_upper` | Float64 | no | m/z | isolation-window upper bound (1.0e6 for AIF full-range fallback) |
 | `precursor_mz` | Float64 | yes | m/z | selected precursor m/z, null when absent |
 | `precursor_charge` | Int32 | yes | - | precursor charge, null when absent |
+| `window_im_lower` | Float32 | yes | V s cm^-2 | window 1/K0 lower bound (diaPASEF slot); null for 3D input (schema v2) |
+| `window_im_upper` | Float32 | yes | V s cm^-2 | window 1/K0 upper bound; null for 3D input (schema v2) |
 | `mz` | List\<Float32\> | yes | m/z | centroided fragment m/z values |
 | `intensity` | List\<Float32\> | yes | counts | fragment intensities aligned to `mz` |
+| `im` | LargeList\<Float32\> | yes | V s cm^-2 | per-peak 1/K0 aligned to `mz`; column present only for a mobility source (native timsTOF reader, schema v2) |
 
 ### isolation_windows (`convert.rs:215-226`)
 
@@ -76,6 +80,8 @@ The distinct-window column is `window_id` (verified: `convert.rs:218`).
 | `target` | Float64 | no | m/z | window target m/z |
 | `lower` | Float64 | no | m/z | window lower bound |
 | `upper` | Float64 | no | m/z | window upper bound |
+| `im_lower` | Float32 | yes | V s cm^-2 | window 1/K0 lower bound; null for 3D input (schema v2) |
+| `im_upper` | Float32 | yes | V s cm^-2 | window 1/K0 upper bound; null for 3D input (schema v2) |
 
 ### ms2_to_ms1 (`convert.rs:228-234`)
 
