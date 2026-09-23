@@ -39,7 +39,7 @@ written null; there is no IM calibration or IM window.
 | `rust/mumdia/crates/mumdia/src/stages/run.rs` | Orchestrator. Runs the optional DeepLC fine-tune between `search-seed` and this stage, then calls `rt_im_train::run` (see `run.rs:265-314`). |
 | `rust/mumdia/crates/mumdia/src/sidecar.rs` | `run_deeplc_finetune` (sidecar.rs:110-155): the file-contract client that invokes the fine-tune worker. |
 | `scripts/deeplc_finetune.py` | The fine-tune worker: transfer-learns DeepLC (4.4.0 or newer; older versions are refused) on the seed and writes a new library parquet with replaced `predicted_irt`. |
-| `rust/mumdia/crates/mumdia-core/src/config.rs` | `RtImTrainConfig` (config.rs:447-512), `CalibrationMethod` enum (config.rs:56-61), and the load-time validation that rejects `calibration_method=none` (config.rs:1336-1342). |
+| `rust/mumdia/crates/mumdia-core/src/config.rs` | `RtImTrainConfig` (config.rs:626), `CalibrationMethod` enum (config.rs:56-61), and the load-time validation that rejects `calibration_method=none` (config.rs:1336-1342). |
 | `rust/mumdia/crates/mumdia-core/src/schema.rs` | `artifact::RUN_WINDOWS = ("run_windows", 1)` (schema.rs:16). |
 
 ## Inputs and outputs
@@ -591,7 +591,7 @@ calibration_available.then(|| predict(irt))` (rt_im_train.rs:247), the width is
 either the adaptive per-bin value or the global `w_rt` (rt_im_train.rs:248-255), and
 `candidate_window(calibrated_rt, width)` (rt_im_train.rs:256) produces the row
 `(cal, cal - width, cal + width)`, or the unbounded `(NaN, -inf, +inf)` when either
-value is absent. The three IM columns are pushed as `None` (rt_im_train.rs:261-263).
+value is absent. The three IM columns are pushed as `None` (rt_im_train.rs:421-423).
 The table is written (rt_im_train.rs:266-277), `cal.json` is written
 (rt_im_train.rs:309-325), and the artifact report is emitted (rt_im_train.rs:332-344).
 
@@ -713,13 +713,13 @@ is unbounded by construction (docs/31 F7). Measured on HYE B01 with the imported
 | `local_linear` | calibrate.rs:107-153 | Tricubic-weighted local least squares at one point. |
 | `percentile` | calibrate.rs:156-164 | Nearest-rank percentile: sorts a copy, `rank = round(p.clamp(0,1)*(len-1))`. Not interpolated. Empty input returns 0.0. |
 | `CalibrationMethod` | config.rs:56-61 | Enum `{ Loess, Linear, None }`; default `Loess`. `None` is rejected at load. |
-| `RtImTrainConfig` | config.rs:447-512 | All Stage B config fields (below). |
+| `RtImTrainConfig` | config.rs:626 | All Stage B config fields (below). |
 | `run_deeplc_finetune` | sidecar.rs:110-155 | Sidecar client: `deeplc_finetune.py <lib_in> <seed> <lib_out> [flags]`. |
 
 ## Configuration
 
 All fields live under `rt_im_train` in the config (`RtImTrainConfig`,
-config.rs:447-512). The struct is `#[serde(default, deny_unknown_fields)]`, so any
+config.rs:626). The struct is `#[serde(default, deny_unknown_fields)]`, so any
 unknown key is a hard load error and every field has the default below. The config
 surface was pruned: there are no IM calibration fields (IM is a stub), and
 `CalibrationMethod::None` is a foot-gun rejected at load (config.rs:1336-1342) even
@@ -747,7 +747,7 @@ though the enum variant still exists.
 ## Invariants, determinism, gotchas
 
 - **IM is a stub.** `im_pred_cal`, `im_lo`, `im_hi` are always `None`
-  (rt_im_train.rs:261-263). There is no IM calibration, no IM window, and no IM
+  (rt_im_train.rs:421-423). There is no IM calibration, no IM window, and no IM
   config field. Any 4D/diaPASEF work must add both the model and the columns.
 - **Only targets anchor the fit.** Decoy seed PSMs are excluded
   (rt_im_train.rs:106); admitting them would inject random iRT/RT pairs. Keep this
@@ -852,7 +852,7 @@ though the enum variant still exists.
 ## How to extend / modify
 
 - **Add IM (4D).** Populate `im_pred_cal`/`im_lo`/`im_hi` (currently `None` at
-  rt_im_train.rs:261-263) from an IM calibration analogous to the RT path (an
+  rt_im_train.rs:421-423) from an IM calibration analogous to the RT path (an
   IM2Deep-style model), and add IM config fields to `RtImTrainConfig`. The output
   columns already exist and are nullable, so downstream reads survive the
   transition. `extract` and the IM feature families must then consume them.

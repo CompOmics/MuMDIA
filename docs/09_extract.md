@@ -23,7 +23,7 @@ apportioned.
 
 RT is applied as a per-candidate window post-filter (the documented Stage D part
 2 fallback), and the MVP is 3D so the ion-mobility (IM) dimension is absent
-(`extract.rs:8`, `apex_im` is always written `None` at `extract.rs:2484`).
+(`extract.rs:8`, `apex_im` is always written `None` at `extract.rs:3375`).
 
 ## Files
 

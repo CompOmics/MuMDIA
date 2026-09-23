@@ -200,7 +200,7 @@ Per-run fragment mass recalibration sidecar consumed by `extract`.
 | `im_lo` | Float64 | yes | 1/K0 | IM window lower bound; always null |
 | `im_hi` | Float64 | yes | 1/K0 | IM window upper bound; always null |
 
-### `<run_windows>` cal.json (`rt_im_train.rs:290-302`)
+### `<run_windows>` cal.json (`rt_im_train.rs:469-499`)
 
 RT-calibration sidecar (written to `out_cal`, not part of the Parquet contract).
 
