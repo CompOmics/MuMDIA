@@ -505,13 +505,13 @@ pub struct Evidence {
     /// readers index it with a position on that axis. Built once here instead of once in
     /// `coelution` and again in `interference`. Those two builds were bit-identical --
     /// both weight by the raw `pred[f]`, both accumulate fragment-outer and time-inner
-    /// over `traces_full` -- so this is [`weighted_reference_full`] called once.
+    /// over `traces_full` -- so this is `weighted_reference_full` called once.
     /// `chromatographic` is NOT folded in: it clamps the weights at zero and falls back
     /// to an unweighted sum when they are all zero, which differs whenever a predicted
     /// intensity is negative (`index.rs` rejects only non-finite ones), so it keeps its
     /// own build.
     ///
-    /// The length is a contract of [`build_evidence`], not of the type, so both readers
+    /// The length is a contract of `build_evidence`, not of the type, so both readers
     /// CHECK it and rebuild rather than trust it: this struct is `pub` with `pub` fields,
     /// several test fixtures fill it with `vec![]`, and a short profile would degrade
     /// silently rather than fail (see the comment in `interference::values`).
@@ -1158,7 +1158,7 @@ struct Chunk {
 ///
 /// A chunk closes when EITHER limit is reached: `chunk_rows` bounds the traces resident
 /// (what the loader holds) and `max_psm_rows` bounds the value buffers (what the compute
-/// and the writer hold). See [`CHUNK_PSM_ROWS`] for why one limit is not enough. Both are
+/// and the writer hold). See `CHUNK_PSM_ROWS` for why one limit is not enough. Both are
 /// closed at the end of the current candidate's PSM rows, so neither ever cuts a
 /// candidate.
 fn plan_chunks(
@@ -1893,7 +1893,7 @@ pub fn run(p: FeaturesParams) -> Result<u64> {
     run_with_chunk_rows(p, CHUNK_CHROM_ROWS)
 }
 
-/// [`run_with_chunk_rows`] with the PSM-row bound exposed as well; see [`CHUNK_PSM_ROWS`].
+/// [`run_with_chunk_rows`] with the PSM-row bound exposed as well; see `CHUNK_PSM_ROWS`.
 /// Both limits only move chunk boundaries, which move no value.
 pub fn run_with_chunk_limits(
     p: FeaturesParams,
