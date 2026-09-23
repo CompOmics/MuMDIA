@@ -361,7 +361,7 @@ impl Default for ConvertConfig {
             // Provisional values from a peak census on one diaPASEF run
             // (docs/TIMS_ROADMAP.md, P1), not an optimum.
             tdf_mz_ppm: 10.0,
-            tdf_im_gap_scans: 5,
+            tdf_im_gap_scans: 30,
             tdf_min_points: 2,
         }
     }

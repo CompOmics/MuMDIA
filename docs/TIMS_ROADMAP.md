@@ -1,6 +1,6 @@
 # TIMS roadmap: diaPASEF support at DIA-NN parity
 
-Status: plan, 2026-09-23. Code references are to `8d3db2e`. Branch `IM`. The objective order is fixed: identification
+Status: P0 and P1 done, 2026-09-23. Code references are to `8d3db2e`. Branch `IM`. The objective order is fixed: identification
 sensitivity at 1% first. FDR validity (entrapment), quantification accuracy and
 runtime come after the identification gap is closed, and each keeps its own gate
 from `docs/20_sensitivity_and_quantification_playbook.md`.
@@ -148,6 +148,9 @@ Two levers come before any new IM feature, and both are caused by the collapse:
 An IM-gated seed (P3/P4) should raise the anchor count. That is the first check to
 run once P1 exists.
 
+Update after P1: native 2D centroiding alone raised the anchors from 130 to 4,313,
+but RT accuracy on DIA-NN's 1% precursors did not improve (see "P1 result").
+
 ## 3. Environment on the development host
 
 - Python: one pyenv virtualenv, `mumdia-tims` (Python 3.11.11), contains every
@@ -234,6 +237,89 @@ Goal: read `.d` directly with IM kept, and without an mzML round trip.
   - peaks per spectrum (`docs/04` peak census);
   - end-to-end IDs with IM still unused downstream. This isolates the reader, since
     slot separation alone may change counts.
+
+### P1 result (2026-09-23, `29575e1` + gap default 30)
+
+Implemented as `stages/convert/tdf.rs` (docs/04_convert.md, "Native timsTOF reader").
+- **Reader.** timsrust 0.4.2 with only `tdf`. timsrust 0.6.6 was rejected on
+  dependencies: `timsrust-core` 0.6 depends on `filemanager` with default features,
+  which pulls object_store (AWS/Azure/GCP), tokio and a second arrow/parquet (about
+  2,000 lockfile lines). mzdata's `bruker_tdf` was rejected because it decodes each
+  frame once per slot, has no parallel path, and computes slot bounds and peak 1/K0
+  with different converters.
+- **Calibration.** m/z is timsrust's TOF conversion. It agrees with msconvert's
+  vendor-calibrated m/z to a median of 0.02 ppm on MS1 and -0.58 ppm on MS2
+  (p5/p95 about +/-4 ppm). 1/K0 uses Bruker `TimsCalibration` model 2, because
+  timsrust's linear interpolation is off by up to 0.030 V s cm^-2 on this file.
+- **Schema v2** as planned. Windows are keyed on (m/z, 1/K0) via
+  `IsolationWindow::key`, and `groups` deduplicates m/z ranges. `demix_apex_scan`,
+  the covering-window grid and `prescan` stay m/z-only until a candidate IM exists
+  (P3/P4). On this scheme the slot m/z ranges are disjoint.
+
+**Centroiding parameters.** These were chosen on seed confident PSMs on this file
+only. All values are provisional, and none is promoted.
+
+| `tdf_min_points` / `tdf_im_gap_scans` | MS2 peaks (total / median per slot) | seed confident PSMs |
+|---|---|---|
+| msconvert baseline | 711 M / 7,600 | 130 |
+| 2 / 5 | 55.5 M / 224 | **0** (the run then fails: no RT anchors) |
+| 1 / 5 | 486 M / 7,243 | 367 |
+| 2 / 10 | 60.4 M / 367 | 3,616 |
+| 1 / 20 | 392 M / 6,780 | 4,161 |
+| 2 / 20 | 66.6 M / 557 | 4,139 |
+| **2 / 30 (default)** | 71.0 M / 684 | 4,313 |
+| 2 / 50 | 77.3 M / 834 | 4,227 |
+| 3 / 30 | 35.2 M / 176 | 4,307 |
+
+At 50 ng most fragment ions arrive as sparse single counts spread over a mobility
+profile of about 20 scans. A 5-scan gap splits them into singletons, which the
+2-point floor then deletes. That is the peak-group failure CLAUDE.md describes for
+the peak cap, reached by another route. The seed count plateaus from 20 to 50 scans.
+
+**End to end** (FASTA mode, `config.local-tims-baseline.json`, 64 threads, IM unused
+downstream; units as in section 2):
+
+| at 1% | msconvert (P0) | native 2/30 | native 1/30 | native 2/30, seed tol 10 ppm |
+|---|---|---|---|---|
+| precursors | 8,721 | 8,302 | 6,911 | 8,301 |
+| stripped peptides | 7,662 | 7,231 | 6,008 | 7,214 |
+| protein groups | 1,333 | 1,265 | 1,166 | 1,243 |
+| decoy fraction (peptide) | 0.98% | 0.98% | 0.98% | 0.98% |
+| seed confident PSMs | 130 | 4,313 | 4,306 | 4,659 |
+| learned fragment tolerance | 5.0 ppm | 20.4 ppm | 19.6 ppm | 17.2 ppm |
+| wall clock | 45:30 | 8:45 | 10:02 | 8:03 |
+| peak RSS | 30.3 GB | 18.6 GB | 18.9 GB | - |
+
+Stage costs (baseline, then native 2/30):
+- convert: 28:00 msconvert + 2:27, against 1:00 (48 s standalone at 7.9 GB RSS);
+- artifacts: 8.5 GB against 1.2 GB;
+- MS1 points: 1.16e9 against 4.2e7 (median 26,574 per spectrum);
+- search-seed: 32 s against 10 s;
+- extract: 4:38 against 0:26 (243,369 against 226,093 accepted).
+
+Reading:
+- The reader is **5.2x faster end to end at -5.6% peptides**, with IM still unused
+  downstream. The empirical decoy fraction is unchanged, and the overlap stays a
+  near-subset of DIA-NN (7,065 shared, 164 MuMDIA-only).
+- **The 33x seed anchor gain did not translate into RT accuracy.** On DIA-NN's 1%
+  unmodified precursors (n = 17,524), |calibrated RT - DIA-NN RT| is median 3.0 s /
+  p95 14.7 s for the baseline and 4.0 s / 16.3 s for native 2/30. The p95 108.9 s in
+  section 2 was measured on a different population. On the precursors that matter,
+  RT calibration was never the bottleneck, so the "first lever" in section 2 is
+  weaker than stated.
+- **The noise floor helps.** Keeping singletons (1/30) costs 17% of peptides against
+  2/30.
+- **The learned fragment tolerance is window-bound, not data-bound.** The ppm MAD is
+  2.1, but 1.5 x p95 of the deviations stays at 17-20 ppm whatever the seed tolerance
+  is. That means random matches dominate the tail. The msconvert baseline learned
+  5 ppm from 130 PSMs. This moves to P6: an estimator robust to the random-match
+  floor, and extract at a fixed 5-10 ppm.
+- **Second acquisition** (PYE `A9_G_DIA_nLC_tTOF_R1.d`, timsTOF Pro, 11 window groups
+  x 2-3 slots = 26 windows): native convert in 8.9 s, 49,016 MS2 slot spectra.
+  Under 2/30 its MS2 is much sparser (median 76 peaks, p5 1), so the floor may cost
+  more there. An end-to-end PYE run (ProteoBench FASTA) is still open and is
+  required before any `tdf_*` default is claimed. The same holds for 3 `nn_torch`
+  seeds.
 
 ### P2: Library ion mobility (IM2Deep)
 

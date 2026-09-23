@@ -575,7 +575,7 @@ through untouched. Each diaPASEF MS2 frame becomes one spectrum per window slot,
 the slot's m/z bounds and 1/K0 bounds (`window_im_lower/upper`). Each MS1 frame becomes
 one spectrum. Within a spectrum the raw TOF x scan points are centroided in m/z x
 mobility: TOF-ordered points join one m/z trace within `convert.tdf_mz_ppm` (10), a
-trace splits where consecutive scans are more than `convert.tdf_im_gap_scans` (5)
+trace splits where consecutive scans are more than `convert.tdf_im_gap_scans` (30)
 apart, and a cluster with fewer than `convert.tdf_min_points` (2) raw points is
 dropped. Every peak carries its intensity-weighted 1/K0 in the `im` column.
 
