@@ -337,15 +337,17 @@ data model has one `mods[i]` slot per residue plus separate terminal deltas
 
 ### Core data types (`types.rs`)
 
-Ion mobility is `Option`/nullable throughout so one model serves 3D and 4D runs;
-the MVP is 3D so every IM field is `None` (`types.rs:1-3`).
+Ion mobility is `Option`/nullable on the per-SCAN types so one model serves 3D and
+4D runs; the MVP is 3D so every IM field is `None` (`types.rs:1-3`). It is
+deliberately absent from `Peak`, which is a per-MS2-point array and the engine's
+largest resident buffer.
 
 | Type | file:line | Fields / behavior |
 |---|---|---|
-| `Peak` | types.rs:9-13 | `mz` f64, `intensity` f32, `ion_mobility` `Option<f32>` (`None` for Orbitrap DIA) |
-| `IsolationWindow` | types.rs:17-30 | `target_mz`/`lower_mz`/`upper_mz` f64, `im_lower`/`im_upper` `Option<f32>`; `covers(mz)` is inclusive m/z containment (`types.rs:25-30`) |
-| `Label` | types.rs:33-51 | `Target`/`Decoy` (serde snake_case); `pin()` -> +1/-1 (Percolator), `is_decoy()` |
-| `Ms2Scan` | types.rs:54-62 | `scan_index` u32, `id` String, `rt_seconds` f64, `window`, m/z-sorted `peaks` `Vec<Peak>` |
+| `Peak` | types.rs:26-32 | `mz` f32, `intensity` f32; 8 bytes, pinned by a `size_of` test. m/z is the spectra artifact's own f32 width and consumers widen with `as f64` at the comparison, which is exact. No per-peak IM: a 4D run gets a per-scan `Vec<f32>` parallel to `peaks` |
+| `IsolationWindow` | types.rs:35-42 | `target_mz`/`lower_mz`/`upper_mz` f64, `im_lower`/`im_upper` `Option<f32>`; `covers(mz)` is inclusive m/z containment (`types.rs:44-49`) |
+| `Label` | types.rs:52-70 | `Target`/`Decoy` (serde snake_case); `pin()` -> +1/-1 (Percolator), `is_decoy()` |
+| `Ms2Scan` | types.rs:77-84 | `scan_index` u32, `rt_seconds` f64, `window`, m/z-sorted `peaks` `Vec<Peak>`; 80 bytes. No `id`: the mzML native id stays in the artifact's `id` column and scans are addressed by `scan_index` |
 
 ### Error types (`error.rs`)
 

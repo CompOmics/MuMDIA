@@ -111,6 +111,45 @@ pub struct ExtractParams<'a> {
     /// (`groups.parallel`). The probing fan-out is this band's share of the thread pool,
     /// not the whole pool, because every band in flight computes it independently.
     pub sibling_bands: usize,
+    /// This run's MS2 and MS1 scans, already decoded. A grouped search
+    /// (`groups.window_groups > 1`) decodes the run once in `run_groups` and lends the
+    /// same buffers to every band, because every band re-reads the whole run and only the
+    /// library differs. `None` loads them from `ms2` / `ms1`, which is what a standalone
+    /// `mumdia extract` and an ungrouped `run` do.
+    ///
+    /// Borrowed, never owned, and the stage only reads them. What makes that safe is not
+    /// that nothing here corrects the observed m/z -- the per-peak mass recalibration
+    /// corrects exactly that, `peak.mz / mass_off.factor_at(peak.mz)`, and each band
+    /// applies its own factor under `groups.calibration = per_group`. It is safe because
+    /// the corrected value is computed into a LOCAL (`q_mz`) at every one of those call
+    /// sites and never written back, the scans arrive as a shared slice that no stage can
+    /// write through, and the loaders have already sorted by retention time so no stage
+    /// re-sorts. The destructive peak-claim strategies likewise rewrite this band's own
+    /// `Hit` intensities, never `scans`. So no band can leave a trace in the scans the
+    /// next band sees.
+    ///
+    /// If you ever hoist `q_mz` out of the per-peak loop, hoist it into a side buffer.
+    /// Writing it back into the scans was harmless when each band decoded its own copy
+    /// and silently corrupts every later band now. See the note above the probe loop.
+    ///
+    /// The two are one field because extract needs both or neither: a caller that shares
+    /// the MS2 buffer but lets extract re-decode the MS1 would keep the saving it came
+    /// for and lose half the mappings again.
+    pub scans: Option<SharedScans<'a>>,
+}
+
+/// One run's decoded spectra, lent to a stage instead of being re-decoded by it.
+///
+/// An EMPTY slice here never means "this run has no such spectra". It means the caller
+/// has nothing to lend, and the stage decodes the corresponding path itself. Saying "no
+/// MS1" is `ExtractParams::ms1 = None`, as it always was. The two are not interchangeable:
+/// an empty `ms1` believed over a named `ms1` path would drop every MS1 feature and every
+/// `ms1_mono` / `ms1_iso1` / `ms1_iso2` chromatogram row, and write a plausible table
+/// while doing it.
+#[derive(Clone, Copy)]
+pub struct SharedScans<'a> {
+    pub ms2: &'a [Ms2Scan],
+    pub ms1: &'a [Ms1Scan],
 }
 
 /// One observed hit: scan RT, candidate-local fragment index, observed intensity
@@ -776,7 +815,10 @@ fn demix_solve_scan(
     let mut rows: Vec<(f64, Vec<(u32, f32)>)> = Vec::new();
     let mut claimants: Vec<(u32, u16, f32)> = Vec::new();
     for peak in &scan.peaks {
-        let q_mz = peak.mz / mass_off.factor_at(peak.mz);
+        // Peaks are stored at the artifact's f32 width; widen once per peak. Exact, so
+        // `mz` is the value the peak used to carry in an f64 field.
+        let mz = peak.mz as f64;
+        let q_mz = mz / mass_off.factor_at(mz);
         claimants.clear();
         {
             let mut push = |c: u32, frag: u16, pi: f32| {
@@ -1262,15 +1304,48 @@ fn accumulate_groups(
             }
         }
     }
-    // Note on `peak.mz / mass_off.factor_at(peak.mz)` below: it is recomputed once per
-    // task for every peak of the window, so the tasks of one window repeat it. Hoisting
-    // it into a per-window buffer was tried and reverted: it is 8 bytes per peak of every
-    // window in flight, which measured +200 MB of peak RSS on the AIF fixture (and would
-    // be a third of a gigabyte with the whole run in one batch, which is the shape a
-    // grouped band search has), for no measurable time -- the extract compute phase was
-    // 2.12-2.16 s with and without it over five runs. The other half of that hoist, the
-    // `ln()` bin computation inside `probe_peak_win`, needs a `FragIndex` entry point
-    // taking a precomputed bin and cannot be done from this file at all.
+    // Note on the per-peak setup `(peak.mz / mass_off.factor_at(peak.mz), bin_of(q_mz))`:
+    // the tasks of one window each recompute it for every peak of the window, so a window
+    // split into `t` tasks computes it `t` times. Hoisting it into a PER-WINDOW buffer,
+    // shared by those tasks, has now been tried twice and reverted twice.
+    //
+    // The m/z half was reverted first: 8 B/peak, +200 MB of peak RSS on the AIF fixture
+    // (317 MB with the whole run in one batch), no measurable time.
+    //
+    // The `ln()` bin half was reverted in the same place for a different reason. The
+    // buffer has to be filled before the pool starts, so it converts per-task work that
+    // was SPREAD ACROSS THE POOL into serial work on one thread, and the default shape
+    // does not have enough tasks per window to pay that back: `tasks_per_window` is
+    // `(2 * threads).div_ceil(groups.len())`, which is 4 at 32 threads and the default
+    // 16 windows in flight, so the fill costs one pass per peak to save three thirty-
+    // seconds of one; break-even needs `tasks_per_window >= threads`, i.e. a batch of one
+    // or two windows. Measured on `tests/bench_fragindex.rs` `bench_wall`, which runs this
+    // task shape over rayon (32 threads, min of 9, two independent passes): against the
+    // in-probe baseline the serial fill is +8.5 / +22.1% on the default shape and
+    // +38.9 / +30.0% with smaller windows (1-2 tasks each), where the scratch below is
+    // -11.7 / -6.4% and -15.1 / -17.9%. Only a batch of one wide window pays the fill
+    // back (-23.7 / -19.0%, against the scratch's -17.4 / -18.6%). A fill spread over the
+    // POOL removes the regression and is still not worth it: against the scratch it is
+    // -5.6 / -2.3% on the default shape and +5.7 / +3.2% -- a loss -- on the second, for
+    // 4 B/peak of every window in flight, about half of what got the m/z hoist reverted,
+    // in extract, the tallest stage.
+    //
+    // End to end, `mumdia extract` on the AIF run (152 windows, 1.69M candidates,
+    // 465,806 scans, 32 threads, three binaries interleaved over ~24 reps each, timing
+    // the accumulation phase alone): against the in-probe baseline's 3,274 ms min /
+    // 3,360 mean-of-3-fastest / 4,233 median, the serial-fill buffer is +14.0 / +13.2 /
+    // +9.3% and the scratch below -0.3 / -1.9 / -4.5%. The regression is the size the
+    // model predicts: one serial pass over the in-flight peaks, 39.6M x 5.4 ns = 430 ms
+    // of a 3.3 s phase. Byte-identical artifacts in all 69 runs. See docs/09_extract.md.
+
+    //
+    // The memory-cheap version of that hoist -- writing the corrected value back into
+    // `scan.peaks` instead of into a side buffer -- is now FORBIDDEN, not merely
+    // unmeasured. Under `groups.window_groups > 1` the scans are one buffer lent to every
+    // band (`ExtractParams::scans`), and under `groups.calibration = per_group` each band
+    // applies its own `MassOffset` to it, so band g00's factor would be baked into the
+    // peaks band g01 reads. The borrow checker stops it today, because `scans` arrives as
+    // a shared slice; do not reach for `&mut` to get around that.
     let (tx, rx) = std::sync::mpsc::channel::<(usize, usize, HitStore)>();
     {
         let probe_range = |gi: usize, lo: u32, hi: u32| -> HitStore {
@@ -1286,15 +1361,41 @@ fn accumulate_groups(
             // reprobes the same bins, so cache each bin's narrowed posting range once
             // instead of binary-searching it per peak.
             let mut nw = idx.window_narrow(lo, hi);
+            // One scan's `(q_mz, bin)`, refilled per scan and reused. A few KB at 300-2000
+            // peaks a scan, task-local, so it is not the per-window buffer above: nothing
+            // is shared, nothing is filled before the pool starts, and no thread waits.
+            //
+            // It still pays, with exactly the same number of `ln()` calls the probe made
+            // per peak, because a separate pass takes the `ln()` off the dependency chain
+            // that the bin-cache load and then the posting loads hang from. Measured over
+            // rayon at this task shape (`tests/bench_fragindex.rs` `bench_wall`, 32
+            // threads, min of 9, two independent passes): -11.7 / -6.4% on the default
+            // shape, -15.1 / -17.9% with smaller windows, -17.4 / -18.6% with one wide
+            // window in the batch. Single thread, sorted production-shaped peaks
+            // (`bench_probe`): -9.1 / -12.7 / -6.7% for a narrow / medium / wide
+            // candidate window.
+            //
+            // It carries `q_mz` and not just the bin so `factor_at` still runs ONCE per
+            // peak. That is free here and is not free for the caller: under
+            // `search_seed.mass_cal_loess` the offset is a ~74-point grid and `factor_at`
+            // is a binary search plus an interpolation, measured 8.3 ns/peak against
+            // 0.725 for the scalar default, and a bin-only scratch (which recomputes
+            // `q_mz` in the peak loop) turned that arm from -1.7% into +5.6%.
+            let mut setup: Vec<(f64, u32)> = Vec::new();
             for &si in ids {
                 let scan = &scans[si];
                 let rt = scan.rt_seconds;
-                for peak in &scan.peaks {
+                setup.clear();
+                setup.extend(scan.peaks.iter().map(|p| {
+                    let mz = p.mz as f64;
+                    let q = mz / mass_off.factor_at(mz);
+                    (q, idx.bin_of(q))
+                }));
+                for (peak, &(q_mz, bin)) in scan.peaks.iter().zip(&setup) {
                     let inten = peak.intensity;
-                    let q_mz = peak.mz / mass_off.factor_at(peak.mz);
-                    let obs_mz = peak.mz;
+                    let obs_mz = peak.mz as f64;
                     claimants.clear();
-                    idx.probe_peak_win(&mut nw, q_mz, |cid, _pmz, pint, frag| {
+                    idx.probe_peak_win_binned(&mut nw, q_mz, bin, |cid, _pmz, pint, frag| {
                         let c = cid as usize;
                         if rt < rt_lo[c] || rt > rt_hi[c] {
                             return;
@@ -1520,8 +1621,8 @@ fn extract_twopass_windows(
                 let rt = scan.rt_seconds;
                 for peak in &scan.peaks {
                     let inten = peak.intensity;
-                    let q_mz = peak.mz / mass_off.factor_at(peak.mz);
-                    let obs_mz = peak.mz;
+                    let obs_mz = peak.mz as f64;
+                    let q_mz = obs_mz / mass_off.factor_at(obs_mz);
                     claimants.clear();
                     {
                         let mut push = |cid: u32, frag: u16, pi: f32| {
@@ -1574,8 +1675,8 @@ fn extract_twopass_windows(
                     let rtb = rt.to_bits();
                     for peak in &scan.peaks {
                         let inten = peak.intensity;
-                        let q_mz = peak.mz / mass_off.factor_at(peak.mz);
-                        let obs_mz = peak.mz;
+                        let obs_mz = peak.mz as f64;
+                        let q_mz = obs_mz / mass_off.factor_at(obs_mz);
                         claimants.clear();
                         {
                             let mut push = |cid: u32, frag: u16, pi: f32| {
@@ -1646,7 +1747,8 @@ fn extract_twopass_windows(
                         std::collections::BTreeSet::new();
                     let mut prows: Vec<DemixRow> = Vec::new();
                     for peak in &scan.peaks {
-                        let q_mz = peak.mz / mass_off.factor_at(peak.mz);
+                        let obs_mz = peak.mz as f64;
+                        let q_mz = obs_mz / mass_off.factor_at(obs_mz);
                         claimants.clear();
                         {
                             let mut push = |cid: u32, frag: u16, pi: f32| {
@@ -1669,7 +1771,7 @@ fn extract_twopass_windows(
                         for &(cid, _, _) in &claimants {
                             cand.insert(cid);
                         }
-                        prows.push((peak.intensity, peak.mz, claimants.clone()));
+                        prows.push((peak.intensity, obs_mz, claimants.clone()));
                     }
                     if prows.is_empty() {
                         continue;
@@ -1757,7 +1859,8 @@ fn extract_twopass_windows(
                     // both keep signal at a shared peak.
                     let mut prows: Vec<DemixRow> = Vec::new();
                     for peak in &scan.peaks {
-                        let q_mz = peak.mz / mass_off.factor_at(peak.mz);
+                        let obs_mz = peak.mz as f64;
+                        let q_mz = obs_mz / mass_off.factor_at(obs_mz);
                         claimants.clear();
                         {
                             let mut push = |cid: u32, frag: u16, pi: f32| {
@@ -1777,7 +1880,7 @@ fn extract_twopass_windows(
                         if claimants.is_empty() {
                             continue;
                         }
-                        prows.push((peak.intensity, peak.mz, claimants.clone()));
+                        prows.push((peak.intensity, obs_mz, claimants.clone()));
                     }
                     if prows.is_empty() {
                         continue;
@@ -1828,8 +1931,8 @@ fn extract_twopass_windows(
                 }
                 for peak in &scan.peaks {
                     let inten = peak.intensity;
-                    let q_mz = peak.mz / mass_off.factor_at(peak.mz);
-                    let obs_mz = peak.mz;
+                    let obs_mz = peak.mz as f64;
+                    let q_mz = obs_mz / mass_off.factor_at(obs_mz);
                     claimants.clear();
                     {
                         let mut push = |cid: u32, frag: u16, pi: f32| {
@@ -2068,10 +2171,56 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
         }
     }
 
-    let scans = load_ms2(p.ms2)?;
-    let ms1_scans: Vec<Ms1Scan> = match p.ms1 {
-        Some(path) => load_ms1(path)?,
-        None => Vec::new(),
+    // Decoded here unless the caller lent its own copies (see `ExtractParams::scans`).
+    // The owned buffers are declared first so they outlive the borrows.
+    //
+    // An empty lent slice is never believed over a named path. A caller that lends
+    // `SharedScans { ms2, ms1: &[] }` while still passing `ms1: Some(path)` would
+    // otherwise lose every MS1 feature and every MS1 chromatogram row with no error and
+    // no warning, because both are guarded on `!ms1_scans.is_empty()` and simply write
+    // nothing. Decoding the named artifact instead costs nothing when the run really has
+    // no MS1 rows (the decode is then empty too) and makes the silent version impossible.
+    let owned_ms2: Vec<Ms2Scan>;
+    let owned_ms1: Vec<Ms1Scan>;
+    let (scans, ms1_scans): (&[Ms2Scan], &[Ms1Scan]) = match p.scans {
+        Some(shared) => {
+            let ms2: &[Ms2Scan] = if shared.ms2.is_empty() {
+                owned_ms2 = load_ms2(p.ms2)?;
+                if !owned_ms2.is_empty() {
+                    warn!(
+                        ms2 = p.ms2,
+                        scans = owned_ms2.len(),
+                        "extract: the caller lent an empty MS2 buffer for a run that has                          scans; decoding the artifact instead of searching nothing"
+                    );
+                }
+                &owned_ms2
+            } else {
+                shared.ms2
+            };
+            let ms1: &[Ms1Scan] = match p.ms1 {
+                Some(path) if shared.ms1.is_empty() => {
+                    owned_ms1 = load_ms1(path)?;
+                    if !owned_ms1.is_empty() {
+                        warn!(
+                            ms1 = path,
+                            scans = owned_ms1.len(),
+                            "extract: the caller lent an empty MS1 buffer while naming an MS1                              artifact; decoding it instead of dropping every MS1 feature"
+                        );
+                    }
+                    &owned_ms1
+                }
+                _ => shared.ms1,
+            };
+            (ms2, ms1)
+        }
+        None => {
+            owned_ms2 = load_ms2(p.ms2)?;
+            owned_ms1 = match p.ms1 {
+                Some(path) => load_ms1(path)?,
+                None => Vec::new(),
+            };
+            (&owned_ms2, &owned_ms1)
+        }
     };
     let ms1_rts: Vec<f64> = ms1_scans.iter().map(|s| s.rt_seconds).collect();
     info!(
@@ -2084,7 +2233,7 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
     // Isolation-window -> sorted scan RTs, for zero-filled chromatogram grids.
     let windows: Vec<(f64, f64, Vec<f64>)> = if p.cfg.emit_window_grid {
         let mut tmp: HashMap<(u64, u64), Vec<f64>> = HashMap::new();
-        for s in &scans {
+        for s in scans {
             tmp.entry((s.window.lower_mz.to_bits(), s.window.upper_mz.to_bits()))
                 .or_default()
                 .push(s.rt_seconds);
@@ -2214,14 +2363,14 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
             // candidate out as soon as no later window can add a hit to it, so the whole
             // run's hits are never resident. Measured at 1.6 billion hits (35.9 GiB of
             // payload) on the HYE benchmark, which was 60% of extract's 61.3 GiB peak.
-            stream_groups = Some(window_groups(idx, &scans));
+            stream_groups = Some(window_groups(idx, scans));
         } else {
             let pr = Prober {
                 fidx: fidx.as_ref(),
                 lib: &lib,
                 frag_tol,
             };
-            for scan in &scans {
+            for scan in scans {
                 let (lo, hi) = lib.candidate_range(scan.window.lower_mz, scan.window.upper_mz);
                 if hi <= lo {
                     continue;
@@ -2229,7 +2378,8 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
                 let rt = scan.rt_seconds;
                 for peak in &scan.peaks {
                     let inten = peak.intensity;
-                    let q_mz = peak.mz / mass_off.factor_at(peak.mz);
+                    let obs_mz = peak.mz as f64;
+                    let q_mz = obs_mz / mass_off.factor_at(obs_mz);
                     // Collect every co-isolated, in-RT-window candidate matching this
                     // peak, then apportion per the claim strategy. In wide DIA one peak
                     // matches many candidates (~98% of fragments collide).
@@ -2252,7 +2402,6 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
                     if claimants.is_empty() {
                         continue;
                     }
-                    let obs_mz = peak.mz;
                     match p.cfg.peak_claim {
                         PeakClaim::WinnerPredictedIntensity => {
                             let mut best = 0usize;
@@ -2322,11 +2471,11 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
         let (a, c) = extract_twopass_windows(
             fidx.as_ref(),
             &lib,
-            &scans,
+            scans,
             &rt_lo,
             &rt_hi,
             &rt_cal,
-            &ms1_scans,
+            ms1_scans,
             &ms1_rts,
             &mass_off,
             frag_tol,
@@ -2979,7 +3128,14 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
                     .iter()
                     .map(|&r| {
                         let j = nearest_index(&ms1_rts, r);
-                        sum_near(&ms1_scans[j].mz, &ms1_scans[j].intensity, mz, tol) as f32
+                        // No `as f32`: `sum_near` returns f32 and the target is `Vec<f32>`,
+                        // so the cast was an identity. It was tolerated while `ms1_scans`
+                        // was a `Vec<Ms1Scan>` and `clippy::unnecessary_cast` fires on it
+                        // now that it is a `&[Ms1Scan]` -- verified in both directions on
+                        // this tree with clippy 1.96.0, silent before and an error after,
+                        // though which of the lint's heuristics distinguishes `Vec`
+                        // indexing from slice indexing was not established.
+                        sum_near(&ms1_scans[j].mz, &ms1_scans[j].intensity, mz, tol)
                     })
                     .collect();
                 chrom_rows.push((cid, nm.to_string(), mz, mz, 0.0, grid_rt.clone(), ints));
@@ -3309,7 +3465,7 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
                         .expect("streamed path implies a fragment index"),
                     p.sibling_bands,
                     &groups[gi..upto],
-                    &scans,
+                    scans,
                     &rt_lo,
                     &rt_hi,
                     &mass_off,
@@ -3407,7 +3563,7 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
             if peakrank_c[i] != 0 {
                 continue;
             }
-            if let Some(si) = demix_apex_scan(&scans, &rt_scan, apexrt_c[i], mz_c[i]) {
+            if let Some(si) = demix_apex_scan(scans, &rt_scan, apexrt_c[i], mz_c[i]) {
                 by_scan.entry(si).or_default().push(cid_c[i]);
             }
         }
@@ -3881,14 +4037,12 @@ mod accumulate_tests {
         (0..n_scans)
             .map(|si| Ms2Scan {
                 scan_index: (base + si) as u32,
-                id: format!("s{}", base + si),
                 rt_seconds: 100.0 + (base + si) as f64,
                 window,
                 peaks: (0..97)
                     .map(|k| Peak {
-                        mz: 300.0 + k as f64 * 1.37,
+                        mz: 300.0 + k as f32 * 1.37,
                         intensity: 10.0 + (si + k) as f32,
-                        ion_mobility: None,
                     })
                     .collect(),
             })
