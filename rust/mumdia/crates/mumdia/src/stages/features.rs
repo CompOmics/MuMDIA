@@ -989,29 +989,6 @@ impl ChromChunk {
     }
 }
 
-/// Row `k` of an f32 list column as a slice BORROWED from the decoded batch.
-///
-/// [`ListF32::append_row`] copies the row into a caller buffer, and to reach the values it
-/// calls `ListArray::value(k)`, which is `values.slice(start, len)`: one `Arc<dyn Array>`
-/// heap allocation plus refcount traffic on the child buffer, per row per column. The
-/// loader then copied the row a SECOND time, out of the scratch buffer and into the chunk.
-/// At the HYE benchmark shape (38.8M chromatogram rows, ~220-point traces, two list
-/// columns) that was 77.6M allocations and ~68 GB memcpy'd on the single loader thread,
-/// for values [`ChromChunk::push_row`] copies into the chunk anyway. Borrowing leaves
-/// exactly one copy: the one the chunk keeps.
-///
-/// That figure is the MAIN pass alone, not both passes. `read_chunk_filtered` tests
-/// `keep` and `continue`s BEFORE it touches either list column, so the confident-bounds
-/// pass extracts only the ~0.84% of rows belonging to a confident candidate: ~0.33M rows,
-/// ~0.65M extractions, ~0.6 GB. The two passes together are ~68.9 GB, not ~137 GB, and
-/// this saving is one pass's worth.
-///
-/// Byte-identical to `append_row`: `value_offsets()` is already adjusted for a SLICED list
-/// (which matters, because the loader slices a batch that straddles a chunk boundary) and
-/// `PrimitiveArray::values()` for the child's own offset, so `child[o[k]..o[k + 1]]` is
-/// exactly what `value(k).values()` returns. A null row yields an empty slice, which is
-/// what `append_row` left in the cleared scratch buffer.
-
 /// Sequential reader over the chromatogram table that hands out one [`ChromChunk`] of a
 /// requested row count at a time. One decoded batch is resident beyond the chunk; a batch
 /// straddling a chunk boundary is sliced and its remainder kept for the next chunk.
