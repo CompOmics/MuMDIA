@@ -15,6 +15,8 @@
 //! Note: the JSON feature `coelution_weighted_mean` is an exact alias of
 //! `pairwise_coelution_weighted` (identical computation) and is emitted once
 //! here under the `pairwise_coelution_weighted` name only.
+use std::borrow::Cow;
+
 use super::{best_xcorr, Evidence};
 use crate::stats::pearson;
 
@@ -122,13 +124,30 @@ pub fn values(e: &Evidence) -> Vec<f64> {
     // --- full-window ref correlation ---
     let tf = &e.traces_full;
     let has_full = tf.len() == k && k > 0 && !e.axis_full.is_empty();
-    let r_full: Vec<f64> = if has_full {
-        weighted_reference(tf, &e.pred, e.axis_full.len())
+    // R over the full window. This used to be a second build of the profile
+    // `interference` also builds inline, term for term the same sum; `build_evidence`
+    // now builds it once (see `super::weighted_reference_full`). It is read only under
+    // `has_full`, which requires `traces_full.len() == pred.len()` -- the condition that
+    // made the two builds identical.
+    //
+    // The length is checked rather than assumed, for the reason `interference` gives:
+    // `Evidence` is `pub` with `pub` fields, and a short profile would quietly shorten
+    // every `pearson` below instead of failing. On `build_evidence`, the one constructor,
+    // the check is a comparison and the rebuild never runs.
+    let r_full_owned: Cow<[f64]> = if !has_full {
+        Cow::Borrowed(&[][..])
+    } else if e.ref_profile_full.len() == e.axis_full.len() {
+        Cow::Borrowed(&e.ref_profile_full)
     } else {
-        Vec::new()
+        Cow::Owned(super::weighted_reference_full(
+            &e.traces_full,
+            &e.pred,
+            e.axis_full.len(),
+        ))
     };
+    let r_full: &[f64] = &r_full_owned;
     let rc_full: Vec<f64> = if has_full {
-        (0..k).map(|i| pearson(&tf[i], &r_full)).collect()
+        (0..k).map(|i| pearson(&tf[i], r_full)).collect()
     } else {
         Vec::new()
     };
@@ -494,19 +513,6 @@ fn accumulate(dst: &mut [f64], src: &[f64]) {
     for i in 0..n {
         dst[i] += src[i];
     }
-}
-
-/// Predicted-intensity-weighted reference profile over a window of length `t`.
-fn weighted_reference(traces: &[Vec<f64>], pred: &[f64], t: usize) -> Vec<f64> {
-    let mut r = vec![0.0f64; t];
-    for (i, tr) in traces.iter().enumerate() {
-        let w = pred.get(i).cloned().unwrap_or(0.0);
-        let n = t.min(tr.len());
-        for j in 0..n {
-            r[j] += w * tr[j];
-        }
-    }
-    r
 }
 
 /// Indices of `v` sorted by value descending (stable on ties by index).

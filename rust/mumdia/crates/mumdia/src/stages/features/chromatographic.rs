@@ -986,6 +986,9 @@ mod tests {
 
     fn ev(axis: Vec<f64>, traces: Vec<Vec<f64>>, pred: Vec<f64>) -> Evidence {
         let tp = axis.len();
+        // This fixture's full window IS its peak window, so the cached full-window
+        // reference profile is built over the same traces the real Evidence would use.
+        let ref_profile_full = crate::stages::features::weighted_reference_full(&traces, &pred, tp);
         Evidence {
             axis: axis.clone(),
             traces: traces.clone(),
@@ -1001,6 +1004,7 @@ mod tests {
             mass_err_ppm: vec![],
             apex_idx: tp / 2,
             ref_profile: vec![],
+            ref_profile_full,
             apex_rt: 0.0,
             rt_pred_cal: 0.0,
             rt_err: 0.0,

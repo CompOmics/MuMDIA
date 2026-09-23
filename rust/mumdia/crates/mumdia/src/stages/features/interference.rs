@@ -11,6 +11,8 @@
 //! degenerate cases (K = 0 fragments, T < 2 time points, empty windows) return
 //! 0.0. Correlation/cosine are delegated to `crate::stats`; profile helpers to
 //! the parent `features` module.
+use std::borrow::Cow;
+
 use super::Evidence;
 use crate::stats::{cosine, pearson};
 
@@ -69,18 +71,24 @@ pub fn values(e: &Evidence) -> Vec<f64> {
         }
     }
 
-    // Reference profile over the full extraction window (pred-weighted sum).
-    let mut rfull = vec![0.0f64; tf];
-    for f in 0..k {
-        if f < e.traces_full.len() {
-            let x = &e.traces_full[f];
-            let w = e.pred[f];
-            let n = x.len().min(tf);
-            for t in 0..n {
-                rfull[t] += w * x[t];
-            }
-        }
-    }
+    // Reference profile over the full extraction window (pred-weighted sum), built once
+    // in `build_evidence` rather than here and again in `coelution`; the inline loop this
+    // replaces is reproduced term for term by `super::weighted_reference_full`.
+    //
+    // `full_apex` below is a position on `axis_full` and indexes this profile, which the
+    // inline build made `tf` long by construction. A `debug_assert` would not hold that
+    // in a release build: `Evidence` is `pub` with `pub` fields, `build_evidence` is only
+    // today's sole constructor, and a shorter profile degrades SILENTLY here --
+    // `sum_full_profile` becomes 0, the `rfull.len() >= 2` and `>= 3` guards below skip
+    // `peak_bounds` and the second-peak scan, and `pearson` correlates over the shorter
+    // overlap. So the length is checked and the profile rebuilt rather than trusted; on
+    // the one constructor the check is a comparison and the rebuild never runs.
+    let rfull_owned: Cow<[f64]> = if e.ref_profile_full.len() == tf {
+        Cow::Borrowed(&e.ref_profile_full)
+    } else {
+        Cow::Owned(super::weighted_reference_full(&e.traces_full, &e.pred, tf))
+    };
+    let rfull: &[f64] = &rfull_owned;
 
     // Matched fragment set (observed apex intensity present, trace available).
     let matched: Vec<usize> = (0..k)
@@ -265,7 +273,7 @@ pub fn values(e: &Evidence) -> Vec<f64> {
     for &f in &matched {
         sp_corr += corr_ref[f];
         let full_corr = if f < e.traces_full.len() {
-            pearson(&e.traces_full[f], &rfull)
+            pearson(&e.traces_full[f], rfull)
         } else {
             0.0
         };
@@ -402,7 +410,7 @@ pub fn values(e: &Evidence) -> Vec<f64> {
     };
     let max_peak = r.iter().cloned().fold(0.0f64, f64::max);
     let (lo, hi) = if rfull.len() >= 2 {
-        super::peak_bounds(&rfull, full_apex, 0.5, 0)
+        super::peak_bounds(rfull, full_apex, 0.5, 0)
     } else {
         (0, 0)
     };

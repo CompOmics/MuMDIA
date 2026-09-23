@@ -129,6 +129,10 @@ def main() -> int:
             print(f"error: cannot read {path}: {exc}", file=sys.stderr)
             return 2
         for match in REF.finditer(text):
+            # `(0..md.num_row_groups())` is a Rust range over a metadata binding,
+            # not a document: no filename holds two dots in a row.
+            if ".." in match.group(0):
+                continue
             base = match.group(0).rsplit("/", 1)[-1]
             if base in UNTRACKED_BY_POLICY and path in POLICY_FILES:
                 continue

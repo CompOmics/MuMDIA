@@ -784,7 +784,7 @@ listed with the file it is in.
 | `MUMDIA_NN_WARM_EPOCHS` | sidecar | `0` | `scripts/nn_rescore_worker.py:622` |
 | `MUMDIA_NN_WARM_START` | sidecar | `0` | `scripts/nn_rescore_worker.py:621` |
 | `MUMDIA_NN_WD` | sidecar | `1e-4` | `scripts/nn_rescore_worker.py:635` |
-| `MUMDIA_PARQUET_COMPRESSION` | engine | none (unset means off) | `rust/mumdia/crates/mumdia-io/src/table.rs:37` |
+| `MUMDIA_PARQUET_COMPRESSION` | engine | none (unset means off) | `rust/mumdia/crates/mumdia-io/src/table.rs:59` |
 | `MUMDIA_PEPTDEEP_DEVICE` | sidecar | `"auto"` | `scripts/peptdeep_worker.py:214` |
 | `MUMDIA_PYTHON` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/python.rs:233` |
 | `MUMDIA_PYTHON_DEEPLC` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/python.rs:232` |
@@ -792,7 +792,7 @@ listed with the file it is in.
 | `MUMDIA_PYTHON_MS2PIP` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/python.rs:232` |
 | `MUMDIA_PYTHON_PEPTDEEP` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/python.rs:232` |
 | `MUMDIA_PYTHON_RESCORE` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/python.rs:232` |
-| `MUMDIA_RESCORE_MODEL` | both | `"nn"` | `rust/mumdia/crates/mumdia/src/stages/rescore.rs:488`, `scripts/mokapot_worker.py:181`, `scripts/mokapot_worker.py:37` |
+| `MUMDIA_RESCORE_MODEL` | both | `"nn"` | `rust/mumdia/crates/mumdia/src/stages/rescore.rs:644`, `scripts/mokapot_worker.py:181`, `scripts/mokapot_worker.py:37` |
 | `MUMDIA_SCRIPTS` | sidecar | `os.path.dirname(os.path.abspath(__file__` | `scripts/mh_shard_predict.py:23` |
 | `MUMDIA_THERMO_PARSER` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/raw.rs:171` |
 | `MUMDIA_XGB_DEPTH` | sidecar | `"6"` | `scripts/mokapot_worker.py:63` |
@@ -818,23 +818,23 @@ one exception noted in its own help text: it sets `MUMDIA_NN_THREADS` and
 |---|---|---|---|
 | `KMP_DUPLICATE_LIB_OK` | sidecar | `"TRUE"` | `scripts/deeplc_finetune.py:28` |
 | `MKL_NUM_THREADS` | sidecar | `"1"` | `scripts/deeplc_finetune.py:31` |
-| `MUMDIA_NN_FOLDS` | engine | `p.cfg.folds.to_string()` | `rust/mumdia/crates/mumdia/src/stages/rescore.rs:1889` |
-| `MUMDIA_NN_FOLD_KEYS` | engine | `foldkeys` | `rust/mumdia/crates/mumdia/src/stages/rescore.rs:1916` |
-| `MUMDIA_NN_ITERS` | engine | `p.cfg.num_iter.to_string()` | `rust/mumdia/crates/mumdia/src/stages/rescore.rs:1890` |
-| `MUMDIA_NN_MARGIN_FRAC` | engine | `p.cfg.train_margin_frac.to_string()` | `rust/mumdia/crates/mumdia/src/stages/rescore.rs:1914` |
-| `MUMDIA_NN_NEG_RATIO` | engine | `p.cfg.train_neg_ratio.to_string()` | `rust/mumdia/crates/mumdia/src/stages/rescore.rs:1895` |
-| `MUMDIA_NN_NEG_SELECT` | engine | `match p.cfg.train_neg_select { mumdia_core::config::NegSelect::Random => "random", mumdia_core::config::NegSelect::Margin => "margin", mumdia_core::config::NegSelect::Hybrid => "hybrid", }` | `rust/mumdia/crates/mumdia/src/stages/rescore.rs:1896` |
-| `MUMDIA_NN_SEEDS` | engine | `p.cfg.seeds.max(1).to_string()` | `rust/mumdia/crates/mumdia/src/stages/rescore.rs:1915` |
+| `MUMDIA_NN_FOLDS` | engine | `p.cfg.folds.to_string()` | `rust/mumdia/crates/mumdia/src/stages/rescore.rs:2236` |
+| `MUMDIA_NN_FOLD_KEYS` | engine | `foldkeys` | `rust/mumdia/crates/mumdia/src/stages/rescore.rs:2263` |
+| `MUMDIA_NN_ITERS` | engine | `p.cfg.num_iter.to_string()` | `rust/mumdia/crates/mumdia/src/stages/rescore.rs:2237` |
+| `MUMDIA_NN_MARGIN_FRAC` | engine | `p.cfg.train_margin_frac.to_string()` | `rust/mumdia/crates/mumdia/src/stages/rescore.rs:2261` |
+| `MUMDIA_NN_NEG_RATIO` | engine | `p.cfg.train_neg_ratio.to_string()` | `rust/mumdia/crates/mumdia/src/stages/rescore.rs:2242` |
+| `MUMDIA_NN_NEG_SELECT` | engine | `match p.cfg.train_neg_select { mumdia_core::config::NegSelect::Random => "random", mumdia_core::config::NegSelect::Margin => "margin", mumdia_core::config::NegSelect::Hybrid => "hybrid", }` | `rust/mumdia/crates/mumdia/src/stages/rescore.rs:2243` |
+| `MUMDIA_NN_SEEDS` | engine | `p.cfg.seeds.max(1).to_string()` | `rust/mumdia/crates/mumdia/src/stages/rescore.rs:2262` |
 | `MUMDIA_NN_THREADS` | engine | `n.to_string()` | `rust/mumdia/crates/mumdia/src/main.rs:94` |
-| `MUMDIA_NN_TRAIN_FDR` | engine | `p.cfg.train_fdr.to_string()` | `rust/mumdia/crates/mumdia/src/stages/rescore.rs:1891` |
-| `MUMDIA_NN_TRAIN_SUB` | engine | `p.cfg.train_subsample.to_string()` | `rust/mumdia/crates/mumdia/src/stages/rescore.rs:1904` |
-| `MUMDIA_NN_WARM_EPOCHS` | engine | `p.cfg.train_warm_epochs.to_string()` | `rust/mumdia/crates/mumdia/src/stages/rescore.rs:1913` |
-| `MUMDIA_NN_WARM_START` | engine | `if p.cfg.train_warm_epochs > 0 { "1" } else { "0" }` | `rust/mumdia/crates/mumdia/src/stages/rescore.rs:1905` |
+| `MUMDIA_NN_TRAIN_FDR` | engine | `p.cfg.train_fdr.to_string()` | `rust/mumdia/crates/mumdia/src/stages/rescore.rs:2238` |
+| `MUMDIA_NN_TRAIN_SUB` | engine | `p.cfg.train_subsample.to_string()` | `rust/mumdia/crates/mumdia/src/stages/rescore.rs:2251` |
+| `MUMDIA_NN_WARM_EPOCHS` | engine | `p.cfg.train_warm_epochs.to_string()` | `rust/mumdia/crates/mumdia/src/stages/rescore.rs:2260` |
+| `MUMDIA_NN_WARM_START` | engine | `if p.cfg.train_warm_epochs > 0 { "1" } else { "0" }` | `rust/mumdia/crates/mumdia/src/stages/rescore.rs:2252` |
 | `NUMEXPR_NUM_THREADS` | sidecar | `"1"` | `scripts/deeplc_finetune.py:32` |
 | `OMP_NUM_THREADS` | both | `"1"` in deeplc_finetune.py; `n.to_string()` in main.rs | `rust/mumdia/crates/mumdia/src/main.rs:94`, `scripts/deeplc_finetune.py:29` |
 | `OPENBLAS_NUM_THREADS` | sidecar | `"1"` | `scripts/deeplc_finetune.py:30` |
 | `PYTHONIOENCODING` | engine | `"utf-8"` | `rust/mumdia/crates/mumdia/src/sidecar.rs:548` |
-| `PYTHONUTF8` | engine | `"1"` | `rust/mumdia/crates/mumdia/src/sidecar.rs:548`, `rust/mumdia/crates/mumdia/src/stages/rescore.rs:1352`, `rust/mumdia/crates/mumdia/src/stages/rescore.rs:1883` |
+| `PYTHONUTF8` | engine | `"1"` | `rust/mumdia/crates/mumdia/src/sidecar.rs:548`, `rust/mumdia/crates/mumdia/src/stages/rescore.rs:1619`, `rust/mumdia/crates/mumdia/src/stages/rescore.rs:2230` |
 
 ## Unresolved by the generator
 
