@@ -437,6 +437,75 @@ Three things this says:
 On this data the useful range is therefore 48 to 64 bands: about 40 GB per band, which is
 what a 100 GB desktop can run two of at a time, or one with room to spare.
 
+### Band size, not band count: the HYE Astral measurement (2026-09-22)
+
+The band counts above were derived on a 203M-precursor library, where a band of a 63-band
+plan holds 3.2M precursors. Repeating the exercise on a 10.9M-precursor library says the
+useful range is a property of the BAND, not of the plan, and that a small library should not
+be banded at all.
+
+Six 15-minute Astral files, imported HYE library, the same adapted retention times in both
+arms, one arm unbanded and one cut into 100 bands of three isolation windows each
+(about 126,000 precursors per band):
+
+| | unbanded | 100 bands |
+|---|---|---|
+| precursors at 1% | 126,436 | 121,966 |
+| peptides at 1% | 113,860 | 110,006 |
+| protein groups at 1% | 12,166 | 12,029 |
+| extract, summed over six files | 4.6 CPU-min | 153 CPU-min |
+| search-seed, summed | 1.8 CPU-min | 215 CPU-min |
+| engine peak resident | 11.8 GB | 182 GB |
+| peak mappings | 456 | 11,441 |
+
+Two things to take from it.
+
+**The fixed cost per band is the run's spectra, and it does not shrink with the band.** Each
+band decodes its own copy: 3.84 GiB of MS2 scans to search a 0.016 GiB slice of library, a
+ratio of 240 to 1. That is why the seed costs 215 CPU-minutes here against 1.8, and why 48
+bands in flight hold 182 GB. It is also why raising `groups.parallel` stops helping: at 100
+bands the machine was at load 35 of 128, waiting on decodes rather than searching.
+
+**The identification loss was a defect, not a property of banding.** A grouped run fitted
+its fragment mass calibration per band and combined the bands' scalars, giving 11.400 ppm
+against the 8.452 a single fit gives on the same data: the tolerance is
+`1.5 x p95(|dev - median|)`, and a 95th percentile over one band's ~2,000 deviations has a
+heavier tail than the same percentile over the union. Each band also selected its calibrants
+on its own q, whose 1/T floor is looser (106,088 confident seed PSMs against 97,584). The
+wider tolerance admitted 33% more candidates, and the extra noise cost 3.4% of the peptides.
+Proved rather than inferred: one band extracted twice, identical in every input except which
+calibration file it was handed, accepted 12,414 candidates at 11.400 ppm and 8,791 at 8.452.
+A control arm, unbanded on the same adapted library, reproduced the unbanded arm's 113,860
+peptides exactly, which rules out the seeding difference between the arms.
+
+Fitting the calibration once on the bands' pooled deviations settles it. The banded arm
+repeated on that build reproduces the unbanded calibration to eight significant figures and
+selects the same calibrants:
+
+| | unbanded | banded, per-band scalars | banded, pooled deviations |
+|---|---|---|---|
+| offset | -1.8486016959 | -1.8834 | -1.8486016989 |
+| tolerance | 8.452381550 | 11.400 | 8.452381790 |
+| calibrant deviations | 181,196 | 200,257 | 181,196 |
+| residual MAD | 0.90689065 | 1.035 | 0.90689063 |
+
+The residual difference is the sidecar storing deviations as f32. Downstream, the banded run
+then extracts the SAME candidate set as the unbanded one, to the row: 4,986,153 accepted and
+74,115,941 chromatogram rows in both, and 4,986,153 scored rows against the unbanded run's
+4,986,153.
+
+| at 1% | unbanded | 100 bands, per-band scalars | 100 bands, pooled deviations |
+|---|---|---|---|
+| precursors | 126,436 | 121,966 | 125,983 |
+| peptides | 113,860 | 110,006 | 113,789 |
+| protein groups | 12,166 | 12,029 | 12,221 |
+
+That is 98% of the lost peptides recovered, and what remains is inside the single-seed
+spread this pool shows (about 0.4%, docs/28): the protein groups come back slightly above
+the unbanded arm, which is the same noise in the other direction. Banding is
+identification-neutral on this data once the calibration is fitted once, and what it costs
+is the fixed per-band work above.
+
 ### `groups.parallel` and the thread count
 
 A band in flight occupies one rayon worker, which then blocks on its own extraction's
