@@ -6,6 +6,7 @@ pub mod calibrate;
 pub mod fdr;
 pub mod groups;
 pub mod index;
+pub mod masscal;
 pub mod matchers;
 pub mod memlog;
 pub mod peaks;

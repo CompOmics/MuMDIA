@@ -141,6 +141,72 @@ diff <(cut -f1-3 "$work/out/peptides.tsv") <(cut -f1-3 "$work/out_nan_rt/peptide
     || { echo "dropping one unusable scan changed the identifications"; exit 1; }
 echo "    ok: run completed, drop reported, identifications unchanged"
 
+# 4c. The GROUPED orchestrator (`groups.window_groups > 1`), which nothing covered.
+#
+#     `run_groups` is a second orchestrator: it cuts the library into m/z bands, seeds,
+#     calibrates, extracts, features and competes each band separately, and pools the
+#     results back into the artifacts the ungrouped path writes. Every test in the Rust
+#     suite and every arm above runs the UNGROUPED path, so a wiring regression in
+#     run_groups -- a band lent the wrong buffer, a stale buffer, a band pooled out of
+#     order -- passed the whole suite. It is checked here rather than as a Rust
+#     integration test because the tiny hand-crafted fixture in `tests/pipeline.rs` cannot
+#     drive it: run_groups needs converted spectra with several isolation windows, a
+#     library with row-group statistics on `precursor_mz`, and a retention-time model
+#     fitted on confident seed anchors, all of which this fixture already has and that one
+#     would have to fake.
+#
+#     `calibration: per_group` on purpose. It is the mode in which each band applies its
+#     OWN mass calibration to the run's spectra, which since the bands share one decoded
+#     buffer is the configuration most exposed to a stage writing a corrected m/z back
+#     into the scans.
+echo "=== smoke: the grouped orchestrator"
+cat > "$work/grouped.json" <<'JSONEOF'
+{
+  "features": { "set": "extended" },
+  "extract": { "apex_count_window": 5, "apex_rt_prior_s": 120.0, "gate_min_score": 0.2 },
+  "groups": { "window_groups": 3, "parallel": 2, "calibration": "per_group" }
+}
+JSONEOF
+"$BIN" run --fasta test_data/fixture.fasta --mzml "$work/fixture.mzML" \
+    --out-dir "$work/out_grouped" --config "$work/grouped.json" --threads 4 \
+    > "$work/grouped.log" 2>&1 \
+    || { tail -30 "$work/grouped.log"; echo "the grouped run failed"; exit 1; }
+"$BIN" run --fasta test_data/fixture.fasta --mzml "$work/fixture.mzML" \
+    --out-dir "$work/out_grouped2" --config "$work/grouped.json" --threads 4 \
+    > "$work/grouped2.log" 2>&1 \
+    || { tail -30 "$work/grouped2.log"; echo "the second grouped run failed"; exit 1; }
+
+# Three bands were planned, and each writes its own competed table.
+grep -q '"window_groups": 3' "$work/out_grouped/groups/plan.json" \
+    || { echo "the grouped run did not plan three bands"; exit 1; }
+for g in g00 g01 g02; do
+    test -s "$work/out_grouped/groups/$g/psms_competed.parquet" \
+        || { echo "band $g produced no competed table"; exit 1; }
+done
+
+# The run's spectra are decoded ONCE PER PHASE, not once per band. Before the buffers were
+# shared each band's search-seed and each band's extract opened the artifact itself, which
+# on three bands was six MS2 decodes and three MS1 decodes; the counts below are what
+# regresses if a band is ever handed its own copy again.
+# No `$` anchor: the engine's log lines end CRLF on a Windows runner, so an
+# end-of-line anchor after the stage name matches nothing there. Both names are
+# unique substrings in the log as it is.
+n_ms2=$(grep -c 'stage=load-ms2' "$work/grouped.log" || true)
+n_ms1=$(grep -c 'stage=load-ms1' "$work/grouped.log" || true)
+[ "$n_ms2" = "2" ] || { echo "expected 2 MS2 decodes for 3 bands, saw $n_ms2"; exit 1; }
+[ "$n_ms1" = "1" ] || { echo "expected 1 MS1 decode for 3 bands, saw $n_ms1"; exit 1; }
+
+# The grouped path identifies peptides, and does so reproducibly. Not compared against the
+# ungrouped run: banding changes the competition population and the pooled q denominator,
+# so the two are not expected to agree row for row (measured on this fixture: 150 rows
+# ungrouped, 146 grouped under per_group).
+n_grouped=$(($(wc -l < "$work/out_grouped/peptides.tsv") - 1))
+[ "$n_grouped" -ge 100 ] \
+    || { echo "the grouped run found only $n_grouped peptides; expected at least 100"; exit 1; }
+diff "$work/out_grouped/peptides.tsv" "$work/out_grouped2/peptides.tsv" > /dev/null \
+    || { echo "two grouped runs of the same input disagree"; exit 1; }
+echo "    ok: 3 bands, $n_ms2 MS2 + $n_ms1 MS1 decodes, $n_grouped peptides, reproducible"
+
 # 5. The multi-run orchestrator. Nothing tested it: `run-experiment` has a pooled
 #    rescore, a by-source split, per-run quant and a cross-run LFQ that the
 #    single-run path never reaches, and a split that drops rows produces plausible

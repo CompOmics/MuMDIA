@@ -88,14 +88,94 @@ The stages then run unchanged on that table, as if it were the library:
   (local id plus `Library::global_offset`), so a band's table means the same thing as the
   run's and pooling is a concatenation.
 
-Nothing outside the band is resident during any of these. The converted spectra are read by
-each stage as they always are.
+Nothing outside the band is resident during any of these, except the run's spectra, which
+are decoded once for all the bands (next section).
 
 Under `experiment.rt_library_scope = first_run_only` the runs after the first reuse the first
 run's adapted bands, and then they reuse its band slices too: a slice is a deterministic
 function of the library and the row span, so rewriting it would produce the same bytes. Only
 the seed reads it, and the adapted table replaces it everywhere else. On a 203M-precursor
 library that is the whole precursor table not written, per run after the first.
+
+### The run's spectra, decoded once per phase
+
+Every band searches the whole run and differs only in its slice of the library, so the
+scans are the same bytes for all of them. `run_groups` therefore decodes them once for all
+the bands and lends the buffers: MS2 for the seeding phase
+(`search_seed::SearchSeedParams::ms2_scans`), MS2 and MS1 for the extraction phase
+(`extract::ExtractParams::scans`, which carries both). `None` there means "open the file
+yourself", which is what a standalone `mumdia search-seed` or `mumdia extract` and an
+ungrouped `run` still do. An EMPTY lent slice also means that: the stage decodes the named
+path rather than believing that the run has no such spectra, so lending an empty MS1 while
+still passing `--ms1` cannot silently drop every MS1 feature.
+
+Once per phase and not once per run. Nothing between the seeding and the extraction phase
+reads the spectra, and what does sit there is the per-band retention-time phase, one DeepLC
+sidecar process per band, sequentially, 63 of them on the 63-band run. Holding a ~1 GB
+decoded MS2 buffer across that is the resident set the banding exists to bound, so the
+extraction phase pays for a second decode of the same artifact instead. That is two decodes
+per run against the `2m` this replaces, and `run.rs` declines to share for the same reason
+in the ungrouped single-run case. Both buffers are dropped at the end of the extraction
+phase, before `pool::run` reads and rewrites the run's largest artifacts.
+
+What makes the sharing safe is NOT that nothing corrects the observed m/z. The per-run mass
+recalibration corrects exactly that -- `peak.mz / mass_off.factor_at(peak.mz)` -- and under
+`groups.calibration = per_group` each band applies its own factor to the same buffer. It is
+safe because that corrected value is computed into a local (`q_mz`) at every call site and
+never written back; because the stages take a shared slice they cannot write through;
+because `load_ms2` and `load_ms1` sort by retention time before returning, so no stage
+re-sorts; because `select_peaks` returns peak indices instead of truncating `scan.peaks`;
+and because the destructive peak-claim strategies rewrite the band's own `Hit` intensities,
+not the spectra.
+
+Two of those are one edit away from being false, and both edits are the obvious
+optimisation of their call site. Hoisting `q_mz` out of the per-peak loop by writing it
+back into the scan would bake band g00's factor into the peaks band g01 reads. Truncating
+`scan.peaks` in `select_peaks` instead of building an index vector per scan per band would
+hand the following band, and extract, capped spectra; a 300-peak cap costs 60% of the
+peptides on a 50-window Orbitrap DIA run (`docs/04_convert.md`). The borrow checker refuses
+both today, because the scans arrive as `&[Ms2Scan]`; `run_groups::scan_fingerprint` covers
+what it does not (interior mutability, `unsafe`, and the second decode differing from the
+first) with a `debug_assert` that costs nothing in a release build. The fingerprint mixes
+every field the stages read, so it followed `Ms2Scan` when the `id` was deleted and when
+`Peak.mz` was narrowed to `f32`; it is an internal digest compared between two decodes of
+one artifact, never a stored value, so its numeric value is free to change.
+
+What it removes, for `m` bands with `p` of them in flight:
+
+| | decodes per run | MS2 resident | MS1 resident |
+|---|---|---|---|
+| before | `2m` MS2, `m` MS1 | `p` copies while seeding, `p` while extracting | `p` copies while extracting |
+| after | 2 MS2, 1 MS1 | 1 copy while seeding, 1 while extracting | 1 copy while extracting |
+
+Neither buffer is resident during the retention-time phase, or during pooling, in either
+column. The saving scales with `groups.parallel` and nothing is traded for it: at
+`parallel: 8` the extraction phase holds 1 GB of MS2 instead of 8, at `parallel: 48` (a
+100-band run on a smaller library) 1 GB instead of 48.
+
+Measured on the fixture at `window_groups: 3, parallel: 2`, the load-ms2 and load-ms1 stage
+lines go from 6 MS2 decodes and 3 MS1 decodes to 2 and 1, and the run's artifacts are
+byte-identical to the pre-change binary's under both `calibration: global` and
+`calibration: per_group`, which is the mode in which the bands apply different mass offsets
+to the one shared buffer.
+
+At production scale one run's MS2 was about 1 GB decoded (301,127 scans on the immuno data,
+293,271 on the Astral data), and 63 bands were 126 decodes of it. Since `Peak` was narrowed
+to two `f32` and `Ms2Scan.id` deleted it is about a third of that: measured on
+`LFQ_Orbitrap_AIF_Ecoli_01` (465,806 scans, 41,293,465 MS2 points, the engine's own
+`mem: ms2 scans` report), 0.968 GiB before and 0.342 GiB after.
+
+It also removes allocations, which is the failure the banding is up against: the engine
+dies at the kernel's per-process mapping limit (1,048,576; the live grouped run peaked at
+556,573 mappings and 244 GB). A decoded MS2 scan used to be two heap blocks, its
+`Vec<Peak>` and its id `String`, so one copy of a 301,127-scan run was about 602,000 blocks
+and eight concurrent copies about 4.8 million. Deleting the id halves that to one block per
+scan. How many of those become distinct mappings depends on the allocator's size classes
+and is not measured here; the block count is exact.
+
+`ci/smoke.sh` runs a grouped arm (`window_groups: 3, parallel: 2, calibration: per_group`)
+so that this path, and `run_groups` generally, has regression cover: without it every
+assertion in the suite is about the ungrouped `scans: None` arm, which is a no-op.
 
 ## 4. The seed pool and the two calibration modes
 
@@ -108,14 +188,75 @@ ids are local.
 `seed-pool` (`stages/seed_pool.rs`) reads every band's seed, maps the ids to library-wide
 ones, keeps the higher-scoring row where two bands searched the same candidate, re-estimates
 `spectrum_q` over the union with the seed's own target-decoy kernel (`fdr::target_decoy_q`),
-and writes the run-level `seed_psms.parquet`. Beside it goes `seed_psms.parquet.masscal.json`:
-the bands' scalar ppm offsets and learned tolerances combined by calibrant count (`n_dev`).
-The optional m/z-dependent grids are not combined, because they need the per-fragment
-deviations the seed does not keep; extract then applies the scalar offset. A band with no
-calibrants wrote the configured tolerance in place of a learned one (search-seed's failure
-branch), and when no band calibrated the pool keeps that tolerance rather than averaging
-nothing into a zero, with a warning. It also writes each band's view of the pooled seed,
-`groups/gNN/seed_psms_pooled.parquet`: the band's own rows, local ids, pooled q.
+and writes the run-level `seed_psms.parquet`. Beside it goes
+`seed_psms.parquet.masscal.json`, the run's fragment mass calibration, fitted once over the
+bands' calibrant deviations (next subsection). It also writes each band's view of the
+pooled seed, `groups/gNN/seed_psms_pooled.parquet`: the band's own rows, local ids,
+pooled q.
+
+### 4a. The mass calibration is fitted once, not averaged
+
+The tolerance `search-seed` learns is `1.5 * p95(|dev - median|)` over the ppm deviations of
+the matched fragments of its confident target PSMs (`docs/07_search_seed.md`). Combining the
+bands' fitted SCALARS is not that estimator, and it is systematically wider. Measured on the
+six-file HYE Astral benchmark, the same library and the same retention-time model, 100 bands
+against none:
+
+| | unbanded | 100 bands, scalars combined |
+|---|---|---|
+| `frag_ppm_offset` | -1.8486 | -1.8834 |
+| `frag_ppm_sigma` | 8.452 | 11.400 |
+| `n_dev` | 181,196 | 200,257 |
+| `ppm_residual_mad` | 0.907 | 1.035 |
+| candidates accepted by extract | 4,986,153 | 6,609,984 |
+| peptides at 1% | 113,860 | 110,006 |
+| precursors at 1% | 126,436 | 121,966 |
+
+The offsets agree and the tolerance is 35% wider, extract then accepts 33% more candidates
+and the run returns 3.4% fewer peptides. Causal rather than correlated: one band extracted
+twice, identical in every input but the calibration file it was handed, accepted 12,414
+candidates at 11.40 ppm and 8,791 at 8.45; and an unbanded control on the same adapted
+library returned the unbanded arm's 113,860 peptides exactly.
+
+Two things compound. A p95 estimated on one band's ~2,000 deviations has a heavier tail than
+the p95 of the union, and a mean of those p95s does not recover it. And each band selects
+its calibrants on its OWN `spectrum_q`, which is not the pooled one: on that benchmark it is
+looser (106,088 band-confident PSMs against 97,584 pooled).
+
+So the bands write their deviations and the pool fits them, exactly as the retention-time
+calibration already uses the pooled anchors under `groups.calibration = global`:
+
+- `search-seed`, asked for it (`SearchSeedParams::emit_calibrants`, set only by the grouped
+  path), writes `<seed>.masscal.parquet` beside the masscal: `candidate_id` (LIBRARY-WIDE,
+  the band's local id plus its fragment offset), `scan_index`, `frag_mz` and `ppm`, one row
+  per matched fragment. 16 B per deviation, a few MB for a whole run.
+- `seed-pool` reads them, keeps the deviations whose PSM the POOLED q accepts at
+  `search_seed.fdr_seed` (and whose scan is the one the pool kept, so an overlap candidate
+  contributes one PSM's fragments as an ungrouped seed would), and fits
+  `masscal::MassCal::fit_from` -- the same function `search-seed` calls -- once.
+  `two_pass_mass_cal` and the `mass_cal_loess` grid work on this path, because both read the
+  deviations rather than a scalar.
+- The band's own `<seed>.masscal.json` is unchanged: still fitted on that band's confident
+  targets alone, and still what `groups.calibration = per_group` extracts with.
+
+The band's q is not the pooled q in either direction, so the sidecar carries more than the
+band's own selection: the band's best-scoring targets down to
+`masscal::CALIBRANT_OFFER_PSMS` (2,000) are offered whatever its own q says, and the pooled
+q decides. That matters where the band q is STRICTER, which is the `1/T` case above: on the
+CI fixture at three bands, every band's own q rejects every one of its targets, so a
+strictly q-selected sidecar would be empty in all three. With the offer, the three bands
+contribute 437, 401 and 230 deviations, the pool selects all 1,068 of them and fits
+`frag_tol_ppm` 5.0 at offset 0.0 -- the same calibration, to the digit, that the ungrouped
+search of the same spectra produces. Before this the same run calibrated nothing and
+extracted at the configured 20 ppm.
+
+`masscal.json` gains `masscal_source`, which reads `pooled_deviations` or `band_scalars`. A
+band directory seeded before the sidecar existed has none, and the pool then combines the
+scalars as it always did, naming the missing groups in a warning; if `mass_cal_loess` is set
+it warns separately that the grid cannot be recovered from scalars. A band with no
+calibrants wrote the configured tolerance in place of a learned one, and when the pooled fit
+has fewer than `masscal::MIN_CALIBRANTS` deviations the pool keeps that tolerance rather
+than fitting a percentile of a handful of points, with a warning.
 
 `groups.calibration` decides which anchors each band's calibration sees:
 
@@ -363,6 +504,75 @@ Three things this says:
 
 On this data the useful range is therefore 48 to 64 bands: about 40 GB per band, which is
 what a 100 GB desktop can run two of at a time, or one with room to spare.
+
+### Band size, not band count: the HYE Astral measurement (2026-09-22)
+
+The band counts above were derived on a 203M-precursor library, where a band of a 63-band
+plan holds 3.2M precursors. Repeating the exercise on a 10.9M-precursor library says the
+useful range is a property of the BAND, not of the plan, and that a small library should not
+be banded at all.
+
+Six 15-minute Astral files, imported HYE library, the same adapted retention times in both
+arms, one arm unbanded and one cut into 100 bands of three isolation windows each
+(about 126,000 precursors per band):
+
+| | unbanded | 100 bands |
+|---|---|---|
+| precursors at 1% | 126,436 | 121,966 |
+| peptides at 1% | 113,860 | 110,006 |
+| protein groups at 1% | 12,166 | 12,029 |
+| extract, summed over six files | 4.6 CPU-min | 153 CPU-min |
+| search-seed, summed | 1.8 CPU-min | 215 CPU-min |
+| engine peak resident | 11.8 GB | 182 GB |
+| peak mappings | 456 | 11,441 |
+
+Two things to take from it.
+
+**The fixed cost per band is the run's spectra, and it does not shrink with the band.** Each
+band decodes its own copy: 3.84 GiB of MS2 scans to search a 0.016 GiB slice of library, a
+ratio of 240 to 1. That is why the seed costs 215 CPU-minutes here against 1.8, and why 48
+bands in flight hold 182 GB. It is also why raising `groups.parallel` stops helping: at 100
+bands the machine was at load 35 of 128, waiting on decodes rather than searching.
+
+**The identification loss was a defect, not a property of banding.** A grouped run fitted
+its fragment mass calibration per band and combined the bands' scalars, giving 11.400 ppm
+against the 8.452 a single fit gives on the same data: the tolerance is
+`1.5 x p95(|dev - median|)`, and a 95th percentile over one band's ~2,000 deviations has a
+heavier tail than the same percentile over the union. Each band also selected its calibrants
+on its own q, whose 1/T floor is looser (106,088 confident seed PSMs against 97,584). The
+wider tolerance admitted 33% more candidates, and the extra noise cost 3.4% of the peptides.
+Proved rather than inferred: one band extracted twice, identical in every input except which
+calibration file it was handed, accepted 12,414 candidates at 11.400 ppm and 8,791 at 8.452.
+A control arm, unbanded on the same adapted library, reproduced the unbanded arm's 113,860
+peptides exactly, which rules out the seeding difference between the arms.
+
+Fitting the calibration once on the bands' pooled deviations settles it. The banded arm
+repeated on that build reproduces the unbanded calibration to eight significant figures and
+selects the same calibrants:
+
+| | unbanded | banded, per-band scalars | banded, pooled deviations |
+|---|---|---|---|
+| offset | -1.8486016959 | -1.8834 | -1.8486016989 |
+| tolerance | 8.452381550 | 11.400 | 8.452381790 |
+| calibrant deviations | 181,196 | 200,257 | 181,196 |
+| residual MAD | 0.90689065 | 1.035 | 0.90689063 |
+
+The residual difference is the sidecar storing deviations as f32. Downstream, the banded run
+then extracts the SAME candidate set as the unbanded one, to the row: 4,986,153 accepted and
+74,115,941 chromatogram rows in both, and 4,986,153 scored rows against the unbanded run's
+4,986,153.
+
+| at 1% | unbanded | 100 bands, per-band scalars | 100 bands, pooled deviations |
+|---|---|---|---|
+| precursors | 126,436 | 121,966 | 125,983 |
+| peptides | 113,860 | 110,006 | 113,789 |
+| protein groups | 12,166 | 12,029 | 12,221 |
+
+That is 98% of the lost peptides recovered, and what remains is inside the single-seed
+spread this pool shows (about 0.4%, docs/28): the protein groups come back slightly above
+the unbanded arm, which is the same noise in the other direction. Banding is
+identification-neutral on this data once the calibration is fitted once, and what it costs
+is the fixed per-band work above.
 
 ### `groups.parallel` and the thread count
 

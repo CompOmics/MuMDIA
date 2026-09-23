@@ -414,10 +414,19 @@ fn warn_about_ion_mobility(vendor: Vendor) {
 /// frame into the 3D spectra this pipeline reads; without it the output is one
 /// spectrum per mobility scan, which is both enormous and not what any downstream
 /// stage expects.
+///
+/// Array widths are asked for per array rather than with one `--64`, because the
+/// engine keeps only one of the two at 64 bits. `stages::convert` writes m/z at
+/// f32 but computes on the f64 it read, and stores intensity as f32 unconditionally
+/// (`convert.rs`, `Ms2Chunk::inten`), so a 64-bit intensity array is inflated by
+/// msconvert, base64'd, deflated, inflated again by mzdata and then halved on the
+/// first read. `--inten32` asks msconvert to do the same rounding once, at write
+/// time. m/z keeps `--mz64`: that one IS read at full width.
 fn msconvert_vendor_args(vendor: Vendor) -> Vec<String> {
     let mut a: Vec<String> = vec![
         "--mzML".into(),
-        "--64".into(),
+        "--mz64".into(),
+        "--inten32".into(),
         "--zlib".into(),
         // Indexed output, matching what the engine has always read.
         "--simAsSpectra".into(),
@@ -1438,6 +1447,32 @@ mod tests {
             let a = msconvert_vendor_args(v).join(" ");
             assert!(a.contains("peakPicking vendor"), "{}: {a}", v.name());
             assert!(!a.contains("combineIonMobility"), "{}: {a}", v.name());
+        }
+    }
+
+    #[test]
+    fn msconvert_is_asked_for_the_widths_the_engine_actually_reads() {
+        // The old argument was a bare `--64`, which is msconvert's default anyway
+        // and set BOTH arrays to 64 bits. `stages::convert` stores intensity as
+        // f32 unconditionally, so every intensity was written, compressed,
+        // decompressed and then immediately halved. Ask for the narrower array at
+        // write time instead. m/z stays 64-bit: convert reads that at full width.
+        for v in [
+            Vendor::Thermo,
+            Vendor::Waters,
+            Vendor::Bruker,
+            Vendor::Agilent,
+            Vendor::Sciex,
+        ] {
+            let a = msconvert_vendor_args(v);
+            assert!(a.iter().any(|s| s == "--mz64"), "{}: {a:?}", v.name());
+            assert!(a.iter().any(|s| s == "--inten32"), "{}: {a:?}", v.name());
+            // A bare `--64` after them would put the intensity array back.
+            assert!(!a.iter().any(|s| s == "--64"), "{}: {a:?}", v.name());
+            assert!(!a.iter().any(|s| s == "--inten64"), "{}: {a:?}", v.name());
+            // m/z at 32 bits would be a real loss: the ppm predicates are computed
+            // on the value convert reads.
+            assert!(!a.iter().any(|s| s == "--mz32"), "{}: {a:?}", v.name());
         }
     }
 

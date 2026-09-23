@@ -1203,6 +1203,9 @@ fn real_main() -> Result<()> {
             let ch = mumdia_io::hash::blake3_str(&cfg.canonical_json());
             stages::search_seed::run(stages::search_seed::SearchSeedParams {
                 fragment_offset: None,
+                // Standalone: this invocation decodes the run itself.
+                ms2_scans: None,
+                emit_calibrants: false,
                 ms2: &ms2,
                 library_precursors: &lib_precursors,
                 library_fragments: &lib_fragments,
@@ -1296,6 +1299,8 @@ fn real_main() -> Result<()> {
             stages::extract::run(stages::extract::ExtractParams {
                 fragment_offset,
                 sibling_bands: 1,
+                // Standalone: this invocation decodes the run itself.
+                scans: None,
                 ms2: &ms2,
                 library_precursors: &lib_precursors,
                 library_fragments: &lib_fragments,

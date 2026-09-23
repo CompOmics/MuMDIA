@@ -101,16 +101,22 @@ impl<'a> FloatList<'a> {
 pub fn load_ms2(path: &str) -> Result<Vec<Ms2Scan>> {
     let t = TableFile::open(path).with_context(|| format!("loading ms2 {path}"))?;
     let scan_index = t.u32("scan_index")?;
-    let mut id = t.str("id")?;
     let rt = t.f64("rt_seconds")?;
     let wlo = t.f64("window_lower")?;
     let whi = t.f64("window_upper")?;
     let wtarget = t.f64("window_target")?;
+    // The "id" column is NOT read. It stays in the artifact, where an external consumer can
+    // find the mzML native id of any scan by `scan_index`, but decoding it here built one
+    // String per scan (~72 B of header plus payload each, ~17 MB and 233 k allocations on
+    // an AIF run) that no stage ever looked at.
+    //
     // Build the per-scan peak lists in a single pass over the "mz"/"intensity"
     // ListArrays, downcasting each row's inner Float32Array once, without the
-    // intermediate Vec<Vec<f32>> that list_f32() would materialize. m/z is stored
-    // as f32 for size and widened to f64 here. The global row counter `i` tracks
-    // the same batch-then-row order the scalar getters used, so it stays aligned.
+    // intermediate Vec<Vec<f32>> that list_f32() would materialize. m/z is copied at the
+    // artifact's own f32 width and widened by the consumers at the comparison, which is
+    // exact; the widening used to happen here and cost 8 B per peak for nothing. The
+    // global row counter `i` tracks the same batch-then-row order the scalar getters used,
+    // so it stays aligned.
     let mut out = Vec::with_capacity(t.nrows);
     let mut i = 0usize;
     t.for_each_batch(Some(&["mz", "intensity"]), SCAN_BATCH_ROWS, |b| {
@@ -128,16 +134,14 @@ pub fn load_ms2(path: &str) -> Result<Vec<Ms2Scan>> {
                 let mut peaks = Vec::with_capacity(n);
                 for j in 0..n {
                     peaks.push(Peak {
-                        mz: mf.value(j) as f64,
+                        mz: mf.value(j),
                         intensity: iff.value(j),
-                        ion_mobility: None,
                     });
                 }
                 peaks
             };
             out.push(Ms2Scan {
                 scan_index: scan_index[i],
-                id: std::mem::take(&mut id[i]),
                 rt_seconds: rt[i],
                 window: IsolationWindow {
                     target_mz: wtarget[i],
@@ -259,5 +263,52 @@ mod tests {
         assert_eq!(scans[0].intensity, vec![3.0], "truncated to the m/z count");
         assert_eq!(scans[1].mz, vec![100.0, 200.0]);
         assert_eq!(scans[1].intensity, vec![1.0, 2.0]);
+    }
+
+    /// The MS2 loader hands each peak m/z on at the artifact's own f32 width, and a
+    /// consumer's `peak.mz as f64` is the same f64 the loader used to store in the peak.
+    ///
+    /// This pins the OLD behaviour of the narrowed field. The loader ran
+    /// `mz: mf.value(j) as f64` and every consumer read that f64; it now runs
+    /// `mz: mf.value(j)` and every consumer says `as f64`. The two differ only if
+    /// `f32 -> f64` were lossy, so the assertion is written as the old expression against
+    /// the new one, over values chosen to be awkward at f32: a decimal that is not
+    /// representable, a value at the top of the fragment m/z range where f32 spacing is
+    /// ~1.2e-4, and the subnormal boundary.
+    #[test]
+    fn ms2_peak_mz_is_the_artifact_f32_and_widens_to_the_f64_the_loader_used_to_store() {
+        let dir = std::env::temp_dir().join(format!("mumdia_ms2_mz_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ms2.parquet").to_str().unwrap().to_string();
+        let mzs: Vec<f32> = vec![0.1, 133.107_1, 1_999.999_9, f32::MIN_POSITIVE, 700.325_44];
+        write_table(
+            &path,
+            vec![
+                Col::U32("scan_index".into(), vec![1]),
+                Col::Str("id".into(), vec!["controllerType=0 scan=1".into()]),
+                Col::F64("rt_seconds".into(), vec![12.5]),
+                Col::F64("window_lower".into(), vec![400.0]),
+                Col::F64("window_upper".into(), vec![410.0]),
+                Col::F64("window_target".into(), vec![405.0]),
+                Col::ListF32("mz".into(), vec![mzs.clone()]),
+                Col::ListF32("intensity".into(), vec![vec![1.0; mzs.len()]]),
+            ],
+        )
+        .unwrap();
+        let scans = load_ms2(&path).unwrap();
+        assert_eq!(scans.len(), 1);
+        assert_eq!(scans[0].scan_index, 1);
+        assert_eq!(scans[0].peaks.len(), mzs.len());
+        for (p, &m) in scans[0].peaks.iter().zip(&mzs) {
+            assert_eq!(p.mz.to_bits(), m.to_bits(), "stored f32 was not preserved");
+            // `m as f64` is exactly what the loader wrote into the old `mz: f64` field.
+            assert_eq!(
+                (p.mz as f64).to_bits(),
+                (m as f64).to_bits(),
+                "widening at the consumer does not reproduce the old stored f64"
+            );
+        }
+        // The artifact still carries the native id; the in-memory scan no longer does.
+        assert!(TableFile::open(&path).unwrap().str("id").is_ok());
     }
 }
