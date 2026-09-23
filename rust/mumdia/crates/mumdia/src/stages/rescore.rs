@@ -41,10 +41,22 @@ fn meta_bytes(cid: &[u32], is_decoy: &[bool], pform: &FlatStr, protein: &FlatStr
 /// plus the text itself -- 29.7 and 21.8 bytes per row here -- in two allocations for the
 /// whole column instead of one per row.
 ///
-/// The allocation COUNT is the load-bearing half. The engine dies at the kernel's
-/// per-process mapping limit (1,048,576) rather than on memory, and the three string
-/// columns through `str` are three live blocks per PSM: 2.6 million at the measured single
-/// run, 9.4 million at the six-run Astral pool.
+/// The allocation COUNT is the other half: the three string columns through `str` are
+/// three live heap BLOCKS per PSM, 2.6 million at the measured single run and 9.4 million
+/// at the six-run Astral pool, against five for the whole stage here. Blocks, not kernel
+/// mappings -- mimalloc serves 32-48 byte blocks out of its segment pages, and the
+/// per-process mapping limit this repository has actually measured a death on
+/// (`stages/extract.rs`, 129,393 mappings at 180 GB) was 240 KB-2.4 MB blocks, which
+/// mimalloc does map individually. Nothing here establishes that a 40-byte `String` block
+/// consumes a mapping, so this is an allocator-pressure argument, not a `vm.max_map_count`
+/// one.
+///
+/// `bytes()` reports capacity rather than length on purpose. `TableFile::str_flat` builds
+/// `data` from `String::new()` and appends one row at a time, so it ends at a capacity in
+/// `[len, 2 x len)` -- measured 1.19x on 879,027 rows of 21-byte values and 1.34x on
+/// 3,133,636 -- and that slack is resident for the whole stage. `shrink` gives it back
+/// once the concatenation is complete, which is what makes the per-row figure above a
+/// resident figure rather than a lower bound.
 #[derive(Default)]
 struct FlatStr {
     /// `rows + 1` byte offsets into `data`; row `r` is `data[offsets[r]..offsets[r + 1]]`.
@@ -63,15 +75,29 @@ impl FlatStr {
         &self.data[self.offsets[i]..self.offsets[i + 1]]
     }
 
-    /// Rows in order. `ExactSizeIterator`, which is what `StringArray::from_iter_values`
-    /// needs to size its offset buffer in one allocation.
+    /// Rows in order. `ExactSizeIterator` is load-bearing, not decoration:
+    /// `StringArray::from_iter_values` is `data_len.expect("Iterator must be sized")` on
+    /// the iterator's upper size bound, so it PANICS on an unbounded one. Anything that
+    /// wraps this in a `filter` before handing it to arrow turns a write into an abort;
+    /// materialise the selection (see `gather`) instead.
     fn iter(&self) -> impl ExactSizeIterator<Item = &str> {
         (0..self.len()).map(|i| self.get(i))
     }
 
-    /// Resident payload: the offsets plus the text.
+    /// Resident bytes: the offsets and the text buffer as ALLOCATED, not as filled. The
+    /// text arrives from `str_flat`'s amortised doubling with up to 2x slack in it, and a
+    /// figure that ignored that would under-report exactly the thing `memlog` is for.
     fn bytes(&self) -> usize {
-        std::mem::size_of_val(self.offsets.as_slice()) + self.data.len()
+        self.offsets.capacity() * std::mem::size_of::<usize>() + self.data.capacity()
+    }
+
+    /// Return the growth slack once the whole column is in, so the resident cost for the
+    /// rest of the stage is the text and nothing else. One realloc-copy of the text buffer
+    /// (~68 MB at the Astral pool) at a point where the metadata columns are all that is
+    /// live, against 1.19-1.34x of that text held for the 16-22 minutes the sidecar trains.
+    fn shrink(&mut self) {
+        self.offsets.shrink_to_fit();
+        self.data.shrink_to_fit();
     }
 
     /// Append one competed input's column, the flat counterpart of [`merge_col`].
@@ -99,10 +125,18 @@ impl FlatStr {
 
     /// The named rows, in the given order: the flat counterpart of the `keep_rows!`
     /// gather in the top-K collapse.
+    ///
+    /// The text buffer is sized from the kept rows' own lengths rather than grown by
+    /// doubling, so the gathered column does not carry the same slack the read does while
+    /// it coexists with the source it was gathered from.
     fn gather(&self, keep: &[usize]) -> FlatStr {
+        let need: usize = keep
+            .iter()
+            .map(|&i| self.offsets[i + 1] - self.offsets[i])
+            .sum();
         let mut out = FlatStr {
             offsets: Vec::with_capacity(keep.len() + 1),
-            data: String::new(),
+            data: String::with_capacity(need),
         };
         out.offsets.push(0);
         for &i in keep {
@@ -247,7 +281,9 @@ pub fn run(p: RescoreParams) -> Result<u64> {
     // of it in this stage is `== "decoy"`, so it is reduced to one bit per row as it is
     // read; `peptidoform` and `protein` are flat (see `FlatStr`). Measured on the competed
     // table this takes the resident metadata from 120 bytes and 3 live heap blocks per PSM
-    // to about 51 bytes and 4 blocks for the whole stage.
+    // to 1 + 29.7 + 21.8 = 52.5 bytes per row and 5 blocks for the whole stage (the bits,
+    // and offsets + text for each of the two flat columns), once `shrink` below has taken
+    // the read's growth slack back off the text buffers.
     let (mut cid, mut is_decoy, mut base, mut charge, mut prelim) = (
         Vec::new(),
         Vec::<bool>::new(),
@@ -414,6 +450,12 @@ pub fn run(p: RescoreParams) -> Result<u64> {
         merge_col(&mut elution_hi, ehi, total_rows);
         merge_col(&mut source, vec![src as u32; t.nrows], total_rows);
     }
+    // Both text buffers were grown by `String::push_str` one value at a time, inside
+    // `str_flat` and again in `merge`, so each ends with up to 2x its own length in unused
+    // capacity (measured 1.19x at 879,027 rows, 1.34x at 3.1M). Nothing appends to them
+    // after this point and they are resident until the stage ends, so give it back.
+    pform.shrink();
+    protein.shrink();
     // The row loop this pass replaces was `for i in 0..t.nrows { cid.push(c[i]); ... }`,
     // which could not produce columns of different lengths: it indexed every column at the
     // footer's row count and panicked if one was short. `merge_col` appends whatever the
@@ -1170,6 +1212,11 @@ fn write_scored_table(path: &str, c: ScoredColumns) -> Result<u64> {
         Arc::new(Float64Array::from(c.precursor_q)),
         Arc::new(Int32Array::from(c.peak_rank)),
     ];
+    // `from_iter_values` COPIES into the arrow buffers, but it borrows while it does, so
+    // unlike the `StringArray::from(Vec<String>)` it replaces it does not consume its
+    // source. Release the flat text explicitly rather than letting it live through the
+    // encoder: 111-200 MB at the Astral pool, for the whole of `write` and `close`.
+    drop((c.pform, c.protein, c.is_decoy));
     let batch = RecordBatch::try_new(schema.clone(), arrays)
         .with_context(|| format!("building the scored record batch for {path}"))?;
     let mut w = mumdia_io::table::BatchWriter::new(path, schema)?;
@@ -1358,19 +1405,35 @@ type GroupBest = (f64, bool, bool, bool, usize);
 /// instead of hashing.
 ///
 /// `protein_id` and `precursor_id` arrive dense already (both were interned in `run`
-/// immediately before the call). `base_peptide_id` is dense over the LIBRARY, not over
-/// the competed rows: at 203M precursors an array indexed by it would be gigabytes for a
-/// few million rows. So index directly when the span is within a small factor of the row
-/// count, and otherwise intern, which costs one hash per row but bounds the array by the
-/// number of groups. The interning is a permutation of the group labels, and the
-/// reduction's result does not depend on which integer names a group, so the two arms
-/// agree row for row (`grouped_q_is_the_same_on_a_dense_and_a_sparse_key_space`).
+/// immediately before the call), so their span IS their group count and they always take
+/// the direct arm. `base_peptide_id` is dense over the LIBRARY, not over the competed
+/// rows: at 203M precursors an array indexed by it would be gigabytes for a few million
+/// rows. So index directly while the span is no larger than the row count, and otherwise
+/// intern, which costs one hash per row but bounds the array by the number of groups. The
+/// interning is a permutation of the group labels, and the reduction's result does not
+/// depend on which integer names a group, so the two arms agree row for row
+/// (`grouped_q_is_the_same_on_a_dense_and_a_sparse_key_space`).
+///
+/// The gate is `span <= n`, not a multiple of it, because the array is 24 bytes per SLOT
+/// and the alternative is not free but is bounded by the ROW count. At n rows the direct
+/// arm costs `24 * span`; the interning arm costs `4n` for the ids plus `24k` for the k
+/// distinct groups (k <= n), with its own `HashMap<u32, u32>` (9 bytes per bucket over
+/// next_pow2(8n/7) buckets, about 18n) live only while it runs -- so at most about 28n
+/// bytes, and at the six-run Astral pool (n = 3,133,636) 76 MB against the direct arm's
+/// 24 * span. The two cross at span ~ 1.2n. An earlier `4n` gate admitted span up to
+/// 12.5M there, i.e. 301 MB, which is worse than both the interning arm AND the
+/// `HashMap<u32, GroupBest>` this rewrite replaced (4,194,304 buckets x 33 bytes = 138 MB)
+/// -- and `base_peptide_id` against a 6-12M base-peptide library lands precisely in that
+/// band. Under `span <= n` the direct arm is at most 24n, which is inside the interning
+/// arm's own bound and saves it one hash per row.
 fn dense_group_ids(keys: &[u32]) -> (std::borrow::Cow<'_, [u32]>, usize) {
     let Some(&max) = keys.iter().max() else {
         return (std::borrow::Cow::Borrowed(keys), 0);
     };
     let span = max as usize + 1;
-    if span <= keys.len().saturating_mul(4).max(1024) {
+    // `.max(1024)` so a handful of rows with a scattered key space does not build a hash
+    // table to save 24 KB.
+    if span <= keys.len().max(1024) {
         return (std::borrow::Cow::Borrowed(keys), span);
     }
     let mut interner: HashMap<u32, u32> = HashMap::with_capacity(keys.len().min(span));
@@ -1409,6 +1472,9 @@ fn grouped_q(
     // ties go to the active null (decoy or entrapment) so input row order cannot
     // make the accepted set anti-conservative.
     let mut best: Vec<Option<GroupBest>> = vec![None; span];
+    // Counted here rather than recovered from the collect below, so `picked` can be sized
+    // exactly: see the comment on its allocation.
+    let mut n_groups = 0usize;
     for i in 0..n {
         // In entrapment mode the in-silico decoys are not the null, so they must not
         // compete for the group. A target and its paired decoy SHARE `base_peptide_id`
@@ -1429,7 +1495,9 @@ fn grouped_q(
         // NEG_INFINITY, so the comparison below promotes the first row of a group unless
         // its own score is NEG_INFINITY or NaN, in which case the tuple already holds
         // that row's flags and index and is left alone. Same arithmetic, same outcome.
-        let e = best[ids[i] as usize].get_or_insert((
+        let slot = &mut best[ids[i] as usize];
+        n_groups += usize::from(slot.is_none());
+        let e = slot.get_or_insert((
             f64::NEG_INFINITY,
             is_decoy[i],
             is_entrapment[i],
@@ -1454,7 +1522,19 @@ fn grouped_q(
     // project bans even where it is harmless (it was harmless: a group's q depends only
     // on the multiset of (score, is_null), because every member of a tied block is
     // assigned the same qmin and the totals are order-free).
-    let picked: Vec<GroupBest> = best.into_iter().flatten().collect();
+    //
+    // `with_capacity(n_groups)` + `extend`, NOT `collect`. `Flatten`'s `size_hint` lower
+    // bound is 0 -- `Option<T>` is not a `ConstSizeIntoIterator`, only arrays are -- so
+    // `collect` grows from nothing by doubling and lands on next_pow2(n_groups) slots:
+    // verified with rustc -O, `len = 3,133,636` gave `capacity = 4,194,304`, 100.7 MB of
+    // allocation for 75.2 MB of groups, and the final doubling holds the 50.3 MB
+    // predecessor as well while `best` is still owned by the `IntoIter`. That made the
+    // COLLECT the peak of this function (226 MB at the Astral pool, 882 MB at 11.6M rows)
+    // rather than the kernel call below. Sized exactly it is 75.2 + 75.2 = 150 MB there,
+    // and the peak moves back to the kernel.
+    let mut picked: Vec<GroupBest> = Vec::with_capacity(n_groups);
+    picked.extend(best.into_iter().flatten());
+    debug_assert_eq!(picked.len(), n_groups);
     let qv = match qmode {
         QMode::Decoy => {
             let sd: Vec<(f64, bool)> = picked.iter().map(|g| (g.0, g.1)).collect();
@@ -1598,19 +1678,47 @@ fn kept_matrix(slot: &Option<FeatureMatrix>) -> &FeatureMatrix {
 /// ~250k rows x 387 f32 is about 390 MB per batch, which keeps the encoder's working set
 /// modest.
 ///
-/// It is also the fastest of the sizes measured, which is not what the staging layout
-/// suggests. `flush_block` stages rows row-major and then gathers 387 columns back out at
-/// a 1,548-byte stride, so every element read costs a 64-byte line: making the block
-/// L2-resident really does make THAT loop 6-8x cheaper (`handoff_block_size_end_to_end`,
-/// transpose in isolation, 262,144 rows x 387: 2.6-3.4 s/Mrow at 250,000 against 0.42 at
-/// 4,096). The parquet encoder's per-batch cost at 387 columns grows faster than the
-/// transpose shrinks, so end to end the same change is a LOSS: 5.3-5.5 s/Mrow at 250,000
-/// against 9.2-9.6 at 4,096 and 12.2-13.4 at 1,024, with 131,072 / 65,536 / 16,384 all in
-/// the 8.5-10.3 band (min of three per arm, three whole runs). The 387 MB this stages is
-/// transient and is not at the measured peak: under `rescore.strict` with `nn_torch`
-/// there is no feature matrix at handoff time and the engine sits near 1.4 GB, while the
-/// 9.3 GB process-tree peak happens later, inside the worker. Re-measure with the ignored
-/// benchmark before moving it.
+/// The staging layout says a smaller block should be faster and the end-to-end measurement
+/// says nothing at all, so the constant stays where it is for want of a reason to move it.
+///
+/// `flush_block` stages rows row-major and then gathers 387 columns back out at a
+/// 1,548-byte stride, so every element read costs a 64-byte line, and making the block
+/// L2-resident really does make THAT loop cheaper. `handoff_block_size_end_to_end`
+/// (262,144 rows x 387 f32, release, s/Mrow, MINIMUM over three repetitions in each of
+/// three whole runs, on a machine that was carrying other work):
+///
+/// ```text
+///   block     end to end   transpose only
+///   250,000        5.99         2.32
+///   131,072        6.03         1.51
+///    65,536        5.06          -
+///    16,384        5.03         1.32
+///     4,096        5.51         0.35
+///     1,024        6.50         0.18
+/// ```
+///
+/// The transpose in isolation is strongly block-dependent, reproduces in every run, and is
+/// 13x cheaper at 1,024 than at 250,000. End to end it does not survive: the six arms span
+/// 5.03-6.50 with no monotone trend, and the spread of one arm across whole runs (up to
+/// 1.45x; 131,072 measured 6.03, 7.33 and 8.72) is larger than the spread between arms
+/// (1.29x). The transpose is real and it is not the binding cost; the parquet encoder is.
+///
+/// This does NOT reproduce an earlier reading of the same benchmark that had 250,000 at
+/// 5.3 s/Mrow and 4,096 at 9.2, i.e. 1.7x slower, and the difference is not the benchmark's
+/// arm bias: the pre-fix benchmark (every arm paying a 250,000-row staging reservation
+/// before `with_block_rows` replaced it) run on this machine in the same session gives
+/// 250,000 at 7.06 and 4,096 at 7.05. Treat the block size as unmeasured rather than
+/// settled, and do not quote a ratio from one run of this benchmark.
+///
+/// The memory is 387 MB of staged f32 PLUS the columnar copy `flush_block` gathers out of
+/// it -- all 387 `Vec<f32>` are live until `RecordBatch::try_new` -- so the transient is
+/// ~774 MB, not 387, against ~12.7 MB at 4,096. That is a real difference and the reason
+/// to revisit this; it is not at the measured peak, which is why nobody has. Under
+/// `rescore.strict` with `nn_torch` there is no feature matrix at handoff time and the
+/// engine sits near 1.4 GB, while the 9.3 GB process-tree peak happens later, inside the
+/// worker. Moving the constant also has to answer an output question this note cannot:
+/// the batch size is not the row-group size, but nothing here pins that the handoff's
+/// BYTES are independent of how rows are fed to the arrow writer.
 const HANDOFF_BATCH_ROWS: usize = 250_000;
 /// Row groups are capped well below the batch: the worker reads this file back with
 /// `ParquetFile.iter_batches`, which decodes a whole row group before it slices batches out
@@ -1673,6 +1781,35 @@ impl<'a> HandoffWriter<'a> {
         protein: &'a FlatStr,
         mz: &'a [f64],
     ) -> Result<HandoffWriter<'a>> {
+        Self::with_block_size(
+            paths,
+            feat_names,
+            is_decoy,
+            pform,
+            protein,
+            mz,
+            HANDOFF_BATCH_ROWS,
+        )
+    }
+
+    /// [`HandoffWriter::new`] with the parquet block size named, so the staging buffer is
+    /// reserved at that size ONCE.
+    ///
+    /// Production always goes through `new` at `HANDOFF_BATCH_ROWS`. This exists for
+    /// `handoff_block_size_end_to_end`: a benchmark arm at N has to allocate what a build
+    /// with `HANDOFF_BATCH_ROWS = N` would allocate, and `with_block_rows` cannot deliver
+    /// that, because by the time it runs `new` has already reserved (and the arm must then
+    /// free) 250,000 x nf x 4 bytes inside the timer.
+    #[allow(clippy::too_many_arguments)]
+    fn with_block_size(
+        paths: &SidecarPaths,
+        feat_names: &'a [String],
+        is_decoy: &'a [bool],
+        pform: &'a FlatStr,
+        protein: &'a FlatStr,
+        mz: &'a [f64],
+        block_rows: usize,
+    ) -> Result<HandoffWriter<'a>> {
         use arrow::datatypes::{DataType, Field, Schema};
         use std::io::Write as _;
         use std::sync::Arc;
@@ -1699,7 +1836,7 @@ impl<'a> HandoffWriter<'a> {
             HandoffSink::Parquet(Box::new(ParquetHandoff {
                 schema,
                 writer,
-                stage: Vec::with_capacity(HANDOFF_BATCH_ROWS.saturating_mul(feat_names.len())),
+                stage: Vec::with_capacity(block_rows.saturating_mul(feat_names.len())),
                 block_start: 0,
             }))
         } else {
@@ -1715,7 +1852,7 @@ impl<'a> HandoffWriter<'a> {
         };
         Ok(HandoffWriter {
             sink,
-            block_rows: HANDOFF_BATCH_ROWS,
+            block_rows: block_rows.max(1),
             rows: 0,
             feat_names,
             is_decoy,
@@ -1728,15 +1865,13 @@ impl<'a> HandoffWriter<'a> {
     /// Shrink the parquet batch so a test can exercise several blocks. Production always
     /// uses `HANDOFF_BATCH_ROWS`.
     ///
-    /// The staging buffer is re-reserved to match, so a benchmark arm at `rows` pays
-    /// exactly what a build with `HANDOFF_BATCH_ROWS = rows` would pay, allocation
-    /// included. The stage is always empty here (this is a builder), so nothing is lost.
+    /// This changes the flush boundary and NOT the staging reservation, which `new` has
+    /// already made at `HANDOFF_BATCH_ROWS`. Correct for the block-boundary tests and
+    /// wrong for a benchmark; measure allocation-sensitive arms through
+    /// [`HandoffWriter::with_block_size`] instead.
     #[cfg(test)]
     fn with_block_rows(mut self, rows: usize) -> Self {
         self.block_rows = rows.max(1);
-        if let HandoffSink::Parquet(pq) = &mut self.sink {
-            pq.stage = Vec::with_capacity(self.block_rows * self.feat_names.len().max(1));
-        }
         self
     }
 
@@ -2394,6 +2529,39 @@ b
         let cloned: Vec<String> = keep.iter().map(|&i| want[i].clone()).collect();
         assert_eq!(gathered.iter().collect::<Vec<_>>(), cloned);
         assert_eq!(gathered.len(), 3);
+        assert_eq!(
+            gathered.data.capacity(),
+            gathered.data.len(),
+            "gather sizes its text buffer from the kept rows rather than doubling into it"
+        );
+    }
+
+    #[test]
+    fn the_flat_column_reports_capacity_and_shrink_returns_it() {
+        // `bytes()` feeds `meta_bytes` and therefore `memlog`, so it has to report what is
+        // ALLOCATED. `TableFile::str_flat` builds the text buffer from `String::new()` and
+        // appends one value at a time, so it arrives with up to 2x the text it holds in
+        // unused capacity; a `bytes()` that reported `len` would under-report exactly the
+        // resident cost the flat layout is justified on, and `shrink` is what makes the
+        // documented per-row figure a resident figure instead of a lower bound.
+        let v: Vec<String> = (0..10_000).map(|i| format!("PEPTIDEK[+16]{i}")).collect();
+        let text: usize = v.iter().map(|s| s.len()).sum();
+        let mut f = flat(&v);
+        assert!(
+            f.data.capacity() > text,
+            "the row-at-a-time read should leave growth slack: capacity {} for {text} bytes",
+            f.data.capacity()
+        );
+        assert_eq!(
+            f.bytes(),
+            f.offsets.capacity() * std::mem::size_of::<usize>() + f.data.capacity(),
+            "bytes() is capacity, not length"
+        );
+        let before = f.bytes();
+        f.shrink();
+        assert!(f.data.capacity() >= text && f.data.capacity() < before);
+        assert!(f.bytes() < before);
+        assert_eq!(f.iter().collect::<Vec<_>>(), v, "shrink moved no value");
     }
 
     #[test]
@@ -2603,18 +2771,185 @@ b
         assert!(text.lines().nth(1).unwrap().starts_with("psm_0\t-1\t0\t"));
     }
 
+    /// The handoff exactly as it was written before the flat/bit metadata columns: the
+    /// three metadata columns as `Vec<String>`, `StringArray::from(Vec<String>)` for the
+    /// text arrays, `protein[start..end].to_vec()` for `Proteins`, and `label[i] ==
+    /// "decoy"` for `Label`. Kept verbatim in the test module so the shipped writer can be
+    /// pinned against THIS rather than against another copy of itself.
+    fn handoff_from_string_columns(
+        paths: &SidecarPaths,
+        names: &[String],
+        meta: (&[String], &[String], &[String]),
+        mz: &[f64],
+        rows: &[Vec<f32>],
+        block_rows: usize,
+    ) {
+        use arrow::array::{ArrayRef, Float32Array, Int32Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+        use std::io::Write as _;
+        use std::sync::Arc;
+
+        let (label, pform, protein) = meta;
+        let nf = names.len();
+        if !paths.use_pq {
+            let mut w = std::io::BufWriter::with_capacity(
+                1 << 20,
+                std::fs::File::create(&paths.handoff).unwrap(),
+            );
+            w.write_all(b"SpecId\tLabel\tScanNr\tExpMass\tCalcMass\t")
+                .unwrap();
+            w.write_all(names.join("\t").as_bytes()).unwrap();
+            w.write_all(b"\tPeptide\tProteins\n").unwrap();
+            for (i, values) in rows.iter().enumerate() {
+                let lab = if label[i] == "decoy" { -1 } else { 1 };
+                write!(w, "psm_{}\t{}\t{}\t{:.5}\t{:.5}\t", i, lab, i, mz[i], mz[i]).unwrap();
+                for v in values.iter().take(nf) {
+                    write!(w, "{:.6}\t", v).unwrap();
+                }
+                writeln!(w, "-.{}.-\t{}", pform[i], protein[i]).unwrap();
+            }
+            w.flush().unwrap();
+            return;
+        }
+
+        let mut fields: Vec<Field> = vec![
+            Field::new("SpecId", DataType::Utf8, false),
+            Field::new("Label", DataType::Int32, false),
+            Field::new("ScanNr", DataType::Int32, false),
+            Field::new("ExpMass", DataType::Float64, false),
+            Field::new("CalcMass", DataType::Float64, false),
+        ];
+        for n in names {
+            fields.push(Field::new(n, DataType::Float32, false));
+        }
+        fields.push(Field::new("Peptide", DataType::Utf8, false));
+        fields.push(Field::new("Proteins", DataType::Utf8, false));
+        let schema = Arc::new(Schema::new(fields));
+        let mut w = mumdia_io::table::BatchWriter::with_row_group_rows(
+            &paths.handoff,
+            schema.clone(),
+            HANDOFF_ROW_GROUP_ROWS,
+        )
+        .unwrap();
+        let mut start = 0usize;
+        while start < rows.len() {
+            let end = (start + block_rows).min(rows.len());
+            let mut arrays: Vec<ArrayRef> = Vec::with_capacity(nf + 7);
+            arrays.push(Arc::new(StringArray::from(
+                (start..end).map(|i| format!("psm_{i}")).collect::<Vec<_>>(),
+            )));
+            arrays.push(Arc::new(Int32Array::from(
+                (start..end)
+                    .map(|i| if label[i] == "decoy" { -1 } else { 1 })
+                    .collect::<Vec<_>>(),
+            )));
+            arrays.push(Arc::new(Int32Array::from(
+                (start..end).map(|i| i as i32).collect::<Vec<_>>(),
+            )));
+            let mzv: Vec<f64> = mz[start..end].to_vec();
+            arrays.push(Arc::new(Float64Array::from(mzv.clone())));
+            arrays.push(Arc::new(Float64Array::from(mzv)));
+            for fi in 0..nf {
+                let col: Vec<f32> = rows[start..end].iter().map(|r| r[fi]).collect();
+                arrays.push(Arc::new(Float32Array::from(col)));
+            }
+            arrays.push(Arc::new(StringArray::from(
+                (start..end)
+                    .map(|i| format!("-.{}.-", pform[i]))
+                    .collect::<Vec<_>>(),
+            )));
+            arrays.push(Arc::new(StringArray::from(protein[start..end].to_vec())));
+            w.write(&RecordBatch::try_new(schema.clone(), arrays).unwrap())
+                .unwrap();
+            start = end;
+        }
+        w.close().unwrap();
+    }
+
+    #[test]
+    fn the_flat_metadata_columns_write_the_same_handoff() {
+        // The other half of the flat/bit output-equality claim, and the half the smoke run
+        // cannot reach: `ci/smoke.sh` uses `configs/examples/native.json`, whose empty
+        // `rescore` block leaves `classifier = native_tda` and `python = None`, so
+        // `stream_to_handoff` is false and `run_pin_sidecar` is never entered. Every
+        // rewritten read in `HandoffWriter` -- `is_decoy[i]` in the PIN row and in `Label`,
+        // `pform.get(i)`/`protein.get(i)` in both encodings, and `from_iter_values` in
+        // place of `StringArray::from(protein[start..end].to_vec())` -- is therefore
+        // unexercised by the byte-identity evidence from a smoke run, and the streamed
+        // -versus -matrix test above compares the new writer against itself.
+        //
+        // So: both encodings, a block boundary inside the data, decoys, and a protein
+        // column with repeats (the `to_vec()` the flat path replaced).
+        let names: Vec<String> = ["f0", "f1", "f2"].iter().map(|s| s.to_string()).collect();
+        let n = 12usize;
+        let label: Vec<String> = (0..n)
+            .map(|i| if i % 3 == 0 { "decoy" } else { "target" }.to_string())
+            .collect();
+        let pform: Vec<String> = (0..n).map(|i| format!("PEPTIDEK[+16]/{i}")).collect();
+        let protein: Vec<String> = (0..n)
+            .map(|i| format!("sp|P{:05}|PROT_HUMAN;sp|Q{:05}|ALT", i % 5, i % 3))
+            .collect();
+        let mz: Vec<f64> = (0..n).map(|i| 400.0 + i as f64 * 1.5).collect();
+        let values: Vec<Vec<f32>> = (0..n)
+            .map(|i| {
+                (0..names.len())
+                    .map(|j| (i * 7 + j) as f32 * 0.125 - 3.0)
+                    .collect()
+            })
+            .collect();
+        let is_decoy: Vec<bool> = label.iter().map(|l| l == "decoy").collect();
+        let fpform = flat(&pform);
+        let fprotein = flat(&protein);
+
+        for use_pq in [true, false] {
+            let ext = if use_pq { "parquet" } else { "pin" };
+            let old = SidecarPaths {
+                handoff: scratch(&format!("hold.{ext}")),
+                out: String::new(),
+                foldkeys: String::new(),
+                use_pq,
+            };
+            let new = SidecarPaths {
+                handoff: scratch(&format!("hnew.{ext}")),
+                out: String::new(),
+                foldkeys: String::new(),
+                use_pq,
+            };
+            handoff_from_string_columns(&old, &names, (&label, &pform, &protein), &mz, &values, 5);
+            let mut w = HandoffWriter::new(&new, &names, &is_decoy, &fpform, &fprotein, &mz)
+                .unwrap()
+                .with_block_rows(5);
+            for (i, v) in values.iter().enumerate() {
+                w.push_row(i, v).unwrap();
+            }
+            assert_eq!(w.finish().unwrap(), n as u64);
+            assert_eq!(
+                std::fs::read(&old.handoff).unwrap(),
+                std::fs::read(&new.handoff).unwrap(),
+                "the flat/bit handoff differs from the Vec<String> handoff (parquet = {use_pq})"
+            );
+        }
+    }
+
     /// What the handoff block size costs, end to end, at the real column count.
     ///
     /// Ignored: it stages and encodes several hundred MB. Run with
-    /// `cargo test -p mumdia --release handoff_block_size -- --ignored --nocapture`.
+    /// `cargo test -p mumdia --release handoff_block_size -- --ignored --nocapture`, and
+    /// run it three times: the numbers on [`HANDOFF_BATCH_ROWS`] are the minimum per arm
+    /// over three whole runs, and one run's arms do not separate from each other by more
+    /// than one arm varies between runs. It asserts nothing and it is not a regression
+    /// test; it is the only thing that can re-derive that constant.
     ///
-    /// Both arms pay for everything they use: each builds its own `HandoffWriter`
-    /// (including the staging reservation, which `with_block_rows` re-sizes to match the
-    /// arm), pushes every row, transposes, builds every `RecordBatch` and encodes to a
-    /// real file. Nothing is hoisted out of the timer, which is the point: the transpose
-    /// is only part of the handoff write, so a per-transpose speedup is not a per-stage
-    /// speedup, and the second section below shows exactly how much of the first is
-    /// transpose.
+    /// Both arms pay for everything they use and nothing they do not: each builds its own
+    /// `HandoffWriter` through `with_block_size`, so the staging buffer is reserved ONCE
+    /// at that arm's size (`with_block_rows` would not do -- `new` reserves at
+    /// `HANDOFF_BATCH_ROWS` first, and every arm would pay that 387 MB reservation and
+    /// free inside the timer), then pushes every row, transposes, builds every
+    /// `RecordBatch` and encodes to a real file. Nothing is hoisted out of the timer,
+    /// which is the point: the transpose is only part of the handoff write, so a
+    /// per-transpose speedup is not a per-stage speedup, and the second section below
+    /// shows exactly how much of the first is transpose.
     #[test]
     #[ignore]
     fn handoff_block_size_end_to_end() {
@@ -2663,9 +2998,10 @@ b
                     use_pq: true,
                 };
                 let t0 = std::time::Instant::now();
-                let mut w = HandoffWriter::new(&paths, &names, &is_decoy, &pform, &protein, &mz)
-                    .unwrap()
-                    .with_block_rows(block);
+                let mut w = HandoffWriter::with_block_size(
+                    &paths, &names, &is_decoy, &pform, &protein, &mz, block,
+                )
+                .unwrap();
                 for i in 0..rows {
                     w.push_row(i, &pool[i % pool.len()]).unwrap();
                 }
@@ -2673,9 +3009,15 @@ b
                 best = best.min(t0.elapsed().as_secs_f64() * 1000.0);
                 bytes = std::fs::metadata(&path).unwrap().len();
             }
+            // `transient` is the staging buffer AND the columnar copy `flush_block`
+            // gathers out of it: all `nf` column vectors are live until the
+            // `RecordBatch` is built, so the block costs twice what it stages.
             println!(
-                "block {block:>7}: {best:8.1} ms  ({:.2} s/Mrow)  staged {:>6.1} MB  file {:.1} MB",
+                "block {block:>7}: {best:8.1} ms  ({:.2} s/Mrow)  transient {:>6.1} MB \
+                 (stage {:.1} + columns {:.1})  file {:.1} MB",
                 best / 1000.0 * 1e6 / rows as f64,
+                (2 * block.min(rows) * nf * 4) as f64 / 1e6,
+                (block.min(rows) * nf * 4) as f64 / 1e6,
                 (block.min(rows) * nf * 4) as f64 / 1e6,
                 bytes as f64 / 1e6
             );
@@ -2686,27 +3028,33 @@ b
         // block row-major, then gather each of the 387 columns out of it at a 1,548-byte
         // stride. Each arm allocates its own staging buffer and its own column vectors
         // inside its own timer, so neither is handed a buffer the other paid for.
+        //
+        // The gathered columns are COLLECTED AND HELD, exactly as `flush_block` holds them
+        // in `arrays` until `RecordBatch::try_new`. An earlier version of this section read
+        // only `col[0]` and dropped each column immediately, which is a different loop:
+        // 386 of every 387 stores are then dead and formally removable, and the allocator
+        // hands back the same hot buffer every iteration instead of `nf` distinct ones.
         println!("-- transpose only (no encode) --");
         for block in [250_000usize, 131_072, 16_384, 4_096, 1_024] {
             let mut best = f64::INFINITY;
             for _ in 0..3 {
                 let t0 = std::time::Instant::now();
                 let mut stage: Vec<f32> = Vec::with_capacity(block * nf);
-                let mut acc = 0.0f32;
                 let mut done = 0usize;
                 while done < rows {
                     let k = block.min(rows - done);
                     for i in 0..k {
                         stage.extend_from_slice(&pool[(done + i) % pool.len()]);
                     }
+                    let mut cols: Vec<Vec<f32>> = Vec::with_capacity(nf);
                     for fi in 0..nf {
-                        let col: Vec<f32> = (0..k).map(|r| stage[r * nf + fi]).collect();
-                        acc += col[0];
+                        cols.push((0..k).map(|r| stage[r * nf + fi]).collect());
                     }
+                    std::hint::black_box(&cols);
+                    drop(cols);
                     stage.clear();
                     done += k;
                 }
-                std::hint::black_box(acc);
                 best = best.min(t0.elapsed().as_secs_f64() * 1000.0);
             }
             println!(
@@ -3347,17 +3695,21 @@ b
     fn the_dense_group_reduction_reproduces_the_hashed_one() {
         // The output-equality claim of the dense rewrite, against the previous
         // implementation rather than against the new shape, in both q modes and on both
-        // arms of the density gate: `group_stride` 1 indexes the keys directly, 100_000
-        // blows the span past the gate and takes the interning fallback.
+        // arms of the density gate. At 4,000 rows and ~1,334 groups, `group_stride` 1
+        // indexes the keys directly (span 1,334) and 100_000 blows the span past the gate
+        // and interns. Stride 9 is the case that matters most here: span 12,002 over
+        // 4,000 rows is the band a `span <= 4n` gate indexed directly and `span <= n`
+        // interns, so this is the population whose ARM the gate change moved, compared
+        // against a reference that has no gate at all.
         assert_eq!(
             std::mem::size_of::<Option<GroupBest>>(),
             24,
             "the dense array's per-group cost is the memory claim: a niche in one of the \
              bools must absorb the Option discriminant"
         );
-        for stride in [1u32, 100_000] {
+        for stride in [1u32, 9, 100_000] {
             for seed in [1u64, 2, 3, 4] {
-                let p = grouped_q_population(600, stride, seed);
+                let p = grouped_q_population(4_000, stride, seed);
                 let (keys, scores) = (&p.keys, &p.scores);
                 let (d, e, r) = (&p.is_decoy, &p.is_entrapment, &p.is_real);
                 for qmode in [QMode::Decoy, QMode::Entrapment] {
@@ -3403,6 +3755,22 @@ b
         let (ids, span) = dense_group_ids(&dense);
         assert_eq!(span, 64);
         assert_eq!(ids.as_ref(), dense.as_slice());
+
+        // The band an earlier `span <= 4n` gate admitted, and this one does not. The
+        // direct array is 24 bytes per SLOT, so a span of 3n costs 72 bytes per ROW --
+        // more than the interning arm (4n for the ids plus 24k for k <= n groups, about
+        // 28n) and more than the `HashMap<u32, GroupBest>` the dense rewrite replaced
+        // (33 bytes over next_pow2(8n/7) buckets, about 44n). `base_peptide_id` against a
+        // library with a few times more base peptides than the pool has rows is exactly
+        // this shape, so the gate that was meant to guard it was admitting it.
+        let banded: Vec<u32> = (0..2_000u32).map(|i| i * 3).collect();
+        let (ids, span) = dense_group_ids(&banded);
+        assert_eq!(
+            span, 2_000,
+            "a span of 5,998 over 2,000 rows must intern rather than index"
+        );
+        assert_eq!(ids[0], 0);
+        assert_eq!(ids[1_999], 1_999);
     }
 
     #[test]
