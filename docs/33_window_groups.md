@@ -584,7 +584,48 @@ process sat at 0.1 s of CPU indefinitely, with no error and no output). The orch
 clamps the value to `threads - 1` and warns. The production runs are far from the bound (8
 bands on 128 threads), which is why this was not visible before.
 
-## 9. What is not there yet
+## 9. The confident elution bounds are pooled too
+
+`features.bound_from_confident` (default on) fits one pair of elution half-widths from the
+run's confident seed anchors and gives every candidate the window `[apex - L, apex + R]`.
+It needs at least 20 anchors with a resolvable peak; below that it warns and falls back to
+per-candidate boundary detection.
+
+Twenty is a floor on the RUN's anchors, and a band holds a slice of the m/z range and
+therefore a slice of them. Measured on the seven-file immunopeptidomics search
+(`window_groups = 63`, 203M-precursor library), AT10273AUH had **735 confident anchors in
+the pooled seed and 0 or 1 in each band's chromatogram table**, so every band logged
+
+```text
+features: bound_from_confident set but < 20 confident anchors; falling back to
+per-candidate boundary
+```
+
+while the same run searched unbanded fitted a global window. That is a banded/unbanded
+divergence of the same kind as the per-band mass calibration of section 7, in the stage
+after it.
+
+The fix is the same move: the samples are pooled, not the fitted scalars. The band loop is
+now two phases. Phase 1 runs `rt-im-train` and `extract` for every band and calls
+`features::confident_bound_samples`, which is the pass `features` would have run
+internally -- same confident set, same row-group pruning, same detector -- returning the
+per-anchor half-widths instead of a percentile of them. The run absorbs every band's
+samples, fits `features::bounds_from_samples` once, and phase 2 runs `features` and
+`compete` for every band through `features::run_with_bounds` on that one pair. A run whose
+pooled set is genuinely under 20 anchors still falls back, now once rather than band by
+band.
+
+Two things come free with the split. The shared MS2 and MS1 buffers are dropped at the end
+of phase 1 rather than after competition, and phase 2 skips the extra streaming pass over
+the chromatogram table that each band used to make.
+
+Sizing the cost of the defect: rescoring one banded competed table (AT10273AUH,
+29,429,386 rows) under the first pass's own recipe gave 9,148 peptides against the
+unbanded first pass's 10,342, with the rescore recipe held fixed -- 11.5% of peptides,
+10.0% of precursors and 6.1% of protein groups, from a band search that pushed 88% MORE
+candidates into the scored table. How much of that this fix returns is not yet measured.
+
+## 10. What is not there yet
 
 - Groups run one after another in one process. Running them as child processes in parallel
   is the next step and needs nothing in the artifacts: the band directories are already
