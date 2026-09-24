@@ -84,6 +84,16 @@ impl FlatStr {
         (0..self.len()).map(|i| self.get(i))
     }
 
+    /// Rows `lo..hi`, with the same `ExactSizeIterator` contract as [`FlatStr::iter`].
+    ///
+    /// The writer needs this because an arrow `StringArray` addresses its values buffer
+    /// with i32 offsets: a column built from every row at once panics with `offset
+    /// overflow` once the concatenated text passes 2 GiB, which a pooled scored table
+    /// reaches at a few hundred million PSMs.
+    fn range(&self, lo: usize, hi: usize) -> impl ExactSizeIterator<Item = &str> {
+        (lo..hi).map(|i| self.get(i))
+    }
+
     /// Resident bytes: the offsets and the text buffer as ALLOCATED, not as filled. The
     /// text arrives from `str_flat`'s amortised doubling with up to 2x slack in it, and a
     /// figure that ignored that would under-report exactly the thing `memlog` is for.
@@ -1170,57 +1180,77 @@ fn scored_schema() -> std::sync::Arc<arrow::datatypes::Schema> {
     ]))
 }
 
+/// Rows per record batch in [`write_scored_table`].
+///
+/// The same 65,536 that `mumdia_io::table::write_table` feeds its writer, so the parquet
+/// is unchanged; what the chunk bounds is the width of one arrow `StringArray`.
+const SCORED_CHUNK_ROWS: usize = 1 << 16;
+
 fn write_scored_table(path: &str, c: ScoredColumns) -> Result<u64> {
     use arrow::array::{ArrayRef, Int32Array, StringArray, UInt32Array};
     use arrow::record_batch::RecordBatch;
     use std::sync::Arc;
 
     let schema = scored_schema();
-    // `StringArray::from(Vec<String>)` IS `StringArray::from_iter_values` in arrow 59
-    // (`string_array.rs`), so building the same values from the flat columns and from the
-    // label bits produces the identical offsets+values buffers, and therefore the
-    // identical parquet. `the_flat_metadata_columns_write_the_same_scored_parquet` pins
-    // that against the previous `Vec<String>` construction.
-    let protein: ArrayRef = Arc::new(StringArray::from_iter_values(c.protein.iter()));
-    let q: ArrayRef = Arc::new(Float64Array::from(c.psm_q));
-    let arrays: Vec<ArrayRef> = vec![
-        Arc::new(UInt32Array::from(c.cid)),
-        Arc::new(StringArray::from_iter_values(c.pform.iter())),
-        Arc::new(Int32Array::from(c.charge)),
-        Arc::new(StringArray::from_iter_values(c.is_decoy.iter().map(|&d| {
-            if d {
-                "decoy"
-            } else {
-                "target"
-            }
-        }))),
-        protein.clone(),
-        Arc::new(UInt32Array::from(c.base)),
-        Arc::new(Float64Array::from(c.apex_rt)),
-        Arc::new(Float64Array::from(c.elution_lo)),
-        Arc::new(Float64Array::from(c.elution_hi)),
-        Arc::new(Float64Array::from(c.scores)),
-        q.clone(),
-        Arc::new(Float64Array::from(c.peptide_q)),
-        protein,
-        Arc::new(Float64Array::from(c.pg_q)),
-        q.clone(),
-        Arc::new(Float64Array::from(c.prelim)),
-        Arc::new(UInt32Array::from(c.source)),
-        Arc::new(Float64Array::from(c.run_psm_q)),
-        q,
-        Arc::new(Float64Array::from(c.precursor_q)),
-        Arc::new(Int32Array::from(c.peak_rank)),
-    ];
-    // `from_iter_values` COPIES into the arrow buffers, but it borrows while it does, so
-    // unlike the `StringArray::from(Vec<String>)` it replaces it does not consume its
-    // source. Release the flat text explicitly rather than letting it live through the
-    // encoder: 111-200 MB at the Astral pool, for the whole of `write` and `close`.
-    drop((c.pform, c.protein, c.is_decoy));
-    let batch = RecordBatch::try_new(schema.clone(), arrays)
-        .with_context(|| format!("building the scored record batch for {path}"))?;
-    let mut w = mumdia_io::table::BatchWriter::new(path, schema)?;
-    w.write(&batch)?;
+    let nrows = c.cid.len();
+    let mut w = mumdia_io::table::BatchWriter::new(path, schema.clone())?;
+    // At least one batch, so a scored table with no rows still writes its schema.
+    let mut lo = 0usize;
+    loop {
+        let hi = (lo + SCORED_CHUNK_ROWS).min(nrows);
+        // `StringArray::from(Vec<String>)` IS `StringArray::from_iter_values` in arrow 59
+        // (`string_array.rs`), so building the same values from the flat columns and from
+        // the label bits produces the identical offsets+values buffers, and therefore the
+        // identical parquet. `the_flat_metadata_columns_write_the_same_scored_parquet`
+        // pins that against the previous `Vec<String>` construction.
+        let protein: ArrayRef = Arc::new(StringArray::from_iter_values(c.protein.range(lo, hi)));
+        let f = |v: &[f64]| -> ArrayRef {
+            Arc::new(Float64Array::from_iter_values(v[lo..hi].iter().copied()))
+        };
+        let q: ArrayRef = f(&c.psm_q);
+        let arrays: Vec<ArrayRef> = vec![
+            Arc::new(UInt32Array::from_iter_values(c.cid[lo..hi].iter().copied())),
+            Arc::new(StringArray::from_iter_values(c.pform.range(lo, hi))),
+            Arc::new(Int32Array::from_iter_values(
+                c.charge[lo..hi].iter().copied(),
+            )),
+            Arc::new(StringArray::from_iter_values(
+                c.is_decoy[lo..hi]
+                    .iter()
+                    .map(|&d| if d { "decoy" } else { "target" }),
+            )),
+            protein.clone(),
+            Arc::new(UInt32Array::from_iter_values(
+                c.base[lo..hi].iter().copied(),
+            )),
+            f(&c.apex_rt),
+            f(&c.elution_lo),
+            f(&c.elution_hi),
+            f(&c.scores),
+            q.clone(),
+            f(&c.peptide_q),
+            protein,
+            f(&c.pg_q),
+            q.clone(),
+            f(&c.prelim),
+            Arc::new(UInt32Array::from_iter_values(
+                c.source[lo..hi].iter().copied(),
+            )),
+            f(&c.run_psm_q),
+            q,
+            f(&c.precursor_q),
+            Arc::new(Int32Array::from_iter_values(
+                c.peak_rank[lo..hi].iter().copied(),
+            )),
+        ];
+        let batch = RecordBatch::try_new(schema.clone(), arrays)
+            .with_context(|| format!("building the scored record batch for {path}"))?;
+        w.write(&batch)?;
+        lo = hi;
+        if lo >= nrows {
+            break;
+        }
+    }
     w.close()
 }
 
@@ -2661,6 +2691,70 @@ b
             std::fs::read(&from_flat).unwrap(),
             std::fs::read(&from_vecs).unwrap(),
             "the flat metadata columns must write the identical psms_scored"
+        );
+    }
+
+    #[test]
+    fn a_scored_table_wider_than_one_batch_keeps_every_row_in_order() {
+        // `write_scored_table` used to build one record batch over every row. An arrow
+        // `StringArray` addresses its values with i32 offsets, so on a pooled table whose
+        // concatenated `peptidoform` or `protein` text passes 2 GiB that construction
+        // panics inside arrow with `offset overflow` -- which is how a 258,753,296-PSM
+        // seven-run rescore died after its worker had finished, at the last write of a
+        // 6.7-hour stage. The writer now emits `SCORED_CHUNK_ROWS` rows per batch, the
+        // same 65,536 `write_table` uses, so the widest string buffer it ever builds is
+        // one chunk of rows rather than the whole table.
+        //
+        // Two-GiB text is not testable here, so what this pins is the mechanism: more
+        // than one batch, every row present, in order, across the boundary. Byte equality
+        // with the single-batch file for a table SMALLER than a chunk is pinned by
+        // `the_flat_metadata_columns_write_the_same_scored_parquet` above.
+        let n = SCORED_CHUNK_ROWS + 7;
+        let pform: Vec<String> = (0..n).map(|i| format!("PEPTIDE{i}")).collect();
+        let protein: Vec<String> = (0..n).map(|i| format!("sp|P{i:07}|PROT")).collect();
+        let c = ScoredColumns {
+            cid: (0..n as u32).collect(),
+            pform: flat(&pform),
+            charge: vec![2; n],
+            is_decoy: (0..n).map(|i| i % 2 == 0).collect(),
+            protein: flat(&protein),
+            base: (0..n as u32).collect(),
+            apex_rt: (0..n).map(|i| i as f64).collect(),
+            elution_lo: vec![0.0; n],
+            elution_hi: vec![1.0; n],
+            scores: (0..n).map(|i| i as f64).collect(),
+            psm_q: vec![0.5; n],
+            peptide_q: vec![0.5; n],
+            pg_q: vec![0.5; n],
+            prelim: vec![0.0; n],
+            source: vec![0; n],
+            run_psm_q: vec![0.5; n],
+            precursor_q: vec![0.5; n],
+            peak_rank: vec![0; n],
+        };
+        let path = scratch("chunked_scored.parquet");
+        let rows = write_scored_table(&path, c).unwrap();
+        assert_eq!(rows, n as u64);
+
+        let t = mumdia_io::table::TableFile::open(&path).unwrap();
+        let (off, txt) = t.str_flat("peptidoform").unwrap();
+        assert_eq!(off.len(), n + 1, "one offset per row plus the terminator");
+        let row = |i: usize| &txt[off[i]..off[i + 1]];
+        // The chunk boundary itself, and the short final batch after it.
+        assert_eq!(row(0), "PEPTIDE0");
+        assert_eq!(
+            row(SCORED_CHUNK_ROWS - 1),
+            format!("PEPTIDE{}", SCORED_CHUNK_ROWS - 1)
+        );
+        assert_eq!(
+            row(SCORED_CHUNK_ROWS),
+            format!("PEPTIDE{SCORED_CHUNK_ROWS}")
+        );
+        assert_eq!(row(n - 1), format!("PEPTIDE{}", n - 1));
+        let (poff, ptxt) = t.str_flat("protein").unwrap();
+        assert_eq!(
+            &ptxt[poff[n - 1]..poff[n]],
+            format!("sp|P{:07}|PROT", n - 1)
         );
     }
 
