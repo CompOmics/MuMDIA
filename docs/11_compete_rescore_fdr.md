@@ -297,9 +297,10 @@ compare per-run counts on `run_psm_q`.
 What scales with cost: pooled rescoring measured 0.834 ms/PSM on the streaming
 backend, linear in PSM count. Two matrices with two widths -- the Python worker's
 is `n_psms * n_features * 4` bytes (f32), while the Rust `feats` the stage builds
-is `Vec<Vec<f64>>`, so `n_psms * n_features * 8` plus a heap allocation and 24
-bytes of spine per PSM, and `native_tda` holds roughly `(1 + folds)x` that at
-peak. The stage logs the figure before allocating, and
+is a flat f32 `FeatureMatrix`, so the same `n_psms * n_features * 4`, and
+`native_tda` holds one standardised training copy on top of it, peaking at
+`1 + (folds - 1) / folds` -- 1.67x at the default 3 folds, and never above 2x
+however many folds are configured. The stage logs the figure before allocating, and
 `rescore.max_feature_matrix_gib` makes exceeding a ceiling an error at startup.
 
 The NnTorch worker picks its backend from the handoff file size against

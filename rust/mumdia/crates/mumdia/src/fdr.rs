@@ -49,7 +49,42 @@ fn rank_key(x: f64) -> f64 {
 /// same permutation, and no two records compare equal, so the unstable parallel sort is
 /// deterministic.
 pub fn target_decoy_q(scores: &[(f64, bool)]) -> Vec<f64> {
-    let n = scores.len();
+    target_decoy_q_core(scores.len(), |i| scores[i])
+}
+
+/// [`target_decoy_q`] from two parallel slices instead of a slice of pairs.
+///
+/// Identical kernel, identical output; the only difference is where the pairing happens.
+/// Every caller already holds the score and the label as separate columns, so the pair
+/// form made each of them build an `n * 16` byte staging buffer whose whole purpose was to
+/// be walked once into `ranked`. In `rescoring::percolator_lite` that buffer was the
+/// expensive one: it is allocated outside the `num_iter` loop and only refilled inside it,
+/// so it stayed resident for the entire fit. `entrapment_q` below already takes its
+/// columns separately, so this makes the two kernels consistent rather than adding a
+/// convention.
+///
+/// Five call sites are still on the pair form, and the largest of them is the pooled PSM q
+/// over the whole scored table (`stages/rescore.rs:685`, `:753`, `:1273`,
+/// `stages/search_seed.rs:158`, `stages/seed_pool.rs:166`), where the staging buffer is
+/// 186 MB at 11.6M rows -- bigger than the one this form was introduced to remove. They
+/// should move too; they are outside the file set of the change that added this, which is
+/// why they have not. Note that this is a saving left on the table, NOT a divergence
+/// hazard: both entry points are one-line wrappers over `target_decoy_q_core` below and
+/// there is no second copy of the estimator to drift.
+pub fn target_decoy_q_split(scores: &[f64], is_decoy: &[bool]) -> Vec<f64> {
+    assert_eq!(
+        scores.len(),
+        is_decoy.len(),
+        "target_decoy_q_split: {} scores against {} labels",
+        scores.len(),
+        is_decoy.len()
+    );
+    target_decoy_q_core(scores.len(), |i| (scores[i], is_decoy[i]))
+}
+
+/// Shared body of the two forms above: everything below depends on the input only through
+/// `(score, is_decoy)` per row.
+fn target_decoy_q_core(n: usize, row: impl Fn(usize) -> (f64, bool)) -> Vec<f64> {
     if n == 0 {
         return Vec::new();
     }
@@ -60,13 +95,16 @@ pub fn target_decoy_q(scores: &[(f64, bool)]) -> Vec<f64> {
         n <= u32::MAX as usize,
         "target_decoy_q: {n} rows exceeds the u32 row index"
     );
-    let mut ranked: Vec<(f64, u32, bool)> = scores
-        .iter()
-        .enumerate()
-        .map(|(i, &(s, d))| (rank_key(s), i as u32, d))
+    let mut ranked: Vec<(f64, u32, bool)> = (0..n)
+        .map(|i| {
+            let (s, d) = row(i);
+            (rank_key(s), i as u32, d)
+        })
         .collect();
     ranked.par_sort_unstable_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
-    let total_d = scores.iter().filter(|&&(_, d)| d).count();
+    // An integer count over the same multiset, so reading it off the sorted records rather
+    // than the input is the same number.
+    let total_d = ranked.iter().filter(|r| r.2).count();
     let total_t = n - total_d;
     // Walk in score order, processing tied-score blocks together so every PSM in
     // a block gets the same FDR (its within-tie order is arbitrary and must not
@@ -119,6 +157,20 @@ pub fn target_decoy_q(scores: &[(f64, bool)]) -> Vec<f64> {
 /// empirical-null analog of `target_decoy_q`: the entrapment population, unlike
 /// in-silico decoys, experiences the same chimeric DIA interference as real
 /// targets, so the estimate is not optimistic. Returns q aligned to input order.
+///
+/// Layout, not statistics, and exactly the rewrite `target_decoy_q` already had: this
+/// ranks ONE sortable record per row -- `(key, row, is_entrapment, is_real)`, 16 bytes --
+/// where it used to sort an index permutation with a comparator that dereferenced a
+/// separate `key` column, then walk the ties through two more indirections per row
+/// (`key[order[end]]`, `is_entrapment[order[end]]`). The `fdr_at` column is gone because
+/// the monotonization runs in the same backward pass that computes each block's FDP, from
+/// the per-block counts and the totals, so four n-vectors (`key`, `order`, `fdr_at`, `q`,
+/// 32 bytes per row) become two (24). The serial `sort_by` is now a parallel sort over a
+/// cache-resident record, which matters because this kernel runs five or more times per
+/// entrapment rescore (pooled PSM q, once per source for `run_psm_q`, and three times
+/// through `grouped_q`) over the whole scored table. Off the default path entirely: only
+/// `QMode::Entrapment` reaches it. Leaving the two copies of one kernel divergent is how
+/// the next reader picks the wrong one.
 pub fn entrapment_q(
     scores: &[f64],
     is_entrapment: &[bool],
@@ -129,41 +181,55 @@ pub fn entrapment_q(
     if n == 0 {
         return Vec::new();
     }
-    let key: Vec<f64> = scores.iter().map(|&s| rank_key(s)).collect();
-    let mut order: Vec<usize> = (0..n).collect();
-    // Stable sort: ties keep input order, so q values are deterministic. Keyed on
-    // `rank_key` so a non-finite score cannot hang the tied-block walk below.
-    order.sort_by(|&a, &b| key[b].total_cmp(&key[a]));
-    let (mut ne, mut nr) = (0usize, 0usize);
-    let mut fdr_at = vec![1.0f64; n];
-    // Process tied-score blocks together so every row in a block gets the same
-    // FDP regardless of its arbitrary within-tie order (determinism,
-    // docs/14_build_test_deploy_gotchas.md). Mirrors the tied-block walk in
-    // `target_decoy_q`.
-    let mut rank = 0usize;
-    while rank < n {
-        let s = key[order[rank]];
-        let mut end = rank;
-        while end < n && key[order[end]] == s {
-            let i = order[end];
-            if is_entrapment[i] {
-                ne += 1;
-            } else if is_real[i] {
-                nr += 1;
-            }
-            end += 1;
-        }
-        let f = (ratio * ne as f64 + 1.0) / (nr.max(1) as f64);
-        for value in fdr_at.iter_mut().take(end).skip(rank) {
-            *value = f;
-        }
-        rank = end;
-    }
+    assert!(
+        n <= u32::MAX as usize,
+        "entrapment_q: {n} rows exceeds the u32 row index"
+    );
+    // Keyed on `rank_key` so a non-finite score cannot hang the tied-block walk below.
+    // The previous stable `sort_by` over an ascending index vector ordered ties by row
+    // index; sorting `(key desc, row asc)` is the same permutation, and no two records
+    // compare equal, so the unstable parallel sort is deterministic.
+    let mut ranked: Vec<(f64, u32, bool, bool)> = (0..n)
+        .map(|i| (rank_key(scores[i]), i as u32, is_entrapment[i], is_real[i]))
+        .collect();
+    ranked.par_sort_unstable_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    // Integer counts over the whole population. `is_entrapment` wins where a row claims
+    // both, which is the precedence the forward walk had.
+    let total_e = ranked.iter().filter(|r| r.2).count();
+    let total_r = ranked.iter().filter(|r| !r.2 && r.3).count();
+    // Process tied-score blocks together so every row in a block gets the same FDP
+    // regardless of its arbitrary within-tie order (determinism,
+    // docs/14_build_test_deploy_gotchas.md). Walked from the WORST-scoring end so the
+    // monotonization happens in the same pass: the counts at or above a block are the
+    // totals minus what is strictly below it, which is exactly what the forward walk
+    // accumulated, and `qmin` over the blocks already visited is what the separate
+    // backward pass over `fdr_at` used to compute.
     let mut q = vec![1.0f64; n];
+    let (mut below_e, mut below_r) = (0usize, 0usize);
     let mut qmin = 1.0f64;
-    for rank in (0..n).rev() {
-        qmin = qmin.min(fdr_at[rank]);
-        q[order[rank]] = qmin;
+    let mut end = n;
+    while end > 0 {
+        let s = ranked[end - 1].0;
+        let mut start = end;
+        let (mut block_e, mut block_r) = (0usize, 0usize);
+        while start > 0 && ranked[start - 1].0 == s {
+            start -= 1;
+            if ranked[start].2 {
+                block_e += 1;
+            } else if ranked[start].3 {
+                block_r += 1;
+            }
+        }
+        let ne = total_e - below_e;
+        let nr = total_r - below_r;
+        let f = (ratio * ne as f64 + 1.0) / (nr.max(1) as f64);
+        qmin = qmin.min(f);
+        for r in &ranked[start..end] {
+            q[r.1 as usize] = qmin;
+        }
+        below_e += block_e;
+        below_r += block_r;
+        end = start;
     }
     q
 }
@@ -289,6 +355,50 @@ mod tests {
     }
 
     #[test]
+    fn the_split_and_paired_q_forms_agree_bit_for_bit() {
+        // Both entry points reach the same kernel, so the only thing this can catch is a
+        // mis-pairing of the two columns; it is cheap and it is the whole claim.
+        let mut state = 0xD1B5_4A32_D192_ED03u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for n in [0usize, 1, 2, 7, 64, 513, 4096] {
+            let mut scores: Vec<(f64, bool)> = Vec::with_capacity(n);
+            for _ in 0..n {
+                let r = next();
+                let v = match r % 9 {
+                    0 => f64::NAN,
+                    1 => f64::NEG_INFINITY,
+                    _ => ((r >> 8) % 23) as f64 * 0.5 - 6.0,
+                };
+                scores.push((v, r % 4 == 0));
+            }
+            let (col_s, col_d): (Vec<f64>, Vec<bool>) = scores.iter().copied().unzip();
+            assert_eq!(
+                target_decoy_q(&scores)
+                    .iter()
+                    .map(|v| v.to_bits())
+                    .collect::<Vec<_>>(),
+                target_decoy_q_split(&col_s, &col_d)
+                    .iter()
+                    .map(|v| v.to_bits())
+                    .collect::<Vec<_>>(),
+                "n = {n}"
+            );
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "target_decoy_q_split: 2 scores against 1 labels")]
+    fn the_split_form_rejects_mismatched_columns() {
+        // Silently truncating to the shorter column would drop rows out of the null.
+        target_decoy_q_split(&[1.0, 2.0], &[false]);
+    }
+
+    #[test]
     fn perfect_separation_q_is_conservative_plus_one() {
         // all targets score above all decoys; with the (n_decoys+1)/n_targets
         // estimator the best targets get q = 1/n_targets (not 0).
@@ -313,6 +423,111 @@ mod tests {
         let s = vec![(5.0, false), (5.0, true), (5.0, false)];
         let q = target_decoy_q(&s);
         assert!((q[0] - q[1]).abs() < 1e-12 && (q[1] - q[2]).abs() < 1e-12);
+    }
+
+    /// The previous `entrapment_q`, transcribed unchanged: an index permutation sorted with
+    /// an indirect comparator, a forward tied-block walk into `fdr_at`, and a separate
+    /// backward monotonization. Kept for the same reason its sibling's is.
+    fn entrapment_q_reference(
+        scores: &[f64],
+        is_entrapment: &[bool],
+        is_real: &[bool],
+        ratio: f64,
+    ) -> Vec<f64> {
+        let n = scores.len();
+        if n == 0 {
+            return Vec::new();
+        }
+        let key: Vec<f64> = scores.iter().map(|&s| rank_key(s)).collect();
+        let mut order: Vec<usize> = (0..n).collect();
+        order.sort_by(|&a, &b| key[b].total_cmp(&key[a]));
+        let (mut ne, mut nr) = (0usize, 0usize);
+        let mut fdr_at = vec![1.0f64; n];
+        let mut rank = 0usize;
+        while rank < n {
+            let s = key[order[rank]];
+            let mut end = rank;
+            while end < n && key[order[end]] == s {
+                let i = order[end];
+                if is_entrapment[i] {
+                    ne += 1;
+                } else if is_real[i] {
+                    nr += 1;
+                }
+                end += 1;
+            }
+            let f = (ratio * ne as f64 + 1.0) / (nr.max(1) as f64);
+            for value in fdr_at.iter_mut().take(end).skip(rank) {
+                *value = f;
+            }
+            rank = end;
+        }
+        let mut q = vec![1.0f64; n];
+        let mut qmin = 1.0f64;
+        for rank in (0..n).rev() {
+            qmin = qmin.min(fdr_at[rank]);
+            q[order[rank]] = qmin;
+        }
+        q
+    }
+
+    #[test]
+    fn entrapment_q_is_bit_identical_to_the_previous_kernel() {
+        // Every case the rewrite touches: heavy ties (the tied-block walk), signed zeros,
+        // non-finite scores, rows that are neither entrapment nor real (decoys, ranked but
+        // counted nowhere), rows that claim BOTH (entrapment wins, as in the forward walk),
+        // single-class stretches, and a library-size ratio that is not 1.
+        let mut state = 0x8AC7_23B4_9F1D_5E07u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for n in [1usize, 2, 3, 7, 64, 513, 4096] {
+            let mut scores = Vec::with_capacity(n);
+            let mut is_entrap = Vec::with_capacity(n);
+            let mut is_real = Vec::with_capacity(n);
+            for _ in 0..n {
+                let r = next();
+                scores.push(match r % 11 {
+                    0 => 0.0,
+                    1 => -0.0,
+                    2 => f64::NAN,
+                    3 => f64::INFINITY,
+                    4 => f64::NEG_INFINITY,
+                    _ => ((r >> 8) % 37) as f64 * 0.25 - 4.0,
+                });
+                let cls = (r >> 32) % 4;
+                is_entrap.push(cls == 0 || cls == 3);
+                is_real.push(cls == 1 || cls == 3);
+            }
+            for ratio in [1.0f64, 2.5, 0.37] {
+                let got = entrapment_q(&scores, &is_entrap, &is_real, ratio);
+                let want = entrapment_q_reference(&scores, &is_entrap, &is_real, ratio);
+                assert_eq!(
+                    got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    want.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    "n = {n}, ratio = {ratio}"
+                );
+            }
+        }
+        // Populations where `max(1, nr)` bites: no real targets at all, and no entrapment.
+        let scores: Vec<f64> = (0..32).map(|i| (i % 4) as f64).collect();
+        let all = vec![true; 32];
+        let none = vec![false; 32];
+        assert_eq!(
+            entrapment_q(&scores, &all, &none, 1.0),
+            entrapment_q_reference(&scores, &all, &none, 1.0)
+        );
+        assert_eq!(
+            entrapment_q(&scores, &none, &all, 1.0),
+            entrapment_q_reference(&scores, &none, &all, 1.0)
+        );
+        assert_eq!(
+            entrapment_q(&[], &[], &[], 1.0),
+            entrapment_q_reference(&[], &[], &[], 1.0)
+        );
     }
 
     #[test]
