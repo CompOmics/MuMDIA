@@ -384,9 +384,10 @@ pub fn run(p: RescoreParams) -> Result<u64> {
         anyhow::bail!(
             "rescore feature matrix would be {} ({total_rows} PSMs x {} features x 4 bytes, \
              f32), over the configured rescore.max_feature_matrix_gib of {ceiling:.2}. This \
-             is the matrix alone: per-PSM metadata, the per-fold standardised training \
-             copies of native_tda (roughly (1 + folds) times this at peak) and the Python \
-             worker's own copy come on top. Either raise the ceiling, or rescore fewer runs \
+             is the matrix alone: per-PSM metadata, the one standardised training copy \
+             native_tda holds (its peak is 1 + (folds - 1) / folds times this, 1.67x at \
+             the default 3 folds and never above 2x) and the Python worker's own copy come on top. \
+             Either raise the ceiling, or rescore fewer runs \
              per invocation -- `run_psm_q` is computed per source, so sub-batching costs no \
              per-run FDR, though it does change which PSMs share the pooled q_value.",
             human_bytes(matrix_bytes as f64),
