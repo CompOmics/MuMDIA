@@ -1859,24 +1859,62 @@ fn confident_global_bounds(
 ) -> Result<Option<(f64, f64)>> {
     let (lefts, rights) =
         confident_half_widths(ch, spans, confident_rows, apex_rt, cfg, chunk_rows)?;
-    if lefts.len() >= 20 {
+    Ok(bounds_from_samples(&BoundSamples { lefts, rights }, cfg))
+}
+
+/// One caller's confident-anchor elution half-widths, in seconds, before the percentile.
+///
+/// A banded search holds these per band, so the run pools them and fits once; see
+/// [`bounds_from_samples`].
+#[derive(Default, Clone)]
+pub struct BoundSamples {
+    pub lefts: Vec<f64>,
+    pub rights: Vec<f64>,
+}
+
+impl BoundSamples {
+    /// Absorb another band's anchors. Order does not matter: both vectors are reduced by
+    /// a percentile, which sorts.
+    pub fn absorb(&mut self, other: BoundSamples) {
+        self.lefts.extend(other.lefts);
+        self.rights.extend(other.rights);
+    }
+
+    pub fn len(&self) -> usize {
+        self.lefts.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.lefts.is_empty()
+    }
+}
+
+/// The global half-widths, or `None` below 20 anchors, in which case the caller keeps the
+/// per-candidate boundary detection.
+///
+/// The 20 is a floor on the anchor count of the RUN, not of one band. A banded search
+/// splits the run's confident set across `groups.window_groups` chromatogram tables, and
+/// measured on a seven-file immunopeptidomics search 735 pooled anchors arrived as 0 or 1
+/// per band, so every band fell back to per-candidate detection while the unbanded arm
+/// used a global window.
+pub fn bounds_from_samples(s: &BoundSamples, cfg: &FeaturesConfig) -> Option<(f64, f64)> {
+    if s.lefts.len() >= 20 {
         let q = (cfg.bound_confident_pct / 100.0).clamp(0.0, 1.0);
-        let (l, r) = (percentile(&lefts, q), percentile(&rights, q));
+        let (l, r) = (percentile(&s.lefts, q), percentile(&s.rights, q));
         info!(
-            n_confident = lefts.len(),
+            n_confident = s.lefts.len(),
             left_hw_s = l,
             right_hw_s = r,
             pct = cfg.bound_confident_pct,
             "features: global elution half-widths from confident set"
         );
-        Ok(Some((l, r)))
+        Some((l, r))
     } else {
         warn!(
-            n_confident = lefts.len(),
-            "features: bound_from_confident set but < 20 confident anchors; \
-             falling back to per-candidate boundary"
+            n_confident = s.lefts.len(),
+            "features: bound_from_confident set but < 20 confident anchors; falling back              to per-candidate boundary"
         );
-        Ok(None)
+        None
     }
 }
 
@@ -1900,7 +1938,13 @@ pub fn run_with_chunk_limits(
     chunk_rows: usize,
     max_psm_rows: usize,
 ) -> Result<u64> {
-    run_chunked(p, chunk_rows, max_psm_rows, PinFinish::Normal)
+    run_chunked(
+        p,
+        chunk_rows,
+        max_psm_rows,
+        PinFinish::Normal,
+        BoundsSource::Learn,
+    )
 }
 
 /// How the PIN is closed. `Fail` exists only under `cfg(test)` and injects a failure at
@@ -1938,7 +1982,100 @@ impl PinFinish {
 /// (`moving_a_chunk_boundary_moves_parquet_bytes_above_one_row_group` measures it), and
 /// both chunk limits move boundaries. Nothing downstream reads those bytes.
 pub fn run_with_chunk_rows(p: FeaturesParams, chunk_rows: usize) -> Result<u64> {
-    run_chunked(p, chunk_rows, CHUNK_PSM_ROWS, PinFinish::Normal)
+    run_chunked(
+        p,
+        chunk_rows,
+        CHUNK_PSM_ROWS,
+        PinFinish::Normal,
+        BoundsSource::Learn,
+    )
+}
+
+/// [`run`] with the run's pooled confident elution half-widths supplied.
+///
+/// A banded search calls [`confident_bound_samples`] on every band, pools the samples and
+/// fits [`bounds_from_samples`] once, then passes the pair here. Without it each band fits
+/// its own and falls below the 20-anchor floor: measured on a seven-file
+/// immunopeptidomics search, 735 pooled anchors arrived as 0 or 1 per band.
+pub fn run_with_bounds(p: FeaturesParams, bounds: Option<(f64, f64)>) -> Result<u64> {
+    let mut inputs = vec![("--psms", p.psms), ("--chromatograms", p.chromatograms)];
+    if let Some(seed) = p.seed {
+        inputs.push(("--seed-psms", seed));
+    }
+    mumdia_io::refuse_output_over_input(p.out, &inputs)?;
+    if !p.out_pin.is_empty() {
+        mumdia_io::refuse_output_over_input(p.out_pin, &inputs)?;
+    }
+    run_chunked(
+        p,
+        CHUNK_CHROM_ROWS,
+        CHUNK_PSM_ROWS,
+        PinFinish::Normal,
+        BoundsSource::Given(bounds),
+    )
+}
+
+/// This table's confident anchors' elution half-widths, without computing any feature.
+///
+/// The band half of the pooled bounds: it runs exactly the pass [`run`] would run
+/// internally -- same confident set, same row-group pruning, same half-width detector --
+/// and returns the samples instead of the percentile.
+pub fn confident_bound_samples(p: &FeaturesParams) -> Result<BoundSamples> {
+    if !p.cfg.bound_from_confident {
+        return Ok(BoundSamples::default());
+    }
+    let Some(seed) = p.seed else {
+        return Ok(BoundSamples::default());
+    };
+    let ps = TableFile::open(p.psms)?;
+    let cid = ps.u32("candidate_id")?;
+    let apex_rt = ps.f64("apex_rt")?;
+
+    let s = TableFile::open(seed)?;
+    let scid = s.u32("candidate_id")?;
+    let sq = s.f64("spectrum_q")?;
+    let slabel = s.str("label")?;
+    let mut confident: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    for i in 0..s.nrows {
+        if sq[i] <= 0.01 && slabel[i] == "target" {
+            confident.insert(scid[i]);
+        }
+    }
+
+    let mut confident_rows: HashMap<u32, Vec<usize>> = HashMap::new();
+    for (i, &c) in cid.iter().enumerate() {
+        if confident.contains(&c) {
+            confident_rows.entry(c).or_default().push(i);
+        }
+    }
+    let ch = TableFile::open(p.chromatograms)?;
+    let mut sorted: Vec<u32> = confident_rows.keys().copied().collect();
+    sorted.sort_unstable();
+    let spans = ch
+        .row_group_stats("candidate_id")
+        .ok()
+        .and_then(|st| confident_row_spans(&st, &sorted))
+        .unwrap_or_else(|| vec![(0, ch.nrows)]);
+    let (lefts, rights) = confident_half_widths(
+        &ch,
+        &spans,
+        &confident_rows,
+        &apex_rt,
+        p.cfg,
+        CHUNK_CHROM_ROWS,
+    )?;
+    Ok(BoundSamples { lefts, rights })
+}
+
+/// Where a call gets the global elution half-widths from.
+#[derive(Clone, Copy)]
+enum BoundsSource {
+    /// Learn them from this table's own confident anchors, which is right when the table
+    /// is the whole run.
+    Learn,
+    /// Use the run's pooled pair. `None` means the pooled set was below the anchor floor,
+    /// so every band keeps per-candidate detection, together rather than band by band.
+    Given(Option<(f64, f64)>),
 }
 
 fn run_chunked(
@@ -1946,6 +2083,7 @@ fn run_chunked(
     chunk_rows: usize,
     max_psm_rows: usize,
     pin_finish: PinFinish,
+    bounds: BoundsSource,
 ) -> Result<u64> {
     let t0 = Instant::now();
     let ps = TableFile::open(p.psms)?;
@@ -2065,40 +2203,45 @@ fn run_chunked(
     // the per-candidate boundary detection (default). This is a global quantity, so it
     // costs one extra streaming pass over the chromatogram table before the chunked pass
     // below; only the confident candidates' rows are ever held.
-    let global_bounds: Option<(f64, f64)> = if p.cfg.bound_from_confident {
-        let mut confident_rows: HashMap<u32, Vec<usize>> = HashMap::new();
-        for (i, &c) in cid.iter().enumerate() {
-            if confident_cids.contains(&c) {
-                confident_rows.entry(c).or_default().push(i);
+    let global_bounds: Option<(f64, f64)> = match bounds {
+        // A banded run fits the half-widths once over every band's anchors and hands
+        // the pair down, so a band with one anchor of its own still gets the run's
+        // window. The pooled fit also makes this pass unnecessary here.
+        BoundsSource::Given(b) => b,
+        BoundsSource::Learn if p.cfg.bound_from_confident => {
+            let mut confident_rows: HashMap<u32, Vec<usize>> = HashMap::new();
+            for (i, &c) in cid.iter().enumerate() {
+                if confident_cids.contains(&c) {
+                    confident_rows.entry(c).or_default().push(i);
+                }
             }
+            // Read only the row groups whose candidate_id range can hold a confident
+            // candidate; the rest contain none by construction.
+            let mut sorted: Vec<u32> = confident_rows.keys().copied().collect();
+            sorted.sort_unstable();
+            let spans = ch
+                .row_group_stats("candidate_id")
+                .ok()
+                .and_then(|s| confident_row_spans(&s, &sorted))
+                .unwrap_or_else(|| vec![(0, ch.nrows)]);
+            let span_rows: usize = spans.iter().map(|s| s.1).sum();
+            info!(
+                spans = spans.len(),
+                rows = span_rows,
+                of_rows = ch.nrows,
+                confident = sorted.len(),
+                "features: confident-bounds pass reads this much of the chromatogram table"
+            );
+            confident_global_bounds(
+                &ch,
+                &spans,
+                &confident_rows,
+                &apex_rt,
+                p.cfg,
+                chunk_rows.max(1),
+            )?
         }
-        // Read only the row groups whose candidate_id range can hold a confident
-        // candidate; the rest contain none by construction.
-        let mut sorted: Vec<u32> = confident_rows.keys().copied().collect();
-        sorted.sort_unstable();
-        let spans = ch
-            .row_group_stats("candidate_id")
-            .ok()
-            .and_then(|s| confident_row_spans(&s, &sorted))
-            .unwrap_or_else(|| vec![(0, ch.nrows)]);
-        let span_rows: usize = spans.iter().map(|s| s.1).sum();
-        info!(
-            spans = spans.len(),
-            rows = span_rows,
-            of_rows = ch.nrows,
-            confident = sorted.len(),
-            "features: confident-bounds pass reads this much of the chromatogram table"
-        );
-        confident_global_bounds(
-            &ch,
-            &spans,
-            &confident_rows,
-            &apex_rt,
-            p.cfg,
-            chunk_rows.max(1),
-        )?
-    } else {
-        None
+        BoundsSource::Learn => None,
     };
 
     let gradient = apex_rt.iter().cloned().fold(0.0f64, f64::max).max(1.0);
@@ -3135,6 +3278,52 @@ fn isotope_features(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bands_below_the_anchor_floor_clear_it_once_pooled() {
+        // The banded defect, as arithmetic. Each band's confident set is a slice of the
+        // run's, so fitting per band puts every band under the 20-anchor floor and each
+        // one silently falls back to per-candidate boundary detection, while the same run
+        // searched unbanded fits a global window. Measured on a seven-file
+        // immunopeptidomics search: 735 pooled anchors, 0 or 1 per band.
+        let cfg = FeaturesConfig {
+            bound_from_confident: true,
+            bound_confident_pct: 50.0,
+            ..Default::default()
+        };
+        let band = |n: usize, w: f64| BoundSamples {
+            lefts: vec![w; n],
+            rights: vec![w * 2.0; n],
+        };
+
+        // Sixty-three bands of one anchor each: every one of them declines on its own.
+        let bands: Vec<BoundSamples> = (0..63).map(|_| band(1, 4.0)).collect();
+        for b in &bands {
+            assert_eq!(
+                bounds_from_samples(b, &cfg),
+                None,
+                "a single-anchor band must not fit a window of its own"
+            );
+        }
+
+        // Pooled, the same anchors clear the floor and every band gets one window.
+        let mut pooled = BoundSamples::default();
+        for b in bands {
+            pooled.absorb(b);
+        }
+        assert_eq!(pooled.len(), 63);
+        assert_eq!(pooled.rights.len(), 63);
+        assert_eq!(bounds_from_samples(&pooled, &cfg), Some((4.0, 8.0)));
+
+        // The floor still bites when the RUN really is short of anchors, which is the
+        // case the fallback exists for.
+        let mut thin = BoundSamples::default();
+        for _ in 0..19 {
+            thin.absorb(band(1, 4.0));
+        }
+        assert_eq!(bounds_from_samples(&thin, &cfg), None);
+        assert!(!thin.is_empty());
+    }
 
     #[test]
     fn plan_chunks_cuts_only_at_candidate_boundaries() {
@@ -4882,12 +5071,24 @@ mod tests {
             config_hash: "test",
         };
 
-        run_chunked(params(), 4, CHUNK_PSM_ROWS, PinFinish::Normal)
-            .expect("the good run must succeed");
+        run_chunked(
+            params(),
+            4,
+            CHUNK_PSM_ROWS,
+            PinFinish::Normal,
+            BoundsSource::Learn,
+        )
+        .expect("the good run must succeed");
         let good = mumdia_io::hash::blake3_file(&out).unwrap();
 
-        let err = run_chunked(params(), 4, CHUNK_PSM_ROWS, PinFinish::Fail)
-            .expect_err("a PIN that cannot be flushed must fail the stage");
+        let err = run_chunked(
+            params(),
+            4,
+            CHUNK_PSM_ROWS,
+            PinFinish::Fail,
+            BoundsSource::Learn,
+        )
+        .expect_err("a PIN that cannot be flushed must fail the stage");
         assert!(
             err.to_string().contains("PIN"),
             "the PIN failure must be the reported error, not the writer's: {err}"
