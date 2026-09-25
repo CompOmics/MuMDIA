@@ -444,6 +444,16 @@ struct FragmentColumns {
 /// in parallel and one batch ahead of the placement ([`crate::colread::for_each_zipped`]).
 /// That is the only parallelism a one-row-group table without an offset index has, which
 /// is what pyarrow writes by default.
+///
+/// Errors do not depend on the part layout. Pass 1 refuses `candidate_id` defects (NULL,
+/// out of range on a full load), pass 2 the others (NULLs, non-finite m/z or intensity).
+/// Within a pass the table is refused on its FIRST defective row in file order, whatever
+/// the kind of defect: every batch reports its first bad row across all its checks, and
+/// the parts' results are taken in part order. The name limit (more distinct names than
+/// the u16 id holds) is the one check that belongs to no row. The serial pass meets it at
+/// the row that introduces the 65,536th name, the parted pass at the merge of the parts'
+/// dictionaries, so in a table that also has a row defect, which of the two is reported
+/// can depend on the layout. Both are refused either way.
 fn load_fragments(
     fragments: &str,
     frag_offset: usize,
@@ -622,9 +632,14 @@ fn count_part(
                 .ok_or_else(|| anyhow::anyhow!("fragment column 'candidate_id' is not u32"))?;
             // `values()` is the physical buffer and ignores the validity bitmap: a NULL
             // candidate_id would read as 0 and attach the fragment to candidate 0
-            // (docs/29 #2).
-            require_no_nulls(a, "candidate_id", range.fragments, row0 + base)?;
-            for (k, &candidate_id) in a.values().iter().enumerate() {
+            // (docs/29 #2). So only the rows before the first NULL are read, and the batch
+            // is refused on whichever defect comes first in the file: an id out of range
+            // in those rows, or the NULL. Checking every NULL of the batch first would name
+            // a later row whenever a batch holds both, and which one would depend on where
+            // the batch boundaries fall, which differs between the serial and the parted
+            // pass.
+            let clean = first_null(a).unwrap_or(a.len());
+            for (k, &candidate_id) in a.values()[..clean].iter().enumerate() {
                 // A range load sees the fragments of neighbouring candidates in the
                 // boundary row groups (or the whole table when it is unsorted); they
                 // belong to precursors this library does not hold and are skipped. A
@@ -641,10 +656,35 @@ fn count_part(
                 info.last = Some(c);
                 info.kept += 1;
             }
-            Ok(())
+            // The NULL at `clean`, if there is one.
+            require_no_nulls(a, "candidate_id", range.fragments, row0 + base)
         },
     )?;
     Ok(info)
+}
+
+/// First NULL row of an array (its validity bitmap), `None` when it has none.
+fn first_null(a: &dyn Array) -> Option<usize> {
+    if a.null_count() == 0 {
+        return None;
+    }
+    (0..a.len()).find(|&i| a.is_null(i))
+}
+
+/// First row of a string batch whose dictionary VALUE is NULL behind a valid key: the one
+/// NULL a validity check on the column cannot see. A parquet reader never produces one (a
+/// parquet dictionary holds no NULLs; a missing value is a NULL key), but an Arrow producer
+/// can, and the row would otherwise read as whatever the value buffer holds.
+fn first_null_dict_value(col: &dyn Array, name: &mumdia_io::table::StrBatch) -> Option<usize> {
+    match name {
+        mumdia_io::table::StrBatch::Plain(_) => None,
+        mumdia_io::table::StrBatch::Dict { keys, values } => {
+            if values.null_count() == 0 {
+                return None;
+            }
+            (0..keys.len()).find(|&k| !col.is_null(k) && values.is_null(keys[k] as usize))
+        }
+    }
 }
 
 /// Whether the kept rows' candidates never decrease over the whole table, parts in order.
@@ -883,39 +923,65 @@ impl<'a> FragBatch<'a> {
             .ok_or_else(|| anyhow::anyhow!("fragment column 'predicted_intensity' is not f32"))?;
         let name = mumdia_io::table::StrBatch::of(&cols[3])
             .ok_or_else(|| anyhow::anyhow!("fragment column 'name' is not utf8"))?;
-        // Every required column, before any value is read: the finiteness checks
-        // below run on physical buffers, where a NULL is a perfectly finite 0.0, and
-        // the fill used to turn NULLs into NaN and "" instead of refusing them
-        // (docs/29 #2).
-        require_no_nulls(a_cid, "candidate_id", fragments, row_base)?;
-        require_no_nulls(a_mz, "mz", fragments, row_base)?;
-        require_no_nulls(a_int, "predicted_intensity", fragments, row_base)?;
-        require_no_nulls(cols[3].as_ref(), "name", fragments, row_base)?;
-        // Same contract as the precursor columns, applied batch by batch. A
-        // non-finite fragment m/z is worse than a wrong value: `FragIndex::build`
-        // collapses its whole m/z range when the observed min or max is not finite,
-        // which clamps every real fragment into one bin and turns the probe into a
-        // linear scan of the entire posting list. A non-finite predicted_intensity
-        // sorts ahead of every real value under `total_cmp`, so it is preferentially
-        // selected for quantification.
-        if let Some(k) = a_mz.values().iter().position(|x| !x.is_finite()) {
-            anyhow::bail!(
-                "library column 'mz' has a non-finite value ({}) for candidate_id {} in \
-                 {fragments}; a Parquet NULL decodes to NaN, and a NaN here silently \
-                 means \"matches everything\" downstream rather than an error. Fix or \
-                 drop the row",
-                a_mz.value(k),
-                a_cid.value(k)
-            );
-        }
-        if let Some(k) = a_int.values().iter().position(|x| !x.is_finite()) {
-            anyhow::bail!(
-                "library column 'predicted_intensity' has a non-finite value ({}) for \
-                 candidate_id {} in {fragments}; a Parquet NULL decodes to NaN, and a \
-                 NaN here sorts ahead of every real intensity. Fix or drop the row",
-                a_int.value(k),
-                a_cid.value(k)
-            );
+        // NULLs in every required column: the finiteness checks below run on physical
+        // buffers, where a NULL is a perfectly finite 0.0, and the fill used to turn NULLs
+        // into NaN and "" instead of refusing them (docs/29 #2).
+        //
+        // Finiteness is the same contract as the precursor columns, applied batch by
+        // batch. A non-finite fragment m/z is worse than a wrong value: `FragIndex::build`
+        // collapses its whole m/z range when the observed min or max is not finite, which
+        // clamps every real fragment into one bin and turns the probe into a linear scan
+        // of the entire posting list. A non-finite predicted_intensity sorts ahead of every
+        // real value under `total_cmp`, so it is preferentially selected for
+        // quantification.
+        //
+        // Every check finds the first row it fails on, and the batch is refused on the
+        // SMALLEST of those rows, a tie going to the check listed first (a NULL before a
+        // non-finite value at the same row, whose physical value means nothing). Refusing
+        // check by check instead -- every NULL of the batch before any non-finite value --
+        // names a later row whenever a batch holds two kinds of defect, and which row it
+        // names depends on where the batch boundaries fall, which differs between the
+        // serial pass and the parted one. This way both report the first defective row of
+        // the file.
+        let first = [
+            first_null(a_cid),
+            first_null(a_mz),
+            first_null(a_int),
+            first_null(cols[3].as_ref()),
+            first_null_dict_value(cols[3].as_ref(), &name),
+            a_mz.values().iter().position(|x| !x.is_finite()),
+            a_int.values().iter().position(|x| !x.is_finite()),
+        ]
+        .into_iter()
+        .enumerate()
+        .filter_map(|(check, row)| row.map(|row| (row, check)))
+        .min();
+        if let Some((k, check)) = first {
+            match check {
+                0 => require_no_nulls(a_cid, "candidate_id", fragments, row_base)?,
+                1 => require_no_nulls(a_mz, "mz", fragments, row_base)?,
+                2 => require_no_nulls(a_int, "predicted_intensity", fragments, row_base)?,
+                3 => require_no_nulls(cols[3].as_ref(), "name", fragments, row_base)?,
+                4 => anyhow::bail!(
+                    "fragment column 'name' has a NULL dictionary value at row {} in {fragments}",
+                    row_base + k
+                ),
+                5 => anyhow::bail!(
+                    "library column 'mz' has a non-finite value ({}) for candidate_id {} in \
+                     {fragments}; a Parquet NULL decodes to NaN, and a NaN here silently \
+                     means \"matches everything\" downstream rather than an error. Fix or \
+                     drop the row",
+                    a_mz.value(k),
+                    a_cid.value(k)
+                ),
+                _ => anyhow::bail!(
+                    "library column 'predicted_intensity' has a non-finite value ({}) for \
+                     candidate_id {} in {fragments}; a Parquet NULL decodes to NaN, and a \
+                     NaN here sorts ahead of every real intensity. Fix or drop the row",
+                    a_int.value(k),
+                    a_cid.value(k)
+                ),
+            }
         }
         Ok(FragBatch {
             cid: a_cid,
@@ -2259,6 +2325,121 @@ mod tests {
                         assert_eq!(par.frag_name_id, serial.frag_name_id, "{what}: name ids");
                         assert_eq!(par.frag_name_dict, serial.frag_name_dict, "{what}: dict");
                     }
+                }
+            }
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Two defects of DIFFERENT kinds inside one 65,536-row serial batch, with a part
+    /// boundary between them: the serial pass sees both in one batch and the parted pass
+    /// in two parts. Both must refuse the table on the first bad row (row 10), not on the
+    /// kind of defect a batch happens to check first.
+    #[test]
+    fn a_batch_is_refused_on_its_first_bad_row_whatever_the_kind_of_defect() {
+        use arrow::array::{Float32Array, Float64Array, StringArray, UInt32Array};
+        use arrow::datatypes::{DataType, Field, Schema};
+        let dir = unique_dir("first_bad_row");
+        std::fs::create_dir_all(&dir).unwrap();
+        let n = 62_000usize;
+        let (early, late) = (10usize, 60_000usize);
+        assert!(late < FRAG_BATCH_ROWS, "both defects in one serial batch");
+        // 30,000-row groups: the parted pass cuts between the two defects.
+        let write = |tag: &str, fault: &str| -> String {
+            let f = dir
+                .join(format!("{tag}.parquet"))
+                .to_str()
+                .unwrap()
+                .to_string();
+            let mut cid: Vec<Option<u32>> = (0..n).map(|i| Some((i / 10) as u32)).collect();
+            let mut mz: Vec<Option<f64>> = (0..n).map(|i| Some(200.0 + i as f64 * 1e-3)).collect();
+            let mut int: Vec<Option<f32>> = vec![Some(1.0); n];
+            let mut name: Vec<Option<&str>> = vec![Some("y1"); n];
+            match fault {
+                // Pass 1: an out-of-range id early, a NULL id late.
+                "oor_then_null_cid" => {
+                    cid[early] = Some(999_999);
+                    cid[late] = None;
+                }
+                // Pass 1, the other way round.
+                "null_cid_then_oor" => {
+                    cid[early] = None;
+                    cid[late] = Some(999_999);
+                }
+                // Pass 2: a non-finite intensity early, a NULL m/z late.
+                "nan_int_then_null_mz" => {
+                    int[early] = Some(f32::NAN);
+                    mz[late] = None;
+                }
+                // Pass 2: a non-finite m/z early, a NULL name late.
+                "inf_mz_then_null_name" => {
+                    mz[early] = Some(f64::INFINITY);
+                    name[late] = None;
+                }
+                // Pass 2: a NULL intensity early, a non-finite m/z late.
+                "null_int_then_nan_mz" => {
+                    int[early] = None;
+                    mz[late] = Some(f64::NAN);
+                }
+                other => panic!("unknown fault {other}"),
+            }
+            let schema = std::sync::Arc::new(Schema::new(vec![
+                Field::new("candidate_id", DataType::UInt32, true),
+                Field::new("mz", DataType::Float64, true),
+                Field::new("predicted_intensity", DataType::Float32, true),
+                Field::new("name", DataType::Utf8, true),
+            ]));
+            let batch = arrow::record_batch::RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    std::sync::Arc::new(UInt32Array::from(cid)),
+                    std::sync::Arc::new(Float64Array::from(mz)),
+                    std::sync::Arc::new(Float32Array::from(int)),
+                    std::sync::Arc::new(StringArray::from(name)),
+                ],
+            )
+            .unwrap();
+            let mut w =
+                mumdia_io::table::BatchWriter::with_row_group_rows(&f, schema, 30_000).unwrap();
+            w.write(&batch).unwrap();
+            w.close().unwrap();
+            f
+        };
+        let ncand = n / 10;
+        for (fault, expect) in [
+            (
+                "oor_then_null_cid",
+                "fragment row 10 references candidate_id 999999",
+            ),
+            ("null_cid_then_oor", "'candidate_id' has a NULL at row 10"),
+            (
+                "nan_int_then_null_mz",
+                "'predicted_intensity' has a non-finite value",
+            ),
+            ("inf_mz_then_null_name", "'mz' has a non-finite value"),
+            (
+                "null_int_then_nan_mz",
+                "'predicted_intensity' has a NULL at row 10",
+            ),
+        ] {
+            let f = write(fault, fault);
+            for payload in [true, false] {
+                let msg = |parts: usize| match load_fragments(&f, 0, ncand, false, parts, payload) {
+                    Ok(_) => panic!("{fault}: the bad rows must be refused"),
+                    Err(e) => format!("{e:#}"),
+                };
+                let serial = msg(1);
+                assert!(
+                    serial.contains(expect),
+                    "{fault} payload={payload}: the serial pass must name the first bad row, \
+                     got {serial}"
+                );
+                for parts in [2usize, 3] {
+                    assert_eq!(
+                        msg(parts),
+                        serial,
+                        "{fault} payload={payload} parts={parts}"
+                    );
                 }
             }
         }
