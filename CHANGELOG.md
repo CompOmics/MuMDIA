@@ -162,7 +162,10 @@ than a number. Both are recorded in every run's `manifest.json`.
 - **Parquet columns are encoded in parallel.** Every writer encodes a row group's columns
   concurrently on a dedicated codec pool (at most 8 threads, `--threads` when it is lower,
   serial at `--threads 1` or `MUMDIA_PARQUET_THREADS=1`) and appends them in schema order,
-  which writes the serial writer's file byte for byte. Encoding the AIF features table took
+  which writes the serial writer's file byte for byte. The codec pool is a second pool
+  beside the global one: `--threads N` now bounds the global pool at N and the codec pool
+  at min(N, 8), and the two can be busy at once, so a run can keep up to N + min(N, 8)
+  threads busy; `MUMDIA_PARQUET_THREADS=1` restores the previous bound. Encoding the AIF features table took
   0.14 s on 8 threads against 0.45 s, the competed table 0.16 against 0.42 s, the
   chromatograms 4.4 against 8.1 s. Writers called from inside a rayon pool keep encoding on
   their own thread, and so does a writer that finds as many callers already waiting on the

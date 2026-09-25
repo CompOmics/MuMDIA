@@ -252,7 +252,14 @@ refused rather than reproduced; no writer here sets either.
 The work runs on a dedicated rayon pool, never the global one. Its size is
 `MUMDIA_PARQUET_THREADS` when set (0 or 1 is serial), else `--threads` capped at
 8 (`set_codec_threads`, called by the CLI; `--threads 1` is serial), else the
-machine's parallelism capped at 8. A writer called from inside any rayon pool
+machine's parallelism capped at 8. `--threads N` therefore bounds two pools
+separately, the global pool at N and the codec pool at min(N, 8), and the codec
+pool works for plain writer and loader threads while the global pool is busy
+(extract's chromatogram writer encodes while the candidate loop scores, the
+features writer while the chunk workers compute). Up to N + min(N, 8) threads
+can then be busy at once. `MUMDIA_PARQUET_THREADS=1` makes the codec serial,
+which brings a run back to N threads plus its few plain writer and loader
+threads, as before the codec pool. A writer called from inside any rayon pool
 encodes on its own thread instead: rayon lets a worker that waits on another
 pool steal jobs of its own pool meanwhile, and such a job could take a lock the
 writer's caller holds. The parallel path is therefore used from plain threads

@@ -31,9 +31,14 @@ struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
 
-    /// Maximum worker threads. Default: every core.
+    /// Worker threads of the engine's thread pools. Default: every core.
     ///
-    /// Bounds the engine's rayon pool and is forwarded to the Python sidecars as
+    /// Sets the engine's rayon pool to N threads and the parquet codec pool to
+    /// min(N, 8) threads, serial at N = 1 (docs/03_io_layer.md, "Parallel column
+    /// codec"). The codec pool encodes and decodes artifacts for writer and loader
+    /// threads that run beside the rayon pool, so up to N + min(N, 8) threads can be
+    /// busy at once; add `MUMDIA_PARQUET_THREADS=1` to keep the parquet codec serial
+    /// and the run near N threads. N is also forwarded to the Python sidecars as
     /// `MUMDIA_NN_THREADS` and `OMP_NUM_THREADS` unless those are already set.
     /// Without this there was no way to bound MuMDIA at all except the
     /// undocumented `RAYON_NUM_THREADS`, which the engine never read and which
@@ -89,7 +94,9 @@ fn apply_threads(threads: Option<usize>) -> Result<()> {
         .num_threads(n)
         .build_global()
         .map_err(|e| anyhow::anyhow!("cannot set --threads {n}: {e}"))?;
-    // The parquet codec's own pool: at most `n` threads, none at `--threads 1`.
+    // The parquet codec's own pool: min(n, 8) threads, none at `--threads 1`. It is a
+    // second pool beside the global one, used from plain writer and loader threads while
+    // the global pool works, so the two together can keep n + min(n, 8) threads busy.
     mumdia_io::codec::set_codec_threads(n);
     for var in ["MUMDIA_NN_THREADS", "OMP_NUM_THREADS"] {
         if std::env::var_os(var).is_none() {
