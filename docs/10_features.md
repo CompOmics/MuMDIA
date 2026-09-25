@@ -667,7 +667,7 @@ variant no longer exists).
 | `bound_peak_grace` | 0 | consecutive sub-threshold scans to bridge before stopping (0 = stop at first miss; 1 bridges a single-scan dip) |
 | `bound_from_confident` | true | learn one global left/right half-width from the confident seed set and apply it to every candidate; false = per-candidate detection |
 | `bound_confident_pct` | 50.0 | percentile of the confident-set half-widths taken as the global half-width (50 = median) |
-| `chrom_loaders` | 3 | chromatogram decode threads in the main pass (see "The chunked pass" below); changes time and memory only, never a value or a byte of the features table |
+| `chrom_loaders` | 3 | chromatogram decode threads in the main pass, an upper bound that `--threads` and the chunk count also cap (see "The chunked pass" below); changes time and memory only, never a value or a byte of the features table |
 
 Note that the fragment tolerance used inside `mass_accuracy` is a hardcoded
 `FRAG_TOL_PPM = 20.0` (`mass_accuracy.rs:44`), not `prec_tol_ppm`; Evidence does
@@ -686,7 +686,10 @@ chunk passes three stages on their own threads:
    table of its own (`load_chunk`). A loader may claim chunk `j` only while
    `j < taken + loaders`, where `taken` counts the chunks the computation has
    taken, so at most `chrom_loaders + 1` chunks are resident; one loader is the
-   previous single-loader bound of two. Loaders beyond the first come from a
+   previous single-loader bound of two. The setting is an upper bound: a pass
+   runs no more loaders than it has chunks or than the engine's thread pool has
+   threads (`main_loaders_wanted`), so `--threads 1` decodes on one loader as it
+   did before the loaders were parallel. Loaders beyond the first come from a
    process-wide pool of four (`MAIN_LOADER_EXTRAS`), so concurrent bands or runs
    share it rather than multiply it.
 2. **Computation.** The calling thread takes the chunks strictly in table order
@@ -698,11 +701,20 @@ chunk passes three stages on their own threads:
 
 Because a chunk's rows are fixed by the plan and the computation takes chunks in
 order, every `write_cols` call receives the same columns at every loader count:
-the features table is byte-identical
-(`the_loader_count_moves_no_byte_of_the_features_table` checks 1, 2, 3 and 7
-loaders, including zero-row chunks). A failed chunk is handed over in order like
-any other, so the error surfaces at the same chunk as with one loader; a loader
-panic stops the pass and is reported rather than waited on.
+the features table is byte-identical.
+`the_loader_count_moves_no_byte_of_the_features_table` checks 1, 2, 3 and 7
+loaders exactly (bypassing the shared pool, so no arm can quietly run one) and
+the production leased path, on a chromatogram table with 64-row groups so that
+chunk spans start inside a row group, cover several and share a boundary group
+with the next chunk, and with one PSM per chunk for the zero-row chunks. A
+failed chunk is handed over in order like any other, so the error surfaces at
+the same chunk as with one loader; a loader panic stops the pass, and the
+computation reports that no loader is left rather than waiting (the thread scope
+then re-raises the panic, as it did for the single loader). Both are tested with
+an injected failure at chunk 3 while chunk 2 is still decoding on another
+loader: chunks 0 to 2 arrive intact and in order, then the failure, and no table
+is published (`a_loader_failure_reaches_the_computation_in_chunk_order_and_never_hangs`,
+`a_loader_failure_mid_pass_publishes_nothing`).
 
 Every pass logs one `features: pass timers` line: loader busy and blocked time
 (summed over loaders), the computation's wait for the loaders, per-PSM compute,

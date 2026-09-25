@@ -1174,11 +1174,13 @@ pub struct FeaturesConfig {
     /// feature value and the features table bytes are the same at every setting; only the
     /// time and the memory move. The pass holds up to `chrom_loaders + 1` decoded chunks
     /// (0.92 GiB of traces each at the HYE benchmark shape, docs/27 section 3.4), where one
-    /// loader held two. Loaders beyond each pass's first come from a process-wide pool of
-    /// four, so concurrent bands or runs (`groups.parallel`, `experiment.parallel_runs`)
-    /// share that pool instead of multiplying it. Default 3; `1` restores the single
-    /// loader and `0` is read as `1`. A memory knob and a speed knob, not a sensitivity
-    /// knob.
+    /// loader held two. The value is an upper bound: a pass never runs more loaders than
+    /// `--threads` (the engine's thread pool) or than it has chunks, so `--threads 1` decodes
+    /// on one loader as before. Loaders beyond each pass's first come from a process-wide
+    /// pool of four, so concurrent bands or runs (`groups.parallel`,
+    /// `experiment.parallel_runs`) share that pool instead of multiplying it. Default 3; `1`
+    /// restores the single loader and `0` is read as `1`. A memory knob and a speed knob,
+    /// not a sensitivity knob.
     pub chrom_loaders: usize,
 }
 impl Default for FeaturesConfig {

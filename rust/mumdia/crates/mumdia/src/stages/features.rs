@@ -2199,6 +2199,7 @@ pub fn run_with_chunk_limits(
         max_psm_rows,
         PinFinish::Normal,
         BoundsSource::Learn,
+        LoaderSource::Leased,
     )
 }
 
@@ -2243,6 +2244,7 @@ pub fn run_with_chunk_rows(p: FeaturesParams, chunk_rows: usize) -> Result<u64> 
         CHUNK_PSM_ROWS,
         PinFinish::Normal,
         BoundsSource::Learn,
+        LoaderSource::Leased,
     )
 }
 
@@ -2267,6 +2269,7 @@ pub fn run_with_bounds(p: FeaturesParams, bounds: Option<(f64, f64)>) -> Result<
         CHUNK_PSM_ROWS,
         PinFinish::Normal,
         BoundsSource::Given(bounds),
+        LoaderSource::Leased,
     )
 }
 
@@ -2346,6 +2349,49 @@ const MAIN_LOADER_EXTRAS: usize = 4;
 static MAIN_LOADER_BUDGET: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(MAIN_LOADER_EXTRAS);
 
+/// The main pass's loader request before the pool lease: `features.chrom_loaders` (at
+/// least one), and no more than there are chunks to decode or threads in the rayon pool.
+/// The pool is what `--threads` sizes, so a run held to one thread decodes on one loader,
+/// as it did before the loaders were parallel, instead of adding decode threads the
+/// thread budget did not grant. Under `groups.parallel` or `experiment.parallel_runs` the
+/// pool is the whole pool, and [`MAIN_LOADER_EXTRAS`] is the bound that applies there.
+fn main_loaders_wanted(chrom_loaders: usize, chunks: usize, threads: usize) -> usize {
+    chrom_loaders.max(1).min(chunks.max(1)).min(threads.max(1))
+}
+
+/// How a main pass gets its loaders.
+#[derive(Clone, Copy)]
+enum LoaderSource {
+    /// Every production call: [`main_loaders_wanted`], the loaders beyond the first
+    /// leased from [`MAIN_LOADER_BUDGET`], so a pass may run fewer than it asked for.
+    Leased,
+    /// Exactly `loaders` loaders (capped by the chunk count only), nothing leased, and an
+    /// optional injected failure. Tests use it so that a test of the multi-loader
+    /// hand-over cannot quietly run one loader because another test in the same process
+    /// holds the shared pool, and so that the failure paths can be driven on purpose.
+    #[cfg(test)]
+    Exact {
+        loaders: usize,
+        fault: Option<LoadFault>,
+    },
+}
+
+/// A failure injected into one chunk's decode ([`LoaderSource::Exact`]).
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+struct LoadFault {
+    /// The chunk whose decode fails.
+    at: usize,
+    /// Panic in the loader instead of returning an error.
+    panic: bool,
+    /// Hold chunk `at - 1`'s decode until the failure at `at` has stopped the pass, so
+    /// the failure lands while the chunk before it is still being decoded: the
+    /// out-of-order case the in-order hand-over exists for. Needs two loaders or more
+    /// (with one, chunk `at` is only claimed after `at - 1`); the hold gives up after ten
+    /// seconds so a wrong setup fails its test instead of hanging it.
+    hold_prev: bool,
+}
+
 /// Decode one planned chunk (`n_rows` chromatogram rows from `first`) on its own, from
 /// its row span, with a fragment-name table of its own.
 ///
@@ -2393,6 +2439,8 @@ struct ChunkLoader<'a> {
     loaders: usize,
     state: std::sync::Mutex<LoadState>,
     cv: std::sync::Condvar,
+    #[cfg(test)]
+    fault: Option<LoadFault>,
 }
 
 /// [`ChunkLoader`]'s shared state; see there.
@@ -2430,6 +2478,53 @@ impl<'a> ChunkLoader<'a> {
                 live: loaders.max(1),
             }),
             cv: std::sync::Condvar::new(),
+            #[cfg(test)]
+            fault: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_fault(mut self, fault: Option<LoadFault>) -> ChunkLoader<'a> {
+        self.fault = fault;
+        self
+    }
+
+    /// The injected failure's effect on chunk `j` before its decode: hold it (see
+    /// [`LoadFault::hold_prev`]) or panic.
+    #[cfg(test)]
+    fn inject_before(&self, j: usize) {
+        let Some(f) = self.fault else { return };
+        if f.hold_prev && j + 1 == f.at {
+            let deadline = Instant::now() + std::time::Duration::from_secs(10);
+            let mut st = self.lock();
+            while !st.stop {
+                let Some(left) = deadline.checked_duration_since(Instant::now()) else {
+                    break;
+                };
+                st = self
+                    .cv
+                    .wait_timeout(st, left)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .0;
+            }
+        }
+        if f.panic && j == f.at {
+            panic!("features: injected loader panic at chunk {j}");
+        }
+    }
+
+    /// The injected failure's effect on chunk `j`'s decode result.
+    #[cfg(test)]
+    fn inject_after(
+        &self,
+        j: usize,
+        r: Result<(ChromChunk, NameTab)>,
+    ) -> Result<(ChromChunk, NameTab)> {
+        match self.fault {
+            Some(f) if !f.panic && j == f.at => {
+                Err(anyhow!("features: injected load failure at chunk {j}"))
+            }
+            _ => r,
         }
     }
 
@@ -2491,8 +2586,12 @@ impl<'a> ChunkLoader<'a> {
                 debug_assert!(st.next - st.taken <= self.loaders);
                 st.next - 1
             };
+            #[cfg(test)]
+            self.inject_before(j);
             let busy = Instant::now();
             let r = load_chunk(self.ch, self.first[j], self.rows[j]);
+            #[cfg(test)]
+            let r = self.inject_after(j, r);
             timers.add(&timers.loader_busy_ns, busy);
             let mut st = self.lock();
             if r.is_err() {
@@ -2624,6 +2723,7 @@ fn run_chunked(
     max_psm_rows: usize,
     pin_finish: PinFinish,
     bounds: BoundsSource,
+    loaders: LoaderSource,
 ) -> Result<u64> {
     let t0 = Instant::now();
     let ps = TableFile::open(p.psms)?;
@@ -2883,12 +2983,29 @@ fn run_chunked(
             Some(first)
         })
         .collect();
-    let want_loaders = p.cfg.chrom_loaders.max(1).min(chunks.len().max(1));
-    // Loaders beyond the first come from the process-wide pool; this pass's own first loader
-    // is never leased, so a pass always runs even when the pool is empty.
-    let extra_lease = DecoderLease::take_from(&MAIN_LOADER_BUDGET, want_loaders - 1);
-    let n_loaders = 1 + extra_lease.granted();
+    let (extra_lease, n_loaders) = match loaders {
+        LoaderSource::Leased => {
+            let want = main_loaders_wanted(
+                p.cfg.chrom_loaders,
+                chunks.len(),
+                rayon::current_num_threads(),
+            );
+            // Loaders beyond the first come from the process-wide pool; this pass's own
+            // first loader is never leased, so a pass always runs even when the pool is
+            // empty.
+            let lease = DecoderLease::take_from(&MAIN_LOADER_BUDGET, want - 1);
+            let n = 1 + lease.granted();
+            (Some(lease), n)
+        }
+        #[cfg(test)]
+        LoaderSource::Exact { loaders, .. } => (None, loaders.max(1).min(chunks.len().max(1))),
+    };
     let loader = ChunkLoader::new(&ch, &chunk_first, &chunk_rows, n_loaders);
+    #[cfg(test)]
+    let loader = loader.with_fault(match loaders {
+        LoaderSource::Exact { fault, .. } => fault,
+        LoaderSource::Leased => None,
+    });
     let timers = PassTimers::default();
     let pass_start = Instant::now();
     let rows = std::thread::scope(|sc| -> Result<u64> {
@@ -6058,6 +6175,9 @@ mod tests {
         }
     }
 
+    /// Extract's chromatogram row-group size (`extract.rs` `CHROM_ROW_GROUP_ROWS`).
+    const EXTRACT_CHROM_GROUP_ROWS: usize = 1 << 16;
+
     /// A PRODUCTION-SHAPED Extended fixture for the per-PSM kernels: mostly 12 fragments
     /// on ~150-240-point shared grids (the HYE shape), with every degenerate case the
     /// kernels branch on mixed in: 0 to 11 fragments, 1- to 12-point grids, predicted but
@@ -6069,7 +6189,15 @@ mod tests {
     /// `craft_extended_inputs` has at most five fragments and ten points, so it never
     /// reaches the body of an 11-lag cross-correlation nor a pair matrix of the size the
     /// kernels are tuned for; this one does, which is what the kernel golden below needs.
-    fn craft_kernel_inputs(dir: &std::path::Path, n_cand: u32) -> (String, String) {
+    ///
+    /// `chrom_group_rows` is the chromatogram table's row-group size: extract's 65,536 for
+    /// the golden and the benchmark, a small one where a test needs chunk spans that start
+    /// inside a row group, cover several and share a boundary group with the next chunk.
+    fn craft_kernel_inputs(
+        dir: &std::path::Path,
+        n_cand: u32,
+        chrom_group_rows: usize,
+    ) -> (String, String) {
         let psms = dir
             .join("psms_kernel.parquet")
             .to_string_lossy()
@@ -6274,9 +6402,7 @@ mod tests {
             ],
         )
         .unwrap();
-        // Extract's row-group size, so a benchmark on a large instance of this fixture
-        // decodes the row groups a production table has.
-        let mut w = TableWriter::new(&chrom).with_row_group_rows(1 << 16);
+        let mut w = TableWriter::new(&chrom).with_row_group_rows(chrom_group_rows);
         w.write_cols(vec![
             Col::U32("candidate_id".into(), ccid),
             Col::Str("frag_name".into(), cname),
@@ -6310,7 +6436,9 @@ mod tests {
             .unwrap_or(40_000);
         let dir = std::path::PathBuf::from(out);
         std::fs::create_dir_all(&dir).unwrap();
-        let (psms, chrom) = craft_kernel_inputs(&dir, n);
+        // Extract's row-group size, so a benchmark on a large instance of this fixture
+        // decodes the row groups a production table has.
+        let (psms, chrom) = craft_kernel_inputs(&dir, n, EXTRACT_CHROM_GROUP_ROWS);
         eprintln!("wrote {psms} and {chrom} ({n} candidates)");
     }
 
@@ -6339,7 +6467,7 @@ mod tests {
         };
         let dir = std::env::temp_dir().join("mumdia_features_kernel_golden");
         std::fs::create_dir_all(&dir).unwrap();
-        let (psms, chrom) = craft_kernel_inputs(&dir, 400);
+        let (psms, chrom) = craft_kernel_inputs(&dir, 400, EXTRACT_CHROM_GROUP_ROWS);
         let mut h = 0xcbf2_9ce4_8422_2325u64;
         let arms: [(&str, bool, BoundsSource); 3] = [
             ("percand", true, BoundsSource::Learn),
@@ -6373,6 +6501,7 @@ mod tests {
                 usize::MAX,
                 PinFinish::Normal,
                 bounds,
+                LoaderSource::Leased,
             )
             .unwrap();
             let (rows, ncols, digest) = features_digest(&out);
@@ -6489,6 +6618,49 @@ mod tests {
         assert!(n_charge.iter().all(|&v| (1.0..=3.0).contains(&v)));
     }
 
+    /// The kernel fixture's chunk plan: `(first chromatogram row, rows)` per chunk.
+    fn kernel_chunk_plan(
+        psms: &str,
+        chrom: &str,
+        chunk_rows: usize,
+        max_psm_rows: usize,
+    ) -> (Vec<usize>, Vec<usize>) {
+        let cid = TableFile::open(psms).unwrap().u32("candidate_id").unwrap();
+        let ch_cid = TableFile::open(chrom).unwrap().u32("candidate_id").unwrap();
+        let chunks = plan_chunks(&cid, &ch_cid, chrom, chunk_rows, max_psm_rows).unwrap();
+        let rows: Vec<usize> = chunks.iter().map(|c| c.chrom_rows).collect();
+        let first: Vec<usize> = rows
+            .iter()
+            .scan(0usize, |acc, &n| {
+                let f = *acc;
+                *acc += n;
+                Some(f)
+            })
+            .collect();
+        (first, rows)
+    }
+
+    #[test]
+    fn main_loaders_follow_the_thread_budget_and_the_chunk_count() {
+        // (chrom_loaders, chunks, threads) -> loaders requested before the pool lease.
+        for (cfg, chunks, threads, want) in [
+            (3, 10, 32, 3),
+            (3, 10, 1, 1), // `--threads 1` decodes on one loader, as before F1
+            (3, 10, 2, 2),
+            (3, 2, 32, 2),  // never more loaders than chunks
+            (3, 0, 32, 1),  // an empty plan still gets its one loader
+            (0, 10, 32, 1), // 0 is read as 1
+            (7, 10, 0, 1),
+            (1, 10, 32, 1),
+        ] {
+            assert_eq!(
+                main_loaders_wanted(cfg, chunks, threads),
+                want,
+                "chrom_loaders {cfg}, {chunks} chunks, {threads} threads"
+            );
+        }
+    }
+
     #[test]
     fn the_loader_count_moves_no_byte_of_the_features_table() {
         // `features.chrom_loaders` decodes chunks on several threads from their own row
@@ -6498,24 +6670,61 @@ mod tests {
         // chunkings: chromatogram-row chunks, and one PSM per chunk, which makes the
         // zero-row chunks of the PSMs that have no chromatogram rows (`load_chunk` returns
         // an empty chunk for those without opening a span).
+        //
+        // The loader counts are EXACT here (`LoaderSource::Exact`). The production path
+        // leases every loader beyond the first from a process-wide pool that another test
+        // in this process may be holding, and an arm that quietly ran one loader would
+        // compare one loader against one. The production path is the last arm. The
+        // chromatogram table has 64-row groups, so the ~150-row chunk spans start inside a
+        // row group, cover several, and share their boundary group with the next chunk,
+        // which two loaders then decode at the same time.
+        const GROUP: usize = 64;
         let dir = std::env::temp_dir().join("mumdia_features_loaders");
         std::fs::create_dir_all(&dir).unwrap();
-        let (psms, chrom) = craft_kernel_inputs(&dir, 120);
+        let (psms, chrom) = craft_kernel_inputs(&dir, 120, GROUP);
         for (tag, chunk_rows, max_psm_rows) in [("rows", 150usize, usize::MAX), ("psm", 1 << 20, 1)]
         {
-            let mut hashes: Vec<(usize, String)> = Vec::new();
-            for loaders in [1usize, 2, 3, 7] {
+            let (first, rows) = kernel_chunk_plan(&psms, &chrom, chunk_rows, max_psm_rows);
+            assert!(
+                rows.len() >= 7,
+                "chunking {tag}: {} chunks cannot keep seven loaders busy",
+                rows.len()
+            );
+            if tag == "rows" {
+                let inside = (0..rows.len())
+                    .filter(|&j| first[j] >= GROUP && first[j] % GROUP != 0)
+                    .count();
+                let multi = rows.iter().filter(|&&n| n > 2 * GROUP).count();
+                assert!(
+                    inside > 0 && multi > 0,
+                    "the plan must reach the span decode's hard cases: {inside} spans start \
+                     inside a later row group (and so share it with the chunk before), \
+                     {multi} cover several groups"
+                );
+            }
+            let exact = |loaders: usize| LoaderSource::Exact {
+                loaders,
+                fault: None,
+            };
+            let arms = [
+                ("1", exact(1)),
+                ("2", exact(2)),
+                ("3", exact(3)),
+                ("7", exact(7)),
+                ("leased", LoaderSource::Leased),
+            ];
+            let mut hashes: Vec<(&str, String)> = Vec::new();
+            for (arm, loaders) in arms {
                 let out = dir
-                    .join(format!("features_{tag}_{loaders}.parquet"))
+                    .join(format!("features_{tag}_{arm}.parquet"))
                     .to_string_lossy()
                     .to_string();
                 let cfg = FeaturesConfig {
                     set: FeatureSet::Extended,
                     bound_from_confident: false,
-                    chrom_loaders: loaders,
                     ..Default::default()
                 };
-                run_with_chunk_limits(
+                run_chunked(
                     FeaturesParams {
                         psms: &psms,
                         chromatograms: &chrom,
@@ -6527,16 +6736,209 @@ mod tests {
                     },
                     chunk_rows,
                     max_psm_rows,
+                    PinFinish::Normal,
+                    BoundsSource::Learn,
+                    loaders,
                 )
                 .unwrap();
-                hashes.push((loaders, mumdia_io::hash::blake3_file(&out).unwrap()));
+                hashes.push((arm, mumdia_io::hash::blake3_file(&out).unwrap()));
             }
-            for (loaders, h) in &hashes[1..] {
+            for (arm, h) in &hashes[1..] {
                 assert_eq!(
                     h, &hashes[0].1,
-                    "chunking {tag}: {loaders} loaders wrote different bytes than one"
+                    "chunking {tag}: loaders '{arm}' wrote different bytes than one"
                 );
             }
+        }
+    }
+
+    /// What [`ChunkLoader::take`] handed over for one chunk.
+    #[derive(Debug, PartialEq)]
+    enum Took {
+        /// Decoded: the chunk's candidate ids, fragment and MS1 row counts, payload bytes
+        /// and axis values (as bits).
+        Chunk(Vec<u32>, usize, usize, (usize, usize), Vec<u32>),
+        Err,
+        /// No loader was left to park it.
+        Gone,
+    }
+
+    impl Took {
+        fn of(c: &ChromChunk) -> Took {
+            Took::Chunk(
+                c.cids.clone(),
+                c.frag.nrows(),
+                c.ms1.nrows(),
+                c.payload_bytes(),
+                c.axis_vals.iter().map(|v| v.to_bits()).collect(),
+            )
+        }
+    }
+
+    /// The kernel fixture's failure setup: 60 candidates, 64-row groups, ~100-row chunks.
+    fn fault_fixture(tag: &str) -> (std::path::PathBuf, String, String) {
+        let dir = std::env::temp_dir().join(format!("mumdia_features_loader_fault_{tag}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (psms, chrom) = craft_kernel_inputs(&dir, 60, 64);
+        (dir, psms, chrom)
+    }
+
+    /// The chunk a fault test fails; three loaders, so chunk `FAULT_AT - 1` can still be
+    /// decoding when it fails.
+    const FAULT_AT: usize = 3;
+
+    #[test]
+    fn a_loader_failure_reaches_the_computation_in_chunk_order_and_never_hangs() {
+        // The in-order hand-over under a failure that lands OUT of order: chunk 3 fails (an
+        // error, or a loader panic) while chunk 2 is still being decoded on another loader
+        // (`LoadFault::hold_prev` keeps it there until the failure has stopped the pass).
+        // The computation must still receive chunks 0, 1 and 2 intact and in order, each
+        // exactly as a lone sequential decode of it gives, then the failure at chunk 3: the
+        // error itself, or, after a panic, the report that no loader is left. Never a hang.
+        // Driven on `ChunkLoader` directly, with exactly three loaders.
+        let (_dir, psms, chrom) = fault_fixture("order");
+        let (first, rows) = kernel_chunk_plan(&psms, &chrom, 100, usize::MAX);
+        assert!(rows.len() > FAULT_AT + 1, "{} chunks", rows.len());
+        let ch = TableFile::open(&chrom).unwrap();
+        let seq: Vec<Took> = (0..FAULT_AT)
+            .map(|j| Took::of(&load_chunk(&ch, first[j], rows[j]).unwrap().0))
+            .collect();
+        for panic in [false, true] {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let (chrom, first, rows) = (chrom.clone(), first.clone(), rows.clone());
+            std::thread::spawn(move || {
+                let ch = TableFile::open(&chrom).unwrap();
+                let fault = LoadFault {
+                    at: FAULT_AT,
+                    panic,
+                    hold_prev: true,
+                };
+                let loader = ChunkLoader::new(&ch, &first, &rows, 3).with_fault(Some(fault));
+                let timers = PassTimers::default();
+                let got = std::thread::scope(|sc| {
+                    let release = loader.release_on_drop();
+                    let handles: Vec<_> = (0..3)
+                        .map(|_| {
+                            let (loader, timers) = (&loader, &timers);
+                            sc.spawn(move || loader.run(timers))
+                        })
+                        .collect();
+                    let mut took = Vec::new();
+                    for j in 0..rows.len() {
+                        let t = match loader.take(j) {
+                            Some(Ok((c, _))) => Took::of(&c),
+                            Some(Err(_)) => Took::Err,
+                            None => Took::Gone,
+                        };
+                        let stop = !matches!(t, Took::Chunk(..));
+                        took.push(t);
+                        if stop {
+                            break;
+                        }
+                    }
+                    drop(release);
+                    // Joined here, so a panicked loader is counted instead of re-raised by
+                    // the scope.
+                    let panicked = handles.into_iter().filter_map(|h| h.join().err()).count();
+                    (took, panicked)
+                });
+                let _ = tx.send(got);
+            });
+            let (took, panicked) = rx
+                .recv_timeout(std::time::Duration::from_secs(60))
+                .unwrap_or_else(|e| panic!("panic={panic}: the hand-over hung ({e})"));
+            assert_eq!(took.len(), FAULT_AT + 1, "panic={panic}: {took:?}");
+            assert_eq!(
+                &took[..FAULT_AT],
+                &seq[..],
+                "panic={panic}: the chunks before the failure"
+            );
+            let want = if panic { Took::Gone } else { Took::Err };
+            assert_eq!(took[FAULT_AT], want, "panic={panic}: the failed chunk");
+            assert_eq!(panicked, usize::from(panic), "loaders that panicked");
+        }
+    }
+
+    #[test]
+    fn a_loader_failure_mid_pass_publishes_nothing() {
+        // The same out-of-order failure through the whole pass, three loaders: the stage
+        // must come back (an error for a decode error; for a loader panic the scope
+        // re-raises it after joining, as the single loader's panic was re-raised before
+        // the loaders were parallel), and the previous features table must stay exactly as
+        // it was, with no temp file left behind.
+        let (dir, psms, chrom) = fault_fixture("pass");
+        let (_, rows) = kernel_chunk_plan(&psms, &chrom, 100, usize::MAX);
+        assert!(rows.len() > FAULT_AT + 1, "{} chunks", rows.len());
+        let out = dir
+            .join("features_fault.parquet")
+            .to_string_lossy()
+            .to_string();
+        let go = |psms: &str, chrom: &str, out: &str, fault: Option<LoadFault>| {
+            let cfg = FeaturesConfig {
+                set: FeatureSet::Extended,
+                bound_from_confident: false,
+                ..Default::default()
+            };
+            run_chunked(
+                FeaturesParams {
+                    psms,
+                    chromatograms: chrom,
+                    seed: None,
+                    out,
+                    out_pin: "",
+                    cfg: &cfg,
+                    config_hash: "test",
+                },
+                100,
+                usize::MAX,
+                PinFinish::Normal,
+                BoundsSource::Learn,
+                LoaderSource::Exact { loaders: 3, fault },
+            )
+        };
+        go(&psms, &chrom, &out, None).expect("the good run must succeed");
+        let good = mumdia_io::hash::blake3_file(&out).unwrap();
+        for panic in [false, true] {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let (p2, c2, o2) = (psms.clone(), chrom.clone(), out.clone());
+            std::thread::spawn(move || {
+                let fault = LoadFault {
+                    at: FAULT_AT,
+                    panic,
+                    hold_prev: true,
+                };
+                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    go(&p2, &c2, &o2, Some(fault))
+                }));
+                let _ = tx.send(match r {
+                    Ok(Ok(_)) => "ok",
+                    Ok(Err(_)) => "error",
+                    Err(_) => "panic",
+                });
+            });
+            let got = rx
+                .recv_timeout(std::time::Duration::from_secs(60))
+                .unwrap_or_else(|e| panic!("panic={panic}: the stage hung ({e})"));
+            if panic {
+                assert_ne!(got, "ok", "a loader panic must fail the stage");
+            } else {
+                assert_eq!(got, "error", "a decode error must be the stage's error");
+            }
+            assert_eq!(
+                mumdia_io::hash::blake3_file(&out).unwrap(),
+                good,
+                "panic={panic}: a failed pass must leave the previous table as it was"
+            );
+            let leftovers: Vec<_> = std::fs::read_dir(&dir)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().to_string())
+                .filter(|n| n.contains("features_fault.parquet.tmp-"))
+                .collect();
+            assert!(
+                leftovers.is_empty(),
+                "panic={panic}: temp files left behind: {leftovers:?}"
+            );
         }
     }
 
@@ -6681,6 +7083,7 @@ mod tests {
             CHUNK_PSM_ROWS,
             PinFinish::Normal,
             BoundsSource::Learn,
+            LoaderSource::Leased,
         )
         .expect("the good run must succeed");
         let good = mumdia_io::hash::blake3_file(&out).unwrap();
@@ -6691,6 +7094,7 @@ mod tests {
             CHUNK_PSM_ROWS,
             PinFinish::Fail,
             BoundsSource::Learn,
+            LoaderSource::Leased,
         )
         .expect_err("a PIN that cannot be flushed must fail the stage");
         assert!(
