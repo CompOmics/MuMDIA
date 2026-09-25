@@ -808,7 +808,7 @@ moves to another function.
 | `MUMDIA_NN_WARM_START` | sidecar | `0` | `scripts/nn_rescore_worker.py::main` |
 | `MUMDIA_NN_WD` | sidecar | `1e-4` | `scripts/nn_rescore_worker.py::main` |
 | `MUMDIA_PARQUET_COMPRESSION` | engine | computed: snappy. `zstd`, or `uncompressed` / `none`, changes the codec (`table.rs` `codec`) | `rust/mumdia/crates/mumdia-io/src/table.rs::codec` |
-| `MUMDIA_PARQUET_DECODE_THREADS` | engine | computed: automatic column groups, up to the codec pool's threads; one reader for a coalesced scan or inside a rayon pool. `k` asks for k groups, `1` is one reader (`table.rs` `automatic_decode_groups`) | `rust/mumdia/crates/mumdia-io/src/table.rs::TableFile::scan` |
+| `MUMDIA_PARQUET_DECODE_THREADS` | engine | computed: automatic column groups, up to the codec pool's threads; one reader for a coalesced scan or inside a rayon pool. `k` asks for k groups, `1` is one reader (`table.rs` `automatic_decode_groups`) | `rust/mumdia/crates/mumdia-io/src/table.rs::TableFile::scan_spec` |
 | `MUMDIA_PARQUET_PLAN` | engine | computed: on (capped writers plan their float encodings). `0` / `off` / `false` / `no` restores the unplanned layout (`table.rs` `plan_enabled`) | `rust/mumdia/crates/mumdia-io/src/table.rs::plan_enabled` |
 | `MUMDIA_PARQUET_THREADS` | engine | computed: min(`--threads`, 8), or min(cores, 8) without `--threads`. `0` or `1` is serial (`codec.rs` `codec_threads`) | `rust/mumdia/crates/mumdia-io/src/codec.rs::codec_threads` |
 | `MUMDIA_PEPTDEEP_DEVICE` | sidecar | `"auto"` | `scripts/peptdeep_worker.py::main` |
