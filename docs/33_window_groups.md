@@ -306,8 +306,8 @@ as before.
 
 Refitting per band is sound because the multi-head ridge and the base-model re-prediction
 are deterministic in their anchors: the same pooled anchors give the same head selection,
-the same ridge and the same predictions, so every band carries one model, at the cost of
-one anchor pass per band (seconds). The optional DeepLC fine-tune is not deterministic and
+the same ridge and the same predictions, so every band carries one model. What it costs is
+one DeepLC worker per band, which section 4b below removes. The optional DeepLC fine-tune is not deterministic and
 would be trained once per band, so a grouped run refuses `rt_im_train.finetune_deeplc`;
 fine-tune the library once beforehand (`docs/08_rt_im_train.md`, once per library) and
 search that table.
@@ -317,6 +317,59 @@ one pooling pass cheaper and every group is independent, but each group fits on 
 of the anchors, and the fit quality sets the RT window that the extract of every group then
 pays for. On the CI fixture it cannot fit at all (no band has a confident anchor, for the
 `1/T` reason above); on a real run every band has thousands.
+
+### 4b. One retention-time adaptation per run (`groups.rt_adaptation`)
+
+The per-band refit above is sound but not cheap. Each band's DeepLC sidecar starts an
+interpreter, imports torch and DeepLC, reads the pooled seed, refits the same heads on the
+same anchors (head 2503 in every band of the HYE sweep), and predicts every sequence of its
+own band. The charge states of one peptidoform sit at `(M + z * 1.007) / z`, which differ by
+a factor of at least 1.33, so they usually fall in different bands and each of those bands
+predicts the sequence again: the 10.9M HYE precursor rows are 4.91M unique sequences
+unbanded. Measured on HYE Astral (2026-09-24), the multi-head step took about 13 min
+unbanded and 19-24 min at 2-16 bands.
+
+`groups.rt_adaptation = once_per_run` (default `per_band`, the behaviour before the setting
+existed) runs one worker per run under `calibration = global`:
+`deeplc_finetune.py - <seed> - --bands <tsv>`, where `groups/rt_bands.tsv` lists every
+band's table and output. The worker fits the multi-head calibration once, predicts the union
+of the bands' unique sequences once, in the order the bands list them, and rewrites each band
+with the rule a single table gets, writing `groups/gNN/lib_precursors_multihead.parquet` (or
+`_deeplc` for the base-model re-prediction) and its `.summary.json` under the names a
+per-band run uses. The shared-band reuse of later runs, `seed_pool::refresh_irt` and the
+manifest records are therefore unchanged. `per_group` keeps one sidecar per band, fitted on
+the band's own anchors.
+
+The setting also covers a re-prediction the caller has already made. With the multi-head
+calibration off and `library_irt` resolving to DeepLC, `run-experiment` re-predicts the
+imported library once for the whole experiment, and each band of each run then re-predicted
+its slice of that table again, because `experiment.rt_library_scope` shares only an
+adaptation (a fine-tune or the multi-head calibration). Under `once_per_run` the bands keep
+the experiment-level values (`GroupRun::library_irt_repredicted`); under `per_band` they
+re-predict as before.
+
+Output effect: float-equivalent to `per_band`, not bit-identical. A sequence is predicted
+once, in different company from its per-band prediction, and torch's CPU kernels round by
+batch. Measured on the smoke fixture with DeepLC 4.5.0 on CPU (3,820 precursors, 4 threads):
+
+| | `per_band` | `once_per_run` |
+|---|---|---|
+| 3 bands, multi-head 80: sequences predicted | 2,954 (1,174 + 1,310 + 470) | 1,910 |
+| same, wall of the run | 25 s | 12 s |
+| same, selected heads | identical | identical |
+| same, largest per-row change of `predicted_irt` | | 0.87 s |
+| same, PSMs at `q_value` 1% / peptides at `peptide_q_value` 5% | 154 / 152 | 156 / 152 |
+| `run-experiment`, 2 runs of 2 bands, multi-head off: wall | 39 s | 9 s |
+| same, bands re-predicted | 4 | 0 |
+| same, largest change of a band value against the experiment-level one | 6.1e-5 s | 0 |
+
+On a synthetic library one `--bands` call over contiguous bands writes exactly the
+whole-library column band by band, under both the multi-head calibration and the base model
+(`tests/python/test_deeplc_predict.py`,
+`test_bands_write_the_whole_library_column_band_by_band`), so the union call reproduces what
+an unbanded run predicts. Before defaulting it on: the per-band max |delta `predicted_irt`|
+and the selected heads against `per_band`, and peptides at 1% on a banded HYE arm inside the
+seed spread, on two acquisitions.
 
 ## 5. The artifact pool
 

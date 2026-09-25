@@ -1918,6 +1918,23 @@ pub enum GroupCalibration {
     PerGroup,
 }
 
+/// How often a grouped run adapts the library's retention times (the multi-head calibration
+/// or the base-model re-prediction) under `groups.calibration = global`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum GroupRtAdaptation {
+    /// One DeepLC sidecar per band, each fitting the pooled anchors and predicting its own
+    /// band. The behaviour before this setting existed.
+    #[default]
+    PerBand,
+    /// One sidecar per run over the union of the bands: the calibration is fitted once, each
+    /// unique sequence is predicted once, and every band's table is written under the name
+    /// a per-band run gives it. A library the caller already re-predicted with the base
+    /// model (`run-experiment` with the multi-head calibration off) is not re-predicted per
+    /// band again.
+    OncePerRun,
+}
+
 /// Searching a run one isolation-window group at a time.
 ///
 /// A group of isolation windows can only select precursors whose m/z lies in the group's
@@ -1954,6 +1971,30 @@ pub struct GroupsConfig {
     /// probing and the run deadlocks. A larger value is clamped to `threads - 1` with a
     /// warning rather than hanging.
     pub parallel: usize,
+    /// How often the library's retention times are adapted under `calibration = global`:
+    /// `per_band` (the default) runs one DeepLC sidecar per band, `once_per_run` one per run
+    /// over the union of the bands. `per_group` calibration always adapts per band.
+    ///
+    /// Each per-band sidecar starts an interpreter, imports torch and DeepLC, reads the
+    /// pooled seed, refits the same heads on the same anchors (head 2503 in every band of
+    /// the HYE sweep) and predicts every sequence of its band, so a sequence whose charge
+    /// states fall in two bands is predicted twice (10.9M HYE rows are 4.91M unique
+    /// sequences). On HYE Astral the multi-head step took about 13 min unbanded and 19-24
+    /// min at 2-16 bands. `once_per_run` fits once, predicts the union once and writes each
+    /// band's table under the name a per-band run gives it
+    /// (`groups/gNN/lib_precursors_multihead.parquet` or `lib_precursors_deeplc.parquet`),
+    /// so the shared-band reuse of later runs and the seed refresh are unchanged. Under
+    /// `run-experiment` with the multi-head calibration off, the library is re-predicted
+    /// once for the experiment, and the bands then keep those values instead of each band
+    /// of each run re-predicting them.
+    ///
+    /// Float-equivalent, not bit-identical: a sequence is predicted in different company,
+    /// and torch's CPU kernels round by batch. On a synthetic library, one call over
+    /// contiguous bands writes exactly the whole-library column band by band
+    /// (`tests/python/test_deeplc_predict.py`). Validate on two acquisitions (peptides at
+    /// 1% inside the seed spread, the per-band max |delta predicted_irt| and the selected
+    /// heads) before defaulting it on.
+    pub rt_adaptation: GroupRtAdaptation,
 }
 impl Default for GroupsConfig {
     fn default() -> Self {
@@ -1961,6 +2002,7 @@ impl Default for GroupsConfig {
             window_groups: 1,
             calibration: GroupCalibration::Global,
             parallel: 1,
+            rt_adaptation: GroupRtAdaptation::PerBand,
         }
     }
 }
@@ -3040,6 +3082,17 @@ mod tests {
         assert_eq!(c.rt_im_train.deeplc_predict_shards, 8);
         let auto = Config::from_json(r#"{"rt_im_train":{"deeplc_predict_shards":0}}"#).unwrap();
         assert_eq!(auto.rt_im_train.deeplc_predict_shards, 0);
+    }
+
+    #[test]
+    fn the_banded_rt_adaptation_defaults_to_per_band_and_parses() {
+        assert_eq!(
+            Config::default().groups.rt_adaptation,
+            GroupRtAdaptation::PerBand
+        );
+        let c = Config::from_json(r#"{"groups":{"rt_adaptation":"once_per_run"}}"#).unwrap();
+        assert_eq!(c.groups.rt_adaptation, GroupRtAdaptation::OncePerRun);
+        assert!(Config::from_json(r#"{"groups":{"rt_adaptation":"sometimes"}}"#).is_err());
     }
 
     #[test]

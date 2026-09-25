@@ -20,6 +20,11 @@ Usage:
       (engine path for rt_im_train.library_irt = deeplc: predict with the DeepLC base
       model, no seed needed; per-run LOESS calibration then maps the predictions onto
       observed RT)
+  python deeplc_finetune.py - <seed_psms|-> - --bands <pairs.tsv> (--multihead N | --no-finetune)
+      (engine path for groups.rt_adaptation = once_per_run: several band tables, one line
+      `lib_in<TAB>lib_out` each. The calibration is fitted once, the union of the bands'
+      unique sequences is predicted once, and every band is written with the rewrite a
+      single table gets; see `read_band_pairs`)
 
 Both torch pools (--threads for training, --predict-threads for the whole-library
 prediction) are capped at the physical cores available to the process: the distinct
@@ -655,6 +660,15 @@ def main():
                          "with threads. Each child is a Python process with torch and DeepLC "
                          "loaded (about 0.57 GB; the model itself about 35 MB). One process "
                          "when a GPU is available." % SHARD_AUTO_THREADS)
+    ap.add_argument("--bands", metavar="TSV", default=None,
+                    help="predict several band tables in one process: one line "
+                         "'lib_in<TAB>lib_out' per band, and the positional lib_in and "
+                         "lib_out are '-'. The multi-head calibration is fitted once, the "
+                         "union of the bands' unique sequences is predicted once (in the "
+                         "order the bands list them), and each band is written with the "
+                         "rewrite a single table gets, with its own <lib_out>.summary.json. "
+                         "With --multihead or --no-finetune only: a fine-tune is refused "
+                         "for banded runs by the engine.")
     ap.add_argument("--predict-chunk", type=int, default=PREDICT_CHUNK, metavar="N",
                     help="unique peptidoforms per prediction call (default %d). Shards are "
                          "cut at multiples of it. Changing it changes how DeepLC batches the "
@@ -718,9 +732,18 @@ def main():
     # Wall time per phase, in seconds, for the summary (survey P0). None where a phase did
     # not run or could not be measured.
     timings = {}
+    band_pairs = read_band_pairs(args) if args.bands else None
     t_phase = time.perf_counter()
-    lib = pq.read_table(args.lib_in)
-    orig = np.asarray(lib.column("predicted_irt"), dtype=np.float32)
+    if band_pairs is None:
+        lib = pq.read_table(args.lib_in)
+        orig = np.asarray(lib.column("predicted_irt"), dtype=np.float32)
+    else:
+        # Only the sequences now; each band's whole table is read when it is written.
+        lib = orig = None
+        band_bases = [
+            library_bases(pq.read_table(src, columns=["peptidoform"]).column("peptidoform"))
+            for src, _ in band_pairs
+        ]
     timings["read_library"] = round(time.perf_counter() - t_phase, 3)
 
     if args.multihead and args.no_finetune:
@@ -767,8 +790,18 @@ def main():
     # fine-tuned onto the same iRT scale as targets (shift-decoys reuse their target's
     # prediction; reverse-decoys get their reversed-sequence prediction).
     t_phase = time.perf_counter()
-    bases = library_bases(lib.column("peptidoform"))
-    uniq = unique_standard_bases(bases)
+    if band_pairs is None:
+        bases = library_bases(lib.column("peptidoform"))
+        uniq = unique_standard_bases(bases)
+        band_pos = None
+    else:
+        # The union over the bands, in the order the bands list the sequences, and every
+        # band row's position in it. A sequence shared by bands (charge states of one
+        # peptidoform fall in different m/z bands; window overlaps put rows in two) is
+        # predicted once instead of once per band.
+        bases = None
+        uniq, band_pos = union_positions(band_bases)
+        del band_bases
     if args.predict_limit:
         uniq = uniq.slice(0, args.predict_limit)
     timings["unique"] = round(time.perf_counter() - t_phase, 3)
@@ -816,7 +849,8 @@ def main():
         ft_model = base_model = None
         gc.collect()
         values, per_shard = predict_sharded(
-            uniq, n_shards, shard_threads, chunk, fitted, args.lib_out)
+            uniq, n_shards, shard_threads, chunk, fitted,
+            args.lib_out if band_pairs is None else band_pairs[0][1])
         shard_record["per_shard"] = per_shard
         # Summed over the shards, so these are process-seconds rather than wall time.
         for key in ("featurisation", "forward"):
@@ -827,6 +861,13 @@ def main():
           f"(featurisation {_fmt_s(timings['featurisation'])}, "
           f"forward pass {_fmt_s(timings['forward'])}"
           f"{', summed over shards' if n_shards > 1 else ''})", flush=True)
+
+    if band_pairs is not None:
+        write_bands(band_pairs, band_pos, uniq, values, which, thread_record, shard_record,
+                    timings,
+                    multihead_record(calibration, args.multihead, len(ref_psms))
+                    if calibration is not None else None)
+        return
 
     t_phase = time.perf_counter()
     new, summary = rewrite_irt(bases, orig, uniq, values)
@@ -877,6 +918,119 @@ def multihead_record(calibration, requested, anchors):
         "best_head": None if best is None else int(best),
         "ridge_alpha": None if alpha is None else float(alpha),
     }
+
+
+def read_band_pairs(args):
+    """The `(lib_in, lib_out)` pairs of `--bands`, validated against the other arguments.
+
+    One line per band, `lib_in<TAB>lib_out`; blank lines are skipped. The positional
+    lib_in and lib_out must be '-', so a call cannot mean both a single table and a band
+    list. A fine-tune is refused: the engine trains no fine-tune for a banded run, and one
+    fitted here would be applied to every band without that decision being made.
+    """
+    if args.lib_in != "-" or args.lib_out != "-":
+        raise SystemExit("--bands takes its tables from the TSV; pass '-' for the "
+                         "positional lib_in and lib_out")
+    if not (args.multihead or args.no_finetune):
+        raise SystemExit("--bands needs --multihead N or --no-finetune; a fine-tune is not "
+                         "supported for band tables")
+    pairs = []
+    with open(args.bands, encoding="utf-8") as fh:
+        for n, line in enumerate(fh, 1):
+            line = line.rstrip("\r\n")
+            if not line.strip():
+                continue
+            parts = line.split("\t")
+            if len(parts) != 2 or not all(parts):
+                raise SystemExit(f"{args.bands}:{n}: expected 'lib_in<TAB>lib_out', got {line!r}")
+            pairs.append((parts[0], parts[1]))
+    if not pairs:
+        raise SystemExit(f"{args.bands} lists no band")
+    outs = [o for _, o in pairs]
+    if len(set(outs)) != len(outs):
+        raise SystemExit(f"{args.bands} writes the same output twice")
+    return pairs
+
+
+def union_positions(band_bases):
+    """The union of the bands' standard sequences and each band row's position in it.
+
+    `band_bases` holds each band's DECOY_-stripped sequences (`library_bases`). The union
+    is `unique_standard_bases` over the bands' rows in band order, so for a single band it
+    is exactly the set, in exactly the order, a single-table call predicts. Positions come
+    from one `index_in` over all the rows against the union, rather than one hash table per
+    band, and are split back by band: -1 where a row's sequence is not in the union
+    (non-standard residues), which is what `rewrite_irt` calls not found.
+    """
+    chunks = [c.cast(pa.large_string()) for b in band_bases for c in b.chunks]
+    if not chunks:
+        return pa.array([], pa.large_string()), [np.empty(0, dtype=np.int64)
+                                                  for _ in band_bases]
+    all_bases = pa.chunked_array(chunks, type=pa.large_string())
+    uniq = unique_standard_bases(all_bases)
+    pos = pc.fill_null(pc.index_in(all_bases, value_set=uniq), -1)
+    pos = np.asarray(pos.to_numpy(), dtype=np.int64)
+    out, start = [], 0
+    for b in band_bases:
+        out.append(pos[start:start + len(b)])
+        start += len(b)
+    return uniq, out
+
+
+def write_bands(band_pairs, band_pos, uniq, values, which, thread_record, shard_record,
+                timings, multihead):
+    """Rewrite and write every band of a `--bands` call, each with its own summary.
+
+    Each band's table is read whole, its `predicted_irt` rewritten from the union's
+    predictions by the same rule as a single table (`rewrite_positions`), and written with
+    the same writer. Each `<lib_out>.summary.json` carries the band's own counts and the
+    shared model, thread, shard and timing records, plus `bands` (how many, which one, and
+    the size of the union that was predicted).
+    """
+    t_rewrite = t_write = 0.0
+    totals = {"rows": 0, "repredicted": 0, "retained_imported": 0}
+    summaries = []
+    for j, ((src, dst), pos) in enumerate(zip(band_pairs, band_pos)):
+        t_phase = time.perf_counter()
+        lib = pq.read_table(src)
+        orig = np.asarray(lib.column("predicted_irt"), dtype=np.float32)
+        if len(orig) != len(pos):
+            raise SystemExit(f"{src} changed while it was being predicted: {len(orig)} rows "
+                             f"now, {len(pos)} when its sequences were read")
+        new, summary = rewrite_positions(orig, pos, values, len(uniq))
+        t_rewrite += time.perf_counter() - t_phase
+        t_phase = time.perf_counter()
+        idx = lib.schema.get_field_index("predicted_irt")
+        lib = lib.set_column(idx, "predicted_irt", pa.array(new, pa.float32()))
+        pq.write_table(lib, dst)
+        del lib
+        t_write += time.perf_counter() - t_phase
+        summary["model"] = which
+        summary["lib_in"] = src
+        summary["lib_out"] = dst
+        summary["unique_predicted"] = len(uniq)
+        summary["bands"] = {"count": len(band_pairs), "index": j, "union_unique": len(uniq)}
+        summaries.append(summary)
+        for k in totals:
+            totals[k] += summary[k]
+    timings["rewrite"] = round(t_rewrite, 3)
+    timings["write"] = round(t_write, 3)
+    for summary in summaries:
+        summary["torch_threads"] = thread_record
+        summary["shards"] = shard_record
+        summary["timings_s"] = timings
+        if multihead is not None:
+            summary["multihead"] = multihead
+        with open(summary["lib_out"] + ".summary.json", "w", encoding="utf-8") as fh:
+            json.dump(summary, fh, indent=2)
+    print(f"wrote {len(band_pairs)} band libraries with re-predicted iRT ({which}), "
+          f"{len(uniq)} unique sequences predicted once for all of them")
+    print(f"  rows={totals['rows']} repredicted={totals['repredicted']} "
+          f"retained_imported={totals['retained_imported']}")
+    if totals["retained_imported"]:
+        print(f"WARNING: {totals['retained_imported']} of {totals['rows']} band rows keep "
+              f"their imported iRT, which is on the imported model's scale, not {which}'s; "
+              f"the counts are in each band's <lib_out>.summary.json", flush=True)
 
 
 def _fmt_s(value):
@@ -1201,7 +1355,6 @@ def rewrite_irt(bases, orig, uniq, values):
     R6). The counts and the column are what the per-row dictionary lookup gave; only the
     lookup moved into Arrow (`index_in`), so a 1e7-row library is not walked in Python.
     """
-    n = len(bases)
     probe, value_set = bases, uniq
     try:
         # `index_in` needs one string type on both sides. The library column is usually
@@ -1212,6 +1365,17 @@ def rewrite_irt(bases, orig, uniq, values):
         probe = bases.cast(pa.large_string())
     pos = pc.fill_null(pc.index_in(probe, value_set=value_set), -1)
     pos = np.asarray(pos.to_numpy(), dtype=np.int64)
+    return rewrite_positions(orig, pos, values, len(uniq))
+
+
+def rewrite_positions(orig, pos, values, n_uniq):
+    """`rewrite_irt` from each row's position in the predicted set (-1 = not in it).
+
+    A position at or past `n_uniq` counts as not found, which is what a set cut short by
+    `--predict-limit` gives a sequence past the limit.
+    """
+    n = len(orig)
+    pos = np.where(pos < n_uniq, pos, -1)
     found = pos >= 0
     vals = np.full(n, np.nan, dtype=np.float64)
     vals[found] = values[pos[found]]

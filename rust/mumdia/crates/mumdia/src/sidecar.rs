@@ -504,6 +504,109 @@ pub fn run_deeplc_repredict(
     Ok(())
 }
 
+/// What a band-list DeepLC call ([`run_deeplc_bands`]) does to every band.
+pub enum BandAdaptation<'a> {
+    /// The multi-head calibration against `seed`, fitted once for all the bands.
+    Multihead {
+        seed: &'a str,
+        n_heads: usize,
+        q_train: f64,
+        window_holdout_frac: f64,
+    },
+    /// The base-model re-prediction.
+    Repredict,
+}
+
+/// One DeepLC worker for all the bands of a grouped run (`groups.rt_adaptation =
+/// once_per_run`): `deeplc_finetune.py - <seed|-> - --bands <tsv>`, where `tsv` lists
+/// `lib_in<TAB>lib_out` per band. The worker fits the calibration once, predicts the union
+/// of the bands' unique sequences once, and writes each `lib_out` with the rewrite a
+/// single-table call applies, each with its own `<lib_out>.summary.json`. `threads` and
+/// `shards` mean what they mean for [`run_deeplc_multihead`].
+pub fn run_deeplc_bands(
+    python: &str,
+    script: &str,
+    pairs: &[(String, String)],
+    tsv: &str,
+    mode: BandAdaptation,
+    threads: usize,
+    shards: usize,
+) -> Result<()> {
+    require_deeplc_version(python)?;
+    if pairs.is_empty() {
+        bail!("no band to adapt");
+    }
+    let mut body = String::new();
+    for (lib_in, lib_out) in pairs {
+        if lib_in.contains(['\t', '\n', '\r']) || lib_out.contains(['\t', '\n', '\r']) {
+            bail!("a band path contains a tab or a line break: {lib_in} -> {lib_out}");
+        }
+        body.push_str(lib_in);
+        body.push('\t');
+        body.push_str(lib_out);
+        body.push('\n');
+    }
+    std::fs::write(tsv, body).with_context(|| format!("writing the band list {tsv}"))?;
+    let th = threads.max(1).to_string();
+    let sh = shards.to_string();
+    let (nh, qt, hf);
+    let mut args: Vec<&str> = Vec::new();
+    match mode {
+        BandAdaptation::Multihead {
+            seed,
+            n_heads,
+            q_train,
+            window_holdout_frac,
+        } => {
+            nh = n_heads.to_string();
+            qt = q_train.to_string();
+            hf = window_holdout_frac.to_string();
+            info!(
+                bands = pairs.len(),
+                seed,
+                n_heads,
+                q_train,
+                threads,
+                shards,
+                "sidecar: calibrating DeepLC over multiple heads once for every band"
+            );
+            args.extend_from_slice(&[
+                "-",
+                seed,
+                "-",
+                "--bands",
+                tsv,
+                "--multihead",
+                &nh,
+                "--q-train",
+                &qt,
+                "--window-holdout-frac",
+                &hf,
+            ]);
+        }
+        BandAdaptation::Repredict => {
+            info!(
+                bands = pairs.len(),
+                threads,
+                shards,
+                "sidecar: re-predicting the band libraries' iRT with the DeepLC base model \
+                 in one pass"
+            );
+            args.extend_from_slice(&["-", "-", "-", "--bands", tsv, "--no-finetune"]);
+        }
+    }
+    args.extend_from_slice(&["--threads", &th, "--predict-threads", &th]);
+    push_shards(&mut args, shards, &sh);
+    run_worker(python, script, &args, true).context("DeepLC band adaptation failed")?;
+    for (_, lib_out) in pairs {
+        if !std::path::Path::new(lib_out).exists() {
+            bail!("the DeepLC band worker exited 0 but wrote no {lib_out}");
+        }
+        warn_on_retained_imported(lib_out);
+    }
+    Ok(())
+}
+
 /// Append `--shards <n>` for a sharded whole-library prediction
 /// (`rt_im_train.deeplc_predict_shards`). One process, the default, passes nothing, so the
 /// default argument list is the one an older `deeplc_finetune.py` accepts.

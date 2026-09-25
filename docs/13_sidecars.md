@@ -391,6 +391,20 @@ start. Whether sharding is faster at all is open: on that desktop the forward pa
 dominated and scaled with threads, so four processes of two threads were no faster than
 one of eight (`docs/08_rt_im_train.md`, "Sharded whole-library prediction").
 
+**Band lists** (`groups.rt_adaptation = once_per_run`, `--bands <tsv>`). A grouped run
+under global calibration can adapt all its bands in one call:
+`deeplc_finetune.py - <seed|-> - --bands <tsv> (--multihead N | --no-finetune)`, where
+each TSV line is `lib_in<TAB>lib_out` and the positional `lib_in` and `lib_out` are `-`.
+The worker reads each band's `peptidoform` column, fits the calibration once, predicts the
+union of the bands' unique standard sequences once (`union_positions`: the same
+`unique_standard_bases` over the bands' rows in band order, then one `index_in` of every row
+against it), and rewrites each band from those positions with the rule a single table gets
+(`rewrite_positions`, which `rewrite_irt` now calls too). Each `lib_out` gets its own
+`.summary.json` with the band's counts, the shared model, thread, shard and timing records,
+and `bands` (`count`, `index`, `union_unique`). A fine-tune is refused in this mode. Sharding
+applies to the union prediction as it does to one table. The engine side is
+`sidecar::run_deeplc_bands`; `docs/33_window_groups.md` section 4b has the measurements.
+
 **DeepLC thread cap.** Every DeepLC call site asks for the engine's rayon thread count
 (the fine-tune's training pool keeps its own bound), and both workers cap what they
 give torch at the physical cores available to the process: on Linux the physical cores

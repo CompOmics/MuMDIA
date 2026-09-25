@@ -177,7 +177,8 @@ def test_the_physical_core_count_is_plausible():
 # ------------------------------------------------ the Arrow unique set and rewrite
 
 ARROW_NAMES = ["STD", "MOD_RE", "strip_mods", "base_pf", "DECOY_PREFIX_RE", "STD_FULL_RE"]
-ARROW_FUNCS = ["is_std", "library_bases", "unique_standard_bases", "rewrite_irt"]
+ARROW_FUNCS = ["is_std", "library_bases", "unique_standard_bases", "rewrite_irt",
+               "rewrite_positions", "union_positions"]
 
 
 def _arrow_helpers():
@@ -289,6 +290,89 @@ def test_the_arrow_unique_set_and_rewrite_equal_the_per_row_loop(predict_limit):
         "retained_no_prediction": counts["nonfinite"],
     }
     assert counts["nonfinite"] > 0 and counts["none"] > 0, "the fixture lost a case"
+
+
+def test_the_band_union_rewrites_every_band_as_the_whole_library_would():
+    """`--bands`: one union over the bands, and each band rewritten from its positions.
+
+    Cut into contiguous bands in library order, the union is the whole library's unique
+    set in the same order, so every band's rewritten column is exactly its slice of the
+    whole library's, and the per-band counts add up to the whole library's counts. A band
+    that repeats another band's rows (a window overlap) adds nothing to the union.
+    """
+    h = _arrow_helpers()
+    np, pa = h["np"], h["pa"]
+    rng = np.random.default_rng(5)
+    pform = _library_peptidoforms(rng)
+    orig = rng.uniform(0, 100, len(pform)).astype(np.float32)
+    whole = pa.chunked_array([pa.array(pform, pa.string())])
+    bases = h["library_bases"](whole)
+    uniq = h["unique_standard_bases"](bases)
+    values = rng.normal(50, 20, len(uniq))
+    values[::13] = np.nan
+    new_whole, s_whole = h["rewrite_irt"](bases, orig, uniq, values)
+
+    cuts = [0, 120, 121, 500, len(pform)]
+    band_bases = [h["library_bases"](pa.chunked_array([pa.array(pform[a:b], pa.string())]))
+                  for a, b in zip(cuts, cuts[1:])]
+    union, band_pos = h["union_positions"](band_bases)
+    assert union.to_pylist() == uniq.to_pylist(), "the union is not the library's unique set"
+    totals = {k: 0 for k in s_whole}
+    for (a, b), pos in zip(zip(cuts, cuts[1:]), band_pos):
+        new_b, s_b = h["rewrite_positions"](orig[a:b], pos, values, len(union))
+        assert np.array_equal(new_b.view(np.uint32), new_whole[a:b].view(np.uint32))
+        for k in totals:
+            totals[k] += s_b[k]
+    assert totals == s_whole
+
+    # An overlap: the last band repeats the first 50 rows. The union does not grow, and the
+    # repeated rows get the same values the first band gave them.
+    overlap = band_bases + [h["library_bases"](pa.chunked_array([pa.array(pform[:50],
+                                                                          pa.string())]))]
+    union2, pos2 = h["union_positions"](overlap)
+    assert union2.to_pylist() == uniq.to_pylist()
+    new_o, _ = h["rewrite_positions"](orig[:50], pos2[-1], values, len(union2))
+    assert np.array_equal(new_o.view(np.uint32), new_whole[:50].view(np.uint32))
+
+    # A limit on the predicted set: positions past it count as not found, as they do for
+    # a single table.
+    lim = 40
+    new_l, s_l = h["rewrite_irt"](bases, orig, uniq.slice(0, lim), values[:lim])
+    new_p, s_p = h["rewrite_positions"](orig, np.concatenate(band_pos), values[:lim], lim)
+    assert np.array_equal(new_l.view(np.uint32), new_p.view(np.uint32))
+    assert s_l == s_p
+
+
+def test_the_band_list_is_validated_before_anything_is_read(tmp_path):
+    source = _module_source(["read_band_pairs"])
+    ns = {}
+    exec(compile(source, "deeplc_finetune.py", "exec"), ns)  # noqa: S102
+
+    class Args:
+        lib_in = lib_out = "-"
+        multihead = 80
+        no_finetune = False
+
+    tsv = tmp_path / "bands.tsv"
+    tsv.write_text("a.parquet\tb.parquet\n\nc.parquet\td.parquet\r\n", encoding="utf-8")
+    Args.bands = str(tsv)
+    assert ns["read_band_pairs"](Args) == [("a.parquet", "b.parquet"), ("c.parquet", "d.parquet")]
+    for bad, why in [
+        ("a.parquet\n", "expected"),
+        ("a\tb\tc\n", "expected"),
+        ("a\tb\nc\tb\n", "same output twice"),
+        ("\n", "no band"),
+    ]:
+        tsv.write_text(bad, encoding="utf-8")
+        with pytest.raises(SystemExit, match=why):
+            ns["read_band_pairs"](Args)
+    tsv.write_text("a\tb\n", encoding="utf-8")
+    Args.lib_in = "x.parquet"
+    with pytest.raises(SystemExit, match="positional"):
+        ns["read_band_pairs"](Args)
+    Args.lib_in, Args.multihead = "-", 0
+    with pytest.raises(SystemExit, match="fine-tune"):
+        ns["read_band_pairs"](Args)
 
 
 def _assigned_constants(script, names):
@@ -546,6 +630,57 @@ def test_a_failed_shard_fails_the_stage_and_writes_nothing(tmp_path):
     assert "prediction shard 2/2 exited with status 7" in (stdout + stderr)
     assert not out.exists()
     assert not list(tmp_path.glob("*.shards.*")), "the shard scratch directory was left behind"
+
+
+@pytest.mark.parametrize("mode", ["base", "multihead"])
+def test_bands_write_the_whole_library_column_band_by_band(tmp_path, mode):
+    """`--bands` over contiguous slices writes what one call over the whole table writes.
+
+    The fit runs once on the same anchors, the union is the whole table's unique set in
+    the same order, so with the same threads and chunks every band's `predicted_irt` is
+    bit for bit its slice of the single-table output. Each band gets its own summary.
+    """
+    _deeplc_or_skip()
+    import numpy as np
+    import pyarrow.parquet as pq
+
+    _write_shard_fixture(tmp_path)
+    lib, seed = tmp_path / "lib.parquet", tmp_path / "seed.parquet"
+    env = {"MUMDIA_DEEPLC_THREAD_CAP": "0", "CUDA_VISIBLE_DEVICES": "-1"}
+    mode_args = {"base": ["--no-finetune"], "multihead": ["--multihead", "80"]}[mode]
+    seed_arg = "-" if mode == "base" else str(seed)
+    common = ["--threads", "1", "--predict-threads", "1", "--predict-chunk", "64"]
+    whole = tmp_path / "whole.parquet"
+    run_worker_ok("deeplc_finetune.py", str(lib), seed_arg, str(whole), *mode_args, *common,
+                  env=env, timeout=1800)
+    table = pq.read_table(str(lib))
+    cuts = [0, 150, 151, 400, table.num_rows]
+    pairs = []
+    for j, (a, b) in enumerate(zip(cuts, cuts[1:])):
+        src = tmp_path / "band{}.parquet".format(j)
+        pq.write_table(table.slice(a, b - a), str(src))
+        pairs.append((src, tmp_path / "band{}_out.parquet".format(j)))
+    tsv = tmp_path / "bands.tsv"
+    tsv.write_text("".join("{}\t{}\n".format(a, b) for a, b in pairs), encoding="utf-8")
+    run_worker_ok("deeplc_finetune.py", "-", seed_arg, "-", "--bands", str(tsv), *mode_args,
+                  *common, env=env, timeout=1800)
+    want = _predicted_irt(whole)
+    got = np.concatenate([_predicted_irt(out) for _, out in pairs])
+    assert (want == got).all(), "{} of {} rows differ".format(int((want != got).sum()),
+                                                            len(want))
+    whole_summary = json.loads((tmp_path / "whole.parquet.summary.json").read_text("utf-8"))
+    total = {k: 0 for k in ("rows", "repredicted", "retained_imported")}
+    for j, (_, out) in enumerate(pairs):
+        s = json.loads((tmp_path / (out.name + ".summary.json")).read_text("utf-8"))
+        assert s["bands"] == {"count": len(pairs), "index": j,
+                              "union_unique": whole_summary["unique_predicted"]}
+        assert s["model"] == whole_summary["model"]
+        for k in total:
+            total[k] += s[k]
+        if mode == "multihead":
+            assert s["multihead"]["heads"] == whole_summary["multihead"]["heads"]
+    for k in total:
+        assert total[k] == whole_summary[k], k
 
 
 # ------------------------------------------------ shard clean-up (no DeepLC needed)

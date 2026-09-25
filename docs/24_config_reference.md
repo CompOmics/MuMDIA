@@ -68,12 +68,12 @@ undocumented on purpose; those fields are counted under "Coverage".
 | [`quant`](#quant) | `QuantConfig` | 17 | [docs/12_quant_lfq_align_mbr_report_audit.md](12_quant_lfq_align_mbr_report_audit.md) |
 | [`mbr`](#mbr) | `MbrConfig` | 9 | [docs/12_quant_lfq_align_mbr_report_audit.md](12_quant_lfq_align_mbr_report_audit.md) |
 | [`experiment`](#experiment) | `ExperimentConfig` | 2 | [docs/01_overview_and_dataflow.md](01_overview_and_dataflow.md) |
-| [`groups`](#groups) | `GroupsConfig` | 3 |  |
+| [`groups`](#groups) | `GroupsConfig` | 4 |  |
 | [`peptidoforms.fixed_mods[] / peptidoforms.variable_mods[]`](#peptidoformsfixed_mods--peptidoformsvariable_mods) | `ResidueMod` | 2 | [docs/05_digest_peptidoforms.md](05_digest_peptidoforms.md) |
 
 ## (top level)
 
-`Config` (rust/mumdia/crates/mumdia-core/src/config.rs:1970). stage document: [docs/02_config_and_data_model.md](02_config_and_data_model.md).
+`Config` (rust/mumdia/crates/mumdia-core/src/config.rs:2012). stage document: [docs/02_config_and_data_model.md](02_config_and_data_model.md).
 
 | Field | Type | Default | Gated | Description |
 |---|---|---|---|---|
@@ -389,7 +389,7 @@ Options for the experiment-wide orchestrator (`mumdia run-experiment`).
 
 ## groups
 
-`GroupsConfig` (rust/mumdia/crates/mumdia-core/src/config.rs:1933).
+`GroupsConfig` (rust/mumdia/crates/mumdia-core/src/config.rs:1950).
 
 Searching a run one isolation-window group at a time. A group of isolation windows can only select precursors whose m/z lies in the group's band, so its seed, calibration, extract, features and compete need only that band of the library (`Library::load_with_fragment_offset`): the library, the hit accumulator and the accepted rows are all one band's worth instead of the whole run's, which is what bounds the memory of a search against a library of 10^8 precursors. Only rescore, quant and report see everything, after the group artifacts are pooled with library-wide ids. The groups run one after another in this process; `docs/33_window_groups.md` has the layout and the measurements.
 
@@ -398,6 +398,7 @@ Searching a run one isolation-window group at a time. A group of isolation windo
 | `window_groups` | `usize` | `1` |  | Number of window groups. `1` (the default) is the ordinary single-library search. Groups are contiguous bands of isolation windows balanced by the number of library precursors they select, read from the precursor table's row-group statistics. |
 | `calibration` | `GroupCalibration` | `global` |  | Anchors for the RT calibration of each group; see `GroupCalibration`. |
 | `parallel` | `usize` | `1` |  | Bands searched at the same time inside one run. `1` (the default) is one band at a time, which is what bounds the memory: each band in flight holds its own extraction working set, so the peak is this many bands' worth. Raise it to fill a large machine, after checking one band's peak RSS: on a 203M-precursor library at 63 bands the largest band took 39 GB and the median far less. Results do not depend on it; bands are independent and their artifacts are pooled in band order either way. The bands go through a bounded queue: this many workers each take the next band as soon as their current one is done, most expensive first (estimated precursors times MS2 peaks of the band's windows for the seed and extract, accepted rows for features and compete), rather than in fixed chunks that waited for their slowest band. It must stay below the thread count: a band in flight parks one worker on its accumulation channel, so as many bands as there are threads leaves nothing to do the probing and the run deadlocks. A larger value is clamped to `threads - 1` with a warning rather than hanging. |
+| `rt_adaptation` | `GroupRtAdaptation` | `per_band` |  | How often the library's retention times are adapted under `calibration = global`: `per_band` (the default) runs one DeepLC sidecar per band, `once_per_run` one per run over the union of the bands. `per_group` calibration always adapts per band. Each per-band sidecar starts an interpreter, imports torch and DeepLC, reads the pooled seed, refits the same heads on the same anchors (head 2503 in every band of the HYE sweep) and predicts every sequence of its band, so a sequence whose charge states fall in two bands is predicted twice (10.9M HYE rows are 4.91M unique sequences). On HYE Astral the multi-head step took about 13 min unbanded and 19-24 min at 2-16 bands. `once_per_run` fits once, predicts the union once and writes each band's table under the name a per-band run gives it (`groups/gNN/lib_precursors_multihead.parquet` or `lib_precursors_deeplc.parquet`), so the shared-band reuse of later runs and the seed refresh are unchanged. Under `run-experiment` with the multi-head calibration off, the library is re-predicted once for the experiment, and the bands then keep those values instead of each band of each run re-predicting them. Float-equivalent, not bit-identical: a sequence is predicted in different company, and torch's CPU kernels round by batch. On a synthetic library, one call over contiguous bands writes exactly the whole-library column band by band (`tests/python/test_deeplc_predict.py`). Validate on two acquisitions (peptides at 1% inside the seed spread, the per-band max \|delta predicted_irt\| and the selected heads) before defaulting it on. |
 
 ## peptidoforms.fixed_mods[] / peptidoforms.variable_mods[]
 
@@ -561,6 +562,17 @@ Which anchors the retention-time calibration of a window group is fitted on.
 |---|---|---|
 | `global` | yes | The confident seed PSMs of every group, pooled (q re-estimated on the union), so each group's LOESS and multi-head fit see the whole run's anchors. The default: a group holds a fraction of the anchors, and the fit quality is what sets the RT window that the extract of every group then pays for. |
 | `per_group` |  | Each group calibrates on its own seeds only. Cheaper by one pooling pass and fully independent per group; kept for the comparison, not as a recommendation. |
+
+### `GroupRtAdaptation`
+
+(rust/mumdia/crates/mumdia-core/src/config.rs:1925)
+
+How often a grouped run adapts the library's retention times (the multi-head calibration or the base-model re-prediction) under `groups.calibration = global`.
+
+| Value | Default | Description |
+|---|---|---|
+| `per_band` | yes | One DeepLC sidecar per band, each fitting the pooled anchors and predicting its own band. The behaviour before this setting existed. |
+| `once_per_run` |  | One sidecar per run over the union of the bands: the calibration is fitted once, each unique sequence is predicted once, and every band's table is written under the name a per-band run gives it. A library the caller already re-predicted with the base model (`run-experiment` with the multi-head calibration off) is not re-predicted per band again. |
 
 ### `Handoff`
 
@@ -738,11 +750,11 @@ listed with the file it is in.
 | Variable | Side | Default in code | Read at |
 |---|---|---|---|
 | `CONDA_PREFIX` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/python.rs:242` |
-| `DEEPLC_FT_THREADS` | sidecar | `"8"` | `scripts/deeplc_finetune.py:41` |
+| `DEEPLC_FT_THREADS` | sidecar | `"8"` | `scripts/deeplc_finetune.py:46` |
 | `MUMDIA_BREW_ITERS` | sidecar | `"20"` | `scripts/mokapot_worker.py:38` |
 | `MUMDIA_CONVERT_THREADS` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/stages/convert.rs:491` |
-| `MUMDIA_DEEPLC_RAW_OUTPUT` | sidecar | `""` | `scripts/deeplc_finetune.py:183`, `scripts/deeplc_worker.py:288` |
-| `MUMDIA_DEEPLC_THREAD_CAP` | sidecar | `"auto"` | `scripts/deeplc_finetune.py:402`, `scripts/deeplc_worker.py:190` |
+| `MUMDIA_DEEPLC_RAW_OUTPUT` | sidecar | `""` | `scripts/deeplc_finetune.py:188`, `scripts/deeplc_worker.py:288` |
+| `MUMDIA_DEEPLC_THREAD_CAP` | sidecar | `"auto"` | `scripts/deeplc_finetune.py:407`, `scripts/deeplc_worker.py:190` |
 | `MUMDIA_ENTRAPMENT_MODEL` | sidecar | `"gbm"` | `scripts/entrapment_worker.py:39` |
 | `MUMDIA_LR_C` | sidecar | `"1.0"` | `scripts/mokapot_worker.py:48` |
 | `MUMDIA_LR_MAX_ITER` | sidecar | `"1000"` | `scripts/mokapot_worker.py:49` |
@@ -818,8 +830,8 @@ one exception noted in its own help text: it sets `MUMDIA_NN_THREADS` and
 
 | Variable | Set by | Value | Site |
 |---|---|---|---|
-| `KMP_DUPLICATE_LIB_OK` | sidecar | `"TRUE"` | `scripts/deeplc_finetune.py:42` |
-| `MKL_NUM_THREADS` | sidecar | `"1"` | `scripts/deeplc_finetune.py:45` |
+| `KMP_DUPLICATE_LIB_OK` | sidecar | `"TRUE"` | `scripts/deeplc_finetune.py:47` |
+| `MKL_NUM_THREADS` | sidecar | `"1"` | `scripts/deeplc_finetune.py:50` |
 | `MUMDIA_NN_FOLDS` | engine | `p.cfg.folds.to_string()` | `rust/mumdia/crates/mumdia/src/stages/rescore.rs:2267` |
 | `MUMDIA_NN_FOLD_KEYS` | engine | `foldkeys` | `rust/mumdia/crates/mumdia/src/stages/rescore.rs:2294` |
 | `MUMDIA_NN_ITERS` | engine | `p.cfg.num_iter.to_string()` | `rust/mumdia/crates/mumdia/src/stages/rescore.rs:2268` |
@@ -832,11 +844,11 @@ one exception noted in its own help text: it sets `MUMDIA_NN_THREADS` and
 | `MUMDIA_NN_TRAIN_SUB` | engine | `p.cfg.train_subsample.to_string()` | `rust/mumdia/crates/mumdia/src/stages/rescore.rs:2282` |
 | `MUMDIA_NN_WARM_EPOCHS` | engine | `p.cfg.train_warm_epochs.to_string()` | `rust/mumdia/crates/mumdia/src/stages/rescore.rs:2291` |
 | `MUMDIA_NN_WARM_START` | engine | `if p.cfg.train_warm_epochs > 0 { "1" } else { "0" }` | `rust/mumdia/crates/mumdia/src/stages/rescore.rs:2283` |
-| `NUMEXPR_NUM_THREADS` | sidecar | `"1"` | `scripts/deeplc_finetune.py:46` |
-| `OMP_NUM_THREADS` | both | `"1"` in deeplc_finetune.py; `n.to_string()` in main.rs | `rust/mumdia/crates/mumdia/src/main.rs:94`, `scripts/deeplc_finetune.py:43` |
-| `OPENBLAS_NUM_THREADS` | sidecar | `"1"` | `scripts/deeplc_finetune.py:44` |
-| `PYTHONIOENCODING` | engine | `"utf-8"` | `rust/mumdia/crates/mumdia/src/sidecar.rs:584` |
-| `PYTHONUTF8` | engine | `"1"` | `rust/mumdia/crates/mumdia/src/sidecar.rs:584`, `rust/mumdia/crates/mumdia/src/stages/rescore.rs:1650`, `rust/mumdia/crates/mumdia/src/stages/rescore.rs:2261` |
+| `NUMEXPR_NUM_THREADS` | sidecar | `"1"` | `scripts/deeplc_finetune.py:51` |
+| `OMP_NUM_THREADS` | both | `"1"` in deeplc_finetune.py; `n.to_string()` in main.rs | `rust/mumdia/crates/mumdia/src/main.rs:94`, `scripts/deeplc_finetune.py:48` |
+| `OPENBLAS_NUM_THREADS` | sidecar | `"1"` | `scripts/deeplc_finetune.py:49` |
+| `PYTHONIOENCODING` | engine | `"utf-8"` | `rust/mumdia/crates/mumdia/src/sidecar.rs:687` |
+| `PYTHONUTF8` | engine | `"1"` | `rust/mumdia/crates/mumdia/src/sidecar.rs:687`, `rust/mumdia/crates/mumdia/src/stages/rescore.rs:1650`, `rust/mumdia/crates/mumdia/src/stages/rescore.rs:2261` |
 
 ## Unresolved by the generator
 
@@ -858,6 +870,6 @@ Every field whose struct has an `impl Default` resolved from the source.
 
 ## Coverage
 
-19 structs and 194 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 25 enumerations, 1 named profile(s), 69 environment variables read and 19 set.
+19 structs and 195 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 26 enumerations, 1 named profile(s), 69 environment variables read and 19 set.
 
 20 field(s) carry a gating marker in their doc comment. 48 field(s) carry no doc comment at all, so their description is empty above. 0 default(s) could not be resolved and 2 have none by design.

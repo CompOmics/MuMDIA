@@ -173,6 +173,8 @@ fn process_run(
     top_peaks_ms2: usize,
     max_spectra: usize,
     shared_rt_lib: Option<&str>,
+    // `lib_p_base` is the experiment-level base-model re-prediction of the imported iRT.
+    library_irt_repredicted: bool,
 ) -> Result<(String, String, Option<String>)> {
     let d = |name: &str| format!("{out}/{name}");
     std::fs::create_dir_all(out).ok();
@@ -217,6 +219,7 @@ fn process_run(
             shared_bands: shared_rt_lib,
             mh_heads,
             library_input,
+            library_irt_repredicted,
         })?;
         return Ok((
             pooled.competed,
@@ -604,10 +607,11 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
     // Library-input mode without a fine-tune: the DeepLC base-model re-prediction of the
     // imported iRT does not depend on any run, so it is computed once here and every
     // per-run chain fits its own RT calibration against the same table.
-    let lib_p_base = if cfg.rt_im_train.repredicts_library_irt(
+    let library_irt_repredicted = cfg.rt_im_train.repredicts_library_irt(
         p.lib_precursors.is_some(),
         cfg.predict_frag.deeplc_python.is_some(),
-    ) {
+    );
+    let lib_p_base = if library_irt_repredicted {
         let python = cfg
             .predict_frag
             .deeplc_python
@@ -723,6 +727,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
             p.top_peaks_ms2,
             p.max_spectra,
             None,
+            library_irt_repredicted,
         )?;
         competed.push(comp);
         chroms.push(chrom);
@@ -756,6 +761,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
                 p.top_peaks_ms2,
                 p.max_spectra,
                 shared_ft.as_deref(),
+                library_irt_repredicted,
             )?;
             competed.push(comp);
             chroms.push(chrom);
@@ -782,6 +788,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
                         p.top_peaks_ms2,
                         p.max_spectra,
                         shared_ft.as_deref(),
+                        library_irt_repredicted,
                     )
                 })
                 .collect::<Result<Vec<_>>>()?;

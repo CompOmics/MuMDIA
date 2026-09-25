@@ -20,7 +20,7 @@ use std::collections::BTreeMap;
 use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
-use mumdia_core::config::{Config, GroupCalibration};
+use mumdia_core::config::{Config, GroupCalibration, GroupRtAdaptation};
 use mumdia_core::manifest::Manifest;
 use mumdia_core::schema::artifact;
 use mumdia_io::record_artifact;
@@ -54,6 +54,12 @@ pub struct GroupRun<'a> {
     /// Multi-head calibration heads resolved by the caller (0 = off).
     pub mh_heads: usize,
     pub library_input: bool,
+    /// The caller has already re-predicted `lib_precursors` with the DeepLC base model
+    /// (`run-experiment` does so once per experiment when the multi-head calibration is
+    /// off). Under `groups.rt_adaptation = once_per_run` the bands then keep those values
+    /// rather than re-predicting their slices of the same table; under `per_band` they
+    /// re-predict as before. Only a caller that did the re-prediction may set it.
+    pub library_irt_repredicted: bool,
 }
 
 /// Paths the pooled stages continue with.
@@ -443,6 +449,15 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
         "library".to_string()
     };
     let mut repredicted: Vec<(String, u32)> = Vec::new();
+    // `groups.rt_adaptation = once_per_run`: one DeepLC worker for all the bands under
+    // global calibration, rather than one per band (see `GroupRtAdaptation`). `per_group`
+    // fits each band on its own anchors, so it keeps the per-band loop.
+    let once_per_run = cfg.groups.rt_adaptation == GroupRtAdaptation::OncePerRun && global;
+    // The caller re-predicted the library with the base model already, and the bands are
+    // slices of that table: re-predicting them again only recomputes the same model's
+    // values in different company. Kept per band under `per_band`, which is today's
+    // behaviour.
+    let keep_caller_irt = once_per_run && repredict && g.library_irt_repredicted;
     if let Some(shared) = g.shared_bands {
         // Take a previous run's adapted bands wholesale: same ids, same row order, which is
         // what `fragment_offset` and the per-band seed views key on. Only the retention
@@ -466,7 +481,71 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
             "groups: reusing a previous run's adapted bands"
         );
     }
-    for b in bands.iter_mut().filter(|_| g.shared_bands.is_none()) {
+    let union_mode = g.shared_bands.is_none()
+        && once_per_run
+        && !keep_caller_irt
+        && (g.mh_heads > 0 || repredict);
+    if g.shared_bands.is_none() && keep_caller_irt {
+        info!(
+            groups = bands.len(),
+            "groups: the library's iRT was re-predicted with the DeepLC base model for the \
+             whole experiment; the bands keep those values (groups.rt_adaptation = \
+             once_per_run)"
+        );
+    }
+    if union_mode {
+        let name = band_lib_name(&rt_model);
+        let pairs: Vec<(String, String)> = bands
+            .iter()
+            .map(|b| (b.prec.clone(), gd(b.index, name)))
+            .collect();
+        let python = python.expect("mh_heads and repredict imply deeplc_python");
+        let mode = if g.mh_heads > 0 {
+            info!(stage = %"deeplc-multihead", groups = bands.len(), "run: stage start");
+            crate::sidecar::BandAdaptation::Multihead {
+                seed: &pooled_seed,
+                n_heads: g.mh_heads,
+                q_train: cfg.rt_im_train.q_train,
+                window_holdout_frac: cfg.rt_im_train.window_holdout_frac,
+            }
+        } else {
+            info!(stage = %"deeplc-repredict", groups = bands.len(), "run: stage start");
+            crate::sidecar::BandAdaptation::Repredict
+        };
+        crate::sidecar::run_deeplc_bands(
+            python,
+            &script,
+            &pairs,
+            &d("groups/rt_bands.tsv"),
+            mode,
+            rayon::current_num_threads(),
+            cfg.rt_im_train.deeplc_predict_shards,
+        )?;
+        for (b, (_, out)) in bands.iter_mut().zip(pairs) {
+            let rows = mumdia_io::table::nrows(&out)?;
+            record_opt(
+                g.man.as_deref_mut(),
+                record_artifact(
+                    &format!(
+                        "{}[g{:02}]",
+                        artifact::FRAGMENT_LIBRARY_PRECURSORS.0,
+                        b.index
+                    ),
+                    artifact::FRAGMENT_LIBRARY_PRECURSORS,
+                    &out,
+                    rows,
+                    &rt_model,
+                    ch,
+                )?,
+            );
+            repredicted.push((out.clone(), b.offset));
+            b.prec = out;
+        }
+    }
+    for b in bands
+        .iter_mut()
+        .filter(|_| g.shared_bands.is_none() && !union_mode && !keep_caller_irt)
+    {
         let anchors = if global { &pooled_seed } else { &b.seed };
         let out = if g.mh_heads > 0 {
             let out = gd(b.index, "lib_precursors_multihead.parquet");

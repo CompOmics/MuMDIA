@@ -338,6 +338,8 @@ pub fn run(p: RunParams) -> Result<()> {
                 shared_bands: None,
                 mh_heads,
                 library_input: p.lib_precursors.is_some(),
+                // A single run re-predicts nothing before banding.
+                library_irt_repredicted: false,
             })?;
             (
                 pooled.seed,
