@@ -669,18 +669,18 @@ fn near_unique(bits: &[u64], threshold: f64) -> bool {
 /// psms_competed.parquet (131,072) 1,592 -> 399 at +0.5%, chromatograms.parquet (65,536)
 /// 1,141 -> 947 at +0.05%. Read and write times from the page cache did not move beyond the
 /// run-to-run noise. The values are unchanged, and the uncapped writers' files do not move.
-fn writer_props(schema: &Schema, row_group_rows: Option<usize>) -> WriterProperties {
-    writer_props_planned(schema, row_group_rows, None)
-}
-
-/// [`writer_props`], with every float leaf that `plan` covers decided by the plan instead:
-/// written PLAIN when its sample was near-unique, otherwise given the dictionary limit sized
-/// from its values per row group rather than its rows ([`EncodingPlan`]). A leaf the plan
-/// does not cover keeps the unplanned rule, and so does every leaf when `plan` is `None`.
-fn writer_props_planned(
+///
+/// PLAN. Every float leaf that `plan` covers is decided by the plan instead: written PLAIN
+/// when its sample was near-unique, otherwise given the dictionary limit sized from its
+/// values per row group rather than its rows ([`EncodingPlan`]). A leaf the plan does not
+/// cover keeps the unplanned rule above, and so does every leaf when `plan` is `None`.
+/// Every leaf under a root column named in `plain` is written without a dictionary whatever
+/// the plan says ([`WriteOptions::plain_column`]).
+fn writer_props(
     schema: &Schema,
     row_group_rows: Option<usize>,
     plan: Option<&EncodingPlan>,
+    plain: &[String],
 ) -> WriterProperties {
     let mut b = WriterProperties::builder().set_compression(codec());
     if let Some(n) = row_group_rows {
@@ -688,7 +688,14 @@ fn writer_props_planned(
             .set_max_row_group_row_count(Some(n.max(1)))
             .set_data_page_row_count_limit(data_page_rows(n));
     }
+    let plain_leaves = plain_leaf_paths(schema, plain);
+    for leaf in &plain_leaves {
+        b = b.set_column_dictionary_enabled(leaf.clone(), false);
+    }
     for leaf in float_leaves(schema) {
+        if plain_leaves.contains(&leaf.path) {
+            continue;
+        }
         let planned = plan.and_then(|p| p.leaf(&leaf.path));
         if planned.is_some_and(|l| l.near_unique) {
             b = b.set_column_dictionary_enabled(leaf.path, false);
@@ -703,6 +710,26 @@ fn writer_props_planned(
         }
     }
     b.build()
+}
+
+/// The parquet leaves under the root columns of `schema` named in `plain`.
+fn plain_leaf_paths(schema: &Schema, plain: &[String]) -> Vec<ColumnPath> {
+    if plain.is_empty() {
+        return Vec::new();
+    }
+    let Ok(desc) = ArrowSchemaConverter::new()
+        .with_coerce_types(false)
+        .convert(schema)
+    else {
+        return Vec::new();
+    };
+    (0..desc.num_columns())
+        .filter(|&i| {
+            let root = desc.get_column_root_idx(i);
+            plain.iter().any(|p| p == schema.field(root).name())
+        })
+        .map(|i| desc.column(i).path().clone())
+        .collect()
 }
 
 /// The data page row limit of a writer capped at `row_group_rows` rows per row group.
@@ -784,6 +811,8 @@ enum EncoderState {
         row_group_rows: usize,
         pending: Vec<RecordBatch>,
         rows: usize,
+        /// [`WriteOptions::plain_column`].
+        plain: Vec<String>,
     },
     Writing(Box<ArrowWriter<Sink>>),
     /// Only while a transition is in flight, or after one failed.
@@ -791,7 +820,19 @@ enum EncoderState {
 }
 
 impl Encoder {
-    fn new(sink: Sink, schema: Arc<Schema>, row_group_rows: Option<usize>) -> Result<Encoder> {
+    fn new(sink: Sink, schema: Arc<Schema>, opts: &WriteOptions) -> Result<Encoder> {
+        if let Some(missing) = opts.plain.iter().find(|p| schema.index_of(p).is_err()) {
+            return Err(anyhow!(
+                "WriteOptions::plain_column({missing:?}): no such column in {:?}",
+                schema
+                    .fields()
+                    .iter()
+                    .map(|f| f.name().as_str())
+                    .collect::<Vec<_>>()
+            ));
+        }
+        let plain = opts.plain.clone();
+        let row_group_rows = opts.row_group_rows;
         let state = match row_group_rows {
             Some(cap) if plan_enabled() && !float_leaves(&schema).is_empty() => {
                 EncoderState::Sampling {
@@ -800,10 +841,11 @@ impl Encoder {
                     row_group_rows: cap.max(1),
                     pending: Vec::new(),
                     rows: 0,
+                    plain,
                 }
             }
             _ => {
-                let props = writer_props(&schema, row_group_rows);
+                let props = writer_props(&schema, row_group_rows, None, &plain);
                 EncoderState::Writing(Box::new(ArrowWriter::try_new(sink, schema, Some(props))?))
             }
         };
@@ -843,13 +885,14 @@ impl Encoder {
             schema,
             row_group_rows,
             pending,
+            plain,
             ..
         } = std::mem::replace(&mut self.state, EncoderState::Poisoned)
         else {
             unreachable!("checked above");
         };
         let plan = EncodingPlan::of(&schema, &pending, plan_sample_rows(row_group_rows));
-        let props = writer_props_planned(&schema, Some(row_group_rows), Some(&plan));
+        let props = writer_props(&schema, Some(row_group_rows), Some(&plan), &plain);
         let mut w = ArrowWriter::try_new(*sink, schema, Some(props))?;
         for b in &pending {
             w.write(b)?;
@@ -874,6 +917,7 @@ impl Encoder {
 pub struct WriteOptions {
     row_group_rows: Option<usize>,
     content_hash: bool,
+    plain: Vec<String>,
 }
 
 impl WriteOptions {
@@ -893,6 +937,20 @@ impl WriteOptions {
     /// source, a sidecar handoff.
     pub fn content_hash(mut self) -> WriteOptions {
         self.content_hash = true;
+        self
+    }
+
+    /// Write every leaf of the root column `name` without a dictionary, whatever its type
+    /// and whatever the float plan says. For a column whose repeats snappy shortens better
+    /// in PLAIN form than a dictionary's bit-packed indices allow: the chromatogram `rt`
+    /// axis repeats one list per fragment row of a candidate, and PLAIN made the AIF
+    /// chromatograms 12.0% smaller than the planned dictionary did (docs/03_io_layer.md,
+    /// "Float encodings planned from the first rows"). A name that is not a column of the
+    /// written schema is an error when the writer opens.
+    pub fn plain_column(mut self, name: &str) -> WriteOptions {
+        if !self.plain.iter().any(|p| p == name) {
+            self.plain.push(name.to_string());
+        }
         self
     }
 }
@@ -1204,6 +1262,12 @@ impl TableWriter {
         self
     }
 
+    /// Write the column `name` without a dictionary ([`WriteOptions::plain_column`]).
+    pub fn with_plain_column(mut self, name: &str) -> TableWriter {
+        self.opts = self.opts.plain_column(name);
+        self
+    }
+
     /// Append one chunk. Empty chunks are accepted (they only fix or check the schema).
     pub fn write_cols(&mut self, cols: Vec<Col>) -> Result<()> {
         let (schema, batch) = cols_to_batch(&self.path, cols)?;
@@ -1215,11 +1279,7 @@ impl TableWriter {
                 let target = AtomicPath::new(&self.path)?;
                 let file = Sink::create(target.tmp(), self.opts.content_hash)?;
                 self.target = Some(target);
-                self.writer = Some(Encoder::new(
-                    file,
-                    schema.clone(),
-                    self.opts.row_group_rows,
-                )?);
+                self.writer = Some(Encoder::new(file, schema.clone(), &self.opts)?);
                 self.schema = Some(schema);
             }
             Some(first) => {
@@ -1473,7 +1533,7 @@ impl BatchWriter {
         let target = AtomicPath::new(path)?;
         let file = Sink::create(target.tmp(), opts.content_hash)?;
         Ok(BatchWriter {
-            writer: Some(Encoder::new(file, schema, opts.row_group_rows)?),
+            writer: Some(Encoder::new(file, schema, &opts)?),
             rows: 0,
             target: Some(target),
         })
@@ -1546,7 +1606,7 @@ fn write_batches_with(
     // The same encoder [`TableWriter`] uses, minus the row-group cap: this path and the
     // chunked one must produce the same file, which
     // `write_table_matches_one_batch_byte_for_byte_on_scalars` asserts.
-    let mut writer = Encoder::new(file, schema, None)?;
+    let mut writer = Encoder::new(file, schema, &WriteOptions::default())?;
     let mut n = 0u64;
     for b in batches {
         writer.write(b)?;
@@ -4326,7 +4386,7 @@ mod encoding_tests {
     /// Write `cols` as a capped writer would WITHOUT the plan ([`writer_props`] at `cap`).
     fn write_unplanned(path: &str, cols: Vec<Col>, cap: usize) {
         let (schema, batch) = cols_to_batch(path, cols).unwrap();
-        let props = writer_props(&schema, Some(cap));
+        let props = writer_props(&schema, Some(cap), None, &[]);
         let f = std::fs::File::create(path).unwrap();
         let mut w = ArrowWriter::try_new(f, schema, Some(props)).unwrap();
         w.write(&batch).unwrap();
@@ -4493,6 +4553,77 @@ mod encoding_tests {
         w.close().unwrap();
         write_unplanned(&q, cols(), 65_536);
         assert_eq!(std::fs::read(&p).unwrap(), std::fs::read(&q).unwrap());
+        std::fs::remove_file(&p).ok();
+        std::fs::remove_file(&q).ok();
+    }
+
+    /// A column named with [`WriteOptions::plain_column`] loses its dictionary on every leaf
+    /// whatever the plan says, the other columns keep what the plan gave them, the values
+    /// are unchanged, and a name that is not in the schema is refused when the writer opens.
+    #[test]
+    fn a_plain_column_is_written_without_a_dictionary() {
+        let n = 20_000usize;
+        let cols = || {
+            vec![
+                Col::U32(
+                    "candidate_id".into(),
+                    (0..n).map(|i| (i / 6) as u32).collect(),
+                ),
+                // One axis per candidate, repeated on each of its six fragment rows: the
+                // shape of the chromatogram `rt` list.
+                Col::LargeListF32(
+                    "rt".into(),
+                    (0..n)
+                        .map(|i| (0..40).map(|j| ((i / 6) * 3 + j) as f32 * 0.9).collect())
+                        .collect(),
+                ),
+                Col::LargeListF32(
+                    "intensity".into(),
+                    (0..n)
+                        .map(|i| (0..40).map(|j| ((i * 13 + j) % 97) as f32).collect())
+                        .collect(),
+                ),
+            ]
+        };
+        let p = tmp("plain_rt.parquet");
+        let q = tmp("planned_rt.parquet");
+        let mut w = TableWriter::new(&p)
+            .with_row_group_rows(8_192)
+            .with_plain_column("rt");
+        w.write_cols(cols()).unwrap();
+        w.close().unwrap();
+        let mut w = TableWriter::new(&q).with_row_group_rows(8_192);
+        w.write_cols(cols()).unwrap();
+        w.close().unwrap();
+
+        assert!(!encodings(&p, "rt.list.item").contains(&Encoding::RLE_DICTIONARY));
+        assert!(encodings(&q, "rt.list.item").contains(&Encoding::RLE_DICTIONARY));
+        for leaf in ["candidate_id", "intensity.list.item"] {
+            assert_eq!(leaf_bytes(&p, leaf), leaf_bytes(&q, leaf), "{leaf}");
+        }
+        let (a, b) = (Table::read(&p).unwrap(), Table::read(&q).unwrap());
+        assert_eq!(a.list_f32("rt").unwrap(), b.list_f32("rt").unwrap());
+        assert_eq!(
+            a.list_f32("intensity").unwrap(),
+            b.list_f32("intensity").unwrap()
+        );
+
+        // Uncapped writers honour it too.
+        let (schema, batch) = cols_to_batch(&p, cols()).unwrap();
+        let mut bw =
+            BatchWriter::with_options(&p, schema.clone(), WriteOptions::new().plain_column("rt"))
+                .unwrap();
+        bw.write(&batch).unwrap();
+        bw.close().unwrap();
+        assert!(!encodings(&p, "rt.list.item").contains(&Encoding::RLE_DICTIONARY));
+        assert_eq!(
+            Table::read(&p).unwrap().list_f32("rt").unwrap(),
+            b.list_f32("rt").unwrap()
+        );
+
+        let mut w = TableWriter::new(&q).with_plain_column("retention");
+        let err = w.write_cols(cols()).unwrap_err().to_string();
+        assert!(err.contains("retention"), "{err}");
         std::fs::remove_file(&p).ok();
         std::fs::remove_file(&q).ok();
     }
@@ -4841,7 +4972,7 @@ mod writer_bench {
         GlobalLimited,
         /// The unplanned [`writer_props`]: the c = 0.5 rule with pages cut by size.
         WriterUnplanned,
-        /// [`writer_props_planned`] with a plan from the first `cap / sample_div` rows at a
+        /// [`writer_props`] with a plan from the first `cap / sample_div` rows at a
         /// distinct-fraction `threshold`; `rt_plain` also drops the chromatogram `rt` leaf's
         /// dictionary whatever the plan says (X6 of the 2026-09-25 survey).
         Planned {
@@ -4918,7 +5049,7 @@ mod writer_bench {
             return props_under(rule, schema, cap);
         };
         let Some(rows) = cap else {
-            return writer_props(schema, None);
+            return writer_props(schema, None, None, &[]);
         };
         let plan = EncodingPlan::with_threshold(
             schema,
@@ -4927,20 +5058,14 @@ mod writer_bench {
             threshold,
         );
         if !rt_plain {
-            return writer_props_planned(schema, cap, Some(&plan));
+            return writer_props(schema, cap, Some(&plan), &[]);
         }
-        let mut plan = plan;
-        for l in &mut plan.leaves {
-            if l.path.string() == "rt.list.item" {
-                l.near_unique = true;
-            }
-        }
-        writer_props_planned(schema, cap, Some(&plan))
+        writer_props(schema, cap, Some(&plan), &["rt".to_string()])
     }
 
     fn props_under(rule: DictRule, schema: &Schema, cap: Option<usize>) -> WriterProperties {
         match rule {
-            DictRule::WriterUnplanned => return writer_props(schema, cap),
+            DictRule::WriterUnplanned => return writer_props(schema, cap, None, &[]),
             DictRule::Planned { .. } => panic!("a planned rule needs the batches: props_for"),
             _ => {}
         }

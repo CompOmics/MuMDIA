@@ -2576,10 +2576,15 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
 
     // Chromatogram rows stream to parquet chunk by chunk (see the candidate loop below).
     // Hashed as it is written: the report's content hash then needs no read-back of the
-    // run's largest artifact (docs/03_io_layer.md, "Hash on write").
+    // run's largest artifact (docs/03_io_layer.md, "Hash on write"). The `rt` axis is
+    // written PLAIN: every fragment row of a candidate carries the same axis, and snappy
+    // shortens those repeated PLAIN runs far better than a dictionary's bit-packed indices
+    // (AIF chromatograms 12.0% smaller; same values, docs/03 "Float encodings planned
+    // from the first rows").
     let chrom_writer = TableWriter::new(p.out_chrom)
         .with_row_group_rows(CHROM_ROW_GROUP_ROWS)
-        .with_content_hash();
+        .with_content_hash()
+        .with_plain_column("rt");
 
     // Deterministic output order (a HashMap's iteration order is randomized,
     // and downstream floating-point sums in the rescorer are order-sensitive).

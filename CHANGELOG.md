@@ -154,6 +154,11 @@ than a number. Both are recorded in every run's `manifest.json`.
   1.31 s with half the writer buffer. Values are unchanged; bytes and content hashes of
   capped writers change; `MUMDIA_PARQUET_PLAN=0` restores the unplanned layout (docs/03
   "Float encodings planned from the first rows").
+- **The chromatogram `rt` axis is written PLAIN.** Each fragment row of a candidate repeats
+  the candidate's axis, which snappy shortens in PLAIN form and cannot find in bit-packed
+  dictionary indices, so the AIF chromatograms are 12.0% smaller than with the planned
+  dictionary (160.9 against 182.8 MB) with identical values. Writers can name such columns
+  with `WriteOptions::plain_column` (docs/09 "Output: chromatograms").
 
 - **Library writers emit fragment tables sorted by `candidate_id`.** `import_diann_lib.py`,
   `make_reverse_decoys.py` and `make_shift_decoys.py` finish with a streaming bucket sort

@@ -220,6 +220,17 @@ byte comparison against a binary from before the plan. A pooled table spliced
 from band artifacts carries each band's own plan in its row groups, which is
 legal parquet. This is F2 of the 2026-09-25 performance survey.
 
+A writer can also name columns to write without any dictionary
+(`WriteOptions::plain_column`, `TableWriter::with_plain_column`), whatever the
+plan says. The distinct-fraction test cannot see the one case where PLAIN wins
+on a low-cardinality column: a list whose rows repeat whole runs of values,
+which snappy shortens in PLAIN form and cannot find in bit-packed dictionary
+indices. `extract` names the chromatogram `rt` axis, which each fragment row of
+a candidate repeats: the AIF chromatograms came out 12.0% smaller than with
+the planned dictionary (160.9 against 182.8 MB; 17.5% against the unplanned
+layout), written in 5.4 against 7.2 s. This is X6 of the survey. An unknown
+column name is an error when the writer opens.
+
 ### Read side: Parquet -> `Table` -> typed `Vec`
 
 `Table` (`table.rs:200-204`) holds the `Arc<Schema>`, the `Vec<RecordBatch>`,
