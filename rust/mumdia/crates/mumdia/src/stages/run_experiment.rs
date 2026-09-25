@@ -806,7 +806,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
     let mut first: usize = 0;
     let grouped_runs = cfg.groups.window_groups > 1;
     let overlap = cfg.experiment.overlap_front_threads;
-    if overlap > 0 && !(share_ft && !grouped_runs) {
+    if overlap > 0 && (grouped_runs || !share_ft) {
         info!(
             overlap_front_threads = overlap,
             "run-experiment: experiment.overlap_front_threads applies to ungrouped runs whose \

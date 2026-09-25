@@ -559,6 +559,7 @@ pub enum BandAdaptation<'a> {
 /// of the bands' unique sequences once, and writes each `lib_out` with the rewrite a
 /// single-table call applies, each with its own `<lib_out>.summary.json`. `threads` and
 /// `shards` mean what they mean for [`run_deeplc_multihead`].
+#[allow(clippy::too_many_arguments)]
 pub fn run_deeplc_bands(
     python: &str,
     script: &str,
