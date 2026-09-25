@@ -846,10 +846,14 @@ impl FileCopy {
 /// filesystem that cannot link (another volume, FAT, some network and sync folders) falls
 /// back to a byte copy into the same temp name. An error here leaves `out` as it was.
 ///
-/// The two names share one file after a link. Every writer in this crate publishes by
-/// renaming a new file over its destination, which replaces the directory entry and leaves
-/// the other name's file alone, so rewriting either artifact never changes the other. A
-/// tool that edits one of them IN PLACE changes both.
+/// The two names share one file after a link. Every writer in this crate (the parquet
+/// writers, [`write_batches`], this function and `json::write_json`) publishes by renaming
+/// a new file over its destination, which replaces the directory entry and leaves the other
+/// name's file alone, so rewriting either artifact through them never changes the other.
+/// That does not hold for a writer that opens its destination with `File::create`, which
+/// truncates the shared file and so writes through both names. The engine has two, the
+/// `features` PIN and rescore's tab-separated handoff, and neither writes a parquet
+/// artifact path. A tool that edits one of the linked files IN PLACE changes both.
 pub fn publish_copy_of(src: &str, out: &str) -> Result<FileCopy> {
     publish_copy_of_with(src, out, true)
 }

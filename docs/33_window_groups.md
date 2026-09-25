@@ -312,7 +312,12 @@ Within a band, the competed table is normally a hard link to the band's feature 
 the shipped grouping compete removes no row, so it publishes the features file's own bytes
 instead of rewriting them (docs/11 "compete: how the competed table is published"). The two
 names then cost the disk once, and deleting one band file does not free the space while the
-other name exists. The pool splices from the competed name as before.
+other name exists. The pool splices from the competed name as before, so the pooled
+`psms_competed.parquet` inherits the bands' 65,536-row feature row groups where it used to
+inherit the 131,072-row groups of the rewrite. Its values and row order are unchanged, and so
+is everything rescore reads from it, but its bytes and its manifest and report `content_hash`
+differ from a grouped run made before 2026-09-25 whenever a band table holds more than one
+row group.
 
 Each pooled table is hashed once, for the manifest record and the report beside it
 together. At experiment scale those tables are tens of GB, and hashing reads all of it.

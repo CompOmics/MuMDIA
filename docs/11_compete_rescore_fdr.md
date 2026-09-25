@@ -343,17 +343,29 @@ groups and bytes, so its `content_hash` IS the features hash. An orchestrator pa
 the features stage's own hash as `CompeteParams::features_hash`, and compete records it
 rather than reading the file again; the standalone `mumdia compete` passes none and
 hashes the output. Every downstream reader decodes the same values in the same order,
-so `psms_scored.parquet` and everything after it are byte-identical; only the competed
-file's bytes and hash differ from a rewritten one.
+so `psms_scored.parquet` and everything after it are byte-identical. Only the competed
+file's bytes and hash differ from a rewritten one, and on a grouped run the pooled
+competed table's as well, because the pool splices the bands' row groups as they are
+(docs/33 section 5). On a table of one row group, such as the CI smoke fixture, even
+those are identical.
 
-After a hard link the two names share one file, so they cost the disk once. Every
-writer in the engine publishes by renaming a new file over its destination, which
-replaces that directory entry and leaves the other name's file untouched: a rerun that
-rewrites `features.parquet` does not change `psms_competed.parquet`, and deleting one
-leaves the other intact. A tool that edits either file IN PLACE changes both. A rerun
-of `compete` over an output that is already a link to its input leaves no temporary
-file behind (POSIX `rename` is a no-op between two names of one file, and the stage
-removes the surviving temp name).
+After a hard link the two names share one file, so they cost the disk once. The
+engine's parquet writers (`TableWriter` and `write_table`, `BatchWriter` and
+`write_batches`, `SpliceWriter`) and `publish_copy_of` all write to an `AtomicPath`
+temp name and rename it over the destination, which replaces that directory entry and
+leaves the other name's file untouched: a rerun that rewrites `features.parquet` does
+not change `psms_competed.parquet`, and deleting one leaves the other intact. Two text
+writers do truncate their destination in place, the optional `features` PIN
+(`PinWriter`, `features.emit_pin`) and rescore's tab-separated handoff for mokapot and
+the entrapment sidecar. Neither ever writes to a parquet artifact path, so neither can
+reach a linked file, but a new writer that opened `features.parquet` or
+`psms_competed.parquet` with `File::create` would write through both names. The same
+holds outside the engine: a tool that edits either file IN PLACE changes both, and
+pandas `to_parquet` or pyarrow `write_table` onto an existing path truncates that file
+in place. Write to a new name and rename it over the old one, or delete the old name
+first. A rerun of `compete` over an output that is already a link to its input leaves
+no temporary file behind (POSIX `rename` is a no-op between two names of one file, and
+the stage removes the surviving temp name).
 
 ### rescore: input concat and classifier dispatch
 

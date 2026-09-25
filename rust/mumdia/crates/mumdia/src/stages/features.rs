@@ -1993,7 +1993,13 @@ impl PinFinish {
 /// whose chunk boundaries move therefore writes a features.parquet with the same values
 /// and different BYTES once the table exceeds one row group
 /// (`moving_a_chunk_boundary_moves_parquet_bytes_above_one_row_group` measures it), and
-/// both chunk limits move boundaries. Nothing downstream reads those bytes.
+/// both chunk limits move boundaries. No stage decodes a different value because of it,
+/// but the bytes are not private to this stage: when compete keeps every row it publishes
+/// these exact bytes as `psms_competed.parquet` (docs/11 "compete: how the competed table
+/// is published"), so a change to `CHUNK_CHROM_ROWS`, `CHUNK_PSM_ROWS` or the writer
+/// thread's chunking also moves the competed table's bytes and its recorded content hash,
+/// and on a grouped run the pooled competed table's. `psms_scored.parquet` and everything
+/// after it are unaffected.
 pub fn run_with_chunk_rows(p: FeaturesParams, chunk_rows: usize) -> Result<u64> {
     run_chunked(
         p,

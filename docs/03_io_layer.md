@@ -357,10 +357,19 @@ The orchestrators therefore take the hash from the stage instead:
   pooled seed and the DeepLC library tables have no Rust report hash, so they
   are still hashed by `record_artifact`.
 
-Every hash value in `manifest.json`, `experiment_manifest.json` and the
-`*.report.json` files is unchanged; only the second read is gone.
-`hash::blake3_file` itself is not memoised: `features` uses it as an
+Reusing the stage hashes changes no hash value in `manifest.json`,
+`experiment_manifest.json` or the `*.report.json` files; only the second read
+is gone. `hash::blake3_file` itself is not memoised: `features` uses it as an
 independent integrity check.
+
+One hash does change in the same release, for a different reason: compete
+now publishes `psms_competed.parquet` as the features file's own bytes when
+it removes no row (docs/11 "compete: how the competed table is published").
+Its `content_hash` then equals the `features` hash, and it differs from the
+hash of the 131,072-row-group rewrite an earlier binary wrote whenever the
+table holds more than one row group. On a grouped run the pooled
+`psms_competed` hash differs for the same reason (docs/33 section 5).
+`psms_scored.parquet` and every artifact after it are byte-identical.
 
 ### `inspect` (`lib.rs:43`)
 
