@@ -208,6 +208,30 @@ def capped_threads(requested, cap):
     return requested if cap <= 0 else max(1, min(requested, cap))
 
 
+def load_base_model():
+    """The DeepLC base model, loaded once, or None to let every call load its own.
+
+    `deeplc.predict(batch)` loads the checkpoint from disk on every call, and
+    `predict_and_calibrate` twice (once to size its head source, once to predict), so a
+    whole-library prediction in 100,000-peptidoform chunks read the model 50 to 100 times.
+    `load_model` hands a module instance back unchanged, and prediction runs in eval mode
+    under `no_grad`, so passing the one instance gives the same numbers (measured
+    bit-identical on 3,002 peptidoforms, DeepLC 4.5.0). The helpers are private DeepLC API
+    (present in 4.4.0 and 4.5.0) and the engine sets no DeepLC ceiling, so a release that
+    moves, renames or re-signatures them returns None here, with a warning, and every call
+    loads its own model as before: slower, same numbers. Identical in both DeepLC workers.
+    """
+    try:
+        from deeplc import _model_ops
+        from deeplc.core import DEFAULT_MODEL
+
+        return _model_ops.load_model(DEFAULT_MODEL)
+    except (ImportError, AttributeError, TypeError) as exc:
+        print("WARNING: could not load the DeepLC base model once (%s: %s); every "
+              "prediction call loads its own" % (type(exc).__name__, exc), flush=True)
+        return None
+
+
 class _DropBlankProgress(io.TextIOBase):
     """`sys.stdout` with DeepLC's empty progress writes removed.
 
@@ -293,17 +317,9 @@ def main():
     pforms = tbl.column("peptidoform").to_pylist()
 
     # One model for every chunk: `deeplc.predict` without `model=` reads the checkpoint
-    # from disk on each call. The instance is handed back unchanged and prediction runs in
-    # eval mode under no_grad, so the numbers are the same (see deeplc_finetune.py,
-    # `load_base_model`, for the measurement).
+    # from disk on each call (`load_base_model`).
     t0 = time.perf_counter()
-    try:
-        from deeplc import _model_ops
-        from deeplc.core import DEFAULT_MODEL
-
-        model = _model_ops.load_model(DEFAULT_MODEL)
-    except ImportError:
-        model = None
+    model = load_base_model()
     t_load = time.perf_counter() - t0
 
     preds = np.empty(len(pforms), dtype=np.float32)

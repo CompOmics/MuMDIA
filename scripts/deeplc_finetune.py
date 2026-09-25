@@ -438,14 +438,19 @@ def load_base_model():
     `load_model` hands a module instance back unchanged, and prediction runs in eval mode
     under `no_grad`, so passing the one instance gives the same numbers (measured
     bit-identical on 3,002 peptidoforms, DeepLC 4.5.0). The helpers are private DeepLC API
-    (present in 4.4.0 and 4.5.0), hence the fallback.
+    (present in 4.4.0 and 4.5.0) and the engine sets no DeepLC ceiling, so a release that
+    moves, renames or re-signatures them returns None here, with a warning, and every call
+    loads its own model as before: slower, same numbers. Identical in both DeepLC workers.
     """
     try:
         from deeplc import _model_ops
         from deeplc.core import DEFAULT_MODEL
-    except ImportError:
+
+        return _model_ops.load_model(DEFAULT_MODEL)
+    except (ImportError, AttributeError, TypeError) as exc:
+        print("WARNING: could not load the DeepLC base model once (%s: %s); every "
+              "prediction call loads its own" % (type(exc).__name__, exc), flush=True)
         return None
-    return _model_ops.load_model(DEFAULT_MODEL)
 
 
 def library_bases(peptidoforms):

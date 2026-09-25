@@ -54,10 +54,51 @@ def test_both_workers_carry_the_same_thread_cap_helpers():
     `deeplc_worker.py` cannot import `deeplc_finetune.py`: that module's body pins the
     OpenMP pools and imports psm_utils, which the predict-frag worker does not need.
     """
-    a = _function_sources("deeplc_worker.py", THREAD_HELPERS)
-    b = _function_sources("deeplc_finetune.py", THREAD_HELPERS)
-    for name in THREAD_HELPERS:
+    shared = THREAD_HELPERS + ["load_base_model"]
+    a = _function_sources("deeplc_worker.py", shared)
+    b = _function_sources("deeplc_finetune.py", shared)
+    for name in shared:
         assert a[name] == b[name], "{} differs between the two DeepLC workers".format(name)
+
+
+def test_the_model_load_falls_back_on_any_private_api_change(monkeypatch, capsys):
+    """A DeepLC that moves or re-signatures `_model_ops.load_model` gives None, not a crash.
+
+    None makes every prediction call load its own model, which is what the workers did
+    before they loaded it once. Faked with a stand-in `deeplc` package, so no DeepLC is
+    needed.
+    """
+    import types
+
+    source = _function_sources("deeplc_finetune.py", ["load_base_model"])["load_base_model"]
+    namespace = {}
+    exec(compile(source, "deeplc_finetune.py", "exec"), namespace)  # noqa: S102
+    load = namespace["load_base_model"]
+
+    def install(model_ops, core):
+        pkg = types.ModuleType("deeplc")
+        pkg.__path__ = []
+        if model_ops is not None:
+            pkg._model_ops = model_ops
+            monkeypatch.setitem(sys.modules, "deeplc._model_ops", model_ops)
+        else:
+            monkeypatch.setitem(sys.modules, "deeplc._model_ops", None)
+        monkeypatch.setitem(sys.modules, "deeplc", pkg)
+        monkeypatch.setitem(sys.modules, "deeplc.core", core)
+
+    core = types.SimpleNamespace(DEFAULT_MODEL="default.pt")
+    ok = types.SimpleNamespace(load_model=lambda path: ("model", path))
+    install(ok, core)
+    assert load() == ("model", "default.pt")
+    renamed = types.SimpleNamespace()  # AttributeError
+    install(renamed, core)
+    assert load() is None
+    resigned = types.SimpleNamespace(load_model=lambda: "no argument")  # TypeError
+    install(resigned, core)
+    assert load() is None
+    install(None, core)  # ImportError
+    assert load() is None
+    assert capsys.readouterr().out.count("every prediction call loads its own") == 3
 
 
 def test_the_cap_is_a_ceiling_and_never_a_target():
