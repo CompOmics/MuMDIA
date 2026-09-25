@@ -60,7 +60,10 @@ schema.rs:20) at `--out`. Column schema includes `candidate_id`
 (str), `protein`
 (str), `apex_rt`, `elution_lo`, `elution_hi` (f64), `precursor_mz` (f64),
 `prelim_score` (f64), then every
-feature column (f64) carried through unchanged. It also writes
+feature column (f64) carried through unchanged. When every row survives and the
+features file already has exactly this schema, the competed table is the features
+file's bytes, published by hard link (see "compete: how the competed table is
+published"). It also writes
 `<out>.schema.json` (compete.rs:188) so rescore recovers the exact feature list,
 and `<out>.report.json`.
 
@@ -269,6 +272,102 @@ is forwarded. The report records `group_by`, `mode`, `input_rows`, `kept`,
 whether a grouping choice is silently discarding evidence: under
 `group_by = base_peptide` on a modification-rich library it reached 46.6% of the
 input rows, and under `group_by = peptidoform_charge` on the same input it was 0.
+
+### compete: cost
+
+The stage logs one `compete: phase timings` line per call, beside `compete: done`.
+Its fields are wall-clock milliseconds:
+
+| field | what it covers |
+|---|---|
+| `keys_ms` | footer open, the streamed key columns (`label`, `prelim_score`, `peak_rank`, the grouping columns) and the sort of the `(key, row)` array |
+| `resolve_ms` | the unique-evidence estimate (that mode only) and `resolve_competition` |
+| `write_ms` | writing the competed table and its `<out>.schema.json` |
+| `audit_ms` | the optional `<out>.compete_audit.parquet` (0 when the audit is off) |
+| `hash_ms` | the blake3 content hash recorded in `<out>.report.json` |
+| `elapsed_ms` | the whole stage |
+
+On a wide features table `write_ms` and `hash_ms` dominate: the keys are a few
+columns, the table is every feature column. The same line names how the table was
+published (`publish`, next section).
+
+### compete: how the competed table is published
+
+Under the shipped grouping (`peptidoform_charge`) every group is normally a
+singleton, `removed` is 0, and the competed table is the features table: the same
+columns in the same order, the same rows in the same order, the same values.
+Decoding and re-encoding it column by column cost about 10 s per HYE file and one
+full write of an ~83 GB table per immunopeptidomics run. `publish_competed` therefore
+checks whether the features file's own bytes are exactly what the rewrite would
+produce (`features_bytes_reusable`), and when they are and every row is kept it
+publishes them as the competed table:
+
+1. a hard link into the `AtomicPath` temp name, then the usual rename
+   (`mumdia_io::table::publish_copy_of`);
+2. if the filesystem refuses the link (another volume, FAT, some network and sync
+   folders), a byte copy into the same temp name;
+3. if that fails too, the rows are rewritten by `copy_kept_rows`, as before.
+
+The features bytes are reusable only when all of these hold, and each is necessary:
+the Arrow schema is exactly the competed schema (the 11 bookkeeping columns, then the
+schema companion's feature columns, same types, non-nullable, same metadata, nothing
+extra); every parquet leaf is REQUIRED, so no null exists for the rewrite to turn into
+NaN or `""`; every row group holds at most 131,072 rows, the competed cap (`features`
+writes 65,536); the table has its own `peak_rank` column; and
+`compete.emit_competition_audit` is off. Otherwise the stage logs the reason and
+rewrites.
+
+When some rows are removed, the same four conditions hold, and the non-empty
+features row groups that lost no row hold at least half of the table's rows
+(`splice_pays`), the table is spliced instead (`splice_kept_rows`): the untouched row
+groups are appended as bytes through `SpliceWriter`, as the pool splices band tables,
+and each run of consecutive row groups that lost a row is rewritten by
+`copy_kept_rows` into a scratch file (`<out>.splice-<pid>-<row>.parquet`, removed
+afterwards) whose row groups take its place. A row group that lost every row
+contributes nothing. A splice writes each dirty row twice (into the scratch file, then
+into the output) and each clean row once, while a full rewrite writes every row once
+but decodes and re-encodes all of them. The half-the-rows threshold bounds the splice
+at 1.5 times the table's write traffic, half of it re-encoded, with no scratch file
+larger than half the table. Below it, which is the usual case for a grouping that
+removes many rows (`base_peptide` removed 23% of the rows on HYE B01, from most row
+groups), most of the table would pass through a scratch file, up to twice the write
+traffic and scratch space close to the table's size, so the table is rewritten
+directly. A splice that fails for any reason (for example a scratch file the splice
+refuses) is logged as a warning and followed by the same full rewrite; the output temp
+and the scratch files are removed first. The spliced file holds the rewrite's rows in
+the rewrite's order with its values; its row groups are the features file's where they
+were untouched, so it is not byte-identical to a full rewrite. Under the shipped
+defaults no row is removed and this path does not run.
+
+The report's `stats.publish` records which path ran: `hard_link`, `byte_copy`,
+`spliced` (with `rewritten_row_groups` and `row_groups`) or `rewritten`. After a link or a copy the competed file has the features file's row
+groups and bytes, so its `content_hash` IS the features hash. An orchestrator passes
+the features stage's own hash as `CompeteParams::features_hash`, and compete records it
+rather than reading the file again; the standalone `mumdia compete` passes none and
+hashes the output. Every downstream reader decodes the same values in the same order,
+so `psms_scored.parquet` and everything after it are byte-identical. Only the competed
+file's bytes and hash differ from a rewritten one, and on a grouped run the pooled
+competed table's as well, because the pool splices the bands' row groups as they are
+(docs/33 section 5). On a table of one row group, such as the CI smoke fixture, even
+those are identical.
+
+After a hard link the two names share one file, so they cost the disk once. The
+engine's parquet writers (`TableWriter` and `write_table`, `BatchWriter` and
+`write_batches`, `SpliceWriter`) and `publish_copy_of` all write to an `AtomicPath`
+temp name and rename it over the destination, which replaces that directory entry and
+leaves the other name's file untouched: a rerun that rewrites `features.parquet` does
+not change `psms_competed.parquet`, and deleting one leaves the other intact. Two text
+writers do truncate their destination in place, the optional `features` PIN
+(`PinWriter`, `features.emit_pin`) and rescore's tab-separated handoff for mokapot and
+the entrapment sidecar. Neither ever writes to a parquet artifact path, so neither can
+reach a linked file, but a new writer that opened `features.parquet` or
+`psms_competed.parquet` with `File::create` would write through both names. The same
+holds outside the engine: a tool that edits either file IN PLACE changes both, and
+pandas `to_parquet` or pyarrow `write_table` onto an existing path truncates that file
+in place. Write to a new name and rename it over the old one, or delete the old name
+first. A rerun of `compete` over an output that is already a link to its input leaves
+no temporary file behind (POSIX `rename` is a no-op between two names of one file, and
+the stage removes the surviving temp name).
 
 ### rescore: input concat and classifier dispatch
 
@@ -576,7 +675,12 @@ counts feed a hyperscore-style term; `n` is small so the naive loop is fine.
 | `compete::unique_evidence_with_source` | compete.rs:279 | derive per-candidate unique-fragment evidence for `UniqueEvidence` mode, plus the column it came from |
 | `compete::prefer_peak_contested_fraction` | compete.rs:301 | choose the Extended `peak_contested_frac`, else the legacy `contested_frac` |
 | `compete::col_f64` | compete.rs:309 | read a numeric column as f64, accepting an f64 or i32 encoding |
-| `CompeteParams` | compete.rs:21 | `features`, `out`, `cfg`, `config_hash` |
+| `CompeteParams` | compete.rs:21 | `features`, `out`, `cfg`, `config_hash`, `features_hash` (the features stage's report hash, reused when the competed table is the features file's bytes) |
+| `compete::run_hashed` | compete.rs | `run`, returning the row count and the report content hash (`mumdia_io::report::Written`) |
+| `compete::publish_competed` | compete.rs | publish the kept rows: the features file's bytes when they are exactly the competed table, a splice when few rows are removed, otherwise (or when either fast path fails) `copy_kept_rows` |
+| `compete::features_bytes_reusable` | compete.rs | the four conditions under which the features bytes can stand in for the competed table |
+| `compete::splice_kept_rows` | compete.rs | some rows removed: splice the untouched features row groups, rewrite the others |
+| `compete::splice_pays` | compete.rs | whether the non-empty untouched row groups hold at least half the rows, so a splice beats a full rewrite |
 | `rescore::run` | rescore.rs:41 | full rescore stage: concat, dispatch, multi-context q, scored table |
 | `rescore::validate_feature_schema` | rescore.rs:596 | reject a concat whose feature companions differ in id or ordered columns |
 | `rescore::native_scores` | rescore.rs:616 | thin wrapper calling `percolator_lite` with the config knobs |

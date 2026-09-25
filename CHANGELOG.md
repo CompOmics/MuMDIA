@@ -97,6 +97,30 @@ than a number. Both are recorded in every run's `manifest.json`.
   always are -- the definition levels are run-encoded, which moves the writer's internal
   mini-batch size and so the page framing. Measured at 196,615 rows: 16 bytes, with every
   row, value and row-group boundary unchanged.
+- **`psms_competed.parquet` is published as the features file's own bytes when compete
+  removes no row, which is the shipped default.** Under `group_by = peptidoform_charge` the
+  competed table has the features table's columns, rows, order and values, and it was
+  decoded and re-encoded column by column for nothing (estimated at about 10 s per HYE
+  file). When the features file is exactly what that rewrite would write, compete now
+  hard-links it to the competed name, falls back to a byte copy where the filesystem refuses
+  a link, and rewrites only if both fail. The competed file then has the features file's
+  65,536-row groups instead of 131,072-row ones, and its `content_hash` IS the features
+  hash, so it differs from an earlier run's whenever the table holds more than one row
+  group. On a grouped run the pooled `psms_competed.parquet` inherits the bands' row groups,
+  and its hash differs for the same reason. When compete does remove rows and the untouched
+  row groups hold at least half of the table's rows, those groups are spliced as bytes and
+  only the others are rewritten; a splice that fails falls back to the full rewrite. The
+  report records the path in `stats.publish` (`hard_link`, `byte_copy`, `spliced` with
+  `rewritten_row_groups` and `row_groups`, or `rewritten`). `psms_scored.parquet` and every
+  artifact after it are byte-identical. After a hard link the two names share one file:
+  rewriting either through the engine leaves the other alone, but a tool that edits either
+  file in place, including pandas `to_parquet` or pyarrow `write_table` onto the existing
+  path, changes both.
+- **Each artifact is hashed once.** The orchestrators record a stage's outputs in
+  `manifest.json` with the hash the stage already computed for its own report instead of
+  reading and hashing every file again, and a grouped run under `run-experiment` no longer
+  builds the band records it then dropped. Reusing the stage hashes changes no recorded
+  hash value.
 
 - **Library writers emit fragment tables sorted by `candidate_id`.** `import_diann_lib.py`,
   `make_reverse_decoys.py` and `make_shift_decoys.py` finish with a streaming bucket sort

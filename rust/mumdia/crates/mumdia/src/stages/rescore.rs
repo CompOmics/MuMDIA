@@ -10,7 +10,7 @@ use anyhow::{anyhow, Context as _, Result};
 use arrow::array::{Array, Float64Array};
 use mumdia_core::config::{FeaturePreset, RescoreConfig, RescorerKind};
 use mumdia_core::schema::artifact;
-use mumdia_io::report::ArtifactReport;
+use mumdia_io::report::{ArtifactReport, Written};
 use mumdia_io::table::{write_table, Col, TableFile};
 use rayon::prelude::*;
 use serde_json::json;
@@ -269,6 +269,12 @@ fn require_both_labels(n_targets: usize, n_decoys: usize) -> Result<()> {
 }
 
 pub fn run(p: RescoreParams) -> Result<u64> {
+    run_hashed(p).map(|w| w.rows)
+}
+
+/// [`run`], returning the output's row count and the content hash its report records, so
+/// an orchestrator can record the artifact without reading and hashing it again.
+pub fn run_hashed(p: RescoreParams) -> Result<Written> {
     let t0 = Instant::now();
     if p.competed.is_empty() {
         anyhow::bail!("rescore requires at least one competed input");
@@ -1085,7 +1091,7 @@ pub fn run(p: RescoreParams) -> Result<u64> {
     if let Some(env) = &nn_env {
         params["nn_env"] = json!(env);
     }
-    ArtifactReport {
+    let report = ArtifactReport {
         logical_name: artifact::PSMS_SCORED.0.to_string(),
         schema_name: artifact::PSMS_SCORED.0.to_string(),
         schema_version: artifact::PSMS_SCORED.1,
@@ -1096,8 +1102,8 @@ pub fn run(p: RescoreParams) -> Result<u64> {
         stats,
         model_identity: Some(model_identity),
         elapsed_ms: elapsed,
-    }
-    .write_for(p.out)?;
+    };
+    report.write_for(p.out)?;
 
     info!(
         psms = n,
@@ -1106,7 +1112,7 @@ pub fn run(p: RescoreParams) -> Result<u64> {
         elapsed_ms = elapsed,
         "rescore: done"
     );
-    Ok(rows)
+    Ok(report.written())
 }
 
 /// The `psms_scored` columns, in schema order.

@@ -330,6 +330,47 @@ Calibration JSON, PIN/schema companions, TSVs, and some diagnostics are not
 manifest records. Standalone single-stage invocations write their normal
 sidecars, when implemented, but not a manifest.
 
+#### Each artifact is hashed once
+
+`record_artifact` reads and hashes the whole file. Every stage has already done
+that once for its own `<artifact>.report.json`, so calling it after the stage
+read each artifact twice; on a grouped run the band artifacts are tens of GB.
+The orchestrators therefore take the hash from the stage instead:
+
+- each stage an orchestrator calls has a `run_hashed` sibling of `run`
+  (`digest`, `peptidoforms`, `predict_frag`, `search_seed`, `rt_im_train`,
+  `extract`, `features` and `features::run_with_bounds_hashed`, `compete`,
+  `rescore`, `quant`) that returns a `report::Written { rows, content_hash }`
+  per output, taken from the report it just wrote. `convert::run` returns the
+  four hashes in `ConvertOutputs::hashes`. `run` itself is unchanged and
+  returns the row counts, so the CLI and the tests call it as before;
+- the caller records with `Written::record`, a thin wrapper of
+  `record_artifact_with_hash`, so the manifest carries the identical hash;
+- in library-input mode the two library records reuse the hash `run` computed
+  when it recorded the same files as inputs;
+- the grouped path (`run_groups`) builds no band record at all when it has no
+  manifest to put it in. `run-experiment` passes none, and before this change
+  every band artifact was hashed a second time there for a record that was then
+  dropped;
+- `run-experiment` reuses the rescore and quant hashes for its experiment
+  manifest. The MBR worker's table, the by-source split, the LFQ matrix, the
+  pooled seed and the DeepLC library tables have no Rust report hash, so they
+  are still hashed by `record_artifact`.
+
+Reusing the stage hashes changes no hash value in `manifest.json`,
+`experiment_manifest.json` or the `*.report.json` files; only the second read
+is gone. `hash::blake3_file` itself is not memoised: `features` uses it as an
+independent integrity check.
+
+One hash does change in the same release, for a different reason: compete
+now publishes `psms_competed.parquet` as the features file's own bytes when
+it removes no row (docs/11 "compete: how the competed table is published").
+Its `content_hash` then equals the `features` hash, and it differs from the
+hash of the 131,072-row-group rewrite an earlier binary wrote whenever the
+table holds more than one row group. On a grouped run the pooled
+`psms_competed` hash differs for the same reason (docs/33 section 5).
+`psms_scored.parquet` and every artifact after it are byte-identical.
+
 ### `inspect` (`lib.rs:43`)
 
 `inspect(path)` reads the whole table via `Table::read`, then builds a string:
@@ -372,6 +413,8 @@ string (`main.rs:713`).
 | `blake3_str` | `hash.rs:23` | one-shot blake3 hex digest of a string (`config_hash`) |
 | `write_json` / `read_json` | `json.rs:7` / `16` | pretty serde JSON write / read, creating parent dirs on write |
 | `record_artifact` | `lib.rs:20` | build an `ArtifactRecord` (format hard-coded `"parquet"`) |
+| `record_artifact_with_hash` | `lib.rs` | the same record from a hash the caller already has |
+| `report::Written` | `report.rs` | an output's row count and report content hash, returned by each stage's `run_hashed`; `Written::record` builds the manifest record |
 | `inspect` | `lib.rs:43` | schema + head(<=10, first batch) + row count as a string |
 | `init_logging` | `lib.rs:13` | `tracing` init honouring `RUST_LOG`, default `info` |
 
