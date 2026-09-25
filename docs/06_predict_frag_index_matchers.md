@@ -286,6 +286,25 @@ still assigned in first-appearance order over the rows the load keeps, so a part
 load never interns a name that only a skipped row carries.
 `n_candidates()` is the candidate count.
 
+The load is parallel and its arrays are bit-identical to the serial load. The eight
+precursor columns and the `candidate_id` check are read concurrently, one reader
+each, and their results are taken in the serial order, so a table with several
+problems is refused with the same message. The fragment table is cut into
+row-contiguous parts (`TableFile::row_parts`: row groups, merged to about one part per
+thread, and page-aligned ranges inside a row group that carries an offset index;
+without an offset index a group is never split, because every part would decode the
+pages before its own). Pass 1 counts the parts concurrently into atomic counters and
+records whether the kept ids ascend. When they ascend over the whole table, which is
+the layout every library writer produces, the counting sort is the identity, so each
+part fills its own contiguous slice of the output (`split_at_mut`) and interns names
+locally; the dictionaries are merged in part order, which is first appearance in file
+order. Otherwise pass 2 is the serial scatter. Within a part the four columns are
+decoded by one reader each, in parallel and one batch ahead of the placement
+(`colread::for_each_zipped`, `rayon::join` only, so it cannot deadlock on a small
+pool). Measured on the AIF library at 16 threads: 990 ms to 350-440 ms for the
+one-row-group file pyarrow wrote, and to 175 ms for the same library in 1M-row groups
+with an offset index.
+
 The library is structure-of-arrays, indexed by local candidate id: one column per
 precursor field (`peptidoform_id`, `base_peptide_id`, `charge`, `predicted_irt`,
 `is_decoy`), the peptidoform text as one arena (`peptidoform(cid)`), the protein

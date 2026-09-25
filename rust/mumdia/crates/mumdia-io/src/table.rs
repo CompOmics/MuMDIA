@@ -1705,6 +1705,16 @@ struct RowSpan {
     skip_after: usize,
 }
 
+/// Whether row group `g` of `meta` carries an offset index (page locations) for every
+/// column, which is what lets a reader skip the pages before a row range.
+fn has_offset_index(meta: &ParquetMetaData, g: usize) -> bool {
+    meta.offset_index().is_some_and(|oi| {
+        oi.get(g).is_some_and(|cols| {
+            !cols.is_empty() && cols.iter().all(|c| !c.page_locations().is_empty())
+        })
+    })
+}
+
 /// Per-row-group facts a caller can plan a partial read from without decoding anything:
 /// the row count and the writer's min/max statistics of one numeric column, as f64.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1771,8 +1781,19 @@ impl TableFile {
                 self.path
             );
         }
+        self.span_on(&self.meta, first_row, n_rows)
+    }
+
+    /// The span `[first_row, first_row + n_rows)` of the FILE, read through `meta` (this
+    /// handle's footer, or the same footer with its offset index loaded).
+    fn span_on(
+        &self,
+        meta_handle: &ArrowReaderMetadata,
+        first_row: usize,
+        n_rows: usize,
+    ) -> Result<TableFile> {
         let path = &self.path;
-        let meta: &ParquetMetaData = self.meta.metadata();
+        let meta: &ParquetMetaData = meta_handle.metadata();
         let total = meta.file_metadata().num_rows().max(0) as usize;
         if first_row.saturating_add(n_rows) > total {
             anyhow::bail!(
@@ -1801,7 +1822,7 @@ impl TableFile {
             path: self.path.clone(),
             schema: self.schema.clone(),
             nrows: n_rows,
-            meta: self.meta.clone(),
+            meta: meta_handle.clone(),
             selection: Some(RowSpan {
                 row_groups,
                 skip_before,
@@ -1809,6 +1830,124 @@ impl TableFile {
                 skip_after,
             }),
         })
+    }
+
+    /// The file rows this handle reads, as `(first, nrows)`.
+    fn file_row_range(&self) -> (usize, usize) {
+        match &self.selection {
+            None => (0, self.nrows),
+            Some(span) => {
+                let meta = self.meta.metadata();
+                let before: usize = (0..span.row_groups.first().copied().unwrap_or(0))
+                    .map(|i| meta.row_group(i).num_rows().max(0) as usize)
+                    .sum();
+                (before + span.skip_before, span.take)
+            }
+        }
+    }
+
+    /// Split this handle's rows into at most about `max_parts` contiguous parts for
+    /// parallel decoding, in row order: concatenating the parts' rows gives this handle's
+    /// rows, row for row. Every part is a handle of its own (a span of the file), so each
+    /// can be read on its own thread with its own reader.
+    ///
+    /// Parts follow the file's layout, because a part that begins inside a page makes its
+    /// reader decode that page up to the part's first row:
+    ///
+    /// - Row-group boundaries are always usable, and consecutive small row groups are
+    ///   merged until a part holds about `nrows / max_parts` rows.
+    /// - A row group larger than that is split further ONLY when the file carries an
+    ///   offset index for it, which the engine's own writer does. The parts' readers are
+    ///   then built on the footer with that index loaded, so a reader skips the pages
+    ///   before its range instead of decoding them; each part boundary costs at most one
+    ///   partly decoded page per column. Without an offset index (pyarrow writes none by
+    ///   default) a split would make part `k` decode `k` parts' worth of pages before its
+    ///   own, so such a row group stays whole.
+    ///
+    /// One part (a span of the whole handle) when `max_parts <= 1` or the handle is empty.
+    pub fn row_parts(&self, max_parts: usize) -> Result<Vec<TableFile>> {
+        let (first, n) = self.file_row_range();
+        let max_parts = max_parts.max(1);
+        let whole = || -> Result<Vec<TableFile>> {
+            Ok(vec![match self.selection {
+                None => self.span_on(&self.meta, 0, self.nrows)?,
+                Some(_) => self.span_on(&self.meta, first, n)?,
+            }])
+        };
+        if max_parts == 1 || n == 0 {
+            return whole();
+        }
+        let target = n.div_ceil(max_parts).max(1);
+        let meta = self.meta.metadata();
+        // Row groups the handle covers, as file-row segments clipped to the handle.
+        let mut segs: Vec<(usize, usize, usize)> = Vec::new(); // (group, start, end)
+        let mut start = 0usize;
+        for g in 0..meta.num_row_groups() {
+            let rows = meta.row_group(g).num_rows().max(0) as usize;
+            let (s, e) = (start.max(first), (start + rows).min(first + n));
+            if s < e {
+                segs.push((g, s, e));
+            }
+            start += rows;
+        }
+        // The offset index is read only when some covered group is worth splitting.
+        let needs_split = segs.iter().any(|&(_, s, e)| e - s > target);
+        let indexed: Option<ArrowReaderMetadata> = if needs_split {
+            let file = std::fs::File::open(&self.path)
+                .with_context(|| format!("opening {}", self.path))?;
+            let m = ArrowReaderMetadata::load(
+                &file,
+                ArrowReaderOptions::new().with_offset_index_policy(PageIndexPolicy::Optional),
+            )
+            .with_context(|| format!("reading parquet offset index {}", self.path))?;
+            // Same options as `open` apart from the index, so the Arrow schema is the one
+            // this handle already has.
+            Some(m)
+        } else {
+            None
+        };
+        let split_ok = |g: usize| {
+            indexed
+                .as_ref()
+                .is_some_and(|m| has_offset_index(m.metadata(), g))
+        };
+        // Pieces: whole segments, or equal sub-ranges of an indexed large one.
+        let mut pieces: Vec<(usize, usize, bool)> = Vec::new(); // (start, end, from a split)
+        for &(g, s, e) in &segs {
+            let len = e - s;
+            if len > target && split_ok(g) {
+                let k = len.div_ceil(target);
+                for i in 0..k {
+                    let (a, b) = (s + len * i / k, s + len * (i + 1) / k);
+                    if a < b {
+                        pieces.push((a, b, true));
+                    }
+                }
+            } else {
+                pieces.push((s, e, false));
+            }
+        }
+        // Merge consecutive pieces greedily up to the target size.
+        let mut parts: Vec<(usize, usize, bool)> = Vec::new();
+        for (a, b, split) in pieces {
+            match parts.last_mut() {
+                Some(last) if last.1 == a && last.1 - last.0 < target && b - last.0 <= target => {
+                    last.1 = b;
+                    last.2 |= split;
+                }
+                _ => parts.push((a, b, split)),
+            }
+        }
+        if parts.len() <= 1 {
+            return whole();
+        }
+        parts
+            .into_iter()
+            .map(|(a, b, split)| match (&indexed, split) {
+                (Some(m), true) => self.span_on(m, a, b - a),
+                _ => self.span_on(&self.meta, a, b - a),
+            })
+            .collect()
     }
 
     /// Row count and min/max statistics of a numeric column per row group, in file order,
@@ -2200,7 +2339,9 @@ mod tests {
         let p = dir.join("s.parquet").to_str().unwrap().to_string();
         let n = SCALAR_BATCH_ROWS + 7;
         let pool = ["P3", "P1", "", "P2", "UNASSIGNED"];
-        let rows: Vec<String> = (0..n).map(|i| pool[(i * 7 + i / 3) % 5].to_string()).collect();
+        let rows: Vec<String> = (0..n)
+            .map(|i| pool[(i * 7 + i / 3) % 5].to_string())
+            .collect();
         let mut w = TableWriter::new(&p).with_row_group_rows(1000);
         w.write_cols(vec![
             Col::Str("s".into(), rows.clone()),
@@ -2247,6 +2388,129 @@ mod tests {
             err.contains(&format!("NULL at row {}", SCALAR_BATCH_ROWS + 2)),
             "{err}"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Write `n` rows (`id` u32 and a list column `v` of `id % 5 + 1` floats) with the given
+    /// row-group size, many small data pages, and the offset index on or off.
+    fn write_parts_fixture(path: &str, n: usize, row_group: usize, offset_index: bool) {
+        use parquet::file::properties::EnabledStatistics;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::UInt32, false),
+            Field::new(
+                "v",
+                DataType::LargeList(Arc::new(Field::new_list_field(DataType::Float32, true))),
+                false,
+            ),
+        ]));
+        let mut lb = LargeListBuilder::new(Float32Builder::new());
+        for i in 0..n {
+            for k in 0..(i % 5 + 1) {
+                lb.values().append_value(i as f32 + k as f32 * 0.25);
+            }
+            lb.append(true);
+        }
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from((0..n as u32).collect::<Vec<_>>())),
+                Arc::new(lb.finish()),
+            ],
+        )
+        .unwrap();
+        let mut props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(row_group))
+            .set_data_page_row_count_limit(97)
+            .set_write_batch_size(97);
+        if !offset_index {
+            props = props
+                .set_statistics_enabled(EnabledStatistics::Chunk)
+                .set_offset_index_disabled(true);
+        }
+        let file = std::fs::File::create(path).unwrap();
+        let mut w = ArrowWriter::try_new(file, schema, Some(props.build())).unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+    }
+
+    /// Every row of a part set, in order: the ids and the flattened list values.
+    fn read_parts(parts: &[TableFile]) -> (Vec<u32>, Vec<f32>) {
+        let mut ids = Vec::new();
+        let mut vals = Vec::new();
+        for p in parts {
+            assert_eq!(
+                p.u32("id").unwrap().len(),
+                p.nrows,
+                "a part's nrows is its rows"
+            );
+            ids.extend(p.u32("id").unwrap());
+            vals.extend(p.list_f32_flat("v").unwrap().1);
+        }
+        (ids, vals)
+    }
+
+    /// `row_parts` is a partition of the handle's rows, in order, whatever the layout: many
+    /// row groups (merged), one large row group with an offset index (split), one without
+    /// (kept whole), and a span handle (clipped to the span).
+    #[test]
+    fn row_parts_partition_the_rows_in_order_and_split_only_where_pages_can_be_skipped() {
+        let dir = std::env::temp_dir().join(format!("mumdia_row_parts_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let n = 20_000usize;
+        let whole_ref = |p: &str| {
+            let t = TableFile::open(p).unwrap();
+            (t.u32("id").unwrap(), t.list_f32_flat("v").unwrap().1)
+        };
+
+        // Many row groups: parts are merged runs of whole groups.
+        let many = dir.join("many.parquet").to_str().unwrap().to_string();
+        write_parts_fixture(&many, n, 700, true);
+        let t = TableFile::open(&many).unwrap();
+        let parts = t.row_parts(6).unwrap();
+        assert!(parts.len() > 1 && parts.len() <= 8, "{} parts", parts.len());
+        assert_eq!(read_parts(&parts), whole_ref(&many));
+
+        // One row group WITH an offset index: split inside the group.
+        let one = dir.join("one.parquet").to_str().unwrap().to_string();
+        write_parts_fixture(&one, n, n, true);
+        let t = TableFile::open(&one).unwrap();
+        let parts = t.row_parts(8).unwrap();
+        assert_eq!(
+            parts.len(),
+            8,
+            "an indexed group splits into the requested parts"
+        );
+        assert_eq!(read_parts(&parts), whole_ref(&one));
+
+        // One row group WITHOUT an offset index: never split, one part.
+        let flat = dir.join("flat.parquet").to_str().unwrap().to_string();
+        write_parts_fixture(&flat, n, n, false);
+        let t = TableFile::open(&flat).unwrap();
+        let parts = t.row_parts(8).unwrap();
+        assert_eq!(
+            parts.len(),
+            1,
+            "no offset index, so no split inside the group"
+        );
+        assert_eq!(read_parts(&parts), whole_ref(&flat));
+
+        // A span of each: the parts cover exactly the span's rows.
+        for p in [&many, &one, &flat] {
+            let t = TableFile::open(p).unwrap();
+            let (a, len) = (1_234usize, 9_876usize);
+            let sp = t.span(a, len).unwrap();
+            let parts = sp.row_parts(5).unwrap();
+            let (ids, vals) = read_parts(&parts);
+            assert_eq!(ids, (a as u32..(a + len) as u32).collect::<Vec<_>>(), "{p}");
+            assert_eq!(vals, sp.list_f32_flat("v").unwrap().1, "{p}");
+        }
+        // Degenerate requests.
+        let t = TableFile::open(&one).unwrap();
+        assert_eq!(t.row_parts(1).unwrap().len(), 1);
+        assert_eq!(t.row_parts(0).unwrap().len(), 1);
+        assert!(read_parts(&t.span(5, 0).unwrap().row_parts(4).unwrap())
+            .0
+            .is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

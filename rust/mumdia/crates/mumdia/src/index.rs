@@ -19,6 +19,7 @@ use arrow::array::{Array, ArrayRef, Float32Array, Float64Array, StringArray, UIn
 use mumdia_core::constants::{ppm_bounds, PROTON};
 use mumdia_io::table::{require_no_nulls, TableFile};
 use rayon::prelude::*;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 /// Fragment rows per decoded batch while streaming the fragment table (a few MB).
@@ -253,6 +254,12 @@ struct PrecursorColumns {
 
 /// Read and validate the precursor table's columns: the whole file, or the row span of a
 /// range load, whose ids are checked against the FILE row (`offset`).
+///
+/// The eight column reads and the `candidate_id` check are independent, so they run
+/// concurrently (`rayon::scope`, one task per column, each with its own reader); a
+/// one-thread pool runs them in turn. Their results are then taken in the order the
+/// serial load read them, and every check runs in its old order, so a table with more than
+/// one problem is refused with the same message as before.
 fn load_precursors(
     precursors: &str,
     span: Option<(usize, usize)>,
@@ -262,18 +269,42 @@ fn load_precursors(
         None => TableFile::open(precursors)?,
         Some((first, n)) => TableFile::open_rows(precursors, first, n)?,
     };
-    let peptidoform_id = pt.u32("peptidoform_id")?;
-    let base_peptide_id = pt.u32("base_peptide_id")?;
-    // One arena for the peptidoform text instead of one `String` per precursor.
-    let (pform_offsets, mut pform_data) = pt.str_flat("peptidoform")?;
-    let charge = pt.i32("charge")?;
-    let precursor_mz = pt.f64("precursor_mz")?;
-    let predicted_irt = pt.f32("predicted_irt")?;
-    // Interned: a library has far fewer protein groups than precursors.
-    let (protein_id, mut protein_dict) = pt.str_interned("protein")?;
-    // `label` is validated and reduced to a bit in one streaming pass rather than being
-    // held as a `Vec<String>`; `candidate_id` is checked the same way further down.
-    let is_decoy = read_is_decoy(&pt, precursors)?;
+    let ncand = pt.nrows;
+    let (mut r_pfid, mut r_base, mut r_pform, mut r_charge) = (None, None, None, None);
+    let (mut r_pmz, mut r_irt, mut r_prot, mut r_dec, mut r_ids) = (None, None, None, None, None);
+    {
+        let pt = &pt;
+        rayon::scope(|s| {
+            s.spawn(|_| r_pfid = Some(pt.u32("peptidoform_id")));
+            s.spawn(|_| r_base = Some(pt.u32("base_peptide_id")));
+            // One arena for the peptidoform text instead of one `String` per precursor.
+            s.spawn(|_| r_pform = Some(pt.str_flat("peptidoform")));
+            s.spawn(|_| r_charge = Some(pt.i32("charge")));
+            s.spawn(|_| r_pmz = Some(pt.f64("precursor_mz")));
+            s.spawn(|_| r_irt = Some(pt.f32("predicted_irt")));
+            // Interned: a library has far fewer protein groups than precursors.
+            s.spawn(|_| r_prot = Some(pt.str_interned("protein")));
+            // `label` is validated and reduced to a bit in one streaming pass rather than
+            // being held as a `Vec<String>`.
+            s.spawn(|_| r_dec = Some(read_is_decoy(pt, precursors)));
+            // Precondition: candidate_id is the contiguous, row-aligned range 0..ncand
+            // (the library + decoy builders guarantee this). An external library that
+            // violates it would misgroup fragments or panic on the index below, so it is
+            // checked explicitly -- its verdict is reported after the column checks, where
+            // the serial load reported it. For a range load the same invariant holds
+            // against the file row: local id c is file row c + offset.
+            s.spawn(|_| r_ids = Some(check_candidate_ids(pt, precursors, offset, ncand)));
+        });
+    }
+    let taken = "the scope ran every read";
+    let peptidoform_id = r_pfid.expect(taken)?;
+    let base_peptide_id = r_base.expect(taken)?;
+    let (pform_offsets, mut pform_data) = r_pform.expect(taken)?;
+    let charge = r_charge.expect(taken)?;
+    let precursor_mz = r_pmz.expect(taken)?;
+    let predicted_irt = r_irt.expect(taken)?;
+    let (protein_id, mut protein_dict) = r_prot.expect(taken)?;
+    let is_decoy = r_dec.expect(taken)?;
     // `str_flat` grows its buffer by doubling; the arena lives for the whole search.
     pform_data.shrink_to_fit();
     let pform = |i: usize| &pform_data[pform_offsets[i]..pform_offsets[i + 1]];
@@ -307,7 +338,6 @@ fn load_precursors(
     // explicitly empty string is a different thing and still reaches here: an empty
     // `peptidoform` cannot be parsed into residues, and an empty `protein` silently
     // joins every such candidate into one protein group.
-    let ncand = pt.nrows;
     if let Some(row) = (0..ncand).position(|i| pform(i).trim().is_empty()) {
         anyhow::bail!(
             "library column 'peptidoform' is empty at row {row} in {precursors}; it is \
@@ -347,13 +377,7 @@ fn load_precursors(
             }
         }
     }
-    // Precondition: candidate_id is the contiguous, row-aligned range 0..ncand
-    // (the library + decoy builders guarantee this). An external library that
-    // violates it would misgroup fragments or panic on the index below, so
-    // check explicitly and fail with a clear error instead.
-    // For a range load the same invariant holds against the file row: local id c is
-    // file row c + offset, so the slice's ids must be exactly offset..offset + ncand.
-    check_candidate_ids(&pt, precursors, offset, ncand)?;
+    r_ids.expect(taken)?;
     Ok(PrecursorColumns {
         peptidoform_id,
         base_peptide_id,
@@ -369,6 +393,7 @@ fn load_precursors(
 }
 
 /// The fragment columns of a library, grouped by candidate.
+#[derive(Debug)]
 struct FragmentColumns {
     frag_offsets: Vec<u32>,
     frag_mz: Vec<f32>,
@@ -383,22 +408,42 @@ struct FragmentColumns {
 /// Two streaming passes over the four columns the library needs (the artifact also carries
 /// `ion_type`, `ordinal`, `frag_charge` and `cardinality`, which are never fetched). Pass 1
 /// decodes only `candidate_id` and counts fragments per candidate; pass 2 decodes the four
-/// columns batch by batch and scatters each row straight into its final grouped slot,
-/// interning the fragment name on the way.
+/// columns batch by batch and places each row in its final grouped slot, interning the
+/// fragment name on the way.
 ///
-/// This is the same counting sort as before -- rows scattered in ascending file order keep
-/// each candidate's fragments in stored order, so the resulting layout is identical -- but
-/// with the file as the source instead of owned copies: no whole-table Arrow batches (23 GB
-/// at 657M rows), no owned copy of the four columns, no `frag_order` permutation and no
-/// `Vec<String>` with one heap allocation per fragment. The resident peak is the final
-/// arrays plus one batch, which is what lets a modification-expanded library load on a
-/// 32 GB machine. A partial load (a range of one file, or a band file against the shared
-/// fragment table) sees fragments of other candidates and skips them.
+/// This is a counting sort -- rows placed in ascending file order keep each candidate's
+/// fragments in stored order -- with the file as the source instead of owned copies: no
+/// whole-table Arrow batches (23 GB at 657M rows), no owned copy of the four columns, no
+/// permutation and no `Vec<String>` with one heap allocation per fragment. The resident
+/// peak is the final arrays plus the batches in flight, which is what lets a
+/// modification-expanded library load on a 32 GB machine. A partial load (a range of one
+/// file, or a band file against the shared fragment table) sees fragments of other
+/// candidates and skips them.
+///
+/// Parallel, in two ways, with the arrays bit-identical to the serial pass:
+///
+/// - The table is cut into row-contiguous parts ([`TableFile::row_parts`]: row groups,
+///   and page-aligned ranges inside a group that has an offset index). Pass 1 counts the
+///   parts concurrently into shared atomic counters (integer sums, so the order does not
+///   matter) and records whether each part's in-range ids are ascending.
+/// - When they are ascending across the whole table -- the layout every library writer
+///   produces, and what `scripts/sort_fragments.py` restores -- the counting sort is the
+///   identity: a kept row's slot is its rank among the kept rows. Each part then owns one
+///   contiguous slice of the output (`split_at_mut`, no shared writes), fills it, and
+///   interns names locally; the local dictionaries are merged in part order, which is
+///   first appearance in file order, and the ids remapped. Otherwise (an unsorted table,
+///   or one part) pass 2 is the serial scatter.
+///
+/// Within a part, and on the serial path, the columns are decoded with one reader each,
+/// in parallel and one batch ahead of the placement ([`crate::colread::for_each_zipped`]).
+/// That is the only parallelism a one-row-group table without an offset index has, which
+/// is what pyarrow writes by default.
 fn load_fragments(
     fragments: &str,
     frag_offset: usize,
     ncand: usize,
     partial: bool,
+    max_parts: usize,
 ) -> Result<FragmentColumns> {
     let ft = if partial {
         Library::open_fragments_for(fragments, frag_offset, ncand)?
@@ -411,40 +456,45 @@ fn load_fragments(
             ft.nrows
         );
     }
-    let mut frag_offsets: Vec<u32> = vec![0; ncand + 1];
-    {
-        let mut row = 0usize;
-        for b in ft.batches(Some(&["candidate_id"]), FRAG_BATCH_ROWS)? {
-            let b = b?;
-            let a = b
-                .column(0)
-                .as_any()
-                .downcast_ref::<UInt32Array>()
-                .ok_or_else(|| anyhow::anyhow!("fragment column 'candidate_id' is not u32"))?;
-            // `values()` is the physical buffer and ignores the validity bitmap: a NULL
-            // candidate_id would read as 0 and attach the fragment to candidate 0
-            // (docs/29 #2).
-            require_no_nulls(a, "candidate_id", fragments, row)?;
-            for &candidate_id in a.values().iter() {
-                let c = candidate_id as usize;
-                row += 1;
-                // A range load sees the fragments of neighbouring candidates in the
-                // boundary row groups (or the whole table when it is unsorted); they
-                // belong to precursors this library does not hold and are skipped. A
-                // full load has no such rows, so an id past the end is a broken file.
-                if c < frag_offset || c >= frag_offset + ncand {
-                    if partial {
-                        continue;
-                    }
-                    anyhow::bail!(
-                        "fragment row {} references candidate_id {c} >= precursor count {ncand}",
-                        row - 1
-                    );
-                }
-                frag_offsets[c - frag_offset + 1] += 1;
-            }
-        }
-    }
+    let range = FragRange {
+        fragments,
+        frag_offset,
+        ncand,
+        partial,
+    };
+    let parts = ft.row_parts(max_parts)?;
+    // First handle row of each part, for the error messages.
+    let part_row0: Vec<usize> = parts
+        .iter()
+        .scan(0usize, |acc, p| {
+            let r = *acc;
+            *acc += p.nrows;
+            Some(r)
+        })
+        .collect();
+
+    // Pass 1.
+    let (mut frag_offsets, infos) = if parts.len() > 1 {
+        let counts: Vec<AtomicU32> = (0..=ncand).map(|_| AtomicU32::new(0)).collect();
+        let infos = crate::colread::first_err(
+            parts
+                .par_iter()
+                .zip(part_row0.par_iter())
+                .map(|(part, &row0)| {
+                    count_part(part, row0, &range, |c| {
+                        counts[c + 1].fetch_add(1, Ordering::Relaxed);
+                    })
+                })
+                .collect(),
+        )?;
+        // In place: `AtomicU32` and `u32` share size and alignment.
+        let counts: Vec<u32> = counts.into_iter().map(AtomicU32::into_inner).collect();
+        (counts, infos)
+    } else {
+        let mut counts: Vec<u32> = vec![0; ncand + 1];
+        let info = count_part(&ft, 0, &range, |c| counts[c + 1] += 1)?;
+        (counts, vec![info])
+    };
     for c in 0..ncand {
         frag_offsets[c + 1] += frag_offsets[c];
     }
@@ -456,71 +506,300 @@ fn load_fragments(
     // Fragment names are INTERNED (see the struct field docs): a u16 dictionary id per
     // fragment, assigned by first appearance in file order.
     let mut frag_name_id: Vec<u16> = vec![0; n_frag_rows];
-    // Interned through the column's dictionary (`batches_dict`): the name column is a
-    // few hundred distinct values over every fragment row, so a row costs an i32 key
-    // lookup in a per-batch memo rather than a SipHash of its text, and the ids are
-    // still assigned in first-appearance order over the IN-RANGE rows, exactly as the
-    // per-row map assigned them.
-    let mut names = mumdia_io::table::StrInterner::new();
-    {
-        let mut cursor = frag_offsets.clone();
-        let reader = ft.batches_dict(
-            Some(&["candidate_id", "mz", "predicted_intensity", "name"]),
-            FRAG_BATCH_ROWS,
-            &["name"],
-        )?;
-        let schema = reader.schema();
-        let ix = |n: &str| {
-            schema
-                .index_of(n)
-                .map_err(|_| anyhow::anyhow!("fragment library has no column '{n}'"))
-        };
-        let (i_cid, i_mz, i_int, i_name) = (
-            ix("candidate_id")?,
-            ix("mz")?,
-            ix("predicted_intensity")?,
-            ix("name")?,
-        );
-        let mut row_base = 0usize;
-        for b in reader {
-            let b = b?;
-            let cols = [
-                b.column(i_cid).clone(),
-                b.column(i_mz).clone(),
-                b.column(i_int).clone(),
-                b.column(i_name).clone(),
-            ];
-            let batch = FragBatch::of(&cols, fragments, row_base)?;
-            names.begin(&batch.name);
-            for k in 0..batch.len() {
-                let c = batch.cid.value(k) as usize;
-                if c < frag_offset || c >= frag_offset + ncand {
-                    if partial {
-                        continue;
-                    }
-                    anyhow::bail!(
-                        "fragment table changed between passes: candidate_id {c} >= {ncand}"
-                    );
-                }
-                let c = c - frag_offset;
-                let pos = cursor[c] as usize;
-                cursor[c] += 1;
-                // NULLs were rejected above, so the physical values are the values.
-                frag_mz[pos] = batch.mz.value(k) as f32;
-                frag_int[pos] = batch.int.value(k);
-                let id = batch.name_id(&mut names, k, fragments, row_base)?;
-                frag_name_id[pos] = frag_name_id_u16(id)?;
-            }
-            row_base += batch.len();
-        }
-    }
+    let frag_name_dict = if parts.len() > 1 && ascending_across(&infos) {
+        place_sorted_parts(
+            &parts,
+            &part_row0,
+            &infos,
+            &range,
+            &mut frag_mz,
+            &mut frag_int,
+            &mut frag_name_id,
+        )?
+    } else {
+        scatter_serial(
+            &ft,
+            &range,
+            &frag_offsets,
+            &mut frag_mz,
+            &mut frag_int,
+            &mut frag_name_id,
+        )?
+    };
     Ok(FragmentColumns {
         frag_offsets,
         frag_mz,
         frag_int,
         frag_name_id,
-        frag_name_dict: names.into_values(),
+        frag_name_dict,
     })
+}
+
+/// Which candidates a fragment load keeps, and how it names its input.
+struct FragRange<'a> {
+    fragments: &'a str,
+    frag_offset: usize,
+    ncand: usize,
+    partial: bool,
+}
+
+impl FragRange<'_> {
+    /// Local candidate of a fragment row's id, `None` for a row a partial load skips, and
+    /// the error a full load raises for an id past the end (`row` is the handle row).
+    #[inline]
+    fn local(&self, c: usize, row: usize) -> Result<Option<usize>> {
+        if c < self.frag_offset || c >= self.frag_offset + self.ncand {
+            if self.partial {
+                return Ok(None);
+            }
+            anyhow::bail!(
+                "fragment row {row} references candidate_id {c} >= precursor count {}",
+                self.ncand
+            );
+        }
+        Ok(Some(c - self.frag_offset))
+    }
+}
+
+/// What pass 1 learned about one part of the fragment table.
+#[derive(Clone, Copy, Debug)]
+struct PartInfo {
+    /// Rows of the part the load keeps.
+    kept: usize,
+    /// Local candidate of the first and last kept row.
+    first: Option<u32>,
+    last: Option<u32>,
+    /// Whether the kept rows' candidates never decrease within the part.
+    ascending: bool,
+}
+
+/// Pass 1 over one part: count each kept row's candidate through `bump`.
+fn count_part(
+    part: &TableFile,
+    row0: usize,
+    range: &FragRange,
+    mut bump: impl FnMut(usize) + Send,
+) -> Result<PartInfo> {
+    let mut info = PartInfo {
+        kept: 0,
+        first: None,
+        last: None,
+        ascending: true,
+    };
+    crate::colread::for_each_zipped(
+        part,
+        &["candidate_id"],
+        &[],
+        FRAG_BATCH_ROWS,
+        |base, cols| {
+            let a = cols[0]
+                .as_any()
+                .downcast_ref::<UInt32Array>()
+                .ok_or_else(|| anyhow::anyhow!("fragment column 'candidate_id' is not u32"))?;
+            // `values()` is the physical buffer and ignores the validity bitmap: a NULL
+            // candidate_id would read as 0 and attach the fragment to candidate 0
+            // (docs/29 #2).
+            require_no_nulls(a, "candidate_id", range.fragments, row0 + base)?;
+            for (k, &candidate_id) in a.values().iter().enumerate() {
+                // A range load sees the fragments of neighbouring candidates in the
+                // boundary row groups (or the whole table when it is unsorted); they
+                // belong to precursors this library does not hold and are skipped. A
+                // full load has no such rows, so an id past the end is a broken file.
+                let Some(c) = range.local(candidate_id as usize, row0 + base + k)? else {
+                    continue;
+                };
+                bump(c);
+                let c = c as u32;
+                if info.last.is_some_and(|l| c < l) {
+                    info.ascending = false;
+                }
+                info.first.get_or_insert(c);
+                info.last = Some(c);
+                info.kept += 1;
+            }
+            Ok(())
+        },
+    )?;
+    Ok(info)
+}
+
+/// Whether the kept rows' candidates never decrease over the whole table, parts in order.
+fn ascending_across(infos: &[PartInfo]) -> bool {
+    let mut prev: Option<u32> = None;
+    for i in infos {
+        if !i.ascending {
+            return false;
+        }
+        if let (Some(p), Some(f)) = (prev, i.first) {
+            if f < p {
+                return false;
+            }
+        }
+        if i.last.is_some() {
+            prev = i.last;
+        }
+    }
+    true
+}
+
+/// `v` cut into consecutive slices of the given lengths (which must sum to `v.len()`).
+fn split_lens<'a, T>(mut v: &'a mut [T], lens: &[usize]) -> Vec<&'a mut [T]> {
+    let mut out = Vec::with_capacity(lens.len());
+    for &n in lens {
+        let (head, tail) = std::mem::take(&mut v).split_at_mut(n);
+        out.push(head);
+        v = tail;
+    }
+    out
+}
+
+/// Pass 2 on an ascending table: every part fills its own slice, in parallel.
+#[allow(clippy::too_many_arguments)]
+fn place_sorted_parts(
+    parts: &[TableFile],
+    part_row0: &[usize],
+    infos: &[PartInfo],
+    range: &FragRange,
+    frag_mz: &mut [f32],
+    frag_int: &mut [f32],
+    frag_name_id: &mut [u16],
+) -> Result<Vec<String>> {
+    let lens: Vec<usize> = infos.iter().map(|i| i.kept).collect();
+    let jobs: Vec<_> = parts
+        .iter()
+        .zip(part_row0)
+        .zip(split_lens(frag_mz, &lens))
+        .zip(split_lens(frag_int, &lens))
+        .zip(split_lens(frag_name_id, &lens))
+        .map(|((((part, &row0), mz), int), ids)| (part, row0, mz, int, ids))
+        .collect();
+    let locals: Vec<Vec<String>> = crate::colread::first_err(
+        jobs.into_par_iter()
+            .map(|(part, row0, mz, int, ids)| place_part(part, row0, range, mz, int, ids))
+            .collect(),
+    )?;
+    // Merge the parts' dictionaries in part order: that is first appearance over the kept
+    // rows in file order, exactly the order the serial pass assigns.
+    let mut names = mumdia_io::table::StrInterner::new();
+    let maps: Vec<Vec<u16>> = locals
+        .iter()
+        .map(|local| {
+            local
+                .iter()
+                .map(|v| frag_name_id_u16(names.intern(v)))
+                .collect::<Result<Vec<u16>>>()
+        })
+        .collect::<Result<_>>()?;
+    split_lens(frag_name_id, &lens)
+        .into_par_iter()
+        .zip(maps.par_iter())
+        .for_each(|(ids, map)| {
+            for id in ids.iter_mut() {
+                *id = map[*id as usize];
+            }
+        });
+    Ok(names.into_values())
+}
+
+/// One part of an ascending table, into its own output slices; returns its local name
+/// dictionary (the slice holds local ids).
+fn place_part(
+    part: &TableFile,
+    row0: usize,
+    range: &FragRange,
+    mz_out: &mut [f32],
+    int_out: &mut [f32],
+    id_out: &mut [u16],
+) -> Result<Vec<String>> {
+    let mut names = mumdia_io::table::StrInterner::new();
+    let mut j = 0usize;
+    let changed = || anyhow::anyhow!("fragment table {} changed between passes", range.fragments);
+    crate::colread::for_each_zipped(
+        part,
+        &["candidate_id", "mz", "predicted_intensity", "name"],
+        &["name"],
+        FRAG_BATCH_ROWS,
+        |base, cols| {
+            let cols: &[ArrayRef; 4] = cols.try_into().expect("four columns");
+            let batch = FragBatch::of(cols, range.fragments, row0 + base)?;
+            names.begin(&batch.name);
+            for k in 0..batch.len() {
+                // Pass 1 already refused an out-of-range id on a full load, so one here
+                // means the file changed under the load.
+                if range
+                    .local(batch.cid.value(k) as usize, row0 + base + k)
+                    .map_err(|_| changed())?
+                    .is_none()
+                {
+                    continue;
+                }
+                if j >= mz_out.len() {
+                    return Err(changed());
+                }
+                // NULLs were rejected above, so the physical values are the values.
+                mz_out[j] = batch.mz.value(k) as f32;
+                int_out[j] = batch.int.value(k);
+                let id = batch.name_id(&mut names, k, range.fragments, row0 + base)?;
+                id_out[j] = frag_name_id_u16(id)?;
+                j += 1;
+            }
+            Ok(())
+        },
+    )?;
+    if j != mz_out.len() {
+        return Err(changed());
+    }
+    Ok(names.into_values())
+}
+
+/// Pass 2 by scatter: each kept row to the next free slot of its candidate.
+fn scatter_serial(
+    ft: &TableFile,
+    range: &FragRange,
+    frag_offsets: &[u32],
+    frag_mz: &mut [f32],
+    frag_int: &mut [f32],
+    frag_name_id: &mut [u16],
+) -> Result<Vec<String>> {
+    // Interned through the column's dictionary (`batches_dict`): the name column is a few
+    // hundred distinct values over every fragment row, so a row costs an i32 key lookup in
+    // a per-batch memo rather than a SipHash of its text, and the ids are still assigned
+    // in first-appearance order over the KEPT rows, exactly as the per-row map assigned
+    // them.
+    let mut names = mumdia_io::table::StrInterner::new();
+    let mut cursor: Vec<u32> = frag_offsets.to_vec();
+    crate::colread::for_each_zipped(
+        ft,
+        &["candidate_id", "mz", "predicted_intensity", "name"],
+        &["name"],
+        FRAG_BATCH_ROWS,
+        |base, cols| {
+            let cols: &[ArrayRef; 4] = cols.try_into().expect("four columns");
+            let batch = FragBatch::of(cols, range.fragments, base)?;
+            names.begin(&batch.name);
+            for k in 0..batch.len() {
+                let c = batch.cid.value(k) as usize;
+                let Some(c) = range.local(c, base + k).map_err(|_| {
+                    anyhow::anyhow!(
+                        "fragment table changed between passes: candidate_id {c} >= {}",
+                        range.ncand
+                    )
+                })?
+                else {
+                    continue;
+                };
+                let pos = cursor[c] as usize;
+                cursor[c] += 1;
+                // NULLs were rejected above, so the physical values are the values.
+                frag_mz[pos] = batch.mz.value(k) as f32;
+                frag_int[pos] = batch.int.value(k);
+                let id = batch.name_id(&mut names, k, range.fragments, base)?;
+                frag_name_id[pos] = frag_name_id_u16(id)?;
+            }
+            Ok(())
+        },
+    )?;
+    Ok(names.into_values())
 }
 
 /// One decoded batch of the four fragment columns a library needs, type-checked, NULL-
@@ -815,7 +1094,13 @@ impl Library {
         let ncand = pc.charge.len();
         let precursor_ms = t_load.elapsed().as_millis() as u64;
 
-        let fc = load_fragments(fragments, frag_offset, ncand, partial)?;
+        let fc = load_fragments(
+            fragments,
+            frag_offset,
+            ncand,
+            partial,
+            rayon::current_num_threads(),
+        )?;
         let fragment_ms = t_load.elapsed().as_millis() as u64 - precursor_ms;
         let n_frag_rows = fc.frag_mz.len();
 
@@ -1765,6 +2050,172 @@ mod tests {
         // Unique per process so two concurrent `cargo test` runs cannot race, per the
         // convention in docs/14.
         std::env::temp_dir().join(format!("mumdia_index_{tag}_{}", std::process::id()))
+    }
+
+    /// A fragment table for `n_cand` candidates with 0..=6 fragments each, names drawn from
+    /// a small vocabulary in a scrambled order, written in `row_group_rows`-row groups.
+    /// `order` is the candidate order of the rows: ascending (the writers' layout),
+    /// shuffled (an unsorted table), or blocks of ascending ids out of order.
+    fn write_parts_fragments(path: &str, n_cand: u32, order: &str, row_group_rows: usize) {
+        let mut rows: Vec<(u32, f64, f32, String)> = Vec::new();
+        let mut state = 0x9e37_79b9_u64;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) as u32
+        };
+        let vocab = ["b2", "y1", "y7", "b3", "y9^2", "b10", "y3", "a2"];
+        for c in 0..n_cand {
+            for k in 0..(next() % 7) {
+                let name = vocab[(next() as usize + c as usize * 3) % vocab.len()];
+                rows.push((
+                    c,
+                    150.0 + (next() % 180_000) as f64 * 0.01 + k as f64 * 1e-4,
+                    (next() % 1000) as f32 / 1000.0,
+                    name.to_string(),
+                ));
+            }
+        }
+        match order {
+            "ascending" => {}
+            "shuffled" => {
+                for i in (1..rows.len()).rev() {
+                    let j = next() as usize % (i + 1);
+                    rows.swap(i, j);
+                }
+            }
+            "blocks" => {
+                // Ascending inside each block of ~50 rows, blocks reversed: every part
+                // is ascending on its own, the table is not.
+                let blocks: Vec<Vec<_>> = rows.chunks(50).map(|b| b.to_vec()).collect();
+                rows = blocks.into_iter().rev().flatten().collect();
+            }
+            other => panic!("unknown order {other}"),
+        }
+        let mut w = TableWriter::new(path).with_row_group_rows(row_group_rows);
+        w.write_cols(vec![
+            Col::U32("candidate_id".into(), rows.iter().map(|r| r.0).collect()),
+            Col::F64("mz".into(), rows.iter().map(|r| r.1).collect()),
+            Col::F32(
+                "predicted_intensity".into(),
+                rows.iter().map(|r| r.2).collect(),
+            ),
+            Col::Str("name".into(), rows.iter().map(|r| r.3.clone()).collect()),
+        ])
+        .unwrap();
+        w.close().unwrap();
+    }
+
+    /// The parallel fragment passes (row-group and page-range parts, atomic counts, the
+    /// identity placement of an ascending table, per-part name dictionaries merged in part
+    /// order) must produce the arrays of the serial pass bit for bit, on every layout and
+    /// every kind of load: whole, a range of the table, and a band against the shared
+    /// table.
+    #[test]
+    fn parallel_fragment_passes_reproduce_the_serial_arrays() {
+        let dir = unique_dir("par_frag");
+        std::fs::create_dir_all(&dir).unwrap();
+        let n_cand = 400u32;
+        for order in ["ascending", "shuffled", "blocks"] {
+            for rg in [37usize, 1 << 20] {
+                let f = dir
+                    .join(format!("frag_{order}_{rg}.parquet"))
+                    .to_str()
+                    .unwrap()
+                    .to_string();
+                write_parts_fragments(&f, n_cand, order, rg);
+                // (frag_offset, ncand, partial): whole, a middle band, a band at row 0, the
+                // tail band.
+                for (off, n, partial) in [
+                    (0usize, n_cand as usize, false),
+                    (101, 157, true),
+                    (0, 64, true),
+                    (300, 100, true),
+                ] {
+                    let serial = load_fragments(&f, off, n, partial, 1).unwrap();
+                    for parts in [2usize, 5, 64] {
+                        let par = load_fragments(&f, off, n, partial, parts).unwrap();
+                        let what = format!("{order} rg={rg} band=({off},{n}) parts={parts}");
+                        assert_eq!(par.frag_offsets, serial.frag_offsets, "{what}: offsets");
+                        assert_eq!(
+                            par.frag_mz.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                            serial
+                                .frag_mz
+                                .iter()
+                                .map(|v| v.to_bits())
+                                .collect::<Vec<_>>(),
+                            "{what}: frag_mz"
+                        );
+                        assert_eq!(
+                            par.frag_int.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                            serial
+                                .frag_int
+                                .iter()
+                                .map(|v| v.to_bits())
+                                .collect::<Vec<_>>(),
+                            "{what}: frag_int"
+                        );
+                        assert_eq!(par.frag_name_id, serial.frag_name_id, "{what}: name ids");
+                        assert_eq!(par.frag_name_dict, serial.frag_name_dict, "{what}: dict");
+                    }
+                }
+            }
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A broken row in a LATER part must be reported exactly as the serial pass reports
+    /// it: the first bad row in file order, whichever part finished first.
+    #[test]
+    fn a_parallel_load_reports_the_first_bad_row_as_the_serial_load_does() {
+        let dir = unique_dir("par_err");
+        std::fs::create_dir_all(&dir).unwrap();
+        let n = 500usize;
+        let mk = |tag: &str, cid: Vec<u32>, mz: Vec<f64>| {
+            let f = dir
+                .join(format!("{tag}.parquet"))
+                .to_str()
+                .unwrap()
+                .to_string();
+            let mut w = TableWriter::new(&f).with_row_group_rows(40);
+            w.write_cols(vec![
+                Col::U32("candidate_id".into(), cid),
+                Col::F64("mz".into(), mz),
+                Col::F32("predicted_intensity".into(), vec![1.0; n]),
+                Col::Str("name".into(), vec!["y1".to_string(); n]),
+            ])
+            .unwrap();
+            w.close().unwrap();
+            f
+        };
+        let ids: Vec<u32> = (0..n as u32).map(|i| i / 5).collect();
+        let mzs: Vec<f64> = (0..n).map(|i| 200.0 + i as f64).collect();
+        // Two out-of-range ids, in the fourth and the tenth row group.
+        let mut bad_ids = ids.clone();
+        bad_ids[150] = 9_999;
+        bad_ids[390] = 9_998;
+        let f1 = mk("bad_id", bad_ids, mzs.clone());
+        // Two non-finite m/z, in the third and the ninth row group.
+        let mut bad_mz = mzs.clone();
+        bad_mz[90] = f64::INFINITY;
+        bad_mz[350] = f64::NAN;
+        let f2 = mk("bad_mz", ids.clone(), bad_mz);
+        for f in [&f1, &f2] {
+            let msg = |parts: usize| match load_fragments(f, 0, 100, false, parts) {
+                Ok(_) => panic!("{f}: the bad row must be refused"),
+                Err(e) => format!("{e:#}"),
+            };
+            let serial = msg(1);
+            for parts in [2, 5, 13] {
+                assert_eq!(msg(parts), serial, "{f} with {parts} parts");
+            }
+        }
+        assert!(
+            format!("{:#}", load_fragments(&f1, 0, 100, false, 5).err().unwrap())
+                .contains("fragment row 150 ")
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
