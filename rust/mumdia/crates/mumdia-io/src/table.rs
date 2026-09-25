@@ -3657,6 +3657,26 @@ impl TableFile {
         })
     }
 
+    /// [`TableFile::str_rows`] in the layout of [`TableFile::str_flat`]: the picked values
+    /// concatenated into one `String`, with `rows.len() + 1` byte offsets (value `j` is
+    /// `data[offsets[j]..offsets[j + 1]]`). Two allocations for the picked rows instead of
+    /// one per row, and nothing for the rows not picked. Same null policy as `str_rows`.
+    pub fn str_flat_rows(&self, name: &str, rows: &[usize]) -> Result<(Vec<usize>, String)> {
+        let mut data = String::new();
+        let ends = self.gather_rows(name, rows, |col, k, out: &mut Vec<usize>| {
+            let a: &StringArray = downcast(col, name, "utf8")?;
+            for &k in k {
+                data.push_str(a.value(k));
+                out.push(data.len());
+            }
+            Ok(())
+        })?;
+        let mut offsets = Vec::with_capacity(ends.len() + 1);
+        offsets.push(0);
+        offsets.extend(ends);
+        Ok((offsets, data))
+    }
+
     /// Stream `name` and hand `pick` each batch with the batch-relative indices of the
     /// requested rows in it. The column's type is checked on every batch by `pick`, and a
     /// NULL in a column `pick` does not read as NaN is refused with its absolute row, on
@@ -3665,7 +3685,7 @@ impl TableFile {
         &self,
         name: &str,
         rows: &[usize],
-        pick: impl Fn(&ArrayRef, &[usize], &mut Vec<T>) -> Result<()>,
+        mut pick: impl FnMut(&ArrayRef, &[usize], &mut Vec<T>) -> Result<()>,
     ) -> Result<Vec<T>> {
         if rows.windows(2).any(|w| w[0] >= w[1]) {
             return Err(anyhow!(
@@ -3844,6 +3864,17 @@ mod tests {
                 .map(|&r| t.str("s").unwrap()[r].clone())
                 .collect::<Vec<_>>()
         );
+        // The flat form holds the same values, in the same order, and an empty pick is the
+        // single leading offset.
+        let (off, txt) = t.str_flat_rows("s", &rows).unwrap();
+        assert_eq!(off.len(), rows.len() + 1);
+        assert_eq!(
+            (0..rows.len())
+                .map(|j| txt[off[j]..off[j + 1]].to_string())
+                .collect::<Vec<_>>(),
+            t.str_rows("s", &rows).unwrap()
+        );
+        assert_eq!(t.str_flat_rows("s", &[]).unwrap(), (vec![0], String::new()));
         assert!(t.u32_rows("u", &[]).unwrap().is_empty());
         // The folding visitor sees every value once, in order.
         let mut seen: Vec<u64> = Vec::new();
@@ -3888,6 +3919,7 @@ mod tests {
         let picked = t.str_rows("s", &[0]).unwrap_err().to_string();
         assert!(picked.contains(&format!("row {null_at}")), "{picked}");
         assert_eq!(picked, whole);
+        assert_eq!(t.str_flat_rows("s", &[0]).unwrap_err().to_string(), whole);
         std::fs::remove_dir_all(&dir).ok();
     }
 

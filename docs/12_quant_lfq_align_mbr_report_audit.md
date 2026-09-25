@@ -214,6 +214,19 @@ the read returns empty and refinement is inert. Writes `candidate_audit.parquet`
    with the matching chromatograms. Changing `q_filter` does not select a run.
    `run-experiment` performs that split itself but forces `PsmQ`; see the
    gotchas.
+
+   Only the filter columns (`candidate_id`, `label`, the q column, `is_transferred`)
+   are read for every row. The identity columns that reach an output (`peptidoform`,
+   `charge`, `protein_group`, `base_peptide_id`) are read at the accepted rows only,
+   once those rows are known, and the identification apex (the first finite
+   `apex_rt` of a candidate in row order) is kept only for the candidates whose
+   chromatograms are loaded. The consensus mode's best target q per candidate is kept
+   for the same candidates. The values at every row that is used are the ones a whole
+   read gives, and so is the null and type policy; the report's
+   `candidates_with_scored_apex` still counts every candidate of the table with a
+   finite apex. On a per-run split of a large experiment most scored rows are not
+   accepted, so this removes most of quant's resident set before a chromatogram is
+   read.
 2. Group chromatogram rows by `candidate_id` into `cand_rows` (`quant.rs:301`). Rows
    whose `frag_name` starts with `ms1_` are MS1 isotope XIC pseudo-traces, not
    fragment ions; they are excluded from both peak detection and the top-N sum.

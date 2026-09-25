@@ -65,21 +65,24 @@ impl NameTab {
 /// zero-filled one, for a predicted fragment that was never observed.
 const NO_AXIS: u32 = u32::MAX;
 
-/// A string column as one buffer plus per-row offsets, from [`TableFile::str_flat`].
+/// A string column at some rows as one buffer plus per-value offsets, from
+/// [`TableFile::str_flat_rows`].
 ///
 /// `TableFile::str` returns a `String` per row: a 24-byte spine plus its own heap block.
 /// On the six-run HYE scored table (879,027 rows) `peptidoform` and `protein_group`
 /// together are 1.76 million live allocations and 42 MB of spine to carry 31 MB of text,
 /// held for the whole stage, and both are read per row but cloned only for the few
-/// percent of rows that become output. This is the same payload in two allocations.
+/// percent of rows that become output. This is the payload of those rows alone, in two
+/// allocations.
 struct FlatStr {
     off: Vec<usize>,
     txt: String,
 }
 
 impl FlatStr {
-    fn read(t: &TableFile, name: &str) -> Result<FlatStr> {
-        let (off, txt) = t.str_flat(name)?;
+    /// The column at `rows` (strictly ascending): value `j` is row `rows[j]`.
+    fn read_rows(t: &TableFile, name: &str, rows: &[usize]) -> Result<FlatStr> {
+        let (off, txt) = t.str_flat_rows(name, rows)?;
         Ok(FlatStr { off, txt })
     }
 
@@ -167,6 +170,64 @@ impl CidSet {
                 _ => None,
             },
         }
+    }
+}
+
+/// Distinct candidate ids marked so far, one bit per id over a range fixed up front (the
+/// hashed fallback past [`CID_BITSET_MAX_BYTES`], as for [`CidSet`]). For a count over a
+/// whole table that must not cost a map entry per candidate.
+struct CidMarks {
+    base: u32,
+    bits: Vec<u64>,
+    hashed: Option<std::collections::HashSet<u32>>,
+    count: usize,
+}
+
+impl CidMarks {
+    /// Marks for ids in `min(ids)..=max(ids)`; every id later inserted must lie there.
+    fn over(ids: &[u32]) -> CidMarks {
+        let empty = CidMarks {
+            base: 0,
+            bits: Vec::new(),
+            hashed: None,
+            count: 0,
+        };
+        let (Some(&base), Some(&top)) = (ids.iter().min(), ids.iter().max()) else {
+            return empty;
+        };
+        let span = u64::from(top - base) + 1;
+        if span.div_ceil(64) * 8 > CID_BITSET_MAX_BYTES as u64 {
+            return CidMarks {
+                hashed: Some(std::collections::HashSet::new()),
+                ..empty
+            };
+        }
+        CidMarks {
+            base,
+            bits: vec![0u64; (span as usize).div_ceil(64)],
+            ..empty
+        }
+    }
+
+    /// Mark `c`, returning whether it was unmarked before.
+    #[inline]
+    fn insert(&mut self, c: u32) -> bool {
+        let new = match &mut self.hashed {
+            Some(h) => h.insert(c),
+            None => {
+                let k = (c - self.base) as usize;
+                let (w, b) = (k >> 6, 1u64 << (k & 63));
+                let new = self.bits[w] & b == 0;
+                self.bits[w] |= b;
+                new
+            }
+        };
+        self.count += usize::from(new);
+        new
+    }
+
+    fn count(&self) -> usize {
+        self.count
     }
 }
 
@@ -1474,19 +1535,20 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
     }
 
     // Identified target PSMs below the peptide q threshold.
+    //
+    // Only the columns that decide which rows pass the filter are read for every row: the
+    // candidate id, `label` (as the one bit its readers test), the q column and the MBR
+    // flag. The identity columns that reach an output (`peptidoform`, `charge`,
+    // `protein_group`, `base_peptide_id`) are read at the accepted rows alone, below, once
+    // those rows are known. They used to be read whole and held for the whole stage, which
+    // on a per-run split of the immunopeptidomics experiment (tens of millions of scored
+    // rows, a few percent accepted) was most of quant's resident set before a
+    // chromatogram was read. Same values at the rows that are used, same null and type
+    // policy (`TableFile::str_flat_rows` and friends refuse a NULL anywhere in the column,
+    // as the whole-column getters do).
     let ps = TableFile::open(p.psms_scored)?;
     let cid = ps.u32("candidate_id")?;
-    // The three string columns are read in the shape they are USED, not as `Vec<String>`:
-    // `peptidoform` and `protein_group` flat (see [`FlatStr`]), and `label` as the single
-    // bit every one of its readers tests. On the six-run HYE scored table `str` on these
-    // three is 63 MB of `Vec<String>` spine plus ~42 MB of payload blocks -- 2.64 million
-    // live heap allocations held for the whole stage -- and `label` carries two distinct
-    // values over all 879,027 rows.
-    let pform = FlatStr::read(&ps, "peptidoform")?;
-    let charge = ps.i32("charge")?;
     let is_decoy = ps.str_eq("label", "decoy")?;
-    let pg = FlatStr::read(&ps, "protein_group")?;
-    let base = ps.u32("base_peptide_id")?;
     // Q-value column to filter on. Peptide/precursor q is per-run only when the
     // rescore itself is single-run; grouped q-values are experiment-wide otherwise.
     // For per-run slices of a pooled rescore, run_psm_q is the run-local FDR gate.
@@ -1521,18 +1583,6 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
             "quant: including match-between-runs transfers, which the selected q column              does not itself reflect"
         );
     }
-    // `psms_scored` carries the exact identification apex (schema psms_scored v4;
-    // the column has been present since v3). Older artifacts, or rows whose apex is
-    // null (read as NaN) or non-finite, carry no hint, and quant then re-detects the
-    // apex from the chromatogram itself.
-    //
-    // That fallback is not equivalent: re-detection reproduces the identification's
-    // apex only about half the time (CLAUDE.md, "the selected apex was historically
-    // correct/strongest only about 48-52% of the time"), so a quantity integrated
-    // around a re-detected apex can belong to a different peak than the one that was
-    // identified. It must therefore be visible rather than silent: warn, and record
-    // the coverage in the artifact report so a downstream reader can tell which apex
-    // source a quantity actually used.
     // Every map in this stage is keyed on `candidate_id` alone, and `candidate_id` is a
     // library row index, so it repeats across runs. Handed a POOLED scored table
     // (`rescore --competed a b c ...`, which stamps `source` with the input table each
@@ -1558,22 +1608,21 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
         }
     }
 
-    let mut apex_by_cid: HashMap<u32, f64> = HashMap::new();
-    let apex_rt_col = ps.f64("apex_rt").ok();
-    let apex_column_present = apex_rt_col.is_some();
-    if let Some(apex_rt) = apex_rt_col {
-        for i in 0..ps.nrows {
-            if apex_rt[i].is_finite() {
-                apex_by_cid.entry(cid[i]).or_insert(apex_rt[i]);
-            }
-        }
-    }
-    if !apex_column_present {
-        warn!(
-            psms_scored = p.psms_scored,
-            "quant: scored table has no apex_rt column (pre-v3 artifact); every              quantity will be integrated around a RE-DETECTED apex, which reproduces              the identification apex only about half the time"
-        );
-    }
+    // The rows that pass the quant filter, ascending: the only rows whose identity columns
+    // reach an output, each visited once by the peptide and fragment tables below.
+    let accepted: Vec<usize> = (0..ps.nrows)
+        .filter(|&i| {
+            passes_quant_filter(is_decoy[i], pep_q[i], p.cfg.q_threshold, is_transferred[i])
+        })
+        .collect();
+    // The identity columns at those rows only (see the note at the top of the scored
+    // read). `peptidoform` and `protein_group` stay flat (see [`FlatStr`]).
+    let pform = FlatStr::read_rows(&ps, "peptidoform", &accepted)?;
+    let charge = ps.i32_rows("charge", &accepted)?;
+    let pg = FlatStr::read_rows(&ps, "protein_group", &accepted)?;
+    let base = ps.u32_rows("base_peptide_id", &accepted)?;
+    let acc_cid: Vec<u32> = accepted.iter().map(|&i| cid[i]).collect();
+    drop(accepted);
 
     // Chromatograms, grouped by candidate, for the candidates quant actually uses.
     //
@@ -1622,6 +1671,71 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
         }
         CidSet::from_ids(&ids)
     };
+    // The best target q per candidate, for the consensus anchors. Only the candidates whose
+    // chromatograms are loaded are ever looked up (`index.cids` below), which outside
+    // `keep_all` is a subset of `wanted`, so the map holds those alone: the same values at
+    // every key that is read, without an entry per target row of the whole table.
+    let q_by_cid: HashMap<u32, f64> = if consensus_mode {
+        let mut m: HashMap<u32, f64> = HashMap::new();
+        for i in 0..ps.nrows {
+            if is_target[i] && (keep_all || wanted.contains(cid[i])) {
+                let e = m.entry(cid[i]).or_insert(f64::INFINITY);
+                if pep_q[i] < *e {
+                    *e = pep_q[i];
+                }
+            }
+        }
+        m
+    } else {
+        HashMap::new()
+    };
+    // `psms_scored` carries the exact identification apex (schema psms_scored v4;
+    // the column has been present since v3). Older artifacts, or rows whose apex is
+    // null (read as NaN) or non-finite, carry no hint, and quant then re-detects the
+    // apex from the chromatogram itself.
+    //
+    // That fallback is not equivalent: re-detection reproduces the identification's
+    // apex only about half the time (CLAUDE.md, "the selected apex was historically
+    // correct/strongest only about 48-52% of the time"), so a quantity integrated
+    // around a re-detected apex can belong to a different peak than the one that was
+    // identified. It must therefore be visible rather than silent: warn, and record
+    // the coverage in the artifact report so a downstream reader can tell which apex
+    // source a quantity actually used.
+    //
+    // The identification apex per candidate is the first finite `apex_rt` in row order.
+    // It is kept only for the candidates it can be looked up for (the loaded ones, as for
+    // `q_by_cid`; every candidate under `keep_all`). It used to be a map entry for every
+    // scored row, which on a large per-run table was the stage's largest structure. The
+    // report's `candidates_with_scored_apex` still counts the WHOLE table's candidates with
+    // a finite apex, as it always did, through one bit per candidate id.
+    let mut apex_by_cid: HashMap<u32, f64> = HashMap::new();
+    let mut scored_apex = CidMarks::over(&cid);
+    let apex_column_present = ps
+        .visit_f64("apex_rt", |first, vals| {
+            for (k, &a) in vals.iter().enumerate() {
+                let c = cid[first + k];
+                if a.is_finite() && scored_apex.insert(c) && (keep_all || wanted.contains(c)) {
+                    apex_by_cid.insert(c, a);
+                }
+            }
+            Ok(())
+        })
+        .is_ok();
+    if !apex_column_present {
+        // A column that is absent or not f64 carries no hint, exactly as before; nothing a
+        // failed read left behind may count.
+        apex_by_cid.clear();
+        scored_apex = CidMarks::over(&[]);
+        warn!(
+            psms_scored = p.psms_scored,
+            "quant: scored table has no apex_rt column (pre-v3 artifact); every              quantity will be integrated around a RE-DETECTED apex, which reproduces              the identification apex only about half the time"
+        );
+    }
+    let candidates_with_scored_apex = scored_apex.count();
+    drop(scored_apex);
+    // Nothing below reads a column of the scored table per row any more: the outputs walk
+    // the accepted rows, whose values were gathered above.
+    drop((cid, is_decoy, pep_q, is_transferred, is_target));
     // `predicted_intensity` is OPTIONAL. Chromatogram artifacts written before that column
     // existed do not carry it, and the default `observed_area` ranking never reads it, so
     // probe the footer (which decodes no data) and project only what is present. Demanding
@@ -1711,15 +1825,7 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
     // Spelled `consensus_mode` rather than repeating the two-term condition, because that
     // is also the flag `is_target` was read under: they must not be able to drift apart.
     let consensus: Option<(f64, f64)> = if consensus_mode {
-        let mut q_by_cid: HashMap<u32, f64> = HashMap::new();
-        for i in 0..ps.nrows {
-            if is_target[i] {
-                let e = q_by_cid.entry(cid[i]).or_insert(f64::INFINITY);
-                if pep_q[i] < *e {
-                    *e = pep_q[i];
-                }
-            }
-        }
+        // `q_by_cid` was taken with the scored columns, for the loaded candidates.
         let (mut left, mut right) = (Vec::new(), Vec::new());
         for (ci, &(lo, hi, apex)) in win.iter().enumerate() {
             if lo.is_finite()
@@ -1925,11 +2031,10 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
     // areas, and every extra row mapping to the same candidate repeated that.
     let mut selected: HashMap<usize, usize> = HashMap::new();
     let mut selections: Vec<(Option<f64>, usize, &'static str)> = Vec::new();
-    for i in 0..ps.nrows {
-        if !passes_quant_filter(is_decoy[i], pep_q[i], p.cfg.q_threshold, is_transferred[i]) {
-            continue;
-        }
-        let ci = index.find(cid[i]);
+    // One pass over the accepted rows, in table order, which is the order the filter over
+    // every row visited them in.
+    for (k, &c) in acc_cid.iter().enumerate() {
+        let ci = index.find(c);
         let (quantity, used, status) = match ci {
             None => select_fragment_areas(None, p.cfg.top_n_fragments, p.cfg.fragment_selection),
             Some(ci) => {
@@ -1953,18 +2058,18 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
             Some((lo, hi, apex)) => (finite_option(lo), finite_option(hi), finite_option(apex)),
             None => (None, None, None),
         };
-        q_cid.push(cid[i]);
-        q_base.push(base[i]);
-        q_pform.push(pform.get(i).to_string());
-        q_z.push(charge[i]);
-        q_pg.push(pg.get(i).to_string());
+        q_cid.push(c);
+        q_base.push(base[k]);
+        q_pform.push(pform.get(k).to_string());
+        q_z.push(charge[k]);
+        q_pg.push(pg.get(k).to_string());
         q_val.push(quantity);
         q_status.push(status.to_string());
         q_nfrag.push(used as i32);
         q_apex.push(integration_apex);
         q_lo.push(integration_lo);
         q_hi.push(integration_hi);
-        add_protein_base_quantity(&mut per_group, pg.get(i), base[i], quantity);
+        add_protein_base_quantity(&mut per_group, pg.get(k), base[k], quantity);
     }
 
     let n_pep = write_table(
@@ -2020,23 +2125,20 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
             Vec::new(),
             Vec::new(),
         );
-        for i in 0..ps.nrows {
-            if !passes_quant_filter(is_decoy[i], pep_q[i], p.cfg.q_threshold, is_transferred[i]) {
-                continue;
-            }
+        for (k, &c) in acc_cid.iter().enumerate() {
             // The fragment name comes from the interned table by row rather than from a
             // per-candidate `Vec<(&str, f64)>` built alongside the areas; the rows are the
             // same rows in the same order.
-            if let Some(ci) = index.find(cid[i]) {
+            if let Some(ci) = index.find(c) {
                 for slot in index.slots(ci) {
                     let a = area_by_slot[slot];
                     if !a.is_finite() || a <= 0.0 {
                         continue;
                     }
-                    f_cid.push(cid[i]);
-                    f_pf.push(pform.get(i).to_string());
-                    f_z.push(charge[i]);
-                    f_pg.push(pg.get(i).to_string());
+                    f_cid.push(c);
+                    f_pf.push(pform.get(k).to_string());
+                    f_z.push(charge[k]);
+                    f_pg.push(pg.get(k).to_string());
                     f_name.push(store.name(index.rows[slot]).to_string());
                     f_area.push(a);
                 }
@@ -2095,7 +2197,7 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
         // Which apex each quantity was integrated around: `scored_apex` rows reuse the
         // identification apex, `redetected` rows fell back to quant's own peak pick.
         "apex_rt_column_present": apex_column_present,
-        "candidates_with_scored_apex": apex_by_cid.len(),
+        "candidates_with_scored_apex": candidates_with_scored_apex,
     });
     let mut written: Vec<Written> = Vec::with_capacity(2);
     for (path, schema, rows) in [
@@ -3677,6 +3779,122 @@ mod tests {
             "the diagnostic keeps candidates no scored row selected"
         );
     }
+
+    #[test]
+    fn the_apex_of_an_accepted_candidate_may_come_from_a_row_the_filter_drops() {
+        // Quant reads the identity columns at the accepted rows only and keeps the apex of
+        // the loaded candidates only. Neither may change what a row gets: the apex of a
+        // candidate is its FIRST finite `apex_rt` in row order over the whole table, which
+        // for candidate 3 below is row 1 (4.0, q 0.5, filtered out) and not its accepted row
+        // 5 (9.0); candidate 5's first row carries NaN, so row 2's 6.0 is its apex. The
+        // report still counts every candidate of the table with a finite apex (3, 5, 7, 9),
+        // the decoy's and the filtered ones included.
+        let scored = quant_test_path("narrow_scored.parquet");
+        let chrom = quant_test_path("narrow_chrom.parquet");
+        write_table(
+            &scored,
+            vec![
+                Col::U32("candidate_id".into(), vec![5, 3, 5, 7, 9, 3, 11]),
+                Col::U32("base_peptide_id".into(), vec![50, 30, 50, 70, 90, 30, 110]),
+                Col::Str(
+                    "peptidoform".into(),
+                    ["P5", "P3", "P5b", "P7", "P9", "P3b", "P11"]
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect(),
+                ),
+                Col::I32("charge".into(), vec![2, 3, 3, 2, 2, 2, 2]),
+                Col::Str(
+                    "label".into(),
+                    [
+                        "target", "target", "target", "decoy", "target", "target", "target",
+                    ]
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect(),
+                ),
+                Col::Str(
+                    "protein_group".into(),
+                    ["A", "B", "A", "C", "D", "B", "E"]
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect(),
+                ),
+                Col::F64(
+                    "peptide_q_value".into(),
+                    vec![0.001, 0.5, 0.001, 0.0, 0.001, 0.001, 0.9],
+                ),
+                Col::F64(
+                    "apex_rt".into(),
+                    vec![f64::NAN, 4.0, 6.0, 4.0, 5.0, 9.0, f64::NAN],
+                ),
+            ],
+        )
+        .unwrap();
+        let grid: Vec<f32> = (0..12).map(|rt| rt as f32).collect();
+        let trace: Vec<f32> = (0..12).map(|k| 1.0 + (k as f32 - 5.0).abs()).collect();
+        let cids = [3u32, 5, 7, 9];
+        write_table(
+            &chrom,
+            vec![
+                Col::U32("candidate_id".into(), cids.to_vec()),
+                Col::Str("frag_name".into(), vec!["y2".into(); cids.len()]),
+                Col::ListF32("rt".into(), vec![grid.clone(); cids.len()]),
+                Col::ListF32("intensity".into(), vec![trace.clone(); cids.len()]),
+            ],
+        )
+        .unwrap();
+        let fixed = QuantConfig {
+            bound_peak: false,
+            fixed_window_s: 2.0,
+            ..QuantConfig::default()
+        };
+        // `bound_peak` with the diagnostic export is the `keep_all` read, which keeps every
+        // candidate's apex, so both paths through the apex map are held to the same rows.
+        for (tag, cfg, bounds) in [
+            ("fixed", fixed, None),
+            (
+                "keep_all",
+                QuantConfig::default(),
+                Some("narrow_bounds.parquet"),
+            ),
+        ] {
+            let peptide = quant_test_path(&format!("narrow_{tag}_peptide.parquet"));
+            let protein = quant_test_path(&format!("narrow_{tag}_protein.parquet"));
+            let bounds = bounds.map(quant_test_path);
+            run(QuantParams {
+                psms_scored: &scored,
+                chromatograms: &chrom,
+                out_peptide: &peptide,
+                out_protein: &protein,
+                out_fragment: None,
+                out_peak_bounds: bounds.as_deref(),
+                cfg: &cfg,
+                config_hash: "test",
+            })
+            .unwrap();
+            let pq = Table::read(&peptide).unwrap();
+            assert_eq!(pq.u32("candidate_id").unwrap(), vec![5, 5, 9, 3], "{tag}");
+            assert_eq!(
+                pq.str("peptidoform").unwrap(),
+                vec!["P5", "P5b", "P9", "P3b"],
+                "{tag}"
+            );
+            assert_eq!(pq.i32("charge").unwrap(), vec![2, 3, 2, 2], "{tag}");
+            assert_eq!(pq.u32("base_peptide_id").unwrap(), vec![50, 50, 90, 30]);
+            assert_eq!(
+                pq.opt_f64("integration_apex_rt").unwrap(),
+                vec![Some(6.0), Some(6.0), Some(5.0), Some(4.0)],
+                "{tag}: candidate 3's apex is the one on its filtered row"
+            );
+            let report: serde_json::Value =
+                mumdia_io::json::read_json(&format!("{peptide}.report.json")).unwrap();
+            assert_eq!(report["params"]["candidates_with_scored_apex"], json!(4));
+            assert_eq!(report["params"]["apex_rt_column_present"], json!(true));
+            let pg = Table::read(&protein).unwrap();
+            assert_eq!(pg.str("protein_group").unwrap(), vec!["A", "B", "D"]);
+        }
+    }
     // ---- chromatogram load: accepted-candidate bitset, row-group spans ----
 
     /// Every row of a store as the values its consumers read:
@@ -3850,12 +4068,15 @@ mod tests {
         )
         .unwrap();
         let t = TableFile::open(&p).unwrap();
-        let flat = FlatStr::read(&t, "peptidoform").unwrap();
+        let flat = FlatStr::read_rows(&t, "peptidoform", &[0, 1, 2, 3]).unwrap();
         let by_row = t.str("peptidoform").unwrap();
         assert_eq!(by_row, pforms);
         for (i, want) in by_row.iter().enumerate() {
             assert_eq!(flat.get(i), want);
         }
+        // At the accepted rows only, value `j` is row `rows[j]`, the empty value included.
+        let some = FlatStr::read_rows(&t, "peptidoform", &[1, 3]).unwrap();
+        assert_eq!((some.get(0), some.get(1)), ("", by_row[3].as_str()));
         let is_decoy = t.str_eq("label", "decoy").unwrap();
         let is_target = t.str_eq("label", "target").unwrap();
         for (i, l) in labels.iter().enumerate() {
