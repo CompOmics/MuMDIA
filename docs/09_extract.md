@@ -46,7 +46,12 @@ the CLI in `main.rs:535` (`Cmd::Extract`) and from the orchestrator in
 
 ### Inputs (`ExtractParams`, `extract.rs:83`)
 
-- `ms2` (Parquet): converted MS2 scans, loaded via `load_ms2` (`extract.rs:1348`).
+- `ms2` (Parquet): converted MS2 scans, loaded via `load_ms2`. On the fragindex
+  matcher the MS2 and MS1 decodes run concurrently with the library load and the
+  index build; the mass calibration JSON is read first because its learned tolerance
+  is the one the index is built at, and its log lines and errors keep their old place
+  after the spectra. A caller may lend both decodes (`ExtractParams::scans`); the
+  ungrouped `run` lends the seed's MS2 when no DeepLC step ran in between.
   Each `Ms2Scan` carries `rt_seconds`, an isolation `window` (`lower_mz`,
   `upper_mz`), and centroided `peaks` (`mz`, `intensity`). This stage applies no
   peak cap of its own: the MS2 peak budget is fixed at conversion time by

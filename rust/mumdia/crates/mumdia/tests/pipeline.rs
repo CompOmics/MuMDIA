@@ -880,3 +880,85 @@ fn search_seed_from_a_shared_scan_buffer_is_byte_identical_and_read_only() {
         "an empty lent MS2 slice was searched instead of the artifact"
     );
 }
+
+/// The ungrouped `run` lends the seed's own MS2 decode to extract when no DeepLC step runs
+/// between them (`search_seed::run_returning_scans`). The scans the seed hands back must be
+/// exactly what `load_ms2` decodes, the seed must hand back nothing it was lent, and an
+/// extract over the handed-back scans (with the run's MS1) must write the bytes of an
+/// extract that decodes both artifacts itself.
+#[test]
+fn the_seed_hands_back_its_decode_and_extract_over_it_is_byte_identical() {
+    let (prec, frag) = craft_library();
+    let ms2 = craft_ms2_with_decoy(true);
+    let ms1 = craft_ms1();
+    let win = craft_windows();
+    let cfg = Config::default();
+    let seed_params = |out: &str, shared: Option<&[Ms2Scan]>| {
+        stages::search_seed::run_returning_scans(stages::search_seed::SearchSeedParams {
+            fragment_offset: None,
+            ms2_scans: shared,
+            emit_calibrants: false,
+            ms2: &ms2,
+            library_precursors: &prec,
+            library_fragments: &frag,
+            out,
+            cfg: &cfg.search_seed,
+            bucket_size: cfg.extract.bucket_size,
+            config_hash: "test",
+        })
+        .unwrap()
+    };
+    let seed = tmp("seed_handback.parquet");
+    let (_, handed) = seed_params(&seed, None);
+    let handed = handed.expect("the seed decoded the scans, so it hands them back");
+    assert_scans_identical(&handed, &mumdia::spectra::load_ms2(&ms2).unwrap());
+    let (_, again) = seed_params(&tmp("seed_handback_lent.parquet"), Some(&handed));
+    assert!(again.is_none(), "a lent buffer is not handed back");
+
+    let extract = |shared: Option<stages::extract::SharedScans>, tag: &str| {
+        let psms = tmp(&format!("psms_handback_{tag}.parquet"));
+        let chrom = tmp(&format!("chrom_handback_{tag}.parquet"));
+        stages::extract::run(stages::extract::ExtractParams {
+            fragment_offset: None,
+            sibling_bands: 1,
+            scans: shared,
+            ms2: &ms2,
+            library_precursors: &prec,
+            library_fragments: &frag,
+            run_windows: &win,
+            ms1: Some(&ms1),
+            mass_cal: Some(&format!("{seed}.masscal.json")),
+            out_psms: &psms,
+            out_chrom: &chrom,
+            restrict_candidates: None,
+            cfg: &cfg.extract,
+            config_hash: "test",
+        })
+        .unwrap();
+        (psms, chrom)
+    };
+    let own = extract(None, "own");
+    let ms1_scans = mumdia::spectra::load_ms1(&ms1).unwrap();
+    let lent = extract(
+        Some(stages::extract::SharedScans {
+            ms2: &handed,
+            ms1: &ms1_scans,
+        }),
+        "lent",
+    );
+    let h = |p: &str| mumdia_io::hash::blake3_file(p).unwrap();
+    assert!(
+        mumdia_io::table::nrows(&own.0).unwrap() > 0,
+        "extract found nothing on this fixture, so the comparison is between empty tables"
+    );
+    assert_eq!(
+        h(&own.0),
+        h(&lent.0),
+        "psms_extracted differs over the lent decode"
+    );
+    assert_eq!(
+        h(&own.1),
+        h(&lent.1),
+        "chromatograms differ over the lent decode"
+    );
+}

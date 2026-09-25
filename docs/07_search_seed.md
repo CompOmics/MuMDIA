@@ -126,9 +126,17 @@ formatted threshold, e.g. `targets_at_q0.01`), `model_identity =
 
 Entry point: `search_seed::run(SearchSeedParams)` (`search_seed.rs:45-283`).
 
-**1. Load** the library (`Library::load`, `index.rs:54`) and MS2 scans
-(`load_ms2`, `spectra.rs:101`), then log candidate and scan counts
-(`search_seed.rs:47-53`). `load_ms2` sorts the returned `Vec<Ms2Scan>` by
+**1. Load** the library (`Library::load_with`) and MS2 scans (`load_ms2`), then
+log candidate and scan counts. On the fragindex matcher the MS2 decode runs
+concurrently with the library load and the index build (`rayon::join`); they are
+independent, and the scans are resident during the index build either way. The
+bucketed matcher keeps them in sequence, because its library load builds a sorted
+copy of every fragment and holding the scans through that transient would raise the
+peak. `run_returning_scans` hands the decoded scans back to the caller: the
+ungrouped `run` lends them to extract when no DeepLC step runs between seed and
+extract, so a run decodes its MS2 once (with a DeepLC step it does not, because the
+scans would then sit in the parent across the sidecar's peak). `load_ms2` sorts the
+returned `Vec<Ms2Scan>` by
 `rt_seconds` ascending (`spectra.rs:95`); this RT ordering is what makes the
 within-group strictly-greater update deterministic (earliest-RT wins a tie). It
 does **not** re-sort each scan's peaks: peak m/z order is inherited from `convert`

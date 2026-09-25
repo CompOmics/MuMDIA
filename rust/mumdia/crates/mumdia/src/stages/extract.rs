@@ -2079,6 +2079,113 @@ fn extract_twopass_windows(
     (acc, contested)
 }
 
+/// The mass calibration extract applies, as read from `ExtractParams::mass_cal`.
+struct MassCalRead {
+    frag_offset: f64,
+    frag_tol: f64,
+    grid_mz: Vec<f64>,
+    grid_ppm: Vec<f64>,
+    /// The file it came from; `None` when no file was passed or it does not exist, and the
+    /// values are the configured fallback (no offset, `extract.frag_tol_ppm`).
+    from_file: Option<String>,
+}
+
+/// Read the per-run mass recalibration: the scalar offset + learned tolerance, plus an
+/// optional m/z-dependent correction grid (mass_cal_loess). No logging here; the caller
+/// reports it once the spectra are in, where the stage always reported it.
+fn read_mass_cal(p: &ExtractParams) -> Result<MassCalRead> {
+    let read_grid = |v: &serde_json::Value, key: &str| -> Vec<f64> {
+        v.get(key)
+            .and_then(|x| x.as_array())
+            .map(|a| a.iter().filter_map(|e| e.as_f64()).collect())
+            .unwrap_or_default()
+    };
+    match p.mass_cal {
+        Some(path) if std::path::Path::new(path).exists() => {
+            let v: serde_json::Value = mumdia_io::json::read_json(path)?;
+            Ok(MassCalRead {
+                frag_offset: v
+                    .get("frag_ppm_offset")
+                    .and_then(|x| x.as_f64())
+                    .unwrap_or(0.0),
+                frag_tol: v
+                    .get("frag_tol_ppm")
+                    .and_then(|x| x.as_f64())
+                    .unwrap_or(p.cfg.frag_tol_ppm),
+                grid_mz: read_grid(&v, "mz_cal_grid_mz"),
+                grid_ppm: read_grid(&v, "mz_cal_grid_ppm"),
+                from_file: Some(path.to_string()),
+            })
+        }
+        _ => Ok(MassCalRead {
+            frag_offset: 0.0,
+            frag_tol: p.cfg.frag_tol_ppm,
+            grid_mz: Vec::new(),
+            grid_ppm: Vec::new(),
+            from_file: None,
+        }),
+    }
+}
+
+/// Decode the spectra the caller did not lend: `(ms2, ms1)`, each `None` when the lent
+/// buffer is used instead.
+///
+/// An empty lent slice is never believed over a named path. A caller that lends
+/// `SharedScans { ms2, ms1: &[] }` while still passing `ms1: Some(path)` would otherwise
+/// lose every MS1 feature and every MS1 chromatogram row with no error and no warning,
+/// because both are guarded on `!ms1_scans.is_empty()` and simply write nothing. Decoding
+/// the named artifact instead costs nothing when the run really has no MS1 rows (the
+/// decode is then empty too) and makes the silent version impossible.
+#[allow(clippy::type_complexity)]
+fn decode_unlent(p: &ExtractParams) -> Result<(Option<Vec<Ms2Scan>>, Option<Vec<Ms1Scan>>)> {
+    match p.scans {
+        Some(shared) => {
+            let ms2 = if shared.ms2.is_empty() {
+                let owned = load_ms2(p.ms2)?;
+                if !owned.is_empty() {
+                    warn!(
+                        ms2 = p.ms2,
+                        scans = owned.len(),
+                        "extract: the caller lent an empty MS2 buffer for a run that has \
+                         scans; decoding the artifact instead of searching nothing"
+                    );
+                }
+                Some(owned)
+            } else {
+                None
+            };
+            let ms1 = match p.ms1 {
+                Some(path) if shared.ms1.is_empty() => {
+                    let owned = load_ms1(path)?;
+                    if !owned.is_empty() {
+                        warn!(
+                            ms1 = path,
+                            scans = owned.len(),
+                            "extract: the caller lent an empty MS1 buffer while naming an \
+                             MS1 artifact; decoding it instead of dropping every MS1 feature"
+                        );
+                    }
+                    Some(owned)
+                }
+                _ => None,
+            };
+            Ok((ms2, ms1))
+        }
+        None => {
+            // The two artifacts are independent; the MS2 error, if any, is reported first.
+            let (ms2, ms1) = rayon::join(
+                || load_ms2(p.ms2),
+                || match p.ms1 {
+                    Some(path) => load_ms1(path),
+                    None => Ok(Vec::new()),
+                },
+            );
+            let ms2 = ms2?;
+            Ok((Some(ms2), Some(ms1?)))
+        }
+    }
+}
+
 pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
     let t0 = Instant::now();
     // Neither output may be one of the inputs (docs/31 F6).
@@ -2092,22 +2199,51 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
     // Skip the bucketed page_search index when the fragindex backend is selected (the
     // default): it is never read on that path and costs a full sort plus several full
     // copies of every library fragment.
-    let build_bucketed = !matches!(p.cfg.matcher, MatcherKind::Fragindex);
-    let lib = match p.fragment_offset {
-        None => Library::load_with(
-            p.library_precursors,
-            p.library_fragments,
-            p.cfg.bucket_size,
-            build_bucketed,
-        )?,
-        Some(offset) => Library::load_with_fragment_offset(
-            p.library_precursors,
-            p.library_fragments,
-            offset,
-            p.cfg.bucket_size,
-            build_bucketed,
-        )?,
+    let fragindex = matches!(p.cfg.matcher, MatcherKind::Fragindex);
+    let build_bucketed = !fragindex;
+    // The mass calibration is read FIRST: it is one small JSON file, and its learned
+    // tolerance is what the fragment index is built at, so building the index while the
+    // spectra decode needs it up front. Its errors and its log lines stay where they were,
+    // after the spectra (`mass?` below).
+    let mass = read_mass_cal(&p);
+    let load_indexed = || -> Result<(Library, Option<FragIndex>)> {
+        let lib = match p.fragment_offset {
+            None => Library::load_with(
+                p.library_precursors,
+                p.library_fragments,
+                p.cfg.bucket_size,
+                build_bucketed,
+            )?,
+            Some(offset) => Library::load_with_fragment_offset(
+                p.library_precursors,
+                p.library_fragments,
+                offset,
+                p.cfg.bucket_size,
+                build_bucketed,
+            )?,
+        };
+        // fragindex backend, built once at the learned fragment tolerance when selected
+        // (`MatcherKind::Fragindex`); otherwise the bucketed `Library::page_search` path
+        // is used. `Prober::probe` dispatches on this per peak.
+        let fidx = match (&mass, fragindex) {
+            (Ok(m), true) => Some(FragIndex::build(&lib, m.frag_tol)),
+            _ => None,
+        };
+        Ok((lib, fidx))
     };
+    // On the fragindex path the spectra decode runs concurrently with the library load and
+    // the index build: they are independent, and the scans are resident during the index
+    // build either way, so the overlap does not raise the peak. The bucketed path keeps them
+    // in sequence, because its library load builds a full sorted copy of every fragment and
+    // holding the scans through that transient would. Errors are reported in the old order:
+    // the library's, then the allowlist's and the RT windows', then the spectra's.
+    let (loaded, decoded) = if fragindex {
+        let (l, d) = rayon::join(load_indexed, || decode_unlent(&p));
+        (l, Some(d))
+    } else {
+        (load_indexed(), None)
+    };
+    let (lib, prebuilt_fidx) = loaded?;
 
     // Optional candidate allowlist (gate-first-then-compete): restrict extraction to
     // the accepted survivors of a prior gate-on run so the two-pass peak-claim profile
@@ -2171,57 +2307,21 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
         }
     }
 
-    // Decoded here unless the caller lent its own copies (see `ExtractParams::scans`).
-    // The owned buffers are declared first so they outlive the borrows.
-    //
-    // An empty lent slice is never believed over a named path. A caller that lends
-    // `SharedScans { ms2, ms1: &[] }` while still passing `ms1: Some(path)` would
-    // otherwise lose every MS1 feature and every MS1 chromatogram row with no error and
-    // no warning, because both are guarded on `!ms1_scans.is_empty()` and simply write
-    // nothing. Decoding the named artifact instead costs nothing when the run really has
-    // no MS1 rows (the decode is then empty too) and makes the silent version impossible.
-    let owned_ms2: Vec<Ms2Scan>;
-    let owned_ms1: Vec<Ms1Scan>;
-    let (scans, ms1_scans): (&[Ms2Scan], &[Ms1Scan]) = match p.scans {
-        Some(shared) => {
-            let ms2: &[Ms2Scan] = if shared.ms2.is_empty() {
-                owned_ms2 = load_ms2(p.ms2)?;
-                if !owned_ms2.is_empty() {
-                    warn!(
-                        ms2 = p.ms2,
-                        scans = owned_ms2.len(),
-                        "extract: the caller lent an empty MS2 buffer for a run that has                          scans; decoding the artifact instead of searching nothing"
-                    );
-                }
-                &owned_ms2
-            } else {
-                shared.ms2
-            };
-            let ms1: &[Ms1Scan] = match p.ms1 {
-                Some(path) if shared.ms1.is_empty() => {
-                    owned_ms1 = load_ms1(path)?;
-                    if !owned_ms1.is_empty() {
-                        warn!(
-                            ms1 = path,
-                            scans = owned_ms1.len(),
-                            "extract: the caller lent an empty MS1 buffer while naming an MS1                              artifact; decoding it instead of dropping every MS1 feature"
-                        );
-                    }
-                    &owned_ms1
-                }
-                _ => shared.ms1,
-            };
-            (ms2, ms1)
-        }
-        None => {
-            owned_ms2 = load_ms2(p.ms2)?;
-            owned_ms1 = match p.ms1 {
-                Some(path) => load_ms1(path)?,
-                None => Vec::new(),
-            };
-            (&owned_ms2, &owned_ms1)
-        }
+    // Decoded here unless the caller lent its own copies (see `ExtractParams::scans` and
+    // `decode_unlent`); on the fragindex path the decode already ran, concurrently with the
+    // library load.
+    let (owned_ms2, owned_ms1) = match decoded {
+        Some(d) => d?,
+        None => decode_unlent(&p)?,
     };
+    let (scans, ms1_scans): (&[Ms2Scan], &[Ms1Scan]) = (
+        owned_ms2
+            .as_deref()
+            .unwrap_or_else(|| p.scans.map(|s| s.ms2).unwrap_or(&[])),
+        owned_ms1
+            .as_deref()
+            .unwrap_or_else(|| p.scans.map(|s| s.ms1).unwrap_or(&[])),
+    );
     let ms1_rts: Vec<f64> = ms1_scans.iter().map(|s| s.rt_seconds).collect();
     info!(
         candidates = ncand,
@@ -2260,52 +2360,39 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
             .map(|w| w.1 - w.0)
             .fold(0.0f64, |a, b| if b > a { b } else { a });
 
-    // Per-run mass recalibration (optional). Reads the scalar offset + learned
-    // tolerance, plus an optional m/z-dependent correction grid (mass_cal_loess).
-    let read_grid = |v: &serde_json::Value, key: &str| -> Vec<f64> {
-        v.get(key)
-            .and_then(|x| x.as_array())
-            .map(|a| a.iter().filter_map(|e| e.as_f64()).collect())
-            .unwrap_or_default()
-    };
-    let (frag_offset, frag_tol, grid_mz, grid_ppm) = match p.mass_cal {
-        Some(path) if std::path::Path::new(path).exists() => {
-            let v: serde_json::Value = mumdia_io::json::read_json(path)?;
-            let off = v
-                .get("frag_ppm_offset")
-                .and_then(|x| x.as_f64())
-                .unwrap_or(0.0);
-            let tol = v
-                .get("frag_tol_ppm")
-                .and_then(|x| x.as_f64())
-                .unwrap_or(p.cfg.frag_tol_ppm);
-            let gmz = read_grid(&v, "mz_cal_grid_mz");
-            let gpp = read_grid(&v, "mz_cal_grid_ppm");
-            info!(
-                frag_ppm_offset = off,
-                frag_tol_ppm = tol,
-                mz_cal_grid = gmz.len(),
-                "extract: using mass recalibration"
+    // Per-run mass recalibration (optional): the scalar offset + learned tolerance, plus
+    // an optional m/z-dependent correction grid (mass_cal_loess), read at the top of the
+    // stage (`read_mass_cal`) and reported here, where it always was.
+    let MassCalRead {
+        frag_offset,
+        frag_tol,
+        grid_mz,
+        grid_ppm,
+        from_file,
+    } = mass?;
+    if let Some(path) = from_file.as_deref() {
+        info!(
+            frag_ppm_offset = frag_offset,
+            frag_tol_ppm = frag_tol,
+            mz_cal_grid = grid_mz.len(),
+            "extract: using mass recalibration"
+        );
+        // `extract.frag_tol_ppm` is a FALLBACK, not a setting, in any orchestrated
+        // run: search-seed always writes `frag_tol_ppm` into masscal.json --
+        // including in its calibration-failure branch, where it writes
+        // `search_seed.fragment_tol_ppm` -- and both orchestrators always pass
+        // `--mass-cal`. So a config carrying `extract.frag_tol_ppm = 40` extracted at
+        // the learned value with nothing said about it. Say it, because a config key
+        // that is read and then ignored is worse than one that is absent.
+        if (frag_tol - p.cfg.frag_tol_ppm).abs() > 1e-9 {
+            warn!(
+                configured_frag_tol_ppm = p.cfg.frag_tol_ppm,
+                learned_frag_tol_ppm = frag_tol,
+                mass_cal = path,
+                "extract: extract.frag_tol_ppm is overridden by the learned tolerance                      from mass calibration. It applies only when no --mass-cal is passed;                      to widen the search tolerance, set search_seed.fragment_tol_ppm"
             );
-            // `extract.frag_tol_ppm` is a FALLBACK, not a setting, in any orchestrated
-            // run: search-seed always writes `frag_tol_ppm` into masscal.json --
-            // including in its calibration-failure branch, where it writes
-            // `search_seed.fragment_tol_ppm` -- and both orchestrators always pass
-            // `--mass-cal`. So a config carrying `extract.frag_tol_ppm = 40` extracted at
-            // the learned value with nothing said about it. Say it, because a config key
-            // that is read and then ignored is worse than one that is absent.
-            if (tol - p.cfg.frag_tol_ppm).abs() > 1e-9 {
-                warn!(
-                    configured_frag_tol_ppm = p.cfg.frag_tol_ppm,
-                    learned_frag_tol_ppm = tol,
-                    mass_cal = path,
-                    "extract: extract.frag_tol_ppm is overridden by the learned tolerance                      from mass calibration. It applies only when no --mass-cal is passed;                      to widen the search tolerance, set search_seed.fragment_tol_ppm"
-                );
-            }
-            (off, tol, gmz, gpp)
         }
-        _ => (0.0, p.cfg.frag_tol_ppm, Vec::new(), Vec::new()),
-    };
+    }
     // The grid is used only if both arrays agree in length and have >= 2 points.
     let mass_off = if grid_mz.len() >= 2 && grid_mz.len() == grid_ppm.len() {
         MassOffset {
@@ -2321,11 +2408,12 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
         }
     };
 
-    // fragindex backend, built once at the learned fragment tolerance when selected
-    // (`MatcherKind::Fragindex`); otherwise the bucketed `Library::page_search` path
-    // is used. `Prober::probe` dispatches on this per peak.
-    let fidx =
-        matches!(p.cfg.matcher, MatcherKind::Fragindex).then(|| FragIndex::build(&lib, frag_tol));
+    // The fragment index, built with the library above at this same learned tolerance.
+    let fidx = match (fragindex, prebuilt_fidx) {
+        (true, Some(f)) => Some(f),
+        (true, None) => Some(FragIndex::build(&lib, frag_tol)),
+        (false, _) => None,
+    };
 
     // Peak-major accumulation. The fast path (single pass, fragment index, no candidate
     // allowlist) leaves `acc` empty and fills `stream_groups` instead; every other path

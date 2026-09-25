@@ -86,6 +86,13 @@ struct Best {
 }
 
 pub fn run(p: SearchSeedParams) -> Result<u64> {
+    run_returning_scans(p).map(|(n, _)| n)
+}
+
+/// [`run`], handing back the MS2 scans when the stage decoded them itself (`None` when the
+/// caller lent them). An orchestrator that runs extract on the same spectra with nothing
+/// in between that needs the memory can lend them on instead of decoding the run twice.
+pub fn run_returning_scans(p: SearchSeedParams) -> Result<(u64, Option<Vec<Ms2Scan>>)> {
     let t0 = Instant::now();
     // `--out` must not be one of this stage's own inputs: every input is read
     // before the output is published, so writing over one replaces it and exits 0
@@ -99,58 +106,84 @@ pub fn run(p: SearchSeedParams) -> Result<u64> {
         ],
     )?;
     // See extract: the bucketed index is dead weight on the fragindex path.
-    let build_bucketed = !matches!(p.cfg.matcher, MatcherKind::Fragindex);
-    let mut lib = match p.fragment_offset {
-        None => Library::load_with(
-            p.library_precursors,
-            p.library_fragments,
-            p.bucket_size,
-            build_bucketed,
-        )?,
-        Some(offset) => Library::load_with_fragment_offset(
-            p.library_precursors,
-            p.library_fragments,
-            offset,
-            p.bucket_size,
-            build_bucketed,
-        )?,
-    };
-    // Decoded here unless the caller lent its own copy (see `ms2_scans`). The owned
-    // buffer is declared first so it outlives the borrow. An empty lent slice is not
-    // believed over the path: it means the caller had nothing to lend.
-    let owned_scans: Vec<Ms2Scan>;
-    let scans: &[Ms2Scan] = match p.ms2_scans {
-        Some(s) if !s.is_empty() => s,
-        _ => {
-            owned_scans = load_ms2(p.ms2)?;
-            if p.ms2_scans.is_some() && !owned_scans.is_empty() {
-                warn!(
-                    ms2 = p.ms2,
-                    scans = owned_scans.len(),
-                    "search-seed: the caller lent an empty MS2 buffer for a run that has                      scans; decoding the artifact instead of searching nothing"
-                );
-            }
-            &owned_scans
+    let fragindex = matches!(p.cfg.matcher, MatcherKind::Fragindex);
+    let build_bucketed = !fragindex;
+    let load_lib = || -> Result<Library> {
+        match p.fragment_offset {
+            None => Library::load_with(
+                p.library_precursors,
+                p.library_fragments,
+                p.bucket_size,
+                build_bucketed,
+            ),
+            Some(offset) => Library::load_with_fragment_offset(
+                p.library_precursors,
+                p.library_fragments,
+                offset,
+                p.bucket_size,
+                build_bucketed,
+            ),
         }
+    };
+    // The library and its fragment index, built once at the seed's fragment tolerance when
+    // the fragindex backend is selected.
+    let load_indexed = || -> Result<(Library, Option<FragIndex>)> {
+        let mut lib = load_lib()?;
+        let fidx = fragindex.then(|| FragIndex::build(&lib, p.cfg.fragment_tol_ppm));
+        if fidx.is_some() {
+            // The index owns its own copy of every posting, and the seed reads neither the
+            // predicted intensity nor the fragment name from either side: the hyperscore is
+            // count + observed intensity, and the mass recalibration below needs only
+            // `frag_mz`. So the library's `frag_int` and `frag_name_id` are dead from here
+            // on -- 6 bytes per library fragment, held for the whole search. The bucketed
+            // path keeps them, because `page_search` serves `idx_int` out of arrays built
+            // from them.
+            lib.release_fragment_payload();
+        }
+        Ok((lib, fidx))
+    };
+    // Decoded here unless the caller lent its own copy (see `ms2_scans`). An empty lent
+    // slice is not believed over the path: it means the caller had nothing to lend.
+    let lent = p.ms2_scans.filter(|s| !s.is_empty());
+    let decode = || -> Result<Option<Vec<Ms2Scan>>> {
+        if lent.is_some() {
+            return Ok(None);
+        }
+        let owned = load_ms2(p.ms2)?;
+        if p.ms2_scans.is_some() && !owned.is_empty() {
+            warn!(
+                ms2 = p.ms2,
+                scans = owned.len(),
+                "search-seed: the caller lent an empty MS2 buffer for a run that has                  scans; decoding the artifact instead of searching nothing"
+            );
+        }
+        Ok(Some(owned))
+    };
+    // On the fragindex path the spectra decode runs concurrently with the library load and
+    // the index build: they are independent, and the scans are resident during the index
+    // build either way, so the overlap does not raise the peak. The bucketed path keeps
+    // them in sequence, because its library load builds a full sorted copy of every
+    // fragment, and holding the scans through that transient would. The library's error,
+    // if any, is still the one reported first.
+    let (loaded, decoded) = if fragindex {
+        rayon::join(load_indexed, decode)
+    } else {
+        let loaded = load_indexed();
+        let decoded = if loaded.is_ok() { decode() } else { Ok(None) };
+        (loaded, decoded)
+    };
+    let (lib, fidx) = loaded?;
+    let owned_scans: Option<Vec<Ms2Scan>> = decoded?;
+    let scans: &[Ms2Scan] = match (lent, owned_scans.as_deref()) {
+        (Some(s), _) => s,
+        (None, Some(s)) => s,
+        (None, None) => unreachable!("the decode ran because nothing was lent"),
     };
     info!(
         candidates = lib.n_candidates(),
         scans = scans.len(),
         "search-seed: loaded"
     );
-
-    // fragindex backend, built once at the seed's fragment tolerance when selected.
-    let fidx = matches!(p.cfg.matcher, MatcherKind::Fragindex)
-        .then(|| FragIndex::build(&lib, p.cfg.fragment_tol_ppm));
-    if fidx.is_some() {
-        // The index owns its own copy of every posting, and the seed reads neither the
-        // predicted intensity nor the fragment name from either side: the hyperscore is
-        // count + observed intensity, and the mass recalibration below needs only
-        // `frag_mz`. So the library's `frag_int` and `frag_name_id` are dead from here on
-        // -- 6 bytes per library fragment, held for the whole search. The bucketed path
-        // keeps them, because `page_search` serves `idx_int` out of arrays built from them.
-        lib.release_fragment_payload();
-    }
 
     // Best-per-candidate PSM. The fragindex path parallelizes across isolation-window
     // groups (each scan belongs to exactly one window, so groups are independent) and
@@ -410,7 +443,9 @@ pub fn run(p: SearchSeedParams) -> Result<u64> {
         elapsed_ms = elapsed,
         "search-seed: done"
     );
-    Ok(n)
+    drop(fidx);
+    drop(lib);
+    Ok((n, owned_scans))
 }
 
 /// Score of the [`crate::masscal::CALIBRANT_OFFER_PSMS`]-th best TARGET PSM: every target at
