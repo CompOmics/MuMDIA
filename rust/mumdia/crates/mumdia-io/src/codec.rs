@@ -35,7 +35,7 @@
 //! The pool is shared by every plain-thread writer and decoder of the process, so it counts
 //! the callers inside it. When as many callers are waiting on it as it has threads, the
 //! next caller encodes (or decodes) on its own thread instead of queueing behind them
-//! ([`claim`]). Without that, more than eight concurrent writers (one extract chromatogram
+//! (`claim`). Without that, more than eight concurrent writers (one extract chromatogram
 //! writer per band in flight under `groups.parallel`, plus features and compete writers)
 //! would share eight codec threads where they used to have one core each, and a band's
 //! candidate loop would stall on its writer's channel. Both paths write the same bytes.
