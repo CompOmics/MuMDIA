@@ -127,6 +127,14 @@ than a number. Both are recorded in every run's `manifest.json`.
   features, compete, the pool and rescore no longer read their outputs back to hash them.
   The digest is the same blake3 over the same bytes: every recorded hash and every artifact
   byte is unchanged (docs/03 "Hash on write").
+- **`TableFile::scan` can read each row group's projection in one sequential read.**
+  `ScanOptions::coalesced()` gives the parquet reader a span cache that reads every selected
+  row group's projected column chunks as one byte span (split where unprojected columns
+  leave a gap over 1 MB), serves the page reads from memory, prefetches the next span on a
+  helper thread and releases a span once its column chunks are read. The batches are
+  identical to the plain reader's. Nothing uses it by default; it is for wide full scans on
+  spinning storage, where the page-at-a-time reader is seek-bound (docs/03 "Sequential
+  row-group reads").
 
 - **Library writers emit fragment tables sorted by `candidate_id`.** `import_diann_lib.py`,
   `make_reverse_decoys.py` and `make_shift_decoys.py` finish with a streaming bucket sort

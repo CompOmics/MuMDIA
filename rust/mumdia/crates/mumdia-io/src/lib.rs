@@ -4,6 +4,7 @@
 pub mod hash;
 pub mod json;
 pub mod report;
+pub mod span_cache;
 pub mod table;
 
 use anyhow::Result;

@@ -39,6 +39,7 @@ the schema-id tuples).
 |---|---|
 | `rust/mumdia/crates/mumdia-io/src/lib.rs` | crate root: `init_logging`, `record_artifact`, `inspect`; re-exports the modules |
 | `rust/mumdia/crates/mumdia-io/src/table.rs` | `Col` enum (write side), `write_table`, `Table` (read side) and the typed getters |
+| `rust/mumdia/crates/mumdia-io/src/span_cache.rs` | `SpanCache`, the coalescing `ChunkReader` behind `TableFile::scan` with `ScanOptions::coalesced()` |
 | `rust/mumdia/crates/mumdia-io/src/report.rs` | `ArtifactReport` struct + `write_for` (the `.report.json` sidecar) |
 | `rust/mumdia/crates/mumdia-io/src/hash.rs` | `blake3_file`, `blake3_str`, `HashingWrite` (hash on write) |
 | `rust/mumdia/crates/mumdia-io/src/json.rs` | `write_json`, `read_json` (pretty JSON via serde) |
@@ -212,6 +213,52 @@ The getters and their exact null behaviour:
   present list is materialized via `f.values().to_vec()`.
 
 `column_names()` (`table.rs:373`) returns the schema field names in order.
+
+#### Sequential row-group reads (`span_cache.rs`)
+
+parquet-rs's synchronous reader fetches every page on its own, a header read and
+a body read through a fresh seek each time, and the arrow reader advances every
+projected column in lockstep, one batch at a time. A batch of a 398-column
+features or competed table therefore issues about 400 page reads, each one column
+chunk away from the previous one, and a row group is covered in several strided
+passes. On an SSD or from the page cache that costs nothing measurable. On a
+spinning array it is seek-bound: one reader of the immunopeptidomics competed
+tables measured 44 MB/s against a 133 MB/s sequential ceiling, and seven
+concurrent readers only 47-53 MB/s together.
+
+`TableFile::scan(columns, batch_size, &ScanOptions)` is `batches` with read
+options. `ScanOptions::default()` is exactly `batches`. With
+`ScanOptions::coalesced()` (or `coalesce: Some(SpanReadOptions { .. })`) the
+reader is given a `span_cache::SpanCache` instead of the `File`:
+
+- for each selected row group, in reading order, the projected column chunks'
+  byte ranges (`ColumnChunkMetaData::byte_range`) are coalesced into spans. Two
+  chunks at most `max_gap_bytes` (1 MB) apart share a span, so a narrow
+  projection never reads the columns it skipped wholesale. A `RowSpan` handle
+  (`open_rows`, `span`) plans only its own row groups;
+- a span is read with one sequential read on first use and every page request
+  inside it is sliced from memory. Requests outside a span (the footer, an
+  unplanned column) and spans over `max_span_bytes` (512 MB) are read directly,
+  exactly as the plain reader reads them;
+- a span is released as soon as every column chunk in it has been read to its
+  end, so a forward scan holds the one or two row groups a batch straddles, plus
+  one prefetched span when `prefetch` is on: a helper thread with its own file
+  handle reads span i+1 while the decoder works through span i, within
+  `max_resident_bytes` (1 GB). The decoder never waits on the budget;
+- the decoder receives the same bytes through the same metadata, projection,
+  selection and batch size, so the batches are identical to the plain reader's
+  (`coalesced_reads_yield_the_plain_readers_batches` compares them over
+  projections, span handles, straddling batch sizes and every option corner;
+  `each_span_is_read_once_and_released_when_its_chunks_are_done` counts the
+  reads). A `debug` line on drop reports spans read, bytes, prefetches and
+  direct reads.
+
+Nothing in the engine turns it on by default. It is meant for the wide full scans
+on spinning storage (rescore's `for_each_feature_row`, compete's `copy_kept_rows`),
+where the memory it holds (two or three row groups of the projection, about
+0.9 GB on a 131,072-row competed group) buys a forward read; it does not help a
+reader that skips pages through the page index, because a span holds whole
+column chunks.
 
 ### Parquet written outside this crate
 

@@ -29,6 +29,7 @@ use parquet::file::writer::SerializedFileWriter;
 use parquet::schema::types::ColumnPath;
 
 pub use crate::report::Written;
+pub use crate::span_cache::SpanReadOptions;
 
 /// The codec every artifact is written with. Snappy by default, which is what released
 /// artifacts use and what the sidecars' pyarrow reads without configuration;
@@ -1785,6 +1786,113 @@ impl Iterator for BatchReader {
     }
 }
 
+/// How [`TableFile::scan`] gets the bytes to the decoder. The default is the plain reader
+/// every getter uses: one `File`, pages fetched one at a time.
+#[derive(Clone, Debug, Default)]
+pub struct ScanOptions {
+    /// Read each selected row group's projected column chunks as one byte span, with one
+    /// sequential read, and decode from memory ([`crate::span_cache::SpanCache`]). For a
+    /// wide projection on a spinning disk this turns a row group's several hundred strided
+    /// page reads into one forward read; on an SSD or from the page cache it changes
+    /// nothing measurable. Costs up to the options' resident budget in memory.
+    pub coalesce: Option<SpanReadOptions>,
+}
+
+impl ScanOptions {
+    /// Coalesced reads ([`ScanOptions::coalesce`]) with the default span budget.
+    pub fn coalesced() -> ScanOptions {
+        ScanOptions {
+            coalesce: Some(SpanReadOptions::default()),
+        }
+    }
+}
+
+/// Everything a record-batch reader over one file is built from, owned, so the same reader
+/// can be built on another thread.
+#[derive(Clone)]
+struct ReadSpec {
+    path: String,
+    meta: ArrowReaderMetadata,
+    selection: Option<RowSpan>,
+    /// Sorted, unique root columns; `None` reads every column.
+    roots: Option<Vec<usize>>,
+    batch_size: usize,
+    coalesce: Option<SpanReadOptions>,
+}
+
+impl ReadSpec {
+    /// The row groups the reader decodes, in reading order.
+    fn row_groups(&self) -> Vec<usize> {
+        match &self.selection {
+            Some(span) => span.row_groups.clone(),
+            None => (0..self.meta.metadata().num_row_groups()).collect(),
+        }
+    }
+
+    /// The parquet leaf columns under the projected roots.
+    fn leaves(&self) -> Vec<usize> {
+        let descr = self.meta.metadata().file_metadata().schema_descr();
+        (0..descr.num_columns())
+            .filter(|&c| match &self.roots {
+                None => true,
+                Some(r) => r.binary_search(&descr.get_column_root_idx(c)).is_ok(),
+            })
+            .collect()
+    }
+
+    fn build(&self) -> Result<parquet::arrow::arrow_reader::ParquetRecordBatchReader> {
+        match &self.coalesce {
+            None => {
+                let file = std::fs::File::open(&self.path)
+                    .with_context(|| format!("opening {}", self.path))?;
+                self.build_with(file)
+            }
+            Some(o) => {
+                let cache = crate::span_cache::SpanCache::plan(
+                    &self.path,
+                    self.meta.metadata(),
+                    &self.row_groups(),
+                    &self.leaves(),
+                    o.clone(),
+                )?;
+                self.build_with(cache)
+            }
+        }
+    }
+
+    fn build_with<T: parquet::file::reader::ChunkReader + 'static>(
+        &self,
+        input: T,
+    ) -> Result<parquet::arrow::arrow_reader::ParquetRecordBatchReader> {
+        // The footer the handle parsed at `open`, not a fresh parse: a typed getter is one
+        // call to this, and a stage reads a dozen columns.
+        let mut builder =
+            ParquetRecordBatchReaderBuilder::new_with_metadata(input, self.meta.clone())
+                .with_batch_size(self.batch_size);
+        if let Some(span) = &self.selection {
+            // The selection counts rows of the SELECTED row groups only, front to back, so
+            // it is skip / take / skip over exactly the groups named here.
+            let mut sel = Vec::with_capacity(3);
+            if span.skip_before > 0 {
+                sel.push(RowSelector::skip(span.skip_before));
+            }
+            sel.push(RowSelector::select(span.take));
+            if span.skip_after > 0 {
+                sel.push(RowSelector::skip(span.skip_after));
+            }
+            builder = builder
+                .with_row_groups(span.row_groups.clone())
+                .with_row_selection(RowSelection::from(sel));
+        }
+        if let Some(roots) = &self.roots {
+            let mask =
+                parquet::arrow::ProjectionMask::roots(builder.parquet_schema(), roots.clone());
+            builder = builder.with_projection(mask);
+        }
+        Ok(builder.build()?)
+    }
+}
+
 /// A parquet table opened by its footer only: schema and row count are known up front,
 /// nothing is decoded until asked, and every typed getter streams just its own column,
 /// batch by batch, straight into the returned `Vec`.
@@ -2047,51 +2155,62 @@ impl TableFile {
     /// projected columns in FILE order, so look them up by name (`batch.schema().index_of`)
     /// rather than by the order of `columns`.
     pub fn batches(&self, columns: Option<&[&str]>, batch_size: usize) -> Result<BatchReader> {
-        let file =
-            std::fs::File::open(&self.path).with_context(|| format!("opening {}", self.path))?;
-        // The footer this handle parsed at `open`, not a fresh parse: a typed getter is one
-        // call to this, and a stage reads a dozen columns.
-        let mut builder =
-            ParquetRecordBatchReaderBuilder::new_with_metadata(file, self.meta.clone())
-                .with_batch_size(batch_size.max(1));
-        if let Some(span) = &self.selection {
-            // The selection counts rows of the SELECTED row groups only, front to back, so
-            // it is skip / take / skip over exactly the groups named here.
-            let mut sel = Vec::with_capacity(3);
-            if span.skip_before > 0 {
-                sel.push(RowSelector::skip(span.skip_before));
-            }
-            sel.push(RowSelector::select(span.take));
-            if span.skip_after > 0 {
-                sel.push(RowSelector::skip(span.skip_after));
-            }
-            builder = builder
-                .with_row_groups(span.row_groups.clone())
-                .with_row_selection(RowSelection::from(sel));
-        }
-        if let Some(want) = columns {
-            let mask = {
-                let parquet_schema = builder.parquet_schema();
-                let fields = parquet_schema.root_schema().get_fields();
-                let mut roots: Vec<usize> = Vec::with_capacity(want.len());
-                for w in want {
-                    let i = fields.iter().position(|f| f.name() == *w).ok_or_else(|| {
-                        anyhow!("column '{w}' not found in {:?}", self.column_names())
-                    })?;
-                    roots.push(i);
-                }
-                roots.sort_unstable();
-                roots.dedup();
-                parquet::arrow::ProjectionMask::roots(parquet_schema, roots)
-            };
-            builder = builder.with_projection(mask);
-        }
-        let reader = builder.build()?;
+        self.scan(columns, batch_size, &ScanOptions::default())
+    }
+
+    /// [`TableFile::batches`] under explicit read options. With [`ScanOptions::default`]
+    /// this is `batches` exactly. The batches are identical whatever the options: the same
+    /// rows, the same row-group boundaries, the same values, because the options change
+    /// only how the bytes reach the decoder.
+    pub fn scan(
+        &self,
+        columns: Option<&[&str]>,
+        batch_size: usize,
+        opts: &ScanOptions,
+    ) -> Result<BatchReader> {
+        let spec = self.read_spec(columns, batch_size, opts.coalesce.clone())?;
+        let reader = spec.build()?;
         // Schema from the READER: under a projection it carries only the selected columns.
         let schema = arrow::array::RecordBatchReader::schema(&reader);
         Ok(BatchReader {
             inner: reader,
             schema,
+        })
+    }
+
+    /// The root columns `columns` names, sorted and unique, or `None` for every column.
+    fn projection_roots(&self, columns: Option<&[&str]>) -> Result<Option<Vec<usize>>> {
+        let Some(want) = columns else {
+            return Ok(None);
+        };
+        let parquet_schema = self.meta.metadata().file_metadata().schema_descr();
+        let fields = parquet_schema.root_schema().get_fields();
+        let mut roots: Vec<usize> = Vec::with_capacity(want.len());
+        for w in want {
+            let i = fields
+                .iter()
+                .position(|f| f.name() == *w)
+                .ok_or_else(|| anyhow!("column '{w}' not found in {:?}", self.column_names()))?;
+            roots.push(i);
+        }
+        roots.sort_unstable();
+        roots.dedup();
+        Ok(Some(roots))
+    }
+
+    fn read_spec(
+        &self,
+        columns: Option<&[&str]>,
+        batch_size: usize,
+        coalesce: Option<SpanReadOptions>,
+    ) -> Result<ReadSpec> {
+        Ok(ReadSpec {
+            path: self.path.clone(),
+            meta: self.meta.clone(),
+            selection: self.selection.clone(),
+            roots: self.projection_roots(columns)?,
+            batch_size: batch_size.max(1),
+            coalesce,
         })
     }
 
