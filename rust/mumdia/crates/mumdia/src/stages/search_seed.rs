@@ -12,7 +12,7 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use mumdia_core::config::{MatcherKind, SearchSeedConfig};
 use mumdia_core::schema::artifact;
-use mumdia_io::report::ArtifactReport;
+use mumdia_io::report::{ArtifactReport, Written};
 use mumdia_io::table::{write_table, Col};
 use serde_json::json;
 use tracing::{info, warn};
@@ -86,6 +86,12 @@ struct Best {
 }
 
 pub fn run(p: SearchSeedParams) -> Result<u64> {
+    run_hashed(p).map(|w| w.rows)
+}
+
+/// [`run`], returning the output's row count and the content hash its report records, so
+/// an orchestrator can record the artifact without reading and hashing it again.
+pub fn run_hashed(p: SearchSeedParams) -> Result<Written> {
     let t0 = Instant::now();
     // `--out` must not be one of this stage's own inputs: every input is read
     // before the output is published, so writing over one replaces it and exits 0
@@ -384,7 +390,7 @@ pub fn run(p: SearchSeedParams) -> Result<u64> {
     let mut stats = std::collections::BTreeMap::new();
     stats.insert("psms".to_string(), json!(n));
     stats.insert(format!("targets_at_q{}", p.cfg.fdr_seed), json!(n_at_1pct));
-    ArtifactReport {
+    let report = ArtifactReport {
         logical_name: artifact::SEED_PSMS.0.to_string(),
         schema_name: artifact::SEED_PSMS.0.to_string(),
         schema_version: artifact::SEED_PSMS.1,
@@ -401,8 +407,8 @@ pub fn run(p: SearchSeedParams) -> Result<u64> {
         stats,
         model_identity: Some("native-seed-hyperscore-v1".to_string()),
         elapsed_ms: elapsed,
-    }
-    .write_for(p.out)?;
+    };
+    report.write_for(p.out)?;
 
     info!(
         psms = n,
@@ -410,7 +416,7 @@ pub fn run(p: SearchSeedParams) -> Result<u64> {
         elapsed_ms = elapsed,
         "search-seed: done"
     );
-    Ok(n)
+    Ok(report.written())
 }
 
 /// Score of the [`crate::masscal::CALIBRANT_OFFER_PSMS`]-th best TARGET PSM: every target at

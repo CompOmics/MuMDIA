@@ -1366,6 +1366,7 @@ fn real_main() -> Result<()> {
                 out: &out,
                 cfg: &cfg.compete,
                 config_hash: &ch,
+                features_hash: None,
             })?;
         }
         Cmd::Pool {
