@@ -100,6 +100,7 @@ id into the Parquet file itself).
 | `RUN_WINDOWS` | `run_windows` | 1 |
 | `PSMS_EXTRACTED` | `psms_extracted` | **2** |
 | `CHROMATOGRAMS` | `chromatograms` | 1 |
+| `CHROMATOGRAMS_V2` | `chromatograms` | **2** (only under `extract.chromatogram_schema = 2`) |
 | `FEATURES` | `features` | 1 |
 | `PSMS_COMPETED` | `psms_competed` | **3** |
 | `PSMS_SCORED` | `psms_scored` | **4** |

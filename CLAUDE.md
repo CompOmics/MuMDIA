@@ -624,6 +624,17 @@ sections 10-16:
   (default 4). A feature matrix marginally over the threshold silently falls to
   the much slower disk-backed streaming memmap; a 4.31 GB matrix against the
   4.00 GB default took the slow path.
+- `chromatograms.parquet` has two layouts. v1 (the default, schema 1) stores every row's
+  whole `rt` axis and `intensity` trace. v2 (`extract.chromatogram_schema = 2`, schema
+  2, `CHROMATOGRAMS_V2`) stores the lists as `rt_axis` and `intensity_trimmed`, plus
+  `trace_offset` and `trace_len`: each candidate's axis once per parquet row group (an
+  empty `rt_axis` means the last axis that candidate wrote in the same row group) and each
+  trace trimmed to its first-to-last run of values that are not `+0.0`. A v2 row group
+  decodes on its own, so a reader must start at a row group or at a candidate's first
+  row. `mumdia::chromatograms::Decoder` is the reference reader and
+  `mumdia::chromatograms::rewrite` converts either way; convert to v1 before handing the
+  table to a tool outside the engine. The lists are renamed so that such a tool, or an
+  engine binary from before v2, stops at the missing `rt` instead of misreading v2.
 
 ## Quantification rules
 

@@ -78,6 +78,7 @@ They are `pub const` tuples in the `artifact` submodule, referenced as
 | `run_windows` | 1 | rt-im-train |
 | `psms_extracted` | 1 | extract |
 | `chromatograms` | 1 | extract |
+| `chromatograms` | 2 (`CHROMATOGRAMS_V2`, only under `extract.chromatogram_schema = 2`) | extract |
 | `features` | 1 | features |
 | `psms_competed` | 2 | compete |
 | `psms_scored` | 3 | rescore |
