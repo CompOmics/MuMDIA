@@ -1152,8 +1152,101 @@ def add(store: dict[str, EnvVar], name: str, default: str | None, site: str) -> 
     var.sites.add(site)
 
 
+# The first word of an attributed element that makes it an item: an item ends at a
+# `;` or at the close of its body, never at a `,` (`fn f<A, B>()`, `impl<'a, T>`).
+# Anything else (an enum variant, a struct field, a match arm, an expression statement)
+# also ends at a `,`. A macro invocation (`thread_local! { .. }`) counts as an item.
+RUST_ITEM_KEYWORDS = frozenset(
+    (
+        "async",
+        "const",
+        "enum",
+        "extern",
+        "fn",
+        "impl",
+        "let",
+        "mod",
+        "static",
+        "struct",
+        "trait",
+        "type",
+        "union",
+        "unsafe",
+        "use",
+    )
+)
+RUST_ELEMENT_HEAD = re.compile(
+    r"(?:pub(?:\s*\([^()]*\))?\s+)?([A-Za-z_][A-Za-z0-9_]*)(\s*!)?"
+)
+
+
+def rust_attributed_end(code: str, start: int) -> int:
+    """Offset one past the element an outer attribute ending at `start` applies to.
+
+    `code` is masked (`mask_rust_literals`), so every bracket in it is code. Further
+    attributes are skipped first. The element then ends at the first of:
+
+    - a `;` outside brackets (a statement, `mod name;`, `use ..;`, a unit struct);
+    - for an item (`RUST_ITEM_KEYWORDS` or a macro), the `}` that closes its body,
+      together with a `;` or `,` that follows it;
+    - for anything else, a `,` outside brackets (a variant, a field, a match arm), or
+      the `}` closing a match arm's `=> { .. }` block, which may omit its comma;
+    - the `}` of the enclosing block, which ends the element just before it (the last
+      variant or field without a trailing comma, or a tail expression).
+
+    The last case is the safety property: an element never extends past the block
+    that contains it, so blanking it cannot remove a brace that closes real code.
+    """
+    n = len(code)
+    k = start
+    while True:
+        while k < n and code[k].isspace():
+            k += 1
+        if not code.startswith("#[", k):
+            break
+        depth = 0
+        while k < n:
+            if code[k] == "[":
+                depth += 1
+            elif code[k] == "]":
+                depth -= 1
+                if depth == 0:
+                    k += 1
+                    break
+            k += 1
+    head = RUST_ELEMENT_HEAD.match(code, k)
+    item = bool(head) and (head.group(1) in RUST_ITEM_KEYWORDS or bool(head.group(2)))
+
+    def with_separator(end: int) -> int:
+        m = re.compile(r"\s*[;,]").match(code, end)
+        return m.end() if m else end
+
+    depth = 0
+    last = k
+    arm_block = False
+    j = k
+    while j < n:
+        c = code[j]
+        if c in "([{":
+            if depth == 0 and c == "{" and not item:
+                arm_block = code[last - 2 : last] == "=>" if last >= 2 else False
+            depth += 1
+        elif c in ")]}":
+            if depth == 0:
+                return last
+            depth -= 1
+            if depth == 0 and c == "}" and (item or arm_block):
+                return with_separator(j + 1)
+        elif depth == 0 and (c == ";" or (c == "," and not item)):
+            return j + 1
+        if not c.isspace():
+            last = j + 1
+        j += 1
+    return n
+
+
 def blank_cfg_test(text: str) -> str:
-    """Blank out `#[cfg(test)]` blocks, preserving line numbers.
+    """Blank out `#[cfg(test)]` elements, preserving offsets and line numbers.
 
     The environment-variable table is built by scanning the Rust sources for reads and
     sets. Test code is not the engine, so a `std::env::set_var` inside a test must not
@@ -1169,28 +1262,33 @@ def blank_cfg_test(text: str) -> str:
     `#[cfg(test)]` instead, which is fine for one file that keeps its tests at the end;
     this has to cope with any source file, including an inline test module followed by
     more real code.
+
+    The attribute applies to one element, which is not always a braced item: it can
+    be an enum variant, a match arm or a statement (`inject(Fault::Publish)?;`). The
+    element's extent is `rust_attributed_end`. Counting braces from the attribute to
+    the next balanced `}` instead blanked a variant together with the rest of its
+    enum and the header of the next item, which left the file's braces unbalanced;
+    on a statement it silently blanked the code up to the end of the next block.
+    Only the element's own characters are blanked (newlines kept), so code sharing
+    its first or last line survives.
     """
-    lines = text.split(chr(10))
-    i = 0
-    while i < len(lines):
-        if lines[i].lstrip().startswith("#[cfg(test)]"):
-            # Find the opening brace of the item the attribute applies to, then
-            # brace-match to its end. Runs after `decomment`, and a test module's own
-            # braces balance, so counting is enough.
-            j, depth, started = i, 0, False
-            while j < len(lines):
-                depth += lines[j].count("{") - lines[j].count("}")
-                if "{" in lines[j]:
-                    started = True
-                if started and depth <= 0:
-                    break
-                j += 1
-            for k in range(i, min(j + 1, len(lines))):
-                lines[k] = ""
-            i = j + 1
-        else:
-            i += 1
-    return chr(10).join(lines)
+    code = mask_rust_literals(text)
+    out = list(text)
+    pos = 0
+    while True:
+        at = code.find("#[cfg(test)]", pos)
+        if at == -1:
+            break
+        line_start = code.rfind("\n", 0, at) + 1
+        if code[line_start:at].strip():
+            pos = at + 1
+            continue
+        end = rust_attributed_end(code, at + len("#[cfg(test)]"))
+        for k in range(at, end):
+            if out[k] != "\n":
+                out[k] = " "
+        pos = max(end, at + 1)
+    return "".join(out)
 
 
 def scan_rust_env(

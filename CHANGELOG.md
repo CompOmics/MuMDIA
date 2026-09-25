@@ -149,6 +149,13 @@ than a number. Both are recorded in every run's `manifest.json`.
   has fewer entries. In the list of reads whose name is not a literal, such reads share
   one entry that gives their number, and the header still counts reads. The variables,
   their defaults, the fields and the settings are unchanged.
+  The generator also skips a `#[cfg(test)]` element by the element's own extent
+  (`rust_attributed_end`), not by counting braces to the next balanced `}`. The old count
+  ran past an attribute on something without a body: on an enum variant it took the
+  enum's closing brace and the next item's header, so a source with a test-only variant
+  was rejected as unbalanced, and on a statement (`inject(Fault::Publish)?;`) it silently
+  blanked real code up to the end of the next block. The reference generated from main is
+  unchanged by this.
 ### Added
 
 - **`mumdia pool` pools a grouped run's band artifacts from the command line.** `run` does

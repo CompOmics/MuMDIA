@@ -231,6 +231,82 @@ def test_unbalanced_braces_after_masking_fail_loudly():
     assert reads["MUMDIA_T_AFTER"][0] == ["src/x.rs::b"]
 
 
+def test_cfg_test_blanks_only_the_element_it_applies_to():
+    """`#[cfg(test)]` on a variant, an arm, a statement or a `use` blanks that alone.
+
+    The blanking used to count braces from the attribute to the next balanced `}`, so
+    an attribute on something without a body of its own ran on into real code. On an
+    enum variant it took the enum's `}` and the next item's header, and the file was
+    then rejected as unbalanced; on a statement it silently blanked the code up to the
+    end of the next block, dropping any read there from the reference. Every read below
+    sits right after such an element and must still be cited by its own function.
+    """
+    source = """\
+#[cfg(test)]
+use crate::only::InTests;
+
+enum Probe<'a> {
+    Local { bins: &'a u32 },
+    #[cfg(test)]
+    Global(&'a u32),
+}
+
+impl Probe<'_> {
+    fn bins(&self) -> u32 {
+        match self {
+            Probe::Local { .. } => 1,
+            #[cfg(test)]
+            Probe::Global(_) => 2,
+        }
+    }
+
+    fn run(&self) {
+        match self {
+            #[cfg(test)]
+            Probe::Global(_) => {
+                std::env::set_var("MUMDIA_T_ARM_BLOCK", "x");
+            }
+            Probe::Local { .. } => {
+                let _ = std::env::var("MUMDIA_T_AFTER_ARM");
+            }
+        }
+    }
+}
+
+fn publish() -> Result<()> {
+    #[cfg(test)]
+    inject(Fault::Publish)?;
+    let _ = std::env::var("MUMDIA_T_AFTER_STATEMENT");
+    Ok(())
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+fn helper<A, B>(a: A, b: B) {
+    std::env::set_var("MUMDIA_T_GENERIC_HELPER", "x");
+}
+
+fn after_enum() {
+    let _ = std::env::var("MUMDIA_T_AFTER_ENUM");
+}
+"""
+    blanked = gen.blank_cfg_test(source)
+    assert len(blanked) == len(source)
+    assert blanked.count("\n") == source.count("\n")
+    for gone in ("InTests", "Global(&'a u32)", "Probe::Global(_) => 2", "inject(", "helper"):
+        assert gone not in blanked, gone
+    for kept in ("Local { bins", "Probe::Local { .. } => 1", "fn after_enum"):
+        assert kept in blanked, kept
+    reads, sets, unresolved = scan_rust(source)
+    assert {name: entry[0] for name, entry in reads.items()} == {
+        "MUMDIA_T_AFTER_ARM": ["src/x.rs::Probe::run"],
+        "MUMDIA_T_AFTER_ENUM": ["src/x.rs::after_enum"],
+        "MUMDIA_T_AFTER_STATEMENT": ["src/x.rs::publish"],
+    }
+    assert sets == {}
+    assert unresolved == []
+
+
 def test_repeated_unresolved_reads_are_counted_not_merged():
     """A second non-literal read in the same function changes the document.
 
