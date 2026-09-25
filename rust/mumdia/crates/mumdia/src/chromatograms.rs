@@ -10,9 +10,9 @@
 //! the row's retention-time axis and `intensity` its values on that axis, the same length,
 //! and both are empty for a predicted fragment that was never observed. In window-grid mode
 //! every observed row of a candidate repeats the same axis, and a fragment's trace is zero
-//! over most of the candidate's RT window. Measured on one AIF run, the `rt` column held
-//! 11.2 times the values that one axis per candidate needs, and 92.8% of the fragment
-//! intensities were 0.0.
+//! over most of the candidate's RT window. On the AIF run of docs/15 ("Layout v2"), the
+//! `rt` column held 10.8 times the values that one axis per candidate needs, and 57% of
+//! the `intensity` values lay outside their trace's nonzero run.
 //!
 //! **v2** (`extract.chromatogram_schema = 2`) adds two `u32` columns and changes what the
 //! two list columns hold:
