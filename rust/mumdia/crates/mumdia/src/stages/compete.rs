@@ -19,7 +19,7 @@ use mumdia_core::schema::artifact;
 use mumdia_io::report::{ArtifactReport, Written};
 use mumdia_io::table::{
     publish_copy_of, require_no_nulls, write_table, BatchWriter, Col, FileCopy, SpliceWriter,
-    TableFile,
+    TableFile, WriteOptions,
 };
 use serde_json::json;
 use tracing::{info, warn};
@@ -214,7 +214,7 @@ pub fn run_hashed(p: CompeteParams) -> Result<Written> {
     let resolve_ms = t_resolve.elapsed().as_millis();
     let t_write = Instant::now();
 
-    let (rows, published) = publish_competed(
+    let (rows, published, streamed_hash) = publish_competed(
         &t,
         p.features,
         p.out,
@@ -286,8 +286,10 @@ pub fn run_hashed(p: CompeteParams) -> Result<Written> {
     // Published as the features file's bytes: its hash is the features hash, which the
     // caller may already hold. Hashing the output again would read the widest artifact of
     // the run for a value that is known.
-    let content_hash = match (published, p.features_hash) {
-        (Published::FeaturesFile(_), Some(h)) => h.to_string(),
+    // A spliced or rewritten table was hashed while it was written.
+    let content_hash = match (published, p.features_hash, streamed_hash) {
+        (Published::FeaturesFile(_), Some(h), _) => h.to_string(),
+        (_, _, Some(h)) => h,
         _ => mumdia_io::hash::blake3_file(p.out)?,
     };
     let hash_ms = t_hash.elapsed().as_millis();
@@ -541,12 +543,12 @@ fn publish_competed(
     synth_peak_rank: bool,
     audit: bool,
     keep: &[usize],
-) -> Result<(u64, Published)> {
+) -> Result<(u64, Published, Option<String>)> {
     let n = t.nrows;
     match features_bytes_reusable(t, feat_names, synth_peak_rank, audit)? {
         // `keep` is sorted and unique within 0..n, so n entries are every row.
         Reuse::Yes if keep.len() == n => match link_or_copy(features, out) {
-            Ok(how) => return Ok((n as u64, Published::FeaturesFile(how))),
+            Ok(how) => return Ok((n as u64, Published::FeaturesFile(how), None)),
             Err(e) => warn!(
                 error = %format!("{e:#}"),
                 "compete: every row survived, but the features table could not be linked or \
@@ -561,13 +563,14 @@ fn publish_competed(
                 // on drop, so a failed splice leaves nothing behind, and the rewrite then
                 // produces the table the stage always produced.
                 match splice_kept_rows(t, features, out, feat_names, keep, &spans) {
-                    Ok((rows, rewritten)) => {
+                    Ok((rows, rewritten, hash)) => {
                         return Ok((
                             rows,
                             Published::Spliced {
                                 rewritten,
                                 row_groups: spans.len(),
                             },
+                            Some(hash),
                         ))
                     }
                     Err(e) => warn!(
@@ -583,15 +586,17 @@ fn publish_competed(
             "compete: the features table's bytes cannot be reused; rewriting the rows"
         ),
     }
-    let rows = copy_kept_rows(
+    let (rows, hash) = copy_kept_rows_with(
         t,
         out,
         feat_names,
         synth_peak_rank,
         keep,
-        COMPETED_ROW_GROUP_ROWS,
+        WriteOptions::new()
+            .row_group_rows(COMPETED_ROW_GROUP_ROWS)
+            .content_hash(),
     )?;
-    Ok((rows, Published::Rewritten))
+    Ok((rows, Published::Rewritten, hash))
 }
 
 /// `(first row, row count)` of each row group of the features file, in file order.
@@ -678,7 +683,8 @@ impl Drop for ScratchFile {
 /// keeps all its rows is appended as bytes ([`SpliceWriter`], as the pool splices band
 /// tables), and each run of consecutive row groups that lost a row is rewritten by
 /// [`copy_kept_rows`] into a scratch file whose row groups are then appended in its place.
-/// Returns the rows written and how many features row groups were rewritten.
+/// Returns the rows written, how many features row groups were rewritten, and the content
+/// hash of `out`, computed while it was written (the scratch files are not hashed).
 ///
 /// The caller has established [`features_bytes_reusable`], so the features file already is
 /// exactly what the copy writes for its rows, and a rewritten run carries the same parquet
@@ -692,12 +698,12 @@ fn splice_kept_rows(
     feat_names: &[String],
     keep: &[usize],
     spans: &[(usize, usize)],
-) -> Result<(u64, usize)> {
+) -> Result<(u64, usize, String)> {
     let clean: Vec<bool> = spans
         .iter()
         .map(|&(s, len)| kept_in(keep, s, len) == len)
         .collect();
-    let mut w = SpliceWriter::create(out, features)?;
+    let mut w = SpliceWriter::create_hashed(out, features)?;
     let (mut rows, mut rewritten) = (0u64, 0usize);
     let mut i = 0usize;
     while i < spans.len() {
@@ -745,14 +751,15 @@ fn splice_kept_rows(
         }
         rows += spliced;
     }
-    let written = w.close()?;
-    if written != rows || rows != keep.len() as u64 {
+    let written = w.close_hashed()?;
+    if written.rows != rows || rows != keep.len() as u64 {
         anyhow::bail!(
-            "compete: spliced {rows} rows into {out} (file holds {written}), expected {}",
+            "compete: spliced {rows} rows into {out} (file holds {}), expected {}",
+            written.rows,
             keep.len()
         );
     }
-    Ok((rows, rewritten))
+    Ok((rows, rewritten, written.content_hash))
 }
 
 /// The competed table's schema, in exactly the column set and order the previous typed
@@ -810,6 +817,20 @@ fn copy_kept_rows(
     keep: &[usize],
     row_group_rows: usize,
 ) -> Result<u64> {
+    let opts = WriteOptions::new().row_group_rows(row_group_rows);
+    Ok(copy_kept_rows_with(t, out, feat_names, synth_peak_rank, keep, opts)?.0)
+}
+
+/// [`copy_kept_rows`] under explicit writer options; returns the rows and, when `opts`
+/// asks for it, the content hash of `out`.
+fn copy_kept_rows_with(
+    t: &TableFile,
+    out: &str,
+    feat_names: &[String],
+    synth_peak_rank: bool,
+    keep: &[usize],
+    opts: WriteOptions,
+) -> Result<(u64, Option<String>)> {
     let (out_schema, source) = competed_schema(t, feat_names, synth_peak_rank)?;
     let proj: Vec<&str> = source.iter().flatten().map(String::as_str).collect();
     let reader = t.batches(Some(&proj), COPY_BATCH_ROWS)?;
@@ -821,7 +842,7 @@ fn copy_kept_rows(
                 .map(|s| in_schema.index_of(s).expect("validated above"))
         })
         .collect();
-    let mut w = BatchWriter::with_row_group_rows(out, out_schema.clone(), row_group_rows)?;
+    let mut w = BatchWriter::with_options(out, out_schema.clone(), opts)?;
     let (mut row0, mut kp) = (0usize, 0usize);
     for b in reader {
         let b = b?;
@@ -878,7 +899,7 @@ fn copy_kept_rows(
         }
         row0 = row1;
     }
-    w.close()
+    w.close_with_digest()
 }
 
 /// Apply the typed getters' null policy to a taken column so the output stays non-nullable,

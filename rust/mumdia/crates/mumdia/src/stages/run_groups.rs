@@ -872,13 +872,19 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
         out_competed: &out.competed,
     })
     .context("pooling the window groups")?;
-    let pooled_artifacts = pool_psms
-        .then_some((
-            artifact::PSMS_EXTRACTED.0,
-            artifact::PSMS_EXTRACTED,
-            &out.psms,
-            stats.psms,
-        ))
+    let pooled_artifacts = stats
+        .psms_hash
+        .clone()
+        .filter(|_| pool_psms)
+        .map(|h| {
+            (
+                artifact::PSMS_EXTRACTED.0,
+                artifact::PSMS_EXTRACTED,
+                &out.psms,
+                stats.psms,
+                h,
+            )
+        })
         .into_iter()
         .chain([
             (
@@ -886,18 +892,20 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
                 artifact::CHROMATOGRAMS,
                 &out.chromatograms,
                 stats.chromatograms,
+                stats.chromatograms_hash.clone(),
             ),
             (
                 artifact::PSMS_COMPETED.0,
                 artifact::PSMS_COMPETED,
                 &out.competed,
                 stats.competed,
+                stats.competed_hash.clone(),
             ),
         ]);
-    for (name, schema, path, rows) in pooled_artifacts {
-        // One hash for both the manifest record and the report beside the file: these are
-        // the run's largest artifacts, and hashing reads all of it.
-        let content_hash = mumdia_io::hash::blake3_file(path)?;
+    for (name, schema, path, rows, content_hash) in pooled_artifacts {
+        // One hash for both the manifest record and the report beside the file, computed
+        // by the pool while it spliced the table: these are the run's largest artifacts,
+        // and a read-back would read all of it again.
         record_opt(
             g.man.as_deref_mut(),
             mumdia_io::record_artifact_with_hash(

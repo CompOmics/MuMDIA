@@ -2334,7 +2334,11 @@ fn run_chunked(
     // The feature -> column permutation, taken once instead of once per value per row.
     let ix = ColIx::new(&cols_active, &ext_names);
 
-    let writer = TableWriter::new(p.out).with_row_group_rows(FEATURE_ROW_GROUP_ROWS);
+    // Hashed as it is written, so the report's content hash needs no read-back of the table
+    // (docs/03_io_layer.md, "Hash on write").
+    let writer = TableWriter::new(p.out)
+        .with_row_group_rows(FEATURE_ROW_GROUP_ROWS)
+        .with_content_hash();
     let mut pin = if p.cfg.emit_pin {
         Some(PinWriter::create(p.out_pin, &cols_active)?)
     } else {
@@ -2362,7 +2366,7 @@ fn run_chunked(
     // exactly what the serial code saw at that point.
     let chunk_rows: Vec<usize> = chunks.iter().map(|c| c.chrom_rows).collect();
     let ch_ref = &ch;
-    let rows = std::thread::scope(|sc| -> Result<u64> {
+    let written = std::thread::scope(|sc| -> Result<Written> {
         // A RENDEZVOUS channel, not a one-deep buffer. `sync_channel(1)` let the loader
         // finish a chunk, park it in the buffer and start a third, so three chunks of
         // traces were resident where the comment claimed two. At depth 0 the loader's
@@ -2387,7 +2391,7 @@ fn run_chunked(
         // over the previous good one, where the old in-line write simply returned before
         // `close` and let `AtomicPath` remove its temp file.
         let (wtx, wrx) = std::sync::mpsc::sync_channel::<Option<Vec<Col>>>(0);
-        let wh = sc.spawn(move || -> Result<u64> {
+        let wh = sc.spawn(move || -> Result<Written> {
             let mut writer = writer;
             let mut commit = false;
             for msg in wrx {
@@ -2407,7 +2411,7 @@ fn run_chunked(
                      the features table was not written"
                 ));
             }
-            writer.close()
+            writer.close_hashed()
         });
         sc.spawn(move || {
             let mut stream = match ChromStream::open(ch_ref) {
@@ -2703,6 +2707,7 @@ fn run_chunked(
         wh.join()
             .map_err(|_| anyhow!("features: the parquet writer thread panicked"))?
     })?;
+    let rows = written.rows;
 
     crate::memlog::report(
         "features chromatogram store",
@@ -2758,7 +2763,8 @@ fn run_chunked(
         schema_version: artifact::FEATURES.1,
         stage: "features".to_string(),
         rows,
-        content_hash: mumdia_io::hash::blake3_file(p.out)?,
+        // Computed while the table was written.
+        content_hash: written.content_hash,
         params: json!({"set": format!("{:?}", p.cfg.set), "coelution_corr_threshold": p.cfg.coelution_corr_threshold}),
         stats,
         model_identity: None,

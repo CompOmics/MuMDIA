@@ -40,7 +40,7 @@ the schema-id tuples).
 | `rust/mumdia/crates/mumdia-io/src/lib.rs` | crate root: `init_logging`, `record_artifact`, `inspect`; re-exports the modules |
 | `rust/mumdia/crates/mumdia-io/src/table.rs` | `Col` enum (write side), `write_table`, `Table` (read side) and the typed getters |
 | `rust/mumdia/crates/mumdia-io/src/report.rs` | `ArtifactReport` struct + `write_for` (the `.report.json` sidecar) |
-| `rust/mumdia/crates/mumdia-io/src/hash.rs` | `blake3_file`, `blake3_str` |
+| `rust/mumdia/crates/mumdia-io/src/hash.rs` | `blake3_file`, `blake3_str`, `HashingWrite` (hash on write) |
 | `rust/mumdia/crates/mumdia-io/src/json.rs` | `write_json`, `read_json` (pretty JSON via serde) |
 | `rust/mumdia/crates/mumdia-core/src/schema.rs` | frozen `(logical name, schema version)` tuples for every artifact |
 | `rust/mumdia/crates/mumdia-core/src/manifest.rs` | `ArtifactRecord` / `Manifest` (populated from `record_artifact`) |
@@ -246,11 +246,11 @@ snappy before feeding it to the engine.
 
 ### Hashing (`hash.rs`)
 
-`blake3_file(path)` (`hash.rs:8`) streams the file in 64 KiB chunks
+`blake3_file(path)` (`hash.rs:14`) streams the file in 64 KiB chunks
 (`[0u8; 1 << 16]`) through a `blake3::Hasher` and returns the hex digest. This
 is the artifact `content_hash`. It is fallible: it returns `Result` and errors
 with context `"hashing {path}"` if the file cannot be opened or a read fails.
-`blake3_str(s)` (`hash.rs:23`) is a one-shot hex digest of a string, used for the
+`blake3_str(s)` (`hash.rs:29`) is a one-shot hex digest of a string, used for the
 `config_hash`; it is infallible and returns a plain `String` rather than a
 `Result`. The engine derives the
 config hash from `Config::canonical_json()` (`config.rs:1125`, a plain
@@ -260,6 +260,46 @@ a deliberate exception: because `--max-spectra`, `--top-peaks-ms2`, and
 of `Config`, they are folded into the hash with a unit-separator (`\u{1f}`)
 alongside the canonical config JSON so two different caps do not collapse to the
 same `config_hash` (`main.rs:402-404`).
+
+#### Hash on write
+
+Every stage used to publish its output and then read the whole file back
+through `blake3_file` for the `content_hash` in its report, so each artifact byte
+crossed the disk or the page cache twice. The parquet writers in `table.rs` only
+ever append to their sink and never seek, so the digest of the byte stream is the
+digest of the finished file. A writer can therefore hash while it writes:
+
+- `hash::HashingWrite<W>` forwards every byte to `W` and feeds the bytes `W`
+  accepted to a `blake3::Hasher`;
+- in `table.rs` the output file is a `Sink`: `File` -> `HashingWrite` -> a 1 MB
+  `BufWriter`, so blake3 sees large contiguous inputs rather than parquet's
+  page headers one at a time. An unhashed sink has a zero-capacity buffer, which
+  passes every write straight through, so it issues the same writes as before;
+- hashing is opt-in per writer: `WriteOptions::content_hash()` for
+  `BatchWriter::with_options`, `TableWriter::with_content_hash()`,
+  `SpliceWriter::create_hashed`, `write_table_hashed` and
+  `write_batches_hashed`. The digest is finalised after parquet has written the
+  footer (`ArrowWriter::into_inner`, `SerializedFileWriter::into_inner`, which
+  write the same footer bytes as `close`) and returned as a
+  `report::Written { rows, content_hash }` by the writer's `close_hashed`;
+- it is off for files nobody records: the pool's per-row-group rewrite temp
+  files, compete's splice scratch files and the rescore sidecar handoff.
+
+The stages that write through `mumdia-io` and then hashed the same file now use
+the streamed digest: convert (both spectra tables, the isolation windows and the
+MS2-to-MS1 map), predict-frag (both library tables), search-seed, rt-im-train,
+extract (`psms_extracted` and `chromatograms`), features, compete (the spliced or
+rewritten table; a hard-linked one carries the features hash), the pool's three
+spliced tables in `run_groups`, and rescore's `psms_scored`. The small tables
+(digest, peptidoforms, quant, prescan, align) still hash by reading back.
+
+The digest is the same blake3 over the same bytes, so every `content_hash` in
+the reports and manifests is unchanged; the smoke run's manifests and reports are
+identical to the previous binary's apart from the git SHA and argv
+(`hash_on_write_tests` in `table.rs` pins digest == `blake3_file` for every writer
+type: empty, one block, many row groups, list columns). `blake3_file` itself is
+still not memoised: `features` uses it in its tests as an independent integrity
+check of a published file.
 
 ### JSON (`json.rs`)
 
@@ -360,7 +400,8 @@ The orchestrators therefore take the hash from the stage instead:
 Reusing the stage hashes changes no hash value in `manifest.json`,
 `experiment_manifest.json` or the `*.report.json` files; only the second read
 is gone. `hash::blake3_file` itself is not memoised: `features` uses it as an
-independent integrity check.
+independent integrity check. The stage's own hash no longer reads the file back
+either for the large artifacts ("Hash on write" above).
 
 One hash does change in the same release, for a different reason: compete
 now publishes `psms_competed.parquet` as the features file's own bytes when

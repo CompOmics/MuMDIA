@@ -11,7 +11,7 @@ use anyhow::Result;
 use mumdia_core::config::{CalibrationMethod, RtImTrainConfig};
 use mumdia_core::schema::artifact;
 use mumdia_io::report::{ArtifactReport, Written};
-use mumdia_io::table::{write_table, Col, TableFile};
+use mumdia_io::table::{write_table_hashed, Col, TableFile};
 use serde_json::json;
 use tracing::{info, warn};
 
@@ -429,7 +429,7 @@ pub fn run_hashed(p: RtImTrainParams) -> Result<Written> {
         imhi_c.push(None);
     }
 
-    let rows = write_table(
+    let windows = write_table_hashed(
         p.out_windows,
         vec![
             Col::U32("candidate_id".into(), cid_c),
@@ -441,6 +441,7 @@ pub fn run_hashed(p: RtImTrainParams) -> Result<Written> {
             Col::OptF64("im_hi".into(), imhi_c),
         ],
     )?;
+    let rows = windows.rows;
 
     let method = if !calibration_available {
         "unavailable"
@@ -519,7 +520,8 @@ pub fn run_hashed(p: RtImTrainParams) -> Result<Written> {
         schema_version: artifact::RUN_WINDOWS.1,
         stage: "rt-im-train".to_string(),
         rows,
-        content_hash: mumdia_io::hash::blake3_file(p.out_windows)?,
+        // Computed while the table was written.
+        content_hash: windows.content_hash,
         params: json!({"q_train": p.cfg.q_train, "p_rt": p.cfg.p_rt, "method": format!("{:?}", p.cfg.calibration_method)}),
         stats,
         model_identity: None,

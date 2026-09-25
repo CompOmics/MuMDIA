@@ -19,7 +19,7 @@ use anyhow::Result;
 use mumdia_core::config::{ExtractConfig, GateMode, PeakClaim};
 use mumdia_core::schema::artifact;
 use mumdia_io::report::{ArtifactReport, Written};
-use mumdia_io::table::{write_table, Col, TableFile, TableWriter};
+use mumdia_io::table::{write_table, write_table_hashed, Col, TableFile, TableWriter};
 use serde_json::json;
 use tracing::{info, warn};
 
@@ -2575,7 +2575,11 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
         (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
 
     // Chromatogram rows stream to parquet chunk by chunk (see the candidate loop below).
-    let chrom_writer = TableWriter::new(p.out_chrom).with_row_group_rows(CHROM_ROW_GROUP_ROWS);
+    // Hashed as it is written: the report's content hash then needs no read-back of the
+    // run's largest artifact (docs/03_io_layer.md, "Hash on write").
+    let chrom_writer = TableWriter::new(p.out_chrom)
+        .with_row_group_rows(CHROM_ROW_GROUP_ROWS)
+        .with_content_hash();
 
     // Deterministic output order (a HashMap's iteration order is randomized,
     // and downstream floating-point sums in the rescorer are order-sensitive).
@@ -3342,14 +3346,14 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
     // The chromatogram writer runs on its own thread and cannot borrow the library, so the
     // band's offset travels with the chunks.
     let chrom_offset = lib.global_offset;
-    let n_chrom = std::thread::scope(|sc| -> Result<u64> {
+    let chrom_written = std::thread::scope(|sc| -> Result<Written> {
         let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<Col>>(2);
-        let writer = sc.spawn(move || -> Result<u64> {
+        let writer = sc.spawn(move || -> Result<Written> {
             let mut w = chrom_writer;
             for cols in rx {
                 w.write_cols(cols)?;
             }
-            w.close()
+            w.close_hashed()
         });
         // One flush of finished candidates: score them in parallel, append their PSM
         // rows, and hand their chromatogram rows to the writer thread. Called once per
@@ -3668,7 +3672,7 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
         psms_cols.push(Col::F32("deconv_max_collinearity".into(), deconv_collin_c));
         psms_cols.push(Col::F32("shadow_kept_frac".into(), deconv_shadow_c));
     }
-    let n_psms = write_table(p.out_psms, psms_cols)?;
+    let psms_written = write_table_hashed(p.out_psms, psms_cols)?;
 
     // (chromatograms were streamed to `p.out_chrom` during the candidate loop above)
 
@@ -3698,18 +3702,20 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
     let mut stats = std::collections::BTreeMap::new();
     stats.insert("accepted".to_string(), json!(n_accepted));
     stats.insert("scan_window".to_string(), json!(scan_window));
+    let n_chrom = chrom_written.rows;
     let mut written: Vec<Written> = Vec::with_capacity(2);
-    for (path, schema, rows) in [
-        (p.out_psms, artifact::PSMS_EXTRACTED, n_psms),
-        (p.out_chrom, artifact::CHROMATOGRAMS, n_chrom),
+    for (path, schema, file) in [
+        (p.out_psms, artifact::PSMS_EXTRACTED, psms_written),
+        (p.out_chrom, artifact::CHROMATOGRAMS, chrom_written),
     ] {
         let report = ArtifactReport {
             logical_name: schema.0.to_string(),
             schema_name: schema.0.to_string(),
             schema_version: schema.1,
             stage: "extract".to_string(),
-            rows,
-            content_hash: mumdia_io::hash::blake3_file(path)?,
+            rows: file.rows,
+            // Both files were hashed while they were written.
+            content_hash: file.content_hash,
             params: json!({
                 "frag_tol_ppm": p.cfg.frag_tol_ppm,
                 "effective_frag_tol_ppm": frag_tol,

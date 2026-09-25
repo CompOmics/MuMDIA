@@ -28,6 +28,8 @@ use parquet::file::statistics::Statistics;
 use parquet::file::writer::SerializedFileWriter;
 use parquet::schema::types::ColumnPath;
 
+pub use crate::report::Written;
+
 /// The codec every artifact is written with. Snappy by default, which is what released
 /// artifacts use and what the sidecars' pyarrow reads without configuration;
 /// `MUMDIA_PARQUET_COMPRESSION=zstd` writes zstd instead. Both are read transparently,
@@ -418,6 +420,101 @@ fn writer_props(schema: &Schema, row_group_rows: Option<usize>) -> WriterPropert
     b.build()
 }
 
+/// The buffer in front of the hasher of a hashed artifact. parquet hands its sink page
+/// headers of a few dozen bytes between page bodies, and blake3 is several times faster on
+/// large contiguous inputs than on many small ones, so the hashed sink collects 1 MB before
+/// it hashes and writes. An unhashed sink has no buffer of its own (capacity 0 passes every
+/// write straight through), so it issues exactly the writes it always did.
+const HASH_BUFFER_BYTES: usize = 1 << 20;
+
+/// The file an artifact is written to, optionally hashed on the way (docs/03_io_layer.md,
+/// "Hash on write").
+///
+/// Every stage used to publish its output and then read the whole file back through
+/// [`crate::hash::blake3_file`] for the content hash in its report, so each artifact byte
+/// crossed the disk or the page cache twice. parquet's writers only ever append to their
+/// sink, so the digest of the stream is the digest of the file, and a writer opened with
+/// [`WriteOptions::content_hash`] returns it from its `close_hashed` without a read-back.
+struct Sink(std::io::BufWriter<crate::hash::HashingWrite<std::fs::File>>);
+
+impl Sink {
+    fn create(path: &std::path::Path, hash: bool) -> Result<Sink> {
+        let file =
+            std::fs::File::create(path).with_context(|| format!("creating {}", path.display()))?;
+        let cap = if hash { HASH_BUFFER_BYTES } else { 0 };
+        Ok(Sink(std::io::BufWriter::with_capacity(
+            cap,
+            crate::hash::HashingWrite::new(file, hash),
+        )))
+    }
+
+    /// Flush every byte to the file, close it, and return the digest of what was written
+    /// when one was asked for. Called after parquet has written the footer.
+    fn finish(self) -> Result<Option<String>> {
+        let inner = self
+            .0
+            .into_inner()
+            .map_err(|e| anyhow!("flushing an artifact to disk: {}", e.error()))?;
+        let (file, digest) = inner.finish();
+        drop(file);
+        Ok(digest)
+    }
+}
+
+impl std::io::Write for Sink {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.write(buf)
+    }
+
+    fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
+        self.0.write_all(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.flush()
+    }
+}
+
+/// How a writer lays out and accounts for the file it writes. The default is what every
+/// writer here did before the options existed: parquet-rs's row-group maximum, no digest.
+#[derive(Clone, Debug, Default)]
+pub struct WriteOptions {
+    row_group_rows: Option<usize>,
+    content_hash: bool,
+}
+
+impl WriteOptions {
+    pub fn new() -> WriteOptions {
+        WriteOptions::default()
+    }
+
+    /// Cap the rows per row group (see [`TableWriter::with_row_group_rows`]).
+    pub fn row_group_rows(mut self, rows: usize) -> WriteOptions {
+        self.row_group_rows = Some(rows.max(1));
+        self
+    }
+
+    /// Hash the file as it is written, so the writer's `close_hashed` returns the same
+    /// blake3 digest [`crate::hash::blake3_file`] would compute from the published file,
+    /// without reading it back. Leave it off for files nobody records: a temporary splice
+    /// source, a sidecar handoff.
+    pub fn content_hash(mut self) -> WriteOptions {
+        self.content_hash = true;
+        self
+    }
+}
+
+/// The digest a hashed writer returns, or an error naming the writer that was never asked
+/// to compute one.
+fn require_digest(rows: u64, digest: Option<String>, what: &str) -> Result<Written> {
+    match digest {
+        Some(content_hash) => Ok(Written { rows, content_hash }),
+        None => Err(anyhow!(
+            "{what}: close_hashed on a writer opened without WriteOptions::content_hash"
+        )),
+    }
+}
+
 /// A parquet file assembled from the row groups of other parquet files, copied as bytes.
 ///
 /// Pooling a grouped run's band artifacts is a concatenation: the rows are already in the
@@ -435,7 +532,7 @@ fn writer_props(schema: &Schema, row_group_rows: Option<usize>) -> WriterPropert
 /// The values and the row order are exactly those of the sources. The row-group boundaries
 /// are the sources' own, so a spliced file is not byte-identical to a re-encoded one.
 pub struct SpliceWriter {
-    writer: Option<SerializedFileWriter<std::fs::File>>,
+    writer: Option<SerializedFileWriter<Sink>>,
     /// The Arrow schema the sources must share, for the caller's own checks.
     pub schema: Arc<Schema>,
     rows: u64,
@@ -456,6 +553,16 @@ impl SpliceWriter {
     /// Create `out`, taking the schema and the Arrow metadata from `template`, which is
     /// normally the first file whose row groups will be spliced in.
     pub fn create(out: &str, template: &str) -> Result<SpliceWriter> {
+        Self::open(out, template, false)
+    }
+
+    /// [`SpliceWriter::create`], hashing the spliced file as it is written so
+    /// [`SpliceWriter::close_hashed`] returns its content hash without reading it back.
+    pub fn create_hashed(out: &str, template: &str) -> Result<SpliceWriter> {
+        Self::open(out, template, true)
+    }
+
+    fn open(out: &str, template: &str, hash: bool) -> Result<SpliceWriter> {
         let (_, meta) = splice_meta(template)?;
         let fm = meta.file_metadata();
         let props = WriterProperties::builder()
@@ -465,8 +572,7 @@ impl SpliceWriter {
             parquet::arrow::parquet_to_arrow_schema(fm.schema_descr(), fm.key_value_metadata())
                 .with_context(|| format!("reading the arrow schema of {template}"))?;
         let target = AtomicPath::new(out)?;
-        let file = std::fs::File::create(target.tmp())
-            .with_context(|| format!("creating {}", target.tmp().display()))?;
+        let file = Sink::create(target.tmp(), hash)?;
         let writer =
             SerializedFileWriter::new(file, fm.schema_descr().root_schema_ptr(), Arc::new(props))
                 .with_context(|| format!("opening {out} for splicing"))?;
@@ -537,14 +643,29 @@ impl SpliceWriter {
         self.rows
     }
 
-    pub fn close(mut self) -> Result<u64> {
+    pub fn close(self) -> Result<u64> {
+        Ok(self.finish()?.0)
+    }
+
+    /// Close, and return the rows and the content hash of the spliced file. The writer
+    /// must have been opened with [`SpliceWriter::create_hashed`].
+    pub fn close_hashed(self) -> Result<Written> {
+        let (rows, digest) = self.finish()?;
+        require_digest(rows, digest, "SpliceWriter")
+    }
+
+    fn finish(mut self) -> Result<(u64, Option<String>)> {
+        let mut digest = None;
         if let Some(w) = self.writer.take() {
-            w.close().context("closing the spliced parquet file")?;
+            // `into_inner` writes the footer, then hands the sink back so its digest can
+            // include the footer's bytes; `close` wrote the same bytes and dropped the sink.
+            let sink = w.into_inner().context("closing the spliced parquet file")?;
+            digest = sink.finish()?;
         }
         if let Some(t) = self.target.take() {
             t.publish()?;
         }
-        Ok(self.rows)
+        Ok((self.rows, digest))
     }
 }
 
@@ -614,9 +735,19 @@ col_chunks!(
 /// `..._row_for_row_on_lists` asserts the rows where the encoder's page boundaries are its
 /// own business.
 pub fn write_table(path: &str, cols: Vec<Col>) -> Result<u64> {
+    write_table_to(TableWriter::new(path), path, cols)?.close()
+}
+
+/// [`write_table`], hashing the file as it is written: returns the rows and the content
+/// hash [`crate::hash::blake3_file`] would compute, without reading the file back.
+pub fn write_table_hashed(path: &str, cols: Vec<Col>) -> Result<Written> {
+    write_table_to(TableWriter::new(path).with_content_hash(), path, cols)?.close_hashed()
+}
+
+/// Feed `cols` to `w` in [`WRITE_TABLE_CHUNK_ROWS`] chunks, leaving it open.
+fn write_table_to(mut w: TableWriter, path: &str, cols: Vec<Col>) -> Result<TableWriter> {
     let nrows = validate_cols(path, &cols)?;
     let mut chunks: Vec<ColChunks> = cols.into_iter().map(ColChunks::of).collect();
-    let mut w = TableWriter::new(path);
     let mut written = 0usize;
     loop {
         let k = (nrows - written).min(WRITE_TABLE_CHUNK_ROWS);
@@ -628,7 +759,7 @@ pub fn write_table(path: &str, cols: Vec<Col>) -> Result<u64> {
             break;
         }
     }
-    w.close()
+    Ok(w)
 }
 
 /// Incremental typed writer: the chunked counterpart of [`write_table`]. Feed `Vec<Col>`
@@ -645,10 +776,10 @@ pub fn write_table(path: &str, cols: Vec<Col>) -> Result<u64> {
 pub struct TableWriter {
     path: String,
     schema: Option<Arc<Schema>>,
-    writer: Option<ArrowWriter<std::fs::File>>,
+    writer: Option<ArrowWriter<Sink>>,
     target: Option<AtomicPath>,
     rows: u64,
-    row_group_rows: Option<usize>,
+    opts: WriteOptions,
 }
 
 impl TableWriter {
@@ -660,7 +791,7 @@ impl TableWriter {
             writer: None,
             target: None,
             rows: 0,
-            row_group_rows: None,
+            opts: WriteOptions::default(),
         }
     }
 
@@ -669,7 +800,14 @@ impl TableWriter {
     /// (chromatogram traces, spectra peak lists); keep them at tens of thousands of rows
     /// so the footer stays small and readers still get large batches.
     pub fn with_row_group_rows(mut self, rows: usize) -> TableWriter {
-        self.row_group_rows = Some(rows.max(1));
+        self.opts = self.opts.row_group_rows(rows);
+        self
+    }
+
+    /// Hash the file as it is written ([`WriteOptions::content_hash`]); close it with
+    /// [`TableWriter::close_hashed`] to get the digest.
+    pub fn with_content_hash(mut self) -> TableWriter {
+        self.opts = self.opts.content_hash();
         self
     }
 
@@ -682,13 +820,12 @@ impl TableWriter {
                 // writer here: a chunked artifact is the one most likely to be interrupted
                 // part-way, and an abandoned writer takes its temp file with it.
                 let target = AtomicPath::new(&self.path)?;
-                let file = std::fs::File::create(target.tmp())
-                    .with_context(|| format!("creating {}", target.tmp().display()))?;
+                let file = Sink::create(target.tmp(), self.opts.content_hash)?;
                 self.target = Some(target);
                 self.writer = Some(ArrowWriter::try_new(
                     file,
                     schema.clone(),
-                    Some(writer_props(&schema, self.row_group_rows)),
+                    Some(writer_props(&schema, self.opts.row_group_rows)),
                 )?);
                 self.schema = Some(schema);
             }
@@ -720,19 +857,35 @@ impl TableWriter {
     }
 
     /// Finish the file (the footer is written here) and return the row count.
-    pub fn close(mut self) -> Result<u64> {
+    pub fn close(self) -> Result<u64> {
+        Ok(self.finish()?.0)
+    }
+
+    /// Finish the file and return its rows and content hash, computed while it was written.
+    /// The writer must have been built [`TableWriter::with_content_hash`].
+    pub fn close_hashed(self) -> Result<Written> {
+        let path = self.path.clone();
+        let (rows, digest) = self.finish()?;
+        require_digest(rows, digest, &format!("TableWriter for {path}"))
+    }
+
+    fn finish(mut self) -> Result<(u64, Option<String>)> {
         let w = self.writer.take().ok_or_else(|| {
             anyhow!(
                 "TableWriter: no chunk written for {}; write one (possibly empty) chunk to fix the schema",
                 self.path
             )
         })?;
-        w.close()
+        // `into_inner` writes the footer (the same bytes `close` writes) and returns the sink,
+        // whose digest therefore covers the whole file.
+        let sink = w
+            .into_inner()
             .with_context(|| format!("closing parquet writer {}", self.path))?;
+        let digest = sink.finish()?;
         if let Some(t) = self.target.take() {
             t.publish()?;
         }
-        Ok(self.rows)
+        Ok((self.rows, digest))
     }
 }
 
@@ -894,14 +1047,14 @@ fn publish_copy_of_with(src: &str, out: &str, allow_link: bool) -> Result<FileCo
 /// is fine for ordinary artifacts but not for the rescoring feature matrix - hundreds of
 /// columns over millions of rows, where the caller already holds the data once.
 pub struct BatchWriter {
-    writer: Option<ArrowWriter<std::fs::File>>,
+    writer: Option<ArrowWriter<Sink>>,
     rows: u64,
     target: Option<AtomicPath>,
 }
 
 impl BatchWriter {
     pub fn new(path: &str, schema: Arc<Schema>) -> Result<BatchWriter> {
-        Self::open(path, schema, None)
+        Self::with_options(path, schema, WriteOptions::default())
     }
 
     /// Like [`BatchWriter::new`], with row groups capped at `rows` rows.
@@ -915,14 +1068,18 @@ impl BatchWriter {
         schema: Arc<Schema>,
         rows: usize,
     ) -> Result<BatchWriter> {
-        Self::open(path, schema, Some(rows))
+        Self::with_options(path, schema, WriteOptions::new().row_group_rows(rows))
     }
 
-    fn open(path: &str, schema: Arc<Schema>, row_group_rows: Option<usize>) -> Result<BatchWriter> {
+    /// A writer for `path` laid out and accounted for as `opts` says.
+    pub fn with_options(
+        path: &str,
+        schema: Arc<Schema>,
+        opts: WriteOptions,
+    ) -> Result<BatchWriter> {
         let target = AtomicPath::new(path)?;
-        let file = std::fs::File::create(target.tmp())
-            .with_context(|| format!("creating {}", target.tmp().display()))?;
-        let props = writer_props(&schema, row_group_rows);
+        let file = Sink::create(target.tmp(), opts.content_hash)?;
+        let props = writer_props(&schema, opts.row_group_rows);
         Ok(BatchWriter {
             writer: Some(ArrowWriter::try_new(file, schema, Some(props))?),
             rows: 0,
@@ -941,21 +1098,59 @@ impl BatchWriter {
     }
 
     /// Finish the file and return the row count. Must be called: the footer is written here.
-    pub fn close(mut self) -> Result<u64> {
+    pub fn close(self) -> Result<u64> {
+        Ok(self.finish()?.0)
+    }
+
+    /// Finish the file and return its rows and content hash, computed while it was written.
+    /// The writer must have been opened with [`WriteOptions::content_hash`].
+    pub fn close_hashed(self) -> Result<Written> {
+        let (rows, digest) = self.finish()?;
+        require_digest(rows, digest, "BatchWriter")
+    }
+
+    /// Finish the file and return its rows, and its content hash when the writer was opened
+    /// with [`WriteOptions::content_hash`]: for a caller that hashes only some of the files
+    /// one code path writes.
+    pub fn close_with_digest(self) -> Result<(u64, Option<String>)> {
+        self.finish()
+    }
+
+    fn finish(mut self) -> Result<(u64, Option<String>)> {
+        let mut digest = None;
         if let Some(w) = self.writer.take() {
-            w.close().context("closing parquet writer")?;
+            let sink = w.into_inner().context("closing parquet writer")?;
+            digest = sink.finish()?;
         }
         if let Some(t) = self.target.take() {
             t.publish()?;
         }
-        Ok(self.rows)
+        Ok((self.rows, digest))
     }
 }
 
 pub fn write_batches(path: &str, schema: Arc<Schema>, batches: &[RecordBatch]) -> Result<u64> {
+    Ok(write_batches_with(path, schema, batches, false)?.0)
+}
+
+/// [`write_batches`], hashing the file as it is written.
+pub fn write_batches_hashed(
+    path: &str,
+    schema: Arc<Schema>,
+    batches: &[RecordBatch],
+) -> Result<Written> {
+    let (rows, digest) = write_batches_with(path, schema, batches, true)?;
+    require_digest(rows, digest, "write_batches_hashed")
+}
+
+fn write_batches_with(
+    path: &str,
+    schema: Arc<Schema>,
+    batches: &[RecordBatch],
+    hash: bool,
+) -> Result<(u64, Option<String>)> {
     let target = AtomicPath::new(path)?;
-    let file = std::fs::File::create(target.tmp())
-        .with_context(|| format!("creating {}", target.tmp().display()))?;
+    let file = Sink::create(target.tmp(), hash)?;
     // The same properties [`TableWriter`] uses, minus the row-group cap: this path and the
     // chunked one must produce the same file, which
     // `write_table_matches_one_batch_byte_for_byte_on_scalars` asserts.
@@ -966,9 +1161,9 @@ pub fn write_batches(path: &str, schema: Arc<Schema>, batches: &[RecordBatch]) -
         writer.write(b)?;
         n += b.num_rows() as u64;
     }
-    writer.close()?;
+    let digest = writer.into_inner()?.finish()?;
     target.publish()?;
-    Ok(n)
+    Ok((n, digest))
 }
 
 /// A read-back table: all batches concatenated logically, accessed by column
@@ -2545,6 +2740,208 @@ mod batch_writer_tests {
         assert_eq!(meta.row_group(0).num_rows(), 3_000);
         assert_eq!(meta.row_group(3).num_rows(), 1_000);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// The digest a hashed writer returns is the blake3 of the published file, for every writer
+/// type and shape, and hashing does not change a byte of the file.
+#[cfg(test)]
+mod hash_on_write_tests {
+    use super::*;
+    use crate::hash::blake3_file;
+
+    fn dir(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "mumdia_hash_on_write_{}_{name}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn cols(n: usize) -> Vec<Col> {
+        vec![
+            Col::U32("id".into(), (0..n as u32).collect()),
+            Col::F64("mz".into(), (0..n).map(|i| i as f64 * 1.000_7).collect()),
+            Col::Str(
+                "label".into(),
+                (0..n)
+                    .map(|i| if i % 3 == 0 { "decoy" } else { "target" }.to_string())
+                    .collect(),
+            ),
+            Col::OptF32(
+                "im".into(),
+                (0..n).map(|i| (i % 4 != 1).then_some(i as f32)).collect(),
+            ),
+            Col::ListF32(
+                "trace".into(),
+                (0..n)
+                    .map(|i| (0..(i % 9)).map(|k| (i * k) as f32).collect())
+                    .collect(),
+            ),
+            Col::LargeListF32(
+                "rt".into(),
+                (0..n)
+                    .map(|i| (0..(i % 5)).map(|k| k as f32 * 0.25).collect())
+                    .collect(),
+            ),
+        ]
+    }
+
+    fn check(path: &str, w: &Written, rows: usize) {
+        assert_eq!(w.rows, rows as u64, "{path}");
+        assert_eq!(w.content_hash, blake3_file(path).unwrap(), "{path}");
+    }
+
+    #[test]
+    fn write_table_and_table_writer_digests_are_the_file_digests() {
+        let d = dir("table");
+        // Empty (schema only), one row, a sub-chunk table, and several 65,536-row chunks.
+        for n in [0usize, 1, 1_000, 2 * WRITE_TABLE_CHUNK_ROWS + 17] {
+            let hashed = d
+                .join(format!("hashed_{n}.parquet"))
+                .to_string_lossy()
+                .to_string();
+            let plain = d
+                .join(format!("plain_{n}.parquet"))
+                .to_string_lossy()
+                .to_string();
+            let w = write_table_hashed(&hashed, cols(n)).unwrap();
+            check(&hashed, &w, n);
+            write_table(&plain, cols(n)).unwrap();
+            assert_eq!(
+                std::fs::read(&hashed).unwrap(),
+                std::fs::read(&plain).unwrap(),
+                "hashing must not change the file ({n} rows)"
+            );
+        }
+        // Many row groups through a capped TableWriter, fed in uneven chunks.
+        let p = d.join("capped.parquet").to_string_lossy().to_string();
+        let mut w = TableWriter::new(&p)
+            .with_row_group_rows(1_000)
+            .with_content_hash();
+        let n = 7_777;
+        let mut rows = 0;
+        for (a, b) in [
+            (0usize, 10usize),
+            (10, 3_000),
+            (3_000, 3_000),
+            (3_000, 7_777),
+        ] {
+            let all = cols(n);
+            w.write_cols(all.into_iter().map(|c| slice_col(c, a, b)).collect())
+                .unwrap();
+            rows += b - a;
+        }
+        let written = w.close_hashed().unwrap();
+        check(&p, &written, rows);
+        assert_eq!(TableFile::open(&p).unwrap().row_group_rows().len(), 8);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    fn slice_col(c: Col, a: usize, b: usize) -> Col {
+        match c {
+            Col::U32(n, v) => Col::U32(n, v[a..b].to_vec()),
+            Col::F64(n, v) => Col::F64(n, v[a..b].to_vec()),
+            Col::Str(n, v) => Col::Str(n, v[a..b].to_vec()),
+            Col::OptF32(n, v) => Col::OptF32(n, v[a..b].to_vec()),
+            Col::ListF32(n, v) => Col::ListF32(n, v[a..b].to_vec()),
+            Col::LargeListF32(n, v) => Col::LargeListF32(n, v[a..b].to_vec()),
+            _ => unreachable!("not in the fixture"),
+        }
+    }
+
+    #[test]
+    fn batch_writer_write_batches_and_splice_digests_are_the_file_digests() {
+        let d = dir("batch");
+        let (schema, batch) = cols_to_batch("fixture", cols(5_000)).unwrap();
+        let p = |x: &str| d.join(x).to_string_lossy().to_string();
+
+        // BatchWriter: no batch at all, one batch, and one batch split into many row groups.
+        for (name, batches, cap) in [
+            ("bw_empty", vec![], Some(100)),
+            ("bw_one", vec![batch.clone()], None),
+            (
+                "bw_many",
+                vec![batch.clone(), batch.slice(0, 1_234)],
+                Some(700),
+            ),
+        ] {
+            let path = p(&format!("{name}.parquet"));
+            let mut opts = WriteOptions::new().content_hash();
+            if let Some(c) = cap {
+                opts = opts.row_group_rows(c);
+            }
+            let mut w = BatchWriter::with_options(&path, schema.clone(), opts).unwrap();
+            let mut rows = 0;
+            for b in &batches {
+                w.write(b).unwrap();
+                rows += b.num_rows();
+            }
+            check(&path, &w.close_hashed().unwrap(), rows);
+        }
+
+        // write_batches: empty, one, two batches; and the same bytes as the unhashed path.
+        for (name, batches) in [
+            ("wb_empty", vec![]),
+            ("wb_one", vec![batch.clone()]),
+            ("wb_two", vec![batch.clone(), batch.slice(100, 900)]),
+        ] {
+            let path = p(&format!("{name}.parquet"));
+            let plain = p(&format!("{name}_plain.parquet"));
+            let rows: usize = batches.iter().map(|b: &RecordBatch| b.num_rows()).sum();
+            check(
+                &path,
+                &write_batches_hashed(&path, schema.clone(), &batches).unwrap(),
+                rows,
+            );
+            write_batches(&plain, schema.clone(), &batches).unwrap();
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                std::fs::read(&plain).unwrap()
+            );
+        }
+
+        // SpliceWriter over two capped sources, hashed and not.
+        let a = p("src_a.parquet");
+        let b = p("src_b.parquet");
+        let mut w = TableWriter::new(&a).with_row_group_rows(1_500);
+        w.write_cols(cols(4_000)).unwrap();
+        w.close().unwrap();
+        let mut w = TableWriter::new(&b).with_row_group_rows(1_500);
+        w.write_cols(cols(2_000)).unwrap();
+        w.close().unwrap();
+        let spliced = p("spliced.parquet");
+        let mut s = SpliceWriter::create_hashed(&spliced, &a).unwrap();
+        s.append_row_groups(&a, |_| true).unwrap();
+        s.append_row_groups(&b, |k| k == 1).unwrap();
+        let written = s.close_hashed().unwrap();
+        check(&spliced, &written, 4_000 + 500);
+        let unhashed = p("spliced_plain.parquet");
+        let mut s = SpliceWriter::create(&unhashed, &a).unwrap();
+        s.append_row_groups(&a, |_| true).unwrap();
+        s.append_row_groups(&b, |k| k == 1).unwrap();
+        s.close().unwrap();
+        assert_eq!(
+            std::fs::read(&spliced).unwrap(),
+            std::fs::read(&unhashed).unwrap()
+        );
+        // An empty splice (footer only) is hashed too.
+        let empty = p("spliced_empty.parquet");
+        let s = SpliceWriter::create_hashed(&empty, &a).unwrap();
+        check(&empty, &s.close_hashed().unwrap(), 0);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn close_hashed_refuses_a_writer_that_was_not_asked_to_hash() {
+        let d = dir("refuse");
+        let p = d.join("x.parquet").to_string_lossy().to_string();
+        let mut w = TableWriter::new(&p);
+        w.write_cols(cols(3)).unwrap();
+        let e = w.close_hashed().unwrap_err().to_string();
+        assert!(e.contains("content_hash"), "{e}");
+        let _ = std::fs::remove_dir_all(&d);
     }
 }
 

@@ -121,6 +121,12 @@ than a number. Both are recorded in every run's `manifest.json`.
   reading and hashing every file again, and a grouped run under `run-experiment` no longer
   builds the band records it then dropped. Reusing the stage hashes changes no recorded
   hash value.
+- **The large artifacts are hashed while they are written.** A writer opened with
+  `WriteOptions::content_hash` feeds its bytes to blake3 on the way to the file and returns
+  the digest when it closes, so convert, predict-frag, search-seed, rt-im-train, extract,
+  features, compete, the pool and rescore no longer read their outputs back to hash them.
+  The digest is the same blake3 over the same bytes: every recorded hash and every artifact
+  byte is unchanged (docs/03 "Hash on write").
 
 - **Library writers emit fragment tables sorted by `candidate_id`.** `import_diann_lib.py`,
   `make_reverse_decoys.py` and `make_shift_decoys.py` finish with a streaming bucket sort

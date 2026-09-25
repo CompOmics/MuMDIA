@@ -1009,8 +1009,9 @@ pub fn run_hashed(p: RescoreParams) -> Result<Written> {
         seen.len()
     };
 
-    let rows = write_scored_table(
+    let (rows, scored_hash) = write_scored(
         p.out,
+        true,
         ScoredColumns {
             cid,
             pform,
@@ -1054,7 +1055,8 @@ pub fn run_hashed(p: RescoreParams) -> Result<Written> {
         schema_version: artifact::PSMS_SCORED.1,
         stage: "rescore".to_string(),
         rows,
-        content_hash: mumdia_io::hash::blake3_file(p.out)?,
+        // Computed while the table was written.
+        content_hash: scored_hash.expect("write_scored hashes when asked"),
         params: json!({
             "classifier": classifier_used,
             "classifier_requested": format!("{:?}", p.cfg.classifier),
@@ -1187,20 +1189,32 @@ fn scored_schema() -> std::sync::Arc<arrow::datatypes::Schema> {
     ]))
 }
 
-/// Rows per record batch in [`write_scored_table`].
+/// Rows per record batch in [`write_scored`].
 ///
 /// The same 65,536 that `mumdia_io::table::write_table` feeds its writer, so the parquet
 /// is unchanged; what the chunk bounds is the width of one arrow `StringArray`.
 const SCORED_CHUNK_ROWS: usize = 1 << 16;
 
+/// [`write_scored`] without the digest; the tests compare its bytes across constructions.
+#[cfg(test)]
 fn write_scored_table(path: &str, c: ScoredColumns) -> Result<u64> {
+    Ok(write_scored(path, false, c)?.0)
+}
+
+/// [`write_scored_table`], hashing the table while it is written when `hash` is set; the
+/// bytes are the same either way.
+fn write_scored(path: &str, hash: bool, c: ScoredColumns) -> Result<(u64, Option<String>)> {
     use arrow::array::{ArrayRef, Int32Array, StringArray, UInt32Array};
     use arrow::record_batch::RecordBatch;
     use std::sync::Arc;
 
     let schema = scored_schema();
     let nrows = c.cid.len();
-    let mut w = mumdia_io::table::BatchWriter::new(path, schema.clone())?;
+    let mut opts = mumdia_io::table::WriteOptions::new();
+    if hash {
+        opts = opts.content_hash();
+    }
+    let mut w = mumdia_io::table::BatchWriter::with_options(path, schema.clone(), opts)?;
     // At least one batch, so a scored table with no rows still writes its schema.
     let mut lo = 0usize;
     loop {
@@ -1258,7 +1272,7 @@ fn write_scored_table(path: &str, c: ScoredColumns) -> Result<u64> {
             break;
         }
     }
-    w.close()
+    w.close_with_digest()
 }
 
 /// Reject a concatenation whose feature companions differ in either identity or

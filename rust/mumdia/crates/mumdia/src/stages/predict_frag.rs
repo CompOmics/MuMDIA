@@ -14,7 +14,7 @@ use mumdia_core::config::{FragPredictorKind, PredictFragConfig, RtPredictorKind}
 use mumdia_core::mass::{parse_peptidoform, Fragment, ParsedPeptidoform};
 use mumdia_core::schema::artifact;
 use mumdia_io::report::{ArtifactReport, Written};
-use mumdia_io::table::{write_table, Col, TableFile};
+use mumdia_io::table::{write_table_hashed, Col, TableFile};
 use serde_json::json;
 use tracing::info;
 
@@ -291,7 +291,7 @@ pub fn run_hashed(p: PredictFragParams) -> Result<(Written, Written)> {
         }
     }
 
-    let n_prec = write_table(
+    let prec_written = write_table_hashed(
         p.out_precursors,
         vec![
             Col::U32("candidate_id".into(), cid),
@@ -312,7 +312,7 @@ pub fn run_hashed(p: PredictFragParams) -> Result<(Written, Written)> {
     // deterministic precomputed column instead of a runtime heuristic. Diagnostic;
     // no consumer yet.
     let f_card = fragment_cardinality(&f_cid, &f_mz);
-    let n_frag = write_table(
+    let frag_written = write_table_hashed(
         p.out_fragments,
         vec![
             Col::U32("candidate_id".into(), f_cid),
@@ -326,6 +326,7 @@ pub fn run_hashed(p: PredictFragParams) -> Result<(Written, Written)> {
         ],
     )?;
 
+    let (n_prec, n_frag) = (prec_written.rows, frag_written.rows);
     let elapsed = t0.elapsed().as_millis();
     let mut stats = std::collections::BTreeMap::new();
     stats.insert("candidates".to_string(), json!(n_prec));
@@ -344,21 +345,26 @@ pub fn run_hashed(p: PredictFragParams) -> Result<(Written, Written)> {
         json!(n_dropped_pairs),
     );
     let mut written: Vec<Written> = Vec::with_capacity(2);
-    for (path, schema) in [
-        (p.out_precursors, artifact::FRAGMENT_LIBRARY_PRECURSORS),
-        (p.out_fragments, artifact::FRAGMENT_LIBRARY_FRAGMENTS),
+    for (path, schema, file) in [
+        (
+            p.out_precursors,
+            artifact::FRAGMENT_LIBRARY_PRECURSORS,
+            prec_written,
+        ),
+        (
+            p.out_fragments,
+            artifact::FRAGMENT_LIBRARY_FRAGMENTS,
+            frag_written,
+        ),
     ] {
         let report = ArtifactReport {
             logical_name: schema.0.to_string(),
             schema_name: schema.0.to_string(),
             schema_version: schema.1,
             stage: "predict-frag".to_string(),
-            rows: if path == p.out_precursors {
-                n_prec
-            } else {
-                n_frag
-            },
-            content_hash: mumdia_io::hash::blake3_file(path)?,
+            rows: file.rows,
+            // Both tables were hashed while they were written.
+            content_hash: file.content_hash,
             params: json!({"top_n": p.cfg.top_n_fragments, "ms2pip_model": p.cfg.ms2pip_model,
                            "rt_predictor": format!("{:?}", p.cfg.rt_predictor),
                            "fragment_predictor": format!("{:?}", p.cfg.predictor)}),
