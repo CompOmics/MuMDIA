@@ -35,7 +35,7 @@ The crate is declared in `lib.rs:6-13` (`config`, `constants`, `error`,
 | `rust/mumdia/crates/mumdia-core/src/config.rs` | All config structs + every strategy enum; `Config::from_json`, `validate`, `apply_profile`, `canonical_json` (1585 lines) |
 | `rust/mumdia/crates/mumdia-core/src/constants.rs` | Physical constants (`PROTON`, `WATER`, `AMMONIA`, `ISOTOPE_SPACING`), `residue_mass`, `mass_to_mz`, ppm predicates |
 | `rust/mumdia/crates/mumdia-core/src/mass.rs` | `unimod_mass`, `IonType`, `Fragment`, `ParsedPeptidoform`, `parse_peptidoform`, b/y fragment generation |
-| `rust/mumdia/crates/mumdia-core/src/schema.rs` | Frozen `(name, version)` ids for every artifact; `PSMS_SCORED` is v4, `PSMS_COMPETED` is v3, `PSMS_EXTRACTED`/`PEPTIDE_QUANT`/`PROTEIN_GROUP_QUANT` are v2, all others v1 |
+| `rust/mumdia/crates/mumdia-core/src/schema.rs` | Frozen `(name, version)` ids for every artifact; `PSMS_SCORED` and `PSMS_COMPETED` are v4, `FEATURES`/`PSMS_EXTRACTED`/`PEPTIDE_QUANT`/`PROTEIN_GROUP_QUANT` are v2, all others v1 |
 | `rust/mumdia/crates/mumdia-core/src/manifest.rs` | `Manifest` + `ArtifactRecord` (provenance) |
 | `rust/mumdia/crates/mumdia-core/src/types.rs` | `Peak`, `IsolationWindow`, `Label`, `Ms2Scan` |
 | `rust/mumdia/crates/mumdia-core/src/rejection.rs` | `RejectionReason` ladder for the candidate-audit table |
@@ -931,10 +931,14 @@ stale.
 - **Second mod at the same position accumulates** (`mass.rs:235`), which is a
   behavior difference from engines that drop it; terminal mods are separate
   fields, not part of `mods[i]`.
-- **Correctness changes have bumped five schemas.** `PSMS_EXTRACTED`,
-  `PEPTIDE_QUANT`, and `PROTEIN_GROUP_QUANT` are v2; `PSMS_COMPETED` is v3;
-  `PSMS_SCORED` is v4. Other registry entries remain v1. Readers must honor the
-  registry rather than assume one version globally.
+- **Six schemas have been bumped.** `FEATURES`, `PSMS_EXTRACTED`,
+  `PEPTIDE_QUANT`, and `PROTEIN_GROUP_QUANT` are v2; `PSMS_COMPETED` and
+  `PSMS_SCORED` are v4. The earlier bumps were correctness changes. The
+  `FEATURES` bump (v2) and the latest `PSMS_COMPETED` bump (v4) changed only the
+  stored width: the feature columns are `Float32` except the five
+  `F64_FEATURE_COLUMNS`, and no value the classifier sees changed. Other
+  registry entries remain v1. Readers must honor the registry rather than assume
+  one version globally.
 - **`content_hash` is the file's blake3, not the logical content.** Any byte
   change (compression, column order) changes the hash; it is a change detector,
   not a canonical-content identity.

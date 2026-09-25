@@ -82,9 +82,17 @@ confident-target set (`spectrum_q <= 0.01` and `label == "target"`) used for
 Bookkeeping columns, in order: `candidate_id` (u32), `label` (str),
 `base_peptide_id` (u32), `peptidoform` (str), `protein` (str), `apex_rt` (f64),
 `elution_lo` (f64), `elution_hi` (f64), `precursor_mz` (f64), `prelim_score`
-(f64). Then one `F64` column per name in `active_features(cfg.set)`, in order.
-`elution_lo`/`elution_hi` are the RT bounds the stage actually used (emitted so
-downstream and plotting read them rather than re-derive).
+(f64). `elution_lo`/`elution_hi` are the RT bounds the stage actually used
+(emitted so downstream and plotting read them rather than re-derive). Then one
+column per name in `active_features(cfg.set)`, in order.
+
+Each feature column is `Float32`, holding the f64 value the stage computed
+narrowed by `v as f32`, except the five `F64_FEATURE_COLUMNS` (`charge`,
+`n_matched_fragments`, `unique_fragment_count`, `peak_contested_frac`,
+`contested_frac`), which stay `Float64` because compete or rescore reads them as
+f64 before narrowing. Every classifier narrows every feature to f32 the same way,
+so the scored outputs do not change. `docs/15_data_dictionary.md`
+("features.parquet") has the storage contract and the version-1 layout.
 
 ### Produced: companion + PIN + report
 
@@ -94,8 +102,9 @@ downstream and plotting read them rather than re-derive).
   `SpecId Label ScanNr ExpMass CalcMass <features...> Peptide Proteins`
   (`write_pin`, `features.rs:1537`).
 - `<out>.report.json` (`ArtifactReport`, `features.rs:969`): logical name
-  `features`, schema version 1, `stats` carrying `feature_schema_id`,
-  `n_features`, and `set`; `params` records `set` and
+  `features`, schema version 2 (version 1 stored every feature column as
+  `Float64`; compete and rescore still read it), `stats` carrying
+  `feature_schema_id`, `n_features`, and `set`; `params` records `set` and
   `coelution_corr_threshold` (`features.rs:976`); `content_hash` is the blake3 of
   the features Parquet; `model_identity` is `None`.
 
