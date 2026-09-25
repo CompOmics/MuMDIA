@@ -591,6 +591,21 @@ tier is a manual worker invocation. `--seed` receives the engine-wide
 validated as a prototype but Stage D3 is a stub in the engine (config hooks only;
 not in the `run` chain).
 
+Every lookup the worker makes is for a candidate that is a confident target of some
+run (`allc`, the union of the per-run confident sets), so the per-run apex maps and
+the per-candidate metadata hold only those candidates, and rescore's selected-peak
+lookup is built only for a run whose competed table has several peaks of one
+candidate (never under the default `extract.retain_top_peaks = 1`). The accepted
+transfers are flagged in the augmented scored table by one sorted-key lookup on
+`(source, candidate_id)` instead of a Python loop over every row (`flag_transfers`),
+and the frames the flagging no longer needs are released before the whole scored
+table is loaded. On the 258.75M-row pooled immunopeptidomics experiment the
+survey estimated about 100 GB of worker memory and 4-6 minutes of Python loops for
+what these replace. The confident sets, and so the iteration order of `allc` that the
+permuted-RT null depends on, are built from the same rows in the same order as before;
+`test_the_worker_writes_the_reference_workers_bytes` compares every output, with and
+without retained top-K peaks, byte for byte against the worker before the change.
+
 ### DIA-NN recipe (offline, license-clean)
 
 Run once by the user, who must hold their own DIA-NN license (MuMDIA ships no
