@@ -15,7 +15,7 @@ use mumdia_core::config::{
     FragmentSelection, NormalizeMethod, PeakWindowMode, QuantConfig, QuantQColumn, RollupMethod,
 };
 use mumdia_core::schema::artifact;
-use mumdia_io::report::ArtifactReport;
+use mumdia_io::report::{ArtifactReport, Written};
 use mumdia_io::table::{column_names, write_table, Col, ListF32, TableFile};
 use rayon::prelude::*;
 use serde_json::json;
@@ -1445,6 +1445,21 @@ fn load_chrom_span(
 }
 
 pub fn run(p: QuantParams) -> Result<(u64, u64)> {
+    run_hashed(p).map(|w| (w.peptide.rows, w.protein.rows))
+}
+
+/// The quant outputs as written and reported: row count and report content hash of each.
+#[derive(Clone, Debug)]
+pub struct QuantWritten {
+    pub peptide: Written,
+    pub protein: Written,
+    /// `Some` exactly when `QuantParams::out_fragment` was set.
+    pub fragment: Option<Written>,
+}
+
+/// [`run`], returning each output's row count and the content hash its report records, so
+/// an orchestrator can record the artifacts without reading and hashing them again.
+pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
     let t0 = Instant::now();
     // No output may be one of the inputs (docs/31 F6).
     let inputs = [
@@ -2082,11 +2097,12 @@ pub fn run(p: QuantParams) -> Result<(u64, u64)> {
         "apex_rt_column_present": apex_column_present,
         "candidates_with_scored_apex": apex_by_cid.len(),
     });
+    let mut written: Vec<Written> = Vec::with_capacity(2);
     for (path, schema, rows) in [
         (p.out_peptide, artifact::PEPTIDE_QUANT, n_pep),
         (p.out_protein, artifact::PROTEIN_GROUP_QUANT, n_pg),
     ] {
-        ArtifactReport {
+        let report = ArtifactReport {
             logical_name: schema.0.to_string(),
             schema_name: schema.0.to_string(),
             schema_version: schema.1,
@@ -2097,11 +2113,13 @@ pub fn run(p: QuantParams) -> Result<(u64, u64)> {
             stats: stats.clone(),
             model_identity: None,
             elapsed_ms: elapsed,
-        }
-        .write_for(path)?;
+        };
+        report.write_for(path)?;
+        written.push(report.written());
     }
+    let mut fragment_written: Option<Written> = None;
     if let Some((path, rows)) = fragment_output {
-        ArtifactReport {
+        let report = ArtifactReport {
             logical_name: artifact::FRAGMENT_QUANT.0.to_string(),
             schema_name: artifact::FRAGMENT_QUANT.0.to_string(),
             schema_version: artifact::FRAGMENT_QUANT.1,
@@ -2112,8 +2130,9 @@ pub fn run(p: QuantParams) -> Result<(u64, u64)> {
             stats: stats.clone(),
             model_identity: None,
             elapsed_ms: elapsed,
-        }
-        .write_for(path)?;
+        };
+        report.write_for(path)?;
+        fragment_written = Some(report.written());
     }
 
     info!(
@@ -2124,7 +2143,13 @@ pub fn run(p: QuantParams) -> Result<(u64, u64)> {
         elapsed_ms = elapsed,
         "quant: done"
     );
-    Ok((n_pep, n_pg))
+    let protein = written.pop().expect("two reports written");
+    let peptide = written.pop().expect("two reports written");
+    Ok(QuantWritten {
+        peptide,
+        protein,
+        fragment: fragment_written,
+    })
 }
 
 /// Combine several per-run quant tables into a protein-by-run abundance matrix

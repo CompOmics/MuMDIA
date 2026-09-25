@@ -9,8 +9,8 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use mumdia_core::schema::artifact;
-use mumdia_io::report::ArtifactReport;
-use mumdia_io::table::{write_table, Col, TableWriter};
+use mumdia_io::report::{ArtifactReport, Written};
+use mumdia_io::table::{write_table_hashed, Col, TableWriter};
 use mzdata::io::mzml::MzMLReaderType;
 use mzdata::io::{DetailLevel, MZReaderType};
 use mzdata::prelude::*;
@@ -127,6 +127,18 @@ pub struct ConvertParams<'a> {
 
 /// Result paths for chaining.
 pub struct ConvertOutputs {
+    pub ms1: String,
+    pub ms2: String,
+    pub isolation_windows: String,
+    pub ms2_to_ms1: String,
+    /// The content hash each artifact's `<artifact>.report.json` records, so an
+    /// orchestrator can record the four artifacts without reading and hashing them again.
+    pub hashes: ConvertHashes,
+}
+
+/// The report content hash of each convert artifact, field for field with the paths of
+/// [`ConvertOutputs`].
+pub struct ConvertHashes {
     pub ms1: String,
     pub ms2: String,
     pub isolation_windows: String,
@@ -337,8 +349,14 @@ struct Fold {
 impl Fold {
     fn new(ms1_path: &str, ms2_path: &str) -> Self {
         Self {
-            ms1_w: TableWriter::new(ms1_path).with_row_group_rows(SPECTRA_CHUNK),
-            ms2_w: TableWriter::new(ms2_path).with_row_group_rows(SPECTRA_CHUNK),
+            // Hashed as they are written, so the reports need no read-back of the spectra
+            // (docs/03_io_layer.md, "Hash on write").
+            ms1_w: TableWriter::new(ms1_path)
+                .with_row_group_rows(SPECTRA_CHUNK)
+                .with_content_hash(),
+            ms2_w: TableWriter::new(ms2_path)
+                .with_row_group_rows(SPECTRA_CHUNK)
+                .with_content_hash(),
             ms1: Ms1Chunk::default(),
             ms2: Ms2Chunk::default(),
             uniq: Vec::new(),
@@ -928,10 +946,11 @@ fn run_inner(p: ConvertParams, force_threads: Option<usize>) -> Result<ConvertOu
         );
     }
 
-    let n_ms1 = ms1_w.close()?;
-    let n_ms2 = ms2_w.close()?;
+    let ms1_written = ms1_w.close_hashed()?;
+    let ms2_written = ms2_w.close_hashed()?;
+    let (n_ms1, n_ms2) = (ms1_written.rows, ms2_written.rows);
 
-    let n_iw = write_table(
+    let iw_written = write_table_hashed(
         &iw_path,
         vec![
             Col::U32(
@@ -944,7 +963,7 @@ fn run_inner(p: ConvertParams, force_threads: Option<usize>) -> Result<ConvertOu
         ],
     )?;
 
-    let n_map = write_table(
+    let map_written = write_table_hashed(
         &map_path,
         vec![
             Col::U32("ms2_scan_index".into(), map_ms2),
@@ -953,12 +972,13 @@ fn run_inner(p: ConvertParams, force_threads: Option<usize>) -> Result<ConvertOu
     )?;
 
     let elapsed = t0.elapsed().as_millis();
-    write_reports(
-        &[
-            (&ms1_path, artifact::SPECTRA_MS1, n_ms1),
-            (&ms2_path, artifact::SPECTRA_MS2, n_ms2),
-            (&iw_path, artifact::ISOLATION_WINDOWS, n_iw),
-            (&map_path, artifact::MS2_TO_MS1, n_map),
+    let n_iw = iw_written.rows;
+    let mut hashes = write_reports(
+        vec![
+            (&ms1_path, artifact::SPECTRA_MS1, ms1_written),
+            (&ms2_path, artifact::SPECTRA_MS2, ms2_written),
+            (&iw_path, artifact::ISOLATION_WINDOWS, iw_written),
+            (&map_path, artifact::MS2_TO_MS1, map_written),
         ],
         elapsed,
         json!({
@@ -977,34 +997,50 @@ fn run_inner(p: ConvertParams, force_threads: Option<usize>) -> Result<ConvertOu
         elapsed_ms = elapsed,
         "convert: done"
     );
+    // `write_reports` returns the hashes in the order it was given the artifacts.
+    let map_hash = hashes.pop().expect("four reports written");
+    let iw_hash = hashes.pop().expect("four reports written");
+    let ms2_hash = hashes.pop().expect("four reports written");
+    let ms1_hash = hashes.pop().expect("four reports written");
     Ok(ConvertOutputs {
         ms1: ms1_path,
         ms2: ms2_path,
         isolation_windows: iw_path,
         ms2_to_ms1: map_path,
+        hashes: ConvertHashes {
+            ms1: ms1_hash,
+            ms2: ms2_hash,
+            isolation_windows: iw_hash,
+            ms2_to_ms1: map_hash,
+        },
     })
 }
+
+/// Write one report per artifact and return the content hashes they record, in `items`
+/// order. Every artifact was hashed while it was written.
 fn write_reports(
-    items: &[(&String, (&str, u32), u64)],
+    items: Vec<(&String, (&str, u32), Written)>,
     elapsed_ms: u128,
     params: serde_json::Value,
-) -> Result<()> {
-    for (path, schema, rows) in items {
+) -> Result<Vec<String>> {
+    let mut hashes = Vec::with_capacity(items.len());
+    for (path, schema, written) in items {
         let rep = ArtifactReport {
             logical_name: schema.0.to_string(),
             schema_name: schema.0.to_string(),
             schema_version: schema.1,
             stage: "convert".to_string(),
-            rows: *rows,
-            content_hash: mumdia_io::hash::blake3_file(path)?,
+            rows: written.rows,
+            content_hash: written.content_hash,
             params: params.clone(),
             stats: Default::default(),
             model_identity: None,
             elapsed_ms,
         };
         rep.write_for(path)?;
+        hashes.push(rep.content_hash);
     }
-    Ok(())
+    Ok(hashes)
 }
 
 #[cfg(test)]
@@ -1607,6 +1643,43 @@ mod tests {
         // is kept, and nothing declares the file truncated.
         assert_eq!(rows_in_report(&out.ms1), 2);
         assert_eq!(rows_in_report(&out.ms2), 1);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// `ConvertOutputs::hashes` is what an orchestrator records in the manifest instead of
+    /// hashing the four files again, so each field must be the hash of the file at the
+    /// path of the same name, and the hash its own report records. A swap between two
+    /// fields would put one artifact's hash on another's record; the four files differ,
+    /// so any swap fails here.
+    #[test]
+    fn the_returned_hashes_are_those_of_the_files_written() {
+        let d = tmpdir("hashes");
+        let mzml_path = d.join("run.mzML");
+        std::fs::write(
+            &mzml_path,
+            mzml(4, &four_spectra(["0.10", "0.11", "0.20", "0.21"])),
+        )
+        .unwrap();
+        let out = run(ConvertParams {
+            mzml: mzml_path.to_str().unwrap(),
+            out_dir: d.to_str().unwrap(),
+            max_spectra: 0,
+            top_peaks_ms2: 0,
+            top_peaks_ms1: 0,
+            config_hash: "test",
+        })
+        .unwrap();
+        for (path, hash) in [
+            (&out.ms1, &out.hashes.ms1),
+            (&out.ms2, &out.hashes.ms2),
+            (&out.isolation_windows, &out.hashes.isolation_windows),
+            (&out.ms2_to_ms1, &out.hashes.ms2_to_ms1),
+        ] {
+            assert_eq!(hash, &mumdia_io::hash::blake3_file(path).unwrap(), "{path}");
+            let rep: mumdia_io::report::ArtifactReport =
+                mumdia_io::json::read_json(&format!("{path}.report.json")).unwrap();
+            assert_eq!(hash, &rep.content_hash, "{path}");
+        }
         let _ = std::fs::remove_dir_all(&d);
     }
 

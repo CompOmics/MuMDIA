@@ -16,6 +16,18 @@
 use crate::index::Library;
 use crate::matchers::binning::LogBins;
 use mumdia_core::constants::within_ppm;
+use rayon::prelude::*;
+use std::sync::atomic::{AtomicU16, AtomicU32, Ordering};
+
+/// Postings per chunk below which a build does not bother splitting: each chunk carries a
+/// histogram of every bin, so a chunk must be worth more than its histogram.
+const MIN_CHUNK_POSTINGS: usize = 1 << 16;
+
+/// `n` zeroed atomics, allocated and touched in parallel (the pages are first written here,
+/// so a serial fill would be a serial page-fault pass over the whole posting array).
+fn atomic_u32_zeroed(n: usize) -> Vec<AtomicU32> {
+    (0..n).into_par_iter().map(|_| AtomicU32::new(0)).collect()
+}
 
 /// The CSR inverted fragment index. Structure-of-arrays so the verify hot loop
 /// decides on `post_mz` alone and `post_cand`/`post_int`/`post_frag` are wanted only
@@ -30,12 +42,14 @@ pub struct FragIndex {
     post_cand: Vec<u32>,
     /// Predicted m/z per posting, f32.
     post_mz: Vec<f32>,
-    /// Predicted intensity per posting.
+    /// Predicted intensity per posting. Empty on an m/z-only index
+    /// ([`FragIndex::build_mz_only`]).
     post_int: Vec<f32>,
-    /// Candidate-local fragment ordinal per posting.
+    /// Candidate-local fragment ordinal per posting. Empty on an m/z-only index.
     post_frag: Vec<u16>,
-    /// Precursor m/z indexed by candidate id (ascending); for `candidate_range`.
-    prec_mz: Vec<f64>,
+    /// Precursor m/z indexed by candidate id (ascending); for `candidate_range`. The
+    /// library's own array, shared rather than copied.
+    prec_mz: std::sync::Arc<[f64]>,
     n_cand: usize,
     tol_ppm: f64,
 }
@@ -43,25 +57,210 @@ pub struct FragIndex {
 impl FragIndex {
     /// Build the CSR index from a loaded library at a fixed tolerance
     /// (docs/06_predict_frag_index_matchers.md, two-pass counting sort).
-    /// Deterministic: candidate-order scatter, no parallel sort, no hashing.
+    ///
+    /// Deterministic and parallel, with arrays bit-identical to the serial counting sort
+    /// (`FragIndex::build_serial`, kept under `cfg(test)` as the reference):
+    ///
+    /// - the m/z range is a parallel min/max over the finite fragment m/z, which is exact;
+    /// - the fragments are cut into chunks at candidate boundaries (the library is CSR in
+    ///   candidate order, so a chunk is a contiguous run of candidates), and pass 1 counts
+    ///   one bin histogram per chunk, concurrently;
+    /// - chunk `j`'s cursor in bin `b` starts at `bin_start[b]` plus the counts of chunks
+    ///   `0..j` in that bin. Every chunk therefore owns disjoint slots, and within a bin
+    ///   the chunks follow each other in candidate order, so `post_cand` is ascending
+    ///   within every bin exactly as the serial candidate-order scatter leaves it;
+    /// - pass 2 scatters every chunk concurrently. Safe Rust: the posting arrays are
+    ///   atomics during the scatter, written with relaxed stores (plain moves on x86 and
+    ///   ARM; every slot is written exactly once, by one chunk), and are turned into plain
+    ///   arrays in place afterwards. Binning calls the same [`LogBins::bin`] as the serial
+    ///   build, so m/z on a bin edge, below the range, above it (the top bin) and NaN
+    ///   (bin 0) land where they always did.
     pub fn build(lib: &Library, tol_ppm: f64) -> FragIndex {
-        let n_cand = lib.cands.len();
-        // Precondition (docs/06_predict_frag_index_matchers.md, CLAUDE.md
-        // index.rs:73): candidate_id is dense 0..n_cand so it indexes the
-        // accumulator and post_cand directly.
-        for (c, cand) in lib.cands.iter().enumerate() {
-            assert_eq!(
-                cand.candidate_id as usize, c,
-                "fragindex requires contiguous candidate_id (id {} at index {c})",
-                cand.candidate_id
-            );
-        }
+        assert!(
+            !lib.fragment_payload_released(),
+            "FragIndex::build needs the library's fragment payload (predicted intensities); \
+             an m/z-only library indexes with FragIndex::build_mz_only"
+        );
+        Self::build_chunked(lib, tol_ppm, None, true)
+    }
+
+    /// The seed's index: postings of candidate and m/z only, no predicted intensity and no
+    /// fragment ordinal (6 bytes per posting less). The seed never reads either -- its
+    /// accumulator counts matches and sums OBSERVED intensity
+    /// ([`SeedScratch::accumulate`], through [`FragIndex::probe_peak_cand`]) -- and this is
+    /// what an m/z-only library ([`Library::load_mz_only`]) can be indexed with. The
+    /// geometry, `bin_start`, `post_cand` and `post_mz` are the full index's bit for bit.
+    ///
+    /// The entry points that hand out a posting's intensity or ordinal
+    /// ([`FragIndex::probe_peak`], [`FragIndex::window_narrow`]) refuse an index built this
+    /// way rather than returning zeros.
+    ///
+    /// [`Library::load_mz_only`]: crate::index::Library::load_mz_only
+    pub fn build_mz_only(lib: &Library, tol_ppm: f64) -> FragIndex {
+        Self::build_chunked(lib, tol_ppm, None, false)
+    }
+
+    /// Whether the postings carry their intensity and ordinal (a [`FragIndex::build`]
+    /// index) or not ([`FragIndex::build_mz_only`]).
+    pub fn has_payload(&self) -> bool {
+        self.post_int.len() == self.post_mz.len()
+    }
+
+    /// [`FragIndex::build`] with an explicit chunk count (tests drive many chunks over a
+    /// small library through this); `None` picks it. `payload` false builds the m/z-only
+    /// index.
+    fn build_chunked(
+        lib: &Library,
+        tol_ppm: f64,
+        n_chunks: Option<usize>,
+        payload: bool,
+    ) -> FragIndex {
+        let t0 = std::time::Instant::now();
+        let n_cand = lib.n_candidates();
+        // Precondition (docs/06_predict_frag_index_matchers.md): candidate_id is dense
+        // 0..n_cand so it indexes the accumulator and post_cand directly. The library
+        // stores its candidates as columns indexed by that id, so this holds by
+        // construction (and `Library::from_candidates` asserts it for a hand-built one).
         let total = lib.frag_mz.len();
         assert!(total <= u32::MAX as usize, "total_frags exceeds u32");
+        // Every fragment belongs to exactly one candidate, in candidate order: the
+        // chunking below cuts the fragment array at candidate boundaries.
+        assert_eq!(
+            lib.frag_offsets.last().copied().unwrap_or(0) as usize,
+            total,
+            "the library's fragment offsets must tile its fragment arrays"
+        );
+        let bins = Self::geometry(lib, tol_ppm);
+        let n_bins = bins.n_bins;
 
+        // Chunks: contiguous candidate runs of about equal posting counts. The result does
+        // not depend on the count. What the count costs is one histogram of every bin per
+        // chunk, so the automatic choice is one chunk per thread, capped so that no chunk
+        // is under `MIN_CHUNK_POSTINGS` postings and the histograms together stay under
+        // half of one posting array (a tight tolerance has many bins: ~400k at 7.5 ppm).
+        let n_chunks = n_chunks
+            .unwrap_or_else(|| {
+                rayon::current_num_threads()
+                    .min(total / MIN_CHUNK_POSTINGS)
+                    .min(total / (2 * n_bins).max(1))
+            })
+            .clamp(1, n_cand.max(1));
+        let mut bounds: Vec<usize> = (0..=n_chunks)
+            .map(|j| {
+                let target = (total as u64 * j as u64 / n_chunks as u64) as u32;
+                lib.frag_offsets
+                    .partition_point(|&o| o < target)
+                    .min(n_cand)
+            })
+            .collect();
+        bounds[0] = 0;
+        bounds[n_chunks] = n_cand;
+        bounds.dedup();
+        let chunks: Vec<(usize, usize)> = bounds.windows(2).map(|w| (w[0], w[1])).collect();
+
+        // Pass 1: per-chunk bin occupancy. Bin each posting by the SAME f32-rounded m/z
+        // that the verify uses (post_mz is f32), so the +/-1 probe's one-bin-width proof
+        // holds exactly for the stored value and a boundary-straddling within-tol pair is
+        // never missed. Binning by the raw f64 while verifying the f32 could place the
+        // posting two bins from the peak.
+        let mut cursors: Vec<Vec<u32>> = chunks
+            .par_iter()
+            .map(|&(c0, c1)| {
+                let mut h = vec![0u32; n_bins];
+                let (a, z) = (lib.frag_offsets[c0] as usize, lib.frag_offsets[c1] as usize);
+                for &mz in &lib.frag_mz[a..z] {
+                    h[bins.bin(mz as f64)] += 1;
+                }
+                h
+            })
+            .collect();
+        // Per-bin totals -> CSR start offsets, then each chunk's histogram becomes its
+        // starting cursor in every bin: the bin's start plus the earlier chunks' counts.
+        let mut bin_start = vec![0u32; n_bins + 1];
+        for b in 0..n_bins {
+            let n: u32 = cursors.iter().map(|h| h[b]).sum();
+            bin_start[b + 1] = bin_start[b] + n;
+        }
+        for b in 0..n_bins {
+            let mut run = bin_start[b];
+            for h in cursors.iter_mut() {
+                let n = h[b];
+                h[b] = run;
+                run += n;
+            }
+        }
+
+        // Pass 2: scatter every chunk in candidate order into its own slots.
+        let post_cand: Vec<AtomicU32> = atomic_u32_zeroed(total);
+        let post_mz: Vec<AtomicU32> = atomic_u32_zeroed(total);
+        let n_payload = if payload { total } else { 0 };
+        let post_int: Vec<AtomicU32> = atomic_u32_zeroed(n_payload);
+        let post_frag: Vec<AtomicU16> = (0..n_payload)
+            .into_par_iter()
+            .map(|_| AtomicU16::new(0))
+            .collect();
+        cursors
+            .par_iter_mut()
+            .zip(chunks.par_iter())
+            .for_each(|(cur, &(c0, c1))| {
+                for c in c0..c1 {
+                    for (k, gi) in lib.frag_range(c as u32).enumerate() {
+                        let mz = lib.frag_mz[gi];
+                        let b = bins.bin(mz as f64); // bin by the stored (f32) value
+                        let slot = cur[b] as usize;
+                        cur[b] += 1;
+                        post_cand[slot].store(c as u32, Ordering::Relaxed);
+                        post_mz[slot].store(mz.to_bits(), Ordering::Relaxed);
+                        if payload {
+                            post_int[slot].store(lib.frag_int[gi].to_bits(), Ordering::Relaxed);
+                            post_frag[slot].store(k as u16, Ordering::Relaxed);
+                        }
+                    }
+                }
+            });
+        drop(cursors);
+        // In place: an atomic has the size and alignment of its integer, and `f32` those
+        // of `u32`, so each of these collects reuses its allocation
+        // (`the_posting_arrays_are_converted_in_place` pins it).
+        let post_cand: Vec<u32> = post_cand.into_iter().map(AtomicU32::into_inner).collect();
+        let post_mz: Vec<f32> = post_mz
+            .into_iter()
+            .map(|a| f32::from_bits(a.into_inner()))
+            .collect();
+        let post_int: Vec<f32> = post_int
+            .into_iter()
+            .map(|a| f32::from_bits(a.into_inner()))
+            .collect();
+        let post_frag: Vec<u16> = post_frag.into_iter().map(AtomicU16::into_inner).collect();
+
+        tracing::info!(
+            postings = total,
+            bins = n_bins,
+            chunks = chunks.len(),
+            payload,
+            tol_ppm,
+            elapsed_ms = t0.elapsed().as_millis() as u64,
+            "fragindex: built"
+        );
+        FragIndex {
+            bins,
+            bin_start,
+            post_cand,
+            post_mz,
+            post_int,
+            post_frag,
+            prec_mz: lib.prec_mz.clone(),
+            n_cand,
+            tol_ppm,
+        }
+    }
+
+    /// The bin geometry for `lib` at `tol_ppm`: log-space bins over the finite fragment
+    /// m/z range. It is what [`FragIndex::build`] bins with, and what a [`LocalIndex`]
+    /// must be built with to probe the same bins in the same order.
+    pub fn geometry(lib: &Library, tol_ppm: f64) -> LogBins {
         // m/z range from the library fragments (guard > 0), spec geometry in f64.
-        let mut mz_min = f64::INFINITY;
-        let mut mz_max = f64::NEG_INFINITY;
+        //
         // Skip non-finite values rather than letting one of them decide the range. A single
         // +inf fragment m/z used to make `mz_max` infinite, which tripped the fallback
         // below and collapsed the range for the WHOLE library to [1.0, 2.0]: `LogBins`
@@ -70,6 +269,50 @@ impl FragIndex {
         // just an unbounded hang. Library load rejects non-finite m/z now, so this is the
         // second line of defence; dropping the offending value is the right shape either
         // way, because the range is a property of the real fragments.
+        //
+        // A parallel min/max. The minimum and maximum of a set do not depend on the order
+        // they are taken in; the one tie that could (0.0 against -0.0) is clamped to 1.0
+        // by the `max(1.0)` below either way.
+        let (mut mz_min, mut mz_max) = lib
+            .frag_mz
+            .par_iter()
+            .fold(
+                || (f64::INFINITY, f64::NEG_INFINITY),
+                |(lo, hi), &mz| {
+                    let mz = mz as f64;
+                    if !mz.is_finite() {
+                        return (lo, hi);
+                    }
+                    (if mz < lo { mz } else { lo }, if mz > hi { mz } else { hi })
+                },
+            )
+            .reduce(
+                || (f64::INFINITY, f64::NEG_INFINITY),
+                |a, b| {
+                    (
+                        if b.0 < a.0 { b.0 } else { a.0 },
+                        if b.1 > a.1 { b.1 } else { a.1 },
+                    )
+                },
+            );
+        // Reached only when the library has no finite fragment m/z at all (in practice: no
+        // fragments). A placeholder range keeps `LogBins::new` well-defined; `page_search`
+        // early-returns on the resulting empty index.
+        if !mz_min.is_finite() || !mz_max.is_finite() {
+            mz_min = 1.0;
+            mz_max = 2.0;
+        }
+        LogBins::new(tol_ppm, mz_min.max(1.0), mz_max.max(mz_min.max(1.0) + 1e-6))
+    }
+
+    /// The serial two-pass counting sort the parallel [`FragIndex::build`] replaced, kept
+    /// verbatim as the reference its arrays are compared against bit for bit.
+    #[cfg(test)]
+    fn build_serial(lib: &Library, tol_ppm: f64) -> FragIndex {
+        let n_cand = lib.n_candidates();
+        let total = lib.frag_mz.len();
+        let mut mz_min = f64::INFINITY;
+        let mut mz_max = f64::NEG_INFINITY;
         for &mz in &lib.frag_mz {
             let mz = mz as f64;
             if !mz.is_finite() {
@@ -82,41 +325,27 @@ impl FragIndex {
                 mz_max = mz;
             }
         }
-        // Reached only when the library has no finite fragment m/z at all (in practice: no
-        // fragments). A placeholder range keeps `LogBins::new` well-defined; `page_search`
-        // early-returns on the resulting empty index.
         if !mz_min.is_finite() || !mz_max.is_finite() {
             mz_min = 1.0;
             mz_max = 2.0;
         }
         let bins = LogBins::new(tol_ppm, mz_min.max(1.0), mz_max.max(mz_min.max(1.0) + 1e-6));
-
-        // pass 1: per-bin occupancy (+1 offset for the counting-sort idiom).
-        // Bin each posting by the SAME f32-rounded m/z that the verify uses
-        // (post_mz is f32), so the +/-1 probe's one-bin-width proof holds exactly
-        // for the stored value and a boundary-straddling within-tol pair is never
-        // missed. Binning by the raw f64 while verifying the f32 could place the
-        // posting two bins from the peak.
         let mut bin_start = vec![0u32; bins.n_bins + 1];
         for &mz in &lib.frag_mz {
             bin_start[bins.bin(mz as f64) + 1] += 1;
         }
-        // prefix sum -> CSR start offsets.
         for b in 0..bins.n_bins {
             bin_start[b + 1] += bin_start[b];
         }
-
-        // pass 2: scatter, in candidate-id order so within-bin post_cand is ascending.
         let mut post_cand = vec![0u32; total];
         let mut post_mz = vec![0f32; total];
         let mut post_int = vec![0f32; total];
         let mut post_frag = vec![0u16; total];
         let mut cursor: Vec<u32> = bin_start[..bins.n_bins].to_vec();
-        for (c, cand) in lib.cands.iter().enumerate() {
-            for k in 0..cand.n_frag {
-                let gi = cand.frag_start + k;
+        for c in 0..n_cand {
+            for (k, gi) in lib.frag_range(c as u32).enumerate() {
                 let mz = lib.frag_mz[gi];
-                let b = bins.bin(mz as f64); // bin by the stored (f32) value
+                let b = bins.bin(mz as f64);
                 let slot = cursor[b] as usize;
                 post_cand[slot] = c as u32;
                 post_mz[slot] = mz;
@@ -125,7 +354,6 @@ impl FragIndex {
                 cursor[b] += 1;
             }
         }
-
         FragIndex {
             bins,
             bin_start,
@@ -141,6 +369,11 @@ impl FragIndex {
 
     pub fn n_cand(&self) -> usize {
         self.n_cand
+    }
+
+    /// The bin geometry this index was built with ([`FragIndex::geometry`]).
+    pub fn bins(&self) -> &LogBins {
+        &self.bins
     }
 
     pub fn tol_ppm(&self) -> f64 {
@@ -173,6 +406,10 @@ impl FragIndex {
         cand_hi: u32,
         mut f: F,
     ) {
+        assert!(
+            self.has_payload(),
+            "probe_peak hands out posting intensities, which an m/z-only index does not hold"
+        );
         if cand_hi <= cand_lo {
             return;
         }
@@ -182,6 +419,38 @@ impl FragIndex {
         for nb in lo_bin..=hi_bin {
             let (a, z) = self.narrow_bin(nb, cand_lo, cand_hi);
             self.emit_range(a, z, peak_mz, &mut f);
+        }
+    }
+
+    /// [`FragIndex::probe_peak`] for a caller that needs only the matching CANDIDATE of each
+    /// posting: the same bins, the same narrowing, the same exact f64 predicate and the
+    /// same posting order, calling `f(cid)` where `probe_peak` calls
+    /// `f(cid, pmz, pint, pfrag)`. Works on an m/z-only index ([`FragIndex::build_mz_only`])
+    /// as well as a full one, because it never touches the payload arrays.
+    #[inline]
+    pub fn probe_peak_cand<F: FnMut(u32)>(
+        &self,
+        peak_mz: f64,
+        cand_lo: u32,
+        cand_hi: u32,
+        mut f: F,
+    ) {
+        if cand_hi <= cand_lo {
+            return;
+        }
+        let b = self.bins.bin(peak_mz);
+        let lo_bin = b.saturating_sub(1);
+        let hi_bin = (b + 1).min(self.bins.n_bins - 1);
+        for nb in lo_bin..=hi_bin {
+            let (a, z) = self.narrow_bin(nb, cand_lo, cand_hi);
+            if z <= a {
+                continue;
+            }
+            for (&mz, &cid) in self.post_mz[a..z].iter().zip(&self.post_cand[a..z]) {
+                if within_ppm(mz as f64, peak_mz, self.tol_ppm) {
+                    f(cid);
+                }
+            }
         }
     }
 
@@ -314,6 +583,12 @@ impl FragIndex {
 
     /// Build an empty narrowing cache for the candidate window `[cand_lo, cand_hi)`.
     pub fn window_narrow(&self, cand_lo: u32, cand_hi: u32) -> WindowNarrow {
+        // The windowed probes hand out posting intensities and ordinals.
+        assert!(
+            self.has_payload(),
+            "the windowed probes hand out posting intensities, which an m/z-only index \
+             does not hold"
+        );
         WindowNarrow {
             cand_lo,
             cand_hi,
@@ -346,17 +621,212 @@ pub struct WindowNarrow {
     range: Vec<(u32, u32)>,
 }
 
+/// One probe of a fixed candidate window with the bin already computed: the entry point a
+/// probing task calls per peak, whether it probes the global index through a
+/// [`WindowNarrow`] ([`NarrowedProbe`]) or a [`LocalIndex`] of its own. Both call
+/// `f(cid, post_mz_f64, post_int, post_frag)` for the same postings in the same order
+/// (`a_local_index_probes_exactly_what_the_narrowed_global_index_probes`).
+pub trait BinnedProbe {
+    /// `bin` must be the whole-library geometry's bin of `peak_mz`
+    /// ([`FragIndex::bin_of`], or [`LogBins::bin`] of [`FragIndex::geometry`]).
+    fn probe_binned<F: FnMut(u32, f64, f32, u16)>(&mut self, peak_mz: f64, bin: u32, f: F);
+}
+
+/// The global index probed through a per-window narrowing cache: the probe extract's
+/// streamed accumulation made before [`LocalIndex`], and the reference it is tested
+/// against.
+pub struct NarrowedProbe<'a> {
+    pub idx: &'a FragIndex,
+    pub nw: WindowNarrow,
+}
+
+impl BinnedProbe for NarrowedProbe<'_> {
+    #[inline]
+    fn probe_binned<F: FnMut(u32, f64, f32, u16)>(&mut self, peak_mz: f64, bin: u32, f: F) {
+        self.idx
+            .probe_peak_win_binned(&mut self.nw, peak_mz, bin, f)
+    }
+}
+
+/// A compact inverted index over the postings of ONE candidate sub-range `[cand_lo,
+/// cand_hi)`, built by the probing task that owns the sub-range.
+///
+/// Extract's streamed accumulation used to build the global [`FragIndex`] over every
+/// library fragment, then give each probing task a [`WindowNarrow`] that binary-searched
+/// every bin it touched down to the task's candidates. The task only ever sees its own
+/// sub-range, so this indexes just those postings: a counting sort of the sub-range's
+/// fragments by bin, scattered in candidate order and, within a candidate, in fragment
+/// order. Within a bin that is exactly the order the global build leaves them in
+/// (`post_cand` ascending, then the fragment ordinal), and a narrowed global bin is a
+/// contiguous run of it, so the postings of every bin are the narrowed global ones in the
+/// same order. The bins are the WHOLE LIBRARY's geometry ([`FragIndex::geometry`]): a
+/// sub-range geometry would be a different partition of m/z and would emit the same
+/// matches in a different order across the three probed bins.
+///
+/// The global index is then not needed for this path at all, which removes its build and
+/// its 14 bytes per library fragment. What a task holds instead is 14 bytes per posting of
+/// its own sub-range plus 4 bytes per bin between the first and the last occupied one, less
+/// than the 8 bytes per bin of the narrowing cache it replaces.
+pub struct LocalIndex {
+    /// Bins of the whole-library geometry (the probe clamps into `0..n_bins`).
+    n_bins: usize,
+    /// First bin holding a posting; `start` covers bins `bin0..bin0 + start.len() - 1`.
+    bin0: usize,
+    /// CSR offsets over the occupied bin span; empty when the sub-range has no postings.
+    start: Vec<u32>,
+    post_cand: Vec<u32>,
+    post_mz: Vec<f32>,
+    post_int: Vec<f32>,
+    post_frag: Vec<u16>,
+    tol_ppm: f64,
+}
+
+impl LocalIndex {
+    /// Index the fragments of candidates `cand_lo..cand_hi` of `lib`, binned by `bins`
+    /// (which must be [`FragIndex::geometry`] of `lib` at `tol_ppm`).
+    pub fn build(
+        lib: &Library,
+        bins: &LogBins,
+        tol_ppm: f64,
+        cand_lo: u32,
+        cand_hi: u32,
+    ) -> LocalIndex {
+        assert!(
+            !lib.fragment_payload_released(),
+            "LocalIndex::build needs the library's fragment payload (predicted intensities)"
+        );
+        let mut out = LocalIndex {
+            n_bins: bins.n_bins,
+            bin0: 0,
+            start: Vec::new(),
+            post_cand: Vec::new(),
+            post_mz: Vec::new(),
+            post_int: Vec::new(),
+            post_frag: Vec::new(),
+            tol_ppm,
+        };
+        if cand_hi <= cand_lo {
+            return out;
+        }
+        let a = lib.frag_offsets[cand_lo as usize] as usize;
+        let z = lib.frag_offsets[cand_hi as usize] as usize;
+        let n = z - a;
+        if n == 0 {
+            return out;
+        }
+        // Bin each posting once, by the stored f32 m/z widened, as the global build does.
+        let bin: Vec<u32> = lib.frag_mz[a..z]
+            .iter()
+            .map(|&mz| bins.bin(mz as f64) as u32)
+            .collect();
+        let (lo_b, hi_b) = bin
+            .iter()
+            .fold((u32::MAX, 0u32), |(l, h), &b| (l.min(b), h.max(b)));
+        let span = (hi_b - lo_b) as usize + 1;
+        let mut start = vec![0u32; span + 1];
+        for &b in &bin {
+            start[(b - lo_b) as usize + 1] += 1;
+        }
+        for i in 0..span {
+            start[i + 1] += start[i];
+        }
+        let mut cursor: Vec<u32> = start[..span].to_vec();
+        let mut post_cand = vec![0u32; n];
+        let mut post_mz = vec![0f32; n];
+        let mut post_int = vec![0f32; n];
+        let mut post_frag = vec![0u16; n];
+        for c in cand_lo..cand_hi {
+            for (k, gi) in lib.frag_range(c).enumerate() {
+                let b = (bin[gi - a] - lo_b) as usize;
+                let slot = cursor[b] as usize;
+                cursor[b] += 1;
+                post_cand[slot] = c;
+                post_mz[slot] = lib.frag_mz[gi];
+                post_int[slot] = lib.frag_int[gi];
+                post_frag[slot] = k as u16;
+            }
+        }
+        out.bin0 = lo_b as usize;
+        out.start = start;
+        out.post_cand = post_cand;
+        out.post_mz = post_mz;
+        out.post_int = post_int;
+        out.post_frag = post_frag;
+        out
+    }
+
+    /// Postings held (the sub-range's fragment count).
+    pub fn len(&self) -> usize {
+        self.post_mz.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.post_mz.is_empty()
+    }
+
+    /// Bytes this index holds, for the memory accounting of its callers.
+    pub fn heap_bytes(&self) -> usize {
+        self.start.len() * 4 + self.post_mz.len() * (4 + 4 + 4 + 2)
+    }
+}
+
+impl BinnedProbe for LocalIndex {
+    /// [`FragIndex::probe_peak_win_binned`] over the sub-range: bins `bin - 1 ..= bin + 1`
+    /// clamped to the whole-library geometry, each bin's postings in index order, every
+    /// posting verified with the same exact f64 predicate.
+    #[inline]
+    fn probe_binned<F: FnMut(u32, f64, f32, u16)>(&mut self, peak_mz: f64, bin: u32, mut f: F) {
+        if self.start.is_empty() {
+            return;
+        }
+        let b = (bin as usize).min(self.n_bins - 1);
+        let lo_bin = b.saturating_sub(1).max(self.bin0);
+        let hi_bin = (b + 1)
+            .min(self.n_bins - 1)
+            .min(self.bin0 + self.start.len() - 2);
+        if hi_bin < lo_bin {
+            return;
+        }
+        let a = self.start[lo_bin - self.bin0] as usize;
+        let z = self.start[hi_bin - self.bin0 + 1] as usize;
+        // The three bins are adjacent in the CSR, so their postings are one contiguous run
+        // in bin order: the order the per-bin loop of the global probe emits them in.
+        if z <= a {
+            return;
+        }
+        let mzs = &self.post_mz[a..z];
+        let cands = &self.post_cand[a..z];
+        let ints = &self.post_int[a..z];
+        let frags = &self.post_frag[a..z];
+        for (((&mz, &cid), &pint), &pfrag) in mzs.iter().zip(cands).zip(ints).zip(frags) {
+            let pmz = mz as f64;
+            if within_ppm(pmz, peak_mz, self.tol_ppm) {
+                f(cid, pmz, pint, pfrag);
+            }
+        }
+    }
+}
+
 /// Epoch-stamped dense accumulator for the seed's fused `(count, obs_sum)` semiring
 /// (docs/06_predict_frag_index_matchers.md). `obs_sum` sums the OBSERVED peak
 /// intensity per matched posting (predicted intensity deliberately dropped,
 /// reproducing the seed's existing `_pi` discard); `count` is the per-posting match
 /// count. Reused across all scans of a block; the accumulator is reset lazily via
 /// `epoch`, so only touched candidates are ever written or read.
+///
+/// Array-of-structs: a candidate's stamp, count and observed sum sit in one 16-byte slot,
+/// so a matched posting updates one cache line instead of three (the three arrays used to
+/// be separate, and in a dense window the posting stream reaches slots at random). Also
+/// kept, beside the first-touch list: the QUALIFIED list, the candidates whose count has
+/// reached the caller's `min_count`, appended at the moment they reach it, so a scan's
+/// scoring walks only the candidates it can report instead of filtering every candidate
+/// the scan touched.
 pub struct SeedScratch {
-    count: Vec<u32>,
-    obs_sum: Vec<f64>,
-    stamp: Vec<u32>,
+    slots: Vec<SeedSlot>,
     touched: Vec<u32>,
+    qualified: Vec<u32>,
+    /// Count at which a candidate enters `qualified` (at least 1).
+    min_count: u32,
     epoch: u32,
     /// `candidate_id` that maps to slot 0. The arrays are indexed WINDOW-RELATIVE, so
     /// they only need to span the widest isolation window rather than the whole library:
@@ -366,34 +836,50 @@ pub struct SeedScratch {
     base: u32,
 }
 
+/// One candidate's accumulator slot (16 bytes).
+#[derive(Clone, Copy, Default)]
+struct SeedSlot {
+    /// Epoch of the scan that last touched it; 0 is never a live epoch.
+    stamp: u32,
+    count: u32,
+    obs_sum: f64,
+}
+
 impl SeedScratch {
     /// `cap` is the expected maximum candidate-window width, not the library size.
-    /// Passing a smaller value is safe: the arrays grow on demand.
+    /// Passing a smaller value is safe: the arrays grow on demand. The qualified list
+    /// holds every touched candidate (a `min_count` of 1).
     pub fn new(cap: usize) -> SeedScratch {
+        SeedScratch::with_min_count(cap, 1)
+    }
+
+    /// As [`SeedScratch::new`], with the count at which a candidate is QUALIFIED
+    /// ([`SeedScratch::qualified`]): the seed's `min_matched_peaks`. Zero behaves as one,
+    /// since every touched candidate has matched at least once.
+    pub fn with_min_count(cap: usize, min_count: usize) -> SeedScratch {
         SeedScratch {
-            count: vec![0; cap],
-            obs_sum: vec![0.0; cap],
-            stamp: vec![0; cap], // 0 is never a live epoch (epoch increments before scan 1)
+            slots: vec![SeedSlot::default(); cap],
             touched: Vec::new(),
+            qualified: Vec::new(),
+            min_count: u32::try_from(min_count).unwrap_or(u32::MAX).max(1),
             epoch: 0,
             base: 0,
         }
     }
 
-    /// Ensure the window-relative arrays span `width` slots.
+    /// Ensure the window-relative slots span `width`.
     fn ensure(&mut self, width: usize) {
-        if self.count.len() < width {
-            self.count.resize(width, 0);
-            self.obs_sum.resize(width, 0.0);
+        if self.slots.len() < width {
             // New slots must not appear stamped for the current epoch.
-            self.stamp.resize(width, 0);
+            self.slots.resize(width, SeedSlot::default());
         }
     }
 
     /// Accumulate one scan's peaks over the candidate window. Peaks must already be
     /// in the caller's fixed order (e.g. m/z ascending, or the top-N re-sorted
     /// order) so `obs_sum` is summed deterministically. After the call, `touched()`
-    /// lists the hit candidates and `count`/`obs_sum` hold their values.
+    /// lists the hit candidates, `qualified()` those among them that reached the minimum
+    /// count, and `count`/`obs_sum` hold their values.
     pub fn accumulate(
         &mut self,
         idx: &FragIndex,
@@ -403,22 +889,33 @@ impl SeedScratch {
     ) {
         self.epoch += 1;
         self.touched.clear();
+        self.qualified.clear();
         // Index relative to this window's first candidate.
         self.base = cand_lo;
         self.ensure((cand_hi.saturating_sub(cand_lo)) as usize + 1);
-        let epoch = self.epoch;
-        let base = self.base;
+        let (epoch, base, min_count) = (self.epoch, self.base, self.min_count);
+        let SeedScratch {
+            slots,
+            touched,
+            qualified,
+            ..
+        } = self;
         for &(mz, inten) in peaks {
-            idx.probe_peak(mz, cand_lo, cand_hi, |cid, _pmz, _pint, _pfrag| {
-                let cc = (cid - base) as usize;
-                if self.stamp[cc] != epoch {
-                    self.stamp[cc] = epoch;
-                    self.count[cc] = 0;
-                    self.obs_sum[cc] = 0.0;
-                    self.touched.push(cid);
+            idx.probe_peak_cand(mz, cand_lo, cand_hi, |cid| {
+                let s = &mut slots[(cid - base) as usize];
+                if s.stamp != epoch {
+                    *s = SeedSlot {
+                        stamp: epoch,
+                        count: 0,
+                        obs_sum: 0.0,
+                    };
+                    touched.push(cid);
                 }
-                self.count[cc] += 1;
-                self.obs_sum[cc] += inten as f64;
+                s.count += 1;
+                s.obs_sum += inten as f64;
+                if s.count == min_count {
+                    qualified.push(cid);
+                }
             });
         }
     }
@@ -429,17 +926,25 @@ impl SeedScratch {
         &self.touched
     }
 
+    /// Candidates of the last `accumulate` whose count reached the minimum count, in the
+    /// order they reached it: exactly the touched candidates with `count >= min_count`,
+    /// in a different order, so a caller that sorts them (the seed sorts by score, then
+    /// candidate id) gets the list it got by filtering `touched`.
+    pub fn qualified(&self) -> &[u32] {
+        &self.qualified
+    }
+
     /// Valid only for candidate ids from the most recent [`SeedScratch::accumulate`]
     /// window (which is what [`SeedScratch::touched`] returns).
     #[inline]
     pub fn count(&self, cid: u32) -> u32 {
-        self.count[(cid - self.base) as usize]
+        self.slots[(cid - self.base) as usize].count
     }
 
     /// See [`SeedScratch::count`] for the validity window.
     #[inline]
     pub fn obs_sum(&self, cid: u32) -> f64 {
-        self.obs_sum[(cid - self.base) as usize]
+        self.slots[(cid - self.base) as usize].obs_sum
     }
 }
 
@@ -480,7 +985,6 @@ mod tests {
         let mut frag_mz = Vec::new();
         let mut frag_int = Vec::new();
         let mut frag_name_id: Vec<u16> = Vec::new();
-        let mut prec_mz = Vec::new();
         let mut cs = Vec::new();
         for (i, (frags, pmz)) in cands.iter().enumerate() {
             let start = frag_mz.len();
@@ -503,22 +1007,8 @@ mod tests {
                 frag_start: start,
                 n_frag: frags.len(),
             });
-            prec_mz.push(*pmz);
         }
-        Library {
-            cands: cs,
-            frag_mz,
-            frag_int,
-            frag_name_id,
-            frag_name_dict: vec!["f".to_string()],
-            idx_mz: Vec::new(),
-            idx_cid: Vec::new(),
-            idx_int: Vec::new(),
-            bucket_min: Vec::new(),
-            bucket_size: 1,
-            prec_mz,
-            global_offset: 0,
-        }
+        Library::from_candidates(cs, frag_mz, frag_int, frag_name_id, vec!["f".to_string()])
     }
 
     #[test]
@@ -682,9 +1172,8 @@ mod tests {
         });
         // Reference: the same predicate, over the library itself.
         let mut want: Vec<(u32, u64, u32, u16)> = Vec::new();
-        for (c, cand) in lib.cands.iter().enumerate() {
-            for k in 0..cand.n_frag {
-                let gi = cand.frag_start + k;
+        for c in 0..lib.n_candidates() {
+            for (k, gi) in lib.frag_range(c as u32).enumerate() {
                 let pmz = lib.frag_mz[gi] as f64;
                 if within_ppm(pmz, q, tol) {
                     want.push((
@@ -846,6 +1335,487 @@ mod tests {
         }
     }
 
+    /// Every array of a parallel build equals the serial build's, bit for bit.
+    fn assert_same_index(a: &FragIndex, b: &FragIndex, what: &str) {
+        assert_eq!(
+            format!("{:?}", a.bins),
+            format!("{:?}", b.bins),
+            "{what}: geometry"
+        );
+        assert_eq!(a.bin_start, b.bin_start, "{what}: bin_start");
+        assert_eq!(a.post_cand, b.post_cand, "{what}: post_cand");
+        let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        assert_eq!(bits(&a.post_mz), bits(&b.post_mz), "{what}: post_mz");
+        assert_eq!(bits(&a.post_int), bits(&b.post_int), "{what}: post_int");
+        assert_eq!(a.post_frag, b.post_frag, "{what}: post_frag");
+        assert_eq!(a.prec_mz, b.prec_mz, "{what}: prec_mz");
+        assert_eq!(a.n_cand, b.n_cand, "{what}: n_cand");
+    }
+
+    /// A library of `n` candidates with 0..=11 fragments each, spread over 100-2000 m/z
+    /// so every bin range is populated and many candidates share bins.
+    fn random_lib(n: usize, seed: u64) -> Library {
+        let mut state = seed;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let cands: Vec<(Vec<(f64, f32)>, f64)> = (0..n)
+            .map(|i| {
+                let k = (next() * 12.0) as usize;
+                let frags = (0..k)
+                    .map(|_| (100.0 + 1900.0 * next(), next() as f32))
+                    .collect();
+                (frags, 400.0 + i as f64 * 0.01)
+            })
+            .collect();
+        lib_from(&cands)
+    }
+
+    /// The parallel build (chunked histograms, per-chunk cursors, atomic scatter) against
+    /// the serial counting sort it replaced, over chunk counts from one to one per
+    /// candidate, at two tolerances.
+    #[test]
+    fn the_parallel_build_reproduces_the_serial_index_bit_for_bit() {
+        let lib = random_lib(3_000, 0x5eed);
+        for tol in [20.0, 7.5] {
+            let serial = FragIndex::build_serial(&lib, tol);
+            for chunks in [1usize, 2, 3, 7, 64] {
+                let par = FragIndex::build_chunked(&lib, tol, Some(chunks), true);
+                assert_same_index(&par, &serial, &format!("tol {tol} chunks {chunks}"));
+            }
+            assert_same_index(&FragIndex::build(&lib, tol), &serial, "build");
+        }
+        // Empty candidates at the ends and in the middle, so chunk boundaries fall on runs
+        // of candidates without fragments.
+        let mut cands: Vec<(Vec<(f64, f32)>, f64)> = Vec::new();
+        for i in 0..200 {
+            let frags = if i % 3 == 0 || !(5..=190).contains(&i) {
+                Vec::new()
+            } else {
+                vec![(300.0 + i as f64, 1.0), (900.0 - i as f64, 0.5)]
+            };
+            cands.push((frags, 400.0 + i as f64));
+        }
+        let lib = lib_from(&cands);
+        let serial = FragIndex::build_serial(&lib, 20.0);
+        for chunks in [1usize, 4, 50, 200] {
+            let par = FragIndex::build_chunked(&lib, 20.0, Some(chunks), true);
+            assert_same_index(&par, &serial, &format!("gappy chunks {chunks}"));
+        }
+    }
+
+    /// The m/z that the bin geometry treats specially must land in the same bins through
+    /// the parallel build: values exactly on bin edges and one f32 ULP either side, values
+    /// below the range (zero, negative, subnormal, below 1.0 where the range is clamped),
+    /// the top of the range, and the non-finite values the range skips (NaN to bin 0,
+    /// +inf clamped to the top bin, -inf to bin 0).
+    #[test]
+    fn edge_mz_bins_identically_in_the_parallel_build() {
+        let tol = 20.0;
+        // Geometry of a plain 150-1800 library, to place values on its bin edges.
+        let probe = lib_from(&[(vec![(150.0, 1.0), (1800.0, 1.0)], 400.0)]);
+        let g = FragIndex::build_serial(&probe, tol).bins;
+        let mut special: Vec<f64> = Vec::new();
+        for k in [0usize, 1, 2, 1_000, 50_000, g.n_bins - 3, g.n_bins - 2] {
+            // The m/z of edge k: exp(ln_min + k w), with ln_min = ln(150).
+            let e = ((150.0f64).ln() + k as f64 * g.w).exp() as f32;
+            for d in [-1i32, 0, 1] {
+                special.push(f32::from_bits((e.to_bits() as i32 + d) as u32) as f64);
+            }
+        }
+        special.extend([
+            150.0,
+            1800.0,
+            0.0,
+            -0.0,
+            -5.0,
+            f32::MIN_POSITIVE as f64,
+            0.5,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+        ]);
+        let mut cands: Vec<(Vec<(f64, f32)>, f64)> = Vec::new();
+        for (i, chunk) in special.chunks(3).enumerate() {
+            cands.push((
+                chunk.iter().map(|&m| (m, i as f32)).collect(),
+                400.0 + i as f64,
+            ));
+        }
+        let lib = lib_from(&cands);
+        let serial = FragIndex::build_serial(&lib, tol);
+        for chunks in [1usize, 2, 5, cands.len()] {
+            let par = FragIndex::build_chunked(&lib, tol, Some(chunks), true);
+            assert_same_index(&par, &serial, &format!("edges chunks {chunks}"));
+        }
+        // And the clamping is what it claims: NaN and -inf in bin 0, +inf in the top bin.
+        assert_eq!(serial.bins.bin(f64::NAN), 0);
+        assert_eq!(serial.bins.bin(f64::NEG_INFINITY), 0);
+        assert_eq!(serial.bins.bin(f64::INFINITY), serial.bins.n_bins - 1);
+    }
+
+    /// A [`LocalIndex`] over any candidate sub-range probes exactly what the global index,
+    /// narrowed to that sub-range, probes: the same postings in the same order with the same
+    /// bits, for every probe m/z. The sub-ranges include the empty one, single candidates,
+    /// runs of candidates without fragments, the whole library and ragged cuts; the probes
+    /// include every third fragment m/z nudged inside and outside the tolerance, the
+    /// geometry's clamped edges and non-finite values. Two tolerances, so the bin width
+    /// differs.
+    #[test]
+    fn a_local_index_probes_exactly_what_the_narrowed_global_index_probes() {
+        let mut libs = vec![random_lib(1_500, 0x10ca1)];
+        // Candidates without fragments at the ends and in the middle.
+        let mut gappy: Vec<(Vec<(f64, f32)>, f64)> = Vec::new();
+        for i in 0..120 {
+            let frags = if i % 4 == 0 || !(3..=110).contains(&i) {
+                Vec::new()
+            } else {
+                vec![(300.0 + i as f64 * 1.7, 1.0), (900.0 - i as f64, 0.5)]
+            };
+            gappy.push((frags, 400.0 + i as f64));
+        }
+        libs.push(lib_from(&gappy));
+        for lib in &libs {
+            let n = lib.n_candidates() as u32;
+            for tol in [20.0, 7.5] {
+                let idx = FragIndex::build(lib, tol);
+                let bins = FragIndex::geometry(lib, tol);
+                assert_eq!(format!("{bins:?}"), format!("{:?}", idx.bins()));
+                let mut ranges: Vec<(u32, u32)> = vec![(0, n), (0, 0), (0, 1), (n - 1, n)];
+                for &(a, b) in &[(3u32, 17u32), (100, 101), (5, 5), (40, n / 2)] {
+                    ranges.push((a.min(n), b.min(n)));
+                }
+                let step = (n / 9).max(1);
+                let mut lo = 0u32;
+                while lo < n {
+                    ranges.push((lo, (lo + step + 3).min(n)));
+                    lo += step;
+                }
+                let mut probes: Vec<f64> = Vec::new();
+                for (i, &m) in lib.frag_mz.iter().enumerate().step_by(3) {
+                    let f = [0.0, 0.97, -0.97, 1.02, -1.5][i % 5];
+                    probes.push(m as f64 * (1.0 + f * tol * 1e-6));
+                }
+                probes.extend([0.0, -1.0, 1.0, 50.0, 1e6, f64::NAN, f64::INFINITY]);
+                let mut n_emitted = 0usize;
+                for &(lo, hi) in &ranges {
+                    let mut local = LocalIndex::build(lib, &bins, tol, lo, hi);
+                    let want_len = lib.frag_offsets[hi.max(lo) as usize] as usize
+                        - lib.frag_offsets[lo as usize] as usize;
+                    assert_eq!(local.len(), want_len, "postings of {lo}..{hi}");
+                    let mut narrowed = NarrowedProbe {
+                        idx: &idx,
+                        nw: idx.window_narrow(lo, hi),
+                    };
+                    for &q in &probes {
+                        let bin = idx.bin_of(q);
+                        assert_eq!(bin as usize, bins.bin(q));
+                        let (mut a, mut b) = (Vec::new(), Vec::new());
+                        local.probe_binned(q, bin, |c, m, it, f| {
+                            a.push((c, m.to_bits(), it.to_bits(), f))
+                        });
+                        narrowed.probe_binned(q, bin, |c, m, it, f| {
+                            b.push((c, m.to_bits(), it.to_bits(), f))
+                        });
+                        assert_eq!(a, b, "tol {tol} range {lo}..{hi} q {q}");
+                        n_emitted += a.len();
+                    }
+                }
+                assert!(
+                    n_emitted > lib.frag_mz.len() / 4,
+                    "tol {tol}: too little traffic ({n_emitted})"
+                );
+            }
+        }
+    }
+
+    /// The seed's m/z-only index is the full index without its payload: the same geometry,
+    /// CSR offsets, candidates and m/z, bit for bit, and `probe_peak_cand` reports exactly
+    /// the candidates `probe_peak` reports, in the same order, on either index.
+    #[test]
+    fn the_mz_only_index_is_the_full_index_without_its_payload() {
+        let lib = random_lib(2_000, 0xfeed);
+        for tol in [20.0, 7.5] {
+            let full = FragIndex::build(&lib, tol);
+            for chunks in [None, Some(1usize), Some(5)] {
+                let mz = FragIndex::build_chunked(&lib, tol, chunks, false);
+                assert!(full.has_payload() && !mz.has_payload());
+                assert!(mz.post_int.is_empty() && mz.post_frag.is_empty());
+                assert_eq!(format!("{:?}", mz.bins), format!("{:?}", full.bins));
+                assert_eq!(mz.bin_start, full.bin_start);
+                assert_eq!(mz.post_cand, full.post_cand);
+                let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+                assert_eq!(bits(&mz.post_mz), bits(&full.post_mz));
+                assert_eq!(mz.prec_mz, full.prec_mz);
+                // Probe every fragment m/z, nudged inside and outside the tolerance, over a
+                // narrow and the full candidate window.
+                for &(lo, hi) in &[(0u32, 2_000u32), (300, 900), (1_999, 2_000), (5, 5)] {
+                    for (i, &m) in lib.frag_mz.iter().enumerate().step_by(7) {
+                        let q = m as f64 * (1.0 + [0.0, 0.9, -0.9, 1.3][i % 4] * tol * 1e-6);
+                        let mut want = Vec::new();
+                        full.probe_peak(q, lo, hi, |c, _, _, _| want.push(c));
+                        let mut got_full = Vec::new();
+                        full.probe_peak_cand(q, lo, hi, |c| got_full.push(c));
+                        let mut got_mz = Vec::new();
+                        mz.probe_peak_cand(q, lo, hi, |c| got_mz.push(c));
+                        assert_eq!(got_full, want, "q={q} window=({lo},{hi})");
+                        assert_eq!(got_mz, want, "q={q} window=({lo},{hi})");
+                    }
+                }
+            }
+        }
+    }
+
+    /// The payload entry points refuse an m/z-only index rather than handing out zeros.
+    #[test]
+    #[should_panic(expected = "m/z-only index")]
+    fn an_mz_only_index_refuses_the_windowed_probe() {
+        let lib = random_lib(50, 3);
+        let _ = FragIndex::build_mz_only(&lib, 20.0).window_narrow(0, 50);
+    }
+
+    #[test]
+    #[should_panic(expected = "m/z-only index")]
+    fn an_mz_only_index_refuses_probe_peak() {
+        let lib = random_lib(50, 3);
+        FragIndex::build_mz_only(&lib, 20.0).probe_peak(500.0, 0, 50, |_, _, _, _| {});
+    }
+
+    /// The seed accumulator reads through `probe_peak_cand`, so it must see the same counts
+    /// and observed sums over an m/z-only index as over a full one.
+    #[test]
+    fn the_seed_accumulator_is_the_same_over_the_mz_only_index() {
+        let lib = random_lib(1_500, 0xabc);
+        let full = FragIndex::build(&lib, 20.0);
+        let mz = FragIndex::build_mz_only(&lib, 20.0);
+        let peaks: Vec<(f64, f32)> = lib
+            .frag_mz
+            .iter()
+            .step_by(3)
+            .enumerate()
+            .map(|(i, &m)| (m as f64 * (1.0 + 3e-6), 1.0 + i as f32 * 0.5))
+            .collect();
+        let (mut a, mut b) = (SeedScratch::new(8), SeedScratch::new(8));
+        for &(lo, hi) in &[(0u32, 1_500u32), (200, 700)] {
+            a.accumulate(&full, &peaks, lo, hi);
+            b.accumulate(&mz, &peaks, lo, hi);
+            assert_eq!(a.touched(), b.touched());
+            for &c in a.touched() {
+                assert_eq!(a.count(c), b.count(c));
+                assert_eq!(a.obs_sum(c).to_bits(), b.obs_sum(c).to_bits());
+            }
+        }
+    }
+
+    /// The three-array accumulator the slot accumulator replaced, verbatim, as the
+    /// reference it is compared against and timed against.
+    struct SoaScratch {
+        count: Vec<u32>,
+        obs_sum: Vec<f64>,
+        stamp: Vec<u32>,
+        touched: Vec<u32>,
+        epoch: u32,
+        base: u32,
+    }
+
+    impl SoaScratch {
+        fn new(cap: usize) -> SoaScratch {
+            SoaScratch {
+                count: vec![0; cap],
+                obs_sum: vec![0.0; cap],
+                stamp: vec![0; cap],
+                touched: Vec::new(),
+                epoch: 0,
+                base: 0,
+            }
+        }
+        fn accumulate(&mut self, idx: &FragIndex, peaks: &[(f64, f32)], lo: u32, hi: u32) {
+            self.epoch += 1;
+            self.touched.clear();
+            self.base = lo;
+            let width = (hi.saturating_sub(lo)) as usize + 1;
+            if self.count.len() < width {
+                self.count.resize(width, 0);
+                self.obs_sum.resize(width, 0.0);
+                self.stamp.resize(width, 0);
+            }
+            let (epoch, base) = (self.epoch, self.base);
+            for &(mz, inten) in peaks {
+                idx.probe_peak_cand(mz, lo, hi, |cid| {
+                    let cc = (cid - base) as usize;
+                    if self.stamp[cc] != epoch {
+                        self.stamp[cc] = epoch;
+                        self.count[cc] = 0;
+                        self.obs_sum[cc] = 0.0;
+                        self.touched.push(cid);
+                    }
+                    self.count[cc] += 1;
+                    self.obs_sum[cc] += inten as f64;
+                });
+            }
+        }
+    }
+
+    /// Dense scans over a crowded window: peaks drawn from the library's own fragment m/z,
+    /// so most candidates are touched and many several times.
+    fn dense_scans(lib: &Library, n_scans: usize, per_scan: usize) -> Vec<Vec<(f64, f32)>> {
+        let mut state = 0x51ce_u64;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) as usize
+        };
+        (0..n_scans)
+            .map(|_| {
+                let mut v: Vec<(f64, f32)> = (0..per_scan)
+                    .map(|_| {
+                        let m = lib.frag_mz[next() % lib.frag_mz.len()] as f64;
+                        (m * (1.0 + 2e-6), (next() % 1000) as f32 / 7.0)
+                    })
+                    .collect();
+                v.sort_by(|a, b| a.0.total_cmp(&b.0));
+                v
+            })
+            .collect()
+    }
+
+    /// The slot accumulator touches the same candidates in the same order, with the same
+    /// counts and the same observed sums bit for bit, as the three-array one, scan after
+    /// scan over one reused scratch (so the epoch reset is exercised); and its qualified
+    /// list is exactly the touched candidates at or above the minimum count.
+    #[test]
+    fn the_slot_accumulator_matches_the_three_array_one() {
+        let lib = random_lib(3_000, 0x9e37);
+        let idx = FragIndex::build_mz_only(&lib, 20.0);
+        let scans = dense_scans(&lib, 40, 400);
+        for min in [0usize, 1, 2, 3, 6] {
+            let mut new = SeedScratch::with_min_count(4, min);
+            let mut old = SoaScratch::new(4);
+            for (k, peaks) in scans.iter().enumerate() {
+                let (lo, hi) = if k % 3 == 0 { (0, 3_000) } else { (500, 2_100) };
+                new.accumulate(&idx, peaks, lo, hi);
+                old.accumulate(&idx, peaks, lo, hi);
+                assert_eq!(new.touched(), &old.touched[..], "scan {k}");
+                for &c in new.touched() {
+                    let cc = (c - old.base) as usize;
+                    assert_eq!(new.count(c), old.count[cc]);
+                    assert_eq!(new.obs_sum(c).to_bits(), old.obs_sum[cc].to_bits());
+                }
+                let mut want: Vec<u32> = old
+                    .touched
+                    .iter()
+                    .copied()
+                    .filter(|&c| old.count[(c - old.base) as usize] as usize >= min)
+                    .collect();
+                let mut got = new.qualified().to_vec();
+                assert_eq!(
+                    got.len(),
+                    want.len(),
+                    "scan {k} min {min}: a candidate twice?"
+                );
+                want.sort_unstable();
+                got.sort_unstable();
+                assert_eq!(got, want, "scan {k} min {min}");
+            }
+        }
+    }
+
+    /// Microbenchmark: the slot accumulator plus its qualified list against the three-array
+    /// accumulator plus the filter over `touched` the seed used to run, over dense scans of
+    /// one wide window. `#[ignore]`d.
+    ///
+    ///   cargo test --release -p mumdia bench_seed_accumulator -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn bench_seed_accumulator() {
+        // A window that fits in cache (60k candidates, ~1 MB of slots) and one that does not
+        // (2M candidates, ~32 MB), where the slot's single cache line per posting counts.
+        for (n_cand, n_scans, per_scan) in
+            [(60_000usize, 200usize, 2_000usize), (2_000_000, 60, 4_000)]
+        {
+            let lib = random_lib(n_cand, 0x7);
+            let idx = FragIndex::build_mz_only(&lib, 20.0);
+            let scans = dense_scans(&lib, n_scans, per_scan);
+            let hi = n_cand as u32;
+            let min = 4usize;
+            let mut best = (f64::INFINITY, f64::INFINITY);
+            let (mut ha, mut hb) = (0u64, 0u64);
+            for r in 0..6 {
+                for arm in [r % 2, 1 - r % 2] {
+                    let t = std::time::Instant::now();
+                    let mut acc = 0u64;
+                    if arm == 0 {
+                        let mut sc = SeedScratch::with_min_count(n_cand + 1, min);
+                        for peaks in &scans {
+                            sc.accumulate(&idx, peaks, 0, hi);
+                            for &c in sc.qualified() {
+                                acc = acc
+                                    .wrapping_add(c as u64)
+                                    .wrapping_add(sc.obs_sum(c).to_bits());
+                            }
+                        }
+                    } else {
+                        let mut sc = SoaScratch::new(n_cand + 1);
+                        for peaks in &scans {
+                            sc.accumulate(&idx, peaks, 0, hi);
+                            for &c in sc.touched.iter() {
+                                let cc = (c - sc.base) as usize;
+                                if sc.count[cc] as usize >= min {
+                                    acc = acc
+                                        .wrapping_add(c as u64)
+                                        .wrapping_add(sc.obs_sum[cc].to_bits());
+                                }
+                            }
+                        }
+                    }
+                    let el = t.elapsed().as_secs_f64();
+                    std::hint::black_box(acc);
+                    if arm == 0 {
+                        best.0 = best.0.min(el);
+                        ha = acc;
+                    } else {
+                        best.1 = best.1.min(el);
+                        hb = acc;
+                    }
+                }
+            }
+            assert_eq!(ha, hb, "the two accumulators disagree");
+            println!(
+                "seed accumulator, {n_scans} scans x {per_scan} peaks over {n_cand} candidates: \
+                 slots + qualified {:.1} ms, three arrays + filter {:.1} ms ({:+.1}%)",
+                best.0 * 1e3,
+                best.1 * 1e3,
+                100.0 * (best.0 - best.1) / best.1
+            );
+        }
+    }
+
+    /// The atomic posting arrays become plain arrays IN PLACE: an atomic has its integer's
+    /// size and alignment, so `into_iter().map(..).collect()` reuses the allocation rather
+    /// than holding two copies of a posting array at the build's peak.
+    #[test]
+    fn the_posting_arrays_are_converted_in_place() {
+        let a = atomic_u32_zeroed(10_000);
+        let p = a.as_ptr() as usize;
+        let b: Vec<u32> = a.into_iter().map(AtomicU32::into_inner).collect();
+        assert_eq!(b.as_ptr() as usize, p, "u32 conversion reallocated");
+        let a = atomic_u32_zeroed(10_000);
+        let p = a.as_ptr() as usize;
+        let f: Vec<f32> = a
+            .into_iter()
+            .map(|x| f32::from_bits(x.into_inner()))
+            .collect();
+        assert_eq!(f.as_ptr() as usize, p, "f32 conversion reallocated");
+        let h: Vec<AtomicU16> = (0..10_000).map(|_| AtomicU16::new(0)).collect();
+        let p = h.as_ptr() as usize;
+        let h: Vec<u16> = h.into_iter().map(AtomicU16::into_inner).collect();
+        assert_eq!(h.as_ptr() as usize, p, "u16 conversion reallocated");
+    }
+
     // docs/06_predict_frag_index_matchers.md: fragindex == naive at K=C, same
     // predicate.
     #[test]
@@ -867,7 +1837,7 @@ mod tests {
             (200.10f64, 1.0f32),
             (1500.605f64, 3.0f32),
         ];
-        let (lo, hi) = (0u32, lib.cands.len() as u32);
+        let (lo, hi) = (0u32, lib.n_candidates() as u32);
         let fi = score_scan_count_dot(&idx, &peaks, lo, hi);
         let nv = naive::score_scan_count_dot(&lib, &peaks, lo, hi, tol);
         assert_eq!(fi.len(), nv.len(), "matched-candidate set size differs");

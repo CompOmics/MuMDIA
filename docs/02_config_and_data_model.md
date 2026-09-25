@@ -65,8 +65,12 @@ crates read and write. Two things it owns appear on disk:
 `logical_name`, `path`, `format` (always `"parquet"`), `schema_name`,
 `schema_version`, `rows`, `content_hash` (blake3 of the file bytes),
 `producing_stage`, `config_hash`. Built by `record_artifact`
-(`mumdia-io/src/lib.rs:20-39`), which hashes the written Parquet file with
-`blake3_file` (`hash.rs:8-20`, streamed in 64 KiB chunks).
+(`mumdia-io/src/lib.rs:83-101`), which hashes the written Parquet file with
+`blake3_file` (`hash.rs:14-26`, streamed in 64 KiB chunks), or by
+`record_artifact_with_hash` (`lib.rs:107-127`) from a hash the caller already
+has. The writers of the large artifacts compute the same digest while they
+write (`HashingWrite`, docs/03_io_layer.md "Hash on write"), and their stages
+record that digest instead of reading the file back.
 
 **`ArtifactReport`** / `<artifact>.report.json` (`report.rs:11-24`) is written
 alongside each artifact by its producing stage, not by core: `logical_name`,
@@ -790,6 +794,7 @@ requiring entrapment/target-decoy FDR validation before use.
 | `bound_from_confident` | `true` | learn one global peak width from confident seed PSMs |
 | `bound_confident_pct` | 50.0 | percentile of confident half-widths as the shared width |
 | `ms1_precursor_features` | `false` | **default-off** MS1 apex-isotope feature `ms1_isotope_height_corr`; it overlaps the existing `ms1_isotope_cosine_apex`, so it is opt-in. The name stays in the battery either way and returns 0.0 when off, so the vector length does not change |
+| `chrom_loaders` | 3 | chromatogram decode threads in the main feature pass, capped by `--threads` and by the chunk count. Changes time and memory only, never a value or a byte of the features table. The pass holds up to `chrom_loaders + 1` decoded chunks (about 0.92 GiB of traces each at the HYE shape, docs/27 section 3.4); `1` restores the previous single loader and its two resident chunks |
 
 ### `CompeteConfig` (config.rs:825-851)
 

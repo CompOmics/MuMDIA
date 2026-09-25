@@ -120,7 +120,6 @@ fn build_lib(n_cand: usize, n_frag: usize) -> Library {
     let mut frag_mz: Vec<f32> = Vec::with_capacity(n_cand * n_frag);
     let mut frag_int: Vec<f32> = Vec::with_capacity(n_cand * n_frag);
     let mut frag_name_id: Vec<u16> = Vec::with_capacity(n_cand * n_frag);
-    let mut prec_mz: Vec<f64> = Vec::with_capacity(n_cand);
     let mut cands: Vec<Candidate> = Vec::with_capacity(n_cand);
     for c in 0..n_cand {
         let p = 400.0 + 800.0 * (c as f64) / (n_cand as f64);
@@ -144,22 +143,14 @@ fn build_lib(n_cand: usize, n_frag: usize) -> Library {
             frag_start: start,
             n_frag,
         });
-        prec_mz.push(p);
     }
-    Library {
+    Library::from_candidates(
         cands,
         frag_mz,
         frag_int,
         frag_name_id,
-        frag_name_dict: vec!["f".to_string()],
-        idx_mz: Vec::new(),
-        idx_cid: Vec::new(),
-        idx_int: Vec::new(),
-        bucket_min: Vec::new(),
-        bucket_size: 1,
-        prec_mz,
-        global_offset: 0,
-    }
+        vec!["f".to_string()],
+    )
 }
 
 /// `n_scans` scans of `per_scan` peaks each, concatenated, EACH SCAN SORTED BY m/z --

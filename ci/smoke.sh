@@ -4,7 +4,7 @@
 #   ci/smoke.sh [work_dir]
 #
 # Needs: a built `mumdia` binary (found automatically, or set MUMDIA_BIN) and a
-# Python with pyarrow. No sidecar (arm 5b stands a stub in for the DeepLC worker), no
+# Python with pyarrow. No sidecar (arm 5c stands a stub in for the DeepLC worker), no
 # network, no data file in the repository: the
 # fixture is generated from `test_data/fixture.fasta` and from the library the
 # engine itself builds out of it, so the planted peaks cannot disagree with the
@@ -266,7 +266,68 @@ cp "$work/fixture.mzML" "$work/fixture_b.mzML"
 "$BIN" report --experiment-dir "$work/exp" --out-dir "$work/exp_report" --q 0.05 \
     > "$work/exp_report.log" 2>&1 || { tail -20 "$work/exp_report.log"; exit 1; }
 
-# 5b. The DeepLC branches of the orchestrators, with a stub worker.
+# 5b. The same experiment with `experiment.parallel_runs = 2`, and one whose second run
+#     cannot be converted.
+#
+#     An ungrouped run-experiment runs in three phases: convert every run, seed every run
+#     against ONE shared seed library, then continue each run's chain. With
+#     parallel_runs > 1 the converts, the seeds (all reading the one lent library) and the
+#     chains run concurrently, which nothing else exercises. Every stage is deterministic
+#     and reads only its own run's inputs, so every parquet and TSV must be the sequential
+#     experiment's, byte for byte (the report JSONs and manifests carry wall clocks and
+#     are left out). Then the documented consequence of the phase order: a conversion
+#     failure of run 2 stops the experiment before run 1 is seeded or extracted, under
+#     both settings.
+echo "=== smoke: run-experiment with parallel_runs = 2, and a failing conversion"
+"$PY" - "$cfg" "$work/exp_par.json" <<'PYEOF'
+import json, sys
+c = json.load(open(sys.argv[1]))
+c.setdefault("experiment", {})["parallel_runs"] = 2
+json.dump(c, open(sys.argv[2], "w"), indent=2)
+PYEOF
+"$BIN" run-experiment --fasta test_data/fixture.fasta \
+    --mzml "$work/fixture.mzML" --mzml "$work/fixture_b.mzML" \
+    --run-names a --run-names b \
+    --out-dir "$work/exp_par" --config "$work/exp_par.json" > "$work/exp_par.log" 2>&1 \
+    || { tail -30 "$work/exp_par.log"; echo "run-experiment with parallel_runs = 2 failed"; exit 1; }
+grep -q "per-run chains in parallel" "$work/exp_par.log" \
+    || { echo "parallel_runs = 2 did not take the parallel path"; exit 1; }
+(cd "$work/exp" && find . -type f \( -name '*.parquet' -o -name '*.tsv' \) | sort) \
+    > "$work/exp_files.txt"
+(cd "$work/exp_par" && find . -type f \( -name '*.parquet' -o -name '*.tsv' \) | sort) \
+    > "$work/exp_par_files.txt"
+diff "$work/exp_files.txt" "$work/exp_par_files.txt" > /dev/null \
+    || { echo "parallel_runs = 2 wrote a different set of tables"; \
+         diff "$work/exp_files.txt" "$work/exp_par_files.txt"; exit 1; }
+n_tables=0
+while read -r f; do
+    cmp -s "$work/exp/$f" "$work/exp_par/$f" \
+        || { echo "parallel_runs = 2 changed $f"; exit 1; }
+    n_tables=$((n_tables + 1))
+done < "$work/exp_files.txt"
+[ "$n_tables" -ge 20 ] \
+    || { echo "only $n_tables experiment tables compared; expected at least 20"; exit 1; }
+printf 'this is not an mzML file\n' > "$work/fixture_bad.mzML"
+for exp_cfg in "$cfg" "$work/exp_par.json"; do
+    rm -rf "$work/exp_fail"
+    if "$BIN" run-experiment --fasta test_data/fixture.fasta \
+        --mzml "$work/fixture.mzML" --mzml "$work/fixture_bad.mzML" \
+        --run-names a --run-names b \
+        --out-dir "$work/exp_fail" --config "$exp_cfg" > "$work/exp_fail.log" 2>&1; then
+        echo "run-experiment accepted an mzML it cannot convert ($exp_cfg)"; exit 1
+    fi
+    grep -q "fixture_bad.mzML" "$work/exp_fail.log" \
+        || { tail -20 "$work/exp_fail.log"; echo "the failure does not name the bad file"; exit 1; }
+    test -s "$work/exp_fail/a/spectra/spectra_ms2.parquet" \
+        || { echo "run a was not converted before run b failed ($exp_cfg)"; exit 1; }
+    for f in seed_psms.parquet psms_extracted.parquet; do
+        [ ! -e "$work/exp_fail/a/$f" ] \
+            || { echo "run a reached $f although run b's conversion failed ($exp_cfg)"; exit 1; }
+    done
+done
+echo "    ok: $n_tables tables byte-identical under parallel_runs = 2; a failed conversion stops before any seed"
+
+# 5c. The DeepLC branches of the orchestrators, with a stub worker.
 #
 #     CI has no DeepLC, so every choice `run_groups` and `run-experiment` make about WHICH
 #     DeepLC call to make, and where its output goes, ran only on a developer machine:
@@ -298,7 +359,7 @@ os.makedirs(site)
 os.makedirs(scripts)
 with open(os.path.join(site, "METADATA"), "w", encoding="utf-8") as fh:
     fh.write("Metadata-Version: 2.1\nName: deeplc\nVersion: 4.5.0\n")
-STUB = r'''"""Stand-in for deeplc_finetune.py in ci/smoke.sh (arm 5b). No DeepLC, no torch."""
+STUB = r'''"""Stand-in for deeplc_finetune.py in ci/smoke.sh (arm 5c). No DeepLC, no torch."""
 import json, os, shutil, sys
 import pyarrow.parquet as pq
 

@@ -284,7 +284,20 @@ Per-subcommand specifics that are easy to miss:
   scoring and uses a fixed `sidecar_work` working directory (`main.rs:588`);
   inside `run` it is passed exactly one table and a per-out-dir work directory.
 - `run-experiment` (`main.rs:660`, `run_experiment.rs:267`) runs the per-file
-  chain over N runs, rescores all competed tables in one pass
+  chain over N runs. An ungrouped experiment runs it in three phases: every run is
+  converted, then ONE seed library and fragment index (`search_seed::SeedLibrary`,
+  the m/z-only library at the seed tolerance) is loaded and every run is seeded
+  against it, then the library is dropped and each run continues from its seed
+  (RT adaptation, rt-im-train, extract, features, compete, under the same
+  `experiment.rt_library_scope` and `parallel_runs` rules as before). Every run's
+  seed searched the same base library at the same tolerance, so each used to load
+  and index the same arrays again; the outputs are unchanged, only the order in
+  which stages of different runs execute. One consequence of that order: a run whose
+  conversion fails stops the experiment before any run is seeded, so the earlier
+  runs' directories hold only `spectra/`. The smoke test checks both this and that
+  `parallel_runs = 2` writes the same parquet and TSV bytes as the sequential
+  experiment. A grouped run keeps its own chain. It
+  then rescores all competed tables in one pass
   (`run_experiment.rs:428`), then splits the scored table by `source` for per-run
   quant (`run_experiment.rs:474-477`), cross-run LFQ, and then the
   experiment-wide report (`report::run_experiment`): one `peptides.tsv` and one

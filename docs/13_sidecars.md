@@ -490,7 +490,11 @@ report's recorded params match what ran; mokapot ignores those three. On success
 the classifier label and `model_identity` are recorded; on failure the path falls
 back to `native_scores` only when `rescore.strict = false`; strict is the
 production default. The authoritative actual path is recorded in
-`psms_scored.parquet.report.json`.
+`psms_scored.parquet.report.json`. When `nn_torch` ran, its `params.nn_env` also records
+every `MUMDIA_NN_*` variable the worker inherited from the engine's environment, beyond
+the ones the engine sets itself (`inherited_nn_env`, sorted by name; `{}` when there were
+none). `MUMDIA_NN_SEED`, `MUMDIA_NN_THREADS` (set from `--threads`) and
+`MUMDIA_NN_PARALLEL` change the scores and reach the worker only this way.
 
 - `mokapot_worker.py` reads the PIN with `mokapot.read_pin`, builds a model
   chosen by `MUMDIA_RESCORE_MODEL` (`make_model`, `mokapot_worker.py:35-98`:
@@ -786,7 +790,14 @@ cores); `MUMDIA_MOKAPOT_WORKERS` (3, thread-based CV-fold parallelism).
 (300000; when no feature reaches the training FDR on that sample the init scan is
 repeated on 4x the rows up to the whole fold), `MUMDIA_NN_INIT_FDR_MAX` (0.05; ceiling
 of the first-iteration bootstrap ladder 0.02/0.05/0.1 used only when the init feature
-selects no positive at the training FDR over the whole fold, 0 = hard error as before)
+selects no positive at the training FDR over the whole fold, 0 = hard error as before),
+`MUMDIA_NN_PARALLEL` (0; opt-in concurrent fold training, see "Invariants" below) and
+`MUMDIA_NN_PARALLEL_THREADS`, the two caps on the init-scan threads
+(`MUMDIA_NN_SCAN_ROWS_PER_THREAD`, 20000; `MUMDIA_NN_SCAN_MEM_GB`, 1), and the switches
+back to the pre-2026-09-25 code paths
+(`MUMDIA_NN_FINAL_POOL_SCORE`, `MUMDIA_NN_GATHER`, `MUMDIA_NN_SCAN_THREADS`,
+`MUMDIA_NN_LOAD_THREADS`, `MUMDIA_NN_READ_AHEAD`, `MUMDIA_NN_PRE_BUFFER`,
+`MUMDIA_NN_SELECT`),
 plus the three the Rust caller injects: `MUMDIA_NN_FOLDS` (worker default
 3), `MUMDIA_NN_ITERS` (worker default 5, but `run_pin_sidecar` overrides it with
 `rescore.num_iter` = 10), `MUMDIA_NN_TRAIN_FDR` (0.01). These worker defaults
@@ -853,8 +864,9 @@ MLP. Set it explicitly for the logreg path.
 - **The in-memory backend holds one matrix and little else** (2026-09-16). The
   engine writes the handoff parquet in 131,072-row groups and releases its own
   `FeatureMatrix` before the worker starts (under `rescore.strict`, which has no
-  native fallback), and the worker reads one row group at a time; pyarrow's
-  `iter_batches` reads ahead and had buffered a second copy of the matrix. Six-run
+  native fallback), and the worker reads row group by row group, holding at most two
+  decoded groups (the one being filled and the next, read ahead); pyarrow's
+  `iter_batches` reads ahead without bound and had buffered a second copy of the matrix. Six-run
   Astral pool: process tree 17.9 GB before, under 10 after; HYE B01 12.0 -> 5.05 GB,
   identical identifications (`docs/27` section 0.1).
 - **Torch CPU threads are capped** at 16, or at the performance-core count on a
@@ -864,6 +876,137 @@ MLP. Set it explicitly for the logreg path.
   the pooled Astral rescore 118 minutes against 74 at 8, before the subnormal fix below. The
   worker prints `torch cpu threads=N (asked A from ...; cap C: why)` at startup;
   `MUMDIA_NN_THREAD_CAP` overrides the cap, `0` removes it.
+- **The worker ends with a phase breakdown and a sub-timer block.** The phases
+  (`pin_read_standardise`, `init_feature_scan`, `train`, `score_pool_per_iter`,
+  `score_holdout`) are disjoint wall intervals, and `MEASURED TOTAL` is their sum. The
+  sub-timers are printed after it and are not added to that total: `load: read`,
+  `load: fill + moments` and `load: standardise` split `pin_read_standardise` on the
+  parquet in-memory path (with the read-ahead below, `load: read` is the reader
+  thread's busy time and `load: read wait` is how long the fill loop waited for it), and
+  `selection` is the positive re-selection between a pool score and the next training
+  round, which no phase covers.
+- **The worker's speed-ups on the default path keep the scores byte-identical**, and
+  each keeps a switch back to the code it replaced, so a suspected difference can be
+  checked on the same host and seed:
+  - `MUMDIA_NN_FINAL_POOL_SCORE` (default 0): the training pool is not scored after
+    the last round, because no later selection reads those scores. The per-fold log
+    line then reports the held-out fold's targets at the training FDR instead of the
+    training pool's. `1` restores the extra pass and the old line.
+  - `MUMDIA_NN_GATHER` (default `torch`): on the in-memory backend each scoring
+    batch is gathered with `torch.index_select` into one buffer reused for the whole
+    run, on the intra-op threads, instead of a single-threaded numpy fancy index and
+    a fresh allocation per batch (660,000 rows x 387 features: 0.39 s against
+    0.08 s at 8 threads). Same values and shapes. The buffer is allocated by numpy, as
+    the fancy index was, so the model's input does not move to torch's 64-byte
+    alignment; a BLAS kernel may pick its code path by input alignment. The scores
+    were checked byte-identical on Windows x86-64 with torch 2.6, on CPU and on CUDA
+    (RTX 4090), and on synthetic pools of 40 and 120 features;
+    `test_scoring_forward_does_not_depend_on_the_batch_address` repeats the check at
+    the production batch shape (16,384 x 387) on the host that runs it. The Linux
+    fleet has not been checked yet: before relying on identity there, run that test
+    and the two score-identity tests below on one fleet host. `numpy` restores the old
+    gather; the streaming backend always uses it.
+  - `MUMDIA_NN_SCAN_THREADS` (default: the torch CPU thread count): the init feature
+    scan counts its columns on a thread pool, one task per column with both signs
+    from one column read. Each count is computed as before and the winner is reduced in
+    the serial (column, sign) order with the same strict `>`, so the chosen feature,
+    sign and count are identical (400,000 x 120 synthetic pool: 24.9 s against 4.3 s at
+    8 threads). `1` runs it serially. Two caps keep the pool small: one thread per
+    `MUMDIA_NN_SCAN_ROWS_PER_THREAD` sample rows (20,000), and `MUMDIA_NN_SCAN_MEM_GB`
+    (1) of transient memory for the tasks in flight together, at about 64 bytes per
+    sample row each (58 measured: the column copy, its negation, the int64 order and
+    the int64 cumulative counts). The memory cap binds only when the init sample
+    escalates: at 4.8M rows, a step of the ladder on the 8.07M-row immunopeptidomics
+    pool, 16 tasks would have held about 4.5 GB beside the 6.7 GB sample, and the cap
+    allows 3. The init log line prints the thread count used.
+  - `MUMDIA_NN_LOAD_THREADS` (default `min(8, torch CPU threads)`),
+    `MUMDIA_NN_READ_AHEAD` (1) and `MUMDIA_NN_PRE_BUFFER` (1): the parquet in-memory
+    load decodes row group r+1 on a reader thread (its own `ParquetFile`, opened with
+    `pre_buffer=True`) while row group r is written straight into the matrix by the
+    fill threads, each taking one 32,768-row moment sub-block. Each column is narrowed
+    to float32 before its non-finite cells are zeroed, as the old block cast did, and
+    the float64 partial sums are added in the old sub-block order, so the matrix, mean
+    and std are byte-identical. Standardisation is elementwise and runs on the same
+    threads. Measured on a 1,000,000 x 387 handoff: 11.8 s (fill 10.9, standardise
+    1.0) against 2.4 s at 8 threads. Each fill thread holds a 32,768 x features float64
+    buffer (0.1 GB at 387 features) for the duration of the load, and one extra decoded
+    row group is resident; with one fill thread the buffer is the main thread's and is
+    released when the load ends. `MUMDIA_NN_LOAD_THREADS=0` restores the old serial loop
+    without read-ahead.
+  - `MUMDIA_NN_SELECT` (default `window`): each round's positives are the targets up
+    to the last position of the stable descending order whose FDR
+    `(decoys+1)/max(targets,1)` is at or below the training FDR, so only a top window
+    is sorted: every row scoring at least the `(floor(fdr x T)+1)`-th best decoy, ties
+    at the cut included, which makes it a prefix of the full order. Past that window
+    every FDR is at least `(window decoys + 1) / T`; when that exceeds the threshold
+    no later row can be accepted and the window's selection is `tda_q`'s exactly.
+    Otherwise (no certificate, NaN scores, a window above half the rows, or nothing
+    selected, which the bootstrap ladder needs every q-value for) the full `tda_q`
+    runs as before. The hybrid and margin decoy order uses one sort of distinct
+    uint64 keys (order-preserving score bits over the row position), which equals the
+    stable argsort, `-0.0`, NaN and subnormals included. Measured on 10M synthetic
+    scores: 1.69 s against 0.08 s per selection, and 0.48 s against 0.13 s for a
+    5M-decoy order. The worker prints how many selections used the window. `full`
+    restores the full sort everywhere.
+  - Pool threads get the main thread's flush-to-zero state through their
+    initializer, because a thread started on Windows does not inherit it. Without it,
+    measured on Windows, a fill thread narrows a float64 value that is subnormal in
+    float32 to that subnormal where the main thread gives 0.0, and a scan thread ranks
+    a float32 subnormal above 0.0 where the main thread ties them.
+
+  Three tests in `tests/python` (they need torch) hold the default path to the old
+  scores on the host that runs them. `test_default_speedups_leave_scores_byte_identical`
+  runs the worker with every switch set back and with the defaults, for the in-memory
+  and the streaming backend. `test_default_path_scores_as_the_reference_worker` runs the
+  worker as it was before these changes (extracted with `git show` from
+  `REFERENCE_COMMIT`, skipped without the history) against the current one, for the
+  in-memory, streaming and TSV paths, which also covers the refactors that have no
+  switch (the training loop moved into `_build_trainer`, the `_entry` wrapper). Both use
+  a pool with several row groups, non-finite and subnormal cells, nulls and ties, and
+  make the default arm run the threaded init scan. `test_thread_pools_compute_under_the_main_threads_flush_to_zero`
+  compares the threaded fill, standardisation and scan with the serial code under
+  flush-to-zero, on inputs where the thread state decides the bytes. When a later
+  change moves the default scores on purpose, `REFERENCE_COMMIT` is moved to the
+  commit that made it.
+- **Concurrent fold training is opt-in** (`MUMDIA_NN_PARALLEL`, default 0). The folds,
+  and the seeds when `MUMDIA_NN_SEEDS > 1`, train one after another on at most 16
+  threads, while the MLP does not get faster past 16 (8 on an EPYC 9354), so most of a
+  large host idles through the rescore. `MUMDIA_NN_PARALLEL=K` trains the
+  (seed, fold) tasks in K spawned processes at `MUMDIA_NN_PARALLEL_THREADS` torch
+  threads each (default: the serial worker's resolved count). The matrix is shared,
+  not copied: the in-memory backend writes it to `<output>.feat.mm` instead of RAM (the
+  streaming backend already has that file) and every child maps it read-only, so the
+  page cache holds one copy; `y` and the fold index go to two small `.npy` files next
+  to it. Each child holds its own fold's gathered training rows, so the training
+  transient is K times the serial one. Needs free disk for the matrix, like the
+  streaming backend.
+  - Output effect: the epoch shuffle can no longer come from one numpy stream per seed
+    (the folds would have to run in order), so under the opt-in it is keyed per
+    (seed, fold, iteration, epoch). That changes the scores once, as a seed change
+    does. Nothing else a task computes depends on another task: torch is reseeded per
+    training call, and the negative cap and subsample already use RandomStates keyed
+    per (seed, fold, iteration). The scores therefore do not depend on K: K=1 runs the
+    same keyed tasks one after another in one child, and on the same host and per-process
+    thread count K=1 and K=3 return identical bytes
+    (`test_parallel_folds_do_not_depend_on_the_process_count`). A different per-process
+    thread count changes the arithmetic, as it does for the serial worker.
+  - Validate it as a seed change before relying on it: peptides at 1% on `run_psm_q`,
+    mean over three seeds, on two pools, against the serial default, plus the
+    entrapment pool (CLAUDE.md). Compare wall time and each task's `train` phase (the
+    worker prints the per-task phases summed over tasks, and the wall of the parallel
+    section as `parallel_folds_wall`). Measured on the 8-performance-core desktop, a
+    400,000 x 120 synthetic pool with 3 folds: 23.7 s serial at 8 threads, 13.8 s with
+    3 processes x 8 threads; the gain on a many-core server is not measured.
+  - A child exits when the worker dies (it waits on the parent's process sentinel), so
+    an engine that kills the worker does not leave folds training for nobody. The
+    memmap and side arrays are removed when the worker exits, also after an error; only
+    a hard kill leaves them. Under CUDA every child opens its own context on the device.
+  - A child's log is printed by the worker when its task ends. When a task fails, the
+    log travels inside the exception (`--- log of that task ---` in the traceback), so
+    the init feature, rescan, bootstrap and churn lines that explain the failure are
+    not lost.
+  - `MUMDIA_NN_PARALLEL` and `MUMDIA_NN_PARALLEL_THREADS` reach the worker only through
+    the environment; `params.nn_env` in `psms_scored.parquet.report.json` records them.
 - **Constant feature columns are dropped before training** (`MUMDIA_NN_DROP_CONSTANT`,
   default 1; 2026-09-16), identified from the parquet footer's per-column min/max
   without a read (11 of the 387 Extended features on the Astral pool, `has_ms1` and

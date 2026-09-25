@@ -446,8 +446,25 @@ Two of the four tables an ungrouped run writes are not pooled, because nothing r
   run's second-widest artifact, so pooling it cost a full read and a full write for a file
   nothing opened.
 
+Within a band, the competed table is normally a hard link to the band's feature table: under
+the shipped grouping compete removes no row, so it publishes the features file's own bytes
+instead of rewriting them (docs/11 "compete: how the competed table is published"). The two
+names then cost the disk once, and deleting one band file does not free the space while the
+other name exists. The pool splices from the competed name as before, so the pooled
+`psms_competed.parquet` inherits the bands' 65,536-row feature row groups where it used to
+inherit the 131,072-row groups of the rewrite. Its values and row order are unchanged, and so
+is everything rescore reads from it, but its bytes and its manifest and report `content_hash`
+differ from a grouped run made before 2026-09-25 whenever a band table holds more than one
+row group.
+
 Each pooled table is hashed once, for the manifest record and the report beside it
 together. At experiment scale those tables are tens of GB, and hashing reads all of it.
+The band artifacts are hashed once as well, by the stage that writes them, for its own
+report. A band's manifest record reuses that hash (`run_hashed`, docs/03 "Each artifact is
+hashed once"), and under `run-experiment`, which keeps no per-run manifest, no band record
+is built at all. Before 2026-09-25 every band closure re-hashed its seed, windows,
+extracted, chromatogram, feature and competed tables for a record that `run-experiment`
+then dropped.
 
 The pooling itself is a byte copy. A band's rows are already in the order the pooled table
 wants and already encoded, so `pool` splices each band's parquet row groups into the output

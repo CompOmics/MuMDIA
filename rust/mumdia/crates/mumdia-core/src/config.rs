@@ -1249,6 +1249,24 @@ pub struct FeaturesConfig {
     /// overlaps the existing `ms1_isotope_cosine_apex`, so it is opt-in and
     /// benchmark-gated rather than default-on (AlphaDIA-plan item 12).
     pub ms1_precursor_features: bool,
+    /// Chromatogram decode threads in the main feature pass. The pass decodes the
+    /// chromatogram table one chunk at a time while the features of the chunk before are
+    /// computed; with one loader the whole decode ran on a single core, which bound the
+    /// stage whenever decoding a chunk took longer than computing one (measured on an
+    /// 8-12-mer immunopeptidomics run before the decode overlapped the computation: 3.7 of
+    /// a 4-minute stage were the load). Each loader reads its own chunk from that chunk's
+    /// row span, and the computation takes the chunks in table order, so the chunks, every
+    /// feature value and the features table bytes are the same at every setting; only the
+    /// time and the memory move. The pass holds up to `chrom_loaders + 1` decoded chunks
+    /// (0.92 GiB of traces each at the HYE benchmark shape, docs/27 section 3.4), where one
+    /// loader held two. The value is an upper bound: a pass never runs more loaders than
+    /// `--threads` (the engine's thread pool) or than it has chunks, so `--threads 1` decodes
+    /// on one loader as before. Loaders beyond each pass's first come from a process-wide
+    /// pool of four, so concurrent bands or runs (`groups.parallel`,
+    /// `experiment.parallel_runs`) share that pool instead of multiplying it. Default 3; `1`
+    /// restores the single loader and `0` is read as `1`. A memory knob and a speed knob,
+    /// not a sensitivity knob.
+    pub chrom_loaders: usize,
 }
 impl Default for FeaturesConfig {
     fn default() -> Self {
@@ -1268,6 +1286,7 @@ impl Default for FeaturesConfig {
             bound_from_confident: true, // fixed feature window from confident-seed norm
             bound_confident_pct: 50.0, // median confident half-width
             ms1_precursor_features: false, // opt-in; overlaps ms1_isotope_cosine_apex
+            chrom_loaders: 3,
         }
     }
 }
@@ -1961,8 +1980,10 @@ pub struct ExperimentConfig {
     /// `threads`, which moves the adapted library in the last bits unless the DeepLC thread
     /// cap binds both counts to the same number (on an SMT host with `N` below the
     /// logical-minus-physical core count it does). Float-equivalent, hence opt-in. The
-    /// fronts' seeds hold their library and fragment index beside the DeepLC worker, which
-    /// is where the experiment's peak can sit. Not measured at scale.
+    /// fronts keep the ungrouped experiment's phase order: every conversion first, then one
+    /// seed library and fragment index for all of their seeds (run 1 seeds on its own
+    /// load before the overlap starts). That library is held beside the DeepLC worker while
+    /// the fronts seed, which is where the experiment's peak can sit. Not measured at scale.
     pub overlap_front_threads: usize,
 }
 

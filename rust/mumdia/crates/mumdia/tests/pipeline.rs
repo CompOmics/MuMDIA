@@ -200,6 +200,7 @@ fn run_extract(prec: &str, frag: &str, ms2: &str, win: &str, tag: &str) -> (Stri
     stages::extract::run(stages::extract::ExtractParams {
         precursor_span: None,
         fragment_offset: None,
+        rt_windows: None,
         sibling_bands: 1,
         scans: None,
         ms2,
@@ -282,6 +283,7 @@ fn features_compete_rescore_run_on_crafted_input() {
         out: &competed,
         cfg: &cfg.compete,
         config_hash: "test",
+        features_hash: None,
     })
     .unwrap();
 
@@ -298,6 +300,166 @@ fn features_compete_rescore_run_on_crafted_input() {
     let t = Table::read(&scored).unwrap();
     assert!(t.nrows >= 1);
     assert!(t.column_names().contains(&"q_value".to_string()));
+}
+
+/// `w` is what an orchestrator records in the manifest for `path` without reading the
+/// file again (docs/03 "Each artifact is hashed once"), so it must be the hash of the file
+/// at that path and the hash and row count its report records.
+fn assert_written(w: &mumdia_io::report::Written, path: &str) {
+    assert_eq!(
+        w.content_hash,
+        mumdia_io::hash::blake3_file(path).unwrap(),
+        "{path}"
+    );
+    let rep: mumdia_io::report::ArtifactReport =
+        mumdia_io::json::read_json(&format!("{path}.report.json")).unwrap();
+    assert_eq!(w.content_hash, rep.content_hash, "{path}");
+    assert_eq!(w.rows, rep.rows, "{path}");
+}
+
+/// The library-build stages, digest to predict-frag with the native predictors. The
+/// predict-frag pair is returned as (precursors, fragments); the two files differ, so a
+/// swap in that order fails here rather than only in the smoke run.
+#[test]
+fn library_build_stages_return_the_hashes_of_the_files_they_wrote() {
+    let fasta = tmp("tiny.fasta");
+    std::fs::write(
+        &fasta,
+        ">sp|P1|PROT1\nMPEPTIDEKLVNELTEFAKTCVADESHAGCEKSLHTLFGDELCK\n\
+         >sp|P2|PROT2\nMAGVLTDLQKRSSLLNELSASSGYRK\n",
+    )
+    .unwrap();
+    let cfg = Config::default();
+    let peptides = tmp("peptides.parquet");
+    let wd = stages::digest::run_hashed(stages::digest::DigestParams {
+        fasta: &fasta,
+        out: &peptides,
+        cfg: &cfg.digest,
+        rng_seed: cfg.rng_seed,
+        config_hash: "test",
+    })
+    .unwrap();
+    assert!(wd.rows > 0);
+    assert_written(&wd, &peptides);
+
+    let pforms = tmp("peptidoforms.parquet");
+    let wp = stages::peptidoforms::run_hashed(stages::peptidoforms::PeptidoformsParams {
+        peptides: &peptides,
+        out: &pforms,
+        cfg: &cfg.peptidoforms,
+        config_hash: "test",
+    })
+    .unwrap();
+    assert!(wp.rows > 0);
+    assert_written(&wp, &pforms);
+
+    let prec = tmp("lib_precursors_hashed.parquet");
+    let frag = tmp("lib_fragments_hashed.parquet");
+    let (wprec, wfrag) =
+        stages::predict_frag::run_hashed(stages::predict_frag::PredictFragParams {
+            rt_placeholder: false,
+            peptidoforms: &pforms,
+            out_precursors: &prec,
+            out_fragments: &frag,
+            cfg: &cfg.predict_frag,
+            work_dir: &tmp("predict_frag_work"),
+            config_hash: "test",
+        })
+        .unwrap();
+    assert_written(&wprec, &prec);
+    assert_written(&wfrag, &frag);
+    assert_ne!(wprec.content_hash, wfrag.content_hash);
+}
+
+/// The search stages from extract to quant through their `run_hashed` entry points,
+/// chained as the orchestrators chain them: compete receives the features hash, and quant
+/// writes all three of its tables. Each returned value must describe its own file.
+#[test]
+fn search_stages_return_the_hashes_of_the_files_they_wrote() {
+    let (prec, frag) = craft_library();
+    let ms2 = craft_ms2_with_decoy(true);
+    let win = craft_windows();
+    let cfg = Config::default();
+
+    let psms = tmp("psms_hashed.parquet");
+    let chrom = tmp("chrom_hashed.parquet");
+    let (wpsms, wchrom) = stages::extract::run_hashed(stages::extract::ExtractParams {
+        precursor_span: None,
+        fragment_offset: None,
+        sibling_bands: 1,
+        rt_windows: None,
+        scans: None,
+        ms2: &ms2,
+        library_precursors: &prec,
+        library_fragments: &frag,
+        run_windows: &win,
+        ms1: None,
+        mass_cal: None,
+        out_psms: &psms,
+        out_chrom: &chrom,
+        restrict_candidates: None,
+        cfg: &cfg.extract,
+        config_hash: "test",
+    })
+    .unwrap();
+    assert!(wpsms.rows >= 1);
+    assert_written(&wpsms, &psms);
+    assert_written(&wchrom, &chrom);
+    assert_ne!(wpsms.content_hash, wchrom.content_hash);
+
+    let feats = tmp("features_hashed.parquet");
+    let wfeat = stages::features::run_hashed(stages::features::FeaturesParams {
+        psms: &psms,
+        chromatograms: &chrom,
+        seed: None,
+        out: &feats,
+        out_pin: &tmp("hashed.pin"),
+        cfg: &cfg.features,
+        config_hash: "test",
+    })
+    .unwrap();
+    assert_written(&wfeat, &feats);
+
+    let competed = tmp("competed_hashed.parquet");
+    let wcomp = stages::compete::run_hashed(stages::compete::CompeteParams {
+        features: &feats,
+        out: &competed,
+        cfg: &cfg.compete,
+        config_hash: "test",
+        features_hash: Some(&wfeat.content_hash),
+    })
+    .unwrap();
+    assert_written(&wcomp, &competed);
+
+    let scored = tmp("scored_hashed.parquet");
+    let wscored = stages::rescore::run_hashed(stages::rescore::RescoreParams {
+        competed: &[competed],
+        out: &scored,
+        work_dir: &tmp("rescore_work_hashed"),
+        script_dir: "scripts",
+        cfg: &cfg.rescore,
+        config_hash: "test",
+    })
+    .unwrap();
+    assert_written(&wscored, &scored);
+
+    let qpep = tmp("quant_peptide_hashed.parquet");
+    let qprot = tmp("quant_protein_hashed.parquet");
+    let qfrag = tmp("quant_fragment_hashed.parquet");
+    let wq = stages::quant::run_hashed(stages::quant::QuantParams {
+        psms_scored: &scored,
+        chromatograms: &chrom,
+        out_peptide: &qpep,
+        out_protein: &qprot,
+        out_fragment: Some(&qfrag),
+        out_peak_bounds: None,
+        cfg: &cfg.quant,
+        config_hash: "test",
+    })
+    .unwrap();
+    assert_written(&wq.peptide, &qpep);
+    assert_written(&wq.protein, &qprot);
+    assert_written(wq.fragment.as_ref().expect("out_fragment was set"), &qfrag);
 }
 
 /// Synthetic `psms_extracted` + `chromatograms` pair with enough candidates to span
@@ -584,6 +746,7 @@ fn extract_from_a_shared_scan_buffer_is_byte_identical_and_read_only() {
         let (npsm, _) = stages::extract::run(stages::extract::ExtractParams {
             precursor_span: None,
             fragment_offset: None,
+            rt_windows: None,
             sibling_bands: 1,
             scans: shared,
             ms2: &ms2,
@@ -623,7 +786,7 @@ fn extract_from_a_shared_scan_buffer_is_byte_identical_and_read_only() {
     let ms1_scans = mumdia::spectra::load_ms1(&ms1).unwrap();
     let shared = stages::extract::SharedScans {
         ms2: &ms2_scans,
-        ms1: &ms1_scans,
+        ms1: Some(&ms1_scans),
     };
     let (psms_a1, chrom_a1, _) = run_one(Some(shared), &cal_a, "shared_a1");
     let (psms_b1, _chrom_b1, _) = run_one(Some(shared), &cal_b, "shared_b1");
@@ -669,6 +832,7 @@ fn extract_from_a_shared_scan_buffer_is_byte_identical_and_read_only() {
     stages::extract::run(stages::extract::ExtractParams {
         precursor_span: None,
         fragment_offset: None,
+        rt_windows: None,
         sibling_bands: 1,
         scans: None,
         ms2: &ms2,
@@ -697,6 +861,7 @@ fn extract_from_a_shared_scan_buffer_is_byte_identical_and_read_only() {
     stages::extract::run(stages::extract::ExtractParams {
         precursor_span: None,
         fragment_offset: None,
+        rt_windows: None,
         sibling_bands: 1,
         scans: None,
         ms2: &ms2,
@@ -721,7 +886,7 @@ fn extract_from_a_shared_scan_buffer_is_byte_identical_and_read_only() {
 
 /// An EMPTY lent MS1 slice must not be read as "this run has no MS1".
 ///
-/// `SharedScans { ms2, ms1: &[] }` with `ms1: Some(path)` is a caller bug -- a refactor
+/// `SharedScans { ms2, ms1: Some(&[]) }` with `ms1: Some(path)` is a caller bug -- a refactor
 /// that builds the struct before the MS1 is decoded, or a caller that wants only the MS2
 /// saving -- and before the guard it cost every MS1 feature and every `ms1_mono` /
 /// `ms1_iso1` / `ms1_iso2` chromatogram row, silently, because both are written under
@@ -741,6 +906,7 @@ fn extract_does_not_believe_an_empty_lent_ms1_over_a_named_one() {
         stages::extract::run(stages::extract::ExtractParams {
             precursor_span: None,
             fragment_offset: None,
+            rt_windows: None,
             sibling_bands: 1,
             scans: shared,
             ms2: &ms2,
@@ -764,7 +930,7 @@ fn extract_does_not_believe_an_empty_lent_ms1_over_a_named_one() {
     let (psms_lent, chrom_lent) = run_one(
         Some(stages::extract::SharedScans {
             ms2: &ms2_scans,
-            ms1: &[],
+            ms1: Some(&[]),
         }),
         "ms1_lent_empty",
     );
@@ -783,7 +949,10 @@ fn extract_does_not_believe_an_empty_lent_ms1_over_a_named_one() {
     // The same rule for MS2: an empty lent slice means the caller had nothing to lend,
     // never that the run is empty.
     let (psms_no_ms2, chrom_no_ms2) = run_one(
-        Some(stages::extract::SharedScans { ms2: &[], ms1: &[] }),
+        Some(stages::extract::SharedScans {
+            ms2: &[],
+            ms1: Some(&[]),
+        }),
         "ms2_lent_empty",
     );
     assert_eq!(h(&psms_own), h(&psms_no_ms2));
@@ -818,6 +987,7 @@ fn search_seed_from_a_shared_scan_buffer_is_byte_identical_and_read_only() {
             fragment_offset: None,
             ms2_scans: shared,
             emit_calibrants: false,
+            library: None,
             ms2: &ms2,
             library_precursors: &prec,
             library_fragments: &frag,
@@ -864,6 +1034,7 @@ fn search_seed_from_a_shared_scan_buffer_is_byte_identical_and_read_only() {
         fragment_offset: None,
         ms2_scans: None,
         emit_calibrants: false,
+        library: None,
         ms2: &ms2,
         library_precursors: &prec,
         library_fragments: &frag,
@@ -1148,6 +1319,7 @@ fn pooled_mass_calibration_equals_the_unbanded_fit(overlap: bool) {
             fragment_offset: offset,
             ms2_scans: None,
             emit_calibrants: emit,
+            library: None,
             ms2: &f.ms2,
             library_precursors: prec,
             library_fragments: &f.frag,
@@ -1259,5 +1431,424 @@ fn pooled_mass_calibration_equals_the_unbanded_fit(overlap: bool) {
             (a - b).abs() <= 1e-5 * b.abs().max(1.0),
             "{arm} {key}: pooled {a} against unbanded {b}"
         );
+    }
+}
+
+/// The ungrouped `run` lends the seed's own MS2 decode to extract when no DeepLC step runs
+/// between them (`search_seed::run_returning_scans`). The scans the seed hands back must be
+/// exactly what `load_ms2` decodes, the seed must hand back nothing it was lent, and an
+/// extract over the handed-back scans must write the bytes of an extract that decodes both
+/// artifacts itself: with the run's MS1 lent beside them, and with the MS2 lent alone
+/// (`ms1: None`, extract decoding the MS1), which is what `run` does.
+#[test]
+fn the_seed_hands_back_its_decode_and_extract_over_it_is_byte_identical() {
+    let (prec, frag) = craft_library();
+    let ms2 = craft_ms2_with_decoy(true);
+    let ms1 = craft_ms1();
+    let win = craft_windows();
+    let cfg = Config::default();
+    let seed_params = |out: &str, shared: Option<&[Ms2Scan]>| {
+        stages::search_seed::run_returning_scans(stages::search_seed::SearchSeedParams {
+            precursor_span: None,
+            fragment_offset: None,
+            ms2_scans: shared,
+            emit_calibrants: false,
+            library: None,
+            ms2: &ms2,
+            library_precursors: &prec,
+            library_fragments: &frag,
+            out,
+            cfg: &cfg.search_seed,
+            bucket_size: cfg.extract.bucket_size,
+            config_hash: "test",
+        })
+        .unwrap()
+    };
+    let seed = tmp("seed_handback.parquet");
+    let (_, handed) = seed_params(&seed, None);
+    let handed = handed.expect("the seed decoded the scans, so it hands them back");
+    assert_scans_identical(&handed, &mumdia::spectra::load_ms2(&ms2).unwrap());
+    let (_, again) = seed_params(&tmp("seed_handback_lent.parquet"), Some(&handed));
+    assert!(again.is_none(), "a lent buffer is not handed back");
+
+    let extract = |shared: Option<stages::extract::SharedScans>, tag: &str| {
+        let psms = tmp(&format!("psms_handback_{tag}.parquet"));
+        let chrom = tmp(&format!("chrom_handback_{tag}.parquet"));
+        stages::extract::run(stages::extract::ExtractParams {
+            precursor_span: None,
+            fragment_offset: None,
+            rt_windows: None,
+            sibling_bands: 1,
+            scans: shared,
+            ms2: &ms2,
+            library_precursors: &prec,
+            library_fragments: &frag,
+            run_windows: &win,
+            ms1: Some(&ms1),
+            mass_cal: Some(&format!("{seed}.masscal.json")),
+            out_psms: &psms,
+            out_chrom: &chrom,
+            restrict_candidates: None,
+            cfg: &cfg.extract,
+            config_hash: "test",
+        })
+        .unwrap();
+        (psms, chrom)
+    };
+    let own = extract(None, "own");
+    let ms1_scans = mumdia::spectra::load_ms1(&ms1).unwrap();
+    let lent = extract(
+        Some(stages::extract::SharedScans {
+            ms2: &handed,
+            ms1: Some(&ms1_scans),
+        }),
+        "lent",
+    );
+    let ms2_only = extract(
+        Some(stages::extract::SharedScans {
+            ms2: &handed,
+            ms1: None,
+        }),
+        "ms2_only",
+    );
+    let h = |p: &str| mumdia_io::hash::blake3_file(p).unwrap();
+    assert!(
+        mumdia_io::table::nrows(&own.0).unwrap() > 0,
+        "extract found nothing on this fixture, so the comparison is between empty tables"
+    );
+    assert_eq!(
+        h(&own.0),
+        h(&lent.0),
+        "psms_extracted differs over the lent decode"
+    );
+    assert_eq!(
+        h(&own.1),
+        h(&lent.1),
+        "chromatograms differ over the lent decode"
+    );
+    assert_eq!(
+        (h(&own.0), h(&own.1)),
+        (h(&ms2_only.0), h(&ms2_only.1)),
+        "extract over a lent MS2 alone must decode the MS1 and write the same bytes"
+    );
+    // Guard: the MS1 has to reach the output, or the MS2-only arm would pass over an MS1
+    // decode nothing reads. The same extract over the lent MS2 with no MS1 artifact.
+    let no_ms1_psms = tmp("psms_handback_no_ms1.parquet");
+    stages::extract::run(stages::extract::ExtractParams {
+        precursor_span: None,
+        fragment_offset: None,
+        rt_windows: None,
+        sibling_bands: 1,
+        scans: Some(stages::extract::SharedScans {
+            ms2: &handed,
+            ms1: None,
+        }),
+        ms2: &ms2,
+        library_precursors: &prec,
+        library_fragments: &frag,
+        run_windows: &win,
+        ms1: None,
+        mass_cal: Some(&format!("{seed}.masscal.json")),
+        out_psms: &no_ms1_psms,
+        out_chrom: &tmp("chrom_handback_no_ms1.parquet"),
+        restrict_candidates: None,
+        cfg: &cfg.extract,
+        config_hash: "test",
+    })
+    .unwrap();
+    assert_ne!(
+        h(&own.0),
+        h(&no_ms1_psms),
+        "the MS1 fixture does not reach psms_extracted, so the MS2-only arm is untested"
+    );
+}
+
+/// `run-experiment` loads one seed library and index and lends it to every run's seed
+/// (`search_seed::SeedLibrary`). A seed over the lent library must write the bytes of a
+/// seed that loads its own, on both matchers, for several seeds in a row; and a library
+/// built for other settings must be refused rather than searched.
+#[test]
+fn a_lent_seed_library_gives_the_seed_it_would_have_loaded() {
+    let (prec, frag) = craft_library();
+    let ms2 = craft_ms2_with_decoy(true);
+    let h = |p: &str| mumdia_io::hash::blake3_file(p).unwrap();
+    for matcher in [
+        mumdia_core::config::MatcherKind::Fragindex,
+        mumdia_core::config::MatcherKind::Bucketed,
+    ] {
+        let mut cfg = Config::default();
+        cfg.search_seed.min_matched_peaks = 2;
+        cfg.search_seed.matcher = matcher;
+        let seed = |out: &str, library: Option<&stages::search_seed::SeedLibrary>| {
+            stages::search_seed::run(stages::search_seed::SearchSeedParams {
+                precursor_span: None,
+                fragment_offset: None,
+                ms2_scans: None,
+                emit_calibrants: false,
+                library,
+                ms2: &ms2,
+                library_precursors: &prec,
+                library_fragments: &frag,
+                out,
+                cfg: &cfg.search_seed,
+                bucket_size: cfg.extract.bucket_size,
+                config_hash: "test",
+            })
+        };
+        let own = tmp(&format!("seed_lend_own_{matcher:?}.parquet"));
+        assert!(
+            seed(&own, None).unwrap() > 0,
+            "the fixture must produce seed rows"
+        );
+        let lib = stages::search_seed::SeedLibrary::load(
+            &prec,
+            &frag,
+            None,
+            None,
+            &cfg.search_seed,
+            cfg.extract.bucket_size,
+        )
+        .unwrap();
+        for k in 0..3 {
+            let out = tmp(&format!("seed_lend_{matcher:?}_{k}.parquet"));
+            seed(&out, Some(&lib)).unwrap();
+            assert_eq!(
+                h(&own),
+                h(&out),
+                "{matcher:?} seed {k} over the lent library"
+            );
+            assert_eq!(
+                std::fs::read(format!("{own}.masscal.json")).unwrap(),
+                std::fs::read(format!("{out}.masscal.json")).unwrap()
+            );
+        }
+        // Built at another tolerance: refused.
+        let mut other = cfg.clone();
+        other.search_seed.fragment_tol_ppm += 5.0;
+        let wrong = stages::search_seed::SeedLibrary::load(
+            &prec,
+            &frag,
+            None,
+            None,
+            &other.search_seed,
+            cfg.extract.bucket_size,
+        )
+        .unwrap();
+        let err = seed(&tmp("seed_lend_wrong.parquet"), Some(&wrong))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("lent seed library"), "{err}");
+    }
+}
+
+/// T1: the RT windows `rt-im-train` hands an orchestrated extract in memory give the
+/// psms_extracted and chromatograms bytes of the extract that reads the run_windows file
+/// the same call wrote, and extract takes them without opening that file. Windows fitted
+/// on another precursor table, written to another run_windows path, or covering another
+/// candidate count are refused, and the file is read instead, with the same bytes.
+///
+/// Whether extract opened the file is observed directly: for the length of one extract
+/// the file holds bytes that are not parquet, so an extract that reads it fails.
+#[test]
+fn extract_takes_the_handed_rt_windows_only_when_they_are_its_own() {
+    use stages::rt_im_train::{run_in_memory, RtImTrainParams, RtWindows};
+
+    /// Run `f` while `path` holds bytes that are not parquet, then put the file back.
+    fn without_file<T>(path: &str, f: impl FnOnce() -> T) -> T {
+        let bytes = std::fs::read(path).unwrap();
+        std::fs::write(path, b"not a parquet file").unwrap();
+        let out = f();
+        std::fs::write(path, &bytes).unwrap();
+        out
+    }
+
+    // The planted target (0) and its decoy (1) of `craft_library`, plus a second target (2)
+    // on its own base peptide and iRT, whose fragments the spectra do not carry. Two target
+    // anchors with distinct iRTs give a calibrated, BOUNDED window, so the arrays handed
+    // over are not the unbounded sentinel of a run without anchors.
+    let prec = tmp("t1_prec.parquet");
+    let frag = tmp("t1_frag.parquet");
+    let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    write_table(
+        &prec,
+        vec![
+            Col::U32("candidate_id".into(), vec![0, 1, 2]),
+            Col::U32("peptidoform_id".into(), vec![0, 1, 2]),
+            Col::U32("base_peptide_id".into(), vec![0, 0, 1]),
+            Col::Str(
+                "peptidoform".into(),
+                names(&["PEPTIDEK", "EDITPEPK", "ANQTHERK"]),
+            ),
+            Col::I32("charge".into(), vec![2, 2, 2]),
+            Col::F64("precursor_mz".into(), vec![500.0, 500.0, 501.0]),
+            Col::F32("predicted_irt".into(), vec![10.0, 10.0, 20.0]),
+            Col::Str("label".into(), names(&["target", "decoy", "target"])),
+            Col::Str("protein".into(), names(&["P1", "DECOY_P1", "P2"])),
+            Col::I32("n_fragments".into(), vec![3, 3, 3]),
+        ],
+    )
+    .unwrap();
+    write_table(
+        &frag,
+        vec![
+            Col::U32("candidate_id".into(), vec![0, 0, 0, 1, 1, 1, 2, 2, 2]),
+            Col::F64(
+                "mz".into(),
+                vec![
+                    200.1, 300.2, 400.3, 250.7, 350.8, 450.9, 700.1, 710.2, 720.3,
+                ],
+            ),
+            Col::F32(
+                "predicted_intensity".into(),
+                vec![1.0, 0.8, 0.6, 1.0, 0.8, 0.6, 1.0, 0.8, 0.6],
+            ),
+            Col::Str(
+                "name".into(),
+                names(&["b2", "y3", "y4", "b2", "y3", "y4", "b2", "y3", "y4"]),
+            ),
+            Col::Str(
+                "ion_type".into(),
+                names(&["b", "y", "y", "b", "y", "y", "b", "y", "y"]),
+            ),
+            Col::I32("ordinal".into(), vec![2, 3, 4, 2, 3, 4, 2, 3, 4]),
+            Col::I32("frag_charge".into(), vec![1; 9]),
+        ],
+    )
+    .unwrap();
+    let ms2 = craft_ms2_with_decoy(true);
+    let seed = tmp("t1_seed.parquet");
+    write_table(
+        &seed,
+        vec![
+            Col::U32("candidate_id".into(), vec![0, 2]),
+            Col::U32("base_peptide_id".into(), vec![0, 1]),
+            Col::F64("spectrum_q".into(), vec![0.001, 0.001]),
+            Col::F64("score".into(), vec![5.0, 4.0]),
+            Col::F64("observed_rt".into(), vec![140.0, 240.0]),
+            Col::Str("label".into(), names(&["target", "target"])),
+        ],
+    )
+    .unwrap();
+
+    let cfg = Config::default();
+    let fit = |library: &str, windows: &str| -> RtWindows {
+        let (_, kept) = run_in_memory(RtImTrainParams {
+            precursor_span: None,
+            seed_psms: &seed,
+            library_precursors: library,
+            out_windows: windows,
+            out_cal: &format!("{windows}.cal.json"),
+            cfg: &cfg.rt_im_train,
+            config_hash: "test",
+            anchor_irt_from_seed: false,
+        })
+        .unwrap();
+        kept.expect("no NaN bound, so the windows are handed over")
+    };
+    let extract = |rt_windows: Option<RtWindows>,
+                   run_windows: &str,
+                   tag: &str|
+     -> anyhow::Result<(String, String)> {
+        let psms = tmp(&format!("t1_psms_{tag}.parquet"));
+        let chrom = tmp(&format!("t1_chrom_{tag}.parquet"));
+        stages::extract::run(stages::extract::ExtractParams {
+            precursor_span: None,
+            fragment_offset: None,
+            rt_windows,
+            sibling_bands: 1,
+            scans: None,
+            ms2: &ms2,
+            library_precursors: &prec,
+            library_fragments: &frag,
+            run_windows,
+            ms1: None,
+            mass_cal: None,
+            out_psms: &psms,
+            out_chrom: &chrom,
+            restrict_candidates: None,
+            cfg: &cfg.extract,
+            config_hash: "test",
+        })?;
+        Ok((psms, chrom))
+    };
+    let bytes = |(psms, chrom): &(String, String)| {
+        (std::fs::read(psms).unwrap(), std::fs::read(chrom).unwrap())
+    };
+
+    let windows = tmp("t1_run_windows.parquet");
+    let handed = fit(&prec, &windows);
+    let t = Table::read(&windows).unwrap();
+    assert!(
+        t.f64("rt_lo").unwrap()[0].is_finite() && t.f64("rt_hi").unwrap()[0].is_finite(),
+        "the fixture has to fit a bounded window, or the arrays handed over are the sentinel"
+    );
+    let from_file = extract(None, &windows, "file").unwrap();
+    assert!(
+        Table::read(&from_file.0)
+            .unwrap()
+            .u32("candidate_id")
+            .unwrap()
+            .contains(&0),
+        "the planted target must be extracted, or the comparison is of empty tables"
+    );
+    let from_file = bytes(&from_file);
+
+    // Handed over and taken: the same bytes, and the file was not opened.
+    let from_memory = without_file(&windows, || extract(Some(handed), &windows, "memory"))
+        .expect("the handed windows are used, so the unreadable file is never opened");
+    let from_memory = bytes(&from_memory);
+    assert_eq!(
+        from_memory.0, from_file.0,
+        "psms_extracted, in memory vs file"
+    );
+    assert_eq!(
+        from_memory.1, from_file.1,
+        "chromatograms, in memory vs file"
+    );
+
+    // Each refusal, built twice: once to show the file is read (it fails while the file is
+    // unreadable), once to show that reading it gives the bytes above.
+    let prec_copy = tmp("t1_prec_copy.parquet");
+    std::fs::copy(&prec, &prec_copy).unwrap();
+    let windows_copy = tmp("t1_run_windows_copy.parquet");
+    let refusals: [(&str, &dyn Fn() -> RtWindows); 3] = [
+        // Fitted on another precursor table holding the same candidates.
+        ("library", &|| fit(&prec_copy, &windows)),
+        // Written to another run_windows path.
+        ("path", &|| fit(&prec, &windows_copy)),
+        // Fitted for this library path and this file, over a different candidate count:
+        // the table at the path changed after the fit.
+        ("count", &|| {
+            let (p, w) = (
+                std::fs::read(&prec).unwrap(),
+                std::fs::read(&windows).unwrap(),
+            );
+            write_table(
+                &prec,
+                vec![
+                    Col::U32("candidate_id".into(), vec![0, 1]),
+                    Col::F32("predicted_irt".into(), vec![10.0, 10.0]),
+                ],
+            )
+            .unwrap();
+            let fitted = fit(&prec, &windows);
+            std::fs::write(&prec, p).unwrap();
+            std::fs::write(&windows, w).unwrap();
+            assert_eq!(fitted.len(), 2);
+            fitted
+        }),
+    ];
+    for (tag, refused) in refusals {
+        let w = refused();
+        assert!(
+            without_file(&windows, || extract(Some(w), &windows, &format!("{tag}_x"))).is_err(),
+            "{tag}: windows that are not this extract's were used instead of the file"
+        );
+        let got = bytes(&extract(Some(refused()), &windows, tag).unwrap());
+        assert_eq!(
+            got.0, from_file.0,
+            "{tag}: psms_extracted after the refusal"
+        );
+        assert_eq!(got.1, from_file.1, "{tag}: chromatograms after the refusal");
     }
 }

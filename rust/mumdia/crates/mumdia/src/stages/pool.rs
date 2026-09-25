@@ -25,7 +25,7 @@ use std::time::Instant;
 use anyhow::{anyhow, bail, Result};
 use arrow::array::{Array, BooleanArray, UInt32Array};
 use arrow::compute::filter_record_batch;
-use mumdia_io::table::{BatchWriter, SpliceWriter, TableFile};
+use mumdia_io::table::{BatchWriter, SpliceWriter, TableFile, Written};
 use tracing::info;
 
 const BATCH_ROWS: usize = 1 << 16;
@@ -56,6 +56,11 @@ pub struct PoolStats {
     pub psms: u64,
     pub chromatograms: u64,
     pub competed: u64,
+    /// Content hashes of the pooled tables, computed while they were spliced, in the order
+    /// psms (when pooled), chromatograms, competed.
+    pub psms_hash: Option<String>,
+    pub chromatograms_hash: String,
+    pub competed_hash: String,
     /// Candidates that appeared in two bands and were kept from one.
     pub duplicates: u64,
 }
@@ -104,7 +109,9 @@ fn overlap_losers(bands: &[BandArtifacts]) -> Result<(Vec<HashSet<u32>>, u64)> {
     Ok((losers, duplicates))
 }
 
-/// Append every band's table into `out`, losers dropped. Returns the row count.
+/// Append every band's table into `out`, losers dropped. Returns the row count and the
+/// content hash of `out`, computed while it was written (the per-row-group rewrite temp
+/// files are not hashed).
 ///
 /// The bands already wrote library-wide ids (`Library::global_offset` is added on the way
 /// out of extract), so pooling is a concatenation and almost every row group can be spliced
@@ -113,12 +120,12 @@ fn overlap_losers(bands: &[BandArtifacts]) -> Result<(Vec<HashSet<u32>>, u64)> {
 /// against a disk that does 221 MB/s. Only the row groups that actually hold a dropped
 /// candidate are decoded, filtered and re-encoded, and window overlap puts those at the two
 /// ends of a band.
-fn pool_table(paths: impl Iterator<Item = (String, HashSet<u32>)>, out: &str) -> Result<u64> {
+fn pool_table(paths: impl Iterator<Item = (String, HashSet<u32>)>, out: &str) -> Result<Written> {
     let paths: Vec<(String, HashSet<u32>)> = paths.collect();
     let Some((template, _)) = paths.first() else {
         bail!("pool: no group tables to pool into {out}");
     };
-    let mut w = SpliceWriter::create(out, template)?;
+    let mut w = SpliceWriter::create_hashed(out, template)?;
     let mut rows = 0u64;
     for (path, drop) in &paths {
         if drop.is_empty() {
@@ -165,11 +172,14 @@ fn pool_table(paths: impl Iterator<Item = (String, HashSet<u32>)>, out: &str) ->
             rows += w.append_row_groups(path, |k| k >= start && k < i)?;
         }
     }
-    let spliced = w.close()?;
-    if spliced != rows {
-        bail!("pool: counted {rows} rows into {out} but the file holds {spliced}");
+    let spliced = w.close_hashed()?;
+    if spliced.rows != rows {
+        bail!(
+            "pool: counted {rows} rows into {out} but the file holds {}",
+            spliced.rows
+        );
     }
-    Ok(rows)
+    Ok(spliced)
 }
 
 /// Decode one row group, drop the losers, and splice the result back in. Used only for the
@@ -229,13 +239,19 @@ pub fn run(p: PoolParams) -> Result<PoolStats> {
             .map(move |(b, l)| (pick(b).clone(), l.clone()))
             .collect::<Vec<_>>()
     };
+    let psms = match p.out_psms {
+        Some(out) => Some(pool_table(with(|b| &b.psms).into_iter(), out)?),
+        None => None,
+    };
+    let chromatograms = pool_table(with(|b| &b.chromatograms).into_iter(), p.out_chromatograms)?;
+    let competed = pool_table(with(|b| &b.competed).into_iter(), p.out_competed)?;
     let stats = PoolStats {
-        psms: match p.out_psms {
-            Some(out) => pool_table(with(|b| &b.psms).into_iter(), out)?,
-            None => 0,
-        },
-        chromatograms: pool_table(with(|b| &b.chromatograms).into_iter(), p.out_chromatograms)?,
-        competed: pool_table(with(|b| &b.competed).into_iter(), p.out_competed)?,
+        psms: psms.as_ref().map_or(0, |w| w.rows),
+        chromatograms: chromatograms.rows,
+        competed: competed.rows,
+        psms_hash: psms.map(|w| w.content_hash),
+        chromatograms_hash: chromatograms.content_hash,
+        competed_hash: competed.content_hash,
         duplicates,
     };
     info!(

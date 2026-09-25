@@ -214,22 +214,22 @@ fn process_run(
             Some(format!("{out}/groups")),
         ));
     }
-    let seed = seed_run(cfg, ch, &co, lib_p_base, lib_f, out)?;
-    let (lib_p, produced_rt_lib) = adapt_rt_library(
+    let seed = seed_run(cfg, ch, lib_p_base, lib_f, &co, out, None)?;
+    chain_after_seed(
         cfg,
+        ch,
         lib_p_base,
-        &seed,
+        lib_f,
+        library_input,
+        &co,
         out,
-        mh_heads,
+        &seed,
         shared_rt_lib,
         irt_placeholder,
-        rayon::current_num_threads(),
-    )?;
-    let (competed, chrom) = finish_run(cfg, ch, &lib_p, lib_f, &co, &seed, out)?;
-    Ok((competed, chrom, produced_rt_lib))
+    )
 }
 
-/// Convert one run's mzML (or vendor file) into its `spectra/` artifacts.
+/// Convert one run's mzML (or vendor file) into `<out>/spectra`.
 fn convert_run(
     cfg: &Config,
     mzml: &str,
@@ -260,24 +260,26 @@ fn convert_run(
     })
 }
 
-/// The ungrouped seed search of one run, on the base library (the seed is
-/// iRT-independent). Returns the seed table's path.
+/// Seed one ungrouped run against the base library (the seed is iRT-independent) into
+/// `<out>/seed_psms.parquet`, with the experiment's shared seed library when one is lent.
+/// Returns the seed path.
 fn seed_run(
     cfg: &Config,
     ch: &str,
-    co: &convert::ConvertOutputs,
     lib_p_base: &str,
     lib_f: &str,
+    co: &convert::ConvertOutputs,
     out: &str,
+    library: Option<&search_seed::SeedLibrary>,
 ) -> Result<String> {
-    let d = |name: &str| format!("{out}/{name}");
-    let seed = d("seed_psms.parquet");
+    let seed = format!("{out}/seed_psms.parquet");
     search_seed::run(search_seed::SearchSeedParams {
         precursor_span: None,
         fragment_offset: None,
         // One reader at a time, as in the ungrouped `run`.
         ms2_scans: None,
         emit_calibrants: false,
+        library,
         ms2: &co.ms2,
         library_precursors: lib_p_base,
         library_fragments: lib_f,
@@ -287,6 +289,40 @@ fn seed_run(
         config_hash: ch,
     })?;
     Ok(seed)
+}
+
+/// Everything of an ungrouped run's chain after its seed: the optional RT-library
+/// adaptation, rt-im-train, extract, features and compete. Returns
+/// `(competed, chromatograms, adapted_library_if_produced)`.
+#[allow(clippy::too_many_arguments)]
+fn chain_after_seed(
+    cfg: &Config,
+    ch: &str,
+    lib_p_base: &str,
+    lib_f: &str,
+    library_input: bool,
+    co: &convert::ConvertOutputs,
+    out: &str,
+    seed: &str,
+    shared_rt_lib: Option<&str>,
+    irt_placeholder: bool,
+) -> Result<(String, String, Option<String>)> {
+    let has_deeplc = cfg.predict_frag.deeplc_python.is_some();
+    let mh_heads = cfg
+        .rt_im_train
+        .multihead_heads(has_deeplc, cfg.deeplc_rt_source(library_input, has_deeplc));
+    let (lib_p, produced_rt_lib) = adapt_rt_library(
+        cfg,
+        lib_p_base,
+        seed,
+        out,
+        mh_heads,
+        shared_rt_lib,
+        irt_placeholder,
+        rayon::current_num_threads(),
+    )?;
+    let (competed, chrom) = finish_run(cfg, ch, &lib_p, lib_f, co, seed, out)?;
+    Ok((competed, chrom, produced_rt_lib))
 }
 
 /// Choose the precursor table the rest of an ungrouped run reads: a previous run's adapted
@@ -394,7 +430,8 @@ fn finish_run(
 ) -> Result<(String, String)> {
     let d = |name: &str| format!("{out}/{name}");
     let windows = d("run_windows.parquet");
-    rt_im_train::run(rt_im_train::RtImTrainParams {
+    // Handed to extract in memory; see `rt_im_train::RtWindows`.
+    let (_, fitted_windows) = rt_im_train::run_in_memory(rt_im_train::RtImTrainParams {
         precursor_span: None,
         anchor_irt_from_seed: false,
         seed_psms: seed,
@@ -410,6 +447,7 @@ fn finish_run(
         precursor_span: None,
         fragment_offset: None,
         sibling_bands: 1,
+        rt_windows: fitted_windows,
         scans: None,
         ms2: &co.ms2,
         library_precursors: lib_p,
@@ -424,7 +462,7 @@ fn finish_run(
         config_hash: ch,
     })?;
     let feats = d("features.parquet");
-    features::run(features::FeaturesParams {
+    let features_written = features::run_hashed(features::FeaturesParams {
         psms: &psms,
         chromatograms: &chrom,
         seed: Some(seed),
@@ -439,6 +477,7 @@ fn finish_run(
         out: &competed,
         cfg: &cfg.compete,
         config_hash: ch,
+        features_hash: Some(&features_written.content_hash),
     })?;
     Ok((competed, chrom))
 }
@@ -802,8 +841,8 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
             RtLibraryScope::FirstRunOnly
         )
         && n_runs > 1;
-    let mut shared_ft: Option<String> = None;
-    let mut first: usize = 0;
+    // `experiment.overlap_front_threads`: under first_run_only, the converts and seeds of
+    // runs 2..N run beside run 1's RT adaptation instead of before it (the branch below).
     let grouped_runs = cfg.groups.window_groups > 1;
     let overlap = cfg.experiment.overlap_front_threads;
     if overlap > 0 && (grouped_runs || !share_ft) {
@@ -814,13 +853,126 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
              running the runs one after the other"
         );
     }
-    if share_ft && overlap > 0 && !grouped_runs {
+    let overlapped = share_ft && overlap > 0 && !grouped_runs;
+    // Ungrouped runs seed against ONE library: every run's seed searches the base library
+    // at the seed tolerance, so the library and its fragment index are the same arrays for
+    // every run, and each seed used to load and build them again. So the chain runs in
+    // three phases: every run is converted first (the conversion is the memory-heavy step
+    // of its own and needs no library), then the seed library is loaded once and every run
+    // seeded against it, then the library is dropped and each run's chain continues from
+    // its seed. The outputs are the ones the per-run chain wrote: every stage is
+    // deterministic and reads only its own run's inputs, so only the order in which the
+    // stages of different runs execute changes. A grouped run seeds band by band against
+    // band libraries and keeps its own chain. The overlapped experiment orders its own
+    // phases (below), so it skips these.
+    let library_input = p.lib_precursors.is_some();
+    let prepared: Vec<Option<(convert::ConvertOutputs, String)>> = if grouped_runs || overlapped {
+        (0..n_runs).map(|_| None).collect()
+    } else {
+        let mut conv: Vec<convert::ConvertOutputs> = Vec::with_capacity(n_runs);
+        let all: Vec<usize> = (0..n_runs).collect();
+        for chunk in all.chunks(par) {
+            let done: Vec<convert::ConvertOutputs> = crate::colread::first_err(
+                chunk
+                    .par_iter()
+                    .map(|&i| {
+                        info!(run = %names[i], i = i + 1, n = n_runs, "run-experiment: convert");
+                        convert_run(
+                            cfg,
+                            &p.mzmls[i],
+                            &d(&names[i]),
+                            p.top_peaks_ms2,
+                            p.max_spectra,
+                        )
+                    })
+                    .collect(),
+            )?;
+            conv.extend(done);
+        }
+        let t_lib = Instant::now();
+        let seed_lib = search_seed::SeedLibrary::load(
+            &lib_p_base,
+            &lib_f,
+            None,
+            None,
+            &cfg.search_seed,
+            cfg.extract.bucket_size,
+        )?;
+        info!(
+            candidates = seed_lib.n_candidates(),
+            runs = n_runs,
+            elapsed_ms = t_lib.elapsed().as_millis() as u64,
+            "run-experiment: one seed library and fragment index for every run's seed"
+        );
+        let mut seeds: Vec<String> = Vec::with_capacity(n_runs);
+        for chunk in all.chunks(par) {
+            let done: Vec<String> = crate::colread::first_err(
+                chunk
+                    .par_iter()
+                    .map(|&i| {
+                        info!(run = %names[i], i = i + 1, n = n_runs, "run-experiment: seed");
+                        seed_run(
+                            cfg,
+                            &ch,
+                            &lib_p_base,
+                            &lib_f,
+                            &conv[i],
+                            &d(&names[i]),
+                            Some(&seed_lib),
+                        )
+                    })
+                    .collect(),
+            )?;
+            seeds.extend(done);
+        }
+        drop(seed_lib);
+        conv.into_iter().zip(seeds).map(Some).collect()
+    };
+    // One run's chain: from its seed when phases 1-2 ran, else (grouped) whole, with the
+    // band slices of an earlier grouped run to reuse (`slices_from`).
+    let run_one = |i: usize,
+                   shared: Option<&str>,
+                   slices_from: Option<&str>|
+     -> Result<(String, String, Option<String>)> {
+        match &prepared[i] {
+            Some((co, seed)) => chain_after_seed(
+                cfg,
+                &ch,
+                &lib_p_base,
+                &lib_f,
+                library_input,
+                co,
+                &d(&names[i]),
+                seed,
+                shared,
+                irt_placeholder,
+            ),
+            None => process_run(
+                cfg,
+                &ch,
+                &lib_p_base,
+                &lib_f,
+                library_input,
+                &p.mzmls[i],
+                &d(&names[i]),
+                p.top_peaks_ms2,
+                p.max_spectra,
+                shared,
+                library_irt_repredicted,
+                slices_from,
+                irt_placeholder,
+            ),
+        }
+    };
+
+    let mut shared_ft: Option<String> = None;
+    let mut first: usize = 0;
+    if overlapped {
         // Run 1's front, then its RT adaptation beside the fronts of runs 2..N on disjoint
         // thread budgets, then every run's rest on the whole pool.
         let total = rayon::current_num_threads();
         let front_threads = overlap.min(total.saturating_sub(1)).max(1);
         let adapt_threads = total.saturating_sub(front_threads).max(1);
-        let library_input = p.lib_precursors.is_some();
         let has_deeplc = cfg.predict_frag.deeplc_python.is_some();
         let mh_heads = cfg
             .rt_im_train
@@ -835,7 +987,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         );
         let out0 = d(&names[0]);
         let co0 = convert_run(cfg, &p.mzmls[0], &out0, p.top_peaks_ms2, p.max_spectra)?;
-        let seed0 = seed_run(cfg, &ch, &co0, &lib_p_base, &lib_f, &out0)?;
+        let seed0 = seed_run(cfg, &ch, &lib_p_base, &lib_f, &co0, &out0, None)?;
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(front_threads)
             .build()
@@ -854,29 +1006,54 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         };
         let (adapted, fronts) = std::thread::scope(|scope| {
             let fronts = scope.spawn(|| {
-                let r = pool.install(|| {
-                    (1..n_runs)
-                        .map(|i| {
-                            use std::sync::atomic::Ordering;
-                            if cancel.load(Ordering::SeqCst) {
-                                return Err(cancelled());
-                            }
-                            let out = d(&names[i]);
-                            info!(run = %names[i], i = i + 1, n = n_runs, "run-experiment: convert and seed, overlapped");
-                            let co = convert_run(
-                                cfg,
-                                &p.mzmls[i],
-                                &out,
-                                p.top_peaks_ms2,
-                                p.max_spectra,
-                            )?;
-                            if cancel.load(Ordering::SeqCst) {
-                                return Err(cancelled());
-                            }
-                            let seed = seed_run(cfg, &ch, &co, &lib_p_base, &lib_f, &out)?;
-                            Ok((co, seed))
-                        })
-                        .collect::<Result<Vec<_>>>()
+                // The fronts keep the phase order of the ungrouped experiment above: every
+                // conversion first, with no library resident, then one seed library for all
+                // of their seeds (run 1 has already seeded on its own load).
+                let r = pool.install(|| -> Result<Vec<(convert::ConvertOutputs, String)>> {
+                    use std::sync::atomic::Ordering;
+                    let mut conv: Vec<convert::ConvertOutputs> = Vec::with_capacity(n_runs - 1);
+                    for i in 1..n_runs {
+                        if cancel.load(Ordering::SeqCst) {
+                            return Err(cancelled());
+                        }
+                        info!(run = %names[i], i = i + 1, n = n_runs, "run-experiment: convert, overlapped");
+                        conv.push(convert_run(
+                            cfg,
+                            &p.mzmls[i],
+                            &d(&names[i]),
+                            p.top_peaks_ms2,
+                            p.max_spectra,
+                        )?);
+                    }
+                    if cancel.load(Ordering::SeqCst) {
+                        return Err(cancelled());
+                    }
+                    let seed_lib = search_seed::SeedLibrary::load(
+                        &lib_p_base,
+                        &lib_f,
+                        None,
+                        None,
+                        &cfg.search_seed,
+                        cfg.extract.bucket_size,
+                    )?;
+                    let mut seeds: Vec<String> = Vec::with_capacity(n_runs - 1);
+                    for (co, i) in conv.iter().zip(1..n_runs) {
+                        if cancel.load(Ordering::SeqCst) {
+                            return Err(cancelled());
+                        }
+                        info!(run = %names[i], i = i + 1, n = n_runs, "run-experiment: seed, overlapped");
+                        seeds.push(seed_run(
+                            cfg,
+                            &ch,
+                            &lib_p_base,
+                            &lib_f,
+                            co,
+                            &d(&names[i]),
+                            Some(&seed_lib),
+                        )?);
+                    }
+                    drop(seed_lib);
+                    Ok(conv.into_iter().zip(seeds).collect())
                 });
                 if let Err(e) = &r {
                     if !cancel.load(std::sync::atomic::Ordering::SeqCst) {
@@ -936,7 +1113,6 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         };
         let items: Vec<(usize, &(convert::ConvertOutputs, String))> =
             (1..n_runs).zip(fronts.iter()).collect();
-        let par = cfg.experiment.parallel_runs.max(1);
         for chunk in items.chunks(par) {
             let done: Vec<(String, String)> = if par == 1 {
                 chunk
@@ -961,21 +1137,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
             n = n_runs,
             "run-experiment: adapting the library's retention times on the first run only;              the remaining runs reuse that library and fit their own RT calibration on it              (experiment.rt_library_scope = per_run to adapt for every run instead)"
         );
-        let (comp, chrom, ft) = process_run(
-            cfg,
-            &ch,
-            &lib_p_base,
-            &lib_f,
-            p.lib_precursors.is_some(),
-            &p.mzmls[0],
-            &d(&names[0]),
-            p.top_peaks_ms2,
-            p.max_spectra,
-            None,
-            library_irt_repredicted,
-            None,
-            irt_placeholder,
-        )?;
+        let (comp, chrom, ft) = run_one(0, None, None)?;
         competed.push(comp);
         chroms.push(chrom);
         match ft {
@@ -1002,21 +1164,8 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
     if par == 1 {
         for &i in &rest {
             info!(run = %names[i], i = i + 1, n = n_runs, "run-experiment: per-run chain");
-            let (comp, chrom, groups_dir) = process_run(
-                cfg,
-                &ch,
-                &lib_p_base,
-                &lib_f,
-                p.lib_precursors.is_some(),
-                &p.mzmls[i],
-                &d(&names[i]),
-                p.top_peaks_ms2,
-                p.max_spectra,
-                shared_ft.as_deref(),
-                library_irt_repredicted,
-                slice_source.as_deref(),
-                irt_placeholder,
-            )?;
+            let (comp, chrom, groups_dir) =
+                run_one(i, shared_ft.as_deref(), slice_source.as_deref())?;
             competed.push(comp);
             chroms.push(chrom);
             if grouped && slice_source.is_none() {
@@ -1034,21 +1183,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
                 .par_iter()
                 .map(|&i| {
                     info!(run = %names[i], i = i + 1, n = n_runs, "run-experiment: per-run chain");
-                    process_run(
-                        cfg,
-                        &ch,
-                        &lib_p_base,
-                        &lib_f,
-                        p.lib_precursors.is_some(),
-                        &p.mzmls[i],
-                        &d(&names[i]),
-                        p.top_peaks_ms2,
-                        p.max_spectra,
-                        shared_ft.as_deref(),
-                        library_irt_repredicted,
-                        slice_source.as_deref(),
-                        irt_placeholder,
-                    )
+                    run_one(i, shared_ft.as_deref(), slice_source.as_deref())
                 })
                 .collect::<Result<Vec<_>>>()?;
             for (comp, chrom, groups_dir) in done {
@@ -1063,7 +1198,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
 
     // --- one experiment-wide rescore over all competed tables ---
     let scored_combined = d("scored_combined.parquet");
-    rescore::run(rescore::RescoreParams {
+    let scored_written = rescore::run_hashed(rescore::RescoreParams {
         competed: &competed,
         out: &scored_combined,
         work_dir: &d("sidecar_work"),
@@ -1172,10 +1307,13 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
     qcfg.q_filter = QuantQColumn::PsmQ;
     let mut peptide_quants: Vec<String> = Vec::with_capacity(n_runs);
     let mut protein_quants: Vec<String> = Vec::with_capacity(n_runs);
+    // Each run's quant hashes its two tables for their reports; the manifest below reuses
+    // those hashes instead of reading the tables again.
+    let mut quant_written: Vec<quant::QuantWritten> = Vec::with_capacity(n_runs);
     for i in 0..n_runs {
         let pq = d(&format!("{}/peptide_quant.parquet", names[i]));
         let gq = d(&format!("{}/protein_group_quant.parquet", names[i]));
-        quant::run(quant::QuantParams {
+        let written = quant::run_hashed(quant::QuantParams {
             psms_scored: &split_paths[i],
             chromatograms: &chroms[i],
             out_peptide: &pq,
@@ -1187,6 +1325,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         })?;
         peptide_quants.push(pq);
         protein_quants.push(gq);
+        quant_written.push(written);
     }
     let lfq = d("lfq_maxlfq.parquet");
     let n_lfq = quant::run_lfq_combine(
@@ -1304,14 +1443,18 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
     );
     prov.model_identities
         .insert("mbr".into(), format!("{:?}", cfg.mbr.strategy));
-    // Recorded in a fixed order, and every record hashes its file. `Manifest`
-    // stores them in a BTreeMap, so the serialised order is by logical name and
-    // does not depend on this sequence.
-    let mut artifacts: Vec<(String, (&str, u32), String, &str)> = vec![(
+    // Recorded in a fixed order. `Manifest` stores them in a BTreeMap, so the serialised
+    // order is by logical name and does not depend on this sequence. The last field is the
+    // content hash when the producing stage already computed it for its own report (rescore,
+    // quant); the others (the MBR worker's table, the by-source split) are hashed here.
+    // (logical name, schema, path, producing stage, content hash when already known)
+    type Recorded<'s> = (String, (&'s str, u32), String, &'s str, Option<String>);
+    let mut artifacts: Vec<Recorded> = vec![(
         "scored_combined".to_string(),
         artifact::PSMS_SCORED,
         scored_combined.clone(),
         "rescore",
+        Some(scored_written.content_hash.clone()),
     )];
     // Only when MBR actually produced a different table; otherwise
     // `scored_for_quant` IS `scored_combined` and recording it twice would claim two
@@ -1322,6 +1465,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
             artifact::PSMS_SCORED,
             scored_for_quant.clone(),
             "mbr",
+            None,
         ));
     }
     for (i, name) in names.iter().enumerate() {
@@ -1330,26 +1474,32 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
             artifact::PSMS_SCORED,
             split_paths[i].clone(),
             "split-by-source",
+            None,
         ));
         artifacts.push((
             format!("peptide_quant[{name}]"),
             artifact::PEPTIDE_QUANT,
             peptide_quants[i].clone(),
             "quant",
+            Some(quant_written[i].peptide.content_hash.clone()),
         ));
         artifacts.push((
             format!("protein_group_quant[{name}]"),
             artifact::PROTEIN_GROUP_QUANT,
             protein_quants[i].clone(),
             "quant",
+            Some(quant_written[i].protein.content_hash.clone()),
         ));
     }
-    for (logical, schema, path, stage) in artifacts {
+    for (logical, schema, path, stage, known_hash) in artifacts {
         let rows = mumdia_io::table::nrows(&path)
             .with_context(|| format!("counting rows of {path} for the experiment manifest"))?;
-        prov.record(mumdia_io::record_artifact(
-            &logical, schema, &path, rows, stage, &ch,
-        )?);
+        prov.record(match known_hash {
+            Some(hash) => mumdia_io::record_artifact_with_hash(
+                &logical, schema, &path, rows, stage, &ch, hash,
+            ),
+            None => mumdia_io::record_artifact(&logical, schema, &path, rows, stage, &ch)?,
+        });
     }
     prov.record(mumdia_io::record_artifact(
         artifact::LFQ_MAXLFQ.0,

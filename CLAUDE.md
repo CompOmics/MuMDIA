@@ -422,9 +422,11 @@ sections 10-16:
   identifications. Under `rescore.strict` (the production setting) with a sidecar classifier
   the engine releases its own `FeatureMatrix` as soon as the handoff parquet is written,
   because strict has no native fallback that could still read it; the handoff is written in
-  131,072-row groups; and the worker loads it one row group at a time, since pyarrow's
-  `iter_batches` reads ahead and its buffered batches were a second copy of the matrix (the
-  worker climbed to 11.2 GB while filling a 4.85 GB matrix, then fell to 6.3). Measured on
+  131,072-row groups; and the worker loads it row group by row group, holding at most two
+  decoded groups (one filling, one read ahead on a reader thread since 2026-09-25), since
+  pyarrow's `iter_batches` reads ahead without bound and its buffered batches were a second
+  copy of the matrix (the worker climbed to 11.2 GB while filling a 4.85 GB matrix, then
+  fell to 6.3). Measured on
   the fleet (EPYC 9354, 32 threads, process-tree peaks): the six-run Astral pool
   (3,133,636 x 387) 17.9 GB -> 9.3 GB in 19.4 against 19.4 min, HYE B01
   (1,838,344 x 387) 12.0 GB -> 5.05 GB in 5.2 against 5.0 min, 63,270 peptides in both HYE
@@ -614,9 +616,10 @@ sections 10-16:
   and `large_utf8`, and the engine rejects both ("Disabled feature at compile
   time: zstd", "column 'peptidoform' is not utf8").
 - A library must carry `candidate_id` as the contiguous row-aligned range
-  `0..ncand` (`index.rs:112-125`) and precursors ascending by `precursor_mz`
-  (`index.rs:215-231`). Both are hard errors. Fragments are grouped by a
-  counting sort, so they need valid ids but not a sorted order.
+  `0..ncand` (`index.rs:215-245`) and precursors ascending by `precursor_mz`
+  (`index.rs:1288-1299`). Both are hard errors. Fragments are grouped by a
+  counting sort, so they need valid ids but not a sorted order; a table whose
+  ids ascend (what every library writer produces) takes the parallel fill.
 - The `nn_torch` worker selects its backend at `MUMDIA_NN_STREAM_GB`
   (default 4). A feature matrix marginally over the threshold silently falls to
   the much slower disk-backed streaming memmap; a 4.31 GB matrix against the
