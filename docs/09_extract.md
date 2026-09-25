@@ -324,16 +324,24 @@ first collision.
 
 There are three accumulation paths:
 
-- **Parallel per-window, single-pass** (`extract_accumulate_windows`,
-  `extract.rs:662`): used when `fidx` is present and there is no `restrict` list
-  and the path is not two-pass. Scans are grouped by isolation window (each scan
-  belongs to exactly one window), and the ~150 windows are processed in parallel
-  with rayon. It is bit-identical to the serial loop because the per-candidate
-  cascade rt-sorts hits before summing, and same-rt hits for a candidate all come
-  from one window (`extract.rs:1456`).
-- **Serial single-pass** (`extract.rs:1462`): the fallback when there is a
-  `restrict` allowlist or no fragindex. It honors every non-co-elution
-  `peak_claim` strategy.
+- **Streamed, single-pass** (`accumulate_groups`): the default, used with the
+  fragindex matcher whenever the path is not two-pass, with or without a `restrict`
+  allowlist. Scans are grouped by isolation window, a batch of
+  `extract.windows_in_flight` windows is probed at a time, and each window is cut
+  on a shared grid of candidate sub-ranges; one task probes one (sub-range, window)
+  pair through its own `LocalIndex`. A sub-range is flushed to the per-candidate
+  pass as soon as every window of the batch has reported, so the accumulator holds
+  the windows in flight rather than the run. A flush hands the pass at most
+  `CAND_CHUNK` candidates. When every candidate of a flush sits in one window's
+  store as its only segment, which is the common case (a sub-range reached by one
+  window, no leftovers from the batch before), the flush lends slices of that store
+  directly (`single_run_span`, `flush_below`); otherwise the candidates are
+  gathered and concatenated window by window into a reusable buffer first. The
+  zero-copy flush hands over exactly the batches the gather would build, because
+  each flush becomes one chromatogram chunk and the parquet page framing follows
+  the chunk sizes (`the_zero_copy_flush_hands_over_the_batches_the_gather_builds`).
+- **Serial single-pass**: the fallback of the bucketed matcher. It honors every
+  non-co-elution `peak_claim` strategy.
 - **Two-pass co-elution** (`extract_twopass_windows`, `extract.rs:787`): used
   when `peak_claim` is one of the `Coelution*` variants **or**
   `emit_contested_features` is set (`extract.rs:1443`). Like the single-pass

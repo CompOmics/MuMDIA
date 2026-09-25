@@ -273,14 +273,20 @@ impl HitStore {
     /// a slice sort either way, so the hits it sees and the order it sees them in are
     /// exactly those of the owned vector.
     fn slices_mut(&mut self) -> Vec<(u32, &mut [Hit])> {
+        let n = self.cids.len();
+        self.slices_mut_range(0, n)
+    }
+
+    /// [`HitStore::slices_mut`] for candidates `a..b` of the store only.
+    fn slices_mut_range(&mut self, a: usize, b: usize) -> Vec<(u32, &mut [Hit])> {
         let HitStore { cids, offs, hits } = self;
-        let mut out = Vec::with_capacity(cids.len());
-        let mut rest: &mut [Hit] = hits.as_mut_slice();
-        let mut base = 0usize;
-        for (i, &cid) in cids.iter().enumerate() {
+        let mut out = Vec::with_capacity(b - a);
+        let mut base = offs[a];
+        let mut rest: &mut [Hit] = &mut hits[base..offs[b]];
+        for i in a..b {
             let end = offs[i + 1];
             let (head, tail) = rest.split_at_mut(end - base);
-            out.push((cid, head));
+            out.push((cids[i], head));
             rest = tail;
             base = end;
         }
@@ -401,6 +407,19 @@ impl HitRun {
         self.settle();
     }
 
+    /// Step past `m` candidates of the current part.
+    fn advance_by(&mut self, m: usize) {
+        self.ci += m;
+        self.settle();
+    }
+
+    /// The next `m` candidates, all in the current part, as `(cid, hits)` slices into the
+    /// run's own store: nothing is copied.
+    fn span_mut(&mut self, m: usize) -> Vec<(u32, &mut [Hit])> {
+        let ci = self.ci;
+        self.parts[self.pi].slices_mut_range(ci, ci + m)
+    }
+
     /// Hits not yet gathered out of this run.
     fn hits_left(&self) -> usize {
         match self.parts.get(self.pi) {
@@ -486,6 +505,103 @@ fn gather_chunk(runs: &mut [HitRun], bound: u32, max_cands: usize, out: &mut Hit
                 out.push_segment(cid, r.current());
                 r.advance();
             }
+        }
+    }
+}
+
+/// When the next [`gather_chunk`] of `(bound, max_cands)` would copy the hits of candidates
+/// that ALL sit in one run's current part, each as that candidate's only segment, return
+/// `(run, m)`: that run and how many of its candidates the gather would take. Flushing
+/// them straight out of the run's store then hands the flush exactly the batch the gather
+/// would have built, candidate for candidate and hit for hit, without the copy.
+///
+/// The batch has to be the SAME batch, not merely the same candidates, because each flush
+/// call becomes one chromatogram chunk and the parquet page framing follows the chunk
+/// sizes. So a span is taken only when the gather could not have gone past it: it filled
+/// `max_cands`, or nothing else below `bound` remains, in any run or in a later part of this
+/// one. Otherwise `None`, and the caller gathers.
+fn single_run_span(runs: &[HitRun], bound: u32, max_cands: usize) -> Option<(usize, usize)> {
+    // The run holding the smallest pending candidate, and the smallest of every other run.
+    let mut best: Option<(usize, u32)> = None;
+    let mut other_min = u32::MAX;
+    for (i, r) in runs.iter().enumerate() {
+        let Some(c) = r.peek() else { continue };
+        match best {
+            None => best = Some((i, c)),
+            Some((_, bc)) if c < bc => {
+                other_min = other_min.min(bc);
+                best = Some((i, c));
+            }
+            Some(_) => other_min = other_min.min(c),
+        }
+    }
+    let (r, first) = best?;
+    // Nothing flushable, or the first candidate has a segment in another run too.
+    if first >= bound || other_min == first || max_cands == 0 {
+        return None;
+    }
+    let run = &runs[r];
+    let part = &run.parts[run.pi];
+    let limit = bound.min(other_min);
+    let m = part.cids[run.ci..]
+        .partition_point(|&c| c < limit)
+        .min(max_cands);
+    if m == max_cands {
+        return Some((r, m));
+    }
+    // A short span: the gather would go on to whatever else lies below `bound`.
+    if other_min < bound {
+        return None;
+    }
+    if run.ci + m == part.len() {
+        let next = run.parts[run.pi + 1..]
+            .iter()
+            .find(|q| !q.is_empty())
+            .map(|q| q.cids[0]);
+        if next.is_some_and(|c| c < bound) {
+            return None;
+        }
+    }
+    Some((r, m))
+}
+
+/// A flush of finished candidates: `(cid, hits)` in ascending id, at most `CAND_CHUNK` of
+/// them. Returns false when the consumer went away.
+type FlushFn<'f> = dyn for<'h> FnMut(Vec<(u32, &'h mut [Hit])>) -> bool + Send + 'f;
+
+/// Flush every candidate of `runs` below `bound`, `max_cands` at a time, in ascending id.
+/// Returns true when `flush` asked to stop.
+///
+/// A batch whose candidates all come from one run's store, each as its only segment, is
+/// flushed straight out of that store ([`single_run_span`]); every other batch is gathered
+/// into `chunk` first. That is the common case by far: a sub-range reached by one window
+/// and holding no leftovers from the batch before. `zero_copy = false` always gathers,
+/// which is the reference the zero-copy batches are tested against.
+fn flush_below(
+    runs: &mut [HitRun],
+    bound: u32,
+    max_cands: usize,
+    zero_copy: bool,
+    chunk: &mut HitStore,
+    flush: &mut FlushFn<'_>,
+) -> bool {
+    loop {
+        if zero_copy {
+            if let Some((r, m)) = single_run_span(runs, bound, max_cands) {
+                let ok = flush(runs[r].span_mut(m));
+                runs[r].advance_by(m);
+                if !ok {
+                    return true;
+                }
+                continue;
+            }
+        }
+        gather_chunk(runs, bound, max_cands, chunk);
+        if chunk.is_empty() {
+            return false;
+        }
+        if !flush(chunk.slices_mut()) {
+            return true;
         }
     }
 }
@@ -1500,7 +1616,7 @@ fn accumulate_groups(
     bound: u32,
     acc: &mut HitAcc,
     chunk: &mut HitStore,
-    flush: &mut (dyn FnMut(&mut HitStore) -> bool + Send),
+    flush: &mut FlushFn<'_>,
 ) -> bool {
     if groups.is_empty() {
         return false;
@@ -1662,14 +1778,9 @@ fn accumulate_groups(
                     // Everything this sub-range owns is final, except what a later batch
                     // can still reach.
                     let sub_bound = sub_bounds(next_k).1.min(bound);
-                    while !stopped {
-                        gather_chunk(&mut runs, sub_bound, CAND_CHUNK, chunk);
-                        if chunk.is_empty() {
-                            break;
-                        }
-                        if !flush(chunk) {
-                            stopped = true;
-                        }
+                    if !stopped && flush_below(&mut runs, sub_bound, CAND_CHUNK, true, chunk, flush)
+                    {
+                        stopped = true;
                     }
                     acc.runs = runs;
                     acc.compact();
@@ -3676,8 +3787,7 @@ pub fn run(mut p: ExtractParams) -> Result<(u64, u64)> {
         // window batch on the streamed path and once on the eager paths, so the code
         // that produces a row is the same either way. Returns false when the writer has
         // gone away; its error surfaces at the join below.
-        let mut emit_batch = |store: &mut HitStore| -> bool {
-            let mut cand_hits = store.slices_mut();
+        let mut emit_batch = |mut cand_hits: Vec<(u32, &mut [Hit])>| -> bool {
             for chunk in cand_hits.chunks_mut(CAND_CHUNK) {
                 let outs: Vec<Vec<CandOut>> = chunk
                     .par_iter_mut()
@@ -3780,7 +3890,7 @@ pub fn run(mut p: ExtractParams) -> Result<(u64, u64)> {
         if let Some(groups) = stream_groups.as_ref() {
             // Counting the flushed candidates here rather than inside `emit_batch` keeps
             // the eager path below able to borrow `emit_batch` on its own.
-            let mut flush = |c: &mut HitStore| -> bool {
+            let mut flush = |c: Vec<(u32, &mut [Hit])>| -> bool {
                 n_materialized += c.len() as u64;
                 emit_batch(c)
             };
@@ -3821,14 +3931,17 @@ pub fn run(mut p: ExtractParams) -> Result<(u64, u64)> {
                 // Candidates past the batch's own sub-range grid (a window of this batch
                 // can reach past the last window's range when the windows differ in width)
                 // are final too, and the sub-range loop cannot have reached them.
-                while !stopped {
-                    gather_chunk(&mut acc_stream.runs, bound, CAND_CHUNK, &mut chunk);
-                    if chunk.is_empty() {
-                        break;
-                    }
-                    if !flush(&mut chunk) {
-                        stopped = true;
-                    }
+                if !stopped
+                    && flush_below(
+                        &mut acc_stream.runs,
+                        bound,
+                        CAND_CHUNK,
+                        true,
+                        &mut chunk,
+                        &mut flush,
+                    )
+                {
+                    stopped = true;
                 }
                 acc_stream.compact();
                 if stopped {
@@ -3873,7 +3986,7 @@ pub fn run(mut p: ExtractParams) -> Result<(u64, u64)> {
                     chunk.push_segment(cid, &hits);
                 }
                 i = end;
-                if !emit_batch(&mut chunk) {
+                if !emit_batch(chunk.slices_mut()) {
                     break;
                 }
             }
@@ -4518,8 +4631,8 @@ mod accumulate_tests {
                 let mut chunk = HitStore::default();
                 let mut flushed: Vec<(u32, Vec<Hit>)> = Vec::new();
                 pool.install(|| {
-                    let mut sink = |c: &mut HitStore| -> bool {
-                        for (cid, hits) in c.slices_mut() {
+                    let mut sink = |c: Vec<(u32, &mut [Hit])>| -> bool {
+                        for (cid, hits) in c {
                             flushed.push((cid, hits.to_vec()));
                         }
                         true
@@ -4724,6 +4837,107 @@ mod accumulate_tests {
         gather_chunk(&mut acc.runs, u32::MAX, usize::MAX, &mut out);
         assert_eq!(out.cids, vec![8, 11]);
         assert_eq!(acc.n_hits(), 0);
+    }
+
+    /// The zero-copy flush hands over exactly the batches the gathering flush builds: the
+    /// same candidates in the same calls, the same hits in the same order, and it leaves the
+    /// runs holding the same remainder. Randomised over runs with disjoint and overlapping
+    /// candidates, several parts, empty stores, bounds inside and past the runs and small
+    /// chunk caps, so every branch of `single_run_span` is taken.
+    #[test]
+    fn the_zero_copy_flush_hands_over_the_batches_the_gather_builds() {
+        let mut state = 0x2e40_u64;
+        let mut next = move |m: u64| -> u64 {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) % m.max(1)
+        };
+        let mut n_zero_copy_batches = 0usize;
+        for case in 0..400 {
+            // One recipe, built twice: `HitStore` is not `Clone`, on purpose.
+            let n_runs = 1 + next(4) as usize;
+            let mut recipe: Vec<Vec<Vec<(u32, u32)>>> = Vec::new(); // run -> part -> (cid, n)
+            for _ in 0..n_runs {
+                let n_parts = 1 + next(3) as usize;
+                let mut c = next(20) as u32;
+                let mut parts = Vec::new();
+                for _ in 0..n_parts {
+                    let mut part = Vec::new();
+                    for _ in 0..next(12) {
+                        part.push((c, 1 + next(3) as u32));
+                        c += 1 + next(3) as u32;
+                    }
+                    parts.push(part);
+                }
+                recipe.push(parts);
+            }
+            let build = || -> Vec<HitRun> {
+                let mut scan = 0u32;
+                recipe
+                    .iter()
+                    .map(|parts| {
+                        let stores = parts
+                            .iter()
+                            .map(|part| {
+                                let mut st = HitStore::default();
+                                for &(cid, n) in part {
+                                    let hits: Vec<Hit> = (0..n)
+                                        .map(|_| {
+                                            scan += 1;
+                                            Hit {
+                                                scan,
+                                                frag: (scan % 7) as u16,
+                                                inten: scan as f32,
+                                                obs_mz: 300.0,
+                                            }
+                                        })
+                                        .collect();
+                                    st.push_segment(cid, &hits);
+                                }
+                                st
+                            })
+                            .collect();
+                        HitRun::new(stores)
+                    })
+                    .collect()
+            };
+            let bound = [u32::MAX, next(60) as u32, 0][case % 3];
+            let cap = 1 + next(6) as usize;
+            let outcome = |zero_copy: bool| {
+                let mut runs = build();
+                let mut chunk = HitStore::default();
+                let mut batches: Vec<Vec<(u32, Vec<Hit>)>> = Vec::new();
+                let mut sink = |c: Vec<(u32, &mut [Hit])>| -> bool {
+                    batches.push(c.into_iter().map(|(cid, h)| (cid, h.to_vec())).collect());
+                    true
+                };
+                let stopped = flush_below(&mut runs, bound, cap, zero_copy, &mut chunk, &mut sink);
+                assert!(!stopped);
+                let mut rest = HitStore::default();
+                gather_chunk(&mut runs, u32::MAX, usize::MAX, &mut rest);
+                let rest: Vec<(u32, Vec<Hit>)> = rest
+                    .slices_mut()
+                    .into_iter()
+                    .map(|(c, h)| (c, h.to_vec()))
+                    .collect();
+                (batches, rest)
+            };
+            let reference = outcome(false);
+            let candidate = outcome(true);
+            assert_eq!(
+                candidate, reference,
+                "case {case}: bound {bound}, cap {cap}"
+            );
+            // Whether the first batch of this case is one the zero-copy path takes.
+            if single_run_span(&build(), bound, cap).is_some() {
+                n_zero_copy_batches += 1;
+            }
+        }
+        assert!(
+            n_zero_copy_batches > 50,
+            "the zero-copy branch must be exercised ({n_zero_copy_batches} cases)"
+        );
     }
 
     /// The chunk cap is a flush-size limit, not a filter: chunking must not lose or
