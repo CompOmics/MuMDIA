@@ -122,8 +122,9 @@ than a number. Both are recorded in every run's `manifest.json`.
   lines inserted and fails if either artifact differs;
   `tests/python/test_gen_config_reference.py` pins the same property on synthetic
   sources. Two reads in one function now share one citation, so the `Read at` column
-  and the list of unresolved reads have fewer entries. The variables, their defaults,
-  the fields and the settings are unchanged.
+  has fewer entries. In the list of reads whose name is not a literal, such reads share
+  one entry that gives their number, and the header still counts reads. The variables,
+  their defaults, the fields and the settings are unchanged.
 ### Added
 
 - **`mumdia pool` pools a grouped run's band artifacts from the command line.** `run` does

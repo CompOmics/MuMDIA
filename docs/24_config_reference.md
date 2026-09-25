@@ -855,10 +855,10 @@ Every field whose struct has an `impl Default` resolved from the source.
 - `peptidoforms.fixed_mods[].name` (`String`)
 - `peptidoforms.fixed_mods[].residue` (`char`)
 
-2 environment read(s) whose name is not a literal:
+3 environment read(s) whose name is not a literal. Reads with the same function, access and argument share one entry, which gives their number when there is more than one:
 
 - `rust/mumdia/crates/mumdia/src/stages/extract.rs::accumulate_groups: env read via closure of `chunk``
-- `rust/mumdia/crates/mumdia/src/stages/extract.rs::run: env read via closure of `&mut chunk``
+- `rust/mumdia/crates/mumdia/src/stages/extract.rs::run: env read via closure of `&mut chunk`` (2 reads)
 
 ## Coverage
 

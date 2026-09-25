@@ -231,6 +231,30 @@ def test_unbalanced_braces_after_masking_fail_loudly():
     assert reads["MUMDIA_T_AFTER"][0] == ["src/x.rs::b"]
 
 
+def test_repeated_unresolved_reads_are_counted_not_merged():
+    """A second non-literal read in the same function changes the document.
+
+    The entry names the function, not the line, so both reads share it. Printed
+    once without a count, the second read would leave docs/24 and `--check`
+    unchanged, which is the drift the unresolved list exists to show.
+    """
+    config_text = gen.load_inputs().config_text
+
+    def unresolved_section(n_reads):
+        body = "".join("    let _ = std::env::var(name);\n" for _ in range(n_reads))
+        source = f"fn dynamic(name: &str) {{\n{body}}}\n"
+        inputs = gen.Inputs(config_text, [("src/x.rs", source)], [])
+        document, _stats = gen.build_document(inputs)
+        start = document.index("environment read(s) whose name is not a literal")
+        return document[document.rindex("\n", 0, start) + 1 : document.index("## ", start)]
+
+    one, two = unresolved_section(1), unresolved_section(2)
+    assert one.startswith("1 environment read(s)")
+    assert "- `src/x.rs::dynamic: env read of `name``\n" in one
+    assert two.startswith("2 environment read(s)")
+    assert "- `src/x.rs::dynamic: env read of `name`` (2 reads)\n" in two
+
+
 def test_python_reads_are_cited_by_enclosing_def():
     """Each sidecar read is cited by its qualified `def`, or `<module>`.
 

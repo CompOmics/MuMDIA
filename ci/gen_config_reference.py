@@ -54,6 +54,7 @@ import json
 import re
 import subprocess
 import sys
+from collections import Counter
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -1208,8 +1209,8 @@ def scan_rust_env(
     - `role.env_var()`: a `-> &'static str` helper whose body is a match over
       variable-name literals. Its body is brace-matched and harvested.
 
-    Anything that resolves to no literal is returned as unresolved and printed in
-    the document, never dropped.
+    Anything that resolves to no literal is returned as unresolved, one list entry
+    per read, and printed in the document with its count, never dropped.
 
     `sources` holds `(repository-relative path, text)` pairs. Every site is cited
     as `path::fn`, the enclosing function, so the result does not depend on where
@@ -1845,13 +1846,19 @@ def build_document(inputs: Inputs) -> tuple[str, dict[str, object]]:
             a(f"- {entry}")
         a("")
     if env_unresolved:
+        # Counted, not deduplicated. An entry names the function, not the line, so
+        # two reads of the same argument in one function share it; without the
+        # count, a second such read would leave this list, and `--check`, unchanged.
+        counts = Counter(env_unresolved)
         a(
-            f"{len(set(env_unresolved))} environment read(s) whose name is not a "
-            "literal:"
+            f"{len(env_unresolved)} environment read(s) whose name is not a literal. "
+            "Reads with the same function, access and argument share one entry, "
+            "which gives their number when there is more than one:"
         )
         a("")
-        for entry in sorted(set(env_unresolved)):
-            a(f"- `{entry}`")
+        for entry in sorted(counts):
+            n = counts[entry]
+            a(f"- `{entry}`" + (f" ({n} reads)" if n > 1 else ""))
         a("")
 
     # ---- coverage ----------------------------------------------------------
