@@ -125,7 +125,8 @@ formatted threshold, e.g. `targets_at_q0.01`), `model_identity =
 ## How it works
 
 Entry point: `search_seed::run(SearchSeedParams)` (`search_seed.rs:175`), a wrapper
-over `run_returning_scans` (`search_seed.rs:182`).
+over `run_hashed` (`search_seed.rs:181`), itself a wrapper over `run_returning_scans`
+(`search_seed.rs:189`).
 
 **1. Load** the library and MS2 scans (`load_ms2`), then log candidate and scan
 counts. On the fragindex matcher the library is the m/z-only one
@@ -294,7 +295,8 @@ tolerance (falling back to the config value if the file is absent,
 | name | file:line | what it does |
 |---|---|---|
 | `run` | `search_seed.rs:175` | stage entry point; orchestrates load, score, q, masscal, write |
-| `run_returning_scans` | `search_seed.rs:182` | `run`, handing back the MS2 scans it decoded itself (`None` when they were lent), for a caller that lends them on to extract |
+| `run_hashed` | `search_seed.rs:181` | `run`, returning the row count and the report content hash (`mumdia_io::report::Written`) |
+| `run_returning_scans` | `search_seed.rs:189` | `run_hashed`, also handing back the MS2 scans it decoded itself (`None` when they were lent), for a caller that lends them on to extract |
 | `SearchSeedParams` | `search_seed.rs:27` | input struct (`ms2`, `library_precursors`, `library_fragments`, `out` output-path prefix, `cfg`, `bucket_size`, `config_hash`, `fragment_offset`, `ms2_scans`, `emit_calibrants`, `library`) |
 | `SeedLibrary` / `SeedLibrary::load` | `search_seed.rs:92` / `:120` | a seed's library and index, loaded once and lent to every seed of `run-experiment`; records how it was built and is refused by a seed with other settings |
 | `Best` | `search_seed.rs:168` | per-candidate best `{ score, rt, matched, scan_index }` |

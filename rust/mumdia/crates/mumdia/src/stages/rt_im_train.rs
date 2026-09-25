@@ -10,7 +10,7 @@ use std::time::Instant;
 use anyhow::Result;
 use mumdia_core::config::{CalibrationMethod, RtImTrainConfig};
 use mumdia_core::schema::artifact;
-use mumdia_io::report::ArtifactReport;
+use mumdia_io::report::{ArtifactReport, Written};
 use mumdia_io::table::{write_table_chunked, Col, TableFile};
 use serde_json::json;
 use tracing::{info, warn};
@@ -261,17 +261,23 @@ impl RtWindowsBuilder {
 }
 
 pub fn run(p: RtImTrainParams) -> Result<u64> {
-    run_impl(p, false).map(|(rows, _)| rows)
+    run_hashed(p).map(|w| w.rows)
 }
 
-/// [`run`], also returning the fitted windows in the form `extract` consumes, so an
+/// [`run`], returning the output's row count and the content hash its report records, so
+/// an orchestrator can record the artifact without reading and hashing it again.
+pub fn run_hashed(p: RtImTrainParams) -> Result<Written> {
+    run_impl(p, false).map(|(written, _)| written)
+}
+
+/// [`run_hashed`], also returning the fitted windows in the form `extract` consumes, so an
 /// orchestrator can hand them over instead of having `extract` decode the table it just
 /// wrote. `None` only when the table holds a NaN bound (see [`RtWindows`]).
-pub fn run_in_memory(p: RtImTrainParams) -> Result<(u64, Option<RtWindows>)> {
+pub fn run_in_memory(p: RtImTrainParams) -> Result<(Written, Option<RtWindows>)> {
     run_impl(p, true)
 }
 
-fn run_impl(p: RtImTrainParams, keep_windows: bool) -> Result<(u64, Option<RtWindows>)> {
+fn run_impl(p: RtImTrainParams, keep_windows: bool) -> Result<(Written, Option<RtWindows>)> {
     let t0 = Instant::now();
     // `--out` must not be one of this stage's own inputs: every input is read
     // before the output is published, so writing over one replaces it and exits 0
@@ -682,7 +688,7 @@ fn run_impl(p: RtImTrainParams, keep_windows: bool) -> Result<(u64, Option<RtWin
         "candidates_without_finite_irt".to_string(),
         json!(n_nonfinite_irt),
     );
-    ArtifactReport {
+    let report = ArtifactReport {
         logical_name: artifact::RUN_WINDOWS.0.to_string(),
         schema_name: artifact::RUN_WINDOWS.0.to_string(),
         schema_version: artifact::RUN_WINDOWS.1,
@@ -693,8 +699,8 @@ fn run_impl(p: RtImTrainParams, keep_windows: bool) -> Result<(u64, Option<RtWin
         stats,
         model_identity: None,
         elapsed_ms: elapsed,
-    }
-    .write_for(p.out_windows)?;
+    };
+    report.write_for(p.out_windows)?;
 
     if n_nonfinite_irt > 0 {
         tracing::warn!(
@@ -712,7 +718,7 @@ fn run_impl(p: RtImTrainParams, keep_windows: bool) -> Result<(u64, Option<RtWin
         "rt-im-train: done"
     );
     Ok((
-        rows,
+        report.written(),
         kept.and_then(|b| b.finish(p.library_precursors, p.out_windows)),
     ))
 }
@@ -894,8 +900,8 @@ mod tests {
                 config_hash: "test",
                 anchor_irt_from_seed: false,
             };
-            let (rows, kept) = run_in_memory(params()).unwrap();
-            assert_eq!(rows, n as u64);
+            let (written, kept) = run_in_memory(params()).unwrap();
+            assert_eq!(written.rows, n as u64);
             let kept = kept.expect("no NaN bound, so the windows are kept");
             let status: serde_json::Value = mumdia_io::json::read_json(&cal).unwrap();
             assert_eq!(status["calibration_status"], want_status, "{tag}");

@@ -13,7 +13,7 @@ use anyhow::{bail, Result};
 use mumdia_core::config::{FragPredictorKind, PredictFragConfig, RtPredictorKind};
 use mumdia_core::mass::{parse_peptidoform, Fragment, ParsedPeptidoform};
 use mumdia_core::schema::artifact;
-use mumdia_io::report::ArtifactReport;
+use mumdia_io::report::{ArtifactReport, Written};
 use mumdia_io::table::{write_table, Col, TableFile};
 use serde_json::json;
 use tracing::info;
@@ -49,6 +49,13 @@ struct Raw {
 }
 
 pub fn run(p: PredictFragParams) -> Result<(u64, u64)> {
+    run_hashed(p).map(|(prec, frag)| (prec.rows, frag.rows))
+}
+
+/// [`run`], returning each output's row count and the content hash its report records
+/// (precursors, then fragments), so an orchestrator can record both artifacts without
+/// reading and hashing them again.
+pub fn run_hashed(p: PredictFragParams) -> Result<(Written, Written)> {
     let t0 = Instant::now();
     let t = TableFile::open(p.peptidoforms)?;
     let pf_id = t.u32("id")?;
@@ -336,11 +343,12 @@ pub fn run(p: PredictFragParams) -> Result<(u64, u64)> {
         "pairs_dropped_unpredicted".to_string(),
         json!(n_dropped_pairs),
     );
+    let mut written: Vec<Written> = Vec::with_capacity(2);
     for (path, schema) in [
         (p.out_precursors, artifact::FRAGMENT_LIBRARY_PRECURSORS),
         (p.out_fragments, artifact::FRAGMENT_LIBRARY_FRAGMENTS),
     ] {
-        ArtifactReport {
+        let report = ArtifactReport {
             logical_name: schema.0.to_string(),
             schema_name: schema.0.to_string(),
             schema_version: schema.1,
@@ -357,8 +365,9 @@ pub fn run(p: PredictFragParams) -> Result<(u64, u64)> {
             stats: stats.clone(),
             model_identity: Some(model_identity.clone()),
             elapsed_ms: elapsed,
-        }
-        .write_for(path)?;
+        };
+        report.write_for(path)?;
+        written.push(report.written());
     }
 
     info!(
@@ -367,7 +376,9 @@ pub fn run(p: PredictFragParams) -> Result<(u64, u64)> {
         elapsed_ms = elapsed,
         "predict-frag: done"
     );
-    Ok((n_prec, n_frag))
+    let frag = written.pop().expect("two reports written");
+    let prec = written.pop().expect("two reports written");
+    Ok((prec, frag))
 }
 
 /// Assign predicted iRT to every candidate. Returns the model id and the indices of the

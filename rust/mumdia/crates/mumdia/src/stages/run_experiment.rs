@@ -396,7 +396,7 @@ fn chain_after_seed(
         config_hash: ch,
     })?;
     let feats = d("features.parquet");
-    features::run(features::FeaturesParams {
+    let features_written = features::run_hashed(features::FeaturesParams {
         psms: &psms,
         chromatograms: &chrom,
         seed: Some(seed),
@@ -411,6 +411,7 @@ fn chain_after_seed(
         out: &competed,
         cfg: &cfg.compete,
         config_hash: ch,
+        features_hash: Some(&features_written.content_hash),
     })?;
     Ok((competed, chrom, produced_rt_lib))
 }
@@ -920,7 +921,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
 
     // --- one experiment-wide rescore over all competed tables ---
     let scored_combined = d("scored_combined.parquet");
-    rescore::run(rescore::RescoreParams {
+    let scored_written = rescore::run_hashed(rescore::RescoreParams {
         competed: &competed,
         out: &scored_combined,
         work_dir: &d("sidecar_work"),
@@ -1029,10 +1030,13 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
     qcfg.q_filter = QuantQColumn::PsmQ;
     let mut peptide_quants: Vec<String> = Vec::with_capacity(n_runs);
     let mut protein_quants: Vec<String> = Vec::with_capacity(n_runs);
+    // Each run's quant hashes its two tables for their reports; the manifest below reuses
+    // those hashes instead of reading the tables again.
+    let mut quant_written: Vec<quant::QuantWritten> = Vec::with_capacity(n_runs);
     for i in 0..n_runs {
         let pq = d(&format!("{}/peptide_quant.parquet", names[i]));
         let gq = d(&format!("{}/protein_group_quant.parquet", names[i]));
-        quant::run(quant::QuantParams {
+        let written = quant::run_hashed(quant::QuantParams {
             psms_scored: &split_paths[i],
             chromatograms: &chroms[i],
             out_peptide: &pq,
@@ -1044,6 +1048,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         })?;
         peptide_quants.push(pq);
         protein_quants.push(gq);
+        quant_written.push(written);
     }
     let lfq = d("lfq_maxlfq.parquet");
     let n_lfq = quant::run_lfq_combine(
@@ -1161,14 +1166,18 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
     );
     prov.model_identities
         .insert("mbr".into(), format!("{:?}", cfg.mbr.strategy));
-    // Recorded in a fixed order, and every record hashes its file. `Manifest`
-    // stores them in a BTreeMap, so the serialised order is by logical name and
-    // does not depend on this sequence.
-    let mut artifacts: Vec<(String, (&str, u32), String, &str)> = vec![(
+    // Recorded in a fixed order. `Manifest` stores them in a BTreeMap, so the serialised
+    // order is by logical name and does not depend on this sequence. The last field is the
+    // content hash when the producing stage already computed it for its own report (rescore,
+    // quant); the others (the MBR worker's table, the by-source split) are hashed here.
+    // (logical name, schema, path, producing stage, content hash when already known)
+    type Recorded<'s> = (String, (&'s str, u32), String, &'s str, Option<String>);
+    let mut artifacts: Vec<Recorded> = vec![(
         "scored_combined".to_string(),
         artifact::PSMS_SCORED,
         scored_combined.clone(),
         "rescore",
+        Some(scored_written.content_hash.clone()),
     )];
     // Only when MBR actually produced a different table; otherwise
     // `scored_for_quant` IS `scored_combined` and recording it twice would claim two
@@ -1179,6 +1188,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
             artifact::PSMS_SCORED,
             scored_for_quant.clone(),
             "mbr",
+            None,
         ));
     }
     for (i, name) in names.iter().enumerate() {
@@ -1187,26 +1197,32 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
             artifact::PSMS_SCORED,
             split_paths[i].clone(),
             "split-by-source",
+            None,
         ));
         artifacts.push((
             format!("peptide_quant[{name}]"),
             artifact::PEPTIDE_QUANT,
             peptide_quants[i].clone(),
             "quant",
+            Some(quant_written[i].peptide.content_hash.clone()),
         ));
         artifacts.push((
             format!("protein_group_quant[{name}]"),
             artifact::PROTEIN_GROUP_QUANT,
             protein_quants[i].clone(),
             "quant",
+            Some(quant_written[i].protein.content_hash.clone()),
         ));
     }
-    for (logical, schema, path, stage) in artifacts {
+    for (logical, schema, path, stage, known_hash) in artifacts {
         let rows = mumdia_io::table::nrows(&path)
             .with_context(|| format!("counting rows of {path} for the experiment manifest"))?;
-        prov.record(mumdia_io::record_artifact(
-            &logical, schema, &path, rows, stage, &ch,
-        )?);
+        prov.record(match known_hash {
+            Some(hash) => mumdia_io::record_artifact_with_hash(
+                &logical, schema, &path, rows, stage, &ch, hash,
+            ),
+            None => mumdia_io::record_artifact(&logical, schema, &path, rows, stage, &ch)?,
+        });
     }
     prov.record(mumdia_io::record_artifact(
         artifact::LFQ_MAXLFQ.0,
