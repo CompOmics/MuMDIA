@@ -2338,7 +2338,7 @@ impl Config {
         }
         if !(1..=2).contains(&self.extract.chromatogram_schema) {
             return Err(Invalid(format!(
-                "extract.chromatogram_schema must be 1 (full traces) or 2 (the axis once per \r
+                "extract.chromatogram_schema must be 1 (full traces) or 2 (the axis once per \
                  candidate and trimmed traces), not {}",
                 self.extract.chromatogram_schema
             )));
@@ -3222,6 +3222,29 @@ mod tests {
             assert!(Config::from_json(ok).is_ok(), "{ok} must be accepted");
         }
         assert!(Config::default().validate().is_ok());
+    }
+
+    #[test]
+    fn chromatogram_schema_accepts_one_and_two_and_names_the_rejected_value_on_one_line() {
+        for ok in [1u32, 2] {
+            let json = format!(r#"{{"extract":{{"chromatogram_schema":{ok}}}}}"#);
+            assert!(Config::from_json(&json).is_ok(), "{json} must be accepted");
+        }
+        for bad in [0u32, 3] {
+            let mut cfg = Config::default();
+            cfg.extract.chromatogram_schema = bad;
+            let msg = cfg.validate().expect_err("must be rejected").to_string();
+            assert!(
+                msg.contains("extract.chromatogram_schema") && msg.contains(&format!("not {bad}")),
+                "{msg}"
+            );
+            // A string continuation must drop the line break and the indentation: no
+            // control characters and no run of spaces inside the sentence.
+            assert!(
+                !msg.contains('\r') && !msg.contains('\n') && !msg.contains("  "),
+                "{msg:?}"
+            );
+        }
     }
 
     #[test]
