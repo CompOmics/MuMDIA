@@ -629,6 +629,18 @@ but do not affect the wired `mumdia mbr` path.
   (`run_experiment.rs:490-497`) and then ignored; no artifact records the
   substitution. Per-run quantities out of `run-experiment` are therefore gated on
   the pooled `q_value`, not on `run_psm_q` and not on the configured column.
+- **How the per-run split tables are written.** A run's rows are contiguous in the
+  pooled scored table (rescore appends each competed table in input order, and MBR
+  keeps the order), so every row group whose `source` statistics hold one run is
+  spliced into that run's `<run>/scored.parquet` as bytes, and only the boundary
+  groups, at most `n_runs - 1` of them, are decoded, filtered and re-encoded
+  (`split_by_source`). The per-run tables hold the same rows in the same order with
+  the same values as the re-encoded split that was the only path before, so quant and
+  the report are unchanged. Their bytes are not: a spliced group keeps the scored
+  table's 1,048,576-row groups, so the content hashes `experiment_manifest.json`
+  records for `scored[<run>]` differ from an earlier release's; they are computed
+  while the tables are written. A table whose `source` column is nullable (the MBR
+  worker's pyarrow output) is re-encoded as before, in 131,072-row groups.
 - **`run-experiment` produces no TSV report.** `report::run` is called only from
   `run.rs:484` and the `mumdia report` handler (`main.rs:798`), so an experiment
   output tree has scored, per-run split, quant, and LFQ artifacts but no

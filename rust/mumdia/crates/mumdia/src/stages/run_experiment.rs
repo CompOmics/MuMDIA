@@ -22,6 +22,7 @@ use arrow::compute::filter_record_batch;
 use mumdia_core::config::{Config, QuantQColumn, RtLibraryScope};
 use mumdia_core::manifest::Manifest;
 use mumdia_core::schema::artifact;
+use mumdia_io::table::Written;
 use rayon::prelude::*;
 use serde_json::json;
 use tracing::{info, warn};
@@ -483,25 +484,216 @@ fn finish_run(
 }
 
 /// Split an experiment-wide scored table into per-run tables by the `source`
-/// column (0..n-1), preserving the schema exactly (arrow row filter). Quant then
-/// runs per run with `q_filter = psm_q`, keeping each run's own confident PSMs.
-fn split_by_source(scored: &str, out_paths: &[String]) -> Result<()> {
-    // One streaming pass: every output has its writer open, each input batch is filtered
-    // once per run and appended, so the resident set is one batch rather than the whole
-    // experiment-wide scored table that the old read-then-filter held in full.
+/// column (0..n-1), preserving the schema and the rows exactly. Quant then runs per run
+/// with `q_filter = psm_q`, keeping each run's own confident PSMs. Returns each run's table
+/// with its content hash, computed while it was written.
+///
+/// The rows of one run are contiguous: rescore appends each competed table's rows in input
+/// order and stamps `source` with the input's index, the top-K collapse keeps that order,
+/// and MBR's round trip preserves it. So every row group except at most `n_runs - 1`
+/// boundary groups holds one source, and its statistics say so (`min == max`). Those
+/// groups are spliced into their run's table as bytes (`SpliceWriter`), and only the
+/// boundary groups are decoded, filtered and re-encoded. Decoding and re-encoding all of
+/// it, which this did before, is one thread's work over every row of every column: an
+/// estimated 3.5-7 min on the 258.75M-row immunopeptidomics pool, against a copy at disk
+/// speed.
+///
+/// The per-run tables hold the same rows, in the same order, with the same values either
+/// way, so quant and the report read the same data. Their bytes differ from a re-encoded
+/// split: a spliced group keeps the scored table's own layout (1,048,576-row groups), so
+/// the content hashes the experiment manifest records for them change. The re-encoding
+/// path remains for a table the splice cannot take: one whose `source` is nullable or has
+/// no statistics (the MBR worker's pyarrow output), or whose re-encoded boundary rows the
+/// splice refuses.
+fn split_by_source(scored: &str, out_paths: &[String]) -> Result<Vec<Written>> {
     let t = mumdia_io::table::TableFile::open(scored)?;
     let src_idx = t
         .schema
         .index_of("source")
         .map_err(|_| anyhow::anyhow!("scored table has no `source` column for split"))?;
-    // Row groups capped as the rescore handoff caps them. The scored table is ~390 float
-    // columns wide, so parquet's default 1,048,576-row group is about 3 GB decoded, and
-    // every reader of these per-run tables (quant, report) then pays that in one allocation.
-    // Only the row-group boundaries change; the rows, their order and their values do not.
+    if t.schema.field(src_idx).data_type() != &arrow::datatypes::DataType::UInt32 {
+        anyhow::bail!("`source` column is not u32");
+    }
+    let spliced = if t.schema.field(src_idx).is_nullable() {
+        None
+    } else {
+        match split_spliced(&t, scored, out_paths) {
+            Ok(done) => done,
+            Err(e) => {
+                warn!(
+                    error = %format!("{e:#}"),
+                    "run-experiment: splicing the scored table by source failed; re-encoding \
+                     every row instead"
+                );
+                None
+            }
+        }
+    };
+    let (written_tables, written) = match spliced {
+        Some(done) => done,
+        None => split_rewritten(&t, src_idx, out_paths)?,
+    };
+    // The split is a partition, so it must account for every input row. Nothing
+    // enforced that: a `source` value outside `0..out_paths.len()` -- which a
+    // hand-assembled or externally rescored table can carry, and which the MBR
+    // worker could reintroduce -- dropped those PSMs into no output at all. Every
+    // downstream number is then computed from a silently smaller population, with
+    // no error and no warning. A count is the whole check.
+    let total: usize = t.nrows;
+    if written != total {
+        anyhow::bail!(
+            "splitting {scored} by `source` placed {written} of {total} rows into \
+             {} per-run tables; the rest carry a source index outside 0..{}, so they \
+             would be dropped from every per-run quantity",
+            out_paths.len(),
+            out_paths.len()
+        );
+    }
+    Ok(written_tables)
+}
+
+/// Rows per row group of a re-encoded per-run table, and of the re-encoded boundary rows
+/// the splice takes. The scored table is 22 columns wide (two more after MBR), about 170
+/// bytes a row decoded, so a group is about 22 MB.
+const SPLIT_ROW_GROUP_ROWS: usize = 1 << 17;
+
+/// The splice form of [`split_by_source`]: `None` when the statistics cannot drive it.
+/// Returns the tables and the rows placed.
+fn split_spliced(
+    t: &mumdia_io::table::TableFile,
+    scored: &str,
+    out_paths: &[String],
+) -> Result<Option<(Vec<Written>, usize)>> {
+    use mumdia_io::table::SpliceWriter;
+    let stats = t.row_group_stats("source")?;
+    let spans = SpliceWriter::row_group_spans(scored)?;
+    if stats.len() != spans.len() {
+        return Ok(None);
+    }
+    let n = out_paths.len();
+    // Per row group, the run whose rows it holds, when its statistics say it holds one
+    // run's rows only. A group whose one source is outside 0..n is left to the boundary
+    // rewrite, which places none of its rows, so the partition check reports them.
+    let single: Vec<Option<usize>> = stats
+        .iter()
+        .map(|s| match (s.min, s.max) {
+            (Some(lo), Some(hi)) if lo == hi && lo >= 0.0 && lo < n as f64 => Some(lo as usize),
+            _ => None,
+        })
+        .collect();
+    let mut writers: Vec<SpliceWriter> = out_paths
+        .iter()
+        .map(|out| SpliceWriter::create_hashed(out, scored))
+        .collect::<Result<_>>()?;
+    let mut written = 0usize;
+    let mut g = 0usize;
+    while g < spans.len() {
+        match single[g] {
+            Some(run) => {
+                // Consecutive groups of this one source, spliced in one call.
+                let start = g;
+                while g < spans.len() && single[g] == Some(run) {
+                    g += 1;
+                }
+                let end = g;
+                written +=
+                    writers[run].append_row_groups(scored, |k| k >= start && k < end)? as usize;
+            }
+            None => {
+                written += rewrite_boundary_group(t, spans[g], out_paths, &mut writers)?;
+                g += 1;
+            }
+        }
+    }
+    let tables = writers
+        .into_iter()
+        .map(SpliceWriter::close_hashed)
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Some((tables, written)))
+}
+
+/// Decode one row group that holds more than one source, and splice each run's rows of it
+/// into that run's table through a temporary file. Returns the rows placed.
+fn rewrite_boundary_group(
+    t: &mumdia_io::table::TableFile,
+    span: (usize, usize),
+    out_paths: &[String],
+    writers: &mut [mumdia_io::table::SpliceWriter],
+) -> Result<usize> {
+    let (first_row, n_rows) = span;
+    let part = t.span(first_row, n_rows)?;
+    let src_idx = part
+        .schema
+        .index_of("source")
+        .map_err(|_| anyhow::anyhow!("scored table has no `source` column for split"))?;
+    // One temporary table per run with rows in this group, created with its first row.
+    let mut temps: Vec<Option<(String, mumdia_io::table::BatchWriter)>> =
+        (0..out_paths.len()).map(|_| None).collect();
+    let mut placed = 0usize;
+    part.for_each_batch(None, 1 << 14, |b| {
+        let src = b
+            .column(src_idx)
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .ok_or_else(|| anyhow::anyhow!("`source` column is not u32"))?;
+        for (i, slot) in temps.iter_mut().enumerate() {
+            let mask: BooleanArray = (0..src.len()).map(|k| src.value(k) == i as u32).collect();
+            let filtered = filter_record_batch(b, &mask)?;
+            if filtered.num_rows() == 0 {
+                continue;
+            }
+            if slot.is_none() {
+                let tmp = format!("{}.split-rg{first_row}.parquet", out_paths[i]);
+                let w = mumdia_io::table::BatchWriter::with_row_group_rows(
+                    &tmp,
+                    part.schema.clone(),
+                    SPLIT_ROW_GROUP_ROWS,
+                )?;
+                *slot = Some((tmp, w));
+            }
+            let (_, w) = slot.as_mut().expect("created above");
+            w.write(&filtered)?;
+            placed += filtered.num_rows();
+        }
+        Ok(())
+    })?;
+    let mut spliced = 0usize;
+    for (i, slot) in temps.into_iter().enumerate() {
+        let Some((tmp, w)) = slot else {
+            continue;
+        };
+        w.close()?;
+        let appended = writers[i].append_row_groups(&tmp, |_| true);
+        std::fs::remove_file(&tmp).ok();
+        spliced += appended? as usize;
+    }
+    if spliced != placed {
+        anyhow::bail!("split: re-encoded {placed} boundary rows but spliced {spliced}");
+    }
+    Ok(placed)
+}
+
+/// The re-encoding form of [`split_by_source`]: one streaming pass, every output with its
+/// writer open, each input batch filtered once per run and appended, so the resident set is
+/// one batch rather than the whole experiment-wide scored table. Returns the tables and the
+/// rows placed.
+fn split_rewritten(
+    t: &mumdia_io::table::TableFile,
+    src_idx: usize,
+    out_paths: &[String],
+) -> Result<(Vec<Written>, usize)> {
+    // Row groups capped at 131,072 rows. Only the row-group boundaries change; the rows,
+    // their order and their values do not.
     let mut writers: Vec<mumdia_io::table::BatchWriter> = out_paths
         .iter()
         .map(|out| {
-            mumdia_io::table::BatchWriter::with_row_group_rows(out, t.schema.clone(), 1 << 17)
+            mumdia_io::table::BatchWriter::with_options(
+                out,
+                t.schema.clone(),
+                mumdia_io::table::WriteOptions::new()
+                    .row_group_rows(SPLIT_ROW_GROUP_ROWS)
+                    .content_hash(),
+            )
         })
         .collect::<Result<_>>()?;
     let mut written = 0usize;
@@ -521,26 +713,11 @@ fn split_by_source(scored: &str, out_paths: &[String]) -> Result<()> {
         }
         Ok(())
     })?;
-    for w in writers {
-        w.close()?;
-    }
-    // The split is a partition, so it must account for every input row. Nothing
-    // enforced that: a `source` value outside `0..out_paths.len()` -- which a
-    // hand-assembled or externally rescored table can carry, and which the MBR
-    // worker could reintroduce -- dropped those PSMs into no output at all. Every
-    // downstream number is then computed from a silently smaller population, with
-    // no error and no warning. A count is the whole check.
-    let total: usize = t.nrows;
-    if written != total {
-        anyhow::bail!(
-            "splitting {scored} by `source` placed {written} of {total} rows into \
-             {} per-run tables; the rest carry a source index outside 0..{}, so they \
-             would be dropped from every per-run quantity",
-            out_paths.len(),
-            out_paths.len()
-        );
-    }
-    Ok(())
+    let tables = writers
+        .into_iter()
+        .map(mumdia_io::table::BatchWriter::close_hashed)
+        .collect::<Result<Vec<_>>>()?;
+    Ok((tables, written))
 }
 
 /// Reject run names that would share a per-run output directory.
@@ -1283,7 +1460,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
     let split_paths: Vec<String> = (0..n_runs)
         .map(|i| d(&format!("{}/scored.parquet", names[i])))
         .collect();
-    split_by_source(&scored_for_quant, &split_paths)?;
+    let split_written = split_by_source(&scored_for_quant, &split_paths)?;
 
     let mut qcfg = cfg.quant.clone();
     // Per-run quant gates on the pooled `q_value`, not on whatever `quant.q_filter` says. The
@@ -1445,8 +1622,9 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         .insert("mbr".into(), format!("{:?}", cfg.mbr.strategy));
     // Recorded in a fixed order. `Manifest` stores them in a BTreeMap, so the serialised
     // order is by logical name and does not depend on this sequence. The last field is the
-    // content hash when the producing stage already computed it for its own report (rescore,
-    // quant); the others (the MBR worker's table, the by-source split) are hashed here.
+    // content hash when the producing stage already computed it (rescore and quant for their
+    // reports, the by-source split while it wrote its tables); the MBR worker's table is
+    // hashed here.
     // (logical name, schema, path, producing stage, content hash when already known)
     type Recorded<'s> = (String, (&'s str, u32), String, &'s str, Option<String>);
     let mut artifacts: Vec<Recorded> = vec![(
@@ -1474,7 +1652,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
             artifact::PSMS_SCORED,
             split_paths[i].clone(),
             "split-by-source",
-            None,
+            Some(split_written[i].content_hash.clone()),
         ));
         artifacts.push((
             format!("peptide_quant[{name}]"),
@@ -1619,6 +1797,99 @@ mod tests {
         )
         .unwrap();
         path
+    }
+
+    /// A scored-like table in row groups of `rg_rows`, with a string and a float column
+    /// beside `source`, so a splice has more than one leaf type to carry.
+    fn scored_in_groups(sources: &[u32], rg_rows: usize) -> String {
+        let n = sources.len();
+        let path = tmp("scored_rg.parquet");
+        let mut w = mumdia_io::table::TableWriter::new(&path).with_row_group_rows(rg_rows);
+        w.write_cols(vec![
+            Col::U32("source".into(), sources.to_vec()),
+            Col::U32("candidate_id".into(), (0..n as u32).collect()),
+            Col::Str(
+                "peptidoform".into(),
+                (0..n).map(|i| format!("PEP{i}K")).collect(),
+            ),
+            Col::F64("q_value".into(), (0..n).map(|i| i as f64 * 0.001).collect()),
+        ])
+        .unwrap();
+        w.close().unwrap();
+        path
+    }
+
+    /// Every row of `path`, as comparable tuples.
+    fn rows_of(path: &str) -> Vec<(u32, u32, String, u64)> {
+        let t = Table::read(path).unwrap();
+        let src = t.u32("source").unwrap();
+        let cid = t.u32("candidate_id").unwrap();
+        let pf = t.str("peptidoform").unwrap();
+        let q = t.f64("q_value").unwrap();
+        (0..t.nrows)
+            .map(|i| (src[i], cid[i], pf[i].clone(), q[i].to_bits()))
+            .collect()
+    }
+
+    #[test]
+    fn the_spliced_split_holds_the_rewritten_splits_rows() {
+        // Runs of 0, 1 and 2 in row groups of 4: groups 0-1 are run 0 only, group 2 holds
+        // the 0/1 boundary, group 3 is run 1 only, group 4 holds the 1/2 boundary, the rest
+        // is run 2. Run 3 has no rows.
+        let mut sources = vec![0u32; 10];
+        sources.extend(vec![1u32; 7]);
+        sources.extend(vec![2u32; 9]);
+        let scored = scored_in_groups(&sources, 4);
+        let spliced: Vec<String> = (0..4).map(|i| tmp(&format!("sp{i}.parquet"))).collect();
+        let written = split_by_source(&scored, &spliced).unwrap();
+        let t = mumdia_io::table::TableFile::open(&scored).unwrap();
+        let rewritten: Vec<String> = (0..4).map(|i| tmp(&format!("rw{i}.parquet"))).collect();
+        let (_, placed) =
+            split_rewritten(&t, t.schema.index_of("source").unwrap(), &rewritten).unwrap();
+        assert_eq!(placed, sources.len());
+        for i in 0..4 {
+            assert_eq!(rows_of(&spliced[i]), rows_of(&rewritten[i]), "run {i}");
+            // The hash is the file's, computed while it was written.
+            assert_eq!(
+                written[i].content_hash,
+                mumdia_io::hash::blake3_file(&spliced[i]).unwrap(),
+                "run {i}"
+            );
+            assert_eq!(written[i].rows as usize, rows_of(&spliced[i]).len());
+        }
+        // The single-source groups were spliced, not re-encoded: run 0's table keeps the
+        // input's two whole groups of 4 and then its 2 boundary rows.
+        let groups = |p: &str| {
+            mumdia_io::table::SpliceWriter::row_group_spans(p)
+                .unwrap()
+                .iter()
+                .map(|s| s.1)
+                .collect::<Vec<usize>>()
+        };
+        assert_eq!(groups(&spliced[0]), vec![4, 4, 2]);
+        assert_eq!(groups(&spliced[1]), vec![2, 4, 1]);
+        assert_eq!(groups(&spliced[2]), vec![3, 4, 2]);
+        assert!(groups(&spliced[3]).is_empty());
+        // No temporary boundary file is left behind.
+        for o in &spliced {
+            let dir = std::path::Path::new(o).parent().unwrap();
+            for e in std::fs::read_dir(dir).unwrap() {
+                let name = e.unwrap().file_name().to_string_lossy().into_owned();
+                assert!(!name.contains(".split-rg"), "{name}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_whole_row_group_of_an_unknown_source_is_still_an_error() {
+        // A group whose statistics say one source, outside 0..n, is spliced nowhere: the
+        // partition check must still report the rows it did not place.
+        let mut sources = vec![0u32; 4];
+        sources.extend(vec![5u32; 4]);
+        let scored = scored_in_groups(&sources, 4);
+        let outs: Vec<String> = (0..2).map(|i| tmp(&format!("bad{i}.parquet"))).collect();
+        let err = split_by_source(&scored, &outs).unwrap_err().to_string();
+        assert!(err.contains("4 of 8 rows"), "{err}");
     }
 
     #[test]

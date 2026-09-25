@@ -649,9 +649,10 @@ The orchestrators therefore take the hash from the stage instead:
   every band artifact was hashed a second time there for a record that was then
   dropped;
 - `run-experiment` reuses the rescore and quant hashes for its experiment
-  manifest. The MBR worker's table, the by-source split, the LFQ matrix, the
-  pooled seed and the DeepLC library tables have no Rust report hash, so they
-  are still hashed by `record_artifact`.
+  manifest, and the by-source split hashes its per-run tables while it writes
+  them. The MBR worker's table, the LFQ matrix, the pooled seed and the DeepLC
+  library tables have no Rust report hash, so they are still hashed by
+  `record_artifact`.
 
 Reusing the stage hashes changes no hash value in `manifest.json`,
 `experiment_manifest.json` or the `*.report.json` files; only the second read
