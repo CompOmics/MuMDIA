@@ -294,7 +294,15 @@ Under `global`, after a per-band re-prediction of the library iRT, the pooled an
 the library's iRT as it was when seeded; `seed_pool::refresh_irt` then copies each anchor's
 new value from its band's table into `seed_psms_calibrated.parquet`, which is what
 `rt-im-train` reads. The RT fit is then identical across bands (same anchors, same model),
-and only the windows differ, because the precursors do.
+and only the windows differ, because the precursors do. So it is fitted once:
+`rt_im_train::fit_from_seed` reads the pooled (or refreshed) seed and fits the curve, the
+window width and the optional held-out and adaptive sizing, and every band only applies that
+fit to its own table (`rt_im_train::apply`), writing its `run_windows.parquet` and a
+`cal.json` identical to the one it wrote when it fitted for itself
+(`one_fit_applied_writes_what_the_whole_stage_writes`). Before, each band decoded the pooled
+seed and refitted the same curve, one seed decode and one fit per band on the band loop's
+critical path; the log now shows one `stage=rt-fit` line per run. `per_group` fits per band,
+as before.
 
 Refitting per band is sound because the multi-head ridge and the base-model re-prediction
 are deterministic in their anchors: the same pooled anchors give the same head selection,

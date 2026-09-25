@@ -542,6 +542,23 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
     } else {
         None
     };
+    // Under global calibration every band fits the same pooled anchors with their iRT read
+    // from the seed, so the retention-time fit is a property of the run: fitted here once,
+    // and each band only applies it to its own table (docs/33 section 4). Before, each band
+    // decoded the pooled seed and refitted the same curve. `per_group` fits per band.
+    let shared_rt_fit = if global {
+        let anchors = anchors_for_windows.as_deref().unwrap_or(&pooled_seed);
+        info!(stage = %"rt-fit", anchors = %anchors, "run: stage start");
+        let fit = rt_im_train::fit_from_seed(anchors, &cfg.rt_im_train)?;
+        info!(
+            n_train = fit.n_train(),
+            bands = bands.len(),
+            "groups: retention-time calibration fitted once for every band"
+        );
+        Some(fit)
+    } else {
+        None
+    };
 
     // --- windows, extract, features, compete per band
     let mut arts: Vec<pool::BandArtifacts> = Vec::new();
@@ -586,21 +603,30 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
             let mut recs: Vec<mumdia_core::manifest::ArtifactRecord> = Vec::new();
             let windows = gd(b.index, "run_windows.parquet");
             let cal = gd(b.index, "cal.json");
-            let (seed_for_windows, from_seed) = match (&anchors_for_windows, global) {
-                (Some(refreshed), _) => (refreshed.clone(), true),
-                (None, true) => (pooled_seed.clone(), true),
-                (None, false) => (b.seed.clone(), false),
-            };
             info!(stage = %"rt-im-train", group = b.index, "run: stage start");
-            let rows = rt_im_train::run(rt_im_train::RtImTrainParams {
-                seed_psms: &seed_for_windows,
-                library_precursors: &b.prec,
-                out_windows: &windows,
-                out_cal: &cal,
-                cfg: &cfg.rt_im_train,
-                config_hash: ch,
-                anchor_irt_from_seed: from_seed,
-            })?;
+            let rows = match &shared_rt_fit {
+                // Global: the run's one fit, applied to this band's table.
+                Some(fit) => rt_im_train::apply(
+                    fit,
+                    &rt_im_train::ApplyParams {
+                        library_precursors: &b.prec,
+                        out_windows: &windows,
+                        out_cal: &cal,
+                        cfg: &cfg.rt_im_train,
+                        config_hash: ch,
+                    },
+                )?,
+                // Per group: this band's own anchors, iRT joined from its own table.
+                None => rt_im_train::run(rt_im_train::RtImTrainParams {
+                    seed_psms: &b.seed,
+                    library_precursors: &b.prec,
+                    out_windows: &windows,
+                    out_cal: &cal,
+                    cfg: &cfg.rt_im_train,
+                    config_hash: ch,
+                    anchor_irt_from_seed: false,
+                })?,
+            };
             recs.push(record_artifact(
                 &format!("{}[g{:02}]", artifact::RUN_WINDOWS.0, b.index),
                 artifact::RUN_WINDOWS,

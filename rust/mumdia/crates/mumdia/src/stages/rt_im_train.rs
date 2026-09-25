@@ -103,61 +103,162 @@ fn candidate_window(calibrated_rt: Option<f64>, width: Option<f64>) -> (f64, f64
     }
 }
 
-pub fn run(p: RtImTrainParams) -> Result<u64> {
-    let t0 = Instant::now();
-    // `--out` must not be one of this stage's own inputs: every input is read
-    // before the output is published, so writing over one replaces it and exits 0
-    // (docs/31 F6). The shared guard existed and was wired into two stages.
-    mumdia_io::refuse_output_over_input(
-        p.out_windows,
-        &[
-            ("--seed-psms", p.seed_psms),
-            ("--lib-precursors", p.library_precursors),
-        ],
-    )?;
-    mumdia_io::refuse_output_over_input(
-        p.out_cal,
-        &[
-            ("--seed-psms", p.seed_psms),
-            ("--lib-precursors", p.library_precursors),
-        ],
-    )?;
+/// A fitted retention-time calibration: everything the anchors determine, which
+/// [`apply`] then maps over a library table.
+///
+/// Under `groups.calibration = global` every band of a grouped run fits the same pooled
+/// anchors with their iRT read from the seed (`anchor_irt_from_seed`), so the fit depends on
+/// the seed and the configuration only, never on the band's library. `run_groups` therefore
+/// fits once per run ([`fit_from_seed`]) and applies the one fit to every band, which is
+/// what each band computed for itself before: one seed decode and one fit per band
+/// (docs/33 section 4).
+pub struct RtFit {
+    n_train: usize,
+    calibration_available: bool,
+    slope: f64,
+    intercept: f64,
+    use_loess: bool,
+    loess: Option<Loess>,
+    w_rt: Option<f64>,
+    status: String,
+    holdout_frac: f64,
+    holdout_sizing: Option<HoldoutSizing>,
+    adaptive: Option<(f64, f64, Vec<f64>)>,
+    /// Signed median, absolute median and MAD of the in-sample residuals (seconds).
+    residuals: (f64, f64, f64),
+}
 
-    let holdout_frac = p.cfg.window_holdout_frac;
+impl RtFit {
+    fn predict(&self, irt: f64) -> f64 {
+        if !self.calibration_available {
+            return f64::NAN;
+        }
+        match &self.loess {
+            Some(l) => l.predict(irt),
+            None => self.slope * irt + self.intercept,
+        }
+    }
+
+    /// Anchors the fit was made on.
+    pub fn n_train(&self) -> usize {
+        self.n_train
+    }
+}
+
+/// What [`apply`] writes: the windows of one library table and its `cal.json`.
+pub struct ApplyParams<'a> {
+    pub library_precursors: &'a str,
+    pub out_windows: &'a str,
+    pub out_cal: &'a str,
+    pub cfg: &'a RtImTrainConfig,
+    pub config_hash: &'a str,
+}
+
+fn check_cfg(cfg: &RtImTrainConfig) -> Result<()> {
+    let holdout_frac = cfg.window_holdout_frac;
     if !(0.0..=0.9).contains(&holdout_frac) {
         anyhow::bail!(
             "rt_im_train.window_holdout_frac must be in [0.0, 0.9], got {holdout_frac}; \
              0.0 disables held-out window sizing"
         );
     }
-    if holdout_frac > 0.0 && p.cfg.adaptive_rt_window {
+    if holdout_frac > 0.0 && cfg.adaptive_rt_window {
         anyhow::bail!(
             "rt_im_train.window_holdout_frac and rt_im_train.adaptive_rt_window are mutually \
              exclusive: the adaptive per-bin percentiles are in-sample and would silently undo \
              the held-out sizing; disable one of them"
         );
     }
+    Ok(())
+}
+
+pub fn run(p: RtImTrainParams) -> Result<u64> {
+    let t0 = Instant::now();
+    // `--out` must not be one of this stage's own inputs: every input is read
+    // before the output is published, so writing over one replaces it and exits 0
+    // (docs/31 F6). The shared guard existed and was wired into two stages.
+    for out in [p.out_windows, p.out_cal] {
+        mumdia_io::refuse_output_over_input(
+            out,
+            &[
+                ("--seed-psms", p.seed_psms),
+                ("--lib-precursors", p.library_precursors),
+            ],
+        )?;
+    }
+    check_cfg(p.cfg)?;
 
     // Library predicted iRT, keyed by candidate_id (single source of truth, so
     // a patched/updated library iRT is used for both training and application).
     let lib = TableFile::open(p.library_precursors)?;
     let lib_cid = lib.u32("candidate_id")?;
     let lib_irt = lib.f32("predicted_irt")?;
-    let mut irt_by_cid: HashMap<u32, f64> = HashMap::with_capacity(lib.nrows);
-    for i in 0..lib.nrows {
-        irt_by_cid.insert(lib_cid[i], lib_irt[i] as f64);
-    }
+    // The join map is built only when the anchors take their iRT from the library; with
+    // `anchor_irt_from_seed` nothing reads it.
+    let irt_by_cid: Option<HashMap<u32, f64>> = (!p.anchor_irt_from_seed).then(|| {
+        let mut m: HashMap<u32, f64> = HashMap::with_capacity(lib.nrows);
+        for i in 0..lib.nrows {
+            m.insert(lib_cid[i], lib_irt[i] as f64);
+        }
+        m
+    });
+    let fit = fit_anchors(p.seed_psms, p.cfg, irt_by_cid.as_ref())?;
+    drop(irt_by_cid);
+    write_windows(
+        &fit,
+        &ApplyParams {
+            library_precursors: p.library_precursors,
+            out_windows: p.out_windows,
+            out_cal: p.out_cal,
+            cfg: p.cfg,
+            config_hash: p.config_hash,
+        },
+        lib_cid,
+        lib_irt,
+        t0,
+    )
+}
 
+/// Fit the calibration on a seed table whose own `predicted_irt` column carries the anchors'
+/// iRT (`RtImTrainParams::anchor_irt_from_seed`): the fit a grouped run's bands share under
+/// `groups.calibration = global`. No library is read.
+pub fn fit_from_seed(seed_psms: &str, cfg: &RtImTrainConfig) -> Result<RtFit> {
+    check_cfg(cfg)?;
+    fit_anchors(seed_psms, cfg, None)
+}
+
+/// Write the windows of `p.library_precursors` and its `cal.json` from a fit made by
+/// [`fit_from_seed`]. With the fit [`run`] would have made and the same table, this writes
+/// what [`run`] writes, byte for byte (the report's `elapsed_ms` aside).
+pub fn apply(fit: &RtFit, p: &ApplyParams) -> Result<u64> {
+    let t0 = Instant::now();
+    for out in [p.out_windows, p.out_cal] {
+        mumdia_io::refuse_output_over_input(out, &[("--lib-precursors", p.library_precursors)])?;
+    }
+    let lib = TableFile::open(p.library_precursors)?;
+    let lib_cid = lib.u32("candidate_id")?;
+    let lib_irt = lib.f32("predicted_irt")?;
+    write_windows(fit, p, lib_cid, lib_irt, t0)
+}
+
+/// The anchors and the fit. `irt_by_cid` joins each anchor's iRT from the library; `None`
+/// reads it from the seed's own `predicted_irt` column.
+fn fit_anchors(
+    seed_psms: &str,
+    cfg: &RtImTrainConfig,
+    irt_by_cid: Option<&HashMap<u32, f64>>,
+) -> Result<RtFit> {
+    let holdout_frac = cfg.window_holdout_frac;
     // Training rows: confident seed PSMs, one apex (best score) per peptide;
     // predicted iRT is joined from the library by candidate_id.
-    let seed = TableFile::open(p.seed_psms)?;
+    let seed = TableFile::open(seed_psms)?;
     let s_cid = seed.u32("candidate_id")?;
     let s_base = seed.u32("base_peptide_id")?;
     let s_q = seed.f64("spectrum_q")?;
     let s_score = seed.f64("score")?;
     let s_rt = seed.f64("observed_rt")?;
     let s_label = seed.str("label")?;
-    let s_irt: Option<Vec<f32>> = if p.anchor_irt_from_seed {
+    let s_irt: Option<Vec<f32>> = if irt_by_cid.is_none() {
         Some(seed.f32("predicted_irt")?)
     } else {
         None
@@ -168,7 +269,7 @@ pub fn run(p: RtImTrainParams) -> Result<u64> {
         if !s_q[i].is_finite()
             || !s_score[i].is_finite()
             || !s_rt[i].is_finite()
-            || s_q[i] >= p.cfg.q_train
+            || s_q[i] >= cfg.q_train
         {
             continue;
         }
@@ -177,19 +278,20 @@ pub fn run(p: RtImTrainParams) -> Result<u64> {
         if s_label[i] != "target" {
             continue;
         }
-        let irt = match &s_irt {
-            Some(col) => {
+        let irt = match (&s_irt, irt_by_cid) {
+            (Some(col), _) => {
                 let v = col[i] as f64;
                 if !v.is_finite() {
                     continue;
                 }
                 v
             }
-            None => match irt_by_cid.get(&s_cid[i]) {
+            (None, Some(map)) => match map.get(&s_cid[i]) {
                 Some(v) if v.is_finite() => *v,
                 None => continue,
                 Some(_) => continue,
             },
+            (None, None) => unreachable!("the seed column is read when there is no join map"),
         };
         let e = best_per_pep
             .entry(s_base[i])
@@ -211,22 +313,27 @@ pub fn run(p: RtImTrainParams) -> Result<u64> {
         (f64::NAN, f64::NAN)
     };
     let use_loess = calibration_available
-        && matches!(p.cfg.calibration_method, CalibrationMethod::Loess)
-        && n_train >= p.cfg.min_seed_for_calibration;
+        && matches!(cfg.calibration_method, CalibrationMethod::Loess)
+        && n_train >= cfg.min_seed_for_calibration;
     let loess = if use_loess {
-        Some(Loess::fit(&train_irt, &train_rt, p.cfg.loess_span, 200))
+        Some(Loess::fit(&train_irt, &train_rt, cfg.loess_span, 200))
     } else {
         None
     };
 
-    let predict = |irt: f64| -> f64 {
-        if !calibration_available {
-            return f64::NAN;
-        }
-        match &loess {
-            Some(l) => l.predict(irt),
-            None => slope * irt + intercept,
-        }
+    let mut fit = RtFit {
+        n_train,
+        calibration_available,
+        slope,
+        intercept,
+        use_loess,
+        loess,
+        w_rt: None,
+        status: String::new(),
+        holdout_frac,
+        holdout_sizing: None,
+        adaptive: None,
+        residuals: (f64::NAN, f64::NAN, f64::NAN),
     };
 
     // Residuals and RT window. Require enough anchors before trusting the
@@ -234,8 +341,8 @@ pub fn run(p: RtImTrainParams) -> Result<u64> {
     // passes ~exactly through them, so residuals ~0 and the window collapses to
     // the 1s floor (which then discards nearly every true co-elution). Below the
     // threshold, use the configured fixed fallback instead.
-    let min_anchors = p.cfg.min_seed_for_calibration.max(2);
-    let plan = window_plan(n_train, min_anchors, p.cfg.fallback_rt_window_s);
+    let min_anchors = cfg.min_seed_for_calibration.max(2);
+    let plan = window_plan(n_train, min_anchors, cfg.fallback_rt_window_s);
 
     // Held-out window sizing (`window_holdout_frac > 0`): fit the sizing curve on
     // the non-held-out anchors only and take the residual percentile of the
@@ -247,61 +354,60 @@ pub fn run(p: RtImTrainParams) -> Result<u64> {
     // curve applied to the library still uses every anchor; only the width is
     // sized out-of-sample, which is slightly conservative (the all-anchor curve
     // is marginally better than the sizing curve).
-    let holdout_sizing: Option<HoldoutSizing> = if holdout_frac > 0.0
-        && plan == WindowPlan::Calibrated
-    {
-        let (mut tr_x, mut tr_y, mut ho_x, mut ho_y) =
-            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-        for k in 0..n_train {
-            if is_holdout(anchor_ids[k], holdout_frac) {
-                ho_x.push(train_irt[k]);
-                ho_y.push(train_rt[k]);
-            } else {
-                tr_x.push(train_irt[k]);
-                tr_y.push(train_rt[k]);
-            }
-        }
-        if ho_x.len() < MIN_HOLDOUT_ANCHORS || tr_x.len() < min_anchors {
-            warn!(
-                n_holdout = ho_x.len(),
-                n_sizing_train = tr_x.len(),
-                min_holdout = MIN_HOLDOUT_ANCHORS,
-                min_anchors,
-                "rt-im-train: too few anchors on one side of the holdout split; \
-                 falling back to in-sample window sizing"
-            );
-            None
-        } else {
-            // Same method selection as the main fit, refit on the sizing subset.
-            let sizing_loess = use_loess.then(|| Loess::fit(&tr_x, &tr_y, p.cfg.loess_span, 200));
-            let (s_slope, s_intercept) = if sizing_loess.is_none() {
-                linear_fit(&tr_x, &tr_y)
-            } else {
-                (f64::NAN, f64::NAN)
-            };
-            let sizing_predict = |x: f64| -> f64 {
-                match &sizing_loess {
-                    Some(l) => l.predict(x),
-                    None => s_slope * x + s_intercept,
+    let holdout_sizing: Option<HoldoutSizing> =
+        if holdout_frac > 0.0 && plan == WindowPlan::Calibrated {
+            let (mut tr_x, mut tr_y, mut ho_x, mut ho_y) =
+                (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+            for k in 0..n_train {
+                if is_holdout(anchor_ids[k], holdout_frac) {
+                    ho_x.push(train_irt[k]);
+                    ho_y.push(train_rt[k]);
+                } else {
+                    tr_x.push(train_irt[k]);
+                    tr_y.push(train_rt[k]);
                 }
-            };
-            let resid: Vec<f64> = ho_x
-                .iter()
-                .zip(&ho_y)
-                .map(|(x, y)| (y - sizing_predict(*x)).abs())
-                .collect();
-            let p_rt_s = percentile(&resid, p.cfg.p_rt);
-            Some(HoldoutSizing {
-                width: (p_rt_s * p.cfg.rt_window_multiplier).max(1.0),
-                n_sizing_train: tr_x.len(),
-                n_holdout: ho_x.len(),
-                resid_p_rt_s: p_rt_s,
-                resid_abs_median_s: percentile(&resid, 0.5),
-            })
-        }
-    } else {
-        None
-    };
+            }
+            if ho_x.len() < MIN_HOLDOUT_ANCHORS || tr_x.len() < min_anchors {
+                warn!(
+                    n_holdout = ho_x.len(),
+                    n_sizing_train = tr_x.len(),
+                    min_holdout = MIN_HOLDOUT_ANCHORS,
+                    min_anchors,
+                    "rt-im-train: too few anchors on one side of the holdout split; \
+                 falling back to in-sample window sizing"
+                );
+                None
+            } else {
+                // Same method selection as the main fit, refit on the sizing subset.
+                let sizing_loess = use_loess.then(|| Loess::fit(&tr_x, &tr_y, cfg.loess_span, 200));
+                let (s_slope, s_intercept) = if sizing_loess.is_none() {
+                    linear_fit(&tr_x, &tr_y)
+                } else {
+                    (f64::NAN, f64::NAN)
+                };
+                let sizing_predict = |x: f64| -> f64 {
+                    match &sizing_loess {
+                        Some(l) => l.predict(x),
+                        None => s_slope * x + s_intercept,
+                    }
+                };
+                let resid: Vec<f64> = ho_x
+                    .iter()
+                    .zip(&ho_y)
+                    .map(|(x, y)| (y - sizing_predict(*x)).abs())
+                    .collect();
+                let p_rt_s = percentile(&resid, cfg.p_rt);
+                Some(HoldoutSizing {
+                    width: (p_rt_s * cfg.rt_window_multiplier).max(1.0),
+                    n_sizing_train: tr_x.len(),
+                    n_holdout: ho_x.len(),
+                    resid_p_rt_s: p_rt_s,
+                    resid_abs_median_s: percentile(&resid, 0.5),
+                })
+            }
+        } else {
+            None
+        };
 
     let (w_rt, status): (Option<f64>, String) = match plan {
         WindowPlan::Unbounded => {
@@ -326,9 +432,9 @@ pub fn run(p: RtImTrainParams) -> Result<u64> {
                     let resid: Vec<f64> = train_irt
                         .iter()
                         .zip(&train_rt)
-                        .map(|(x, y)| (y - predict(*x)).abs())
+                        .map(|(x, y)| (y - fit.predict(*x)).abs())
                         .collect();
-                    (percentile(&resid, p.cfg.p_rt) * p.cfg.rt_window_multiplier).max(1.0)
+                    (percentile(&resid, cfg.p_rt) * cfg.rt_window_multiplier).max(1.0)
                 }
             };
             let status = if use_loess { "loess" } else { "linear" };
@@ -340,49 +446,84 @@ pub fn run(p: RtImTrainParams) -> Result<u64> {
     // calibrated-RT bin, so well-calibrated regions get a tight window (less
     // interference) and poorly-calibrated regions a wider one (more recall).
     // `None` keeps the single global `w_rt`. Empty bins fall back to `w_rt`.
-    let adaptive: Option<(f64, f64, Vec<f64>)> =
-        if p.cfg.adaptive_rt_window && n_train >= min_anchors {
-            let cals: Vec<f64> = train_irt.iter().map(|x| predict(*x)).collect();
-            let resid: Vec<f64> = cals
-                .iter()
-                .zip(&train_rt)
-                .map(|(c, y)| (y - c).abs())
-                .collect();
-            let rt_min = cals.iter().cloned().fold(f64::INFINITY, f64::min);
-            let rt_max = cals.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-            let nb = p.cfg.adaptive_rt_bins.max(1);
-            if rt_max > rt_min {
-                let span = rt_max - rt_min;
-                let mut per_bin: Vec<Vec<f64>> = vec![Vec::new(); nb];
-                for (c, r) in cals.iter().zip(&resid) {
-                    let frac = ((c - rt_min) / span).clamp(0.0, 0.999_999);
-                    per_bin[(frac * nb as f64) as usize].push(*r);
-                }
-                let lo_clamp = p.cfg.rt_window_min_s.max(0.0);
-                let hi_clamp = p.cfg.fallback_rt_window_s.max(lo_clamp);
-                let widths: Vec<f64> = per_bin
-                    .iter()
-                    .map(|rs| {
-                        if rs.is_empty() {
-                            w_rt.expect("adaptive RT windows require a calibrated global width")
-                        } else {
-                            (percentile(rs, p.cfg.p_rt) * p.cfg.rt_window_multiplier)
-                                .clamp(lo_clamp, hi_clamp)
-                        }
-                    })
-                    .collect();
-                Some((rt_min, span, widths))
-            } else {
-                None
+    let adaptive: Option<(f64, f64, Vec<f64>)> = if cfg.adaptive_rt_window && n_train >= min_anchors
+    {
+        let cals: Vec<f64> = train_irt.iter().map(|x| fit.predict(*x)).collect();
+        let resid: Vec<f64> = cals
+            .iter()
+            .zip(&train_rt)
+            .map(|(c, y)| (y - c).abs())
+            .collect();
+        let rt_min = cals.iter().cloned().fold(f64::INFINITY, f64::min);
+        let rt_max = cals.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let nb = cfg.adaptive_rt_bins.max(1);
+        if rt_max > rt_min {
+            let span = rt_max - rt_min;
+            let mut per_bin: Vec<Vec<f64>> = vec![Vec::new(); nb];
+            for (c, r) in cals.iter().zip(&resid) {
+                let frac = ((c - rt_min) / span).clamp(0.0, 0.999_999);
+                per_bin[(frac * nb as f64) as usize].push(*r);
             }
+            let lo_clamp = cfg.rt_window_min_s.max(0.0);
+            let hi_clamp = cfg.fallback_rt_window_s.max(lo_clamp);
+            let widths: Vec<f64> = per_bin
+                .iter()
+                .map(|rs| {
+                    if rs.is_empty() {
+                        w_rt.expect("adaptive RT windows require a calibrated global width")
+                    } else {
+                        (percentile(rs, cfg.p_rt) * cfg.rt_window_multiplier)
+                            .clamp(lo_clamp, hi_clamp)
+                    }
+                })
+                .collect();
+            Some((rt_min, span, widths))
         } else {
             None
-        };
+        }
+    } else {
+        None
+    };
 
+    // RT calibration-quality residuals over the training anchors (seconds):
+    // signed median = residual bias, absolute median = typical accuracy, MAD =
+    // spread. Diagnostic only (the RT window already derives from these
+    // residuals); surfaced so a run's RT calibration can be judged good or biased.
+    let residuals = if calibration_available {
+        let signed: Vec<f64> = train_irt
+            .iter()
+            .zip(&train_rt)
+            .map(|(x, y)| y - fit.predict(*x))
+            .collect();
+        let med = percentile(&signed, 0.5);
+        let absres: Vec<f64> = signed.iter().map(|r| r.abs()).collect();
+        let mad: Vec<f64> = signed.iter().map(|r| (r - med).abs()).collect();
+        (med, percentile(&absres, 0.5), percentile(&mad, 0.5))
+    } else {
+        (f64::NAN, f64::NAN, f64::NAN)
+    };
+
+    fit.w_rt = w_rt;
+    fit.status = status;
+    fit.holdout_sizing = holdout_sizing;
+    fit.adaptive = adaptive;
+    fit.residuals = residuals;
+    Ok(fit)
+}
+
+/// Apply `fit` to every row of one library table and write the windows, the `cal.json` and
+/// the windows' report.
+fn write_windows(
+    fit: &RtFit,
+    p: &ApplyParams,
+    lib_cid: Vec<u32>,
+    lib_irt: Vec<f32>,
+    t0: Instant,
+) -> Result<u64> {
     // Apply to every library candidate.
     let cid = lib_cid;
     let irt = lib_irt;
-    let n = lib.nrows;
+    let n = cid.len();
     let (mut cid_c, mut cal_c, mut lo_c, mut hi_c) = (
         Vec::with_capacity(n),
         Vec::with_capacity(n),
@@ -404,14 +545,17 @@ pub fn run(p: RtImTrainParams) -> Result<u64> {
         if !usable_irt {
             n_nonfinite_irt += 1;
         }
-        let calibrated_rt = (calibration_available && usable_irt).then(|| predict(irt[i] as f64));
-        let width = calibrated_rt.map(|cal| match &adaptive {
+        let calibrated_rt =
+            (fit.calibration_available && usable_irt).then(|| fit.predict(irt[i] as f64));
+        let width = calibrated_rt.map(|cal| match &fit.adaptive {
             Some((rt_min, span, widths)) => {
                 let nb = widths.len();
                 let frac = ((cal - rt_min) / span).clamp(0.0, 0.999_999);
                 widths[(frac * nb as f64) as usize]
             }
-            None => w_rt.expect("available RT calibration requires a bounded window"),
+            None => fit
+                .w_rt
+                .expect("available RT calibration requires a bounded window"),
         });
         let (cal, lo, hi) = candidate_window(calibrated_rt, width);
         cid_c.push(cid[i]);
@@ -436,34 +580,21 @@ pub fn run(p: RtImTrainParams) -> Result<u64> {
         ],
     )?;
 
-    let method = if !calibration_available {
+    let method = if !fit.calibration_available {
         "unavailable"
-    } else if use_loess {
+    } else if fit.use_loess {
         "loess"
     } else {
         "linear"
     };
-    let slope_report = calibration_available.then_some(slope);
-    let intercept_report = calibration_available.then_some(intercept);
-
-    // RT calibration-quality residuals over the training anchors (seconds):
-    // signed median = residual bias, absolute median = typical accuracy, MAD =
-    // spread. Diagnostic only (the RT window already derives from these
-    // residuals); surfaced so a run's RT calibration can be judged good or biased.
-    let (rt_residual_median_s, rt_residual_abs_median_s, rt_residual_mad_s) =
-        if calibration_available {
-            let signed: Vec<f64> = train_irt
-                .iter()
-                .zip(&train_rt)
-                .map(|(x, y)| y - predict(*x))
-                .collect();
-            let med = percentile(&signed, 0.5);
-            let absres: Vec<f64> = signed.iter().map(|r| r.abs()).collect();
-            let mad: Vec<f64> = signed.iter().map(|r| (r - med).abs()).collect();
-            (med, percentile(&absres, 0.5), percentile(&mad, 0.5))
-        } else {
-            (f64::NAN, f64::NAN, f64::NAN)
-        };
+    let slope_report = fit.calibration_available.then_some(fit.slope);
+    let intercept_report = fit.calibration_available.then_some(fit.intercept);
+    let (rt_residual_median_s, rt_residual_abs_median_s, rt_residual_mad_s) = fit.residuals;
+    let holdout_sizing = &fit.holdout_sizing;
+    let holdout_frac = fit.holdout_frac;
+    let w_rt = fit.w_rt;
+    let status = fit.status.as_str();
+    let n_train = fit.n_train;
 
     // cal.json
     mumdia_io::json::write_json(
@@ -481,7 +612,7 @@ pub fn run(p: RtImTrainParams) -> Result<u64> {
             // residuals; "holdout_fallback_in_sample" means it was requested but
             // an anchor-count guard fell back; "in_sample" is the historical
             // behavior. The holdout_* fields are null unless sizing ran held-out.
-            "w_rt_sizing": match (&holdout_sizing, holdout_frac > 0.0) {
+            "w_rt_sizing": match (holdout_sizing, holdout_frac > 0.0) {
                 (Some(_), _) => "holdout",
                 (None, true) => "holdout_fallback_in_sample",
                 (None, false) => "in_sample",
@@ -525,7 +656,9 @@ pub fn run(p: RtImTrainParams) -> Result<u64> {
         tracing::warn!(
             candidates = n_nonfinite_irt,
             of = rows,
-            "rt-im-train: these candidates have no finite library iRT, so they get the              unbounded RT window rather than a calibrated one; a null predicted_irt reads              as NaN (docs/31 F4)"
+            "rt-im-train: these candidates have no finite library iRT, so they get the \
+             unbounded RT window rather than a calibrated one; a null predicted_irt reads \
+             as NaN (docs/31 F4)"
         );
     }
     info!(
@@ -604,5 +737,122 @@ mod tests {
             candidate_window(Some(300.0), Some(120.0)),
             (300.0, 180.0, 420.0)
         );
+    }
+
+    /// A seed of `n` confident target anchors (plus a decoy and an unconfident row, which
+    /// the fit must skip) and a library of `n + 5` rows, both with iRT columns.
+    fn anchors_and_library(dir: &std::path::Path, n: usize) -> (String, String) {
+        let seed = dir.join("seed.parquet").to_str().unwrap().to_string();
+        let lib = dir.join("lib.parquet").to_str().unwrap().to_string();
+        let m = n + 2;
+        let irt: Vec<f32> = (0..m).map(|i| (i as f32) * 0.7 + 3.0).collect();
+        let rt: Vec<f64> = (0..m)
+            .map(|i| 100.0 + 12.0 * (i as f64 * 0.7 + 3.0) + ((i * 37 % 11) as f64 - 5.0) * 4.0)
+            .collect();
+        let mut label = vec!["target".to_string(); m];
+        label[n] = "decoy".to_string();
+        let mut q = vec![0.001; m];
+        q[n + 1] = 0.5;
+        write_table(
+            &seed,
+            vec![
+                Col::U32("candidate_id".into(), (0..m as u32).collect()),
+                Col::U32("base_peptide_id".into(), (0..m as u32).collect()),
+                Col::F64("spectrum_q".into(), q),
+                Col::F64("score".into(), (0..m).map(|i| 10.0 + i as f64).collect()),
+                Col::F64("observed_rt".into(), rt),
+                Col::Str("label".into(), label),
+                Col::F32("predicted_irt".into(), irt),
+            ],
+        )
+        .unwrap();
+        write_table(
+            &lib,
+            vec![
+                Col::U32("candidate_id".into(), (0..(n + 5) as u32).collect()),
+                Col::F32(
+                    "predicted_irt".into(),
+                    (0..n + 5)
+                        .map(|i| if i == 3 { f32::NAN } else { i as f32 * 0.9 })
+                        .collect(),
+                ),
+            ],
+        )
+        .unwrap();
+        (seed, lib)
+    }
+
+    #[test]
+    fn one_fit_applied_writes_what_the_whole_stage_writes() {
+        // The grouped path fits once per run and applies the fit to every band; each band
+        // used to run the whole stage. Same windows bytes and the same cal.json, under the
+        // default, the held-out sizing, the adaptive window and a linear fit, and for too
+        // few anchors.
+        let dir = std::env::temp_dir().join(format!("mumdia_rt_fit_apply_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let holdout = RtImTrainConfig {
+            window_holdout_frac: 0.3,
+            ..Default::default()
+        };
+        let adaptive = RtImTrainConfig {
+            adaptive_rt_window: true,
+            ..Default::default()
+        };
+        let linear = RtImTrainConfig {
+            calibration_method: CalibrationMethod::Linear,
+            ..Default::default()
+        };
+        for (tag, cfg, n) in [
+            ("default", RtImTrainConfig::default(), 400usize),
+            ("holdout", holdout, 400),
+            ("adaptive", adaptive, 400),
+            ("linear", linear, 400),
+            ("few", RtImTrainConfig::default(), 20),
+            ("one", RtImTrainConfig::default(), 1),
+        ] {
+            let sub = dir.join(tag);
+            std::fs::create_dir_all(&sub).unwrap();
+            let (seed, lib) = anchors_and_library(&sub, n);
+            let out = |name: &str| sub.join(name).to_str().unwrap().to_string();
+            run(RtImTrainParams {
+                seed_psms: &seed,
+                library_precursors: &lib,
+                out_windows: &out("w_run.parquet"),
+                out_cal: &out("cal_run.json"),
+                cfg: &cfg,
+                config_hash: "h",
+                anchor_irt_from_seed: true,
+            })
+            .unwrap();
+            let fit = fit_from_seed(&seed, &cfg).unwrap();
+            apply(
+                &fit,
+                &ApplyParams {
+                    library_precursors: &lib,
+                    out_windows: &out("w_apply.parquet"),
+                    out_cal: &out("cal_apply.json"),
+                    cfg: &cfg,
+                    config_hash: "h",
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                std::fs::read(out("w_run.parquet")).unwrap(),
+                std::fs::read(out("w_apply.parquet")).unwrap(),
+                "{tag}: the windows differ"
+            );
+            assert_eq!(
+                std::fs::read(out("cal_run.json")).unwrap(),
+                std::fs::read(out("cal_apply.json")).unwrap(),
+                "{tag}: cal.json differs"
+            );
+            assert_eq!(
+                fit.n_train(),
+                n,
+                "{tag}: the decoy and the unconfident row are not anchors"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
