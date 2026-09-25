@@ -2078,6 +2078,85 @@ enum BoundsSource {
     Given(Option<(f64, f64)>),
 }
 
+/// Where the chunked pass spends its time (perf survey P0), so the next optimisation can
+/// be sized from a log line instead of from a cost model.
+///
+/// The pass is a three-stage pipeline -- loader thread(s) decoding chromatogram chunks,
+/// the calling thread computing and assembling the features of one chunk, a writer thread
+/// encoding the previous chunk's columns -- and its wall time is set by whichever stage is
+/// busiest. Each stage records its BUSY time and the time it spent BLOCKED on a
+/// neighbour, so the binding stage is the one that is busy while the others wait on it: a
+/// pass whose `wait_for_loader_ms` is large and whose `loader_blocked_ms` is small is
+/// decode-bound, and one whose `loader_blocked_ms` and `writer_idle_ms` are both large
+/// while `compute_ms` dominates is compute-bound. Busy time is summed over threads, so
+/// with several loaders it can exceed the wall time.
+///
+/// Relaxed atomics: the counters are read once, after every thread has been joined.
+/// Nothing here feeds a value, a file or a hash; the only output is the log line.
+#[derive(Default)]
+struct PassTimers {
+    /// Loader threads decoding and storing chunks, summed over loaders.
+    loader_busy_ns: std::sync::atomic::AtomicU64,
+    /// Loader threads holding a decoded chunk the computation has not taken yet.
+    loader_blocked_ns: std::sync::atomic::AtomicU64,
+    /// The computation waiting for the next chunk to be decoded.
+    wait_loader_ns: std::sync::atomic::AtomicU64,
+    /// The parallel per-PSM kernels (`fragment_features`, `build_evidence`, families).
+    compute_ns: std::sync::atomic::AtomicU64,
+    /// The serial assembly of the value matrix, the PIN and the output columns.
+    assemble_ns: std::sync::atomic::AtomicU64,
+    /// The computation waiting for the writer to take the finished columns.
+    wait_writer_ns: std::sync::atomic::AtomicU64,
+    /// The writer encoding columns (and closing the file).
+    writer_busy_ns: std::sync::atomic::AtomicU64,
+    /// The writer waiting for the next chunk's columns.
+    writer_idle_ns: std::sync::atomic::AtomicU64,
+}
+
+impl PassTimers {
+    fn add(&self, slot: &std::sync::atomic::AtomicU64, since: Instant) {
+        let ns = u64::try_from(since.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        slot.fetch_add(ns, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn ms(slot: &std::sync::atomic::AtomicU64) -> u64 {
+        slot.load(std::sync::atomic::Ordering::Relaxed) / 1_000_000
+    }
+
+    /// The stage that was busiest per thread: the loaders' busy time is shared across
+    /// `loaders` threads, the computation's and the writer's belong to one thread each.
+    fn binding(&self, loaders: usize) -> &'static str {
+        let loader = Self::ms(&self.loader_busy_ns) / loaders.max(1) as u64;
+        let compute = Self::ms(&self.compute_ns) + Self::ms(&self.assemble_ns);
+        let writer = Self::ms(&self.writer_busy_ns);
+        if loader >= compute && loader >= writer {
+            "loader"
+        } else if writer >= compute {
+            "writer"
+        } else {
+            "compute"
+        }
+    }
+
+    fn log(&self, wall: std::time::Duration, loaders: usize, chunks: usize) {
+        info!(
+            wall_ms = u64::try_from(wall.as_millis()).unwrap_or(u64::MAX),
+            chunks,
+            loaders,
+            loader_busy_ms = Self::ms(&self.loader_busy_ns),
+            loader_blocked_ms = Self::ms(&self.loader_blocked_ns),
+            wait_for_loader_ms = Self::ms(&self.wait_loader_ns),
+            compute_ms = Self::ms(&self.compute_ns),
+            assemble_ms = Self::ms(&self.assemble_ns),
+            wait_for_writer_ms = Self::ms(&self.wait_writer_ns),
+            writer_busy_ms = Self::ms(&self.writer_busy_ns),
+            writer_idle_ms = Self::ms(&self.writer_idle_ns),
+            binding = self.binding(loaders),
+            "features: pass timers"
+        );
+    }
+}
+
 fn run_chunked(
     p: FeaturesParams,
     chunk_rows: usize,
@@ -2336,6 +2415,8 @@ fn run_chunked(
     // exactly what the serial code saw at that point.
     let chunk_rows: Vec<usize> = chunks.iter().map(|c| c.chrom_rows).collect();
     let ch_ref = &ch;
+    let timers = PassTimers::default();
+    let pass_start = Instant::now();
     let rows = std::thread::scope(|sc| -> Result<u64> {
         // A RENDEZVOUS channel, not a one-deep buffer. `sync_channel(1)` let the loader
         // finish a chunk, park it in the buffer and start a third, so three chunks of
@@ -2361,12 +2442,20 @@ fn run_chunked(
         // over the previous good one, where the old in-line write simply returned before
         // `close` and let `AtomicPath` remove its temp file.
         let (wtx, wrx) = std::sync::mpsc::sync_channel::<Option<Vec<Col>>>(0);
+        let timers_w = &timers;
         let wh = sc.spawn(move || -> Result<u64> {
             let mut writer = writer;
             let mut commit = false;
-            for msg in wrx {
+            loop {
+                let idle = Instant::now();
+                let Ok(msg) = wrx.recv() else { break };
+                timers_w.add(&timers_w.writer_idle_ns, idle);
                 match msg {
-                    Some(cols) => writer.write_cols(cols)?,
+                    Some(cols) => {
+                        let busy = Instant::now();
+                        writer.write_cols(cols)?;
+                        timers_w.add(&timers_w.writer_busy_ns, busy);
+                    }
                     None => {
                         commit = true;
                         break;
@@ -2381,9 +2470,14 @@ fn run_chunked(
                      the features table was not written"
                 ));
             }
-            writer.close()
+            let busy = Instant::now();
+            let rows = writer.close();
+            timers_w.add(&timers_w.writer_busy_ns, busy);
+            rows
         });
+        let timers_l = &timers;
         sc.spawn(move || {
+            let busy = Instant::now();
             let mut stream = match ChromStream::open(ch_ref) {
                 Ok(s) => s,
                 Err(e) => {
@@ -2391,18 +2485,25 @@ fn run_chunked(
                     return;
                 }
             };
+            timers_l.add(&timers_l.loader_busy_ns, busy);
             let mut names = NameTab::default();
             for want in chunk_rows {
+                let busy = Instant::now();
                 let r = stream
                     .read_chunk(want, &mut names)
                     .map(|store| (store, names.clone()));
+                timers_l.add(&timers_l.loader_busy_ns, busy);
                 let failed = r.is_err();
-                if tx.send(r).is_err() || failed {
+                let blocked = Instant::now();
+                let sent = tx.send(r).is_ok();
+                timers_l.add(&timers_l.loader_blocked_ns, blocked);
+                if !sent || failed {
                     return;
                 }
             }
         });
         for chunk in &chunks {
+            let waited = Instant::now();
             let (store, names) = rx.recv().map_err(|_| {
                 anyhow!(
                     "features: the chromatogram loader stopped before chunk {}..{}",
@@ -2410,6 +2511,7 @@ fn run_chunked(
                     chunk.psm_hi
                 )
             })??;
+            timers.add(&timers.wait_loader_ns, waited);
             let (lo, hi) = (chunk.psm_lo, chunk.psm_hi);
             let rows_in_chunk = hi - lo;
             let (fb, mb) = store.payload_bytes();
@@ -2489,6 +2591,7 @@ fn run_chunked(
                 ff
             };
 
+            let computing = Instant::now();
             let mut frag_feats: Vec<FragFeatures> = vec![FragFeatures::default(); rows_in_chunk];
             let mut ext_vals: Vec<f64> = vec![0.0; rows_in_chunk * n_ext];
             if n_ext > 0 {
@@ -2503,7 +2606,9 @@ fn run_chunked(
                     .enumerate()
                     .for_each(|(r, ff)| *ff = per_psm(lo + r, &mut []));
             }
+            timers.add(&timers.compute_ns, computing);
 
+            let assembling = Instant::now();
             let mut m = ValueMatrix::new(cols_active.len(), rows_in_chunk);
             let mut prelim = vec![0.0f64; rows_in_chunk];
             let mut elu_lo = vec![0.0f64; rows_in_chunk];
@@ -2645,12 +2750,16 @@ fn run_chunked(
                 cols.push(Col::F64(name.clone(), m.take_column(c)));
             }
             drop(m);
+            timers.add(&timers.assemble_ns, assembling);
             // The parquet encode is single-threaded and ran here, between one chunk's
             // computation and the next chunk's: the writer thread below takes it off the
             // critical path, the way the loader thread took the decode off it. The
             // channel is a rendezvous, so at most one chunk's columns wait behind the
             // one being written.
-            if wtx.send(Some(cols)).is_err() {
+            let handing = Instant::now();
+            let sent = wtx.send(Some(cols)).is_ok();
+            timers.add(&timers.wait_writer_ns, handing);
+            if !sent {
                 // The writer failed; its error is the real one, so surface that.
                 break;
             }
@@ -2677,6 +2786,7 @@ fn run_chunked(
         wh.join()
             .map_err(|_| anyhow!("features: the parquet writer thread panicked"))?
     })?;
+    timers.log(pass_start.elapsed(), 1, chunks.len());
 
     crate::memlog::report(
         "features chromatogram store",
