@@ -6458,10 +6458,16 @@ mod tests {
         // so the multi-chunk loader is on the path too.
         //
         // PER PLATFORM for the reason `extended_features_match_the_pre_permutation_build`
-        // gives (the platform libm). REGENERATING: re-derive at the last commit whose
-        // values are trusted, never from the build under test.
+        // gives (the platform libm). Both values were captured at b346ca5, which is main
+        // 6887c41 plus this test and nothing else: Windows with the MSVC toolchain, Linux on
+        // Ubuntu 24.04 (glibc 2.39, the ubuntu-latest CI image), where the older golden's
+        // Linux digest reproduced in the same run. A platform with no entry prints its
+        // digest and passes. REGENERATING: re-derive at the last commit whose values are
+        // trusted, never from the build under test.
         const GOLDEN_DIGEST: Option<u64> = if cfg!(target_os = "windows") {
             Some(0x7eaa_3aa3_e1bc_0502)
+        } else if cfg!(target_os = "linux") {
+            Some(0x312c_7b08_b6c5_6400)
         } else {
             None
         };
