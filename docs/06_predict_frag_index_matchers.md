@@ -361,7 +361,22 @@ width `w = ln(1 + delta)`, `inv_w`, `ln_min`, and `n_bins = floor(span * inv_w)
 per-bin occupancy with the `+1` counting-sort offset (`fragindex.rs:83-86`); a
 prefix sum turns counts into CSR start offsets (`fragindex.rs:88-90`); pass 2
 scatters postings in candidate-id order (`fragindex.rs:98-110`) so `post_cand` is
-ascending within every bin. Postings are Structure-of-Arrays
+ascending within every bin.
+
+The build runs in parallel and its arrays are bit-identical to that serial counting
+sort (kept as `FragIndex::build_serial` under `cfg(test)` and compared array by
+array, including m/z on bin edges and one ULP either side, zero, negative and
+subnormal values, the top bin, NaN and both infinities). The m/z range is a parallel
+min/max over the finite values, which is exact. The fragments are cut into chunks at
+candidate boundaries; pass 1 counts one bin histogram per chunk, and chunk `j`'s
+cursor in bin `b` starts at `bin_start[b]` plus the counts of chunks `0..j` in that
+bin, so the chunks own disjoint slots and follow each other in candidate order within
+every bin. Pass 2 scatters the chunks concurrently into atomic posting arrays with
+relaxed stores (safe Rust; the workspace forbids `unsafe`), which are then converted to
+plain arrays in place. The chunk count is one per thread, capped so a chunk holds at
+least 65,536 postings and the histograms stay under half of one posting array.
+Measured on the AIF library (20.6M postings, 180k bins, 16 threads): 560-660 ms to
+159-210 ms. Postings are Structure-of-Arrays
 (`post_cand`/`post_mz`/`post_int`/`post_frag`) so the verify hot loop decides on
 `post_mz` alone and wants the other three only where a posting verifies.
 

@@ -16,6 +16,18 @@
 use crate::index::Library;
 use crate::matchers::binning::LogBins;
 use mumdia_core::constants::within_ppm;
+use rayon::prelude::*;
+use std::sync::atomic::{AtomicU16, AtomicU32, Ordering};
+
+/// Postings per chunk below which a build does not bother splitting: each chunk carries a
+/// histogram of every bin, so a chunk must be worth more than its histogram.
+const MIN_CHUNK_POSTINGS: usize = 1 << 16;
+
+/// `n` zeroed atomics, allocated and touched in parallel (the pages are first written here,
+/// so a serial fill would be a serial page-fault pass over the whole posting array).
+fn atomic_u32_zeroed(n: usize) -> Vec<AtomicU32> {
+    (0..n).into_par_iter().map(|_| AtomicU32::new(0)).collect()
+}
 
 /// The CSR inverted fragment index. Structure-of-arrays so the verify hot loop
 /// decides on `post_mz` alone and `post_cand`/`post_int`/`post_frag` are wanted only
@@ -44,8 +56,31 @@ pub struct FragIndex {
 impl FragIndex {
     /// Build the CSR index from a loaded library at a fixed tolerance
     /// (docs/06_predict_frag_index_matchers.md, two-pass counting sort).
-    /// Deterministic: candidate-order scatter, no parallel sort, no hashing.
+    ///
+    /// Deterministic and parallel, with arrays bit-identical to the serial counting sort
+    /// ([`FragIndex::build_serial`], kept under `cfg(test)` as the reference):
+    ///
+    /// - the m/z range is a parallel min/max over the finite fragment m/z, which is exact;
+    /// - the fragments are cut into chunks at candidate boundaries (the library is CSR in
+    ///   candidate order, so a chunk is a contiguous run of candidates), and pass 1 counts
+    ///   one bin histogram per chunk, concurrently;
+    /// - chunk `j`'s cursor in bin `b` starts at `bin_start[b]` plus the counts of chunks
+    ///   `0..j` in that bin. Every chunk therefore owns disjoint slots, and within a bin
+    ///   the chunks follow each other in candidate order, so `post_cand` is ascending
+    ///   within every bin exactly as the serial candidate-order scatter leaves it;
+    /// - pass 2 scatters every chunk concurrently. Safe Rust: the posting arrays are
+    ///   atomics during the scatter, written with relaxed stores (plain moves on x86 and
+    ///   ARM; every slot is written exactly once, by one chunk), and are turned into plain
+    ///   arrays in place afterwards. Binning calls the same [`LogBins::bin`] as the serial
+    ///   build, so m/z on a bin edge, below the range, above it (the top bin) and NaN
+    ///   (bin 0) land where they always did.
     pub fn build(lib: &Library, tol_ppm: f64) -> FragIndex {
+        Self::build_chunked(lib, tol_ppm, None)
+    }
+
+    /// [`FragIndex::build`] with an explicit chunk count (tests drive many chunks over a
+    /// small library through this); `None` picks it.
+    fn build_chunked(lib: &Library, tol_ppm: f64, n_chunks: Option<usize>) -> FragIndex {
         let t0 = std::time::Instant::now();
         let n_cand = lib.n_candidates();
         // Precondition (docs/06_predict_frag_index_matchers.md): candidate_id is dense
@@ -54,10 +89,139 @@ impl FragIndex {
         // construction (and `Library::from_candidates` asserts it for a hand-built one).
         let total = lib.frag_mz.len();
         assert!(total <= u32::MAX as usize, "total_frags exceeds u32");
+        // Every fragment belongs to exactly one candidate, in candidate order: the
+        // chunking below cuts the fragment array at candidate boundaries.
+        assert_eq!(
+            lib.frag_offsets.last().copied().unwrap_or(0) as usize,
+            total,
+            "the library's fragment offsets must tile its fragment arrays"
+        );
+        let bins = Self::geometry(lib, tol_ppm);
+        let n_bins = bins.n_bins;
 
+        // Chunks: contiguous candidate runs of about equal posting counts. The result does
+        // not depend on the count. What the count costs is one histogram of every bin per
+        // chunk, so the automatic choice is one chunk per thread, capped so that no chunk
+        // is under `MIN_CHUNK_POSTINGS` postings and the histograms together stay under
+        // half of one posting array (a tight tolerance has many bins: ~400k at 7.5 ppm).
+        let n_chunks = n_chunks
+            .unwrap_or_else(|| {
+                rayon::current_num_threads()
+                    .min(total / MIN_CHUNK_POSTINGS)
+                    .min(total / (2 * n_bins).max(1))
+            })
+            .clamp(1, n_cand.max(1));
+        let mut bounds: Vec<usize> = (0..=n_chunks)
+            .map(|j| {
+                let target = (total as u64 * j as u64 / n_chunks as u64) as u32;
+                lib.frag_offsets
+                    .partition_point(|&o| o < target)
+                    .min(n_cand)
+            })
+            .collect();
+        bounds[0] = 0;
+        bounds[n_chunks] = n_cand;
+        bounds.dedup();
+        let chunks: Vec<(usize, usize)> = bounds.windows(2).map(|w| (w[0], w[1])).collect();
+
+        // Pass 1: per-chunk bin occupancy. Bin each posting by the SAME f32-rounded m/z
+        // that the verify uses (post_mz is f32), so the +/-1 probe's one-bin-width proof
+        // holds exactly for the stored value and a boundary-straddling within-tol pair is
+        // never missed. Binning by the raw f64 while verifying the f32 could place the
+        // posting two bins from the peak.
+        let mut cursors: Vec<Vec<u32>> = chunks
+            .par_iter()
+            .map(|&(c0, c1)| {
+                let mut h = vec![0u32; n_bins];
+                let (a, z) = (lib.frag_offsets[c0] as usize, lib.frag_offsets[c1] as usize);
+                for &mz in &lib.frag_mz[a..z] {
+                    h[bins.bin(mz as f64)] += 1;
+                }
+                h
+            })
+            .collect();
+        // Per-bin totals -> CSR start offsets, then each chunk's histogram becomes its
+        // starting cursor in every bin: the bin's start plus the earlier chunks' counts.
+        let mut bin_start = vec![0u32; n_bins + 1];
+        for b in 0..n_bins {
+            let n: u32 = cursors.iter().map(|h| h[b]).sum();
+            bin_start[b + 1] = bin_start[b] + n;
+        }
+        for b in 0..n_bins {
+            let mut run = bin_start[b];
+            for h in cursors.iter_mut() {
+                let n = h[b];
+                h[b] = run;
+                run += n;
+            }
+        }
+
+        // Pass 2: scatter every chunk in candidate order into its own slots.
+        let post_cand: Vec<AtomicU32> = atomic_u32_zeroed(total);
+        let post_mz: Vec<AtomicU32> = atomic_u32_zeroed(total);
+        let post_int: Vec<AtomicU32> = atomic_u32_zeroed(total);
+        let post_frag: Vec<AtomicU16> = (0..total)
+            .into_par_iter()
+            .map(|_| AtomicU16::new(0))
+            .collect();
+        cursors
+            .par_iter_mut()
+            .zip(chunks.par_iter())
+            .for_each(|(cur, &(c0, c1))| {
+                for c in c0..c1 {
+                    for (k, gi) in lib.frag_range(c as u32).enumerate() {
+                        let mz = lib.frag_mz[gi];
+                        let b = bins.bin(mz as f64); // bin by the stored (f32) value
+                        let slot = cur[b] as usize;
+                        cur[b] += 1;
+                        post_cand[slot].store(c as u32, Ordering::Relaxed);
+                        post_mz[slot].store(mz.to_bits(), Ordering::Relaxed);
+                        post_int[slot].store(lib.frag_int[gi].to_bits(), Ordering::Relaxed);
+                        post_frag[slot].store(k as u16, Ordering::Relaxed);
+                    }
+                }
+            });
+        drop(cursors);
+        // In place: an atomic has the size and alignment of its integer, and `f32` those
+        // of `u32`, so each of these collects reuses its allocation
+        // (`the_posting_arrays_are_converted_in_place` pins it).
+        let post_cand: Vec<u32> = post_cand.into_iter().map(AtomicU32::into_inner).collect();
+        let post_mz: Vec<f32> = post_mz
+            .into_iter()
+            .map(|a| f32::from_bits(a.into_inner()))
+            .collect();
+        let post_int: Vec<f32> = post_int
+            .into_iter()
+            .map(|a| f32::from_bits(a.into_inner()))
+            .collect();
+        let post_frag: Vec<u16> = post_frag.into_iter().map(AtomicU16::into_inner).collect();
+
+        tracing::info!(
+            postings = total,
+            bins = n_bins,
+            chunks = chunks.len(),
+            tol_ppm,
+            elapsed_ms = t0.elapsed().as_millis() as u64,
+            "fragindex: built"
+        );
+        FragIndex {
+            bins,
+            bin_start,
+            post_cand,
+            post_mz,
+            post_int,
+            post_frag,
+            prec_mz: lib.prec_mz.clone(),
+            n_cand,
+            tol_ppm,
+        }
+    }
+
+    /// The bin geometry for `lib` at `tol_ppm`: log-space bins over the finite fragment
+    /// m/z range.
+    fn geometry(lib: &Library, tol_ppm: f64) -> LogBins {
         // m/z range from the library fragments (guard > 0), spec geometry in f64.
-        let mut mz_min = f64::INFINITY;
-        let mut mz_max = f64::NEG_INFINITY;
+        //
         // Skip non-finite values rather than letting one of them decide the range. A single
         // +inf fragment m/z used to make `mz_max` infinite, which tripped the fallback
         // below and collapsed the range for the WHOLE library to [1.0, 2.0]: `LogBins`
@@ -66,6 +230,50 @@ impl FragIndex {
         // just an unbounded hang. Library load rejects non-finite m/z now, so this is the
         // second line of defence; dropping the offending value is the right shape either
         // way, because the range is a property of the real fragments.
+        //
+        // A parallel min/max. The minimum and maximum of a set do not depend on the order
+        // they are taken in; the one tie that could (0.0 against -0.0) is clamped to 1.0
+        // by the `max(1.0)` below either way.
+        let (mut mz_min, mut mz_max) = lib
+            .frag_mz
+            .par_iter()
+            .fold(
+                || (f64::INFINITY, f64::NEG_INFINITY),
+                |(lo, hi), &mz| {
+                    let mz = mz as f64;
+                    if !mz.is_finite() {
+                        return (lo, hi);
+                    }
+                    (if mz < lo { mz } else { lo }, if mz > hi { mz } else { hi })
+                },
+            )
+            .reduce(
+                || (f64::INFINITY, f64::NEG_INFINITY),
+                |a, b| {
+                    (
+                        if b.0 < a.0 { b.0 } else { a.0 },
+                        if b.1 > a.1 { b.1 } else { a.1 },
+                    )
+                },
+            );
+        // Reached only when the library has no finite fragment m/z at all (in practice: no
+        // fragments). A placeholder range keeps `LogBins::new` well-defined; `page_search`
+        // early-returns on the resulting empty index.
+        if !mz_min.is_finite() || !mz_max.is_finite() {
+            mz_min = 1.0;
+            mz_max = 2.0;
+        }
+        LogBins::new(tol_ppm, mz_min.max(1.0), mz_max.max(mz_min.max(1.0) + 1e-6))
+    }
+
+    /// The serial two-pass counting sort the parallel [`FragIndex::build`] replaced, kept
+    /// verbatim as the reference its arrays are compared against bit for bit.
+    #[cfg(test)]
+    fn build_serial(lib: &Library, tol_ppm: f64) -> FragIndex {
+        let n_cand = lib.n_candidates();
+        let total = lib.frag_mz.len();
+        let mut mz_min = f64::INFINITY;
+        let mut mz_max = f64::NEG_INFINITY;
         for &mz in &lib.frag_mz {
             let mz = mz as f64;
             if !mz.is_finite() {
@@ -78,31 +286,18 @@ impl FragIndex {
                 mz_max = mz;
             }
         }
-        // Reached only when the library has no finite fragment m/z at all (in practice: no
-        // fragments). A placeholder range keeps `LogBins::new` well-defined; `page_search`
-        // early-returns on the resulting empty index.
         if !mz_min.is_finite() || !mz_max.is_finite() {
             mz_min = 1.0;
             mz_max = 2.0;
         }
         let bins = LogBins::new(tol_ppm, mz_min.max(1.0), mz_max.max(mz_min.max(1.0) + 1e-6));
-
-        // pass 1: per-bin occupancy (+1 offset for the counting-sort idiom).
-        // Bin each posting by the SAME f32-rounded m/z that the verify uses
-        // (post_mz is f32), so the +/-1 probe's one-bin-width proof holds exactly
-        // for the stored value and a boundary-straddling within-tol pair is never
-        // missed. Binning by the raw f64 while verifying the f32 could place the
-        // posting two bins from the peak.
         let mut bin_start = vec![0u32; bins.n_bins + 1];
         for &mz in &lib.frag_mz {
             bin_start[bins.bin(mz as f64) + 1] += 1;
         }
-        // prefix sum -> CSR start offsets.
         for b in 0..bins.n_bins {
             bin_start[b + 1] += bin_start[b];
         }
-
-        // pass 2: scatter, in candidate-id order so within-bin post_cand is ascending.
         let mut post_cand = vec![0u32; total];
         let mut post_mz = vec![0f32; total];
         let mut post_int = vec![0f32; total];
@@ -111,7 +306,7 @@ impl FragIndex {
         for c in 0..n_cand {
             for (k, gi) in lib.frag_range(c as u32).enumerate() {
                 let mz = lib.frag_mz[gi];
-                let b = bins.bin(mz as f64); // bin by the stored (f32) value
+                let b = bins.bin(mz as f64);
                 let slot = cursor[b] as usize;
                 post_cand[slot] = c as u32;
                 post_mz[slot] = mz;
@@ -120,14 +315,6 @@ impl FragIndex {
                 cursor[b] += 1;
             }
         }
-
-        tracing::info!(
-            postings = total,
-            bins = bins.n_bins,
-            tol_ppm,
-            elapsed_ms = t0.elapsed().as_millis() as u64,
-            "fragindex: built"
-        );
         FragIndex {
             bins,
             bin_start,
@@ -830,6 +1017,150 @@ mod tests {
                 best.1 / n_post as f64
             );
         }
+    }
+
+    /// Every array of a parallel build equals the serial build's, bit for bit.
+    fn assert_same_index(a: &FragIndex, b: &FragIndex, what: &str) {
+        assert_eq!(
+            format!("{:?}", a.bins),
+            format!("{:?}", b.bins),
+            "{what}: geometry"
+        );
+        assert_eq!(a.bin_start, b.bin_start, "{what}: bin_start");
+        assert_eq!(a.post_cand, b.post_cand, "{what}: post_cand");
+        let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        assert_eq!(bits(&a.post_mz), bits(&b.post_mz), "{what}: post_mz");
+        assert_eq!(bits(&a.post_int), bits(&b.post_int), "{what}: post_int");
+        assert_eq!(a.post_frag, b.post_frag, "{what}: post_frag");
+        assert_eq!(a.prec_mz, b.prec_mz, "{what}: prec_mz");
+        assert_eq!(a.n_cand, b.n_cand, "{what}: n_cand");
+    }
+
+    /// A library of `n` candidates with 0..=11 fragments each, spread over 100-2000 m/z
+    /// so every bin range is populated and many candidates share bins.
+    fn random_lib(n: usize, seed: u64) -> Library {
+        let mut state = seed;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let cands: Vec<(Vec<(f64, f32)>, f64)> = (0..n)
+            .map(|i| {
+                let k = (next() * 12.0) as usize;
+                let frags = (0..k)
+                    .map(|_| (100.0 + 1900.0 * next(), next() as f32))
+                    .collect();
+                (frags, 400.0 + i as f64 * 0.01)
+            })
+            .collect();
+        lib_from(&cands)
+    }
+
+    /// The parallel build (chunked histograms, per-chunk cursors, atomic scatter) against
+    /// the serial counting sort it replaced, over chunk counts from one to one per
+    /// candidate, at two tolerances.
+    #[test]
+    fn the_parallel_build_reproduces_the_serial_index_bit_for_bit() {
+        let lib = random_lib(3_000, 0x5eed);
+        for tol in [20.0, 7.5] {
+            let serial = FragIndex::build_serial(&lib, tol);
+            for chunks in [1usize, 2, 3, 7, 64] {
+                let par = FragIndex::build_chunked(&lib, tol, Some(chunks));
+                assert_same_index(&par, &serial, &format!("tol {tol} chunks {chunks}"));
+            }
+            assert_same_index(&FragIndex::build(&lib, tol), &serial, "build");
+        }
+        // Empty candidates at the ends and in the middle, so chunk boundaries fall on runs
+        // of candidates without fragments.
+        let mut cands: Vec<(Vec<(f64, f32)>, f64)> = Vec::new();
+        for i in 0..200 {
+            let frags = if i % 3 == 0 || !(5..=190).contains(&i) {
+                Vec::new()
+            } else {
+                vec![(300.0 + i as f64, 1.0), (900.0 - i as f64, 0.5)]
+            };
+            cands.push((frags, 400.0 + i as f64));
+        }
+        let lib = lib_from(&cands);
+        let serial = FragIndex::build_serial(&lib, 20.0);
+        for chunks in [1usize, 4, 50, 200] {
+            let par = FragIndex::build_chunked(&lib, 20.0, Some(chunks));
+            assert_same_index(&par, &serial, &format!("gappy chunks {chunks}"));
+        }
+    }
+
+    /// The m/z that the bin geometry treats specially must land in the same bins through
+    /// the parallel build: values exactly on bin edges and one f32 ULP either side, values
+    /// below the range (zero, negative, subnormal, below 1.0 where the range is clamped),
+    /// the top of the range, and the non-finite values the range skips (NaN to bin 0,
+    /// +inf clamped to the top bin, -inf to bin 0).
+    #[test]
+    fn edge_mz_bins_identically_in_the_parallel_build() {
+        let tol = 20.0;
+        // Geometry of a plain 150-1800 library, to place values on its bin edges.
+        let probe = lib_from(&[(vec![(150.0, 1.0), (1800.0, 1.0)], 400.0)]);
+        let g = FragIndex::build_serial(&probe, tol).bins;
+        let mut special: Vec<f64> = Vec::new();
+        for k in [0usize, 1, 2, 1_000, 50_000, g.n_bins - 3, g.n_bins - 2] {
+            // The m/z of edge k: exp(ln_min + k w), with ln_min = ln(150).
+            let e = ((150.0f64).ln() + k as f64 * g.w).exp() as f32;
+            for d in [-1i32, 0, 1] {
+                special.push(f32::from_bits((e.to_bits() as i32 + d) as u32) as f64);
+            }
+        }
+        special.extend([
+            150.0,
+            1800.0,
+            0.0,
+            -0.0,
+            -5.0,
+            f32::MIN_POSITIVE as f64,
+            0.5,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+        ]);
+        let mut cands: Vec<(Vec<(f64, f32)>, f64)> = Vec::new();
+        for (i, chunk) in special.chunks(3).enumerate() {
+            cands.push((
+                chunk.iter().map(|&m| (m, i as f32)).collect(),
+                400.0 + i as f64,
+            ));
+        }
+        let lib = lib_from(&cands);
+        let serial = FragIndex::build_serial(&lib, tol);
+        for chunks in [1usize, 2, 5, cands.len()] {
+            let par = FragIndex::build_chunked(&lib, tol, Some(chunks));
+            assert_same_index(&par, &serial, &format!("edges chunks {chunks}"));
+        }
+        // And the clamping is what it claims: NaN and -inf in bin 0, +inf in the top bin.
+        assert_eq!(serial.bins.bin(f64::NAN), 0);
+        assert_eq!(serial.bins.bin(f64::NEG_INFINITY), 0);
+        assert_eq!(serial.bins.bin(f64::INFINITY), serial.bins.n_bins - 1);
+    }
+
+    /// The atomic posting arrays become plain arrays IN PLACE: an atomic has its integer's
+    /// size and alignment, so `into_iter().map(..).collect()` reuses the allocation rather
+    /// than holding two copies of a posting array at the build's peak.
+    #[test]
+    fn the_posting_arrays_are_converted_in_place() {
+        let a = atomic_u32_zeroed(10_000);
+        let p = a.as_ptr() as usize;
+        let b: Vec<u32> = a.into_iter().map(AtomicU32::into_inner).collect();
+        assert_eq!(b.as_ptr() as usize, p, "u32 conversion reallocated");
+        let a = atomic_u32_zeroed(10_000);
+        let p = a.as_ptr() as usize;
+        let f: Vec<f32> = a
+            .into_iter()
+            .map(|x| f32::from_bits(x.into_inner()))
+            .collect();
+        assert_eq!(f.as_ptr() as usize, p, "f32 conversion reallocated");
+        let h: Vec<AtomicU16> = (0..10_000).map(|_| AtomicU16::new(0)).collect();
+        let p = h.as_ptr() as usize;
+        let h: Vec<u16> = h.into_iter().map(AtomicU16::into_inner).collect();
+        assert_eq!(h.as_ptr() as usize, p, "u16 conversion reallocated");
     }
 
     // docs/06_predict_frag_index_matchers.md: fragindex == naive at K=C, same
