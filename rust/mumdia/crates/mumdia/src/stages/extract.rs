@@ -3431,14 +3431,26 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
     // The chromatogram writer runs on its own thread and cannot borrow the library, so the
     // band's offset travels with the chunks.
     let chrom_offset = lib.global_offset;
+    // Writer-side timing (P0 instrumentation, log lines only): how long the extraction
+    // side sat blocked in `tx.send` because both channel slots were full, against how long
+    // the writer thread spent encoding. A large blocked time with a writer busy for most of
+    // the stage means the serial encoder bounds extract; a small one means it does not.
+    let mut chrom_send_blocked = std::time::Duration::ZERO;
+    let mut chrom_chunks_sent = 0u64;
     let n_chrom = std::thread::scope(|sc| -> Result<u64> {
         let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<Col>>(2);
-        let writer = sc.spawn(move || -> Result<u64> {
+        let writer = sc.spawn(move || -> Result<(u64, std::time::Duration)> {
             let mut w = chrom_writer;
+            let mut busy = std::time::Duration::ZERO;
             for cols in rx {
+                let t = Instant::now();
                 w.write_cols(cols)?;
+                busy += t.elapsed();
             }
-            w.close()
+            let t = Instant::now();
+            let n = w.close()?;
+            busy += t.elapsed();
+            Ok((n, busy))
         });
         // One flush of finished candidates: score them in parallel, append their PSM
         // rows, and hand their chromatogram rows to the writer thread. Called once per
@@ -3523,8 +3535,15 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
                 chrom_bytes_total += chunk_bytes;
                 chrom_bytes_max_chunk = chrom_bytes_max_chunk.max(chunk_bytes);
                 // Hand the chunk's chromatogram rows to the writer thread. A send error means
-                // the writer failed; its error surfaces at the join below.
-                if tx.send(ch.cols(chrom_offset)).is_err() {
+                // the writer failed; its error surfaces at the join below. The columns are
+                // built before the clock starts, so the timer holds only the wait for a
+                // free channel slot.
+                let cols = ch.cols(chrom_offset);
+                let t_send = Instant::now();
+                let sent = tx.send(cols);
+                chrom_send_blocked += t_send.elapsed();
+                chrom_chunks_sent += 1;
+                if sent.is_err() {
                     return false;
                 }
             }
@@ -3626,9 +3645,9 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
         // A final empty chunk fixes the schema when no candidate was accepted at all.
         let _ = tx.send(ChromChunk::default().cols(0));
         drop(tx);
-        let n = writer
+        let (n, writer_busy) = writer
             .join()
-            .map_err(|_| anyhow::anyhow!("chromatogram writer thread panicked"))?;
+            .map_err(|_| anyhow::anyhow!("chromatogram writer thread panicked"))??;
         crate::memlog::report(
             "extract chromatogram traces",
             &[
@@ -3636,7 +3655,13 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
                 ("run_total_streamed", chrom_bytes_total),
             ],
         );
-        n
+        info!(
+            chunks = chrom_chunks_sent,
+            send_blocked_ms = chrom_send_blocked.as_millis() as u64,
+            writer_busy_ms = writer_busy.as_millis() as u64,
+            "extract: chromatogram writer"
+        );
+        Ok(n)
     })?;
 
     // Spectrum-centric NNLS demixing (D2), second pass: solve ONCE PER APEX SCAN.

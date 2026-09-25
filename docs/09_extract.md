@@ -508,6 +508,15 @@ isotope offsets and `sum_near` (`extract.rs:495`) to integrate within
 are the per-PSM columns, taken from the nearest MS1 scan to the apex RT
 (`extract.rs:1957`).
 
+The chromatogram rows of each candidate chunk are handed to one writer thread
+through a two-slot channel, so encoding overlaps extraction. The stage logs one
+`extract: chromatogram writer` line with `chunks`, `send_blocked_ms` (time the
+extraction side waited for a free channel slot, the column build excluded) and
+`writer_busy_ms` (time the writer thread spent in `write_cols` and `close`). A
+`send_blocked_ms` near zero says the serial encoder does not bound the stage; one
+that approaches the stage's accumulation time says it does, and that a parallel
+column encoder (survey item R2) would pay off here. The line is log output only.
+
 ### 7. Top-K peak enumeration (`retain_top_peaks`)
 
 Two independent knobs consume the enumerator, and they must not be confused:
