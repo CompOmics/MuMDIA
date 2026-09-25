@@ -445,11 +445,37 @@ def _release_allocator_slack():
 
 PHASE = {}
 
+# Sub-timers, kept apart from PHASE so `sum(PHASE.values())` stays a sum of disjoint wall
+# intervals. The load entries split `1_pin_read_standardise` (so they are already inside
+# that phase); `selection` is the positive re-selection between a pool score and the next
+# training round, which no phase covers.
+DETAIL = {}
+
 
 def _tick(name, t0):
     "Accumulate elapsed wall time under `name` and return a fresh timestamp."
     PHASE[name] = PHASE.get(name, 0.0) + (time.time() - t0)
     return time.time()
+
+
+def _detail(name, seconds):
+    "Accumulate `seconds` under the sub-timer `name` (never into PHASE)."
+    DETAIL[name] = DETAIL.get(name, 0.0) + seconds
+
+
+def _print_timers():
+    """The phase breakdown, then the sub-timers that are not part of its total."""
+    tot = sum(PHASE.values())
+    print("nn_rescore_worker: phase breakdown (wall seconds)", flush=True)
+    for k in sorted(PHASE):
+        v = PHASE[k]
+        print("    %-26s %8.1f s  %5.1f%%" % (k[2:], v, 100 * v / max(tot, 1e-9)), flush=True)
+    print("    %-26s %8.1f s" % ("MEASURED TOTAL", tot), flush=True)
+    if DETAIL:
+        print("nn_rescore_worker: sub-timers (wall seconds; not added to the total above)",
+              flush=True)
+        for k in sorted(DETAIL):
+            print("    %-26s %8.1f s" % (k, DETAIL[k]), flush=True)
 
 
 def tda_q(scores, is_target):
@@ -883,7 +909,10 @@ def main():
             # engine writes at 131,072 rows (200 MB at 387 features); a file with parquet's
             # default 1,048,576-row groups still loads, at 1.6 GB per group.
             for _rg in range(_pf.num_row_groups):
+                _tr = time.time()
                 _tbl = _pf.read_row_group(_rg, columns=feat_cols)
+                _tf = time.time()
+                _detail("load: read", _tf - _tr)
                 for _s0 in range(0, _tbl.num_rows, CHUNK):
                     _b = _tbl.slice(_s0, CHUNK)
                     k = _b.num_rows
@@ -897,12 +926,14 @@ def main():
                     del blk
                 del _tbl, _b
                 _tbl = _b = None
+                _detail("load: fill + moments", time.time() - _tf)
             del _pf, _tbl, _b
             if off != n:
                 raise RuntimeError(f"parquet row mismatch: metadata {n}, features {off}")
             # The decoded Arrow buffers are garbage now; hand them back before training
             # starts, or they stay in RSS for the whole run.
             _release_allocator_slack()
+            _ts = time.time()
             mean = (s1 / n).astype(np.float32)
             std = np.sqrt(np.maximum(s2 / n - (s1 / n) ** 2, 1e-12)).astype(np.float32)
             std[std == 0] = 1.0
@@ -912,6 +943,7 @@ def main():
                 np.subtract(view, mean, out=view)
                 np.divide(view, std, out=view)
                 np.clip(view, -8, 8, out=view)
+            _detail("load: standardise", time.time() - _ts)
             get = lambda idx: Xs[idx]
             get_col = lambda idx, j: np.asarray(Xs[idx, j])
         else:
@@ -1138,6 +1170,7 @@ def main():
             prev_pos = None
             used_iters = 0
             for _ in range(ITERS):
+                _tsel = time.time()
                 q = tda_q(score_tr, ytr)
                 pos = (q <= TRAIN_FDR) & (ytr == 1)
                 if model is None and not np.any(pos) and INIT_FDR_MAX > 0:
@@ -1180,6 +1213,7 @@ def main():
                               f"iteration(s) (churn {frac:.3%} <= tol "
                               f"{EARLY_STOP_TOL:.3%}); skipping "
                               f"{ITERS - used_iters} remaining", flush=True)
+                        _detail("selection", time.time() - _tsel)
                         break
                 prev_pos = pos
                 sel = tr_idx[pos | neg]
@@ -1261,6 +1295,7 @@ def main():
                         flush=True,
                     )
                 pw = float(sel_neg) / max(1.0, float(sel_pos))
+                _detail("selection", time.time() - _tsel)
                 _t = time.time()
                 # Warm start reuses the previous iteration's weights and Adam state, so a
                 # later iteration only adapts to the changed positive set. WARM_EPOCHS (when
@@ -1311,12 +1346,7 @@ def main():
             os.remove(mm_path)
         except OSError:
             pass
-    tot = sum(PHASE.values())
-    print("nn_rescore_worker: phase breakdown (wall seconds)", flush=True)
-    for k in sorted(PHASE):
-        v = PHASE[k]
-        print("    %-26s %8.1f s  %5.1f%%" % (k[2:], v, 100 * v / max(tot, 1e-9)), flush=True)
-    print("    %-26s %8.1f s" % ("MEASURED TOTAL", tot), flush=True)
+    _print_timers()
     print(f"nn_rescore_worker: {n} PSMs rescored (targets+decoys), {N_SEEDS} seed(s), "
           f"OOF at {FOLDS} folds, backend={'stream' if stream else 'in-memory'}", flush=True)
 

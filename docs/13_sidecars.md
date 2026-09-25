@@ -722,6 +722,13 @@ MLP. Set it explicitly for the logreg path.
   the pooled Astral rescore 118 minutes against 74 at 8, before the subnormal fix below. The
   worker prints `torch cpu threads=N (asked A from ...; cap C: why)` at startup;
   `MUMDIA_NN_THREAD_CAP` overrides the cap, `0` removes it.
+- **The worker ends with a phase breakdown and a sub-timer block.** The phases
+  (`pin_read_standardise`, `init_feature_scan`, `train`, `score_pool_per_iter`,
+  `score_holdout`) are disjoint wall intervals, and `MEASURED TOTAL` is their sum. The
+  sub-timers are printed after it and are not added to that total: `load: read`,
+  `load: fill + moments` and `load: standardise` split `pin_read_standardise` on the
+  parquet in-memory path, and `selection` is the positive re-selection between a pool
+  score and the next training round, which no phase covers.
 - **Constant feature columns are dropped before training** (`MUMDIA_NN_DROP_CONSTANT`,
   default 1; 2026-09-16), identified from the parquet footer's per-column min/max
   without a read (11 of the 387 Extended features on the Astral pool, `has_ms1` and
