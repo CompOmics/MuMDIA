@@ -17,6 +17,7 @@ import importlib.util
 import re
 import sys
 
+import pytest
 from conftest import ROOT
 
 _SPEC = importlib.util.spec_from_file_location(
@@ -150,6 +151,39 @@ def test_rust_reads_are_cited_by_enclosing_function():
     # Test code is not the engine, and a child-process `.env` is a set.
     assert sets == {"MUMDIA_T_CHILD": (["src/x.rs::child"], [('"1"', ("src/x.rs::child",))])}
     assert unresolved == []
+
+
+def test_unbalanced_braces_after_masking_fail_loudly():
+    """A masking error stops the run instead of citing later reads wrongly.
+
+    The trigger is real: comments are stripped line by line before masking, so a
+    `//` on a continuation line of a multi-line string (a URL) cuts the closing
+    quote off, and the rest of the file is read with inverted quote parity. The read
+    in `b` would then be cited under `a` or as `<module>`, and the blank-line
+    self-check would not notice, because a wrong scope is stable under moved lines.
+    """
+    source = (
+        "fn a() {\n"
+        '    let _s = "first line\n'
+        'see https://example.org/x";\n'
+        "}\n"
+        "\n"
+        "fn b() {\n"
+        '    let _ = std::env::var("MUMDIA_T_AFTER");\n'
+        "}\n"
+    )
+    with pytest.raises(SystemExit) as exc:
+        gen.scan_rust_env([("src/x.rs", source)])
+    assert "src/x.rs" in str(exc.value)
+    assert "unbalanced braces" in str(exc.value)
+    # A `}` without its `{` is rejected as well, not skipped.
+    with pytest.raises(SystemExit) as exc:
+        gen.rust_scopes("fn a() {}\n}\n", "src/y.rs")
+    assert "src/y.rs" in str(exc.value)
+    # The same file without the URL is balanced and cites `b`.
+    fixed = source.replace("https://example.org/x", "example.org")
+    reads, _sets, _unresolved = scan_rust(fixed)
+    assert reads["MUMDIA_T_AFTER"][0] == ["src/x.rs::b"]
 
 
 def test_python_reads_are_cited_by_enclosing_def():

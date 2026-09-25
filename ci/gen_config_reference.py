@@ -890,7 +890,7 @@ def rust_impl_type(header: str) -> str | None:
     return None
 
 
-def rust_scopes(text: str) -> list[tuple[int, int, str, str]]:
+def rust_scopes(text: str, rel: str) -> list[tuple[int, int, str, str]]:
     """`(start, end, name, kind)` of every Rust `fn` and `impl` that has a body.
 
     A body opens at the first `{` outside parentheses and brackets after the
@@ -900,15 +900,31 @@ def rust_scopes(text: str) -> list[tuple[int, int, str, str]]:
     or the start of the file: `-> impl Iterator<..> {` is a return type, and its
     `{` opens the function body, not an impl block. An impl span carries the self
     type, so a method is cited as `Type::method`, as Python cites `Class.method`.
+
+    The braces left after masking must balance. If they do not, a literal or a
+    comment was masked wrongly, and every later read in the file would be cited
+    under the wrong function or as `<module>`. The blank-line self-check cannot
+    see that, because a wrong scope is as stable under inserted blank lines as a
+    right one, so the file is rejected here instead. `rel` names it in the error.
     """
     code = mask_rust_literals(text)
     close_of: dict[int, int] = {}
     stack: list[int] = []
+    unmatched_close = 0
     for idx, c in enumerate(code):
         if c == "{":
             stack.append(idx)
-        elif c == "}" and stack:
-            close_of[stack.pop()] = idx
+        elif c == "}":
+            if stack:
+                close_of[stack.pop()] = idx
+            else:
+                unmatched_close += 1
+    if stack or unmatched_close:
+        sys.exit(
+            f"error: {rel}: unbalanced braces after masking literals and comments "
+            f"({len(stack)} unclosed '{{', {unmatched_close} unmatched '}}'), so the "
+            "enclosing function of an environment read cannot be cited"
+        )
 
     def body_open(after: int) -> int | None:
         depth = 0
@@ -1172,7 +1188,7 @@ def scan_rust_env(
         # stray quote (an apostrophe in "engine's") and offsets still hold.
         text = blank_cfg_test(decomment(raw))
         lines = text.split("\n")
-        scopes = rust_scopes(text)
+        scopes = rust_scopes(text, rel)
 
         def line_of(offset: int) -> int:
             return text.count("\n", 0, offset) + 1
