@@ -33,7 +33,7 @@
       "default_text": "0",
       "help": "",
       "gates": [],
-      "source_line": 2046
+      "source_line": 2057
     },
     {
       "path": "convert.thermo_raw_parser",
@@ -2506,6 +2506,19 @@
         "precursors",
         "cost"
       ]
+    },
+    {
+      "path": "groups.delete_band_intermediates",
+      "name": "delete_band_intermediates",
+      "section": "groups",
+      "rust_type": "bool",
+      "kind": "bool",
+      "optional": false,
+      "default": false,
+      "default_text": "false",
+      "help": "Delete each band's `psms_extracted.parquet` and `features.parquet` (with their reports and schema companions, and `run.pin` where one was written) once the pool is written. Default `false`. Disk only: no stage reads them after pooling. The features are carried by the competed table and the extracted table's one reader, the candidate audit, reads the pooled copy. On the immunopeptidomics runs the band features alone were 55 GB per run, in an experiment that wrote about 2.7 TB of artifacts. The manifest keeps their records, and the band directories can no longer be re-featured; the chromatograms and competed tables that `mumdia pool --groups-dir` re-pools from are kept.",
+      "gates": [],
+      "source_line": 2037
     }
   ],
   "list_sections": [

@@ -1082,6 +1082,39 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
                 .with_context(|| format!("copying {src} beside the pooled table"))?;
         }
     }
+    // Opt-in: the bands' extracted and feature tables are read by nothing once the pool is
+    // written (features are carried by the competed table; the extracted table's one
+    // reader, the candidate audit, reads the pooled copy), and on a large run they are the
+    // bulk of the band directories. Chromatograms and competed tables stay: the pooled
+    // copies are what later stages read, but the band copies are what `mumdia pool
+    // --groups-dir` re-pools from.
+    if cfg.groups.delete_band_intermediates {
+        let (mut files, mut bytes) = (0u64, 0u64);
+        for (index, _) in &cals {
+            for name in ["psms_extracted.parquet", "features.parquet", "run.pin"] {
+                let base = gd(*index, name);
+                for f in [
+                    base.clone(),
+                    format!("{base}.report.json"),
+                    format!("{base}.schema.json"),
+                ] {
+                    if let Ok(meta) = std::fs::metadata(&f) {
+                        std::fs::remove_file(&f)
+                            .with_context(|| format!("deleting the band intermediate {f}"))?;
+                        files += 1;
+                        bytes += meta.len();
+                    }
+                }
+            }
+        }
+        info!(
+            groups = cals.len(),
+            files,
+            bytes,
+            "groups: deleted the bands' psms_extracted and features tables after pooling \
+             (groups.delete_band_intermediates); the manifest still lists them"
+        );
+    }
     info!(
         groups = arts.len(),
         duplicates = stats.duplicates,

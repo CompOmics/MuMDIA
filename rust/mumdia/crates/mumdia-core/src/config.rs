@@ -2025,6 +2025,16 @@ pub struct GroupsConfig {
     /// wall times, on two acquisitions. Note that the MS2 is decoded before the plan under
     /// either setting.
     pub balance: GroupBalance,
+    /// Delete each band's `psms_extracted.parquet` and `features.parquet` (with their
+    /// reports and schema companions, and `run.pin` where one was written) once the pool is
+    /// written. Default `false`. Disk only: no stage reads them after pooling. The features
+    /// are carried by the competed table and the extracted table's one reader, the
+    /// candidate audit, reads the pooled copy. On the immunopeptidomics runs the band
+    /// features alone were 55 GB per run, in an experiment that wrote about 2.7 TB of
+    /// artifacts. The manifest keeps their records, and the band directories can no longer
+    /// be re-featured; the chromatograms and competed tables that `mumdia pool
+    /// --groups-dir` re-pools from are kept.
+    pub delete_band_intermediates: bool,
 }
 impl Default for GroupsConfig {
     fn default() -> Self {
@@ -2034,6 +2044,7 @@ impl Default for GroupsConfig {
             parallel: 1,
             rt_adaptation: GroupRtAdaptation::PerBand,
             balance: GroupBalance::Precursors,
+            delete_band_intermediates: false,
         }
     }
 }

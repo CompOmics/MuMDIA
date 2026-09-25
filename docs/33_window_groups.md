@@ -474,7 +474,13 @@ out/
 ```
 
 The band directories are diagnostics and reproducibility material, not inputs to any later
-stage; delete them once the run is accepted if space matters. There is no run-level
+stage; delete them once the run is accepted if space matters. `groups.delete_band_intermediates`
+(default `false`) does part of that automatically: once the pool is written, each band's
+`psms_extracted.parquet` and `features.parquet` (with their reports, schema companions and
+any `run.pin`) are deleted, which on the immunopeptidomics experiment was most of the band
+directories' volume. The chromatograms and competed tables stay, because `mumdia pool
+--groups-dir` re-pools from them; the manifest keeps the deleted tables' records. Disk only:
+every output is unchanged. There is no run-level
 `run_windows.parquet`: the windows are per band, and nothing after compete reads them.
 
 ## 7. The run-level `cal.json`
