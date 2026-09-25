@@ -22,7 +22,7 @@ use serde_json::json;
 use tracing::{info, warn};
 
 use crate::calibrate::percentile;
-use crate::stats::{cosine, pearson, spectral_angle};
+use crate::stats::{cosine, pearson, pearson_pairs, pearson_vs, spectral_angle, Centered};
 use rayon::prelude::*;
 
 // Extended feature battery (FeatureSet::Extended). One module per family; each
@@ -3387,12 +3387,14 @@ fn fragment_features(
     let mut corrs = Vec::new();
     let mut lags = Vec::new();
     let mut shapes = Vec::new();
-    // Each trace's norm once, not once per pair it is in.
-    let norms: Vec<f64> = traces.iter().map(|t| xcorr_norm(t)).collect();
-    for a in 0..traces.len() {
-        for b in (a + 1)..traces.len() {
-            if axis.len() >= 2 {
-                corrs.push(pearson(&traces[a], &traces[b]));
+    if axis.len() >= 2 {
+        // Every pair's correlation from traces centred once (`pearson_pairs`, bit-identical
+        // to `pearson` pair by pair), in the same (a, b) order the loop below visits.
+        pearson_pairs(&traces, &mut corrs);
+        // Each trace's norm once, not once per pair it is in.
+        let norms: Vec<f64> = traces.iter().map(|t| xcorr_norm(t)).collect();
+        for a in 0..traces.len() {
+            for b in (a + 1)..traces.len() {
                 let (lag, shape) = best_xcorr_normed(&traces[a], &traces[b], 5, norms[a], norms[b]);
                 lags.push(lag.abs() as f64);
                 shapes.push(shape);
@@ -3436,8 +3438,13 @@ fn fragment_features(
             den += w;
         }
         f.profile_cos = if den > 0.0 { num / den } else { 0.0 };
-        // pTimeCorr: each fragment XIC correlated with the reference profile.
-        let rc: Vec<f64> = traces.iter().map(|tr| pearson(tr, &refp)).collect();
+        // pTimeCorr: each fragment XIC correlated with the reference profile, which is
+        // centred once for all of them.
+        let refp_c = Centered::new(&refp);
+        let rc: Vec<f64> = traces
+            .iter()
+            .map(|tr| pearson_vs(tr, &refp, &refp_c))
+            .collect();
         f.ref_corr = mean(&rc);
         f.best_ref_corr = rc.iter().cloned().fold(f64::MIN, f64::max).max(0.0);
         // pResCorr proxy: co-elution of the low-predicted-intensity fragments.
@@ -3503,15 +3510,12 @@ fn fragment_features(
         } else {
             0.0
         };
-        // co-elution of cleaned traces and correlation of residuals (shared interferent).
+        // co-elution of cleaned traces and correlation of residuals (shared interferent),
+        // each a pair matrix over rows centred once, in the old (a, b) order.
         let mut clean_corrs = Vec::new();
         let mut res_corrs = Vec::new();
-        for a in 0..traces.len() {
-            for b in (a + 1)..traces.len() {
-                clean_corrs.push(pearson(&cleaned[a], &cleaned[b]));
-                res_corrs.push(pearson(&residuals[a], &residuals[b]));
-            }
-        }
+        pearson_pairs(&cleaned, &mut clean_corrs);
+        pearson_pairs(&residuals, &mut res_corrs);
         f.coel_clean = mean(&clean_corrs);
         f.resid_corr = mean(&res_corrs);
     }

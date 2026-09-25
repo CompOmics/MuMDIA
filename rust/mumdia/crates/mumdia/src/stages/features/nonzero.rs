@@ -12,7 +12,7 @@
 //! Contract: NAMES and values(&Evidence) in matching order/length. See the
 //! Evidence struct in stages/features.rs.
 use super::Evidence;
-use crate::stats::{cosine, pearson, spectral_angle};
+use crate::stats::{cosine, pearson, pearson_pairs, spectral_angle};
 
 pub const NAMES: &[&str] = &[
     "frag_corr_peakmax",
@@ -96,6 +96,11 @@ pub fn values(e: &Evidence) -> Vec<f64> {
     } else {
         Vec::new()
     };
+    // The summed-positive pairs over rows centred once, in the (a, b) order of the loop
+    // below (`pearson_pairs` is `pearson` pair by pair, bit for bit).
+    if sm.len() >= 2 {
+        pearson_pairs(&sm_gathered, &mut summpos);
+    }
     // The both-positive index set IS pair-dependent, so only its buffers are reused.
     let mut idx: Vec<usize> = Vec::with_capacity(np);
     let mut xa: Vec<f64> = Vec::with_capacity(np);
@@ -110,9 +115,6 @@ pub fn values(e: &Evidence) -> Vec<f64> {
                 xb.clear();
                 xb.extend(idx.iter().map(|&t| e.traces[b][t]));
                 both.push(pearson(&xa, &xb));
-            }
-            if sm.len() >= 2 {
-                summpos.push(pearson(&sm_gathered[a], &sm_gathered[b]));
             }
         }
     }

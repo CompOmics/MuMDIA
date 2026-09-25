@@ -18,7 +18,7 @@
 use std::borrow::Cow;
 
 use super::{best_xcorr_normed, xcorr_norm, Evidence};
-use crate::stats::pearson;
+use crate::stats::{pearson, pearson_pairs, pearson_vs, Centered};
 
 pub const NAMES: &[&str] = &[
     "frag_ref_corr_mean",
@@ -72,8 +72,10 @@ pub fn values(e: &Evidence) -> Vec<f64> {
     let has_traces = traces.len() == k && k > 0;
 
     // --- per-fragment ref correlation over the peak window ---
+    // `r` centred once for every fragment (`pearson_vs` is `pearson` bit for bit).
+    let r_c = Centered::new(r);
     let rc: Vec<f64> = if has_traces {
-        (0..k).map(|i| pearson(&traces[i], r)).collect()
+        (0..k).map(|i| pearson_vs(&traces[i], r, &r_c)).collect()
     } else {
         Vec::new()
     };
@@ -147,7 +149,10 @@ pub fn values(e: &Evidence) -> Vec<f64> {
     };
     let r_full: &[f64] = &r_full_owned;
     let rc_full: Vec<f64> = if has_full {
-        (0..k).map(|i| pearson(&tf[i], r_full)).collect()
+        let r_full_c = Centered::new(r_full);
+        (0..k)
+            .map(|i| pearson_vs(&tf[i], r_full, &r_full_c))
+            .collect()
     } else {
         Vec::new()
     };
@@ -178,11 +183,17 @@ pub fn values(e: &Evidence) -> Vec<f64> {
     } else {
         Vec::new()
     };
+    // Every pair's Pearson from traces centred once, in the (a, b) order the loop reads.
+    let mut pairs: Vec<f64> = Vec::new();
+    if has_traces {
+        pearson_pairs(&traces[..k], &mut pairs);
+    }
+    let mut pairs = pairs.into_iter();
     if has_traces {
         for a in 0..k {
             corr[a * k + a] = 1.0;
             for b in (a + 1)..k {
-                let p = pearson(&traces[a], &traces[b]);
+                let p = pairs.next().expect("one correlation per pair");
                 corr[a * k + b] = p;
                 corr[b * k + a] = p;
                 pair_p.push(p);
@@ -310,7 +321,7 @@ pub fn values(e: &Evidence) -> Vec<f64> {
     let f_sum_corr = if s_trace.is_empty() {
         0.0
     } else {
-        pearson(&s_trace, r)
+        pearson_vs(&s_trace, r, &r_c)
     };
 
     // 32-33. leave-one-out ref correlation: R^{-f} = R - pred[f]*traces[f]

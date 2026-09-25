@@ -12,7 +12,7 @@
 //! Every value is finite: divisions are denominator-guarded, empty reductions
 //! yield 0.0, and any non-finite intermediate is coerced to 0.0.
 use super::Evidence;
-use crate::stats::{cosine, pearson, spectral_angle};
+use crate::stats::{cosine, pearson, pearson_vs, spectral_angle, Centered};
 use mumdia_core::constants::PROTON;
 use std::collections::HashSet;
 
@@ -468,11 +468,12 @@ pub fn values(e: &Evidence) -> Vec<f64> {
 
     // charge_corr_balance: min/max of mean ref-profile correlation per charge.
     let charge_corr_balance = if has_traces && e.ref_profile.len() == e.axis.len() {
+        let ref_c = Centered::new(&e.ref_profile);
         let mean_refcorr = |idx: &[usize]| -> f64 {
             let mut s = 0.0;
             let mut c = 0.0;
             for &i in idx {
-                s += fin(pearson(&e.traces[i], &e.ref_profile));
+                s += fin(pearson_vs(&e.traces[i], &e.ref_profile, &ref_c));
                 c += 1.0;
             }
             if c > 0.0 {

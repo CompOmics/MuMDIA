@@ -14,7 +14,7 @@
 use std::borrow::Cow;
 
 use super::Evidence;
-use crate::stats::{cosine, pearson};
+use crate::stats::{cosine, pearson, pearson_vs, Centered};
 
 pub const NAMES: &[&str] = &[
     "explained_variance_ref",
@@ -101,10 +101,13 @@ pub fn values(e: &Evidence) -> Vec<f64> {
     // value-preserving: `pearson` is pure, and the guards below mean the `0.0` filler for
     // an absent trace is never read (features 15-17 iterate `matched`, which already
     // requires `f < e.traces.len()`, and feature 18 keeps its own bounds check).
+    //
+    // `r` is centred once for all of them (`pearson_vs` is `pearson` bit for bit).
+    let r_c = Centered::new(r);
     let corr_ref: Vec<f64> = (0..k)
         .map(|f| {
             if f < e.traces.len() {
-                pearson(&e.traces[f], r)
+                pearson_vs(&e.traces[f], r, &r_c)
             } else {
                 0.0
             }
@@ -270,10 +273,11 @@ pub fn values(e: &Evidence) -> Vec<f64> {
     let mut sp_corr = 0.0;
     let mut sf_corr = 0.0;
     let mut c_corr = 0usize;
+    let rfull_c = Centered::new(rfull);
     for &f in &matched {
         sp_corr += corr_ref[f];
         let full_corr = if f < e.traces_full.len() {
-            pearson(&e.traces_full[f], rfull)
+            pearson_vs(&e.traces_full[f], rfull, &rfull_c)
         } else {
             0.0
         };
