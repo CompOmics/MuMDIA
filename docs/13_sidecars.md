@@ -379,7 +379,8 @@ is gone, so an out-of-memory kill of the parent does not leave shards predicting
 core; measured on Windows with `taskkill /F` of the parent alone. There is no timeout,
 because a slow shard on a large library cannot be told from a hung one. At equal threads
 per process the result is bit-identical to one process
-(`tests/python/test_deeplc_predict.py`, base model and multi-head); at the same engine
+(`tests/python/test_deeplc_predict.py`: base model, multi-head, and a seeded one-thread
+fine-tune whose saved module every child loads with `torch.load`); at the same engine
 thread count it is float-equivalent, because each child predicts on fewer threads (see
 the thread cap below for what that does). Each child holds its own model copy
 (0.3-0.5 GB).

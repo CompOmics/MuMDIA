@@ -414,7 +414,7 @@ def _predicted_irt(path):
                       dtype=np.float32).view(np.uint32)
 
 
-@pytest.mark.parametrize("mode", ["base", "multihead"])
+@pytest.mark.parametrize("mode", ["base", "multihead", "finetune"])
 def test_sharded_prediction_writes_the_column_one_process_writes(tmp_path, mode):
     """K processes at T threads each write the `predicted_irt` one process at T writes.
 
@@ -424,12 +424,22 @@ def test_sharded_prediction_writes_the_column_one_process_writes(tmp_path, mode)
     on --threads: a fit at another thread count moves most rows in the last bits. The
     chunk is shrunk so a 500-sequence library spans several shards, and the GPU is hidden
     so the shards actually run (a GPU gets one process).
+
+    The fine-tune case is the whole-module round trip: the parent `torch.save`s the
+    fine-tuned model and every shard `torch.load`s it, which is the part a torch or DeepLC
+    release is most likely to break. Both arms train on one CPU thread from seed 0, which
+    reproduces the fine-tuned weights exactly, so the comparison is still bit for bit.
     """
     _deeplc_or_skip()
     _write_shard_fixture(tmp_path)
     lib, seed = tmp_path / "lib.parquet", tmp_path / "seed.parquet"
     env = {"MUMDIA_DEEPLC_THREAD_CAP": "0", "CUDA_VISIBLE_DEVICES": "-1"}
-    mode_args = ["-", "--no-finetune"] if mode == "base" else [str(seed), "--multihead", "80"]
+    mode_args = {
+        "base": ["-", "--no-finetune"],
+        "multihead": [str(seed), "--multihead", "80"],
+        "finetune": [str(seed), "--epochs", "2", "--patience", "1", "--max-ref", "60",
+                     "--seed", "0"],
+    }[mode]
     outs = {}
     for k, threads in [(1, 1), (3, 3)]:
         out = tmp_path / "out_k{}.parquet".format(k)
@@ -448,6 +458,9 @@ def test_sharded_prediction_writes_the_column_one_process_writes(tmp_path, mode)
     for key in ("rows", "repredicted", "retained_imported", "retained_non_standard",
                 "retained_no_prediction", "unique_predicted"):
         assert s1[key] == s3[key], key
+    expected_model = {"base": "the DeepLC base model", "finetune": "the fine-tuned model",
+                      "multihead": "the base model calibrated over 80 heads"}[mode]
+    assert s1["model"] == s3["model"] == expected_model
     assert s1["shards"]["used"] == 1
     assert s3["shards"]["used"] == 3 and s3["shards"]["threads_per_shard"] == 1
     assert len(s3["shards"]["per_shard"]) == 3
