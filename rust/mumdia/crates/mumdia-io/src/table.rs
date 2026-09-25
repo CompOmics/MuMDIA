@@ -817,6 +817,8 @@ enum EncoderState {
         rows: usize,
         /// [`WriteOptions::plain_column`].
         plain: Vec<String>,
+        /// [`WriteOptions::metadata`].
+        metadata: Vec<(String, String)>,
     },
     Writing(Box<ColumnEncoder<Sink>>),
     /// Only while a transition is in flight, or after one failed.
@@ -836,6 +838,7 @@ impl Encoder {
             ));
         }
         let plain = opts.plain.clone();
+        let metadata = opts.metadata.clone();
         let row_group_rows = opts.row_group_rows;
         let state = match row_group_rows {
             Some(cap) if plan_enabled() && !float_leaves(&schema).is_empty() => {
@@ -846,10 +849,14 @@ impl Encoder {
                     pending: Vec::new(),
                     rows: 0,
                     plain,
+                    metadata,
                 }
             }
             _ => {
-                let props = writer_props(&schema, row_group_rows, None, &plain);
+                let props = with_metadata(
+                    writer_props(&schema, row_group_rows, None, &plain),
+                    &metadata,
+                );
                 EncoderState::Writing(Box::new(ColumnEncoder::try_new(
                     sink,
                     schema,
@@ -895,13 +902,17 @@ impl Encoder {
             row_group_rows,
             pending,
             plain,
+            metadata,
             ..
         } = std::mem::replace(&mut self.state, EncoderState::Poisoned)
         else {
             unreachable!("checked above");
         };
         let plan = EncodingPlan::of(&schema, &pending, plan_sample_rows(row_group_rows));
-        let props = writer_props(&schema, Some(row_group_rows), Some(&plan), &plain);
+        let props = with_metadata(
+            writer_props(&schema, Some(row_group_rows), Some(&plan), &plain),
+            &metadata,
+        );
         let mut w = ColumnEncoder::try_new(*sink, schema, props, codec_pool())?;
         for b in &pending {
             w.write(b)?;
@@ -927,6 +938,24 @@ pub struct WriteOptions {
     row_group_rows: Option<usize>,
     content_hash: bool,
     plain: Vec<String>,
+    metadata: Vec<(String, String)>,
+}
+
+/// `props` with `metadata` added to the footer's key-value metadata, where the arrow writer
+/// then adds its own `ARROW:schema` entry. Unchanged when there is none to add, so a writer
+/// that sets none writes the bytes it always wrote.
+fn with_metadata(props: WriterProperties, metadata: &[(String, String)]) -> WriterProperties {
+    if metadata.is_empty() {
+        return props;
+    }
+    let kv = metadata
+        .iter()
+        .map(|(k, v)| parquet::file::metadata::KeyValue::new(k.clone(), v.clone()))
+        .collect();
+    props
+        .into_builder()
+        .set_key_value_metadata(Some(kv))
+        .build()
 }
 
 impl WriteOptions {
@@ -960,6 +989,16 @@ impl WriteOptions {
         if !self.plain.iter().any(|p| p == name) {
             self.plain.push(name.to_string());
         }
+        self
+    }
+
+    /// Record `value` under `key` in the file's footer key-value metadata, where
+    /// [`TableFile::metadata_value`] reads it back without touching a data page: for a
+    /// small fact about the whole table that is not a column of it. Setting a key twice
+    /// keeps the last value.
+    pub fn metadata(mut self, key: &str, value: &str) -> WriteOptions {
+        self.metadata.retain(|(k, _)| k != key);
+        self.metadata.push((key.to_string(), value.to_string()));
         self
     }
 }
@@ -1381,6 +1420,12 @@ impl TableWriter {
     /// Write the column `name` without a dictionary ([`WriteOptions::plain_column`]).
     pub fn with_plain_column(mut self, name: &str) -> TableWriter {
         self.opts = self.opts.plain_column(name);
+        self
+    }
+
+    /// Record `value` under `key` in the footer ([`WriteOptions::metadata`]).
+    pub fn with_metadata(mut self, key: &str, value: &str) -> TableWriter {
+        self.opts = self.opts.metadata(key, value);
         self
     }
 
@@ -3331,6 +3376,18 @@ impl TableFile {
 
     pub fn has_column(&self, name: &str) -> bool {
         self.schema.index_of(name).is_ok()
+    }
+
+    /// The value the writer recorded under `key` in the footer's key-value metadata
+    /// ([`WriteOptions::metadata`]), or `None` when it recorded none.
+    pub fn metadata_value(&self, key: &str) -> Option<String> {
+        self.meta
+            .metadata()
+            .file_metadata()
+            .key_value_metadata()?
+            .iter()
+            .find(|kv| kv.key == key)
+            .and_then(|kv| kv.value.clone())
     }
 
     fn idx(&self, name: &str) -> Result<usize> {
@@ -7005,6 +7062,59 @@ mod selection_tests {
         id_starts.dedup();
         assert_eq!(indexed.page_starts("id").unwrap().unwrap(), id_starts);
         std::fs::remove_file(&path).ok();
+    }
+
+    /// A footer key-value entry round-trips through both encoder paths (the capped writer
+    /// that plans its float encodings, and the uncapped one), next to the arrow schema the
+    /// writer adds, and the file content hash covers it.
+    #[test]
+    fn footer_metadata_round_trips_on_both_encoder_paths() {
+        for (label, cap) in [("uncapped", None), ("capped", Some(4usize))] {
+            let path = tmp(&format!("kv_{label}.parquet"));
+            let cols = || {
+                vec![
+                    Col::U32("id".into(), (0..10).collect()),
+                    Col::LargeListF32("trace".into(), (0..10).map(|i| vec![i as f32]).collect()),
+                ]
+            };
+            let with = |v: &str| {
+                let mut w = TableWriter::new(&path)
+                    .with_content_hash()
+                    .with_metadata("k", "old")
+                    .with_metadata("k", v);
+                if let Some(c) = cap {
+                    w = w.with_row_group_rows(c);
+                }
+                w.write_cols(cols()).unwrap();
+                w.close_hashed().unwrap()
+            };
+            let a = with("value one");
+            let t = TableFile::open(&path).unwrap();
+            assert_eq!(
+                t.metadata_value("k").as_deref(),
+                Some("value one"),
+                "{label}"
+            );
+            assert_eq!(t.metadata_value("absent"), None);
+            assert!(
+                matches!(
+                    t.schema.field_with_name("trace").unwrap().data_type(),
+                    DataType::LargeList(_)
+                ),
+                "{label}: the arrow schema entry was lost"
+            );
+            assert_eq!(t.u32("id").unwrap(), (0..10).collect::<Vec<u32>>());
+            let b = with("value two");
+            assert_ne!(a.content_hash, b.content_hash, "{label}");
+            let mut plain = TableWriter::new(&path);
+            if let Some(c) = cap {
+                plain = plain.with_row_group_rows(c);
+            }
+            plain.write_cols(cols()).unwrap();
+            plain.close().unwrap();
+            assert_eq!(TableFile::open(&path).unwrap().metadata_value("k"), None);
+            std::fs::remove_file(&path).ok();
+        }
     }
 }
 

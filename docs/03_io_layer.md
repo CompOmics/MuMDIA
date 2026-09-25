@@ -759,7 +759,8 @@ string (`main.rs:713`).
 | `TableFile::batches_selected` | `table.rs:2100` | stream only the rows of `(rows, keep)` runs, skipping pages with no kept row where the file has an offset index (whole-file handles only) |
 | `TableFile::open_with_offset_index` / `offset_indexed` | `table.rs` | `open` with the page locations of every column chunk loaded as well (opt-in); whether a handle holds them for every row group it covers |
 | `TableFile::batches_runs` | `table.rs` | stream only the rows of `(rows, keep)` runs of this handle, a whole file or a span, through the footer it already holds, always as a queue of selectors; a page with no kept row is skipped unread on an offset-indexed handle |
-| `TableFile::row_group_parts` / `page_starts` | `table.rs` | a handle cut at the file's row-group boundaries; the handle rows at which a column's data pages begin, from the offset index |
+| `TableFile::row_group_parts` / `page_starts` | `table.rs` | a handle cut at the file's row-group boundaries; the handle rows at which a column's data pages begin in every one of its leaves, from the offset index |
+| `WriteOptions::metadata` / `TableWriter::with_metadata` / `TableFile::metadata_value` | `table.rs` | record a small fact about the whole table under a key in the footer's key-value metadata, next to the arrow schema; read it back from the footer alone (the overlap loser table names its band tables this way) |
 | `TableFile::str_flat_rows` | `table.rs` | `str_flat` at given rows only: one text arena plus offsets for the picked rows, the same null policy |
 | `TableFile::str_interned` / `str_flat` | `table.rs:2309` / `:2358` | a string column as one id per row plus its distinct values (first appearance), or as one text arena plus offsets; both refuse a NULL with the row |
 | `StrBatch` / `StrInterner` | `table.rs:1517` / `:1550` | one batch of a string column, plain or through its dictionary; first-appearance interning with a per-batch key memo |
