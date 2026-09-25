@@ -500,8 +500,11 @@ identical to the byte, 2,603,894 and 38,889,646 rows):
   this audit set as its target, and 12.3 GiB is available for a 9% wall cost.
 
 What remains: the open hits (6.16 GiB at 16 in flight) are the `Vec<Hit>` payload plus its
-growth slack, and `Hit` is 24 bytes where 16 would do (`obs_mz` as an f32 ppm offset from
-the theoretical m/z, `rt` as a scan index). That is a precision change and gated.
+growth slack. `Hit` was 24 bytes where 16 would do; since 2026-09-25 it is 16 (survey item
+X2), with `rt` replaced by the scan index and `obs_mz` stored at the peaks' own f32 width.
+That turned out not to be a precision change: the scan index recovers the f64 RT exactly
+and the f32 m/z is the value the f64 held, so the outputs are byte-identical. The
+payload row above is then about 24 GiB at the same hit count.
 
 ## 4. Rewrite candidates (structural changes beyond the items above)
 

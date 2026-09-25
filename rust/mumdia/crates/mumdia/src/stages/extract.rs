@@ -164,15 +164,37 @@ pub struct SharedScans<'a> {
     pub ms1: Option<&'a [Ms1Scan]>,
 }
 
-/// One observed hit: scan RT, candidate-local fragment index, observed intensity
-/// and observed m/z (for mass-accuracy features).
+/// One observed hit: the scan it was observed in, candidate-local fragment index,
+/// observed intensity and observed m/z (for mass-accuracy features).
+///
+/// 16 bytes. It used to be 24: the scan's RT as an f64 and the observed m/z widened to an
+/// f64. Both were redundant. Every hit comes from one scan of the stage's `scans` slice, so
+/// the scan index recovers the RT exactly (`scans[scan].rt_seconds`, the same f64 the hit
+/// used to copy), and peaks are stored at f32 width, so the f32 m/z IS the value the f64
+/// held, widened again where it is used. The hit payload is the stage's largest structure
+/// (1.6 billion hits measured on one HYE run), so a third off it is a third off the
+/// accumulator.
+///
+/// Order-sensitive code keeps reading the RT, not the index: the per-candidate pass sorts
+/// and groups hits on the looked-up RT, and the two-pass elution profile keys on the RT's
+/// bits, exactly as before. Scans are RT-sorted by the loaders, but a sort on the index
+/// would still differ from one on the RT wherever two scans share an RT.
 #[derive(Clone, Copy)]
 #[cfg_attr(test, derive(Debug, PartialEq))]
 struct Hit {
-    rt: f64,
+    /// Index into the stage's `scans` slice.
+    scan: u32,
     frag: u16,
     inten: f32,
-    obs_mz: f64,
+    obs_mz: f32,
+}
+
+const _: () = assert!(std::mem::size_of::<Hit>() == 16);
+
+/// The retention time of `h`: the RT of the scan it was observed in.
+#[inline]
+fn hit_rt(scans: &[Ms2Scan], h: &Hit) -> f64 {
+    scans[h.scan as usize].rt_seconds
 }
 
 /// Hits for many candidates in one flat buffer with per-candidate offsets (CSR).
@@ -537,9 +559,10 @@ impl ChromChunk {
     }
 }
 
-/// One observed peak for the per-scan demix: (observed intensity, observed m/z, claimants
-/// as (candidate_id, fragment_ordinal, predicted_intensity)).
-type DemixRow = (f32, f64, Vec<(u32, u16, f32)>);
+/// One observed peak for the per-scan demix: (observed intensity, observed m/z at the
+/// artifact's f32 width, claimants as (candidate_id, fragment_ordinal,
+/// predicted_intensity)).
+type DemixRow = (f32, f32, Vec<(u32, u16, f32)>);
 
 /// Per-candidate contested-peak statistics from the co-elution arbitration
 /// (two-pass path). `won`/`lost` are the summed observed intensity of shared peaks
@@ -1397,6 +1420,7 @@ fn accumulate_groups(
             for &si in ids {
                 let scan = &scans[si];
                 let rt = scan.rt_seconds;
+                let hs = si as u32;
                 setup.clear();
                 setup.extend(scan.peaks.iter().map(|p| {
                     let mz = p.mz as f64;
@@ -1405,7 +1429,7 @@ fn accumulate_groups(
                 }));
                 for (peak, &(q_mz, bin)) in scan.peaks.iter().zip(&setup) {
                     let inten = peak.intensity;
-                    let obs_mz = peak.mz as f64;
+                    let obs_mz = peak.mz;
                     claimants.clear();
                     idx.probe_peak_win_binned(&mut nw, q_mz, bin, |cid, _pmz, pint, frag| {
                         let c = cid as usize;
@@ -1438,7 +1462,7 @@ fn accumulate_groups(
                             let (cid, frag, _) = claimants[best];
                             flat_cid.push(cid);
                             flat_hit.push(Hit {
-                                rt,
+                                scan: hs,
                                 frag,
                                 inten,
                                 obs_mz,
@@ -1454,7 +1478,7 @@ fn accumulate_groups(
                                 };
                                 flat_cid.push(cid);
                                 flat_hit.push(Hit {
-                                    rt,
+                                    scan: hs,
                                     frag,
                                     inten: share,
                                     obs_mz,
@@ -1465,7 +1489,7 @@ fn accumulate_groups(
                             for &(cid, frag, _) in &claimants {
                                 flat_cid.push(cid);
                                 flat_hit.push(Hit {
-                                    rt,
+                                    scan: hs,
                                     frag,
                                     inten,
                                     obs_mz,
@@ -1631,10 +1655,11 @@ fn extract_twopass_windows(
             for &si in ids {
                 let scan = &scans[si];
                 let rt = scan.rt_seconds;
+                let hs = si as u32;
                 for peak in &scan.peaks {
                     let inten = peak.intensity;
-                    let obs_mz = peak.mz as f64;
-                    let q_mz = obs_mz / mass_off.factor_at(obs_mz);
+                    let obs_mz = peak.mz;
+                    let q_mz = obs_mz as f64 / mass_off.factor_at(obs_mz as f64);
                     claimants.clear();
                     {
                         let mut push = |cid: u32, frag: u16, pi: f32| {
@@ -1653,7 +1678,7 @@ fn extract_twopass_windows(
                     }
                     for &(cid, frag, _) in &claimants {
                         acc1.entry(cid).or_default().push(Hit {
-                            rt,
+                            scan: hs,
                             frag,
                             inten,
                             obs_mz,
@@ -1665,7 +1690,7 @@ fn extract_twopass_windows(
             for (cid, hits) in &acc1 {
                 let m = profile.entry(*cid).or_default();
                 for h in hits {
-                    *m.entry(h.rt.to_bits()).or_insert(0.0) += h.inten;
+                    *m.entry(hit_rt(scans, h).to_bits()).or_insert(0.0) += h.inten;
                 }
             }
             // S2 uniqueness-seeded EM: re-seed each candidate's elution profile from its
@@ -1750,6 +1775,7 @@ fn extract_twopass_windows(
                 let scan = &scans[si];
                 let rt = scan.rt_seconds;
                 let rtb = rt.to_bits();
+                let hs = si as u32;
                 // Spectrum-centric demix redistribution (CoelutionDemix): solve one NNLS
                 // over this scan's co-isolated candidate x fragment matrix and split each
                 // shared peak by beta_c * D[peak,c] (smooth joint deconvolution) rather than
@@ -1783,7 +1809,7 @@ fn extract_twopass_windows(
                         for &(cid, _, _) in &claimants {
                             cand.insert(cid);
                         }
-                        prows.push((peak.intensity, obs_mz, claimants.clone()));
+                        prows.push((peak.intensity, peak.mz, claimants.clone()));
                     }
                     if prows.is_empty() {
                         continue;
@@ -1855,7 +1881,7 @@ fn extract_twopass_windows(
                                 e.n_lost += 1;
                             }
                             acc2.entry(cid).or_default().push(Hit {
-                                rt,
+                                scan: hs,
                                 frag,
                                 inten: share as f32,
                                 obs_mz: *obs_mz,
@@ -1892,7 +1918,7 @@ fn extract_twopass_windows(
                         if claimants.is_empty() {
                             continue;
                         }
-                        prows.push((peak.intensity, obs_mz, claimants.clone()));
+                        prows.push((peak.intensity, peak.mz, claimants.clone()));
                     }
                     if prows.is_empty() {
                         continue;
@@ -1932,7 +1958,7 @@ fn extract_twopass_windows(
                                 e.n_lost += 1;
                             }
                             acc2.entry(cid).or_default().push(Hit {
-                                rt,
+                                scan: hs,
                                 frag,
                                 inten: cleaned as f32,
                                 obs_mz: *obs_mz,
@@ -1944,6 +1970,7 @@ fn extract_twopass_windows(
                 for peak in &scan.peaks {
                     let inten = peak.intensity;
                     let obs_mz = peak.mz as f64;
+                    let hit_mz = peak.mz;
                     let q_mz = obs_mz / mass_off.factor_at(obs_mz);
                     claimants.clear();
                     {
@@ -2036,27 +2063,27 @@ fn extract_twopass_windows(
                                 PeakClaim::CoelutionWinner | PeakClaim::CoelutionMultiCue => {
                                     if cid == win {
                                         acc2.entry(cid).or_default().push(Hit {
-                                            rt,
+                                            scan: hs,
                                             frag,
                                             inten,
-                                            obs_mz,
+                                            obs_mz: hit_mz,
                                         });
                                     }
                                 }
                                 PeakClaim::CoelutionProportional => {
                                     acc2.entry(cid).or_default().push(Hit {
-                                        rt,
+                                        scan: hs,
                                         frag,
                                         inten: share,
-                                        obs_mz,
+                                        obs_mz: hit_mz,
                                     });
                                 }
                                 PeakClaim::CoelutionWinnerMargin if !dominant || cid == win => {
                                     acc2.entry(cid).or_default().push(Hit {
-                                        rt,
+                                        scan: hs,
                                         frag,
                                         inten,
-                                        obs_mz,
+                                        obs_mz: hit_mz,
                                     });
                                 }
                                 _ => {}
@@ -2516,16 +2543,17 @@ pub fn run(mut p: ExtractParams) -> Result<(u64, u64)> {
                 lib: &lib,
                 frag_tol,
             };
-            for scan in scans {
+            for (si, scan) in scans.iter().enumerate() {
                 let (lo, hi) = lib.candidate_range(scan.window.lower_mz, scan.window.upper_mz);
                 if hi <= lo {
                     continue;
                 }
                 let rt = scan.rt_seconds;
+                let hs = si as u32;
                 for peak in &scan.peaks {
                     let inten = peak.intensity;
-                    let obs_mz = peak.mz as f64;
-                    let q_mz = obs_mz / mass_off.factor_at(obs_mz);
+                    let obs_mz = peak.mz;
+                    let q_mz = obs_mz as f64 / mass_off.factor_at(obs_mz as f64);
                     // Collect every co-isolated, in-RT-window candidate matching this
                     // peak, then apportion per the claim strategy. In wide DIA one peak
                     // matches many candidates (~98% of fragments collide).
@@ -2560,7 +2588,7 @@ pub fn run(mut p: ExtractParams) -> Result<(u64, u64)> {
                             }
                             let (cid, frag, _) = claimants[best];
                             acc.entry(cid).or_default().push(Hit {
-                                rt,
+                                scan: hs,
                                 frag,
                                 inten,
                                 obs_mz,
@@ -2575,7 +2603,7 @@ pub fn run(mut p: ExtractParams) -> Result<(u64, u64)> {
                                     inten / claimants.len() as f32
                                 };
                                 acc.entry(cid).or_default().push(Hit {
-                                    rt,
+                                    scan: hs,
                                     frag,
                                     inten: share,
                                     obs_mz,
@@ -2586,7 +2614,7 @@ pub fn run(mut p: ExtractParams) -> Result<(u64, u64)> {
                         _ => {
                             for &(cid, frag, _) in &claimants {
                                 acc.entry(cid).or_default().push(Hit {
-                                    rt,
+                                    scan: hs,
                                     frag,
                                     inten,
                                     obs_mz,
@@ -2814,15 +2842,19 @@ pub fn run(mut p: ExtractParams) -> Result<(u64, u64)> {
         // already rt-ascending in the ordinary case; the sort then allocates scratch as large
         // as the vector itself for nothing. Equal-rt hits collapse to `max` per (rt, frag)
         // below either way, so skipping a sort that would not move anything is exact.
-        if !hits.windows(2).all(|w| w[0].rt <= w[1].rt) {
-            hits.sort_by(|a, b| a.rt.total_cmp(&b.rt));
+        if !hits
+            .windows(2)
+            .all(|w| hit_rt(scans, &w[0]) <= hit_rt(scans, &w[1]))
+        {
+            hits.sort_by(|a, b| hit_rt(scans, a).total_cmp(&hit_rt(scans, b)));
         }
         // scan groups: Vec<(rt, BTreeMap<frag,intensity>)>. A BTreeMap keeps the
         // per-scan fragment order fixed so the f32 apex sum is deterministic.
         let mut groups: Vec<(f64, BTreeMap<u16, f32>)> = Vec::new();
         for h in hits.iter() {
+            let h_rt = hit_rt(scans, h);
             match groups.last_mut() {
-                Some((rt, map)) if (*rt - h.rt).abs() < 1e-9 => {
+                Some((rt, map)) if (*rt - h_rt).abs() < 1e-9 => {
                     let e = map.entry(h.frag).or_insert(0.0);
                     if h.inten > *e {
                         *e = h.inten;
@@ -2831,7 +2863,7 @@ pub fn run(mut p: ExtractParams) -> Result<(u64, u64)> {
                 _ => {
                     let mut m = BTreeMap::new();
                     m.insert(h.frag, h.inten);
-                    groups.push((h.rt, m));
+                    groups.push((h_rt, m));
                 }
             }
         }
@@ -3183,7 +3215,7 @@ pub fn run(mut p: ExtractParams) -> Result<(u64, u64)> {
         let mut wsum: Vec<(f64, f64)> = vec![(0.0, 0.0); fmzs.len()]; // (sum w*mz, sum w)
         for h in hits.iter() {
             if let Some(e) = wsum.get_mut(h.frag as usize) {
-                e.0 += h.obs_mz * h.inten as f64;
+                e.0 += h.obs_mz as f64 * h.inten as f64;
                 e.1 += h.inten as f64;
             }
         }
@@ -4400,10 +4432,10 @@ mod accumulate_tests {
             let c = lo + ((i * 7) % 11) + if i % 5 == 0 { 2 } else { 0 };
             let c = c.min(hi - 1);
             let h = Hit {
-                rt: 100.0 + i as f64,
+                scan: i,
                 frag: (i % 6) as u16,
                 inten: 1.0 + i as f32,
-                obs_mz: 300.0 + i as f64 * 0.01,
+                obs_mz: 300.0 + i as f32 * 0.01,
             };
             cid.push(c);
             hits.push(h);
@@ -4427,18 +4459,18 @@ mod accumulate_tests {
     /// candidate's segments run by run.
     #[test]
     fn gather_concatenates_a_candidate_across_runs_in_window_order() {
-        let h = |rt: f64| Hit {
-            rt,
+        let h = |scan: u32| Hit {
+            scan,
             frag: 0,
             inten: 1.0,
             obs_mz: 300.0,
         };
         let mut a = HitStore::default();
-        a.push_segment(4, &[h(1.0), h(2.0)]);
-        a.push_segment(9, &[h(3.0)]);
+        a.push_segment(4, &[h(1), h(2)]);
+        a.push_segment(9, &[h(3)]);
         let mut b = HitStore::default();
-        b.push_segment(4, &[h(4.0)]);
-        b.push_segment(7, &[h(5.0)]);
+        b.push_segment(4, &[h(4)]);
+        b.push_segment(7, &[h(5)]);
         let mut acc = HitAcc {
             runs: vec![HitRun::new(vec![a]), HitRun::new(vec![b])],
         };
@@ -4446,27 +4478,27 @@ mod accumulate_tests {
         gather_chunk(&mut acc.runs, u32::MAX, usize::MAX, &mut out);
         assert_eq!(out.cids, vec![4, 7, 9]);
         assert_eq!(
-            out.slice(0).iter().map(|x| x.rt).collect::<Vec<_>>(),
-            vec![1.0, 2.0, 4.0],
+            out.slice(0).iter().map(|x| x.scan).collect::<Vec<_>>(),
+            vec![1, 2, 4],
             "the earlier window's hits must come first"
         );
-        assert_eq!(out.slice(1).iter().map(|x| x.rt).collect::<Vec<_>>(), [5.0]);
-        assert_eq!(out.slice(2).iter().map(|x| x.rt).collect::<Vec<_>>(), [3.0]);
+        assert_eq!(out.slice(1).iter().map(|x| x.scan).collect::<Vec<_>>(), [5]);
+        assert_eq!(out.slice(2).iter().map(|x| x.scan).collect::<Vec<_>>(), [3]);
     }
 
     /// `bound` is the only thing holding a candidate back, and what it holds back must
     /// still be there, in order, for the next flush.
     #[test]
     fn gather_stops_at_the_bound_and_keeps_the_rest() {
-        let h = |rt: f64| Hit {
-            rt,
+        let h = |scan: u32| Hit {
+            scan,
             frag: 0,
             inten: 1.0,
             obs_mz: 300.0,
         };
         let mut a = HitStore::default();
         for c in [2u32, 5, 8, 11] {
-            a.push_segment(c, &[h(c as f64)]);
+            a.push_segment(c, &[h(c)]);
         }
         let mut acc = HitAcc {
             runs: vec![HitRun::new(vec![a])],
@@ -4485,15 +4517,15 @@ mod accumulate_tests {
     /// reorder a candidate.
     #[test]
     fn gather_chunking_partitions_the_accumulator() {
-        let h = |rt: f64| Hit {
-            rt,
+        let h = |scan: u32| Hit {
+            scan,
             frag: 0,
             inten: 1.0,
             obs_mz: 300.0,
         };
         let mut a = HitStore::default();
         for c in 0..50u32 {
-            a.push_segment(c, &[h(c as f64), h(c as f64 + 0.5)]);
+            a.push_segment(c, &[h(2 * c), h(2 * c + 1)]);
         }
         let mut acc = HitAcc {
             runs: vec![HitRun::new(vec![a])],

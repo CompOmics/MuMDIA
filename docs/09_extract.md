@@ -304,8 +304,15 @@ by precursor m/z. This is what makes a per-window probe cheap.
 ### 2. Peak-major accumulation
 
 The accumulator `acc: HashMap<u32, Vec<Hit>>` (`extract.rs:1435`) maps each
-candidate to the observed hits it collected. A `Hit` (`extract.rs:108`) is
-`{rt, frag, inten, obs_mz}`. Entries are created lazily on the first collision.
+candidate to the observed hits it collected. A `Hit` is `{scan, frag, inten,
+obs_mz}`, 16 bytes: `scan` is the index of the scan in the stage's `scans` slice,
+whose `rt_seconds` is the hit's RT (`hit_rt`), and `obs_mz` is the peak's own f32
+m/z. Until 2026-09-25 it was 24 bytes, carrying a copy of the scan RT as an f64 and
+the f32 m/z widened to an f64; both are recovered exactly, so no value moved. Code
+that depends on the order of hits sorts and groups them on the looked-up RT, never on
+the scan index, and the two-pass elution profile still keys on the RT's bits, so two
+scans that share an RT behave as they always did. Entries are created lazily on the
+first collision.
 
 There are three accumulation paths:
 
@@ -582,7 +589,7 @@ the training/FDR population and needs entrapment validation, not a count check.
 |---|---|---|
 | `run` | `extract.rs:1300` | Stage entry point; orchestrates load, accumulate, cascade, write |
 | `ExtractParams` | `extract.rs:83` | Input path bundle + config + config hash |
-| `Hit` | `extract.rs:108` | One observed hit: `rt`, `frag`, `inten`, `obs_mz` |
+| `Hit` / `hit_rt` | `extract.rs` | One observed hit (16 bytes): `scan`, `frag`, `inten`, `obs_mz`; `hit_rt` looks its RT up in `scans` |
 | `Contested` | `extract.rs:130` | Per-candidate two-pass contested-peak stats: `won`/`lost` intensity, `n_won`/`n_lost` peak counts, `apportioned` share |
 | `CandOut` | `extract.rs:1656` | Per-candidate parallel-map result (PSM row + chrom rows + peaks); one candidate may yield several |
 | `Prober` / `Prober::probe` | `extract.rs:38`, `extract.rs:57` | Dispatch a peak probe to fragindex or bucketed backend |
