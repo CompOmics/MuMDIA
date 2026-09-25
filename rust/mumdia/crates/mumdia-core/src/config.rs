@@ -332,6 +332,18 @@ pub struct ConvertConfig {
     /// pay for it twice. Turn it off when the neighbouring mzML may have come from
     /// a different converter or a different `.raw` of the same name.
     pub reuse_converted: bool,
+    /// How many vendor files `run` and `run-experiment` convert to mzML at once. Default 4.
+    ///
+    /// Every vendor input is converted before the first run starts, and the conversions
+    /// used to run one after another, so an experiment of N `.raw` files paid N converter
+    /// runs of several minutes each on the critical path. Each conversion is a separate
+    /// child process writing its own destination under its own lock, and its output does
+    /// not depend on what else runs beside it, so running them concurrently changes the
+    /// wall time only. The bound is there because a converter reads a multi-GB file and
+    /// writes a larger one: more at once than the disk can feed is slower, not faster.
+    /// `1` converts one at a time, as before. Only the first conversion of an input pays
+    /// this at all; `reuse_converted` skips the rest. Not measured at scale.
+    pub parallel_conversions: usize,
 }
 impl Default for ConvertConfig {
     fn default() -> Self {
@@ -340,6 +352,7 @@ impl Default for ConvertConfig {
             msconvert: "auto".to_string(),
             msconvert_args: Vec::new(),
             reuse_converted: true,
+            parallel_conversions: 4,
         }
     }
 }
@@ -2564,6 +2577,10 @@ impl Config {
                 self.extract.presence_min_fragments,
             ),
             ("experiment.parallel_runs", self.experiment.parallel_runs),
+            (
+                "convert.parallel_conversions",
+                self.convert.parallel_conversions,
+            ),
             ("rescore.seeds", self.rescore.seeds),
             ("groups.window_groups", self.groups.window_groups),
             ("groups.parallel", self.groups.parallel),
@@ -3067,6 +3084,7 @@ mod tests {
             r#"{"rt_im_train":{"p_rt":0.0}}"#,
             r#"{"search_seed":{"min_matched_peaks":0}}"#,
             r#"{"experiment":{"parallel_runs":0}}"#,
+            r#"{"convert":{"parallel_conversions":0}}"#,
             r#"{"rescore":{"train_neg_ratio":-1.0}}"#,
             r#"{"predict_frag":{"top_n_fragments":0}}"#,
             // docs/30 R5: the five values the follow-up review found still accepted.
