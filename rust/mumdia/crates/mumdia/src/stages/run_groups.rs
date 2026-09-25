@@ -506,6 +506,7 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
                 cfg.rt_im_train.q_train,
                 cfg.rt_im_train.window_holdout_frac,
                 rayon::current_num_threads(),
+                cfg.rt_im_train.deeplc_predict_shards,
             )?;
             Some(out)
         } else if cfg.rt_im_train.finetune_deeplc {
@@ -523,6 +524,8 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
                 cfg.rt_im_train.finetune_batch,
                 cfg.rt_im_train.window_holdout_frac,
                 cfg.rng_seed,
+                rayon::current_num_threads(),
+                cfg.rt_im_train.deeplc_predict_shards,
             )?;
             Some(out)
         } else if repredict {
@@ -534,6 +537,7 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
                 &b.prec,
                 &out,
                 rayon::current_num_threads(),
+                cfg.rt_im_train.deeplc_predict_shards,
             )?;
             Some(out)
         } else {
