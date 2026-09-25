@@ -490,6 +490,7 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
                 cfg.rt_im_train.finetune_batch,
                 cfg.rt_im_train.window_holdout_frac,
                 cfg.rng_seed,
+                rayon::current_num_threads(),
             )?;
             Some(out)
         } else if repredict {

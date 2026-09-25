@@ -445,6 +445,7 @@ pub fn run(p: RunParams) -> Result<()> {
                     // residuals and the window shrinks back toward in-sample optimism.
                     cfg.rt_im_train.window_holdout_frac,
                     cfg.rng_seed,
+                    rayon::current_num_threads(),
                 )?;
                 // The fine-tuned precursor table is the artifact actually consumed by
                 // RT calibration and extraction. Replace the base-library manifest entry

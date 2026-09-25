@@ -299,6 +299,7 @@ fn process_run(
             // split (see run.rs); 0.0 (default) changes nothing.
             cfg.rt_im_train.window_holdout_frac,
             cfg.rng_seed,
+            rayon::current_num_threads(),
         )?;
         produced_rt_lib = Some(lib_p_ft.clone());
         lib_p_ft

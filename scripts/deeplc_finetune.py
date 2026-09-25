@@ -20,6 +20,12 @@ Usage:
       (engine path for rt_im_train.library_irt = deeplc: predict with the DeepLC base
       model, no seed needed; per-run LOESS calibration then maps the predictions onto
       observed RT)
+
+Both torch pools (--threads for training, --predict-threads for the whole-library
+prediction) are capped at the physical cores available to the process: the unique
+(package, core) pairs under the affinity mask on Linux, every physical core on Windows.
+MUMDIA_DEEPLC_THREAD_CAP=N sets the cap explicitly and 0 disables it. The resolved
+numbers are printed and recorded under "torch_threads" in <lib_out>.summary.json.
 """
 import os
 
@@ -155,6 +161,107 @@ def quiet_deeplc_progress():
         proxy.close()
         sys.stdout = original
 
+def _windows_physical_cores():
+    """Physical core count from `GetLogicalProcessorInformationEx(RelationProcessorCore)`.
+
+    One record per physical core, across every processor group, whatever its efficiency
+    class: a hybrid CPU's efficiency cores are real cores for a forward pass, unlike a
+    second hyperthread on a core that is already busy. None when the call fails.
+    """
+    try:
+        import ctypes
+        import struct
+        from ctypes import wintypes
+
+        k32 = ctypes.windll.kernel32
+        relation_processor_core = 0
+        size = wintypes.DWORD(0)
+        k32.GetLogicalProcessorInformationEx(relation_processor_core, None, ctypes.byref(size))
+        buf = ctypes.create_string_buffer(size.value)
+        if not k32.GetLogicalProcessorInformationEx(
+            relation_processor_core, buf, ctypes.byref(size)
+        ):
+            return None
+        raw = buf.raw
+        cores = 0
+        off = 0
+        # SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX: Relationship (u32), Size (u32), payload.
+        while off + 8 <= size.value:
+            relationship, record_size = struct.unpack_from("<II", raw, off)
+            if record_size < 8:
+                return None
+            if relationship == relation_processor_core:
+                cores += 1
+            off += record_size
+        return cores or None
+    except Exception:  # noqa: BLE001 - detection is best effort; None means no cap
+        return None
+
+
+def physical_cores():
+    """`(count, how)`: the physical cores this process may run on, or `(None, why)`.
+
+    Linux: the unique (physical_package_id, core_id) pairs from sysfs over the CPUs in
+    `sched_getaffinity(0)`, so a container or a `taskset` mask is respected and two
+    hyperthreads of one core count once. Windows: every physical core of the machine.
+    Anywhere else the count is unknown and nothing is capped.
+    """
+    if hasattr(os, "sched_getaffinity"):
+        try:
+            cpus = sorted(os.sched_getaffinity(0))
+        except OSError:
+            cpus = []
+        if cpus:
+            pairs = set()
+            for cpu in cpus:
+                topo = "/sys/devices/system/cpu/cpu%d/topology/" % cpu
+                try:
+                    with open(topo + "physical_package_id", encoding="ascii") as fh:
+                        package = fh.read().strip()
+                    with open(topo + "core_id", encoding="ascii") as fh:
+                        core = fh.read().strip()
+                except OSError:
+                    return len(cpus), "%d CPUs in the affinity mask (no sysfs topology)" % len(cpus)
+                pairs.add((package, core))
+            return len(pairs), "%d physical cores under the affinity mask of %d CPUs" % (
+                len(pairs), len(cpus))
+    if sys.platform == "win32":
+        n = _windows_physical_cores()
+        if n:
+            return n, "%d physical cores (GetLogicalProcessorInformationEx)" % n
+    return None, "physical core count unknown on this platform"
+
+
+def deeplc_thread_cap():
+    """`(cap, why)` for DeepLC's torch CPU threads; a cap of 0 means none.
+
+    Measured on doxy (EPYC, 64 cores, 128 CPUs): the multi-head step took 10:41 at 96
+    requested threads and 18:09 at 128, because every OpenMP-parallel op waits for its
+    slowest thread and a second hyperthread on a busy core is the slowest one. The cap is a
+    ceiling on what the engine asks for, never a target, so below it nothing changes.
+    `MUMDIA_DEEPLC_THREAD_CAP` sets it explicitly; 0 disables it.
+    """
+    raw = os.environ.get("MUMDIA_DEEPLC_THREAD_CAP", "auto").strip().lower()
+    if raw not in ("", "auto"):
+        try:
+            value = int(float(raw))
+        except ValueError:
+            print("WARNING: MUMDIA_DEEPLC_THREAD_CAP=%r is not a number, 0 or auto; "
+                  "using auto" % raw, flush=True)
+        else:
+            if value <= 0:
+                return 0, "MUMDIA_DEEPLC_THREAD_CAP=0 (no cap)"
+            return value, "MUMDIA_DEEPLC_THREAD_CAP"
+    n, why = physical_cores()
+    return (n or 0), why
+
+
+def capped_threads(requested, cap):
+    """`requested` bounded by `cap` (0 = no cap), and at least 1."""
+    requested = max(1, int(requested))
+    return requested if cap <= 0 else max(1, min(requested, cap))
+
+
 def is_std(pf):
     # Same predicate as `all(c in STD for c in strip_mods(base_pf(pf)))`, but the regex
     # substitution only runs when there is actually a bracketed modification to strip.
@@ -237,8 +344,8 @@ def fit_multihead(args, ref_psms):
     return cal
 
 
-def build_finetuned_model(args, ref_psms):
-    """Transfer-learn on the confident seed PSMs."""
+def build_finetuned_model(args, ref_psms, threads):
+    """Transfer-learn on the confident seed PSMs with `threads` torch CPU threads."""
     # Batch size: 0 -> auto-scale so each epoch runs ~30+ gradient steps. A fixed 512
     # underfits small references (e.g. ~4k E.coli seed = ~8 steps/epoch, never
     # converges); clamp to [16, 512].
@@ -255,7 +362,7 @@ def build_finetuned_model(args, ref_psms):
         "device": args.device,
     }
     if args.device == "cpu":
-        train_kwargs["num_threads"] = max(1, args.threads)   # cpu-only knob; absent in some deeplc builds
+        train_kwargs["num_threads"] = max(1, threads)   # cpu-only knob; absent in some deeplc builds
     ft_model = deeplc.finetune(ref_psms, train_kwargs=train_kwargs)   # <-- transfer learning
     print("fine-tuned model ready", flush=True)
     return ft_model
@@ -269,7 +376,9 @@ def main():
     ap.add_argument("--device", default="cpu", choices=["cpu", "cuda"],
                     help="cuda moves training/inference onto the GPU; sidesteps the CPU OpenMP crash entirely")
     ap.add_argument("--threads", type=int, default=int(_THREADS),
-                    help="torch CPU threads for training (bounded to avoid OpenMP oversubscription; cpu only)")
+                    help="torch CPU threads for training (bounded to avoid OpenMP oversubscription; cpu only). "
+                         "Like --predict-threads it is capped at the physical cores available to the "
+                         "process; MUMDIA_DEEPLC_THREAD_CAP sets the cap, 0 disables it")
     ap.add_argument("--predict-threads", type=int, default=0,
                     help="torch CPU threads for the whole-library prediction phase; "
                          "0 (default) reuses --threads, i.e. no change in behaviour. The "
@@ -277,7 +386,11 @@ def main():
                          "sustained BACKWARD pass; prediction is forward-only, and it is the "
                          "phase that dominates wall clock on a large library, so it can "
                          "usually take more threads. Raise it deliberately and watch the "
-                         "per-chunk rate logged below.")
+                         "per-chunk rate logged below. Capped at the physical cores "
+                         "available to the process (MUMDIA_DEEPLC_THREAD_CAP, 0 = no cap): "
+                         "past that, a second hyperthread on a busy core slows every "
+                         "OpenMP-parallel op down (10:41 at 96 threads, 18:09 at 128 on a "
+                         "64-core host).")
     ap.add_argument("--epochs", type=int, default=25)
     ap.add_argument("--batch", type=int, default=0,
                     help="fine-tune batch size; 0 (default) auto-scales to the reference "
@@ -336,8 +449,22 @@ def main():
           f"{', cuda' if torch.cuda.is_available() else ''}); "
           "training kernels are not guaranteed bit-for-bit deterministic", flush=True)
 
-    # bound torch's own thread pool; only one OpenMP pool spins now (matters on cpu)
-    torch.set_num_threads(max(1, args.threads))
+    # Bound torch's own thread pool; only one OpenMP pool spins now (matters on cpu). Both
+    # the training and the prediction pool are capped at the physical cores this process
+    # may use (`deeplc_thread_cap`); a request at or below the cap is taken as given.
+    cap, cap_why = deeplc_thread_cap()
+    train_threads = capped_threads(args.threads, cap)
+    predict_asked = args.predict_threads if args.predict_threads > 0 else args.threads
+    predict_threads = capped_threads(predict_asked, cap)
+    thread_record = {
+        "requested_train": max(1, args.threads),
+        "requested_predict": max(1, predict_asked),
+        "cap": cap,
+        "cap_source": cap_why,
+        "train": train_threads,
+        "predict": predict_threads,
+    }
+    torch.set_num_threads(train_threads)
     try:
         torch.set_num_interop_threads(1)
     except RuntimeError:
@@ -346,6 +473,13 @@ def main():
         print(f"device=cuda gpu={torch.cuda.get_device_name(0)}; compute off the CPU OpenMP pools", flush=True)
     else:
         print(f"device=cpu torch threads={torch.get_num_threads()} interop=1; OMP/BLAS pinned to 1", flush=True)
+    print(f"torch thread cap {cap if cap > 0 else 'none'} ({cap_why}): training "
+          f"{train_threads} of {thread_record['requested_train']} asked, prediction "
+          f"{predict_threads} of {thread_record['requested_predict']} asked", flush=True)
+    if (train_threads < thread_record["requested_train"]
+            or predict_threads < thread_record["requested_predict"]):
+        print("the thread cap lowered the requested torch threads; set "
+              "MUMDIA_DEEPLC_THREAD_CAP=0 to take the request as given", flush=True)
 
     lib = pq.read_table(args.lib_in)
     pform = lib.column("peptidoform").to_pylist()
@@ -366,7 +500,7 @@ def main():
         ft_model = None
         print("no-finetune: predicting with the DeepLC base model (seed ignored)", flush=True)
     else:
-        ft_model = build_finetuned_model(args, build_reference(args))
+        ft_model = build_finetuned_model(args, build_reference(args), train_threads)
 
     if args.skip_predict:
         print("skip-predict set; fine-tune smoke test complete (crash path exercised)", flush=True)
@@ -383,9 +517,8 @@ def main():
             uniq.append(b)
     if args.predict_limit:
         uniq = uniq[: args.predict_limit]
-    pt = args.predict_threads if args.predict_threads > 0 else args.threads
-    if pt != torch.get_num_threads():
-        torch.set_num_threads(max(1, pt))
+    if predict_threads != torch.get_num_threads():
+        torch.set_num_threads(predict_threads)
     which = (
         f"the base model calibrated over {args.multihead} heads"
         if calibration is not None
@@ -442,6 +575,7 @@ def main():
     summary["model"] = which
     summary["lib_in"] = args.lib_in
     summary["lib_out"] = args.lib_out
+    summary["torch_threads"] = thread_record
     with open(args.lib_out + ".summary.json", "w", encoding="utf-8") as fh:
         json.dump(summary, fh, indent=2)
     print(f"wrote library with re-predicted iRT ({which}): {args.lib_out}")

@@ -61,8 +61,8 @@ the column it keys the readback on.
 | worker | positional args in | output file | key column |
 |---|---|---|---|
 | ms2pip_worker | `<in.parquet> <out.parquet> <model> <processes>` (`sidecar.rs`, `run_ms2pip`; `processes` is the engine's thread count) | `ms2pip_out.parquet` | `id` |
-| deeplc_worker | `<in.parquet> <out.parquet>` (`sidecar.rs:99`) | `deeplc_out.parquet` | `id` |
-| deeplc_finetune | `<lib_in> <seed> <lib_out> --epochs --patience --q-train --batch --window-holdout-frac` (`sidecar.rs`) | `<lib_out>` (= `fragment_library_precursors_ft.parquet`) | `peptidoform` (new table with replaced `predicted_irt`; input unchanged) |
+| deeplc_worker | `<in.parquet> <out.parquet> [threads]` (`sidecar.rs`, `run_deeplc`; `threads` is the engine's thread count, capped by the worker, see **DeepLC thread cap**) | `deeplc_out.parquet` | `id` |
+| deeplc_finetune | `<lib_in> <seed> <lib_out> --epochs --patience --q-train --batch --window-holdout-frac --seed --predict-threads` (`sidecar.rs`, `run_deeplc_finetune`) | `<lib_out>` (= `fragment_library_precursors_ft.parquet`) | `peptidoform` (new table with replaced `predicted_irt`; input unchanged) |
 | mokapot_worker / nn_rescore_worker | `<rescore.pin> <out.parquet>` + env `MUMDIA_NN_FOLDS/ITERS/TRAIN_FDR` (`rescore.rs:781-792`) | `rescore_sidecar_out.parquet` | `candidate_id` (echoes the flat row index) |
 | entrapment_worker | `<in.parquet> <out.parquet> <folds>` (`rescore.rs:718-724`) | `entrapment_out.parquet` | `row_id` |
 | mbr_worker | `<scored> <psms_csv> <out> --q-anchor --min-anchor-runs --q-transfer --seed [--out-scored] [--frag-csv --consensus-corr-min]` (`sidecar.rs:193-211`) | `<out>.parquet` | `candidate_id` |
@@ -127,7 +127,10 @@ code.
   `MUMDIA_PEPTDEEP_DEVICE` (auto|cuda|cpu), matching `MUMDIA_NN_DEVICE` in the
   rescorer rather than inventing a second convention.
 
-**deeplc_worker** (`sidecar.rs:81` `run_deeplc`)
+**deeplc_worker** (`sidecar.rs` `run_deeplc`)
+- ARGV `<in> <out> [threads]`; `threads` sizes torch's CPU pool under the
+  **DeepLC thread cap**. A worker run without it keeps torch's own default, under
+  the same cap.
 - IN `deeplc_in.parquet`: `id` u32, `peptidoform` str.
 - OUT `deeplc_out.parquet`: `id` u32, `predicted_rt` f32. Rust returns
   `HashMap<u32, f32>` (`sidecar.rs:104`).
@@ -320,11 +323,13 @@ that is non-standard (`is_std` false, e.g. a terminal mod outside `STD`) or was
 not predicted keeps its **original** `predicted_irt` unchanged, because the
 write-back is `preds.get(base_pf(pf), orig[i])` (`deeplc_finetune.py:156`), so
 only the sequences DeepLC actually re-predicted move onto the fine-tuned scale.
-Beyond the five flags Rust passes for a fine-tune (`--epochs/--patience/--q-train/--batch/
---window-holdout-frac`), and the three it passes for a base-model re-prediction
-(`--no-finetune --threads N --predict-threads N` with `-` as the seed path,
-`sidecar::run_deeplc_repredict`, N = the engine's rayon thread count because prediction is
-forward-only), the worker exposes CLI-only knobs that `run` never sets:
+Beyond the seven flags Rust passes for a fine-tune (`--epochs/--patience/--q-train/--batch/
+--window-holdout-frac/--seed/--predict-threads`, the last one the engine's rayon thread
+count for the forward-only library prediction while training keeps its bounded pool), and
+the three it passes for a base-model re-prediction (`--no-finetune --threads N
+--predict-threads N` with `-` as the seed path, `sidecar::run_deeplc_repredict`, N = the
+engine's rayon thread count because prediction is forward-only), the worker exposes
+CLI-only knobs that `run` never sets:
 `--device cpu|cuda` (cuda aborts with `SystemExit` if `torch.cuda.is_available()`
 is false, `deeplc_finetune.py:79-81`), `--threads` (torch CPU pool, defaults to
 `DEEPLC_FT_THREADS`), `--max-ref N` (cap reference PSMs), `--predict-limit N`
@@ -337,6 +342,40 @@ under `KMP_DUPLICATE_LIB_OK=TRUE`, and without pinning `OMP/MKL/OPENBLAS` to 1
 thread and bounding torch's pool, the two full thread pools oversubscribe the CPU
 during the backward pass (`deeplc_finetune.py:6-28, 82-91`). `--device cuda`
 sidesteps this entirely by moving compute off the CPU pools.
+
+**DeepLC thread cap.** Every DeepLC call site asks for the engine's rayon thread count
+(the fine-tune's training pool keeps its own bound), and both workers cap what they
+give torch at the physical cores available to the process: the unique
+`(physical_package_id, core_id)` pairs from sysfs over `sched_getaffinity(0)` on Linux,
+so a container or `taskset` mask is respected, and every physical core
+(`GetLogicalProcessorInformationEx`) on Windows. Elsewhere the count is unknown and
+nothing is capped. The cap is a ceiling, never a target: a request at or below it is
+taken as given, so the default path changes only on a host where the engine's thread
+count exceeds the physical cores, which is the default on any SMT machine run without
+`--threads`. `deeplc_worker.py` took torch's own default before (the physical cores on
+an MKL build), so it now also follows an explicit `--threads` below that. Measured on
+doxy (64 cores, 128 CPUs), the multi-head step took 10:41 at 96 threads and 18:09 at
+128, because every OpenMP-parallel op waits for its slowest thread.
+`MUMDIA_DEEPLC_THREAD_CAP=N` sets the cap explicitly, and `0` disables it. The
+fine-tune worker prints the resolved numbers and records them under `torch_threads` in
+`<lib_out>.summary.json` (requested and used training and prediction threads, the cap
+and where it came from); `deeplc_worker.py` prints them.
+
+Where the cap binds, the numbers change the way any change of `--threads` changes them.
+Measured on the CPU (DeepLC 4.5.0, one i9-13900KS with 24 physical cores): torch's
+kernels round differently at different thread counts, so 10 to 89 of 3,002 base-model
+predictions differed in the last bits between 8 threads and each of 1, 2, 4, 16 and 24
+(at most 3.1e-5), and 1,701 at 32 threads, past the physical cores (at most 1.4e-4). The
+multi-head calibration amplifies this for a few sequences: DeepLC's per-head spline
+hands over to a linear trail outside the reference's range, so a sequence at that edge
+can move by tens of seconds. On a 12,002-row synthetic library, 32 threads against the
+capped 24 moved the median row by 0.002 s, 63 rows by more than 1 s and one by 129 s,
+with the same 80 heads, ridge strength and best head; the unmodified worker at 8
+against 32 threads differs the same way (75 rows above 1 s, 179 s at most). Where the
+cap does not bind, old and new worker wrote byte-identical libraries. Predictions on a
+GPU do not depend on the torch thread count. The cap-binding sweep on a 64-core host,
+with peptides at 1% on `run_psm_q` over seeds, is the validation that remains
+(`docs/08_rt_im_train.md` section 4d).
 
 ### Rescorers (Stage F)
 
@@ -526,8 +565,8 @@ every entry on one axis before extraction, so no explicit reconciliation is done
 | `resolve_script` | `sidecar.rs:20` | Resolve a worker path: CWD-relative dir, then `<exe_dir>/<dir>`, then `<exe_dir>/scripts`, else CWD-relative fallback |
 | `run_worker` | `sidecar.rs:217` | Spawn `python <script> <argv...>`; `utf8=true` sets `PYTHONUTF8`/`PYTHONIOENCODING` (DeepLC/Keras crash on Windows cp1252) |
 | `run_ms2pip` | `sidecar.rs:42` | Write ms2pip_in.parquet, run worker, fold output to `HashMap<u32,HashMap<(u8,u16),f32>>` |
-| `run_deeplc` | `sidecar.rs:81` | Write deeplc_in.parquet, run worker, return `HashMap<u32,f32>` (`utf8=true`) |
-| `run_deeplc_finetune` | `sidecar.rs:111` | Run `deeplc_finetune.py <lib_in> <seed> <lib_out> --epochs --patience --q-train --batch --window-holdout-frac` (`utf8=true`) |
+| `run_deeplc` | `sidecar.rs:81` | Write deeplc_in.parquet, run worker with the engine's thread count, return `HashMap<u32,f32>` (`utf8=true`) |
+| `run_deeplc_finetune` | `sidecar.rs:111` | Run `deeplc_finetune.py <lib_in> <seed> <lib_out> --epochs --patience --q-train --batch --window-holdout-frac --seed --predict-threads` (`utf8=true`) |
 | `run_mbr` | `sidecar.rs:162` | Run `mbr_worker.py <scored> <psms_csv> <out> [--out-scored] [--frag-csv --consensus-corr-min] --q-anchor --min-anchor-runs --q-transfer --seed` |
 | `run_pin_sidecar` | `rescore.rs:740` | Write PIN keyed by row index, run mokapot/nn worker, map `score` back by row index |
 | `run_entrapment_gbm` | `rescore.rs:675` | Write features+meta Parquet, run entrapment worker, map `score` back by `row_id` |

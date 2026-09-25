@@ -288,8 +288,12 @@ pub fn run_deeplc(
             Col::Str("peptidoform".into(), peptidoforms.to_vec()),
         ],
     )?;
-    info!(n = ids.len(), "sidecar: running DeepLC");
-    run_worker(python, script, &[&inp, &outp], true).context("DeepLC worker failed")?;
+    // The worker sizes torch's CPU pool from this, capped at the physical cores available
+    // to it (`MUMDIA_DEEPLC_THREAD_CAP`). Without it torch took its own default, which
+    // ignored the engine's `--threads` (docs/13, "DeepLC thread cap").
+    let threads = rayon::current_num_threads().max(1).to_string();
+    info!(n = ids.len(), threads = %threads, "sidecar: running DeepLC");
+    run_worker(python, script, &[&inp, &outp, &threads], true).context("DeepLC worker failed")?;
 
     let t = TableFile::open(&outp)?;
     let oid = t.u32("id")?;
@@ -318,6 +322,11 @@ pub fn run_deeplc(
 /// DeepLC multitask fine-tune: adapt the RT model to this run's confident seed
 /// PSMs and rewrite the supplied library's `predicted_irt`. Positional contract:
 /// `deeplc_finetune.py <lib_in> <seed> <lib_out>`.
+///
+/// Training keeps the worker's bounded pool (`--threads`, default 8: the documented
+/// OpenMP crash was the backward pass). The whole-library prediction after it is
+/// forward-only and gets `threads` (`--predict-threads`), which the worker caps at the
+/// physical cores available to it; before, it ran on the 8 training threads.
 #[allow(clippy::too_many_arguments)]
 pub fn run_deeplc_finetune(
     python: &str,
@@ -331,6 +340,7 @@ pub fn run_deeplc_finetune(
     batch: usize,
     window_holdout_frac: f64,
     rng_seed: u64,
+    threads: usize,
 ) -> Result<()> {
     require_deeplc_version(python)?;
     info!(
@@ -343,6 +353,7 @@ pub fn run_deeplc_finetune(
         batch,
         window_holdout_frac,
         rng_seed,
+        threads,
         "sidecar: running DeepLC multitask fine-tune"
     );
     let ep = epochs.to_string();
@@ -357,6 +368,7 @@ pub fn run_deeplc_finetune(
     // remains, so this narrows the variance rather than removing it
     // (docs/14_build_test_deploy_gotchas.md).
     let rs = rng_seed.to_string();
+    let pt = threads.max(1).to_string();
     run_worker(
         python,
         script,
@@ -376,6 +388,8 @@ pub fn run_deeplc_finetune(
             &hf,
             "--seed",
             &rs,
+            "--predict-threads",
+            &pt,
         ],
         true,
     )
@@ -392,7 +406,8 @@ pub fn run_deeplc_finetune(
 /// writes the calibrated retention times into the library. See
 /// `RtImTrainConfig::multihead_calibration` for why one head plus a monotone curve is not
 /// the same thing. Positional contract:
-/// `deeplc_finetune.py <lib_in> <seed> <lib_out> --multihead <n_heads>`.
+/// `deeplc_finetune.py <lib_in> <seed> <lib_out> --multihead <n_heads>`. `threads` sizes
+/// both torch pools, and the worker caps it at the physical cores available to it.
 #[allow(clippy::too_many_arguments)]
 pub fn run_deeplc_multihead(
     python: &str,
@@ -444,7 +459,10 @@ pub fn run_deeplc_multihead(
 /// peptidoform, decoys on the DECOY_-stripped sequence, rows with non-standard residues
 /// keeping the imported value) is the one the fine-tune path uses. Positional contract:
 /// `deeplc_finetune.py <lib_in> - <lib_out> --no-finetune`. Prediction is forward-only,
-/// so it takes the engine's full thread count rather than the fine-tune's bounded pool.
+/// so it asks for the engine's full thread count rather than the fine-tune's bounded pool,
+/// and the worker caps that at the physical cores available to it: past them a second
+/// hyperthread on a busy core slows every OpenMP-parallel op (the multi-head step took
+/// 10:41 at 96 threads and 18:09 at 128 on a 64-core host).
 pub fn run_deeplc_repredict(
     python: &str,
     script: &str,

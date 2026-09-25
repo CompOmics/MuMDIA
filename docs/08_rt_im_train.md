@@ -656,14 +656,16 @@ OpenMP) and torch's Intel OpenMP coexist only under `KMP_DUPLICATE_LIB_OK=TRUE`,
 and each spawns a full thread pool that oversubscribes the CPU during the
 sustained backward pass and crashes the machine, so the worker sets the OMP/BLAS
 thread caps to 1 before importing numpy and torch (deeplc_finetune.py:6-13, 22-28)
-and bounds torch's own pool to `DEEPLC_FT_THREADS` (default 8) after import
-(deeplc_finetune.py:100-105). `deeplc` is imported before numpy for OpenMP load
-order (deeplc_finetune.py:33). Beyond the four flags the engine passes, the worker
-accepts standalone-only flags the engine never sets, so they take their defaults:
-`--device {cpu,cuda}` (cuda sidesteps the CPU OpenMP crash entirely), `--threads`,
-`--predict-threads` (0 = reuse `--threads`; the prediction phase is forward-only
-and usually tolerates more threads than the fine-tune backward pass), `--max-ref`,
-`--predict-limit`, and `--skip-predict` (deeplc_finetune.py:68-79, 89-94).
+and bounds torch's own training pool to `DEEPLC_FT_THREADS` (default 8) after
+import. `deeplc` is imported before numpy for OpenMP load order. The engine passes
+`--predict-threads` with its rayon thread count, so the whole-library prediction after
+the fine-tune, which is forward-only, no longer runs on the 8 training threads. Both
+pools are capped at the physical cores available to the process
+(`MUMDIA_DEEPLC_THREAD_CAP`, 0 = no cap; docs/13, "DeepLC thread cap"), and the
+resolved numbers are recorded under `torch_threads` in `<lib_out>.summary.json`. The
+worker also accepts standalone-only flags the engine never sets, so they take their
+defaults: `--device {cpu,cuda}` (cuda sidesteps the CPU OpenMP crash entirely),
+`--threads`, `--max-ref`, `--predict-limit`, and `--skip-predict`.
 
 The fine-tune sets no torch/numpy seed, so it is nondeterministic across runs
 (CLAUDE.md notes this). Its main use is library-input mode, where the base iRT is

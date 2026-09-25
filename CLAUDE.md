@@ -584,6 +584,14 @@ sections 10-16:
   only a FASTA-mode library build reaches it.
 - `mumdia doctor` probes `deeplc,numpy,pandas,pyarrow,torch,psm_utils` for the
   DeepLC interpreter, because `deeplc_finetune.py` imports the last three too.
+- Every DeepLC call site asks for the engine's thread count (the fine-tune's training
+  pool keeps its own bound of 8), and both DeepLC workers cap what they give torch at the
+  physical cores available to the process: sysfs (package, core) pairs under
+  `sched_getaffinity` on Linux, every physical core on Windows.
+  `MUMDIA_DEEPLC_THREAD_CAP=N` overrides it and `0` disables it; the resolved numbers are
+  under `torch_threads` in `<lib_out>.summary.json`. Measured on doxy (64 cores, 128
+  CPUs): the multi-head step took 10:41 at 96 threads and 18:09 at 128. The cap is a
+  ceiling, so below it nothing changes.
 - Any parquet written outside `mumdia-io` and read by the engine must be
   snappy-compressed with arrow `utf8` string columns. Polars defaults to zstd
   and `large_utf8`, and the engine rejects both ("Disabled feature at compile
