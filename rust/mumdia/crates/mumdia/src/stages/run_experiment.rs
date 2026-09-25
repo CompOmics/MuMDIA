@@ -1130,7 +1130,10 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
             )
         };
         if plan.is_auto() {
-            conv = plan.map_pooled(&all, |&i| convert_one(i))?;
+            // Not in per-run pools: a conversion already takes its share of the engine's
+            // pool by dividing it among the live conversions (`convert::LIVE_CONVERTS`),
+            // and inside a pool of its own that division would count the others twice.
+            conv = crate::sched::map_bounded(&all, plan.par, |&i| convert_one(i))?;
         } else {
             for chunk in all.chunks(par) {
                 let done: Vec<convert::ConvertOutputs> =
@@ -1434,14 +1437,9 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         {
             let i = rest[0];
             info!(run = %names[i], i = i + 1, n = n_runs, "run-experiment: per-run chain, alone to size the rest (parallel_runs = auto)");
-            let alone = crate::sched::RunConcurrency {
-                par: 1,
-                pool_threads: Some(threads_budget),
-            };
-            let mut one = alone.map_pooled(&[i], |&i| {
-                run_one(i, shared_ft.as_deref(), slice_source.as_deref())
-            })?;
-            let (comp, chrom, groups_dir) = one.remove(0);
+            // On the engine's whole pool, exactly as the sequential loop runs it.
+            let (comp, chrom, groups_dir) =
+                run_one(i, shared_ft.as_deref(), slice_source.as_deref())?;
             competed.push(comp);
             chroms.push(chrom);
             if grouped && slice_source.is_none() {
