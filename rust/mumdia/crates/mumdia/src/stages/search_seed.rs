@@ -67,10 +67,10 @@ pub struct SearchSeedParams<'a> {
     /// and its own `spectrum_q`, and combining the bands' fitted scalars is a wider
     /// tolerance than the estimator applied to the union (35% wider, measured; see
     /// [`crate::masscal`]), so `seed-pool` refits over the sidecars instead. Because the
-    /// pooled q is not this band's q in either direction, the sidecar carries the band's
-    /// best-scoring targets ([`crate::masscal::CALIBRANT_OFFER_PSMS`]) as well as the ones
-    /// this band's own q accepts, and `seed-pool` decides. The band's own
-    /// `masscal.json` is unaffected: it is still fitted on its confident targets alone.
+    /// pooled q is not this band's q in either direction, the sidecar carries EVERY target
+    /// PSM of the band, not only the ones this band's own q accepts, and `seed-pool`
+    /// decides. The band's own `masscal.json` is unaffected: it is still fitted on its
+    /// confident targets alone.
     ///
     /// An ungrouped run already fits on every deviation it has, writes no sidecar, and
     /// selects exactly the rows it always did.
@@ -267,22 +267,18 @@ pub fn run(p: SearchSeedParams) -> Result<u64> {
     // masscal for a grouped run to pool. Stays empty otherwise.
     let gid_base = p.fragment_offset.unwrap_or(0);
     let mut calibrants = crate::masscal::Calibrants::default();
-    let offer_floor = if p.emit_calibrants {
-        calibrant_offer_floor(&score_c, &is_dec)
-    } else {
-        // No sidecar, so nothing is offered and the loop below selects exactly what it
-        // always did: this band's confident targets.
-        f64::INFINITY
-    };
     for (i, (cid, b)) in rows.iter().enumerate() {
         if is_dec[i] {
             continue;
         }
         // This band's own calibrants, which are what its own `masscal.json` is fitted from.
         let confident = q[i] <= p.cfg.fdr_seed;
-        // Offered to the pool on top of them, and never to this band's own fit.
-        let offered = score_c[i] >= offer_floor;
-        if !confident && !offered {
+        // With the sidecar, EVERY target is offered to the pool on top of them (and never
+        // to this band's own fit): the pooled q decides, and no band-local rule can know
+        // in advance which of its targets the pooled q will accept (see
+        // `crate::masscal`, "Every target is offered"). Without it, the loop selects
+        // exactly what it always did: this band's confident targets.
+        if !confident && !p.emit_calibrants {
             continue;
         }
         if let Some(scan) = scan_by_index.get(&b.scan_index) {
@@ -411,26 +407,6 @@ pub fn run(p: SearchSeedParams) -> Result<u64> {
         "search-seed: done"
     );
     Ok(n)
-}
-
-/// Score of the [`crate::masscal::CALIBRANT_OFFER_PSMS`]-th best TARGET PSM: every target at
-/// or above it is offered to the pooled mass calibration whatever this band's own q says.
-///
-/// `-inf` when the band has fewer targets than that, so it offers all of them. The pooled
-/// selection inside one band is a score-ranked prefix of the band's targets, so a prefix is
-/// the shape of superset that makes `seed-pool`'s pooled-q selection exact.
-fn calibrant_offer_floor(scores: &[f64], is_decoy: &[bool]) -> f64 {
-    let mut targets: Vec<f64> = scores
-        .iter()
-        .zip(is_decoy)
-        .filter(|(_, d)| !**d)
-        .map(|(s, _)| *s)
-        .collect();
-    targets.sort_by(|a, b| b.total_cmp(a));
-    targets
-        .get(crate::masscal::CALIBRANT_OFFER_PSMS - 1)
-        .copied()
-        .unwrap_or(f64::NEG_INFINITY)
 }
 
 /// Peak indices to probe for a scan: the `top_n` most intense (index-ascending
@@ -838,35 +814,6 @@ mod survey_tests {
             (500.0, 510.0),
             (0.0, 2000.0)
         ]));
-    }
-
-    #[test]
-    fn a_band_offers_a_score_prefix_of_its_targets_to_the_pooled_mass_calibration() {
-        use super::calibrant_offer_floor;
-        use crate::masscal::CALIBRANT_OFFER_PSMS;
-        // Fewer targets than the cap: every target is offered, whatever the band's own q
-        // makes of them. This is the CI fixture's case, where each band's q rejects all of
-        // its targets and a q-selected sidecar would be empty in every band.
-        let scores = [9.0, 8.0, 7.0, 6.0];
-        let decoys = [false, true, false, false];
-        assert_eq!(
-            calibrant_offer_floor(&scores, &decoys),
-            f64::NEG_INFINITY,
-            "3 targets, so all three are at or above the floor"
-        );
-        assert_eq!(calibrant_offer_floor(&[], &[]), f64::NEG_INFINITY);
-        // More targets than the cap: the floor is the cap-th best TARGET score, and the
-        // decoys interleaved among them do not consume a slot.
-        let n = 2 * (CALIBRANT_OFFER_PSMS + 500);
-        let scores: Vec<f64> = (0..n).map(|i| (n - i) as f64).collect();
-        let decoys: Vec<bool> = (0..n).map(|i| i % 2 == 1).collect();
-        let floor = calibrant_offer_floor(&scores, &decoys);
-        let offered = scores
-            .iter()
-            .zip(&decoys)
-            .filter(|(s, d)| !**d && **s >= floor)
-            .count();
-        assert_eq!(offered, CALIBRANT_OFFER_PSMS);
     }
 
     #[test]

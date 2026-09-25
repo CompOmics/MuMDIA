@@ -207,6 +207,45 @@ diff "$work/out_grouped/peptides.tsv" "$work/out_grouped2/peptides.tsv" > /dev/n
     || { echo "two grouped runs of the same input disagree"; exit 1; }
 echo "    ok: 3 bands, $n_ms2 MS2 + $n_ms1 MS1 decodes, $n_grouped peptides, reproducible"
 
+# 4d. Two bands under the default `calibration: global`: the pooled fragment mass
+#     calibration is the one the ungrouped run fitted (docs/33 section 4a). Until
+#     2026-09-25 each band offered only its 2,000 best targets as calibrants, which was
+#     short at 2 and 4 bands on real data; every target is offered now. The fixture's
+#     bands hold fewer than 2,000 targets, so this pins the equality on real spectra and
+#     the test `a_two_band_pooled_mass_calibration_equals_the_unbanded_fit`
+#     (`tests/pipeline.rs`) pins the case the prefix got wrong.
+echo "=== smoke: two bands, global calibration, pooled mass calibration"
+cat > "$work/grouped_2b.json" <<'JSONEOF'
+{
+  "features": { "set": "extended" },
+  "extract": { "apex_count_window": 5, "apex_rt_prior_s": 120.0, "gate_min_score": 0.2 },
+  "groups": { "window_groups": 2, "calibration": "global" }
+}
+JSONEOF
+"$BIN" run --fasta test_data/fixture.fasta --mzml "$work/fixture.mzML" \
+    --out-dir "$work/out_grouped_2b" --config "$work/grouped_2b.json" --threads 2 \
+    > "$work/grouped_2b.log" 2>&1 \
+    || { tail -30 "$work/grouped_2b.log"; echo "the two-band run failed"; exit 1; }
+"$PY" - "$work/out/seed_psms.parquet.masscal.json" \
+    "$work/out_grouped_2b/seed_psms.parquet.masscal.json" <<'PYEOF'
+import json, sys
+one = json.load(open(sys.argv[1], encoding="utf-8"))
+two = json.load(open(sys.argv[2], encoding="utf-8"))
+if two.get("masscal_source") != "pooled_deviations":
+    sys.exit("the two-band run did not fit its mass calibration on the pooled deviations: %r"
+             % two.get("masscal_source"))
+if one["n_dev"] != two["n_dev"]:
+    sys.exit("the pooled mass calibration saw %d calibrant deviations, the ungrouped run %d"
+             % (two["n_dev"], one["n_dev"]))
+for key in ("frag_ppm_offset", "frag_tol_ppm"):
+    a, b = float(one[key]), float(two[key])
+    # The sidecar stores deviations as f32, so the two agree to f32 precision.
+    if abs(a - b) > 1e-5 * max(1.0, abs(a)):
+        sys.exit("%s: pooled %r against ungrouped %r" % (key, b, a))
+print("    ok: 2 bands, %d calibrant deviations, frag_tol_ppm %.6g, as ungrouped"
+      % (two["n_dev"], float(two["frag_tol_ppm"])))
+PYEOF
+
 # 5. The multi-run orchestrator. Nothing tested it: `run-experiment` has a pooled
 #    rescore, a by-source split, per-run quant and a cross-run LFQ that the
 #    single-run path never reaches, and a split that drops rows produces plausible

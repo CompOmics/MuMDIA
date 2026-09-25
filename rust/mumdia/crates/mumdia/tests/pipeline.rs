@@ -7,7 +7,7 @@ use mumdia::spectra::Ms1Scan;
 use mumdia::stages;
 use mumdia_core::config::Config;
 use mumdia_core::types::Ms2Scan;
-use mumdia_io::table::{write_table, Col, Table};
+use mumdia_io::table::{write_table, Col, Table, TableFile};
 
 fn tmp(name: &str) -> String {
     // Unique per call: cargo runs tests concurrently in one process, and several
@@ -879,4 +879,329 @@ fn search_seed_from_a_shared_scan_buffer_is_byte_identical_and_read_only() {
         h(&empty),
         "an empty lent MS2 slice was searched instead of the artifact"
     );
+}
+
+/// Two isolation windows, one library band under each, built so that the bands' own q
+/// scales disagree with the pooled one in the direction the fixed calibrant prefix got
+/// wrong (docs/33 section 4a).
+///
+/// Band A (window 400-500) holds 5,000 clean, high-scoring targets and five decoys that
+/// score below everything else in the run (a library must hold both labels). Band B
+/// (window 500-600) holds 2,500 targets and 60 decoys whose scores sit among its lowest
+/// 1,000 targets, so band B's own q puts those targets above 1% while the pooled q, whose
+/// denominator also counts band A, accepts every target of both bands (61 / 7,500). The
+/// deviations of band B are wider than band A's, so leaving out any of its pooled-accepted
+/// calibrants changes the fit. Every candidate has its own scan, carrying its four
+/// fragments at small, deterministic ppm deviations; consecutive fragment m/z are 60 ppm
+/// apart, so no scan matches a second candidate.
+struct TwoBandFixture {
+    prec: String,
+    frag: String,
+    ms2: String,
+    /// `(first_row, rows)` of each band in the precursor table.
+    spans: [(usize, usize); 2],
+    band_b_targets: usize,
+}
+
+fn craft_two_band_fixture() -> TwoBandFixture {
+    let (n_at, n_ad, n_bt, n_bd) = (5_000usize, 5usize, 2_500usize, 60usize);
+    let n_a = n_at + n_ad;
+    let n = n_a + n_bt + n_bd;
+    // Row order is precursor m/z order; band B's decoys are interleaved with its targets.
+    let mut is_decoy = vec![false; n];
+    // Position on the band's own score ladder: 1 is the best, 0 the worst. Band A's
+    // decoys get a negative position, which puts them below every row of the run.
+    let mut ladder = vec![0.0f64; n];
+    for (i, l) in ladder.iter_mut().enumerate().take(n_at) {
+        *l = 1.0 - i as f64 / n_at as f64;
+    }
+    for i in n_at..n_a {
+        is_decoy[i] = true;
+        ladder[i] = -1.0 - i as f64;
+    }
+    // Band B: targets on an even ladder, one decoy after every 16th of the bottom 1,000
+    // targets, placed just below the target before it.
+    let mut k_target = 0usize;
+    let mut k_decoy = 0usize;
+    for i in n_a..n {
+        let in_bottom = k_target >= n_bt - 1_000;
+        let decoy_due = in_bottom && k_decoy < n_bd && (k_target - (n_bt - 1_000)) / 16 > k_decoy;
+        if (decoy_due || k_target == n_bt) && k_decoy < n_bd {
+            is_decoy[i] = true;
+            ladder[i] = 1.0 - (k_target as f64 - 0.5) / n_bt as f64;
+            k_decoy += 1;
+        } else {
+            ladder[i] = 1.0 - k_target as f64 / n_bt as f64;
+            k_target += 1;
+        }
+    }
+    assert_eq!(
+        (k_target, k_decoy),
+        (n_bt, n_bd),
+        "the fixture places every row"
+    );
+    let prec_mz: Vec<f64> = (0..n)
+        .map(|i| {
+            if i < n_a {
+                400.5 + 99.0 * i as f64 / n_a as f64
+            } else {
+                500.5 + 99.0 * (i - n_a) as f64 / (n - n_a) as f64
+            }
+        })
+        .collect();
+    let letters = |mut c: usize| {
+        let mut s = String::new();
+        loop {
+            s.push(char::from(b"ACDEFGHILMNPQRSTVWYK"[c % 20]));
+            c /= 20;
+            if c == 0 {
+                break s;
+            }
+        }
+    };
+    let prec = tmp("two_band_prec.parquet");
+    write_table(
+        &prec,
+        vec![
+            Col::U32("candidate_id".into(), (0..n as u32).collect()),
+            Col::U32("peptidoform_id".into(), (0..n as u32).collect()),
+            Col::U32("base_peptide_id".into(), (0..n as u32).collect()),
+            Col::Str(
+                "peptidoform".into(),
+                (0..n).map(|i| format!("{}K", letters(i))).collect(),
+            ),
+            Col::I32("charge".into(), vec![2; n]),
+            Col::F64("precursor_mz".into(), prec_mz),
+            Col::F32("predicted_irt".into(), (0..n).map(|i| i as f32).collect()),
+            Col::Str(
+                "label".into(),
+                is_decoy
+                    .iter()
+                    .map(|&d| if d { "decoy" } else { "target" }.to_string())
+                    .collect(),
+            ),
+            Col::Str(
+                "protein".into(),
+                (0..n)
+                    .map(|i| {
+                        if is_decoy[i] {
+                            format!("DECOY_P{i}")
+                        } else {
+                            format!("P{i}")
+                        }
+                    })
+                    .collect(),
+            ),
+            Col::I32("n_fragments".into(), vec![4; n]),
+        ],
+    )
+    .unwrap();
+    // Geometric spacing, 60 ppm between consecutive fragments: wider than the seed's 20 ppm
+    // tolerance and the calibrant collection's 50 ppm window even after a 9 ppm deviation.
+    let frag_mz = |i: usize, k: usize| 200.0 * (1.0 + 60e-6f64).powi((i * 4 + k) as i32);
+    let frag = tmp("two_band_frag.parquet");
+    write_table(
+        &frag,
+        vec![
+            Col::U32(
+                "candidate_id".into(),
+                (0..n as u32).flat_map(|i| [i; 4]).collect(),
+            ),
+            Col::F64(
+                "mz".into(),
+                (0..n)
+                    .flat_map(|i| (0..4).map(move |k| frag_mz(i, k)))
+                    .collect(),
+            ),
+            Col::F32("predicted_intensity".into(), vec![1.0; 4 * n]),
+            Col::Str(
+                "name".into(),
+                (0..n)
+                    .flat_map(|_| (2..6).map(|o| format!("y{o}")))
+                    .collect(),
+            ),
+            Col::Str("ion_type".into(), vec!["y".to_string(); 4 * n]),
+            Col::I32(
+                "ordinal".into(),
+                (0..n).flat_map(|_| 2..6).collect::<Vec<i32>>(),
+            ),
+            Col::I32("frag_charge".into(), vec![1; 4 * n]),
+        ],
+    )
+    .unwrap();
+    // One scan per candidate. Summed intensity sets the hyperscore: band A far above band
+    // B, and inside each band the ladder above.
+    let ms2 = tmp("two_band_ms2.parquet");
+    let in_a = |i: usize| i < n_a;
+    let mut mz_lists = Vec::with_capacity(n);
+    let mut int_lists = Vec::with_capacity(n);
+    for i in 0..n {
+        let spread = if in_a(i) { 0.4 } else { 1.5 };
+        let mz: Vec<f32> = (0..4)
+            .map(|k| {
+                let dev_ppm = (((i * 7 + k * 3) % 13) as f64 - 6.0) * spread;
+                (frag_mz(i, k) * (1.0 + dev_ppm * 1e-6)) as f32
+            })
+            .collect();
+        let total = if in_a(i) && is_decoy[i] {
+            // Below band B's lowest (1e3): ln(1 + 500 / (1 + 5)) and less.
+            500.0 / (1.0 - ladder[i])
+        } else if in_a(i) {
+            1.0e6 * (1.0 + ladder[i])
+        } else {
+            1.0e3 * (1.0 + 99.0 * ladder[i])
+        };
+        mz_lists.push(mz);
+        int_lists.push(vec![(total / 4.0) as f32; 4]);
+    }
+    let (lo, hi): (Vec<f64>, Vec<f64>) = (0..n)
+        .map(|i| {
+            if in_a(i) {
+                (400.0, 500.0)
+            } else {
+                (500.0, 600.0)
+            }
+        })
+        .unzip();
+    write_table(
+        &ms2,
+        vec![
+            Col::U32("scan_index".into(), (0..n as u32).collect()),
+            Col::Str("id".into(), (0..n).map(|i| format!("scan={i}")).collect()),
+            Col::F64(
+                "rt_seconds".into(),
+                (0..n).map(|i| 10.0 + i as f64 * 0.5).collect(),
+            ),
+            Col::U32(
+                "window_id".into(),
+                (0..n).map(|i| u32::from(!in_a(i))).collect(),
+            ),
+            Col::F64(
+                "window_target".into(),
+                lo.iter().zip(&hi).map(|(a, b)| 0.5 * (a + b)).collect(),
+            ),
+            Col::F64("window_lower".into(), lo),
+            Col::F64("window_upper".into(), hi),
+            Col::OptF64("precursor_mz".into(), vec![None; n]),
+            Col::OptI32("precursor_charge".into(), vec![None; n]),
+            Col::ListF32("mz".into(), mz_lists),
+            Col::ListF32("intensity".into(), int_lists),
+        ],
+    )
+    .unwrap();
+    TwoBandFixture {
+        prec,
+        frag,
+        ms2,
+        spans: [(0, n_a), (n_a, n - n_a)],
+        band_b_targets: n_bt,
+    }
+}
+
+/// The pooled mass calibration of a 2-band search is the unbanded fit (docs/33 section
+/// 4a). Until 2026-09-25 each band offered only its 2,000 best targets beyond its own
+/// confident set, which is exact at 8 bands and more and short below: here band B's own q
+/// rejects its lowest targets and the pooled q accepts all 2,500, so a 2,000-target offer
+/// lost the deviations of the rest and the pooled fit came out narrower than the unbanded
+/// one, as it did on the HYE Astral benchmark at 2 and 4 bands.
+#[test]
+fn a_two_band_pooled_mass_calibration_equals_the_unbanded_fit() {
+    let f = craft_two_band_fixture();
+    let cfg = Config::default();
+    let seed = |prec: &str, offset: Option<u32>, emit: bool, tag: &str| -> String {
+        let out = tmp(&format!("two_band_seed_{tag}.parquet"));
+        stages::search_seed::run(stages::search_seed::SearchSeedParams {
+            fragment_offset: offset,
+            ms2_scans: None,
+            emit_calibrants: emit,
+            ms2: &f.ms2,
+            library_precursors: prec,
+            library_fragments: &f.frag,
+            out: &out,
+            cfg: &cfg.search_seed,
+            bucket_size: cfg.extract.bucket_size,
+            config_hash: "test",
+        })
+        .unwrap();
+        out
+    };
+    let json = |p: &str| -> serde_json::Value {
+        serde_json::from_str(&std::fs::read_to_string(format!("{p}.masscal.json")).unwrap())
+            .unwrap()
+    };
+    let unbanded_seed = seed(&f.prec, None, false, "unbanded");
+    let unbanded = json(&unbanded_seed);
+    assert_eq!(
+        mumdia_io::table::nrows(&unbanded_seed).unwrap(),
+        7_565,
+        "one seed PSM per candidate, as designed"
+    );
+
+    let mut bands = Vec::new();
+    for (k, &(first, rows)) in f.spans.iter().enumerate() {
+        let slice = tmp(&format!("two_band_slice_{k}.parquet"));
+        mumdia::groups::write_band_slice(&f.prec, first, rows, &slice).unwrap();
+        let out = seed(&slice, Some(first as u32), true, &format!("band{k}"));
+        bands.push((out, first as u32, rows as u32));
+    }
+    // The fixture does what it is for: band B's own q rejects hundreds of the targets the
+    // pooled q will accept, more than a 2,000-target prefix could make up for.
+    let confident = |path: &str| {
+        let t = TableFile::open(path).unwrap();
+        t.f64("spectrum_q")
+            .unwrap()
+            .iter()
+            .zip(&t.str("label").unwrap())
+            .filter(|(q, l)| **q <= 0.01 && *l == "target")
+            .count()
+    };
+    let own_b = confident(&bands[1].0);
+    assert!(
+        own_b + 300 < f.band_b_targets && own_b < 2_000,
+        "band B's own q must reject its low targets, got {own_b} of {} confident",
+        f.band_b_targets
+    );
+
+    let pooled = tmp("two_band_pooled.parquet");
+    let seeds: Vec<stages::seed_pool::BandSeed> = bands
+        .iter()
+        .map(|(path, offset, rows)| stages::seed_pool::BandSeed {
+            path: path.clone(),
+            offset: *offset,
+            rows: *rows,
+        })
+        .collect();
+    stages::seed_pool::run(stages::seed_pool::SeedPoolParams {
+        seeds: &seeds,
+        masscals: &bands
+            .iter()
+            .map(|b| mumdia::masscal::json_path(&b.0))
+            .collect::<Vec<_>>(),
+        calibrants: &bands
+            .iter()
+            .map(|b| mumdia::masscal::calibrants_path(&b.0))
+            .collect::<Vec<_>>(),
+        cfg: &cfg.search_seed,
+        out: &pooled,
+    })
+    .unwrap();
+    let got = json(&pooled);
+    assert_eq!(got["masscal_source"], "pooled_deviations");
+    // The pooled q accepts every target of both bands, which is what the unbanded seed
+    // accepts too, so the two fits see the same deviations.
+    assert_eq!(confident(&pooled), 5_000 + f.band_b_targets);
+    assert_eq!(confident(&unbanded_seed), 5_000 + f.band_b_targets);
+    assert_eq!(
+        got["n_dev"], unbanded["n_dev"],
+        "the pooled fit saw a different calibrant set than the unbanded one"
+    );
+    // The sidecar stores deviations as f32, so the fitted numbers agree to f32 precision
+    // rather than bit for bit (docs/33 section 4a: 8.452381550 against 8.452381790).
+    for key in ["frag_ppm_offset", "frag_tol_ppm", "ppm_residual_mad"] {
+        let (a, b) = (got[key].as_f64().unwrap(), unbanded[key].as_f64().unwrap());
+        assert!(
+            (a - b).abs() <= 1e-5 * b.abs().max(1.0),
+            "{key}: pooled {a} against unbanded {b}"
+        );
+    }
 }

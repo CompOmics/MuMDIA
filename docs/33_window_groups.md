@@ -240,15 +240,38 @@ calibration already uses the pooled anchors under `groups.calibration = global`:
   targets alone, and still what `groups.calibration = per_group` extracts with.
 
 The band's q is not the pooled q in either direction, so the sidecar carries more than the
-band's own selection: the band's best-scoring targets down to
-`masscal::CALIBRANT_OFFER_PSMS` (2,000) are offered whatever its own q says, and the pooled
-q decides. That matters where the band q is STRICTER, which is the `1/T` case above: on the
-CI fixture at three bands, every band's own q rejects every one of its targets, so a
-strictly q-selected sidecar would be empty in all three. With the offer, the three bands
-contribute 437, 401 and 230 deviations, the pool selects all 1,068 of them and fits
-`frag_tol_ppm` 5.0 at offset 0.0 -- the same calibration, to the digit, that the ungrouped
-search of the same spectra produces. Before this the same run calibrated nothing and
-extracted at the configured 20 ppm.
+band's own selection: EVERY target PSM of the band is offered whatever its own q says, and
+the pooled q decides. That matters where the band q is STRICTER, which is the `1/T` case
+above: on the CI fixture at three bands, every band's own q rejects every one of its
+targets, so a strictly q-selected sidecar would be empty in all three. With the offer, the
+three bands contribute 437, 401 and 230 deviations, the pool selects all 1,068 of them and
+fits `frag_tol_ppm` 5.0 at offset 0.0 -- the same calibration, to the digit, that the
+ungrouped search of the same spectra produces. Before this the same run calibrated nothing
+and extracted at the configured 20 ppm.
+
+Until 2026-09-25 the offer was a fixed prefix, each band's 2,000 best targets. No rule a
+band can apply to its own data gives a superset of what the pooled q accepts, because the
+pooled threshold moves with the other bands: a band of clean, high-scoring targets lowers
+it, and the pool then accepts targets of a noisier band at scores where that band's own q is
+well above the threshold. The prefix was sized from the 100-band benchmark (about 1,000
+pooled-accepted targets per band) and was exact from 8 bands up, and short below it. On the
+six-file HYE Astral benchmark, 2026-09-24:
+
+| bands | calibrant deviations | `frag_tol_ppm` |
+|---|---|---|
+| unbanded | 181,196 | 8.45 |
+| 2, 2,000-target prefix | 167,418 | 7.76 |
+| 4, 2,000-target prefix | 177,380 | 8.24 |
+| 8 and more, 2,000-target prefix | 181,196 | 8.45 |
+
+The missing deviations belonged to the lower-scoring accepted targets, which are the
+noisier ones, so the short fits came out narrower rather than wider. With every target
+offered the pooled fit is the unbanded fit at any band count; `ci/smoke.sh` checks this at
+two bands on the fixture, and `tests/pipeline.rs`
+(`a_two_band_pooled_mass_calibration_equals_the_unbanded_fit`) on a two-band library built
+so that one band's own q rejects hundreds of targets the pooled q accepts, which the old
+prefix failed by 2,000 deviations of 30,000. The sidecar stays 16 B per deviation, now for every
+target of the band.
 
 `masscal.json` gains `masscal_source`, which reads `pooled_deviations` or `band_scalars`. A
 band directory seeded before the sidecar existed has none, and the pool then combines the

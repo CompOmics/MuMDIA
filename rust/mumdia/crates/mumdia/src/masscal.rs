@@ -35,24 +35,31 @@ pub const MIN_CALIBRANTS: usize = 20;
 /// Fewest calibrant deviations the optional m/z-dependent (LOESS) grid is fitted from.
 pub const MIN_LOESS_CALIBRANTS: usize = 50;
 
-/// How many of a band's best-scoring target PSMs are OFFERED as calibrants in the sidecar,
-/// over and above the ones the band's own q accepts.
-///
-/// A band estimates `spectrum_q` on its own PSMs, and that estimate is not the pooled one
-/// in either direction. On the HYE Astral benchmark it is looser (106,088 band-confident
-/// against 97,584 pooled), which is half of why the banded tolerance came out wide, and
-/// `seed-pool` re-selecting on the pooled q removes that. On a band with few targets it is
-/// far STRICTER instead: on the CI fixture at three bands, every band's own q rejects every
-/// one of its targets, so a sidecar of "the band's confident calibrants" is empty in all
-/// three and the pooled fit has nothing, while the same spectra searched against the whole
-/// library give 1,068 calibrants.
-///
-/// The set the pooled q accepts inside one band is a score-ranked prefix of that band's
-/// targets, so offering a prefix rather than the band's own q-selected set is the shape of
-/// superset that makes the pooled selection exact. Sized above what a band can plausibly
-/// need -- about 1,000 PSMs per band were pooled-accepted on the 100-band benchmark -- while
-/// the sidecar stays a few MB for a whole run.
-pub const CALIBRANT_OFFER_PSMS: usize = 2_000;
+// Every target is offered.
+//
+// A band estimates `spectrum_q` on its own PSMs, and that estimate is not the pooled one
+// in either direction. On the HYE Astral benchmark at 100 bands it is looser (106,088
+// band-confident against 97,584 pooled), which is half of why the banded tolerance came
+// out wide, and `seed-pool` re-selecting on the pooled q removes that. On a band with few
+// targets, or a band whose low-scoring targets sit among decoys, it is STRICTER instead:
+// on the CI fixture at three bands every band's own q rejects every one of its targets.
+//
+// So the sidecar has to carry a superset of what the pooled q will accept, and no rule a
+// band can apply on its own data gives one. The pooled threshold moves with the other
+// bands: a band of clean, high-scoring targets lowers it, and then the pool accepts
+// targets of a noisier band at a score where that band's own q is several times the
+// threshold. There was such a rule until 2026-09-25, a fixed prefix of each band's 2,000
+// best targets, sized from the 100-band benchmark, where about 1,000 per band were
+// pooled-accepted. It was exact from 8 bands up and short below: on the six-file HYE
+// Astral benchmark the pooled fit saw 167,418 deviations at 2 bands and 177,380 at 4,
+// against the unbanded 181,196, and fitted 7.76 and 8.24 ppm against 8.45, because a
+// band of a 2-band plan has tens of thousands of pooled-accepted targets. Every target
+// PSM of the band is therefore offered, and `seed-pool` keeps the ones the pooled q
+// accepts, so the pooled fit is the unbanded fit at any band count
+// (`tests/pipeline.rs`, `a_two_band_pooled_mass_calibration_equals_the_unbanded_fit`).
+// The sidecar stays 16 B per deviation, now one row per matched fragment of every target
+// PSM of the band rather than of its best 2,000; `seed-pool` reads the sidecars one band
+// at a time and keeps only the accepted deviations.
 
 /// Median offset and `1.5 * p95(|dev - median|)` tolerance, floored at 5 ppm.
 ///
