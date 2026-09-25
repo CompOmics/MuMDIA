@@ -581,6 +581,14 @@ rule, so target/decoy exchangeability is preserved. At
 and the block is a no-op. The surviving row's rank is written out as
 `selected_peak_rank`.
 
+The no-op is detected before the map is built (`every_candidate_is_unique`). The
+rows of one input are contiguous, so each source's candidate ids are checked
+against one bitset over the library's id range, cleared between sources: one bit
+per library candidate and one pass, where the map took about 35 bytes per row
+(~9 GB at the 258.75M-row immunopeptidomics pool) to find no repeated key. A
+repeated pair, or a source that decreases along the rows, builds the map as
+before.
+
 ### rescore: the multi-context q columns
 
 After scoring, the stage computes q-values at several aggregation levels, each an

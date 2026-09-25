@@ -888,7 +888,11 @@ pub fn run_hashed(p: RescoreParams) -> Result<Written> {
     // the whole block is a no-op (byte-identical). Decoys collapse by the identical
     // rule, so target/decoy exchangeability is preserved. Tie-break: lower peak_rank
     // then lower row index (deterministic).
-    if n > 0 {
+    //
+    // The no-op is now detected before the map is built (`every_candidate_is_unique`):
+    // the map was `with_capacity(n)` over every row, ~9 GB transient at the 258.75M-row
+    // immunopeptidomics pool, to find that no key repeats.
+    if n > 0 && !every_candidate_is_unique(&source, &cid) {
         let mut best: HashMap<(u32, u32), usize> = HashMap::with_capacity(n);
         for i in 0..n {
             let key = (source[i], cid[i]);
@@ -1541,6 +1545,39 @@ fn classify_entrapment(
         real[i] = !is_ent;
     }
     (ent, real)
+}
+
+/// Whether every `(source, candidate_id)` pair occurs once, which is when the top-K
+/// collapse keeps every row and can be skipped.
+///
+/// The rows of one competed input are contiguous and `source` is the input's index, so
+/// `source` does not decrease along the rows. Each source's candidate ids are then checked
+/// against one bitset over `0..=max(candidate_id)`, cleared between sources: an eighth of
+/// a byte per library candidate (25 MB at a 203M-precursor library) and one pass, where
+/// the map the collapse builds takes ~35 bytes per row. `false` whenever that cannot
+/// decide: a source that decreases, or a repeated pair, sends the caller to the map, which
+/// is exact in every case.
+fn every_candidate_is_unique(source: &[u32], cid: &[u32]) -> bool {
+    if source.windows(2).any(|w| w[1] < w[0]) {
+        return false;
+    }
+    let Some(&max) = cid.iter().max() else {
+        return true;
+    };
+    let mut seen = vec![0u64; max as usize / 64 + 1];
+    let mut current = source.first().copied();
+    for (&s, &c) in source.iter().zip(cid) {
+        if Some(s) != current {
+            seen.fill(0);
+            current = Some(s);
+        }
+        let (word, bit) = (c as usize / 64, 1u64 << (c % 64));
+        if seen[word] & bit != 0 {
+            return false;
+        }
+        seen[word] |= bit;
+    }
+    true
 }
 
 /// A group's winning row: its score, the three label bits it carries into the q kernel,
@@ -4348,6 +4385,41 @@ b
             schema_id: "schema-b".into(),
         };
         assert!(validate_feature_schema(&expected, &different_id, "id.parquet").is_err());
+    }
+
+    #[test]
+    fn the_collapse_is_skipped_exactly_when_no_candidate_repeats() {
+        // The map `run` builds for the top-K collapse, as it builds it: the pair count it
+        // ends with is `n` exactly when no (source, candidate_id) pair repeats.
+        let map_says_unique = |source: &[u32], cid: &[u32]| {
+            let pairs: std::collections::HashSet<(u32, u32)> =
+                source.iter().copied().zip(cid.iter().copied()).collect();
+            pairs.len() == cid.len()
+        };
+        let cases: Vec<(Vec<u32>, Vec<u32>)> = vec![
+            (vec![], vec![]),
+            (vec![0], vec![7]),
+            (vec![0, 0, 0], vec![3, 1, 2]),
+            // The same candidate in two runs is two candidates.
+            (vec![0, 0, 1, 1], vec![5, 9, 5, 9]),
+            // A repeat inside one run.
+            (vec![0, 0, 1], vec![5, 5, 6]),
+            (vec![0, 1, 1], vec![5, 6, 6]),
+            // Ids on the 64-bit word edges.
+            (vec![0, 0, 0], vec![63, 64, 0]),
+            (vec![0, 0], vec![64, 64]),
+        ];
+        for (source, cid) in &cases {
+            assert_eq!(
+                every_candidate_is_unique(source, cid),
+                map_says_unique(source, cid),
+                "{source:?} {cid:?}"
+            );
+        }
+        // A source that goes back down cannot be decided by the per-source bitset, even
+        // when every pair is unique: the map is asked instead.
+        assert!(map_says_unique(&[1, 0], &[4, 4]));
+        assert!(!every_candidate_is_unique(&[1, 0], &[4, 4]));
     }
 
     #[test]
