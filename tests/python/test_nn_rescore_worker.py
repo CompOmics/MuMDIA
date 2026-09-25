@@ -350,6 +350,8 @@ LEGACY_ENV = {
     "MUMDIA_NN_FINAL_POOL_SCORE": "1",
     # W1: gather scoring batches with a numpy fancy index.
     "MUMDIA_NN_GATHER": "numpy",
+    # W5: scan the init features on one thread.
+    "MUMDIA_NN_SCAN_THREADS": "1",
 }
 
 IDENTITY_ENV = dict(
@@ -447,3 +449,28 @@ def test_default_speedups_leave_scores_byte_identical(torch_available, tmp_path,
         "a default-path speed-up changed the scores (%d of %d rows differ)"
         % (int(np.count_nonzero(rs != ns)), n)
     )
+
+
+def test_threaded_init_scan_picks_the_serial_feature_and_count():
+    """The threaded init scan must return the serial scan's (column, sign, count) exactly.
+
+    Tied columns make the tie-breaking rule (lowest column, sign +1 first, strict `>`)
+    decide the winner, which is the part a completion-order reduction would get wrong.
+    """
+    w = _import_worker()
+    rng = np.random.default_rng(11)
+    n, nf = 30000, 9
+    tgt = rng.random(n) < 0.5
+    x = rng.normal(size=(n, nf)).astype(np.float32)
+    x[tgt, 1] += 2.0
+    x[:, 4] = x[:, 1]           # an exact duplicate of the best column
+    x[:, 6] = -x[:, 1]          # its mirror image, tying on sign -1
+    x[:, 7] = np.round(x[:, 7], 1)
+    for topk in (0, 500):
+        serial = w.n_targets_at_many(x, tgt, 0.01, topk=topk, workers=1)
+        for workers in (2, 3, 8):
+            assert w.n_targets_at_many(x, tgt, 0.01, topk=topk, workers=workers) == serial
+    assert serial[0] == 1 and serial[1] == 1, "the tie must go to the lowest column"
+    assert w.scan_workers(16, 300000, 387) == 15
+    assert w.scan_workers(16, 10000, 387) == 1
+    assert w.scan_workers(16, 300000, 3) == 3

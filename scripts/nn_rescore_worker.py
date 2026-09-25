@@ -163,6 +163,11 @@ Env knobs (all optional):
     MUMDIA_NN_PREGATHER_GB= 8        pre-gather the fold's training rows when they fit in
                                      this many GB (one gather per iteration instead of a
                                      fancy-index copy per minibatch)
+    MUMDIA_NN_SCAN_THREADS = auto    threads for the init feature scan (one column, both
+                                     signs, per task; the winner is reduced in the serial
+                                     (column, sign) order, so the choice is identical).
+                                     auto = the torch CPU thread count, capped by the sample
+                                     size (one thread per 20,000 rows). 1 = serial.
     MUMDIA_NN_GATHER      = torch    how `score_idx` gathers a scoring batch on the
                                      in-memory backend: torch = `torch.index_select` into
                                      one reused buffer (multi-threaded); numpy = the
@@ -548,18 +553,49 @@ def n_targets_at_col(col, tgt, fdr, topk=0):
     return _count_at_fdr_sorted(tgt[order], fdr)[0]
 
 
-def n_targets_at_many(X, is_target, fdr, topk=0):
+# Rows of init sample per scan thread before another thread is worth starting: below this
+# a column's sort is a few milliseconds and the pool's start-up and GIL hand-offs dominate.
+_SCAN_ROWS_PER_THREAD = 20000
+
+
+def scan_workers(requested, rows, cols):
+    """Threads for the init feature scan, capped by the sample size and the column count."""
+    return max(1, min(int(requested), int(cols), rows // _SCAN_ROWS_PER_THREAD))
+
+
+def n_targets_at_many(X, is_target, fdr, topk=0, workers=1, initializer=None):
     """Best (column, sign) by targets accepted at `fdr`, over every column of X.
 
     Ties resolve toward the lowest column index and sign +1, matching the original nested
     loop, which scanned j ascending with sign +1 before -1 and used a strict `>`.
+
+    With `workers > 1` the columns are counted on a thread pool (numpy's argsort, cumsum and
+    fancy indexing release the GIL), one task per column evaluating both signs from the same
+    column read. Every count is computed exactly as in the serial loop, and the winner is
+    then reduced over (j, sign) in the serial loop's order with the same strict `>`, so the
+    result does not depend on the thread count or on task completion order. `initializer`
+    runs once per pool thread; the worker passes its flush-to-zero setting there, because a
+    new thread does not inherit the main thread's floating-point control state on Windows.
     """
     tgt = np.asarray(is_target).astype(bool)
-    best_j, best_sign, best_n = 0, 1, -1
-    for j in range(X.shape[1]):
+
+    def both_signs(j):
         col = np.ascontiguousarray(X[:, j])
-        for sign in (1, -1):
-            c = n_targets_at_col(col if sign > 0 else -col, tgt, fdr, topk=topk)
+        return (n_targets_at_col(col, tgt, fdr, topk=topk),
+                n_targets_at_col(-col, tgt, fdr, topk=topk))
+
+    ncol = X.shape[1]
+    if workers > 1 and ncol > 1:
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=min(int(workers), ncol),
+                                initializer=initializer) as ex:
+            counts = list(ex.map(both_signs, range(ncol)))
+    else:
+        counts = [both_signs(j) for j in range(ncol)]
+    best_j, best_sign, best_n = 0, 1, -1
+    for j, pair in enumerate(counts):
+        for sign, c in zip((1, -1), pair):
             if c > best_n:
                 best_n, best_j, best_sign = c, j, sign
     return best_j, best_sign, best_n
@@ -754,6 +790,26 @@ def main():
             flush=True,
         )
     DEBUG_DENORMALS = env_i("MUMDIA_NN_DEBUG_DENORMALS", 0) != 0
+
+    def _fp_thread_init():
+        """Give a Python pool thread the main thread's flush-to-zero state.
+
+        FTZ/DAZ live in each thread's MXCSR, and a thread started on Windows begins with the
+        default state rather than inheriting its creator's. Numpy work on a pool thread must
+        see the same state as the serial code it replaces, or a subnormal operand could round
+        or compare differently there.
+        """
+        if FLUSH_DENORMAL:
+            torch.set_flush_denormal(True)
+
+    # Threads for the worker's own numpy thread pools (the init scan here). Defaults to the
+    # torch CPU thread count resolved above, which already carries the cap.
+    _scan_raw = os.environ.get("MUMDIA_NN_SCAN_THREADS", "auto").strip().lower()
+    SCAN_THREADS = (
+        min(torch.get_num_threads(), _THREAD_CAP)
+        if _scan_raw in ("", "auto")
+        else max(1, int(float(_scan_raw)))
+    )
 
     stream_env = os.environ.get("MUMDIA_NN_STREAM", "auto").lower()
     filesize = os.path.getsize(pin_path)
@@ -1179,7 +1235,9 @@ def main():
                 # over feature blocks (see n_targets_at_many): same counts and tie-breaking
                 # as the per-feature scan, ~387x fewer Python-level argsort calls.
                 best_j, best_sign, best_n = n_targets_at_many(
-                    Xsamp, ysamp, TRAIN_FDR, topk=env_i("MUMDIA_NN_INIT_TOPK", 0)
+                    Xsamp, ysamp, TRAIN_FDR, topk=env_i("MUMDIA_NN_INIT_TOPK", 0),
+                    workers=scan_workers(SCAN_THREADS, len(init_idx), Xsamp.shape[1]),
+                    initializer=_fp_thread_init,
                 )
                 if best_n > 0 or sample_n >= len(tr_idx):
                     break

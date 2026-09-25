@@ -743,6 +743,15 @@ MLP. Set it explicitly for the logreg path.
     0.08 s at 8 threads). Same values and shapes, so the scores are identical, on
     CPU and on CUDA. `numpy` restores the old gather; the streaming backend always
     uses it.
+  - `MUMDIA_NN_SCAN_THREADS` (default: the torch CPU thread count): the init feature
+    scan counts its columns on a thread pool, one task per column with both signs
+    from one column read, and one thread per 20,000 sample rows at most. Each count is
+    computed as before and the winner is reduced in the serial (column, sign) order
+    with the same strict `>`, so the chosen feature, sign and count are identical
+    (400,000 x 120 synthetic pool: 24.9 s against 4.3 s at 8 threads). `1` runs it
+    serially.
+  - Pool threads get the main thread's flush-to-zero state through their
+    initializer, because a thread started on Windows does not inherit it.
 
   `test_default_speedups_leave_scores_byte_identical` (`tests/python`, needs torch)
   runs the worker with every switch set back and with the defaults and asserts equal
