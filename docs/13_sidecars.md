@@ -715,6 +715,29 @@ MLP. Set it explicitly for the logreg path.
   `iter_batches` reads ahead and had buffered a second copy of the matrix. Six-run
   Astral pool: process tree 17.9 GB before, under 10 after; HYE B01 12.0 -> 5.05 GB,
   identical identifications (`docs/27` section 0.1).
+- **Where the rescore sidecar files go, and when they are removed.** The feature
+  handoff, the fold keys, the worker's output and the NN worker's streaming memmap
+  (placed next to the output) go to one work directory: `<out-dir>/sidecar_work`
+  under `run` and `run-experiment`, `sidecar_work` in the current directory for a
+  standalone `mumdia rescore`. `MUMDIA_SIDECAR_DIR` moves it for all three, and
+  `mumdia rescore --work-dir` names it for one call. It is an environment variable
+  rather than a configuration field, so moving the files (onto a RAM-backed
+  directory or a disk with room) does not change the configuration hash. The files
+  are named after the output and the engine's PID, so nothing ever reused them and
+  they piled up: 7.7 GB per HYE rescore and 359 GB per immunopeptidomics pool for
+  the handoff alone. They are now removed once the worker's scores have passed
+  `align_sidecar_scores`, and the entrapment worker's files as well. A failed worker
+  still leaves its input behind for a rerun; `MUMDIA_KEEP_HANDOFF=1` keeps the files
+  on success too. Before a byte is written, the engine asks the sidecar interpreter
+  for the free space of that directory (`shutil.disk_usage`). It refuses the run when
+  the space is below what the handoff cannot be smaller than (half the raw f32 size
+  for the parquet handoff, 9 bytes a value for the PIN, plus the fold keys and the
+  output), and the message names the directory, the size and the ways out. Between
+  that floor and the usual size it warns. `MUMDIA_SIDECAR_SPACE_CHECK=0` skips the
+  check. The scores do not depend on where the directory is, as long as the NN
+  worker takes the same backend. Its in-memory or memmap choice depends on free
+  memory, and files on a RAM-backed directory lower free memory, so pin
+  `MUMDIA_NN_STREAM` when comparing two placements.
 - **Torch CPU threads are capped** at 16, or at the performance-core count on a
   hybrid CPU (Windows `GetLogicalProcessorInformationEx`); the engine's `--threads`
   arrives as `MUMDIA_NN_THREADS` and is an upper bound. The MLP is flat past 16

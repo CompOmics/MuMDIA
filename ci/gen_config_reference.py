@@ -848,6 +848,16 @@ COMPUTED_ENV_DEFAULTS: dict[str, str] = {
         "min(`--threads`, 8), or min(cores, 8) without `--threads`. `0` or `1` is serial "
         "(`codec.rs` `codec_threads`)"
     ),
+    "MUMDIA_SIDECAR_DIR": (
+        "`<out-dir>/sidecar_work` under `run` and `run-experiment`; `sidecar_work` in the "
+        "current directory, or `--work-dir`, for `mumdia rescore`. A path moves the "
+        "rescore sidecar files there (`stages/rescore.rs` `sidecar_work_dir`)"
+    ),
+    "MUMDIA_SIDECAR_SPACE_CHECK": (
+        "on (a rescore sidecar run whose work directory cannot hold the handoff is "
+        "refused before it is written). `0` / `off` / `false` / `no` skips the check "
+        "(`stages/rescore.rs` `check_sidecar_space`)"
+    ),
     "MUMDIA_WIDE_SCAN": (
         "coalesced row-group reads for rescore's feature stream and compete's "
         "pass-through copy. `plain` restores the plain reader with its parallel decode "

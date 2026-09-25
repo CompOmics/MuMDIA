@@ -281,8 +281,9 @@ Per-subcommand specifics that are easy to miss:
 - `search-seed` reads `extract.bucket_size` from the config (not a `search_seed`
   field) for its fragment-index bucketing (`main.rs:473`, `run.rs:225`).
 - `rescore` standalone accepts several `--competed` tables for experiment-wide
-  scoring and uses a fixed `sidecar_work` working directory (`main.rs:588`);
-  inside `run` it is passed exactly one table and a per-out-dir work directory.
+  scoring and puts its sidecar files in `--work-dir` (default `sidecar_work` in the
+  current directory); inside `run` it is passed exactly one table and a per-out-dir
+  work directory. `MUMDIA_SIDECAR_DIR` overrides both (docs/13).
 - `run-experiment` (`main.rs:660`, `run_experiment.rs:267`) runs the per-file
   chain over N runs, rescores all competed tables in one pass
   (`run_experiment.rs:428`), then splits the scored table by `source` for per-run

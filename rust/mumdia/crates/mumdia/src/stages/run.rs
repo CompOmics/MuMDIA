@@ -657,7 +657,7 @@ pub fn run(p: RunParams) -> Result<()> {
     let w = rescore::run_hashed(rescore::RescoreParams {
         competed: std::slice::from_ref(&competed),
         out: &scored,
-        work_dir: &d("sidecar_work"),
+        work_dir: &rescore::sidecar_work_dir(&d("sidecar_work")),
         script_dir: &cfg.predict_frag.sidecar_script_dir,
         cfg: &cfg.rescore,
         config_hash: &ch,

@@ -162,6 +162,17 @@ contracts exist:
   without it a killed `mumdia` leaves the Python process holding its feature
   memmap and every later rescore fails on a file it cannot delete.
 
+The work directory is `sidecar_work` under the run's output directory inside `run`
+and `run-experiment`, and `sidecar_work` in the current directory (or `--work-dir`)
+for a standalone `mumdia rescore`; `MUMDIA_SIDECAR_DIR` overrides all of them
+(`sidecar_work_dir`). Once a worker's scores have passed `align_sidecar_scores`,
+its handoff, fold keys and output are removed (`remove_sidecar_files`), unless
+`MUMDIA_KEEP_HANDOFF=1`; a failed worker leaves them in place. Before the handoff
+is written, `check_sidecar_space` refuses a work directory whose free space is below
+the smallest the handoff can be, and warns below its usual size
+(`MUMDIA_SIDECAR_SPACE_CHECK=0` skips it). docs/13 "Where the rescore sidecar files
+go" has the sizes.
+
 ## How it works
 
 ### compete: grouping

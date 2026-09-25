@@ -202,7 +202,11 @@ pub struct RescoreParams<'a> {
     /// One or more competed feature tables (experiment-wide concat).
     pub competed: &'a [String],
     pub out: &'a str,
-    /// Working directory + script dir for the Mokapot sidecar (when selected).
+    /// Working directory for the sidecar files (the feature handoff, the fold keys, the
+    /// worker's output and its memmap), and the script dir for the sidecar (when
+    /// selected). Callers take it from [`sidecar_work_dir`], so `MUMDIA_SIDECAR_DIR`
+    /// moves it. The files are removed once the scores are aligned
+    /// (`MUMDIA_KEEP_HANDOFF=1` keeps them).
     pub work_dir: &'a str,
     pub script_dir: &'a str,
     pub cfg: &'a RescoreConfig,
@@ -629,6 +633,13 @@ pub fn run_hashed(p: RescoreParams) -> Result<Written> {
     let mut prewritten: Option<SidecarPaths> = None;
     if stream_to_handoff {
         let paths = sidecar_paths(&p, sidecar_script.expect("checked in the condition"));
+        check_sidecar_space(
+            p.cfg.python.as_deref(),
+            &paths.dir(),
+            n,
+            feat_names.len(),
+            paths.format(),
+        )?;
         // The validation aborts the stream on the first offending row rather than after the
         // file is complete. A malformed competed table used to cost nothing: the serial
         // scan ran before `run_pin_sidecar` was ever entered and nothing had been written.
@@ -1860,6 +1871,13 @@ fn run_entrapment_gbm(
             (0..cid.len()).map(|i| feats.row(i)[fi] as f64).collect(),
         ));
     }
+    check_sidecar_space(
+        Some(python),
+        p.work_dir,
+        cid.len(),
+        feat_names.len(),
+        HandoffFormat::ParquetF64,
+    )?;
     write_table(&inp, cols)?;
 
     let script = crate::sidecar::resolve_script(p.script_dir, "entrapment_worker.py");
@@ -1877,7 +1895,10 @@ fn run_entrapment_gbm(
     let t = TableFile::open(&outp)?;
     let orid = t.u32("row_id")?;
     let osc = t.f64("score")?;
-    align_sidecar_scores(&orid, &osc, cid.len(), "entrapment_worker")
+    let aligned = align_sidecar_scores(&orid, &osc, cid.len(), "entrapment_worker")?;
+    drop(t);
+    remove_sidecar_files(&[&inp, &outp], keep_handoff());
+    Ok(aligned)
 }
 
 /// Owns a spawned sidecar child and kills it on drop unless it was already awaited.
@@ -2607,6 +2628,186 @@ fn bail_non_finite(
     Ok(())
 }
 
+/// The directory the rescore sidecar files go to: `MUMDIA_SIDECAR_DIR` when it is set and
+/// not empty, else `default` (the orchestrators pass `<out-dir>/sidecar_work`, the
+/// standalone `mumdia rescore` passes `sidecar_work` unless `--work-dir` names one).
+///
+/// An environment variable rather than a configuration field, so moving the files, for
+/// instance onto a RAM-backed directory or a disk with room, does not change the
+/// configuration hash every artifact records. The NN worker puts its streaming memmap next
+/// to its output file, so the memmap moves too.
+pub fn sidecar_work_dir(default: &str) -> String {
+    match std::env::var("MUMDIA_SIDECAR_DIR") {
+        Ok(d) if !d.trim().is_empty() => d,
+        _ => default.to_string(),
+    }
+}
+
+/// Whether `MUMDIA_KEEP_HANDOFF` asks to keep the sidecar files once the scores are read
+/// back (`1`, `true`, `yes` or `on`).
+fn keep_handoff() -> bool {
+    env_flag(std::env::var("MUMDIA_KEEP_HANDOFF").ok().as_deref())
+}
+
+/// `1`, `true`, `yes` or `on`, in any case, is set; anything else, or unset, is not.
+fn env_flag(v: Option<&str>) -> bool {
+    matches!(
+        v.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("1" | "true" | "yes" | "on")
+    )
+}
+
+/// Remove the files of one sidecar invocation once its scores are aligned, unless
+/// `keep` is set. Returns the bytes removed.
+///
+/// Every invocation names its files after its output and its PID (`sidecar_paths`), so
+/// nothing ever reused or removed them: they piled up in the work directory, 7.7 GB per
+/// HYE rescore and 359 GB per immunopeptidomics pool for the handoff alone. They are
+/// removed only after `align_sidecar_scores` has accepted the worker's output, so a failed
+/// worker still leaves its input behind for a rerun or a look at it; `MUMDIA_KEEP_HANDOFF=1`
+/// keeps them on success too. A file that cannot be removed is reported and does not fail
+/// the stage, which has its scores.
+fn remove_sidecar_files(files: &[&str], keep: bool) -> u64 {
+    if keep {
+        info!(
+            files = ?files,
+            "rescore: kept the sidecar files (MUMDIA_KEEP_HANDOFF)"
+        );
+        return 0;
+    }
+    let mut freed = 0u64;
+    for f in files {
+        let bytes = std::fs::metadata(f).map(|m| m.len()).unwrap_or(0);
+        match std::fs::remove_file(f) {
+            Ok(()) => freed += bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => warn!(file = %f, error = %e, "rescore: could not remove a sidecar file"),
+        }
+    }
+    info!(
+        freed = %human_bytes(freed as f64),
+        files = files.len(),
+        "rescore: removed the sidecar files (set MUMDIA_KEEP_HANDOFF=1 to keep them)"
+    );
+    freed
+}
+
+/// How the feature handoff is encoded, for the space estimate.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum HandoffFormat {
+    Pin,
+    Parquet,
+    /// The entrapment worker's input: f64 features in a parquet table.
+    ParquetF64,
+}
+
+/// `(floor, estimate)` bytes of a sidecar invocation's files for `rows` PSMs and `nf`
+/// features: the handoff, the fold keys (4 bytes a row) and the worker's output (~20).
+///
+/// The floor is what the handoff cannot be smaller than, so less free space than that is
+/// certain to fail; the estimate is its usual size. The PIN writes every value as `{:.6}`
+/// plus a tab, never fewer than 9 bytes. The f32 parquet handoff measured 0.72 of the raw
+/// f32 size on HYE (1.01 GB for 879,018 x 387) and 0.87 on the immunopeptidomics pool
+/// (359 GB for 258.75M rows), so half the raw size is taken as its floor and the raw size
+/// as its estimate.
+fn handoff_space(rows: u64, nf: u64, format: HandoffFormat) -> (u64, u64) {
+    let cells = rows.saturating_mul(nf);
+    let (floor, estimate) = match format {
+        HandoffFormat::Pin => (cells.saturating_mul(9), cells.saturating_mul(11)),
+        HandoffFormat::Parquet => (cells.saturating_mul(2), cells.saturating_mul(4)),
+        HandoffFormat::ParquetF64 => (cells.saturating_mul(4), cells.saturating_mul(8)),
+    };
+    // SpecId, Label, ScanNr, ExpMass, CalcMass, Peptide, Proteins; then keys and output.
+    let per_row = rows.saturating_mul(48 + 4 + 20);
+    (
+        floor.saturating_add(per_row),
+        estimate.saturating_add(per_row),
+    )
+}
+
+/// Free bytes on the filesystem that holds `dir`, asked of the sidecar's own interpreter
+/// (`shutil.disk_usage`): the standard library has no portable free-space call, and the
+/// interpreter is the one thing every sidecar run already requires. `None` when it cannot
+/// be asked, which skips the check rather than failing a run the sidecar would then fail
+/// anyway, with its own clearer error.
+fn free_bytes(python: &str, dir: &str) -> Option<u64> {
+    let out = std::process::Command::new(python)
+        .args([
+            "-c",
+            "import shutil, sys; print(shutil.disk_usage(sys.argv[1]).free)",
+            dir,
+        ])
+        .env("PYTHONUTF8", "1")
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout).trim().parse().ok()
+}
+
+/// Refuse a sidecar run whose work directory cannot hold its files, before a byte of them
+/// is written (`MUMDIA_SIDECAR_SPACE_CHECK=0` skips the check).
+///
+/// Without it a pooled rescore wrote the handoff until the disk filled, hundreds of GB and
+/// hours into the stage, and failed there with a bare `No space left on device`.
+fn check_sidecar_space(
+    python: Option<&str>,
+    dir: &str,
+    rows: usize,
+    nf: usize,
+    format: HandoffFormat,
+) -> Result<()> {
+    if std::env::var("MUMDIA_SIDECAR_SPACE_CHECK")
+        .is_ok_and(|v| matches!(v.trim(), "0" | "off" | "false" | "no"))
+    {
+        return Ok(());
+    }
+    let (floor, estimate) = handoff_space(rows as u64, nf as u64, format);
+    let Some(free) = python.and_then(|py| free_bytes(py, dir)) else {
+        tracing::debug!(
+            dir,
+            "rescore: free space unknown; skipping the sidecar space check"
+        );
+        return Ok(());
+    };
+    space_verdict(free, floor, estimate, dir, rows, nf, format)
+}
+
+/// The decision of [`check_sidecar_space`] once the free space is known.
+fn space_verdict(
+    free: u64,
+    floor: u64,
+    estimate: u64,
+    dir: &str,
+    rows: usize,
+    nf: usize,
+    format: HandoffFormat,
+) -> Result<()> {
+    if free < floor {
+        anyhow::bail!(
+            "rescore: the sidecar work directory {dir} has {} free, and the {format:?} \
+             handoff of {rows} PSMs x {nf} features needs at least {} ({} expected) with \
+             the fold keys and the worker's output. Point MUMDIA_SIDECAR_DIR (or `mumdia \
+             rescore --work-dir`) at a directory with room, rescore fewer runs per \
+             invocation, or set MUMDIA_SIDECAR_SPACE_CHECK=0 to skip this check.",
+            human_bytes(free as f64),
+            human_bytes(floor as f64),
+            human_bytes(estimate as f64)
+        );
+    }
+    if free < estimate {
+        warn!(
+            dir,
+            free = %human_bytes(free as f64),
+            expected = %human_bytes(estimate as f64),
+            "rescore: the sidecar work directory may be too small for the handoff \
+             (MUMDIA_SIDECAR_DIR moves it)"
+        );
+    }
+    Ok(())
+}
+
 /// The per-invocation sidecar file paths, and which handoff encoding they name.
 struct SidecarPaths {
     /// The feature handoff: a parquet for `nn_torch`, the tab-separated PIN otherwise.
@@ -2614,6 +2815,30 @@ struct SidecarPaths {
     out: String,
     foldkeys: String,
     use_pq: bool,
+}
+
+impl SidecarPaths {
+    /// The directory the files are in.
+    fn dir(&self) -> String {
+        std::path::Path::new(&self.handoff)
+            .parent()
+            .map(|d| d.to_string_lossy().into_owned())
+            .filter(|d| !d.is_empty())
+            .unwrap_or_else(|| ".".to_string())
+    }
+
+    fn format(&self) -> HandoffFormat {
+        if self.use_pq {
+            HandoffFormat::Parquet
+        } else {
+            HandoffFormat::Pin
+        }
+    }
+
+    /// Every file of the invocation, for the cleanup.
+    fn files(&self) -> Vec<&str> {
+        vec![&self.handoff, &self.foldkeys, &self.out]
+    }
 }
 
 /// Per-invocation sidecar filenames. Fixed names (`rescore.pin`,
@@ -2688,6 +2913,13 @@ fn run_pin_sidecar(
         Some(paths) => paths,
         None => {
             let paths = sidecar_paths(p, script_name);
+            check_sidecar_space(
+                Some(python),
+                &paths.dir(),
+                cid.len(),
+                feat_names.len(),
+                paths.format(),
+            )?;
             let matrix = feats.as_ref().ok_or_else(|| {
                 anyhow::anyhow!(
                     "rescore: the feature matrix was released before the {script_name} handoff"
@@ -2818,6 +3050,7 @@ fn run_pin_sidecar(
     let orow = t.u32("candidate_id")?;
     let osc = t.f64("score")?;
     let aligned = align_sidecar_scores(&orow, &osc, cid.len(), script_name)?;
+    drop(t);
     info!(
         script = script_name,
         handoff_and_fold_keys_ms = handoff_ms as u64,
@@ -2825,6 +3058,8 @@ fn run_pin_sidecar(
         read_scores_ms = t_read.elapsed().as_millis() as u64,
         "rescore: sidecar timings"
     );
+    // The scores are in memory and validated; the files are not read again.
+    remove_sidecar_files(&paths.files(), keep_handoff());
     Ok(aligned)
 }
 
@@ -4543,6 +4778,127 @@ b
                 );
             }
         }
+    }
+
+    #[test]
+    fn the_sidecar_files_are_removed_unless_kept() {
+        let files: Vec<String> = ["h.parquet", "k.parquet", "o.parquet"]
+            .iter()
+            .map(|n| scratch(&format!("cleanup_{n}")))
+            .collect();
+        let refs: Vec<&str> = files.iter().map(String::as_str).collect();
+        for f in &files {
+            std::fs::write(f, b"12345").unwrap();
+        }
+        // Kept: nothing removed, nothing counted.
+        assert_eq!(remove_sidecar_files(&refs, true), 0);
+        assert!(files.iter().all(|f| std::path::Path::new(f).exists()));
+        // Removed, and a file that is already gone is not an error.
+        std::fs::remove_file(&files[1]).unwrap();
+        assert_eq!(remove_sidecar_files(&refs, false), 10);
+        assert!(files.iter().all(|f| !std::path::Path::new(f).exists()));
+        // The flag's spellings.
+        for (v, want) in [
+            (None, false),
+            (Some("1"), true),
+            (Some(" TRUE "), true),
+            (Some("yes"), true),
+            (Some("on"), true),
+            (Some("0"), false),
+            (Some(""), false),
+            (Some("no"), false),
+        ] {
+            assert_eq!(env_flag(v), want, "{v:?}");
+        }
+    }
+
+    #[test]
+    fn the_space_check_refuses_below_the_floor_and_names_the_way_out() {
+        let (floor, estimate) = handoff_space(1_000, 100, HandoffFormat::Parquet);
+        assert!(floor < estimate);
+        // Half the raw f32 size and the raw size, plus the per-row metadata, keys and
+        // output.
+        assert_eq!(floor, 1_000 * 100 * 2 + 1_000 * 72);
+        assert_eq!(estimate, 1_000 * 100 * 4 + 1_000 * 72);
+        let (pin_floor, _) = handoff_space(1_000, 100, HandoffFormat::Pin);
+        assert!(
+            pin_floor > estimate,
+            "a PIN value is never fewer than 9 bytes"
+        );
+        let e = space_verdict(
+            floor - 1,
+            floor,
+            estimate,
+            "D:/x",
+            1_000,
+            100,
+            HandoffFormat::Parquet,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            e.contains("MUMDIA_SIDECAR_DIR") && e.contains("--work-dir"),
+            "{e}"
+        );
+        assert!(
+            e.contains("D:/x") && e.contains("1000 PSMs x 100 features"),
+            "{e}"
+        );
+        // Between the floor and the estimate it warns and goes on; above it, silently.
+        space_verdict(
+            floor,
+            floor,
+            estimate,
+            "D:/x",
+            1_000,
+            100,
+            HandoffFormat::Parquet,
+        )
+        .unwrap();
+        space_verdict(
+            estimate,
+            floor,
+            estimate,
+            "D:/x",
+            1_000,
+            100,
+            HandoffFormat::Parquet,
+        )
+        .unwrap();
+        // An interpreter that cannot be started skips the check.
+        assert_eq!(
+            free_bytes("mumdia-no-such-interpreter-for-this-test", "."),
+            None
+        );
+        check_sidecar_space(
+            Some("mumdia-no-such-interpreter-for-this-test"),
+            ".",
+            usize::MAX / 4,
+            1_000,
+            HandoffFormat::Parquet,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn the_sidecar_directory_is_named_by_its_handoff() {
+        let paths = SidecarPaths {
+            handoff: "D:/work/sc/rescore_x_1.features.parquet".to_string(),
+            out: "D:/work/sc/rescore_x_1_out.parquet".to_string(),
+            foldkeys: "D:/work/sc/rescore_x_1.foldkeys.parquet".to_string(),
+            use_pq: true,
+        };
+        assert_eq!(paths.dir(), "D:/work/sc");
+        assert_eq!(paths.format(), HandoffFormat::Parquet);
+        assert_eq!(paths.files().len(), 3);
+        let bare = SidecarPaths {
+            handoff: "rescore.pin".to_string(),
+            out: String::new(),
+            foldkeys: String::new(),
+            use_pq: false,
+        };
+        assert_eq!(bare.dir(), ".");
+        assert_eq!(bare.format(), HandoffFormat::Pin);
     }
 
     #[test]

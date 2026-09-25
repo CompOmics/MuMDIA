@@ -794,7 +794,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
     let scored_written = rescore::run_hashed(rescore::RescoreParams {
         competed: &competed,
         out: &scored_combined,
-        work_dir: &d("sidecar_work"),
+        work_dir: &rescore::sidecar_work_dir(&d("sidecar_work")),
         script_dir: &cfg.predict_frag.sidecar_script_dir,
         cfg: &cfg.rescore,
         config_hash: &ch,

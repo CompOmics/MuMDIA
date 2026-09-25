@@ -321,6 +321,12 @@ enum Cmd {
         competed: Vec<String>,
         #[arg(long)]
         out: String,
+        /// Directory for a sidecar classifier's files: the feature handoff, the fold keys,
+        /// the worker's output and its streaming memmap. Default: `MUMDIA_SIDECAR_DIR`
+        /// when set, else `sidecar_work` in the current directory. The files are removed
+        /// once the scores are read back, unless `MUMDIA_KEEP_HANDOFF=1`.
+        #[arg(long)]
+        work_dir: Option<String>,
         #[arg(long)]
         config: Option<String>,
     },
@@ -1466,14 +1472,17 @@ fn real_main() -> Result<()> {
         Cmd::Rescore {
             competed,
             out,
+            work_dir,
             config,
         } => {
             let cfg = load_config(&config)?;
             let ch = mumdia_io::hash::blake3_str(&cfg.canonical_json());
+            let work_dir =
+                work_dir.unwrap_or_else(|| stages::rescore::sidecar_work_dir("sidecar_work"));
             stages::rescore::run(stages::rescore::RescoreParams {
                 competed: &competed,
                 out: &out,
-                work_dir: "sidecar_work",
+                work_dir: &work_dir,
                 script_dir: &cfg.predict_frag.sidecar_script_dir,
                 cfg: &cfg.rescore,
                 config_hash: &ch,
