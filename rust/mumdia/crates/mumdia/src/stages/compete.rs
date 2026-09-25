@@ -526,11 +526,13 @@ fn features_bytes_reusable(
 /// so the features file's content hash. Every reader decodes the same values in the same
 /// order, which is what the downstream stages see.
 ///
-/// When some rows are removed but at least one features row group lost none, the table is
-/// spliced instead ([`splice_kept_rows`]): the untouched row groups are copied as bytes
-/// and only the ones that lost a row are rewritten. When every row group lost a row (a
-/// grouping that removes many rows, such as `base_peptide`) splicing would rewrite all of
-/// them through a temporary file, so the whole table is rewritten directly.
+/// When some rows are removed but the row groups that lost none hold at least half the
+/// table's rows ([`splice_pays`]), the table is spliced instead ([`splice_kept_rows`]):
+/// the untouched row groups are copied as bytes and only the ones that lost a row are
+/// rewritten. Otherwise (a grouping that removes many rows, such as `base_peptide`, leaves
+/// few or no untouched groups) splicing would write most of the table twice, once into a
+/// scratch file and once into the output, so the whole table is rewritten directly. A
+/// splice that fails is also followed by the rewrite.
 fn publish_competed(
     t: &TableFile,
     features: &str,
@@ -543,7 +545,7 @@ fn publish_competed(
     let n = t.nrows;
     match features_bytes_reusable(t, feat_names, synth_peak_rank, audit)? {
         // `keep` is sorted and unique within 0..n, so n entries are every row.
-        Reuse::Yes if keep.len() == n => match publish_copy_of(features, out) {
+        Reuse::Yes if keep.len() == n => match link_or_copy(features, out) {
             Ok(how) => return Ok((n as u64, Published::FeaturesFile(how))),
             Err(e) => warn!(
                 error = %format!("{e:#}"),
@@ -553,16 +555,27 @@ fn publish_competed(
         },
         Reuse::Yes => {
             let spans = row_group_spans(t);
-            if spans.iter().any(|&(s, len)| kept_in(keep, s, len) == len) {
-                let (rows, rewritten) =
-                    splice_kept_rows(t, features, out, feat_names, keep, &spans)?;
-                return Ok((
-                    rows,
-                    Published::Spliced {
-                        rewritten,
-                        row_groups: spans.len(),
-                    },
-                ));
+            if splice_pays(keep, &spans, n) {
+                // The splice only saves work over the rewrite below; it is never required.
+                // `out` is written behind an `AtomicPath` and the scratch files are removed
+                // on drop, so a failed splice leaves nothing behind, and the rewrite then
+                // produces the table the stage always produced.
+                match splice_kept_rows(t, features, out, feat_names, keep, &spans) {
+                    Ok((rows, rewritten)) => {
+                        return Ok((
+                            rows,
+                            Published::Spliced {
+                                rewritten,
+                                row_groups: spans.len(),
+                            },
+                        ))
+                    }
+                    Err(e) => warn!(
+                        error = %format!("{e:#}"),
+                        "compete: splicing the untouched features row groups into the \
+                         competed table failed; rewriting it"
+                    ),
+                }
             }
         }
         Reuse::No(reason) => info!(
@@ -597,6 +610,59 @@ fn row_group_spans(t: &TableFile) -> Vec<(usize, usize)> {
 /// How many of the sorted, unique row indices `keep` fall in `[start, start + len)`.
 fn kept_in(keep: &[usize], start: usize, len: usize) -> usize {
     keep.partition_point(|&r| r < start + len) - keep.partition_point(|&r| r < start)
+}
+
+/// Whether splicing the `n`-row features table beats rewriting it: the non-empty row
+/// groups that keep every row must hold at least half the rows.
+///
+/// A splice rewrites each dirty run into a scratch file and then copies that file's bytes
+/// into the output, so a dirty row is written twice and a clean row once, while a full
+/// rewrite writes every row once but decodes and re-encodes all of them. With the clean
+/// rows at half the table or more, the splice re-encodes at most half the rows and writes
+/// at most 1.5 times the table, and its largest scratch file holds at most half the rows.
+/// Below that, most of the table would go through the scratch file, which costs up to
+/// twice the write traffic and scratch space close to the table's own size. An empty row
+/// group counts for nothing either way.
+fn splice_pays(keep: &[usize], spans: &[(usize, usize)], n: usize) -> bool {
+    let clean_rows: usize = spans
+        .iter()
+        .filter(|&&(s, len)| len > 0 && kept_in(keep, s, len) == len)
+        .map(|&(_, len)| len)
+        .sum();
+    clean_rows > 0 && 2 * clean_rows >= n
+}
+
+/// [`publish_copy_of`], with the test build's fault injection in front of it.
+fn link_or_copy(features: &str, out: &str) -> Result<FileCopy> {
+    #[cfg(test)]
+    inject(Fault::Publish)?;
+    publish_copy_of(features, out)
+}
+
+/// Test-only faults in the fast publication paths, so the fallbacks to the rewrite are
+/// exercised without a filesystem that refuses a link or a splice. Per thread, because the
+/// test harness runs tests concurrently and each stage call publishes on its own thread.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Fault {
+    /// [`link_or_copy`] fails before touching the destination.
+    Publish,
+    /// [`splice_kept_rows`] fails after it has appended a clean run and written the first
+    /// dirty run's scratch file, so both the output temp and a scratch file exist.
+    Splice,
+}
+
+#[cfg(test)]
+thread_local! {
+    static FAULT: std::cell::Cell<Option<Fault>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn inject(at: Fault) -> Result<()> {
+    if FAULT.with(|f| f.get()) == Some(at) {
+        anyhow::bail!("compete: injected {at:?} failure");
+    }
+    Ok(())
 }
 
 /// Removes a scratch file when dropped, on the error path as on the normal one.
@@ -668,6 +734,8 @@ fn splice_kept_rows(
             &local,
             COMPETED_ROW_GROUP_ROWS,
         )?;
+        #[cfg(test)]
+        inject(Fault::Splice)?;
         let spliced = w.append_row_groups(&scratch.0, |_| true)?;
         if spliced != local.len() as u64 {
             anyhow::bail!(
@@ -1462,7 +1530,8 @@ mod tests {
     /// peptidoform of the row two before them, which under the default
     /// `peptidoform_charge` grouping makes each a second member of that row's group (same
     /// charge parity; the callers pick rows whose label matches too). `extra` adds a column
-    /// the competed schema does not have; `peak_rank = false` leaves out `peak_rank`.
+    /// the competed schema does not have; `peak_rank = false` leaves out `peak_rank`;
+    /// `nullable` stores `n_matched_fragments` as a nullable column (every value present).
     fn write_features_table(
         path: &str,
         n: usize,
@@ -1470,6 +1539,7 @@ mod tests {
         dups: &[usize],
         extra: bool,
         peak_rank: bool,
+        nullable: bool,
     ) {
         let f = |g: &dyn Fn(usize) -> f64| (0..n).map(g).collect::<Vec<f64>>();
         let pform = |i: usize| {
@@ -1499,8 +1569,15 @@ mod tests {
             IoCol::F64("precursor_mz".into(), f(&|i| 400.0 + i as f64)),
             IoCol::F64("prelim_score".into(), f(&|i| (i % 7) as f64 / 7.0)),
             IoCol::F64("charge".into(), f(&|i| 2.0 + (i % 2) as f64)),
-            IoCol::F64("n_matched_fragments".into(), f(&|i| (i % 5) as f64)),
         ]);
+        cols.push(if nullable {
+            IoCol::OptF64(
+                "n_matched_fragments".into(),
+                (0..n).map(|i| Some((i % 5) as f64)).collect(),
+            )
+        } else {
+            IoCol::F64("n_matched_fragments".into(), f(&|i| (i % 5) as f64))
+        });
         if extra {
             cols.push(IoCol::F64("not_a_feature".into(), f(&|i| i as f64)));
         }
@@ -1562,7 +1639,7 @@ mod tests {
         let dir = tmp_dir("identity");
         let feats = dir.join("features.parquet");
         let feats = feats.to_str().unwrap();
-        write_features_table(feats, 21, 4, &[], false, true);
+        write_features_table(feats, 21, 4, &[], false, true, false);
         let out = dir.join("competed.parquet");
         let out = out.to_str().unwrap();
         let cfg = CompeteConfig::default();
@@ -1600,7 +1677,7 @@ mod tests {
         let dir = tmp_dir("given_hash");
         let feats = dir.join("features.parquet");
         let feats = feats.to_str().unwrap();
-        write_features_table(feats, 9, 4, &[], false, true);
+        write_features_table(feats, 9, 4, &[], false, true, false);
         let out = dir.join("competed.parquet");
         let out = out.to_str().unwrap();
         let cfg = CompeteConfig::default();
@@ -1616,7 +1693,7 @@ mod tests {
         let dir = tmp_dir("rerun");
         let feats = dir.join("features.parquet");
         let feats = feats.to_str().unwrap();
-        write_features_table(feats, 9, 4, &[], false, true);
+        write_features_table(feats, 9, 4, &[], false, true, false);
         let out = dir.join("competed.parquet");
         let out = out.to_str().unwrap();
         let cfg = CompeteConfig::default();
@@ -1647,7 +1724,7 @@ mod tests {
         let dir = tmp_dir("splice");
         let feats = dir.join("features.parquet");
         let feats = feats.to_str().unwrap();
-        write_features_table(feats, 16, 4, &[7], false, true);
+        write_features_table(feats, 16, 4, &[7], false, true, false);
         let out = dir.join("competed.parquet");
         let out = out.to_str().unwrap();
         let cfg = CompeteConfig::default();
@@ -1687,7 +1764,7 @@ mod tests {
         let dir = tmp_dir("splice_empty_group");
         let feats = dir.join("features.parquet");
         let feats = feats.to_str().unwrap();
-        write_features_table(feats, 16, 1, &[7], false, true);
+        write_features_table(feats, 16, 1, &[7], false, true, false);
         let out = dir.join("competed.parquet");
         let out = out.to_str().unwrap();
         let cfg = CompeteConfig::default();
@@ -1712,7 +1789,7 @@ mod tests {
         let dir = tmp_dir("splice_all_dirty");
         let feats = dir.join("features.parquet");
         let feats = feats.to_str().unwrap();
-        write_features_table(feats, 8, 4, &[4, 7], false, true);
+        write_features_table(feats, 8, 4, &[4, 7], false, true, false);
         let out = dir.join("competed.parquet");
         let out = out.to_str().unwrap();
         let cfg = CompeteConfig::default();
@@ -1751,7 +1828,7 @@ mod tests {
             let dir = tmp_dir(&format!("fallback_{tag}"));
             let feats = dir.join("features.parquet");
             let feats = feats.to_str().unwrap();
-            write_features_table(feats, 9, 4, &[], extra, peak_rank);
+            write_features_table(feats, 9, 4, &[], extra, peak_rank, false);
             let out = dir.join("competed.parquet");
             let out = out.to_str().unwrap();
             let (w, rep) = compete_with(feats, out, cfg, None);
@@ -1763,5 +1840,239 @@ mod tests {
             assert_eq!(t.i32("peak_rank").unwrap(), vec![0; 9], "{tag}");
             let _ = std::fs::remove_dir_all(&dir);
         }
+    }
+
+    /// Arms one [`Fault`] on the current thread and disarms it when dropped, so a failed
+    /// assertion cannot leave it armed for a later test on the same thread.
+    struct Armed;
+
+    impl Armed {
+        fn new(f: Fault) -> Armed {
+            FAULT.with(|c| c.set(Some(f)));
+            Armed
+        }
+    }
+
+    impl Drop for Armed {
+        fn drop(&mut self) {
+            FAULT.with(|c| c.set(None));
+        }
+    }
+
+    /// Temporary or scratch files left in `dir`.
+    fn leftovers(dir: &std::path::Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp-") || n.contains(".splice-"))
+            .collect()
+    }
+
+    /// Candidate ids of `path`, which the test tables set to the row index.
+    fn kept_rows(path: &str) -> Vec<usize> {
+        TableFile::open(path)
+            .unwrap()
+            .u32("candidate_id")
+            .unwrap()
+            .into_iter()
+            .map(|c| c as usize)
+            .collect()
+    }
+
+    #[test]
+    fn a_nullable_features_column_is_rewritten() {
+        // A nullable leaf may hold a null that the rewrite turns into NaN, so the file is
+        // not reused as the competed table even when, as here, it holds none. The Arrow
+        // field is nullable as well, so the schema comparison already refuses it; the
+        // leaf check stands behind it.
+        let dir = tmp_dir("fallback_nullable");
+        let feats = dir.join("features.parquet");
+        let feats = feats.to_str().unwrap();
+        write_features_table(feats, 9, 4, &[], false, true, true);
+        let t = TableFile::open(feats).unwrap();
+        assert!(!t.all_leaves_required());
+        let names = FeatureSchema::read(feats).unwrap().feature_columns;
+        assert!(matches!(
+            features_bytes_reusable(&t, &names, false, false).unwrap(),
+            Reuse::No(_)
+        ));
+        let out = dir.join("competed.parquet");
+        let out = out.to_str().unwrap();
+        let cfg = CompeteConfig::default();
+        let (w, rep) = compete_with(feats, out, &cfg, Some(&"f".repeat(64)));
+        assert_eq!(rep.stats["publish"], json!("rewritten"));
+        assert_eq!(w.rows, 9);
+        assert_eq!(rep.content_hash, mumdia_io::hash::blake3_file(out).unwrap());
+        // The rewrite stores the column non-nullable, as it always did, with its values.
+        let t = TableFile::open(out).unwrap();
+        assert!(t.all_leaves_required());
+        assert_eq!(
+            t.f64("n_matched_fragments").unwrap(),
+            (0..9).map(|i| (i % 5) as f64).collect::<Vec<f64>>()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_row_group_above_the_competed_cap_is_rewritten() {
+        // One row group one row over the cap: reused as is, a reader of the competed table
+        // would decode more per group than the cap allows, so the table is rewritten into
+        // capped groups although every row is kept.
+        let dir = tmp_dir("fallback_big_group");
+        let feats = dir.join("features.parquet");
+        let feats = feats.to_str().unwrap();
+        let n = COMPETED_ROW_GROUP_ROWS + 1;
+        write_features_table(feats, n, n, &[], false, true, false);
+        assert_eq!(row_group_sizes(feats), vec![n]);
+        let out = dir.join("competed.parquet");
+        let out = out.to_str().unwrap();
+        let cfg = CompeteConfig::default();
+        let (w, rep) = compete_with(feats, out, &cfg, Some(&"f".repeat(64)));
+        assert_eq!(rep.stats["removed"], json!(0));
+        assert_eq!(rep.stats["publish"], json!("rewritten"));
+        assert_eq!(w.rows, n as u64);
+        assert_eq!(rep.content_hash, mumdia_io::hash::blake3_file(out).unwrap());
+        assert_eq!(row_group_sizes(out), vec![COMPETED_ROW_GROUP_ROWS, 1]);
+        assert_eq!(whole_table(out), whole_table(feats));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failed_link_and_copy_falls_back_to_the_rewrite() {
+        let dir = tmp_dir("fallback_publish");
+        let feats = dir.join("features.parquet");
+        let feats = feats.to_str().unwrap();
+        write_features_table(feats, 21, 4, &[], false, true, false);
+        let out = dir.join("competed.parquet");
+        let out = out.to_str().unwrap();
+        let cfg = CompeteConfig::default();
+        let (w, rep) = {
+            let _armed = Armed::new(Fault::Publish);
+            compete_with(feats, out, &cfg, Some(&"f".repeat(64)))
+        };
+        assert_eq!(rep.stats["removed"], json!(0));
+        assert_eq!(rep.stats["publish"], json!("rewritten"));
+        assert_eq!(w.rows, 21);
+        // Rewritten, so hashed: the caller's features hash does not describe this file.
+        assert_eq!(rep.content_hash, mumdia_io::hash::blake3_file(out).unwrap());
+        assert_eq!(w.content_hash, rep.content_hash);
+        let reference = dir.join("reference.parquet");
+        let reference = reference.to_str().unwrap();
+        rewritten_reference(feats, reference, &(0..21).collect::<Vec<_>>());
+        assert_eq!(
+            std::fs::read(out).unwrap(),
+            std::fs::read(reference).unwrap()
+        );
+        assert!(leftovers(&dir).is_empty(), "{:?}", leftovers(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failed_splice_falls_back_to_the_rewrite() {
+        // The fault fires after the splice has appended the first clean group and written
+        // the scratch file of the dirty one, so both the output temp and a scratch file
+        // exist when it fails. Neither may survive, and the rewrite must be what the
+        // stage writes without a splice.
+        let dir = tmp_dir("fallback_splice");
+        let feats = dir.join("features.parquet");
+        let feats = feats.to_str().unwrap();
+        write_features_table(feats, 16, 4, &[7], false, true, false);
+        let out = dir.join("competed.parquet");
+        let out = out.to_str().unwrap();
+        let cfg = CompeteConfig::default();
+        let (w, rep) = {
+            let _armed = Armed::new(Fault::Splice);
+            compete_with(feats, out, &cfg, None)
+        };
+        assert_eq!(rep.stats["removed"], json!(1));
+        assert_eq!(rep.stats["publish"], json!("rewritten"));
+        assert!(!rep.stats.contains_key("rewritten_row_groups"));
+        assert_eq!(w.rows, 15);
+        let keep: Vec<usize> = (0..16).filter(|&r| r != 7).collect();
+        let reference = dir.join("reference.parquet");
+        let reference = reference.to_str().unwrap();
+        rewritten_reference(feats, reference, &keep);
+        assert_eq!(
+            std::fs::read(out).unwrap(),
+            std::fs::read(reference).unwrap()
+        );
+        assert!(leftovers(&dir).is_empty(), "{:?}", leftovers(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dirty_runs_over_several_row_groups_between_clean_ones_are_spliced() {
+        // Six 4-row groups. Rows 7, 10 and 22 take the peptidoforms of rows 5, 8 and 20,
+        // and on prelim_score (row % 7) rows 7, 8 and 22 lose. Groups 1 and 2 (rows 4-11)
+        // are one dirty run of two groups, rewritten into one scratch file; group 5 is a
+        // second dirty run after the clean groups 3 and 4; groups 0, 3 and 4 are clean and
+        // hold 12 of the 24 rows, which is enough to splice.
+        let dir = tmp_dir("splice_multi");
+        let feats = dir.join("features.parquet");
+        let feats = feats.to_str().unwrap();
+        write_features_table(feats, 24, 4, &[7, 10, 22], false, true, false);
+        let out = dir.join("competed.parquet");
+        let out = out.to_str().unwrap();
+        let cfg = CompeteConfig::default();
+        let (w, rep) = compete_with(feats, out, &cfg, None);
+        assert_eq!(rep.stats["removed"], json!(3));
+        assert_eq!(rep.stats["publish"], json!("spliced"));
+        assert_eq!(rep.stats["rewritten_row_groups"], json!(3));
+        assert_eq!(rep.stats["row_groups"], json!(6));
+        assert_eq!(w.rows, 21);
+        let keep: Vec<usize> = (0..24).filter(|r| ![7, 8, 22].contains(r)).collect();
+        assert_eq!(kept_rows(out), keep);
+        // The two-group dirty run is one re-chunked scratch group of its 6 kept rows.
+        assert_eq!(row_group_sizes(out), vec![4, 6, 4, 4, 3]);
+        let reference = dir.join("reference.parquet");
+        let reference = reference.to_str().unwrap();
+        rewritten_reference(feats, reference, &keep);
+        assert_eq!(whole_table(out), whole_table(reference));
+        assert!(leftovers(&dir).is_empty(), "{:?}", leftovers(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_splice_is_not_chosen_when_the_untouched_groups_hold_under_half_the_rows() {
+        // Rows 7, 13, 16 and 22 duplicate rows 5, 11, 14 and 20, which removes rows 7, 11,
+        // 14 and 22 from groups 1, 2, 3 and 5. Groups 0 and 4 are clean but hold only 8 of
+        // the 24 rows, so a splice would push most of the table through scratch files; the
+        // table is rewritten directly.
+        let dir = tmp_dir("splice_under_half");
+        let feats = dir.join("features.parquet");
+        let feats = feats.to_str().unwrap();
+        write_features_table(feats, 24, 4, &[7, 13, 16, 22], false, true, false);
+        let out = dir.join("competed.parquet");
+        let out = out.to_str().unwrap();
+        let cfg = CompeteConfig::default();
+        let (w, rep) = compete_with(feats, out, &cfg, None);
+        assert_eq!(rep.stats["removed"], json!(4));
+        assert_eq!(rep.stats["publish"], json!("rewritten"));
+        assert_eq!(w.rows, 20);
+        let keep: Vec<usize> = (0..24).filter(|r| ![7, 11, 14, 22].contains(r)).collect();
+        assert_eq!(kept_rows(out), keep);
+        let reference = dir.join("reference.parquet");
+        let reference = reference.to_str().unwrap();
+        rewritten_reference(feats, reference, &keep);
+        assert_eq!(
+            std::fs::read(out).unwrap(),
+            std::fs::read(reference).unwrap()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn splice_pays_counts_the_rows_of_non_empty_clean_groups() {
+        let spans = [(0, 4), (4, 0), (4, 4), (8, 4)];
+        // Group 2 loses row 5: clean rows 8 of 12.
+        let keep: Vec<usize> = (0..12).filter(|&r| r != 5).collect();
+        assert!(splice_pays(&keep, &spans, 12));
+        // Groups 0 and 2 lose a row: the clean rows are group 3's 4 of 12, and the empty
+        // group 1 adds nothing.
+        let keep: Vec<usize> = (0..12).filter(|&r| r != 1 && r != 5).collect();
+        assert!(!splice_pays(&keep, &spans, 12));
+        // Only the empty group is clean.
+        let keep: Vec<usize> = (0..12).filter(|&r| r % 4 != 0).collect();
+        assert!(!splice_pays(&keep, &spans, 12));
     }
 }

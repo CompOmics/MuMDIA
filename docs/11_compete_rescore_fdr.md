@@ -315,19 +315,27 @@ writes 65,536); the table has its own `peak_rank` column; and
 `compete.emit_competition_audit` is off. Otherwise the stage logs the reason and
 rewrites.
 
-When some rows are removed, the same four conditions hold, and at least one
-features row group lost no row, the table is spliced instead (`splice_kept_rows`):
-the untouched row groups are appended as bytes through `SpliceWriter`, as the pool
-splices band tables, and each run of consecutive row groups that lost a row is
-rewritten by `copy_kept_rows` into a scratch file (`<out>.splice-<pid>-<row>.parquet`,
-removed afterwards) whose row groups take its place. A row group that lost every row
-contributes nothing. When every row group lost a row, which is the usual case for a
-grouping that removes many rows (`base_peptide` removed 23% of the rows on HYE B01),
-splicing would only add a scratch write, so the table is rewritten directly. The
-spliced file holds the rewrite's rows in the rewrite's order with its values; its row
-groups are the features file's where they were untouched, so it is not byte-identical
-to a full rewrite. Under the shipped defaults no row is removed and this path does not
-run.
+When some rows are removed, the same four conditions hold, and the non-empty
+features row groups that lost no row hold at least half of the table's rows
+(`splice_pays`), the table is spliced instead (`splice_kept_rows`): the untouched row
+groups are appended as bytes through `SpliceWriter`, as the pool splices band tables,
+and each run of consecutive row groups that lost a row is rewritten by
+`copy_kept_rows` into a scratch file (`<out>.splice-<pid>-<row>.parquet`, removed
+afterwards) whose row groups take its place. A row group that lost every row
+contributes nothing. A splice writes each dirty row twice (into the scratch file, then
+into the output) and each clean row once, while a full rewrite writes every row once
+but decodes and re-encodes all of them. The half-the-rows threshold bounds the splice
+at 1.5 times the table's write traffic, half of it re-encoded, with no scratch file
+larger than half the table. Below it, which is the usual case for a grouping that
+removes many rows (`base_peptide` removed 23% of the rows on HYE B01, from most row
+groups), most of the table would pass through a scratch file, up to twice the write
+traffic and scratch space close to the table's size, so the table is rewritten
+directly. A splice that fails for any reason (for example a scratch file the splice
+refuses) is logged as a warning and followed by the same full rewrite; the output temp
+and the scratch files are removed first. The spliced file holds the rewrite's rows in
+the rewrite's order with its values; its row groups are the features file's where they
+were untouched, so it is not byte-identical to a full rewrite. Under the shipped
+defaults no row is removed and this path does not run.
 
 The report's `stats.publish` records which path ran: `hard_link`, `byte_copy`,
 `spliced` (with `rewritten_row_groups` and `row_groups`) or `rewritten`. After a link or a copy the competed file has the features file's row
@@ -655,9 +663,10 @@ counts feed a hyperscore-style term; `n` is small so the naive loop is fine.
 | `compete::col_f64` | compete.rs:309 | read a numeric column as f64, accepting an f64 or i32 encoding |
 | `CompeteParams` | compete.rs:21 | `features`, `out`, `cfg`, `config_hash`, `features_hash` (the features stage's report hash, reused when the competed table is the features file's bytes) |
 | `compete::run_hashed` | compete.rs | `run`, returning the row count and the report content hash (`mumdia_io::report::Written`) |
-| `compete::publish_competed` | compete.rs | publish the kept rows: the features file's bytes when they are exactly the competed table, otherwise `copy_kept_rows` |
+| `compete::publish_competed` | compete.rs | publish the kept rows: the features file's bytes when they are exactly the competed table, a splice when few rows are removed, otherwise (or when either fast path fails) `copy_kept_rows` |
 | `compete::features_bytes_reusable` | compete.rs | the four conditions under which the features bytes can stand in for the competed table |
 | `compete::splice_kept_rows` | compete.rs | some rows removed: splice the untouched features row groups, rewrite the others |
+| `compete::splice_pays` | compete.rs | whether the non-empty untouched row groups hold at least half the rows, so a splice beats a full rewrite |
 | `rescore::run` | rescore.rs:41 | full rescore stage: concat, dispatch, multi-context q, scored table |
 | `rescore::validate_feature_schema` | rescore.rs:596 | reject a concat whose feature companions differ in id or ordered columns |
 | `rescore::native_scores` | rescore.rs:616 | thin wrapper calling `percolator_lite` with the config knobs |
