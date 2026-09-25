@@ -28,28 +28,28 @@ const FEATURE_BATCH_ROWS: usize = 1 << 14;
 /// (`compete::COMPETED_ROW_GROUP_ROWS`), ~400 MB of decoded f64 at 387 features.
 const FEATURE_BATCH_ROWS_MAX: usize = 1 << 17;
 
-/// Rows per decoded batch of the feature stream over `t` under the read options `scan`.
+/// Rows per decoded batch of the feature stream over `t` under the wide-scan mode `mode`.
 ///
-/// Under the plain reader (`MUMDIA_WIDE_SCAN=plain`) a batch is one row group: the largest
+/// 16,384 rows (~50 MB of decoded f64) under the plain reader (the default) and the
+/// coalesced one. Under `MUMDIA_WIDE_SCAN=rowgroup` a batch is one row group: the largest
 /// row group of `t`, clamped to `[FEATURE_BATCH_ROWS, FEATURE_BATCH_ROWS_MAX]`. The arrow
 /// reader fills a batch column by column, so a batch that covers a whole row group reads
 /// every page of one column chunk before it moves to the next, which is a near-forward
 /// sweep through the row group; a 16,384-row batch visits every column chunk of the group
 /// once per batch instead (step 1 of R1 in the 2026-09-25 survey). The competed table
-/// carries the features file's 65,536-row groups or compete's own 131,072.
-///
-/// Under the coalesced reader (the default) a row group is read with one sequential read
-/// whatever the batch size, so the batch stays at the 16,384-row floor and ~50 MB. Measured
-/// from the page cache on the HYE competed table (879,018 rows, 131,072-row groups): 1.54 s
-/// plain at 16,384 rows, 1.58 s plain at a row group, 2.50 s coalesced at 16,384 rows and
-/// 2.76 s coalesced at a row group, so the larger batch buys no time where the read is not
-/// the limit and costs ~350 MB of decoded f64.
+/// carries the features file's 65,536-row groups or compete's own 131,072. The coalesced
+/// reader reads a row group with one sequential read whatever the batch size, so it keeps
+/// the floor. Measured from the page cache on the HYE competed table (879,018 rows,
+/// 131,072-row groups): 1.54 s plain at 16,384 rows, 1.58 s plain at a row group, 2.50 s
+/// coalesced at 16,384 rows and 2.76 s coalesced at a row group, so the larger batch buys
+/// no time where the read is not the limit and costs ~350 MB of decoded f64; whether it
+/// buys time on a seek-bound disk is not measured.
 ///
 /// The rows reach the closure one at a time in file order whatever the batch size, so the
 /// handoff and the matrix are unchanged
 /// (`every_read_mode_streams_the_same_feature_rows` covers both readers and several sizes).
-fn feature_batch_rows(t: &TableFile, scan: &mumdia_io::table::ScanOptions) -> usize {
-    if scan.coalesce.is_some() {
+fn feature_batch_rows(t: &TableFile, mode: super::WideScan) -> usize {
+    if mode != super::WideScan::RowGroup {
         return FEATURE_BATCH_ROWS;
     }
     let largest = t.row_group_rows().into_iter().max().unwrap_or(0);
@@ -660,6 +660,7 @@ pub fn run_hashed(p: RescoreParams) -> Result<Written> {
             n,
             feat_names.len(),
             paths.format(),
+            sidecar_script == Some("nn_rescore_worker.py"),
         )?;
         // The validation aborts the stream on the first offending row rather than after the
         // file is complete. A malformed competed table used to cost nothing: the serial
@@ -699,9 +700,7 @@ pub fn run_hashed(p: RescoreParams) -> Result<Written> {
                 // its final name, but the PIN and the raw matrix are written to their final
                 // paths directly, so an aborted stream would leave a truncated file for the
                 // next reader to find. Take the rubble with us.
-                for f in paths.files() {
-                    let _ = std::fs::remove_file(f);
-                }
+                paths.discard();
                 return Err(e);
             }
         };
@@ -1885,10 +1884,11 @@ fn run_entrapment_gbm(
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("classifier=entrapment GBM requires rescore.python"))?;
     std::fs::create_dir_all(p.work_dir).ok();
-    // Per-invocation names; see the note in `sidecar::run_ms2pip`.
-    let pid = std::process::id();
-    let inp = format!("{}/entrapment_in_{pid}.parquet", p.work_dir);
-    let outp = format!("{}/entrapment_out_{pid}.parquet", p.work_dir);
+    // Per-invocation names (`invocation_tag`, which a shared MUMDIA_SIDECAR_DIR needs);
+    // see also the note in `sidecar::run_ms2pip`.
+    let tag = invocation_tag(p.out);
+    let inp = format!("{}/entrapment_in_{tag}.parquet", p.work_dir);
+    let outp = format!("{}/entrapment_out_{tag}.parquet", p.work_dir);
 
     let mut cols = vec![
         // Unique per-row id for score readback: candidate_id repeats across
@@ -1918,6 +1918,7 @@ fn run_entrapment_gbm(
         cid.len(),
         feat_names.len(),
         HandoffFormat::ParquetF64,
+        false,
     )?;
     write_table(&inp, cols)?;
 
@@ -2729,14 +2730,14 @@ fn for_each_feature_row(
     feat_names: &[String],
     f: impl FnMut(usize, &[f32]) -> Result<()>,
 ) -> Result<()> {
-    // Every feature column of every row: the widest read of the stage, so one forward read
-    // per row group (`wide_scan_options`); the batches are the plain reader's.
-    let scan = super::wide_scan_options();
+    // Every feature column of every row: the widest read of the stage, read as
+    // `MUMDIA_WIDE_SCAN` says (`WideScan`); the batches are the plain reader's either way.
+    let mode = super::WideScan::from_env();
     for_each_feature_row_with(
         competed,
         feat_names,
-        &scan,
-        |t| feature_batch_rows(t, &scan),
+        &mode.options(),
+        |t| feature_batch_rows(t, mode),
         f,
     )
 }
@@ -2848,12 +2849,12 @@ fn for_each_feature_batch(
     feat_names: &[String],
     f: impl FnMut(&FeatureBatch<'_>) -> Result<()>,
 ) -> Result<()> {
-    let scan = super::wide_scan_options();
+    let mode = super::WideScan::from_env();
     for_each_feature_batch_with(
         competed,
         feat_names,
-        &scan,
-        |t| feature_batch_rows(t, &scan),
+        &mode.options(),
+        |t| feature_batch_rows(t, mode),
         f,
     )
 }
@@ -3027,29 +3028,113 @@ enum HandoffFormat {
     Raw,
 }
 
-/// `(floor, estimate)` bytes of a sidecar invocation's files for `rows` PSMs and `nf`
-/// features: the handoff, the fold keys (4 bytes a row) and the worker's output (~20).
+/// What a sidecar invocation's files need in its work directory, in bytes.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct SpaceNeed {
+    /// What the files cannot be smaller than: less free space than this is certain to
+    /// fail, so the check refuses below it. Only uncompressed bytes count.
+    floor: u64,
+    /// Their usual size, the NN worker's memmap included when it may write one: the check
+    /// warns below it.
+    estimate: u64,
+    /// The part of `estimate` that is the NN worker's float32 memmap (0 when none).
+    memmap: u64,
+}
+
+/// [`SpaceNeed`] of a sidecar invocation's files for `rows` PSMs and `nf` features: the
+/// handoff, the fold keys (4 bytes a row) and the worker's output (~20), plus `memmap`,
+/// the NN worker's memmap from [`nn_memmap_bytes`].
 ///
-/// The floor is what the handoff cannot be smaller than, so less free space than that is
-/// certain to fail; the estimate is its usual size. The PIN writes every value as `{:.6}`
-/// plus a tab, never fewer than 9 bytes. The f32 parquet handoff measured 0.72 of the raw
-/// f32 size on HYE (1.01 GB for 879,018 x 387) and 0.87 on the immunopeptidomics pool
-/// (359 GB for 258.75M rows), so half the raw size is taken as its floor and the raw size
-/// as its estimate.
-fn handoff_space(rows: u64, nf: u64, format: HandoffFormat) -> (u64, u64) {
+/// The floor counts only bytes no encoding can remove. The PIN is text: every value is
+/// `{:.6}` plus a tab, never fewer than 9 bytes, and a row's other columns are never fewer
+/// than 32 (`psm_0`, the label, the scan number, two `{:.5}` masses, the flanked peptide,
+/// the tabs and the newline). The raw handoff's matrix is exactly 4 bytes a value. A
+/// parquet file has no such bound: snappy and dictionary encoding shrink a constant or
+/// low-cardinality column to almost nothing, and 43 of the 387 Extended features are
+/// constant or duplicated by construction. So the parquet handoffs, the metadata parquet
+/// of the raw handoff, the fold keys and the output add nothing to the floor, and a
+/// parquet handoff is only ever warned about. The memmap does not count towards the floor
+/// either: its width is the features the worker keeps after its constant-column drop
+/// (`MUMDIA_NN_DROP_CONSTANT`) and any `MUMDIA_NN_FEATURES` subset, which the engine does
+/// not know, so `rows x nf x 4` is its upper bound.
+///
+/// The estimate is the usual size. The f32 parquet handoff measured 0.72 of the raw f32
+/// size on HYE (1.01 GB for 879,018 x 387) and 0.87 on the immunopeptidomics pool (359 GB
+/// for 258.75M rows), so the raw size is its estimate.
+fn handoff_space(rows: u64, nf: u64, format: HandoffFormat, memmap: u64) -> SpaceNeed {
     let cells = rows.saturating_mul(nf);
     let (floor, estimate) = match format {
-        HandoffFormat::Pin => (cells.saturating_mul(9), cells.saturating_mul(11)),
-        HandoffFormat::Parquet => (cells.saturating_mul(2), cells.saturating_mul(4)),
-        HandoffFormat::ParquetF64 => (cells.saturating_mul(4), cells.saturating_mul(8)),
-        HandoffFormat::Raw => (cells.saturating_mul(4), cells.saturating_mul(4)),
+        HandoffFormat::Pin => (
+            cells
+                .saturating_mul(9)
+                .saturating_add(rows.saturating_mul(32)),
+            cells.saturating_mul(11),
+        ),
+        HandoffFormat::Parquet => (0, cells.saturating_mul(4)),
+        HandoffFormat::ParquetF64 => (0, cells.saturating_mul(8)),
+        // The `.npy` header is at least 64 bytes.
+        HandoffFormat::Raw => (
+            cells.saturating_mul(4).saturating_add(64),
+            cells.saturating_mul(4),
+        ),
     };
     // SpecId, Label, ScanNr, ExpMass, CalcMass, Peptide, Proteins; then keys and output.
     let per_row = rows.saturating_mul(48 + 4 + 20);
-    (
-        floor.saturating_add(per_row),
-        estimate.saturating_add(per_row),
-    )
+    SpaceNeed {
+        floor,
+        estimate: estimate.saturating_add(per_row).saturating_add(memmap),
+        memmap,
+    }
+}
+
+/// The bytes the NN worker (`nn_rescore_worker.py`) may add to the work directory beside
+/// the handoff: its float32 memmap `<out>.feat.mm` of up to `rows x nf x 4` bytes, written
+/// next to its output, and under `MUMDIA_NN_PARALLEL` the per-row label and fold arrays
+/// beside it. 0 for any other worker, or when the worker holds its matrix in memory.
+///
+/// The backend choice is the worker's, and this follows it: `MUMDIA_NN_STREAM` `1` / `on`
+/// / `true` streams; `auto` (the default) streams above `MUMDIA_NN_STREAM_GB` when that is
+/// set, and otherwise above a threshold sized from free memory that is never below 4 GiB,
+/// which is taken here as the size above which it may stream; any other value never
+/// streams. It compares the decoded matrix for parquet and raw and the file size for a PIN,
+/// which is `handoff_bytes` here. `MUMDIA_NN_PARALLEL > 0` maps the matrix from a memmap on
+/// either backend. `var` reads the environment the worker inherits (a parameter for the
+/// tests).
+fn nn_memmap_bytes(
+    nn: bool,
+    rows: u64,
+    nf: u64,
+    format: HandoffFormat,
+    handoff_bytes: u64,
+    var: impl Fn(&str) -> Option<String>,
+) -> u64 {
+    if !nn {
+        return 0;
+    }
+    let matrix = rows.saturating_mul(nf).saturating_mul(4);
+    let parallel = var("MUMDIA_NN_PARALLEL")
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .is_some_and(|k| k > 0);
+    let stream_env = var("MUMDIA_NN_STREAM")
+        .unwrap_or_else(|| "auto".to_string())
+        .to_lowercase();
+    let compared = if format == HandoffFormat::Pin {
+        handoff_bytes
+    } else {
+        matrix
+    };
+    let threshold_gib = var("MUMDIA_NN_STREAM_GB")
+        .filter(|v| !v.trim().is_empty())
+        .map_or(4.0, |v| v.trim().parse::<f64>().unwrap_or(4.0));
+    let threshold = (threshold_gib.max(0.0) * (1u64 << 30) as f64) as u64;
+    let may_stream = matches!(stream_env.as_str(), "1" | "on" | "true")
+        || (stream_env == "auto" && compared > threshold);
+    if !(may_stream || parallel) {
+        return 0;
+    }
+    // Under MUMDIA_NN_PARALLEL, `y` (float32) and `fold` are saved beside the memmap.
+    let side = if parallel { rows.saturating_mul(12) } else { 0 };
+    matrix.saturating_add(side)
 }
 
 /// Free bytes on the filesystem that holds `dir`, asked of the sidecar's own interpreter
@@ -3074,23 +3159,30 @@ fn free_bytes(python: &str, dir: &str) -> Option<u64> {
 }
 
 /// Refuse a sidecar run whose work directory cannot hold its files, before a byte of them
-/// is written (`MUMDIA_SIDECAR_SPACE_CHECK=0` skips the check).
+/// is written, and warn when it may not (`MUMDIA_SIDECAR_SPACE_CHECK=0` skips the check).
+/// `nn` says the worker is `nn_rescore_worker.py`, whose memmap the estimate then counts.
 ///
 /// Without it a pooled rescore wrote the handoff until the disk filled, hundreds of GB and
-/// hours into the stage, and failed there with a bare `No space left on device`.
+/// hours into the stage, and failed there with a bare `No space left on device`. It refuses
+/// only below the floor of [`handoff_space`], which a parquet handoff does not have, so for
+/// the default handoff it warns and goes on.
 fn check_sidecar_space(
     python: Option<&str>,
     dir: &str,
     rows: usize,
     nf: usize,
     format: HandoffFormat,
+    nn: bool,
 ) -> Result<()> {
     if std::env::var("MUMDIA_SIDECAR_SPACE_CHECK")
         .is_ok_and(|v| matches!(v.trim(), "0" | "off" | "false" | "no"))
     {
         return Ok(());
     }
-    let (floor, estimate) = handoff_space(rows as u64, nf as u64, format);
+    let (rows_u, nf_u) = (rows as u64, nf as u64);
+    let handoff = handoff_space(rows_u, nf_u, format, 0).estimate;
+    let memmap = nn_memmap_bytes(nn, rows_u, nf_u, format, handoff, |k| std::env::var(k).ok());
+    let need = handoff_space(rows_u, nf_u, format, memmap);
     let Some(free) = python.and_then(|py| free_bytes(py, dir)) else {
         tracing::debug!(
             dir,
@@ -3098,38 +3190,39 @@ fn check_sidecar_space(
         );
         return Ok(());
     };
-    space_verdict(free, floor, estimate, dir, rows, nf, format)
+    space_verdict(free, need, dir, rows, nf, format)
 }
 
 /// The decision of [`check_sidecar_space`] once the free space is known.
 fn space_verdict(
     free: u64,
-    floor: u64,
-    estimate: u64,
+    need: SpaceNeed,
     dir: &str,
     rows: usize,
     nf: usize,
     format: HandoffFormat,
 ) -> Result<()> {
-    if free < floor {
+    if free < need.floor {
         anyhow::bail!(
             "rescore: the sidecar work directory {dir} has {} free, and the {format:?} \
-             handoff of {rows} PSMs x {nf} features needs at least {} ({} expected) with \
-             the fold keys and the worker's output. Point MUMDIA_SIDECAR_DIR (or `mumdia \
-             rescore --work-dir`) at a directory with room, rescore fewer runs per \
+             handoff of {rows} PSMs x {nf} features cannot be smaller than {} ({} expected \
+             with the fold keys and the worker's output). Point MUMDIA_SIDECAR_DIR (or \
+             `mumdia rescore --work-dir`) at a directory with room, rescore fewer runs per \
              invocation, or set MUMDIA_SIDECAR_SPACE_CHECK=0 to skip this check.",
             human_bytes(free as f64),
-            human_bytes(floor as f64),
-            human_bytes(estimate as f64)
+            human_bytes(need.floor as f64),
+            human_bytes(need.estimate as f64)
         );
     }
-    if free < estimate {
+    if free < need.estimate {
         warn!(
             dir,
             free = %human_bytes(free as f64),
-            expected = %human_bytes(estimate as f64),
-            "rescore: the sidecar work directory may be too small for the handoff \
-             (MUMDIA_SIDECAR_DIR moves it)"
+            expected = %human_bytes(need.estimate as f64),
+            nn_memmap = %human_bytes(need.memmap as f64),
+            "rescore: the sidecar work directory may be too small for the handoff, the fold \
+             keys, the worker's output and the NN worker's memmap if it writes one \
+             (MUMDIA_SIDECAR_DIR moves them)"
         );
     }
     Ok(())
@@ -3212,23 +3305,63 @@ impl SidecarPaths {
         }
         v
     }
+
+    /// Remove every file of the invocation, after a failed write. The PIN and the raw
+    /// matrix are written to their final paths directly, so a write that failed part way,
+    /// a full disk above all, would otherwise leave a truncated multi-GB file behind, for
+    /// nothing: the names are this invocation's own and nothing reads them again.
+    fn discard(&self) {
+        for f in self.files() {
+            let _ = std::fs::remove_file(f);
+        }
+    }
+}
+
+/// A name part no other sidecar invocation shares: the PID and a 48-bit nonce.
+///
+/// The PID alone was enough while every run had its own `<out-dir>/sidecar_work`. With
+/// `MUMDIA_SIDECAR_DIR` several runs can share one directory, and two containers that mount
+/// the same scratch directory often run the engine under the same small PID (two hosts on a
+/// shared filesystem can too), with the same output stem (`psms_scored`). Two such runs
+/// would then write, read and remove each other's files, and a worker could score the other
+/// arm's handoff of the same row count, which `align_sidecar_scores` cannot tell apart. The
+/// nonce hashes the absolute output path, the clock, the PID and a per-process counter
+/// under the standard library's randomly keyed hasher, whose keys come from the operating
+/// system's random source, so it differs between processes even when all the rest agree.
+fn invocation_tag(out: &str) -> String {
+    use std::hash::{BuildHasher, Hash, Hasher};
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    std::path::absolute(out)
+        .unwrap_or_else(|_| std::path::PathBuf::from(out))
+        .hash(&mut h);
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos())
+        .hash(&mut h);
+    std::process::id().hash(&mut h);
+    COUNTER
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        .hash(&mut h);
+    format!(
+        "{}_{:012x}",
+        std::process::id(),
+        h.finish() & 0xffff_ffff_ffff
+    )
 }
 
 /// Per-invocation sidecar filenames. Fixed names (`rescore.pin`,
 /// `rescore_sidecar_out.parquet`) made two concurrent rescores clobber each other and let a
 /// killed run's orphaned Python worker hold `*.feat.mm` open forever, so every later
-/// rescore failed with `OSError: [Errno 22]` on a path it did not own. Keying on the output
-/// artifact plus the PID makes collisions impossible.
+/// rescore failed with `OSError: [Errno 22]` on a path it did not own. The names are
+/// `rescore_<output stem>_<PID>_<nonce>` ([`invocation_tag`]), and a tag whose files, or
+/// the NN worker's memmap beside its output, already exist is drawn again.
 fn sidecar_paths(p: &RescoreParams, script_name: &str) -> SidecarPaths {
     std::fs::create_dir_all(p.work_dir).ok();
-    let tag = format!(
-        "{}_{}",
-        std::path::Path::new(p.out)
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("rescore"),
-        std::process::id()
-    );
+    let stem = std::path::Path::new(p.out)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("rescore");
     // Parquet and raw apply to nn_torch only: mokapot_worker.py goes through
     // `mokapot.read_pin()`, which requires the tab-separated form. Falling back with a
     // warning beats failing a configured run.
@@ -3249,17 +3382,34 @@ fn sidecar_paths(p: &RescoreParams, script_name: &str) -> SidecarPaths {
             HandoffKind::Pin
         }
     };
-    let handoff = match kind {
-        HandoffKind::Parquet => format!("{}/rescore_{tag}.features.parquet", p.work_dir),
-        HandoffKind::Raw => format!("{}/rescore_{tag}.features.raw.json", p.work_dir),
-        HandoffKind::Pin => format!("{}/rescore_{tag}.pin", p.work_dir),
+    let named = |tag: &str| {
+        let handoff = match kind {
+            HandoffKind::Parquet => format!("{}/rescore_{tag}.features.parquet", p.work_dir),
+            HandoffKind::Raw => format!("{}/rescore_{tag}.features.raw.json", p.work_dir),
+            HandoffKind::Pin => format!("{}/rescore_{tag}.pin", p.work_dir),
+        };
+        SidecarPaths {
+            handoff,
+            out: format!("{}/rescore_{tag}_out.parquet", p.work_dir),
+            foldkeys: format!("{}/rescore_{tag}.foldkeys.parquet", p.work_dir),
+            kind,
+        }
     };
-    SidecarPaths {
-        handoff,
-        out: format!("{}/rescore_{tag}_out.parquet", p.work_dir),
-        foldkeys: format!("{}/rescore_{tag}.foldkeys.parquet", p.work_dir),
-        kind,
+    let taken = |paths: &SidecarPaths| {
+        paths
+            .files()
+            .into_iter()
+            .chain([format!("{}.feat.mm", paths.out)])
+            .any(|f| std::path::Path::new(&f).exists())
+    };
+    let mut paths = named(&format!("{stem}_{}", invocation_tag(p.out)));
+    for _ in 0..8 {
+        if !taken(&paths) {
+            break;
+        }
+        paths = named(&format!("{stem}_{}", invocation_tag(p.out)));
     }
+    paths
 }
 
 /// Run a PIN-contract Python rescorer sidecar (`mokapot_worker.py` or
@@ -3300,6 +3450,7 @@ fn run_pin_sidecar(
                 cid.len(),
                 feat_names.len(),
                 paths.format(),
+                script_name.contains("nn_rescore"),
             )?;
             let matrix = feats.as_ref().ok_or_else(|| {
                 anyhow::anyhow!(
@@ -3312,11 +3463,21 @@ fn run_pin_sidecar(
             // per-spectrum competition would collapse the runs. The row index is unique
             // across the whole concatenation. Single-run behaviour is unchanged (the
             // mapping is bijective and mokapot does not use SpecId/ScanNr as features).
-            let mut w = HandoffWriter::new(&paths, feat_names, is_decoy, pform, protein, mz)?;
-            for i in 0..cid.len() {
-                w.push_row(i, matrix.row(i))?;
-            }
-            let rows = w.finish()?;
+            let written = (|| {
+                let mut w = HandoffWriter::new(&paths, feat_names, is_decoy, pform, protein, mz)?;
+                for i in 0..cid.len() {
+                    w.push_row(i, matrix.row(i))?;
+                }
+                w.finish()
+            })();
+            // As on the streamed path: a failed write leaves no truncated file behind.
+            let rows = match written {
+                Ok(rows) => rows,
+                Err(e) => {
+                    paths.discard();
+                    return Err(e);
+                }
+            };
             tracing::info!(
                 path = %paths.handoff,
                 rows,
@@ -3344,7 +3505,12 @@ fn run_pin_sidecar(
     // shared with `mokapot_worker.py`, and the NN hyperparameters already travel this way.
     // A worker that does not read it simply keeps its previous behaviour.
     let foldkeys = &paths.foldkeys;
-    write_table(foldkeys, vec![Col::U32("fold_key".into(), base.to_vec())])?;
+    if let Err(e) = write_table(foldkeys, vec![Col::U32("fold_key".into(), base.to_vec())]) {
+        // The handoff is complete, but no worker is started without its fold keys, so it
+        // would only hold the space that the failed write most likely ran out of.
+        paths.discard();
+        return Err(e);
+    }
     let handoff_ms = t_handoff.elapsed().as_millis();
 
     // Everything the worker reads is on disk now. Under `strict` a sidecar failure is an
@@ -4154,13 +4320,14 @@ b
     #[test]
     fn the_feature_batch_follows_the_row_groups_within_its_bounds() {
         let names: Vec<String> = ["f0", "f1", "f2"].iter().map(|s| s.to_string()).collect();
-        let plain = mumdia_io::table::ScanOptions::default();
-        let coalesced = mumdia_io::table::ScanOptions::coalesced();
+        use super::super::WideScan;
+        let (rowgroup, plain, coalesced) =
+            (WideScan::RowGroup, WideScan::Plain, WideScan::Coalesced);
         let small = scratch("fbr_small.parquet");
         crafted_competed(&small, 7, 100.0, &names, false);
         // A tiny table still reads in batches of the floor.
         assert_eq!(
-            feature_batch_rows(&TableFile::open(&small).unwrap(), &plain),
+            feature_batch_rows(&TableFile::open(&small).unwrap(), rowgroup),
             FEATURE_BATCH_ROWS
         );
         // One batch per row group between the floor and the cap.
@@ -4170,15 +4337,16 @@ b
             .unwrap();
         w.close().unwrap();
         let mid = TableFile::open(&mid).unwrap();
-        assert_eq!(feature_batch_rows(&mid, &plain), 40_000);
-        // The coalesced reader reads the group whole whatever the batch, so it keeps the
-        // floor.
-        assert_eq!(feature_batch_rows(&mid, &coalesced), FEATURE_BATCH_ROWS);
+        assert_eq!(feature_batch_rows(&mid, rowgroup), 40_000);
+        // The default plain reader keeps the floor, and so does the coalesced reader,
+        // which reads the group whole whatever the batch.
+        assert_eq!(feature_batch_rows(&mid, plain), FEATURE_BATCH_ROWS);
+        assert_eq!(feature_batch_rows(&mid, coalesced), FEATURE_BATCH_ROWS);
         // A table written as one huge group is read in batches of the cap.
         let big = scratch("fbr_big.parquet");
         write_table(&big, vec![Col::F64("f0".into(), vec![1.0; 200_000])]).unwrap();
         assert_eq!(
-            feature_batch_rows(&TableFile::open(&big).unwrap(), &plain),
+            feature_batch_rows(&TableFile::open(&big).unwrap(), rowgroup),
             FEATURE_BATCH_ROWS_MAX
         );
     }
@@ -4279,7 +4447,7 @@ b
                 let mut sum = 0u64;
                 let sizing = |t: &TableFile| {
                     if *aligned {
-                        feature_batch_rows(t, &mumdia_io::table::ScanOptions::default())
+                        feature_batch_rows(t, super::super::WideScan::RowGroup)
                     } else {
                         FEATURE_BATCH_ROWS
                     }
@@ -4588,6 +4756,153 @@ b
         let e = w.finish().unwrap_err().to_string();
         assert!(e.contains("declares 5 rows and 12"), "{e}");
         assert!(!std::path::Path::new(&short.handoff).exists());
+    }
+
+    /// Per-feature (min, max) of a parquet handoff from its footer: the minimum of the
+    /// row groups' minima and the maximum of their maxima, as the NN worker's
+    /// `constant_columns` folds them with Python's `min` / `max`.
+    fn footer_ranges(path: &str, names: &[String]) -> Vec<(f32, f32)> {
+        use parquet::file::reader::{FileReader, SerializedFileReader};
+        use parquet::file::statistics::Statistics;
+        let r = SerializedFileReader::new(std::fs::File::open(path).unwrap()).unwrap();
+        let md = r.metadata();
+        assert!(md.num_row_groups() > 1, "the test needs several row groups");
+        names
+            .iter()
+            .map(|name| {
+                let mut range: Option<(f32, f32)> = None;
+                for g in 0..md.num_row_groups() {
+                    let rg = md.row_group(g);
+                    let col = (0..rg.num_columns())
+                        .map(|c| rg.column(c))
+                        .find(|c| c.column_descr().name() == name)
+                        .unwrap();
+                    let Some(Statistics::Float(st)) = col.statistics() else {
+                        panic!("{name}: no float statistics in row group {g}");
+                    };
+                    let (lo, hi) = (*st.min_opt().unwrap(), *st.max_opt().unwrap());
+                    range = Some(match range {
+                        None => (lo, hi),
+                        Some((a, b)) => (if lo < a { lo } else { a }, if hi > b { hi } else { b }),
+                    });
+                }
+                range.unwrap()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_raw_descriptions_range_decides_constants_as_the_parquet_footer_does() {
+        // The worker drops a constant column from the parquet footer's statistics, and from
+        // the raw description's min/max, so the two handoffs score the same only if both
+        // give every feature the same range. The corners: signed zeros (the parquet writer
+        // stores a zero minimum as -0.0 and a zero maximum as +0.0, the engine keeps the
+        // sign it saw), float32 subnormals (which flush-to-zero reads as 0 on both sides)
+        // and several row groups. Both handoffs are written from the same decoded batches,
+        // as the streamed path writes them.
+        let names: Vec<String> = [
+            "pos_zero",
+            "mixed_zero",
+            "zero_subnormal",
+            "neg_subnormal",
+            "normal",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let rg = HANDOFF_ROW_GROUP_ROWS;
+        let n = rg + 1_000;
+        let tiny = f32::from_bits(1);
+        let value = |j: usize, i: usize| -> f64 {
+            let v: f32 = match j {
+                0 => 0.0,
+                1 => {
+                    if i < rg {
+                        -0.0
+                    } else {
+                        0.0
+                    }
+                }
+                2 => {
+                    if i == rg + 7 {
+                        tiny
+                    } else if i == 3 {
+                        -0.0
+                    } else {
+                        0.0
+                    }
+                }
+                3 => {
+                    if i == 11 {
+                        -f32::from_bits(3)
+                    } else {
+                        0.0
+                    }
+                }
+                _ => i as f32 * 0.5 - 7.0,
+            };
+            f64::from(v)
+        };
+        let competed = scratch("ranges_competed.parquet");
+        write_table(
+            &competed,
+            names
+                .iter()
+                .enumerate()
+                .map(|(j, name)| Col::F64(name.clone(), (0..n).map(|i| value(j, i)).collect()))
+                .collect(),
+        )
+        .unwrap();
+        let is_decoy: Vec<bool> = (0..n).map(|i| i % 3 == 0).collect();
+        let pform = flat(&(0..n).map(|i| format!("PEPTIDEK/{i}")).collect::<Vec<_>>());
+        let protein = flat(&vec!["sp|P00001|X"; n]);
+        let mz = vec![500.0f64; n];
+        let write = |kind: HandoffKind, name: &str| -> SidecarPaths {
+            let paths = SidecarPaths {
+                handoff: scratch(name),
+                out: String::new(),
+                foldkeys: String::new(),
+                kind,
+            };
+            let mut w =
+                HandoffWriter::new(&paths, &names, &is_decoy, &pform, &protein, &mz).unwrap();
+            for_each_feature_batch_with(
+                std::slice::from_ref(&competed),
+                &names,
+                &mumdia_io::table::ScanOptions::default(),
+                |_| 16_384,
+                |b| w.push_batch(b),
+            )
+            .unwrap();
+            assert_eq!(w.finish().unwrap(), n as u64);
+            paths
+        };
+        let parquet = write(HandoffKind::Parquet, "ranges.features.parquet");
+        let raw = write(HandoffKind::Raw, "ranges.features.raw.json");
+        let footer = footer_ranges(&parquet.handoff, &names);
+        let desc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&raw.handoff).unwrap()).unwrap();
+        // Through float32, as the worker reads both.
+        let bound = |key: &str, j: usize| desc[key][j].as_f64().unwrap() as f32;
+        for (j, name) in names.iter().enumerate() {
+            let (lo, hi) = (bound("min", j), bound("max", j));
+            let (flo, fhi) = footer[j];
+            // Equal as numbers, which is how both sides compare them (-0.0 == +0.0) ...
+            assert!(
+                lo == flo && hi == fhi,
+                "{name}: raw ({lo:e}, {hi:e}), footer ({flo:e}, {fhi:e})"
+            );
+            // ... and bit for bit apart from the sign of a zero, so a subnormal bound
+            // reaches the worker unchanged on both sides.
+            let bits = |v: f32| if v == 0.0 { 0 } else { v.to_bits() };
+            assert_eq!((bits(lo), bits(hi)), (bits(flo), bits(fhi)), "{name}");
+            assert_eq!(lo == hi, flo == fhi, "{name}: the constant-column decision");
+        }
+        // The corners are what they were built to be.
+        assert!(footer[0].0 == footer[0].1 && footer[1].0 == footer[1].1);
+        assert_eq!(footer[2].1.to_bits(), tiny.to_bits());
+        assert_eq!(footer[3].0.to_bits(), (-f32::from_bits(3)).to_bits());
+        assert!(footer[2].0 != footer[2].1 && footer[3].0 != footer[3].1);
     }
 
     #[test]
@@ -5223,17 +5538,9 @@ b
         );
         // The handoff is a parquet (the default `handoff`), named per invocation, and holds
         // every row exactly once in flat order with the PIN column contract.
-        let tag = format!(
-            "{}_{}",
-            std::path::Path::new(&out)
-                .file_stem()
-                .unwrap()
-                .to_str()
-                .unwrap(),
-            std::process::id()
-        );
-        let handoff = format!("{work}/rescore_{tag}.features.parquet");
-        let t = mumdia_io::table::Table::read(&handoff).unwrap();
+        let handoffs = handoffs_in(&work, &out);
+        assert_eq!(handoffs.len(), 1, "{handoffs:?}");
+        let t = mumdia_io::table::Table::read(&handoffs[0]).unwrap();
         assert_eq!(t.nrows, 24);
         assert_eq!(t.i32("ScanNr").unwrap(), (0..24).collect::<Vec<i32>>());
         assert_eq!(
@@ -5273,16 +5580,43 @@ b
         })
         .unwrap_err()
         .to_string();
-        let tag = format!(
-            "{}_{}",
-            std::path::Path::new(&out)
+        // The handoff this invocation left, if it left one; otherwise a name under its
+        // prefix that no file has, for the callers' `exists` checks.
+        let handoff = handoffs_in(&work, &out)
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| {
+                format!(
+                    "{work}/rescore_{}_none.features.parquet",
+                    std::process::id()
+                )
+            });
+        (err, handoff, work)
+    }
+
+    /// The parquet handoffs in `work` named after `out` by this process
+    /// (`rescore_<out stem>_<PID>_<nonce>.features.parquet`).
+    fn handoffs_in(work: &str, out: &str) -> Vec<String> {
+        let prefix = format!(
+            "rescore_{}_{}_",
+            std::path::Path::new(out)
                 .file_stem()
                 .unwrap()
                 .to_str()
                 .unwrap(),
             std::process::id()
         );
-        (err, format!("{work}/rescore_{tag}.features.parquet"), work)
+        let mut found: Vec<String> = std::fs::read_dir(work)
+            .map(|d| {
+                d.filter_map(|e| e.ok())
+                    .map(|e| e.file_name().to_string_lossy().to_string())
+                    .filter(|n| n.starts_with(&prefix) && n.ends_with(".features.parquet"))
+                    .map(|n| format!("{work}/{n}"))
+                    .collect()
+            })
+            .unwrap_or_default();
+        found.sort();
+        found
     }
 
     /// Nothing that looks like a handoff (published or half-written) is left in `work`.
@@ -5681,28 +6015,28 @@ b
 
     #[test]
     fn the_space_check_refuses_below_the_floor_and_names_the_way_out() {
-        let (floor, estimate) = handoff_space(1_000, 100, HandoffFormat::Parquet);
-        assert!(floor < estimate);
-        // Half the raw f32 size and the raw size, plus the per-row metadata, keys and
-        // output.
-        assert_eq!(floor, 1_000 * 100 * 2 + 1_000 * 72);
-        assert_eq!(estimate, 1_000 * 100 * 4 + 1_000 * 72);
-        let (pin_floor, _) = handoff_space(1_000, 100, HandoffFormat::Pin);
-        assert!(
-            pin_floor > estimate,
-            "a PIN value is never fewer than 9 bytes"
+        // A parquet file has no floor: the check only warns about it.
+        let pq = handoff_space(1_000, 100, HandoffFormat::Parquet, 0);
+        assert_eq!(pq.floor, 0);
+        assert_eq!(pq.estimate, 1_000 * 100 * 4 + 1_000 * 72);
+        assert_eq!(
+            handoff_space(1_000, 100, HandoffFormat::ParquetF64, 0).floor,
+            0
         );
-        let e = space_verdict(
-            floor - 1,
-            floor,
-            estimate,
-            "D:/x",
-            1_000,
-            100,
-            HandoffFormat::Parquet,
-        )
-        .unwrap_err()
-        .to_string();
+        // The PIN and the raw matrix have one, from their uncompressed bytes.
+        let pin = handoff_space(1_000, 100, HandoffFormat::Pin, 0);
+        assert_eq!(pin.floor, 1_000 * 100 * 9 + 1_000 * 32);
+        let raw = handoff_space(1_000, 100, HandoffFormat::Raw, 0);
+        assert_eq!(raw.floor, 1_000 * 100 * 4 + 64);
+        // The memmap is in the estimate, not the floor.
+        let with_mm = handoff_space(1_000, 100, HandoffFormat::Raw, 400_000);
+        assert_eq!(with_mm.floor, raw.floor);
+        assert_eq!(with_mm.estimate, raw.estimate + 400_000);
+        assert_eq!(with_mm.memmap, 400_000);
+
+        let e = space_verdict(pin.floor - 1, pin, "D:/x", 1_000, 100, HandoffFormat::Pin)
+            .unwrap_err()
+            .to_string();
         assert!(
             e.contains("MUMDIA_SIDECAR_DIR") && e.contains("--work-dir"),
             "{e}"
@@ -5712,26 +6046,10 @@ b
             "{e}"
         );
         // Between the floor and the estimate it warns and goes on; above it, silently.
-        space_verdict(
-            floor,
-            floor,
-            estimate,
-            "D:/x",
-            1_000,
-            100,
-            HandoffFormat::Parquet,
-        )
-        .unwrap();
-        space_verdict(
-            estimate,
-            floor,
-            estimate,
-            "D:/x",
-            1_000,
-            100,
-            HandoffFormat::Parquet,
-        )
-        .unwrap();
+        space_verdict(pin.floor, pin, "D:/x", 1_000, 100, HandoffFormat::Pin).unwrap();
+        space_verdict(pin.estimate, pin, "D:/x", 1_000, 100, HandoffFormat::Pin).unwrap();
+        // A parquet handoff is never refused, however little room there is.
+        space_verdict(0, pq, "D:/x", 1_000, 100, HandoffFormat::Parquet).unwrap();
         // An interpreter that cannot be started skips the check.
         assert_eq!(
             free_bytes("mumdia-no-such-interpreter-for-this-test", "."),
@@ -5742,9 +6060,148 @@ b
             ".",
             usize::MAX / 4,
             1_000,
-            HandoffFormat::Parquet,
+            HandoffFormat::Pin,
+            true,
         )
         .unwrap();
+    }
+
+    #[test]
+    fn the_space_floor_is_never_above_what_the_handoff_writes() {
+        // The floor refuses a run, so it must be a true minimum of the bytes written. The
+        // smallest rows there are: every value 0, empty peptide and protein, the first row
+        // indices. The PIN and the raw matrix must reach their floors; a parquet handoff of
+        // such rows is far below the half of the raw size the floor used to assume.
+        let (n, nf) = (2_000usize, 50usize);
+        let names: Vec<String> = (0..nf).map(|j| format!("f{j}")).collect();
+        let is_decoy = vec![false; n];
+        let empty = flat(&vec![""; n]);
+        let mz = vec![0.0f64; n];
+        let row = vec![0.0f32; nf];
+        let write = |kind: HandoffKind, name: &str| -> u64 {
+            let paths = SidecarPaths {
+                handoff: scratch(name),
+                out: String::new(),
+                foldkeys: String::new(),
+                kind,
+            };
+            let mut w = HandoffWriter::new(&paths, &names, &is_decoy, &empty, &empty, &mz).unwrap();
+            for i in 0..n {
+                w.push_row(i, &row).unwrap();
+            }
+            w.finish().unwrap();
+            match paths.raw_files() {
+                Some((matrix, _)) => std::fs::metadata(matrix).unwrap().len(),
+                None => std::fs::metadata(&paths.handoff).unwrap().len(),
+            }
+        };
+        let (rows, cols) = (n as u64, nf as u64);
+        let pin = write(HandoffKind::Pin, "floor.pin");
+        assert!(
+            pin >= handoff_space(rows, cols, HandoffFormat::Pin, 0).floor,
+            "PIN {pin} B"
+        );
+        let raw = write(HandoffKind::Raw, "floor.features.raw.json");
+        assert!(
+            raw >= handoff_space(rows, cols, HandoffFormat::Raw, 0).floor,
+            "raw matrix {raw} B"
+        );
+        let parquet = write(HandoffKind::Parquet, "floor.features.parquet");
+        assert!(
+            parquet < rows * cols * 2,
+            "a constant parquet handoff is {parquet} B, under 2 bytes a value"
+        );
+    }
+
+    #[test]
+    fn the_nn_memmap_follows_the_workers_backend_choice() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |k: &str| {
+                pairs
+                    .iter()
+                    .find(|(name, _)| *name == k)
+                    .map(|(_, v)| v.to_string())
+            }
+        };
+        let gib = 1u64 << 30;
+        // 1M rows x 100 features: a 400 MB matrix, under the 4 GiB the auto threshold
+        // never goes below, so the default in-memory backend writes no memmap.
+        let (small, nf) = (1_000_000u64, 100u64);
+        let pq = HandoffFormat::Parquet;
+        assert_eq!(nn_memmap_bytes(true, small, nf, pq, 0, env(&[])), 0);
+        // Not the NN worker: nothing, whatever the environment.
+        assert_eq!(
+            nn_memmap_bytes(false, small, nf, pq, 0, env(&[("MUMDIA_NN_STREAM", "1")])),
+            0
+        );
+        // Forced streaming, or the parallel trainer, map the matrix.
+        for forced in [
+            &[("MUMDIA_NN_STREAM", "1")][..],
+            &[("MUMDIA_NN_STREAM", "ON")][..],
+            &[("MUMDIA_NN_PARALLEL", "2")][..],
+        ] {
+            let pairs: &'static [(&'static str, &'static str)] = forced;
+            let want = small * nf * 4
+                + if pairs[0].0 == "MUMDIA_NN_PARALLEL" {
+                    small * 12
+                } else {
+                    0
+                };
+            assert_eq!(nn_memmap_bytes(true, small, nf, pq, 0, env(pairs)), want);
+        }
+        // A 12 GB matrix may stream under auto; an explicit threshold decides it; `0`
+        // never streams.
+        let big = 30_000_000u64;
+        assert!(big * nf * 4 > 4 * gib);
+        assert_eq!(
+            nn_memmap_bytes(true, big, nf, pq, 0, env(&[])),
+            big * nf * 4
+        );
+        assert_eq!(
+            nn_memmap_bytes(true, big, nf, pq, 0, env(&[("MUMDIA_NN_STREAM_GB", "64")])),
+            0
+        );
+        assert_eq!(
+            nn_memmap_bytes(
+                true,
+                small,
+                nf,
+                pq,
+                0,
+                env(&[("MUMDIA_NN_STREAM_GB", "0.1")])
+            ),
+            small * nf * 4
+        );
+        assert_eq!(
+            nn_memmap_bytes(true, big, nf, pq, 0, env(&[("MUMDIA_NN_STREAM", "0")])),
+            0
+        );
+        // For a PIN the worker compares the file size, not the decoded matrix.
+        let pin = HandoffFormat::Pin;
+        assert_eq!(nn_memmap_bytes(true, small, nf, pin, gib, env(&[])), 0);
+        assert_eq!(
+            nn_memmap_bytes(true, small, nf, pin, 5 * gib, env(&[])),
+            small * nf * 4
+        );
+    }
+
+    #[test]
+    fn two_invocations_never_share_a_tag() {
+        // A shared MUMDIA_SIDECAR_DIR: the same output stem and the same PID must still
+        // give two invocations different files.
+        let prefix = format!("{}_", std::process::id());
+        let tags: std::collections::BTreeSet<String> = (0..64)
+            .map(|_| invocation_tag("x/psms_scored.parquet"))
+            .collect();
+        assert_eq!(tags.len(), 64);
+        for t in &tags {
+            assert!(t.starts_with(&prefix), "{t}");
+            assert_eq!(t.len(), prefix.len() + 12, "{t}");
+            assert!(
+                t[prefix.len()..].bytes().all(|c| c.is_ascii_hexdigit()),
+                "{t}"
+            );
+        }
     }
 
     #[test]
@@ -5766,6 +6223,28 @@ b
         };
         assert_eq!(bare.dir(), ".");
         assert_eq!(bare.format(), HandoffFormat::Pin);
+    }
+
+    #[test]
+    fn a_failed_write_discards_every_file_of_the_invocation() {
+        // The raw handoff has the most files: the description, the matrix, the metadata,
+        // the fold keys and the output. A missing one is not an error.
+        let paths = SidecarPaths {
+            handoff: scratch("discard.features.raw.json"),
+            out: scratch("discard_out.parquet"),
+            foldkeys: scratch("discard.foldkeys.parquet"),
+            kind: HandoffKind::Raw,
+        };
+        let files = paths.files();
+        assert_eq!(files.len(), 5);
+        for f in &files[1..] {
+            std::fs::write(f, b"partial").unwrap();
+        }
+        paths.discard();
+        assert!(
+            files.iter().all(|f| !std::path::Path::new(f).exists()),
+            "{files:?}"
+        );
     }
 
     #[test]

@@ -853,9 +853,9 @@ moves to another function.
 | `MUMDIA_RESCORE_MODEL` | both | `"nn"` | `rust/mumdia/crates/mumdia/src/stages/rescore.rs::run_hashed`, `scripts/mokapot_worker.py::main`, `scripts/mokapot_worker.py::make_model` |
 | `MUMDIA_SCRIPTS` | sidecar | `os.path.dirname(os.path.abspath(__file__` | `scripts/mh_shard_predict.py::<module>` |
 | `MUMDIA_SIDECAR_DIR` | engine | computed: `<out-dir>/sidecar_work` under `run` and `run-experiment`; `sidecar_work` in the current directory, or `--work-dir`, for `mumdia rescore`. A path moves the rescore sidecar files there (`stages/rescore.rs` `sidecar_work_dir`) | `rust/mumdia/crates/mumdia/src/stages/rescore.rs::sidecar_work_dir` |
-| `MUMDIA_SIDECAR_SPACE_CHECK` | engine | computed: on (a rescore sidecar run whose work directory cannot hold the handoff is refused before it is written). `0` / `off` / `false` / `no` skips the check (`stages/rescore.rs` `check_sidecar_space`) | `rust/mumdia/crates/mumdia/src/stages/rescore.rs::check_sidecar_space` |
+| `MUMDIA_SIDECAR_SPACE_CHECK` | engine | computed: on (before the handoff is written, a rescore sidecar run is refused when its work directory has less room than a PIN or raw handoff cannot be smaller than, and warned about below the files' usual size). `0` / `off` / `false` / `no` skips the check (`stages/rescore.rs` `check_sidecar_space`) | `rust/mumdia/crates/mumdia/src/stages/rescore.rs::check_sidecar_space` |
 | `MUMDIA_THERMO_PARSER` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/raw.rs::locate_parser` |
-| `MUMDIA_WIDE_SCAN` | engine | computed: coalesced row-group reads for rescore's feature stream and compete's pass-through copy. `plain` restores the plain reader with its parallel decode (`stages/mod.rs` `wide_scan_options`) | `rust/mumdia/crates/mumdia/src/stages/mod.rs::wide_scan_options` |
+| `MUMDIA_WIDE_SCAN` | engine | computed: `plain`: the plain reader with its parallel decode for rescore's feature stream and compete's pass-through copy. `rowgroup` decodes the feature stream one row group a batch; `coalesced` reads each row group's projected column chunks in one sequential read (`stages/mod.rs` `WideScan`) | `rust/mumdia/crates/mumdia/src/stages/mod.rs::WideScan::from_env` |
 | `MUMDIA_XGB_DEPTH` | sidecar | `"6"` | `scripts/mokapot_worker.py::make_model` |
 | `MUMDIA_XGB_JOBS` | sidecar | `"0"` | `scripts/mokapot_worker.py::make_model` |
 | `MUMDIA_XGB_LR` | sidecar | `"0.1"` | `scripts/mokapot_worker.py::make_model` |
@@ -909,12 +909,13 @@ Every field whose struct has an `impl Default` resolved from the source.
 - `peptidoforms.fixed_mods[].name` (`String`)
 - `peptidoforms.fixed_mods[].residue` (`char`)
 
-4 environment read(s) whose name is not a literal. Reads with the same function, access and argument share one entry, which gives their number when there is more than one:
+5 environment read(s) whose name is not a literal. Reads with the same function, access and argument share one entry, which gives their number when there is more than one:
 
 - `rust/mumdia/crates/mumdia/src/stages/extract.rs::PsmRows::push: env read via closure of `&mut self``
 - `rust/mumdia/crates/mumdia/src/stages/extract.rs::PsmStream::push: env read via closure of `&mut self``
 - `rust/mumdia/crates/mumdia/src/stages/extract.rs::flush_below: env read via closure of `chunk.slices_mut()``
 - `rust/mumdia/crates/mumdia/src/stages/extract.rs::flush_below: env read via closure of `runs[r].span_mut(m)``
+- `rust/mumdia/crates/mumdia/src/stages/rescore.rs::check_sidecar_space: env read of `k``
 
 ## Coverage
 

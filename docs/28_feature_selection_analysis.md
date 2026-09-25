@@ -90,7 +90,9 @@ The PINs are converted to float32 parquet (`~/hye/pin2parquet.py`). Everything b
 computed from the PIN alone; the features stage is not re-run. The features-stage PIN
 (`run.pin`, SpecId `cand_<id>`) and the rescore-stage PIN the worker consumed
 (`sidecar_work/*.pin`, SpecId `psm_<row>`) were verified row-aligned on B01: identical
-labels, masses and peptides in the same order.
+labels, masses and peptides in the same order. Since 2026-09-25 the rescore removes its
+sidecar files once the scores are read back, so reproducing this needs
+`MUMDIA_KEEP_HANDOFF=1` (docs/13 "Where the rescore sidecar files go").
 
 The objective is measured with `bench/feature_selection/fs_lib.py::run_rescoring`, a
 re-implementation of `scripts/nn_rescore_worker.py` under the configuration the engine

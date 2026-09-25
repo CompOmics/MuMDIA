@@ -85,8 +85,13 @@ than a number. Both are recorded in every run's `manifest.json`.
   They are now removed after `align_sidecar_scores` accepts the scores (a failed worker
   still leaves its input), unless `MUMDIA_KEEP_HANDOFF=1`. `MUMDIA_SIDECAR_DIR` moves the
   work directory for `run`, `run-experiment` and `rescore`, and `mumdia rescore --work-dir`
-  names it for one call. Before the handoff is written the engine asks the sidecar
-  interpreter for the directory's free space and refuses a run that cannot fit, naming
+  names it for one call. The file names carry a nonce beside the PID, so runs that share
+  one `MUMDIA_SIDECAR_DIR` (two containers with the same PID) cannot touch each other's
+  files, and a handoff or fold-keys write that fails removes what it wrote. Before the
+  handoff is written the engine asks the sidecar interpreter for the directory's free
+  space. It refuses a run only below what the files cannot be smaller than, which a PIN
+  or raw handoff has and a parquet handoff does not, and it warns below their usual size,
+  the NN worker's streaming memmap included when the worker may stream; the messages name
   the directory and the way out (`MUMDIA_SIDECAR_SPACE_CHECK=0` skips it). The scores are
   unchanged.
 - **`run-experiment` splices the per-run scored tables.** A run's rows are contiguous in the
@@ -259,9 +264,12 @@ than a number. Both are recorded in every run's `manifest.json`.
 ### Performance
 
 - **Rescore's feature stream and its post-classifier tail do less.** The feature stream
-  reads each row group's projected column chunks in one sequential read (the span cache;
-  `MUMDIA_WIDE_SCAN=plain` restores the plain reader, the faster one from the page cache),
-  and so does compete's pass-through copy. The parquet handoff is staged column by column
+  and compete's pass-through copy can read each row group's projected column chunks in
+  one sequential read (the span cache, `MUMDIA_WIDE_SCAN=coalesced`), and the feature
+  stream can decode one row group a batch (`MUMDIA_WIDE_SCAN=rowgroup`). Both are opt-in
+  for seek-bound storage, where neither is measured yet: the plain reader stays the
+  default, the faster one from the page cache (1.54 s against 2.50 s coalesced on the HYE
+  competed table). The parquet handoff is staged column by column
   from the decoded batches, with no row-major round trip: the streamed handoff of the HYE
   competed table (879,018 x 387) went from 8.4-8.7 s to 3.0-4.1 s of process wall, to the
   same bytes. The top-K collapse map is skipped when no candidate repeats (a 9.1 GB

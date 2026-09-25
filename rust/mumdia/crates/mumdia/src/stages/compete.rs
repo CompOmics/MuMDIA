@@ -833,8 +833,9 @@ fn copy_kept_rows_with(
 ) -> Result<(u64, Option<String>)> {
     let (out_schema, source) = competed_schema(t, feat_names, synth_peak_rank)?;
     let proj: Vec<&str> = source.iter().flatten().map(String::as_str).collect();
-    // A full scan of every column of the widest artifact: one forward read per row group
-    // (`wide_scan_options`). The batches, and so the output, are the plain reader's.
+    // A full scan of every column of the widest artifact, read as `MUMDIA_WIDE_SCAN` says
+    // (`wide_scan_options`: the plain reader by default, one forward read per row group
+    // under `coalesced`). The batches, and so the output, are the plain reader's.
     let reader = t.scan(Some(&proj), COPY_BATCH_ROWS, &super::wide_scan_options())?;
     let in_schema = reader.schema();
     let src_idx: Vec<Option<usize>> = source

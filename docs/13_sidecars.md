@@ -917,18 +917,32 @@ MLP. Set it explicitly for the logreg path.
   `mumdia rescore --work-dir` names it for one call. It is an environment variable
   rather than a configuration field, so moving the files (onto a RAM-backed
   directory or a disk with room) does not change the configuration hash. The files
-  are named after the output and the engine's PID, so nothing ever reused them and
-  they piled up: 7.7 GB per HYE rescore and 359 GB per immunopeptidomics pool for
-  the handoff alone. They are now removed once the worker's scores have passed
-  `align_sidecar_scores`, and the entrapment worker's files as well. A failed worker
-  still leaves its input behind for a rerun; `MUMDIA_KEEP_HANDOFF=1` keeps the files
-  on success too. Before a byte is written, the engine asks the sidecar interpreter
-  for the free space of that directory (`shutil.disk_usage`). It refuses the run when
-  the space is below what the handoff cannot be smaller than (half the raw f32 size
-  for the parquet handoff, 9 bytes a value for the PIN, plus the fold keys and the
-  output), and the message names the directory, the size and the ways out. Between
-  that floor and the usual size it warns. `MUMDIA_SIDECAR_SPACE_CHECK=0` skips the
-  check. The scores do not depend on where the directory is, as long as the NN
+  are named `rescore_<output stem>_<PID>_<nonce>` (`invocation_tag`, and
+  `entrapment_in_<PID>_<nonce>` for the entrapment worker): the nonce keeps apart two
+  runs that share one `MUMDIA_SIDECAR_DIR` with the same PID, which two containers
+  mounting one scratch directory often have. Named after the output and the PID
+  alone, nothing ever reused the files and they piled up: 7.7 GB per HYE rescore and
+  359 GB per immunopeptidomics pool for the handoff alone. They are now removed once
+  the worker's scores have passed `align_sidecar_scores`, and the entrapment worker's
+  files as well; a handoff or fold-keys write that fails removes what it wrote. A
+  failed worker still leaves its input behind for a rerun; `MUMDIA_KEEP_HANDOFF=1`
+  keeps the files on success too. Before a byte is written, the engine asks the
+  sidecar interpreter for the free space of that directory (`shutil.disk_usage`). It
+  refuses the run only when the space is below what the files cannot be smaller
+  than, which counts uncompressed bytes alone: 9 bytes a value plus 32 a row for the
+  PIN, exactly 4 bytes a value for the raw matrix. A parquet file has no such floor
+  (snappy and dictionary encoding shrink a constant column to almost nothing), so
+  the default parquet handoff is never refused, only warned about. It warns when the
+  space is below the usual size: the raw f32 size for the parquet handoff (it
+  measured 0.72-0.87 of it), 11 bytes a value for the PIN, plus the fold keys, the
+  output and, for `nn_torch`, the worker's float32 memmap of `rows x features x 4`
+  bytes whenever the worker may stream (`MUMDIA_NN_STREAM=1`, `MUMDIA_NN_PARALLEL`,
+  or a matrix above `MUMDIA_NN_STREAM_GB`, or above 4 GiB when that is unset, the
+  least the worker's free-memory threshold can be). The memmap is not in the floor,
+  because the worker's constant-column drop narrows it by an amount the engine does
+  not know. The refusal names the directory, the size and the ways out.
+  `MUMDIA_SIDECAR_SPACE_CHECK=0` skips the check. The scores do not depend on where
+  the directory is, as long as the NN
   worker takes the same backend. Its in-memory or memmap choice depends on free
   memory, and files on a RAM-backed directory lower free memory, so pin
   `MUMDIA_NN_STREAM` when comparing two placements.

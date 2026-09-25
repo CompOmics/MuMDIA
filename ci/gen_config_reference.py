@@ -1141,14 +1141,16 @@ COMPUTED_ENV_DEFAULTS: dict[str, str] = {
         "rescore sidecar files there (`stages/rescore.rs` `sidecar_work_dir`)"
     ),
     "MUMDIA_SIDECAR_SPACE_CHECK": (
-        "on (a rescore sidecar run whose work directory cannot hold the handoff is "
-        "refused before it is written). `0` / `off` / `false` / `no` skips the check "
-        "(`stages/rescore.rs` `check_sidecar_space`)"
+        "on (before the handoff is written, a rescore sidecar run is refused when its "
+        "work directory has less room than a PIN or raw handoff cannot be smaller than, "
+        "and warned about below the files' usual size). `0` / `off` / `false` / `no` "
+        "skips the check (`stages/rescore.rs` `check_sidecar_space`)"
     ),
     "MUMDIA_WIDE_SCAN": (
-        "coalesced row-group reads for rescore's feature stream and compete's "
-        "pass-through copy. `plain` restores the plain reader with its parallel decode "
-        "(`stages/mod.rs` `wide_scan_options`)"
+        "`plain`: the plain reader with its parallel decode for rescore's feature "
+        "stream and compete's pass-through copy. `rowgroup` decodes the feature stream "
+        "one row group a batch; `coalesced` reads each row group's projected column "
+        "chunks in one sequential read (`stages/mod.rs` `WideScan`)"
     ),
 }
 
