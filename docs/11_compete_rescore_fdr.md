@@ -268,6 +268,23 @@ whether a grouping choice is silently discarding evidence: under
 `group_by = base_peptide` on a modification-rich library it reached 46.6% of the
 input rows, and under `group_by = peptidoform_charge` on the same input it was 0.
 
+### compete: cost
+
+The stage logs one `compete: phase timings` line per call, beside `compete: done`.
+Its fields are wall-clock milliseconds:
+
+| field | what it covers |
+|---|---|
+| `keys_ms` | footer open, the streamed key columns (`label`, `prelim_score`, `peak_rank`, the grouping columns) and the sort of the `(key, row)` array |
+| `resolve_ms` | the unique-evidence estimate (that mode only) and `resolve_competition` |
+| `write_ms` | writing the competed table and its `<out>.schema.json` |
+| `audit_ms` | the optional `<out>.compete_audit.parquet` (0 when the audit is off) |
+| `hash_ms` | the blake3 content hash recorded in `<out>.report.json` |
+| `elapsed_ms` | the whole stage |
+
+On a wide features table `write_ms` and `hash_ms` dominate: the keys are a few
+columns, the table is every feature column.
+
 ### rescore: input concat and classifier dispatch
 
 `rescore::run` (rescore.rs:41) concatenates all `--competed` tables into flat

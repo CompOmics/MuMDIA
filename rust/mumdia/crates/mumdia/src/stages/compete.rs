@@ -138,6 +138,10 @@ pub fn run(p: CompeteParams) -> Result<u64> {
         entries.push((key, i));
     }
     entries.sort_unstable();
+    // Phase timers (docs/11 "compete: cost"): key reads and the sort, the group
+    // resolution, the table write, the audit sidecar and the content hash. Log only.
+    let keys_ms = t0.elapsed().as_millis();
+    let t_resolve = Instant::now();
 
     // Per-candidate unique-fragment evidence for the `unique_evidence` mode. Prefers
     // an explicit `unique_fragment_count` feature; otherwise approximates it as
@@ -193,6 +197,8 @@ pub fn run(p: CompeteParams) -> Result<u64> {
         unique_ev.as_deref(),
     );
     drop(entries);
+    let resolve_ms = t_resolve.elapsed().as_millis();
+    let t_write = Instant::now();
 
     let rows = copy_kept_rows(
         &t,
@@ -204,6 +210,8 @@ pub fn run(p: CompeteParams) -> Result<u64> {
     )?;
     // Feature schema companion: unchanged feature list, so rescore validates the same schema.
     mumdia_io::json::write_json(&format!("{}.schema.json", p.out), &schema)?;
+    let write_ms = t_write.elapsed().as_millis();
+    let t_audit = Instant::now();
 
     // Competition audit sidecar (opt-in): one row per removed PSM with its winner. Lets a
     // post-hoc analysis see what competition removed without re-running the stage. This is
@@ -258,6 +266,10 @@ pub fn run(p: CompeteParams) -> Result<u64> {
             ],
         )?;
     }
+    let audit_ms = t_audit.elapsed().as_millis();
+    let t_hash = Instant::now();
+    let content_hash = mumdia_io::hash::blake3_file(p.out)?;
+    let hash_ms = t_hash.elapsed().as_millis();
 
     let elapsed = t0.elapsed().as_millis();
     let mut stats = std::collections::BTreeMap::new();
@@ -270,7 +282,7 @@ pub fn run(p: CompeteParams) -> Result<u64> {
         schema_version: artifact::PSMS_COMPETED.1,
         stage: "compete".to_string(),
         rows,
-        content_hash: mumdia_io::hash::blake3_file(p.out)?,
+        content_hash,
         params: json!({
             "group_by": format!("{:?}", p.cfg.group_by),
             "mode": format!("{:?}", p.cfg.mode),
@@ -281,6 +293,15 @@ pub fn run(p: CompeteParams) -> Result<u64> {
     }
     .write_for(p.out)?;
 
+    info!(
+        keys_ms,
+        resolve_ms,
+        write_ms,
+        audit_ms,
+        hash_ms,
+        elapsed_ms = elapsed,
+        "compete: phase timings"
+    );
     info!(
         input = n,
         kept = rows,
