@@ -142,8 +142,17 @@ code.
   columns are read).
 - OUT `<lib_out>` = `fragment_library_precursors_ft.parquet`: the input table with
   the `predicted_irt` column replaced (`rewrite_irt`). Same schema, values rewritten.
-  Beside it `<lib_out>.summary.json` counts where each row's value came from and
-  records the torch threads used.
+  Beside it `<lib_out>.summary.json` counts where each row's value came from
+  (`rows`, `repredicted`, `retained_imported` and its two parts), the number of unique
+  sequences predicted (`unique_predicted`), the torch threads used (`torch_threads`)
+  and the wall time per phase in seconds (`timings_s`: `read_library`, `model_load`,
+  `reference`, `fit`, `unique`, `predict`, `featurisation`, `forward`, `rewrite`,
+  `write`). `featurisation` (PSM parsing, dataset construction, length bucketing and
+  batch encoding) and `forward` (the model's forward calls) are measured inside
+  `predict` by wrapping DeepLC's own steps (`PredictTimers`); the rest of `predict` is
+  the calibration transform and copies. A phase that did not run, or that DeepLC's
+  internals did not let the worker measure, is `null`; under a fine-tune the model
+  load is part of `fit`.
 
 **mokapot_worker** / **nn_rescore_worker** (`rescore.rs:740` `run_pin_sidecar`)
 - IN `rescore.pin`: Percolator tab-separated. Fixed columns

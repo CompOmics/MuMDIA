@@ -170,6 +170,104 @@ def quiet_deeplc_progress():
         proxy.close()
         sys.stdout = original
 
+class PredictTimers:
+    """Where the whole-library prediction spends its time, for `<lib_out>.summary.json`.
+
+    DeepLC does not report its own phases, so this wraps the steps it runs:
+
+    - featurisation: PSM parsing (`deeplc.core._parse_psms`), dataset construction
+      (`DeepLCDataset.from_psm_list`), the length bucketing
+      (`deeplc._model_ops._length_buckets`) and batch encoding
+      (`DeepLCDataset.encode_batch`). Only the outermost of nested calls is timed.
+    - forward: the model's forward calls, from a forward pre-hook and a forward hook on
+      the module, synchronised first when the output is on a GPU.
+
+    The wrappers call the original functions with the same arguments and the hooks return
+    nothing, so the numbers they time are unchanged. These are private DeepLC names
+    (present in 4.4.0 and 4.5.0): any that is missing leaves its total as None rather than
+    failing the run. `install` restores every original on exit.
+    """
+
+    def __init__(self):
+        self.featurisation = 0.0
+        self.forward = 0.0
+        self.have_featurisation = False
+        self.have_forward = False
+        self._depth = 0
+        self._t_forward = None
+
+    def _timed(self, func):
+        timers = self
+
+        def wrapped(*a, **k):
+            if timers._depth:
+                return func(*a, **k)
+            timers._depth += 1
+            t0 = time.perf_counter()
+            try:
+                return func(*a, **k)
+            finally:
+                timers.featurisation += time.perf_counter() - t0
+                timers._depth -= 1
+
+        return wrapped
+
+    def _pre_forward(self, module, args):
+        self._t_forward = time.perf_counter()
+
+    def _post_forward(self, module, args, output):
+        if self._t_forward is None:
+            return
+        if getattr(output, "is_cuda", False):
+            torch.cuda.synchronize()
+        self.forward += time.perf_counter() - self._t_forward
+        self._t_forward = None
+
+    @contextlib.contextmanager
+    def install(self, model):
+        restore = []
+        try:
+            import inspect
+
+            from deeplc import _model_ops
+            from deeplc import core as deeplc_core
+            from deeplc.data import DeepLCDataset
+
+            for owner, name in ((deeplc_core, "_parse_psms"), (_model_ops, "_length_buckets")):
+                original = getattr(owner, name, None)
+                if callable(original):
+                    setattr(owner, name, self._timed(original))
+                    restore.append((owner, name, original))
+            for name in ("from_psm_list", "encode_batch"):
+                static = inspect.getattr_static(DeepLCDataset, name, None)
+                if isinstance(static, classmethod):
+                    setattr(DeepLCDataset, name, classmethod(self._timed(static.__func__)))
+                elif callable(static):
+                    setattr(DeepLCDataset, name, self._timed(static))
+                else:
+                    continue
+                restore.append((DeepLCDataset, name, static))
+            self.have_featurisation = bool(restore)
+        except Exception:  # noqa: BLE001 - timing is diagnostic, never a failure
+            pass
+        hooks = []
+        if model is not None and hasattr(model, "register_forward_hook"):
+            hooks = [model.register_forward_pre_hook(self._pre_forward),
+                     model.register_forward_hook(self._post_forward)]
+            self.have_forward = True
+        try:
+            yield self
+        finally:
+            for h in hooks:
+                h.remove()
+            for owner, name, original in reversed(restore):
+                setattr(owner, name, original)
+
+    def totals(self):
+        return (round(self.featurisation, 3) if self.have_featurisation else None,
+                round(self.forward, 3) if self.have_forward else None)
+
+
 def _windows_physical_cores():
     """Physical core count from `GetLogicalProcessorInformationEx(RelationProcessorCore)`.
 
@@ -542,8 +640,13 @@ def main():
         print("the thread cap lowered the requested torch threads; set "
               "MUMDIA_DEEPLC_THREAD_CAP=0 to take the request as given", flush=True)
 
+    # Wall time per phase, in seconds, for the summary (survey P0). None where a phase did
+    # not run or could not be measured.
+    timings = {}
+    t_phase = time.perf_counter()
     lib = pq.read_table(args.lib_in)
     orig = np.asarray(lib.column("predicted_irt"), dtype=np.float32)
+    timings["read_library"] = round(time.perf_counter() - t_phase, 3)
 
     if args.multihead and args.no_finetune:
         raise SystemExit("--multihead and --no-finetune are alternatives: the first "
@@ -554,15 +657,32 @@ def main():
 
     calibration = None
     base_model = None
+    timings["model_load"] = None
+    timings["reference"] = None
+    timings["fit"] = None
     if args.multihead:
+        t_phase = time.perf_counter()
         base_model = load_base_model()
-        calibration = fit_multihead(args, build_reference(args), model=base_model)
+        timings["model_load"] = round(time.perf_counter() - t_phase, 3)
+        t_phase = time.perf_counter()
+        ref_psms = build_reference(args)
+        timings["reference"] = round(time.perf_counter() - t_phase, 3)
+        t_phase = time.perf_counter()
+        calibration = fit_multihead(args, ref_psms, model=base_model)
+        timings["fit"] = round(time.perf_counter() - t_phase, 3)
         ft_model = None
     elif args.no_finetune:
         ft_model = None
         print("no-finetune: predicting with the DeepLC base model (seed ignored)", flush=True)
     else:
-        ft_model = build_finetuned_model(args, build_reference(args), train_threads)
+        t_phase = time.perf_counter()
+        ref_psms = build_reference(args)
+        timings["reference"] = round(time.perf_counter() - t_phase, 3)
+        # The fine-tune loads its own copy of the model inside `deeplc.finetune`, so that
+        # load is part of "fit" here.
+        t_phase = time.perf_counter()
+        ft_model = build_finetuned_model(args, ref_psms, train_threads)
+        timings["fit"] = round(time.perf_counter() - t_phase, 3)
 
     if args.skip_predict:
         print("skip-predict set; fine-tune smoke test complete (crash path exercised)", flush=True)
@@ -571,12 +691,16 @@ def main():
     # Deduplicate and predict on the DECOY_-stripped underlying sequence so decoys are
     # fine-tuned onto the same iRT scale as targets (shift-decoys reuse their target's
     # prediction; reverse-decoys get their reversed-sequence prediction).
+    t_phase = time.perf_counter()
     bases = library_bases(lib.column("peptidoform"))
     uniq = unique_standard_bases(bases)
     if args.predict_limit:
         uniq = uniq.slice(0, args.predict_limit)
+    timings["unique"] = round(time.perf_counter() - t_phase, 3)
     if ft_model is None and base_model is None:
+        t_phase = time.perf_counter()
         base_model = load_base_model()
+        timings["model_load"] = round(time.perf_counter() - t_phase, 3)
     model = ft_model if ft_model is not None else base_model
     if predict_threads != torch.get_num_threads():
         torch.set_num_threads(predict_threads)
@@ -595,11 +719,12 @@ def main():
     values = np.empty(len(uniq), dtype=np.float64)
     chunk = PREDICT_CHUNK
     t_pred0 = time.time()
+    timers = PredictTimers()
     # DeepLC's progress writer emits one blank line per update when stdout is not a
     # terminal, and the engine inherits this worker's stdout, so a real run was 98%
     # blank lines. The per-chunk progress printed inside the loop is not blank and
     # still comes through.
-    with quiet_deeplc_progress():
+    with quiet_deeplc_progress(), timers.install(model):
         for s in range(0, len(uniq), chunk):
             t0 = time.time()
             batch = uniq.slice(s, chunk).to_pylist()
@@ -627,16 +752,26 @@ def main():
             eta = (len(uniq) - done) / rate if rate > 0 else float("nan")
             print(f"  {done}/{len(uniq)}  {dt:.1f}s for this chunk "
                   f"({rate:.0f} peptidoforms/s, ETA {eta / 60:.1f} min)", flush=True)
-    print(f"prediction phase: {time.time() - t_pred0:.1f}s total", flush=True)
+    timings["predict"] = round(time.time() - t_pred0, 3)
+    timings["featurisation"], timings["forward"] = timers.totals()
+    print(f"prediction phase: {time.time() - t_pred0:.1f}s total "
+          f"(featurisation {_fmt_s(timings['featurisation'])}, "
+          f"forward pass {_fmt_s(timings['forward'])})", flush=True)
 
+    t_phase = time.perf_counter()
     new, summary = rewrite_irt(bases, orig, uniq, values)
+    timings["rewrite"] = round(time.perf_counter() - t_phase, 3)
+    t_phase = time.perf_counter()
     idx = lib.schema.get_field_index("predicted_irt")
     lib = lib.set_column(idx, "predicted_irt", pa.array(new, pa.float32()))
     pq.write_table(lib, args.lib_out)
+    timings["write"] = round(time.perf_counter() - t_phase, 3)
     summary["model"] = which
     summary["lib_in"] = args.lib_in
     summary["lib_out"] = args.lib_out
+    summary["unique_predicted"] = len(uniq)
     summary["torch_threads"] = thread_record
+    summary["timings_s"] = timings
     with open(args.lib_out + ".summary.json", "w", encoding="utf-8") as fh:
         json.dump(summary, fh, indent=2)
     print(f"wrote library with re-predicted iRT ({which}): {args.lib_out}")
@@ -649,6 +784,10 @@ def main():
               f"({100.0 * summary['retained_imported'] / max(1, summary['rows']):.2f}%) keep "
               f"their imported iRT, which is on the imported model's scale, not {which}'s; "
               f"the counts are in {args.lib_out}.summary.json", flush=True)
+
+
+def _fmt_s(value):
+    return "n/a" if value is None else f"{value:.1f}s"
 
 
 def ref_psms_for_transform(calibration, args):

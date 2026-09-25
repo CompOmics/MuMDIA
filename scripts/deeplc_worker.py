@@ -19,6 +19,7 @@ import contextlib
 import io
 import os
 import sys
+import time
 # `deeplc` MUST be imported before numpy/pyarrow. DeepLC 4.x is torch-backed, and on Windows
 # importing numpy (and the pyarrow that follows it) first makes torch's DLL initialisation fail
 # outright:
@@ -266,6 +267,7 @@ def main():
     # from disk on each call. The instance is handed back unchanged and prediction runs in
     # eval mode under no_grad, so the numbers are the same (see deeplc_finetune.py,
     # `load_base_model`, for the measurement).
+    t0 = time.perf_counter()
     try:
         from deeplc import _model_ops
         from deeplc.core import DEFAULT_MODEL
@@ -273,6 +275,7 @@ def main():
         model = _model_ops.load_model(DEFAULT_MODEL)
     except ImportError:
         model = None
+    t_load = time.perf_counter() - t0
 
     preds = np.empty(len(pforms), dtype=np.float32)
     chunk = 200_000
@@ -286,12 +289,14 @@ def main():
                 p = p.mean(axis=1)
             preds[start:end] = p.astype(np.float32)
 
+    t_predict = time.perf_counter() - t0 - t_load
     out = pa.table({
         "id": pa.array(ids, pa.uint32()),
         "predicted_rt": pa.array(preds, pa.float32()),
     })
     pq.write_table(out, out_path)
-    print(f"deeplc_worker: {len(ids)} peptides predicted")
+    print(f"deeplc_worker: {len(ids)} peptides predicted (model load {t_load:.1f}s, "
+          f"prediction {t_predict:.1f}s)")
 
 
 if __name__ == "__main__":
