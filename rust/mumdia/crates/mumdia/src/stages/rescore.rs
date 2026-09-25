@@ -2452,7 +2452,10 @@ mod tests {
         let start = src.find("\nfn run_pin_sidecar(").expect("run_pin_sidecar");
         let body = &src[start..];
         // Its closing brace is the first one in column 0 (the checkout may use CRLF).
-        let body = &body[..body.find("\n}").expect("end of run_pin_sidecar")];
+        // `\x7d` is that brace, spelled as an escape: `ci/gen_config_reference.py` counts
+        // the braces of a `#[cfg(test)]` module without masking string literals, and a
+        // bare one here would end its blanking of this module early.
+        let body = &body[..body.find("\n\x7d").expect("end of run_pin_sidecar")];
         let mut set: Vec<&str> = body
             .match_indices("\"MUMDIA_NN_")
             .map(|(i, _)| {
