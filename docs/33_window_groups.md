@@ -310,6 +310,12 @@ Two of the four tables an ungrouped run writes are not pooled, because nothing r
 
 Each pooled table is hashed once, for the manifest record and the report beside it
 together. At experiment scale those tables are tens of GB, and hashing reads all of it.
+The band artifacts are hashed once as well, by the stage that writes them, for its own
+report. A band's manifest record reuses that hash (`run_hashed`, docs/03 "Each artifact is
+hashed once"), and under `run-experiment`, which keeps no per-run manifest, no band record
+is built at all. Before 2026-09-25 every band closure re-hashed its seed, windows,
+extracted, chromatogram, feature and competed tables for a record that `run-experiment`
+then dropped.
 
 The pooling itself is a byte copy. A band's rows are already in the order the pooled table
 wants and already encoded, so `pool` splices each band's parquet row groups into the output

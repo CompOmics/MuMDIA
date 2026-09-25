@@ -16,7 +16,7 @@ use arrow::record_batch::RecordBatch;
 use mumdia_core::config::{CompeteConfig, CompeteGroupBy, CompetitionMode};
 use mumdia_core::rejection::RejectionReason;
 use mumdia_core::schema::artifact;
-use mumdia_io::report::ArtifactReport;
+use mumdia_io::report::{ArtifactReport, Written};
 use mumdia_io::table::{require_no_nulls, write_table, BatchWriter, Col, TableFile};
 use serde_json::json;
 use tracing::{info, warn};
@@ -38,6 +38,12 @@ pub struct CompeteParams<'a> {
 }
 
 pub fn run(p: CompeteParams) -> Result<u64> {
+    run_hashed(p).map(|w| w.rows)
+}
+
+/// [`run`], returning the output's row count and the content hash its report records, so
+/// an orchestrator can record the artifact without reading and hashing it again.
+pub fn run_hashed(p: CompeteParams) -> Result<Written> {
     let t0 = Instant::now();
     // `--out` must not be one of this stage's own inputs: every input is read
     // before the output is published, so writing over one replaces it and exits 0
@@ -276,7 +282,7 @@ pub fn run(p: CompeteParams) -> Result<u64> {
     stats.insert("input_rows".to_string(), json!(n));
     stats.insert("kept".to_string(), json!(rows));
     stats.insert("removed".to_string(), json!(removed.len()));
-    ArtifactReport {
+    let report = ArtifactReport {
         logical_name: artifact::PSMS_COMPETED.0.to_string(),
         schema_name: artifact::PSMS_COMPETED.0.to_string(),
         schema_version: artifact::PSMS_COMPETED.1,
@@ -290,8 +296,8 @@ pub fn run(p: CompeteParams) -> Result<u64> {
         stats,
         model_identity: None,
         elapsed_ms: elapsed,
-    }
-    .write_for(p.out)?;
+    };
+    report.write_for(p.out)?;
 
     info!(
         keys_ms,
@@ -309,7 +315,7 @@ pub fn run(p: CompeteParams) -> Result<u64> {
         mode = ?p.cfg.mode,
         "compete: done"
     );
-    Ok(rows)
+    Ok(report.written())
 }
 
 /// The label column as one code per row: `target` -> 0, `decoy` -> 1, anything else -> 2,
