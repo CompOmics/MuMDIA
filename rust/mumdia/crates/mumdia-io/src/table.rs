@@ -1127,8 +1127,10 @@ impl SpliceWriter {
                 "{src} has a different parquet schema from the table being spliced into \
                  ({diff}); the tables must come from the same configuration and the same \
                  engine version (features v1 and psms_competed v3 store every feature \
-                 column as f64, features v2 and psms_competed v4 store most as f32), so \
-                 re-run the bands with one binary"
+                 column as f64, features v2 and psms_competed v4 store most as f32, and \
+                 chromatograms v2 carries two columns v1 has not, per \
+                 `extract.chromatogram_schema`), so re-run the bands with one binary and \
+                 one configuration"
             ));
         }
         let column_indexes = meta.column_index();

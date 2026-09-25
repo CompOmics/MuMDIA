@@ -391,6 +391,28 @@ impl Decoder {
     }
 }
 
+/// Which of the columns no reader requires a chromatogram table has.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Optional {
+    pub frag_mz: bool,
+    pub frag_obs_mz: bool,
+}
+
+impl Optional {
+    /// Every column: what extract writes.
+    pub const ALL: Optional = Optional {
+        frag_mz: true,
+        frag_obs_mz: true,
+    };
+
+    pub fn of(tf: &TableFile) -> Optional {
+        Optional {
+            frag_mz: tf.has_column("frag_mz"),
+            frag_obs_mz: tf.has_column("frag_obs_mz"),
+        }
+    }
+}
+
 /// Chromatogram rows gathered into one chunk of columns, in either layout. Extract fills it
 /// and so does [`rewrite`], so the column set and order are defined once.
 #[derive(Default)]
@@ -398,7 +420,6 @@ pub struct Rows {
     pub cid: Vec<u32>,
     pub name: Vec<String>,
     pub frag_mz: Vec<f64>,
-    /// `None` rows are not allowed; the column is omitted when `has_obs_mz` is false.
     pub frag_obs_mz: Vec<f64>,
     pub predicted_intensity: Vec<f32>,
     pub rt: Vec<Vec<f32>>,
@@ -414,15 +435,18 @@ impl Rows {
         crate::memlog::bytes_of_nested(&self.rt) + crate::memlog::bytes_of_nested(&self.intensity)
     }
 
-    /// The columns of a table in `layout`. `has_obs_mz` keeps `frag_obs_mz`, which every
-    /// table extract writes has and tables from before it was added do not.
-    pub fn into_cols(self, layout: Layout, has_obs_mz: bool) -> Vec<Col> {
+    /// The columns of a table in `layout`, with the optional ones `opt` names: every table
+    /// extract writes has both, a table from before `frag_obs_mz` existed has no such
+    /// column, and quant's test tables carry neither.
+    pub fn into_cols(self, layout: Layout, opt: Optional) -> Vec<Col> {
         let mut cols = vec![
             Col::U32("candidate_id".into(), self.cid),
             Col::Str("frag_name".into(), self.name),
-            Col::F64("frag_mz".into(), self.frag_mz),
         ];
-        if has_obs_mz {
+        if opt.frag_mz {
+            cols.push(Col::F64("frag_mz".into(), self.frag_mz));
+        }
+        if opt.frag_obs_mz {
             cols.push(Col::F64("frag_obs_mz".into(), self.frag_obs_mz));
         }
         cols.extend([
@@ -458,8 +482,8 @@ pub fn writer(path: &str, row_group_rows: usize) -> TableWriter {
 pub struct DenseRow<'a> {
     pub cid: u32,
     pub name: &'a str,
-    pub frag_mz: f64,
-    /// `None` when the table has no `frag_obs_mz` column.
+    /// `None` when the table has no such column.
+    pub frag_mz: Option<f64>,
     pub frag_obs_mz: Option<f64>,
     pub predicted_intensity: f32,
     pub rt: &'a [f32],
@@ -471,16 +495,18 @@ pub struct DenseRow<'a> {
 /// candidate's first row.
 pub fn for_each_row(tf: &TableFile, mut f: impl FnMut(&DenseRow) -> Result<()>) -> Result<()> {
     let layout = Layout::of(tf)?;
-    let has_obs_mz = tf.has_column("frag_obs_mz");
+    let opt = Optional::of(tf);
     let mut cols = vec![
         "candidate_id",
         "frag_name",
-        "frag_mz",
         "predicted_intensity",
         "rt",
         "intensity",
     ];
-    if has_obs_mz {
+    if opt.frag_mz {
+        cols.push("frag_mz");
+    }
+    if opt.frag_obs_mz {
         cols.push("frag_obs_mz");
     }
     cols.extend_from_slice(layout.trace_columns());
@@ -502,11 +528,17 @@ pub fn for_each_row(tf: &TableFile, mut f: impl FnMut(&DenseRow) -> Result<()>) 
             .as_any()
             .downcast_ref::<StringArray>()
             .ok_or_else(|| anyhow!("chromatograms column 'frag_name' is not utf8"))?;
-        let fmz = col("frag_mz")?
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .ok_or_else(|| anyhow!("chromatograms column 'frag_mz' is not f64"))?;
-        let obsmz = if has_obs_mz {
+        let fmz = if opt.frag_mz {
+            Some(
+                col("frag_mz")?
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .ok_or_else(|| anyhow!("chromatograms column 'frag_mz' is not f64"))?,
+            )
+        } else {
+            None
+        };
+        let obsmz = if opt.frag_obs_mz {
             Some(
                 col("frag_obs_mz")?
                     .as_any()
@@ -537,7 +569,7 @@ pub fn for_each_row(tf: &TableFile, mut f: impl FnMut(&DenseRow) -> Result<()>) 
             f(&DenseRow {
                 cid: c,
                 name: if name.is_null(k) { "" } else { name.value(k) },
-                frag_mz: fmz.value(k),
+                frag_mz: fmz.map(|a| a.value(k)),
                 frag_obs_mz: obsmz.map(|a| a.value(k)),
                 predicted_intensity: pint.value(k),
                 rt: rt_k,
@@ -557,7 +589,7 @@ pub fn rewrite(src: &str, out: &str, layout: Layout, row_group_rows: usize) -> R
         bail!("chromatograms rewrite: the output {out} is the input");
     }
     let tf = TableFile::open(src)?;
-    let has_obs_mz = tf.has_column("frag_obs_mz");
+    let opt = Optional::of(&tf);
     let mut w = writer(out, row_group_rows);
     let mut enc = Encoder::new(row_group_rows);
     let mut rows = Rows::default();
@@ -567,8 +599,8 @@ pub fn rewrite(src: &str, out: &str, layout: Layout, row_group_rows: usize) -> R
     for_each_row(&tf, |r| {
         rows.cid.push(r.cid);
         rows.name.push(r.name.to_string());
-        rows.frag_mz.push(r.frag_mz);
-        rows.frag_obs_mz.push(r.frag_obs_mz.unwrap_or(r.frag_mz));
+        rows.frag_mz.push(r.frag_mz.unwrap_or(0.0));
+        rows.frag_obs_mz.push(r.frag_obs_mz.unwrap_or(0.0));
         rows.predicted_intensity.push(r.predicted_intensity);
         match layout {
             Layout::V1 => {
@@ -584,13 +616,13 @@ pub fn rewrite(src: &str, out: &str, layout: Layout, row_group_rows: usize) -> R
             }
         }
         if rows.cid.len() >= chunk {
-            w.write_cols(std::mem::take(&mut rows).into_cols(layout, has_obs_mz))?;
+            w.write_cols(std::mem::take(&mut rows).into_cols(layout, opt))?;
         }
         Ok(())
     })
     .with_context(|| format!("rewriting {src}"))?;
     // Also the chunk that fixes the schema when the source has no row.
-    w.write_cols(rows.into_cols(layout, has_obs_mz))?;
+    w.write_cols(rows.into_cols(layout, opt))?;
     w.close()
 }
 
@@ -809,7 +841,8 @@ mod tests {
             r.rt.push(rt.clone());
             r.intensity.push(it.clone());
         }
-        w.write_cols(r.into_cols(Layout::V1, true)).unwrap();
+        w.write_cols(r.into_cols(Layout::V1, Optional::ALL))
+            .unwrap();
         w.close().unwrap();
     }
 
@@ -820,7 +853,7 @@ mod tests {
             out.push((
                 r.cid,
                 r.name.to_string(),
-                r.frag_mz.to_bits(),
+                r.frag_mz.unwrap().to_bits(),
                 r.frag_obs_mz.unwrap().to_bits(),
                 r.predicted_intensity.to_bits(),
                 bits(r.rt),
@@ -896,7 +929,7 @@ mod tests {
     fn half_a_v2_schema_is_neither_layout() {
         let p = scratch("half.parquet");
         let mut w = writer(&p, 16);
-        let mut cols = Rows::default().into_cols(Layout::V1, true);
+        let mut cols = Rows::default().into_cols(Layout::V1, Optional::ALL);
         cols.push(Col::U32(TRACE_LEN.into(), Vec::new()));
         w.write_cols(cols).unwrap();
         w.close().unwrap();

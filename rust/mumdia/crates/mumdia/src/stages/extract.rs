@@ -671,7 +671,8 @@ impl ChromChunk {
                 *c += offset;
             }
         }
-        self.rows.into_cols(layout, true)
+        self.rows
+            .into_cols(layout, crate::chromatograms::Optional::ALL)
     }
 }
 

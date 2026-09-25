@@ -503,13 +503,23 @@ fn rewrite_row_group(
 ) -> Result<u64> {
     let (first_row, n_rows) = span;
     let t = TableFile::open_rows(path, first_row, n_rows)?;
+    // A chromatogram v2 group must stay ONE group: its rows may take their axis from an
+    // earlier row of their candidate in the group, and the rule restarts at each group
+    // (`crate::chromatograms`), so a split would leave the rows after it without one. The
+    // filter drops whole candidates, which keeps every surviving candidate's axis row. Other
+    // tables keep the cap they always had, so their pooled bytes do not move.
+    let rg_rows = if crate::chromatograms::Layout::of(&t)? == crate::chromatograms::Layout::V2 {
+        ROW_GROUP_ROWS.max(n_rows)
+    } else {
+        ROW_GROUP_ROWS
+    };
     let reader = t.batches(None, BATCH_ROWS)?;
     let schema = reader.schema();
     let cid_ix = schema
         .index_of("candidate_id")
         .map_err(|_| anyhow!("{path} has no candidate_id column"))?;
     let tmp = format!("{path}.pool-rg{first_row}.parquet");
-    let mut bw = BatchWriter::with_row_group_rows(&tmp, schema.clone(), ROW_GROUP_ROWS)?;
+    let mut bw = BatchWriter::with_row_group_rows(&tmp, schema.clone(), rg_rows)?;
     let mut kept = 0u64;
     for b in reader {
         let b = b?;
