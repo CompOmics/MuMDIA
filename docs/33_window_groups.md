@@ -548,7 +548,11 @@ groups/overlap_losers.parquet`, with the band tables in band order, or `mumdia p
 --groups-dir` rebuilds the pooled table. To validate on a data set, run the same grouped
 configuration with the default and with `false` and compare `peptide_quant.parquet`,
 `protein_group_quant.parquet` and `fragment_quant.parquet` byte for byte; the smoke does this
-on its three-band fixture.
+on its three-band fixture. Done on the AIF benchmark in four bands (augmented DIA-NN
+library, `native_tda`, 1,050,807 chromatogram rows, disjoint bands): the three quant tables,
+`psms_scored.parquet` and both TSVs were byte-identical, the pooled table the run no longer
+wrote was 237 MB, and `mumdia quant` over the four band tables with the loser file wrote
+the same quant tables again. Overlapping bands are covered by the tests above only.
 
 From here on the run is an ordinary run: rescore, audit, quant and report read the pooled
 tables (or the band tables above), and `psms_scored.parquet.report.json` names the
