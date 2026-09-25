@@ -362,6 +362,12 @@ There are three accumulation paths:
   zero-copy flush hands over exactly the batches the gather would build, because
   each flush becomes one chromatogram chunk and the parquet page framing follows
   the chunk sizes (`the_zero_copy_flush_hands_over_the_batches_the_gather_builds`).
+  Its effect on the AIF run (1.8M candidates, standalone extract, commit against
+  its parent, interleaved on an i9-13900KS) is inside run-to-run noise: +0.4% wall
+  at 32 threads (11 pairs), +1.9% and -2.7% at one thread (12 and 5 pairs), peak
+  working set within 10 MiB. The copy it removes is at most about 1% of extract by
+  the survey's estimate, so AIF cannot resolve it; it was not measured on a larger
+  run.
 - **Serial single-pass**: the fallback of the bucketed matcher. It honors every
   non-co-elution `peak_claim` strategy.
 - **Two-pass co-elution** (`extract_twopass_windows`, `extract.rs:787`): used
@@ -452,7 +458,12 @@ The cheap-to-expensive acceptance cascade, in order:
    candidate-local. That can exceed the traces the candidate emits: a candidate
    that observed only ordinal 11 holds 12 values per group against one trace, and
    in sparse (non-grid) mode a trace covers only the groups where its fragment
-   occurs.
+   occurs. Measured on the AIF run against the tree form (standalone extract,
+   interleaved, i9-13900KS), the change is inside run-to-run noise: -1.5% wall at
+   32 threads (11 pairs, CPU time -0.3%), -1.5% and -3.7% at one thread (12 and 5
+   pairs), peak working set within 10 MiB. The survey estimated at most 1-2% of
+   extract; the saving grows with the scan groups per candidate, which AIF
+   exercises little, and it was not measured on a larger run.
    Presence is a bit rather than a sentinel value, and a fragment first seen by a
    later hit of the same group starts from 0.0 before the max, exactly as the tree's
    `entry(..).or_insert(0.0)` did.
