@@ -167,6 +167,25 @@ returns the row count as `u64`:
    (`table.rs:192-194`). One `write_table` call produces exactly one row group /
    one logical batch.
 
+#### Page layout of capped writers
+
+A writer with a row-group cap (`TableWriter::with_row_group_rows`,
+`BatchWriter::with_row_group_rows`, `WriteOptions::row_group_rows`) cuts its data
+pages by size only: `writer_props` sets the data page row limit to the cap
+(at most `MAX_DATA_PAGE_ROWS`, 131,072), where parquet-rs cuts every 20,000
+rows. A scalar column of a 65,536-row group is then one page instead of four,
+and the plain reader, which fetches every page with its own seek, reads it with
+one seek. Pages still end at parquet's 1 MB data page size, so list leaves
+barely change. Measured on the AIF artifacts at their own row-group sizes
+(`bench_rewrite_a_real_artifact`): features 2,003 -> 1,039 data pages at +0.5%
+bytes, psms_competed 1,592 -> 399 at +0.5%, chromatograms 1,141 -> 947 at
++0.05%. The writer's in-progress buffers grow with the page: 551.9 -> 620.2 MB
+for one 131,072-row group of the 398-column competed table. Values are
+unchanged; file bytes and content hashes of capped writers change; uncapped
+writers (`write_table`, `write_batches`, `BatchWriter::new`) are byte-identical
+to parquet-rs's defaults. This is step 3 of R1 in the 2026-09-25 performance
+survey.
+
 ### Read side: Parquet -> `Table` -> typed `Vec`
 
 `Table` (`table.rs:200-204`) holds the `Arc<Schema>`, the `Vec<RecordBatch>`,

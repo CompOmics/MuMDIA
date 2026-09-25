@@ -338,6 +338,18 @@ fn float_dictionary_page_size_limit(
         .filter(|&limit| limit < parquet::file::properties::DEFAULT_DICTIONARY_PAGE_SIZE_LIMIT)
 }
 
+/// The most rows a capped writer puts in one data page (see [`writer_props`], "PAGES").
+///
+/// A column writer holds its open page's values until the page is cut, so a larger row
+/// limit is a larger in-progress buffer per column. Measured through the writer's own
+/// `memory_size` (`bench_rewrite_a_real_artifact`, peak over the write): the 398-column
+/// competed table in one 131,072-row group went from 551.9 to 620.2 MB (+12%), the features
+/// table at 65,536-row groups from 327.8 to 316.3 MB (fewer page headers outweigh the
+/// buffer), the chromatograms from 24.3 to 24.9 MB. Every cap the engine sets is at most
+/// this value, so the bound only stops a future, larger cap from buffering a whole
+/// multi-million-row chunk per column.
+const MAX_DATA_PAGE_ROWS: usize = 1 << 17;
+
 /// Writer properties for one artifact: the codec, an optional row-group cap, and a
 /// row-group-sized dictionary page size limit on the f32/f64 leaves.
 ///
@@ -401,17 +413,34 @@ fn float_dictionary_page_size_limit(
 /// EQUALITY. Every artifact written through a CAPPED writer whose schema has a float leaf
 /// gets different bytes and a different blake3 content hash, exactly as the
 /// `MUMDIA_PARQUET_COMPRESSION` knob already does. The decoded f32/f64 values are
-/// identical, every non-float column chunk is identical byte for byte, and files from the
-/// uncapped writers do not move at all
-/// (`the_float_limit_shrinks_high_cardinality_leaves_and_touches_nothing_else`).
+/// identical, the dictionary rule leaves every non-float column chunk as it would be
+/// without it, and files from the uncapped writers do not move at all
+/// (`the_float_limit_shrinks_high_cardinality_leaves_and_touches_nothing_else`); the page
+/// rule below changes the page boundaries of every column of a capped writer.
 /// [`SpliceWriter`] copies column chunks without re-encoding, so a pooled table assembled
 /// from a mix of pre- and post-change band artifacts carries both encodings in different
 /// row groups. That is legal parquet and reads correctly, but such a file is reproducible
 /// from neither binary alone; re-run the bands rather than pooling across the upgrade.
+///
+/// PAGES. A capped writer also cuts its data pages by size only (a data page row limit at
+/// the row-group cap, [`MAX_DATA_PAGE_ROWS`] at most), not every 20,000 rows as parquet-rs
+/// does by default. parquet-rs's synchronous reader fetches every page with its own seek, so
+/// a scalar column of a 65,536-row group was four page reads and is now one; on a spinning
+/// array, where a reader of a 398-column table is seek-bound (docs/03_io_layer.md,
+/// "Sequential row-group reads"), the page count is the read cost. Pages still end at
+/// parquet's 1 MB data page size, so list leaves, whose pages were already cut by size,
+/// barely change. Measured on the AIF artifacts rewritten at their own row-group sizes
+/// (`bench_rewrite_a_real_artifact`, against the c = 0.5 rule with 20,000-row pages):
+/// features.parquet (65,536-row groups) 2,003 -> 1,039 data pages at +0.5% bytes,
+/// psms_competed.parquet (131,072) 1,592 -> 399 at +0.5%, chromatograms.parquet (65,536)
+/// 1,141 -> 947 at +0.05%. Read and write times from the page cache did not move beyond the
+/// run-to-run noise. The values are unchanged, and the uncapped writers' files do not move.
 fn writer_props(schema: &Schema, row_group_rows: Option<usize>) -> WriterProperties {
     let mut b = WriterProperties::builder().set_compression(codec());
     if let Some(n) = row_group_rows {
-        b = b.set_max_row_group_row_count(Some(n.max(1)));
+        b = b
+            .set_max_row_group_row_count(Some(n.max(1)))
+            .set_data_page_row_count_limit(data_page_rows(n));
     }
     for (leaf, width) in float_leaf_paths(schema) {
         if let Some(limit) = float_dictionary_page_size_limit(row_group_rows, width) {
@@ -419,6 +448,11 @@ fn writer_props(schema: &Schema, row_group_rows: Option<usize>) -> WriterPropert
         }
     }
     b.build()
+}
+
+/// The data page row limit of a writer capped at `row_group_rows` rows per row group.
+fn data_page_rows(row_group_rows: usize) -> usize {
+    row_group_rows.clamp(1, MAX_DATA_PAGE_ROWS)
 }
 
 /// The buffer in front of the hasher of a hashed artifact. parquet hands its sink page
@@ -3716,13 +3750,16 @@ mod encoding_tests {
     /// compare the shipped properties against themselves and pass vacuously.
     const TEST_ROW_GROUP: usize = 4_096;
 
-    /// Write `cols` with parquet-rs's own defaults: a dictionary on every column, 1 MB
-    /// limit. The pre-change baseline every assertion below is against.
+    /// Write `cols` with parquet-rs's own dictionary defaults: a dictionary on every column,
+    /// 1 MB limit. The pre-change baseline every assertion below is against. Its data pages
+    /// are cut the way a capped writer here cuts them ([`writer_props`], "PAGES"), so a
+    /// comparison against it isolates the dictionary rule.
     fn write_with_parquet_defaults(path: &str, cols: Vec<Col>) {
         let (schema, batch) = cols_to_batch(path, cols).unwrap();
         let props = WriterProperties::builder()
             .set_compression(codec())
             .set_max_row_group_row_count(Some(TEST_ROW_GROUP))
+            .set_data_page_row_count_limit(data_page_rows(TEST_ROW_GROUP))
             .build();
         let f = std::fs::File::create(path).unwrap();
         let mut w = ArrowWriter::try_new(f, schema, Some(props)).unwrap();
@@ -3866,6 +3903,66 @@ mod encoding_tests {
             float_dictionary_page_size_limit(Some(131_072), 8),
             Some(524_288)
         );
+        std::fs::remove_file(&p).ok();
+        std::fs::remove_file(&q).ok();
+    }
+
+    /// The page rule of [`writer_props`]: a capped writer cuts a scalar column's pages by
+    /// size, so a row group of a narrow column is one page where parquet's default cut it
+    /// every 20,000 rows, and the values are the ones the default layout holds.
+    #[test]
+    fn a_capped_writer_cuts_pages_by_size_not_every_20000_rows() {
+        let n: usize = 3 * 65_536;
+        let cols = || {
+            vec![
+                Col::F64("mz".into(), (0..n).map(|i| i as f64 * 1.000_7).collect()),
+                Col::I32(
+                    "candidate_id".into(),
+                    (0..n).map(|i| i as i32 / 3).collect(),
+                ),
+            ]
+        };
+        let pages = |path: &str| -> Vec<usize> {
+            let (_, meta) = splice_meta(path).unwrap();
+            let oi = meta
+                .offset_index()
+                .expect("the writers write an offset index");
+            oi.iter()
+                .flat_map(|rg| rg.iter().map(|c| c.page_locations().len()))
+                .collect()
+        };
+        let p = tmp("page_rows.parquet");
+        let q = tmp("page_rows_default.parquet");
+        let mut w = TableWriter::new(&p).with_row_group_rows(65_536);
+        w.write_cols(cols()).unwrap();
+        w.close().unwrap();
+        let (schema, batch) = cols_to_batch(&q, cols()).unwrap();
+        let props = WriterProperties::builder()
+            .set_compression(codec())
+            .set_max_row_group_row_count(Some(65_536))
+            .build();
+        let f = std::fs::File::create(&q).unwrap();
+        let mut dw = ArrowWriter::try_new(f, schema, Some(props)).unwrap();
+        dw.write(&batch).unwrap();
+        dw.close().unwrap();
+
+        // Three row groups of two columns. 65,536 f64 are 512 KB and the indices of a
+        // run-length id column far less, both under the 1 MB page size, so the id column is
+        // one page per group. `mz` is two: the dictionary fallback of the float rule closes
+        // the dictionary-encoded prefix as a page of its own and writes the rest PLAIN.
+        assert_eq!(pages(&p), vec![2, 1, 2, 1, 2, 1]);
+        assert!(pages(&q).iter().all(|&k| k >= 4), "{:?}", pages(&q));
+        let (a, b) = (Table::read(&p).unwrap(), Table::read(&q).unwrap());
+        assert_eq!(a.f64("mz").unwrap(), b.f64("mz").unwrap());
+        assert_eq!(
+            a.i32("candidate_id").unwrap(),
+            b.i32("candidate_id").unwrap()
+        );
+        // An uncapped writer keeps parquet's 20,000-row pages.
+        write_table(&p, cols()).unwrap();
+        assert!(pages(&p).iter().all(|&k| k > 1), "{:?}", pages(&p));
+        assert_eq!(data_page_rows(65_536), 65_536);
+        assert_eq!(data_page_rows(1 << 20), MAX_DATA_PAGE_ROWS);
         std::fs::remove_file(&p).ok();
         std::fs::remove_file(&q).ok();
     }
@@ -4199,8 +4296,10 @@ mod writer_bench {
             .collect()
     }
 
-    /// The four dictionary rules the choice was made between. `Default` is parquet-rs as
-    /// shipped and therefore the pre-change baseline every percentage is against.
+    /// The dictionary rules the choice was made between. `Default` is parquet-rs as
+    /// shipped and therefore the pre-change baseline every percentage is against. `Shipped`
+    /// is the c = 0.5 dictionary rule alone, with parquet's 20,000-row data pages; `Writer`
+    /// is what this crate's capped writers use today ([`writer_props`]), whatever that is.
     #[derive(Clone, Copy)]
     enum DictRule {
         Default,
@@ -4210,19 +4309,24 @@ mod writer_bench {
         FloatC075,
         FloatC025,
         GlobalLimited,
+        Writer,
     }
 
     const DICT_RULES: &[(&str, DictRule)] = &[
         ("default", DictRule::Default),
         ("float-off", DictRule::FloatOff),
         ("float-16K", DictRule::Float16K),
-        ("shipped-c0.5", DictRule::Shipped),
+        ("c0.5", DictRule::Shipped),
         ("c0.75", DictRule::FloatC075),
         ("c0.25", DictRule::FloatC025),
         ("global-16K", DictRule::GlobalLimited),
+        ("writer", DictRule::Writer),
     ];
 
     fn props_under(rule: DictRule, schema: &Schema, cap: Option<usize>) -> WriterProperties {
+        if let DictRule::Writer = rule {
+            return writer_props(schema, cap);
+        }
         let mut b = WriterProperties::builder().set_compression(codec());
         if let Some(n) = cap {
             b = b.set_max_row_group_row_count(Some(n.max(1)));
@@ -4263,6 +4367,7 @@ mod writer_bench {
             DictRule::GlobalLimited => {
                 b = b.set_dictionary_page_size_limit(16 * 1024);
             }
+            DictRule::Writer => unreachable!("returned above"),
         }
         b.build()
     }
@@ -4328,43 +4433,83 @@ mod writer_bench {
                     if matches!(i.data_type(), DataType::Float32 | DataType::Float64))
             })
             .count();
-        let rewrite = |path: &str, rule: DictRule| -> (u64, f64) {
+        // One rewrite under `rule`: the file size, the encode time, and the writer's peak
+        // `memory_size` (its in-progress row group: compressed pages plus the buffered values
+        // of each column's open page), sampled after every batch.
+        let rewrite = |path: &str, rule: DictRule| -> (u64, f64, usize) {
             let props = props_under(rule, &table.schema, cap);
             let t = Instant::now();
             let f = std::fs::File::create(path).unwrap();
             let mut w = ArrowWriter::try_new(f, table.schema.clone(), Some(props)).unwrap();
+            let mut peak = 0usize;
             for b in &table.batches {
                 w.write(b).unwrap();
+                peak = peak.max(w.memory_size());
             }
             w.close().unwrap();
             let secs = t.elapsed().as_secs_f64();
-            (std::fs::metadata(path).unwrap().len(), secs)
+            (std::fs::metadata(path).unwrap().len(), secs, peak)
         };
-        let p = tmp("real_rule.parquet");
-        let arms: Vec<(&str, u64, f64)> = DICT_RULES
+        // The data pages of a rewritten file, from its offset index, and one full read.
+        let pages_and_read = |path: &str| -> (usize, f64) {
+            let (_, meta) = splice_meta(path).unwrap();
+            let pages = meta
+                .offset_index()
+                .map(|oi| {
+                    oi.iter()
+                        .flat_map(|rg| rg.iter().map(|c| c.page_locations().len()))
+                        .sum()
+                })
+                .unwrap_or(0);
+            let t = Instant::now();
+            let mut rows = 0usize;
+            for b in TableFile::open(path)
+                .unwrap()
+                .batches(None, 1 << 14)
+                .unwrap()
+            {
+                rows += b.unwrap().num_rows();
+            }
+            assert_eq!(rows, table.nrows);
+            (pages, t.elapsed().as_secs_f64())
+        };
+        // `MUMDIA_BENCH_RULES=default,writer` restricts the arms (the first is the baseline
+        // the percentages are against); `MUMDIA_BENCH_REPEATS` (default 3) sets how many
+        // interleaved rounds the median times come from.
+        let wanted: Option<Vec<String>> = std::env::var("MUMDIA_BENCH_RULES")
+            .ok()
+            .map(|v| v.split(',').map(|s| s.trim().to_string()).collect());
+        let repeats: usize = std::env::var("MUMDIA_BENCH_REPEATS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(3)
+            .max(1);
+        let rules: Vec<(&str, DictRule)> = DICT_RULES
             .iter()
-            .map(|&(label, rule)| {
-                let (n, secs) = rewrite(&p, rule);
-                (label, n, secs)
-            })
+            .copied()
+            .filter(|(label, _)| wanted.as_ref().is_none_or(|w| w.iter().any(|x| x == label)))
             .collect();
+        let p = tmp("real_rule.parquet");
+        let median = |mut v: Vec<f64>| -> f64 {
+            v.sort_by(f64::total_cmp);
+            v[v.len() / 2]
+        };
+        let mut writes: Vec<Vec<f64>> = vec![Vec::new(); rules.len()];
+        let mut reads: Vec<Vec<f64>> = vec![Vec::new(); rules.len()];
+        let mut shape: Vec<(u64, usize, usize)> = vec![(0, 0, 0); rules.len()];
+        for _ in 0..repeats {
+            for (k, &(_, rule)) in rules.iter().enumerate() {
+                let (n, secs, peak) = rewrite(&p, rule);
+                let (pages, read) = pages_and_read(&p);
+                writes[k].push(secs);
+                reads[k].push(read);
+                shape[k] = (n, pages, peak);
+            }
+        }
         std::fs::remove_file(&p).ok();
-        let base = arms[0].1 as f64;
-        let rendered = arms
-            .iter()
-            .map(|(label, n, secs)| {
-                format!(
-                    "{label} {:.3} MB ({:+.1}%) / write {secs:.2} s",
-                    *n as f64 / 1e6,
-                    100.0 * (*n as f64 / base - 1.0)
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("; ");
+        let base = shape[0].0 as f64;
         println!(
-            "{src}: {} rows x {} columns ({floats} float), row group {}; on disk {:.3} MB. \
-             Rewritten {rendered}. \
-             Write times are single shots; repeats of one arm spread 10-20% here.",
+            "{src}: {} rows x {} columns ({floats} float), row group {}; on disk {:.3} MB; median write and read of {repeats} interleaved rounds",
             table.nrows,
             table.schema.fields().len(),
             match cap {
@@ -4373,6 +4518,17 @@ mod writer_bench {
             },
             std::fs::metadata(&src).unwrap().len() as f64 / 1e6,
         );
+        for (k, (label, _)) in rules.iter().enumerate() {
+            let (n, pages, peak) = shape[k];
+            println!(
+                "  {label:>12} {:>10.3} MB ({:+6.1}%)  write {:.2} s  read {:.2} s  {pages} data pages  writer peak {:.1} MB",
+                n as f64 / 1e6,
+                100.0 * (n as f64 / base - 1.0),
+                median(writes[k].clone()),
+                median(reads[k].clone()),
+                peak as f64 / 1e6,
+            );
+        }
     }
 
     /// The four candidate dictionary rules against every column shape this engine writes.

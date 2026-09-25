@@ -135,6 +135,14 @@ than a number. Both are recorded in every run's `manifest.json`.
   identical to the plain reader's. Nothing uses it by default; it is for wide full scans on
   spinning storage, where the page-at-a-time reader is seek-bound (docs/03 "Sequential
   row-group reads").
+- **Capped writers cut data pages by size, not every 20,000 rows.** A scalar column of a
+  65,536-row group is one page instead of four, so the plain reader, which seeks once per
+  page, reads a wide table with a quarter of the seeks: on the AIF artifacts features went
+  from 2,003 to 1,039 data pages and psms_competed from 1,592 to 399, at +0.5% bytes, and
+  the writer's in-progress buffer of one 131,072-row competed group from 552 to 620 MB.
+  Values are unchanged; the bytes and content hashes of files from capped writers change,
+  and uncapped writers are byte-identical to before (docs/03 "Page layout of capped
+  writers").
 
 - **Library writers emit fragment tables sorted by `candidate_id`.** `import_diann_lib.py`,
   `make_reverse_decoys.py` and `make_shift_decoys.py` finish with a streaming bucket sort
