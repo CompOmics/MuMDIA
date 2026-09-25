@@ -375,6 +375,34 @@ def test_the_band_list_is_validated_before_anything_is_read(tmp_path):
         ns["read_band_pairs"](Args)
 
 
+def test_the_projection_cache_key_depends_on_the_strings_not_on_the_slicing():
+    """The cache key hashes the sequences' bytes in order, whatever the Arrow layout."""
+    import hashlib
+
+    np = pytest.importorskip("numpy")
+    pa = pytest.importorskip("pyarrow")
+    source = _module_source(["_sequence_digest"])
+    ns = {"np": np, "pa": pa}
+    exec(compile(source, "deeplc_finetune.py", "exec"), ns)  # noqa: S102
+
+    def digest(arr):
+        h = hashlib.blake2b(digest_size=20)
+        ns["_sequence_digest"](arr, h)
+        return h.hexdigest()
+
+    seqs = ["PEPTIDEK", "ACDK", "", "LLLLLLLLLLR"] * 300
+    whole = pa.array(seqs, pa.large_string())
+    padded = pa.array(["XX"] + seqs + ["YY"], pa.string()).slice(1, len(seqs))
+    chunked = pa.chunked_array([pa.array(seqs[:7]), pa.array(seqs[7:])])
+    assert digest(whole) == digest(padded) == digest(chunked)
+    assert digest(whole) != digest(pa.array(seqs[::-1], pa.large_string()))
+    assert digest(whole) != digest(pa.array(seqs[:-1], pa.large_string()))
+    # Moving a character between neighbours keeps the concatenation and changes the key.
+    moved = list(seqs)
+    moved[0], moved[1] = "PEPTIDE", "KACDK"
+    assert digest(whole) != digest(pa.array(moved, pa.large_string()))
+
+
 def _assigned_constants(script, names):
     tree = ast.parse((SCRIPTS / script).read_text(encoding="utf-8"))
     out = {}
@@ -681,6 +709,52 @@ def test_bands_write_the_whole_library_column_band_by_band(tmp_path, mode):
             assert s["multihead"]["heads"] == whole_summary["multihead"]["heads"]
     for k in total:
         assert total[k] == whole_summary[k], k
+
+
+@pytest.mark.parametrize("mode", ["base", "multihead"])
+def test_the_projection_cache_reproduces_the_prediction_and_is_read_back(tmp_path, mode):
+    """`--projection-cache`: a miss writes the projection, a hit reads it, and the values
+    match a plain prediction (bit for bit for the base model's default head, within float
+    tolerance for the multi-head transform, which evaluates the heads in numpy)."""
+    _deeplc_or_skip()
+    import numpy as np
+
+    _write_shard_fixture(tmp_path)
+    lib, seed = tmp_path / "lib.parquet", tmp_path / "seed.parquet"
+    env = {"MUMDIA_DEEPLC_THREAD_CAP": "0", "CUDA_VISIBLE_DEVICES": "-1"}
+    mode_args = {"base": ["-", "--no-finetune"], "multihead": [str(seed), "--multihead", "80"]}[mode]
+    common = ["--threads", "1", "--predict-threads", "1", "--predict-chunk", "64"]
+    cache = tmp_path / "cache"
+    outs = {}
+    for arm, extra in [("plain", []), ("miss", ["--projection-cache", str(cache)]),
+                       ("hit", ["--projection-cache", str(cache)])]:
+        out = tmp_path / "{}.parquet".format(arm)
+        run_worker_ok("deeplc_finetune.py", str(lib), mode_args[0], str(out), *mode_args[1:],
+                      *common, *extra, env=env, timeout=1800)
+        outs[arm] = out
+    plain, miss, hit = (_predicted_irt(outs[a]) for a in ("plain", "miss", "hit"))
+    assert (miss == hit).all(), "a cache hit changed the values"
+    if mode == "base":
+        assert (plain == miss).all(), "{} rows differ".format(int((plain != miss).sum()))
+    else:
+        # Float-equivalent: the heads are evaluated from the cached factors in numpy, and the
+        # multi-head splines amplify last-bit differences for the few sequences outside the
+        # anchors' range (measured here: 402 of 572 rows identical, 7 above 1e-3 s, the
+        # largest 3.7 s on a 4-1602 s scale; a thread-count change does the same, docs/13).
+        a = plain.view(np.float32).astype(np.float64)
+        b = miss.view(np.float32).astype(np.float64)
+        close = np.abs(a - b) <= 1e-3
+        assert close.mean() >= 0.97, "{} of {} rows move by more than 1e-3".format(
+            int((~close).sum()), len(close))
+        assert np.median(np.abs(a - b)) == 0.0
+    s_miss = json.loads((tmp_path / "miss.parquet.summary.json").read_text("utf-8"))
+    s_hit = json.loads((tmp_path / "hit.parquet.summary.json").read_text("utf-8"))
+    assert s_miss["projection_cache"]["used"] and not s_miss["projection_cache"]["hit"]
+    assert s_hit["projection_cache"]["hit"]
+    assert s_hit["projection_cache"]["key"] == s_miss["projection_cache"]["key"]
+    entries = [p for p in cache.iterdir()]
+    assert len(entries) == 1 and (entries[0] / "projections.npy").exists(), entries
+    assert not [p for p in cache.iterdir() if ".tmp-" in p.name]
 
 
 # ------------------------------------------------ shard clean-up (no DeepLC needed)

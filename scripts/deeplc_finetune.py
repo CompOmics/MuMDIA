@@ -53,6 +53,7 @@ os.environ["NUMEXPR_NUM_THREADS"] = "1"
 import argparse
 import contextlib
 import gc
+import hashlib
 import io
 import json
 import pickle
@@ -669,6 +670,16 @@ def main():
                          "rewrite a single table gets, with its own <lib_out>.summary.json. "
                          "With --multihead or --no-finetune only: a fine-tune is refused "
                          "for banded runs by the engine.")
+    ap.add_argument("--projection-cache", metavar="DIR", default=None,
+                    help="keep the base model's run-independent trunk projection of every "
+                         "predicted sequence (64 float32 each) in DIR, keyed by the DeepLC "
+                         "version, the model file and the exact sequence list, and read it "
+                         "back on a later call over the same sequences, so only the per-run "
+                         "calibration is computed. Base model only (--multihead or "
+                         "--no-finetune); a fine-tuned model has no factored head. The "
+                         "values are float-equivalent to a plain prediction, not "
+                         "bit-identical (the heads are evaluated in numpy from the cached "
+                         "factors instead of in torch).")
     ap.add_argument("--predict-chunk", type=int, default=PREDICT_CHUNK, metavar="N",
                     help="unique peptidoforms per prediction call (default %d). Shards are "
                          "cut at multiples of it. Changing it changes how DeepLC batches the "
@@ -825,7 +836,28 @@ def main():
         "plan": shard_note,
     }
     t_pred0 = time.time()
-    if n_shards == 1:
+    cache_record = None
+    values = None
+    if args.projection_cache and ft_model is not None:
+        print("projection cache: not used with a fine-tuned model, which has no factored "
+              "head; predicting as usual", flush=True)
+    if args.projection_cache and ft_model is None:
+        if base_model is None:
+            t_phase = time.perf_counter()
+            base_model = load_base_model()
+            timings["model_load"] = round(time.perf_counter() - t_phase, 3)
+        if shard_threads != torch.get_num_threads():
+            torch.set_num_threads(shard_threads)
+        values, cache_record, timers = predict_from_projections(
+            uniq, base_model, calibration, chunk, args.projection_cache)
+        if values is not None:
+            n_shards = 1
+            shard_record["used"] = 1
+            shard_record["plan"] = "projection cache"
+            timings["featurisation"], timings["forward"] = timers.totals()
+    if values is not None:
+        pass  # predicted from the projection cache
+    elif n_shards == 1:
         if ft_model is None and base_model is None:
             t_phase = time.perf_counter()
             base_model = load_base_model()
@@ -866,7 +898,8 @@ def main():
         write_bands(band_pairs, band_pos, uniq, values, which, thread_record, shard_record,
                     timings,
                     multihead_record(calibration, args.multihead, len(ref_psms))
-                    if calibration is not None else None)
+                    if calibration is not None else None,
+                    cache_record)
         return
 
     t_phase = time.perf_counter()
@@ -884,6 +917,8 @@ def main():
     summary["torch_threads"] = thread_record
     summary["shards"] = shard_record
     summary["timings_s"] = timings
+    if cache_record is not None:
+        summary["projection_cache"] = cache_record
     if calibration is not None:
         summary["multihead"] = multihead_record(calibration, args.multihead, len(ref_psms))
     with open(args.lib_out + ".summary.json", "w", encoding="utf-8") as fh:
@@ -978,7 +1013,7 @@ def union_positions(band_bases):
 
 
 def write_bands(band_pairs, band_pos, uniq, values, which, thread_record, shard_record,
-                timings, multihead):
+                timings, multihead, cache_record=None):
     """Rewrite and write every band of a `--bands` call, each with its own summary.
 
     Each band's table is read whole, its `predicted_irt` rewritten from the union's
@@ -1019,6 +1054,8 @@ def write_bands(band_pairs, band_pos, uniq, values, which, thread_record, shard_
         summary["torch_threads"] = thread_record
         summary["shards"] = shard_record
         summary["timings_s"] = timings
+        if cache_record is not None:
+            summary["projection_cache"] = cache_record
         if multihead is not None:
             summary["multihead"] = multihead
         with open(summary["lib_out"] + ".summary.json", "w", encoding="utf-8") as fh:
@@ -1082,6 +1119,153 @@ def predict_values(uniq, model, calibration, chunk, label=""):
             print(f"  {prefix}{done}/{len(uniq)}  {dt:.1f}s for this chunk "
                   f"({rate:.0f} peptidoforms/s, ETA {eta / 60:.1f} min)", flush=True)
     return values, timers
+
+
+def _sequence_digest(uniq, h):
+    """Feed the exact bytes of every sequence in `uniq`, in order, to the hash `h`.
+
+    Offsets are re-based per slice so the digest depends on the strings only, not on how
+    the Arrow array happens to be sliced or chunked.
+    """
+    arr = uniq.cast(pa.large_string())
+    if isinstance(arr, pa.ChunkedArray):
+        arr = arr.combine_chunks()
+    step = 1_000_000
+    for a in range(0, len(arr), step):
+        part = arr.slice(a, step)
+        offsets = np.frombuffer(part.buffers()[1], dtype=np.int64)[
+            part.offset:part.offset + len(part) + 1]
+        data = part.buffers()[2]
+        start, stop = int(offsets[0]), int(offsets[-1])
+        h.update((offsets - start).tobytes())
+        if data is not None and stop > start:
+            h.update(memoryview(data)[start:stop])
+
+
+def projection_cache_key(uniq, model_path):
+    """Hex key of a cached projection: the DeepLC version, the model file, the sequences."""
+    h = hashlib.blake2b(digest_size=20)
+    h.update(("deeplc=%s;" % getattr(deeplc, "__version__", "")).encode())
+    with open(model_path, "rb") as fh:
+        for block in iter(lambda: fh.read(1 << 20), b""):
+            h.update(block)
+    h.update(b";sequences=%d;" % len(uniq))
+    _sequence_digest(uniq, h)
+    return h.hexdigest()
+
+
+def predict_from_projections(uniq, model, calibration, chunk, cache_dir):
+    """Predict `uniq` from the base model's cached trunk projection, computing it once.
+
+    Calibrated RT is `ridge(spline_h(head_h(proj(trunk(x)))))` over the selected heads, and
+    only the head selection, the splines and the ridge depend on a run; `proj(trunk(x))`, 64
+    float32 per sequence, depends on the sequence and the model alone. So the projection is
+    computed on the first call over a sequence list (the same forward pass a plain
+    prediction makes), stored as `<cache_dir>/<key>/projections.npy`, and every later call
+    over the same list evaluates only the heads it needs from the factors: the multi-head
+    calibration's transform, or the default head for the base model. The key covers the
+    DeepLC version, the model file's bytes and the exact sequence list.
+
+    Returns `(values, record, timers)`, or `(None, record, None)` when the model has no
+    factored head, in which case the caller predicts as usual. Private DeepLC API
+    (`FactoredPredictionMatrix._projections`, `_default_task_idx`, present in 4.4.0 and
+    4.5.0): a release that moves them falls back the same way, with a warning.
+    """
+    try:
+        from deeplc import _model_ops
+        from deeplc._factored import FactoredPredictionMatrix
+        from deeplc.core import DEFAULT_MODEL, _default_task_idx
+    except ImportError as exc:
+        print("WARNING: projection cache unavailable (%s); predicting as usual" % exc,
+              flush=True)
+        return None, {"used": False, "why": str(exc)}, None
+    if model is None or not _model_ops.supports_factored(model):
+        print("WARNING: projection cache: this model has no factored head; predicting as "
+              "usual", flush=True)
+        return None, {"used": False, "why": "no factored head"}, None
+    t0 = time.perf_counter()
+    key = projection_cache_key(uniq, DEFAULT_MODEL)
+    t_key = time.perf_counter() - t0
+    final = os.path.join(cache_dir, key)
+    path = os.path.join(final, "projections.npy")
+    head = model.head
+    emb = head.embedding.detach().cpu().numpy()
+    scale = head.scale.detach().cpu().numpy()
+    shift = head.shift.detach().cpu().numpy()
+    rank = emb.shape[1]
+    timers = PredictTimers()
+    hit = os.path.exists(path)
+    t1 = time.perf_counter()
+    if not hit:
+        os.makedirs(cache_dir, exist_ok=True)
+        work = tempfile.mkdtemp(prefix=f"{key}.tmp-{os.getpid()}.", dir=cache_dir)
+        try:
+            proj = np.lib.format.open_memmap(os.path.join(work, "projections.npy"), mode="w+",
+                                             dtype=np.float32, shape=(len(uniq), rank))
+            with quiet_deeplc_progress(), timers.install(model):
+                for s in range(0, len(uniq), chunk):
+                    batch = uniq.slice(s, chunk).to_pylist()
+                    m = deeplc.predict(batch, model=model, return_matrix=True)
+                    if not isinstance(m, FactoredPredictionMatrix):
+                        raise TypeError("predict(return_matrix=True) returned %s, not factors"
+                                        % type(m).__name__)
+                    block = np.asarray(m._projections, dtype=np.float32)
+                    if block.shape != (len(batch), rank):
+                        raise SystemExit(f"DeepLC returned projections of shape {block.shape} "
+                                         f"for {len(batch)} sequences")
+                    proj[s:s + len(batch)] = block
+                    print(f"  projection {min(s + chunk, len(uniq))}/{len(uniq)}", flush=True)
+            proj.flush()
+            del proj
+            with open(os.path.join(work, "meta.json"), "w", encoding="utf-8") as fh:
+                json.dump({"key": key, "sequences": len(uniq), "rank": int(rank),
+                           "deeplc": getattr(deeplc, "__version__", ""),
+                           "model": str(DEFAULT_MODEL), "chunk": chunk,
+                           "torch_threads": torch.get_num_threads()}, fh, indent=2)
+            try:
+                os.replace(work, final)
+            except OSError:
+                # Another call wrote the same key first; its projections are the same.
+                shutil.rmtree(work, ignore_errors=True)
+        except (TypeError, AttributeError) as exc:
+            shutil.rmtree(work, ignore_errors=True)
+            print("WARNING: projection cache: %s; predicting as usual" % exc, flush=True)
+            return None, {"used": False, "why": str(exc)}, None
+        except BaseException:
+            shutil.rmtree(work, ignore_errors=True)
+            raise
+    t_proj = time.perf_counter() - t1
+    proj = np.load(path, mmap_mode="r")
+    if proj.shape != (len(uniq), rank):
+        raise SystemExit(f"{path} holds {proj.shape}, expected ({len(uniq)}, {rank})")
+    t2 = time.perf_counter()
+    default_head = None if calibration is not None else int(_default_task_idx(model))
+    values = np.empty(len(uniq), dtype=np.float64)
+    for s in range(0, len(uniq), chunk):
+        block = np.ascontiguousarray(proj[s:s + chunk])
+        source = FactoredPredictionMatrix(block, emb, scale, shift)
+        if calibration is not None:
+            p = agg(calibration.transform(source))
+        else:
+            p = np.asarray(source[:, default_head], dtype=np.float64)
+        if len(p) != len(block):
+            raise SystemExit(f"the cached projection gave {len(p)} values for {len(block)} "
+                             f"sequences")
+        values[s:s + len(block)] = p
+    t_eval = time.perf_counter() - t2
+    record = {
+        "used": True,
+        "hit": bool(hit),
+        "key": key,
+        "path": path,
+        "rank": int(rank),
+        "key_s": round(t_key, 3),
+        "project_s": round(t_proj, 3) if not hit else 0.0,
+        "evaluate_s": round(t_eval, 3),
+    }
+    print(f"projection cache {'hit' if hit else 'written'}: {path} "
+          f"({len(uniq)} sequences; evaluate {t_eval:.1f}s)", flush=True)
+    return values, record, timers
 
 
 def shard_plan(requested, budget, n_items, chunk, gpu):

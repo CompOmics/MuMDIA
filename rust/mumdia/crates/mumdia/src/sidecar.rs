@@ -455,6 +455,7 @@ pub fn run_deeplc_multihead(
     window_holdout_frac: f64,
     threads: usize,
     shards: usize,
+    projection_cache: Option<&str>,
 ) -> Result<()> {
     require_deeplc_version(python)?;
     info!(
@@ -488,6 +489,7 @@ pub fn run_deeplc_multihead(
     ];
     let sh = shards.to_string();
     push_shards(&mut args, shards, &sh);
+    push_projection_cache(&mut args, projection_cache);
     run_worker(python, script, &args, true).context("DeepLC multi-head calibration failed")?;
     warn_on_retained_imported(lib_out);
     Ok(())
@@ -509,6 +511,7 @@ pub fn run_deeplc_repredict(
     lib_out: &str,
     threads: usize,
     shards: usize,
+    projection_cache: Option<&str>,
 ) -> Result<()> {
     require_deeplc_version(python)?;
     info!(
@@ -531,6 +534,7 @@ pub fn run_deeplc_repredict(
     ];
     let sh = shards.to_string();
     push_shards(&mut args, shards, &sh);
+    push_projection_cache(&mut args, projection_cache);
     run_worker(python, script, &args, true).context("DeepLC library re-prediction failed")?;
     warn_on_retained_imported(lib_out);
     Ok(())
@@ -563,6 +567,7 @@ pub fn run_deeplc_bands(
     mode: BandAdaptation,
     threads: usize,
     shards: usize,
+    projection_cache: Option<&str>,
 ) -> Result<()> {
     require_deeplc_version(python)?;
     if pairs.is_empty() {
@@ -629,6 +634,7 @@ pub fn run_deeplc_bands(
     }
     args.extend_from_slice(&["--threads", &th, "--predict-threads", &th]);
     push_shards(&mut args, shards, &sh);
+    push_projection_cache(&mut args, projection_cache);
     run_worker(python, script, &args, true).context("DeepLC band adaptation failed")?;
     for (_, lib_out) in pairs {
         if !std::path::Path::new(lib_out).exists() {
@@ -637,6 +643,15 @@ pub fn run_deeplc_bands(
         warn_on_retained_imported(lib_out);
     }
     Ok(())
+}
+
+/// Append `--projection-cache <dir>` (`rt_im_train.deeplc_projection_cache`). Nothing when
+/// it is off, so the default argument list is the one an older worker accepts.
+fn push_projection_cache<'a>(args: &mut Vec<&'a str>, dir: Option<&'a str>) {
+    if let Some(dir) = dir {
+        args.push("--projection-cache");
+        args.push(dir);
+    }
 }
 
 /// Append `--shards <n>` for a sharded whole-library prediction

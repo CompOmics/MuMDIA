@@ -405,6 +405,28 @@ and `bands` (`count`, `index`, `union_unique`). A fine-tune is refused in this m
 applies to the union prediction as it does to one table. The engine side is
 `sidecar::run_deeplc_bands`; `docs/33_window_groups.md` section 4b has the measurements.
 
+**Projection cache** (`rt_im_train.deeplc_projection_cache`, `--projection-cache DIR`).
+Calibrated RT is `ridge(spline_h(head_h(proj(trunk(x)))))` over the selected heads, and only
+the head selection, the splines and the ridge depend on a run; `proj(trunk(x))`, 64 float32
+per sequence, depends on the sequence and the model alone. With a cache directory the worker
+computes that projection once per sequence list (`predict_from_projections`: the same
+forward pass, through `deeplc.predict(..., return_matrix=True)`, which hands back a
+`FactoredPredictionMatrix`), stores it as `<DIR>/<key>/projections.npy` with a `meta.json`,
+and on a later call over the same list memory-maps it and evaluates only the heads it needs:
+the multi-head calibration's `transform` on a `FactoredPredictionMatrix` of each 100,000-row
+block, or the default head for the base-model re-prediction. The key is a BLAKE2b digest of
+the DeepLC version, the model file's bytes and the exact sequence list in order
+(`projection_cache_key`, `_sequence_digest`). The entry is written into a `.tmp-<pid>`
+directory and renamed into place, so a reader never sees a partial one. A miss computes the
+projection in one process (`--shards` does not apply to it); a fine-tuned model has no
+factored head and predicts as usual. The summary records `projection_cache` (`hit`, `key`,
+`path`, timings). The values are float-equivalent to a plain prediction: bit-identical for
+the base model on the smoke library, and within the spline edge amplification for the
+multi-head calibration (`test_the_projection_cache_reproduces_the_prediction_and_is_read_back`).
+Private DeepLC API (`FactoredPredictionMatrix._projections`, `core._default_task_idx`,
+present in 4.4.0 and 4.5.0); a release that moves them falls back to a plain prediction with
+a warning.
+
 **DeepLC thread cap.** Every DeepLC call site asks for the engine's rayon thread count
 (the fine-tune's training pool keeps its own bound), and both workers cap what they
 give torch at the physical cores available to the process: on Linux the physical cores

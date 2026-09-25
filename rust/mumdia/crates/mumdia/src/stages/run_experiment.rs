@@ -338,6 +338,7 @@ fn adapt_rt_library(
             cfg.rt_im_train.window_holdout_frac,
             threads,
             cfg.rt_im_train.deeplc_predict_shards,
+            cfg.rt_im_train.deeplc_projection_cache.as_deref(),
         )?;
         if irt_placeholder {
             crate::sidecar::require_every_row_repredicted(&lib_p_mh)?;
@@ -725,6 +726,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
             &out,
             rayon::current_num_threads(),
             cfg.rt_im_train.deeplc_predict_shards,
+            cfg.rt_im_train.deeplc_projection_cache.as_deref(),
         )?;
         out
     } else {

@@ -778,6 +778,33 @@ pub struct RtImTrainConfig {
     /// process-tree peak. Validate on two acquisitions (peptides at 1% inside the seed
     /// spread, `docs/08_rt_im_train.md` section 4d) before defaulting it on.
     pub deeplc_predict_shards: usize,
+    /// Directory for DeepLC's run-independent trunk projection (`deeplc_finetune.py
+    /// --projection-cache`). `null` (the default) is off.
+    ///
+    /// Calibrated RT is `ridge(spline_h(head_h(proj(trunk(x)))))` over the selected heads,
+    /// and only the head selection, the splines and the ridge depend on a run. The
+    /// projection, 64 float32 per sequence, depends on the sequence and the model alone, yet
+    /// every multi-head calibration and base-model re-prediction recomputed it, which is
+    /// essentially the whole of the step (10:41 of the HYE multi-head step at 96 threads).
+    /// Set, the first call over a sequence list writes `<dir>/<key>/projections.npy` (the
+    /// key covers the DeepLC version, the model file and the exact list; 256 B per
+    /// sequence, about 1.26 GB for HYE's 4.91M) and later calls over the same list read it
+    /// and evaluate only the heads they need: `rt_library_scope = per_run`, every rerun of
+    /// an experiment, and the bands of `groups.rt_adaptation = once_per_run` across runs.
+    /// A miss computes the projection in one process (`deeplc_predict_shards` does not
+    /// apply to it). Base model only: a fine-tune has no factored head and ignores it.
+    ///
+    /// Float-equivalent, not bit-identical: the heads are evaluated in numpy from the cached
+    /// factors instead of in torch. Measured with DeepLC 4.5.0 on CPU: the base-model
+    /// re-prediction bit-identical on every row of the smoke library (3,820 rows); the
+    /// multi-head calibration bit-identical on 3,782 of those rows and within 7.6e-6 s on
+    /// the rest, and on a synthetic 572-row library with sequences outside the anchors'
+    /// range 402 rows identical and 7 above 1e-3 s, the largest 3.7 s, which is the spline
+    /// edge amplification a thread-count change shows too (docs/13). A hit took 0.12 s
+    /// against 7.0 s for the prediction. Validate at scale as a DeepLC version change:
+    /// per-row max |delta predicted_irt|, the selected heads, and peptides at 1% inside the
+    /// seed spread on two acquisitions.
+    pub deeplc_projection_cache: Option<String>,
 }
 
 /// Source of `predicted_irt` for an imported library; see `RtImTrainConfig::library_irt`.
@@ -865,6 +892,7 @@ impl Default for RtImTrainConfig {
             window_holdout_frac: 0.0,
             library_irt: LibraryIrt::Auto,
             deeplc_predict_shards: 1,
+            deeplc_projection_cache: None,
         }
     }
 }

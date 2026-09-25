@@ -427,6 +427,7 @@ pub fn run(p: RunParams) -> Result<()> {
                     cfg.rt_im_train.window_holdout_frac,
                     rayon::current_num_threads(),
                     cfg.rt_im_train.deeplc_predict_shards,
+                    cfg.rt_im_train.deeplc_projection_cache.as_deref(),
                 )?;
                 if rt_placeholder {
                     crate::sidecar::require_every_row_repredicted(&lib_p_mh)?;
@@ -511,6 +512,7 @@ pub fn run(p: RunParams) -> Result<()> {
                     &lib_p_dl,
                     rayon::current_num_threads(),
                     cfg.rt_im_train.deeplc_predict_shards,
+                    cfg.rt_im_train.deeplc_projection_cache.as_deref(),
                 )?;
                 let n_dl = mumdia_io::table::nrows(&lib_p_dl)?;
                 man.record(record_artifact(
