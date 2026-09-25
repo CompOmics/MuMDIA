@@ -218,8 +218,10 @@ echo "    ok: 3 bands, $n_ms2 MS2 + $n_ms1 MS1 decodes, $n_grouped peptides, rep
 echo "=== smoke: the grouped run with the competed rows and chromatograms left per band"
 sed 's/"calibration": "per_group" }/"calibration": "per_group", "pool_competed": false, "pool_chromatograms": false }/' \
     "$work/grouped.json" > "$work/grouped_nopool.json"
-grep -q '"pool_chromatograms": false' "$work/grouped_nopool.json" \
+grep -q '"pool_competed": false' "$work/grouped_nopool.json" \
     || { echo "could not derive the pool_competed = false config"; exit 1; }
+grep -q '"pool_chromatograms": false' "$work/grouped_nopool.json" \
+    || { echo "could not derive the pool_chromatograms = false config"; exit 1; }
 "$BIN" run --fasta test_data/fixture.fasta --mzml "$work/fixture.mzML" \
     --out-dir "$work/out_grouped_nopool" --config "$work/grouped_nopool.json" --threads 4 \
     > "$work/grouped_nopool.log" 2>&1 \

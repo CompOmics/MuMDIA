@@ -336,7 +336,7 @@ enum Cmd {
         psms_scored: String,
         /// The run's chromatogram table, or a grouped run's band tables in band order
         /// (`groups/gNN/chromatograms.parquet`) when it did not pool them.
-        #[arg(long, num_args = 1..)]
+        #[arg(long, num_args = 1.., required = true)]
         chromatograms: Vec<String>,
         /// A grouped run's `groups/overlap_losers.parquet`: the candidates each band table
         /// does not contribute, because the pool's overlap dedup gave them to another

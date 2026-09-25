@@ -475,7 +475,7 @@ Plus the 5 repeated flags removed above: see "Global flags".
 ```text
 Quantify identified peptides + roll up to protein groups
 
-Usage: mumdia quant [OPTIONS] --psms-scored <PSMS_SCORED> --out-peptide <OUT_PEPTIDE> --out-protein <OUT_PROTEIN>
+Usage: mumdia quant [OPTIONS] --psms-scored <PSMS_SCORED> --chromatograms <CHROMATOGRAMS>... --out-peptide <OUT_PEPTIDE> --out-protein <OUT_PROTEIN>
 
 Options:
       --psms-scored <PSMS_SCORED>
@@ -484,7 +484,7 @@ Options:
           The run's chromatogram table, or a grouped run's band tables in band order (`groups/gNN/chromatograms.parquet`) when it did not pool them
 
       --overlap-losers <OVERLAP_LOSERS>
-          A grouped run's `groups/overlap_losers.parquet`: the candidates each band table does not contribute, because the pool's overlap dedup gave them to another band. Its `band` column indexes the `--chromatograms` list
+          A grouped run's `groups/overlap_losers.parquet`: the candidates each band table does not contribute, because the pool's overlap dedup gave them to another band. Its `band` column indexes the `--chromatograms` list, which must be the band tables the file names, in its order (a mismatch is refused)
 
       --out-peptide <OUT_PEPTIDE>
 
