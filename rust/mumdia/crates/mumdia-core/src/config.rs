@@ -1918,6 +1918,19 @@ pub enum GroupCalibration {
     PerGroup,
 }
 
+/// What a grouped run's band plan balances.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum GroupBalance {
+    /// The estimated library precursors each band selects. The behaviour before this setting
+    /// existed.
+    #[default]
+    Precursors,
+    /// The estimated search cost: per window, the precursors it selects times the MS2 peaks
+    /// its scans carry.
+    Cost,
+}
+
 /// How often a grouped run adapts the library's retention times (the multi-head calibration
 /// or the base-model re-prediction) under `groups.calibration = global`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -1995,6 +2008,23 @@ pub struct GroupsConfig {
     /// 1% inside the seed spread, the per-band max |delta predicted_irt| and the selected
     /// heads) before defaulting it on.
     pub rt_adaptation: GroupRtAdaptation,
+    /// What the band plan balances: `precursors` (the default), the estimated library
+    /// precursors per band, or `cost`, per window the precursors it selects times the MS2
+    /// peaks of its scans.
+    ///
+    /// Band cost follows spectral density more than precursor count: on the
+    /// immunopeptidomics search two bands of 2.98M and 3.03M precursors took 42 s and 460 s,
+    /// and at 81-94 bands the slowest windows (418-460 s) set the floor of the run. The
+    /// queue already starts the most expensive bands first whatever this says; `cost` also
+    /// moves the cuts, so that no band is several times the work of the others.
+    ///
+    /// Output-changing, hence opt-in: the cuts decide which candidates sit at a band edge,
+    /// which the overlap deduplication and the edge candidates' neighbours depend on, and the
+    /// pooled row order the classifier sees. Validate like a band-count change (docs/33
+    /// section 8): peptides at 1% inside the seed spread against `precursors`, and the per-band
+    /// wall times, on two acquisitions. Note that the MS2 is decoded before the plan under
+    /// either setting.
+    pub balance: GroupBalance,
 }
 impl Default for GroupsConfig {
     fn default() -> Self {
@@ -2003,6 +2033,7 @@ impl Default for GroupsConfig {
             calibration: GroupCalibration::Global,
             parallel: 1,
             rt_adaptation: GroupRtAdaptation::PerBand,
+            balance: GroupBalance::Precursors,
         }
     }
 }
@@ -3093,6 +3124,9 @@ mod tests {
         let c = Config::from_json(r#"{"groups":{"rt_adaptation":"once_per_run"}}"#).unwrap();
         assert_eq!(c.groups.rt_adaptation, GroupRtAdaptation::OncePerRun);
         assert!(Config::from_json(r#"{"groups":{"rt_adaptation":"sometimes"}}"#).is_err());
+        assert_eq!(Config::default().groups.balance, GroupBalance::Precursors);
+        let c = Config::from_json(r#"{"groups":{"balance":"cost"}}"#).unwrap();
+        assert_eq!(c.groups.balance, GroupBalance::Cost);
     }
 
     #[test]

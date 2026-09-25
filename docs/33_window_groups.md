@@ -52,6 +52,18 @@ than by windows matters: on the immunopeptidomics library the per-window precurs
 differed by 3x across the m/z range, and equal window counts would have made the memory
 peak the largest band's, not the average's.
 
+`groups.balance = cost` (default `precursors`) balances the cuts on an estimate of the search
+cost instead: per window, the precursors it selects times the MS2 peaks its scans carry
+(`groups::window_costs`; the run's MS2 is decoded before the plan for this, and for the
+dispatch order of section 3). Band cost follows spectral density more than precursor count:
+on the immunopeptidomics search two bands of 2.98M and 3.03M precursors took 42 s and 460 s,
+and at 81-94 bands the slowest single windows (418-460 s) set the floor of the run. The
+bands' `est_precursors` and the merge of empty bands are unchanged, and `plan.json` records
+`"balance": "Cost"`. The setting moves the cuts, and with them which candidates sit at a band
+edge and the order of the pooled rows the classifier sees, so it is output-changing and
+opt-in; validate it as a band-count change (section 8): peptides at 1% inside the seed spread
+against `precursors`, and the per-band wall times, on two acquisitions. Not measured.
+
 A band is the union of its windows' m/z ranges. Two consequences are written to
 `groups/plan.json`:
 

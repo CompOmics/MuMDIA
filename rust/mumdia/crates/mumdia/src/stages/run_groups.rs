@@ -20,7 +20,7 @@ use std::collections::BTreeMap;
 use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
-use mumdia_core::config::{Config, GroupCalibration, GroupRtAdaptation};
+use mumdia_core::config::{Config, GroupBalance, GroupCalibration, GroupRtAdaptation};
 use mumdia_core::manifest::Manifest;
 use mumdia_core::schema::artifact;
 use mumdia_io::record_artifact;
@@ -201,16 +201,49 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
     let d = |name: &str| format!("{}/{}", g.out_dir, name);
     let gd = |i: usize, name: &str| format!("{}/groups/g{i:02}/{name}", g.out_dir);
 
+    // --- the run's MS2, decoded once for the whole seeding phase
+    //
+    // Each band searches the whole run and differs only in its slice of the library, so
+    // the scans are the same bytes for all of them, and one decode serves the lot. The
+    // buffer is dropped at the end of the seeding phase rather than held to the end of the
+    // run. Nothing between here and extract reads the spectra, and what sits in between is
+    // the retention-time phase, where DeepLC sidecar processes run -- one per band under
+    // `groups.rt_adaptation = per_band`, 63 of them on the 63-band run. Holding ~1 GB of
+    // decoded MS2 across that is exactly the resident set the banding exists to bound, so
+    // the extraction phase below decodes it a second time instead. Two decodes per run
+    // against the 2m this replaces (m = bands), and `run.rs` refuses to share for the same
+    // reason in the ungrouped single-run case. It is decoded before the plan because the
+    // band costs, and under `groups.balance = cost` the cuts, count its peaks per window.
+    info!(stage = %"load-ms2", "run: stage start");
+    let ms2_scans: Vec<Ms2Scan> = load_ms2(&g.converted.ms2)?;
+    let peaks = groups::peaks_per_window(&ms2_scans);
+
     // --- plan
     let windows = windows_of(&g.converted.isolation_windows)?;
     let stats = TableFile::open(g.lib_precursors)?.row_group_stats("precursor_mz")?;
-    let plan = groups::plan(&windows, &stats, cfg.groups.window_groups)?;
+    let cost_weight = |lo: f64, hi: f64| -> f64 {
+        groups::est_precursors(&stats, lo, hi)
+            * peaks
+                .get(&(lo.to_bits(), hi.to_bits()))
+                .copied()
+                .unwrap_or(0) as f64
+    };
+    let plan = match cfg.groups.balance {
+        GroupBalance::Precursors => groups::plan(&windows, &stats, cfg.groups.window_groups)?,
+        GroupBalance::Cost => groups::plan_weighted(
+            &windows,
+            &stats,
+            cfg.groups.window_groups,
+            Some(&cost_weight),
+        )?,
+    };
     info!(
         groups = plan.bands.len(),
         windows = plan.windows.len(),
         est_unselectable = plan.est_unselectable as u64,
         est_duplicated = plan.est_duplicated as u64,
         calibration = ?cfg.groups.calibration,
+        balance = ?cfg.groups.balance,
         "groups: plan"
     );
     for b in &plan.bands {
@@ -224,19 +257,21 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
         );
     }
     std::fs::create_dir_all(d("groups"))?;
-    mumdia_io::json::write_json(
-        &d("groups/plan.json"),
-        &serde_json::json!({
-            "window_groups": cfg.groups.window_groups,
-            "calibration": format!("{:?}", cfg.groups.calibration),
-            "est_unselectable": plan.est_unselectable,
-            "est_duplicated": plan.est_duplicated,
-            "bands": plan.bands.iter().map(|b| serde_json::json!({
-                "index": b.index, "mz_lo": b.mz_lo, "mz_hi": b.mz_hi,
-                "windows": b.windows, "est_precursors": b.est_precursors,
-            })).collect::<Vec<_>>(),
-        }),
-    )?;
+    let mut plan_json = serde_json::json!({
+        "window_groups": cfg.groups.window_groups,
+        "calibration": format!("{:?}", cfg.groups.calibration),
+        "est_unselectable": plan.est_unselectable,
+        "est_duplicated": plan.est_duplicated,
+        "bands": plan.bands.iter().map(|b| serde_json::json!({
+            "index": b.index, "mz_lo": b.mz_lo, "mz_hi": b.mz_hi,
+            "windows": b.windows, "est_precursors": b.est_precursors,
+        })).collect::<Vec<_>>(),
+    });
+    // Recorded only when it is not the default, so a default plan.json is what it was.
+    if cfg.groups.balance != GroupBalance::Precursors {
+        plan_json["balance"] = serde_json::json!(format!("{:?}", cfg.groups.balance));
+    }
+    mumdia_io::json::write_json(&d("groups/plan.json"), &plan_json)?;
 
     // --- band seeds
     struct Band {
@@ -275,21 +310,7 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
             want
         }
     };
-    // --- the run's MS2, decoded once for the whole seeding phase
-    //
-    // Each band searches the whole run and differs only in its slice of the library, so
-    // the scans are the same bytes for all of them, and one decode serves the lot. The
-    // block is what bounds the buffer's LIFETIME: it is dropped at the end of the seeding
-    // phase rather than held to the end of the run. Nothing between here and extract
-    // reads the spectra, and what sits in between is the per-band retention-time phase,
-    // where a DeepLC sidecar process runs once per band, sequentially -- 63 of them on
-    // the 63-band run. Holding ~1 GB of decoded MS2 across that is exactly the resident
-    // set the banding exists to bound, so the extraction phase below decodes it a second
-    // time instead. Two decodes per run against the 2m this replaces (m = bands), and
-    // `run.rs` refuses to share for the same reason in the ungrouped single-run case.
     let ms2_fingerprint = {
-        info!(stage = %"load-ms2", "run: stage start");
-        let ms2_scans: Vec<Ms2Scan> = load_ms2(&g.converted.ms2)?;
         info!(
             scans = ms2_scans.len(),
             bands = plan.bands.len(),
@@ -298,8 +319,7 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
         let fp = scan_fingerprint(&ms2_scans, &[]);
         // Each band's estimated cost, its windows' precursors times their MS2 peaks, so the
         // band queues below start the longest bands first (`groups::window_costs`).
-        let window_cost =
-            groups::window_costs(&plan.windows, &stats, &groups::peaks_per_window(&ms2_scans));
+        let window_cost = groups::window_costs(&plan.windows, &stats, &peaks);
         for b in &plan.bands {
             band_cost.insert(b.index, b.windows.iter().map(|&w| window_cost[w]).sum());
         }
@@ -386,6 +406,8 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
         );
         fp
     };
+    drop(ms2_scans);
+    drop(peaks);
     if bands.is_empty() {
         bail!("groups: no band selects any precursor of the library");
     }

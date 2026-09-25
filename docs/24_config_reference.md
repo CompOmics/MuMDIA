@@ -68,12 +68,12 @@ undocumented on purpose; those fields are counted under "Coverage".
 | [`quant`](#quant) | `QuantConfig` | 17 | [docs/12_quant_lfq_align_mbr_report_audit.md](12_quant_lfq_align_mbr_report_audit.md) |
 | [`mbr`](#mbr) | `MbrConfig` | 9 | [docs/12_quant_lfq_align_mbr_report_audit.md](12_quant_lfq_align_mbr_report_audit.md) |
 | [`experiment`](#experiment) | `ExperimentConfig` | 2 | [docs/01_overview_and_dataflow.md](01_overview_and_dataflow.md) |
-| [`groups`](#groups) | `GroupsConfig` | 4 |  |
+| [`groups`](#groups) | `GroupsConfig` | 5 |  |
 | [`peptidoforms.fixed_mods[] / peptidoforms.variable_mods[]`](#peptidoformsfixed_mods--peptidoformsvariable_mods) | `ResidueMod` | 2 | [docs/05_digest_peptidoforms.md](05_digest_peptidoforms.md) |
 
 ## (top level)
 
-`Config` (rust/mumdia/crates/mumdia-core/src/config.rs:2012). stage document: [docs/02_config_and_data_model.md](02_config_and_data_model.md).
+`Config` (rust/mumdia/crates/mumdia-core/src/config.rs:2043). stage document: [docs/02_config_and_data_model.md](02_config_and_data_model.md).
 
 | Field | Type | Default | Gated | Description |
 |---|---|---|---|---|
@@ -389,7 +389,7 @@ Options for the experiment-wide orchestrator (`mumdia run-experiment`).
 
 ## groups
 
-`GroupsConfig` (rust/mumdia/crates/mumdia-core/src/config.rs:1950).
+`GroupsConfig` (rust/mumdia/crates/mumdia-core/src/config.rs:1963).
 
 Searching a run one isolation-window group at a time. A group of isolation windows can only select precursors whose m/z lies in the group's band, so its seed, calibration, extract, features and compete need only that band of the library (`Library::load_with_fragment_offset`): the library, the hit accumulator and the accepted rows are all one band's worth instead of the whole run's, which is what bounds the memory of a search against a library of 10^8 precursors. Only rescore, quant and report see everything, after the group artifacts are pooled with library-wide ids. The groups run one after another in this process; `docs/33_window_groups.md` has the layout and the measurements.
 
@@ -399,6 +399,7 @@ Searching a run one isolation-window group at a time. A group of isolation windo
 | `calibration` | `GroupCalibration` | `global` |  | Anchors for the RT calibration of each group; see `GroupCalibration`. |
 | `parallel` | `usize` | `1` |  | Bands searched at the same time inside one run. `1` (the default) is one band at a time, which is what bounds the memory: each band in flight holds its own extraction working set, so the peak is this many bands' worth. Raise it to fill a large machine, after checking one band's peak RSS: on a 203M-precursor library at 63 bands the largest band took 39 GB and the median far less. Results do not depend on it; bands are independent and their artifacts are pooled in band order either way. The bands go through a bounded queue: this many workers each take the next band as soon as their current one is done, most expensive first (estimated precursors times MS2 peaks of the band's windows for the seed and extract, accepted rows for features and compete), rather than in fixed chunks that waited for their slowest band. It must stay below the thread count: a band in flight parks one worker on its accumulation channel, so as many bands as there are threads leaves nothing to do the probing and the run deadlocks. A larger value is clamped to `threads - 1` with a warning rather than hanging. |
 | `rt_adaptation` | `GroupRtAdaptation` | `per_band` |  | How often the library's retention times are adapted under `calibration = global`: `per_band` (the default) runs one DeepLC sidecar per band, `once_per_run` one per run over the union of the bands. `per_group` calibration always adapts per band. Each per-band sidecar starts an interpreter, imports torch and DeepLC, reads the pooled seed, refits the same heads on the same anchors (head 2503 in every band of the HYE sweep) and predicts every sequence of its band, so a sequence whose charge states fall in two bands is predicted twice (10.9M HYE rows are 4.91M unique sequences). On HYE Astral the multi-head step took about 13 min unbanded and 19-24 min at 2-16 bands. `once_per_run` fits once, predicts the union once and writes each band's table under the name a per-band run gives it (`groups/gNN/lib_precursors_multihead.parquet` or `lib_precursors_deeplc.parquet`), so the shared-band reuse of later runs and the seed refresh are unchanged. Under `run-experiment` with the multi-head calibration off, the library is re-predicted once for the experiment, and the bands then keep those values instead of each band of each run re-predicting them. Float-equivalent, not bit-identical: a sequence is predicted in different company, and torch's CPU kernels round by batch. On a synthetic library, one call over contiguous bands writes exactly the whole-library column band by band (`tests/python/test_deeplc_predict.py`). Validate on two acquisitions (peptides at 1% inside the seed spread, the per-band max \|delta predicted_irt\| and the selected heads) before defaulting it on. |
+| `balance` | `GroupBalance` | `precursors` |  | What the band plan balances: `precursors` (the default), the estimated library precursors per band, or `cost`, per window the precursors it selects times the MS2 peaks of its scans. Band cost follows spectral density more than precursor count: on the immunopeptidomics search two bands of 2.98M and 3.03M precursors took 42 s and 460 s, and at 81-94 bands the slowest windows (418-460 s) set the floor of the run. The queue already starts the most expensive bands first whatever this says; `cost` also moves the cuts, so that no band is several times the work of the others. Output-changing, hence opt-in: the cuts decide which candidates sit at a band edge, which the overlap deduplication and the edge candidates' neighbours depend on, and the pooled row order the classifier sees. Validate like a band-count change (docs/33 section 8): peptides at 1% inside the seed spread against `precursors`, and the per-band wall times, on two acquisitions. Note that the MS2 is decoded before the plan under either setting. |
 
 ## peptidoforms.fixed_mods[] / peptidoforms.variable_mods[]
 
@@ -552,6 +553,17 @@ Spectral-agreement score the extraction acceptance gate (`gate_min_score`) thres
 | `coelution` |  | Predicted-intensity-weighted mean CO-ELUTION correlation of each matched fragment's XIC to the signature reference over the elution peak (temporal agreement, orthogonal to intensity agreement). |
 | `combined` |  | Require BOTH: peak-integrated spectral Pearson >= `gate_min_score` AND the co-elution score >= `gate_coelution_min`. More specific (an interferent passing one axis is still rejected), for a cleaner FDR pool. |
 
+### `GroupBalance`
+
+(rust/mumdia/crates/mumdia-core/src/config.rs:1924)
+
+What a grouped run's band plan balances.
+
+| Value | Default | Description |
+|---|---|---|
+| `precursors` | yes | The estimated library precursors each band selects. The behaviour before this setting existed. |
+| `cost` |  | The estimated search cost: per window, the precursors it selects times the MS2 peaks its scans carry. |
+
 ### `GroupCalibration`
 
 (rust/mumdia/crates/mumdia-core/src/config.rs:1909)
@@ -565,7 +577,7 @@ Which anchors the retention-time calibration of a window group is fitted on.
 
 ### `GroupRtAdaptation`
 
-(rust/mumdia/crates/mumdia-core/src/config.rs:1925)
+(rust/mumdia/crates/mumdia-core/src/config.rs:1938)
 
 How often a grouped run adapts the library's retention times (the multi-head calibration or the base-model re-prediction) under `groups.calibration = global`.
 
@@ -864,12 +876,12 @@ Every field whose struct has an `impl Default` resolved from the source.
 
 3 environment read(s) whose name is not a literal:
 
-- `rust/mumdia/crates/mumdia/src/stages/extract.rs:1520: env read via closure of `chunk``
+- `rust/mumdia/crates/mumdia/src/stages/extract.rs:1527: env read via closure of `chunk``
 - `rust/mumdia/crates/mumdia/src/stages/extract.rs:3489: env read via closure of `&mut chunk``
 - `rust/mumdia/crates/mumdia/src/stages/extract.rs:3525: env read via closure of `&mut chunk``
 
 ## Coverage
 
-19 structs and 195 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 26 enumerations, 1 named profile(s), 69 environment variables read and 19 set.
+19 structs and 196 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 27 enumerations, 1 named profile(s), 69 environment variables read and 19 set.
 
 20 field(s) carry a gating marker in their doc comment. 48 field(s) carry no doc comment at all, so their description is empty above. 0 default(s) could not be resolved and 2 have none by design.

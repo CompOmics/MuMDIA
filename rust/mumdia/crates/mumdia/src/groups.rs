@@ -80,6 +80,20 @@ pub fn est_precursors(stats: &[RowGroupStats], lo: f64, hi: f64) -> f64 {
 /// candidate). Groups that would select no precursor at all are merged into their neighbour,
 /// so every band a caller loads is non-empty; `n` is therefore an upper bound.
 pub fn plan(windows: &[(f64, f64)], stats: &[RowGroupStats], n: usize) -> Result<Plan> {
+    plan_weighted(windows, stats, n, None)
+}
+
+/// [`plan`] with the cuts balanced on `weight(lo, hi)` per window instead of the window's
+/// estimated precursor count (`groups.balance = cost` passes precursors times MS2 peaks,
+/// [`window_costs`]). Everything else is the same plan: the bands' `est_precursors`, the
+/// merge of bands that select nothing, the unselectable and duplicated estimates. A weight
+/// that is zero for every window falls back to the precursor count.
+pub fn plan_weighted(
+    windows: &[(f64, f64)],
+    stats: &[RowGroupStats],
+    n: usize,
+    weight: Option<&dyn Fn(f64, f64) -> f64>,
+) -> Result<Plan> {
     if windows.is_empty() {
         bail!("no isolation windows to group");
     }
@@ -109,10 +123,16 @@ pub fn plan(windows: &[(f64, f64)], stats: &[RowGroupStats], n: usize) -> Result
     // Per-window estimate, each window taken on its own range. Overlaps count twice here,
     // which only nudges the balance; the plan's duplicate estimate is computed exactly on
     // the final bands below.
-    let per_window: Vec<f64> = windows
-        .iter()
-        .map(|&(lo, hi)| est_precursors(stats, lo, hi))
-        .collect();
+    let mut per_window: Vec<f64> = match weight {
+        Some(w) => windows.iter().map(|&(lo, hi)| w(lo, hi)).collect(),
+        None => Vec::new(),
+    };
+    if !per_window.iter().any(|w| w.is_finite() && *w > 0.0) {
+        per_window = windows
+            .iter()
+            .map(|&(lo, hi)| est_precursors(stats, lo, hi))
+            .collect();
+    }
     let n = n.min(windows.len()).max(1);
     let target = per_window.iter().sum::<f64>() / n as f64;
 
@@ -750,6 +770,31 @@ mod tests {
         // Nothing to do is not an error.
         let none: Vec<usize> = Vec::new();
         assert!(run_bounded(&none, 4, &[], |&i| Ok(i)).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_cost_weighted_plan_moves_the_cut_toward_the_expensive_windows() {
+        // Uniform precursors over ten windows; the first three windows carry ten times the
+        // peaks of the others, so balancing cost puts fewer windows in the first band.
+        let windows = contiguous_windows(400.0, 10.0, 10);
+        let stats = uniform_stats(400.0, 500.0, 20, 1000);
+        let by_prec = plan(&windows, &stats, 2).unwrap();
+        assert_eq!(by_prec.bands[0].windows, vec![0, 1, 2, 3, 4]);
+        let cost =
+            |lo: f64, hi: f64| est_precursors(&stats, lo, hi) * if lo < 430.0 { 10.0 } else { 1.0 };
+        let by_cost = plan_weighted(&windows, &stats, 2, Some(&cost)).unwrap();
+        assert_eq!(by_cost.bands.len(), 2);
+        assert_eq!(by_cost.bands[0].windows, vec![0, 1]);
+        assert_eq!(by_cost.bands[1].windows, (2..10).collect::<Vec<_>>());
+        // The bands still report precursors, not cost.
+        assert!((by_cost.bands[0].est_precursors - 4_000.0).abs() < 1.0);
+        // A weight that is zero everywhere is no information: the precursor plan.
+        let zero = |_: f64, _: f64| 0.0;
+        assert_eq!(
+            plan_weighted(&windows, &stats, 2, Some(&zero)).unwrap(),
+            by_prec
+        );
+        assert_eq!(plan_weighted(&windows, &stats, 2, None).unwrap(), by_prec);
     }
 
     #[test]
