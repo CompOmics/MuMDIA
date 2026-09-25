@@ -126,8 +126,19 @@ formatted threshold, e.g. `targets_at_q0.01`), `model_identity =
 
 Entry point: `search_seed::run(SearchSeedParams)` (`search_seed.rs:45-283`).
 
-**1. Load** the library (`Library::load_with`) and MS2 scans (`load_ms2`), then
-log candidate and scan counts. On the fragindex matcher the MS2 decode runs
+**1. Load** the library and MS2 scans (`load_ms2`), then log candidate and scan
+counts. On the fragindex matcher the library is the m/z-only one
+(`Library::load_mz_only`) and its index the m/z-only index
+(`FragIndex::build_mz_only`): the seed reads neither predicted intensities nor
+fragment names (the hyperscore is a match count plus observed intensity, and the mass
+recalibration walks `frag_mz`), so those two columns are never decoded and neither the
+library nor the index holds them, 12 bytes per fragment at the build peak (AIF, 20.6M
+fragments: seed peak 1,269-1,297 to 1,023-1,052 MB). Their presence and type are still
+checked here, from the footer, with the full load's messages; their per-value checks
+(NULLs, non-finite intensities) happen in extract's full load of the same table. The
+seed's accumulator probes through `FragIndex::probe_peak_cand`, which visits the same
+postings in the same order as `probe_peak`; the payload entry points refuse an
+m/z-only index. The bucketed matcher loads the full payload, as `page_search` needs it. On the fragindex matcher the MS2 decode runs
 concurrently with the library load and the index build (`rayon::join`); they are
 independent, and the scans are resident during the index build either way. The
 bucketed matcher keeps them in sequence, because its library load builds a sorted

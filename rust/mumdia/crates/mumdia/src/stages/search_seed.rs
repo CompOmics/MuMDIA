@@ -105,42 +105,46 @@ pub fn run_returning_scans(p: SearchSeedParams) -> Result<(u64, Option<Vec<Ms2Sc
             ("--lib-fragments", p.library_fragments),
         ],
     )?;
-    // See extract: the bucketed index is dead weight on the fragindex path.
     let fragindex = matches!(p.cfg.matcher, MatcherKind::Fragindex);
-    let build_bucketed = !fragindex;
-    let load_lib = || -> Result<Library> {
-        match p.fragment_offset {
+    // The library and its fragment index, built once at the seed's fragment tolerance when
+    // the fragindex backend is selected.
+    //
+    // The fragindex seed reads neither the predicted intensity nor the fragment name: the
+    // hyperscore is count + observed intensity, and the mass recalibration below needs only
+    // `frag_mz`. So it loads the m/z-only library and indexes it with the m/z-only index
+    // (`Library::load_mz_only`, `FragIndex::build_mz_only`): the two payload columns are
+    // never decoded, and neither the library nor the index holds them (12 bytes per
+    // fragment at the build peak; this used to load them, index them, and release the
+    // library's copy afterwards). Their schema is still checked here; their values by
+    // extract, which loads the full payload. The bucketed path keeps the full load,
+    // because `page_search` serves `idx_int` out of arrays built from the intensities, and
+    // the bucketed index is dead weight on the fragindex path (see extract).
+    let load_indexed = || -> Result<(Library, Option<FragIndex>)> {
+        if fragindex {
+            let lib = Library::load_mz_only(
+                p.library_precursors,
+                p.library_fragments,
+                p.fragment_offset,
+            )?;
+            let fidx = FragIndex::build_mz_only(&lib, p.cfg.fragment_tol_ppm);
+            return Ok((lib, Some(fidx)));
+        }
+        let lib = match p.fragment_offset {
             None => Library::load_with(
                 p.library_precursors,
                 p.library_fragments,
                 p.bucket_size,
-                build_bucketed,
-            ),
+                true,
+            )?,
             Some(offset) => Library::load_with_fragment_offset(
                 p.library_precursors,
                 p.library_fragments,
                 offset,
                 p.bucket_size,
-                build_bucketed,
-            ),
-        }
-    };
-    // The library and its fragment index, built once at the seed's fragment tolerance when
-    // the fragindex backend is selected.
-    let load_indexed = || -> Result<(Library, Option<FragIndex>)> {
-        let mut lib = load_lib()?;
-        let fidx = fragindex.then(|| FragIndex::build(&lib, p.cfg.fragment_tol_ppm));
-        if fidx.is_some() {
-            // The index owns its own copy of every posting, and the seed reads neither the
-            // predicted intensity nor the fragment name from either side: the hyperscore is
-            // count + observed intensity, and the mass recalibration below needs only
-            // `frag_mz`. So the library's `frag_int` and `frag_name_id` are dead from here
-            // on -- 6 bytes per library fragment, held for the whole search. The bucketed
-            // path keeps them, because `page_search` serves `idx_int` out of arrays built
-            // from them.
-            lib.release_fragment_payload();
-        }
-        Ok((lib, fidx))
+                true,
+            )?,
+        };
+        Ok((lib, None))
     };
     // Decoded here unless the caller lent its own copy (see `ms2_scans`). An empty lent
     // slice is not believed over the path: it means the caller had nothing to lend.

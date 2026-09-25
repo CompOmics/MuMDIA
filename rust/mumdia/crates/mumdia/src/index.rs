@@ -450,6 +450,7 @@ fn load_fragments(
     ncand: usize,
     partial: bool,
     max_parts: usize,
+    payload: bool,
 ) -> Result<FragmentColumns> {
     let ft = if partial {
         Library::open_fragments_for(fragments, frag_offset, ncand)?
@@ -507,30 +508,36 @@ fn load_fragments(
     // Rows in range, which for a range load is fewer than the rows decoded.
     let n_frag_rows = frag_offsets[ncand] as usize;
 
+    // The m/z-only load decodes two of the four columns. The other two are still checked
+    // here for presence and type, from the footer and with the messages the full load
+    // gives, so a library whose schema is wrong is refused at the seed exactly as before;
+    // what moves to the first full load (extract) is the per-VALUE check (NULLs, non-finite
+    // intensities), because those values are what this load no longer reads.
+    if !payload {
+        check_payload_schema(&ft)?;
+    }
     let mut frag_mz: Vec<f32> = vec![0.0; n_frag_rows];
-    let mut frag_int: Vec<f32> = vec![0.0; n_frag_rows];
+    let mut frag_int: Vec<f32> = if payload {
+        vec![0.0; n_frag_rows]
+    } else {
+        Vec::new()
+    };
     // Fragment names are INTERNED (see the struct field docs): a u16 dictionary id per
     // fragment, assigned by first appearance in file order.
-    let mut frag_name_id: Vec<u16> = vec![0; n_frag_rows];
-    let frag_name_dict = if parts.len() > 1 && ascending_across(&infos) {
-        place_sorted_parts(
-            &parts,
-            &part_row0,
-            &infos,
-            &range,
-            &mut frag_mz,
-            &mut frag_int,
-            &mut frag_name_id,
-        )?
+    let mut frag_name_id: Vec<u16> = if payload {
+        vec![0; n_frag_rows]
     } else {
-        scatter_serial(
-            &ft,
-            &range,
-            &frag_offsets,
-            &mut frag_mz,
-            &mut frag_int,
-            &mut frag_name_id,
-        )?
+        Vec::new()
+    };
+    let out = FragOut {
+        mz: &mut frag_mz,
+        int: payload.then_some(&mut frag_int[..]),
+        name_id: payload.then_some(&mut frag_name_id[..]),
+    };
+    let frag_name_dict = if parts.len() > 1 && ascending_across(&infos) {
+        place_sorted_parts(&parts, &part_row0, &infos, &range, out)?
+    } else {
+        scatter_serial(&ft, &range, &frag_offsets, out)?
     };
     Ok(FragmentColumns {
         frag_offsets,
@@ -539,6 +546,50 @@ fn load_fragments(
         frag_name_id,
         frag_name_dict,
     })
+}
+
+/// The columns pass 2 reads: all four, or `candidate_id` and `mz` alone.
+fn pass2_columns(payload: bool) -> &'static [&'static str] {
+    if payload {
+        &["candidate_id", "mz", "predicted_intensity", "name"]
+    } else {
+        &["candidate_id", "mz"]
+    }
+}
+
+/// Presence and type of the two payload columns, from the footer, as the full load would
+/// refuse them: a missing column with the reader's message, then the type, intensity
+/// before name.
+fn check_payload_schema(ft: &TableFile) -> Result<()> {
+    for name in ["predicted_intensity", "name"] {
+        if !ft.has_column(name) {
+            anyhow::bail!("column '{name}' not found in {:?}", ft.column_names());
+        }
+    }
+    let ty = |n: &str| {
+        ft.schema
+            .field_with_name(n)
+            .map(|f| f.data_type().clone())
+            .ok()
+    };
+    if ty("predicted_intensity") != Some(arrow::datatypes::DataType::Float32) {
+        anyhow::bail!("fragment column 'predicted_intensity' is not f32");
+    }
+    // Utf8, or a string dictionary written as one (the full load reads both).
+    let name_ty = ty("name");
+    let name_ok = name_ty == Some(arrow::datatypes::DataType::Utf8)
+        || name_ty == Some(mumdia_io::table::dict_utf8_type());
+    if !name_ok {
+        anyhow::bail!("fragment column 'name' is not utf8");
+    }
+    Ok(())
+}
+
+/// Pass 2's output arrays; the payload ones are `None` on an m/z-only load.
+struct FragOut<'a> {
+    mz: &'a mut [f32],
+    int: Option<&'a mut [f32]>,
+    name_id: Option<&'a mut [u16]>,
 }
 
 /// Which candidates a fragment load keeps, and how it names its input.
@@ -659,76 +710,84 @@ fn split_lens<'a, T>(mut v: &'a mut [T], lens: &[usize]) -> Vec<&'a mut [T]> {
     out
 }
 
+/// `split_lens` of an optional array: one `None` per part when it is absent.
+fn split_opt<'a, T>(v: Option<&'a mut [T]>, lens: &[usize]) -> Vec<Option<&'a mut [T]>> {
+    match v {
+        Some(v) => split_lens(v, lens).into_iter().map(Some).collect(),
+        None => lens.iter().map(|_| None).collect(),
+    }
+}
+
 /// Pass 2 on an ascending table: every part fills its own slice, in parallel.
-#[allow(clippy::too_many_arguments)]
 fn place_sorted_parts(
     parts: &[TableFile],
     part_row0: &[usize],
     infos: &[PartInfo],
     range: &FragRange,
-    frag_mz: &mut [f32],
-    frag_int: &mut [f32],
-    frag_name_id: &mut [u16],
+    out: FragOut,
 ) -> Result<Vec<String>> {
     let lens: Vec<usize> = infos.iter().map(|i| i.kept).collect();
+    let payload = out.int.is_some();
+    let FragOut { mz, int, name_id } = out;
     let jobs: Vec<_> = parts
         .iter()
         .zip(part_row0)
-        .zip(split_lens(frag_mz, &lens))
-        .zip(split_lens(frag_int, &lens))
-        .zip(split_lens(frag_name_id, &lens))
+        .zip(split_lens(mz, &lens))
+        .zip(split_opt(int, &lens))
+        .zip(split_opt(name_id, &lens))
         .map(|((((part, &row0), mz), int), ids)| (part, row0, mz, int, ids))
         .collect();
-    let locals: Vec<Vec<String>> = crate::colread::first_err(
+    let placed: Vec<(Vec<String>, Option<&mut [u16]>)> = crate::colread::first_err(
         jobs.into_par_iter()
             .map(|(part, row0, mz, int, ids)| place_part(part, row0, range, mz, int, ids))
             .collect(),
     )?;
+    if !payload {
+        return Ok(Vec::new());
+    }
     // Merge the parts' dictionaries in part order: that is first appearance over the kept
     // rows in file order, exactly the order the serial pass assigns.
     let mut names = mumdia_io::table::StrInterner::new();
-    let maps: Vec<Vec<u16>> = locals
-        .iter()
-        .map(|local| {
-            local
-                .iter()
-                .map(|v| frag_name_id_u16(names.intern(v)))
-                .collect::<Result<Vec<u16>>>()
-        })
-        .collect::<Result<_>>()?;
-    split_lens(frag_name_id, &lens)
-        .into_par_iter()
-        .zip(maps.par_iter())
-        .for_each(|(ids, map)| {
-            for id in ids.iter_mut() {
-                *id = map[*id as usize];
-            }
-        });
+    let mut remap: Vec<(Vec<u16>, &mut [u16])> = Vec::with_capacity(placed.len());
+    for (local, ids) in placed {
+        let map = local
+            .iter()
+            .map(|v| frag_name_id_u16(names.intern(v)))
+            .collect::<Result<Vec<u16>>>()?;
+        remap.push((map, ids.expect("a payload load places name ids")));
+    }
+    remap.into_par_iter().for_each(|(map, ids)| {
+        for id in ids.iter_mut() {
+            *id = map[*id as usize];
+        }
+    });
     Ok(names.into_values())
 }
 
 /// One part of an ascending table, into its own output slices; returns its local name
-/// dictionary (the slice holds local ids).
-fn place_part(
+/// dictionary (the slice holds local ids) and hands the id slice back for the remap.
+fn place_part<'a>(
     part: &TableFile,
     row0: usize,
     range: &FragRange,
     mz_out: &mut [f32],
-    int_out: &mut [f32],
-    id_out: &mut [u16],
-) -> Result<Vec<String>> {
+    mut int_out: Option<&mut [f32]>,
+    mut id_out: Option<&'a mut [u16]>,
+) -> Result<(Vec<String>, Option<&'a mut [u16]>)> {
+    let payload = int_out.is_some();
     let mut names = mumdia_io::table::StrInterner::new();
     let mut j = 0usize;
     let changed = || anyhow::anyhow!("fragment table {} changed between passes", range.fragments);
     crate::colread::for_each_zipped(
         part,
-        &["candidate_id", "mz", "predicted_intensity", "name"],
+        pass2_columns(payload),
         &["name"],
         FRAG_BATCH_ROWS,
         |base, cols| {
-            let cols: &[ArrayRef; 4] = cols.try_into().expect("four columns");
             let batch = FragBatch::of(cols, range.fragments, row0 + base)?;
-            names.begin(&batch.name);
+            if let Some(name) = &batch.name {
+                names.begin(name);
+            }
             for k in 0..batch.len() {
                 // Pass 1 already refused an out-of-range id on a full load, so one here
                 // means the file changed under the load.
@@ -744,9 +803,13 @@ fn place_part(
                 }
                 // NULLs were rejected above, so the physical values are the values.
                 mz_out[j] = batch.mz.value(k) as f32;
-                int_out[j] = batch.int.value(k);
-                let id = batch.name_id(&mut names, k, range.fragments, row0 + base)?;
-                id_out[j] = frag_name_id_u16(id)?;
+                if let (Some(int_out), Some(int)) = (int_out.as_deref_mut(), batch.int) {
+                    int_out[j] = int.value(k);
+                }
+                if let Some(id_out) = id_out.as_deref_mut() {
+                    let id = batch.name_id(&mut names, k, range.fragments, row0 + base)?;
+                    id_out[j] = frag_name_id_u16(id)?;
+                }
                 j += 1;
             }
             Ok(())
@@ -755,7 +818,7 @@ fn place_part(
     if j != mz_out.len() {
         return Err(changed());
     }
-    Ok(names.into_values())
+    Ok((names.into_values(), id_out))
 }
 
 /// Pass 2 by scatter: each kept row to the next free slot of its candidate.
@@ -763,10 +826,14 @@ fn scatter_serial(
     ft: &TableFile,
     range: &FragRange,
     frag_offsets: &[u32],
-    frag_mz: &mut [f32],
-    frag_int: &mut [f32],
-    frag_name_id: &mut [u16],
+    out: FragOut,
 ) -> Result<Vec<String>> {
+    let FragOut {
+        mz: frag_mz,
+        mut int,
+        mut name_id,
+    } = out;
+    let payload = int.is_some();
     // Interned through the column's dictionary (`batches_dict`): the name column is a few
     // hundred distinct values over every fragment row, so a row costs an i32 key lookup in
     // a per-batch memo rather than a SipHash of its text, and the ids are still assigned
@@ -776,13 +843,14 @@ fn scatter_serial(
     let mut cursor: Vec<u32> = frag_offsets.to_vec();
     crate::colread::for_each_zipped(
         ft,
-        &["candidate_id", "mz", "predicted_intensity", "name"],
+        pass2_columns(payload),
         &["name"],
         FRAG_BATCH_ROWS,
         |base, cols| {
-            let cols: &[ArrayRef; 4] = cols.try_into().expect("four columns");
             let batch = FragBatch::of(cols, range.fragments, base)?;
-            names.begin(&batch.name);
+            if let Some(name) = &batch.name {
+                names.begin(name);
+            }
             for k in 0..batch.len() {
                 let c = batch.cid.value(k) as usize;
                 let Some(c) = range.local(c, base + k).map_err(|_| {
@@ -798,9 +866,13 @@ fn scatter_serial(
                 cursor[c] += 1;
                 // NULLs were rejected above, so the physical values are the values.
                 frag_mz[pos] = batch.mz.value(k) as f32;
-                frag_int[pos] = batch.int.value(k);
-                let id = batch.name_id(&mut names, k, range.fragments, base)?;
-                frag_name_id[pos] = frag_name_id_u16(id)?;
+                if let (Some(frag_int), Some(a)) = (int.as_deref_mut(), batch.int) {
+                    frag_int[pos] = a.value(k);
+                }
+                if let Some(frag_name_id) = name_id.as_deref_mut() {
+                    let id = batch.name_id(&mut names, k, range.fragments, base)?;
+                    frag_name_id[pos] = frag_name_id_u16(id)?;
+                }
             }
             Ok(())
         },
@@ -808,19 +880,19 @@ fn scatter_serial(
     Ok(names.into_values())
 }
 
-/// One decoded batch of the four fragment columns a library needs, type-checked, NULL-
-/// checked and finiteness-checked.
+/// One decoded batch of the fragment columns a library needs, type-checked, NULL-checked
+/// and finiteness-checked: all four, or `candidate_id` and `mz` on an m/z-only load.
 struct FragBatch<'a> {
     cid: &'a UInt32Array,
     mz: &'a Float64Array,
-    int: &'a Float32Array,
-    name: mumdia_io::table::StrBatch<'a>,
+    int: Option<&'a Float32Array>,
+    name: Option<mumdia_io::table::StrBatch<'a>>,
 }
 
 impl<'a> FragBatch<'a> {
-    /// `cols` is `[candidate_id, mz, predicted_intensity, name]`; `row_base` is the handle
-    /// row of the batch's first row, for the messages.
-    fn of(cols: &'a [ArrayRef; 4], fragments: &str, row_base: usize) -> Result<FragBatch<'a>> {
+    /// `cols` is `[candidate_id, mz, predicted_intensity, name]`, or its first two;
+    /// `row_base` is the handle row of the batch's first row, for the messages.
+    fn of(cols: &'a [ArrayRef], fragments: &str, row_base: usize) -> Result<FragBatch<'a>> {
         let a_cid = cols[0]
             .as_any()
             .downcast_ref::<UInt32Array>()
@@ -829,20 +901,37 @@ impl<'a> FragBatch<'a> {
             .as_any()
             .downcast_ref::<Float64Array>()
             .ok_or_else(|| anyhow::anyhow!("fragment column 'mz' is not f64"))?;
-        let a_int = cols[2]
-            .as_any()
-            .downcast_ref::<Float32Array>()
-            .ok_or_else(|| anyhow::anyhow!("fragment column 'predicted_intensity' is not f32"))?;
-        let name = mumdia_io::table::StrBatch::of(&cols[3])
-            .ok_or_else(|| anyhow::anyhow!("fragment column 'name' is not utf8"))?;
+        let payload = cols.len() == 4;
+        let a_int = if payload {
+            Some(
+                cols[2]
+                    .as_any()
+                    .downcast_ref::<Float32Array>()
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("fragment column 'predicted_intensity' is not f32")
+                    })?,
+            )
+        } else {
+            None
+        };
+        let name = if payload {
+            Some(
+                mumdia_io::table::StrBatch::of(&cols[3])
+                    .ok_or_else(|| anyhow::anyhow!("fragment column 'name' is not utf8"))?,
+            )
+        } else {
+            None
+        };
         // Every required column, before any value is read: the finiteness checks
         // below run on physical buffers, where a NULL is a perfectly finite 0.0, and
         // the fill used to turn NULLs into NaN and "" instead of refusing them
         // (docs/29 #2).
         require_no_nulls(a_cid, "candidate_id", fragments, row_base)?;
         require_no_nulls(a_mz, "mz", fragments, row_base)?;
-        require_no_nulls(a_int, "predicted_intensity", fragments, row_base)?;
-        require_no_nulls(cols[3].as_ref(), "name", fragments, row_base)?;
+        if let Some(a_int) = a_int {
+            require_no_nulls(a_int, "predicted_intensity", fragments, row_base)?;
+            require_no_nulls(cols[3].as_ref(), "name", fragments, row_base)?;
+        }
         // Same contract as the precursor columns, applied batch by batch. A
         // non-finite fragment m/z is worse than a wrong value: `FragIndex::build`
         // collapses its whole m/z range when the observed min or max is not finite,
@@ -860,14 +949,16 @@ impl<'a> FragBatch<'a> {
                 a_cid.value(k)
             );
         }
-        if let Some(k) = a_int.values().iter().position(|x| !x.is_finite()) {
-            anyhow::bail!(
-                "library column 'predicted_intensity' has a non-finite value ({}) for \
-                 candidate_id {} in {fragments}; a Parquet NULL decodes to NaN, and a \
-                 NaN here sorts ahead of every real intensity. Fix or drop the row",
-                a_int.value(k),
-                a_cid.value(k)
-            );
+        if let Some(a_int) = a_int {
+            if let Some(k) = a_int.values().iter().position(|x| !x.is_finite()) {
+                anyhow::bail!(
+                    "library column 'predicted_intensity' has a non-finite value ({}) for \
+                     candidate_id {} in {fragments}; a Parquet NULL decodes to NaN, and a \
+                     NaN here sorts ahead of every real intensity. Fix or drop the row",
+                    a_int.value(k),
+                    a_cid.value(k)
+                );
+            }
         }
         Ok(FragBatch {
             cid: a_cid,
@@ -881,7 +972,7 @@ impl<'a> FragBatch<'a> {
         self.cid.len()
     }
 
-    /// Interned id of row `k`'s fragment name.
+    /// Interned id of row `k`'s fragment name (a payload batch only).
     fn name_id(
         &self,
         names: &mut mumdia_io::table::StrInterner,
@@ -889,7 +980,8 @@ impl<'a> FragBatch<'a> {
         fragments: &str,
         row_base: usize,
     ) -> Result<u32> {
-        names.row(&self.name, k).ok_or_else(|| {
+        let name = self.name.as_ref().expect("a payload batch carries names");
+        names.row(name, k).ok_or_else(|| {
             anyhow::anyhow!(
                 "fragment column 'name' has a NULL dictionary value at row {} in {fragments}",
                 row_base + k
@@ -924,6 +1016,7 @@ impl Library {
             build_bucketed,
             None,
             None,
+            true,
         )
     }
 
@@ -966,6 +1059,7 @@ impl Library {
             build_bucketed,
             Some((first_row, n_rows)),
             Some(first_row),
+            true,
         )
     }
 
@@ -990,6 +1084,41 @@ impl Library {
             build_bucketed,
             None,
             Some(fragment_offset as usize),
+            true,
+        )
+    }
+
+    /// The seed's library: the precursor columns and the fragment m/z, with NO fragment
+    /// payload (`frag_int`, `frag_name_id`, `frag_name_dict` stay empty, so
+    /// [`Library::fragment_payload_released`] is true and [`Library::cand_frags`] refuses to
+    /// hand out intensities). `fragment_offset` is that of
+    /// [`Library::load_with_fragment_offset`] for a band file, `None` for a whole library.
+    ///
+    /// The seed never reads a predicted intensity or a fragment name: its hyperscore is a
+    /// match count plus observed intensity, and its mass recalibration walks `frag_mz`. So
+    /// decoding the two columns and holding them until the index was built -- where the
+    /// fragindex path then released them -- cost their decode and 6 bytes per fragment at
+    /// the seed's build peak, plus 6 more in the index ([`FragIndex::build_mz_only`]).
+    ///
+    /// Validation: every check that reads the loaded columns is unchanged; the presence and
+    /// type of `predicted_intensity` and `name` are checked from the footer with the full
+    /// load's messages; their per-VALUE checks (NULLs, non-finite intensities, the u16 name
+    /// limit) are left to the first full load of the same table, which is extract's.
+    ///
+    /// [`FragIndex::build_mz_only`]: crate::matchers::fragindex::FragIndex::build_mz_only
+    pub fn load_mz_only(
+        precursors: &str,
+        fragments: &str,
+        fragment_offset: Option<u32>,
+    ) -> Result<Library> {
+        Self::load_impl(
+            precursors,
+            fragments,
+            1,
+            false,
+            None,
+            fragment_offset.map(|o| o as usize),
+            false,
         )
     }
 
@@ -1087,7 +1216,13 @@ impl Library {
         build_bucketed: bool,
         span: Option<(usize, usize)>,
         frag_offset: Option<usize>,
+        payload: bool,
     ) -> Result<Library> {
+        // The bucketed index is built from the predicted intensities.
+        assert!(
+            payload || !build_bucketed,
+            "the bucketed page_search index needs the fragment payload"
+        );
         // Phase timers for the load-path work (`library: loaded` below). The stage logs
         // bracket the library load together with the spectra decode and the index build, so
         // before these lines no log could say which of the three a seed or extract spent its
@@ -1106,6 +1241,7 @@ impl Library {
             ncand,
             partial,
             rayon::current_num_threads().min(LOAD_PARTS_MAX),
+            payload,
         )?;
         let fragment_ms = t_load.elapsed().as_millis() as u64 - precursor_ms;
         let n_frag_rows = fc.frag_mz.len();
@@ -2139,9 +2275,9 @@ mod tests {
                     (0, 64, true),
                     (300, 100, true),
                 ] {
-                    let serial = load_fragments(&f, off, n, partial, 1).unwrap();
+                    let serial = load_fragments(&f, off, n, partial, 1, true).unwrap();
                     for parts in [2usize, 5, 64] {
-                        let par = load_fragments(&f, off, n, partial, parts).unwrap();
+                        let par = load_fragments(&f, off, n, partial, parts, true).unwrap();
                         let what = format!("{order} rg={rg} band=({off},{n}) parts={parts}");
                         assert_eq!(par.frag_offsets, serial.frag_offsets, "{what}: offsets");
                         assert_eq!(
@@ -2208,7 +2344,7 @@ mod tests {
         bad_mz[350] = f64::NAN;
         let f2 = mk("bad_mz", ids.clone(), bad_mz);
         for f in [&f1, &f2] {
-            let msg = |parts: usize| match load_fragments(f, 0, 100, false, parts) {
+            let msg = |parts: usize| match load_fragments(f, 0, 100, false, parts, true) {
                 Ok(_) => panic!("{f}: the bad row must be refused"),
                 Err(e) => format!("{e:#}"),
             };
@@ -2217,10 +2353,11 @@ mod tests {
                 assert_eq!(msg(parts), serial, "{f} with {parts} parts");
             }
         }
-        assert!(
-            format!("{:#}", load_fragments(&f1, 0, 100, false, 5).err().unwrap())
-                .contains("fragment row 150 ")
-        );
+        assert!(format!(
+            "{:#}",
+            load_fragments(&f1, 0, 100, false, 5, true).err().unwrap()
+        )
+        .contains("fragment row 150 "));
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -2674,6 +2811,192 @@ mod tests {
             Err(e) => e.to_string(),
         };
         assert!(err.contains("'peptidoform'"), "{err}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The seed's m/z-only library holds exactly the full load's precursor columns, CSR
+    /// offsets and fragment m/z, and no payload, for whole, range and band loads over
+    /// ascending and shuffled tables in one and in many parts.
+    #[test]
+    fn the_mz_only_library_is_the_full_library_without_its_payload() {
+        let dir = unique_dir("mz_only");
+        std::fs::create_dir_all(&dir).unwrap();
+        let (p, _) = build_six_lib(&dir, "mzonly", &[0, 1, 2, 3, 4, 5]);
+        for order in ["ascending", "shuffled"] {
+            for rg in [3usize, 1 << 20] {
+                // The six-candidate precursor table, so the fragment ids stay below 6.
+                let f = dir
+                    .join(format!("frag_mzonly_{order}_{rg}.parquet"))
+                    .to_str()
+                    .unwrap()
+                    .to_string();
+                write_parts_fragments(&f, 6, order, rg);
+                let pairs: Vec<(Library, Library)> = vec![
+                    (
+                        Library::load_with(&p, &f, 8, false).unwrap(),
+                        Library::load_mz_only(&p, &f, None).unwrap(),
+                    ),
+                    (
+                        {
+                            let band = dir.join("mzonly_band.parquet");
+                            let band = band.to_str().unwrap().to_string();
+                            crate::groups::write_band_slice(&p, 2, 3, &band).unwrap();
+                            Library::load_with_fragment_offset(&band, &f, 2, 8, false).unwrap()
+                        },
+                        {
+                            let band = dir.join("mzonly_band.parquet");
+                            let band = band.to_str().unwrap().to_string();
+                            Library::load_mz_only(&band, &f, Some(2)).unwrap()
+                        },
+                    ),
+                ];
+                for (full, mz) in &pairs {
+                    let what = format!("{order} rg={rg}");
+                    assert_eq!(mz.n_candidates(), full.n_candidates(), "{what}");
+                    assert_eq!(mz.frag_offsets, full.frag_offsets, "{what}: offsets");
+                    assert_eq!(
+                        mz.frag_mz.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                        full.frag_mz.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                        "{what}: frag_mz"
+                    );
+                    assert_eq!(mz.prec_mz, full.prec_mz, "{what}: prec_mz");
+                    assert_eq!(mz.global_offset, full.global_offset, "{what}: offset");
+                    for c in 0..full.n_candidates() as u32 {
+                        let (a, b) = (mz.cand(c), full.cand(c));
+                        assert_eq!(
+                            (a.peptidoform, a.protein, a.charge, a.is_decoy),
+                            (b.peptidoform, b.protein, b.charge, b.is_decoy),
+                            "{what}: candidate {c}"
+                        );
+                        assert_eq!(a.predicted_irt.to_bits(), b.predicted_irt.to_bits());
+                        assert_eq!(
+                            (a.peptidoform_id, a.base_peptide_id),
+                            (b.peptidoform_id, b.base_peptide_id)
+                        );
+                    }
+                    assert!(mz.frag_int.is_empty() && mz.frag_name_id.is_empty());
+                    assert!(mz.frag_name_dict.is_empty());
+                    if !mz.frag_mz.is_empty() {
+                        assert!(mz.fragment_payload_released(), "{what}");
+                    }
+                }
+            }
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Validation parity of the m/z-only load. Whatever it still reads is checked exactly
+    /// as before; the payload columns' presence and TYPE are checked from the footer with
+    /// the full load's messages; only their per-VALUE checks move, to the full load that
+    /// extract performs, which must still refuse them.
+    #[test]
+    fn the_mz_only_load_keeps_every_schema_check_and_defers_only_payload_values() {
+        use arrow::array::{Float32Array, Float64Array, Int32Array, StringArray, UInt32Array};
+        use arrow::datatypes::{DataType, Field, Schema};
+        let dir = unique_dir("mz_only_validation");
+        std::fs::create_dir_all(&dir).unwrap();
+        let (p, _) = library_with(&dir, ["PEPTIDEK", "SAMPLER"], ["P1", "P2"]);
+        // One fragment table per fault, written column by column so each can be missing,
+        // mistyped or poisoned.
+        let write = |tag: &str, fault: &str| -> String {
+            let f = dir
+                .join(format!("{tag}.parquet"))
+                .to_str()
+                .unwrap()
+                .to_string();
+            let mut fields = Vec::new();
+            let mut cols: Vec<ArrayRef> = Vec::new();
+            fields.push(Field::new("candidate_id", DataType::UInt32, true));
+            cols.push(std::sync::Arc::new(UInt32Array::from(
+                if fault == "null_cid" {
+                    vec![Some(0u32), None]
+                } else {
+                    vec![Some(0u32), Some(1)]
+                },
+            )));
+            fields.push(Field::new("mz", DataType::Float64, true));
+            cols.push(std::sync::Arc::new(Float64Array::from(
+                if fault == "nan_mz" {
+                    vec![200.1, f64::NAN]
+                } else {
+                    vec![200.1, 250.5]
+                },
+            )));
+            match fault {
+                "no_int" => {}
+                "int_f64" => {
+                    fields.push(Field::new("predicted_intensity", DataType::Float64, true));
+                    cols.push(std::sync::Arc::new(Float64Array::from(vec![1.0, 0.9])));
+                }
+                _ => {
+                    fields.push(Field::new("predicted_intensity", DataType::Float32, true));
+                    cols.push(std::sync::Arc::new(Float32Array::from(match fault {
+                        "null_int" => vec![Some(1.0f32), None],
+                        "nan_int" => vec![Some(1.0f32), Some(f32::NAN)],
+                        _ => vec![Some(1.0f32), Some(0.9)],
+                    })));
+                }
+            }
+            match fault {
+                "no_name" => {}
+                "name_i32" => {
+                    fields.push(Field::new("name", DataType::Int32, true));
+                    cols.push(std::sync::Arc::new(Int32Array::from(vec![2, 3])));
+                }
+                _ => {
+                    fields.push(Field::new("name", DataType::Utf8, true));
+                    cols.push(std::sync::Arc::new(StringArray::from(
+                        if fault == "null_name" {
+                            vec![Some("b2"), None]
+                        } else {
+                            vec![Some("b2"), Some("y3")]
+                        },
+                    )));
+                }
+            }
+            let schema = std::sync::Arc::new(Schema::new(fields));
+            let batch = arrow::record_batch::RecordBatch::try_new(schema.clone(), cols).unwrap();
+            mumdia_io::table::write_batches(&f, schema, &[batch]).unwrap();
+            f
+        };
+        let full = |f: &str| {
+            Library::load_with(&p, f, 8, false)
+                .err()
+                .map(|e| format!("{e:#}"))
+        };
+        let mz = |f: &str| {
+            Library::load_mz_only(&p, f, None)
+                .err()
+                .map(|e| format!("{e:#}"))
+        };
+        // The table without a fault loads both ways.
+        let ok = write("ok", "none");
+        assert!(full(&ok).is_none() && mz(&ok).is_none());
+        // Schema faults and faults in the columns the m/z-only load reads: the same refusal.
+        for fault in [
+            "no_int", "no_name", "int_f64", "name_i32", "null_cid", "nan_mz",
+        ] {
+            let f = write(fault, fault);
+            let (a, b) = (full(&f), mz(&f));
+            assert!(a.is_some(), "{fault}: the full load must refuse it");
+            assert_eq!(
+                a, b,
+                "{fault}: the m/z-only load must refuse it the same way"
+            );
+        }
+        // Payload-value faults: refused by the full load (extract), not read by the seed.
+        for fault in ["null_int", "nan_int", "null_name"] {
+            let f = write(fault, fault);
+            assert!(
+                full(&f).is_some(),
+                "{fault}: extract's full load must refuse it"
+            );
+            assert!(
+                mz(&f).is_none(),
+                "{fault}: the m/z-only load does not read the value, got {:?}",
+                mz(&f)
+            );
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 }

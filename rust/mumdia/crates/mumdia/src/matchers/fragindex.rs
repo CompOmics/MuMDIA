@@ -42,9 +42,10 @@ pub struct FragIndex {
     post_cand: Vec<u32>,
     /// Predicted m/z per posting, f32.
     post_mz: Vec<f32>,
-    /// Predicted intensity per posting.
+    /// Predicted intensity per posting. Empty on an m/z-only index
+    /// ([`FragIndex::build_mz_only`]).
     post_int: Vec<f32>,
-    /// Candidate-local fragment ordinal per posting.
+    /// Candidate-local fragment ordinal per posting. Empty on an m/z-only index.
     post_frag: Vec<u16>,
     /// Precursor m/z indexed by candidate id (ascending); for `candidate_range`. The
     /// library's own array, shared rather than copied.
@@ -75,12 +76,45 @@ impl FragIndex {
     ///   build, so m/z on a bin edge, below the range, above it (the top bin) and NaN
     ///   (bin 0) land where they always did.
     pub fn build(lib: &Library, tol_ppm: f64) -> FragIndex {
-        Self::build_chunked(lib, tol_ppm, None)
+        assert!(
+            !lib.fragment_payload_released(),
+            "FragIndex::build needs the library's fragment payload (predicted intensities); \
+             an m/z-only library indexes with FragIndex::build_mz_only"
+        );
+        Self::build_chunked(lib, tol_ppm, None, true)
+    }
+
+    /// The seed's index: postings of candidate and m/z only, no predicted intensity and no
+    /// fragment ordinal (6 bytes per posting less). The seed never reads either -- its
+    /// accumulator counts matches and sums OBSERVED intensity
+    /// ([`SeedScratch::accumulate`], through [`FragIndex::probe_peak_cand`]) -- and this is
+    /// what an m/z-only library ([`Library::load_mz_only`]) can be indexed with. The
+    /// geometry, `bin_start`, `post_cand` and `post_mz` are the full index's bit for bit.
+    ///
+    /// The entry points that hand out a posting's intensity or ordinal
+    /// ([`FragIndex::probe_peak`], [`FragIndex::window_narrow`]) refuse an index built this
+    /// way rather than returning zeros.
+    ///
+    /// [`Library::load_mz_only`]: crate::index::Library::load_mz_only
+    pub fn build_mz_only(lib: &Library, tol_ppm: f64) -> FragIndex {
+        Self::build_chunked(lib, tol_ppm, None, false)
+    }
+
+    /// Whether the postings carry their intensity and ordinal (a [`FragIndex::build`]
+    /// index) or not ([`FragIndex::build_mz_only`]).
+    pub fn has_payload(&self) -> bool {
+        self.post_int.len() == self.post_mz.len()
     }
 
     /// [`FragIndex::build`] with an explicit chunk count (tests drive many chunks over a
-    /// small library through this); `None` picks it.
-    fn build_chunked(lib: &Library, tol_ppm: f64, n_chunks: Option<usize>) -> FragIndex {
+    /// small library through this); `None` picks it. `payload` false builds the m/z-only
+    /// index.
+    fn build_chunked(
+        lib: &Library,
+        tol_ppm: f64,
+        n_chunks: Option<usize>,
+        payload: bool,
+    ) -> FragIndex {
         let t0 = std::time::Instant::now();
         let n_cand = lib.n_candidates();
         // Precondition (docs/06_predict_frag_index_matchers.md): candidate_id is dense
@@ -159,8 +193,9 @@ impl FragIndex {
         // Pass 2: scatter every chunk in candidate order into its own slots.
         let post_cand: Vec<AtomicU32> = atomic_u32_zeroed(total);
         let post_mz: Vec<AtomicU32> = atomic_u32_zeroed(total);
-        let post_int: Vec<AtomicU32> = atomic_u32_zeroed(total);
-        let post_frag: Vec<AtomicU16> = (0..total)
+        let n_payload = if payload { total } else { 0 };
+        let post_int: Vec<AtomicU32> = atomic_u32_zeroed(n_payload);
+        let post_frag: Vec<AtomicU16> = (0..n_payload)
             .into_par_iter()
             .map(|_| AtomicU16::new(0))
             .collect();
@@ -176,8 +211,10 @@ impl FragIndex {
                         cur[b] += 1;
                         post_cand[slot].store(c as u32, Ordering::Relaxed);
                         post_mz[slot].store(mz.to_bits(), Ordering::Relaxed);
-                        post_int[slot].store(lib.frag_int[gi].to_bits(), Ordering::Relaxed);
-                        post_frag[slot].store(k as u16, Ordering::Relaxed);
+                        if payload {
+                            post_int[slot].store(lib.frag_int[gi].to_bits(), Ordering::Relaxed);
+                            post_frag[slot].store(k as u16, Ordering::Relaxed);
+                        }
                     }
                 }
             });
@@ -200,6 +237,7 @@ impl FragIndex {
             postings = total,
             bins = n_bins,
             chunks = chunks.len(),
+            payload,
             tol_ppm,
             elapsed_ms = t0.elapsed().as_millis() as u64,
             "fragindex: built"
@@ -362,6 +400,10 @@ impl FragIndex {
         cand_hi: u32,
         mut f: F,
     ) {
+        assert!(
+            self.has_payload(),
+            "probe_peak hands out posting intensities, which an m/z-only index does not hold"
+        );
         if cand_hi <= cand_lo {
             return;
         }
@@ -371,6 +413,38 @@ impl FragIndex {
         for nb in lo_bin..=hi_bin {
             let (a, z) = self.narrow_bin(nb, cand_lo, cand_hi);
             self.emit_range(a, z, peak_mz, &mut f);
+        }
+    }
+
+    /// [`FragIndex::probe_peak`] for a caller that needs only the matching CANDIDATE of each
+    /// posting: the same bins, the same narrowing, the same exact f64 predicate and the
+    /// same posting order, calling `f(cid)` where `probe_peak` calls
+    /// `f(cid, pmz, pint, pfrag)`. Works on an m/z-only index ([`FragIndex::build_mz_only`])
+    /// as well as a full one, because it never touches the payload arrays.
+    #[inline]
+    pub fn probe_peak_cand<F: FnMut(u32)>(
+        &self,
+        peak_mz: f64,
+        cand_lo: u32,
+        cand_hi: u32,
+        mut f: F,
+    ) {
+        if cand_hi <= cand_lo {
+            return;
+        }
+        let b = self.bins.bin(peak_mz);
+        let lo_bin = b.saturating_sub(1);
+        let hi_bin = (b + 1).min(self.bins.n_bins - 1);
+        for nb in lo_bin..=hi_bin {
+            let (a, z) = self.narrow_bin(nb, cand_lo, cand_hi);
+            if z <= a {
+                continue;
+            }
+            for (&mz, &cid) in self.post_mz[a..z].iter().zip(&self.post_cand[a..z]) {
+                if within_ppm(mz as f64, peak_mz, self.tol_ppm) {
+                    f(cid);
+                }
+            }
         }
     }
 
@@ -503,6 +577,12 @@ impl FragIndex {
 
     /// Build an empty narrowing cache for the candidate window `[cand_lo, cand_hi)`.
     pub fn window_narrow(&self, cand_lo: u32, cand_hi: u32) -> WindowNarrow {
+        // The windowed probes hand out posting intensities and ordinals.
+        assert!(
+            self.has_payload(),
+            "the windowed probes hand out posting intensities, which an m/z-only index \
+             does not hold"
+        );
         WindowNarrow {
             cand_lo,
             cand_hi,
@@ -598,7 +678,7 @@ impl SeedScratch {
         let epoch = self.epoch;
         let base = self.base;
         for &(mz, inten) in peaks {
-            idx.probe_peak(mz, cand_lo, cand_hi, |cid, _pmz, _pint, _pfrag| {
+            idx.probe_peak_cand(mz, cand_lo, cand_hi, |cid| {
                 let cc = (cid - base) as usize;
                 if self.stamp[cc] != epoch {
                     self.stamp[cc] = epoch;
@@ -1067,7 +1147,7 @@ mod tests {
         for tol in [20.0, 7.5] {
             let serial = FragIndex::build_serial(&lib, tol);
             for chunks in [1usize, 2, 3, 7, 64] {
-                let par = FragIndex::build_chunked(&lib, tol, Some(chunks));
+                let par = FragIndex::build_chunked(&lib, tol, Some(chunks), true);
                 assert_same_index(&par, &serial, &format!("tol {tol} chunks {chunks}"));
             }
             assert_same_index(&FragIndex::build(&lib, tol), &serial, "build");
@@ -1086,7 +1166,7 @@ mod tests {
         let lib = lib_from(&cands);
         let serial = FragIndex::build_serial(&lib, 20.0);
         for chunks in [1usize, 4, 50, 200] {
-            let par = FragIndex::build_chunked(&lib, 20.0, Some(chunks));
+            let par = FragIndex::build_chunked(&lib, 20.0, Some(chunks), true);
             assert_same_index(&par, &serial, &format!("gappy chunks {chunks}"));
         }
     }
@@ -1132,13 +1212,91 @@ mod tests {
         let lib = lib_from(&cands);
         let serial = FragIndex::build_serial(&lib, tol);
         for chunks in [1usize, 2, 5, cands.len()] {
-            let par = FragIndex::build_chunked(&lib, tol, Some(chunks));
+            let par = FragIndex::build_chunked(&lib, tol, Some(chunks), true);
             assert_same_index(&par, &serial, &format!("edges chunks {chunks}"));
         }
         // And the clamping is what it claims: NaN and -inf in bin 0, +inf in the top bin.
         assert_eq!(serial.bins.bin(f64::NAN), 0);
         assert_eq!(serial.bins.bin(f64::NEG_INFINITY), 0);
         assert_eq!(serial.bins.bin(f64::INFINITY), serial.bins.n_bins - 1);
+    }
+
+    /// The seed's m/z-only index is the full index without its payload: the same geometry,
+    /// CSR offsets, candidates and m/z, bit for bit, and `probe_peak_cand` reports exactly
+    /// the candidates `probe_peak` reports, in the same order, on either index.
+    #[test]
+    fn the_mz_only_index_is_the_full_index_without_its_payload() {
+        let lib = random_lib(2_000, 0xfeed);
+        for tol in [20.0, 7.5] {
+            let full = FragIndex::build(&lib, tol);
+            for chunks in [None, Some(1usize), Some(5)] {
+                let mz = FragIndex::build_chunked(&lib, tol, chunks, false);
+                assert!(full.has_payload() && !mz.has_payload());
+                assert!(mz.post_int.is_empty() && mz.post_frag.is_empty());
+                assert_eq!(format!("{:?}", mz.bins), format!("{:?}", full.bins));
+                assert_eq!(mz.bin_start, full.bin_start);
+                assert_eq!(mz.post_cand, full.post_cand);
+                let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+                assert_eq!(bits(&mz.post_mz), bits(&full.post_mz));
+                assert_eq!(mz.prec_mz, full.prec_mz);
+                // Probe every fragment m/z, nudged inside and outside the tolerance, over a
+                // narrow and the full candidate window.
+                for &(lo, hi) in &[(0u32, 2_000u32), (300, 900), (1_999, 2_000), (5, 5)] {
+                    for (i, &m) in lib.frag_mz.iter().enumerate().step_by(7) {
+                        let q = m as f64 * (1.0 + [0.0, 0.9, -0.9, 1.3][i % 4] * tol * 1e-6);
+                        let mut want = Vec::new();
+                        full.probe_peak(q, lo, hi, |c, _, _, _| want.push(c));
+                        let mut got_full = Vec::new();
+                        full.probe_peak_cand(q, lo, hi, |c| got_full.push(c));
+                        let mut got_mz = Vec::new();
+                        mz.probe_peak_cand(q, lo, hi, |c| got_mz.push(c));
+                        assert_eq!(got_full, want, "q={q} window=({lo},{hi})");
+                        assert_eq!(got_mz, want, "q={q} window=({lo},{hi})");
+                    }
+                }
+            }
+        }
+    }
+
+    /// The payload entry points refuse an m/z-only index rather than handing out zeros.
+    #[test]
+    #[should_panic(expected = "m/z-only index")]
+    fn an_mz_only_index_refuses_the_windowed_probe() {
+        let lib = random_lib(50, 3);
+        let _ = FragIndex::build_mz_only(&lib, 20.0).window_narrow(0, 50);
+    }
+
+    #[test]
+    #[should_panic(expected = "m/z-only index")]
+    fn an_mz_only_index_refuses_probe_peak() {
+        let lib = random_lib(50, 3);
+        FragIndex::build_mz_only(&lib, 20.0).probe_peak(500.0, 0, 50, |_, _, _, _| {});
+    }
+
+    /// The seed accumulator reads through `probe_peak_cand`, so it must see the same counts
+    /// and observed sums over an m/z-only index as over a full one.
+    #[test]
+    fn the_seed_accumulator_is_the_same_over_the_mz_only_index() {
+        let lib = random_lib(1_500, 0xabc);
+        let full = FragIndex::build(&lib, 20.0);
+        let mz = FragIndex::build_mz_only(&lib, 20.0);
+        let peaks: Vec<(f64, f32)> = lib
+            .frag_mz
+            .iter()
+            .step_by(3)
+            .enumerate()
+            .map(|(i, &m)| (m as f64 * (1.0 + 3e-6), 1.0 + i as f32 * 0.5))
+            .collect();
+        let (mut a, mut b) = (SeedScratch::new(8), SeedScratch::new(8));
+        for &(lo, hi) in &[(0u32, 1_500u32), (200, 700)] {
+            a.accumulate(&full, &peaks, lo, hi);
+            b.accumulate(&mz, &peaks, lo, hi);
+            assert_eq!(a.touched(), b.touched());
+            for &c in a.touched() {
+                assert_eq!(a.count(c), b.count(c));
+                assert_eq!(a.obs_sum(c).to_bits(), b.obs_sum(c).to_bits());
+            }
+        }
     }
 
     /// The atomic posting arrays become plain arrays IN PLACE: an atomic has its integer's
