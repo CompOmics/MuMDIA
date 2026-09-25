@@ -554,7 +554,7 @@ impl SpliceWriter {
 /// same sequence of mini-batches it would see from one big batch, and a divisor of the
 /// writer's default 1,048,576-row row group, so the row-group boundaries are where they
 /// were. 65,536 rows is ~0.5 MB for an f64 column and ~1.5 MB for a string column.
-const WRITE_TABLE_CHUNK_ROWS: usize = 1 << 16;
+pub const WRITE_TABLE_CHUNK_ROWS: usize = 1 << 16;
 
 /// One column of [`write_table`] mid-flight: the source `Vec` turned into an iterator so
 /// each chunk MOVES its rows out of it. A `String` or an inner `Vec<f32>` is handed to the
@@ -623,6 +623,48 @@ pub fn write_table(path: &str, cols: Vec<Col>) -> Result<u64> {
         // A zero-row table still writes its one empty chunk, which fixes the schema, so
         // an empty artifact keeps its columns.
         w.write_cols(chunks.iter_mut().map(|c| c.take(k)).collect())?;
+        written += k;
+        if written >= nrows {
+            break;
+        }
+    }
+    w.close()
+}
+
+/// [`write_table`] for a table whose columns are produced chunk by chunk rather than held
+/// whole: `chunk(start..end)` returns rows `start..end` of every column, and it is called
+/// for exactly the row ranges `write_table` would cut the full columns into
+/// (`WRITE_TABLE_CHUNK_ROWS` rows each, a short last one, and one empty range for an empty
+/// table). The writer and the sequence of chunks it is handed are therefore the ones
+/// `write_table` uses, so the file is byte-identical to `write_table` over the
+/// concatenated columns (`write_table_chunked_writes_the_write_table_file`), including the
+/// page framing of all-null columns that a different chunking would move
+/// (`an_entirely_null_column_keeps_its_rows_but_not_its_page_framing`).
+///
+/// What it saves is the whole-table columns: the caller builds one chunk at a time, and
+/// only one chunk plus the encoder's in-progress row group is resident. Each chunk must
+/// declare the same columns and hold `end - start` rows; a mismatch is an error from the
+/// writer, as it is for [`TableWriter`].
+pub fn write_table_chunked(
+    path: &str,
+    nrows: usize,
+    mut chunk: impl FnMut(std::ops::Range<usize>) -> Result<Vec<Col>>,
+) -> Result<u64> {
+    let mut w = TableWriter::new(path);
+    let mut written = 0usize;
+    loop {
+        let k = (nrows - written).min(WRITE_TABLE_CHUNK_ROWS);
+        let cols = chunk(written..written + k)?;
+        if let Some(c) = cols.iter().find(|c| c.len() != k) {
+            return Err(anyhow!(
+                "write_table_chunked: column '{}' of rows {}..{} for {path} has {} rows, expected {k}",
+                c.name(),
+                written,
+                written + k,
+                c.len()
+            ));
+        }
+        w.write_cols(cols)?;
         written += k;
         if written >= nrows {
             break;
@@ -2760,6 +2802,83 @@ mod write_chunking_tests {
                     .collect(),
             ),
         ]
+    }
+
+    /// Rows `r` of a table mixing every shape whose framing the chunk sequence can move:
+    /// scalars, strings, a partly-null column, entirely-null columns and list columns.
+    /// Values depend only on the global row index, so any split of `0..n` concatenates to
+    /// the same table.
+    fn mixed_cols(r: std::ops::Range<usize>) -> Vec<Col> {
+        let rows = || r.clone();
+        vec![
+            Col::U32("id".into(), rows().map(|i| i as u32).collect()),
+            Col::F64("mz".into(), rows().map(|i| i as f64 * 1.5 - 3.0).collect()),
+            Col::Str(
+                "label".into(),
+                rows()
+                    .map(|i| if i % 2 == 0 { "target" } else { "decoy" }.to_string())
+                    .collect(),
+            ),
+            Col::OptF64(
+                "cal".into(),
+                rows().map(|i| (i % 5 != 2).then_some(i as f64)).collect(),
+            ),
+            Col::OptF64("im_pred_cal".into(), rows().map(|_| None).collect()),
+            Col::OptF64("im_lo".into(), rows().map(|_| None).collect()),
+            Col::LargeListF32(
+                "rt".into(),
+                rows()
+                    .map(|i| (0..(i % 5)).map(|k| k as f32 * 0.5).collect())
+                    .collect(),
+            ),
+        ]
+    }
+
+    /// The streamed writer hands the writer exactly the chunks `write_table` cuts, so the
+    /// file is the `write_table` file byte for byte, at every size that exercises a
+    /// boundary: empty, one row, exactly one chunk, one past it, and several chunks with a
+    /// short last one. The all-null columns are the ones a different chunk sequence would
+    /// re-frame, so they are what makes this more than a row comparison.
+    #[test]
+    fn write_table_chunked_writes_the_write_table_file() {
+        let c = WRITE_TABLE_CHUNK_ROWS;
+        for n in [0usize, 1, c, c + 1, 3 * c + 7] {
+            let whole = tmp(&format!("chunked_ref_{n}.parquet"));
+            let streamed = tmp(&format!("chunked_new_{n}.parquet"));
+            assert_eq!(write_table(&whole, mixed_cols(0..n)).unwrap(), n as u64);
+            let mut ranges: Vec<std::ops::Range<usize>> = Vec::new();
+            let rows = write_table_chunked(&streamed, n, |r| {
+                ranges.push(r.clone());
+                Ok(mixed_cols(r))
+            })
+            .unwrap();
+            assert_eq!(rows, n as u64);
+            assert_eq!(
+                std::fs::read(&streamed).unwrap(),
+                std::fs::read(&whole).unwrap(),
+                "{n} rows: the streamed file differs from write_table's"
+            );
+            // The ranges tile 0..n in WRITE_TABLE_CHUNK_ROWS steps, one empty range when
+            // the table is empty.
+            assert_eq!(ranges.first().map(|r| r.start), Some(0));
+            assert_eq!(ranges.last().map(|r| r.end), Some(n));
+            assert!(ranges.windows(2).all(|w| w[0].end == w[1].start));
+            assert!(ranges.iter().all(|r| r.len() <= c));
+            assert_eq!(ranges.len(), n.div_ceil(c).max(1));
+            std::fs::remove_file(&whole).ok();
+            std::fs::remove_file(&streamed).ok();
+        }
+    }
+
+    /// A chunk that does not hold the rows it was asked for is refused, not written.
+    #[test]
+    fn write_table_chunked_refuses_a_short_chunk() {
+        let p = tmp("chunked_short.parquet");
+        let err = write_table_chunked(&p, 10, |r| Ok(mixed_cols(r.start..r.end - 1)))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("expected 10"), "{err}");
+        assert!(!std::path::Path::new(&p).exists());
     }
 
     /// The pre-change write path, verbatim: validate, build ONE record batch for the whole

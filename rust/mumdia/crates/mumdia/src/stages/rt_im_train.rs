@@ -11,7 +11,7 @@ use anyhow::Result;
 use mumdia_core::config::{CalibrationMethod, RtImTrainConfig};
 use mumdia_core::schema::artifact;
 use mumdia_io::report::ArtifactReport;
-use mumdia_io::table::{write_table, Col, TableFile};
+use mumdia_io::table::{write_table_chunked, Col, TableFile};
 use serde_json::json;
 use tracing::{info, warn};
 
@@ -427,62 +427,59 @@ pub fn run(p: RtImTrainParams) -> Result<u64> {
             None
         };
 
-    // Apply to every library candidate.
+    // Apply to every library candidate, streamed: each 65,536-row chunk of the window
+    // table is computed and written before the next, through the same writer and the same
+    // chunk sequence `write_table` uses, so the file is byte-identical to writing the seven
+    // whole columns at once. Holding them whole was 76 bytes per candidate (three
+    // `Option<f64>` ion-mobility columns among them), 15 GB at 203M rows, for a table that
+    // is written once and never read back here.
     let cid = lib_cid;
     let irt = lib_irt;
     let n = lib.nrows;
-    let (mut cid_c, mut cal_c, mut lo_c, mut hi_c) = (
-        Vec::with_capacity(n),
-        Vec::with_capacity(n),
-        Vec::with_capacity(n),
-        Vec::with_capacity(n),
-    );
-    let (mut im_c, mut imlo_c, mut imhi_c) = (
-        Vec::with_capacity(n),
-        Vec::with_capacity(n),
-        Vec::with_capacity(n),
-    );
     let mut n_nonfinite_irt = 0u64;
-    for i in 0..n {
-        // A row whose library iRT is not finite has no calibrated RT, which is the
-        // documented "search the whole gradient" sentinel rather than an arithmetic
-        // accident. The parquet reader maps a null f32 to NaN, so one failed prediction
-        // in an imported library reaches here (docs/31 F4).
-        let usable_irt = (irt[i] as f64).is_finite();
-        if !usable_irt {
-            n_nonfinite_irt += 1;
-        }
-        let calibrated_rt = (calibration_available && usable_irt).then(|| predict(irt[i] as f64));
-        let width = calibrated_rt.map(|cal| match &adaptive {
-            Some((rt_min, span, widths)) => {
-                let nb = widths.len();
-                let frac = ((cal - rt_min) / span).clamp(0.0, 0.999_999);
-                widths[(frac * nb as f64) as usize]
+    let rows = write_table_chunked(p.out_windows, n, |r| {
+        let k = r.len();
+        let (mut cid_c, mut cal_c, mut lo_c, mut hi_c) = (
+            Vec::with_capacity(k),
+            Vec::with_capacity(k),
+            Vec::with_capacity(k),
+            Vec::with_capacity(k),
+        );
+        for i in r {
+            // A row whose library iRT is not finite has no calibrated RT, which is the
+            // documented "search the whole gradient" sentinel rather than an arithmetic
+            // accident. The parquet reader maps a null f32 to NaN, so one failed prediction
+            // in an imported library reaches here (docs/31 F4).
+            let usable_irt = (irt[i] as f64).is_finite();
+            if !usable_irt {
+                n_nonfinite_irt += 1;
             }
-            None => w_rt.expect("available RT calibration requires a bounded window"),
-        });
-        let (cal, lo, hi) = candidate_window(calibrated_rt, width);
-        cid_c.push(cid[i]);
-        cal_c.push(cal);
-        lo_c.push(lo);
-        hi_c.push(hi);
-        im_c.push(None);
-        imlo_c.push(None);
-        imhi_c.push(None);
-    }
-
-    let rows = write_table(
-        p.out_windows,
-        vec![
+            let calibrated_rt =
+                (calibration_available && usable_irt).then(|| predict(irt[i] as f64));
+            let width = calibrated_rt.map(|cal| match &adaptive {
+                Some((rt_min, span, widths)) => {
+                    let nb = widths.len();
+                    let frac = ((cal - rt_min) / span).clamp(0.0, 0.999_999);
+                    widths[(frac * nb as f64) as usize]
+                }
+                None => w_rt.expect("available RT calibration requires a bounded window"),
+            });
+            let (cal, lo, hi) = candidate_window(calibrated_rt, width);
+            cid_c.push(cid[i]);
+            cal_c.push(cal);
+            lo_c.push(lo);
+            hi_c.push(hi);
+        }
+        Ok(vec![
             Col::U32("candidate_id".into(), cid_c),
             Col::F64("rt_pred_cal".into(), cal_c),
             Col::F64("rt_lo".into(), lo_c),
             Col::F64("rt_hi".into(), hi_c),
-            Col::OptF64("im_pred_cal".into(), im_c),
-            Col::OptF64("im_lo".into(), imlo_c),
-            Col::OptF64("im_hi".into(), imhi_c),
-        ],
-    )?;
+            Col::OptF64("im_pred_cal".into(), vec![None; k]),
+            Col::OptF64("im_lo".into(), vec![None; k]),
+            Col::OptF64("im_hi".into(), vec![None; k]),
+        ])
+    })?;
 
     let method = if !calibration_available {
         "unavailable"

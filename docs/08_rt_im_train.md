@@ -601,8 +601,12 @@ either the adaptive per-bin value or the global `w_rt` (rt_im_train.rs:248-255),
 `candidate_window(calibrated_rt, width)` (rt_im_train.rs:256) produces the row
 `(cal, cal - width, cal + width)`, or the unbounded `(NaN, -inf, +inf)` when either
 value is absent. The three IM columns are pushed as `None` (rt_im_train.rs:261-263).
-The table is written (rt_im_train.rs:266-277), `cal.json` is written
-(rt_im_train.rs:309-325), and the artifact report is emitted (rt_im_train.rs:332-344).
+The table is written as it is computed: `write_table_chunked` asks for one
+65,536-row chunk at a time, the rows of that chunk are computed and encoded, and the
+next chunk follows. The chunk sequence is the one `write_table` uses, so
+`run_windows.parquet` is byte-identical to writing the seven whole columns at once,
+and those columns (76 bytes per candidate, 15 GB at 203M rows) are never resident.
+Then `cal.json` is written and the artifact report is emitted.
 
 ### DeepLC multitask fine-tune (orchestrator pre-step, default off)
 

@@ -166,6 +166,19 @@ returns the row count as `u64`:
    (`table.rs:192-194`). One `write_table` call produces exactly one row group /
    one logical batch.
 
+The list above describes the original single-batch write. `write_table` now hands
+the writer the rows in `WRITE_TABLE_CHUNK_ROWS` (65,536-row) chunks through a
+`TableWriter`, which keeps one chunk of Arrow arrays resident instead of a second
+copy of the whole table; the row groups still fall at the writer's 1,048,576-row
+default. `write_table_chunked(path, nrows, chunk)` is the same write for a caller
+that produces its rows chunk by chunk: `chunk(start..end)` is called for exactly the
+ranges `write_table` would cut (one empty range for an empty table), so the file is
+byte-identical to `write_table` over the concatenated columns, including the page
+framing of an all-null column, which a different chunk sequence would move
+(`write_table_chunked_writes_the_write_table_file`). `rt-im-train` writes
+`run_windows.parquet` this way, so the seven whole columns (76 bytes per candidate)
+are never resident.
+
 ### Read side: Parquet -> `Table` -> typed `Vec`
 
 `Table` (`table.rs:200-204`) holds the `Arc<Schema>`, the `Vec<RecordBatch>`,
@@ -357,6 +370,7 @@ string (`main.rs:713`).
 | `Col::field` | `table.rs:83` | Arrow `Field`; scalars non-nullable, `Opt*`/lists nullable |
 | `Col::into_array` | `table.rs:107` | consuming move of the `Vec` into an `ArrayRef` (copy once) |
 | `write_table` | `table.rs:151` | validate + write one SNAPPY Parquet batch; returns row count |
+| `write_table_chunked` | `table.rs` | the `write_table` file, built from caller-produced 65,536-row chunks |
 | `Table` (struct) | `table.rs:200` | read-back table: schema, batches, nrows |
 | `Table::read` | `table.rs:207` | read a Parquet file fully into memory |
 | `Table::column_names` | `table.rs:227` | schema field names, in order |
