@@ -4839,6 +4839,341 @@ mod tests {
         }
     }
 
+    /// Deterministic pseudo-random stream for the production-shaped fixture below. A
+    /// 64-bit LCG (Knuth's MMIX constants), high bits only: no dependency, and the same
+    /// sequence on every platform, which a golden digest needs.
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn next_u32(&mut self) -> u32 {
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (self.0 >> 33) as u32
+        }
+
+        /// Uniform in `[0, 1)`.
+        fn unit(&mut self) -> f64 {
+            self.next_u32() as f64 / (1u64 << 31) as f64
+        }
+
+        /// Uniform in `0..n`.
+        fn below(&mut self, n: u32) -> u32 {
+            self.next_u32() % n.max(1)
+        }
+    }
+
+    /// A PRODUCTION-SHAPED Extended fixture for the per-PSM kernels: mostly 12 fragments
+    /// on ~150-240-point shared grids (the HYE shape), with every degenerate case the
+    /// kernels branch on mixed in -- 0 to 11 fragments, 1- to 12-point grids, predicted but
+    /// unobserved fragments, all-zero traces, quantised intensities (ties), zero and
+    /// negative predicted intensities, rows on a shifted grid (the union alignment), a row
+    /// whose intensity vector is longer than its axis, MS1 isotope XICs on the fragment
+    /// grid, on a different grid, incomplete and absent, and apexes off the axis.
+    ///
+    /// `craft_extended_inputs` has at most five fragments and ten points, so it never
+    /// reaches the body of an 11-lag cross-correlation nor a pair matrix of the size the
+    /// kernels are tuned for; this one does, which is what the kernel golden below needs.
+    fn craft_kernel_inputs(dir: &std::path::Path, n_cand: u32) -> (String, String) {
+        let psms = dir
+            .join("psms_kernel.parquet")
+            .to_string_lossy()
+            .to_string();
+        let chrom = dir
+            .join("chrom_kernel.parquet")
+            .to_string_lossy()
+            .to_string();
+        let mut rng = Lcg(0x5eed_1234_abcd_0001);
+        let (mut cid, mut base): (Vec<u32>, Vec<u32>) = (Vec::new(), Vec::new());
+        let (mut apex_rt, mut cal, mut mz): (Vec<f64>, Vec<f64>, Vec<f64>) =
+            (Vec::new(), Vec::new(), Vec::new());
+        let mut apex_int: Vec<f32> = Vec::new();
+        let (mut nmatch, mut npred, mut corun, mut z): (Vec<i32>, Vec<i32>, Vec<i32>, Vec<i32>) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let (mut label, mut pform, mut prot): (Vec<String>, Vec<String>, Vec<String>) =
+            (Vec::new(), Vec::new(), Vec::new());
+        let mut ms1: [Vec<Option<f64>>; 4] = Default::default();
+        let (mut ccid, mut cname): (Vec<u32>, Vec<String>) = (Vec::new(), Vec::new());
+        let (mut cfmz, mut cobsmz): (Vec<f64>, Vec<f64>) = (Vec::new(), Vec::new());
+        let mut cpint: Vec<f32> = Vec::new();
+        let (mut crt, mut cint): (Vec<Vec<f32>>, Vec<Vec<f32>>) = (Vec::new(), Vec::new());
+        // One Gaussian elution peak on `n` points, centred at `centre`, with dropouts,
+        // noise, an optional interferent and optional quantisation.
+        let peak = |rng: &mut Lcg, n: usize, centre: f64| -> Vec<f32> {
+            let height = 10f64.powf(1.0 + 3.0 * rng.unit());
+            let width = 1.5 + 4.0 * rng.unit();
+            let interferent = if rng.below(5) == 0 {
+                Some((
+                    rng.below(n.max(1) as u32) as f64,
+                    height * 2.0 * rng.unit(),
+                    1.0 + 3.0 * rng.unit(),
+                ))
+            } else {
+                None
+            };
+            let quantise = rng.below(10) == 0;
+            (0..n)
+                .map(|i| {
+                    let x = (i as f64 - centre) / width;
+                    let mut v = height * (-0.5 * x * x).exp();
+                    if let Some((c2, h2, w2)) = interferent {
+                        let x2 = (i as f64 - c2) / w2;
+                        v += h2 * (-0.5 * x2 * x2).exp();
+                    }
+                    if rng.below(4) == 0 {
+                        return 0.0;
+                    }
+                    v += height * 0.05 * rng.unit();
+                    if quantise {
+                        let q = height / 8.0;
+                        v = (v / q).round() * q;
+                    }
+                    v as f32
+                })
+                .collect()
+        };
+        for c in 0..n_cand {
+            let roll = rng.unit();
+            let k: u32 = if roll < 0.55 {
+                12
+            } else if roll < 0.6 {
+                0
+            } else {
+                1 + rng.below(11)
+            };
+            let npts: usize = if rng.below(10) == 0 {
+                1 + rng.below(12) as usize
+            } else {
+                150 + rng.below(91) as usize
+            };
+            let dt = 0.5 + 2.5 * rng.unit();
+            let start = 200.0 + c as f64 * 3.0;
+            let grid: Vec<f32> = (0..npts).map(|i| (start + i as f64 * dt) as f32).collect();
+            let centre = (npts / 2) as f64 + rng.below(9) as f64 - 4.0;
+            let centre_i = (centre.max(0.0) as usize).min(npts - 1);
+            let apex = if rng.below(20) == 0 {
+                grid[0] as f64 - 10.0 // apex off the left end of the axis
+            } else {
+                grid[centre_i] as f64 + (rng.unit() - 0.5) * 0.6 * dt
+            };
+            cid.push(c);
+            base.push(c / 3);
+            apex_rt.push(apex);
+            cal.push(apex + (rng.unit() - 0.5) * 20.0);
+            mz.push(400.0 + 600.0 * rng.unit());
+            apex_int.push((10f64.powf(2.0 + 3.0 * rng.unit())) as f32);
+            npred.push(k as i32);
+            nmatch.push(rng.below(k + 1) as i32);
+            corun.push(rng.below(k + 1) as i32);
+            z.push(2 + (c % 3) as i32);
+            label.push(if c % 3 == 0 { "decoy" } else { "target" }.to_string());
+            pform.push(format!("PEPTIDEK{}", c / 3));
+            prot.push(format!("P{c};Q{}", c / 2));
+            for (slot, v) in ms1.iter_mut().enumerate() {
+                v.push(if rng.below(8) == 0 {
+                    None
+                } else {
+                    Some(10f64.powf(2.0 + 2.0 * rng.unit()) / (slot + 1) as f64)
+                });
+            }
+            for f in 0..k {
+                let series = if rng.below(2) == 0 { 'y' } else { 'b' };
+                let ordinal = 1 + rng.below(14);
+                let name = if rng.below(5) == 0 {
+                    format!("{series}{ordinal}^2")
+                } else {
+                    format!("{series}{ordinal}")
+                };
+                let fmz = 150.0 + 1200.0 * rng.unit();
+                ccid.push(c);
+                cname.push(name);
+                cfmz.push(fmz);
+                cobsmz.push(fmz * (1.0 + (rng.unit() - 0.5) * 20e-6));
+                cpint.push(match rng.below(20) {
+                    0 => 0.0,
+                    1 => -0.05,
+                    2 => 0.5,
+                    _ => rng.unit() as f32,
+                });
+                let jitter = rng.below(5) as f64 - 2.0;
+                // The first fragment always carries a trace: a candidate whose every row is
+                // empty has an empty union axis, which extract never emits and which the
+                // peak-window slice in `fragment_features` does not accept.
+                let mut case = rng.below(20);
+                if f == 0 && case == 0 {
+                    case = 4;
+                }
+                match case {
+                    0 => {
+                        crt.push(Vec::new()); // predicted but never observed
+                        cint.push(Vec::new());
+                    }
+                    1 => {
+                        crt.push(grid.clone());
+                        cint.push(vec![0.0; npts]);
+                    }
+                    2 => {
+                        // A row on a shifted grid: no shared axis, so the union build runs.
+                        crt.push(grid.iter().map(|&t| t + (0.25 * dt) as f32).collect());
+                        cint.push(peak(&mut rng, npts, centre + jitter));
+                    }
+                    3 => {
+                        // More values than axis points: the union build truncates.
+                        crt.push(grid.clone());
+                        cint.push(peak(&mut rng, npts + 2, centre + jitter));
+                    }
+                    _ => {
+                        crt.push(grid.clone());
+                        cint.push(peak(&mut rng, npts, centre + jitter));
+                    }
+                }
+            }
+            if k == 0 {
+                continue; // a PSM row with no chromatogram rows at all
+            }
+            let ms1_case = rng.below(10);
+            let isotopes: &[&str] = match ms1_case {
+                8 => &["ms1_mono", "ms1_iso1"],
+                9 => &[],
+                _ => &["ms1_mono", "ms1_iso1", "ms1_iso2"],
+            };
+            for (iso, nm) in isotopes.iter().enumerate() {
+                ccid.push(c);
+                cname.push(nm.to_string());
+                cfmz.push(500.0 + iso as f64 * 0.5);
+                cobsmz.push(500.0 + iso as f64 * 0.5);
+                cpint.push(0.0);
+                if ms1_case == 7 {
+                    // Every second fragment scan: an MS1 grid that is not the fragments'.
+                    let sub: Vec<f32> = grid.iter().step_by(2).copied().collect();
+                    let n = sub.len();
+                    crt.push(sub);
+                    cint.push(peak(&mut rng, n, centre / 2.0));
+                } else {
+                    crt.push(grid.clone());
+                    cint.push(peak(&mut rng, npts, centre));
+                }
+            }
+        }
+        let [m_mono, m_i1, m_i2, m_m1] = ms1;
+        mumdia_io::table::write_table(
+            &psms,
+            vec![
+                Col::U32("candidate_id".into(), cid),
+                Col::F64("apex_rt".into(), apex_rt),
+                Col::F32("apex_intensity".into(), apex_int),
+                Col::I32("n_matched_fragments".into(), nmatch),
+                Col::I32("n_predicted_fragments".into(), npred),
+                Col::I32("coelution_run".into(), corun),
+                Col::F64("rt_pred_cal".into(), cal),
+                Col::I32("charge".into(), z),
+                Col::Str("label".into(), label),
+                Col::U32("base_peptide_id".into(), base),
+                Col::Str("peptidoform".into(), pform),
+                Col::Str("protein".into(), prot),
+                Col::F64("precursor_mz".into(), mz),
+                Col::OptF64("ms1_mono".into(), m_mono),
+                Col::OptF64("ms1_iso1".into(), m_i1),
+                Col::OptF64("ms1_iso2".into(), m_i2),
+                Col::OptF64("ms1_isom1".into(), m_m1),
+            ],
+        )
+        .unwrap();
+        mumdia_io::table::write_table(
+            &chrom,
+            vec![
+                Col::U32("candidate_id".into(), ccid),
+                Col::Str("frag_name".into(), cname),
+                Col::F64("frag_mz".into(), cfmz),
+                Col::F64("frag_obs_mz".into(), cobsmz),
+                Col::F32("predicted_intensity".into(), cpint),
+                Col::ListF32("rt".into(), crt),
+                Col::ListF32("intensity".into(), cint),
+            ],
+        )
+        .unwrap();
+        (psms, chrom)
+    }
+
+    #[test]
+    fn production_shaped_features_match_the_pre_kernel_build() {
+        // A GOLDEN over the production-shaped fixture above, captured at main 6887c41
+        // BEFORE the per-PSM kernel work (the shared pair statistics, the MS1 identity
+        // path, the lag-parallel cross-correlation, the centred Pearson, the order
+        // statistics by selection, the power iteration and the cached Spearman ranks).
+        // Every one of those changes claims bit-identical feature values; this is the test
+        // that holds them to it on inputs large enough to reach the code they changed.
+        //
+        // Three configurations, because the kernels branch on them: per-candidate peak
+        // bounds, the global half-widths a confident set would give, and
+        // `bound_features = false` (where `fragment_features` scores the whole window and
+        // must not share the Extended path's peak statistics). Each runs in small chunks,
+        // so the multi-chunk loader is on the path too.
+        //
+        // PER PLATFORM for the reason `extended_features_match_the_pre_permutation_build`
+        // gives (the platform libm). REGENERATING: re-derive at the last commit whose
+        // values are trusted, never from the build under test.
+        const GOLDEN_DIGEST: Option<u64> = if cfg!(target_os = "windows") {
+            Some(0x7eaa_3aa3_e1bc_0502)
+        } else {
+            None
+        };
+        let dir = std::env::temp_dir().join("mumdia_features_kernel_golden");
+        std::fs::create_dir_all(&dir).unwrap();
+        let (psms, chrom) = craft_kernel_inputs(&dir, 400);
+        let mut h = 0xcbf2_9ce4_8422_2325u64;
+        let arms: [(&str, bool, BoundsSource); 3] = [
+            ("percand", true, BoundsSource::Learn),
+            ("global", true, BoundsSource::Given(Some((6.0, 9.0)))),
+            ("unbounded", false, BoundsSource::Learn),
+        ];
+        for (tag, bound_features, bounds) in arms {
+            let out = dir
+                .join(format!("kernel_{tag}.parquet"))
+                .to_string_lossy()
+                .to_string();
+            let mut cfg = FeaturesConfig {
+                set: FeatureSet::Extended,
+                emit_pin: false,
+                bound_from_confident: false,
+                bound_features,
+                ..Default::default()
+            };
+            cfg.ms1_precursor_features = true;
+            run_chunked(
+                FeaturesParams {
+                    psms: &psms,
+                    chromatograms: &chrom,
+                    seed: None,
+                    out: &out,
+                    out_pin: "",
+                    cfg: &cfg,
+                    config_hash: "test",
+                },
+                300,
+                usize::MAX,
+                PinFinish::Normal,
+                bounds,
+            )
+            .unwrap();
+            let (rows, ncols, digest) = features_digest(&out);
+            assert_eq!((rows, ncols), (400, 398), "arm {tag}: table shape moved");
+            eprintln!("arm {tag}: 0x{digest:016x}");
+            fnv(&mut h, &digest.to_le_bytes());
+        }
+        match GOLDEN_DIGEST {
+            Some(golden) => assert_eq!(
+                h, golden,
+                "a feature value differs from the pre-kernel build (this platform computes \
+                 0x{h:016x})"
+            ),
+            None => {
+                eprintln!("no kernel digest is recorded for this platform; it computes 0x{h:016x}")
+            }
+        }
+    }
+
     #[test]
     fn extended_features_are_chunk_invariant() {
         // The `features_chunking_is_value_preserving` integration test runs the DEFAULT
