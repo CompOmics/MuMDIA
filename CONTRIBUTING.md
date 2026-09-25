@@ -45,7 +45,8 @@ python ci/gen_third_party_licenses.py     # THIRD_PARTY_LICENSES.md, from Cargo.
 
 `docs/24` and `configs/config-schema.json` contain no source line numbers. An
 environment read is cited as `path::function` (the file and the enclosing Rust `fn`,
-qualified by its `impl` type, or Python `def`), and a config struct by its name, so
+qualified by its `impl` type, `trait` and inline `mod`, or Python `def`), and a config
+struct by its name, so
 moving code within a file does not make either artifact stale. They change when a
 field, a default, a doc comment, a variable, or the function that reads a variable
 changes. `--check` also regenerates both from copies of every input with blank lines

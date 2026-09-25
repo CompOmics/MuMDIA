@@ -34,9 +34,10 @@ order and therefore meaningful. Enums, environment variables, and the unresolved
 lists are sorted by name. No timestamp, path, or version is embedded.
 
 Stable anchors. No line number is emitted. A site is cited as `path::scope`: the
-tracked file plus the enclosing Rust `fn` (qualified by its `impl` type) or Python
-`def` (qualified by its class), nested scopes joined, `<module>` outside any
-function; a config struct or enum is cited by its name. The reference used to cite `path:line`, so every merge that moved lines in
+tracked file plus the enclosing Rust `fn` (qualified by its `impl` type, `trait`
+and inline `mod`) or Python `def` (qualified by its class), nested scopes joined,
+`<module>` outside any function; a config struct or enum is cited by its name.
+The reference used to cite `path:line`, so every merge that moved lines in
 `rescore.rs`, `config.rs`, `main.rs` or a sidecar script made the committed
 document stale on every other open pull request, although no variable, field or
 default had changed. `--check` also regenerates from copies of every input with
@@ -794,6 +795,12 @@ MODULE_SCOPE = "<module>"
 
 RUST_FN_DECL = re.compile(r"\bfn\s+([A-Za-z_][A-Za-z0-9_]*)")
 RUST_IMPL = re.compile(r"\bimpl\b")
+# An inline module or a trait: both name the functions inside them.
+RUST_NAMED_BLOCK = re.compile(r"\b(mod|trait)\s+([A-Za-z_][A-Za-z0-9_]*)")
+# What may stand between an item keyword and the end of the previous item:
+# visibility (`pub`, `pub(crate)`, `pub(in path)`) and the qualifiers of an
+# `unsafe impl`, an `unsafe trait`, an `auto trait` or a `default impl`.
+RUST_ITEM_QUALIFIER = re.compile(r"(?:pub(?:\s*\([^()]*\))?|unsafe|auto|default)\Z")
 RUST_PATH = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(?:\s*::\s*[A-Za-z_][A-Za-z0-9_]*)*")
 RUST_RAW_STR = re.compile(r'b?r(#*)"')
 
@@ -890,16 +897,40 @@ def rust_impl_type(header: str) -> str | None:
     return None
 
 
+def rust_item_position(code: str, start: int) -> bool:
+    """Whether the keyword at `start` of masked `code` begins an item.
+
+    It does when only whitespace, visibility and the qualifiers `unsafe`, `auto`
+    and `default` stand between it and a `{`, `}`, `;`, an attribute's `]` or the
+    start of the file. `-> impl Iterator<..> {` and `x: impl Trait` fail the test:
+    there `impl` is part of a type.
+    """
+    k = start
+    while True:
+        while k > 0 and code[k - 1].isspace():
+            k -= 1
+        if k == 0 or code[k - 1] in "{};]":
+            return True
+        m = RUST_ITEM_QUALIFIER.search(code, max(0, k - 80), k)
+        if m is None:
+            return False
+        if m.start() > 0 and (code[m.start() - 1].isalnum() or code[m.start() - 1] == "_"):
+            return False
+        k = m.start()
+
+
 def rust_scopes(text: str, rel: str) -> list[tuple[int, int, str, str]]:
-    """`(start, end, name, kind)` of every Rust `fn` and `impl` that has a body.
+    """`(start, end, name, kind)` of every Rust `fn`, `impl`, `mod` and `trait` body.
 
     A body opens at the first `{` outside parentheses and brackets after the
-    keyword; a `;` there first is a declaration without a body (a trait method).
-    Brace pairs are matched once for the whole file, so the cost is linear in its
-    size. An `impl` counts only in item position, after `{`, `}`, `;`, an attribute
-    or the start of the file: `-> impl Iterator<..> {` is a return type, and its
-    `{` opens the function body, not an impl block. An impl span carries the self
-    type, so a method is cited as `Type::method`, as Python cites `Class.method`.
+    keyword; a `;` there first is a declaration without a body (a trait method, or
+    `mod name;`). Brace pairs are matched once for the whole file, so the cost is
+    linear in its size. An `impl`, `mod` or `trait` counts only in item position
+    (`rust_item_position`): `-> impl Iterator<..> {` is a return type, and its `{`
+    opens the function body, not an impl block. An impl span carries the self type
+    and a `mod` or `trait` span its own name, so a method is cited as
+    `Type::method`, a trait's default method as `Trait::method` and a function in
+    an inline module as `module::function`, as Python cites `Class.method`.
 
     The braces left after masking must balance. If they do not, a literal or a
     comment was masked wrongly, and every later read in the file would be cited
@@ -946,10 +977,7 @@ def rust_scopes(text: str, rel: str) -> list[tuple[int, int, str, str]]:
         if j is not None:
             spans.append((m.start(), close_of[j], m.group(1), "fn"))
     for m in RUST_IMPL.finditer(code):
-        k = m.start() - 1
-        while k >= 0 and code[k].isspace():
-            k -= 1
-        if k >= 0 and code[k] not in "{};]":
+        if not rust_item_position(code, m.start()):
             continue
         j = body_open(m.end())
         if j is None:
@@ -957,15 +985,22 @@ def rust_scopes(text: str, rel: str) -> list[tuple[int, int, str, str]]:
         name = rust_impl_type(code[m.end() : j])
         if name:
             spans.append((m.start(), close_of[j], name, "impl"))
+    for m in RUST_NAMED_BLOCK.finditer(code):
+        if not rust_item_position(code, m.start()):
+            continue
+        j = body_open(m.end())
+        if j is not None:
+            spans.append((m.start(), close_of[j], m.group(2), m.group(1)))
     return spans
 
 
 def rust_scope_at(spans: list[tuple[int, int, str, str]], offset: int) -> str:
-    """The enclosing `fn` of `offset`, qualified by its `impl` type and outer `fn`s.
+    """The enclosing `fn` of `offset`, qualified by every enclosing item.
 
-    `Type::method`, `outer::inner`, or `<module>` outside any function. An `impl`
-    alone is not a function scope, so a read in an associated `const` of an impl
-    block is `<module>` like one in a `static`.
+    `Type::method`, `Trait::method`, `module::function`, `outer::inner`, or
+    `<module>` outside any function. An `impl`, `mod` or `trait` alone is not a
+    function scope, so a read in an associated `const` or a `static` inside a
+    module is `<module>` like one in a top-level `static`.
     """
     chain = sorted(span for span in spans if span[0] <= offset <= span[1])
     if not any(kind == "fn" for _, _, _, kind in chain):
@@ -1712,8 +1747,9 @@ def build_document(inputs: Inputs) -> tuple[str, dict[str, object]]:
     a("listed with the file it is in.")
     a("")
     a("`Read at` and `Site` name the file and the enclosing function as")
-    a("`path::function`: `Type::method` for a Rust method, nested Rust functions")
-    a(f"joined with `::`, `Class.method` in Python, `{MODULE_SCOPE}` outside any")
+    a("`path::function`: `Type::method` for a Rust method, `Trait::method` for a")
+    a("default trait method, inline modules and nested Rust functions joined with")
+    a(f"`::`, `Class.method` in Python, `{MODULE_SCOPE}` outside any")
     a("function. No line number is cited, so the tables change only when a read")
     a("moves to another function.")
     a("")

@@ -114,8 +114,9 @@ than a number. Both are recorded in every run's `manifest.json`.
   `source_line` per setting. Any merge that moved lines in `rescore.rs`, `config.rs`,
   `main.rs` or a sidecar script therefore made both files stale on every other open pull
   request, although no variable, field or default had changed. A read is now cited as
-  `path::function` (`Type::method` and `outer::inner` in Rust, `Class.method` in Python,
-  `<module>` outside any function), a struct or enum by its name, and the schema field
+  `path::function` (`Type::method`, `Trait::method`, `module::function` and
+  `outer::inner` in Rust, `Class.method` in Python, `<module>` outside any function), a
+  struct or enum by its name, and the schema field
   `source_line` is replaced by `source_struct`, the declaring struct (the desktop editor
   never read either). `--check` also regenerates from copies of every input with blank
   lines inserted and fails if either artifact differs;

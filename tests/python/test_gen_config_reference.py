@@ -68,6 +68,42 @@ fn child(cmd: &mut Command) {
     cmd.env("MUMDIA_T_CHILD", "1");
 }
 
+pub(crate) mod alpha {
+    pub fn run() {
+        let _ = std::env::var("MUMDIA_T_MOD_A");
+    }
+}
+
+mod beta {
+    static IN_MOD: Lazy<Option<String>> = Lazy::new(|| std::env::var("MUMDIA_T_MOD_STATIC").ok());
+
+    fn run() {
+        let _ = std::env::var("MUMDIA_T_MOD_B");
+    }
+
+    impl super::Runner {
+        fn in_mod(&self) {
+            let _ = std::env::var("MUMDIA_T_MOD_IMPL");
+        }
+    }
+}
+
+mod declared_elsewhere;
+
+pub trait Source {
+    fn required(&self);
+
+    fn provided(&self) {
+        let _ = std::env::var("MUMDIA_T_TRAIT_DEFAULT");
+    }
+}
+
+unsafe impl Backend for Shared {
+    fn open() {
+        let _ = std::env::var("MUMDIA_T_UNSAFE_IMPL");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -134,19 +170,28 @@ def line_of(text, needle):
 
 
 def test_rust_reads_are_cited_by_enclosing_function():
-    """Each engine read is cited by its function, qualified by impl type and outer fn.
+    """Each engine read is cited by its function, qualified by every enclosing item.
 
     A wrong scope sends a reader of docs/24 to the wrong function; a `fn` or `{`
     inside a literal opening a scope would misattribute every later read in the file.
+    Inline modules and traits are part of the chain, so two same-named functions in
+    different modules get different citations, and a read that moves from one to
+    the other changes the reference. `unsafe impl` is an impl block like any other.
     """
     reads, sets, unresolved = scan_rust(RUST_SOURCE)
     sites = {name: entry[0] for name, entry in reads.items()}
     assert sites == {
         "MUMDIA_T_FREE": ["src/x.rs::free"],
         "MUMDIA_T_METHOD": ["src/x.rs::Runner::run"],
+        "MUMDIA_T_MOD_A": ["src/x.rs::alpha::run"],
+        "MUMDIA_T_MOD_B": ["src/x.rs::beta::run"],
+        "MUMDIA_T_MOD_IMPL": ["src/x.rs::beta::Runner::in_mod"],
+        "MUMDIA_T_MOD_STATIC": ["src/x.rs::<module>"],
         "MUMDIA_T_NESTED": ["src/x.rs::Runner::run::inner"],
         "MUMDIA_T_STATIC": ["src/x.rs::<module>"],
+        "MUMDIA_T_TRAIT_DEFAULT": ["src/x.rs::Source::provided"],
         "MUMDIA_T_TRAIT_IMPL": ["src/x.rs::Wrapper::default"],
+        "MUMDIA_T_UNSAFE_IMPL": ["src/x.rs::Shared::open"],
     }
     # Test code is not the engine, and a child-process `.env` is a set.
     assert sets == {"MUMDIA_T_CHILD": (["src/x.rs::child"], [('"1"', ("src/x.rs::child",))])}

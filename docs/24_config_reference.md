@@ -733,8 +733,9 @@ is unset. Two workers can disagree, in which case every distinct fallback is
 listed with the file it is in.
 
 `Read at` and `Site` name the file and the enclosing function as
-`path::function`: `Type::method` for a Rust method, nested Rust functions
-joined with `::`, `Class.method` in Python, `<module>` outside any
+`path::function`: `Type::method` for a Rust method, `Trait::method` for a
+default trait method, inline modules and nested Rust functions joined with
+`::`, `Class.method` in Python, `<module>` outside any
 function. No line number is cited, so the tables change only when a read
 moves to another function.
 

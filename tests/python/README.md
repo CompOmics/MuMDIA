@@ -174,8 +174,10 @@ the crates for environment reads. The generator cites each read as `path::functi
 rather than `path:line`, because a cited line made `docs/24_config_reference.md` and
 `configs/config-schema.json` stale on every merge that moved lines in a large file. On
 synthetic Rust and Python sources it asserts the citation (`Type::method`,
-`outer::inner`, `Class.method`, `<module>`, a `fn` inside a string opening no scope, a
-`#[cfg(test)]` read left out) and that inserting blank lines changes no site. On the
+`Trait::method`, `module::function`, `outer::inner`, `Class.method`, `<module>`, a
+`fn` inside a string opening no scope, a `#[cfg(test)]` read left out) and that
+inserting blank lines changes no site. A Rust file whose braces do not balance after
+its literals and comments are masked is rejected with an error naming the file. On the
 committed inputs it asserts that the reference and the schema are unchanged with blank
 lines inserted into every file, and that neither carries a line number.
 
