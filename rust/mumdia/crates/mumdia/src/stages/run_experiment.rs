@@ -840,11 +840,27 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
             .num_threads(front_threads)
             .build()
             .context("building the thread pool for the overlapped runs")?;
+        // Set when run 1's RT adaptation fails: the fronts of runs 2..N then stop before
+        // their next convert or seed instead of doing N-1 full passes for a run that is
+        // going to report the adaptation's error anyway. The reverse direction (a front
+        // failing while the DeepLC worker runs) cannot interrupt the worker; the front's
+        // error is logged at once, and returned after the worker exits.
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let cancelled = || {
+            anyhow::anyhow!(
+                "run-experiment: not converting and seeding the remaining runs because the \
+                 first run's retention-time adaptation failed"
+            )
+        };
         let (adapted, fronts) = std::thread::scope(|scope| {
             let fronts = scope.spawn(|| {
-                pool.install(|| {
+                let r = pool.install(|| {
                     (1..n_runs)
                         .map(|i| {
+                            use std::sync::atomic::Ordering;
+                            if cancel.load(Ordering::SeqCst) {
+                                return Err(cancelled());
+                            }
                             let out = d(&names[i]);
                             info!(run = %names[i], i = i + 1, n = n_runs, "run-experiment: convert and seed, overlapped");
                             let co = convert_run(
@@ -854,11 +870,25 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
                                 p.top_peaks_ms2,
                                 p.max_spectra,
                             )?;
+                            if cancel.load(Ordering::SeqCst) {
+                                return Err(cancelled());
+                            }
                             let seed = seed_run(cfg, &ch, &co, &lib_p_base, &lib_f, &out)?;
                             Ok((co, seed))
                         })
                         .collect::<Result<Vec<_>>>()
-                })
+                });
+                if let Err(e) = &r {
+                    if !cancel.load(std::sync::atomic::Ordering::SeqCst) {
+                        tracing::error!(
+                            error = %format!("{e:#}"),
+                            "run-experiment: an overlapped run's convert or seed failed; the \
+                             first run's retention-time adaptation is still running and the \
+                             experiment stops when it returns"
+                        );
+                    }
+                }
+                r
             });
             let adapted = adapt_rt_library(
                 cfg,
@@ -870,6 +900,9 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
                 irt_placeholder,
                 adapt_threads,
             );
+            if adapted.is_err() {
+                cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
             let fronts = fronts
                 .join()
                 .unwrap_or_else(|_| Err(anyhow::anyhow!("the overlapped runs' thread panicked")));
