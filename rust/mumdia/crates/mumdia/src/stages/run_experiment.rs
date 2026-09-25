@@ -174,27 +174,7 @@ fn process_run(
     max_spectra: usize,
     shared_rt_lib: Option<&str>,
 ) -> Result<(String, String, Option<String>)> {
-    let d = |name: &str| format!("{out}/{name}");
-    std::fs::create_dir_all(out).ok();
-    // Fold the conversion caps into the convert artifacts' provenance key, exactly as
-    // both the standalone `convert` subcommand and single-run `run` do. The caps change
-    // the spectra output but are not part of the config, so the bare config hash made
-    // two experiments with different caps record identical convert provenance.
-    let convert_hash = mumdia_io::hash::blake3_str(&format!(
-        "{}\u{1f}max_spectra={}\u{1f}top_peaks_ms2={}\u{1f}top_peaks_ms1={}",
-        cfg.canonical_json(),
-        max_spectra,
-        top_peaks_ms2,
-        0
-    ));
-    let co = convert::run(convert::ConvertParams {
-        mzml,
-        out_dir: &d("spectra"),
-        max_spectra,
-        top_peaks_ms2,
-        top_peaks_ms1: 0,
-        config_hash: &convert_hash,
-    })?;
+    let co = convert_run(cfg, mzml, out, top_peaks_ms2, max_spectra)?;
     let has_deeplc = cfg.predict_frag.deeplc_python.is_some();
     let mh_heads = cfg
         .rt_im_train
@@ -224,12 +204,69 @@ fn process_run(
             Some(format!("{out}/groups")),
         ));
     }
-    let seed = d("seed_psms.parquet");
+    let seed = seed_run(cfg, ch, lib_p_base, lib_f, &co, out, None)?;
+    chain_after_seed(
+        cfg,
+        ch,
+        lib_p_base,
+        lib_f,
+        library_input,
+        &co,
+        out,
+        &seed,
+        shared_rt_lib,
+    )
+}
+
+/// Convert one run's mzML into `<out>/spectra`.
+fn convert_run(
+    cfg: &Config,
+    mzml: &str,
+    out: &str,
+    top_peaks_ms2: usize,
+    max_spectra: usize,
+) -> Result<convert::ConvertOutputs> {
+    let d = |name: &str| format!("{out}/{name}");
+    std::fs::create_dir_all(out).ok();
+    // Fold the conversion caps into the convert artifacts' provenance key, exactly as
+    // both the standalone `convert` subcommand and single-run `run` do. The caps change
+    // the spectra output but are not part of the config, so the bare config hash made
+    // two experiments with different caps record identical convert provenance.
+    let convert_hash = mumdia_io::hash::blake3_str(&format!(
+        "{}\u{1f}max_spectra={}\u{1f}top_peaks_ms2={}\u{1f}top_peaks_ms1={}",
+        cfg.canonical_json(),
+        max_spectra,
+        top_peaks_ms2,
+        0
+    ));
+    convert::run(convert::ConvertParams {
+        mzml,
+        out_dir: &d("spectra"),
+        max_spectra,
+        top_peaks_ms2,
+        top_peaks_ms1: 0,
+        config_hash: &convert_hash,
+    })
+}
+
+/// Seed one ungrouped run against the base library into `<out>/seed_psms.parquet`, with
+/// the experiment's shared seed library when one is lent. Returns the seed path.
+fn seed_run(
+    cfg: &Config,
+    ch: &str,
+    lib_p_base: &str,
+    lib_f: &str,
+    co: &convert::ConvertOutputs,
+    out: &str,
+    library: Option<&search_seed::SeedLibrary>,
+) -> Result<String> {
+    let seed = format!("{out}/seed_psms.parquet");
     search_seed::run(search_seed::SearchSeedParams {
         fragment_offset: None,
         // One reader at a time, as in the ungrouped `run`.
         ms2_scans: None,
         emit_calibrants: false,
+        library,
         ms2: &co.ms2,
         library_precursors: lib_p_base,
         library_fragments: lib_f,
@@ -238,6 +275,29 @@ fn process_run(
         bucket_size: cfg.extract.bucket_size,
         config_hash: ch,
     })?;
+    Ok(seed)
+}
+
+/// Everything of an ungrouped run's chain after its seed: the optional RT-library
+/// adaptation, rt-im-train, extract, features and compete. Returns
+/// `(competed, chromatograms, adapted_library_if_produced)`.
+#[allow(clippy::too_many_arguments)]
+fn chain_after_seed(
+    cfg: &Config,
+    ch: &str,
+    lib_p_base: &str,
+    lib_f: &str,
+    library_input: bool,
+    co: &convert::ConvertOutputs,
+    out: &str,
+    seed: &str,
+    shared_rt_lib: Option<&str>,
+) -> Result<(String, String, Option<String>)> {
+    let d = |name: &str| format!("{out}/{name}");
+    let has_deeplc = cfg.predict_frag.deeplc_python.is_some();
+    let mh_heads = cfg
+        .rt_im_train
+        .multihead_heads(has_deeplc, cfg.deeplc_rt_source(library_input, has_deeplc));
     // DeepLC fine-tune. Under `RtLibraryScope::FirstRunOnly` the caller hands every run
     // after the first the library the first run produced, so the fine-tune -- the most
     // expensive step in the whole experiment -- is paid once. Run-to-run chromatographic
@@ -265,7 +325,7 @@ fn process_run(
             python,
             &script,
             lib_p_base,
-            &seed,
+            seed,
             &lib_p_mh,
             mh_heads,
             cfg.rt_im_train.q_train,
@@ -289,7 +349,7 @@ fn process_run(
             python,
             &script,
             lib_p_base,
-            &seed,
+            seed,
             &lib_p_ft,
             cfg.rt_im_train.finetune_epochs,
             cfg.rt_im_train.finetune_patience,
@@ -308,7 +368,7 @@ fn process_run(
     let windows = d("run_windows.parquet");
     rt_im_train::run(rt_im_train::RtImTrainParams {
         anchor_irt_from_seed: false,
-        seed_psms: &seed,
+        seed_psms: seed,
         library_precursors: &lib_p,
         out_windows: &windows,
         out_cal: &d("cal.json"),
@@ -337,7 +397,7 @@ fn process_run(
     features::run(features::FeaturesParams {
         psms: &psms,
         chromatograms: &chrom,
-        seed: Some(&seed),
+        seed: Some(seed),
         out: &feats,
         out_pin: &d("run.pin"),
         cfg: &cfg.features,
@@ -700,6 +760,107 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
             RtLibraryScope::FirstRunOnly
         )
         && n_runs > 1;
+    // Ungrouped runs seed against ONE library: every run's seed searches the base library
+    // at the seed tolerance, so the library and its fragment index are the same arrays for
+    // every run, and each seed used to load and build them again. So the chain runs in
+    // three phases: every run is converted first (the conversion is the memory-heavy step
+    // of its own and needs no library), then the seed library is loaded once and every run
+    // seeded against it, then the library is dropped and each run's chain continues from
+    // its seed. The outputs are the ones the per-run chain wrote: every stage is
+    // deterministic and reads only its own run's inputs, so only the order in which the
+    // stages of different runs execute changes. A grouped run seeds band by band against
+    // band libraries and keeps its own chain.
+    let library_input = p.lib_precursors.is_some();
+    let prepared: Vec<Option<(convert::ConvertOutputs, String)>> = if cfg.groups.window_groups > 1 {
+        (0..n_runs).map(|_| None).collect()
+    } else {
+        let mut conv: Vec<convert::ConvertOutputs> = Vec::with_capacity(n_runs);
+        let all: Vec<usize> = (0..n_runs).collect();
+        for chunk in all.chunks(par) {
+            let done: Vec<convert::ConvertOutputs> = crate::colread::first_err(
+                chunk
+                    .par_iter()
+                    .map(|&i| {
+                        info!(run = %names[i], i = i + 1, n = n_runs, "run-experiment: convert");
+                        convert_run(
+                            cfg,
+                            &p.mzmls[i],
+                            &d(&names[i]),
+                            p.top_peaks_ms2,
+                            p.max_spectra,
+                        )
+                    })
+                    .collect(),
+            )?;
+            conv.extend(done);
+        }
+        let t_lib = Instant::now();
+        let seed_lib = search_seed::SeedLibrary::load(
+            &lib_p_base,
+            &lib_f,
+            None,
+            &cfg.search_seed,
+            cfg.extract.bucket_size,
+        )?;
+        info!(
+            candidates = seed_lib.n_candidates(),
+            runs = n_runs,
+            elapsed_ms = t_lib.elapsed().as_millis() as u64,
+            "run-experiment: one seed library and fragment index for every run's seed"
+        );
+        let mut seeds: Vec<String> = Vec::with_capacity(n_runs);
+        for chunk in all.chunks(par) {
+            let done: Vec<String> = crate::colread::first_err(
+                chunk
+                    .par_iter()
+                    .map(|&i| {
+                        info!(run = %names[i], i = i + 1, n = n_runs, "run-experiment: seed");
+                        seed_run(
+                            cfg,
+                            &ch,
+                            &lib_p_base,
+                            &lib_f,
+                            &conv[i],
+                            &d(&names[i]),
+                            Some(&seed_lib),
+                        )
+                    })
+                    .collect(),
+            )?;
+            seeds.extend(done);
+        }
+        drop(seed_lib);
+        conv.into_iter().zip(seeds).map(Some).collect()
+    };
+    // One run's chain: from its seed when phases 1-2 ran, else (grouped) whole.
+    let run_one = |i: usize, shared: Option<&str>| -> Result<(String, String, Option<String>)> {
+        match &prepared[i] {
+            Some((co, seed)) => chain_after_seed(
+                cfg,
+                &ch,
+                &lib_p_base,
+                &lib_f,
+                library_input,
+                co,
+                &d(&names[i]),
+                seed,
+                shared,
+            ),
+            None => process_run(
+                cfg,
+                &ch,
+                &lib_p_base,
+                &lib_f,
+                library_input,
+                &p.mzmls[i],
+                &d(&names[i]),
+                p.top_peaks_ms2,
+                p.max_spectra,
+                shared,
+            ),
+        }
+    };
+
     let mut shared_ft: Option<String> = None;
     let mut first: usize = 0;
     if share_ft {
@@ -708,18 +869,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
             n = n_runs,
             "run-experiment: adapting the library's retention times on the first run only;              the remaining runs reuse that library and fit their own RT calibration on it              (experiment.rt_library_scope = per_run to adapt for every run instead)"
         );
-        let (comp, chrom, ft) = process_run(
-            cfg,
-            &ch,
-            &lib_p_base,
-            &lib_f,
-            p.lib_precursors.is_some(),
-            &p.mzmls[0],
-            &d(&names[0]),
-            p.top_peaks_ms2,
-            p.max_spectra,
-            None,
-        )?;
+        let (comp, chrom, ft) = run_one(0, None)?;
         competed.push(comp);
         chroms.push(chrom);
         match ft {
@@ -741,18 +891,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
     if par == 1 {
         for &i in &rest {
             info!(run = %names[i], i = i + 1, n = n_runs, "run-experiment: per-run chain");
-            let (comp, chrom, _) = process_run(
-                cfg,
-                &ch,
-                &lib_p_base,
-                &lib_f,
-                p.lib_precursors.is_some(),
-                &p.mzmls[i],
-                &d(&names[i]),
-                p.top_peaks_ms2,
-                p.max_spectra,
-                shared_ft.as_deref(),
-            )?;
+            let (comp, chrom, _) = run_one(i, shared_ft.as_deref())?;
             competed.push(comp);
             chroms.push(chrom);
         }
@@ -767,18 +906,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
                 .par_iter()
                 .map(|&i| {
                     info!(run = %names[i], i = i + 1, n = n_runs, "run-experiment: per-run chain");
-                    process_run(
-                        cfg,
-                        &ch,
-                        &lib_p_base,
-                        &lib_f,
-                        p.lib_precursors.is_some(),
-                        &p.mzmls[i],
-                        &d(&names[i]),
-                        p.top_peaks_ms2,
-                        p.max_spectra,
-                        shared_ft.as_deref(),
-                    )
+                    run_one(i, shared_ft.as_deref())
                 })
                 .collect::<Result<Vec<_>>>()?;
             for (comp, chrom, _) in done {

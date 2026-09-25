@@ -328,6 +328,7 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
                 // mass calibration once over the whole run rather than average the
                 // bands' fitted scalars (see `crate::masscal`).
                 emit_calibrants: true,
+                library: None,
             })?;
             let rec = vec![record_artifact(
                 &format!("{}[g{:02}]", artifact::SEED_PSMS.0, b.index),

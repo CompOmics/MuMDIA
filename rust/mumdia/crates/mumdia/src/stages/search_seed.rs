@@ -75,6 +75,92 @@ pub struct SearchSeedParams<'a> {
     /// An ungrouped run already fits on every deviation it has, writes no sidecar, and
     /// selects exactly the rows it always did.
     pub emit_calibrants: bool,
+    /// The library and index, already loaded ([`SeedLibrary::load`]) by a caller that
+    /// seeds several runs against the same library (`run-experiment`), instead of each
+    /// seed loading them again. It must be the one these params would load: same
+    /// precursor and fragment tables, fragment offset, matcher and fragment tolerance;
+    /// anything else is refused rather than searched. `None` loads it here.
+    pub library: Option<&'a SeedLibrary>,
+}
+
+/// A seed's library and fragment index, loaded once and lent to every seed that searches
+/// the same library at the same configuration.
+///
+/// `run-experiment` seeds every run against one base library at one tolerance, and each
+/// seed used to load the library and build the index again: identical arrays, rebuilt per
+/// run. The lent copy is read-only; the seed never writes through it.
+pub struct SeedLibrary {
+    lib: Library,
+    fidx: Option<FragIndex>,
+    /// What it was built from, checked against every seed it is lent to.
+    key: SeedLibraryKey,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct SeedLibraryKey {
+    precursors: String,
+    fragments: String,
+    fragment_offset: Option<u32>,
+    fragindex: bool,
+    tol_bits: u64,
+    bucket_size: usize,
+}
+
+impl SeedLibrary {
+    /// Load the library a seed with these settings searches, and its index. On the
+    /// fragindex matcher this is the m/z-only library and index: the seed reads neither
+    /// predicted intensities nor fragment names (the hyperscore is a match count plus
+    /// observed intensity, and the mass recalibration walks `frag_mz`), so the two payload
+    /// columns are never decoded and neither the library nor the index holds them, 12
+    /// bytes per fragment at the build peak ([`Library::load_mz_only`],
+    /// [`FragIndex::build_mz_only`]). Their schema is still checked here; their values by
+    /// extract, which loads the full payload. The bucketed matcher keeps the full load,
+    /// because `page_search` serves `idx_int` out of arrays built from the intensities.
+    pub fn load(
+        precursors: &str,
+        fragments: &str,
+        fragment_offset: Option<u32>,
+        cfg: &SearchSeedConfig,
+        bucket_size: usize,
+    ) -> Result<SeedLibrary> {
+        let fragindex = matches!(cfg.matcher, MatcherKind::Fragindex);
+        let key = SeedLibraryKey {
+            precursors: precursors.to_string(),
+            fragments: fragments.to_string(),
+            fragment_offset,
+            fragindex,
+            tol_bits: cfg.fragment_tol_ppm.to_bits(),
+            bucket_size,
+        };
+        if fragindex {
+            let lib = Library::load_mz_only(precursors, fragments, fragment_offset)?;
+            let fidx = FragIndex::build_mz_only(&lib, cfg.fragment_tol_ppm);
+            return Ok(SeedLibrary {
+                lib,
+                fidx: Some(fidx),
+                key,
+            });
+        }
+        let lib = match fragment_offset {
+            None => Library::load_with(precursors, fragments, bucket_size, true)?,
+            Some(offset) => Library::load_with_fragment_offset(
+                precursors,
+                fragments,
+                offset,
+                bucket_size,
+                true,
+            )?,
+        };
+        Ok(SeedLibrary {
+            lib,
+            fidx: None,
+            key,
+        })
+    }
+
+    pub fn n_candidates(&self) -> usize {
+        self.lib.n_candidates()
+    }
 }
 
 #[derive(Clone)]
@@ -107,44 +193,33 @@ pub fn run_returning_scans(p: SearchSeedParams) -> Result<(u64, Option<Vec<Ms2Sc
     )?;
     let fragindex = matches!(p.cfg.matcher, MatcherKind::Fragindex);
     // The library and its fragment index, built once at the seed's fragment tolerance when
-    // the fragindex backend is selected.
-    //
-    // The fragindex seed reads neither the predicted intensity nor the fragment name: the
-    // hyperscore is count + observed intensity, and the mass recalibration below needs only
-    // `frag_mz`. So it loads the m/z-only library and indexes it with the m/z-only index
-    // (`Library::load_mz_only`, `FragIndex::build_mz_only`): the two payload columns are
-    // never decoded, and neither the library nor the index holds them (12 bytes per
-    // fragment at the build peak; this used to load them, index them, and release the
-    // library's copy afterwards). Their schema is still checked here; their values by
-    // extract, which loads the full payload. The bucketed path keeps the full load,
-    // because `page_search` serves `idx_int` out of arrays built from the intensities, and
-    // the bucketed index is dead weight on the fragindex path (see extract).
-    let load_indexed = || -> Result<(Library, Option<FragIndex>)> {
-        if fragindex {
-            let lib = Library::load_mz_only(
-                p.library_precursors,
-                p.library_fragments,
-                p.fragment_offset,
-            )?;
-            let fidx = FragIndex::build_mz_only(&lib, p.cfg.fragment_tol_ppm);
-            return Ok((lib, Some(fidx)));
-        }
-        let lib = match p.fragment_offset {
-            None => Library::load_with(
-                p.library_precursors,
-                p.library_fragments,
-                p.bucket_size,
-                true,
-            )?,
-            Some(offset) => Library::load_with_fragment_offset(
-                p.library_precursors,
-                p.library_fragments,
-                offset,
-                p.bucket_size,
-                true,
-            )?,
+    // the fragindex backend is selected (see `SeedLibrary::load`), unless the caller lent
+    // them.
+    if let Some(shared) = p.library {
+        let want = SeedLibraryKey {
+            precursors: p.library_precursors.to_string(),
+            fragments: p.library_fragments.to_string(),
+            fragment_offset: p.fragment_offset,
+            fragindex,
+            tol_bits: p.cfg.fragment_tol_ppm.to_bits(),
+            bucket_size: p.bucket_size,
         };
-        Ok((lib, None))
+        if shared.key != want {
+            anyhow::bail!(
+                "search-seed: the lent seed library was built for {:?}, not for this seed \
+                 ({want:?}); load the library for these settings instead",
+                shared.key
+            );
+        }
+    }
+    let load_indexed = || -> Result<SeedLibrary> {
+        SeedLibrary::load(
+            p.library_precursors,
+            p.library_fragments,
+            p.fragment_offset,
+            p.cfg,
+            p.bucket_size,
+        )
     };
     // Decoded here unless the caller lent its own copy (see `ms2_scans`). An empty lent
     // slice is not believed over the path: it means the caller had nothing to lend.
@@ -169,14 +244,24 @@ pub fn run_returning_scans(p: SearchSeedParams) -> Result<(u64, Option<Vec<Ms2Sc
     // them in sequence, because its library load builds a full sorted copy of every
     // fragment, and holding the scans through that transient would. The library's error,
     // if any, is still the one reported first.
-    let (loaded, decoded) = if fragindex {
-        rayon::join(load_indexed, decode)
+    let (loaded, decoded) = if p.library.is_some() {
+        (None, decode())
+    } else if fragindex {
+        let (l, d) = rayon::join(load_indexed, decode);
+        (Some(l), d)
     } else {
         let loaded = load_indexed();
         let decoded = if loaded.is_ok() { decode() } else { Ok(None) };
-        (loaded, decoded)
+        (Some(loaded), decoded)
     };
-    let (lib, fidx) = loaded?;
+    let owned_library: Option<SeedLibrary> = loaded.transpose()?;
+    let seed_library: &SeedLibrary = match (p.library, owned_library.as_ref()) {
+        (Some(s), _) => s,
+        (None, Some(s)) => s,
+        (None, None) => unreachable!("the library loaded because nothing was lent"),
+    };
+    let lib: &Library = &seed_library.lib;
+    let fidx: Option<&FragIndex> = seed_library.fidx.as_ref();
     let owned_scans: Option<Vec<Ms2Scan>> = decoded?;
     let scans: &[Ms2Scan] = match (lent, owned_scans.as_deref()) {
         (Some(s), _) => s,
@@ -193,7 +278,7 @@ pub fn run_returning_scans(p: SearchSeedParams) -> Result<(u64, Option<Vec<Ms2Sc
     // groups (each scan belongs to exactly one window, so groups are independent) and
     // is bit-identical to the serial path via a deterministic per-candidate merge; the
     // bucketed path stays serial.
-    let best: HashMap<u32, Best> = if let Some(idx) = fidx.as_ref() {
+    let best: HashMap<u32, Best> = if let Some(idx) = fidx {
         seed_fragindex_windows(idx, scans, p.cfg)
     } else {
         let mut best: HashMap<u32, Best> = HashMap::new();
@@ -447,8 +532,7 @@ pub fn run_returning_scans(p: SearchSeedParams) -> Result<(u64, Option<Vec<Ms2Sc
         elapsed_ms = elapsed,
         "search-seed: done"
     );
-    drop(fidx);
-    drop(lib);
+    drop(owned_library);
     Ok((n, owned_scans))
 }
 

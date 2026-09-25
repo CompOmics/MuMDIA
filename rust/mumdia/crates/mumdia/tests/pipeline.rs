@@ -812,6 +812,7 @@ fn search_seed_from_a_shared_scan_buffer_is_byte_identical_and_read_only() {
             fragment_offset: None,
             ms2_scans: shared,
             emit_calibrants: false,
+            library: None,
             ms2: &ms2,
             library_precursors: &prec,
             library_fragments: &frag,
@@ -857,6 +858,7 @@ fn search_seed_from_a_shared_scan_buffer_is_byte_identical_and_read_only() {
         fragment_offset: None,
         ms2_scans: None,
         emit_calibrants: false,
+        library: None,
         ms2: &ms2,
         library_precursors: &prec,
         library_fragments: &frag,
@@ -898,6 +900,7 @@ fn the_seed_hands_back_its_decode_and_extract_over_it_is_byte_identical() {
             fragment_offset: None,
             ms2_scans: shared,
             emit_calibrants: false,
+            library: None,
             ms2: &ms2,
             library_precursors: &prec,
             library_fragments: &frag,
@@ -961,4 +964,79 @@ fn the_seed_hands_back_its_decode_and_extract_over_it_is_byte_identical() {
         h(&lent.1),
         "chromatograms differ over the lent decode"
     );
+}
+
+/// `run-experiment` loads one seed library and index and lends it to every run's seed
+/// (`search_seed::SeedLibrary`). A seed over the lent library must write the bytes of a
+/// seed that loads its own, on both matchers, for several seeds in a row; and a library
+/// built for other settings must be refused rather than searched.
+#[test]
+fn a_lent_seed_library_gives_the_seed_it_would_have_loaded() {
+    let (prec, frag) = craft_library();
+    let ms2 = craft_ms2_with_decoy(true);
+    let h = |p: &str| mumdia_io::hash::blake3_file(p).unwrap();
+    for matcher in [
+        mumdia_core::config::MatcherKind::Fragindex,
+        mumdia_core::config::MatcherKind::Bucketed,
+    ] {
+        let mut cfg = Config::default();
+        cfg.search_seed.min_matched_peaks = 2;
+        cfg.search_seed.matcher = matcher;
+        let seed = |out: &str, library: Option<&stages::search_seed::SeedLibrary>| {
+            stages::search_seed::run(stages::search_seed::SearchSeedParams {
+                fragment_offset: None,
+                ms2_scans: None,
+                emit_calibrants: false,
+                library,
+                ms2: &ms2,
+                library_precursors: &prec,
+                library_fragments: &frag,
+                out,
+                cfg: &cfg.search_seed,
+                bucket_size: cfg.extract.bucket_size,
+                config_hash: "test",
+            })
+        };
+        let own = tmp(&format!("seed_lend_own_{matcher:?}.parquet"));
+        assert!(
+            seed(&own, None).unwrap() > 0,
+            "the fixture must produce seed rows"
+        );
+        let lib = stages::search_seed::SeedLibrary::load(
+            &prec,
+            &frag,
+            None,
+            &cfg.search_seed,
+            cfg.extract.bucket_size,
+        )
+        .unwrap();
+        for k in 0..3 {
+            let out = tmp(&format!("seed_lend_{matcher:?}_{k}.parquet"));
+            seed(&out, Some(&lib)).unwrap();
+            assert_eq!(
+                h(&own),
+                h(&out),
+                "{matcher:?} seed {k} over the lent library"
+            );
+            assert_eq!(
+                std::fs::read(format!("{own}.masscal.json")).unwrap(),
+                std::fs::read(format!("{out}.masscal.json")).unwrap()
+            );
+        }
+        // Built at another tolerance: refused.
+        let mut other = cfg.clone();
+        other.search_seed.fragment_tol_ppm += 5.0;
+        let wrong = stages::search_seed::SeedLibrary::load(
+            &prec,
+            &frag,
+            None,
+            &other.search_seed,
+            cfg.extract.bucket_size,
+        )
+        .unwrap();
+        let err = seed(&tmp("seed_lend_wrong.parquet"), Some(&wrong))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("lent seed library"), "{err}");
+    }
 }

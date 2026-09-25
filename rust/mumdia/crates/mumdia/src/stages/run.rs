@@ -370,6 +370,7 @@ pub fn run(p: RunParams) -> Result<()> {
             fragment_offset: None,
             ms2_scans: None,
             emit_calibrants: false,
+            library: None,
             ms2: &co.ms2,
             library_precursors: &lib_p,
             library_fragments: &lib_f,
