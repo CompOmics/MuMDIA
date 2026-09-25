@@ -28,7 +28,7 @@ use parquet::file::metadata::{PageIndexPolicy, ParquetMetaData, ParquetMetaDataR
 use parquet::file::properties::WriterProperties;
 use parquet::file::statistics::Statistics;
 use parquet::file::writer::SerializedFileWriter;
-use parquet::schema::types::ColumnPath;
+use parquet::schema::types::{ColumnPath, SchemaDescriptor};
 
 use crate::codec::{codec_pool, ColumnEncoder};
 pub use crate::report::Written;
@@ -999,6 +999,39 @@ pub struct SpliceWriter {
     target: Option<AtomicPath>,
 }
 
+/// Where the parquet schema `src` first departs from `into`, for the splice refusal: the
+/// first leaf column whose name, physical type, annotation or nullability differs, or the
+/// column counts.
+fn schema_difference(src: &SchemaDescriptor, into: &SchemaDescriptor) -> String {
+    for (s, t) in src.columns().iter().zip(into.columns()) {
+        if s.path() != t.path() {
+            return format!("column {} where the table has {}", s.path(), t.path());
+        }
+        if s.physical_type() != t.physical_type() {
+            return format!(
+                "column {} is {:?} here and {:?} in the table",
+                s.path(),
+                s.physical_type(),
+                t.physical_type()
+            );
+        }
+        if s.self_type() != t.self_type() {
+            return format!(
+                "column {} differs in its type annotation or nullability",
+                s.path()
+            );
+        }
+    }
+    if src.num_columns() != into.num_columns() {
+        return format!(
+            "{} columns against the table's {}",
+            src.num_columns(),
+            into.num_columns()
+        );
+    }
+    "the column structure differs".to_string()
+}
+
 /// The parsed footer of a file to splice from, with its page index when it has one.
 fn splice_meta(path: &str) -> Result<(std::fs::File, ParquetMetaData)> {
     let file = std::fs::File::open(path).with_context(|| format!("opening {path}"))?;
@@ -1050,8 +1083,13 @@ impl SpliceWriter {
         let (file, meta) = splice_meta(src)?;
         let w = self.writer.as_mut().expect("writer closed");
         if meta.file_metadata().schema_descr() != w.schema_descr() {
+            let diff = schema_difference(meta.file_metadata().schema_descr(), w.schema_descr());
             return Err(anyhow!(
-                "{src} has a different parquet schema from the table being spliced into;                  the band artifacts must come from the same configuration"
+                "{src} has a different parquet schema from the table being spliced into \
+                 ({diff}); the tables must come from the same configuration and the same \
+                 engine version (features v1 and psms_competed v3 store every feature \
+                 column as f64, features v2 and psms_competed v4 store most as f32), so \
+                 re-run the bands with one binary"
             ));
         }
         let column_indexes = meta.column_index();
@@ -4810,6 +4848,44 @@ mod hash_on_write_tests {
         let empty = p("spliced_empty.parquet");
         let s = SpliceWriter::create_hashed(&empty, &a).unwrap();
         check(&empty, &s.close_hashed().unwrap(), 0);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn splice_refusal_names_the_column_whose_width_differs() {
+        let d = dir("splice_width");
+        let p = |x: &str| d.join(x).to_string_lossy().to_string();
+        let table = |path: &str, wide: bool| {
+            let (dt, x): (DataType, ArrayRef) = if wide {
+                (
+                    DataType::Float64,
+                    Arc::new(Float64Array::from(vec![1.0, 2.0])),
+                )
+            } else {
+                (
+                    DataType::Float32,
+                    Arc::new(Float32Array::from(vec![1.0, 2.0])),
+                )
+            };
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("candidate_id", DataType::UInt32, false),
+                Field::new("f", dt, false),
+            ]));
+            let cid: ArrayRef = Arc::new(UInt32Array::from(vec![0u32, 1]));
+            let b = RecordBatch::try_new(schema.clone(), vec![cid, x]).unwrap();
+            write_batches(path, schema, &[b]).unwrap();
+        };
+        let (old, new) = (p("v3.parquet"), p("v4.parquet"));
+        table(&old, true);
+        table(&new, false);
+        let mut s = SpliceWriter::create(&p("pooled.parquet"), &old).unwrap();
+        s.append_row_groups(&old, |_| true).unwrap();
+        let e = s.append_row_groups(&new, |_| true).unwrap_err().to_string();
+        assert!(
+            e.contains("column \"f\" is FLOAT here and DOUBLE in the table"),
+            "{e}"
+        );
+        assert!(e.contains("same engine version"), "{e}");
         let _ = std::fs::remove_dir_all(&d);
     }
 
