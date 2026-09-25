@@ -26,6 +26,9 @@ with several `--mzml`, which pays the calibration once.
    peptidoform are far apart in an m/z-sorted table, so row-range shards would predict each
    sequence 2.4 times), `predict` fits the same ridge from the same seeds in every shard and
    predicts its slice, `merge` joins the predictions back. 12 shards: 36 min plus 6 min merge.
+   Through the engine the same split is `rt_im_train.deeplc_predict_shards`, which fits once
+   and shards the prediction of `deeplc_finetune.py` itself; that path reads the whole
+   precursor table into memory, so at 1e8 rows the streaming recipe is still the one to use.
 6. **rt-im-train** on the calibrated table. Residual median 81 s -> 29 s on the 9-mers, `w_rt`
    469 s -> 239 s; 8-12-mers 33 s and 286 s from 910 anchors.
 7. **No tag prescan.** Uncapped `prescan.top_peaks` keeps 59.4% of the 9-mer library on wide

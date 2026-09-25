@@ -341,6 +341,7 @@ pub fn run_deeplc_finetune(
     window_holdout_frac: f64,
     rng_seed: u64,
     threads: usize,
+    shards: usize,
 ) -> Result<()> {
     require_deeplc_version(python)?;
     info!(
@@ -354,6 +355,7 @@ pub fn run_deeplc_finetune(
         window_holdout_frac,
         rng_seed,
         threads,
+        shards,
         "sidecar: running DeepLC multitask fine-tune"
     );
     let ep = epochs.to_string();
@@ -369,31 +371,28 @@ pub fn run_deeplc_finetune(
     // (docs/14_build_test_deploy_gotchas.md).
     let rs = rng_seed.to_string();
     let pt = threads.max(1).to_string();
-    run_worker(
-        python,
-        script,
-        &[
-            lib_in,
-            seed,
-            lib_out,
-            "--epochs",
-            &ep,
-            "--patience",
-            &pa,
-            "--q-train",
-            &qt,
-            "--batch",
-            &ba,
-            "--window-holdout-frac",
-            &hf,
-            "--seed",
-            &rs,
-            "--predict-threads",
-            &pt,
-        ],
-        true,
-    )
-    .context("DeepLC fine-tune failed")?;
+    let mut args = vec![
+        lib_in,
+        seed,
+        lib_out,
+        "--epochs",
+        &ep,
+        "--patience",
+        &pa,
+        "--q-train",
+        &qt,
+        "--batch",
+        &ba,
+        "--window-holdout-frac",
+        &hf,
+        "--seed",
+        &rs,
+        "--predict-threads",
+        &pt,
+    ];
+    let sh = shards.to_string();
+    push_shards(&mut args, shards, &sh);
+    run_worker(python, script, &args, true).context("DeepLC fine-tune failed")?;
     warn_on_retained_imported(lib_out);
     Ok(())
 }
@@ -408,6 +407,7 @@ pub fn run_deeplc_finetune(
 /// the same thing. Positional contract:
 /// `deeplc_finetune.py <lib_in> <seed> <lib_out> --multihead <n_heads>`. `threads` sizes
 /// both torch pools, and the worker caps it at the physical cores available to it.
+/// `shards` is `rt_im_train.deeplc_predict_shards`.
 #[allow(clippy::too_many_arguments)]
 pub fn run_deeplc_multihead(
     python: &str,
@@ -419,37 +419,41 @@ pub fn run_deeplc_multihead(
     q_train: f64,
     window_holdout_frac: f64,
     threads: usize,
+    shards: usize,
 ) -> Result<()> {
     require_deeplc_version(python)?;
     info!(
         lib_in,
-        seed, lib_out, n_heads, q_train, "sidecar: calibrating DeepLC over multiple heads"
+        seed,
+        lib_out,
+        n_heads,
+        q_train,
+        threads,
+        shards,
+        "sidecar: calibrating DeepLC over multiple heads"
     );
     let nh = n_heads.to_string();
     let qt = q_train.to_string();
     let hf = window_holdout_frac.to_string();
     let th = threads.max(1).to_string();
-    run_worker(
-        python,
-        script,
-        &[
-            lib_in,
-            seed,
-            lib_out,
-            "--multihead",
-            &nh,
-            "--q-train",
-            &qt,
-            "--window-holdout-frac",
-            &hf,
-            "--threads",
-            &th,
-            "--predict-threads",
-            &th,
-        ],
-        true,
-    )
-    .context("DeepLC multi-head calibration failed")?;
+    let mut args = vec![
+        lib_in,
+        seed,
+        lib_out,
+        "--multihead",
+        &nh,
+        "--q-train",
+        &qt,
+        "--window-holdout-frac",
+        &hf,
+        "--threads",
+        &th,
+        "--predict-threads",
+        &th,
+    ];
+    let sh = shards.to_string();
+    push_shards(&mut args, shards, &sh);
+    run_worker(python, script, &args, true).context("DeepLC multi-head calibration failed")?;
     warn_on_retained_imported(lib_out);
     Ok(())
 }
@@ -469,31 +473,42 @@ pub fn run_deeplc_repredict(
     lib_in: &str,
     lib_out: &str,
     threads: usize,
+    shards: usize,
 ) -> Result<()> {
     require_deeplc_version(python)?;
     info!(
         lib_in,
-        lib_out, threads, "sidecar: re-predicting the library iRT with the DeepLC base model"
+        lib_out,
+        threads,
+        shards,
+        "sidecar: re-predicting the library iRT with the DeepLC base model"
     );
     let th = threads.max(1).to_string();
-    run_worker(
-        python,
-        script,
-        &[
-            lib_in,
-            "-",
-            lib_out,
-            "--no-finetune",
-            "--threads",
-            &th,
-            "--predict-threads",
-            &th,
-        ],
-        true,
-    )
-    .context("DeepLC library re-prediction failed")?;
+    let mut args = vec![
+        lib_in,
+        "-",
+        lib_out,
+        "--no-finetune",
+        "--threads",
+        &th,
+        "--predict-threads",
+        &th,
+    ];
+    let sh = shards.to_string();
+    push_shards(&mut args, shards, &sh);
+    run_worker(python, script, &args, true).context("DeepLC library re-prediction failed")?;
     warn_on_retained_imported(lib_out);
     Ok(())
+}
+
+/// Append `--shards <n>` for a sharded whole-library prediction
+/// (`rt_im_train.deeplc_predict_shards`). One process, the default, passes nothing, so the
+/// default argument list is the one an older `deeplc_finetune.py` accepts.
+fn push_shards<'a>(args: &mut Vec<&'a str>, shards: usize, rendered: &'a str) {
+    if shards != 1 {
+        args.push("--shards");
+        args.push(rendered);
+    }
 }
 
 /// MBR transfer (Stage D3): match-between-runs identification transfer over the
@@ -596,6 +611,27 @@ fn run_worker(python: &str, script: &str, args: &[&str], utf8: bool) -> Result<(
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod shard_arg_tests {
+    use super::push_shards;
+
+    #[test]
+    fn one_shard_adds_nothing_so_an_older_worker_still_parses_the_call() {
+        let mut args = vec!["lib_in", "-", "lib_out"];
+        push_shards(&mut args, 1, "1");
+        assert_eq!(args, ["lib_in", "-", "lib_out"]);
+    }
+
+    #[test]
+    fn several_or_automatic_shards_are_passed_through() {
+        for (n, rendered) in [(4usize, "4"), (0, "0")] {
+            let mut args = vec!["lib_in"];
+            push_shards(&mut args, n, rendered);
+            assert_eq!(args, ["lib_in", "--shards", rendered]);
+        }
+    }
 }
 
 #[cfg(test)]

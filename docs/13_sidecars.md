@@ -62,7 +62,7 @@ the column it keys the readback on.
 |---|---|---|---|
 | ms2pip_worker | `<in.parquet> <out.parquet> <model> <processes>` (`sidecar.rs`, `run_ms2pip`; `processes` is the engine's thread count) | `ms2pip_out.parquet` | `id` |
 | deeplc_worker | `<in.parquet> <out.parquet> [threads]` (`sidecar.rs`, `run_deeplc`; `threads` is the engine's thread count, capped by the worker, see **DeepLC thread cap**) | `deeplc_out.parquet` | `id` |
-| deeplc_finetune | `<lib_in> <seed> <lib_out> --epochs --patience --q-train --batch --window-holdout-frac --seed --predict-threads` (`sidecar.rs`, `run_deeplc_finetune`) | `<lib_out>` (= `fragment_library_precursors_ft.parquet`) | `peptidoform` (new table with replaced `predicted_irt`; input unchanged) |
+| deeplc_finetune | `<lib_in> <seed> <lib_out> --epochs --patience --q-train --batch --window-holdout-frac --seed --predict-threads [--shards K]` (`sidecar.rs`, `run_deeplc_finetune`; `--shards` only when `rt_im_train.deeplc_predict_shards` is not 1, for all three modes) | `<lib_out>` (= `fragment_library_precursors_ft.parquet`) | `peptidoform` (new table with replaced `predicted_irt`; input unchanged) |
 | mokapot_worker / nn_rescore_worker | `<rescore.pin> <out.parquet>` + env `MUMDIA_NN_FOLDS/ITERS/TRAIN_FDR` (`rescore.rs:781-792`) | `rescore_sidecar_out.parquet` | `candidate_id` (echoes the flat row index) |
 | entrapment_worker | `<in.parquet> <out.parquet> <folds>` (`rescore.rs:718-724`) | `entrapment_out.parquet` | `row_id` |
 | mbr_worker | `<scored> <psms_csv> <out> --q-anchor --min-anchor-runs --q-transfer --seed [--out-scored] [--frag-csv --consensus-corr-min]` (`sidecar.rs:193-211`) | `<out>.parquet` | `candidate_id` |
@@ -356,6 +356,23 @@ under `KMP_DUPLICATE_LIB_OK=TRUE`, and without pinning `OMP/MKL/OPENBLAS` to 1
 thread and bounding torch's pool, the two full thread pools oversubscribe the CPU
 during the backward pass (`deeplc_finetune.py:6-28, 82-91`). `--device cuda`
 sidesteps this entirely by moving compute off the CPU pools.
+
+**Sharded prediction** (`rt_im_train.deeplc_predict_shards`, `--shards K`). The
+whole-library prediction of `deeplc_finetune.py` can run in `K` child processes of the
+same script (`--shard-worker <spec.json>`, internal). The parent fits once (the
+calibration is pickled, a fine-tuned model saved whole with `torch.save`), writes each
+child a slice of the unique sequences that starts at a multiple of the prediction call
+(`--predict-chunk`, 100,000; a test knob), and joins the float64 predictions in slice
+order before its single rewrite. `K` and the threads per child follow from the request
+and the prediction thread budget only (`shard_plan`: `budget / K` each; `K = 0` is one
+child per 8 threads; never more children than threads or whole calls; one process on a
+GPU). A child that exits non-zero stops the others and fails the stage with no library
+written; the scratch directory beside `<lib_out>` is removed either way. At equal threads
+per process the result is bit-identical to one process
+(`tests/python/test_deeplc_predict.py`, base model and multi-head); at the same engine
+thread count it is float-equivalent, because each child predicts on fewer threads (see
+the thread cap below for what that does). Each child holds its own model copy
+(0.3-0.5 GB).
 
 **DeepLC thread cap.** Every DeepLC call site asks for the engine's rayon thread count
 (the fine-tune's training pool keeps its own bound), and both workers cap what they

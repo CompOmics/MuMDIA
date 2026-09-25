@@ -591,7 +591,13 @@ sections 10-16:
   `MUMDIA_DEEPLC_THREAD_CAP=N` overrides it and `0` disables it; the resolved numbers are
   under `torch_threads` in `<lib_out>.summary.json`. Measured on doxy (64 cores, 128
   CPUs): the multi-head step took 10:41 at 96 threads and 18:09 at 128. The cap is a
-  ceiling, so below it nothing changes.
+  ceiling, so below it nothing changes; where it binds the output is float-equivalent,
+  like any change of `--threads` (docs/13, "DeepLC thread cap").
+- `rt_im_train.deeplc_predict_shards` (default 1) splits that whole-library prediction
+  across processes of `budget / K` threads, with the calibration or fine-tuned model
+  fitted once in the parent and no refit per shard. Bit-identical to one process at
+  equal threads per process, float-equivalent at the same `--threads`; unmeasured
+  through the engine, so it stays opt-in until two acquisitions say otherwise.
 - Any parquet written outside `mumdia-io` and read by the engine must be
   snappy-compressed with arrow `utf8` string columns. Polars defaults to zstd
   and `large_utf8`, and the engine rejects both ("Disabled feature at compile

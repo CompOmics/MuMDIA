@@ -271,6 +271,7 @@ fn process_run(
             cfg.rt_im_train.q_train,
             cfg.rt_im_train.window_holdout_frac,
             rayon::current_num_threads(),
+            cfg.rt_im_train.deeplc_predict_shards,
         )?;
         produced_rt_lib = Some(lib_p_mh.clone());
         lib_p_mh
@@ -300,6 +301,7 @@ fn process_run(
             cfg.rt_im_train.window_holdout_frac,
             cfg.rng_seed,
             rayon::current_num_threads(),
+            cfg.rt_im_train.deeplc_predict_shards,
         )?;
         produced_rt_lib = Some(lib_p_ft.clone());
         lib_p_ft
@@ -626,6 +628,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
             &lib_p_base,
             &out,
             rayon::current_num_threads(),
+            cfg.rt_im_train.deeplc_predict_shards,
         )?;
         out
     } else {

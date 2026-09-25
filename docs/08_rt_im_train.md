@@ -696,6 +696,23 @@ not been rerun against a once-fine-tuned library. Until it is, treat the choice 
 open: per-run fine-tuning is the benchmarked default, once-per-library is the
 cheaper option with equal RT residuals on the one run measured here.
 
+The whole-library prediction after the fit (the fine-tune, the multi-head calibration or
+none) can be split across processes with `rt_im_train.deeplc_predict_shards`. It is bound
+by featurisation, which is single-threaded Python (docs/32: about 6,000 sequences per
+second per process), so beyond a few threads only more processes make it faster. The
+worker fits once and writes the fitted calibration (pickled) or the fine-tuned model
+(`torch.save` of the module) into a scratch directory beside `<lib_out>`; each child
+(`deeplc_finetune.py --shard-worker <spec>`) reads it, loads the model once, predicts
+its contiguous slice of the unique sequences in the same 100,000-sequence calls one
+process would make, and saves its float64 predictions; the parent joins them in slice
+order and runs the one rewrite. No shard refits, because a refit from last-bit
+differences in the reference predictions could select another head at rank 80. `K` and
+the threads per child are a function of the thread budget and the library size only
+(`shard_plan`), a child that exits non-zero stops the others and fails the stage, and
+the scratch directory is removed either way. `<lib_out>.summary.json` records the plan
+under `shards` (requested, used, threads per shard, and per shard its rows, threads,
+model load and prediction time). With the default of one process nothing changes.
+
 ## Key types and functions
 
 | name | file:line | what it does |
@@ -747,6 +764,7 @@ though the enum variant still exists.
 | `adaptive_rt_bins` | `12` | Number of equal-width calibrated-RT bins for the adaptive window (rt_im_train.rs:202). |
 | `rt_window_min_s` | `1.0` | Lower clamp (seconds) for any adaptive half-window (rt_im_train.rs:210); mirrors the 1s floor on the global window. |
 | `library_irt` | `auto` | Library-input mode only. `auto` re-predicts the imported `predicted_irt` with the DeepLC base model when `predict_frag.deeplc_python` is set and keeps it, with a warning, when not; `deeplc` requires the interpreter (preflight); `library` keeps the imported values. Ignored under `finetune_deeplc` and in FASTA mode. Section 4c has the measurement. |
+| `deeplc_predict_shards` | `1` | Worker processes for the whole-library DeepLC prediction (multi-head calibration, base-model re-prediction, the prediction after a fine-tune; `deeplc_finetune.py --shards`). The fit happens once, in the first process, and is handed to the others; each predicts a slice of the unique sequences cut at a multiple of the 100,000-sequence call, and the slices are joined in order. `K` processes share the thread budget, `budget / K` threads each; `0` is one process per 8 threads, and a GPU always gets one. Bit-identical to one process at equal threads per process, float-equivalent at the same engine thread count. Off by default until measured on two acquisitions; the arithmetic for HYE is 10:41 to 2.5-4.5 min. |
 | `window_holdout_frac` | `0.0` | Size `w_rt` from held-out anchor residuals instead of in-sample ones (section 4b). `base_peptide_id % 1000 < round(frac*1000)` selects the holdout; the same rule excludes those peptides from the orchestrated DeepLC fine-tune. Range `[0.0, 0.9]`, `0.0` = off; mutually exclusive with `adaptive_rt_window`. Benchmark-gated. |
 
 ## Invariants, determinism, gotchas
