@@ -303,7 +303,12 @@ decoded by one reader each, in parallel and one batch ahead of the placement
 (`colread::for_each_zipped`, `rayon::join` only, so it cannot deadlock on a small
 pool). Measured on the AIF library at 16 threads: 990 ms to 350-440 ms for the
 one-row-group file pyarrow wrote, and to 175 ms for the same library in 1M-row groups
-with an offset index.
+with an offset index. Every load logs `library: loaded` with its candidate and fragment
+counts, the precursor-table and fragment-table phases (`precursor_ms`, `fragment_ms`) and
+the total (`elapsed_ms`); every index build logs `fragindex: built` with its posting, bin
+and chunk counts, whether it holds the payload, the tolerance and `elapsed_ms`. A stage's
+own "loaded" line brackets the library load, the spectra decode and the index build
+together, so these lines are what splits that interval.
 
 The library is structure-of-arrays, indexed by local candidate id: one column per
 precursor field (`peptidoform_id`, `base_peptide_id`, `charge`, `predicted_irt`,

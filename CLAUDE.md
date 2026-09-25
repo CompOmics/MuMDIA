@@ -589,9 +589,10 @@ sections 10-16:
   and `large_utf8`, and the engine rejects both ("Disabled feature at compile
   time: zstd", "column 'peptidoform' is not utf8").
 - A library must carry `candidate_id` as the contiguous row-aligned range
-  `0..ncand` (`index.rs:112-125`) and precursors ascending by `precursor_mz`
-  (`index.rs:215-231`). Both are hard errors. Fragments are grouped by a
-  counting sort, so they need valid ids but not a sorted order.
+  `0..ncand` (`index.rs:215-245`) and precursors ascending by `precursor_mz`
+  (`index.rs:1264-1275`). Both are hard errors. Fragments are grouped by a
+  counting sort, so they need valid ids but not a sorted order; a table whose
+  ids ascend (what every library writer produces) takes the parallel fill.
 - The `nn_torch` worker selects its backend at `MUMDIA_NN_STREAM_GB`
   (default 4). A feature matrix marginally over the threshold silently falls to
   the much slower disk-backed streaming memmap; a 4.31 GB matrix against the
