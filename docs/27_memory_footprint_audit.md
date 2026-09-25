@@ -93,7 +93,7 @@ State of the plan in section 3:
 | 3.1 streaming typed readers | shipped `503eadb` | part of 231.0 -> 86.6 GiB |
 | 3.2 extract incremental write | shipped `503eadb` | trace residency 61.8 GiB -> 0.074 GiB in flight |
 | 3.3 f32 bulk arrays | shipped `503eadb` | library 26 -> 22 B per fragment row; rescore matrix halved |
-| 3.4 features chunked | shipped | features stage 86.6 -> 3.03 GiB |
+| 3.4 features chunked | shipped | features stage 86.6 -> 3.03 GiB (one loader; see 3.4 for `features.chrom_loaders`) |
 | 3.10 extract window-closing flush | shipped | extract stage 61.33 -> 28.13 GiB |
 | 3.10 incremental merge + `windows_in_flight` cap | shipped 2026-09-05 | extract stage 28.13 -> 16.57 GiB (12.31 at 8 in flight) |
 | 3.5 rescore flat f32 matrix | half shipped `503eadb` | matrix is flat f32; the binary sidecar handoff and the early drop are not done |
@@ -413,6 +413,17 @@ identical. Wall time 7:15 against 5:05; the extra pass is the difference.
 chunk against one candidate per chunk, comparing every f64 column bit for bit
 plus the PIN bytes.
 
+The 3.03 GiB (and the 3.11 GiB of the complete run in section 0) were measured
+with one chromatogram loader, which holds two decoded chunks: the one being
+computed and the next. Since the perf survey's F1, `features.chrom_loaders`
+(default 3) decodes on several loaders and holds up to `chrom_loaders + 1`
+chunks, so at the HYE shape the expected peak is about 1.8 GiB higher (two more
+chunks of about 0.92 GiB of traces), roughly 4.9 GiB. On the HYE-shaped
+synthetic fixture (400,000 PSMs, 7 chunks) the peak working set went from 1.83
+to 3.23 GiB. That default has not been measured on a real HYE run.
+`features.chrom_loaders: 1` restores the measured 3.03 GiB, and a pass never
+runs more loaders than `--threads` allows.
+
 ### 3.5 rescore: flat f32 matrix and a binary sidecar handoff
 
 - Build `feats` as one row-major `Vec<f32>` of `N D` values, not
@@ -572,5 +583,6 @@ carries the measured numbers and the state of each plan item. Sections 3.1-3.3 a
 3.6-3.9 shipped in `503eadb`, 3.4 and 3.10 in the commits that added those sections, and
 3.5 is half done. Stage peaks on the benchmark are now extract 16.57 GiB (default) or 12.31
 (8 windows in flight), rescore 8.95 GiB by default (parquet handoff, docs/28 section 11) or
-5.5 GiB with the opt-in recipe, and features 3.03 GiB. A single HYE run fits the 32 GB target
+5.5 GiB with the opt-in recipe, and features 3.03 GiB at one chromatogram loader (about
+4.9 GiB expected at the default three, section 3.4). A single HYE run fits the 32 GB target
 machine. The measurement to take is a full `mumdia run` on the current build.

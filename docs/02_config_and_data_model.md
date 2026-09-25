@@ -790,6 +790,7 @@ requiring entrapment/target-decoy FDR validation before use.
 | `bound_from_confident` | `true` | learn one global peak width from confident seed PSMs |
 | `bound_confident_pct` | 50.0 | percentile of confident half-widths as the shared width |
 | `ms1_precursor_features` | `false` | **default-off** MS1 apex-isotope feature `ms1_isotope_height_corr`; it overlaps the existing `ms1_isotope_cosine_apex`, so it is opt-in. The name stays in the battery either way and returns 0.0 when off, so the vector length does not change |
+| `chrom_loaders` | 3 | chromatogram decode threads in the main feature pass, capped by `--threads` and by the chunk count. Changes time and memory only, never a value or a byte of the features table. The pass holds up to `chrom_loaders + 1` decoded chunks (about 0.92 GiB of traces each at the HYE shape, docs/27 section 3.4); `1` restores the previous single loader and its two resident chunks |
 
 ### `CompeteConfig` (config.rs:825-851)
 
