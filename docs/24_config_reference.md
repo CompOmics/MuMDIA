@@ -850,8 +850,8 @@ Every field whose struct has an `impl Default` resolved from the source.
 
 4 environment read(s) whose name is not a literal:
 
-- `rust/mumdia/crates/mumdia/src/stages/extract.rs:2784: env read via closure of `&mut self``
-- `rust/mumdia/crates/mumdia/src/stages/extract.rs:2939: env read via closure of `&mut self``
+- `rust/mumdia/crates/mumdia/src/stages/extract.rs:2789: env read via closure of `&mut self``
+- `rust/mumdia/crates/mumdia/src/stages/extract.rs:2944: env read via closure of `&mut self``
 - `rust/mumdia/crates/mumdia/src/stages/extract.rs:593: env read via closure of `runs[r].span_mut(m)``
 - `rust/mumdia/crates/mumdia/src/stages/extract.rs:605: env read via closure of `chunk.slices_mut()``
 
