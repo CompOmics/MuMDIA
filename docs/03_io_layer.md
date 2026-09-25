@@ -260,6 +260,20 @@ writer's caller holds. The parallel path is therefore used from plain threads
 thread, rescore's handoff and psms_scored writers); a band or a run that already
 runs on the global pool is parallel at that level.
 
+The pool is shared by every plain-thread writer and decoder of the process, and
+it counts the callers waiting on it (`codec::claim`). When as many callers wait
+as the pool has threads, the next caller encodes or decodes on its own thread
+instead of queueing behind them, which writes the same bytes. Under
+`groups.parallel` every band in flight has its own chromatogram writer thread,
+and features and compete writers can run beside them. Without the count, more
+than eight such writers would share eight codec threads where each used to have
+a core of its own, and a band's candidate loop would wait on its writer's
+channel. With it, encode capacity never falls below one thread per concurrent
+writer (`a_saturated_pool_sends_the_next_caller_to_its_own_thread`,
+`concurrent_writers_beyond_the_pool_size_write_the_serial_writers_file`). The
+timings below are for one writer at a time; a banded run with
+`groups.parallel >= 8` has not been timed against the serial codec.
+
 Measured on the AIF artifacts re-chunked to 65,536-row batches under the shipped
 properties (`bench_parallel_encode_a_real_artifact`, median of 3 rounds, every
 arm byte-identical): features 0.45 s serial, 0.26 s on 2 threads, 0.19 s on 4,

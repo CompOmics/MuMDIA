@@ -2236,7 +2236,7 @@ enum Decoder {
     Single(parquet::arrow::arrow_reader::ParquetRecordBatchReader),
     Groups {
         readers: Vec<parquet::arrow::arrow_reader::ParquetRecordBatchReader>,
-        pool: Option<Arc<rayon::ThreadPool>>,
+        pool: Option<Arc<crate::codec::CodecPool>>,
         done: bool,
     },
 }
@@ -2276,14 +2276,12 @@ impl Iterator for BatchReader {
         }
         use rayon::prelude::*;
         // Every group reader has the same row groups, selection and batch size, so each
-        // yields the same rows per batch; only the columns differ. From inside a rayon pool
-        // the groups are decoded in turn on this thread (see `crate::codec`).
+        // yields the same rows per batch; only the columns differ. From inside a rayon pool,
+        // or while the codec pool is saturated, the groups are decoded in turn on this
+        // thread (`crate::codec::claim`).
         type Part = Option<std::result::Result<RecordBatch, arrow::error::ArrowError>>;
-        let parts: Vec<Part> = match pool
-            .as_deref()
-            .filter(|_| rayon::current_thread_index().is_none())
-        {
-            Some(p) => p.install(|| readers.par_iter_mut().map(|r| r.next()).collect()),
+        let parts: Vec<Part> = match crate::codec::claim(pool) {
+            Some(turn) => turn.install(|| readers.par_iter_mut().map(|r| r.next()).collect()),
             None => readers.iter_mut().map(|r| r.next()).collect(),
         };
         if parts.iter().all(|p| p.is_none()) {
@@ -5670,14 +5668,7 @@ mod writer_bench {
         let plan = cap.map(|c| EncodingPlan::of(&table.schema, &chunks, plan_sample_rows(c)));
         let props = || writer_props(&table.schema, cap, plan.as_ref(), &[]);
         let write = |threads: usize| -> (Vec<u8>, f64) {
-            let pool = (threads > 1).then(|| {
-                Arc::new(
-                    rayon::ThreadPoolBuilder::new()
-                        .num_threads(threads)
-                        .build()
-                        .unwrap(),
-                )
-            });
+            let pool = (threads > 1).then(|| crate::codec::CodecPool::new(threads).unwrap());
             let t = Instant::now();
             let mut out = Vec::with_capacity(1 << 28);
             let mut w =

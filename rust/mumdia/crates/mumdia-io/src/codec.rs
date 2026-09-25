@@ -31,6 +31,14 @@
 //! OS threads only: the main thread, extract's chromatogram writer thread, the features
 //! writer thread. A band or run already running on the global pool is parallel at that
 //! level. The codec pool's jobs never wait on anything but their own column.
+//!
+//! The pool is shared by every plain-thread writer and decoder of the process, so it counts
+//! the callers inside it. When as many callers are waiting on it as it has threads, the
+//! next caller encodes (or decodes) on its own thread instead of queueing behind them
+//! ([`claim`]). Without that, more than eight concurrent writers (one extract chromatogram
+//! writer per band in flight under `groups.parallel`, plus features and compete writers)
+//! would share eight codec threads where they used to have one core each, and a band's
+//! candidate loop would stall on its writer's channel. Both paths write the same bytes.
 
 use std::io::Write;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -56,7 +64,68 @@ pub const DEFAULT_CODEC_THREADS: usize = 8;
 /// Set by the CLI from `--threads` before any artifact is written; 0 means unset.
 static REQUESTED: AtomicUsize = AtomicUsize::new(0);
 
-static POOL: OnceLock<Option<Arc<rayon::ThreadPool>>> = OnceLock::new();
+static POOL: OnceLock<Option<Arc<CodecPool>>> = OnceLock::new();
+
+/// A rayon pool for column jobs, with a count of the plain-thread callers inside it.
+pub(crate) struct CodecPool {
+    pool: rayon::ThreadPool,
+    /// Callers currently in [`Claim::install`], each a plain thread waiting on its own jobs.
+    callers: AtomicUsize,
+}
+
+impl CodecPool {
+    /// A codec pool of `threads` threads named `mumdia-codec-{i}`.
+    pub(crate) fn new(threads: usize) -> Result<Arc<CodecPool>> {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .thread_name(|i| format!("mumdia-codec-{i}"))
+            .build()
+            .map_err(|e| anyhow!("building the parquet codec pool: {e}"))?;
+        Ok(Arc::new(CodecPool {
+            pool,
+            callers: AtomicUsize::new(0),
+        }))
+    }
+
+    /// Threads of the pool.
+    pub(crate) fn threads(&self) -> usize {
+        self.pool.current_num_threads()
+    }
+}
+
+/// One caller's turn on a [`CodecPool`]; releases its place when dropped.
+pub(crate) struct Claim<'a>(&'a CodecPool);
+
+impl Claim<'_> {
+    /// Run `op` on the pool and wait for it.
+    pub(crate) fn install<R: Send>(&self, op: impl FnOnce() -> R + Send) -> R {
+        self.0.pool.install(op)
+    }
+}
+
+impl Drop for Claim<'_> {
+    fn drop(&mut self) {
+        self.0.callers.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// A turn on `pool` for the calling thread, or `None` when the caller should do the work on
+/// its own thread: always from inside any rayon pool (module docs), and when as many callers
+/// already wait on the pool as it has threads, so that concurrent writers beyond the pool's
+/// size keep one core each instead of queueing (module docs).
+pub(crate) fn claim(pool: &Option<Arc<CodecPool>>) -> Option<Claim<'_>> {
+    let pool = pool.as_deref()?;
+    if rayon::current_thread_index().is_some() {
+        return None;
+    }
+    let limit = pool.threads();
+    pool.callers
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+            (n < limit).then_some(n + 1)
+        })
+        .ok()?;
+    Some(Claim(pool))
+}
 
 /// Size the codec pool from `--threads`: at most `threads` codec threads, and none (the
 /// serial path) at `--threads 1`. Call it before the first artifact is written; the pool is
@@ -86,32 +155,21 @@ pub fn codec_threads() -> usize {
 }
 
 /// The process-wide codec pool, or `None` when the codec runs serially.
-pub(crate) fn codec_pool() -> Option<Arc<rayon::ThreadPool>> {
+pub(crate) fn codec_pool() -> Option<Arc<CodecPool>> {
     POOL.get_or_init(|| {
         let n = codec_threads();
         if n <= 1 {
             return None;
         }
-        match rayon::ThreadPoolBuilder::new()
-            .num_threads(n)
-            .thread_name(|i| format!("mumdia-codec-{i}"))
-            .build()
-        {
-            Ok(p) => Some(Arc::new(p)),
+        match CodecPool::new(n) {
+            Ok(p) => Some(p),
             Err(e) => {
-                tracing::warn!(error = %e, "parquet codec pool unavailable; encoding serially");
+                tracing::warn!(error = %format!("{e:#}"), "parquet codec pool unavailable; encoding serially");
                 None
             }
         }
     })
     .clone()
-}
-
-/// The pool a writer may encode on from the calling thread: none from inside any rayon pool
-/// (module docs).
-fn usable(pool: &Option<Arc<rayon::ThreadPool>>) -> Option<&rayon::ThreadPool> {
-    pool.as_deref()
-        .filter(|_| rayon::current_thread_index().is_none())
 }
 
 /// One row group being encoded: the column writers of each root field, in schema order.
@@ -134,17 +192,18 @@ pub(crate) struct ColumnEncoder<W: Write + Send> {
     leaves_per_root: Vec<usize>,
     max_rows: Option<usize>,
     in_progress: Option<RowGroup>,
-    pool: Option<Arc<rayon::ThreadPool>>,
+    pool: Option<Arc<CodecPool>>,
 }
 
 impl<W: Write + Send> ColumnEncoder<W> {
     /// An encoder on `sink` for `schema` under `props`, with the columns of a row group
-    /// encoded on `pool` (serially when `None`).
+    /// encoded on `pool` (serially when `None`, from inside a rayon pool, or while the pool
+    /// is saturated: [`claim`]).
     pub(crate) fn try_new(
         sink: W,
         schema: SchemaRef,
         props: WriterProperties,
-        pool: Option<Arc<rayon::ThreadPool>>,
+        pool: Option<Arc<CodecPool>>,
     ) -> Result<ColumnEncoder<W>> {
         if props.max_row_group_bytes().is_some() || props.content_defined_chunking().is_some() {
             return Err(anyhow!(
@@ -226,11 +285,19 @@ impl<W: Write + Send> ColumnEncoder<W> {
             }
             Ok(())
         };
-        match usable(&self.pool) {
-            Some(pool) if rg.roots.len() > 1 => {
-                pool.install(|| rg.roots.par_iter_mut().enumerate().try_for_each(encode))?
+        {
+            // The turn is released before `flush`, which takes its own.
+            let turn = if rg.roots.len() > 1 {
+                claim(&self.pool)
+            } else {
+                None
+            };
+            match turn {
+                Some(turn) => {
+                    turn.install(|| rg.roots.par_iter_mut().enumerate().try_for_each(encode))?
+                }
+                None => rg.roots.iter_mut().enumerate().try_for_each(encode)?,
             }
-            _ => rg.roots.iter_mut().enumerate().try_for_each(encode)?,
         }
         if self.max_rows.is_some_and(|max| rg.rows >= max) {
             self.flush()?;
@@ -249,14 +316,19 @@ impl<W: Write + Send> ColumnEncoder<W> {
                 .map(|w| w.close().map_err(anyhow::Error::from))
                 .collect()
         };
-        let chunks: Vec<Vec<ArrowColumnChunk>> = match usable(&self.pool) {
-            Some(pool) if rg.roots.len() > 1 => pool.install(|| {
+        let turn = if rg.roots.len() > 1 {
+            claim(&self.pool)
+        } else {
+            None
+        };
+        let chunks: Vec<Vec<ArrowColumnChunk>> = match turn {
+            Some(turn) => turn.install(|| {
                 rg.roots
                     .into_par_iter()
                     .map(close)
                     .collect::<Result<Vec<_>>>()
             })?,
-            _ => rg.roots.into_iter().map(close).collect::<Result<_>>()?,
+            None => rg.roots.into_iter().map(close).collect::<Result<_>>()?,
         };
         let mut out = self.file.next_row_group()?;
         for chunk in chunks.into_iter().flatten() {
@@ -367,7 +439,7 @@ mod tests {
     fn parallel(
         batches: &[RecordBatch],
         props: WriterProperties,
-        pool: Option<Arc<rayon::ThreadPool>>,
+        pool: Option<Arc<CodecPool>>,
     ) -> Vec<u8> {
         let mut out = Vec::new();
         let mut w = ColumnEncoder::try_new(&mut out, batches[0].schema(), props, pool).unwrap();
@@ -384,20 +456,10 @@ mod tests {
     /// serial [`ArrowWriter`]'s file byte for byte, on a pool of any size and without one.
     #[test]
     fn the_parallel_encoder_writes_the_serial_writers_bytes() {
-        let pools: Vec<Option<Arc<rayon::ThreadPool>>> = vec![
+        let pools: Vec<Option<Arc<CodecPool>>> = vec![
             None,
-            Some(Arc::new(
-                rayon::ThreadPoolBuilder::new()
-                    .num_threads(1)
-                    .build()
-                    .unwrap(),
-            )),
-            Some(Arc::new(
-                rayon::ThreadPoolBuilder::new()
-                    .num_threads(4)
-                    .build()
-                    .unwrap(),
-            )),
+            Some(CodecPool::new(1).unwrap()),
+            Some(CodecPool::new(4).unwrap()),
         ];
         // (batch sizes, row-group cap, planned properties)
         let cases: Vec<(Vec<usize>, Option<usize>, bool)> = vec![
@@ -430,7 +492,7 @@ mod tests {
                     got == want,
                     "sizes {sizes:?} cap {cap:?} planned {planned} threads {:?}: {} bytes \
                      against the serial writer's {}",
-                    pool.as_ref().map(|p| p.current_num_threads()),
+                    pool.as_ref().map(|p| p.threads()),
                     got.len(),
                     want.len()
                 );
@@ -459,12 +521,7 @@ mod tests {
 
     #[test]
     fn a_wide_table_on_a_pool_is_the_serial_writers_file() {
-        let pool = Some(Arc::new(
-            rayon::ThreadPoolBuilder::new()
-                .num_threads(6)
-                .build()
-                .unwrap(),
-        ));
+        let pool = Some(CodecPool::new(6).unwrap());
         let mut first = 0usize;
         let batches: Vec<RecordBatch> = [3_001usize, 0, 4_999, 12_000, 1, 7_777]
             .iter()
@@ -503,12 +560,7 @@ mod tests {
     /// and the file is the same.
     #[test]
     fn a_writer_inside_a_rayon_pool_encodes_on_its_own_thread() {
-        let codec = Some(Arc::new(
-            rayon::ThreadPoolBuilder::new()
-                .num_threads(3)
-                .build()
-                .unwrap(),
-        ));
+        let codec = Some(CodecPool::new(3).unwrap());
         let outer = rayon::ThreadPoolBuilder::new()
             .num_threads(1)
             .build()
@@ -520,12 +572,58 @@ mod tests {
                 .build()
         };
         let want = serial(&batches, props());
-        assert!(usable(&codec).is_some(), "a plain thread uses the pool");
+        assert!(claim(&codec).is_some(), "a plain thread uses the pool");
         let got = outer.install(|| {
-            assert!(usable(&codec).is_none(), "a rayon worker does not");
+            assert!(claim(&codec).is_none(), "a rayon worker does not");
             parallel(&batches, props(), codec.clone())
         });
         assert!(got == want);
+    }
+
+    /// A pool gives out as many turns as it has threads and no more, so a caller beyond
+    /// that works on its own thread, and a released turn is available again.
+    #[test]
+    fn a_saturated_pool_sends_the_next_caller_to_its_own_thread() {
+        let codec = Some(CodecPool::new(2).unwrap());
+        let a = claim(&codec).expect("first turn");
+        let b = claim(&codec).expect("second turn");
+        assert!(
+            claim(&codec).is_none(),
+            "a third caller encodes on its own thread"
+        );
+        drop(a);
+        let c = claim(&codec).expect("a released turn is given out again");
+        drop((b, c));
+        assert!(claim(&codec).is_some());
+        assert!(claim(&None).is_none(), "no pool, no turn");
+    }
+
+    /// More concurrent writers than the pool has threads: whichever of them get a turn and
+    /// whichever encode on their own thread, every file is the serial writer's.
+    #[test]
+    fn concurrent_writers_beyond_the_pool_size_write_the_serial_writers_file() {
+        let codec = Some(CodecPool::new(2).unwrap());
+        let batches = vec![wide(0, 6_000), wide(6_000, 3_500)];
+        let props = || {
+            WriterProperties::builder()
+                .set_max_row_group_row_count(Some(2_500))
+                .build()
+        };
+        let want = serial(&batches, props());
+        let files: Vec<Vec<u8>> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..6)
+                .map(|_| s.spawn(|| parallel(&batches, props(), codec.clone())))
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        for got in files {
+            assert!(got == want);
+        }
+        assert_eq!(
+            codec.as_ref().unwrap().callers.load(Ordering::Acquire),
+            0,
+            "every turn was released"
+        );
     }
 
     /// The encoder refuses the row-group splits it does not reproduce rather than writing a

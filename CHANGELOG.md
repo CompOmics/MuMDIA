@@ -165,7 +165,9 @@ than a number. Both are recorded in every run's `manifest.json`.
   which writes the serial writer's file byte for byte. Encoding the AIF features table took
   0.14 s on 8 threads against 0.45 s, the competed table 0.16 against 0.42 s, the
   chromatograms 4.4 against 8.1 s. Writers called from inside a rayon pool keep encoding on
-  their own thread (docs/03 "Parallel column codec").
+  their own thread, and so does a writer that finds as many callers already waiting on the
+  pool as it has threads, so concurrent band writers under `groups.parallel` never have less
+  than a thread each (docs/03 "Parallel column codec").
 - **Multi-column scans decode their columns in parallel.** `TableFile::scan` and
   `TableFile::batches` split the projection into contiguous column groups, one reader each,
   decode the groups of every batch on the codec pool and join them column-wise; the batches
