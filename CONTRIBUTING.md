@@ -43,6 +43,16 @@ python ci/gen_config_reference.py         # docs/24, from config.rs
 python ci/gen_third_party_licenses.py     # THIRD_PARTY_LICENSES.md, from Cargo.lock
 ```
 
+`docs/24` and `configs/config-schema.json` contain no source line numbers. An
+environment read is cited as `path::function` (the file and the enclosing Rust `fn`,
+qualified by its `impl` type, `trait` and inline `mod`, or Python `def`), and a config
+struct by its name, so
+moving code within a file does not make either artifact stale. They change when a
+field, a default, a doc comment, a variable, or the function that reads a variable
+changes. `--check` also regenerates both from copies of every input with blank lines
+inserted and fails if the result differs, which keeps a line dependency from coming
+back; `--self-test` runs that check alone.
+
 CI runs all of the above on Linux, and the build and tests also on macOS and
 Windows. A pull request that fails any of them will not be merged.
 
