@@ -108,7 +108,31 @@ than a number. Both are recorded in every run's `manifest.json`.
   depended on the previous order. `scripts/sort_fragments.py` applies the same rewrite to a
   table written before this change; the engine still loads an unsorted table through a
   filtered scan, with a warning.
+
+### Performance
+
+- **The `nn_torch` worker spends less time outside training, with byte-identical
+  scores.** The parquet load decodes the next row group on a reader thread
+  (`pre_buffer=True`) while up to 8 threads write the current one straight into the
+  matrix, keeping the float64 moment partition and order (1,000,000 x 387: 11.8 s to
+  2.4 s); the init feature scan counts its columns on a thread pool (400,000 x 120:
+  24.9 s to 4.3 s); scoring batches are gathered with `torch.index_select` into one
+  reused buffer (4.7x on the gather); each round's positives come from a certified top
+  window instead of a full stable sort (10M scores: 1.69 s to 0.08 s), and the decoy
+  order of the hybrid cap from one uint64 key sort; the training pool is no longer
+  scored after the last round, whose scores fed only a log line. Every change keeps a
+  switch back to the code it replaced (`docs/13_sidecars.md`), and a test asserts equal
+  score bytes with all of them set back. The worker also prints read, fill, standardise
+  and selection sub-timers, and removes its memmap after a failed run as well.
+
 ### Added
+
+- **Opt-in concurrent fold training for `nn_torch` (`MUMDIA_NN_PARALLEL=K`).** The
+  (seed, fold) tasks train in K spawned processes at a fixed per-process thread count
+  (`MUMDIA_NN_PARALLEL_THREADS`), sharing the matrix through a read-only memmap. The
+  epoch shuffle is then keyed per (seed, fold, iteration, epoch), which changes the scores
+  once, like a seed change; they do not depend on K. Off by default; validate it as a seed
+  change (three seeds, two pools, entrapment) before relying on it.
 
 - **`mumdia pool` pools a grouped run's band artifacts from the command line.** `run` does
   this itself at the end of a grouped search; standalone it is for the case where the

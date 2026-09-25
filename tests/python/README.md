@@ -102,6 +102,19 @@ feature table, and the streaming memmap backend, which must also delete its
 targets outscore decoys (so the scores are aligned to the rows), a single-class
 PIN exits nonzero, and an unknown `MUMDIA_NN_FEATURES` name aborts.
 
+The worker's default-path speed-ups must not move a score: the worker is run with
+every switch back to the replaced code (`MUMDIA_NN_FINAL_POOL_SCORE=1`,
+`MUMDIA_NN_GATHER=numpy`, `MUMDIA_NN_SCAN_THREADS=1`, `MUMDIA_NN_LOAD_THREADS=0`,
+`MUMDIA_NN_SELECT=full`) and with the defaults, and the score bytes must be equal, on
+a pool with several row groups, non-finite cells, a float64 overflow column, nulls,
+ties and a constant column, for the in-memory and the streaming backend.
+`MUMDIA_NN_PARALLEL` must give the same bytes for one and three processes, and neither
+it nor a failing run may leave the memmap or its side arrays behind. Without torch:
+the threaded load reproduces the serial loop's matrix, moments, mean and std bytes;
+the threaded init scan returns the serial (column, sign, count); `desc_order` equals
+the stable descending argsort (ties, +-0.0, infinities, subnormals, signed NaN); and
+the windowed positive selection equals the full `tda_q` selection or declines.
+
 ### `test_mokapot_worker.py` (needs mokapot)
 
 The same complete-coverage contract, and that the out-of-fold branch ran (there
