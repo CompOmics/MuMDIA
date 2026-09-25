@@ -291,6 +291,52 @@ def test_the_arrow_unique_set_and_rewrite_equal_the_per_row_loop(predict_limit):
     assert counts["nonfinite"] > 0 and counts["none"] > 0, "the fixture lost a case"
 
 
+def _assigned_constants(script, names):
+    tree = ast.parse((SCRIPTS / script).read_text(encoding="utf-8"))
+    out = {}
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name) and target.id in names:
+                    out[target.id] = ast.literal_eval(node.value)
+    return out
+
+
+def test_the_recipe_selects_the_sequences_the_worker_predicts(tmp_path):
+    """`mh_shard_predict.py uniq` keeps exactly the worker's unique standard set.
+
+    The recipe copies the worker's residue and modification rules, because `uniq` runs
+    without DeepLC; it used `+` where the worker uses `*`, so a row whose stripped base is
+    empty was predicted by the worker and left on its imported iRT by the recipe.
+    """
+    import subprocess
+
+    h = _arrow_helpers()
+    np, pa = h["np"], h["pa"]
+    import pyarrow.parquet as pq
+
+    worker = _assigned_constants("deeplc_finetune.py", {"STD_FULL_RE", "MOD_RE"})
+    recipe = _assigned_constants("mh_shard_predict.py", {"STD_RE", "MOD_RE"})
+    assert recipe == {"STD_RE": worker["STD_FULL_RE"], "MOD_RE": worker["MOD_RE"]}
+
+    pform = _library_peptidoforms(np.random.default_rng(5))
+    assert "DECOY_" in pform and "" in pform, "the fixture lost the empty-base rows"
+    lib = tmp_path / "lib.parquet"
+    pq.write_table(pa.table({"peptidoform": pa.array(pform, pa.string())}), str(lib),
+                   row_group_size=150)
+    done = subprocess.run([sys.executable, str(SCRIPTS / "mh_shard_predict.py"), "uniq",
+                           str(lib), str(tmp_path / "shard_"), "2"],
+                          capture_output=True, text=True, timeout=300)
+    assert done.returncode == 0, done.stderr
+    got = []
+    for k in range(2):
+        got += pq.read_table(str(tmp_path / "shard_{:02d}.parquet".format(k))).column(
+            "seq").to_pylist()
+    want = h["unique_standard_bases"](h["library_bases"](pa.chunked_array([pform])))
+    assert sorted(got) == sorted(want.to_pylist())
+    assert "" in got
+
+
 def test_only_a_leading_decoy_marker_is_stripped():
     h = _arrow_helpers()
     pa = h["pa"]

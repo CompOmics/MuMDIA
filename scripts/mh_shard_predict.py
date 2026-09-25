@@ -39,7 +39,11 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
-STD_RE = r"^[ACDEFGHIKLMNPQRSTVWY]+$"
+# The worker's rules, copied because `uniq` must run without DeepLC (importing the worker
+# imports it) and pinned to deeplc_finetune.STD_FULL_RE and MOD_RE by
+# tests/python/test_deeplc_predict.py. `*` rather than `+`: the worker predicts a row whose
+# stripped base is empty (a bare "DECOY_"), because `is_std("")` is true.
+STD_RE = r"^[ACDEFGHIKLMNPQRSTVWY]*$"
 MOD_RE = r"\[[^\]]*\]"
 
 
