@@ -392,16 +392,32 @@ different row count is an error, not a short batch.
 Because the batches are identical, this is on by default: `decode_threads: None`
 uses `codec_threads()` groups (at most 8, fewer when the projection has fewer
 root columns or less than 4 MB of compressed data per group,
-`MIN_DECODE_GROUP_BYTES`), and the single reader from inside a rayon pool, for
-the reason the encoder avoids the pool there. `Some(1)` is the single reader;
-`Some(k)` asks for k groups whatever the size, and
+`MIN_DECODE_GROUP_BYTES`; `automatic_decode_groups`). It uses the single reader
+from inside a rayon pool, for the reason the encoder avoids the pool there, and
+for a coalesced scan. A coalesced scan exists to give seek-bound storage one
+forward read per row group. Column groups would each hold their own spans, read
+their own slices of every row group and run their own prefetcher, so the disk
+would again see up to eight interleaved streams. `Some(1)` is the single reader;
+`Some(k)` asks for k groups whatever the size, coalesced or not, and
 `MUMDIA_PARQUET_DECODE_THREADS=k` does the same for every automatic scan of a
 process, which is how a whole run, small artifacts included, is checked end to
 end (the smoke with `MUMDIA_PARQUET_DECODE_THREADS=3` writes every artifact
-byte for byte as without it). Under `coalesce` each group holds its own spans,
-and the resident budget is divided between them.
+byte for byte as without it). Under `coalesce` with explicit groups each group
+holds its own spans, and the resident budget is divided between them.
 `BatchReader::decode_groups` reports what a scan uses. A getter that reads one
 column is unchanged.
+
+Automatic groups stay on for uncoalesced scans, including on spinning storage.
+The plain reader already fetches each page on its own with a seek, from every
+projected column chunk in turn (previous section). Column groups issue the same
+page reads, of the same sizes, from several threads at once, so they change the
+queue depth and not the number of seeks. On the spinning array where the plain
+reader was measured, seven concurrent strided readers reached 47-53 MB/s
+together against 44 MB/s for one, so concurrency did not lower throughput there.
+The groups themselves have not been timed on that array. If a scan on rotational
+storage is slower with them, `MUMDIA_PARQUET_DECODE_THREADS=1` restores the
+single reader for the whole process, and an `iostat` A/B on the server is the
+check.
 
 Measured on the AIF artifacts (`bench_scan_a_real_artifact`, full scans in
 16,384-row batches, median of 5 interleaved rounds on a loaded 32-thread host):
@@ -409,8 +425,9 @@ features 1.18 s with one reader, 0.80 s with 2 groups, 0.65 s with 4, 0.60 s
 with 8, 0.51 s automatic; psms_competed 1.22 / 0.86 / 0.55 / 0.47, 0.45 s
 automatic; chromatograms 5.14 s against 2.99 s with 2 groups and 3.29 s
 automatic (7 groups: the two list columns carry the work); spectra_ms2 0.85
-against 0.44 s. Coalesced reads with automatic groups: 0.43, 0.47, 2.97 and
-0.46 s.
+against 0.44 s. Coalesced reads split into the same automatic group counts,
+which a coalesced scan now uses only when `decode_threads` asks for them: 0.43,
+0.47, 2.97 and 0.46 s.
 
 ### Parquet written outside this crate
 

@@ -172,8 +172,9 @@ than a number. Both are recorded in every run's `manifest.json`.
   `TableFile::batches` split the projection into contiguous column groups, one reader each,
   decode the groups of every batch on the codec pool and join them column-wise; the batches
   are the single reader's exactly. Automatic by default (up to 8 groups, at least 4 MB of
-  data each, the single reader from inside a rayon pool); `ScanOptions::decode_threads`
-  sets it. A full scan of the AIF features table went from 1.18 to 0.51 s, the competed
+  data each, the single reader from inside a rayon pool and for a coalesced scan, which
+  keeps its one forward read per row group); `ScanOptions::decode_threads` sets it, and
+  `MUMDIA_PARQUET_DECODE_THREADS=1` keeps every scan of a process on one reader. A full scan of the AIF features table went from 1.18 to 0.51 s, the competed
   table from 1.22 to 0.45 s, the chromatograms from 5.1 to 3.3 s (docs/03 "Parallel
   decode").
 

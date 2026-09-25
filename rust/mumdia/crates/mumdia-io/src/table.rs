@@ -2328,6 +2328,22 @@ impl Iterator for BatchReader {
 /// projection keeps the single reader.
 pub const MIN_DECODE_GROUP_BYTES: u64 = 4 << 20;
 
+/// Column groups of an automatic scan ([`ScanOptions::decode_threads`] `None`) over
+/// `bytes()` of compressed data: one reader from inside a rayon pool (see `crate::codec`)
+/// and for a coalesced scan, else [`crate::codec::codec_threads`] groups of at least
+/// [`MIN_DECODE_GROUP_BYTES`] each.
+///
+/// A coalesced scan exists to give seek-bound storage one forward read per row group.
+/// Column groups would each hold their own spans, read their own slices of every row group
+/// and run their own prefetcher, so the disk would see up to eight interleaved streams
+/// again; an explicit `decode_threads` still splits.
+fn automatic_decode_groups(coalesced: bool, bytes: impl FnOnce() -> u64) -> usize {
+    if coalesced || rayon::current_thread_index().is_some() {
+        return 1;
+    }
+    crate::codec::codec_threads().min((bytes() / MIN_DECODE_GROUP_BYTES).max(1) as usize)
+}
+
 /// How [`TableFile::scan`] gets the bytes to the decoder. The default is the plain reader
 /// every getter uses: one `File`, pages fetched one at a time.
 #[derive(Clone, Debug, Default)]
@@ -2343,14 +2359,17 @@ pub struct ScanOptions {
     /// column-wise. The batches are the single reader's batches exactly, so this is on by
     /// default: `None` picks [`crate::codec::codec_threads`] groups, fewer when the
     /// projection has fewer root columns or less than [`MIN_DECODE_GROUP_BYTES`] of data
-    /// per group, and the single reader from inside a rayon pool. `Some(1)` is the single
-    /// reader always; `Some(k)` asks for k groups whatever the size.
+    /// per group, and the single reader from inside a rayon pool or under
+    /// [`ScanOptions::coalesce`] (whose point is one forward read per row group, which
+    /// column groups with their own span caches would break up). `Some(1)` is the single
+    /// reader always; `Some(k)` asks for k groups whatever the size, coalesced or not.
     /// `MUMDIA_PARQUET_DECODE_THREADS=k` replaces `None` with `Some(k)` process-wide.
     pub decode_threads: Option<usize>,
 }
 
 impl ScanOptions {
-    /// Coalesced reads ([`ScanOptions::coalesce`]) with the default span budget.
+    /// Coalesced reads ([`ScanOptions::coalesce`]) with the default span budget, decoded
+    /// by one reader unless [`ScanOptions::with_decode_threads`] asks for groups.
     pub fn coalesced() -> ScanOptions {
         ScanOptions {
             coalesce: Some(SpanReadOptions::default()),
@@ -2787,11 +2806,9 @@ impl TableFile {
         });
         let k = match requested {
             Some(k) => k.max(1),
-            None if rayon::current_thread_index().is_some() => 1,
-            None => {
-                let bytes: u64 = spec.root_bytes().iter().map(|&(_, b)| b).sum();
-                crate::codec::codec_threads().min((bytes / MIN_DECODE_GROUP_BYTES).max(1) as usize)
-            }
+            None => automatic_decode_groups(spec.coalesce.is_some(), || {
+                spec.root_bytes().iter().map(|&(_, b)| b).sum()
+            }),
         };
         let groups = if k > 1 {
             spec.column_groups(k)
@@ -3879,6 +3896,25 @@ mod streaming_tests {
                 .decode_groups(),
             1
         );
+        // A coalesced scan splits only when asked to: automatically it keeps one reader
+        // over any amount of data, and so one forward read per row group.
+        assert_eq!(automatic_decode_groups(true, || 1 << 40), 1);
+        assert_eq!(
+            automatic_decode_groups(false, || 1 << 40),
+            crate::codec::codec_threads()
+        );
+        assert_eq!(automatic_decode_groups(false, || 1), 1);
+        assert_eq!(
+            whole
+                .scan(
+                    None,
+                    1_000,
+                    &ScanOptions::coalesced().with_decode_threads(3)
+                )
+                .unwrap()
+                .decode_groups(),
+            3
+        );
         // From inside a rayon pool the groups are decoded in turn, with the same batches,
         // and automatic mode stays on the single reader.
         let pool = rayon::ThreadPoolBuilder::new()
@@ -3906,6 +3942,7 @@ mod streaming_tests {
                     .decode_groups(),
                 1
             );
+            assert_eq!(automatic_decode_groups(false, || 1 << 40), 1);
         });
         std::fs::remove_file(&p).ok();
     }

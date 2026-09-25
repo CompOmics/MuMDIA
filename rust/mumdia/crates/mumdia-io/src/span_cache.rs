@@ -779,7 +779,14 @@ mod tests {
                 "coalesced, one reader",
                 ScanOptions::coalesced().with_decode_threads(1),
             ),
-            ("coalesced, automatic", ScanOptions::coalesced()),
+            (
+                "coalesced, automatic (one reader)",
+                ScanOptions::coalesced(),
+            ),
+            (
+                "coalesced, 4 decode groups",
+                ScanOptions::coalesced().with_decode_threads(4),
+            ),
             (
                 "coalesced, no prefetch, one reader",
                 ScanOptions {
