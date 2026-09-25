@@ -144,7 +144,17 @@ contracts exist:
   logical columns under the same names, written in 250k-row batches with f32
   features (`write_features_parquet`, rescore.rs:833-906); f32 is not a precision
   loss relative to the PIN, which already wrote `{:.6}` and whose values the worker
-  casts to f32 anyway. The worker echoes the SpecId tail
+  casts to f32 anyway. Under the opt-in `rescore.handoff = raw` (NnTorch only) the
+  worker is given `rescore_<tag>.features.raw.json`, a description naming
+  `rescore_<tag>.features.f32.npy` (the features as one row-major little-endian f32
+  matrix, rows x features, `.npy` version 1.0) and `rescore_<tag>.features.meta.parquet`
+  (the seven metadata columns above, as the parquet form writes them), with the feature
+  names, each feature's min and max (NaN left out, as a parquet footer leaves it out)
+  and `row_group_rows`, the parquet form's 131,072-row groups that the worker sums its
+  float64 moments over. The engine writes each decoded batch row-major with no
+  transpose and no parquet encode (`RawHandoff`), and the description last, so its
+  presence says the other two are whole. Scores are byte-identical to the parquet form;
+  docs/13 has the validation. The worker echoes the SpecId tail
   as a `candidate_id` column (here the row index `i`) and emits a `score` column;
   scores are mapped back by row index through `align_sidecar_scores`, which
   requires every input row to be covered exactly once with a finite score and
@@ -815,7 +825,7 @@ unless a knob is set.
 | `entrapment_contaminant_markers` | `[]` | substrings marking genuine contaminants inside the spike-in proteome; matching PSMs stay real targets |
 | `entrapment_ratio` | `1.0` | `N_real_lib / N_entrap_lib`, scales the entrapment FDR estimate |
 | `strict` | `true` | production default: any sidecar failure / misconfiguration is a hard error; false explicitly enables compatibility fallback |
-| `handoff` | `tsv` | how the feature matrix reaches a sidecar (`Handoff`, config.rs:1230): `tsv` writes the Percolator PIN, `parquet` writes an f32 Parquet feature table. `parquet` applies to `nn_torch` only; a mokapot run warns and falls back to `tsv` (rescore.rs:946-954) |
+| `handoff` | `parquet` | how the feature matrix reaches a sidecar (`Handoff`): `tsv` writes the Percolator PIN, `parquet` writes an f32 Parquet feature table, `raw` (opt-in) a row-major f32 `.npy` matrix with a metadata parquet and a `.raw.json` description. `parquet` and `raw` apply to `nn_torch` only; a mokapot run warns and falls back to `tsv` (`sidecar_paths`) |
 
 ## Invariants, determinism, gotchas
 

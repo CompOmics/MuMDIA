@@ -532,6 +532,31 @@ none). `MUMDIA_NN_SEED`, `MUMDIA_NN_THREADS` (set from `--threads`) and
   full read needs (`nn_rescore_worker.py:292-298`). The streaming backend is what
   makes an experiment-wide multi-run rescore tractable: the full matrix never
   lives in RAM.
+  The raw handoff (`rescore.handoff = raw`, opt-in) is read by `read_raw_handoff`:
+  the `.raw.json` description must carry format `mumdia-raw-f32` and version 1 or the
+  worker refuses it, and its `.npy` matrix is memory-mapped and copied into the
+  worker's matrix (`fill_raw_matrix`) group by group, each group of `row_group_rows`
+  rows cut into the same moment sub-blocks the parquet load uses, so the float64 sums,
+  the mean, the std and the scores are the parquet handoff's. The streaming backend
+  takes the matrix in the `MUMDIA_NN_CHUNK`-row chunks that `iter_batches` cuts the
+  parquet into. The constant-column drop reads the description's min/max through
+  float32, as pyarrow hands a float32 footer statistic to Python, so flush-to-zero
+  treats a column of zeros and subnormals as it does there. What it saves is the
+  parquet encode in the engine and the decode and strided column-to-row fill in the
+  worker; the file is 4 bytes a value, about 11% more than the snappy parquet on the
+  immunopeptidomics pool, so it pays where the codec is the limit rather than the
+  disk (a RAM-backed `MUMDIA_SIDECAR_DIR`, an SSD). How much depends on how well the
+  features compress: on a 522,237 x 387 competed table from the page cache of a
+  Windows desktop, the raw matrix was 808 MB against a far smaller parquet, the
+  engine's encode took 0.75-0.78 s against 0.60-0.62 s, and the worker's load 0.5 s
+  against 0.9 s, so measure on the data before switching. Validation:
+  `test_the_raw_handoff_scores_as_the_parquet_handoff` compares score bytes against
+  the parquet handoff for both backends, with and without a feature subset; on that
+  machine a real AIF competed table (41,910 PSMs) and the 522,237-PSM table (four
+  row groups, in-memory and streaming backends) rescored to byte-identical
+  `psms_scored.parquet` either way. Repeat that pair on a new host before relying on
+  it: one pool, same seed and threads, `handoff` `parquet` against `raw`, `cmp` the
+  scored tables.
   `tda_q` (`:77-87`) is the shared q formula `(decoys+1)/max(1,targets)`, running
   min from the tail. Seeds are ensembled by averaging rank-normalised OOF scores
   (`:281-288`).

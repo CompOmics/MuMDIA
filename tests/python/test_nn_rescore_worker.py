@@ -21,6 +21,7 @@ import numpy as np
 import pytest
 
 from conftest import (
+    SCRIPTS,
     assert_complete_finite_coverage,
     importorskip_any,
     read_columns,
@@ -541,6 +542,126 @@ def test_default_path_scores_as_the_reference_worker(torch_available, tmp_path, 
     run_worker_ok(str(reference), pin, ref, env=env)
     run_worker_ok("nn_rescore_worker.py", pin, new, env=env)
     _assert_same_scores(ref, new, n, "the current worker (against %s)" % REFERENCE_COMMIT[:7])
+
+
+# The metadata columns of a handoff (`NON_FEATURE` in the worker).
+_HANDOFF_META = ("SpecId", "Label", "ScanNr", "ExpMass", "CalcMass", "Peptide", "Proteins")
+
+
+def _identity_pool_f32(tmp_path, row_group=1500):
+    """The identity pool with every feature column float32, as the engine writes a parquet
+    handoff (the float64 columns are narrowed here, outside the worker, as the engine's
+    `v as f32` narrows them), in `row_group`-row groups. Returns (path, fold keys, n)."""
+    import pyarrow as pa
+    import pyarrow.compute as pc
+    import pyarrow.parquet as pq
+
+    features, keys, n = _identity_pool(tmp_path, row_group=row_group)
+    tbl = pq.read_table(str(features))
+    cols = {}
+    for name in tbl.column_names:
+        col = tbl.column(name)
+        if name not in _HANDOFF_META and col.type != pa.float32():
+            col = pc.cast(col, pa.float32(), safe=False)
+        cols[name] = col
+    path = tmp_path / "identity_f32.features.parquet"
+    pq.write_table(pa.table(cols), str(path), row_group_size=row_group, compression="snappy")
+    return path, keys, n
+
+
+def _raw_handoff_of(tmp_path, features, version=1):
+    """The raw handoff (`rescore.handoff = raw`) of a float32 parquet handoff, in the layout
+    `HandoffSink::Raw` writes: a C-order `<f4` .npy matrix, the metadata parquet, and the
+    description, whose min/max are the per-feature ranges a parquet footer records."""
+    import json
+
+    import pyarrow.parquet as pq
+
+    tbl = pq.read_table(str(features))
+    feats = [c for c in tbl.column_names if c not in _HANDOFF_META]
+    n = tbl.num_rows
+    mat = np.empty((n, len(feats)), np.float32)
+    for j, c in enumerate(feats):
+        mat[:, j] = tbl.column(c).to_numpy(zero_copy_only=False)
+    stem = "identity"
+    np.save(tmp_path / (stem + ".features.f32.npy"), mat)
+    pq.write_table(tbl.select(list(_HANDOFF_META)), str(tmp_path / (stem + ".features.meta.parquet")))
+    md = pq.ParquetFile(str(features)).metadata
+    names = pq.read_schema(str(features)).names
+    lo, hi = [], []
+    for c in feats:
+        j = names.index(c)
+        mins = [md.row_group(g).column(j).statistics.min for g in range(md.num_row_groups)]
+        maxs = [md.row_group(g).column(j).statistics.max for g in range(md.num_row_groups)]
+        lo.append(float(min(mins)))
+        hi.append(float(max(maxs)))
+    desc = tmp_path / (stem + ".features.raw.json")
+    desc.write_text(json.dumps({
+        "format": "mumdia-raw-f32",
+        "version": version,
+        "rows": n,
+        "features": feats,
+        "features_file": stem + ".features.f32.npy",
+        "metadata_file": stem + ".features.meta.parquet",
+        "row_group_rows": md.row_group(0).num_rows,
+        "min": lo,
+        "max": hi,
+    }), encoding="utf-8")
+    return desc
+
+
+@pytest.mark.parametrize("backend", ["in-memory", "stream"])
+@pytest.mark.parametrize("subset", [False, True])
+def test_the_raw_handoff_scores_as_the_parquet_handoff(torch_available, tmp_path, backend, subset):
+    """The raw handoff must give the parquet handoff's score bytes: the same matrix from a
+    copy instead of a decode, the moments over the same partition, the same constant
+    columns dropped (`f07`), and the same projection under MUMDIA_NN_FEATURES."""
+    features, keys, n = _identity_pool_f32(tmp_path)
+    raw = _raw_handoff_of(tmp_path, features)
+    env = dict(IDENTITY_ENV, MUMDIA_NN_FOLD_KEYS=str(keys),
+               MUMDIA_NN_STREAM="1" if backend == "stream" else "0")
+    if subset:
+        env["MUMDIA_NN_FEATURES"] = "f00,f02,f03,f05,f07,f09,f10,f12"
+    ref = tmp_path / "parquet.parquet"
+    new = tmp_path / "raw.parquet"
+    stdout_ref, _ = run_worker_ok("nn_rescore_worker.py", features, ref, env=env)
+    stdout, _ = run_worker_ok("nn_rescore_worker.py", raw, new, env=env)
+    assert "format=raw" in stdout and "format=parquet" in stdout_ref
+    # The same constant columns: f07, and under flush-to-zero f12, whose zeros and float32
+    # subnormals read from the footer as one value.
+    drop = [ln for ln in stdout.splitlines() if "constant feature column" in ln]
+    drop_ref = [ln for ln in stdout_ref.splitlines() if "constant feature column" in ln]
+    assert drop == drop_ref and drop and "f07" in drop[0], (drop, drop_ref)
+    _assert_same_scores(ref, new, n, "the raw handoff (%s)" % backend)
+
+
+def test_a_raw_handoff_of_another_version_is_refused(tmp_path):
+    """A description the worker does not know must fail loudly, not be read as another
+    layout; the one it does know is read with its matrix mapped. The reader imports no
+    torch, so this runs wherever pandas does."""
+    import importlib.util
+    import json
+
+    pytest.importorskip("pandas")
+    spec = importlib.util.spec_from_file_location(
+        "nn_rescore_worker_mod", SCRIPTS / "nn_rescore_worker.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    features, _keys, n = _identity_pool_f32(tmp_path)
+    raw = _raw_handoff_of(tmp_path, features)
+    info = mod.read_raw_handoff(raw)
+    assert info["matrix"].shape == (n, len(info["features"]))
+    # Without flush-to-zero in this process, f12's subnormal range is not one value.
+    assert mod.raw_constant_columns(info, info["features"]) == ["f07"]
+    desc = json.loads(raw.read_text(encoding="utf-8"))
+    for key, value, message in [("version", 2, "version 2"),
+                                ("format", "something-else", "not a raw rescore handoff"),
+                                ("rows", n + 1, "expected a C-order")]:
+        bad = dict(desc, **{key: value})
+        path = tmp_path / ("bad_%s.raw.json" % key)
+        path.write_text(json.dumps(bad), encoding="utf-8")
+        with pytest.raises((ValueError, RuntimeError), match=message):
+            mod.read_raw_handoff(path)
 
 
 def test_scoring_forward_does_not_depend_on_the_batch_address(torch_available):

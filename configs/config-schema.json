@@ -1930,7 +1930,8 @@
       "source_struct": "RescoreConfig",
       "choices": [
         "tsv",
-        "parquet"
+        "parquet",
+        "raw"
       ]
     },
     {

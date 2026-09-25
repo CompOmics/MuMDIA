@@ -1925,6 +1925,28 @@ pub enum Handoff {
     /// Parquet, so a mokapot run falls back to `Tsv` with a warning instead of failing.
     #[default]
     Parquet,
+    /// Opt-in: the features as one row-major little-endian f32 `.npy` matrix, beside a
+    /// small parquet of the metadata columns and a `<name>.raw.json` description (feature
+    /// names, per-feature min/max, the parquet handoff's row-group size) that the worker is
+    /// given.
+    ///
+    /// The engine streams each decoded batch straight into the file with no transpose and
+    /// no parquet encode, and the worker copies the matrix into its own with no decode and
+    /// no column-to-row transpose: on the 258.75M-row immunopeptidomics pool the parquet
+    /// path spent an estimated 26 min of serial engine CPU encoding and the worker a
+    /// strided fill of every column. The file is the raw size, 4 bytes a value, about 11%
+    /// more than the snappy parquet there, so it pays where the codec, not the disk, is the
+    /// limit (a RAM-backed `MUMDIA_SIDECAR_DIR`, an SSD). Features that compress well make
+    /// the gap much larger: docs/13 has a table where the raw write was the slower one, so
+    /// measure on the data first.
+    ///
+    /// Scores are byte-identical to `Parquet`: the worker fills the same matrix and sums
+    /// the float64 moments over the same partition (the description carries the row-group
+    /// size), and drops the same constant columns. Validate a new host by rescoring one
+    /// pool with each handoff, same seed and threads, and comparing `psms_scored.parquet`
+    /// byte for byte (`tests/python/test_nn_rescore_worker.py` does it on a fixture).
+    /// nn_torch only; a mokapot run falls back to `Tsv` with a warning.
+    Raw,
 }
 
 /// Options for the experiment-wide orchestrator (`mumdia run-experiment`).

@@ -39,6 +39,16 @@ file extension (.parquet / .pq). Parquet avoids serialising the whole feature ma
 measured at 34% of a rescore on a 1.5M-row subset, and worse at full scale where a 30 GB text
 PIN also forced the streaming backend. Column names and semantics are identical either way.
 
+A third form, the raw handoff (`rescore.handoff = raw`, opt-in), is given as a
+`<name>.raw.json` description: the features as one row-major little-endian float32 `.npy`
+matrix (rows x features), the metadata columns (SpecId, Label, ScanNr, ExpMass, CalcMass,
+Peptide, Proteins) in a small parquet beside it, and in the JSON the feature names, the
+per-feature min/max (for the constant-column drop the parquet footer serves otherwise) and
+the row-group size of the equivalent parquet handoff. The matrix is copied into the
+worker's matrix with no parquet decode and no column-to-row transpose, and the float64
+moments are summed over the same partition as the parquet load, so the matrix, mean, std
+and scores are byte-identical to a parquet handoff of the same rows.
+
 Env knobs (all optional):
     MUMDIA_NN_FOLDS       = 3        cross-validation folds
     MUMDIA_NN_ITERS       = 5        semi-supervised self-training iterations
@@ -538,8 +548,17 @@ def _fill_block(arrays, dst, r0, r1):
         if not finite.all():
             src = np.where(finite, src, np.float32(0.0))
         dst[:, j] = src
-    k = r1 - r0
-    nf = dst.shape[1]
+    return _block_moments(dst)
+
+
+def _block_moments(dst):
+    """The float64 column sums and sums of squares of one filled moment sub-block.
+
+    The rows cast to a C-contiguous float64 block of the same shape, summed, squared in
+    place and summed again, in a per-thread buffer reused across calls: the arithmetic of
+    the original loop's sub-block, shared by the parquet and the raw load.
+    """
+    k, nf = dst.shape
     buf = getattr(_TLS, "moments", None)
     if buf is None or buf.shape[1] != nf or buf.shape[0] < k:
         buf = _TLS.moments = np.empty((max(k, _MOMENT_ROWS), nf), np.float64)
@@ -668,6 +687,135 @@ def _fill_parquet_matrix_legacy(pin_path, feat_cols, n, chunk, out):
     del _pf, _tbl, _b
     if off != n:
         raise RuntimeError(f"parquet row mismatch: metadata {n}, features {off}")
+    return s1, s2
+
+
+RAW_HANDOFF_FORMAT = "mumdia-raw-f32"
+RAW_HANDOFF_VERSION = 1
+
+
+def is_raw_handoff(path):
+    """Whether `path` is a raw handoff's description (`<name>.raw.json`)."""
+    return str(path).lower().endswith(".raw.json")
+
+
+def read_raw_handoff(path):
+    """Read and check a raw handoff's description; return it with the matrix memory-mapped.
+
+    Keys: `rows`, `features` (names, in matrix column order), `features_file` and
+    `metadata_file` (resolved against the description's directory), `row_group_rows` (the
+    equivalent parquet handoff's row-group size, which the float64 moments are partitioned
+    by), `min`/`max` (per feature), and `matrix` (read-only memmap, rows x features,
+    little-endian float32). A description of another format or version is refused rather
+    than read: it would be read wrong, not merely slower.
+    """
+    import json
+
+    with open(path, encoding="utf-8") as fh:
+        info = json.load(fh)
+    if info.get("format") != RAW_HANDOFF_FORMAT:
+        raise ValueError("%s is not a raw rescore handoff (format %r, expected %r)"
+                         % (path, info.get("format"), RAW_HANDOFF_FORMAT))
+    if info.get("version") != RAW_HANDOFF_VERSION:
+        raise ValueError("%s is raw handoff version %r; this worker reads version %d"
+                         % (path, info.get("version"), RAW_HANDOFF_VERSION))
+    base = os.path.dirname(os.path.abspath(path))
+    for key in ("features_file", "metadata_file"):
+        info[key] = os.path.join(base, info[key])
+    rows = int(info["rows"])
+    feats = list(info["features"])
+    mm = np.load(info["features_file"], mmap_mode="r")
+    if (mm.ndim != 2 or mm.shape != (rows, len(feats)) or mm.dtype != np.dtype("<f4")
+            or not mm.flags.c_contiguous):
+        raise ValueError(
+            "%s: expected a C-order little-endian float32 matrix of %d x %d, found %s %s"
+            % (info["features_file"], rows, len(feats), mm.dtype.str, mm.shape))
+    meta_rows = int(pq.read_metadata(info["metadata_file"]).num_rows)
+    if meta_rows != rows:
+        raise RuntimeError("raw handoff row mismatch: %d metadata rows, %d feature rows"
+                           % (meta_rows, rows))
+    if int(info["row_group_rows"]) < 1:
+        raise ValueError("%s: row_group_rows must be positive" % path)
+    info["matrix"] = mm
+    return info
+
+
+def raw_constant_columns(info, cols):
+    """`constant_columns` for a raw handoff, from the per-feature min/max the engine
+    recorded while it wrote the matrix (min == max over every row). The engine refuses a
+    non-finite feature before it writes one, so the range is over finite values, as a
+    parquet footer's is.
+
+    Each bound is taken through float32, as pyarrow hands a float32 footer statistic to
+    Python. That conversion is where the worker's flush-to-zero setting acts: a column of
+    zeros and float32 subnormals reads from the footer as min == max == 0 once denormals
+    are treated as zero, and is dropped there, so it has to be dropped here as well."""
+    lo, hi = info.get("min"), info.get("max")
+    if lo is None or hi is None:
+        return []
+    position = {name: j for j, name in enumerate(info["features"])}
+    out = []
+    for c in cols:
+        j = position.get(c)
+        if j is None or lo[j] is None or hi[j] is None:
+            continue
+        if float(np.float32(lo[j])) == float(np.float32(hi[j])):
+            out.append(c)
+    return out
+
+
+def _fill_raw_block(src, col_idx, dst):
+    """Copy rows of the raw matrix (the selected columns) into `dst`; return their moments.
+
+    `_fill_block` for the raw handoff: the values are already float32, a non-finite cell
+    becomes 0.0 as it does there, and the moments are `_block_moments` of the same rows.
+    """
+    if col_idx is None:
+        np.copyto(dst, src)
+    else:
+        np.take(src, col_idx, axis=1, out=dst, mode="clip")
+    finite = np.isfinite(dst)
+    if not finite.all():
+        np.copyto(dst, np.float32(0.0), where=~finite)
+    return _block_moments(dst)
+
+
+def fill_raw_matrix(matrix, col_idx, n, chunk, out, group_rows, threads=1, initializer=None):
+    """Fill `out` (n x nf float32) from a raw handoff's matrix; return (s1, s2).
+
+    The matrix and the float64 column sums `fill_parquet_matrix` produces from the parquet
+    handoff of the same rows: the rows are cut into `group_rows`-row groups, as that file's
+    row groups are, each group into its `moment_blocks`, and the sub-blocks' partial sums
+    are added in order. `col_idx` is the selected columns' positions in the matrix, or
+    None for all of them in order. `threads` fill disjoint sub-blocks of a group at once.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    nf = out.shape[1]
+    s1 = np.zeros(nf, np.float64)
+    s2 = np.zeros(nf, np.float64)
+    pool = (ThreadPoolExecutor(max_workers=int(threads), initializer=initializer)
+            if threads > 1 else None)
+    try:
+        for g0 in range(0, n, group_rows):
+            tf = time.time()
+            rows = min(group_rows, n - g0)
+            spans = [(g0 + a, g0 + b) for a, b in moment_blocks(rows, chunk)]
+            if pool is not None:
+                futs = [pool.submit(_fill_raw_block, matrix[r0:r1], col_idx, out[r0:r1])
+                        for r0, r1 in spans]
+                parts = [fu.result() for fu in futs]
+            else:
+                parts = [_fill_raw_block(matrix[r0:r1], col_idx, out[r0:r1])
+                         for r0, r1 in spans]
+            for p1, p2 in parts:
+                s1 += p1
+                s2 += p2
+            _detail("load: fill + moments", time.time() - tf)
+    finally:
+        if pool is not None:
+            pool.shutdown(wait=True)
+        vars(_TLS).pop("moments", None)
     return s1, s2
 
 
@@ -1844,8 +1992,13 @@ def main():
     SCAN_MEM_BYTES = int(env_f("MUMDIA_NN_SCAN_MEM_GB", 1.0) * 1024 ** 3)
 
     stream_env = os.environ.get("MUMDIA_NN_STREAM", "auto").lower()
+    IS_RAW = is_raw_handoff(pin_path)
+    RAW = read_raw_handoff(pin_path) if IS_RAW else None
     filesize = os.path.getsize(pin_path)
-    if pin_path.lower().endswith((".parquet", ".pq")):
+    if IS_RAW:
+        # The decoded matrix, as for parquet: rows x features x 4 bytes.
+        filesize = int(RAW["rows"]) * max(1, len(RAW["features"])) * 4
+    elif pin_path.lower().endswith((".parquet", ".pq")):
         # Compare DECODED bytes, not compressed-on-disk bytes: a column store is several
         # times smaller than the equivalent text, so the raw file size would understate the
         # memory a full read actually needs.
@@ -1871,7 +2024,7 @@ def main():
         f"nn_rescore_worker: PIN {filesize / 1024 ** 3:.2f} GB, threshold {stream_gb:.2f} GB "
         f"({stream_why}), MUMDIA_NN_STREAM={stream_env} -> "
         f"backend={'stream(memmap)' if stream else 'in-memory'}"
-        f", format={'parquet' if pin_path.lower().endswith(('.parquet', '.pq')) else 'tsv'}",
+        f", format={'raw' if IS_RAW else 'parquet' if pin_path.lower().endswith(('.parquet', '.pq')) else 'tsv'}",
         flush=True,
     )
 
@@ -1888,7 +2041,9 @@ def main():
     _t = time.time()
     # Parquet or the legacy tab-separated PIN, decided by extension.
     IS_PQ = pin_path.lower().endswith((".parquet", ".pq"))
-    if IS_PQ:
+    if IS_RAW:
+        header = list(RAW["features"])
+    elif IS_PQ:
         _sch = pq.read_schema(pin_path)
         header = list(_sch.names)
     else:
@@ -1930,8 +2085,9 @@ def main():
     # assist on Intel cores, ~100x a normal one, which made a desktop rescore 6x slower than
     # the same pool on an EPYC. Dropping them here removes the source without touching the
     # arithmetic of anything else; the parquet footer identifies them, so nothing is read.
-    if IS_PQ and env_i("MUMDIA_NN_DROP_CONSTANT", 1) != 0:
-        _const = constant_columns(pin_path, feat_cols)
+    if (IS_PQ or IS_RAW) and env_i("MUMDIA_NN_DROP_CONSTANT", 1) != 0:
+        _const = (raw_constant_columns(RAW, feat_cols) if IS_RAW
+                  else constant_columns(pin_path, feat_cols))
         if _const and len(_const) < len(feat_cols):
             _drop = set(_const)
             feat_cols = [c for c in feat_cols if c not in _drop]
@@ -1979,9 +2135,18 @@ def main():
     _folds = lambda peptides, off=0: folds_for(peptides, fold_keys, FOLDS, off)
 
     mm_path = None
+    # A raw handoff's metadata columns are the parquet beside its matrix, and the selected
+    # features are positions in that matrix (None = all of them, in order).
+    meta_path = RAW["metadata_file"] if IS_RAW else pin_path
+    raw_idx = None
+    if IS_RAW:
+        _pos = {name: j for j, name in enumerate(RAW["features"])}
+        _idx = [_pos[c] for c in feat_cols]
+        if _idx != list(range(len(RAW["features"]))):
+            raw_idx = np.asarray(_idx, dtype=np.intp)
     if not stream:
         # ---- in-memory backend (median/IQR standardisation) ----
-        if IS_PQ:
+        if IS_PQ or IS_RAW:
             # ---- Parquet in-memory: one float32 matrix, standardised in place ----
             # Metadata columns first; they are small as long as they stay Arrow. The
             # previous `to_pylist()` round trips made a Python string per row out of SpecId
@@ -1989,7 +2154,7 @@ def main():
             # high-water mark for the whole run. Peptide is only needed when there is no
             # fold-key table to fold on.
             _cols = ["SpecId", "Label"] + ([] if fold_keys is not None else ["Peptide"])
-            _tb = pq.read_table(pin_path, columns=_cols)
+            _tb = pq.read_table(meta_path, columns=_cols)
             y = (_tb.column("Label").to_numpy() == 1).astype(np.float32)
             n = len(y)
             cids = _row_ids(_tb.column("SpecId"))
@@ -2005,7 +2170,12 @@ def main():
                 Xs = np.memmap(mm_path, dtype=np.float32, mode="w+", shape=(n, nf))
             else:
                 Xs = np.empty((n, nf), np.float32)
-            if LOAD_THREADS == 0:
+            if IS_RAW:
+                s1, s2 = fill_raw_matrix(
+                    RAW["matrix"], raw_idx, n, CHUNK, Xs, int(RAW["row_group_rows"]),
+                    threads=LOAD_THREADS, initializer=_fp_thread_init,
+                )
+            elif LOAD_THREADS == 0:
                 s1, s2 = _fill_parquet_matrix_legacy(pin_path, feat_cols, n, CHUNK, Xs)
             else:
                 s1, s2 = fill_parquet_matrix(
@@ -2013,6 +2183,9 @@ def main():
                     read_ahead=READ_AHEAD, pre_buffer=PRE_BUFFER,
                     initializer=_fp_thread_init,
                 )
+            if IS_RAW:
+                # Copied into `Xs`: the mapping is not read again.
+                RAW.pop("matrix", None)
             # The decoded Arrow buffers are garbage now; hand them back before training
             # starts, or they stay in RSS for the whole run.
             _release_allocator_slack()
@@ -2023,7 +2196,7 @@ def main():
             _detail("load: standardise", time.time() - _ts)
         else:
             pin = pd.read_csv(pin_path, sep=chr(9))
-        if not IS_PQ:
+        if not (IS_PQ or IS_RAW):
             y = (pin["Label"].to_numpy() == 1).astype(np.float32)
             cids = np.array(
                 [int(s.rsplit("_", 1)[-1]) for s in pin["SpecId"].astype(str)], np.int64
@@ -2056,7 +2229,9 @@ def main():
                 del _mm
     else:
         # ---- streaming memmap backend (mean/std, one text pass) ----
-        if IS_PQ:
+        if IS_RAW:
+            n = int(RAW["rows"])
+        elif IS_PQ:
             n = int(pq.read_metadata(pin_path).num_rows)
         else:
             with open(pin_path, "rb") as fh:
@@ -2076,25 +2251,43 @@ def main():
         off = 0
         def _chunks():
             "Yield fixed-size frames from either backing format."
-            if IS_PQ:
+            if IS_RAW:
+                # The metadata parquet in CHUNK-row batches, as `iter_batches` cuts the
+                # parquet handoff (across its row groups), with the same rows of the matrix:
+                # the float32 values the parquet path takes out of its frame.
+                pf = pq.ParquetFile(meta_path)
+                mat = RAW["matrix"]
+                r0 = 0
+                for batch in pf.iter_batches(batch_size=CHUNK,
+                                             columns=["SpecId", "Label", "Peptide"]):
+                    k = batch.num_rows
+                    block = mat[r0:r0 + k] if raw_idx is None else mat[r0:r0 + k][:, raw_idx]
+                    r0 += k
+                    yield batch.to_pandas(), block
+            elif IS_PQ:
                 pf = pq.ParquetFile(pin_path)
                 cols = ["SpecId", "Label", "Peptide"] + feat_cols
                 for batch in pf.iter_batches(batch_size=CHUNK, columns=cols):
-                    yield batch.to_pandas()
+                    yield batch.to_pandas(), None
             else:
                 for ch in pd.read_csv(pin_path, sep=chr(9),
                                       usecols=lambda c: c in keep, chunksize=CHUNK):
-                    yield ch
+                    yield ch, None
 
-        for chunk in _chunks():
+        for chunk, block in _chunks():
             k = len(chunk)
-            xf = np.nan_to_num(chunk[feat_cols].to_numpy(np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+            if block is None:
+                block = chunk[feat_cols].to_numpy(np.float32)
+            xf = np.nan_to_num(np.asarray(block, dtype=np.float32), nan=0.0, posinf=0.0,
+                               neginf=0.0)
             mm[off:off + k] = xf
             _accumulate_moments(xf, s1, s2)
             y[off:off + k] = (chunk["Label"].to_numpy() == 1).astype(np.float32)
             cids[off:off + k] = [int(s.rsplit("_", 1)[-1]) for s in chunk["SpecId"].astype(str)]
             fold[off:off + k] = _folds(chunk["Peptide"].tolist(), off)
             off += k
+        if IS_RAW:
+            RAW.pop("matrix", None)
         mean = (s1 / n).astype(np.float32)
         std = np.sqrt(np.maximum(s2 / n - (s1 / n) ** 2, 1e-12)).astype(np.float32)
         std[std == 0] = 1.0
