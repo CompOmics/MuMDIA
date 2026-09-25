@@ -1,8 +1,11 @@
 """Sharded, deduplicated multi-head DeepLC calibration of a very large precursor table.
 
   python mh_shard_predict.py uniq    <lib_precursors> <out_prefix> <n_shards>
+  python mh_shard_predict.py fit     <seed_psms.parquet> <calibration.pkl>
+                                     [--holdout F] [--q-train Q] [--threads T] [--heads N]
   python mh_shard_predict.py predict <shard.parquet> <seed_psms.parquet> <out_preds.parquet>
-                                     [--holdout F] [--threads T] [--heads N] [--limit K]
+                                     [--calibration calibration.pkl] [--holdout F]
+                                     [--q-train Q] [--threads T] [--heads N] [--limit K]
   python mh_shard_predict.py merge   <lib_precursors> <out_precursors> <preds.parquet> [...]
 
 Reuses deeplc_finetune.py's reference builder, multi-head fit and calibrated prediction
@@ -11,6 +14,15 @@ call (imported from the script directory, or MUMDIA_SCRIPTS), so the merged tabl
 unique DECOY_-stripped standard sequences are predicted once across all shards. A row-range
 shard of an m/z-sorted table would predict every charge state separately (2.4x the work on
 the 9-mer immunopeptidomics library).
+
+Fit once with `fit` and pass the pickle to every `predict --calibration`: then no shard
+refits, and every shard transforms with the same calibration. Without `--calibration` each
+`predict` still fits its own from the same seeds, which repeats the fit per shard and can
+select another head at rank 80 if the shards predict the reference on different thread
+counts. `--q-train` must match `rt_im_train.q_train` (default 0.01), and `--holdout`
+`rt_im_train.window_holdout_frac`. The engine shards the same prediction itself under
+`rt_im_train.deeplc_predict_shards`; this recipe streams the library by row group, which
+is the reason to keep it for tables of 1e8 rows.
 """
 import argparse
 import json
@@ -32,8 +44,12 @@ MOD_RE = r"\[[^\]]*\]"
 
 
 def _bases(col):
-    """DECOY_-stripped peptidoforms, as deeplc_finetune.base_pf."""
-    return pc.replace_substring(col, "DECOY_", "")
+    """DECOY_-stripped peptidoforms, as deeplc_finetune.base_pf: a leading marker only.
+
+    `pc.replace_substring` stripped every occurrence, so a sequence with an interior
+    "DECOY_" was predicted on a different string than the worker would use.
+    """
+    return pc.replace_substring_regex(col, pattern=r"^DECOY_", replacement="")
 
 
 def uniq(lib, prefix, n):
@@ -62,20 +78,53 @@ def uniq(lib, prefix, n):
           f"{n} shards of <= {per} -> {prefix}NN.parquet in {time.time() - t0:.0f}s", flush=True)
 
 
+def _fit(a, W, model):
+    """The multi-head calibration from the seeds, as `deeplc_finetune.py --multihead` fits it."""
+    args = argparse.Namespace(seed_path=a.seed, q_train=a.q_train, window_holdout_frac=a.holdout,
+                              max_ref=0, multihead=a.heads)
+    ref = W.build_reference(args)
+    return W.fit_multihead(args, ref, model=model), len(ref)
+
+
+def fit(a):
+    import pickle
+
+    import deeplc_finetune as W  # imports deeplc before numpy/torch, as the worker must
+    import torch
+
+    torch.set_num_threads(max(1, a.threads))
+    model = W.load_base_model()
+    cal, anchors = _fit(a, W, model)
+    with open(a.out, "wb") as fh:
+        pickle.dump(cal, fh, protocol=pickle.HIGHEST_PROTOCOL)
+    record = W.multihead_record(cal, a.heads, anchors)
+    with open(a.out + ".json", "w", encoding="utf-8") as fh:
+        json.dump(record, fh, indent=2)
+    print(f"fit: {len(record['heads'] or [])} heads, best head {record['best_head']}, "
+          f"{anchors} anchors -> {a.out}", flush=True)
+
+
 def predict(a):
+    import pickle
+
     import deeplc_finetune as W  # imports deeplc before numpy/torch, as the worker must
     import deeplc
     import torch
 
-    args = argparse.Namespace(seed_path=a.seed, q_train=0.01, window_holdout_frac=a.holdout,
-                              max_ref=0, multihead=a.heads)
-    ref = W.build_reference(args)
-    cal = W.fit_multihead(args, ref)
     torch.set_num_threads(max(1, a.threads))
+    model = W.load_base_model()
+    if a.calibration:
+        with open(a.calibration, "rb") as fh:
+            cal = pickle.load(fh)
+        print(f"calibration from {a.calibration} (fitted once, not refitted here)", flush=True)
+    else:
+        print("no --calibration: fitting from the seeds in this shard; `fit` once and pass "
+              "--calibration to every shard instead", flush=True)
+        cal, _ = _fit(a, W, model)
     seqs = pq.read_table(a.shard).column("seq").to_pylist()
     if a.limit:
         seqs = seqs[: a.limit]
-    ref_t = W.ref_psms_for_transform(cal, args)
+    ref_t = W.ref_psms_for_transform(cal, None)
     out = np.full(len(seqs), np.nan, dtype=np.float32)
     chunk = 100_000
     t0 = time.time()
@@ -84,7 +133,8 @@ def predict(a):
         for s in range(0, len(seqs), chunk):
             t1 = time.time()
             batch = seqs[s:s + chunk]
-            p = W.agg(deeplc.predict_and_calibrate(batch, psm_list_reference=ref_t, calibration=cal))
+            p = W.agg(deeplc.predict_and_calibrate(batch, psm_list_reference=ref_t,
+                                                   calibration=cal, model=model))
             if len(p) != len(batch):
                 raise SystemExit(f"DeepLC returned {len(p)} predictions for {len(batch)} sequences")
             out[s:s + len(batch)] = np.asarray(p, dtype=np.float32)
@@ -109,7 +159,7 @@ def merge(lib, out, preds):
     print(f"merge: {len(idx)} predicted sequences indexed in {time.time() - t0:.0f}s", flush=True)
     pf = pq.ParquetFile(lib)
     w = None
-    rows = re = 0
+    rows = re = missing = 0
     for rg in range(pf.num_row_groups):
         rt = pf.read_row_group(rg)
         bases = _bases(rt.column("peptidoform")).to_numpy(zero_copy_only=False)
@@ -121,13 +171,18 @@ def merge(lib, out, preds):
         fin = np.isfinite(vals)
         new[hit[fin]] = vals[fin]
         re += int(fin.sum())
+        missing += int(len(bases) - len(hit))
         rows += len(bases)
         rt = rt.set_column(rt.schema.get_field_index("predicted_irt"), "predicted_irt", pa.array(new, pa.float32()))
         if w is None:
             w = pq.ParquetWriter(out, rt.schema, compression="snappy")
         w.write_table(rt)
     w.close()
+    # The same fields deeplc_finetune.py writes, so `sidecar::warn_on_retained_imported`
+    # and a reader of either file see one layout: rows whose sequence was never predicted
+    # (non-standard residues) and rows whose prediction was not finite.
     summary = {"rows": rows, "repredicted": re, "retained_imported": rows - re,
+               "retained_non_standard": missing, "retained_no_prediction": rows - re - missing,
                "model": "the base model calibrated over multiple heads (sharded)", "lib_in": lib, "lib_out": out}
     with open(out + ".summary.json", "w", encoding="utf-8") as fh:
         json.dump(summary, fh, indent=2)
@@ -138,13 +193,23 @@ def main():
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="mode", required=True)
     u = sub.add_parser("uniq"); u.add_argument("lib"); u.add_argument("prefix"); u.add_argument("n", type=int)
+    f = sub.add_parser("fit"); f.add_argument("seed"); f.add_argument("out")
     p = sub.add_parser("predict"); p.add_argument("shard"); p.add_argument("seed"); p.add_argument("out")
-    p.add_argument("--holdout", type=float, default=0.0); p.add_argument("--threads", type=int, default=16)
-    p.add_argument("--heads", type=int, default=80); p.add_argument("--limit", type=int, default=0)
+    p.add_argument("--calibration", default="", help="a calibration pickled by `fit`; without it "
+                   "this shard fits its own from the seeds")
+    p.add_argument("--limit", type=int, default=0)
+    for q in (f, p):
+        q.add_argument("--holdout", type=float, default=0.0)
+        q.add_argument("--q-train", dest="q_train", type=float, default=0.01,
+                       help="max spectrum_q of a seed anchor; must match rt_im_train.q_train")
+        q.add_argument("--threads", type=int, default=16)
+        q.add_argument("--heads", type=int, default=80)
     m = sub.add_parser("merge"); m.add_argument("lib"); m.add_argument("out"); m.add_argument("preds", nargs="+")
     a = ap.parse_args()
     if a.mode == "uniq":
         uniq(a.lib, a.prefix, a.n)
+    elif a.mode == "fit":
+        fit(a)
     elif a.mode == "predict":
         predict(a)
     else:

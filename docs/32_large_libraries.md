@@ -24,8 +24,12 @@ with several `--mzml`, which pays the calibration once.
    125.9M-sequence library is 6 hours in one process. `scripts/mh_shard_predict.py uniq`
    writes the unique DECOY_-stripped sequences into N shards (the charge states of one
    peptidoform are far apart in an m/z-sorted table, so row-range shards would predict each
-   sequence 2.4 times), `predict` fits the same ridge from the same seeds in every shard and
-   predicts its slice, `merge` joins the predictions back. 12 shards: 36 min plus 6 min merge.
+   sequence 2.4 times), `fit` fits the ridge once from the seeds and pickles it, `predict
+   --calibration` predicts one slice with that calibration, and `merge` joins the predictions
+   back. 12 shards: 36 min plus 6 min merge, measured when every shard still refitted the same
+   ridge itself (`predict` without `--calibration` still does). Pass `--q-train` and
+   `--holdout` equal to `rt_im_train.q_train` and `window_holdout_frac`; `q_train` used to be
+   fixed at 0.01.
    Through the engine the same split is `rt_im_train.deeplc_predict_shards`, which fits once
    and shards the prediction of `deeplc_finetune.py` itself; that path reads the whole
    precursor table into memory, so at 1e8 rows the streaming recipe is still the one to use.

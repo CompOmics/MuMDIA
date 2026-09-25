@@ -92,7 +92,7 @@ For the mapping from each conda environment to the config field that points at i
 | `scripts/mz_range_survivors.py` | Recipe: candidate ids inside the run's isolation range, as a prescan-style survivors table (docs/32) |
 | `scripts/assemble_survivors.py` | Recipe: survivors table -> renumbered library, target/decoy pair kept together on `peptidoform_id`, fragments streamed (docs/21, docs/32) |
 | `scripts/shard_parquet.py` | Recipe: row-group-aligned parquet split / concatenate |
-| `scripts/mh_shard_predict.py` | Recipe: deduplicated, sharded multi-head DeepLC calibration of a very large precursor table (`uniq` / `predict` / `merge`; reuses `deeplc_finetune.py`) |
+| `scripts/mh_shard_predict.py` | Recipe: deduplicated, sharded multi-head DeepLC calibration of a very large precursor table (`uniq` / `fit` / `predict --calibration` / `merge`; reuses `deeplc_finetune.py`). The engine shards the same prediction itself under `rt_im_train.deeplc_predict_shards`; the recipe streams the library by row group, which matters at 1e8 rows |
 | `rust/mumdia/crates/mumdia/src/sidecar.rs` | Rust clients: `resolve_script`, `run_ms2pip`, `run_peptdeep`, `run_deeplc`, `run_deeplc_finetune`, `run_mbr`, `run_worker`, and the shared `fragment_request` / `read_fragment_intensities` the two intensity predictors both use |
 | `rust/mumdia/crates/mumdia/src/stages/predict_frag.rs` | Call sites for MS2PIP + DeepLC (Stage C) |
 | `rust/mumdia/crates/mumdia/src/stages/run.rs` | Call site for DeepLC fine-tune (between search-seed and rt-im-train) |
