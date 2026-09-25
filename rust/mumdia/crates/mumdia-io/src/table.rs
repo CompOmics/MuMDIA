@@ -1818,6 +1818,20 @@ impl Table {
         Ok(out)
     }
 
+    /// An f64 or f32 column as f64: f64 values as stored, f32 values widened exactly
+    /// (`f64::from`), a null read as NaN either way. For a column whose stored width
+    /// changed between artifact versions, such as the feature columns of
+    /// `features.parquet` v2 and `psms_competed.parquet` v4 (docs/15_data_dictionary.md),
+    /// so one reader serves both. Any other type is the error [`Table::f64`] gives.
+    pub fn f64_widening(&self, name: &str) -> Result<Vec<f64>> {
+        let i = self.idx(name)?;
+        let mut out = Vec::with_capacity(self.nrows);
+        for b in &self.batches {
+            push_f64_widening(&mut out, b.column(i), name)?;
+        }
+        Ok(out)
+    }
+
     pub fn f32(&self, name: &str) -> Result<Vec<f32>> {
         let i = self.idx(name)?;
         let mut out = Vec::with_capacity(self.nrows);
@@ -1928,6 +1942,25 @@ fn push_f64(out: &mut Vec<f64>, col: &ArrayRef, name: &str) -> Result<()> {
     } else {
         for k in 0..a.len() {
             out.push(if a.is_null(k) { f64::NAN } else { a.value(k) });
+        }
+    }
+    Ok(())
+}
+
+/// [`push_f64`], also accepting an f32 column, whose values are widened exactly.
+fn push_f64_widening(out: &mut Vec<f64>, col: &ArrayRef, name: &str) -> Result<()> {
+    let Some(a) = col.as_any().downcast_ref::<Float32Array>() else {
+        return push_f64(out, col, name);
+    };
+    if a.null_count() == 0 {
+        out.extend(a.values().iter().map(|&v| f64::from(v)));
+    } else {
+        for k in 0..a.len() {
+            out.push(if a.is_null(k) {
+                f64::NAN
+            } else {
+                f64::from(a.value(k))
+            });
         }
     }
     Ok(())
@@ -3377,6 +3410,16 @@ impl TableFile {
         Ok(out)
     }
 
+    /// [`Table::f64_widening`] for the streaming reader: an f64 column as stored, an f32
+    /// column widened exactly, a null as NaN.
+    pub fn f64_widening(&self, name: &str) -> Result<Vec<f64>> {
+        let mut out = Vec::with_capacity(self.nrows);
+        for b in self.column(name, SCALAR_BATCH_ROWS)? {
+            push_f64_widening(&mut out, b?.column(0), name)?;
+        }
+        Ok(out)
+    }
+
     pub fn f32(&self, name: &str) -> Result<Vec<f32>> {
         let mut out = Vec::with_capacity(self.nrows);
         for b in self.column(name, SCALAR_BATCH_ROWS)? {
@@ -3649,6 +3692,51 @@ impl TableFile {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `f64_widening` reads an f64 column exactly as `f64` does and an f32 column as its
+    /// values widened by `f64::from`, a null as NaN, through both readers; any other type
+    /// is refused as `f64` refuses it.
+    #[test]
+    fn the_widening_getter_reads_f64_as_stored_and_f32_widened() {
+        let dir = std::env::temp_dir().join(format!("mumdia_widen_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("w.parquet").to_str().unwrap().to_string();
+        let n = SCALAR_BATCH_ROWS + 7;
+        // 0.1 and friends are not representable in f32, so a widened value is visibly the
+        // f32's own value and not the f64 it was narrowed from.
+        let f64s: Vec<f64> = (0..n).map(|i| i as f64 * 0.1 + 1e-9).collect();
+        let f32s: Vec<f32> = f64s.iter().map(|&v| v as f32).collect();
+        let mut w = TableWriter::new(&p).with_row_group_rows(5000);
+        w.write_cols(vec![
+            Col::F64("d".into(), f64s.clone()),
+            Col::F32("s".into(), f32s.clone()),
+            Col::OptF32(
+                "os".into(),
+                (0..n).map(|i| (i % 5 != 0).then_some(f32s[i])).collect(),
+            ),
+            Col::I32("i".into(), vec![1; n]),
+        ])
+        .unwrap();
+        w.close().unwrap();
+        let bits = |v: Vec<f64>| v.iter().map(|x| x.to_bits()).collect::<Vec<u64>>();
+        let widened: Vec<f64> = f32s.iter().map(|&v| f64::from(v)).collect();
+        let opt: Vec<f64> = (0..n)
+            .map(|i| if i % 5 != 0 { widened[i] } else { f64::NAN })
+            .collect();
+        let tf = TableFile::open(&p).unwrap();
+        let t = Table::read(&p).unwrap();
+        assert_eq!(bits(tf.f64_widening("d").unwrap()), bits(f64s.clone()));
+        assert_eq!(bits(t.f64_widening("d").unwrap()), bits(f64s));
+        assert_eq!(bits(tf.f64_widening("s").unwrap()), bits(widened.clone()));
+        assert_eq!(bits(t.f64_widening("s").unwrap()), bits(widened));
+        assert_eq!(bits(tf.f64_widening("os").unwrap()), bits(opt.clone()));
+        assert_eq!(bits(t.f64_widening("os").unwrap()), bits(opt));
+        assert!(tf.f64("s").is_err(), "the strict getter still refuses f32");
+        let e = format!("{:#}", tf.f64_widening("i").unwrap_err());
+        assert!(e.contains("is not f64"), "{e}");
+        assert!(t.f64_widening("i").is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// The row gathers are the whole-column getters indexed at the rows, across row-group
     /// and batch boundaries; a NULL in a required column is refused with its absolute row
