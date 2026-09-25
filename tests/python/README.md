@@ -179,7 +179,10 @@ synthetic Rust and Python sources it asserts the citation (`Type::method`,
 inserting blank lines changes no site. A Rust file whose braces do not balance after
 its literals and comments are masked is rejected with an error naming the file. On the
 committed inputs it asserts that the reference and the schema are unchanged with blank
-lines inserted into every file, and that neither carries a line number.
+lines inserted into every file, and that neither carries a line number. A negative test
+makes the Rust and then the Python citation carry the position of the read and asserts
+that the check reports it, so the invariance check cannot pass because the shifting
+became a no-op.
 
 ## Conventions
 

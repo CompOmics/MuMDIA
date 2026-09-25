@@ -282,9 +282,62 @@ def test_repository_reference_has_no_line_numbers_and_is_blank_line_invariant():
     another one that only moved lines in rescore.rs or config.rs merges first.
     """
     inputs = gen.load_inputs()
+    # The shifted copy really differs in every text; if `transformed` or
+    # `insert_blank_lines` stopped editing one kind of input, the comparison below
+    # would pass without testing it.
+    shifted = inputs.transformed(gen.insert_blank_lines)
+    assert shifted.config_text != inputs.config_text
+    assert inputs.rust_sources and inputs.py_sources
+    for before, after in (
+        (inputs.rust_sources, shifted.rust_sources),
+        (inputs.py_sources, shifted.py_sources),
+    ):
+        assert [rel for rel, _ in after] == [rel for rel, _ in before]
+        assert all(a != b for (_, b), (_, a) in zip(before, after))
     document, _stats = gen.build_document(inputs)
     schema = gen.schema_text(inputs.config_text)
     assert gen.blank_line_problems(inputs, document, schema) == []
     # No `file.rs:123` / `file.py:45` citation, and no line field in the schema.
     assert re.search(r"\.(?:rs|py):\d", document) is None
     assert '"source_line"' not in schema
+
+
+def test_blank_line_check_detects_a_line_dependency(monkeypatch):
+    """The self-check fails when a citation depends on where a read sits.
+
+    The repository test above asserts that the check finds nothing. This one asserts
+    that it can find something: a citation that carries the Rust offset or the
+    Python line of a read must be reported for the reference document. Without it,
+    a no-op in the shifting would make that test, and `--check` in CI, pass
+    whatever the generator emits.
+    """
+    config_text = gen.load_inputs().config_text
+    inputs = gen.Inputs(
+        config_text, [("src/x.rs", RUST_SOURCE)], [("scripts/x.py", PY_SOURCE)]
+    )
+
+    def problems():
+        document, _stats = gen.build_document(inputs)
+        return gen.blank_line_problems(inputs, document, gen.schema_text(config_text))
+
+    assert problems() == []
+
+    rust_scope_at = gen.rust_scope_at
+    python_scope_at = gen.python_scope_at
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            gen,
+            "rust_scope_at",
+            lambda spans, offset: f"{rust_scope_at(spans, offset)}@{offset}",
+        )
+        found = problems()
+        assert found and "the reference document changed" in found[0]
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            gen,
+            "python_scope_at",
+            lambda spans, line: f"{python_scope_at(spans, line)}:{line}",
+        )
+        found = problems()
+        assert found and "the reference document changed" in found[0]
+    assert problems() == []
