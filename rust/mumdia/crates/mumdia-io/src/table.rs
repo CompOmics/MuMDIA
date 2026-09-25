@@ -1135,7 +1135,7 @@ impl SpliceWriter {
 /// same sequence of mini-batches it would see from one big batch, and a divisor of the
 /// writer's default 1,048,576-row row group, so the row-group boundaries are where they
 /// were. 65,536 rows is ~0.5 MB for an f64 column and ~1.5 MB for a string column.
-const WRITE_TABLE_CHUNK_ROWS: usize = 1 << 16;
+pub const WRITE_TABLE_CHUNK_ROWS: usize = 1 << 16;
 
 /// One column of [`write_table`] mid-flight: the source `Vec` turned into an iterator so
 /// each chunk MOVES its rows out of it. A `String` or an inner `Vec<f32>` is handed to the
@@ -1214,6 +1214,75 @@ fn write_table_to(mut w: TableWriter, path: &str, cols: Vec<Col>) -> Result<Tabl
         // A zero-row table still writes its one empty chunk, which fixes the schema, so
         // an empty artifact keeps its columns.
         w.write_cols(chunks.iter_mut().map(|c| c.take(k)).collect())?;
+        written += k;
+        if written >= nrows {
+            break;
+        }
+    }
+    Ok(w)
+}
+
+/// [`write_table`] for a table whose columns are produced chunk by chunk rather than held
+/// whole: `chunk(start..end)` returns rows `start..end` of every column, and it is called
+/// for exactly the row ranges `write_table` would cut the full columns into
+/// (`WRITE_TABLE_CHUNK_ROWS` rows each, a short last one, and one empty range for an empty
+/// table). The writer and the sequence of chunks it is handed are therefore the ones
+/// `write_table` uses, so the file is byte-identical to `write_table` over the
+/// concatenated columns (`write_table_chunked_writes_the_write_table_file`), including the
+/// page framing of all-null columns that a different chunking would move
+/// (`an_entirely_null_column_keeps_its_rows_but_not_its_page_framing`).
+///
+/// What it saves is the whole-table columns: the caller builds one chunk at a time, and
+/// only one chunk plus the encoder's in-progress row group is resident. Each chunk must
+/// declare the same columns and hold `end - start` rows; a mismatch is an error from the
+/// writer, as it is for [`TableWriter`].
+pub fn write_table_chunked(
+    path: &str,
+    nrows: usize,
+    chunk: impl FnMut(std::ops::Range<usize>) -> Result<Vec<Col>>,
+) -> Result<u64> {
+    write_table_chunked_to(TableWriter::new(path), path, nrows, chunk)?.close()
+}
+
+/// [`write_table_chunked`], hashing the file as it is written: returns the rows and the
+/// content hash [`crate::hash::blake3_file`] would compute, without reading the file back,
+/// as [`write_table_hashed`] does for [`write_table`].
+pub fn write_table_chunked_hashed(
+    path: &str,
+    nrows: usize,
+    chunk: impl FnMut(std::ops::Range<usize>) -> Result<Vec<Col>>,
+) -> Result<Written> {
+    write_table_chunked_to(
+        TableWriter::new(path).with_content_hash(),
+        path,
+        nrows,
+        chunk,
+    )?
+    .close_hashed()
+}
+
+/// Feed `w` the chunks `chunk` produces for the ranges [`write_table_chunked`] describes,
+/// leaving it open.
+fn write_table_chunked_to(
+    mut w: TableWriter,
+    path: &str,
+    nrows: usize,
+    mut chunk: impl FnMut(std::ops::Range<usize>) -> Result<Vec<Col>>,
+) -> Result<TableWriter> {
+    let mut written = 0usize;
+    loop {
+        let k = (nrows - written).min(WRITE_TABLE_CHUNK_ROWS);
+        let cols = chunk(written..written + k)?;
+        if let Some(c) = cols.iter().find(|c| c.len() != k) {
+            return Err(anyhow!(
+                "write_table_chunked: column '{}' of rows {}..{} for {path} has {} rows, expected {k}",
+                c.name(),
+                written,
+                written + k,
+                c.len()
+            ));
+        }
+        w.write_cols(cols)?;
         written += k;
         if written >= nrows {
             break;
@@ -2217,6 +2286,135 @@ impl<'a> ListF32<'a> {
     }
 }
 
+/// The decode type a string column is read as through [`TableFile::batches_dict`].
+pub fn dict_utf8_type() -> DataType {
+    DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8))
+}
+
+/// One batch of a required string column, seen through its dictionary when the reader
+/// produced one ([`TableFile::batches_dict`]) and as plain values otherwise.
+///
+/// The point is the dictionary case. A low-cardinality column (fragment names, protein
+/// accessions, labels) repeats a few hundred values across hundreds of millions of rows,
+/// and the parquet writer stores it dictionary-encoded. Read as `Utf8`, arrow expands
+/// every row back into its own copy of the text, and an interner then hashes that copy
+/// once per row. Read as `Dictionary(Int32, Utf8)`, a row is an `i32` key into the
+/// batch's value array, so a per-batch memo resolves each distinct key once
+/// ([`StrInterner`]). Row values are the same strings either way.
+pub enum StrBatch<'a> {
+    Plain(&'a StringArray),
+    Dict {
+        keys: &'a [i32],
+        values: &'a StringArray,
+    },
+}
+
+impl<'a> StrBatch<'a> {
+    /// `None` when the column is neither `Utf8` nor `Dictionary(Int32, Utf8)`, so the
+    /// caller can name the column in its own error.
+    pub fn of(col: &'a ArrayRef) -> Option<StrBatch<'a>> {
+        if let Some(a) = col.as_any().downcast_ref::<StringArray>() {
+            return Some(StrBatch::Plain(a));
+        }
+        let d = col
+            .as_any()
+            .downcast_ref::<arrow::array::DictionaryArray<arrow::datatypes::Int32Type>>()?;
+        let values = d.values().as_any().downcast_ref::<StringArray>()?;
+        Some(StrBatch::Dict {
+            keys: d.keys().values(),
+            values,
+        })
+    }
+}
+
+/// Dense ids for strings in FIRST-APPEARANCE order: the first distinct value interned is
+/// id 0, the next new one id 1, and so on, exactly what a `HashMap<String, id>` filled
+/// row by row produces. [`StrInterner::row`] adds a per-batch memo over a dictionary
+/// batch's keys, so a dictionary-encoded column costs one hash per distinct key per batch
+/// instead of one per row; since a string's id never changes once assigned, the memo
+/// cannot reorder anything.
+#[derive(Default)]
+pub struct StrInterner {
+    ids: std::collections::HashMap<String, u32>,
+    values: Vec<String>,
+    /// Key -> id for the current dictionary batch, `u32::MAX` for "not yet resolved".
+    memo: Vec<u32>,
+}
+
+impl StrInterner {
+    pub fn new() -> StrInterner {
+        StrInterner::default()
+    }
+
+    /// Id of `s`, assigning the next one if it is new.
+    pub fn intern(&mut self, s: &str) -> u32 {
+        if let Some(&id) = self.ids.get(s) {
+            return id;
+        }
+        let id = u32::try_from(self.values.len()).expect("fewer than 2^32 distinct strings");
+        self.ids.insert(s.to_owned(), id);
+        self.values.push(s.to_owned());
+        id
+    }
+
+    /// Reset the key memo for a new batch. Call it once per batch, before
+    /// [`StrInterner::row`] is used on that batch.
+    pub fn begin(&mut self, col: &StrBatch) {
+        if let StrBatch::Dict { values, .. } = col {
+            self.memo.clear();
+            self.memo.resize(values.len(), u32::MAX);
+        }
+    }
+
+    /// Id of row `k` of `col`, `None` when the row's value is NULL. The caller checks the
+    /// column's own validity (the keys) first, as for any other column; a dictionary VALUE
+    /// that is NULL is the one case that check cannot see, and it is reported here.
+    pub fn row(&mut self, col: &StrBatch, k: usize) -> Option<u32> {
+        match col {
+            StrBatch::Plain(a) => {
+                if a.is_null(k) {
+                    return None;
+                }
+                Some(self.intern(a.value(k)))
+            }
+            StrBatch::Dict { keys, values } => {
+                let key = keys[k] as usize;
+                match self.memo.get(key).copied() {
+                    Some(id) if id != u32::MAX => Some(id),
+                    _ => {
+                        if values.is_null(key) {
+                            return None;
+                        }
+                        let id = self.intern(values.value(key));
+                        if let Some(m) = self.memo.get_mut(key) {
+                            *m = id;
+                        }
+                        Some(id)
+                    }
+                }
+            }
+        }
+    }
+
+    /// Distinct values interned so far.
+    pub fn len(&self) -> usize {
+        self.values.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.values.is_empty()
+    }
+
+    /// The distinct values, indexed by id.
+    pub fn values(&self) -> &[String] {
+        &self.values
+    }
+
+    pub fn into_values(self) -> Vec<String> {
+        self.values
+    }
+}
+
 /// Rows per decoded batch for scalar columns (a batch is ~0.5 MB of f64).
 const SCALAR_BATCH_ROWS: usize = 1 << 16;
 /// Rows per decoded batch for list columns, whose rows are hundreds of values each.
@@ -2395,6 +2593,9 @@ struct ReadSpec {
     roots: Option<Vec<usize>>,
     batch_size: usize,
     coalesce: Option<SpanReadOptions>,
+    /// `(rows, keep)` runs over the whole file ([`TableFile::batches_selected`]), applied
+    /// in place of `selection`, which is then `None`.
+    runs: Option<Vec<(usize, bool)>>,
 }
 
 impl ReadSpec {
@@ -2496,7 +2697,20 @@ impl ReadSpec {
         let mut builder =
             ParquetRecordBatchReaderBuilder::new_with_metadata(input, self.meta.clone())
                 .with_batch_size(self.batch_size);
-        if let Some(span) = &self.selection {
+        if let Some(runs) = &self.runs {
+            let sel: Vec<RowSelector> = runs
+                .iter()
+                .filter(|r| r.0 > 0)
+                .map(|&(n, keep)| {
+                    if keep {
+                        RowSelector::select(n)
+                    } else {
+                        RowSelector::skip(n)
+                    }
+                })
+                .collect();
+            builder = builder.with_row_selection(RowSelection::from(sel));
+        } else if let Some(span) = &self.selection {
             // The selection counts rows of the SELECTED row groups only, front to back, so
             // it is skip / take / skip over exactly the groups named here.
             let mut sel = Vec::with_capacity(3);
@@ -2569,6 +2783,16 @@ struct RowSpan {
     skip_after: usize,
 }
 
+/// Whether row group `g` of `meta` carries an offset index (page locations) for every
+/// column, which is what lets a reader skip the pages before a row range.
+fn has_offset_index(meta: &ParquetMetaData, g: usize) -> bool {
+    meta.offset_index().is_some_and(|oi| {
+        oi.get(g).is_some_and(|cols| {
+            !cols.is_empty() && cols.iter().all(|c| !c.page_locations().is_empty())
+        })
+    })
+}
+
 /// Per-row-group facts a caller can plan a partial read from without decoding anything:
 /// the row count and the writer's min/max statistics of one numeric column, as f64.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -2635,8 +2859,19 @@ impl TableFile {
                 self.path
             );
         }
+        self.span_on(&self.meta, first_row, n_rows)
+    }
+
+    /// The span `[first_row, first_row + n_rows)` of the FILE, read through `meta` (this
+    /// handle's footer, or the same footer with its offset index loaded).
+    fn span_on(
+        &self,
+        meta_handle: &ArrowReaderMetadata,
+        first_row: usize,
+        n_rows: usize,
+    ) -> Result<TableFile> {
         let path = &self.path;
-        let meta: &ParquetMetaData = self.meta.metadata();
+        let meta: &ParquetMetaData = meta_handle.metadata();
         let total = meta.file_metadata().num_rows().max(0) as usize;
         if first_row.saturating_add(n_rows) > total {
             anyhow::bail!(
@@ -2665,7 +2900,7 @@ impl TableFile {
             path: self.path.clone(),
             schema: self.schema.clone(),
             nrows: n_rows,
-            meta: self.meta.clone(),
+            meta: meta_handle.clone(),
             selection: Some(RowSpan {
                 row_groups,
                 skip_before,
@@ -2673,6 +2908,124 @@ impl TableFile {
                 skip_after,
             }),
         })
+    }
+
+    /// The file rows this handle reads, as `(first, nrows)`.
+    fn file_row_range(&self) -> (usize, usize) {
+        match &self.selection {
+            None => (0, self.nrows),
+            Some(span) => {
+                let meta = self.meta.metadata();
+                let before: usize = (0..span.row_groups.first().copied().unwrap_or(0))
+                    .map(|i| meta.row_group(i).num_rows().max(0) as usize)
+                    .sum();
+                (before + span.skip_before, span.take)
+            }
+        }
+    }
+
+    /// Split this handle's rows into at most about `max_parts` contiguous parts for
+    /// parallel decoding, in row order: concatenating the parts' rows gives this handle's
+    /// rows, row for row. Every part is a handle of its own (a span of the file), so each
+    /// can be read on its own thread with its own reader.
+    ///
+    /// Parts follow the file's layout, because a part that begins inside a page makes its
+    /// reader decode that page up to the part's first row:
+    ///
+    /// - Row-group boundaries are always usable, and consecutive small row groups are
+    ///   merged until a part holds about `nrows / max_parts` rows.
+    /// - A row group larger than that is split further ONLY when the file carries an
+    ///   offset index for it, which the engine's own writer does. The parts' readers are
+    ///   then built on the footer with that index loaded, so a reader skips the pages
+    ///   before its range instead of decoding them; each part boundary costs at most one
+    ///   partly decoded page per column. Without an offset index (pyarrow writes none by
+    ///   default) a split would make part `k` decode `k` parts' worth of pages before its
+    ///   own, so such a row group stays whole.
+    ///
+    /// One part (a span of the whole handle) when `max_parts <= 1` or the handle is empty.
+    pub fn row_parts(&self, max_parts: usize) -> Result<Vec<TableFile>> {
+        let (first, n) = self.file_row_range();
+        let max_parts = max_parts.max(1);
+        let whole = || -> Result<Vec<TableFile>> {
+            Ok(vec![match self.selection {
+                None => self.span_on(&self.meta, 0, self.nrows)?,
+                Some(_) => self.span_on(&self.meta, first, n)?,
+            }])
+        };
+        if max_parts == 1 || n == 0 {
+            return whole();
+        }
+        let target = n.div_ceil(max_parts).max(1);
+        let meta = self.meta.metadata();
+        // Row groups the handle covers, as file-row segments clipped to the handle.
+        let mut segs: Vec<(usize, usize, usize)> = Vec::new(); // (group, start, end)
+        let mut start = 0usize;
+        for g in 0..meta.num_row_groups() {
+            let rows = meta.row_group(g).num_rows().max(0) as usize;
+            let (s, e) = (start.max(first), (start + rows).min(first + n));
+            if s < e {
+                segs.push((g, s, e));
+            }
+            start += rows;
+        }
+        // The offset index is read only when some covered group is worth splitting.
+        let needs_split = segs.iter().any(|&(_, s, e)| e - s > target);
+        let indexed: Option<ArrowReaderMetadata> = if needs_split {
+            let file = std::fs::File::open(&self.path)
+                .with_context(|| format!("opening {}", self.path))?;
+            let m = ArrowReaderMetadata::load(
+                &file,
+                ArrowReaderOptions::new().with_offset_index_policy(PageIndexPolicy::Optional),
+            )
+            .with_context(|| format!("reading parquet offset index {}", self.path))?;
+            // Same options as `open` apart from the index, so the Arrow schema is the one
+            // this handle already has.
+            Some(m)
+        } else {
+            None
+        };
+        let split_ok = |g: usize| {
+            indexed
+                .as_ref()
+                .is_some_and(|m| has_offset_index(m.metadata(), g))
+        };
+        // Pieces: whole segments, or equal sub-ranges of an indexed large one.
+        let mut pieces: Vec<(usize, usize, bool)> = Vec::new(); // (start, end, from a split)
+        for &(g, s, e) in &segs {
+            let len = e - s;
+            if len > target && split_ok(g) {
+                let k = len.div_ceil(target);
+                for i in 0..k {
+                    let (a, b) = (s + len * i / k, s + len * (i + 1) / k);
+                    if a < b {
+                        pieces.push((a, b, true));
+                    }
+                }
+            } else {
+                pieces.push((s, e, false));
+            }
+        }
+        // Merge consecutive pieces greedily up to the target size.
+        let mut parts: Vec<(usize, usize, bool)> = Vec::new();
+        for (a, b, split) in pieces {
+            match parts.last_mut() {
+                Some(last) if last.1 == a && last.1 - last.0 < target && b - last.0 <= target => {
+                    last.1 = b;
+                    last.2 |= split;
+                }
+                _ => parts.push((a, b, split)),
+            }
+        }
+        if parts.len() <= 1 {
+            return whole();
+        }
+        parts
+            .into_iter()
+            .map(|(a, b, split)| match (&indexed, split) {
+                (Some(m), true) => self.span_on(m, a, b - a),
+                _ => self.span_on(&self.meta, a, b - a),
+            })
+            .collect()
     }
 
     /// Row count and min/max statistics of a numeric column per row group, in file order,
@@ -2785,6 +3138,99 @@ impl TableFile {
         self.scan(columns, batch_size, &ScanOptions::default())
     }
 
+    /// As [`TableFile::batches`], with every column named in `dict` that the file stores as
+    /// `Utf8` decoded as `Dictionary(Int32, Utf8)` ([`dict_utf8_type`]) instead, so its
+    /// batches can be read through [`StrBatch`]. A named column of any other type is read as
+    /// usual, which leaves the caller's own type check to reject it exactly as before.
+    ///
+    /// The row values do not change: a dictionary-encoded parquet column is handed over
+    /// with its dictionary, and a plain-encoded one (a writer's dictionary fallback) gets a
+    /// dictionary computed per batch by the reader.
+    pub fn batches_dict(
+        &self,
+        columns: Option<&[&str]>,
+        batch_size: usize,
+        dict: &[&str],
+    ) -> Result<BatchReader> {
+        let mut spec = self.read_spec(columns, batch_size, None)?;
+        if let Some(meta) = self.dict_meta(dict)? {
+            spec.meta = meta;
+        }
+        self.scan_spec(spec, &ScanOptions::default())
+    }
+
+    /// The footer with the `dict` columns' arrow type switched to a dictionary, or `None`
+    /// when none of them is a `Utf8` column of this file.
+    fn dict_meta(&self, dict: &[&str]) -> Result<Option<ArrowReaderMetadata>> {
+        let mut changed = false;
+        let fields: Vec<Field> = self
+            .schema
+            .fields()
+            .iter()
+            .map(|f| {
+                if dict.contains(&f.name().as_str()) && f.data_type() == &DataType::Utf8 {
+                    changed = true;
+                    f.as_ref().clone().with_data_type(dict_utf8_type())
+                } else {
+                    f.as_ref().clone()
+                }
+            })
+            .collect();
+        if !changed {
+            return Ok(None);
+        }
+        let schema = Arc::new(Schema::new_with_metadata(
+            fields,
+            self.schema.metadata().clone(),
+        ));
+        let meta = ArrowReaderMetadata::try_new(
+            self.meta.metadata().clone(),
+            ArrowReaderOptions::new().with_schema(schema),
+        )
+        .with_context(|| format!("dictionary read of {}", self.path))?;
+        Ok(Some(meta))
+    }
+
+    /// Stream only the rows `runs` keeps, in file order: `runs` is `(rows, keep)` pairs
+    /// covering the whole file front to back. The footer is read again with its offset
+    /// index, so where the file carries one (the engine's writer writes it) the reader
+    /// skips the pages that hold no kept row instead of decoding and discarding them.
+    ///
+    /// Whole-file handles only: a span already is a selection.
+    pub fn batches_selected(
+        &self,
+        columns: Option<&[&str]>,
+        batch_size: usize,
+        runs: &[(usize, bool)],
+    ) -> Result<BatchReader> {
+        if self.selection.is_some() {
+            anyhow::bail!(
+                "TableFile::batches_selected: {} is a row span; select from the whole file",
+                self.path
+            );
+        }
+        let covered: usize = runs.iter().map(|r| r.0).sum();
+        if covered != self.nrows {
+            anyhow::bail!(
+                "TableFile::batches_selected: the selection covers {covered} rows of {}, which \
+                 has {}",
+                self.path,
+                self.nrows
+            );
+        }
+        let file =
+            std::fs::File::open(&self.path).with_context(|| format!("opening {}", self.path))?;
+        let meta = ArrowReaderMetadata::load(
+            &file,
+            ArrowReaderOptions::new().with_offset_index_policy(PageIndexPolicy::Optional),
+        )
+        .with_context(|| format!("reading parquet offset index {}", self.path))?;
+        let mut spec = self.read_spec(columns, batch_size, None)?;
+        spec.meta = meta;
+        spec.runs = Some(runs.to_vec());
+        self.scan_spec(spec, &ScanOptions::default())
+    }
+
     /// [`TableFile::batches`] under explicit read options. With [`ScanOptions::default`]
     /// this is `batches` exactly. The batches are identical whatever the options: the same
     /// rows, the same row-group boundaries, the same values, because the options change
@@ -2796,6 +3242,14 @@ impl TableFile {
         opts: &ScanOptions,
     ) -> Result<BatchReader> {
         let spec = self.read_spec(columns, batch_size, opts.coalesce.clone())?;
+        self.scan_spec(spec, opts)
+    }
+
+    /// The reader for `spec` under `opts`: the body of [`TableFile::scan`], shared with
+    /// [`TableFile::batches_dict`] and [`TableFile::batches_selected`], which change only
+    /// the footer or the row selection the spec carries. Every column group applies the
+    /// same footer and selection, so the groups still yield the same rows per batch.
+    fn scan_spec(&self, spec: ReadSpec, opts: &ScanOptions) -> Result<BatchReader> {
         // `MUMDIA_PARQUET_DECODE_THREADS` stands in for an automatic setting, so a whole run
         // can be decoded through column groups of any size, small artifacts included, to
         // check end to end that its outputs do not move.
@@ -2892,6 +3346,7 @@ impl TableFile {
             roots: self.projection_roots(columns)?,
             batch_size: batch_size.max(1),
             coalesce,
+            runs: None,
         })
     }
 
@@ -2988,6 +3443,38 @@ impl TableFile {
         Ok(out)
     }
 
+    /// A string column as one dense id per row plus the distinct values, in
+    /// first-appearance order ([`StrInterner`]): `values[ids[r]]` is row `r`.
+    ///
+    /// For a column with few distinct values and many rows -- a protein accession column,
+    /// or `label` -- [`TableFile::str`] builds one `String` per row: 24 bytes of spine plus
+    /// a heap block each, 203 million of them on the full precursor library. This is 4
+    /// bytes per row and one `String` per distinct value, and it reads the column through
+    /// its dictionary, so the text is not even expanded per row. Same null policy as `str`:
+    /// a NULL is refused, naming the row.
+    pub fn str_interned(&self, name: &str) -> Result<(Vec<u32>, Vec<String>)> {
+        self.idx(name)?;
+        let mut ids = Vec::with_capacity(self.nrows);
+        let mut interner = StrInterner::new();
+        for b in self.batches_dict(Some(&[name]), SCALAR_BATCH_ROWS, &[name])? {
+            let b = b?;
+            let col = b.column(0);
+            let view = StrBatch::of(col).ok_or_else(|| anyhow!("column '{name}' is not utf8"))?;
+            if col.null_count() > 0 {
+                let row = (0..col.len()).find(|&i| col.is_null(i)).unwrap_or(0);
+                return Err(reject_null(name, ids.len() + row));
+            }
+            interner.begin(&view);
+            for k in 0..col.len() {
+                match interner.row(&view, k) {
+                    Some(id) => ids.push(id),
+                    None => return Err(reject_null(name, ids.len())),
+                }
+            }
+        }
+        Ok((ids, interner.into_values()))
+    }
+
     pub fn opt_f64(&self, name: &str) -> Result<Vec<Option<f64>>> {
         let mut out = Vec::with_capacity(self.nrows);
         for b in self.column(name, SCALAR_BATCH_ROWS)? {
@@ -3046,6 +3533,192 @@ impl TableFile {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `str_interned` is `str` plus a first-appearance map, read through the dictionary:
+    /// `values[ids[r]]` must be row `r`'s string for every row, the ids must be assigned in
+    /// first-appearance order, row groups and batch boundaries must not matter, and a NULL
+    /// must be refused with its absolute row, as `str` refuses it.
+    #[test]
+    fn str_interned_is_str_through_a_first_appearance_dictionary() {
+        let dir = std::env::temp_dir().join(format!("mumdia_str_interned_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("s.parquet").to_str().unwrap().to_string();
+        let n = SCALAR_BATCH_ROWS + 7;
+        let pool = ["P3", "P1", "", "P2", "UNASSIGNED"];
+        let rows: Vec<String> = (0..n)
+            .map(|i| pool[(i * 7 + i / 3) % 5].to_string())
+            .collect();
+        let mut w = TableWriter::new(&p).with_row_group_rows(1000);
+        w.write_cols(vec![
+            Col::Str("s".into(), rows.clone()),
+            Col::U32("x".into(), (0..n as u32).collect()),
+        ])
+        .unwrap();
+        w.close().unwrap();
+        let t = TableFile::open(&p).unwrap();
+        let (ids, values) = t.str_interned("s").unwrap();
+        assert_eq!(ids.len(), n);
+        let mut first: Vec<String> = Vec::new();
+        for r in &rows {
+            if !first.contains(r) {
+                first.push(r.clone());
+            }
+        }
+        assert_eq!(values, first, "ids are not in first-appearance order");
+        for (r, id) in rows.iter().zip(&ids) {
+            assert_eq!(&values[*id as usize], r);
+        }
+        assert_eq!(t.str("s").unwrap(), rows);
+        // On a span, too: the interning sees only the span's rows.
+        let sp = t.span(SCALAR_BATCH_ROWS - 3, 9).unwrap();
+        let (sids, svals) = sp.str_interned("s").unwrap();
+        let want: Vec<String> = rows[SCALAR_BATCH_ROWS - 3..SCALAR_BATCH_ROWS + 6].to_vec();
+        let got: Vec<String> = sids.iter().map(|&i| svals[i as usize].clone()).collect();
+        assert_eq!(got, want);
+        // A non-string column is refused by type, as `str` refuses it.
+        let err = t.str_interned("x").unwrap_err().to_string();
+        assert!(err.contains("not utf8"), "{err}");
+        assert!(t.str_interned("nope").is_err());
+
+        // A NULL in the second batch is named by its absolute row.
+        let q = dir.join("null.parquet").to_str().unwrap().to_string();
+        let mut vals: Vec<Option<String>> = rows.iter().cloned().map(Some).collect();
+        vals[SCALAR_BATCH_ROWS + 2] = None;
+        write_table(&q, vec![Col::OptStr("s".into(), vals)]).unwrap();
+        let err = TableFile::open(&q)
+            .unwrap()
+            .str_interned("s")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(&format!("NULL at row {}", SCALAR_BATCH_ROWS + 2)),
+            "{err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Write `n` rows (`id` u32 and a list column `v` of `id % 5 + 1` floats) with the given
+    /// row-group size, many small data pages, and the offset index on or off.
+    fn write_parts_fixture(path: &str, n: usize, row_group: usize, offset_index: bool) {
+        use parquet::file::properties::EnabledStatistics;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::UInt32, false),
+            Field::new(
+                "v",
+                DataType::LargeList(Arc::new(Field::new_list_field(DataType::Float32, true))),
+                false,
+            ),
+        ]));
+        let mut lb = LargeListBuilder::new(Float32Builder::new());
+        for i in 0..n {
+            for k in 0..(i % 5 + 1) {
+                lb.values().append_value(i as f32 + k as f32 * 0.25);
+            }
+            lb.append(true);
+        }
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from((0..n as u32).collect::<Vec<_>>())),
+                Arc::new(lb.finish()),
+            ],
+        )
+        .unwrap();
+        let mut props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(row_group))
+            .set_data_page_row_count_limit(97)
+            .set_write_batch_size(97);
+        if !offset_index {
+            props = props
+                .set_statistics_enabled(EnabledStatistics::Chunk)
+                .set_offset_index_disabled(true);
+        }
+        let file = std::fs::File::create(path).unwrap();
+        let mut w = ArrowWriter::try_new(file, schema, Some(props.build())).unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+    }
+
+    /// Every row of a part set, in order: the ids and the flattened list values.
+    fn read_parts(parts: &[TableFile]) -> (Vec<u32>, Vec<f32>) {
+        let mut ids = Vec::new();
+        let mut vals = Vec::new();
+        for p in parts {
+            assert_eq!(
+                p.u32("id").unwrap().len(),
+                p.nrows,
+                "a part's nrows is its rows"
+            );
+            ids.extend(p.u32("id").unwrap());
+            vals.extend(p.list_f32_flat("v").unwrap().1);
+        }
+        (ids, vals)
+    }
+
+    /// `row_parts` is a partition of the handle's rows, in order, whatever the layout: many
+    /// row groups (merged), one large row group with an offset index (split), one without
+    /// (kept whole), and a span handle (clipped to the span).
+    #[test]
+    fn row_parts_partition_the_rows_in_order_and_split_only_where_pages_can_be_skipped() {
+        let dir = std::env::temp_dir().join(format!("mumdia_row_parts_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let n = 20_000usize;
+        let whole_ref = |p: &str| {
+            let t = TableFile::open(p).unwrap();
+            (t.u32("id").unwrap(), t.list_f32_flat("v").unwrap().1)
+        };
+
+        // Many row groups: parts are merged runs of whole groups.
+        let many = dir.join("many.parquet").to_str().unwrap().to_string();
+        write_parts_fixture(&many, n, 700, true);
+        let t = TableFile::open(&many).unwrap();
+        let parts = t.row_parts(6).unwrap();
+        assert!(parts.len() > 1 && parts.len() <= 8, "{} parts", parts.len());
+        assert_eq!(read_parts(&parts), whole_ref(&many));
+
+        // One row group WITH an offset index: split inside the group.
+        let one = dir.join("one.parquet").to_str().unwrap().to_string();
+        write_parts_fixture(&one, n, n, true);
+        let t = TableFile::open(&one).unwrap();
+        let parts = t.row_parts(8).unwrap();
+        assert_eq!(
+            parts.len(),
+            8,
+            "an indexed group splits into the requested parts"
+        );
+        assert_eq!(read_parts(&parts), whole_ref(&one));
+
+        // One row group WITHOUT an offset index: never split, one part.
+        let flat = dir.join("flat.parquet").to_str().unwrap().to_string();
+        write_parts_fixture(&flat, n, n, false);
+        let t = TableFile::open(&flat).unwrap();
+        let parts = t.row_parts(8).unwrap();
+        assert_eq!(
+            parts.len(),
+            1,
+            "no offset index, so no split inside the group"
+        );
+        assert_eq!(read_parts(&parts), whole_ref(&flat));
+
+        // A span of each: the parts cover exactly the span's rows.
+        for p in [&many, &one, &flat] {
+            let t = TableFile::open(p).unwrap();
+            let (a, len) = (1_234usize, 9_876usize);
+            let sp = t.span(a, len).unwrap();
+            let parts = sp.row_parts(5).unwrap();
+            let (ids, vals) = read_parts(&parts);
+            assert_eq!(ids, (a as u32..(a + len) as u32).collect::<Vec<_>>(), "{p}");
+            assert_eq!(vals, sp.list_f32_flat("v").unwrap().1, "{p}");
+        }
+        // Degenerate requests.
+        let t = TableFile::open(&one).unwrap();
+        assert_eq!(t.row_parts(1).unwrap().len(), 1);
+        assert_eq!(t.row_parts(0).unwrap().len(), 1);
+        assert!(read_parts(&t.span(5, 0).unwrap().row_parts(4).unwrap())
+            .0
+            .is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn open_rows_reads_exactly_the_span_and_stats_describe_the_groups() {
@@ -3272,6 +3945,94 @@ mod write_chunking_tests {
                     .collect(),
             ),
         ]
+    }
+
+    /// Rows `r` of a table mixing every shape whose framing the chunk sequence can move:
+    /// scalars, strings, a partly-null column, entirely-null columns and list columns.
+    /// Values depend only on the global row index, so any split of `0..n` concatenates to
+    /// the same table.
+    fn mixed_cols(r: std::ops::Range<usize>) -> Vec<Col> {
+        let rows = || r.clone();
+        vec![
+            Col::U32("id".into(), rows().map(|i| i as u32).collect()),
+            Col::F64("mz".into(), rows().map(|i| i as f64 * 1.5 - 3.0).collect()),
+            Col::Str(
+                "label".into(),
+                rows()
+                    .map(|i| if i % 2 == 0 { "target" } else { "decoy" }.to_string())
+                    .collect(),
+            ),
+            Col::OptF64(
+                "cal".into(),
+                rows().map(|i| (i % 5 != 2).then_some(i as f64)).collect(),
+            ),
+            Col::OptF64("im_pred_cal".into(), rows().map(|_| None).collect()),
+            Col::OptF64("im_lo".into(), rows().map(|_| None).collect()),
+            Col::LargeListF32(
+                "rt".into(),
+                rows()
+                    .map(|i| (0..(i % 5)).map(|k| k as f32 * 0.5).collect())
+                    .collect(),
+            ),
+        ]
+    }
+
+    /// The streamed writer hands the writer exactly the chunks `write_table` cuts, so the
+    /// file is the `write_table` file byte for byte, at every size that exercises a
+    /// boundary: empty, one row, exactly one chunk, one past it, and several chunks with a
+    /// short last one. The all-null columns are the ones a different chunk sequence would
+    /// re-frame, so they are what makes this more than a row comparison.
+    #[test]
+    fn write_table_chunked_writes_the_write_table_file() {
+        let c = WRITE_TABLE_CHUNK_ROWS;
+        for n in [0usize, 1, c, c + 1, 3 * c + 7] {
+            let whole = tmp(&format!("chunked_ref_{n}.parquet"));
+            let streamed = tmp(&format!("chunked_new_{n}.parquet"));
+            assert_eq!(write_table(&whole, mixed_cols(0..n)).unwrap(), n as u64);
+            let mut ranges: Vec<std::ops::Range<usize>> = Vec::new();
+            let rows = write_table_chunked(&streamed, n, |r| {
+                ranges.push(r.clone());
+                Ok(mixed_cols(r))
+            })
+            .unwrap();
+            assert_eq!(rows, n as u64);
+            assert_eq!(
+                std::fs::read(&streamed).unwrap(),
+                std::fs::read(&whole).unwrap(),
+                "{n} rows: the streamed file differs from write_table's"
+            );
+            // Hashed while written, the file is the same file and the hash is its hash.
+            let hashed = tmp(&format!("chunked_hashed_{n}.parquet"));
+            let w = write_table_chunked_hashed(&hashed, n, |r| Ok(mixed_cols(r))).unwrap();
+            assert_eq!(w.rows, n as u64);
+            assert_eq!(
+                std::fs::read(&hashed).unwrap(),
+                std::fs::read(&whole).unwrap(),
+                "{n} rows: the hashed streamed file differs from write_table's"
+            );
+            assert_eq!(w.content_hash, crate::hash::blake3_file(&hashed).unwrap());
+            std::fs::remove_file(&hashed).ok();
+            // The ranges tile 0..n in WRITE_TABLE_CHUNK_ROWS steps, one empty range when
+            // the table is empty.
+            assert_eq!(ranges.first().map(|r| r.start), Some(0));
+            assert_eq!(ranges.last().map(|r| r.end), Some(n));
+            assert!(ranges.windows(2).all(|w| w[0].end == w[1].start));
+            assert!(ranges.iter().all(|r| r.len() <= c));
+            assert_eq!(ranges.len(), n.div_ceil(c).max(1));
+            std::fs::remove_file(&whole).ok();
+            std::fs::remove_file(&streamed).ok();
+        }
+    }
+
+    /// A chunk that does not hold the rows it was asked for is refused, not written.
+    #[test]
+    fn write_table_chunked_refuses_a_short_chunk() {
+        let p = tmp("chunked_short.parquet");
+        let err = write_table_chunked(&p, 10, |r| Ok(mixed_cols(r.start..r.end - 1)))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("expected 10"), "{err}");
+        assert!(!std::path::Path::new(&p).exists());
     }
 
     /// The pre-change write path, verbatim: validate, build ONE record batch for the whole

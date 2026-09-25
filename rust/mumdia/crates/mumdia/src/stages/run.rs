@@ -168,6 +168,13 @@ pub fn run(p: RunParams) -> Result<()> {
         }
     }
 
+    // A FASTA build may leave DeepLC to the multi-head calibration, which re-predicts every
+    // row before anything reads the iRT (`predict_frag.defer_deeplc_to_multihead`).
+    let rt_placeholder = cfg.defers_library_deeplc(
+        p.lib_precursors.is_some(),
+        cfg.predict_frag.deeplc_python.is_some(),
+    );
+
     // --- experiment-wide artifacts: the spectral library ---
     // Either digest the FASTA (default) or consume a prebuilt library
     // (library-input mode), then feed the same lib_p/lib_f downstream.
@@ -258,7 +265,15 @@ pub fn run(p: RunParams) -> Result<()> {
 
             let lib_p = d("fragment_library_precursors.parquet");
             let lib_f = d("fragment_library_fragments.parquet");
+            if cfg.predict_frag.defer_deeplc_to_multihead && !rt_placeholder {
+                info!(
+                    "run: predict_frag.defer_deeplc_to_multihead is set, but no multi-head \
+                     calibration re-predicts this library (it needs rt_predictor = deeplc \
+                     and a DeepLC interpreter); predicting it with DeepLC as usual"
+                );
+            }
             let (wp, wf) = predict_frag::run_hashed(predict_frag::PredictFragParams {
+                rt_placeholder,
                 peptidoforms: &pf,
                 out_precursors: &lib_p,
                 out_fragments: &lib_f,
@@ -373,6 +388,10 @@ pub fn run(p: RunParams) -> Result<()> {
                 shared_bands: None,
                 mh_heads,
                 library_input: p.lib_precursors.is_some(),
+                // A single run re-predicts nothing before banding.
+                library_irt_repredicted: false,
+                slices_from: None,
+                irt_placeholder: rt_placeholder,
             })?;
             (
                 pooled.seed,
@@ -385,15 +404,27 @@ pub fn run(p: RunParams) -> Result<()> {
             )
         } else {
             let seed = d("seed_psms.parquet");
+            // Ungrouped: the seed and the extract below are the only readers of the
+            // spectra. Whether the seed's MS2 decode is lent on to extract depends on what
+            // runs between them. A DeepLC step (multi-head calibration, fine-tune or
+            // re-prediction) is where the tallest sidecar of a single run sits, and holding
+            // the scans (~1 GB) across it would add them to the process-tree peak, so then
+            // each stage decodes its own and drops it. Without one, only rt-im-train runs in
+            // between, which holds far less than extract does with the scans resident
+            // anyway, so the decode is kept and lent: one MS2 decode per run instead of two.
+            let rt_sidecar = mh_heads > 0
+                || cfg.rt_im_train.finetune_deeplc
+                || cfg.rt_im_train.repredicts_library_irt(
+                    p.lib_precursors.is_some(),
+                    cfg.predict_frag.deeplc_python.is_some(),
+                );
             info!(stage = %"search-seed", "run: stage start");
-            let w = search_seed::run_hashed(search_seed::SearchSeedParams {
+            let (w, seed_ms2) = search_seed::run_returning_scans(search_seed::SearchSeedParams {
+                precursor_span: None,
                 fragment_offset: None,
-                // Ungrouped: the seed and the extract below are the only readers of the
-                // spectra and they run minutes apart, so each decodes its own and drops
-                // it. Sharing here would hold ~1 GB across the retention-time model,
-                // which in a single run is where the tallest sidecar sits.
                 ms2_scans: None,
                 emit_calibrants: false,
+                library: None,
                 ms2: &co.ms2,
                 library_precursors: &lib_p,
                 library_fragments: &lib_f,
@@ -409,6 +440,17 @@ pub fn run(p: RunParams) -> Result<()> {
                 "search-seed",
                 &ch,
             ));
+            // Consumed here either way: kept for extract, or freed now, before any sidecar.
+            // (A conditional move would leave the scans alive to the end of this block.)
+            // Only on extract's fragindex matcher: the bucketed one builds a sorted copy of
+            // every library fragment in its load, and extract keeps its decode out of that
+            // transient for the same reason, so scans held from the seed would put it back.
+            let lend = !rt_sidecar
+                && matches!(
+                    cfg.extract.matcher,
+                    mumdia_core::config::MatcherKind::Fragindex
+                );
+            let lent_ms2: Option<Vec<mumdia_core::types::Ms2Scan>> = seed_ms2.filter(|_| lend);
 
             // Optional DeepLC multitask fine-tune: adapt the RT model to this run's
             // confident seed PSMs and rewrite the library's predicted_irt before RT
@@ -440,7 +482,12 @@ pub fn run(p: RunParams) -> Result<()> {
                     cfg.rt_im_train.q_train,
                     cfg.rt_im_train.window_holdout_frac,
                     rayon::current_num_threads(),
+                    cfg.rt_im_train.deeplc_predict_shards,
+                    cfg.rt_im_train.deeplc_projection_cache.as_deref(),
                 )?;
+                if rt_placeholder {
+                    crate::sidecar::require_every_row_repredicted(&lib_p_mh)?;
+                }
                 let n_mh = mumdia_io::table::nrows(&lib_p_mh)?;
                 man.record(record_artifact(
                     artifact::FRAGMENT_LIBRARY_PRECURSORS.0,
@@ -479,6 +526,8 @@ pub fn run(p: RunParams) -> Result<()> {
                     // residuals and the window shrinks back toward in-sample optimism.
                     cfg.rt_im_train.window_holdout_frac,
                     cfg.rng_seed,
+                    rayon::current_num_threads(),
+                    cfg.rt_im_train.deeplc_predict_shards,
                 )?;
                 // The fine-tuned precursor table is the artifact actually consumed by
                 // RT calibration and extraction. Replace the base-library manifest entry
@@ -518,6 +567,8 @@ pub fn run(p: RunParams) -> Result<()> {
                     &lib_p,
                     &lib_p_dl,
                     rayon::current_num_threads(),
+                    cfg.rt_im_train.deeplc_predict_shards,
+                    cfg.rt_im_train.deeplc_projection_cache.as_deref(),
                 )?;
                 let n_dl = mumdia_io::table::nrows(&lib_p_dl)?;
                 man.record(record_artifact(
@@ -549,9 +600,9 @@ pub fn run(p: RunParams) -> Result<()> {
                 );
                     } else {
                         tracing::info!(
-                    "run: the multi-head calibration re-predicts the library iRT against this \
+                        "run: the multi-head calibration re-predicts the library iRT against this \
                      run's anchors; skipping the base-model re-prediction it would overwrite"
-                );
+                    );
                     }
                 }
                 lib_p
@@ -560,7 +611,11 @@ pub fn run(p: RunParams) -> Result<()> {
             let windows = d("run_windows.parquet");
             let cal = d("cal.json");
             info!(stage = %"rt-im-train", "run: stage start");
-            let w = rt_im_train::run_hashed(rt_im_train::RtImTrainParams {
+            // In memory as well as on disk: extract reads the same library, so it takes the
+            // fitted windows as they are instead of decoding the table written here
+            // (`rt_im_train::RtWindows`). The file stays the artifact.
+            let (w, fitted_windows) = rt_im_train::run_in_memory(rt_im_train::RtImTrainParams {
+                precursor_span: None,
                 anchor_irt_from_seed: false,
                 seed_psms: &seed,
                 library_precursors: &lib_p,
@@ -580,10 +635,17 @@ pub fn run(p: RunParams) -> Result<()> {
             let psms = d("psms_extracted.parquet");
             let chrom = d("chromatograms.parquet");
             info!(stage = %"extract", "run: stage start");
+            // The MS2 only (`SharedScans::ms1 = None`): extract decodes the MS1 itself,
+            // concurrently with its library load and after the library's errors, as it does
+            // with nothing lent.
             let (wpsm, wchr) = extract::run_hashed(extract::ExtractParams {
+                precursor_span: None,
                 fragment_offset: None,
                 sibling_bands: 1,
-                scans: None,
+                rt_windows: fitted_windows,
+                scans: lent_ms2
+                    .as_deref()
+                    .map(|ms2| extract::SharedScans { ms2, ms1: None }),
                 ms2: &co.ms2,
                 library_precursors: &lib_p,
                 library_fragments: &lib_f,
@@ -596,6 +658,7 @@ pub fn run(p: RunParams) -> Result<()> {
                 cfg: &cfg.extract,
                 config_hash: &ch,
             })?;
+            drop(lent_ms2);
             man.record(wpsm.record(
                 artifact::PSMS_EXTRACTED.0,
                 artifact::PSMS_EXTRACTED,

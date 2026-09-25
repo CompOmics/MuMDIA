@@ -37,6 +37,13 @@ pub struct SearchSeedParams<'a> {
     /// table at ids `offset..offset + n`. The seed table is then in band-local ids. `None`
     /// is the ordinary whole-library search.
     pub fragment_offset: Option<u32>,
+    /// `library_precursors` is the WHOLE library and this stage searches its rows
+    /// `[first, first + n)`, loaded directly by row span (`Library::load_row_span_with`):
+    /// local ids `0..n`, fragments at library-wide ids `first..first + n`, outputs in local
+    /// ids exactly as for a band file. A grouped run loads a band this way wherever nothing
+    /// rewrites the band's precursor table, instead of writing the band out first.
+    /// `fragment_offset` is then `None` (or `Some(first)`). `None` is the ordinary load.
+    pub precursor_span: Option<(usize, usize)>,
     /// This run's MS2 scans, already decoded. A grouped search
     /// (`groups.window_groups > 1`) decodes the run once in `run_groups` and lends the
     /// same buffer to every band, because every band re-reads the whole run and only the
@@ -67,14 +74,111 @@ pub struct SearchSeedParams<'a> {
     /// and its own `spectrum_q`, and combining the bands' fitted scalars is a wider
     /// tolerance than the estimator applied to the union (35% wider, measured; see
     /// [`crate::masscal`]), so `seed-pool` refits over the sidecars instead. Because the
-    /// pooled q is not this band's q in either direction, the sidecar carries the band's
-    /// best-scoring targets ([`crate::masscal::CALIBRANT_OFFER_PSMS`]) as well as the ones
-    /// this band's own q accepts, and `seed-pool` decides. The band's own
-    /// `masscal.json` is unaffected: it is still fitted on its confident targets alone.
+    /// pooled q is not this band's q in either direction, the sidecar carries EVERY target
+    /// PSM of the band, not only the ones this band's own q accepts, and `seed-pool`
+    /// decides. The band's own `masscal.json` is unaffected: it is still fitted on its
+    /// confident targets alone.
     ///
     /// An ungrouped run already fits on every deviation it has, writes no sidecar, and
     /// selects exactly the rows it always did.
     pub emit_calibrants: bool,
+    /// The library and index, already loaded ([`SeedLibrary::load`]) by a caller that
+    /// seeds several runs against the same library (`run-experiment`), instead of each
+    /// seed loading them again. It must be the one these params would load: same
+    /// precursor and fragment tables, fragment offset, row span, matcher and fragment tolerance;
+    /// anything else is refused rather than searched. `None` loads it here.
+    pub library: Option<&'a SeedLibrary>,
+}
+
+/// A seed's library and fragment index, loaded once and lent to every seed that searches
+/// the same library at the same configuration.
+///
+/// `run-experiment` seeds every run against one base library at one tolerance, and each
+/// seed used to load the library and build the index again: identical arrays, rebuilt per
+/// run. The lent copy is read-only; the seed never writes through it.
+pub struct SeedLibrary {
+    lib: Library,
+    fidx: Option<FragIndex>,
+    /// What it was built from, checked against every seed it is lent to.
+    key: SeedLibraryKey,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct SeedLibraryKey {
+    precursors: String,
+    fragments: String,
+    fragment_offset: Option<u32>,
+    precursor_span: Option<(usize, usize)>,
+    fragindex: bool,
+    tol_bits: u64,
+    bucket_size: usize,
+}
+
+impl SeedLibrary {
+    /// Load the library a seed with these settings searches, and its index. On the
+    /// fragindex matcher this is the m/z-only library and index: the seed reads neither
+    /// predicted intensities nor fragment names (the hyperscore is a match count plus
+    /// observed intensity, and the mass recalibration walks `frag_mz`), so neither the
+    /// library nor the index holds the two payload columns, 12 bytes per fragment at the
+    /// build peak ([`Library::load_mz_only`], [`FragIndex::build_mz_only`]). They are still
+    /// decoded and checked here exactly as the full load checks them, batch by batch, and
+    /// discarded, so a library extract would refuse is refused by the seed, before any
+    /// DeepLC step. The bucketed matcher keeps the full load, because `page_search` serves
+    /// `idx_int` out of arrays built from the intensities.
+    ///
+    /// `fragment_offset` and `precursor_span` select the rows exactly as for
+    /// [`Library::load_for_stage`]: the whole table, a band file, or a row span of the
+    /// whole table.
+    pub fn load(
+        precursors: &str,
+        fragments: &str,
+        fragment_offset: Option<u32>,
+        precursor_span: Option<(usize, usize)>,
+        cfg: &SearchSeedConfig,
+        bucket_size: usize,
+    ) -> Result<SeedLibrary> {
+        let fragindex = matches!(cfg.matcher, MatcherKind::Fragindex);
+        let key = SeedLibraryKey {
+            precursors: precursors.to_string(),
+            fragments: fragments.to_string(),
+            fragment_offset,
+            precursor_span,
+            fragindex,
+            tol_bits: cfg.fragment_tol_ppm.to_bits(),
+            bucket_size,
+        };
+        if fragindex {
+            let lib = Library::load_mz_only_for_stage(
+                precursors,
+                fragments,
+                fragment_offset,
+                precursor_span,
+            )?;
+            let fidx = FragIndex::build_mz_only(&lib, cfg.fragment_tol_ppm);
+            return Ok(SeedLibrary {
+                lib,
+                fidx: Some(fidx),
+                key,
+            });
+        }
+        let lib = Library::load_for_stage(
+            precursors,
+            fragments,
+            fragment_offset,
+            precursor_span,
+            bucket_size,
+            true,
+        )?;
+        Ok(SeedLibrary {
+            lib,
+            fidx: None,
+            key,
+        })
+    }
+
+    pub fn n_candidates(&self) -> usize {
+        self.lib.n_candidates()
+    }
 }
 
 #[derive(Clone)]
@@ -92,6 +196,14 @@ pub fn run(p: SearchSeedParams) -> Result<u64> {
 /// [`run`], returning the output's row count and the content hash its report records, so
 /// an orchestrator can record the artifact without reading and hashing it again.
 pub fn run_hashed(p: SearchSeedParams) -> Result<Written> {
+    run_returning_scans(p).map(|(w, _)| w)
+}
+
+/// [`run_hashed`], handing back the MS2 scans when the stage decoded them itself (`None`
+/// when the caller lent them). An orchestrator that runs extract on the same spectra with
+/// nothing in between that needs the memory can lend them on instead of decoding the run
+/// twice.
+pub fn run_returning_scans(p: SearchSeedParams) -> Result<(Written, Option<Vec<Ms2Scan>>)> {
     let t0 = Instant::now();
     // `--out` must not be one of this stage's own inputs: every input is read
     // before the output is published, so writing over one replaces it and exits 0
@@ -104,40 +216,91 @@ pub fn run_hashed(p: SearchSeedParams) -> Result<Written> {
             ("--lib-fragments", p.library_fragments),
         ],
     )?;
-    // See extract: the bucketed index is dead weight on the fragindex path.
-    let build_bucketed = !matches!(p.cfg.matcher, MatcherKind::Fragindex);
-    let mut lib = match p.fragment_offset {
-        None => Library::load_with(
-            p.library_precursors,
-            p.library_fragments,
-            p.bucket_size,
-            build_bucketed,
-        )?,
-        Some(offset) => Library::load_with_fragment_offset(
-            p.library_precursors,
-            p.library_fragments,
-            offset,
-            p.bucket_size,
-            build_bucketed,
-        )?,
-    };
-    // Decoded here unless the caller lent its own copy (see `ms2_scans`). The owned
-    // buffer is declared first so it outlives the borrow. An empty lent slice is not
-    // believed over the path: it means the caller had nothing to lend.
-    let owned_scans: Vec<Ms2Scan>;
-    let scans: &[Ms2Scan] = match p.ms2_scans {
-        Some(s) if !s.is_empty() => s,
-        _ => {
-            owned_scans = load_ms2(p.ms2)?;
-            if p.ms2_scans.is_some() && !owned_scans.is_empty() {
-                warn!(
-                    ms2 = p.ms2,
-                    scans = owned_scans.len(),
-                    "search-seed: the caller lent an empty MS2 buffer for a run that has                      scans; decoding the artifact instead of searching nothing"
-                );
-            }
-            &owned_scans
+    let fragindex = matches!(p.cfg.matcher, MatcherKind::Fragindex);
+    // The calibrant ids are library-wide: local id plus where the band starts, which is the
+    // fragment offset of a band file and the first row of a span.
+    let gid_base = p
+        .precursor_span
+        .map(|(first, _)| first as u32)
+        .or(p.fragment_offset)
+        .unwrap_or(0);
+    // The library and its fragment index, built once at the seed's fragment tolerance when
+    // the fragindex backend is selected (see `SeedLibrary::load`), unless the caller lent
+    // them.
+    if let Some(shared) = p.library {
+        let want = SeedLibraryKey {
+            precursors: p.library_precursors.to_string(),
+            fragments: p.library_fragments.to_string(),
+            fragment_offset: p.fragment_offset,
+            precursor_span: p.precursor_span,
+            fragindex,
+            tol_bits: p.cfg.fragment_tol_ppm.to_bits(),
+            bucket_size: p.bucket_size,
+        };
+        if shared.key != want {
+            anyhow::bail!(
+                "search-seed: the lent seed library was built for {:?}, not for this seed \
+                 ({want:?}); load the library for these settings instead",
+                shared.key
+            );
         }
+    }
+    let load_indexed = || -> Result<SeedLibrary> {
+        SeedLibrary::load(
+            p.library_precursors,
+            p.library_fragments,
+            p.fragment_offset,
+            p.precursor_span,
+            p.cfg,
+            p.bucket_size,
+        )
+    };
+    // Decoded here unless the caller lent its own copy (see `ms2_scans`). An empty lent
+    // slice is not believed over the path: it means the caller had nothing to lend.
+    let lent = p.ms2_scans.filter(|s| !s.is_empty());
+    let decode = || -> Result<Option<Vec<Ms2Scan>>> {
+        if lent.is_some() {
+            return Ok(None);
+        }
+        let owned = load_ms2(p.ms2)?;
+        if p.ms2_scans.is_some() && !owned.is_empty() {
+            warn!(
+                ms2 = p.ms2,
+                scans = owned.len(),
+                "search-seed: the caller lent an empty MS2 buffer for a run that has                  scans; decoding the artifact instead of searching nothing"
+            );
+        }
+        Ok(Some(owned))
+    };
+    // On the fragindex path the spectra decode runs concurrently with the library load and
+    // the index build: they are independent, and the scans are resident during the index
+    // build either way, so the overlap does not raise the peak. The bucketed path keeps
+    // them in sequence, because its library load builds a full sorted copy of every
+    // fragment, and holding the scans through that transient would. The library's error,
+    // if any, is still the one reported first.
+    let (loaded, decoded) = if p.library.is_some() {
+        (None, decode())
+    } else if fragindex {
+        let (l, d) = rayon::join(load_indexed, decode);
+        (Some(l), d)
+    } else {
+        let loaded = load_indexed();
+        let decoded = if loaded.is_ok() { decode() } else { Ok(None) };
+        (Some(loaded), decoded)
+    };
+    let owned_library: Option<SeedLibrary> = loaded.transpose()?;
+    let seed_library: &SeedLibrary = match (p.library, owned_library.as_ref()) {
+        (Some(s), _) => s,
+        (None, Some(s)) => s,
+        (None, None) => unreachable!("the library loaded because nothing was lent"),
+    };
+    let lib: &Library = &seed_library.lib;
+    let fidx: Option<&FragIndex> = seed_library.fidx.as_ref();
+    let owned_scans: Option<Vec<Ms2Scan>> = decoded?;
+    let scans: &[Ms2Scan] = match (lent, owned_scans.as_deref()) {
+        (Some(s), _) => s,
+        (None, Some(s)) => s,
+        (None, None) => unreachable!("the decode ran because nothing was lent"),
     };
     info!(
         candidates = lib.n_candidates(),
@@ -145,24 +308,11 @@ pub fn run_hashed(p: SearchSeedParams) -> Result<Written> {
         "search-seed: loaded"
     );
 
-    // fragindex backend, built once at the seed's fragment tolerance when selected.
-    let fidx = matches!(p.cfg.matcher, MatcherKind::Fragindex)
-        .then(|| FragIndex::build(&lib, p.cfg.fragment_tol_ppm));
-    if fidx.is_some() {
-        // The index owns its own copy of every posting, and the seed reads neither the
-        // predicted intensity nor the fragment name from either side: the hyperscore is
-        // count + observed intensity, and the mass recalibration below needs only
-        // `frag_mz`. So the library's `frag_int` and `frag_name_id` are dead from here on
-        // -- 6 bytes per library fragment, held for the whole search. The bucketed path
-        // keeps them, because `page_search` serves `idx_int` out of arrays built from them.
-        lib.release_fragment_payload();
-    }
-
     // Best-per-candidate PSM. The fragindex path parallelizes across isolation-window
     // groups (each scan belongs to exactly one window, so groups are independent) and
     // is bit-identical to the serial path via a deterministic per-candidate merge; the
     // bucketed path stays serial.
-    let best: HashMap<u32, Best> = if let Some(idx) = fidx.as_ref() {
+    let best: HashMap<u32, Best> = if let Some(idx) = fidx {
         seed_fragindex_windows(idx, scans, p.cfg)
     } else {
         let mut best: HashMap<u32, Best> = HashMap::new();
@@ -216,7 +366,7 @@ pub fn run_hashed(p: SearchSeedParams) -> Result<Written> {
     rows.sort_by_key(|(cid, _)| *cid);
     let sd: Vec<(f64, bool)> = rows
         .iter()
-        .map(|(cid, b)| (b.score, lib.cands[*cid as usize].is_decoy))
+        .map(|(cid, b)| (b.score, lib.is_decoy[*cid as usize]))
         .collect();
     let q = target_decoy_q(&sd);
 
@@ -238,13 +388,13 @@ pub fn run_hashed(p: SearchSeedParams) -> Result<Written> {
     let mut scan_c = Vec::with_capacity(n_rows);
     let mut irt_c = Vec::with_capacity(n_rows);
     for (i, (cid, b)) in rows.iter().enumerate() {
-        let c = &lib.cands[*cid as usize];
+        let c = lib.cand(*cid);
         cid_c.push(*cid);
-        pform_c.push(c.peptidoform.clone());
+        pform_c.push(c.peptidoform.to_string());
         charge_c.push(c.charge);
         mz_c.push(c.precursor_mz);
         base_c.push(c.base_peptide_id);
-        prot_c.push(c.protein.clone());
+        prot_c.push(c.protein.to_string());
         is_dec.push(c.is_decoy);
         score_c.push(b.score);
         q_c.push(q[i]);
@@ -271,24 +421,19 @@ pub fn run_hashed(p: SearchSeedParams) -> Result<Written> {
     let mut dev_mz: Vec<f64> = Vec::new();
     // The same deviations keyed by library-wide candidate id and scan, written beside the
     // masscal for a grouped run to pool. Stays empty otherwise.
-    let gid_base = p.fragment_offset.unwrap_or(0);
     let mut calibrants = crate::masscal::Calibrants::default();
-    let offer_floor = if p.emit_calibrants {
-        calibrant_offer_floor(&score_c, &is_dec)
-    } else {
-        // No sidecar, so nothing is offered and the loop below selects exactly what it
-        // always did: this band's confident targets.
-        f64::INFINITY
-    };
     for (i, (cid, b)) in rows.iter().enumerate() {
         if is_dec[i] {
             continue;
         }
         // This band's own calibrants, which are what its own `masscal.json` is fitted from.
         let confident = q[i] <= p.cfg.fdr_seed;
-        // Offered to the pool on top of them, and never to this band's own fit.
-        let offered = score_c[i] >= offer_floor;
-        if !confident && !offered {
+        // With the sidecar, EVERY target is offered to the pool on top of them (and never
+        // to this band's own fit): the pooled q decides, and no band-local rule can know
+        // in advance which of its targets the pooled q will accept (see
+        // `crate::masscal`, "Every target is offered"). Without it, the loop selects
+        // exactly what it always did: this band's confident targets.
+        if !confident && !p.emit_calibrants {
             continue;
         }
         if let Some(scan) = scan_by_index.get(&b.scan_index) {
@@ -349,13 +494,23 @@ pub fn run_hashed(p: SearchSeedParams) -> Result<Written> {
     // deviations of a grouped run.
     let cal = crate::masscal::MassCal::fit_from(&devs, &dev_mz, p.cfg);
     mumdia_io::json::write_json(&crate::masscal::json_path(p.out), &cal.to_json())?;
-    if p.emit_calibrants {
-        let n_cal = crate::masscal::write_calibrants(p.out, &calibrants)?;
+    // `(deviations, in-memory bytes, target rows)` of the sidecar, for the artifact report:
+    // every target row of the band is offered, so this is what an at-scale run needs to
+    // see to size the grouped seed phase (`crate::masscal` has the bound).
+    let calibrant_stats = if p.emit_calibrants {
+        let bytes = calibrants.bytes();
+        let n_targets = is_dec.iter().filter(|d| !**d).count();
+        let n_cal = crate::masscal::write_calibrants(p.out, calibrants)?;
         info!(
             calibrant_deviations = n_cal,
+            calibrant_bytes = bytes,
+            target_rows = n_targets,
             "search-seed: wrote the calibrant deviations for the pooled mass calibration"
         );
-    }
+        Some((n_cal, bytes, n_targets))
+    } else {
+        None
+    };
     info!(
         frag_ppm_offset = cal.frag_ppm_offset,
         frag_tol_learned = cal.frag_tol_ppm,
@@ -391,6 +546,11 @@ pub fn run_hashed(p: SearchSeedParams) -> Result<Written> {
     let mut stats = std::collections::BTreeMap::new();
     stats.insert("psms".to_string(), json!(n));
     stats.insert(format!("targets_at_q{}", p.cfg.fdr_seed), json!(n_at_1pct));
+    if let Some((n_cal, bytes, n_targets)) = calibrant_stats {
+        stats.insert("calibrant_deviations".to_string(), json!(n_cal));
+        stats.insert("calibrant_bytes".to_string(), json!(bytes));
+        stats.insert("calibrant_target_rows".to_string(), json!(n_targets));
+    }
     let report = ArtifactReport {
         logical_name: artifact::SEED_PSMS.0.to_string(),
         schema_name: artifact::SEED_PSMS.0.to_string(),
@@ -418,27 +578,8 @@ pub fn run_hashed(p: SearchSeedParams) -> Result<Written> {
         elapsed_ms = elapsed,
         "search-seed: done"
     );
-    Ok(report.written())
-}
-
-/// Score of the [`crate::masscal::CALIBRANT_OFFER_PSMS`]-th best TARGET PSM: every target at
-/// or above it is offered to the pooled mass calibration whatever this band's own q says.
-///
-/// `-inf` when the band has fewer targets than that, so it offers all of them. The pooled
-/// selection inside one band is a score-ranked prefix of the band's targets, so a prefix is
-/// the shape of superset that makes `seed-pool`'s pooled-q selection exact.
-fn calibrant_offer_floor(scores: &[f64], is_decoy: &[bool]) -> f64 {
-    let mut targets: Vec<f64> = scores
-        .iter()
-        .zip(is_decoy)
-        .filter(|(_, d)| !**d)
-        .map(|(s, _)| *s)
-        .collect();
-    targets.sort_by(|a, b| b.total_cmp(a));
-    targets
-        .get(crate::masscal::CALIBRANT_OFFER_PSMS - 1)
-        .copied()
-        .unwrap_or(f64::NEG_INFINITY)
+    drop(owned_library);
+    Ok((report.written(), owned_scans))
 }
 
 /// Peak indices to probe for a scan: the `top_n` most intense (index-ascending
@@ -581,6 +722,70 @@ fn seed_fragindex_windows(
     scans: &[Ms2Scan],
     cfg: &SearchSeedConfig,
 ) -> HashMap<u32, Best> {
+    seed_fragindex_windows_chunked(
+        idx,
+        scans,
+        cfg,
+        rayon::current_num_threads(),
+        SEED_MIN_CHUNK_SCANS,
+    )
+}
+
+/// Fewest scans a seed task holds when a window group is split (see [`seed_chunk_plan`]).
+const SEED_MIN_CHUNK_SCANS: usize = 32;
+
+/// The seed's parallel tasks: `(group, start, end)` over `group_vec[group][start..end]`, for
+/// the SERVED groups only, in group order and, within a group, in RT order.
+///
+/// The unit used to be one isolation-window group, which is one task per window. A banded
+/// search (`groups.window_groups`) loads one m/z band and so serves only the one to three
+/// windows over it: its whole probe phase ran on that many threads, whatever `--threads`
+/// was (the 63-band immunopeptidomics plan covers 114 windows; the 100-band HYE plan has
+/// three per band). Groups are therefore split into contiguous scan chunks when the served
+/// scans would give fewer than about four tasks per thread, never below `min_chunk` scans.
+/// An ungrouped run serves every window and usually has enough groups already, so its
+/// groups mostly stay whole.
+fn seed_chunk_plan(
+    sizes: &[usize],
+    served: &[bool],
+    threads: usize,
+    min_chunk: usize,
+) -> Vec<(usize, usize, usize)> {
+    let total: usize = sizes
+        .iter()
+        .zip(served)
+        .filter(|(_, s)| **s)
+        .map(|(n, _)| *n)
+        .sum();
+    let target = (4 * threads.max(1)).max(1);
+    let chunk = total.div_ceil(target).max(min_chunk).max(1);
+    let mut tasks = Vec::new();
+    for (g, (&n, &s)) in sizes.iter().zip(served).enumerate() {
+        if !s || n == 0 {
+            continue;
+        }
+        let pieces = n.div_ceil(chunk);
+        for k in 0..pieces {
+            // Near-equal pieces: the first `n % pieces` get one scan more.
+            let a = k * n / pieces;
+            let b = (k + 1) * n / pieces;
+            if b > a {
+                tasks.push((g, a, b));
+            }
+        }
+    }
+    tasks
+}
+
+/// [`seed_fragindex_windows`] with the task plan's inputs explicit, so a test can force
+/// every group into many chunks and compare against one task per group.
+fn seed_fragindex_windows_chunked(
+    idx: &FragIndex,
+    scans: &[Ms2Scan],
+    cfg: &SearchSeedConfig,
+    threads: usize,
+    min_chunk: usize,
+) -> HashMap<u32, Best> {
     use std::collections::BTreeMap;
     // Group scan indices by window; BTreeMap keys give a deterministic group order
     // (the merge is order-independent anyway, being a total-order max).
@@ -647,19 +852,19 @@ fn seed_fragindex_windows(
     }
 
     let scratch_width = initial_scratch_width(&survey);
-    let partials: Vec<Vec<(u32, Best)>> = group_vec
+    // Served groups only, split into RT-contiguous chunks when there are too few to fill
+    // the threads (`seed_chunk_plan`). A group outside the loaded library range returns
+    // nothing and gets no task.
+    let sizes: Vec<usize> = group_vec.iter().map(|ids| ids.len()).collect();
+    let served: Vec<bool> = ranges.iter().map(|(lo, hi)| hi > lo).collect();
+    let tasks = seed_chunk_plan(&sizes, &served, threads, min_chunk);
+    let chunk_partials: Vec<(usize, HashMap<u32, Best>)> = tasks
         .par_iter()
         .map_init(
-            || SeedScratch::new(scratch_width),
-            |scratch, ids| {
-                if ids.is_empty() {
-                    return Vec::new();
-                }
-                let w = &scans[ids[0]].window;
-                let (lo, hi) = idx.candidate_range(w.lower_mz, w.upper_mz);
-                if hi <= lo {
-                    return Vec::new();
-                }
+            || SeedScratch::with_min_count(scratch_width, cfg.min_matched_peaks),
+            |scratch, &(g, a, b)| {
+                let ids = &group_vec[g][a..b];
+                let (lo, hi) = ranges[g];
                 let mut local: HashMap<u32, Best> = HashMap::new();
                 for &si in ids {
                     let scan = &scans[si];
@@ -669,13 +874,15 @@ fn seed_fragindex_windows(
                         .map(|&pi| (scan.peaks[pi].mz as f64, scan.peaks[pi].intensity))
                         .collect();
                     scratch.accumulate(idx, &peaks, lo, hi);
-                    // Borrowed, not copied: `touched` can be as long as the candidate
-                    // window, so the copy was one allocation of up to a window's width per
-                    // scan. Same slice, same order, so the scored list is unchanged.
-                    let touched = scratch.touched();
-                    let mut scored: Vec<(u32, f64, u32)> = touched
+                    // The candidates that reached `min_matched_peaks`, which the scratch
+                    // collected as they reached it (`SeedScratch::qualified`) instead of
+                    // this loop filtering every candidate the scan touched. They come in a
+                    // different order than `touched`, and the sort below is a total order
+                    // over unique candidate ids (score, then id), so the scored list, and
+                    // what `truncate` keeps of it, are unchanged.
+                    let mut scored: Vec<(u32, f64, u32)> = scratch
+                        .qualified()
                         .iter()
-                        .filter(|&&cid| scratch.count(cid) as usize >= cfg.min_matched_peaks)
                         .map(|&cid| {
                             (
                                 cid,
@@ -703,10 +910,39 @@ fn seed_fragindex_windows(
                         }
                     }
                 }
-                local.into_iter().collect()
+                (g, local)
             },
         )
         .collect();
+    // A group's chunks merge back in chunk order with the same strictly-greater rule the
+    // walk over the group applies scan by scan, so an earlier chunk keeps an exact tie:
+    // the group's partial is what one task over all its scans would have produced.
+    let mut partials: Vec<Vec<(u32, Best)>> = Vec::new();
+    let mut current: Option<(usize, HashMap<u32, Best>)> = None;
+    for (g, part) in chunk_partials {
+        match &mut current {
+            Some((cg, acc)) if *cg == g => {
+                for (cid, b) in part {
+                    match acc.get_mut(&cid) {
+                        Some(e) if b.score > e.score => *e = b,
+                        Some(_) => {}
+                        None => {
+                            acc.insert(cid, b);
+                        }
+                    }
+                }
+            }
+            _ => {
+                if let Some((_, acc)) = current.take() {
+                    partials.push(acc.into_iter().collect());
+                }
+                current = Some((g, part));
+            }
+        }
+    }
+    if let Some((_, acc)) = current {
+        partials.push(acc.into_iter().collect());
+    }
 
     // Deterministic cross-group merge (total order, so independent of group/thread order).
     let mut best: HashMap<u32, Best> = HashMap::new();
@@ -849,35 +1085,6 @@ mod survey_tests {
     }
 
     #[test]
-    fn a_band_offers_a_score_prefix_of_its_targets_to_the_pooled_mass_calibration() {
-        use super::calibrant_offer_floor;
-        use crate::masscal::CALIBRANT_OFFER_PSMS;
-        // Fewer targets than the cap: every target is offered, whatever the band's own q
-        // makes of them. This is the CI fixture's case, where each band's q rejects all of
-        // its targets and a q-selected sidecar would be empty in every band.
-        let scores = [9.0, 8.0, 7.0, 6.0];
-        let decoys = [false, true, false, false];
-        assert_eq!(
-            calibrant_offer_floor(&scores, &decoys),
-            f64::NEG_INFINITY,
-            "3 targets, so all three are at or above the floor"
-        );
-        assert_eq!(calibrant_offer_floor(&[], &[]), f64::NEG_INFINITY);
-        // More targets than the cap: the floor is the cap-th best TARGET score, and the
-        // decoys interleaved among them do not consume a slot.
-        let n = 2 * (CALIBRANT_OFFER_PSMS + 500);
-        let scores: Vec<f64> = (0..n).map(|i| (n - i) as f64).collect();
-        let decoys: Vec<bool> = (0..n).map(|i| i % 2 == 1).collect();
-        let floor = calibrant_offer_floor(&scores, &decoys);
-        let offered = scores
-            .iter()
-            .zip(&decoys)
-            .filter(|(s, d)| !**d && **s >= floor)
-            .count();
-        assert_eq!(offered, CALIBRANT_OFFER_PSMS);
-    }
-
-    #[test]
     fn label_column_is_the_boolean_the_old_code_parsed_back_out_of_it() {
         // The artifact text is unchanged, and the boolean the stage uses is now its source
         // rather than its product: `is_decoy` -> column -> `l == "decoy"` is the identity.
@@ -920,5 +1127,166 @@ mod peak_selection_tests {
         let s = scan(305);
         assert_eq!(select_peaks(&s, 0), (0..305).collect::<Vec<_>>());
         assert_eq!(select_peaks(&s, 300), (5..305).collect::<Vec<_>>());
+    }
+}
+
+#[cfg(test)]
+mod chunk_tests {
+    use super::{seed_chunk_plan, seed_fragindex_windows_chunked, Best};
+    use crate::index::{Candidate, Library};
+    use crate::matchers::fragindex::FragIndex;
+    use mumdia_core::config::SearchSeedConfig;
+    use mumdia_core::types::{IsolationWindow, Ms2Scan, Peak};
+    use std::collections::HashMap;
+
+    #[test]
+    fn the_chunk_plan_covers_every_served_scan_once_and_skips_the_rest() {
+        let sizes = [100usize, 0, 7, 1_000, 3];
+        let served = [true, true, false, true, true];
+        for (threads, min) in [(1usize, 32usize), (8, 32), (64, 1), (1, usize::MAX)] {
+            let tasks = seed_chunk_plan(&sizes, &served, threads, min);
+            for (g, &n) in sizes.iter().enumerate() {
+                let mine: Vec<&(usize, usize, usize)> = tasks.iter().filter(|t| t.0 == g).collect();
+                if !served[g] || n == 0 {
+                    assert!(mine.is_empty(), "group {g} has no task");
+                    continue;
+                }
+                // Contiguous, in order, covering 0..n exactly once.
+                assert_eq!(mine[0].1, 0);
+                assert_eq!(mine.last().unwrap().2, n);
+                assert!(mine.windows(2).all(|w| w[0].2 == w[1].1));
+                if min != usize::MAX {
+                    assert!(mine.iter().all(|t| t.2 - t.1 >= min.min(n)));
+                }
+            }
+            // Groups appear in order, which the in-group merge relies on.
+            assert!(tasks.windows(2).all(|w| w[0].0 <= w[1].0));
+        }
+        // Enough tasks on one served group to occupy the threads.
+        let one = seed_chunk_plan(&[4_000], &[true], 32, 32);
+        assert_eq!(one.len(), 125);
+        // Many groups already: one task each.
+        let many = seed_chunk_plan(&[50; 400], &[true; 400], 32, 32);
+        assert_eq!(many.len(), 400);
+    }
+
+    fn lib_from(cands: &[(Vec<f64>, f64)]) -> Library {
+        let mut frag_mz = Vec::new();
+        let mut frag_int = Vec::new();
+        let mut frag_name_id: Vec<u16> = Vec::new();
+        let mut cs = Vec::new();
+        for (i, (frags, pmz)) in cands.iter().enumerate() {
+            let start = frag_mz.len();
+            for &mz in frags {
+                frag_mz.push(mz as f32);
+                frag_int.push(1.0);
+                frag_name_id.push(0);
+            }
+            cs.push(Candidate {
+                candidate_id: i as u32,
+                peptidoform_id: i as u32,
+                base_peptide_id: i as u32,
+                peptidoform: String::new(),
+                charge: 2,
+                precursor_mz: *pmz,
+                predicted_irt: 0.0,
+                is_decoy: i % 3 == 0,
+                protein: String::new(),
+                frag_start: start,
+                n_frag: frags.len(),
+            });
+        }
+        Library::from_candidates(cs, frag_mz, frag_int, frag_name_id, vec!["f".to_string()])
+    }
+
+    fn bits(m: &HashMap<u32, Best>) -> Vec<(u32, u64, u64, u32, u32)> {
+        let mut v: Vec<_> = m
+            .iter()
+            .map(|(c, b)| {
+                (
+                    *c,
+                    b.score.to_bits(),
+                    b.rt.to_bits(),
+                    b.matched,
+                    b.scan_index,
+                )
+            })
+            .collect();
+        v.sort_unstable();
+        v
+    }
+
+    #[test]
+    fn a_chunked_seed_is_the_one_task_per_window_seed_exactly() {
+        // Two windows of 60 candidates each, 600 scans. Every scan carries fragments of a
+        // few candidates of its window; scans repeat with the same peaks at a later RT and
+        // at the SAME RT, so the chunk merge meets exact score ties and has to keep the
+        // earlier scan, as the scan-by-scan walk does.
+        let mut cands = Vec::new();
+        for i in 0..120usize {
+            let pmz = if i < 60 {
+                410.0 + i as f64
+            } else {
+                520.0 + (i - 60) as f64
+            };
+            let frags: Vec<f64> = (0..6).map(|k| 200.0 + (i * 6 + k) as f64 * 1.37).collect();
+            cands.push((frags, pmz));
+        }
+        let lib = lib_from(&cands);
+        let idx = FragIndex::build(&lib, 20.0);
+        let window = |a: bool| IsolationWindow {
+            target_mz: if a { 450.0 } else { 550.0 },
+            lower_mz: if a { 400.0 } else { 500.0 },
+            upper_mz: if a { 500.0 } else { 600.0 },
+            im_lower: None,
+            im_upper: None,
+        };
+        let mut scans = Vec::new();
+        for s in 0..600usize {
+            // Scans 4k and 4k+1 are window A, 4k+2 and 4k+3 window B, and the two scans of
+            // a pair carry the same peaks: exact score ties inside one window.
+            let key = s / 4;
+            let in_a = (s / 2) % 2 == 0;
+            let base = if in_a { 0 } else { 60 };
+            let mut peaks: Vec<Peak> = Vec::new();
+            for j in 0..4usize {
+                let c = base + (key * 7 + j * 11) % 60;
+                for k in 0..(4 + j % 3) {
+                    peaks.push(Peak {
+                        mz: cands[c].0[k] as f32,
+                        intensity: (100 + key % 17 * 10 + j) as f32,
+                    });
+                }
+            }
+            peaks.sort_by(|a, b| a.mz.total_cmp(&b.mz));
+            scans.push(Ms2Scan {
+                scan_index: s as u32,
+                // Some tied pairs share one RT, the rest are a scan apart.
+                rt_seconds: (s / 3) as f64 * 2.0,
+                window: window(in_a),
+                peaks,
+            });
+        }
+        let cfg = SearchSeedConfig {
+            min_matched_peaks: 3,
+            ..Default::default()
+        };
+        let whole = seed_fragindex_windows_chunked(&idx, &scans, &cfg, 1, usize::MAX);
+        assert!(!whole.is_empty(), "the fixture must produce seed PSMs");
+        for (threads, min) in [(64usize, 1usize), (8, 5), (3, 32)] {
+            let chunked = seed_fragindex_windows_chunked(&idx, &scans, &cfg, threads, min);
+            assert_eq!(
+                bits(&chunked),
+                bits(&whole),
+                "threads {threads}, chunk floor {min}"
+            );
+        }
+        // A library holding only window B's candidates: window A is unserved and gets no
+        // task, and the result is the B half of the whole-library one.
+        let lib_b = lib_from(&cands[60..]);
+        let idx_b = FragIndex::build(&lib_b, 20.0);
+        let a = seed_fragindex_windows_chunked(&idx_b, &scans, &cfg, 1, usize::MAX);
+        let b = seed_fragindex_windows_chunked(&idx_b, &scans, &cfg, 64, 1);
+        assert_eq!(bits(&a), bits(&b));
     }
 }

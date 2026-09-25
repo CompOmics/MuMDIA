@@ -168,6 +168,20 @@ returns the row count as `u64`:
    (`table.rs:192-194`). One `write_table` call produces exactly one row group /
    one logical batch.
 
+The list above describes the original single-batch write. `write_table` now hands
+the writer the rows in `WRITE_TABLE_CHUNK_ROWS` (65,536-row) chunks through a
+`TableWriter`, which keeps one chunk of Arrow arrays resident instead of a second
+copy of the whole table; the row groups still fall at the writer's 1,048,576-row
+default. `write_table_chunked(path, nrows, chunk)` is the same write for a caller
+that produces its rows chunk by chunk: `chunk(start..end)` is called for exactly the
+ranges `write_table` would cut (one empty range for an empty table), so the file is
+byte-identical to `write_table` over the concatenated columns, including the page
+framing of an all-null column, which a different chunk sequence would move
+(`write_table_chunked_writes_the_write_table_file`). `write_table_chunked_hashed`
+is the same write, hashed as it is written ("Hash on write" below). `rt-im-train`
+writes `run_windows.parquet` this way, so the seven whole columns (76 bytes per
+candidate) are never resident.
+
 #### Page layout of capped writers
 
 A writer with a row-group cap (`TableWriter::with_row_group_rows`,
@@ -513,8 +527,8 @@ digest of the finished file. A writer can therefore hash while it writes:
   passes every write straight through, so it issues the same writes as before;
 - hashing is opt-in per writer: `WriteOptions::content_hash()` for
   `BatchWriter::with_options`, `TableWriter::with_content_hash()`,
-  `SpliceWriter::create_hashed`, `write_table_hashed` and
-  `write_batches_hashed`. The digest is finalised after parquet has written the
+  `SpliceWriter::create_hashed`, `write_table_hashed`,
+  `write_table_chunked_hashed` and `write_batches_hashed`. The digest is finalised after parquet has written the
   footer (`ColumnEncoder::into_inner`, which ends in
   `SerializedFileWriter::into_inner`, for `TableWriter`, `BatchWriter` and
   `write_batches`; `SerializedFileWriter::into_inner` directly for
@@ -681,6 +695,8 @@ string (`main.rs:713`).
 | `Col::field` | `table.rs:83` | Arrow `Field`; scalars non-nullable, `Opt*`/lists nullable |
 | `Col::into_array` | `table.rs:107` | consuming move of the `Vec` into an `ArrayRef` (copy once) |
 | `write_table` | `table.rs:151` | validate + write one SNAPPY Parquet batch; returns row count |
+| `write_table_chunked` | `table.rs` | the `write_table` file, built from caller-produced 65,536-row chunks |
+| `write_table_chunked_hashed` | `table.rs` | `write_table_chunked`, returning the rows and the content hash taken while writing |
 | `Table` (struct) | `table.rs:200` | read-back table: schema, batches, nrows |
 | `Table::read` | `table.rs:207` | read a Parquet file fully into memory |
 | `Table::column_names` | `table.rs:227` | schema field names, in order |
@@ -690,6 +706,14 @@ string (`main.rs:713`).
 | `Table::str` | `table.rs:357` | string getter; null -> `""` |
 | `Table::opt_f64` | `table.rs:377` | only null-preserving getter; -> `Vec<Option<f64>>` |
 | `Table::list_f32` | `table.rs:396` | f32 list getter; reads `List` and `LargeList`; null row -> empty `Vec` |
+| `TableFile` / `TableFile::open` / `open_rows` | `table.rs:1673` / `:1742` / `:1765` | footer-only handle whose getters stream one column batch by batch; `open_rows` is a row span of the file that behaves as a smaller file |
+| `TableFile::row_parts` | `table.rs:1868` | cut a handle into at most `max_parts` row-contiguous parts, in order: whole row groups, merged, and page-aligned ranges inside a group that has an offset index (a group without one is never split) |
+| `TableFile::batches` / `batches_dict` | `table.rs:2038` / `:2050` | streaming batch reader over the named columns; `batches_dict` reads the named `Utf8` columns as `Dictionary(Int32, Utf8)`, with the same row values |
+| `TableFile::batches_selected` | `table.rs:2100` | stream only the rows of `(rows, keep)` runs, skipping pages with no kept row where the file has an offset index (whole-file handles only) |
+| `TableFile::str_interned` / `str_flat` | `table.rs:2309` / `:2358` | a string column as one id per row plus its distinct values (first appearance), or as one text arena plus offsets; both refuse a NULL with the row |
+| `StrBatch` / `StrInterner` | `table.rs:1517` / `:1550` | one batch of a string column, plain or through its dictionary; first-appearance interning with a per-batch key memo |
+| `ListF32` | `table.rs:1422` | borrowed view of a batch's f32 list column (row slices of the batch's own buffer) |
+| `require_no_nulls` | `table.rs:1203` | refuse a NULL in a required column of a batch a reader walks itself, naming the absolute row |
 | `ArtifactReport` | `report.rs:11` | per-artifact JSON summary struct |
 | `ArtifactReport::write_for` | `report.rs:28` | write `<artifact>.report.json` |
 | `blake3_file` | `hash.rs:8` | streamed blake3 hex digest of a file (`content_hash`) |

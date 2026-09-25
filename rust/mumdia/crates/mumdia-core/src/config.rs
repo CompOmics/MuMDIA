@@ -545,6 +545,27 @@ pub struct PredictFragConfig {
     pub deeplc_python: Option<String>,
     /// Directory holding the sidecar worker scripts.
     pub sidecar_script_dir: String,
+    /// Skip DeepLC in a FASTA library build (`rt_predictor = deeplc`) when the multi-head
+    /// calibration will re-predict every row anyway. Default `false`.
+    ///
+    /// With `rt_predictor = deeplc` the automatic multi-head calibration runs, and it
+    /// rewrites the `predicted_irt` of every standard-residue row against the run's anchors
+    /// (the only rows it keeps are non-standard ones, and a FASTA digest emits none), so the
+    /// library's own DeepLC pass is work whose only output is overwritten: about 19 minutes
+    /// on the 9.8M-peptidoform HYE FASTA library. Nothing reads the library's iRT before the
+    /// calibration: the seed is iRT-independent and only passes the column through. Set, the
+    /// orchestrators (`run`, `run-experiment`, and their grouped path) write the native
+    /// model's iRT as a placeholder, the library's model identity says so, and the run fails
+    /// if the calibration's summary reports any row it did not re-predict
+    /// (`retained_imported > 0`), because such a row would keep the placeholder. Ignored
+    /// where the multi-head calibration does not run, and by the standalone `predict-frag`.
+    ///
+    /// Final outputs are then byte-identical to the default's; the intermediate library
+    /// table, the seed's pass-through iRT column and the predict-frag report differ. Opt-in
+    /// because the library table is no longer a DeepLC library, which matters to anyone who
+    /// reuses it as `--lib-precursors` elsewhere. Validate by comparing `psms_scored.parquet`
+    /// against a default FASTA run (on CPU, where DeepLC's base prediction is deterministic).
+    pub defer_deeplc_to_multihead: bool,
 }
 impl Default for PredictFragConfig {
     fn default() -> Self {
@@ -562,6 +583,7 @@ impl Default for PredictFragConfig {
             peptdeep_python: None,
             deeplc_python: None,
             sidecar_script_dir: "scripts".to_string(),
+            defer_deeplc_to_multihead: false,
         }
     }
 }
@@ -723,6 +745,67 @@ pub struct RtImTrainConfig {
     /// DIA-NN library iRT and 10,181 from a per-run fine-tune, with `w_rt` 343 s against
     /// 632 s and 472 s (docs/08 section 4c). `run-experiment` predicts once per experiment.
     pub library_irt: LibraryIrt,
+    /// Worker processes for the whole-library DeepLC prediction: the multi-head
+    /// calibration, the base-model re-prediction under `library_irt`, and the prediction
+    /// after `finetune_deeplc` (`deeplc_finetune.py --shards`). The calibration or the
+    /// fine-tuned model is fitted once and handed to every process, and each process
+    /// predicts a contiguous slice of the unique sequences cut at a multiple of the
+    /// 100,000-sequence prediction call, so it makes the calls one process would have made.
+    /// The thread budget (the engine's thread count after the DeepLC thread cap) is divided
+    /// evenly, so `K` processes get `budget / K` torch threads each. `1` (the default) is
+    /// one process, the behaviour before this setting existed; `0` is automatic, one
+    /// process per 8 threads of the budget. A GPU always gets one process.
+    ///
+    /// Whether sharding pays is not established. docs/32 attributes the per-process rate
+    /// (about 6,000 sequences per second) to featurisation, which is single-threaded
+    /// Python. On the one CPU measured so far (an i9 desktop, docs/08, "Sharded
+    /// whole-library prediction") the forward pass dominated at 8 threads or fewer and
+    /// scaled with threads inside one
+    /// process, so four processes of two threads were no faster than one of eight.
+    /// Sharding is expected to help only where one process stops scaling with threads,
+    /// as the multi-head step did on doxy (10:41 at 96 threads, 18:09 at 128); the survey's
+    /// arithmetic for HYE at 8 to 12 shards is 2.5 to 4.5 minutes, unmeasured. With `K`
+    /// processes at the same threads each as one process the `predicted_irt` column is
+    /// bit-identical (`tests/python/test_deeplc_predict.py`). At the same engine thread
+    /// count the fit is the same, but each process predicts on `budget / K` threads
+    /// instead of `budget`, and torch's CPU kernels round differently at a different thread
+    /// count: most rows move in the last bits, and under the multi-head calibration a few
+    /// sequences at the edge of the reference range move by up to about two minutes (129 s
+    /// measured, docs/13, "DeepLC thread cap"). A sharded run is therefore float-equivalent
+    /// to an unsharded one, not bit-identical. Each process is its own Python process with
+    /// torch and DeepLC loaded (0.57 GB resident after the model load on the desktop
+    /// measured, of which the model is about 35 MB), and this step can hold the
+    /// process-tree peak. Validate on two acquisitions (peptides at 1% inside the seed
+    /// spread, `docs/08_rt_im_train.md` section 4d) before defaulting it on.
+    pub deeplc_predict_shards: usize,
+    /// Directory for DeepLC's run-independent trunk projection (`deeplc_finetune.py
+    /// --projection-cache`). `null` (the default) is off.
+    ///
+    /// Calibrated RT is `ridge(spline_h(head_h(proj(trunk(x)))))` over the selected heads,
+    /// and only the head selection, the splines and the ridge depend on a run. The
+    /// projection, 64 float32 per sequence, depends on the sequence and the model alone, yet
+    /// every multi-head calibration and base-model re-prediction recomputed it, which is
+    /// essentially the whole of the step (10:41 of the HYE multi-head step at 96 threads).
+    /// Set, the first call over a sequence list writes `<dir>/<key>/projections.npy` (the
+    /// key covers the DeepLC version, the model file and the exact list; 256 B per
+    /// sequence, about 1.26 GB for HYE's 4.91M) and later calls over the same list read it
+    /// and evaluate only the heads they need: `rt_library_scope = per_run`, every rerun of
+    /// an experiment, and the bands of `groups.rt_adaptation = once_per_run` across runs.
+    /// A miss computes the projection in one process on the whole prediction-thread budget,
+    /// the threads a one-process prediction gets (`deeplc_predict_shards` does not split
+    /// it). Base model only: a fine-tune has no factored head and ignores it.
+    ///
+    /// Float-equivalent, not bit-identical: the heads are evaluated in numpy from the cached
+    /// factors instead of in torch. Measured with DeepLC 4.5.0 on CPU: the base-model
+    /// re-prediction bit-identical on every row of the smoke library (3,820 rows); the
+    /// multi-head calibration bit-identical on 3,782 of those rows and within 7.6e-6 s on
+    /// the rest, and on a synthetic 572-row library with sequences outside the anchors'
+    /// range 402 rows identical and 7 above 1e-3 s, the largest 3.7 s, which is the spline
+    /// edge amplification a thread-count change shows too (docs/13). A hit took 0.12 s
+    /// against 7.0 s for the prediction. Validate at scale as a DeepLC version change:
+    /// per-row max |delta predicted_irt|, the selected heads, and peptides at 1% inside the
+    /// seed spread on two acquisitions.
+    pub deeplc_projection_cache: Option<String>,
 }
 
 /// Source of `predicted_irt` for an imported library; see `RtImTrainConfig::library_irt`.
@@ -809,6 +892,8 @@ impl Default for RtImTrainConfig {
             rt_window_min_s: 1.0,
             window_holdout_frac: 0.0,
             library_irt: LibraryIrt::Auto,
+            deeplc_predict_shards: 1,
+            deeplc_projection_cache: None,
         }
     }
 }
@@ -1164,6 +1249,24 @@ pub struct FeaturesConfig {
     /// overlaps the existing `ms1_isotope_cosine_apex`, so it is opt-in and
     /// benchmark-gated rather than default-on (AlphaDIA-plan item 12).
     pub ms1_precursor_features: bool,
+    /// Chromatogram decode threads in the main feature pass. The pass decodes the
+    /// chromatogram table one chunk at a time while the features of the chunk before are
+    /// computed; with one loader the whole decode ran on a single core, which bound the
+    /// stage whenever decoding a chunk took longer than computing one (measured on an
+    /// 8-12-mer immunopeptidomics run before the decode overlapped the computation: 3.7 of
+    /// a 4-minute stage were the load). Each loader reads its own chunk from that chunk's
+    /// row span, and the computation takes the chunks in table order, so the chunks, every
+    /// feature value and the features table bytes are the same at every setting; only the
+    /// time and the memory move. The pass holds up to `chrom_loaders + 1` decoded chunks
+    /// (0.92 GiB of traces each at the HYE benchmark shape, docs/27 section 3.4), where one
+    /// loader held two. The value is an upper bound: a pass never runs more loaders than
+    /// `--threads` (the engine's thread pool) or than it has chunks, so `--threads 1` decodes
+    /// on one loader as before. Loaders beyond each pass's first come from a process-wide
+    /// pool of four, so concurrent bands or runs (`groups.parallel`,
+    /// `experiment.parallel_runs`) share that pool instead of multiplying it. Default 3; `1`
+    /// restores the single loader and `0` is read as `1`. A memory knob and a speed knob,
+    /// not a sensitivity knob.
+    pub chrom_loaders: usize,
 }
 impl Default for FeaturesConfig {
     fn default() -> Self {
@@ -1183,6 +1286,7 @@ impl Default for FeaturesConfig {
             bound_from_confident: true, // fixed feature window from confident-seed norm
             bound_confident_pct: 50.0, // median confident half-width
             ms1_precursor_features: false, // opt-in; overlaps ms1_isotope_cosine_apex
+            chrom_loaders: 3,
         }
     }
 }
@@ -1858,6 +1962,29 @@ pub struct ExperimentConfig {
     /// does a long batch where drift accumulates (see the measured cost above).
     #[serde(alias = "finetune_scope")]
     pub rt_library_scope: RtLibraryScope,
+    /// Threads given to converting and seeding runs 2..N while run 1 adapts the library's
+    /// retention times, under `rt_library_scope = first_run_only`. `0` (the default) runs
+    /// them after run 1, as before.
+    ///
+    /// Runs 2..N convert their spectra and seed on the base library (the seed is
+    /// iRT-independent), so nothing of theirs waits for run 1's adapted library until
+    /// rt-im-train. Set to `N`, those fronts run on a pool of `N` threads while run 1's
+    /// DeepLC sidecar gets the remaining `threads - N` (disjoint budgets), and every run's
+    /// rest follows once run 1 has finished. On the six-file HYE Astral experiment a
+    /// front is convert 1.9-2.5 min plus seed 0.4 min per file, against a first-run
+    /// multi-head step of 11.7 min, so up to about 12 minutes of fronts fit behind it.
+    ///
+    /// Ungrouped runs only: a grouped run seeds per band inside its band loop, and its
+    /// adaptation sits between those band seeds and its extract. The fronts' outputs are
+    /// byte-identical; run 1's DeepLC predicts on `threads - N` torch threads instead of
+    /// `threads`, which moves the adapted library in the last bits unless the DeepLC thread
+    /// cap binds both counts to the same number (on an SMT host with `N` below the
+    /// logical-minus-physical core count it does). Float-equivalent, hence opt-in. The
+    /// fronts keep the ungrouped experiment's phase order: every conversion first, then one
+    /// seed library and fragment index for all of their seeds (run 1 seeds on its own
+    /// load before the overlap starts). That library is held beside the DeepLC worker while
+    /// the fronts seed, which is where the experiment's peak can sit. Not measured at scale.
+    pub overlap_front_threads: usize,
 }
 
 impl Default for ExperimentConfig {
@@ -1865,6 +1992,7 @@ impl Default for ExperimentConfig {
         Self {
             parallel_runs: 1,
             rt_library_scope: RtLibraryScope::FirstRunOnly,
+            overlap_front_threads: 0,
         }
     }
 }
@@ -1882,6 +2010,36 @@ pub enum GroupCalibration {
     /// Each group calibrates on its own seeds only. Cheaper by one pooling pass and fully
     /// independent per group; kept for the comparison, not as a recommendation.
     PerGroup,
+}
+
+/// What a grouped run's band plan balances.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum GroupBalance {
+    /// The estimated library precursors each band selects. The behaviour before this setting
+    /// existed.
+    #[default]
+    Precursors,
+    /// The estimated search cost: per window, the precursors it selects times the MS2 peaks
+    /// its scans carry.
+    Cost,
+}
+
+/// How often a grouped run adapts the library's retention times (the multi-head calibration
+/// or the base-model re-prediction) under `groups.calibration = global`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum GroupRtAdaptation {
+    /// One DeepLC sidecar per band, each fitting the pooled anchors and predicting its own
+    /// band. The behaviour before this setting existed.
+    #[default]
+    PerBand,
+    /// One sidecar per run over the union of the bands: the calibration is fitted once, each
+    /// unique sequence is predicted once, and every band's table is written under the name
+    /// a per-band run gives it. A library the caller already re-predicted with the base
+    /// model (`run-experiment` with the multi-head calibration off) is not re-predicted per
+    /// band again.
+    OncePerRun,
 }
 
 /// Searching a run one isolation-window group at a time.
@@ -1910,11 +2068,67 @@ pub struct GroupsConfig {
     /// bands the largest band took 39 GB and the median far less. Results do not depend on
     /// it; bands are independent and their artifacts are pooled in band order either way.
     ///
+    /// The bands go through a bounded queue: this many workers each take the next band as
+    /// soon as their current one is done, most expensive first (estimated precursors times
+    /// MS2 peaks of the band's windows for the seed and extract, accepted rows for features
+    /// and compete), rather than in fixed chunks that waited for their slowest band.
+    ///
     /// It must stay below the thread count: a band in flight parks one worker on its
     /// accumulation channel, so as many bands as there are threads leaves nothing to do the
     /// probing and the run deadlocks. A larger value is clamped to `threads - 1` with a
     /// warning rather than hanging.
     pub parallel: usize,
+    /// How often the library's retention times are adapted under `calibration = global`:
+    /// `per_band` (the default) runs one DeepLC sidecar per band, `once_per_run` one per run
+    /// over the union of the bands. `per_group` calibration always adapts per band.
+    ///
+    /// Each per-band sidecar starts an interpreter, imports torch and DeepLC, reads the
+    /// pooled seed, refits the same heads on the same anchors (head 2503 in every band of
+    /// the HYE sweep) and predicts every sequence of its band, so a sequence whose charge
+    /// states fall in two bands is predicted twice (10.9M HYE rows are 4.91M unique
+    /// sequences). On HYE Astral the multi-head step took about 13 min unbanded and 19-24
+    /// min at 2-16 bands. `once_per_run` fits once, predicts the union once and writes each
+    /// band's table under the name a per-band run gives it
+    /// (`groups/gNN/lib_precursors_multihead.parquet` or `lib_precursors_deeplc.parquet`),
+    /// so the shared-band reuse of later runs and the seed refresh are unchanged. Under
+    /// `run-experiment` with the multi-head calibration off, the library is re-predicted
+    /// once for the experiment, and the bands then keep those values instead of each band
+    /// of each run re-predicting them.
+    ///
+    /// Float-equivalent, not bit-identical: a sequence is predicted in different company,
+    /// and torch's CPU kernels round by batch. On a synthetic library, one call over
+    /// contiguous bands writes exactly the whole-library column band by band
+    /// (`tests/python/test_deeplc_predict.py`). Validate on two acquisitions (peptides at
+    /// 1% inside the seed spread, the per-band max |delta predicted_irt| and the selected
+    /// heads) before defaulting it on.
+    pub rt_adaptation: GroupRtAdaptation,
+    /// What the band plan balances: `precursors` (the default), the estimated library
+    /// precursors per band, or `cost`, per window the precursors it selects times the MS2
+    /// peaks of its scans.
+    ///
+    /// Band cost follows spectral density more than precursor count: on the
+    /// immunopeptidomics search two bands of 2.98M and 3.03M precursors took 42 s and 460 s,
+    /// and at 81-94 bands the slowest windows (418-460 s) set the floor of the run. The
+    /// queue already starts the most expensive bands first whatever this says; `cost` also
+    /// moves the cuts, so that no band is several times the work of the others.
+    ///
+    /// Output-changing, hence opt-in: the cuts decide which candidates sit at a band edge,
+    /// which the overlap deduplication and the edge candidates' neighbours depend on, and the
+    /// pooled row order the classifier sees. Validate like a band-count change (docs/33
+    /// section 8): peptides at 1% inside the seed spread against `precursors`, and the per-band
+    /// wall times, on two acquisitions. Note that the MS2 is decoded before the plan under
+    /// either setting.
+    pub balance: GroupBalance,
+    /// Delete each band's `psms_extracted.parquet` and `features.parquet` (with their
+    /// reports and schema companions, and `run.pin` where one was written) once the pool is
+    /// written. Default `false`. Disk only: no stage reads them after pooling. The features
+    /// are carried by the competed table and the extracted table's one reader, the
+    /// candidate audit, reads the pooled copy. On the immunopeptidomics runs the band
+    /// features alone were 55 GB per run, in an experiment that wrote about 2.7 TB of
+    /// artifacts. The manifest keeps their records, and the band directories can no longer
+    /// be re-featured; the chromatograms and competed tables that `mumdia pool
+    /// --groups-dir` re-pools from are kept.
+    pub delete_band_intermediates: bool,
 }
 impl Default for GroupsConfig {
     fn default() -> Self {
@@ -1922,6 +2136,9 @@ impl Default for GroupsConfig {
             window_groups: 1,
             calibration: GroupCalibration::Global,
             parallel: 1,
+            rt_adaptation: GroupRtAdaptation::PerBand,
+            balance: GroupBalance::Precursors,
+            delete_band_intermediates: false,
         }
     }
 }
@@ -1989,6 +2206,19 @@ impl Config {
         } else {
             self.predict_frag.rt_predictor == RtPredictorKind::Deeplc
         }
+    }
+
+    /// Whether a FASTA library build writes the native model's iRT as a placeholder
+    /// instead of running DeepLC (`predict_frag.defer_deeplc_to_multihead`): set, with
+    /// `rt_predictor = deeplc`, and the multi-head calibration going to re-predict every row.
+    pub fn defers_library_deeplc(&self, library_input: bool, has_deeplc: bool) -> bool {
+        !library_input
+            && self.predict_frag.defer_deeplc_to_multihead
+            && self.predict_frag.rt_predictor == RtPredictorKind::Deeplc
+            && self
+                .rt_im_train
+                .multihead_heads(has_deeplc, self.deeplc_rt_source(false, has_deeplc))
+                > 0
     }
 
     /// Parse from a JSON string, rejecting unknown keys, then validate.
@@ -2992,6 +3222,50 @@ mod tests {
             !d.deeplc_rt_source(true, false),
             "imported library, no interpreter"
         );
+    }
+
+    #[test]
+    fn deeplc_predict_shards_defaults_to_one_process_and_parses() {
+        assert_eq!(Config::default().rt_im_train.deeplc_predict_shards, 1);
+        let c = Config::from_json(r#"{"rt_im_train":{"deeplc_predict_shards":8}}"#).unwrap();
+        assert_eq!(c.rt_im_train.deeplc_predict_shards, 8);
+        let auto = Config::from_json(r#"{"rt_im_train":{"deeplc_predict_shards":0}}"#).unwrap();
+        assert_eq!(auto.rt_im_train.deeplc_predict_shards, 0);
+    }
+
+    #[test]
+    fn the_library_deeplc_pass_is_deferred_only_where_the_multihead_replaces_it() {
+        let on = |json: &str| Config::from_json(json).unwrap();
+        let deferred =
+            on(r#"{"predict_frag":{"rt_predictor":"deeplc","defer_deeplc_to_multihead":true}}"#);
+        assert!(deferred.defers_library_deeplc(false, true));
+        // Off by default; never for an imported library; not without an interpreter (no
+        // multi-head runs); not with the multi-head calibration off; not for native RT.
+        let default = on(r#"{"predict_frag":{"rt_predictor":"deeplc"}}"#);
+        assert!(!default.defers_library_deeplc(false, true));
+        assert!(!deferred.defers_library_deeplc(true, true));
+        assert!(!deferred.defers_library_deeplc(false, false));
+        let no_mh = on(
+            r#"{"predict_frag":{"rt_predictor":"deeplc","defer_deeplc_to_multihead":true},
+                          "rt_im_train":{"multihead_calibration":0}}"#,
+        );
+        assert!(!no_mh.defers_library_deeplc(false, true));
+        let native = on(r#"{"predict_frag":{"defer_deeplc_to_multihead":true}}"#);
+        assert!(!native.defers_library_deeplc(false, true));
+    }
+
+    #[test]
+    fn the_banded_rt_adaptation_defaults_to_per_band_and_parses() {
+        assert_eq!(
+            Config::default().groups.rt_adaptation,
+            GroupRtAdaptation::PerBand
+        );
+        let c = Config::from_json(r#"{"groups":{"rt_adaptation":"once_per_run"}}"#).unwrap();
+        assert_eq!(c.groups.rt_adaptation, GroupRtAdaptation::OncePerRun);
+        assert!(Config::from_json(r#"{"groups":{"rt_adaptation":"sometimes"}}"#).is_err());
+        assert_eq!(Config::default().groups.balance, GroupBalance::Precursors);
+        let c = Config::from_json(r#"{"groups":{"balance":"cost"}}"#).unwrap();
+        assert_eq!(c.groups.balance, GroupBalance::Cost);
     }
 
     #[test]

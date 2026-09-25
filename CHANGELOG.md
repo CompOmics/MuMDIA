@@ -193,7 +193,65 @@ than a number. Both are recorded in every run's `manifest.json`.
   depended on the previous order. `scripts/sort_fragments.py` applies the same rewrite to a
   table written before this change; the engine still loads an unsorted table through a
   filtered scan, with a warning.
+- **The generated config reference cites functions, not line numbers.**
+  `ci/gen_config_reference.py` cited every environment read as `path:line` and every
+  config struct and enum by its line, and `configs/config-schema.json` carried a
+  `source_line` per setting. Any merge that moved lines in `rescore.rs`, `config.rs`,
+  `main.rs` or a sidecar script therefore made both files stale on every other open pull
+  request, although no variable, field or default had changed. A read is now cited as
+  `path::function` (`Type::method`, `Trait::method`, `module::function` and
+  `outer::inner` in Rust, `Class.method` in Python, `<module>` outside any function), a
+  struct or enum by its name, and the schema field
+  `source_line` is replaced by `source_struct`, the declaring struct (the desktop editor
+  never read either). `--check` also regenerates from copies of every input with blank
+  lines inserted and fails if either artifact differs;
+  `tests/python/test_gen_config_reference.py` pins the same property on synthetic
+  sources. Two reads in one function now share one citation, so the `Read at` column
+  has fewer entries. In the list of reads whose name is not a literal, such reads share
+  one entry that gives their number, and the header still counts reads. The variables,
+  their defaults, the fields and the settings are unchanged.
+  The generator also skips a `#[cfg(test)]` element by the element's own extent
+  (`cfg_test_item_end`), not by counting braces to the next balanced `}`. The old count
+  ran past an attribute on something without a body: on an enum variant it took the
+  enum's closing brace and the next item's header, so a source with a test-only variant
+  was rejected as unbalanced, and on a statement (`inject(Fault::Publish)?;`) it silently
+  blanked real code up to the end of the next block. The reference generated from main is
+  unchanged by this.
+
+### Performance
+
+- **The `nn_torch` worker spends less time outside training, with byte-identical
+  scores.** The parquet load decodes the next row group on a reader thread
+  (`pre_buffer=True`) while up to 8 threads write the current one straight into the
+  matrix, keeping the float64 moment partition and order (1,000,000 x 387: 11.8 s to
+  2.4 s); the init feature scan counts its columns on a thread pool (400,000 x 120:
+  24.9 s to 4.3 s), with at most 1 GiB of sort transients in flight
+  (`MUMDIA_NN_SCAN_MEM_GB`) when the init sample escalates toward the whole fold;
+  scoring batches are gathered with `torch.index_select` into one reused
+  numpy-allocated buffer (4.7x on the gather; identity checked on Windows x86-64 with
+  torch 2.6, CPU and CUDA, not yet on the Linux fleet); each round's positives come from a certified top window instead of a
+  full stable sort (10M scores: 1.69 s to 0.08 s), and the decoy order of the hybrid cap
+  from one uint64 key sort; the training pool is no longer scored after the last round,
+  whose scores fed only a log line. Every change keeps a switch back to the code it
+  replaced (`docs/13_sidecars.md`). Tests assert equal score bytes with all of them set
+  back and against the worker before the change (extracted from git history), for the
+  in-memory, streaming and TSV paths. The worker also prints read, fill, standardise
+  and selection sub-timers, and removes its memmap after a failed run as well.
+
 ### Added
+
+- **Opt-in concurrent fold training for `nn_torch` (`MUMDIA_NN_PARALLEL=K`).** The
+  (seed, fold) tasks train in K spawned processes at a fixed per-process thread count
+  (`MUMDIA_NN_PARALLEL_THREADS`), sharing the matrix through a read-only memmap. The
+  epoch shuffle is then keyed per (seed, fold, iteration, epoch), which changes the scores
+  once, like a seed change; they do not depend on K. Off by default; validate it as a seed
+  change (three seeds, two pools, entrapment) before relying on it.
+
+- **`psms_scored.parquet.report.json` records the NN worker's inherited environment.**
+  When `nn_torch` ran, `params.nn_env` lists every `MUMDIA_NN_*` variable the worker
+  inherited beyond the ones the engine sets. `MUMDIA_NN_SEED`, `MUMDIA_NN_THREADS` and
+  `MUMDIA_NN_PARALLEL` change the scores and reach the worker only this way, so two runs
+  of one configuration that differ in them are now told apart by the report.
 
 - **`mumdia pool` pools a grouped run's band artifacts from the command line.** `run` does
   this itself at the end of a grouped search; standalone it is for the case where the

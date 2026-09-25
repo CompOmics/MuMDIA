@@ -812,11 +812,14 @@ the only thing that exercises it is a FASTA-mode library build.
 and the smoke job exercise native paths only. Inside `cargo test` there is still
 no stage-level test for `convert`, `search-seed`, `predict-frag`, the `run`
 orchestrator, `manifest.json`, `inspect`, or the library-input path; `ci/smoke.sh`
-now covers all of those except the library-input path, but it runs outside
-`cargo test`, so a green `cargo test --workspace` alone still proves none of them.
-The real sidecar strategies (MS2PIP, DeepLC, DeepLC fine-tune, mokapot, the
+now covers all of those, the library-input path only in its stub-DeepLC arm (5b), but it
+runs outside `cargo test`, so a green `cargo test --workspace` alone still proves none of
+them. The real sidecar strategies (MS2PIP, DeepLC, DeepLC fine-tune, mokapot, the
 PyTorch NN, entrapment, MBR) never run in the test suite or in CI; only the native
-fallbacks are covered. (Percolator is not a gap but a rejection: `validate`
+fallbacks are covered. Arm 5b replaces `deeplc_finetune.py` with a stub that copies
+each library table and logs its call, so what CI checks there is which DeepLC calls the
+orchestrators make and where the tables go (`groups.rt_adaptation`, band-slice reuse, the
+deferred-DeepLC refusal, `experiment.overlap_front_threads`), not any retention time. (Percolator is not a gap but a rejection: `validate`
 refuses it, `config.rs:1512`.) This gap has already shipped one real defect: a
 module-level import reordering in `scripts/deeplc_worker.py` made every
 FASTA-mode DeepLC prediction abort on Windows, and a green workspace suite plus a

@@ -46,7 +46,17 @@ the CLI in `main.rs:535` (`Cmd::Extract`) and from the orchestrator in
 
 ### Inputs (`ExtractParams`, `extract.rs:83`)
 
-- `ms2` (Parquet): converted MS2 scans, loaded via `load_ms2` (`extract.rs:1348`).
+- `ms2` (Parquet): converted MS2 scans, loaded via `load_ms2`. On the fragindex
+  matcher the MS2 and MS1 decodes run concurrently with the library load and the
+  index build; the mass calibration JSON is read first because its learned tolerance
+  is the one the index is built at, and its log lines and errors keep their old place
+  after the spectra. A caller may lend the decodes (`ExtractParams::scans`): a
+  grouped search lends both to every band, and the ungrouped `run` lends the seed's
+  MS2 alone (`SharedScans::ms1 = None`, so extract still decodes the MS1 concurrently
+  with its library load, and its errors keep their place after the library's). `run`
+  lends only when no DeepLC step ran in between and `extract.matcher` is `fragindex`:
+  the bucketed matcher's library load builds a sorted copy of every fragment, and scans
+  held from the seed would sit through that transient.
   Each `Ms2Scan` carries `rt_seconds`, an isolation `window` (`lower_mz`,
   `upper_mz`), and centroided `peaks` (`mz`, `intensity`). This stage applies no
   peak cap of its own: the MS2 peak budget is fixed at conversion time by
@@ -59,11 +69,20 @@ the CLI in `main.rs:535` (`Cmd::Extract`) and from the orchestrator in
   skips building the bucketed `page_search` index when the fragindex backend is
   selected (`index.rs:73`).
 - `run_windows` (Parquet): per-candidate RT windows, columns `candidate_id`,
-  `rt_pred_cal`, `rt_lo`, `rt_hi` (read at `extract.rs:1330`, scattered into the
-  dense `rt_lo`/`rt_hi`/`rt_cal` arrays indexed by `candidate_id`,
-  `extract.rs:1342`). Candidates with no window row keep `[-inf, +inf]` and
-  `rt_cal = 0.0` (`extract.rs:1336`); the `0.0` disables the Gaussian RT prior for
-  those candidates (the prior requires `rt_cal > 0`, `extract.rs:1855`).
+  `rt_pred_cal`, `rt_lo`, `rt_hi`, read by `read_run_windows` and scattered into the
+  dense `rt_lo`/`rt_hi`/`rt_cal` arrays indexed by `candidate_id`. The decoded
+  columns (28 bytes per row) are dropped as soon as the scatter is done, so only the
+  24-byte-per-candidate dense copy lives through the extraction. Candidates with no
+  window row keep `[-inf, +inf]` and `rt_cal = NaN`, the same "calibration
+  unavailable" sentinel `rt-im-train` writes; the NaN disables the Gaussian RT prior
+  for those candidates (the prior requires `rt_cal > 0`). A NaN `rt_lo` or `rt_hi` is
+  rejected with the row named, because a NaN bound would match every scan. An
+  orchestrator hands the same three arrays over in memory
+  (`ExtractParams::rt_windows`, from `rt_im_train::run_in_memory`); extract uses
+  them only when they were fitted on its own `library_precursors` path, written to
+  its own `run_windows` path, and cover exactly its library's candidates
+  (`RtWindows::mismatch`), and reads the file otherwise, so the arrays and every
+  output are the same either way (docs/08, "The in-memory handoff to extract").
 - `ms1` (optional Parquet): MS1 scans via `load_ms1` (`extract.rs:1350`). When
   absent, all MS1 columns are null.
 - `mass_cal` (optional JSON, the seed's `<seed>.masscal.json`): reads
@@ -99,6 +118,29 @@ Column order and types from `extract.rs:2480`:
 | `ms1_mono` | OptF64 | MS1 monoisotopic intensity |
 | `ms1_iso1` | OptF64 | MS1 +1 isotope intensity |
 | `ms1_iso2` | OptF64 | MS1 +2 isotope intensity |
+
+The rows are written as they are produced (`PsmStream`). Each time 65,536 rows have
+accumulated (`WRITE_TABLE_CHUNK_ROWS`) they go to the table's `TableWriter`, which is
+exactly the chunk sequence `write_table` cut the whole table into, so the file is
+byte-identical to the one written at the end of the stage before 2026-09-25 while only
+one chunk of rows is resident (at most about 6 GB less on an unbanded
+immunopeptidomics run). `the_streamed_psms_table_is_the_write_table_file` checks the
+bytes at 0, 1, 65,536, 65,537 and 131,075 rows, with every optional column group.
+The one exception is `emit_demix_features`: its five columns are patched in after the
+candidate loop, so the rows are kept whole and written at the end through
+`write_table_hashed`, which produces the same chunks. Either way the table, like the
+chromatograms, is hashed as it is written, so the report's content hash needs no
+read-back (`docs/03_io_layer.md`, "Hash on write"). The stage logs `extract:
+psms_extracted writer` with the row count, whether the table was streamed and the
+writer's busy time.
+
+A chunk write that fails inside the candidate loop stops the loop, and the stage
+then publishes neither table: the chromatogram writer is dropped unclosed
+(`close_chromatograms`), so its temporary file is removed and a chromatograms table
+already at the path stays as it was, as the `psms_extracted` one does. Publishing
+the chromatograms there would put a truncated table beside an older
+`psms_extracted`. Before the rows were streamed, the psms table was written after
+the chromatograms were complete, so this case could not arise.
 
 Conditional columns (default-off, added only when the knob is set so the
 production schema stays byte-identical):
@@ -276,10 +318,18 @@ wrote 127 byte-identical artifacts against a binary built from the parent commit
 five that differ are logs and a work-directory path inside `planted.json`).
 
 Two matcher backends dispatch through `Prober::probe` (`extract.rs:57`):
-- `MatcherKind::Fragindex` (default): builds a `FragIndex` once at the learned
-  tolerance (`extract.rs:1431`). `FragIndex::probe_peak` (`fragindex.rs:169`)
-  probes bins `bin-1 ..= bin+1`, verifies each posting with the exact f64 ppm
-  predicate, and carries the **true generating fragment ordinal** in `post_frag`.
+- `MatcherKind::Fragindex` (default): probes bins `bin-1 ..= bin+1` of the
+  whole-library log-space geometry at the learned tolerance, verifies each posting
+  with the exact f64 ppm predicate, and carries the **true generating fragment
+  ordinal** in `post_frag`. On the default streamed path each probing task builds a
+  `LocalIndex` over its own candidate sub-range and the global `FragIndex` is not
+  built; the two-pass arbitration and `emit_demix_features`, which probe arbitrary
+  candidate windows, build the global index as before (docs/06, "Task-local
+  indexes"). The postings a task sees, and their order, are the narrowed global
+  index's, so the outputs are the same either way
+  (`candidate_range_split_reproduces_the_unsplit_accumulation` compares the two
+  probes callback for callback on every task shape of its fixture and the two
+  accumulations hit for hit).
 - Bucketed fallback (`MatcherKind::Bucketed`): `Library::page_search`
   (`index.rs:350`) resolves the fragment ordinal by nearest stored m/z via
   `Library::local_frag_index` (`index.rs:325`). This is a semantic difference for
@@ -295,21 +345,42 @@ by precursor m/z. This is what makes a per-window probe cheap.
 ### 2. Peak-major accumulation
 
 The accumulator `acc: HashMap<u32, Vec<Hit>>` (`extract.rs:1435`) maps each
-candidate to the observed hits it collected. A `Hit` (`extract.rs:108`) is
-`{rt, frag, inten, obs_mz}`. Entries are created lazily on the first collision.
+candidate to the observed hits it collected. A `Hit` is `{scan, frag, inten,
+obs_mz}`, 16 bytes: `scan` is the index of the scan in the stage's `scans` slice,
+whose `rt_seconds` is the hit's RT (`hit_rt`), and `obs_mz` is the peak's own f32
+m/z. Until 2026-09-25 it was 24 bytes, carrying a copy of the scan RT as an f64 and
+the f32 m/z widened to an f64; both are recovered exactly, so no value moved. Code
+that depends on the order of hits sorts and groups them on the looked-up RT, never on
+the scan index, and the two-pass elution profile still keys on the RT's bits, so two
+scans that share an RT behave as they always did. Entries are created lazily on the
+first collision.
 
 There are three accumulation paths:
 
-- **Parallel per-window, single-pass** (`extract_accumulate_windows`,
-  `extract.rs:662`): used when `fidx` is present and there is no `restrict` list
-  and the path is not two-pass. Scans are grouped by isolation window (each scan
-  belongs to exactly one window), and the ~150 windows are processed in parallel
-  with rayon. It is bit-identical to the serial loop because the per-candidate
-  cascade rt-sorts hits before summing, and same-rt hits for a candidate all come
-  from one window (`extract.rs:1456`).
-- **Serial single-pass** (`extract.rs:1462`): the fallback when there is a
-  `restrict` allowlist or no fragindex. It honors every non-co-elution
-  `peak_claim` strategy.
+- **Streamed, single-pass** (`accumulate_groups`): the default, used with the
+  fragindex matcher whenever the path is not two-pass, with or without a `restrict`
+  allowlist. Scans are grouped by isolation window, a batch of
+  `extract.windows_in_flight` windows is probed at a time, and each window is cut
+  on a shared grid of candidate sub-ranges; one task probes one (sub-range, window)
+  pair through its own `LocalIndex`. A sub-range is flushed to the per-candidate
+  pass as soon as every window of the batch has reported, so the accumulator holds
+  the windows in flight rather than the run. A flush hands the pass at most
+  `CAND_CHUNK` candidates. When every candidate of a flush sits in one window's
+  store as its only segment, which is the common case (a sub-range reached by one
+  window, no leftovers from the batch before), the flush lends slices of that store
+  directly (`single_run_span`, `flush_below`); otherwise the candidates are
+  gathered and concatenated window by window into a reusable buffer first. The
+  zero-copy flush hands over exactly the batches the gather would build, because
+  each flush becomes one chromatogram chunk and the parquet page framing follows
+  the chunk sizes (`the_zero_copy_flush_hands_over_the_batches_the_gather_builds`).
+  Its effect on the AIF run (1.8M candidates, standalone extract, commit against
+  its parent, interleaved on an i9-13900KS) is inside run-to-run noise: +0.4% wall
+  at 32 threads (11 pairs), +1.9% and -2.7% at one thread (12 and 5 pairs), peak
+  working set within 10 MiB. The copy it removes is at most about 1% of extract by
+  the survey's estimate, so AIF cannot resolve it; it was not measured on a larger
+  run.
+- **Serial single-pass**: the fallback of the bucketed matcher. It honors every
+  non-co-elution `peak_claim` strategy.
 - **Two-pass co-elution** (`extract_twopass_windows`, `extract.rs:787`): used
   when `peak_claim` is one of the `Coelution*` variants **or**
   `emit_contested_features` is set (`extract.rs:1443`). Like the single-pass
@@ -381,10 +452,32 @@ The cheap-to-expensive acceptance cascade, in order:
    `presence_min_coelution` are each floored at 1 via `.max(1)` (`extract.rs:1727`,
    `extract.rs:1926`, `extract.rs:1915`), so a configured 0 still requires at
    least one fragment.
-2. **Scan grouping**: hits are rt-sorted and grouped into scan groups
-   `Vec<(rt, BTreeMap<frag, intensity>)>`, deduping the same fragment within one
-   scan by max (`extract.rs:1735`). The `BTreeMap` fixes per-scan fragment order so
-   the f32 apex sum is deterministic.
+2. **Scan grouping**: hits are rt-sorted (on the looked-up scan RT) and grouped
+   into scan groups, deduping the same fragment within one scan by max. The groups
+   are one dense `ScanGroups` per candidate: the group RTs, a `groups x width` f32
+   value array and a presence bitmask of the same shape, `width` being one past the
+   largest fragment ordinal among the candidate's hits. Until 2026-09-25 each group
+   was a `BTreeMap<frag, intensity>`; the dense form answers the same questions
+   (count, fragments ascending, lookup, the values summed in ordinal order through
+   the same `Iterator::sum`) with the same values, so the f32 apex sum is
+   deterministic and unchanged, and it allocates three buffers per candidate
+   instead of a tree node per occupied group
+   (`dense_groups_answer_what_the_trees_answered`). Because `width` is one past the
+   largest observed ordinal rather than the number of observed fragments, the
+   buffers hold `groups x (max observed ordinal + 1)` f32 values plus the presence
+   words, at most `groups x n_predicted_fragments` values since ordinals are
+   candidate-local. That can exceed the traces the candidate emits: a candidate
+   that observed only ordinal 11 holds 12 values per group against one trace, and
+   in sparse (non-grid) mode a trace covers only the groups where its fragment
+   occurs. Measured on the AIF run against the tree form (standalone extract,
+   interleaved, i9-13900KS), the change is inside run-to-run noise: -1.5% wall at
+   32 threads (11 pairs, CPU time -0.3%), -1.5% and -3.7% at one thread (12 and 5
+   pairs), peak working set within 10 MiB. The survey estimated at most 1-2% of
+   extract; the saving grows with the scan groups per candidate, which AIF
+   exercises little, and it was not measured on a larger run.
+   Presence is a bit rather than a sentinel value, and a fragment first seen by a
+   later hit of the same group starts from 0.0 before the max, exactly as the tree's
+   `entry(..).or_insert(0.0)` did.
 3. **Acquisition-scan grid projection** (`extract.rs:1782`): when
    `emit_window_grid` is on, the sparse groups are projected onto the full set of
    covering-window scans inside the RT window, so missing acquisition scans count
@@ -507,6 +600,16 @@ isotope offsets and `sum_near` (`extract.rs:495`) to integrate within
 are the per-PSM columns, taken from the nearest MS1 scan to the apex RT
 (`extract.rs:1957`).
 
+The chromatogram rows of each candidate chunk are handed to one writer thread
+through a two-slot channel, so encoding overlaps extraction. The stage logs one
+`extract: chromatogram writer` line with `chunks`, `send_blocked_ms` (time the
+extraction side waited for a free channel slot, the column build excluded) and
+`writer_busy_ms` (time the writer thread spent in `write_cols`, plus the final
+`close`, which runs on the extraction side once the loop has ended). A
+`send_blocked_ms` near zero says the serial encoder does not bound the stage; one
+that approaches the stage's accumulation time says it does, and that a parallel
+column encoder (survey item R2) would pay off here. The line is log output only.
+
 ### 7. Top-K peak enumeration (`retain_top_peaks`)
 
 Two independent knobs consume the enumerator, and they must not be confused:
@@ -564,7 +667,7 @@ the training/FDR population and needs entrapment validation, not a count check.
 |---|---|---|
 | `run` | `extract.rs:1300` | Stage entry point; orchestrates load, accumulate, cascade, write |
 | `ExtractParams` | `extract.rs:83` | Input path bundle + config + config hash |
-| `Hit` | `extract.rs:108` | One observed hit: `rt`, `frag`, `inten`, `obs_mz` |
+| `Hit` / `hit_rt` | `extract.rs` | One observed hit (16 bytes): `scan`, `frag`, `inten`, `obs_mz`; `hit_rt` looks its RT up in `scans` |
 | `Contested` | `extract.rs:130` | Per-candidate two-pass contested-peak stats: `won`/`lost` intensity, `n_won`/`n_lost` peak counts, `apportioned` share |
 | `CandOut` | `extract.rs:1656` | Per-candidate parallel-map result (PSM row + chrom rows + peaks); one candidate may yield several |
 | `Prober` / `Prober::probe` | `extract.rs:38`, `extract.rs:57` | Dispatch a peak probe to fragindex or bucketed backend |
@@ -667,8 +770,9 @@ here for one index.
 
 - **Determinism**: output is emitted in ascending `candidate_id` order
   (`extract.rs:1651`); the parallel per-candidate map preserves that order via
-  `collect()`. Per-scan fragment maps are `BTreeMap` so f32 apex sums have a fixed
-  addition order (`extract.rs:1735`). The parallel window accumulation is documented
+  `collect()`. Per-scan fragment values are read in ascending ordinal order
+  (`ScanGroups`, which replaced a `BTreeMap` per scan group) so f32 apex sums have a
+  fixed addition order. The parallel window accumulation is documented
   as bit-identical to the serial loop (`extract.rs:1456`). A
   HashMap f32 sum shifting the apex once broke reproducibility; keep ordered maps
   and sorted iteration wherever floats are summed.
@@ -768,11 +872,12 @@ tests encode the behavioral invariants that gate tuning must preserve.
   as real `psms_extracted` rows carrying `peak_rank`, so they pick up the full
   feature vector downstream. What is still missing is per-candidate q-collapse over
   `(candidate_id, peak_rank)` and entrapment validation, so it stays default-off.
-- **New per-PSM columns**: append to the `CandOut` struct (`extract.rs:1656`), set
+- **New per-PSM columns**: append to the `CandOut` struct (`extract.rs:2682`), set
   it in the `rank0` construction (`extract.rs:2203`) and in the promoted-alternate
-  construction (`extract.rs:2297`), push it in the serial append loop
-  (`extract.rs:2435`), and add the `Col` in the `psms_cols` vector
-  (`extract.rs:2480`). Gate any non-production column behind an `emit_*` flag to
+  construction (`extract.rs:2297`), add a vector to `PsmRows`, push it in
+  `PsmRows::push` and emit its `Col` in `PsmRows::take_cols`, which writes the
+  columns in the table's order for every streamed chunk. Gate any non-production
+  column behind an `emit_*` flag to
   preserve the byte-identical default schema, and bump the schema version in
   `schema.rs` if the default schema changes.
 - **IM / 4D**: `apex_im` and the IM data-model hooks exist but are unfilled; a

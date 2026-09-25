@@ -173,28 +173,15 @@ fn process_run(
     top_peaks_ms2: usize,
     max_spectra: usize,
     shared_rt_lib: Option<&str>,
+    // `lib_p_base` is the experiment-level base-model re-prediction of the imported iRT.
+    library_irt_repredicted: bool,
+    // An earlier grouped run's `groups/` directory whose band slices this run may reuse.
+    slices_from: Option<&str>,
+    // `lib_p_base` carries placeholder iRT the multi-head calibration must replace in full
+    // (`predict_frag.defer_deeplc_to_multihead`).
+    irt_placeholder: bool,
 ) -> Result<(String, String, Option<String>)> {
-    let d = |name: &str| format!("{out}/{name}");
-    std::fs::create_dir_all(out).ok();
-    // Fold the conversion caps into the convert artifacts' provenance key, exactly as
-    // both the standalone `convert` subcommand and single-run `run` do. The caps change
-    // the spectra output but are not part of the config, so the bare config hash made
-    // two experiments with different caps record identical convert provenance.
-    let convert_hash = mumdia_io::hash::blake3_str(&format!(
-        "{}\u{1f}max_spectra={}\u{1f}top_peaks_ms2={}\u{1f}top_peaks_ms1={}",
-        cfg.canonical_json(),
-        max_spectra,
-        top_peaks_ms2,
-        0
-    ));
-    let co = convert::run(convert::ConvertParams {
-        mzml,
-        out_dir: &d("spectra"),
-        max_spectra,
-        top_peaks_ms2,
-        top_peaks_ms1: 0,
-        config_hash: &convert_hash,
-    })?;
+    let co = convert_run(cfg, mzml, out, top_peaks_ms2, max_spectra)?;
     let has_deeplc = cfg.predict_frag.deeplc_python.is_some();
     let mh_heads = cfg
         .rt_im_train
@@ -217,6 +204,9 @@ fn process_run(
             shared_bands: shared_rt_lib,
             mh_heads,
             library_input,
+            library_irt_repredicted,
+            slices_from,
+            irt_placeholder,
         })?;
         return Ok((
             pooled.competed,
@@ -224,12 +214,72 @@ fn process_run(
             Some(format!("{out}/groups")),
         ));
     }
-    let seed = d("seed_psms.parquet");
+    let seed = seed_run(cfg, ch, lib_p_base, lib_f, &co, out, None)?;
+    chain_after_seed(
+        cfg,
+        ch,
+        lib_p_base,
+        lib_f,
+        library_input,
+        &co,
+        out,
+        &seed,
+        shared_rt_lib,
+        irt_placeholder,
+    )
+}
+
+/// Convert one run's mzML (or vendor file) into `<out>/spectra`.
+fn convert_run(
+    cfg: &Config,
+    mzml: &str,
+    out: &str,
+    top_peaks_ms2: usize,
+    max_spectra: usize,
+) -> Result<convert::ConvertOutputs> {
+    let d = |name: &str| format!("{out}/{name}");
+    std::fs::create_dir_all(out).ok();
+    // Fold the conversion caps into the convert artifacts' provenance key, exactly as
+    // both the standalone `convert` subcommand and single-run `run` do. The caps change
+    // the spectra output but are not part of the config, so the bare config hash made
+    // two experiments with different caps record identical convert provenance.
+    let convert_hash = mumdia_io::hash::blake3_str(&format!(
+        "{}\u{1f}max_spectra={}\u{1f}top_peaks_ms2={}\u{1f}top_peaks_ms1={}",
+        cfg.canonical_json(),
+        max_spectra,
+        top_peaks_ms2,
+        0
+    ));
+    convert::run(convert::ConvertParams {
+        mzml,
+        out_dir: &d("spectra"),
+        max_spectra,
+        top_peaks_ms2,
+        top_peaks_ms1: 0,
+        config_hash: &convert_hash,
+    })
+}
+
+/// Seed one ungrouped run against the base library (the seed is iRT-independent) into
+/// `<out>/seed_psms.parquet`, with the experiment's shared seed library when one is lent.
+/// Returns the seed path.
+fn seed_run(
+    cfg: &Config,
+    ch: &str,
+    lib_p_base: &str,
+    lib_f: &str,
+    co: &convert::ConvertOutputs,
+    out: &str,
+    library: Option<&search_seed::SeedLibrary>,
+) -> Result<String> {
+    let seed = format!("{out}/seed_psms.parquet");
     search_seed::run(search_seed::SearchSeedParams {
+        precursor_span: None,
         fragment_offset: None,
         // One reader at a time, as in the ungrouped `run`.
         ms2_scans: None,
         emit_calibrants: false,
+        library,
         ms2: &co.ms2,
         library_precursors: lib_p_base,
         library_fragments: lib_f,
@@ -238,6 +288,58 @@ fn process_run(
         bucket_size: cfg.extract.bucket_size,
         config_hash: ch,
     })?;
+    Ok(seed)
+}
+
+/// Everything of an ungrouped run's chain after its seed: the optional RT-library
+/// adaptation, rt-im-train, extract, features and compete. Returns
+/// `(competed, chromatograms, adapted_library_if_produced)`.
+#[allow(clippy::too_many_arguments)]
+fn chain_after_seed(
+    cfg: &Config,
+    ch: &str,
+    lib_p_base: &str,
+    lib_f: &str,
+    library_input: bool,
+    co: &convert::ConvertOutputs,
+    out: &str,
+    seed: &str,
+    shared_rt_lib: Option<&str>,
+    irt_placeholder: bool,
+) -> Result<(String, String, Option<String>)> {
+    let has_deeplc = cfg.predict_frag.deeplc_python.is_some();
+    let mh_heads = cfg
+        .rt_im_train
+        .multihead_heads(has_deeplc, cfg.deeplc_rt_source(library_input, has_deeplc));
+    let (lib_p, produced_rt_lib) = adapt_rt_library(
+        cfg,
+        lib_p_base,
+        seed,
+        out,
+        mh_heads,
+        shared_rt_lib,
+        irt_placeholder,
+        rayon::current_num_threads(),
+    )?;
+    let (competed, chrom) = finish_run(cfg, ch, &lib_p, lib_f, co, seed, out)?;
+    Ok((competed, chrom, produced_rt_lib))
+}
+
+/// Choose the precursor table the rest of an ungrouped run reads: a previous run's adapted
+/// library, this run's multi-head calibration or fine-tune of the base library (`threads`
+/// torch threads), or the base library. Returns `(table, the table this run produced)`.
+#[allow(clippy::too_many_arguments)]
+fn adapt_rt_library(
+    cfg: &Config,
+    lib_p_base: &str,
+    seed: &str,
+    out: &str,
+    mh_heads: usize,
+    shared_rt_lib: Option<&str>,
+    irt_placeholder: bool,
+    threads: usize,
+) -> Result<(String, Option<String>)> {
+    let d = |name: &str| format!("{out}/{name}");
     // DeepLC fine-tune. Under `RtLibraryScope::FirstRunOnly` the caller hands every run
     // after the first the library the first run produced, so the fine-tune -- the most
     // expensive step in the whole experiment -- is paid once. Run-to-run chromatographic
@@ -265,13 +367,18 @@ fn process_run(
             python,
             &script,
             lib_p_base,
-            &seed,
+            seed,
             &lib_p_mh,
             mh_heads,
             cfg.rt_im_train.q_train,
             cfg.rt_im_train.window_holdout_frac,
-            rayon::current_num_threads(),
+            threads,
+            cfg.rt_im_train.deeplc_predict_shards,
+            cfg.rt_im_train.deeplc_projection_cache.as_deref(),
         )?;
+        if irt_placeholder {
+            crate::sidecar::require_every_row_repredicted(&lib_p_mh)?;
+        }
         produced_rt_lib = Some(lib_p_mh.clone());
         lib_p_mh
     } else if cfg.rt_im_train.finetune_deeplc {
@@ -289,7 +396,7 @@ fn process_run(
             python,
             &script,
             lib_p_base,
-            &seed,
+            seed,
             &lib_p_ft,
             cfg.rt_im_train.finetune_epochs,
             cfg.rt_im_train.finetune_patience,
@@ -299,17 +406,36 @@ fn process_run(
             // split (see run.rs); 0.0 (default) changes nothing.
             cfg.rt_im_train.window_holdout_frac,
             cfg.rng_seed,
+            threads,
+            cfg.rt_im_train.deeplc_predict_shards,
         )?;
         produced_rt_lib = Some(lib_p_ft.clone());
         lib_p_ft
     } else {
         lib_p_base.to_string()
     };
+    Ok((lib_p, produced_rt_lib))
+}
+
+/// Retention-time windows, extract, features and compete of one ungrouped run on `lib_p`.
+/// Returns `(competed, chromatograms)`.
+fn finish_run(
+    cfg: &Config,
+    ch: &str,
+    lib_p: &str,
+    lib_f: &str,
+    co: &convert::ConvertOutputs,
+    seed: &str,
+    out: &str,
+) -> Result<(String, String)> {
+    let d = |name: &str| format!("{out}/{name}");
     let windows = d("run_windows.parquet");
-    rt_im_train::run(rt_im_train::RtImTrainParams {
+    // Handed to extract in memory; see `rt_im_train::RtWindows`.
+    let (_, fitted_windows) = rt_im_train::run_in_memory(rt_im_train::RtImTrainParams {
+        precursor_span: None,
         anchor_irt_from_seed: false,
-        seed_psms: &seed,
-        library_precursors: &lib_p,
+        seed_psms: seed,
+        library_precursors: lib_p,
         out_windows: &windows,
         out_cal: &d("cal.json"),
         cfg: &cfg.rt_im_train,
@@ -318,11 +444,13 @@ fn process_run(
     let psms = d("psms_extracted.parquet");
     let chrom = d("chromatograms.parquet");
     extract::run(extract::ExtractParams {
+        precursor_span: None,
         fragment_offset: None,
         sibling_bands: 1,
+        rt_windows: fitted_windows,
         scans: None,
         ms2: &co.ms2,
-        library_precursors: &lib_p,
+        library_precursors: lib_p,
         library_fragments: lib_f,
         run_windows: &windows,
         ms1: Some(&co.ms1),
@@ -337,7 +465,7 @@ fn process_run(
     let features_written = features::run_hashed(features::FeaturesParams {
         psms: &psms,
         chromatograms: &chrom,
-        seed: Some(&seed),
+        seed: Some(seed),
         out: &feats,
         out_pin: &d("run.pin"),
         cfg: &cfg.features,
@@ -351,7 +479,7 @@ fn process_run(
         config_hash: ch,
         features_hash: Some(&features_written.content_hash),
     })?;
-    Ok((competed, chrom, produced_rt_lib))
+    Ok((competed, chrom))
 }
 
 /// Split an experiment-wide scored table into per-run tables by the `source`
@@ -562,6 +690,14 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         None => (0..n_runs).map(|i| format!("r{i}")).collect(),
     };
 
+    // A FASTA build may leave DeepLC to the multi-head calibration of each run, which
+    // re-predicts every row before anything reads the iRT
+    // (`predict_frag.defer_deeplc_to_multihead`).
+    let irt_placeholder = cfg.defers_library_deeplc(
+        p.lib_precursors.is_some(),
+        cfg.predict_frag.deeplc_python.is_some(),
+    );
+
     // --- shared library (imported or digested once) ---
     let (lib_p_base, lib_f) = match (p.lib_precursors, p.lib_fragments) {
         (Some(lp), Some(lf)) => {
@@ -588,6 +724,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
             let lib_p = d("fragment_library_precursors.parquet");
             let lib_f = d("fragment_library_fragments.parquet");
             predict_frag::run(predict_frag::PredictFragParams {
+                rt_placeholder: irt_placeholder,
                 peptidoforms: &pf,
                 out_precursors: &lib_p,
                 out_fragments: &lib_f,
@@ -602,10 +739,11 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
     // Library-input mode without a fine-tune: the DeepLC base-model re-prediction of the
     // imported iRT does not depend on any run, so it is computed once here and every
     // per-run chain fits its own RT calibration against the same table.
-    let lib_p_base = if cfg.rt_im_train.repredicts_library_irt(
+    let library_irt_repredicted = cfg.rt_im_train.repredicts_library_irt(
         p.lib_precursors.is_some(),
         cfg.predict_frag.deeplc_python.is_some(),
-    ) {
+    );
+    let lib_p_base = if library_irt_repredicted {
         let python = cfg
             .predict_frag
             .deeplc_python
@@ -626,6 +764,8 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
             &lib_p_base,
             &out,
             rayon::current_num_threads(),
+            cfg.rt_im_train.deeplc_predict_shards,
+            cfg.rt_im_train.deeplc_projection_cache.as_deref(),
         )?;
         out
     } else {
@@ -701,26 +841,303 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
             RtLibraryScope::FirstRunOnly
         )
         && n_runs > 1;
+    // `experiment.overlap_front_threads`: under first_run_only, the converts and seeds of
+    // runs 2..N run beside run 1's RT adaptation instead of before it (the branch below).
+    let grouped_runs = cfg.groups.window_groups > 1;
+    let overlap = cfg.experiment.overlap_front_threads;
+    if overlap > 0 && (grouped_runs || !share_ft) {
+        info!(
+            overlap_front_threads = overlap,
+            "run-experiment: experiment.overlap_front_threads applies to ungrouped runs whose \
+             first run adapts the library for the rest (rt_library_scope = first_run_only); \
+             running the runs one after the other"
+        );
+    }
+    let overlapped = share_ft && overlap > 0 && !grouped_runs;
+    // Ungrouped runs seed against ONE library: every run's seed searches the base library
+    // at the seed tolerance, so the library and its fragment index are the same arrays for
+    // every run, and each seed used to load and build them again. So the chain runs in
+    // three phases: every run is converted first (the conversion is the memory-heavy step
+    // of its own and needs no library), then the seed library is loaded once and every run
+    // seeded against it, then the library is dropped and each run's chain continues from
+    // its seed. The outputs are the ones the per-run chain wrote: every stage is
+    // deterministic and reads only its own run's inputs, so only the order in which the
+    // stages of different runs execute changes. A grouped run seeds band by band against
+    // band libraries and keeps its own chain. The overlapped experiment orders its own
+    // phases (below), so it skips these.
+    let library_input = p.lib_precursors.is_some();
+    let prepared: Vec<Option<(convert::ConvertOutputs, String)>> = if grouped_runs || overlapped {
+        (0..n_runs).map(|_| None).collect()
+    } else {
+        let mut conv: Vec<convert::ConvertOutputs> = Vec::with_capacity(n_runs);
+        let all: Vec<usize> = (0..n_runs).collect();
+        for chunk in all.chunks(par) {
+            let done: Vec<convert::ConvertOutputs> = crate::colread::first_err(
+                chunk
+                    .par_iter()
+                    .map(|&i| {
+                        info!(run = %names[i], i = i + 1, n = n_runs, "run-experiment: convert");
+                        convert_run(
+                            cfg,
+                            &p.mzmls[i],
+                            &d(&names[i]),
+                            p.top_peaks_ms2,
+                            p.max_spectra,
+                        )
+                    })
+                    .collect(),
+            )?;
+            conv.extend(done);
+        }
+        let t_lib = Instant::now();
+        let seed_lib = search_seed::SeedLibrary::load(
+            &lib_p_base,
+            &lib_f,
+            None,
+            None,
+            &cfg.search_seed,
+            cfg.extract.bucket_size,
+        )?;
+        info!(
+            candidates = seed_lib.n_candidates(),
+            runs = n_runs,
+            elapsed_ms = t_lib.elapsed().as_millis() as u64,
+            "run-experiment: one seed library and fragment index for every run's seed"
+        );
+        let mut seeds: Vec<String> = Vec::with_capacity(n_runs);
+        for chunk in all.chunks(par) {
+            let done: Vec<String> = crate::colread::first_err(
+                chunk
+                    .par_iter()
+                    .map(|&i| {
+                        info!(run = %names[i], i = i + 1, n = n_runs, "run-experiment: seed");
+                        seed_run(
+                            cfg,
+                            &ch,
+                            &lib_p_base,
+                            &lib_f,
+                            &conv[i],
+                            &d(&names[i]),
+                            Some(&seed_lib),
+                        )
+                    })
+                    .collect(),
+            )?;
+            seeds.extend(done);
+        }
+        drop(seed_lib);
+        conv.into_iter().zip(seeds).map(Some).collect()
+    };
+    // One run's chain: from its seed when phases 1-2 ran, else (grouped) whole, with the
+    // band slices of an earlier grouped run to reuse (`slices_from`).
+    let run_one = |i: usize,
+                   shared: Option<&str>,
+                   slices_from: Option<&str>|
+     -> Result<(String, String, Option<String>)> {
+        match &prepared[i] {
+            Some((co, seed)) => chain_after_seed(
+                cfg,
+                &ch,
+                &lib_p_base,
+                &lib_f,
+                library_input,
+                co,
+                &d(&names[i]),
+                seed,
+                shared,
+                irt_placeholder,
+            ),
+            None => process_run(
+                cfg,
+                &ch,
+                &lib_p_base,
+                &lib_f,
+                library_input,
+                &p.mzmls[i],
+                &d(&names[i]),
+                p.top_peaks_ms2,
+                p.max_spectra,
+                shared,
+                library_irt_repredicted,
+                slices_from,
+                irt_placeholder,
+            ),
+        }
+    };
+
     let mut shared_ft: Option<String> = None;
     let mut first: usize = 0;
-    if share_ft {
+    if overlapped {
+        // Run 1's front, then its RT adaptation beside the fronts of runs 2..N on disjoint
+        // thread budgets, then every run's rest on the whole pool.
+        let total = rayon::current_num_threads();
+        let front_threads = overlap.min(total.saturating_sub(1)).max(1);
+        let adapt_threads = total.saturating_sub(front_threads).max(1);
+        let has_deeplc = cfg.predict_frag.deeplc_python.is_some();
+        let mh_heads = cfg
+            .rt_im_train
+            .multihead_heads(has_deeplc, cfg.deeplc_rt_source(library_input, has_deeplc));
+        info!(
+            run = %names[0],
+            n = n_runs,
+            front_threads,
+            adapt_threads,
+            "run-experiment: converting and seeding the other runs while the first adapts \
+             the library's retention times (experiment.overlap_front_threads)"
+        );
+        let out0 = d(&names[0]);
+        let co0 = convert_run(cfg, &p.mzmls[0], &out0, p.top_peaks_ms2, p.max_spectra)?;
+        let seed0 = seed_run(cfg, &ch, &lib_p_base, &lib_f, &co0, &out0, None)?;
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(front_threads)
+            .build()
+            .context("building the thread pool for the overlapped runs")?;
+        // Set when run 1's RT adaptation fails: the fronts of runs 2..N then stop before
+        // their next convert or seed instead of doing N-1 full passes for a run that is
+        // going to report the adaptation's error anyway. The reverse direction (a front
+        // failing while the DeepLC worker runs) cannot interrupt the worker; the front's
+        // error is logged at once, and returned after the worker exits.
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let cancelled = || {
+            anyhow::anyhow!(
+                "run-experiment: not converting and seeding the remaining runs because the \
+                 first run's retention-time adaptation failed"
+            )
+        };
+        let (adapted, fronts) = std::thread::scope(|scope| {
+            let fronts = scope.spawn(|| {
+                // The fronts keep the phase order of the ungrouped experiment above: every
+                // conversion first, with no library resident, then one seed library for all
+                // of their seeds (run 1 has already seeded on its own load).
+                let r = pool.install(|| -> Result<Vec<(convert::ConvertOutputs, String)>> {
+                    use std::sync::atomic::Ordering;
+                    let mut conv: Vec<convert::ConvertOutputs> = Vec::with_capacity(n_runs - 1);
+                    for (i, (name, mzml)) in names.iter().zip(p.mzmls).enumerate().skip(1) {
+                        if cancel.load(Ordering::SeqCst) {
+                            return Err(cancelled());
+                        }
+                        info!(run = %name, i = i + 1, n = n_runs, "run-experiment: convert, overlapped");
+                        conv.push(convert_run(
+                            cfg,
+                            mzml,
+                            &d(name),
+                            p.top_peaks_ms2,
+                            p.max_spectra,
+                        )?);
+                    }
+                    if cancel.load(Ordering::SeqCst) {
+                        return Err(cancelled());
+                    }
+                    let seed_lib = search_seed::SeedLibrary::load(
+                        &lib_p_base,
+                        &lib_f,
+                        None,
+                        None,
+                        &cfg.search_seed,
+                        cfg.extract.bucket_size,
+                    )?;
+                    let mut seeds: Vec<String> = Vec::with_capacity(n_runs - 1);
+                    for (co, i) in conv.iter().zip(1..n_runs) {
+                        if cancel.load(Ordering::SeqCst) {
+                            return Err(cancelled());
+                        }
+                        info!(run = %names[i], i = i + 1, n = n_runs, "run-experiment: seed, overlapped");
+                        seeds.push(seed_run(
+                            cfg,
+                            &ch,
+                            &lib_p_base,
+                            &lib_f,
+                            co,
+                            &d(&names[i]),
+                            Some(&seed_lib),
+                        )?);
+                    }
+                    drop(seed_lib);
+                    Ok(conv.into_iter().zip(seeds).collect())
+                });
+                if let Err(e) = &r {
+                    if !cancel.load(std::sync::atomic::Ordering::SeqCst) {
+                        tracing::error!(
+                            error = %format!("{e:#}"),
+                            "run-experiment: an overlapped run's convert or seed failed; the \
+                             first run's retention-time adaptation is still running and the \
+                             experiment stops when it returns"
+                        );
+                    }
+                }
+                r
+            });
+            let adapted = adapt_rt_library(
+                cfg,
+                &lib_p_base,
+                &seed0,
+                &out0,
+                mh_heads,
+                None,
+                irt_placeholder,
+                adapt_threads,
+            );
+            if adapted.is_err() {
+                cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            let fronts = fronts
+                .join()
+                .unwrap_or_else(|_| Err(anyhow::anyhow!("the overlapped runs' thread panicked")));
+            (adapted, fronts)
+        });
+        let (lib0, produced) = adapted?;
+        let fronts = fronts?;
+        let (comp0, chrom0) = finish_run(cfg, &ch, &lib0, &lib_f, &co0, &seed0, &out0)?;
+        competed.push(comp0);
+        chroms.push(chrom0);
+        if produced.is_none() {
+            warn!(
+                "run-experiment: the first run produced no adapted library; the remaining \
+                 runs will each adapt their own"
+            );
+        }
+        let back = |i: usize, (co, seed): &(convert::ConvertOutputs, String)| {
+            let out = d(&names[i]);
+            info!(run = %names[i], i = i + 1, n = n_runs, "run-experiment: per-run chain after the overlapped front");
+            let (lib_p, _) = adapt_rt_library(
+                cfg,
+                &lib_p_base,
+                seed,
+                &out,
+                mh_heads,
+                produced.as_deref(),
+                irt_placeholder,
+                rayon::current_num_threads(),
+            )?;
+            finish_run(cfg, &ch, &lib_p, &lib_f, co, seed, &out)
+        };
+        let items: Vec<(usize, &(convert::ConvertOutputs, String))> =
+            (1..n_runs).zip(fronts.iter()).collect();
+        for chunk in items.chunks(par) {
+            let done: Vec<(String, String)> = if par == 1 {
+                chunk
+                    .iter()
+                    .map(|&(i, f)| back(i, f))
+                    .collect::<Result<Vec<_>>>()?
+            } else {
+                chunk
+                    .par_iter()
+                    .map(|&(i, f)| back(i, f))
+                    .collect::<Result<Vec<_>>>()?
+            };
+            for (comp, chrom) in done {
+                competed.push(comp);
+                chroms.push(chrom);
+            }
+        }
+        first = n_runs;
+    } else if share_ft {
         info!(
             run = %names[0],
             n = n_runs,
             "run-experiment: adapting the library's retention times on the first run only;              the remaining runs reuse that library and fit their own RT calibration on it              (experiment.rt_library_scope = per_run to adapt for every run instead)"
         );
-        let (comp, chrom, ft) = process_run(
-            cfg,
-            &ch,
-            &lib_p_base,
-            &lib_f,
-            p.lib_precursors.is_some(),
-            &p.mzmls[0],
-            &d(&names[0]),
-            p.top_peaks_ms2,
-            p.max_spectra,
-            None,
-        )?;
+        let (comp, chrom, ft) = run_one(0, None, None)?;
         competed.push(comp);
         chroms.push(chrom);
         match ft {
@@ -738,24 +1155,22 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         first = 1;
     }
 
+    // A grouped run writes a band out only where a DeepLC sidecar rewrites it, and the runs
+    // of one experiment plan the same bands over the same library, so a run after the
+    // first takes the first grouped run's slices where the plans agree (`run_groups`).
+    let grouped = cfg.groups.window_groups > 1;
+    let mut slice_source: Option<String> = if grouped { shared_ft.clone() } else { None };
     let rest: Vec<usize> = (first..n_runs).collect();
     if par == 1 {
         for &i in &rest {
             info!(run = %names[i], i = i + 1, n = n_runs, "run-experiment: per-run chain");
-            let (comp, chrom, _) = process_run(
-                cfg,
-                &ch,
-                &lib_p_base,
-                &lib_f,
-                p.lib_precursors.is_some(),
-                &p.mzmls[i],
-                &d(&names[i]),
-                p.top_peaks_ms2,
-                p.max_spectra,
-                shared_ft.as_deref(),
-            )?;
+            let (comp, chrom, groups_dir) =
+                run_one(i, shared_ft.as_deref(), slice_source.as_deref())?;
             competed.push(comp);
             chroms.push(chrom);
+            if grouped && slice_source.is_none() {
+                slice_source = groups_dir;
+            }
         }
     } else {
         info!(
@@ -768,23 +1183,15 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
                 .par_iter()
                 .map(|&i| {
                     info!(run = %names[i], i = i + 1, n = n_runs, "run-experiment: per-run chain");
-                    process_run(
-                        cfg,
-                        &ch,
-                        &lib_p_base,
-                        &lib_f,
-                        p.lib_precursors.is_some(),
-                        &p.mzmls[i],
-                        &d(&names[i]),
-                        p.top_peaks_ms2,
-                        p.max_spectra,
-                        shared_ft.as_deref(),
-                    )
+                    run_one(i, shared_ft.as_deref(), slice_source.as_deref())
                 })
                 .collect::<Result<Vec<_>>>()?;
-            for (comp, chrom, _) in done {
+            for (comp, chrom, groups_dir) in done {
                 competed.push(comp);
                 chroms.push(chrom);
+                if grouped && slice_source.is_none() {
+                    slice_source = groups_dir;
+                }
             }
         }
     }

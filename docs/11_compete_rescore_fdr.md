@@ -111,7 +111,9 @@ the protein-accession-set string, a duplicate of `protein`), `pg_q_value` (f64),
 rescorer kept; `0` = the up-front apex). Plus
 `<out>.report.json` whose `params` records `classifier` (the path actually taken),
 `classifier_requested`, `strict`, `folds`, `num_iter`, `train_fdr`,
-`feature_schema_id`, `competed_inputs`, `config_hash` (rescore.rs:565-575),
+`feature_schema_id`, `competed_inputs`, `config_hash` (rescore.rs:565-575), and, when
+`nn_torch` ran, `nn_env`: the `MUMDIA_NN_*` variables the worker inherited beyond the
+ones the engine sets (`inherited_nn_env`, `docs/13_sidecars.md`),
 `model_identity` (e.g. `native-percolator-lite-v1`, `mokapot-<estimator>`
 (default `mokapot-nn`), `nn-torch-semisup-sidecar-v1`,
 `entrapment-gbm-sidecar-v1`, `native-percolator-lite-entrapment-v1`,

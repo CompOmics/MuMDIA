@@ -186,6 +186,41 @@ DeepLC miss, rather than receiving the native heuristic under an MS2PIP model id
 otherwise (`predict_frag.rs:371-374`); its model id is `format!("ms2pip-{model}")`
 (`predict_frag.rs:446`).
 
+**Both sidecars at once** (`assign_predictions`, `MUMDIA_PREDICT_FRAG_CONCURRENT=1`, off by
+default). When the iRT comes from DeepLC and the intensities from MS2PIP or AlphaPeptDeep,
+the two workers can run at the same time: they write disjoint fields of each candidate, and
+each gets exactly the request and the thread count it gets alone, so the library is
+byte-identical either way (measured on the fixture library, 3,820 precursors, DeepLC 4.5.0
+and MS2PIP 4.2.0: identical precursor, fragment and seed tables; the stage took 9.1 s
+concurrent against 14.7 s one after the other). It is opt-in because each worker sizes
+itself from the engine's whole thread count: MS2PIP starts that many processes and DeepLC
+takes that many torch threads, so together they ask for twice the CPUs and hold both
+workers' memory. The fixture's saving is the workers' start-up. On the 9.8M-peptidoform HYE
+FASTA library the two were DeepLC 19 min and MS2PIP 35-39 min in sequence, both CPU-bound,
+and the pair's wall time and process-tree peak have not been measured. Giving each worker
+half the threads instead would change DeepLC's torch thread count and so the last bits of
+its predictions. To validate: a large FASTA build with and without the variable, comparing
+the wall time, the process-tree peak and both library tables byte for byte. A DeepLC error is
+reported first; a fragment-worker error is logged as soon as it happens and returned once the
+DeepLC worker has exited.
+
+**Deferred DeepLC** (`predict_frag.defer_deeplc_to_multihead`, default `false`). With
+`rt_predictor = deeplc` the automatic multi-head calibration rewrites the iRT of every
+standard-residue row against the run's anchors before anything reads it (the seed is
+iRT-independent and only passes the column through), and a FASTA digest emits only standard
+residues, so the library's DeepLC pass is work whose output is overwritten: about 19 minutes
+on the HYE FASTA library. Set, `run` and `run-experiment` (grouped or not) write the native
+model's iRT as a placeholder (`PredictFragParams::rt_placeholder`; the library's model
+identity says `(placeholder: DeepLC deferred to the multi-head calibration)`), log that they
+do, and fail if a multi-head summary reports any row it kept (`retained_imported > 0`,
+`sidecar::require_every_row_repredicted`), because that row would keep the placeholder.
+Ignored where the multi-head calibration does not run, with a log line, and by the standalone
+`predict-frag`. Measured on the fixture with DeepLC 4.5.0 on CPU and the native fragment
+model: every output from the multi-head library on is byte-identical to a default run's,
+including `psms_scored.parquet` and `peptides.tsv`; only the library table and the seed's
+pass-through iRT column differ, and the run took 11 s against 21 s. Opt-in because the
+library table is no longer a DeepLC library for anyone who reuses it as `--lib-precursors`.
+
 **finite guard** (`predict_frag.rs:140-153`). Between assignment and top-N, every
 candidate's iRT and every fragment intensity is checked for finiteness and a
 non-finite value is a hard error. A NaN from a misbehaving sidecar would otherwise
@@ -259,103 +294,188 @@ input Parquet, invoke `python script arg...`, read an output Parquet keyed by id
   `PYTHONIOENCODING=utf-8` (DeepLC/Keras/torch crash on the Windows cp1252 console);
   it is on for the DeepLC and fine-tune calls, off for MS2PIP and MBR.
 
-### Library load and the bucketed inverted index (`index.rs:66`)
+### Library load and the bucketed inverted index (`index.rs:1021`)
 
-`Library::load(precursors, fragments, bucket_size)` (`index.rs:66`) is a thin
-wrapper over `Library::load_with(..., build_bucketed)` (`index.rs:73`). Callers
+`Library::load(precursors, fragments, bucket_size)` (`index.rs:1021`) is a thin
+wrapper over `Library::load_with(..., build_bucketed)` (`index.rs:1028`). Callers
 that use the default fragindex backend pass `build_bucketed = false`, which skips
 the bucketed arrays entirely: they are a full extra copy of every library fragment
 plus a global sort, all of it dead when `page_search` is never called.
 `page_search` early-returns on the resulting empty index, so skipping is safe.
 
-`load_with` reads the precursor artifact in full and the fragment artifact
-column-projected to `candidate_id`/`mz`/`predicted_intensity`/`name`
-(`index.rs:102-105`; `ion_type`, `ordinal`, `frag_charge` and `cardinality` are
-never read). It validates the label column (only `"target"`/`"decoy"` allowed, via
-`fdr::validate_labels`, `index.rs:89`), then regroups fragments per candidate with
-a counting sort into flat contiguous arrays (`index.rs:126-207`), so
+`load_with` reads the precursor columns it needs (`load_precursors`, `index.rs:269`)
+and the fragment artifact column-projected to
+`candidate_id`/`mz`/`predicted_intensity`/`name` (`PASS2_COLUMNS`, `index.rs:563`;
+`ion_type`, `ordinal`, `frag_charge` and `cardinality` are never read). It validates
+the label column (only `"target"`/`"decoy"` allowed, via `fdr::validate_labels`,
+`read_is_decoy`, `index.rs:181-213`), then regroups fragments per candidate with a
+counting sort into flat contiguous arrays (`load_fragments`, `index.rs:457`), so
 `cand_frags(cid)` returns three parallel slices for one candidate
-(`index.rs:312-321`): m/z, predicted intensity, and INTERNED fragment-name ids
-(`u16` into `frag_name_dict`, resolved with `frag_name_str`, `index.rs:303`).
+(`index.rs:1549-1561`): m/z, predicted intensity, and INTERNED fragment-name ids
+(`u16` into `frag_name_dict`, resolved with `frag_name_str`).
 Names are interned rather than stored as `String` because they come from a tiny
 repeating vocabulary and a per-fragment `String` costs about 24 bytes of struct
-before any text. `n_candidates()` is the candidate count (`index.rs:297`).
-Each row becomes a `Candidate` (`index.rs:23-35`) with `candidate_id`,
-`peptidoform_id`, `base_peptide_id`, `peptidoform`, `charge`, `precursor_mz`,
-`predicted_irt`, `protein`, `frag_start`/`n_frag` (the slice bounds into the flat
-fragment arrays), and `is_decoy`, which is derived from the `label` string
-(`label == "decoy"`, `index.rs:201`); the string label is not otherwise retained.
+before any text. The `name` column is read through its parquet dictionary
+(`TableFile::batches_dict`, `Dictionary(Int32, Utf8)`), so a row costs a key lookup
+in a per-batch memo (`StrInterner`) rather than a hash of its text; the ids are
+still assigned in first-appearance order over the rows the load keeps, so a partial
+load never interns a name that only a skipped row carries.
+`n_candidates()` is the candidate count.
+
+The load is parallel and its arrays are bit-identical to the serial load. The eight
+precursor columns and the `candidate_id` check are read concurrently, one reader
+each, and their results are taken in the serial order, so a table with several
+problems is refused with the same message. The fragment table is cut into
+row-contiguous parts (`TableFile::row_parts`: row groups, merged to about one part per
+thread, and page-aligned ranges inside a row group that carries an offset index;
+without an offset index a group is never split, because every part would decode the
+pages before its own). Pass 1 counts the parts concurrently into atomic counters and
+records whether the kept ids ascend. When they ascend over the whole table, which is
+the layout every library writer produces, the counting sort is the identity, so each
+part fills its own contiguous slice of the output (`split_at_mut`) and interns names
+locally; the dictionaries are merged in part order, which is first appearance in file
+order. Otherwise pass 2 is the serial scatter. Within a part the four columns are
+decoded by one reader each, in parallel and one batch ahead of the placement
+(`colread::for_each_zipped`, `rayon::join` only, so it cannot deadlock on a small
+pool). Measured on the AIF library at 16 threads: 990 ms to 350-440 ms for the
+one-row-group file pyarrow wrote, and to 175 ms for the same library in 1M-row groups
+with an offset index. Every load logs `library: loaded` with its candidate and fragment
+counts, the precursor-table and fragment-table phases (`precursor_ms`, `fragment_ms`) and
+the total (`elapsed_ms`); every index build logs `fragindex: built` with its posting, bin
+and chunk counts, whether it holds the payload, the tolerance and `elapsed_ms`. A stage's
+own "loaded" line brackets the library load, the spectra decode and the index build
+together, so these lines are what splits that interval.
+
+Errors do not depend on that part layout. Pass 1 refuses `candidate_id` defects (a
+NULL, or an id past the precursor count on a full load); pass 2 the others (NULLs in
+the four columns, non-finite m/z or intensity). Within a pass the table is refused on
+its first defective row in file order, whatever the kind of defect: every batch
+reports its first bad row across all its checks rather than check by check, and the
+parts' results are taken in part order, so the serial and the parted pass name the
+same row. The one check that belongs to no row, more distinct fragment names than
+the `u16` id holds, is met at the row that introduces the 65,536th name on the
+serial pass and at the dictionary merge on the parted one.
+
+The seed's m/z-only load (`Library::load_mz_only`, `index.rs:1133`) runs the same
+two passes over the same four columns with the same checks, and then stores only the
+fragment m/z: `frag_int`, `frag_name_id` and the name dictionary stay empty, so
+`fragment_payload_released()` is true, `cand_frags` panics and `cand_frag_mz`
+(`index.rs:1566`) is the fragment accessor it serves. A library the full load would
+refuse is therefore refused at the seed with the same message; what the seed saves
+is the 6 bytes per fragment those two arrays hold, not their decode.
+
+The library is structure-of-arrays, indexed by local candidate id: one column per
+precursor field (`peptidoform_id`, `base_peptide_id`, `charge`, `predicted_irt`,
+`is_decoy`), the peptidoform text as one arena (`peptidoform(cid)`), the protein
+interned (`protein(cid)`; an empty value reads as `UNASSIGNED`), the fragment slice
+bounds as one `u32` CSR array (`frag_offsets`, `frag_range(cid)`), and `prec_mz`
+as an `Arc<[f64]>` that every `FragIndex` built from the library shares instead of
+copying. `cand(cid)` returns the fields of one candidate as a borrowed `CandInfo`.
+The struct-per-candidate layout it replaced held two owned `String`s, a duplicate
+`precursor_mz`, its own position as `candidate_id` and two `usize` bounds, about
+180 bytes per precursor against about 60 now (measured on the AIF library,
+1.8M precursors: seed peak 1,226 to 1,045 MB, extract peak 1,717 to 1,517 MB, with
+byte-identical outputs). `Candidate` survives as the owned input record of
+`Library::from_candidates`, which tests and benchmarks use to build a library in
+memory. `is_decoy` is derived from the `label` string (`label == "decoy"`); the
+string label is not otherwise retained.
 When `build_bucketed` is true, `load_with` then builds the bucketed inverted index
-(`index.rs:245-280`):
+(`index.rs:1318-1348`):
 
 1. Emit one `(frag_mz as f32, candidate_id, frag_int)` entry per fragment.
 2. Globally sort entries by fragment m/z with `par_sort_by` (parallel stable
-   sort, identical result to the serial stable sort, `index.rs:263`).
+   sort, identical result to the serial stable sort, `index.rs:1331`).
 3. Chunk the sorted entries into fixed buckets of `bucket_size` (floored at 1 via
-   `bucket_size.max(1)`, `index.rs:250`); record each bucket's first (== minimum)
+   `bucket_size.max(1)`, `index.rs:1318`); record each bucket's first (== minimum)
    m/z in `bucket_min`; within each bucket sort by `candidate_id`
-   (`index.rs:266-270`).
+   (`index.rs:1334-1338`).
 4. Split into the three parallel arrays `idx_mz`/`idx_cid`/`idx_int`.
 
-`page_search` (`index.rs:350`) probes this index for an observed neutral m/z `q`.
+`page_search` (`index.rs:1621`) probes this index for an observed neutral m/z `q`.
 It early-returns on a degenerate window or empty index (`cand_hi <= cand_lo ||
-idx_mz.is_empty()`, `index.rs:358-360`). Otherwise `ppm_bounds(q, tol_ppm)` gives
+idx_mz.is_empty()`, `index.rs:1629-1631`). Otherwise `ppm_bounds(q, tol_ppm)` gives
 the query window `[lo, hi]` (cast to f32); the first bucket is
 `partition_point(|m| m <= lo32).saturating_sub(1)` and the last is
-`partition_point(|m| m <= hi32)` over `bucket_min` (`index.rs:361-371`); within
+`partition_point(|m| m <= hi32)` over `bucket_min` (`index.rs:1637-1642`); within
 each bucket, because `idx_cid` is ascending, two `partition_point` calls narrow to
-the `[cand_lo, cand_hi)` slice (`index.rs:378-379`); a linear tail applies the
-exact f32 m/z bound (`index.rs:380-386`). `candidate_range` (`index.rs:341`) turns
+the `[cand_lo, cand_hi)` slice (`index.rs:1649-1650`); a linear tail applies the
+exact f32 m/z bound (`index.rs:1651-1657`). `candidate_range` (`index.rs:1612`) turns
 an isolation window into `[lo, hi)` over `prec_mz` by two `partition_point`s (`m <
 win_lo` for `lo`, `m <= win_hi` for `hi`, so `win_hi` is inclusive and `win_lo`
 exclusive).
 
 ### The fragindex CSR matcher (`matchers/fragindex.rs`)
 
-`FragIndex::build` (`fragindex.rs:47`) is a two-pass counting sort into a CSR
-layout keyed by log-space bin. It first derives the m/z range by scanning
-`lib.frag_mz` for the min and max (`fragindex.rs:61-70`); if the library is empty
-(no finite bound) it falls back to `[1.0, 2.0]` (`fragindex.rs:71-74`), and it
+`FragIndex::build` (`fragindex.rs:78`) produces the CSR layout, keyed by log-space
+bin, of a two-pass counting sort. That serial counting sort is described first
+(`build_serial`, `fragindex.rs:310-367`, kept under `cfg(test)` as the reference);
+the parallel build that replaced it follows. It first derives the m/z range from the
+min and max of `lib.frag_mz` (`geometry`, `fragindex.rs:260-305`); if the library is
+empty (no finite bound) it falls back to `[1.0, 2.0]` (`fragindex.rs:300-303`), and it
 clamps the arguments to `LogBins::new` so `mz_min >= 1.0` and `mz_max > mz_min`
-(`fragindex.rs:75`). `LogBins::new` (`binning.rs:27`) asserts `mz_min > 0 &&
+(`fragindex.rs:304`). `LogBins::new` (`binning.rs:27`) asserts `mz_min > 0 &&
 mz_max >= mz_min` and precomputes the geometry: `delta = tol_ppm * 1e-6`, bin
 width `w = ln(1 + delta)`, `inv_w`, `ln_min`, and `n_bins = floor(span * inv_w)
 + 2` (the `+2` pads the top so `bin+1` never overflows). `LogBins::bin`
 (`binning.rs:49`) maps m/z to `floor((ln(mz) - ln_min) * inv_w)`, clamped to
 `[0, n_bins-1]` (m/z <= 0 or <= `mz_min` maps to bin 0). Pass 1 counts
-per-bin occupancy with the `+1` counting-sort offset (`fragindex.rs:83-86`); a
-prefix sum turns counts into CSR start offsets (`fragindex.rs:88-90`); pass 2
-scatters postings in candidate-id order (`fragindex.rs:98-110`) so `post_cand` is
-ascending within every bin. Postings are Structure-of-Arrays
+per-bin occupancy with the `+1` counting-sort offset (`fragindex.rs:332-335`); a
+prefix sum turns counts into CSR start offsets (`fragindex.rs:336-338`); pass 2
+scatters postings in candidate-id order (`fragindex.rs:343-355`) so `post_cand` is
+ascending within every bin.
+
+The build runs in parallel and its arrays are bit-identical to that serial counting
+sort (kept as `FragIndex::build_serial` under `cfg(test)` and compared array by
+array, including m/z on bin edges and one ULP either side, zero, negative and
+subnormal values, the top bin, NaN and both infinities). The m/z range is a parallel
+min/max over the finite values, which is exact. The fragments are cut into chunks at
+candidate boundaries; pass 1 counts one bin histogram per chunk, and chunk `j`'s
+cursor in bin `b` starts at `bin_start[b]` plus the counts of chunks `0..j` in that
+bin, so the chunks own disjoint slots and follow each other in candidate order within
+every bin. Pass 2 scatters the chunks concurrently into atomic posting arrays with
+relaxed stores (safe Rust; the workspace forbids `unsafe`), which are then converted to
+plain arrays in place. The chunk count is one per thread, capped so a chunk holds at
+least 65,536 postings and the histograms stay under half of one posting array.
+Measured on the AIF library (20.6M postings, 180k bins, 16 threads): 560-660 ms to
+159-210 ms. Postings are Structure-of-Arrays
 (`post_cand`/`post_mz`/`post_int`/`post_frag`) so the verify hot loop decides on
 `post_mz` alone and wants the other three only where a posting verifies.
 
-`FragIndex` keeps its own copy of `prec_mz` and exposes `n_cand()`
-(`fragindex.rs:142`), `tol_ppm()` (`fragindex.rs:146`), and a `candidate_range`
-(`fragindex.rs:154-158`) with the same `[lo, hi)` semantics as
+`FragIndex::build_mz_only` (`fragindex.rs:99`) is the seed's index: the same geometry,
+`bin_start`, `post_cand` and `post_mz`, bit for bit, and no `post_int` or `post_frag`
+(`has_payload()` is false, `fragindex.rs:105`), 6 bytes per posting less. The seed
+probes it through `probe_peak_cand` (`fragindex.rs:425`), which visits the same bins
+with the same narrowing, the same exact predicate and the same posting order as
+`probe_peak` and reports the candidate only. The payload probes (`probe_peak`,
+`window_narrow` and the windowed probes built on it) assert `has_payload()` and panic
+on an m/z-only index rather than returning zeros.
+
+`FragIndex` shares the library's `prec_mz` (the same `Arc<[f64]>`, not a copy) and
+exposes `n_cand()` (`fragindex.rs:369`), `tol_ppm()` (`fragindex.rs:373`), and a
+`candidate_range` (`fragindex.rs:381-384`) with the same `[lo, hi)` semantics as
 `Library::candidate_range`, so a caller holding only the index can still narrow to
-the isolation window. `probe_peak` (`fragindex.rs:169`) early-returns on a
-degenerate window (`cand_hi <= cand_lo`, `fragindex.rs:159`), then probes bins
-`bin(peak)-1 ..= bin(peak)+1` (clamped, `fragindex.rs:162-165`), narrows each bin
+the isolation window. `probe_peak` (`fragindex.rs:396`) early-returns on a
+degenerate window (`cand_hi <= cand_lo`, `fragindex.rs:407`), then probes bins
+`bin(peak)-1 ..= bin(peak)+1` (clamped, `fragindex.rs:411-412`), narrows each bin
 to `[cand_lo, cand_hi)` by binary search over the ascending `post_cand`
-(`narrow_bin`, `fragindex.rs:205-215`), and verifies each posting with the exact
-`within_ppm` predicate in f64 (`emit_range`, `fragindex.rs:292-312`). Its callback
+(`narrow_bin`, `fragindex.rs:519-529`), and verifies each posting with the exact
+`within_ppm` predicate in f64 (`emit_range`, `fragindex.rs:556-576`). Its callback
 receives `(cid, post_mz_f64, post_int, post_frag)`, where `post_frag` is the
 candidate-local fragment ordinal that extract carries through directly (the
 bucketed path has to recover it via `local_frag_index`).
 
-`probe_peak_win` (`fragindex.rs:206`) is a drop-in for `probe_peak` that takes a
-`WindowNarrow` (`fragindex.rs:263`), a lazily filled per-isolation-window cache of
+`probe_peak_win` (`fragindex.rs:470`) is a drop-in for `probe_peak` that takes a
+`WindowNarrow` (`fragindex.rs:612`), a lazily filled per-isolation-window cache of
 each bin's `[cand_lo, cand_hi)` posting sub-range built by `window_narrow`
-(`fragindex.rs:236`). `cand_lo`/`cand_hi` are fixed for a whole isolation window
+(`fragindex.rs:579`). `cand_lo`/`cand_hi` are fixed for a whole isolation window
 and every scan of that window revisits the same bins, so the two binary searches
 per bin happen once per `(window, bin)` instead of once per peak. Semantics and
 callback order are identical, which the test
-`probe_peak_win_matches_probe_peak_callback_for_callback` (`fragindex.rs:524`)
+`probe_peak_win_matches_probe_peak_callback_for_callback` (`fragindex.rs:823`)
 asserts posting-for-posting.
 
-`probe_peak_win_binned` (`fragindex.rs:225`) is the same probe again with the bin
-handed in rather than computed, and `bin_of` (`fragindex.rs:197`) is what computes
+`probe_peak_win_binned` (`fragindex.rs:489`) is the same probe again with the bin
+handed in rather than computed, and `bin_of` (`fragindex.rs:461`) is what computes
 it; `probe_peak_win` is now just `probe_peak_win_binned` with `bin_of` applied, so
 the three cannot drift. The bin is a `ln()`, and the point of splitting it out is
 NOT to cache it across calls but to let the caller compute it in a pass of its own:
@@ -364,6 +484,36 @@ the scratch, which measures 9-15% faster than computing the bin inside the probe
 even though the number of `ln()` calls is identical, because the separate pass takes
 the `ln()` off the dependency chain the bin-cache load and then the posting loads
 hang from (`docs/09_extract.md`, `tests/bench_fragindex.rs`).
+
+**Task-local indexes (`LocalIndex`, 2026-09-25).** Extract's default streamed
+accumulation no longer probes the global index at all. Each probing task owns one
+candidate sub-range `[cand_lo, cand_hi)` of one isolation window, and builds a
+`LocalIndex` over exactly that sub-range's fragments: a counting sort by bin,
+scattered in candidate order and, within a candidate, in fragment order. Within a
+bin that is the order the global build leaves the postings in (`post_cand`
+ascending, then the ordinal), and a narrowed global bin is a contiguous run of it, so
+every bin of the local index holds the narrowed global bin's postings in the same
+order. The bins are the whole library's geometry (`FragIndex::geometry`, the same
+`LogBins` `build` uses); a geometry fitted to the sub-range would partition m/z
+differently and emit the same matches in a different order across the three probed
+bins. The three probed bins are adjacent in the local CSR, so the local probe
+verifies one contiguous run of postings with the same `within_ppm` predicate.
+`BinnedProbe` is the common entry point: `LocalIndex` and `NarrowedProbe` (the
+global index plus a `WindowNarrow`, the previous path, kept as the reference)
+implement it, and `a_local_index_probes_exactly_what_the_narrowed_global_index_probes`
+compares the two callback for callback over empty, single-candidate, gappy, ragged
+and whole-library sub-ranges at 20 and 7.5 ppm, including clamped and non-finite
+probe m/z.
+
+A task's local index holds 14 bytes per posting of its sub-range plus 4 bytes per bin
+between its first and last occupied bin, which is less than the 8 bytes per bin of
+the `WindowNarrow` it replaces. Extract then builds the global index only when a path
+needs arbitrary candidate windows (the two-pass arbitration, `emit_demix_features`),
+so the default run skips the global build and its 14 bytes per library fragment
+(about 1.9 GB on the HYE library, 34 GB on a monolithic 203M-precursor library).
+Extract logs `extract: task-local fragment indexes` with the task count, the postings
+indexed across tasks (a candidate in overlapping windows is indexed once per window),
+the library's fragment count and the largest task index in bytes.
 
 Sharing one fill between several tasks is a different thing and was tried and
 reverted: see `docs/09_extract.md`. `bin` is clamped into range, so a stale one
@@ -403,7 +553,16 @@ touched); `ensure` grows them on demand, so an undersized `new(cap)` is safe. Th
 seed accumulates a fused `(count, obs_sum)` semiring where `obs_sum` sums the
 observed peak intensity per matched posting (predicted intensity deliberately
 discarded, `fragindex.rs:341`), and exposes the touched set plus per-candidate
-`count(cid)` / `obs_sum(cid)` getters (`fragindex.rs:348-363`).
+`count(cid)` / `obs_sum(cid)` getters (`fragindex.rs:348-363`). The state is
+array-of-structs: a candidate's stamp, count and observed sum share one 16-byte
+slot, so a matched posting updates one cache line instead of three. It also keeps a
+QUALIFIED list (`with_min_count`, `qualified()`): a candidate is appended when its
+count reaches the seed's `min_matched_peaks`, so scoring walks only the candidates it
+can report. The seed then sorts them by score and candidate id, a total order, so the
+scored list is the one the filter over `touched` gave. Measured
+(`bench_seed_accumulator`): 5% faster on a 60,000-candidate window that fits in
+cache, 2.05x on a 2M-candidate window (32 MB of slots) that does not; the probe
+through `probe_peak_cand` visits the postings in `probe_peak`'s order.
 
 The free function `score_scan_count_dot` (`fragindex.rs:450`) is a separate,
 non-`SeedScratch` scorer used only by the equivalence gate: it accumulates
@@ -472,23 +631,31 @@ m/z (`Library::local_frag_index`, `index.rs:325`).
 | `run_deeplc_finetune` | `sidecar.rs:111` | DeepLC multitask fine-tune; `deeplc_finetune.py <lib_in> <seed> <lib_out>` + epoch/patience/q-train/batch flags (called by `run`, not predict-frag) |
 | `run_mbr` | `sidecar.rs:162` | MBR transfer (Stage D3); `mbr_worker.py <scored> <psms_csv> <out>` + flags |
 | `run_worker` | `sidecar.rs:217` | shared launcher; bails on non-zero exit; `utf8` sets `PYTHONUTF8`/`PYTHONIOENCODING` |
-| `Candidate` | `index.rs:23` | one library row in SoA; `is_decoy` derived from the `label` string |
-| `Library` | `index.rs:37` | SoA candidate + fragment model plus the optional bucketed inverted index |
-| `Library::load` / `load_with` | `index.rs:66` / `index.rs:73` | read Parquet, validate labels, group fragments, enforce preconditions; `load_with` can skip the bucketed index and is what both stages call |
-| `Library::n_candidates` / `cand_frags` / `frag_name_str` | `index.rs:297` / `index.rs:312` / `index.rs:303` | candidate count; per-candidate (m/z, intensity, interned name id) slices; name-id resolver |
-| `Library::page_search` | `index.rs:350` | bucketed probe: bucket select -> candidate slice -> f32 ppm verify |
-| `Library::candidate_range` | `index.rs:341` | isolation window -> `[lo, hi)` over `prec_mz` |
-| `Library::local_frag_index` | `index.rs:325` | nearest-stored-m/z fragment ordinal (bucketed path only) |
-| `deconvolve` | `index.rs:394` | z-charged peak m/z -> neutral m/z, in f64 |
+| `Candidate` | `index.rs:43` | one candidate as an owned record; only the input of `Library::from_candidates` (tests, benchmarks). A loaded library holds the same fields as columns |
+| `CandInfo` / `Library::cand` | `index.rs:59` / `index.rs:1506` | one candidate's precursor fields, borrowed from the library's columns |
+| `Library` | `index.rs:81` | columnar library indexed by local candidate id: per-field precursor columns, a peptidoform arena, interned proteins, `u32` CSR `frag_offsets`, the fragment m/z, intensity and interned-name arrays, `prec_mz` as an `Arc<[f64]>` shared with `FragIndex`, plus the optional bucketed inverted index |
+| `Library::load` / `load_with` | `index.rs:1021` / `index.rs:1028` | read Parquet, validate labels, group fragments, enforce preconditions; parallel (concurrent precursor columns, parted fragment passes) and bit-identical to the serial load; `load_with` can skip the bucketed index and is what both stages call |
+| `Library::load_range_with` / `load_with_fragment_offset` | `index.rs:1059` / `index.rs:1095` | a precursor m/z range of one library file, or a band file against the library-wide fragment table (isolation-window groups) |
+| `Library::load_mz_only` | `index.rs:1133` | the seed's library: precursor columns and fragment m/z; the payload columns are decoded and checked as the full load checks them, then discarded |
+| `Library::from_candidates` | `index.rs:1405` | build a library in memory from `Candidate` records and fragment arrays (tests, benchmarks) |
+| `Library::n_candidates` / `peptidoform` / `protein` / `frag_range` | `index.rs:1480` / `:1486` / `:1493` / `:1499` | candidate count; the peptidoform text (arena slice); the protein group (empty reads `UNASSIGNED`); the candidate's range of the fragment arrays |
+| `Library::cand_frags` / `cand_frag_mz` / `frag_name_str` | `index.rs:1549` / `:1566` / `:1540` | per-candidate (m/z, intensity, interned name id) slices, which panic on a library without the payload; the m/z slice alone, which every library serves; name-id resolver |
+| `Library::page_search` | `index.rs:1621` | bucketed probe: bucket select -> candidate slice -> f32 ppm verify |
+| `Library::candidate_range` | `index.rs:1612` | isolation window -> `[lo, hi)` over `prec_mz` |
+| `Library::local_frag_index` | `index.rs:1596` | nearest-stored-m/z fragment ordinal (bucketed path only) |
+| `deconvolve` | `index.rs:1665` | z-charged peak m/z -> neutral m/z, in f64 |
+| `colread::for_each_zipped` / `first_err` | `colread.rs:27` / `:83` | one reader per column, the next batch of every column decoded while the caller processes the current one (`rayon::join` only); the first error of a parallel collect in part order, which is the first bad row in file order |
 | `LogBins` / `LogBins::bin` | `binning.rs:11` / `binning.rs:49` | log-space bin geometry and mapping |
-| `FragIndex::build` | `fragindex.rs:47` | two-pass counting-sort CSR build at a fixed tolerance; derives m/z range from the library |
-| `FragIndex::probe_peak` | `fragindex.rs:169` | +/-1 bin probe + `within_ppm` verify, candidate-window narrowed; callback `(cid, mz, int, frag)` |
-| `FragIndex::probe_peak_win` / `window_narrow` / `WindowNarrow` | `fragindex.rs:206` / `:315` / `:342` | same probe with the per-window bin-narrowing cache amortized |
-| `FragIndex::probe_peak_win_binned` / `bin_of` | `fragindex.rs:225` / `:197` | same probe again with the bin handed in, for a caller that computes the per-peak setup in a pass of its own; `bin_of` is the bin it expects |
-| `FragIndex::candidate_range` / `n_cand` / `tol_ppm` | `fragindex.rs:154` / `:142` / `:146` | index-side isolation-window narrowing + accessors |
-| `SeedScratch` | `fragindex.rs:354` | epoch-stamped, window-relative dense `(count, obs_sum)` accumulator; `touched`/`count`/`obs_sum` getters |
-| `score_scan_count_dot` (fragindex / naive) | `fragindex.rs:450` / `naive.rs:16` | equivalence-gate scorers, `dot = predicted*observed`, under an identical predicate |
-| `within_ppm` / `ppm_bounds` | `constants.rs:92` / `constants.rs:78` | min-relative vs query-relative tolerance predicates |
+| `FragIndex::build` / `build_mz_only` / `has_payload` | `fragindex.rs:78` / `:99` / `:105` | CSR build at a fixed tolerance, in parallel and bit-identical to the serial counting sort; derives the m/z range from the library. `build_mz_only` omits the intensity and ordinal postings, and `has_payload` says which kind an index is |
+| `FragIndex::probe_peak` / `probe_peak_cand` | `fragindex.rs:396` / `:425` | +/-1 bin probe + `within_ppm` verify, candidate-window narrowed; `probe_peak` calls back `(cid, mz, int, frag)` and needs the payload, `probe_peak_cand` calls back `(cid)` in the same order and serves an m/z-only index |
+| `FragIndex::probe_peak_win` / `window_narrow` / `WindowNarrow` | `fragindex.rs:470` / `:579` / `:612` | same probe with the per-window bin-narrowing cache amortized |
+| `LocalIndex` / `BinnedProbe` / `NarrowedProbe` / `FragIndex::geometry` | `fragindex.rs` | task-local compact index over one candidate sub-range, whole-library geometry; the probe trait both it and the narrowed global index implement |
+| `FragIndex::probe_peak_win_binned` / `bin_of` | `fragindex.rs:489` / `:461` | same probe again with the bin handed in, for a caller that computes the per-peak setup in a pass of its own; `bin_of` is the bin it expects |
+| `FragIndex::candidate_range` / `n_cand` / `tol_ppm` | `fragindex.rs:381` / `:369` / `:373` | index-side isolation-window narrowing + accessors |
+| `SeedScratch` / `SeedScratch::with_min_count` | `fragindex.rs:632` / `:667` | epoch-stamped, window-relative `(count, obs_sum)` accumulator, one 16-byte slot per candidate; `with_min_count` sets the count at which a candidate enters `qualified` |
+| `SeedScratch::accumulate` / `touched` / `qualified` | `fragindex.rs:691` / `:733` / `:741` | accumulate one scan; the touched candidates in first-touch order; those that reached the minimum count, in the order they reached it |
+| `score_scan_count_dot` (fragindex / naive) | `fragindex.rs:764` / `naive.rs:16` | equivalence-gate scorers, `dot = predicted*observed`, under an identical predicate |
+| `within_ppm` / `ppm_bounds` | `constants.rs:130` / `constants.rs:109` | min-relative vs query-relative tolerance predicates |
 
 ## Configuration
 
@@ -522,16 +689,18 @@ Matcher selection (both stages default to `Fragindex`):
 - **candidate_id contiguity.** `candidate_id` must be the dense range `0..N` in
   precursor-m/z-ascending row order. predict-frag guarantees it
   (`predict_frag.rs:178,210`); `Library::load_with` re-checks it and bails with a
-  clear message (`index.rs:112-125`); `FragIndex::build` asserts it
-  (`fragindex.rs:50-56`).
+  clear message (`check_candidate_ids`, `index.rs:215-245`); `FragIndex::build`
+  relies on it by construction (the library stores candidates as columns indexed by
+  that id) and asserts that the fragment offsets tile the fragment arrays
+  (`fragindex.rs:120-132`).
   An external library fed in unsorted or unindexed (for example
   `import_diann_lib.py` output not passed through `make_reverse_decoys.py`) fails
   here rather than silently misgrouping fragments.
 - **precursors ascending by m/z.** `Library::load_with` verifies `prec_mz` is
-  non-decreasing and bails otherwise (`index.rs:215-231`); the `candidate_range`
+  non-decreasing and bails otherwise (`index.rs:1288-1299`); the `candidate_range`
   binary search assumes it.
 - **fragment foreign key.** A fragment row referencing `candidate_id >= N` is a
-  hard error (`index.rs:133-139`).
+  hard error (`FragRange::local`, `index.rs:584-596`).
 - **both label classes must be present.** A library with zero targets or zero
   decoys makes target-decoy q-values meaningless, so load bails at library
   load with a clear message rather than completing a long search on an invalid
