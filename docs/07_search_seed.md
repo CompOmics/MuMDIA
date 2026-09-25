@@ -174,8 +174,9 @@ index via `page_search` and needs no separate build.
   processes them (`:334-390`). Per group, `candidate_range` is computed once
   (`:343`). Per scan, `select_peaks` picks the probe set, `SeedScratch::accumulate`
   probes each peak and fuses `(count, obs_sum)` per touched candidate
-  (`fragindex.rs:214-237`), candidates with `count >= min_matched_peaks` are
-  scored by `hyperscore`, sorted by score desc then candidate-id asc, truncated to
+  (`fragindex.rs:214-237`), the candidates with `count >= min_matched_peaks` (the
+  scratch's qualified list, collected as they reach the count) are scored by
+  `hyperscore`, sorted by score desc then candidate-id asc, truncated to
   `report_psms`, and folded into a group-local best with a strictly-greater update
   (`:357-385`).
 - *Bucketed path* (serial, `search_seed.rs:66-107`): per scan, `candidate_range` on

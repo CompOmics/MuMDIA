@@ -765,7 +765,7 @@ fn seed_fragindex_windows(
     let partials: Vec<Vec<(u32, Best)>> = group_vec
         .par_iter()
         .map_init(
-            || SeedScratch::new(scratch_width),
+            || SeedScratch::with_min_count(scratch_width, cfg.min_matched_peaks),
             |scratch, ids| {
                 if ids.is_empty() {
                     return Vec::new();
@@ -784,13 +784,15 @@ fn seed_fragindex_windows(
                         .map(|&pi| (scan.peaks[pi].mz as f64, scan.peaks[pi].intensity))
                         .collect();
                     scratch.accumulate(idx, &peaks, lo, hi);
-                    // Borrowed, not copied: `touched` can be as long as the candidate
-                    // window, so the copy was one allocation of up to a window's width per
-                    // scan. Same slice, same order, so the scored list is unchanged.
-                    let touched = scratch.touched();
-                    let mut scored: Vec<(u32, f64, u32)> = touched
+                    // The candidates that reached `min_matched_peaks`, which the scratch
+                    // collected as they reached it (`SeedScratch::qualified`) instead of
+                    // this loop filtering every candidate the scan touched. They come in a
+                    // different order than `touched`, and the sort below is a total order
+                    // over unique candidate ids (score, then id), so the scored list, and
+                    // what `truncate` keeps of it, are unchanged.
+                    let mut scored: Vec<(u32, f64, u32)> = scratch
+                        .qualified()
                         .iter()
-                        .filter(|&&cid| scratch.count(cid) as usize >= cfg.min_matched_peaks)
                         .map(|&cid| {
                             (
                                 cid,

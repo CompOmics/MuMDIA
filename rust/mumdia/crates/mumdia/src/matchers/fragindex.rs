@@ -621,11 +621,20 @@ pub struct WindowNarrow {
 /// reproducing the seed's existing `_pi` discard); `count` is the per-posting match
 /// count. Reused across all scans of a block; the accumulator is reset lazily via
 /// `epoch`, so only touched candidates are ever written or read.
+///
+/// Array-of-structs: a candidate's stamp, count and observed sum sit in one 16-byte slot,
+/// so a matched posting updates one cache line instead of three (the three arrays used to
+/// be separate, and in a dense window the posting stream reaches slots at random). Also
+/// kept, beside the first-touch list: the QUALIFIED list, the candidates whose count has
+/// reached the caller's `min_count`, appended at the moment they reach it, so a scan's
+/// scoring walks only the candidates it can report instead of filtering every candidate
+/// the scan touched.
 pub struct SeedScratch {
-    count: Vec<u32>,
-    obs_sum: Vec<f64>,
-    stamp: Vec<u32>,
+    slots: Vec<SeedSlot>,
     touched: Vec<u32>,
+    qualified: Vec<u32>,
+    /// Count at which a candidate enters `qualified` (at least 1).
+    min_count: u32,
     epoch: u32,
     /// `candidate_id` that maps to slot 0. The arrays are indexed WINDOW-RELATIVE, so
     /// they only need to span the widest isolation window rather than the whole library:
@@ -635,34 +644,50 @@ pub struct SeedScratch {
     base: u32,
 }
 
+/// One candidate's accumulator slot (16 bytes).
+#[derive(Clone, Copy, Default)]
+struct SeedSlot {
+    /// Epoch of the scan that last touched it; 0 is never a live epoch.
+    stamp: u32,
+    count: u32,
+    obs_sum: f64,
+}
+
 impl SeedScratch {
     /// `cap` is the expected maximum candidate-window width, not the library size.
-    /// Passing a smaller value is safe: the arrays grow on demand.
+    /// Passing a smaller value is safe: the arrays grow on demand. The qualified list
+    /// holds every touched candidate (a `min_count` of 1).
     pub fn new(cap: usize) -> SeedScratch {
+        SeedScratch::with_min_count(cap, 1)
+    }
+
+    /// As [`SeedScratch::new`], with the count at which a candidate is QUALIFIED
+    /// ([`SeedScratch::qualified`]): the seed's `min_matched_peaks`. Zero behaves as one,
+    /// since every touched candidate has matched at least once.
+    pub fn with_min_count(cap: usize, min_count: usize) -> SeedScratch {
         SeedScratch {
-            count: vec![0; cap],
-            obs_sum: vec![0.0; cap],
-            stamp: vec![0; cap], // 0 is never a live epoch (epoch increments before scan 1)
+            slots: vec![SeedSlot::default(); cap],
             touched: Vec::new(),
+            qualified: Vec::new(),
+            min_count: u32::try_from(min_count).unwrap_or(u32::MAX).max(1),
             epoch: 0,
             base: 0,
         }
     }
 
-    /// Ensure the window-relative arrays span `width` slots.
+    /// Ensure the window-relative slots span `width`.
     fn ensure(&mut self, width: usize) {
-        if self.count.len() < width {
-            self.count.resize(width, 0);
-            self.obs_sum.resize(width, 0.0);
+        if self.slots.len() < width {
             // New slots must not appear stamped for the current epoch.
-            self.stamp.resize(width, 0);
+            self.slots.resize(width, SeedSlot::default());
         }
     }
 
     /// Accumulate one scan's peaks over the candidate window. Peaks must already be
     /// in the caller's fixed order (e.g. m/z ascending, or the top-N re-sorted
     /// order) so `obs_sum` is summed deterministically. After the call, `touched()`
-    /// lists the hit candidates and `count`/`obs_sum` hold their values.
+    /// lists the hit candidates, `qualified()` those among them that reached the minimum
+    /// count, and `count`/`obs_sum` hold their values.
     pub fn accumulate(
         &mut self,
         idx: &FragIndex,
@@ -672,22 +697,33 @@ impl SeedScratch {
     ) {
         self.epoch += 1;
         self.touched.clear();
+        self.qualified.clear();
         // Index relative to this window's first candidate.
         self.base = cand_lo;
         self.ensure((cand_hi.saturating_sub(cand_lo)) as usize + 1);
-        let epoch = self.epoch;
-        let base = self.base;
+        let (epoch, base, min_count) = (self.epoch, self.base, self.min_count);
+        let SeedScratch {
+            slots,
+            touched,
+            qualified,
+            ..
+        } = self;
         for &(mz, inten) in peaks {
             idx.probe_peak_cand(mz, cand_lo, cand_hi, |cid| {
-                let cc = (cid - base) as usize;
-                if self.stamp[cc] != epoch {
-                    self.stamp[cc] = epoch;
-                    self.count[cc] = 0;
-                    self.obs_sum[cc] = 0.0;
-                    self.touched.push(cid);
+                let s = &mut slots[(cid - base) as usize];
+                if s.stamp != epoch {
+                    *s = SeedSlot {
+                        stamp: epoch,
+                        count: 0,
+                        obs_sum: 0.0,
+                    };
+                    touched.push(cid);
                 }
-                self.count[cc] += 1;
-                self.obs_sum[cc] += inten as f64;
+                s.count += 1;
+                s.obs_sum += inten as f64;
+                if s.count == min_count {
+                    qualified.push(cid);
+                }
             });
         }
     }
@@ -698,17 +734,25 @@ impl SeedScratch {
         &self.touched
     }
 
+    /// Candidates of the last `accumulate` whose count reached the minimum count, in the
+    /// order they reached it: exactly the touched candidates with `count >= min_count`,
+    /// in a different order, so a caller that sorts them (the seed sorts by score, then
+    /// candidate id) gets the list it got by filtering `touched`.
+    pub fn qualified(&self) -> &[u32] {
+        &self.qualified
+    }
+
     /// Valid only for candidate ids from the most recent [`SeedScratch::accumulate`]
     /// window (which is what [`SeedScratch::touched`] returns).
     #[inline]
     pub fn count(&self, cid: u32) -> u32 {
-        self.count[(cid - self.base) as usize]
+        self.slots[(cid - self.base) as usize].count
     }
 
     /// See [`SeedScratch::count`] for the validity window.
     #[inline]
     pub fn obs_sum(&self, cid: u32) -> f64 {
-        self.obs_sum[(cid - self.base) as usize]
+        self.slots[(cid - self.base) as usize].obs_sum
     }
 }
 
@@ -1296,6 +1340,190 @@ mod tests {
                 assert_eq!(a.count(c), b.count(c));
                 assert_eq!(a.obs_sum(c).to_bits(), b.obs_sum(c).to_bits());
             }
+        }
+    }
+
+    /// The three-array accumulator the slot accumulator replaced, verbatim, as the
+    /// reference it is compared against and timed against.
+    struct SoaScratch {
+        count: Vec<u32>,
+        obs_sum: Vec<f64>,
+        stamp: Vec<u32>,
+        touched: Vec<u32>,
+        epoch: u32,
+        base: u32,
+    }
+
+    impl SoaScratch {
+        fn new(cap: usize) -> SoaScratch {
+            SoaScratch {
+                count: vec![0; cap],
+                obs_sum: vec![0.0; cap],
+                stamp: vec![0; cap],
+                touched: Vec::new(),
+                epoch: 0,
+                base: 0,
+            }
+        }
+        fn accumulate(&mut self, idx: &FragIndex, peaks: &[(f64, f32)], lo: u32, hi: u32) {
+            self.epoch += 1;
+            self.touched.clear();
+            self.base = lo;
+            let width = (hi.saturating_sub(lo)) as usize + 1;
+            if self.count.len() < width {
+                self.count.resize(width, 0);
+                self.obs_sum.resize(width, 0.0);
+                self.stamp.resize(width, 0);
+            }
+            let (epoch, base) = (self.epoch, self.base);
+            for &(mz, inten) in peaks {
+                idx.probe_peak_cand(mz, lo, hi, |cid| {
+                    let cc = (cid - base) as usize;
+                    if self.stamp[cc] != epoch {
+                        self.stamp[cc] = epoch;
+                        self.count[cc] = 0;
+                        self.obs_sum[cc] = 0.0;
+                        self.touched.push(cid);
+                    }
+                    self.count[cc] += 1;
+                    self.obs_sum[cc] += inten as f64;
+                });
+            }
+        }
+    }
+
+    /// Dense scans over a crowded window: peaks drawn from the library's own fragment m/z,
+    /// so most candidates are touched and many several times.
+    fn dense_scans(lib: &Library, n_scans: usize, per_scan: usize) -> Vec<Vec<(f64, f32)>> {
+        let mut state = 0x51ce_u64;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) as usize
+        };
+        (0..n_scans)
+            .map(|_| {
+                let mut v: Vec<(f64, f32)> = (0..per_scan)
+                    .map(|_| {
+                        let m = lib.frag_mz[next() % lib.frag_mz.len()] as f64;
+                        (m * (1.0 + 2e-6), (next() % 1000) as f32 / 7.0)
+                    })
+                    .collect();
+                v.sort_by(|a, b| a.0.total_cmp(&b.0));
+                v
+            })
+            .collect()
+    }
+
+    /// The slot accumulator touches the same candidates in the same order, with the same
+    /// counts and the same observed sums bit for bit, as the three-array one, scan after
+    /// scan over one reused scratch (so the epoch reset is exercised); and its qualified
+    /// list is exactly the touched candidates at or above the minimum count.
+    #[test]
+    fn the_slot_accumulator_matches_the_three_array_one() {
+        let lib = random_lib(3_000, 0x9e37);
+        let idx = FragIndex::build_mz_only(&lib, 20.0);
+        let scans = dense_scans(&lib, 40, 400);
+        for min in [0usize, 1, 2, 3, 6] {
+            let mut new = SeedScratch::with_min_count(4, min);
+            let mut old = SoaScratch::new(4);
+            for (k, peaks) in scans.iter().enumerate() {
+                let (lo, hi) = if k % 3 == 0 { (0, 3_000) } else { (500, 2_100) };
+                new.accumulate(&idx, peaks, lo, hi);
+                old.accumulate(&idx, peaks, lo, hi);
+                assert_eq!(new.touched(), &old.touched[..], "scan {k}");
+                for &c in new.touched() {
+                    let cc = (c - old.base) as usize;
+                    assert_eq!(new.count(c), old.count[cc]);
+                    assert_eq!(new.obs_sum(c).to_bits(), old.obs_sum[cc].to_bits());
+                }
+                let mut want: Vec<u32> = old
+                    .touched
+                    .iter()
+                    .copied()
+                    .filter(|&c| old.count[(c - old.base) as usize] as usize >= min)
+                    .collect();
+                let mut got = new.qualified().to_vec();
+                assert_eq!(
+                    got.len(),
+                    want.len(),
+                    "scan {k} min {min}: a candidate twice?"
+                );
+                want.sort_unstable();
+                got.sort_unstable();
+                assert_eq!(got, want, "scan {k} min {min}");
+            }
+        }
+    }
+
+    /// Microbenchmark: the slot accumulator plus its qualified list against the three-array
+    /// accumulator plus the filter over `touched` the seed used to run, over dense scans of
+    /// one wide window. `#[ignore]`d.
+    ///
+    ///   cargo test --release -p mumdia bench_seed_accumulator -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn bench_seed_accumulator() {
+        // A window that fits in cache (60k candidates, ~1 MB of slots) and one that does not
+        // (2M candidates, ~32 MB), where the slot's single cache line per posting counts.
+        for (n_cand, n_scans, per_scan) in
+            [(60_000usize, 200usize, 2_000usize), (2_000_000, 60, 4_000)]
+        {
+            let lib = random_lib(n_cand, 0x7);
+            let idx = FragIndex::build_mz_only(&lib, 20.0);
+            let scans = dense_scans(&lib, n_scans, per_scan);
+            let hi = n_cand as u32;
+            let min = 4usize;
+            let mut best = (f64::INFINITY, f64::INFINITY);
+            let (mut ha, mut hb) = (0u64, 0u64);
+            for r in 0..6 {
+                for arm in [r % 2, 1 - r % 2] {
+                    let t = std::time::Instant::now();
+                    let mut acc = 0u64;
+                    if arm == 0 {
+                        let mut sc = SeedScratch::with_min_count(n_cand + 1, min);
+                        for peaks in &scans {
+                            sc.accumulate(&idx, peaks, 0, hi);
+                            for &c in sc.qualified() {
+                                acc = acc
+                                    .wrapping_add(c as u64)
+                                    .wrapping_add(sc.obs_sum(c).to_bits());
+                            }
+                        }
+                    } else {
+                        let mut sc = SoaScratch::new(n_cand + 1);
+                        for peaks in &scans {
+                            sc.accumulate(&idx, peaks, 0, hi);
+                            for &c in sc.touched.iter() {
+                                let cc = (c - sc.base) as usize;
+                                if sc.count[cc] as usize >= min {
+                                    acc = acc
+                                        .wrapping_add(c as u64)
+                                        .wrapping_add(sc.obs_sum[cc].to_bits());
+                                }
+                            }
+                        }
+                    }
+                    let el = t.elapsed().as_secs_f64();
+                    std::hint::black_box(acc);
+                    if arm == 0 {
+                        best.0 = best.0.min(el);
+                        ha = acc;
+                    } else {
+                        best.1 = best.1.min(el);
+                        hb = acc;
+                    }
+                }
+            }
+            assert_eq!(ha, hb, "the two accumulators disagree");
+            println!(
+                "seed accumulator, {n_scans} scans x {per_scan} peaks over {n_cand} candidates: \
+                 slots + qualified {:.1} ms, three arrays + filter {:.1} ms ({:+.1}%)",
+                best.0 * 1e3,
+                best.1 * 1e3,
+                100.0 * (best.0 - best.1) / best.1
+            );
         }
     }
 

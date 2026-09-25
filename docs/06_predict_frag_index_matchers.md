@@ -453,7 +453,16 @@ touched); `ensure` grows them on demand, so an undersized `new(cap)` is safe. Th
 seed accumulates a fused `(count, obs_sum)` semiring where `obs_sum` sums the
 observed peak intensity per matched posting (predicted intensity deliberately
 discarded, `fragindex.rs:341`), and exposes the touched set plus per-candidate
-`count(cid)` / `obs_sum(cid)` getters (`fragindex.rs:348-363`).
+`count(cid)` / `obs_sum(cid)` getters (`fragindex.rs:348-363`). The state is
+array-of-structs: a candidate's stamp, count and observed sum share one 16-byte
+slot, so a matched posting updates one cache line instead of three. It also keeps a
+QUALIFIED list (`with_min_count`, `qualified()`): a candidate is appended when its
+count reaches the seed's `min_matched_peaks`, so scoring walks only the candidates it
+can report. The seed then sorts them by score and candidate id, a total order, so the
+scored list is the one the filter over `touched` gave. Measured
+(`bench_seed_accumulator`): 5% faster on a 60,000-candidate window that fits in
+cache, 2.05x on a 2M-candidate window (32 MB of slots) that does not; the probe
+through `probe_peak_cand` visits the postings in `probe_peak`'s order.
 
 The free function `score_scan_count_dot` (`fragindex.rs:450`) is a separate,
 non-`SeedScratch` scorer used only by the equivalence gate: it accumulates
