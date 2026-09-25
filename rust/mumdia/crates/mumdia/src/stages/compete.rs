@@ -18,7 +18,8 @@ use mumdia_core::rejection::RejectionReason;
 use mumdia_core::schema::artifact;
 use mumdia_io::report::{ArtifactReport, Written};
 use mumdia_io::table::{
-    publish_copy_of, require_no_nulls, write_table, BatchWriter, Col, FileCopy, TableFile,
+    publish_copy_of, require_no_nulls, write_table, BatchWriter, Col, FileCopy, SpliceWriter,
+    TableFile,
 };
 use serde_json::json;
 use tracing::{info, warn};
@@ -299,6 +300,14 @@ pub fn run_hashed(p: CompeteParams) -> Result<Written> {
     // How the table reached disk: `hard_link` / `byte_copy` (the features file's own bytes)
     // or `rewritten`. The values are the same either way; the file bytes and hash are not.
     stats.insert("publish".to_string(), json!(published.as_str()));
+    if let Published::Spliced {
+        rewritten,
+        row_groups,
+    } = published
+    {
+        stats.insert("rewritten_row_groups".to_string(), json!(rewritten));
+        stats.insert("row_groups".to_string(), json!(row_groups));
+    }
     let report = ArtifactReport {
         logical_name: artifact::PSMS_COMPETED.0.to_string(),
         schema_name: artifact::PSMS_COMPETED.0.to_string(),
@@ -426,6 +435,10 @@ enum Published {
     /// Every row survived and the features file already is the competed table, so its bytes
     /// were published unchanged: a hard link, or a byte copy where the link failed.
     FeaturesFile(FileCopy),
+    /// Some rows were removed: the features row groups that lost none were spliced in as
+    /// bytes, and only the `rewritten` of the `row_groups` that did were decoded and
+    /// re-encoded ([`splice_kept_rows`]).
+    Spliced { rewritten: usize, row_groups: usize },
     /// Decoded and re-encoded batch by batch ([`copy_kept_rows`]).
     Rewritten,
 }
@@ -434,6 +447,7 @@ impl Published {
     fn as_str(self) -> &'static str {
         match self {
             Published::FeaturesFile(how) => how.as_str(),
+            Published::Spliced { .. } => "spliced",
             Published::Rewritten => "rewritten",
         }
     }
@@ -511,6 +525,12 @@ fn features_bytes_reusable(
 /// The competed file then has the features file's row groups (65,536 rows) and bytes, and
 /// so the features file's content hash. Every reader decodes the same values in the same
 /// order, which is what the downstream stages see.
+///
+/// When some rows are removed but at least one features row group lost none, the table is
+/// spliced instead ([`splice_kept_rows`]): the untouched row groups are copied as bytes
+/// and only the ones that lost a row are rewritten. When every row group lost a row (a
+/// grouping that removes many rows, such as `base_peptide`) splicing would rewrite all of
+/// them through a temporary file, so the whole table is rewritten directly.
 fn publish_competed(
     t: &TableFile,
     features: &str,
@@ -531,7 +551,20 @@ fn publish_competed(
                  copied as the competed table; rewriting it"
             ),
         },
-        Reuse::Yes => {}
+        Reuse::Yes => {
+            let spans = row_group_spans(t);
+            if spans.iter().any(|&(s, len)| kept_in(keep, s, len) == len) {
+                let (rows, rewritten) =
+                    splice_kept_rows(t, features, out, feat_names, keep, &spans)?;
+                return Ok((
+                    rows,
+                    Published::Spliced {
+                        rewritten,
+                        row_groups: spans.len(),
+                    },
+                ));
+            }
+        }
         Reuse::No(reason) => info!(
             reason,
             "compete: the features table's bytes cannot be reused; rewriting the rows"
@@ -546,6 +579,112 @@ fn publish_competed(
         COMPETED_ROW_GROUP_ROWS,
     )?;
     Ok((rows, Published::Rewritten))
+}
+
+/// `(first row, row count)` of each row group of the features file, in file order.
+fn row_group_spans(t: &TableFile) -> Vec<(usize, usize)> {
+    let mut start = 0usize;
+    t.row_group_rows()
+        .into_iter()
+        .map(|len| {
+            let span = (start, len);
+            start += len;
+            span
+        })
+        .collect()
+}
+
+/// How many of the sorted, unique row indices `keep` fall in `[start, start + len)`.
+fn kept_in(keep: &[usize], start: usize, len: usize) -> usize {
+    keep.partition_point(|&r| r < start + len) - keep.partition_point(|&r| r < start)
+}
+
+/// Removes a scratch file when dropped, on the error path as on the normal one.
+struct ScratchFile(String);
+
+impl Drop for ScratchFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Write the rows `keep` of the features table to `out` by splicing: every row group that
+/// keeps all its rows is appended as bytes ([`SpliceWriter`], as the pool splices band
+/// tables), and each run of consecutive row groups that lost a row is rewritten by
+/// [`copy_kept_rows`] into a scratch file whose row groups are then appended in its place.
+/// Returns the rows written and how many features row groups were rewritten.
+///
+/// The caller has established [`features_bytes_reusable`], so the features file already is
+/// exactly what the copy writes for its rows, and a rewritten run carries the same parquet
+/// schema; the splice would refuse anything else. The rows, their order and their values
+/// are those of the full rewrite. The row-group boundaries are not: the clean groups keep
+/// the features file's, so the file is not byte-identical to a full rewrite.
+fn splice_kept_rows(
+    t: &TableFile,
+    features: &str,
+    out: &str,
+    feat_names: &[String],
+    keep: &[usize],
+    spans: &[(usize, usize)],
+) -> Result<(u64, usize)> {
+    let clean: Vec<bool> = spans
+        .iter()
+        .map(|&(s, len)| kept_in(keep, s, len) == len)
+        .collect();
+    let mut w = SpliceWriter::create(out, features)?;
+    let (mut rows, mut rewritten) = (0u64, 0usize);
+    let mut i = 0usize;
+    while i < spans.len() {
+        let start = i;
+        if clean[i] {
+            while i < spans.len() && clean[i] {
+                i += 1;
+            }
+            rows += w.append_row_groups(features, |k| k >= start && k < i)?;
+            continue;
+        }
+        while i < spans.len() && !clean[i] {
+            i += 1;
+        }
+        rewritten += i - start;
+        let first = spans[start].0;
+        let end = spans[i - 1].0 + spans[i - 1].1;
+        let lo = keep.partition_point(|&r| r < first);
+        let hi = keep.partition_point(|&r| r < end);
+        if lo == hi {
+            // Every row of this run was removed: nothing to write in its place.
+            continue;
+        }
+        let local: Vec<usize> = keep[lo..hi].iter().map(|&r| r - first).collect();
+        let scratch = ScratchFile(format!(
+            "{out}.splice-{}-{first}.parquet",
+            std::process::id()
+        ));
+        copy_kept_rows(
+            &t.span(first, end - first)?,
+            &scratch.0,
+            feat_names,
+            false,
+            &local,
+            COMPETED_ROW_GROUP_ROWS,
+        )?;
+        let spliced = w.append_row_groups(&scratch.0, |_| true)?;
+        if spliced != local.len() as u64 {
+            anyhow::bail!(
+                "compete: rewrote {} rows of {features} rows {first}..{end} but spliced {spliced}",
+                local.len()
+            );
+        }
+        rows += spliced;
+    }
+    let written = w.close()?;
+    if written != rows || rows != keep.len() as u64 {
+        anyhow::bail!(
+            "compete: spliced {rows} rows into {out} (file holds {written}), expected {}",
+            keep.len()
+        );
+    }
+    Ok((rows, rewritten))
 }
 
 /// The competed table's schema, in exactly the column set and order the previous typed
@@ -1491,6 +1630,104 @@ mod tests {
         assert!(
             names.iter().all(|n| !n.contains(".tmp-")),
             "a temporary file survived: {names:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn row_group_sizes(path: &str) -> Vec<usize> {
+        TableFile::open(path).unwrap().row_group_rows()
+    }
+
+    #[test]
+    fn removing_a_few_rows_splices_the_untouched_row_groups() {
+        // Row 7 takes row 5's peptidoform (both targets, both charge 3), so the default
+        // grouping puts them in one group and row 7 (the lower prelim) is removed. Row 7
+        // is in the second of four 4-row groups: that group is rewritten, the other three
+        // are spliced in as bytes.
+        let dir = tmp_dir("splice");
+        let feats = dir.join("features.parquet");
+        let feats = feats.to_str().unwrap();
+        write_features_table(feats, 16, 4, &[7], false, true);
+        let out = dir.join("competed.parquet");
+        let out = out.to_str().unwrap();
+        let cfg = CompeteConfig::default();
+        let (w, rep) = compete_with(feats, out, &cfg, Some(&"f".repeat(64)));
+        assert_eq!(rep.stats["removed"], json!(1));
+        assert_eq!(rep.stats["publish"], json!("spliced"));
+        assert_eq!(rep.stats["rewritten_row_groups"], json!(1));
+        assert_eq!(rep.stats["row_groups"], json!(4));
+        assert_eq!(w.rows, 15);
+        // Not the features bytes, so the output is hashed and the caller's hash ignored.
+        assert_eq!(rep.content_hash, mumdia_io::hash::blake3_file(out).unwrap());
+        assert_eq!(row_group_sizes(out), vec![4, 3, 4, 4]);
+        // The values and their order are exactly the full rewrite's.
+        let keep: Vec<usize> = (0..16).filter(|&r| r != 7).collect();
+        let reference = dir.join("reference.parquet");
+        let reference = reference.to_str().unwrap();
+        rewritten_reference(feats, reference, &keep);
+        assert_eq!(whole_table(out), whole_table(reference));
+        // The scratch file of the rewritten group is gone.
+        let names: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            names
+                .iter()
+                .all(|n| !n.contains(".splice-") && !n.contains(".tmp-")),
+            "{names:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_row_group_that_loses_every_row_is_dropped_from_the_splice() {
+        // One row per row group: removing row 7 empties its group, which contributes
+        // nothing, and the fifteen others are spliced.
+        let dir = tmp_dir("splice_empty_group");
+        let feats = dir.join("features.parquet");
+        let feats = feats.to_str().unwrap();
+        write_features_table(feats, 16, 1, &[7], false, true);
+        let out = dir.join("competed.parquet");
+        let out = out.to_str().unwrap();
+        let cfg = CompeteConfig::default();
+        let (w, rep) = compete_with(feats, out, &cfg, None);
+        assert_eq!(rep.stats["publish"], json!("spliced"));
+        assert_eq!(rep.stats["rewritten_row_groups"], json!(1));
+        assert_eq!(w.rows, 15);
+        assert_eq!(row_group_sizes(out), vec![1; 15]);
+        let keep: Vec<usize> = (0..16).filter(|&r| r != 7).collect();
+        let reference = dir.join("reference.parquet");
+        let reference = reference.to_str().unwrap();
+        rewritten_reference(feats, reference, &keep);
+        assert_eq!(whole_table(out), whole_table(reference));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn when_every_row_group_loses_a_row_the_table_is_rewritten() {
+        // Rows 4 and 7 duplicate rows 2 and 5, so rows 2 and 7 are removed, one from each
+        // of the two 4-row groups. No group is clean, so splicing would rewrite everything
+        // through scratch files; the table is rewritten directly instead.
+        let dir = tmp_dir("splice_all_dirty");
+        let feats = dir.join("features.parquet");
+        let feats = feats.to_str().unwrap();
+        write_features_table(feats, 8, 4, &[4, 7], false, true);
+        let out = dir.join("competed.parquet");
+        let out = out.to_str().unwrap();
+        let cfg = CompeteConfig::default();
+        let (w, rep) = compete_with(feats, out, &cfg, None);
+        assert_eq!(rep.stats["removed"], json!(2));
+        assert_eq!(rep.stats["publish"], json!("rewritten"));
+        assert_eq!(w.rows, 6);
+        let keep: Vec<usize> = vec![0, 1, 3, 4, 5, 6];
+        let reference = dir.join("reference.parquet");
+        let reference = reference.to_str().unwrap();
+        rewritten_reference(feats, reference, &keep);
+        // The rewrite path is the reference path, so here even the bytes agree.
+        assert_eq!(
+            std::fs::read(out).unwrap(),
+            std::fs::read(reference).unwrap()
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

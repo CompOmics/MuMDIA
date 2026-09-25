@@ -315,8 +315,22 @@ writes 65,536); the table has its own `peak_rank` column; and
 `compete.emit_competition_audit` is off. Otherwise the stage logs the reason and
 rewrites.
 
-The report's `stats.publish` records which path ran: `hard_link`, `byte_copy` or
-`rewritten`. After a link or a copy the competed file has the features file's row
+When some rows are removed, the same four conditions hold, and at least one
+features row group lost no row, the table is spliced instead (`splice_kept_rows`):
+the untouched row groups are appended as bytes through `SpliceWriter`, as the pool
+splices band tables, and each run of consecutive row groups that lost a row is
+rewritten by `copy_kept_rows` into a scratch file (`<out>.splice-<pid>-<row>.parquet`,
+removed afterwards) whose row groups take its place. A row group that lost every row
+contributes nothing. When every row group lost a row, which is the usual case for a
+grouping that removes many rows (`base_peptide` removed 23% of the rows on HYE B01),
+splicing would only add a scratch write, so the table is rewritten directly. The
+spliced file holds the rewrite's rows in the rewrite's order with its values; its row
+groups are the features file's where they were untouched, so it is not byte-identical
+to a full rewrite. Under the shipped defaults no row is removed and this path does not
+run.
+
+The report's `stats.publish` records which path ran: `hard_link`, `byte_copy`,
+`spliced` (with `rewritten_row_groups` and `row_groups`) or `rewritten`. After a link or a copy the competed file has the features file's row
 groups and bytes, so its `content_hash` IS the features hash. An orchestrator passes
 the features stage's own hash as `CompeteParams::features_hash`, and compete records it
 rather than reading the file again; the standalone `mumdia compete` passes none and
@@ -643,6 +657,7 @@ counts feed a hyperscore-style term; `n` is small so the naive loop is fine.
 | `compete::run_hashed` | compete.rs | `run`, returning the row count and the report content hash (`mumdia_io::report::Written`) |
 | `compete::publish_competed` | compete.rs | publish the kept rows: the features file's bytes when they are exactly the competed table, otherwise `copy_kept_rows` |
 | `compete::features_bytes_reusable` | compete.rs | the four conditions under which the features bytes can stand in for the competed table |
+| `compete::splice_kept_rows` | compete.rs | some rows removed: splice the untouched features row groups, rewrite the others |
 | `rescore::run` | rescore.rs:41 | full rescore stage: concat, dispatch, multi-context q, scored table |
 | `rescore::validate_feature_schema` | rescore.rs:596 | reject a concat whose feature companions differ in id or ordered columns |
 | `rescore::native_scores` | rescore.rs:616 | thin wrapper calling `percolator_lite` with the config knobs |
