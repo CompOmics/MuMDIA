@@ -413,10 +413,21 @@ The cheap-to-expensive acceptance cascade, in order:
    `presence_min_coelution` are each floored at 1 via `.max(1)` (`extract.rs:1727`,
    `extract.rs:1926`, `extract.rs:1915`), so a configured 0 still requires at
    least one fragment.
-2. **Scan grouping**: hits are rt-sorted and grouped into scan groups
-   `Vec<(rt, BTreeMap<frag, intensity>)>`, deduping the same fragment within one
-   scan by max (`extract.rs:1735`). The `BTreeMap` fixes per-scan fragment order so
-   the f32 apex sum is deterministic.
+2. **Scan grouping**: hits are rt-sorted (on the looked-up scan RT) and grouped
+   into scan groups, deduping the same fragment within one scan by max. The groups
+   are one dense `ScanGroups` per candidate: the group RTs, a `groups x width` f32
+   value array and a presence bitmask of the same shape, `width` being one past the
+   largest fragment ordinal among the candidate's hits. Until 2026-09-25 each group
+   was a `BTreeMap<frag, intensity>`; the dense form answers the same questions
+   (count, fragments ascending, lookup, the values summed in ordinal order through
+   the same `Iterator::sum`) with the same values, so the f32 apex sum is
+   deterministic and unchanged, and it allocates three buffers per candidate
+   instead of a tree node per occupied group
+   (`dense_groups_answer_what_the_trees_answered`). The value array is at most the
+   size of the grid-mode traces the candidate emits for its observed fragments.
+   Presence is a bit rather than a sentinel value, and a fragment first seen by a
+   later hit of the same group starts from 0.0 before the max, exactly as the tree's
+   `entry(..).or_insert(0.0)` did.
 3. **Acquisition-scan grid projection** (`extract.rs:1782`): when
    `emit_window_grid` is on, the sparse groups are projected onto the full set of
    covering-window scans inside the RT window, so missing acquisition scans count
@@ -708,8 +719,9 @@ here for one index.
 
 - **Determinism**: output is emitted in ascending `candidate_id` order
   (`extract.rs:1651`); the parallel per-candidate map preserves that order via
-  `collect()`. Per-scan fragment maps are `BTreeMap` so f32 apex sums have a fixed
-  addition order (`extract.rs:1735`). The parallel window accumulation is documented
+  `collect()`. Per-scan fragment values are read in ascending ordinal order
+  (`ScanGroups`, which replaced a `BTreeMap` per scan group) so f32 apex sums have a
+  fixed addition order. The parallel window accumulation is documented
   as bit-identical to the serial loop (`extract.rs:1456`). A
   HashMap f32 sum shifting the apex once broke reproducibility; keep ordered maps
   and sorted iteration wherever floats are summed.

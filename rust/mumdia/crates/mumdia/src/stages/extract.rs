@@ -806,6 +806,189 @@ impl FragSet {
     }
 }
 
+/// One candidate's scan groups: per group its RT and, for each fragment ordinal
+/// `0..width`, the observed intensity when the fragment was seen in that group.
+///
+/// This replaces `Vec<(f64, BTreeMap<u16, f32>)>`, one tree per scan group, which on the
+/// window grid meant one tree per grid scan and a node allocation for every group that
+/// held a fragment. Here the whole candidate is three flat buffers: the RTs, a dense
+/// `groups x width` value array and a presence bitmask of the same shape. `width` is one
+/// past the largest ordinal among the candidate's hits, so the value array is at most
+/// the size of the grid-mode traces the candidate emits for its observed fragments.
+///
+/// It answers every question the trees answered with the same values in the same order:
+/// `count` is the tree's `len`, `frags` its keys ascending, `sum` its values summed in key
+/// order through the same `Iterator::sum`, `get` its lookup (`None` for an absent
+/// fragment, including one past `width`). Presence is a bit, not a sentinel value, because
+/// an observed intensity can be 0.0 (or negative in a hand-made artifact) and must still
+/// count as present.
+struct ScanGroups {
+    rt: Vec<f64>,
+    width: usize,
+    /// `u64` words of presence per group.
+    words: usize,
+    val: Vec<f32>,
+    bits: Vec<u64>,
+}
+
+impl ScanGroups {
+    /// No groups yet, room for ordinals `0..width`.
+    fn new(width: usize) -> ScanGroups {
+        ScanGroups {
+            rt: Vec::new(),
+            width,
+            words: width.div_ceil(64),
+            val: Vec::new(),
+            bits: Vec::new(),
+        }
+    }
+
+    /// One empty group per RT of `rts`.
+    fn empty_on(rts: &[f64], width: usize) -> ScanGroups {
+        let words = width.div_ceil(64);
+        ScanGroups {
+            rt: rts.to_vec(),
+            width,
+            words,
+            val: vec![0.0; rts.len() * width],
+            bits: vec![0; rts.len() * words],
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.rt.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.rt.is_empty()
+    }
+
+    #[inline]
+    fn rt(&self, i: usize) -> f64 {
+        self.rt[i]
+    }
+
+    /// Open a new, empty group at `rt`.
+    fn push_group(&mut self, rt: f64) {
+        self.rt.push(rt);
+        self.val.resize(self.val.len() + self.width, 0.0);
+        self.bits.resize(self.bits.len() + self.words, 0);
+    }
+
+    #[inline]
+    fn present(&self, i: usize, f: usize) -> bool {
+        f < self.width && self.bits[i * self.words + f / 64] >> (f % 64) & 1 == 1
+    }
+
+    /// Fragment `f`'s intensity in group `i`, if it was observed there.
+    #[inline]
+    fn get(&self, i: usize, f: u16) -> Option<f32> {
+        let f = f as usize;
+        self.present(i, f).then(|| self.val[i * self.width + f])
+    }
+
+    /// [`ScanGroups::get`], 0.0 when absent: the tree's `get(..).unwrap_or(0.0)`.
+    #[inline]
+    fn or_zero(&self, i: usize, f: u16) -> f32 {
+        self.get(i, f).unwrap_or(0.0)
+    }
+
+    /// Distinct fragments observed in group `i`.
+    fn count(&self, i: usize) -> usize {
+        self.bits[i * self.words..(i + 1) * self.words]
+            .iter()
+            .map(|w| w.count_ones() as usize)
+            .sum()
+    }
+
+    /// The fragments observed in group `i`, ascending.
+    fn frags(&self, i: usize) -> impl Iterator<Item = u16> + '_ {
+        let row = &self.bits[i * self.words..(i + 1) * self.words];
+        row.iter().enumerate().flat_map(|(w, &word)| {
+            let mut word = word;
+            std::iter::from_fn(move || {
+                (word != 0).then(|| {
+                    let b = word.trailing_zeros() as usize;
+                    word &= word - 1;
+                    (w * 64 + b) as u16
+                })
+            })
+        })
+    }
+
+    /// The observed intensities of group `i` summed in ascending fragment order: the tree's
+    /// `values().sum()`.
+    fn sum(&self, i: usize) -> f32 {
+        let base = i * self.width;
+        self.frags(i)
+            .map(|f| self.val[base + f as usize])
+            .sum::<f32>()
+    }
+
+    /// The first hit of a new group: the tree's `insert(frag, inten)`.
+    #[inline]
+    fn insert(&mut self, i: usize, f: u16, v: f32) {
+        let f = f as usize;
+        self.bits[i * self.words + f / 64] |= 1u64 << (f % 64);
+        self.val[i * self.width + f] = v;
+    }
+
+    /// A later hit of the same group: the tree's `entry(frag).or_insert(0.0)` followed by
+    /// `if v > *e { *e = v }`. A fragment first seen here therefore starts from 0.0, not
+    /// from `v`, exactly as the tree did.
+    #[inline]
+    fn merge_max(&mut self, i: usize, f: u16, v: f32) {
+        let fu = f as usize;
+        if !self.present(i, fu) {
+            self.insert(i, f, 0.0);
+        }
+        let e = &mut self.val[i * self.width + fu];
+        if v > *e {
+            *e = v;
+        }
+    }
+
+    /// Replace group `j` with group `i` of `src` (same width).
+    fn copy_group(&mut self, j: usize, src: &ScanGroups, i: usize) {
+        debug_assert_eq!(self.width, src.width);
+        let (w, k) = (self.width, self.words);
+        self.val[j * w..(j + 1) * w].copy_from_slice(&src.val[i * w..(i + 1) * w]);
+        self.bits[j * k..(j + 1) * k].copy_from_slice(&src.bits[i * k..(i + 1) * k]);
+    }
+
+    /// Distinct fragments observed anywhere in groups `lo..=hi`.
+    fn count_union(&self, lo: usize, hi: usize) -> usize {
+        (0..self.words)
+            .map(|w| {
+                (lo..=hi)
+                    .map(|i| self.bits[i * self.words + w])
+                    .fold(0u64, |a, b| a | b)
+                    .count_ones() as usize
+            })
+            .sum()
+    }
+
+    /// Build from `(rt, [(frag, intensity)])` rows, each fragment inserted once: the
+    /// fixtures of the gate-score tests, which were written against the tree form.
+    #[cfg(test)]
+    fn from_rows(rows: &[(f64, &[(u16, f32)])]) -> ScanGroups {
+        let width = rows
+            .iter()
+            .flat_map(|(_, fs)| fs.iter().map(|(f, _)| *f as usize + 1))
+            .max()
+            .unwrap_or(0);
+        let mut g = ScanGroups::new(width);
+        for (rt, fs) in rows {
+            g.push_group(*rt);
+            let i = g.len() - 1;
+            for &(f, v) in fs.iter() {
+                g.insert(i, f, v);
+            }
+        }
+        g
+    }
+}
+
 /// Index of the value in ascending `rts` nearest to `t` (binary search).
 fn nearest_index(rts: &[f64], t: f64) -> usize {
     if rts.is_empty() {
@@ -1196,18 +1379,14 @@ fn sum_near(mz: &[f32], inten: &[f32], target: f64, tol_ppm: f64) -> f32 {
 /// Over the full (wide) extraction window the traces are mostly zeros and any
 /// correlation is noise; the spectral/co-elution gates are only meaningful across
 /// the elution peak itself.
-fn peak_window(
-    groups: &[(f64, std::collections::BTreeMap<u16, f32>)],
-    sig: &[u16],
-) -> Option<(usize, usize, Vec<f64>)> {
+fn peak_window(groups: &ScanGroups, sig: &[u16]) -> Option<(usize, usize, Vec<f64>)> {
     if groups.len() < 3 {
         return None;
     }
-    let refp: Vec<f64> = groups
-        .iter()
-        .map(|(_, m)| {
+    let refp: Vec<f64> = (0..groups.len())
+        .map(|i| {
             sig.iter()
-                .map(|o| *m.get(o).unwrap_or(&0.0) as f64)
+                .map(|&o| groups.or_zero(i, o) as f64)
                 .sum::<f64>()
         })
         .collect();
@@ -1237,20 +1416,15 @@ fn peak_window(
 /// (each predicted fragment integrated over the elution-peak scans) with the
 /// predicted intensities. Averaging over the peak removes the single-interfered-
 /// scan fragility of the apex-only Pearson. Returns 1.0 when no peak is resolved.
-fn peak_spectral_score(
-    groups: &[(f64, std::collections::BTreeMap<u16, f32>)],
-    sig: &[u16],
-    fints0: &[f32],
-) -> f64 {
+fn peak_spectral_score(groups: &ScanGroups, sig: &[u16], fints0: &[f32]) -> f64 {
     let (lo, hi, _refp) = match peak_window(groups, sig) {
         Some(w) => w,
         None => return 1.0,
     };
     let obs: Vec<f64> = (0..fints0.len())
         .map(|f| {
-            groups[lo..=hi]
-                .iter()
-                .map(|(_, m)| *m.get(&(f as u16)).unwrap_or(&0.0) as f64)
+            (lo..=hi)
+                .map(|i| groups.or_zero(i, f as u16) as f64)
                 .sum::<f64>()
         })
         .collect();
@@ -1263,12 +1437,7 @@ fn peak_spectral_score(
 /// reference profile, over the elution peak. High when the peptide's own fragments
 /// co-elute; low when a matched fragment only coincides at the apex. Orthogonal to
 /// the intensity-agreement of `peak_spectral_score`.
-fn coelution_gate_score(
-    groups: &[(f64, std::collections::BTreeMap<u16, f32>)],
-    distinct: &[u16],
-    sig: &[u16],
-    fints0: &[f32],
-) -> f64 {
+fn coelution_gate_score(groups: &ScanGroups, distinct: &[u16], sig: &[u16], fints0: &[f32]) -> f64 {
     let (lo, hi, refp) = match peak_window(groups, sig) {
         Some(w) => w,
         None => return 1.0,
@@ -1276,10 +1445,7 @@ fn coelution_gate_score(
     let refw = &refp[lo..=hi];
     let (mut wsum, mut wtot) = (0.0f64, 0.0f64);
     for &f in distinct {
-        let tr: Vec<f64> = groups[lo..=hi]
-            .iter()
-            .map(|(_, m)| *m.get(&f).unwrap_or(&0.0) as f64)
-            .collect();
+        let tr: Vec<f64> = (lo..=hi).map(|i| groups.or_zero(i, f) as f64).collect();
         if tr.iter().any(|x| *x > 0.0) {
             let c = crate::stats::pearson(&tr, refw).max(0.0);
             let w = *fints0.get(f as usize).unwrap_or(&0.0) as f64 + 1e-9;
@@ -3096,22 +3262,23 @@ pub fn run(mut p: ExtractParams) -> Result<(u64, u64)> {
         {
             hits.sort_by(|a, b| hit_rt(scans, a).total_cmp(&hit_rt(scans, b)));
         }
-        // scan groups: Vec<(rt, BTreeMap<frag,intensity>)>. A BTreeMap keeps the
-        // per-scan fragment order fixed so the f32 apex sum is deterministic.
-        let mut groups: Vec<(f64, BTreeMap<u16, f32>)> = Vec::new();
+        // Scan groups, dense (`ScanGroups`): per group its RT and each fragment's max
+        // observed intensity. The per-group fragment order is the ordinal order, as the
+        // `BTreeMap` per group this replaces fixed it, so the f32 apex sum is
+        // deterministic and unchanged.
+        let width = hits.iter().map(|h| h.frag as usize + 1).max().unwrap_or(0);
+        let mut groups = ScanGroups::new(width);
         for h in hits.iter() {
             let h_rt = hit_rt(scans, h);
-            match groups.last_mut() {
-                Some((rt, map)) if (*rt - h_rt).abs() < 1e-9 => {
-                    let e = map.entry(h.frag).or_insert(0.0);
-                    if h.inten > *e {
-                        *e = h.inten;
-                    }
+            match groups.rt.last() {
+                Some(&rt) if (rt - h_rt).abs() < 1e-9 => {
+                    let i = groups.len() - 1;
+                    groups.merge_max(i, h.frag, h.inten);
                 }
                 _ => {
-                    let mut m = BTreeMap::new();
-                    m.insert(h.frag, h.inten);
-                    groups.push((h_rt, m));
+                    groups.push_group(h_rt);
+                    let i = groups.len() - 1;
+                    groups.insert(i, h.frag, h.inten);
                 }
             }
         }
@@ -3155,19 +3322,19 @@ pub fn run(mut p: ExtractParams) -> Result<(u64, u64)> {
             Vec::new()
         };
         if !grid.is_empty() {
-            let mut aligned: Vec<(f64, BTreeMap<u16, f32>)> =
-                grid.iter().map(|&r| (r, BTreeMap::new())).collect();
+            let mut aligned = ScanGroups::empty_on(&grid, width);
             // Both sides are ascending (`grid` is sorted and deduplicated; the scan groups
             // were built from rt-sorted hits), so this is a merge rather than a per-
             // candidate `HashMap` of the grid. The match is still on the exact bit
             // pattern, so a group whose RT is not a grid RT is dropped exactly as before.
             let mut j = 0usize;
-            for (rt, map) in std::mem::take(&mut groups) {
+            for i in 0..groups.len() {
+                let rt = groups.rt(i);
                 while j < grid.len() && grid[j] < rt {
                     j += 1;
                 }
                 if j < grid.len() && grid[j].to_bits() == rt.to_bits() {
-                    aligned[j].1 = map;
+                    aligned.copy_group(j, &groups, i);
                     j += 1;
                 }
             }
@@ -3190,7 +3357,7 @@ pub fn run(mut p: ExtractParams) -> Result<(u64, u64)> {
         // (~= the predicted RT). That mild RT-prior steers off off-centre interfering
         // peaks; measured, sum beats mean by ~+300 IDs on the AIF file. Window 1
         // reproduces the exact per-scan-count behavior.
-        let counts: Vec<usize> = groups.iter().map(|(_, m)| m.len()).collect();
+        let counts: Vec<usize> = (0..groups.len()).map(|i| groups.count(i)).collect();
         let w = p.cfg.apex_count_window.max(1);
         let r = w / 2;
         let sigma = p.cfg.apex_gaussian_sigma_scans;
@@ -3252,19 +3419,17 @@ pub fn run(mut p: ExtractParams) -> Result<(u64, u64)> {
             ord.sort_by(|&a, &b| fints0[b].total_cmp(&fints0[a]));
             ord.into_iter().take(k_sig).map(|o| o as u16).collect()
         };
-        let mut apex_rt = groups[0].0;
+        let mut apex_rt = groups.rt(0);
         let mut apex_sum = 0.0f32;
         let mut best_sig = f32::NEG_INFINITY;
-        for (i, (rt, map)) in groups.iter().enumerate() {
-            if map.is_empty() || smoothed[i] < thresh {
+        for (i, &n_here) in counts.iter().enumerate() {
+            if n_here == 0 || smoothed[i] < thresh {
                 continue;
             }
-            let sig_sum: f32 = sig
-                .iter()
-                .map(|&o| map.get(&o).copied().unwrap_or(0.0))
-                .sum();
+            let rt = groups.rt(i);
+            let sig_sum: f32 = sig.iter().map(|&o| groups.or_zero(i, o)).sum();
             let prior = if use_prior {
-                (-0.5 * ((*rt - rt_cal_c) / rt_prior_sigma).powi(2)).exp() as f32
+                (-0.5 * ((rt - rt_cal_c) / rt_prior_sigma).powi(2)).exp() as f32
             } else {
                 1.0
             };
@@ -3274,7 +3439,7 @@ pub fn run(mut p: ExtractParams) -> Result<(u64, u64)> {
                 // intensity only breaks ties within [0,1). Interference-resistant
                 // in wide-window DIA (a chimeric-intensity spike cannot outvote a
                 // scan where more of the peptide's own transitions co-elute).
-                let n_frag = map.len() as f32;
+                let n_frag = n_here as f32;
                 let tie = sig_sum / (sig_sum + 1.0);
                 (n_frag + tie) * prior
             } else {
@@ -3284,16 +3449,16 @@ pub fn run(mut p: ExtractParams) -> Result<(u64, u64)> {
             };
             if score > best_sig {
                 best_sig = score;
-                apex_rt = *rt;
-                apex_sum = map.values().sum(); // report full apex intensity
+                apex_rt = rt;
+                apex_sum = groups.sum(i); // report full apex intensity
             }
         }
 
         // Co-elution run: max consecutive scan groups with >= min_coelution frags.
         let mut best_run = 0usize;
         let mut cur = 0usize;
-        for (_, map) in &groups {
-            if map.len() >= p.cfg.presence_min_coelution.max(1) {
+        for &n_here in &counts {
+            if n_here >= p.cfg.presence_min_coelution.max(1) {
                 cur += 1;
                 best_run = best_run.max(cur);
             } else {
@@ -3351,17 +3516,16 @@ pub fn run(mut p: ExtractParams) -> Result<(u64, u64)> {
         // above is the primary symmetric discriminator). With `ms1_rescue`, a
         // candidate that fails the single-scan fragment Pearson is kept when it has
         // adequate matched fragments AND MS1 isotope-pattern support.
-        let apex_map = groups
-            .iter()
-            .find(|(rt, _)| (*rt - apex_rt).abs() < 1e-9)
-            .map(|(_, m)| m);
+        // The first group within 1e-9 s of the apex RT: the group the apex was read from.
+        let apex_gi: Option<usize> =
+            (0..groups.len()).find(|&i| (groups.rt(i) - apex_rt).abs() < 1e-9);
         // Spectral-agreement score closures, evaluated lazily: the acceptance gate
         // needs only the ACTIVE `gate_mode`'s score, and the four diagnostic scores
         // are computed only when `emit_gate_diagnostics` is set (see below), so the
         // default chain pays the same per-candidate cost as before this feature.
-        let apex_obs: Option<Vec<f64>> = apex_map.map(|map| {
+        let apex_obs: Option<Vec<f64>> = apex_gi.map(|gi| {
             (0..fmzs0.len())
-                .map(|k| *map.get(&(k as u16)).unwrap_or(&0.0) as f64)
+                .map(|k| groups.or_zero(gi, k as u16) as f64)
                 .collect()
         });
         let pred_f64: Vec<f64> = fints0.iter().map(|x| *x as f64).collect();
@@ -3483,8 +3647,8 @@ pub fn run(mut p: ExtractParams) -> Result<(u64, u64)> {
         // Vec<(f64, f32)>>` over the whole candidate plus a `HashMap<u64, f32>` per
         // fragment, and produces the same values in the same order.
         let mut observed = FragSet::default();
-        for (_, m) in &groups {
-            for &f in m.keys() {
+        for i in 0..groups.len() {
+            for f in groups.frags(i) {
                 observed.insert(f);
             }
         }
@@ -3508,10 +3672,7 @@ pub fn run(mut p: ExtractParams) -> Result<(u64, u64)> {
             } else if !grid.is_empty() {
                 (
                     grid_rt.clone(),
-                    groups
-                        .iter()
-                        .map(|(_, m)| *m.get(&frag).unwrap_or(&0.0))
-                        .collect(),
+                    (0..groups.len()).map(|i| groups.or_zero(i, frag)).collect(),
                 )
             } else {
                 // Sparse mode: the groups are already ascending in RT, so the trace is
@@ -3519,10 +3680,10 @@ pub fn run(mut p: ExtractParams) -> Result<(u64, u64)> {
                 // vector held before its (already-sorted) stable sort.
                 let mut rts: Vec<f32> = Vec::new();
                 let mut ints: Vec<f32> = Vec::new();
-                for (rt, m) in &groups {
-                    if let Some(&i) = m.get(&frag) {
-                        rts.push(*rt as f32);
-                        ints.push(i);
+                for i in 0..groups.len() {
+                    if let Some(v) = groups.get(i, frag) {
+                        rts.push(groups.rt(i) as f32);
+                        ints.push(v);
                     }
                 }
                 (rts, ints)
@@ -3576,16 +3737,16 @@ pub fn run(mut p: ExtractParams) -> Result<(u64, u64)> {
         // selection model. Empty for K=1 (the default).
         let peaks: Vec<(u8, f64, f64, f64, f64, f64)> =
             if p.cfg.retain_top_peaks > 1 && !groups.is_empty() {
-                let count_prof: Vec<f32> = groups.iter().map(|(_, m)| m.len() as f32).collect();
+                let count_prof: Vec<f32> = counts.iter().map(|&c| c as f32).collect();
                 crate::peaks::enumerate_peaks(&count_prof, p.cfg.retain_top_peaks, 1.0 / 3.0, 0.1)
                     .into_iter()
                     .map(|pk| {
                         (
                             pk.rank as u8,
-                            groups[pk.apex_idx].0,
-                            groups[pk.start_idx].0,
-                            groups[pk.end_idx].0,
-                            groups[pk.apex_idx].1.len() as f64,
+                            groups.rt(pk.apex_idx),
+                            groups.rt(pk.start_idx),
+                            groups.rt(pk.end_idx),
+                            counts[pk.apex_idx] as f64,
                             pk.area as f64,
                         )
                     })
@@ -3650,12 +3811,9 @@ pub fn run(mut p: ExtractParams) -> Result<(u64, u64)> {
         // rank 0, looked up by candidate_id downstream) and re-slices only its own
         // apex-dependent scalars + MS1; the features stage recomputes peak-shape and
         // co-elution features from the shared chrom windowed to each row's own apex.
-        let count_prof: Vec<f32> = groups.iter().map(|(_, m)| m.len() as f32).collect();
+        let count_prof: Vec<f32> = counts.iter().map(|&c| c as f32).collect();
         let alt_peaks =
             crate::peaks::enumerate_peaks(&count_prof, p.cfg.promote_top_peaks, 1.0 / 3.0, 0.1);
-        let apex_gi = groups
-            .iter()
-            .position(|(rt, _)| (*rt - apex_rt).abs() < 1e-9);
         // Reference area for the area gate: the enumerated envelope holding the
         // selected apex (0 disables the area gate if the apex is not a counted peak).
         let rank0_area = apex_gi
@@ -3678,30 +3836,27 @@ pub fn run(mut p: ExtractParams) -> Result<(u64, u64)> {
                     continue;
                 }
             }
-            let alt_apex_rt = groups[pk.apex_idx].0;
+            let alt_apex_rt = groups.rt(pk.apex_idx);
             if (alt_apex_rt - apex_rt).abs() < p.cfg.alt_peak_min_separation_s {
                 continue;
             }
             if rank0_area > 0.0 && (pk.area as f64) < p.cfg.alt_peak_min_area_frac * rank0_area {
                 continue;
             }
-            let mut altset: std::collections::HashSet<u16> = std::collections::HashSet::new();
-            for (_, m) in &groups[pk.start_idx..=pk.end_idx] {
-                for &f in m.keys() {
-                    altset.insert(f);
-                }
-            }
-            if altset.len() < p.cfg.presence_min_matched.max(1) {
+            // Distinct fragments across the alternate envelope: the size of the union of
+            // its groups' fragment sets.
+            let alt_distinct = groups.count_union(pk.start_idx, pk.end_idx);
+            if alt_distinct < p.cfg.presence_min_matched.max(1) {
                 continue;
             }
-            let alt_apex_int: f32 = groups[pk.apex_idx].1.values().sum();
+            let alt_apex_int: f32 = groups.sum(pk.apex_idx);
             let (a_m1, a_mono, a_i1, a_i2) = ms1_at(alt_apex_rt);
             out.push(CandOut {
                 cid,
                 peak_rank: rank,
                 apex_rt: alt_apex_rt,
                 apex_int: alt_apex_int,
-                n_match: altset.len() as i32,
+                n_match: alt_distinct as i32,
                 corun: best_run as i32,
                 npred: fmzs0.len() as i32,
                 calrt: rt_cal[cid as usize],
@@ -4367,14 +4522,175 @@ mod mass_offset_tests {
 }
 
 #[cfg(test)]
-mod coelution_tests {
-    use super::{coelution_gate_score, peak_spectral_score};
+mod scan_group_tests {
+    use super::ScanGroups;
     use std::collections::BTreeMap;
 
-    fn g(rows: &[(f64, &[(u16, f32)])]) -> Vec<(f64, BTreeMap<u16, f32>)> {
-        rows.iter()
-            .map(|(rt, fs)| (*rt, fs.iter().cloned().collect()))
-            .collect()
+    type TreeGroups = Vec<(f64, BTreeMap<u16, f32>)>;
+
+    /// The per-group trees `ScanGroups` replaced, built verbatim from `(rt, frag, inten)`
+    /// hits in the order the per-candidate pass builds them.
+    fn tree_groups(hits: &[(f64, u16, f32)]) -> TreeGroups {
+        let mut groups: TreeGroups = Vec::new();
+        for &(h_rt, frag, inten) in hits {
+            match groups.last_mut() {
+                Some((rt, map)) if (*rt - h_rt).abs() < 1e-9 => {
+                    let e = map.entry(frag).or_insert(0.0);
+                    if inten > *e {
+                        *e = inten;
+                    }
+                }
+                _ => {
+                    let mut m = BTreeMap::new();
+                    m.insert(frag, inten);
+                    groups.push((h_rt, m));
+                }
+            }
+        }
+        groups
+    }
+
+    fn dense_groups(hits: &[(f64, u16, f32)]) -> ScanGroups {
+        let width = hits.iter().map(|h| h.1 as usize + 1).max().unwrap_or(0);
+        let mut groups = ScanGroups::new(width);
+        for &(h_rt, frag, inten) in hits {
+            match groups.rt.last() {
+                Some(&rt) if (rt - h_rt).abs() < 1e-9 => {
+                    let i = groups.len() - 1;
+                    groups.merge_max(i, frag, inten);
+                }
+                _ => {
+                    groups.push_group(h_rt);
+                    let i = groups.len() - 1;
+                    groups.insert(i, frag, inten);
+                }
+            }
+        }
+        groups
+    }
+
+    /// Every question the per-candidate pass asks of a scan group, asked of both forms.
+    fn assert_same(tree: &TreeGroups, dense: &ScanGroups, what: &str) {
+        assert_eq!(tree.len(), dense.len(), "{what}: group count");
+        for (i, (rt, map)) in tree.iter().enumerate() {
+            assert_eq!(rt.to_bits(), dense.rt(i).to_bits(), "{what}: rt {i}");
+            assert_eq!(map.len(), dense.count(i), "{what}: count {i}");
+            let keys: Vec<u16> = map.keys().copied().collect();
+            assert_eq!(
+                keys,
+                dense.frags(i).collect::<Vec<_>>(),
+                "{what}: frags {i}"
+            );
+            let tree_sum: f32 = map.values().sum();
+            assert_eq!(
+                tree_sum.to_bits(),
+                dense.sum(i).to_bits(),
+                "{what}: sum {i}"
+            );
+            for f in 0..(dense.width as u16 + 70) {
+                assert_eq!(
+                    map.get(&f).map(|v| v.to_bits()),
+                    dense.get(i, f).map(f32::to_bits),
+                    "{what}: group {i} frag {f}"
+                );
+            }
+        }
+    }
+
+    /// Randomised hit lists with repeated RTs, RTs within 1e-9 s of each other (which the
+    /// grouping merges), repeated fragments in a group, and intensities that are zero,
+    /// negative, negative zero and NaN: the cases where "first hit inserts, later hits take
+    /// the max starting from 0.0" differs from "take the max".
+    #[test]
+    fn dense_groups_answer_what_the_trees_answered() {
+        let mut state = 0x5ca9_u64;
+        let mut next = move |m: u64| -> u64 {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) % m.max(1)
+        };
+        let specials = [0.0f32, -0.0, -3.5, f32::NAN, 1e-40, 7.25];
+        for case in 0..300 {
+            let width = 1 + next(if case % 5 == 0 { 140 } else { 14 }) as u16;
+            let mut rt = 100.0f64;
+            let mut hits: Vec<(f64, u16, f32)> = Vec::new();
+            for _ in 0..next(80) {
+                match next(4) {
+                    0 => rt += 1.0 + next(3) as f64,
+                    1 => rt += 1e-10, // same group
+                    _ => {}
+                }
+                let inten = if next(6) == 0 {
+                    specials[next(specials.len() as u64) as usize]
+                } else {
+                    next(1000) as f32 * 0.5
+                };
+                hits.push((rt, next(width as u64) as u16, inten));
+            }
+            let tree = tree_groups(&hits);
+            let dense = dense_groups(&hits);
+            assert_same(&tree, &dense, &format!("case {case}"));
+
+            // The grid projection: a grid holding some of the group RTs and some others.
+            let mut grid: Vec<f64> = tree
+                .iter()
+                .map(|(r, _)| *r)
+                .filter(|_| next(3) != 0)
+                .collect();
+            for _ in 0..next(5) {
+                grid.push(95.0 + next(200) as f64 * 0.5);
+            }
+            grid.sort_by(|a, b| a.total_cmp(b));
+            grid.dedup();
+            let mut aligned: TreeGroups = grid.iter().map(|&r| (r, BTreeMap::new())).collect();
+            let mut j = 0usize;
+            for (r, map) in tree.clone() {
+                while j < grid.len() && grid[j] < r {
+                    j += 1;
+                }
+                if j < grid.len() && grid[j].to_bits() == r.to_bits() {
+                    aligned[j].1 = map;
+                    j += 1;
+                }
+            }
+            let mut dense_aligned = ScanGroups::empty_on(&grid, dense.width);
+            let mut j = 0usize;
+            for i in 0..dense.len() {
+                let r = dense.rt(i);
+                while j < grid.len() && grid[j] < r {
+                    j += 1;
+                }
+                if j < grid.len() && grid[j].to_bits() == r.to_bits() {
+                    dense_aligned.copy_group(j, &dense, i);
+                    j += 1;
+                }
+            }
+            assert_same(
+                &aligned,
+                &dense_aligned,
+                &format!("case {case} on the grid"),
+            );
+            // The union count the promoted-peak gate takes over an envelope.
+            if !aligned.is_empty() {
+                let lo = next(aligned.len() as u64) as usize;
+                let hi = lo + next((aligned.len() - lo) as u64) as usize;
+                let mut set = std::collections::HashSet::new();
+                for (_, m) in &aligned[lo..=hi] {
+                    set.extend(m.keys().copied());
+                }
+                assert_eq!(set.len(), dense_aligned.count_union(lo, hi), "case {case}");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod coelution_tests {
+    use super::{coelution_gate_score, peak_spectral_score, ScanGroups};
+
+    fn g(rows: &[(f64, &[(u16, f32)])]) -> ScanGroups {
+        ScanGroups::from_rows(rows)
     }
 
     #[test]
