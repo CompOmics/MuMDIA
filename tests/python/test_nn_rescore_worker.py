@@ -354,6 +354,8 @@ LEGACY_ENV = {
     "MUMDIA_NN_SCAN_THREADS": "1",
     # W2/W3: the serial load loop, without read-ahead or pre_buffer.
     "MUMDIA_NN_LOAD_THREADS": "0",
+    # W4: the full stable sort for every positive selection and decoy order.
+    "MUMDIA_NN_SELECT": "full",
 }
 
 IDENTITY_ENV = dict(
@@ -526,3 +528,71 @@ def test_moment_blocks_follow_the_serial_partition():
     ]
     assert w.moment_blocks(5, 2, sub=32768) == [(0, 2), (2, 4), (4, 5)]
     assert w.moment_blocks(0, 250000) == []
+
+
+def _awkward_scores(rng, n, kind):
+    """float32 scores with the values an exact order must get right."""
+    if kind == "ties":
+        s = np.round(rng.normal(size=n), 1)
+    elif kind == "coarse":
+        s = rng.integers(-3, 4, size=n).astype(np.float64)
+    else:
+        s = rng.normal(size=n)
+    s = s.astype(np.float32)
+    k = max(1, n // 50)
+    s[rng.integers(0, n, k)] = np.float32(-0.0)
+    s[rng.integers(0, n, k)] = np.float32(0.0)
+    s[rng.integers(0, n, 3)] = np.float32(np.inf)
+    s[rng.integers(0, n, 3)] = np.float32(-np.inf)
+    s[rng.integers(0, n, 2)] = np.float32(1e-41)      # subnormal
+    s[rng.integers(0, n, 2)] = np.float32(-1e-41)
+    return s
+
+
+def test_desc_order_is_the_stable_descending_argsort():
+    """One uint64 key sort must reproduce `np.argsort(-s, kind="stable")` exactly."""
+    w = _import_worker()
+    rng = np.random.default_rng(5)
+    for kind in ("ties", "coarse", "normal"):
+        for n in (1, 2, 17, 5000):
+            s = _awkward_scores(rng, n, kind) if n > 4 else rng.normal(size=n).astype(np.float32)
+            want = np.argsort(-s, kind="stable")
+            assert np.array_equal(w.desc_order(s), want), (kind, n)
+            s2 = s.copy()
+            s2[rng.integers(0, n, max(1, n // 100))] = np.float32(np.nan)
+            s2[:1] = -np.float32(np.nan)                   # a NaN with its sign bit set
+            assert np.array_equal(w.desc_order(s2), np.argsort(-s2, kind="stable")), (kind, n)
+    assert w.desc_order(np.zeros(0, np.float32)).shape == (0,)
+    f64 = rng.normal(size=100)
+    assert np.array_equal(w.desc_order(f64), np.argsort(-f64, kind="stable"))
+
+
+@pytest.mark.parametrize("kind", ["ties", "coarse", "normal"])
+def test_windowed_positive_selection_equals_the_full_tda_q_selection(kind):
+    """The certified window must select exactly `(tda_q <= thr) & target`, or decline.
+
+    Randomised over pool size, target fraction, separation and threshold, with ties at
+    the window edge, +-0.0, infinities and subnormals. A NaN anywhere must make it decline
+    rather than guess where the sort puts NaN.
+    """
+    w = _import_worker()
+    rng = np.random.default_rng({"ties": 1, "coarse": 2, "normal": 3}[kind])
+    windowed = declined = 0
+    for trial in range(60):
+        n = int(rng.integers(50, 20000))
+        tgt = rng.random(n) < rng.uniform(0.2, 0.8)
+        s = _awkward_scores(rng, n, kind)
+        s[tgt] += np.float32(rng.uniform(0.0, 3.0))
+        thr = float(rng.choice([0.001, 0.01, 0.05, 0.2]))
+        want = (w.tda_q(s, tgt.astype(np.float32)) <= thr) & tgt
+        got = w.select_positives(s, tgt, thr)
+        if got is None:
+            declined += 1
+        else:
+            windowed += 1
+            assert np.array_equal(got, want), (kind, trial, n, thr)
+        assert w.n_targets_at_windowed(s, tgt.astype(np.float32), thr) == int(want.sum())
+        s_nan = s.copy()
+        s_nan[int(rng.integers(0, n))] = np.float32(np.nan)
+        assert w.select_positives(s_nan, tgt, thr) is None
+    assert windowed > 10, "the window was almost never certified; the test lost its point"

@@ -765,6 +765,21 @@ MLP. Set it explicitly for the logreg path.
     1.0) against 2.4 s at 8 threads. Each fill thread holds a 32,768 x features float64
     buffer (0.1 GB at 387 features) and one extra decoded row group is resident.
     `MUMDIA_NN_LOAD_THREADS=0` restores the old serial loop without read-ahead.
+  - `MUMDIA_NN_SELECT` (default `window`): each round's positives are the targets up
+    to the last position of the stable descending order whose FDR
+    `(decoys+1)/max(targets,1)` is at or below the training FDR, so only a top window
+    is sorted: every row scoring at least the `(floor(fdr x T)+1)`-th best decoy, ties
+    at the cut included, which makes it a prefix of the full order. Past that window
+    every FDR is at least `(window decoys + 1) / T`; when that exceeds the threshold
+    no later row can be accepted and the window's selection is `tda_q`'s exactly.
+    Otherwise (no certificate, NaN scores, a window above half the rows, or nothing
+    selected, which the bootstrap ladder needs every q-value for) the full `tda_q`
+    runs as before. The hybrid and margin decoy order uses one sort of distinct
+    uint64 keys (order-preserving score bits over the row position), which equals the
+    stable argsort, `-0.0`, NaN and subnormals included. Measured on 10M synthetic
+    scores: 1.69 s against 0.08 s per selection, and 0.48 s against 0.13 s for a
+    5M-decoy order. The worker prints how many selections used the window. `full`
+    restores the full sort everywhere.
   - Pool threads get the main thread's flush-to-zero state through their
     initializer, because a thread started on Windows does not inherit it.
 

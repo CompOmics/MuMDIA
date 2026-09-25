@@ -179,6 +179,12 @@ Env knobs (all optional):
                                      (column, sign) order, so the choice is identical).
                                      auto = the torch CPU thread count, capped by the sample
                                      size (one thread per 20,000 rows). 1 = serial.
+    MUMDIA_NN_SELECT      = window   how each round selects its positives: window = sort
+                                     only the top rows down to the (floor(fdr * targets)+1)-th
+                                     best decoy, certify that no later row can be accepted,
+                                     else fall back to the full sort; the hybrid/margin decoy
+                                     order uses one uint64 key sort. Both reproduce the stable
+                                     argsort exactly. full = the previous full sort each round.
     MUMDIA_NN_GATHER      = torch    how `score_idx` gathers a scoring batch on the
                                      in-memory backend: torch = `torch.index_select` into
                                      one reused buffer (multi-threaded); numpy = the
@@ -697,6 +703,9 @@ def _release_allocator_slack():
 
 
 PHASE = {}
+# How the self-training rounds selected their positives: from a certified window, or with
+# the full sort. Printed with the sub-timers.
+SELECT_COUNTS = {}
 
 # Sub-timers, kept apart from PHASE so `sum(PHASE.values())` stays a sum of disjoint wall
 # intervals. The load entries split `1_pin_read_standardise` (so they are already inside
@@ -729,6 +738,10 @@ def _print_timers():
               flush=True)
         for k in sorted(DETAIL):
             print("    %-26s %8.1f s" % (k, DETAIL[k]), flush=True)
+    if SELECT_COUNTS:
+        print("nn_rescore_worker: positive selection: %d from a certified window, %d full "
+              "sort(s)" % (SELECT_COUNTS.get("window", 0), SELECT_COUNTS.get("full", 0)),
+              flush=True)
 
 
 def tda_q(scores, is_target):
@@ -747,6 +760,97 @@ def tda_q(scores, is_target):
 def n_targets_at(scores, is_target, fdr):
     q = tda_q(scores, is_target)
     return int(((q <= fdr) & (is_target == 1)).sum())
+
+
+def desc_order(scores):
+    """`np.argsort(-scores, kind="stable")` for a float32 vector, from one uint64 sort.
+
+    Each score is mapped to an order-preserving 32-bit key in the high half of a uint64 and
+    its position fills the low half, so the keys are distinct and an unstable sort of them
+    yields exactly the stable order (numpy's SIMD sort of 64-bit integers: 2.7x a stable
+    argsort on 2M scores). The mapping reproduces the comparison the stable sort makes:
+    `-0.0` and `+0.0` get one key (they compare equal), every NaN gets the key of one
+    positive quiet NaN, above +inf (numpy sorts NaN last, in index order), and the `+ 0.0`
+    that merges the zeros also treats a subnormal as the sort's comparison does under the
+    thread's DAZ setting. Anything that is not float32, or longer than 2**32, takes the
+    argsort itself.
+    """
+    s = np.asarray(scores)
+    n = s.shape[0]
+    if s.dtype != np.float32 or s.ndim != 1 or n >= 2 ** 32:
+        return np.argsort(-s, kind="stable")
+    v = np.negative(s)
+    v += np.float32(0.0)
+    nan = np.isnan(v)
+    if nan.any():
+        v[nan] = np.float32(np.nan)
+    b = v.view(np.uint32)
+    sign = np.uint32(0x80000000)
+    key = np.where((b & sign) != 0, ~b, b | sign).astype(np.uint64)
+    key <<= np.uint64(32)
+    key |= np.arange(n, dtype=np.uint64)
+    key.sort()
+    key &= np.uint64(0xFFFFFFFF)
+    return key.astype(np.int64)
+
+
+def select_positives(scores, is_target, thr, max_frac=0.5):
+    """`(tda_q(scores, is_target) <= thr) & is_target`, from a top window when it is certified.
+
+    Returns the boolean mask, or None when the window cannot be certified (the caller then
+    runs the full `tda_q`). The accepted set of `tda_q` is the prefix of the stable
+    descending order up to the LAST position whose FDR `(cd+1)/max(ct,1)` is at or below
+    `thr` (q is a reverse running minimum), so only a prefix long enough to contain that
+    position needs sorting:
+      - the window is every row scoring at least the `need`-th best decoy score, with
+        `need = floor(thr * T) + 1` for T targets. All ties at the cut are included, so
+        the window is exactly a prefix of the full stable order, sorted here in that order;
+      - certificate: past the window every position has at least the window's cd decoys
+        and at most T targets, so its FDR is at least `(cd_W + 1) / T`. When that exceeds
+        `thr` (checked in the same float64 arithmetic; division is monotone), no later
+        position can be accepted and the window's own last accepted position is the
+        global one.
+    The counts, FDR values and comparison are those of `tda_q`, so the mask is identical.
+    NaN scores, too few decoys, a failed certificate or a window above `max_frac` of the
+    rows (where the full sort costs little more) return None.
+    """
+    s = np.asarray(scores)
+    tgt = np.asarray(is_target, dtype=bool)
+    n = s.shape[0]
+    n_t = int(np.count_nonzero(tgt))
+    n_d = n - n_t
+    if n == 0 or n_t == 0:
+        return None
+    need = int(thr * n_t) + 1
+    if need > n_d or np.isnan(s).any():
+        return None
+    dec = s[~tgt]
+    cut = np.partition(dec, n_d - need)[n_d - need]
+    del dec
+    win = np.flatnonzero(s >= cut)
+    if win.shape[0] > max_frac * n:
+        return None
+    order = win[desc_order(s[win])]
+    t = tgt[order]
+    ct = np.cumsum(t, dtype=np.int64)
+    cd = np.cumsum(~t, dtype=np.int64)
+    if not ((float(cd[-1]) + 1.0) / float(max(n_t, 1)) > thr):
+        return None
+    ok = (cd + 1) / np.maximum(ct, 1) <= thr
+    pos = np.zeros(n, dtype=bool)
+    if ok.any():
+        last = int(np.flatnonzero(ok)[-1])
+        head = order[:last + 1]
+        pos[head[t[:last + 1]]] = True
+    return pos
+
+
+def n_targets_at_windowed(scores, is_target, fdr):
+    """`n_targets_at`, from `select_positives` when its window is certified."""
+    pos = select_positives(scores, np.asarray(is_target) == 1, fdr)
+    if pos is None:
+        return n_targets_at(scores, is_target, fdr)
+    return int(np.count_nonzero(pos))
 
 
 def _count_at_fdr_sorted(t_sorted, fdr):
@@ -954,6 +1058,9 @@ def main():
     PREGATHER_GB = env_f("MUMDIA_NN_PREGATHER_GB", 8)
     CLAMP_TINY = env_f("MUMDIA_NN_CLAMP_TINY", 1e-20)
     FINAL_POOL_SCORE = env_i("MUMDIA_NN_FINAL_POOL_SCORE", 0) != 0
+    SELECT = os.environ.get("MUMDIA_NN_SELECT", "window").strip().lower()
+    if SELECT not in ("window", "full"):
+        raise ValueError("MUMDIA_NN_SELECT must be window or full (got %r)" % SELECT)
     GATHER = os.environ.get("MUMDIA_NN_GATHER", "torch").strip().lower()
     if GATHER not in ("torch", "numpy"):
         raise ValueError("MUMDIA_NN_GATHER must be torch or numpy (got %r)" % GATHER)
@@ -1426,6 +1533,7 @@ def main():
             tr_idx = np.where(fold != f)[0]
             te_idx = np.where(fold == f)[0]
             ytr = y[tr_idx]
+            tgt_tr = ytr == 1
             if len(tr_idx) == 0 or len(te_idx) == 0:
                 raise RuntimeError(
                     f"fold {f} is empty in training or holdout; reduce MUMDIA_NN_FOLDS"
@@ -1481,8 +1589,16 @@ def main():
             score_tr_current = True
             for it in range(ITERS):
                 _tsel = time.time()
-                q = tda_q(score_tr, ytr)
-                pos = (q <= TRAIN_FDR) & (ytr == 1)
+                pos = (select_positives(score_tr, tgt_tr, TRAIN_FDR)
+                       if SELECT == "window" else None)
+                if pos is not None and pos.any():
+                    SELECT_COUNTS["window"] = SELECT_COUNTS.get("window", 0) + 1
+                else:
+                    # The full sort: when the window is not certified, or selects nothing
+                    # (the bootstrap ladder below needs every q-value).
+                    SELECT_COUNTS["full"] = SELECT_COUNTS.get("full", 0) + 1
+                    q = tda_q(score_tr, ytr)
+                    pos = (q <= TRAIN_FDR) & (ytr == 1)
                 if model is None and not np.any(pos) and INIT_FDR_MAX > 0:
                     # Bootstrap only. The init feature ranks the whole fold here, and on a
                     # pool that is overwhelmingly false no single column may reach the
@@ -1554,7 +1670,8 @@ def main():
                         neg_i = rs_n.choice(neg_i, size=min(keep_n, len(neg_i)), replace=False)
                     else:
                         s_neg = score_tr[neg]
-                        order = np.argsort(-s_neg, kind="stable")
+                        order = (desc_order(s_neg) if SELECT == "window"
+                                 else np.argsort(-s_neg, kind="stable"))
                         if NEG_SELECT == "margin":
                             take = order[:keep_n]
                         else:
@@ -1643,7 +1760,8 @@ def main():
                       f"{n_targets_at(score_tr, ytr, TRAIN_FDR)}", flush=True)
             else:
                 print(f"  seed {seed} fold {f}: held-out targets@{TRAIN_FDR:.0%} = "
-                      f"{n_targets_at(oof[te_idx], y[te_idx], TRAIN_FDR)}", flush=True)
+                      f"{n_targets_at_windowed(oof[te_idx], y[te_idx], TRAIN_FDR)}",
+                      flush=True)
         return oof
 
     # seed ensemble: average rank-normalised out-of-fold scores across seeds
