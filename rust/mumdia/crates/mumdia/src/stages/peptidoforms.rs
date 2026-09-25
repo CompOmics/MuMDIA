@@ -10,7 +10,7 @@ use anyhow::Result;
 use mumdia_core::config::{PeptidoformsConfig, ResidueMod, UnknownModPolicy};
 use mumdia_core::mass::unimod_mass;
 use mumdia_core::schema::artifact;
-use mumdia_io::report::ArtifactReport;
+use mumdia_io::report::{ArtifactReport, Written};
 use mumdia_io::table::{write_table, Col, TableFile};
 use serde_json::json;
 use tracing::{info, warn};
@@ -185,6 +185,12 @@ pub struct PeptidoformsParams<'a> {
 }
 
 pub fn run(p: PeptidoformsParams) -> Result<u64> {
+    run_hashed(p).map(|w| w.rows)
+}
+
+/// [`run`], returning the output's row count and the content hash its report records, so
+/// an orchestrator can record the artifact without reading and hashing it again.
+pub fn run_hashed(p: PeptidoformsParams) -> Result<Written> {
     let t0 = Instant::now();
     let (fixed_rules, variable_rules) = validated_rules(p.cfg)?;
     let t = TableFile::open(p.peptides)?;
@@ -292,7 +298,7 @@ pub fn run(p: PeptidoformsParams) -> Result<u64> {
     )?;
 
     let elapsed = t0.elapsed().as_millis();
-    ArtifactReport {
+    let report = ArtifactReport {
         logical_name: artifact::PEPTIDOFORMS.0.to_string(),
         schema_name: artifact::PEPTIDOFORMS.0.to_string(),
         schema_version: artifact::PEPTIDOFORMS.1,
@@ -308,11 +314,11 @@ pub fn run(p: PeptidoformsParams) -> Result<u64> {
         stats: Default::default(),
         model_identity: None,
         elapsed_ms: elapsed,
-    }
-    .write_for(p.out)?;
+    };
+    report.write_for(p.out)?;
 
     info!(rows, elapsed_ms = elapsed, "peptidoforms: done");
-    Ok(rows)
+    Ok(report.written())
 }
 
 #[cfg(test)]

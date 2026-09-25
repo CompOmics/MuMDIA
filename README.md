@@ -276,8 +276,10 @@ that role's workers import, so `auto` cannot quietly select a Python without
 torch and defer the failure to hour three of a run. An explicit path is honoured
 as given and never second-guessed.
 
-**Global flags**, accepted on either side of the subcommand: `--threads N` bounds
-the engine's thread pool and is forwarded to the sidecars as `MUMDIA_NN_THREADS`
+**Global flags**, accepted on either side of the subcommand: `--threads N` sets
+the engine's thread pool to N threads and its parquet codec pool to min(N, 8),
+so up to N + min(N, 8) threads can be busy (`MUMDIA_PARQUET_THREADS=1` keeps the
+codec serial), and is forwarded to the sidecars as `MUMDIA_NN_THREADS`
 and `OMP_NUM_THREADS` when those are unset; `--log-level LEVEL` takes any
 `RUST_LOG` filter; `-v` and `-vv` raise verbosity to debug and trace; `-q`
 restricts output to warnings and errors.
@@ -609,8 +611,10 @@ Only measured quantities are stated here; no RAM figure is published yet.
   disk-backed streaming memmap: a 4.31 GB matrix against the 4.00 GB default took
   the slow path. Compute the matrix size up front and raise
   `MUMDIA_NN_STREAM_GB` if the RAM is available.
-- `--threads N` bounds the engine's thread pool and is forwarded to the sidecars.
-  More is not always better there: the PyTorch rescore worker measured faster on
+- `--threads N` sets the engine's thread pool to N threads and its parquet codec
+  pool to min(N, 8), so up to N + min(N, 8) threads can be busy at once
+  (`MUMDIA_PARQUET_THREADS=1` keeps the codec serial). N is forwarded to the
+  sidecars. More is not always better there: the PyTorch rescore worker measured faster on
   8 threads than on 32.
 
 ## Documentation

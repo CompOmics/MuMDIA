@@ -97,6 +97,91 @@ than a number. Both are recorded in every run's `manifest.json`.
   always are -- the definition levels are run-encoded, which moves the writer's internal
   mini-batch size and so the page framing. Measured at 196,615 rows: 16 bytes, with every
   row, value and row-group boundary unchanged.
+- **`psms_competed.parquet` is published as the features file's own bytes when compete
+  removes no row, which is the shipped default.** Under `group_by = peptidoform_charge` the
+  competed table has the features table's columns, rows, order and values, and it was
+  decoded and re-encoded column by column for nothing (estimated at about 10 s per HYE
+  file). When the features file is exactly what that rewrite would write, compete now
+  hard-links it to the competed name, falls back to a byte copy where the filesystem refuses
+  a link, and rewrites only if both fail. The competed file then has the features file's
+  65,536-row groups instead of 131,072-row ones, and its `content_hash` IS the features
+  hash, so it differs from an earlier run's whenever the table holds more than one row
+  group. On a grouped run the pooled `psms_competed.parquet` inherits the bands' row groups,
+  and its hash differs for the same reason. When compete does remove rows and the untouched
+  row groups hold at least half of the table's rows, those groups are spliced as bytes and
+  only the others are rewritten; a splice that fails falls back to the full rewrite. The
+  report records the path in `stats.publish` (`hard_link`, `byte_copy`, `spliced` with
+  `rewritten_row_groups` and `row_groups`, or `rewritten`). `psms_scored.parquet` and every
+  artifact after it are byte-identical. After a hard link the two names share one file:
+  rewriting either through the engine leaves the other alone, but a tool that edits either
+  file in place, including pandas `to_parquet` or pyarrow `write_table` onto the existing
+  path, changes both.
+- **Each artifact is hashed once.** The orchestrators record a stage's outputs in
+  `manifest.json` with the hash the stage already computed for its own report instead of
+  reading and hashing every file again, and a grouped run under `run-experiment` no longer
+  builds the band records it then dropped. Reusing the stage hashes changes no recorded
+  hash value.
+- **The large artifacts are hashed while they are written.** A writer opened with
+  `WriteOptions::content_hash` feeds its bytes to blake3 on the way to the file and returns
+  the digest when it closes, so convert, predict-frag, search-seed, rt-im-train, extract,
+  features, compete, the pool and rescore no longer read their outputs back to hash them.
+  The digest is the same blake3 over the same bytes, so hashing while writing changes no
+  artifact byte and no recorded hash by itself (docs/03 "Hash on write"). The capped-writer
+  layout changes below (page cut, float plan, PLAIN chromatogram `rt`) do change the bytes
+  and content hashes of the files they write.
+- **`TableFile::scan` can read each row group's projection in one sequential read.**
+  `ScanOptions::coalesced()` gives the parquet reader a span cache that reads every selected
+  row group's projected column chunks as one byte span (split where unprojected columns
+  leave a gap over 1 MB), serves the page reads from memory, prefetches the next span on a
+  helper thread and releases a span once its column chunks are read. The batches are
+  identical to the plain reader's. Nothing uses it by default; it is for wide full scans on
+  spinning storage, where the page-at-a-time reader is seek-bound (docs/03 "Sequential
+  row-group reads").
+- **Capped writers cut data pages by size, not every 20,000 rows.** A scalar column of a
+  65,536-row group is one page instead of four, so the plain reader, which seeks once per
+  page, reads a wide table with a quarter of the seeks: on the AIF artifacts features went
+  from 2,003 to 1,039 data pages and psms_competed from 1,592 to 399, at +0.5% bytes, and
+  the writer's in-progress buffer of one 131,072-row competed group from 552 to 620 MB.
+  Values are unchanged; the bytes and content hashes of files from capped writers change,
+  and uncapped writers are byte-identical to before (docs/03 "Page layout of capped
+  writers").
+- **Capped writers plan their float encodings from their first rows.** A writer with a
+  row-group cap holds its first quarter row group, writes every float leaf whose sampled
+  values are more than 80% distinct PLAIN from the first page (instead of paying for a
+  dictionary prefix until the dictionary limit fills), and sizes the dictionary limit of the
+  other float leaves from their values per row group rather than their rows, which gives the
+  chromatogram traces back the dictionary the row-sized limit cut at 128 KB. Against the
+  unplanned layout on the AIF artifacts: features -8.6%, psms_competed -14.9%,
+  chromatograms -6.3%, spectra -0.2%, and the competed rewrite encodes in 0.54 s against
+  1.31 s with half the writer buffer. Values are unchanged; bytes and content hashes of
+  capped writers change; `MUMDIA_PARQUET_PLAN=0` restores the unplanned layout (docs/03
+  "Float encodings planned from the first rows").
+- **The chromatogram `rt` axis is written PLAIN.** Each fragment row of a candidate repeats
+  the candidate's axis, which snappy shortens in PLAIN form and cannot find in bit-packed
+  dictionary indices, so the AIF chromatograms are 12.0% smaller than with the planned
+  dictionary (160.9 against 182.8 MB) with identical values. Writers can name such columns
+  with `WriteOptions::plain_column` (docs/09 "Output: chromatograms").
+- **Parquet columns are encoded in parallel.** Every writer encodes a row group's columns
+  concurrently on a dedicated codec pool (at most 8 threads, `--threads` when it is lower,
+  serial at `--threads 1` or `MUMDIA_PARQUET_THREADS=1`) and appends them in schema order,
+  which writes the serial writer's file byte for byte. The codec pool is a second pool
+  beside the global one: `--threads N` now bounds the global pool at N and the codec pool
+  at min(N, 8), and the two can be busy at once, so a run can keep up to N + min(N, 8)
+  threads busy; `MUMDIA_PARQUET_THREADS=1` restores the previous bound. Encoding the AIF features table took
+  0.14 s on 8 threads against 0.45 s, the competed table 0.16 against 0.42 s, the
+  chromatograms 4.4 against 8.1 s. Writers called from inside a rayon pool keep encoding on
+  their own thread, and so does a writer that finds as many callers already waiting on the
+  pool as it has threads, so concurrent band writers under `groups.parallel` never have less
+  than a thread each (docs/03 "Parallel column codec").
+- **Multi-column scans decode their columns in parallel.** `TableFile::scan` and
+  `TableFile::batches` split the projection into contiguous column groups, one reader each,
+  decode the groups of every batch on the codec pool and join them column-wise; the batches
+  are the single reader's exactly. Automatic by default (up to 8 groups, at least 4 MB of
+  data each, the single reader from inside a rayon pool and for a coalesced scan, which
+  keeps its one forward read per row group); `ScanOptions::decode_threads` sets it, and
+  `MUMDIA_PARQUET_DECODE_THREADS=1` keeps every scan of a process on one reader. A full scan of the AIF features table went from 1.18 to 0.51 s, the competed
+  table from 1.22 to 0.45 s, the chromatograms from 5.1 to 3.3 s (docs/03 "Parallel
+  decode").
 
 - **Library writers emit fragment tables sorted by `candidate_id`.** `import_diann_lib.py`,
   `make_reverse_decoys.py` and `make_shift_decoys.py` finish with a streaming bucket sort
@@ -125,7 +210,41 @@ than a number. Both are recorded in every run's `manifest.json`.
   has fewer entries. In the list of reads whose name is not a literal, such reads share
   one entry that gives their number, and the header still counts reads. The variables,
   their defaults, the fields and the settings are unchanged.
+
+### Performance
+
+- **The `nn_torch` worker spends less time outside training, with byte-identical
+  scores.** The parquet load decodes the next row group on a reader thread
+  (`pre_buffer=True`) while up to 8 threads write the current one straight into the
+  matrix, keeping the float64 moment partition and order (1,000,000 x 387: 11.8 s to
+  2.4 s); the init feature scan counts its columns on a thread pool (400,000 x 120:
+  24.9 s to 4.3 s), with at most 1 GiB of sort transients in flight
+  (`MUMDIA_NN_SCAN_MEM_GB`) when the init sample escalates toward the whole fold;
+  scoring batches are gathered with `torch.index_select` into one reused
+  numpy-allocated buffer (4.7x on the gather; identity checked on Windows x86-64 with
+  torch 2.6, CPU and CUDA, not yet on the Linux fleet); each round's positives come from a certified top window instead of a
+  full stable sort (10M scores: 1.69 s to 0.08 s), and the decoy order of the hybrid cap
+  from one uint64 key sort; the training pool is no longer scored after the last round,
+  whose scores fed only a log line. Every change keeps a switch back to the code it
+  replaced (`docs/13_sidecars.md`). Tests assert equal score bytes with all of them set
+  back and against the worker before the change (extracted from git history), for the
+  in-memory, streaming and TSV paths. The worker also prints read, fill, standardise
+  and selection sub-timers, and removes its memmap after a failed run as well.
+
 ### Added
+
+- **Opt-in concurrent fold training for `nn_torch` (`MUMDIA_NN_PARALLEL=K`).** The
+  (seed, fold) tasks train in K spawned processes at a fixed per-process thread count
+  (`MUMDIA_NN_PARALLEL_THREADS`), sharing the matrix through a read-only memmap. The
+  epoch shuffle is then keyed per (seed, fold, iteration, epoch), which changes the scores
+  once, like a seed change; they do not depend on K. Off by default; validate it as a seed
+  change (three seeds, two pools, entrapment) before relying on it.
+
+- **`psms_scored.parquet.report.json` records the NN worker's inherited environment.**
+  When `nn_torch` ran, `params.nn_env` lists every `MUMDIA_NN_*` variable the worker
+  inherited beyond the ones the engine sets. `MUMDIA_NN_SEED`, `MUMDIA_NN_THREADS` and
+  `MUMDIA_NN_PARALLEL` change the scores and reach the worker only this way, so two runs
+  of one configuration that differ in them are now told apart by the report.
 
 - **`mumdia pool` pools a grouped run's band artifacts from the command line.** `run` does
   this itself at the end of a grouped search; standalone it is for the case where the

@@ -1,9 +1,11 @@
 //! mumdia-io: on-disk contracts (Parquet, JSON), content hashing, logging, and
 //! the `inspect` helper (docs/03_io_layer.md).
 
+pub mod codec;
 pub mod hash;
 pub mod json;
 pub mod report;
+pub mod span_cache;
 pub mod table;
 
 use anyhow::Result;

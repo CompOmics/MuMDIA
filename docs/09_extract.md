@@ -157,6 +157,15 @@ the ~2.1B 32-bit `ListArray` offset ceiling when gates are opened wide
 fragment names as interned u16 dictionary ids, resolved back through
 `Library::frag_name_str` (`extract.rs:2137`).
 
+The table is written in 65,536-row groups (`CHROM_ROW_GROUP_ROWS`) with the
+`rt` column PLAIN (`TableWriter::with_plain_column("rt")`): every fragment row
+of a candidate carries the same axis, and snappy shortens those repeated PLAIN
+runs far better than a dictionary's bit-packed indices. On the AIF
+chromatograms that is 12.0% smaller than the planned dictionary (160.9 against
+182.8 MB) with identical values. The other float columns keep the writer's
+planned encodings (docs/03_io_layer.md, "Float encodings planned from the first
+rows").
+
 ### Output: top-K peaks sidecar (`<out_psms>.peaks.parquet`)
 
 Written only when `retain_top_peaks > 1` produced rows (`extract.rs:2544`), one

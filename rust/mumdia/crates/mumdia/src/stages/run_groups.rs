@@ -111,6 +111,32 @@ fn record_opt(man: Option<&mut Manifest>, rec: mumdia_core::manifest::ArtifactRe
     }
 }
 
+/// Record a file that no stage report has hashed (a sidecar's output, the pooled seed),
+/// hashing it only when there is a manifest to record it in. `run-experiment` passes no
+/// manifest, and `record_opt(man, record_artifact(..)?)` read and hashed the whole file
+/// first and then dropped the record.
+fn record_hashing(
+    man: Option<&mut Manifest>,
+    logical_name: &str,
+    schema: (&str, u32),
+    path: &str,
+    rows: u64,
+    stage: &str,
+    config_hash: &str,
+) -> Result<()> {
+    if let Some(m) = man {
+        m.record(record_artifact(
+            logical_name,
+            schema,
+            path,
+            rows,
+            stage,
+            config_hash,
+        )?);
+    }
+    Ok(())
+}
+
 /// Content fingerprint of the scans lent to the bands. FNV-1a over every field the
 /// stages read, so any change to any peak changes it.
 ///
@@ -246,6 +272,12 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
             want
         }
     };
+    // Band artifact records are kept only when this run has a manifest of its own. The
+    // stages hash every output for their reports anyway, so a kept record reuses that hash
+    // (`Written::record`); an unkept one is not built at all. Before, every band closure
+    // called `record_artifact`, which read and hashed each band artifact a second time,
+    // and under `run-experiment` (no manifest) the record was then dropped.
+    let keep_records = g.man.is_some();
     // --- the run's MS2, decoded once for the whole seeding phase
     //
     // Each band searches the whole run and differs only in its slice of the library, so
@@ -314,7 +346,7 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
             }
             let seed = gd(b.index, "seed_psms.parquet");
             info!(stage = %"search-seed", group = b.index, "run: stage start");
-            let rows = search_seed::run(search_seed::SearchSeedParams {
+            let written = search_seed::run_hashed(search_seed::SearchSeedParams {
                 ms2: &g.converted.ms2,
                 library_precursors: &prec,
                 library_fragments: g.lib_fragments,
@@ -330,14 +362,17 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
                 emit_calibrants: true,
                 library: None,
             })?;
-            let rec = vec![record_artifact(
-                &format!("{}[g{:02}]", artifact::SEED_PSMS.0, b.index),
-                artifact::SEED_PSMS,
-                &seed,
-                rows,
-                "search-seed",
-                ch,
-            )?];
+            let rec: Vec<mumdia_core::manifest::ArtifactRecord> = if keep_records {
+                vec![written.record(
+                    &format!("{}[g{:02}]", artifact::SEED_PSMS.0, b.index),
+                    artifact::SEED_PSMS,
+                    &seed,
+                    "search-seed",
+                    ch,
+                )]
+            } else {
+                Vec::new()
+            };
             Ok(Some((
                 Band {
                     index: b.index,
@@ -405,17 +440,15 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
         cfg: &cfg.search_seed,
         out: &pooled_seed,
     })?;
-    record_opt(
+    record_hashing(
         g.man.as_deref_mut(),
-        record_artifact(
-            artifact::SEED_PSMS.0,
-            artifact::SEED_PSMS,
-            &pooled_seed,
-            n,
-            "seed-pool",
-            ch,
-        )?,
-    );
+        artifact::SEED_PSMS.0,
+        artifact::SEED_PSMS,
+        &pooled_seed,
+        n,
+        "seed-pool",
+        ch,
+    )?;
     let global = cfg.groups.calibration == GroupCalibration::Global;
 
     // --- RT model per band, against the pooled or the band's own anchors
@@ -474,6 +507,7 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
                 cfg.rt_im_train.q_train,
                 cfg.rt_im_train.window_holdout_frac,
                 rayon::current_num_threads(),
+                cfg.rt_im_train.deeplc_predict_shards,
             )?;
             Some(out)
         } else if cfg.rt_im_train.finetune_deeplc {
@@ -491,6 +525,8 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
                 cfg.rt_im_train.finetune_batch,
                 cfg.rt_im_train.window_holdout_frac,
                 cfg.rng_seed,
+                rayon::current_num_threads(),
+                cfg.rt_im_train.deeplc_predict_shards,
             )?;
             Some(out)
         } else if repredict {
@@ -502,16 +538,17 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
                 &b.prec,
                 &out,
                 rayon::current_num_threads(),
+                cfg.rt_im_train.deeplc_predict_shards,
             )?;
             Some(out)
         } else {
             None
         };
         if let Some(out) = out {
-            let rows = mumdia_io::table::nrows(&out)?;
-            record_opt(
-                g.man.as_deref_mut(),
-                record_artifact(
+            if keep_records {
+                let rows = mumdia_io::table::nrows(&out)?;
+                record_hashing(
+                    g.man.as_deref_mut(),
                     &format!(
                         "{}[g{:02}]",
                         artifact::FRAGMENT_LIBRARY_PRECURSORS.0,
@@ -522,8 +559,8 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
                     rows,
                     &rt_model,
                     ch,
-                )?,
-            );
+                )?;
+            }
             repredicted.push((out.clone(), b.offset));
             b.prec = out;
         }
@@ -589,7 +626,7 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
                 (None, false) => (b.seed.clone(), false),
             };
             info!(stage = %"rt-im-train", group = b.index, "run: stage start");
-            let rows = rt_im_train::run(rt_im_train::RtImTrainParams {
+            let windows_written = rt_im_train::run_hashed(rt_im_train::RtImTrainParams {
                 seed_psms: &seed_for_windows,
                 library_precursors: &b.prec,
                 out_windows: &windows,
@@ -598,14 +635,15 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
                 config_hash: ch,
                 anchor_irt_from_seed: from_seed,
             })?;
-            recs.push(record_artifact(
-                &format!("{}[g{:02}]", artifact::RUN_WINDOWS.0, b.index),
-                artifact::RUN_WINDOWS,
-                &windows,
-                rows,
-                "rt-im-train",
-                ch,
-            )?);
+            if keep_records {
+                recs.push(windows_written.record(
+                    &format!("{}[g{:02}]", artifact::RUN_WINDOWS.0, b.index),
+                    artifact::RUN_WINDOWS,
+                    &windows,
+                    "rt-im-train",
+                    ch,
+                ));
+            }
             let mass_cal = if global {
                 format!("{pooled_seed}.masscal.json")
             } else {
@@ -614,7 +652,7 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
             let psms = gd(b.index, "psms_extracted.parquet");
             let chrom = gd(b.index, "chromatograms.parquet");
             info!(stage = %"extract", group = b.index, candidates = b.n, "run: stage start");
-            let (npsm, nchr) = extract::run(extract::ExtractParams {
+            let (psms_written, chrom_written) = extract::run_hashed(extract::ExtractParams {
                 ms2: &g.converted.ms2,
                 library_precursors: &b.prec,
                 library_fragments: g.lib_fragments,
@@ -633,22 +671,22 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
                     ms1: Some(&ms1_scans),
                 }),
             })?;
-            recs.push(record_artifact(
-                &format!("{}[g{:02}]", artifact::PSMS_EXTRACTED.0, b.index),
-                artifact::PSMS_EXTRACTED,
-                &psms,
-                npsm,
-                "extract",
-                ch,
-            )?);
-            recs.push(record_artifact(
-                &format!("{}[g{:02}]", artifact::CHROMATOGRAMS.0, b.index),
-                artifact::CHROMATOGRAMS,
-                &chrom,
-                nchr,
-                "extract",
-                ch,
-            )?);
+            if keep_records {
+                recs.push(psms_written.record(
+                    &format!("{}[g{:02}]", artifact::PSMS_EXTRACTED.0, b.index),
+                    artifact::PSMS_EXTRACTED,
+                    &psms,
+                    "extract",
+                    ch,
+                ));
+                recs.push(chrom_written.record(
+                    &format!("{}[g{:02}]", artifact::CHROMATOGRAMS.0, b.index),
+                    artifact::CHROMATOGRAMS,
+                    &chrom,
+                    "extract",
+                    ch,
+                ));
+            }
             // The band half of the pooled bounds: the same pass `features` would run
             // internally, returning its anchors instead of a percentile of them.
             let samples = features::confident_bound_samples(&features::FeaturesParams {
@@ -721,7 +759,7 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
             let feats = gd(e.index, "features.parquet");
             let pin = gd(e.index, "run.pin");
             info!(stage = %"features", group = e.index, "run: stage start");
-            let nf = features::run_with_bounds(
+            let features_written = features::run_with_bounds_hashed(
                 features::FeaturesParams {
                     psms: &e.psms,
                     chromatograms: &e.chrom,
@@ -737,30 +775,33 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
                 },
                 bounds,
             )?;
-            recs.push(record_artifact(
-                &format!("{}[g{:02}]", artifact::FEATURES.0, e.index),
-                artifact::FEATURES,
-                &feats,
-                nf,
-                "features",
-                ch,
-            )?);
+            if keep_records {
+                recs.push(features_written.record(
+                    &format!("{}[g{:02}]", artifact::FEATURES.0, e.index),
+                    artifact::FEATURES,
+                    &feats,
+                    "features",
+                    ch,
+                ));
+            }
             let competed = gd(e.index, "psms_competed.parquet");
             info!(stage = %"compete", group = e.index, "run: stage start");
-            let nc = compete::run(compete::CompeteParams {
+            let competed_written = compete::run_hashed(compete::CompeteParams {
                 features: &feats,
                 out: &competed,
                 cfg: &cfg.compete,
                 config_hash: ch,
+                features_hash: Some(&features_written.content_hash),
             })?;
-            recs.push(record_artifact(
-                &format!("{}[g{:02}]", artifact::PSMS_COMPETED.0, e.index),
-                artifact::PSMS_COMPETED,
-                &competed,
-                nc,
-                "compete",
-                ch,
-            )?);
+            if keep_records {
+                recs.push(competed_written.record(
+                    &format!("{}[g{:02}]", artifact::PSMS_COMPETED.0, e.index),
+                    artifact::PSMS_COMPETED,
+                    &competed,
+                    "compete",
+                    ch,
+                ));
+            }
             Ok((
                 pool::BandArtifacts {
                     psms: e.psms.clone(),
@@ -836,13 +877,19 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
         out_competed: &out.competed,
     })
     .context("pooling the window groups")?;
-    let pooled_artifacts = pool_psms
-        .then_some((
-            artifact::PSMS_EXTRACTED.0,
-            artifact::PSMS_EXTRACTED,
-            &out.psms,
-            stats.psms,
-        ))
+    let pooled_artifacts = stats
+        .psms_hash
+        .clone()
+        .filter(|_| pool_psms)
+        .map(|h| {
+            (
+                artifact::PSMS_EXTRACTED.0,
+                artifact::PSMS_EXTRACTED,
+                &out.psms,
+                stats.psms,
+                h,
+            )
+        })
         .into_iter()
         .chain([
             (
@@ -850,18 +897,20 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
                 artifact::CHROMATOGRAMS,
                 &out.chromatograms,
                 stats.chromatograms,
+                stats.chromatograms_hash.clone(),
             ),
             (
                 artifact::PSMS_COMPETED.0,
                 artifact::PSMS_COMPETED,
                 &out.competed,
                 stats.competed,
+                stats.competed_hash.clone(),
             ),
         ]);
-    for (name, schema, path, rows) in pooled_artifacts {
-        // One hash for both the manifest record and the report beside the file: these are
-        // the run's largest artifacts, and hashing reads all of it.
-        let content_hash = mumdia_io::hash::blake3_file(path)?;
+    for (name, schema, path, rows, content_hash) in pooled_artifacts {
+        // One hash for both the manifest record and the report beside the file, computed
+        // by the pool while it spliced the table: these are the run's largest artifacts,
+        // and a read-back would read all of it again.
         record_opt(
             g.man.as_deref_mut(),
             mumdia_io::record_artifact_with_hash(

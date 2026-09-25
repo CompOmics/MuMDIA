@@ -12,8 +12,8 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use mumdia_core::config::{MatcherKind, SearchSeedConfig};
 use mumdia_core::schema::artifact;
-use mumdia_io::report::ArtifactReport;
-use mumdia_io::table::{write_table, Col};
+use mumdia_io::report::{ArtifactReport, Written};
+use mumdia_io::table::{write_table_hashed, Col};
 use serde_json::json;
 use tracing::{info, warn};
 
@@ -173,13 +173,20 @@ struct Best {
 }
 
 pub fn run(p: SearchSeedParams) -> Result<u64> {
-    run_returning_scans(p).map(|(n, _)| n)
+    run_hashed(p).map(|w| w.rows)
 }
 
-/// [`run`], handing back the MS2 scans when the stage decoded them itself (`None` when the
-/// caller lent them). An orchestrator that runs extract on the same spectra with nothing
-/// in between that needs the memory can lend them on instead of decoding the run twice.
-pub fn run_returning_scans(p: SearchSeedParams) -> Result<(u64, Option<Vec<Ms2Scan>>)> {
+/// [`run`], returning the output's row count and the content hash its report records, so
+/// an orchestrator can record the artifact without reading and hashing it again.
+pub fn run_hashed(p: SearchSeedParams) -> Result<Written> {
+    run_returning_scans(p).map(|(w, _)| w)
+}
+
+/// [`run_hashed`], handing back the MS2 scans when the stage decoded them itself (`None`
+/// when the caller lent them). An orchestrator that runs extract on the same spectra with
+/// nothing in between that needs the memory can lend them on instead of decoding the run
+/// twice.
+pub fn run_returning_scans(p: SearchSeedParams) -> Result<(Written, Option<Vec<Ms2Scan>>)> {
     let t0 = Instant::now();
     // `--out` must not be one of this stage's own inputs: every input is read
     // before the output is published, so writing over one replaces it and exits 0
@@ -480,7 +487,7 @@ pub fn run_returning_scans(p: SearchSeedParams) -> Result<(u64, Option<Vec<Ms2Sc
         "search-seed: mass recalibration"
     );
 
-    let n = write_table(
+    let seed_written = write_table_hashed(
         p.out,
         vec![
             Col::U32("candidate_id".into(), cid_c),
@@ -502,18 +509,20 @@ pub fn run_returning_scans(p: SearchSeedParams) -> Result<(u64, Option<Vec<Ms2Sc
             Col::U32("scan_index".into(), scan_c),
         ],
     )?;
+    let n = seed_written.rows;
 
     let elapsed = t0.elapsed().as_millis();
     let mut stats = std::collections::BTreeMap::new();
     stats.insert("psms".to_string(), json!(n));
     stats.insert(format!("targets_at_q{}", p.cfg.fdr_seed), json!(n_at_1pct));
-    ArtifactReport {
+    let report = ArtifactReport {
         logical_name: artifact::SEED_PSMS.0.to_string(),
         schema_name: artifact::SEED_PSMS.0.to_string(),
         schema_version: artifact::SEED_PSMS.1,
         stage: "search-seed".to_string(),
         rows: n,
-        content_hash: mumdia_io::hash::blake3_file(p.out)?,
+        // Computed while the table was written.
+        content_hash: seed_written.content_hash,
         params: json!({
             "fragment_tol_ppm": p.cfg.fragment_tol_ppm,
             "report_psms": p.cfg.report_psms,
@@ -524,8 +533,8 @@ pub fn run_returning_scans(p: SearchSeedParams) -> Result<(u64, Option<Vec<Ms2Sc
         stats,
         model_identity: Some("native-seed-hyperscore-v1".to_string()),
         elapsed_ms: elapsed,
-    }
-    .write_for(p.out)?;
+    };
+    report.write_for(p.out)?;
 
     info!(
         psms = n,
@@ -534,7 +543,7 @@ pub fn run_returning_scans(p: SearchSeedParams) -> Result<(u64, Option<Vec<Ms2Sc
         "search-seed: done"
     );
     drop(owned_library);
-    Ok((n, owned_scans))
+    Ok((report.written(), owned_scans))
 }
 
 /// Score of the [`crate::masscal::CALIBRANT_OFFER_PSMS`]-th best TARGET PSM: every target at

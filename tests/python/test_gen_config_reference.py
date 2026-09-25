@@ -231,6 +231,101 @@ def test_unbalanced_braces_after_masking_fail_loudly():
     assert reads["MUMDIA_T_AFTER"][0] == ["src/x.rs::b"]
 
 
+CFG_TEST_ITEMS = """\
+enum Finish {
+    Normal,
+    #[cfg(test)]
+    Fail,
+}
+
+impl Finish {
+    fn apply(self) {
+        let _ = std::env::var("MUMDIA_T_AFTER_VARIANT");
+        match self {
+            Finish::Normal => {}
+            #[cfg(test)]
+            Finish::Fail => {
+                std::env::set_var("MUMDIA_T_TEST_ARM", "1");
+            }
+        }
+    }
+}
+
+struct Loader<'a> {
+    rows: &'a [usize],
+    #[cfg(test)]
+    fault: Option<u8>,
+}
+
+impl<'a> Loader<'a> {
+    fn new(rows: &'a [usize]) -> Loader<'a> {
+        Loader {
+            rows,
+            #[cfg(test)]
+            fault: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_fault(mut self, fault: Option<u8>) -> Loader<'a> {
+        std::env::set_var("MUMDIA_T_TEST_FN", "1");
+        self.fault = fault;
+        self
+    }
+
+    fn run(&self) {
+        #[cfg(test)]
+        let _ = std::env::var("MUMDIA_T_TEST_STMT");
+        #[cfg(test)]
+        let _l = self.with_fault(match self.rows.len() {
+            0 => None,
+            _ => Some(1),
+        });
+        let _ = std::env::var("MUMDIA_T_AFTER_STMT");
+    }
+}
+
+#[cfg(test)]
+fn generic<A, B>(a: A, b: B) -> Vec<(A, B)>
+where
+    A: Clone,
+    B: Clone,
+{
+    std::env::set_var("MUMDIA_T_TEST_GENERIC", "1");
+    vec![(a, b)]
+}
+
+fn last() {
+    let _ = std::env::var("MUMDIA_T_LAST");
+}
+"""
+
+
+def test_cfg_test_on_braceless_items_blanks_only_that_item():
+    """A test-only field, variant, arm or statement blanks itself and nothing more.
+
+    Searching for the next `{` from `#[cfg(test)] fault: None,` inside a struct
+    literal swallowed the literal's closing brace and the next function's header,
+    so the braces no longer balanced and `rust_scopes` rejected features.rs. Here
+    every braceless form is followed by real code whose read must be cited under
+    its own function, and every test-only read must be absent.
+    """
+    reads, sets, unresolved = scan_rust(CFG_TEST_ITEMS)
+    assert {name: entry[0] for name, entry in reads.items()} == {
+        "MUMDIA_T_AFTER_STMT": ["src/x.rs::Loader::run"],
+        "MUMDIA_T_AFTER_VARIANT": ["src/x.rs::Finish::apply"],
+        "MUMDIA_T_LAST": ["src/x.rs::last"],
+    }
+    assert sets == {}
+    assert unresolved == []
+    # Line count is preserved, and the lines left after the items are untouched.
+    blanked = gen.blank_cfg_test(CFG_TEST_ITEMS)
+    assert blanked.count("\n") == CFG_TEST_ITEMS.count("\n")
+    kept = [line for line in blanked.split("\n") if line.strip()]
+    assert "            rows," in kept and "        }" in kept
+    assert not any("fault: None" in line or "Fail," in line for line in kept)
+
+
 def test_repeated_unresolved_reads_are_counted_not_merged():
     """A second non-literal read in the same function changes the document.
 
@@ -365,3 +460,18 @@ def test_blank_line_check_detects_a_line_dependency(monkeypatch):
         found = problems()
         assert found and "the reference document changed" in found[0]
     assert problems() == []
+
+
+def test_computed_env_defaults_are_read_somewhere():
+    """Every `computed:` default names a variable the repository reads.
+
+    The builder only reports a stale entry, so it runs on synthetic sources that read
+    none of them; the entry point refuses to write or pass `--check` while one is
+    stale, so a removed variable cannot leave its row behind.
+    """
+    _document, stats = gen.build_document(gen.load_inputs())
+    assert stats["stale_computed_env"] == []
+
+    config_text = gen.load_inputs().config_text
+    _document, stats = gen.build_document(gen.Inputs(config_text, [], []))
+    assert stats["stale_computed_env"] == sorted(gen.COMPUTED_ENV_DEFAULTS)

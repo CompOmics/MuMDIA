@@ -10,8 +10,8 @@ use std::time::Instant;
 use anyhow::Result;
 use mumdia_core::config::{CalibrationMethod, RtImTrainConfig};
 use mumdia_core::schema::artifact;
-use mumdia_io::report::ArtifactReport;
-use mumdia_io::table::{write_table, Col, TableFile};
+use mumdia_io::report::{ArtifactReport, Written};
+use mumdia_io::table::{write_table_hashed, Col, TableFile};
 use serde_json::json;
 use tracing::{info, warn};
 
@@ -104,6 +104,12 @@ fn candidate_window(calibrated_rt: Option<f64>, width: Option<f64>) -> (f64, f64
 }
 
 pub fn run(p: RtImTrainParams) -> Result<u64> {
+    run_hashed(p).map(|w| w.rows)
+}
+
+/// [`run`], returning the output's row count and the content hash its report records, so
+/// an orchestrator can record the artifact without reading and hashing it again.
+pub fn run_hashed(p: RtImTrainParams) -> Result<Written> {
     let t0 = Instant::now();
     // `--out` must not be one of this stage's own inputs: every input is read
     // before the output is published, so writing over one replaces it and exits 0
@@ -423,7 +429,7 @@ pub fn run(p: RtImTrainParams) -> Result<u64> {
         imhi_c.push(None);
     }
 
-    let rows = write_table(
+    let windows = write_table_hashed(
         p.out_windows,
         vec![
             Col::U32("candidate_id".into(), cid_c),
@@ -435,6 +441,7 @@ pub fn run(p: RtImTrainParams) -> Result<u64> {
             Col::OptF64("im_hi".into(), imhi_c),
         ],
     )?;
+    let rows = windows.rows;
 
     let method = if !calibration_available {
         "unavailable"
@@ -507,19 +514,20 @@ pub fn run(p: RtImTrainParams) -> Result<u64> {
         "candidates_without_finite_irt".to_string(),
         json!(n_nonfinite_irt),
     );
-    ArtifactReport {
+    let report = ArtifactReport {
         logical_name: artifact::RUN_WINDOWS.0.to_string(),
         schema_name: artifact::RUN_WINDOWS.0.to_string(),
         schema_version: artifact::RUN_WINDOWS.1,
         stage: "rt-im-train".to_string(),
         rows,
-        content_hash: mumdia_io::hash::blake3_file(p.out_windows)?,
+        // Computed while the table was written.
+        content_hash: windows.content_hash,
         params: json!({"q_train": p.cfg.q_train, "p_rt": p.cfg.p_rt, "method": format!("{:?}", p.cfg.calibration_method)}),
         stats,
         model_identity: None,
         elapsed_ms: elapsed,
-    }
-    .write_for(p.out_windows)?;
+    };
+    report.write_for(p.out_windows)?;
 
     if n_nonfinite_irt > 0 {
         tracing::warn!(
@@ -536,7 +544,7 @@ pub fn run(p: RtImTrainParams) -> Result<u64> {
         elapsed_ms = elapsed,
         "rt-im-train: done"
     );
-    Ok(rows)
+    Ok(report.written())
 }
 
 #[cfg(test)]

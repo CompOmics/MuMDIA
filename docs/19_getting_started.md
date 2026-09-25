@@ -240,8 +240,8 @@ Interaction with the per-run fine-tune (the best-workflow config sets
 DeepLC on this run's confident seed PSMs and writes a new output table with
 replaced `predicted_irt` for every standard peptidoform before RT calibration
 (`rust/mumdia/crates/mumdia/src/stages/run.rs:242-280`;
-`scripts/deeplc_finetune.py:156-159`). The input file's `predicted_irt` is then
-only a fallback for non-standard peptidoforms (`deeplc_finetune.py:95`, `:156`),
+`scripts/deeplc_finetune.py`, `rewrite_irt`). The input file's `predicted_irt` is then
+only a fallback for non-standard peptidoforms (`is_std`, `rewrite_irt`),
 so raw and `_ft` may converge when the fine-tune is on. For a clean
 reproduction, pass the raw table when `finetune_deeplc = true` and let `run`
 create and record its own `_ft` output. The pre-existing `_ft` distinction matters
