@@ -119,16 +119,26 @@ Column order and types from `extract.rs:2480`:
 | `ms1_iso1` | OptF64 | MS1 +1 isotope intensity |
 | `ms1_iso2` | OptF64 | MS1 +2 isotope intensity |
 
-The rows are written as they are produced. Each time 65,536 rows have accumulated
-(`WRITE_TABLE_CHUNK_ROWS`) they go to the table's `TableWriter`, which is exactly the
-chunk sequence `write_table` cut the whole table into, so the file is byte-identical
-to the one written at the end of the stage before 2026-09-25 while only one chunk of
-rows is resident (at most about 6 GB less on an unbanded immunopeptidomics run). The
-one exception is `emit_demix_features`: its five columns are patched in after the
+The rows are written as they are produced (`PsmStream`). Each time 65,536 rows have
+accumulated (`WRITE_TABLE_CHUNK_ROWS`) they go to the table's `TableWriter`, which is
+exactly the chunk sequence `write_table` cut the whole table into, so the file is
+byte-identical to the one written at the end of the stage before 2026-09-25 while only
+one chunk of rows is resident (at most about 6 GB less on an unbanded
+immunopeptidomics run). `the_streamed_psms_table_is_the_write_table_file` checks the
+bytes at 0, 1, 65,536, 65,537 and 131,075 rows, with every optional column group.
+The one exception is `emit_demix_features`: its five columns are patched in after the
 candidate loop, so the rows are kept whole and written at the end through
 `write_table`, which produces the same chunks. The stage logs `extract:
 psms_extracted writer` with the row count, whether the table was streamed and the
 writer's busy time.
+
+A chunk write that fails inside the candidate loop stops the loop, and the stage
+then publishes neither table: the chromatogram writer is dropped unclosed
+(`close_chromatograms`), so its temporary file is removed and a chromatograms table
+already at the path stays as it was, as the `psms_extracted` one does. Publishing
+the chromatograms there would put a truncated table beside an older
+`psms_extracted`. Before the rows were streamed, the psms table was written after
+the chromatograms were complete, so this case could not arise.
 
 Conditional columns (default-off, added only when the knob is set so the
 production schema stays byte-identical):
@@ -566,7 +576,8 @@ The chromatogram rows of each candidate chunk are handed to one writer thread
 through a two-slot channel, so encoding overlaps extraction. The stage logs one
 `extract: chromatogram writer` line with `chunks`, `send_blocked_ms` (time the
 extraction side waited for a free channel slot, the column build excluded) and
-`writer_busy_ms` (time the writer thread spent in `write_cols` and `close`). A
+`writer_busy_ms` (time the writer thread spent in `write_cols`, plus the final
+`close`, which runs on the extraction side once the loop has ended). A
 `send_blocked_ms` near zero says the serial encoder does not bound the stage; one
 that approaches the stage's accumulation time says it does, and that a parallel
 column encoder (survey item R2) would pay off here. The line is log output only.
@@ -833,7 +844,7 @@ tests encode the behavioral invariants that gate tuning must preserve.
   as real `psms_extracted` rows carrying `peak_rank`, so they pick up the full
   feature vector downstream. What is still missing is per-candidate q-collapse over
   `(candidate_id, peak_rank)` and entrapment validation, so it stays default-off.
-- **New per-PSM columns**: append to the `CandOut` struct (`extract.rs:1656`), set
+- **New per-PSM columns**: append to the `CandOut` struct (`extract.rs:2682`), set
   it in the `rank0` construction (`extract.rs:2203`) and in the promoted-alternate
   construction (`extract.rs:2297`), add a vector to `PsmRows`, push it in
   `PsmRows::push` and emit its `Col` in `PsmRows::take_cols`, which writes the
