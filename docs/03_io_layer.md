@@ -377,7 +377,7 @@ reader is given a `span_cache::SpanCache` instead of the `File`:
   direct reads.
 
 Two full scans use it by default, through `stages::wide_scan_options`: rescore's
-feature stream (`for_each_feature_row`, all ~390 feature columns of every row of
+feature stream (`for_each_feature_batch`, all ~390 feature columns of every row of
 every competed input) and compete's pass-through copy (`copy_kept_rows`, every
 column of the features table). Those are the wide scans of the run on spinning
 storage, where the memory the cache holds (two or three row groups of the

@@ -24,7 +24,7 @@ pub mod seed_pool;
 pub mod sub_library;
 
 /// Read options for the full scans of the widest artifacts: rescore's feature stream
-/// (`rescore::for_each_feature_row`) and compete's pass-through copy
+/// (`rescore::for_each_feature_batch`) and compete's pass-through copy
 /// (`compete::copy_kept_rows`), which both read ~390 columns of every row of a competed or
 /// features table.
 ///

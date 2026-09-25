@@ -639,18 +639,19 @@ pub fn run_hashed(p: RescoreParams) -> Result<Written> {
         // the row index.
         let streamed = {
             let mut w = HandoffWriter::new(&paths, &feat_names, &is_decoy, &pform, &protein, &mz)?;
-            let scan = for_each_feature_row(p.competed, &feat_names, |row, values| {
-                if let Some(col) = values.iter().position(|v| !v.is_finite()) {
-                    bail_non_finite(Some((row, col, values[col])), bad_scalar, &feat_names)?;
+            let scan = for_each_feature_batch(p.competed, &feat_names, |b| {
+                // The row-at-a-time scan stopped at the first row that either held a
+                // non-finite feature or was the offending scalar row, and
+                // `bail_non_finite` chose between the two on the row index. A batch that
+                // holds the first bad feature, or reaches the scalar row, is where that
+                // row lies; the same call makes the same choice with the same message.
+                let bad_feature = b.first_non_finite();
+                if bad_feature.is_some()
+                    || bad_scalar.is_some_and(|scalar_row| scalar_row < b.first_row + b.rows)
+                {
+                    bail_non_finite(bad_feature, bad_scalar, &feat_names)?;
                 }
-                // Past the offending scalar row with no earlier bad feature, the choice
-                // `bail_non_finite` would make is already decided (a later feature row
-                // loses the tie-break), so there is nothing left to learn from the rest of
-                // the file.
-                if bad_scalar.is_some_and(|scalar_row| row >= scalar_row) {
-                    bail_non_finite(None, bad_scalar, &feat_names)?;
-                }
-                w.push_row(row, values)
+                w.push_batch(b)
             });
             // `finish` consumes the writer, and the `Err` arm drops it, so the file is
             // closed either way before the cleanup below.
@@ -679,6 +680,8 @@ pub fn run_hashed(p: RescoreParams) -> Result<Written> {
             path = %paths.handoff,
             rows,
             features = feat_names.len(),
+            elapsed_ms = t_features.elapsed().as_millis() as u64,
+            encode_ms = timings.handoff_encode_ms as u64,
             "rescore: streamed the competed features into the sidecar handoff \
              (no engine-side feature matrix)"
         );
@@ -1874,8 +1877,15 @@ const HANDOFF_ROW_GROUP_ROWS: usize = 131_072;
 struct ParquetHandoff {
     schema: std::sync::Arc<arrow::datatypes::Schema>,
     writer: mumdia_io::table::BatchWriter,
-    /// Row-major staging buffer for the current block, transposed to columns on flush.
+    /// Row-major staging buffer for the current block, transposed to columns on flush
+    /// ([`HandoffWriter::push_row`], the matrix path).
     stage: Vec<f32>,
+    /// Column-major staging for the current block, one vector per feature, moved into the
+    /// batch on flush without a transpose ([`HandoffWriter::push_batch`], the stream).
+    /// A block is staged one way or the other, never both.
+    cols: Vec<Vec<f32>>,
+    /// Rows staged in `cols`.
+    col_rows: usize,
     block_start: usize,
 }
 
@@ -1942,9 +1952,8 @@ impl<'a> HandoffWriter<'a> {
     ///
     /// Production always goes through `new` at `HANDOFF_BATCH_ROWS`. This exists for
     /// `handoff_block_size_end_to_end`: a benchmark arm at N has to allocate what a build
-    /// with `HANDOFF_BATCH_ROWS = N` would allocate, and `with_block_rows` cannot deliver
-    /// that, because by the time it runs `new` has already reserved (and the arm must then
-    /// free) 250,000 x nf x 4 bytes inside the timer.
+    /// with `HANDOFF_BATCH_ROWS = N` would allocate. The staging buffers are reserved when
+    /// the first block is staged, at the block size of the writer.
     #[allow(clippy::too_many_arguments)]
     fn with_block_size(
         paths: &SidecarPaths,
@@ -1981,7 +1990,11 @@ impl<'a> HandoffWriter<'a> {
             HandoffSink::Parquet(Box::new(ParquetHandoff {
                 schema,
                 writer,
-                stage: Vec::with_capacity(block_rows.saturating_mul(feat_names.len())),
+                // Reserved lazily, by whichever of `push_row` and `push_batch` stages the
+                // first block, so the path that is not used allocates nothing.
+                stage: Vec::new(),
+                cols: vec![Vec::new(); feat_names.len()],
+                col_rows: 0,
                 block_start: 0,
             }))
         } else {
@@ -2011,10 +2024,10 @@ impl<'a> HandoffWriter<'a> {
     /// Shrink the parquet batch so a test can exercise several blocks. Production always
     /// uses `HANDOFF_BATCH_ROWS`.
     ///
-    /// This changes the flush boundary and NOT the staging reservation, which `new` has
-    /// already made at `HANDOFF_BATCH_ROWS`. Correct for the block-boundary tests and
-    /// wrong for a benchmark; measure allocation-sensitive arms through
-    /// [`HandoffWriter::with_block_size`] instead.
+    /// Call it before the first row: the staging buffers are reserved at the block size in
+    /// force when the first block is staged. The benchmark arms still go through
+    /// [`HandoffWriter::with_block_size`], which is what a build with another
+    /// `HANDOFF_BATCH_ROWS` would construct.
     #[cfg(test)]
     fn with_block_rows(mut self, rows: usize) -> Self {
         self.block_rows = rows.max(1);
@@ -2031,6 +2044,11 @@ impl<'a> HandoffWriter<'a> {
         self.rows += 1;
         match &mut self.sink {
             HandoffSink::Parquet(pq) => {
+                debug_assert_eq!(pq.col_rows, 0, "a block is staged by rows or by columns");
+                if pq.stage.capacity() == 0 {
+                    pq.stage
+                        .reserve_exact(self.block_rows.saturating_mul(nf.max(1)));
+                }
                 pq.stage.extend_from_slice(&values[..nf]);
                 if pq.stage.len() >= self.block_rows.saturating_mul(nf.max(1)) {
                     self.flush_block()?;
@@ -2053,9 +2071,57 @@ impl<'a> HandoffWriter<'a> {
         }
     }
 
-    /// Transpose the staged rows into one column per field and write them as one batch.
+    /// Append a decoded batch of the feature stream, whose first row is the next flat row.
+    ///
+    /// The parquet encoding stages it column by column: each feature's values are narrowed
+    /// straight out of the decoded Arrow column into that feature's block vector, in
+    /// parallel over features, and the block is handed to the writer without the row-major
+    /// round trip `push_row` makes (decoded columns to rows, rows back to columns on
+    /// flush). Blocks still hold `block_rows` rows and are flushed at the same rows, so the
+    /// writer receives the same record batches and the file is byte-identical
+    /// (`the_streamed_handoff_is_byte_identical_to_the_handoff_from_the_matrix`). The PIN is
+    /// written a row at a time, as before.
+    fn push_batch(&mut self, b: &FeatureBatch<'_>) -> Result<()> {
+        if !matches!(self.sink, HandoffSink::Parquet(_)) {
+            let mut row = vec![0.0f32; self.feat_names.len()];
+            for k in 0..b.rows {
+                b.row_into(k, &mut row);
+                self.push_row(b.first_row + k, &row)?;
+            }
+            return Ok(());
+        }
+        let block_rows = self.block_rows;
+        let mut lo = 0usize;
+        while lo < b.rows {
+            let HandoffSink::Parquet(pq) = &mut self.sink else {
+                unreachable!("checked above");
+            };
+            debug_assert!(
+                pq.stage.is_empty(),
+                "a block is staged by rows or by columns"
+            );
+            let take = (block_rows - pq.col_rows).min(b.rows - lo);
+            let hi = lo + take;
+            pq.cols.par_iter_mut().enumerate().for_each(|(j, col)| {
+                if col.capacity() == 0 {
+                    col.reserve_exact(block_rows);
+                }
+                b.extend_column(j, lo, hi, col);
+            });
+            pq.col_rows += take;
+            self.rows += take as u64;
+            lo = hi;
+            if pq.col_rows >= block_rows {
+                self.flush_block()?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Write the staged block as one record batch: the columns staged by `push_batch` are
+    /// moved in as they are, rows staged by `push_row` are transposed first.
     fn flush_block(&mut self) -> Result<()> {
-        use arrow::array::{ArrayRef, Float32Array, Int32Array, StringArray};
+        use arrow::array::{ArrayRef, Float32Array, Int32Array};
         use arrow::record_batch::RecordBatch;
         use std::sync::Arc;
 
@@ -2064,17 +2130,30 @@ impl<'a> HandoffWriter<'a> {
         let HandoffSink::Parquet(pq) = &mut self.sink else {
             return Ok(());
         };
-        if pq.stage.is_empty() {
+        if pq.stage.is_empty() && pq.col_rows == 0 {
             return Ok(());
         }
         let t = std::time::Instant::now();
         let start = pq.block_start;
-        let k = pq.stage.len() / nf.max(1);
+        let k = if pq.col_rows > 0 {
+            pq.col_rows
+        } else {
+            pq.stage.len() / nf.max(1)
+        };
         let end = start + k;
+        let features: Vec<Vec<f32>> = if pq.col_rows > 0 {
+            // Moved out, and re-reserved lazily by the next block.
+            pq.cols.iter_mut().map(std::mem::take).collect()
+        } else {
+            transpose_block(&pq.stage, nf, k)
+        };
         let mut arrays: Vec<ArrayRef> = Vec::with_capacity(nf + 7);
-        arrays.push(Arc::new(StringArray::from(
-            (start..end).map(|i| format!("psm_{i}")).collect::<Vec<_>>(),
-        )));
+        // One text buffer per block for each of the two formatted columns rather than one
+        // `String` per row. The values are the same, so the array and the file are too.
+        arrays.push(Arc::new(string_column(k, 12, |r, s| {
+            use std::fmt::Write as _;
+            let _ = write!(s, "psm_{}", start + r);
+        })?));
         arrays.push(Arc::new(Int32Array::from(
             (start..end)
                 .map(|i| if is_decoy[i] { -1 } else { 1 })
@@ -2083,25 +2162,28 @@ impl<'a> HandoffWriter<'a> {
         arrays.push(Arc::new(Int32Array::from(
             (start..end).map(|i| i as i32).collect::<Vec<_>>(),
         )));
-        let mzv: Vec<f64> = mz[start..end].to_vec();
-        arrays.push(Arc::new(Float64Array::from(mzv.clone())));
-        arrays.push(Arc::new(Float64Array::from(mzv)));
-        for fi in 0..nf {
-            let col: Vec<f32> = (0..k).map(|r| pq.stage[r * nf + fi]).collect();
+        // `ExpMass` and `CalcMass` are the same values: one array in both slots, which
+        // writes the same bytes as two copies (`a_shared_column_array_writes_the_same_
+        // parquet_as_two_copies`).
+        let mzv: ArrayRef = Arc::new(Float64Array::from(mz[start..end].to_vec()));
+        arrays.push(mzv.clone());
+        arrays.push(mzv);
+        for col in features {
             arrays.push(Arc::new(Float32Array::from(col)));
         }
-        arrays.push(Arc::new(StringArray::from(
-            (start..end)
-                .map(|i| format!("-.{}.-", pform.get(i)))
-                .collect::<Vec<_>>(),
-        )));
+        arrays.push(Arc::new(string_column(k, 28, |r, s| {
+            s.push_str("-.");
+            s.push_str(pform.get(start + r));
+            s.push_str(".-");
+        })?));
         // `StringArray::from(Vec<String>)` is `from_iter_values`, so the same bytes.
-        arrays.push(Arc::new(StringArray::from_iter_values(
+        arrays.push(Arc::new(arrow::array::StringArray::from_iter_values(
             (start..end).map(|i| protein.get(i)),
         )));
         pq.writer
             .write(&RecordBatch::try_new(pq.schema.clone(), arrays)?)?;
         pq.stage.clear();
+        pq.col_rows = 0;
         pq.block_start = end;
         self.encode += t.elapsed();
         Ok(())
@@ -2129,11 +2211,68 @@ impl<'a> HandoffWriter<'a> {
     }
 }
 
+/// The `k` rows of a row-major block of `nf` features as one vector per feature.
+///
+/// In parallel over tiles of 16 features: a tile's task reads each staged row once, as 64
+/// contiguous bytes, and appends one value to each of its 16 columns, where one task per
+/// feature re-read every row's cache line for every feature. Each value is copied to its
+/// own column in row order, so the columns are the serial loop's exactly.
+fn transpose_block(stage: &[f32], nf: usize, k: usize) -> Vec<Vec<f32>> {
+    const TILE: usize = 16;
+    let tiles: Vec<Vec<Vec<f32>>> = (0..nf.div_ceil(TILE))
+        .into_par_iter()
+        .map(|t| {
+            let c0 = t * TILE;
+            let w = TILE.min(nf - c0);
+            let mut out: Vec<Vec<f32>> = (0..w).map(|_| Vec::with_capacity(k)).collect();
+            for r in 0..k {
+                let row = &stage[r * nf + c0..r * nf + c0 + w];
+                for (col, &v) in out.iter_mut().zip(row) {
+                    col.push(v);
+                }
+            }
+            out
+        })
+        .collect();
+    tiles.into_iter().flatten().collect()
+}
+
+/// A `k`-row string column whose row `r` is what `write(r, buf)` appends, built in one
+/// text buffer (about `bytes_per_row` bytes a row reserved up front) and one offsets
+/// vector, rather than one `String` per row.
+fn string_column(
+    k: usize,
+    bytes_per_row: usize,
+    mut write: impl FnMut(usize, &mut String),
+) -> Result<arrow::array::StringArray> {
+    use arrow::buffer::{Buffer, OffsetBuffer, ScalarBuffer};
+    let mut values = String::with_capacity(k.saturating_mul(bytes_per_row));
+    let mut offsets: Vec<i32> = Vec::with_capacity(k + 1);
+    offsets.push(0);
+    for r in 0..k {
+        write(r, &mut values);
+        offsets.push(
+            i32::try_from(values.len())
+                .map_err(|_| anyhow!("a handoff string column passed 2 GiB in one block"))?,
+        );
+    }
+    Ok(arrow::array::StringArray::try_new(
+        OffsetBuffer::new(ScalarBuffer::from(offsets)),
+        Buffer::from(values.into_bytes()),
+        None,
+    )?)
+}
+
 /// Stream the selected feature columns of every competed input, one row at a time, in flat
 /// row order, narrowed to f32 exactly as `FeatureMatrix::push` narrows them.
 ///
 /// One pass over just the feature columns. The null policy is unchanged: a null f64 reads
 /// as NaN, which the validation then rejects.
+///
+/// The stage itself reads through [`for_each_feature_batch`], which hands whole decoded
+/// batches to the handoff and the matrix; this row form is what the tests and the
+/// benchmark compare every consumer against.
+#[cfg(test)]
 fn for_each_feature_row(
     competed: &[String],
     feat_names: &[String],
@@ -2153,6 +2292,7 @@ fn for_each_feature_row(
 
 /// [`for_each_feature_row`] under explicit read options and batch sizing, for the
 /// benchmark that compares them.
+#[cfg(test)]
 fn for_each_feature_row_with(
     competed: &[String],
     feat_names: &[String],
@@ -2160,8 +2300,121 @@ fn for_each_feature_row_with(
     batch_rows: impl Fn(&TableFile) -> usize,
     mut f: impl FnMut(usize, &[f32]) -> Result<()>,
 ) -> Result<()> {
-    let names: Vec<&str> = feat_names.iter().map(String::as_str).collect();
     let mut row: Vec<f32> = vec![0.0; feat_names.len()];
+    for_each_feature_batch_with(competed, feat_names, scan, batch_rows, |b| {
+        for k in 0..b.rows {
+            b.row_into(k, &mut row);
+            f(b.first_row + k, &row)?;
+        }
+        Ok(())
+    })
+}
+
+/// One decoded batch of the feature stream: the selected feature columns, in selection
+/// order, for the flat rows `first_row..first_row + rows`.
+///
+/// Every value leaves it narrowed exactly as `FeatureMatrix::push` narrows it, `v as f32`,
+/// with a null read as `f64::NAN as f32` (the same expression the matrix path narrowed
+/// through, so a null cell keeps its bits). The validation then rejects it as non-finite.
+struct FeatureBatch<'a> {
+    first_row: usize,
+    rows: usize,
+    cols: Vec<&'a Float64Array>,
+}
+
+impl FeatureBatch<'_> {
+    /// Value `k` (batch-local row) of selected column `j`, narrowed.
+    #[inline]
+    fn value(&self, j: usize, k: usize) -> f32 {
+        let c = self.cols[j];
+        if c.is_null(k) {
+            f64::NAN as f32
+        } else {
+            c.value(k) as f32
+        }
+    }
+
+    /// Batch-local row `k` into `row` (one value per selected column).
+    fn row_into(&self, k: usize, row: &mut [f32]) {
+        for (j, slot) in row.iter_mut().enumerate() {
+            *slot = self.value(j, k);
+        }
+    }
+
+    /// Batch-local rows `lo..lo + dst.len() / nf` into `dst`, row-major, in parallel over
+    /// row chunks. The values are the ones `row_into` produces; only the order in which
+    /// they are written differs, and each lands in its own slot.
+    fn rows_into(&self, lo: usize, dst: &mut [f32]) {
+        let nf = self.cols.len();
+        if nf == 0 {
+            return;
+        }
+        const CHUNK_ROWS: usize = 1024;
+        dst.par_chunks_mut(CHUNK_ROWS * nf)
+            .enumerate()
+            .for_each(|(c, chunk)| {
+                let r0 = lo + c * CHUNK_ROWS;
+                for (r, row) in chunk.chunks_exact_mut(nf).enumerate() {
+                    self.row_into(r0 + r, row);
+                }
+            });
+    }
+
+    /// Batch-local rows `lo..hi` of column `j`, narrowed, appended to `out`.
+    fn extend_column(&self, j: usize, lo: usize, hi: usize, out: &mut Vec<f32>) {
+        let c = self.cols[j];
+        if c.null_count() == 0 {
+            out.extend(c.values()[lo..hi].iter().map(|&v| v as f32));
+        } else {
+            out.extend((lo..hi).map(|k| self.value(j, k)));
+        }
+    }
+
+    /// `(flat row, column, value)` of the first non-finite narrowed value in row-major order:
+    /// the lowest row, and in it the lowest column, which is what the row-at-a-time scan
+    /// found with `values.iter().position(..)` on the first offending row. Columns are
+    /// searched in parallel; the minimum over `(row, column)` does not depend on which
+    /// worker finds what.
+    fn first_non_finite(&self) -> Option<(usize, usize, f32)> {
+        (0..self.cols.len())
+            .into_par_iter()
+            .filter_map(|j| {
+                (0..self.rows)
+                    .find(|&k| !self.value(j, k).is_finite())
+                    .map(|k| (k, j))
+            })
+            .min()
+            .map(|(k, j)| (self.first_row + k, j, self.value(j, k)))
+    }
+}
+
+/// Stream the selected feature columns of every competed input one decoded batch at a
+/// time, in flat row order: the column form of [`for_each_feature_row`], for consumers
+/// that can take a batch whole (the parquet handoff stages it column by column, the matrix
+/// fills it row-major in parallel).
+fn for_each_feature_batch(
+    competed: &[String],
+    feat_names: &[String],
+    f: impl FnMut(&FeatureBatch<'_>) -> Result<()>,
+) -> Result<()> {
+    let scan = super::wide_scan_options();
+    for_each_feature_batch_with(
+        competed,
+        feat_names,
+        &scan,
+        |t| feature_batch_rows(t, &scan),
+        f,
+    )
+}
+
+fn for_each_feature_batch_with(
+    competed: &[String],
+    feat_names: &[String],
+    scan: &mumdia_io::table::ScanOptions,
+    batch_rows: impl Fn(&TableFile) -> usize,
+    mut f: impl FnMut(&FeatureBatch<'_>) -> Result<()>,
+) -> Result<()> {
+    let names: Vec<&str> = feat_names.iter().map(String::as_str).collect();
     let mut flat = 0usize;
     for path in competed {
         let t = TableFile::open(path)?;
@@ -2187,26 +2440,13 @@ fn for_each_feature_row_with(
                         })
                 })
                 .collect::<Result<_>>()?;
-            let any_null = cols.iter().any(|c| c.null_count() > 0);
-            for k in 0..b.num_rows() {
-                if any_null {
-                    for (slot, c) in row.iter_mut().zip(&cols) {
-                        // `f64::NAN as f32`, not `f32::NAN`: the same expression the
-                        // matrix path narrowed through, so a null cell keeps its bits.
-                        *slot = if c.is_null(k) {
-                            f64::NAN as f32
-                        } else {
-                            c.value(k) as f32
-                        };
-                    }
-                } else {
-                    for (slot, c) in row.iter_mut().zip(&cols) {
-                        *slot = c.value(k) as f32;
-                    }
-                }
-                f(flat, &row)?;
-                flat += 1;
-            }
+            let batch = FeatureBatch {
+                first_row: flat,
+                rows: b.num_rows(),
+                cols,
+            };
+            f(&batch)?;
+            flat += batch.rows;
         }
     }
     Ok(())
@@ -2218,9 +2458,17 @@ fn load_feature_matrix(
     feat_names: &[String],
     total_rows: usize,
 ) -> Result<FeatureMatrix> {
-    let mut m = FeatureMatrix::with_capacity(total_rows, feat_names.len());
-    for_each_feature_row(competed, feat_names, |_, values| {
-        m.push_row(values);
+    let nf = feat_names.len();
+    let mut m = FeatureMatrix::with_capacity(total_rows, nf);
+    // One row-major block per batch, filled in parallel and appended. The block is reused,
+    // so after the first batch it costs no allocation; the values are the ones
+    // `for_each_feature_row` hands out, in the same rows.
+    let mut block: Vec<f32> = Vec::new();
+    for_each_feature_batch(competed, feat_names, |b| {
+        block.clear();
+        block.resize(b.rows * nf, 0.0);
+        b.rows_into(0, &mut block);
+        m.push_row(&block);
         Ok(())
     })?;
     m.finish()
@@ -2961,6 +3209,123 @@ b
         // matrix scan does.
         assert!(seen[7].1[1].is_nan());
         assert_eq!(m.find_non_finite(), Some((7, 1)));
+        // The batch form's own scan finds it too, in the batch that holds it and in no
+        // earlier one.
+        let mut found = Vec::new();
+        for_each_feature_batch(&competed, &names, |b| {
+            found.push((b.first_row, b.first_non_finite()));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(found.len(), 2);
+        assert_eq!(found[0], (0, None));
+        assert_eq!(found[1].0, 7);
+        let (row, col, v) = found[1].1.expect("the null is found");
+        assert_eq!((row, col), (7, 1));
+        assert!(v.is_nan());
+    }
+
+    #[test]
+    fn the_first_non_finite_value_of_a_batch_is_the_row_major_first() {
+        // Two offending cells in one batch: the earlier row wins whatever its column, and
+        // within a row the lower column, as `values.iter().position(..)` on the first
+        // offending row picked it. An f64 that overflows f32 counts, because the check is
+        // on the narrowed value.
+        let path = scratch("fnf.parquet");
+        let big = f64::MAX;
+        write_table(
+            &path,
+            vec![
+                Col::F64("a".into(), vec![0.0, 1.0, 2.0, f64::NAN, 4.0]),
+                Col::F64("b".into(), vec![0.0, 1.0, big, 3.0, 4.0]),
+                Col::F64("c".into(), vec![0.0, 1.0, f64::INFINITY, 3.0, 4.0]),
+            ],
+        )
+        .unwrap();
+        let names: Vec<String> = ["a", "b", "c"].iter().map(|s| s.to_string()).collect();
+        let mut got = None;
+        for_each_feature_batch(std::slice::from_ref(&path), &names, |b| {
+            got = b.first_non_finite();
+            Ok(())
+        })
+        .unwrap();
+        let (row, col, v) = got.expect("found");
+        assert_eq!((row, col), (2, 1));
+        assert!(v.is_infinite(), "f64::MAX narrows to infinity: {v}");
+        // And the row stream agrees.
+        let mut first = None;
+        for_each_feature_row(&[path], &names, |i, values| {
+            if first.is_none() {
+                if let Some(c) = values.iter().position(|v| !v.is_finite()) {
+                    first = Some((i, c));
+                }
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(first, Some((2, 1)));
+    }
+
+    #[test]
+    fn the_matrix_filled_from_batches_is_the_matrix_filled_from_rows() {
+        let names: Vec<String> = ["f0", "f1", "f2"].iter().map(|s| s.to_string()).collect();
+        let a = scratch("mfb_a.parquet");
+        let b = scratch("mfb_b.parquet");
+        crafted_competed(&a, 2_500, 100.0, &names, false);
+        crafted_competed(&b, 1_300, 900.0, &names, true);
+        let competed = vec![a, b];
+        let m = load_feature_matrix(&competed, &names, 3_800).unwrap();
+        let mut rows = FeatureMatrix::with_capacity(3_800, names.len());
+        for_each_feature_row(&competed, &names, |_, v| {
+            rows.push_row(v);
+            Ok(())
+        })
+        .unwrap();
+        let rows = rows.finish().unwrap();
+        assert_eq!(m.rows(), rows.rows());
+        for i in 0..m.rows() {
+            assert_eq!(
+                m.row(i).iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                rows.row(i).iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "row {i}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_tiled_transpose_is_the_serial_one() {
+        for (nf, k) in [
+            (1usize, 1usize),
+            (3, 7),
+            (16, 5),
+            (17, 9),
+            (40, 33),
+            (387, 11),
+        ] {
+            let stage: Vec<f32> = (0..nf * k).map(|x| x as f32 * 0.5 - 7.0).collect();
+            let want: Vec<Vec<f32>> = (0..nf)
+                .map(|fi| (0..k).map(|r| stage[r * nf + fi]).collect())
+                .collect();
+            assert_eq!(transpose_block(&stage, nf, k), want, "{nf} x {k}");
+        }
+    }
+
+    #[test]
+    fn the_string_column_is_the_vec_of_strings_column() {
+        use arrow::array::StringArray;
+        let want = StringArray::from(
+            (0..5)
+                .map(|i| format!("psm_{}", 40 + i))
+                .collect::<Vec<_>>(),
+        );
+        let got = string_column(5, 1, |r, s| {
+            use std::fmt::Write as _;
+            let _ = write!(s, "psm_{}", 40 + r);
+        })
+        .unwrap();
+        assert_eq!(got, want);
+        let empty = string_column(0, 12, |_, _| {}).unwrap();
+        assert_eq!(empty.len(), 0);
     }
 
     #[test]
@@ -3162,11 +3527,47 @@ b
             for_each_feature_row(&competed, &names, |i, v| w.push_row(i, v)).unwrap();
             assert_eq!(w.finish().unwrap(), n as u64);
 
+            let reference = std::fs::read(&from_matrix.handoff).unwrap();
             assert_eq!(
-                std::fs::read(&from_matrix.handoff).unwrap(),
+                reference,
                 std::fs::read(&from_stream.handoff).unwrap(),
                 "handoff differs (parquet = {use_pq})"
             );
+
+            // The batch form the stage uses: whole decoded batches staged column by column,
+            // with batches smaller than, straddling and larger than the 5-row blocks, under
+            // both readers.
+            for scan in [
+                mumdia_io::table::ScanOptions::default(),
+                mumdia_io::table::ScanOptions::coalesced(),
+            ] {
+                for batch in [1usize, 3, 16_384] {
+                    let from_batches = SidecarPaths {
+                        handoff: scratch(if use_pq { "b.parquet" } else { "b.pin" }),
+                        out: String::new(),
+                        foldkeys: String::new(),
+                        use_pq,
+                    };
+                    let mut w =
+                        HandoffWriter::new(&from_batches, &names, &is_decoy, &pform, &protein, &mz)
+                            .unwrap()
+                            .with_block_rows(5);
+                    for_each_feature_batch_with(
+                        &competed,
+                        &names,
+                        &scan,
+                        |_| batch,
+                        |b| w.push_batch(b),
+                    )
+                    .unwrap();
+                    assert_eq!(w.finish().unwrap(), n as u64);
+                    assert_eq!(
+                        reference,
+                        std::fs::read(&from_batches.handoff).unwrap(),
+                        "batch handoff differs (parquet = {use_pq}, {batch}-row batches, {scan:?})"
+                    );
+                }
+            }
         }
         // And the PIN really is the PIN contract: header, then one row per PSM.
         let pin = scratch("m.pin");

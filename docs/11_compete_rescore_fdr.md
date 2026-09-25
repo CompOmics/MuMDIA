@@ -404,7 +404,7 @@ is a flat f32 `FeatureMatrix`, so the same `n_psms * n_features * 4`, and
 however many folds are configured. The stage logs the figure before allocating, and
 `rescore.max_feature_matrix_gib` makes exceeding a ceiling an error at startup.
 
-**Reading the feature columns.** The feature pass (`for_each_feature_row`) is the
+**Reading the feature columns.** The feature pass (`for_each_feature_batch`) is the
 widest read of the stage: every selected feature column of every row of every
 input, once. It reads through the coalesced scan (`stages::wide_scan_options`,
 docs/03 "Sequential row-group reads"), so each row group's projected column
@@ -416,8 +416,33 @@ against 2.50 s over the 879,018-row HYE competed table). Under the plain reader 
 decoded batch is one row group (`feature_batch_rows`, at most 131,072 rows), so
 the reader sweeps each column chunk before the next one; under the coalesced
 reader it stays at 16,384 rows, because the group is read whole either way. The
-rows reach the handoff and the matrix one at a time in file order whatever the
-reader and batch size (`every_read_mode_streams_the_same_feature_rows`).
+rows reach the handoff and the matrix in file order whatever the reader and batch
+size (`every_read_mode_streams_the_same_feature_rows`).
+
+The stream hands out whole decoded batches (`FeatureBatch`), and each consumer
+takes a batch in the layout it needs, in parallel:
+
+- the parquet handoff stages a block column by column: every feature's values are
+  narrowed to f32 straight out of the decoded Arrow column into that feature's
+  block vector, and the block goes to the writer without a transpose. The row
+  path it replaces turned the decoded columns into rows and the staged rows back
+  into columns on flush. Blocks keep `HANDOFF_BATCH_ROWS` (250,000) rows and are
+  flushed at the same rows, so the writer receives the same record batches and
+  the file is byte-identical;
+- `SpecId` and `Peptide` are formatted into one text buffer per block rather than
+  one `String` per row, and `ExpMass` and `CalcMass` share one array;
+- the matrix path (every native, mokapot or non-strict run) fills a reused
+  row-major block per batch in parallel and appends it; a handoff written from
+  the matrix transposes its staged rows in parallel tiles of 16 features;
+- the first non-finite value of a batch is found per column in parallel and
+  reduced to the lowest `(row, column)`, which is the row-major first the row
+  scan reported, so the refusal names the same row, feature and value.
+
+Measured on the HYE competed table (879,018 rows, 387 features, strict `nn_torch`
+with an interpreter that cannot start, so the stage ends after the handoff; three
+rounds): the streamed handoff took 8.4-8.7 s of process wall before and 3.0-4.1 s
+after, 2.3-2.9 s of it the stream itself and 1.2-1.6 s of that the encode. The
+handoff files are byte-identical.
 
 The NnTorch worker picks its backend from the handoff file size against
 `MUMDIA_NN_STREAM_GB` (default 4, `nn_rescore_worker.py:299-300`). A matrix
