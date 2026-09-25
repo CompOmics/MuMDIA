@@ -591,32 +591,32 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
     let n_runs = p.mzmls.len();
 
     // Provenance: the identity of the code, of the configuration and of the INPUTS,
-    // hashed now, before anything reads them for compute (docs/29 #15). Hashing at the
+    // hashed from the start, before any stage reads them (docs/29 #15). Hashing at the
     // end recorded whatever bytes were on disk after a multi-hour experiment, which is
-    // not necessarily what the search read; the single-run orchestrator has always
-    // hashed first, and the two now agree.
+    // not necessarily what the search read.
+    //
+    // The hashes are taken on a background thread (`prestage::InputHashes`) and joined
+    // when the manifest is written. Taken serially here they were the first, cold read of
+    // every mzML and of the library, minutes of I/O with nothing else running on a large
+    // experiment. The order is the order the chain reads the files: the first run's mzML,
+    // then the library its seed loads, then the other runs. The manifest keys inputs by
+    // role, so the order changes nothing in it.
     let mut prov = Manifest::new(cfg.canonical_json(), ch.clone());
-    for (i, m) in p.mzmls.iter().enumerate() {
-        if let (Ok(bytes), Ok(hash)) = (
-            std::fs::metadata(m).map(|x| x.len()),
-            mumdia_io::hash::blake3_file(m),
-        ) {
-            prov.record_input(&format!("mzml[{i}]"), m, bytes, hash);
-        }
-    }
+    let mut hash_order: Vec<(String, String)> = Vec::with_capacity(n_runs + 3);
+    hash_order.push(("mzml[0]".to_string(), p.mzmls[0].clone()));
     for (role, path) in [
         ("fasta", p.fasta),
         ("lib_precursors", p.lib_precursors),
         ("lib_fragments", p.lib_fragments),
     ] {
-        let Some(path) = path else { continue };
-        if let (Ok(bytes), Ok(hash)) = (
-            std::fs::metadata(path).map(|x| x.len()),
-            mumdia_io::hash::blake3_file(path),
-        ) {
-            prov.record_input(role, path, bytes, hash);
+        if let Some(path) = path {
+            hash_order.push((role.to_string(), path.to_string()));
         }
     }
+    for (i, m) in p.mzmls.iter().enumerate().skip(1) {
+        hash_order.push((format!("mzml[{i}]"), m.clone()));
+    }
+    let input_hashes = crate::prestage::InputHashes::spawn("run-experiment", hash_order);
     // Reject a bad --run-names rather than silently substituting r0..rN-1.
     //
     // The old `_ =>` arm swallowed any count mismatch with no warning, and accepted
@@ -1359,6 +1359,9 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         "quant-lfq",
         &ch,
     )?);
+
+    // The input hashes started at the top of the experiment.
+    input_hashes.record(&mut prov);
 
     // The resolved configuration itself, not only its hash: a hash identifies a
     // configuration but cannot replay one (docs/29 #15).
