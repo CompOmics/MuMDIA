@@ -1893,12 +1893,20 @@ mod tests {
         assert_eq!(groups(&spliced[1]), vec![2, 4, 1]);
         assert_eq!(groups(&spliced[2]), vec![3, 4, 2]);
         assert!(groups(&spliced[3]).is_empty());
-        // No temporary boundary file is left behind.
+        // No temporary boundary file of THIS split is left behind. The directory is shared
+        // with the module's other tests, which run concurrently and write their own
+        // `.split-rg` files while they split, so only names that start with one of this
+        // test's outputs are this split's.
         for o in &spliced {
-            let dir = std::path::Path::new(o).parent().unwrap();
+            let path = std::path::Path::new(o);
+            let dir = path.parent().unwrap();
+            let own = path.file_name().unwrap().to_string_lossy().into_owned();
             for e in std::fs::read_dir(dir).unwrap() {
                 let name = e.unwrap().file_name().to_string_lossy().into_owned();
-                assert!(!name.contains(".split-rg"), "{name}");
+                assert!(
+                    !(name.starts_with(&own) && name.contains(".split-rg")),
+                    "{name}"
+                );
             }
         }
     }
