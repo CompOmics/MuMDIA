@@ -158,7 +158,16 @@ index via `page_search` and needs no separate build.
   (`fragindex.rs:214-237`), candidates with `count >= min_matched_peaks` are
   scored by `hyperscore`, sorted by score desc then candidate-id asc, truncated to
   `report_psms`, and folded into a group-local best with a strictly-greater update
-  (`:357-385`).
+  (`:357-385`). Since 2026-09-25 the parallel unit is a contiguous RT chunk of a
+  served window group rather than the whole group (`seed_chunk_plan`): groups whose
+  candidate range is empty get no task, and the served groups are split when their scans
+  would give fewer than about four tasks per thread, never below 32 scans per chunk. A
+  banded search serves only the one to three windows over its band, so its whole probe
+  phase ran on that many threads before. A group's chunks merge back in chunk order with
+  the same strictly-greater update, so an earlier chunk keeps an exact tie and the group's
+  best is the one the scan-by-scan walk gives
+  (`chunk_tests::a_chunked_seed_is_the_one_task_per_window_seed_exactly`). An ungrouped
+  run with many windows mostly keeps one task per group.
 - *Bucketed path* (serial, `search_seed.rs:66-107`): per scan, `candidate_range` on
   the Library, `select_peaks`, then `page_search` for each probed peak accumulates
   `(count, obs_sum)` into a `HashMap`. Same `min_matched_peaks` filter, hyperscore,

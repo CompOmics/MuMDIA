@@ -555,6 +555,70 @@ fn seed_fragindex_windows(
     scans: &[Ms2Scan],
     cfg: &SearchSeedConfig,
 ) -> HashMap<u32, Best> {
+    seed_fragindex_windows_chunked(
+        idx,
+        scans,
+        cfg,
+        rayon::current_num_threads(),
+        SEED_MIN_CHUNK_SCANS,
+    )
+}
+
+/// Fewest scans a seed task holds when a window group is split (see [`seed_chunk_plan`]).
+const SEED_MIN_CHUNK_SCANS: usize = 32;
+
+/// The seed's parallel tasks: `(group, start, end)` over `group_vec[group][start..end]`, for
+/// the SERVED groups only, in group order and, within a group, in RT order.
+///
+/// The unit used to be one isolation-window group, which is one task per window. A banded
+/// search (`groups.window_groups`) loads one m/z band and so serves only the one to three
+/// windows over it: its whole probe phase ran on that many threads, whatever `--threads`
+/// was (the 63-band immunopeptidomics plan covers 114 windows; the 100-band HYE plan has
+/// three per band). Groups are therefore split into contiguous scan chunks when the served
+/// scans would give fewer than about four tasks per thread, never below `min_chunk` scans.
+/// An ungrouped run serves every window and usually has enough groups already, so its
+/// groups mostly stay whole.
+fn seed_chunk_plan(
+    sizes: &[usize],
+    served: &[bool],
+    threads: usize,
+    min_chunk: usize,
+) -> Vec<(usize, usize, usize)> {
+    let total: usize = sizes
+        .iter()
+        .zip(served)
+        .filter(|(_, s)| **s)
+        .map(|(n, _)| *n)
+        .sum();
+    let target = (4 * threads.max(1)).max(1);
+    let chunk = total.div_ceil(target).max(min_chunk).max(1);
+    let mut tasks = Vec::new();
+    for (g, (&n, &s)) in sizes.iter().zip(served).enumerate() {
+        if !s || n == 0 {
+            continue;
+        }
+        let pieces = n.div_ceil(chunk);
+        for k in 0..pieces {
+            // Near-equal pieces: the first `n % pieces` get one scan more.
+            let a = k * n / pieces;
+            let b = (k + 1) * n / pieces;
+            if b > a {
+                tasks.push((g, a, b));
+            }
+        }
+    }
+    tasks
+}
+
+/// [`seed_fragindex_windows`] with the task plan's inputs explicit, so a test can force
+/// every group into many chunks and compare against one task per group.
+fn seed_fragindex_windows_chunked(
+    idx: &FragIndex,
+    scans: &[Ms2Scan],
+    cfg: &SearchSeedConfig,
+    threads: usize,
+    min_chunk: usize,
+) -> HashMap<u32, Best> {
     use std::collections::BTreeMap;
     // Group scan indices by window; BTreeMap keys give a deterministic group order
     // (the merge is order-independent anyway, being a total-order max).
@@ -621,19 +685,19 @@ fn seed_fragindex_windows(
     }
 
     let scratch_width = initial_scratch_width(&survey);
-    let partials: Vec<Vec<(u32, Best)>> = group_vec
+    // Served groups only, split into RT-contiguous chunks when there are too few to fill
+    // the threads (`seed_chunk_plan`). A group outside the loaded library range returns
+    // nothing and gets no task.
+    let sizes: Vec<usize> = group_vec.iter().map(|ids| ids.len()).collect();
+    let served: Vec<bool> = ranges.iter().map(|(lo, hi)| hi > lo).collect();
+    let tasks = seed_chunk_plan(&sizes, &served, threads, min_chunk);
+    let chunk_partials: Vec<(usize, HashMap<u32, Best>)> = tasks
         .par_iter()
         .map_init(
             || SeedScratch::new(scratch_width),
-            |scratch, ids| {
-                if ids.is_empty() {
-                    return Vec::new();
-                }
-                let w = &scans[ids[0]].window;
-                let (lo, hi) = idx.candidate_range(w.lower_mz, w.upper_mz);
-                if hi <= lo {
-                    return Vec::new();
-                }
+            |scratch, &(g, a, b)| {
+                let ids = &group_vec[g][a..b];
+                let (lo, hi) = ranges[g];
                 let mut local: HashMap<u32, Best> = HashMap::new();
                 for &si in ids {
                     let scan = &scans[si];
@@ -677,10 +741,39 @@ fn seed_fragindex_windows(
                         }
                     }
                 }
-                local.into_iter().collect()
+                (g, local)
             },
         )
         .collect();
+    // A group's chunks merge back in chunk order with the same strictly-greater rule the
+    // walk over the group applies scan by scan, so an earlier chunk keeps an exact tie:
+    // the group's partial is what one task over all its scans would have produced.
+    let mut partials: Vec<Vec<(u32, Best)>> = Vec::new();
+    let mut current: Option<(usize, HashMap<u32, Best>)> = None;
+    for (g, part) in chunk_partials {
+        match &mut current {
+            Some((cg, acc)) if *cg == g => {
+                for (cid, b) in part {
+                    match acc.get_mut(&cid) {
+                        Some(e) if b.score > e.score => *e = b,
+                        Some(_) => {}
+                        None => {
+                            acc.insert(cid, b);
+                        }
+                    }
+                }
+            }
+            _ => {
+                if let Some((_, acc)) = current.take() {
+                    partials.push(acc.into_iter().collect());
+                }
+                current = Some((g, part));
+            }
+        }
+    }
+    if let Some((_, acc)) = current {
+        partials.push(acc.into_iter().collect());
+    }
 
     // Deterministic cross-group merge (total order, so independent of group/thread order).
     let mut best: HashMap<u32, Best> = HashMap::new();
@@ -865,5 +958,181 @@ mod peak_selection_tests {
         let s = scan(305);
         assert_eq!(select_peaks(&s, 0), (0..305).collect::<Vec<_>>());
         assert_eq!(select_peaks(&s, 300), (5..305).collect::<Vec<_>>());
+    }
+}
+
+#[cfg(test)]
+mod chunk_tests {
+    use super::{seed_chunk_plan, seed_fragindex_windows_chunked, Best};
+    use crate::index::{Candidate, Library};
+    use crate::matchers::fragindex::FragIndex;
+    use mumdia_core::config::SearchSeedConfig;
+    use mumdia_core::types::{IsolationWindow, Ms2Scan, Peak};
+    use std::collections::HashMap;
+
+    #[test]
+    fn the_chunk_plan_covers_every_served_scan_once_and_skips_the_rest() {
+        let sizes = [100usize, 0, 7, 1_000, 3];
+        let served = [true, true, false, true, true];
+        for (threads, min) in [(1usize, 32usize), (8, 32), (64, 1), (1, usize::MAX)] {
+            let tasks = seed_chunk_plan(&sizes, &served, threads, min);
+            for (g, &n) in sizes.iter().enumerate() {
+                let mine: Vec<&(usize, usize, usize)> = tasks.iter().filter(|t| t.0 == g).collect();
+                if !served[g] || n == 0 {
+                    assert!(mine.is_empty(), "group {g} has no task");
+                    continue;
+                }
+                // Contiguous, in order, covering 0..n exactly once.
+                assert_eq!(mine[0].1, 0);
+                assert_eq!(mine.last().unwrap().2, n);
+                assert!(mine.windows(2).all(|w| w[0].2 == w[1].1));
+                if min != usize::MAX {
+                    assert!(mine.iter().all(|t| t.2 - t.1 >= min.min(n)));
+                }
+            }
+            // Groups appear in order, which the in-group merge relies on.
+            assert!(tasks.windows(2).all(|w| w[0].0 <= w[1].0));
+        }
+        // Enough tasks on one served group to occupy the threads.
+        let one = seed_chunk_plan(&[4_000], &[true], 32, 32);
+        assert_eq!(one.len(), 125);
+        // Many groups already: one task each.
+        let many = seed_chunk_plan(&[50; 400], &[true; 400], 32, 32);
+        assert_eq!(many.len(), 400);
+    }
+
+    fn lib_from(cands: &[(Vec<f64>, f64)]) -> Library {
+        let mut frag_mz = Vec::new();
+        let mut frag_int = Vec::new();
+        let mut frag_name_id: Vec<u16> = Vec::new();
+        let mut prec_mz = Vec::new();
+        let mut cs = Vec::new();
+        for (i, (frags, pmz)) in cands.iter().enumerate() {
+            let start = frag_mz.len();
+            for &mz in frags {
+                frag_mz.push(mz as f32);
+                frag_int.push(1.0);
+                frag_name_id.push(0);
+            }
+            cs.push(Candidate {
+                candidate_id: i as u32,
+                peptidoform_id: i as u32,
+                base_peptide_id: i as u32,
+                peptidoform: String::new(),
+                charge: 2,
+                precursor_mz: *pmz,
+                predicted_irt: 0.0,
+                is_decoy: i % 3 == 0,
+                protein: String::new(),
+                frag_start: start,
+                n_frag: frags.len(),
+            });
+            prec_mz.push(*pmz);
+        }
+        Library {
+            cands: cs,
+            frag_mz,
+            frag_int,
+            frag_name_id,
+            frag_name_dict: vec!["f".to_string()],
+            idx_mz: Vec::new(),
+            idx_cid: Vec::new(),
+            idx_int: Vec::new(),
+            bucket_min: Vec::new(),
+            bucket_size: 1,
+            prec_mz,
+            global_offset: 0,
+        }
+    }
+
+    fn bits(m: &HashMap<u32, Best>) -> Vec<(u32, u64, u64, u32, u32)> {
+        let mut v: Vec<_> = m
+            .iter()
+            .map(|(c, b)| {
+                (
+                    *c,
+                    b.score.to_bits(),
+                    b.rt.to_bits(),
+                    b.matched,
+                    b.scan_index,
+                )
+            })
+            .collect();
+        v.sort_unstable();
+        v
+    }
+
+    #[test]
+    fn a_chunked_seed_is_the_one_task_per_window_seed_exactly() {
+        // Two windows of 60 candidates each, 600 scans. Every scan carries fragments of a
+        // few candidates of its window; scans repeat with the same peaks at a later RT and
+        // at the SAME RT, so the chunk merge meets exact score ties and has to keep the
+        // earlier scan, as the scan-by-scan walk does.
+        let mut cands = Vec::new();
+        for i in 0..120usize {
+            let pmz = if i < 60 {
+                410.0 + i as f64
+            } else {
+                520.0 + (i - 60) as f64
+            };
+            let frags: Vec<f64> = (0..6).map(|k| 200.0 + (i * 6 + k) as f64 * 1.37).collect();
+            cands.push((frags, pmz));
+        }
+        let lib = lib_from(&cands);
+        let idx = FragIndex::build(&lib, 20.0);
+        let window = |a: bool| IsolationWindow {
+            target_mz: if a { 450.0 } else { 550.0 },
+            lower_mz: if a { 400.0 } else { 500.0 },
+            upper_mz: if a { 500.0 } else { 600.0 },
+            im_lower: None,
+            im_upper: None,
+        };
+        let mut scans = Vec::new();
+        for s in 0..600usize {
+            // Scans 4k and 4k+1 are window A, 4k+2 and 4k+3 window B, and the two scans of
+            // a pair carry the same peaks: exact score ties inside one window.
+            let key = s / 4;
+            let in_a = (s / 2) % 2 == 0;
+            let base = if in_a { 0 } else { 60 };
+            let mut peaks: Vec<Peak> = Vec::new();
+            for j in 0..4usize {
+                let c = base + (key * 7 + j * 11) % 60;
+                for k in 0..(4 + j % 3) {
+                    peaks.push(Peak {
+                        mz: cands[c].0[k] as f32,
+                        intensity: (100 + key % 17 * 10 + j) as f32,
+                    });
+                }
+            }
+            peaks.sort_by(|a, b| a.mz.total_cmp(&b.mz));
+            scans.push(Ms2Scan {
+                scan_index: s as u32,
+                // Some tied pairs share one RT, the rest are a scan apart.
+                rt_seconds: (s / 3) as f64 * 2.0,
+                window: window(in_a),
+                peaks,
+            });
+        }
+        let cfg = SearchSeedConfig {
+            min_matched_peaks: 3,
+            ..Default::default()
+        };
+        let whole = seed_fragindex_windows_chunked(&idx, &scans, &cfg, 1, usize::MAX);
+        assert!(!whole.is_empty(), "the fixture must produce seed PSMs");
+        for (threads, min) in [(64usize, 1usize), (8, 5), (3, 32)] {
+            let chunked = seed_fragindex_windows_chunked(&idx, &scans, &cfg, threads, min);
+            assert_eq!(
+                bits(&chunked),
+                bits(&whole),
+                "threads {threads}, chunk floor {min}"
+            );
+        }
+        // A library holding only window B's candidates: window A is unserved and gets no
+        // task, and the result is the B half of the whole-library one.
+        let lib_b = lib_from(&cands[60..]);
+        let idx_b = FragIndex::build(&lib_b, 20.0);
+        let a = seed_fragindex_windows_chunked(&idx_b, &scans, &cfg, 1, usize::MAX);
+        let b = seed_fragindex_windows_chunked(&idx_b, &scans, &cfg, 64, 1);
+        assert_eq!(bits(&a), bits(&b));
     }
 }

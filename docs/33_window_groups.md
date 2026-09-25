@@ -694,6 +694,15 @@ features phase uses the rows the band's extract accepted. Starting the long band
 keeps one of them from arriving last and running alone. The gain is not measured; it is
 zero at the default `parallel: 1`, and it applies only where the band phases are CPU-bound.
 
+Inside a band, the seed's parallel unit is a contiguous RT chunk of a window group rather
+than the whole group (`docs/07_search_seed.md`, step 3). A band serves only the one to three
+isolation windows over its m/z range (114 windows over 63 bands on the immunopeptidomics
+plan, three per band on the 100-band HYE plan), so with one task per window its probe phase
+ran on one to three threads whatever `--threads` was. The chunked seed is bit-identical to
+the per-window one; the gain is not measured. The interval from a band's
+`search-seed: loaded` to its `search-seed: mass recalibration` log line is the index build
+plus the probe, which is what the change shortens.
+
 ### `groups.parallel` and the thread count
 
 A band in flight occupies one rayon worker, which then blocks on its own extraction's
