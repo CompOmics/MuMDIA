@@ -88,6 +88,19 @@
       "source_struct": "ConvertConfig"
     },
     {
+      "path": "convert.parallel_conversions",
+      "name": "parallel_conversions",
+      "section": "convert",
+      "rust_type": "usize",
+      "kind": "integer",
+      "optional": false,
+      "default": 4,
+      "default_text": "4",
+      "help": "How many vendor files `run` and `run-experiment` convert to mzML at once. Default 4. Every vendor input is converted before the first run starts, and the conversions used to run one after another, so an experiment of N `.raw` files paid N converter runs of several minutes each on the critical path. Each conversion is a separate child process writing its own destination under its own lock, and its output does not depend on what else runs beside it, so running them concurrently changes the wall time only. The bound is there because a converter reads a multi-GB file and writes a larger one: more at once than the disk can feed is slower, not faster. `1` converts one at a time, as before. Only the first conversion of an input pays this at all; `reuse_converted` skips the rest. Not measured at scale.",
+      "gates": [],
+      "source_struct": "ConvertConfig"
+    },
+    {
       "path": "prescan.tol_da",
       "name": "tol_da",
       "section": "prescan",

@@ -327,6 +327,15 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ### Performance
 
+- **`run` and `run-experiment` hash their inputs off the critical path, and convert
+  vendor files concurrently.** The blake3 hash of every input file for the manifest was
+  taken serially before the first stage, and it is the first, cold read of each input:
+  minutes on a large library. It now runs on a background thread in the order the stages
+  read the files and is joined when the manifest is written, which records the same
+  roles, paths, sizes and hashes. The single-run library-input records reuse that hash
+  instead of reading the library again. Vendor inputs convert up to
+  `convert.parallel_conversions` at once (default 4, `1` is the old serial loop); each
+  conversion keeps its own destination and lock, so the mzML files are unchanged.
 - **Rescore's feature stream and its post-classifier tail do less.** The feature stream
   and compete's pass-through copy can read each row group's projected column chunks in
   one sequential read (the span cache, `MUMDIA_WIDE_SCAN=coalesced`), and the feature

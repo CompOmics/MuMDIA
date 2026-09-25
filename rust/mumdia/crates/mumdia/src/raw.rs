@@ -767,6 +767,91 @@ fn sweep_stale_partials(out_dir: &Path, out: &Path) {
     }
 }
 
+/// Convert every vendor input among `inputs` to mzML, at most
+/// `cfg.parallel_conversions` at once, and return the mzML paths in input order.
+///
+/// `run` and `run-experiment` convert all of their inputs before the first run starts,
+/// and did so one after another, so an experiment of N vendor files paid N converter
+/// runs of several minutes each before any search began (perf survey critic item 4).
+/// Each conversion is its own child process writing its own destination under its own
+/// [`ConvertLock`], so running several at once changes nothing but the wall time: the
+/// returned paths, and the files behind them, are what the serial loop produced. An
+/// mzML input passes through without taking a slot.
+///
+/// A failure is reported for the FIRST failing input in input order, as the serial loop
+/// did, and no conversion is started after one has failed. Conversions already running
+/// are allowed to finish, because killing a converter mid-write only leaves a partial
+/// file for the next run to sweep; a finished one is simply reused by that run.
+pub fn ensure_mzml_all(
+    inputs: &[String],
+    cfg: &ConvertConfig,
+    fallback_dir: Option<&Path>,
+) -> Result<Vec<String>> {
+    let vendor = inputs
+        .iter()
+        .filter(|m| detect(m).needs_conversion())
+        .count();
+    let limit = cfg.parallel_conversions.max(1).min(vendor.max(1));
+    if vendor > 1 && limit > 1 {
+        info!(
+            vendor_inputs = vendor,
+            at_once = limit,
+            "convert: converting the vendor inputs concurrently (convert.parallel_conversions)"
+        );
+    }
+    map_bounded(inputs, limit, |m| ensure_mzml(m, cfg, fallback_dir))
+}
+
+/// Apply `f` to every item on at most `limit` threads, returning the results in item
+/// order, or the error of the lowest-index item that failed.
+///
+/// Once any item has failed no further item is started. With `limit <= 1` this is the
+/// plain serial loop, on the calling thread.
+fn map_bounded<T, R, F>(items: &[T], limit: usize, f: F) -> Result<Vec<R>>
+where
+    T: Sync,
+    R: Send,
+    F: Fn(&T) -> Result<R> + Sync,
+{
+    if limit <= 1 || items.len() <= 1 {
+        return items.iter().map(&f).collect();
+    }
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Mutex;
+    let next = AtomicUsize::new(0);
+    let failed = AtomicBool::new(false);
+    let slots: Vec<Mutex<Option<Result<R>>>> = items.iter().map(|_| Mutex::new(None)).collect();
+    std::thread::scope(|scope| {
+        for _ in 0..limit.min(items.len()) {
+            scope.spawn(|| loop {
+                if failed.load(Ordering::SeqCst) {
+                    return;
+                }
+                let i = next.fetch_add(1, Ordering::SeqCst);
+                let Some(item) = items.get(i) else {
+                    return;
+                };
+                let r = f(item);
+                if r.is_err() {
+                    failed.store(true, Ordering::SeqCst);
+                }
+                *slots[i].lock().unwrap_or_else(|p| p.into_inner()) = Some(r);
+            });
+        }
+    });
+    // Items are claimed in index order, so the started items are a prefix of the list
+    // and every failure lies inside it: walking the slots in order meets the
+    // lowest-index error before it can meet a slot that was never started.
+    let mut out = Vec::with_capacity(items.len());
+    for (i, slot) in slots.into_iter().enumerate() {
+        match slot.into_inner().unwrap_or_else(|p| p.into_inner()) {
+            Some(r) => out.push(r?),
+            None => bail!("internal: input {i} was never converted and no earlier one failed"),
+        }
+    }
+    Ok(out)
+}
+
 pub fn ensure_mzml(
     input: &str,
     cfg: &ConvertConfig,
@@ -1314,6 +1399,7 @@ mod tests {
             msconvert: "/definitely/not/here".to_string(),
             msconvert_args: Vec::new(),
             reuse_converted: true,
+            parallel_conversions: 4,
         };
         assert_eq!(ensure_mzml("run.mzML", &cfg, None).unwrap(), "run.mzML");
     }
@@ -1518,6 +1604,7 @@ mod tests {
             msconvert: "auto".to_string(),
             msconvert_args: Vec::new(),
             reuse_converted: false,
+            parallel_conversions: 4,
         };
         let err = ensure_mzml(raw.to_str().unwrap(), &cfg, Some(&d)).unwrap_err();
         let msg = err.to_string();
@@ -1583,5 +1670,106 @@ mod tests {
         assert!(!stem_is_ambiguous(&e, "sample", &only));
         let _ = std::fs::remove_dir_all(&d);
         let _ = std::fs::remove_dir_all(&e);
+    }
+
+    #[test]
+    fn bounded_conversion_keeps_input_order_and_the_concurrency_bound() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let items: Vec<usize> = (0..12).collect();
+        let live = AtomicUsize::new(0);
+        let peak = AtomicUsize::new(0);
+        let out = map_bounded(&items, 3, |&i| {
+            let now = live.fetch_add(1, Ordering::SeqCst) + 1;
+            peak.fetch_max(now, Ordering::SeqCst);
+            // Later items finish first, so any reordering would show.
+            std::thread::sleep(std::time::Duration::from_millis(30 - 2 * i as u64));
+            live.fetch_sub(1, Ordering::SeqCst);
+            Ok(i * 10)
+        })
+        .unwrap();
+        assert_eq!(out, (0..12).map(|i| i * 10).collect::<Vec<_>>());
+        let peak = peak.load(Ordering::SeqCst);
+        assert!(peak <= 3, "at most `limit` at once, saw {peak}");
+        assert!(
+            peak >= 2,
+            "the bound is a bound, not a serial loop: saw {peak}"
+        );
+    }
+
+    #[test]
+    fn bounded_conversion_reports_the_first_failure_in_input_order_and_stops() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let items: Vec<usize> = (0..40).collect();
+        let started = AtomicUsize::new(0);
+        let err = map_bounded(&items, 4, |&i| {
+            started.fetch_add(1, Ordering::SeqCst);
+            // Item 5 fails slowly, item 6 fails at once: the reported error must still be
+            // item 5's, as the serial loop would have reported.
+            match i {
+                5 => {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    bail!("input 5 failed")
+                }
+                6 => bail!("input 6 failed"),
+                // Slow enough that the other workers cannot claim every remaining item
+                // before item 6's failure is seen.
+                _ => {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    Ok(i)
+                }
+            }
+        })
+        .unwrap_err();
+        assert_eq!(err.to_string(), "input 5 failed");
+        assert!(
+            started.load(Ordering::SeqCst) < items.len(),
+            "no conversion may start after one has failed"
+        );
+        // Serial (limit 1) stops at the first failure too.
+        let n = AtomicUsize::new(0);
+        let err = map_bounded(&items, 1, |&i| {
+            n.fetch_add(1, Ordering::SeqCst);
+            if i == 2 {
+                bail!("two")
+            }
+            Ok(i)
+        })
+        .unwrap_err();
+        assert_eq!(err.to_string(), "two");
+        assert_eq!(n.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn converting_many_inputs_returns_the_serial_paths_in_order() {
+        // Reused conversions and mzML inputs, which need no converter, through the
+        // concurrent entry point: the paths must be exactly the serial loop's.
+        let d = tmp("ensure-all");
+        let mut inputs = Vec::new();
+        for name in ["a", "b", "c"] {
+            let raw = d.join(format!("{name}.raw"));
+            std::fs::write(&raw, b"x").unwrap();
+            inputs.push(raw.to_string_lossy().into_owned());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        for name in ["a", "b", "c"] {
+            std::fs::write(d.join(format!("{name}.mzML")), b"converted").unwrap();
+        }
+        inputs.insert(1, "plain.mzML".to_string());
+        let cfg = ConvertConfig {
+            thermo_raw_parser: "/definitely/not/here".to_string(),
+            msconvert: "/definitely/not/here".to_string(),
+            msconvert_args: Vec::new(),
+            reuse_converted: true,
+            parallel_conversions: 3,
+        };
+        let serial: Vec<String> = inputs
+            .iter()
+            .map(|m| ensure_mzml(m, &cfg, Some(&d)).unwrap())
+            .collect();
+        let concurrent = ensure_mzml_all(&inputs, &cfg, Some(&d)).unwrap();
+        assert_eq!(serial, concurrent);
+        assert_eq!(concurrent[1], "plain.mzML");
+        assert!(concurrent[3].ends_with("c.mzML"), "{}", concurrent[3]);
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

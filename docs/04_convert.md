@@ -639,6 +639,21 @@ For a directory input the newest mtime *inside* the directory is used, one level
 deep, because a `.d` directory's own mtime does not necessarily change when a
 contained acquisition file is rewritten.
 
+`run` and `run-experiment` convert every vendor input before the first run starts.
+They used to do so one file after another, so an experiment of N `.raw` files paid N
+converter runs of several minutes each before any search began. `raw::ensure_mzml_all`
+now converts up to `convert.parallel_conversions` files at once (default 4; `1` is the
+old serial loop). Each conversion is its own child process writing its own
+destination under its own lock, so the returned paths and the files behind them are
+the ones the serial loop produced; only the wall time changes. The paths keep the
+input order, a failure is reported for the first failing input in that order, and no
+conversion starts after one has failed. The bound exists because a converter reads a
+multi-GB file and writes a larger one, and more concurrent conversions than the disk
+can feed are slower, not faster. A reused mzML costs no slot worth mentioning, so the
+setting only matters on the first conversion of an input. Not measured at scale: to
+size it on a new host, time the conversion phase of one experiment at `1` and at the
+default.
+
 ### Peak picking
 
 ThermoRawFileParser is invoked with `-f 2` (indexed mzML, which is what msconvert
