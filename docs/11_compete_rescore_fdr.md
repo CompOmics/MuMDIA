@@ -280,13 +280,15 @@ Its fields are wall-clock milliseconds:
 |---|---|
 | `keys_ms` | footer open, the streamed key columns (`label`, `prelim_score`, `peak_rank`, the grouping columns) and the sort of the `(key, row)` array |
 | `resolve_ms` | the unique-evidence estimate (that mode only) and `resolve_competition` |
-| `write_ms` | writing the competed table and its `<out>.schema.json` |
+| `write_ms` | writing the competed table and its `<out>.schema.json`; a spliced or rewritten table is hashed during this write (docs/03 "Hash on write") |
 | `audit_ms` | the optional `<out>.compete_audit.parquet` (0 when the audit is off) |
-| `hash_ms` | the blake3 content hash recorded in `<out>.report.json` |
+| `hash_ms` | the blake3 content hash recorded in `<out>.report.json`: near 0 when the hash came from the write or is the features hash of a hard-linked table; a read-back of the file only for a linked or copied table without `features_hash` |
 | `elapsed_ms` | the whole stage |
 
-On a wide features table `write_ms` and `hash_ms` dominate: the keys are a few
-columns, the table is every feature column. The same line names how the table was
+On a wide features table `write_ms` dominates: the keys are a few columns, the
+table is every feature column, and the hash of a spliced or rewritten table is
+computed while it is written. `hash_ms` is large only for a standalone compete
+that links or copies the features file without being given its hash. The same line names how the table was
 published (`publish`, next section).
 
 ### compete: how the competed table is published
