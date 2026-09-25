@@ -26,7 +26,7 @@ recipe use `Extended`.
 
 | path | role |
 |---|---|
-| `rust/mumdia/crates/mumdia/src/stages/features.rs` | stage entry point, `run`, `Evidence`, `build_evidence`, `fragment_features`, boundary detection, `prelim_score`, PIN, schema hash, the Minimal/Rich column lists, and the Extended family registry |
+| `rust/mumdia/crates/mumdia/src/stages/features.rs` | stage entry point, `run`, `Evidence`, `evidence_from` (and its test-only wrapper `build_evidence`), `fragment_features`, boundary detection, `prelim_score`, PIN, schema hash, the Minimal/Rich column lists, and the Extended family registry |
 | `rust/mumdia/crates/mumdia/src/stages/features/similarity.rs` | Extended family: observed-vs-library intensity agreement kernels (64 names) |
 | `rust/mumdia/crates/mumdia/src/stages/features/entropy.rs` | Extended family: spectral-entropy / information-divergence (18 names); also exports the gate kernel `spectral_entropy_similarity_sqrt` |
 | `rust/mumdia/crates/mumdia/src/stages/features/coelution.rs` | Extended family: fragment-vs-reference and pairwise co-elution + cross-correlation (38 names) |
@@ -70,6 +70,16 @@ optional; falls back to `frag_mz`), `predicted_intensity` (f32), `rt`
 `ms1_` are routed to a separate `ms1x` map and fed to the MS1 XIC evidence;
 all others are the fragment chromatograms.
 
+Either chromatogram layout is read (docs/15_data_dictionary.md, "Layout v2").
+`ChromStream` passes every v2 row through a `chromatograms::Decoder` before the row
+is stored, so a chunk holds exactly the v1 rows and every feature is the same. The
+main pass starts each chunk at a candidate's first row, where the decoder needs
+nothing earlier. The confident-bounds pass reads sub-chunks on the absolute
+`chunk_rows` grid, which can start inside a row group and inside a candidate. There
+`ChromStream::open_at` opens the table at that row group's first row and follows the
+rows before the sub-chunk through the decoder without keeping them, so the samples
+are v1's in order, bit for bit.
+
 ### Consumed: seed PSMs (optional, `features.rs:620`-`652`)
 
 `candidate_id` (u32), `score` (f64), `spectrum_q` (f64), `label` (str). Builds
@@ -82,9 +92,17 @@ confident-target set (`spectrum_q <= 0.01` and `label == "target"`) used for
 Bookkeeping columns, in order: `candidate_id` (u32), `label` (str),
 `base_peptide_id` (u32), `peptidoform` (str), `protein` (str), `apex_rt` (f64),
 `elution_lo` (f64), `elution_hi` (f64), `precursor_mz` (f64), `prelim_score`
-(f64). Then one `F64` column per name in `active_features(cfg.set)`, in order.
-`elution_lo`/`elution_hi` are the RT bounds the stage actually used (emitted so
-downstream and plotting read them rather than re-derive).
+(f64). `elution_lo`/`elution_hi` are the RT bounds the stage actually used
+(emitted so downstream and plotting read them rather than re-derive). Then one
+column per name in `active_features(cfg.set)`, in order.
+
+Each feature column is `Float32`, holding the f64 value the stage computed
+narrowed by `v as f32`, except the five `F64_FEATURE_COLUMNS` (`charge`,
+`n_matched_fragments`, `unique_fragment_count`, `peak_contested_frac`,
+`contested_frac`), which stay `Float64` because compete or rescore reads them as
+f64 before narrowing. Every classifier narrows every feature to f32 the same way,
+so the scored outputs do not change. `docs/15_data_dictionary.md`
+("features.parquet") has the storage contract and the version-1 layout.
 
 ### Produced: companion + PIN + report
 
@@ -94,8 +112,9 @@ downstream and plotting read them rather than re-derive).
   `SpecId Label ScanNr ExpMass CalcMass <features...> Peptide Proteins`
   (`write_pin`, `features.rs:1537`).
 - `<out>.report.json` (`ArtifactReport`, `features.rs:969`): logical name
-  `features`, schema version 1, `stats` carrying `feature_schema_id`,
-  `n_features`, and `set`; `params` records `set` and
+  `features`, schema version 2 (version 1 stored every feature column as
+  `Float64`; compete and rescore still read it), `stats` carrying
+  `feature_schema_id`, `n_features`, and `set`; `params` records `set` and
   `coelution_corr_threshold` (`features.rs:976`); `content_hash` is the blake3 of
   the features Parquet; `model_identity` is `None`.
 
@@ -119,8 +138,9 @@ Control flow of `run` (`features.rs:548`):
    `peptidoform` (`features.rs:714`-`734`).
 7. In parallel over rows (`features.rs:757`-`808`), compute the two expensive
    per-PSM pieces: `fragment_features` (the Minimal/Rich fragment battery) and,
-   when Extended, `build_evidence` + `extended_values`. Results collect into a
-   `Vec<PerPsm>` indexed by row, preserving order.
+   when Extended, the Evidence (`peak_window`, `PeakTraces`, `evidence_from`) +
+   `extended_values`. Results go into a per-row `FragFeatures` vector and one
+   flat `rows x n_ext` value buffer, both indexed by row, preserving order.
 8. Serially assemble `fmap` (name -> per-row value vector), `prelim`, and the
    elution bounds (`features.rs:810`-`905`). The serial loop reads `per[i]` and
    pushes each named value with the `push` closure (`features.rs:738`).
@@ -209,8 +229,9 @@ averagine differs from the `0.000594` used by the Extended `ms1` family
 
 ### The Evidence struct (`features.rs:293`)
 
-`build_evidence` (`features.rs:360`) constructs the per-PSM `Evidence` handed to
-every Extended family. It mirrors the alignment and peak-bounding of
+`evidence_from` constructs the per-PSM `Evidence` handed to every Extended
+family, from parts the chunked pass builds once per PSM (see the end of this
+section). It mirrors the alignment and peak-bounding of
 `fragment_features` so families see the same elution peak. Fields:
 
 - Time series: `axis` (RT seconds over the detected elution peak), `traces`
@@ -221,17 +242,48 @@ every Extended family. It mirrors the alignment and peak-bounding of
   `obs_apex` (intensity at the apex scan; `> 0` defines "matched"), `is_b`,
   `ordinal`, `frag_charge`, `frag_mz` (theoretical), `frag_obs_mz` (intensity-
   weighted observed), `mass_err_ppm` (signed ppm).
-- `apex_rt` is set inside `build_evidence` itself (`features.rs:517`) from its
-  `apex_rt` argument, not by the caller.
+- `apex_rt` is set inside `evidence_from` itself from its `apex_rt` argument,
+  not by the caller.
 - Scalars filled by the caller after build (`features.rs:784`-`798`):
   `rt_pred_cal`, `rt_err` (via `calibrated_rt_error`), `gradient`,
   `precursor_mz`, `charge`, `seq_len`, `n_matched`, `n_predicted`, `seed_score`,
   `seed_identified`, `apex_intensity` (plus the MS1 apex isotopes below,
   `features.rs:795`-`798`). All start at a zero/`None` default set by
-  `build_evidence` (`features.rs:517`-`533`).
+  `evidence_from`.
 - MS1: `ms1_mono`/`ms1_iso1`/`ms1_iso2`/`ms1_isom1` (apex isotope intensities,
   `None` when no MS1) and `ms1_xic` (the `[mono,+1,+2]` XICs resampled onto
   `axis`; empty unless the extract stage persisted `ms1_*` chromatogram rows).
+  A row that samples `axis_full` itself (what extract writes: the fragments'
+  window grid) is sliced directly; any other grid goes through the RT-keyed map.
+- `ref_profile_full` (the raw-weighted reference over the whole window) and
+  `pair_stats` (see "Per-PSM shared statistics" below).
+
+In the chunked pass the parts are built once per PSM and shared with
+`fragment_features`: `apex_intensities` (the nearest-apex intensity per row),
+`peak_window` (the elution-peak window; global half-widths or the walk down the
+smoothed top-3 profile), and `PeakTraces` (the window, the sliced traces, both
+reference profiles and a `PairStats`). `evidence_from` then assembles the
+Evidence from them. `build_evidence` is a test-only (`#[cfg(test)]`) wrapper
+that builds those parts and calls `evidence_from` in one step; a release build
+has no `build_evidence`.
+
+#### Per-PSM shared statistics (`PairStats`)
+
+Several readers computed the same correlations from the same peak traces:
+`fragment_features` and `coelution` both built the pair Pearson matrix and every
+pair's lag-optimised cross-correlation, `ion_series` and `nonzero` read subsets
+of that matrix, four readers correlated every fragment with `ref_profile`, and
+two correlated every full-window trace with `ref_profile_full`. `PairStats`
+holds each of these once: the `k x k` Pearson matrix (1.0 on the diagonal), the
+cross-correlation for `a < b`, the per-trace norms, and the reference and
+full-window reference correlations. Every entry comes from the kernel call the
+reader made, on the same arguments in the same order, so a read equals the
+computation it replaces bit for bit. A reader uses the cache only when
+`PairStats::fits` matches its evidence (and, for the full-window values, only
+when it reads `ref_profile_full` itself rather than a rebuild); otherwise it
+computes the value, which is what the test fixtures (`pair_stats: None`)
+exercise. `fragment_features` borrows the shared window only when
+`bound_features` is set, because without it it scores the whole window.
 
 `parse_ion` (`features.rs:346`) parses `b3`, `y7`, `b3^2` into
 `(is_b, ordinal, charge)`.
@@ -565,14 +617,22 @@ a real-peptide-width window centred on its apex rather than one it can widen or
 narrow. With fewer than 20 anchors the stage logs a warning and falls back to
 per-candidate boundary detection for that run. When the flag is false, every
 candidate detects its own peak boundary from its top-3-predicted-fragment
-profile (the legacy path). The same `global_bounds` argument threads into both
-`fragment_features` and `build_evidence`, so Minimal/Rich and Extended see the
+profile (the legacy path). The same `global_bounds` argument threads into
+`peak_window`, which sets the window of both `fragment_features` (under
+`bound_features`) and the Extended Evidence, so Minimal/Rich and Extended see the
 identical window.
 
 ## The shared stats kernel (`stats.rs`)
 
 One implementation of `pearson`, `cosine`, `spectral_angle`, used by
-`fragment_features` and every family (do not reimplement). `pearson`
+`fragment_features` and every family (do not reimplement). Two faster forms of
+`pearson` return its value bit for bit: `pearson_vs(a, r, &Centered::new(r))`
+correlates many vectors with one reference centred once, and
+`pearson_pairs(rows, out)` produces every pair `a < b` from rows centred once,
+four covariances at a time. Both reproduce `pearson`'s operations exactly (the
+mean by the same `iter().sum()` over the same count, deviations and squares
+accumulated from 0.0 in ascending order) and hand a length mismatch to `pearson`
+itself. `pearson`
 (`stats.rs:6`) is population Pearson with a zero-variance guard returning 0.0
 for `n < 2` or zero variance. `cosine` (`stats.rs:29`) returns 0.0 if either
 vector is all-zero. `spectral_angle` (`stats.rs:44`) is
@@ -582,7 +642,29 @@ Pearson, Spearman via `pearson` on average ranks, Kendall tau, windowed cross-
 correlation via `super::best_xcorr`, `features.rs:1484`, which returns the best
 normalized correlation and its integer lag over `[-maxlag, maxlag]` as
 `(lag_of_max, value.max(0.0))`), but the base Pearson/cosine call the shared
-functions.
+functions. `best_xcorr_normed` takes the two norms (`xcorr_norm`) so a pair
+matrix computes each once; at the lag window every caller uses (5) it
+accumulates the 11 lags side by side (`lag_dots`), each lag's terms still in
+ascending order, so the result is the per-lag loop's bit for bit.
+
+The per-PSM order statistics (`peak_snr`'s median and MAD, the `log_sn` noise
+median, `coelution`'s median and IQR) are taken by selection
+(`order_stat`, `median_select`, `quantile_select`), not by sorting a copy;
+under `f64::total_cmp` every order statistic is unique bit for bit, so the
+values are those of the sorted copy. The interference power iteration stops as
+soon as its 100th iterate is known exactly (a bitwise fixed point, or a bitwise
+period-2 cycle whose parity gives it), and `order_consistency` ranks each scan
+column once.
+
+Measured single-threaded on one pinned P-core over a 60,000-PSM HYE-shaped
+fixture (`write_kernel_bench_fixture`, minimum of 5-7 interleaved runs, a
+desktop shared with other builds): the per-PSM compute went from 6.76 s to
+5.24 s over the seven kernel changes (MS1 slice -2.3%, lag-parallel
+cross-correlation -6.2%, centred Pearson -3 to -8%, selection -4.4%, power
+iteration -1.9%, rank cache within noise, shared statistics -6.1%). Every
+change leaves the features table byte-identical; the golden digests
+`extended_features_match_the_pre_permutation_build` and
+`production_shaped_features_match_the_pre_kernel_build` pin the values.
 
 ## Configuration
 
@@ -599,15 +681,81 @@ variant no longer exists).
 | `set` | `Minimal` | which set `active_features` returns (Minimal 14 / Rich 44 / Extended 381) |
 | `coelution_corr_threshold` | 0.9 | threshold for `n_coelution_above` (count of pairwise fragment correlations at or above it) |
 | `prec_tol_ppm` | 20.0 | precursor tolerance carried for feature bookkeeping |
-| `bound_features` | true | restrict trace-based features to the elution peak instead of the whole extracted window; **gates only the Minimal/Rich `fragment_features` path** (Extended `build_evidence` always peak-bounds, see gotchas) |
+| `bound_features` | true | restrict trace-based features to the elution peak instead of the whole extracted window; **gates only the Minimal/Rich `fragment_features` path** (the Extended Evidence always peak-bounds, see gotchas) |
 | `bound_peak_fraction` | 1/3 | peak-boundary threshold as a fraction of apex height (DIA-NN-style; matched DIA-NN RT bounds best) |
 | `bound_peak_grace` | 0 | consecutive sub-threshold scans to bridge before stopping (0 = stop at first miss; 1 bridges a single-scan dip) |
 | `bound_from_confident` | true | learn one global left/right half-width from the confident seed set and apply it to every candidate; false = per-candidate detection |
 | `bound_confident_pct` | 50.0 | percentile of the confident-set half-widths taken as the global half-width (50 = median) |
+| `chrom_loaders` | 3 | chromatogram decode threads in the main pass, an upper bound that `--threads` and the chunk count also cap (see "The chunked pass" below); changes time and memory only, never a value or a byte of the features table |
 
 Note that the fragment tolerance used inside `mass_accuracy` is a hardcoded
 `FRAG_TOL_PPM = 20.0` (`mass_accuracy.rs:44`), not `prec_tol_ppm`; Evidence does
 not carry the configured fragment tolerance.
+
+## The chunked pass: loaders, computation, writer
+
+`run_chunked` processes the run in chunks planned up front from the
+`candidate_id` columns (`plan_chunks`; a chunk closes at `CHUNK_CHROM_ROWS`
+chromatogram rows or `CHUNK_PSM_ROWS` PSM rows and never cuts a candidate). Each
+chunk passes three stages on their own threads:
+
+1. **Loaders.** `features.chrom_loaders` threads (default 3) each claim the next
+   unclaimed chunk, open that chunk's row span of the chromatogram table
+   (`TableFile::span`) and decode it into a `ChromChunk` with a fragment-name
+   table of its own (`load_chunk`). A loader may claim chunk `j` only while
+   `j < taken + loaders`, where `taken` counts the chunks the computation has
+   taken, so at most `chrom_loaders + 1` chunks are resident; one loader is the
+   previous single-loader bound of two. The setting is an upper bound: a pass
+   runs no more loaders than it has chunks or than the engine's thread pool has
+   threads (`main_loaders_wanted`), so `--threads 1` decodes on one loader as it
+   did before the loaders were parallel. Loaders beyond the first come from a
+   process-wide pool of four (`MAIN_LOADER_EXTRAS`), so concurrent bands or runs
+   share it rather than multiply it.
+2. **Computation.** The calling thread takes the chunks strictly in table order
+   (`ChunkLoader::take`), runs the per-PSM kernels in parallel (rayon), then
+   assembles the value matrix and the output columns serially.
+3. **Writer.** One thread encodes the previous chunk's columns
+   (`TableWriter::write_cols`) and publishes the table only after the commit
+   marker.
+
+Because a chunk's rows are fixed by the plan and the computation takes chunks in
+order, every `write_cols` call receives the same columns at every loader count:
+the features table is byte-identical.
+`the_loader_count_moves_no_byte_of_the_features_table` checks 1, 2, 3 and 7
+loaders exactly (bypassing the shared pool, so no arm can quietly run one) and
+the production leased path, on a chromatogram table with 64-row groups so that
+chunk spans start inside a row group, cover several and share a boundary group
+with the next chunk, and with one PSM per chunk for the zero-row chunks. A
+failed chunk is handed over in order like any other, so the error surfaces at
+the same chunk as with one loader; a loader panic stops the pass, and the
+computation reports that no loader is left rather than waiting (the thread scope
+then re-raises the panic, as it did for the single loader). Both are tested with
+an injected failure at chunk 3 while chunk 2 is still decoding on another
+loader: chunks 0 to 2 arrive intact and in order, then the failure, and no table
+is published (`a_loader_failure_reaches_the_computation_in_chunk_order_and_never_hangs`,
+`a_loader_failure_mid_pass_publishes_nothing`).
+
+Every pass logs one `features: pass timers` line: loader busy and blocked time
+(summed over loaders), the computation's wait for the loaders, per-PSM compute,
+serial assembly, the wait for the writer, writer busy and idle time, and a
+`binding` hint naming the busiest stage per thread. A large
+`wait_for_loader_ms` with a small `loader_blocked_ms` means the pass is
+decode-bound; a large `wait_for_writer_ms` means the encoder binds.
+
+Measured on the local desktop (32 threads, shared with other builds, so single
+runs carry noise):
+
+| input | loaders | wall | binding | notes |
+|---|---|---|---|---|
+| Astral 15-min run, 522,237 PSMs, ~8 points per trace, 8 chunks | 1 | 7.6 s | writer | loader busy 5.3 s, compute 2.0 s, assembly 3.1 s, writer 6.8 s |
+| same | 3 | 8.2-8.5 s | writer | no gain: the encoder binds |
+| HYE-shaped fixture (`write_kernel_bench_fixture`, 400,000 PSMs, 150-240-point traces, 7 chunks) | 1 | 25.0-26.2 s | loader | loader busy 24 s |
+| same | 3 | 13.3-13.6 s | compute / writer | peak working set 1.83 -> 3.23 GiB |
+
+So the loaders pay where traces are long (a 2 h gradient, the immunopeptidomics
+windows). Where the encoder binds they buy nothing and cost memory plus some
+contention with the writer (the Astral run was 0.6-0.9 s slower at 3 loaders);
+set `chrom_loaders: 1` there if that matters.
 
 ## Invariants, determinism, gotchas
 
@@ -641,7 +789,8 @@ not carry the configured fragment tolerance.
   leave the features at 0.0.
 - `bound_features` gates only the Minimal/Rich `fragment_features` path
   (`features.rs:1286`): when false, that path scores over the whole extracted
-  window. The Extended `build_evidence` (`features.rs:360`) takes no such flag
+  window. The Extended Evidence build (`peak_window`, `PeakTraces`,
+  `evidence_from`) takes no such flag
   and always peak-bounds `axis`/`traces` while still retaining
   `axis_full`/`traces_full`, so Extended families read whichever window they
   name regardless of `bound_features`, and `global_bounds` from
@@ -658,7 +807,9 @@ not carry the configured fragment tolerance.
   `(name, values)` to `FAMILIES` (`features.rs:52`). Appending at the end keeps
   all prior schema positions stable. Reuse `crate::stats` and the parent helpers
   (`mean`, `normalize_sum`, `best_xcorr`, `smooth3`, `peak_bounds`) rather than
-  reimplementing kernels. Add an arity unit test (`values(&e).len() ==
+  reimplementing kernels. A family that needs a pair correlation, a pair
+  cross-correlation or a fragment-vs-reference correlation should read it from
+  `e.pair_stats` when `PairStats::fits` holds, and compute it otherwise. Add an arity unit test (`values(&e).len() ==
   NAMES.len()`) and a degenerate-evidence finiteness test.
 - To add a Minimal/Rich feature: append the name to `MINIMAL_FEATURES` or
   `RICH_EXTRA` and push its value in the serial loop (`features.rs:820`); make

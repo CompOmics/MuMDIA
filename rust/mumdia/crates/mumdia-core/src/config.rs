@@ -997,6 +997,19 @@ pub struct ExtractConfig {
     /// window), so the elution profile drops to zero between peaks and the
     /// features-stage boundary calling is not misled by interpolated gaps.
     pub emit_window_grid: bool,
+    /// On-disk layout of `chromatograms.parquet` (docs/15_data_dictionary.md). `1`, the
+    /// default, stores every row's retention-time axis and its whole trace, zero-filled over
+    /// the candidate's window in window-grid mode. `2` stores the axis once per candidate per
+    /// parquet row group (`rt_axis`) and each trace from its first to its last nonzero value
+    /// (`intensity_trimmed`), with two extra columns (`trace_offset`, `trace_len`) that
+    /// rebuild it. Every reader (features, quant, the pool) accepts both layouts and rebuilds
+    /// the same rows bit for bit, so every table downstream of extract is byte-identical;
+    /// only the chromatogram table changes (smaller, with a different content hash). Opt-in
+    /// because a reader outside the engine, or an engine binary from before v2, reads only
+    /// `rt` and `intensity` and stops at their absence from a v2 table;
+    /// `mumdia::chromatograms::rewrite` converts a table between the layouts. The pool
+    /// splices band tables of one layout only, so all bands of a grouped run share it.
+    pub chromatogram_schema: u32,
     /// m/z bucket size (power of two).
     pub bucket_size: usize,
     /// How a shared observed peak's intensity is apportioned among co-isolated,
@@ -1149,6 +1162,7 @@ impl Default for ExtractConfig {
             apex_count_window: 1,  // no rolling smoothing by default (opt-in; window 5
             // cuts AIF apex misassignment, median |dRT| 131s->9s)
             emit_window_grid: true, // zero-filled window-grid chromatograms
+            chromatogram_schema: 1, // full axis and trace on every row (v2 is opt-in)
             bucket_size: 8192,
             peak_claim: PeakClaim::None,
             claim_cues: ClaimCues::default(),
@@ -1262,6 +1276,24 @@ pub struct FeaturesConfig {
     /// overlaps the existing `ms1_isotope_cosine_apex`, so it is opt-in and
     /// benchmark-gated rather than default-on (AlphaDIA-plan item 12).
     pub ms1_precursor_features: bool,
+    /// Chromatogram decode threads in the main feature pass. The pass decodes the
+    /// chromatogram table one chunk at a time while the features of the chunk before are
+    /// computed; with one loader the whole decode ran on a single core, which bound the
+    /// stage whenever decoding a chunk took longer than computing one (measured on an
+    /// 8-12-mer immunopeptidomics run before the decode overlapped the computation: 3.7 of
+    /// a 4-minute stage were the load). Each loader reads its own chunk from that chunk's
+    /// row span, and the computation takes the chunks in table order, so the chunks, every
+    /// feature value and the features table bytes are the same at every setting; only the
+    /// time and the memory move. The pass holds up to `chrom_loaders + 1` decoded chunks
+    /// (0.92 GiB of traces each at the HYE benchmark shape, docs/27 section 3.4), where one
+    /// loader held two. The value is an upper bound: a pass never runs more loaders than
+    /// `--threads` (the engine's thread pool) or than it has chunks, so `--threads 1` decodes
+    /// on one loader as before. Loaders beyond each pass's first come from a process-wide
+    /// pool of four, so concurrent bands or runs (`groups.parallel`,
+    /// `experiment.parallel_runs`) share that pool instead of multiplying it. Default 3; `1`
+    /// restores the single loader and `0` is read as `1`. A memory knob and a speed knob,
+    /// not a sensitivity knob.
+    pub chrom_loaders: usize,
 }
 impl Default for FeaturesConfig {
     fn default() -> Self {
@@ -1281,6 +1313,7 @@ impl Default for FeaturesConfig {
             bound_from_confident: true, // fixed feature window from confident-seed norm
             bound_confident_pct: 50.0, // median confident half-width
             ms1_precursor_features: false, // opt-in; overlaps ms1_isotope_cosine_apex
+            chrom_loaders: 3,
         }
     }
 }
@@ -1919,6 +1952,28 @@ pub enum Handoff {
     /// Parquet, so a mokapot run falls back to `Tsv` with a warning instead of failing.
     #[default]
     Parquet,
+    /// Opt-in: the features as one row-major little-endian f32 `.npy` matrix, beside a
+    /// small parquet of the metadata columns and a `<name>.raw.json` description (feature
+    /// names, per-feature min/max, the parquet handoff's row-group size) that the worker is
+    /// given.
+    ///
+    /// The engine streams each decoded batch straight into the file with no transpose and
+    /// no parquet encode, and the worker copies the matrix into its own with no decode and
+    /// no column-to-row transpose: on the 258.75M-row immunopeptidomics pool the parquet
+    /// path spent an estimated 26 min of serial engine CPU encoding and the worker a
+    /// strided fill of every column. The file is the raw size, 4 bytes a value, about 11%
+    /// more than the snappy parquet there, so it pays where the codec, not the disk, is the
+    /// limit (a RAM-backed `MUMDIA_SIDECAR_DIR`, an SSD). Features that compress well make
+    /// the gap much larger: docs/13 has a table where the raw write was the slower one, so
+    /// measure on the data first.
+    ///
+    /// Scores are byte-identical to `Parquet`: the worker fills the same matrix and sums
+    /// the float64 moments over the same partition (the description carries the row-group
+    /// size), and drops the same constant columns. Validate a new host by rescoring one
+    /// pool with each handoff, same seed and threads, and comparing `psms_scored.parquet`
+    /// byte for byte (`tests/python/test_nn_rescore_worker.py` does it on a fixture).
+    /// nn_torch only; a mokapot run falls back to `Tsv` with a warning.
+    Raw,
 }
 
 /// Options for the experiment-wide orchestrator (`mumdia run-experiment`).
@@ -1974,8 +2029,10 @@ pub struct ExperimentConfig {
     /// `threads`, which moves the adapted library in the last bits unless the DeepLC thread
     /// cap binds both counts to the same number (on an SMT host with `N` below the
     /// logical-minus-physical core count it does). Float-equivalent, hence opt-in. The
-    /// fronts' seeds hold their library and fragment index beside the DeepLC worker, which
-    /// is where the experiment's peak can sit. Not measured at scale.
+    /// fronts keep the ungrouped experiment's phase order: every conversion first, then one
+    /// seed library and fragment index for all of their seeds (run 1 seeds on its own
+    /// load before the overlap starts). That library is held beside the DeepLC worker while
+    /// the fronts seed, which is where the experiment's peak can sit. Not measured at scale.
     pub overlap_front_threads: usize,
 }
 
@@ -2121,6 +2178,48 @@ pub struct GroupsConfig {
     /// be re-featured; the chromatograms and competed tables that `mumdia pool
     /// --groups-dir` re-pools from are kept.
     pub delete_band_intermediates: bool,
+    /// Write the run's pooled `psms_competed.parquet`. Default `true`. With `false`, rescore
+    /// reads the bands' own competed tables in band order, each with the run's `source`,
+    /// and the pooled copy is not written: one full write and read of the run's widest
+    /// artifact less (about 83 GB per run on the immunopeptidomics experiment). This
+    /// happens only where it cannot change a result: the bands' library row spans must be
+    /// disjoint, so no candidate was searched in two bands and there is no overlap
+    /// duplicate to drop, and neither the candidate audit (`extract.emit_candidate_audit`)
+    /// nor match-between-runs (`mbr.strategy`), which read the pooled table, may be on.
+    /// Otherwise the table is pooled as with `true`, and the log says why.
+    ///
+    /// `psms_scored.parquet` is byte-identical either way; what changes is the artifact
+    /// set. The run's manifest then has no pooled `psms_competed` record, the scored
+    /// table's report lists the band tables under `competed_inputs` with their
+    /// `competed_sources`, and a later standalone `mumdia rescore` or audit needs the table
+    /// rebuilt first with `mumdia pool --groups-dir`, which the band tables allow. Validate
+    /// on a grouped run by comparing `psms_scored.parquet` byte for byte against a run with
+    /// the default.
+    pub pool_competed: bool,
+    /// Write the run's pooled `chromatograms.parquet`. Default `true`. With `false`, quant
+    /// reads the bands' own chromatogram tables in band order, dropping from each the
+    /// candidates the pool's overlap dedup gave to another band, and the pooled copy is not
+    /// written: one full splice write, hash and read of the run's largest artifact less
+    /// (about 68 GB per run on the immunopeptidomics experiment). The pool writes those
+    /// loser sets to `groups/overlap_losers.parquet` (`band`, `candidate_id`, with the band
+    /// tables it belongs to named in its footer), so a later `mumdia quant --chromatograms
+    /// <band tables> --overlap-losers <that file>` reads the same rows, and refuses band
+    /// tables that are not the named ones in their order. Unlike `pool_competed` this holds
+    /// for overlapping bands as well, including an overlap candidate compete deleted in one
+    /// band (the losers are found in the chromatogram tables themselves), and nothing but
+    /// quant reads the pooled table (the candidate audit and match-between-runs do not).
+    ///
+    /// The quant tables are byte-identical either way; what changes is the artifact set.
+    /// There is no pooled `chromatograms.parquet` (one an earlier run left in the
+    /// directory is removed) and no manifest record for it, `overlap_losers.parquet` is
+    /// written and recorded instead, and the quant report's `chromatograms` lists the band
+    /// tables with `chromatogram_dropped_candidates`. The band chromatogram tables are then
+    /// the run's only chromatograms, so the band directories are no longer disposable once
+    /// the run is accepted: deleting them loses re-quantification. `mumdia pool
+    /// --groups-dir` rebuilds the pooled table from them. Validate on a grouped run by
+    /// comparing `peptide_quant.parquet`, `protein_group_quant.parquet` and
+    /// `fragment_quant.parquet` byte for byte against a run with the default.
+    pub pool_chromatograms: bool,
 }
 impl Default for GroupsConfig {
     fn default() -> Self {
@@ -2131,6 +2230,8 @@ impl Default for GroupsConfig {
             rt_adaptation: GroupRtAdaptation::PerBand,
             balance: GroupBalance::Precursors,
             delete_band_intermediates: false,
+            pool_competed: true,
+            pool_chromatograms: true,
         }
     }
 }
@@ -2248,6 +2349,13 @@ impl Config {
                  behaviour; K>1 retains up to K peak groups per candidate)."
                     .into(),
             ));
+        }
+        if !(1..=2).contains(&self.extract.chromatogram_schema) {
+            return Err(Invalid(format!(
+                "extract.chromatogram_schema must be 1 (full traces) or 2 (the axis once per \
+                 candidate and trimmed traces), not {}",
+                self.extract.chromatogram_schema
+            )));
         }
         if !self.extract.gate_min_score.is_finite()
             || !(0.0..=1.0).contains(&self.extract.gate_min_score)
@@ -3133,6 +3241,29 @@ mod tests {
             assert!(Config::from_json(ok).is_ok(), "{ok} must be accepted");
         }
         assert!(Config::default().validate().is_ok());
+    }
+
+    #[test]
+    fn chromatogram_schema_accepts_one_and_two_and_names_the_rejected_value_on_one_line() {
+        for ok in [1u32, 2] {
+            let json = format!(r#"{{"extract":{{"chromatogram_schema":{ok}}}}}"#);
+            assert!(Config::from_json(&json).is_ok(), "{json} must be accepted");
+        }
+        for bad in [0u32, 3] {
+            let mut cfg = Config::default();
+            cfg.extract.chromatogram_schema = bad;
+            let msg = cfg.validate().expect_err("must be rejected").to_string();
+            assert!(
+                msg.contains("extract.chromatogram_schema") && msg.contains(&format!("not {bad}")),
+                "{msg}"
+            );
+            // A string continuation must drop the line break and the indentation: no
+            // control characters and no run of spaces inside the sentence.
+            assert!(
+                !msg.contains('\r') && !msg.contains('\n') && !msg.contains("  "),
+                "{msg:?}"
+            );
+        }
     }
 
     #[test]

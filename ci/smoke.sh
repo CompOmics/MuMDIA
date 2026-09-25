@@ -4,7 +4,7 @@
 #   ci/smoke.sh [work_dir]
 #
 # Needs: a built `mumdia` binary (found automatically, or set MUMDIA_BIN) and a
-# Python with pyarrow. No sidecar (arm 5b stands a stub in for the DeepLC worker), no
+# Python with pyarrow. No sidecar (arm 5c stands a stub in for the DeepLC worker), no
 # network, no data file in the repository: the
 # fixture is generated from `test_data/fixture.fasta` and from the library the
 # engine itself builds out of it, so the planted peaks cannot disagree with the
@@ -208,6 +208,42 @@ diff "$work/out_grouped/peptides.tsv" "$work/out_grouped2/peptides.tsv" > /dev/n
     || { echo "two grouped runs of the same input disagree"; exit 1; }
 echo "    ok: 3 bands, $n_ms2 MS2 + $n_ms1 MS1 decodes, $n_grouped peptides, reproducible"
 
+# The same grouped run with the competed rows and the chromatograms left per band
+# (`groups.pool_competed = false`, `groups.pool_chromatograms = false`): rescore reads the
+# three band tables with a table-to-source map instead of the pooled copy, which must give
+# the same scored table byte for byte, and quant reads the three band chromatogram tables
+# with the overlap losers, which must give the same quant tables byte for byte. The
+# fixture's bands do not overlap, so the competed option applies; the log lines and the
+# absent pooled tables prove both did.
+echo "=== smoke: the grouped run with the competed rows and chromatograms left per band"
+sed 's/"calibration": "per_group" }/"calibration": "per_group", "pool_competed": false, "pool_chromatograms": false }/' \
+    "$work/grouped.json" > "$work/grouped_nopool.json"
+grep -q '"pool_competed": false' "$work/grouped_nopool.json" \
+    || { echo "could not derive the pool_competed = false config"; exit 1; }
+grep -q '"pool_chromatograms": false' "$work/grouped_nopool.json" \
+    || { echo "could not derive the pool_chromatograms = false config"; exit 1; }
+"$BIN" run --fasta test_data/fixture.fasta --mzml "$work/fixture.mzML" \
+    --out-dir "$work/out_grouped_nopool" --config "$work/grouped_nopool.json" --threads 4 \
+    > "$work/grouped_nopool.log" 2>&1 \
+    || { tail -30 "$work/grouped_nopool.log"; echo "the grouped run without a pooled competed table failed"; exit 1; }
+grep -q 'the competed rows stay per band' "$work/grouped_nopool.log" \
+    || { echo "groups.pool_competed = false did not leave the competed rows per band"; exit 1; }
+test ! -e "$work/out_grouped_nopool/psms_competed.parquet" \
+    || { echo "a pooled psms_competed.parquet was written under pool_competed = false"; exit 1; }
+cmp -s "$work/out_grouped/psms_scored.parquet" "$work/out_grouped_nopool/psms_scored.parquet" \
+    || { echo "rescoring the band tables changed psms_scored.parquet"; exit 1; }
+grep -q 'the chromatograms stay per band' "$work/grouped_nopool.log" \
+    || { echo "groups.pool_chromatograms = false did not leave the chromatograms per band"; exit 1; }
+test ! -e "$work/out_grouped_nopool/chromatograms.parquet" \
+    || { echo "a pooled chromatograms.parquet was written under pool_chromatograms = false"; exit 1; }
+test -s "$work/out_grouped_nopool/groups/overlap_losers.parquet" \
+    || { echo "the overlap losers were not persisted under pool_chromatograms = false"; exit 1; }
+for f in peptide_quant.parquet protein_group_quant.parquet fragment_quant.parquet peptides.tsv proteins.tsv; do
+    cmp -s "$work/out_grouped/$f" "$work/out_grouped_nopool/$f" \
+        || { echo "quantifying the band chromatogram tables changed $f"; exit 1; }
+done
+echo "    ok: band tables rescored and quantified; psms_scored and the quant tables byte-identical to the pooled run's"
+
 # 4d. Two bands under the default `calibration: global`: the pooled fragment mass
 #     calibration is the one the ungrouped run fitted (docs/33 section 4a). Until
 #     2026-09-25 each band offered only its 2,000 best targets as calibrants, which was
@@ -247,6 +283,101 @@ print("    ok: 2 bands, %d calibrant deviations, frag_tol_ppm %.6g, as ungrouped
       % (two["n_dev"], float(two["frag_tol_ppm"])))
 PYEOF
 
+# 4e. The chromatogram v2 layout (`extract.chromatogram_schema = 2`, docs/15 "Layout v2"):
+#     the RT axis once per candidate per row group, each trace trimmed to its nonzero run.
+#     Every reader rebuilds the v1 rows from it, so every table after extract must be the
+#     v1 run's in `$work/out`, byte for byte, while the chromatogram table says schema 2
+#     and stores its lists as `rt_axis`/`intensity_trimmed`, never as `rt`/`intensity`.
+#     A second v2 run puts a row-group seam at EVERY row (`MUMDIA_CHROM_ROW_GROUP_ROWS=1`,
+#     a test knob that moves only the seams), so no row may take its axis from another
+#     row and every read that starts at a seam must still find one; the same bytes again.
+#     Then the grouped run of 4c under v2, pooled and per band: the pool splices v2 band
+#     tables (re-encoding the groups that hold an overlap loser) and quant reads either.
+echo "=== smoke: chromatograms v2 leave every downstream table byte-identical"
+"$PY" - "$cfg" "$work/chrom_v2.json" <<'PYEOF'
+import json, sys
+c = json.load(open(sys.argv[1], encoding="utf-8"))
+c.setdefault("extract", {})["chromatogram_schema"] = 2
+json.dump(c, open(sys.argv[2], "w", encoding="utf-8"), indent=2)
+PYEOF
+"$BIN" run --fasta test_data/fixture.fasta --mzml "$work/fixture.mzML" \
+    --out-dir "$work/out_chrom_v2" --config "$work/chrom_v2.json" --threads 2 \
+    > "$work/chrom_v2.log" 2>&1 \
+    || { tail -30 "$work/chrom_v2.log"; echo "the chromatograms v2 run failed"; exit 1; }
+MUMDIA_CHROM_ROW_GROUP_ROWS=1 "$BIN" run --fasta test_data/fixture.fasta \
+    --mzml "$work/fixture.mzML" --out-dir "$work/out_chrom_v2_rg1" \
+    --config "$work/chrom_v2.json" --threads 2 > "$work/chrom_v2_rg1.log" 2>&1 \
+    || { tail -30 "$work/chrom_v2_rg1.log"; echo "the v2 run with a seam at every row failed"; exit 1; }
+grep -q 'chromatogram row groups resized' "$work/chrom_v2_rg1.log" \
+    || { echo "MUMDIA_CHROM_ROW_GROUP_ROWS did not reach extract"; exit 1; }
+for d in out_chrom_v2 out_chrom_v2_rg1; do
+    for f in psms_extracted.parquet features.parquet psms_competed.parquet psms_scored.parquet \
+             peptide_quant.parquet protein_group_quant.parquet fragment_quant.parquet \
+             peptides.tsv proteins.tsv; do
+        cmp -s "$work/out/$f" "$work/$d/$f" \
+            || { echo "chromatograms v2 ($d) changed $f"; exit 1; }
+    done
+done
+"$PY" - "$work/grouped.json" "$work/grouped_v2.json" "$work/grouped_nopool_v2.json" <<'PYEOF'
+import json, sys
+c = json.load(open(sys.argv[1], encoding="utf-8"))
+c.setdefault("extract", {})["chromatogram_schema"] = 2
+json.dump(c, open(sys.argv[2], "w", encoding="utf-8"), indent=2)
+c["groups"]["pool_chromatograms"] = False
+json.dump(c, open(sys.argv[3], "w", encoding="utf-8"), indent=2)
+PYEOF
+for arm in grouped_v2 grouped_nopool_v2; do
+    "$BIN" run --fasta test_data/fixture.fasta --mzml "$work/fixture.mzML" \
+        --out-dir "$work/out_$arm" --config "$work/$arm.json" --threads 4 \
+        > "$work/$arm.log" 2>&1 \
+        || { tail -30 "$work/$arm.log"; echo "the grouped chromatograms v2 run ($arm) failed"; exit 1; }
+    for f in psms_scored.parquet peptide_quant.parquet protein_group_quant.parquet \
+             fragment_quant.parquet peptides.tsv proteins.tsv; do
+        cmp -s "$work/out_grouped/$f" "$work/out_$arm/$f" \
+            || { echo "chromatograms v2 changed $f of the grouped run ($arm)"; exit 1; }
+    done
+done
+"$PY" - "$work" <<'PYEOF'
+import json, os, sys
+import pyarrow.parquet as pq
+work = sys.argv[1]
+def rec(d):
+    m = json.load(open(os.path.join(work, d, "manifest.json"), encoding="utf-8"))
+    return m["artifacts"]["chromatograms"]
+def check(ok, what):
+    if not ok:
+        sys.exit("chromatograms v2: " + what)
+v1 = os.path.join(work, "out", "chromatograms.parquet")
+v2 = os.path.join(work, "out_chrom_v2", "chromatograms.parquet")
+rg1 = os.path.join(work, "out_chrom_v2_rg1", "chromatograms.parquet")
+check(rec("out")["schema_version"] == 1, "the default run no longer records schema 1")
+for d in ("out_chrom_v2", "out_chrom_v2_rg1", "out_grouped_v2"):
+    check(rec(d)["schema_version"] == 2, f"{d} does not record chromatograms schema 2")
+f1, f2, fr = pq.ParquetFile(v1), pq.ParquetFile(v2), pq.ParquetFile(rg1)
+names = lambda f: f.schema_arrow.names
+V1_LISTS = {"rt", "intensity"}
+V2_COLS = {"rt_axis", "intensity_trimmed", "trace_offset", "trace_len"}
+check(V1_LISTS <= set(names(f1)) and not V2_COLS & set(names(f1)),
+      "the default table is not v1: it lacks rt/intensity or has a v2 column")
+# The v2 lists are renamed so that a reader that knows only v1 stops at the missing `rt`
+# instead of taking an empty axis beside a trimmed trace for an observed row.
+for f, d in ((f2, "out_chrom_v2"), (fr, "out_chrom_v2_rg1")):
+    check(V2_COLS <= set(names(f)) and not V1_LISTS & set(names(f)),
+          f"the {d} table does not have the v2 columns in place of rt/intensity")
+check(f1.metadata.num_rows == f2.metadata.num_rows == fr.metadata.num_rows,
+      "the layouts hold different row counts")
+check(all(fr.metadata.row_group(i).num_rows == 1 for i in range(fr.metadata.num_row_groups)),
+      "MUMDIA_CHROM_ROW_GROUP_ROWS=1 did not put a seam at every row")
+t1 = pq.read_table(v1, columns=["rt", "intensity"])
+t2 = pq.read_table(v2, columns=["rt_axis", "intensity_trimmed"])
+vals = lambda t, c: sum(len(x) for x in t.column(c).to_pylist())
+s1, s2 = os.path.getsize(v1), os.path.getsize(v2)
+print("    ok: %d rows; rt values %d -> %d, intensity values %d -> %d; %d -> %d bytes (%.1f%% smaller)"
+      % (f1.metadata.num_rows, vals(t1, "rt"), vals(t2, "rt_axis"), vals(t1, "intensity"),
+         vals(t2, "intensity_trimmed"), s1, s2, 100.0 * (1 - s2 / s1)))
+PYEOF
+echo "    ok: every table after extract byte-identical to v1, ungrouped (default seams and a seam at every row) and grouped (pooled and per band)"
+
 # 5. The multi-run orchestrator. Nothing tested it: `run-experiment` has a pooled
 #    rescore, a by-source split, per-run quant and a cross-run LFQ that the
 #    single-run path never reaches, and a split that drops rows produces plausible
@@ -266,7 +397,68 @@ cp "$work/fixture.mzML" "$work/fixture_b.mzML"
 "$BIN" report --experiment-dir "$work/exp" --out-dir "$work/exp_report" --q 0.05 \
     > "$work/exp_report.log" 2>&1 || { tail -20 "$work/exp_report.log"; exit 1; }
 
-# 5b. The DeepLC branches of the orchestrators, with a stub worker.
+# 5b. The same experiment with `experiment.parallel_runs = 2`, and one whose second run
+#     cannot be converted.
+#
+#     An ungrouped run-experiment runs in three phases: convert every run, seed every run
+#     against ONE shared seed library, then continue each run's chain. With
+#     parallel_runs > 1 the converts, the seeds (all reading the one lent library) and the
+#     chains run concurrently, which nothing else exercises. Every stage is deterministic
+#     and reads only its own run's inputs, so every parquet and TSV must be the sequential
+#     experiment's, byte for byte (the report JSONs and manifests carry wall clocks and
+#     are left out). Then the documented consequence of the phase order: a conversion
+#     failure of run 2 stops the experiment before run 1 is seeded or extracted, under
+#     both settings.
+echo "=== smoke: run-experiment with parallel_runs = 2, and a failing conversion"
+"$PY" - "$cfg" "$work/exp_par.json" <<'PYEOF'
+import json, sys
+c = json.load(open(sys.argv[1]))
+c.setdefault("experiment", {})["parallel_runs"] = 2
+json.dump(c, open(sys.argv[2], "w"), indent=2)
+PYEOF
+"$BIN" run-experiment --fasta test_data/fixture.fasta \
+    --mzml "$work/fixture.mzML" --mzml "$work/fixture_b.mzML" \
+    --run-names a --run-names b \
+    --out-dir "$work/exp_par" --config "$work/exp_par.json" > "$work/exp_par.log" 2>&1 \
+    || { tail -30 "$work/exp_par.log"; echo "run-experiment with parallel_runs = 2 failed"; exit 1; }
+grep -q "per-run chains in parallel" "$work/exp_par.log" \
+    || { echo "parallel_runs = 2 did not take the parallel path"; exit 1; }
+(cd "$work/exp" && find . -type f \( -name '*.parquet' -o -name '*.tsv' \) | sort) \
+    > "$work/exp_files.txt"
+(cd "$work/exp_par" && find . -type f \( -name '*.parquet' -o -name '*.tsv' \) | sort) \
+    > "$work/exp_par_files.txt"
+diff "$work/exp_files.txt" "$work/exp_par_files.txt" > /dev/null \
+    || { echo "parallel_runs = 2 wrote a different set of tables"; \
+         diff "$work/exp_files.txt" "$work/exp_par_files.txt"; exit 1; }
+n_tables=0
+while read -r f; do
+    cmp -s "$work/exp/$f" "$work/exp_par/$f" \
+        || { echo "parallel_runs = 2 changed $f"; exit 1; }
+    n_tables=$((n_tables + 1))
+done < "$work/exp_files.txt"
+[ "$n_tables" -ge 20 ] \
+    || { echo "only $n_tables experiment tables compared; expected at least 20"; exit 1; }
+printf 'this is not an mzML file\n' > "$work/fixture_bad.mzML"
+for exp_cfg in "$cfg" "$work/exp_par.json"; do
+    rm -rf "$work/exp_fail"
+    if "$BIN" run-experiment --fasta test_data/fixture.fasta \
+        --mzml "$work/fixture.mzML" --mzml "$work/fixture_bad.mzML" \
+        --run-names a --run-names b \
+        --out-dir "$work/exp_fail" --config "$exp_cfg" > "$work/exp_fail.log" 2>&1; then
+        echo "run-experiment accepted an mzML it cannot convert ($exp_cfg)"; exit 1
+    fi
+    grep -q "fixture_bad.mzML" "$work/exp_fail.log" \
+        || { tail -20 "$work/exp_fail.log"; echo "the failure does not name the bad file"; exit 1; }
+    test -s "$work/exp_fail/a/spectra/spectra_ms2.parquet" \
+        || { echo "run a was not converted before run b failed ($exp_cfg)"; exit 1; }
+    for f in seed_psms.parquet psms_extracted.parquet; do
+        [ ! -e "$work/exp_fail/a/$f" ] \
+            || { echo "run a reached $f although run b's conversion failed ($exp_cfg)"; exit 1; }
+    done
+done
+echo "    ok: $n_tables tables byte-identical under parallel_runs = 2; a failed conversion stops before any seed"
+
+# 5c. The DeepLC branches of the orchestrators, with a stub worker.
 #
 #     CI has no DeepLC, so every choice `run_groups` and `run-experiment` make about WHICH
 #     DeepLC call to make, and where its output goes, ran only on a developer machine:
@@ -298,7 +490,7 @@ os.makedirs(site)
 os.makedirs(scripts)
 with open(os.path.join(site, "METADATA"), "w", encoding="utf-8") as fh:
     fh.write("Metadata-Version: 2.1\nName: deeplc\nVersion: 4.5.0\n")
-STUB = r'''"""Stand-in for deeplc_finetune.py in ci/smoke.sh (arm 5b). No DeepLC, no torch."""
+STUB = r'''"""Stand-in for deeplc_finetune.py in ci/smoke.sh (arm 5c). No DeepLC, no torch."""
 import json, os, shutil, sys
 import pyarrow.parquet as pq
 

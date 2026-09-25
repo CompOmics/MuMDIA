@@ -63,14 +63,14 @@ pub fn target_decoy_q(scores: &[(f64, bool)]) -> Vec<f64> {
 /// columns separately, so this makes the two kernels consistent rather than adding a
 /// convention.
 ///
-/// Five call sites are still on the pair form, and the largest of them is the pooled PSM q
-/// over the whole scored table (`stages/rescore.rs:685`, `:753`, `:1273`,
-/// `stages/search_seed.rs:158`, `stages/seed_pool.rs:166`), where the staging buffer is
-/// 186 MB at 11.6M rows -- bigger than the one this form was introduced to remove. They
-/// should move too; they are outside the file set of the change that added this, which is
-/// why they have not. Note that this is a saving left on the table, NOT a divergence
-/// hazard: both entry points are one-line wrappers over `target_decoy_q_core` below and
-/// there is no second copy of the estimator to drift.
+/// Rescore's three call sites have moved off the pair form: the pooled PSM q and the
+/// per-source q read the columns through this form, and the grouped q through
+/// [`target_decoy_q_by`]. The largest was the pooled PSM q over the whole scored table,
+/// whose staging buffer is 186 MB at 11.6M rows and 4.1 GB at the 258.75M-row
+/// immunopeptidomics pool. Two remain on it (`stages/search_seed.rs`, `stages/seed_pool.rs`).
+/// That is a saving left on the table, NOT a divergence hazard: every entry point is a
+/// one-line wrapper over `target_decoy_q_core` below and there is no second copy of the
+/// estimator to drift.
 pub fn target_decoy_q_split(scores: &[f64], is_decoy: &[bool]) -> Vec<f64> {
     assert_eq!(
         scores.len(),
@@ -82,7 +82,16 @@ pub fn target_decoy_q_split(scores: &[f64], is_decoy: &[bool]) -> Vec<f64> {
     target_decoy_q_core(scores.len(), |i| (scores[i], is_decoy[i]))
 }
 
-/// Shared body of the two forms above: everything below depends on the input only through
+/// [`target_decoy_q`] over `n` rows whose `(score, is_decoy)` pair `row(i)` returns.
+///
+/// Identical kernel, identical output; for a caller whose rows are fields of something
+/// else (rescore's picked groups), which would otherwise copy them into an `n * 16` byte
+/// pair buffer only to have it walked once into the kernel's own records.
+pub fn target_decoy_q_by(n: usize, row: impl Fn(usize) -> (f64, bool)) -> Vec<f64> {
+    target_decoy_q_core(n, row)
+}
+
+/// Shared body of the forms above: everything below depends on the input only through
 /// `(score, is_decoy)` per row.
 fn target_decoy_q_core(n: usize, row: impl Fn(usize) -> (f64, bool)) -> Vec<f64> {
     if n == 0 {

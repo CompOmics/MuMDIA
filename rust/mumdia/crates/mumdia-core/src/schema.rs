@@ -25,13 +25,36 @@ pub mod artifact {
     pub const SEED_PSMS: (&str, u32) = ("seed_psms", 1);
     pub const RUN_WINDOWS: (&str, u32) = ("run_windows", 1);
     pub const PSMS_EXTRACTED: (&str, u32) = ("psms_extracted", 2);
+    /// v1: every row stores its whole `rt` axis and its whole `intensity` trace.
     pub const CHROMATOGRAMS: (&str, u32) = ("chromatograms", 1);
-    pub const FEATURES: (&str, u32) = ("features", 1);
-    pub const PSMS_COMPETED: (&str, u32) = ("psms_competed", 3);
+    /// v2, written only under `extract.chromatogram_schema = 2`: the axis once per candidate
+    /// per row group (`rt_axis`), each trace trimmed to its nonzero run (`intensity_trimmed`),
+    /// and `trace_offset` / `trace_len` to rebuild it (`mumdia::chromatograms`). Every reader
+    /// in the engine accepts both; the renamed lists make a v1-only reader fail on v2.
+    pub const CHROMATOGRAMS_V2: (&str, u32) = ("chromatograms", 2);
+    /// v2: the feature columns are Float32 except the few `F64_FEATURE_COLUMNS` of
+    /// `stages/features.rs`; v1 stored every feature as Float64. Every reader accepts both.
+    pub const FEATURES: (&str, u32) = ("features", 2);
+    /// v4: the feature columns are stored as in `features` v2; v3 stored every feature as
+    /// Float64. Every reader accepts both, and compete given a v1 features table writes v4.
+    pub const PSMS_COMPETED: (&str, u32) = ("psms_competed", 4);
     pub const PSMS_SCORED: (&str, u32) = ("psms_scored", 4);
     pub const PEPTIDE_QUANT: (&str, u32) = ("peptide_quant", 2);
     pub const PROTEIN_GROUP_QUANT: (&str, u32) = ("protein_group_quant", 2);
     pub const FRAGMENT_QUANT: (&str, u32) = ("fragment_quant", 1);
     /// Cross-run MaxLFQ table, written only by `run-experiment` and `quant-lfq`.
     pub const LFQ_MAXLFQ: (&str, u32) = ("lfq_maxlfq", 1);
+    /// The candidates a grouped run's pool dropped from each band (`band`,
+    /// `candidate_id`), written only under `groups.pool_chromatograms = false`.
+    pub const OVERLAP_LOSERS: (&str, u32) = ("overlap_losers", 1);
+
+    /// The chromatogram schema for `extract.chromatogram_schema`: [`CHROMATOGRAMS_V2`] for 2,
+    /// else [`CHROMATOGRAMS`] (config validation admits only 1 and 2).
+    pub fn chromatograms(schema: u32) -> (&'static str, u32) {
+        if schema == CHROMATOGRAMS_V2.1 {
+            CHROMATOGRAMS_V2
+        } else {
+            CHROMATOGRAMS
+        }
+    }
 }

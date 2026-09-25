@@ -35,7 +35,7 @@ The crate is declared in `lib.rs:6-13` (`config`, `constants`, `error`,
 | `rust/mumdia/crates/mumdia-core/src/config.rs` | All config structs + every strategy enum; `Config::from_json`, `validate`, `apply_profile`, `canonical_json` (1585 lines) |
 | `rust/mumdia/crates/mumdia-core/src/constants.rs` | Physical constants (`PROTON`, `WATER`, `AMMONIA`, `ISOTOPE_SPACING`), `residue_mass`, `mass_to_mz`, ppm predicates |
 | `rust/mumdia/crates/mumdia-core/src/mass.rs` | `unimod_mass`, `IonType`, `Fragment`, `ParsedPeptidoform`, `parse_peptidoform`, b/y fragment generation |
-| `rust/mumdia/crates/mumdia-core/src/schema.rs` | Frozen `(name, version)` ids for every artifact; `PSMS_SCORED` is v4, `PSMS_COMPETED` is v3, `PSMS_EXTRACTED`/`PEPTIDE_QUANT`/`PROTEIN_GROUP_QUANT` are v2, all others v1 |
+| `rust/mumdia/crates/mumdia-core/src/schema.rs` | Frozen `(name, version)` ids for every artifact; `PSMS_SCORED` and `PSMS_COMPETED` are v4, `FEATURES`/`PSMS_EXTRACTED`/`PEPTIDE_QUANT`/`PROTEIN_GROUP_QUANT` are v2, all others v1 |
 | `rust/mumdia/crates/mumdia-core/src/manifest.rs` | `Manifest` + `ArtifactRecord` (provenance) |
 | `rust/mumdia/crates/mumdia-core/src/types.rs` | `Peak`, `IsolationWindow`, `Label`, `Ms2Scan` |
 | `rust/mumdia/crates/mumdia-core/src/rejection.rs` | `RejectionReason` ladder for the candidate-audit table |
@@ -65,8 +65,12 @@ crates read and write. Two things it owns appear on disk:
 `logical_name`, `path`, `format` (always `"parquet"`), `schema_name`,
 `schema_version`, `rows`, `content_hash` (blake3 of the file bytes),
 `producing_stage`, `config_hash`. Built by `record_artifact`
-(`mumdia-io/src/lib.rs:20-39`), which hashes the written Parquet file with
-`blake3_file` (`hash.rs:8-20`, streamed in 64 KiB chunks).
+(`mumdia-io/src/lib.rs:83-101`), which hashes the written Parquet file with
+`blake3_file` (`hash.rs:14-26`, streamed in 64 KiB chunks), or by
+`record_artifact_with_hash` (`lib.rs:107-127`) from a hash the caller already
+has. The writers of the large artifacts compute the same digest while they
+write (`HashingWrite`, docs/03_io_layer.md "Hash on write"), and their stages
+record that digest instead of reading the file back.
 
 **`ArtifactReport`** / `<artifact>.report.json` (`report.rs:11-24`) is written
 alongside each artifact by its producing stage, not by core: `logical_name`,
@@ -96,6 +100,7 @@ id into the Parquet file itself).
 | `RUN_WINDOWS` | `run_windows` | 1 |
 | `PSMS_EXTRACTED` | `psms_extracted` | **2** |
 | `CHROMATOGRAMS` | `chromatograms` | 1 |
+| `CHROMATOGRAMS_V2` | `chromatograms` | **2** (only under `extract.chromatogram_schema = 2`) |
 | `FEATURES` | `features` | 1 |
 | `PSMS_COMPETED` | `psms_competed` | **3** |
 | `PSMS_SCORED` | `psms_scored` | **4** |
@@ -790,6 +795,7 @@ requiring entrapment/target-decoy FDR validation before use.
 | `bound_from_confident` | `true` | learn one global peak width from confident seed PSMs |
 | `bound_confident_pct` | 50.0 | percentile of confident half-widths as the shared width |
 | `ms1_precursor_features` | `false` | **default-off** MS1 apex-isotope feature `ms1_isotope_height_corr`; it overlaps the existing `ms1_isotope_cosine_apex`, so it is opt-in. The name stays in the battery either way and returns 0.0 when off, so the vector length does not change |
+| `chrom_loaders` | 3 | chromatogram decode threads in the main feature pass, capped by `--threads` and by the chunk count. Changes time and memory only, never a value or a byte of the features table. The pass holds up to `chrom_loaders + 1` decoded chunks (about 0.92 GiB of traces each at the HYE shape, docs/27 section 3.4); `1` restores the previous single loader and its two resident chunks |
 
 ### `CompeteConfig` (config.rs:825-851)
 
@@ -926,10 +932,14 @@ stale.
 - **Second mod at the same position accumulates** (`mass.rs:235`), which is a
   behavior difference from engines that drop it; terminal mods are separate
   fields, not part of `mods[i]`.
-- **Correctness changes have bumped five schemas.** `PSMS_EXTRACTED`,
-  `PEPTIDE_QUANT`, and `PROTEIN_GROUP_QUANT` are v2; `PSMS_COMPETED` is v3;
-  `PSMS_SCORED` is v4. Other registry entries remain v1. Readers must honor the
-  registry rather than assume one version globally.
+- **Six schemas have been bumped.** `FEATURES`, `PSMS_EXTRACTED`,
+  `PEPTIDE_QUANT`, and `PROTEIN_GROUP_QUANT` are v2; `PSMS_COMPETED` and
+  `PSMS_SCORED` are v4. The earlier bumps were correctness changes. The
+  `FEATURES` bump (v2) and the latest `PSMS_COMPETED` bump (v4) changed only the
+  stored width: the feature columns are `Float32` except the five
+  `F64_FEATURE_COLUMNS`, and no value the classifier sees changed. Other
+  registry entries remain v1. Readers must honor the registry rather than assume
+  one version globally.
 - **`content_hash` is the file's blake3, not the logical content.** Any byte
   change (compression, column order) changes the hash; it is a change detector,
   not a canonical-content identity.

@@ -47,9 +47,8 @@ fn qcell(q: f64) -> String {
     }
 }
 
-/// The match-between-runs acceptance basis of every row: the flag and the q it was
-/// accepted at, or all-false and all-NaN when the table has never been through
-/// `mumdia mbr`.
+/// The match-between-runs flag of every row, or `None` when the table has never been
+/// through `mumdia mbr`.
 ///
 /// Absent means absent; present means readable. A present column of the wrong type used
 /// to be swallowed by an `Err(_) => vec![false; n]` arm, so a boolean written as a
@@ -57,64 +56,117 @@ fn qcell(q: f64) -> String {
 /// removed EVERY transfer from both TSVs at exit 0, indistinguishable from an MBR run
 /// that transferred nothing while the parquet still showed them (docs/31 F2). This is the
 /// absent-versus-malformed rule `quant` and `audit` already follow.
-fn transfer_columns(t: &TableFile, n: usize) -> Result<(Vec<bool>, Vec<f64>)> {
-    let flag = if t.has_column("is_transferred") {
-        t.bool("is_transferred").with_context(|| {
-            "report: `is_transferred` is present but not a boolean column; it is written by \
-             `mumdia mbr` and decides which rows are reported"
-        })?
-    } else {
-        vec![false; n]
-    };
-    let q = if t.has_column("transfer_q") {
-        t.f64("transfer_q")
-            .with_context(|| "report: `transfer_q` is present but not a float column")?
-    } else {
-        vec![f64::NAN; n]
-    };
-    if flag.len() != n || q.len() != n {
+fn transfer_flag(t: &TableFile) -> Result<Option<Vec<bool>>> {
+    if !t.has_column("is_transferred") {
+        return Ok(None);
+    }
+    let flag = t.bool("is_transferred").with_context(|| {
+        "report: `is_transferred` is present but not a boolean column; it is written by \
+         `mumdia mbr` and decides which rows are reported"
+    })?;
+    if flag.len() != t.nrows {
         anyhow::bail!(
-            "report: the transfer columns have {} and {} rows against {n} scored rows",
+            "report: the transfer flag has {} rows against {} scored rows",
             flag.len(),
-            q.len()
+            t.nrows
         );
     }
-    Ok((flag, q))
+    Ok(Some(flag))
+}
+
+/// The q each of `rows` was transferred at, or NaN for every row when the table has no
+/// `transfer_q` column. A present column must be a float column (see [`transfer_flag`]).
+fn transfer_q_rows(t: &TableFile, rows: &[usize]) -> Result<Vec<f64>> {
+    if !t.has_column("transfer_q") {
+        return Ok(vec![f64::NAN; rows.len()]);
+    }
+    t.f64_rows("transfer_q", rows)
+        .with_context(|| "report: `transfer_q` is present but not a float column")
+}
+
+/// Pass 1 of a report: the rows it can print, ascending, and their transfer flags.
+///
+/// A report prints a row only when it is a target that was transferred or has one of
+/// `q_cols` at or below the threshold (the `accepted` rule of both reports; a NaN q fails
+/// `<=`, as it does there). Everything else only fed the two full sorts. On the
+/// 258.75M-row pooled immunopeptidomics table, holding four string columns for every row
+/// was ~55 GB and a billion allocations to print ~10^5 rows. This reads `label`, the flag
+/// and the q columns as bits and a fold, 3 bytes a row, so pass 2 reads the printed
+/// columns for the returned rows only.
+fn printable_rows(
+    t: &TableFile,
+    q_cols: &[&str],
+    q_threshold: f64,
+) -> Result<(Vec<usize>, Vec<bool>)> {
+    let n = t.nrows;
+    let target = t.str_eq("label", "target")?;
+    let flag = transfer_flag(t)?;
+    let mut hit = vec![false; n];
+    for name in q_cols {
+        t.visit_f64(name, |first, v| {
+            let Some(slot) = hit.get_mut(first..first + v.len()) else {
+                anyhow::bail!("report: column '{name}' has more rows than the table's {n}");
+            };
+            for (h, &q) in slot.iter_mut().zip(v) {
+                *h |= q <= q_threshold;
+            }
+            Ok(())
+        })?;
+    }
+    if target.len() != n {
+        anyhow::bail!("report: `label` has {} rows against {n}", target.len());
+    }
+    let rows: Vec<usize> = (0..n)
+        .filter(|&i| target[i] && (flag.as_ref().is_some_and(|f| f[i]) || hit[i]))
+        .collect();
+    let flags = match &flag {
+        Some(f) => rows.iter().map(|&i| f[i]).collect(),
+        None => vec![false; rows.len()],
+    };
+    Ok((rows, flags))
 }
 
 /// Write peptides.tsv + proteins.tsv from a scored PSM table. Returns
 /// (n_peptides, n_protein_groups) at the FDR threshold.
+///
+/// Two passes (`printable_rows`): the rows that can be printed first, then their printed
+/// columns only. The loops below run over those rows in file order, and `sort_by` is
+/// stable, so sorting them by q gives exactly their order in the stable sort of all rows
+/// that the one-pass report did; the rows it skipped were never written, so both TSVs
+/// are byte-identical to its output.
 pub fn run(p: ReportParams) -> Result<(u64, u64)> {
     let t = TableFile::open(p.scored)?;
-    let pform = t.str("peptidoform")?;
-    let charge = t.i32("charge")?;
-    let protein = t.str("protein")?;
-    let label = t.str("label")?;
-    let pep_q = t.f64("peptide_q_value")?;
-    let pg = t.str("protein_group")?;
-    let pg_q = t.f64("pg_q_value")?;
-    let score = t.f64("score")?;
-    let n = t.nrows;
     // Match-between-runs acceptance, when this table has been through `mumdia mbr`.
     // MBR lowers the three PSM-level q columns and neither of the two grouped columns
     // this stage filters on, so without this a `mumdia mbr` followed by `mumdia report`
     // showed no transfers at all. Same contract as `quant`: a transfer has already
     // passed `mbr.q_transfer`, and a decoy is still never reported.
-    let (is_transferred, transfer_q) = transfer_columns(&t, n)?;
-    let accepted =
-        |i: usize, q: &[f64]| label[i] == "target" && (is_transferred[i] || q[i] <= p.q_threshold);
+    let (rows, is_transferred) =
+        printable_rows(&t, &["peptide_q_value", "pg_q_value"], p.q_threshold)?;
+    let pform = t.str_rows("peptidoform", &rows)?;
+    let charge = t.i32_rows("charge", &rows)?;
+    let protein = t.str_rows("protein", &rows)?;
+    let pep_q = t.f64_rows("peptide_q_value", &rows)?;
+    let pg = t.str_rows("protein_group", &rows)?;
+    let pg_q = t.f64_rows("pg_q_value", &rows)?;
+    let score = t.f64_rows("score", &rows)?;
+    let transfer_q = transfer_q_rows(&t, &rows)?;
+    let m = rows.len();
+    // Every printable row is a target (pass 1), so this is the one-pass rule
+    // `label == "target" && (is_transferred || q <= threshold)` on them.
+    let accepted = |j: usize, q: &[f64]| is_transferred[j] || q[j] <= p.q_threshold;
     // The acceptance basis is exported with every row (`is_transferred`, `transfer_q`),
     // because the rule above is otherwise invisible in the TSV: a transferred row keeps
     // its grouped q, usually 1.0, and a tighter threshold does not revoke a transfer that
     // already passed `mbr.q_transfer` (docs/29 #19). A transfer is a peptide-level
     // acceptance and not protein-group confidence; a group admitted through one carries
     // the flag so a reader can tell.
-    let transfer_cells = |i: usize| -> String {
-        if is_transferred[i] {
-            let q = if transfer_q[i].is_nan() {
+    let transfer_cells = |j: usize| -> String {
+        if is_transferred[j] {
+            let q = if transfer_q[j].is_nan() {
                 String::new()
             } else {
-                format!("{:.6}", transfer_q[i])
+                format!("{:.6}", transfer_q[j])
             };
             format!("\ttrue\t{q}")
         } else {
@@ -145,7 +197,7 @@ pub fn run(p: ReportParams) -> Result<(u64, u64)> {
     };
 
     // Peptides, best q first, unique by (peptidoform, charge).
-    let mut order: Vec<usize> = (0..n).collect();
+    let mut order: Vec<usize> = (0..m).collect();
     order.sort_by(|&a, &b| pep_q[a].total_cmp(&pep_q[b]));
     let mut seen: HashSet<(String, i32)> = HashSet::new();
     let mut seen_strip: HashSet<String> = HashSet::new();
@@ -165,12 +217,12 @@ pub fn run(p: ReportParams) -> Result<(u64, u64)> {
          is_transferred\ttransfer_q"
     )?;
     let mut npep = 0u64;
-    for &i in &order {
-        if !accepted(i, &pep_q) {
+    for &j in &order {
+        if !accepted(j, &pep_q) {
             continue;
         }
-        seen_strip.insert(strip(&pform[i]));
-        let key = (pform[i].clone(), charge[i]);
+        seen_strip.insert(strip(&pform[j]));
+        let key = (pform[j].clone(), charge[j]);
         if !seen.insert(key.clone()) {
             continue;
         }
@@ -178,14 +230,14 @@ pub fn run(p: ReportParams) -> Result<(u64, u64)> {
         writeln!(
             w,
             "{}\t{}\t{}\t{}\t{:.6}\t{:.4}\t{}{}",
-            pform[i],
-            strip(&pform[i]),
-            charge[i],
-            protein[i],
-            pep_q[i],
-            score[i],
+            pform[j],
+            strip(&pform[j]),
+            charge[j],
+            protein[j],
+            pep_q[j],
+            score[j],
             qcell(qv),
-            transfer_cells(i)
+            transfer_cells(j)
         )?;
         npep += 1;
     }
@@ -194,7 +246,7 @@ pub fn run(p: ReportParams) -> Result<(u64, u64)> {
     pep_target.publish()?;
 
     // Protein groups, best q first, unique.
-    let mut porder: Vec<usize> = (0..n).collect();
+    let mut porder: Vec<usize> = (0..m).collect();
     porder.sort_by(|&a, &b| pg_q[a].total_cmp(&pg_q[b]));
     let mut pseen: HashSet<String> = HashSet::new();
     let prot_target = mumdia_io::table::AtomicPath::new(p.out_proteins)?;
@@ -204,21 +256,21 @@ pub fn run(p: ReportParams) -> Result<(u64, u64)> {
         "protein_group\tq_value\tquantity\tis_transferred\ttransfer_q"
     )?;
     let mut nprot = 0u64;
-    for &i in &porder {
-        if !accepted(i, &pg_q) || pg[i].is_empty() {
+    for &j in &porder {
+        if !accepted(j, &pg_q) || pg[j].is_empty() {
             continue;
         }
-        if !pseen.insert(pg[i].clone()) {
+        if !pseen.insert(pg[j].clone()) {
             continue;
         }
-        let qv = prot_quant.get(&pg[i]).copied().unwrap_or(f64::NAN);
+        let qv = prot_quant.get(&pg[j]).copied().unwrap_or(f64::NAN);
         writeln!(
             w2,
             "{}\t{:.6}\t{}{}",
-            pg[i],
-            pg_q[i],
+            pg[j],
+            pg_q[j],
             qcell(qv),
-            transfer_cells(i)
+            transfer_cells(j)
         )?;
         nprot += 1;
     }
@@ -230,6 +282,8 @@ pub fn run(p: ReportParams) -> Result<(u64, u64)> {
         precursors = npep,
         stripped_sequences = seen_strip.len() as u64,
         protein_groups = nprot,
+        printable_rows = m,
+        scored_rows = t.nrows,
         "report: done (peptides.tsv rows are precursors, not stripped sequences)"
     );
     Ok((npep, nprot))
@@ -265,6 +319,8 @@ pub struct ExperimentReportParams<'a> {
 /// on its own `run_psm_q`, and one quantity column per run: `quantity_<run>` for
 /// precursors (each run's own quant), `lfq_<run>` for protein groups (the cross-run
 /// MaxLFQ matrix). Returns (n_precursors, n_protein_groups) at the threshold.
+///
+/// Read in two passes, as [`run`] is, with byte-identical output.
 pub fn run_experiment(p: ExperimentReportParams) -> Result<(u64, u64)> {
     let n_runs = p.run_names.len();
     if !p.peptide_quants.is_empty() && p.peptide_quants.len() != n_runs {
@@ -274,32 +330,39 @@ pub fn run_experiment(p: ExperimentReportParams) -> Result<(u64, u64)> {
         );
     }
     let t = TableFile::open(p.scored)?;
-    let pform = t.str("peptidoform")?;
-    let charge = t.i32("charge")?;
-    let protein = t.str("protein")?;
-    let label = t.str("label")?;
-    let pep_q = t.f64("peptide_q_value")?;
-    let pg = t.str("protein_group")?;
-    let pg_q = t.f64("pg_q_value")?;
-    let score = t.f64("score")?;
-    let source = t.u32("source")?;
-    let run_q = t.f64("run_psm_q")?;
-    let n = t.nrows;
-    let (is_transferred, transfer_q) = transfer_columns(&t, n)?;
-    let accepted =
-        |i: usize, q: &[f64]| label[i] == "target" && (is_transferred[i] || q[i] <= p.q_threshold);
+    // Two passes, as in `run`: the printable rows (a target, transferred or at the
+    // threshold on the experiment-wide peptide or protein-group q, or on its own
+    // `run_psm_q` for `n_runs`), then their printed columns only.
+    let (rows, is_transferred) = printable_rows(
+        &t,
+        &["peptide_q_value", "pg_q_value", "run_psm_q"],
+        p.q_threshold,
+    )?;
+    let pform = t.str_rows("peptidoform", &rows)?;
+    let charge = t.i32_rows("charge", &rows)?;
+    let protein = t.str_rows("protein", &rows)?;
+    let pep_q = t.f64_rows("peptide_q_value", &rows)?;
+    let pg = t.str_rows("protein_group", &rows)?;
+    let pg_q = t.f64_rows("pg_q_value", &rows)?;
+    let score = t.f64_rows("score", &rows)?;
+    let source = t.u32_rows("source", &rows)?;
+    let run_q = t.f64_rows("run_psm_q", &rows)?;
+    let transfer_q = transfer_q_rows(&t, &rows)?;
+    let m = rows.len();
+    // Every printable row is a target, so this is the one-pass rule on them.
+    let accepted = |j: usize, q: &[f64]| is_transferred[j] || q[j] <= p.q_threshold;
     // The acceptance basis is exported with every row (`is_transferred`, `transfer_q`),
     // because the rule above is otherwise invisible in the TSV: a transferred row keeps
     // its grouped q, usually 1.0, and a tighter threshold does not revoke a transfer that
     // already passed `mbr.q_transfer` (docs/29 #19). A transfer is a peptide-level
     // acceptance and not protein-group confidence; a group admitted through one carries
     // the flag so a reader can tell.
-    let transfer_cells = |i: usize| -> String {
-        if is_transferred[i] {
-            let q = if transfer_q[i].is_nan() {
+    let transfer_cells = |j: usize| -> String {
+        if is_transferred[j] {
+            let q = if transfer_q[j].is_nan() {
                 String::new()
             } else {
-                format!("{:.6}", transfer_q[i])
+                format!("{:.6}", transfer_q[j])
             };
             format!("\ttrue\t{q}")
         } else {
@@ -310,24 +373,25 @@ pub fn run_experiment(p: ExperimentReportParams) -> Result<(u64, u64)> {
     // Runs in which each precursor / protein group was identified on its own per-run FDR.
     let mut pep_runs: HashMap<(String, i32), Vec<bool>> = HashMap::new();
     let mut pg_runs: HashMap<String, Vec<bool>> = HashMap::new();
-    for i in 0..n {
-        if !accepted(i, &run_q) {
+    for j in 0..m {
+        if !accepted(j, &run_q) {
             continue;
         }
-        let s = source[i] as usize;
+        let s = source[j] as usize;
         if s >= n_runs {
             anyhow::bail!(
-                "experiment report: row {i} of {} has source {s} but only {n_runs} run names \
+                "experiment report: row {} of {} has source {s} but only {n_runs} run names \
                  were given",
+                rows[j],
                 p.scored
             );
         }
         pep_runs
-            .entry((pform[i].clone(), charge[i]))
+            .entry((pform[j].clone(), charge[j]))
             .or_insert_with(|| vec![false; n_runs])[s] = true;
-        if !pg[i].is_empty() {
+        if !pg[j].is_empty() {
             pg_runs
-                .entry(pg[i].clone())
+                .entry(pg[j].clone())
                 .or_insert_with(|| vec![false; n_runs])[s] = true;
         }
     }
@@ -367,7 +431,7 @@ pub fn run_experiment(p: ExperimentReportParams) -> Result<(u64, u64)> {
     // Precursors: best experiment-wide q first, unique by (peptidoform, charge). The
     // winner carries the grouped q; its copies in other runs carry 1.0 and are skipped
     // here but counted in `n_runs` above.
-    let mut order: Vec<usize> = (0..n).collect();
+    let mut order: Vec<usize> = (0..m).collect();
     order.sort_by(|&a, &b| pep_q[a].total_cmp(&pep_q[b]));
     let mut seen: HashSet<(String, i32)> = HashSet::new();
     let mut seen_strip: HashSet<String> = HashSet::new();
@@ -385,30 +449,34 @@ pub fn run_experiment(p: ExperimentReportParams) -> Result<(u64, u64)> {
     write!(w, "\tis_transferred\ttransfer_q")?;
     writeln!(w)?;
     let mut npep = 0u64;
-    for &i in &order {
-        if !accepted(i, &pep_q) {
+    for &j in &order {
+        if !accepted(j, &pep_q) {
             continue;
         }
-        seen_strip.insert(strip(&pform[i]));
-        let key = (pform[i].clone(), charge[i]);
+        seen_strip.insert(strip(&pform[j]));
+        let key = (pform[j].clone(), charge[j]);
         if !seen.insert(key.clone()) {
             continue;
         }
         write!(
             w,
             "{}\t{}\t{}\t{}\t{:.6}\t{:.4}\t{}",
-            pform[i],
-            strip(&pform[i]),
-            charge[i],
-            protein[i],
-            pep_q[i],
-            score[i],
+            pform[j],
+            strip(&pform[j]),
+            charge[j],
+            protein[j],
+            pep_q[j],
+            score[j],
             count(pep_runs.get(&key))
         )?;
-        for m in &pep_quant {
-            write!(w, "\t{}", qcell(m.get(&key).copied().unwrap_or(f64::NAN)))?;
+        for quant in &pep_quant {
+            write!(
+                w,
+                "\t{}",
+                qcell(quant.get(&key).copied().unwrap_or(f64::NAN))
+            )?;
         }
-        write!(w, "{}", transfer_cells(i))?;
+        write!(w, "{}", transfer_cells(j))?;
         writeln!(w)?;
         npep += 1;
     }
@@ -417,7 +485,7 @@ pub fn run_experiment(p: ExperimentReportParams) -> Result<(u64, u64)> {
     pep_target.publish()?;
 
     // Protein groups: best experiment-wide q first, unique.
-    let mut porder: Vec<usize> = (0..n).collect();
+    let mut porder: Vec<usize> = (0..m).collect();
     porder.sort_by(|&a, &b| pg_q[a].total_cmp(&pg_q[b]));
     let mut pseen: HashSet<String> = HashSet::new();
     let prot_target = mumdia_io::table::AtomicPath::new(p.out_proteins)?;
@@ -431,27 +499,27 @@ pub fn run_experiment(p: ExperimentReportParams) -> Result<(u64, u64)> {
     write!(w2, "\tis_transferred\ttransfer_q")?;
     writeln!(w2)?;
     let mut nprot = 0u64;
-    for &i in &porder {
-        if !accepted(i, &pg_q) || pg[i].is_empty() {
+    for &j in &porder {
+        if !accepted(j, &pg_q) || pg[j].is_empty() {
             continue;
         }
-        if !pseen.insert(pg[i].clone()) {
+        if !pseen.insert(pg[j].clone()) {
             continue;
         }
         write!(
             w2,
             "{}\t{:.6}\t{}",
-            pg[i],
-            pg_q[i],
-            count(pg_runs.get(&pg[i]))
+            pg[j],
+            pg_q[j],
+            count(pg_runs.get(&pg[j]))
         )?;
         if p.protein_lfq.is_some() {
             let none = vec![f64::NAN; n_runs];
-            for x in prot_lfq.get(&pg[i]).unwrap_or(&none) {
+            for x in prot_lfq.get(&pg[j]).unwrap_or(&none) {
                 write!(w2, "\t{}", qcell(*x))?;
             }
         }
-        write!(w2, "{}", transfer_cells(i))?;
+        write!(w2, "{}", transfer_cells(j))?;
         writeln!(w2)?;
         nprot += 1;
     }
@@ -464,6 +532,8 @@ pub fn run_experiment(p: ExperimentReportParams) -> Result<(u64, u64)> {
         stripped_sequences = seen_strip.len() as u64,
         protein_groups = nprot,
         runs = n_runs,
+        printable_rows = m,
+        scored_rows = t.nrows,
         "report: experiment-wide done (rows are precursors selected on the experiment-wide \
          peptide_q_value; n_runs counts per-run acceptances on run_psm_q)"
     );
@@ -474,6 +544,416 @@ pub fn run_experiment(p: ExperimentReportParams) -> Result<(u64, u64)> {
 mod tests {
     use super::*;
     use mumdia_io::table::{write_table, Col};
+
+    // The one-pass report as it was before the two-pass read (Q3 of the 2026-09-25
+    // performance survey), kept verbatim so the tests can compare the TSV bytes.
+    /// The match-between-runs acceptance basis of every row: the flag and the q it was
+    /// accepted at, or all-false and all-NaN when the table has never been through
+    /// `mumdia mbr`.
+    ///
+    /// Absent means absent; present means readable. A present column of the wrong type used
+    /// to be swallowed by an `Err(_) => vec![false; n]` arm, so a boolean written as a
+    /// nullable dtype or as int8 (which `mbr_worker.py` writes through pandas) silently
+    /// removed EVERY transfer from both TSVs at exit 0, indistinguishable from an MBR run
+    /// that transferred nothing while the parquet still showed them (docs/31 F2). This is the
+    /// absent-versus-malformed rule `quant` and `audit` already follow.
+    fn legacy_transfer_columns(t: &TableFile, n: usize) -> Result<(Vec<bool>, Vec<f64>)> {
+        let flag = if t.has_column("is_transferred") {
+            t.bool("is_transferred").with_context(|| {
+                "report: `is_transferred` is present but not a boolean column; it is written by \
+                 `mumdia mbr` and decides which rows are reported"
+            })?
+        } else {
+            vec![false; n]
+        };
+        let q = if t.has_column("transfer_q") {
+            t.f64("transfer_q")
+                .with_context(|| "report: `transfer_q` is present but not a float column")?
+        } else {
+            vec![f64::NAN; n]
+        };
+        if flag.len() != n || q.len() != n {
+            anyhow::bail!(
+                "report: the transfer columns have {} and {} rows against {n} scored rows",
+                flag.len(),
+                q.len()
+            );
+        }
+        Ok((flag, q))
+    }
+
+    /// Write peptides.tsv + proteins.tsv from a scored PSM table. Returns
+    /// (n_peptides, n_protein_groups) at the FDR threshold.
+    fn legacy_run(p: ReportParams) -> Result<(u64, u64)> {
+        let t = TableFile::open(p.scored)?;
+        let pform = t.str("peptidoform")?;
+        let charge = t.i32("charge")?;
+        let protein = t.str("protein")?;
+        let label = t.str("label")?;
+        let pep_q = t.f64("peptide_q_value")?;
+        let pg = t.str("protein_group")?;
+        let pg_q = t.f64("pg_q_value")?;
+        let score = t.f64("score")?;
+        let n = t.nrows;
+        // Match-between-runs acceptance, when this table has been through `mumdia mbr`.
+        // MBR lowers the three PSM-level q columns and neither of the two grouped columns
+        // this stage filters on, so without this a `mumdia mbr` followed by `mumdia report`
+        // showed no transfers at all. Same contract as `quant`: a transfer has already
+        // passed `mbr.q_transfer`, and a decoy is still never reported.
+        let (is_transferred, transfer_q) = legacy_transfer_columns(&t, n)?;
+        let accepted = |i: usize, q: &[f64]| {
+            label[i] == "target" && (is_transferred[i] || q[i] <= p.q_threshold)
+        };
+        // The acceptance basis is exported with every row (`is_transferred`, `transfer_q`),
+        // because the rule above is otherwise invisible in the TSV: a transferred row keeps
+        // its grouped q, usually 1.0, and a tighter threshold does not revoke a transfer that
+        // already passed `mbr.q_transfer` (docs/29 #19). A transfer is a peptide-level
+        // acceptance and not protein-group confidence; a group admitted through one carries
+        // the flag so a reader can tell.
+        let transfer_cells = |i: usize| -> String {
+            if is_transferred[i] {
+                let q = if transfer_q[i].is_nan() {
+                    String::new()
+                } else {
+                    format!("{:.6}", transfer_q[i])
+                };
+                format!("\ttrue\t{q}")
+            } else {
+                "\tfalse\t".to_string()
+            }
+        };
+
+        let pep_quant: HashMap<(String, i32), f64> = match p.peptide_quant {
+            Some(path) => {
+                let q = TableFile::open(path)?;
+                let qp = q.str("peptidoform")?;
+                let qc = q.i32("charge")?;
+                let qq = q.f64("quantity")?;
+                (0..q.nrows)
+                    .map(|i| ((qp[i].clone(), qc[i]), qq[i]))
+                    .collect()
+            }
+            None => HashMap::new(),
+        };
+        let prot_quant: HashMap<String, f64> = match p.protein_quant {
+            Some(path) => {
+                let q = TableFile::open(path)?;
+                let qg = q.str("protein_group")?;
+                let qq = q.f64("quantity")?;
+                (0..q.nrows).map(|i| (qg[i].clone(), qq[i])).collect()
+            }
+            None => HashMap::new(),
+        };
+
+        // Peptides, best q first, unique by (peptidoform, charge).
+        let mut order: Vec<usize> = (0..n).collect();
+        order.sort_by(|&a, &b| pep_q[a].total_cmp(&pep_q[b]));
+        let mut seen: HashSet<(String, i32)> = HashSet::new();
+        let mut seen_strip: HashSet<String> = HashSet::new();
+        // Atomic, like every parquet and json artifact. These two TSVs were the only
+        // outputs still written straight to their final path, so an interruption left a
+        // truncated `peptides.tsv` under the canonical name -- and unlike a truncated
+        // parquet, which fails to open because its footer is missing, a short TSV parses
+        // perfectly and simply has fewer peptides in it. That is the worst failure shape
+        // available: a plausible wrong answer.
+        let pep_target = mumdia_io::table::AtomicPath::new(p.out_peptides)?;
+        let mut w = std::io::BufWriter::new(std::fs::File::create(pep_target.tmp())?);
+        // The row unit here is the precursor (peptidoform + charge), NOT the stripped
+        // sequence; the header and the returned count reflect that.
+        writeln!(
+            w,
+            "precursor\tstripped_sequence\tcharge\tprotein\tq_value\tscore\tquantity\t\
+             is_transferred\ttransfer_q"
+        )?;
+        let mut npep = 0u64;
+        for &i in &order {
+            if !accepted(i, &pep_q) {
+                continue;
+            }
+            seen_strip.insert(strip(&pform[i]));
+            let key = (pform[i].clone(), charge[i]);
+            if !seen.insert(key.clone()) {
+                continue;
+            }
+            let qv = pep_quant.get(&key).copied().unwrap_or(f64::NAN);
+            writeln!(
+                w,
+                "{}\t{}\t{}\t{}\t{:.6}\t{:.4}\t{}{}",
+                pform[i],
+                strip(&pform[i]),
+                charge[i],
+                protein[i],
+                pep_q[i],
+                score[i],
+                qcell(qv),
+                transfer_cells(i)
+            )?;
+            npep += 1;
+        }
+        w.flush()?;
+        drop(w);
+        pep_target.publish()?;
+
+        // Protein groups, best q first, unique.
+        let mut porder: Vec<usize> = (0..n).collect();
+        porder.sort_by(|&a, &b| pg_q[a].total_cmp(&pg_q[b]));
+        let mut pseen: HashSet<String> = HashSet::new();
+        let prot_target = mumdia_io::table::AtomicPath::new(p.out_proteins)?;
+        let mut w2 = std::io::BufWriter::new(std::fs::File::create(prot_target.tmp())?);
+        writeln!(
+            w2,
+            "protein_group\tq_value\tquantity\tis_transferred\ttransfer_q"
+        )?;
+        let mut nprot = 0u64;
+        for &i in &porder {
+            if !accepted(i, &pg_q) || pg[i].is_empty() {
+                continue;
+            }
+            if !pseen.insert(pg[i].clone()) {
+                continue;
+            }
+            let qv = prot_quant.get(&pg[i]).copied().unwrap_or(f64::NAN);
+            writeln!(
+                w2,
+                "{}\t{:.6}\t{}{}",
+                pg[i],
+                pg_q[i],
+                qcell(qv),
+                transfer_cells(i)
+            )?;
+            nprot += 1;
+        }
+        w2.flush()?;
+        drop(w2);
+        prot_target.publish()?;
+
+        tracing::info!(
+            precursors = npep,
+            stripped_sequences = seen_strip.len() as u64,
+            protein_groups = nprot,
+            "report: done (peptides.tsv rows are precursors, not stripped sequences)"
+        );
+        Ok((npep, nprot))
+    }
+
+    /// The experiment-wide report for a pooled rescore: one `peptides.tsv` and one
+    /// `proteins.tsv` for the whole experiment.
+    ///
+    /// Rows are selected on the experiment-wide grouped q columns, the one unit that is
+    /// valid across a pooled rescore: `rescore` writes `peptide_q_value` and `pg_q_value`
+    /// to each group's single experiment-wide winner and 1.0 to the rest, so a per-run
+    /// reading of those columns is diluted by about 1/n_runs and a per-run report is not
+    /// the right shape (the per-run unit is `run_psm_q`). Each row carries `n_runs`, the
+    /// number of runs in which the precursor (protein group) has an accepted target PSM
+    /// on its own `run_psm_q`, and one quantity column per run: `quantity_<run>` for
+    /// precursors (each run's own quant), `lfq_<run>` for protein groups (the cross-run
+    /// MaxLFQ matrix). Returns (n_precursors, n_protein_groups) at the threshold.
+    fn legacy_run_experiment(p: ExperimentReportParams) -> Result<(u64, u64)> {
+        let n_runs = p.run_names.len();
+        if !p.peptide_quants.is_empty() && p.peptide_quants.len() != n_runs {
+            anyhow::bail!(
+                "experiment report: {n_runs} run names but {} per-run quant tables",
+                p.peptide_quants.len()
+            );
+        }
+        let t = TableFile::open(p.scored)?;
+        let pform = t.str("peptidoform")?;
+        let charge = t.i32("charge")?;
+        let protein = t.str("protein")?;
+        let label = t.str("label")?;
+        let pep_q = t.f64("peptide_q_value")?;
+        let pg = t.str("protein_group")?;
+        let pg_q = t.f64("pg_q_value")?;
+        let score = t.f64("score")?;
+        let source = t.u32("source")?;
+        let run_q = t.f64("run_psm_q")?;
+        let n = t.nrows;
+        let (is_transferred, transfer_q) = legacy_transfer_columns(&t, n)?;
+        let accepted = |i: usize, q: &[f64]| {
+            label[i] == "target" && (is_transferred[i] || q[i] <= p.q_threshold)
+        };
+        // The acceptance basis is exported with every row (`is_transferred`, `transfer_q`),
+        // because the rule above is otherwise invisible in the TSV: a transferred row keeps
+        // its grouped q, usually 1.0, and a tighter threshold does not revoke a transfer that
+        // already passed `mbr.q_transfer` (docs/29 #19). A transfer is a peptide-level
+        // acceptance and not protein-group confidence; a group admitted through one carries
+        // the flag so a reader can tell.
+        let transfer_cells = |i: usize| -> String {
+            if is_transferred[i] {
+                let q = if transfer_q[i].is_nan() {
+                    String::new()
+                } else {
+                    format!("{:.6}", transfer_q[i])
+                };
+                format!("\ttrue\t{q}")
+            } else {
+                "\tfalse\t".to_string()
+            }
+        };
+
+        // Runs in which each precursor / protein group was identified on its own per-run FDR.
+        let mut pep_runs: HashMap<(String, i32), Vec<bool>> = HashMap::new();
+        let mut pg_runs: HashMap<String, Vec<bool>> = HashMap::new();
+        for i in 0..n {
+            if !accepted(i, &run_q) {
+                continue;
+            }
+            let s = source[i] as usize;
+            if s >= n_runs {
+                anyhow::bail!(
+                    "experiment report: row {i} of {} has source {s} but only {n_runs} run names \
+                     were given",
+                    p.scored
+                );
+            }
+            pep_runs
+                .entry((pform[i].clone(), charge[i]))
+                .or_insert_with(|| vec![false; n_runs])[s] = true;
+            if !pg[i].is_empty() {
+                pg_runs
+                    .entry(pg[i].clone())
+                    .or_insert_with(|| vec![false; n_runs])[s] = true;
+            }
+        }
+        let count =
+            |v: Option<&Vec<bool>>| v.map(|b| b.iter().filter(|&&x| x).count()).unwrap_or(0);
+
+        // Per-run precursor quantities, one map per run, NaN for an unquantified precursor.
+        let mut pep_quant: Vec<HashMap<(String, i32), f64>> =
+            Vec::with_capacity(p.peptide_quants.len());
+        for path in p.peptide_quants {
+            let q = TableFile::open(path)?;
+            let qp = q.str("peptidoform")?;
+            let qc = q.i32("charge")?;
+            let qq = q.f64("quantity")?;
+            pep_quant.push(
+                (0..q.nrows)
+                    .map(|i| ((qp[i].clone(), qc[i]), qq[i]))
+                    .collect(),
+            );
+        }
+        // Cross-run protein quantities: protein_group -> per-run MaxLFQ value, NaN for none.
+        let mut prot_lfq: HashMap<String, Vec<f64>> = HashMap::new();
+        if let Some(path) = p.protein_lfq {
+            let l = TableFile::open(path)?;
+            let lg = l.str("protein_group")?;
+            let lr = l.i32("run")?;
+            let lq = l.f64("quantity")?;
+            for i in 0..l.nrows {
+                if lr[i] < 0 || lr[i] as usize >= n_runs {
+                    continue;
+                }
+                prot_lfq
+                    .entry(lg[i].clone())
+                    .or_insert_with(|| vec![f64::NAN; n_runs])[lr[i] as usize] = lq[i];
+            }
+        }
+
+        // Precursors: best experiment-wide q first, unique by (peptidoform, charge). The
+        // winner carries the grouped q; its copies in other runs carry 1.0 and are skipped
+        // here but counted in `n_runs` above.
+        let mut order: Vec<usize> = (0..n).collect();
+        order.sort_by(|&a, &b| pep_q[a].total_cmp(&pep_q[b]));
+        let mut seen: HashSet<(String, i32)> = HashSet::new();
+        let mut seen_strip: HashSet<String> = HashSet::new();
+        let pep_target = mumdia_io::table::AtomicPath::new(p.out_peptides)?;
+        let mut w = std::io::BufWriter::new(std::fs::File::create(pep_target.tmp())?);
+        write!(
+            w,
+            "precursor\tstripped_sequence\tcharge\tprotein\tq_value\tscore\tn_runs"
+        )?;
+        if !pep_quant.is_empty() {
+            for name in p.run_names {
+                write!(w, "\tquantity_{name}")?;
+            }
+        }
+        write!(w, "\tis_transferred\ttransfer_q")?;
+        writeln!(w)?;
+        let mut npep = 0u64;
+        for &i in &order {
+            if !accepted(i, &pep_q) {
+                continue;
+            }
+            seen_strip.insert(strip(&pform[i]));
+            let key = (pform[i].clone(), charge[i]);
+            if !seen.insert(key.clone()) {
+                continue;
+            }
+            write!(
+                w,
+                "{}\t{}\t{}\t{}\t{:.6}\t{:.4}\t{}",
+                pform[i],
+                strip(&pform[i]),
+                charge[i],
+                protein[i],
+                pep_q[i],
+                score[i],
+                count(pep_runs.get(&key))
+            )?;
+            for m in &pep_quant {
+                write!(w, "\t{}", qcell(m.get(&key).copied().unwrap_or(f64::NAN)))?;
+            }
+            write!(w, "{}", transfer_cells(i))?;
+            writeln!(w)?;
+            npep += 1;
+        }
+        w.flush()?;
+        drop(w);
+        pep_target.publish()?;
+
+        // Protein groups: best experiment-wide q first, unique.
+        let mut porder: Vec<usize> = (0..n).collect();
+        porder.sort_by(|&a, &b| pg_q[a].total_cmp(&pg_q[b]));
+        let mut pseen: HashSet<String> = HashSet::new();
+        let prot_target = mumdia_io::table::AtomicPath::new(p.out_proteins)?;
+        let mut w2 = std::io::BufWriter::new(std::fs::File::create(prot_target.tmp())?);
+        write!(w2, "protein_group\tq_value\tn_runs")?;
+        if p.protein_lfq.is_some() {
+            for name in p.run_names {
+                write!(w2, "\tlfq_{name}")?;
+            }
+        }
+        write!(w2, "\tis_transferred\ttransfer_q")?;
+        writeln!(w2)?;
+        let mut nprot = 0u64;
+        for &i in &porder {
+            if !accepted(i, &pg_q) || pg[i].is_empty() {
+                continue;
+            }
+            if !pseen.insert(pg[i].clone()) {
+                continue;
+            }
+            write!(
+                w2,
+                "{}\t{:.6}\t{}",
+                pg[i],
+                pg_q[i],
+                count(pg_runs.get(&pg[i]))
+            )?;
+            if p.protein_lfq.is_some() {
+                let none = vec![f64::NAN; n_runs];
+                for x in prot_lfq.get(&pg[i]).unwrap_or(&none) {
+                    write!(w2, "\t{}", qcell(*x))?;
+                }
+            }
+            write!(w2, "{}", transfer_cells(i))?;
+            writeln!(w2)?;
+            nprot += 1;
+        }
+        w2.flush()?;
+        drop(w2);
+        prot_target.publish()?;
+
+        tracing::info!(
+            precursors = npep,
+            stripped_sequences = seen_strip.len() as u64,
+            protein_groups = nprot,
+            runs = n_runs,
+            "report: experiment-wide done (rows are precursors selected on the experiment-wide \
+             peptide_q_value; n_runs counts per-run acceptances on run_psm_q)"
+        );
+        Ok((npep, nprot))
+    }
 
     #[test]
     fn experiment_report_selects_experiment_wide_and_writes_one_column_per_run() {
@@ -989,5 +1469,225 @@ mod tests {
             }
         }
         assert_eq!((quantified, empty), (1, 1));
+    }
+
+    /// A pooled scored table of `n` rows in small row groups, drawn from a fixed-seed
+    /// generator: repeated precursors across runs, decoys, NaN and tied q values, empty
+    /// protein groups, and (when `mbr`) transfers with and without a transfer q.
+    fn random_scored(n: usize, n_runs: u32, mbr: bool) -> String {
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let pool = [
+            "PEPTIDEK",
+            "M[Oxidation]EGVDGHK",
+            "SECONDK",
+            "AAAK",
+            "C[Carbamidomethyl]DEFK",
+            "LATEK",
+            "VVVK",
+            "QQQR",
+        ];
+        let qs = [
+            0.0,
+            0.001,
+            0.005,
+            0.005,
+            0.01,
+            0.0100001,
+            0.2,
+            1.0,
+            f64::NAN,
+        ];
+        let (mut pf, mut ch, mut prot, mut lab, mut pq, mut pg, mut pgq) =
+            (vec![], vec![], vec![], vec![], vec![], vec![], vec![]);
+        let (mut sc, mut src, mut rq, mut tr, mut tq) = (vec![], vec![], vec![], vec![], vec![]);
+        for i in 0..n {
+            let r = next();
+            let decoy = r % 5 == 0;
+            let base = pool[(r >> 8) as usize % pool.len()];
+            let form = if decoy {
+                format!("DECOY_{base}{}", (r >> 16) % 40)
+            } else {
+                format!("{base}{}", (r >> 16) % 40)
+            };
+            pf.push(form);
+            ch.push(2 + ((r >> 24) % 3) as i32);
+            prot.push(format!("P{}", (r >> 28) % 30));
+            lab.push(if decoy { "decoy" } else { "target" }.to_string());
+            pq.push(qs[(r >> 32) as usize % qs.len()]);
+            pg.push(if (r >> 36) % 7 == 0 {
+                String::new()
+            } else {
+                format!("PG{}", (r >> 40) % 25)
+            });
+            pgq.push(qs[(r >> 44) as usize % qs.len()]);
+            sc.push(((r >> 48) % 1000) as f64 / 7.0);
+            // Contiguous runs, as rescore writes them.
+            src.push((i as u64 * n_runs as u64 / n as u64) as u32);
+            rq.push(qs[(next() >> 3) as usize % qs.len()]);
+            let t = mbr && (r >> 52) % 11 == 0;
+            tr.push(t);
+            tq.push(if t && (r >> 56) % 3 != 0 {
+                0.004
+            } else {
+                f64::NAN
+            });
+        }
+        let path = tmp("random_scored.parquet");
+        let mut cols = vec![
+            Col::Str("peptidoform".into(), pf),
+            Col::I32("charge".into(), ch),
+            Col::Str("protein".into(), prot),
+            Col::Str("label".into(), lab),
+            Col::F64("peptide_q_value".into(), pq),
+            Col::Str("protein_group".into(), pg),
+            Col::F64("pg_q_value".into(), pgq),
+            Col::F64("score".into(), sc),
+            Col::U32("source".into(), src),
+            Col::F64("run_psm_q".into(), rq),
+        ];
+        if mbr {
+            cols.push(Col::Bool("is_transferred".into(), tr));
+            cols.push(Col::F64("transfer_q".into(), tq));
+        }
+        let mut w = mumdia_io::table::TableWriter::new(&path).with_row_group_rows(9_973);
+        w.write_cols(cols).unwrap();
+        w.close().unwrap();
+        path
+    }
+
+    /// The two-pass reports write the one-pass reports' bytes: single-run and
+    /// experiment-wide, with and without MBR columns, with quantities, at thresholds that
+    /// print nothing, some rows and almost every row, over more rows than one decode
+    /// batch.
+    #[test]
+    fn the_two_pass_reports_write_the_one_pass_bytes() {
+        let n_runs = 3u32;
+        let names: Vec<String> = (0..n_runs).map(|i| format!("r{i}")).collect();
+        let quants: Vec<String> = (0..n_runs)
+            .map(|r| {
+                let q = tmp(&format!("pq{r}.parquet"));
+                write_table(
+                    &q,
+                    vec![
+                        Col::Str(
+                            "peptidoform".into(),
+                            vec!["PEPTIDEK1".into(), "SECONDK2".into()],
+                        ),
+                        Col::I32("charge".into(), vec![2, 3]),
+                        Col::F64("quantity".into(), vec![10.0 + r as f64, 20.5]),
+                    ],
+                )
+                .unwrap();
+                q
+            })
+            .collect();
+        let lfq = tmp("lfq.parquet");
+        write_table(
+            &lfq,
+            vec![
+                Col::Str("protein_group".into(), vec!["PG1".into(), "PG2".into()]),
+                Col::I32("run".into(), vec![0, 2]),
+                Col::F64("quantity".into(), vec![3.25, 7.0]),
+            ],
+        )
+        .unwrap();
+        for mbr in [false, true] {
+            let scored = random_scored(70_001, n_runs, mbr);
+            for q_threshold in [0.0, 0.01, 1.0] {
+                let out = tmp("two_pass");
+                std::fs::create_dir_all(&out).unwrap();
+                let f = |n: &str| format!("{out}/{n}");
+                let got = run(ReportParams {
+                    scored: &scored,
+                    peptide_quant: Some(&quants[0]),
+                    protein_quant: None,
+                    out_peptides: &f("p1.tsv"),
+                    out_proteins: &f("g1.tsv"),
+                    q_threshold,
+                })
+                .unwrap();
+                let want = legacy_run(ReportParams {
+                    scored: &scored,
+                    peptide_quant: Some(&quants[0]),
+                    protein_quant: None,
+                    out_peptides: &f("p1_old.tsv"),
+                    out_proteins: &f("g1_old.tsv"),
+                    q_threshold,
+                })
+                .unwrap();
+                assert_eq!(got, want, "single run, mbr {mbr}, threshold {q_threshold}");
+                let got_e = run_experiment(ExperimentReportParams {
+                    scored: &scored,
+                    run_names: &names,
+                    peptide_quants: &quants,
+                    protein_lfq: Some(&lfq),
+                    out_peptides: &f("pe.tsv"),
+                    out_proteins: &f("ge.tsv"),
+                    q_threshold,
+                })
+                .unwrap();
+                let want_e = legacy_run_experiment(ExperimentReportParams {
+                    scored: &scored,
+                    run_names: &names,
+                    peptide_quants: &quants,
+                    protein_lfq: Some(&lfq),
+                    out_peptides: &f("pe_old.tsv"),
+                    out_proteins: &f("ge_old.tsv"),
+                    q_threshold,
+                })
+                .unwrap();
+                assert_eq!(
+                    got_e, want_e,
+                    "experiment, mbr {mbr}, threshold {q_threshold}"
+                );
+                for (a, b) in [
+                    ("p1.tsv", "p1_old.tsv"),
+                    ("g1.tsv", "g1_old.tsv"),
+                    ("pe.tsv", "pe_old.tsv"),
+                    ("ge.tsv", "ge_old.tsv"),
+                ] {
+                    let (x, y) = (std::fs::read(f(a)).unwrap(), std::fs::read(f(b)).unwrap());
+                    assert!(
+                        x == y,
+                        "{a} differs from the one-pass report (mbr {mbr}, threshold \
+                         {q_threshold})"
+                    );
+                }
+                if q_threshold == 0.01 {
+                    assert!(got.0 > 0 && got.1 > 0 && got_e.0 > 0, "rows are printed");
+                }
+            }
+        }
+        // A source outside the run names is still refused, at the same row.
+        let scored = random_scored(1_000, 4, false);
+        let e_new = run_experiment(ExperimentReportParams {
+            scored: &scored,
+            run_names: &names,
+            peptide_quants: &[],
+            protein_lfq: None,
+            out_peptides: &tmp("x1.tsv"),
+            out_proteins: &tmp("x2.tsv"),
+            q_threshold: 0.01,
+        })
+        .unwrap_err()
+        .to_string();
+        let e_old = legacy_run_experiment(ExperimentReportParams {
+            scored: &scored,
+            run_names: &names,
+            peptide_quants: &[],
+            protein_lfq: None,
+            out_peptides: &tmp("x3.tsv"),
+            out_proteins: &tmp("x4.tsv"),
+            q_threshold: 0.01,
+        })
+        .unwrap_err()
+        .to_string();
+        assert_eq!(e_new, e_old);
     }
 }

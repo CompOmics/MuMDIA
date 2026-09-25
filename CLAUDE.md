@@ -422,9 +422,11 @@ sections 10-16:
   identifications. Under `rescore.strict` (the production setting) with a sidecar classifier
   the engine releases its own `FeatureMatrix` as soon as the handoff parquet is written,
   because strict has no native fallback that could still read it; the handoff is written in
-  131,072-row groups; and the worker loads it one row group at a time, since pyarrow's
-  `iter_batches` reads ahead and its buffered batches were a second copy of the matrix (the
-  worker climbed to 11.2 GB while filling a 4.85 GB matrix, then fell to 6.3). Measured on
+  131,072-row groups; and the worker loads it row group by row group, holding at most two
+  decoded groups (one filling, one read ahead on a reader thread since 2026-09-25), since
+  pyarrow's `iter_batches` reads ahead without bound and its buffered batches were a second
+  copy of the matrix (the worker climbed to 11.2 GB while filling a 4.85 GB matrix, then
+  fell to 6.3). Measured on
   the fleet (EPYC 9354, 32 threads, process-tree peaks): the six-run Astral pool
   (3,133,636 x 387) 17.9 GB -> 9.3 GB in 19.4 against 19.4 min, HYE B01
   (1,838,344 x 387) 12.0 GB -> 5.05 GB in 5.2 against 5.0 min, 63,270 peptides in both HYE
@@ -614,13 +616,25 @@ sections 10-16:
   and `large_utf8`, and the engine rejects both ("Disabled feature at compile
   time: zstd", "column 'peptidoform' is not utf8").
 - A library must carry `candidate_id` as the contiguous row-aligned range
-  `0..ncand` (`index.rs:112-125`) and precursors ascending by `precursor_mz`
-  (`index.rs:215-231`). Both are hard errors. Fragments are grouped by a
-  counting sort, so they need valid ids but not a sorted order.
+  `0..ncand` (`index.rs:215-245`) and precursors ascending by `precursor_mz`
+  (`index.rs:1288-1299`). Both are hard errors. Fragments are grouped by a
+  counting sort, so they need valid ids but not a sorted order; a table whose
+  ids ascend (what every library writer produces) takes the parallel fill.
 - The `nn_torch` worker selects its backend at `MUMDIA_NN_STREAM_GB`
   (default 4). A feature matrix marginally over the threshold silently falls to
   the much slower disk-backed streaming memmap; a 4.31 GB matrix against the
   4.00 GB default took the slow path.
+- `chromatograms.parquet` has two layouts. v1 (the default, schema 1) stores every row's
+  whole `rt` axis and `intensity` trace. v2 (`extract.chromatogram_schema = 2`, schema
+  2, `CHROMATOGRAMS_V2`) stores the lists as `rt_axis` and `intensity_trimmed`, plus
+  `trace_offset` and `trace_len`: each candidate's axis once per parquet row group (an
+  empty `rt_axis` means the last axis that candidate wrote in the same row group) and each
+  trace trimmed to its first-to-last run of values that are not `+0.0`. A v2 row group
+  decodes on its own, so a reader must start at a row group or at a candidate's first
+  row. `mumdia::chromatograms::Decoder` is the reference reader and
+  `mumdia::chromatograms::rewrite` converts either way; convert to v1 before handing the
+  table to a tool outside the engine. The lists are renamed so that such a tool, or an
+  engine binary from before v2, stops at the missing `rt` instead of misreading v2.
 
 ## Quantification rules
 

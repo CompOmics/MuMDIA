@@ -51,16 +51,28 @@ plus its schema companion `<features>.schema.json` (read at compete.rs:46 via
 (str), `apex_rt`, `elution_lo`, `elution_hi` (f64), `precursor_mz` (f64),
 `prelim_score` (f64), `peak_rank` (i32, defaulted to 0 when absent,
 compete.rs:45), `charge`
-(f64, only needed for `peptidoform_charge` grouping), and every feature column
-named in the schema.
+(f64, only needed for `peptidoform_charge` grouping, read through the widening
+getter `TableFile::f64_widening`), and every feature column named in the schema,
+each Float32 or Float64.
 
-Produces `psms_competed` (schema version 3, `artifact::PSMS_COMPETED`,
-schema.rs:20) at `--out`. Column schema includes `candidate_id`
+Produces `psms_competed` (schema version 4, `artifact::PSMS_COMPETED`) at `--out`.
+Column schema includes `candidate_id`
 (u32), `peak_rank` (i32), `label` (str), `base_peptide_id` (u32), `peptidoform`
 (str), `protein`
 (str), `apex_rt`, `elution_lo`, `elution_hi` (f64), `precursor_mz` (f64),
-`prelim_score` (f64), then every
-feature column (f64) carried through unchanged. It also writes
+`prelim_score` (f64), then every feature column in its storage width
+(`features::feature_storage_type`): Float32, except the five
+`features::F64_FEATURE_COLUMNS` (`charge`, `n_matched_fragments`,
+`unique_fragment_count`, `peak_contested_frac`, `contested_frac`), which stay
+Float64 because this stage or rescore reads them as f64 before any narrowing. A
+features v2 table already stores them this way and its values pass through
+unchanged. A v1 table stores every feature as Float64; compete then narrows the
+Float32 ones with `as f32` (`conform`), the conversion rescore applied to the same
+value when it read a v3 competed table, so the classifier input does not move.
+When every row survives and the features file already has exactly this schema, the
+competed table is the features file's bytes, published by hard link (see "compete:
+how the competed table is published"). A v1 features table never has it, so it is
+rewritten. It also writes
 `<out>.schema.json` (compete.rs:188) so rescore recovers the exact feature list,
 and `<out>.report.json`.
 
@@ -84,9 +96,13 @@ Consumes one or more `psms_competed` tables (`--competed`, a `Vec<String>`).
 The ordered feature schema from the first input is the expected contract, and
 every later schema companion must match it exactly before tables are
 concatenated. Reads `candidate_id`, `label`, `base_peptide_id`, `peptidoform`,
-`protein`, `charge` (f64, cast to i32), `prelim_score`, `precursor_mz`,
+`protein`, `charge` (f64 read widening, cast to i32), `prelim_score`, `precursor_mz`,
 `apex_rt`, `elution_lo`, `elution_hi`, `peak_rank` (i32, defaulted to 0 when
-absent, rescore.rs:93), and the feature columns.
+absent, rescore.rs:93), and the feature columns. A feature column may be Float32
+(`psms_competed` v4) or Float64 (v3, and the v4 columns that stay wide): a Float64
+cell is narrowed with `as f32` and a Float32 cell, narrowed that way when it was
+written, is used as stored (`FeatureCol`), so a v3 and a v4 table of the same run
+give the classifier the same values and the same scored table.
 
 Four input conditions are hard errors before any scoring: fewer than 2
 `rescore.folds` (rescore.rs:46-48), an empty `--competed` list (rescore.rs:43-45),
@@ -102,13 +118,18 @@ at `--out`. Column schema is, in order (rescore.rs:508-541): `candidate_id` (u32
 `q_value` (f64, pooled PSM q), `peptide_q_value` (f64), `protein_group` (str,
 the protein-accession-set string, a duplicate of `protein`), `pg_q_value` (f64),
 `global_q_value` (f64, byte-identical alias of `q_value`), `prelim_score` (f64),
-`source` (u32, index into `--competed` identifying the run), `run_psm_q` (f64),
+`source` (u32, index into `--competed` identifying the run, or the entry of
+`RescoreParams::sources` for that table when a grouped run hands over its band
+tables, `groups.pool_competed = false`), `run_psm_q` (f64),
 `experiment_psm_q` (f64, alias of `q_value`), `precursor_q` (f64), and
 `selected_peak_rank` (i32, which chromatographic peak of the candidate the
 rescorer kept; `0` = the up-front apex). Plus
 `<out>.report.json` whose `params` records `classifier` (the path actually taken),
 `classifier_requested`, `strict`, `folds`, `num_iter`, `train_fdr`,
 `feature_schema_id`, `competed_inputs`, `config_hash` (rescore.rs:565-575),
+`competed_sources` when a source map was given, and, when
+`nn_torch` ran, `nn_env`: the `MUMDIA_NN_*` variables the worker inherited beyond the
+ones the engine sets (`inherited_nn_env`, `docs/13_sidecars.md`),
 `model_identity` (e.g. `native-percolator-lite-v1`, `mokapot-<estimator>`
 (default `mokapot-nn`), `nn-torch-semisup-sidecar-v1`,
 `entrapment-gbm-sidecar-v1`, `native-percolator-lite-entrapment-v1`,
@@ -136,7 +157,17 @@ contracts exist:
   logical columns under the same names, written in 250k-row batches with f32
   features (`write_features_parquet`, rescore.rs:833-906); f32 is not a precision
   loss relative to the PIN, which already wrote `{:.6}` and whose values the worker
-  casts to f32 anyway. The worker echoes the SpecId tail
+  casts to f32 anyway. Under the opt-in `rescore.handoff = raw` (NnTorch only) the
+  worker is given `rescore_<tag>.features.raw.json`, a description naming
+  `rescore_<tag>.features.f32.npy` (the features as one row-major little-endian f32
+  matrix, rows x features, `.npy` version 1.0) and `rescore_<tag>.features.meta.parquet`
+  (the seven metadata columns above, as the parquet form writes them), with the feature
+  names, each feature's min and max (NaN left out, as a parquet footer leaves it out)
+  and `row_group_rows`, the parquet form's 131,072-row groups that the worker sums its
+  float64 moments over. The engine writes each decoded batch row-major with no
+  transpose and no parquet encode (`RawHandoff`), and the description last, so its
+  presence says the other two are whole. Scores are byte-identical to the parquet form;
+  docs/13 has the validation. The worker echoes the SpecId tail
   as a `candidate_id` column (here the row index `i`) and emits a `score` column;
   scores are mapped back by row index through `align_sidecar_scores`, which
   requires every input row to be covered exactly once with a finite score and
@@ -158,6 +189,18 @@ contracts exist:
   `ChildGuard` (rescore.rs:803-819) that kills the worker if the parent unwinds;
   without it a killed `mumdia` leaves the Python process holding its feature
   memmap and every later rescore fails on a file it cannot delete.
+
+The work directory is `sidecar_work` under the run's output directory inside `run`
+and `run-experiment`, and `sidecar_work` in the current directory (or `--work-dir`)
+for a standalone `mumdia rescore`; `MUMDIA_SIDECAR_DIR` overrides all of them
+(`sidecar_work_dir`). Once a worker's scores have passed `align_sidecar_scores`,
+its handoff, fold keys and output are removed (`remove_sidecar_files`), unless
+`MUMDIA_KEEP_HANDOFF=1`; a failed worker leaves them in place. Before the handoff
+is written, `check_sidecar_space` refuses a work directory whose free space is below
+the smallest a PIN or raw handoff can be (a parquet handoff has no such floor), and
+warns below the usual size of the files, the NN worker's memmap included when it may
+stream (`MUMDIA_SIDECAR_SPACE_CHECK=0` skips it). docs/13 "Where the rescore sidecar
+files go" has the sizes.
 
 ## How it works
 
@@ -251,9 +294,11 @@ the winner as the highest `prelim_score`, ties broken by smallest row index
   clamped to [0,1]), else raw `n_matched_fragments`, else `None`. The contested
   fraction is resolved by `prefer_peak_contested_fraction` (compete.rs:301-306),
   which prefers the Extended-feature `peak_contested_frac` column and falls back to
-  the legacy `contested_frac` spelling. Each column is read through `col_f64`
-  (compete.rs:309-315), which accepts either an f64 or an i32 encoding, so an
-  integer-typed fragment count is handled without a schema mismatch. If the mode is
+  the legacy `contested_frac` spelling. Each column is read through `col_f64`,
+  which accepts an f64, an f32 (widened exactly) or an i32 encoding, so an
+  integer-typed fragment count is handled without a schema mismatch. The features
+  writer keeps all four columns as f64 (`F64_FEATURE_COLUMNS`), because an f32
+  contested fraction could move `n * (1 - c)` across the integer threshold. If the mode is
   selected but no column is available it warns and falls back to winner-take-all
   (compete.rs:133-139, 366 `.unwrap_or(false)`).
 - `MarginGated`: keep the winner; remove a loser only when
@@ -267,6 +312,106 @@ is forwarded. The report records `group_by`, `mode`, `input_rows`, `kept`,
 whether a grouping choice is silently discarding evidence: under
 `group_by = base_peptide` on a modification-rich library it reached 46.6% of the
 input rows, and under `group_by = peptidoform_charge` on the same input it was 0.
+
+### compete: cost
+
+The stage logs one `compete: phase timings` line per call, beside `compete: done`.
+Its fields are wall-clock milliseconds:
+
+| field | what it covers |
+|---|---|
+| `keys_ms` | footer open, the streamed key columns (`label`, `prelim_score`, `peak_rank`, the grouping columns) and the sort of the `(key, row)` array |
+| `resolve_ms` | the unique-evidence estimate (that mode only) and `resolve_competition` |
+| `write_ms` | writing the competed table and its `<out>.schema.json`; a spliced or rewritten table is hashed during this write (docs/03 "Hash on write") |
+| `audit_ms` | the optional `<out>.compete_audit.parquet` (0 when the audit is off) |
+| `hash_ms` | the blake3 content hash recorded in `<out>.report.json`: near 0 when the hash came from the write or is the features hash of a hard-linked table; a read-back of the file only for a linked or copied table without `features_hash` |
+| `elapsed_ms` | the whole stage |
+
+On a wide features table `write_ms` dominates: the keys are a few columns, the
+table is every feature column, and the hash of a spliced or rewritten table is
+computed while it is written. `hash_ms` is large only for a standalone compete
+that links or copies the features file without being given its hash. The same line names how the table was
+published (`publish`, next section).
+
+### compete: how the competed table is published
+
+Under the shipped grouping (`peptidoform_charge`) every group is normally a
+singleton, `removed` is 0, and the competed table is the features table: the same
+columns in the same order, the same rows in the same order, the same values.
+Decoding and re-encoding it column by column cost about 10 s per HYE file and one
+full write of an ~83 GB table per immunopeptidomics run. `publish_competed` therefore
+checks whether the features file's own bytes are exactly what the rewrite would
+produce (`features_bytes_reusable`), and when they are and every row is kept it
+publishes them as the competed table:
+
+1. a hard link into the `AtomicPath` temp name, then the usual rename
+   (`mumdia_io::table::publish_copy_of`);
+2. if the filesystem refuses the link (another volume, FAT, some network and sync
+   folders), a byte copy into the same temp name;
+3. if that fails too, the rows are rewritten by `copy_kept_rows`, as before.
+
+The features bytes are reusable only when all of these hold, and each is necessary:
+the Arrow schema is exactly the competed schema (the 11 bookkeeping columns, then the
+schema companion's feature columns, same types, non-nullable, same metadata, nothing
+extra); every parquet leaf is REQUIRED, so no null exists for the rewrite to turn into
+NaN or `""`; every row group holds at most 131,072 rows, the competed cap (`features`
+writes 65,536); the table has its own `peak_rank` column; and
+`compete.emit_competition_audit` is off. Otherwise the stage logs the reason and
+rewrites. A features v1 table fails the first condition, because its feature
+columns are all Float64 and the competed schema declares most of them Float32, so it
+is always rewritten into the v4 layout.
+
+When some rows are removed, the same four conditions hold, and the non-empty
+features row groups that lost no row hold at least half of the table's rows
+(`splice_pays`), the table is spliced instead (`splice_kept_rows`): the untouched row
+groups are appended as bytes through `SpliceWriter`, as the pool splices band tables,
+and each run of consecutive row groups that lost a row is rewritten by
+`copy_kept_rows` into a scratch file (`<out>.splice-<pid>-<row>.parquet`, removed
+afterwards) whose row groups take its place. A row group that lost every row
+contributes nothing. A splice writes each dirty row twice (into the scratch file, then
+into the output) and each clean row once, while a full rewrite writes every row once
+but decodes and re-encodes all of them. The half-the-rows threshold bounds the splice
+at 1.5 times the table's write traffic, half of it re-encoded, with no scratch file
+larger than half the table. Below it, which is the usual case for a grouping that
+removes many rows (`base_peptide` removed 23% of the rows on HYE B01, from most row
+groups), most of the table would pass through a scratch file, up to twice the write
+traffic and scratch space close to the table's size, so the table is rewritten
+directly. A splice that fails for any reason (for example a scratch file the splice
+refuses) is logged as a warning and followed by the same full rewrite; the output temp
+and the scratch files are removed first. The spliced file holds the rewrite's rows in
+the rewrite's order with its values; its row groups are the features file's where they
+were untouched, so it is not byte-identical to a full rewrite. Under the shipped
+defaults no row is removed and this path does not run.
+
+The report's `stats.publish` records which path ran: `hard_link`, `byte_copy`,
+`spliced` (with `rewritten_row_groups` and `row_groups`) or `rewritten`. After a link or a copy the competed file has the features file's row
+groups and bytes, so its `content_hash` IS the features hash. An orchestrator passes
+the features stage's own hash as `CompeteParams::features_hash`, and compete records it
+rather than reading the file again; the standalone `mumdia compete` passes none and
+hashes the output. Every downstream reader decodes the same values in the same order,
+so `psms_scored.parquet` and everything after it are byte-identical. Only the competed
+file's bytes and hash differ from a rewritten one, and on a grouped run the pooled
+competed table's as well, because the pool splices the bands' row groups as they are
+(docs/33 section 5). On a table of one row group, such as the CI smoke fixture, even
+those are identical.
+
+After a hard link the two names share one file, so they cost the disk once. The
+engine's parquet writers (`TableWriter` and `write_table`, `BatchWriter` and
+`write_batches`, `SpliceWriter`) and `publish_copy_of` all write to an `AtomicPath`
+temp name and rename it over the destination, which replaces that directory entry and
+leaves the other name's file untouched: a rerun that rewrites `features.parquet` does
+not change `psms_competed.parquet`, and deleting one leaves the other intact. Two text
+writers do truncate their destination in place, the optional `features` PIN
+(`PinWriter`, `features.emit_pin`) and rescore's tab-separated handoff for mokapot and
+the entrapment sidecar. Neither ever writes to a parquet artifact path, so neither can
+reach a linked file, but a new writer that opened `features.parquet` or
+`psms_competed.parquet` with `File::create` would write through both names. The same
+holds outside the engine: a tool that edits either file IN PLACE changes both, and
+pandas `to_parquet` or pyarrow `write_table` onto an existing path truncates that file
+in place. Write to a new name and rename it over the old one, or delete the old name
+first. A rerun of `compete` over an output that is already a link to its input leaves
+no temporary file behind (POSIX `rename` is a no-op between two names of one file, and
+the stage removes the surviving temp name).
 
 ### rescore: input concat and classifier dispatch
 
@@ -302,6 +447,49 @@ is a flat f32 `FeatureMatrix`, so the same `n_psms * n_features * 4`, and
 `1 + (folds - 1) / folds` -- 1.67x at the default 3 folds, and never above 2x
 however many folds are configured. The stage logs the figure before allocating, and
 `rescore.max_feature_matrix_gib` makes exceeding a ceiling an error at startup.
+
+**Reading the feature columns.** The feature pass (`for_each_feature_batch`) is the
+widest read of the stage: every selected feature column of every row of every
+input, once. It reads through `stages::wide_scan_options`, which is the plain
+reader with its parallel decode and 16,384-row batches unless `MUMDIA_WIDE_SCAN`
+asks otherwise (docs/03 "Sequential row-group reads"). The plain reader seeks once
+per page, which is what limits it on a spinning array (44 MB/s measured on the
+immunopeptidomics competed tables against a 133 MB/s ceiling). Two opt-ins address
+that: `MUMDIA_WIDE_SCAN=rowgroup` decodes one row group a batch
+(`feature_batch_rows`, at most 131,072 rows), so the reader sweeps each column chunk
+before the next one, and `MUMDIA_WIDE_SCAN=coalesced` reads each row group's
+projected column chunks in one sequential read at 16,384-row batches. Neither is
+the default: from the page cache the stream over the 879,018-row HYE competed table
+took 1.54 s plain, 1.58 s `rowgroup` and 2.50 s `coalesced`, and neither has been
+measured on the spinning array yet. The rows reach the handoff and the matrix in
+file order whatever the reader and batch size
+(`every_read_mode_streams_the_same_feature_rows`).
+
+The stream hands out whole decoded batches (`FeatureBatch`), and each consumer
+takes a batch in the layout it needs, in parallel:
+
+- the parquet handoff stages a block column by column: every feature's values are
+  narrowed to f32 straight out of the decoded Arrow column into that feature's
+  block vector (a Float32 column of a v4 table is copied as stored), and the block
+  goes to the writer without a transpose. The row
+  path it replaces turned the decoded columns into rows and the staged rows back
+  into columns on flush. Blocks keep `HANDOFF_BATCH_ROWS` (250,000) rows and are
+  flushed at the same rows, so the writer receives the same record batches and
+  the file is byte-identical;
+- `SpecId` and `Peptide` are formatted into one text buffer per block rather than
+  one `String` per row, and `ExpMass` and `CalcMass` share one array;
+- the matrix path (every native, mokapot or non-strict run) fills a reused
+  row-major block per batch in parallel and appends it; a handoff written from
+  the matrix transposes its staged rows in parallel tiles of 16 features;
+- the first non-finite value of a batch is found per column in parallel and
+  reduced to the lowest `(row, column)`, which is the row-major first the row
+  scan reported, so the refusal names the same row, feature and value.
+
+Measured on the HYE competed table (879,018 rows, 387 features, strict `nn_torch`
+with an interpreter that cannot start, so the stage ends after the handoff; three
+rounds): the streamed handoff took 8.4-8.7 s of process wall before and 3.0-4.1 s
+after, 2.3-2.9 s of it the stream itself and 1.2-1.6 s of that the encode. The
+handoff files are byte-identical.
 
 The NnTorch worker picks its backend from the handoff file size against
 `MUMDIA_NN_STREAM_GB` (default 4, `nn_rescore_worker.py:299-300`). A matrix
@@ -440,7 +628,27 @@ rule, so target/decoy exchangeability is preserved. At
 and the block is a no-op. The surviving row's rank is written out as
 `selected_peak_rank`.
 
+The no-op is detected before the map is built (`every_candidate_is_unique`). The
+rows of one input are contiguous, so each source's candidate ids are checked
+against one bitset over the library's id range, cleared between sources: one bit
+per library candidate and one pass, where the map took about 35 bytes per row
+(~9 GB at the 258.75M-row immunopeptidomics pool) to find no repeated key. A
+repeated pair, or a source that decreases along the rows, builds the map as
+before.
+
 ### rescore: the multi-context q columns
+
+The q columns are computed without per-row staging copies: the pooled PSM q reads
+`score` and the label bit in place (`target_decoy_q_split`, where the pair form
+built an `n * 16` byte buffer, 4.1 GB at the 258.75M-row immunopeptidomics pool);
+`run_psm_q` runs the kernel on each source's rows as one slice, because the rows of
+one input are contiguous (`per_source_q`; one source returns the pooled q, which is
+the kernel's output on the same input, and a source column in any other order keeps
+the index form); `grouped_q` reads its picked groups through `target_decoy_q_by`.
+The protein and precursor interners grow with the distinct keys and are not
+presized: by rows they would take 17.7 GB at that pool for a key set that is a
+small fraction of them. Every q is the kernel's output on the same input as
+before (`per_source_q_reproduces_the_index_vector_form`).
 
 After scoring, the stage computes q-values at several aggregation levels, each an
 **independent** target-decoy (or entrapment) analysis run on the appropriate
@@ -574,7 +782,12 @@ counts feed a hyperscore-style term; `n` is small so the naive loop is fine.
 | `compete::unique_evidence_with_source` | compete.rs:279 | derive per-candidate unique-fragment evidence for `UniqueEvidence` mode, plus the column it came from |
 | `compete::prefer_peak_contested_fraction` | compete.rs:301 | choose the Extended `peak_contested_frac`, else the legacy `contested_frac` |
 | `compete::col_f64` | compete.rs:309 | read a numeric column as f64, accepting an f64 or i32 encoding |
-| `CompeteParams` | compete.rs:21 | `features`, `out`, `cfg`, `config_hash` |
+| `CompeteParams` | compete.rs:21 | `features`, `out`, `cfg`, `config_hash`, `features_hash` (the features stage's report hash, reused when the competed table is the features file's bytes) |
+| `compete::run_hashed` | compete.rs | `run`, returning the row count and the report content hash (`mumdia_io::report::Written`) |
+| `compete::publish_competed` | compete.rs | publish the kept rows: the features file's bytes when they are exactly the competed table, a splice when few rows are removed, otherwise (or when either fast path fails) `copy_kept_rows` |
+| `compete::features_bytes_reusable` | compete.rs | the four conditions under which the features bytes can stand in for the competed table |
+| `compete::splice_kept_rows` | compete.rs | some rows removed: splice the untouched features row groups, rewrite the others |
+| `compete::splice_pays` | compete.rs | whether the non-empty untouched row groups hold at least half the rows, so a splice beats a full rewrite |
 | `rescore::run` | rescore.rs:41 | full rescore stage: concat, dispatch, multi-context q, scored table |
 | `rescore::validate_feature_schema` | rescore.rs:596 | reject a concat whose feature companions differ in id or ordered columns |
 | `rescore::native_scores` | rescore.rs:616 | thin wrapper calling `percolator_lite` with the config knobs |
@@ -633,7 +846,7 @@ unless a knob is set.
 | `entrapment_contaminant_markers` | `[]` | substrings marking genuine contaminants inside the spike-in proteome; matching PSMs stay real targets |
 | `entrapment_ratio` | `1.0` | `N_real_lib / N_entrap_lib`, scales the entrapment FDR estimate |
 | `strict` | `true` | production default: any sidecar failure / misconfiguration is a hard error; false explicitly enables compatibility fallback |
-| `handoff` | `tsv` | how the feature matrix reaches a sidecar (`Handoff`, config.rs:1230): `tsv` writes the Percolator PIN, `parquet` writes an f32 Parquet feature table. `parquet` applies to `nn_torch` only; a mokapot run warns and falls back to `tsv` (rescore.rs:946-954) |
+| `handoff` | `parquet` | how the feature matrix reaches a sidecar (`Handoff`): `tsv` writes the Percolator PIN, `parquet` writes an f32 Parquet feature table, `raw` (opt-in) a row-major f32 `.npy` matrix with a metadata parquet and a `.raw.json` description. `parquet` and `raw` apply to `nn_torch` only; a mokapot run warns and falls back to `tsv` (`sidecar_paths`) |
 
 ## Invariants, determinism, gotchas
 

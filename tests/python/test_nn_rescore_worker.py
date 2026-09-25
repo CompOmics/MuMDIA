@@ -21,6 +21,7 @@ import numpy as np
 import pytest
 
 from conftest import (
+    SCRIPTS,
     assert_complete_finite_coverage,
     importorskip_any,
     read_columns,
@@ -336,3 +337,687 @@ def test_available_ram_is_optional_and_never_fatal():
     # Whatever it returns, the threshold is usable.
     gb, why = m.auto_stream_threshold_gb(4)
     assert gb >= 4 and isinstance(why, str)
+
+
+# ------------------------------------------ default-path speed-ups are score-identical
+
+# Every speed-up on the default path is meant to leave the output scores byte-identical,
+# so each one keeps a switch back to the code it replaced. Running the worker once with
+# all of them switched back and once with the defaults, on the same host and seed, must
+# give the same bytes. A single-seed count is not a measurement (CLAUDE.md), so nothing
+# weaker than exact equality would catch a change that only moves the arithmetic.
+LEGACY_ENV = {
+    # W6: score the training pool after the last round as well.
+    "MUMDIA_NN_FINAL_POOL_SCORE": "1",
+    # W1: gather scoring batches with a numpy fancy index.
+    "MUMDIA_NN_GATHER": "numpy",
+    # W5: scan the init features on one thread.
+    "MUMDIA_NN_SCAN_THREADS": "1",
+    # W2/W3: the serial load loop, without read-ahead or pre_buffer.
+    "MUMDIA_NN_LOAD_THREADS": "0",
+    # W4: the full stable sort for every positive selection and decoy order.
+    "MUMDIA_NN_SELECT": "full",
+}
+
+IDENTITY_ENV = dict(
+    FAST_ENV,
+    MUMDIA_NN_FOLDS="3",
+    MUMDIA_NN_ITERS="3",
+    MUMDIA_NN_EPOCHS="8",
+    MUMDIA_NN_HIDDEN="16,8",
+    MUMDIA_NN_BATCH="128",
+    # Run every round, so the last one (the one W6 skips scoring after) is reached.
+    MUMDIA_NN_EARLY_STOP="0",
+    MUMDIA_NN_NEG_RATIO="2",
+    MUMDIA_NN_NEG_SELECT="hybrid",
+    MUMDIA_NN_WARM_START="1",
+    MUMDIA_NN_WARM_EPOCHS="2",
+    MUMDIA_NN_INIT_SAMPLE="2000",
+    MUMDIA_NN_CHUNK="700",
+    MUMDIA_NN_THREADS="2",
+    # One scan thread per 500 sample rows, so the default arm really runs the threaded init
+    # scan (W5) on the 2,000-row sample; the production default of 20,000 would keep it
+    # serial here.
+    MUMDIA_NN_SCAN_ROWS_PER_THREAD="500",
+)
+
+
+def _identity_pool(tmp_path, n=6000, nf=13, row_group=1500, seed=3):
+    """A parquet handoff with the awkward cells the load path must treat exactly as before.
+
+    Several row groups (and a CHUNK smaller than one), NaN and infinite cells, a float64
+    column with values beyond float32 range, a column with nulls, a constant column, -0.0
+    cells, heavily tied columns and subnormal cells: float32 subnormals in an ordinary
+    column, a float64 column with values that are normal in float64 but subnormal once
+    narrowed to float32 plus float64 subnormals, and a column of zeros and float32
+    subnormals only, whose float64 sums flush-to-zero decides. Returns (features path,
+    fold-key path, n).
+    """
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    rng = np.random.default_rng(seed)
+    labels = np.where(rng.random(n) < 0.5, 1, -1).astype(np.int32)
+    true = (labels == 1) & (rng.random(n) < 0.4)
+    x = rng.normal(0.0, 1.0, (n, nf))
+    x[true] += np.linspace(2.5, 0.2, nf)
+    x[:, 2] = np.round(x[:, 2], 1)
+    x[rng.random(n) < 0.02, 3] = -0.0
+    x[rng.random(n) < 0.01, 4] = np.nan
+    x[rng.random(n) < 0.005, 5] = np.inf
+    x[rng.random(n) < 0.005, 6] = -np.inf
+    x[:, 7] = 1.5
+    x[rng.random(n) < 0.01, 10] = 1e-40          # float32 subnormal
+    x[:, 12] = 0.0
+    x[true & (rng.random(n) < 0.5), 12] = 1e-40  # zeros and float32 subnormals only
+    x[rng.random(n) < 0.01, 12] = -3e-42
+    cols = {
+        "SpecId": pa.array(["psm_%d" % i for i in range(n)], pa.string()),
+        "Label": pa.array(labels, pa.int32()),
+        "ScanNr": pa.array(np.arange(n, dtype=np.int32), pa.int32()),
+        "ExpMass": pa.array(np.full(n, 500.0), pa.float64()),
+        "CalcMass": pa.array(np.full(n, 500.0), pa.float64()),
+    }
+    for j in range(nf):
+        if j == 8:
+            v = x[:, j].copy()
+            v[rng.random(n) < 0.005] = 1e300
+            cols["f%02d" % j] = pa.array(v, pa.float64())
+        elif j == 9:
+            cols["f%02d" % j] = pa.array(
+                x[:, j].astype(np.float32), pa.float32(), mask=rng.random(n) < 0.01
+            )
+        elif j == 11:
+            v = x[:, j].copy()
+            v[rng.random(n) < 0.01] = 1e-40      # normal float64, subnormal in float32
+            v[rng.random(n) < 0.01] = -1e-310    # float64 subnormal
+            cols["f%02d" % j] = pa.array(v, pa.float64())
+        else:
+            cols["f%02d" % j] = pa.array(x[:, j].astype(np.float32), pa.float32())
+    cols["Peptide"] = pa.array(["-.PEP%dK.-" % (i // 2) for i in range(n)], pa.string())
+    cols["Proteins"] = pa.array(["P%d" % (i % 7) for i in range(n)], pa.string())
+    features = tmp_path / "identity.features.parquet"
+    pq.write_table(pa.table(cols), str(features), row_group_size=row_group,
+                   compression="snappy")
+    keys = tmp_path / "identity.foldkeys.parquet"
+    pq.write_table(
+        pa.table({"fold_key": pa.array((np.arange(n) // 2).astype(np.uint32), pa.uint32())}),
+        str(keys),
+    )
+    return features, keys, n
+
+
+def _scores_by_row(out_path):
+    cols = read_columns(out_path)
+    cid = np.asarray(cols["candidate_id"], dtype=np.int64)
+    return cid, np.asarray(cols["score"], dtype=np.float64)
+
+
+def _identity_tsv(tmp_path, features):
+    """The same pool as a tab-separated PIN (the `rescore.handoff = tsv` layout)."""
+    import pyarrow.parquet as pq
+
+    path = tmp_path / "identity.pin"
+    pq.read_table(str(features)).to_pandas().to_csv(path, sep="\t", index=False)
+    return path
+
+
+def _identity_inputs(tmp_path, backend):
+    """(PIN path, fold-key path, n, env) for one backend of the identity pool."""
+    features, keys, n = _identity_pool(tmp_path)
+    pin = _identity_tsv(tmp_path, features) if backend == "tsv" else features
+    env = dict(IDENTITY_ENV, MUMDIA_NN_FOLD_KEYS=str(keys),
+               MUMDIA_NN_STREAM="1" if backend == "stream" else "0")
+    return pin, keys, n, env
+
+
+def _assert_same_scores(ref, new, n, what):
+    rc, rs = _scores_by_row(ref)
+    nc, ns = _scores_by_row(new)
+    assert len(rs) == len(ns) == n
+    assert np.array_equal(rc, nc), "the row order of the output changed"
+    assert rs.tobytes() == ns.tobytes(), (
+        "%s changed the scores (%d of %d rows differ)"
+        % (what, int(np.count_nonzero(rs != ns)), n)
+    )
+
+
+@pytest.mark.parametrize("backend", ["in-memory", "stream"])
+def test_default_speedups_leave_scores_byte_identical(torch_available, tmp_path, backend):
+    """The default path must score exactly as the code it replaced, on the same host."""
+    pin, _keys, n, env = _identity_inputs(tmp_path, backend)
+    ref = tmp_path / "legacy.parquet"
+    new = tmp_path / "default.parquet"
+    stdout_ref, _ = run_worker_ok("nn_rescore_worker.py", pin, ref, env=dict(env, **LEGACY_ENV))
+    stdout, _ = run_worker_ok("nn_rescore_worker.py", pin, new, env=env)
+    # The comparison is only as strong as the paths it runs: the default arm must have
+    # threaded its init scan, and the legacy arm must not have.
+    assert "2 scan thread(s)" in stdout, "the default arm did not run the threaded init scan"
+    assert "2 scan thread(s)" not in stdout_ref
+    _assert_same_scores(ref, new, n, "a default-path speed-up")
+
+
+# The worker as it was before the default-path speed-ups (W1-W6) and the move of the
+# training loop into `_build_trainer`: origin/main when they were written. The switches in
+# LEGACY_ENV only reach code that kept a switch; comparing against this commit also covers
+# the refactors that have none. When a later change moves the default scores on purpose,
+# point this at the commit that made it.
+REFERENCE_COMMIT = "6887c41b7ed04ace7eb1d744d750e83bb2c93e9e"
+
+
+def _reference_worker(tmp_path):
+    """Write the worker at REFERENCE_COMMIT to tmp_path, or skip when git cannot supply it."""
+    import pathlib
+    import shutil
+    import subprocess
+
+    git = shutil.which("git")
+    if git is None:
+        pytest.skip("git is not available to extract the reference worker")
+    root = pathlib.Path(__file__).resolve().parents[2]
+    proc = subprocess.run(
+        [git, "-C", str(root), "show", REFERENCE_COMMIT + ":scripts/nn_rescore_worker.py"],
+        capture_output=True,
+    )
+    if proc.returncode != 0 or not proc.stdout:
+        pytest.skip("reference commit %s is not in this clone (a shallow checkout?)"
+                    % REFERENCE_COMMIT[:7])
+    path = tmp_path / "nn_rescore_worker_reference.py"
+    path.write_bytes(proc.stdout)
+    return path
+
+
+@pytest.mark.parametrize("backend", ["in-memory", "stream", "tsv"])
+def test_default_path_scores_as_the_reference_worker(torch_available, tmp_path, backend):
+    """The default path must give the reference worker's score bytes, on the same host.
+
+    A host-local comparison of two code versions rather than a committed hash, so it holds
+    on any CPU generation. The default arm runs the threaded init scan
+    (`MUMDIA_NN_SCAN_ROWS_PER_THREAD` in IDENTITY_ENV) and every other default speed-up.
+    """
+    reference = _reference_worker(tmp_path)
+    pin, _keys, n, env = _identity_inputs(tmp_path, backend)
+    ref = tmp_path / "reference.parquet"
+    new = tmp_path / "default.parquet"
+    run_worker_ok(str(reference), pin, ref, env=env)
+    run_worker_ok("nn_rescore_worker.py", pin, new, env=env)
+    _assert_same_scores(ref, new, n, "the current worker (against %s)" % REFERENCE_COMMIT[:7])
+
+
+# The metadata columns of a handoff (`NON_FEATURE` in the worker).
+_HANDOFF_META = ("SpecId", "Label", "ScanNr", "ExpMass", "CalcMass", "Peptide", "Proteins")
+
+
+def _identity_pool_f32(tmp_path, row_group=1500):
+    """The identity pool with every feature column float32, as the engine writes a parquet
+    handoff (the float64 columns are narrowed here, outside the worker, as the engine's
+    `v as f32` narrows them), in `row_group`-row groups. Returns (path, fold keys, n)."""
+    import pyarrow as pa
+    import pyarrow.compute as pc
+    import pyarrow.parquet as pq
+
+    features, keys, n = _identity_pool(tmp_path, row_group=row_group)
+    tbl = pq.read_table(str(features))
+    cols = {}
+    for name in tbl.column_names:
+        col = tbl.column(name)
+        if name not in _HANDOFF_META and col.type != pa.float32():
+            col = pc.cast(col, pa.float32(), safe=False)
+        cols[name] = col
+    path = tmp_path / "identity_f32.features.parquet"
+    pq.write_table(pa.table(cols), str(path), row_group_size=row_group, compression="snappy")
+    return path, keys, n
+
+
+def _raw_handoff_of(tmp_path, features, version=1):
+    """The raw handoff (`rescore.handoff = raw`) of a float32 parquet handoff, in the layout
+    `HandoffSink::Raw` writes: a C-order `<f4` .npy matrix, the metadata parquet, and the
+    description, whose min/max are the per-feature ranges a parquet footer records."""
+    import json
+
+    import pyarrow.parquet as pq
+
+    tbl = pq.read_table(str(features))
+    feats = [c for c in tbl.column_names if c not in _HANDOFF_META]
+    n = tbl.num_rows
+    mat = np.empty((n, len(feats)), np.float32)
+    for j, c in enumerate(feats):
+        mat[:, j] = tbl.column(c).to_numpy(zero_copy_only=False)
+    stem = "identity"
+    np.save(tmp_path / (stem + ".features.f32.npy"), mat)
+    pq.write_table(tbl.select(list(_HANDOFF_META)), str(tmp_path / (stem + ".features.meta.parquet")))
+    md = pq.ParquetFile(str(features)).metadata
+    names = pq.read_schema(str(features)).names
+    lo, hi = [], []
+    for c in feats:
+        j = names.index(c)
+        mins = [md.row_group(g).column(j).statistics.min for g in range(md.num_row_groups)]
+        maxs = [md.row_group(g).column(j).statistics.max for g in range(md.num_row_groups)]
+        lo.append(float(min(mins)))
+        hi.append(float(max(maxs)))
+    desc = tmp_path / (stem + ".features.raw.json")
+    desc.write_text(json.dumps({
+        "format": "mumdia-raw-f32",
+        "version": version,
+        "rows": n,
+        "features": feats,
+        "features_file": stem + ".features.f32.npy",
+        "metadata_file": stem + ".features.meta.parquet",
+        "row_group_rows": md.row_group(0).num_rows,
+        "min": lo,
+        "max": hi,
+    }), encoding="utf-8")
+    return desc
+
+
+@pytest.mark.parametrize("backend", ["in-memory", "stream"])
+@pytest.mark.parametrize("subset", [False, True])
+def test_the_raw_handoff_scores_as_the_parquet_handoff(torch_available, tmp_path, backend, subset):
+    """The raw handoff must give the parquet handoff's score bytes: the same matrix from a
+    copy instead of a decode, the moments over the same partition, the same constant
+    columns dropped (`f07`), and the same projection under MUMDIA_NN_FEATURES."""
+    features, keys, n = _identity_pool_f32(tmp_path)
+    raw = _raw_handoff_of(tmp_path, features)
+    env = dict(IDENTITY_ENV, MUMDIA_NN_FOLD_KEYS=str(keys),
+               MUMDIA_NN_STREAM="1" if backend == "stream" else "0")
+    if subset:
+        env["MUMDIA_NN_FEATURES"] = "f00,f02,f03,f05,f07,f09,f10,f12"
+    ref = tmp_path / "parquet.parquet"
+    new = tmp_path / "raw.parquet"
+    stdout_ref, _ = run_worker_ok("nn_rescore_worker.py", features, ref, env=env)
+    stdout, _ = run_worker_ok("nn_rescore_worker.py", raw, new, env=env)
+    assert "format=raw" in stdout and "format=parquet" in stdout_ref
+    # The same constant columns: f07, and under flush-to-zero f12, whose zeros and float32
+    # subnormals read from the footer as one value.
+    drop = [ln for ln in stdout.splitlines() if "constant feature column" in ln]
+    drop_ref = [ln for ln in stdout_ref.splitlines() if "constant feature column" in ln]
+    assert drop == drop_ref and drop and "f07" in drop[0], (drop, drop_ref)
+    _assert_same_scores(ref, new, n, "the raw handoff (%s)" % backend)
+
+
+def test_a_raw_handoff_of_another_version_is_refused(tmp_path):
+    """A description the worker does not know must fail loudly, not be read as another
+    layout; the one it does know is read with its matrix mapped. The reader imports no
+    torch, so this runs wherever pandas does."""
+    import importlib.util
+    import json
+
+    pytest.importorskip("pandas")
+    spec = importlib.util.spec_from_file_location(
+        "nn_rescore_worker_mod", SCRIPTS / "nn_rescore_worker.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    features, _keys, n = _identity_pool_f32(tmp_path)
+    raw = _raw_handoff_of(tmp_path, features)
+    info = mod.read_raw_handoff(raw)
+    assert info["matrix"].shape == (n, len(info["features"]))
+    # Without flush-to-zero in this process, f12's subnormal range is not one value.
+    assert mod.raw_constant_columns(info, info["features"]) == ["f07"]
+    desc = json.loads(raw.read_text(encoding="utf-8"))
+    for key, value, message in [("version", 2, "version 2"),
+                                ("format", "something-else", "not a raw rescore handoff"),
+                                ("rows", n + 1, "expected a C-order")]:
+        bad = dict(desc, **{key: value})
+        path = tmp_path / ("bad_%s.raw.json" % key)
+        path.write_text(json.dumps(bad), encoding="utf-8")
+        with pytest.raises((ValueError, RuntimeError), match=message):
+            mod.read_raw_handoff(path)
+
+
+def test_scoring_forward_does_not_depend_on_the_batch_address(torch_available):
+    """The MLP forward must give the same bytes wherever its input batch sits in memory.
+
+    W1 hands the model one reused buffer where the numpy fancy index handed it a fresh
+    allocation per batch. The worker allocates that buffer with numpy, as the fancy index
+    was, but its address still differs from batch to batch of the old path (16 bytes past
+    a 64-byte boundary on glibc for an mmap'd block, any 16-byte multiple from the heap).
+    A BLAS kernel may choose its code path by alignment, so the production shape is
+    checked here: a 16,384-row scoring batch (MUMDIA_NN_BATCH 4096 x 4) of 387 features
+    through the 128-64 network in eval mode, fed from the numpy gather, from the worker's
+    numpy-backed buffer and a 64-byte aligned `torch.empty` one, and from numpy views at
+    4 to 48 bytes past a 64-byte boundary.
+    """
+    torch = pytest.importorskip("torch")
+    nn = torch.nn
+    threads = torch.get_num_threads()
+    torch.set_num_threads(max(1, min(8, threads)))
+    try:
+        torch.manual_seed(0)
+        nf, step = 387, 16384
+        layers, d = [], nf
+        for h in (128, 64):
+            layers += [nn.Linear(d, h), nn.BatchNorm1d(h), nn.ReLU(), nn.Dropout(0.3)]
+            d = h
+        model = nn.Sequential(*layers, nn.Linear(d, 1))
+        with torch.no_grad():
+            model.train()
+            for _ in range(3):                  # non-trivial BatchNorm running statistics
+                model(torch.randn(4096, nf))
+        model.eval()
+
+        def forward(x):
+            with torch.no_grad():
+                return model(x).squeeze(-1).numpy().tobytes()
+
+        rng = np.random.default_rng(1)
+        xs = np.clip(rng.normal(size=(20000, nf)).astype(np.float32), -8, 8)
+        idx = np.sort(rng.choice(len(xs), step, replace=False)).astype(np.int64)
+        want = forward(torch.from_numpy(xs[idx]))            # the numpy gather
+        for buf in (torch.from_numpy(np.empty((step, nf), np.float32)),   # the worker's
+                    torch.empty((step, nf), dtype=torch.float32)):
+            torch.index_select(torch.from_numpy(xs), 0, torch.from_numpy(idx), out=buf)
+            assert forward(buf) == want, "the torch gather changed the forward pass"
+            # The last, partial batch is gathered into a leading view of the same buffer.
+            torch.index_select(torch.from_numpy(xs), 0, torch.from_numpy(idx[:5000]),
+                               out=buf[:5000])
+            assert forward(buf[:5000]) == forward(torch.from_numpy(xs[idx[:5000]]))
+        raw = np.empty(step * nf * 4 + 128, np.uint8)
+        base = (-raw.ctypes.data) % 64
+        for off in (0, 4, 8, 16, 32, 48):
+            view = raw[base + off:base + off + step * nf * 4].view(np.float32)
+            view = view.reshape(step, nf)
+            view[:] = xs[idx]
+            assert view.ctypes.data % 64 == off
+            assert forward(torch.from_numpy(view)) == want, (
+                "the forward pass depends on the input address (%d bytes past 64)" % off)
+    finally:
+        torch.set_num_threads(threads)
+
+
+def test_threaded_init_scan_picks_the_serial_feature_and_count():
+    """The threaded init scan must return the serial scan's (column, sign, count) exactly.
+
+    Tied columns make the tie-breaking rule (lowest column, sign +1 first, strict `>`)
+    decide the winner, which is the part a completion-order reduction would get wrong.
+    """
+    w = _import_worker()
+    rng = np.random.default_rng(11)
+    n, nf = 30000, 9
+    tgt = rng.random(n) < 0.5
+    x = rng.normal(size=(n, nf)).astype(np.float32)
+    x[tgt, 1] += 2.0
+    x[:, 4] = x[:, 1]           # an exact duplicate of the best column
+    x[:, 6] = -x[:, 1]          # its mirror image, tying on sign -1
+    x[:, 7] = np.round(x[:, 7], 1)
+    for topk in (0, 500):
+        serial = w.n_targets_at_many(x, tgt, 0.01, topk=topk, workers=1)
+        for workers in (2, 3, 8):
+            assert w.n_targets_at_many(x, tgt, 0.01, topk=topk, workers=workers) == serial
+    assert serial[0] == 1 and serial[1] == 1, "the tie must go to the lowest column"
+    assert w.scan_workers(16, 300000, 387) == 15
+    assert w.scan_workers(16, 10000, 387) == 1
+    assert w.scan_workers(16, 300000, 3) == 3
+    assert w.scan_workers(16, 10000, 387, rows_per_thread=500) == 16
+    # The memory cap: each task in flight holds ~64 B per sample row. It binds only when the
+    # init sample escalates (the 8.07M-row immunopeptidomics ladder reaches 4.8M rows).
+    assert w.scan_workers(16, 1_200_000, 347) == 13
+    assert w.scan_workers(16, 4_800_000, 347) == 3
+    assert w.scan_workers(16, 20_000_000, 347) == 1
+    assert w.scan_workers(16, 4_800_000, 347, mem_bytes=0) == 1
+    assert w.scan_workers(16, 4_800_000, 347, mem_bytes=8 << 30) == 16
+
+
+def test_single_threaded_load_releases_its_moment_buffer(tmp_path):
+    """With one fill thread the moment buffer lives on the main thread; it must not stay.
+
+    Pool threads drop theirs when they exit. The main thread lives for the whole run, so a
+    cached 32,768 x features float64 buffer (0.1 GB at 387 features) would stay resident
+    through training.
+    """
+    w = _import_worker()
+    import pyarrow.parquet as pq
+
+    features, _keys, n = _identity_pool(tmp_path)
+    names = [c for c in pq.read_schema(str(features)).names if c not in w.NON_FEATURE]
+    out = np.empty((n, len(names)), np.float32)
+    w.fill_parquet_matrix(str(features), names, n, 700, out, threads=1, read_ahead=False)
+    assert getattr(w._TLS, "moments", None) is None, "the main thread kept its moment buffer"
+
+
+@pytest.mark.parametrize("chunk", [250000, 700])
+def test_parallel_parquet_load_reproduces_the_serial_matrix_and_moments(tmp_path, chunk):
+    """The threaded, read-ahead load must give the serial loop's matrix, mean and std bytes.
+
+    The float64 column sums depend on the order of their additions, so the parallel loader
+    keeps the serial loop's sub-block partition and adds the partial sums in that order.
+    The pool carries non-finite cells, a float64 column beyond float32 range, nulls, -0.0
+    and a CHUNK smaller than a row group (700 rows against 1,500).
+    """
+    w = _import_worker()
+    import pyarrow.parquet as pq
+
+    features, _keys, n = _identity_pool(tmp_path)
+    names = [c for c in pq.read_schema(str(features)).names if c not in w.NON_FEATURE]
+    nf = len(names)
+
+    ref = np.empty((n, nf), np.float32)
+    r1, r2 = w._fill_parquet_matrix_legacy(str(features), names, n, chunk, ref)
+    rmean, rstd = w.moments_to_mean_std(r1, r2, n)
+    w.standardise_matrix(ref, rmean, rstd, chunk, threads=1)
+
+    for threads, read_ahead, pre_buffer in [(1, False, False), (1, True, True),
+                                            (3, True, True), (8, False, True)]:
+        got = np.empty((n, nf), np.float32)
+        g1, g2 = w.fill_parquet_matrix(str(features), names, n, chunk, got, threads=threads,
+                                       read_ahead=read_ahead, pre_buffer=pre_buffer)
+        assert g1.tobytes() == r1.tobytes() and g2.tobytes() == r2.tobytes(), (
+            "column sums differ at threads=%d read_ahead=%s" % (threads, read_ahead))
+        gmean, gstd = w.moments_to_mean_std(g1, g2, n)
+        w.standardise_matrix(got, gmean, gstd, chunk, threads=threads, block=256)
+        assert gmean.tobytes() == rmean.tobytes() and gstd.tobytes() == rstd.tobytes()
+        assert got.tobytes() == ref.tobytes(), (
+            "matrix differs at threads=%d read_ahead=%s" % (threads, read_ahead))
+    assert np.isfinite(ref).all()
+
+
+def test_moment_blocks_follow_the_serial_partition():
+    w = _import_worker()
+    assert w.moment_blocks(7000, 3000, sub=1000) == [
+        (0, 1000), (1000, 2000), (2000, 3000),
+        (3000, 4000), (4000, 5000), (5000, 6000),
+        (6000, 7000),
+    ]
+    assert w.moment_blocks(131072, 250000) == [
+        (0, 32768), (32768, 65536), (65536, 98304), (98304, 131072)
+    ]
+    assert w.moment_blocks(5, 2, sub=32768) == [(0, 2), (2, 4), (4, 5)]
+    assert w.moment_blocks(0, 250000) == []
+
+
+def _awkward_scores(rng, n, kind):
+    """float32 scores with the values an exact order must get right."""
+    if kind == "ties":
+        s = np.round(rng.normal(size=n), 1)
+    elif kind == "coarse":
+        s = rng.integers(-3, 4, size=n).astype(np.float64)
+    else:
+        s = rng.normal(size=n)
+    s = s.astype(np.float32)
+    k = max(1, n // 50)
+    s[rng.integers(0, n, k)] = np.float32(-0.0)
+    s[rng.integers(0, n, k)] = np.float32(0.0)
+    s[rng.integers(0, n, 3)] = np.float32(np.inf)
+    s[rng.integers(0, n, 3)] = np.float32(-np.inf)
+    s[rng.integers(0, n, 2)] = np.float32(1e-41)      # subnormal
+    s[rng.integers(0, n, 2)] = np.float32(-1e-41)
+    return s
+
+
+def test_desc_order_is_the_stable_descending_argsort():
+    """One uint64 key sort must reproduce `np.argsort(-s, kind="stable")` exactly."""
+    w = _import_worker()
+    rng = np.random.default_rng(5)
+    for kind in ("ties", "coarse", "normal"):
+        for n in (1, 2, 17, 5000):
+            s = _awkward_scores(rng, n, kind) if n > 4 else rng.normal(size=n).astype(np.float32)
+            want = np.argsort(-s, kind="stable")
+            assert np.array_equal(w.desc_order(s), want), (kind, n)
+            s2 = s.copy()
+            s2[rng.integers(0, n, max(1, n // 100))] = np.float32(np.nan)
+            s2[:1] = -np.float32(np.nan)                   # a NaN with its sign bit set
+            assert np.array_equal(w.desc_order(s2), np.argsort(-s2, kind="stable")), (kind, n)
+    assert w.desc_order(np.zeros(0, np.float32)).shape == (0,)
+    f64 = rng.normal(size=100)
+    assert np.array_equal(w.desc_order(f64), np.argsort(-f64, kind="stable"))
+
+
+@pytest.mark.parametrize("kind", ["ties", "coarse", "normal"])
+def test_windowed_positive_selection_equals_the_full_tda_q_selection(kind):
+    """The certified window must select exactly `(tda_q <= thr) & target`, or decline.
+
+    Randomised over pool size, target fraction, separation and threshold, with ties at
+    the window edge, +-0.0, infinities and subnormals. A NaN anywhere must make it decline
+    rather than guess where the sort puts NaN.
+    """
+    w = _import_worker()
+    rng = np.random.default_rng({"ties": 1, "coarse": 2, "normal": 3}[kind])
+    windowed = declined = 0
+    for trial in range(60):
+        n = int(rng.integers(50, 20000))
+        tgt = rng.random(n) < rng.uniform(0.2, 0.8)
+        s = _awkward_scores(rng, n, kind)
+        s[tgt] += np.float32(rng.uniform(0.0, 3.0))
+        thr = float(rng.choice([0.001, 0.01, 0.05, 0.2]))
+        want = (w.tda_q(s, tgt.astype(np.float32)) <= thr) & tgt
+        got = w.select_positives(s, tgt, thr)
+        if got is None:
+            declined += 1
+        else:
+            windowed += 1
+            assert np.array_equal(got, want), (kind, trial, n, thr)
+        assert w.n_targets_at_windowed(s, tgt.astype(np.float32), thr) == int(want.sum())
+        s_nan = s.copy()
+        s_nan[int(rng.integers(0, n))] = np.float32(np.nan)
+        assert w.select_positives(s_nan, tgt, thr) is None
+    assert windowed > 10, "the window was almost never certified; the test lost its point"
+
+
+def test_thread_pools_compute_under_the_main_threads_flush_to_zero(torch_available, tmp_path):
+    """Under the worker's default flush-to-zero, pool threads must match the serial code.
+
+    FTZ/DAZ live in each thread's MXCSR, and a thread started on Windows does not inherit
+    them, so every pool the worker starts runs `_fp_thread_init`. Checked where the state
+    decides the bytes: the float64-to-float32 narrowing of a value that is subnormal in
+    float32 (the fill), the float64 sums of a column of zeros and float32 subnormals (the
+    moments), standardisation, and the init scan on a column whose only signal is
+    subnormal, which DAZ turns into a tie. `desc_order` and the windowed selection run on
+    the main thread and must still reproduce the stable argsort and `tda_q` under DAZ.
+
+    Every input is built before flush-to-zero is switched on: under FTZ, `np.float32(1e-40)`
+    is already 0.0, and the checks would pass on inputs without a single subnormal.
+    """
+    torch = pytest.importorskip("torch")
+    w = _import_worker()
+    import pyarrow.parquet as pq
+
+    tiny = np.float32(1.2e-38)
+    features, _keys, n = _identity_pool(tmp_path)
+    names = [c for c in pq.read_schema(str(features)).names if c not in w.NON_FEATURE]
+    nf = len(names)
+    rng = np.random.default_rng(13)
+    m = 40000
+    tgt = rng.random(m) < 0.5
+    x = rng.normal(size=(m, 3)).astype(np.float32)
+    x[tgt, 0] += np.float32(1.0)
+    x[:, 1] = np.float32(0.0)
+    x[tgt & (rng.random(m) < 0.6), 1] = np.float32(1e-40)
+    assert np.count_nonzero(x[:, 1]) > 1000
+    scores = []
+    for kind in ("ties", "coarse", "normal"):
+        s = _awkward_scores(rng, 5000, kind)
+        lab = rng.random(5000) < 0.5
+        shifted = s.copy()
+        shifted[lab] += np.float32(1.5)
+        shifted[rng.integers(0, 5000, 20)] = np.float32(3e-41)
+        assert np.any((s != 0) & (np.abs(s) < tiny))
+        assert np.any((shifted != 0) & (np.abs(shifted) < tiny))
+        scores.append((kind, s, lab, shifted))
+
+    if not torch.set_flush_denormal(True):
+        pytest.skip("this CPU cannot flush subnormals to zero")
+    w._FLUSH["on"] = True
+    try:
+        init = w._fp_thread_init
+        serial = w.n_targets_at_many(x, tgt, 0.01, workers=1)
+        assert serial[0] == 0, "DAZ is not in effect: the subnormal column separated"
+        assert w.n_targets_at_many(x, tgt, 0.01, workers=4, initializer=init) == serial
+
+        ref = np.empty((n, nf), np.float32)
+        r1, r2 = w._fill_parquet_matrix_legacy(str(features), names, n, 700, ref)
+        j11 = names.index("f11")
+        assert not np.any((ref[:, j11] != 0) & (np.abs(ref[:, j11]) < tiny)), (
+            "flush-to-zero is not in effect on the main thread")
+        got = np.empty((n, nf), np.float32)
+        g1, g2 = w.fill_parquet_matrix(str(features), names, n, 700, got, threads=4,
+                                       initializer=init)
+        assert got.tobytes() == ref.tobytes(), "a fill thread narrowed without FTZ"
+        assert g1.tobytes() == r1.tobytes() and g2.tobytes() == r2.tobytes(), (
+            "a fill thread summed float32 subnormals without DAZ")
+        mean, std = w.moments_to_mean_std(r1, r2, n)
+        a, b = ref.copy(), ref.copy()
+        w.standardise_matrix(a, mean, std, 700, threads=1)
+        w.standardise_matrix(b, mean, std, 700, threads=4, initializer=init, block=256)
+        assert a.tobytes() == b.tobytes()
+
+        for kind, s, lab, shifted in scores:
+            assert np.array_equal(w.desc_order(s), np.argsort(-s, kind="stable")), kind
+            want = (w.tda_q(shifted, lab.astype(np.float32)) <= 0.05) & lab
+            got_sel = w.select_positives(shifted, lab, 0.05)
+            assert got_sel is None or np.array_equal(got_sel, want), kind
+    finally:
+        torch.set_flush_denormal(False)
+        w._FLUSH["on"] = False
+
+
+@pytest.mark.parametrize("backend", ["in-memory", "stream", "tsv"])
+def test_parallel_folds_do_not_depend_on_the_process_count(torch_available, tmp_path, backend):
+    """MUMDIA_NN_PARALLEL: the scores are a function of the tasks, not of the processes.
+
+    The keyed epoch shuffle makes every (seed, fold) task self-contained, so one process
+    running the six tasks in turn and three running them at once must return the same
+    bytes, at the same per-process thread count. Every row is still scored exactly once,
+    and neither the shared memmap nor the side arrays may be left behind. Each backend
+    reaches the children by its own route: the parquet in-memory load writes the matrix
+    into the memmap, the streaming backend hands over its own memmap, and the TSV load
+    copies its standardised matrix into one.
+    """
+    pin, _keys, n, env = _identity_inputs(tmp_path, backend)
+    env = dict(env, MUMDIA_NN_SEEDS="2", MUMDIA_NN_PARALLEL_THREADS="1")
+    outs = {}
+    for k in (1, 3):
+        out = tmp_path / ("parallel_%d.parquet" % k)
+        stdout, _ = run_worker_ok("nn_rescore_worker.py", pin, out,
+                                  env=dict(env, MUMDIA_NN_PARALLEL=str(k)))
+        assert "parallel training: %d process(es) x 1 torch thread(s) for 6 task(s)" % k in stdout
+        assert ("backend=stream(memmap)" in stdout) == (backend == "stream")
+        assert ("format=tsv" in stdout) == (backend == "tsv")
+        assert_complete_finite_coverage(out, n, sidecar="nn_rescore_worker[parallel=%d]" % k)
+        outs[k] = _scores_by_row(out)
+    assert np.array_equal(outs[1][0], outs[3][0])
+    assert outs[1][1].tobytes() == outs[3][1].tobytes(), (
+        "the parallel scores depend on the process count")
+    leftovers = [p.name for p in tmp_path.iterdir()
+                 if p.name.endswith((".feat.mm", ".npy"))]
+    assert not leftovers, "parallel training left files behind: %s" % leftovers
+
+
+def test_failed_run_removes_its_memmap(torch_available, tmp_path):
+    """A worker that fails must not leave its memmap behind (Windows keeps it mapped until
+    the traceback is released, so the removal is retried after it is printed)."""
+    features, keys, n = _identity_pool(tmp_path)
+    env = dict(IDENTITY_ENV, MUMDIA_NN_FOLD_KEYS=str(keys), MUMDIA_NN_STREAM="1",
+               MUMDIA_NN_TRAIN_FDR="0.0000001", MUMDIA_NN_INIT_FDR_MAX="0")
+    out = tmp_path / "failing.parquet"
+    rc, _, err = run_worker("nn_rescore_worker.py", features, out, env=env)
+    assert rc != 0
+    assert "selected no positive targets" in err
+    assert not (tmp_path / "failing.parquet.feat.mm").exists()
+    rc, _, err = run_worker("nn_rescore_worker.py", features, out,
+                            env=dict(env, MUMDIA_NN_STREAM="0", MUMDIA_NN_PARALLEL="2"))
+    assert rc != 0
+    assert "selected no positive targets" in err
+    # A child's log reaches the parent only inside the exception, and it is what explains
+    # the failure: the rescans and the init feature the fold started from.
+    assert "--- log of that task ---" in err
+    assert "rescanning on" in err and "init=" in err
+    assert not [p.name for p in tmp_path.iterdir() if p.name.startswith("failing.parquet.")]

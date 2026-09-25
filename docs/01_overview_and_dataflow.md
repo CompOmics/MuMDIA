@@ -175,8 +175,9 @@ diagnostic sidecar not yet scored downstream (see docs/18 A6, and Gotchas below)
 
 `features.parquet` (`features.rs:828`): bookkeeping columns `candidate_id`,
 `label`, `base_peptide_id`, `peptidoform`, `protein`, `apex_rt`, `elution_lo`,
-`elution_hi`, `precursor_mz`, `prelim_score`, followed by one f64 column per
-active feature name (`features.rs:839`). Sidecar `features.parquet.schema.json`
+`elution_hi`, `precursor_mz`, `prelim_score`, followed by one column per
+active feature name (`features.rs:839`), stored as Float32 except the five
+`F64_FEATURE_COLUMNS` (schema v2; docs/15_data_dictionary.md). Sidecar `features.parquet.schema.json`
 records the ordered feature-column list and its hashed `schema_id`; `run.pin` is
 the Percolator input written deterministically alongside.
 
@@ -281,10 +282,24 @@ Per-subcommand specifics that are easy to miss:
 - `search-seed` reads `extract.bucket_size` from the config (not a `search_seed`
   field) for its fragment-index bucketing (`main.rs:473`, `run.rs:225`).
 - `rescore` standalone accepts several `--competed` tables for experiment-wide
-  scoring and uses a fixed `sidecar_work` working directory (`main.rs:588`);
-  inside `run` it is passed exactly one table and a per-out-dir work directory.
+  scoring and puts its sidecar files in `--work-dir` (default `sidecar_work` in the
+  current directory); inside `run` it is passed exactly one table and a per-out-dir
+  work directory. `MUMDIA_SIDECAR_DIR` overrides both (docs/13).
 - `run-experiment` (`main.rs:660`, `run_experiment.rs:267`) runs the per-file
-  chain over N runs, rescores all competed tables in one pass
+  chain over N runs. An ungrouped experiment runs it in three phases: every run is
+  converted, then ONE seed library and fragment index (`search_seed::SeedLibrary`,
+  the m/z-only library at the seed tolerance) is loaded and every run is seeded
+  against it, then the library is dropped and each run continues from its seed
+  (RT adaptation, rt-im-train, extract, features, compete, under the same
+  `experiment.rt_library_scope` and `parallel_runs` rules as before). Every run's
+  seed searched the same base library at the same tolerance, so each used to load
+  and index the same arrays again; the outputs are unchanged, only the order in
+  which stages of different runs execute. One consequence of that order: a run whose
+  conversion fails stops the experiment before any run is seeded, so the earlier
+  runs' directories hold only `spectra/`. The smoke test checks both this and that
+  `parallel_runs = 2` writes the same parquet and TSV bytes as the sequential
+  experiment. A grouped run keeps its own chain. It
+  then rescores all competed tables in one pass
   (`run_experiment.rs:428`), then splits the scored table by `source` for per-run
   quant (`run_experiment.rs:474-477`), cross-run LFQ, and then the
   experiment-wide report (`report::run_experiment`): one `peptides.tsv` and one

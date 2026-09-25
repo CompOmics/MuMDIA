@@ -31,9 +31,14 @@ struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
 
-    /// Maximum worker threads. Default: every core.
+    /// Worker threads of the engine's thread pools. Default: every core.
     ///
-    /// Bounds the engine's rayon pool and is forwarded to the Python sidecars as
+    /// Sets the engine's rayon pool to N threads and the parquet codec pool to
+    /// min(N, 8) threads, serial at N = 1 (docs/03_io_layer.md, "Parallel column
+    /// codec"). The codec pool encodes and decodes artifacts for writer and loader
+    /// threads that run beside the rayon pool, so up to N + min(N, 8) threads can be
+    /// busy at once; add `MUMDIA_PARQUET_THREADS=1` to keep the parquet codec serial
+    /// and the run near N threads. N is also forwarded to the Python sidecars as
     /// `MUMDIA_NN_THREADS` and `OMP_NUM_THREADS` unless those are already set.
     /// Without this there was no way to bound MuMDIA at all except the
     /// undocumented `RAYON_NUM_THREADS`, which the engine never read and which
@@ -89,6 +94,10 @@ fn apply_threads(threads: Option<usize>) -> Result<()> {
         .num_threads(n)
         .build_global()
         .map_err(|e| anyhow::anyhow!("cannot set --threads {n}: {e}"))?;
+    // The parquet codec's own pool: min(n, 8) threads, none at `--threads 1`. It is a
+    // second pool beside the global one, used from plain writer and loader threads while
+    // the global pool works, so the two together can keep n + min(n, 8) threads busy.
+    mumdia_io::codec::set_codec_threads(n);
     for var in ["MUMDIA_NN_THREADS", "OMP_NUM_THREADS"] {
         if std::env::var_os(var).is_none() {
             std::env::set_var(var, n.to_string());
@@ -312,6 +321,12 @@ enum Cmd {
         competed: Vec<String>,
         #[arg(long)]
         out: String,
+        /// Directory for a sidecar classifier's files: the feature handoff, the fold keys,
+        /// the worker's output and its streaming memmap. Default: `MUMDIA_SIDECAR_DIR`
+        /// when set, else `sidecar_work` in the current directory. The files are removed
+        /// once the scores are read back, unless `MUMDIA_KEEP_HANDOFF=1`.
+        #[arg(long)]
+        work_dir: Option<String>,
         #[arg(long)]
         config: Option<String>,
     },
@@ -319,8 +334,16 @@ enum Cmd {
     Quant {
         #[arg(long)]
         psms_scored: String,
+        /// The run's chromatogram table, or a grouped run's band tables in band order
+        /// (`groups/gNN/chromatograms.parquet`) when it did not pool them.
+        #[arg(long, num_args = 1.., required = true)]
+        chromatograms: Vec<String>,
+        /// A grouped run's `groups/overlap_losers.parquet`: the candidates each band table
+        /// does not contribute, because the pool's overlap dedup gave them to another
+        /// band. Its `band` column indexes the `--chromatograms` list, which must be the
+        /// band tables the file names, in its order (a mismatch is refused).
         #[arg(long)]
-        chromatograms: String,
+        overlap_losers: Option<String>,
         #[arg(long)]
         out_peptide: String,
         #[arg(long)]
@@ -1209,6 +1232,7 @@ fn real_main() -> Result<()> {
                 // Standalone: this invocation decodes the run itself.
                 ms2_scans: None,
                 emit_calibrants: false,
+                library: None,
                 ms2: &ms2,
                 library_precursors: &lib_precursors,
                 library_fragments: &lib_fragments,
@@ -1304,6 +1328,9 @@ fn real_main() -> Result<()> {
                 precursor_span: None,
                 fragment_offset,
                 sibling_bands: 1,
+                // Standalone: the windows come from the named file, which is this stage's
+                // contract; only the orchestrators hand them over in memory.
+                rt_windows: None,
                 // Standalone: this invocation decodes the run itself.
                 scans: None,
                 ms2: &ms2,
@@ -1371,6 +1398,7 @@ fn real_main() -> Result<()> {
                 out: &out,
                 cfg: &cfg.compete,
                 config_hash: &ch,
+                features_hash: None,
             })?;
         }
         Cmd::Pool {
@@ -1421,8 +1449,11 @@ fn real_main() -> Result<()> {
             let stats = stages::pool::run(stages::pool::PoolParams {
                 bands: &bands,
                 out_psms: psms.then_some(op.as_str()),
-                out_chromatograms: &oc,
-                out_competed: &ok,
+                out_chromatograms: Some(&oc),
+                out_losers: None,
+                out_competed: Some(ok.as_str()),
+                // The band directories carry no plan here, so the pool looks.
+                bands_disjoint: false,
             })?;
             println!(
                 "pooled {} bands: {} competed rows, {} chromatogram rows, {} overlap                  duplicates removed{}",
@@ -1461,14 +1492,18 @@ fn real_main() -> Result<()> {
         Cmd::Rescore {
             competed,
             out,
+            work_dir,
             config,
         } => {
             let cfg = load_config(&config)?;
             let ch = mumdia_io::hash::blake3_str(&cfg.canonical_json());
+            let work_dir =
+                work_dir.unwrap_or_else(|| stages::rescore::sidecar_work_dir("sidecar_work"));
             stages::rescore::run(stages::rescore::RescoreParams {
                 competed: &competed,
+                sources: None,
                 out: &out,
-                work_dir: "sidecar_work",
+                work_dir: &work_dir,
                 script_dir: &cfg.predict_frag.sidecar_script_dir,
                 cfg: &cfg.rescore,
                 config_hash: &ch,
@@ -1576,6 +1611,7 @@ fn real_main() -> Result<()> {
         Cmd::Quant {
             psms_scored,
             chromatograms,
+            overlap_losers,
             out_peptide,
             out_protein,
             out_fragment,
@@ -1584,9 +1620,21 @@ fn real_main() -> Result<()> {
         } => {
             let cfg = load_config(&config)?;
             let ch = mumdia_io::hash::blake3_str(&cfg.canonical_json());
+            let losers = match &overlap_losers {
+                Some(path) => stages::pool::read_losers(path, &chromatograms)?,
+                None => vec![Vec::new(); chromatograms.len()],
+            };
+            let tables: Vec<stages::quant::ChromTable> = chromatograms
+                .iter()
+                .zip(losers)
+                .map(|(path, drop)| stages::quant::ChromTable {
+                    path: path.clone(),
+                    drop,
+                })
+                .collect();
             stages::quant::run(stages::quant::QuantParams {
                 psms_scored: &psms_scored,
-                chromatograms: &chromatograms,
+                chromatograms: &tables,
                 out_peptide: &out_peptide,
                 out_protein: &out_protein,
                 out_fragment: out_fragment.as_deref(),

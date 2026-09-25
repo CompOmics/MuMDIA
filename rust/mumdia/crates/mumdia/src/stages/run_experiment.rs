@@ -22,10 +22,12 @@ use arrow::compute::filter_record_batch;
 use mumdia_core::config::{Config, QuantQColumn, RtLibraryScope};
 use mumdia_core::manifest::Manifest;
 use mumdia_core::schema::artifact;
+use mumdia_io::table::Written;
 use rayon::prelude::*;
 use serde_json::json;
 use tracing::{info, warn};
 
+use crate::stages::quant::ChromTable;
 use crate::stages::*;
 
 pub struct RunExperimentParams<'a> {
@@ -158,7 +160,9 @@ fn preflight(p: &RunExperimentParams) -> Result<()> {
 /// `shared_ft` is a precursor library that has ALREADY been
 /// DeepLC-fine-tuned (by an earlier run of this same experiment); when present this run
 /// uses it as-is instead of fine-tuning again, and still fits its own retention-time
-/// calibration on top. Returns `(competed, chromatograms, fine_tuned_library_if_produced)`.
+/// calibration on top. Returns `(competed, chromatograms, fine_tuned_library_if_produced)`,
+/// where `competed` is the run's competed tables in row order: one, or a grouped run's band
+/// tables when its pooled table was not written (`groups.pool_competed = false`).
 #[allow(clippy::too_many_arguments)]
 fn process_run(
     cfg: &Config,
@@ -180,7 +184,7 @@ fn process_run(
     // `lib_p_base` carries placeholder iRT the multi-head calibration must replace in full
     // (`predict_frag.defer_deeplc_to_multihead`).
     irt_placeholder: bool,
-) -> Result<(String, String, Option<String>)> {
+) -> Result<(Vec<String>, Vec<ChromTable>, Option<String>)> {
     let co = convert_run(cfg, mzml, out, top_peaks_ms2, max_spectra)?;
     let has_deeplc = cfg.predict_frag.deeplc_python.is_some();
     let mh_heads = cfg
@@ -214,22 +218,22 @@ fn process_run(
             Some(format!("{out}/groups")),
         ));
     }
-    let seed = seed_run(cfg, ch, &co, lib_p_base, lib_f, out)?;
-    let (lib_p, produced_rt_lib) = adapt_rt_library(
+    let seed = seed_run(cfg, ch, lib_p_base, lib_f, &co, out, None)?;
+    chain_after_seed(
         cfg,
+        ch,
         lib_p_base,
-        &seed,
+        lib_f,
+        library_input,
+        &co,
         out,
-        mh_heads,
+        &seed,
         shared_rt_lib,
         irt_placeholder,
-        rayon::current_num_threads(),
-    )?;
-    let (competed, chrom) = finish_run(cfg, ch, &lib_p, lib_f, &co, &seed, out)?;
-    Ok((competed, chrom, produced_rt_lib))
+    )
 }
 
-/// Convert one run's mzML (or vendor file) into its `spectra/` artifacts.
+/// Convert one run's mzML (or vendor file) into `<out>/spectra`.
 fn convert_run(
     cfg: &Config,
     mzml: &str,
@@ -260,24 +264,26 @@ fn convert_run(
     })
 }
 
-/// The ungrouped seed search of one run, on the base library (the seed is
-/// iRT-independent). Returns the seed table's path.
+/// Seed one ungrouped run against the base library (the seed is iRT-independent) into
+/// `<out>/seed_psms.parquet`, with the experiment's shared seed library when one is lent.
+/// Returns the seed path.
 fn seed_run(
     cfg: &Config,
     ch: &str,
-    co: &convert::ConvertOutputs,
     lib_p_base: &str,
     lib_f: &str,
+    co: &convert::ConvertOutputs,
     out: &str,
+    library: Option<&search_seed::SeedLibrary>,
 ) -> Result<String> {
-    let d = |name: &str| format!("{out}/{name}");
-    let seed = d("seed_psms.parquet");
+    let seed = format!("{out}/seed_psms.parquet");
     search_seed::run(search_seed::SearchSeedParams {
         precursor_span: None,
         fragment_offset: None,
         // One reader at a time, as in the ungrouped `run`.
         ms2_scans: None,
         emit_calibrants: false,
+        library,
         ms2: &co.ms2,
         library_precursors: lib_p_base,
         library_fragments: lib_f,
@@ -287,6 +293,44 @@ fn seed_run(
         config_hash: ch,
     })?;
     Ok(seed)
+}
+
+/// Everything of an ungrouped run's chain after its seed: the optional RT-library
+/// adaptation, rt-im-train, extract, features and compete. Returns
+/// `(competed, chromatograms, adapted_library_if_produced)`.
+#[allow(clippy::too_many_arguments)]
+fn chain_after_seed(
+    cfg: &Config,
+    ch: &str,
+    lib_p_base: &str,
+    lib_f: &str,
+    library_input: bool,
+    co: &convert::ConvertOutputs,
+    out: &str,
+    seed: &str,
+    shared_rt_lib: Option<&str>,
+    irt_placeholder: bool,
+) -> Result<(Vec<String>, Vec<ChromTable>, Option<String>)> {
+    let has_deeplc = cfg.predict_frag.deeplc_python.is_some();
+    let mh_heads = cfg
+        .rt_im_train
+        .multihead_heads(has_deeplc, cfg.deeplc_rt_source(library_input, has_deeplc));
+    let (lib_p, produced_rt_lib) = adapt_rt_library(
+        cfg,
+        lib_p_base,
+        seed,
+        out,
+        mh_heads,
+        shared_rt_lib,
+        irt_placeholder,
+        rayon::current_num_threads(),
+    )?;
+    let (competed, chrom) = finish_run(cfg, ch, &lib_p, lib_f, co, seed, out)?;
+    Ok((
+        vec![competed],
+        vec![ChromTable::whole(&chrom)],
+        produced_rt_lib,
+    ))
 }
 
 /// Choose the precursor table the rest of an ungrouped run reads: a previous run's adapted
@@ -394,7 +438,8 @@ fn finish_run(
 ) -> Result<(String, String)> {
     let d = |name: &str| format!("{out}/{name}");
     let windows = d("run_windows.parquet");
-    rt_im_train::run(rt_im_train::RtImTrainParams {
+    // Handed to extract in memory; see `rt_im_train::RtWindows`.
+    let (_, fitted_windows) = rt_im_train::run_in_memory(rt_im_train::RtImTrainParams {
         precursor_span: None,
         anchor_irt_from_seed: false,
         seed_psms: seed,
@@ -410,6 +455,7 @@ fn finish_run(
         precursor_span: None,
         fragment_offset: None,
         sibling_bands: 1,
+        rt_windows: fitted_windows,
         scans: None,
         ms2: &co.ms2,
         library_precursors: lib_p,
@@ -424,7 +470,7 @@ fn finish_run(
         config_hash: ch,
     })?;
     let feats = d("features.parquet");
-    features::run(features::FeaturesParams {
+    let features_written = features::run_hashed(features::FeaturesParams {
         psms: &psms,
         chromatograms: &chrom,
         seed: Some(seed),
@@ -439,30 +485,222 @@ fn finish_run(
         out: &competed,
         cfg: &cfg.compete,
         config_hash: ch,
+        features_hash: Some(&features_written.content_hash),
     })?;
     Ok((competed, chrom))
 }
 
 /// Split an experiment-wide scored table into per-run tables by the `source`
-/// column (0..n-1), preserving the schema exactly (arrow row filter). Quant then
-/// runs per run with `q_filter = psm_q`, keeping each run's own confident PSMs.
-fn split_by_source(scored: &str, out_paths: &[String]) -> Result<()> {
-    // One streaming pass: every output has its writer open, each input batch is filtered
-    // once per run and appended, so the resident set is one batch rather than the whole
-    // experiment-wide scored table that the old read-then-filter held in full.
+/// column (0..n-1), preserving the schema and the rows exactly. Quant then runs per run
+/// with `q_filter = psm_q`, keeping each run's own confident PSMs. Returns each run's table
+/// with its content hash, computed while it was written.
+///
+/// The rows of one run are contiguous: rescore appends each competed table's rows in input
+/// order and stamps `source` with the input's index, the top-K collapse keeps that order,
+/// and MBR's round trip preserves it. So every row group except at most `n_runs - 1`
+/// boundary groups holds one source, and its statistics say so (`min == max`). Those
+/// groups are spliced into their run's table as bytes (`SpliceWriter`), and only the
+/// boundary groups are decoded, filtered and re-encoded. Decoding and re-encoding all of
+/// it, which this did before, is one thread's work over every row of every column: an
+/// estimated 3.5-7 min on the 258.75M-row immunopeptidomics pool, against a copy at disk
+/// speed.
+///
+/// The per-run tables hold the same rows, in the same order, with the same values either
+/// way, so quant and the report read the same data. Their bytes differ from a re-encoded
+/// split: a spliced group keeps the scored table's own layout (1,048,576-row groups), so
+/// the content hashes the experiment manifest records for them change. The re-encoding
+/// path remains for a table the splice cannot take: one whose `source` is nullable or has
+/// no statistics (the MBR worker's pyarrow output), or whose re-encoded boundary rows the
+/// splice refuses.
+fn split_by_source(scored: &str, out_paths: &[String]) -> Result<Vec<Written>> {
     let t = mumdia_io::table::TableFile::open(scored)?;
     let src_idx = t
         .schema
         .index_of("source")
         .map_err(|_| anyhow::anyhow!("scored table has no `source` column for split"))?;
-    // Row groups capped as the rescore handoff caps them. The scored table is ~390 float
-    // columns wide, so parquet's default 1,048,576-row group is about 3 GB decoded, and
-    // every reader of these per-run tables (quant, report) then pays that in one allocation.
-    // Only the row-group boundaries change; the rows, their order and their values do not.
+    if t.schema.field(src_idx).data_type() != &arrow::datatypes::DataType::UInt32 {
+        anyhow::bail!("`source` column is not u32");
+    }
+    let spliced = if t.schema.field(src_idx).is_nullable() {
+        None
+    } else {
+        match split_spliced(&t, scored, out_paths) {
+            Ok(done) => done,
+            Err(e) => {
+                warn!(
+                    error = %format!("{e:#}"),
+                    "run-experiment: splicing the scored table by source failed; re-encoding \
+                     every row instead"
+                );
+                None
+            }
+        }
+    };
+    let (written_tables, written) = match spliced {
+        Some(done) => done,
+        None => split_rewritten(&t, src_idx, out_paths)?,
+    };
+    // The split is a partition, so it must account for every input row. Nothing
+    // enforced that: a `source` value outside `0..out_paths.len()` -- which a
+    // hand-assembled or externally rescored table can carry, and which the MBR
+    // worker could reintroduce -- dropped those PSMs into no output at all. Every
+    // downstream number is then computed from a silently smaller population, with
+    // no error and no warning. A count is the whole check.
+    let total: usize = t.nrows;
+    if written != total {
+        anyhow::bail!(
+            "splitting {scored} by `source` placed {written} of {total} rows into \
+             {} per-run tables; the rest carry a source index outside 0..{}, so they \
+             would be dropped from every per-run quantity",
+            out_paths.len(),
+            out_paths.len()
+        );
+    }
+    Ok(written_tables)
+}
+
+/// Rows per row group of a re-encoded per-run table, and of the re-encoded boundary rows
+/// the splice takes. The scored table is 22 columns wide (two more after MBR), about 170
+/// bytes a row decoded, so a group is about 22 MB.
+const SPLIT_ROW_GROUP_ROWS: usize = 1 << 17;
+
+/// The splice form of [`split_by_source`]: `None` when the statistics cannot drive it.
+/// Returns the tables and the rows placed.
+fn split_spliced(
+    t: &mumdia_io::table::TableFile,
+    scored: &str,
+    out_paths: &[String],
+) -> Result<Option<(Vec<Written>, usize)>> {
+    use mumdia_io::table::SpliceWriter;
+    let stats = t.row_group_stats("source")?;
+    let spans = SpliceWriter::row_group_spans(scored)?;
+    if stats.len() != spans.len() {
+        return Ok(None);
+    }
+    let n = out_paths.len();
+    // Per row group, the run whose rows it holds, when its statistics say it holds one
+    // run's rows only. A group whose one source is outside 0..n is left to the boundary
+    // rewrite, which places none of its rows, so the partition check reports them.
+    let single: Vec<Option<usize>> = stats
+        .iter()
+        .map(|s| match (s.min, s.max) {
+            (Some(lo), Some(hi)) if lo == hi && lo >= 0.0 && lo < n as f64 => Some(lo as usize),
+            _ => None,
+        })
+        .collect();
+    let mut writers: Vec<SpliceWriter> = out_paths
+        .iter()
+        .map(|out| SpliceWriter::create_hashed(out, scored))
+        .collect::<Result<_>>()?;
+    let mut written = 0usize;
+    let mut g = 0usize;
+    while g < spans.len() {
+        match single[g] {
+            Some(run) => {
+                // Consecutive groups of this one source, spliced in one call.
+                let start = g;
+                while g < spans.len() && single[g] == Some(run) {
+                    g += 1;
+                }
+                let end = g;
+                written +=
+                    writers[run].append_row_groups(scored, |k| k >= start && k < end)? as usize;
+            }
+            None => {
+                written += rewrite_boundary_group(t, spans[g], out_paths, &mut writers)?;
+                g += 1;
+            }
+        }
+    }
+    let tables = writers
+        .into_iter()
+        .map(SpliceWriter::close_hashed)
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Some((tables, written)))
+}
+
+/// Decode one row group that holds more than one source, and splice each run's rows of it
+/// into that run's table through a temporary file. Returns the rows placed.
+fn rewrite_boundary_group(
+    t: &mumdia_io::table::TableFile,
+    span: (usize, usize),
+    out_paths: &[String],
+    writers: &mut [mumdia_io::table::SpliceWriter],
+) -> Result<usize> {
+    let (first_row, n_rows) = span;
+    let part = t.span(first_row, n_rows)?;
+    let src_idx = part
+        .schema
+        .index_of("source")
+        .map_err(|_| anyhow::anyhow!("scored table has no `source` column for split"))?;
+    // One temporary table per run with rows in this group, created with its first row.
+    let mut temps: Vec<Option<(String, mumdia_io::table::BatchWriter)>> =
+        (0..out_paths.len()).map(|_| None).collect();
+    let mut placed = 0usize;
+    part.for_each_batch(None, 1 << 14, |b| {
+        let src = b
+            .column(src_idx)
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .ok_or_else(|| anyhow::anyhow!("`source` column is not u32"))?;
+        for (i, slot) in temps.iter_mut().enumerate() {
+            let mask: BooleanArray = (0..src.len()).map(|k| src.value(k) == i as u32).collect();
+            let filtered = filter_record_batch(b, &mask)?;
+            if filtered.num_rows() == 0 {
+                continue;
+            }
+            if slot.is_none() {
+                let tmp = format!("{}.split-rg{first_row}.parquet", out_paths[i]);
+                let w = mumdia_io::table::BatchWriter::with_row_group_rows(
+                    &tmp,
+                    part.schema.clone(),
+                    SPLIT_ROW_GROUP_ROWS,
+                )?;
+                *slot = Some((tmp, w));
+            }
+            let (_, w) = slot.as_mut().expect("created above");
+            w.write(&filtered)?;
+            placed += filtered.num_rows();
+        }
+        Ok(())
+    })?;
+    let mut spliced = 0usize;
+    for (i, slot) in temps.into_iter().enumerate() {
+        let Some((tmp, w)) = slot else {
+            continue;
+        };
+        w.close()?;
+        let appended = writers[i].append_row_groups(&tmp, |_| true);
+        std::fs::remove_file(&tmp).ok();
+        spliced += appended? as usize;
+    }
+    if spliced != placed {
+        anyhow::bail!("split: re-encoded {placed} boundary rows but spliced {spliced}");
+    }
+    Ok(placed)
+}
+
+/// The re-encoding form of [`split_by_source`]: one streaming pass, every output with its
+/// writer open, each input batch filtered once per run and appended, so the resident set is
+/// one batch rather than the whole experiment-wide scored table. Returns the tables and the
+/// rows placed.
+fn split_rewritten(
+    t: &mumdia_io::table::TableFile,
+    src_idx: usize,
+    out_paths: &[String],
+) -> Result<(Vec<Written>, usize)> {
+    // Row groups capped at 131,072 rows. Only the row-group boundaries change; the rows,
+    // their order and their values do not.
     let mut writers: Vec<mumdia_io::table::BatchWriter> = out_paths
         .iter()
         .map(|out| {
-            mumdia_io::table::BatchWriter::with_row_group_rows(out, t.schema.clone(), 1 << 17)
+            mumdia_io::table::BatchWriter::with_options(
+                out,
+                t.schema.clone(),
+                mumdia_io::table::WriteOptions::new()
+                    .row_group_rows(SPLIT_ROW_GROUP_ROWS)
+                    .content_hash(),
+            )
         })
         .collect::<Result<_>>()?;
     let mut written = 0usize;
@@ -482,26 +720,11 @@ fn split_by_source(scored: &str, out_paths: &[String]) -> Result<()> {
         }
         Ok(())
     })?;
-    for w in writers {
-        w.close()?;
-    }
-    // The split is a partition, so it must account for every input row. Nothing
-    // enforced that: a `source` value outside `0..out_paths.len()` -- which a
-    // hand-assembled or externally rescored table can carry, and which the MBR
-    // worker could reintroduce -- dropped those PSMs into no output at all. Every
-    // downstream number is then computed from a silently smaller population, with
-    // no error and no warning. A count is the whole check.
-    let total: usize = t.nrows;
-    if written != total {
-        anyhow::bail!(
-            "splitting {scored} by `source` placed {written} of {total} rows into \
-             {} per-run tables; the rest carry a source index outside 0..{}, so they \
-             would be dropped from every per-run quantity",
-            out_paths.len(),
-            out_paths.len()
-        );
-    }
-    Ok(())
+    let tables = writers
+        .into_iter()
+        .map(mumdia_io::table::BatchWriter::close_hashed)
+        .collect::<Result<Vec<_>>>()?;
+    Ok((tables, written))
 }
 
 /// Reject run names that would share a per-run output directory.
@@ -767,8 +990,11 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
     // rayon's indexed `collect` preserves within-chunk order, so the result is identical
     // to the sequential build regardless of completion order.
     let par = cfg.experiment.parallel_runs.max(1);
-    let mut competed: Vec<String> = Vec::with_capacity(n_runs);
-    let mut chroms: Vec<String> = Vec::with_capacity(n_runs);
+    // Each run's competed tables, in row order (see `process_run`).
+    let mut competed: Vec<Vec<String>> = Vec::with_capacity(n_runs);
+    // Each run's chromatogram tables, in row order: one, or a grouped run's band tables
+    // (`groups.pool_chromatograms = false`).
+    let mut chroms: Vec<Vec<ChromTable>> = Vec::with_capacity(n_runs);
 
     // Under `RtLibraryScope::FirstRunOnly` (the default) the first run is processed alone
     // so the library it adapted can be handed to all the others. That adaptation -- the
@@ -802,8 +1028,8 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
             RtLibraryScope::FirstRunOnly
         )
         && n_runs > 1;
-    let mut shared_ft: Option<String> = None;
-    let mut first: usize = 0;
+    // `experiment.overlap_front_threads`: under first_run_only, the converts and seeds of
+    // runs 2..N run beside run 1's RT adaptation instead of before it (the branch below).
     let grouped_runs = cfg.groups.window_groups > 1;
     let overlap = cfg.experiment.overlap_front_threads;
     if overlap > 0 && (grouped_runs || !share_ft) {
@@ -814,13 +1040,126 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
              running the runs one after the other"
         );
     }
-    if share_ft && overlap > 0 && !grouped_runs {
+    let overlapped = share_ft && overlap > 0 && !grouped_runs;
+    // Ungrouped runs seed against ONE library: every run's seed searches the base library
+    // at the seed tolerance, so the library and its fragment index are the same arrays for
+    // every run, and each seed used to load and build them again. So the chain runs in
+    // three phases: every run is converted first (the conversion is the memory-heavy step
+    // of its own and needs no library), then the seed library is loaded once and every run
+    // seeded against it, then the library is dropped and each run's chain continues from
+    // its seed. The outputs are the ones the per-run chain wrote: every stage is
+    // deterministic and reads only its own run's inputs, so only the order in which the
+    // stages of different runs execute changes. A grouped run seeds band by band against
+    // band libraries and keeps its own chain. The overlapped experiment orders its own
+    // phases (below), so it skips these.
+    let library_input = p.lib_precursors.is_some();
+    let prepared: Vec<Option<(convert::ConvertOutputs, String)>> = if grouped_runs || overlapped {
+        (0..n_runs).map(|_| None).collect()
+    } else {
+        let mut conv: Vec<convert::ConvertOutputs> = Vec::with_capacity(n_runs);
+        let all: Vec<usize> = (0..n_runs).collect();
+        for chunk in all.chunks(par) {
+            let done: Vec<convert::ConvertOutputs> = crate::colread::first_err(
+                chunk
+                    .par_iter()
+                    .map(|&i| {
+                        info!(run = %names[i], i = i + 1, n = n_runs, "run-experiment: convert");
+                        convert_run(
+                            cfg,
+                            &p.mzmls[i],
+                            &d(&names[i]),
+                            p.top_peaks_ms2,
+                            p.max_spectra,
+                        )
+                    })
+                    .collect(),
+            )?;
+            conv.extend(done);
+        }
+        let t_lib = Instant::now();
+        let seed_lib = search_seed::SeedLibrary::load(
+            &lib_p_base,
+            &lib_f,
+            None,
+            None,
+            &cfg.search_seed,
+            cfg.extract.bucket_size,
+        )?;
+        info!(
+            candidates = seed_lib.n_candidates(),
+            runs = n_runs,
+            elapsed_ms = t_lib.elapsed().as_millis() as u64,
+            "run-experiment: one seed library and fragment index for every run's seed"
+        );
+        let mut seeds: Vec<String> = Vec::with_capacity(n_runs);
+        for chunk in all.chunks(par) {
+            let done: Vec<String> = crate::colread::first_err(
+                chunk
+                    .par_iter()
+                    .map(|&i| {
+                        info!(run = %names[i], i = i + 1, n = n_runs, "run-experiment: seed");
+                        seed_run(
+                            cfg,
+                            &ch,
+                            &lib_p_base,
+                            &lib_f,
+                            &conv[i],
+                            &d(&names[i]),
+                            Some(&seed_lib),
+                        )
+                    })
+                    .collect(),
+            )?;
+            seeds.extend(done);
+        }
+        drop(seed_lib);
+        conv.into_iter().zip(seeds).map(Some).collect()
+    };
+    // One run's chain: from its seed when phases 1-2 ran, else (grouped) whole, with the
+    // band slices of an earlier grouped run to reuse (`slices_from`).
+    let run_one = |i: usize,
+                   shared: Option<&str>,
+                   slices_from: Option<&str>|
+     -> Result<(Vec<String>, Vec<ChromTable>, Option<String>)> {
+        match &prepared[i] {
+            Some((co, seed)) => chain_after_seed(
+                cfg,
+                &ch,
+                &lib_p_base,
+                &lib_f,
+                library_input,
+                co,
+                &d(&names[i]),
+                seed,
+                shared,
+                irt_placeholder,
+            ),
+            None => process_run(
+                cfg,
+                &ch,
+                &lib_p_base,
+                &lib_f,
+                library_input,
+                &p.mzmls[i],
+                &d(&names[i]),
+                p.top_peaks_ms2,
+                p.max_spectra,
+                shared,
+                library_irt_repredicted,
+                slices_from,
+                irt_placeholder,
+            ),
+        }
+    };
+
+    let mut shared_ft: Option<String> = None;
+    let mut first: usize = 0;
+    if overlapped {
         // Run 1's front, then its RT adaptation beside the fronts of runs 2..N on disjoint
         // thread budgets, then every run's rest on the whole pool.
         let total = rayon::current_num_threads();
         let front_threads = overlap.min(total.saturating_sub(1)).max(1);
         let adapt_threads = total.saturating_sub(front_threads).max(1);
-        let library_input = p.lib_precursors.is_some();
         let has_deeplc = cfg.predict_frag.deeplc_python.is_some();
         let mh_heads = cfg
             .rt_im_train
@@ -835,7 +1174,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         );
         let out0 = d(&names[0]);
         let co0 = convert_run(cfg, &p.mzmls[0], &out0, p.top_peaks_ms2, p.max_spectra)?;
-        let seed0 = seed_run(cfg, &ch, &co0, &lib_p_base, &lib_f, &out0)?;
+        let seed0 = seed_run(cfg, &ch, &lib_p_base, &lib_f, &co0, &out0, None)?;
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(front_threads)
             .build()
@@ -854,29 +1193,54 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         };
         let (adapted, fronts) = std::thread::scope(|scope| {
             let fronts = scope.spawn(|| {
-                let r = pool.install(|| {
-                    (1..n_runs)
-                        .map(|i| {
-                            use std::sync::atomic::Ordering;
-                            if cancel.load(Ordering::SeqCst) {
-                                return Err(cancelled());
-                            }
-                            let out = d(&names[i]);
-                            info!(run = %names[i], i = i + 1, n = n_runs, "run-experiment: convert and seed, overlapped");
-                            let co = convert_run(
-                                cfg,
-                                &p.mzmls[i],
-                                &out,
-                                p.top_peaks_ms2,
-                                p.max_spectra,
-                            )?;
-                            if cancel.load(Ordering::SeqCst) {
-                                return Err(cancelled());
-                            }
-                            let seed = seed_run(cfg, &ch, &co, &lib_p_base, &lib_f, &out)?;
-                            Ok((co, seed))
-                        })
-                        .collect::<Result<Vec<_>>>()
+                // The fronts keep the phase order of the ungrouped experiment above: every
+                // conversion first, with no library resident, then one seed library for all
+                // of their seeds (run 1 has already seeded on its own load).
+                let r = pool.install(|| -> Result<Vec<(convert::ConvertOutputs, String)>> {
+                    use std::sync::atomic::Ordering;
+                    let mut conv: Vec<convert::ConvertOutputs> = Vec::with_capacity(n_runs - 1);
+                    for (i, (name, mzml)) in names.iter().zip(p.mzmls).enumerate().skip(1) {
+                        if cancel.load(Ordering::SeqCst) {
+                            return Err(cancelled());
+                        }
+                        info!(run = %name, i = i + 1, n = n_runs, "run-experiment: convert, overlapped");
+                        conv.push(convert_run(
+                            cfg,
+                            mzml,
+                            &d(name),
+                            p.top_peaks_ms2,
+                            p.max_spectra,
+                        )?);
+                    }
+                    if cancel.load(Ordering::SeqCst) {
+                        return Err(cancelled());
+                    }
+                    let seed_lib = search_seed::SeedLibrary::load(
+                        &lib_p_base,
+                        &lib_f,
+                        None,
+                        None,
+                        &cfg.search_seed,
+                        cfg.extract.bucket_size,
+                    )?;
+                    let mut seeds: Vec<String> = Vec::with_capacity(n_runs - 1);
+                    for (co, i) in conv.iter().zip(1..n_runs) {
+                        if cancel.load(Ordering::SeqCst) {
+                            return Err(cancelled());
+                        }
+                        info!(run = %names[i], i = i + 1, n = n_runs, "run-experiment: seed, overlapped");
+                        seeds.push(seed_run(
+                            cfg,
+                            &ch,
+                            &lib_p_base,
+                            &lib_f,
+                            co,
+                            &d(&names[i]),
+                            Some(&seed_lib),
+                        )?);
+                    }
+                    drop(seed_lib);
+                    Ok(conv.into_iter().zip(seeds).collect())
                 });
                 if let Err(e) = &r {
                     if !cancel.load(std::sync::atomic::Ordering::SeqCst) {
@@ -911,8 +1275,8 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         let (lib0, produced) = adapted?;
         let fronts = fronts?;
         let (comp0, chrom0) = finish_run(cfg, &ch, &lib0, &lib_f, &co0, &seed0, &out0)?;
-        competed.push(comp0);
-        chroms.push(chrom0);
+        competed.push(vec![comp0]);
+        chroms.push(vec![ChromTable::whole(&chrom0)]);
         if produced.is_none() {
             warn!(
                 "run-experiment: the first run produced no adapted library; the remaining \
@@ -936,7 +1300,6 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         };
         let items: Vec<(usize, &(convert::ConvertOutputs, String))> =
             (1..n_runs).zip(fronts.iter()).collect();
-        let par = cfg.experiment.parallel_runs.max(1);
         for chunk in items.chunks(par) {
             let done: Vec<(String, String)> = if par == 1 {
                 chunk
@@ -950,8 +1313,8 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
                     .collect::<Result<Vec<_>>>()?
             };
             for (comp, chrom) in done {
-                competed.push(comp);
-                chroms.push(chrom);
+                competed.push(vec![comp]);
+                chroms.push(vec![ChromTable::whole(&chrom)]);
             }
         }
         first = n_runs;
@@ -961,21 +1324,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
             n = n_runs,
             "run-experiment: adapting the library's retention times on the first run only;              the remaining runs reuse that library and fit their own RT calibration on it              (experiment.rt_library_scope = per_run to adapt for every run instead)"
         );
-        let (comp, chrom, ft) = process_run(
-            cfg,
-            &ch,
-            &lib_p_base,
-            &lib_f,
-            p.lib_precursors.is_some(),
-            &p.mzmls[0],
-            &d(&names[0]),
-            p.top_peaks_ms2,
-            p.max_spectra,
-            None,
-            library_irt_repredicted,
-            None,
-            irt_placeholder,
-        )?;
+        let (comp, chrom, ft) = run_one(0, None, None)?;
         competed.push(comp);
         chroms.push(chrom);
         match ft {
@@ -1002,21 +1351,8 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
     if par == 1 {
         for &i in &rest {
             info!(run = %names[i], i = i + 1, n = n_runs, "run-experiment: per-run chain");
-            let (comp, chrom, groups_dir) = process_run(
-                cfg,
-                &ch,
-                &lib_p_base,
-                &lib_f,
-                p.lib_precursors.is_some(),
-                &p.mzmls[i],
-                &d(&names[i]),
-                p.top_peaks_ms2,
-                p.max_spectra,
-                shared_ft.as_deref(),
-                library_irt_repredicted,
-                slice_source.as_deref(),
-                irt_placeholder,
-            )?;
+            let (comp, chrom, groups_dir) =
+                run_one(i, shared_ft.as_deref(), slice_source.as_deref())?;
             competed.push(comp);
             chroms.push(chrom);
             if grouped && slice_source.is_none() {
@@ -1030,25 +1366,11 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
             "run-experiment: per-run chains in parallel (each run can hold tens of GB;              lower experiment.parallel_runs if memory is tight)"
         );
         for chunk in rest.chunks(par) {
-            let done: Vec<(String, String, Option<String>)> = chunk
+            let done: Vec<(Vec<String>, Vec<ChromTable>, Option<String>)> = chunk
                 .par_iter()
                 .map(|&i| {
                     info!(run = %names[i], i = i + 1, n = n_runs, "run-experiment: per-run chain");
-                    process_run(
-                        cfg,
-                        &ch,
-                        &lib_p_base,
-                        &lib_f,
-                        p.lib_precursors.is_some(),
-                        &p.mzmls[i],
-                        &d(&names[i]),
-                        p.top_peaks_ms2,
-                        p.max_spectra,
-                        shared_ft.as_deref(),
-                        library_irt_repredicted,
-                        slice_source.as_deref(),
-                        irt_placeholder,
-                    )
+                    run_one(i, shared_ft.as_deref(), slice_source.as_deref())
                 })
                 .collect::<Result<Vec<_>>>()?;
             for (comp, chrom, groups_dir) in done {
@@ -1062,11 +1384,23 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
     }
 
     // --- one experiment-wide rescore over all competed tables ---
+    //
+    // Every table of run i carries source i. When each run is one table (every run
+    // ungrouped, or grouped with its competed table pooled) the source is the table's own
+    // index, as it always was, and the rescore report is what it was.
+    let rescore_inputs: Vec<String> = competed.iter().flatten().cloned().collect();
+    let rescore_sources: Vec<u32> = competed
+        .iter()
+        .enumerate()
+        .flat_map(|(i, tables)| std::iter::repeat_n(i as u32, tables.len()))
+        .collect();
+    let one_table_per_run = competed.iter().all(|tables| tables.len() == 1);
     let scored_combined = d("scored_combined.parquet");
-    rescore::run(rescore::RescoreParams {
-        competed: &competed,
+    let scored_written = rescore::run_hashed(rescore::RescoreParams {
+        competed: &rescore_inputs,
+        sources: (!one_table_per_run).then_some(rescore_sources.as_slice()),
         out: &scored_combined,
-        work_dir: &d("sidecar_work"),
+        work_dir: &rescore::sidecar_work_dir(&d("sidecar_work")),
         script_dir: &cfg.predict_frag.sidecar_script_dir,
         cfg: &cfg.rescore,
         config_hash: &ch,
@@ -1106,12 +1440,20 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
                 format!("removing a previous run's {scored_mbr} before running MBR")
             })?;
         }
-        // The competed tables carry candidate_id + apex_rt in `source` order.
+        // The competed tables carry candidate_id + apex_rt in `source` order, one per run:
+        // match-between-runs keeps a grouped run's competed table pooled (`run_groups`).
+        if !one_table_per_run {
+            anyhow::bail!(
+                "match-between-runs reads one competed table per run, and a grouped run left \
+                 its competed rows per band"
+            );
+        }
+        let mbr_competed: Vec<String> = competed.iter().map(|t| t[0].clone()).collect();
         crate::sidecar::run_mbr(
             python,
             &script,
             &scored_combined,
-            &competed,
+            &mbr_competed,
             &transferred,
             Some(&scored_mbr),
             &[],
@@ -1148,7 +1490,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
     let split_paths: Vec<String> = (0..n_runs)
         .map(|i| d(&format!("{}/scored.parquet", names[i])))
         .collect();
-    split_by_source(&scored_for_quant, &split_paths)?;
+    let split_written = split_by_source(&scored_for_quant, &split_paths)?;
 
     let mut qcfg = cfg.quant.clone();
     // Per-run quant gates on the pooled `q_value`, not on whatever `quant.q_filter` says. The
@@ -1172,10 +1514,13 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
     qcfg.q_filter = QuantQColumn::PsmQ;
     let mut peptide_quants: Vec<String> = Vec::with_capacity(n_runs);
     let mut protein_quants: Vec<String> = Vec::with_capacity(n_runs);
+    // Each run's quant hashes its two tables for their reports; the manifest below reuses
+    // those hashes instead of reading the tables again.
+    let mut quant_written: Vec<quant::QuantWritten> = Vec::with_capacity(n_runs);
     for i in 0..n_runs {
         let pq = d(&format!("{}/peptide_quant.parquet", names[i]));
         let gq = d(&format!("{}/protein_group_quant.parquet", names[i]));
-        quant::run(quant::QuantParams {
+        let written = quant::run_hashed(quant::QuantParams {
             psms_scored: &split_paths[i],
             chromatograms: &chroms[i],
             out_peptide: &pq,
@@ -1187,6 +1532,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         })?;
         peptide_quants.push(pq);
         protein_quants.push(gq);
+        quant_written.push(written);
     }
     let lfq = d("lfq_maxlfq.parquet");
     let n_lfq = quant::run_lfq_combine(
@@ -1304,14 +1650,19 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
     );
     prov.model_identities
         .insert("mbr".into(), format!("{:?}", cfg.mbr.strategy));
-    // Recorded in a fixed order, and every record hashes its file. `Manifest`
-    // stores them in a BTreeMap, so the serialised order is by logical name and
-    // does not depend on this sequence.
-    let mut artifacts: Vec<(String, (&str, u32), String, &str)> = vec![(
+    // Recorded in a fixed order. `Manifest` stores them in a BTreeMap, so the serialised
+    // order is by logical name and does not depend on this sequence. The last field is the
+    // content hash when the producing stage already computed it (rescore and quant for their
+    // reports, the by-source split while it wrote its tables); the MBR worker's table is
+    // hashed here.
+    // (logical name, schema, path, producing stage, content hash when already known)
+    type Recorded<'s> = (String, (&'s str, u32), String, &'s str, Option<String>);
+    let mut artifacts: Vec<Recorded> = vec![(
         "scored_combined".to_string(),
         artifact::PSMS_SCORED,
         scored_combined.clone(),
         "rescore",
+        Some(scored_written.content_hash.clone()),
     )];
     // Only when MBR actually produced a different table; otherwise
     // `scored_for_quant` IS `scored_combined` and recording it twice would claim two
@@ -1322,6 +1673,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
             artifact::PSMS_SCORED,
             scored_for_quant.clone(),
             "mbr",
+            None,
         ));
     }
     for (i, name) in names.iter().enumerate() {
@@ -1330,26 +1682,32 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
             artifact::PSMS_SCORED,
             split_paths[i].clone(),
             "split-by-source",
+            Some(split_written[i].content_hash.clone()),
         ));
         artifacts.push((
             format!("peptide_quant[{name}]"),
             artifact::PEPTIDE_QUANT,
             peptide_quants[i].clone(),
             "quant",
+            Some(quant_written[i].peptide.content_hash.clone()),
         ));
         artifacts.push((
             format!("protein_group_quant[{name}]"),
             artifact::PROTEIN_GROUP_QUANT,
             protein_quants[i].clone(),
             "quant",
+            Some(quant_written[i].protein.content_hash.clone()),
         ));
     }
-    for (logical, schema, path, stage) in artifacts {
+    for (logical, schema, path, stage, known_hash) in artifacts {
         let rows = mumdia_io::table::nrows(&path)
             .with_context(|| format!("counting rows of {path} for the experiment manifest"))?;
-        prov.record(mumdia_io::record_artifact(
-            &logical, schema, &path, rows, stage, &ch,
-        )?);
+        prov.record(match known_hash {
+            Some(hash) => mumdia_io::record_artifact_with_hash(
+                &logical, schema, &path, rows, stage, &ch, hash,
+            ),
+            None => mumdia_io::record_artifact(&logical, schema, &path, rows, stage, &ch)?,
+        });
     }
     prov.record(mumdia_io::record_artifact(
         artifact::LFQ_MAXLFQ.0,
@@ -1472,6 +1830,107 @@ mod tests {
         )
         .unwrap();
         path
+    }
+
+    /// A scored-like table in row groups of `rg_rows`, with a string and a float column
+    /// beside `source`, so a splice has more than one leaf type to carry.
+    fn scored_in_groups(sources: &[u32], rg_rows: usize) -> String {
+        let n = sources.len();
+        let path = tmp("scored_rg.parquet");
+        let mut w = mumdia_io::table::TableWriter::new(&path).with_row_group_rows(rg_rows);
+        w.write_cols(vec![
+            Col::U32("source".into(), sources.to_vec()),
+            Col::U32("candidate_id".into(), (0..n as u32).collect()),
+            Col::Str(
+                "peptidoform".into(),
+                (0..n).map(|i| format!("PEP{i}K")).collect(),
+            ),
+            Col::F64("q_value".into(), (0..n).map(|i| i as f64 * 0.001).collect()),
+        ])
+        .unwrap();
+        w.close().unwrap();
+        path
+    }
+
+    /// Every row of `path`, as comparable tuples.
+    fn rows_of(path: &str) -> Vec<(u32, u32, String, u64)> {
+        let t = Table::read(path).unwrap();
+        let src = t.u32("source").unwrap();
+        let cid = t.u32("candidate_id").unwrap();
+        let pf = t.str("peptidoform").unwrap();
+        let q = t.f64("q_value").unwrap();
+        (0..t.nrows)
+            .map(|i| (src[i], cid[i], pf[i].clone(), q[i].to_bits()))
+            .collect()
+    }
+
+    #[test]
+    fn the_spliced_split_holds_the_rewritten_splits_rows() {
+        // Runs of 0, 1 and 2 in row groups of 4: groups 0-1 are run 0 only, group 2 holds
+        // the 0/1 boundary, group 3 is run 1 only, group 4 holds the 1/2 boundary, the rest
+        // is run 2. Run 3 has no rows.
+        let mut sources = vec![0u32; 10];
+        sources.extend(vec![1u32; 7]);
+        sources.extend(vec![2u32; 9]);
+        let scored = scored_in_groups(&sources, 4);
+        let spliced: Vec<String> = (0..4).map(|i| tmp(&format!("sp{i}.parquet"))).collect();
+        let written = split_by_source(&scored, &spliced).unwrap();
+        let t = mumdia_io::table::TableFile::open(&scored).unwrap();
+        let rewritten: Vec<String> = (0..4).map(|i| tmp(&format!("rw{i}.parquet"))).collect();
+        let (_, placed) =
+            split_rewritten(&t, t.schema.index_of("source").unwrap(), &rewritten).unwrap();
+        assert_eq!(placed, sources.len());
+        for i in 0..4 {
+            assert_eq!(rows_of(&spliced[i]), rows_of(&rewritten[i]), "run {i}");
+            // The hash is the file's, computed while it was written.
+            assert_eq!(
+                written[i].content_hash,
+                mumdia_io::hash::blake3_file(&spliced[i]).unwrap(),
+                "run {i}"
+            );
+            assert_eq!(written[i].rows as usize, rows_of(&spliced[i]).len());
+        }
+        // The single-source groups were spliced, not re-encoded: run 0's table keeps the
+        // input's two whole groups of 4 and then its 2 boundary rows.
+        let groups = |p: &str| {
+            mumdia_io::table::SpliceWriter::row_group_spans(p)
+                .unwrap()
+                .iter()
+                .map(|s| s.1)
+                .collect::<Vec<usize>>()
+        };
+        assert_eq!(groups(&spliced[0]), vec![4, 4, 2]);
+        assert_eq!(groups(&spliced[1]), vec![2, 4, 1]);
+        assert_eq!(groups(&spliced[2]), vec![3, 4, 2]);
+        assert!(groups(&spliced[3]).is_empty());
+        // No temporary boundary file of THIS split is left behind. The directory is shared
+        // with the module's other tests, which run concurrently and write their own
+        // `.split-rg` files while they split, so only names that start with one of this
+        // test's outputs are this split's.
+        for o in &spliced {
+            let path = std::path::Path::new(o);
+            let dir = path.parent().unwrap();
+            let own = path.file_name().unwrap().to_string_lossy().into_owned();
+            for e in std::fs::read_dir(dir).unwrap() {
+                let name = e.unwrap().file_name().to_string_lossy().into_owned();
+                assert!(
+                    !(name.starts_with(&own) && name.contains(".split-rg")),
+                    "{name}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_whole_row_group_of_an_unknown_source_is_still_an_error() {
+        // A group whose statistics say one source, outside 0..n, is spliced nowhere: the
+        // partition check must still report the rows it did not place.
+        let mut sources = vec![0u32; 4];
+        sources.extend(vec![5u32; 4]);
+        let scored = scored_in_groups(&sources, 4);
+        let outs: Vec<String> = (0..2).map(|i| tmp(&format!("bad{i}.parquet"))).collect();
+        let err = split_by_source(&scored, &outs).unwrap_err().to_string();
+        assert!(err.contains("4 of 8 rows"), "{err}");
     }
 
     #[test]

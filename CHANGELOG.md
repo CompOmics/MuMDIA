@@ -43,6 +43,59 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ### Added
 
+- **`extract.chromatogram_schema = 2`, an opt-in chromatogram layout (schema version 2)
+  with identical downstream tables.** Each candidate's retention-time axis is stored once
+  per parquet row group instead of on every row, each intensity trace from its first to
+  its last nonzero value, and two `u32` columns (`trace_offset`, `trace_len`) rebuild the
+  full trace. The two list columns are named `rt_axis` and `intensity_trimmed` in v2, so a
+  reader that knows only v1 (an older engine binary, a script reading `rt`) stops at the
+  missing column instead of misreading the table. The rule restarts at every row group, so
+  each group decodes on its own, and features, quant and the pool rebuild the v1 rows bit
+  for bit: `features.parquet`,
+  `psms_competed.parquet`, `psms_scored.parquet` and the quant tables are byte-identical to
+  a v1 run, checked in the Rust suite at every row-group size from one row to the whole
+  table, by `ci/smoke.sh` (ungrouped, grouped pooled and per band, and with a seam at every
+  row through the test knob `MUMDIA_CHROM_ROW_GROUP_ROWS`), and on three real runs. The
+  table was 28.7% smaller on an AIF run, 50.3% on an AIF entrapment run and 15.5% on an
+  Astral run (docs/15, "Layout v2"). The default stays 1, because readers outside the
+  engine and older engine binaries read only v1; `mumdia::chromatograms::rewrite` converts
+  between the layouts. Validate on a new dataset by running once with each setting and
+  comparing those tables with `cmp`.
+- **`rescore.handoff = raw`, an opt-in handoff with no parquet codec on either side.** The
+  `nn_torch` worker is given a `.raw.json` description naming a row-major little-endian
+  f32 `.npy` matrix and a small parquet of the metadata columns. The engine writes each
+  decoded batch straight into the matrix, and the worker copies it into its own with no
+  decode and no column-to-row transpose, summing the float64 moments over the parquet
+  handoff's 131,072-row groups, so the scores are byte-identical to `parquet` (checked on
+  a fixture for both worker backends and on a 41,910-PSM and a 522,237-PSM competed
+  table). The file is 4 bytes a value, so it pays where the codec, not the disk, is the
+  limit. Validate a new host by rescoring one pool with each handoff and comparing
+  `psms_scored.parquet` byte for byte.
+- **`groups.pool_chromatograms = false` has quant read a grouped run's band chromatogram
+  tables directly.** The pool writes the overlap losers it finds anyway to
+  `groups/overlap_losers.parquet` (`band`, `candidate_id`), and quant reads the bands'
+  tables in band order, dropping each band's losers, so the pooled `chromatograms.parquet`
+  (about 68 GB a run on the immunopeptidomics experiment) is neither written, hashed nor
+  read. It holds for overlapping bands too. Default `true`. The quant tables are
+  byte-identical either way (tests with two overlapping bands, including overlap
+  candidates compete deleted in one band, and with a band whose row groups are all pruned;
+  a smoke arm compares the quant tables and TSVs of the three-band fixture). What changes
+  is the artifact set: no pooled chromatogram record, an `overlap_losers` record (schema
+  `overlap_losers` 1, whose footer names the band tables it belongs to), and the quant
+  report lists the band tables with `chromatogram_dropped_candidates`. The band
+  directories are then the run's only chromatograms. `mumdia quant` takes several
+  `--chromatograms` and `--overlap-losers` for the same read by hand, and refuses band
+  tables that are not the ones the loser file names, in its order.
+- **`groups.pool_competed = false` has rescore read a grouped run's band tables directly.**
+  Rescore takes a table-to-source map (`competed_sources` in the scored report), so the
+  bands' competed tables in band order give exactly the rows the pooled
+  `psms_competed.parquet` holds, and that copy (about 83 GB a run on the
+  immunopeptidomics experiment) is not written. It applies only when the bands' library
+  row spans are disjoint and neither the candidate audit nor match-between-runs is on;
+  otherwise the table is pooled and the log says why. Default `true`. `psms_scored.parquet`
+  is byte-identical either way (a smoke arm compares it); the manifest then has no pooled
+  competed record, and `mumdia pool --groups-dir` rebuilds the table from the bands.
+
 - **`mumdia sub-library` subsets a library to a set of candidates.** A second pass searches
   the survivors of a first pass (or of `prescan`) as a library of their own, which means
   keeping those precursors, renumbering them to the contiguous `0..n` the fragment index
@@ -58,6 +111,60 @@ than a number. Both are recorded in every run's `manifest.json`.
   note pointing at the command.
 
 ### Changed
+
+- **Quant reads less of its two inputs.** The scored table's identity columns
+  (`peptidoform`, `protein_group`, `charge`, `base_peptide_id`) are read at the accepted
+  rows only, and the identification-apex map holds only the candidates whose
+  chromatograms are loaded; the report's `candidates_with_scored_apex` still counts the
+  whole table. The chromatogram table is opened with its offset index: a row group whose
+  `candidate_id` statistics hold no accepted id is not opened, and in an opened group each
+  column skips, unread, every data page that holds no kept row. Rows are never skipped
+  inside a page, because parquet-rs steps over a long list row slower than it decodes it.
+  Every quant table and report is byte-identical (checked against the previous binary on
+  a per-run split of the six-file Astral experiment and on the AIF benchmark, in both the
+  old single-row-group and the current chromatogram layouts). On those tables every list
+  page holds an accepted row, so no page is skipped and the read time does not move; the
+  gain is on tables whose accepted candidates cluster more coarsely than their pages,
+  which `selective_read_on_a_real_artifact` measures from a real footer.
+  `MUMDIA_QUANT_SELECTIVE_READ=0` turns the page selection off for an A/B.
+- **`features.parquet` and `psms_competed.parquet` store the feature columns as float32.**
+  Every classifier narrows every feature to f32 before it sees it, so the features stage
+  now stores `v as f32` and the classifier inputs, the scores and every scored output are
+  unchanged (byte-identical `psms_scored.parquet` on the smoke fixture, and in a test that
+  runs both layouts through compete and rescore, `unique_evidence` included). Five columns
+  that compete or rescore read as f64 before narrowing stay float64 (`charge`,
+  `n_matched_fragments`, `unique_fragment_count`, `peak_contested_frac`,
+  `contested_frac`), as do the bookkeeping columns. The two tables are about half the
+  bytes, which is the widest write, copy and read of a run (about 83 GB a run of
+  `psms_competed` on the immunopeptidomics experiment). The schema versions are now
+  `features` 2 and `psms_competed` 4. Compete and rescore still read the previous
+  versions: a v1 features table is rewritten into the v4 layout, and a v3 competed table
+  scores exactly as its v4 counterpart. An external reader of these files sees float32
+  columns. Band tables from before and after the change cannot be pooled into one table;
+  re-run the bands with one binary. The PIN (`features.emit_pin`) is written from the f64
+  values and does not change.
+- **Rescore removes its sidecar files once the scores are read back.** The handoff, the
+  fold keys and the worker's output were named after the output and the PID and never
+  removed, so they piled up: 7.7 GB per HYE rescore, 359 GB per immunopeptidomics pool.
+  They are now removed after `align_sidecar_scores` accepts the scores (a failed worker
+  still leaves its input), unless `MUMDIA_KEEP_HANDOFF=1`. `MUMDIA_SIDECAR_DIR` moves the
+  work directory for `run`, `run-experiment` and `rescore`, and `mumdia rescore --work-dir`
+  names it for one call. The file names carry a nonce beside the PID, so runs that share
+  one `MUMDIA_SIDECAR_DIR` (two containers with the same PID) cannot touch each other's
+  files, and a handoff or fold-keys write that fails removes what it wrote. Before the
+  handoff is written the engine asks the sidecar interpreter for the directory's free
+  space. It refuses a run only below what the files cannot be smaller than, which a PIN
+  or raw handoff has and a parquet handoff does not, and it warns below their usual size,
+  the NN worker's streaming memmap included when the worker may stream; the messages name
+  the directory and the way out (`MUMDIA_SIDECAR_SPACE_CHECK=0` skips it). The scores are
+  unchanged.
+- **`run-experiment` splices the per-run scored tables.** A run's rows are contiguous in the
+  pooled scored table, so the by-source split copies every single-source row group as
+  bytes and re-encodes only the boundary groups. The per-run `<run>/scored.parquet` tables
+  hold the same rows, order and values, so quant and the reports are unchanged, but their
+  bytes and the `scored[<run>]` hashes in `experiment_manifest.json` change: a spliced
+  group keeps the scored table's 1,048,576-row layout. A nullable `source` (the MBR
+  worker's output) is re-encoded as before.
 
 - **The engine holds far fewer heap blocks, because that, not memory, is what a banded
   search runs out of.** A grouped search of a 203M-precursor library died at about 290 GB
@@ -97,6 +204,91 @@ than a number. Both are recorded in every run's `manifest.json`.
   always are -- the definition levels are run-encoded, which moves the writer's internal
   mini-batch size and so the page framing. Measured at 196,615 rows: 16 bytes, with every
   row, value and row-group boundary unchanged.
+- **`psms_competed.parquet` is published as the features file's own bytes when compete
+  removes no row, which is the shipped default.** Under `group_by = peptidoform_charge` the
+  competed table has the features table's columns, rows, order and values, and it was
+  decoded and re-encoded column by column for nothing (estimated at about 10 s per HYE
+  file). When the features file is exactly what that rewrite would write, compete now
+  hard-links it to the competed name, falls back to a byte copy where the filesystem refuses
+  a link, and rewrites only if both fail. The competed file then has the features file's
+  65,536-row groups instead of 131,072-row ones, and its `content_hash` IS the features
+  hash, so it differs from an earlier run's whenever the table holds more than one row
+  group. On a grouped run the pooled `psms_competed.parquet` inherits the bands' row groups,
+  and its hash differs for the same reason. When compete does remove rows and the untouched
+  row groups hold at least half of the table's rows, those groups are spliced as bytes and
+  only the others are rewritten; a splice that fails falls back to the full rewrite. The
+  report records the path in `stats.publish` (`hard_link`, `byte_copy`, `spliced` with
+  `rewritten_row_groups` and `row_groups`, or `rewritten`). `psms_scored.parquet` and every
+  artifact after it are byte-identical. After a hard link the two names share one file:
+  rewriting either through the engine leaves the other alone, but a tool that edits either
+  file in place, including pandas `to_parquet` or pyarrow `write_table` onto the existing
+  path, changes both.
+- **Each artifact is hashed once.** The orchestrators record a stage's outputs in
+  `manifest.json` with the hash the stage already computed for its own report instead of
+  reading and hashing every file again, and a grouped run under `run-experiment` no longer
+  builds the band records it then dropped. Reusing the stage hashes changes no recorded
+  hash value.
+- **The large artifacts are hashed while they are written.** A writer opened with
+  `WriteOptions::content_hash` feeds its bytes to blake3 on the way to the file and returns
+  the digest when it closes, so convert, predict-frag, search-seed, rt-im-train, extract,
+  features, compete, the pool and rescore no longer read their outputs back to hash them.
+  The digest is the same blake3 over the same bytes, so hashing while writing changes no
+  artifact byte and no recorded hash by itself (docs/03 "Hash on write"). The capped-writer
+  layout changes below (page cut, float plan, PLAIN chromatogram `rt`) do change the bytes
+  and content hashes of the files they write.
+- **`TableFile::scan` can read each row group's projection in one sequential read.**
+  `ScanOptions::coalesced()` gives the parquet reader a span cache that reads every selected
+  row group's projected column chunks as one byte span (split where unprojected columns
+  leave a gap over 1 MB), serves the page reads from memory, prefetches the next span on a
+  helper thread and releases a span once its column chunks are read. The batches are
+  identical to the plain reader's. Nothing uses it by default; it is for wide full scans on
+  spinning storage, where the page-at-a-time reader is seek-bound (docs/03 "Sequential
+  row-group reads").
+- **Capped writers cut data pages by size, not every 20,000 rows.** A scalar column of a
+  65,536-row group is one page instead of four, so the plain reader, which seeks once per
+  page, reads a wide table with a quarter of the seeks: on the AIF artifacts features went
+  from 2,003 to 1,039 data pages and psms_competed from 1,592 to 399, at +0.5% bytes, and
+  the writer's in-progress buffer of one 131,072-row competed group from 552 to 620 MB.
+  Values are unchanged; the bytes and content hashes of files from capped writers change,
+  and uncapped writers are byte-identical to before (docs/03 "Page layout of capped
+  writers").
+- **Capped writers plan their float encodings from their first rows.** A writer with a
+  row-group cap holds its first quarter row group, writes every float leaf whose sampled
+  values are more than 80% distinct PLAIN from the first page (instead of paying for a
+  dictionary prefix until the dictionary limit fills), and sizes the dictionary limit of the
+  other float leaves from their values per row group rather than their rows, which gives the
+  chromatogram traces back the dictionary the row-sized limit cut at 128 KB. Against the
+  unplanned layout on the AIF artifacts: features -8.6%, psms_competed -14.9%,
+  chromatograms -6.3%, spectra -0.2%, and the competed rewrite encodes in 0.54 s against
+  1.31 s with half the writer buffer. Values are unchanged; bytes and content hashes of
+  capped writers change; `MUMDIA_PARQUET_PLAN=0` restores the unplanned layout (docs/03
+  "Float encodings planned from the first rows").
+- **The chromatogram `rt` axis is written PLAIN.** Each fragment row of a candidate repeats
+  the candidate's axis, which snappy shortens in PLAIN form and cannot find in bit-packed
+  dictionary indices, so the AIF chromatograms are 12.0% smaller than with the planned
+  dictionary (160.9 against 182.8 MB) with identical values. Writers can name such columns
+  with `WriteOptions::plain_column` (docs/09 "Output: chromatograms").
+- **Parquet columns are encoded in parallel.** Every writer encodes a row group's columns
+  concurrently on a dedicated codec pool (at most 8 threads, `--threads` when it is lower,
+  serial at `--threads 1` or `MUMDIA_PARQUET_THREADS=1`) and appends them in schema order,
+  which writes the serial writer's file byte for byte. The codec pool is a second pool
+  beside the global one: `--threads N` now bounds the global pool at N and the codec pool
+  at min(N, 8), and the two can be busy at once, so a run can keep up to N + min(N, 8)
+  threads busy; `MUMDIA_PARQUET_THREADS=1` restores the previous bound. Encoding the AIF features table took
+  0.14 s on 8 threads against 0.45 s, the competed table 0.16 against 0.42 s, the
+  chromatograms 4.4 against 8.1 s. Writers called from inside a rayon pool keep encoding on
+  their own thread, and so does a writer that finds as many callers already waiting on the
+  pool as it has threads, so concurrent band writers under `groups.parallel` never have less
+  than a thread each (docs/03 "Parallel column codec").
+- **Multi-column scans decode their columns in parallel.** `TableFile::scan` and
+  `TableFile::batches` split the projection into contiguous column groups, one reader each,
+  decode the groups of every batch on the codec pool and join them column-wise; the batches
+  are the single reader's exactly. Automatic by default (up to 8 groups, at least 4 MB of
+  data each, the single reader from inside a rayon pool and for a coalesced scan, which
+  keeps its one forward read per row group); `ScanOptions::decode_threads` sets it, and
+  `MUMDIA_PARQUET_DECODE_THREADS=1` keeps every scan of a process on one reader. A full scan of the AIF features table went from 1.18 to 0.51 s, the competed
+  table from 1.22 to 0.45 s, the chromatograms from 5.1 to 3.3 s (docs/03 "Parallel
+  decode").
 
 - **Library writers emit fragment tables sorted by `candidate_id`.** `import_diann_lib.py`,
   `make_reverse_decoys.py` and `make_shift_decoys.py` finish with a streaming bucket sort
@@ -108,7 +300,92 @@ than a number. Both are recorded in every run's `manifest.json`.
   depended on the previous order. `scripts/sort_fragments.py` applies the same rewrite to a
   table written before this change; the engine still loads an unsorted table through a
   filtered scan, with a warning.
+- **The generated config reference cites functions, not line numbers.**
+  `ci/gen_config_reference.py` cited every environment read as `path:line` and every
+  config struct and enum by its line, and `configs/config-schema.json` carried a
+  `source_line` per setting. Any merge that moved lines in `rescore.rs`, `config.rs`,
+  `main.rs` or a sidecar script therefore made both files stale on every other open pull
+  request, although no variable, field or default had changed. A read is now cited as
+  `path::function` (`Type::method`, `Trait::method`, `module::function` and
+  `outer::inner` in Rust, `Class.method` in Python, `<module>` outside any function), a
+  struct or enum by its name, and the schema field
+  `source_line` is replaced by `source_struct`, the declaring struct (the desktop editor
+  never read either). `--check` also regenerates from copies of every input with blank
+  lines inserted and fails if either artifact differs;
+  `tests/python/test_gen_config_reference.py` pins the same property on synthetic
+  sources. Two reads in one function now share one citation, so the `Read at` column
+  has fewer entries. In the list of reads whose name is not a literal, such reads share
+  one entry that gives their number, and the header still counts reads. The variables,
+  their defaults, the fields and the settings are unchanged.
+  The generator also skips a `#[cfg(test)]` element by the element's own extent
+  (`cfg_test_item_end`), not by counting braces to the next balanced `}`. The old count
+  ran past an attribute on something without a body: on an enum variant it took the
+  enum's closing brace and the next item's header, so a source with a test-only variant
+  was rejected as unbalanced, and on a statement (`inject(Fault::Publish)?;`) it silently
+  blanked real code up to the end of the next block. The reference generated from main is
+  unchanged by this.
+
+### Performance
+
+- **Rescore's feature stream and its post-classifier tail do less.** The feature stream
+  and compete's pass-through copy can read each row group's projected column chunks in
+  one sequential read (the span cache, `MUMDIA_WIDE_SCAN=coalesced`), and the feature
+  stream can decode one row group a batch (`MUMDIA_WIDE_SCAN=rowgroup`). Both are opt-in
+  for seek-bound storage, where neither is measured yet: the plain reader stays the
+  default, the faster one from the page cache (1.54 s against 2.50 s coalesced on the HYE
+  competed table). The parquet handoff is staged column by column
+  from the decoded batches, with no row-major round trip: the streamed handoff of the HYE
+  competed table (879,018 x 387) went from 8.4-8.7 s to 3.0-4.1 s of process wall, to the
+  same bytes. The top-K collapse map is skipped when no candidate repeats (a 9.1 GB
+  transient on the immunopeptidomics pool), the q columns are computed in place and per
+  source by slice, and a grouped run whose bands' library row spans are disjoint skips
+  the overlap dedup. Each run logs `rescore: phase timings` (the metadata pass, the
+  feature stream and its encode, the classifier, the tail) and `rescore: sidecar
+  timings`. `psms_scored.parquet` is byte-identical.
+- **Both TSV reports read the scored table in two passes.** The rows that can be printed
+  come from `label`, the transfer flag and the q columns, 3 bytes a row; the printed
+  columns are then read for those rows only. The one-pass read held four string columns
+  for every row, an estimated 55 GB on the 258.75M-row pooled table, to print about 10^5
+  rows. Both TSVs are byte-identical (compared against the one-pass code in the tests).
+- **The MBR worker keeps only the confident candidates.** Its apex maps, metadata and
+  selected-peak lookup hold only candidates that are a confident target somewhere, and the
+  transfers are flagged by one sorted-key lookup instead of a Python loop over every scored
+  row: an estimated 100 GB of worker memory and 4-6 minutes on the pooled
+  immunopeptidomics experiment with MBR on. Every output is byte-identical to the worker
+  before the change, which the tests run from git history.
+
+- **The `nn_torch` worker spends less time outside training, with byte-identical
+  scores.** The parquet load decodes the next row group on a reader thread
+  (`pre_buffer=True`) while up to 8 threads write the current one straight into the
+  matrix, keeping the float64 moment partition and order (1,000,000 x 387: 11.8 s to
+  2.4 s); the init feature scan counts its columns on a thread pool (400,000 x 120:
+  24.9 s to 4.3 s), with at most 1 GiB of sort transients in flight
+  (`MUMDIA_NN_SCAN_MEM_GB`) when the init sample escalates toward the whole fold;
+  scoring batches are gathered with `torch.index_select` into one reused
+  numpy-allocated buffer (4.7x on the gather; identity checked on Windows x86-64 with
+  torch 2.6, CPU and CUDA, not yet on the Linux fleet); each round's positives come from a certified top window instead of a
+  full stable sort (10M scores: 1.69 s to 0.08 s), and the decoy order of the hybrid cap
+  from one uint64 key sort; the training pool is no longer scored after the last round,
+  whose scores fed only a log line. Every change keeps a switch back to the code it
+  replaced (`docs/13_sidecars.md`). Tests assert equal score bytes with all of them set
+  back and against the worker before the change (extracted from git history), for the
+  in-memory, streaming and TSV paths. The worker also prints read, fill, standardise
+  and selection sub-timers, and removes its memmap after a failed run as well.
+
 ### Added
+
+- **Opt-in concurrent fold training for `nn_torch` (`MUMDIA_NN_PARALLEL=K`).** The
+  (seed, fold) tasks train in K spawned processes at a fixed per-process thread count
+  (`MUMDIA_NN_PARALLEL_THREADS`), sharing the matrix through a read-only memmap. The
+  epoch shuffle is then keyed per (seed, fold, iteration, epoch), which changes the scores
+  once, like a seed change; they do not depend on K. Off by default; validate it as a seed
+  change (three seeds, two pools, entrapment) before relying on it.
+
+- **`psms_scored.parquet.report.json` records the NN worker's inherited environment.**
+  When `nn_torch` ran, `params.nn_env` lists every `MUMDIA_NN_*` variable the worker
+  inherited beyond the ones the engine sets. `MUMDIA_NN_SEED`, `MUMDIA_NN_THREADS` and
+  `MUMDIA_NN_PARALLEL` change the scores and reach the worker only this way, so two runs
+  of one configuration that differ in them are now told apart by the report.
 
 - **`mumdia pool` pools a grouped run's band artifacts from the command line.** `run` does
   this itself at the end of a grouped search; standalone it is for the case where the
@@ -187,6 +464,17 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ### Fixed
 
+- **A grouped run no longer quantifies an overlap candidate from two bands.** The pool
+  found its overlap duplicates in the bands' competed tables only, but a band's
+  chromatogram (and extracted) table holds every candidate extract accepted, including
+  ones compete then deleted there. Under `compete.group_by = base_peptide` or `apex`, with
+  overlapping bands, a candidate deleted in one band and kept in the other was therefore
+  in one competed table and two chromatogram tables, and the pooled `chromatograms.parquet`
+  held both bands' rows of it, which quant summed into one quantity. The losers of the
+  chromatogram and extracted tables are now found in those tables: such a candidate is
+  kept from the band whose competed row won it, or from the first band that holds it when
+  no band kept it. The default `peptidoform_charge` gives each candidate a competition
+  group of its own and deletes none, so default runs do not change.
 - **`extract --restrict-candidates` now runs on the streaming path.** A candidate allowlist
   routed extract to the serial path, whose whole-run hit accumulator ignores
   `extract.windows_in_flight`, so a prescan-restricted extract had the memory profile of

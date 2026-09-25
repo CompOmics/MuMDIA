@@ -91,6 +91,32 @@ The unbounded row `(NaN, -inf, +inf)` is materialized by `candidate_window`
 infinite bounds make the downstream extractor scan the full isolation-window RT
 range (recall-safe) rather than a numeric window.
 
+**The in-memory handoff to extract.** The orchestrators (`run`, `run-experiment`
+and the band loop of a grouped run) call `rt_im_train::run_in_memory`, which writes
+the same file and also returns `RtWindows`: the three dense per-candidate arrays
+(`rt_cal`, `rt_lo`, `rt_hi`, 24 bytes per candidate) that `extract` builds from
+`run_windows.parquet`, filled from the rows as they are written. The arrays carry
+the precursor-table path they were fitted on and the `run_windows` path they were
+written to. `extract` takes them only when both are the paths it was itself given
+and its library has the same candidate count (`RtWindows::mismatch`), logs
+`extract: RT windows handed over in memory; run_windows is not re-read`, and
+otherwise warns with the reason and reads the file. A count alone would accept
+windows fitted on another library of the same size, such as a re-predicted or
+fine-tuned precursor table or another band, which the file-based contract cannot do.
+The arrays are the ones the file would produce, bit for bit
+(`the_windows_kept_in_memory_are_the_windows_extract_reads_back`), and extract's
+outputs are the same bytes whether it takes them or reads the file
+(`extract_takes_the_handed_rt_windows_only_when_they_are_its_own` in
+`tests/pipeline.rs`, which also shows that extract does not open the file when it
+takes them and does open it for each refusal), so the handoff changes no output; it saves the decode of the table just written, 1-2 s per run on
+HYE and an estimated 20-60 s on an unbanded immunopeptidomics library. A table
+with a NaN bound is never handed over, so `extract` reads it and rejects it with the
+row named, as before. The file stays the artifact and the contract of the
+standalone stages: `mumdia extract` always reads it. One memory consequence: the
+24-byte-per-candidate arrays now exist from the end of `rt-im-train` through
+extract's library load, where extract used to allocate them (and a 28-byte decode
+beside them) only after the load.
+
 **`cal.json`** (side artifact, written with `mumdia_io::json::write_json`,
 rt_im_train.rs:309-325). Fields:
 
@@ -139,9 +165,18 @@ hash and pass it as `config_hash`, but the stage never reads it (see gotchas).
 
 ### 1. Join iRT to candidates
 
-Read the library precursors and build `irt_by_cid: HashMap<u32, f64>` mapping
-`candidate_id -> predicted_irt` (rt_im_train.rs:80-83). This is the only source of
-iRT; both training and application use it.
+Read the library precursors' `candidate_id` and `predicted_irt` columns. This is
+the only source of iRT; both training and application use it. The
+`candidate_id -> predicted_irt` join the anchors are read through (`IrtJoin`) is
+built only when it is used: under `anchor_irt_from_seed` (a pooled seed of a grouped
+run) the seed table carries the iRT and nothing is joined. When it is used and the
+library carries `candidate_id` as the row-aligned range `0..n`, which is the layout
+the engine writes and `Library::load` requires, the join is a direct index into the
+iRT column. Any other layout gets the historical `HashMap<u32, f64>`, in which the
+last row with a given id wins. The hash table was built unconditionally before
+2026-09-25 and was about 4.5 GB of transient on an unbanded 203M-row library; the
+anchors it returns are the same either way
+(`the_irt_join_answers_what_the_hash_join_answered`).
 
 ### 2. Select calibration anchors
 
@@ -558,8 +593,10 @@ rt-im-train: they convert their spectra and seed on the base library, and the se
 iRT-independent. `experiment.overlap_front_threads = N` (default `0`, off) runs those
 fronts, convert and seed of runs 2..N, on a pool of `N` threads while the first run's DeepLC
 worker gets the remaining `threads - N`, and every run's rest follows once the first has
-finished (`run_experiment::convert_run`, `seed_run`, `adapt_rt_library`, `finish_run`). On
-the six-file HYE Astral experiment a front is convert 1.9-2.5 min plus seed 0.4 min, against
+finished (`run_experiment::convert_run`, `seed_run`, `adapt_rt_library`, `finish_run`). The
+fronts keep the phase order of the experiment without the overlap: every conversion first,
+then one seed library and fragment index for all of their seeds; the first run seeds on its
+own load before the overlap starts. On the six-file HYE Astral experiment a front is convert 1.9-2.5 min plus seed 0.4 min, against
 a first-run multi-head step of 11.7 min. Ungrouped runs only: a grouped run seeds per band
 inside its band loop. The fronts are byte-identical; the first run's DeepLC predicts on
 `threads - N` torch threads, which moves the adapted library in the last bits unless the
@@ -608,8 +645,13 @@ either the adaptive per-bin value or the global `w_rt` (rt_im_train.rs:248-255),
 `candidate_window(calibrated_rt, width)` (rt_im_train.rs:256) produces the row
 `(cal, cal - width, cal + width)`, or the unbounded `(NaN, -inf, +inf)` when either
 value is absent. The three IM columns are pushed as `None` (rt_im_train.rs:261-263).
-The table is written (rt_im_train.rs:266-277), `cal.json` is written
-(rt_im_train.rs:309-325), and the artifact report is emitted (rt_im_train.rs:332-344).
+The table is written as it is computed: `write_table_chunked_hashed` asks for one
+65,536-row chunk at a time, the rows of that chunk are computed and encoded, and the
+next chunk follows. The chunk sequence is the one `write_table` uses, so
+`run_windows.parquet` is byte-identical to writing the seven whole columns at once,
+and those columns (76 bytes per candidate, 15 GB at 203M rows) are never resident.
+The file is hashed as it is written, so the report's content hash needs no read-back.
+Then `cal.json` is written and the artifact report is emitted.
 
 ### DeepLC multitask fine-tune (orchestrator pre-step, default off)
 
