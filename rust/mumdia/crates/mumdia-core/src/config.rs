@@ -723,6 +723,39 @@ pub struct RtImTrainConfig {
     /// DIA-NN library iRT and 10,181 from a per-run fine-tune, with `w_rt` 343 s against
     /// 632 s and 472 s (docs/08 section 4c). `run-experiment` predicts once per experiment.
     pub library_irt: LibraryIrt,
+    /// Worker processes for the whole-library DeepLC prediction: the multi-head
+    /// calibration, the base-model re-prediction under `library_irt`, and the prediction
+    /// after `finetune_deeplc` (`deeplc_finetune.py --shards`). The calibration or the
+    /// fine-tuned model is fitted once and handed to every process, and each process
+    /// predicts a contiguous slice of the unique sequences cut at a multiple of the
+    /// 100,000-sequence prediction call, so it makes the calls one process would have made.
+    /// The thread budget (the engine's thread count after the DeepLC thread cap) is divided
+    /// evenly, so `K` processes get `budget / K` torch threads each. `1` (the default) is
+    /// one process, the behaviour before this setting existed; `0` is automatic, one
+    /// process per 8 threads of the budget. A GPU always gets one process.
+    ///
+    /// Whether sharding pays is not established. docs/32 attributes the per-process rate
+    /// (about 6,000 sequences per second) to featurisation, which is single-threaded
+    /// Python. On the one CPU measured so far (an i9 desktop, docs/08, "Sharded
+    /// whole-library prediction") the forward pass dominated at 8 threads or fewer and
+    /// scaled with threads inside one
+    /// process, so four processes of two threads were no faster than one of eight.
+    /// Sharding is expected to help only where one process stops scaling with threads,
+    /// as the multi-head step did on doxy (10:41 at 96 threads, 18:09 at 128); the survey's
+    /// arithmetic for HYE at 8 to 12 shards is 2.5 to 4.5 minutes, unmeasured. With `K`
+    /// processes at the same threads each as one process the `predicted_irt` column is
+    /// bit-identical (`tests/python/test_deeplc_predict.py`). At the same engine thread
+    /// count the fit is the same, but each process predicts on `budget / K` threads
+    /// instead of `budget`, and torch's CPU kernels round differently at a different thread
+    /// count: most rows move in the last bits, and under the multi-head calibration a few
+    /// sequences at the edge of the reference range move by up to about two minutes (129 s
+    /// measured, docs/13, "DeepLC thread cap"). A sharded run is therefore float-equivalent
+    /// to an unsharded one, not bit-identical. Each process is its own Python process with
+    /// torch and DeepLC loaded (0.57 GB resident after the model load on the desktop
+    /// measured, of which the model is about 35 MB), and this step can hold the
+    /// process-tree peak. Validate on two acquisitions (peptides at 1% inside the seed
+    /// spread, `docs/08_rt_im_train.md` section 4d) before defaulting it on.
+    pub deeplc_predict_shards: usize,
 }
 
 /// Source of `predicted_irt` for an imported library; see `RtImTrainConfig::library_irt`.
@@ -809,6 +842,7 @@ impl Default for RtImTrainConfig {
             rt_window_min_s: 1.0,
             window_holdout_frac: 0.0,
             library_irt: LibraryIrt::Auto,
+            deeplc_predict_shards: 1,
         }
     }
 }
@@ -1164,6 +1198,24 @@ pub struct FeaturesConfig {
     /// overlaps the existing `ms1_isotope_cosine_apex`, so it is opt-in and
     /// benchmark-gated rather than default-on (AlphaDIA-plan item 12).
     pub ms1_precursor_features: bool,
+    /// Chromatogram decode threads in the main feature pass. The pass decodes the
+    /// chromatogram table one chunk at a time while the features of the chunk before are
+    /// computed; with one loader the whole decode ran on a single core, which bound the
+    /// stage whenever decoding a chunk took longer than computing one (measured on an
+    /// 8-12-mer immunopeptidomics run before the decode overlapped the computation: 3.7 of
+    /// a 4-minute stage were the load). Each loader reads its own chunk from that chunk's
+    /// row span, and the computation takes the chunks in table order, so the chunks, every
+    /// feature value and the features table bytes are the same at every setting; only the
+    /// time and the memory move. The pass holds up to `chrom_loaders + 1` decoded chunks
+    /// (0.92 GiB of traces each at the HYE benchmark shape, docs/27 section 3.4), where one
+    /// loader held two. The value is an upper bound: a pass never runs more loaders than
+    /// `--threads` (the engine's thread pool) or than it has chunks, so `--threads 1` decodes
+    /// on one loader as before. Loaders beyond each pass's first come from a process-wide
+    /// pool of four, so concurrent bands or runs (`groups.parallel`,
+    /// `experiment.parallel_runs`) share that pool instead of multiplying it. Default 3; `1`
+    /// restores the single loader and `0` is read as `1`. A memory knob and a speed knob,
+    /// not a sensitivity knob.
+    pub chrom_loaders: usize,
 }
 impl Default for FeaturesConfig {
     fn default() -> Self {
@@ -1183,6 +1235,7 @@ impl Default for FeaturesConfig {
             bound_from_confident: true, // fixed feature window from confident-seed norm
             bound_confident_pct: 50.0, // median confident half-width
             ms1_precursor_features: false, // opt-in; overlaps ms1_isotope_cosine_apex
+            chrom_loaders: 3,
         }
     }
 }
@@ -2992,6 +3045,15 @@ mod tests {
             !d.deeplc_rt_source(true, false),
             "imported library, no interpreter"
         );
+    }
+
+    #[test]
+    fn deeplc_predict_shards_defaults_to_one_process_and_parses() {
+        assert_eq!(Config::default().rt_im_train.deeplc_predict_shards, 1);
+        let c = Config::from_json(r#"{"rt_im_train":{"deeplc_predict_shards":8}}"#).unwrap();
+        assert_eq!(c.rt_im_train.deeplc_predict_shards, 8);
+        let auto = Config::from_json(r#"{"rt_im_train":{"deeplc_predict_shards":0}}"#).unwrap();
+        assert_eq!(auto.rt_im_train.deeplc_predict_shards, 0);
     }
 
     #[test]

@@ -22,7 +22,7 @@ use serde_json::json;
 use tracing::{info, warn};
 
 use crate::calibrate::percentile;
-use crate::stats::{cosine, pearson, spectral_angle};
+use crate::stats::{cosine, pearson, pearson_pairs, pearson_vs, spectral_angle, Centered};
 use rayon::prelude::*;
 
 // Extended feature battery (FeatureSet::Extended). One module per family; each
@@ -470,7 +470,10 @@ fn align_union(rows: &[ChromRow]) -> TraceAlign {
 /// Per-PSM evidence handed to the extended feature families. All arrays are
 /// f64. Fragment-indexed arrays share one order; time-series share `axis`
 /// (elution-peak-bounded) or `axis_full` (whole extracted window). Built once
-/// per PSM by `build_evidence`, then scalar fields are filled by the caller.
+/// per PSM by `evidence_from` from the parts the chunked pass builds once
+/// (`apex_intensities`, `peak_window`, `PeakTraces`), then scalar fields are
+/// filled by the caller. `build_evidence` is the test-only wrapper that builds those
+/// parts and calls `evidence_from` in one step.
 /// The family modules in `stages/features/` read this and return feature values.
 pub struct Evidence {
     /// RT axis (seconds) restricted to the detected elution peak.
@@ -511,11 +514,19 @@ pub struct Evidence {
     /// intensity is negative (`index.rs` rejects only non-finite ones), so it keeps its
     /// own build.
     ///
-    /// The length is a contract of `build_evidence`, not of the type, so both readers
+    /// The length is a contract of `evidence_from` (the profile comes from
+    /// `PeakTraces::new` over the same alignment), not of the type, so both readers
     /// CHECK it and rebuild rather than trust it: this struct is `pub` with `pub` fields,
     /// several test fixtures fill it with `vec![]`, and a short profile would degrade
     /// silently rather than fail (see the comment in `interference::values`).
     pub ref_profile_full: Vec<f64>,
+    /// The pairwise and reference correlations several families and `fragment_features`
+    /// all computed from `traces`, `ref_profile`, `traces_full` and `ref_profile_full`,
+    /// computed once per PSM by `PairStats::new` from exactly those fields. `Some` only
+    /// from `evidence_from`; a reader uses it when its shape matches the evidence it is
+    /// reading (`PairStats::fits`) and computes the value itself otherwise, which is
+    /// what the `vec![]`-filled test fixtures (with `None`) exercise.
+    pub pair_stats: Option<PairStats>,
     // --- scalars (filled by the caller after build) ---
     pub apex_rt: f64,
     pub rt_pred_cal: f64,
@@ -568,8 +579,9 @@ fn parse_ion(name: &str) -> (bool, u32, u32) {
 /// written once and the equality of the two it replaced can be read off it. It reproduces
 /// `interference`'s inline loop exactly (`for f in 0..k` under an `f < traces_full.len()`
 /// guard, `n = x.len().min(t)`), and `coelution`'s `weighted_reference` whenever
-/// `traces_full.len() == pred.len()` -- which `build_evidence` guarantees, since both are
-/// built per row of the same `rows`, and which coelution's `has_full` guard requires
+/// `traces_full.len() == pred.len()` -- which the Evidence build guarantees
+/// ([`PeakTraces::new`] and [`evidence_from`] take `al.traces_full` and `pred` from the
+/// same `rows`, one entry per row), and which coelution's `has_full` guard requires
 /// anyway. Fragment-outer, time-inner, so the f64 accumulation order is the old one.
 fn weighted_reference_full(traces_full: &[Vec<f64>], pred: &[f64], t: usize) -> Vec<f64> {
     let mut r = vec![0.0f64; t];
@@ -582,10 +594,243 @@ fn weighted_reference_full(traces_full: &[Vec<f64>], pred: &[f64], t: usize) -> 
     r
 }
 
+/// Observed intensity at the scan nearest the apex, per row (the first of two equally near
+/// scans, by the strict `<`), widened to f64. `fragment_features` and the Evidence build
+/// each ran this K x T search over the same rows; the caller now runs it once per PSM and
+/// hands the result to both.
+fn apex_intensities(rows: &[ChromRow], apex_rt: f64) -> Vec<f64> {
+    rows.iter()
+        .map(|r| {
+            let mut best = 0.0f32;
+            let mut bestd = f64::MAX;
+            for (k, &rt) in r.rt.iter().enumerate() {
+                let d = (rt as f64 - apex_rt).abs();
+                if d < bestd {
+                    bestd = d;
+                    best = r.inten[k];
+                }
+            }
+            best as f64
+        })
+        .collect()
+}
+
+/// The elution-peak window `lo..=hi` on the union axis: the global half-widths when a
+/// confident set gave them, otherwise the walk down the smoothed top-3-predicted profile
+/// from the apex-nearest scan; the whole axis below three points. `fragment_features`
+/// (under `bound_features`) and the Evidence build each carried this block, identical
+/// term for term, and computed it twice per PSM.
+fn peak_window(
+    axis_full: &[f32],
+    traces_full: &[Vec<f64>],
+    pred: &[f64],
+    apex_rt: f64,
+    frac: f64,
+    grace: usize,
+    global_bounds: Option<(f64, f64)>,
+) -> (usize, usize) {
+    if axis_full.len() < 3 {
+        return (0, axis_full.len().saturating_sub(1));
+    }
+    let ai = axis_full
+        .iter()
+        .enumerate()
+        .min_by(|(_, a), (_, b)| {
+            (**a as f64 - apex_rt)
+                .abs()
+                .total_cmp(&(**b as f64 - apex_rt).abs())
+        })
+        .map(|(i, _)| i)
+        .unwrap_or(0);
+    match global_bounds {
+        Some((l, r)) => global_bound_indices(axis_full, apex_rt, ai, l, r),
+        None => {
+            let mut ord: Vec<usize> = (0..pred.len()).collect();
+            ord.sort_by(|&a, &b| pred[b].total_cmp(&pred[a]));
+            let k3: Vec<usize> = ord.into_iter().take(3).collect();
+            let prof_raw: Vec<f64> = (0..axis_full.len())
+                .map(|k| k3.iter().map(|&i| traces_full[i][k]).sum::<f64>())
+                .collect();
+            let prof = smooth3(&prof_raw);
+            peak_bounds(&prof, ai, frac, grace)
+        }
+    }
+}
+
+/// The pairwise and fragment-vs-reference statistics of one PSM's peak-window traces,
+/// computed once and read by `fragment_features` and the `coelution`, `interference`,
+/// `ion_series` and `nonzero` families.
+///
+/// Each of them computed some of these itself, from the same traces: the pair Pearson
+/// matrix and the lag-optimised cross-correlation of every pair (in `fragment_features`
+/// and again in `coelution`, which docs/28 section 3.1 found bit-identical as columns),
+/// subsets of the same pair matrix (`ion_series` per series and for complementary pairs,
+/// `nonzero` when every scan carries signal), every fragment against the reference
+/// profile (four times per fragment) and every full-window trace against the full-window
+/// reference (twice). Every entry here is produced by the same kernel call the reader made
+/// (`pearson_pairs`, `best_xcorr_normed`, `pearson_vs`), on the same arguments in the same
+/// order, so a read is bit-identical to the computation it replaces. Pearson is exactly
+/// symmetric, so `corr(b, a)` serves a pair asked for the other way round; the
+/// cross-correlation is not, and is stored for `a < b` only, the one order every reader uses.
+pub struct PairStats {
+    k: usize,
+    np: usize,
+    /// `k x k` row-major, `pearson(traces[a], traces[b])` off the diagonal, 1.0 on it.
+    corr: Vec<f64>,
+    /// `k x k` row-major, `best_xcorr_normed(traces[a], traces[b], 5, ..)` for `a < b`.
+    xcorr: Vec<(i32, f64)>,
+    /// `xcorr_norm(traces[f])`.
+    norms: Vec<f64>,
+    /// `pearson(traces[f], ref_profile)`.
+    ref_corr: Vec<f64>,
+    /// `pearson(traces_full[f], ref_profile_full)`, or empty when `traces_full` does not
+    /// have one row per fragment.
+    ref_corr_full: Vec<f64>,
+}
+
+impl PairStats {
+    fn new(
+        traces: &[Vec<f64>],
+        np: usize,
+        ref_profile: &[f64],
+        traces_full: &[Vec<f64>],
+        ref_profile_full: &[f64],
+    ) -> PairStats {
+        let k = traces.len();
+        let mut pairs: Vec<f64> = Vec::with_capacity(k * k.saturating_sub(1) / 2);
+        pearson_pairs(traces, &mut pairs);
+        let mut pairs = pairs.into_iter();
+        let norms: Vec<f64> = traces.iter().map(|t| xcorr_norm(t)).collect();
+        let mut corr = vec![0.0f64; k * k];
+        let mut xcorr = vec![(0i32, 0.0f64); k * k];
+        for a in 0..k {
+            corr[a * k + a] = 1.0;
+            for b in (a + 1)..k {
+                let p = pairs.next().expect("one correlation per pair");
+                corr[a * k + b] = p;
+                corr[b * k + a] = p;
+                xcorr[a * k + b] = best_xcorr_normed(
+                    &traces[a],
+                    &traces[b],
+                    XCORR_MAXLAG as i32,
+                    norms[a],
+                    norms[b],
+                );
+            }
+        }
+        let rc = Centered::new(ref_profile);
+        let ref_corr = traces
+            .iter()
+            .map(|t| pearson_vs(t, ref_profile, &rc))
+            .collect();
+        let ref_corr_full = if traces_full.len() == k {
+            let rfc = Centered::new(ref_profile_full);
+            traces_full
+                .iter()
+                .map(|t| pearson_vs(t, ref_profile_full, &rfc))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        PairStats {
+            k,
+            np,
+            corr,
+            xcorr,
+            norms,
+            ref_corr,
+            ref_corr_full,
+        }
+    }
+
+    /// Whether these statistics describe `k` fragments on an `np`-point peak window. A
+    /// reader checks it before trusting a read: `Evidence` has `pub` fields and could be
+    /// assembled around statistics of other traces.
+    pub(crate) fn fits(&self, k: usize, np: usize) -> bool {
+        self.k == k && self.np == np
+    }
+
+    /// `pearson(traces[a], traces[b])`, either order; 1.0 when `a == b`.
+    pub(crate) fn corr(&self, a: usize, b: usize) -> f64 {
+        self.corr[a * self.k + b]
+    }
+
+    /// The `k x k` pair matrix, row-major, 1.0 on the diagonal.
+    pub(crate) fn corr_matrix(&self) -> &[f64] {
+        &self.corr
+    }
+
+    /// `best_xcorr(traces[a], traces[b], 5)` for `a < b`.
+    pub(crate) fn xcorr(&self, a: usize, b: usize) -> (i32, f64) {
+        debug_assert!(a < b, "the cross-correlation is stored for a < b only");
+        self.xcorr[a * self.k + b]
+    }
+
+    pub(crate) fn norms(&self) -> &[f64] {
+        &self.norms
+    }
+
+    pub(crate) fn ref_corr(&self) -> &[f64] {
+        &self.ref_corr
+    }
+
+    /// `pearson(traces_full[f], ref_profile_full)` per fragment, when it was computed.
+    pub(crate) fn ref_corr_full(&self) -> Option<&[f64]> {
+        (self.ref_corr_full.len() == self.k).then_some(&self.ref_corr_full[..])
+    }
+}
+
+/// One PSM's elution-peak window and everything `fragment_features` and
+/// [`evidence_from`] both need from it: the window, the traces sliced to it, the
+/// predicted-intensity-weighted reference profile over it (clamped weights) and over the
+/// whole window (raw weights), and the [`PairStats`]. Built once per PSM from the
+/// alignment; `fragment_features` borrows it when `bound_features` makes its window the
+/// same one, and the Evidence then takes it over.
+struct PeakTraces {
+    lo: usize,
+    hi: usize,
+    traces: Vec<Vec<f64>>,
+    ref_profile: Vec<f64>,
+    ref_profile_full: Vec<f64>,
+    stats: PairStats,
+}
+
+impl PeakTraces {
+    fn new(al: &TraceAlign, pred: &[f64], (lo, hi): (usize, usize)) -> PeakTraces {
+        let traces: Vec<Vec<f64>> = al.traces_full.iter().map(|t| t[lo..=hi].to_vec()).collect();
+        let np = al.axis_full[lo..=hi].len();
+        let mut ref_profile = vec![0.0f64; np];
+        for (fi, tr) in traces.iter().enumerate() {
+            let w = pred[fi].max(0.0);
+            for k in 0..np {
+                ref_profile[k] += w * tr[k];
+            }
+        }
+        let ref_profile_full = weighted_reference_full(&al.traces_full, pred, al.axis_full.len());
+        let stats = PairStats::new(
+            &traces,
+            np,
+            &ref_profile,
+            &al.traces_full,
+            &ref_profile_full,
+        );
+        PeakTraces {
+            lo,
+            hi,
+            traces,
+            ref_profile,
+            ref_profile_full,
+            stats,
+        }
+    }
+}
+
 /// Build the trace-derived fields of [`Evidence`] from a PSM's chromatogram
-/// rows (scalar fields default; the caller fills them). Mirrors the alignment
-/// and peak-bounding of [`fragment_features`] so the extended families see the
-/// same elution peak the legacy features use.
+/// rows (scalar fields default; the caller fills them), in one call. The chunked pass
+/// builds the same parts itself ([`apex_intensities`], [`peak_window`], [`PeakTraces`])
+/// so that `fragment_features` can share them, then calls [`evidence_from`]; this is the
+/// one-call form the tests use.
+#[cfg(test)]
 fn build_evidence(
     rows: &[ChromRow],
     al: TraceAlign,
@@ -595,9 +840,35 @@ fn build_evidence(
     grace: usize,
     global_bounds: Option<(f64, f64)>,
 ) -> Evidence {
+    let obs = apex_intensities(rows, apex_rt);
+    let pred: Vec<f64> = rows.iter().map(|r| r.pred_int as f64).collect();
+    let win = peak_window(
+        &al.axis_full,
+        &al.traces_full,
+        &pred,
+        apex_rt,
+        frac,
+        grace,
+        global_bounds,
+    );
+    let peak = PeakTraces::new(&al, &pred, win);
+    evidence_from(rows, al, obs, pred, peak, ms1_rows, apex_rt)
+}
+
+/// The trace-derived fields of [`Evidence`] from parts built once per PSM: the apex
+/// intensities, the predicted intensities, the alignment (moved in: the Evidence owns it)
+/// and the peak window with its statistics. The families therefore see the same elution
+/// peak the legacy features use.
+fn evidence_from(
+    rows: &[ChromRow],
+    al: TraceAlign,
+    obs_apex: Vec<f64>,
+    pred: Vec<f64>,
+    peak: PeakTraces,
+    ms1_rows: &[ChromRow],
+    apex_rt: f64,
+) -> Evidence {
     let m = rows.len();
-    let mut obs_apex = Vec::with_capacity(m);
-    let mut pred = Vec::with_capacity(m);
     let mut is_b = Vec::with_capacity(m);
     let mut ordinal = Vec::with_capacity(m);
     let mut frag_charge = Vec::with_capacity(m);
@@ -605,17 +876,6 @@ fn build_evidence(
     let mut frag_obs_mz = Vec::with_capacity(m);
     let mut mass_err_ppm = Vec::with_capacity(m);
     for r in rows {
-        let mut best = 0.0f32;
-        let mut bestd = f64::MAX;
-        for (k, &rt) in r.rt.iter().enumerate() {
-            let d = (rt as f64 - apex_rt).abs();
-            if d < bestd {
-                bestd = d;
-                best = r.inten[k];
-            }
-        }
-        obs_apex.push(best as f64);
-        pred.push(r.pred_int as f64);
         let (b, o, c) = parse_ion(r.frag_name);
         is_b.push(b);
         ordinal.push(o);
@@ -631,39 +891,15 @@ fn build_evidence(
         axis_full,
         traces_full,
     } = al;
-
-    let (lo_i, hi_i) = if axis_full.len() >= 3 {
-        let ai = axis_full
-            .iter()
-            .enumerate()
-            .min_by(|(_, a), (_, b)| {
-                (**a as f64 - apex_rt)
-                    .abs()
-                    .total_cmp(&(**b as f64 - apex_rt).abs())
-            })
-            .map(|(i, _)| i)
-            .unwrap_or(0);
-        match global_bounds {
-            Some((l, r)) => global_bound_indices(&axis_full, apex_rt, ai, l, r),
-            None => {
-                let mut ord: Vec<usize> = (0..pred.len()).collect();
-                ord.sort_by(|&a, &b| pred[b].total_cmp(&pred[a]));
-                let k3: Vec<usize> = ord.into_iter().take(3).collect();
-                let prof_raw: Vec<f64> = (0..axis_full.len())
-                    .map(|k| k3.iter().map(|&i| traces_full[i][k]).sum::<f64>())
-                    .collect();
-                let prof = smooth3(&prof_raw);
-                peak_bounds(&prof, ai, frac, grace)
-            }
-        }
-    } else {
-        (0, axis_full.len().saturating_sub(1))
-    };
+    let PeakTraces {
+        lo: lo_i,
+        hi: hi_i,
+        traces,
+        ref_profile,
+        ref_profile_full,
+        stats,
+    } = peak;
     let axis: Vec<f64> = axis_full[lo_i..=hi_i].iter().map(|&x| x as f64).collect();
-    let traces: Vec<Vec<f64>> = traces_full
-        .iter()
-        .map(|t| t[lo_i..=hi_i].to_vec())
-        .collect();
     let axis_full_f: Vec<f64> = axis_full.iter().map(|&x| x as f64).collect();
 
     let apex_idx = axis
@@ -673,23 +909,36 @@ fn build_evidence(
         .map(|(i, _)| i)
         .unwrap_or(0);
 
-    let np = axis.len();
-    let mut ref_profile = vec![0.0f64; np];
-    for (fi, tr) in traces.iter().enumerate() {
-        let w = pred[fi].max(0.0);
-        for k in 0..np {
-            ref_profile[k] += w * tr[k];
-        }
-    }
-    let ref_profile_full = weighted_reference_full(&traces_full, &pred, axis_full_f.len());
-
     // MS1 isotope XICs [mono, +1, +2] sampled on the same grid as the fragments,
     // mapped onto axis_full then sliced to the elution peak. Present only when the
     // extract stage emitted them (grid mode + MS1 data); else empty.
+    //
+    // Extract writes an MS1 row on the fragments' own window grid (the same `grid_rt` every
+    // fragment row carries), so the usual row samples `axis_full` itself and the map below
+    // is the identity. `ms1_on_axis` recognises that case and slices the row directly: the
+    // map built three SipHash tables and a full-window vector per PSM to return, at every
+    // position, the value already stored there. Bit-identical: on a strictly ascending axis
+    // every bit pattern is distinct, so `map[axis_full[k]]` is exactly `r.inten[k]`, and
+    // both paths widen the same f32 to f64. Any other row (another grid, a length
+    // mismatch, an axis that is not strictly ascending) still goes through the map.
+    let axis_ascending = axis_full.windows(2).all(|w| w[0] < w[1]);
+    let ms1_on_axis = |r: &ChromRow| -> bool {
+        axis_ascending
+            && r.rt.len() == axis_full.len()
+            && r.inten.len() == r.rt.len()
+            && r.rt
+                .iter()
+                .zip(&axis_full)
+                .all(|(a, b)| a.to_bits() == b.to_bits())
+    };
     let ms1_xic: Vec<Vec<f64>> = {
         let mut out = Vec::new();
         for name in ["ms1_mono", "ms1_iso1", "ms1_iso2"] {
             if let Some(r) = ms1_rows.iter().find(|r| r.frag_name == name) {
+                if ms1_on_axis(r) {
+                    out.push(r.inten[lo_i..=hi_i].iter().map(|&v| v as f64).collect());
+                    continue;
+                }
                 let map: HashMap<u32, f32> =
                     r.rt.iter()
                         .zip(r.inten.iter())
@@ -725,6 +974,7 @@ fn build_evidence(
         apex_idx,
         ref_profile,
         ref_profile_full,
+        pair_stats: Some(stats),
         apex_rt,
         rt_pred_cal: 0.0,
         rt_err: 0.0,
@@ -1634,6 +1884,11 @@ impl DecoderLease {
     fn decoders(&self) -> usize {
         self.n.max(1)
     }
+
+    /// What the budget actually granted, which may be zero.
+    fn granted(&self) -> usize {
+        self.n
+    }
 }
 
 impl Drop for DecoderLease {
@@ -1940,6 +2195,7 @@ pub fn run_hashed(p: FeaturesParams) -> Result<Written> {
         CHUNK_PSM_ROWS,
         PinFinish::Normal,
         BoundsSource::Learn,
+        LoaderSource::Leased,
     )
 }
 
@@ -1956,6 +2212,7 @@ pub fn run_with_chunk_limits(
         max_psm_rows,
         PinFinish::Normal,
         BoundsSource::Learn,
+        LoaderSource::Leased,
     )
     .map(|w| w.rows)
 }
@@ -2007,6 +2264,7 @@ pub fn run_with_chunk_rows(p: FeaturesParams, chunk_rows: usize) -> Result<u64> 
         CHUNK_PSM_ROWS,
         PinFinish::Normal,
         BoundsSource::Learn,
+        LoaderSource::Leased,
     )
     .map(|w| w.rows)
 }
@@ -2038,6 +2296,7 @@ pub fn run_with_bounds_hashed(p: FeaturesParams, bounds: Option<(f64, f64)>) -> 
         CHUNK_PSM_ROWS,
         PinFinish::Normal,
         BoundsSource::Given(bounds),
+        LoaderSource::Leased,
     )
 }
 
@@ -2104,12 +2363,394 @@ enum BoundsSource {
     Given(Option<(f64, f64)>),
 }
 
+/// Main-pass loaders beyond each pass's first, PROCESS-WIDE, for the reason
+/// [`BOUNDS_DECODERS`] is: [`run`] is called from inside a rayon `par_iter` when
+/// `groups.parallel > 1` or `experiment.parallel_runs > 1`, and each loader holds one
+/// decoded chunk (0.92 GiB of traces at the HYE benchmark shape), so a per-pass allowance
+/// would multiply with the concurrency. Every pass keeps the one loader it always had and
+/// takes up to `features.chrom_loaders - 1` more from this pool, whatever is left of it, so
+/// `C` concurrent passes run at most `C + MAIN_LOADER_EXTRAS` loaders.
+const MAIN_LOADER_EXTRAS: usize = 4;
+
+/// Extra main-pass loaders of the [`MAIN_LOADER_EXTRAS`] pool not currently leased.
+static MAIN_LOADER_BUDGET: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(MAIN_LOADER_EXTRAS);
+
+/// The main pass's loader request before the pool lease: `features.chrom_loaders` (at
+/// least one), and no more than there are chunks to decode or threads in the rayon pool.
+/// The pool is what `--threads` sizes, so a run held to one thread decodes on one loader,
+/// as it did before the loaders were parallel, instead of adding decode threads the
+/// thread budget did not grant. Under `groups.parallel` or `experiment.parallel_runs` the
+/// pool is the whole pool, and [`MAIN_LOADER_EXTRAS`] is the bound that applies there.
+fn main_loaders_wanted(chrom_loaders: usize, chunks: usize, threads: usize) -> usize {
+    chrom_loaders.max(1).min(chunks.max(1)).min(threads.max(1))
+}
+
+/// How a main pass gets its loaders.
+#[derive(Clone, Copy)]
+enum LoaderSource {
+    /// Every production call: [`main_loaders_wanted`], the loaders beyond the first
+    /// leased from [`MAIN_LOADER_BUDGET`], so a pass may run fewer than it asked for.
+    Leased,
+    /// Exactly `loaders` loaders (capped by the chunk count only), nothing leased, and an
+    /// optional injected failure. Tests use it so that a test of the multi-loader
+    /// hand-over cannot quietly run one loader because another test in the same process
+    /// holds the shared pool, and so that the failure paths can be driven on purpose.
+    #[cfg(test)]
+    Exact {
+        loaders: usize,
+        fault: Option<LoadFault>,
+    },
+}
+
+/// A failure injected into one chunk's decode ([`LoaderSource::Exact`]).
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+struct LoadFault {
+    /// The chunk whose decode fails.
+    at: usize,
+    /// Panic in the loader instead of returning an error.
+    panic: bool,
+    /// Hold chunk `at - 1`'s decode until the failure at `at` has stopped the pass, so
+    /// the failure lands while the chunk before it is still being decoded: the
+    /// out-of-order case the in-order hand-over exists for. Needs two loaders or more
+    /// (with one, chunk `at` is only claimed after `at - 1`); the hold gives up after ten
+    /// seconds so a wrong setup fails its test instead of hanging it.
+    hold_prev: bool,
+}
+
+/// Decode one planned chunk (`n_rows` chromatogram rows from `first`) on its own, from
+/// its row span, with a fragment-name table of its own.
+///
+/// The chunk is the same whichever thread reads it and whatever was read before it: its
+/// rows are fixed by the plan, [`ChromChunk`] is built from them in table order, and the
+/// candidate grouping, the axis dedup and every stored value depend on those rows alone.
+/// The name ids do differ from a table shared across chunks, but nothing reads an id
+/// except to look its string up in the table the chunk travels with
+/// ([`ChromChunk::rows`]). A zero-row chunk (PSM rows with no chromatogram rows) is an
+/// empty chunk, as the sequential stream returned for it.
+///
+/// A span decodes whole row groups, so a chunk that starts or ends inside one decodes
+/// and discards the rest of it: at most one 65,536-row group at each end of a ~1M-row
+/// chunk, against the single sequential stream that decoded every row once.
+fn load_chunk(ch: &TableFile, first: usize, n_rows: usize) -> Result<(ChromChunk, NameTab)> {
+    let mut names = NameTab::default();
+    if n_rows == 0 {
+        return Ok((ChromChunk::new(), names));
+    }
+    let span = ch.span(first, n_rows)?;
+    let mut stream = ChromStream::open(&span)?;
+    let chunk = stream.read_chunk(n_rows, &mut names)?;
+    Ok((chunk, names))
+}
+
+/// The main pass's chromatogram loaders and the ordered hand-over to the computation.
+///
+/// `loaders` threads each claim the next unclaimed chunk, decode it with [`load_chunk`] and
+/// park it; the computation takes chunk `j` only after chunk `j - 1`, so the features are
+/// computed, assembled and written in table order exactly as with one sequential loader.
+/// A loader may claim chunk `j` only while `j < taken + loaders`, where `taken` is the
+/// number of chunks the computation has taken, so at most `loaders` chunks are decoded or
+/// being decoded ahead of it, and `loaders + 1` are resident with the one it is computing.
+/// With one loader that is the previous bound exactly: one chunk computed, one decoded.
+///
+/// Errors keep the order too. A failed chunk is parked like any other and no further chunk
+/// is claimed; the chunks before it were claimed earlier (claims are in order), so the
+/// computation receives them first and then the error, at the same chunk as before. A
+/// loader that dies without parking its chunk (a panic) is counted out, so the computation
+/// reports that the loaders stopped instead of waiting for a chunk that will never come.
+struct ChunkLoader<'a> {
+    ch: &'a TableFile,
+    first: &'a [usize],
+    rows: &'a [usize],
+    loaders: usize,
+    state: std::sync::Mutex<LoadState>,
+    cv: std::sync::Condvar,
+    #[cfg(test)]
+    fault: Option<LoadFault>,
+}
+
+/// [`ChunkLoader`]'s shared state; see there.
+struct LoadState {
+    /// The next chunk no loader has claimed.
+    next: usize,
+    /// Chunks the computation has taken.
+    taken: usize,
+    /// Decoded chunks the computation has not taken yet, by chunk index. An ordered map so
+    /// that nothing about the hand-over depends on hash iteration.
+    ready: std::collections::BTreeMap<usize, Result<(ChromChunk, NameTab)>>,
+    /// Claim nothing more: a chunk failed, or the computation has stopped.
+    stop: bool,
+    /// Loaders still running.
+    live: usize,
+}
+
+impl<'a> ChunkLoader<'a> {
+    fn new(
+        ch: &'a TableFile,
+        first: &'a [usize],
+        rows: &'a [usize],
+        loaders: usize,
+    ) -> ChunkLoader<'a> {
+        ChunkLoader {
+            ch,
+            first,
+            rows,
+            loaders: loaders.max(1),
+            state: std::sync::Mutex::new(LoadState {
+                next: 0,
+                taken: 0,
+                ready: std::collections::BTreeMap::new(),
+                stop: false,
+                live: loaders.max(1),
+            }),
+            cv: std::sync::Condvar::new(),
+            #[cfg(test)]
+            fault: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_fault(mut self, fault: Option<LoadFault>) -> ChunkLoader<'a> {
+        self.fault = fault;
+        self
+    }
+
+    /// The injected failure's effect on chunk `j` before its decode: hold it (see
+    /// [`LoadFault::hold_prev`]) or panic.
+    #[cfg(test)]
+    fn inject_before(&self, j: usize) {
+        let Some(f) = self.fault else { return };
+        if f.hold_prev && j + 1 == f.at {
+            let deadline = Instant::now() + std::time::Duration::from_secs(10);
+            let mut st = self.lock();
+            while !st.stop {
+                let Some(left) = deadline.checked_duration_since(Instant::now()) else {
+                    break;
+                };
+                st = self
+                    .cv
+                    .wait_timeout(st, left)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .0;
+            }
+        }
+        if f.panic && j == f.at {
+            panic!("features: injected loader panic at chunk {j}");
+        }
+    }
+
+    /// The injected failure's effect on chunk `j`'s decode result.
+    #[cfg(test)]
+    fn inject_after(
+        &self,
+        j: usize,
+        r: Result<(ChromChunk, NameTab)>,
+    ) -> Result<(ChromChunk, NameTab)> {
+        match self.fault {
+            Some(f) if !f.panic && j == f.at => {
+                Err(anyhow!("features: injected load failure at chunk {j}"))
+            }
+            _ => r,
+        }
+    }
+
+    /// The state, whether or not another thread panicked holding it: every update below
+    /// leaves the state consistent before it can panic, and the only panics possible while
+    /// the lock is held are allocation failures.
+    fn lock(&self) -> std::sync::MutexGuard<'_, LoadState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn wait<'g>(
+        &self,
+        g: std::sync::MutexGuard<'g, LoadState>,
+    ) -> std::sync::MutexGuard<'g, LoadState> {
+        self.cv
+            .wait(g)
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// One loader thread's loop: claim, decode, park, until every chunk is claimed or the
+    /// pass stops.
+    fn run(&self, timers: &PassTimers) {
+        // Counted out on every exit, a panic included, so `take` cannot wait forever. A
+        // panic also stops the pass: the chunk it was decoding is never parked, so the
+        // other loaders would otherwise fill the window past it and wait for a computation
+        // that is itself waiting for the missing chunk.
+        struct Exit<'l, 'a>(&'l ChunkLoader<'a>);
+        impl Drop for Exit<'_, '_> {
+            fn drop(&mut self) {
+                let mut st = self.0.lock();
+                st.live -= 1;
+                if std::thread::panicking() {
+                    st.stop = true;
+                }
+                drop(st);
+                self.0.cv.notify_all();
+            }
+        }
+        let _exit = Exit(self);
+        loop {
+            let j = {
+                let mut st = self.lock();
+                loop {
+                    if st.stop || st.next >= self.rows.len() {
+                        return;
+                    }
+                    if st.next < st.taken + self.loaders {
+                        break;
+                    }
+                    let blocked = Instant::now();
+                    st = self.wait(st);
+                    timers.add(&timers.loader_blocked_ns, blocked);
+                }
+                st.next += 1;
+                // The window: never more than `loaders` chunks claimed ahead of the
+                // computation, which is what bounds the resident chunks at `loaders + 1`.
+                debug_assert!(st.next - st.taken <= self.loaders);
+                st.next - 1
+            };
+            #[cfg(test)]
+            self.inject_before(j);
+            let busy = Instant::now();
+            let r = load_chunk(self.ch, self.first[j], self.rows[j]);
+            #[cfg(test)]
+            let r = self.inject_after(j, r);
+            timers.add(&timers.loader_busy_ns, busy);
+            let mut st = self.lock();
+            if r.is_err() {
+                st.stop = true;
+            }
+            st.ready.insert(j, r);
+            drop(st);
+            self.cv.notify_all();
+        }
+    }
+
+    /// Chunk `j`, blocking until a loader has parked it. `None` when every loader has
+    /// exited without parking it, which only a loader panic can cause.
+    fn take(&self, j: usize) -> Option<Result<(ChromChunk, NameTab)>> {
+        let mut st = self.lock();
+        loop {
+            if let Some(r) = st.ready.remove(&j) {
+                st.taken += 1;
+                drop(st);
+                self.cv.notify_all();
+                return Some(r);
+            }
+            if st.live == 0 {
+                return None;
+            }
+            st = self.wait(st);
+        }
+    }
+
+    /// Stop the loaders when the returned guard drops: nothing more is claimed and every
+    /// loader waiting for the window wakes and exits. A loader in the middle of a decode
+    /// finishes it first, and its chunk is dropped with the loader.
+    fn release_on_drop(&self) -> impl Drop + '_ {
+        struct Release<'l, 'a>(&'l ChunkLoader<'a>);
+        impl Drop for Release<'_, '_> {
+            fn drop(&mut self) {
+                self.0.lock().stop = true;
+                self.0.cv.notify_all();
+            }
+        }
+        Release(self)
+    }
+}
+
+/// Where the chunked pass spends its time (perf survey P0), so the next optimisation can
+/// be sized from a log line instead of from a cost model.
+///
+/// The pass is a three-stage pipeline (loader thread(s) decoding chromatogram chunks,
+/// the calling thread computing and assembling the features of one chunk, a writer thread
+/// encoding the previous chunk's columns), and its wall time is set by whichever stage is
+/// busiest. Each stage records its BUSY time and the time it spent BLOCKED on a
+/// neighbour, so the binding stage is the one that is busy while the others wait on it: a
+/// pass whose `wait_for_loader_ms` is large and whose `loader_blocked_ms` is small is
+/// decode-bound, and one whose `loader_blocked_ms` and `writer_idle_ms` are both large
+/// while `compute_ms` dominates is compute-bound. Busy time is summed over threads, so
+/// with several loaders it can exceed the wall time.
+///
+/// Relaxed atomics: the counters are read once, after every thread has been joined.
+/// Nothing here feeds a value, a file or a hash; the only output is the log line.
+#[derive(Default)]
+struct PassTimers {
+    /// Loader threads decoding and storing chunks, summed over loaders.
+    loader_busy_ns: std::sync::atomic::AtomicU64,
+    /// Loader threads waiting for the computation to take a chunk, because the decode
+    /// window ([`ChunkLoader`]) is full; summed over loaders.
+    loader_blocked_ns: std::sync::atomic::AtomicU64,
+    /// The computation waiting for the next chunk to be decoded.
+    wait_loader_ns: std::sync::atomic::AtomicU64,
+    /// The parallel per-PSM kernels (`fragment_features`, the Evidence build through
+    /// [`PeakTraces`] and [`evidence_from`], the families).
+    compute_ns: std::sync::atomic::AtomicU64,
+    /// The serial assembly of the value matrix, the PIN and the output columns.
+    assemble_ns: std::sync::atomic::AtomicU64,
+    /// The computation waiting for the writer to take the finished columns.
+    wait_writer_ns: std::sync::atomic::AtomicU64,
+    /// The writer encoding columns (and closing the file).
+    writer_busy_ns: std::sync::atomic::AtomicU64,
+    /// The writer waiting for the next chunk's columns.
+    writer_idle_ns: std::sync::atomic::AtomicU64,
+}
+
+impl PassTimers {
+    fn add(&self, slot: &std::sync::atomic::AtomicU64, since: Instant) {
+        let ns = u64::try_from(since.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        slot.fetch_add(ns, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn ms(slot: &std::sync::atomic::AtomicU64) -> u64 {
+        slot.load(std::sync::atomic::Ordering::Relaxed) / 1_000_000
+    }
+
+    /// The stage that was busiest per thread: the loaders' busy time is shared across
+    /// `loaders` threads, the computation's and the writer's belong to one thread each.
+    fn binding(&self, loaders: usize) -> &'static str {
+        let loader = Self::ms(&self.loader_busy_ns) / loaders.max(1) as u64;
+        let compute = Self::ms(&self.compute_ns) + Self::ms(&self.assemble_ns);
+        let writer = Self::ms(&self.writer_busy_ns);
+        if loader >= compute && loader >= writer {
+            "loader"
+        } else if writer >= compute {
+            "writer"
+        } else {
+            "compute"
+        }
+    }
+
+    fn log(&self, wall: std::time::Duration, loaders: usize, chunks: usize) {
+        info!(
+            wall_ms = u64::try_from(wall.as_millis()).unwrap_or(u64::MAX),
+            chunks,
+            loaders,
+            loader_busy_ms = Self::ms(&self.loader_busy_ns),
+            loader_blocked_ms = Self::ms(&self.loader_blocked_ns),
+            wait_for_loader_ms = Self::ms(&self.wait_loader_ns),
+            compute_ms = Self::ms(&self.compute_ns),
+            assemble_ms = Self::ms(&self.assemble_ns),
+            wait_for_writer_ms = Self::ms(&self.wait_writer_ns),
+            writer_busy_ms = Self::ms(&self.writer_busy_ns),
+            writer_idle_ms = Self::ms(&self.writer_idle_ns),
+            binding = self.binding(loaders),
+            "features: pass timers"
+        );
+    }
+}
+
 fn run_chunked(
     p: FeaturesParams,
     chunk_rows: usize,
     max_psm_rows: usize,
     pin_finish: PinFinish,
     bounds: BoundsSource,
+    loaders: LoaderSource,
 ) -> Result<Written> {
     let t0 = Instant::now();
     let ps = TableFile::open(p.psms)?;
@@ -2316,7 +2957,7 @@ fn run_chunked(
     let ext_names = extended_name_refs();
 
     // The two expensive per-PSM computations (`fragment_features` and, when the
-    // extended set is active, `build_evidence` + `extended_values`) are pure
+    // extended set is active, `PeakTraces` + `evidence_from` + `extended_values`) are pure
     // functions of that PSM's own inputs, so they are computed in parallel over the
     // chunk and indexed by row. The serial assembly below reads them back by row and
     // is otherwise unchanged, so the feature values are identical to the whole-run
@@ -2360,27 +3001,53 @@ fn run_chunked(
     // The chunk decode is single-threaded parquet work and it ran in series with the
     // feature computation, which is what left a 24-thread features process at 1.6-2.8 cores
     // (measured on the 8-12-mer immunopeptidomics run: 3.7 of a 4-minute stage were the
-    // load). The loader now runs on its own thread, one chunk ahead of the computation, so
-    // decode and compute overlap; at most two chunks are resident. Each chunk travels with a
-    // snapshot of the fragment-name table as it stood when the chunk was read, which is
-    // exactly what the serial code saw at that point.
+    // load). It then moved onto one loader thread, one chunk ahead of the computation, so
+    // decode and compute overlapped but the decode itself stayed on one core. Now
+    // `chrom_loaders` threads each decode a whole chunk from that chunk's row span (see
+    // [`ChunkLoader`]), and the computation takes the chunks in table order.
     let chunk_rows: Vec<usize> = chunks.iter().map(|c| c.chrom_rows).collect();
-    let ch_ref = &ch;
+    let chunk_first: Vec<usize> = chunk_rows
+        .iter()
+        .scan(0usize, |acc, &n| {
+            let first = *acc;
+            *acc += n;
+            Some(first)
+        })
+        .collect();
+    let (extra_lease, n_loaders) = match loaders {
+        LoaderSource::Leased => {
+            let want = main_loaders_wanted(
+                p.cfg.chrom_loaders,
+                chunks.len(),
+                rayon::current_num_threads(),
+            );
+            // Loaders beyond the first come from the process-wide pool; this pass's own
+            // first loader is never leased, so a pass always runs even when the pool is
+            // empty.
+            let lease = DecoderLease::take_from(&MAIN_LOADER_BUDGET, want - 1);
+            let n = 1 + lease.granted();
+            (Some(lease), n)
+        }
+        #[cfg(test)]
+        LoaderSource::Exact { loaders, .. } => (None, loaders.max(1).min(chunks.len().max(1))),
+    };
+    let loader = ChunkLoader::new(&ch, &chunk_first, &chunk_rows, n_loaders);
+    #[cfg(test)]
+    let loader = loader.with_fault(match loaders {
+        LoaderSource::Exact { fault, .. } => fault,
+        LoaderSource::Leased => None,
+    });
+    let timers = PassTimers::default();
+    let pass_start = Instant::now();
     let written = std::thread::scope(|sc| -> Result<Written> {
-        // A RENDEZVOUS channel, not a one-deep buffer. `sync_channel(1)` let the loader
-        // finish a chunk, park it in the buffer and start a third, so three chunks of
-        // traces were resident where the comment claimed two. At depth 0 the loader's
-        // `send` blocks until this loop takes the chunk, which still overlaps decode with
-        // compute fully (the loader is free again the instant the chunk is handed over)
-        // and holds exactly two: the one being computed and the one being decoded.
-        //
-        // Both channels are created HERE rather than outside the scope so that both
-        // receivers drop when this closure returns. An error return used to leave `rx`
-        // alive in the enclosing frame while the scope waited to join the loader, and the
-        // loader was blocked in `send` on a channel that would never be received from
-        // again: the stage hung instead of reporting the error. Depth 0 makes that more
-        // reachable, not less, so it is fixed rather than papered over.
-        let (tx, rx) = std::sync::mpsc::sync_channel::<Result<(ChromChunk, NameTab)>>(0);
+        // The queue is created outside the scope (the loaders borrow it), so its stop
+        // flag, not the drop of a channel, is what releases them when this closure returns
+        // early. The guard is declared FIRST so it drops LAST among this closure's locals,
+        // and it drops before the scope joins the loaders: an error return here therefore
+        // wakes every loader waiting for the window to open instead of leaving the scope
+        // to join threads that would never wake: the hang the rendezvous channel was
+        // once fixed for, in its new form.
+        let _release = loader.release_on_drop();
         // The parquet encode is single-threaded; on its own thread it overlaps with the
         // next chunk's computation instead of stalling it. Rendezvous again, so the
         // encoder never queues a backlog of value matrices.
@@ -2391,12 +3058,20 @@ fn run_chunked(
         // over the previous good one, where the old in-line write simply returned before
         // `close` and let `AtomicPath` remove its temp file.
         let (wtx, wrx) = std::sync::mpsc::sync_channel::<Option<Vec<Col>>>(0);
+        let timers_w = &timers;
         let wh = sc.spawn(move || -> Result<Written> {
             let mut writer = writer;
             let mut commit = false;
-            for msg in wrx {
+            loop {
+                let idle = Instant::now();
+                let Ok(msg) = wrx.recv() else { break };
+                timers_w.add(&timers_w.writer_idle_ns, idle);
                 match msg {
-                    Some(cols) => writer.write_cols(cols)?,
+                    Some(cols) => {
+                        let busy = Instant::now();
+                        writer.write_cols(cols)?;
+                        timers_w.add(&timers_w.writer_busy_ns, busy);
+                    }
                     None => {
                         commit = true;
                         break;
@@ -2411,35 +3086,25 @@ fn run_chunked(
                      the features table was not written"
                 ));
             }
-            writer.close_hashed()
+            let busy = Instant::now();
+            let written = writer.close_hashed();
+            timers_w.add(&timers_w.writer_busy_ns, busy);
+            written
         });
-        sc.spawn(move || {
-            let mut stream = match ChromStream::open(ch_ref) {
-                Ok(s) => s,
-                Err(e) => {
-                    let _ = tx.send(Err(e));
-                    return;
-                }
-            };
-            let mut names = NameTab::default();
-            for want in chunk_rows {
-                let r = stream
-                    .read_chunk(want, &mut names)
-                    .map(|store| (store, names.clone()));
-                let failed = r.is_err();
-                if tx.send(r).is_err() || failed {
-                    return;
-                }
-            }
-        });
-        for chunk in &chunks {
-            let (store, names) = rx.recv().map_err(|_| {
+        for _ in 0..n_loaders {
+            let (loader, timers) = (&loader, &timers);
+            sc.spawn(move || loader.run(timers));
+        }
+        for (j, chunk) in chunks.iter().enumerate() {
+            let waited = Instant::now();
+            let (store, names) = loader.take(j).ok_or_else(|| {
                 anyhow!(
-                    "features: the chromatogram loader stopped before chunk {}..{}",
+                    "features: the chromatogram loaders stopped before chunk {}..{}",
                     chunk.psm_lo,
                     chunk.psm_hi
                 )
             })??;
+            timers.add(&timers.wait_loader_ns, waited);
             let (lo, hi) = (chunk.psm_lo, chunk.psm_hi);
             let rows_in_chunk = hi - lo;
             let (fb, mb) = store.payload_bytes();
@@ -2463,12 +3128,45 @@ fn run_chunked(
                     // values, as before.
                     return FragFeatures::default();
                 }
-                // One alignment per PSM, read by `fragment_features` and then moved
-                // into the Evidence: it used to be rebuilt inside each of them.
+                // One alignment and one apex-intensity search per PSM, read by
+                // `fragment_features` and then moved into the Evidence: they used to be
+                // rebuilt inside each of them.
                 let al = align_traces(&rows);
+                let obs = apex_intensities(&rows, apex_rt[i]);
+                if ext.is_empty() {
+                    return fragment_features(
+                        &rows,
+                        &al,
+                        &obs,
+                        None,
+                        apex_rt[i],
+                        p.cfg.coelution_corr_threshold,
+                        p.cfg.bound_features,
+                        p.cfg.bound_peak_fraction,
+                        p.cfg.bound_peak_grace,
+                        global_bounds,
+                    );
+                }
+                // The Extended set: the peak window, its traces, the reference profiles
+                // and the pair statistics once. `fragment_features` shares them when
+                // `bound_features` makes its window this one; without it, it scores the
+                // whole extracted window and computes its own.
+                let pred: Vec<f64> = rows.iter().map(|r| r.pred_int as f64).collect();
+                let win = peak_window(
+                    &al.axis_full,
+                    &al.traces_full,
+                    &pred,
+                    apex_rt[i],
+                    p.cfg.bound_peak_fraction,
+                    p.cfg.bound_peak_grace,
+                    global_bounds,
+                );
+                let peak = PeakTraces::new(&al, &pred, win);
                 let ff = fragment_features(
                     &rows,
                     &al,
+                    &obs,
+                    p.cfg.bound_features.then_some(&peak),
                     apex_rt[i],
                     p.cfg.coelution_corr_threshold,
                     p.cfg.bound_features,
@@ -2476,19 +3174,11 @@ fn run_chunked(
                     p.cfg.bound_peak_grace,
                     global_bounds,
                 );
-                if !ext.is_empty() {
+                {
                     let ms1_rows = ci
                         .map(|c| store.rows(&store.ms1, c, &names))
                         .unwrap_or_default();
-                    let mut ev = build_evidence(
-                        &rows,
-                        al,
-                        &ms1_rows,
-                        apex_rt[i],
-                        p.cfg.bound_peak_fraction,
-                        p.cfg.bound_peak_grace,
-                        global_bounds,
-                    );
+                    let mut ev = evidence_from(&rows, al, obs, pred, peak, &ms1_rows, apex_rt[i]);
                     ev.rt_pred_cal = rt_cal[i];
                     ev.rt_err = calibrated_rt_error(apex_rt[i], rt_cal[i]);
                     ev.gradient = gradient;
@@ -2519,6 +3209,7 @@ fn run_chunked(
                 ff
             };
 
+            let computing = Instant::now();
             let mut frag_feats: Vec<FragFeatures> = vec![FragFeatures::default(); rows_in_chunk];
             let mut ext_vals: Vec<f64> = vec![0.0; rows_in_chunk * n_ext];
             if n_ext > 0 {
@@ -2533,7 +3224,9 @@ fn run_chunked(
                     .enumerate()
                     .for_each(|(r, ff)| *ff = per_psm(lo + r, &mut []));
             }
+            timers.add(&timers.compute_ns, computing);
 
+            let assembling = Instant::now();
             let mut m = ValueMatrix::new(cols_active.len(), rows_in_chunk);
             let mut prelim = vec![0.0f64; rows_in_chunk];
             let mut elu_lo = vec![0.0f64; rows_in_chunk];
@@ -2675,12 +3368,16 @@ fn run_chunked(
                 cols.push(Col::F64(name.clone(), m.take_column(c)));
             }
             drop(m);
+            timers.add(&timers.assemble_ns, assembling);
             // The parquet encode is single-threaded and ran here, between one chunk's
             // computation and the next chunk's: the writer thread below takes it off the
             // critical path, the way the loader thread took the decode off it. The
             // channel is a rendezvous, so at most one chunk's columns wait behind the
             // one being written.
-            if wtx.send(Some(cols)).is_err() {
+            let handing = Instant::now();
+            let sent = wtx.send(Some(cols)).is_ok();
+            timers.add(&timers.wait_writer_ns, handing);
+            if !sent {
                 // The writer failed; its error is the real one, so surface that.
                 break;
             }
@@ -2708,6 +3405,8 @@ fn run_chunked(
             .map_err(|_| anyhow!("features: the parquet writer thread panicked"))?
     })?;
     let rows = written.rows;
+    drop(extra_lease);
+    timers.log(pass_start.elapsed(), n_loaders, chunks.len());
 
     crate::memlog::report(
         "features chromatogram store",
@@ -2928,7 +3627,8 @@ fn global_bound_indices(
 /// top-3 predicted-intensity fragments, walked from the apex-nearest scan while
 /// >= `frac` x apex height, bridging <= `grace` sub-threshold scans. Returns
 /// > (lo_rt, hi_rt), or None when fewer than 3 distinct scans. Mirrors the boundary
-/// > logic inside `fragment_features`/`build_evidence` so the confident-set half-widths
+/// > logic of `peak_window` (shared by `fragment_features` and the Evidence build) so the
+/// > confident-set half-widths
 /// > match the per-candidate detector they replace when `bound_from_confident` is set.
 fn elution_peak_rt_bounds(
     rows: &[ChromRow],
@@ -2965,11 +3665,19 @@ fn elution_peak_rt_bounds(
 }
 
 // The peak-bounding knobs (`bound`, `frac`, `grace`, `global_bounds`) are passed through
-// from the config as they always were; the alignment is the eighth.
+// from the config as they always were; the alignment, the apex intensities and the shared
+// peak window are the others.
+//
+// `shared` is the PSM's [`PeakTraces`] when the caller built one AND `bound` is set, which
+// is exactly when this function's own peak window is that one: both walk the same profile
+// with the same knobs (`peak_window`). Without `bound` it scores the whole extracted window
+// and must not share.
 #[allow(clippy::too_many_arguments)]
 fn fragment_features(
     rows: &[ChromRow],
     al: &TraceAlign,
+    obs: &[f64],
+    shared: Option<&PeakTraces>,
     apex_rt: f64,
     coel_thresh: f64,
     bound: bool,
@@ -2977,42 +3685,36 @@ fn fragment_features(
     grace: usize,
     global_bounds: Option<(f64, f64)>,
 ) -> FragFeatures {
+    debug_assert!(
+        bound || shared.is_none(),
+        "the whole-window path must not share"
+    );
     let mut f = FragFeatures::default();
-    // Observed apex intensity per fragment (nearest scan to apex).
-    let mut obs = Vec::with_capacity(rows.len());
+    // Observed apex intensity per fragment (nearest scan to apex): `obs`, from
+    // `apex_intensities`, the f64 widening of the value this loop used to find itself.
     let mut pred = Vec::with_capacity(rows.len());
     let mut mass_err = Vec::new();
     let mut mass_w = Vec::new();
-    for r in rows {
-        let mut best = 0.0f32;
-        let mut bestd = f64::MAX;
-        for (k, &rt) in r.rt.iter().enumerate() {
-            let d = (rt as f64 - apex_rt).abs();
-            if d < bestd {
-                bestd = d;
-                best = r.inten[k];
-            }
-        }
-        obs.push(best as f64);
+    for (r, &best) in rows.iter().zip(obs) {
         pred.push(r.pred_int as f64);
         let pe = ppm_diff(r.frag_obs_mz, r.frag_mz).abs();
         mass_err.push(pe);
-        mass_w.push(best as f64);
+        mass_w.push(best);
         let is_b = r.frag_name.starts_with('b');
         if is_b {
-            f.sum_b += best as f64;
+            f.sum_b += best;
             f.n_b += 1.0;
         } else {
-            f.sum_y += best as f64;
+            f.sum_y += best;
             f.n_y += 1.0;
         }
     }
-    f.frag_corr = pearson(&obs, &pred);
-    f.frag_cosine = cosine(&obs, &pred);
-    f.spectral_angle = spectral_angle(&obs, &pred);
+    f.frag_corr = pearson(obs, &pred);
+    f.frag_cosine = cosine(obs, &pred);
+    f.spectral_angle = spectral_angle(obs, &pred);
 
     // normalized manhattan + rmsd on sum-normalized vectors
-    let (on, pn) = (normalize_sum(&obs), normalize_sum(&pred));
+    let (on, pn) = (normalize_sum(obs), normalize_sum(&pred));
     f.norm_manhattan = on.iter().zip(&pn).map(|(a, b)| (a - b).abs()).sum();
     let m = on.len().max(1) as f64;
     f.rmsd = (on
@@ -3047,39 +3749,32 @@ fn fragment_features(
     // co-elution/profile scores).
     let axis_full = &al.axis_full;
     let traces_full = &al.traces_full;
-    let (lo_i, hi_i) = if bound && axis_full.len() >= 3 {
-        // boundary on the smoothed summed top-3-predicted-fragment profile, around apex
-        let ai = axis_full
-            .iter()
-            .enumerate()
-            .min_by(|(_, a), (_, b)| {
-                (**a as f64 - apex_rt)
-                    .abs()
-                    .total_cmp(&(**b as f64 - apex_rt).abs())
-            })
-            .map(|(i, _)| i)
-            .unwrap_or(0);
-        match global_bounds {
-            Some((l, r)) => global_bound_indices(axis_full, apex_rt, ai, l, r),
-            None => {
-                let mut ord: Vec<usize> = (0..pred.len()).collect();
-                ord.sort_by(|&a, &b| pred[b].total_cmp(&pred[a]));
-                let k3: Vec<usize> = ord.into_iter().take(3).collect();
-                let prof_raw: Vec<f64> = (0..axis_full.len())
-                    .map(|k| k3.iter().map(|&i| traces_full[i][k]).sum::<f64>())
-                    .collect();
-                let prof = smooth3(&prof_raw);
-                peak_bounds(&prof, ai, frac, grace)
-            }
-        }
-    } else {
-        (0, axis_full.len().saturating_sub(1))
+    // boundary on the smoothed summed top-3-predicted-fragment profile, around apex
+    let (lo_i, hi_i) = match shared {
+        Some(pk) => (pk.lo, pk.hi),
+        None if bound => peak_window(
+            axis_full,
+            traces_full,
+            &pred,
+            apex_rt,
+            frac,
+            grace,
+            global_bounds,
+        ),
+        None => (0, axis_full.len().saturating_sub(1)),
     };
-    let axis: Vec<f32> = axis_full[lo_i..=hi_i].to_vec();
-    let traces: Vec<Vec<f64>> = traces_full
-        .iter()
-        .map(|t| t[lo_i..=hi_i].to_vec())
-        .collect();
+    let axis: &[f32] = &axis_full[lo_i..=hi_i];
+    let traces_owned: Vec<Vec<f64>>;
+    let traces: &[Vec<f64>] = match shared {
+        Some(pk) => &pk.traces,
+        None => {
+            traces_owned = traces_full
+                .iter()
+                .map(|t| t[lo_i..=hi_i].to_vec())
+                .collect();
+            &traces_owned
+        }
+    };
     f.n_observations = axis.len() as f64;
     f.elution_lo = axis.first().map(|&x| x as f64).unwrap_or(0.0);
     f.elution_hi = axis.last().map(|&x| x as f64).unwrap_or(0.0);
@@ -3091,13 +3786,31 @@ fn fragment_features(
     let mut corrs = Vec::new();
     let mut lags = Vec::new();
     let mut shapes = Vec::new();
-    for a in 0..traces.len() {
-        for b in (a + 1)..traces.len() {
-            if axis.len() >= 2 {
-                corrs.push(pearson(&traces[a], &traces[b]));
-                let (lag, shape) = best_xcorr(&traces[a], &traces[b], 5);
-                lags.push(lag.abs() as f64);
-                shapes.push(shape);
+    if axis.len() >= 2 {
+        if let Some(pk) = shared {
+            // The PSM's pair statistics, computed by the same calls on the same traces.
+            let st = &pk.stats;
+            for a in 0..traces.len() {
+                for b in (a + 1)..traces.len() {
+                    corrs.push(st.corr(a, b));
+                    let (lag, shape) = st.xcorr(a, b);
+                    lags.push(lag.abs() as f64);
+                    shapes.push(shape);
+                }
+            }
+        } else {
+            // Every pair's correlation from traces centred once (`pearson_pairs`,
+            // bit-identical to `pearson` pair by pair), in the (a, b) order below.
+            pearson_pairs(traces, &mut corrs);
+            // Each trace's norm once, not once per pair it is in.
+            let norms: Vec<f64> = traces.iter().map(|t| xcorr_norm(t)).collect();
+            for a in 0..traces.len() {
+                for b in (a + 1)..traces.len() {
+                    let (lag, shape) =
+                        best_xcorr_normed(&traces[a], &traces[b], 5, norms[a], norms[b]);
+                    lags.push(lag.abs() as f64);
+                    shapes.push(shape);
+                }
             }
         }
     }
@@ -3114,13 +3827,22 @@ fn fragment_features(
     // Reference elution profile = predicted-intensity-weighted sum of fragment XICs.
     if !traces.is_empty() && axis.len() >= 2 {
         let np = axis.len();
-        let mut refp = vec![0.0f64; np];
-        for (fi, tr) in traces.iter().enumerate() {
-            let w = pred[fi].max(0.0);
-            for k in 0..np {
-                refp[k] += w * tr[k];
+        // The shared window's reference profile is this one, term for term.
+        let refp_owned: Vec<f64>;
+        let refp: &[f64] = match shared {
+            Some(pk) => &pk.ref_profile,
+            None => {
+                let mut r = vec![0.0f64; np];
+                for (fi, tr) in traces.iter().enumerate() {
+                    let w = pred[fi].max(0.0);
+                    for k in 0..np {
+                        r[k] += w * tr[k];
+                    }
+                }
+                refp_owned = r;
+                &refp_owned
             }
-        }
+        };
         // pCos: at each scan, cosine(observed fragment vector, predicted vector),
         // weighted by reference-profile^2 (concentrates on the elution peak).
         let (mut num, mut den) = (0.0, 0.0);
@@ -3138,8 +3860,19 @@ fn fragment_features(
             den += w;
         }
         f.profile_cos = if den > 0.0 { num / den } else { 0.0 };
-        // pTimeCorr: each fragment XIC correlated with the reference profile.
-        let rc: Vec<f64> = traces.iter().map(|tr| pearson(tr, &refp)).collect();
+        // pTimeCorr: each fragment XIC correlated with the reference profile, which is
+        // centred once for all of them (or read from the shared statistics, which made
+        // the same calls).
+        let rc: Vec<f64> = match shared {
+            Some(pk) => pk.stats.ref_corr().to_vec(),
+            None => {
+                let refp_c = Centered::new(refp);
+                traces
+                    .iter()
+                    .map(|tr| pearson_vs(tr, refp, &refp_c))
+                    .collect()
+            }
+        };
         f.ref_corr = mean(&rc);
         f.best_ref_corr = rc.iter().cloned().fold(f64::MIN, f64::max).max(0.0);
         // pResCorr proxy: co-elution of the low-predicted-intensity fragments.
@@ -3168,7 +3901,7 @@ fn fragment_features(
         // Scratch reused across fragments; the per-fragment allocation it replaces was
         // one heap block per fragment per PSM.
         let mut others: Vec<f64> = Vec::with_capacity(np);
-        for tr in &traces {
+        for tr in traces {
             others.clear();
             others.extend((0..np).map(|k| total[k] - tr[k]));
             contrasts.push(pearson(tr, &others));
@@ -3184,8 +3917,8 @@ fn fragment_features(
         let mut residuals: Vec<Vec<f64>> = Vec::with_capacity(traces.len());
         let mut shadow_num = 0.0;
         let mut total_int = 0.0;
-        for tr in &traces {
-            let rk: f64 = tr.iter().zip(&refp).map(|(a, b)| a * b).sum::<f64>() / rr;
+        for tr in traces {
+            let rk: f64 = tr.iter().zip(refp).map(|(a, b)| a * b).sum::<f64>() / rr;
             let cl: Vec<f64> = (0..np)
                 .map(|k| {
                     let cap = (1.5 * rk * refp[k]).max(0.0);
@@ -3205,15 +3938,12 @@ fn fragment_features(
         } else {
             0.0
         };
-        // co-elution of cleaned traces and correlation of residuals (shared interferent).
+        // co-elution of cleaned traces and correlation of residuals (shared interferent),
+        // each a pair matrix over rows centred once, in the old (a, b) order.
         let mut clean_corrs = Vec::new();
         let mut res_corrs = Vec::new();
-        for a in 0..traces.len() {
-            for b in (a + 1)..traces.len() {
-                clean_corrs.push(pearson(&cleaned[a], &cleaned[b]));
-                res_corrs.push(pearson(&residuals[a], &residuals[b]));
-            }
-        }
+        pearson_pairs(&cleaned, &mut clean_corrs);
+        pearson_pairs(&residuals, &mut res_corrs);
         f.coel_clean = mean(&clean_corrs);
         f.resid_corr = mean(&res_corrs);
     }
@@ -3229,8 +3959,9 @@ fn fragment_features(
     let noise = if all_points.is_empty() {
         1.0
     } else {
-        all_points.sort_by(|a, b| a.total_cmp(b));
-        all_points[all_points.len() / 2].max(1.0)
+        // One order statistic, by selection: bit-identical to indexing the sorted copy.
+        let mid = all_points.len() / 2;
+        order_stat(&mut all_points, mid).max(1.0)
     };
     f.log_sn = ((apex_val + 1.0) / (noise + 1.0)).ln();
     f
@@ -3253,19 +3984,124 @@ fn mean(v: &[f64]) -> f64 {
     }
 }
 
+/// The `k`-th smallest value of `v` under `f64::total_cmp`, by selection (O(n)) rather than
+/// by sorting a copy (O(n log n)). `v` is permuted.
+///
+/// Bit-identical to `sorted[k]` of the sort it replaces: `total_cmp` is a total order in
+/// which two values compare equal only when their bit patterns are equal, so the sorted
+/// sequence of a multiset is unique bit for bit, whatever algorithm produced it (stable or
+/// not), and every order statistic is determined by the multiset alone.
+fn order_stat(v: &mut [f64], k: usize) -> f64 {
+    *v.select_nth_unstable_by(k, f64::total_cmp).1
+}
+
+/// The median of a NON-EMPTY `v` exactly as the families computed it from a sorted copy:
+/// the middle value, or for an even length `0.5 * (s[n / 2 - 1] + s[n / 2])`. After
+/// selecting position `n / 2`, the lower half holds the `n / 2` smallest values, so its
+/// maximum under `total_cmp` is `s[n / 2 - 1]`. `v` is permuted.
+fn median_select(v: &mut [f64]) -> f64 {
+    let n = v.len();
+    let hi = order_stat(v, n / 2);
+    if n % 2 == 1 {
+        hi
+    } else {
+        let lo = v[..n / 2]
+            .iter()
+            .copied()
+            .max_by(f64::total_cmp)
+            .expect("an even-length median has a lower half");
+        0.5 * (lo + hi)
+    }
+}
+
+/// The linearly interpolated `q`-quantile exactly as a sorted copy gave it (position
+/// `q * (n - 1)`, `s[lo] * (1 - frac) + s[hi] * frac` between the two neighbouring order
+/// statistics; 0 for an empty `v`, the value itself for one). After selecting `lo`, every
+/// value to its right is at least `s[lo]`, so their minimum is `s[lo + 1]`. `v` is
+/// permuted, and two calls on the same buffer are as good as two sorted copies, because
+/// selection depends on the multiset only.
+fn quantile_select(v: &mut [f64], q: f64) -> f64 {
+    let n = v.len();
+    if n == 0 {
+        return 0.0;
+    }
+    if n == 1 {
+        return v[0];
+    }
+    let pos = q * (n - 1) as f64;
+    let lo = pos.floor() as usize;
+    let hi = pos.ceil() as usize;
+    let s_lo = order_stat(v, lo);
+    if lo == hi {
+        s_lo
+    } else {
+        let s_hi = v[lo + 1..]
+            .iter()
+            .copied()
+            .min_by(f64::total_cmp)
+            .expect("a value above the lower neighbour");
+        let frac = pos - lo as f64;
+        s_lo * (1.0 - frac) + s_hi * frac
+    }
+}
+
 /// Best cross-correlation of two traces over integer lags in [-maxlag, maxlag].
 /// Returns (lag_of_max, normalized_max_value).
+///
+/// The one-call form, for a family that correlates a pair once. The shipped callers
+/// correlate every pair of a PSM and pass cached norms to [`best_xcorr_normed`] instead
+/// (through [`PairStats`] or directly), so outside the tests nothing calls this today.
+#[cfg_attr(not(test), allow(dead_code))]
 fn best_xcorr(a: &[f64], b: &[f64], maxlag: i32) -> (i32, f64) {
+    if a.len() < 2 {
+        return (0, 0.0);
+    }
+    best_xcorr_normed(a, b, maxlag, xcorr_norm(a), xcorr_norm(b))
+}
+
+/// The Euclidean norm of one trace, exactly as [`best_xcorr`] computes it for each of its
+/// two arguments. A pair matrix calls `best_xcorr` K - 1 times per trace, so the norms are
+/// computed once per trace with this and handed to [`best_xcorr_normed`].
+fn xcorr_norm(a: &[f64]) -> f64 {
+    (a.iter().map(|x| x * x).sum::<f64>()).sqrt()
+}
+
+/// The lag at which every call site cross-correlates, and the lag-window width.
+const XCORR_MAXLAG: usize = 5;
+const XCORR_LAGS: usize = 2 * XCORR_MAXLAG + 1;
+
+/// [`best_xcorr`] with both norms supplied; `na` and `nb` must be [`xcorr_norm`] of `a`
+/// and `b`, which makes the two functions agree bit for bit.
+///
+/// The correlation used to be one serial pass per lag: each lag's dot product a single
+/// dependent chain of adds with a bounds branch inside, 11 chains one after another.
+/// [`lag_dots`] runs the 11 accumulators side by side instead. Every accumulator still
+/// receives exactly its old terms in ascending `i`, starting from `0.0`, each a separate
+/// multiply and add (Rust never contracts them into a fused multiply-add), so every dot
+/// product, every `dot / (na * nb)` and the strict `>` first-maximum selection are
+/// unchanged. Any other lag window, or a `b` shorter than `a` (which indexed out of
+/// bounds before and still does), takes the per-lag loop as it was.
+fn best_xcorr_normed(a: &[f64], b: &[f64], maxlag: i32, na: f64, nb: f64) -> (i32, f64) {
     let n = a.len();
     if n < 2 {
         return (0, 0.0);
     }
-    let na = (a.iter().map(|x| x * x).sum::<f64>()).sqrt();
-    let nb = (b.iter().map(|x| x * x).sum::<f64>()).sqrt();
     if na <= 0.0 || nb <= 0.0 {
         return (0, 0.0);
     }
     let (mut best_lag, mut best_val) = (0i32, f64::MIN);
+    if maxlag == XCORR_MAXLAG as i32 && b.len() >= n {
+        // `b[..n]`: the old loop never read past `n`, whatever `b.len()` was.
+        let dots = lag_dots(a, &b[..n]);
+        for (li, &dot) in dots.iter().enumerate() {
+            let v = dot / (na * nb);
+            if v > best_val {
+                best_val = v;
+                best_lag = li as i32 - maxlag;
+            }
+        }
+        return (best_lag, best_val.max(0.0));
+    }
     for lag in -maxlag..=maxlag {
         let mut dot = 0.0;
         #[allow(clippy::needless_range_loop)] // i also drives j = i + lag
@@ -3282,6 +4118,38 @@ fn best_xcorr(a: &[f64], b: &[f64], maxlag: i32) -> (i32, f64) {
         }
     }
     (best_lag, best_val.max(0.0))
+}
+
+/// The dot products `sum_i a[i] * b[i + lag]` for every lag in
+/// `-XCORR_MAXLAG..=XCORR_MAXLAG`, in that order, over the `i` where `i + lag` is inside
+/// `0..n`. `b` must be exactly as long as `a`.
+///
+/// `i` is the outer loop, so each accumulator gets its terms in ascending `i` exactly as
+/// the one-lag-at-a-time loop gave them. Away from the two ends every lag is valid and
+/// the body is branch-free over an 11-wide window of `b`; within `XCORR_MAXLAG` of either
+/// end each lag keeps its bounds test.
+fn lag_dots(a: &[f64], b: &[f64]) -> [f64; XCORR_LAGS] {
+    let n = a.len();
+    debug_assert_eq!(b.len(), n);
+    let l = XCORR_MAXLAG;
+    let mut acc = [0.0f64; XCORR_LAGS];
+    for (i, &ai) in a.iter().enumerate() {
+        if i >= l && i + l < n {
+            let w: &[f64; XCORR_LAGS] =
+                b[i - l..=i + l].try_into().expect("an 11-wide window of b");
+            for (dst, &bj) in acc.iter_mut().zip(w) {
+                *dst += ai * bj;
+            }
+        } else {
+            for (li, dst) in acc.iter_mut().enumerate() {
+                // lag = li - l, so j = i + li - l.
+                if i + li >= l && i + li - l < n {
+                    *dst += ai * b[i + li - l];
+                }
+            }
+        }
+    }
+    acc
 }
 
 /// Averagine isotope-envelope agreement from MS1 apex intensities.
@@ -3492,6 +4360,450 @@ mod tests {
                 "fragment {i} trace differs"
             );
         }
+    }
+
+    /// The MS1 XIC resampling exactly as it stood before the identity fast path: one map
+    /// per isotope keyed on the RT bit pattern, a full-window vector, then the peak slice.
+    /// A transcription of the replaced code, kept as the reference.
+    fn old_ms1_xic(
+        axis_full: &[f32],
+        ms1_rows: &[ChromRow],
+        lo: usize,
+        hi: usize,
+    ) -> Vec<Vec<f64>> {
+        let mut out = Vec::new();
+        for name in ["ms1_mono", "ms1_iso1", "ms1_iso2"] {
+            if let Some(r) = ms1_rows.iter().find(|r| r.frag_name == name) {
+                let map: HashMap<u32, f32> =
+                    r.rt.iter()
+                        .zip(r.inten.iter())
+                        .map(|(&t, &v)| (t.to_bits(), v))
+                        .collect();
+                let full: Vec<f64> = axis_full
+                    .iter()
+                    .map(|t| *map.get(&t.to_bits()).unwrap_or(&0.0) as f64)
+                    .collect();
+                out.push(full[lo..=hi].to_vec());
+            }
+        }
+        if out.len() == 3 {
+            out
+        } else {
+            Vec::new()
+        }
+    }
+
+    #[test]
+    fn ms1_rows_on_the_fragment_axis_skip_the_map_bit_for_bit() {
+        // The fast path applies when the MS1 row samples the fragments' own axis, which is
+        // what extract writes; every other shape must still reach the map. Both must equal
+        // the map build it replaced, bit for bit, including signed zeros and subnormals.
+        let grid: Vec<f32> = (0..12).map(|k| 100.0 + k as f32 * 1.5).collect();
+        let shifted: Vec<f32> = grid.iter().map(|t| t + 0.25).collect();
+        let every_other: Vec<f32> = grid.iter().step_by(2).copied().collect();
+        let tr_a: Vec<f32> = (0..12)
+            .map(|k| ((k as f32 - 6.0).abs() * -3.0 + 20.0).max(0.0))
+            .collect();
+        let tr_b: Vec<f32> = (0..12).map(|k| (k * 7 % 5) as f32).collect();
+        let iso = |k: usize| -> Vec<f32> {
+            let mut v: Vec<f32> = (0..12).map(|i| (i * (k + 3) % 11) as f32 * 10.0).collect();
+            v[1] = -0.0;
+            v[2] = f32::MIN_POSITIVE / 4.0; // subnormal
+            v
+        };
+        let (i0, i1, i2) = (iso(0), iso(1), iso(2));
+        let long: Vec<f32> = i1.iter().chain([5.0f32, 6.0].iter()).copied().collect();
+        let short_vals: Vec<f32> = i2.iter().step_by(2).copied().collect();
+        let frags = vec![row("y1", 1.0, &grid, &tr_a), row("b2", 0.5, &grid, &tr_b)];
+        let cases: Vec<(&str, Vec<ChromRow>)> = vec![
+            (
+                "on axis",
+                vec![
+                    row("ms1_mono", 0.0, &grid, &i0),
+                    row("ms1_iso1", 0.0, &grid, &i1),
+                    row("ms1_iso2", 0.0, &grid, &i2),
+                ],
+            ),
+            (
+                "shifted grid",
+                vec![
+                    row("ms1_mono", 0.0, &shifted, &i0),
+                    row("ms1_iso1", 0.0, &grid, &i1),
+                    row("ms1_iso2", 0.0, &grid, &i2),
+                ],
+            ),
+            (
+                "sub-grid",
+                vec![
+                    row("ms1_mono", 0.0, &grid, &i0),
+                    row("ms1_iso1", 0.0, &grid, &i1),
+                    row("ms1_iso2", 0.0, &every_other, &short_vals),
+                ],
+            ),
+            (
+                "longer intensity",
+                vec![
+                    row("ms1_mono", 0.0, &grid, &i0),
+                    row("ms1_iso1", 0.0, &grid, &long),
+                    row("ms1_iso2", 0.0, &grid, &i2),
+                ],
+            ),
+            (
+                "empty trace",
+                vec![
+                    row("ms1_mono", 0.0, &grid, &i0),
+                    row("ms1_iso1", 0.0, &[], &[]),
+                    row("ms1_iso2", 0.0, &grid, &i2),
+                ],
+            ),
+            (
+                "two isotopes",
+                vec![
+                    row("ms1_mono", 0.0, &grid, &i0),
+                    row("ms1_iso1", 0.0, &grid, &i1),
+                ],
+            ),
+        ];
+        for (tag, ms1) in &cases {
+            for (apex, bounds) in [(109.0, None), (104.5, Some((3.0, 4.0))), (90.0, None)] {
+                let al = align_traces(&frags);
+                let axis_full = al.axis_full.clone();
+                let ev = build_evidence(&frags, al, ms1, apex, 1.0 / 3.0, 0, bounds);
+                // The peak window as positions on the full axis.
+                let lo = axis_full
+                    .iter()
+                    .position(|&t| t as f64 == ev.axis[0])
+                    .unwrap();
+                let hi = lo + ev.axis.len() - 1;
+                let want = old_ms1_xic(&axis_full, ms1, lo, hi);
+                let bits = |v: &Vec<Vec<f64>>| -> Vec<Vec<u64>> {
+                    v.iter()
+                        .map(|t| t.iter().map(|x| x.to_bits()).collect())
+                        .collect()
+                };
+                assert_eq!(bits(&ev.ms1_xic), bits(&want), "{tag}, apex {apex}");
+            }
+        }
+    }
+
+    /// `best_xcorr` exactly as it stood before the lag-parallel kernel: one serial pass
+    /// per lag, norms recomputed per call. A transcription kept as the reference.
+    fn old_best_xcorr(a: &[f64], b: &[f64], maxlag: i32) -> (i32, f64) {
+        let n = a.len();
+        if n < 2 {
+            return (0, 0.0);
+        }
+        let na = (a.iter().map(|x| x * x).sum::<f64>()).sqrt();
+        let nb = (b.iter().map(|x| x * x).sum::<f64>()).sqrt();
+        if na <= 0.0 || nb <= 0.0 {
+            return (0, 0.0);
+        }
+        let (mut best_lag, mut best_val) = (0i32, f64::MIN);
+        for lag in -maxlag..=maxlag {
+            let mut dot = 0.0;
+            #[allow(clippy::needless_range_loop)]
+            for i in 0..n {
+                let j = i as i32 + lag;
+                if j >= 0 && (j as usize) < n {
+                    dot += a[i] * b[j as usize];
+                }
+            }
+            let v = dot / (na * nb);
+            if v > best_val {
+                best_val = v;
+                best_lag = lag;
+            }
+        }
+        (best_lag, best_val.max(0.0))
+    }
+
+    #[test]
+    fn lag_parallel_xcorr_matches_the_per_lag_loop_bit_for_bit() {
+        // Random, sparse, constant, all-zero, single-spike, signed and tied traces at
+        // every length through the 11-lag window and past it, including the lengths below
+        // 2 * maxlag + 1 where no position has every lag valid, and a `b` longer than `a`
+        // (the old loop read only its first `n` values but normed all of it).
+        let mut rng = Lcg(0xc0ff_ee00_1234_5678);
+        let mut checked = 0usize;
+        for n in 0..48usize {
+            for shape in 0..8u32 {
+                let gen = |rng: &mut Lcg, len: usize| -> Vec<f64> {
+                    (0..len)
+                        .map(|i| match shape {
+                            0 => rng.unit() * 1e4,
+                            1 => {
+                                if rng.below(3) == 0 {
+                                    rng.unit() * 50.0
+                                } else {
+                                    0.0
+                                }
+                            }
+                            2 => 7.0,
+                            3 => 0.0,
+                            4 => {
+                                if i == len / 2 {
+                                    3.5
+                                } else {
+                                    0.0
+                                }
+                            }
+                            5 => rng.unit() - 0.5,
+                            6 => (rng.below(4) as f64) * 0.25,
+                            _ => {
+                                if i % 2 == 0 {
+                                    -0.0
+                                } else {
+                                    f64::MIN_POSITIVE * rng.unit()
+                                }
+                            }
+                        })
+                        .collect()
+                };
+                let a = gen(&mut rng, n);
+                for extra in [0usize, 3] {
+                    let b = gen(&mut rng, n + extra);
+                    for maxlag in [5i32, 3] {
+                        let want = old_best_xcorr(&a, &b, maxlag);
+                        let got = best_xcorr(&a, &b, maxlag);
+                        assert_eq!(
+                            (got.0, got.1.to_bits()),
+                            (want.0, want.1.to_bits()),
+                            "n {n}, shape {shape}, extra {extra}, maxlag {maxlag}"
+                        );
+                        let normed =
+                            best_xcorr_normed(&a, &b, maxlag, xcorr_norm(&a), xcorr_norm(&b));
+                        assert_eq!((normed.0, normed.1.to_bits()), (want.0, want.1.to_bits()));
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(checked, 48 * 8 * 2 * 2);
+    }
+
+    #[test]
+    fn order_statistics_by_selection_equal_the_sorted_copy_bit_for_bit() {
+        // The sort-based median and quantiles exactly as the families wrote them, against
+        // selection, on vectors with ties, zeros of both signs, subnormals, infinities and
+        // NaN (which `total_cmp` orders like any other value).
+        fn old_median(v: &[f64]) -> f64 {
+            let mut s = v.to_vec();
+            s.sort_by(|a, b| a.total_cmp(b));
+            let n = s.len();
+            if n % 2 == 1 {
+                s[n / 2]
+            } else {
+                0.5 * (s[n / 2 - 1] + s[n / 2])
+            }
+        }
+        fn old_quantile(v: &[f64], q: f64) -> f64 {
+            let mut s = v.to_vec();
+            s.sort_by(|a, b| a.total_cmp(b));
+            let n = s.len();
+            if n == 0 {
+                return 0.0;
+            }
+            if n == 1 {
+                return s[0];
+            }
+            let pos = q * (n - 1) as f64;
+            let (lo, hi) = (pos.floor() as usize, pos.ceil() as usize);
+            if lo == hi {
+                s[lo]
+            } else {
+                let frac = pos - lo as f64;
+                s[lo] * (1.0 - frac) + s[hi] * frac
+            }
+        }
+        let mut rng = Lcg(0x0bad_cafe_d00d_f00d);
+        for n in 1..70usize {
+            for kind in 0..4u32 {
+                let v: Vec<f64> = (0..n)
+                    .map(|_| match (kind, rng.below(12)) {
+                        (0, _) => rng.unit() * 100.0,
+                        (1, r) => (r % 4) as f64, // heavy ties
+                        (2, 0) => -0.0,
+                        (2, 1) => 0.0,
+                        (2, 2) => f64::MIN_POSITIVE / 8.0,
+                        (2, 3) => f64::INFINITY,
+                        (2, _) => rng.unit() - 0.5,
+                        (_, 0) => f64::NAN,
+                        (_, _) => rng.unit(),
+                    })
+                    .collect();
+                let bits = |x: f64| x.to_bits();
+                assert_eq!(
+                    bits(median_select(&mut v.clone())),
+                    bits(old_median(&v)),
+                    "median, n {n}, kind {kind}"
+                );
+                let mut buf = v.clone();
+                for q in [0.75, 0.25, 0.0, 1.0, 0.5, 1.0 / 3.0] {
+                    assert_eq!(
+                        bits(quantile_select(&mut buf, q)),
+                        bits(old_quantile(&v, q)),
+                        "quantile {q}, n {n}, kind {kind}"
+                    );
+                }
+                let mut sorted = v.clone();
+                sorted.sort_by(|a, b| a.total_cmp(b));
+                for k in [0, n / 2, n - 1] {
+                    assert_eq!(bits(order_stat(&mut v.clone(), k)), bits(sorted[k]));
+                }
+            }
+        }
+        assert_eq!(quantile_select(&mut [], 0.5), 0.0);
+    }
+
+    /// Every field of a `FragFeatures` as bit patterns, for exact comparison.
+    fn ff_bits(f: &FragFeatures) -> Vec<u64> {
+        [
+            f.frag_corr,
+            f.frag_cosine,
+            f.spectral_angle,
+            f.coelution_mean,
+            f.coelution_best,
+            f.n_coelution_above,
+            f.norm_manhattan,
+            f.rmsd,
+            f.xcorr_coelution,
+            f.xcorr_shape,
+            f.sum_b,
+            f.sum_y,
+            f.n_b,
+            f.n_y,
+            f.weighted_mass_error,
+            f.mean_mass_error,
+            f.log_sn,
+            f.n_observations,
+            f.base_width_rt,
+            f.profile_cos,
+            f.ref_corr,
+            f.best_ref_corr,
+            f.low_frag_coel,
+            f.evidence,
+            f.contrast_min,
+            f.resid_corr,
+            f.coel_clean,
+            f.shadow_frac,
+            f.elution_lo,
+            f.elution_hi,
+        ]
+        .iter()
+        .map(|v| v.to_bits())
+        .collect()
+    }
+
+    #[test]
+    fn shared_pair_statistics_equal_the_per_reader_computations_bit_for_bit() {
+        // Per PSM, the shared path against each reader's own computation on the SAME
+        // evidence: `fragment_features` with and without the shared peak window, and the
+        // Extended families with the `PairStats` cache and with it removed (every reader
+        // then takes its fallback). Random traces with dropouts and ties, 1-12 fragments,
+        // 3-60 points, per-candidate and global bounds, an empty trace now and then.
+        let mut rng = Lcg(0x5a5a_1234_0f0f_9876);
+        let mut checked = 0usize;
+        for case in 0..400u32 {
+            let k = 1 + rng.below(12) as usize;
+            let npts = 3 + rng.below(58) as usize;
+            let grid: Vec<f32> = (0..npts).map(|i| 300.0 + i as f32 * 1.25).collect();
+            let centre = rng.below(npts as u32) as f64;
+            let traces: Vec<Vec<f32>> = (0..k)
+                .map(|f| {
+                    if f > 0 && rng.below(15) == 0 {
+                        return Vec::new();
+                    }
+                    let h = 10f64.powf(1.0 + 3.0 * rng.unit());
+                    let w = 1.0 + 4.0 * rng.unit();
+                    (0..npts)
+                        .map(|i| {
+                            if rng.below(4) == 0 {
+                                return 0.0;
+                            }
+                            let x = (i as f64 - centre - (f % 3) as f64) / w;
+                            let v = h * (-0.5 * x * x).exp() + h * 0.05 * rng.unit();
+                            if case % 5 == 0 {
+                                ((v / 50.0).round() * 50.0) as f32
+                            } else {
+                                v as f32
+                            }
+                        })
+                        .collect()
+                })
+                .collect();
+            let names: Vec<String> = (0..k)
+                .map(|_| {
+                    let s = if rng.below(2) == 0 { 'b' } else { 'y' };
+                    let z = if rng.below(4) == 0 { "^2" } else { "" };
+                    format!("{s}{}{z}", 1 + rng.below(14))
+                })
+                .collect();
+            let preds: Vec<f32> = (0..k).map(|_| rng.unit() as f32).collect();
+            let rows: Vec<ChromRow> = (0..k)
+                .map(|f| {
+                    let rt: &[f32] = if traces[f].is_empty() { &[] } else { &grid };
+                    ChromRow {
+                        frag_name: &names[f],
+                        frag_mz: 200.0 + f as f64 * 50.0,
+                        frag_obs_mz: 200.0 + f as f64 * 50.0 + 0.001,
+                        pred_int: preds[f],
+                        rt,
+                        inten: &traces[f],
+                    }
+                })
+                .collect();
+            let apex = grid[centre as usize] as f64 + 0.3;
+            let bounds = if case % 2 == 0 {
+                None
+            } else {
+                Some((4.0, 6.5))
+            };
+            let (frac, grace) = (1.0 / 3.0, (case % 3 == 0) as usize);
+
+            let al = align_traces(&rows);
+            let obs = apex_intensities(&rows, apex);
+            let pred: Vec<f64> = rows.iter().map(|r| r.pred_int as f64).collect();
+            let win = peak_window(
+                &al.axis_full,
+                &al.traces_full,
+                &pred,
+                apex,
+                frac,
+                grace,
+                bounds,
+            );
+            let peak = PeakTraces::new(&al, &pred, win);
+            let shared = fragment_features(
+                &rows,
+                &al,
+                &obs,
+                Some(&peak),
+                apex,
+                0.9,
+                true,
+                frac,
+                grace,
+                bounds,
+            );
+            let own =
+                fragment_features(&rows, &al, &obs, None, apex, 0.9, true, frac, grace, bounds);
+            assert_eq!(
+                ff_bits(&shared),
+                ff_bits(&own),
+                "fragment_features, case {case}"
+            );
+
+            let mut ev = evidence_from(&rows, al, obs, pred, peak, &[], apex);
+            ev.n_matched = k as i32;
+            ev.n_predicted = k as i32;
+            let with_cache = extended_values(&ev);
+            ev.pair_stats = None;
+            let without = extended_values(&ev);
+            let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+            assert_eq!(bits(&with_cache), bits(&without), "families, case {case}");
+            checked += 1;
+        }
+        assert_eq!(checked, 400);
     }
 
     #[test]
@@ -4892,6 +6204,383 @@ mod tests {
         }
     }
 
+    /// Deterministic pseudo-random stream for the production-shaped fixture below. A
+    /// 64-bit LCG (Knuth's MMIX constants), high bits only: no dependency, and the same
+    /// sequence on every platform, which a golden digest needs.
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn next_u32(&mut self) -> u32 {
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (self.0 >> 33) as u32
+        }
+
+        /// Uniform in `[0, 1)`.
+        fn unit(&mut self) -> f64 {
+            self.next_u32() as f64 / (1u64 << 31) as f64
+        }
+
+        /// Uniform in `0..n`.
+        fn below(&mut self, n: u32) -> u32 {
+            self.next_u32() % n.max(1)
+        }
+    }
+
+    /// Extract's chromatogram row-group size (`extract.rs` `CHROM_ROW_GROUP_ROWS`).
+    const EXTRACT_CHROM_GROUP_ROWS: usize = 1 << 16;
+
+    /// A PRODUCTION-SHAPED Extended fixture for the per-PSM kernels: mostly 12 fragments
+    /// on ~150-240-point shared grids (the HYE shape), with every degenerate case the
+    /// kernels branch on mixed in: 0 to 11 fragments, 1- to 12-point grids, predicted but
+    /// unobserved fragments, all-zero traces, quantised intensities (ties), zero and
+    /// negative predicted intensities, rows on a shifted grid (the union alignment), a row
+    /// whose intensity vector is longer than its axis, MS1 isotope XICs on the fragment
+    /// grid, on a different grid, incomplete and absent, and apexes off the axis.
+    ///
+    /// `craft_extended_inputs` has at most five fragments and ten points, so it never
+    /// reaches the body of an 11-lag cross-correlation nor a pair matrix of the size the
+    /// kernels are tuned for; this one does, which is what the kernel golden below needs.
+    ///
+    /// `chrom_group_rows` is the chromatogram table's row-group size: extract's 65,536 for
+    /// the golden and the benchmark, a small one where a test needs chunk spans that start
+    /// inside a row group, cover several and share a boundary group with the next chunk.
+    fn craft_kernel_inputs(
+        dir: &std::path::Path,
+        n_cand: u32,
+        chrom_group_rows: usize,
+    ) -> (String, String) {
+        let psms = dir
+            .join("psms_kernel.parquet")
+            .to_string_lossy()
+            .to_string();
+        let chrom = dir
+            .join("chrom_kernel.parquet")
+            .to_string_lossy()
+            .to_string();
+        let mut rng = Lcg(0x5eed_1234_abcd_0001);
+        let (mut cid, mut base): (Vec<u32>, Vec<u32>) = (Vec::new(), Vec::new());
+        let (mut apex_rt, mut cal, mut mz): (Vec<f64>, Vec<f64>, Vec<f64>) =
+            (Vec::new(), Vec::new(), Vec::new());
+        let mut apex_int: Vec<f32> = Vec::new();
+        let (mut nmatch, mut npred, mut corun, mut z): (Vec<i32>, Vec<i32>, Vec<i32>, Vec<i32>) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let (mut label, mut pform, mut prot): (Vec<String>, Vec<String>, Vec<String>) =
+            (Vec::new(), Vec::new(), Vec::new());
+        let mut ms1: [Vec<Option<f64>>; 4] = Default::default();
+        let (mut ccid, mut cname): (Vec<u32>, Vec<String>) = (Vec::new(), Vec::new());
+        let (mut cfmz, mut cobsmz): (Vec<f64>, Vec<f64>) = (Vec::new(), Vec::new());
+        let mut cpint: Vec<f32> = Vec::new();
+        let (mut crt, mut cint): (Vec<Vec<f32>>, Vec<Vec<f32>>) = (Vec::new(), Vec::new());
+        // One Gaussian elution peak on `n` points, centred at `centre`, with dropouts,
+        // noise, an optional interferent and optional quantisation.
+        let peak = |rng: &mut Lcg, n: usize, centre: f64| -> Vec<f32> {
+            let height = 10f64.powf(1.0 + 3.0 * rng.unit());
+            let width = 1.5 + 4.0 * rng.unit();
+            let interferent = if rng.below(5) == 0 {
+                Some((
+                    rng.below(n.max(1) as u32) as f64,
+                    height * 2.0 * rng.unit(),
+                    1.0 + 3.0 * rng.unit(),
+                ))
+            } else {
+                None
+            };
+            let quantise = rng.below(10) == 0;
+            (0..n)
+                .map(|i| {
+                    let x = (i as f64 - centre) / width;
+                    let mut v = height * (-0.5 * x * x).exp();
+                    if let Some((c2, h2, w2)) = interferent {
+                        let x2 = (i as f64 - c2) / w2;
+                        v += h2 * (-0.5 * x2 * x2).exp();
+                    }
+                    if rng.below(4) == 0 {
+                        return 0.0;
+                    }
+                    v += height * 0.05 * rng.unit();
+                    if quantise {
+                        let q = height / 8.0;
+                        v = (v / q).round() * q;
+                    }
+                    v as f32
+                })
+                .collect()
+        };
+        for c in 0..n_cand {
+            let roll = rng.unit();
+            let k: u32 = if roll < 0.55 {
+                12
+            } else if roll < 0.6 {
+                0
+            } else {
+                1 + rng.below(11)
+            };
+            let npts: usize = if rng.below(10) == 0 {
+                1 + rng.below(12) as usize
+            } else {
+                150 + rng.below(91) as usize
+            };
+            let dt = 0.5 + 2.5 * rng.unit();
+            let start = 200.0 + c as f64 * 3.0;
+            let grid: Vec<f32> = (0..npts).map(|i| (start + i as f64 * dt) as f32).collect();
+            let centre = (npts / 2) as f64 + rng.below(9) as f64 - 4.0;
+            let centre_i = (centre.max(0.0) as usize).min(npts - 1);
+            let apex = if rng.below(20) == 0 {
+                grid[0] as f64 - 10.0 // apex off the left end of the axis
+            } else {
+                grid[centre_i] as f64 + (rng.unit() - 0.5) * 0.6 * dt
+            };
+            cid.push(c);
+            base.push(c / 3);
+            apex_rt.push(apex);
+            cal.push(apex + (rng.unit() - 0.5) * 20.0);
+            mz.push(400.0 + 600.0 * rng.unit());
+            apex_int.push((10f64.powf(2.0 + 3.0 * rng.unit())) as f32);
+            npred.push(k as i32);
+            nmatch.push(rng.below(k + 1) as i32);
+            corun.push(rng.below(k + 1) as i32);
+            z.push(2 + (c % 3) as i32);
+            label.push(if c % 3 == 0 { "decoy" } else { "target" }.to_string());
+            pform.push(format!("PEPTIDEK{}", c / 3));
+            prot.push(format!("P{c};Q{}", c / 2));
+            for (slot, v) in ms1.iter_mut().enumerate() {
+                v.push(if rng.below(8) == 0 {
+                    None
+                } else {
+                    Some(10f64.powf(2.0 + 2.0 * rng.unit()) / (slot + 1) as f64)
+                });
+            }
+            for f in 0..k {
+                let series = if rng.below(2) == 0 { 'y' } else { 'b' };
+                let ordinal = 1 + rng.below(14);
+                let name = if rng.below(5) == 0 {
+                    format!("{series}{ordinal}^2")
+                } else {
+                    format!("{series}{ordinal}")
+                };
+                let fmz = 150.0 + 1200.0 * rng.unit();
+                ccid.push(c);
+                cname.push(name);
+                cfmz.push(fmz);
+                cobsmz.push(fmz * (1.0 + (rng.unit() - 0.5) * 20e-6));
+                cpint.push(match rng.below(20) {
+                    0 => 0.0,
+                    1 => -0.05,
+                    2 => 0.5,
+                    _ => rng.unit() as f32,
+                });
+                let jitter = rng.below(5) as f64 - 2.0;
+                // The first fragment always carries a trace: a candidate whose every row is
+                // empty has an empty union axis, which extract never emits and which the
+                // peak-window slice in `fragment_features` does not accept.
+                let mut case = rng.below(20);
+                if f == 0 && case == 0 {
+                    case = 4;
+                }
+                match case {
+                    0 => {
+                        crt.push(Vec::new()); // predicted but never observed
+                        cint.push(Vec::new());
+                    }
+                    1 => {
+                        crt.push(grid.clone());
+                        cint.push(vec![0.0; npts]);
+                    }
+                    2 => {
+                        // A row on a shifted grid: no shared axis, so the union build runs.
+                        crt.push(grid.iter().map(|&t| t + (0.25 * dt) as f32).collect());
+                        cint.push(peak(&mut rng, npts, centre + jitter));
+                    }
+                    3 => {
+                        // More values than axis points: the union build truncates.
+                        crt.push(grid.clone());
+                        cint.push(peak(&mut rng, npts + 2, centre + jitter));
+                    }
+                    _ => {
+                        crt.push(grid.clone());
+                        cint.push(peak(&mut rng, npts, centre + jitter));
+                    }
+                }
+            }
+            if k == 0 {
+                continue; // a PSM row with no chromatogram rows at all
+            }
+            let ms1_case = rng.below(10);
+            let isotopes: &[&str] = match ms1_case {
+                8 => &["ms1_mono", "ms1_iso1"],
+                9 => &[],
+                _ => &["ms1_mono", "ms1_iso1", "ms1_iso2"],
+            };
+            for (iso, nm) in isotopes.iter().enumerate() {
+                ccid.push(c);
+                cname.push(nm.to_string());
+                cfmz.push(500.0 + iso as f64 * 0.5);
+                cobsmz.push(500.0 + iso as f64 * 0.5);
+                cpint.push(0.0);
+                if ms1_case == 7 {
+                    // Every second fragment scan: an MS1 grid that is not the fragments'.
+                    let sub: Vec<f32> = grid.iter().step_by(2).copied().collect();
+                    let n = sub.len();
+                    crt.push(sub);
+                    cint.push(peak(&mut rng, n, centre / 2.0));
+                } else {
+                    crt.push(grid.clone());
+                    cint.push(peak(&mut rng, npts, centre));
+                }
+            }
+        }
+        let [m_mono, m_i1, m_i2, m_m1] = ms1;
+        mumdia_io::table::write_table(
+            &psms,
+            vec![
+                Col::U32("candidate_id".into(), cid),
+                Col::F64("apex_rt".into(), apex_rt),
+                Col::F32("apex_intensity".into(), apex_int),
+                Col::I32("n_matched_fragments".into(), nmatch),
+                Col::I32("n_predicted_fragments".into(), npred),
+                Col::I32("coelution_run".into(), corun),
+                Col::F64("rt_pred_cal".into(), cal),
+                Col::I32("charge".into(), z),
+                Col::Str("label".into(), label),
+                Col::U32("base_peptide_id".into(), base),
+                Col::Str("peptidoform".into(), pform),
+                Col::Str("protein".into(), prot),
+                Col::F64("precursor_mz".into(), mz),
+                Col::OptF64("ms1_mono".into(), m_mono),
+                Col::OptF64("ms1_iso1".into(), m_i1),
+                Col::OptF64("ms1_iso2".into(), m_i2),
+                Col::OptF64("ms1_isom1".into(), m_m1),
+            ],
+        )
+        .unwrap();
+        let mut w = TableWriter::new(&chrom).with_row_group_rows(chrom_group_rows);
+        w.write_cols(vec![
+            Col::U32("candidate_id".into(), ccid),
+            Col::Str("frag_name".into(), cname),
+            Col::F64("frag_mz".into(), cfmz),
+            Col::F64("frag_obs_mz".into(), cobsmz),
+            Col::F32("predicted_intensity".into(), cpint),
+            Col::ListF32("rt".into(), crt),
+            Col::ListF32("intensity".into(), cint),
+        ])
+        .unwrap();
+        w.close().unwrap();
+        (psms, chrom)
+    }
+
+    #[test]
+    #[ignore = "benchmark fixture: set MUMDIA_BENCH_OUT (and MUMDIA_BENCH_CANDS); writes GBs"]
+    fn write_kernel_bench_fixture() {
+        // Writes a large instance of `craft_kernel_inputs` for an A/B of two `mumdia
+        // features` binaries on HYE-shaped traces (mostly 12 fragments on 150-240-point
+        // grids), which the local real runs (a 15-minute Astral gradient, ~8 points per
+        // trace) do not have. Run with `--ignored --nocapture`, then point `mumdia
+        // features --psms-extracted <out>/psms_kernel.parquet --chromatograms
+        // <out>/chrom_kernel.parquet` at it with the Extended set.
+        let Ok(out) = std::env::var("MUMDIA_BENCH_OUT") else {
+            eprintln!("MUMDIA_BENCH_OUT is not set; nothing written");
+            return;
+        };
+        let n: u32 = std::env::var("MUMDIA_BENCH_CANDS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(40_000);
+        let dir = std::path::PathBuf::from(out);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Extract's row-group size, so a benchmark on a large instance of this fixture
+        // decodes the row groups a production table has.
+        let (psms, chrom) = craft_kernel_inputs(&dir, n, EXTRACT_CHROM_GROUP_ROWS);
+        eprintln!("wrote {psms} and {chrom} ({n} candidates)");
+    }
+
+    #[test]
+    fn production_shaped_features_match_the_pre_kernel_build() {
+        // A GOLDEN over the production-shaped fixture above, captured at main 6887c41
+        // BEFORE the per-PSM kernel work (the shared pair statistics, the MS1 identity
+        // path, the lag-parallel cross-correlation, the centred Pearson, the order
+        // statistics by selection, the power iteration and the cached Spearman ranks).
+        // Every one of those changes claims bit-identical feature values; this is the test
+        // that holds them to it on inputs large enough to reach the code they changed.
+        //
+        // Three configurations, because the kernels branch on them: per-candidate peak
+        // bounds, the global half-widths a confident set would give, and
+        // `bound_features = false` (where `fragment_features` scores the whole window and
+        // must not share the Extended path's peak statistics). Each runs in small chunks,
+        // so the multi-chunk loader is on the path too.
+        //
+        // PER PLATFORM for the reason `extended_features_match_the_pre_permutation_build`
+        // gives (the platform libm). Both values were captured at b346ca5, which is main
+        // 6887c41 plus this test and nothing else: Windows with the MSVC toolchain, Linux on
+        // Ubuntu 24.04 (glibc 2.39, the ubuntu-latest CI image), where the older golden's
+        // Linux digest reproduced in the same run. A platform with no entry prints its
+        // digest and passes. REGENERATING: re-derive at the last commit whose values are
+        // trusted, never from the build under test.
+        const GOLDEN_DIGEST: Option<u64> = if cfg!(target_os = "windows") {
+            Some(0x7eaa_3aa3_e1bc_0502)
+        } else if cfg!(target_os = "linux") {
+            Some(0x312c_7b08_b6c5_6400)
+        } else {
+            None
+        };
+        let dir = std::env::temp_dir().join("mumdia_features_kernel_golden");
+        std::fs::create_dir_all(&dir).unwrap();
+        let (psms, chrom) = craft_kernel_inputs(&dir, 400, EXTRACT_CHROM_GROUP_ROWS);
+        let mut h = 0xcbf2_9ce4_8422_2325u64;
+        let arms: [(&str, bool, BoundsSource); 3] = [
+            ("percand", true, BoundsSource::Learn),
+            ("global", true, BoundsSource::Given(Some((6.0, 9.0)))),
+            ("unbounded", false, BoundsSource::Learn),
+        ];
+        for (tag, bound_features, bounds) in arms {
+            let out = dir
+                .join(format!("kernel_{tag}.parquet"))
+                .to_string_lossy()
+                .to_string();
+            let mut cfg = FeaturesConfig {
+                set: FeatureSet::Extended,
+                emit_pin: false,
+                bound_from_confident: false,
+                bound_features,
+                ..Default::default()
+            };
+            cfg.ms1_precursor_features = true;
+            run_chunked(
+                FeaturesParams {
+                    psms: &psms,
+                    chromatograms: &chrom,
+                    seed: None,
+                    out: &out,
+                    out_pin: "",
+                    cfg: &cfg,
+                    config_hash: "test",
+                },
+                300,
+                usize::MAX,
+                PinFinish::Normal,
+                bounds,
+                LoaderSource::Leased,
+            )
+            .unwrap();
+            let (rows, ncols, digest) = features_digest(&out);
+            assert_eq!((rows, ncols), (400, 398), "arm {tag}: table shape moved");
+            eprintln!("arm {tag}: 0x{digest:016x}");
+            fnv(&mut h, &digest.to_le_bytes());
+        }
+        match GOLDEN_DIGEST {
+            Some(golden) => assert_eq!(
+                h, golden,
+                "a feature value differs from the pre-kernel build (this platform computes \
+                 0x{h:016x})"
+            ),
+            None => {
+                eprintln!("no kernel digest is recorded for this platform; it computes 0x{h:016x}")
+            }
+        }
+    }
+
     #[test]
     fn extended_features_are_chunk_invariant() {
         // The `features_chunking_is_value_preserving` integration test runs the DEFAULT
@@ -4987,6 +6676,330 @@ mod tests {
             "the charge-state count never reached 3"
         );
         assert!(n_charge.iter().all(|&v| (1.0..=3.0).contains(&v)));
+    }
+
+    /// The kernel fixture's chunk plan: `(first chromatogram row, rows)` per chunk.
+    fn kernel_chunk_plan(
+        psms: &str,
+        chrom: &str,
+        chunk_rows: usize,
+        max_psm_rows: usize,
+    ) -> (Vec<usize>, Vec<usize>) {
+        let cid = TableFile::open(psms).unwrap().u32("candidate_id").unwrap();
+        let ch_cid = TableFile::open(chrom).unwrap().u32("candidate_id").unwrap();
+        let chunks = plan_chunks(&cid, &ch_cid, chrom, chunk_rows, max_psm_rows).unwrap();
+        let rows: Vec<usize> = chunks.iter().map(|c| c.chrom_rows).collect();
+        let first: Vec<usize> = rows
+            .iter()
+            .scan(0usize, |acc, &n| {
+                let f = *acc;
+                *acc += n;
+                Some(f)
+            })
+            .collect();
+        (first, rows)
+    }
+
+    #[test]
+    fn main_loaders_follow_the_thread_budget_and_the_chunk_count() {
+        // (chrom_loaders, chunks, threads) -> loaders requested before the pool lease.
+        for (cfg, chunks, threads, want) in [
+            (3, 10, 32, 3),
+            (3, 10, 1, 1), // `--threads 1` decodes on one loader, as before F1
+            (3, 10, 2, 2),
+            (3, 2, 32, 2),  // never more loaders than chunks
+            (3, 0, 32, 1),  // an empty plan still gets its one loader
+            (0, 10, 32, 1), // 0 is read as 1
+            (7, 10, 0, 1),
+            (1, 10, 32, 1),
+        ] {
+            assert_eq!(
+                main_loaders_wanted(cfg, chunks, threads),
+                want,
+                "chrom_loaders {cfg}, {chunks} chunks, {threads} threads"
+            );
+        }
+    }
+
+    #[test]
+    fn the_loader_count_moves_no_byte_of_the_features_table() {
+        // `features.chrom_loaders` decodes chunks on several threads from their own row
+        // spans. The claim is stronger than equal values: the chunk boundaries are fixed by
+        // the plan and the computation takes the chunks in table order, so every
+        // `write_cols` call receives the same columns and the file is byte-identical. Two
+        // chunkings: chromatogram-row chunks, and one PSM per chunk, which makes the
+        // zero-row chunks of the PSMs that have no chromatogram rows (`load_chunk` returns
+        // an empty chunk for those without opening a span).
+        //
+        // The loader counts are EXACT here (`LoaderSource::Exact`). The production path
+        // leases every loader beyond the first from a process-wide pool that another test
+        // in this process may be holding, and an arm that quietly ran one loader would
+        // compare one loader against one. The production path is the last arm. The
+        // chromatogram table has 64-row groups, so the ~150-row chunk spans start inside a
+        // row group, cover several, and share their boundary group with the next chunk,
+        // which two loaders then decode at the same time.
+        const GROUP: usize = 64;
+        let dir = std::env::temp_dir().join("mumdia_features_loaders");
+        std::fs::create_dir_all(&dir).unwrap();
+        let (psms, chrom) = craft_kernel_inputs(&dir, 120, GROUP);
+        for (tag, chunk_rows, max_psm_rows) in [("rows", 150usize, usize::MAX), ("psm", 1 << 20, 1)]
+        {
+            let (first, rows) = kernel_chunk_plan(&psms, &chrom, chunk_rows, max_psm_rows);
+            assert!(
+                rows.len() >= 7,
+                "chunking {tag}: {} chunks cannot keep seven loaders busy",
+                rows.len()
+            );
+            if tag == "rows" {
+                let inside = (0..rows.len())
+                    .filter(|&j| first[j] >= GROUP && first[j] % GROUP != 0)
+                    .count();
+                let multi = rows.iter().filter(|&&n| n > 2 * GROUP).count();
+                assert!(
+                    inside > 0 && multi > 0,
+                    "the plan must reach the span decode's hard cases: {inside} spans start \
+                     inside a later row group (and so share it with the chunk before), \
+                     {multi} cover several groups"
+                );
+            }
+            let exact = |loaders: usize| LoaderSource::Exact {
+                loaders,
+                fault: None,
+            };
+            let arms = [
+                ("1", exact(1)),
+                ("2", exact(2)),
+                ("3", exact(3)),
+                ("7", exact(7)),
+                ("leased", LoaderSource::Leased),
+            ];
+            let mut hashes: Vec<(&str, String)> = Vec::new();
+            for (arm, loaders) in arms {
+                let out = dir
+                    .join(format!("features_{tag}_{arm}.parquet"))
+                    .to_string_lossy()
+                    .to_string();
+                let cfg = FeaturesConfig {
+                    set: FeatureSet::Extended,
+                    bound_from_confident: false,
+                    ..Default::default()
+                };
+                run_chunked(
+                    FeaturesParams {
+                        psms: &psms,
+                        chromatograms: &chrom,
+                        seed: None,
+                        out: &out,
+                        out_pin: "",
+                        cfg: &cfg,
+                        config_hash: "test",
+                    },
+                    chunk_rows,
+                    max_psm_rows,
+                    PinFinish::Normal,
+                    BoundsSource::Learn,
+                    loaders,
+                )
+                .unwrap();
+                hashes.push((arm, mumdia_io::hash::blake3_file(&out).unwrap()));
+            }
+            for (arm, h) in &hashes[1..] {
+                assert_eq!(
+                    h, &hashes[0].1,
+                    "chunking {tag}: loaders '{arm}' wrote different bytes than one"
+                );
+            }
+        }
+    }
+
+    /// What [`ChunkLoader::take`] handed over for one chunk.
+    #[derive(Debug, PartialEq)]
+    enum Took {
+        /// Decoded: the chunk's candidate ids, fragment and MS1 row counts, payload bytes
+        /// and axis values (as bits).
+        Chunk(Vec<u32>, usize, usize, (usize, usize), Vec<u32>),
+        Err,
+        /// No loader was left to park it.
+        Gone,
+    }
+
+    impl Took {
+        fn of(c: &ChromChunk) -> Took {
+            Took::Chunk(
+                c.cids.clone(),
+                c.frag.nrows(),
+                c.ms1.nrows(),
+                c.payload_bytes(),
+                c.axis_vals.iter().map(|v| v.to_bits()).collect(),
+            )
+        }
+    }
+
+    /// The kernel fixture's failure setup: 60 candidates, 64-row groups, ~100-row chunks.
+    fn fault_fixture(tag: &str) -> (std::path::PathBuf, String, String) {
+        let dir = std::env::temp_dir().join(format!("mumdia_features_loader_fault_{tag}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (psms, chrom) = craft_kernel_inputs(&dir, 60, 64);
+        (dir, psms, chrom)
+    }
+
+    /// The chunk a fault test fails; three loaders, so chunk `FAULT_AT - 1` can still be
+    /// decoding when it fails.
+    const FAULT_AT: usize = 3;
+
+    #[test]
+    fn a_loader_failure_reaches_the_computation_in_chunk_order_and_never_hangs() {
+        // The in-order hand-over under a failure that lands OUT of order: chunk 3 fails (an
+        // error, or a loader panic) while chunk 2 is still being decoded on another loader
+        // (`LoadFault::hold_prev` keeps it there until the failure has stopped the pass).
+        // The computation must still receive chunks 0, 1 and 2 intact and in order, each
+        // exactly as a lone sequential decode of it gives, then the failure at chunk 3: the
+        // error itself, or, after a panic, the report that no loader is left. Never a hang.
+        // Driven on `ChunkLoader` directly, with exactly three loaders.
+        let (_dir, psms, chrom) = fault_fixture("order");
+        let (first, rows) = kernel_chunk_plan(&psms, &chrom, 100, usize::MAX);
+        assert!(rows.len() > FAULT_AT + 1, "{} chunks", rows.len());
+        let ch = TableFile::open(&chrom).unwrap();
+        let seq: Vec<Took> = (0..FAULT_AT)
+            .map(|j| Took::of(&load_chunk(&ch, first[j], rows[j]).unwrap().0))
+            .collect();
+        for panic in [false, true] {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let (chrom, first, rows) = (chrom.clone(), first.clone(), rows.clone());
+            std::thread::spawn(move || {
+                let ch = TableFile::open(&chrom).unwrap();
+                let fault = LoadFault {
+                    at: FAULT_AT,
+                    panic,
+                    hold_prev: true,
+                };
+                let loader = ChunkLoader::new(&ch, &first, &rows, 3).with_fault(Some(fault));
+                let timers = PassTimers::default();
+                let got = std::thread::scope(|sc| {
+                    let release = loader.release_on_drop();
+                    let handles: Vec<_> = (0..3)
+                        .map(|_| {
+                            let (loader, timers) = (&loader, &timers);
+                            sc.spawn(move || loader.run(timers))
+                        })
+                        .collect();
+                    let mut took = Vec::new();
+                    for j in 0..rows.len() {
+                        let t = match loader.take(j) {
+                            Some(Ok((c, _))) => Took::of(&c),
+                            Some(Err(_)) => Took::Err,
+                            None => Took::Gone,
+                        };
+                        let stop = !matches!(t, Took::Chunk(..));
+                        took.push(t);
+                        if stop {
+                            break;
+                        }
+                    }
+                    drop(release);
+                    // Joined here, so a panicked loader is counted instead of re-raised by
+                    // the scope.
+                    let panicked = handles.into_iter().filter_map(|h| h.join().err()).count();
+                    (took, panicked)
+                });
+                let _ = tx.send(got);
+            });
+            let (took, panicked) = rx
+                .recv_timeout(std::time::Duration::from_secs(60))
+                .unwrap_or_else(|e| panic!("panic={panic}: the hand-over hung ({e})"));
+            assert_eq!(took.len(), FAULT_AT + 1, "panic={panic}: {took:?}");
+            assert_eq!(
+                &took[..FAULT_AT],
+                &seq[..],
+                "panic={panic}: the chunks before the failure"
+            );
+            let want = if panic { Took::Gone } else { Took::Err };
+            assert_eq!(took[FAULT_AT], want, "panic={panic}: the failed chunk");
+            assert_eq!(panicked, usize::from(panic), "loaders that panicked");
+        }
+    }
+
+    #[test]
+    fn a_loader_failure_mid_pass_publishes_nothing() {
+        // The same out-of-order failure through the whole pass, three loaders: the stage
+        // must come back (an error for a decode error; for a loader panic the scope
+        // re-raises it after joining, as the single loader's panic was re-raised before
+        // the loaders were parallel), and the previous features table must stay exactly as
+        // it was, with no temp file left behind.
+        let (dir, psms, chrom) = fault_fixture("pass");
+        let (_, rows) = kernel_chunk_plan(&psms, &chrom, 100, usize::MAX);
+        assert!(rows.len() > FAULT_AT + 1, "{} chunks", rows.len());
+        let out = dir
+            .join("features_fault.parquet")
+            .to_string_lossy()
+            .to_string();
+        let go = |psms: &str, chrom: &str, out: &str, fault: Option<LoadFault>| {
+            let cfg = FeaturesConfig {
+                set: FeatureSet::Extended,
+                bound_from_confident: false,
+                ..Default::default()
+            };
+            run_chunked(
+                FeaturesParams {
+                    psms,
+                    chromatograms: chrom,
+                    seed: None,
+                    out,
+                    out_pin: "",
+                    cfg: &cfg,
+                    config_hash: "test",
+                },
+                100,
+                usize::MAX,
+                PinFinish::Normal,
+                BoundsSource::Learn,
+                LoaderSource::Exact { loaders: 3, fault },
+            )
+        };
+        go(&psms, &chrom, &out, None).expect("the good run must succeed");
+        let good = mumdia_io::hash::blake3_file(&out).unwrap();
+        for panic in [false, true] {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let (p2, c2, o2) = (psms.clone(), chrom.clone(), out.clone());
+            std::thread::spawn(move || {
+                let fault = LoadFault {
+                    at: FAULT_AT,
+                    panic,
+                    hold_prev: true,
+                };
+                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    go(&p2, &c2, &o2, Some(fault))
+                }));
+                let _ = tx.send(match r {
+                    Ok(Ok(_)) => "ok",
+                    Ok(Err(_)) => "error",
+                    Err(_) => "panic",
+                });
+            });
+            let got = rx
+                .recv_timeout(std::time::Duration::from_secs(60))
+                .unwrap_or_else(|e| panic!("panic={panic}: the stage hung ({e})"));
+            if panic {
+                assert_ne!(got, "ok", "a loader panic must fail the stage");
+            } else {
+                assert_eq!(got, "error", "a decode error must be the stage's error");
+            }
+            assert_eq!(
+                mumdia_io::hash::blake3_file(&out).unwrap(),
+                good,
+                "panic={panic}: a failed pass must leave the previous table as it was"
+            );
+            let leftovers: Vec<_> = std::fs::read_dir(&dir)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().to_string())
+                .filter(|n| n.contains("features_fault.parquet.tmp-"))
+                .collect();
+            assert!(
+                leftovers.is_empty(),
+                "panic={panic}: temp files left behind: {leftovers:?}"
+            );
+        }
     }
 
     #[test]
@@ -5130,6 +7143,7 @@ mod tests {
             CHUNK_PSM_ROWS,
             PinFinish::Normal,
             BoundsSource::Learn,
+            LoaderSource::Leased,
         )
         .expect("the good run must succeed");
         let good = mumdia_io::hash::blake3_file(&out).unwrap();
@@ -5140,6 +7154,7 @@ mod tests {
             CHUNK_PSM_ROWS,
             PinFinish::Fail,
             BoundsSource::Learn,
+            LoaderSource::Leased,
         )
         .expect_err("a PIN that cannot be flushed must fail the stage");
         assert!(

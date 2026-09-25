@@ -440,6 +440,7 @@ pub fn run(p: RunParams) -> Result<()> {
                     cfg.rt_im_train.q_train,
                     cfg.rt_im_train.window_holdout_frac,
                     rayon::current_num_threads(),
+                    cfg.rt_im_train.deeplc_predict_shards,
                 )?;
                 let n_mh = mumdia_io::table::nrows(&lib_p_mh)?;
                 man.record(record_artifact(
@@ -479,6 +480,8 @@ pub fn run(p: RunParams) -> Result<()> {
                     // residuals and the window shrinks back toward in-sample optimism.
                     cfg.rt_im_train.window_holdout_frac,
                     cfg.rng_seed,
+                    rayon::current_num_threads(),
+                    cfg.rt_im_train.deeplc_predict_shards,
                 )?;
                 // The fine-tuned precursor table is the artifact actually consumed by
                 // RT calibration and extraction. Replace the base-library manifest entry
@@ -518,6 +521,7 @@ pub fn run(p: RunParams) -> Result<()> {
                     &lib_p,
                     &lib_p_dl,
                     rayon::current_num_threads(),
+                    cfg.rt_im_train.deeplc_predict_shards,
                 )?;
                 let n_dl = mumdia_io::table::nrows(&lib_p_dl)?;
                 man.record(record_artifact(

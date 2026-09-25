@@ -163,6 +163,61 @@ Env knobs (all optional):
     MUMDIA_NN_PREGATHER_GB= 8        pre-gather the fold's training rows when they fit in
                                      this many GB (one gather per iteration instead of a
                                      fancy-index copy per minibatch)
+    MUMDIA_NN_LOAD_THREADS = auto    threads that fill the in-memory matrix from a parquet
+                                     handoff: each 32,768-row moment sub-block of a row group
+                                     is written straight into its rows and its float64 sums
+                                     are added in the original order, so the matrix, mean and
+                                     std are byte-identical. auto = min(8, torch CPU threads);
+                                     each thread holds a 32,768 x features float64 buffer.
+                                     0 = the original serial loop (no read-ahead/pre_buffer).
+    MUMDIA_NN_READ_AHEAD  = 1        decode row group r+1 on a reader thread while r is being
+                                     filled (at most two decoded groups resident). 0 = off.
+    MUMDIA_NN_PRE_BUFFER  = 1        open the reader's ParquetFile with pre_buffer=True
+                                     (coalesced column-chunk reads). 0 = off.
+    MUMDIA_NN_SCAN_THREADS = auto    threads for the init feature scan (one column, both
+                                     signs, per task; the winner is reduced in the serial
+                                     (column, sign) order, so the choice is identical).
+                                     auto = the torch CPU thread count. Always capped by the
+                                     two knobs below. 1 = serial.
+    MUMDIA_NN_SCAN_ROWS_PER_THREAD = 20000  init-sample rows per scan thread: a smaller
+                                     sample starts fewer threads.
+    MUMDIA_NN_SCAN_MEM_GB = 1        transient memory the scan tasks in flight may hold
+                                     together, at about 64 bytes per sample row each. Binds
+                                     only when the init sample escalates to millions of
+                                     rows (3 tasks at 4.8M rows).
+    MUMDIA_NN_SELECT      = window   how each round selects its positives: window = sort
+                                     only the top rows down to the (floor(fdr * targets)+1)-th
+                                     best decoy, certify that no later row can be accepted,
+                                     else fall back to the full sort; the hybrid/margin decoy
+                                     order uses one uint64 key sort. Both reproduce the stable
+                                     argsort exactly. full = the previous full sort each round.
+    MUMDIA_NN_GATHER      = torch    how `score_idx` gathers a scoring batch on the
+                                     in-memory backend: torch = `torch.index_select` into
+                                     one reused numpy-allocated buffer (multi-threaded);
+                                     numpy = the previous `Xs[idx]` fancy index. Same
+                                     values, same shapes; byte-identical scores where
+                                     checked (Windows x86-64, torch 2.6, CPU and CUDA; the
+                                     tests repeat it on the host that runs them). The
+                                     streaming backend always uses the numpy path.
+    MUMDIA_NN_PARALLEL    = 0        opt-in: > 0 trains the (seed, fold) tasks in that many
+                                     spawned processes at once. The matrix is shared through
+                                     a read-only memmap next to the output (the in-memory
+                                     backend writes it there instead of to RAM), not copied
+                                     per process. The epoch shuffle is then keyed per (seed,
+                                     fold, iteration, epoch) rather than drawn from one
+                                     stream per seed, which changes the scores once, like a
+                                     seed change; they do not depend on the process count
+                                     (1 runs the same keyed tasks one after another in one
+                                     child). 0 = the serial loop and today's scores.
+    MUMDIA_NN_PARALLEL_THREADS = auto  torch threads per process under MUMDIA_NN_PARALLEL;
+                                     auto = the serial worker's resolved thread count. Fixed
+                                     per process, so the arithmetic of a task does not depend
+                                     on how many processes run.
+    MUMDIA_NN_FINAL_POOL_SCORE = 0   1 = also score the training pool after the LAST
+                                     round and log its target count. Those scores feed no
+                                     later selection, so by default the pass is skipped and
+                                     the per-fold log line reports the held-out fold's
+                                     count instead. Scores are identical either way.
 
 Performance notes (measured on a 32-core CPU box, 1.3M-PSM rescore):
     The MLP is tiny (387->128->64->1, ~58k params) but is executed ~160,500 times
@@ -177,6 +232,7 @@ import hashlib
 import os
 import re
 import sys
+import threading
 import time
 
 import numpy as np
@@ -414,6 +470,235 @@ def _accumulate_moments(blk, s1, s2, rows=32768):
         s2 += sub.sum(axis=0)
 
 
+# Rows per moment sub-block. The per-column float64 sums are accumulated one sub-block at a
+# time, in this partition, so any loader that reproduces the partition reproduces the sums.
+_MOMENT_ROWS = 32768
+
+
+def moment_blocks(rows, chunk, sub=_MOMENT_ROWS):
+    """(start, stop) rows of one row group's moment sub-blocks, in accumulation order.
+
+    The partition of the original loop: the row group is sliced into `chunk`-row pieces from
+    its first row, and each piece into `sub`-row sub-blocks from the piece's first row. The
+    float64 sums depend on this partition (addition is not associative), so it is kept.
+    """
+    out = []
+    for c0 in range(0, rows, chunk):
+        k = min(chunk, rows - c0)
+        for a in range(0, k, sub):
+            out.append((c0 + a, c0 + min(a + sub, k)))
+    return out
+
+
+def moments_to_mean_std(s1, s2, n):
+    """Mean and standard deviation (float32) from float64 column sums, as every backend does."""
+    mean = (s1 / n).astype(np.float32)
+    std = np.sqrt(np.maximum(s2 / n - (s1 / n) ** 2, 1e-12)).astype(np.float32)
+    std[std == 0] = 1.0
+    return mean, std
+
+
+def _column_to_numpy(col):
+    """A decoded column as numpy, nulls as NaN (older pyarrow lacks the keyword)."""
+    try:
+        return col.to_numpy(zero_copy_only=False)
+    except TypeError:
+        return col.to_numpy()
+
+
+def _open_parquet(path, pre_buffer):
+    """`pq.ParquetFile`, with `pre_buffer` (coalesced column-chunk reads) when available."""
+    if pre_buffer:
+        try:
+            return pq.ParquetFile(path, pre_buffer=True)
+        except TypeError:  # pragma: no cover - pyarrow without the keyword
+            pass
+    return pq.ParquetFile(path)
+
+
+_TLS = threading.local()
+
+
+def _fill_block(arrays, dst, r0, r1):
+    """Write rows `r0:r1` of one decoded row group into `dst` and return their moments.
+
+    `dst` is the matrix's view of exactly those rows. Each column is narrowed to float32
+    first (the cast the original `blk[:, j] = column` assignment made), then its non-finite
+    cells are set to 0.0 on that narrowed column, which is what `np.nan_to_num` did to the
+    block: a finite float64 beyond float32 range becomes inf in the cast and 0.0 here, as
+    before. The moments are the original sub-block's: the rows cast to a C-contiguous
+    float64 block of the same shape, summed, squared in place and summed again. The float64
+    block is a per-thread buffer, reused across calls.
+    """
+    for j, a in enumerate(arrays):
+        src = a[r0:r1]
+        if src.dtype != np.float32:
+            src = src.astype(np.float32)
+        finite = np.isfinite(src)
+        if not finite.all():
+            src = np.where(finite, src, np.float32(0.0))
+        dst[:, j] = src
+    k = r1 - r0
+    nf = dst.shape[1]
+    buf = getattr(_TLS, "moments", None)
+    if buf is None or buf.shape[1] != nf or buf.shape[0] < k:
+        buf = _TLS.moments = np.empty((max(k, _MOMENT_ROWS), nf), np.float64)
+    sub = buf[:k]
+    np.copyto(sub, dst)
+    p1 = sub.sum(axis=0)
+    np.square(sub, out=sub)
+    p2 = sub.sum(axis=0)
+    return p1, p2
+
+
+def fill_parquet_matrix(pin_path, feat_cols, n, chunk, out, threads=1, read_ahead=True,
+                        pre_buffer=True, initializer=None):
+    """Decode the handoff's feature columns into `out` (n x nf float32); return (s1, s2).
+
+    Byte-for-byte the matrix and the float64 column sums of the original loop
+    (`_fill_parquet_matrix_legacy`), produced faster:
+      - `read_ahead`: one reader thread, with its own ParquetFile, decodes row group r+1
+        while row group r is filled, so at most two decoded groups are held;
+      - `pre_buffer`: that ParquetFile coalesces column-chunk reads;
+      - `threads`: the moment sub-blocks of a group (see `moment_blocks`) are filled into
+        disjoint row ranges of `out` in parallel, straight from the decoded columns, with no
+        intermediate block, and their partial sums are added in sub-block order.
+    `initializer` runs once per pool thread (the worker's flush-to-zero setting).
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    nf = len(feat_cols)
+    s1 = np.zeros(nf, np.float64)
+    s2 = np.zeros(nf, np.float64)
+    nrg = pq.read_metadata(pin_path).num_row_groups
+    state = {}
+
+    def read(rg):
+        t0 = time.time()
+        pf = state.get("pf")
+        if pf is None:
+            pf = state["pf"] = _open_parquet(pin_path, pre_buffer)
+        tbl = pf.read_row_group(rg, columns=feat_cols)
+        rows = tbl.num_rows
+        arrays = [_column_to_numpy(tbl.column(j)) for j in range(tbl.num_columns)]
+        del tbl
+        return rows, arrays, time.time() - t0
+
+    reader = ThreadPoolExecutor(max_workers=1, initializer=initializer) if read_ahead else None
+    pool = (ThreadPoolExecutor(max_workers=int(threads), initializer=initializer)
+            if threads > 1 else None)
+    off = 0
+    try:
+        pending = reader.submit(read, 0) if (reader is not None and nrg) else None
+        for rg in range(nrg):
+            tw = time.time()
+            if reader is not None:
+                rows, arrays, busy = pending.result()
+                _detail("load: read wait", time.time() - tw)
+                pending = reader.submit(read, rg + 1) if rg + 1 < nrg else None
+            else:
+                rows, arrays, busy = read(rg)
+            _detail("load: read", busy)
+            tf = time.time()
+            if off + rows > n:
+                raise RuntimeError(
+                    f"parquet row mismatch: metadata {n}, features at least {off + rows}")
+            blocks = moment_blocks(rows, chunk)
+            if pool is not None:
+                futs = [pool.submit(_fill_block, arrays, out[off + a:off + b], a, b)
+                        for a, b in blocks]
+                parts = [fu.result() for fu in futs]
+            else:
+                parts = [_fill_block(arrays, out[off + a:off + b], a, b) for a, b in blocks]
+            for p1, p2 in parts:
+                s1 += p1
+                s2 += p2
+            off += rows
+            del arrays, parts
+            _detail("load: fill + moments", time.time() - tf)
+    finally:
+        if reader is not None:
+            reader.shutdown(wait=True)
+        if pool is not None:
+            pool.shutdown(wait=True)
+        state.clear()
+        # With one thread `_fill_block` ran here and cached its moment buffer (32,768 x
+        # features float64, 0.1 GB at 387) on the main thread, which lives for the whole
+        # run. Pool threads release theirs when they exit.
+        vars(_TLS).pop("moments", None)
+    if off != n:
+        raise RuntimeError(f"parquet row mismatch: metadata {n}, features {off}")
+    return s1, s2
+
+
+def _fill_parquet_matrix_legacy(pin_path, feat_cols, n, chunk, out):
+    """The original serial load loop (MUMDIA_NN_LOAD_THREADS=0); returns (s1, s2)."""
+    nf = len(feat_cols)
+    s1 = np.zeros(nf, np.float64)
+    s2 = np.zeros(nf, np.float64)
+    _pf = pq.ParquetFile(pin_path)
+    off = 0
+    _tbl = _b = None
+    # One row group at a time. `iter_batches` reads ahead and decodes groups in
+    # parallel, and its buffered batches grew into a second copy of the matrix:
+    # measured, the worker climbed to 11.2 GB while filling a 4.85 GB `Xs`, then
+    # fell to 6.3 GB the moment the loop ended. Reading a group, slicing it into
+    # CHUNK-row blocks and dropping it bounds the transient to one group, which the
+    # engine writes at 131,072 rows (200 MB at 387 features); a file with parquet's
+    # default 1,048,576-row groups still loads, at 1.6 GB per group.
+    for _rg in range(_pf.num_row_groups):
+        _tr = time.time()
+        _tbl = _pf.read_row_group(_rg, columns=feat_cols)
+        _tf = time.time()
+        _detail("load: read", _tf - _tr)
+        for _s0 in range(0, _tbl.num_rows, chunk):
+            _b = _tbl.slice(_s0, chunk)
+            k = _b.num_rows
+            blk = np.empty((k, nf), np.float32)
+            for j in range(nf):
+                blk[:, j] = _b.column(j).to_numpy(zero_copy_only=False)
+            np.nan_to_num(blk, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+            out[off:off + k] = blk
+            _accumulate_moments(blk, s1, s2)
+            off += k
+            del blk
+        del _tbl, _b
+        _tbl = _b = None
+        _detail("load: fill + moments", time.time() - _tf)
+    del _pf, _tbl, _b
+    if off != n:
+        raise RuntimeError(f"parquet row mismatch: metadata {n}, features {off}")
+    return s1, s2
+
+
+def _standardise_rows(X, mean, std, i0, i1):
+    view = X[i0:i1]
+    np.subtract(view, mean, out=view)
+    np.divide(view, std, out=view)
+    np.clip(view, -8, 8, out=view)
+
+
+def standardise_matrix(X, mean, std, chunk, threads=1, initializer=None, block=65536):
+    """`X = clip((X - mean) / std, -8, 8)` in place.
+
+    Every operation is elementwise, so the bytes do not depend on how the rows are
+    partitioned; with `threads > 1` row blocks are processed on a thread pool. `threads <= 1`
+    is the original serial loop over `chunk`-row views.
+    """
+    n = X.shape[0]
+    if threads <= 1:
+        # In place on each chunk: `(Xs[i:j] - mean) / std` made two chunk-sized copies.
+        for i in range(0, n, chunk):
+            _standardise_rows(X, mean, std, i, i + chunk)
+        return
+    from concurrent.futures import ThreadPoolExecutor
+
+    step = max(1, min(int(chunk), int(block)))
+    with ThreadPoolExecutor(max_workers=int(threads), initializer=initializer) as ex:
+        list(ex.map(lambda i: _standardise_rows(X, mean, std, i, i + step),
+                    range(0, n, step)))
+
+
 def _row_ids(spec_ids):
     """`<prefix>_<flat row>` -> int64 flat rows, without a Python string per row."""
     tail = pc.replace_substring_regex(spec_ids, pattern="^.*_", replacement="")
@@ -444,12 +729,52 @@ def _release_allocator_slack():
 
 
 PHASE = {}
+# How the self-training rounds selected their positives: from a certified window, or with
+# the full sort. Printed with the sub-timers.
+SELECT_COUNTS = {}
+
+# Sub-timers, kept apart from PHASE so `sum(PHASE.values())` stays a sum of disjoint wall
+# intervals. The load entries split `1_pin_read_standardise` (so they are already inside
+# that phase); `selection` is the positive re-selection between a pool score and the next
+# training round, which no phase covers.
+DETAIL = {}
 
 
 def _tick(name, t0):
     "Accumulate elapsed wall time under `name` and return a fresh timestamp."
     PHASE[name] = PHASE.get(name, 0.0) + (time.time() - t0)
     return time.time()
+
+
+def _detail(name, seconds):
+    "Accumulate `seconds` under the sub-timer `name` (never into PHASE)."
+    DETAIL[name] = DETAIL.get(name, 0.0) + seconds
+
+
+def _print_timers():
+    """The phase breakdown, then the sub-timers that are not part of its total."""
+    tot = sum(PHASE.values())
+    print("nn_rescore_worker: phase breakdown (wall seconds)", flush=True)
+    for k in sorted(PHASE):
+        v = PHASE[k]
+        print("    %-26s %8.1f s  %5.1f%%" % (k[2:], v, 100 * v / max(tot, 1e-9)), flush=True)
+    print("    %-26s %8.1f s" % ("MEASURED TOTAL", tot), flush=True)
+    if DETAIL:
+        print("nn_rescore_worker: sub-timers (wall seconds; not added to the total above)",
+              flush=True)
+        for k in sorted(DETAIL):
+            print("    %-26s %8.1f s" % (k, DETAIL[k]), flush=True)
+    if CHILD_PHASE:
+        print("nn_rescore_worker: parallel tasks, summed over all tasks (process seconds; "
+              "they overlap in wall time)", flush=True)
+        for k in sorted(CHILD_PHASE):
+            print("    %-26s %8.1f s" % (k[2:], CHILD_PHASE[k]), flush=True)
+        for k in sorted(CHILD_DETAIL):
+            print("    %-26s %8.1f s" % (k, CHILD_DETAIL[k]), flush=True)
+    if SELECT_COUNTS:
+        print("nn_rescore_worker: positive selection: %d from a certified window, %d full "
+              "sort(s)" % (SELECT_COUNTS.get("window", 0), SELECT_COUNTS.get("full", 0)),
+              flush=True)
 
 
 def tda_q(scores, is_target):
@@ -468,6 +793,97 @@ def tda_q(scores, is_target):
 def n_targets_at(scores, is_target, fdr):
     q = tda_q(scores, is_target)
     return int(((q <= fdr) & (is_target == 1)).sum())
+
+
+def desc_order(scores):
+    """`np.argsort(-scores, kind="stable")` for a float32 vector, from one uint64 sort.
+
+    Each score is mapped to an order-preserving 32-bit key in the high half of a uint64 and
+    its position fills the low half, so the keys are distinct and an unstable sort of them
+    yields exactly the stable order (numpy's SIMD sort of 64-bit integers: 2.7x a stable
+    argsort on 2M scores). The mapping reproduces the comparison the stable sort makes:
+    `-0.0` and `+0.0` get one key (they compare equal), every NaN gets the key of one
+    positive quiet NaN, above +inf (numpy sorts NaN last, in index order), and the `+ 0.0`
+    that merges the zeros also treats a subnormal as the sort's comparison does under the
+    thread's DAZ setting. Anything that is not float32, or longer than 2**32, takes the
+    argsort itself.
+    """
+    s = np.asarray(scores)
+    n = s.shape[0]
+    if s.dtype != np.float32 or s.ndim != 1 or n >= 2 ** 32:
+        return np.argsort(-s, kind="stable")
+    v = np.negative(s)
+    v += np.float32(0.0)
+    nan = np.isnan(v)
+    if nan.any():
+        v[nan] = np.float32(np.nan)
+    b = v.view(np.uint32)
+    sign = np.uint32(0x80000000)
+    key = np.where((b & sign) != 0, ~b, b | sign).astype(np.uint64)
+    key <<= np.uint64(32)
+    key |= np.arange(n, dtype=np.uint64)
+    key.sort()
+    key &= np.uint64(0xFFFFFFFF)
+    return key.astype(np.int64)
+
+
+def select_positives(scores, is_target, thr, max_frac=0.5):
+    """`(tda_q(scores, is_target) <= thr) & is_target`, from a top window when it is certified.
+
+    Returns the boolean mask, or None when the window cannot be certified (the caller then
+    runs the full `tda_q`). The accepted set of `tda_q` is the prefix of the stable
+    descending order up to the LAST position whose FDR `(cd+1)/max(ct,1)` is at or below
+    `thr` (q is a reverse running minimum), so only a prefix long enough to contain that
+    position needs sorting:
+      - the window is every row scoring at least the `need`-th best decoy score, with
+        `need = floor(thr * T) + 1` for T targets. All ties at the cut are included, so
+        the window is exactly a prefix of the full stable order, sorted here in that order;
+      - certificate: past the window every position has at least the window's cd decoys
+        and at most T targets, so its FDR is at least `(cd_W + 1) / T`. When that exceeds
+        `thr` (checked in the same float64 arithmetic; division is monotone), no later
+        position can be accepted and the window's own last accepted position is the
+        global one.
+    The counts, FDR values and comparison are those of `tda_q`, so the mask is identical.
+    NaN scores, too few decoys, a failed certificate or a window above `max_frac` of the
+    rows (where the full sort costs little more) return None.
+    """
+    s = np.asarray(scores)
+    tgt = np.asarray(is_target, dtype=bool)
+    n = s.shape[0]
+    n_t = int(np.count_nonzero(tgt))
+    n_d = n - n_t
+    if n == 0 or n_t == 0:
+        return None
+    need = int(thr * n_t) + 1
+    if need > n_d or np.isnan(s).any():
+        return None
+    dec = s[~tgt]
+    cut = np.partition(dec, n_d - need)[n_d - need]
+    del dec
+    win = np.flatnonzero(s >= cut)
+    if win.shape[0] > max_frac * n:
+        return None
+    order = win[desc_order(s[win])]
+    t = tgt[order]
+    ct = np.cumsum(t, dtype=np.int64)
+    cd = np.cumsum(~t, dtype=np.int64)
+    if not ((float(cd[-1]) + 1.0) / float(max(n_t, 1)) > thr):
+        return None
+    ok = (cd + 1) / np.maximum(ct, 1) <= thr
+    pos = np.zeros(n, dtype=bool)
+    if ok.any():
+        last = int(np.flatnonzero(ok)[-1])
+        head = order[:last + 1]
+        pos[head[t[:last + 1]]] = True
+    return pos
+
+
+def n_targets_at_windowed(scores, is_target, fdr):
+    """`n_targets_at`, from `select_positives` when its window is certified."""
+    pos = select_positives(scores, np.asarray(is_target) == 1, fdr)
+    if pos is None:
+        return n_targets_at(scores, is_target, fdr)
+    return int(np.count_nonzero(pos))
 
 
 def _count_at_fdr_sorted(t_sorted, fdr):
@@ -511,18 +927,71 @@ def n_targets_at_col(col, tgt, fdr, topk=0):
     return _count_at_fdr_sorted(tgt[order], fdr)[0]
 
 
-def n_targets_at_many(X, is_target, fdr, topk=0):
+# Rows of init sample per scan thread before another thread is worth starting: below this
+# a column's sort is a few milliseconds and the pool's start-up and GIL hand-offs dominate.
+_SCAN_ROWS_PER_THREAD = 20000
+
+# Transient bytes one scan task holds per sample row while it counts a column: the column
+# copy and its negation (float32), the int64 sort order, the sorted target mask and the
+# int64 cumulative counts. Measured 58 B/row with tracemalloc on a 1M-row column; rounded up.
+_SCAN_BYTES_PER_ROW = 64
+
+# Transient memory the concurrent scan tasks may hold together, beyond the sample itself.
+_SCAN_MEM_BYTES = 1 << 30
+
+
+def scan_workers(requested, rows, cols, rows_per_thread=None, mem_bytes=None):
+    """Threads for the init feature scan.
+
+    Capped by the column count, by the sample size (one thread per `rows_per_thread` rows,
+    default `_SCAN_ROWS_PER_THREAD`) and by memory: every task in flight holds about
+    `_SCAN_BYTES_PER_ROW` bytes per sample row, so at most `mem_bytes` (default
+    `_SCAN_MEM_BYTES`) of them together. The memory cap binds only when the init sample
+    escalates: at 4.8M rows, a step of the ladder on the 8.07M-row immunopeptidomics pool,
+    16 tasks would hold about 4.5 GB beside the 6.7 GB sample, where the serial scan held
+    0.3 GB; under the 1 GiB default that is 3 tasks. At the 300,000-row default sample the
+    cap is 55 tasks, so it does not bind. The thread count never changes the result.
+    """
+    rpt = _SCAN_ROWS_PER_THREAD if rows_per_thread is None else max(1, int(rows_per_thread))
+    budget = _SCAN_MEM_BYTES if mem_bytes is None else max(0, int(mem_bytes))
+    rows = int(rows)
+    by_mem = budget // max(1, rows * _SCAN_BYTES_PER_ROW)
+    return max(1, min(int(requested), int(cols), rows // rpt, by_mem))
+
+
+def n_targets_at_many(X, is_target, fdr, topk=0, workers=1, initializer=None):
     """Best (column, sign) by targets accepted at `fdr`, over every column of X.
 
     Ties resolve toward the lowest column index and sign +1, matching the original nested
     loop, which scanned j ascending with sign +1 before -1 and used a strict `>`.
+
+    With `workers > 1` the columns are counted on a thread pool (numpy's argsort, cumsum and
+    fancy indexing release the GIL), one task per column evaluating both signs from the same
+    column read. Every count is computed exactly as in the serial loop, and the winner is
+    then reduced over (j, sign) in the serial loop's order with the same strict `>`, so the
+    result does not depend on the thread count or on task completion order. `initializer`
+    runs once per pool thread; the worker passes its flush-to-zero setting there, because a
+    new thread does not inherit the main thread's floating-point control state on Windows.
     """
     tgt = np.asarray(is_target).astype(bool)
-    best_j, best_sign, best_n = 0, 1, -1
-    for j in range(X.shape[1]):
+
+    def both_signs(j):
         col = np.ascontiguousarray(X[:, j])
-        for sign in (1, -1):
-            c = n_targets_at_col(col if sign > 0 else -col, tgt, fdr, topk=topk)
+        return (n_targets_at_col(col, tgt, fdr, topk=topk),
+                n_targets_at_col(-col, tgt, fdr, topk=topk))
+
+    ncol = X.shape[1]
+    if workers > 1 and ncol > 1:
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=min(int(workers), ncol),
+                                initializer=initializer) as ex:
+            counts = list(ex.map(both_signs, range(ncol)))
+    else:
+        counts = [both_signs(j) for j in range(ncol)]
+    best_j, best_sign, best_n = 0, 1, -1
+    for j, pair in enumerate(counts):
+        for sign, c in zip((1, -1), pair):
             if c > best_n:
                 best_n, best_j, best_sign = c, j, sign
     return best_j, best_sign, best_n
@@ -610,11 +1079,633 @@ def auto_stream_threshold_gb(default_gb):
         return default_gb, f"default ({free_gb:.1f} GiB free is not enough to raise it)"
     return derived, f"{_FREE_MULTIPLIER:g}x the {free_gb:.1f} GiB free"
 
+# Whether this process flushes subnormals to zero; `_fp_thread_init` copies it to a thread.
+_FLUSH = {"on": False}
+
+
+def _fp_thread_init():
+    """Give a Python pool thread the main thread's flush-to-zero state.
+
+    FTZ/DAZ live in each thread's MXCSR, and a thread started on Windows begins with the
+    default state rather than inheriting its creator's. Numpy work on a pool thread must see
+    the same state as the serial code it replaces, or a subnormal operand could round or
+    compare differently there.
+    """
+    if _FLUSH["on"]:
+        import torch
+
+        torch.set_flush_denormal(True)
+
+
+class _TrainConfig:
+    """The training hyperparameters, as plain attributes (picklable for a child process)."""
+
+    def __init__(self, **kw):
+        self.__dict__.update(kw)
+
+
+def _keyed_rng(key):
+    """A numpy Generator seeded from a tuple of non-negative integers."""
+    return np.random.default_rng([int(k) % (2 ** 63) for k in key])
+
+
+def _build_trainer(torch, cfg, X, stream, y, fold, feat_cols, keyed_shuffle=False):
+    """The per-fold trainer over the standardised matrix `X`; returns `run_fold(seed, f)`.
+
+    Built by the serial path in `main` and by each `MUMDIA_NN_PARALLEL` child process from
+    the same `cfg`, so both run the same code. `X` is the in-memory matrix or a memmap;
+    `stream` selects the accessors the streaming backend uses.
+    """
+    nn = torch.nn
+    TRAIN_SUB = cfg.TRAIN_SUB
+    WARM = cfg.WARM
+    WARM_EPOCHS = cfg.WARM_EPOCHS
+    NEG_RATIO = cfg.NEG_RATIO
+    NEG_SELECT = cfg.NEG_SELECT
+    MARGIN_FRAC = cfg.MARGIN_FRAC
+    ITERS = cfg.ITERS
+    EPOCHS = cfg.EPOCHS
+    HIDDEN = cfg.HIDDEN
+    DROPOUT = cfg.DROPOUT
+    LR = cfg.LR
+    WD = cfg.WD
+    BATCH = cfg.BATCH
+    TRAIN_FDR = cfg.TRAIN_FDR
+    INIT_FDR_MAX = cfg.INIT_FDR_MAX
+    EARLY_STOP = cfg.EARLY_STOP
+    EARLY_STOP_TOL = cfg.EARLY_STOP_TOL
+    PREGATHER_GB = cfg.PREGATHER_GB
+    CLAMP_TINY = cfg.CLAMP_TINY
+    FINAL_POOL_SCORE = cfg.FINAL_POOL_SCORE
+    SELECT = cfg.SELECT
+    GATHER = cfg.GATHER
+    DEVICE = cfg.DEVICE
+    DEBUG_DENORMALS = cfg.DEBUG_DENORMALS
+    SCAN_THREADS = cfg.SCAN_THREADS
+    SCAN_ROWS_PER_THREAD = cfg.SCAN_ROWS_PER_THREAD
+    SCAN_MEM_BYTES = cfg.SCAN_MEM_BYTES
+    init_sample_limit = cfg.INIT_SAMPLE
+    KEYED_SHUFFLE = bool(keyed_shuffle)
+    nf = len(feat_cols)
+    if stream:
+        get = lambda idx: np.ascontiguousarray(X[idx])
+        get_col = lambda idx, j: np.asarray(X[idx, j])
+    else:
+        get = lambda idx: X[idx]
+        get_col = lambda idx, j: np.asarray(X[idx, j])
+    # A torch view of the in-memory matrix (shared memory, no copy) for `score_idx`. A
+    # read-only memmap (a parallel child's) makes torch warn that writes would be
+    # undefined; nothing here writes to it.
+    if not stream and GATHER == "torch":
+        import warnings
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            X_t = torch.from_numpy(X)
+    else:
+        X_t = None
+    _score_buf = [None]
+
+    class MLP(nn.Module):
+        def __init__(self, d_in, hidden, p):
+            super().__init__()
+            layers, d = [], d_in
+            for h in hidden:
+                layers += [nn.Linear(d, h), nn.BatchNorm1d(h), nn.ReLU(), nn.Dropout(p)]
+                d = h
+            layers += [nn.Linear(d, 1)]
+            self.net = nn.Sequential(*layers)
+
+        def forward(self, x):
+            return self.net(x).squeeze(-1)
+
+    def train_model(train_idx, pos_weight, seed, warm=None, epochs=None, shuffle_key=None):
+        """Minibatch train the MLP on `train_idx`.
+
+        The training row set is FIXED for all EPOCHS, so its features are gathered ONCE
+        into a contiguous tensor and each minibatch is then a cheap index into that
+        tensor. The previous code fancy-indexed the full feature matrix
+        (`Xs[idx]` / `mm[idx]`) once per minibatch, which measured ~25% of total runtime
+        at production scale. Falls back to the per-batch path when the gathered block
+        would exceed MUMDIA_NN_PREGATHER_GB, so the streaming backend keeps its low-RAM
+        guarantee on very large pools.
+        """
+        torch.manual_seed(seed)
+        if warm is None:
+            m = MLP(nf, HIDDEN, DROPOUT).to(DEVICE)
+            opt = torch.optim.Adam(m.parameters(), lr=LR, weight_decay=WD)
+        else:
+            # Warm start: carry both the weights AND the Adam moments forward. Keeping the
+            # optimiser matters - a fresh Adam would re-enter its bias-correction warmup
+            # every iteration and undo much of the benefit.
+            m, opt = warm
+        n_ep = EPOCHS if epochs is None else max(1, int(epochs))
+        lossf = nn.BCEWithLogitsLoss(pos_weight=torch.tensor(pos_weight, device=DEVICE))
+        idx = np.asarray(train_idx)
+        ntr = len(idx)
+        pregather = (ntr * nf * 4) <= PREGATHER_GB * 1024 ** 3
+        if pregather:
+            Xt = torch.from_numpy(np.ascontiguousarray(get(idx))).to(DEVICE)
+            yt = torch.from_numpy(np.ascontiguousarray(y[idx])).to(DEVICE)
+        for ep_i in range(n_ep):
+            m.train()
+            # numpy RNG drives the shuffle in both paths, so the training trajectory
+            # stays tied to the existing np.random.seed(seed) stream. Under
+            # MUMDIA_NN_PARALLEL the stream is keyed per (seed, fold, iteration, epoch)
+            # instead, so a fold's trajectory does not depend on the folds before it.
+            if shuffle_key is None:
+                order = np.random.permutation(ntr)
+            else:
+                order = _keyed_rng(shuffle_key + (ep_i,)).permutation(ntr)
+            # A trailing minibatch of exactly one row makes BatchNorm1d raise "Expected more
+            # than 1 value per channel when training" (it cannot compute a batch variance
+            # from one sample). ntr changes with the selected positive set every iteration, so
+            # this is otherwise a lurking crash that could land in the final experiment-wide
+            # rescore, after every run's compute has been spent. Drop that single row for this
+            # epoch; the permutation is reshuffled next epoch, so no row is systematically
+            # excluded from training.
+            n_use = ntr - 1 if (ntr % BATCH) == 1 and ntr > BATCH else ntr
+            if pregather:
+                perm_t = torch.from_numpy(order).to(DEVICE)
+                for i in range(0, n_use, BATCH):
+                    b = perm_t[i:i + BATCH]
+                    opt.zero_grad()
+                    lossf(m(Xt[b]), yt[b]).backward()
+                    opt.step()
+            else:
+                perm = idx[order]
+                for i in range(0, n_use, BATCH):
+                    b = perm[i:i + BATCH]
+                    Xb = torch.from_numpy(get(b)).to(DEVICE)
+                    yb = torch.from_numpy(y[b]).to(DEVICE)
+                    opt.zero_grad()
+                    lossf(m(Xb), yb).backward()
+                    opt.step()
+            _clamp_tiny(m, CLAMP_TINY, opt)
+        return m, opt
+
+    @torch.no_grad()
+    def score_idx(m, idx):
+        m.eval()
+        idx = np.asarray(idx)
+        out = np.empty(len(idx), np.float32)
+        step = BATCH * 4
+        if X_t is None:
+            for i in range(0, len(idx), step):
+                b = idx[i:i + step]
+                out[i:i + len(b)] = m(torch.from_numpy(get(b)).to(DEVICE)).cpu().numpy()
+            return out
+        # In-memory backend: gather each scoring batch with `torch.index_select` into one
+        # buffer that lives for the whole run. `Xs[b]` was a single-threaded numpy fancy
+        # index plus a fresh 25 MB allocation per batch (16,384 x 387 float32); the torch
+        # gather runs on the intra-op threads and writes the same values into the same
+        # shape. The buffer is allocated by numpy, as `Xs[b]` was, and wrapped without a
+        # copy, so the model's input keeps the old allocator's alignment rather than
+        # torch's 64-byte one: a BLAS kernel may pick its code path by input alignment.
+        # The streaming backend keeps the numpy path above, which reads the memmap.
+        idx_t = torch.from_numpy(np.ascontiguousarray(idx, dtype=np.int64))
+        buf = _score_buf[0]
+        if buf is None:
+            buf = _score_buf[0] = torch.from_numpy(np.empty((step, nf), np.float32))
+        for i in range(0, len(idx), step):
+            k = min(step, len(idx) - i)
+            xb = buf[:k]
+            torch.index_select(X_t, 0, idx_t[i:i + k], out=xb)
+            out[i:i + k] = m(xb.to(DEVICE)).cpu().numpy()
+        return out
+
+    def run_fold(seed, f):
+        """Train fold `f` under seed `seed`; return (held-out rows, their scores).
+
+        The fold body of the original per-seed loop, unchanged. Every fold's work is
+        self-contained except the epoch shuffle, which draws from the global numpy stream
+        (seeded once per seed by the caller) unless `KEYED_SHUFFLE` keys it per
+        (seed, fold, iteration, epoch).
+        """
+        tr_idx = np.where(fold != f)[0]
+        te_idx = np.where(fold == f)[0]
+        ytr = y[tr_idx]
+        tgt_tr = ytr == 1
+        if len(tr_idx) == 0 or len(te_idx) == 0:
+            raise RuntimeError(
+                f"fold {f} is empty in training or holdout; reduce MUMDIA_NN_FOLDS"
+            )
+        if not (np.any(ytr == 1) and np.any(ytr == 0)):
+            raise RuntimeError(
+                f"fold {f} training rows do not contain both targets and decoys"
+            )
+        # Select the initial feature and sign using this fold's training rows
+        # only. The old global selection inspected held-out labels and made
+        # the nominal OOF scores optimistic. For very large folds, sample
+        # evenly across the deterministic training order rather than taking
+        # only the file head.
+        _t = time.time()
+        sample_n = min(len(tr_idx), init_sample_limit)
+        while True:
+            if sample_n >= len(tr_idx):
+                sample_n, init_idx = len(tr_idx), tr_idx
+            else:
+                positions = np.linspace(0, len(tr_idx) - 1, sample_n, dtype=np.int64)
+                init_idx = tr_idx[positions]
+            Xsamp, ysamp = get(init_idx), y[init_idx]
+            # One column at a time, both signs from the SAME column read, vectorised
+            # over feature blocks (see n_targets_at_many): same counts and tie-breaking
+            # as the per-feature scan, ~387x fewer Python-level argsort calls.
+            scan_n = scan_workers(SCAN_THREADS, len(init_idx), Xsamp.shape[1],
+                                  SCAN_ROWS_PER_THREAD, SCAN_MEM_BYTES)
+            best_j, best_sign, best_n = n_targets_at_many(
+                Xsamp, ysamp, TRAIN_FDR, topk=env_i("MUMDIA_NN_INIT_TOPK", 0),
+                workers=scan_n, initializer=_fp_thread_init,
+            )
+            if best_n > 0 or sample_n >= len(tr_idx):
+                break
+            # Nothing passes on this sample. That is a property of the sample size
+            # relative to the pool's true fraction, not of the features: a pool that
+            # is overwhelmingly false (35M candidates screened, 8M PSMs accepted, a
+            # few thousand true) puts too few true rows into a fixed 300k sample for
+            # any column to accumulate 100 targets before its first decoy. Rescan on
+            # 4x the rows rather than rank the fold by an arbitrary column.
+            next_n = min(len(tr_idx), sample_n * 4)
+            print(f"  seed {seed} fold {f}: no feature reaches {TRAIN_FDR:.0%} on a "
+                  f"{sample_n}-row init sample; rescanning on {next_n} rows", flush=True)
+            del Xsamp, ysamp
+            sample_n = next_n
+        score_tr = (best_sign * get_col(tr_idx, best_j)).astype(np.float32)
+        _t = _tick("2_init_feature_scan", _t)
+        print(f"  seed {seed} fold {f}: init={feat_cols[best_j]} "
+              f"sign{best_sign:+d} ({best_n}@{TRAIN_FDR:.0%} "
+              f"on {sample_n} training rows, {scan_n} scan thread(s))", flush=True)
+        model = None
+        optim = None
+        prev_pos = None
+        used_iters = 0
+        score_tr_current = True
+        for it in range(ITERS):
+            _tsel = time.time()
+            pos = (select_positives(score_tr, tgt_tr, TRAIN_FDR)
+                   if SELECT == "window" else None)
+            if pos is not None and pos.any():
+                SELECT_COUNTS["window"] = SELECT_COUNTS.get("window", 0) + 1
+            else:
+                # The full sort: when the window is not certified, or selects nothing
+                # (the bootstrap ladder below needs every q-value).
+                SELECT_COUNTS["full"] = SELECT_COUNTS.get("full", 0) + 1
+                q = tda_q(score_tr, ytr)
+                pos = (q <= TRAIN_FDR) & (ytr == 1)
+            if model is None and not np.any(pos) and INIT_FDR_MAX > 0:
+                # Bootstrap only. The init feature ranks the whole fold here, and on a
+                # pool that is overwhelmingly false no single column may reach the
+                # training FDR although the model trained on a looser first selection
+                # will. Loosen this one selection in steps up to INIT_FDR_MAX; the next
+                # iteration re-selects at TRAIN_FDR on the model's scores as always.
+                for fdr in (0.02, 0.05, 0.1):
+                    if fdr > INIT_FDR_MAX + 1e-12:
+                        break
+                    pos = (q <= fdr) & (ytr == 1)
+                    if np.any(pos):
+                        print(f"  seed {seed} fold {f}: init feature has no target at "
+                              f"{TRAIN_FDR:.0%}; bootstrap positives selected at {fdr:.0%} "
+                              f"({int(pos.sum())} rows), later iterations use {TRAIN_FDR:.0%}",
+                              flush=True)
+                        break
+            neg = ytr == 0
+            if not np.any(pos):
+                raise RuntimeError(
+                    f"fold {f} selected no positive targets at training FDR "
+                    f"{TRAIN_FDR}; use a larger PSM pool or review the feature contract"
+                )
+            # Convergence on the selected positive set (Percolator's criterion). Exact
+            # equality is too strict to ever trigger in practice: dropout plus the
+            # retrained-from-scratch model perturbs scores enough that a handful of
+            # borderline PSMs flip every iteration forever (measured: it never fired
+            # on a 40k pool over 10 iterations). So stop when the CHURN - the symmetric
+            # difference as a fraction of the selected set - falls below a tolerance,
+            # i.e. the training set has stabilised to within noise.
+            # MUMDIA_NN_EARLY_STOP_TOL=0 restores exact-equality; EARLY_STOP=0 disables.
+            if model is not None and prev_pos is not None:
+                churn = int(np.count_nonzero(pos != prev_pos))
+                frac = churn / max(1, int(pos.sum()))
+                print(f"  seed {seed} fold {f}: iter {used_iters} positive-set churn "
+                      f"{churn} ({frac:.3%} of {int(pos.sum())})", flush=True)
+                if EARLY_STOP and frac <= EARLY_STOP_TOL:
+                    print(f"  seed {seed} fold {f}: converged after {used_iters} "
+                          f"iteration(s) (churn {frac:.3%} <= tol "
+                          f"{EARLY_STOP_TOL:.3%}); skipping "
+                          f"{ITERS - used_iters} remaining", flush=True)
+                    _detail("selection", time.time() - _tsel)
+                    break
+            prev_pos = pos
+            sel = tr_idx[pos | neg]
+            sel_pos, sel_neg = int(pos.sum()), int(neg.sum())
+            pos_i = tr_idx[pos]
+            neg_i = tr_idx[neg]
+            if NEG_RATIO > 0 and len(neg_i) > NEG_RATIO * len(pos_i):
+                # Cap negatives at NEG_RATIO x the positives selected THIS iteration.
+                # Training on every decoy in the fold is ~15-19:1 in practice, so most
+                # gradient steps are spent on negatives. `pos_weight` below is recomputed
+                # from the capped set, so the loss stays balanced for what is actually
+                # trained on.
+                #
+                # This does NOT touch the FDR: decoys are thinned for TRAINING only, while
+                # scoring, target/decoy competition and q-values still use the full pool.
+                # It can move the learned boundary, hence a knob rather than a default.
+                #
+                # NEG_SELECT decides WHICH decoys survive. `random` keeps the shape of the
+                # decoy distribution. `margin` keeps the highest-scoring ones, i.e. the
+                # only part of that distribution still competing with accepted targets,
+                # at the cost of never showing the model the easy bulk. `hybrid` splits
+                # the budget between the two.
+                keep_n = max(1, int(round(NEG_RATIO * len(pos_i))))
+                rs_n = np.random.RandomState(
+                    (int(seed) * 7919 + int(f) * 104729 + used_iters * 31) % (2 ** 32)
+                )
+                if NEG_SELECT == "random":
+                    neg_i = rs_n.choice(neg_i, size=min(keep_n, len(neg_i)), replace=False)
+                else:
+                    s_neg = score_tr[neg]
+                    order = (desc_order(s_neg) if SELECT == "window"
+                             else np.argsort(-s_neg, kind="stable"))
+                    if NEG_SELECT == "margin":
+                        take = order[:keep_n]
+                    else:
+                        k_hard = max(1, int(round(MARGIN_FRAC * keep_n)))
+                        hard, rest = order[:k_hard], order[k_hard:]
+                        k_rand = min(max(0, keep_n - k_hard), len(rest))
+                        rand = (
+                            rs_n.choice(rest, size=k_rand, replace=False)
+                            if k_rand
+                            else np.empty(0, np.int64)
+                        )
+                        take = np.concatenate([hard, rand]).astype(np.int64)
+                    neg_i = neg_i[np.sort(take)]
+                sel = np.sort(np.concatenate([pos_i, neg_i]))
+                sel_pos, sel_neg = len(pos_i), len(neg_i)
+                print(
+                    "  seed %s fold %s: negative cap %.2fx (%s) -> %d neg for %d pos"
+                    % (seed, f, NEG_RATIO, NEG_SELECT, sel_neg, sel_pos),
+                    flush=True,
+                )
+            if TRAIN_SUB > 0:
+                # Stratified subsample of the training rows for THIS iteration.
+                # Positives and negatives are thinned by the same factor, so the class
+                # balance -- and therefore pos_weight below -- is unchanged and only the
+                # number of gradient steps falls. Seeded per (seed, fold, iteration) so a
+                # rerun reproduces. Positive SELECTION still runs over the FULL fold, so
+                # this trades gradient steps for wall time without narrowing what can be
+                # discovered.
+                # thin whatever survived the negative cap above
+                frac = (
+                    TRAIN_SUB
+                    if TRAIN_SUB <= 1.0
+                    else min(1.0, TRAIN_SUB / max(1, len(sel)))
+                )
+                rs = np.random.RandomState(
+                    (int(seed) * 1000003 + int(f) * 1009 + used_iters) % (2 ** 32)
+                )
+                kp = max(1, int(round(len(pos_i) * frac)))
+                kn = max(1, int(round(len(neg_i) * frac)))
+                pos_i = rs.choice(pos_i, size=min(kp, len(pos_i)), replace=False)
+                neg_i = rs.choice(neg_i, size=min(kn, len(neg_i)), replace=False)
+                sel = np.sort(np.concatenate([pos_i, neg_i]))
+                sel_pos, sel_neg = len(pos_i), len(neg_i)
+                print(
+                    "  seed %s fold %s: train subsample frac=%.4f -> %d rows "
+                    "(%d pos / %d neg)"
+                    % (seed, f, frac, len(sel), sel_pos, sel_neg),
+                    flush=True,
+                )
+            pw = float(sel_neg) / max(1.0, float(sel_pos))
+            _detail("selection", time.time() - _tsel)
+            _t = time.time()
+            # Warm start reuses the previous iteration's weights and Adam state, so a
+            # later iteration only adapts to the changed positive set. WARM_EPOCHS (when
+            # set) applies from the SECOND iteration on: the first still needs a full
+            # run to get off random initialisation.
+            warm_in = (model, optim) if (WARM and model is not None) else None
+            ep = None
+            if WARM and model is not None and WARM_EPOCHS > 0:
+                ep = WARM_EPOCHS
+            model, optim = train_model(
+                sel, pw, seed, warm=warm_in, epochs=ep,
+                shuffle_key=(seed, f, used_iters) if KEYED_SHUFFLE else None,
+            )
+            _t = _tick("3_train", _t)
+            if DEBUG_DENORMALS:
+                model.eval()
+                _xb = torch.from_numpy(get(tr_idx[:BATCH * 4])).to(DEVICE)
+                print(
+                    "  seed %d fold %d: subnormals params=%d buffers=%d activations=%d "
+                    "adam_moments=%d" % ((seed, f) + _denormal_census(model, _xb, optim)),
+                    flush=True,
+                )
+            if it == ITERS - 1 and not FINAL_POOL_SCORE:
+                # The last round's pool scores would feed nothing but the log line
+                # below: there is no next selection to make from them. Skipping the
+                # pass leaves every score untouched (it neither trains nor draws from an
+                # RNG), and saves one full training-pool forward pass per fold.
+                score_tr_current = False
+            else:
+                score_tr = score_idx(model, tr_idx)
+                _t = _tick("4_score_pool_per_iter", _t)
+            used_iters += 1
+        _t = time.time()
+        te_scores = score_idx(model, te_idx)
+        _t = _tick("5_score_holdout", _t)
+        if score_tr_current:
+            print(f"  seed {seed} fold {f}: train targets@{TRAIN_FDR:.0%} = "
+                  f"{n_targets_at(score_tr, ytr, TRAIN_FDR)}", flush=True)
+        else:
+            print(f"  seed {seed} fold {f}: held-out targets@{TRAIN_FDR:.0%} = "
+                  f"{n_targets_at_windowed(te_scores, y[te_idx], TRAIN_FDR)}",
+                  flush=True)
+        return te_idx, te_scores
+    return run_fold
+
+
+# Files this run created and removes on exit: the memmap and the parallel side arrays.
+_LEFTOVERS = []
+
+
+def _remove_leftovers():
+    """Delete `_LEFTOVERS` that are no longer mapped; keep the rest for a later retry."""
+    import gc
+
+    gc.collect()
+    for path in list(_LEFTOVERS):
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+            _LEFTOVERS.remove(path)
+        except OSError:
+            pass
+
+
+# Per-task phases and sub-timers reported by MUMDIA_NN_PARALLEL children, summed. They are
+# process seconds that overlap in wall time, so they are printed apart from PHASE.
+CHILD_PHASE = {}
+CHILD_DETAIL = {}
+
+# State of a MUMDIA_NN_PARALLEL child process, set once by `_parallel_child_init`.
+_CHILD = {}
+
+
+def _exit_with_parent(parent):
+    """Stop this child when the parent worker dies, instead of training for nobody.
+
+    The engine kills the worker it spawned on error or interrupt (`ChildGuard`), but not the
+    worker's own children; without this they would finish their current fold first.
+    """
+    parent.join()
+    os._exit(3)
+
+
+def _parallel_child_init(spec):
+    """Initialise one fold-training child: threads, flush-to-zero, the shared matrix."""
+    import multiprocessing
+
+    import torch
+
+    if spec["threads"] > 0:
+        torch.set_num_threads(int(spec["threads"]))
+    _FLUSH["on"] = bool(spec["flush"])
+    if spec["flush"]:
+        torch.set_flush_denormal(True)
+    # Read-only and shared: every child maps the same file, so the page cache holds one copy
+    # of the matrix however many children read it.
+    X = np.memmap(spec["mm_path"], dtype=np.float32, mode="r",
+                  shape=(int(spec["n"]), int(spec["nf"])))
+    y = np.load(spec["y_path"])
+    fold = np.load(spec["fold_path"])
+    cfg = spec["cfg"]
+    # The init scan's thread pool shares this process's budget; its result does not depend
+    # on the thread count.
+    cfg.SCAN_THREADS = max(1, min(int(cfg.SCAN_THREADS), int(spec["threads"])))
+    _CHILD["run_fold"] = _build_trainer(torch, cfg, X, spec["stream"], y, fold,
+                                        spec["feat_cols"], keyed_shuffle=True)
+    parent = multiprocessing.parent_process()
+    if parent is not None:
+        threading.Thread(target=_exit_with_parent, args=(parent,), daemon=True).start()
+
+
+def _parallel_child_task(seed, f):
+    """Train one (seed, fold) in a child; return its held-out scores, timers and log text."""
+    import contextlib
+    import io
+
+    PHASE.clear()
+    DETAIL.clear()
+    SELECT_COUNTS.clear()
+    log = io.StringIO()
+    t0 = time.time()
+    try:
+        with contextlib.redirect_stdout(log):
+            _te_idx, te_scores = _CHILD["run_fold"](seed, f)
+    except Exception as exc:
+        # Only the exception crosses the process boundary, so carry the task's log in it:
+        # the init feature, rescan, bootstrap and churn lines are what explain a failed
+        # fold, and the serial path prints them before its traceback.
+        text = log.getvalue().rstrip()
+        raise RuntimeError(
+            "seed %s fold %s failed in child %d: %s: %s%s"
+            % (seed, f, os.getpid(), type(exc).__name__, exc,
+               "\n--- log of that task ---\n" + text if text else "")
+        ) from exc
+    return (seed, f, te_scores, dict(PHASE), dict(DETAIL), dict(SELECT_COUNTS),
+            log.getvalue(), time.time() - t0, os.getpid())
+
+
+def _run_parallel(spec, seeds, folds, workers, fold):
+    """Train every (seed, fold) in `workers` spawned processes; return {(seed, fold): scores}.
+
+    Tasks are independent under the keyed shuffle, so which process runs which task, and in
+    what order, cannot change a score. Each child's log is printed in one block when its task
+    ends; the results are assembled afterwards in (seed, fold) order.
+    """
+    import multiprocessing
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+
+    tasks = [(sd, f) for sd in seeds for f in range(folds)]
+    ctx = multiprocessing.get_context("spawn")
+    ex = ProcessPoolExecutor(max_workers=workers, mp_context=ctx,
+                             initializer=_parallel_child_init, initargs=(spec,))
+    results = {}
+    futs = []
+    try:
+        futs = [ex.submit(_parallel_child_task, sd, f) for sd, f in tasks]
+        for fu in as_completed(futs):
+            sd, f, scores, ph, de, sc, log, wall, pid = fu.result()
+            want = int(np.count_nonzero(fold == f))
+            if len(scores) != want:
+                raise RuntimeError(
+                    f"parallel task seed {sd} fold {f} returned {len(scores)} scores for "
+                    f"{want} held-out rows")
+            results[(sd, f)] = scores
+            for k, v in ph.items():
+                CHILD_PHASE[k] = CHILD_PHASE.get(k, 0.0) + v
+            for k, v in de.items():
+                CHILD_DETAIL[k] = CHILD_DETAIL.get(k, 0.0) + v
+            for k, v in sc.items():
+                SELECT_COUNTS[k] = SELECT_COUNTS.get(k, 0) + v
+            sys.stdout.write(log)
+            print(f"  seed {sd} fold {f}: trained in child {pid} ({wall:.1f} s)", flush=True)
+    except BaseException:
+        for fu in futs:
+            fu.cancel()
+        for proc in list(getattr(ex, "_processes", {}).values()):
+            try:
+                proc.terminate()
+            except Exception:  # noqa: BLE001 - best effort on the way out
+                pass
+        raise
+    finally:
+        ex.shutdown(wait=True, cancel_futures=True)
+    return results
+
+
+def _train_in_processes(cfg, X, mm_path, out_path, stream, y, fold, feat_cols, seeds, folds,
+                        parallel, side_paths, flush, torch):
+    """MUMDIA_NN_PARALLEL: write the per-row arrays next to the memmap and run the tasks."""
+    if not isinstance(X, np.memmap) or not mm_path:
+        raise RuntimeError("MUMDIA_NN_PARALLEL needs the matrix in a memmap file")
+    X.flush()
+    n_rows, n_cols = int(X.shape[0]), int(X.shape[1])
+    del X
+    base = os.path.abspath(out_path)
+    y_path, fold_path = base + ".par.y.npy", base + ".par.fold.npy"
+    side_paths += [y_path, fold_path]
+    np.save(y_path, y)
+    np.save(fold_path, fold)
+    raw = os.environ.get("MUMDIA_NN_PARALLEL_THREADS", "").strip()
+    threads = max(1, int(float(raw))) if raw else max(1, torch.get_num_threads())
+    n_tasks = len(seeds) * folds
+    workers = max(1, min(int(parallel), n_tasks))
+    print(
+        "nn_rescore_worker: parallel training: %d process(es) x %d torch thread(s) for "
+        "%d task(s) (%d seed(s) x %d fold(s)); the epoch shuffle is keyed per (seed, fold, "
+        "iteration, epoch), so the scores differ from the serial default as a seed change "
+        "would, and do not depend on the process count" % (workers, threads, n_tasks,
+                                                           len(seeds), folds),
+        flush=True,
+    )
+    cpus = os.cpu_count() or 0
+    if cpus and workers * threads > cpus:
+        print(
+            "nn_rescore_worker: %d processes x %d threads oversubscribe the %d visible CPUs; "
+            "lower MUMDIA_NN_PARALLEL_THREADS" % (workers, threads, cpus),
+            flush=True,
+        )
+    spec = {
+        "cfg": cfg, "mm_path": mm_path, "n": n_rows, "nf": n_cols,
+        "stream": bool(stream), "y_path": y_path, "fold_path": fold_path,
+        "feat_cols": list(feat_cols), "threads": threads, "flush": bool(flush),
+    }
+    return _run_parallel(spec, seeds, folds, workers, fold)
+
+
 def main():
     pin_path, out_path = sys.argv[1], sys.argv[2]
 
     import torch
-    import torch.nn as nn
 
     FOLDS = env_i("MUMDIA_NN_FOLDS", 3)
     TRAIN_SUB = env_f("MUMDIA_NN_TRAIN_SUB", 0.0)
@@ -643,6 +1734,16 @@ def main():
     EARLY_STOP_TOL = env_f("MUMDIA_NN_EARLY_STOP_TOL", 0.01)
     PREGATHER_GB = env_f("MUMDIA_NN_PREGATHER_GB", 8)
     CLAMP_TINY = env_f("MUMDIA_NN_CLAMP_TINY", 1e-20)
+    FINAL_POOL_SCORE = env_i("MUMDIA_NN_FINAL_POOL_SCORE", 0) != 0
+    # Opt-in: train the (seed, fold) tasks in this many spawned processes at once, with the
+    # epoch shuffle keyed per task. 0 (default) is the serial loop and today's scores.
+    PARALLEL = max(0, env_i("MUMDIA_NN_PARALLEL", 0))
+    SELECT = os.environ.get("MUMDIA_NN_SELECT", "window").strip().lower()
+    if SELECT not in ("window", "full"):
+        raise ValueError("MUMDIA_NN_SELECT must be window or full (got %r)" % SELECT)
+    GATHER = os.environ.get("MUMDIA_NN_GATHER", "torch").strip().lower()
+    if GATHER not in ("torch", "numpy"):
+        raise ValueError("MUMDIA_NN_GATHER must be torch or numpy (got %r)" % GATHER)
     # auto (default) uses the GPU when torch can see one; cuda/cpu force it. Forcing is
     # what makes a device-only comparison possible: same environment, same package
     # versions, same data, only the device differs (CUDA_VISIBLE_DEVICES="" does NOT
@@ -713,6 +1814,34 @@ def main():
             flush=True,
         )
     DEBUG_DENORMALS = env_i("MUMDIA_NN_DEBUG_DENORMALS", 0) != 0
+
+    _FLUSH["on"] = FLUSH_DENORMAL
+
+    # The parquet in-memory load: threads that fill the matrix (0 = the original serial loop,
+    # with no read-ahead and no pre_buffer), a one-deep row-group read-ahead, and pre_buffer.
+    # auto is at most 8: each fill thread holds a 32,768-row float64 moment buffer (0.1 GB at
+    # 387 features), and the fill is memory-bound well before 8 threads.
+    _load_raw = os.environ.get("MUMDIA_NN_LOAD_THREADS", "auto").strip().lower()
+    LOAD_THREADS = (
+        min(8, torch.get_num_threads())
+        if _load_raw in ("", "auto")
+        else max(0, int(float(_load_raw)))
+    )
+    READ_AHEAD = env_i("MUMDIA_NN_READ_AHEAD", 1) != 0
+    PRE_BUFFER = env_i("MUMDIA_NN_PRE_BUFFER", 1) != 0
+    # Threads for the worker's own numpy thread pools (the init scan here). Defaults to the
+    # torch CPU thread count resolved above, which already carries the cap.
+    _scan_raw = os.environ.get("MUMDIA_NN_SCAN_THREADS", "auto").strip().lower()
+    SCAN_THREADS = (
+        min(torch.get_num_threads(), _THREAD_CAP)
+        if _scan_raw in ("", "auto")
+        else max(1, int(float(_scan_raw)))
+    )
+    # The two caps on those threads: sample rows per thread, and the transient memory the
+    # tasks in flight may hold together (see `scan_workers`). The defaults are those of
+    # `_SCAN_ROWS_PER_THREAD` and `_SCAN_MEM_BYTES`, written out for the config reference.
+    SCAN_ROWS_PER_THREAD = max(1, env_i("MUMDIA_NN_SCAN_ROWS_PER_THREAD", 20000))
+    SCAN_MEM_BYTES = int(env_f("MUMDIA_NN_SCAN_MEM_GB", 1.0) * 1024 ** 3)
 
     stream_env = os.environ.get("MUMDIA_NN_STREAM", "auto").lower()
     filesize = os.path.getsize(pin_path)
@@ -869,51 +1998,29 @@ def main():
             else:
                 fold = _folds(_tb.column("Peptide").to_pylist())
             del _tb
-            Xs = np.empty((n, nf), np.float32)
-            s1 = np.zeros(nf, np.float64)
-            s2 = np.zeros(nf, np.float64)
-            _pf = pq.ParquetFile(pin_path)
-            off = 0
-            _tbl = _b = None
-            # One row group at a time. `iter_batches` reads ahead and decodes groups in
-            # parallel, and its buffered batches grew into a second copy of the matrix:
-            # measured, the worker climbed to 11.2 GB while filling a 4.85 GB `Xs`, then
-            # fell to 6.3 GB the moment the loop ended. Reading a group, slicing it into
-            # CHUNK-row blocks and dropping it bounds the transient to one group, which the
-            # engine writes at 131,072 rows (200 MB at 387 features); a file with parquet's
-            # default 1,048,576-row groups still loads, at 1.6 GB per group.
-            for _rg in range(_pf.num_row_groups):
-                _tbl = _pf.read_row_group(_rg, columns=feat_cols)
-                for _s0 in range(0, _tbl.num_rows, CHUNK):
-                    _b = _tbl.slice(_s0, CHUNK)
-                    k = _b.num_rows
-                    blk = np.empty((k, nf), np.float32)
-                    for j in range(nf):
-                        blk[:, j] = _b.column(j).to_numpy(zero_copy_only=False)
-                    np.nan_to_num(blk, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
-                    Xs[off:off + k] = blk
-                    _accumulate_moments(blk, s1, s2)
-                    off += k
-                    del blk
-                del _tbl, _b
-                _tbl = _b = None
-            del _pf, _tbl, _b
-            if off != n:
-                raise RuntimeError(f"parquet row mismatch: metadata {n}, features {off}")
+            if PARALLEL > 0:
+                # The children map this file read-only instead of each copying the matrix.
+                mm_path = os.path.abspath(out_path + ".feat.mm")
+                _LEFTOVERS.append(mm_path)
+                Xs = np.memmap(mm_path, dtype=np.float32, mode="w+", shape=(n, nf))
+            else:
+                Xs = np.empty((n, nf), np.float32)
+            if LOAD_THREADS == 0:
+                s1, s2 = _fill_parquet_matrix_legacy(pin_path, feat_cols, n, CHUNK, Xs)
+            else:
+                s1, s2 = fill_parquet_matrix(
+                    pin_path, feat_cols, n, CHUNK, Xs, threads=LOAD_THREADS,
+                    read_ahead=READ_AHEAD, pre_buffer=PRE_BUFFER,
+                    initializer=_fp_thread_init,
+                )
             # The decoded Arrow buffers are garbage now; hand them back before training
             # starts, or they stay in RSS for the whole run.
             _release_allocator_slack()
-            mean = (s1 / n).astype(np.float32)
-            std = np.sqrt(np.maximum(s2 / n - (s1 / n) ** 2, 1e-12)).astype(np.float32)
-            std[std == 0] = 1.0
-            # In place on each chunk: `(Xs[i:j] - mean) / std` made two chunk-sized copies.
-            for i in range(0, n, CHUNK):
-                view = Xs[i:i + CHUNK]
-                np.subtract(view, mean, out=view)
-                np.divide(view, std, out=view)
-                np.clip(view, -8, 8, out=view)
-            get = lambda idx: Xs[idx]
-            get_col = lambda idx, j: np.asarray(Xs[idx, j])
+            _ts = time.time()
+            mean, std = moments_to_mean_std(s1, s2, n)
+            standardise_matrix(Xs, mean, std, CHUNK, threads=LOAD_THREADS,
+                               initializer=_fp_thread_init)
+            _detail("load: standardise", time.time() - _ts)
         else:
             pin = pd.read_csv(pin_path, sep=chr(9))
         if not IS_PQ:
@@ -940,8 +2047,13 @@ def main():
             Xs = np.clip((X - mean) / std, -8, 8).astype(np.float32)
             del X
             n = len(y)
-            get = lambda idx: Xs[idx]
-            get_col = lambda idx, j: np.asarray(Xs[idx, j])
+            if PARALLEL > 0:
+                mm_path = os.path.abspath(out_path + ".feat.mm")
+                _LEFTOVERS.append(mm_path)
+                _mm = np.memmap(mm_path, dtype=np.float32, mode="w+", shape=Xs.shape)
+                _mm[:] = Xs
+                Xs = _mm
+                del _mm
     else:
         # ---- streaming memmap backend (mean/std, one text pass) ----
         if IS_PQ:
@@ -953,6 +2065,7 @@ def main():
         # rescore launched from a different directory failed with a bare
         # `OSError: [Errno 22]` naming a path it could not create.
         mm_path = os.path.abspath(out_path + ".feat.mm")
+        _LEFTOVERS.append(mm_path)
         mm = np.memmap(mm_path, dtype=np.float32, mode="w+", shape=(n, nf))
         y = np.empty(n, np.float32)
         cids = np.empty(n, np.int64)
@@ -989,337 +2102,93 @@ def main():
         for i in range(0, n, CHUNK):
             mm[i:i + CHUNK] = np.clip((mm[i:i + CHUNK] - mean) / std, -8, 8)
         mm.flush()
-        get = lambda idx: np.ascontiguousarray(mm[idx])
-        get_col = lambda idx, j: np.asarray(mm[idx, j])
     _t = _tick("1_pin_read_standardise", _t)
     init_sample_limit = env_i("MUMDIA_NN_INIT_SAMPLE", 300000)
     print(f"nn_rescore_worker: device={DEVICE} backend={'stream' if stream else 'in-memory'} "
           f"pool={n} feats={nf}", flush=True)
 
-    class MLP(nn.Module):
-        def __init__(self, d_in, hidden, p):
-            super().__init__()
-            layers, d = [], d_in
-            for h in hidden:
-                layers += [nn.Linear(d, h), nn.BatchNorm1d(h), nn.ReLU(), nn.Dropout(p)]
-                d = h
-            layers += [nn.Linear(d, 1)]
-            self.net = nn.Sequential(*layers)
-
-        def forward(self, x):
-            return self.net(x).squeeze(-1)
-
-    def train_model(train_idx, pos_weight, seed, warm=None, epochs=None):
-        """Minibatch train the MLP on `train_idx`.
-
-        The training row set is FIXED for all EPOCHS, so its features are gathered ONCE
-        into a contiguous tensor and each minibatch is then a cheap index into that
-        tensor. The previous code fancy-indexed the full feature matrix
-        (`Xs[idx]` / `mm[idx]`) once per minibatch, which measured ~25% of total runtime
-        at production scale. Falls back to the per-batch path when the gathered block
-        would exceed MUMDIA_NN_PREGATHER_GB, so the streaming backend keeps its low-RAM
-        guarantee on very large pools.
-        """
-        torch.manual_seed(seed)
-        if warm is None:
-            m = MLP(nf, HIDDEN, DROPOUT).to(DEVICE)
-            opt = torch.optim.Adam(m.parameters(), lr=LR, weight_decay=WD)
+    cfg = _TrainConfig(
+        FOLDS=FOLDS, TRAIN_SUB=TRAIN_SUB, WARM=WARM, WARM_EPOCHS=WARM_EPOCHS,
+        NEG_RATIO=NEG_RATIO, NEG_SELECT=NEG_SELECT, MARGIN_FRAC=MARGIN_FRAC, ITERS=ITERS,
+        EPOCHS=EPOCHS, HIDDEN=HIDDEN, DROPOUT=DROPOUT, LR=LR, WD=WD, BATCH=BATCH,
+        TRAIN_FDR=TRAIN_FDR, INIT_FDR_MAX=INIT_FDR_MAX, EARLY_STOP=EARLY_STOP,
+        EARLY_STOP_TOL=EARLY_STOP_TOL, PREGATHER_GB=PREGATHER_GB, CLAMP_TINY=CLAMP_TINY,
+        FINAL_POOL_SCORE=FINAL_POOL_SCORE, SELECT=SELECT, GATHER=GATHER, DEVICE=DEVICE,
+        DEBUG_DENORMALS=DEBUG_DENORMALS, SCAN_THREADS=SCAN_THREADS,
+        SCAN_ROWS_PER_THREAD=SCAN_ROWS_PER_THREAD, SCAN_MEM_BYTES=SCAN_MEM_BYTES,
+        INIT_SAMPLE=init_sample_limit,
+    )
+    X = mm if stream else Xs
+    side_paths = _LEFTOVERS
+    run_fold = None
+    try:
+        seeds = list(range(BASE_SEED, BASE_SEED + N_SEEDS))
+        if PARALLEL > 0:
+            _t = time.time()
+            by_task = _train_in_processes(
+                cfg, X, mm_path, out_path, stream, y, fold, feat_cols, seeds, FOLDS,
+                PARALLEL, side_paths, FLUSH_DENORMAL, torch,
+            )
+            _t = _tick("6_parallel_folds_wall", _t)
         else:
-            # Warm start: carry both the weights AND the Adam moments forward. Keeping the
-            # optimiser matters - a fresh Adam would re-enter its bias-correction warmup
-            # every iteration and undo much of the benefit.
-            m, opt = warm
-        n_ep = EPOCHS if epochs is None else max(1, int(epochs))
-        lossf = nn.BCEWithLogitsLoss(pos_weight=torch.tensor(pos_weight, device=DEVICE))
-        idx = np.asarray(train_idx)
-        ntr = len(idx)
-        pregather = (ntr * nf * 4) <= PREGATHER_GB * 1024 ** 3
-        if pregather:
-            Xt = torch.from_numpy(np.ascontiguousarray(get(idx))).to(DEVICE)
-            yt = torch.from_numpy(np.ascontiguousarray(y[idx])).to(DEVICE)
-        for _ in range(n_ep):
-            m.train()
-            # numpy RNG drives the shuffle in both paths, so the training trajectory
-            # stays tied to the existing np.random.seed(seed) stream.
-            order = np.random.permutation(ntr)
-            # A trailing minibatch of exactly one row makes BatchNorm1d raise "Expected more
-            # than 1 value per channel when training" (it cannot compute a batch variance
-            # from one sample). ntr changes with the selected positive set every iteration, so
-            # this is otherwise a lurking crash that could land in the final experiment-wide
-            # rescore, after every run's compute has been spent. Drop that single row for this
-            # epoch; the permutation is reshuffled next epoch, so no row is systematically
-            # excluded from training.
-            n_use = ntr - 1 if (ntr % BATCH) == 1 and ntr > BATCH else ntr
-            if pregather:
-                perm_t = torch.from_numpy(order).to(DEVICE)
-                for i in range(0, n_use, BATCH):
-                    b = perm_t[i:i + BATCH]
-                    opt.zero_grad()
-                    lossf(m(Xt[b]), yt[b]).backward()
-                    opt.step()
+            run_fold = _build_trainer(torch, cfg, X, stream, y, fold, feat_cols)
+
+        # seed ensemble: average rank-normalised out-of-fold scores across seeds
+        acc = np.zeros(n, np.float64)
+        for s in seeds:
+            oof = np.zeros(n, np.float32)
+            if PARALLEL > 0:
+                for f in range(FOLDS):
+                    oof[np.where(fold == f)[0]] = by_task[(s, f)]
             else:
-                perm = idx[order]
-                for i in range(0, n_use, BATCH):
-                    b = perm[i:i + BATCH]
-                    Xb = torch.from_numpy(get(b)).to(DEVICE)
-                    yb = torch.from_numpy(y[b]).to(DEVICE)
-                    opt.zero_grad()
-                    lossf(m(Xb), yb).backward()
-                    opt.step()
-            _clamp_tiny(m, CLAMP_TINY, opt)
-        return m, opt
+                np.random.seed(s)
+                torch.manual_seed(s)
+                for f in range(FOLDS):
+                    te_idx, te_scores = run_fold(s, f)
+                    oof[te_idx] = te_scores
+            acc += pd.Series(oof).rank(method="average").to_numpy() / n
+        final = acc / N_SEEDS
 
-    @torch.no_grad()
-    def score_idx(m, idx):
-        m.eval()
-        idx = np.asarray(idx)
-        out = np.empty(len(idx), np.float32)
-        step = BATCH * 4
-        for i in range(0, len(idx), step):
-            b = idx[i:i + step]
-            out[i:i + len(b)] = m(torch.from_numpy(get(b)).to(DEVICE)).cpu().numpy()
-        return out
-
-    def one_pass(seed):
-        """One full CV pass -> out-of-fold scores for all PSMs."""
-        oof = np.zeros(n, np.float32)
-        for f in range(FOLDS):
-            tr_idx = np.where(fold != f)[0]
-            te_idx = np.where(fold == f)[0]
-            ytr = y[tr_idx]
-            if len(tr_idx) == 0 or len(te_idx) == 0:
-                raise RuntimeError(
-                    f"fold {f} is empty in training or holdout; reduce MUMDIA_NN_FOLDS"
-                )
-            if not (np.any(ytr == 1) and np.any(ytr == 0)):
-                raise RuntimeError(
-                    f"fold {f} training rows do not contain both targets and decoys"
-                )
-            # Select the initial feature and sign using this fold's training rows
-            # only. The old global selection inspected held-out labels and made
-            # the nominal OOF scores optimistic. For very large folds, sample
-            # evenly across the deterministic training order rather than taking
-            # only the file head.
-            _t = time.time()
-            sample_n = min(len(tr_idx), init_sample_limit)
-            while True:
-                if sample_n >= len(tr_idx):
-                    sample_n, init_idx = len(tr_idx), tr_idx
-                else:
-                    positions = np.linspace(0, len(tr_idx) - 1, sample_n, dtype=np.int64)
-                    init_idx = tr_idx[positions]
-                Xsamp, ysamp = get(init_idx), y[init_idx]
-                # One column at a time, both signs from the SAME column read, vectorised
-                # over feature blocks (see n_targets_at_many): same counts and tie-breaking
-                # as the per-feature scan, ~387x fewer Python-level argsort calls.
-                best_j, best_sign, best_n = n_targets_at_many(
-                    Xsamp, ysamp, TRAIN_FDR, topk=env_i("MUMDIA_NN_INIT_TOPK", 0)
-                )
-                if best_n > 0 or sample_n >= len(tr_idx):
-                    break
-                # Nothing passes on this sample. That is a property of the sample size
-                # relative to the pool's true fraction, not of the features: a pool that
-                # is overwhelmingly false (35M candidates screened, 8M PSMs accepted, a
-                # few thousand true) puts too few true rows into a fixed 300k sample for
-                # any column to accumulate 100 targets before its first decoy. Rescan on
-                # 4x the rows rather than rank the fold by an arbitrary column.
-                next_n = min(len(tr_idx), sample_n * 4)
-                print(f"  seed {seed} fold {f}: no feature reaches {TRAIN_FDR:.0%} on a "
-                      f"{sample_n}-row init sample; rescanning on {next_n} rows", flush=True)
-                del Xsamp, ysamp
-                sample_n = next_n
-            score_tr = (best_sign * get_col(tr_idx, best_j)).astype(np.float32)
-            _t = _tick("2_init_feature_scan", _t)
-            print(f"  seed {seed} fold {f}: init={feat_cols[best_j]} "
-                  f"sign{best_sign:+d} ({best_n}@{TRAIN_FDR:.0%} "
-                  f"on {sample_n} training rows)", flush=True)
-            model = None
-            optim = None
-            prev_pos = None
-            used_iters = 0
-            for _ in range(ITERS):
-                q = tda_q(score_tr, ytr)
-                pos = (q <= TRAIN_FDR) & (ytr == 1)
-                if model is None and not np.any(pos) and INIT_FDR_MAX > 0:
-                    # Bootstrap only. The init feature ranks the whole fold here, and on a
-                    # pool that is overwhelmingly false no single column may reach the
-                    # training FDR although the model trained on a looser first selection
-                    # will. Loosen this one selection in steps up to INIT_FDR_MAX; the next
-                    # iteration re-selects at TRAIN_FDR on the model's scores as always.
-                    for fdr in (0.02, 0.05, 0.1):
-                        if fdr > INIT_FDR_MAX + 1e-12:
-                            break
-                        pos = (q <= fdr) & (ytr == 1)
-                        if np.any(pos):
-                            print(f"  seed {seed} fold {f}: init feature has no target at "
-                                  f"{TRAIN_FDR:.0%}; bootstrap positives selected at {fdr:.0%} "
-                                  f"({int(pos.sum())} rows), later iterations use {TRAIN_FDR:.0%}",
-                                  flush=True)
-                            break
-                neg = ytr == 0
-                if not np.any(pos):
-                    raise RuntimeError(
-                        f"fold {f} selected no positive targets at training FDR "
-                        f"{TRAIN_FDR}; use a larger PSM pool or review the feature contract"
-                    )
-                # Convergence on the selected positive set (Percolator's criterion). Exact
-                # equality is too strict to ever trigger in practice: dropout plus the
-                # retrained-from-scratch model perturbs scores enough that a handful of
-                # borderline PSMs flip every iteration forever (measured: it never fired
-                # on a 40k pool over 10 iterations). So stop when the CHURN - the symmetric
-                # difference as a fraction of the selected set - falls below a tolerance,
-                # i.e. the training set has stabilised to within noise.
-                # MUMDIA_NN_EARLY_STOP_TOL=0 restores exact-equality; EARLY_STOP=0 disables.
-                if model is not None and prev_pos is not None:
-                    churn = int(np.count_nonzero(pos != prev_pos))
-                    frac = churn / max(1, int(pos.sum()))
-                    print(f"  seed {seed} fold {f}: iter {used_iters} positive-set churn "
-                          f"{churn} ({frac:.3%} of {int(pos.sum())})", flush=True)
-                    if EARLY_STOP and frac <= EARLY_STOP_TOL:
-                        print(f"  seed {seed} fold {f}: converged after {used_iters} "
-                              f"iteration(s) (churn {frac:.3%} <= tol "
-                              f"{EARLY_STOP_TOL:.3%}); skipping "
-                              f"{ITERS - used_iters} remaining", flush=True)
-                        break
-                prev_pos = pos
-                sel = tr_idx[pos | neg]
-                sel_pos, sel_neg = int(pos.sum()), int(neg.sum())
-                pos_i = tr_idx[pos]
-                neg_i = tr_idx[neg]
-                if NEG_RATIO > 0 and len(neg_i) > NEG_RATIO * len(pos_i):
-                    # Cap negatives at NEG_RATIO x the positives selected THIS iteration.
-                    # Training on every decoy in the fold is ~15-19:1 in practice, so most
-                    # gradient steps are spent on negatives. `pos_weight` below is recomputed
-                    # from the capped set, so the loss stays balanced for what is actually
-                    # trained on.
-                    #
-                    # This does NOT touch the FDR: decoys are thinned for TRAINING only, while
-                    # scoring, target/decoy competition and q-values still use the full pool.
-                    # It can move the learned boundary, hence a knob rather than a default.
-                    #
-                    # NEG_SELECT decides WHICH decoys survive. `random` keeps the shape of the
-                    # decoy distribution. `margin` keeps the highest-scoring ones, i.e. the
-                    # only part of that distribution still competing with accepted targets,
-                    # at the cost of never showing the model the easy bulk. `hybrid` splits
-                    # the budget between the two.
-                    keep_n = max(1, int(round(NEG_RATIO * len(pos_i))))
-                    rs_n = np.random.RandomState(
-                        (int(seed) * 7919 + int(f) * 104729 + used_iters * 31) % (2 ** 32)
-                    )
-                    if NEG_SELECT == "random":
-                        neg_i = rs_n.choice(neg_i, size=min(keep_n, len(neg_i)), replace=False)
-                    else:
-                        s_neg = score_tr[neg]
-                        order = np.argsort(-s_neg, kind="stable")
-                        if NEG_SELECT == "margin":
-                            take = order[:keep_n]
-                        else:
-                            k_hard = max(1, int(round(MARGIN_FRAC * keep_n)))
-                            hard, rest = order[:k_hard], order[k_hard:]
-                            k_rand = min(max(0, keep_n - k_hard), len(rest))
-                            rand = (
-                                rs_n.choice(rest, size=k_rand, replace=False)
-                                if k_rand
-                                else np.empty(0, np.int64)
-                            )
-                            take = np.concatenate([hard, rand]).astype(np.int64)
-                        neg_i = neg_i[np.sort(take)]
-                    sel = np.sort(np.concatenate([pos_i, neg_i]))
-                    sel_pos, sel_neg = len(pos_i), len(neg_i)
-                    print(
-                        "  seed %s fold %s: negative cap %.2fx (%s) -> %d neg for %d pos"
-                        % (seed, f, NEG_RATIO, NEG_SELECT, sel_neg, sel_pos),
-                        flush=True,
-                    )
-                if TRAIN_SUB > 0:
-                    # Stratified subsample of the training rows for THIS iteration.
-                    # Positives and negatives are thinned by the same factor, so the class
-                    # balance -- and therefore pos_weight below -- is unchanged and only the
-                    # number of gradient steps falls. Seeded per (seed, fold, iteration) so a
-                    # rerun reproduces. Positive SELECTION still runs over the FULL fold, so
-                    # this trades gradient steps for wall time without narrowing what can be
-                    # discovered.
-                    # thin whatever survived the negative cap above
-                    frac = (
-                        TRAIN_SUB
-                        if TRAIN_SUB <= 1.0
-                        else min(1.0, TRAIN_SUB / max(1, len(sel)))
-                    )
-                    rs = np.random.RandomState(
-                        (int(seed) * 1000003 + int(f) * 1009 + used_iters) % (2 ** 32)
-                    )
-                    kp = max(1, int(round(len(pos_i) * frac)))
-                    kn = max(1, int(round(len(neg_i) * frac)))
-                    pos_i = rs.choice(pos_i, size=min(kp, len(pos_i)), replace=False)
-                    neg_i = rs.choice(neg_i, size=min(kn, len(neg_i)), replace=False)
-                    sel = np.sort(np.concatenate([pos_i, neg_i]))
-                    sel_pos, sel_neg = len(pos_i), len(neg_i)
-                    print(
-                        "  seed %s fold %s: train subsample frac=%.4f -> %d rows "
-                        "(%d pos / %d neg)"
-                        % (seed, f, frac, len(sel), sel_pos, sel_neg),
-                        flush=True,
-                    )
-                pw = float(sel_neg) / max(1.0, float(sel_pos))
-                _t = time.time()
-                # Warm start reuses the previous iteration's weights and Adam state, so a
-                # later iteration only adapts to the changed positive set. WARM_EPOCHS (when
-                # set) applies from the SECOND iteration on: the first still needs a full
-                # run to get off random initialisation.
-                warm_in = (model, optim) if (WARM and model is not None) else None
-                ep = None
-                if WARM and model is not None and WARM_EPOCHS > 0:
-                    ep = WARM_EPOCHS
-                model, optim = train_model(sel, pw, seed, warm=warm_in, epochs=ep)
-                _t = _tick("3_train", _t)
-                if DEBUG_DENORMALS:
-                    model.eval()
-                    _xb = torch.from_numpy(get(tr_idx[:BATCH * 4])).to(DEVICE)
-                    print(
-                        "  seed %d fold %d: subnormals params=%d buffers=%d activations=%d "
-                        "adam_moments=%d" % ((seed, f) + _denormal_census(model, _xb, optim)),
-                        flush=True,
-                    )
-                score_tr = score_idx(model, tr_idx)
-                _t = _tick("4_score_pool_per_iter", _t)
-                used_iters += 1
-            _t = time.time()
-            oof[te_idx] = score_idx(model, te_idx)
-            _t = _tick("5_score_holdout", _t)
-            print(f"  seed {seed} fold {f}: train targets@{TRAIN_FDR:.0%} = "
-                  f"{n_targets_at(score_tr, ytr, TRAIN_FDR)}", flush=True)
-        return oof
-
-    # seed ensemble: average rank-normalised out-of-fold scores across seeds
-    acc = np.zeros(n, np.float64)
-    for s in range(BASE_SEED, BASE_SEED + N_SEEDS):
-        np.random.seed(s)
-        torch.manual_seed(s)
-        oof = one_pass(s)
-        acc += pd.Series(oof).rank(method="average").to_numpy() / n
-    final = acc / N_SEEDS
-
-    out = pa.table({
-        "candidate_id": pa.array(cids.astype(np.uint32), pa.uint32()),
-        "score": pa.array(final.astype(np.float64), pa.float64()),
-        "q_value": pa.array(np.zeros(n, np.float64), pa.float64()),
-    })
-    pq.write_table(out, out_path)
-    if mm_path and os.path.exists(mm_path):
-        try:
-            del mm
-            os.remove(mm_path)
-        except OSError:
-            pass
-    tot = sum(PHASE.values())
-    print("nn_rescore_worker: phase breakdown (wall seconds)", flush=True)
-    for k in sorted(PHASE):
-        v = PHASE[k]
-        print("    %-26s %8.1f s  %5.1f%%" % (k[2:], v, 100 * v / max(tot, 1e-9)), flush=True)
-    print("    %-26s %8.1f s" % ("MEASURED TOTAL", tot), flush=True)
+        out = pa.table({
+            "candidate_id": pa.array(cids.astype(np.uint32), pa.uint32()),
+            "score": pa.array(final.astype(np.float64), pa.float64()),
+            "q_value": pa.array(np.zeros(n, np.float64), pa.float64()),
+        })
+        pq.write_table(out, out_path)
+    finally:
+        # Drop every reference to the memmap (the trainer's torch view included) before
+        # removing its file: Windows refuses to delete a file that is still mapped. On an
+        # error the traceback still references it; `_entry` retries once that is released.
+        mm = Xs = X = run_fold = None
+        _remove_leftovers()
+    _print_timers()
     print(f"nn_rescore_worker: {n} PSMs rescored (targets+decoys), {N_SEEDS} seed(s), "
           f"OOF at {FOLDS} folds, backend={'stream' if stream else 'in-memory'}", flush=True)
 
 
+def _entry():
+    """Run `main`, then remove this run's files even when it failed.
+
+    The memmap and the parallel side arrays are useless once the worker exits. On an error
+    the in-flight traceback's frames still reference the matrix, and Windows refuses to
+    delete a mapped file, so the removal is retried here, outside the handler, after the
+    traceback has been printed and released. Exit codes and the printed traceback are those
+    of an uncaught exception.
+    """
+    code = None
+    try:
+        main()
+    except SystemExit as exc:
+        code = exc.code
+    except BaseException:  # noqa: BLE001 - reported below, then the worker exits nonzero
+        import traceback
+
+        traceback.print_exc()
+        code = 1
+    _remove_leftovers()
+    if code is not None:
+        sys.exit(code)
+
+
 if __name__ == "__main__":
-    main()
+    _entry()

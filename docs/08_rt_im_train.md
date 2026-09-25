@@ -640,30 +640,42 @@ last-write-wins in iteration order rather than best-score. The batch size
 auto-scales when `--batch 0`: `min(512, max(16, n_ref // 30))`, so each epoch runs
 at least about 30 gradient steps; a fixed large batch underfits small references
 (deeplc_finetune.py:132-135). `deeplc.finetune(ref_psms, train_kwargs=...)`
-transfer-learns the model (deeplc_finetune.py:137-146); predictions come from
-`deeplc.predict(batch, model=ft_model)` over the unique standard peptidoforms in
-chunks of 100_000 (deeplc_finetune.py:169-184). DeepLC's multitask models return a 2D
-array (one column per task head); `agg` reduces it to one iRT by averaging across
-heads (`a.mean(axis=1)`, deeplc_finetune.py:58-60, called at 175). Prediction is on
-the DECOY_-stripped underlying sequence so decoys land on the same iRT scale as
-targets (deeplc_finetune.py:45, 153-161). The rewritten column overwrites
-`predicted_irt` in place in the output parquet (deeplc_finetune.py:189-192);
-peptidoforms with no prediction, including non-standard ones, keep their original
-iRT (`preds.get(base_pf(pf), orig[i])`, deeplc_finetune.py:189).
+transfer-learns the model; predictions come from `deeplc.predict(batch,
+model=ft_model)` over the unique standard peptidoforms in chunks of 100_000
+(`PREDICT_CHUNK`). DeepLC's multitask models return a 2D array (one column per task
+head); `agg` reduces it to one iRT by averaging across heads (`a.mean(axis=1)`).
+Prediction is on the DECOY_-stripped underlying sequence (a prefix strip, as
+`base_pf`) so decoys land on the same iRT scale as targets. The unique set is built in
+Arrow (`library_bases`, `unique_standard_bases`: first-occurrence order, standard
+residues only), the seed reference reads only the five columns it uses, the base model
+is loaded once and passed to every call, and the rewrite is one Arrow `index_in` lookup
+(`rewrite_irt`); all four measured byte-identical to the per-row Python version on
+library and multi-head fixtures. The rewritten column overwrites `predicted_irt` in the
+output parquet; peptidoforms with no finite prediction, including non-standard ones,
+keep their original iRT and are counted in `<lib_out>.summary.json`.
 
 The worker also carries a documented OpenMP crash fix: numpy's OpenBLAS (GNU
 OpenMP) and torch's Intel OpenMP coexist only under `KMP_DUPLICATE_LIB_OK=TRUE`,
 and each spawns a full thread pool that oversubscribes the CPU during the
 sustained backward pass and crashes the machine, so the worker sets the OMP/BLAS
 thread caps to 1 before importing numpy and torch (deeplc_finetune.py:6-13, 22-28)
-and bounds torch's own pool to `DEEPLC_FT_THREADS` (default 8) after import
-(deeplc_finetune.py:100-105). `deeplc` is imported before numpy for OpenMP load
-order (deeplc_finetune.py:33). Beyond the four flags the engine passes, the worker
-accepts standalone-only flags the engine never sets, so they take their defaults:
-`--device {cpu,cuda}` (cuda sidesteps the CPU OpenMP crash entirely), `--threads`,
-`--predict-threads` (0 = reuse `--threads`; the prediction phase is forward-only
-and usually tolerates more threads than the fine-tune backward pass), `--max-ref`,
-`--predict-limit`, and `--skip-predict` (deeplc_finetune.py:68-79, 89-94).
+and bounds torch's own training pool to `DEEPLC_FT_THREADS` (default 8) after
+import. `deeplc` is imported before numpy for OpenMP load order. The engine passes
+`--predict-threads` with its rayon thread count, so the whole-library prediction after
+the fine-tune, which is forward-only, no longer runs on the 8 training threads. That
+changes the fine-tune path's output on every host with more than 8 physical cores,
+whether or not the thread cap binds: the prediction runs on another thread count, which
+is float-equivalent but not bit-identical to the previous 8-thread prediction (on a
+6,600-row fixture, 24 threads against 8 moved 36 rows in the last bit, at most 6.1e-5;
+docs/13, "DeepLC thread cap"), far inside the fine-tune's own draw variance.
+`DEEPLC_FT_THREADS` now bounds the training pool only; `--threads` or
+`MUMDIA_DEEPLC_THREAD_CAP` bounds the prediction. Both
+pools are capped at the physical cores available to the process
+(`MUMDIA_DEEPLC_THREAD_CAP`, 0 = no cap; docs/13, "DeepLC thread cap"), and the
+resolved numbers are recorded under `torch_threads` in `<lib_out>.summary.json`. The
+worker also accepts standalone-only flags the engine never sets, so they take their
+defaults: `--device {cpu,cuda}` (cuda sidesteps the CPU OpenMP crash entirely),
+`--threads`, `--max-ref`, `--predict-limit`, and `--skip-predict`.
 
 The fine-tune sets no torch/numpy seed, so it is nondeterministic across runs
 (CLAUDE.md notes this). Its main use is library-input mode, where the base iRT is
@@ -690,6 +702,53 @@ sensitivity workflow still specifies per-run fine-tuning, and that benchmark has
 not been rerun against a once-fine-tuned library. Until it is, treat the choice as
 open: per-run fine-tuning is the benchmarked default, once-per-library is the
 cheaper option with equal RT residuals on the one run measured here.
+
+#### Sharded whole-library prediction (`deeplc_predict_shards`, default 1)
+
+The whole-library prediction after the fit (the fine-tune, the multi-head calibration or
+none) can be split across processes with `rt_im_train.deeplc_predict_shards`. The premise
+is docs/32's: it attributes the per-process rate (about 6,000 sequences per second) to
+featurisation, which is single-threaded Python, so that past some thread count only more
+processes would make the prediction faster. The measurement below does not bear that out
+on the one CPU measured: there the forward pass dominated and scaled with threads.
+Sharding is expected to pay only where one process stops scaling with threads, which is
+unmeasured. The parent process fits once and writes the fitted calibration (pickled) or
+the fine-tuned model (`torch.save` of the module) into a scratch directory beside
+`<lib_out>`; each child
+(`deeplc_finetune.py --shard-worker <spec>`) reads it, loads the model once, predicts
+its contiguous slice of the unique sequences in the same 100,000-sequence calls one
+process would make, and saves its float64 predictions; the parent joins them in slice
+order and runs the one rewrite. No shard refits, because a refit from last-bit
+differences in the reference predictions could select another head at rank 80. `K` and
+the threads per child are a function of the thread budget and the library size only
+(`shard_plan`), a child that exits non-zero stops the others and fails the stage, and
+the scratch directory is removed either way (docs/13, "Sharded prediction", for a
+stopped run and a killed parent). `<lib_out>.summary.json` records the plan
+under `shards` (requested, used, threads per shard, and per shard its rows, threads,
+model load and prediction time). With the default of one process nothing changes.
+
+Measured on one desktop (i9-13900KS, 24 physical cores, other jobs running; DeepLC 4.5.0
+on the CPU; base-model prediction of 322,908 unique sequences from an 800,628-row
+synthetic library, calls of 25,000):
+
+| processes x threads | prediction | featurisation | forward pass |
+|---|---|---|---|
+| 1 x 8 | 53.5 s | 11.5 s | 40.3 s |
+| 4 x 2 | 52.7 s | 19.0 s (summed) | 136.2 s (summed) |
+| 7 x 1 | 101.4 s | 33.4 s (summed) | 567.2 s (summed) |
+| 1 x 2 | 310.0 s | 22.5 s | 283.7 s |
+| 1 x 1 | 587.7 s | 22.2 s | 561.8 s |
+
+4 x 2 and 7 x 1 wrote a `predicted_irt` column bit-identical to 1 x 2 and 1 x 1 over all
+800,628 rows; 4 x 2 against 1 x 8 differed on 6,507 rows by at most 4.6e-5. On this CPU
+the forward pass, not featurisation, dominates at eight threads or fewer and it scales
+with threads inside one process, so sharding a budget of 8 gained nothing (four processes
+of two threads are 5.9x faster than one process of two, which is the scaling the shards
+offer). The case sharding is meant for is the one doxy measured: one process got slower
+past the host's 64 physical cores (10:41 at 96 threads, 18:09 at 128). The hypothesis is
+that featurisation, 11.5 s of 53.5 here, becomes the bound once the forward pass is spread
+over many cores; it has not been measured. Whether sharding pays there is the doxy A/B
+that remains; the survey's arithmetic is 10:41 to 2.5-4.5 min at 8-12 shards.
 
 ## Key types and functions
 
@@ -742,6 +801,7 @@ though the enum variant still exists.
 | `adaptive_rt_bins` | `12` | Number of equal-width calibrated-RT bins for the adaptive window (rt_im_train.rs:202). |
 | `rt_window_min_s` | `1.0` | Lower clamp (seconds) for any adaptive half-window (rt_im_train.rs:210); mirrors the 1s floor on the global window. |
 | `library_irt` | `auto` | Library-input mode only. `auto` re-predicts the imported `predicted_irt` with the DeepLC base model when `predict_frag.deeplc_python` is set and keeps it, with a warning, when not; `deeplc` requires the interpreter (preflight); `library` keeps the imported values. Ignored under `finetune_deeplc` and in FASTA mode. Section 4c has the measurement. |
+| `deeplc_predict_shards` | `1` | Worker processes for the whole-library DeepLC prediction (multi-head calibration, base-model re-prediction, the prediction after a fine-tune; `deeplc_finetune.py --shards`). The fit happens once, in the parent process, and is handed to every child; each child predicts a slice of the unique sequences cut at a multiple of the 100,000-sequence call, and the slices are joined in order. `K` processes share the thread budget, `budget / K` threads each; `0` is one process per 8 threads, and a GPU always gets one. Bit-identical to one process at equal threads per process, float-equivalent at the same engine thread count. Off by default: on the one desktop measured, four processes of two threads were no faster than one of eight, and the survey's arithmetic for HYE (10:41 to 2.5-4.5 min) is unmeasured; it needs two acquisitions before a default. |
 | `window_holdout_frac` | `0.0` | Size `w_rt` from held-out anchor residuals instead of in-sample ones (section 4b). `base_peptide_id % 1000 < round(frac*1000)` selects the holdout; the same rule excludes those peptides from the orchestrated DeepLC fine-tune. Range `[0.0, 0.9]`, `0.0` = off; mutually exclusive with `adaptive_rt_window`. Benchmark-gated. |
 
 ## Invariants, determinism, gotchas
