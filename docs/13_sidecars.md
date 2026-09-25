@@ -736,6 +736,13 @@ MLP. Set it explicitly for the logreg path.
     the last round, because no later selection reads those scores. The per-fold log
     line then reports the held-out fold's targets at the training FDR instead of the
     training pool's. `1` restores the extra pass and the old line.
+  - `MUMDIA_NN_GATHER` (default `torch`): on the in-memory backend each scoring
+    batch is gathered with `torch.index_select` into one buffer reused for the whole
+    run, on the intra-op threads, instead of a single-threaded numpy fancy index and
+    a fresh allocation per batch (660,000 rows x 387 features: 0.39 s against
+    0.08 s at 8 threads). Same values and shapes, so the scores are identical, on
+    CPU and on CUDA. `numpy` restores the old gather; the streaming backend always
+    uses it.
 
   `test_default_speedups_leave_scores_byte_identical` (`tests/python`, needs torch)
   runs the worker with every switch set back and with the defaults and asserts equal

@@ -163,6 +163,12 @@ Env knobs (all optional):
     MUMDIA_NN_PREGATHER_GB= 8        pre-gather the fold's training rows when they fit in
                                      this many GB (one gather per iteration instead of a
                                      fancy-index copy per minibatch)
+    MUMDIA_NN_GATHER      = torch    how `score_idx` gathers a scoring batch on the
+                                     in-memory backend: torch = `torch.index_select` into
+                                     one reused buffer (multi-threaded); numpy = the
+                                     previous `Xs[idx]` fancy index. Same values, same
+                                     shapes, byte-identical scores. The streaming backend
+                                     always uses the numpy path.
     MUMDIA_NN_FINAL_POOL_SCORE = 0   1 = also score the training pool after the LAST
                                      round and log its target count. Those scores feed no
                                      later selection, so by default the pass is skipped and
@@ -675,6 +681,9 @@ def main():
     PREGATHER_GB = env_f("MUMDIA_NN_PREGATHER_GB", 8)
     CLAMP_TINY = env_f("MUMDIA_NN_CLAMP_TINY", 1e-20)
     FINAL_POOL_SCORE = env_i("MUMDIA_NN_FINAL_POOL_SCORE", 0) != 0
+    GATHER = os.environ.get("MUMDIA_NN_GATHER", "torch").strip().lower()
+    if GATHER not in ("torch", "numpy"):
+        raise ValueError("MUMDIA_NN_GATHER must be torch or numpy (got %r)" % GATHER)
     # auto (default) uses the GPU when torch can see one; cuda/cpu force it. Forcing is
     # what makes a device-only comparison possible: same environment, same package
     # versions, same data, only the device differs (CUDA_VISIBLE_DEVICES="" does NOT
@@ -1030,6 +1039,9 @@ def main():
         get = lambda idx: np.ascontiguousarray(mm[idx])
         get_col = lambda idx, j: np.asarray(mm[idx, j])
     _t = _tick("1_pin_read_standardise", _t)
+    # A torch view of the in-memory matrix (shared memory, no copy) for `score_idx`.
+    X_t = torch.from_numpy(Xs) if (not stream and GATHER == "torch") else None
+    _score_buf = [None]
     init_sample_limit = env_i("MUMDIA_NN_INIT_SAMPLE", 300000)
     print(f"nn_rescore_worker: device={DEVICE} backend={'stream' if stream else 'in-memory'} "
           f"pool={n} feats={nf}", flush=True)
@@ -1113,9 +1125,25 @@ def main():
         idx = np.asarray(idx)
         out = np.empty(len(idx), np.float32)
         step = BATCH * 4
+        if X_t is None:
+            for i in range(0, len(idx), step):
+                b = idx[i:i + step]
+                out[i:i + len(b)] = m(torch.from_numpy(get(b)).to(DEVICE)).cpu().numpy()
+            return out
+        # In-memory backend: gather each scoring batch with `torch.index_select` into one
+        # buffer that lives for the whole run. `Xs[b]` was a single-threaded numpy fancy
+        # index plus a fresh 25 MB allocation per batch (16,384 x 387 float32); the torch
+        # gather runs on the intra-op threads and writes the same values into the same
+        # shape. The streaming backend keeps the numpy path above, which reads the memmap.
+        idx_t = torch.from_numpy(np.ascontiguousarray(idx, dtype=np.int64))
+        buf = _score_buf[0]
+        if buf is None:
+            buf = _score_buf[0] = torch.empty((step, nf), dtype=torch.float32)
         for i in range(0, len(idx), step):
-            b = idx[i:i + step]
-            out[i:i + len(b)] = m(torch.from_numpy(get(b)).to(DEVICE)).cpu().numpy()
+            k = min(step, len(idx) - i)
+            xb = buf[:k]
+            torch.index_select(X_t, 0, idx_t[i:i + k], out=xb)
+            out[i:i + k] = m(xb.to(DEVICE)).cpu().numpy()
         return out
 
     def one_pass(seed):

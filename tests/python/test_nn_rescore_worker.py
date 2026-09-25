@@ -348,6 +348,8 @@ def test_available_ram_is_optional_and_never_fatal():
 LEGACY_ENV = {
     # W6: score the training pool after the last round as well.
     "MUMDIA_NN_FINAL_POOL_SCORE": "1",
+    # W1: gather scoring batches with a numpy fancy index.
+    "MUMDIA_NN_GATHER": "numpy",
 }
 
 IDENTITY_ENV = dict(
