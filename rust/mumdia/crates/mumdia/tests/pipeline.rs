@@ -300,6 +300,163 @@ fn features_compete_rescore_run_on_crafted_input() {
     assert!(t.column_names().contains(&"q_value".to_string()));
 }
 
+/// `w` is what an orchestrator records in the manifest for `path` without reading the
+/// file again (docs/03 "Each artifact is hashed once"), so it must be the hash of the file
+/// at that path and the hash and row count its report records.
+fn assert_written(w: &mumdia_io::report::Written, path: &str) {
+    assert_eq!(
+        w.content_hash,
+        mumdia_io::hash::blake3_file(path).unwrap(),
+        "{path}"
+    );
+    let rep: mumdia_io::report::ArtifactReport =
+        mumdia_io::json::read_json(&format!("{path}.report.json")).unwrap();
+    assert_eq!(w.content_hash, rep.content_hash, "{path}");
+    assert_eq!(w.rows, rep.rows, "{path}");
+}
+
+/// The library-build stages, digest to predict-frag with the native predictors. The
+/// predict-frag pair is returned as (precursors, fragments); the two files differ, so a
+/// swap in that order fails here rather than only in the smoke run.
+#[test]
+fn library_build_stages_return_the_hashes_of_the_files_they_wrote() {
+    let fasta = tmp("tiny.fasta");
+    std::fs::write(
+        &fasta,
+        ">sp|P1|PROT1\nMPEPTIDEKLVNELTEFAKTCVADESHAGCEKSLHTLFGDELCK\n\
+         >sp|P2|PROT2\nMAGVLTDLQKRSSLLNELSASSGYRK\n",
+    )
+    .unwrap();
+    let cfg = Config::default();
+    let peptides = tmp("peptides.parquet");
+    let wd = stages::digest::run_hashed(stages::digest::DigestParams {
+        fasta: &fasta,
+        out: &peptides,
+        cfg: &cfg.digest,
+        rng_seed: cfg.rng_seed,
+        config_hash: "test",
+    })
+    .unwrap();
+    assert!(wd.rows > 0);
+    assert_written(&wd, &peptides);
+
+    let pforms = tmp("peptidoforms.parquet");
+    let wp = stages::peptidoforms::run_hashed(stages::peptidoforms::PeptidoformsParams {
+        peptides: &peptides,
+        out: &pforms,
+        cfg: &cfg.peptidoforms,
+        config_hash: "test",
+    })
+    .unwrap();
+    assert!(wp.rows > 0);
+    assert_written(&wp, &pforms);
+
+    let prec = tmp("lib_precursors_hashed.parquet");
+    let frag = tmp("lib_fragments_hashed.parquet");
+    let (wprec, wfrag) =
+        stages::predict_frag::run_hashed(stages::predict_frag::PredictFragParams {
+            peptidoforms: &pforms,
+            out_precursors: &prec,
+            out_fragments: &frag,
+            cfg: &cfg.predict_frag,
+            work_dir: &tmp("predict_frag_work"),
+            config_hash: "test",
+        })
+        .unwrap();
+    assert_written(&wprec, &prec);
+    assert_written(&wfrag, &frag);
+    assert_ne!(wprec.content_hash, wfrag.content_hash);
+}
+
+/// The search stages from extract to quant through their `run_hashed` entry points,
+/// chained as the orchestrators chain them: compete receives the features hash, and quant
+/// writes all three of its tables. Each returned value must describe its own file.
+#[test]
+fn search_stages_return_the_hashes_of_the_files_they_wrote() {
+    let (prec, frag) = craft_library();
+    let ms2 = craft_ms2_with_decoy(true);
+    let win = craft_windows();
+    let cfg = Config::default();
+
+    let psms = tmp("psms_hashed.parquet");
+    let chrom = tmp("chrom_hashed.parquet");
+    let (wpsms, wchrom) = stages::extract::run_hashed(stages::extract::ExtractParams {
+        fragment_offset: None,
+        sibling_bands: 1,
+        scans: None,
+        ms2: &ms2,
+        library_precursors: &prec,
+        library_fragments: &frag,
+        run_windows: &win,
+        ms1: None,
+        mass_cal: None,
+        out_psms: &psms,
+        out_chrom: &chrom,
+        restrict_candidates: None,
+        cfg: &cfg.extract,
+        config_hash: "test",
+    })
+    .unwrap();
+    assert!(wpsms.rows >= 1);
+    assert_written(&wpsms, &psms);
+    assert_written(&wchrom, &chrom);
+    assert_ne!(wpsms.content_hash, wchrom.content_hash);
+
+    let feats = tmp("features_hashed.parquet");
+    let wfeat = stages::features::run_hashed(stages::features::FeaturesParams {
+        psms: &psms,
+        chromatograms: &chrom,
+        seed: None,
+        out: &feats,
+        out_pin: &tmp("hashed.pin"),
+        cfg: &cfg.features,
+        config_hash: "test",
+    })
+    .unwrap();
+    assert_written(&wfeat, &feats);
+
+    let competed = tmp("competed_hashed.parquet");
+    let wcomp = stages::compete::run_hashed(stages::compete::CompeteParams {
+        features: &feats,
+        out: &competed,
+        cfg: &cfg.compete,
+        config_hash: "test",
+        features_hash: Some(&wfeat.content_hash),
+    })
+    .unwrap();
+    assert_written(&wcomp, &competed);
+
+    let scored = tmp("scored_hashed.parquet");
+    let wscored = stages::rescore::run_hashed(stages::rescore::RescoreParams {
+        competed: &[competed],
+        out: &scored,
+        work_dir: &tmp("rescore_work_hashed"),
+        script_dir: "scripts",
+        cfg: &cfg.rescore,
+        config_hash: "test",
+    })
+    .unwrap();
+    assert_written(&wscored, &scored);
+
+    let qpep = tmp("quant_peptide_hashed.parquet");
+    let qprot = tmp("quant_protein_hashed.parquet");
+    let qfrag = tmp("quant_fragment_hashed.parquet");
+    let wq = stages::quant::run_hashed(stages::quant::QuantParams {
+        psms_scored: &scored,
+        chromatograms: &chrom,
+        out_peptide: &qpep,
+        out_protein: &qprot,
+        out_fragment: Some(&qfrag),
+        out_peak_bounds: None,
+        cfg: &cfg.quant,
+        config_hash: "test",
+    })
+    .unwrap();
+    assert_written(&wq.peptide, &qpep);
+    assert_written(&wq.protein, &qprot);
+    assert_written(wq.fragment.as_ref().expect("out_fragment was set"), &qfrag);
+}
+
 /// Synthetic `psms_extracted` + `chromatograms` pair with enough candidates to span
 /// several chunks: varying fragment counts, varying trace lengths, MS1 XIC rows, one
 /// never-observed fragment with an empty trace, and one candidate with no chromatogram

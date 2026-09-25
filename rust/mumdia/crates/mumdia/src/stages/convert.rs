@@ -1638,6 +1638,43 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
+    /// `ConvertOutputs::hashes` is what an orchestrator records in the manifest instead of
+    /// hashing the four files again, so each field must be the hash of the file at the
+    /// path of the same name, and the hash its own report records. A swap between two
+    /// fields would put one artifact's hash on another's record; the four files differ,
+    /// so any swap fails here.
+    #[test]
+    fn the_returned_hashes_are_those_of_the_files_written() {
+        let d = tmpdir("hashes");
+        let mzml_path = d.join("run.mzML");
+        std::fs::write(
+            &mzml_path,
+            mzml(4, &four_spectra(["0.10", "0.11", "0.20", "0.21"])),
+        )
+        .unwrap();
+        let out = run(ConvertParams {
+            mzml: mzml_path.to_str().unwrap(),
+            out_dir: d.to_str().unwrap(),
+            max_spectra: 0,
+            top_peaks_ms2: 0,
+            top_peaks_ms1: 0,
+            config_hash: "test",
+        })
+        .unwrap();
+        for (path, hash) in [
+            (&out.ms1, &out.hashes.ms1),
+            (&out.ms2, &out.hashes.ms2),
+            (&out.isolation_windows, &out.hashes.isolation_windows),
+            (&out.ms2_to_ms1, &out.hashes.ms2_to_ms1),
+        ] {
+            assert_eq!(hash, &mumdia_io::hash::blake3_file(path).unwrap(), "{path}");
+            let rep: mumdia_io::report::ArtifactReport =
+                mumdia_io::json::read_json(&format!("{path}.report.json")).unwrap();
+            assert_eq!(hash, &rep.content_hash, "{path}");
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
     /// The same shape one scan earlier, which the old code survived because the
     /// following good spectrum re-assigned `read`. Kept so the pair states where
     /// the boundary was rather than only that it moved.

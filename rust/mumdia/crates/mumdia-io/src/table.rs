@@ -2099,6 +2099,45 @@ mod tests {
     }
 
     #[test]
+    fn row_group_rows_and_required_leaves_describe_the_footer() {
+        // compete reuses a features file's bytes only when both hold (docs/11), so each is
+        // pinned here on its own: the row-group sizes in file order, also through a span
+        // handle, and REQUIRED leaves for plain columns but not for an optional one.
+        let dir = std::env::temp_dir().join(format!("mumdia_table_footer_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let req = dir.join("required.parquet").to_str().unwrap().to_string();
+        let mut w = TableWriter::new(&req).with_row_group_rows(4);
+        w.write_cols(vec![
+            Col::U32("id".into(), (0..10).collect()),
+            Col::F64("v".into(), (0..10).map(|i| i as f64).collect()),
+            Col::Str("s".into(), (0..10).map(|i| format!("s{i}")).collect()),
+        ])
+        .unwrap();
+        w.close().unwrap();
+        let t = TableFile::open(&req).unwrap();
+        assert_eq!(t.row_group_rows(), vec![4, 4, 2]);
+        assert_eq!(
+            TableFile::open_rows(&req, 5, 2).unwrap().row_group_rows(),
+            vec![4, 4, 2]
+        );
+        assert!(t.all_leaves_required());
+
+        let opt = dir.join("optional.parquet").to_str().unwrap().to_string();
+        write_table(
+            &opt,
+            vec![
+                Col::U32("id".into(), vec![0, 1]),
+                Col::OptF64("v".into(), vec![Some(1.0), Some(2.0)]),
+            ],
+        )
+        .unwrap();
+        let t = TableFile::open(&opt).unwrap();
+        assert_eq!(t.row_group_rows(), vec![2]);
+        assert!(!t.all_leaves_required());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn roundtrip_mixed_columns() {
         // Unique per process: a fixed name races when two `cargo test` runs share a
         // machine, which is the convention docs/14 states and four other test modules
