@@ -47,6 +47,7 @@ os.environ["NUMEXPR_NUM_THREADS"] = "1"
 
 import argparse
 import contextlib
+import gc
 import io
 import json
 import pickle
@@ -802,8 +803,15 @@ def main():
         print(f"predicting {len(uniq)} unique standard peptidoforms with {which} in "
               f"{n_shards} processes of {shard_threads} torch threads ({shard_note})",
               flush=True)
+        # The parent predicts nothing while it shards and every child loads its own model,
+        # so this process lets go of its copies before the children start: the base model
+        # the multi-head fit used, and the fine-tuned model once `predict_sharded` has
+        # saved it for the children (it is handed over in `fitted` for that reason).
+        fitted = {"model": ft_model, "calibration": calibration}
+        ft_model = base_model = None
+        gc.collect()
         values, per_shard = predict_sharded(
-            uniq, n_shards, shard_threads, chunk, ft_model, calibration, args.lib_out)
+            uniq, n_shards, shard_threads, chunk, fitted, args.lib_out)
         shard_record["per_shard"] = per_shard
         # Summed over the shards, so these are process-seconds rather than wall time.
         for key in ("featurisation", "forward"):
@@ -956,12 +964,15 @@ def shard_bounds(n_items, shards, chunk):
     return [(a, min(a + per, n_items)) for a in range(0, n_items, per)]
 
 
-def predict_sharded(uniq, shards, threads, chunk, ft_model, calibration, lib_out):
+def predict_sharded(uniq, shards, threads, chunk, fitted, lib_out):
     """Predict `uniq` in `shards` child processes and join the slices in order.
 
-    The fitted calibration (pickled) or fine-tuned model (`torch.save` of the module) is
-    written once and every child reads it, so no shard refits: a refit could select a
-    different head at rank 80 from last-bit differences in the reference predictions. Each
+    `fitted` holds the fitted `calibration` and the fine-tuned `model`, either of them None.
+    The calibration (pickled) or the model (`torch.save` of the module) is written once
+    and every child reads it, so no shard refits: a refit could select a different head at
+    rank 80 from last-bit differences in the reference predictions. The model is taken out
+    of `fitted` and released once it is on disk, so the parent does not hold a copy next
+    to the children's (the caller keeps no other reference). Each
     child's slice starts at a multiple of `chunk` and it predicts in `chunk`-sized calls
     from there, which are the calls the one process would have made. A child that exits
     non-zero stops the others and fails the stage; nothing is written then.
@@ -984,13 +995,17 @@ def predict_sharded(uniq, shards, threads, chunk, ft_model, calibration, lib_out
                                 dir=base_dir)
         try:
             cal_path = model_path = None
+            calibration = fitted.get("calibration")
             if calibration is not None:
                 cal_path = os.path.join(work, f"calibration.{token}.pkl")
                 with open(cal_path, "wb") as fh:
                     pickle.dump(calibration, fh, protocol=pickle.HIGHEST_PROTOCOL)
+            ft_model = fitted.pop("model", None)
             if ft_model is not None:
                 model_path = os.path.join(work, f"model.{token}.pt")
                 torch.save(ft_model, model_path)
+                ft_model = None
+                gc.collect()
             specs = []
             for j, (a, b) in enumerate(bounds):
                 stem = os.path.join(work, f"shard_{j:03d}.{token}")
