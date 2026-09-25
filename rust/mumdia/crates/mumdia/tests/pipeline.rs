@@ -1091,3 +1091,213 @@ fn a_lent_seed_library_gives_the_seed_it_would_have_loaded() {
         assert!(err.contains("lent seed library"), "{err}");
     }
 }
+
+/// T1: the RT windows `rt-im-train` hands an orchestrated extract in memory give the
+/// psms_extracted and chromatograms bytes of the extract that reads the run_windows file
+/// the same call wrote, and extract takes them without opening that file. Windows fitted
+/// on another precursor table, written to another run_windows path, or covering another
+/// candidate count are refused, and the file is read instead, with the same bytes.
+///
+/// Whether extract opened the file is observed directly: for the length of one extract
+/// the file holds bytes that are not parquet, so an extract that reads it fails.
+#[test]
+fn extract_takes_the_handed_rt_windows_only_when_they_are_its_own() {
+    use stages::rt_im_train::{run_in_memory, RtImTrainParams, RtWindows};
+
+    /// Run `f` while `path` holds bytes that are not parquet, then put the file back.
+    fn without_file<T>(path: &str, f: impl FnOnce() -> T) -> T {
+        let bytes = std::fs::read(path).unwrap();
+        std::fs::write(path, b"not a parquet file").unwrap();
+        let out = f();
+        std::fs::write(path, &bytes).unwrap();
+        out
+    }
+
+    // The planted target (0) and its decoy (1) of `craft_library`, plus a second target (2)
+    // on its own base peptide and iRT, whose fragments the spectra do not carry. Two target
+    // anchors with distinct iRTs give a calibrated, BOUNDED window, so the arrays handed
+    // over are not the unbounded sentinel of a run without anchors.
+    let prec = tmp("t1_prec.parquet");
+    let frag = tmp("t1_frag.parquet");
+    let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    write_table(
+        &prec,
+        vec![
+            Col::U32("candidate_id".into(), vec![0, 1, 2]),
+            Col::U32("peptidoform_id".into(), vec![0, 1, 2]),
+            Col::U32("base_peptide_id".into(), vec![0, 0, 1]),
+            Col::Str(
+                "peptidoform".into(),
+                names(&["PEPTIDEK", "EDITPEPK", "ANQTHERK"]),
+            ),
+            Col::I32("charge".into(), vec![2, 2, 2]),
+            Col::F64("precursor_mz".into(), vec![500.0, 500.0, 501.0]),
+            Col::F32("predicted_irt".into(), vec![10.0, 10.0, 20.0]),
+            Col::Str("label".into(), names(&["target", "decoy", "target"])),
+            Col::Str("protein".into(), names(&["P1", "DECOY_P1", "P2"])),
+            Col::I32("n_fragments".into(), vec![3, 3, 3]),
+        ],
+    )
+    .unwrap();
+    write_table(
+        &frag,
+        vec![
+            Col::U32("candidate_id".into(), vec![0, 0, 0, 1, 1, 1, 2, 2, 2]),
+            Col::F64(
+                "mz".into(),
+                vec![
+                    200.1, 300.2, 400.3, 250.7, 350.8, 450.9, 700.1, 710.2, 720.3,
+                ],
+            ),
+            Col::F32(
+                "predicted_intensity".into(),
+                vec![1.0, 0.8, 0.6, 1.0, 0.8, 0.6, 1.0, 0.8, 0.6],
+            ),
+            Col::Str(
+                "name".into(),
+                names(&["b2", "y3", "y4", "b2", "y3", "y4", "b2", "y3", "y4"]),
+            ),
+            Col::Str(
+                "ion_type".into(),
+                names(&["b", "y", "y", "b", "y", "y", "b", "y", "y"]),
+            ),
+            Col::I32("ordinal".into(), vec![2, 3, 4, 2, 3, 4, 2, 3, 4]),
+            Col::I32("frag_charge".into(), vec![1; 9]),
+        ],
+    )
+    .unwrap();
+    let ms2 = craft_ms2_with_decoy(true);
+    let seed = tmp("t1_seed.parquet");
+    write_table(
+        &seed,
+        vec![
+            Col::U32("candidate_id".into(), vec![0, 2]),
+            Col::U32("base_peptide_id".into(), vec![0, 1]),
+            Col::F64("spectrum_q".into(), vec![0.001, 0.001]),
+            Col::F64("score".into(), vec![5.0, 4.0]),
+            Col::F64("observed_rt".into(), vec![140.0, 240.0]),
+            Col::Str("label".into(), names(&["target", "target"])),
+        ],
+    )
+    .unwrap();
+
+    let cfg = Config::default();
+    let fit = |library: &str, windows: &str| -> RtWindows {
+        let (_, kept) = run_in_memory(RtImTrainParams {
+            seed_psms: &seed,
+            library_precursors: library,
+            out_windows: windows,
+            out_cal: &format!("{windows}.cal.json"),
+            cfg: &cfg.rt_im_train,
+            config_hash: "test",
+            anchor_irt_from_seed: false,
+        })
+        .unwrap();
+        kept.expect("no NaN bound, so the windows are handed over")
+    };
+    let extract = |rt_windows: Option<RtWindows>,
+                   run_windows: &str,
+                   tag: &str|
+     -> anyhow::Result<(String, String)> {
+        let psms = tmp(&format!("t1_psms_{tag}.parquet"));
+        let chrom = tmp(&format!("t1_chrom_{tag}.parquet"));
+        stages::extract::run(stages::extract::ExtractParams {
+            fragment_offset: None,
+            rt_windows,
+            sibling_bands: 1,
+            scans: None,
+            ms2: &ms2,
+            library_precursors: &prec,
+            library_fragments: &frag,
+            run_windows,
+            ms1: None,
+            mass_cal: None,
+            out_psms: &psms,
+            out_chrom: &chrom,
+            restrict_candidates: None,
+            cfg: &cfg.extract,
+            config_hash: "test",
+        })?;
+        Ok((psms, chrom))
+    };
+    let bytes = |(psms, chrom): &(String, String)| {
+        (std::fs::read(psms).unwrap(), std::fs::read(chrom).unwrap())
+    };
+
+    let windows = tmp("t1_run_windows.parquet");
+    let handed = fit(&prec, &windows);
+    let t = Table::read(&windows).unwrap();
+    assert!(
+        t.f64("rt_lo").unwrap()[0].is_finite() && t.f64("rt_hi").unwrap()[0].is_finite(),
+        "the fixture has to fit a bounded window, or the arrays handed over are the sentinel"
+    );
+    let from_file = extract(None, &windows, "file").unwrap();
+    assert!(
+        Table::read(&from_file.0)
+            .unwrap()
+            .u32("candidate_id")
+            .unwrap()
+            .contains(&0),
+        "the planted target must be extracted, or the comparison is of empty tables"
+    );
+    let from_file = bytes(&from_file);
+
+    // Handed over and taken: the same bytes, and the file was not opened.
+    let from_memory = without_file(&windows, || extract(Some(handed), &windows, "memory"))
+        .expect("the handed windows are used, so the unreadable file is never opened");
+    let from_memory = bytes(&from_memory);
+    assert_eq!(
+        from_memory.0, from_file.0,
+        "psms_extracted, in memory vs file"
+    );
+    assert_eq!(
+        from_memory.1, from_file.1,
+        "chromatograms, in memory vs file"
+    );
+
+    // Each refusal, built twice: once to show the file is read (it fails while the file is
+    // unreadable), once to show that reading it gives the bytes above.
+    let prec_copy = tmp("t1_prec_copy.parquet");
+    std::fs::copy(&prec, &prec_copy).unwrap();
+    let windows_copy = tmp("t1_run_windows_copy.parquet");
+    let refusals: [(&str, &dyn Fn() -> RtWindows); 3] = [
+        // Fitted on another precursor table holding the same candidates.
+        ("library", &|| fit(&prec_copy, &windows)),
+        // Written to another run_windows path.
+        ("path", &|| fit(&prec, &windows_copy)),
+        // Fitted for this library path and this file, over a different candidate count:
+        // the table at the path changed after the fit.
+        ("count", &|| {
+            let (p, w) = (
+                std::fs::read(&prec).unwrap(),
+                std::fs::read(&windows).unwrap(),
+            );
+            write_table(
+                &prec,
+                vec![
+                    Col::U32("candidate_id".into(), vec![0, 1]),
+                    Col::F32("predicted_irt".into(), vec![10.0, 10.0]),
+                ],
+            )
+            .unwrap();
+            let fitted = fit(&prec, &windows);
+            std::fs::write(&prec, p).unwrap();
+            std::fs::write(&windows, w).unwrap();
+            assert_eq!(fitted.len(), 2);
+            fitted
+        }),
+    ];
+    for (tag, refused) in refusals {
+        let w = refused();
+        assert!(
+            without_file(&windows, || extract(Some(w), &windows, &format!("{tag}_x"))).is_err(),
+            "{tag}: windows that are not this extract's were used instead of the file"
+        );
+        let got = bytes(&extract(Some(refused()), &windows, tag).unwrap());
+        assert_eq!(
+            got.0, from_file.0,
+            "{tag}: psms_extracted after the refusal"
+        );
+        assert_eq!(got.1, from_file.1, "{tag}: chromatograms after the refusal");
+    }
+}

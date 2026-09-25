@@ -144,9 +144,11 @@ pub struct ExtractParams<'a> {
     pub scans: Option<SharedScans<'a>>,
     /// The windows `rt-im-train` just fitted and wrote to `run_windows`, handed over in
     /// memory by an orchestrator (`rt_im_train::run_in_memory`) so the table is not
-    /// decoded again. Used only when it covers exactly this library's candidates, and then
-    /// it is what the file would have produced; otherwise, and whenever it is `None`, the
-    /// `run_windows` file is read. A standalone `mumdia extract` always reads the file.
+    /// decoded again. Used only when they were fitted on this `library_precursors` table,
+    /// written to this `run_windows` path, and cover exactly this library's candidates
+    /// (`RtWindows::mismatch`), and then they are what the file would have produced;
+    /// otherwise, and whenever this is `None`, the `run_windows` file is read. A standalone
+    /// `mumdia extract` always reads the file.
     pub rt_windows: Option<crate::stages::rt_im_train::RtWindows>,
 }
 
@@ -2671,6 +2673,7 @@ pub(crate) fn read_run_windows(path: &str, ncand: usize) -> Result<RtWindows> {
         rt_cal,
         rt_lo,
         rt_hi,
+        fitted_for: None,
     })
 }
 
@@ -2777,33 +2780,40 @@ pub fn run(mut p: ExtractParams) -> Result<(u64, u64)> {
         None => None,
     };
 
-    // run windows indexed by candidate_id: the orchestrator's in-memory copy when it
-    // covers this library (`rt_im_train::RtWindows` says why that is the same arrays),
-    // the file otherwise.
+    // run windows indexed by candidate_id: the orchestrator's in-memory copy when it was
+    // fitted for this library and this run_windows file (`rt_im_train::RtWindows` says why
+    // that is the same arrays), the file otherwise.
     let ncand = lib.n_candidates();
+    let handed_windows = match handed_windows {
+        Some(w) => match w.mismatch(p.library_precursors, p.run_windows, ncand) {
+            None => Some(w),
+            Some(why) => {
+                warn!(
+                    handed = w.len(),
+                    candidates = ncand,
+                    run_windows = p.run_windows,
+                    "extract: the RT windows handed over are not this extract's ({why}); \
+                     reading the run_windows file instead"
+                );
+                None
+            }
+        },
+        None => None,
+    };
     let RtWindows {
         rt_cal,
         rt_lo,
         rt_hi,
+        ..
     } = match handed_windows {
-        Some(w) if w.len() == ncand => {
+        Some(w) => {
             info!(
                 candidates = ncand,
                 "extract: RT windows handed over in memory; run_windows is not re-read"
             );
             w
         }
-        other => {
-            if let Some(w) = other {
-                warn!(
-                    handed = w.len(),
-                    candidates = ncand,
-                    run_windows = p.run_windows,
-                    "extract: the RT windows handed over cover a different candidate count;                      reading the run_windows file instead"
-                );
-            }
-            read_run_windows(p.run_windows, ncand)?
-        }
+        None => read_run_windows(p.run_windows, ncand)?,
     };
 
     // Decoded here unless the caller lent its own copies (see `ExtractParams::scans` and

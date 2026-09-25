@@ -95,12 +95,20 @@ range (recall-safe) rather than a numeric window.
 and the band loop of a grouped run) call `rt_im_train::run_in_memory`, which writes
 the same file and also returns `RtWindows`: the three dense per-candidate arrays
 (`rt_cal`, `rt_lo`, `rt_hi`, 24 bytes per candidate) that `extract` builds from
-`run_windows.parquet`, filled from the rows as they are written. `extract` takes
-them when they cover exactly its library's candidates, logs `extract: RT windows
-handed over in memory; run_windows is not re-read`, and otherwise reads the file.
+`run_windows.parquet`, filled from the rows as they are written. The arrays carry
+the precursor-table path they were fitted on and the `run_windows` path they were
+written to. `extract` takes them only when both are the paths it was itself given
+and its library has the same candidate count (`RtWindows::mismatch`), logs
+`extract: RT windows handed over in memory; run_windows is not re-read`, and
+otherwise warns with the reason and reads the file. A count alone would accept
+windows fitted on another library of the same size, such as a re-predicted or
+fine-tuned precursor table or another band, which the file-based contract cannot do.
 The arrays are the ones the file would produce, bit for bit
-(`the_windows_kept_in_memory_are_the_windows_extract_reads_back`), so the handoff
-changes no output; it saves the decode of the table just written, 1-2 s per run on
+(`the_windows_kept_in_memory_are_the_windows_extract_reads_back`), and extract's
+outputs are the same bytes whether it takes them or reads the file
+(`extract_takes_the_handed_rt_windows_only_when_they_are_its_own` in
+`tests/pipeline.rs`, which also shows that extract does not open the file when it
+takes them and does open it for each refusal), so the handoff changes no output; it saves the decode of the table just written, 1-2 s per run on
 HYE and an estimated 20-60 s on an unbanded immunopeptidomics library. A table
 with a NaN bound is never handed over, so `extract` reads it and rejects it with the
 row named, as before. The file stays the artifact and the contract of the

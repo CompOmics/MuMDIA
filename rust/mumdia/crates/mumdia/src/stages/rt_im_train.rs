@@ -153,12 +153,22 @@ fn candidate_window(calibrated_rt: Option<f64>, width: Option<f64>) -> (f64, f64
 /// arrays indexed by candidate id over the library's `n` rows, `(NaN, -inf, +inf)` for a
 /// candidate with no row, and for every row `i` with `candidate_id[i] < n`, in row order,
 /// that row's `(rt_pred_cal, rt_lo, rt_hi)`. The file is still written and is still the
-/// contract of the standalone stages; `extract` takes this only when its own library has
-/// the same `n` candidates, and reads the file otherwise.
+/// contract of the standalone stages.
+///
+/// The arrays carry the identity of what they were fitted for: the precursor table
+/// `rt-im-train` read and the `run_windows` path it wrote. `extract` takes them only when
+/// both are the paths it was itself given and its library has the same `n` candidates
+/// ([`RtWindows::mismatch`]), and reads the file otherwise. A count alone would accept
+/// windows fitted on a different library of the same size (a re-predicted or fine-tuned
+/// precursor table, another band), which the file-based contract cannot do, because
+/// `extract` reads the `run_windows` path it is given.
 pub struct RtWindows {
     pub(crate) rt_cal: Vec<f64>,
     pub(crate) rt_lo: Vec<f64>,
     pub(crate) rt_hi: Vec<f64>,
+    /// `(library_precursors, run_windows)` of the `rt-im-train` call that fitted these
+    /// windows; `None` for windows read back from a file, which are never handed over.
+    pub(crate) fitted_for: Option<(String, String)>,
 }
 
 impl RtWindows {
@@ -169,6 +179,39 @@ impl RtWindows {
 
     pub fn is_empty(&self) -> bool {
         self.rt_cal.is_empty()
+    }
+
+    /// Why these windows are NOT the ones `extract` would read from `run_windows` for the
+    /// `ncand`-candidate library at `library_precursors`, or `None` when they are: the same
+    /// precursor table and the same `run_windows` path as the fit, and the same candidate
+    /// count. The paths are compared as given, so an equivalent path spelled differently
+    /// reads the file, which is the safe direction.
+    pub fn mismatch(
+        &self,
+        library_precursors: &str,
+        run_windows: &str,
+        ncand: usize,
+    ) -> Option<String> {
+        let Some((lib, rw)) = &self.fitted_for else {
+            return Some("they were not fitted by rt-im-train in this process".to_string());
+        };
+        if lib != library_precursors {
+            return Some(format!(
+                "they were fitted on the precursor table {lib}, not {library_precursors}"
+            ));
+        }
+        if rw != run_windows {
+            return Some(format!(
+                "they were written to {rw}, not to the run_windows path {run_windows}"
+            ));
+        }
+        if self.len() != ncand {
+            return Some(format!(
+                "they cover {} candidates and this library has {ncand}",
+                self.len()
+            ));
+        }
+        None
     }
 }
 
@@ -188,6 +231,7 @@ impl RtWindowsBuilder {
                 rt_cal: vec![f64::NAN; n],
                 rt_lo: vec![f64::NEG_INFINITY; n],
                 rt_hi: vec![f64::INFINITY; n],
+                fitted_for: None,
             },
             poisoned: false,
         }
@@ -207,8 +251,12 @@ impl RtWindowsBuilder {
         }
     }
 
-    fn finish(self) -> Option<RtWindows> {
-        (!self.poisoned).then_some(self.w)
+    /// The windows, stamped with the precursor table they were fitted on and the
+    /// `run_windows` path they were written to; `None` when a NaN bound was seen.
+    fn finish(self, library_precursors: &str, run_windows: &str) -> Option<RtWindows> {
+        let mut w = self.w;
+        w.fitted_for = Some((library_precursors.to_string(), run_windows.to_string()));
+        (!self.poisoned).then_some(w)
     }
 }
 
@@ -663,7 +711,10 @@ fn run_impl(p: RtImTrainParams, keep_windows: bool) -> Result<(u64, Option<RtWin
         elapsed_ms = elapsed,
         "rt-im-train: done"
     );
-    Ok((rows, kept.and_then(RtWindowsBuilder::finish)))
+    Ok((
+        rows,
+        kept.and_then(|b| b.finish(p.library_precursors, p.out_windows)),
+    ))
 }
 
 #[cfg(test)]
@@ -854,6 +905,14 @@ mod tests {
                 bits(&from_file),
                 "{tag}: in memory != read back"
             );
+            // Handed over only to the extract of the library and the file they were
+            // fitted for; a table of the same size elsewhere, another run_windows path or
+            // another candidate count reads the file instead.
+            assert_eq!(kept.mismatch(&prec, &windows, n), None, "{tag}");
+            assert!(kept.mismatch("other_prec.parquet", &windows, n).is_some());
+            assert!(kept.mismatch(&prec, "other_windows.parquet", n).is_some());
+            assert!(kept.mismatch(&prec, &windows, n + 1).is_some());
+            assert!(from_file.mismatch(&prec, &windows, n).is_some());
             // `run` writes the same file as `run_in_memory`.
             let bytes = std::fs::read(&windows).unwrap();
             assert_eq!(run(params()).unwrap(), n as u64);
@@ -894,7 +953,7 @@ mod tests {
         for &(c, cal, lo, hi) in &rows {
             b.row(c, cal, lo, hi);
         }
-        let kept = b.finish().expect("no NaN bound");
+        let kept = b.finish("lib", "rw").expect("no NaN bound");
         let read = crate::stages::extract::read_run_windows(&path, 4).unwrap();
         assert_eq!(bits(&kept), bits(&read));
         assert_eq!(kept.rt_cal[2], 11.0);
@@ -903,7 +962,10 @@ mod tests {
         write(&path, &[(1u32, 3.0, f64::NAN, 4.0)]);
         let mut b = RtWindowsBuilder::new(4);
         b.row(1, 3.0, f64::NAN, 4.0);
-        assert!(b.finish().is_none(), "a NaN bound must not be handed over");
+        assert!(
+            b.finish("lib", "rw").is_none(),
+            "a NaN bound must not be handed over"
+        );
         let err = crate::stages::extract::read_run_windows(&path, 4)
             .err()
             .unwrap();
@@ -911,7 +973,7 @@ mod tests {
         // A NaN bound on a row past the library is not checked by extract either.
         let mut b = RtWindowsBuilder::new(1);
         b.row(1, 3.0, f64::NAN, 4.0);
-        assert!(b.finish().is_some());
+        assert!(b.finish("lib", "rw").is_some());
     }
 
     #[test]

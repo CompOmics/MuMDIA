@@ -79,9 +79,10 @@ the CLI in `main.rs:535` (`Cmd::Extract`) and from the orchestrator in
   rejected with the row named, because a NaN bound would match every scan. An
   orchestrator hands the same three arrays over in memory
   (`ExtractParams::rt_windows`, from `rt_im_train::run_in_memory`); extract uses
-  them when they cover exactly its library's candidates and reads the file
-  otherwise, so the arrays and every output are the same either way (docs/08, "The
-  in-memory handoff to extract").
+  them only when they were fitted on its own `library_precursors` path, written to
+  its own `run_windows` path, and cover exactly its library's candidates
+  (`RtWindows::mismatch`), and reads the file otherwise, so the arrays and every
+  output are the same either way (docs/08, "The in-memory handoff to extract").
 - `ms1` (optional Parquet): MS1 scans via `load_ms1` (`extract.rs:1350`). When
   absent, all MS1 columns are null.
 - `mass_cal` (optional JSON, the seed's `<seed>.masscal.json`): reads
