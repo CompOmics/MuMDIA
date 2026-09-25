@@ -17,7 +17,7 @@
 
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 
 use bytes::{Buf, Bytes};
@@ -87,6 +87,10 @@ struct Shared {
     loaded: Condvar,
     options: SpanReadOptions,
     stats: Stats,
+    /// One past the highest span the decoder has asked for. Only written and read under
+    /// the `slots` lock. A prefetch request for a span below it is stale: the decoder got
+    /// there first, and loading the span again would hold bytes nobody reads.
+    reached: AtomicUsize,
 }
 
 /// What the cache did, for the debug line it logs when it is dropped and for the tests.
@@ -226,6 +230,7 @@ impl SpanCache {
             loaded: Condvar::new(),
             options,
             stats: Stats::default(),
+            reached: AtomicUsize::new(0),
         });
         let (prefetch, helper) = if shared.options.prefetch && shared.spans.len() > 1 {
             // The helper has its own handle: a cloned `File` shares the cursor of the one
@@ -262,10 +267,14 @@ impl SpanCache {
         (!s.direct && start + len <= s.end).then_some(i)
     }
 
-    /// The bytes of span `i`, reading them if nobody has, waiting if the helper is.
+    /// The bytes of span `i`, reading them if nobody has, waiting if the helper is. The
+    /// first request for a span asks the helper for the next one.
     fn acquire(&self, i: usize) -> PqResult<Bytes> {
         let sh = &self.shared;
         let mut slots = sh.slots.lock().expect("span cache lock");
+        if sh.reached.fetch_max(i + 1, Ordering::Relaxed) <= i {
+            self.request_prefetch(i + 1);
+        }
         loop {
             match &slots[i].state {
                 State::Ready(b) => return Ok(b.clone()),
@@ -276,7 +285,6 @@ impl SpanCache {
                     slots[i].state = State::Loading;
                     slots[i].finished = 0;
                     drop(slots);
-                    self.request_prefetch(i + 1);
                     let sp = &sh.spans[i];
                     let got = read_span(&self.file, sp.start, sp.end);
                     if got.is_ok() {
@@ -338,12 +346,15 @@ impl SpanCache {
 }
 
 /// The helper thread's half of [`SpanCache::acquire`]: read span `i` ahead of the decoder
-/// when it is idle, cacheable and fits the resident budget.
+/// when it is idle, cacheable, still ahead of the decoder and fits the resident budget.
 fn prefetch_one(sh: &Shared, file: &File, i: usize) {
     {
         let mut slots = sh.slots.lock().expect("span cache lock");
         let sp = &sh.spans[i];
-        if sp.direct || !matches!(slots[i].state, State::Idle) {
+        if sp.direct
+            || !matches!(slots[i].state, State::Idle)
+            || i < sh.reached.load(Ordering::Relaxed)
+        {
             return;
         }
         if Shared::resident(&slots, &sh.spans) + (sp.end - sp.start) > sh.options.max_resident_bytes
@@ -669,6 +680,59 @@ mod tests {
         )
         .unwrap();
         assert_eq!(cache.plan_shape(), (4, 4));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A prefetch request that reaches the helper after the decoder has already read and
+    /// released its span must not load the span again: nobody would read it, so it would
+    /// stay resident until the cache is dropped. On a loaded host the helper can fall that
+    /// far behind; this replays the late request directly.
+    #[test]
+    fn a_late_prefetch_does_not_reload_a_finished_span() {
+        let d = dir("late");
+        let p = d.join("t.parquet").to_string_lossy().to_string();
+        fixture(&p, 6_000, 2_000);
+        let file = File::open(&p).unwrap();
+        let am = ArrowReaderMetadata::load(&file, Default::default()).unwrap();
+        let meta = am.metadata().clone();
+        let n_rg = meta.num_row_groups();
+        let leaves: Vec<usize> = (0..meta.file_metadata().schema_descr().num_columns()).collect();
+        let cache = SpanCache::plan(
+            &p,
+            &meta,
+            &(0..n_rg).collect::<Vec<_>>(),
+            &leaves,
+            SpanReadOptions {
+                prefetch: false,
+                ..SpanReadOptions::default()
+            },
+        )
+        .unwrap();
+        // Read span 0 to the end of every column chunk in it, so it is released.
+        let sp = &cache.shared.spans[0];
+        let (start, ends) = (sp.start, sp.chunk_ends.clone());
+        let mut from = start;
+        for end in ends {
+            cache.get_bytes(from, (end - from) as usize).unwrap();
+            from = end;
+        }
+        assert_eq!(cache.resident_bytes(), 0);
+        assert_eq!(cache.reads(), (1, 0));
+        // The late request for span 0, and a timely one for the next span.
+        prefetch_one(&cache.shared, &file, 0);
+        assert_eq!(
+            cache.resident_bytes(),
+            0,
+            "a finished span is not loaded again"
+        );
+        assert_eq!(cache.reads(), (1, 0));
+        prefetch_one(&cache.shared, &file, 1);
+        assert!(
+            cache.resident_bytes() > 0,
+            "a span ahead of the decoder is prefetched"
+        );
+        assert_eq!(cache.reads(), (2, 0));
+        drop(cache);
         let _ = std::fs::remove_dir_all(&d);
     }
 
