@@ -166,7 +166,11 @@ Three changes, all in `rescore.rs`, `table.rs` and `nn_rescore_worker.py`:
   (`pa.default_memory_pool().release_unused()`, `malloc_trim` on glibc) before training.
   Since 2026-09-25 one further row group is decoded ahead on a reader thread and the fill
   runs on up to 8 threads, each with a 32k-row float64 moment buffer (0.1 GB at 387
-  features); the matrix and its moments are byte-identical (`docs/13`).
+  features) for the duration of the load; the matrix and its moments are byte-identical
+  (`docs/13`). The init feature scan also runs on a thread pool since then, and each task
+  in flight holds about 64 bytes per sample row; `MUMDIA_NN_SCAN_MEM_GB` (1) caps those
+  tasks together, which binds only when the init sample escalates toward the whole fold
+  (3 tasks at 4.8M rows, where 16 would have held about 4.5 GB beside the sample).
 
 | pool | before | after | peptides |
 |------|--------|-------|----------|

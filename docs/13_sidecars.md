@@ -646,7 +646,9 @@ repeated on 4x the rows up to the whole fold), `MUMDIA_NN_INIT_FDR_MAX` (0.05; c
 of the first-iteration bootstrap ladder 0.02/0.05/0.1 used only when the init feature
 selects no positive at the training FDR over the whole fold, 0 = hard error as before),
 `MUMDIA_NN_PARALLEL` (0; opt-in concurrent fold training, see "Invariants" below) and
-`MUMDIA_NN_PARALLEL_THREADS`, and the switches back to the pre-2026-09-25 code paths
+`MUMDIA_NN_PARALLEL_THREADS`, the two caps on the init-scan threads
+(`MUMDIA_NN_SCAN_ROWS_PER_THREAD`, 20000; `MUMDIA_NN_SCAN_MEM_GB`, 1), and the switches
+back to the pre-2026-09-25 code paths
 (`MUMDIA_NN_FINAL_POOL_SCORE`, `MUMDIA_NN_GATHER`, `MUMDIA_NN_SCAN_THREADS`,
 `MUMDIA_NN_LOAD_THREADS`, `MUMDIA_NN_READ_AHEAD`, `MUMDIA_NN_PRE_BUFFER`,
 `MUMDIA_NN_SELECT`),
@@ -753,11 +755,17 @@ MLP. Set it explicitly for the logreg path.
     uses it.
   - `MUMDIA_NN_SCAN_THREADS` (default: the torch CPU thread count): the init feature
     scan counts its columns on a thread pool, one task per column with both signs
-    from one column read, and one thread per 20,000 sample rows at most. Each count is
-    computed as before and the winner is reduced in the serial (column, sign) order
-    with the same strict `>`, so the chosen feature, sign and count are identical
-    (400,000 x 120 synthetic pool: 24.9 s against 4.3 s at 8 threads). `1` runs it
-    serially.
+    from one column read. Each count is computed as before and the winner is reduced in
+    the serial (column, sign) order with the same strict `>`, so the chosen feature,
+    sign and count are identical (400,000 x 120 synthetic pool: 24.9 s against 4.3 s at
+    8 threads). `1` runs it serially. Two caps keep the pool small: one thread per
+    `MUMDIA_NN_SCAN_ROWS_PER_THREAD` sample rows (20,000), and `MUMDIA_NN_SCAN_MEM_GB`
+    (1) of transient memory for the tasks in flight together, at about 64 bytes per
+    sample row each (58 measured: the column copy, its negation, the int64 order and
+    the int64 cumulative counts). The memory cap binds only when the init sample
+    escalates: at 4.8M rows, a step of the ladder on the 8.07M-row immunopeptidomics
+    pool, 16 tasks would have held about 4.5 GB beside the 6.7 GB sample, and the cap
+    allows 3. The init log line prints the thread count used.
   - `MUMDIA_NN_LOAD_THREADS` (default `min(8, torch CPU threads)`),
     `MUMDIA_NN_READ_AHEAD` (1) and `MUMDIA_NN_PRE_BUFFER` (1): the parquet in-memory
     load decodes row group r+1 on a reader thread (its own `ParquetFile`, opened with
@@ -768,8 +776,10 @@ MLP. Set it explicitly for the logreg path.
     and std are byte-identical. Standardisation is elementwise and runs on the same
     threads. Measured on a 1,000,000 x 387 handoff: 11.8 s (fill 10.9, standardise
     1.0) against 2.4 s at 8 threads. Each fill thread holds a 32,768 x features float64
-    buffer (0.1 GB at 387 features) and one extra decoded row group is resident.
-    `MUMDIA_NN_LOAD_THREADS=0` restores the old serial loop without read-ahead.
+    buffer (0.1 GB at 387 features) for the duration of the load, and one extra decoded
+    row group is resident; with one fill thread the buffer is the main thread's and is
+    released when the load ends. `MUMDIA_NN_LOAD_THREADS=0` restores the old serial loop
+    without read-ahead.
   - `MUMDIA_NN_SELECT` (default `window`): each round's positives are the targets up
     to the last position of the stable descending order whose FDR
     `(decoys+1)/max(targets,1)` is at or below the training FDR, so only a top window

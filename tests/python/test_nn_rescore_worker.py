@@ -478,6 +478,31 @@ def test_threaded_init_scan_picks_the_serial_feature_and_count():
     assert w.scan_workers(16, 300000, 387) == 15
     assert w.scan_workers(16, 10000, 387) == 1
     assert w.scan_workers(16, 300000, 3) == 3
+    assert w.scan_workers(16, 10000, 387, rows_per_thread=500) == 16
+    # The memory cap: each task in flight holds ~64 B per sample row. It binds only when the
+    # init sample escalates (the 8.07M-row immunopeptidomics ladder reaches 4.8M rows).
+    assert w.scan_workers(16, 1_200_000, 347) == 13
+    assert w.scan_workers(16, 4_800_000, 347) == 3
+    assert w.scan_workers(16, 20_000_000, 347) == 1
+    assert w.scan_workers(16, 4_800_000, 347, mem_bytes=0) == 1
+    assert w.scan_workers(16, 4_800_000, 347, mem_bytes=8 << 30) == 16
+
+
+def test_single_threaded_load_releases_its_moment_buffer(tmp_path):
+    """With one fill thread the moment buffer lives on the main thread; it must not stay.
+
+    Pool threads drop theirs when they exit. The main thread lives for the whole run, so a
+    cached 32,768 x features float64 buffer (0.1 GB at 387 features) would stay resident
+    through training.
+    """
+    w = _import_worker()
+    import pyarrow.parquet as pq
+
+    features, _keys, n = _identity_pool(tmp_path)
+    names = [c for c in pq.read_schema(str(features)).names if c not in w.NON_FEATURE]
+    out = np.empty((n, len(names)), np.float32)
+    w.fill_parquet_matrix(str(features), names, n, 700, out, threads=1, read_ahead=False)
+    assert getattr(w._TLS, "moments", None) is None, "the main thread kept its moment buffer"
 
 
 @pytest.mark.parametrize("chunk", [250000, 700])

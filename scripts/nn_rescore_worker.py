@@ -177,8 +177,14 @@ Env knobs (all optional):
     MUMDIA_NN_SCAN_THREADS = auto    threads for the init feature scan (one column, both
                                      signs, per task; the winner is reduced in the serial
                                      (column, sign) order, so the choice is identical).
-                                     auto = the torch CPU thread count, capped by the sample
-                                     size (one thread per 20,000 rows). 1 = serial.
+                                     auto = the torch CPU thread count. Always capped by the
+                                     two knobs below. 1 = serial.
+    MUMDIA_NN_SCAN_ROWS_PER_THREAD = 20000  init-sample rows per scan thread: a smaller
+                                     sample starts fewer threads.
+    MUMDIA_NN_SCAN_MEM_GB = 1        transient memory the scan tasks in flight may hold
+                                     together, at about 64 bytes per sample row each. Binds
+                                     only when the init sample escalates to millions of
+                                     rows (3 tasks at 4.8M rows).
     MUMDIA_NN_SELECT      = window   how each round selects its positives: window = sort
                                      only the top rows down to the (floor(fdr * targets)+1)-th
                                      best decoy, certify that no later row can be accepted,
@@ -614,6 +620,10 @@ def fill_parquet_matrix(pin_path, feat_cols, n, chunk, out, threads=1, read_ahea
         if pool is not None:
             pool.shutdown(wait=True)
         state.clear()
+        # With one thread `_fill_block` ran here and cached its moment buffer (32,768 x
+        # features float64, 0.1 GB at 387) on the main thread, which lives for the whole
+        # run. Pool threads release theirs when they exit.
+        vars(_TLS).pop("moments", None)
     if off != n:
         raise RuntimeError(f"parquet row mismatch: metadata {n}, features {off}")
     return s1, s2
@@ -919,10 +929,32 @@ def n_targets_at_col(col, tgt, fdr, topk=0):
 # a column's sort is a few milliseconds and the pool's start-up and GIL hand-offs dominate.
 _SCAN_ROWS_PER_THREAD = 20000
 
+# Transient bytes one scan task holds per sample row while it counts a column: the column
+# copy and its negation (float32), the int64 sort order, the sorted target mask and the
+# int64 cumulative counts. Measured 58 B/row with tracemalloc on a 1M-row column; rounded up.
+_SCAN_BYTES_PER_ROW = 64
 
-def scan_workers(requested, rows, cols):
-    """Threads for the init feature scan, capped by the sample size and the column count."""
-    return max(1, min(int(requested), int(cols), rows // _SCAN_ROWS_PER_THREAD))
+# Transient memory the concurrent scan tasks may hold together, beyond the sample itself.
+_SCAN_MEM_BYTES = 1 << 30
+
+
+def scan_workers(requested, rows, cols, rows_per_thread=None, mem_bytes=None):
+    """Threads for the init feature scan.
+
+    Capped by the column count, by the sample size (one thread per `rows_per_thread` rows,
+    default `_SCAN_ROWS_PER_THREAD`) and by memory: every task in flight holds about
+    `_SCAN_BYTES_PER_ROW` bytes per sample row, so at most `mem_bytes` (default
+    `_SCAN_MEM_BYTES`) of them together. The memory cap binds only when the init sample
+    escalates: at 4.8M rows, a step of the ladder on the 8.07M-row immunopeptidomics pool,
+    16 tasks would hold about 4.5 GB beside the 6.7 GB sample, where the serial scan held
+    0.3 GB; under the 1 GiB default that is 3 tasks. At the 300,000-row default sample the
+    cap is 55 tasks, so it does not bind. The thread count never changes the result.
+    """
+    rpt = _SCAN_ROWS_PER_THREAD if rows_per_thread is None else max(1, int(rows_per_thread))
+    budget = _SCAN_MEM_BYTES if mem_bytes is None else max(0, int(mem_bytes))
+    rows = int(rows)
+    by_mem = budget // max(1, rows * _SCAN_BYTES_PER_ROW)
+    return max(1, min(int(requested), int(cols), rows // rpt, by_mem))
 
 
 def n_targets_at_many(X, is_target, fdr, topk=0, workers=1, initializer=None):
@@ -1108,6 +1140,8 @@ def _build_trainer(torch, cfg, X, stream, y, fold, feat_cols, keyed_shuffle=Fals
     DEVICE = cfg.DEVICE
     DEBUG_DENORMALS = cfg.DEBUG_DENORMALS
     SCAN_THREADS = cfg.SCAN_THREADS
+    SCAN_ROWS_PER_THREAD = cfg.SCAN_ROWS_PER_THREAD
+    SCAN_MEM_BYTES = cfg.SCAN_MEM_BYTES
     init_sample_limit = cfg.INIT_SAMPLE
     KEYED_SHUFFLE = bool(keyed_shuffle)
     nf = len(feat_cols)
@@ -1272,10 +1306,11 @@ def _build_trainer(torch, cfg, X, stream, y, fold, feat_cols, keyed_shuffle=Fals
             # One column at a time, both signs from the SAME column read, vectorised
             # over feature blocks (see n_targets_at_many): same counts and tie-breaking
             # as the per-feature scan, ~387x fewer Python-level argsort calls.
+            scan_n = scan_workers(SCAN_THREADS, len(init_idx), Xsamp.shape[1],
+                                  SCAN_ROWS_PER_THREAD, SCAN_MEM_BYTES)
             best_j, best_sign, best_n = n_targets_at_many(
                 Xsamp, ysamp, TRAIN_FDR, topk=env_i("MUMDIA_NN_INIT_TOPK", 0),
-                workers=scan_workers(SCAN_THREADS, len(init_idx), Xsamp.shape[1]),
-                initializer=_fp_thread_init,
+                workers=scan_n, initializer=_fp_thread_init,
             )
             if best_n > 0 or sample_n >= len(tr_idx):
                 break
@@ -1294,7 +1329,7 @@ def _build_trainer(torch, cfg, X, stream, y, fold, feat_cols, keyed_shuffle=Fals
         _t = _tick("2_init_feature_scan", _t)
         print(f"  seed {seed} fold {f}: init={feat_cols[best_j]} "
               f"sign{best_sign:+d} ({best_n}@{TRAIN_FDR:.0%} "
-              f"on {sample_n} training rows)", flush=True)
+              f"on {sample_n} training rows, {scan_n} scan thread(s))", flush=True)
         model = None
         optim = None
         prev_pos = None
@@ -1786,6 +1821,10 @@ def main():
         if _scan_raw in ("", "auto")
         else max(1, int(float(_scan_raw)))
     )
+    # The two caps on those threads: sample rows per thread, and the transient memory the
+    # tasks in flight may hold together (see `scan_workers`).
+    SCAN_ROWS_PER_THREAD = max(1, env_i("MUMDIA_NN_SCAN_ROWS_PER_THREAD", _SCAN_ROWS_PER_THREAD))
+    SCAN_MEM_BYTES = int(env_f("MUMDIA_NN_SCAN_MEM_GB", _SCAN_MEM_BYTES / 1024 ** 3) * 1024 ** 3)
 
     stream_env = os.environ.get("MUMDIA_NN_STREAM", "auto").lower()
     filesize = os.path.getsize(pin_path)
@@ -2059,6 +2098,7 @@ def main():
         EARLY_STOP_TOL=EARLY_STOP_TOL, PREGATHER_GB=PREGATHER_GB, CLAMP_TINY=CLAMP_TINY,
         FINAL_POOL_SCORE=FINAL_POOL_SCORE, SELECT=SELECT, GATHER=GATHER, DEVICE=DEVICE,
         DEBUG_DENORMALS=DEBUG_DENORMALS, SCAN_THREADS=SCAN_THREADS,
+        SCAN_ROWS_PER_THREAD=SCAN_ROWS_PER_THREAD, SCAN_MEM_BYTES=SCAN_MEM_BYTES,
         INIT_SAMPLE=init_sample_limit,
     )
     X = mm if stream else Xs
