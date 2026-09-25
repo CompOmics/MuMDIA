@@ -348,7 +348,11 @@ report's recorded params match what ran; mokapot ignores those three. On success
 the classifier label and `model_identity` are recorded; on failure the path falls
 back to `native_scores` only when `rescore.strict = false`; strict is the
 production default. The authoritative actual path is recorded in
-`psms_scored.parquet.report.json`.
+`psms_scored.parquet.report.json`. When `nn_torch` ran, its `params.nn_env` also records
+every `MUMDIA_NN_*` variable the worker inherited from the engine's environment, beyond
+the ones the engine sets itself (`inherited_nn_env`, sorted by name; `{}` when there were
+none). `MUMDIA_NN_SEED`, `MUMDIA_NN_THREADS` (set from `--threads`) and
+`MUMDIA_NN_PARALLEL` change the scores and reach the worker only this way.
 
 - `mokapot_worker.py` reads the PIN with `mokapot.read_pin`, builds a model
   chosen by `MUMDIA_RESCORE_MODEL` (`make_model`, `mokapot_worker.py:35-98`:
@@ -834,6 +838,12 @@ MLP. Set it explicitly for the logreg path.
     an engine that kills the worker does not leave folds training for nobody. The
     memmap and side arrays are removed when the worker exits, also after an error; only
     a hard kill leaves them. Under CUDA every child opens its own context on the device.
+  - A child's log is printed by the worker when its task ends. When a task fails, the
+    log travels inside the exception (`--- log of that task ---` in the traceback), so
+    the init feature, rescan, bootstrap and churn lines that explain the failure are
+    not lost.
+  - `MUMDIA_NN_PARALLEL` and `MUMDIA_NN_PARALLEL_THREADS` reach the worker only through
+    the environment; `params.nn_env` in `psms_scored.parquet.report.json` records them.
 - **Constant feature columns are dropped before training** (`MUMDIA_NN_DROP_CONSTANT`,
   default 1; 2026-09-16), identified from the parquet footer's per-column min/max
   without a read (11 of the 387 Extended features on the Astral pool, `has_ms1` and

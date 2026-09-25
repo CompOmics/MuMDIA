@@ -134,6 +134,12 @@ than a number. Both are recorded in every run's `manifest.json`.
   once, like a seed change; they do not depend on K. Off by default; validate it as a seed
   change (three seeds, two pools, entrapment) before relying on it.
 
+- **`psms_scored.parquet.report.json` records the NN worker's inherited environment.**
+  When `nn_torch` ran, `params.nn_env` lists every `MUMDIA_NN_*` variable the worker
+  inherited beyond the ones the engine sets. `MUMDIA_NN_SEED`, `MUMDIA_NN_THREADS` and
+  `MUMDIA_NN_PARALLEL` change the scores and reach the worker only this way, so two runs
+  of one configuration that differ in them are now told apart by the report.
+
 - **`mumdia pool` pools a grouped run's band artifacts from the command line.** `run` does
   this itself at the end of a grouped search; standalone it is for the case where the
   search finished and the run did not, which now costs a pool rather than a re-search.

@@ -665,4 +665,8 @@ def test_failed_run_removes_its_memmap(torch_available, tmp_path):
                             env=dict(env, MUMDIA_NN_STREAM="0", MUMDIA_NN_PARALLEL="2"))
     assert rc != 0
     assert "selected no positive targets" in err
+    # A child's log reaches the parent only inside the exception, and it is what explains
+    # the failure: the rescans and the init feature the fold started from.
+    assert "--- log of that task ---" in err
+    assert "rescanning on" in err and "init=" in err
     assert not [p.name for p in tmp_path.iterdir() if p.name.startswith("failing.parquet.")]

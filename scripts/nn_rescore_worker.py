@@ -1592,8 +1592,19 @@ def _parallel_child_task(seed, f):
     SELECT_COUNTS.clear()
     log = io.StringIO()
     t0 = time.time()
-    with contextlib.redirect_stdout(log):
-        _te_idx, te_scores = _CHILD["run_fold"](seed, f)
+    try:
+        with contextlib.redirect_stdout(log):
+            _te_idx, te_scores = _CHILD["run_fold"](seed, f)
+    except Exception as exc:
+        # Only the exception crosses the process boundary, so carry the task's log in it:
+        # the init feature, rescan, bootstrap and churn lines are what explain a failed
+        # fold, and the serial path prints them before its traceback.
+        text = log.getvalue().rstrip()
+        raise RuntimeError(
+            "seed %s fold %s failed in child %d: %s: %s%s"
+            % (seed, f, os.getpid(), type(exc).__name__, exc,
+               "\n--- log of that task ---\n" + text if text else "")
+        ) from exc
     return (seed, f, te_scores, dict(PHASE), dict(DETAIL), dict(SELECT_COUNTS),
             log.getvalue(), time.time() - t0, os.getpid())
 
