@@ -59,7 +59,7 @@ impl FragIndex {
     /// (docs/06_predict_frag_index_matchers.md, two-pass counting sort).
     ///
     /// Deterministic and parallel, with arrays bit-identical to the serial counting sort
-    /// ([`FragIndex::build_serial`], kept under `cfg(test)` as the reference):
+    /// (`FragIndex::build_serial`, kept under `cfg(test)` as the reference):
     ///
     /// - the m/z range is a parallel min/max over the finite fragment m/z, which is exact;
     /// - the fragments are cut into chunks at candidate boundaries (the library is CSR in
